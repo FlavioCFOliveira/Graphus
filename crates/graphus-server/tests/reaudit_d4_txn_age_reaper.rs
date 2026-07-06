@@ -68,6 +68,8 @@ fn engine_with_age_cap(clock: &SharedClock, max_age: Option<Duration>) -> (Engin
         engine_clock,
         None,
         max_age,
+        // No egress-stall ceiling here (rmp #591): this gate exercises the transaction-age reaper.
+        None,
     )
     .expect("spawn threaded engine");
     (eng, metrics)

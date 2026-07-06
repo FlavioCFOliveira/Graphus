@@ -528,8 +528,13 @@ struct ActiveTxnGauge {
     metrics: Arc<Metrics>,
     /// The database name labelling this engine's per-database open-transaction gauge (`rmp` #463).
     db_name: Arc<str>,
-    /// The count this engine last contributed to the shared gauge.
+    /// The open-transaction count this engine last contributed to the shared gauge.
     last: u64,
+    /// The retained-SSI-conflict-record count this engine last contributed to the shared
+    /// `graphus_ssi_tracked_transactions` gauge (`rmp` #591 D-#1). Published additively at the SAME
+    /// cadence as `last` (every begin/commit/rollback/retire/reap/maintenance publish), so the gauge is
+    /// never stale and equals the SUM across databases.
+    last_ssi: u64,
 }
 
 impl ActiveTxnGauge {
@@ -538,36 +543,51 @@ impl ActiveTxnGauge {
             metrics,
             db_name,
             last: 0,
+            last_ssi: 0,
         }
     }
 
-    /// Publishes this engine's `current` open-transaction count, folding only the delta since the last
-    /// publish into BOTH the shared additive gauge and this database's per-database gauge (`rmp` #463).
-    fn publish(&mut self, current: usize) {
-        let current = current as u64;
-        if current == self.last {
-            return;
+    /// Publishes this engine's `active` open-transaction count and `ssi_tracked` retained-conflict-record
+    /// count, folding only the delta since the last publish of each into the corresponding shared additive
+    /// gauge(s): the open-transaction count into BOTH the aggregate and this database's per-database gauge
+    /// (`rmp` #463), and the SSI-tracked count into the aggregate `graphus_ssi_tracked_transactions`
+    /// gauge (`rmp` #591 D-#1). Both are cheap O(1) coordinator reads taken by the caller.
+    fn publish(&mut self, active: usize, ssi_tracked: usize) {
+        let active = active as u64;
+        if active != self.last {
+            // `i128` headroom so the subtraction never overflows `i64` for any realistic count (a small
+            // `usize`); clamp into `i64` for the (impossible-in-practice) saturating case.
+            let delta = (i128::from(active) - i128::from(self.last))
+                .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+            self.metrics.add_active_txns_delta_for(&self.db_name, delta);
+            self.last = active;
         }
-        // `i128` headroom so the subtraction never overflows `i64` for any realistic open-txn count
-        // (which is a small `usize`); clamp into `i64` for the (impossible-in-practice) saturating case.
-        let delta = (i128::from(current) - i128::from(self.last))
-            .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
-        self.metrics.add_active_txns_delta_for(&self.db_name, delta);
-        self.last = current;
+        let ssi_tracked = ssi_tracked as u64;
+        if ssi_tracked != self.last_ssi {
+            let delta = (i128::from(ssi_tracked) - i128::from(self.last_ssi))
+                .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+            self.metrics.add_ssi_tracked_delta(delta);
+            self.last_ssi = ssi_tracked;
+        }
     }
 }
 
 impl Drop for ActiveTxnGauge {
     fn drop(&mut self) {
         // Retract this engine's whole remaining contribution so a stopped/torn-down engine never
-        // leaves a phantom count in the server-wide gauge OR this database's per-database gauge
-        // (`rmp` #418/#463).
+        // leaves a phantom count in the server-wide gauge(s) OR this database's per-database gauge
+        // (`rmp` #418/#463/#591).
         if self.last != 0 {
             self.metrics.add_active_txns_delta_for(
                 &self.db_name,
                 -(i64::try_from(self.last).unwrap_or(i64::MAX)),
             );
             self.last = 0;
+        }
+        if self.last_ssi != 0 {
+            self.metrics
+                .add_ssi_tracked_delta(-(i64::try_from(self.last_ssi).unwrap_or(i64::MAX)));
+            self.last_ssi = 0;
         }
     }
 }
@@ -699,6 +719,12 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     clock: Arc<dyn graphus_core::capability::Clock + Send + Sync>,
     statement_timeout: Option<std::time::Duration>,
     max_transaction_age: Option<std::time::Duration>,
+    // The off-thread reader egress-stall ceiling (`rmp` #591, C-F1): bounds a reader-pool read's
+    // no-progress wait on a full result-egress channel INDEPENDENTLY of `statement_timeout`, so a stalled
+    // consumer releases the reader's GC-watermark pin + pool slot even when the per-statement timeout is
+    // disabled. Threaded into the reader pool at spawn. `None` disables it. The deterministic
+    // [`LocalEngine`] never runs this loop (no pool, unbounded egress), so DST is unaffected.
+    egress_stall_timeout: Option<std::time::Duration>,
     // The bound on **concurrently parked (suspended) inline statements** (`rmp` #485, finding B1).
     // Several slow-consumer inline statements can be parked at once (writes + explicit-txn reads run
     // inline and any can fill its bounded egress on its first visit), so a single slot is unsound: a
@@ -744,6 +770,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     let dispatch = read_pool::ReadDispatch::Threaded(read_pool::ReadPool::spawn(
         reader_threads,
         reader_threads.saturating_mul(8).max(16),
+        egress_stall_timeout,
         retire_tx,
         Arc::clone(&metrics),
     ));
@@ -999,7 +1026,12 @@ fn process_retirements<D: BlockDevice, S: LogSink>(
             finish_reader(coord, open, retirement, metrics, db, degraded);
         }
         *readers_inflight = readers_inflight.saturating_sub(1);
-        active_txns.publish(coordinator.as_ref().map_or(0, TxnCoordinator::active_count));
+        active_txns.publish(
+            coordinator.as_ref().map_or(0, TxnCoordinator::active_count),
+            coordinator
+                .as_ref()
+                .map_or(0, TxnCoordinator::ssi_tracked_len),
+        );
         any_retired = true;
     }
     // `rmp` #588: a retired reader may have been the last one predating some GC-freed slot's reuse
@@ -1334,7 +1366,7 @@ fn maybe_reap_aged<D: BlockDevice, S: LogSink>(
     }
     if reaped > 0 {
         // The active set shrank — refresh the open-transaction gauge so observability reflects the reap.
-        active_txns.publish(coord.active_count());
+        active_txns.publish(coord.active_count(), coord.ssi_tracked_len());
     }
 }
 
@@ -1423,7 +1455,12 @@ fn resume_parked_statements<
     if finalized_any {
         // A parked statement finalised/aborted — refresh the open-transaction gauge so observability
         // reflects it promptly (the threaded loop otherwise publishes only after a dispatched command).
-        active_txns.publish(coordinator.as_ref().map_or(0, TxnCoordinator::active_count));
+        active_txns.publish(
+            coordinator.as_ref().map_or(0, TxnCoordinator::active_count),
+            coordinator
+                .as_ref()
+                .map_or(0, TxnCoordinator::ssi_tracked_len),
+        );
     }
 }
 
@@ -1955,12 +1992,12 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
     match cmd {
         Cmd::Begin { mode, reply } => {
             let ticket = open_tx(coord, open, next_ticket, mode, false, clock.now_nanos());
-            active_txns.publish(coord.active_count());
+            active_txns.publish(coord.active_count(), coord.ssi_tracked_len());
             let _ = reply.send(Ok(ticket));
         }
         Cmd::BeginAutoCommit { mode, reply } => {
             let ticket = open_tx(coord, open, next_ticket, mode, true, clock.now_nanos());
-            active_txns.publish(coord.active_count());
+            active_txns.publish(coord.active_count(), coord.ssi_tracked_len());
             let _ = reply.send(Ok(ticket));
         }
         Cmd::Run {
@@ -2002,18 +2039,18 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
                 commit_batch,
                 reply,
             );
-            active_txns.publish(coord.active_count());
+            active_txns.publish(coord.active_count(), coord.ssi_tracked_len());
         }
         Cmd::Commit { ticket, reply } => {
             // Group commit (`rmp` #528): PREPARE the commit (SSI + append `COMMIT`, no `fdatasync`) and
             // DEFER the ack into `commit_batch`; the caller hardens the whole batch with one sync and
             // then replies. A read-only or SSI-aborted commit is answered here and never batched.
             commit_prepare_tx(coord, open, ticket, reply, commit_batch, metrics, db);
-            active_txns.publish(coord.active_count());
+            active_txns.publish(coord.active_count(), coord.ssi_tracked_len());
         }
         Cmd::Rollback { ticket, reply } => {
             let out = rollback_tx(coord, open, ticket, metrics, db);
-            active_txns.publish(coord.active_count());
+            active_txns.publish(coord.active_count(), coord.ssi_tracked_len());
             let _ = reply.send(out);
         }
         Cmd::Status { reply } => {
@@ -2120,8 +2157,9 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             let out = harden_store(coordinator);
             // Retract this engine's whole contribution from the server-wide gauge (`rmp` #418); the
             // `ActiveTxnGauge` drop at loop exit would also do this, but publishing 0 here keeps the
-            // gauge correct the instant the engine drains.
-            active_txns.publish(0);
+            // gauge correct the instant the engine drains. The coordinator is consumed above, so its
+            // retained-SSI count is now 0 too (`rmp` #591 D-#1).
+            active_txns.publish(0, 0);
             let _ = reply.send(out);
             // Drained + durable: signal the loop to exit so the thread can join.
             return false;
@@ -3320,9 +3358,10 @@ pub struct Engine {
 /// `db_name` is the canonical database name this engine serves; it labels the per-database metric
 /// series (`rmp` #463) so an operator can attribute transaction/latency/abort counts to a single tenant.
 ///
-/// This convenience spawns an engine with **no per-statement timeout** (the prior behaviour); the
-/// production path uses [`spawn_engine_with_timeout`] to install the configured per-statement CPU
-/// budget (`rmp` #476).
+/// This convenience spawns an engine with **no per-statement timeout, no transaction-age cap, and no
+/// egress-stall ceiling** (the prior behaviour); the production path uses [`spawn_engine_with_timeout`]
+/// to install the configured per-statement CPU budget (`rmp` #476), age cap (`rmp` #477) and off-thread
+/// reader egress-stall ceiling (`rmp` #591).
 ///
 /// # Errors
 /// Returns the spawn error if the OS thread cannot be created, or the `build` error (e.g. an
@@ -3351,6 +3390,7 @@ where
         clock,
         None,
         None,
+        None,
     )
 }
 
@@ -3362,12 +3402,15 @@ where
 /// cooperatively aborted instead of pinning the engine thread and starving co-tenants. A finite
 /// `max_transaction_age` installs a background sweep that aborts any explicit transaction whose
 /// lifetime exceeds it, freeing the MVCC GC watermark a long-running reader would otherwise pin
-/// indefinitely (the idle-in-transaction DoS). Either `None` disables the respective guard (identical
-/// to [`spawn_engine`]).
+/// indefinitely (the idle-in-transaction DoS). A finite `egress_stall_timeout` bounds how long an
+/// off-thread reader-pool read may block on a full result-egress channel with no progress before it is
+/// aborted (releasing its GC-watermark pin + pool slot) — INDEPENDENTLY of `statement_timeout`, so a
+/// stalled/zero-window consumer cannot pin a reader forever even when the per-statement timeout is
+/// disabled (`rmp` #591 C-F1). Any `None` disables the respective guard (identical to [`spawn_engine`]).
 ///
 /// # Errors
 /// As [`spawn_engine`].
-#[allow(clippy::too_many_arguments)] // engine sizing + clock + per-statement/per-transaction budgets — all positional knobs
+#[allow(clippy::too_many_arguments)] // engine sizing + clock + per-statement/per-transaction/egress budgets — all positional knobs
 pub fn spawn_engine_with_timeout<D, S, B>(
     db_name: Arc<str>,
     build: B,
@@ -3378,6 +3421,7 @@ pub fn spawn_engine_with_timeout<D, S, B>(
     clock: Arc<dyn graphus_core::capability::Clock + Send + Sync>,
     statement_timeout: Option<std::time::Duration>,
     max_transaction_age: Option<std::time::Duration>,
+    egress_stall_timeout: Option<std::time::Duration>,
 ) -> Result<Engine>
 where
     D: BlockDevice + Send + Sync + 'static,
@@ -3432,6 +3476,7 @@ where
                     clock,
                     statement_timeout,
                     max_transaction_age,
+                    egress_stall_timeout,
                     // Bound on concurrently parked (suspended) inline statements (`rmp` #485 B1). The
                     // command channel is sized `engine_queue_capacity`, which in any sane config is ≥
                     // `max_concurrent_queries` (the admission limit that actually bounds how many

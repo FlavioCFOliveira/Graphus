@@ -61,6 +61,10 @@ fn engine_with_timeout(statement_timeout: Option<Duration>) -> Engine {
         statement_timeout,
         // No max-transaction-age cap in this test (rmp #477): it exercises the per-statement timeout.
         None,
+        // No egress-stall ceiling here (rmp #591): these tests exercise the per-statement timeout as the
+        // bound on a stalled reader; the egress-stall ceiling has its own dedicated gate
+        // (`egress_stall_timeout.rs`), driving the `statement_timeout = None` case this file does not.
+        None,
     )
     .expect("spawn threaded engine")
 }

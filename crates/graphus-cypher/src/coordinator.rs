@@ -3169,12 +3169,15 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.ssi.borrow().tracks(txn)
     }
 
-    /// Test-only witness of the SSI tracker's retained-conflict-record count (`rmp` #552): the direct
-    /// witness that [`checkpoint`](Self::checkpoint)'s `prune_committed` actually shrank the tracker
-    /// after a burst of committed transactions and auto-commit reads.
-    #[cfg(test)]
+    /// The SSI tracker's retained-conflict-record count — the size of its `txns` table, the single
+    /// unbounded-growth vector the tracker exposes (`rmp` #552 / #591 D-#1). It is the direct witness that
+    /// [`checkpoint`](Self::checkpoint)'s `prune_committed` shrank the tracker after a burst of committed
+    /// transactions and auto-commit reads, and the value the engine publishes as the
+    /// `graphus_ssi_tracked_transactions` observability gauge so an operator can alert on a long-lived
+    /// active reader pinning the GC watermark (retention is REQUIRED for serializability — this surfaces
+    /// the growth, it does not change it). An O(1) map length read.
     #[must_use]
-    pub(crate) fn ssi_tracked_len(&self) -> usize {
+    pub fn ssi_tracked_len(&self) -> usize {
         self.ssi.borrow().tracked_len()
     }
 

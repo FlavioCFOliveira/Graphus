@@ -389,6 +389,35 @@ pub struct TimingConfig {
     /// [`statement_timeout_ms`](Self::statement_timeout_ms); this cap targets explicit
     /// `BEGIN … COMMIT` transactions, which are the only ones a client can hold open across statements.
     pub max_transaction_age_ms: u64,
+    /// Maximum wall-clock time an **off-thread reader** may spend blocked on a **full result-egress
+    /// channel with no progress** (no row accepted by the consumer) before the read is aborted with a
+    /// clean, retriable error (`rmp` #591, sprint-52 finding C-F1). This is an **egress-stall ceiling**
+    /// that is deliberately **independent of** [`statement_timeout_ms`](Self::statement_timeout_ms):
+    ///
+    /// An auto-commit read that runs on the reader pool (`rmp` #336/#543) streams its rows into a bounded
+    /// channel. If the consumer stops draining (a TCP zero-window / slow-loris on the result stream), the
+    /// reader backs off waiting for room. The per-statement timeout bounds that wait **only when it is
+    /// configured** — with `statement_timeout_ms = 0` (a legitimate choice for long-running analytics),
+    /// nothing else bounds an off-thread reader blocked on egress, so it would spin/park **forever**,
+    /// pinning its MVCC snapshot (the GC watermark — nothing it read is ever reclaimed, so RAM and disk
+    /// grow without bound) and holding a finite reader-pool slot (a few such stalls exhaust the pool and
+    /// kill read service). A full consumer *disconnect* already unblocks the reader; a *zero-window
+    /// stall* never disconnects, which is the gap this ceiling closes.
+    ///
+    /// The ceiling measures **time since the last row was accepted** (it resets on every successful send),
+    /// so it never false-aborts a consumer that keeps draining — even slowly, even for hours: it targets a
+    /// genuine *stall*, not a legitimately slow but progressing reader. Its total duration is bounded by
+    /// [`statement_timeout_ms`](Self::statement_timeout_ms) (when set) as before.
+    ///
+    /// Deliberately **generous** so a real client's transient hiccup (a GC pause, a momentary network
+    /// stall) never trips it: at 30 s it is far beyond any interactive client's inter-row latency (which
+    /// is sub-second), yet finite so a genuinely wedged consumer releases the reader — and its GC pin —
+    /// promptly. In milliseconds; `0` **disables** the ceiling (opt-out — an off-thread reader can then be
+    /// pinned indefinitely by a stalled consumer when `statement_timeout_ms` is also `0`, exactly the
+    /// pre-fix behaviour, so only disable it deliberately). Applies only to the **off-thread reader**
+    /// (auto-commit reads); inline statements suspend-and-yield the engine thread instead of blocking, and
+    /// the deterministic [`crate::engine::LocalEngine`] uses an unbounded egress, so neither is affected.
+    pub egress_stall_timeout_ms: u64,
 }
 
 impl Default for TimingConfig {
@@ -416,6 +445,13 @@ impl Default for TimingConfig {
             // idle-in-transaction holder pinning the GC watermark — the classic "idle-in-transaction
             // blocks vacuum" DoS — is reclaimed in bounded time. `0` disables it.
             max_transaction_age_ms: 60 * 60 * 1000,
+            // 30s (rmp #591, sprint-52 C-F1): the off-thread reader egress-stall ceiling. Bounds how long
+            // a reader-pool read blocks on a full result-egress channel with NO progress (a non-draining /
+            // zero-window consumer) before it is aborted and releases its GC-watermark pin + pool slot —
+            // independently of `statement_timeout_ms`, so a stalled consumer cannot pin a reader forever
+            // even when the per-statement timeout is disabled for long analytics. Resets on every accepted
+            // row, so it never false-aborts a slow-but-progressing consumer. `0` disables it.
+            egress_stall_timeout_ms: 30_000,
         }
     }
 }
@@ -483,6 +519,19 @@ impl TimingConfig {
             None
         } else {
             Some(Duration::from_millis(self.max_transaction_age_ms))
+        }
+    }
+
+    /// The off-thread reader egress-stall ceiling as a [`Duration`], or `None` when disabled
+    /// (`egress_stall_timeout_ms == 0`) — `rmp` #591 (sprint-52 C-F1). Bounds how long a reader-pool read
+    /// may block on a full result-egress channel with no progress before it is aborted, releasing its
+    /// GC-watermark pin and pool slot independently of the per-statement timeout.
+    #[must_use]
+    pub fn egress_stall_timeout(&self) -> Option<Duration> {
+        if self.egress_stall_timeout_ms == 0 {
+            None
+        } else {
+            Some(Duration::from_millis(self.egress_stall_timeout_ms))
         }
     }
 
@@ -1059,6 +1108,13 @@ impl ServerConfig {
                 ))
             })?;
         }
+        if let Ok(v) = var("GRAPHUS_EGRESS_STALL_TIMEOUT_MS") {
+            self.timing.egress_stall_timeout_ms = v.parse().map_err(|_| {
+                ConfigError::Parse(format!(
+                    "GRAPHUS_EGRESS_STALL_TIMEOUT_MS is not an integer: {v:?}"
+                ))
+            })?;
+        }
         Ok(())
     }
 
@@ -1539,6 +1595,28 @@ mod tests {
             .max_transaction_age(),
             None,
             "0 ⇒ disabled (opt-out, unbounded lifetime)"
+        );
+
+        // The off-thread reader egress-stall ceiling (rmp #591, C-F1) is bounded-by-default (30s) and
+        // `0` disables it — the always-on guard against a stalled consumer pinning a reader's GC watermark.
+        assert_eq!(
+            t.egress_stall_timeout_ms, 30_000,
+            "egress-stall ceiling is finite (30s) by default"
+        );
+        assert_eq!(
+            t.egress_stall_timeout(),
+            Some(Duration::from_millis(30_000)),
+            "egress-stall ceiling is finite (bounded) by default"
+        );
+        assert_eq!(
+            TimingConfig {
+                egress_stall_timeout_ms: 0,
+                ..TimingConfig::default()
+            }
+            .egress_stall_timeout(),
+            None,
+            "0 ⇒ disabled (opt-out; a stalled consumer can then pin a reader when the statement timeout \
+             is also disabled)"
         );
 
         // A zero connection cap is rejected.

@@ -784,6 +784,9 @@ enum EgressStep {
     ConsumerGone,
     /// The per-statement deadline (or an explicit cancel) tripped while the channel was full: abort the read.
     Cancelled,
+    /// The **egress-stall ceiling** (`rmp` #591, C-F1) tripped: the consumer accepted no row for longer
+    /// than `egress_stall_timeout`, so the reader is released even when no per-statement deadline is set.
+    Stalled,
 }
 
 /// Backoff escalation for the off-thread reader's egress-backpressure wait (`rmp` #551): a short
@@ -796,7 +799,7 @@ const EGRESS_PARK_YIELDS: u32 = 16;
 const EGRESS_PARK_SLEEP: Duration = Duration::from_micros(200);
 
 /// Delivers one `item` to the bounded egress channel, honouring the reader's per-statement deadline
-/// while the channel is full (`rmp` #551).
+/// AND an always-on egress-stall ceiling while the channel is full (`rmp` #551 / #591).
 ///
 /// The off-thread reader (`run_cursor`, called only from the reader pool) runs on its own worker
 /// thread — it cannot "suspend and yield the engine thread" the way the inline path does. A bare
@@ -804,18 +807,35 @@ const EGRESS_PARK_SLEEP: Duration = Duration::from_micros(200);
 /// draining (TCP zero-window / a slow-loris on the result stream), which pins this read's MVCC snapshot
 /// (the GC watermark, so nothing it read is ever reclaimed → unbounded RAM + disk growth) and wedges a
 /// finite reader-pool slot (a few such reads exhaust the pool = read-service DoS). Instead we
-/// [`RowSender::try_send`] and, while the channel is full, back off and re-check the same
-/// [`CancellationToken`](graphus_cypher::CancellationToken) the CPU path already enforces. This closes
-/// exactly the gap the aged-transaction reaper's auto-commit exclusion (`engine::maybe_reap_aged`)
-/// already ASSUMES is closed — that an auto-commit read is "bounded by the per-statement timeout"
-/// (`rmp` #476) — which held on the CPU path but not while blocked on egress.
+/// [`RowSender::try_send`] and, while the channel is full, back off and re-check two independent bounds:
+///
+/// 1. the reader's [`CancellationToken`](graphus_cypher::CancellationToken) — the SAME per-statement
+///    deadline the CPU path enforces (`rmp` #476). This closes the gap the aged-transaction reaper's
+///    auto-commit exclusion (`engine::maybe_reap_aged`) ASSUMES is closed — that an auto-commit read is
+///    "bounded by the per-statement timeout" — which held on the CPU path but not while blocked on egress.
+///
+/// 2. an **egress-stall ceiling** (`egress_stall_timeout`, `rmp` #591 C-F1): the maximum wall-clock the
+///    channel may stay full with **no progress** (no row accepted). This is measured from the moment this
+///    send first finds the channel full, so it is a *time-since-last-progress* bound — every accepted row
+///    starts a fresh call, resetting it — that never false-aborts a consumer which keeps draining (even
+///    slowly). It exists because bound (1) is `None` when `statement_timeout_ms = 0` (a legitimate choice
+///    for long analytics): without it a zero-window consumer would pin the reader forever. A full
+///    consumer *disconnect* already returns [`EgressStep::ConsumerGone`]; a zero-window *stall* never
+///    disconnects, which is exactly what this ceiling bounds. `None` disables it (opt-out).
 fn send_row_with_backpressure(
     row_tx: &RowSender,
     cancel: &graphus_cypher::CancellationToken,
+    egress_stall_timeout: Option<Duration>,
     item: super::stream::RowItem,
 ) -> EgressStep {
     let mut item = item;
     let mut waited: u32 = 0;
+    // The stall deadline is armed lazily on the FIRST full-channel observation (not before the loop), so
+    // it measures time spent with no progress on *this* row — and because a delivered row returns and the
+    // next row starts a fresh call, it resets on every accepted row. A consumer draining at any finite
+    // rate under the ceiling therefore never trips it; only a genuine stall (no row accepted for the whole
+    // window) does. `None` (ceiling disabled) leaves it unarmed forever — the pre-`rmp`-#591 behaviour.
+    let mut stall_deadline: Option<Instant> = None;
     loop {
         match row_tx.try_send(item) {
             super::stream::TrySend::Sent => return EgressStep::Sent,
@@ -825,6 +845,18 @@ fn send_row_with_backpressure(
                 // reader (and its snapshot + slot) within the statement budget.
                 if cancel.is_cancelled() {
                     return EgressStep::Cancelled;
+                }
+                // Arm the egress-stall ceiling on first contention, then trip it once the channel has
+                // stayed full with no accepted row for the whole window — bounding a stalled consumer
+                // INDEPENDENTLY of the per-statement deadline (`rmp` #591 C-F1).
+                match stall_deadline {
+                    None => {
+                        stall_deadline = egress_stall_timeout.map(|t| Instant::now() + t);
+                    }
+                    Some(deadline) if Instant::now() >= deadline => {
+                        return EgressStep::Stalled;
+                    }
+                    Some(_) => {}
                 }
                 item = returned;
                 if waited < EGRESS_PARK_SPINS {
@@ -848,13 +880,19 @@ fn send_row_with_backpressure(
 /// row goes through `reply`; a runtime error mid-stream goes through `row_tx`. Authorization denials
 /// and seam-captured deferral errors are surfaced by the caller after this returns (they live on the
 /// `graph`/wrapper, not in the runtime error channel).
-#[allow(clippy::too_many_arguments)] // Threads the seam + extension registry + egress channel.
+#[allow(clippy::too_many_arguments)] // Threads the seam + extension registry + egress channel + bounds.
 pub(super) fn run_cursor(
     plan: &Arc<graphus_cypher::PhysicalPlan>,
     bound: &graphus_cypher::BoundParameters,
     graph: &mut dyn GraphAccess,
     extensions: &ExtensionRegistry,
     deadline: Option<Instant>,
+    // The always-on egress-stall ceiling (`rmp` #591 C-F1): bounds a full-channel no-progress wait
+    // independently of `deadline`, so a stalled consumer releases this reader even when the per-statement
+    // timeout is disabled. `None` disables it. Pool-wide (captured at `ReadPool::spawn`), not per-task.
+    egress_stall_timeout: Option<Duration>,
+    // For the `graphus_egress_stall_aborts_total` observability counter, recorded on the stall exit path.
+    metrics: &Metrics,
     row_tx: &RowSender,
     row_rx: std::sync::mpsc::Receiver<super::stream::RowItem>,
     summary: SummarySink,
@@ -908,23 +946,41 @@ pub(super) fn run_cursor(
         // `AuthorizedGraph` decorator (rmp #93) — RBAC filtering and MVCC visibility compose
         // automatically: a hidden property is already `None`, an invisible entity already filtered.
         match cursor.next_materialized() {
-            Ok(Some(cells)) => match send_row_with_backpressure(row_tx, &cancel, Ok(cells)) {
-                EgressStep::Sent => {}
-                // A closed channel (consumer gone) ends streaming early; not an error.
-                EgressStep::ConsumerGone => return true,
-                EgressStep::Cancelled => {
-                    // The per-statement deadline (`rmp` #476) tripped (or an explicit cancel) WHILE this
-                    // reader was backpressured by a consumer that stopped draining (`rmp` #551). End the
-                    // read so it retires and releases its MVCC snapshot (advancing the GC watermark) and
-                    // its reader-pool slot. Best-effort deliver a clear timeout error; if the channel is
-                    // still full it is dropped and the consumer observes the disconnect at retirement.
-                    let _ = row_tx.try_send(Err(GraphusError::Runtime(
-                        "statement timed out while streaming results to a slow or stalled consumer"
-                            .to_owned(),
-                    )));
-                    return false;
+            Ok(Some(cells)) => {
+                match send_row_with_backpressure(row_tx, &cancel, egress_stall_timeout, Ok(cells)) {
+                    EgressStep::Sent => {}
+                    // A closed channel (consumer gone) ends streaming early; not an error.
+                    EgressStep::ConsumerGone => return true,
+                    EgressStep::Cancelled => {
+                        // The per-statement deadline (`rmp` #476) tripped (or an explicit cancel) WHILE
+                        // this reader was backpressured by a consumer that stopped draining (`rmp` #551).
+                        // End the read so it retires and releases its MVCC snapshot (advancing the GC
+                        // watermark) and its reader-pool slot. Best-effort deliver a clear timeout error;
+                        // if the channel is still full it is dropped and the consumer observes the
+                        // disconnect at retirement.
+                        let _ = row_tx.try_send(Err(GraphusError::Runtime(
+                            "statement timed out while streaming results to a slow or stalled consumer"
+                                .to_owned(),
+                        )));
+                        return false;
+                    }
+                    EgressStep::Stalled => {
+                        // The egress-stall ceiling (`rmp` #591 C-F1) tripped: the consumer accepted no row
+                        // for the whole `egress_stall_timeout` window (a zero-window / non-draining
+                        // consumer). Terminate the read so it retires and releases its MVCC snapshot
+                        // (advancing the GC watermark) and its reader-pool slot — the SAME terminal-error
+                        // contract as the deadline path, but bounded INDEPENDENTLY of `statement_timeout`
+                        // (so a stalled consumer cannot pin the reader forever when the timeout is `0`).
+                        metrics.record_egress_stall_abort();
+                        let _ = row_tx.try_send(Err(GraphusError::Runtime(
+                            "read aborted: the result stream stalled (the client stopped draining rows) \
+                             past the egress-stall ceiling"
+                                .to_owned(),
+                        )));
+                        return false;
+                    }
                 }
-            },
+            }
             Ok(None) => break,
             Err(e) => {
                 let _ = row_tx.send(Err(GraphusError::Runtime(e.to_string())));

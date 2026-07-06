@@ -508,6 +508,16 @@ pub struct EngineParams {
     /// deterministic [`crate::engine::LocalEngine`] does not run the sweep (so DST stays wall-clock-free
     /// and deterministic).
     pub max_transaction_age: Option<std::time::Duration>,
+    /// Off-thread reader egress-stall ceiling (`rmp` #591, sprint-52 C-F1), or `None` when disabled.
+    /// Threaded to the engine thread and captured by the reader pool: it bounds how long a reader-pool
+    /// read blocks on a full result-egress channel with no progress (a non-draining / TCP zero-window
+    /// consumer) before it is aborted, releasing its GC-watermark pin + pool slot — INDEPENDENTLY of
+    /// `statement_timeout`, so a stalled consumer cannot pin a reader forever even when the per-statement
+    /// timeout is disabled for long analytics. Sourced from
+    /// [`TimingConfig::egress_stall_timeout`](crate::config::TimingConfig::egress_stall_timeout). The
+    /// deterministic [`crate::engine::LocalEngine`] uses an unbounded egress and never dispatches
+    /// off-thread, so this has no effect there (DST stays wall-clock-free and deterministic).
+    pub egress_stall_timeout: Option<std::time::Duration>,
 }
 
 impl std::fmt::Debug for EngineParams {
@@ -527,6 +537,7 @@ impl std::fmt::Debug for EngineParams {
             .field("engine_shutdown_timeout", &self.engine_shutdown_timeout)
             .field("statement_timeout", &self.statement_timeout)
             .field("max_transaction_age", &self.max_transaction_age)
+            .field("egress_stall_timeout", &self.egress_stall_timeout)
             .finish()
     }
 }
@@ -572,6 +583,7 @@ impl EngineParams {
             engine_shutdown_timeout: config.timing.shutdown_drain_deadline(),
             statement_timeout: config.timing.statement_timeout(),
             max_transaction_age: config.timing.max_transaction_age(),
+            egress_stall_timeout: config.timing.egress_stall_timeout(),
         })
     }
 }
@@ -867,6 +879,7 @@ fn spawn_db_engine(
         std::sync::Arc::clone(&params.clock),
         params.statement_timeout,
         params.max_transaction_age,
+        params.egress_stall_timeout,
     )
 }
 
@@ -2308,6 +2321,7 @@ mod tests {
             engine_shutdown_timeout: std::time::Duration::from_secs(10),
             statement_timeout: None,
             max_transaction_age: None,
+            egress_stall_timeout: None,
         }
     }
 

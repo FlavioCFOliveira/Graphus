@@ -68,6 +68,8 @@ fn engine_with_timeout(timeout: Option<Duration>) -> Engine {
         clock,
         timeout,
         None,
+        // No egress-stall ceiling here (rmp #591): this gate exercises per-statement-timeout shapes.
+        None,
     )
     .expect("spawn threaded engine")
 }

@@ -273,6 +273,26 @@ pub struct Metrics {
     /// reader-pool worker's caught panic is accounted through the same counter at retirement).
     statement_panics: CachePad,
 
+    // ---- reliability (`rmp` #591, sprint-52 C-F1) ----
+    /// Off-thread reads **aborted because their consumer stalled the result-egress channel** past the
+    /// egress-stall ceiling (`egress_stall_timeout_ms`) — a non-draining / TCP zero-window consumer. Each
+    /// abort released the reader's MVCC snapshot (GC-watermark pin) and its reader-pool slot; a persistent
+    /// non-zero rate is an operator signal of clients that stop draining result streams (a slow-loris on
+    /// the read path), independent of whether a per-statement timeout is configured. Recorded from a
+    /// reader-pool worker thread (multi-writer), so cache-padded.
+    egress_stall_aborts: CachePad,
+
+    // ---- observability (`rmp` #591, sprint-52 D-#1) ----
+    /// The **retained SSI conflict-record count**, summed across every database engine (a gauge): the
+    /// size of each coordinator's `SsiTracker` `txns` table. Serializability REQUIRES retaining a
+    /// committed transaction's record until the GC low-water mark (`oldest_active_snapshot`) passes it, so
+    /// a single long-lived ACTIVE reader that pins the watermark makes this grow one entry per committed
+    /// write for the reader's whole lifetime — correct, but unbounded (`rmp` #591 D-#1). Surfacing it lets
+    /// an operator alert on that growth (and confirm the maintenance prune / the `rmp` #477 age reaper are
+    /// draining it). Published additively per engine (mirrors [`active_txns`](Self::active_txns)) so it
+    /// equals the SUM across databases, never whichever engine published last.
+    ssi_tracked: AtomicU64,
+
     // ---- reliability (`rmp` #409) ----
     /// Statement-recovery **double-panics** caught at the engine's recovery boundary (`rmp` #409): a
     /// statement panicked AND the subsequent rollback/commit that recovers it *also* panicked. A
@@ -332,6 +352,8 @@ impl Metrics {
             maintenance_stamps_frozen: AtomicU64::new(0),
             maintenance_failures: AtomicU64::new(0),
             statement_panics: CachePad::new(0),
+            egress_stall_aborts: CachePad::new(0),
+            ssi_tracked: AtomicU64::new(0),
             engine_recovery_panics: AtomicU64::new(0),
             per_db: RwLock::new(BTreeMap::new()),
         }
@@ -529,6 +551,56 @@ impl Metrics {
         self.statement_panics.load(Ordering::Relaxed)
     }
 
+    /// Records one off-thread read aborted at the **egress-stall ceiling** (`rmp` #591, C-F1): its
+    /// consumer stopped draining the result-egress channel past `egress_stall_timeout_ms`, so the reader
+    /// was terminated to release its GC-watermark pin and reader-pool slot. Recorded from the reader-pool
+    /// worker thread that observed the stall.
+    pub fn record_egress_stall_abort(&self) {
+        self.egress_stall_aborts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The number of off-thread reads aborted at the egress-stall ceiling so far (`rmp` #591, C-F1) —
+    /// observability / regression tests.
+    #[must_use]
+    pub fn egress_stall_aborts(&self) -> u64 {
+        self.egress_stall_aborts.load(Ordering::Relaxed)
+    }
+
+    /// Publishes a per-engine change to the **server-wide** retained-SSI-conflict-record gauge additively
+    /// (`rmp` #591, D-#1), mirroring [`add_active_txns_delta`](Self::add_active_txns_delta): the engine
+    /// reports the signed delta between its previously-published and current `SsiTracker` tracked length,
+    /// folded into the shared gauge so it always equals the SUM across every engine. A positive delta is a
+    /// `fetch_add`, a negative one a saturating `fetch_sub`; zero is a no-op. The per-engine "previous"
+    /// bookkeeping lives in [`crate::engine`]'s `ActiveTxnGauge`.
+    pub fn add_ssi_tracked_delta(&self, delta: i64) {
+        if delta > 0 {
+            self.ssi_tracked
+                .fetch_add(delta.unsigned_abs(), Ordering::Relaxed);
+        } else if delta < 0 {
+            let dec = delta.unsigned_abs();
+            let mut cur = self.ssi_tracked.load(Ordering::Relaxed);
+            loop {
+                let next = cur.saturating_sub(dec);
+                match self.ssi_tracked.compare_exchange_weak(
+                    cur,
+                    next,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(observed) => cur = observed,
+                }
+            }
+        }
+    }
+
+    /// The current server-wide retained-SSI-conflict-record gauge (`rmp` #591, D-#1) — the direct
+    /// witness of the unbounded-growth vector a long-lived active reader pins. Observability / tests.
+    #[must_use]
+    pub fn ssi_tracked(&self) -> u64 {
+        self.ssi_tracked.load(Ordering::Relaxed)
+    }
+
     /// Records one statement-recovery **double-panic** caught at the engine's recovery boundary
     /// (`rmp` #409): a statement panicked and its recovering rollback/commit *also* panicked. The engine
     /// degradation that drives `/health/ready` to `503` is flagged on the **per-engine**
@@ -719,6 +791,18 @@ impl Metrics {
             "graphus_statement_panics_total",
             "Statements whose execution panicked and was caught at the engine panic boundary (rmp #386).",
             self.statement_panics.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "graphus_egress_stall_aborts_total",
+            "Off-thread reads aborted because their consumer stalled the result-egress channel past the egress-stall ceiling (rmp #591).",
+            self.egress_stall_aborts.load(Ordering::Relaxed),
+        );
+        gauge(
+            &mut out,
+            "graphus_ssi_tracked_transactions",
+            "Retained SSI conflict records across all engines; grows while a long-lived active reader pins the GC watermark (rmp #591).",
+            self.ssi_tracked.load(Ordering::Relaxed),
         );
         counter(
             &mut out,

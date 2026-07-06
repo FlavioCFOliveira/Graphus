@@ -136,6 +136,13 @@ pub struct ReadRetirement {
 /// error/write-degrade (R3), as the `outcome`. The engine then merges + auto-commits.
 pub fn run_read_task<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>(
     task: ReadTask<D, S>,
+    // The pool-wide egress-stall ceiling (`rmp` #591 C-F1), captured once at [`ReadPool::spawn`]: the
+    // maximum no-progress wait an off-thread read may spend blocked on a full result-egress channel before
+    // it is aborted (releasing its GC-watermark pin + pool slot) — independent of the per-statement
+    // deadline. `None` disables it.
+    egress_stall_timeout: Option<std::time::Duration>,
+    // For the `graphus_egress_stall_aborts_total` counter, recorded when the ceiling trips.
+    metrics: &Metrics,
 ) -> ReadRetirement {
     let ReadTask {
         txn,
@@ -184,6 +191,8 @@ pub fn run_read_task<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send +
                 &mut authz,
                 &extensions,
                 deadline,
+                egress_stall_timeout,
+                metrics,
                 &row_tx,
                 row_rx,
                 // A fresh read-only summary sink; `run_cursor` fills it with the `r` query type
@@ -200,6 +209,8 @@ pub fn run_read_task<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send +
             &mut graph,
             &extensions,
             deadline,
+            egress_stall_timeout,
+            metrics,
             &row_tx,
             row_rx,
             // A fresh read-only summary sink; `run_cursor` fills it with the `r` query type before
@@ -298,6 +309,10 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     pub fn spawn(
         threads: usize,
         queue_capacity: usize,
+        // The pool-wide egress-stall ceiling (`rmp` #591 C-F1): threaded from the engine config into every
+        // worker so a stalled consumer releases its reader's GC-watermark pin + pool slot even when the
+        // per-statement timeout is disabled. Captured once here — it is a server policy, not per-task.
+        egress_stall_timeout: Option<std::time::Duration>,
         retire_tx: Sender<ReadRetirement>,
         metrics: Arc<Metrics>,
     ) -> Self {
@@ -320,7 +335,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 // the default ~2 MiB stack overflows on a legal at-the-limit query and a stack overflow
                 // aborts the whole process.
                 .stack_size(super::QUERY_ENGINE_STACK_SIZE)
-                .spawn(move || worker_loop(&work_rx, &retire_tx, &metrics))
+                .spawn(move || worker_loop(&work_rx, egress_stall_timeout, &retire_tx, &metrics))
                 // A failure to spawn a worker is a startup-time OS resource error; surfacing it as a
                 // panic here is acceptable (the server is coming up and the pool size is bounded/small).
                 .expect("INVARIANT: spawning a bounded reader worker thread");
@@ -360,6 +375,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
 /// channel is closed (engine gone), the send fails harmlessly and the worker drains the rest.
 fn worker_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>(
     work_rx: &Arc<std::sync::Mutex<Receiver<ReadTask<D, S>>>>,
+    egress_stall_timeout: Option<std::time::Duration>,
     retire_tx: &Sender<ReadRetirement>,
     metrics: &Metrics,
 ) {
@@ -409,7 +425,9 @@ fn worker_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync 
         let retirement = {
             let _morsel_width =
                 graphus_cypher::morsel::ReaderPoolWorkerGuard::enter_with_width(morsel_width);
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_read_task(task))) {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_read_task(task, egress_stall_timeout, metrics)
+            })) {
                 Ok(retirement) => retirement,
                 Err(panic_payload) => {
                     metrics.record_statement_panic();
