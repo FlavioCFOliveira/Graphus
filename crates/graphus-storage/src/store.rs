@@ -2296,9 +2296,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// the sweep clears. A firing means a committed version would be forgotten while still keyed by an
     /// unresolvable in-flight `TxnId` — which [`is_visible`](graphus_txn::is_visible) reads as
     /// **invisible**, i.e. silent lost committed data (the class the frontier carry-forward fix in
-    /// [`is_inflight_of_inflight_writer`](Self::is_inflight_of_inflight_writer) closes). Compiled out
-    /// entirely in release.
-    #[cfg(debug_assertions)]
+    /// [`is_inflight_of_inflight_writer`](Self::is_inflight_of_inflight_writer) closes). Compiled out in
+    /// an ordinary release build (the full-store scan is O(store) per GC pass), but **opt-in for release**
+    /// via the `check-cold-assert` feature (`rmp` #596): a paranoid deployment or a release certification
+    /// run can enable it to get an always-on runtime guard against this silent-lost-committed-data class,
+    /// not just the debug/DST coverage.
+    #[cfg(any(debug_assertions, feature = "check-cold-assert"))]
     fn debug_assert_freeze_complete(&self) {
         for kind in [StoreKind::Rel, StoreKind::Node, StoreKind::Prop] {
             let in_use = read_view::scan_in_use_mvcc(&self.pool, &self.stores, kind)
@@ -2320,10 +2323,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         }
     }
 
-    /// Release-build no-op counterpart of the debug-only W1 freeze-completeness guard (`rmp` #522):
-    /// the full-store scan it performs is purely a test/debug assertion, so it must cost nothing in an
-    /// optimized build.
-    #[cfg(not(debug_assertions))]
+    /// Release-build no-op counterpart of the W1 freeze-completeness guard (`rmp` #522/#596): the
+    /// full-store scan it performs is O(store) per GC pass, so it costs nothing in an ordinary optimized
+    /// build (enable the `check-cold-assert` feature to run it in release — see the active counterpart).
+    #[cfg(not(any(debug_assertions, feature = "check-cold-assert")))]
     #[inline]
     fn debug_assert_freeze_complete(&self) {}
 

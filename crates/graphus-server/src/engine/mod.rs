@@ -3096,10 +3096,22 @@ fn pipelined_group_commit<
 /// shared by the inline [`flush_commit_batch`] and the [`pipelined_group_commit`] paths.
 fn ack_prepared_commits(durable: u64, batch: &mut Vec<PendingCommit>, metrics: &Metrics, db: &str) {
     for pending in batch.drain(..) {
-        debug_assert!(
+        // ALWAYS-ON ack-after-fsync gate (`rmp` #596; was a `debug_assert!`). The group-commit harden
+        // MUST have advanced the durable watermark past every batched commit LSN before this committer is
+        // acked. If not, the durable-watermark accounting is corrupt — fail CLOSED with a controlled
+        // panic BEFORE any ack (exactly the fsyncgate posture: `04 §4.9`), never acknowledge a commit
+        // that is not yet `fdatasync`-durable (false durability — the cardinal ACID violation). The
+        // invariant holds by construction on every path (`target` = `written_len` at `begin_harden`;
+        // `complete_harden` makes `durable_len ≥ target > every batched commit_lsn`); promoting it to an
+        // always-on gate is the last-line guard that stops a future refactor from silently acking a
+        // non-durable commit in a release build. It is exact integer arithmetic — no false positive — and
+        // a controlled abort here is strictly safer than a false "committed" reply (which "drop without
+        // ack" would wrongly signal for an auto-commit, whose channel-close IS its success signal).
+        assert!(
             pending.commit_lsn().0 < durable,
-            "INVARIANT (ack-after-fsync, rmp #528/#532/#566): the group-commit harden must advance the \
-             durable watermark ({durable}) past every batched commit LSN ({})",
+            "INVARIANT VIOLATED (ack-after-fsync, rmp #528/#532/#566/#596): the group-commit harden did \
+             NOT advance the durable watermark ({durable}) past batched commit LSN ({}) — refusing to \
+             ack a non-durable commit",
             pending.commit_lsn().0
         );
         metrics.record_commit_for(db);
