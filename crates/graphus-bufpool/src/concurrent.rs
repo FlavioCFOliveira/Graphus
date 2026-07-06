@@ -135,10 +135,15 @@ const SHARD_COUNT: usize = 64;
 
 /// Bound on `fetch`/`new_page` victim-acquisition retries before giving up. A retry happens only on a
 /// **transient** condition — a lost hit-race, a peer already `Loading` the same page, or an empty
-/// victim sweep ([`VictimChoice::Contended`] *or* [`VictimChoice::AllPinned`], BOTH transient under a
-/// correct workload — see the miss-arm of [`ConcurrentBufferPool::fetch`] for why even "every frame
-/// pinned right now" clears microseconds later, a property `loom_fetch_under_contention_never_
-/// spuriously_fails` proves). Each retry first backs off (see [`Backoff`]): the loop spreads
+/// victim sweep ([`VictimChoice::Contended`] *or* a **transient** [`VictimChoice::AllPinned`]
+/// snapshot, both of which clear under a correct workload — see the miss-arm of
+/// [`ConcurrentBufferPool::fetch`] for why even "every frame pinned right now" clears microseconds
+/// later, a property `loom_fetch_under_contention_never_spuriously_fails` proves). A **sustained**
+/// `AllPinned` run (a real caller pin-leak / a genuinely full pool) is caught far sooner by the
+/// separate, shorter [`PERSISTENT_ALL_PINNED_SWEEPS`] bound (`rmp` #594 D-#4); this 1 M cap remains the
+/// backstop for the transient `Contended` live-lock, which still retries the *full* budget so the
+/// `rmp` #359 read-integrity fix is untouched. Each retry first backs off (see [`Backoff`]): the loop
+/// spreads
 /// heavily-contended threads out in *time* so the in-flight loader/holder herd drains and a victim
 /// becomes takeable, instead of re-contending the same latches in lockstep (the positive-feedback
 /// live-lock the measured `rmp` #359 spurious-fetch-error came from — a *tight* retry made the
@@ -154,6 +159,37 @@ const SHARD_COUNT: usize = 64;
 /// loaded; 1 M is comfortable headroom). The magnitude is irrelevant to loom (it resolves each retry
 /// the instant a peer releases its latch, in a handful of model yields, never approaching the cap).
 const MAX_FETCH_RETRIES: usize = 1_000_000;
+
+/// Consecutive [`VictimChoice::AllPinned`] sweeps — with **no** interleaved progress — after which
+/// `fetch`/`new_page` stop retrying and surface the clear "pool full of pinned pages" error, well
+/// before the full [`MAX_FETCH_RETRIES`] live-lock budget (`rmp` #594 D-#4).
+///
+/// ## Why a *separate*, shorter bound for `AllPinned` — and why it cannot regress `rmp` #359
+///
+/// [`ConcurrentBufferPool::select_victim`] distinguishes two empty-sweep reasons ([`VictimChoice`]).
+/// [`VictimChoice::Contended`] (an unpinned frame exists but was momentarily latch-contended) is the
+/// **transient** #359 case and MUST keep retrying the *full* `MAX_FETCH_RETRIES` budget — erroring on
+/// it is the exact read-integrity regression (#359/#339, a spurious `Err` swallowed into `Value::Null`)
+/// this must never reintroduce. This shorter bound is applied ONLY to the *other* outcome,
+/// [`VictimChoice::AllPinned`] (literally **every** frame pinned this sweep), and ONLY when it is
+/// **sustained**: the caller resets the counter to zero on ANY interleaved progress — a hit, a peer
+/// `Loading`, a lost-pin-race `Ready`, OR a `Contended` sweep (an unpinned frame is/was present). So
+/// the error trips only after this many sweeps *in a row* all saw the pool wholly pinned with not one
+/// evictable frame appearing between them — the signature of a genuine caller **pin leak** or true
+/// capacity exhaustion (e.g. a fully-pinned pool), which no further retry can resolve.
+///
+/// Under a correct concurrent-reader workload `AllPinned` is observed **zero** times (the misses are
+/// 100% `Contended`; `eviction_chain_repro.rs` asserts `all_pinned == 0` whenever readers < frames),
+/// and a genuine *transient* all-pinned snapshot (the lone free frame pinned by a peer loader in the
+/// instant between its load-publish and the caller's unpin) clears in microseconds — the very next
+/// sweep sees an unpinned frame and resets the counter. So a sustained run of `100_000` PURE
+/// (progress-free) `AllPinned` sweeps cannot arise transiently; it is unreachable except under a real
+/// leak / capacity wall. The value is deliberately generous — 100 k is ≈ 30× the measured clean-run
+/// worst case (~3.5 k) yet 10× shorter than the 1 M live-lock backstop — so even a scheduler-starved
+/// host never trips it spuriously, while still turning a genuinely wedged pool into a clear error ~10×
+/// sooner. Irrelevant to loom (which resolves each retry in a handful of model yields, never
+/// approaching either bound).
+const PERSISTENT_ALL_PINNED_SWEEPS: usize = 100_000;
 
 /// The reservation state of a page, as recorded in a frame-table shard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -553,23 +589,36 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
                 self.frames[idx].pin_count.fetch_add(1, Ordering::Acquire);
                 self.frames[idx].ref_bit.store(1, Ordering::Relaxed);
                 drop(shard);
+                // Own the pin in an RAII guard BEFORE taking the read latch, so a panic in `func`
+                // (or the lost-race fall-through below) still runs the matching `unpin` on unwind
+                // (`rmp` #594) instead of stranding the frame permanently unevictable. `guard` is
+                // declared before `meta`, and Rust drops locals in reverse declaration order, so on
+                // every scope exit — normal return OR unwinding — the later-declared `meta` (the read
+                // latch) drops FIRST and `guard` (the `unpin`) SECOND: the pre-existing
+                // latch-before-unpin discipline (`rmp` #337 Slice 1) is preserved with no second latch
+                // acquisition and no extra per-hit cost.
+                let guard = self.pin_guard(PinnedFrame(idx));
                 let meta = unwrap_lock(self.frames[idx].meta.read());
                 if meta.page_id == Some(page_id) {
                     let r = func(&meta.data);
-                    drop(meta);
-                    self.unpin(PinnedFrame(idx));
+                    drop(meta); // release the read latch first...
+                    drop(guard); // ...then the pin, matching the historical ordering.
                     return Ok(r);
                 }
-                // Lost the race with an evictor between lookup and pin: fall through to the slow path.
+                // Lost the race with an evictor between lookup and pin: release the latch then the
+                // pin (via the guard) and fall through to the slow path.
                 drop(meta);
-                self.unpin(PinnedFrame(idx));
+                drop(guard);
             }
         }
         // Cold path (miss / Loading / lost race): the full fetch keeps the load-once + publish-before-
-        // pin guarantees, then read under a fresh latch.
+        // pin guarantees, then read under a fresh latch. Own the pin in a guard so a panic in `func`
+        // inside `with_page` unpins on unwind (`rmp` #594) rather than stranding the frame; `with_page`
+        // manages (and releases) its own read latch, so here only the pin needs guarding.
         let f = self.fetch(page_id)?;
+        let guard = self.pin_guard(f);
         let r = self.with_page(f, func);
-        self.unpin(f);
+        drop(guard);
         Ok(r)
     }
 
@@ -625,6 +674,21 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         self.slot(f).pin_count.load(Ordering::Acquire)
     }
 
+    /// Wraps an already-established pin — one the caller has just published with
+    /// `pin_count.fetch_add(1, …)` — in a [`PinGuard`] whose `Drop` runs the matching
+    /// [`unpin`](Self::unpin) on **every** exit path, including a panic in a visit closure
+    /// (`rmp` #594). The caller must NOT also call `unpin` for this frame: the guard becomes the
+    /// single owner of the pin, and a second `unpin` would double-decrement and break the
+    /// strictly-additive pin invariant (`fetch_add` ⇔ exactly one `unpin`) the eviction protocol
+    /// relies on. Release the pin by dropping the guard (at scope end or via `drop(guard)`).
+    #[inline]
+    fn pin_guard(&self, f: PinnedFrame) -> PinGuard<'_, D, W> {
+        PinGuard {
+            pool: self,
+            frame: f,
+        }
+    }
+
     /// Fetches `page_id`, loading it from the device on a miss (verifying its checksum) and
     /// pinning it. Concurrent fetches of the same missing page perform **exactly one** device
     /// read; all callers receive a consistent, pinned view.
@@ -641,6 +705,11 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         // cheapest step whenever real progress is made (a load completes), so an unrelated later
         // transient does not inherit a long backoff.
         let mut backoff = Backoff::new();
+        // Consecutive PURE `AllPinned` sweeps with no interleaved progress (`rmp` #594 D-#4). Reset to
+        // zero on ANY progress below (a hit returns; a lost-pin-race `Ready`, a peer `Loading`, and a
+        // `Contended` sweep each reset before retrying); only an uninterrupted run trips the shorter
+        // [`PERSISTENT_ALL_PINNED_SWEEPS`] error, never the transient #359 `Contended` live-lock.
+        let mut consecutive_all_pinned = 0usize;
         #[cfg(feature = "bufpool-probe")]
         let mut iter = 0u64;
         for _ in 0..MAX_FETCH_RETRIES {
@@ -663,6 +732,7 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
                         }
                         drop(meta);
                         self.unpin(PinnedFrame(idx)); // lost the race; undo and retry
+                        consecutive_all_pinned = 0; // progress: a `Ready` frame existed (not all-pinned)
                         #[cfg(feature = "bufpool-probe")]
                         {
                             iter += 1;
@@ -673,6 +743,7 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
                     Some(Slot::Loading(_)) => {
                         // Another thread is loading this exact page; back off (let it finish) and retry.
                         drop(shard);
+                        consecutive_all_pinned = 0; // progress: a peer load is in flight
                         #[cfg(feature = "bufpool-probe")]
                         {
                             iter += 1;
@@ -681,38 +752,77 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
                         continue;
                     }
                     None => {
-                        // Miss: reserve a victim while still holding the shard lock. BOTH empty-sweep
-                        // outcomes — `Contended` (an unpinned frame exists but is momentarily write-
-                        // latched) and `AllPinned` (every frame pinned *this instant*) — are **transient**
-                        // under a correct workload, so BOTH retry (bounded by `MAX_FETCH_RETRIES`), never
-                        // fail fast (`rmp` #359).
+                        // Miss: reserve a victim while still holding the shard lock. A `Contended`
+                        // sweep (an unpinned frame exists but is momentarily write-latched) and a
+                        // *single* `AllPinned` snapshot (every frame pinned *this instant*) are BOTH
+                        // **transient** under a correct workload, so both back off and retry (bounded by
+                        // `MAX_FETCH_RETRIES`), never fail fast on one occurrence (`rmp` #359).
                         //
-                        // Why `AllPinned` is transient too (the loom-proven subtlety): a frame's pin is
-                        // held only across a single record decode (`with_page_fetched` pins, decodes,
-                        // unpins) or across the publish window of a concurrent loader (`fetch` pins its
-                        // freshly-loaded frame just before returning, and the caller unpins after the
-                        // decode). So a snapshot where *every* frame happens to be pinned right now (e.g.
-                        // the one free frame is pinned by a peer loader in the instant between its load-
-                        // publish and the caller's unpin) clears microseconds later. Erroring on it was a
-                        // spurious `Err("buffer pool is full of pinned pages")` that the read-view chain
-                        // swallows into `Value::Null` via the `Option`-returning `GraphAccess::node_property`
-                        // — a present property silently read as absent (the #339 read-integrity violation),
-                        // seen ONLY under eviction since a pool >= the working set never misses-needing-a-
-                        // victim. The `VictimChoice` 3-state split is kept ONLY for probe diagnostics (it
-                        // tells *why* a sweep was empty); it does NOT change control flow. The escalating
-                        // `backoff` drains the loader/holder herd so this converges instead of live-locking;
-                        // `MAX_FETCH_RETRIES` bounds it so a pool genuinely wedged by a *long-lived* pin
-                        // leak (a caller bug) still terminates with the clear post-loop error.
+                        // Why a single `AllPinned` is transient too (the loom-proven subtlety): a frame's
+                        // pin is held only across a single record decode (`with_page_fetched` pins,
+                        // decodes, unpins) or across the publish window of a concurrent loader (`fetch`
+                        // pins its freshly-loaded frame just before returning, and the caller unpins after
+                        // the decode). So a snapshot where *every* frame happens to be pinned right now
+                        // (e.g. the one free frame is pinned by a peer loader in the instant between its
+                        // load-publish and the caller's unpin) clears microseconds later. Erroring on it
+                        // was a spurious `Err("buffer pool is full of pinned pages")` that the read-view
+                        // chain swallows into `Value::Null` via the `Option`-returning
+                        // `GraphAccess::node_property` — a present property silently read as absent (the
+                        // #339 read-integrity violation), seen ONLY under eviction since a pool >= the
+                        // working set never misses-needing-a-victim.
+                        //
+                        // The one refinement (`rmp` #594 D-#4): a `Contended` sweep resets
+                        // `consecutive_all_pinned` and retries the FULL budget (the #359 fix is exact and
+                        // untouched), while a **sustained** run of PURE `AllPinned` sweeps — the pool
+                        // wholly pinned with not one evictable frame appearing between them, the signature
+                        // of a genuine caller pin-leak or true capacity — trips the shorter
+                        // `PERSISTENT_ALL_PINNED_SWEEPS` error ~10× sooner. The `VictimChoice` split now
+                        // drives that one distinction (and still feeds probe diagnostics); the escalating
+                        // `backoff` drains the loader/holder herd so a transient case converges instead of
+                        // live-locking, and `MAX_FETCH_RETRIES` remains the backstop for `Contended`.
                         match self.select_victim() {
                             VictimChoice::Found(victim) => {
                                 shard.insert(page_id, Slot::Loading(victim.idx));
                                 victim
                                 // shard lock dropped here
                             }
-                            VictimChoice::Contended | VictimChoice::AllPinned => {
-                                // Transient victim scarcity: drop the shard lock (hold NO lock across the
-                                // wait), back off, and retry — the next sweep finds the freed victim.
+                            VictimChoice::Contended => {
+                                // An unpinned frame exists but was momentarily latch-contended — the
+                                // **transient** #359 case. Drop the shard lock (hold NO lock across the
+                                // wait), reset the persistent-all-pinned signal (a victim is destined to
+                                // free), back off, and retry the FULL budget — the next sweep finds it.
                                 drop(shard);
+                                consecutive_all_pinned = 0;
+                                #[cfg(feature = "bufpool-probe")]
+                                {
+                                    iter += 1;
+                                }
+                                backoff.spin();
+                                continue;
+                            }
+                            VictimChoice::AllPinned => {
+                                // Every frame pinned this sweep. A SINGLE such snapshot is still transient
+                                // (the lone free frame pinned by a peer loader between its load-publish and
+                                // the caller's unpin), so we back off and retry like `Contended`. But if it
+                                // is SUSTAINED for `PERSISTENT_ALL_PINNED_SWEEPS` consecutive sweeps with no
+                                // interleaved progress, the pool is genuinely wedged by long-lived pins (a
+                                // caller pin-leak) or truly at capacity — no further retry can conjure a
+                                // victim — so fail with the clear error ~10× sooner than the full budget
+                                // (`rmp` #594 D-#4). Only a PURE run trips: any progress above reset the
+                                // counter, so this never fires on the transient #359 contention.
+                                drop(shard);
+                                consecutive_all_pinned += 1;
+                                if consecutive_all_pinned >= PERSISTENT_ALL_PINNED_SWEEPS {
+                                    return Err(GraphusError::Storage(format!(
+                                        "fetch of page {} found the buffer pool full of pinned pages for \
+                                         {PERSISTENT_ALL_PINNED_SWEEPS} consecutive victim sweeps with no \
+                                         evictable frame appearing between them — the pool is wedged by \
+                                         long-lived pins (a caller pin-leak) or genuinely at capacity; a \
+                                         transient all-pinned snapshot clears in microseconds, so a run \
+                                         this sustained cannot be transient",
+                                        page_id.0
+                                    )));
+                                }
                                 #[cfg(feature = "bufpool-probe")]
                                 {
                                     iter += 1;
@@ -788,21 +898,44 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
     /// (WAL rule / device write), or extending the device fails.
     pub fn new_page(&self) -> Result<(PinnedFrame, PageId)> {
         // Reserve a victim first so a fully-pinned pool fails before we grow the device. As in `fetch`'s
-        // miss-arm, BOTH empty-sweep outcomes are **transient** under a correct workload — `Contended`
-        // (an unpinned frame momentarily write-latched) and `AllPinned` (every frame pinned *this
-        // instant*, e.g. the lone free frame pinned by a peer loader between its load-publish and the
-        // caller's unpin) — so BOTH retry with the escalating backoff that drains the holder herd, never
-        // surfacing a spurious "full" error (`rmp` #359; the `AllPinned`-is-also-transient subtlety is
-        // loom-proven by `loom_fetch_under_contention_never_spuriously_fails`). The `VictimChoice` split
-        // is kept ONLY for probe diagnostics, not control flow. No lock is held here, so the retry is a
-        // plain backed-off loop, bounded by `MAX_FETCH_RETRIES` so a pool genuinely wedged by long-lived
-        // pins (a caller bug) still terminates with a clear error.
+        // miss-arm, a `Contended` sweep (an unpinned frame momentarily write-latched) and a *single*
+        // `AllPinned` snapshot (every frame pinned *this instant*, e.g. the lone free frame pinned by a
+        // peer loader between its load-publish and the caller's unpin) are BOTH **transient** under a
+        // correct workload, so both retry with the escalating backoff that drains the holder herd, never
+        // surfacing a spurious "full" error on one occurrence (`rmp` #359; the single-`AllPinned`-is-also-
+        // transient subtlety is loom-proven by `loom_fetch_under_contention_never_spuriously_fails`).
+        // D-#4 (`rmp` #594): a `Contended` sweep resets the persistent-all-pinned counter and retries the
+        // FULL budget, while a **sustained** PURE `AllPinned` run (a genuine pin-leak / true capacity,
+        // e.g. `a_fully_pinned_pool_cannot_evict`) trips the shorter `PERSISTENT_ALL_PINNED_SWEEPS` error
+        // ~10× sooner. No lock is held here, so the retry is a plain backed-off loop; `MAX_FETCH_RETRIES`
+        // remains the `Contended` backstop.
         let mut backoff = Backoff::new();
+        let mut consecutive_all_pinned = 0usize;
         let mut victim = 'pick: {
             for _ in 0..MAX_FETCH_RETRIES {
                 match self.select_victim() {
                     VictimChoice::Found(v) => break 'pick v,
-                    VictimChoice::Contended | VictimChoice::AllPinned => {
+                    VictimChoice::Contended => {
+                        // Transient: an unpinned frame exists — reset the persistent signal and retry.
+                        consecutive_all_pinned = 0;
+                        backoff.spin();
+                        continue;
+                    }
+                    VictimChoice::AllPinned => {
+                        // Sustained PURE all-pinned ⇒ genuine capacity / pin-leak: fail ~10× sooner than
+                        // the full live-lock budget. A single snapshot is still transient (#359), so only
+                        // an uninterrupted consecutive run trips.
+                        consecutive_all_pinned += 1;
+                        if consecutive_all_pinned >= PERSISTENT_ALL_PINNED_SWEEPS {
+                            return Err(GraphusError::Storage(format!(
+                                "new_page found the buffer pool full of pinned pages for \
+                                 {PERSISTENT_ALL_PINNED_SWEEPS} consecutive victim sweeps with no \
+                                 evictable frame appearing between them — the pool is wedged by \
+                                 long-lived pins (a caller pin-leak) or genuinely at capacity; a \
+                                 transient all-pinned snapshot clears in microseconds, so a run this \
+                                 sustained cannot be transient"
+                            )));
+                        }
                         backoff.spin();
                         continue;
                     }
@@ -1414,6 +1547,47 @@ struct Victim<'a> {
     guard: RwLockWriteGuard<'a, FrameMeta>,
 }
 
+/// An RAII guard that owns one frame **pin** and releases it (via
+/// [`ConcurrentBufferPool::unpin`]) exactly once when it drops — on the normal return, on any early
+/// `?`/`return`, AND on **unwind** if a visit closure passed to
+/// [`with_page`](ConcurrentBufferPool::with_page) /
+/// [`with_page_fetched`](ConcurrentBufferPool::with_page_fetched) **panics** (`rmp` #594).
+///
+/// # Why this exists (panic-safety of the pin → visit → unpin window)
+///
+/// The hot read paths pin a frame (`pin_count.fetch_add(1, Acquire)`), run a caller closure over the
+/// page bytes under the frame's read latch, then `unpin`. If that closure panics, the *latch* (a
+/// `parking_lot`/`std` guard) is released as the stack unwinds, but a bare `self.unpin(f)` written
+/// *after* the closure is **never reached** — the pin is stranded forever, the frame permanently
+/// unevictable. One stranded frame per panic is enough to eventually turn
+/// [`select_victim`](ConcurrentBufferPool::select_victim) into an `AllPinned`/`Contended` backoff
+/// storm and finally the "could not reserve a victim" error — a latent availability cliff. Routing the
+/// pin through this guard makes the matching `unpin` run on *every* exit path, so a panicking closure
+/// leaves the pin count **exactly balanced** (the frame stays evictable). The guard owns no resource
+/// other than the logical pin, so its `Drop` is just the one `unpin` — no measurable per-hit cost.
+///
+/// # Ordering (hit path)
+///
+/// On the `with_page_fetched` hit path the read latch MUST be released before the `unpin` (`rmp` #337
+/// Slice 1). The guard is therefore constructed **before** the latch is taken: Rust drops locals in
+/// reverse declaration order, so on scope exit (normal or unwinding) the later-declared latch drops
+/// first and this earlier-declared guard (the `unpin`) drops second — preserving the historical
+/// latch-before-unpin discipline with no second latch acquisition.
+#[must_use = "a PinGuard must be held until the pin should be released; dropping it early unpins the frame"]
+struct PinGuard<'a, D: BlockDevice, W: WalRule> {
+    pool: &'a ConcurrentBufferPool<D, W>,
+    frame: PinnedFrame,
+}
+
+impl<D: BlockDevice, W: WalRule> Drop for PinGuard<'_, D, W> {
+    fn drop(&mut self) {
+        // The sole action: release the pin this guard owns. `unpin` is a saturating `Release`
+        // decrement, balanced against the caller's `fetch_add(1)` exactly once — the strictly-additive
+        // pin invariant the whole eviction protocol relies on.
+        self.pool.unpin(self.frame);
+    }
+}
+
 /// The outcome of one bounded [`ConcurrentBufferPool::select_victim`] sweep. Separating the two
 /// failure modes is the crux of the `rmp` #359 read-integrity fix: a transient contention must
 /// **retry** (with backoff), never surface as an error — collapsing it into the genuine-capacity case
@@ -1422,10 +1596,15 @@ struct Victim<'a> {
 enum VictimChoice<'a> {
     /// An evictable victim, with its write latch already held.
     Found(Victim<'a>),
-    /// **Every** frame examined this sweep was pinned: the genuine "buffer pool full of pinned pages"
-    /// capacity limit. The caller fails fast — a pinned frame will not free until its holder unpins, so
-    /// retrying cannot conjure a victim. (Instrumentation: this is observed **zero** times under a
-    /// concurrent-reader eviction storm; it indicates a real caller pin-leak, not normal pressure.)
+    /// **Every** frame examined this sweep was pinned. A *single* such snapshot is still **transient**
+    /// (the lone free frame pinned by a peer loader in the instant between its load-publish and the
+    /// caller's unpin), so the caller backs off and retries — erroring on one occurrence is the exact
+    /// `rmp` #359/#339 read-integrity regression. Only a **sustained** run of `PERSISTENT_ALL_PINNED_SWEEPS`
+    /// consecutive `AllPinned` sweeps with no interleaved progress — the genuine "buffer pool full of
+    /// pinned pages" capacity limit, or a caller pin-leak — trips the clear error (`rmp` #594 D-#4), since
+    /// no further retry can conjure a victim. (Instrumentation: `AllPinned` is observed **zero** times
+    /// under a concurrent-reader eviction storm with readers < frames; a persistent run indicates a real
+    /// pin-leak / capacity wall, not normal pressure.)
     AllPinned,
     /// At least one frame was **unpinned** but could not be taken this sweep (its write latch was
     /// momentarily held by a concurrent reader/loader, or it was given a CLOCK second chance).
@@ -1736,6 +1915,149 @@ mod tests {
         let g = p.fetch(a).unwrap(); // miss -> reload, checksum verified
         assert_eq!(p.with_page(g, |page| page[100]), 0xAA);
         p.unpin(g);
+    }
+
+    /// `rmp` #594 (acceptance criterion 1): a panic **inside** a `with_page_fetched` visit closure must
+    /// leave the pin count exactly balanced — the RAII [`PinGuard`] runs the matching `unpin` on unwind,
+    /// so the frame stays evictable rather than being stranded permanently unevictable. Covers the HIT
+    /// fast path (the panic fires under the single re-validated read latch).
+    #[test]
+    fn with_page_fetched_hit_panic_leaves_pin_balanced_and_frame_evictable() {
+        // Cap 1 makes evictability a hard, observable property: if the panicking read stranded its pin,
+        // the later `new_page` (which must evict this only frame) would spin to the persistent-all-pinned
+        // bound and error. With the guard the pin is released on unwind, so the frame stays evictable.
+        let p = pool(1);
+        let (fa, a) = p.new_page().unwrap();
+        p.with_page_mut(fa, |page| page[100] = 0xAA);
+        p.flush(fa).unwrap();
+        p.unpin(fa);
+        assert_eq!(
+            p.pin_count(fa),
+            0,
+            "precondition: page resident and unpinned"
+        );
+
+        // Hit fast path with a deliberately panicking visit closure.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = p.with_page_fetched(a, |_page| -> u8 { panic!("boom in hit-path visit") });
+        }));
+        assert!(panicked.is_err(), "the visit closure must have panicked");
+
+        // The pin the hit path took must have been released on unwind (RAII), NOT stranded.
+        assert_eq!(
+            p.pin_count(fa),
+            0,
+            "a panicking with_page_fetched visit must leave the pin balanced (frame evictable)"
+        );
+
+        // Prove evictability directly: the frame is the pool's ONLY frame, so allocating a new page
+        // must evict it. A leaked pin would instead ride the retry bound and error here.
+        let (fb, _b) = p
+            .new_page()
+            .expect("the only frame must be evictable after the panicked read");
+        p.unpin(fb);
+        // And the original page (flushed before the panic) reloads intact.
+        assert_eq!(p.with_page_fetched(a, |page| page[100]).unwrap(), 0xAA);
+    }
+
+    /// `rmp` #594 (acceptance criterion 1): the COLD/miss path of `with_page_fetched` is equally
+    /// panic-safe — the panic fires inside `with_page` after the full `fetch`, and the guard still
+    /// unpins on unwind so the reloaded frame is not stranded.
+    #[test]
+    fn with_page_fetched_miss_panic_leaves_pin_balanced() {
+        let p = pool(1);
+        let (fa, a) = p.new_page().unwrap();
+        p.with_page_mut(fa, |page| page[100] = 0xAA);
+        p.flush(fa).unwrap();
+        p.unpin(fa);
+        // Evict `a` so the next access takes the MISS fallback (fetch -> with_page -> panic).
+        let (fb, _b) = p.new_page().unwrap();
+        p.unpin(fb);
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = p.with_page_fetched(a, |_page| -> u8 { panic!("boom in miss-path visit") });
+        }));
+        assert!(panicked.is_err(), "the visit closure must have panicked");
+
+        // The reloaded frame's pin must be balanced; the pool (cap 1) must stay evictable.
+        let (fc, _c) = p
+            .new_page()
+            .expect("the reloaded frame must be evictable after the panicked miss read");
+        p.unpin(fc);
+        // Every frame is unpinned.
+        for slot in &p.frames {
+            assert_eq!(
+                slot.pin_count.load(Ordering::Acquire),
+                0,
+                "a panicking miss read must leave no stranded pin"
+            );
+        }
+    }
+
+    /// `rmp` #594 (acceptance criterion 1): the raw `fetch` -> `with_page` -> `unpin` triple — the shape
+    /// used across the codebase — is panic-safe when its pin is owned by a [`PinGuard`]. A panic in the
+    /// `with_page` visit closure runs the guard's `Drop` on unwind, balancing the pin.
+    #[test]
+    fn pin_guard_balances_the_fetch_with_page_triple_on_panic() {
+        let p = pool(2);
+        let (fa, a) = p.new_page().unwrap();
+        p.with_page_mut(fa, |page| page[7] = 0x5);
+        p.flush(fa).unwrap();
+        p.unpin(fa);
+
+        // Call-site pattern: fetch -> (guard owns the pin) -> with_page(panicking) -> drop(guard). On
+        // unwind the explicit `drop(guard)` is skipped, but the guard's `Drop` still runs the `unpin`.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let f = p.fetch(a).unwrap();
+            let guard = p.pin_guard(f);
+            let _ = p.with_page(f, |_page| -> u8 { panic!("boom in triple") });
+            drop(guard);
+        }));
+        assert!(panicked.is_err(), "the visit closure must have panicked");
+        assert_eq!(
+            p.pin_count(fa),
+            0,
+            "the PinGuard must release the pin on unwind, leaving the triple balanced"
+        );
+
+        // Evictable: fill both frames with fresh pages (must evict `a`), then reload `a` intact.
+        let (f1, _id1) = p.new_page().unwrap();
+        let (f2, _id2) = p.new_page().unwrap();
+        p.unpin(f1);
+        p.unpin(f2);
+        assert_eq!(p.with_page_fetched(a, |page| page[7]).unwrap(), 0x5);
+    }
+
+    /// `rmp` #594 (D-#4, regression): a fetch that needs a victim while EVERY frame is pinned for a
+    /// **sustained** stretch (a genuine capacity wall / pin-leak, here the single frame pinned for the
+    /// whole test) must surface the clear error via [`PERSISTENT_ALL_PINNED_SWEEPS`] and terminate —
+    /// NOT spin the full 1 M budget, and NOT serve a wrong result. This exercises the fetch miss-arm's
+    /// `AllPinned` branch; the transient-`Contended` #359 path keeps its full budget (proven by the
+    /// `eviction_chain_repro` / loom storm tests, which never trip this because a victim always frees).
+    #[test]
+    fn fetch_on_a_sustained_all_pinned_pool_surfaces_the_clear_error() {
+        let p = pool(1);
+        // Put page 0 on disk, then evict it into disk by allocating page 1 into the single frame;
+        // page 1 stays PINNED (f1 never unpinned) for the rest of the test — a sustained all-pinned.
+        let (f0, p0) = p.new_page().unwrap();
+        p.with_page_mut(f0, |page| page[10] = 0x1);
+        p.flush(f0).unwrap();
+        p.unpin(f0);
+        let (_f1, _p1) = p.new_page().unwrap(); // evicts p0 (clean) to disk; p1 resident AND pinned
+
+        // Fetch the on-disk-but-not-resident p0: it misses, finds the one frame pinned on every sweep,
+        // and — because that all-pinned condition never clears — surfaces the clear D-#4 error.
+        let r = p.fetch(p0);
+        assert!(
+            r.is_err(),
+            "a fetch needing a victim in a sustained-all-pinned pool must surface the clear error, \
+             not spin or return a wrong page"
+        );
+        let msg = format!("{}", r.unwrap_err());
+        assert!(
+            msg.contains("consecutive victim sweeps"),
+            "the error must be the D-#4 persistent-all-pinned message, got: {msg}"
+        );
     }
 
     #[test]
