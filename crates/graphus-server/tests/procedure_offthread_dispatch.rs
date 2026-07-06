@@ -26,7 +26,12 @@
 #![cfg(feature = "internal-test-udf")]
 
 use std::sync::Arc;
+// Only the `#[cfg(target_os = "linux")]` multi-core measurement test below uses these; gate the
+// imports to match, so a non-Linux target (e.g. the macOS CI leg) does not see them as unused under
+// `-D warnings`.
+#[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(target_os = "linux")]
 use std::time::Instant;
 
 use graphus_core::Value;
