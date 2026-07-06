@@ -125,25 +125,6 @@ const WAL_STORE_RATIO_TARGET: u64 = 4;
 /// is immaterial against the per-commit group-commit fsyncs already on the write path.
 const MAINTENANCE_CHECKPOINT_MIN_INTERVAL_BYTES: u64 = 8 * 1024 * 1024;
 
-/// WAL-growth interval used **instead of** [`MAINTENANCE_CHECKPOINT_INTERVAL_BYTES`] while a network
-/// bulk-import Mode A session (`rmp` #519/#521, `08 §5.1`) is `Loading` a database — a stopgap
-/// (`rmp` #522 tracks the general fix) for a measured **O(N²) total cost** in the maintenance cadence:
-/// each pass's `TxnCoordinator::checkpoint` runs a full-store GC scan whose cost is proportional to the
-/// *current total store size*, not to bytes written since the last pass, so passes get steadily more
-/// expensive as a bulk import grows the store — and Mode A batches only ever *create*, never delete, so
-/// each pass finds almost nothing to reclaim (measured: ~100 reclaimed out of ~500-570k scanned,
-/// repeatedly). At the default interval this was measured to consume 85%+ of wall time on a
-/// multi-million-row Mode A load (9 passes, 1.7s → 18s each as the store grew, while ingest itself
-/// blocks on the single engine thread for the whole pass). Since total maintenance overhead scales as
-/// `O(total_bytes² / interval)`, widening the interval here by 16x cuts it by the same factor.
-///
-/// This is deliberately **not zero** (unlike skipping maintenance entirely for the session, which would
-/// let WAL/RAM grow fully unbounded for a session that can run for hours over hundreds of GB — too
-/// risky on a low-RAM host): a `Loading` database is still exclusive to one session and has its own
-/// disk-space preflight/re-check (`BulkImportConfig::min_free_disk_bytes`), so an occasional pass still
-/// bounds the worst case, just far less often than ordinary concurrent-traffic writes need.
-const MAINTENANCE_CHECKPOINT_INTERVAL_BYTES_DURING_LOADING: u64 = 4 * 1024 * 1024 * 1024;
-
 /// After this many **consecutive** background maintenance checkpoint failures, reclamation is treated
 /// as persistently stalled and this database's engine is flagged **degraded** (`rmp` #394/#435): the
 /// **per-engine** [`MaintenanceDegraded`] flag flips, which drives `/health/ready` to `503` for that
@@ -1151,30 +1132,26 @@ fn finish_reader<D: BlockDevice, S: LogSink>(
 /// `consecutive_failures` is owned by the engine loop and threaded in by `&mut` so the streak persists
 /// across maintenance ticks (each tick processes at most one checkpoint).
 ///
-/// `loading_session_active` selects [`MAINTENANCE_CHECKPOINT_INTERVAL_BYTES_DURING_LOADING`] over the
-/// ordinary [`MAINTENANCE_CHECKPOINT_INTERVAL_BYTES`] — see that constant's doc comment for why a Mode A
-/// bulk-import session needs a much wider cadence (the measured O(N²) maintenance-cost finding).
-fn maintenance_interval_bytes(loading_session_active: bool, store_bytes: u64) -> u64 {
-    if loading_session_active {
-        // A `Loading` Mode A session keeps the wide fixed cadence unchanged: it only ever creates rows
-        // (each GC pass finds almost nothing to reclaim) and the pass cost is O(total store size), so a
-        // proportional cadence would still add passes to a delicate, force-detach-adjacent path
-        // (`rmp` #521/#522/#565). The post-load WAL backlog is reclaimed by the ordinary adaptive cadence
-        // below after the next `START DATABASE` (`rmp` #565), on the live database.
-        MAINTENANCE_CHECKPOINT_INTERVAL_BYTES_DURING_LOADING
-    } else {
-        // Adaptive cadence (`rmp` #556): reclaim proportionally to the live store size so the on-disk
-        // WAL/store ratio is bounded to ≈ WAL_STORE_RATIO_TARGET, instead of at a fixed absolute
-        // threshold that leaves a small OLTP store with a WAL tens of times its size. Clamped so a tiny
-        // store is not checkpointed on a hair-trigger (FLOOR) and a large store is never checkpointed
-        // *less* often than the historical 256 MiB cadence (CAP) — so this can only make reclamation more
-        // frequent, never less, and is therefore durability- and regression-safe by construction.
-        // `clamp` is panic-safe: `MIN < CAP` is asserted at compile time in `maintenance_tests`.
-        WAL_STORE_RATIO_TARGET.saturating_mul(store_bytes).clamp(
-            MAINTENANCE_CHECKPOINT_MIN_INTERVAL_BYTES,
-            MAINTENANCE_CHECKPOINT_INTERVAL_BYTES,
-        )
-    }
+/// The adaptive cadence (`rmp` #556) is now used for **both** ordinary traffic and a `Loading` Mode A
+/// bulk-import session (`rmp` #590). Historically a `Loading` session used a much wider fixed cadence
+/// (4 GiB) to dodge a measured O(N²) maintenance cost — each pass ran a full-store GC scan whose cost
+/// grew with the store. `rmp` #522 made the freeze sweep O(Δ), and `rmp` #590 makes the mid-load pass
+/// **freeze-only** (skipping the still-O(store) property sweep, which the Mode A checkpoint sentinel
+/// otherwise gates ON every batch), so a mid-load pass is now O(Δ) too and can run on the ordinary tight
+/// cadence. That bounds the WAL a load retains to ≤ this cadence at ANY crash/`STOP` point *before*
+/// `?end=true` — the fix for the reopen-OOM the un-reclaimed multi-GB WAL used to cause (`rmp` #590).
+fn maintenance_interval_bytes(store_bytes: u64) -> u64 {
+    // Adaptive cadence (`rmp` #556): reclaim proportionally to the live store size so the on-disk
+    // WAL/store ratio is bounded to ≈ WAL_STORE_RATIO_TARGET, instead of at a fixed absolute
+    // threshold that leaves a small OLTP store with a WAL tens of times its size. Clamped so a tiny
+    // store is not checkpointed on a hair-trigger (FLOOR) and a large store is never checkpointed
+    // *less* often than the historical 256 MiB cadence (CAP) — so this can only make reclamation more
+    // frequent, never less, and is therefore durability- and regression-safe by construction.
+    // `clamp` is panic-safe: `MIN < CAP` is asserted at compile time in `maintenance_tests`.
+    WAL_STORE_RATIO_TARGET.saturating_mul(store_bytes).clamp(
+        MAINTENANCE_CHECKPOINT_MIN_INTERVAL_BYTES,
+        MAINTENANCE_CHECKPOINT_INTERVAL_BYTES,
+    )
 }
 
 /// **`rmp` #588 (sprint-52 B1).** The reuse barrier for a GC pass that may free record slots while an
@@ -1212,29 +1189,30 @@ fn maybe_run_maintenance<D: BlockDevice, S: LogSink>(
         return;
     };
     // `rmp` #565 — do NOT fire a maintenance GC pass on the loading→not-loading edge. When a Mode A
-    // network bulk-import session ends (`End`), the maintenance interval flips from the wide loading
-    // cadence ([`MAINTENANCE_CHECKPOINT_INTERVAL_BYTES_DURING_LOADING`], 4 GiB) back to the ordinary
-    // 256 MiB one, and a freshly-loaded multi-GB store has far more than 256 MiB of un-reclaimed WAL —
-    // so this tick would otherwise run `coord.checkpoint()`'s **O(total store size) full-store GC scan**
-    // (measured 1.7 s → 18 s as the store grows). That scan runs synchronously on the engine thread as
-    // the tail of the `End` command, *ahead of the `Shutdown` that a `STOP DATABASE` — which normally
-    // follows `End` — has already queued*; because the engine is single-threaded it cannot acknowledge
-    // `Shutdown` until the scan finishes, so `stop_engine`'s drain deadline elapses and it force-detaches
-    // a perfectly healthy engine (the root cause of the `rmp` #555 force-detach → concurrent-reopen
-    // corruption). Instead we re-anchor the maintenance watermark to the current WAL length and skip the
-    // pass: the backlog of unfrozen commits is reclaimed by the (now-running-again) engine's ordinary
-    // background cadence after the next `START DATABASE`, on the live database — never on the drain path.
-    // Durability is untouched: recovery redo stays bounded because the store's per-commit auto-checkpoint
-    // (`DEFAULT_CHECKPOINT_INTERVAL_BYTES`, 64 MiB) flushed every dirty page home throughout the load, so
-    // the unreclaimed WAL below the redo floor is skipped by recovery, not replayed. The progress-aware
-    // drain (`rmp` #563) is the general safety net for any *other* long maintenance pass that a `STOP`
-    // may still race; this removes the specific, reproducible bulk-import trigger.
+    // network bulk-import session ends (`End`), the session flag has just cleared, so this tick would
+    // otherwise run a FULL `coord.checkpoint()` — and while the freeze sweep is O(Δ) (`rmp` #522) and the
+    // mid-load passes ran freeze-only (`rmp` #590), a FULL pass still runs the **O(total store size)
+    // property sweep** (`sweep_property_chains`, gated ON because the load's checkpoint sentinel tombstones
+    // a property version per batch; measured 1.7 s → 18 s as the store grows). That scan runs synchronously
+    // on the engine thread as the tail of the `End` command, *ahead of the `Shutdown` that a `STOP DATABASE`
+    // — which normally follows `End` — has already queued*; because the engine is single-threaded it cannot
+    // acknowledge `Shutdown` until the scan finishes, so `stop_engine`'s drain deadline elapses and it
+    // force-detaches a perfectly healthy engine (the root cause of the `rmp` #555 force-detach →
+    // concurrent-reopen corruption). Instead we re-anchor the maintenance watermark to the current WAL
+    // length and skip the pass: the FULL end-of-load reclaim already ran inside the `End` handler *before*
+    // this point (`rmp` #579, `bulk_load::reclaim_after_bulk_load`), and any residual is reclaimed by the
+    // ordinary background cadence after the next `START DATABASE`, on the live database — never on the drain
+    // path. Durability is untouched: recovery redo stays bounded because the store's per-commit
+    // auto-checkpoint (`DEFAULT_CHECKPOINT_INTERVAL_BYTES`, 64 MiB) flushed every dirty page home throughout
+    // the load, so the unreclaimed WAL below the redo floor is skipped by recovery, not replayed. The
+    // progress-aware drain (`rmp` #563) is the general safety net for any *other* long maintenance pass that
+    // a `STOP` may still race; this removes the specific, reproducible bulk-import trigger.
     if loading_just_ended {
         *wal_at_last_maintenance = coord.wal_durable_len();
         return;
     }
     // Size the reclaim interval against the live store (`rmp` #556): a cheap, non-allocating page count.
-    let interval = maintenance_interval_bytes(loading_session_active, coord.store_byte_len());
+    let interval = maintenance_interval_bytes(coord.store_byte_len());
     let durable = coord.wal_durable_len();
     if durable.saturating_sub(*wal_at_last_maintenance) < interval {
         return;
@@ -1244,7 +1222,20 @@ fn maybe_run_maintenance<D: BlockDevice, S: LogSink>(
     // lift the hold for every slot whose predating readers have all retired. With no open reader
     // `oldest_open_ticket` is `u64::MAX`, so the hold is released immediately (the inline/DST path and the
     // no-reader fast path are unchanged).
-    let outcome = coord.checkpoint_reader_safe(reuse_barrier, oldest_open_ticket);
+    //
+    // `rmp` #590: while a Mode A bulk-import session is `Loading`, run a **freeze-only** pass. It advances
+    // the WAL reclaim floor (the incremental freeze sweep drains `unfrozen_commit_lsn`) so a crash/`STOP`
+    // *before* `?end=true` cannot leave a multi-GB un-reclaimed WAL for the next `START DATABASE` to
+    // materialise into its recovery heap — WITHOUT paying the O(store) property sweep the Mode A checkpoint
+    // sentinel would otherwise gate ON every batch (which, on this now-tight cadence, would reintroduce the
+    // O(N²) cost `rmp` #556/#565 had widened the loading cadence to avoid). The few dead property versions
+    // the load defers are reclaimed by the ordinary full cadence after `START`, or by the FULL end-of-load
+    // checkpoint (`rmp` #579) at a clean `End`. Ordinary traffic uses the full reclaim.
+    let outcome = if loading_session_active {
+        coord.checkpoint_reader_safe_freeze_only(reuse_barrier, oldest_open_ticket)
+    } else {
+        coord.checkpoint_reader_safe(reuse_barrier, oldest_open_ticket)
+    };
     match outcome {
         Ok(report) => {
             // Success: record progress (aggregate observability counters) and clear **this engine's
@@ -3508,63 +3499,60 @@ mod maintenance_tests {
         assert_eq!(gc_reuse_barrier(5, 3), Some(6));
     }
 
-    /// rmp #521/#522 GATE: a `Loading` Mode A bulk-import session must use the much wider
-    /// [`MAINTENANCE_CHECKPOINT_INTERVAL_BYTES_DURING_LOADING`] interval regardless of store size — the
-    /// O(N²) maintenance-cost finding (measured: 9 checkpoint passes consumed 85% of wall time on a
-    /// multi-million-row load at the narrow interval).
+    /// rmp #556 GATE: traffic uses an **adaptive** cadence proportional to the live store size, clamped
+    /// to `[FLOOR, 256 MiB]`, so a small OLTP store's on-disk WAL is bounded to ≈ `WAL_STORE_RATIO_TARGET
+    /// × store` instead of the fixed 256 MiB that produced 7–60x ratios. The clamp guarantees this can
+    /// only make reclamation *more* frequent than the historical cadence, never less (a large store
+    /// at/above the cap keeps exactly the old 256 MiB interval).
     ///
-    /// rmp #556 GATE: ordinary (non-`Loading`) traffic uses an **adaptive** cadence proportional to the
-    /// live store size, clamped to `[FLOOR, 256 MiB]`, so a small OLTP store's on-disk WAL is bounded to
-    /// ≈ `WAL_STORE_RATIO_TARGET × store` instead of the fixed 256 MiB that produced 7–60x ratios. The
-    /// clamp guarantees this can only make reclamation *more* frequent than the historical cadence, never
-    /// less (a large store at/above the cap keeps exactly the old 256 MiB interval).
+    /// rmp #590 GATE: a `Loading` Mode A bulk-import session now uses this SAME tight adaptive cadence
+    /// (it historically used a 4 GiB fixed interval to dodge an O(N²) maintenance cost). `rmp` #522 made
+    /// the freeze sweep O(Δ) and `rmp` #590 makes the mid-load pass freeze-only (skipping the still-O(store)
+    /// property sweep), so a mid-load pass is O(Δ) and safe to run on this tight cadence — which bounds
+    /// the WAL a load retains to ≤ the cadence at any pre-`End` crash point (the reopen-OOM fix). The
+    /// interval helper is therefore store-size-only; the freeze-only vs full decision lives in
+    /// [`maybe_run_maintenance`] (keyed on `loading_session_active`), asserted separately below.
     #[test]
-    fn ordinary_cadence_is_adaptive_and_loading_stays_wide() {
+    fn cadence_is_adaptive_and_bounded() {
         const MIB: u64 = 1024 * 1024;
-        // Loading is unconditionally the wide fixed interval, whatever the store size.
-        for store in [0, MIB, 1024 * MIB, 64 * 1024 * MIB] {
-            assert_eq!(
-                maintenance_interval_bytes(true, store),
-                MAINTENANCE_CHECKPOINT_INTERVAL_BYTES_DURING_LOADING,
-                "a Loading Mode A session must always use the wide cadence"
-            );
-        }
-        // Ordinary, large store (≥ 256 MiB / RATIO = 64 MiB): capped at exactly the historical cadence,
-        // so large-store reclamation is never made less frequent.
+        // Large store (≥ 256 MiB / RATIO = 64 MiB): capped at exactly the historical cadence, so
+        // large-store reclamation is never made less frequent.
         assert_eq!(
-            maintenance_interval_bytes(false, 512 * MIB),
+            maintenance_interval_bytes(512 * MIB),
             MAINTENANCE_CHECKPOINT_INTERVAL_BYTES,
-            "a large ordinary store must keep the historical 256 MiB cap"
+            "a large store must keep the historical 256 MiB cap"
         );
         assert_eq!(
-            maintenance_interval_bytes(false, 64 * MIB),
+            maintenance_interval_bytes(64 * MIB),
             MAINTENANCE_CHECKPOINT_INTERVAL_BYTES,
             "exactly at the cap boundary (RATIO × 64 MiB == 256 MiB)"
         );
-        // Ordinary, mid-size store (7 MiB, the fraud-OLTP regime): RATIO × store, well under the cap and
-        // above the floor — bounds the ratio to WAL_STORE_RATIO_TARGET.
+        // A very large store (a big bulk load) is still capped at 256 MiB — so the retained WAL a load
+        // can leave un-reclaimed at a crash point is bounded regardless of the eventual store size.
         assert_eq!(
-            maintenance_interval_bytes(false, 7 * MIB),
+            maintenance_interval_bytes(64 * 1024 * MIB),
+            MAINTENANCE_CHECKPOINT_INTERVAL_BYTES,
+            "even a multi-GB bulk load caps the retained WAL at the 256 MiB cadence (rmp #590)"
+        );
+        // Mid-size store (7 MiB, the fraud-OLTP regime): RATIO × store, well under the cap and above the
+        // floor — bounds the ratio to WAL_STORE_RATIO_TARGET.
+        assert_eq!(
+            maintenance_interval_bytes(7 * MIB),
             WAL_STORE_RATIO_TARGET * 7 * MIB,
             "a small OLTP store must reclaim proportionally to its size"
         );
-        // Ordinary, tiny store: the floor prevents a hair-trigger cadence.
+        // Tiny store: the floor prevents a hair-trigger cadence.
         assert_eq!(
-            maintenance_interval_bytes(false, 256 * 1024),
+            maintenance_interval_bytes(256 * 1024),
             MAINTENANCE_CHECKPOINT_MIN_INTERVAL_BYTES,
             "a tiny store must be floored, not checkpointed on every commit"
         );
         assert_eq!(
-            maintenance_interval_bytes(false, 0),
+            maintenance_interval_bytes(0),
             MAINTENANCE_CHECKPOINT_MIN_INTERVAL_BYTES,
             "an empty store falls back to the floor"
         );
         const {
-            assert!(
-                MAINTENANCE_CHECKPOINT_INTERVAL_BYTES_DURING_LOADING
-                    > MAINTENANCE_CHECKPOINT_INTERVAL_BYTES,
-                "the Loading-session interval must be strictly wider, or the stopgap does nothing"
-            );
             assert!(
                 MAINTENANCE_CHECKPOINT_MIN_INTERVAL_BYTES < MAINTENANCE_CHECKPOINT_INTERVAL_BYTES,
                 "the adaptive floor must be below the cap"
@@ -3575,12 +3563,12 @@ mod maintenance_tests {
     /// End-to-end confirmation that [`maybe_run_maintenance`] actually **honors**
     /// `loading_session_active` rather than just computing the right interval and ignoring it: with
     /// `wal_at_last_maintenance` fixed at 0 and a fresh (near-empty) coordinator's `wal_durable_len()`
-    /// comfortably below [`MAINTENANCE_CHECKPOINT_INTERVAL_BYTES_DURING_LOADING`] but the exact
-    /// mechanism also applies below the ordinary interval, calling with `loading_session_active: true`
+    /// comfortably below the adaptive interval, calling with `loading_session_active: true`
     /// vs `false` must not observably diverge from the "insufficient growth yet" no-op path in either
     /// case at this WAL size — this pins the call signature/wiring so a future refactor cannot silently
     /// drop the parameter (a compile-time-only regression that unit tests on the pure helper above
-    /// would miss).
+    /// would miss). The freeze-only-vs-full behaviour the flag now also selects (`rmp` #590) is exercised
+    /// at scale by the `graphus-dst` bulk-load recovery gate.
     #[test]
     fn maybe_run_maintenance_accepts_loading_flag_and_stays_a_noop_below_either_interval() {
         let device = graphus_io::MemBlockDevice::new(0);

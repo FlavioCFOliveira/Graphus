@@ -17,7 +17,7 @@
 //!
 //! The adaptive-interval formula is replicated here from `graphus-server`'s `maintenance_interval_bytes`
 //! (`WAL_STORE_RATIO_TARGET = 4`, floor 8 MiB, cap 256 MiB); the production wiring itself is pinned by
-//! `graphus_server::engine::maintenance_tests::ordinary_cadence_is_adaptive_and_loading_stays_wide`.
+//! `graphus_server::engine::maintenance_tests::cadence_is_adaptive_and_bounded`.
 
 use graphus_core::Value;
 use graphus_cypher::binding::{Parameters, bind_parameters};

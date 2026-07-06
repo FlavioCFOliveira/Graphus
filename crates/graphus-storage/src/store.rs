@@ -2105,6 +2105,49 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// # Errors
     /// Returns a storage error if a record read or a reclamation/freeze write fails.
     pub fn gc(&mut self, txn: TxnId, watermark: Timestamp) -> Result<GcPassReport> {
+        self.gc_inner(txn, watermark, false)
+    }
+
+    /// A **freeze-only** GC pass (`rmp` #590): runs only the incremental freeze sweep (Phase E) and the
+    /// registry-prune scheduling, **skipping** the reclamation sweeps (Phases A–D: relationship/node
+    /// tombstone reclaim, the corpse splice, and the property-chain sweep). Its sole purpose is to drain
+    /// the store's `unfrozen_commit_lsn` map — i.e. to **lower the WAL reclaim floor** — as cheaply as
+    /// possible, so a caller can bound the retained WAL without paying the reclamation sweeps.
+    ///
+    /// Why this exists: a network Mode A bulk-import updates a durable checkpoint-sentinel node's
+    /// counters **every batch** (`graphus_server`'s `bulk_load::checkpoint_sentinel`), and each update
+    /// tombstones the prior property version, so `pending_tombstones[Prop]` is never empty during a load
+    /// and the Phase D property sweep — a full `O(store)` scan of every live owner's property chain —
+    /// gates ON on every pass. Running that sweep on a *tightened* mid-load cadence would reintroduce the
+    /// exact `O(N²)` maintenance cost `rmp` #556/#565 widened the loading cadence to avoid, even though
+    /// the freeze sweep itself is `O(Δ)` since `rmp` #522. The freeze sweep is all that is needed to
+    /// advance the WAL floor; the (few, sentinel-only) dead property versions a load leaves behind are
+    /// reclaimed later by the ordinary full cadence after the next `START DATABASE`, or by the FULL
+    /// end-of-load checkpoint (`rmp` #579) at a clean `End`.
+    ///
+    /// Soundness: the prune's precondition is *freeze completeness* (every committed writer's on-disk
+    /// in-flight stamps settled to `Committed(ts)`), which the Phase E freeze establishes independently
+    /// of whether dead slots are reclaimed; the freeze-frontier invariant (see [`freeze_low`](Self::freeze_low))
+    /// likewise holds whether or not a tombstone below the frontier is physically freed (its stamps are
+    /// frozen either way). This pass therefore leaves the store's *committed, visible* image and its
+    /// crash-recovery behaviour identical to a full pass — only deferred slot reclamation differs.
+    ///
+    /// # Errors
+    /// Returns a storage error if a record read or a freeze write fails.
+    pub fn gc_freeze_only(&mut self, txn: TxnId, watermark: Timestamp) -> Result<GcPassReport> {
+        self.gc_inner(txn, watermark, true)
+    }
+
+    /// Shared body of [`gc`](Self::gc) (`freeze_only == false`) and
+    /// [`gc_freeze_only`](Self::gc_freeze_only) (`freeze_only == true`). When `freeze_only` is set the
+    /// reclamation sweeps (Phases A–D) are skipped; only the incremental freeze sweep and the prune
+    /// scheduling run. See [`gc_freeze_only`](Self::gc_freeze_only) for why.
+    fn gc_inner(
+        &mut self,
+        txn: TxnId,
+        watermark: Timestamp,
+        freeze_only: bool,
+    ) -> Result<GcPassReport> {
         let mut reclaimed = 0usize;
 
         // `rmp` #522: snapshot the freeze frontier BEFORE the freeze sweep advances it, so a rollback of
@@ -2118,44 +2161,51 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // `STOP DATABASE` that races it sees a *progressing* engine and waits rather than force-detaching.
         self.bump_drain_progress();
 
-        // ---- Phase A: reclaim reclaimable RELATIONSHIP tombstones (`rmp` #522: pending-set driven). ----
-        // Was an O(store) `scan_in_use_mvcc(Rel)` every tick; now iterates only the tombstones tracked
-        // since the last pass (with a full-scan fallback on the first post-open pass, which also seeds the
-        // pending set). Reclaimable ones are freed; the rest stay pending. Runs before the corpse splice
-        // (so a corpse whose neighbour was just reclaimed sees the updated chain) and before the node
-        // sweep (so a node whose only incidences were reclaimed becomes reclaimable this pass).
-        reclaimed += self.reclaim_pending(StoreKind::Rel, txn, watermark)?;
+        // ---- Phases A–D: reclamation sweeps. SKIPPED in a freeze-only pass (`rmp` #590). ----
+        // A freeze-only pass exists solely to advance the WAL reclaim floor (Phase E) cheaply during a
+        // bulk load; the reclamation sweeps are what make a mid-load pass `O(store)` (the Phase D property
+        // sweep gates ON every batch because the load's checkpoint sentinel tombstones a property version
+        // per batch), so they are deferred to the next full pass. See [`gc_freeze_only`](Self::gc_freeze_only).
+        if !freeze_only {
+            // ---- Phase A: reclaim reclaimable RELATIONSHIP tombstones (`rmp` #522: pending-set driven). ----
+            // Was an O(store) `scan_in_use_mvcc(Rel)` every tick; now iterates only the tombstones tracked
+            // since the last pass (with a full-scan fallback on the first post-open pass, which also seeds the
+            // pending set). Reclaimable ones are freed; the rest stay pending. Runs before the corpse splice
+            // (so a corpse whose neighbour was just reclaimed sees the updated chain) and before the node
+            // sweep (so a node whose only incidences were reclaimed becomes reclaimable this pass).
+            reclaimed += self.reclaim_pending(StoreKind::Rel, txn, watermark)?;
 
-        // ---- Phase B: splice out dead-link RELATIONSHIP corpses (`rmp` #220), gated (`rmp` #522). ----
-        // A corpse is a slot an aborted/crashed creation left `!in_use`-but-threaded; reads and the
-        // checker thread transparently THROUGH it, so it is harmless until reclaimed. The whole-store
-        // corpse walk runs ONLY when a rolled-back creation may have left one (`pending_corpse_rels`
-        // non-empty) or on the first post-open pass — a no-abort workload skips it entirely. The splice
-        // is walk-driven (re-derives each corpse's true chain position), so it never severs a live chain.
-        if self.gc_full_scan_pending || !self.pending_corpse_rels.is_empty() {
-            self.bump_drain_progress();
-            reclaimed += self.gc_splice_corpses(txn)?;
-            self.pending_corpse_rels.clear();
-        }
+            // ---- Phase B: splice out dead-link RELATIONSHIP corpses (`rmp` #220), gated (`rmp` #522). ----
+            // A corpse is a slot an aborted/crashed creation left `!in_use`-but-threaded; reads and the
+            // checker thread transparently THROUGH it, so it is harmless until reclaimed. The whole-store
+            // corpse walk runs ONLY when a rolled-back creation may have left one (`pending_corpse_rels`
+            // non-empty) or on the first post-open pass — a no-abort workload skips it entirely. The splice
+            // is walk-driven (re-derives each corpse's true chain position), so it never severs a live chain.
+            if self.gc_full_scan_pending || !self.pending_corpse_rels.is_empty() {
+                self.bump_drain_progress();
+                reclaimed += self.gc_splice_corpses(txn)?;
+                self.pending_corpse_rels.clear();
+            }
 
-        // ---- Phase C: reclaim reclaimable NODE tombstones (pending-set driven). ----
-        // A node is reclaimed only once no live (not-yet-reclaimed) relationship still references it, so
-        // referential integrity and the incidence chains stay well-formed throughout.
-        reclaimed += self.reclaim_pending(StoreKind::Node, txn, watermark)?;
+            // ---- Phase C: reclaim reclaimable NODE tombstones (pending-set driven). ----
+            // A node is reclaimed only once no live (not-yet-reclaimed) relationship still references it, so
+            // referential integrity and the incidence chains stay well-formed throughout.
+            reclaimed += self.reclaim_pending(StoreKind::Node, txn, watermark)?;
 
-        // ---- Phase D: sweep PROPERTY chains, gated (`rmp` #522). ----
-        // Reclaims tombstoned property versions (`rmp` task #50) and dead-link property corpses (#172)
-        // from every surviving owner's chain. The full owner walk runs ONLY when a property tombstone or
-        // corpse may exist (a non-empty `pending_tombstones[Prop]`, `pending_prop_corpses`, or the first
-        // post-open pass) — a workload with no property deletes/aborts skips it. A reclaimed owner's whole
-        // chain was already freed by its reclamation, so re-checking liveness here reclaims each once.
-        if self.gc_full_scan_pending
-            || !self.pending_tombstones[StoreKind::Prop as usize].is_empty()
-            || self.pending_prop_corpses
-        {
-            reclaimed += self.sweep_property_chains(txn, watermark)?;
-            self.pending_prop_corpses = false;
-            self.prune_settled_tombstones(StoreKind::Prop)?;
+            // ---- Phase D: sweep PROPERTY chains, gated (`rmp` #522). ----
+            // Reclaims tombstoned property versions (`rmp` task #50) and dead-link property corpses (#172)
+            // from every surviving owner's chain. The full owner walk runs ONLY when a property tombstone or
+            // corpse may exist (a non-empty `pending_tombstones[Prop]`, `pending_prop_corpses`, or the first
+            // post-open pass) — a workload with no property deletes/aborts skips it. A reclaimed owner's whole
+            // chain was already freed by its reclamation, so re-checking liveness here reclaims each once.
+            if self.gc_full_scan_pending
+                || !self.pending_tombstones[StoreKind::Prop as usize].is_empty()
+                || self.pending_prop_corpses
+            {
+                reclaimed += self.sweep_property_chains(txn, watermark)?;
+                self.pending_prop_corpses = false;
+                self.prune_settled_tombstones(StoreKind::Prop)?;
+            }
         }
 
         // ---- Phase E: freeze committed-but-unfrozen MVCC stamps (`rmp` task #59), frontier-based. ----
@@ -2177,7 +2227,12 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
 
         // The first post-open pass has now discovered every pre-existing on-disk corpse/tombstone and
         // seeded the tracking sets, so subsequent passes can safely run the gated incremental sweeps.
-        self.gc_full_scan_pending = false;
+        // A freeze-only pass (`rmp` #590) SKIPPED those seeding scans (Phases A–D), so it must NOT clear
+        // the flag — the next FULL pass still owes the one-time seeding scan (a freeze-only pass never
+        // relies on the tracking sets, since it reclaims nothing).
+        if !freeze_only {
+            self.gc_full_scan_pending = false;
+        }
 
         // `rmp` #522 (durability-audit W1 regression guard): before scheduling the prune that will
         // forget every committed writer, assert the freeze sweep actually settled ALL of their on-disk

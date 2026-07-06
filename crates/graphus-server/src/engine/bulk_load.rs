@@ -931,6 +931,66 @@ mod tests {
         assert!(session.is_none());
     }
 
+    /// `rmp` #590: a **mid-load** freeze-only maintenance pass — the engine's
+    /// [`TxnCoordinator::checkpoint_reader_safe_freeze_only`], which
+    /// [`crate::engine::maybe_run_maintenance`] drives while a Mode A session is `Loading` — must advance
+    /// the WAL reclaim floor (so a crash/`STOP` *before* `?end=true` cannot leave the whole load's WAL
+    /// un-reclaimed for the next `START DATABASE` to OOM on) while running NONE of the O(store) reclamation
+    /// sweeps (it reclaims nothing; only the incremental O(Δ) freeze runs). This is what lets the loading
+    /// cadence be tightened without reintroducing the O(N²) property-sweep cost.
+    #[test]
+    fn mid_load_freeze_only_checkpoint_advances_the_floor_without_reclaiming() {
+        use std::sync::atomic::Ordering;
+        let (mut coord, max_reclaim) = spy_coordinator();
+        let mut session: Option<LoadingSession> = None;
+        let nh = node_header();
+
+        // Ingest several node batches (each also updates the checkpoint sentinel, tombstoning a property
+        // version — the exact pattern that would gate the O(store) property sweep ON in a FULL pass).
+        for i in 0..48u32 {
+            handle_bulk_import_batch(
+                &mut coord,
+                &mut session,
+                BulkImportBatchInput::Nodes {
+                    header: Arc::clone(&nh),
+                    records: vec![record(&[&i.to_string(), "Person", &format!("name{i}")])],
+                },
+            )
+            .expect("node batch");
+        }
+        assert_eq!(
+            max_reclaim.load(Ordering::SeqCst),
+            0,
+            "nothing must reclaim the WAL during the load itself (auto-checkpoint disabled)"
+        );
+
+        // Drive one MID-LOAD freeze-only maintenance pass (no `End`, session still active).
+        let report = coord
+            .checkpoint_reader_safe_freeze_only(None, u64::MAX)
+            .expect("mid-load freeze-only checkpoint");
+
+        // Freeze-only: reclaims NOTHING (the reclamation sweeps are skipped) but freezes committed stamps
+        // so the WAL floor can advance — and the checkpoint then physically reclaimed the WAL prefix.
+        assert_eq!(
+            report.reclaimed, 0,
+            "a mid-load freeze-only pass must not run the O(store) reclamation sweeps"
+        );
+        assert!(
+            report.frozen > 0,
+            "a mid-load freeze-only pass must freeze committed stamps to advance the WAL floor"
+        );
+        assert!(
+            max_reclaim.load(Ordering::SeqCst) > 8,
+            "the freeze-only checkpoint must advance the WAL reclaim floor past HEADER_LEN (=8), \
+             bounding the retained WAL a mid-abort reopen would read (got {})",
+            max_reclaim.load(Ordering::SeqCst)
+        );
+        assert!(
+            session.is_some(),
+            "the loading session is still active mid-load (no End was issued)"
+        );
+    }
+
     #[test]
     fn relationship_batch_resolves_only_against_committed_nodes() {
         let mut coord = coordinator();

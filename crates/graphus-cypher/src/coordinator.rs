@@ -2938,12 +2938,25 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// # Errors
     /// Propagates a storage error from the GC pass or its commit.
     pub fn gc(&mut self) -> Result<GcPassReport> {
+        self.gc_scoped(false)
+    }
+
+    /// A **freeze-only** GC pass (`rmp` #590): drives [`RecordStore::gc_freeze_only`] instead of
+    /// [`RecordStore::gc`], so it advances the WAL reclaim floor (the incremental freeze sweep) without
+    /// paying the `O(store)` reclamation sweeps. Used only by the mid-bulk-load maintenance cadence — see
+    /// [`checkpoint_reader_safe_freeze_only`](Self::checkpoint_reader_safe_freeze_only).
+    fn gc_scoped(&mut self, freeze_only: bool) -> Result<GcPassReport> {
         let watermark = self.gc_watermark();
         self.next_txn_id += 1;
         let gc_txn = TxnId(self.next_txn_id);
         let mut store = self.store.borrow_mut();
         store.begin(gc_txn);
-        let report = match store.gc(gc_txn, watermark) {
+        let gc_result = if freeze_only {
+            store.gc_freeze_only(gc_txn, watermark)
+        } else {
+            store.gc(gc_txn, watermark)
+        };
+        let report = match gc_result {
             Ok(report) => report,
             Err(e) => {
                 // Best-effort undo of the partial pass so the store stays consistent for the caller.
@@ -3033,8 +3046,38 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         reuse_barrier: Option<u64>,
         oldest_open_ticket: u64,
     ) -> Result<GcPassReport> {
+        self.checkpoint_reader_safe_scoped(reuse_barrier, oldest_open_ticket, false)
+    }
+
+    /// **`rmp` #590.** The freeze-only counterpart of
+    /// [`checkpoint_reader_safe`](Self::checkpoint_reader_safe): it drives a freeze-only GC pass
+    /// ([`gc_scoped`](Self::gc_scoped)`(true)`) — advancing the WAL reclaim floor via the incremental
+    /// freeze sweep — and then the same sharp store checkpoint, but **skips** the `O(store)` reclamation
+    /// sweeps. This is what lets the engine tighten the mid-bulk-load maintenance cadence (bounding the
+    /// retained WAL so a crash/`STOP` **before** `?end=true` cannot leave a multi-GB un-reclaimed WAL for
+    /// the next `START DATABASE` to materialise into its recovery heap) **without** reintroducing the
+    /// `O(N²)` mid-load maintenance cost the property sweep would otherwise incur every pass (the Mode A
+    /// checkpoint sentinel tombstones a property version per batch). The (few) dead property versions the
+    /// load leaves behind are reclaimed by the ordinary full cadence after the next `START DATABASE`, or by
+    /// the FULL end-of-load checkpoint (`rmp` #579) at a clean `End`. Same reader-safe barrier discipline
+    /// as [`checkpoint_reader_safe`](Self::checkpoint_reader_safe) (a no-op in practice, since a freeze-only
+    /// pass frees no slots).
+    pub fn checkpoint_reader_safe_freeze_only(
+        &mut self,
+        reuse_barrier: Option<u64>,
+        oldest_open_ticket: u64,
+    ) -> Result<GcPassReport> {
+        self.checkpoint_reader_safe_scoped(reuse_barrier, oldest_open_ticket, true)
+    }
+
+    fn checkpoint_reader_safe_scoped(
+        &mut self,
+        reuse_barrier: Option<u64>,
+        oldest_open_ticket: u64,
+        freeze_only: bool,
+    ) -> Result<GcPassReport> {
         self.set_reuse_barrier(reuse_barrier);
-        let outcome = self.checkpoint();
+        let outcome = self.checkpoint_scoped(freeze_only);
         // Clear the barrier BEFORE releasing so a subsequent non-GC free is not held, then lift the hold
         // on every slot whose predating readers have all retired. Both run on every path (Ok or Err).
         self.set_reuse_barrier(None);
@@ -3043,7 +3086,15 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     }
 
     pub fn checkpoint(&mut self) -> Result<GcPassReport> {
-        let report = self.gc()?;
+        self.checkpoint_scoped(false)
+    }
+
+    /// Shared body of [`checkpoint`](Self::checkpoint) (`freeze_only == false`) and the freeze-only
+    /// maintenance path (`rmp` #590): a GC pass (full or freeze-only per `freeze_only`), then the sharp
+    /// store checkpoint that reclaims the WAL prefix below the now-lowered floor, then the SSI-tracker
+    /// prune.
+    fn checkpoint_scoped(&mut self, freeze_only: bool) -> Result<GcPassReport> {
+        let report = self.gc_scoped(freeze_only)?;
         self.store.borrow_mut().checkpoint()?;
 
         // Reclaim the SSI tracker's retained committed records (`rmp` #552). The watermark is the
