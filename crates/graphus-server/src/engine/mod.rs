@@ -161,16 +161,24 @@ pub const MAINTENANCE_FAILURE_ESCALATION_THRESHOLD: u32 = 3;
 ///
 /// The compile/execute pipeline is recursive-descent over the AST (parser, semantic analysis,
 /// lowering, evaluation), so its peak stack usage is proportional to the *structural depth* of the
-/// query's expressions/clauses. The cypher crate bounds that depth at compile time
-/// ([`graphus_cypher::MAX_EXPR_DEPTH`] ≈ 1 000) and converts anything deeper into a recoverable
-/// compile error rather than a native stack overflow — but a Rust stack overflow **aborts the whole
-/// process** (the guard-page handler calls `abort()`, which no `catch_unwind` can intercept), so the
-/// thread must carry enough stack to absorb a *legal*, at-the-limit query with comfortable margin.
-/// The default thread stack (~2 MiB on Linux) is **not** enough: a depth-1 000 expression overflows
-/// it during parsing/evaluation. 64 MiB matches the dedicated stack the TCK harness already runs the
-/// engine on and was measured (`rmp` #473) to absorb the depth bound with ≥5× headroom, while costing
-/// only reserved address space (lazily paged, a handful of threads per database).
-pub const QUERY_ENGINE_STACK_SIZE: usize = 64 * 1024 * 1024;
+/// query's expressions/clauses. The cypher crate bounds that depth at compile time — expression
+/// nesting by [`graphus_cypher::MAX_EXPR_DEPTH`] (≈ 1 000) and stacked clauses by
+/// [`graphus_cypher::MAX_QUERY_CLAUSES`] (1 024, `rmp` #589) — converting anything deeper into a
+/// recoverable compile error rather than a native stack overflow. But a Rust stack overflow **aborts
+/// the whole process** (the guard-page handler calls `abort()`, which no `catch_unwind` can
+/// intercept), so the thread must carry enough stack to absorb a *legal*, at-the-limit query with
+/// comfortable margin. The default thread stack (~2 MiB on Linux) is **not** enough.
+///
+/// The **clause budget** dominates the sizing (`rmp` #589): the Volcano executor recurses one frame
+/// per nested operator, so a legal `MAX_QUERY_CLAUSES`-clause chain descends ~1 024 frames of the
+/// (heavy) `next()` → `project_row` → `eval` path *on this thread*. Measured empirically on the real
+/// reader-pool path (debug build): a `WITH 1 AS a` chain overflows a 64 MiB stack at ~975 clauses, so
+/// 64 MiB gave **no** margin for the 1 024 cap (it aborted). The cost is ~linear in stack size; at
+/// **256 MiB** a 1 024-clause chain runs with the full cap fitting in **half** the stack (verified:
+/// 1 024 clauses execute cleanly on 128 MiB), i.e. **≥ 2× margin** — and ≈ 3.8× versus the ~975/64 MiB
+/// overflow point. The larger reservation costs only address space (lazily paged; RSS grows only with
+/// actual depth), a handful of threads per database.
+pub const QUERY_ENGINE_STACK_SIZE: usize = 256 * 1024 * 1024;
 
 /// The maximum number of write commits coalesced into a single group-commit `fdatasync` (`rmp` #528,
 /// `04 §4.2`).

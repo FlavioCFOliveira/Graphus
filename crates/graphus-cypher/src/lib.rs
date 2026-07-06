@@ -201,7 +201,9 @@ pub use logical::{
 };
 pub use lower::lower;
 pub use ordering::{cmp_values, compare_values};
-pub use parser::{MAX_EXPR_DEPTH, SyntaxError, SyntaxErrorKind, parse, parse_tokens};
+pub use parser::{
+    MAX_EXPR_DEPTH, MAX_QUERY_CLAUSES, SyntaxError, SyntaxErrorKind, parse, parse_tokens,
+};
 pub use physical::{
     PhysicalOp, PhysicalPlan, QueryType, RangeBound, plan_physical, plan_physical_with_stats,
 };

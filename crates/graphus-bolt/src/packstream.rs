@@ -811,13 +811,47 @@ fn is_tiny_int(m: u8) -> bool {
 
 // ---- High-level Value (de)serialization -------------------------------------------------------
 
+/// The maximum value-nesting depth [`pack_value`] will **encode** before substituting `Null` for the
+/// over-deep subtree — a stack-overflow guard on the output path (`SEC-190`, CWE-674).
+///
+/// This is *defence in depth*: the Cypher engine already caps every runtime value it materialises at
+/// its own value-depth budget (`graphus_cypher::value_depth::MAX_VALUE_DEPTH`, currently 1000), so a
+/// legal result never nests this deep and is always encoded byte-for-byte. But `pack_value` recurses
+/// one frame per nesting level, and a stack overflow on stable Rust is an **uncatchable process
+/// abort** (SIGABRT) — so if a value ever reached the encoder deeper than the engine should allow
+/// (a future code path, or a value read back from storage), recursing it would abort the whole
+/// server rather than fail one request. Capping here makes that impossible.
+///
+/// It **must stay ≥ the engine's value-depth budget** so a legal deep result is never truncated, and
+/// far below the depth that overflows a writer stack (a few thousand small frames). The asymmetry
+/// with [`MAX_DECODE_DEPTH`] (64) is intentional: inbound Bolt values are shallow parameters, whereas
+/// a *result* value the engine builds may legitimately nest up to its full budget.
+const MAX_ENCODE_DEPTH: usize = 1_000;
+
 /// Encodes a [`Value`] as PackStream into `packer`.
 ///
 /// Every variant `graphus_core::Value` currently has is handled. The structural classes (`Node`,
 /// `Relationship`, `Path`, `Point`) are **not** `Value` variants yet (`04 §7.2` defers them), so
 /// they cannot reach this function; the server constructs those structures directly from executor
 /// data via [`Packer::write_struct_header`] (see [`crate::message`]).
+///
+/// Nesting is bounded to [`MAX_ENCODE_DEPTH`] as a stack-overflow guard: a subtree deeper than the
+/// cap is encoded as `Null` rather than recursing (see the constant's docs). Legal values (far below
+/// the cap) are unaffected and encode byte-for-byte.
 pub fn pack_value(packer: &mut Packer, value: &Value) {
+    pack_value_at(packer, value, 0);
+}
+
+/// [`pack_value`] with the current nesting depth threaded through, so the recursion can be bounded
+/// (`SEC-190`). `depth` counts levels from the root (the root value is depth 0).
+fn pack_value_at(packer: &mut Packer, value: &Value, depth: usize) {
+    if depth > MAX_ENCODE_DEPTH {
+        // Unreachable for any engine-produced value (the engine caps depth well below this); a
+        // defensive `Null` keeps a pathological value from overflowing the writer stack (an
+        // uncatchable process abort) instead of recursing it.
+        packer.write_null();
+        return;
+    }
     match value {
         Value::Null => packer.write_null(),
         Value::Boolean(b) => packer.write_bool(*b),
@@ -828,14 +862,14 @@ pub fn pack_value(packer: &mut Packer, value: &Value) {
         Value::List(items) => {
             packer.write_list_header(items.len());
             for item in items {
-                pack_value(packer, item);
+                pack_value_at(packer, item, depth + 1);
             }
         }
         Value::Map(entries) => {
             packer.write_map_header(entries.len());
             for (k, v) in entries {
                 packer.write_string(k);
-                pack_value(packer, v);
+                pack_value_at(packer, v, depth + 1);
             }
         }
         Value::Date(d) => pack_date(packer, *d),
@@ -1695,6 +1729,65 @@ mod tests {
         let out = unpack_value(&mut u).expect("decode");
         assert!(u.is_empty(), "decode left {} trailing bytes", u.remaining());
         out
+    }
+
+    /// A `Value` nested `depth` levels (`[[…[1]…]]`), built iteratively.
+    fn nest(depth: usize) -> Value {
+        let mut v = Value::Integer(1);
+        for _ in 0..depth {
+            v = Value::List(vec![v]);
+        }
+        v
+    }
+
+    /// `SEC-190` / `rmp` #589 (requirement 2): the wire encoders run on tokio `spawn_blocking` session
+    /// threads with the DEFAULT ~2 MiB stack (`graphus-server` sets `max_blocking_threads` but not the
+    /// stack size). Encoding the **deepest value the engine can produce** (bounded by the cypher engine's
+    /// value-depth budget, ≤ [`MAX_ENCODE_DEPTH`]) — and the recursive `Value::Drop` of that value — must
+    /// NOT overflow that 2 MiB stack. Verified empirically here on an explicit 2 MiB thread (an overflow
+    /// would `abort()` the whole test process, so completing IS the assertion). Measured margin: the same
+    /// depth also completes on a **1 MiB** stack (≥ 2×), because the [`MAX_ENCODE_DEPTH`] cap bounds the
+    /// encoder recursion and each `Value::List` `Drop` frame is tiny.
+    #[test]
+    fn encoding_and_dropping_a_max_depth_value_is_safe_on_a_2mib_stack() {
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let v = nest(MAX_ENCODE_DEPTH); // the deepest value packed in full (never truncated)
+                let mut p = Packer::new();
+                pack_value(&mut p, &v);
+                assert!(!p.into_inner().is_empty());
+                drop(v); // recursive `Value::Drop` on the 2 MiB stack
+            })
+            .expect("spawn")
+            .join()
+            .expect("packing + dropping a max-depth value must not overflow a 2 MiB stack");
+    }
+
+    /// `SEC-190`: `pack_value` recurses one frame per nesting level, and a stack overflow is an
+    /// *uncatchable* process abort. A value nested past [`MAX_ENCODE_DEPTH`] must be truncated (the
+    /// over-deep subtree packed as `Null`) rather than recursed — so the encoder cannot abort the
+    /// server even on a value deeper than the engine should ever produce. Shallow (realistic) values
+    /// are unaffected and round-trip byte-for-byte.
+    ///
+    /// (The encode cap exceeds the *decode* cap [`MAX_DECODE_DEPTH`] on purpose — inbound Bolt values
+    /// are shallow parameters, whereas a result the engine builds may legitimately nest deeper — so the
+    /// deep case is checked encode-only, not via a round-trip.)
+    #[test]
+    fn pack_value_bounds_nesting_depth() {
+        // Past the cap: `pack_value` returns (no stack overflow) and still produces output. Built only
+        // slightly over the cap so the source value's own recursive `Drop` stays stack-safe here.
+        let over = nest(MAX_ENCODE_DEPTH + 8);
+        let mut p = Packer::new();
+        pack_value(&mut p, &over);
+        assert!(
+            !p.into_inner().is_empty(),
+            "the over-deep value still produces bounded output rather than overflowing"
+        );
+
+        // A realistic shallow value is unaffected and round-trips exactly.
+        let shallow = nest(5);
+        assert_eq!(round_trip(&shallow), shallow);
     }
 
     #[test]

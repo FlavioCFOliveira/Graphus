@@ -107,6 +107,21 @@ const SIGIL_TEMPORAL: &str = "T";
 /// REST client recovers the CRS and every coordinate without parsing a WKT string.
 const SIGIL_POINT: &str = "@";
 
+/// The maximum value-nesting depth the REST **encoders** ([`value_to_jolt`], [`value_to_cbor`]) will
+/// build before substituting a `null` for the over-deep subtree — a stack-overflow guard on the
+/// output path (`SEC-190`, CWE-674).
+///
+/// Defence in depth: the Cypher engine already caps every runtime value it materialises at its own
+/// value-depth budget (`graphus_cypher::value_depth::MAX_VALUE_DEPTH`, currently 1000), so a legal
+/// result never nests this deep and always encodes byte-for-byte. But both encoders recurse one frame
+/// per nesting level, and a stack overflow on stable Rust is an **uncatchable process abort**
+/// (SIGABRT) — so if a value ever reached an encoder deeper than the engine should allow (a future
+/// code path, or a value read back from storage), recursing it would abort the whole server rather
+/// than fail one request. Capping here makes that impossible. It **must stay ≥ the engine's
+/// value-depth budget** so a legal deep result is never truncated, and far below the depth that
+/// overflows a worker stack. Mirrors the inbound cap [`MAX_CBOR_DEPTH`] on the decode side.
+const MAX_ENCODE_DEPTH: usize = 1_000;
+
 // =============================== JSON / Jolt ===================================================
 
 /// Encodes a [`Value`] into its strict Jolt typed-JSON form (`04 §8.2`).
@@ -115,6 +130,17 @@ const SIGIL_POINT: &str = "@";
 /// sigil table.
 #[must_use]
 pub fn value_to_jolt(value: &Value) -> Json {
+    value_to_jolt_at(value, 0)
+}
+
+/// [`value_to_jolt`] with the current nesting depth threaded through, so the recursion can be bounded
+/// (`SEC-190`). `depth` counts levels from the root (the root value is depth 0). A subtree deeper than
+/// [`MAX_ENCODE_DEPTH`] encodes as `null` rather than recursing — unreachable for any engine-produced
+/// value, but a stack-overflow guard against a pathological one (an overflow is an uncatchable abort).
+fn value_to_jolt_at(value: &Value, depth: usize) -> Json {
+    if depth > MAX_ENCODE_DEPTH {
+        return Json::Null;
+    }
     match value {
         Value::Null => Json::Null,
         Value::Boolean(b) => sigil(SIGIL_BOOL, Json::String(b.to_string())),
@@ -123,11 +149,11 @@ pub fn value_to_jolt(value: &Value) -> Json {
         Value::Float(f) => sigil(SIGIL_REAL, Json::String(format_float(*f))),
         Value::String(s) => sigil(SIGIL_STR, Json::String(s.clone())),
         Value::Bytes(b) => sigil(SIGIL_BYTES, Json::String(to_hex(b))),
-        Value::List(xs) => Json::Array(xs.iter().map(value_to_jolt).collect()),
+        Value::List(xs) => Json::Array(xs.iter().map(|x| value_to_jolt_at(x, depth + 1)).collect()),
         Value::Map(kv) => {
             let mut inner = JsonMap::with_capacity(kv.len());
             for (k, v) in kv {
-                inner.insert(k.clone(), value_to_jolt(v));
+                inner.insert(k.clone(), value_to_jolt_at(v, depth + 1));
             }
             sigil(SIGIL_MAP, Json::Object(inner))
         }
@@ -373,7 +399,18 @@ fn decode_point(payload: &Json) -> Result<Value, ValueCodecError> {
 /// string (the `T`-sigil payload) so the two codecs agree on temporal text.
 #[must_use]
 pub fn value_to_cbor(value: &Value) -> ciborium::Value {
+    value_to_cbor_at(value, 0)
+}
+
+/// [`value_to_cbor`] with the current nesting depth threaded through, so the recursion can be bounded
+/// (`SEC-190`). `depth` counts levels from the root (the root value is depth 0). A subtree deeper than
+/// [`MAX_ENCODE_DEPTH`] encodes as `null` rather than recursing — unreachable for any engine-produced
+/// value, but a stack-overflow guard against a pathological one (an overflow is an uncatchable abort).
+fn value_to_cbor_at(value: &Value, depth: usize) -> ciborium::Value {
     use ciborium::Value as Cbor;
+    if depth > MAX_ENCODE_DEPTH {
+        return Cbor::Null;
+    }
     match value {
         Value::Null => Cbor::Null,
         Value::Boolean(b) => Cbor::Bool(*b),
@@ -381,10 +418,10 @@ pub fn value_to_cbor(value: &Value) -> ciborium::Value {
         Value::Float(f) => Cbor::Float(*f),
         Value::String(s) => Cbor::Text(s.clone()),
         Value::Bytes(b) => Cbor::Bytes(b.clone()),
-        Value::List(xs) => Cbor::Array(xs.iter().map(value_to_cbor).collect()),
+        Value::List(xs) => Cbor::Array(xs.iter().map(|x| value_to_cbor_at(x, depth + 1)).collect()),
         Value::Map(kv) => Cbor::Map(
             kv.iter()
-                .map(|(k, v)| (Cbor::Text(k.clone()), value_to_cbor(v)))
+                .map(|(k, v)| (Cbor::Text(k.clone()), value_to_cbor_at(v, depth + 1)))
                 .collect(),
         ),
         Value::Date(_)
@@ -829,6 +866,59 @@ mod tests {
     fn cbor_round_trip(v: &Value) -> Value {
         let cbor = value_to_cbor(v);
         cbor_to_value(&cbor).expect("decode")
+    }
+
+    /// A `Value` nested `depth` levels (`[[…[1]…]]`), built iteratively.
+    fn nest(depth: usize) -> Value {
+        let mut v = Value::Integer(1);
+        for _ in 0..depth {
+            v = Value::List(vec![v]);
+        }
+        v
+    }
+
+    /// `SEC-190` / `rmp` #589 (requirement 2): the REST encoders run on tokio `spawn_blocking` threads
+    /// with the DEFAULT ~2 MiB stack. Encoding the deepest value the engine can produce (≤
+    /// [`MAX_ENCODE_DEPTH`]) via **both** codecs — each of which builds AND drops a recursive
+    /// `serde_json` / `ciborium` tree — plus the recursive `Value::Drop`, must NOT overflow that 2 MiB
+    /// stack. Verified on an explicit 2 MiB thread (an overflow would `abort()` the process). Measured
+    /// margin: the same depth also completes on a **1 MiB** stack (≥ 2×), because the
+    /// [`MAX_ENCODE_DEPTH`] cap bounds encoder recursion and each nested-collection frame is small.
+    #[test]
+    fn encoding_and_dropping_a_max_depth_value_is_safe_on_a_2mib_stack() {
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let v = nest(MAX_ENCODE_DEPTH);
+                let j = value_to_jolt(&v);
+                let c = value_to_cbor(&v);
+                assert!(j.is_array() && matches!(c, ciborium::Value::Array(_)));
+                drop(j);
+                drop(c);
+                drop(v);
+            })
+            .expect("spawn")
+            .join()
+            .expect("encoding + dropping a max-depth value must not overflow a 2 MiB stack");
+    }
+
+    /// `SEC-190`: the Jolt and CBOR encoders recurse one frame per nesting level, and a stack overflow
+    /// is an *uncatchable* process abort. A value nested past [`MAX_ENCODE_DEPTH`] must be truncated
+    /// (the over-deep subtree encoded as `null`) rather than recursed, so a value deeper than the
+    /// engine should ever produce cannot abort the server on the response path. Shallow values are
+    /// unaffected and round-trip byte-for-byte.
+    #[test]
+    fn jolt_and_cbor_encoders_bound_nesting_depth() {
+        // Past the cap: both encoders return (no stack overflow). Built only slightly over the cap so
+        // the source value's own recursive `Drop` stays stack-safe in the test.
+        let over = nest(MAX_ENCODE_DEPTH + 8);
+        let _ = value_to_jolt(&over);
+        let _ = value_to_cbor(&over);
+
+        // A realistic shallow value is unaffected and still round-trips exactly.
+        let shallow = nest(5);
+        assert_eq!(jolt_round_trip(&shallow), shallow);
+        assert_eq!(cbor_round_trip(&shallow), shallow);
     }
 
     #[test]

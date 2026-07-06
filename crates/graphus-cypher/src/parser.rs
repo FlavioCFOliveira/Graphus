@@ -145,6 +145,16 @@ pub enum SyntaxErrorKind {
     /// range (`i64::MIN..=i64::MAX`). openCypher classifies this as a compile-time `SyntaxError`
     /// (TCK detail `IntegerOverflow`; `tck/.../literals/Literals2`/`Literals3`/`Literals4`).
     IntegerOverflow,
+    /// The query stacks more than [`MAX_QUERY_CLAUSES`] **operator-producing structural units** — the
+    /// sum of its clauses and its path chain links (`rmp` #589). Unlike expression nesting (bounded by
+    /// [`SyntaxErrorKind::NestingTooDeep`]), stacked clauses (`WITH … WITH … …`, nested `CALL { … }`)
+    /// AND long path patterns (`MATCH ()-->()-->…`) are parsed **iteratively**, so their count is not
+    /// bounded by the expression-depth guard — yet each clause becomes one more `Project`/`Filter` and
+    /// each hop one more `Expand`, stacked on the same operator spine the executor recurses through per
+    /// row (each `input.next()` a native frame). An unbounded chain or path therefore overflows the
+    /// execution stack — an *uncatchable* process abort (SIGABRT). Bounding the combined count converts
+    /// that into a recoverable compile-time `SyntaxError`.
+    TooManyClauses,
 }
 
 impl fmt::Display for SyntaxErrorKind {
@@ -162,6 +172,11 @@ impl fmt::Display for SyntaxErrorKind {
                 f.write_str("integer literal out of range (does not fit a 64-bit signed integer)")
             }
             Self::NestingTooDeep => f.write_str("expression nests too deeply"),
+            Self::TooManyClauses => write!(
+                f,
+                "query has too many clauses or path elements (limit {MAX_QUERY_CLAUSES}); \
+                 split it into smaller statements or shorten the path pattern"
+            ),
         }
     }
 }
@@ -271,6 +286,35 @@ impl Query {
 /// The server also sizes its query threads' stacks to absorb a legal at-the-limit query with margin.
 pub const MAX_EXPR_DEPTH: usize = 1_000;
 
+/// The maximum number of clauses a single statement may contain before the parser raises
+/// [`SyntaxErrorKind::TooManyClauses`] (`rmp` #589, the clause-count analogue of [`MAX_EXPR_DEPTH`]).
+///
+/// [`MAX_EXPR_DEPTH`] bounds *expression* nesting, but a statement's **clauses** are parsed
+/// iteratively (`parse_single_query`'s loop, and the same loop inside every nested `CALL { … }`
+/// subquery), so their count is otherwise unbounded. Each clause lowers to one more level of the
+/// nested operator tree, and the Volcano executor pulls a row by recursing `input.next()` **one stack
+/// frame per operator level** (`Operator::Project`/`Filter`). A self-referential chain such as
+/// `WITH [a] AS a` repeated tens of thousands of times therefore overflows the execution stack — an
+/// *uncatchable* process abort (SIGABRT) that would take down every database the server hosts — and
+/// it does so *before* any per-value guard runs, because the descent reaches the leaf before the
+/// bottom-up projection begins. This bound rejects such a statement as a recoverable `SyntaxError`
+/// during parsing, before any deep tree is built or executed. It is measured to be far above any
+/// legitimate query yet safely below the operator-tree recursion depth that exhausts the engine's
+/// large dedicated stack (`graphus_server::engine::QUERY_ENGINE_STACK_SIZE`, 64 MiB).
+///
+/// The value is calibrated empirically (`04 §11.4`, "measure to decide"): the openCypher TCK's
+/// deliberately-large scenario `clauses/create/Create4 [2] Many CREATE clauses` stacks **759** CREATE
+/// clauses and must pass, so the limit must exceed it; and a `WITH [a] AS a` chain executes safely up
+/// to ~800 stacked operators on a 64 MiB *debug* stack but overflows by ~1000 (release frames are
+/// several-fold smaller, so the release ceiling is well above this). `1024` clears the TCK scenario
+/// with margin while staying below the operator-recursion ceiling on the production (release) engine
+/// stack. Counted across the **whole** statement (top-level chain + every nested subquery), so deeply
+/// nested `CALL { … }` is bounded too.
+///
+/// Re-exported at the crate root ([`crate::MAX_QUERY_CLAUSES`]) as part of the engine-wide structural
+/// depth contract.
+pub const MAX_QUERY_CLAUSES: usize = 1024;
+
 struct Parser<'t, 's> {
     /// The tokens to parse.
     tokens: &'t [Token],
@@ -294,6 +338,27 @@ struct Parser<'t, 's> {
     /// parenthesised group, a function argument, an index `[…]`, a comprehension body) that must
     /// **share** the same fold budget rather than reset it.
     in_expr: bool,
+    /// The number of **operator-producing structural units** parsed so far across the **whole**
+    /// statement (`rmp` #589, sprint-52 E-1 completeness). Charged (via
+    /// [`Self::charge_structural_unit`]) once per clause — of the top-level chain and of every nested
+    /// `CALL { … }` subquery — AND once per **relationship chain link** of every path pattern (each
+    /// `-[…]->()` hop lowers to one nested `Expand` operator). Bounded by [`MAX_QUERY_CLAUSES`].
+    ///
+    /// The executor's Volcano pipeline recurses **one native stack frame per operator level**, and a
+    /// path's `Expand`s stack onto the same spine as the enclosing clauses' `Project`s, so the operator
+    /// tree depth is `clauses + total path hops`. Bounding **that sum** (not clauses alone — a single
+    /// `MATCH ()-->()-->…` of thousands of hops is one clause but a thousands-deep operator tree) is
+    /// what converts an adversarially deep statement into a recoverable `SyntaxError` rather than an
+    /// execution-time stack overflow / process abort. It is the structural analogue of the
+    /// [`Self::depth`] / [`Self::expr_folds`] expression-depth guards.
+    structural_units: usize,
+    /// When `true`, path chain links are NOT charged against the structural budget (`rmp` #589, E-1).
+    /// Only **read** patterns (`MATCH`, `OPTIONAL MATCH`, pattern comprehensions/predicates) lower a
+    /// path's hops to nested `Expand` operators the executor recurses through per row; **write** patterns
+    /// (`CREATE`, `MERGE`) materialise their whole path iteratively in one operator, with no per-hop
+    /// recursion — so their hops must not be charged (a legitimate `CREATE ()-->()` × N stays valid).
+    /// Set for the duration of a `CREATE`/`MERGE` pattern parse via a save/restore guard.
+    suppress_hop_charge: bool,
 }
 
 /// An RAII guard that decrements [`Parser::depth`] when it is dropped, so the depth is restored on
@@ -331,6 +396,8 @@ impl<'t, 's> Parser<'t, 's> {
             depth: 0,
             expr_folds: 0,
             in_expr: false,
+            structural_units: 0,
+            suppress_hop_charge: false,
         }
     }
 
@@ -565,10 +632,42 @@ impl<'t, 's> Parser<'t, 's> {
         })
     }
 
-    /// Parses one clause if the current token begins one; returns `None` at a clause boundary
+    /// Charges one operator-producing structural unit (a clause or a path chain link) against the
+    /// whole-statement budget ([`MAX_QUERY_CLAUSES`], `rmp` #589), erroring with
+    /// [`SyntaxErrorKind::TooManyClauses`] once the running total exceeds it. See
+    /// [`Self::structural_units`] for why the clause count and the path-hop count share one budget.
+    fn charge_structural_unit(&mut self, at: Span) -> Result<(), SyntaxError> {
+        self.structural_units += 1;
+        if self.structural_units > MAX_QUERY_CLAUSES {
+            return Err(SyntaxError::new(SyntaxErrorKind::TooManyClauses, at));
+        }
+        Ok(())
+    }
+
+    /// Parses one clause if the current token begins one, counting it against the whole-statement
+    /// structural budget ([`MAX_QUERY_CLAUSES`], `rmp` #589) before delegating to the actual clause
+    /// parse.
+    ///
+    /// Every clause of the top-level chain and of every nested `CALL { … }` subquery flows through
+    /// here, so a single running counter (shared with path chain links, see
+    /// [`Self::charge_structural_unit`]) bounds the depth of the nested operator tree the executor
+    /// recurses through — converting an adversarially long chain into a recoverable `SyntaxError`
+    /// instead of an execution-time stack overflow. The count is charged only once a clause is actually
+    /// recognised (a clause boundary returns `None` uncharged).
+    fn try_parse_clause(&mut self) -> Result<Option<Clause>, SyntaxError> {
+        let start = self.here_span();
+        let parsed = self.try_parse_clause_inner()?;
+        if parsed.is_some() {
+            self.charge_structural_unit(start)?;
+        }
+        Ok(parsed)
+    }
+
+    /// The actual per-clause parse (the clause-budget accounting lives in the
+    /// [`try_parse_clause`](Self::try_parse_clause) wrapper). Returns `None` at a clause boundary
     /// (`UNION`, `;`, EOF, or a token that cannot start a clause — left for the caller / trailing
     /// check).
-    fn try_parse_clause(&mut self) -> Result<Option<Clause>, SyntaxError> {
+    fn try_parse_clause_inner(&mut self) -> Result<Option<Clause>, SyntaxError> {
         let kind = match self.peek_kind() {
             Some(k) => k,
             None => return Ok(None),
@@ -874,7 +973,13 @@ impl<'t, 's> Parser<'t, 's> {
     fn parse_create(&mut self) -> Result<CreateClause, SyntaxError> {
         let start = self.here_span().start;
         self.expect(&TokenKind::Create, "CREATE")?;
-        let pattern = self.parse_pattern()?;
+        // `rmp` #589: a CREATE path is materialised iteratively (no per-hop `Expand` recursion), so its
+        // hops are not charged against the structural budget (guard restored on both success and error).
+        let prev = self.suppress_hop_charge;
+        self.suppress_hop_charge = true;
+        let pattern = self.parse_pattern();
+        self.suppress_hop_charge = prev;
+        let pattern = pattern?;
         let end = pattern.last().map_or(start, |p| p.span.end);
         Ok(CreateClause {
             pattern,
@@ -886,7 +991,13 @@ impl<'t, 's> Parser<'t, 's> {
     fn parse_merge(&mut self) -> Result<MergeClause, SyntaxError> {
         let start = self.here_span().start;
         self.expect(&TokenKind::Merge, "MERGE")?;
-        let pattern = self.parse_pattern_part()?;
+        // `rmp` #589: a MERGE path is materialised iteratively (no per-hop `Expand` recursion), so its
+        // hops are not charged against the structural budget (guard restored on both success and error).
+        let prev = self.suppress_hop_charge;
+        self.suppress_hop_charge = true;
+        let pattern = self.parse_pattern_part();
+        self.suppress_hop_charge = prev;
+        let pattern = pattern?;
         let mut end = pattern.span.end;
         let mut actions = Vec::new();
         while self.at(&TokenKind::On) {
@@ -1262,6 +1373,15 @@ impl<'t, 's> Parser<'t, 's> {
         let mut chain = Vec::new();
         // A chain link begins with a relationship: an arrow head (`<`) or a dash (`-`/`--`).
         while self.at_relationship_start() {
+            // `rmp` #589 (E-1 completeness): each hop of a READ path lowers to one nested `Expand`
+            // operator, and a path is parsed iteratively (no `MAX_EXPR_DEPTH` frame) — so a single
+            // `MATCH ()-->()-->…` of thousands of hops is one clause yet a thousands-deep operator tree
+            // that overflows the engine/reader stack at execution. Charge each hop against the shared
+            // structural budget so an over-long path is a recoverable `SyntaxError`, not a process abort.
+            // `CREATE`/`MERGE` paths materialise iteratively (no per-hop recursion) and are not charged.
+            if !self.suppress_hop_charge {
+                self.charge_structural_unit(self.here_span())?;
+            }
             let relationship = self.parse_relationship_pattern()?;
             let node = self.parse_node_pattern()?;
             chain.push(PatternChainLink { relationship, node });

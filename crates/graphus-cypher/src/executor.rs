@@ -1019,6 +1019,7 @@ fn project_row(row: &Row, items: &[ProjectionColumn], ctx: &mut Ctx<'_>) -> Resu
                 ctx.functions,
                 &ctx.clock,
             )?;
+            reject_over_deep_projection(&v)?;
             values.push(v);
         }
         return Ok(crate::runtime::Row::from_schema_values(schema, values));
@@ -1034,9 +1035,42 @@ fn project_row(row: &Row, items: &[ProjectionColumn], ctx: &mut Ctx<'_>) -> Resu
             ctx.functions,
             &ctx.clock,
         )?;
+        reject_over_deep_projection(&v)?;
         out.set(col.alias.clone(), v);
     }
     Ok(out)
+}
+
+/// Rejects a projected value that nests deeper than [`MAX_VALUE_DEPTH`](crate::value_depth::MAX_VALUE_DEPTH),
+/// the runtime value-nesting-depth budget (`SEC-190`, CWE-674, rmp #589).
+///
+/// A `WITH`/`RETURN` projection is where a runtime value is **rebound**, and a self-referential chain
+/// (`WITH [a] AS a`, `WITH collect(a) AS a`) adds one nesting level per clause with no clause-count
+/// limit — so an attacker can build, from a shallow query under the message-size cap, a value nested
+/// tens of thousands deep. Left unchecked it overflows the stack the first time a depth-recursive
+/// consumer touches it (value collapse [`to_value`](crate::eval::to_value), the wire encoders, or the
+/// derived recursive `Drop`), and a stack overflow is an **uncatchable process abort** — it would take
+/// down every database and connection the server hosts.
+///
+/// Checking at each projection catches the chain **early** (at depth `MAX_VALUE_DEPTH + 1`, long before
+/// it grows dangerous), so no bound row value ever exceeds the cap and every downstream recursive walk
+/// stays comfortably inside a worker stack. The measurement is iterative (it never recurses the
+/// attacker-controlled depth itself), so it is safe and `O(MAX_VALUE_DEPTH)`. Rejection is a recoverable
+/// [`EvalError::ResourceLimit`] (the query fails cleanly; the connection and the server survive).
+///
+/// [`MAX_VALUE_DEPTH`](crate::value_depth::MAX_VALUE_DEPTH) is far above any legitimate Cypher value, so
+/// conforming queries and the TCK are unaffected.
+#[inline]
+fn reject_over_deep_projection(v: &RowValue) -> Result<(), ExecError> {
+    if crate::value_depth::rowvalue_depth_exceeds(v, crate::value_depth::MAX_VALUE_DEPTH) {
+        return Err(ExecError::Eval(EvalError::ResourceLimit {
+            detail: format!(
+                "value nesting depth exceeds the limit of {}",
+                crate::value_depth::MAX_VALUE_DEPTH
+            ),
+        }));
+    }
+    Ok(())
 }
 
 /// Merges two rows (left then right); right bindings win on a name clash (the right branch's view).
@@ -5022,6 +5056,21 @@ impl Accumulator {
     /// # Errors
     /// [`EvalError::ResourceLimit`] (as [`ExecError::Eval`]) once the buffer would cross the budget.
     fn push_collected(&mut self, rv: RowValue) -> Result<(), ExecError> {
+        // `SEC-190` (CWE-674, rmp #589): `collect` is a runtime value-materialisation point, and a
+        // self-referential chain (`WITH collect(a) AS a`) nests one level deeper per clause. The
+        // gathered element becomes one level deeper once wrapped in the collected list, so bound the
+        // element to `MAX_VALUE_DEPTH - 1` to keep the finished list within `MAX_VALUE_DEPTH`. Without
+        // this, the next clause's `eval(collect(a))` clones an ever-deeper `a` and overflows the stack
+        // — an uncatchable process abort. The check is iterative (never recurses the attacker depth).
+        let depth_limit = crate::value_depth::MAX_VALUE_DEPTH.saturating_sub(1);
+        if crate::value_depth::rowvalue_depth_exceeds(&rv, depth_limit) {
+            return Err(ExecError::Eval(EvalError::ResourceLimit {
+                detail: format!(
+                    "collected value nesting depth exceeds the limit of {}",
+                    crate::value_depth::MAX_VALUE_DEPTH
+                ),
+            }));
+        }
         let next = self
             .collected_bytes
             .saturating_add(crate::value_size::estimate_rowvalue_bytes(&rv));
@@ -5937,7 +5986,20 @@ fn eval_property_source(
     row: &Row,
     ctx: &mut Ctx<'_>,
 ) -> Result<Vec<(String, Value)>, ExecError> {
-    match eval(value, row, ctx.params, ctx.graph, ctx.functions, &ctx.clock)? {
+    let source = eval(value, row, ctx.params, ctx.graph, ctx.functions, &ctx.clock)?;
+    // `SEC-190` (rmp #589): a `RowValue::Map` collapses via `to_value` (depth-recursive) below, and any
+    // entry value is about to be persisted, so bound the depth before either can happen. A structural
+    // map from an over-deep chain (`SET x = m` where `m` was self-nested) would otherwise overflow the
+    // stack during collapse or on a later read — an uncatchable process abort.
+    if crate::value_depth::rowvalue_depth_exceeds(&source, crate::value_depth::MAX_VALUE_DEPTH) {
+        return Err(ExecError::Eval(EvalError::ResourceLimit {
+            detail: format!(
+                "value nesting depth exceeds the limit of {}",
+                crate::value_depth::MAX_VALUE_DEPTH
+            ),
+        }));
+    }
+    match source {
         // A graph entity contributes its own property set (the `SET x = entity` copy form).
         RowValue::Node(n) => Ok(ctx.graph.node_properties(n.id).unwrap_or_default()),
         RowValue::Rel(r) => Ok(ctx.graph.rel_properties(r.id).unwrap_or_default()),
@@ -5950,6 +6012,27 @@ fn eval_property_source(
         RowValue::Value(Value::Null) => Ok(Vec::new()),
         _ => Err(ExecError::PropertiesNotAMap),
     }
+}
+
+/// Rejects a property [`Value`] about to be **persisted** that nests deeper than the runtime
+/// value-nesting-depth budget (`SEC-190`, CWE-674, rmp #589).
+///
+/// The projection guard ([`reject_over_deep_projection`]) keeps a value bound in a *row* within the
+/// budget; this keeps a value written to *storage* within it too, so the iterative accumulation loop
+/// `SET n.p = [n.p]` (one nesting level added per statement, unbounded across a session) can never
+/// persist a value whose later read (a depth-recursive decode) or encode would overflow the stack.
+/// Rejection is a recoverable [`EvalError::ResourceLimit`]. The check is iterative and `O(cap)`.
+#[inline]
+fn reject_over_deep_value(v: &Value) -> Result<(), ExecError> {
+    if crate::value_depth::depth_exceeds(v, crate::value_depth::MAX_VALUE_DEPTH) {
+        return Err(ExecError::Eval(EvalError::ResourceLimit {
+            detail: format!(
+                "value nesting depth exceeds the limit of {}",
+                crate::value_depth::MAX_VALUE_DEPTH
+            ),
+        }));
+    }
+    Ok(())
 }
 
 /// Applies a list of `SET` ops to the current row's bound entities.
@@ -5966,6 +6049,11 @@ fn apply_set_ops(ops: &[SetOp], row: &Row, ctx: &mut Ctx<'_>) -> Result<(), Exec
                     continue;
                 };
                 let v = eval_value(value, row, ctx.params, ctx.graph, ctx.functions, &ctx.clock)?;
+                // `SEC-190` (rmp #589): never persist a value nested past the depth budget. Storing an
+                // ever-deeper property (`SET n.p = [n.p]` iterated across statements) would grow a value
+                // whose later read/encode overflows the stack — an uncatchable process abort. Capping
+                // the write keeps stored values shallow, so every read decodes safely.
+                reject_over_deep_value(&v)?;
                 set_entity_property(entity, &key, v, ctx);
             }
             SetOp::ReplaceProperties { target, value } => {
@@ -6948,6 +7036,7 @@ mod tests {
     use crate::graph_access::MemGraph;
     use crate::lexer::tokenize;
     use crate::lower::lower;
+    use crate::parser::MAX_QUERY_CLAUSES;
     use crate::parser::parse_tokens;
     use crate::physical::plan_physical;
     use crate::semantics::analyze;
@@ -7795,6 +7884,223 @@ mod tests {
             Ok(mut cursor) => cursor
                 .collect_all()
                 .expect_err("query was expected to fail at runtime"),
+        }
+    }
+
+    // ---- SEC-190 / rmp #589: stack-overflow hardening for a self-referential clause chain ---------
+    //
+    // A self-referential chain such as `WITH [a] AS a` repeated has TWO coupled stack-overflow
+    // vectors, both reachable from a single shallow authenticated query and both an *uncatchable*
+    // process abort (SIGABRT) — which defeats panic isolation and takes down every database the
+    // server hosts:
+    //
+    //   (1) OPERATOR-TREE recursion: each clause is one more nested `Operator::Project`, and the
+    //       Volcano executor pulls a row by recursing `input.next()` one frame per level. This
+    //       overflows *first* (the descent reaches the leaf before any per-value guard runs) and even
+    //       with a constant shallow value. Bounded by the parser's `MAX_QUERY_CLAUSES` clause budget,
+    //       which rejects the chain as a recoverable `SyntaxError` before any tree is built/executed.
+    //   (2) VALUE-NESTING recursion: the rebound value nests one level deeper per clause and later
+    //       overflows a depth-recursive consumer (`to_value`, the wire encoders, the recursive
+    //       `Drop`). Bounded by `MAX_VALUE_DEPTH` at every runtime materialisation point (projection,
+    //       `collect`, `SET` write). Reachable independently of (1) via a near-cap PARAMETER (allowed
+    //       at the bind boundary at exactly the cap) wrapped once by a single shallow clause.
+
+    /// Runs the full pipeline with `params`, returning the first recoverable error stage (or the rows).
+    /// Every stage's error is a recoverable [`graphus_core::GraphusError`]; a stack overflow would be an
+    /// abort, so reaching `Ok`/`Err` here at all is itself the survival assertion.
+    fn run_full(
+        src: &str,
+        graph: &mut MemGraph,
+        params: &crate::binding::Parameters,
+    ) -> Result<Vec<Row>, graphus_core::GraphusError> {
+        let toks = tokenize(src).map_err(graphus_core::GraphusError::from)?;
+        let ast = parse_tokens(&toks, src).map_err(graphus_core::GraphusError::from)?;
+        let validated = analyze(&ast).map_err(graphus_core::GraphusError::from)?;
+        let plan = plan_physical(&lower(&validated), &IndexCatalog::empty());
+        let bound = crate::binding::bind_parameters(&plan, params)
+            .map_err(graphus_core::GraphusError::from)?;
+        let mut cursor = execute(&plan, &bound, graph).map_err(graphus_core::GraphusError::from)?;
+        cursor
+            .collect_all()
+            .map_err(graphus_core::GraphusError::from)
+    }
+
+    /// A pure-property value nested exactly `depth` levels (`[[…[0]…]]`), built iteratively.
+    fn nested_value(depth: usize) -> Value {
+        let mut v = Value::Integer(0);
+        for _ in 0..depth {
+            v = Value::List(vec![v]);
+        }
+        v
+    }
+
+    /// Vector (1): the operator-tree recursion. A `WITH [a] AS a` chain well past the clause budget is
+    /// rejected as a recoverable compile error **before** any deep operator tree is built or executed,
+    /// and the engine keeps serving. Proves the SIGABRT is converted to a clean, isolated failure.
+    #[test]
+    fn deep_self_referential_chain_is_rejected_not_aborted() {
+        let mut src = String::from("WITH [1] AS a ");
+        for _ in 0..(MAX_QUERY_CLAUSES + 200) {
+            src.push_str("WITH [a] AS a ");
+        }
+        src.push_str("RETURN a");
+
+        let mut g = MemGraph::new();
+        let err = run_full(&src, &mut g, &crate::binding::Parameters::new())
+            .expect_err("an over-long clause chain must be a recoverable error, not an abort");
+        assert!(
+            matches!(err, graphus_core::GraphusError::Compile(_)),
+            "the chain must be rejected at compile time (clause budget), got {err:?}"
+        );
+
+        // The engine survived: a subsequent statement still runs to completion.
+        let rows = run("RETURN 1 AS ok", &mut g);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].value("ok"), Value::Integer(1));
+    }
+
+    /// The `collect`-based self-referential chain (`WITH collect(a) AS a`) is the same operator-tree
+    /// vector and is likewise rejected at the clause budget — recoverable, not an abort.
+    #[test]
+    fn deep_self_referential_collect_chain_is_rejected_not_aborted() {
+        let mut src = String::from("WITH [1] AS a ");
+        for _ in 0..(MAX_QUERY_CLAUSES + 200) {
+            src.push_str("WITH collect(a) AS a ");
+        }
+        src.push_str("RETURN a");
+
+        let mut g = MemGraph::new();
+        let err = run_full(&src, &mut g, &crate::binding::Parameters::new())
+            .expect_err("an over-long collect chain must be a recoverable error, not an abort");
+        assert!(
+            matches!(err, graphus_core::GraphusError::Compile(_)),
+            "got {err:?}"
+        );
+    }
+
+    /// The clause budget is a boundary, not a cliff: a statement with exactly `MAX_QUERY_CLAUSES`
+    /// clauses parses; one more is a recoverable `SyntaxError`. (Parse-only — executing a chain this
+    /// long on the small default test stack is a separate matter; the budget's job is to reject the
+    /// *over*-limit case before execution.)
+    #[test]
+    fn clause_budget_boundary_is_exact() {
+        // A single query is a chain of clauses; build exactly `MAX_QUERY_CLAUSES` of them.
+        let at_limit = {
+            let mut s = String::from("WITH 1 AS a ");
+            for _ in 0..(MAX_QUERY_CLAUSES - 2) {
+                s.push_str("WITH 1 AS a ");
+            }
+            s.push_str("RETURN a"); // total = 1 + (LIMIT-2) + 1 = LIMIT clauses
+            s
+        };
+        let toks = tokenize(&at_limit).expect("lex");
+        assert!(
+            parse_tokens(&toks, &at_limit).is_ok(),
+            "a statement with exactly MAX_QUERY_CLAUSES clauses must parse"
+        );
+
+        let over_limit = format!("{at_limit} UNION RETURN 2 AS a"); // pushes past the budget
+        let toks = tokenize(&over_limit).expect("lex");
+        let err = parse_tokens(&toks, &over_limit).expect_err("over-limit must be rejected");
+        assert!(
+            matches!(err.kind, crate::parser::SyntaxErrorKind::TooManyClauses),
+            "got {:?}",
+            err.kind
+        );
+    }
+
+    /// Vector (2), reachable within the clause budget: a **parameter** nested at exactly the depth cap
+    /// (allowed at the bind boundary) is wrapped once by a single shallow projection, so the projected
+    /// value exceeds `MAX_VALUE_DEPTH`. The projection guard must reject it as a recoverable
+    /// `ResourceLimit`, not let it flow to a depth-recursive `to_value`/encoder/`Drop`.
+    #[test]
+    fn over_deep_value_from_parameter_projection_is_recoverable() {
+        let deep = nested_value(crate::value_depth::MAX_VALUE_DEPTH); // exactly at the cap: bind allows it
+        let params = crate::binding::Parameters::new().with("p", deep);
+        let mut g = MemGraph::new();
+        let err = run_full("RETURN [$p] AS r", &mut g, &params)
+            .expect_err("wrapping a cap-depth parameter must exceed the value budget");
+        assert!(
+            matches!(err, graphus_core::GraphusError::Runtime(_)),
+            "must be a recoverable runtime error (ResourceLimit), got {err:?}"
+        );
+        // Engine survived.
+        let rows = run("RETURN 1 AS ok", &mut g);
+        assert_eq!(rows[0].value("ok"), Value::Integer(1));
+    }
+
+    /// Vector (2) via `collect`: collecting a cap-depth parameter would build a list one level past the
+    /// cap; the `push_collected` gather guard rejects it (recoverable), before the deep value is bound.
+    #[test]
+    fn over_deep_value_from_parameter_collect_is_recoverable() {
+        let deep = nested_value(crate::value_depth::MAX_VALUE_DEPTH);
+        let params = crate::binding::Parameters::new().with("p", deep);
+        let mut g = MemGraph::new();
+        let err = run_full("WITH $p AS a RETURN collect(a) AS c", &mut g, &params)
+            .expect_err("collecting a cap-depth value must exceed the value budget");
+        assert!(
+            matches!(err, graphus_core::GraphusError::Runtime(_)),
+            "got {err:?}"
+        );
+    }
+
+    /// Vector (2) via `SET`: persisting an over-deep property is rejected (recoverable), so the storage
+    /// accumulation loop `SET n.p = [n.p]` can never poison a later read/encode with an abort.
+    #[test]
+    fn over_deep_value_set_is_recoverable() {
+        let deep = nested_value(crate::value_depth::MAX_VALUE_DEPTH);
+        let params = crate::binding::Parameters::new().with("p", deep);
+        let mut g = MemGraph::new();
+        let _ = g.add_node(["N"], NO_PROPS);
+        let err = run_full("MATCH (n:N) SET n.p = [$p]", &mut g, &params)
+            .expect_err("persisting an over-deep property must be rejected");
+        assert!(
+            matches!(err, graphus_core::GraphusError::Runtime(_)),
+            "got {err:?}"
+        );
+    }
+
+    /// Legitimate nesting (a handful of levels, the realistic case) must be **entirely unaffected** by
+    /// the depth budget — the guards only ever reject the pathological deep value, never a real one.
+    #[test]
+    fn legitimate_moderate_nesting_still_projects() {
+        let mut g = MemGraph::new();
+        // Depth 4 list, and a nested map/list mix — both far under the cap.
+        let rows = run("WITH [[[[1]]]] AS a RETURN a AS r", &mut g);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].value("r"),
+            Value::List(vec![Value::List(vec![Value::List(vec![Value::List(
+                vec![Value::Integer(1)]
+            )])])])
+        );
+
+        let rows = run(
+            "WITH [1] AS a WITH [a] AS a WITH [a, [a]] AS a RETURN a AS r",
+            &mut g,
+        );
+        assert_eq!(rows.len(), 1);
+        // a = [1] -> [[1]] -> [[[1]], [[[1]]]]
+        let inner = Value::List(vec![Value::List(vec![Value::Integer(1)])]); // [[1]]
+        assert_eq!(
+            rows[0].value("r"),
+            Value::List(vec![inner.clone(), Value::List(vec![inner])])
+        );
+    }
+
+    /// A `collect` over legitimately shallow values keeps working (the depth guard is depth-only and
+    /// never trips on width): `collect` of many depth-1 elements is a depth-2 list, far under the cap.
+    #[test]
+    fn wide_shallow_collect_is_unaffected() {
+        let mut g = MemGraph::new();
+        for i in 0..50 {
+            let _ = g.add_node(["N"], [("v", Value::Integer(i))]);
+        }
+        let rows = run("MATCH (n) RETURN collect([n.v]) AS r", &mut g);
+        assert_eq!(rows.len(), 1);
+        match rows[0].value("r") {
+            Value::List(items) => assert_eq!(items.len(), 50),
+            other => panic!("expected a 50-element list, got {other:?}"),
         }
     }
 
