@@ -1398,7 +1398,7 @@ fn resume_parked_statements<
     open: &mut HashMap<u64, OpenTx>,
     extensions: &Arc<graphus_cypher::extension::ExtensionRegistry>,
     metrics: &Arc<Metrics>,
-    db: &Arc<str>,
+    db: &str,
     degraded: &EngineDegraded,
     clock: &Arc<dyn graphus_core::capability::Clock + Send + Sync>,
     active_txns: &mut ActiveTxnGauge,
@@ -3061,6 +3061,29 @@ fn pipelined_group_commit<
             metrics,
             db,
             degraded,
+            active_txns,
+        );
+
+        // Resume PARKED slow-consumer statements BETWEEN hardened batches (`rmp` #593, sprint-52 F C-F2).
+        // Symmetric to the `process_retirements` sweep above: under a sustained group-commit write storm
+        // this outer loop hardens batch after batch without returning to the engine loop, so the loop's
+        // top-of-tick [`resume_parked_statements`] would not run — a coexisting parked statement (an
+        // auto-commit read that fell back inline on a full reader queue, an explicit-txn read, or a
+        // `… RETURN`-bearing write whose consumer briefly filled its bounded egress) would starve for the
+        // whole storm: its consumer stalled, its transaction's GC-pin held, and its per-statement deadline
+        // unenforced (cooperative, checked only on resume). Resuming here delivers each parked statement's
+        // next batch within one hardened batch. Safe: same single engine thread; a statement that
+        // re-suspends is pushed to the back and only gets its next batch on the following pass (its own
+        // budget snapshot), so this never spins on one fast-refilling consumer.
+        resume_parked_statements(
+            parked,
+            coordinator,
+            open,
+            extensions,
+            metrics,
+            db,
+            degraded,
+            clock,
             active_txns,
         );
 
