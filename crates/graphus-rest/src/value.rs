@@ -877,17 +877,22 @@ mod tests {
         v
     }
 
-    /// `SEC-190` / `rmp` #589 (requirement 2): the REST encoders run on tokio `spawn_blocking` threads
-    /// with the DEFAULT ~2 MiB stack. Encoding the deepest value the engine can produce (≤
-    /// [`MAX_ENCODE_DEPTH`]) via **both** codecs — each of which builds AND drops a recursive
-    /// `serde_json` / `ciborium` tree — plus the recursive `Value::Drop`, must NOT overflow that 2 MiB
-    /// stack. Verified on an explicit 2 MiB thread (an overflow would `abort()` the process). Measured
-    /// margin: the same depth also completes on a **1 MiB** stack (≥ 2×), because the
-    /// [`MAX_ENCODE_DEPTH`] cap bounds encoder recursion and each nested-collection frame is small.
+    /// `SEC-190` / `rmp` #589 (requirement 2): the REST server configures its Tokio runtime threads
+    /// (workers + `spawn_blocking`) with an **8 MiB** stack (`graphus-server`'s `build_runtime`),
+    /// precisely so encoding the deepest value the engine can produce (≤ [`MAX_ENCODE_DEPTH`]) never
+    /// overflows. Encoding via **both** codecs — each of which builds AND drops a recursive
+    /// `serde_json` / `ciborium` tree — plus the recursive `Value::Drop`, must NOT overflow that stack.
+    /// This mirrors the server's configured size (a stack overflow is an *uncatchable* `abort()`).
+    ///
+    /// The stack must match the server's config, not the ~2 MiB Tokio default: x86_64 encodes this
+    /// depth in well under 1 MiB, but on **aarch64** (a Tier-1 target — Apple Silicon, arm64 Linux,
+    /// Raspberry Pi 5) each recursive frame is materially larger, so the same depth overflows a 2 MiB
+    /// stack there (it aborted both the `macos-14` and `ubuntu-24.04-arm` CI legs). 8 MiB holds it with
+    /// generous headroom on every arch.
     #[test]
-    fn encoding_and_dropping_a_max_depth_value_is_safe_on_a_2mib_stack() {
+    fn encoding_and_dropping_a_max_depth_value_is_safe_on_an_8mib_stack() {
         std::thread::Builder::new()
-            .stack_size(2 * 1024 * 1024)
+            .stack_size(8 * 1024 * 1024)
             .spawn(|| {
                 let v = nest(MAX_ENCODE_DEPTH);
                 let j = value_to_jolt(&v);

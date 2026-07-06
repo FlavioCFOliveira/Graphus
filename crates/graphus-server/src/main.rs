@@ -63,8 +63,25 @@ fn build_runtime(config: &ServerConfig) -> std::io::Result<tokio::runtime::Runti
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .max_blocking_threads(config.admission.blocking_thread_budget())
+        // Give every runtime-spawned thread (workers AND `spawn_blocking` threads) a larger stack
+        // than Tokio's ~2 MiB default. The REST response encoders (`graphus_rest::value_to_jolt` /
+        // `value_to_cbor`) recurse one frame per value-nesting level up to
+        // `graphus_rest::value::MAX_ENCODE_DEPTH` (1000, mirroring the engine's `MAX_VALUE_DEPTH`), and
+        // a stack overflow on stable Rust is an *uncatchable* process abort. On **aarch64** (a Tier-1
+        // target: Apple Silicon, arm64 Linux, Raspberry Pi 5) each recursive `serde_json`/`ciborium`
+        // build-and-drop frame is materially larger than on x86_64, so a legal deep value that encodes
+        // fine on x86_64's 2 MiB overflows aarch64's — aborting the server on the response path. 8 MiB
+        // holds the deepest legal value with generous headroom on every arch (only the touched pages
+        // are resident, so an idle blocking thread costs nothing). The graphus-rest regression test
+        // `encoding_and_dropping_a_max_depth_value_is_safe_on_a_N_mib_stack` pins this same size.
+        .thread_stack_size(WORKER_THREAD_STACK_BYTES)
         .build()
 }
+
+/// Per-thread stack size for the Tokio runtime (workers + blocking pool), sized so a
+/// `MAX_ENCODE_DEPTH`-deep REST value encodes without overflowing on any Tier-1 arch (notably
+/// aarch64, whose recursive frames are larger than x86_64's). See [`build_runtime`].
+const WORKER_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 /// Runs the server to completion on the current runtime (a clean shutdown returns `Ok`).
 async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
