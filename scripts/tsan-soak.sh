@@ -55,6 +55,20 @@ THREADED_TESTS=(
     # remain here). Connection-admission concurrency is still exercised by the real-thread
     # `connection_stress` test on the normal (non-TSan) CI lanes.
     "graphus-server slow_consumer_no_head_of_line_block"
+    # `rmp` #597: the real-OS-thread durability owners the DST simulator (one cooperative thread,
+    # statement-atomic) structurally cannot cover.
+    #   * group_commit_crash_recovery — N concurrent auto-commit committers drive the pipelined
+    #     group-commit path (batch fdatasync offloaded to the WalSyncThread) and then take a HARD
+    #     crash (the un-synced WAL tail + un-synced dirty pages dropped, no graceful final harden),
+    #     proving ack-after-fsync durability and that an un-acked in-flight batch is dropped WHOLE.
+    #   * gc_reader_reclaim_reuse_588 — the B1 off-thread-reader-vs-GC slot-reuse race (this lane's
+    #     exact charter: a real reader pool + real checkpoint-driven reclaim + real slot reuse on
+    #     genuine OS threads).
+    #   * full_engine_write_io_error — a real threaded engine committing while the store DEVICE
+    #     returns a write I/O error mid-flush; TSan validates the shared-device wrapper is race-free.
+    "graphus-server group_commit_crash_recovery"
+    "graphus-server gc_reader_reclaim_reuse_588"
+    "graphus-server full_engine_write_io_error"
     "graphus-storage dwb_concurrent_eviction_411"
     "graphus-dst real_thread_supernode_stress"
 )

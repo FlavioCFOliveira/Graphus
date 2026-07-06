@@ -12,23 +12,26 @@
 //! Run it with:
 //!
 //! ```text
-//! RUSTFLAGS="--cfg loom" cargo test -p graphus-bufpool --test loom_bufpool --release
+//! RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 \
+//!   cargo test -p graphus-bufpool --test loom_bufpool --release
 //! ```
 //!
-//! `--release` is recommended (loom's search is exponential). Each model is kept deliberately
-//! tiny (2 threads, 1–2 frames, 2–3 pages) so the search terminates quickly; growing any of those
-//! dimensions can blow up the state space.
+//! `--release` is recommended (loom's search is exponential). Most models are kept deliberately tiny
+//! (2 threads, 1–2 frames, 2–3 pages) so the search terminates quickly; the two `rmp` #597 models at
+//! the end use a doublewrite-stager under two evictors and a **3-thread** flush-vs-two-fetch race, so
+//! they need the `LOOM_MAX_PREEMPTIONS=3` bound (the same the `loom_eviction_storm` models use) to keep
+//! the state space tractable. Growing any of these dimensions can blow up the search.
 
 #![cfg(loom)]
 
 use graphus_bufpool::page;
-use graphus_bufpool::{ConcurrentBufferPool, WalRule};
+use graphus_bufpool::{ConcurrentBufferPool, PageStager, WalRule};
 use graphus_core::error::{GraphusError, Result};
 use graphus_core::{Lsn, PageId};
 use graphus_io::{BlockDevice, PAGE_SIZE, Page};
 
-use loom::sync::Arc;
 use loom::sync::atomic::{AtomicUsize, Ordering};
+use loom::sync::{Arc, Mutex};
 
 /// A tiny in-memory device for loom models: a fixed set of durable, checksummed pages and a
 /// per-instance device-read counter so a test can assert "loaded exactly once". Writes land in
@@ -372,5 +375,228 @@ fn loom_with_page_fetched_under_eviction_reads_correct_page() {
         let f = pool.fetch(PageId(0)).unwrap();
         pool.unpin(f);
         assert_eq!(pool.pin_count(f), 0, "with_page_fetched must leak no pin");
+    });
+}
+
+/// A `loom`-driven mock [`PageStager`] modelling the doublewrite buffer's **one-region** invariant
+/// (`rmp` #407/#411, `05 §3`): a single doublewrite region, reserved from the moment a page is staged
+/// until its home write is **durably complete**, and only then freed for reuse. The real
+/// `graphus_storage::dwb::DwbPageStager` lives below the `--cfg loom` boundary (it uses `std::sync`),
+/// so this faithful model lets loom drive the pool's `write_back` → `stage_and_sync` integration under
+/// two concurrent evictors — the interleaving DST (single cooperative thread) structurally cannot reach.
+struct MockStager {
+    /// The single doublewrite region: `Some(page_id)` while a page is staged and its home write is in
+    /// flight; `None` when free. Behind a `loom::sync::Mutex` — the stager's interior lock that
+    /// serialises concurrent evictions' staging and is held **across** the home write (the #411 rule).
+    region: Mutex<Option<u64>>,
+    /// Count of completed `stage_and_sync` calls (one per evicted logged page).
+    staged: Arc<AtomicUsize>,
+}
+
+impl PageStager for MockStager {
+    fn stage_and_sync(
+        &self,
+        page_id: PageId,
+        _image: &[u8],
+        home_write: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        // Hold the region lock across staging AND the home write: the slot's occupant must be durable
+        // home before the region can be reused (`rmp` #411 — the InnoDB slot-reuse-after-durable rule).
+        let mut region = self.region.lock().unwrap();
+        // #411 NO-CLOBBER: the region must be FREE when we claim it — a live occupant here would mean a
+        // second evictor reused the region before the prior page's home write completed (the exact
+        // corruption the doublewrite buffer exists to prevent).
+        assert!(
+            region.is_none(),
+            "DWB region reused while page {:?} was still staged — the prior home write had not \
+             completed (#411 slot-reuse-after-durable violated)",
+            *region
+        );
+        *region = Some(page_id.0);
+        // The home write runs INSIDE the staging critical section (region still reserved).
+        home_write()?;
+        // Home write durable → the region may now be reused.
+        *region = None;
+        self.staged.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn stage_batch_and_sync(&self, batch: &[(PageId, &[u8])]) -> Result<()> {
+        // Not exercised by the eviction path this model drives, but keep the region invariant faithful
+        // if a future model uses the checkpoint/flush path.
+        let region = self.region.lock().unwrap();
+        assert!(region.is_none(), "batch stage over an occupied DWB region");
+        let _ = batch;
+        drop(region);
+        Ok(())
+    }
+}
+
+/// **Mock-stager 2-evictor model (`rmp` #597, gap #4a): the doublewrite-buffer stager under two
+/// concurrent evictors.**
+///
+/// Two dirty, WAL-stamped (logged) pages are made resident in a 2-frame pool; two evictor threads then
+/// each fetch a *different* new page, each forcing the eviction of one resident dirty page — so both
+/// evictions run through [`ConcurrentBufferPool::write_back`]'s `stage_and_sync` path **concurrently**
+/// (each under its own frame latch, contending on the stager's single region). loom explores every
+/// interleaving; on each, the [`MockStager`]'s inline assertions enforce the #411 one-region rule (no
+/// evictor reuses the region while another's page is still staged, and the home write runs inside the
+/// staging critical section), and the model must not deadlock (loom completing the search is the proof
+/// of acyclic lock order: frame-latch → region → device).
+///
+/// Run with:
+/// ```text
+/// RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 \
+///   cargo test -p graphus-bufpool --test loom_bufpool \
+///   loom_two_evictors_through_stager_respect_one_region --release
+/// ```
+#[test]
+fn loom_two_evictors_through_stager_respect_one_region() {
+    loom::model(|| {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let dev = ModelDevice::new(4, reads); // pages 0..3
+        let pool = ConcurrentBufferPool::new(dev, 2).shared();
+
+        let staged = Arc::new(AtomicUsize::new(0));
+        // loom's `Arc` does not auto-unsize in argument position; build a `std::sync::Arc<dyn …>` (which
+        // does coerce) and wrap it into a loom `Arc` via `from_std` (loom 0.7 `Arc::from_std`).
+        let std_stager: std::sync::Arc<dyn PageStager> = std::sync::Arc::new(MockStager {
+            region: Mutex::new(None),
+            staged: Arc::clone(&staged),
+        });
+        let stager: Arc<dyn PageStager> = Arc::from_std(std_stager);
+        pool.set_page_stager(stager);
+
+        // Seed two dirty, LOGGED (WAL-stamped, non-zero page_lsn) resident pages — so evicting either one
+        // takes the staged (doublewrite-protected) path, not the unlogged fast path.
+        {
+            let f = pool.fetch(PageId(0)).expect("seed fetch 0");
+            pool.with_page_mut_lsn(f, Lsn(0x10), |pg| pg[100] = 0xA0);
+            pool.unpin(f);
+        }
+        {
+            let f = pool.fetch(PageId(1)).expect("seed fetch 1");
+            pool.with_page_mut_lsn(f, Lsn(0x20), |pg| pg[100] = 0xB0);
+            pool.unpin(f);
+        }
+
+        // Two evictors: each fetches a distinct NEW page (2, 3), each forcing the eviction of one of the
+        // resident dirty pages (0, 1) → a concurrent `stage_and_sync` through the single-region stager.
+        let p2 = pool.clone();
+        let e2 = loom::thread::spawn(move || {
+            if let Ok(f) = p2.fetch(PageId(2)) {
+                assert_eq!(
+                    p2.with_page(f, |pg| pg[100]),
+                    3,
+                    "evictor read wrong page for 2"
+                );
+                p2.unpin(f);
+            }
+        });
+        let p3 = pool.clone();
+        let e3 = loom::thread::spawn(move || {
+            if let Ok(f) = p3.fetch(PageId(3)) {
+                assert_eq!(
+                    p3.with_page(f, |pg| pg[100]),
+                    4,
+                    "evictor read wrong page for 3"
+                );
+                p3.unpin(f);
+            }
+        });
+
+        e2.join().unwrap();
+        e3.join().unwrap();
+
+        // Both resident dirty pages were evicted, so both took the staged path exactly once. (With two
+        // frames and two single-fetch threads that both start with unpinned victims available, each
+        // fetch succeeds and evicts one dirty page — the eviction of both is guaranteed.)
+        assert_eq!(
+            staged.load(Ordering::SeqCst),
+            2,
+            "both dirty pages must be staged-and-home-written exactly once through the DWB stager"
+        );
+
+        // No pin leaked by any evictor on any interleaving: every frame is evictable again.
+        for id in [PageId(2), PageId(3)] {
+            let f = pool.fetch(id).unwrap();
+            pool.unpin(f);
+        }
+    });
+}
+
+/// **3-thread fetch/flush model (`rmp` #597, gap #4b): a write-back concurrent with two readers.**
+///
+/// Beyond the existing ≤2-thread models, this drives **three** threads over a 2-frame / 3-page pool:
+/// one thread [`flush_all`](ConcurrentBufferPool::flush_all)s (writing back a resident dirty page)
+/// while two others [`fetch`] *different* pages (forcing eviction of the resident pages the flusher is
+/// walking). loom explores the pin / latch / write-back interleavings a two-thread model cannot reach
+/// (a flush write-back racing two independent evictions). On every interleaving the byte-integrity
+/// invariant holds — each reader that succeeds observes **exactly** its own page's stamped byte, never
+/// a torn or cross-page value — no pin leaks, and the model does not deadlock (loom completing the
+/// exhaustive-within-the-preemption-bound search is itself the acyclic-lock-order proof).
+///
+/// Three schedulable threads is a large state space; run under a preemption cap (the same `= 3` bound
+/// the `loom_eviction_storm` models use) so the search terminates:
+/// ```text
+/// RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 \
+///   cargo test -p graphus-bufpool --test loom_bufpool \
+///   loom_three_threads_flush_while_two_fetch --release
+/// ```
+#[test]
+fn loom_three_threads_flush_while_two_fetch() {
+    loom::model(|| {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let dev = ModelDevice::new(3, reads); // pages 0,1,2 stamped 1,2,3 at [100]
+        let pool = ConcurrentBufferPool::new(dev, 2).shared();
+
+        // Seed page 0 dirty & resident (a real write-back target for the flusher).
+        {
+            let f = pool.fetch(PageId(0)).expect("seed fetch 0");
+            pool.with_page_mut_lsn(f, Lsn(0x10), |pg| pg[100] = 0xC0);
+            pool.unpin(f);
+        }
+
+        // Flusher: write back all dirty pages (page 0) — concurrent with the two evicting readers.
+        let pf = pool.clone();
+        let flusher = loom::thread::spawn(move || {
+            let _ = pf.flush_all();
+        });
+
+        // Reader of page 1 (stamped byte 2). Whenever the fetch succeeds it must read page 1's byte.
+        let p1 = pool.clone();
+        let r1 = loom::thread::spawn(move || {
+            if let Ok(f) = p1.fetch(PageId(1)) {
+                assert_eq!(
+                    p1.with_page(f, |pg| pg[100]),
+                    2,
+                    "reader of page 1 observed the wrong page's bytes (torn/cross-page read)"
+                );
+                p1.unpin(f);
+            }
+        });
+
+        // Reader of page 2 (stamped byte 3).
+        let p2 = pool.clone();
+        let r2 = loom::thread::spawn(move || {
+            if let Ok(f) = p2.fetch(PageId(2)) {
+                assert_eq!(
+                    p2.with_page(f, |pg| pg[100]),
+                    3,
+                    "reader of page 2 observed the wrong page's bytes (torn/cross-page read)"
+                );
+                p2.unpin(f);
+            }
+        });
+
+        flusher.join().unwrap();
+        r1.join().unwrap();
+        r2.join().unwrap();
+
+        // No pin leaked by any path on any interleaving: every frame is fetchable + evictable again.
+        for slot in 0..pool.capacity() {
+            let f = pool.fetch(PageId(slot as u64)).unwrap();
+            pool.unpin(f);
+        }
     });
 }
