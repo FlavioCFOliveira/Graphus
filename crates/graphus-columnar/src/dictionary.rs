@@ -37,9 +37,14 @@ type DictHeader<'a> = (Vec<Vec<u8>>, u32, &'a [u8]);
 fn read_dict_header(bytes: &[u8]) -> Result<DictHeader<'_>, DecodeError> {
     let num = get_u32(bytes, 0, "dictionary entry count")? as usize;
     let mut pos = 4usize;
-    // Clamp: there can be at most one entry per remaining byte (each costs a 4-byte length prefix),
-    // so a `num` larger than that is corrupt — cap the pre-allocation accordingly.
-    let cap = num.min(bytes.len().saturating_sub(pos));
+    // Clamp: every entry costs at least its 4-byte length prefix, so the remaining bytes can hold at
+    // most `remaining / 4` entries — a `num` larger than that is corrupt/forged. Cap the
+    // pre-allocation to that element-honest maximum (not to `remaining`, which over-reserves the
+    // `Vec<Vec<u8>>` pointer array by 4× — 24 B/entry — for a forged count and needlessly amplifies
+    // peak memory for every caller of this shared reader: bulk transcode, coldstore, cypher, rest —
+    // `rmp` #595, Finding E-3). A valid dictionary never trips this (its `num <= remaining / 4` by
+    // construction), so decoded output is unchanged; only a forged over-count reserves less.
+    let cap = num.min(bytes.len().saturating_sub(pos) / 4);
     let mut dict: Vec<Vec<u8>> = Vec::with_capacity(cap);
     for _ in 0..num {
         let len = get_u32(bytes, pos, "dictionary entry length")? as usize;

@@ -83,15 +83,24 @@
 //!
 //! ## `.gcol` handling
 //!
-//! `.gcol`'s CRC-32C-at-the-end framing ([`graphus_bulk::gcol_to_csv`]) makes it structurally
+//! `.gcol`'s CRC-32C-at-the-end framing ([`graphus_bulk::gcol_to_csv_limited`]) makes it structurally
 //! impossible to decode incrementally — the whole blob must be present before any row can be produced.
-//! For `Content-Type: application/vnd.graphus.gcol` the body is therefore buffered whole (still
-//! byte-quota-bounded — never unbounded), transcoded to CSV bytes in one call, and those bytes are fed
-//! through the **exact same** batch loop the streaming CSV path uses (`run_batch_loop`, generic over
-//! `std::io::Read` — a `ChunkReader` for CSV, a `std::io::Cursor` for the already-in-memory `.gcol`
-//! transcode). This is a deliberate, spec-consistent trade-off, not an implementation gap: `.gcol`'s
-//! wire-compactness benefit (`08` §4.2) is orthogonal to incremental parseability, which the format
-//! itself forecloses.
+//! For `Content-Type: application/vnd.graphus.gcol` the body is therefore buffered whole, transcoded to
+//! CSV bytes in one call, and those bytes are fed through the **exact same** batch loop the streaming
+//! CSV path uses (`run_batch_loop`, generic over `std::io::Read` — a `ChunkReader` for CSV, a
+//! `std::io::Cursor` for the already-in-memory `.gcol` transcode). This is a deliberate, spec-consistent
+//! trade-off, not an implementation gap: `.gcol`'s wire-compactness benefit (`08` §4.2) is orthogonal to
+//! incremental parseability, which the format itself forecloses.
+//!
+//! Because that path holds the whole blob (and then its decoded form) in memory, it is bounded twice so
+//! a large — or adversarially compressible — upload cannot OOM the server (`rmp` #595, Finding E-3): the
+//! buffered upload uses the `.gcol`-specific [`BulkImportConfig::max_gcol_upload_bytes`](crate::config::BulkImportConfig::max_gcol_upload_bytes)
+//! ceiling (lower than the streamed CSV path's session quota), and the transcode runs under the
+//! [`BulkImportConfig::max_gcol_decoded_bytes`](crate::config::BulkImportConfig::max_gcol_decoded_bytes)
+//! **decode budget** ([`gcol_to_csv_limited`]). The decode budget is the load-bearing bound: a CRC-valid
+//! `.gcol` can still be a decompression bomb (a tiny compressed column decoding to gigabytes), which an
+//! upload-size cap alone cannot catch. The CRC integrity check runs first and in full regardless, so a
+//! corrupt/truncated upload is rejected before any row is produced (never partially applied).
 //!
 //! ## Dropped-connection / retry behavior
 //!
@@ -147,7 +156,7 @@ use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use graphus_bulk::{DEFAULT_BATCH_SIZE, ImportStats, NodeHeader, RelHeader, gcol_to_csv};
+use graphus_bulk::{DEFAULT_BATCH_SIZE, ImportStats, NodeHeader, RelHeader, gcol_to_csv_limited};
 use graphus_core::{GraphusError, Value};
 use graphus_cypher::MaterializedValue;
 use http_body_util::BodyExt;
@@ -989,9 +998,30 @@ async fn ingest_csv_stream(
     }
 }
 
-/// Buffers `body` whole (still quota-bounded), transcodes it from `.gcol` to CSV, then runs the SAME
-/// [`run_batch_loop`] the streaming path uses (module docs' "`.gcol` handling"). See
-/// [`ingest_csv_stream`] for the `sink` round-tripping contract.
+/// The byte ceiling for a single buffered `.gcol` upload: the smaller of the session quota and the
+/// `.gcol`-specific [`BulkImportConfig::max_gcol_upload_bytes`](crate::config::BulkImportConfig::max_gcol_upload_bytes)
+/// cap, so the whole-blob buffer the `.gcol` framing forces cannot exceed a host-safe size even when
+/// the session quota is large (`rmp` #595). Never raises the effective limit above the session quota.
+fn gcol_upload_cap(cfg: &crate::config::BulkImportConfig, session_quota: u64) -> u64 {
+    session_quota.min(cfg.max_gcol_upload_bytes)
+}
+
+/// The decode-memory budget handed to [`gcol_to_csv_limited`] for a `.gcol` transcode (`rmp` #595).
+/// Saturates to `usize::MAX` on the (unreachable on this project's 64-bit targets) `u64 > usize`
+/// overflow, so an over-large configured value degrades to "effectively unbounded" rather than
+/// wrapping to a tiny budget that would reject every upload.
+fn gcol_decode_budget(cfg: &crate::config::BulkImportConfig) -> usize {
+    usize::try_from(cfg.max_gcol_decoded_bytes).unwrap_or(usize::MAX)
+}
+
+/// Buffers `body` whole (still quota-bounded — here under the `.gcol`-specific
+/// [`BulkImportConfig::max_gcol_upload_bytes`](crate::config::BulkImportConfig::max_gcol_upload_bytes)
+/// ceiling, lower than the streamed CSV path's session quota), transcodes it from `.gcol` to CSV
+/// under a **decode memory budget** (`decoded_budget` — the `08` §8 / `rmp` #595 guard that keeps
+/// peak decode RAM bounded by the budget rather than the possibly-adversarial decoded size, since a
+/// CRC-valid `.gcol` can be a decompression bomb), then runs the SAME [`run_batch_loop`] the streaming
+/// path uses (module docs' "`.gcol` handling"). See [`ingest_csv_stream`] for the `sink`
+/// round-tripping contract.
 async fn ingest_gcol_buffered(
     sink: BatchSink,
     phase: Phase,
@@ -999,6 +1029,7 @@ async fn ingest_gcol_buffered(
     quota: u64,
     min_free: u64,
     target_dir: PathBuf,
+    decoded_budget: usize,
 ) -> (Option<BatchSink>, Result<ImportStats, BulkIngestError>) {
     let mut guard = QuotaGuard::new(quota, min_free, target_dir);
     let mut buf: Vec<u8> = Vec::new();
@@ -1023,8 +1054,15 @@ async fn ingest_gcol_buffered(
         move || -> (BatchSink, Result<ImportStats, BulkIngestError>) {
             let mut sink = sink;
             let result = (|| {
-                let csv_bytes =
-                    gcol_to_csv(&buf).map_err(|e| BulkIngestError::Gcol(e.to_string()))?;
+                // Transcode under the decode budget: a CRC-valid but oversized/adversarial blob is
+                // rejected here (`Gcol` → `400`) instead of materialising gigabytes of CSV. The CRC
+                // integrity check inside runs first and in full, so a corrupt/truncated upload is
+                // still rejected before any row is produced (`rmp` #595).
+                let csv_bytes = gcol_to_csv_limited(&buf, decoded_budget)
+                    .map_err(|e| BulkIngestError::Gcol(e.to_string()))?;
+                // The compressed upload is no longer needed once transcoded; free it before the batch
+                // loop so it is not resident alongside the decoded CSV during ingestion.
+                drop(buf);
                 run_batch_loop(Cursor::new(csv_bytes), phase, &mut sink, &rt)
             })();
             (sink, result)
@@ -1127,7 +1165,15 @@ async fn handle_phase(
         .map(|(_sink, result)| result),
         BulkImportFormat::Gcol => tokio::time::timeout(
             session_timeout,
-            ingest_gcol_buffered(sink, phase, body, quota, min_free, target_dir),
+            ingest_gcol_buffered(
+                sink,
+                phase,
+                body,
+                gcol_upload_cap(&state.bulk_import, quota),
+                min_free,
+                target_dir,
+                gcol_decode_budget(&state.bulk_import),
+            ),
         )
         .await
         .map(|(_sink, result)| result),
@@ -1414,7 +1460,15 @@ async fn handle_phase_mode_b(
         BulkImportFormat::Gcol => {
             match tokio::time::timeout(
                 session_timeout,
-                ingest_gcol_buffered(sink, phase, body, quota, min_free, target_dir),
+                ingest_gcol_buffered(
+                    sink,
+                    phase,
+                    body,
+                    gcol_upload_cap(&state.bulk_import, quota),
+                    min_free,
+                    target_dir,
+                    gcol_decode_budget(&state.bulk_import),
+                ),
             )
             .await
             {

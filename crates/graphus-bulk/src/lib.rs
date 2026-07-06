@@ -60,7 +60,7 @@ pub mod import;
 pub mod row_parse;
 pub mod value_parse;
 
-pub use columnar::{ColumnarError, csv_to_gcol, gcol_to_csv};
+pub use columnar::{ColumnarError, csv_to_gcol, gcol_to_csv, gcol_to_csv_limited};
 pub use dump::{dump_nodes, dump_relationships};
 pub use header::{ColumnRole, HeaderError, NodeHeader, PropertyType, RelHeader, ScalarType};
 pub use import::{

@@ -98,6 +98,14 @@ pub enum ColumnarError {
     Csv(String),
     /// The `.gcol` blob is truncated, has a bad magic/version, or an unknown codec tag.
     Malformed(String),
+    /// The blob is well-formed and CRC-valid, but decoding it would exceed the caller's transcode
+    /// memory budget ([`gcol_to_csv_limited`]) — i.e. its declared row count, or the working set its
+    /// columns would materialise, is larger than the budget permits. A **CRC-valid** blob can still
+    /// be a decompression bomb (a small compressed column decoding to gigabytes: e.g. a single
+    /// dictionary entry referenced by billions of present rows), so this is the bound that keeps peak
+    /// decode memory independent of the *decoded* size, not just the uploaded size (`rmp` #595). Never
+    /// returned by the unbudgeted [`gcol_to_csv`].
+    TooLarge(String),
 }
 
 impl std::fmt::Display for ColumnarError {
@@ -105,6 +113,7 @@ impl std::fmt::Display for ColumnarError {
         match self {
             Self::Csv(m) => write!(f, "columnar: CSV parse: {m}"),
             Self::Malformed(m) => write!(f, "columnar: malformed .gcol: {m}"),
+            Self::TooLarge(m) => write!(f, "columnar: .gcol exceeds decode memory budget: {m}"),
         }
     }
 }
@@ -413,14 +422,78 @@ fn try_float_codec(values: &[&[u8]]) -> Option<Vec<u8>> {
 // gcol_to_csv
 // =================================================================================================
 
+/// The heap cost, in bytes, this transcoder charges its decode budget for **every** reconstructed
+/// cell — one owned `Vec<u8>` header (24 bytes on a 64-bit target) lives in `columns` per row per
+/// column regardless of whether that cell carries any value bytes. Charging it (rather than counting
+/// only value bytes) is what stops a *tall-but-empty* or *wide-but-empty* blob — whose sections are
+/// tiny but whose `nrows × ncols` pointer array is gigantic — from slipping a multi-gigabyte
+/// allocation past a value-bytes-only limit (`rmp` #595).
+const PER_CELL_OVERHEAD: usize = std::mem::size_of::<Vec<u8>>();
+
+/// The heap cost, in bytes, this transcoder charges its decode budget for **every** column, on top of
+/// its cells: the two `ncols`-length outer pointer arrays a decode always builds — `header_cells`
+/// (`Vec<Vec<u8>>`) and `columns` (`Vec<Vec<Vec<u8>>>`), each one `Vec<u8>`-header (24 bytes) per
+/// column. Charging it (via the `max_cols` ceiling) is what stops a *wide* blob — whose per-column
+/// sections are tiny but whose `ncols`-length pointer arrays are gigantic — from slipping a
+/// multi-gigabyte outer-array allocation past the per-cell limit, the sibling of the `nrows`
+/// row-ceiling for the *tall* case (`rmp` #595, Finding E-3).
+const PER_COL_OVERHEAD: usize = 2 * std::mem::size_of::<Vec<u8>>();
+
+/// Charges `cost` bytes against the remaining decode budget, failing with [`ColumnarError::TooLarge`]
+/// the instant the running total would cross it — so an adversarial blob is rejected **before** the
+/// offending allocation completes, not after it has already exhausted memory.
+fn charge(remaining: &mut usize, cost: usize) -> Result<(), ColumnarError> {
+    if cost > *remaining {
+        return Err(ColumnarError::TooLarge(format!(
+            "decoding would need at least {cost} more bytes than the remaining transcode budget \
+             allows; the blob is a decompression bomb or larger than this endpoint permits"
+        )));
+    }
+    *remaining -= cost;
+    Ok(())
+}
+
 /// Transcodes a `.gcol` blob back into the **byte-identical** CSV the dumper produced (the exact
-/// inverse of [`csv_to_gcol`]).
+/// inverse of [`csv_to_gcol`]), with **no memory budget** — for trusted, offline callers (the
+/// `graphus-bulk` CLI decoding its own just-written files, round-trip tests). Network paths that
+/// transcode an attacker-influenced upload MUST use [`gcol_to_csv_limited`] instead, so a CRC-valid
+/// decompression bomb cannot drive an unbounded allocation.
 ///
 /// # Errors
 ///
 /// Returns [`ColumnarError::Malformed`] if `gcol` is truncated, has a bad magic / version, or names
 /// an unknown codec.
 pub fn gcol_to_csv(gcol: &[u8]) -> Result<Vec<u8>, ColumnarError> {
+    gcol_to_csv_limited(gcol, usize::MAX)
+}
+
+/// Transcodes a `.gcol` blob back into CSV like [`gcol_to_csv`], but bounds the **peak decode working
+/// set** to `max_decoded_bytes` so the transcode's memory is a function of the *budget*, never of the
+/// (potentially adversarial) decoded size (`rmp` #595, `04 §11.4`).
+///
+/// The CRC32C integrity trailer is still verified **first and in full** (unchanged from
+/// [`gcol_to_csv`]) — a corrupt / truncated blob is rejected before any budgeting runs, so this never
+/// weakens integrity checking. The budget then guards the two allocations a CRC-valid blob can still
+/// blow up:
+///
+/// 1. The declared `nrows` is capped so a single column's `nrows`-length intermediates (the
+///    present/absent bitmap, the unpacked code stream, and the returned per-cell pointer array)
+///    cannot exceed the budget on their own.
+/// 2. Every reconstructed cell — including the fixed [`PER_CELL_OVERHEAD`] and, for dictionary
+///    columns, the *pre-summed* size of the entries their row codes reference — is charged against a
+///    running budget, so a small compressed column that decodes to gigabytes (a single dictionary
+///    entry cited by billions of present rows) is rejected via [`ColumnarError::TooLarge`] the moment
+///    the running total crosses the limit, before that allocation completes.
+///
+/// # Errors
+///
+/// [`ColumnarError::Malformed`] for a corrupt / truncated / unknown-codec blob (as [`gcol_to_csv`]),
+/// or [`ColumnarError::TooLarge`] if a CRC-valid blob's decoded working set would exceed
+/// `max_decoded_bytes`.
+pub fn gcol_to_csv_limited(
+    gcol: &[u8],
+    max_decoded_bytes: usize,
+) -> Result<Vec<u8>, ColumnarError> {
     // Verify the CRC32C integrity trailer FIRST (`rmp` #405): a blob whose body does not match its
     // trailing checksum is bit-rotted / truncated and must be rejected before any length field is
     // trusted. The trailer is the last `CRC_LEN` bytes; the checksum covers everything before it.
@@ -444,6 +517,24 @@ pub fn gcol_to_csv(gcol: &[u8]) -> Result<Vec<u8>, ColumnarError> {
     let ncols = cur.take_u32()? as usize;
     let nrows = cur.take_u32()? as usize;
 
+    // Cap `nrows` against the budget BEFORE decoding any column. Each column materialises `nrows`
+    // owned cells (an `nrows`-entry `Vec<u8>` array), and its decode allocates `nrows`-sized
+    // intermediates (the present/absent bitmap `Vec<bool>`, and — for an all-present column — an
+    // `nrows`-entry unpacked code stream). A CRC-valid header can declare up to `u32::MAX` rows
+    // (`decode_bool` would then need `nrows/8` bitmap bytes, so ~536 MB of bitmap already buys
+    // ~4.29 billion rows), so without this ceiling a single column's `nrows`-length arrays alone
+    // could dwarf the budget before any per-cell accounting runs. `max_decoded_bytes / PER_CELL_
+    // OVERHEAD` is the largest row count whose per-cell pointer array can possibly fit the budget
+    // (`rmp` #595). The unbudgeted [`gcol_to_csv`] passes `usize::MAX`, so `max_rows` is effectively
+    // unbounded for trusted callers.
+    let max_rows = (max_decoded_bytes / PER_CELL_OVERHEAD).max(1);
+    if nrows > max_rows {
+        return Err(ColumnarError::TooLarge(format!(
+            "row count {nrows} exceeds the {max_rows}-row ceiling this transcode budget permits \
+             (raise the budget or split the upload)"
+        )));
+    }
+
     // Clamp `ncols` against the remaining body length BEFORE any `Vec::with_capacity(ncols)`: each of
     // the `ncols` header cells consumes at least its 4-byte length prefix (and each column section a
     // further bitmap + tag + payload), so the blob cannot describe more columns than it has bytes
@@ -458,7 +549,25 @@ pub fn gcol_to_csv(gcol: &[u8]) -> Result<Vec<u8>, ColumnarError> {
         )));
     }
 
-    // Header section. Capacity is clamped to `ncols`, now proven `<=` the bytes that remain.
+    // Cap `ncols` against the budget BEFORE the two `Vec::with_capacity(ncols)` outer arrays below.
+    // `ncols > cur.remaining()` above only bounds the count by the *upload* size (each column needs
+    // ≥1 body byte), NOT by the decode budget — so a wide-but-shallow blob (e.g. a 1 GiB upload whose
+    // body is ~`ncols` minimal column sections) would reserve `ncols × PER_COL_OVERHEAD` for
+    // `header_cells` + `columns` (24 B each × 2 ≈ 48 B/column ⇒ tens of GiB of pointer array),
+    // sidestepping the per-cell charge and OOM-/abort-ing the host on a single `malloc`. This is the
+    // *wide*-blob sibling of the `max_rows` *tall*-blob ceiling (`rmp` #595, Finding E-3). The
+    // unbudgeted [`gcol_to_csv`] passes `usize::MAX`, so `max_cols` is effectively unbounded there and
+    // a forged `ncols` still falls to the `Malformed` guard above (trusted-path behaviour unchanged).
+    let max_cols = (max_decoded_bytes / PER_COL_OVERHEAD).max(1);
+    if ncols > max_cols {
+        return Err(ColumnarError::TooLarge(format!(
+            "column count {ncols} exceeds the {max_cols}-column ceiling this transcode budget permits \
+             (raise the budget or split the upload)"
+        )));
+    }
+
+    // Header section. Capacity is clamped to `ncols`, now proven `<=` the bytes that remain AND
+    // `<= max_cols`, so it can be neither an upload- nor a budget-driven over-allocation.
     let mut header_cells: Vec<Vec<u8>> = Vec::with_capacity(ncols);
     for _ in 0..ncols {
         header_cells.push(cur.take_section()?.to_vec());
@@ -470,10 +579,20 @@ pub fn gcol_to_csv(gcol: &[u8]) -> Result<Vec<u8>, ColumnarError> {
     }
 
     // Column section → reconstruct each column's `nrows` cells. `ncols` is already bounded above by
-    // the body length, so this capacity cannot be an attacker-driven over-allocation either.
+    // the body length, so this capacity cannot be an attacker-driven over-allocation either. A
+    // running `budget` (shared across all columns) is charged as each cell is materialised, so the
+    // whole `columns` working set stays `<= max_decoded_bytes` and an entry-reuse decompression bomb
+    // is rejected mid-decode rather than after it OOMs (`rmp` #595).
+    let mut budget = max_decoded_bytes;
+    // Charge the two `ncols`-length outer pointer arrays (`header_cells`, already built above, and
+    // `columns`, about to be) against the shared budget up front — the `nrows` row array is likewise
+    // charged per column inside `decode_column`, so accounting the *column* arrays here keeps total
+    // decode memory `<= max_decoded_bytes` rather than a multiple of it. `ncols <= max_cols` makes
+    // this charge always fit; it is exactly that ceiling's basis (`rmp` #595).
+    charge(&mut budget, ncols.saturating_mul(PER_COL_OVERHEAD))?;
     let mut columns: Vec<Vec<Vec<u8>>> = Vec::with_capacity(ncols);
     for _ in 0..ncols {
-        columns.push(decode_column(&mut cur, nrows)?);
+        columns.push(decode_column(&mut cur, nrows, &mut budget)?);
     }
 
     // Re-serialise with the *same* writer configuration the dumper uses (all `WriterBuilder`
@@ -505,8 +624,16 @@ pub fn gcol_to_csv(gcol: &[u8]) -> Result<Vec<u8>, ColumnarError> {
         .map_err(|e| ColumnarError::Malformed(format!("finishing CSV writer: {e}")))
 }
 
-/// Decodes one column from the cursor back into its `nrows` raw cell-byte values.
-fn decode_column(cur: &mut Cursor<'_>, nrows: usize) -> Result<Vec<Vec<u8>>, ColumnarError> {
+/// Decodes one column from the cursor back into its `nrows` raw cell-byte values, charging every
+/// materialised cell against the shared `budget` so the running working set stays within the caller's
+/// [`gcol_to_csv_limited`] limit (`rmp` #595). `nrows` is already capped against the budget by the
+/// caller, so the `nrows`-length intermediates (`present`, the unpacked code stream, `out`) are each
+/// bounded before this runs; the per-cell charging below then bounds the value bytes on top of that.
+fn decode_column(
+    cur: &mut Cursor<'_>,
+    nrows: usize,
+    budget: &mut usize,
+) -> Result<Vec<Vec<u8>>, ColumnarError> {
     let bitmap = cur.take_section()?;
     let present = decode_bool(bitmap, nrows).map_err(codec_err)?;
     let codec = Codec::from_tag(cur.take_u8()?)
@@ -514,33 +641,81 @@ fn decode_column(cur: &mut Cursor<'_>, nrows: usize) -> Result<Vec<Vec<u8>>, Col
     let payload = cur.take_section()?;
     let n_present = present.iter().filter(|&&p| p).count();
 
-    // Decode the present values into raw cell bytes. Every codec is now fallible: a truncated /
-    // adversarial payload surfaces as a controlled `Malformed`, never a panic (`04 §11.4`, rmp #402).
-    let values: Vec<Vec<u8>> = match codec {
+    // Charge the fixed pointer-array cost for this column's `nrows` owned cells up front (present or
+    // empty, every row is a `Vec<u8>` in the returned column). `nrows <= max_decoded_bytes /
+    // PER_CELL_OVERHEAD` is guaranteed by the caller, so this single charge can never overflow.
+    charge(budget, nrows.saturating_mul(PER_CELL_OVERHEAD))?;
+
+    // Decode the present values into raw cell bytes, charging each value's length as it is produced so
+    // the loop aborts the instant the running total crosses the budget — before the offending
+    // allocation grows unbounded. Every codec is fallible: a truncated / adversarial payload surfaces
+    // as a controlled `Malformed`, never a panic (`04 §11.4`, rmp #402).
+    let mut values: Vec<Vec<u8>> = Vec::with_capacity(n_present);
+    match codec {
         Codec::Integer => {
             let nums = integer::decode_i64(payload, n_present).map_err(codec_err)?;
             let mut buf = itoa::Buffer::new();
-            nums.iter()
-                .map(|n| buf.format(*n).as_bytes().to_vec())
-                .collect()
+            for n in &nums {
+                let cell = buf.format(*n).as_bytes().to_vec();
+                charge(budget, cell.len())?;
+                values.push(cell);
+            }
         }
-        Codec::Float => gorilla::decode(payload, n_present)
-            .map_err(codec_err)?
-            .iter()
-            .map(|f| f.to_string().into_bytes())
-            .collect(),
-        Codec::Dictionary => dictionary::decode(payload, n_present).map_err(codec_err)?,
-    };
+        Codec::Float => {
+            let floats = gorilla::decode(payload, n_present).map_err(codec_err)?;
+            for f in &floats {
+                let cell = f.to_string().into_bytes();
+                charge(budget, cell.len())?;
+                values.push(cell);
+            }
+        }
+        Codec::Dictionary => {
+            // Bound the dictionary's OWN pointer array (built inside `decode_codes` →
+            // `read_dict_header`) against the shared budget BEFORE it is allocated. A dictionary
+            // payload declares `num` distinct entries and reconstructs them into a `num`-entry
+            // `Vec<Vec<u8>>` (24 B/entry); `read_dict_header` clamps that reservation to the entries
+            // the payload can physically hold (each entry costs a ≥4-byte length prefix, so
+            // `<= payload/4`) but NOT to the budget — so a *wide*-dictionary column (num ≈ payload/4
+            // distinct entries) would reserve O(payload) of pointer array, sidestepping the per-cell
+            // charge below and OOM-/abort-ing the host on a single upload-sized `malloc` (`rmp` #595,
+            // Finding E-3). Charge that reservation here — the declared count is the leading LE `u32`
+            // of the payload (mirrors `dictionary::encode`'s framing) — so an over-wide dictionary is
+            // `TooLarge` before it allocates. A payload too short to even hold the count decodes to a
+            // controlled `Malformed` in `decode_codes` as before.
+            if let Some(head) = payload.get(0..4) {
+                let declared = u32::from_le_bytes(head.try_into().expect("4 bytes")) as usize;
+                let dict_entries = declared.min(payload.len() / 4);
+                charge(budget, dict_entries.saturating_mul(PER_CELL_OVERHEAD))?;
+            }
+            // Decode to raw codes + dictionary WITHOUT materialising one owned value per row
+            // (`decode_codes` is itself bomb-safe: the code stream is bounded by `n_present <= nrows`
+            // and the dictionary reservation is now budget-charged just above). Then charge each row's
+            // referenced entry length as it is cloned, so a single small dictionary entry cited by a
+            // huge number of present rows (the classic decompression bomb — a CRC-valid blob whose
+            // decoded size is orders of magnitude larger than the compressed input) is rejected via
+            // `TooLarge` the moment the running total crosses the budget, never after it OOMs.
+            let (codes, dict) = dictionary::decode_codes(payload, n_present).map_err(codec_err)?;
+            for &c in &codes {
+                // `decode_codes` already validated every code `< dict.len()`, so this cannot panic.
+                let entry = &dict[c as usize];
+                charge(budget, entry.len())?;
+                values.push(entry.clone());
+            }
+        }
+    }
 
-    // Re-expand to `nrows` cells using the bitmap: a present row pulls the next decoded value, an
+    // Re-expand to `nrows` cells using the bitmap: a present row **moves** in the next decoded value
+    // (no clone — `values` is consumed here, so only one copy of the cell bytes is ever resident), an
     // absent row is an empty cell. `values` has exactly `n_present` entries by construction, so the
-    // `next` cursor can never run past it.
+    // iterator can never run dry before the present rows are filled.
     let mut out = Vec::with_capacity(nrows);
-    let mut next = 0usize;
+    let mut it = values.into_iter();
     for &p in &present {
         if p {
-            out.push(values[next].clone());
-            next += 1;
+            out.push(
+                it.next()
+                    .expect("n_present present rows ⇒ n_present decoded values"),
+            );
         } else {
             out.push(Vec::new());
         }
@@ -785,6 +960,273 @@ mod tests {
         assert!(
             elapsed.as_secs() < 5,
             "rejecting a forged ncols must be prompt (no oversized alloc), took {elapsed:?}"
+        );
+    }
+
+    /// Builds a **single dictionary column** `.gcol` blob directly (bypassing `csv_to_gcol`, so a
+    /// decompression bomb can be constructed cheaply — one stored entry, not one per row), with a
+    /// correct CRC32C trailer so it passes integrity verification and reaches the decode budget.
+    /// Mirrors `encode_blob` + `dictionary::encode`'s on-disk layout for one all-`Other` (dictionary)
+    /// column of `present.len()` rows whose every present row references the single `entry`.
+    fn build_single_dict_column_blob(
+        header: &[u8],
+        present: &[bool],
+        entry: &[u8],
+        delimiter: u8,
+    ) -> Vec<u8> {
+        // Dictionary payload: [num_entries=1][entry_len][entry][code_width=0]; width 0 (one distinct
+        // value) means an EMPTY code stream, so this stays tiny no matter how many rows cite it.
+        let mut payload = Vec::new();
+        put_u32(&mut payload, 1);
+        put_u32(&mut payload, entry.len() as u32);
+        payload.extend_from_slice(entry);
+        payload.push(0);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&MAGIC);
+        out.push(VERSION);
+        out.push(delimiter);
+        put_u32(&mut out, 1); // ncols
+        put_u32(&mut out, present.len() as u32); // nrows
+        put_bytes(&mut out, header); // header cell
+        put_bytes(&mut out, &encode_bool(present)); // column bitmap section
+        out.push(Codec::Dictionary as u8); // codec tag
+        put_bytes(&mut out, &payload); // column payload section
+        let crc = crc32c::crc32c(&out); // valid trailer over the whole body
+        out.extend_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    /// `rmp` #595 (Finding E-3): a **CRC-valid** `.gcol` in which one small dictionary entry is
+    /// referenced by many present rows decodes to orders of magnitude more than its compressed size.
+    /// [`gcol_to_csv_limited`] must reject it as [`ColumnarError::TooLarge`] (NOT `Malformed` — the
+    /// blob is structurally valid) the moment the running decode exceeds the budget, having allocated
+    /// only up-to-budget bytes, never the full decoded size.
+    #[test]
+    fn dictionary_entry_reuse_bomb_is_rejected_within_budget() {
+        let n = 2_000usize;
+        let entry = vec![b'x'; 100_000]; // 100 KB entry, cited by every one of the n rows
+        let present = vec![true; n];
+        let blob = build_single_dict_column_blob(b"v:string", &present, &entry, b',');
+        // Compressed blob is tiny (one 100 KB entry + an n/8 bitmap); decoded is n × 100 KB ≈ 200 MB.
+        assert!(
+            blob.len() < 200 * 1024,
+            "the bomb's COMPRESSED size must stay tiny: {} bytes",
+            blob.len()
+        );
+
+        let budget = 4 * 1024 * 1024; // 4 MiB — two orders of magnitude below the ~200 MB decode
+        let start = std::time::Instant::now();
+        let result = gcol_to_csv_limited(&blob, budget);
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(result, Err(ColumnarError::TooLarge(_))),
+            "an entry-reuse bomb (valid CRC/structure) must be TooLarge, got {result:?}"
+        );
+        // Prompt/bounded: had it materialised the full 200 MB (or more, at billions of rows) it would
+        // take far longer or OOM-abort. The running budget caps the allocation at ~4 MiB.
+        assert!(
+            elapsed.as_secs() < 5,
+            "bomb rejection must be prompt/bounded, took {elapsed:?}"
+        );
+
+        // The SAME structure at a small row count decodes fine under the same budget — proof the
+        // blob shape is genuinely valid (rejected purely on size, not because it is malformed).
+        let ok = build_single_dict_column_blob(b"v:string", &[true, true, true], b"xxxx", b',');
+        assert!(gcol_to_csv_limited(&ok, budget).is_ok());
+    }
+
+    /// `rmp` #595: a blob declaring far more rows than the budget's per-cell pointer array can hold is
+    /// rejected at the row-count ceiling BEFORE any column is decoded — the guard against a *tall*
+    /// blob whose `nrows`-length intermediates (bitmap, code stream, cell array) alone exhaust memory.
+    #[test]
+    fn oversized_row_count_is_rejected_at_the_budget_row_cap() {
+        let n = 5_000_000usize; // 5M rows → ~625 KB bitmap, cheap to build
+        let present = vec![true; n];
+        let blob = build_single_dict_column_blob(b"v:string", &present, b"z", b',');
+
+        let budget = 1024 * 1024; // 1 MiB ⇒ max_rows ≈ 43_690, far below 5M
+        let start = std::time::Instant::now();
+        let result = gcol_to_csv_limited(&blob, budget);
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(result, Err(ColumnarError::TooLarge(_))),
+            "a row count above the budget's row ceiling must be TooLarge, got {result:?}"
+        );
+        assert!(
+            elapsed.as_secs() < 5,
+            "row-cap rejection must be prompt (before any decode), took {elapsed:?}"
+        );
+    }
+
+    /// `rmp` #595: on VALID data, the budgeted transcode is byte-identical to the unbudgeted one — the
+    /// bound must not alter correct output, only reject oversized/adversarial input.
+    #[test]
+    fn budgeted_transcode_matches_unbudgeted_on_valid_data() {
+        let csv = ":ID,:LABEL,name:string,age:int,score:float,active:boolean\n\
+                   1,Person,Alice,30,1.5,true\n\
+                   2,Person;Admin,Bob,25,2.5,false\n\
+                   3,,Carol,,3.5,\n";
+        let blob = csv_to_gcol(csv.as_bytes(), b',').unwrap();
+        let unbudgeted = gcol_to_csv(&blob).unwrap();
+        let budgeted = gcol_to_csv_limited(&blob, 16 * 1024 * 1024).unwrap();
+        assert_eq!(
+            budgeted, unbudgeted,
+            "a generous budget must not change the decoded output"
+        );
+        assert_eq!(
+            budgeted,
+            csv.as_bytes(),
+            "and it must be byte-identical to the source CSV"
+        );
+    }
+
+    /// `rmp` #595: the budget MUST NOT weaken CRC integrity — a partial/corrupt upload is still
+    /// rejected (never partially applied), exactly as on the unbudgeted path. Any single-byte flip
+    /// stays `Malformed`, even with an effectively-unbounded budget.
+    #[test]
+    fn budgeted_transcode_still_enforces_crc_integrity() {
+        let csv = "id:ID,seq:int\na,1\nb,2\nc,3\n";
+        let good = csv_to_gcol(csv.as_bytes(), b',').unwrap();
+        assert_eq!(
+            gcol_to_csv_limited(&good, usize::MAX).unwrap(),
+            csv.as_bytes()
+        );
+        for i in 0..good.len() {
+            let mut bad = good.clone();
+            bad[i] ^= 0x01;
+            assert!(
+                matches!(
+                    gcol_to_csv_limited(&bad, usize::MAX),
+                    Err(ColumnarError::Malformed(_))
+                ),
+                "flip at byte {i} must be Malformed under the budgeted path too"
+            );
+        }
+    }
+
+    /// Builds a CRC-valid `.gcol` of `ncols` **empty** (0-row) dictionary columns — cheap to
+    /// construct (each column is a fixed ~19 bytes) yet, without the `max_cols` ceiling, would drive
+    /// two `Vec::with_capacity(ncols)` outer pointer arrays (`header_cells` + `columns`, 24 B each)
+    /// that scale with the upload, not the decode budget. Used to prove the *wide*-blob budget cap.
+    fn build_wide_empty_blob(ncols: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&MAGIC);
+        out.push(VERSION);
+        out.push(b','); // delimiter
+        put_u32(&mut out, ncols as u32);
+        put_u32(&mut out, 0); // nrows = 0
+        for _ in 0..ncols {
+            put_bytes(&mut out, b"c"); // header cell
+        }
+        let empty_bitmap = encode_bool(&[]);
+        let mut empty_dict_payload = Vec::new();
+        put_u32(&mut empty_dict_payload, 0); // 0 dictionary entries
+        empty_dict_payload.push(0); // code width 0
+        for _ in 0..ncols {
+            put_bytes(&mut out, &empty_bitmap);
+            out.push(Codec::Dictionary as u8);
+            put_bytes(&mut out, &empty_dict_payload);
+        }
+        let crc = crc32c::crc32c(&out);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    /// Builds a CRC-valid single-column `.gcol` whose dictionary header declares `num_entries` empty
+    /// entries over **0 rows** — the compressed blob is a few MB (one 4-byte length prefix per entry)
+    /// but `read_dict_header` would reconstruct a `num_entries`-slot `Vec<Vec<u8>>` (24 B each). Used
+    /// to prove the *wide-dictionary* pointer-array reservation is now budget-charged.
+    fn build_wide_dict_blob(num_entries: usize) -> Vec<u8> {
+        let mut payload = Vec::new();
+        put_u32(&mut payload, num_entries as u32);
+        for _ in 0..num_entries {
+            put_u32(&mut payload, 0); // each entry: length 0 (empty)
+        }
+        payload.push(0); // code width 0 (no code bytes: 0 rows)
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&MAGIC);
+        out.push(VERSION);
+        out.push(b',');
+        put_u32(&mut out, 1); // ncols = 1
+        put_u32(&mut out, 0); // nrows = 0
+        put_bytes(&mut out, b"v:string"); // header cell
+        put_bytes(&mut out, &encode_bool(&[])); // 0-row bitmap
+        out.push(Codec::Dictionary as u8);
+        put_bytes(&mut out, &payload);
+        let crc = crc32c::crc32c(&out);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    /// `rmp` #595 (Finding E-3, security re-audit F1): a CRC-valid but very *wide* blob (huge `ncols`,
+    /// tiny per-column sections) whose two `ncols`-length outer pointer arrays would exceed the budget
+    /// must be rejected at the `max_cols` ceiling — [`ColumnarError::TooLarge`], promptly, BEFORE any
+    /// `Vec::with_capacity(ncols)` runs — not allowed to reserve `ncols × 48 B` off-budget (which at
+    /// the production `.gcol` cap is a multi-GiB single `malloc` → process abort).
+    #[test]
+    fn oversized_column_count_is_rejected_at_the_budget_column_cap() {
+        let ncols = 50_000usize; // 50k cols × 48 B ≈ 2.4 MB pointer array, ~950 KB compressed blob
+        let blob = build_wide_empty_blob(ncols);
+        let budget = 4096; // ⇒ max_cols ≈ 4096/48 ≈ 85, far below 50k
+        let start = std::time::Instant::now();
+        let result = gcol_to_csv_limited(&blob, budget);
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(result, Err(ColumnarError::TooLarge(_))),
+            "a column count above the budget's column ceiling must be TooLarge, got {result:?}"
+        );
+        assert!(
+            elapsed.as_secs() < 5,
+            "column-cap rejection must be prompt (before any outer-array alloc), took {elapsed:?}"
+        );
+    }
+
+    /// `rmp` #595 (security re-audit F1): a CRC-valid single column whose dictionary header declares
+    /// far more entries than the budget's pointer array can hold must be rejected as
+    /// [`ColumnarError::TooLarge`] BEFORE `read_dict_header` reserves the `Vec<Vec<u8>>` — the fix
+    /// charges the declared entry count against the shared budget up front, so an off-budget
+    /// upload-sized dictionary reservation (the auditor's measured +365 MB RSS bypass) cannot happen.
+    #[test]
+    fn wide_dictionary_header_is_rejected_within_budget() {
+        let blob = build_wide_dict_blob(1_000_000); // 1M empty entries ⇒ ~24 MB would-be pointer array
+        assert!(
+            blob.len() < 8 * 1024 * 1024,
+            "the COMPRESSED wide-dict blob must stay small: {} bytes",
+            blob.len()
+        );
+        let budget = 4096; // two+ orders of magnitude below the ~24 MB reservation
+        let start = std::time::Instant::now();
+        let result = gcol_to_csv_limited(&blob, budget);
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(result, Err(ColumnarError::TooLarge(_))),
+            "a wide dictionary header must be TooLarge, got {result:?}"
+        );
+        assert!(
+            elapsed.as_secs() < 5,
+            "wide-dictionary rejection must be prompt (before the dict alloc), took {elapsed:?}"
+        );
+    }
+
+    /// `rmp` #595 (security re-audit F1): the two new *wide* ceilings must not reject genuinely wide
+    /// but small blobs — a 100-column header-only blob and a 1000-entry dictionary both decode fine
+    /// under a generous budget, proving the caps reject purely on size, never on valid shape.
+    #[test]
+    fn wide_but_valid_blob_and_dictionary_decode_under_budget() {
+        let wide = build_wide_empty_blob(100);
+        let csv =
+            gcol_to_csv_limited(&wide, 16 * 1024 * 1024).expect("100 empty columns are valid");
+        assert_eq!(
+            csv.iter().filter(|&&b| b == b',').count(),
+            99,
+            "100 header cells ⇒ 99 delimiters, got: {csv:?}"
+        );
+        let dict = build_wide_dict_blob(1000);
+        assert!(
+            gcol_to_csv_limited(&dict, 16 * 1024 * 1024).is_ok(),
+            "a 1000-entry dictionary is valid and well under budget"
         );
     }
 

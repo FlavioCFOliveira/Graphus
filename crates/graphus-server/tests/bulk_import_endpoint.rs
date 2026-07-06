@@ -15,7 +15,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use graphus_bulk::{BulkImporter, DEFAULT_BATCH_SIZE};
+use graphus_bulk::{BulkImporter, DEFAULT_BATCH_SIZE, csv_to_gcol};
 use graphus_io::MemBlockDevice;
 use graphus_server::config::{
     AdmissionConfig, AuthBootstrap, BulkImportConfig, ServerConfig, TimingConfig, TlsConfig,
@@ -647,6 +647,89 @@ async fn network_mode_a_happy_path_end_to_end() {
     .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(extract_jolt_int(&body), Some(0), "{body}");
+
+    server.shutdown().await.expect("clean shutdown");
+}
+
+/// `rmp` #595 (Finding E-3): a `.gcol` upload is bounded by the configured decode budget. A valid
+/// blob whose decoded working set fits the budget ingests normally (`200`); one that would exceed it
+/// — the buffered-whole-then-transcoded `.gcol` path is where an oversized-or-adversarial upload could
+/// previously drive an unbounded ~2×+ allocation and OOM-kill the server — is rejected with a clean
+/// `400` **instead of crashing the process**, and the server keeps serving afterwards. This proves the
+/// budget is actually plumbed end-to-end and that the rejection is graceful (availability preserved).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn network_mode_a_gcol_upload_is_bounded_by_the_decode_budget() {
+    let temp = TempStore::new("gcol-budget");
+    // A deliberately tiny decode budget so a modest, entirely VALID `.gcol` overshoots it in the test
+    // without needing a real multi-gigabyte payload.
+    let server = boot(base_config(
+        &temp,
+        BulkImportConfig {
+            max_gcol_decoded_bytes: 4096,
+            ..BulkImportConfig::default()
+        },
+    ))
+    .await;
+    let rest = server.rest_addr.expect("REST enabled");
+    let token = mint_token(ADMIN_USER);
+
+    let (status, body) = rest_statement(rest, &token, DB, "CREATE DATABASE gcoldb").await;
+    assert_eq!(status, 200, "create database: {body}");
+
+    // A small, valid nodes `.gcol` (decoded ~80 bytes, well under the 4 KiB budget) ingests fine.
+    let small_gcol = csv_to_gcol(NODES_CSV.as_bytes(), b',').expect("encode small .gcol");
+    let (status, body) = bulk_call(
+        rest,
+        Some(&token),
+        "gcoldb",
+        "phase=nodes",
+        Some("application/vnd.graphus.gcol"),
+        &small_gcol,
+    )
+    .await;
+    assert_eq!(status, 200, "small valid .gcol must ingest: {body}");
+    assert_eq!(extract_json_number(&body, "nodes"), Some(3), "body: {body}");
+
+    // A larger — but still perfectly valid — nodes `.gcol` whose decoded size exceeds the 4 KiB budget
+    // must be refused with a client-facing `400`, NOT buffered/transcoded into an OOM. (600 rows well
+    // exceeds the budget's row ceiling of 4096/size_of::<Vec<u8>> ≈ 170.)
+    let mut big_csv = String::from("id:ID,:LABEL,name:string,age:int\n");
+    for i in 0..600 {
+        big_csv.push_str(&format!("{i},Person,Name{i},{}\n", 20 + (i % 50)));
+    }
+    let big_gcol = csv_to_gcol(big_csv.as_bytes(), b',').expect("encode big .gcol");
+    // The COMPRESSED upload is itself small — proof the guard is on the decoded size, not the upload.
+    assert!(
+        big_gcol.len() < 64 * 1024,
+        "compressed .gcol should be small: {} bytes",
+        big_gcol.len()
+    );
+    let (status, body) = bulk_call(
+        rest,
+        Some(&token),
+        "gcoldb",
+        "phase=nodes",
+        Some("application/vnd.graphus.gcol"),
+        &big_gcol,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "an over-budget .gcol must be a clean 400, not an OOM/crash: {body}"
+    );
+    assert!(
+        body.contains(".gcol") || body.contains("budget") || body.contains("row count"),
+        "the rejection must explain the .gcol size limit: {body}"
+    );
+
+    // The server survived the over-budget rejection and keeps serving — the availability guarantee the
+    // fix exists to protect. (The database is still `Loading` from the accepted small upload; an
+    // unrelated database on the same server answers normally.)
+    let (status, body) = rest_statement(rest, &token, DB, "RETURN 1 AS ok").await;
+    assert_eq!(
+        status, 200,
+        "server must still serve after the rejection: {body}"
+    );
 
     server.shutdown().await.expect("clean shutdown");
 }

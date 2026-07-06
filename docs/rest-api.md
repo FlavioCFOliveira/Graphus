@@ -312,8 +312,19 @@ byte-for-byte as it always has.
   (`bulk_import.max_bytes_per_session`, default 8 GiB), enforced **per call** as bytes
   arrive. Exceeding it aborts the upload with `413` without ever holding the excess in
   memory. (`.gcol`'s CRC-framing makes it structurally impossible to decode incrementally,
-  so a `.gcol` body is buffered whole — still byte-quota-bounded — before being transcoded
-  to the same CSV shape the streaming path uses.)
+  so a `.gcol` body is buffered whole before being transcoded to the same CSV shape the
+  streaming path uses.)
+- **`.gcol` memory bounds:** because the `.gcol` path buffers the whole blob and then decodes
+  it, it is additionally bounded so a large — or adversarially compressible — upload cannot
+  exhaust server memory: the buffered upload is capped at `bulk_import.max_gcol_upload_bytes`
+  (default 1 GiB, applied on top of `max_bytes_per_session`), and the **decoded** working set
+  is capped at `bulk_import.max_gcol_decoded_bytes` (default 1 GiB). A CRC-valid `.gcol` can
+  be a decompression bomb (a small compressed column decoding to gigabytes), so the decoded
+  cap — not just the upload cap — is what keeps peak memory bounded; a transcode that would
+  exceed it is rejected with `400` (the integrity CRC is still verified in full first, so a
+  corrupt/truncated `.gcol` is rejected before any row is applied). Loads whose decoded size
+  legitimately exceeds the budget should use the streaming CSV format or the offline importer,
+  or raise these limits on a larger-RAM host.
 - **Disk-space guard:** before accepting each call's upload, and periodically while
   streaming, the server checks free space on the target database's volume against
   `bulk_import.min_free_disk_bytes` (default 1 GiB). Insufficient space → `507`. `0`

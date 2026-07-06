@@ -562,6 +562,30 @@ pub struct BulkImportConfig {
     /// below this reserve is refused up front, or aborted mid-stream, rather than running the device
     /// out of space. `0` **disables** the check (not recommended in production). Default: 1 GiB.
     pub min_free_disk_bytes: u64,
+    /// Maximum bytes a single **`.gcol`** (columnar) upload may reach on this call, a ceiling applied
+    /// *in addition to* [`max_bytes_per_session`](Self::max_bytes_per_session) and **only** to the
+    /// `.gcol` format (`rmp` #595, Finding E-3). Unlike the row-streamed CSV path (whose peak memory
+    /// is one batch regardless of file size), `.gcol`'s CRC-32C-at-the-end framing forces the whole
+    /// blob to be buffered before it can be decoded, so this cap bounds that single in-RAM buffer to a
+    /// host-safe size. It does **not** cap the CSV path. Must be `> 0`. Default: 1 GiB.
+    pub max_gcol_upload_bytes: u64,
+    /// Maximum **decoded** working set a single `.gcol` transcode may materialise before the row bytes
+    /// are handed to the batch loop (`rmp` #595, Finding E-3). A CRC-valid `.gcol` can be a
+    /// decompression bomb — a small compressed column (e.g. one dictionary entry cited by billions of
+    /// present rows) decoding to gigabytes — so bounding only the *upload* is insufficient; this caps
+    /// the *decoded* size directly. A transcode whose declared rows or materialised column bytes would
+    /// exceed this is rejected (`400`) rather than allowed to exhaust memory, keeping peak decode RAM a
+    /// function of this budget, not of the (possibly adversarial) *amplification* of the decoded size.
+    /// The budget bounds **all** the transcode's amplifying allocations — the per-cell value bytes, the
+    /// `nrows`-length row array (row ceiling), the two `ncols`-length column pointer arrays (column
+    /// ceiling), and each dictionary's own entry pointer array — so a small compressed blob cannot
+    /// decode to an unbounded working set. Legitimate loads larger than this should use the streaming
+    /// CSV path or the offline importer, or raise this on a larger-RAM host. Must be `> 0`.
+    /// Default: 1 GiB. Worst-case additional peak RAM for a `.gcol` ingest is therefore
+    /// `O(max_gcol_upload_bytes) + O(max_gcol_decoded_bytes)` — the buffered blob (and, for a
+    /// pathological all-distinct dictionary column, one payload-sized copy of its entry bytes) sit in
+    /// the upload-bounded term, while every amplifying structure sits in this decode-bounded term.
+    pub max_gcol_decoded_bytes: u64,
     /// Maximum wall-clock duration a bulk-import session may stay open, from the first request byte
     /// to the last (`08` §8's per-session timeout — guards an abandoned or deliberately slow-loris'd
     /// upload). Measured on the real (wall-clock) timer, the same as
@@ -650,6 +674,8 @@ impl Default for BulkImportConfig {
         Self {
             max_bytes_per_session: 8 * 1024 * 1024 * 1024,
             min_free_disk_bytes: 1024 * 1024 * 1024,
+            max_gcol_upload_bytes: 1024 * 1024 * 1024,
+            max_gcol_decoded_bytes: 1024 * 1024 * 1024,
             session_timeout_ms: 2 * 60 * 60 * 1000,
             mode_b_batch_rows: 2_000,
             mode_b_chunk_rows: 25,
@@ -1187,6 +1213,20 @@ impl ServerConfig {
             return Err(ConfigError::Invalid(
                 "bulk_import.max_bytes_per_session must be > 0 (a zero quota would reject every \
                  bulk-import upload)"
+                    .to_owned(),
+            ));
+        }
+        if self.bulk_import.max_gcol_upload_bytes == 0 {
+            return Err(ConfigError::Invalid(
+                "bulk_import.max_gcol_upload_bytes must be > 0 (a zero cap would reject every \
+                 .gcol upload)"
+                    .to_owned(),
+            ));
+        }
+        if self.bulk_import.max_gcol_decoded_bytes == 0 {
+            return Err(ConfigError::Invalid(
+                "bulk_import.max_gcol_decoded_bytes must be > 0 (a zero budget would reject every \
+                 .gcol upload before it could decode a single row)"
                     .to_owned(),
             ));
         }
