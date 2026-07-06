@@ -1,50 +1,92 @@
 name: CI
 
+# Fast checks (format, clippy, tests) and the heavy deterministic gate (DST sweeps +
+# crash-recovery soaks) run on pull requests, on pushes to `main`, on version tags, and
+# on manual dispatch. `push` is intentionally scoped to `main` + tags: a feature-branch
+# push reaches CI only through its pull request, so nothing runs twice for the same change
+# and the DST/soak gate never fires on an ordinary feature push. The nightly-fuzz workflow
+# soaks the DST fuzzer far deeper on a schedule.
 on:
   push:
+    branches: [main]
+    tags: ["v*"]
   pull_request:
+  workflow_dispatch:
+
+# Cancel a superseded run for the same ref (e.g. a new push to a PR supersedes the previous
+# run), but never cancel a run on `main` — its post-merge gate must always complete.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# Least privilege: this workflow only checks out and compiles. The Actions cache used by
+# rust-cache authenticates with its own runtime token, not GITHUB_TOKEN, so a read-only
+# contents scope does not disable caching.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
-  # macOS's default temp dir (/var/folders/.../T) is long enough that a UDS socket path built under it
-  # overflows the platform `sun_path` limit (~104 bytes), so every integration test that binds a Unix
-  # domain socket fails to boot on macos-14 with "path must be shorter than SUN_LEN". Point the temp dir
-  # at the short /tmp (`std::env::temp_dir()` honours `$TMPDIR` on Unix) so socket paths stay under the
-  # limit on every leg; a no-op on Linux, where `temp_dir()` is already /tmp.
+  # macOS's default temp dir (/var/folders/.../T) is long enough that a UDS socket path built
+  # under it overflows the platform `sun_path` limit (~104 bytes), so every integration test
+  # that binds a Unix domain socket fails to boot on macos-14 with "path must be shorter than
+  # SUN_LEN". Point the temp dir at the short /tmp (`std::env::temp_dir()` honours `$TMPDIR` on
+  # Unix) so socket paths stay under the limit on every leg; a no-op on Linux, where
+  # `temp_dir()` is already /tmp.
   TMPDIR: /tmp
 
 jobs:
-  check:
-    name: ${{ matrix.os }}
+  # Fast, always-on gate: format, lints, and the full test suite across the Tier-1 target
+  # matrix (decision D-target-matrix): x86_64 Linux, aarch64 Linux, and aarch64 macOS.
+  test:
+    name: test ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        # Tier-1 target matrix (decision D-target-matrix): x86_64 Linux,
-        # aarch64 Linux, and aarch64 macOS (Apple Silicon).
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-14]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # Cache the cargo registry, git sources, and build artifacts across runs so each leg
+      # does an incremental build instead of compiling the whole workspace from cold.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Format
         run: cargo fmt --all -- --check
+      # `clippy --all-targets` compiles every target (lib, bins, examples, benches, tests) as a
+      # superset of `cargo check`, and `cargo test` then codegens and runs the lib/bin/test/doc
+      # targets — so a separate `cargo build --all-targets` step would only recompile the same
+      # code. Clippy already fails the run on any target that does not compile.
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: Build
-        run: cargo build --all-targets
       - name: Test
         run: cargo test --all
-      # DST crash-recovery soak gate (rmp #468/#471/#480): the three large-seed crash + ARIES recovery
-      # sweeps that pin the dead-link-corpse class (#468/#172/#301) and recovery idempotency closed —
-      # interleaved self-loop incidence-chain churn (10k seeds), interleaved property-chain churn (10k
-      # seeds), and crash-during-recovery double-crash idempotency (6k seeds). They run on every OS leg
-      # in debug via `cargo test --all` above; this names them as an explicit, always-on standing gate
-      # and re-runs them in release (optimised paths) on the x86_64 Linux leg. No `#[ignore]`, no skips.
-      - name: DST crash-recovery soaks
-        if: matrix.os == 'ubuntu-latest'
+
+  # Heavy deterministic gate — deliberately a separate job so it can be reasoned about and (if
+  # ever needed) re-scoped independently of the fast checks. Same triggers as `test`, so it
+  # gates every PR, every push to `main`, and every tag, but — because `push` is scoped to
+  # `main` + tags above — it never runs on an ordinary feature-branch push.
+  dst:
+    name: DST + crash-recovery gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      # DST crash-recovery soak gate (rmp #468/#471/#480): the three large-seed crash + ARIES
+      # recovery sweeps that pin the dead-link-corpse class (#468/#172/#301) and recovery
+      # idempotency closed — interleaved self-loop incidence-chain churn (10k seeds), interleaved
+      # property-chain churn (10k seeds), and crash-during-recovery double-crash idempotency (6k
+      # seeds). Run in release (optimised paths) as an explicit, always-on standing gate. No
+      # `#[ignore]`, no skips.
+      - name: DST crash-recovery soaks (release)
         run: >
           cargo test --release -p graphus-dst
           --test selfloop_churn_recovery
@@ -54,14 +96,11 @@ jobs:
       # every seed is SAFE (strict serializability + durability + atomicity + reference-model
       # equivalence under injected disk/clock/crash faults), LIVE (progress watchdog + fault-then-heal
       # recovery), and deterministic + oracle-consistent. Any violation, non-determinism, or oracle
-      # divergence fails the PR. Bounded (256 seeds/mode) so it stays a quick gate; the nightly job
-      # soaks far deeper. Runs once on the x86_64 Linux leg to keep the matrix fast.
+      # divergence fails the run. Bounded (256 seeds/mode) so it stays a quick gate; the nightly job
+      # soaks far deeper.
       - name: DST safety sweep
-        if: matrix.os == 'ubuntu-latest'
         run: cargo run --release -p graphus-dst --bin graphus-dst -- vopr safety --seed 1 --seeds 256
       - name: DST liveness sweep
-        if: matrix.os == 'ubuntu-latest'
         run: cargo run --release -p graphus-dst --bin graphus-dst -- vopr liveness --seed 1 --seeds 256
       - name: DST determinism + reference-model sweep
-        if: matrix.os == 'ubuntu-latest'
         run: cargo run --release -p graphus-dst --bin graphus-dst -- vopr --seed 1 --seeds 256

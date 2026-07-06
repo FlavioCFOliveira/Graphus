@@ -1,0 +1,21 @@
+# Keep the GitHub Actions used by the workflows on their latest versions automatically.
+# Dependabot scans .github/workflows/ weekly and opens a single grouped pull request that
+# bumps any outdated action, so the pipelines always run the most recent releases without a
+# manual audit. (If the actions are ever pinned to commit SHAs for supply-chain hardening,
+# Dependabot bumps the SHA and preserves the `# vX.Y.Z` comment next to it.)
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # One consolidated PR for all action bumps instead of one per action.
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "ci"
+      - "dependencies"

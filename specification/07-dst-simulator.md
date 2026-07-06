@@ -541,15 +541,19 @@ The `graphus-dst` binary exposes the VOPR modes as subcommands:
 
 A non-zero exit status signals at least one failing seed, listed for one-line reproduction.
 
-**PR CI gate** (`.github/workflows/ci.yml`). On the x86_64 Linux leg, every pull request runs a fast,
-bounded VOPR sweep that fails on any violation, non-determinism, or oracle divergence:
+**PR CI gate** (`.github/workflows/ci.yml`). A dedicated `dst` job on the x86_64 Linux runner runs a
+fast, bounded VOPR sweep that fails on any violation, non-determinism, or oracle divergence:
 
 - `vopr safety --seed 1 --seeds 256`
 - `vopr liveness --seed 1 --seeds 256`
 - `vopr --seed 1 --seeds 256` (determinism + reference-model)
 
-The gate is bounded to 256 seeds per mode so it stays a quick check; it runs once on the x86_64 Linux
-leg to keep the matrix fast.
+The gate is bounded to 256 seeds per mode so it stays a quick check, and lives in its own job (separate
+from the `test` matrix) so it runs once on a single runner. It fires on pull requests, on pushes to
+`main`, on version tags, and on manual dispatch — but, because `push` is scoped to `main` + tags, it
+never runs on an ordinary feature-branch push (those reach CI only through their pull request). The
+release-optimised crash-recovery soaks (`selfloop_churn_recovery`, `property_churn_recovery`,
+`double_crash_recovery`) run in the same `dst` job.
 
 **Nightly soak** (`.github/workflows/nightly-fuzz.yml`). A scheduled job runs the swarmed,
 time-budgeted fuzzer once per mode (`safety`, `liveness`, `standard`) — `vopr fuzz --mode <m> --swarm

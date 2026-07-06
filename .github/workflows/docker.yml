@@ -1,11 +1,15 @@
 name: docker
 
-# Build (and, on tags/manual dispatch, publish) the multi-architecture Graphus
+# Build (and, except on pull requests, publish) the multi-architecture Graphus
 # container image — linux/amd64 + linux/arm64 — to the GitHub Container Registry.
 #
-#   * Pull requests / pushes to main  → build only (no push) to keep the
-#     Dockerfile green across both architectures.
-#   * Tags `v*` or manual dispatch    → build + push a multi-arch manifest.
+#   * Pull requests                   → build only (no push), linux/amd64 only. The
+#     native amd64 build is fast and catches Dockerfile breakage; the arm64 image code
+#     is already exercised natively by the aarch64 leg of the CI workflow.
+#   * Pushes to main                  → build + push the full multi-arch manifest as the
+#     rolling `:main` tag (a dev image; the release image is handled by dockerhub.yml).
+#   * Tags `v*` or manual dispatch    → build + push a full multi-arch manifest
+#     (`:vX.Y.Z`, `:X.Y`, and `:latest` for tags).
 
 on:
   push:
@@ -25,7 +29,10 @@ on:
 
 concurrency:
   group: docker-${{ github.ref }}
-  cancel-in-progress: true
+  # Only cancel superseded pull-request builds (they never push). A run on main, a tag, or a
+  # dispatch publishes a multi-arch manifest, and a half-pushed manifest is worse than waiting —
+  # matching the deliberate cancel-in-progress: false in dockerhub.yml — so those are never cancelled.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}
@@ -83,7 +90,9 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          platforms: ${{ env.PLATFORMS }}
+          # PRs build the native amd64 image only (fast); pushes/tags build the full multi-arch
+          # manifest so arm64 is validated before it can ship.
+          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || env.PLATFORMS }}
           push: ${{ steps.gate.outputs.push }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
