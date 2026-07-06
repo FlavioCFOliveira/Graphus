@@ -108,6 +108,72 @@ impl DiskImage {
         RecordStore::open(device, wal, 64).expect("open store")
     }
 
+    /// Like [`open`](Self::open), but injects on-disk corruption into the recovered durable image
+    /// **after** ARIES recovery has run and **before** [`RecordStore::open`] — the only way to make a
+    /// checksum tear *survive* to the cold checksum pass.
+    ///
+    /// # Why post-recovery corruption is required (the #592 interaction)
+    ///
+    /// The materialise path is `stage pages → recover_device → open`, exactly as production startup
+    /// runs it. A byte flipped into `self.pages` (the pre-recovery staging image) is corruption that
+    /// **recovery legitimately heals**: `recovery::DeviceTarget::page_lsn` checksum-gates the page
+    /// (`rmp` #592) — a page that fails its CRC reports `page_lsn == 0`, so ARIES redo re-applies
+    /// every WAL record for it, rebuilding the page byte-for-byte from the still-durable redo image
+    /// and stamping a fresh, valid checksum. The result is a *correct* page (verified empirically:
+    /// the flipped body byte is restored to its committed value), so the checker rightly finds
+    /// nothing to flag. That is a durability feature, not a masking bug: the WAL is the authoritative
+    /// post-image and redo is idempotent.
+    ///
+    /// To pin the #398/#426 guarantee — *on-disk corruption of a served page IS flagged on cold
+    /// open* — the corruption must be one recovery **cannot** heal: damage to the durable image past
+    /// the redo horizon (bit-rot, or a torn page whose redo records were already checkpointed away).
+    /// Corrupting the device *after* `recover_device` has consumed the redo image models exactly that:
+    /// recovery does not run again, so the tear reaches the checker intact. `corrupt` receives the
+    /// recovered device; a helper flips a body byte and writes the page back **without** refreshing
+    /// its CRC, so the served durable image fails verification at the checker's cold disk read.
+    ///
+    /// `RecordStore::open` stays robust over the corrupt image: `reconstruct_orphan_store_pages`
+    /// skips the (committed, mapped) record page, and `floor_high_water_over_mapped_corpses` treats a
+    /// checksum-failing boundary page as a scan stop without caching it (`store.rs` §"Robust to
+    /// corruption"), so the page is **never** resident and the cold checksum pass re-reads it from
+    /// disk and flags it (`rmp` #426 cold-pool detection preserved).
+    fn open_corrupting_after_recovery(&self, corrupt: impl FnOnce(&mut MemBlockDevice)) -> Store {
+        let max = self.pages.iter().map(|(i, _)| *i).max().unwrap_or(0);
+        let mut device = MemBlockDevice::new(max + 1);
+        for (idx, bytes) in &self.pages {
+            device.write_page(PageId(*idx), bytes).expect("stage page");
+        }
+        device.sync_all().expect("persist");
+
+        let mut sink = MemLogSink::new();
+        sink.append(&self.log);
+        sink.sync().expect("sync log");
+        let mut wal = WalManager::open(sink.clone()).expect("open wal");
+        recovery::recover_device(&mut wal, &mut device).expect("recover");
+
+        // Damage the recovered image: recovery has already consumed the redo records, so this tear
+        // survives (unlike a pre-recovery flip, which #592's checksum-gated redo heals).
+        corrupt(&mut device);
+        device.sync_all().expect("persist corruption");
+
+        let wal = WalManager::open(sink).expect("reopen wal");
+        RecordStore::open(device, wal, 64).expect("open store")
+    }
+
+    /// Flips a body byte at `(page_id, off + 30)` of `device`'s page and writes it back **without**
+    /// recomputing the page checksum, so the page's stored CRC32C no longer matches its bytes — a
+    /// durable checksum tear. Used as the `corrupt` closure of [`open_corrupting_after_recovery`].
+    fn flip_body_byte(device: &mut MemBlockDevice, page_id: u64, off: usize) {
+        let mut buf = Box::new([0u8; PAGE_SIZE]);
+        device
+            .read_page(PageId(page_id), &mut buf)
+            .expect("read page");
+        buf[off + 30] ^= 0xFF; // a body byte inside the record region; leaves a stale CRC
+        device
+            .write_page(PageId(page_id), &buf)
+            .expect("write page");
+    }
+
     /// The mutable bytes of the page stored at device id `page_id`.
     fn page_mut(&mut self, page_id: u64) -> &mut Page {
         let entry = self
@@ -431,18 +497,21 @@ fn corrupt_checksum_is_flagged() {
     s.create_rel(txn, t, a, b).unwrap();
     s.commit(txn).unwrap();
 
-    let mut img = DiskImage::capture(&mut s);
+    let img = DiskImage::capture(&mut s);
     // First: the uncorrupted image passes (proves we are not flagging a healthy store).
     {
         let mut clean = img.open();
         assert!(report(&mut clean).is_consistent());
     }
 
-    // Corrupt: flip a body byte in node a's page, WITHOUT refreshing the checksum.
+    // Corrupt: flip a body byte in node a's page WITHOUT refreshing the checksum. The flip is applied
+    // to the *recovered* durable image (post-`recover_device`), so ARIES redo cannot heal it from the
+    // still-durable WAL redo image (`rmp` #592, `DeviceTarget::page_lsn` checksum-gate). This models
+    // corruption past the redo horizon (bit-rot / a torn page whose redo was checkpointed away) — the
+    // exact class the cold checksum pass exists to catch.
     let (page_id, off) = img.locate(StoreKind::Node, eid_a.0);
-    img.page_mut(page_id)[off + 30] ^= 0xFF; // a body byte inside the record region
-
-    let mut store = img.open();
+    let mut store =
+        img.open_corrupting_after_recovery(|dev| DiskImage::flip_body_byte(dev, page_id, off));
     let r = report(&mut store);
     assert!(
         r.violations
@@ -473,7 +542,7 @@ fn check_store_cold_open_contract_holds_on_fresh_open() {
     s.create_rel(txn, t, a, b).unwrap();
     s.commit(txn).unwrap();
 
-    let mut img = DiskImage::capture(&mut s);
+    let img = DiskImage::capture(&mut s);
 
     // A freshly-opened store is cold: no dirty resident pages. `assert_cold_open` accepts it (and
     // when built with `--features check-cold-assert` it actively enforces this — here it is the
@@ -487,10 +556,15 @@ fn check_store_cold_open_contract_holds_on_fresh_open() {
     // checksum pass re-reads the durable image from disk and flags it. This is the corruption that
     // the cold-open contract guarantees is caught (it would be missed only on a WARM/dirty pool,
     // which the contract forbids — the limitation the #426 doc now states explicitly).
+    //
+    // The flip is injected into the *recovered* durable image (post-`recover_device`), not the
+    // staging image: a pre-recovery flip is healed by #592's checksum-gated redo (recovery rebuilds
+    // the page from the still-durable WAL redo image), which is a durability feature — so the tear
+    // the cold pass must catch is precisely one past the redo horizon, modelled here by damaging the
+    // device after recovery has consumed the redo records. See [`open_corrupting_after_recovery`].
     let (page_id, off) = img.locate(StoreKind::Node, eid_a.0);
-    img.page_mut(page_id)[off + 30] ^= 0xFF;
-
-    let mut store = img.open();
+    let mut store =
+        img.open_corrupting_after_recovery(|dev| DiskImage::flip_body_byte(dev, page_id, off));
     graphus_storage::check::assert_cold_open(&store); // still cold right after open
     let r = report(&mut store);
     assert!(
