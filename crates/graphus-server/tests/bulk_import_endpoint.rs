@@ -651,6 +651,73 @@ async fn network_mode_a_happy_path_end_to_end() {
     server.shutdown().await.expect("clean shutdown");
 }
 
+/// `rmp` #598 (Finding E-5): a Mode A load abandoned with a plain **`STOP DATABASE`** (bypassing the
+/// network `?end=true`, whose `End` batch is what normally deletes the sentinel) must not leak its
+/// internal `__graphus_bulk_import_session__` checkpoint sentinel into the database once it is brought
+/// back Online. Before the fix, `STOP DATABASE` on a `Loading` database closed the store with the
+/// sentinel still present, and the next `START DATABASE` (`Offline -> Online`) exposed that internal
+/// bookkeeping node to ordinary Cypher. `STOP` now sweeps it at the source (the same `End` batch the
+/// endpoint runs), so a subsequent `START` opens a clean store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn network_mode_a_stop_without_end_then_start_does_not_leak_sentinel() {
+    let temp = TempStore::new("stop-no-end");
+    let server = boot(base_config(&temp, BulkImportConfig::default())).await;
+    let rest = server.rest_addr.expect("REST enabled");
+    let token = mint_token(ADMIN_USER);
+
+    let (status, body) = rest_statement(rest, &token, DB, "CREATE DATABASE leakdb").await;
+    assert_eq!(status, 200, "create database: {body}");
+
+    // A Mode A nodes batch creates the durable checkpoint sentinel — but we deliberately do NOT call
+    // `?end=true`, leaving the database in the `Loading` state with the sentinel present.
+    let (status, body) = bulk_call(
+        rest,
+        Some(&token),
+        "leakdb",
+        "phase=nodes",
+        Some("text/csv"),
+        NODES_CSV.as_bytes(),
+    )
+    .await;
+    assert_eq!(status, 200, "nodes phase: {body}");
+    assert_eq!(extract_json_number(&body, "nodes"), Some(3), "body: {body}");
+
+    // Abandon the load with a plain STOP (`Loading -> Offline`), bypassing `?end=true`.
+    let (status, body) = rest_statement(rest, &token, DB, "STOP DATABASE leakdb").await;
+    assert_eq!(status, 200, "stop database: {body}");
+
+    // Bring it back Online for ordinary serving.
+    let (status, body) = rest_statement(rest, &token, DB, "START DATABASE leakdb").await;
+    assert_eq!(status, 200, "start database: {body}");
+
+    // The imported data survived the stop/start...
+    let (status, body) = rest_statement(rest, &token, "leakdb", "MATCH (n) RETURN count(n)").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        extract_jolt_int(&body),
+        Some(3),
+        "the imported nodes survive the stop/start: {body}"
+    );
+
+    // ...and the checkpoint sentinel was swept — it is NOT queryable after coming back Online.
+    let (status, body) = rest_statement(
+        rest,
+        &token,
+        "leakdb",
+        "MATCH (n:__graphus_bulk_import_session__) RETURN count(n)",
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        extract_jolt_int(&body),
+        Some(0),
+        "a plain STOP of a Loading database must sweep the checkpoint sentinel, never leak it into \
+         the Online graph: {body}"
+    );
+
+    server.shutdown().await.expect("clean shutdown");
+}
+
 /// `rmp` #595 (Finding E-3): a `.gcol` upload is bounded by the configured decode budget. A valid
 /// blob whose decoded working set fits the budget ingests normally (`200`); one that would exceed it
 /// — the buffered-whole-then-transcoded `.gcol` path is where an oversized-or-adversarial upload could

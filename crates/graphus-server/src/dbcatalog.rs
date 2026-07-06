@@ -116,7 +116,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::config::ServerConfig;
-use crate::engine::{Engine, EngineHandle, spawn_engine_with_timeout};
+use crate::engine::{BulkImportBatchInput, Engine, EngineHandle, spawn_engine_with_timeout};
 use crate::metrics::Metrics;
 use crate::store_device::{MasterKey, StoreDevice, WalSink};
 
@@ -586,6 +586,70 @@ impl EngineParams {
             egress_stall_timeout: config.timing.egress_stall_timeout(),
         })
     }
+}
+
+/// The most escalating store-open-lock reminders the [`spawn_force_detached_watchdog`] emits before
+/// it stops (so it can never become a permanently-running task even if the zombie thread never
+/// exits — a truly hung storage syscall). The durable signal after that is the
+/// `graphus_engine_force_detached_active` gauge, which stays raised until the process restarts.
+const FORCE_DETACH_WATCHDOG_MAX_REMINDERS: u32 = 20;
+
+/// Bounded observability watchdog for a **force-detached** engine (`rmp` #598, C-F3). The engine was
+/// abandoned (not joined) because it wedged mid-drain, and it still holds its exclusive store-open
+/// `flock` until it finishes flushing and drops the store (`rmp` #563) — so every subsequent
+/// `START DATABASE` for that store fails fast (fail-SAFE, no corruption) until then.
+///
+/// This task periodically polls the abandoned thread's handle with the **non-blocking**
+/// [`std::thread::JoinHandle::is_finished`] (it never joins — joining a wedged thread is the hang the
+/// force-detach exists to avoid, and it never touches the `flock` — probing it could itself spuriously
+/// fail a concurrent legitimate reopen). While the thread is still running it logs an escalating
+/// reminder; once the thread exits it logs recovery and clears the
+/// `graphus_engine_force_detached_active` gauge. It is deliberately **bounded** to
+/// [`FORCE_DETACH_WATCHDOG_MAX_REMINDERS`] iterations so a thread that never exits cannot leave a
+/// permanently-running task; the gauge then stays raised (the durable signal) until a process restart.
+///
+/// A detached, self-terminating task (its `JoinHandle` is intentionally not tracked): it holds no
+/// lock, performs only logging + one atomic decrement, and this is a cold, rare path (a genuinely
+/// wedged engine), so tracking it would add lifecycle machinery for no benefit.
+fn spawn_force_detached_watchdog(
+    db: String,
+    join: std::thread::JoinHandle<()>,
+    window: std::time::Duration,
+    metrics: Arc<Metrics>,
+) {
+    // A sane poll cadence even if the configured no-progress window is sub-second.
+    let poll = window.max(std::time::Duration::from_secs(1));
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        for reminder in 1..=FORCE_DETACH_WATCHDOG_MAX_REMINDERS {
+            tokio::time::sleep(poll).await;
+            if join.is_finished() {
+                metrics.clear_engine_force_detached();
+                tracing::info!(
+                    db = %db,
+                    held_for_ms = started.elapsed().as_millis() as u64,
+                    "a previously force-detached engine finished flushing and released its \
+                     store-open lock; START DATABASE for this store can now succeed (rmp #598)",
+                );
+                return;
+            }
+            tracing::warn!(
+                db = %db,
+                held_for_ms = started.elapsed().as_millis() as u64,
+                reminder,
+                "a force-detached engine may still be holding its store-open lock; START DATABASE \
+                 for this store will keep failing (fail-SAFE, no corruption) until it finishes \
+                 flushing or the process restarts (rmp #598)",
+            );
+        }
+        tracing::warn!(
+            db = %db,
+            held_for_ms = started.elapsed().as_millis() as u64,
+            "stopping store-open-lock watchdog reminders for a force-detached engine that has not \
+             yet exited; the graphus_engine_force_detached_active gauge stays raised until the \
+             process restarts (rmp #598)",
+        );
+    });
 }
 
 /// Opens an existing store (recovering its WAL first) or creates a fresh one, then **verifies it**
@@ -1585,6 +1649,28 @@ impl DatabaseCatalog {
     /// [`CatalogError::UnknownDatabase`], [`CatalogError::DefaultDatabase`], or
     /// [`CatalogError::Io`] on persist failure.
     pub async fn stop(&self, name: &str) -> Result<(), CatalogError> {
+        // A plain operator `STOP DATABASE` sweeps a leftover Mode A checkpoint sentinel (see
+        // [`stop_inner`]); `end_loading` (below) skips the sweep because the network `?end=true`
+        // already deleted it in its own commit.
+        self.stop_inner(name, true).await
+    }
+
+    /// Shared implementation of [`stop`](Self::stop) and [`end_loading`](Self::end_loading).
+    ///
+    /// `sweep_loading_sentinel` (`rmp` #598, Finding E-5): when `true` **and** the database is still
+    /// in the `Loading` state, delete any durable `__graphus_bulk_import_session__` checkpoint
+    /// sentinel node before the engine is drained, via the SAME idempotent
+    /// [`BulkImportBatchInput::End`] batch the network endpoint runs (which itself calls the engine's
+    /// `recover_and_delete_orphaned_sentinel` fallback). Without this, a
+    /// `STOP DATABASE` against an in-progress or crash-recovered Mode A load would close the store
+    /// with the internal bookkeeping node still present, and the next `START DATABASE`
+    /// (`Offline -> Online`) would expose it to ordinary Cypher — a stray, queryable node that
+    /// outlives the load. Deleting it at the source keeps the store's next Online open clean.
+    async fn stop_inner(
+        &self,
+        name: &str,
+        sweep_loading_sentinel: bool,
+    ) -> Result<(), CatalogError> {
         let name = normalize_db_name(name)?;
         if name == self.default_name {
             return Err(CatalogError::DefaultDatabase {
@@ -1596,6 +1682,26 @@ impl DatabaseCatalog {
         let Some(desired) = state.entries.get(&name).copied() else {
             return Err(CatalogError::UnknownDatabase(name));
         };
+
+        // Sweep the Mode A checkpoint sentinel while the engine is still alive (before the drain
+        // below removes it from `running`). The handle is cloned so the `state.running` borrow is
+        // released before the `.await`. Best-effort: the engine is going away regardless, so a
+        // sweep error is logged (an operator can then notice a stray sentinel on the next Online
+        // open) rather than failing the stop over an advisory cleanup.
+        if sweep_loading_sentinel && desired == DbState::Loading {
+            let handle = state.running.get(&name).map(|r| r.handle.clone());
+            if let Some(handle) = handle {
+                if let Err(e) = handle.bulk_import_batch(BulkImportBatchInput::End).await {
+                    tracing::warn!(
+                        db = %name,
+                        error = %e,
+                        "could not sweep the bulk-import checkpoint sentinel while stopping a \
+                         Loading database; a subsequent START may expose it to ordinary queries \
+                         (rmp #598)",
+                    );
+                }
+            }
+        }
 
         let was_running = match state.running.remove(&name) {
             Some(engine) => {
@@ -1734,7 +1840,10 @@ impl DatabaseCatalog {
     pub async fn end_loading(&self, name: &str) -> Result<(), CatalogError> {
         let name = normalize_db_name(name)?;
         self.write_loading_handles().remove(&name);
-        self.stop(&name).await
+        // `sweep_loading_sentinel = false`: the network `?end=true` handler already deleted the
+        // sentinel in its own `End` commit before calling here, so re-running the sweep would be a
+        // redundant store scan (`rmp` #598).
+        self.stop_inner(&name, false).await
     }
 
     /// The store directory of database `name`: the data root for the default database, or
@@ -2021,9 +2130,20 @@ impl DatabaseCatalog {
                          WAL; the exclusive store-open lock prevents a concurrent reopen from racing the \
                          abandoned thread's writes, rmp #563)",
                     );
-                    // Drop the join handle WITHOUT joining: joining a wedged thread is the very hang this
-                    // guard exists to prevent.
-                    drop(join);
+                    // Observability for the force-detach (`rmp` #598, C-F3): record the metric and hand
+                    // the (un-joined) thread handle to a bounded watchdog. The zombie still holds the
+                    // store-open lock until it finishes flushing, so every subsequent `START DATABASE`
+                    // for this store fails fast (fail-SAFE — no corruption) until then; the watchdog
+                    // surfaces that condition via escalating logs and clears the gauge once the thread
+                    // exits, instead of the block being silent and indefinite. We do NOT join here:
+                    // joining a wedged thread is the very hang this guard exists to prevent.
+                    self.metrics.record_engine_force_detached();
+                    spawn_force_detached_watchdog(
+                        name.to_owned(),
+                        join,
+                        no_progress,
+                        Arc::clone(&self.metrics),
+                    );
                     return;
                 }
             }

@@ -1192,10 +1192,15 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // label AND holds an indexable value of the key, set its bit under that value. A node that
         // lost the label or the property ends up in no bitmap, so a seek never returns a phantom.
         //
-        // Record the node as bitmap-dirty for this txn FIRST (`rmp` #453, F-IDX-3), before mutating the
-        // bitmap, so that even a panic struck mid-reindex (between the remove and the reinsert) leaves
-        // the node marked for the abort path to re-derive from the reverted store. A no-op unless a
-        // bitmap index is declared.
+        // Record the node as bitmap-dirty for this txn FIRST (`rmp` #453, F-IDX-3; `rmp` #598, C-F3),
+        // before mutating the bitmap, so that even a panic struck mid-reindex (between the remove and
+        // the reinsert) leaves the node marked for the abort path to re-derive from the reverted store.
+        // This ordering (mark-before-mutate) is load-bearing and MUST hold before the bitmap seek is
+        // ever wired into the planner: inverting it would let a panic in that gap silently drop a node
+        // from a membership-exact candidate source and make a query miss a committed row. Pinned by
+        // `IndexSet::tests::bitmap_maintenance_panic_window_is_captured_before_the_destructive_remove`
+        // (the capture) plus `tests/bitmap_index.rs`'s `aborted_*` tests (the re-derive restore). A
+        // no-op unless a bitmap index is declared.
         index.note_bitmap_dirty(self.txn, node.0);
         for (label_token, prop_key) in index.registered_bitmap() {
             index.remove_bitmap_node(label_token, prop_key, node.0);

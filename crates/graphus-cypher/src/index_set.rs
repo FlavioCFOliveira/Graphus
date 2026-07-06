@@ -1549,6 +1549,50 @@ mod tests {
         );
     }
 
+    /// (`rmp` #598, Finding C-F3): the bitmap is a **membership-exact candidate SOURCE**, so its
+    /// per-write maintenance (`RecordStoreGraph::reindex_node`) records the node as bitmap-dirty
+    /// **before** the destructive `remove` half of its remove-then-reinsert re-index. This test pins
+    /// the crux that makes the maintenance panic window safe **before** the seek is ever wired into
+    /// the planner: even if a panic strikes in the gap between the remove and the reinsert — leaving
+    /// the node dropped from the bitmap (a subset hazard, reproduced here) — the node was already
+    /// captured in the txn's dirty set, so the coordinator's abort path knows to re-derive it from the
+    /// reverted store. Were the ordering ever inverted (mutate first, mark second), a panic in that gap
+    /// would leave a node silently missing from a candidate source and a query would miss a committed
+    /// row. The companion end-to-end proof that the abort re-derive actually *restores* membership
+    /// lives in `tests/bitmap_index.rs` (`aborted_set_does_not_desync_bitmap`,
+    /// `aborted_delete_restores_bitmap_membership`).
+    #[test]
+    fn bitmap_maintenance_panic_window_is_captured_before_the_destructive_remove() {
+        let txn = TxnId(7);
+        let mut set = IndexSet::new();
+        set.register_bitmap(1, 2);
+        set.insert_bitmap_value(1, 2, &Value::Boolean(true), 100);
+        assert_eq!(
+            set.seek_bitmap_eq(1, 2, &Value::Boolean(true)),
+            Some(vec![100]),
+            "the committed value is a bitmap candidate before any re-index"
+        );
+
+        // Reproduce the exact state a panic *between* the remove and the reinsert leaves: the
+        // maintenance path marks the node dirty FIRST, then removes it — and here the reinsert never
+        // runs (the panic struck in that gap).
+        set.note_bitmap_dirty(txn, 100);
+        set.remove_node_from_all_bitmaps(100);
+
+        assert_eq!(
+            set.seek_bitmap_eq(1, 2, &Value::Boolean(true)),
+            Some(Vec::<u64>::new()),
+            "the subset hazard is real: mid-reindex the node is momentarily absent from the bitmap"
+        );
+        // The load-bearing guarantee: the node was captured for the abort re-derive despite the
+        // reinsert never running. This is only true because the dirty-mark precedes the remove.
+        assert_eq!(
+            set.take_dirty_bitmap_nodes(txn),
+            BTreeSet::from([100]),
+            "the node must be captured for abort re-derive even though the reinsert never ran"
+        );
+    }
+
     #[test]
     fn range_returns_superset_of_in_range_ids() {
         let mut set = IndexSet::new();

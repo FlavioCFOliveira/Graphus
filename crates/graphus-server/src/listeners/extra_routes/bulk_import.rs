@@ -1264,6 +1264,56 @@ fn stats_json_mode_b(stats: &ImportStats, session: uuid::Uuid) -> String {
     )
 }
 
+/// RAII guard (`rmp` #598, Finding E-5) that returns a checked-out [`ModeBSession`] to its
+/// [`ModeBSessionRegistry`](crate::bulk_import_mode_b::ModeBSessionRegistry) if the driving task
+/// unwinds (panics) or is cancelled (the client drops the connection) in the window between checking
+/// the session out and moving it into the ingest [`BatchSink`] — the disk-space preflight `.await` is
+/// exactly such a cancellation point. Without the guard a dropped future in that window would strand
+/// the session (losing the client's resumable, already-committed progress). Disarmed via
+/// [`Self::take`] once the session is handed to the sink.
+///
+/// This guard does **not** cover the one residual documented on [`handle_phase_mode_b`]: a request
+/// timeout or blocking-task panic that strikes *after* the session has entered the `spawn_blocking`
+/// ingest task leaves ownership inside that orphaned task, out of reach here — that path is surfaced
+/// via the `graphus_bulk_import_mode_b_sessions_stranded_total` metric instead.
+struct SessionCheckinGuard {
+    registry: Arc<crate::bulk_import_mode_b::ModeBSessionRegistry>,
+    id: uuid::Uuid,
+    session: Option<ModeBSession>,
+}
+
+impl SessionCheckinGuard {
+    fn new(
+        registry: Arc<crate::bulk_import_mode_b::ModeBSessionRegistry>,
+        id: uuid::Uuid,
+        session: ModeBSession,
+    ) -> Self {
+        Self {
+            registry,
+            id,
+            session: Some(session),
+        }
+    }
+
+    /// Disarms the guard, returning the session for the caller to move onward (into the sink). After
+    /// this the guard's `Drop` is an inert no-op.
+    fn take(&mut self) -> ModeBSession {
+        self.session
+            .take()
+            .expect("INVARIANT: SessionCheckinGuard::take is called exactly once while armed")
+    }
+}
+
+impl Drop for SessionCheckinGuard {
+    fn drop(&mut self) {
+        if let Some(session) = self.session.take() {
+            // Reached only on an early return / unwind / cancellation before `take` — restore the
+            // session synchronously (best-effort; see `checkin_from_drop`).
+            self.registry.checkin_from_drop(self.id, session);
+        }
+    }
+}
+
 /// Handles one Mode B `?mode=live&phase=...` call (`08` §5.3, `rmp` #520): resolves (continuing or
 /// beginning) the session, runs the disk-space preflight, then streams + ingests the body under the
 /// call's own quota/timeout budget — reusing the exact same [`ChunkReader`]/CSV/`.gcol`/[`QuotaGuard`]/
@@ -1276,13 +1326,20 @@ fn stats_json_mode_b(stats: &ImportStats, session: uuid::Uuid) -> String {
 /// duration of this call (so a second concurrent call against the same session id cleanly `409`s —
 /// "a Mode B session is driven by one call at a time") and checked back in on every exit path that
 /// still has it: success, a terminal ingest error, a disk-space/preflight rejection discovered after
-/// checkout, and even a database-went-offline race. The **one** exception is a genuine request
-/// timeout or a blocking-task panic (see [`ingest_csv_stream`]'s doc): in both cases the session's
-/// ownership is unrecoverably stuck inside an orphaned `spawn_blocking` task and is **not** checked
-/// back in — a narrow, documented, accepted residual gap (mirrors the "Known, accepted race" already
-/// documented in this module for Mode A's empty-database precondition check), not silently swallowed:
-/// the session slot is simply gone until the server restarts or an operator notices via `08`'s
-/// concurrent-session-cap symptom and investigates.
+/// checkout, and even a database-went-offline race.
+///
+/// The window between checkout and moving the session into the ingest sink — which includes the
+/// disk-space preflight `.await`, a genuine cancellation point if the client drops the connection — is
+/// covered by an RAII [`SessionCheckinGuard`] (`rmp` #598, Finding E-5): a panic or a dropped future
+/// there re-checks the session in via the guard's `Drop`, rather than stranding it.
+///
+/// The **one** remaining exception is a genuine request timeout or a blocking-task panic (see
+/// [`ingest_csv_stream`]'s doc) that strikes *after* the session has entered the `spawn_blocking`
+/// ingest task: its ownership is then unrecoverably stuck inside that orphaned task and is **not**
+/// checked back in — a narrow, documented, accepted residual (mirrors the "Known, accepted race"
+/// already documented in this module for Mode A's empty-database precondition check), not silently
+/// swallowed: it is counted on the `graphus_bulk_import_mode_b_sessions_stranded_total` metric, and
+/// the session slot is otherwise reclaimed by the registry's idle reaper.
 async fn handle_phase_mode_b(
     state: &ExtraState,
     who: &str,
@@ -1394,11 +1451,17 @@ async fn handle_phase_mode_b(
         }
     };
 
+    // From here until the session is handed to the ingest sink, own it through an RAII guard
+    // (`rmp` #598, E-5): every early return below simply lets the guard's `Drop` re-check the session
+    // in, and — crucially — so does a panic or a client-disconnect cancellation at the disk-space
+    // preflight `.await` (which a bare local `session` would silently strand). Disarmed via
+    // `guard.take()` at the move into the sink.
+    let mut guard = SessionCheckinGuard::new(Arc::clone(&state.mode_b), session_id, session);
+
     let Some(engine) = state.catalog.handle(db_name) else {
         // The database went offline between resolving/creating the session and here (a narrow,
-        // accepted race — mirrors Mode A's own documented precondition-check race). Check the
-        // session back in unchanged (no progress lost) and report a clean conflict.
-        state.mode_b.checkin(session_id, session).await;
+        // accepted race — mirrors Mode A's own documented precondition-check race). The guard checks
+        // the session back in unchanged (no progress lost); report a clean conflict.
         audit_fail(format!(
             "bulk-import Mode B phase={} aborted: database {db_name:?} went offline mid-call",
             phase.as_str()
@@ -1415,7 +1478,7 @@ async fn handle_phase_mode_b(
     if min_free > 0 {
         match check_free_space(&target_dir).await {
             Ok(free) if free < min_free => {
-                state.mode_b.checkin(session_id, session).await;
+                // Guard re-checks the session in on return.
                 audit_fail(format!(
                     "bulk-import Mode B phase={} refused: disk-space preflight failed",
                     phase.as_str()
@@ -1431,7 +1494,7 @@ async fn handle_phase_mode_b(
             }
             Ok(_) => {}
             Err(msg) => {
-                state.mode_b.checkin(session_id, session).await;
+                // Guard re-checks the session in on return.
                 return (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response();
             }
         }
@@ -1439,9 +1502,11 @@ async fn handle_phase_mode_b(
 
     let quota = state.bulk_import.max_bytes_per_session;
     let session_timeout = state.bulk_import.session_timeout();
+    // Hand the session to the sink — disarms the guard (from here the post-ingest check-in below, and
+    // the stranded metric, own the session's fate).
     let sink = BatchSink::ModeB {
         engine,
-        session,
+        session: guard.take(),
         cfg: Arc::clone(&state.bulk_import),
     };
 
@@ -1479,11 +1544,16 @@ async fn handle_phase_mode_b(
     };
 
     // Check the session back in on every path that still has it (see the doc comment above for the
-    // one exception: `sink_back` is `None` on a request timeout or a blocking-task panic).
-    if let Some(sink) = sink_back {
-        if let Some(session) = sink.into_mode_b_session() {
-            state.mode_b.checkin(session_id, session).await;
+    // one exception: `sink_back` is `None` on a request timeout or a blocking-task panic — the session
+    // is then stranded inside the orphaned ingest task, so it is recorded on the observability counter
+    // instead of being silently lost, `rmp` #598, E-5).
+    match sink_back {
+        Some(sink) => {
+            if let Some(session) = sink.into_mode_b_session() {
+                state.mode_b.checkin(session_id, session).await;
+            }
         }
+        None => state.metrics.record_mode_b_session_stranded(),
     }
 
     match outcome {
@@ -1689,6 +1759,47 @@ async fn handle_end(state: &ExtraState, who: &str, db_name: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bulk_import_mode_b::ModeBSessionRegistry;
+    use std::time::Duration;
+
+    /// (`rmp` #598, Finding E-5): the `SessionCheckinGuard` returns a checked-out session to the
+    /// registry when it is dropped without `take` (an unwind / cancellation before the ingest sink) —
+    /// preserving the client's resumable progress — and is an inert no-op once `take` has handed the
+    /// session onward. This is the drop-guard the "panic/timeout mid-session → slot reclaimed" AC asks
+    /// for, covering the pre-ingest window.
+    #[tokio::test]
+    async fn session_checkin_guard_restores_on_drop_and_is_inert_after_take() {
+        let reg = Arc::new(ModeBSessionRegistry::new(2, Duration::from_secs(60)));
+        let id = reg.create("db").await.expect("create");
+
+        // Dropped WITHOUT take (models a cancellation/panic in the pre-ingest window) → restored.
+        {
+            let sess = reg.checkout(id).await.expect("checkout");
+            assert_eq!(reg.len().await, 0);
+            let _guard = SessionCheckinGuard::new(Arc::clone(&reg), id, sess);
+        }
+        assert_eq!(
+            reg.len().await,
+            1,
+            "a guard dropped before `take` must re-check the session in"
+        );
+
+        // Taken (the success path) → the guard's drop is inert, the caller owns the session.
+        let taken = {
+            let mut guard =
+                SessionCheckinGuard::new(Arc::clone(&reg), id, reg.checkout(id).await.unwrap());
+            let s = guard.take();
+            drop(guard); // inert: session already handed onward
+            s
+        };
+        assert_eq!(
+            reg.len().await,
+            0,
+            "after `take`, the guard's drop must not double-check-in"
+        );
+        reg.checkin(id, taken).await;
+        assert_eq!(reg.len().await, 1);
+    }
 
     fn headers_with_content_type(value: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();

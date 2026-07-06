@@ -311,6 +311,32 @@ pub struct Metrics {
     /// `maintenance_degraded` gauge for the symmetric reason.
     engine_recovery_panics: AtomicU64,
 
+    // ---- reliability (`rmp` #598, sprint-52 C-F3) ----
+    /// Cumulative count of engines **force-detached** while stopping (`rmp` #563): a wedged engine
+    /// abandoned (not joined) because it made no drain progress within the deadline. A non-zero value
+    /// means at least one store was left with a still-flushing zombie thread holding its exclusive
+    /// store-open lock, so a `START DATABASE` against that store fails fast (fail-SAFE, no corruption)
+    /// until the zombie finishes or the process restarts. Written from the catalog's admin-locked stop
+    /// path (effectively serialized), a cold/rare event, so unpadded.
+    engine_force_detached_total: AtomicU64,
+    /// The number of force-detached zombies **currently believed to still hold their store-open lock**
+    /// (a gauge): incremented at force-detach, decremented when the bounded store-open-lock watchdog
+    /// observes the abandoned thread has finally exited (released the lock). A persistent non-zero
+    /// value is the direct operator signal that a `START DATABASE` for some store is being blocked by a
+    /// zombie and a process restart may be needed (`rmp` #598). Never itself blocks or probes the lock.
+    engine_force_detached_active: AtomicU64,
+
+    // ---- reliability (`rmp` #598, sprint-52 E-5) ----
+    /// Cumulative count of **Mode B bulk-import sessions stranded** by a request timeout or a
+    /// blocking-task panic that struck *after* the checked-out session was moved into the
+    /// `spawn_blocking` ingest task (`crate::bulk_import_mode_b`). In that one window the session's
+    /// ownership is inside an orphaned task, out of the REST handler's `SessionCheckinGuard`'s reach,
+    /// so it is not checked back in — the client's session id becomes unusable until the idle reaper
+    /// sweeps it. Documented residual (see `handle_phase_mode_b`); this counter makes its frequency
+    /// observable so an operator can alert on it. Written from a REST worker (multi-writer) but a cold,
+    /// rare event, so unpadded.
+    mode_b_sessions_stranded: AtomicU64,
+
     // ---- per-database dimension (`rmp` #463) ----
     /// Per-database slices of the transaction/latency/abort families, keyed by canonical database name.
     /// Each engine records into BOTH its slice here and the aggregate fields above, so the per-database
@@ -355,6 +381,9 @@ impl Metrics {
             egress_stall_aborts: CachePad::new(0),
             ssi_tracked: AtomicU64::new(0),
             engine_recovery_panics: AtomicU64::new(0),
+            engine_force_detached_total: AtomicU64::new(0),
+            engine_force_detached_active: AtomicU64::new(0),
+            mode_b_sessions_stranded: AtomicU64::new(0),
             per_db: RwLock::new(BTreeMap::new()),
         }
     }
@@ -619,6 +648,62 @@ impl Metrics {
         self.engine_recovery_panics.load(Ordering::Relaxed)
     }
 
+    /// Records one **force-detach** of a wedged engine (`rmp` #598, C-F3): bumps the cumulative total
+    /// and raises the "currently holding a store-open lock" gauge by one. Paired with
+    /// [`clear_engine_force_detached`](Self::clear_engine_force_detached) once the abandoned thread is
+    /// observed to have exited.
+    pub fn record_engine_force_detached(&self) {
+        self.engine_force_detached_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.engine_force_detached_active
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Lowers the "force-detached zombie still holding its store-open lock" gauge by one, once the
+    /// bounded watchdog observes the abandoned thread has exited and released the lock (`rmp` #598).
+    /// Saturating at zero so a spurious double-clear can never underflow the gauge.
+    pub fn clear_engine_force_detached(&self) {
+        let mut cur = self.engine_force_detached_active.load(Ordering::Relaxed);
+        while cur > 0 {
+            match self.engine_force_detached_active.compare_exchange_weak(
+                cur,
+                cur - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+
+    /// The cumulative count of force-detached engines so far (`rmp` #598) — observability / tests.
+    #[must_use]
+    pub fn engine_force_detached_total(&self) -> u64 {
+        self.engine_force_detached_total.load(Ordering::Relaxed)
+    }
+
+    /// The number of force-detached zombies currently believed to still hold their store-open lock
+    /// (`rmp` #598) — observability / tests.
+    #[must_use]
+    pub fn engine_force_detached_active(&self) -> u64 {
+        self.engine_force_detached_active.load(Ordering::Relaxed)
+    }
+
+    /// Records one **Mode B bulk-import session stranded** by a request timeout / blocking-task panic
+    /// after the session was moved into the ingest task (`rmp` #598, E-5). Infallible and
+    /// allocation-free.
+    pub fn record_mode_b_session_stranded(&self) {
+        self.mode_b_sessions_stranded
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The number of Mode B bulk-import sessions stranded so far (`rmp` #598) — observability / tests.
+    #[must_use]
+    pub fn mode_b_sessions_stranded(&self) -> u64 {
+        self.mode_b_sessions_stranded.load(Ordering::Relaxed)
+    }
+
     // ---- per-database recording (`rmp` #463) -------------------------------------------------------
     //
     // Each of these updates the aggregate field (so every existing aggregate metric is unchanged) AND the
@@ -809,6 +894,24 @@ impl Metrics {
             "graphus_engine_recovery_panics_total",
             "Statement-recovery double-panics caught at the engine recovery boundary (rmp #409).",
             self.engine_recovery_panics.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "graphus_engine_force_detached_total",
+            "Wedged engines force-detached while stopping; each left a zombie holding its store-open lock (rmp #598).",
+            self.engine_force_detached_total.load(Ordering::Relaxed),
+        );
+        gauge(
+            &mut out,
+            "graphus_engine_force_detached_active",
+            "Force-detached zombies still believed to hold their store-open lock, blocking START DATABASE for that store (rmp #598).",
+            self.engine_force_detached_active.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "graphus_bulk_import_mode_b_sessions_stranded_total",
+            "Mode B bulk-import sessions stranded by a request timeout / task panic after the session entered the ingest task (rmp #598).",
+            self.mode_b_sessions_stranded.load(Ordering::Relaxed),
         );
         // NOTE (`rmp` #451): the former `graphus_engine_degraded` gauge was removed — engine degradation
         // is now an authoritative **per-engine** flag surfaced through `/health/ready`'s per-database

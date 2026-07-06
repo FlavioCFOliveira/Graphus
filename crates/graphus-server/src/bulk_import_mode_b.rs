@@ -51,7 +51,7 @@
 //!   §5.3), not a bug to fix here.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use graphus_bulk::{ImportStats, NodeHeader, RelHeader};
@@ -68,7 +68,15 @@ pub struct ModeBSession {
     /// External `:ID` → physical node id, populated **only** by successfully-committed batches (the
     /// staging invariant above). A relationship batch resolves `:START_ID`/`:END_ID` only against
     /// this map.
-    pub id_map: HashMap<String, u64>,
+    ///
+    /// Held behind an [`Arc`] (`rmp` #598, Finding E-4) so a relationship batch's per-attempt
+    /// endpoint-resolution snapshot is a **pointer clone**, never an `O(id_map)` map copy. Over a
+    /// large multi-batch load the previous per-attempt full clone was quadratic-ish memory churn; the
+    /// `Arc` collapses a relationship batch's snapshot to a refcount bump and a node batch's
+    /// post-commit merge to an in-place [`Arc::make_mut`] (amortized `O(1)` — the map is uniquely
+    /// owned during a node batch). The staging invariant is unchanged: new bindings are still merged
+    /// in only *after* a batch's `Commit` returns `Ok`.
+    pub id_map: Arc<HashMap<String, u64>>,
     /// Cumulative stats for the whole session so far, advanced only on a batch's successful commit.
     pub stats: ImportStats,
     /// The last time this session was touched (created, checked out, or checked back in) — the idle-
@@ -86,7 +94,7 @@ impl ModeBSession {
     pub fn new(db: String) -> Self {
         Self {
             db,
-            id_map: HashMap::new(),
+            id_map: Arc::new(HashMap::new()),
             stats: ImportStats::default(),
             last_touched: Instant::now(),
         }
@@ -201,6 +209,33 @@ impl ModeBSessionRegistry {
         self.inner.lock().await.insert(id, session);
     }
 
+    /// Re-checks `session` in from a **synchronous** (`Drop`) context (`rmp` #598, Finding E-5), used
+    /// by the REST handler's `SessionCheckinGuard` to restore a checked-out session when the driving
+    /// task unwinds or is cancelled before the session is handed to the ingest sink.
+    ///
+    /// The registry map is only ever locked for a momentary, await-free critical section (see the type
+    /// docs), so [`tokio::sync::Mutex::try_lock`] succeeds in the overwhelming common case — an
+    /// immediate, synchronous check-in with no runtime interaction. On the rare contended miss it falls
+    /// back to a **detached** async check-in (a single, self-completing task) so the session is still
+    /// restored rather than silently lost. If no Tokio runtime is available (never, inside the server)
+    /// the session is dropped — exactly the pre-#598 behavior.
+    pub fn checkin_from_drop(self: &Arc<Self>, id: uuid::Uuid, mut session: ModeBSession) {
+        session.last_touched = Instant::now();
+        match self.inner.try_lock() {
+            Ok(mut guard) => {
+                guard.insert(id, session);
+            }
+            Err(_) => {
+                let registry = Arc::clone(self);
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        registry.checkin(id, session).await;
+                    });
+                }
+            }
+        }
+    }
+
     /// Ends session `id`: removes and returns it (its final stats), or `None` if it was never open /
     /// already ended — an idempotent no-op, mirroring Mode A's `End` contract (`08` §7.1 precedent).
     pub async fn end(&self, id: uuid::Uuid) -> Option<ModeBSession> {
@@ -297,6 +332,15 @@ fn chunk_lengths(total_rows: usize, chunk_rows: usize) -> Vec<usize> {
     }
     out
 }
+
+/// A single, shared, empty `id_map` snapshot handed to a **node** batch's [`run_one_attempt`]
+/// (`rmp` #598, Finding E-4). Node chunks never resolve `:START_ID`/`:END_ID` against previously
+/// committed bindings, so the snapshot they receive is unused — passing this shared empty `Arc`
+/// avoids both an allocation *and* bumping the session's real `id_map` refcount, which keeps the
+/// post-commit [`Arc::make_mut`] merge uniquely-owned (`O(1)`, no copy) for the common nodes-first
+/// load.
+static EMPTY_ID_MAP: LazyLock<Arc<HashMap<String, u64>>> =
+    LazyLock::new(|| Arc::new(HashMap::new()));
 
 /// One attempt's outcome (before commit): the new external-id bindings this attempt's node chunks
 /// produced, plus the cumulative row-count delta.
@@ -440,16 +484,26 @@ pub(crate) async fn drive_mode_b_batch_from(
     let chunk_rows = cfg.mode_b_chunk_rows.max(1) as usize;
     let mut attempt: u32 = 0;
     let mut pending_first_ticket = first_ticket;
+
+    // Build the endpoint-resolution snapshot ONCE per batch, and ONLY for relationship batches
+    // (`rmp` #598, Finding E-4). Rationale:
+    //  - Node chunks never resolve against previously-committed bindings, so they get the shared
+    //    empty [`EMPTY_ID_MAP`] — no clone, and no refcount held on the session's real `id_map`, so
+    //    the post-commit `Arc::make_mut` merge below stays uniquely-owned and copy-free.
+    //  - A relationship batch shares the SAME `Arc` across every retry attempt: it never adds node
+    //    bindings, so `session.id_map` is invariant across its attempts, making a per-attempt
+    //    re-snapshot redundant. Because `id_map` is now an `Arc`, that snapshot is a pointer clone —
+    //    not the old `O(id_map)` map copy that made a large multi-batch load quadratic-ish.
+    let id_map_snapshot: Arc<HashMap<String, u64>> = match rows {
+        BatchRows::Relationships { .. } => Arc::clone(&session.id_map),
+        BatchRows::Nodes { .. } => Arc::clone(&EMPTY_ID_MAP),
+    };
+
     loop {
         let ticket = match pending_first_ticket.take() {
             Some(t) => t,
             None => engine.begin(AccessMode::Write).await?,
         };
-        // Snapshot `id_map` ONCE per attempt (not per chunk): a relationship batch's rows resolve
-        // endpoints only against previously-COMMITTED bindings (the module docs' hard requirement),
-        // and re-cloning a possibly-large map per chunk would be wasted, unbounded-with-batch-size
-        // work within a single attempt.
-        let id_map_snapshot = Arc::new(session.id_map.clone());
 
         let attempt_outcome =
             run_one_attempt(engine, ticket, rows, &id_map_snapshot, chunk_rows).await;
@@ -460,7 +514,14 @@ pub(crate) async fn drive_mode_b_batch_from(
             }) => match engine.commit(ticket).await {
                 Ok(_) => {
                     // Merge ONLY after a successful commit — the module docs' staging invariant.
-                    session.id_map.extend(pending_bindings);
+                    // `Arc::make_mut` extends in place: a node batch's `id_map` is uniquely owned
+                    // (relationship batches are the only Arc-sharers, and none is in flight during a
+                    // node batch), so this is amortized `O(1)` with no map copy (`rmp` #598). Guarded
+                    // on non-empty so a relationship batch (which produces no bindings) never even
+                    // touches the refcount.
+                    if !pending_bindings.is_empty() {
+                        Arc::make_mut(&mut session.id_map).extend(pending_bindings);
+                    }
                     session.stats.nodes += delta.nodes;
                     session.stats.relationships += delta.relationships;
                     session.stats.properties += delta.properties;
@@ -635,6 +696,32 @@ mod tests {
     async fn end_is_idempotent_for_an_unknown_session() {
         let reg = ModeBSessionRegistry::new(4, Duration::from_secs(60));
         assert!(reg.end(uuid::Uuid::new_v4()).await.is_none());
+    }
+
+    /// (`rmp` #598, Finding E-5): the synchronous `Drop`-context re-check-in restores a checked-out
+    /// session (its accumulated progress preserved), so an unwind/cancellation between checkout and
+    /// the ingest sink does not strand it. The registry mutex is uncontended here, so the fast
+    /// `try_lock` path runs — the check-in is immediate and synchronous, no spawned task involved.
+    #[tokio::test]
+    async fn checkin_from_drop_restores_a_checked_out_session_synchronously() {
+        let reg = Arc::new(ModeBSessionRegistry::new(2, Duration::from_secs(60)));
+        let id = reg.create("db").await.expect("create");
+        let mut sess = reg.checkout(id).await.expect("checkout");
+        assert_eq!(
+            reg.len().await,
+            0,
+            "checked-out session is absent from the map"
+        );
+
+        // Simulate a batch having advanced the session's committed progress.
+        Arc::make_mut(&mut sess.id_map).insert("ext-1".to_owned(), 42);
+        sess.stats.nodes = 1;
+
+        reg.checkin_from_drop(id, sess);
+        assert_eq!(reg.len().await, 1, "the session is back in the registry");
+        let restored = reg.checkout(id).await.expect("re-checkoutable");
+        assert_eq!(restored.stats.nodes, 1, "accumulated progress preserved");
+        assert_eq!(restored.id_map.get("ext-1"), Some(&42));
     }
 
     // ---- real-engine batch-driver tests ------------------------------------------------------
@@ -879,7 +966,9 @@ mod tests {
             .await
             .expect("node batch commits cleanly");
         let stats_before = session.stats;
-        let id_map_before = session.id_map.clone();
+        // A deep clone of the map contents (not the `Arc` pointer) so the post-abort assertion below
+        // genuinely compares membership, not pointer identity.
+        let id_map_before = (*session.id_map).clone();
 
         let rel_rows = BatchRows::Relationships {
             header: rel_header(),
@@ -911,7 +1000,7 @@ mod tests {
         );
         assert_eq!(session.stats.relationships, stats_before.relationships);
         assert_eq!(
-            session.id_map, id_map_before,
+            *session.id_map, id_map_before,
             "id_map untouched by the failed batch"
         );
         let persisted = read_count(&handle, "MATCH ()-[:LINK]->() RETURN count(*) AS c").await;
@@ -919,6 +1008,67 @@ mod tests {
             persisted, 0,
             "nothing from the exhausted-retries batch is durably visible"
         );
+
+        let _ = handle.shutdown().await;
+    }
+
+    /// (`rmp` #598, Finding E-4): a nodes-first multi-batch load never keeps a per-attempt full
+    /// clone of the growing `id_map` alive — the map is uniquely owned (`Arc::strong_count == 1`)
+    /// after each node batch commits, which is what makes the post-commit `Arc::make_mut` merge an
+    /// in-place, copy-free `O(1)` operation instead of the old `O(id_map)`-per-batch churn. The
+    /// subsequent relationship batch still resolves its endpoints against the accumulated bindings,
+    /// proving the sharing optimization did not weaken correctness.
+    #[tokio::test]
+    async fn nodes_first_load_keeps_id_map_uniquely_owned_and_still_resolves_rels() {
+        let eng = engine();
+        let handle = eng.handle.clone();
+        let cfg = BulkImportConfig {
+            mode_b_max_batch_retries: 3,
+            mode_b_retry_backoff_ms: 1,
+            mode_b_chunk_rows: 10,
+            ..BulkImportConfig::default()
+        };
+        let mut session = ModeBSession::new("mode-b-test".to_owned());
+
+        // Several separate node batches, mirroring a real streamed load's batch boundaries. After
+        // EACH one the map must be uniquely owned (no lingering snapshot from the attempt).
+        for (i, (a, b)) in [("n1", "n2"), ("n3", "n4"), ("n5", "n6")]
+            .iter()
+            .enumerate()
+        {
+            let node_rows = BatchRows::Nodes {
+                header: node_header(),
+                records: vec![record(&[a, "Person", "A"]), record(&[b, "Person", "B"])],
+            };
+            drive_mode_b_batch(&handle, &mut session, &node_rows, &cfg)
+                .await
+                .expect("node batch commits");
+            assert_eq!(
+                Arc::strong_count(&session.id_map),
+                1,
+                "after node batch {i} the id_map Arc must be uniquely owned (no per-attempt clone \
+                 left alive) — the precondition for the copy-free make_mut merge"
+            );
+        }
+        assert_eq!(session.id_map.len(), 6, "all six node bindings accumulated");
+        assert_eq!(session.stats.nodes, 6);
+
+        // A relationship batch resolves both endpoints against the accumulated (Arc-shared) bindings.
+        let rel_rows = BatchRows::Relationships {
+            header: rel_header(),
+            records: vec![record(&["n1", "n6", "LINK"]), record(&["n3", "n4", "LINK"])],
+        };
+        drive_mode_b_batch(&handle, &mut session, &rel_rows, &cfg)
+            .await
+            .expect("relationship batch resolves endpoints against the shared id_map and commits");
+        assert_eq!(session.stats.relationships, 2);
+        assert_eq!(
+            Arc::strong_count(&session.id_map),
+            1,
+            "a relationship batch's shared snapshot is dropped by the time the driver returns"
+        );
+        let persisted = read_count(&handle, "MATCH ()-[:LINK]->() RETURN count(*) AS c").await;
+        assert_eq!(persisted, 2, "both relationships are durably visible");
 
         let _ = handle.shutdown().await;
     }
