@@ -855,22 +855,42 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             if mapped.contains(&dev) {
                 continue;
             }
-            let f = pool.fetch(pid)?;
-            // Copy the two header bytes out under the read latch (they escape the borrow).
-            let (is_record, subtype) = pool.with_page(f, |p| {
-                (
-                    page::page_type(p) == PAGE_TYPE_RECORD,
-                    page::page_subtype(p),
-                )
-            });
+            // Read the RAW device bytes without the pool's checksum gate (`rmp` #597). `pool.fetch`
+            // verifies the checksum and would hard-fail here on a page it cannot classify — which
+            // bricks `open` after nothing worse than a transient device write error during allocation:
+            // when a freshly page-boundary-extended record page's seed `flush_unlogged` home write
+            // fails, `new_page`'s device `extend` has already left an **all-zero, checksum-invalid**
+            // page on the device that no store maps and no WAL record covers (the aborting txn's page,
+            // written on the unlogged path, so ARIES redo cannot recreate it and it has no doublewrite
+            // copy). Reading raw lets us classify it below instead of rejecting it.
+            let raw = pool.read_page_unverified(pid)?;
+            let page: &graphus_io::Page = &raw;
+            if !page::verify_checksum(page) {
+                // A checksum-invalid page is EITHER an aborted-allocation phantom (all-zero) OR
+                // untrusted corruption (non-zero). By the time this scan runs, ARIES redo has already
+                // re-materialised every COMMITTED (logged) page — so any all-zero page here holds no
+                // committed data and is unambiguously never-written (`new_page` zero-fills the extend;
+                // a failed seed flush left the real bytes only in a now-lost dirty frame, `rmp` #597).
+                // Skip it — it is not a record-store page and mapping/serving it would be unsound. A
+                // NON-zero bad checksum is genuine corruption: fail closed (Graphus's first mandate —
+                // never serve a page it cannot trust, `04 §4.6`/§4.8 startup).
+                if page.iter().all(|&b| b == 0) {
+                    continue;
+                }
+                return Err(GraphusError::Storage(format!(
+                    "page {} failed checksum verification during orphan-page reconstruction \
+                     (non-zero bytes — untrusted corruption); refusing to serve",
+                    pid.0
+                )));
+            }
+            let is_record = page::page_type(page) == PAGE_TYPE_RECORD;
+            let subtype = page::page_subtype(page);
             if !is_record {
-                pool.unpin(f);
-                continue; // META pages and never-stamped (zeroed) pages are not record-store pages
+                continue; // META pages and (valid, non-record) pages are not record-store pages
             }
             // The subtype indexes a `StoreKind`; ignore an out-of-range value defensively (a torn or
             // pre-`#239` page) rather than trusting it.
             if (subtype as usize) >= STORE_COUNT {
-                pool.unpin(f);
                 continue;
             }
             let kind = ALL_STORE_KINDS[subtype as usize];
@@ -884,8 +904,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // overwhelmingly malformed. A bounded, page-local scan (no chain following) keeps `open`
             // O(device pages) as it already is. On mismatch we fail closed — Graphus's first mandate
             // is to never serve a page it cannot trust (`04 §4.6`/§4.8 startup).
-            let well_formed = pool.with_page(f, |p| Self::orphan_page_records_well_formed(p, kind));
-            pool.unpin(f);
+            let well_formed = Self::orphan_page_records_well_formed(page, kind);
             if !well_formed {
                 return Err(GraphusError::Storage(format!(
                     "orphan record page {} carries subtype {} ({:?}) but its records are not \

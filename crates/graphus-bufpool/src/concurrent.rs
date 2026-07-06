@@ -451,6 +451,27 @@ impl<D: BlockDevice, W: WalRule> ConcurrentBufferPool<D, W> {
         self.read_device().page_count()
     }
 
+    /// Reads page `pid`'s raw bytes straight from the backing device, **WITHOUT** verifying its
+    /// checksum and **WITHOUT** inserting it into the pool. Takes only a device **read** guard.
+    ///
+    /// Used by store-open orphan-page reconstruction (`rmp` #597) to *classify* a page that [`fetch`]
+    /// would reject before it could be classified. A transient device write error on a freshly
+    /// page-boundary-extended record page's seed flush can leave an extended-but-never-initialised
+    /// **all-zero, checksum-invalid** page on the device (an aborted allocation holding no committed
+    /// data, with no WAL record and no doublewrite copy — the seed flush uses the unlogged path).
+    /// [`fetch`] fails that page's checksum and bricks `open`; a raw read lets the caller tell that
+    /// harmless phantom (all-zero ⇒ skip) apart from untrusted corruption (non-zero bad checksum ⇒
+    /// still fail closed, never served). Correct for the cold-open reconstruction scan: the pool holds
+    /// no resident copy of an unmapped orphan page there, so the device image is authoritative.
+    ///
+    /// # Errors
+    /// Propagates a device read failure.
+    pub fn read_page_unverified(&self, pid: PageId) -> Result<Box<Page>> {
+        let mut buf: Box<Page> = Box::new([0u8; PAGE_SIZE]);
+        self.read_device().read_page(pid, &mut buf)?;
+        Ok(buf)
+    }
+
     /// Resolves a frame handle to its slot with an explicit bounds check (CWE-129 defence in
     /// depth). [`PinnedFrame`] handles are minted only by this pool, so `f.0` is in-bounds by
     /// construction today; this checked accessor makes that invariant load-bearing in code rather
