@@ -60,9 +60,21 @@ impl<D: BlockDevice> ApplyTarget for DeviceTarget<'_, D> {
             return Lsn(0);
         }
         let mut buf: Page = [0u8; PAGE_SIZE];
-        // A read failure here means the page is unreadable; treat its lsn as 0 so redo replays the
-        // change (idempotent: redo overwrites the region with the post-image anyway).
-        if self.device.read_page(page, &mut buf).is_err() {
+        // A read failure OR a failed page checksum means the page's stored `page_lsn` cannot be trusted;
+        // treat its lsn as `0` so redo replays every change for it (idempotent: physiological redo
+        // overwrites the region with the post-image anyway, rebuilding the page from the log).
+        //
+        // The checksum check is load-bearing (`rmp` #592, F A-#1). Recovery's OWN redo/undo page writes
+        // bypass the doublewrite buffer (they are a buffered `pwrite` deferred to the final `sync()`), so
+        // a torn writeback of a recovered page + a second crash before that `sync` leaves the page torn.
+        // On the next recovery the doublewrite `recover_home` does NOT name it (recovery never staged it),
+        // and — for an unencrypted device — the torn page READS SUCCESSFULLY with a large, intact header
+        // `page_lsn`: without verifying the checksum, `rec.lsn > page_lsn` would be false, redo would be
+        // SKIPPED, and the tear would survive recovery (committed data left inaccessible until a restore).
+        // Verifying the checksum here makes redo re-apply every record for a torn page, healing it.
+        // (The encrypted device is already safe: an AEAD read of a torn page fails, so `read_page` errors
+        // and the first guard fires — this second guard closes the plaintext gap.)
+        if self.device.read_page(page, &mut buf).is_err() || !page::verify_checksum(&buf) {
             return Lsn(0);
         }
         page::page_lsn(&buf)
@@ -171,6 +183,47 @@ mod tests {
         assert_eq!(&buf[100..104], &[1, 2, 3, 4]);
         assert_eq!(page::page_lsn(&buf), Lsn(42));
         assert!(page::verify_checksum(&buf));
+    }
+
+    /// `rmp` #592 (sprint-52 F A-#1): a page torn during recovery (a valid, intact header `page_lsn`
+    /// but a body that fails the checksum) must report `page_lsn == 0`, so recovery redo re-applies every
+    /// record for it (healing the tear) instead of trusting the stale header lsn and SKIPPING redo. Before
+    /// the checksum check the torn page read back successfully and `page_lsn` returned its (large) stored
+    /// lsn, so `rec.lsn > page_lsn` was false and the tear survived recovery.
+    #[test]
+    fn page_lsn_of_a_torn_page_is_zero_so_recovery_redo_reapplies_it() {
+        let mut dev = MemBlockDevice::new(1);
+        {
+            let mut t = DeviceTarget::new(&mut dev);
+            let patch = crate::paging::encode_patch(100, &[1, 2, 3, 4]);
+            t.apply(PageId(0), Lsn(100), &patch).unwrap();
+            t.sync().unwrap();
+        }
+        // A checksum-valid page reports its stored lsn (redo correctly SKIPS it when already applied).
+        assert_eq!(DeviceTarget::new(&mut dev).page_lsn(PageId(0)), Lsn(100));
+
+        // Tear it: flip a body byte in place, leaving the now-stale checksum and the intact header
+        // `page_lsn` — exactly a torn writeback of a recovered page (recovery's writes bypass the DWB).
+        let mut buf = [0u8; PAGE_SIZE];
+        dev.read_page(PageId(0), &mut buf).unwrap();
+        assert!(page::verify_checksum(&buf));
+        buf[101] ^= 0xFF; // corrupt the body; deliberately do NOT recompute the checksum
+        assert!(
+            !page::verify_checksum(&buf),
+            "the tear must break the checksum"
+        );
+        assert_eq!(
+            page::page_lsn(&buf),
+            Lsn(100),
+            "but the header lsn is still intact"
+        );
+        dev.write_page(PageId(0), &buf).unwrap();
+
+        assert_eq!(
+            DeviceTarget::new(&mut dev).page_lsn(PageId(0)),
+            Lsn(0),
+            "#592: a torn page (bad checksum) must report lsn 0 so recovery redo re-applies it"
+        );
     }
 
     #[test]
