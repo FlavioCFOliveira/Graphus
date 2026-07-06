@@ -626,26 +626,56 @@ impl<S: LogSink> LogSink for EncryptedLogSink<S> {
 
     fn read_bounded(&self, from: u64, to: u64, into: &mut Vec<u8>) -> Result<()> {
         into.clear();
-        // Identical to `read_durable` except capped at `to` (`rmp` #525) — see
-        // `graphus_wal::LogSink::read_bounded`'s doc comment for the rationale (the canonical caller is
-        // `WalManager::open`'s header check, which only ever wants 8 bytes but would otherwise trigger
-        // the same unbounded-allocation crash `read_durable` was fixed against).
+        // Like `read_durable` but bounded at `to` (`rmp` #525) AND — crucially for streaming crash
+        // recovery (`rmp` #599) — reading only the PHYSICAL span of the frames that overlap the
+        // requested logical window, never the whole retained backing. Recovery now issues one
+        // `read_bounded` per sliding window; materialising the entire retained backing on *each* call
+        // (the old `read_durable(retained_base, ..)`) would make an encrypted reopen O(WAL × #windows)
+        // physical I/O + decryption. Reading just the overlapping frames keeps every call proportional
+        // to the window, so encrypted reopen is O(window) too — matching the plaintext `FileLogSink`.
         let end = to.min(self.logical_durable_len);
         if from >= end {
             return Ok(());
         }
-        // Bounded PHYSICAL read from the retained floor (see `read_durable` above): the backing itself
-        // is not indexed by logical range, but reading from `base` instead of 0 keeps the allocation
-        // proportional to the retained window, not the log's lifetime.
-        let base = self.retained_base();
-        let mut physical = Vec::new();
-        self.backing.read_durable(base, &mut physical)?;
-
         let total = (end - from) as usize;
         into.resize(total, 0);
+
+        // The physical extent `[phys_lo, phys_hi)` covering the frames that overlap `[from, end)` and
+        // sit AT/ABOVE the retained base. Frames are appended contiguously in physical order and a
+        // reclaim only ever drops a whole front prefix, so the retained frames stay gap-free and the
+        // overlapping ones form a single contiguous span. The never-reclaimed header frame 0 — the
+        // only frame that can sit BELOW the base, after a reclaim opened a gap above it — is fetched by
+        // `decrypt_frame_at` through its own tiny bounded read, so it is excluded from this span: a
+        // request that reaches frame 0 never forces the whole backing to be materialised.
+        let retained_base = self.retained_base();
+        let mut phys_lo = u64::MAX;
+        let mut phys_hi = 0u64;
         for loc in &self.frames {
             if loc.logical_offset >= end {
-                break; // frames are stored in logical order; nothing further overlaps [from, end)
+                break; // logical order: nothing further overlaps `[from, end)`
+            }
+            if loc.logical_offset + loc.logical_len <= from {
+                continue;
+            }
+            if loc.phys_offset >= retained_base {
+                phys_lo = phys_lo.min(loc.phys_offset);
+                phys_hi = phys_hi.max(loc.phys_offset + loc.phys_len);
+            }
+        }
+        // Read exactly that span (empty when the only overlap is the below-base header frame, which
+        // `decrypt_frame_at` fetches itself). `base` is the absolute physical offset of `physical[0]`;
+        // a frame's absolute `phys_offset` indexes it as `phys_offset - base`.
+        let (physical, base) = if phys_lo < phys_hi {
+            let mut p = Vec::new();
+            self.backing.read_bounded(phys_lo, phys_hi, &mut p)?;
+            (p, phys_lo)
+        } else {
+            (Vec::new(), retained_base)
+        };
+
+        for loc in &self.frames {
+            if loc.logical_offset >= end {
+                break; // frames are stored in logical order; nothing further overlaps `[from, end)`
             }
             let frame_end = (loc.logical_offset + loc.logical_len).min(end);
             if frame_end <= from {
@@ -1672,6 +1702,61 @@ mod tests {
             u64::from_le_bytes(tail.try_into().unwrap()),
             CYCLES,
             "the active (last) data frame recovered its exact payload"
+        );
+    }
+
+    /// **`rmp` #599 encrypted windowed-read gate.** A single `read_bounded(from, from+W)` over a large
+    /// encrypted WAL must read only the PHYSICAL span of the frames overlapping that small logical
+    /// window — never the whole retained backing. Streaming crash recovery (`rmp` #599) issues one such
+    /// call per sliding window, so a whole-backing read *per call* would make an encrypted reopen
+    /// O(WAL × #windows) physical I/O + decryption (before this fix `read_bounded` did exactly that via
+    /// `read_durable(retained_base, ..)`). The read must also stay byte-identical to the same slice of
+    /// `read_durable`. No reclaim runs here (the whole backing is retained) — the worst case for a
+    /// per-window read that must still be proportional to the window, not the log size.
+    #[test]
+    fn read_bounded_reads_only_the_overlapping_frames_not_the_whole_backing() {
+        let kr = keyring(0x5C);
+        let counter = Arc::new(AtomicU64::new(0));
+        let backing = CountingSink::new(MemLogSink::new(), Arc::clone(&counter));
+        let mut enc = EncryptedLogSink::create(backing, &kr).expect("create");
+
+        enc.append(b"WALHDR01"); // frame 0: the header, logical [0, HEADER_LEN)
+        enc.sync().expect("sync header frame");
+
+        const FRAMES: u64 = 500;
+        const FRAME_LEN: u64 = 8;
+        for i in 1..=FRAMES {
+            enc.append(&i.to_le_bytes()); // self-identifying payload per frame
+            enc.sync().expect("sync data frame");
+        }
+        let logical_len = enc.durable_len();
+        assert_eq!(logical_len, HEADER_LEN + FRAMES * FRAME_LEN);
+        let retained_phys = enc.backing().durable_len(); // nothing reclaimed → the whole backing
+
+        // A small logical window well inside the log (not overlapping the header frame 0).
+        let win_from = HEADER_LEN + 100 * FRAME_LEN;
+        let win_to = win_from + 16 * FRAME_LEN; // 16 frames' worth
+        // Ground truth from the whole-image `read_durable`, sliced to the window.
+        let mut full = Vec::new();
+        enc.read_durable(0, &mut full).expect("full read");
+        let expected = full[win_from as usize..win_to as usize].to_vec();
+
+        // Measure ONLY the physical backing reads this single `read_bounded` issues.
+        counter.store(0, Ordering::SeqCst);
+        let mut got = Vec::new();
+        enc.read_bounded(win_from, win_to, &mut got)
+            .expect("bounded read");
+        let phys_read = counter.load(Ordering::SeqCst);
+
+        assert_eq!(
+            got, expected,
+            "read_bounded returns the exact windowed plaintext (byte-identical to read_durable's slice)"
+        );
+        let window_phys = win_to - win_from; // ~128 logical bytes + per-frame AEAD overhead
+        assert!(
+            phys_read < retained_phys / 4,
+            "read_bounded physical read {phys_read} must be far below the whole retained backing \
+             {retained_phys} — bounded by the ~{window_phys}-byte window, not the log size"
         );
     }
 

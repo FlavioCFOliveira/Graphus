@@ -14,7 +14,7 @@ use graphus_core::error::{GraphusError, Result};
 use graphus_core::{Lsn, PageId, Timestamp, TxnId};
 
 use crate::checkpoint::CheckpointSnapshot;
-use crate::record::{LogRecord, LogRecordRef, RecordType};
+use crate::record::{LogRecord, RecordType};
 use crate::recovery::ApplyTarget;
 use crate::sink::LogSink;
 
@@ -139,6 +139,18 @@ impl<S: LogSink> WalManager<S> {
         self.sink.read_durable(from.0, into)
     }
 
+    /// Reads durable log bytes `[from, to.min(durable_len))` into `into` (cleared first) — the
+    /// bounded counterpart of [`read_durable`](Self::read_durable). Streaming crash recovery
+    /// (`rmp` #599) uses this to materialise **one window at a time** — and one record at a time in
+    /// undo — instead of slurping the whole retained log, so peak reopen memory is O(window) rather
+    /// than O(WAL). See [`crate::recovery`] and [`LogSink::read_bounded`].
+    ///
+    /// # Errors
+    /// Propagates a sink read error.
+    pub fn read_bounded(&self, from: Lsn, to: Lsn, into: &mut Vec<u8>) -> Result<()> {
+        self.sink.read_bounded(from.0, to.0, into)
+    }
+
     /// Borrows the underlying sink (test/inspection helper).
     #[must_use]
     pub fn sink(&self) -> &S {
@@ -166,53 +178,41 @@ impl<S: LogSink> WalManager<S> {
     /// # Errors
     /// Propagates a sink read error, or returns a storage error on interior WAL corruption.
     pub fn committed_transactions(&self) -> Result<Vec<(TxnId, Timestamp, Lsn)>> {
-        // Bound the read to the sink's `reclaimed_floor()` (`rmp` #525): reading unconditionally from
-        // `HEADER_LEN` makes `read_durable` allocate and zero-fill a buffer sized by the log's entire
-        // lifetime byte offset once enough has been reclaimed, not by what is actually retained — see
-        // `LogSink::reclaimed_floor`'s doc comment for the full rationale (this is the exact mechanism
-        // behind a real OOM-abort crash on reopen).
+        // Bound the read to the sink's `reclaimed_floor()` (`rmp` #525) AND stream it window-by-window
+        // (`rmp` #599): this scan runs on EVERY reopen (the store rebuilds its transaction table from
+        // it), so it must not allocate a buffer sized by the log's lifetime byte offset nor by the
+        // whole retained window — a large single transaction would otherwise reproduce the OOM-abort
+        // crash on reopen. `scan_forward` reads at most `RECOVERY_WINDOW_BYTES` at a time.
         let base = HEADER_LEN.max(self.sink.reclaimed_floor());
-        let mut log = Vec::new();
-        self.read_durable(Lsn(base), &mut log)?;
+        let durable_len = self.sink.durable_len();
+        let window = crate::recovery::RECOVERY_WINDOW_BYTES;
         let mut out = Vec::new();
-        // `log[0]` corresponds to absolute LSN `base`, so the scan starts at the buffer's beginning.
-        let mut cursor = 0usize;
-        // Skip a reclaimed (zero) prefix to the first surviving record (`rmp` #114; see
-        // `recover_from`). A real record never begins with a zero byte.
-        while cursor < log.len() && log[cursor] == 0 {
-            cursor += 1;
-        }
-        while cursor < log.len() {
-            // This scan reads only header fields and the commit timestamp prefix of `redo`, never the
-            // owned redo/undo images, so decode in place (no per-record heap allocation).
-            match LogRecordRef::decode(&log[cursor..]) {
-                Ok((rec, n)) => {
-                    cursor += n;
-                    if rec.rec_type == RecordType::Commit {
-                        if let Some(ts) = rec.commit_ts() {
-                            out.push((rec.txn_id, ts, rec.lsn));
-                        }
+        let Some(start) =
+            crate::recovery::find_first_record_offset(self, base, durable_len, window)?
+        else {
+            return Ok(out);
+        };
+        // This scan reads only header fields and the commit-timestamp prefix of `redo` via the
+        // borrowed `LogRecordRef`, so it allocates nothing per record. Probe on: the same
+        // interior-corruption guard as `recover_from` — fail loud if real committed data follows an
+        // undecodable spot, because stopping there would silently drop those transactions from the
+        // rebuilt table (an ACID violation); a genuine torn tail just ends the scan.
+        let outcome =
+            crate::recovery::scan_forward(self, start, durable_len, window, true, |rec, _abs| {
+                if rec.rec_type == RecordType::Commit {
+                    if let Some(ts) = rec.commit_ts() {
+                        out.push((rec.txn_id, ts, rec.lsn));
                     }
                 }
-                // Same interior-corruption guard as `recover_from`: only truncate on a genuine torn
-                // tail; fail loud if real committed data follows the undecodable spot. Diagnostics
-                // report absolute LSNs (`base + cursor`), not the buffer-relative index.
-                Err(_) => {
-                    let abs_cursor = base + cursor as u64;
-                    if let Some(abs_off) =
-                        crate::recovery::next_self_consistent_record(&log, cursor + 1, base)
-                    {
-                        return Err(GraphusError::Storage(format!(
-                            "WAL interior log corruption: an undecodable record at offset \
-                             {abs_cursor} is followed by a valid record at offset {abs_off}; \
-                             refusing to rebuild the transaction table, because stopping here would \
-                             silently drop the committed transactions logged after offset \
-                             {abs_cursor}"
-                        )));
-                    }
-                    break;
-                }
-            }
+                Ok(())
+            })?;
+        if let crate::recovery::ScanOutcome::InteriorCorruption { at, next } = outcome {
+            return Err(GraphusError::Storage(format!(
+                "WAL interior log corruption: an undecodable record at offset {at} is followed by a \
+                 valid record at offset {next}; refusing to rebuild the transaction table, because \
+                 stopping here would silently drop the committed transactions logged after offset \
+                 {at}"
+            )));
         }
         Ok(out)
     }
@@ -241,34 +241,28 @@ impl<S: LogSink> WalManager<S> {
     /// corruption is rejected by the recovery path that runs alongside this, so this scan simply stops
     /// at the first undecodable record and never reads past it.)
     pub fn max_recovered_txn_id(&self) -> Result<u64> {
-        // Bound the read to `reclaimed_floor()`, exactly like `committed_transactions` (`rmp` #525) —
-        // see that method's comment and `LogSink::reclaimed_floor`'s doc comment for the rationale.
+        // Bound to `reclaimed_floor()` (`rmp` #525) and stream window-by-window (`rmp` #599), exactly
+        // like `committed_transactions` — this also runs on every reopen and must stay O(window).
         let base = HEADER_LEN.max(self.sink.reclaimed_floor());
-        let mut log = Vec::new();
-        self.read_durable(Lsn(base), &mut log)?;
+        let durable_len = self.sink.durable_len();
+        let window = crate::recovery::RECOVERY_WINDOW_BYTES;
         let mut max_id = 0u64;
-        // `log[0]` corresponds to absolute LSN `base`, so the scan starts at the buffer's beginning.
-        let mut cursor = 0usize;
-        // Skip a reclaimed (zero) prefix to the first surviving record (`rmp` #114; see
-        // `recover_from`). A real record never begins with a zero byte.
-        while cursor < log.len() && log[cursor] == 0 {
-            cursor += 1;
-        }
-        while cursor < log.len() {
-            match LogRecordRef::decode(&log[cursor..]) {
-                Ok((rec, n)) => {
-                    cursor += n;
-                    let id = rec.txn_id.0;
-                    if id != 0 && id != u64::MAX {
-                        max_id = max_id.max(id);
-                    }
-                }
-                // A torn tail (or any undecodable record): stop. The recovery path running over the
-                // same log fails loud on interior corruption (`recover_from`); here we only need a
-                // safe upper bound for the id counter, and a torn tail carries no committed work.
-                Err(_) => break,
+        let Some(start) =
+            crate::recovery::find_first_record_offset(self, base, durable_len, window)?
+        else {
+            return Ok(max_id);
+        };
+        // Probe off: a torn tail (or any undecodable record) simply ends the scan. The recovery path
+        // running over the same log fails loud on interior corruption (`recover_from`); here we only
+        // need a safe upper bound for the id counter, and a torn tail carries no committed work. This
+        // matches the pre-streaming `break`-on-any-decode-error behaviour exactly.
+        crate::recovery::scan_forward(self, start, durable_len, window, false, |rec, _abs| {
+            let id = rec.txn_id.0;
+            if id != 0 && id != u64::MAX {
+                max_id = max_id.max(id);
             }
-        }
+            Ok(())
+        })?;
         Ok(max_id)
     }
 
