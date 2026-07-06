@@ -914,13 +914,23 @@ mod tests {
     /// unaffected and round-trip byte-for-byte.
     #[test]
     fn jolt_and_cbor_encoders_bound_nesting_depth() {
-        // Past the cap: both encoders return (no stack overflow). Built only slightly over the cap so
-        // the source value's own recursive `Drop` stays stack-safe in the test.
-        let over = nest(MAX_ENCODE_DEPTH + 8);
-        let _ = value_to_jolt(&over);
-        let _ = value_to_cbor(&over);
+        // Past the cap: both encoders return (no stack overflow). Building, encoding, AND dropping a
+        // just-over-cap value each recurse up to `MAX_ENCODE_DEPTH` frames — which overflows the
+        // ~2 MiB default libtest thread stack on aarch64 (larger frames than x86_64), so run this part
+        // on the 8 MiB stack the server configures for its encode threads (see
+        // `..._is_safe_on_an_8mib_stack`), the same guarantee production provides.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let over = nest(MAX_ENCODE_DEPTH + 8);
+                let _ = value_to_jolt(&over);
+                let _ = value_to_cbor(&over);
+            })
+            .expect("spawn")
+            .join()
+            .expect("bounding a past-cap value must not overflow the encode stack");
 
-        // A realistic shallow value is unaffected and still round-trips exactly.
+        // A realistic shallow value is unaffected and still round-trips exactly (default stack is fine).
         let shallow = nest(5);
         assert_eq!(jolt_round_trip(&shallow), shallow);
         assert_eq!(cbor_round_trip(&shallow), shallow);
