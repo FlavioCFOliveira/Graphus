@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7] - 2026-07-07
+
+This release is a **Bolt / Neo4j-driver interoperability** fix for retriable transactions.
+Under a serialization conflict the server classified the abort correctly as a `TransientError`,
+but emitted an error *title* — `.Terminated` — that every official Neo4j driver rewrites to a
+non-retriable `ClientError`, so the idiomatic managed-transaction retry
+(`session.execute_write(...)`) never recovered from a serialization conflict. The abort now
+carries the semantically-accurate `.Outdated` title, which drivers classify as retriable. It is a
+**drop-in upgrade** from v0.0.6: the transaction, isolation, Cypher, and data contracts are
+unchanged and no user-facing feature was added — the only behavioural change is the retriable
+error code emitted on a conflict. ACID held throughout (the conflict was always resolved
+correctly, with no lost updates), and the four inviolable guarantees remain at 100% — **100%
+ACID**, **100% openCypher TCK (3914 / 3914)**, **100% Bolt protocol**, and **100% PackStream**.
+
+### Fixed
+
+- **Retriable serialization conflicts were poisoned for the Neo4j driver ecosystem (Bolt / driver
+  conformance).** Under a serialization conflict — an SSI dangerous-structure or write–write abort
+  — both the Bolt and REST interfaces emitted the error title
+  `Neo.TransientError.Transaction.Terminated`. The `TransientError` classification was correct, but
+  `.Terminated` (like `.LockClientStopped`) is a *driver poison title*: every official Neo4j driver
+  keeps a fixed `ERROR_REWRITE_MAP` that rewrites it to `Neo.ClientError.Transaction.Terminated` — a
+  non-retriable `ClientError` — regardless of the class the server sent. As a result the idiomatic
+  managed-transaction retry (`session.execute_write(...)`) never recovered from a serialization
+  conflict, so every contended transaction failed permanently for applications that follow Neo4j's
+  recommended pattern, breaking the "100% Bolt-protocol / Neo4j-driver-ecosystem compatible"
+  guarantee. ACID itself was never at risk — the conflict was always resolved correctly, with no
+  lost updates. The abort now carries `Neo.TransientError.Transaction.Outdated`, the
+  semantically-accurate optimistic-concurrency code that drivers do not rewrite, with Bolt↔REST
+  parity, anti-poison-title regression tests on both interfaces, and empirical validation against
+  the live instance using the real `neo4j` Python driver 6.2.0 (where `.Outdated` classifies as
+  `is_retryable() == true` and `.Terminated` as `false`).
+
 ## [0.0.6] - 2026-07-07
 
 This release is a **reliability and performance hardening** pass. It fixes a series of
@@ -445,7 +478,8 @@ to build, run, and evaluate the server.
   Supply a CA-issued certificate, a strong admin password, and a real JWT secret before
   any non-sandbox use. See the README "Production / TLS" section.
 
-[Unreleased]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.6...HEAD
+[Unreleased]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.7...HEAD
+[0.0.7]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.6...v0.0.7
 [0.0.6]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.5...v0.0.6
 [0.0.5]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.4...v0.0.5
 [0.0.4]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.3...v0.0.4
