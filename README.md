@@ -10,7 +10,7 @@ aarch64 (including Apple Silicon and Raspberry Pi 5+).
 
 ## Status
 
-Released — **v0.0.2** (see the [CHANGELOG](CHANGELOG.md) and
+Released — **v0.0.6** (see the [CHANGELOG](CHANGELOG.md) and
 [releases](https://github.com/FlavioCFOliveira/Graphus/releases)). The single-node
 correctness core is complete and production-hardened: the four inviolable guarantees —
 **100% ACID**, **100% openCypher TCK** (pinned `2024.3`), **100% Bolt protocol**, and

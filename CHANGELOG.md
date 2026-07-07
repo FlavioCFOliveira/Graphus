@@ -7,6 +7,107 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6] - 2026-07-07
+
+This release is a **reliability and performance hardening** pass. It fixes a series of
+critical **ACID / durability** defects that could silently lose committed data under extreme
+multi-core concurrency, bounds several **memory and liveness** failure modes so that
+adversarial or interrupted workloads degrade gracefully instead of aborting the server, and
+continues to **scale reads, writes, and graph analytics across cores**. It is a **drop-in
+upgrade** from v0.0.5: no public Cypher, Bolt, or REST contract changed and no new user-facing
+feature was added. The four inviolable guarantees held throughout — **100% ACID**, **100%
+openCypher TCK (3914 / 3914)**, **100% Bolt protocol**, and **100% PackStream**.
+
+### Changed
+
+- **A single heavy read now scales across cores.** The off-thread reader pool uses an adaptive
+  morsel width, so even one large frontier-seeded traversal — such as a friends-of-friends
+  recommendation query — is split across the reader pool instead of running on a single worker.
+- **Writes coalesce further under concurrency.** Auto-commit write fsyncs are coalesced through
+  group commit, and the commit pipeline is deepened past the previous batch-width ceiling, so
+  more concurrent committers share a single durable `fdatasync`. Every durability invariant is
+  preserved: a committer is acknowledged only after the fsync covering its commit record
+  completes.
+- **Graph Data Science algorithms run in parallel.** The PageRank, weakly-connected-components,
+  and degree-centrality parallelism gaps were closed, and seven previously single-threaded
+  algorithms were parallelized across cores.
+- **Parallel group-by aggregation.** A group-by-over-expand aggregation — for example, counting
+  each node's neighbours — is now executed across cores instead of on the engine thread alone.
+- **Reader-safe procedures dispatched off-thread.** Reader-safe procedures (including full-text
+  and spatial procedures feeding an expansion) are dispatched to the off-thread reader pool and
+  capture their index state in the read view, so they no longer serialize on the engine thread.
+- **Bounded write-ahead-log-to-store ratio.** Background maintenance now runs at a
+  store-proportional cadence built on an incremental, `O(Δ)` freeze sweep, bounding the
+  WAL-to-store size ratio without reintroducing the `O(store)` per-checkpoint cost that a
+  create-only workload would otherwise accrue.
+- **Durability invariants promoted to release-active.** The two load-bearing durability
+  invariants (doublewrite and seed-flush ordering) are now asserted in release builds, not only
+  in debug builds.
+- **Honest, multi-core example.** The GDS-analytics example was corrected so that it
+  demonstrates real multi-core execution rather than overstating it.
+- **Leaner, better-scoped CI.** The GitHub Actions pipeline no longer runs the DST / soak gate
+  on plain feature-branch pushes (a feature branch reaches CI through its pull request), splits
+  the fast cross-platform test job from a dedicated DST gate, adds incremental build caching,
+  and cancels superseded runs. A trigger and permissions security audit added least-privilege
+  `contents: read` permissions and hardened several workflow-input paths. The
+  `.github/dependabot.yml` file was removed by request.
+
+### Fixed
+
+- **Silent loss of a committed value under incremental garbage collection (critical, ACID).**
+  With an explicit `BEGIN … COMMIT` transaction in flight, a maintenance garbage-collection pass
+  could advance its freeze frontier past the in-flight writer's records and then forget the
+  writer, so once it committed a reader at the latest snapshot resolved its value as aborted —
+  permanently losing a committed value with **no crash required**. The freeze frontier now tests
+  live writer membership and keeps a writer's records unfrozen until it commits.
+- **Lost committed edges under concurrent off-thread reads (critical, ACID isolation).** A
+  maintenance garbage collection could reclaim and reuse a record slot while a lock-free
+  off-thread reader still held a pointer into it, so the reader decoded a foreign record and a
+  committed live edge became invisible. A freed slot is now shadow-held from physical reuse until
+  every transaction that predates the free has retired (an epoch / QSBR barrier), while remaining
+  immediately reusable after a restart, when no readers are in flight.
+- **Chain corruption from physical-id double-allocation on live rollback (critical, ACID
+  durability).** Under statement-interleaved SSI write load, restoring a rolling-back
+  transaction's free list to the last committed image could hand a freed id to a concurrent
+  writer twice, producing a self-cyclic property or incidence chain and losing the data threaded
+  below the cycle. Rollback now restores the in-memory free lists around the catalog reload and
+  withdraws only the aborting transaction's own pushes. Two related MVCC-stamp undo fixes landed
+  alongside it: a non-LIFO-safe compare-and-set undo for tombstone stamps, and reclaiming an
+  aborting transaction's own reused-id pops on rollback.
+- **A transient write error could brick store reopen (critical, ACID / availability).** A
+  transient device error on a new page's unlogged seed flush left an all-zero, checksum-invalid
+  page that no store mapped and no WAL record covered, so the next open failed checksum
+  verification and a healthy database could never reopen. Cold-open reconstruction now classifies
+  such an orphan page: an all-zero aborted-allocation phantom is safely skipped, while a non-zero
+  bad checksum still fails closed as genuine corruption, preserving the never-serve-an-untrusted-page
+  mandate.
+- **Torn page during crash recovery.** A page torn mid-write while recovery is running is now
+  healed by checksum-gating its page LSN, instead of propagating a partially written page.
+- **Crash recovery could exhaust memory on a large or interrupted load (critical,
+  recoverability).** A large Mode A network bulk-import interrupted by a crash, kill, power loss,
+  or force-detach left the entire retained WAL un-reclaimed, so crash recovery read gigabytes into
+  memory and the out-of-memory killer aborted the reopen — committed data stayed correct but the
+  database could not come back online without a larger host. Reopen memory is now bounded to the
+  retained window for all large-WAL reopens, a mid-load maintenance pass reclaims the WAL prefix,
+  and a force-detach can no longer corrupt the store on reopen.
+- **A deep query could stack-overflow-abort the whole server (critical, availability).** A single
+  authenticated Cypher query could drive native recursion deeper than the engine / reader-pool
+  stack and trigger an uncatchable stack-overflow abort of the entire process, taking down every
+  hosted database and connection. Query recursion depth is now bounded across all deep-recursion
+  input shapes — runtime value nesting, clause chains, and long `MATCH` paths — and turned into a
+  recoverable error; on aarch64 the runtime threads run on an 8 MiB stack so a deeply nested REST
+  value cannot overflow the server.
+- **A stalled reader or slow consumer could wedge the server or pin garbage collection.** A
+  stalled off-thread reader's egress wait is now bounded so it can no longer pin the
+  garbage-collection watermark forever; the group-commit drain is bounded and reader GC-pins are
+  released mid-storm; and parked slow-consumer statements now resume between hardened
+  group-commit batches instead of stalling.
+- **Adversarial or oversized inputs bounded.** The `.gcol` bulk-upload path is bounded so one
+  large or adversarial upload cannot exhaust server memory, and a RAII pin-guard ensures a
+  panicking visit closure can no longer strand a buffer-pool frame.
+- **Reliability residuals closed.** Five remaining bounded reliability residuals were closed and
+  a Mode A checkpoint-sentinel leak was fixed.
+
 ## [0.0.5] - 2026-07-03
 
 This release makes Graphus **scale reads and writes across cores**, adds a **network
@@ -344,7 +445,8 @@ to build, run, and evaluate the server.
   Supply a CA-issued certificate, a strong admin password, and a real JWT secret before
   any non-sandbox use. See the README "Production / TLS" section.
 
-[Unreleased]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.5...HEAD
+[Unreleased]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.6...HEAD
+[0.0.6]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.5...v0.0.6
 [0.0.5]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.4...v0.0.5
 [0.0.4]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.3...v0.0.4
 [0.0.3]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.2...v0.0.3
