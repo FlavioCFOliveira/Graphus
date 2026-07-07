@@ -51,10 +51,13 @@ COPY . .
 # cross toolchain; they are harmless no-ops for a native amd64 build. BuildKit cache
 # mounts keep the cargo registry and target tree warm; the binary is copied OUT of the
 # cache-mounted target dir in the same RUN. `--locked` matches the committed Cargo.lock.
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,target=/app/target,sharing=locked \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=graphus-registry,sharing=locked \
+    --mount=type=cache,target=/app/target,id=graphus-target-${TARGETARCH},sharing=locked \
     set -eux; \
     RUST_TARGET="$(cat /rust-target)"; \
+    rustup target add "$RUST_TARGET"; \
+    rustup target list --installed; \
+    ls -la "$(rustc --print sysroot)/lib/rustlib/"; \
     export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
            CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
            CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ \
