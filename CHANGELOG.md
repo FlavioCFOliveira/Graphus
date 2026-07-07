@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8] - 2026-07-07
+
+This release is a **Bolt-protocol / connection-pool safety** fix for explicit transactions. After
+*any* statement error inside an explicit `BEGIN … COMMIT` transaction — even a trivial `RETURN 1/0`
+— the Bolt `RESET` failed to abort the executor's still-open transaction, so the connection was
+permanently **poisoned**: every subsequent `BEGIN` on it failed with
+`Neo.TransientError.Transaction.Outdated` ("a transaction is already open"). Because the official
+Neo4j drivers reuse pooled connections, one poisoned connection returned to the pool and failed
+**other sessions'** unrelated work. `RESET` now rolls back the executor's open transaction
+**unconditionally**, in conformance with the Bolt `RESET` specification ("set the connection back
+to its initial state … stopping any unit of work"). This is a **drop-in upgrade** from v0.0.7: the
+transaction, isolation, Cypher, and data contracts are unchanged and no user-facing feature was
+added. **ACID was never at risk** — no transaction ever committed partially and no data was lost;
+only connection reuse after an in-transaction error was broken. The four inviolable guarantees
+remain at 100% — **100% ACID**, **100% openCypher TCK (3914 / 3914)**, **100% Bolt protocol**, and
+**100% PackStream**.
+
+### Fixed
+
+- **A pooled Bolt connection was permanently poisoned after any error inside an explicit
+  transaction (Bolt-protocol conformance / connection-pool safety).** A statement failure inside an
+  explicit `BEGIN … COMMIT` transaction moves the Bolt state machine to `Failed` (via `fail_with`),
+  which erases the `TxReady` / `TxStreaming` marker. `handle_reset` gated its `executor.rollback()`
+  on exactly that marker, so a `RESET` issued after an in-transaction error **skipped the
+  rollback**: the executor's transaction leaked and the connection was left with an open
+  transaction it could no longer see. Every subsequent `BEGIN` on that connection then failed with
+  `Neo.TransientError.Transaction.Outdated` ("a transaction is already open"). Because the official
+  Neo4j drivers reuse connections from a pool, a single poisoned connection returned to the pool and
+  failed the work of **other, unrelated sessions**, so `session.execute_write(...)` could not
+  converge under contention. `handle_reset` now calls `executor.rollback_open_tx()`
+  **unconditionally** — a method that consults the executor's own `current_tx`, is a no-op when
+  nothing is open, and is idempotent and infallible — so `RESET` returns the connection to a clean
+  `READY` regardless of the Bolt state enum, covering every path into `Failed` from inside a
+  transaction (a `RUN` error in `TxReady`, a runtime error during `PULL` / `DISCARD`, or an
+  out-of-order message). ACID was never at risk: no partial commit and no lost data ever occurred —
+  only connection reuse after an in-transaction error was broken. This defect was **masked before
+  v0.0.7**: the driver never retried a serialization conflict (the `.Terminated` poison-title bug
+  fixed in v0.0.7), so it discarded the connection instead of reusing it; enabling managed retry in
+  v0.0.7 exposed the poisoning at scale. It was discovered and reproduced deterministically against
+  the live instance with the real `neo4j` Python driver 6.2.0, and is guarded by a new
+  RED→GREEN regression (`BEGIN`, `RUN 1/0` → `FAILURE`, `RESET`, `BEGIN` — the second `BEGIN` must
+  now succeed).
+
 ## [0.0.7] - 2026-07-07
 
 This release is a **Bolt / Neo4j-driver interoperability** fix for retriable transactions.
@@ -478,7 +521,8 @@ to build, run, and evaluate the server.
   Supply a CA-issued certificate, a strong admin password, and a real JWT secret before
   any non-sandbox use. See the README "Production / TLS" section.
 
-[Unreleased]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.7...HEAD
+[Unreleased]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.8...HEAD
+[0.0.8]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.7...v0.0.8
 [0.0.7]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.6...v0.0.7
 [0.0.6]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.5...v0.0.6
 [0.0.5]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.4...v0.0.5
