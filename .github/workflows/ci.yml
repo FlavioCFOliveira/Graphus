@@ -4,7 +4,9 @@ name: CI
 # crash-recovery soaks) run on pull requests, on pushes to `main`, on version tags, and
 # on manual dispatch. `push` is intentionally scoped to `main` + tags: a feature-branch
 # push reaches CI only through its pull request, so nothing runs twice for the same change
-# and the DST/soak gate never fires on an ordinary feature push. The nightly-fuzz workflow
+# and the DST/soak gate never fires on an ordinary feature push. A self-hosted Raspberry Pi leg
+# (`pi516`) additionally runs the suite on real Pi hardware, but only on trusted, non-pull-request
+# events so untrusted fork code never runs on the self-hosted machine. The nightly-fuzz workflow
 # soaks the DST fuzzer far deeper on a schedule.
 on:
   push:
@@ -104,3 +106,29 @@ jobs:
         run: cargo run --release -p graphus-dst --bin graphus-dst -- vopr liveness --seed 1 --seeds 256
       - name: DST determinism + reference-model sweep
         run: cargo run --release -p graphus-dst --bin graphus-dst -- vopr --seed 1 --seeds 256
+
+  # Native Raspberry Pi (aarch64) validation on the self-hosted `pi516` runner. Graphus targets
+  # Raspberry Pi 5+ as a Tier-1 platform, so this real-hardware leg exercises the suite on an actual
+  # Raspberry Pi / Raspberry Pi OS (its kernel, page size, and default thread-stack size) — the class
+  # of environment that surfaced the aarch64 deep-recursion stack-overflow fixed with an 8 MiB
+  # runtime stack. The GitHub-hosted `ubuntu-24.04-arm` leg already covers generic aarch64 build +
+  # clippy + test, so this leg adds only what that one cannot: real Pi hardware.
+  #
+  # SECURITY: `if: github.event_name != 'pull_request'` keeps this off pull requests, so untrusted
+  # fork-PR code is NEVER executed on the self-hosted machine. It runs only on trusted events —
+  # pushes to `main`, version tags, and manual dispatch.
+  raspberry-pi:
+    name: Raspberry Pi (pi516, aarch64)
+    if: github.event_name != 'pull_request'
+    runs-on: [self-hosted, Linux, ARM64]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      # Format and clippy are architecture-independent and already run on the `test` matrix, so this
+      # leg only builds and runs the suite — its value is executing the tests on real Pi hardware.
+      - name: Test (real Raspberry Pi hardware)
+        run: cargo test --all
