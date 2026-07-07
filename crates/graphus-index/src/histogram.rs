@@ -626,6 +626,10 @@ mod tests {
         assert_eq!(h.estimate_range(None, true, None, true), 100.0);
     }
 
+    #[cfg_attr(
+        miri,
+        ignore = "builds a ~1000-row dataset to validate equi-depth estimation math (not codec UB); impractically slow under miri — the histogram byte codec is covered by codec_roundtrip_empty_single_and_many_buckets under miri"
+    )]
     #[test]
     fn totals_and_distinct_are_exact() {
         // 0..1000 each once, plus 500 appearing 9 extra times (10 total).
@@ -643,6 +647,10 @@ mod tests {
         assert_eq!(h.distinct(), 1000, "still 1000 distinct values");
     }
 
+    #[cfg_attr(
+        miri,
+        ignore = "builds a ~1000-row dataset to validate equi-depth estimation math (not codec UB); impractically slow under miri — the histogram byte codec is covered by codec_roundtrip_empty_single_and_many_buckets under miri"
+    )]
     #[test]
     fn uniform_distribution_equality_within_bound() {
         // 0..1000, one row each. Every equality estimate should be ~1.
@@ -664,6 +672,10 @@ mod tests {
         }
     }
 
+    #[cfg_attr(
+        miri,
+        ignore = "builds a ~1000-row dataset to validate equi-depth estimation math (not codec UB); impractically slow under miri — the histogram byte codec is covered by codec_roundtrip_empty_single_and_many_buckets under miri"
+    )]
     #[test]
     fn uniform_distribution_range_within_half_bucket_depth() {
         let rows = enc_ints(0..1000);
@@ -685,6 +697,10 @@ mod tests {
         );
     }
 
+    #[cfg_attr(
+        miri,
+        ignore = "builds a ~1000-row dataset to validate equi-depth estimation math (not codec UB); impractically slow under miri — the histogram byte codec is covered by codec_roundtrip_empty_single_and_many_buckets under miri"
+    )]
     #[test]
     fn skewed_distribution_concentrates_and_estimates_frequent_values() {
         // A Zipfian-ish shape: value 0 is very frequent, then a long tail of singletons.
@@ -747,6 +763,10 @@ mod tests {
         assert_eq!(h.estimate_range(Some(&lo2), true, None, true), 0.0);
     }
 
+    #[cfg_attr(
+        miri,
+        ignore = "builds a ~1000-row dataset to validate equi-depth estimation math (not codec UB); impractically slow under miri — the histogram byte codec is covered by codec_roundtrip_empty_single_and_many_buckets under miri"
+    )]
     #[test]
     fn equal_values_are_never_split_across_buckets() {
         // 1000 copies of one value, surrounded by singletons, with many target buckets. All 1000
@@ -782,6 +802,10 @@ mod tests {
         assert_eq!(h.estimate_range(Some(&lo), true, None, true), 100.0);
     }
 
+    #[cfg_attr(
+        miri,
+        ignore = "builds a ~1000-row dataset to validate equi-depth estimation math (not codec UB); impractically slow under miri — the histogram byte codec is covered by codec_roundtrip_empty_single_and_many_buckets under miri"
+    )]
     #[test]
     fn range_half_open_vs_oracle_many_windows() {
         let rows = enc_ints(0..1000);

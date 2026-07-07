@@ -1748,6 +1748,10 @@ mod tests {
     /// would `abort()` the whole test process, so completing IS the assertion). Measured margin: the same
     /// depth also completes on a **1 MiB** stack (≥ 2×), because the [`MAX_ENCODE_DEPTH`] cap bounds the
     /// encoder recursion and each `Value::List` `Drop` frame is tiny.
+    #[cfg_attr(
+        miri,
+        ignore = "builds + drops a 1000-deep value on a 2 MiB native thread stack; deep recursion is slow under miri and the stack-overflow bound it proves is a native-stack property outside miri's UB model"
+    )]
     #[test]
     fn encoding_and_dropping_a_max_depth_value_is_safe_on_a_2mib_stack() {
         std::thread::Builder::new()
@@ -1773,6 +1777,10 @@ mod tests {
     /// (The encode cap exceeds the *decode* cap [`MAX_DECODE_DEPTH`] on purpose — inbound Bolt values
     /// are shallow parameters, whereas a result the engine builds may legitimately nest deeper — so the
     /// deep case is checked encode-only, not via a round-trip.)
+    #[cfg_attr(
+        miri,
+        ignore = "builds a >1000-deep value; deep recursion is slow under miri and the depth cap it proves guards against a native stack overflow (an abort, not miri-detectable UB)"
+    )]
     #[test]
     fn pack_value_bounds_nesting_depth() {
         // Past the cap: `pack_value` returns (no stack overflow) and still produces output. Built only
@@ -1991,8 +1999,9 @@ mod tests {
 
     #[test]
     fn string_marker_boundaries() {
-        // tiny (<=15), 8-bit (16..=255), 16-bit (>=256).
-        for len in [0usize, 1, 15, 16, 255, 256, 70_000] {
+        // tiny (<=15), 8-bit (16..=255), 16-bit (>=256). The 32-bit marker (>65535) is exercised by
+        // `string_32bit_marker_round_trips` (miri-excluded: a 70 KB string is slow under miri).
+        for len in [0usize, 1, 15, 16, 255, 256] {
             let s = "a".repeat(len);
             assert_eq!(round_trip(&Value::String(s.clone())), Value::String(s));
         }
@@ -2004,6 +2013,16 @@ mod tests {
         p.write_string(&"x".repeat(16));
         assert_eq!(p.as_bytes()[0], STRING_8);
         assert_eq!(p.as_bytes()[1], 16);
+    }
+
+    /// The 32-bit string length marker (`STRING_32`, length > 65535). Excluded from miri: a 70 KB
+    /// string is slow under the interpreter, and the marker-selection / size-header logic is the
+    /// same code the smaller-marker cases in `string_marker_boundaries` already exercise under miri.
+    #[cfg_attr(miri, ignore = "70 KB string is slow under miri; the small markers cover the codec path")]
+    #[test]
+    fn string_32bit_marker_round_trips() {
+        let s = "a".repeat(70_000);
+        assert_eq!(round_trip(&Value::String(s.clone())), Value::String(s));
     }
 
     #[test]
@@ -2261,6 +2280,10 @@ mod tests {
     /// After the fix it is a fraction of a second. The bound below is deliberately generous (it must
     /// never flake on the O(n) path) yet is ~1–2 orders of magnitude under the broken O(n²) time, so a
     /// regression to the linear-scan dedup would blow straight through it.
+    #[cfg_attr(
+        miri,
+        ignore = "decodes a 200k-key map and asserts wall-clock linearity (O(n) vs O(n^2)); ~200k entries are far too slow under miri and the timing assertion is meaningless there"
+    )]
     #[test]
     fn large_distinct_key_map_decodes_in_linear_time_not_quadratic() {
         let n = 200_000u32;

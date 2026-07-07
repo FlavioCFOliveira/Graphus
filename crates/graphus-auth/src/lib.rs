@@ -78,6 +78,7 @@ pub mod limits;
 pub mod password;
 pub mod peercred;
 pub mod rbac;
+#[cfg(feature = "tls")]
 pub mod tls;
 pub mod token;
 
@@ -86,5 +87,6 @@ pub use error::{AuthError, Result};
 pub use limits::{AuthThrottle, RateLimiter, RequestLimits};
 pub use peercred::{PeerCred, PeerCredMap, PeerCredSource};
 pub use rbac::{Action, Catalog, Privilege, Resource, ResourceRef, Role, User};
+#[cfg(feature = "tls")]
 pub use tls::{into_shared, tls_server_config};
 pub use token::{Claims, DEFAULT_AUDIENCE, DEFAULT_ISSUER, JwtAuthenticator};

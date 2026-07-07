@@ -276,6 +276,10 @@ mod tests {
         assert_eq!(frames(&b), vec![Frame::Noop, Frame::Noop]);
     }
 
+    #[cfg_attr(
+        miri,
+        ignore = "reassembles a ~66 KB multi-chunk payload; a >64 KiB buffer (one chunk is u16::MAX) is slow under miri and the chunk-boundary logic is covered by the smaller framing tests"
+    )]
     #[test]
     fn message_spanning_multiple_chunks_reassembles() {
         // A payload larger than one chunk must split and reassemble byte-for-byte.
@@ -372,6 +376,10 @@ mod tests {
         );
     }
 
+    #[cfg_attr(
+        miri,
+        ignore = "drives 2000 messages through the dechunker to cross the 8 KiB compaction threshold; 2000 iterations are slow under miri and the compaction is a perf concern, not codec UB"
+    )]
     #[test]
     fn many_messages_one_push_drive_cursor_then_compact() {
         // PERF (C2) regression: a single large push of many small messages must reassemble each one

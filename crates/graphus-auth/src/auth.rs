@@ -24,11 +24,14 @@ use crate::limits::{RateLimiter, RequestLimits};
 use crate::peercred::{PeerCredMap, PeerCredSource};
 use crate::rbac::{Catalog, Privilege};
 use crate::token::{Claims, JwtAuthenticator};
-use crate::{password, tls};
+use crate::password;
+#[cfg(feature = "tls")]
+use crate::tls;
 
 use std::collections::HashSet;
 
 use graphus_core::capability::Clock;
+#[cfg(feature = "tls")]
 use rustls::ServerConfig;
 
 /// The authentication operations the connectivity seams (`graphus-bolt`, `graphus-rest`) resolve
@@ -365,6 +368,7 @@ impl Authenticator {
     ///
     /// # Errors
     /// [`AuthError::TlsConfig`] if the material is invalid.
+    #[cfg(feature = "tls")]
     pub fn tls_server_config(&self, cert_pem: &str, key_pem: &str) -> Result<ServerConfig> {
         tls::tls_server_config(cert_pem, key_pem)
     }
