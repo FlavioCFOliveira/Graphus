@@ -525,11 +525,63 @@ fn reset_mid_transaction_rolls_back() {
     let mut transport = MemoryTransport::with_input(&input);
     let mut session = BoltSession::new(&mut transport, exec, &auth);
     session.run().unwrap();
-    // The mock executor logged a rollback triggered by RESET.
+    // The mock executor logged the RESET-triggered rollback of the open transaction. RESET aborts
+    // via `rollback_open_tx` (consults the executor's own `current_tx`), not the plain `rollback`.
     assert!(
-        session.executor().log.contains(&"rollback".to_owned()),
-        "RESET in a transaction must roll back"
+        session
+            .executor()
+            .log
+            .contains(&"rollback_open_tx".to_owned()),
+        "RESET in a transaction must roll back the open transaction"
     );
+}
+
+#[test]
+fn reset_after_error_inside_explicit_tx_clears_tx_so_next_begin_succeeds() {
+    // Regression (rmp #613): a statement FAILURE inside an explicit transaction moves the Bolt state
+    // enum to FAILED, which used to make `handle_reset` skip the executor rollback (it gated on
+    // TxReady/TxStreaming). The executor's transaction then leaked and the NEXT `BEGIN` on the same
+    // (pooled) connection failed with "a transaction is already open", poisoning it. RESET must
+    // abort the underlying transaction UNCONDITIONALLY so the connection is reusable. Found against
+    // the live pi516 v0.0.7 instance with the real neo4j driver.
+    let exec = MockExecutor::new()
+        .on_query_error("RETURN 1/0", GraphusError::Runtime("/ by zero".to_owned()));
+    let input = session_input(&[
+        hello(),
+        logon_alice(),
+        Request::Begin { extra: vec![] },
+        Request::Run {
+            query: "RETURN 1/0".to_owned(),
+            parameters: vec![],
+            extra: vec![],
+        },
+        Request::Reset,
+        Request::Begin { extra: vec![] },
+        Request::Goodbye,
+    ]);
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, exec, &auth);
+        session.run().unwrap();
+    }
+    let (_, stream) = split_handshake(transport.written());
+    let r = decode_responses(stream);
+    // HELLO, LOGON, BEGIN#1 SUCCESS, RUN FAILURE, RESET SUCCESS, BEGIN#2 SUCCESS.
+    assert!(matches!(r[0], Response::Success { .. }), "HELLO");
+    assert!(matches!(r[1], Response::Success { .. }), "LOGON");
+    assert!(matches!(r[2], Response::Success { .. }), "BEGIN #1");
+    match &r[3] {
+        Response::Failure(f) => assert_eq!(f.code, "Neo.ClientError.Statement.ArgumentError"),
+        other => panic!("expected RUN FAILURE, got {other:?}"),
+    }
+    assert!(matches!(r[4], Response::Success { .. }), "RESET → SUCCESS");
+    // The crux: before the fix this was a FAILURE "a transaction is already open".
+    assert!(
+        matches!(r[5], Response::Success { .. }),
+        "BEGIN #2 after RESET must SUCCEED — a leaked transaction poisons the connection"
+    );
+    assert_eq!(r.len(), 6);
 }
 
 #[test]

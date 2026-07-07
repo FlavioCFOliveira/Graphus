@@ -899,11 +899,18 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
     /// Handles `RESET`: clears any failure and open stream, rolls back an open transaction, and
     /// returns to `READY` (`04 §8.1`).
     fn handle_reset(&mut self) -> BoltResult<()> {
-        // If a transaction was open, RESET rolls it back (best-effort; ignore its error — we are
-        // forcing the connection back to a clean READY regardless).
-        if matches!(self.state, State::TxReady | State::TxStreaming) {
-            let _ = self.executor.rollback();
-        }
+        // RESET forces the connection back to a clean READY "as if HELLO/LOGON had just completed"
+        // (`04 §8.1`, Bolt RESET spec), so any in-flight transaction MUST be aborted. Roll back
+        // whatever transaction the executor actually holds, UNCONDITIONALLY — do NOT gate on the
+        // Bolt state enum: a statement failure inside a transaction has already moved the enum to
+        // `State::Failed` (via `fail_with`), erasing the `TxReady`/`TxStreaming` marker. Gating on
+        // the enum (the old bug, rmp #613) skipped the rollback in exactly that case, leaking the
+        // executor's open transaction and poisoning the pooled connection — the next `BEGIN` then
+        // failed with "a transaction is already open". `rollback_open_tx` consults the executor's
+        // own `current_tx`, is a no-op when nothing is open, and is idempotent and infallible, so it
+        // is safe on every RESET (clean `TxReady`/`TxStreaming`, post-failure `Failed`, or plain
+        // `Ready`).
+        self.executor.rollback_open_tx();
         self.open_stream = None;
         self.open_qid = None;
         self.next_qid = 0;
