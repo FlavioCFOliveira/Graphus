@@ -2018,7 +2018,10 @@ mod tests {
     /// The 32-bit string length marker (`STRING_32`, length > 65535). Excluded from miri: a 70 KB
     /// string is slow under the interpreter, and the marker-selection / size-header logic is the
     /// same code the smaller-marker cases in `string_marker_boundaries` already exercise under miri.
-    #[cfg_attr(miri, ignore = "70 KB string is slow under miri; the small markers cover the codec path")]
+    #[cfg_attr(
+        miri,
+        ignore = "70 KB string is slow under miri; the small markers cover the codec path"
+    )]
     #[test]
     fn string_32bit_marker_round_trips() {
         let s = "a".repeat(70_000);

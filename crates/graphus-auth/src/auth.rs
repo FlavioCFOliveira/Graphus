@@ -21,12 +21,12 @@
 
 use crate::error::{AuthError, Result};
 use crate::limits::{RateLimiter, RequestLimits};
+use crate::password;
 use crate::peercred::{PeerCredMap, PeerCredSource};
 use crate::rbac::{Catalog, Privilege};
-use crate::token::{Claims, JwtAuthenticator};
-use crate::password;
 #[cfg(feature = "tls")]
 use crate::tls;
+use crate::token::{Claims, JwtAuthenticator};
 
 use std::collections::HashSet;
 
