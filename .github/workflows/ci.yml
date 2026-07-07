@@ -15,10 +15,11 @@ name: CI
 #
 # SECURITY: pull requests ALWAYS run on GitHub-hosted runners, never on the self-hosted machines, so
 # untrusted fork-PR code can never execute on them — a hard requirement for a public repository.
+#
+# The test suite runs on pull requests (pre-merge coverage) and on manual dispatch ONLY — NOT on
+# pushes to `main` or on version tags, so a build / release never drags the test suite along
+# (the image build in docker.yml / dockerhub.yml is the release path and is independent of the tests).
 on:
-  push:
-    branches: [main]
-    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 

@@ -3,17 +3,20 @@ name: docker
 # Build (and, except on pull requests, publish) the multi-architecture Graphus container image —
 # linux/amd64 + linux/arm64 — to the GitHub Container Registry.
 #
-# NATIVE CPUs: on trusted events each architecture is built on its OWN native self-hosted runner —
-# amd64 on `wg1` (Linux x86_64) and arm64 on `pi516` (Linux aarch64 / Raspberry Pi) — with NO QEMU
-# emulation. Each per-arch build pushes its image by digest; a final `merge` job assembles the
-# multi-arch manifest list (`:vX.Y.Z`, `:X.Y`, `:latest` for tags, `:main` for main) from those
-# digests.
+# CROSS-COMPILED on a native x86_64 self-hosted runner: the Dockerfile builder is pinned to
+# `--platform=$BUILDPLATFORM`, so the heavy Rust compile always runs natively on the x86 runner and
+# cross-compiles the arm64 (Raspberry Pi 5 / Apple Silicon) binary — no emulated compile on the slow
+# Pi. QEMU is set up only for the tiny arm64 runtime layers (a handful of `apt-get`s). One `buildx`
+# invocation yields the full multi-arch manifest.
 #
-#   * Pull requests  → a quick amd64-only Dockerfile check on a GitHub-hosted runner (no push, and —
-#                      a public-repo security requirement — never on a self-hosted machine).
-#   * Pushes to main → the native per-arch build + a `:main` multi-arch manifest (a dev image; the
-#                      release image is handled by dockerhub.yml).
-#   * Tags `v*` / dispatch → the native per-arch build + a full `:vX.Y.Z` / `:X.Y` / `:latest` manifest.
+#   * Pull requests  → amd64-only build (no push) on a GitHub-hosted runner (public-repo security:
+#                      never run fork-PR code on a self-hosted machine).
+#   * Pushes to main → build + push the `:main` multi-arch manifest (dev image; the release image is
+#                      handled by dockerhub.yml).
+#   * Tags `v*` / dispatch → build + push a full `:vX.Y.Z` / `:X.Y` / `:latest` manifest.
+#
+# NOTE: this workflow only BUILDS the image (the Dockerfile compiles the binary); it never runs the
+# cargo test suite. The tests live in ci.yml and run on pull requests / manual dispatch only.
 
 on:
   push:
@@ -34,138 +37,77 @@ on:
 concurrency:
   group: docker-${{ github.ref }}
   # Only cancel superseded pull-request builds (they never push). A run on main, a tag, or a dispatch
-  # publishes a manifest, and a half-pushed manifest is worse than waiting — so those are never cancelled.
+  # publishes a multi-arch manifest, and a half-pushed manifest is worse than waiting.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+  PLATFORMS: linux/amd64,linux/arm64
+
 jobs:
-  # Build each architecture on its native self-hosted runner and push it BY DIGEST (no tag).
   build:
-    if: github.event_name != 'pull_request'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux/amd64
-            runner: [self-hosted, Linux, X64]
-          - platform: linux/arm64
-            runner: [self-hosted, Linux, ARM64]
-    runs-on: ${{ matrix.runner }}
+    # Cross-compile on a native x86_64 self-hosted runner for trusted events; PRs stay on a
+    # GitHub-hosted runner so untrusted fork code never runs on the self-hosted machines.
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || fromJSON('["self-hosted", "Linux", "X64"]') }}
     permissions:
       contents: read
       packages: write
     steps:
-      - name: Prepare platform pair + lowercase image name
-        run: |
-          platform="${{ matrix.platform }}"
-          echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
-          # GHCR (and Docker) reject uppercase repository names; github.repository preserves the
-          # owner's case (FlavioCFOliveira/Graphus), so lowercase it for the image reference.
-          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v7
-      - name: Derive image labels
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ env.IMAGE }}
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # QEMU is needed only for the arm64 RUNTIME layers (the runtime stage's `apt-get`); the Rust
+      # compile is cross-compiled natively on x86 by the `--platform=$BUILDPLATFORM` builder stage.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
+
+      # Only publish for pushes/tags/dispatch; PRs build without pushing.
+      - name: Decide whether to push
+        id: gate
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "push=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "push=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Log in to GHCR
+        if: steps.gate.outputs.push == 'true'
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push by digest (native ${{ matrix.platform }})
-        id: build
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: ${{ matrix.platform }}
-          labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
-          provenance: true
-          sbom: true
-          cache-from: type=gha,scope=ghcr-${{ env.PLATFORM_PAIR }}
-          cache-to: type=gha,mode=max,scope=ghcr-${{ env.PLATFORM_PAIR }}
-      - name: Export digest
-        run: |
-          mkdir -p "${{ runner.temp }}/digests"
-          digest="${{ steps.build.outputs.digest }}"
-          touch "${{ runner.temp }}/digests/${digest#sha256:}"
-      - name: Upload digest
-        uses: actions/upload-artifact@v7
-        with:
-          name: ghcr-digests-${{ env.PLATFORM_PAIR }}
-          path: ${{ runner.temp }}/digests/*
-          if-no-files-found: error
-          retention-days: 1
 
-  # Assemble the multi-arch manifest list from the per-arch digests and push it with the real tags.
-  merge:
-    if: github.event_name != 'pull_request'
-    needs: [build]
-    runs-on: [self-hosted, Linux, X64]
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - name: Lowercase image name
-        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
-      - name: Download digests
-        uses: actions/download-artifact@v7
-        with:
-          path: ${{ runner.temp }}/digests
-          pattern: ghcr-digests-*
-          merge-multiple: true
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-      - name: Derive image tags
+      # metadata-action lowercases the image reference automatically (github.repository preserves the
+      # owner's case), so the derived tags are always registry-valid.
+      - name: Derive image tags and labels
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ${{ env.IMAGE }}
+          images: ${{ env.IMAGE_NAME }}
           tags: |
             type=ref,event=branch
+            type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Create and push the multi-arch manifest
-        working-directory: ${{ runner.temp }}/digests
-        run: |
-          tag_args=""
-          while IFS= read -r tag; do
-            [ -n "$tag" ] && tag_args="$tag_args -t $tag"
-          done <<< "${{ steps.meta.outputs.tags }}"
-          # shellcheck disable=SC2046
-          docker buildx imagetools create $tag_args \
-            $(printf '${{ env.IMAGE }}@sha256:%s ' *)
-      - name: Inspect the published manifest
-        run: docker buildx imagetools inspect "${{ env.IMAGE }}:${{ steps.meta.outputs.version }}"
 
-  # Pull requests: a fast amd64-only Dockerfile check on a GitHub-hosted runner (no push). Never runs
-  # on a self-hosted machine, so untrusted fork-PR code cannot execute there.
-  pr-check:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v7
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-      - name: Build (amd64, no push)
+      - name: Build and push (multi-arch, cross-compiled)
         uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64
-          push: false
-          cache-from: type=gha,scope=ghcr-pr
-          cache-to: type=gha,mode=max,scope=ghcr-pr
+          # PRs build the native amd64 image only (fast); pushes/tags cross-compile the full multi-arch
+          # manifest so arm64 is validated before it can ship.
+          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || env.PLATFORMS }}
+          push: ${{ steps.gate.outputs.push }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: true
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

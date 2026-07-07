@@ -13,33 +13,54 @@
 # favours correctness over cross-compilation complexity for a database server.
 
 # ---------------------------------------------------------------------------
-# Stage 1 — builder
+# Stage 1 — builder (cross-compiling)
 # ---------------------------------------------------------------------------
-# Pinned to the workspace MSRV (rust-version = 1.85, edition 2024).
-FROM rust:1.85-slim-bookworm AS builder
+# Pinned to `--platform=$BUILDPLATFORM`, so the builder always runs on the BUILD
+# machine's architecture (e.g. x86_64) and CROSS-COMPILES `graphus-server` for the
+# requested TARGET architecture. This lets a fast x86 runner produce the arm64
+# (Raspberry Pi 5 / Apple Silicon) binary natively — the heavy Rust compile is never
+# emulated; only the tiny runtime stage below runs under QEMU. Pinned to the workspace
+# MSRV (rust-version = 1.85, edition 2024).
+FROM --platform=$BUILDPLATFORM rust:1.85-slim-bookworm AS builder
+ARG TARGETARCH
 
 # Build dependencies for the aws-lc-rs / ring TLS backends used by rustls:
 #   * cmake + build-essential — compile the vendored AWS-LC C library
 #   * perl                    — AWS-LC assembly generation
-# `--locked` guarantees the build matches the committed Cargo.lock.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        build-essential \
-        cmake \
-        perl \
-        ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# Plus, when the target differs from the build arch, the aarch64 cross toolchain
+# (gcc/g++ + the Rust std for the target). `TARGETARCH` is set automatically by buildx.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        build-essential cmake perl ca-certificates; \
+    case "$TARGETARCH" in \
+      amd64) echo x86_64-unknown-linux-gnu > /rust-target ;; \
+      arm64) apt-get install -y --no-install-recommends \
+               gcc-aarch64-linux-gnu g++-aarch64-linux-gnu; \
+             echo aarch64-unknown-linux-gnu > /rust-target ;; \
+      *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    rm -rf /var/lib/apt/lists/*; \
+    rustup target add "$(cat /rust-target)"
 
 WORKDIR /app
 COPY . .
 
-# BuildKit cache mounts keep the cargo registry and target tree warm across
-# builds. The release binary is copied OUT of the cache-mounted target dir
-# inside the same RUN, because the mount does not persist to the next layer.
+# Cross-compile for the target triple. The `CC_*`/`CXX_*`/`AR_*`/linker env vars point
+# the `cc` and `cmake` crates (which build aws-lc-sys) and the Rust linker at the aarch64
+# cross toolchain; they are harmless no-ops for a native amd64 build. BuildKit cache
+# mounts keep the cargo registry and target tree warm; the binary is copied OUT of the
+# cache-mounted target dir in the same RUN. `--locked` matches the committed Cargo.lock.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/app/target,sharing=locked \
-    cargo build --release --locked -p graphus-server \
-    && cp /app/target/release/graphus-server /usr/local/bin/graphus-server
+    set -eux; \
+    RUST_TARGET="$(cat /rust-target)"; \
+    export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+           CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+           CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ \
+           AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar; \
+    cargo build --release --locked -p graphus-server --target "$RUST_TARGET"; \
+    cp "target/$RUST_TARGET/release/graphus-server" /usr/local/bin/graphus-server
 
 # ---------------------------------------------------------------------------
 # Stage 2 — runtime
