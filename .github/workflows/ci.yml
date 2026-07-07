@@ -1,13 +1,20 @@
 name: CI
 
 # Fast checks (format, clippy, tests) and the heavy deterministic gate (DST sweeps +
-# crash-recovery soaks) run on pull requests, on pushes to `main`, on version tags, and
-# on manual dispatch. `push` is intentionally scoped to `main` + tags: a feature-branch
-# push reaches CI only through its pull request, so nothing runs twice for the same change
-# and the DST/soak gate never fires on an ordinary feature push. A self-hosted Raspberry Pi leg
-# (`pi516`) additionally runs the suite on real Pi hardware, but only on trusted, non-pull-request
-# events so untrusted fork code never runs on the self-hosted machine. The nightly-fuzz workflow
-# soaks the DST fuzzer far deeper on a schedule.
+# crash-recovery soaks) run on pull requests, on pushes to `main`, on version tags, and on manual
+# dispatch. `push` is intentionally scoped to `main` + tags: a feature-branch push reaches CI only
+# through its pull request, so nothing runs twice for the same change and the DST/soak gate never
+# fires on an ordinary feature push. The nightly-fuzz workflow soaks the DST fuzzer far deeper on a
+# schedule.
+#
+# NATIVE CPUs: on trusted events (push to `main`, tags, manual dispatch) every leg runs on a native
+# self-hosted runner — `wg1` (Linux x86_64), `pi516` (Linux aarch64 / Raspberry Pi), and
+# `macbook-flavio` (macOS aarch64 / Apple Silicon) — so the Tier-1 target matrix is exercised on real
+# hardware with no emulation. Lint (format + clippy) runs on the fast x86_64 leg (and on every leg
+# for pull requests); the slower aarch64 legs run the test suite natively.
+#
+# SECURITY: pull requests ALWAYS run on GitHub-hosted runners, never on the self-hosted machines, so
+# untrusted fork-PR code can never execute on them — a hard requirement for a public repository.
 on:
   push:
     branches: [main]
@@ -15,120 +22,92 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Cancel a superseded run for the same ref (e.g. a new push to a PR supersedes the previous
-# run), but never cancel a run on `main` — its post-merge gate must always complete.
+# Cancel a superseded run for the same ref (e.g. a new push to a PR supersedes the previous run),
+# but never cancel a run on `main` — its post-merge gate must always complete.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
-# Least privilege: this workflow only checks out and compiles. The Actions cache used by
-# rust-cache authenticates with its own runtime token, not GITHUB_TOKEN, so a read-only
-# contents scope does not disable caching.
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
-  # macOS's default temp dir (/var/folders/.../T) is long enough that a UDS socket path built
-  # under it overflows the platform `sun_path` limit (~104 bytes), so every integration test
-  # that binds a Unix domain socket fails to boot on macos-14 with "path must be shorter than
-  # SUN_LEN". Point the temp dir at the short /tmp (`std::env::temp_dir()` honours `$TMPDIR` on
-  # Unix) so socket paths stay under the limit on every leg; a no-op on Linux, where
-  # `temp_dir()` is already /tmp.
+  # macOS's default temp dir is long enough that a UDS socket path built under it overflows the
+  # platform `sun_path` limit (~104 bytes). Point the temp dir at the short /tmp so socket paths stay
+  # under the limit on every leg; a no-op on Linux, where `temp_dir()` is already /tmp.
   TMPDIR: /tmp
 
 jobs:
-  # Fast, always-on gate: format, lints, and the full test suite across the Tier-1 target
-  # matrix (decision D-target-matrix): x86_64 Linux, aarch64 Linux, and aarch64 macOS.
+  # The Tier-1 target matrix (decision D-target-matrix): x86_64 Linux, aarch64 Linux, aarch64 macOS.
+  # `runs-on` resolves to a native self-hosted runner on trusted events and a GitHub-hosted runner on
+  # pull requests (see the security note above).
   test:
-    name: test ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    name: test ${{ matrix.name }}
+    runs-on: ${{ github.event_name == 'pull_request' && matrix.hosted || fromJSON(matrix.native) }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14]
+        include:
+          - name: linux-x64
+            hosted: ubuntu-latest
+            native: '["self-hosted", "Linux", "X64"]'
+          - name: linux-arm64
+            hosted: ubuntu-24.04-arm
+            native: '["self-hosted", "Linux", "ARM64"]'
+          - name: macos-arm64
+            hosted: macos-14
+            native: '["self-hosted", "macOS", "ARM64"]'
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      # Cache the cargo registry, git sources, and build artifacts across runs so each leg
-      # does an incremental build instead of compiling the whole workspace from cold.
+      # Cache the cargo registry, git sources, and build artifacts across runs so each leg does an
+      # incremental build instead of compiling the whole workspace from cold.
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+      # Format and clippy are architecture-independent, so on trusted events they run only on the
+      # fast x86_64 leg (sparing the slower aarch64 self-hosted machines); on pull requests they run
+      # on every GitHub-hosted leg for full lint coverage.
       - name: Format
+        if: matrix.name == 'linux-x64' || github.event_name == 'pull_request'
         run: cargo fmt --all -- --check
-      # `clippy --all-targets` compiles every target (lib, bins, examples, benches, tests) as a
-      # superset of `cargo check`, and `cargo test` then codegens and runs the lib/bin/test/doc
-      # targets — so a separate `cargo build --all-targets` step would only recompile the same
-      # code. Clippy already fails the run on any target that does not compile.
       - name: Clippy
+        if: matrix.name == 'linux-x64' || github.event_name == 'pull_request'
         run: cargo clippy --all-targets --all-features -- -D warnings
+      # The full suite compiles and runs on every leg — its value on the aarch64 self-hosted machines
+      # is exercising real Pi / Apple-Silicon hardware (kernel, page/stack sizes) natively.
       - name: Test
         run: cargo test --all
 
-  # Heavy deterministic gate — deliberately a separate job so it can be reasoned about and (if
-  # ever needed) re-scoped independently of the fast checks. Same triggers as `test`, so it
-  # gates every PR, every push to `main`, and every tag, but — because `push` is scoped to
-  # `main` + tags above — it never runs on an ordinary feature-branch push.
+  # Heavy deterministic gate — runs natively on the fast x86_64 self-hosted runner (`wg1`) for trusted
+  # events, and on a GitHub-hosted runner for pull requests.
   dst:
     name: DST + crash-recovery gate
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || fromJSON('["self-hosted", "Linux", "X64"]') }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      # DST crash-recovery soak gate (rmp #468/#471/#480): the three large-seed crash + ARIES
-      # recovery sweeps that pin the dead-link-corpse class (#468/#172/#301) and recovery
-      # idempotency closed — interleaved self-loop incidence-chain churn (10k seeds), interleaved
-      # property-chain churn (10k seeds), and crash-during-recovery double-crash idempotency (6k
-      # seeds). Run in release (optimised paths) as an explicit, always-on standing gate. No
-      # `#[ignore]`, no skips.
+      # DST crash-recovery soak gate (rmp #468/#471/#480): the three large-seed crash + ARIES recovery
+      # sweeps that pin the dead-link-corpse class and recovery idempotency. Release, always-on. No skips.
       - name: DST crash-recovery soaks (release)
         run: >
           cargo test --release -p graphus-dst
           --test selfloop_churn_recovery
           --test property_churn_recovery
           --test double_crash_recovery
-      # Deterministic Simulation Testing gate (rmp #244): a fast, bounded VOPR seed sweep asserting
-      # every seed is SAFE (strict serializability + durability + atomicity + reference-model
-      # equivalence under injected disk/clock/crash faults), LIVE (progress watchdog + fault-then-heal
-      # recovery), and deterministic + oracle-consistent. Any violation, non-determinism, or oracle
-      # divergence fails the run. Bounded (256 seeds/mode) so it stays a quick gate; the nightly job
-      # soaks far deeper.
+      # Deterministic Simulation Testing gate (rmp #244): a fast, bounded VOPR seed sweep asserting every
+      # seed is SAFE, LIVE, and deterministic + oracle-consistent. Bounded (256 seeds/mode) so it stays a
+      # quick gate; the nightly job soaks far deeper.
       - name: DST safety sweep
         run: cargo run --release -p graphus-dst --bin graphus-dst -- vopr safety --seed 1 --seeds 256
       - name: DST liveness sweep
         run: cargo run --release -p graphus-dst --bin graphus-dst -- vopr liveness --seed 1 --seeds 256
       - name: DST determinism + reference-model sweep
         run: cargo run --release -p graphus-dst --bin graphus-dst -- vopr --seed 1 --seeds 256
-
-  # Native Raspberry Pi (aarch64) validation on the self-hosted `pi516` runner. Graphus targets
-  # Raspberry Pi 5+ as a Tier-1 platform, so this real-hardware leg exercises the suite on an actual
-  # Raspberry Pi / Raspberry Pi OS (its kernel, page size, and default thread-stack size) — the class
-  # of environment that surfaced the aarch64 deep-recursion stack-overflow fixed with an 8 MiB
-  # runtime stack. The GitHub-hosted `ubuntu-24.04-arm` leg already covers generic aarch64 build +
-  # clippy + test, so this leg adds only what that one cannot: real Pi hardware.
-  #
-  # SECURITY: `if: github.event_name != 'pull_request'` keeps this off pull requests, so untrusted
-  # fork-PR code is NEVER executed on the self-hosted machine. It runs only on trusted events —
-  # pushes to `main`, version tags, and manual dispatch.
-  raspberry-pi:
-    name: Raspberry Pi (pi516, aarch64)
-    if: github.event_name != 'pull_request'
-    runs-on: [self-hosted, Linux, ARM64]
-    timeout-minutes: 120
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-      # Format and clippy are architecture-independent and already run on the `test` matrix, so this
-      # leg only builds and runs the suite — its value is executing the tests on real Pi hardware.
-      - name: Test (real Raspberry Pi hardware)
-        run: cargo test --all

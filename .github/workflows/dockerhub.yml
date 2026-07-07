@@ -1,85 +1,70 @@
 name: Docker Hub
 
-# Build and publish the multi-architecture Graphus container image
-# (linux/amd64 + linux/arm64) to Docker Hub.
+# Build and publish the multi-architecture Graphus container image (linux/amd64 + linux/arm64) to
+# Docker Hub.
 #
-# Triggers are INTENTIONALLY restricted to two — this workflow never runs on
-# ordinary pushes or pull requests:
+# NATIVE CPUs: each architecture is built on its OWN native self-hosted runner — amd64 on `wg1`
+# (Linux x86_64) and arm64 on `pi516` (Linux aarch64 / Raspberry Pi) — with NO QEMU emulation. Each
+# per-arch build pushes by digest; a final `merge` job assembles the multi-arch manifest with the
+# CONFORMANT tags (`:vX.Y.Z` + `:latest`). Both triggers below are trusted (never a fork pull
+# request), so running on the self-hosted machines is safe.
 #
 #   * workflow_dispatch    → manual, on-demand publish of a specific version (required input)
 #   * release: published   → automatic publish when a GitHub Release is published
 #
-# Either way the image is published with CONFORMANT tags ONLY — `:latest` plus a
-# `:vX.Y.Z` version tag. There is no sha/edge/branch fallback: a publish that would
-# not carry a version tag is treated as a configuration error and fails fast.
-#
-# The companion `docker.yml` workflow keeps the Dockerfile green on every change
-# and publishes to the GitHub Container Registry (GHCR); this one targets Docker Hub.
-#
-# Required repository secrets (Settings → Secrets and variables → Actions):
-#   * DOCKERHUB_USERNAME — Docker Hub account/namespace and login username
-#   * DOCKERHUB_TOKEN    — a Docker Hub Access Token (create one under your Docker
-#                          Hub account settings; do NOT use the account password)
+# Required repository secrets: DOCKERHUB_USERNAME (account/namespace + login) and DOCKERHUB_TOKEN
+# (a Docker Hub access token — not the account password).
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to publish, e.g. 0.0.3 (semver, no leading 'v'). Publishes :vX.Y.Z and :latest."
+        description: "Version to publish, e.g. 0.0.6 (semver, no leading 'v'). Publishes :vX.Y.Z and :latest."
         required: true
         type: string
   release:
     types: [published]
 
-# Never cancel an in-flight publish — a half-pushed multi-arch manifest is worse
-# than waiting. Serialise per ref instead.
+# Never cancel an in-flight publish — a half-pushed multi-arch manifest is worse than waiting.
 concurrency:
   group: dockerhub-${{ github.ref }}
   cancel-in-progress: false
 
-# Docker Hub auth uses the secrets below, so no elevated GITHUB_TOKEN scope is
-# needed; read-only access to the repository contents is enough to check it out.
 permissions:
   contents: read
 
 env:
-  # The published reference is docker.io/<DOCKERHUB_USERNAME>/<IMAGE_REPO>. The
-  # namespace is taken from the secret at run time; only the repository name is
-  # set here. If you publish under a Docker Hub organisation whose name differs
-  # from the login user, change the `images:` value in the metadata step below.
   IMAGE_REPO: graphus
-  PLATFORMS: linux/amd64,linux/arm64
 
 jobs:
-  publish:
-    name: Build and publish to Docker Hub
-    runs-on: ubuntu-latest
+  # Build each architecture on its native self-hosted runner and push it BY DIGEST (no tag).
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: [self-hosted, Linux, X64]
+          - platform: linux/arm64
+            runner: [self-hosted, Linux, ARM64]
+    runs-on: ${{ matrix.runner }}
     steps:
-      # A dispatch must name a concrete semver version up front, so Docker Hub can
-      # never receive a non-conformant (sha/branch) tag via the manual path.
+      # A dispatch must name a concrete semver version up front, so Docker Hub can never receive a
+      # non-conformant (sha/branch) tag via the manual path.
       - name: Validate the dispatch version is semver
         if: github.event_name == 'workflow_dispatch'
         env:
           VERSION: ${{ inputs.version }}
         run: |
-          # Reject control characters / newlines up front: the semver grep below anchors with
-          # ^...$ per line, so a multi-line input could otherwise slip a payload past validation
-          # and into the downstream tag/summary interpolation.
           if printf '%s' "$VERSION" | LC_ALL=C grep -q '[[:cntrl:]]'; then
             echo "::error::The 'version' input must not contain control characters or newlines."
             exit 1
           fi
           if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
-            echo "::error::The 'version' input must be semver like 0.0.3 (no leading v); got '$VERSION'."
+            echo "::error::The 'version' input must be semver like 0.0.6 (no leading v); got '$VERSION'."
             exit 1
           fi
           echo "Publishing version v$VERSION."
-
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      # Fail fast with a clear message if run on a fork or before the secrets are
-      # configured, instead of erroring opaquely deep inside the login step.
       - name: Verify Docker Hub credentials are configured
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -90,63 +75,95 @@ jobs:
             exit 1
           fi
           echo "Docker Hub credentials are present."
-
-      # QEMU lets the runner build the non-native (arm64) image under emulation.
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v4
-        with:
-          # registry defaults to docker.io (Docker Hub) when omitted.
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Derive image tags and labels
+      - name: Prepare platform pair
+        run: |
+          platform="${{ matrix.platform }}"
+          echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v7
+      - name: Derive image labels
         id: meta
         uses: docker/metadata-action@v6
         with:
           images: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_REPO }}
-          # CONFORMANT TAGS ONLY — every publish carries :vX.Y.Z + :latest, never a
-          # sha or branch tag:
-          #   * release  → the git tag (refs/tags/vX.Y.Z) feeds pattern=v{{version}};
-          #                `latest` moves for a final (non-prerelease) release.
-          #   * dispatch → the required, semver-validated `version` input feeds
-          #                :v<version>, and `latest` moves too (an operator publishing
-          #                a version on purpose).
-          tags: |
-            type=semver,pattern=v{{version}},enable=${{ github.event_name == 'release' }}
-            type=raw,value=v${{ inputs.version }},enable=${{ github.event_name == 'workflow_dispatch' }}
-            type=raw,value=latest,enable=${{ (github.event_name == 'release' && !github.event.release.prerelease) || github.event_name == 'workflow_dispatch' }}
-
-      - name: Build and push (multi-arch)
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Build and push by digest (native ${{ matrix.platform }})
         id: build
         uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
-          platforms: ${{ env.PLATFORMS }}
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          # Supply-chain attestations, matching the GHCR workflow.
+          outputs: type=image,name=${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_REPO }},push-by-digest=true,name-canonical=true,push=true
           provenance: true
           sbom: true
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=dockerhub-${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=dockerhub-${{ env.PLATFORM_PAIR }}
+      - name: Export digest
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: dockerhub-digests-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
 
+  # Assemble the multi-arch manifest from the per-arch digests and push it with the CONFORMANT tags.
+  merge:
+    needs: [build]
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v7
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: dockerhub-digests-*
+          merge-multiple: true
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: Derive image tags and labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_REPO }}
+          # CONFORMANT TAGS ONLY — every publish carries :vX.Y.Z + :latest, never a sha or branch tag.
+          tags: |
+            type=semver,pattern=v{{version}},enable=${{ github.event_name == 'release' }}
+            type=raw,value=v${{ inputs.version }},enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=latest,enable=${{ (github.event_name == 'release' && !github.event.release.prerelease) || github.event_name == 'workflow_dispatch' }}
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Create and push the multi-arch manifest
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          tag_args=""
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && tag_args="$tag_args -t $tag"
+          done <<< "${{ steps.meta.outputs.tags }}"
+          # shellcheck disable=SC2046
+          docker buildx imagetools create $tag_args \
+            $(printf '${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_REPO }}@sha256:%s ' *)
       - name: Publish summary
         run: |
           {
-            echo "### Published to Docker Hub"
-            echo ""
-            echo "**Digest:** \`${{ steps.build.outputs.digest }}\`"
+            echo "### Published to Docker Hub (native multi-arch)"
             echo ""
             echo "**Tags:**"
             echo '```'
             echo "${{ steps.meta.outputs.tags }}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+          docker buildx imagetools inspect "${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_REPO }}:${{ steps.meta.outputs.version }}"

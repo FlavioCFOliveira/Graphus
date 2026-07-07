@@ -31,7 +31,9 @@ permissions:
 jobs:
   soak:
     name: VOPR soak (${{ matrix.mode }})
-    runs-on: ubuntu-latest
+    # Native x86_64 self-hosted runner (`wg1`). The schedule and manual dispatch are trusted events
+    # (never fork pull requests), so running on the self-hosted machine is safe.
+    runs-on: [self-hosted, Linux, X64]
     strategy:
       fail-fast: false
       matrix:
@@ -75,7 +77,8 @@ jobs:
   # seed-replay gate (see specification/07-dst-simulator.md §5.1 / §13).
   tsan-soak:
     name: ThreadSanitizer threaded concurrency lane
-    runs-on: ubuntu-latest
+    # Native x86_64 self-hosted runner (`wg1`); schedule + dispatch only, so no fork-PR code runs here.
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v7
       - name: Install nightly + rust-src (ThreadSanitizer needs an instrumented std)
