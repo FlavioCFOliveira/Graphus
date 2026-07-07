@@ -75,13 +75,20 @@ struct TempStore {
 }
 impl TempStore {
     fn new() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // A process-wide counter guarantees a unique path even when two parallel tests observe the
+        // same coarse-resolution `SystemTime` nanos — which collides on macOS (µs-resolution clock),
+        // where a sibling test's `Drop` then `remove_dir_all`'d this shared dir mid-run and the
+        // `security.toml` publish failed with ENOENT. `nanos + pid` alone is NOT collision-free.
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         let mut path = std::env::temp_dir();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock after epoch")
             .as_nanos();
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         path.push(format!(
-            "graphus-kg-rest-mirror-{nanos}-{}",
+            "graphus-kg-rest-mirror-{nanos}-{}-{seq}",
             std::process::id()
         ));
         std::fs::create_dir_all(&path).expect("create temp dir");

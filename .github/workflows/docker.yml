@@ -37,9 +37,6 @@ concurrency:
   # publishes a manifest, and a half-pushed manifest is worse than waiting — so those are never cancelled.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-env:
-  IMAGE_NAME: ghcr.io/${{ github.repository }}
-
 jobs:
   # Build each architecture on its native self-hosted runner and push it BY DIGEST (no tag).
   build:
@@ -57,16 +54,19 @@ jobs:
       contents: read
       packages: write
     steps:
-      - name: Prepare platform pair
+      - name: Prepare platform pair + lowercase image name
         run: |
           platform="${{ matrix.platform }}"
           echo "PLATFORM_PAIR=${platform//\//-}" >> "$GITHUB_ENV"
+          # GHCR (and Docker) reject uppercase repository names; github.repository preserves the
+          # owner's case (FlavioCFOliveira/Graphus), so lowercase it for the image reference.
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
       - name: Derive image labels
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ${{ env.IMAGE_NAME }}
+          images: ${{ env.IMAGE }}
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
       - name: Log in to GHCR
@@ -83,7 +83,7 @@ jobs:
           file: ./Dockerfile
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           provenance: true
           sbom: true
           cache-from: type=gha,scope=ghcr-${{ env.PLATFORM_PAIR }}
@@ -110,6 +110,8 @@ jobs:
       contents: read
       packages: write
     steps:
+      - name: Lowercase image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
       - name: Download digests
         uses: actions/download-artifact@v7
         with:
@@ -122,7 +124,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ${{ env.IMAGE_NAME }}
+          images: ${{ env.IMAGE }}
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}
@@ -143,9 +145,9 @@ jobs:
           done <<< "${{ steps.meta.outputs.tags }}"
           # shellcheck disable=SC2046
           docker buildx imagetools create $tag_args \
-            $(printf '${{ env.IMAGE_NAME }}@sha256:%s ' *)
+            $(printf '${{ env.IMAGE }}@sha256:%s ' *)
       - name: Inspect the published manifest
-        run: docker buildx imagetools inspect "${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}"
+        run: docker buildx imagetools inspect "${{ env.IMAGE }}:${{ steps.meta.outputs.version }}"
 
   # Pull requests: a fast amd64-only Dockerfile check on a GitHub-hosted runner (no push). Never runs
   # on a self-hosted machine, so untrusted fork-PR code cannot execute there.
