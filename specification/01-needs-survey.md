@@ -76,9 +76,11 @@ Target: **100% Cypher TCK compliant** on a pinned openCypher snapshot (decision 
   comparability vs orderability; aggregation grouping keys and empty-input results; `MERGE`
   whole-pattern semantics; 0-based list indexing with out-of-range → `null`; 64-bit integer
   overflow → `ArithmeticError`; codepoint-correct Unicode string handling.
-- **FR-QL-9** [CORE] **Two-phase error model:** `SyntaxError`/`SemanticError`/`ParameterMissing`
+- **FR-QL-9** [CORE] **Two-phase error model:** `SyntaxError`/`ProcedureError`/`ParameterMissing`
   raised at **compile time** before any execution begins; `TypeError`/`ArithmeticError`/
-  `EntityNotFound`/constraint errors at **runtime**. The TCK asserts the phase.
+  `EntityNotFound`/`SemanticError` (the runtime `MergeReadOwnWrites`)/constraint errors at
+  **runtime**. The TCK asserts the phase. The compile-time classification is frozen in
+  `06-bolt-and-error-shapes.md` §2.2.
 - **FR-QL-10** [CORE] **Side-effect accounting:** report net-observable created/removed counts
   for nodes, relationships, properties, and labels exactly as the TCK expects.
 - **FR-QL-11** [CORE] **Query planner/optimizer:** parse → AST → logical plan → physical plan;

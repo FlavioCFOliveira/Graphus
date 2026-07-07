@@ -86,7 +86,8 @@ Then a SyntaxError should be raised at compile time: UndefinedVariable
 which decomposes into three components (openCypher TCK `tck/README.adoc`):
 
 1. **phase** — `compile time` or `runtime`.
-2. **type** (also called classification) — `SyntaxError`, `SemanticError`, and the runtime types.
+2. **type** (also called classification) — `SyntaxError`, `SemanticError`, `ProcedureError`,
+   `ParameterMissing`, and the runtime types.
 3. **detail** — a fine-grained label (e.g. `UndefinedVariable`).
 
 Graphus maps every internal error to its `(phase, type, detail)` triple through an
@@ -107,35 +108,59 @@ new error variant cannot be added without classifying it.
 
 ### 2.2 Compile-time error-classification table
 
-Semantic analysis raises exactly the errors below. Each row is a `(phase, type, detail)` triple. The
-**detail** strings are taken **verbatim** from the openCypher TCK feature files (`tck/features/**`)
-that assert them, and are pinned by tests in `crates/graphus-cypher/src/errors.rs`. The phase is
-**compile time** for every row.
+Semantic analysis raises exactly the errors below — the table is **exhaustive** over the
+`SemanticErrorKind` enum (28 variants mapping onto the 27 distinct details below), and a
+wildcard-free `match` in `crates/graphus-cypher/src/errors.rs` fails to compile the moment a new
+variant is added without classifying it. Each row is a `(phase, type, detail)` triple. The **detail**
+strings are taken **verbatim** from the openCypher TCK feature files (`tck/features/**`) that assert
+them (the two details marked "internal" below are for Neo4j extensions absent from the TCK corpus),
+and are pinned by tests in `crates/graphus-cypher/src/errors.rs`. The phase is **compile time** for
+every row.
+
+Measured over the whole pinned corpus, the openCypher TCK classifies **almost every** compile-time
+fault as a **`SyntaxError`**; the only two exceptions — both from
+`tck/features/clauses/call/Call1.feature` — are an unknown procedure (`ProcedureError`) and a missing
+implicit-call parameter (`ParameterMissing`). **No** compile-time error is a `SemanticError`: the only
+`SemanticError` the corpus asserts is the *runtime* `MergeReadOwnWrites`, which the executor (not
+semantic analysis) raises. Graphus follows the measured TCK, not intuition (`CLAUDE.md`: never guess;
+the TCK is inviolable).
 
 | Detail | TCK type | Phase | Meaning |
 | --- | --- | --- | --- |
 | `UndefinedVariable` | `SyntaxError` | compile time | A variable is referenced where it is not in scope (e.g. a name not carried through a `WITH`). |
-| `VariableAlreadyBound` | `SemanticError` | compile time | A pattern re-introduces a name already bound to an entity where Cypher forbids rebinding. |
-| `VariableTypeConflict` | `SemanticError` | compile time | A name is bound to two incompatible entity kinds (e.g. node vs relationship) in one scope. |
-| `AmbiguousAggregationExpression` | `SemanticError` | compile time | A projection mixes aggregating and non-aggregating terms so that the grouping is ambiguous. |
-| `NestedAggregation` | `SemanticError` | compile time | An aggregating function is nested inside another aggregating function. |
-| `InvalidAggregation` | `SemanticError` | compile time | An aggregation appears where aggregation is forbidden (e.g. `WHERE`, a pattern predicate, a variable-length bound). |
-| `NoExpressionAlias` | `SemanticError` | compile time | A non-trivial `WITH`/`RETURN` expression lacks its mandatory `AS` alias. |
-| `ColumnNameConflict` | `SemanticError` | compile time | Two projected result columns share the same name. |
-| `NegativeIntegerArgument` | `SemanticError` | compile time | A position requiring a non-negative integer literal received a negative one (e.g. a variable-length lower bound). |
-| `NoSingleRelationshipType` | `SemanticError` | compile time | A `CREATE`/`MERGE` relationship pattern does not specify exactly one relationship type. |
-| `RequiresDirectedRelationship` | `SemanticError` | compile time | A `CREATE`/`MERGE` relationship pattern is undirected, but creation requires a direction. |
-| `CreatingVarLength` | `SemanticError` | compile time | A `CREATE`/`MERGE` pattern uses a variable-length relationship, which is not creatable. |
-| `UnknownFunction` | `SemanticError` | compile time | A function invocation names a function the database does not provide. |
-| `InvalidNumberOfArguments` | `SemanticError` | compile time | A known function is called with the wrong arity. |
-| `InvalidDelete` | `SemanticError` | compile time | `DELETE` targets something that is not a deletable graph entity reference. |
-| `InvalidClauseComposition` | `SemanticError` | compile time | Clauses are composed in an order Cypher forbids (e.g. a `RETURN` that is not the final clause, or an empty single query). |
+| `NoVariablesInScope` | `SyntaxError` | compile time | `RETURN *` is used where no variables are in scope. |
+| `VariableAlreadyBound` | `SyntaxError` | compile time | A pattern re-introduces a name already bound to an entity where Cypher forbids rebinding. |
+| `VariableTypeConflict` | `SyntaxError` | compile time | A name is bound to two incompatible entity kinds (e.g. node vs relationship) in one scope. |
+| `AmbiguousAggregationExpression` | `SyntaxError` | compile time | A projection mixes aggregating and non-aggregating terms so that the grouping is ambiguous. |
+| `NestedAggregation` | `SyntaxError` | compile time | An aggregating function is nested inside another aggregating function. |
+| `InvalidAggregation` | `SyntaxError` | compile time | An aggregation appears where aggregation is forbidden (e.g. `WHERE`, a pattern predicate, a variable-length bound). |
+| `NoExpressionAlias` | `SyntaxError` | compile time | A non-trivial `WITH`/`RETURN` expression lacks its mandatory `AS` alias. |
+| `ColumnNameConflict` | `SyntaxError` | compile time | Two projected result columns share the same name. |
+| `NegativeIntegerArgument` | `SyntaxError` | compile time | A position requiring a non-negative integer literal received a negative one (e.g. a variable-length lower bound). |
+| `NoSingleRelationshipType` | `SyntaxError` | compile time | A `CREATE`/`MERGE` relationship pattern does not specify exactly one relationship type. |
+| `RequiresDirectedRelationship` | `SyntaxError` | compile time | A `CREATE`/`MERGE` relationship pattern is undirected, but creation requires a direction. |
+| `CreatingVarLength` | `SyntaxError` | compile time | A `CREATE`/`MERGE` pattern uses a variable-length relationship, which is not creatable. |
+| `UnknownFunction` | `SyntaxError` | compile time | A function invocation names a function the database does not provide. |
+| `InvalidNumberOfArguments` | `SyntaxError` | compile time | A known function or procedure is called with the wrong arity. |
+| `ProcedureNotFound` | `ProcedureError` | compile time | A `CALL` names a procedure the database does not provide (`tck/features/clauses/call/Call1.feature`). |
+| `InvalidArgumentType` | `SyntaxError` | compile time | A statically-typed function or procedure argument cannot satisfy the declared input type. |
+| `MissingParameter` | `ParameterMissing` | compile time | A standalone implicit procedure call needs a query parameter that was not supplied (`tck/features/clauses/call/Call1.feature`). |
+| `NonConstantExpression` | `SyntaxError` | compile time | A position requiring a constant expression received a row-dependent or non-deterministic one (`SKIP n.count`, `LIMIT n.count`, `count(rand())`). |
+| `InvalidDelete` | `SyntaxError` | compile time | `DELETE` targets something that is not a deletable graph entity reference. |
+| `InvalidClauseComposition` | `SyntaxError` | compile time | Clauses are composed in an order Cypher forbids (e.g. a `RETURN` that is not the final clause, or an empty single query). |
+| `DifferentColumnsInUnion` | `SyntaxError` | compile time | The branches of a `UNION` return different column names. |
+| `InvalidLoadCsvUrl` | `SyntaxError` | compile time | A `LOAD CSV ... FROM <expr>` URL is a statically-typed non-string literal. Internal detail: `LOAD CSV` is a Neo4j extension with no TCK counterpart. |
+| `InvalidShortestPath` | `SyntaxError` | compile time | A `shortestPath(...)`/`allShortestPaths(...)` wraps a pattern that is not a single variable-length relationship between two node patterns. Internal detail: no TCK counterpart. |
+| `UnexpectedSyntax` | `SyntaxError` | compile time | A syntactically-formed construct appears where the grammar forbids it (e.g. a bare pattern predicate in a `RETURN`/`WITH` projection, on the right-hand side of `SET`, or as a function argument). |
+| `RelationshipUniquenessViolation` | `SyntaxError` | compile time | The same relationship variable is used more than once inside a single `MATCH` pattern (relationship isomorphism forbids traversing one relationship twice). |
+| `InvalidParameterUse` | `SyntaxError` | compile time | A parameter (`$p`) appears where the grammar forbids it (e.g. as the inline property predicate of a `MATCH`/`MERGE` node or relationship). |
 
-**Note on `UndefinedVariable`.** It is intuitively "semantic", but the openCypher TCK raises it as a
-**`SyntaxError`** at compile time (verbatim in e.g. `tck/features/clauses/return/Return1.feature`).
-Graphus follows the TCK, not intuition (`CLAUDE.md`: never guess; the TCK is inviolable). Both
-`SyntaxError` and `SemanticError` are compile-time types, so this type choice does not affect the
-phase split — the load-bearing invariant is unchanged.
+**Note on the `SyntaxError` classification.** Several of these details are intuitively "semantic"
+(e.g. `UndefinedVariable`, `NestedAggregation`), but the openCypher TCK raises them as a
+**`SyntaxError`** at compile time (verbatim in e.g. `tck/features/clauses/return/Return1.feature` and
+the aggregation feature files). Graphus follows the measured TCK, not intuition. Because `SyntaxError`,
+`ProcedureError`, and `ParameterMissing` are all **compile-time** types, this type choice does not
+affect the phase split — the load-bearing invariant is unchanged.
 
 ### 2.3 Runtime error classes (the executor's responsibility)
 

@@ -165,18 +165,25 @@ The "100% Cypher TCK" target is pinned to the **openCypher `2024.3`** tag (commi
 dated 2026-03-20), the latest release on the GQL-convergent 2024.x line. **`1.0.0-M23`** is the
 first-milestone snapshot.
 
-Scenario counts (measured by cloning each tag and parsing `tck/features/**/*.feature` on 2026-06-05):
+Scenario counts. The `D-cypher-line` comparison below was made on 2026-06-05 by cloning each tag and
+parsing its `features/**/*.feature`:
 
 | Snapshot | `.feature` files | `Scenario` + `Scenario Outline` blocks | Executable scenarios (outline examples expanded) |
 | --- | --- | --- | --- |
-| **2024.3 (target)** | 220 | 1615 (1339 + 276) | **3880** (1339 plain + 2541 example rows) |
+| **2024.3 (target)** | 220 | 1615 (1339 + 276) | 3880 (1339 plain + 2541 example rows) |
 | 1.0.0-M23 (milestone) | 220 | 1615 (1339 + 276) | 3880 |
 
 The two tags coincide in totals but differ in content (the scenarios were revised, not net-added,
 along this path), so the 2024.x language surface (label expressions, quantified path patterns,
 `SHORTEST`, element-pattern `WHERE`) is delivered behind feature flags while certifying the same
-scenario budget. "100% TCK compliant" = **all 3880 executable scenarios of the pinned tag pass**
-(correct result bag/order, correct side-effect counts, correct error type at the correct phase).
+scenario budget. The pinned 2024.3 corpus is **vendored** at `crates/graphus-tck/tck/features` (221
+feature files) and is the authoritative certification target: the `graphus-tck` runner executes and
+passes **all 3914 executable scenarios** (1356 plain + 2558 outline example rows), asserted by the
+`BASELINE` constant in `crates/graphus-tck/tests/tck.rs`. (The corpus grew by 34 scenarios — 17 plain
+and 17 outline example rows — between the 2026-06-05 estimate and the vendored snapshot the harness
+certifies.) "100% TCK compliant" = **all 3914 executable scenarios of the pinned, vendored corpus
+pass** (correct result bag/order, correct side-effect counts, correct error type at the correct
+phase).
 The verbatim result/failure shapes and the error-classification table were read and frozen by
 SPIKE #9 (`06-bolt-and-error-shapes.md` §2–§3; resolves open question 2 and `04-technical-design.md`
 §12 item 13).

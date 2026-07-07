@@ -854,9 +854,11 @@ property values; lists must be homogeneous when persisted) — enforced at write
 ### 7.3 Compile-time vs runtime error-phase split (TCK requirement)
 
 The TCK distinguishes errors that must be raised **at compile time** (e.g., `SyntaxError`,
-`SemanticError`, unknown function arity, type errors detectable statically, undefined variables) from
-those raised **at runtime** (e.g., division by zero on actual data, type coercion failures on actual
-values, constraint violations). Graphus enforces this by construction:
+`ProcedureError`, `ParameterMissing`, unknown function arity, type errors detectable statically,
+undefined variables) from those raised **at runtime** (e.g., division by zero on actual data, type
+coercion failures on actual values, constraint violations). (Over the pinned corpus every
+statically-detectable fault is a `SyntaxError` bar two `CALL` exceptions; the only `SemanticError` is a
+runtime one — the frozen classification lives in `06-bolt-and-error-shapes.md` §2.2.) Graphus enforces this by construction:
 
 - **Semantic analysis** is the *only* phase allowed to emit compile-time errors and it runs to
   completion **before any side effect**. A plan that compiles is guaranteed past all compile-time

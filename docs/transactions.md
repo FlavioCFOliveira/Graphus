@@ -23,7 +23,7 @@ MariaDB / SQL Server autocommit behaviour.
 | Interface | Autocommit statement |
 | --------- | -------------------- |
 | **Bolt** (TCP or UDS) | a `RUN` (+ `PULL`) sent while no explicit transaction is open |
-| **REST** | `POST /query` (a single statement) |
+| **REST** | a `POST /db/{db}/tx/commit` (statements run and commit in one round-trip) |
 
 ## Explicit transactions
 
@@ -34,7 +34,7 @@ you then run belongs to that transaction until you `COMMIT` (durably applies all
 | Interface | Open | Commit | Roll back |
 | --------- | ---- | ------ | --------- |
 | **Bolt** | `BEGIN` | `COMMIT` | `ROLLBACK` (or `RESET`) |
-| **REST** | `POST /tx` | `POST /tx/{id}/commit` | `DELETE /tx/{id}` |
+| **REST** | `POST /db/{db}/tx` | `POST /db/{db}/tx/{id}/commit` | `DELETE /db/{db}/tx/{id}` |
 
 Use an explicit transaction when you need several statements to succeed or fail together, or to
 read-modify-write under the strongest isolation (see below).

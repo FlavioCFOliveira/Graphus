@@ -577,13 +577,21 @@ complement and run on their own (`RUSTFLAGS=--cfg loom`).
 ## 14. Findings (engine gaps surfaced by the simulator)
 
 The simulator did its job and surfaced three real serializability/durability gaps (filed in `rmp`,
-pinned by tests so they cannot silently regress). Two (**#172** and **#220**) are now **FIXED** in the
-storage engine and their pins were flipped into regression **guards**; **#171** remains open:
+pinned by tests so they cannot silently regress). All three (**#171**, **#172** and **#220**) are now
+**FIXED** in the engine and their pins were flipped into regression **guards**:
 
-- **rmp #171 (OPEN) — phantom write-skew / lost-update.** Two transactions that each read a predicate
-  returning nothing and then insert a row matching the other's predicate **both commit**
-  (non-serializable). SSI lacks predicate/index-range SIREAD tracking. *Measured boundary:* a
-  write–write conflict on an **existing** node is correctly aborted; only phantoms slip.
+- **rmp #171 (FIXED) — phantom write-skew / lost-update.** Two transactions that each read a predicate
+  returning nothing and then insert a row matching the other's predicate previously **both committed**
+  (non-serializable), because per-record SIREAD markers only close an rw-antidependency when a writer
+  overwrites a record the reader already saw, never on a phantom insert. *Fix:* SSI now also maintains
+  **predicate SIREAD markers** — a reader registers the predicate footprint it depends on, and a
+  concurrent writer whose insert / relabel / `SET` makes a node newly match that predicate (its
+  predicate *write* footprint) forms the missing `reader --rw--> writer` edge, feeding the unchanged
+  Cahill dangerous-structure detector so exactly one transaction aborts. Relationship phantoms (read
+  "no `:T` edges", concurrent create of a `:T` edge) are covered by a predicate marker keyed by the
+  relationship-type token. Guarded by `phantom_insert_into_equality_predicate_still_aborts` and
+  `same_key_equality_scan_write_skew_still_aborts_one` in
+  `crates/graphus-cypher/tests/ssi_scan_filter_eq.rs`.
 - **rmp #172 (FIXED) — concurrent same-node write–write durability.** The conflict is detected (SSI
   aborts exactly one), and the surviving committed transaction's update now **persists** — the value
   reflects exactly one increment, never reverting to the pre-image. *Root cause:* the SSI loser's

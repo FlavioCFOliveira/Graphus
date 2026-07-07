@@ -43,10 +43,11 @@ labels/types and properties, in a multigraph by default — and you query it wit
 
 ```sh
 docker run -d --name graphus \
-  -p 7687:7687 \      # Bolt over TCP (Neo4j drivers)
-  -p 7474:7474 \      # Web REST API
+  -p 7687:7687 \
+  -p 7474:7474 \
   -v graphus-data:/data \
   flaviocfo/graphus:latest
+# Published ports: 7687 = Bolt over TCP (Neo4j drivers), 7474 = Web REST API
 
 # Liveness probe (unauthenticated; -k because the default cert is self-signed):
 curl -k https://localhost:7474/health/live      # -> live

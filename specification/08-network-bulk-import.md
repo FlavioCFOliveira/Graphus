@@ -170,8 +170,9 @@ of this document).
 
 Design:
 
-- A new route, e.g. `POST /admin/db/{db}/bulk-import`, added to `graphus-rest`'s router
-  (`crates/graphus-rest/src/router.rs`), distinct from the existing `/db/{db}/tx*` transactional
+- A new route, `POST /admin/db/{db}/bulk-import`, registered in the server's extra HTTP routes
+  (`crates/graphus-server/src/listeners/extra_routes/bulk_import.rs`) and merged onto the
+  `graphus-rest` transactional router, distinct from the existing `/db/{db}/tx*` transactional
   Cypher surface (§8.2 of `04-technical-design.md`) — this is an **operator/admin** endpoint, not
   a data-plane query endpoint, matching how `BACKUP`/`RESTORE`/`CREATE DATABASE` are
   administrative rather than query operations.
@@ -689,5 +690,5 @@ modes unless a criterion is explicitly scoped to one:
    session-lifecycle event is audited (§6).
 6. The byte-quota, disk-preflight, timeout, and (for Mode B) concurrent-session-cap guards (§8)
    are exercised and proven to fire by the relevant DST scenario in §10.
-7. The whole Cypher TCK (3880/3880 scenarios) and the full DST safety/liveness/swarm certification
+7. The whole Cypher TCK (3914/3914 scenarios) and the full DST safety/liveness/swarm certification
    remain green — this capability must not regress either inviolable requirement.

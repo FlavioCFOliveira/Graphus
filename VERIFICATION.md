@@ -58,9 +58,11 @@ RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 \
     cargo test -p graphus-bufpool --test loom_bufpool --release
 ```
 
-**Expected:** `test result: ok. 4 passed`
+**Expected:** `test result: ok. 7 passed`
 (`loom_two_threads_fetch_same_page_loads_once`, `loom_fetch_while_evict_other_page`,
-`loom_concurrent_pin_unpin_never_underflows`, `loom_wal_rule_before_every_write_back`).
+`loom_concurrent_pin_unpin_never_underflows`, `loom_wal_rule_before_every_write_back`,
+`loom_with_page_fetched_under_eviction_reads_correct_page`,
+`loom_two_evictors_through_stager_respect_one_region`, `loom_three_threads_flush_while_two_fetch`).
 
 **Bound:** `LOOM_MAX_PREEMPTIONS=3` caps the preemption-point search depth to keep CI time bounded;
 the models are small enough that the run still completes in well under a second. Raise or drop the
@@ -85,7 +87,7 @@ run under miri (and is the only crate with an actual `unsafe` block — the io_u
 Run each scoped command (all GREEN):
 
 ```sh
-cargo +nightly miri test -p graphus-core
+cargo +nightly miri test -p graphus-core --lib
 cargo +nightly miri test -p graphus-wal --lib
 cargo +nightly miri test -p graphus-bolt --lib
 cargo +nightly miri test -p graphus-index --lib
@@ -97,18 +99,25 @@ cargo +nightly miri test -p graphus-storage --lib -- \
 
 | Command | Result |
 | ------- | ------ |
-| `graphus-core` | `10 passed; 0 failed` |
-| `graphus-wal --lib` | `23 passed; 0 failed; 1 ignored` |
-| `graphus-bolt --lib` | `54 passed; 0 failed` |
-| `graphus-index --lib` | `42 passed; 0 failed; 1 ignored` |
-| `graphus-storage` (codecs) | `63 passed; 0 failed` |
+| `graphus-core --lib` | `66 passed; 0 failed` |
+| `graphus-wal --lib` | `49 passed; 0 failed; 7 ignored` |
+| `graphus-bolt --lib` | `91 passed; 0 failed; 6 ignored` |
+| `graphus-index --lib` | `0 failed` — B-tree/codec unit tests under miri; the heavy histogram-estimation and 1000-insert tests are miri-excluded (below), exact count re-measurement tracked (roadmap #610) |
+| `graphus-storage` (codecs) | `0 failed` — the record/value/property/label/heap/paging/token/id codec unit tests under miri, exact count re-measurement tracked (roadmap #610) |
+
+The `graphus-core`, `graphus-wal`, and `graphus-bolt` counts were re-measured for this release
+(`graphus-bolt`'s miri time dropped from impractical to ~17 s once its heavyweight `graphus-auth →
+rustls → aws-lc-sys` build dependency was feature-gated out and its complexity/native-stack tests were
+excluded — see below). The `graphus-index`/`graphus-storage` codec suites run under miri once the
+heavy non-codec tests below are excluded; finishing their trim and re-recording exact counts is a
+tracked follow-up.
 
 The `--lib` scope keeps the gate fast by running each crate's unit tests (the UB-relevant codec/logic
 surface) and skipping the **integration** test binaries that drive the full paging/recovery substrate
 — e.g. `graphus-wal/tests/aries_recovery.rs` and `graphus-index/tests/btree_props.rs` — which are
 correct under miri but take minutes (heavy page churn under the interpreter). Run those natively;
 under miri the same codecs they exercise are already covered by the `--lib` unit tests above.
-`graphus-core` has no integration tests, so it needs no `--lib`.
+`graphus-core` now has integration tests too, so it is scoped with `--lib` for the same reason.
 
 This covers the UB-relevant logic directly: the shared `Value`/version model (`graphus-core`); the
 WAL append/recovery/undo logic over the in-memory sink (`graphus-wal`); the **PackStream wire codec**,
@@ -120,22 +129,32 @@ message framing, handshake negotiation (`graphus-bolt`); the B+-tree node/key-co
 
 **Justified exclusions (minimal; never to hide UB):**
 
-- `graphus-wal::sink::tests::file_sink_round_trips_and_survives_reopen` — `#[cfg_attr(miri, ignore)]`:
-  uses real `open`/`remove_file`, which miri's filesystem **isolation** aborts. It exercises the
-  production `FileLogSink`; the WAL *logic* is validated over the in-memory `MemLogSink` (which runs
-  under miri).
-- `graphus-index::btree::tests::many_inserts_grow_the_tree_height` — `#[cfg_attr(miri, ignore)]`: 1000
-  inserts × page splits is impractically slow under the interpreter; the split/grow logic is covered
-  by the smaller tests (which run under miri) and the native `tests/btree_props.rs` proptest.
-- `graphus-bolt`'s `server::tests` module — `#[cfg(all(test, not(miri)))]`: these end-to-end session
-  tests call `Authenticator::set_password`, a deliberately CPU-expensive password KDF that takes
-  minutes under the interpreter. The wire codec they drive (framing/message/handshake/packstream) is
-  covered by those modules' own miri-green unit tests.
+- **`graphus-wal`** — several tests that do real filesystem I/O (the production `FileLogSink`'s
+  `open`/`remove_file`/`remove_dir_all`) are `#[cfg_attr(miri, ignore)]`: miri's filesystem
+  **isolation** aborts real syscalls. The WAL *logic* is validated over the in-memory `MemLogSink`
+  (which runs under miri). A multi-MiB retained-WAL recovery test is likewise excluded as too slow —
+  the same recovery logic runs under miri on tiny windows.
+- **`graphus-index`** — `btree::tests::many_inserts_grow_the_tree_height` (1000 inserts × page splits)
+  and the histogram equi-depth-**estimation** tests (~1000-row datasets) are `#[cfg_attr(miri, ignore)]`:
+  impractically slow under the interpreter, and they test numeric estimation, not codec UB. The B-tree
+  split/grow logic is covered by the smaller miri-run tests and the native `tests/btree_props.rs`
+  proptest; the histogram *byte codec* is covered by `codec_roundtrip_*` / `decode_rejects_*` (which
+  run under miri).
+- **`graphus-bolt`** — the `server::tests` module is `#[cfg(all(test, not(miri)))]` (its end-to-end
+  sessions call the deliberately CPU-expensive Argon2 password KDF). Six codec tests are additionally
+  `#[cfg_attr(miri, ignore)]`: a 200k-key map decode with a "linear not quadratic time" **timing**
+  assertion, a 70 KB string, a ~66 KB multi-chunk frame, a 2000-message compaction run, and two
+  max-depth (`nest ≈ 1000`) **native-stack**-safety tests — all too slow under miri and testing
+  timing / perf / native-stack behaviour, not byte-codec UB. The wire codec
+  (framing/message/handshake/packstream) is covered by those modules' small miri-run tests; the string
+  test was **split** so the small-marker cases still run under miri.
 - `graphus-storage` non-codec tests (`store::`, `check::`, `recovery::`, `backup::`, `wal_rule::`) are
   out of the miri command's scope by test-name filter: they drive the full store over the paging
   substrate (slow under miri) and exercise the same codecs the scoped tests already cover.
 
-The whole miri gate runs in ~3 minutes total. If `rustup component add miri` ever fails (offline CI),
+Runtime is dominated by the interpreter (miri is ~100–1000× slower than native) and is
+machine-dependent; the exclusions above keep the codec-only gate practical (`graphus-bolt` ≈ 17 s and
+`graphus-core` ≈ 90 s on the reference machine). If `rustup component add miri` ever fails (offline CI),
 the gate is nightly-gated: the commands above are the exact green invocations to run where nightly +
 miri are available.
 
@@ -151,7 +170,7 @@ cargo test -p graphus-storage --test proptest_codecs
 cargo test -p graphus-cypher --test proptest_keycodec
 ```
 
-**Expected:** `proptest_codecs` → `5 passed`; `proptest_keycodec` → `3 passed`.
+**Expected:** `proptest_codecs` → `9 passed`; `proptest_keycodec` → `3 passed`.
 
 Invariants:
 
@@ -257,8 +276,9 @@ See `crates/graphus-bench/RESULTS.md` for recorded numbers, methodology, and the
 ## 8. LDBC-SNB macro harness (AC: "LDBC SNB runs")
 
 A scaled, **inspired** Social-Network-Benchmark workload: generate a synthetic social graph
-(`Person`/`KNOWS`, `Forum`/`Post`/`Comment` with `HAS_CREATOR`/`REPLY_OF`/`CONTAINER_OF`) and run
-representative SNB-style read/write operations through the **real** engine pipeline, reporting
+(`Person`/`KNOWS`, `Forum`/`Post`/`Comment` with `HAS_CREATOR`/`REPLY_OF`/`CONTAINER_OF`, plus
+`Tag`/`Place`/`Organisation` dimensions) and run representative SNB-style read/write operations
+through the **real** engine pipeline, reporting
 throughput + latency percentiles. It is **not** the official LDBC driver — see
 `crates/graphus-bench/LDBC.md` for the provenance, the schema, the query→official-SNB mapping, and the
 deferred official queries (those needing Cypher the young engine does not yet support).
@@ -270,12 +290,16 @@ cargo test -p graphus-bench --lib ldbc                  # as a self-checking tes
 ```
 
 **Expected:** the harness runs to completion and prints a report ending in
-`N/N operations supported and measured`. At the tiny scale it builds a 174-node / 670-relationship
-graph and measures all 8 SNB-flavoured operations (point lookup, 1-hop and 2-hop expand, author
-expand, aggregate, filtered scan, degree, insert). Per-operation latencies are currently in the
-millisecond range because id-keyed `MATCH` is a full label scan (no property index yet — see
-`LDBC.md`); the numbers are stable run-to-run (deterministic generator) and this harness is the
-instrument that will show the speed-up once an index seek is wired into planning.
+`N/N operations supported and measured`. At the tiny scale it builds a **191-node / 898-relationship**
+graph (60 persons, 6 forums, 36 posts, 72 comments, 8 tags, 5 places, 4 orgs; 454 `KNOWS`), builds
+**3 property indexes** (`Person.id`, `Forum.id`, `Post.id`), and measures **all 34 SNB-flavoured
+operations** across the Interactive Short (`IS1`–`IS7`), Interactive Complex (`IC*`), Business
+Intelligence (`BI*`), degree, and insert/update families; the remaining official queries are deferred
+where they need Cypher the engine does not yet express (see `LDBC.md`). With the property indexes in
+place, id-keyed point lookups run in the low hundreds of microseconds (e.g. `IS1-profile` ≈ 250 µs
+p50) and the heaviest multi-hop / aggregation queries in the low single-digit milliseconds; the
+numbers are stable run-to-run (deterministic generator) and every operation is checked against the
+generator's ground-truth by `cargo test -p graphus-bench`.
 
 ---
 
