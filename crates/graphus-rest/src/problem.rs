@@ -34,7 +34,7 @@
 //! | --- | --- | --- | --- |
 //! | [`GraphusError::Compile`] | 400 | `Neo.ClientError.Statement.SyntaxError` | client query invalid (compile-time, `06 §2.1`) |
 //! | [`GraphusError::Runtime`] | 400 | `Neo.ClientError.Statement.ArgumentError` | client-caused runtime fault (`06 §2.3`) |
-//! | [`GraphusError::Transaction`] | 409 | `Neo.TransientError.Transaction.Terminated` | retriable serialization/abort (`04 §5.4`) |
+//! | [`GraphusError::Transaction`] | 409 | `Neo.TransientError.Transaction.Outdated` | retriable serialization/abort (`04 §5.4`; `Terminated` is a driver poison title) |
 //! | [`GraphusError::Storage`] | 500 | `Neo.DatabaseError.General.UnknownError` | server-side fault |
 //! | [`GraphusError::Protocol`] | 400 | `Neo.ClientError.Request.Invalid` | malformed request/protocol misuse |
 //! | [`GraphusError::Security`] | 403 | `Neo.ClientError.Security.Forbidden` | the principal lacks the required privilege (`04 §8.4`) |
@@ -140,7 +140,7 @@ impl Problem {
                 StatusCode::CONFLICT,
                 "transaction",
                 "transaction error",
-                CODE_TXN_TERMINATED,
+                CODE_TXN_CONFLICT_RETRYABLE,
                 false,
             ),
             GraphusError::Storage(_) => (
@@ -248,7 +248,7 @@ impl Problem {
             "too many open transactions",
             detail,
         )
-        .with_code(CODE_TXN_TERMINATED)
+        .with_code(CODE_TXN_CONFLICT_RETRYABLE)
     }
 
     /// A **401 Unauthorized** for a failed `POST /auth/login` (rmp #499): a wrong password **or** an
@@ -331,7 +331,12 @@ impl Problem {
 // Best-effort engine codes (shared classification with the Bolt `FAILURE`; `06 §2.4` deferral).
 const CODE_COMPILE_SYNTAX: &str = "Neo.ClientError.Statement.SyntaxError";
 const CODE_RUNTIME_ARGUMENT: &str = "Neo.ClientError.Statement.ArgumentError";
-const CODE_TXN_TERMINATED: &str = "Neo.TransientError.Transaction.Terminated";
+/// The retriable serialization-conflict code (kept byte-identical to `graphus_bolt`'s
+/// `CODE_TXN_CONFLICT_RETRYABLE` for cross-wire parity). The title MUST NOT be `Terminated` /
+/// `LockClientStopped`: those are Neo4j-driver **poison titles** that the driver `ERROR_REWRITE_MAP`
+/// downgrades from TransientError to a non-retriable ClientError, breaking managed-transaction retry.
+/// `Outdated` = optimistic-concurrency abort, retriable, not rewritten. (rmp #612.)
+const CODE_TXN_CONFLICT_RETRYABLE: &str = "Neo.TransientError.Transaction.Outdated";
 const CODE_TXN_NOT_FOUND: &str = "Neo.ClientError.Transaction.TransactionNotFound";
 const CODE_DB_UNKNOWN: &str = "Neo.DatabaseError.General.UnknownError";
 const CODE_REQUEST_INVALID: &str = "Neo.ClientError.Request.Invalid";
@@ -381,7 +386,15 @@ mod tests {
             "serialization failure".to_owned(),
         ));
         assert_eq!(p.status, 409);
-        assert!(p.code.as_deref().unwrap().contains("TransientError"));
+        let code = p.code.as_deref().unwrap();
+        assert!(code.contains("TransientError"));
+        // Regression guard (rmp #612): keep the title off the Neo4j-driver poison list, so managed
+        // retry works on the Bolt wire that shares this classification.
+        assert!(!code.ends_with(".Terminated"), "poison title: {code}");
+        assert!(
+            !code.ends_with(".LockClientStopped"),
+            "poison title: {code}"
+        );
     }
 
     #[test]

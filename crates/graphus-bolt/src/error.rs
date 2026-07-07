@@ -106,7 +106,7 @@ impl Failure {
 /// | --- | --- | --- |
 /// | [`GraphusError::Compile`] | `Neo.ClientError.Statement.SyntaxError` | client's query is invalid (compile-time, `06 §2.1`) |
 /// | [`GraphusError::Runtime`] | `Neo.ClientError.Statement.ArgumentError` | client-caused runtime fault (type/arith/entity, `06 §2.3`) |
-/// | [`GraphusError::Transaction`] | `Neo.TransientError.Transaction.Terminated` | retriable serialization/abort (`04 §5.4` safe-retry) |
+/// | [`GraphusError::Transaction`] | `Neo.TransientError.Transaction.Outdated` | retriable serialization/abort (`04 §5.4` safe-retry; `Terminated` is a driver poison title — see [`CODE_TXN_CONFLICT_RETRYABLE`]) |
 /// | [`GraphusError::Storage`] | `Neo.DatabaseError.General.UnknownError` | server-side fault, not the client's |
 /// | [`GraphusError::Protocol`] | `Neo.ClientError.Request.Invalid` | malformed request/protocol misuse |
 /// | [`GraphusError::Security`] | `Neo.ClientError.Security.Forbidden` | the principal lacks the required privilege (`04 §8.4`) |
@@ -136,7 +136,7 @@ pub fn failure_from_error(error: &GraphusError) -> Failure {
     let code = match error {
         GraphusError::Compile(_) => CODE_COMPILE_SYNTAX,
         GraphusError::Runtime(_) => CODE_RUNTIME_ARGUMENT,
-        GraphusError::Transaction(_) => CODE_TXN_TERMINATED,
+        GraphusError::Transaction(_) => CODE_TXN_CONFLICT_RETRYABLE,
         GraphusError::Storage(_) => CODE_DB_UNKNOWN,
         GraphusError::Protocol(_) => CODE_REQUEST_INVALID,
         GraphusError::Security(_) => CODE_FORBIDDEN,
@@ -150,7 +150,18 @@ pub fn failure_from_error(error: &GraphusError) -> Failure {
 // Best-effort status codes (`06 §2.4` deferral; replace verbatim when the certified mapping lands).
 const CODE_COMPILE_SYNTAX: &str = "Neo.ClientError.Statement.SyntaxError";
 const CODE_RUNTIME_ARGUMENT: &str = "Neo.ClientError.Statement.ArgumentError";
-const CODE_TXN_TERMINATED: &str = "Neo.TransientError.Transaction.Terminated";
+/// The retriable serialization-conflict code for an aborted transaction ([`GraphusError::Transaction`]:
+/// SSI dangerous-structure abort / write-write conflict, `04 §5.4` safe-retry).
+///
+/// The title MUST NOT be `Terminated` (nor `LockClientStopped`): those are **driver poison titles**.
+/// Every official Neo4j driver keeps a fixed `ERROR_REWRITE_MAP` that rewrites
+/// `Neo.TransientError.Transaction.Terminated` → `Neo.ClientError.Transaction.Terminated`
+/// (transient → **non-retriable** client error), regardless of the classification the server sent,
+/// which silently breaks managed-transaction retry (`session.execute_write`) for serialization
+/// conflicts. `Outdated` ("transaction state invalidated by concurrent updates; retry may succeed")
+/// is the semantically-accurate title for an optimistic SSI abort and is NOT rewritten, so drivers
+/// correctly see `is_retryable() == true`. (rmp #612; found via the pi516 real-driver stability run.)
+const CODE_TXN_CONFLICT_RETRYABLE: &str = "Neo.TransientError.Transaction.Outdated";
 const CODE_DB_UNKNOWN: &str = "Neo.DatabaseError.General.UnknownError";
 const CODE_REQUEST_INVALID: &str = "Neo.ClientError.Request.Invalid";
 /// The constraint-validation class (`rmp` task #99): a unique/existence-constraint breach. This is
@@ -218,8 +229,23 @@ mod tests {
         let f = failure_from_error(&GraphusError::Transaction(
             "serialization failure".to_owned(),
         ));
-        assert_eq!(f.code, CODE_TXN_TERMINATED);
+        assert_eq!(f.code, CODE_TXN_CONFLICT_RETRYABLE);
+        // Retriable classification is what the driver acts on.
         assert!(f.code.contains("TransientError"));
+        // Regression guard (rmp #612): the title MUST NOT be a driver "poison title". Every official
+        // Neo4j driver's ERROR_REWRITE_MAP rewrites `.Terminated` / `.LockClientStopped` from
+        // TransientError to a NON-retriable ClientError, which breaks `execute_write` managed retry
+        // for serialization conflicts even though we emit the transient classification.
+        assert!(
+            !f.code.ends_with(".Terminated"),
+            "poison title breaks driver retry: {}",
+            f.code
+        );
+        assert!(
+            !f.code.ends_with(".LockClientStopped"),
+            "poison title breaks driver retry: {}",
+            f.code
+        );
     }
 
     #[test]

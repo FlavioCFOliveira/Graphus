@@ -743,8 +743,9 @@ async fn auto_commit_single_write_commit_conflict_returns_409() {
     let problem = body_json(resp).await;
     assert_eq!(problem["status"], 409);
     assert_eq!(
-        problem["code"], "Neo.TransientError.Transaction.Terminated",
-        "the transaction-error code marks the failure retriable"
+        problem["code"], "Neo.TransientError.Transaction.Outdated",
+        "the transaction-error code marks the failure retriable (NOT the .Terminated poison title \
+         Neo4j drivers rewrite to non-retriable; rmp #612)"
     );
 
     // SEAM TRACE: the WRITE took the buffered explicit path (begin → run → commit), NOT the read-only
