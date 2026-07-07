@@ -48,7 +48,7 @@ jobs:
   build:
     # Cross-compile on a native x86_64 self-hosted runner for trusted events; PRs stay on a
     # GitHub-hosted runner so untrusted fork code never runs on the self-hosted machines.
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || fromJSON('["self-hosted", "Linux", "X64"]') }}
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || fromJSON('["self-hosted", "Linux", "X64", "wg1"]') }}
     permissions:
       contents: read
       packages: write

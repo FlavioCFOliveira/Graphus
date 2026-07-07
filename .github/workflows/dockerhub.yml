@@ -41,8 +41,8 @@ env:
 jobs:
   publish:
     name: Build and publish to Docker Hub
-    # Cross-compile on the native x86_64 self-hosted runner (both triggers are trusted — no fork PRs).
-    runs-on: [self-hosted, Linux, X64]
+    # Cross-compile on the `wg1` native x86_64 self-hosted runner (both triggers are trusted — no fork PRs).
+    runs-on: [self-hosted, Linux, X64, wg1]
     steps:
       # A dispatch must name a concrete semver version up front, so Docker Hub can never receive a
       # non-conformant (sha/branch) tag via the manual path.
