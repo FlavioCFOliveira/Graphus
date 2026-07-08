@@ -25,6 +25,9 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::OnceLock;
+
+use tokio::sync::Mutex;
 
 use graphus_server::config::{
     AdmissionConfig, AuthBootstrap, ServerConfig, TimingConfig, TlsConfig,
@@ -64,8 +67,15 @@ impl Drop for TempDir {
 
 /// Builds a Bolt-TCP+TLS server config bound to an ephemeral loopback port, with `USER`/`PASSWORD`
 /// as the admin (so the driver can both authenticate and run write queries — CREATE needs write,
-/// which the admin holds).
-fn config_for(dir: &TempDir, cert_path: PathBuf, key_path: PathBuf) -> ServerConfig {
+/// which the admin holds). `bolt_server_agent` selects the `HELLO` `SUCCESS` `server` string the
+/// listener announces (`None` = the honest `Graphus/<ver>` default; `Some("neo4j-compat")` = the
+/// vetted `Neo4j/5.13.0` legacy-driver compat mode — rmp #614).
+fn config_for(
+    dir: &TempDir,
+    cert_path: PathBuf,
+    key_path: PathBuf,
+    bolt_server_agent: Option<String>,
+) -> ServerConfig {
     ServerConfig {
         store_path: dir.path.join("store"),
         default_database: "graphus".to_owned(),
@@ -73,7 +83,7 @@ fn config_for(dir: &TempDir, cert_path: PathBuf, key_path: PathBuf) -> ServerCon
         // Ephemeral port; the OS picks it and we read it back from the handle.
         bolt_tcp_addr: Some("127.0.0.1:0".to_owned()),
         advertised_bolt_address: None,
-        bolt_server_agent: None,
+        bolt_server_agent,
         // No REST/UDS: this test only needs the TLS Bolt-TCP path the driver speaks.
         rest_addr: None,
         uds_path: None,
@@ -352,6 +362,58 @@ async function scalar(driver, query, key, params) {
 })();
 "#;
 
+/// A Node.js script that reads back the `server` agent string Graphus announced in `HELLO` `SUCCESS`
+/// and asserts it equals the expected value passed as argv (rmp #614 — the Neo4j-compat `server`
+/// agent). It verifies BOTH driver-side surfaces the official driver exposes for that field, which
+/// must agree byte-for-byte with each other and with the expected string:
+///
+/// - `driver.getServerInfo({ database }).agent` — reads the HELLO `server` field without a query;
+/// - `result.summary.server.agent` — the same field surfaced on a query's `ResultSummary`.
+///
+/// It prints `GRAPHUS_AGENT_OK:<agent>` and exits 0 only when both surfaces equal the expected
+/// string; otherwise it exits non-zero with a clear message. Connection params and the expected
+/// agent arrive via argv.
+const AGENT_PROBE_SCRIPT: &str = r#"
+'use strict';
+const neo4j = require('neo4j-driver');
+
+const [, , port, user, password, expectedAgent] = process.argv;
+const uri = `bolt+ssc://127.0.0.1:${port}`;
+
+function fail(msg) {
+  console.error('AGENT PROBE FAILURE: ' + msg);
+  process.exit(1);
+}
+
+(async () => {
+  const driver = neo4j.driver(uri, neo4j.auth.basic(user, password));
+  try {
+    // Surface A — getServerInfo(): drives HELLO/LOGON and hands back ServerInfo without a query.
+    const info = await driver.getServerInfo({ database: 'graphus' });
+    if (info.agent !== expectedAgent)
+      fail(`getServerInfo().agent = ${JSON.stringify(info.agent)}, expected ${JSON.stringify(expectedAgent)}`);
+
+    // Surface B — result.summary.server.agent: the same HELLO `server` field on a query summary.
+    const session = driver.session();
+    try {
+      const res = await session.run('RETURN 1 AS n');
+      const agent = res.summary.server.agent;
+      if (agent !== expectedAgent)
+        fail(`result.summary.server.agent = ${JSON.stringify(agent)}, expected ${JSON.stringify(expectedAgent)}`);
+    } finally {
+      await session.close();
+    }
+
+    console.log('GRAPHUS_AGENT_OK:' + expectedAgent);
+    process.exit(0);
+  } catch (err) {
+    fail((err && err.stack) ? err.stack : String(err));
+  } finally {
+    await driver.close();
+  }
+})();
+"#;
+
 /// `package.json` pinning the official driver (v6.x — current major) for a reproducible install.
 const PACKAGE_JSON: &str = r#"{
   "name": "graphus-neo4j-interop",
@@ -376,68 +438,20 @@ async fn official_neo4j_driver_interoperates_over_bolt_tls() {
     std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
 
     // Boot the real server and read back the OS-assigned ephemeral Bolt-TCP port.
-    let config = config_for(&dir, cert_path, key_path);
+    let config = config_for(&dir, cert_path, key_path, None);
     let server = boot(config).await;
     let bolt: SocketAddr = server.bolt_tcp_addr.expect("Bolt-TCP listener enabled");
-    let port = bolt.port();
 
-    // Materialise the Node project in the tempdir.
-    let project = dir.path.join("node");
-    std::fs::create_dir_all(&project).unwrap();
-    std::fs::write(project.join("package.json"), PACKAGE_JSON).unwrap();
-    std::fs::write(project.join("interop.js"), DRIVER_SCRIPT).unwrap();
-
-    // Install the official driver. `npm install` (not `ci`) so it works with or without a lockfile,
-    // honouring any local cache. Run on a blocking thread so we don't stall the Tokio runtime.
-    let install = {
-        let project = project.clone();
-        tokio::task::spawn_blocking(move || {
-            Command::new("npm")
-                .arg("install")
-                .arg("--no-audit")
-                .arg("--no-fund")
-                .arg("--loglevel=error")
-                .current_dir(&project)
-                .output()
-        })
-        .await
-        .expect("npm install task")
-        .expect("spawn npm install (is `npm` on PATH?)")
-    };
-    assert!(
-        install.status.success(),
-        "npm install failed:\n--- stdout ---\n{}\n--- stderr ---\n{}",
-        String::from_utf8_lossy(&install.stdout),
-        String::from_utf8_lossy(&install.stderr),
-    );
-
-    // Run the driver script against the live server.
-    let run = {
-        let project = project.clone();
-        let port = port.to_string();
-        tokio::task::spawn_blocking(move || {
-            Command::new("node")
-                .arg("interop.js")
-                .arg(&port)
-                .arg(USER)
-                .arg(PASSWORD)
-                .current_dir(&project)
-                .output()
-        })
-        .await
-        .expect("node task")
-        .expect("spawn node (is `node` on PATH?)")
-    };
-
-    let stdout = String::from_utf8_lossy(&run.stdout);
-    let stderr = String::from_utf8_lossy(&run.stderr);
+    // Install the official driver and run the round-trip script against the live server (the shared
+    // helper serialises the `npm install` phase so concurrent interop tests don't race the npm cache).
+    let (stdout, stderr, ok) =
+        install_and_run_driver(dir.path.join("node"), DRIVER_SCRIPT, bolt.port()).await;
 
     // Surface the full driver output on failure so a real Bolt-compliance regression is debuggable.
     assert!(
-        run.status.success(),
-        "the official Neo4j driver did NOT round-trip against Graphus (exit {:?}).\n\
+        ok,
+        "the official Neo4j driver did NOT round-trip against Graphus.\n\
          --- node stdout ---\n{stdout}\n--- node stderr ---\n{stderr}",
-        run.status.code(),
     );
     assert!(
         stdout.contains("GRAPHUS_INTEROP_OK"),
@@ -448,19 +462,33 @@ async fn official_neo4j_driver_interoperates_over_bolt_tls() {
     server.shutdown().await.expect("clean shutdown");
 }
 
+/// Serialises the `npm install` phase across the concurrent real-driver interop tests. Cargo runs
+/// `#[test]` functions in parallel by default, and several `npm install` invocations racing on the
+/// shared global npm cache (`~/.npm/_cacache`) can intermittently fail one another — a known npm
+/// concurrency hazard, first observed here once the suite grew to four installs. Holding this lock
+/// only around the install (never the server boot or the `node` round-trip) removes that race while
+/// keeping the actual driver exchanges parallel and the download cache warm.
+fn npm_install_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 /// Materialises a Node project (`package.json` + the given script as `interop.js`) in `project`,
-/// installs the official driver, runs the script against `port`, and returns `(stdout, stderr,
-/// success)`. Shared by both interop tests so the npm/node plumbing lives in one place.
-async fn install_and_run_driver(
+/// installs the official driver, runs the script with the given positional `argv` (the arguments
+/// after the script path), and returns `(stdout, stderr, success)`. Shared by every interop test so
+/// the npm/node plumbing lives in one place.
+async fn install_and_run_driver_argv(
     project: PathBuf,
     script: &str,
-    port: u16,
+    argv: Vec<String>,
 ) -> (String, String, bool) {
     std::fs::create_dir_all(&project).unwrap();
     std::fs::write(project.join("package.json"), PACKAGE_JSON).unwrap();
     std::fs::write(project.join("interop.js"), script).unwrap();
 
     let install = {
+        // Serialise ONLY the install so concurrent tests do not race the shared npm cache.
+        let _serialise = npm_install_lock().lock().await;
         let project = project.clone();
         tokio::task::spawn_blocking(move || {
             Command::new("npm")
@@ -484,13 +512,10 @@ async fn install_and_run_driver(
 
     let run = {
         let project = project.clone();
-        let port = port.to_string();
         tokio::task::spawn_blocking(move || {
             Command::new("node")
                 .arg("interop.js")
-                .arg(&port)
-                .arg(USER)
-                .arg(PASSWORD)
+                .args(&argv)
                 .current_dir(&project)
                 .output()
         })
@@ -504,6 +529,20 @@ async fn install_and_run_driver(
         String::from_utf8_lossy(&run.stderr).into_owned(),
         run.status.success(),
     )
+}
+
+/// Convenience wrapper for scripts that take the standard `(port, user, password)` argv.
+async fn install_and_run_driver(
+    project: PathBuf,
+    script: &str,
+    port: u16,
+) -> (String, String, bool) {
+    install_and_run_driver_argv(
+        project,
+        script,
+        vec![port.to_string(), USER.to_owned(), PASSWORD.to_owned()],
+    )
+    .await
 }
 
 /// Full CRUD lifecycle over the OFFICIAL Neo4j driver at a realistic volume (≥100 nodes, ≥200 edges).
@@ -530,7 +569,7 @@ async fn official_neo4j_driver_full_crud_nodes_and_edges() {
     std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
 
     // Boot the real server and read back the OS-assigned ephemeral Bolt-TCP port.
-    let config = config_for(&dir, cert_path, key_path);
+    let config = config_for(&dir, cert_path, key_path, None);
     let server = boot(config).await;
     let bolt: SocketAddr = server.bolt_tcp_addr.expect("Bolt-TCP listener enabled");
 
@@ -550,4 +589,90 @@ async fn official_neo4j_driver_full_crud_nodes_and_edges() {
     );
 
     server.shutdown().await.expect("clean shutdown");
+}
+
+/// Boots a real Graphus server (Bolt-TCP+TLS) with the given `bolt_server_agent`, then uses the
+/// OFFICIAL Neo4j driver to read the `HELLO` `SUCCESS` `server` agent back over the real wire and
+/// assert it equals `expected_agent`. This is the real-ecosystem proof that the `bolt_server_agent`
+/// startup option actually controls what a genuine Neo4j driver observes (rmp #614) — the unit tests
+/// prove the value reaches Graphus's own encoder, but only the reference driver can prove it is what
+/// the ecosystem reads back. `project_subdir` isolates each test's Node project inside the tempdir.
+async fn assert_official_driver_sees_agent(
+    bolt_server_agent: Option<String>,
+    expected_agent: &str,
+    project_subdir: &str,
+) {
+    let dir = TempDir::new();
+
+    // Self-signed cert/key for the TLS listener (`bolt+ssc://` trusts it).
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let cert_path = dir.path.join("cert.pem");
+    let key_path = dir.path.join("key.pem");
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
+
+    // Boot with the requested agent and read back the OS-assigned ephemeral Bolt-TCP port.
+    let config = config_for(&dir, cert_path, key_path, bolt_server_agent);
+    let server = boot(config).await;
+    let bolt: SocketAddr = server.bolt_tcp_addr.expect("Bolt-TCP listener enabled");
+
+    // Drive the agent probe: expected agent is argv[4], read back via both driver-side surfaces.
+    let (stdout, stderr, ok) = install_and_run_driver_argv(
+        dir.path.join(project_subdir),
+        AGENT_PROBE_SCRIPT,
+        vec![
+            bolt.port().to_string(),
+            USER.to_owned(),
+            PASSWORD.to_owned(),
+            expected_agent.to_owned(),
+        ],
+    )
+    .await;
+
+    assert!(
+        ok,
+        "the official Neo4j driver did NOT read back the server agent {expected_agent:?}.\n\
+         --- node stdout ---\n{stdout}\n--- node stderr ---\n{stderr}",
+    );
+    assert!(
+        stdout.contains(&format!("GRAPHUS_AGENT_OK:{expected_agent}")),
+        "driver exited 0 but the agent success marker for {expected_agent:?} was missing.\n\
+         --- node stdout ---\n{stdout}\n--- node stderr ---\n{stderr}",
+    );
+
+    server.shutdown().await.expect("clean shutdown");
+}
+
+/// The opt-in Neo4j-compat mode, proven end-to-end against the OFFICIAL driver (rmp #614).
+///
+/// Booting with the `neo4j-compat` shortcut must make a genuine Neo4j driver observe the vetted
+/// `Neo4j/5.13.0` product string over the real Bolt+TLS wire — the entire purpose of the mode (so a
+/// strict/legacy driver that parses and case-sensitively checks the `server` product accepts it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn official_driver_reads_neo4j_compat_server_agent() {
+    assert_official_driver_sees_agent(
+        Some("neo4j-compat".to_owned()),
+        graphus_bolt::server::NEO4J_COMPAT_SERVER_AGENT,
+        "node-agent-compat",
+    )
+    .await;
+    // Guard the exact wire literal the strict/legacy driver regex expects (`Neo4j/<major>.<minor>…`).
+    assert_eq!(
+        graphus_bolt::server::NEO4J_COMPAT_SERVER_AGENT,
+        "Neo4j/5.13.0"
+    );
+}
+
+/// Control for [`official_driver_reads_neo4j_compat_server_agent`]: with no override (`None`), the
+/// honest `Graphus/<ver>` default must reach the wire verbatim. This proves it is the *option* the
+/// driver observes — not a hard-wired constant — so the compat result above is a real behavioural
+/// switch and the default remains truthful about the product for every modern driver (rmp #614).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn official_driver_reads_default_graphus_server_agent() {
+    assert_official_driver_sees_agent(
+        None,
+        graphus_bolt::server::DEFAULT_SERVER_AGENT,
+        "node-agent-default",
+    )
+    .await;
 }
