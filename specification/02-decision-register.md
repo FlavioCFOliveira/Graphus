@@ -68,6 +68,24 @@ scope and are propagated into `00-overview.md` and `01-needs-survey.md`:
 > and tracked as `FR-IX-7` (still `[ADV]`); it adds a capability without altering the four-kind core
 > set that option (a) ratifies.
 
+> **Post-ratification note (2026-07-08) — `D-named-index-autoname` (named node-property indexes).**
+> This note records a **design decision**, not a scope change: node-property indexes and their Cypher
+> DDL (`CREATE`/`DROP INDEX`, `SHOW INDEXES`) were always part of the v1 core set (`FR-IX-15`,
+> ratified) and of `D-v1-index-types` option (a). Named node-property indexes (rmp #623–#626) make
+> that DDL **Neo4j-conformant**: an index carries a name (`CREATE INDEX [<name>] [IF NOT EXISTS]
+> FOR (n:Label) ON (n.property)`, `DROP INDEX <name> [IF EXISTS]`), `SHOW INDEXES` returns the Neo4j
+> driver columns, and `IF NOT EXISTS`/`IF EXISTS` are idempotent no-ops.
+> **`D-named-index-autoname`** captures the specific design choice for how the anonymous and legacy
+> `CREATE INDEX ON :Label(property)` forms are named: a **deterministic, stable** auto-name of the
+> form `index_<label>_<property>` (a pure function of the label and property tokens), disambiguated by
+> a deterministic token suffix and, if needed, a counter, until the name is free in every schema
+> catalog; the resolved name is then persisted durably, so it is computed at most once and stays
+> stable across restarts. Names are globally unique across the schema's index and constraint catalogs,
+> and the name catalog is durable (an append-only block in the storage `Statistics` image, crash-atomic
+> with the index catalog; pre-existing anonymous indexes are backfilled with an auto-name on open). No
+> ratified outcome changes; this is the completion of an already-ratified core requirement. Specified in
+> `04-technical-design.md` §6.8 and recorded as a `Decision` node in the KG.
+
 > **Post-ratification note (2026-06-15) — sprint-19 performance/architecture deferrals.**
 > Two performance/architecture findings were evaluated during the sprint-19
 > production-readiness closure and **deferred** (accepted-as-is for the single-node

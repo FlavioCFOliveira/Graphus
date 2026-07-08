@@ -791,6 +791,107 @@ namespaced procedure name accepts a **keyword-spelled** segment (a reserved word
 identifier), mirroring how labels and property keys already accept keyword spellings. The original
 source spelling of a keyword-spelled segment is preserved.
 
+### 6.8 Named node-property indexes and index DDL (rmp #623–#626)
+
+Every node-property index (the range/B-tree and composite kinds of §6.2, declared over a node label
+and a property) carries a **name**, and the four Cypher index-DDL statements of `FR-IX-15` are
+Neo4j-conformant. This completes the v1 DDL surface for the core index set; it adds neither a new
+index kind nor a change to the four-kind baseline of §6.
+
+**DDL statements.** The node-property index-DDL surface is Neo4j-compatible: keywords are
+case-insensitive and a name is an identifier or a backtick-quoted string.
+
+```
+CREATE INDEX [<name>] [IF NOT EXISTS] FOR (<var>:<Label>) ON (<var>.<property>)
+CREATE INDEX ON :<Label>(<property>)                       -- legacy anonymous form
+DROP   INDEX <name> [IF EXISTS]                             -- by name
+DROP   INDEX FOR (<var>:<Label>) ON (<var>.<property>)      -- by target
+DROP   INDEX ON :<Label>(<property>)                        -- legacy by-target form
+SHOW   INDEXES
+```
+
+- **`CREATE INDEX`** declares an index over `(Label, property)`. The `<name>` is optional. When it is
+  present, it is the index's server-unique name; when it is omitted — including the legacy
+  `CREATE INDEX ON :Label(property)` form — the engine assigns a deterministic auto-name (below). A
+  create starts a **non-blocking** background build: the catalog entry is committed in the
+  `Populating` state and promoted to `Online` when the build completes, the same online-build
+  lifecycle as the full-text index of §6.7 (rmp #91).
+- **`DROP INDEX`** removes an index either **by name** (`DROP INDEX <name>`) or **by target**
+  (`DROP INDEX FOR (n:Label) ON (n.property)`, or the legacy `DROP INDEX ON :Label(property)`),
+  cancelling any in-progress build. The drop is durable: it removes both the catalog entry and the
+  in-memory index.
+- **`SHOW INDEXES`** lists every declared node-property index with the Neo4j driver columns
+  (below). It is a read (query type `r`), not a schema change.
+
+**Naming and the auto-name (`D-named-index-autoname`).** When a `CREATE INDEX` omits the name, the
+engine derives a deterministic, stable auto-name of the form `index_<label>_<property>`, with each
+part reduced to the identifier character set `[A-Za-z0-9_]` (every other character becomes `_`). The
+base name is a **pure function** of the label and property, so the same `(label, property)` always
+yields the same base name across restarts and rebuilds. Because the base can collide — two distinct
+`(label, property)` pairs can reduce to the same string, or the base can equal an explicitly declared
+name — the engine resolves a collision **deterministically**: it appends the token suffix
+`_<label_token>_<property_token>` and, if that candidate is still in use, increments a deterministic
+counter (`_2`, `_3`, …) until the name is free in **every** catalog. The resolved name is then
+persisted durably, so the resolution is computed at most once and remains stable thereafter. This
+auto-naming design is registered as decision **`D-named-index-autoname`** (`02-decision-register.md`).
+
+**Global name uniqueness.** Index and constraint names are **globally unique across the whole
+schema**. A `CREATE` that requests a name already used by a *different* catalog is rejected, while
+each catalog keeps its own re-declare (replace) semantics. The uniqueness check spans every index and
+constraint name catalog: the node-property index catalog, the full-text index catalog (§6.7), and the
+constraint catalog (§6.5).
+
+> **Flag — spatial (point) index name catalog.** The implementation also maintains a spatial (point)
+> index name catalog that participates in the same global name-uniqueness rule. The specification does
+> not yet document a point/spatial index (`FR-IX-8` in `01-needs-survey.md` remains `[ADV]` and
+> deferred), so this document intentionally does not specify it. This specification-versus-code gap
+> predates the named-index work and is surfaced for a separate decision; it does not affect the
+> node-property index behavior specified here.
+
+**Idempotent `IF NOT EXISTS` / `IF EXISTS`.** The idempotency modifiers follow Neo4j's
+"changed nothing" contract:
+
+- **`CREATE INDEX … IF NOT EXISTS`** — if an equivalent index (same label and property) already
+  exists, or the requested name is already in use, the statement is a **no-op success**. Without the
+  modifier, the same situation is an **error** (an equivalent index already exists, or the requested
+  name is already in use).
+- **`DROP INDEX <name> IF EXISTS`** — dropping a missing named index is a **no-op success**. Without
+  the modifier, dropping a missing named index is an **error**.
+- **`DROP INDEX` by target** (`FOR (n:Label) ON (n.property)` or the legacy form) — dropping a missing
+  index by target is an **idempotent no-op success** and needs no modifier.
+
+A no-op reports the Neo4j "changed nothing" summary: query type `s`, **no** side-effect counters, and
+`containsUpdates() == false` (in particular a `0` `indexes-added` / `indexes-removed` count). A create
+or drop that does change the schema reports `indexes-added: 1` or `indexes-removed: 1` with
+`contains-updates: true` (`06-bolt-and-error-shapes.md` §3.1).
+
+**SHOW INDEXES columns.** `SHOW INDEXES` returns the Neo4j driver column shape, one row per
+node-property index:
+
+| Column | Value |
+| --- | --- |
+| `name` | the index name |
+| `type` | `RANGE` (the node-property index kind) |
+| `entityType` | `NODE` |
+| `labelsOrTypes` | a single-element list `[<Label>]` |
+| `properties` | a single-element list `[<property>]` |
+| `state` | `online` or `populating` (lower-case, for coherence with the full-text `SHOW … INDEXES` surface of §6.7) |
+
+**Durability and backward compatibility.** The name → `(label_token, property_token)` mapping is a
+**durable, append-only name catalog** appended last in the `graphus-storage` `Statistics`/meta image,
+mirroring the node-property index catalog it names (§6.7 describes the same append-last pattern for the
+full-text catalog). It is **crash-atomic** with the index catalog: both are checkpointed together
+through the metadata checkpoint, so a name and its index never diverge across a crash. A pre-#623
+image — in which every declared index is nameless — decodes to an **empty** name catalog by
+end-of-input detection; on open, the coordinator **backfills a deterministic auto-name** for each such
+legacy index and persists it, so after one open every index is named end-to-end (droppable by name,
+listed with a name in `SHOW INDEXES`) and the names are stable thereafter. The store enforces a
+**one-name-per-target** invariant at the write path (a target holds at most one name), because a
+two-names-per-target image is rejected at decode and would otherwise leave the store unopenable.
+
+The MVCC visibility of index entries (§6.3) and the crash recovery of index data (§6.4) are
+unchanged: only the small, append-only name catalog is added to the metadata image.
+
 ---
 
 ## 7. Cypher engine

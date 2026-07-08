@@ -537,6 +537,13 @@ User, role, and database administration is done by sending the administrative st
 (`CREATE USER`, `GRANT`, `CREATE DATABASE`, …) to the transactional endpoint as an
 administrator — see [security.md](security.md).
 
+Schema DDL is likewise sent as ordinary auto-commit statements. For example, manage
+node-property indexes with `CREATE INDEX ix_person FOR (p:Person) ON (p.name)`,
+`SHOW INDEXES`, and `DROP INDEX ix_person` — see [indexes.md](indexes.md). Index DDL requires
+the `SCHEMA` privilege and, like all admin statements, is rejected inside an explicit
+transaction. Its result `summary.type` is `s` (schema/admin), with `indexes-added` /
+`indexes-removed` counters.
+
 ---
 
 ## 9. End-to-end with curl
@@ -570,4 +577,4 @@ A runnable Go version of this flow is in
 [`examples/clients-go/rest`](../examples/clients-go/rest).
 
 See also: [getting-started.md](getting-started.md) · [security.md](security.md) ·
-[bolt.md](bolt.md) · [configuration.md](configuration.md).
+[bolt.md](bolt.md) · [indexes.md](indexes.md) · [configuration.md](configuration.md).

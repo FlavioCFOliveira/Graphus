@@ -225,7 +225,7 @@ read-only statement carries no `stats`). Keys are kebab-case and only non-zero c
 | `relationships-created` / `relationships-deleted` | relationships created / actually deleted |
 | `properties-set` | property assignments — re-setting an equal value counts; `SET null`/`REMOVE` do not |
 | `labels-added` / `labels-removed` | labels actually added / removed (an idempotent add/remove counts 0) |
-| `indexes-added` / `indexes-removed` | indexes created / dropped |
+| `indexes-added` / `indexes-removed` | indexes created / dropped (an idempotent `IF NOT EXISTS` / `IF EXISTS` no-op counts 0 and sets no `contains-updates`) |
 | `constraints-added` / `constraints-removed` | constraints created / dropped |
 | `system-updates` | system-database changes (database/user/role commands) |
 | `contains-updates` | `true` whenever any data or schema counter is non-zero |

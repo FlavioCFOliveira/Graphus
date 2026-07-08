@@ -7,6 +7,7 @@ into the guide for the interface you need.
 | ----- | -------------- |
 | **[getting-started.md](getting-started.md)** | Install with Docker, default credentials, and a first authenticated query over each interface. |
 | **[transactions.md](transactions.md)** | The transaction model: autocommit by default (MySQL/MariaDB/SQL-Server semantics), explicit transactions, lock-free reads, and the per-work isolation levels (Snapshot for standalone reads, Serializable for writes and explicit transactions). |
+| **[indexes.md](indexes.md)** | Node-property indexes: named `CREATE INDEX`, `IF NOT EXISTS` / `IF EXISTS` idempotency, `DROP INDEX` by name or target, and `SHOW INDEXES` with the Neo4j column shape. |
 | **[rest-api.md](rest-api.md)** | The REST WebAPI: `POST /auth/login`, running queries and transactions, result and error shapes, health and metrics, with `curl` examples. |
 | **[bolt.md](bolt.md)** | The Bolt interfaces over TCP (Neo4j drivers) and UDS (local IPC): addresses, TLS, URI schemes, and authentication. |
 | **[security.md](security.md)** | Credentials, creating users, roles and privileges (RBAC), per-interface authentication, and multi-database scoping. |

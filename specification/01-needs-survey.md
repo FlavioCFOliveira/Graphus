@@ -241,7 +241,14 @@ format: **Bolt over UDS**, **Bolt over TCP**, and the **Web REST API**.
 - **FR-IX-13** [ADV] **Node-key constraint** (composite uniqueness + existence).
 - **FR-IX-14** [ADV] **Type/datatype constraint.**
 - **FR-IX-15** [CORE] **DDL via Cypher:** `CREATE`/`DROP INDEX`, `CREATE`/`DROP CONSTRAINT`,
-  `SHOW INDEXES`/`SHOW CONSTRAINTS`.
+  `SHOW INDEXES`/`SHOW CONSTRAINTS`. Node-property indexes are **named** and Neo4j-conformant
+  (rmp #623–#626): `CREATE INDEX [<name>] [IF NOT EXISTS] FOR (n:Label) ON (n.property)` (name
+  optional, an identifier or backtick-quoted), `DROP INDEX <name> [IF EXISTS]` (or by target), and
+  `SHOW INDEXES` returning the Neo4j driver columns (`name`, `type`, `entityType`, `labelsOrTypes`,
+  `properties`, `state`). The anonymous and legacy `CREATE INDEX ON :Label(property)` forms are
+  preserved and receive a deterministic, stable auto-name; `IF NOT EXISTS`/`IF EXISTS` are idempotent
+  no-ops. Names are globally unique across the schema and durable. Specified in
+  `04-technical-design.md` §6.8 (design decision `D-named-index-autoname`).
 - **FR-IX-16** [CORE] **Pre-commit constraint enforcement** integrated with the transaction manager.
 
 ## 8. Procedures & Functions (PR)
