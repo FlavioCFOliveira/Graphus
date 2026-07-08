@@ -1585,7 +1585,11 @@ fn call_function(
         // Collection-shape functions, evaluated at the RowValue level so structural lists
         // (`nodes(p)`, `collect(n)`, …) and paths keep their elements; the pure-property cases
         // behave exactly as the former `Value`-level implementations.
-        "size" | "length" => {
+        // `char_length` / `character_length` are Neo4j 5.x aliases of `size()` (Unicode character
+        // count over a string; the same list length over a list). They share this arm so their
+        // behaviour is identical to `size` by construction. Only `length` keeps the path-specific
+        // relationship-count semantics (gated on `lower == "length"`).
+        "size" | "length" | "char_length" | "character_length" => {
             let v = eval(&args[0], row, params, graph, functions, clock)?;
             return match v {
                 // `length(p)` is the path's relationship count (openCypher).
@@ -1661,9 +1665,55 @@ fn call_function(
         // silently become `null` (via `to_value`) and the invalid-type scenarios would wrongly
         // succeed. The accepted property values delegate to the value-level helpers, which encode
         // each function's exact conversion table.
-        "tointeger" | "tofloat" | "tostring" | "toboolean" | "tobooleanornull" => {
+        "tointeger" | "tofloat" | "tostring" | "toboolean" | "tobooleanornull"
+        | "tointegerornull" | "tofloatornull" | "tostringornull" => {
             let v = eval(&args[0], row, params, graph, functions, clock)?;
             return convert_scalar(lower, v).map(RowValue::Value);
+        }
+        // `toIntegerList` / `toFloatList` / `toBooleanList` / `toStringList` (Neo4j 5.x): apply the
+        // matching `*OrNull` conversion to every element, so a non-convertible (or null) element
+        // becomes `null`. A null input list is `null`; a non-list argument is a runtime `TypeError`.
+        "tointegerlist" | "tofloatlist" | "tobooleanlist" | "tostringlist" => {
+            let v = eval(&args[0], row, params, graph, functions, clock)?;
+            return to_typed_list(lower, v).map(RowValue::Value);
+        }
+        // `elementId(n | r)` — the STRING element identifier of a node/relationship. Graphus is a
+        // single instance, so the element id is the decimal of the entity's integer id, matching the
+        // Bolt/REST wire `element_id` byte-for-byte (`graphus_bolt::packstream::element_id`). A null
+        // argument is null; any non-entity argument is null (mirroring `id()`).
+        "elementid" => {
+            let v = eval(&args[0], row, params, graph, functions, clock)?;
+            return Ok(match v {
+                RowValue::Node(NodeRef { id }) => {
+                    RowValue::Value(Value::String(wire_element_id(id.0)))
+                }
+                RowValue::Rel(RelRef { id }) => {
+                    RowValue::Value(Value::String(wire_element_id(id.0)))
+                }
+                _ => RowValue::NULL,
+            });
+        }
+        // `valueType(v)` — the STRING name of the most precise Cypher type (Neo4j 5.x normalized form).
+        "valuetype" => {
+            let v = eval(&args[0], row, params, graph, functions, clock)?;
+            return Ok(RowValue::Value(Value::String(value_type_string(&v))));
+        }
+        // `isEmpty(list | map | string)` — whether the collection / string has no elements; `null` on
+        // a null argument; a runtime `TypeError` on any other type (Neo4j 5.x).
+        "isempty" => {
+            let v = eval(&args[0], row, params, graph, functions, clock)?;
+            return is_empty_value(&v).map(RowValue::Value);
+        }
+        // `nullIf(a, b)` — `null` when the two arguments are equivalent (Cypher value equality, plus
+        // node/relationship identity), otherwise the first argument unchanged (Neo4j 5.x / SQL NULLIF).
+        "nullif" => {
+            let a = eval(&args[0], row, params, graph, functions, clock)?;
+            let b = eval(&args[1], row, params, graph, functions, clock)?;
+            return Ok(if row_values_equivalent_for_nullif(&a, &b) {
+                RowValue::NULL
+            } else {
+                a
+            });
         }
         _ => {}
     }
@@ -1744,7 +1794,8 @@ fn call_function(
         },
         "ceil" => float_unary(arg(&argv, 0, "ceil")?, f64::ceil, "ceil")?,
         "floor" => float_unary(arg(&argv, 0, "floor")?, f64::floor, "floor")?,
-        "round" => float_unary(arg(&argv, 0, "round")?, f64::round, "round")?,
+        // `round(value)`, `round(value, precision)`, `round(value, precision, mode)` (Neo4j 5.x).
+        "round" => round_fn(&argv)?,
         // `sqrt()` of a negative number is NaN (IEEE 754, which the openCypher Float is).
         "sqrt" => float_unary(arg(&argv, 0, "sqrt")?, f64::sqrt, "sqrt")?,
         "rand" => Value::Float(next_rand_f64()),
@@ -1760,6 +1811,52 @@ fn call_function(
             Value::Null => Value::Null,
             _ => return Err(num_type_error("sign")),
         },
+        // ---- mathematical constants (rmp #629) ----------------------------------------------
+        // `pi()` and `e()` take no arguments; their exact `f64` constants match Neo4j 5.x
+        // (π = 3.141592653589793, e = 2.718281828459045).
+        "pi" => Value::Float(std::f64::consts::PI),
+        "e" => Value::Float(std::f64::consts::E),
+        // ---- trigonometric functions (rmp #629) ---------------------------------------------
+        // Each accepts a number (radians) and returns a Float; a non-numeric argument is a runtime
+        // `TypeError` and `null` maps to `null` (all via `float_unary`, exactly like `ceil`/`floor`).
+        "sin" => float_unary(arg(&argv, 0, "sin")?, f64::sin, "sin")?,
+        "cos" => float_unary(arg(&argv, 0, "cos")?, f64::cos, "cos")?,
+        "tan" => float_unary(arg(&argv, 0, "tan")?, f64::tan, "tan")?,
+        // `cot(x) = 1/tan(x)`; `cot(0)` is `+Infinity` (IEEE 754 `1.0 / 0.0`), matching Neo4j.
+        "cot" => float_unary(arg(&argv, 0, "cot")?, |x| 1.0 / x.tan(), "cot")?,
+        // `asin`/`acos` return NaN for arguments outside `[-1, 1]` (IEEE 754), matching Neo4j.
+        "asin" => float_unary(arg(&argv, 0, "asin")?, f64::asin, "asin")?,
+        "acos" => float_unary(arg(&argv, 0, "acos")?, f64::acos, "acos")?,
+        "atan" => float_unary(arg(&argv, 0, "atan")?, f64::atan, "atan")?,
+        // `atan2(y, x)` — the two-argument arctangent; argument order matches Neo4j (`y` then `x`).
+        "atan2" => atan2_fn(&argv)?,
+        // `degrees(radians)` / `radians(degrees)` — the standard π-based conversions.
+        "degrees" => float_unary(arg(&argv, 0, "degrees")?, f64::to_degrees, "degrees")?,
+        "radians" => float_unary(arg(&argv, 0, "radians")?, f64::to_radians, "radians")?,
+        // `haversin(x) = (1 - cos(x)) / 2` (the haversine of an angle in radians).
+        "haversin" => float_unary(
+            arg(&argv, 0, "haversin")?,
+            |x| (1.0 - x.cos()) / 2.0,
+            "haversin",
+        )?,
+        // ---- logarithmic / exponential functions (rmp #629) ---------------------------------
+        // `exp(x) = eˣ`; `log(x)` is the natural logarithm (base e); `log10(x)` is base 10.
+        // `log(0)`/`log10(0)` are `-Infinity` and a negative argument is NaN (IEEE 754), per Neo4j.
+        "exp" => float_unary(arg(&argv, 0, "exp")?, f64::exp, "exp")?,
+        "log" => float_unary(arg(&argv, 0, "log")?, f64::ln, "log")?,
+        "log10" => float_unary(arg(&argv, 0, "log10")?, f64::log10, "log10")?,
+        // `isNaN(number)` — whether a FLOAT is NaN. An INTEGER is never NaN; `null` maps to `null`.
+        "isnan" => match arg(&argv, 0, "isNaN")? {
+            Value::Float(f) => Value::Boolean(f.is_nan()),
+            Value::Integer(_) => Value::Boolean(false),
+            Value::Null => Value::Null,
+            _ => return Err(num_type_error("isNaN")),
+        },
+        // `timestamp()` — milliseconds since the Unix epoch, constant for the whole statement (read
+        // off the captured statement clock, never a fresh wall-clock sample).
+        "timestamp" => Value::Integer(clock.epoch_millis()),
+        // `randomUUID()` — a fresh random (version-4) UUID string on every call.
+        "randomuuid" => Value::String(random_uuid_string()),
         "toupper" => string_case(arg(&argv, 0, "toUpper")?, true, "toUpper")?,
         "tolower" => string_case(arg(&argv, 0, "toLower")?, false, "toLower")?,
         "trim" => string_unary(arg(&argv, 0, "trim")?, |s| s.trim().to_owned(), "trim")?,
@@ -1895,10 +1992,26 @@ fn convert_scalar(lower: &str, rv: RowValue) -> Result<Value, EvalError> {
         "tostring" => to_string_value(&v),
         "toboolean" => to_boolean(&v, false),
         "tobooleanornull" => to_boolean(&v, true),
-        // Unreachable: the caller dispatches only the five conversion spellings.
+        // The `*OrNull` companions of the numeric/string conversions: they never raise, so a scalar
+        // that the strict form would reject (e.g. `toFloat(true)`) becomes `null` instead
+        // (`toInteger`/`toString` already never raise on a scalar, so they share their bodies).
+        "tointegerornull" => to_integer(&v),
+        "tofloatornull" => to_float_or_null(&v),
+        "tostringornull" => to_string_value(&v),
+        // Unreachable: the caller dispatches only the conversion spellings above.
         _ => Err(EvalError::TypeError {
             context: format!("{lower}() is not a scalar conversion"),
         }),
+    }
+}
+
+/// `toFloatOrNull(v)` over an already-validated scalar: identical to [`to_float`] except a boolean —
+/// which the strict `toFloat` rejects as an invalid type — yields `null` rather than an error. Every
+/// other scalar delegates to `to_float`, which cannot error for a non-boolean.
+fn to_float_or_null(v: &Value) -> Result<Value, EvalError> {
+    match v {
+        Value::Boolean(_) => Ok(Value::Null),
+        other => to_float(other),
     }
 }
 
@@ -2060,6 +2173,405 @@ fn float_unary(v: &Value, f: impl Fn(f64) -> f64, fname: &str) -> Result<Value, 
         Value::Null => Ok(Value::Null),
         _ => Err(num_type_error(fname)),
     }
+}
+
+/// `atan2(y, x)` — the two-argument arctangent (Neo4j 5.x argument order: `y` then `x`). A null
+/// argument propagates to `null`; a non-numeric argument is a runtime `TypeError`.
+fn atan2_fn(argv: &[Value]) -> Result<Value, EvalError> {
+    let y = arg(argv, 0, "atan2")?;
+    let x = arg(argv, 1, "atan2")?;
+    if matches!(y, Value::Null) || matches!(x, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let (Some(yf), Some(xf)) = (numeric_f64(y), numeric_f64(x)) else {
+        return Err(num_type_error("atan2"));
+    };
+    Ok(Value::Float(yf.atan2(xf)))
+}
+
+// =================================================================================================
+// `round(value[, precision[, mode]])` — Neo4j 5.x numeric rounding (rmp #629)
+// =================================================================================================
+
+/// A Neo4j 5.x rounding mode for the three-argument `round(value, precision, mode)` form.
+#[derive(Clone, Copy)]
+enum RoundMode {
+    /// Round away from zero.
+    Up,
+    /// Round toward zero (truncate).
+    Down,
+    /// Round toward positive infinity.
+    Ceiling,
+    /// Round toward negative infinity.
+    Floor,
+    /// Round to nearest; ties away from zero.
+    HalfUp,
+    /// Round to nearest; ties toward zero.
+    HalfDown,
+    /// Round to nearest; ties to the even neighbour (banker's rounding).
+    HalfEven,
+}
+
+impl RoundMode {
+    /// Parses a Neo4j rounding-mode string. Neo4j's modes are upper-case; parsing is
+    /// case-insensitive for robustness. An unrecognised mode is a runtime error (`ArgumentError`).
+    fn parse(s: &str) -> Result<Self, EvalError> {
+        match s.to_ascii_uppercase().as_str() {
+            "UP" => Ok(Self::Up),
+            "DOWN" => Ok(Self::Down),
+            "CEILING" => Ok(Self::Ceiling),
+            "FLOOR" => Ok(Self::Floor),
+            "HALF_UP" => Ok(Self::HalfUp),
+            "HALF_DOWN" => Ok(Self::HalfDown),
+            "HALF_EVEN" => Ok(Self::HalfEven),
+            _ => Err(EvalError::TypeError {
+                context: format!(
+                    "round(): unknown rounding mode '{s}' (expected UP, DOWN, CEILING, FLOOR, \
+                     HALF_UP, HALF_DOWN or HALF_EVEN)"
+                ),
+            }),
+        }
+    }
+}
+
+/// The `10^precision` scale factor for rounding to `precision` decimal places, or `None` when the
+/// scale is not a usable finite non-zero `f64` (an absurd precision) — in which case rounding is the
+/// identity (the value already carries at least that much / that little precision in an `f64`).
+fn round_scale(precision: i64) -> Option<f64> {
+    let p = i32::try_from(precision.clamp(-308, 308)).unwrap_or(0);
+    let scale = 10f64.powi(p);
+    (scale.is_finite() && scale != 0.0).then_some(scale)
+}
+
+/// `round(value)` and `round(value, precision)` — Neo4j's **default** rounding: HALF_UP (ties away
+/// from zero) at the requested precision, **except at precision 0**, where ties round toward positive
+/// infinity so that `round(value, 0)` aligns with the single-argument `round(value)` (Neo4j 5.x, the
+/// documented exception). Non-finite inputs round to themselves.
+fn default_round(x: f64, precision: i64) -> f64 {
+    if !x.is_finite() {
+        return x;
+    }
+    let Some(scale) = round_scale(precision) else {
+        return x;
+    };
+    let scaled = x * scale;
+    if !scaled.is_finite() {
+        return x;
+    }
+    let rounded = if precision == 0 {
+        // Ties toward +∞ (Java `Math.round` semantics): floor(x + 0.5).
+        (scaled + 0.5).floor()
+    } else {
+        // HALF_UP (ties away from zero) is exactly Rust's `f64::round`.
+        scaled.round()
+    };
+    rounded / scale
+}
+
+/// `round(value, precision, mode)` — rounding to `precision` decimal places with an explicit mode
+/// (applied uniformly, with no precision-0 special case — that is only the default's behaviour).
+/// Non-finite inputs round to themselves.
+fn mode_round(x: f64, precision: i64, mode: RoundMode) -> f64 {
+    if !x.is_finite() {
+        return x;
+    }
+    let Some(scale) = round_scale(precision) else {
+        return x;
+    };
+    let scaled = x * scale;
+    if !scaled.is_finite() {
+        return x;
+    }
+    let rounded = match mode {
+        RoundMode::Up => {
+            if scaled >= 0.0 {
+                scaled.ceil()
+            } else {
+                scaled.floor()
+            }
+        }
+        RoundMode::Down => scaled.trunc(),
+        RoundMode::Ceiling => scaled.ceil(),
+        RoundMode::Floor => scaled.floor(),
+        RoundMode::HalfUp => scaled.round(),
+        RoundMode::HalfDown => round_half_down(scaled),
+        RoundMode::HalfEven => round_half_even(scaled),
+    };
+    rounded / scale
+}
+
+/// Round to nearest with ties toward zero (`HALF_DOWN`).
+fn round_half_down(scaled: f64) -> f64 {
+    let magnitude = scaled.abs();
+    let floor = magnitude.floor();
+    let rounded = if magnitude - floor > 0.5 {
+        floor + 1.0
+    } else {
+        floor
+    };
+    rounded.copysign(scaled)
+}
+
+/// Round to nearest with ties to the even neighbour (`HALF_EVEN`, banker's rounding).
+fn round_half_even(scaled: f64) -> f64 {
+    let floor = scaled.floor();
+    let frac = scaled - floor;
+    if frac < 0.5 {
+        floor
+    } else if frac > 0.5 {
+        floor + 1.0
+    } else if floor % 2.0 == 0.0 {
+        floor
+    } else {
+        floor + 1.0
+    }
+}
+
+/// `round(value[, precision[, mode]])` (Neo4j 5.x). A null value / precision / mode propagates to
+/// `null`; a non-numeric value or precision, or an unknown mode string, is a runtime error.
+fn round_fn(argv: &[Value]) -> Result<Value, EvalError> {
+    let x = match arg(argv, 0, "round")? {
+        Value::Integer(i) => *i as f64,
+        Value::Float(f) => *f,
+        Value::Null => return Ok(Value::Null),
+        _ => return Err(num_type_error("round")),
+    };
+    if argv.len() < 2 {
+        return Ok(Value::Float(default_round(x, 0)));
+    }
+    let precision = match arg(argv, 1, "round")? {
+        Value::Integer(i) => *i,
+        // Neo4j accepts a FLOAT precision; truncate it toward zero to a whole number of places.
+        Value::Float(f) => *f as i64,
+        Value::Null => return Ok(Value::Null),
+        _ => {
+            return Err(EvalError::TypeError {
+                context: "round() precision must be a number".to_owned(),
+            });
+        }
+    };
+    if argv.len() < 3 {
+        return Ok(Value::Float(default_round(x, precision)));
+    }
+    let mode = match arg(argv, 2, "round")? {
+        Value::String(s) => RoundMode::parse(s)?,
+        Value::Null => return Ok(Value::Null),
+        _ => {
+            return Err(EvalError::TypeError {
+                context: "round() rounding mode must be a string".to_owned(),
+            });
+        }
+    };
+    Ok(Value::Float(mode_round(x, precision, mode)))
+}
+
+// =================================================================================================
+// Additional scalar / list functions (Neo4j 5.x; rmp #630)
+// =================================================================================================
+
+/// The STRING element id for an entity whose internal handle is `id` — the decimal of the handle
+/// cast to `i64`, byte-for-byte identical to the Bolt/REST wire element id
+/// (`graphus_bolt::packstream::element_id`, which stringifies the same `i64::try_from`ed handle). A
+/// single-instance convention (`04 §8.3`): a driver treats it as an opaque string.
+fn wire_element_id(id: u64) -> String {
+    i64::try_from(id).unwrap_or(i64::MAX).to_string()
+}
+
+/// `isEmpty(list | map | string)` (Neo4j 5.x): whether a collection or string has no elements. A
+/// null argument yields `null`; any other type is a runtime `TypeError`.
+fn is_empty_value(rv: &RowValue) -> Result<Value, EvalError> {
+    let empty = match rv {
+        RowValue::Value(Value::Null) => return Ok(Value::Null),
+        RowValue::List(items) => items.is_empty(),
+        RowValue::Map(entries) => entries.is_empty(),
+        RowValue::Value(Value::List(items)) => items.is_empty(),
+        RowValue::Value(Value::Map(entries)) => entries.is_empty(),
+        RowValue::Value(Value::String(s)) => s.is_empty(),
+        _ => {
+            return Err(EvalError::TypeError {
+                context: "isEmpty() requires a list, map or string".to_owned(),
+            });
+        }
+    };
+    Ok(Value::Boolean(empty))
+}
+
+/// Whether two arguments of `nullIf(a, b)` are **equivalent** (Neo4j 5.x / SQL `NULLIF`): a
+/// node/relationship pair by identity, everything else by Cypher value equality (only a definite
+/// `TRUE` equality counts — an unknown/`null` comparison is *not* equivalent, so `nullIf` returns
+/// `a`). Entities compared against non-entities are never equivalent.
+fn row_values_equivalent_for_nullif(a: &RowValue, b: &RowValue) -> bool {
+    match (a, b) {
+        (RowValue::Node(x), RowValue::Node(y)) => x.id == y.id,
+        (RowValue::Rel(x), RowValue::Rel(y)) => x.id == y.id,
+        (RowValue::Node(_) | RowValue::Rel(_), _) | (_, RowValue::Node(_) | RowValue::Rel(_)) => {
+            false
+        }
+        _ => equals(&to_value(a.clone()), &to_value(b.clone())).is_true(),
+    }
+}
+
+/// `toIntegerList` / `toFloatList` / `toBooleanList` / `toStringList` (Neo4j 5.x): apply the matching
+/// `*OrNull` conversion to every element (a non-convertible or null element becomes `null`). A null
+/// input list yields `null`; a non-list argument is a runtime `TypeError`.
+fn to_typed_list(lower: &str, rv: RowValue) -> Result<Value, EvalError> {
+    let elem_conv = match lower {
+        "tointegerlist" => "tointegerornull",
+        "tofloatlist" => "tofloatornull",
+        "tobooleanlist" => "tobooleanornull",
+        "tostringlist" => "tostringornull",
+        // Unreachable: the caller dispatches only the four list-conversion spellings.
+        _ => {
+            return Err(EvalError::TypeError {
+                context: format!("{lower}() is not a list conversion"),
+            });
+        }
+    };
+    if rv.is_null() {
+        return Ok(Value::Null);
+    }
+    let Some(elems) = rv.as_list_elems() else {
+        return Err(EvalError::TypeError {
+            context: format!("{lower}() requires a list"),
+        });
+    };
+    check_list_len_budget(elems.len(), lower)?;
+    let mut out = Vec::with_capacity(elems.len());
+    for e in elems {
+        // The `*OrNull` conversions never raise, so this collects one `Value` per input element.
+        out.push(convert_scalar(elem_conv, e)?);
+    }
+    Ok(Value::List(out))
+}
+
+/// `valueType(v)` (Neo4j 5.x): the STRING name of the most precise Cypher type of `v`. A concrete
+/// value is `"<TYPE> NOT NULL"` (the value is non-null); the null value is the lower-case `"null"`.
+///
+/// # Fidelity note
+/// The scalar, temporal, spatial, node/relationship/path/map and **homogeneous** / nested /
+/// nullable-element / empty list forms match Neo4j 5.13+ exactly (including the `NOT NULL` suffixes,
+/// the space-separated temporal names, `LIST<NOTHING>` for `[]`, and a nullable element type when a
+/// `null` is present). For a **heterogeneous** list Neo4j emits a normalized union whose exact member
+/// ordering is not publicly specified; this implementation emits a deterministic (lexicographically
+/// ordered) union — a documented best-effort for that rare case.
+fn value_type_string(rv: &RowValue) -> String {
+    if rv.is_null() {
+        return "null".to_owned();
+    }
+    format!("{} NOT NULL", value_type_body(rv))
+}
+
+/// The type name of a **non-null** value without a trailing nullability marker — the reusable body of
+/// [`value_type_string`], also used as a union member when describing list element types.
+fn value_type_body(rv: &RowValue) -> String {
+    match rv {
+        RowValue::Node(_) => "NODE".to_owned(),
+        RowValue::Rel(_) => "RELATIONSHIP".to_owned(),
+        RowValue::Path(_) => "PATH".to_owned(),
+        RowValue::Map(_) => "MAP".to_owned(),
+        RowValue::List(items) => format!("LIST<{}>", list_element_type(items)),
+        RowValue::Value(v) => value_type_body_value(v),
+    }
+}
+
+/// The type-name body for a property [`Value`] (see [`value_type_body`]).
+fn value_type_body_value(v: &Value) -> String {
+    match v {
+        // `NULL` only reaches here as a list element (a top-level null is handled by
+        // `value_type_string`); as a union member it marks the element type nullable.
+        Value::Null => "NULL".to_owned(),
+        Value::Boolean(_) => "BOOLEAN".to_owned(),
+        Value::Integer(_) => "INTEGER".to_owned(),
+        Value::Float(_) => "FLOAT".to_owned(),
+        Value::String(_) => "STRING".to_owned(),
+        // Graphus models a byte string as a list of byte-valued integers; Neo4j has no distinct
+        // `valueType` name for raw byte arrays, so this reports the equivalent list type.
+        Value::Bytes(_) => "LIST<INTEGER NOT NULL>".to_owned(),
+        Value::List(items) => {
+            let elems: Vec<RowValue> = items.iter().cloned().map(RowValue::Value).collect();
+            format!("LIST<{}>", list_element_type(&elems))
+        }
+        Value::Map(_) => "MAP".to_owned(),
+        Value::Date(_) => "DATE".to_owned(),
+        Value::LocalTime(_) => "LOCAL TIME".to_owned(),
+        Value::ZonedTime(_) => "ZONED TIME".to_owned(),
+        Value::LocalDateTime(_) => "LOCAL DATETIME".to_owned(),
+        Value::ZonedDateTime(_) => "ZONED DATETIME".to_owned(),
+        Value::Duration(_) => "DURATION".to_owned(),
+        Value::Point(_) => "POINT".to_owned(),
+    }
+}
+
+/// The normalized element type of a list for [`value_type_string`]: `NOTHING` for the empty list, a
+/// single `T NOT NULL` (or nullable `T` when a `null` element is present), or a deterministic union
+/// of the distinct member types when the list is heterogeneous.
+fn list_element_type(elems: &[RowValue]) -> String {
+    if elems.is_empty() {
+        return "NOTHING".to_owned();
+    }
+    let mut members: Vec<String> = Vec::new();
+    let mut has_null = false;
+    for e in elems {
+        if e.is_null() {
+            has_null = true;
+        } else {
+            let body = value_type_body(e);
+            if !members.contains(&body) {
+                members.push(body);
+            }
+        }
+    }
+    members.sort();
+    match (members.len(), has_null) {
+        // Every element was null: the element type is `NULL`.
+        (0, _) => "NULL".to_owned(),
+        // A single concrete type: `NOT NULL` unless a null element made it nullable.
+        (1, false) => format!("{} NOT NULL", members[0]),
+        (1, true) => members.into_iter().next().unwrap_or_default(),
+        // A union of distinct types; each member carries its own nullability marker.
+        (_, false) => members
+            .iter()
+            .map(|m| format!("{m} NOT NULL"))
+            .collect::<Vec<_>>()
+            .join(" | "),
+        (_, true) => members.join(" | "),
+    }
+}
+
+/// One `xorshift64*` step of the thread-local `rand()` state, returning the full 64-bit mixed draw.
+/// Shares the exact generator [`next_rand_f64`] scales, so `rand()` and `randomUUID()` advance the
+/// same per-thread stream (no extra state, no lock, no `unsafe`).
+fn next_rand_u64() -> u64 {
+    RAND_STATE.with(|cell| {
+        let mut x = cell.get();
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        cell.set(x);
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    })
+}
+
+/// `randomUUID()` (Neo4j 5.x): a random version-4 UUID (RFC 4122) as the canonical 36-character
+/// lower-case `8-4-4-4-12` hex string. Two 64-bit draws supply the 128 bits; the version nibble
+/// (`4`) and the two variant bits (`10`) are set per the spec, so the output is a well-formed v4 UUID.
+fn random_uuid_string() -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&next_rand_u64().to_le_bytes());
+    bytes[8..].copy_from_slice(&next_rand_u64().to_le_bytes());
+    // Version 4 (random) in the high nibble of byte 6; RFC 4122 variant (10xx) in byte 8.
+    bytes[6] = (bytes[6] & 0x0F) | 0x40;
+    bytes[8] = (bytes[8] & 0x3F) | 0x80;
+    let mut s = String::with_capacity(36);
+    for (i, b) in bytes.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            s.push('-');
+        }
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0F) as usize] as char);
+    }
+    s
 }
 
 fn string_unary(v: &Value, f: impl Fn(&str) -> String, fname: &str) -> Result<Value, EvalError> {
@@ -4300,5 +4812,310 @@ mod tests {
                 name: "split".to_owned()
             }
         );
+    }
+
+    // =============================================================================================
+    // Mathematical functions (rmp #629)
+    // =============================================================================================
+
+    /// Evaluates `src` and asserts the result is a `Float` within `1e-12` of `want`.
+    fn assert_float_close(src: &str, want: f64) {
+        match evaluate(src) {
+            Value::Float(got) => assert!(
+                (got - want).abs() < 1e-12,
+                "{src} = {got}, expected ≈ {want}"
+            ),
+            other => panic!("{src} = {other:?}, expected a Float"),
+        }
+    }
+
+    #[test]
+    fn math_constants_pi_and_e() {
+        assert_eq!(evaluate("pi()"), Value::Float(std::f64::consts::PI));
+        assert_eq!(evaluate("e()"), Value::Float(std::f64::consts::E));
+    }
+
+    #[test]
+    fn trigonometric_functions() {
+        assert_float_close("sin(0)", 0.0);
+        assert_float_close("cos(0)", 1.0);
+        assert_float_close("tan(0)", 0.0);
+        assert_float_close("sin(pi() / 2)", 1.0);
+        assert_float_close("atan(1) * 4", std::f64::consts::PI);
+        assert_float_close("atan2(1, 1)", std::f64::consts::FRAC_PI_4);
+        assert_float_close("haversin(0)", 0.0);
+        assert_float_close("haversin(pi())", 1.0);
+        assert_float_close("degrees(pi())", 180.0);
+        assert_float_close("radians(180)", std::f64::consts::PI);
+        // `cot(0)` is +Infinity (1/tan(0)); `asin`/`acos` out of [-1,1] are NaN.
+        assert_eq!(evaluate("cot(0)"), Value::Float(f64::INFINITY));
+        assert!(matches!(evaluate("asin(2)"), Value::Float(f) if f.is_nan()));
+        assert!(matches!(evaluate("acos(2)"), Value::Float(f) if f.is_nan()));
+        // Integer arguments coerce to Float; null propagates; a non-number is a runtime TypeError.
+        assert_float_close("cos(0.0)", 1.0);
+        assert_eq!(evaluate("sin(null)"), Value::Null);
+        assert!(matches!(
+            eval_in(&MemGraph::new(), &Row::empty(), "sin('x')"),
+            Err(EvalError::TypeError { .. })
+        ));
+    }
+
+    #[test]
+    fn logarithmic_and_exponential_functions() {
+        assert_float_close("exp(0)", 1.0);
+        assert_float_close("log(e())", 1.0);
+        assert_float_close("log10(1000)", 3.0);
+        assert_float_close("sqrt(16)", 4.0);
+        // Documented IEEE-754 edge cases (Neo4j 5.x): log(0) = -Inf, sqrt(-1) = NaN.
+        assert_eq!(evaluate("log(0)"), Value::Float(f64::NEG_INFINITY));
+        assert!(matches!(evaluate("sqrt(-1)"), Value::Float(f) if f.is_nan()));
+        assert_eq!(evaluate("log(null)"), Value::Null);
+    }
+
+    #[test]
+    fn isnan_over_number_kinds() {
+        // NaN only for a NaN Float; an Integer is never NaN; null propagates.
+        assert_eq!(evaluate("isNaN(sqrt(-1))"), Value::Boolean(true));
+        assert_eq!(evaluate("isNaN(1.5)"), Value::Boolean(false));
+        assert_eq!(evaluate("isNaN(1)"), Value::Boolean(false));
+        assert_eq!(evaluate("isNaN(null)"), Value::Null);
+    }
+
+    #[test]
+    fn round_default_and_precision() {
+        // Single-argument: ties toward +∞ (Neo4j `round(value)` / Java Math.round), so a negative
+        // half rounds toward zero-and-up, unlike the away-from-zero `f64::round`.
+        assert_eq!(evaluate("round(2.5)"), Value::Float(3.0));
+        assert_eq!(evaluate("round(-2.5)"), Value::Float(-2.0));
+        assert_eq!(evaluate("round(2.4)"), Value::Float(2.0));
+        assert_eq!(evaluate("round(2.49)"), Value::Float(2.0));
+        // Two-argument precision (HALF_UP away from zero for precision != 0).
+        assert_float_close("round(1.23456, 2)", 1.23);
+        assert_float_close("round(3.145, 2)", 3.15);
+        assert_float_close("round(-3.145, 2)", -3.15);
+        // Precision 0 aligns with the single-argument form (ties toward +∞).
+        assert_eq!(evaluate("round(-2.5, 0)"), Value::Float(-2.0));
+        // Null propagation.
+        assert_eq!(evaluate("round(null)"), Value::Null);
+        assert_eq!(evaluate("round(1.5, null)"), Value::Null);
+    }
+
+    #[test]
+    fn round_with_explicit_modes() {
+        // Each mode applied at precision 0 to the tie value 2.5 (and -2.5 where the sign matters).
+        assert_eq!(evaluate("round(2.5, 0, 'UP')"), Value::Float(3.0));
+        assert_eq!(evaluate("round(2.1, 0, 'UP')"), Value::Float(3.0));
+        assert_eq!(evaluate("round(2.9, 0, 'DOWN')"), Value::Float(2.0));
+        assert_eq!(evaluate("round(-2.1, 0, 'CEILING')"), Value::Float(-2.0));
+        assert_eq!(evaluate("round(2.1, 0, 'FLOOR')"), Value::Float(2.0));
+        assert_eq!(evaluate("round(2.5, 0, 'HALF_UP')"), Value::Float(3.0));
+        assert_eq!(evaluate("round(2.5, 0, 'HALF_DOWN')"), Value::Float(2.0));
+        assert_eq!(evaluate("round(-2.5, 0, 'HALF_DOWN')"), Value::Float(-2.0));
+        // HALF_EVEN (banker's): 2.5 → 2 (even), 3.5 → 4 (even), 2.05 at 1 dp → 2.0.
+        assert_eq!(evaluate("round(2.5, 0, 'HALF_EVEN')"), Value::Float(2.0));
+        assert_eq!(evaluate("round(3.5, 0, 'HALF_EVEN')"), Value::Float(4.0));
+        // An unknown mode is a runtime error; a null mode propagates to null.
+        assert!(matches!(
+            eval_in(&MemGraph::new(), &Row::empty(), "round(2.5, 0, 'SIDEWAYS')"),
+            Err(EvalError::TypeError { .. })
+        ));
+        assert_eq!(evaluate("round(2.5, 0, null)"), Value::Null);
+    }
+
+    // =============================================================================================
+    // Additional scalar / list functions (rmp #630)
+    // =============================================================================================
+
+    #[test]
+    fn element_id_matches_the_integer_id_string() {
+        let (g, row) = graph_with_node_and_rel();
+        // `elementId(n)` is the decimal string of the same integer id `id(n)` returns (and that the
+        // Bolt/REST wire packs as `element_id`).
+        let RowValue::Value(Value::Integer(node_id)) = eval_in(&g, &row, "id(n)").unwrap() else {
+            panic!("id(n) must be an Integer");
+        };
+        assert_eq!(
+            eval_in(&g, &row, "elementId(n)").unwrap(),
+            RowValue::Value(Value::String(node_id.to_string()))
+        );
+        let RowValue::Value(Value::Integer(rel_id)) = eval_in(&g, &row, "id(r)").unwrap() else {
+            panic!("id(r) must be an Integer");
+        };
+        assert_eq!(
+            eval_in(&g, &row, "elementId(r)").unwrap(),
+            RowValue::Value(Value::String(rel_id.to_string()))
+        );
+        // A null argument is null.
+        assert_eq!(
+            eval_in(&g, &row, "elementId(null)").unwrap(),
+            RowValue::NULL
+        );
+    }
+
+    #[test]
+    fn timestamp_is_a_positive_integer() {
+        // A statement-fixed millisecond epoch; only its type and positivity are contract.
+        match evaluate("timestamp()") {
+            Value::Integer(ms) => assert!(ms > 0, "timestamp() = {ms}"),
+            other => panic!("timestamp() = {other:?}, expected an Integer"),
+        }
+    }
+
+    #[test]
+    fn random_uuid_is_a_well_formed_v4() {
+        let Value::String(uuid) = evaluate("randomUUID()") else {
+            panic!("randomUUID() must be a String");
+        };
+        assert_eq!(uuid.len(), 36, "uuid = {uuid}");
+        let bytes = uuid.as_bytes();
+        // Dashes at the canonical 8-4-4-4-12 positions.
+        for pos in [8, 13, 18, 23] {
+            assert_eq!(bytes[pos], b'-', "expected '-' at {pos} in {uuid}");
+        }
+        // Version 4 nibble and the RFC-4122 variant nibble (8, 9, a or b).
+        assert_eq!(bytes[14], b'4', "version nibble in {uuid}");
+        assert!(
+            matches!(bytes[19], b'8' | b'9' | b'a' | b'b'),
+            "variant nibble in {uuid}"
+        );
+        // All non-dash characters are lower-case hex.
+        assert!(
+            uuid.chars()
+                .all(|c| c == '-' || c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+    }
+
+    #[test]
+    fn is_empty_over_lists_maps_and_strings() {
+        assert_eq!(evaluate("isEmpty([])"), Value::Boolean(true));
+        assert_eq!(evaluate("isEmpty([1])"), Value::Boolean(false));
+        assert_eq!(evaluate("isEmpty('')"), Value::Boolean(true));
+        assert_eq!(evaluate("isEmpty('a')"), Value::Boolean(false));
+        assert_eq!(evaluate("isEmpty({})"), Value::Boolean(true));
+        assert_eq!(evaluate("isEmpty({a: 1})"), Value::Boolean(false));
+        // Null propagates; a non-collection non-string is a runtime TypeError.
+        assert_eq!(evaluate("isEmpty(null)"), Value::Null);
+        assert!(matches!(
+            eval_in(&MemGraph::new(), &Row::empty(), "isEmpty(1)"),
+            Err(EvalError::TypeError { .. })
+        ));
+    }
+
+    #[test]
+    fn value_type_names_match_neo4j() {
+        assert_eq!(evaluate("valueType(1)"), s("INTEGER NOT NULL"));
+        assert_eq!(evaluate("valueType(1.5)"), s("FLOAT NOT NULL"));
+        assert_eq!(evaluate("valueType('a')"), s("STRING NOT NULL"));
+        assert_eq!(evaluate("valueType(true)"), s("BOOLEAN NOT NULL"));
+        assert_eq!(evaluate("valueType(null)"), s("null"));
+        assert_eq!(
+            evaluate("valueType([1, 2, 3])"),
+            s("LIST<INTEGER NOT NULL> NOT NULL")
+        );
+        assert_eq!(evaluate("valueType([])"), s("LIST<NOTHING> NOT NULL"));
+        // A null element makes the element type nullable (no inner NOT NULL).
+        assert_eq!(
+            evaluate("valueType([1, null])"),
+            s("LIST<INTEGER> NOT NULL")
+        );
+        assert_eq!(evaluate("valueType({a: 1})"), s("MAP NOT NULL"));
+        // Temporal / spatial names (space-separated, Neo4j 5.x).
+        assert_eq!(
+            evaluate("valueType(date('2020-01-01'))"),
+            s("DATE NOT NULL")
+        );
+        assert_eq!(
+            evaluate("valueType(duration({days: 1}))"),
+            s("DURATION NOT NULL")
+        );
+        assert_eq!(
+            evaluate("valueType(point({x: 1, y: 2}))"),
+            s("POINT NOT NULL")
+        );
+    }
+
+    #[test]
+    fn value_type_over_entities() {
+        let (g, row) = graph_with_node_and_rel();
+        assert_eq!(
+            eval_in(&g, &row, "valueType(n)").unwrap(),
+            RowValue::Value(s("NODE NOT NULL"))
+        );
+        assert_eq!(
+            eval_in(&g, &row, "valueType(r)").unwrap(),
+            RowValue::Value(s("RELATIONSHIP NOT NULL"))
+        );
+    }
+
+    #[test]
+    fn null_if_returns_null_only_when_equivalent() {
+        assert_eq!(evaluate("nullIf(1, 1)"), Value::Null);
+        assert_eq!(evaluate("nullIf(1, 2)"), Value::Integer(1));
+        assert_eq!(evaluate("nullIf('a', 'a')"), Value::Null);
+        assert_eq!(evaluate("nullIf('a', 'b')"), s("a"));
+        // A null first argument is null; differing types are never equivalent.
+        assert_eq!(evaluate("nullIf(null, 1)"), Value::Null);
+        assert_eq!(evaluate("nullIf(1, '1')"), Value::Integer(1));
+        // Same node is equivalent (identity); node vs its relationship is not.
+        let (g, row) = graph_with_node_and_rel();
+        assert_eq!(eval_in(&g, &row, "nullIf(n, n)").unwrap(), RowValue::NULL);
+        assert!(matches!(
+            eval_in(&g, &row, "nullIf(n, r)").unwrap(),
+            RowValue::Node(_)
+        ));
+    }
+
+    #[test]
+    fn char_length_is_a_size_alias() {
+        assert_eq!(evaluate("char_length('hello')"), Value::Integer(5));
+        assert_eq!(evaluate("character_length('héllo')"), Value::Integer(5));
+        assert_eq!(evaluate("char_length('')"), Value::Integer(0));
+        assert_eq!(evaluate("char_length(null)"), Value::Null);
+    }
+
+    #[test]
+    fn to_scalar_or_null_never_raises() {
+        assert_eq!(evaluate("toIntegerOrNull('42')"), Value::Integer(42));
+        assert_eq!(evaluate("toIntegerOrNull('abc')"), Value::Null);
+        assert_eq!(evaluate("toIntegerOrNull([1])"), Value::Null);
+        assert_eq!(evaluate("toFloatOrNull('1.5')"), Value::Float(1.5));
+        assert_eq!(evaluate("toFloatOrNull(true)"), Value::Null);
+        assert_eq!(evaluate("toStringOrNull(42)"), s("42"));
+        assert_eq!(evaluate("toStringOrNull([1, 2])"), Value::Null);
+    }
+
+    #[test]
+    fn to_typed_lists_convert_element_wise() {
+        assert_eq!(
+            evaluate("toIntegerList(['1', '2', 'x'])"),
+            Value::List(vec![Value::Integer(1), Value::Integer(2), Value::Null])
+        );
+        assert_eq!(
+            evaluate("toFloatList([1, 2, 'y'])"),
+            Value::List(vec![Value::Float(1.0), Value::Float(2.0), Value::Null])
+        );
+        assert_eq!(
+            evaluate("toBooleanList(['true', 'nope', false])"),
+            Value::List(vec![
+                Value::Boolean(true),
+                Value::Null,
+                Value::Boolean(false)
+            ])
+        );
+        assert_eq!(
+            evaluate("toStringList([1, 2.5, true])"),
+            Value::List(vec![s("1"), s("2.5"), s("true")])
+        );
+        // A null input list is null; a non-list argument is a runtime TypeError.
+        assert_eq!(evaluate("toIntegerList(null)"), Value::Null);
+        assert!(matches!(
+            eval_in(&MemGraph::new(), &Row::empty(), "toIntegerList(5)"),
+            Err(EvalError::TypeError { .. })
+        ));
+    }
+
+    /// A `Value::String` shorthand for the assertions above.
+    fn s(v: &str) -> Value {
+        Value::String(v.to_owned())
     }
 }

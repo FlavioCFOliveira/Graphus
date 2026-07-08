@@ -4952,6 +4952,13 @@ pub struct Accumulator {
     /// morsel tier ([`sum_is_parallel_unsafe`](Self::sum_is_parallel_unsafe)) detects this and falls back
     /// to serial. The serial path never reads this flag (its single left fold is the source of truth).
     int_sum_saturated: bool,
+    /// Running sum of the **squares** of the numeric inputs (`Σxᵢ²`), maintained only for the
+    /// standard-deviation kinds ([`AggKind::Stdev`] / [`AggKind::StdevP`]). Paired with `sum` (`Σxᵢ`)
+    /// and `count` (`n`), it lets [`finish`](Self::finish) compute the variance in a single streaming
+    /// pass — `(Σxᵢ² − (Σxᵢ)²/n)` — without buffering the values. All three components are additive, so
+    /// the fold is associative and [`combine`](Self::combine) merges partitions exactly. Left at `0.0`
+    /// for every non-stdev kind.
+    sum_sq: f64,
     extreme: Option<Value>,
     // RowValue-typed so `collect(n)` / `collect(nodes(p))` keep their structural elements.
     collected: Vec<RowValue>,
@@ -4990,6 +4997,12 @@ pub enum AggKind {
     /// `percentileDisc(expr, p)` — discrete percentile (nearest-rank) returning a real value of the
     /// set; `p ∈ [0.0, 1.0]`.
     PercentileDisc,
+    /// `stdev(expr)` — the **sample** standard deviation (Bessel-corrected, divides by `n - 1`).
+    /// Neo4j semantics: nulls are ignored, and a group of fewer than two values yields `0.0`.
+    Stdev,
+    /// `stdevp(expr)` — the **population** standard deviation (divides by `n`). Neo4j semantics:
+    /// nulls are ignored, and an empty group (or a single value) yields `0.0`.
+    StdevP,
     /// A non-aggregating expression placed in the aggregate slot (defensive; treated as last value).
     Other,
 }
@@ -5011,6 +5024,8 @@ impl Accumulator {
                     "collect" => AggKind::Collect,
                     "percentilecont" => AggKind::PercentileCont,
                     "percentiledisc" => AggKind::PercentileDisc,
+                    "stdev" => AggKind::Stdev,
+                    "stdevp" => AggKind::StdevP,
                     _ => AggKind::Other,
                 };
                 (kind, *distinct)
@@ -5039,6 +5054,7 @@ impl Accumulator {
             sum_is_int: true,
             int_sum: 0,
             int_sum_saturated: false,
+            sum_sq: 0.0,
             extreme: None,
             collected: Vec::new(),
             collected_bytes: 0,
@@ -5254,6 +5270,11 @@ impl Accumulator {
         self.int_sum_saturated |= other.int_sum_saturated;
         self.add_int_sum(other.int_sum);
         self.sum += other.sum;
+        // The `stdev`/`stdevp` squared-sum component is additive across partitions, so it merges
+        // exactly like `sum`/`count`. It stays `0.0` for every other kind, making this a no-op there;
+        // maintaining it here keeps the standard-deviation fold associative should a future recognizer
+        // ever admit it to the parallel grouped tier (it is serial-only today).
+        self.sum_sq += other.sum_sq;
         self.sum_is_int = self.sum_is_int && other.sum_is_int;
         // Extreme: keep the min/max across partitions, using the same comparator `fold_value` uses.
         if let Some(other_extreme) = other.extreme {
@@ -5456,6 +5477,23 @@ impl Accumulator {
                     self.extreme = Some(argv);
                 }
             }
+            // `stdev`/`stdevp` fold each numeric input into the running `count`/`sum`/`sum_sq` triple
+            // (`Σxᵢ`, `Σxᵢ²`), from which `finish` derives the sample / population variance. Like
+            // `sum`/`avg`, a non-numeric argument is a runtime `TypeError` and nulls were already skipped.
+            AggKind::Stdev | AggKind::StdevP => {
+                let x = match &argv {
+                    Value::Integer(i) => *i as f64,
+                    Value::Float(f) => *f,
+                    _ => {
+                        return Err(ExecError::Eval(EvalError::TypeError {
+                            context: "stdev/stdevp require numeric input".to_owned(),
+                        }));
+                    }
+                };
+                self.count += 1;
+                self.sum += x;
+                self.sum_sq += x * x;
+            }
             AggKind::Other => self.extreme = Some(argv),
             // `Collect` returned early above; `CountStar` counts rows (not values) and is driven by the
             // caller's per-row increment, not a value fold; the percentiles are kept inline in `update`.
@@ -5534,8 +5572,32 @@ impl Accumulator {
             // `collect` builds the canonical list (structural iff any element is).
             AggKind::Collect => return RowValue::list(self.collected),
             AggKind::PercentileCont | AggKind::PercentileDisc => self.finish_percentile(),
+            // Sample (`n - 1`) / population (`n`) standard deviation from the streaming triple.
+            AggKind::Stdev => Value::Float(self.finish_stdev(true)),
+            AggKind::StdevP => Value::Float(self.finish_stdev(false)),
         };
         RowValue::Value(value)
+    }
+
+    /// Computes the standard deviation from the streaming `count`/`sum`/`sum_sq` triple.
+    ///
+    /// `sample == true` applies Bessel's correction (divide the summed squared deviations by
+    /// `n − 1`, the `stdev` semantics); `sample == false` divides by `n` (the `stdevp` /
+    /// population semantics). Neo4j returns `0.0` rather than `null`/`NaN` for a degenerate group:
+    /// a `stdev` of fewer than two values, or a `stdevp` of an empty group.
+    ///
+    /// The variance is `(Σxᵢ² − (Σxᵢ)²/n) / divisor`. Floating-point cancellation can drive the
+    /// numerator a hair below zero for a group of (near-)identical values; the result is clamped to
+    /// `0.0` before the square root so a mathematically-zero variance never yields `NaN`.
+    fn finish_stdev(&self, sample: bool) -> f64 {
+        let n = self.count as f64;
+        let divisor = if sample { n - 1.0 } else { n };
+        if divisor <= 0.0 {
+            // stdev of <2 values, or stdevp of an empty group: Neo4j returns 0.0.
+            return 0.0;
+        }
+        let variance = (self.sum_sq - (self.sum * self.sum) / n) / divisor;
+        variance.max(0.0).sqrt()
     }
 
     /// Computes the group's percentile (`percentileCont`/`percentileDisc`) over the gathered numeric

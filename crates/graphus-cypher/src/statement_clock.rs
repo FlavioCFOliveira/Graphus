@@ -119,6 +119,22 @@ impl StatementClock {
         }
     }
 
+    /// Milliseconds since the Unix epoch (1970-01-01T00:00:00Z) at capture time — the value the
+    /// Cypher `timestamp()` function returns (Neo4j 5.x: "the difference, measured in milliseconds,
+    /// between the current time and midnight, January 1, 1970 UTC").
+    ///
+    /// Reading it off the captured statement instant (rather than a fresh [`SystemTime::now`])
+    /// guarantees `timestamp()` is **constant for the whole statement**, matching Neo4j's contract
+    /// that it "returns the same value during one entire statement, even if the statement is
+    /// long-running". The sub-second component is truncated to whole milliseconds. The arithmetic
+    /// saturates rather than overflowing on an absurd (far-future) system clock.
+    #[must_use]
+    pub fn epoch_millis(&self) -> i64 {
+        self.epoch_seconds
+            .saturating_mul(1_000)
+            .saturating_add(i64::from(self.sub_nanos / 1_000_000))
+    }
+
     /// Builds a [`Date`] from the **live** wall clock (the `.realtime` granularity).
     #[must_use]
     pub fn realtime_date() -> Date {

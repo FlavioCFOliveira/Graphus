@@ -407,6 +407,123 @@ fn aggregation_over_real_store() {
     assert_eq!(rows[0].value("mx"), i(30));
 }
 
+#[test]
+fn new_scalar_and_math_functions_run_through_the_full_pipeline() {
+    // Full parse → semantic-analysis → plan → execute coverage for a representative slice of the
+    // Neo4j 5.x functions added in rmp #629/#630 (the `eval` unit tests bypass semantic analysis;
+    // this proves the whole pipeline accepts and evaluates them). One node supplies `elementId`.
+    let store = fresh_store();
+    let (_r, store) = run_commit("CREATE (:Person {name: 'Ada'})", store, 1);
+    let (rows, _store) = run_commit(
+        "MATCH (n:Person) RETURN \
+         round(sqrt(2.0), 3) AS r, \
+         degrees(pi()) AS deg, \
+         valueType(n.name) AS vt, \
+         isEmpty(n.name) AS empty, \
+         char_length(n.name) AS len, \
+         toIntegerList(['1', 'x', '3']) AS ints, \
+         elementId(n) AS eid",
+        store,
+        2,
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].value("r"), Value::Float(1.414));
+    assert_eq!(rows[0].value("deg"), Value::Float(180.0));
+    assert_eq!(
+        rows[0].value("vt"),
+        Value::String("STRING NOT NULL".to_owned())
+    );
+    assert_eq!(rows[0].value("empty"), Value::Boolean(false));
+    assert_eq!(rows[0].value("len"), i(3));
+    assert_eq!(
+        rows[0].value("ints"),
+        Value::List(vec![i(1), Value::Null, i(3)])
+    );
+    // `elementId(n)` is the decimal of the node's integer id — a non-empty numeric string.
+    let Value::String(eid) = rows[0].value("eid") else {
+        panic!("elementId(n) must be a String");
+    };
+    assert!(
+        eid.chars().all(|c| c.is_ascii_digit()) && !eid.is_empty(),
+        "elementId(n) = {eid:?}, expected a decimal string"
+    );
+}
+
+#[test]
+fn stdev_and_stdevp_aggregates_over_unwind() {
+    // Regression (rmp #628): `stdev`/`stdevp` were registered as aggregates but had no `AggKind`
+    // variant, so they fell silently through to the defensive "last value" fold — `stdev(x)` over
+    // [1,2,3,4,5] returned 5 instead of the sample standard deviation.
+    let store = fresh_store();
+    let (rows, _store) = run_commit(
+        "UNWIND [1, 2, 3, 4, 5] AS x RETURN stdev(x) AS s, stdevp(x) AS p",
+        store,
+        1,
+    );
+    assert_eq!(rows.len(), 1);
+    // Sample (n-1): sqrt(2.5) ≈ 1.5811388300841898; population (n): sqrt(2.0) ≈ 1.4142135623730951.
+    let Value::Float(s) = rows[0].value("s") else {
+        panic!("stdev(x) must be a Float");
+    };
+    assert!(
+        (s - 1.581_138_830_084_189_8).abs() < 1e-9,
+        "sample stdev = {s}, expected ≈1.5811"
+    );
+    let Value::Float(p) = rows[0].value("p") else {
+        panic!("stdevp(x) must be a Float");
+    };
+    assert!(
+        (p - std::f64::consts::SQRT_2).abs() < 1e-9,
+        "population stdev = {p}, expected ≈1.4142"
+    );
+}
+
+#[test]
+fn stdev_single_value_is_zero_and_ignores_nulls() {
+    // A single contributing value yields 0.0 for both sample and population stdev, and nulls are
+    // ignored (so [7, null] behaves exactly like [7]) — Neo4j semantics (rmp #628).
+    let store = fresh_store();
+    let (rows, _store) = run_commit(
+        "UNWIND [7, null] AS x RETURN stdev(x) AS s, stdevp(x) AS p",
+        store,
+        1,
+    );
+    assert_eq!(rows[0].value("s"), Value::Float(0.0));
+    assert_eq!(rows[0].value("p"), Value::Float(0.0));
+}
+
+#[test]
+fn stdev_grouped_aggregate_over_unwind() {
+    // Grouped `stdev` (serial group path): two groups, each with its own sample standard deviation.
+    let store = fresh_store();
+    let (mut rows, _store) = run_commit(
+        "UNWIND [[1, 2], [1, 4], [1, 6], [2, 10], [2, 20]] AS pair \
+         RETURN pair[0] AS g, stdev(pair[1]) AS s ORDER BY g",
+        store,
+        1,
+    );
+    assert_eq!(rows.len(), 2);
+    // Group 1 = {2,4,6}: sample stdev = sqrt(((4-16/3... )) = 2.0. Group 2 = {10,20}: sqrt(50)≈7.071.
+    let g1 = rows.remove(0);
+    let g2 = rows.remove(0);
+    assert_eq!(g1.value("g"), i(1));
+    let Value::Float(s1) = g1.value("s") else {
+        panic!("group-1 stdev must be a Float");
+    };
+    assert!(
+        (s1 - 2.0).abs() < 1e-9,
+        "group-1 stdev = {s1}, expected 2.0"
+    );
+    assert_eq!(g2.value("g"), i(2));
+    let Value::Float(s2) = g2.value("s") else {
+        panic!("group-2 stdev must be a Float");
+    };
+    assert!(
+        (s2 - 50.0_f64.sqrt()).abs() < 1e-9,
+        "group-2 stdev = {s2}, expected ≈7.071"
+    );
+}
+
 // =================================================================================================
 // SET + DELETE over the real store
 // =================================================================================================

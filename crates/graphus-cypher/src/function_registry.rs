@@ -399,8 +399,9 @@ static TABLE: &[Signature] = &[
         aggregate: false,
     },
     Signature {
+        // `round(value)`, `round(value, precision)`, and `round(value, precision, mode)` (Neo4j 5.x).
         name: "round",
-        arity: Arity::Range(1, 2),
+        arity: Arity::Range(1, 3),
         aggregate: false,
     },
     Signature {
@@ -453,6 +454,163 @@ static TABLE: &[Signature] = &[
         arity: Arity::Exact(1),
         aggregate: false,
     },
+    // Additional Neo4j 5.x scalar / predicate functions (rmp #630).
+    Signature {
+        // `char_length(s)` / `character_length(s)` — Unicode character count; aliases of `size()`.
+        name: "char_length",
+        arity: Arity::Exact(1),
+        aggregate: false,
+    },
+    Signature {
+        name: "character_length",
+        arity: Arity::Exact(1),
+        aggregate: false,
+    },
+    Signature {
+        // `elementId(n | r)` — the STRING element identifier (matches the Bolt/REST wire element id).
+        name: "elementid",
+        arity: Arity::Exact(1),
+        aggregate: false,
+    },
+    Signature {
+        // `isEmpty(list | map | string)` — true when the collection / string has no elements.
+        name: "isempty",
+        arity: Arity::Exact(1),
+        aggregate: false,
+    },
+    Signature {
+        // `nullIf(a, b)` — null when the two arguments are equivalent, else the first argument.
+        name: "nullif",
+        arity: Arity::Exact(2),
+        aggregate: false,
+    },
+    Signature {
+        // `randomUUID()` — a randomly generated UUID string.
+        name: "randomuuid",
+        arity: Arity::Exact(0),
+        aggregate: false,
+    },
+    Signature {
+        // `timestamp()` — milliseconds since the Unix epoch (constant within a statement).
+        name: "timestamp",
+        arity: Arity::Exact(0),
+        aggregate: false,
+    },
+    Signature {
+        // `toFloatOrNull(v)` — like `toFloat` but yields null (never errors) on a non-convertible value.
+        name: "tofloatornull",
+        arity: Arity::Exact(1),
+        aggregate: false,
+    },
+    Signature {
+        // `toIntegerOrNull(v)` — like `toInteger` but yields null on a non-convertible value.
+        name: "tointegerornull",
+        arity: Arity::Exact(1),
+        aggregate: false,
+    },
+    Signature {
+        // `toStringOrNull(v)` — like `toString` but yields null on a non-convertible value.
+        name: "tostringornull",
+        arity: Arity::Exact(1),
+        aggregate: false,
+    },
+    Signature {
+        // `valueType(v)` — the STRING name of the most precise Cypher type of the value.
+        name: "valuetype",
+        arity: Arity::Exact(1),
+        aggregate: false,
+    },
+    // ---- mathematical functions (Neo4j 5.x logarithmic + trigonometric; rmp #629) ------------
+    Signature {
+        name: "acos",
+        arity: Arity::Exact(1),
+        aggregate: false,
+    },
+    Signature {
+        name: "asin",
+        arity: Arity::Exact(1),
+        aggregate: false,
+    },
+    Signature {
+        name: "atan",
+        arity: Arity::Exact(1),
+        aggregate: false,
+    },
+    Signature {
+        name: "atan2",
+        arity: Arity::Exact(2),
+        aggregate: false,
+    },
+    Signature {
+        name: "cos",
+        arity: Arity::Exact(1),
+        aggregate: false,
+    },
+    Signature {
+        name: "cot",
+        arity: Arity::Exact(1),
+        aggregate: false,
+    },
+    Signature {
+        name: "degrees",
+        arity: Arity::Exact(1),
+        aggregate: false,
+    },
+    Signature {
+        // `e()` — Euler's number, the base of the natural logarithm.
+        name: "e",
+        arity: Arity::Exact(0),
+        aggregate: false,
+    },
+    Signature {
+        name: "exp",
+        arity: Arity::Exact(1),
+        aggregate: false,
+    },
+    Signature {
+        name: "haversin",
+        arity: Arity::Exact(1),
+        aggregate: false,
+    },
+    Signature {
+        // `isNaN(number)` — whether a FLOAT is NaN (an INTEGER is never NaN).
+        name: "isnan",
+        arity: Arity::Exact(1),
+        aggregate: false,
+    },
+    Signature {
+        // `log(x)` — natural logarithm (base e).
+        name: "log",
+        arity: Arity::Exact(1),
+        aggregate: false,
+    },
+    Signature {
+        // `log10(x)` — base-10 logarithm.
+        name: "log10",
+        arity: Arity::Exact(1),
+        aggregate: false,
+    },
+    Signature {
+        // `pi()` — the mathematical constant π.
+        name: "pi",
+        arity: Arity::Exact(0),
+        aggregate: false,
+    },
+    Signature {
+        name: "radians",
+        arity: Arity::Exact(1),
+        aggregate: false,
+    },
+    Signature {
+        name: "sin",
+        arity: Arity::Exact(1),
+        aggregate: false,
+    },
+    Signature {
+        name: "tan",
+        arity: Arity::Exact(1),
+        aggregate: false,
+    },
     // ---- list functions ---------------------------------------------------------------------
     Signature {
         name: "keys",
@@ -486,6 +644,27 @@ static TABLE: &[Signature] = &[
     },
     Signature {
         name: "tail",
+        arity: Arity::Exact(1),
+        aggregate: false,
+    },
+    // List type-conversion functions (Neo4j 5.x; rmp #630): apply the matching `*OrNull` element-wise.
+    Signature {
+        name: "tobooleanlist",
+        arity: Arity::Exact(1),
+        aggregate: false,
+    },
+    Signature {
+        name: "tofloatlist",
+        arity: Arity::Exact(1),
+        aggregate: false,
+    },
+    Signature {
+        name: "tointegerlist",
+        arity: Arity::Exact(1),
+        aggregate: false,
+    },
+    Signature {
+        name: "tostringlist",
         arity: Arity::Exact(1),
         aggregate: false,
     },
