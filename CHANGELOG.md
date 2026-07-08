@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9] - 2026-07-08
+
 ### Added
 
 - **Hardware-aware startup auto-tuning (rmp #617, decision `D-hw-autotune`).** At startup the server
@@ -42,6 +44,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   page is written home ahead of its log record). Server-side defence in depth: an explicit
   `buffer_pool_pages` below the documented minimum is now rejected at startup with a clear message
   rather than reaching the pool.
+
+## [0.0.8] - 2026-07-07
 
 This release is a **Bolt-protocol / connection-pool safety** fix for explicit transactions. After
 *any* statement error inside an explicit `BEGIN … COMMIT` transaction — even a trivial `RETURN 1/0`
@@ -555,7 +559,8 @@ to build, run, and evaluate the server.
   Supply a CA-issued certificate, a strong admin password, and a real JWT secret before
   any non-sandbox use. See the README "Production / TLS" section.
 
-[Unreleased]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.8...HEAD
+[Unreleased]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.9...HEAD
+[0.0.9]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.8...v0.0.9
 [0.0.8]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.7...v0.0.8
 [0.0.7]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.6...v0.0.7
 [0.0.6]: https://github.com/FlavioCFOliveira/Graphus/compare/v0.0.5...v0.0.6
