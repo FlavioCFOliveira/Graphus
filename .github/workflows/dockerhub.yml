@@ -6,11 +6,13 @@ name: Docker Hub
 # CROSS-COMPILED on a native x86_64 self-hosted runner: the Dockerfile builder is pinned to
 # `--platform=$BUILDPLATFORM`, so the heavy Rust compile runs natively on x86 and cross-compiles the
 # arm64 (Raspberry Pi 5 / Apple Silicon) binary — no emulated compile. QEMU is set up only for the
-# tiny arm64 runtime layers. Both triggers below are trusted (never a fork pull request), so running
-# on the self-hosted machine is safe. This workflow only BUILDS the image; it never runs the tests.
+# tiny arm64 runtime layers. The trigger below is trusted (never a fork pull request), so running on
+# the self-hosted machine is safe. This workflow only BUILDS the image; it never runs the tests.
 #
-#   * workflow_dispatch    → manual, on-demand publish of a specific version (required input)
-#   * release: published   → automatic publish when a GitHub Release is published
+#   * workflow_dispatch    → manual, on-demand publish of a specific version (required input).
+#
+# This is the SOLE trigger: the image is NEVER built or published in reaction to a push, a commit,
+# or a GitHub Release — publishing to Docker Hub is always an explicit, on-demand action.
 #
 # The image is published with CONFORMANT tags ONLY — `:latest` plus a `:vX.Y.Z` version tag.
 #
@@ -23,8 +25,6 @@ on:
         description: "Version to publish, e.g. 0.0.6 (semver, no leading 'v'). Publishes :vX.Y.Z and :latest."
         required: true
         type: string
-  release:
-    types: [published]
 
 # Never cancel an in-flight publish — a half-pushed multi-arch manifest is worse than waiting.
 concurrency:
@@ -47,7 +47,6 @@ jobs:
       # A dispatch must name a concrete semver version up front, so Docker Hub can never receive a
       # non-conformant (sha/branch) tag via the manual path.
       - name: Validate the dispatch version is semver
-        if: github.event_name == 'workflow_dispatch'
         env:
           VERSION: ${{ inputs.version }}
         run: |
@@ -94,10 +93,10 @@ jobs:
         with:
           images: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_REPO }}
           # CONFORMANT TAGS ONLY — every publish carries :vX.Y.Z + :latest, never a sha or branch tag.
+          # The version comes from the required `version` dispatch input (the only trigger).
           tags: |
-            type=semver,pattern=v{{version}},enable=${{ github.event_name == 'release' }}
-            type=raw,value=v${{ inputs.version }},enable=${{ github.event_name == 'workflow_dispatch' }}
-            type=raw,value=latest,enable=${{ (github.event_name == 'release' && !github.event.release.prerelease) || github.event_name == 'workflow_dispatch' }}
+            type=raw,value=v${{ inputs.version }}
+            type=raw,value=latest
 
       - name: Build and push (multi-arch, cross-compiled)
         id: build
