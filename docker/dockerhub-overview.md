@@ -121,6 +121,10 @@ volumes:
   graphus-data:
 ```
 
+More Compose recipes — **UDS-only**, a **`Neo4j`-compat** Bolt agent, **custom ports**,
+**bind-mount persistence**, and a **production CA-TLS** setup — are in
+[`docs/docker.md`](https://github.com/FlavioCFOliveira/Graphus/blob/main/docs/docker.md).
+
 ## Persistence
 
 All durable state lives under **`/data`** — the record store (`/data/graphus-data`), the

@@ -10,7 +10,8 @@ into the guide for the interface you need.
 | **[rest-api.md](rest-api.md)** | The REST WebAPI: `POST /auth/login`, running queries and transactions, result and error shapes, health and metrics, with `curl` examples. |
 | **[bolt.md](bolt.md)** | The Bolt interfaces over TCP (Neo4j drivers) and UDS (local IPC): addresses, TLS, URI schemes, and authentication. |
 | **[security.md](security.md)** | Credentials, creating users, roles and privileges (RBAC), per-interface authentication, and multi-database scoping. |
-| **[configuration.md](configuration.md)** | Every configuration key and `GRAPHUS_*` environment variable, with defaults. |
+| **[configuration.md](configuration.md)** | Every configuration key and `GRAPHUS_*` environment variable, with defaults, and hardware auto-tuning. |
+| **[docker.md](docker.md)** | Container deployment: Docker Compose recipes for each configuration (quickstart, UDS-only, `Neo4j`-compat, custom ports, bind-mount persistence, production CA-TLS). |
 
 ## Runnable examples
 

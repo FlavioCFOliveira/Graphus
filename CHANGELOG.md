@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Hardware-aware startup auto-tuning (rmp #617, decision `D-hw-autotune`).** At startup the server
+  probes the host — logical CPUs, physical/available RAM, and the store filesystem's capacity/free
+  space + an SSD-vs-rotational hint — and sizes its resource parameters to the real hardware, while
+  any value set in the TOML file or a `GRAPHUS_*` env var overrides the auto-detection. The buffer
+  pool (previously a fixed 32 MiB regardless of RAM) auto-sizes to ~1/8 of available RAM, clamped to
+  `[32 MiB, 2 GiB]`; the reader and morsel pools resolve to `min(cpus, 16)`. Driven by a `0 = auto`
+  sentinel (new `GRAPHUS_BUFFER_POOL_PAGES`), so operator config always wins. Detection lives in a
+  new, separately-audited leaf crate `graphus-sysres` that isolates the single macOS `unsafe` sysctl
+  call, keeping `graphus-server` `#![forbid(unsafe_code)]`. A startup log line reports what was
+  detected and how each parameter resolved (`auto` vs `config`).
 - **Configurable Bolt `server` agent for legacy/strict Neo4j-driver interoperability
   (`bolt_server_agent` / `GRAPHUS_BOLT_SERVER_AGENT`, rmp #614).** By default Graphus keeps
   announcing `Graphus/<version>` in the Bolt `HELLO` `SUCCESS` — 100% Bolt-conformant and accepted by
@@ -21,7 +31,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   does **not** change Bolt/PackStream conformance nor unlock capabilities (drivers gate features on
   the negotiated Bolt version, never on this string). The four inviolable guarantees remain at 100%.
 
-## [0.0.8] - 2026-07-07
+### Fixed
+
+- **Tiny buffer-pool re-entrancy abort (rmp #302).** Building a buffer pool with a pathologically
+  small capacity could abort the process with a `RefCell already borrowed` panic during a
+  re-entrant eviction. Root-caused to the index `SharedWal::ensure_durable` (a re-entrant
+  `borrow_mut` when a caller holds the WAL latch across an evicting page write-back — the classic
+  ARIES "don't nest the buffer-pool flush under the log latch" hazard); it now fails closed with a
+  clean, recoverable error instead of aborting, preserving write-ahead-log-before-data ordering (no
+  page is written home ahead of its log record). Server-side defence in depth: an explicit
+  `buffer_pool_pages` below the documented minimum is now rejected at startup with a clear message
+  rather than reaching the pool.
 
 This release is a **Bolt-protocol / connection-pool safety** fix for explicit transactions. After
 *any* statement error inside an explicit `BEGIN … COMMIT` transaction — even a trivial `RETURN 1/0`

@@ -10,13 +10,41 @@ aarch64 (including Apple Silicon and Raspberry Pi 5+).
 
 ## Status
 
-Released — **v0.0.6** (see the [CHANGELOG](CHANGELOG.md) and
+Released — **v0.0.8** (see the [CHANGELOG](CHANGELOG.md) and
 [releases](https://github.com/FlavioCFOliveira/Graphus/releases)). The single-node
 correctness core is complete and production-hardened: the four inviolable guarantees —
 **100% ACID**, **100% openCypher TCK** (pinned `2024.3`), **100% Bolt protocol**, and
 **100% PackStream** — hold, validated by an extensive test suite including a deterministic
 simulation tester (DST/VOPR). A production-grade, multi-architecture Docker image is
 published. The complete **specification** lives in [`specification/`](specification/).
+
+## Features
+
+- **Three connection interfaces** — Bolt over **UDS** (local IPC, peer-credential auth),
+  Bolt over **TCP** (`bolt://`, TLS-mandatory, the Neo4j driver ecosystem), and a **Web REST
+  API** (JSON, JWT Bearer). An [opt-in `Neo4j`-compat Bolt agent](docs/bolt.md) interoperates
+  with strict/legacy drivers.
+- **Cypher engine** targeting the openCypher TCK, with a cost-based planner and plan cache,
+  over a **multigraph** LPG model.
+- **ACID transactions** — MVCC + Serializable Snapshot Isolation, an ARIES write-ahead log
+  with group commit, checkpoints and crash recovery. Autocommit reads run at Snapshot
+  Isolation; writes and explicit transactions are Serializable (see
+  [transactions](docs/transactions.md)).
+- **Parallelism by design** — an off-thread reader pool and intra-query morsel parallelism
+  scale reads across cores; **hardware-aware startup auto-tuning** sizes the buffer pool and
+  worker pools to the detected CPU/RAM (see
+  [configuration](docs/configuration.md#hardware-aware-auto-tuning)).
+- **Indexes & constraints** — B+-tree, composite, relationship-property, full-text and
+  spatial indexes; uniqueness/existence/type constraints; online index builds.
+- **Security** — fine-grained **RBAC**, **encryption at rest** (AES-256-GCM) with key
+  rotation, a crash-safe **audit log**, and TLS 1.3 for the network listeners (see
+  [security](docs/security.md)).
+- **Operations** — **multi-database**, high-throughput **bulk import** (offline and over
+  REST, CSV and native columnar `.gcol`) and whole-graph export, **backup + point-in-time
+  recovery**, a **graph-data-science** procedure library, and Prometheus **`/metrics`** plus
+  `/health/live` · `/health/ready` probes.
+- **Portable** — one multi-architecture binary for Linux, macOS and Raspberry Pi OS on
+  x86-64 and aarch64 (incl. Apple Silicon and Raspberry Pi 5+).
 
 ## Documentation
 
@@ -26,10 +54,12 @@ Usage documentation is in **[`docs/`](docs/)** — start with
 | Guide | Covers |
 | --- | --- |
 | [getting-started](docs/getting-started.md) | Install with Docker, credentials, first query per interface |
+| [transactions](docs/transactions.md) | Autocommit vs explicit transactions, lock-free reads, isolation levels |
 | [rest-api](docs/rest-api.md) | REST WebAPI: login/JWT, queries, transactions, errors, health |
-| [bolt](docs/bolt.md) | Bolt over TCP (Neo4j drivers) and UDS (local IPC) |
+| [bolt](docs/bolt.md) | Bolt over TCP (Neo4j drivers) and UDS (local IPC), the `Neo4j`-compat agent |
 | [security](docs/security.md) | Credentials, users, roles, and access control (RBAC) |
-| [configuration](docs/configuration.md) | Every config key and `GRAPHUS_*` environment variable |
+| [configuration](docs/configuration.md) | Every config key and `GRAPHUS_*` environment variable, hardware auto-tuning |
+| [docker](docs/docker.md) | Container deployment: Docker Compose recipes for each configuration |
 
 Runnable **Go client examples** for all three interfaces are in
 [`examples/clients-go/`](examples/clients-go).
@@ -123,7 +153,10 @@ docker compose down            # stop; the named volume keeps your data
 docker compose down -v         # stop AND delete the data volume
 ```
 
-See [`docker-compose.yml`](docker-compose.yml).
+See [`docker-compose.yml`](docker-compose.yml) for the quickstart, and
+**[docs/docker.md](docs/docker.md)** for copy-pasteable Compose recipes covering other
+configurations — **UDS-only** (no network exposure), a **`Neo4j`-compat** Bolt agent, **custom
+ports**, **bind-mount persistence**, and a **production CA-TLS** setup.
 
 ### Connecting
 
@@ -173,6 +206,11 @@ variables (`GRAPHUS_STORE_PATH`, `GRAPHUS_BOLT_TCP_ADDR`, `GRAPHUS_REST_ADDR`,
 `GRAPHUS_UDS_PATH`, `GRAPHUS_JWT_SECRET`, `GRAPHUS_TLS_CERT_PATH`,
 `GRAPHUS_TLS_KEY_PATH`, …).
 
+At startup Graphus **auto-sizes** its resource-hungry parameters (buffer pool, reader/morsel
+pools) to the detected hardware (CPU, RAM) — a startup log line shows what was detected and
+chosen. Any value you set in the file or via a `GRAPHUS_*` variable overrides the auto-size. See
+[`docs/configuration.md`](docs/configuration.md#hardware-aware-auto-tuning).
+
 ### Production / TLS
 
 The quickstart uses a self-signed certificate. For anything beyond a local
@@ -203,10 +241,10 @@ docker buildx build --platform linux/amd64,linux/arm64 \
   -t flaviocfo/graphus:latest --push .
 ```
 
-CI builds both architectures and publishes the image to **Docker Hub**
-(`flaviocfo/graphus`, see [`dockerhub.yml`](.github/workflows/dockerhub.yml)) on a
-published release, and to the **GitHub Container Registry** on every change
-(see [`docker.yml`](.github/workflows/docker.yml)).
+The multi-architecture image is published to **Docker Hub** (`flaviocfo/graphus`, see
+[`dockerhub.yml`](.github/workflows/dockerhub.yml)) **on demand only**: the workflow is
+triggered manually (`workflow_dispatch`) with the version to publish, never automatically
+from a push, a commit, or a release.
 
 ## License
 

@@ -1,4 +1,4 @@
-# Graphus — local Docker Compose example.
+# Graphus — local Docker Compose example (the quickstart profile).
 #
 #   docker compose up --build      # build from source and run
 #   docker compose down            # stop (the named volume keeps your data)
@@ -7,11 +7,16 @@
 # survive `docker compose down` and container recreation. Remove them with
 # `docker compose down -v`.
 #
+# This file is the DEFAULT quickstart. For other configurations — UDS-only (no
+# network exposure), a Neo4j-compat Bolt agent, custom ports, bind-mount
+# persistence, and a production CA-TLS setup — see the copy-pasteable recipes in
+# docs/docker.md. A few of those toggles are shown commented-out below.
+#
 # ⚠️  This example uses the image's local-quickstart defaults: a SELF-SIGNED TLS
 #     certificate (provisioned on first boot) and a well-known admin password.
 #     Bolt + REST are encrypted but the cert is untrusted — connect with
 #     bolt+ssc:// (Bolt) and curl -k (REST). Do NOT use beyond a local sandbox;
-#     see docker/graphus.toml for how to supply a real (CA-issued) certificate.
+#     see docs/docker.md (Recipe 6) for how to supply a real (CA-issued) certificate.
 
 services:
   graphus:
@@ -26,6 +31,11 @@ services:
     ports:
       - "7687:7687"   # Bolt over TCP (Neo4j drivers)
       - "7474:7474"   # Web REST API
+    # Optional feature toggles (uncomment to try; see docs/docker.md for full recipes):
+    # environment:
+    #   GRAPHUS_BOLT_SERVER_AGENT: "neo4j-compat"   # announce Neo4j/5.13.0 in the Bolt HELLO
+    #   GRAPHUS_BUFFER_POOL_PAGES: "0"               # 0 = auto-size from detected RAM (the default)
+    #   GRAPHUS_BOLT_TCP_ADDR: ""                    # "" disables Bolt-TCP (e.g. for a UDS-only setup)
     volumes:
       - graphus-data:/data
     healthcheck:
