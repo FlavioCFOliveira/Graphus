@@ -110,6 +110,7 @@ fn config(temp: &TempStore) -> ServerConfig {
         buffer_pool_pages: 1024,
         bolt_tcp_addr: None,
         advertised_bolt_address: None,
+        bolt_server_agent: None,
         rest_addr: None,
         uds_path: None,
         tls: TlsConfig::default(),

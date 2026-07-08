@@ -17,6 +17,13 @@ uds_path = "graphus.sock"
 bolt_tcp_addr = "127.0.0.1:7687"
 rest_addr = "127.0.0.1:7474"
 
+# The `server` agent string announced in the Bolt HELLO reply. Default: "Graphus/<version>", which is
+# 100% Bolt-conformant and accepted by every modern Neo4j driver. Set this ONLY to interoperate with
+# strict/legacy clients that verify the string and demand the literal "Neo4j". The shortcut
+# "neo4j-compat" expands to "Neo4j/5.13.0" (the vetted value for Graphus's negotiated Bolt 5.4); any
+# other value is announced verbatim (e.g. "Neo4j/5.13.0-graphus-<ver>" to keep the Graphus marker).
+# bolt_server_agent = "neo4j-compat"
+
 # HS256 JWT signing secret for REST Bearer auth. MUST be changed from the built-in default whenever
 # the REST listener is enabled (the server refuses to start with the insecure default).
 jwt_secret = "change-me-to-a-long-random-secret-value"

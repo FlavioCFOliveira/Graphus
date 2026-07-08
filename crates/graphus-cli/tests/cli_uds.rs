@@ -115,6 +115,7 @@ fn uds_only_config(temp: &TempStore) -> ServerConfig {
         buffer_pool_pages: 256,
         bolt_tcp_addr: None,
         advertised_bolt_address: None,
+        bolt_server_agent: None,
         rest_addr: None,
         uds_path: Some(temp.uds_path()),
         tls: TlsConfig::default(),
@@ -271,6 +272,47 @@ async fn cli_status_admin_op_reports_live_server() {
     assert!(
         report.contains("liveness:     OK"),
         "liveness proven by a live RETURN 1 round-trip:\n{report}"
+    );
+
+    server.shutdown().await.expect("clean shutdown");
+}
+
+// ----------------------------------------------------------------------------------------------
+// (b2) Neo4j-compat mode: the HELLO SUCCESS `server` agent read back by a live Bolt client is the
+// vetted `Neo4j/5.13.0`, not the Graphus default (rmp #614 — legacy Neo4j-driver interop). This is
+// the E2E proof that the `bolt_server_agent` startup option actually reaches the wire.
+// ----------------------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_status_reports_neo4j_compat_server_agent() {
+    let temp = TempStore::new("compat-agent");
+    let mut config = uds_only_config(&temp);
+    // The `neo4j-compat` shortcut resolves to `Neo4j/5.13.0` (graphus_bolt::server::NEO4J_COMPAT_SERVER_AGENT).
+    config.bolt_server_agent = Some("neo4j-compat".to_owned());
+    let server = boot(config).await;
+    let uds = server.uds_path.clone().expect("UDS enabled");
+    let uds_for_repl = uds.clone();
+
+    let report = with_client(&uds, move |client| {
+        // `:status` surfaces exactly the `server` agent string captured from the live HELLO SUCCESS.
+        let mut repl = Repl::new(client, uds_for_repl);
+        let report = repl
+            .status()
+            .expect("status op succeeds against the live server");
+        repl.goodbye();
+        report
+    })
+    .await;
+
+    // The live HELLO SUCCESS `server` field — decoded by the real Bolt client, not our own encoder —
+    // is the compat string, and the Graphus default is NOT announced.
+    assert!(
+        report.contains("Neo4j/5.13.0"),
+        "compat server agent from HELLO:\n{report}"
+    );
+    assert!(
+        !report.contains("Graphus/"),
+        "compat mode must replace the Graphus default on the wire:\n{report}"
     );
 
     server.shutdown().await.expect("clean shutdown");

@@ -75,6 +75,7 @@ fn config(temp: &TempStore) -> ServerConfig {
         buffer_pool_pages: 256,
         bolt_tcp_addr: None,
         advertised_bolt_address: None,
+        bolt_server_agent: None,
         rest_addr: None,
         uds_path: Some(temp.path.join("graphus.sock")),
         tls: TlsConfig::default(),

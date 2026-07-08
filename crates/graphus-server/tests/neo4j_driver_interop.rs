@@ -73,6 +73,7 @@ fn config_for(dir: &TempDir, cert_path: PathBuf, key_path: PathBuf) -> ServerCon
         // Ephemeral port; the OS picks it and we read it back from the handle.
         bolt_tcp_addr: Some("127.0.0.1:0".to_owned()),
         advertised_bolt_address: None,
+        bolt_server_agent: None,
         // No REST/UDS: this test only needs the TLS Bolt-TCP path the driver speaks.
         rest_addr: None,
         uds_path: None,

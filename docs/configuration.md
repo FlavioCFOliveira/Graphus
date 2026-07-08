@@ -35,6 +35,34 @@ full surface. For a listener address env var, an **empty value disables** that l
 | `bolt_tcp_addr`           | `GRAPHUS_BOLT_TCP_ADDR`            | disabled           | Bolt-over-TCP listen address. TLS required when set. (Docker: `0.0.0.0:7687`.) |
 | `uds_path`                | `GRAPHUS_UDS_PATH`                 | `graphus.sock`     | Bolt-over-UDS socket path; `None`/empty disables. (Docker: `/data/graphus.sock`.) |
 | `advertised_bolt_address` | `GRAPHUS_ADVERTISED_BOLT_ADDRESS`  | = `bolt_tcp_addr`  | Address advertised to routing (`neo4j://`) drivers when reachable via a different name/port (LB/NAT). |
+| `bolt_server_agent`       | `GRAPHUS_BOLT_SERVER_AGENT`        | `Graphus/<version>` | The `server` **agent string** announced in the Bolt `HELLO` reply. Opt-in Neo4j compatibility for strict/legacy drivers — see below. |
+
+### Bolt server agent (legacy-driver compatibility)
+
+By default Graphus announces `Graphus/<version>` in the Bolt `HELLO` `SUCCESS` — 100% Bolt-conformant,
+and accepted by every **modern** Neo4j driver (Java 4.x+, Python, JavaScript, Go, .NET), which treat
+this string as informational only. A few **strict/legacy** clients (the 1.x-era Neo4j drivers and
+third-party tooling derived from them) instead *verify* it and reject any product that is not the
+**case-sensitive** literal `Neo4j`. `bolt_server_agent` lets you interoperate with them **without**
+changing the honest default:
+
+- unset / empty → `Graphus/<version>` (the default).
+- `neo4j-compat` (case-insensitive shortcut) → `Neo4j/5.13.0`. This is the vetted value: `5.13.0` is
+  the floor of the Neo4j version window whose native Bolt maximum matches the Bolt version Graphus
+  negotiates (Bolt 5.4 ⇒ Neo4j 5.13–5.22). **Do not announce a higher Neo4j version** — a
+  version-keyed client could assume Bolt 5.7+ features Graphus does not serve.
+- any other string → announced **verbatim**. To keep the Graphus marker while still parsing as Neo4j,
+  use a suffix form such as `Neo4j/5.13.0-graphus-<version>`. Avoid spaces/parentheses (e.g.
+  `Neo4j/5.13.0 (Graphus/...)`) — they break the strict parser; the server logs a warning if it
+  detects such a shape.
+
+Announcing `Neo4j/...` does **not** change Graphus's Bolt/PackStream conformance and does **not**
+unlock capabilities: drivers gate features on the *negotiated Bolt version*, never on this string.
+
+```toml
+# Interoperate with strict/legacy Neo4j drivers:
+bolt_server_agent = "neo4j-compat"     # → announces Neo4j/5.13.0
+```
 
 ## TLS
 

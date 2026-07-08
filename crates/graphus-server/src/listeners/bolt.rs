@@ -46,11 +46,14 @@ fn mint_connection_id() -> String {
     format!("bolt-{n}")
 }
 
-/// Builds the per-connection [`SessionConfig`]: a freshly-minted unique `connection_id` plus the
-/// server's advertised routing address (rmp #95). The default `server_agent`/`routing_ttl` apply.
-fn session_config(advertised_bolt_address: Option<String>) -> SessionConfig {
+/// Builds the per-connection [`SessionConfig`]: a freshly-minted unique `connection_id`, the server's
+/// advertised routing address (rmp #95), and the `server` agent string announced in `HELLO` `SUCCESS`
+/// (rmp #614 — resolved once at startup from config, the same for every connection). The default
+/// `routing_ttl` applies.
+fn session_config(advertised_bolt_address: Option<String>, server_agent: String) -> SessionConfig {
     SessionConfig {
         connection_id: mint_connection_id(),
+        server_agent,
         advertised_bolt_address,
         ..SessionConfig::default()
     }
@@ -70,6 +73,7 @@ pub async fn run_uds_accept_loop(
     context: AdminContext,
     auth: Arc<dyn AuthProvider>,
     advertised_bolt_address: Option<String>,
+    server_agent: String,
     metrics: Arc<Metrics>,
     conn_limit: Arc<Semaphore>,
     idle_timeout: Option<Duration>,
@@ -120,7 +124,7 @@ pub async fn run_uds_accept_loop(
                     context.clone(),
                     AuditSource::BoltUds,
                     Arc::clone(&auth),
-                    session_config(advertised_bolt_address.clone()),
+                    session_config(advertised_bolt_address.clone(), server_agent.clone()),
                     idle_timeout,
                     pre_auth_timeout,
                     permit,
@@ -172,6 +176,7 @@ pub async fn run_tcp_accept_loop(
     context: AdminContext,
     auth: Arc<dyn AuthProvider>,
     advertised_bolt_address: Option<String>,
+    server_agent: String,
     metrics: Arc<Metrics>,
     conn_limit: Arc<Semaphore>,
     per_ip: Arc<PerIpConnLimiter>,
@@ -231,6 +236,7 @@ pub async fn run_tcp_accept_loop(
                 let shutdown = shutdown.clone();
                 let metrics = Arc::clone(&metrics);
                 let advertised = advertised_bolt_address.clone();
+                let agent = server_agent.clone();
                 tokio::spawn(async move {
                     match tokio::time::timeout(handshake_timeout, tls.accept(conn)).await {
                         Ok(Ok(tls_stream)) => {
@@ -242,7 +248,7 @@ pub async fn run_tcp_accept_loop(
                                 context,
                                 AuditSource::BoltTcp,
                                 auth,
-                                session_config(advertised),
+                                session_config(advertised, agent),
                                 idle_timeout,
                                 // Reuse the handshake deadline as the Bolt pre-authentication read
                                 // deadline: after TLS, it bounds the time the (now unauthenticated)

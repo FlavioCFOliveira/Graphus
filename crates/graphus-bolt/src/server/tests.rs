@@ -1732,3 +1732,49 @@ fn hello_reports_the_server_agent_and_hints() {
         "hints map present: {metadata:?}"
     );
 }
+
+#[test]
+fn hello_honors_overridden_server_agent() {
+    // The listener can override the `server` agent (rmp #614, opt-in Neo4j-compat mode): a custom
+    // SessionConfig.server_agent is announced in HELLO SUCCESS verbatim, replacing the Graphus default.
+    let input = session_input(&[hello(), Request::Goodbye]);
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::with_config(
+            &mut transport,
+            MockExecutor::new(),
+            &auth,
+            crate::server::SessionConfig {
+                server_agent: crate::server::NEO4J_COMPAT_SERVER_AGENT.to_owned(),
+                ..Default::default()
+            },
+        );
+        session.run().unwrap();
+    }
+    let (_, stream) = split_handshake(transport.written());
+    let r = decode_responses(stream);
+    let Response::Success { metadata } = &r[0] else {
+        panic!("expected HELLO SUCCESS, got {:?}", r[0]);
+    };
+    match metadata.iter().find(|(k, _)| k == "server").map(|(_, v)| v) {
+        Some(Value::String(s)) => assert_eq!(s, "Neo4j/5.13.0", "overridden server agent: {s}"),
+        other => panic!("server agent missing/!string: {other:?}"),
+    }
+}
+
+#[test]
+fn neo4j_compat_agent_matches_negotiated_bolt_window() {
+    // The Neo4j-compat agent (rmp #614) must announce a Neo4j version whose *native* Bolt maximum
+    // equals the Bolt version Graphus negotiates. Graphus pins MAX_MINOR = 4 (Bolt 5.4); per the
+    // official Bolt compatibility matrix Bolt 5.4 ⇒ Neo4j 5.13–5.22, and we announce the 5.13.0 floor.
+    // These two constants live in different modules with nothing else coupling them — this test makes
+    // a future MAX_MINOR bump fail LOUDLY here, forcing a conscious re-selection of the compat version
+    // (a stale higher/lower Neo4j version would misrepresent the capabilities Graphus actually serves).
+    assert_eq!(
+        crate::handshake::MAX_MINOR,
+        4,
+        "Bolt max minor changed — re-select NEO4J_COMPAT_SERVER_AGENT against the Bolt↔Neo4j matrix"
+    );
+    assert_eq!(crate::server::NEO4J_COMPAT_SERVER_AGENT, "Neo4j/5.13.0");
+}

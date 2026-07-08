@@ -94,6 +94,22 @@ impl State {
 /// override it with a build-stamped one via [`SessionConfig`].
 pub const DEFAULT_SERVER_AGENT: &str = concat!("Graphus/", env!("CARGO_PKG_VERSION"));
 
+/// The `server` agent string for the **opt-in Neo4j compatibility mode** (the listener selects it via
+/// [`SessionConfig::server_agent`]; not the default). Some strict/legacy Bolt clients — the 1.x-era
+/// Neo4j drivers and third-party tooling derived from them — verify the `HELLO` `SUCCESS` `server`
+/// string and reject any product that is not the *case-sensitive* literal `Neo4j` (they parse it with
+/// an anchored `([^/]+)/(\d+)\.(\d+)…` regex and compare the product with `.equals("Neo4j")`). This
+/// value satisfies that check so Graphus interoperates with the widest driver ecosystem.
+///
+/// **Why `5.13.0` and never higher:** the announced Neo4j version must map to a Neo4j release whose
+/// *native* Bolt maximum equals the Bolt version Graphus actually negotiates. Graphus pins Bolt
+/// [`handshake::MAX_MINOR`](crate::handshake::MAX_MINOR) = **5.4**, and per the official Bolt
+/// compatibility matrix Bolt 5.4 ⇒ Neo4j **5.13–5.22**; `5.13.0` is the floor of that window.
+/// Announcing a higher Neo4j version (e.g. `5.26`, which speaks Bolt 5.7/5.8 natively) could make a
+/// version-keyed client assume Bolt features Graphus does not serve. If [`handshake::MAX_MINOR`] is
+/// ever raised, this constant must move in lock-step to the matching Neo4j floor.
+pub const NEO4J_COMPAT_SERVER_AGENT: &str = "Neo4j/5.13.0";
+
 /// Smallest valid `TELEMETRY` `api` value (`0` = managed transaction). The Bolt 5.4+ message spec
 /// enumerates the `api` field as `0` (managed transaction), `1` (explicit transaction), `2`
 /// (implicit transaction), `3` (driver-level `execute_query()`); any value outside this inclusive

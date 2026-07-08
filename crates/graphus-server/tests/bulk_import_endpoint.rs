@@ -72,6 +72,7 @@ fn base_config(temp: &TempStore, bulk_import: BulkImportConfig) -> ServerConfig 
         buffer_pool_pages: 256,
         bolt_tcp_addr: None,
         advertised_bolt_address: None,
+        bolt_server_agent: None,
         rest_addr: Some("127.0.0.1:0".to_owned()),
         uds_path: None,
         tls: TlsConfig::default(),

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Configurable Bolt `server` agent for legacy/strict Neo4j-driver interoperability
+  (`bolt_server_agent` / `GRAPHUS_BOLT_SERVER_AGENT`, rmp #614).** By default Graphus keeps
+  announcing `Graphus/<version>` in the Bolt `HELLO` `SUCCESS` — 100% Bolt-conformant and accepted by
+  every modern Neo4j driver. Some strict/legacy clients (1.x-era drivers and tooling derived from
+  them) instead verify this string and reject any product that is not the case-sensitive literal
+  `Neo4j`. The new opt-in startup option controls the advertised agent: unset → the `Graphus/`
+  default; the `neo4j-compat` shortcut → the vetted `Neo4j/5.13.0` (the floor of the Neo4j window
+  whose native Bolt maximum matches Graphus's negotiated Bolt 5.4, so no version-keyed client assumes
+  Bolt features Graphus does not serve); any other value is announced verbatim. Announcing `Neo4j/…`
+  does **not** change Bolt/PackStream conformance nor unlock capabilities (drivers gate features on
+  the negotiated Bolt version, never on this string). The four inviolable guarantees remain at 100%.
+
 ## [0.0.8] - 2026-07-07
 
 This release is a **Bolt-protocol / connection-pool safety** fix for explicit transactions. After

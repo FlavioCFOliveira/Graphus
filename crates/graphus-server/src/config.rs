@@ -821,6 +821,25 @@ pub struct ServerConfig {
     /// `0.0.0.0:7687`) is not usable as a reconnection target. Graphus is a single instance, so all
     /// three routing roles (read/write/route) advertise this one address.
     pub advertised_bolt_address: Option<String>,
+    /// The `server` **agent string** advertised in the Bolt `HELLO` `SUCCESS` (rmp #614), or `None`
+    /// to keep the honest default
+    /// [`graphus_bolt::server::DEFAULT_SERVER_AGENT`] (`Graphus/<version>`, 100% Bolt-conform).
+    ///
+    /// **Opt-in Neo4j compatibility.** Some strict/legacy Bolt clients (the 1.x-era Neo4j drivers and
+    /// third-party tooling derived from them) verify this string and reject any product that is not
+    /// the *case-sensitive* literal `Neo4j`. Set this to interoperate with them. Accepted forms
+    /// (resolved by [`resolved_bolt_server_agent`](Self::resolved_bolt_server_agent)):
+    /// - the shortcut **`neo4j-compat`** (case-insensitive) → expands to the vetted
+    ///   [`graphus_bolt::server::NEO4J_COMPAT_SERVER_AGENT`] (`Neo4j/5.13.0`);
+    /// - any other non-empty string → used **verbatim** (full operator control, e.g.
+    ///   `Neo4j/5.13.0-graphus-<ver>` to keep the Graphus marker while still parsing as Neo4j);
+    /// - empty/blank or unset → the `Graphus/<version>` default.
+    ///
+    /// Overridable via `GRAPHUS_BOLT_SERVER_AGENT`. Announcing `Neo4j/...` does not change Graphus's
+    /// Bolt/PackStream conformance nor unlock capabilities (drivers gate features on the *negotiated
+    /// Bolt version*, not this string); see [`NEO4J_COMPAT_SERVER_AGENT`](graphus_bolt::server::NEO4J_COMPAT_SERVER_AGENT)
+    /// for why the announced Neo4j version must not exceed the negotiated Bolt window.
+    pub bolt_server_agent: Option<String>,
     /// TCP address for the REST listener, or `None` to disable it. TLS required when set.
     pub rest_addr: Option<String>,
     /// Filesystem path for the Bolt-over-UDS listener, or `None` to disable it.
@@ -883,6 +902,7 @@ impl Default for ServerConfig {
             buffer_pool_pages: 4096,
             bolt_tcp_addr: None,
             advertised_bolt_address: None,
+            bolt_server_agent: None,
             rest_addr: Some("127.0.0.1:7474".to_owned()),
             uds_path: Some(PathBuf::from("graphus.sock")),
             tls: TlsConfig::default(),
@@ -910,6 +930,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("buffer_pool_pages", &self.buffer_pool_pages)
             .field("bolt_tcp_addr", &self.bolt_tcp_addr)
             .field("advertised_bolt_address", &self.advertised_bolt_address)
+            .field("bolt_server_agent", &self.bolt_server_agent)
             .field("rest_addr", &self.rest_addr)
             .field("uds_path", &self.uds_path)
             .field("tls", &self.tls)
@@ -975,6 +996,18 @@ impl ServerConfig {
         {
             self.advertised_bolt_address = None;
         }
+        // The advertised Bolt agent: a blank value means "keep the default", exactly like a blanked
+        // listener address disables its listener; a set value is trimmed so the stored/announced form
+        // is canonical (leading/trailing whitespace in an agent string would defeat the strict Neo4j
+        // parser it may be trying to satisfy — see `resolved_bolt_server_agent`).
+        if let Some(agent) = self.bolt_server_agent.as_deref() {
+            let trimmed = agent.trim();
+            self.bolt_server_agent = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_owned())
+            };
+        }
         if self
             .rest_addr
             .as_deref()
@@ -1013,6 +1046,9 @@ impl ServerConfig {
         }
         if let Ok(v) = var("GRAPHUS_ADVERTISED_BOLT_ADDRESS") {
             self.advertised_bolt_address = empty_to_none(v);
+        }
+        if let Ok(v) = var("GRAPHUS_BOLT_SERVER_AGENT") {
+            self.bolt_server_agent = empty_to_none(v);
         }
         if let Ok(v) = var("GRAPHUS_REST_ADDR") {
             self.rest_addr = empty_to_none(v);
@@ -1356,12 +1392,99 @@ impl ServerConfig {
             .clone()
             .or_else(|| self.bolt_tcp_addr.clone())
     }
+
+    /// The `server` agent string to announce in the Bolt `HELLO` `SUCCESS`, resolved from
+    /// [`bolt_server_agent`](Self::bolt_server_agent) (rmp #614):
+    /// - `None` → the honest default `Graphus/<version>`
+    ///   ([`DEFAULT_SERVER_AGENT`](graphus_bolt::server::DEFAULT_SERVER_AGENT));
+    /// - the case-insensitive shortcut [`NEO4J_COMPAT_AGENT_SHORTCUT`] (`"neo4j-compat"`) → the vetted
+    ///   `Neo4j/5.13.0` ([`NEO4J_COMPAT_SERVER_AGENT`](graphus_bolt::server::NEO4J_COMPAT_SERVER_AGENT));
+    /// - any other value → returned **verbatim** (the operator owns the exact string).
+    ///
+    /// [`normalize`](Self::normalize) already trims and maps blank → `None`; this resolver **also**
+    /// trims and treats blank as unset, so it stays correct even if called on a not-yet-normalized
+    /// config (defence in depth — a stray leading/trailing space must never reach the wire and defeat
+    /// the strict Neo4j parser).
+    #[must_use]
+    pub fn resolved_bolt_server_agent(&self) -> String {
+        use graphus_bolt::server::{DEFAULT_SERVER_AGENT, NEO4J_COMPAT_SERVER_AGENT};
+        match self.bolt_server_agent.as_deref().map(str::trim) {
+            None | Some("") => DEFAULT_SERVER_AGENT.to_owned(),
+            Some(s) if s.eq_ignore_ascii_case(NEO4J_COMPAT_AGENT_SHORTCUT) => {
+                NEO4J_COMPAT_SERVER_AGENT.to_owned()
+            }
+            Some(s) => s.to_owned(),
+        }
+    }
 }
 
 /// Maps an empty string to `None` so `GRAPHUS_REST_ADDR=` explicitly *disables* a listener (rather
 /// than binding to the empty address).
 fn empty_to_none(v: String) -> Option<String> {
     if v.trim().is_empty() { None } else { Some(v) }
+}
+
+/// The case-insensitive shortcut token for [`bolt_server_agent`](ServerConfig::bolt_server_agent)
+/// that expands to the vetted Neo4j-compatibility agent string
+/// [`NEO4J_COMPAT_SERVER_AGENT`](graphus_bolt::server::NEO4J_COMPAT_SERVER_AGENT) (`Neo4j/5.13.0`),
+/// so an operator need not hard-code (and risk mistyping) the exact string.
+pub const NEO4J_COMPAT_AGENT_SHORTCUT: &str = "neo4j-compat";
+
+/// Does `agent` *claim* the Neo4j product but in a shape a strict/legacy Neo4j driver would reject —
+/// defeating the very compatibility it is meant to buy?
+///
+/// Such a driver does two things the modern ones don't: it parses the string with an **anchored**
+/// regex `([^/]+)/(\d+)\.(\d+)(?:\.)?(\d*)(\.|-|\+)?([0-9A-Za-z-.]*)?` (it must consume the *whole*
+/// string), and it then checks the product with a **case-sensitive** `.equals("Neo4j")`. A string can
+/// fail either gate:
+/// - **wrong case** — `neo4j/5.13.0`, `NEO4J/5.13.0`: parse fine but fail the case-sensitive product
+///   check. This is the *most plausible* operator typo — they believe they enabled compat and would
+///   otherwise get no signal.
+/// - **malformed version** — `Neo4j/5`, `Neo4j/5.`, `Neo4j/5.13 beta`, `Neo4j/5.26.0 (Graphus/0.0.8)`:
+///   the anchored regex needs at least `<major>.<minor>` and forbids spaces/parens/extra `/`.
+///
+/// This flags exactly those cases while keeping **zero false positives** (every safe form —
+/// `Neo4j/5.13.0`, `Neo4j/5.13.0-graphus-<ver>`, and any non-Neo4j product like `Graphus/…` — is left
+/// alone). It drives a **startup warning only**, never a rejection: the operator's explicit string is
+/// still announced verbatim.
+#[must_use]
+pub fn bolt_agent_claims_neo4j_but_unparseable(agent: &str) -> bool {
+    // Split product/version on the first `/`; without one, it is not claiming the Neo4j shape.
+    let Some((product, version)) = agent.split_once('/') else {
+        return false;
+    };
+    // Only agents that *attempt* the Neo4j product are this heuristic's business.
+    if !product.eq_ignore_ascii_case("Neo4j") {
+        return false;
+    }
+    // Attempting Neo4j: reject if the product is not the case-sensitive literal, or the version does
+    // not match the strict anchored shape.
+    product != "Neo4j" || !neo4j_version_is_strict_parseable(version)
+}
+
+/// Whether `version` matches the version tail of the strict/legacy Neo4j driver's anchored regex
+/// `(\d+)\.(\d+)(?:\.)?(\d*)(\.|-|\+)?([0-9A-Za-z-.]*)?`: it must begin with `<major>.<minor>`
+/// (digits, `.`, digits) and the whole remainder may contain only the suffix alphabet
+/// `[0-9A-Za-z]` plus the separators `.`, `-`, `+` (never a space, `(`, `)` or `/`).
+fn neo4j_version_is_strict_parseable(version: &str) -> bool {
+    // <major>: one or more leading digits.
+    let major_len = version.chars().take_while(char::is_ascii_digit).count();
+    if major_len == 0 {
+        return false;
+    }
+    // A literal `.` must follow the major.
+    let Some(after_major) = version[major_len..].strip_prefix('.') else {
+        return false;
+    };
+    // <minor>: one or more digits.
+    let minor_len = after_major.chars().take_while(char::is_ascii_digit).count();
+    if minor_len == 0 {
+        return false;
+    }
+    // The rest (optional patch/suffix) may only use the regex's allowed alphabet.
+    after_major[minor_len..]
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
 }
 
 #[cfg(test)]
@@ -1987,6 +2110,7 @@ mod tests {
         // Explicit advertised address wins.
         let cfg = ServerConfig {
             advertised_bolt_address: Some("public.example:7687".to_owned()),
+            bolt_server_agent: None,
             bolt_tcp_addr: Some("0.0.0.0:7687".to_owned()),
             ..ServerConfig::default()
         };
@@ -1998,6 +2122,7 @@ mod tests {
         // Unset advertised address falls back to the Bolt-TCP bind address.
         let cfg = ServerConfig {
             advertised_bolt_address: None,
+            bolt_server_agent: None,
             bolt_tcp_addr: Some("10.0.0.5:7687".to_owned()),
             ..ServerConfig::default()
         };
@@ -2009,6 +2134,7 @@ mod tests {
         // Neither set (UDS-only): None — the Bolt session uses its documented localhost fallback.
         let cfg = ServerConfig {
             advertised_bolt_address: None,
+            bolt_server_agent: None,
             bolt_tcp_addr: None,
             ..ServerConfig::default()
         };
@@ -2019,10 +2145,100 @@ mod tests {
     fn normalize_blanks_disable_advertised_bolt_address() {
         let mut cfg = ServerConfig {
             advertised_bolt_address: Some("   ".to_owned()),
+            bolt_server_agent: None,
             ..ServerConfig::default()
         };
         cfg.normalize();
         assert_eq!(cfg.advertised_bolt_address, None);
+    }
+
+    #[test]
+    fn bolt_server_agent_resolves_default_shortcut_and_verbatim() {
+        use graphus_bolt::server::{DEFAULT_SERVER_AGENT, NEO4J_COMPAT_SERVER_AGENT};
+
+        // Unset → the honest `Graphus/<version>` default (rmp #614; the user-chosen opt-in policy).
+        let cfg = ServerConfig {
+            bolt_server_agent: None,
+            ..ServerConfig::default()
+        };
+        assert_eq!(cfg.resolved_bolt_server_agent(), DEFAULT_SERVER_AGENT);
+        assert!(cfg.resolved_bolt_server_agent().starts_with("Graphus/"));
+
+        // The shortcut expands to the vetted Neo4j-compat string — case-insensitively, so
+        // `neo4j-compat` / `Neo4j-Compat` / `NEO4J-COMPAT` all work.
+        for token in ["neo4j-compat", "Neo4j-Compat", "NEO4J-COMPAT"] {
+            let cfg = ServerConfig {
+                bolt_server_agent: Some(token.to_owned()),
+                ..ServerConfig::default()
+            };
+            assert_eq!(
+                cfg.resolved_bolt_server_agent(),
+                NEO4J_COMPAT_SERVER_AGENT,
+                "shortcut {token:?} must expand to {NEO4J_COMPAT_SERVER_AGENT}"
+            );
+        }
+        // The vetted constant is exactly the Neo4j-5.13.0 floor of the Bolt-5.4 window.
+        assert_eq!(NEO4J_COMPAT_SERVER_AGENT, "Neo4j/5.13.0");
+
+        // Any other value is announced verbatim — full operator control (e.g. keep the Graphus marker
+        // in a strict-parseable form).
+        let cfg = ServerConfig {
+            bolt_server_agent: Some("Neo4j/5.13.0-graphus-0.0.8".to_owned()),
+            ..ServerConfig::default()
+        };
+        assert_eq!(
+            cfg.resolved_bolt_server_agent(),
+            "Neo4j/5.13.0-graphus-0.0.8"
+        );
+    }
+
+    #[test]
+    fn normalize_trims_and_blanks_bolt_server_agent() {
+        // Blank → None → resolves back to the default.
+        let mut cfg = ServerConfig {
+            bolt_server_agent: Some("   ".to_owned()),
+            ..ServerConfig::default()
+        };
+        cfg.normalize();
+        assert_eq!(cfg.bolt_server_agent, None);
+
+        // A set value is trimmed to its canonical form (surrounding whitespace would defeat the
+        // strict Neo4j parser it may be meant to satisfy).
+        let mut cfg = ServerConfig {
+            bolt_server_agent: Some("  Neo4j/5.13.0  ".to_owned()),
+            ..ServerConfig::default()
+        };
+        cfg.normalize();
+        assert_eq!(cfg.bolt_server_agent.as_deref(), Some("Neo4j/5.13.0"));
+    }
+
+    #[test]
+    fn neo4j_agent_footgun_detection() {
+        // Malformed version: space + parentheses + second `/` break the strict anchored parser.
+        assert!(bolt_agent_claims_neo4j_but_unparseable(
+            "Neo4j/5.26.0 (Graphus/0.0.8)"
+        ));
+        assert!(bolt_agent_claims_neo4j_but_unparseable("Neo4j/")); // no version at all
+        assert!(bolt_agent_claims_neo4j_but_unparseable("Neo4j/5.13 beta"));
+        assert!(bolt_agent_claims_neo4j_but_unparseable("Neo4j/5")); // no minor
+        assert!(bolt_agent_claims_neo4j_but_unparseable("Neo4j/5.")); // empty minor
+        assert!(bolt_agent_claims_neo4j_but_unparseable("Neo4j/x.y")); // non-numeric
+
+        // Wrong case: parses, but fails the driver's case-sensitive `.equals("Neo4j")` genuineness
+        // check — the most plausible operator typo, and now warned.
+        assert!(bolt_agent_claims_neo4j_but_unparseable("neo4j/5.13.0"));
+        assert!(bolt_agent_claims_neo4j_but_unparseable("NEO4J/5.13.0"));
+
+        // Safe compatible forms are NOT flagged (zero false positives).
+        assert!(!bolt_agent_claims_neo4j_but_unparseable("Neo4j/5.13.0"));
+        assert!(!bolt_agent_claims_neo4j_but_unparseable("Neo4j/5.13")); // major.minor only is legal
+        assert!(!bolt_agent_claims_neo4j_but_unparseable(
+            "Neo4j/5.13.0-graphus-0.0.8"
+        ));
+        // Non-Neo4j products are none of this heuristic's business (the honest default included).
+        assert!(!bolt_agent_claims_neo4j_but_unparseable("Graphus/0.0.8"));
+        assert!(!bolt_agent_claims_neo4j_but_unparseable("MyGraph/1.0.0"));
+        assert!(!bolt_agent_claims_neo4j_but_unparseable("no-slash-at-all"));
     }
 
     #[test]

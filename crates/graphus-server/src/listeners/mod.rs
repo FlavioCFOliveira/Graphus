@@ -175,6 +175,20 @@ pub async fn start_all(
     // `ServerConfig::resolved_advertised_bolt_address`).
     let advertised_bolt = config.resolved_advertised_bolt_address();
 
+    // The `server` agent string announced in every Bolt `HELLO` `SUCCESS` (rmp #614): the honest
+    // `Graphus/<version>` default, or an operator-chosen value (e.g. `neo4j-compat` → `Neo4j/5.13.0`)
+    // for legacy-driver interop. Resolved once here — it is the same for every connection — and passed
+    // to both Bolt accept loops.
+    let bolt_server_agent = config.resolved_bolt_server_agent();
+    if crate::config::bolt_agent_claims_neo4j_but_unparseable(&bolt_server_agent) {
+        tracing::warn!(
+            server_agent = %bolt_server_agent,
+            "configured bolt_server_agent claims Neo4j identity but is not in a form the strict/legacy \
+             Neo4j driver parser accepts (a space, parenthesis or extra '/' after the version); such a \
+             client may still reject it. Use e.g. `Neo4j/5.13.0` or `Neo4j/5.13.0-graphus-<ver>`."
+        );
+    }
+
     // The shared database-targeting + admin-statement context (rmp #84/#92). One per server: both
     // Bolt loops clone it per connection, the REST adapter holds one. It carries the live
     // `SecurityCatalog` (admin authorization + security-command execution + persistence).
@@ -196,6 +210,7 @@ pub async fn start_all(
             context.clone(),
             Arc::clone(&auth),
             advertised_bolt.clone(),
+            bolt_server_agent.clone(),
             Arc::clone(&metrics),
             Arc::clone(&conn_limit),
             idle_timeout,
@@ -228,6 +243,7 @@ pub async fn start_all(
             context.clone(),
             Arc::clone(&auth),
             advertised_bolt.clone(),
+            bolt_server_agent.clone(),
             Arc::clone(&metrics),
             Arc::clone(&conn_limit),
             Arc::clone(&per_ip_limiter),

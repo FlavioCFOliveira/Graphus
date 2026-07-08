@@ -114,6 +114,12 @@ dialing. To use UDS you therefore speak Bolt directly over the socket. Two optio
   four 32-bit version proposals. Graphus negotiates the highest mutually supported minor in
   the 5.0–5.4 window and replies with the chosen 4-byte version (or `00 00 00 00` to
   reject). The modern Manifest-v1 handshake is also supported.
+- **Server agent.** The `HELLO` reply's `SUCCESS` carries a `server` agent string. Graphus announces
+  `Graphus/<version>` by default — 100% Bolt-conformant and accepted by every modern Neo4j driver
+  (which treat it as informational). For strict/legacy clients that demand the literal `Neo4j`, set
+  the `bolt_server_agent` startup option (e.g. `neo4j-compat` → `Neo4j/5.13.0`); see
+  [configuration.md](configuration.md#bolt-server-agent-legacy-driver-compatibility). This never
+  affects conformance or negotiated capabilities.
 - **Messages.** Each Bolt message is a PackStream structure framed in chunks (a 2-byte
   big-endian length per chunk, terminated by `00 00`). The request set used by a client is
   `HELLO`, `LOGON`, `RUN`, `PULL`/`DISCARD`, `BEGIN`/`COMMIT`/`ROLLBACK`, `RESET`,
