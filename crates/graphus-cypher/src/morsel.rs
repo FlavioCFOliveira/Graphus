@@ -2078,12 +2078,17 @@ pub fn is_pure_per_row_expr(expr: &Expr) -> bool {
                 && case.else_expr.as_deref().is_none_or(is_pure_per_row_expr)
         }
 
-        // Cross-row / non-deterministic / nested-query shapes: always decline (serial path).
+        // Cross-row / non-deterministic / nested-query shapes: always decline (serial path). `reduce`
+        // and map projection are pure per row, but — like the comprehensions / quantifiers above —
+        // are declined here conservatively: the intra-query morsel fast-path stays limited to the
+        // simple operator/accessor shapes, and these forms fall to the (correct) serial evaluator.
         ExprKind::FunctionCall { .. }
         | ExprKind::CountStar
         | ExprKind::ListComprehension(_)
         | ExprKind::PatternComprehension(_)
         | ExprKind::Quantifier(_)
+        | ExprKind::Reduce(_)
+        | ExprKind::MapProjection(_)
         | ExprKind::ExistsSubquery(_) => false,
     }
 }

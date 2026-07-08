@@ -477,6 +477,19 @@ fn collect_expr_literals(expr: &Expr, out: &mut Vec<LiteralSite>) {
             collect_expr_literals(&q.list, out);
             collect_expr_literals(&q.predicate, out);
         }
+        ExprKind::Reduce(r) => {
+            collect_expr_literals(&r.init, out);
+            collect_expr_literals(&r.list, out);
+            collect_expr_literals(&r.body, out);
+        }
+        ExprKind::MapProjection(mp) => {
+            collect_expr_literals(&mp.entity, out);
+            for sel in &mp.selectors {
+                if let crate::ast::MapProjectionSelector::Entry { value, .. } = sel {
+                    collect_expr_literals(value, out);
+                }
+            }
+        }
         ExprKind::ExistsSubquery(ex) => {
             for part in &ex.pattern {
                 collect_pattern_element_literals(&part.element, out);

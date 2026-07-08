@@ -1173,6 +1173,28 @@ fn fmt_expr(expr: &Expr) -> String {
                 fmt_expr(&q.predicate),
             )
         }
+        ExprKind::Reduce(r) => format!(
+            "reduce({} = {}, {} IN {} | {})",
+            r.accumulator.name,
+            fmt_expr(&r.init),
+            r.variable.name,
+            fmt_expr(&r.list),
+            fmt_expr(&r.body),
+        ),
+        ExprKind::MapProjection(mp) => {
+            let rendered: Vec<String> = mp
+                .selectors
+                .iter()
+                .map(|s| match s {
+                    crate::ast::MapProjectionSelector::Property(key) => format!(".{key}"),
+                    crate::ast::MapProjectionSelector::AllProperties => ".*".to_owned(),
+                    crate::ast::MapProjectionSelector::Entry { key, value } => {
+                        format!("{}: {}", key.name, fmt_expr(value))
+                    }
+                })
+                .collect();
+            format!("{}{{{}}}", fmt_expr(&mp.entity), rendered.join(", "))
+        }
         ExprKind::ExistsSubquery(_) => "EXISTS{...}".to_owned(),
     }
 }

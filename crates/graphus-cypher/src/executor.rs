@@ -2879,11 +2879,14 @@ fn expr_references_var(expr: &Expr, var: &str) -> bool {
                     .as_deref()
                     .is_some_and(|e| expr_references_var(e, var))
         }
-        // Comprehensions / quantifiers / subqueries are rejected by the purity gate before this is
-        // reached, so a conservative `false` is fine (the column already declined).
+        // Comprehensions / quantifiers / reduce / map projections / subqueries are rejected by the
+        // purity gate before this is reached, so a conservative `false` is fine (the column already
+        // declined).
         ExprKind::ListComprehension(_)
         | ExprKind::PatternComprehension(_)
         | ExprKind::Quantifier(_)
+        | ExprKind::Reduce(_)
+        | ExprKind::MapProjection(_)
         | ExprKind::ExistsSubquery(_) => false,
     }
 }
@@ -4920,6 +4923,26 @@ fn extract_aggregates(expr: &Expr, subs: &mut Vec<(String, Expr)>, col: usize) -
             q.list = rewrite(&q.list, subs);
             q.predicate = rewrite(&q.predicate, subs);
             ExprKind::Quantifier(q)
+        }
+        // `reduce` hoists an aggregate out of its enclosing-scope init / source list (its body cannot
+        // legally hold one — the semantic pass rejects it — but is rewritten for symmetry).
+        ExprKind::Reduce(r) => {
+            let mut r = (**r).clone();
+            r.init = rewrite(&r.init, subs);
+            r.list = rewrite(&r.list, subs);
+            r.body = rewrite(&r.body, subs);
+            ExprKind::Reduce(Box::new(r))
+        }
+        // A map projection hoists an aggregate out of its entity and its literal entry values.
+        ExprKind::MapProjection(mp) => {
+            let mut mp = (**mp).clone();
+            mp.entity = rewrite(&mp.entity, subs);
+            for sel in &mut mp.selectors {
+                if let crate::ast::MapProjectionSelector::Entry { value, .. } = sel {
+                    *value = rewrite(value, subs);
+                }
+            }
+            ExprKind::MapProjection(Box::new(mp))
         }
         // Pattern comprehensions / EXISTS subqueries cannot contain aggregates (their scopes are
         // pattern-bound; the semantic pass rejects aggregation inside them), so pass them through.

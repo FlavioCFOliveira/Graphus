@@ -752,6 +752,19 @@ impl Expr {
                 q.list.zero_spans_in_place();
                 q.predicate.zero_spans_in_place();
             }
+            ExprKind::Reduce(r) => {
+                r.init.zero_spans_in_place();
+                r.list.zero_spans_in_place();
+                r.body.zero_spans_in_place();
+            }
+            ExprKind::MapProjection(mp) => {
+                mp.entity.zero_spans_in_place();
+                for sel in &mut mp.selectors {
+                    if let MapProjectionSelector::Entry { value, .. } = sel {
+                        value.zero_spans_in_place();
+                    }
+                }
+            }
             // Pattern-scoped forms embed patterns that themselves embed expressions; an `ORDER BY`
             // restatement never targets these, so a shallow zeroing of the boxed node's own
             // expression children is sufficient for the equality use-case (the embedded patterns'
@@ -1043,6 +1056,13 @@ pub enum ExprKind {
     /// A quantifier predicate `all/any/none/single(x IN list WHERE p)` (openCypher
     /// `Quantifier`).
     Quantifier(Box<QuantifierExpr>),
+    /// A list fold `reduce(acc = init, x IN list | body)` (openCypher / Neo4j `reduce`). Boxed to
+    /// keep [`Expr`] small: a [`ReduceExpr`] carries three boxed sub-expressions plus two
+    /// [`Variable`]s.
+    Reduce(Box<ReduceExpr>),
+    /// A map projection `entity { .prop, .*, key: expr, var }` (Neo4j map projection). Boxed for the
+    /// same size reason as [`Reduce`](Self::Reduce).
+    MapProjection(Box<MapProjection>),
     /// An existential subquery `EXISTS { [MATCH] pattern [WHERE p] }` (openCypher
     /// `ExistentialSubquery`). Boxed for the same embedded-pattern reason as
     /// [`PatternComprehension`](Self::PatternComprehension).
@@ -1232,6 +1252,59 @@ pub enum QuantifierKind {
     None,
     /// `single(...)` — exactly one element satisfies the predicate.
     Single,
+}
+
+/// A list fold `reduce(accumulator = init, variable IN list | body)` (openCypher / Neo4j `reduce`).
+///
+/// Evaluates as a left fold: the accumulator starts at `init`, and for each element of `list` the
+/// `body` is evaluated with both `accumulator` and `variable` bound, its result becoming the new
+/// accumulator; the final accumulator is returned. An empty list yields `init`; a `null` list yields
+/// `null`. The `accumulator` and `variable` are scoped to `body` only (they do not escape).
+#[derive(Debug, Clone, PartialEq)]
+#[must_use]
+pub struct ReduceExpr {
+    /// The accumulator variable, bound to `init` initially and to each fold step's result after.
+    pub accumulator: Variable,
+    /// The initial accumulator value, evaluated in the enclosing scope.
+    pub init: Box<Expr>,
+    /// The iteration variable, bound to each element of `list` in turn.
+    pub variable: Variable,
+    /// The list being folded, evaluated in the enclosing scope.
+    pub list: Box<Expr>,
+    /// The fold step, evaluated with `accumulator` and `variable` in scope.
+    pub body: Box<Expr>,
+}
+
+/// A map projection `entity { selector, ... }` (Neo4j map projection): reshapes a node, relationship
+/// or map into a new map by projecting selected properties and/or literal entries.
+#[derive(Debug, Clone, PartialEq)]
+#[must_use]
+pub struct MapProjection {
+    /// The projected entity — a node, relationship or map (evaluated once). A `null` entity makes the
+    /// whole projection `null`.
+    pub entity: Box<Expr>,
+    /// The selectors, in source order.
+    pub selectors: Vec<MapProjectionSelector>,
+}
+
+/// One element of a [`MapProjection`] (Neo4j map-projection selector).
+#[derive(Debug, Clone, PartialEq)]
+#[must_use]
+pub enum MapProjectionSelector {
+    /// A property selector `.name` — the entity's `name` property (`name: entity.name`).
+    Property(String),
+    /// The all-properties selector `.*` — every property of the entity. Applied **before** the other
+    /// selectors (mirroring Neo4j's `includeAllProps` flag), which may then override individual keys.
+    AllProperties,
+    /// A literal entry `key: expr`, **or** the variable-selector shorthand `var` (desugared at parse
+    /// time to `var: var`, i.e. `key` = the variable name and `value` an [`ExprKind::Variable`]) so
+    /// every generic expression walker handles it uniformly — exactly as Neo4j desugars it.
+    Entry {
+        /// The result key.
+        key: MapKey,
+        /// The entry's value expression, evaluated in the enclosing scope.
+        value: Box<Expr>,
+    },
 }
 
 /// An existential subquery (openCypher `ExistentialSubquery`).

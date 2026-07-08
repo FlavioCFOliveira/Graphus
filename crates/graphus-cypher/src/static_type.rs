@@ -162,6 +162,10 @@ fn infer(expr: &Expr, env: &TypeEnv) -> SType {
         ExprKind::ListComprehension(_) | ExprKind::PatternComprehension(_) => {
             SType::List(Box::new(SType::Unknown))
         }
+        // A map projection always produces a map; a reduce fold's result type is not statically
+        // provable (the accumulator type can change across steps).
+        ExprKind::MapProjection(_) => SType::Map,
+        ExprKind::Reduce(_) => SType::Unknown,
         ExprKind::CountStar => SType::Int,
         // Property access, indexing, slicing, function results and CASE are not statically typed.
         ExprKind::Property { .. }
@@ -272,6 +276,24 @@ pub fn check_expr(expr: &Expr, env: &TypeEnv) -> Result<(), SemanticError> {
             }
             if let Some(proj) = &lc.projection {
                 check_expr(proj, &inner)?;
+            }
+        }
+        ExprKind::Reduce(r) => {
+            // The init and list are outer-scope expressions; the body is checked with the element
+            // bound to the list's element type and the accumulator left `Unknown` (its type may
+            // change across steps — never the basis of a static error).
+            check_expr(&r.init, env)?;
+            check_expr(&r.list, env)?;
+            let mut inner = bind_element(env, &r.variable.name, &r.list);
+            inner.insert(r.accumulator.name.clone(), SType::Unknown);
+            check_expr(&r.body, &inner)?;
+        }
+        ExprKind::MapProjection(mp) => {
+            check_expr(&mp.entity, env)?;
+            for sel in &mp.selectors {
+                if let crate::ast::MapProjectionSelector::Entry { value, .. } = sel {
+                    check_expr(value, env)?;
+                }
             }
         }
         // A pattern comprehension binds pattern (node/relationship/path) variables whose value

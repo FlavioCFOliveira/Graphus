@@ -1841,6 +1841,32 @@ impl Analyzer<'_> {
                 inner.bind(&q.variable.name, VarKind::Value, q.variable.span)?;
                 self.check_expr_refs(&q.predicate, &inner)
             }
+            ExprKind::Reduce(r) => {
+                // The initial value and the list are evaluated in the outer scope; the accumulator
+                // and iteration variable are local to the fold body.
+                self.check_expr_refs(&r.init, scope)?;
+                self.check_expr_refs(&r.list, scope)?;
+                // Aggregation is meaningless in the per-element fold body (as in a list
+                // comprehension's projection); reject it there. It stays legal in the source list
+                // (`reduce(s = 0, x IN collect(n) | …)`), which the outer scope evaluates.
+                self.reject_aggregation(&r.body, "a reduce expression")?;
+                let mut inner = scope.clone();
+                inner.bind(&r.accumulator.name, VarKind::Value, r.accumulator.span)?;
+                inner.bind(&r.variable.name, VarKind::Value, r.variable.span)?;
+                self.check_expr_refs(&r.body, &inner)
+            }
+            ExprKind::MapProjection(mp) => {
+                // The projected entity and every entry value are in the outer scope; property and
+                // all-properties selectors reference no variables. (A variable selector `n{v}` is
+                // desugared to an entry whose value is a `Variable`, so it is scope-checked here.)
+                self.check_expr_refs(&mp.entity, scope)?;
+                for sel in &mp.selectors {
+                    if let crate::ast::MapProjectionSelector::Entry { value, .. } = sel {
+                        self.check_expr_refs(value, scope)?;
+                    }
+                }
+                Ok(())
+            }
             ExprKind::ExistsSubquery(ex) => {
                 // Full-query form (`EXISTS { MATCH ... RETURN ... }`): the braces hold a complete
                 // read-only Cypher query, analysed **correlated** with the outer scope.
@@ -2278,6 +2304,16 @@ impl Analyzer<'_> {
                 locals.pop();
                 result
             }
+            ExprKind::Reduce(r) => {
+                self.check_aggregate_item_references(&r.init, keys, locals)?;
+                self.check_aggregate_item_references(&r.list, keys, locals)?;
+                locals.push(r.accumulator.name.clone());
+                locals.push(r.variable.name.clone());
+                let result = self.check_aggregate_item_references(&r.body, keys, locals);
+                locals.pop();
+                locals.pop();
+                result
+            }
             // Pattern-scoped forms bind their own pattern variables and cannot host aggregates;
             // they are left to the general scope checks (conservative: never flagged here).
             ExprKind::PatternComprehension(_) | ExprKind::ExistsSubquery(_) => Ok(()),
@@ -2358,6 +2394,21 @@ impl Analyzer<'_> {
                 }
                 locals.push(q.variable.name.clone());
                 let found = Self::references_free_variable(&q.predicate, locals);
+                locals.pop();
+                found
+            }
+            ExprKind::Reduce(r) => {
+                // The init and list are in the outer scope; the accumulator and element bind locally
+                // for the fold body only.
+                if Self::references_free_variable(&r.init, locals)
+                    || Self::references_free_variable(&r.list, locals)
+                {
+                    return true;
+                }
+                locals.push(r.accumulator.name.clone());
+                locals.push(r.variable.name.clone());
+                let found = Self::references_free_variable(&r.body, locals);
+                locals.pop();
                 locals.pop();
                 found
             }
@@ -2503,6 +2554,20 @@ impl Analyzer<'_> {
                 f(&q.list)?;
                 f(&q.predicate)
             }
+            ExprKind::Reduce(r) => {
+                f(&r.init)?;
+                f(&r.list)?;
+                f(&r.body)
+            }
+            ExprKind::MapProjection(mp) => {
+                f(&mp.entity)?;
+                for sel in &mp.selectors {
+                    if let crate::ast::MapProjectionSelector::Entry { value, .. } = sel {
+                        f(value)?;
+                    }
+                }
+                Ok(())
+            }
             ExprKind::ExistsSubquery(ex) => {
                 if let Some(pred) = &ex.predicate {
                     f(pred)?;
@@ -2598,6 +2663,56 @@ mod tests {
         ] {
             assert!(analyze(&ast(q)).is_ok(), "should accept: {q}");
         }
+    }
+
+    #[test]
+    fn reduce_and_map_projection_pass_scope_analysis() {
+        // A reduce binds its accumulator + element for the body; the source list may use an outer
+        // variable and even an aggregate. A map projection resolves its entity, entry values and
+        // (desugared) variable selectors against the outer scope.
+        for q in [
+            "RETURN reduce(s = 0, x IN [1, 2, 3] | s + x) AS total",
+            "MATCH (n) RETURN reduce(s = 0, x IN collect(n.age) | s + x) AS total",
+            "WITH 5 AS base RETURN reduce(s = base, x IN [1] | s + x) AS r",
+            "MATCH (n) RETURN n{.name, .*} AS shaped",
+            "MATCH (n) WITH n, 'x' AS tag RETURN n{.name, tag, extra: n.age * 2} AS shaped",
+        ] {
+            assert!(analyze(&ast(q)).is_ok(), "should accept: {q}");
+        }
+    }
+
+    #[test]
+    fn reduce_bindings_do_not_escape_and_selectors_must_resolve() {
+        // The accumulator / element are local to the fold body: referencing either outside the
+        // reduce is `UndefinedVariable`. A map-projection variable selector must name a bound
+        // variable, else the same error.
+        for q in [
+            "MATCH (n) RETURN reduce(s = 0, x IN [1] | s + x) AS r, s AS leaked",
+            "MATCH (n) RETURN reduce(s = 0, x IN [1] | s + x) AS r, x AS leaked",
+            "MATCH (n) RETURN n{notBound} AS shaped",
+        ] {
+            let err = analyze(&ast(q)).expect_err("should reject");
+            assert!(
+                matches!(err.kind, SemanticErrorKind::UndefinedVariable { .. }),
+                "{q}: expected UndefinedVariable, got {:?}",
+                err.kind
+            );
+        }
+    }
+
+    #[test]
+    fn reduce_rejects_aggregation_in_the_fold_body() {
+        // Aggregation is meaningless in the per-element fold body (as in a list comprehension's
+        // projection) — it is an `InvalidAggregation`, even though it stays legal in the source list.
+        let err = analyze(&ast(
+            "MATCH (n) RETURN reduce(s = 0, x IN [1] | s + count(*))",
+        ))
+        .expect_err("should reject aggregation in the reduce body");
+        assert!(
+            matches!(err.kind, SemanticErrorKind::InvalidAggregation { .. }),
+            "expected InvalidAggregation, got {:?}",
+            err.kind
+        );
     }
 
     #[test]

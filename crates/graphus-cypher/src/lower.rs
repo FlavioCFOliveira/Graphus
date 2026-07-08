@@ -1498,6 +1498,8 @@ fn expr_size(expr: &Expr) -> usize {
         ExprKind::Case(_)
         | ExprKind::ListComprehension(_)
         | ExprKind::Quantifier(_)
+        | ExprKind::Reduce(_)
+        | ExprKind::MapProjection(_)
         | ExprKind::PatternComprehension(_)
         | ExprKind::ExistsSubquery(_) => {}
     }
@@ -1558,6 +1560,26 @@ fn expr_contains_aggregate(expr: &Expr) -> bool {
         }
         ExprKind::Quantifier(q) => {
             expr_contains_aggregate(&q.list) || expr_contains_aggregate(&q.predicate)
+        }
+        // `reduce` evaluates its init + source list in the enclosing scope, so an aggregate there
+        // (`reduce(s = 0, x IN collect(y) | …)`) makes the item aggregating; the fold body cannot
+        // contain one (the semantic pass rejects it) but is walked for symmetry.
+        ExprKind::Reduce(r) => {
+            expr_contains_aggregate(&r.init)
+                || expr_contains_aggregate(&r.list)
+                || expr_contains_aggregate(&r.body)
+        }
+        // A map projection's entity and entry values are enclosing-scope expressions, so an
+        // aggregate there (`n{ total: sum(m.x) }`) makes the item aggregating.
+        ExprKind::MapProjection(mp) => {
+            expr_contains_aggregate(&mp.entity)
+                || mp.selectors.iter().any(|s| match s {
+                    crate::ast::MapProjectionSelector::Entry { value, .. } => {
+                        expr_contains_aggregate(value)
+                    }
+                    crate::ast::MapProjectionSelector::Property(_)
+                    | crate::ast::MapProjectionSelector::AllProperties => false,
+                })
         }
         // Pattern comprehensions / EXISTS subqueries establish pattern-bound scopes; an aggregate
         // cannot legally appear inside (the semantic pass rejects it).
@@ -1673,6 +1695,19 @@ fn collect_referenced_vars(expr: &Expr, out: &mut BTreeSet<String>) {
         ExprKind::Quantifier(q) => {
             collect_referenced_vars(&q.list, out);
             collect_referenced_vars(&q.predicate, out);
+        }
+        ExprKind::Reduce(r) => {
+            collect_referenced_vars(&r.init, out);
+            collect_referenced_vars(&r.list, out);
+            collect_referenced_vars(&r.body, out);
+        }
+        ExprKind::MapProjection(mp) => {
+            collect_referenced_vars(&mp.entity, out);
+            for sel in &mp.selectors {
+                if let crate::ast::MapProjectionSelector::Entry { value, .. } = sel {
+                    collect_referenced_vars(value, out);
+                }
+            }
         }
         ExprKind::ExistsSubquery(_) => {
             // An existential subquery embeds a pattern (not a bare Expr); its free variables that

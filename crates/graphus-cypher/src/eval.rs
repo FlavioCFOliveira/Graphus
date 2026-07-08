@@ -30,7 +30,10 @@ use std::fmt;
 
 use graphus_core::Value;
 
-use crate::ast::{BinaryOp, CaseExpr, Expr, ExprKind, Literal, MapKey, PredicateOp, UnaryOp};
+use crate::ast::{
+    BinaryOp, CaseExpr, Expr, ExprKind, Literal, MapKey, MapProjectionSelector, PredicateOp,
+    UnaryOp,
+};
 use crate::binding::BoundParameters;
 use crate::equality::{equals, is_in};
 use crate::function_registry::FunctionRegistry;
@@ -309,6 +312,10 @@ pub fn eval(
             eval_pattern_comprehension(pc, row, params, graph, functions, clock)
         }
         ExprKind::Quantifier(q) => eval_quantifier(q, row, params, graph, functions, clock),
+        ExprKind::Reduce(r) => eval_reduce(r, row, params, graph, functions, clock),
+        ExprKind::MapProjection(mp) => {
+            eval_map_projection(mp, row, params, graph, functions, clock)
+        }
         ExprKind::ExistsSubquery(ex) => {
             eval_exists_subquery(ex, row, params, graph, functions, clock)
         }
@@ -1098,49 +1105,63 @@ fn eval_property(
     functions: &dyn FunctionRegistry,
     clock: &StatementClock,
 ) -> EvalResult {
-    match eval(base, row, params, graph, functions, clock)? {
+    let base = eval(base, row, params, graph, functions, clock)?;
+    property_of(&base, key, graph)
+}
+
+/// Reads property `key` from an already-evaluated `base` value, applying Cypher's value model:
+/// node/relationship property reads (raising [`EvalError::DeletedEntityAccess`] for an entity deleted
+/// earlier in this query), map key lookup (property or structural), point/temporal component access,
+/// and the missing-property `null` rule everywhere else. This is the shared core of `n.key` static
+/// property access and the [map projection](eval_map_projection) `.key` selector, so both agree
+/// exactly on the property semantics.
+///
+/// # Errors
+/// [`EvalError::DeletedEntityAccess`] when `base` is a node/relationship deleted earlier in the query.
+fn property_of(base: &RowValue, key: &str, graph: &dyn GraphAccess) -> EvalResult {
+    match base {
         RowValue::Node(NodeRef { id }) => {
             // Reading a property of an entity deleted earlier in this same query raises at runtime
             // (`clauses/return/Return2.feature` [15]); `id`/`type` stay accessible, only properties
             // and labels fail.
-            if graph.entity_deleted_by_txn(DeletedEntity::Node(id)) {
+            if graph.entity_deleted_by_txn(DeletedEntity::Node(*id)) {
                 return Err(EvalError::DeletedEntityAccess);
             }
             Ok(RowValue::Value(
-                graph.node_property(id, key).unwrap_or(Value::Null),
+                graph.node_property(*id, key).unwrap_or(Value::Null),
             ))
         }
         RowValue::Rel(RelRef { id }) => {
-            if graph.entity_deleted_by_txn(DeletedEntity::Rel(id)) {
+            if graph.entity_deleted_by_txn(DeletedEntity::Rel(*id)) {
                 return Err(EvalError::DeletedEntityAccess); // Return2.feature [17]
             }
             Ok(RowValue::Value(
-                graph.rel_property(id, key).unwrap_or(Value::Null),
+                graph.rel_property(*id, key).unwrap_or(Value::Null),
             ))
         }
         RowValue::Value(Value::Map(entries)) => Ok(RowValue::Value(
             entries
-                .into_iter()
+                .iter()
                 .find(|(k, _)| k == key)
-                .map(|(_, v)| v)
+                .map(|(_, v)| v.clone())
                 .unwrap_or(Value::Null),
         )),
         // A structural map keeps its values at the `RowValue` level, so `m.key` recovers the
         // node/relationship/path reference (or nested structural collection) the map holds — the
         // property-map arm above only handles pure-property maps (Delete5.feature).
         RowValue::Map(entries) => Ok(entries
-            .into_iter()
+            .iter()
             .find(|(k, _)| k == key)
-            .map(|(_, v)| v)
+            .map(|(_, v)| v.clone())
             .unwrap_or(RowValue::NULL)),
         // Point component access: `p.x`, `p.longitude`, `p.crs`, `p.srid`, … (rmp #73).
         RowValue::Value(Value::Point(p)) => Ok(RowValue::Value(
-            crate::spatial_fns::component(&p, key).unwrap_or(Value::Null),
+            crate::spatial_fns::component(p, key).unwrap_or(Value::Null),
         )),
         // Temporal component access: `d.year`, `t.hour`, `dur.minutesOfHour`, … (rmp #53).
         // A non-temporal (incl. null) base yields null, Cypher's missing-property rule.
         RowValue::Value(v) => Ok(RowValue::Value(
-            crate::temporal_fns::component(&v, key).unwrap_or(Value::Null),
+            crate::temporal_fns::component(v, key).unwrap_or(Value::Null),
         )),
         // Paths and lists have no properties; the missing-property rule yields null.
         RowValue::Path(_) | RowValue::List(_) => Ok(RowValue::NULL),
@@ -3031,6 +3052,145 @@ fn eval_quantifier(
             }
         }
     }
+}
+
+/// Evaluates a `reduce(acc = init, x IN list | body)` list fold. The list is evaluated first so a
+/// `null` list short-circuits to `null` (Cypher null-propagation) without evaluating `init`; an empty
+/// list returns `init`. Otherwise it is a left fold: `acc` starts at `init` and, for each element,
+/// `body` is re-evaluated with `acc` and `x` bound, its result becoming the new `acc`; the final
+/// `acc` is returned. `acc` and `x` are local to `body` (they never leak into the outer row).
+fn eval_reduce(
+    r: &crate::ast::ReduceExpr,
+    row: &Row,
+    params: &BoundParameters,
+    graph: &dyn GraphAccess,
+    functions: &dyn FunctionRegistry,
+    clock: &StatementClock,
+) -> EvalResult {
+    // A `null` source yields `null`; a non-list, non-null source is a type error (mirrors the
+    // comprehension / quantifier source rule). Evaluated before `init` so a `null` list never forces
+    // `init` evaluation.
+    let items = eval_to_list_items(&r.list, "reduce", row, params, graph, functions, clock)?;
+    let Some(items) = items else {
+        return Ok(RowValue::NULL);
+    };
+    // `init` is evaluated in the enclosing scope (the accumulator / element are not yet bound); for an
+    // empty list this value is the result.
+    let mut acc = eval(&r.init, row, params, graph, functions, clock)?;
+    for item in items {
+        let inner = row
+            .with(r.accumulator.name.clone(), acc)
+            .with(r.variable.name.clone(), item);
+        acc = eval(&r.body, &inner, params, graph, functions, clock)?;
+    }
+    Ok(acc)
+}
+
+/// Evaluates a map projection `entity { .prop, .*, key: expr, var }` into a map. A `null` entity
+/// makes the whole projection `null`. The `.*` all-properties selector is applied **first**
+/// (mirroring Neo4j's `includeAllProps` flag), then the property / literal / variable selectors in
+/// source order — a later selector with a key already present **overrides** it (so an explicit
+/// `key: …` wins over a `.*` property of the same name). Works over nodes, relationships and maps.
+fn eval_map_projection(
+    mp: &crate::ast::MapProjection,
+    row: &Row,
+    params: &BoundParameters,
+    graph: &dyn GraphAccess,
+    functions: &dyn FunctionRegistry,
+    clock: &StatementClock,
+) -> EvalResult {
+    let entity = eval(&mp.entity, row, params, graph, functions, clock)?;
+    if entity.is_null() {
+        return Ok(RowValue::NULL);
+    }
+    let mut out: Vec<(String, RowValue)> = Vec::new();
+    let mut out_bytes: usize = 0;
+    // Pass 1 — the all-properties selector `.*`, applied first regardless of its textual position,
+    // exactly as Neo4j applies `includeAllProps` before the individual entries.
+    if mp
+        .selectors
+        .iter()
+        .any(|s| matches!(s, MapProjectionSelector::AllProperties))
+    {
+        for (k, v) in all_properties_entries(&entity, graph)? {
+            upsert_projection(&mut out, &mut out_bytes, k, v)?;
+        }
+    }
+    // Pass 2 — the property / literal / variable selectors, in source order (last write wins on a key
+    // already produced, including one added by `.*`).
+    for sel in &mp.selectors {
+        match sel {
+            MapProjectionSelector::AllProperties => {}
+            MapProjectionSelector::Property(key) => {
+                let value = property_of(&entity, key, graph)?;
+                upsert_projection(&mut out, &mut out_bytes, key.clone(), value)?;
+            }
+            MapProjectionSelector::Entry { key, value } => {
+                let v = eval(value, row, params, graph, functions, clock)?;
+                upsert_projection(&mut out, &mut out_bytes, key.name.clone(), v)?;
+            }
+        }
+    }
+    Ok(RowValue::map(out))
+}
+
+/// All properties of an evaluated `base` (node / relationship / map) as `(key, value)` entries, for
+/// the `.*` map-projection selector. A non-entity, non-map `base` contributes nothing (Neo4j only
+/// permits node/relationship/map here; `null` is already short-circuited by the caller). The entry
+/// count is bounded against the per-value budget (`SEC-191`, CWE-770 / CWE-789), like `properties()`.
+///
+/// # Errors
+/// [`EvalError::ResourceLimit`] when the property count exceeds the per-value element ceiling.
+fn all_properties_entries(
+    base: &RowValue,
+    graph: &dyn GraphAccess,
+) -> Result<Vec<(String, RowValue)>, EvalError> {
+    let entries = match base {
+        RowValue::Node(NodeRef { id }) => graph
+            .node_properties(*id)
+            .map(props_to_rowvalues)
+            .unwrap_or_default(),
+        RowValue::Rel(RelRef { id }) => graph
+            .rel_properties(*id)
+            .map(props_to_rowvalues)
+            .unwrap_or_default(),
+        RowValue::Value(Value::Map(entries)) => props_to_rowvalues(entries.clone()),
+        RowValue::Map(entries) => entries.clone(),
+        _ => Vec::new(),
+    };
+    check_list_len_budget(entries.len(), "map projection '.*'")?;
+    Ok(entries)
+}
+
+/// Lifts a property list into `RowValue` entries (each value wrapped as [`RowValue::Value`]).
+fn props_to_rowvalues(props: Vec<(String, Value)>) -> Vec<(String, RowValue)> {
+    props
+        .into_iter()
+        .map(|(k, v)| (k, RowValue::Value(v)))
+        .collect()
+}
+
+/// Inserts `(key, value)` into a map-projection builder with **last-wins** semantics (replacing the
+/// value of a key already present, otherwise appending), and charges the key + value against the
+/// per-value budget as it grows (`SEC-191`). The budget total is a monotonic upper bound: an override
+/// re-charges the key, which only ever rejects earlier — the safe direction.
+///
+/// # Errors
+/// [`EvalError::ResourceLimit`] once the running total exceeds the per-value budget.
+fn upsert_projection(
+    out: &mut Vec<(String, RowValue)>,
+    bytes: &mut usize,
+    key: String,
+    value: RowValue,
+) -> Result<(), EvalError> {
+    *bytes = bytes.saturating_add(key.len());
+    accumulate_list_bytes(bytes, &value, "map projection")?;
+    if let Some(slot) = out.iter_mut().find(|(k, _)| *k == key) {
+        slot.1 = value;
+    } else {
+        out.push((key, value));
+    }
+    Ok(())
 }
 
 /// Evaluates a pattern comprehension `[(a)-[r]->(b) WHERE p | e]`: match the pattern seeded by the
@@ -5112,6 +5272,224 @@ mod tests {
             eval_in(&MemGraph::new(), &Row::empty(), "toIntegerList(5)"),
             Err(EvalError::TypeError { .. })
         ));
+    }
+
+    // =============================================================================================
+    // reduce (list fold) — rmp #631
+    // =============================================================================================
+
+    #[test]
+    fn reduce_sums_a_list() {
+        assert_eq!(
+            evaluate("reduce(s = 0, x IN [1, 2, 3] | s + x)"),
+            Value::Integer(6)
+        );
+        // A non-trivial body: sum of squares 1 + 4 + 9.
+        assert_eq!(
+            evaluate("reduce(total = 0, x IN [1, 2, 3] | total + x * x)"),
+            Value::Integer(14)
+        );
+    }
+
+    #[test]
+    fn reduce_empty_list_returns_the_initial_value() {
+        assert_eq!(
+            evaluate("reduce(s = 10, x IN [] | s + x)"),
+            Value::Integer(10)
+        );
+    }
+
+    #[test]
+    fn reduce_null_list_is_null() {
+        assert_eq!(evaluate("reduce(s = 0, x IN null | s + x)"), Value::Null);
+    }
+
+    #[test]
+    fn reduce_folds_strings_left_to_right() {
+        assert_eq!(
+            evaluate("reduce(acc = '', x IN ['a', 'b', 'c'] | acc + x)"),
+            s("abc")
+        );
+    }
+
+    #[test]
+    fn reduce_nests() {
+        // For each of the two outer elements the inner fold contributes 10 + 20 = 30, so 60 total.
+        assert_eq!(
+            evaluate("reduce(a = 0, x IN [1, 2] | a + reduce(b = 0, y IN [10, 20] | b + y))"),
+            Value::Integer(60)
+        );
+    }
+
+    #[test]
+    fn reduce_element_does_not_leak_into_outer_scope() {
+        // Bind `x` in the outer row; the fold's element variable `x` must shadow it only *inside*
+        // the body. The inner fold sees x = 1,2,3 (sum 6); the trailing `+ x` must see the OUTER
+        // x = 100 → 106 (if the element binding leaked it would read the last element, 3 → 9).
+        let mut row = Row::empty();
+        row.set("x", RowValue::Value(Value::Integer(100)));
+        assert_eq!(
+            to_value(
+                eval_in(
+                    &MemGraph::new(),
+                    &row,
+                    "reduce(s = 0, x IN [1, 2, 3] | s + x) + x"
+                )
+                .unwrap()
+            ),
+            Value::Integer(106)
+        );
+    }
+
+    #[test]
+    fn reduce_over_a_non_list_is_a_type_error() {
+        assert!(matches!(
+            eval_in(
+                &MemGraph::new(),
+                &Row::empty(),
+                "reduce(s = 0, x IN 5 | s + x)"
+            ),
+            Err(EvalError::TypeError { .. })
+        ));
+    }
+
+    // =============================================================================================
+    // Map projection — rmp #632
+    // =============================================================================================
+
+    /// A `:Person {name: 'Bob', age: 30}` node bound to `p`, a `tag` string value and a `nothing`
+    /// null binding in the row — the fixture for the map-projection tests.
+    fn graph_with_person() -> (MemGraph, Row) {
+        let mut g = MemGraph::new();
+        let p = g.add_node(
+            ["Person"],
+            [
+                ("name", Value::String("Bob".to_owned())),
+                ("age", Value::Integer(30)),
+            ],
+        );
+        let mut row = Row::empty();
+        row.set("p", RowValue::Node(NodeRef { id: p }));
+        row.set("tag", RowValue::Value(Value::String("vip".to_owned())));
+        row.set("nothing", RowValue::NULL);
+        (g, row)
+    }
+
+    /// Evaluates `src` and asserts it produced a (pure-property) map, returned as key/value pairs.
+    fn eval_map(g: &dyn GraphAccess, row: &Row, src: &str) -> Vec<(String, Value)> {
+        match to_value(eval_in(g, row, src).unwrap()) {
+            Value::Map(m) => m,
+            other => panic!("expected a map from `{src}`, got {other:?}"),
+        }
+    }
+
+    /// Order-independent view of a projected map (for `.*`, whose property order is unspecified).
+    fn as_btree(m: Vec<(String, Value)>) -> std::collections::BTreeMap<String, Value> {
+        m.into_iter().collect()
+    }
+
+    #[test]
+    fn map_projection_property_selector() {
+        let (g, row) = graph_with_person();
+        assert_eq!(
+            eval_map(&g, &row, "p{.name}"),
+            vec![("name".to_owned(), s("Bob"))]
+        );
+        // Two properties, in written order.
+        assert_eq!(
+            eval_map(&g, &row, "p{.name, .age}"),
+            vec![
+                ("name".to_owned(), s("Bob")),
+                ("age".to_owned(), Value::Integer(30))
+            ]
+        );
+        // A missing property projects as null (the missing-property rule).
+        assert_eq!(
+            eval_map(&g, &row, "p{.name, .missing}"),
+            vec![
+                ("name".to_owned(), s("Bob")),
+                ("missing".to_owned(), Value::Null)
+            ]
+        );
+    }
+
+    #[test]
+    fn map_projection_all_properties() {
+        let (g, row) = graph_with_person();
+        assert_eq!(
+            as_btree(eval_map(&g, &row, "p{.*}")),
+            as_btree(vec![
+                ("name".to_owned(), s("Bob")),
+                ("age".to_owned(), Value::Integer(30))
+            ])
+        );
+    }
+
+    #[test]
+    fn map_projection_literal_and_variable_selectors() {
+        let (g, row) = graph_with_person();
+        // Literal entry with a computed value.
+        assert_eq!(
+            eval_map(&g, &row, "p{.name, extra: p.age * 2}"),
+            vec![
+                ("name".to_owned(), s("Bob")),
+                ("extra".to_owned(), Value::Integer(60))
+            ]
+        );
+        // A bare-variable selector projects the value of that row variable under its own name.
+        assert_eq!(
+            eval_map(&g, &row, "p{.name, tag}"),
+            vec![("name".to_owned(), s("Bob")), ("tag".to_owned(), s("vip"))]
+        );
+    }
+
+    #[test]
+    fn map_projection_all_properties_then_override() {
+        let (g, row) = graph_with_person();
+        // `.*` is applied first; an explicit entry with the same key overrides the `.*` property.
+        let projected = as_btree(eval_map(&g, &row, "p{.*, name: 'Override'}"));
+        assert_eq!(projected.get("name"), Some(&s("Override")));
+        assert_eq!(projected.get("age"), Some(&Value::Integer(30)));
+        assert_eq!(projected.len(), 2, "override must not add a duplicate key");
+    }
+
+    #[test]
+    fn map_projection_over_relationship_and_map_literal() {
+        let (g, row) = graph_with_node_and_rel();
+        // A relationship projects like a node.
+        assert_eq!(
+            eval_map(&g, &row, "r{.k}"),
+            vec![("k".to_owned(), Value::Integer(7))]
+        );
+        // A projection applies to any map, including a map literal.
+        assert_eq!(
+            eval_map(&g, &Row::empty(), "{a: 1, b: 2}{.a, tag: 'x'}"),
+            vec![
+                ("a".to_owned(), Value::Integer(1)),
+                ("tag".to_owned(), s("x"))
+            ]
+        );
+        assert_eq!(
+            as_btree(eval_map(&g, &Row::empty(), "{a: 1, b: 2}{.*}")),
+            as_btree(vec![
+                ("a".to_owned(), Value::Integer(1)),
+                ("b".to_owned(), Value::Integer(2))
+            ])
+        );
+    }
+
+    #[test]
+    fn map_projection_of_null_entity_is_null() {
+        let (g, row) = graph_with_person();
+        // A null projected entity makes the whole projection null, regardless of the selectors.
+        assert_eq!(
+            to_value(eval_in(&g, &row, "nothing{.name}").unwrap()),
+            Value::Null
+        );
+        assert_eq!(
+            to_value(eval_in(&g, &row, "nothing{.*, tag: 'x'}").unwrap()),
+            Value::Null
+        );
     }
 
     /// A `Value::String` shorthand for the assertions above.

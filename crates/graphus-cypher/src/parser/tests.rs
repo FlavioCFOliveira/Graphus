@@ -938,6 +938,103 @@ fn pattern_comprehension_named_and_anonymous() {
     assert_eq!(pc2.element.chain.len(), 1);
 }
 
+#[test]
+fn reduce_full_form() {
+    let ExprKind::Reduce(r) = return_kind("RETURN reduce(s = 0, x IN [1, 2, 3] | s + x)") else {
+        panic!("expected a reduce expression")
+    };
+    assert_eq!(r.accumulator.name, "s");
+    assert_eq!(r.variable.name, "x");
+    assert!(matches!(
+        r.init.kind,
+        ExprKind::Literal(Literal::Integer(0))
+    ));
+    assert!(matches!(r.list.kind, ExprKind::List(_)));
+    assert!(matches!(r.body.kind, ExprKind::Binary { .. }));
+}
+
+#[test]
+fn reduce_nested_body() {
+    // A reduce whose body is itself a reduce parses (inner fold in the outer body position).
+    let ExprKind::Reduce(r) =
+        return_kind("RETURN reduce(a = 0, x IN [1] | a + reduce(b = 0, y IN [2] | b + y))")
+    else {
+        panic!("expected an outer reduce")
+    };
+    assert!(
+        matches!(r.body.kind, ExprKind::Binary { rhs, .. } if matches!(rhs.kind, ExprKind::Reduce(_)))
+    );
+}
+
+#[test]
+fn reduce_name_without_special_form_is_a_function_call() {
+    // `reduce` not followed by `( name =` stays an ordinary (here unknown) function call — the
+    // special form is only triggered by the `=` lookahead.
+    let ExprKind::FunctionCall { name, .. } = return_kind("RETURN reduce(1, 2)") else {
+        panic!("expected a function call")
+    };
+    assert_eq!(name, vec!["reduce".to_owned()]);
+}
+
+#[test]
+fn map_projection_all_selector_kinds() {
+    let ExprKind::MapProjection(mp) =
+        return_kind("RETURN n{.name, .*, tag: 'x', extra: n.age * 2, v}")
+    else {
+        panic!("expected a map projection")
+    };
+    assert!(matches!(mp.entity.kind, ExprKind::Variable(_)));
+    assert_eq!(mp.selectors.len(), 5);
+    assert!(matches!(
+        &mp.selectors[0],
+        MapProjectionSelector::Property(k) if k == "name"
+    ));
+    assert!(matches!(
+        &mp.selectors[1],
+        MapProjectionSelector::AllProperties
+    ));
+    assert!(matches!(
+        &mp.selectors[2],
+        MapProjectionSelector::Entry { key, .. } if key.name == "tag"
+    ));
+    assert!(matches!(
+        &mp.selectors[3],
+        MapProjectionSelector::Entry { key, .. } if key.name == "extra"
+    ));
+    // The bare-variable selector `v` desugars to `v: v` — an Entry keyed `v` whose value is a
+    // reference to the variable `v`.
+    let MapProjectionSelector::Entry { key, value } = &mp.selectors[4] else {
+        panic!("expected a variable selector desugared to an entry")
+    };
+    assert_eq!(key.name, "v");
+    assert!(matches!(&value.kind, ExprKind::Variable(name) if name == "v"));
+}
+
+#[test]
+fn map_projection_over_map_literal_and_chained_property() {
+    // A map literal `{...}` directly followed by `{...}` is a projection over that literal.
+    let ExprKind::MapProjection(mp) = return_kind("RETURN {a: 1, b: 2}{.a}") else {
+        panic!("expected a map projection over a map literal")
+    };
+    assert!(matches!(mp.entity.kind, ExprKind::Map(_)));
+
+    // A projection is an atom-level value, so a trailing `.key` accesses the projected map.
+    let ExprKind::Property { base, key } = return_kind("RETURN n{.a, .b}.a") else {
+        panic!("expected a property access over a map projection")
+    };
+    assert_eq!(key, "a");
+    assert!(matches!(base.kind, ExprKind::MapProjection(_)));
+}
+
+#[test]
+fn map_literal_without_leading_expression_stays_a_map() {
+    // A bare `{...}` (no preceding atom) is a map literal, never a projection.
+    assert!(matches!(
+        return_kind("RETURN {a: 1, b: 2}"),
+        ExprKind::Map(_)
+    ));
+}
+
 // =================================================================================================
 // Patterns
 // =================================================================================================

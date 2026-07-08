@@ -57,12 +57,13 @@
 use crate::ast::{
     BinaryOp, CallClause, CaseAlternative, CaseExpr, Clause, CreateClause, DeleteClause,
     ExistsSubquery, Expr, ExprKind, ForeachClause, Label, ListComprehension, Literal,
-    LoadCsvClause, MapKey, MatchClause, MergeAction, MergeClause, NodePattern, PatternChainLink,
-    PatternComprehension, PatternElement, PatternPart, PatternPartKind, PredicateOp, ProcedureCall,
-    ProjectionBody, ProjectionItem, QuantifierExpr, QuantifierKind, Query, QueryBody, RelDirection,
-    RelType, RelationshipPattern, RemoveClause, RemoveItem, ReturnClause, SetClause, SetItem,
-    SingleQuery, SortDirection, SortItem, StandaloneCall, StandaloneYield, UnaryOp, UnionPart,
-    UnwindClause, VarLengthRange, Variable, WithClause, YieldItem,
+    LoadCsvClause, MapKey, MapProjection, MapProjectionSelector, MatchClause, MergeAction,
+    MergeClause, NodePattern, PatternChainLink, PatternComprehension, PatternElement, PatternPart,
+    PatternPartKind, PredicateOp, ProcedureCall, ProjectionBody, ProjectionItem, QuantifierExpr,
+    QuantifierKind, Query, QueryBody, ReduceExpr, RelDirection, RelType, RelationshipPattern,
+    RemoveClause, RemoveItem, ReturnClause, SetClause, SetItem, SingleQuery, SortDirection,
+    SortItem, StandaloneCall, StandaloneYield, UnaryOp, UnionPart, UnwindClause, VarLengthRange,
+    Variable, WithClause, YieldItem,
 };
 use crate::lexer::{IntLiteral, Span, Token, TokenKind, tokenize};
 use graphus_core::GraphusError;
@@ -2085,6 +2086,14 @@ impl<'t, 's> Parser<'t, 's> {
                     self.count_fold()?;
                     expr = self.parse_index_or_slice(expr)?;
                 }
+                // A `{` immediately after an expression begins a **map projection** `expr{ ... }`
+                // (Neo4j map projection). A bare `{ ... }` with no preceding expression is a map
+                // literal, handled in `parse_atom`; the postfix position here can only be a
+                // projection. Each projection deepens the AST by one left-fold level.
+                Some(TokenKind::LBrace) => {
+                    self.count_fold()?;
+                    expr = self.parse_map_projection(expr)?;
+                }
                 _ => break,
             }
         }
@@ -2279,6 +2288,21 @@ impl<'t, 's> Parser<'t, 's> {
             ));
         }
 
+        // `reduce(acc = init, x IN list | body)` — the list-fold special form. Recognised by the
+        // name `reduce` plus the `( name =` lookahead (a `=` at the third position, which no ordinary
+        // `reduce(...)` function call could have). Anything else named `reduce` falls through to a
+        // regular function call.
+        if first.eq_ignore_ascii_case("reduce")
+            && self.at(&TokenKind::LParen)
+            && matches!(
+                self.peek_at(1).map(|t| &t.kind),
+                Some(TokenKind::Identifier(_))
+            )
+            && matches!(self.peek_at(2).map(|t| &t.kind), Some(TokenKind::Eq))
+        {
+            return self.finish_reduce(start_span.start);
+        }
+
         // Quantifier predicates `any/none/single(x IN list WHERE p)` — recognised by the name plus
         // the `( name IN` lookahead (`all` lexes as a keyword and is handled in `parse_atom`).
         // Anything else with these names falls through to a regular function call.
@@ -2341,6 +2365,95 @@ impl<'t, 's> Parser<'t, 's> {
             })),
             Span::new(start, rp.span.end),
         ))
+    }
+
+    /// Finishes a `reduce` special form after its head name:
+    /// `'(' Variable '=' Expression ',' Variable IN Expression '|' Expression ')'`. The accumulator
+    /// initial value and the list are in the enclosing scope; the trailing expression (the fold
+    /// body) sees the accumulator and the iteration variable.
+    fn finish_reduce(&mut self, start: usize) -> Result<Expr, SyntaxError> {
+        self.expect(&TokenKind::LParen, "'(' to begin reduce")?;
+        let accumulator = self.parse_variable()?;
+        self.expect(&TokenKind::Eq, "'=' after the reduce accumulator")?;
+        let init = Box::new(self.parse_expr()?);
+        self.expect(&TokenKind::Comma, "',' after the reduce initial value")?;
+        let variable = self.parse_variable()?;
+        self.expect(&TokenKind::In, "IN in reduce")?;
+        let list = Box::new(self.parse_expr()?);
+        self.expect(&TokenKind::Pipe, "'|' before the reduce expression")?;
+        let body = Box::new(self.parse_expr()?);
+        let rp = self.expect(&TokenKind::RParen, "')' to close reduce")?;
+        Ok(Expr::new(
+            ExprKind::Reduce(Box::new(ReduceExpr {
+                accumulator,
+                init,
+                variable,
+                list,
+                body,
+            })),
+            Span::new(start, rp.span.end),
+        ))
+    }
+
+    /// Parses a **map projection** `entity { selector, ... }` (Neo4j map projection). The `entity`
+    /// has already been parsed by [`Self::parse_postfix_expr`]; the current token is the opening `{`.
+    fn parse_map_projection(&mut self, entity: Expr) -> Result<Expr, SyntaxError> {
+        self.expect(&TokenKind::LBrace, "'{' to begin a map projection")?;
+        let start = entity.span.start;
+        let mut selectors = Vec::new();
+        if !self.at(&TokenKind::RBrace) {
+            selectors.push(self.parse_map_projection_selector()?);
+            while self.eat(&TokenKind::Comma) {
+                selectors.push(self.parse_map_projection_selector()?);
+            }
+        }
+        let rb = self.expect(&TokenKind::RBrace, "'}' to close a map projection")?;
+        Ok(Expr::new(
+            ExprKind::MapProjection(Box::new(MapProjection {
+                entity: Box::new(entity),
+                selectors,
+            })),
+            Span::new(start, rb.span.end),
+        ))
+    }
+
+    /// Parses one map-projection selector: `.*` (all properties), `.name` (property selector),
+    /// `key: expr` (literal entry), or `var` (variable-selector shorthand, desugared to `var: var`).
+    fn parse_map_projection_selector(&mut self) -> Result<MapProjectionSelector, SyntaxError> {
+        // `.` heads either the all-properties selector `.*` or a property selector `.name`.
+        if self.eat(&TokenKind::Dot) {
+            if self.eat(&TokenKind::Star) {
+                return Ok(MapProjectionSelector::AllProperties);
+            }
+            let key = self.parse_property_key("a property name after '.'")?;
+            return Ok(MapProjectionSelector::Property(key));
+        }
+        // Otherwise a name: `name : expr` (literal entry) or a bare `name` (variable selector). Both
+        // start with a property/variable name; the following token disambiguates.
+        let key_span = self.here_span();
+        let name = self.parse_property_key("a map-projection key or variable")?;
+        if self.eat(&TokenKind::Colon) {
+            let value = Box::new(self.parse_expr()?);
+            Ok(MapProjectionSelector::Entry {
+                key: MapKey {
+                    name,
+                    span: key_span,
+                },
+                value,
+            })
+        } else {
+            // Variable selector `var` == `var: var`: desugar to a literal entry whose value is a
+            // reference to that variable (mirroring Neo4j's own desugaring), so every generic
+            // expression walker treats it uniformly.
+            let value = Box::new(Expr::new(ExprKind::Variable(name.clone()), key_span));
+            Ok(MapProjectionSelector::Entry {
+                key: MapKey {
+                    name,
+                    span: key_span,
+                },
+                value,
+            })
+        }
     }
 
     /// Parses the `EXISTS` atom: the `EXISTS { [MATCH] pattern [WHERE p] }` existential subquery,

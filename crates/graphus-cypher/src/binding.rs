@@ -661,6 +661,19 @@ fn params_in_expr(expr: &Expr, ty: ParamType, record: &mut impl FnMut(&str, Para
             params_in_expr(&q.list, ParamType::Any, record);
             params_in_expr(&q.predicate, ParamType::Any, record);
         }
+        ExprKind::Reduce(r) => {
+            params_in_expr(&r.init, ParamType::Any, record);
+            params_in_expr(&r.list, ParamType::Any, record);
+            params_in_expr(&r.body, ParamType::Any, record);
+        }
+        ExprKind::MapProjection(mp) => {
+            params_in_expr(&mp.entity, ParamType::Any, record);
+            for sel in &mp.selectors {
+                if let crate::ast::MapProjectionSelector::Entry { value, .. } = sel {
+                    params_in_expr(value, ParamType::Any, record);
+                }
+            }
+        }
         ExprKind::ExistsSubquery(ex) => {
             for part in &ex.pattern {
                 params_in_pattern_part(part, record);
