@@ -1,0 +1,28 @@
+[package]
+name = "graphus-sysres"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Best-effort host-hardware probes (CPU / memory / storage) so Graphus can size itself to real hardware."
+
+[dependencies]
+# `statvfs(3)` for filesystem capacity. Available on every supported target (POSIX), so it lives in
+# the unconditional dependency table. `fs` = the filesystem syscalls; `std` = the default surface.
+# No default features beyond these — this crate pulls in nothing it does not call.
+rustix = { version = "1", default-features = false, features = ["std", "fs"] }
+
+# Linux-only: `sysinfo(2)` (total/free RAM) via rustix's `system` feature. The feature pulls a
+# Linux-only backend (`linux-raw-sys/system`), so it is gated to Linux targets. Cargo unifies this
+# with the base entry above, giving `["std", "fs", "system"]` on Linux and `["std", "fs"]`
+# elsewhere. Keeping `system` off non-Linux avoids compiling a Linux-only dependency on macOS.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1", default-features = false, features = ["std", "fs", "system"] }
+
+# macOS-only: `sysctlbyname("hw.memsize")` for total physical RAM. This is the crate's ONLY `unsafe`
+# (one FFI call, `// SAFETY:`-documented in `src/lib.rs`), and the only reason `libc` is pulled in.
+# The non-macOS build compiles zero `unsafe` and never links `libc`.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"

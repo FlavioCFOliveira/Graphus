@@ -89,6 +89,7 @@ A single Cargo workspace, Edition 2024, 64-bit-only targets (`D-target-matrix`).
 | `graphus-bolt` | lib | PackStream v1, chunked framing, handshake, Bolt server-state machine; transport-agnostic over UDS and TCP. |
 | `graphus-rest` | lib | HTTP transactional API (axum/hyper), Jolt-style typed JSON + CBOR negotiation, NDJSON streaming, RFC 9457 errors. |
 | `graphus-auth` | lib | `SO_PEERCRED` peer auth, JWT/Bearer verification, RBAC model, shared across listeners. |
+| `graphus-sysres` | lib | Best-effort, one-shot **hardware-resource probe** run once at startup: logical CPUs, physical RAM (total/available), and the store filesystem's capacity/free space plus an SSD-vs-rotational hint. Isolates all OS-specific and `unsafe` probing (rustix `sysinfo`/`statvfs`, `/proc`, `/sys`, macOS `sysctl`) behind a safe API so `graphus-server` stays `#![forbid(unsafe_code)]`. A true leaf: no dependency on any other Graphus crate (`D-hw-autotune`, §9.5). |
 | `graphus-server` | bin | Process entry point: config, listener wiring, runtime construction, admission control, graceful shutdown, observability. |
 | `graphus-cli` | bin | Interactive shell + admin client (Bolt over UDS by default). |
 | `graphus-tck` | test-harness lib+bin | openCypher TCK runner (Rust `cucumber`) + JVM `tck-api` oracle bridge. |
@@ -1051,6 +1052,107 @@ On `SIGTERM`/admin shutdown (Source: Tokio graceful-shutdown pattern): stop acce
 connections; drain in-flight transactions (commit or roll back to a consistent state); flush and
 `fdatasync` the WAL; write a final checkpoint; mark the superblock **clean**; then exit. A hard
 deadline forces rollback of stragglers (always safe — uncommitted work is undone by recovery anyway).
+
+### 9.5 Hardware-aware startup auto-tuning
+
+Ratified as decision `D-hw-autotune` (`02-decision-register.md`) and realizing `FR-AR-6`
+(`01-needs-survey.md`). Graphus ships a single binary that must run well on everything from a 4-core
+Raspberry Pi 5 to a many-core server without hand-tuning. To that end the server **detects the host's
+hardware once at startup** and **derives the defaults** for its resource-sizing parameters, while the
+operator keeps full, explicit control. The rule is a strict three-level precedence:
+
+> **operator configuration (TOML file or `GRAPHUS_*` env var) > hardware-derived value > built-in floor.**
+
+A value the operator sets explicitly always wins; only an unset parameter is auto-derived; and a
+built-in floor guarantees a safe minimum when the hardware cannot be probed. Detection runs **once,
+before any database is opened**, is **best-effort**, and **never panics or blocks the server start**.
+
+**Detection model — `graphus-sysres`.** A dedicated leaf crate, `graphus-sysres` (§1.2), performs a
+single, one-shot probe that produces a `HardwareResources` snapshot with three independent fields:
+
+- `logical_cpus` — the number of schedulable logical CPUs, from
+  `std::thread::available_parallelism`.
+- `MemoryInfo { total, available }` — total and currently-available physical RAM, in bytes. On Linux
+  and Raspberry Pi OS, `total` is read from rustix `system::sysinfo` and `available` from
+  `/proc/meminfo` `MemAvailable`; on macOS, `total` is read from `sysctl hw.memsize` (`available`
+  may be absent there).
+- `StorageInfo { total, available, rotational }` — the store filesystem's total and free capacity in
+  bytes (from `statvfs` on the store path), plus an optional `rotational` hint (`Some(true)` =
+  rotational disk, `Some(false)` = SSD/flash, `None` = unknown). The hint is read from `/sys/block`
+  on Linux and is `None` on other platforms.
+
+Every probe is **independent and best-effort with graceful degradation**: a probe that fails yields
+`None` for its field, and the consumer falls back to the built-in default or floor. `graphus-sysres`
+**isolates all OS-specific and `unsafe` probing** (the rustix syscalls, the `/proc` and `/sys`
+parsing, and the macOS `sysctl` FFI) behind a safe API, so that `graphus-server` — the crate that
+consumes the snapshot — stays `#![forbid(unsafe_code)]`. The crate depends on no other Graphus crate
+(a true leaf) and is independently auditable.
+
+**The `0 = auto` sentinel.** Each auto-tunable numeric parameter uses `0` as the *auto* sentinel: a
+configured `0` (the default) means "derive from hardware", while any value `> 0` pins the parameter
+verbatim. This generalizes the convention already shipped for `reader_threads` and
+`morsel_parallelism` (§9.3) to the memory dimension (`buffer_pool_pages`, §3).
+
+| Precedence | Trigger | Value used |
+| --- | --- | --- |
+| 1 (highest) | Parameter set to a non-sentinel value in the TOML file or its `GRAPHUS_*` env var | The operator's value, verbatim |
+| 2 | Parameter left at its `0` (auto) sentinel and the relevant hardware probe succeeded | The hardware-derived value (per the table below) |
+| 3 (floor) | Parameter left at `0` (auto) but the hardware probe returned `None` | The built-in floor (a safe minimum) |
+
+**Per-parameter tuning policy.**
+
+| Parameter | Dimension | Auto-derived value (when `0`) | Floor / ceiling |
+| --- | --- | --- | --- |
+| `buffer_pool_pages` | Memory | `clamp( floor(0.125 × available_RAM_bytes ÷ 8192), FLOOR, CEIL )` | FLOOR = 4096 pages (32 MiB); CEIL = 262144 pages (2 GiB) |
+| `reader_threads` (§9.3) | CPU | `min(logical_cpus, 16)` | Floor 1; cap 16 |
+| `morsel_parallelism` (§9.3) | CPU | `min(logical_cpus, 16)` | Floor 1 (`1` = fully serial); cap 16 |
+
+- **`buffer_pool_pages` (memory).** The auto value takes a **conservative 1/8 (12.5%) fraction of
+  *available* RAM** (`MemoryInfo.available`, i.e. Linux `MemAvailable`), converts it to 8192-byte
+  pages (the fixed logical page size, §3.1), and clamps the result to `[4096, 262144]` pages
+  (`[32 MiB, 2 GiB]`). If `available` is unknown, the basis falls back to `total`; if RAM is entirely
+  unknown, it falls back to the FLOOR. The fraction is deliberately small because **the buffer pool is
+  per-database** — every opened database gets its own pool of `buffer_pool_pages` (`dbcatalog`) — and
+  RAM is shared with the WAL, index structures, result buffers, and the OS, so taking 1/8 of available
+  RAM leaves headroom even with several databases open. The **FLOOR equals today's fixed default
+  (4096 pages)**, so auto-tuning is never worse than the prior status quo and never reintroduces the
+  known tiny-pool hazard; the **CEIL bounds worst-case resident-set growth**. An operator who needs a
+  larger pool sets `buffer_pool_pages` (or the `GRAPHUS_BUFFER_POOL_PAGES` env var) explicitly, which
+  overrides the derived value under precedence 1.
+- **`reader_threads` / `morsel_parallelism` (CPU).** Behavior is unchanged: auto resolves to
+  `min(logical_cpus, 16)` (§9.3). They are documented here because the value is now sourced from the
+  same unified `graphus-sysres` detection rather than an ad-hoc `available_parallelism` call, and they
+  are the shipped precedent this decision generalizes.
+- **Storage (reported, not yet auto-applied).** In this first cut, the detected storage capacity, free
+  space, and the rotational/SSD hint are **detected and surfaced in the startup log only**. They may
+  inform future tuning (for example prefetch depth, §3.5, or a free-space preflight), but **no
+  parameter is auto-changed from a storage reading yet** — stated explicitly to avoid over-promising.
+
+**Startup summary log contract.** Immediately after detection and parameter resolution, the server
+emits **one structured log line** at startup that records, at minimum:
+
+- the detected hardware: logical CPUs; total and available RAM; the store filesystem's total and free
+  space; and the rotational/SSD hint (rendered "unknown" when a probe returned `None`);
+- the **resolved** value of each auto-tuned parameter (`buffer_pool_pages`, `reader_threads`,
+  `morsel_parallelism`); and
+- the **provenance** of each resolved value — operator-overridden (precedence 1), hardware-derived
+  (precedence 2), or the built-in floor (precedence 3).
+
+This single line makes the effective sizing auditable from the logs on every host.
+
+**Acceptance criteria.**
+
+1. With no configuration, on a host where all probes succeed, each auto-tuned parameter resolves to
+   its hardware-derived value: `buffer_pool_pages = clamp(floor(0.125 × available_RAM ÷ 8192), 4096,
+   262144)` and `reader_threads = morsel_parallelism = min(logical_cpus, 16)`.
+2. An explicit non-zero value set in the TOML file or the matching `GRAPHUS_*` env var is used
+   verbatim and is never overridden by detection.
+3. When a probe fails, its parameter falls back to the built-in floor; the server starts normally
+   (detection never panics and never blocks the start).
+4. `graphus-server` compiles under `#![forbid(unsafe_code)]`; all OS-specific and `unsafe` probing
+   lives in `graphus-sysres`.
+5. The startup summary log line is emitted once and reports the detected hardware, each resolved
+   value, and its provenance.
 
 ---
 

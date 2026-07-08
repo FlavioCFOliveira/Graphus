@@ -13,9 +13,11 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use graphus_io::PAGE_SIZE;
 use serde::Deserialize;
 
 use crate::audit::AuditConfig;
+use crate::hardware::HardwareResources;
 
 /// How a fallible config step failed.
 #[derive(Debug)]
@@ -809,7 +811,18 @@ pub struct ServerConfig {
     /// lowercase — see [`crate::dbcatalog::normalize_db_name`]); checked by
     /// [`validate`](Self::validate).
     pub default_database: String,
-    /// Buffer-pool capacity in pages (`04 §3`).
+    /// Buffer-pool capacity in **pages** (`04 §3`), per database (each open database owns a pool of
+    /// this size). At [`graphus_io::PAGE_SIZE`] = 8 KiB a page, so e.g. `4096` ⇒ 32 MiB.
+    ///
+    /// **`0` means auto** (`04 §9.5`, decision `D-hw-autotune`): at startup the server sizes the
+    /// pool from detected RAM —
+    /// `clamp( ⌊`[`AUTO_BUFFER_POOL_RAM_FRACTION`]`× available_RAM ÷ PAGE_SIZE⌋,`
+    /// [`AUTO_BUFFER_POOL_FLOOR_PAGES`]`,`[`AUTO_BUFFER_POOL_CEIL_PAGES`]`)` — via
+    /// [`apply_hardware_defaults`](Self::apply_hardware_defaults). Any **explicit** value here (from
+    /// the TOML file or `GRAPHUS_BUFFER_POOL_PAGES`) is used verbatim and **overrides** the
+    /// auto-size: operator config always wins over hardware detection. An explicit value must be
+    /// `>=` [`MIN_BUFFER_POOL_PAGES`] (a smaller pool is rejected by [`validate`](Self::validate)
+    /// rather than risking a degenerate pool — `rmp` #302).
     pub buffer_pool_pages: usize,
 
     /// TCP address for the Bolt-over-TCP listener, or `None` to disable it. TLS required when set.
@@ -899,7 +912,10 @@ impl Default for ServerConfig {
         Self {
             store_path: PathBuf::from("graphus-data"),
             default_database: crate::dbcatalog::DEFAULT_DATABASE_NAME.to_owned(),
-            buffer_pool_pages: 4096,
+            // `0` = auto: sized from detected RAM at startup by `apply_hardware_defaults`
+            // (`04 §9.5`), floored at `AUTO_BUFFER_POOL_FLOOR_PAGES` (= the historical fixed 32 MiB
+            // default) so auto is never worse than before, and capped at `AUTO_BUFFER_POOL_CEIL_PAGES`.
+            buffer_pool_pages: 0,
             bolt_tcp_addr: None,
             advertised_bolt_address: None,
             bolt_server_agent: None,
@@ -953,6 +969,64 @@ impl std::fmt::Debug for ServerConfig {
 /// [`ServerConfig::validate`] so a real deployment cannot accidentally ship it.
 pub const DEFAULT_INSECURE_JWT_SECRET: &str = "INSECURE-DEFAULT-CHANGE-ME";
 
+/// The smallest **explicit** [`buffer_pool_pages`](ServerConfig::buffer_pool_pages) a config may set
+/// (`rmp` #302, #617). A pool below this risks a degenerate eviction path, so an operator value under
+/// it is a fail-fast [`validate`](ServerConfig::validate) error rather than a runtime hazard. The
+/// **auto** path never goes below [`AUTO_BUFFER_POOL_FLOOR_PAGES`] (which is far above this), so a
+/// hardware-sized pool is always comfortably valid; this bound only guards a hand-set value. A single
+/// query pins only a handful of pages (a B-tree path plus a little working set), so 64 pages
+/// (= 512 KiB at 8 KiB/page) is a safe, generous floor.
+pub const MIN_BUFFER_POOL_PAGES: usize = 64;
+
+/// Auto buffer-pool **floor** in pages (`04 §9.5`): 4096 pages = 32 MiB at 8 KiB/page. This equals
+/// the historical fixed `buffer_pool_pages` default, so hardware auto-sizing is **never worse than
+/// the prior status quo** — even a tiny host or a failed RAM probe gets at least today's pool.
+pub const AUTO_BUFFER_POOL_FLOOR_PAGES: usize = 4096;
+
+/// Auto buffer-pool **ceiling** in pages (`04 §9.5`): 262 144 pages = 2 GiB at 8 KiB/page. Bounds
+/// worst-case pool RSS on a big-RAM host (the pool is *per-database*, and RAM is shared with the WAL,
+/// indexes, result buffers and the OS), so auto-sizing can never run away. An operator who wants a
+/// larger pool sets an explicit value, which is used verbatim and is not capped here.
+pub const AUTO_BUFFER_POOL_CEIL_PAGES: usize = 262_144;
+
+/// Fraction of **available** RAM the auto path devotes to the (per-database) buffer pool: 1/8
+/// (12.5%). Deliberately conservative because the pool is per-database and coexists with the WAL,
+/// index trees, result buffers and the OS page cache, so a fraction this size leaves ample headroom
+/// even with several databases open, while still dwarfing the historical fixed 32 MiB on any real
+/// host. Expressed as a numerator/denominator pair so the arithmetic stays in integer `u64`.
+pub const AUTO_BUFFER_POOL_RAM_NUM: u64 = 1;
+/// Denominator of [`AUTO_BUFFER_POOL_RAM_NUM`] — see it for the rationale.
+pub const AUTO_BUFFER_POOL_RAM_DEN: u64 = 8;
+
+/// Human-readable form of [`AUTO_BUFFER_POOL_RAM_NUM`]/[`AUTO_BUFFER_POOL_RAM_DEN`] for docs.
+pub const AUTO_BUFFER_POOL_RAM_FRACTION: &str = "1/8";
+
+/// Upper bound on the auto **CPU** pool sizes (`reader_threads`, `morsel_parallelism`) — `04 §9.5`.
+/// Matches the long-standing accessor behaviour: past this many workers, shared buffer-pool
+/// contention dominates (the measured `rmp` #337 Slice-1 knee), so auto never over-subscribes a
+/// many-core host. Pin a larger value explicitly for an I/O-bound read mix.
+pub const AUTO_CPU_POOL_CAP: usize = 16;
+
+/// Computes the auto buffer-pool size (pages) for a detected hardware snapshot: a conservative
+/// fraction of available RAM, clamped to `[`[`AUTO_BUFFER_POOL_FLOOR_PAGES`]`,`
+/// [`AUTO_BUFFER_POOL_CEIL_PAGES`]`]`. When RAM is unknown (probe failed) it returns the floor, so
+/// the server still gets at least the historical default pool. Pure; the clamp keeps the result a
+/// valid `usize` on every target (the ceiling fits well within 32-bit `usize`).
+#[must_use]
+pub fn auto_buffer_pool_pages(hw: &HardwareResources) -> usize {
+    let Some(ram_bytes) = hw.sizing_memory_bytes() else {
+        return AUTO_BUFFER_POOL_FLOOR_PAGES;
+    };
+    // budget = ram * NUM / DEN, then pages = budget / PAGE_SIZE — all in u64 to avoid overflow, then
+    // clamped in u64 before the cast so the narrowing can never truncate a large intermediate.
+    let budget = ram_bytes / AUTO_BUFFER_POOL_RAM_DEN * AUTO_BUFFER_POOL_RAM_NUM;
+    let pages = budget / PAGE_SIZE as u64;
+    pages.clamp(
+        AUTO_BUFFER_POOL_FLOOR_PAGES as u64,
+        AUTO_BUFFER_POOL_CEIL_PAGES as u64,
+    ) as usize
+}
+
 impl ServerConfig {
     /// Loads the config from an optional TOML file and overlays `GRAPHUS_*` environment variables.
     ///
@@ -976,6 +1050,43 @@ impl ServerConfig {
         cfg.apply_env()?;
         cfg.normalize();
         Ok(cfg)
+    }
+
+    /// Fills every resource-sizing parameter still at its `0 = auto` sentinel from a detected
+    /// [`HardwareResources`] snapshot (`04 §9.5`, decision `D-hw-autotune`).
+    ///
+    /// **Override precedence.** A field an operator set explicitly — a non-zero value from the TOML
+    /// file or a `GRAPHUS_*` env var, already applied by [`load`](Self::load) — is left untouched, so
+    /// **operator config always wins over hardware detection**. Only a field left at `0` (auto) is
+    /// resolved here.
+    ///
+    /// Resolves:
+    /// - [`buffer_pool_pages`](Self::buffer_pool_pages) → [`auto_buffer_pool_pages`] (a conservative
+    ///   fraction of available RAM, clamped to the floor/ceiling).
+    /// - [`admission.reader_threads`](AdmissionConfig::reader_threads) and
+    ///   [`admission.morsel_parallelism`](AdmissionConfig::morsel_parallelism) →
+    ///   `min(logical_cpus, `[`AUTO_CPU_POOL_CAP`]`)`. (These already resolved `0` lazily in their
+    ///   accessors; filling the stored field here unifies the source on the one detected CPU count
+    ///   and makes the resolved value concrete for the startup log. `morsel_parallelism == 1` — the
+    ///   "fully serial" opt-out — is a non-sentinel value and is preserved.)
+    ///
+    /// This is **pure** given `hw` (all probing I/O happens in [`HardwareResources::detect`] before
+    /// this is called), so it is exhaustively unit-testable with synthetic hardware. Idempotent: a
+    /// second call is a no-op because every auto field is now concrete.
+    ///
+    /// Call it **once at startup, after [`load`](Self::load) and before [`validate`](Self::validate)**
+    /// (see [`crate::server::Server::start`]); [`validate`] then only ever sees resolved values.
+    pub fn apply_hardware_defaults(&mut self, hw: &HardwareResources) {
+        if self.buffer_pool_pages == 0 {
+            self.buffer_pool_pages = auto_buffer_pool_pages(hw);
+        }
+        let cpu_pool = hw.logical_cpus.clamp(1, AUTO_CPU_POOL_CAP);
+        if self.admission.reader_threads == 0 {
+            self.admission.reader_threads = cpu_pool;
+        }
+        if self.admission.morsel_parallelism == 0 {
+            self.admission.morsel_parallelism = cpu_pool;
+        }
     }
 
     /// Normalises listener addresses so an **empty string** disables that listener (`Some("")` →
@@ -1072,6 +1183,16 @@ impl ServerConfig {
             // Unlike a listener address, an empty value here is NOT "disable": it is an explicit blank
             // secret, which `validate` rejects. Carry it verbatim so the validator can catch it.
             self.metrics_scrape_token = Some(v);
+        }
+        if let Ok(v) = var("GRAPHUS_BUFFER_POOL_PAGES") {
+            // `0` = auto (size from detected RAM at startup); any value `> 0` pins the pool and
+            // overrides auto-detection (`04 §9.5`). Non-zero values below `MIN_BUFFER_POOL_PAGES`
+            // are accepted here and rejected by `validate` with a clear message.
+            self.buffer_pool_pages = v.parse().map_err(|_| {
+                ConfigError::Parse(format!(
+                    "GRAPHUS_BUFFER_POOL_PAGES is not a non-negative integer (0 = auto): {v:?}"
+                ))
+            })?;
         }
         if let Ok(v) = var("GRAPHUS_MAX_CONCURRENT_QUERIES") {
             self.admission.max_concurrent_queries = v.parse().map_err(|_| {
@@ -1196,10 +1317,16 @@ impl ServerConfig {
                     .to_owned(),
             ));
         }
-        if self.buffer_pool_pages == 0 {
-            return Err(ConfigError::Invalid(
-                "buffer_pool_pages must be > 0".to_owned(),
-            ));
+        // `0` = auto: resolved from detected RAM at startup by `apply_hardware_defaults`, *before*
+        // the store is opened (`04 §9.5`), so it is valid here — production never reaches store-open
+        // with an unresolved `0`. Any *explicit* value must be at least `MIN_BUFFER_POOL_PAGES` so a
+        // hand-set tiny pool fails fast with a clear message instead of degenerating at runtime
+        // (`rmp` #302).
+        if self.buffer_pool_pages != 0 && self.buffer_pool_pages < MIN_BUFFER_POOL_PAGES {
+            return Err(ConfigError::Invalid(format!(
+                "buffer_pool_pages must be >= {MIN_BUFFER_POOL_PAGES} (or 0 = auto-size from detected \
+                 RAM at startup)"
+            )));
         }
         if let Err(e) = crate::dbcatalog::normalize_db_name(&self.default_database) {
             return Err(ConfigError::Invalid(format!("default_database: {e}")));
@@ -2302,6 +2429,190 @@ mod tests {
         assert!(
             crate::dbcatalog::normalize_db_name(&cfg.default_database).is_ok(),
             "the normalised form passes the name rule"
+        );
+    }
+
+    // ---- Hardware-aware startup auto-tuning (`04 §9.5`, decision `D-hw-autotune`, rmp #617) ----
+    //
+    // These are deterministic simulations of the resolution: they feed `apply_hardware_defaults` /
+    // `auto_buffer_pool_pages` **synthetic** `HardwareResources` (no probing I/O) and assert the exact
+    // clamp arithmetic, the floor/ceiling, and — critically — that any operator-set value survives
+    // resolution (file/env override hardware). Because the resolution is pure, this table-driven form
+    // exercises every branch reproducibly (the DST/VOPR simulator targets storage-fault/concurrency
+    // scenarios, which this pure config policy has none of).
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// A synthetic hardware snapshot for the tuning tests.
+    fn hw(cpus: usize, available: Option<u64>, total: Option<u64>) -> HardwareResources {
+        let mut h = HardwareResources::unknown();
+        h.logical_cpus = cpus;
+        h.memory.available_bytes = available;
+        h.memory.total_bytes = total;
+        h
+    }
+
+    #[test]
+    fn auto_pool_uses_one_eighth_of_available_ram() {
+        // 8 GiB available → 1 GiB budget → 1 GiB / 8 KiB = 131072 pages (inside [floor, ceil]).
+        let pages = auto_buffer_pool_pages(&hw(4, Some(8 * GIB), Some(16 * GIB)));
+        assert_eq!(pages, (8 * GIB / 8 / PAGE_SIZE as u64) as usize);
+        assert_eq!(pages, 131_072);
+    }
+
+    #[test]
+    fn auto_pool_prefers_available_over_total() {
+        // Available (2 GiB) far below total (64 GiB): the budget must track available.
+        let pages = auto_buffer_pool_pages(&hw(4, Some(2 * GIB), Some(64 * GIB)));
+        assert_eq!(pages, (2 * GIB / 8 / PAGE_SIZE as u64) as usize); // 32768
+    }
+
+    #[test]
+    fn auto_pool_falls_back_to_total_when_available_unknown() {
+        let pages = auto_buffer_pool_pages(&hw(4, None, Some(8 * GIB)));
+        assert_eq!(pages, 131_072);
+    }
+
+    #[test]
+    fn auto_pool_floors_on_tiny_ram() {
+        // 128 MiB available → 16 MiB budget → 2048 pages < floor → floored to the historical default.
+        let pages =
+            auto_buffer_pool_pages(&hw(1, Some(128 * 1024 * 1024), Some(256 * 1024 * 1024)));
+        assert_eq!(pages, AUTO_BUFFER_POOL_FLOOR_PAGES);
+    }
+
+    #[test]
+    fn auto_pool_floors_when_ram_is_unknown() {
+        assert_eq!(
+            auto_buffer_pool_pages(&hw(1, None, None)),
+            AUTO_BUFFER_POOL_FLOOR_PAGES,
+            "a failed RAM probe still yields at least the historical default pool"
+        );
+    }
+
+    #[test]
+    fn auto_pool_caps_on_huge_ram() {
+        // 64 GiB available → 8 GiB budget → far above ceil → capped, so the per-database pool can
+        // never run away on a big-RAM host.
+        assert_eq!(
+            auto_buffer_pool_pages(&hw(64, Some(64 * GIB), Some(64 * GIB))),
+            AUTO_BUFFER_POOL_CEIL_PAGES
+        );
+    }
+
+    #[test]
+    fn apply_hardware_defaults_fills_only_auto_sentinels() {
+        let mut cfg = ServerConfig::default(); // pool/reader/morsel all at the `0` auto sentinel
+        cfg.apply_hardware_defaults(&hw(8, Some(8 * GIB), Some(8 * GIB)));
+        assert_eq!(cfg.buffer_pool_pages, 131_072);
+        assert_eq!(cfg.admission.reader_threads, 8);
+        assert_eq!(cfg.admission.morsel_parallelism, 8);
+    }
+
+    #[test]
+    fn operator_values_override_hardware_detection() {
+        // Every knob set explicitly; auto-tuning must leave them all untouched (config wins).
+        let mut cfg = ServerConfig {
+            buffer_pool_pages: 12_345,
+            admission: AdmissionConfig {
+                reader_threads: 3,
+                morsel_parallelism: 1, // the "fully serial" opt-out — a non-sentinel value
+                ..AdmissionConfig::default()
+            },
+            ..ServerConfig::default()
+        };
+        cfg.apply_hardware_defaults(&hw(64, Some(64 * GIB), Some(64 * GIB)));
+        assert_eq!(cfg.buffer_pool_pages, 12_345, "explicit pool preserved");
+        assert_eq!(
+            cfg.admission.reader_threads, 3,
+            "explicit reader pool preserved"
+        );
+        assert_eq!(
+            cfg.admission.morsel_parallelism, 1,
+            "the serial opt-out (1) is a real value, not the auto sentinel, so it is preserved"
+        );
+    }
+
+    #[test]
+    fn auto_cpu_pools_are_capped_and_floored() {
+        let mut cfg = ServerConfig::default();
+        cfg.apply_hardware_defaults(&hw(64, None, None));
+        assert_eq!(
+            cfg.admission.reader_threads, AUTO_CPU_POOL_CAP,
+            "64 cores → capped"
+        );
+        assert_eq!(cfg.admission.morsel_parallelism, AUTO_CPU_POOL_CAP);
+
+        let mut cfg = ServerConfig::default();
+        cfg.apply_hardware_defaults(&hw(0, None, None));
+        assert_eq!(
+            cfg.admission.reader_threads, 1,
+            "0 reported cores → floored to 1"
+        );
+    }
+
+    #[test]
+    fn apply_hardware_defaults_is_idempotent() {
+        let mut cfg = ServerConfig::default();
+        let snapshot = hw(8, Some(8 * GIB), Some(8 * GIB));
+        cfg.apply_hardware_defaults(&snapshot);
+        let once = cfg.clone();
+        cfg.apply_hardware_defaults(&snapshot);
+        assert_eq!(
+            cfg, once,
+            "a second resolution is a no-op — every auto field is now concrete"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_zero_pool_as_auto_but_rejects_tiny_explicit() {
+        // UDS-only base so no TLS/JWT concerns interfere with the pool assertions.
+        let base = ServerConfig {
+            rest_addr: None,
+            bolt_tcp_addr: None,
+            uds_path: Some(PathBuf::from("x.sock")),
+            ..ServerConfig::default()
+        };
+
+        let mut cfg = base.clone();
+        cfg.buffer_pool_pages = 0;
+        assert!(
+            cfg.validate().is_ok(),
+            "0 = auto must validate (resolved at startup)"
+        );
+
+        // A non-zero value below the minimum fails fast with a clean error — never a runtime panic
+        // (`rmp` #302). {1,2,3,4} are the exact sizes that panicked the legacy RefCell pool.
+        for tiny in [1usize, 2, 3, 4, MIN_BUFFER_POOL_PAGES - 1] {
+            let mut cfg = base.clone();
+            cfg.buffer_pool_pages = tiny;
+            assert!(
+                matches!(cfg.validate(), Err(ConfigError::Invalid(_))),
+                "buffer_pool_pages = {tiny} (< {MIN_BUFFER_POOL_PAGES}) must be rejected"
+            );
+        }
+
+        let mut cfg = base;
+        cfg.buffer_pool_pages = MIN_BUFFER_POOL_PAGES;
+        assert!(cfg.validate().is_ok(), "exactly the minimum pool validates");
+    }
+
+    #[test]
+    fn toml_explicit_pool_overrides_auto_zero_stays_auto() {
+        // An explicit value in the file survives hardware resolution (override precedence).
+        let mut cfg: ServerConfig = toml::from_str("buffer_pool_pages = 5000\n").unwrap();
+        cfg.apply_hardware_defaults(&hw(16, Some(64 * GIB), Some(64 * GIB)));
+        assert_eq!(
+            cfg.buffer_pool_pages, 5000,
+            "file value wins over auto-detection"
+        );
+
+        // `0` in the file means auto → resolved from the detected hardware.
+        let mut cfg: ServerConfig = toml::from_str("buffer_pool_pages = 0\n").unwrap();
+        cfg.apply_hardware_defaults(&hw(16, Some(8 * GIB), Some(8 * GIB)));
+        assert_eq!(
+            cfg.buffer_pool_pages, 131_072,
+            "0 in the file auto-sizes from RAM"
         );
     }
 }

@@ -77,11 +77,40 @@ impl<S: LogSink> SharedWal<S> {
 impl<S: LogSink> WalRule for SharedWal<S> {
     /// Hardens the log through `up_to` before the pool writes an index page home (`04 §4.3`).
     ///
+    /// # Errors
+    /// Returns a storage error, **without** aborting the process, if the WAL manager is already
+    /// borrowed when the pool calls this rule (a re-entrant write-back — see below, `rmp` #302).
+    ///
     /// # Panics
     /// Panics (controlled abort) if the durability `fdatasync` fails (`04 §4.9`).
     fn ensure_durable(&mut self, up_to: Lsn) -> Result<()> {
-        self.inner.borrow_mut().ensure_durable(up_to);
-        Ok(())
+        // Fail closed on a re-entrant borrow instead of aborting the process (`rmp` #302).
+        //
+        // This handle is single-threaded (`Rc<RefCell<…>>`), so a failed `try_borrow_mut` can only
+        // mean the manager is ALREADY borrowed on this same thread: a caller is holding the WAL latch
+        // (`SharedWal::with`) across a buffer-pool write-back that re-entered this rule — the classic
+        // ARIES "don't nest the buffer-pool flush under the log latch" hazard. Under a pathologically
+        // tiny buffer pool an eviction fires *inside* such a window; the old unconditional
+        // `borrow_mut()` turned that into an unrecoverable `RefCell already borrowed` panic (the
+        // `rmp` #302 crash the #242 shrinker hit when probing `pool_pages < 4`).
+        //
+        // Returning a clean storage error instead preserves WAL-before-data: the pool's `write_back`
+        // propagates this `Err` via `?` BEFORE it writes the page home, so the dirty page is never
+        // stolen ahead of its log record — the eviction simply fails and the page stays resident and
+        // dirty (recoverable, no corruption). The storage core's own live-rollback path already
+        // avoids this nesting (it records compensations under the lock and replays them after
+        // releasing it, `rmp` #337); this rule is the defence in depth for every other index path.
+        match self.inner.try_borrow_mut() {
+            Ok(mut manager) => {
+                manager.ensure_durable(up_to);
+                Ok(())
+            }
+            Err(_) => Err(GraphusError::Storage(
+                "WAL re-entrancy: index ensure_durable was called while the WAL manager is already \
+                 borrowed (a caller must not hold the WAL latch across a buffer-pool write-back)"
+                    .to_owned(),
+            )),
+        }
     }
 }
 
@@ -233,6 +262,24 @@ mod tests {
         assert!(shared.with(|w| w.durable_len()) <= u.0);
         shared.ensure_durable(u).unwrap();
         assert!(shared.with(|w| w.durable_len()) > u.0);
+    }
+
+    /// Regression (`rmp` #302): a re-entrant `ensure_durable` — the pool's write-back firing while a
+    /// caller already holds the WAL latch (`with`) — must return a clean `Err`, never abort the
+    /// process with a `RefCell already borrowed` panic. This is the exact double-borrow the #242
+    /// shrinker provoked at `pool_pages < 4`, modelled here directly on the shared handle.
+    #[test]
+    fn reentrant_ensure_durable_returns_err_not_panic() {
+        let wal = WalManager::create(MemLogSink::new()).unwrap();
+        let shared = SharedWal::new(wal);
+        let mut rule = shared.clone(); // a second handle over the SAME Rc<RefCell<…>>
+        // Hold the manager borrowed (as `SharedWal::with` does for the whole closure), then re-enter
+        // the WAL rule through the clone — exactly what a pool write-back nested under the latch does.
+        let result = shared.with(|_manager| rule.ensure_durable(Lsn(1)));
+        assert!(
+            result.is_err(),
+            "a re-entrant ensure_durable must fail closed with Err, never panic"
+        );
     }
 
     #[test]

@@ -30,6 +30,7 @@ pub mod bulk_import_mode_b;
 pub mod config;
 pub mod dbcatalog;
 pub mod engine;
+pub mod hardware;
 pub mod key_rotation;
 pub mod listeners;
 pub mod metrics;

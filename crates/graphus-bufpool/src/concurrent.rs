@@ -2088,6 +2088,57 @@ mod tests {
         assert!(p.new_page().is_err());
     }
 
+    /// Regression (`rmp` #302): the concurrent pool must be robust at the same misconfigured tiny
+    /// capacities as the single-threaded pool — {1,2,3,4}. Forcing real eviction pressure (allocate
+    /// well past capacity, unpinning each so the next allocation evicts + writes back) must never
+    /// panic, and every id must reload the exact bytes written before eviction. Unlike the
+    /// single-threaded pool this cannot hit a `RefCell` re-entrancy (its WAL rule is behind its own
+    /// `Mutex`), but it must still degrade cleanly rather than aborting mid-operation.
+    #[test]
+    fn tiny_concurrent_pool_evicts_and_reloads_without_panic() {
+        for cap in 1..=4usize {
+            let p = pool(cap); // NoWal: unlogged writes are permitted by write_back
+            let mut ids = Vec::new();
+            for i in 0..(cap + 3) {
+                let (f, id) = p.new_page().unwrap();
+                p.with_page_mut(f, |page| page[10] = i as u8);
+                p.unpin(f);
+                ids.push(id);
+            }
+            for (i, id) in ids.iter().enumerate() {
+                let f = p.fetch(*id).unwrap();
+                assert_eq!(
+                    p.with_page(f, |page| page[10]),
+                    i as u8,
+                    "cap={cap}: page {id:?} must reload the exact bytes written before eviction"
+                );
+                p.unpin(f);
+            }
+        }
+    }
+
+    /// Regression (`rmp` #302): a fully **pinned** concurrent pool at every tiny capacity {1,2,3,4}
+    /// must surface the clean `AllPinned` capacity error, never panic. This is the concurrent twin of
+    /// `fully_pinned_tiny_pool_returns_clean_error` in the single-threaded pool.
+    #[test]
+    fn fully_pinned_tiny_concurrent_pool_returns_clean_error() {
+        for cap in 1..=4usize {
+            let p = pool(cap);
+            let mut held = Vec::new();
+            for _ in 0..cap {
+                let (f, _id) = p.new_page().unwrap(); // left pinned
+                held.push(f);
+            }
+            assert!(
+                p.new_page().is_err(),
+                "cap={cap}: a fully pinned concurrent pool must return Err, never panic"
+            );
+            for f in held {
+                p.unpin(f);
+            }
+        }
+    }
+
     #[test]
     fn fetch_hit_increments_pin_count() {
         let p = pool(4);

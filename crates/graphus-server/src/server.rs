@@ -218,16 +218,38 @@ impl Server {
     /// [`ServerError`] if config is invalid, the store cannot be opened/verified, auth/TLS setup
     /// fails, or a listener cannot bind.
     pub async fn start(self) -> Result<ServerHandle, ServerError> {
-        self.config.validate().map_err(ServerError::Config)?;
+        // Resolve hardware-derived defaults BEFORE validation and before any store is opened
+        // (`04 §9.5`, decision `D-hw-autotune`): every resource-sizing parameter left at its
+        // `0 = auto` sentinel (the buffer pool, the reader/morsel pools) is sized from the detected
+        // host resources, while any value an operator set in the TOML file or a `GRAPHUS_*` env var
+        // is kept verbatim — config always overrides hardware detection. `validate` (below) then only
+        // ever sees resolved, concrete values.
+        let mut config = self.config;
+        let hardware = crate::hardware::HardwareResources::detect(&config.store_path);
+        // Capture which fields were still at their auto sentinel, for the tuning log's source tags.
+        let buffer_pool_auto = config.buffer_pool_pages == 0;
+        let reader_threads_auto = config.admission.reader_threads == 0;
+        let morsel_parallelism_auto = config.admission.morsel_parallelism == 0;
+        config.apply_hardware_defaults(&hardware);
+
+        config.validate().map_err(ServerError::Config)?;
         observability::init_logging();
         // The traditional database-server startup banner (app name, version, platform, pid) — emitted
         // as the first line of the boot sequence, matched by the `"graphus-server ready"` line once
         // every listener is bound (rmp #363 keeps `main` sync; this is the first thing an operator
         // sees confirming *which* build is coming up).
         observability::log_startup_banner();
-        observability::set_slow_query_threshold(self.config.timing.slow_query_threshold());
+        // One structured line recording what the hardware probe found and how each auto-tunable
+        // parameter resolved (auto vs operator-overridden) — `04 §9.5`.
+        observability::log_hardware_tuning(
+            &hardware,
+            &config,
+            buffer_pool_auto,
+            reader_threads_auto,
+            morsel_parallelism_auto,
+        );
+        observability::set_slow_query_threshold(config.timing.slow_query_threshold());
 
-        let config = self.config;
         let metrics = Arc::new(Metrics::new());
 
         // 1) Security: load the durable, live RBAC model (rmp #92). A present `security.toml` is

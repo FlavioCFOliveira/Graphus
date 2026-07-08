@@ -573,7 +573,18 @@ impl EngineParams {
         // open. Idempotent across per-database `from_config` invocations.
         graphus_cypher::read_source::set_csr_adjacency(config.admission.csr_adjacency);
         Ok(Self {
-            buffer_pool_pages: config.buffer_pool_pages,
+            // `0` = auto is normally resolved to a concrete size by
+            // `ServerConfig::apply_hardware_defaults` (in `Server::start`) before any store opens
+            // (`04 §9.5`). This is the last-resort safety net: should a caller reach here with an
+            // *unresolved* config (e.g. a direct `DatabaseCatalog::load` that skipped startup
+            // resolution), fall back to the auto floor rather than pass `0` to `ConcurrentBufferPool`,
+            // whose capacity must be `> 0`. Mirrors how `reader_threads()`/`morsel_parallelism()`
+            // (below) resolve their own `0 = auto` lazily.
+            buffer_pool_pages: if config.buffer_pool_pages == 0 {
+                crate::config::AUTO_BUFFER_POOL_FLOOR_PAGES
+            } else {
+                config.buffer_pool_pages
+            },
             engine_queue_capacity: config.admission.engine_queue_capacity,
             result_buffer_capacity: config.admission.result_buffer_capacity,
             max_concurrent_queries: config.admission.max_concurrent_queries,

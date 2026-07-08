@@ -25,7 +25,7 @@ full surface. For a listener address env var, an **empty value disables** that l
 | ------------------- | --------------------------- | --------------- | ------- |
 | `store_path`        | `GRAPHUS_STORE_PATH`        | `graphus-data`  | Directory for the record store, WAL, `security.toml`, audit log. (Docker: `/data/graphus-data`.) |
 | `default_database`  | `GRAPHUS_DEFAULT_DATABASE`  | `graphus`       | The always-online default database; name rule `[a-z][a-z0-9_-]{0,62}`. |
-| `buffer_pool_pages` | —                           | `4096`          | Buffer-pool capacity in pages. |
+| `buffer_pool_pages` | `GRAPHUS_BUFFER_POOL_PAGES` | `0` (auto)      | Buffer-pool capacity in pages, per database (8 KiB/page). `0` = auto-size from detected RAM (see [Hardware-aware auto-tuning](#hardware-aware-auto-tuning)); any explicit value overrides and must be ≥ 64. |
 
 ## Listeners
 
@@ -103,6 +103,44 @@ The `[auth]` bootstrap seeds the catalog only on a **fresh** store; thereafter
 | `reader_threads`            | `GRAPHUS_READER_THREADS`           | `0`     | Off-thread read pool size (`0` = auto). |
 | `morsel_parallelism`        | `GRAPHUS_MORSEL_PARALLELISM`       | `0`     | Intra-query morsel parallelism (`0` = auto). |
 | `csr_adjacency`             | `GRAPHUS_CSR_ADJACENCY`            | `false` | Opt-in CSR adjacency accelerator (`true/false/1/0/yes/no/on/off`). |
+
+## Hardware-aware auto-tuning
+
+At startup Graphus probes the host's resources and sizes its resource-hungry parameters to the
+hardware it actually runs on, instead of shipping one fixed value that is simultaneously too small
+for a server and too large for a Raspberry Pi (`04-technical-design.md` §9.5, decision
+`D-hw-autotune`). Detection is **best-effort**: any figure the OS does not expose falls back to a
+safe built-in default, and probing never delays or fails startup.
+
+**`0 = auto`, and your config always wins.** Three parameters take `0` as an "auto" sentinel:
+
+| Parameter            | Auto value                                                                 |
+| -------------------- | -------------------------------------------------------------------------- |
+| `buffer_pool_pages`  | `clamp(⌊available_RAM ÷ 8 ÷ 8 KiB⌋, 4096 pages = 32 MiB, 262144 pages = 2 GiB)` |
+| `reader_threads`     | `min(logical_cpus, 16)`                                                     |
+| `morsel_parallelism` | `min(logical_cpus, 16)`                                                     |
+
+The precedence is **file/env value → hardware auto-size → built-in floor**: set any of these to a
+non-zero value (in the TOML file or the matching `GRAPHUS_*` env var) and that value is used verbatim,
+overriding the hardware-derived one. Leave it `0` (the default) and the server sizes it from the
+detected hardware. The buffer-pool fraction is deliberately conservative (~⅛ of *available* RAM)
+because the pool is **per database** and RAM is shared with the WAL, indexes, result buffers and the
+OS; the floor equals the historical fixed default, so auto is never worse than before, and the
+ceiling bounds worst-case RSS on a big-RAM host. An explicit `buffer_pool_pages` below 64 is rejected
+at startup with a clear error rather than risking a degenerate pool.
+
+**Storage** capacity/free space and an SSD-vs-rotational hint for the store filesystem are also
+detected and reported, but do not (yet) auto-change any parameter.
+
+**Startup log.** One `INFO` line records what was detected and how each parameter resolved — tagged
+`auto` (hardware-derived) or `config` (an operator value that overrode it) — so you can see and, if
+needed, pin the sizing:
+
+```
+hardware auto-tuning: 16 logical CPUs, RAM 26023 MiB available / 31507 MiB total;
+buffer pool 262144 pages (~2048 MiB, auto)
+  … reader_threads=16 (auto) morsel_parallelism=16 (auto) …
+```
 
 ## Timing and limits
 

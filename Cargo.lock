@@ -1401,6 +1401,7 @@ dependencies = [
  "graphus-security-gen",
  "graphus-sim",
  "graphus-storage",
+ "graphus-sysres",
  "graphus-txn",
  "graphus-wal",
  "http",
@@ -1459,6 +1460,14 @@ dependencies = [
  "graphus-wal",
  "proptest",
  "smallvec",
+]
+
+[[package]]
+name = "graphus-sysres"
+version = "0.0.8"
+dependencies = [
+ "libc",
+ "rustix",
 ]
 
 [[package]]

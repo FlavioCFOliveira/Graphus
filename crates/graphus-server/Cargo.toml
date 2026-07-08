@@ -42,6 +42,11 @@ graphus-cypher = { path = "../graphus-cypher" }
 # The persistent record store the engine owns; opened/recovered and integrity-checked at startup
 # (`04 §4.6`, `§4.8`).
 graphus-storage = { path = "../graphus-storage" }
+# Best-effort host hardware probe (logical CPUs, physical RAM, store-filesystem capacity/free +
+# rotational hint) used at startup to auto-size resource parameters left at their `0 = auto`
+# sentinel (`04 §9.5`, decision `D-hw-autotune`). A leaf crate so its OS-specific `unsafe` (macOS
+# sysctl) stays isolated and audited while this crate keeps `#![forbid(unsafe_code)]`.
+graphus-sysres = { path = "../graphus-sysres" }
 # The WAL manager + sinks (the durability substrate the store commits through) and recovery.
 graphus-wal = { path = "../graphus-wal" }
 # The SSI isolation level the engine begins transactions at (`04 §5.4`). `TxnCoordinator` is generic

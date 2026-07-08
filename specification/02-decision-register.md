@@ -159,6 +159,32 @@ scope and are propagated into `00-overview.md` and `01-needs-survey.md`:
 > `08-network-bulk-import.md` §8 and §10 respectively; they are implementation requirements of the
 > ratified design, not separate decisions.
 
+## Ratified decision (2026-07-08) — `D-hw-autotune`
+
+> **`D-hw-autotune` — Hardware-aware startup auto-tuning.** At startup the server probes the host
+> hardware (logical CPUs, total/available physical RAM, and the store filesystem's capacity/free
+> space plus an SSD-vs-rotational hint) and derives sane defaults for its resource-sizing parameters,
+> while every value stays operator-overridable. It is motivated by `FR-AR-6` (the same binary must
+> scale from a 4-core Raspberry Pi 5 to a many-core server without hand-tuning) and by the observation
+> that `buffer_pool_pages` shipped as a fixed 4096-page (32 MiB) default regardless of host RAM,
+> whereas `reader_threads` / `morsel_parallelism` already auto-sized from the CPU count. This decision
+> unifies both under one detection path and one precedence rule. The full design is
+> `04-technical-design.md` §9.5.
+>
+> **Status: ratified.**
+>
+> | Facet | Ratified choice |
+> | --- | --- |
+> | Precedence & sentinel | **The `0 = auto` sentinel plus a strict three-level precedence — operator configuration (TOML file or `GRAPHUS_*` env var) > hardware-derived value > built-in floor — is adopted as the project-wide auto-tuning convention.** A value the operator sets explicitly always wins; a parameter left at its `0` sentinel is hardware-derived; a built-in floor guarantees a safe minimum when a probe fails. This generalizes the already-shipped `reader_threads` / `morsel_parallelism` behavior (`04` §9.3) to the memory dimension. |
+> | Buffer-pool sizing | **Auto `buffer_pool_pages = clamp( floor(0.125 × available_RAM_bytes ÷ 8192), 4096, 262144 )` — a conservative 1/8 of *available* RAM (falling back to total RAM, then to the floor), floored at 4096 pages (32 MiB) and capped at 262144 pages (2 GiB).** The 1/8 fraction is deliberately conservative **because the buffer pool is per-database** (each opened database gets its own pool) and RAM is shared with the WAL, indexes, result buffers, and the OS; the floor equals today's fixed default, so auto is never worse than the status quo, and the ceiling bounds worst-case resident-set growth. |
+> | Probe isolation | **All OS-specific and `unsafe` hardware probing is isolated in a new, independently-audited `graphus-sysres` leaf crate** (`04` §1.2), so `graphus-server` stays `#![forbid(unsafe_code)]`. Every probe is best-effort with graceful degradation (a failed probe yields `None` and the floor is used); detection never panics or blocks server start. |
+>
+> **Scope note.** In this first cut, the detected storage capacity/free space and the rotational/SSD
+> hint are **detected and reported in the startup log only**; they may inform future tuning but drive
+> no automatic parameter change yet (`04` §9.5). The resolved values and their provenance
+> (operator-overridden, hardware-derived, or floor) are recorded in a single structured startup log
+> line.
+
 ## TCK target (pinned — closes `D-cypher-line` open question 1)
 
 The "100% Cypher TCK" target is pinned to the **openCypher `2024.3`** tag (commit `677cbaf`,

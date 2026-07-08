@@ -6,8 +6,12 @@
 
 # Directory holding the record-store device file + the WAL file (created if absent).
 store_path = "graphus-data"
-# Buffer-pool capacity in pages (04 §3).
-buffer_pool_pages = 4096
+# Buffer-pool capacity in pages, per database (04 §3; 8 KiB a page, so 4096 pages = 32 MiB).
+#   0 = AUTO (default): at startup the server sizes the pool from detected RAM — ~1/8 of available
+#   memory, clamped to [4096 pages = 32 MiB, 262144 pages = 2 GiB] (04 §9.5, decision D-hw-autotune).
+#   Any explicit value (here or via GRAPHUS_BUFFER_POOL_PAGES) OVERRIDES the auto-size and must be
+#   >= 64 pages. The startup log prints the detected hardware and the resolved value (auto vs config).
+buffer_pool_pages = 0
 
 # Listeners. Set an address to "" (or remove it) to disable that listener.
 #   - UDS (Bolt): kernel-protected local channel, peer-cred auth, no TLS.
@@ -47,6 +51,11 @@ max_concurrent_queries = 256
 engine_queue_capacity = 1024
 # Bounded result-row channel capacity (egress backpressure).
 result_buffer_capacity = 256
+# Off-thread reader pool + intra-query morsel pool. 0 = AUTO: sized from detected CPUs as
+# min(logical_cpus, 16) at startup (04 §9.5). Pin a value to override; morsel_parallelism = 1 forces
+# fully-serial execution (the determinism / single-core / Raspberry-Pi path).
+reader_threads = 0
+morsel_parallelism = 0
 
 [timing]
 # Queries slower than this are written to the slow-query log (04 §9 / NFR-10).

@@ -204,7 +204,11 @@ format: **Bolt over UDS**, **Bolt over TCP**, and the **Web REST API**.
 - **FR-AR-5** [CORE] **Cache-line correctness:** cache-padding via `CachePadded`/`#[repr(align)]`,
   never a hard-coded 64 (ARM/Apple Silicon use 128-byte alignment behavior).
 - **FR-AR-6** [CORE] **Hardware adaptivity:** runtime CPU/core detection; configurable worker/shard
-  counts; the same binary scales from a 4-core Raspberry Pi 5 to many-core servers.
+  counts; the same binary scales from a 4-core Raspberry Pi 5 to many-core servers. At startup the
+  server probes CPU, RAM, and the store filesystem and derives resource-sizing defaults (memory-sized
+  `buffer_pool_pages`, CPU-sized `reader_threads` / `morsel_parallelism`), each operator-overridable
+  under a `0 = auto` precedence (operator config > hardware-derived > built-in floor) — decision
+  `D-hw-autotune`; design in `04-technical-design.md` §9.5.
 - **FR-AR-7** [ADV] **SIMD acceleration** feature-gated with scalar fallback and runtime feature
   dispatch (NEON/AVX); never hard-required.
 - **FR-AR-8** [CORE] **Allocator strategy:** system allocator by default; mimalloc/jemalloc adopted

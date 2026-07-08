@@ -129,6 +129,61 @@ pub fn log_startup_banner() {
     );
 }
 
+/// Formats an optional byte count as whole **MiB** for the human tuning message (`None` →
+/// `"unknown"`, so a failed probe reads clearly rather than as a silent zero).
+fn opt_mib(bytes: Option<u64>) -> String {
+    match bytes {
+        Some(b) => (b / (1024 * 1024)).to_string(),
+        None => "unknown".to_owned(),
+    }
+}
+
+/// Emits one structured `info` line summarising the startup hardware auto-tuning (`04 §9.5`,
+/// decision `D-hw-autotune`): what the host probe detected (logical CPUs, physical RAM, store
+/// filesystem capacity/free + rotational hint) and how each auto-tunable parameter resolved, tagging
+/// each as `"auto"` (hardware-derived) or `"config"` (an operator value from the TOML file / a
+/// `GRAPHUS_*` env var that overrode auto-detection).
+///
+/// The `*_auto` flags are captured **before** [`ServerConfig::apply_hardware_defaults`](crate::config::ServerConfig::apply_hardware_defaults)
+/// runs (a field that was `0` was auto-sized; anything else was operator-set), so an operator can see
+/// at a glance — or with a single `grep` — exactly how the server sized itself and pin any value that
+/// the auto policy did not choose well for their workload. Call it once, right after
+/// [`log_startup_banner`], when logging is initialised.
+pub fn log_hardware_tuning(
+    hw: &crate::hardware::HardwareResources,
+    cfg: &crate::config::ServerConfig,
+    buffer_pool_auto: bool,
+    reader_threads_auto: bool,
+    morsel_parallelism_auto: bool,
+) {
+    const MIB: u64 = 1024 * 1024;
+    let pool_mib =
+        (cfg.buffer_pool_pages as u64).saturating_mul(graphus_io::PAGE_SIZE as u64) / MIB;
+    let source = |auto: bool| if auto { "auto" } else { "config" };
+    tracing::info!(
+        detected_logical_cpus = hw.logical_cpus,
+        detected_mem_total_mib = ?hw.memory.total_bytes.map(|b| b / MIB),
+        detected_mem_available_mib = ?hw.memory.available_bytes.map(|b| b / MIB),
+        detected_disk_total_mib = ?hw.storage.total_bytes.map(|b| b / MIB),
+        detected_disk_available_mib = ?hw.storage.available_bytes.map(|b| b / MIB),
+        detected_disk_rotational = ?hw.storage.rotational,
+        buffer_pool_pages = cfg.buffer_pool_pages,
+        buffer_pool_mib = pool_mib,
+        buffer_pool_source = source(buffer_pool_auto),
+        reader_threads = cfg.admission.reader_threads,
+        reader_threads_source = source(reader_threads_auto),
+        morsel_parallelism = cfg.admission.morsel_parallelism,
+        morsel_parallelism_source = source(morsel_parallelism_auto),
+        "hardware auto-tuning: {} logical CPUs, RAM {} MiB available / {} MiB total; buffer pool {} pages (~{} MiB, {})",
+        hw.logical_cpus,
+        opt_mib(hw.memory.available_bytes),
+        opt_mib(hw.memory.total_bytes),
+        cfg.buffer_pool_pages,
+        pool_mib,
+        source(buffer_pool_auto),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

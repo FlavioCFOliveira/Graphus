@@ -367,4 +367,118 @@ mod tests {
         p.page_mut(f)[0] = 1;
         assert!(p.flush(f).is_err()); // the WAL rule refuses, so the write-back fails
     }
+
+    /// A [`WalRule`] over a real `Lsn`-tracking log that counts how many times its `ensure_durable`
+    /// fired, so a tiny pool's eviction write-backs can be observed to actually run the WAL rule.
+    #[derive(Default)]
+    struct CountingWal {
+        fired: usize,
+    }
+    impl WalRule for CountingWal {
+        fn ensure_durable(&mut self, _up_to: Lsn) -> Result<()> {
+            self.fired += 1;
+            Ok(())
+        }
+        fn tracks_lsn(&self) -> bool {
+            false
+        }
+    }
+
+    /// Regression (`rmp` #302): a **misconfigured tiny** buffer pool — `pool_pages` in {1,2,3,4},
+    /// the sizes the #242 shrinker probed — must evict and reload correctly under a WAL rule that
+    /// forces write-back, with NO panic. Every eviction of a dirty page must run the WAL rule
+    /// (WAL-before-data) and reload must re-verify the checksum, at every one of these capacities.
+    #[test]
+    fn tiny_pool_evicts_and_reloads_without_panic() {
+        for cap in 1..=4usize {
+            let mut p = BufferPool::with_wal(MemBlockDevice::new(0), CountingWal::default(), cap);
+            // Allocate cap + 3 dirty pages; each unpinned so the next allocation must evict + write
+            // back, exceeding the pool by enough to force real eviction pressure at any cap in 1..=4.
+            let mut ids = Vec::new();
+            for i in 0..(cap + 3) {
+                let (f, id) = p.new_page().unwrap();
+                p.page_mut(f)[10] = i as u8;
+                p.unpin(f);
+                ids.push(id);
+            }
+            // Re-fetch each id: a miss reloads from the device and verifies its checksum.
+            for (i, id) in ids.iter().enumerate() {
+                let f = p.fetch(*id).unwrap();
+                assert_eq!(
+                    p.page(f)[10],
+                    i as u8,
+                    "cap={cap}: page {id:?} must reload the exact bytes written before eviction"
+                );
+                p.unpin(f);
+            }
+        }
+    }
+
+    /// Regression (`rmp` #302): at a tiny capacity, if the WAL rule refuses to harden (a re-entrancy
+    /// guard returning `Err`, or a genuine durability failure), the eviction that triggers the
+    /// write-back must surface a clean `Err` — never panic — and must NOT steal the dirty page to
+    /// disk (WAL-before-data is upheld: every victim stays resident and intact).
+    #[test]
+    fn tiny_pool_wal_error_on_eviction_is_clean_and_upholds_wal_before_data() {
+        /// A WAL rule that refuses to harden anything: every write-back is blocked.
+        struct AlwaysRefuse;
+        impl WalRule for AlwaysRefuse {
+            fn ensure_durable(&mut self, _up_to: Lsn) -> Result<()> {
+                Err(GraphusError::Storage("wal refuses".to_owned()))
+            }
+            fn tracks_lsn(&self) -> bool {
+                false
+            }
+        }
+        for cap in 1..=4usize {
+            let mut p = BufferPool::with_wal(MemBlockDevice::new(0), AlwaysRefuse, cap);
+            // Fill every frame with a dirty, unpinned page. `new_page` never calls the WAL rule while
+            // a free frame remains (it only extends + installs), so filling to capacity succeeds even
+            // though the rule refuses every hardening.
+            let mut ids = Vec::new();
+            for i in 0..cap {
+                let (f, id) = p.new_page().unwrap();
+                p.page_mut(f)[100] = i as u8; // mark dirty (offset 100 is past the page header)
+                p.unpin(f);
+                ids.push(id);
+            }
+            // The pool is now full of dirty victims. The next allocation must evict one, whose
+            // write-back calls the refusing WAL rule — that must be a clean Err, never a panic, and
+            // must abort BEFORE the home write (so the device is not even extended).
+            assert!(
+                p.new_page().is_err(),
+                "cap={cap}: an eviction blocked by the WAL rule must return Err, not panic"
+            );
+            // WAL-before-data upheld: nothing was stolen to the device and no frame state was
+            // corrupted — every original page is still resident and readable via a HIT fetch (which
+            // needs no eviction), with its bytes intact.
+            for (i, id) in ids.iter().enumerate() {
+                let f = p.fetch(*id).unwrap(); // HIT: still resident, no write-back
+                assert_eq!(
+                    p.page(f)[100],
+                    i as u8,
+                    "cap={cap}: victim {id:?} must be preserved intact after the failed eviction"
+                );
+                p.unpin(f);
+            }
+        }
+    }
+
+    /// Regression (`rmp` #302): a fully **pinned** tiny pool (no evictable victim) must return the
+    /// clean "full of pinned pages" error at every capacity in {1,2,3,4}, never panic.
+    #[test]
+    fn fully_pinned_tiny_pool_returns_clean_error() {
+        for cap in 1..=4usize {
+            let mut p = BufferPool::new(MemBlockDevice::new(0), cap);
+            // Pin every frame.
+            for _ in 0..cap {
+                p.new_page().unwrap(); // left pinned
+            }
+            // No evictable victim remains: allocation must fail cleanly.
+            assert!(
+                p.new_page().is_err(),
+                "cap={cap}: a fully pinned pool must return Err, never panic"
+            );
+        }
+    }
 }
