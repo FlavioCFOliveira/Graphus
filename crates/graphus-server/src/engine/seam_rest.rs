@@ -218,11 +218,9 @@ impl RestEngineAdapter {
                         | crate::engine::IndexCommand::ShowPointIndexes
                 );
                 let detail = redact_index_detail(&cmd);
-                // The result summary (`rmp` #513): query type `s` + `indexes-added`/`indexes-removed`
-                // for a CREATE/DROP, or type `r` for a `SHOW`. Built before the command is moved into
-                // the engine; only the success path reaches the stream (a failure returns via
-                // `outcome?`), so `ok = true`.
-                let summary = index_ddl_summary(&cmd, true);
+                // Keep the command shape for the post-outcome summary (counters depend on whether the
+                // DDL actually mutated — `reply.mutated`); cloning is negligible (DDL is rare).
+                let summary_cmd = cmd.clone();
                 let outcome = handle.index_ddl_blocking(cmd);
                 if mutating {
                     self.context.audit().record(
@@ -241,6 +239,9 @@ impl RestEngineAdapter {
                     );
                 }
                 Some(outcome.map(|reply| {
+                    // Query type `s` + `indexes-added`/`indexes-removed` for a real CREATE/DROP, or the
+                    // `0` counter shape for an idempotent no-op (`rmp` #626 follow-up); `r` for a SHOW.
+                    let summary = index_ddl_summary(&summary_cmd, reply.mutated);
                     RestEngineStream::admin(AdminResult {
                         fields: reply.fields,
                         rows: reply.rows,
@@ -272,11 +273,9 @@ impl RestEngineAdapter {
                 // `SHOW CONSTRAINTS` is read-only — only the mutating CREATE/DROP are schema changes.
                 let mutating = !matches!(cmd, crate::engine::ConstraintCommand::Show);
                 let detail = redact_constraint_detail(&cmd);
-                // The result summary (`rmp` #513): query type `s` +
-                // `constraints-added`/`constraints-removed` for a CREATE/DROP, or type `r` for a
-                // `SHOW`. Built before the command is moved into the engine; only the success path
-                // reaches the stream (a failure returns via `outcome?`), so `ok = true`.
-                let summary = constraint_ddl_summary(&cmd, true);
+                // Keep the command shape for the post-outcome summary (counters depend on
+                // `reply.mutated`).
+                let summary_cmd = cmd.clone();
                 let outcome = handle.constraint_ddl_blocking(cmd);
                 if mutating {
                     self.context.audit().record(
@@ -295,6 +294,9 @@ impl RestEngineAdapter {
                     );
                 }
                 Some(outcome.map(|reply| {
+                    // Query type `s` + `constraints-added`/`constraints-removed` for a real CREATE/DROP,
+                    // or the `0` counter shape for a no-op drop (`rmp` #626 follow-up); `r` for a SHOW.
+                    let summary = constraint_ddl_summary(&summary_cmd, reply.mutated);
                     RestEngineStream::admin(AdminResult {
                         fields: reply.fields,
                         rows: reply.rows,

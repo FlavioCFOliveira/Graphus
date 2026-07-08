@@ -102,7 +102,9 @@ use crate::audit::{
     classify_admin, is_mutating_admin, redact_admin_detail,
 };
 use crate::dbcatalog::{CatalogError, DatabaseCatalog, DbState, normalize_db_name};
-use crate::engine::{ConstraintCommand, EngineHandle, IndexCommand, RunSummary};
+use crate::engine::{
+    ConstraintCommand, EngineHandle, IndexCommand, NodePropertyIndexRef, RunSummary,
+};
 use crate::security::{SecurityCatalog, SecurityError};
 
 // ------------------------------------------------------------------------------------------------
@@ -663,21 +665,23 @@ pub fn parse_admin_statement(query: &str) -> AdminParse {
 }
 
 /// Parses the remainder of a claimed **index** statement (`verb` + `INDEX`/`INDEXES` already read),
-/// for the two `CREATE`/`DROP` shapes and `SHOW INDEXES` (`rmp` task #91):
+/// for the `CREATE`/`DROP` shapes and `SHOW INDEXES` (`rmp` tasks #91, #624):
 ///
 /// ```text
-/// CREATE INDEX FOR (n:Label) ON (n.property)   -- openCypher 9
-/// CREATE INDEX ON :Label(property)             -- legacy
-/// DROP   INDEX FOR (n:Label) ON (n.property)
-/// DROP   INDEX ON :Label(property)
+/// CREATE INDEX [<name>] [IF NOT EXISTS] FOR (n:Label) ON (n.property)  -- openCypher 9 (named/anonymous)
+/// CREATE INDEX [IF NOT EXISTS] ON :Label(property)                     -- legacy (anonymous)
+/// DROP   INDEX <name> [IF EXISTS]                                      -- by name
+/// DROP   INDEX FOR (n:Label) ON (n.property)                           -- by target
+/// DROP   INDEX ON :Label(property)                                     -- by target (legacy)
 /// SHOW   INDEXES
 /// ```
 ///
-/// A label/property name is a bare word or a `` `backtick-quoted` `` name (so a name colliding with a
+/// A name/label/property is a bare word or a `` `backtick-quoted` `` name (so one colliding with a
 /// keyword still works); a variable is any bare word (its actual text is irrelevant — both shapes are
-/// single-variable). `CREATE/DROP INDEX` without a name (openCypher's named-index `DROP INDEX name`)
-/// is **not** supported here: Graphus identifies a node-property index by `(label, property)`, not by
-/// a server-assigned name, so the label/property shapes are the canonical surface.
+/// single-variable). The optional index **name** (`rmp` task #624) is disambiguated from the `FOR`/`ON`
+/// target keywords and the `IF` clause by look-ahead: the first token after `CREATE/DROP INDEX` is the
+/// name **unless** it is the bare keyword `FOR`, `ON` or `IF` (a name that collides with one of those
+/// must be back-ticked).
 fn parse_claimed_index(
     verb: &str,
     plural: bool,
@@ -688,19 +692,86 @@ fn parse_claimed_index(
         expect_end(lex, "SHOW INDEXES")?;
         return Ok(IndexCommand::ShowIndexes);
     }
-    if verb == "SHOW" {
-        // `SHOW INDEX` (singular) is not a recognised form; only the plural `SHOW INDEXES`.
-        return Err("expected SHOW INDEXES (the singular SHOW INDEX is not supported)".to_owned());
-    }
-
-    // CREATE / DROP INDEX: parse the `(label, property)` from either the `FOR … ON …` or the
-    // `ON :Label(property)` shape.
-    let (label, property) = parse_index_target(verb, lex)?;
     match verb {
-        "CREATE" => Ok(IndexCommand::CreateNodePropertyIndex { label, property }),
-        "DROP" => Ok(IndexCommand::DropNodePropertyIndex { label, property }),
+        "SHOW" => {
+            // `SHOW INDEX` (singular) is not a recognised form; only the plural `SHOW INDEXES`.
+            Err("expected SHOW INDEXES (the singular SHOW INDEX is not supported)".to_owned())
+        }
+        "CREATE" => parse_create_index(lex),
+        "DROP" => parse_drop_index(lex),
         // `parse_admin_statement` only routes CREATE/DROP/SHOW here; START/STOP never reach this.
         other => Err(format!("unsupported index verb {other}")),
+    }
+}
+
+/// Parses a `CREATE INDEX [<name>] [IF NOT EXISTS] <target>` tail (`rmp` task #624): an optional name,
+/// an optional `IF NOT EXISTS`, then the `FOR … ON …` or legacy `ON :Label(property)` target.
+fn parse_create_index(lex: &mut Lexer<'_>) -> Result<IndexCommand, String> {
+    let name = parse_optional_index_name(lex)?;
+    let if_not_exists = parse_optional_if(lex, /* with_not */ true)?;
+    let (label, property) = parse_index_target("CREATE", lex)?;
+    Ok(IndexCommand::CreateNodePropertyIndex {
+        name,
+        label,
+        property,
+        if_not_exists,
+    })
+}
+
+/// Parses a `DROP INDEX …` tail (`rmp` task #624): the by-**target** shape (`FOR …`/`ON …`) or the
+/// by-**name** shape (`<name> [IF EXISTS]`). A leading `FOR`/`ON` keyword selects the target shape;
+/// anything else is read as the index name.
+fn parse_drop_index(lex: &mut Lexer<'_>) -> Result<IndexCommand, String> {
+    // Look ahead: a leading FOR/ON keyword is the by-target shape; otherwise it is a `DROP INDEX <name>`.
+    let mut peek = Lexer {
+        rest: lex.rest.clone(),
+    };
+    let by_target = matches!(
+        peek.next_tok()?,
+        Some(ref t) if is_keyword(t, "FOR") || is_keyword(t, "ON")
+    );
+    if by_target {
+        let (label, property) = parse_index_target("DROP", lex)?;
+        return Ok(IndexCommand::DropNodePropertyIndex {
+            index: NodePropertyIndexRef::Target { label, property },
+            if_exists: false,
+        });
+    }
+    // By name: `DROP INDEX <name> [IF EXISTS]`.
+    let name = expect_name(lex, "an index name or a FOR/ON target", "DROP")?;
+    let if_exists = parse_optional_if(lex, /* with_not */ false)?;
+    expect_end(lex, "DROP INDEX")?;
+    Ok(IndexCommand::DropNodePropertyIndex {
+        index: NodePropertyIndexRef::Named(name),
+        if_exists,
+    })
+}
+
+/// Parses the optional index **name** before a `CREATE INDEX` target (`rmp` task #624). Returns the
+/// name if present, or [`None`] when the next token is the bare keyword `FOR`, `ON` or `IF` (which
+/// starts the target or the `IF NOT EXISTS` clause), or when there is no token (the target parser then
+/// produces the precise "expected FOR/ON" error). A back-ticked token is always a name — so an index
+/// may be named `` `for` `` / `` `if` `` if quoted.
+fn parse_optional_index_name(lex: &mut Lexer<'_>) -> Result<Option<String>, String> {
+    // Peek without consuming.
+    let mut peek = Lexer {
+        rest: lex.rest.clone(),
+    };
+    match peek.next_tok()? {
+        // A bare FOR/ON/IF keyword is NOT a name: it starts the target or the IF clause.
+        Some(Tok::Word(w))
+            if w.eq_ignore_ascii_case("FOR")
+                || w.eq_ignore_ascii_case("ON")
+                || w.eq_ignore_ascii_case("IF") =>
+        {
+            Ok(None)
+        }
+        // Any other bare word, or a back-ticked name, is the index name.
+        Some(Tok::Word(_) | Tok::Quoted(_)) => {
+            Ok(Some(expect_name(lex, "an index name", "CREATE")?))
+        }
+        // A symbol / string / end-of-input: no name — let the target parser produce the precise error.
+        _ => Ok(None),
     }
 }
 
@@ -2781,60 +2852,134 @@ mod tests {
         not_admin("showconstraints"); // single token, not the two-token prefix
     }
 
+    /// A `CreateNodePropertyIndex` with the anonymous / no-`IF` defaults, for the terse assertions.
+    fn create_np(label: &str, property: &str) -> IndexCommand {
+        IndexCommand::CreateNodePropertyIndex {
+            name: None,
+            label: label.to_owned(),
+            property: property.to_owned(),
+            if_not_exists: false,
+        }
+    }
+
     #[test]
     fn create_index_both_shapes() {
         // openCypher 9 form.
         assert_eq!(
             index_cmd("CREATE INDEX FOR (n:Person) ON (n.age)"),
-            IndexCommand::CreateNodePropertyIndex {
-                label: "Person".to_owned(),
-                property: "age".to_owned(),
-            }
+            create_np("Person", "age")
         );
         // Legacy form.
         assert_eq!(
             index_cmd("CREATE INDEX ON :Person(age)"),
-            IndexCommand::CreateNodePropertyIndex {
-                label: "Person".to_owned(),
-                property: "age".to_owned(),
-            }
+            create_np("Person", "age")
         );
         // Case-insensitive keywords, surrounding whitespace, trailing `;`, backtick-quoted names.
         assert_eq!(
             index_cmd("  create   index   for ( p : `Sales-Rep` )  on ( p.`first.name` ) ;"),
-            IndexCommand::CreateNodePropertyIndex {
-                label: "Sales-Rep".to_owned(),
-                property: "first.name".to_owned(),
-            }
+            create_np("Sales-Rep", "first.name")
         );
         // A different variable letter in the ON clause is fine (the variable text is irrelevant).
         assert_eq!(
             index_cmd("CREATE INDEX FOR (a:Tag) ON (a.name)"),
+            create_np("Tag", "name")
+        );
+    }
+
+    #[test]
+    fn create_index_named_and_if_not_exists() {
+        // Named openCypher form (`rmp` task #624).
+        assert_eq!(
+            index_cmd("CREATE INDEX ix_person FOR (p:Person) ON (p.name)"),
             IndexCommand::CreateNodePropertyIndex {
-                label: "Tag".to_owned(),
+                name: Some("ix_person".to_owned()),
+                label: "Person".to_owned(),
                 property: "name".to_owned(),
+                if_not_exists: false,
+            }
+        );
+        // Named + IF NOT EXISTS.
+        assert_eq!(
+            index_cmd("CREATE INDEX ix_person IF NOT EXISTS FOR (p:PERSON) ON (p.name)"),
+            IndexCommand::CreateNodePropertyIndex {
+                name: Some("ix_person".to_owned()),
+                label: "PERSON".to_owned(),
+                property: "name".to_owned(),
+                if_not_exists: true,
+            }
+        );
+        // Anonymous + IF NOT EXISTS (no name, still idempotent).
+        assert_eq!(
+            index_cmd("CREATE INDEX IF NOT EXISTS FOR (p:Person) ON (p.age)"),
+            IndexCommand::CreateNodePropertyIndex {
+                name: None,
+                label: "Person".to_owned(),
+                property: "age".to_owned(),
+                if_not_exists: true,
+            }
+        );
+        // A back-ticked name colliding with a keyword still works.
+        assert_eq!(
+            index_cmd("CREATE INDEX `for` FOR (p:Person) ON (p.age)"),
+            IndexCommand::CreateNodePropertyIndex {
+                name: Some("for".to_owned()),
+                label: "Person".to_owned(),
+                property: "age".to_owned(),
+                if_not_exists: false,
             }
         );
     }
 
     #[test]
-    fn drop_index_both_shapes_and_show_indexes() {
+    fn drop_index_by_target_and_show_indexes() {
         assert_eq!(
             index_cmd("DROP INDEX ON :Person(age)"),
             IndexCommand::DropNodePropertyIndex {
-                label: "Person".to_owned(),
-                property: "age".to_owned(),
+                index: NodePropertyIndexRef::Target {
+                    label: "Person".to_owned(),
+                    property: "age".to_owned(),
+                },
+                if_exists: false,
             }
         );
         assert_eq!(
             index_cmd("drop index for (n:Person) on (n.age)"),
             IndexCommand::DropNodePropertyIndex {
-                label: "Person".to_owned(),
-                property: "age".to_owned(),
+                index: NodePropertyIndexRef::Target {
+                    label: "Person".to_owned(),
+                    property: "age".to_owned(),
+                },
+                if_exists: false,
             }
         );
         assert_eq!(index_cmd("SHOW INDEXES"), IndexCommand::ShowIndexes);
         assert_eq!(index_cmd("show indexes ;"), IndexCommand::ShowIndexes);
+    }
+
+    #[test]
+    fn drop_index_by_name_and_if_exists() {
+        assert_eq!(
+            index_cmd("DROP INDEX ix_person"),
+            IndexCommand::DropNodePropertyIndex {
+                index: NodePropertyIndexRef::Named("ix_person".to_owned()),
+                if_exists: false,
+            }
+        );
+        assert_eq!(
+            index_cmd("DROP INDEX ix_person IF EXISTS"),
+            IndexCommand::DropNodePropertyIndex {
+                index: NodePropertyIndexRef::Named("ix_person".to_owned()),
+                if_exists: true,
+            }
+        );
+        // A back-ticked name colliding with a keyword still works.
+        assert_eq!(
+            index_cmd("DROP INDEX `on` IF EXISTS"),
+            IndexCommand::DropNodePropertyIndex {
+                index: NodePropertyIndexRef::Named("on".to_owned()),
+                if_exists: true,
+            }
+        );
     }
 
     #[test]
@@ -2843,13 +2988,18 @@ mod tests {
         invalid("CREATE INDEX"); // missing target
         invalid("CREATE INDEX FOR (n:Person)"); // missing ON clause
         invalid("CREATE INDEX FOR (n:Person) ON (n.age) extra");
+        invalid("CREATE INDEX ix FOR (n:Person) ON (n.age) extra"); // named + trailing junk
         invalid("CREATE INDEX ON Person(age)"); // legacy needs the leading `:`
         invalid("CREATE INDEX ON :Person"); // missing (property)
         invalid("CREATE INDEX FOR (n:Person) ON (age)"); // ON ref must be `var.property`
+        invalid("CREATE INDEX ix_person"); // a name with no target
+        invalid("CREATE INDEX ix IF NOT EXISTS"); // IF NOT EXISTS with no target
         invalid("CREATE INDEXES FOR (n:Person) ON (n.age)"); // plural only for SHOW
         invalid("SHOW INDEX"); // the singular is not a form
         invalid("SHOW INDEXES extra");
-        invalid("DROP INDEX"); // missing target
+        invalid("DROP INDEX"); // missing name/target
+        invalid("DROP INDEX ix_person extra"); // by-name + trailing junk
+        invalid("DROP INDEX ix_person IF NOT EXISTS"); // DROP takes IF EXISTS, not IF NOT EXISTS
         invalid("DROP INDEX ON :Person(age) trailing");
         invalid("CREATE INDEX ON :`unterminated(age)"); // unterminated backtick name
     }

@@ -9,7 +9,10 @@
 //! detail is filled in just-in-time by the owning Phase 1 tasks.
 #![forbid(unsafe_code)]
 
-pub use error::{CONSTRAINT_VIOLATION_PREFIX, GraphusError, Result};
+pub use error::{
+    CONSTRAINT_VIOLATION_PREFIX, GraphusError, Result, SCHEMA_RULE_ERROR_PREFIX,
+    SCHEMA_RULE_ERROR_SEP,
+};
 pub use ids::{ElementId, Lsn, PageId, Timestamp, TxnId};
 pub use temporal_calc::{TemporalError, TemporalResult};
 pub use value::Value;
@@ -465,6 +468,26 @@ pub mod error {
     /// and the consumer (`graphus-bolt`) share one definition with **no** crate dependency between them
     /// (both depend on `graphus-core`). Chosen so a genuine user message can never start with it.
     pub const CONSTRAINT_VIOLATION_PREFIX: &str = "\u{1}constraint-violation\u{1} ";
+
+    /// The stable internal sentinel that prefixes a **schema-rule** error message — an index/constraint
+    /// name collision, an equivalent schema rule already existing, or a drop of a missing rule
+    /// (`rmp` task #624). Carried on a [`GraphusError::Runtime`] whose message, after this prefix, is
+    /// `<Neo4j leaf code>\u{1f}<human message>` (the [`SCHEMA_RULE_ERROR_SEP`] separates the two).
+    ///
+    /// The Bolt / REST error renderers detect the prefix, split off the precise `Neo.ClientError.Schema.*`
+    /// leaf code and emit it (stripping the sentinel + code from the message the wire carries), exactly
+    /// as they already do for [`CONSTRAINT_VIOLATION_PREFIX`]. It lives here in `graphus-core` so the
+    /// producer (`graphus-cypher`) and the consumers (`graphus-bolt`, `graphus-rest`) share one
+    /// definition with **no** crate dependency between them. Chosen so a genuine user message can never
+    /// start with it, and — since the code segment is server-generated from a fixed set of leaf codes
+    /// and any user-supplied name lands in the *human* segment after the first separator — a client can
+    /// never inject an arbitrary status code.
+    pub const SCHEMA_RULE_ERROR_PREFIX: &str = "\u{1}schema-rule-error\u{1} ";
+
+    /// The separator between the Neo4j leaf code and the human message inside a message carrying
+    /// [`SCHEMA_RULE_ERROR_PREFIX`] (`rmp` task #624). The ASCII unit separator (`0x1f`), which never
+    /// appears in a leaf code or a human schema message.
+    pub const SCHEMA_RULE_ERROR_SEP: char = '\u{1f}';
 
     /// Top-level error type for Graphus.
     ///

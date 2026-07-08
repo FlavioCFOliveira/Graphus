@@ -58,6 +58,7 @@ use crate::catalog::IndexCatalog;
 use crate::constraint::ConstraintViolation;
 use crate::index_set::IndexSet;
 use crate::record_graph::RecordStoreGraph;
+use crate::schema_error::{equivalent_index_exists, index_drop_not_found, index_name_in_use};
 use crate::statistics::Statistics;
 use crate::store_statistics;
 
@@ -283,6 +284,58 @@ pub struct TxnCoordinator<D: BlockDevice, S: LogSink> {
     pending_spatial_builds: VecDeque<PendingSpatialBuild>,
 }
 
+/// The deterministic, stable **auto-name** for a node-property index on `(label, property)`
+/// (`rmp` task #624).
+///
+/// Used both when a `CREATE INDEX` omits a name and when backfilling a legacy anonymous index on open.
+/// Form: `index_<label>_<property>`, with each part sanitized to the identifier charset `[A-Za-z0-9_]`
+/// (any other character → `_`). This is a **pure** function of its arguments, so the same
+/// `(label, property)` always yields the same base name across restarts and rebuilds — which is what
+/// makes a legacy index's backfilled name stable.
+///
+/// The base can collide — two distinct `(label, property)` pairs can sanitize to the same string, or
+/// the base can equal an explicitly-declared name. [`TxnCoordinator`] resolves such a collision by
+/// appending the deterministic token suffix `_<label_token>_<property_token>` (see
+/// `unique_auto_index_name`); because the resolved name is then persisted durably, the resolution is
+/// computed at most once and is stable thereafter.
+#[must_use]
+pub fn auto_index_name(label: &str, property: &str) -> String {
+    format!(
+        "index_{}_{}",
+        sanitize_identifier(label),
+        sanitize_identifier(property)
+    )
+}
+
+/// Maps every character outside the identifier charset `[A-Za-z0-9_]` to `_`, so an auto-generated
+/// index name is always a clean bare identifier (`rmp` task #624).
+fn sanitize_identifier(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Which schema catalog a name is being declared into, for the global name-uniqueness check
+/// (`rmp` task #624). Names are unique across **all** catalogs; a `CREATE` rejects a name already used
+/// by a *different* catalog while preserving each catalog's own re-declare (replace) semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NameCatalog {
+    /// The node-property index name catalog.
+    NodeProperty,
+    /// The full-text index catalog.
+    Fulltext,
+    /// The spatial (point) index catalog.
+    Spatial,
+    /// The constraint catalog.
+    Constraint,
+}
+
 impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// A coordinator over `store` with no open transactions.
     ///
@@ -323,6 +376,11 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // recovered id high-water so even the promotion transaction never reuses a pre-crash id.
         let next_txn_id =
             Self::promote_recovered_populating_indexes(&store, &index, recovered_txn_hw);
+        // Backfill a deterministic, durable auto-name for every declared node-property index that has
+        // none — a **legacy anonymous** index persisted before named indexes existed (`rmp` task #624).
+        // After this, every declared index is named end-to-end (droppable by name, listed with a name in
+        // `SHOW INDEXES`), and the name is stable across restarts because it is now durable.
+        let next_txn_id = Self::backfill_recovered_index_names(&store, next_txn_id);
         // The opt-in CSR adjacency (`rmp` #324, Win 2): built from the store on open ONLY when the knob
         // is enabled, so the default (off) path allocates nothing. Like the index it is derived and
         // never recovered — a fresh coordinator over a recovered store rebuilds a store-consistent CSR.
@@ -441,6 +499,81 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         }
         for (_, entry) in populating_spatial {
             idx.set_spatial_state(entry.label_token, entry.property_token, IndexState::Online);
+        }
+        next_txn_id + 1
+    }
+
+    /// Backfills a deterministic, durable **auto-name** for every declared node-property index that has
+    /// none — a **legacy anonymous** index persisted before named indexes existed (`rmp` task #624). One
+    /// committed transaction minted from `next_txn_id`; returns the advanced `next_txn_id`. A no-op (no
+    /// commit) when every declared index is already named — so after the first migration this is free.
+    ///
+    /// The name assigned to each index is [`unique_auto_index_name`](Self::unique_auto_index_name),
+    /// which resolves a base-name collision by a deterministic token suffix. Because each assignment is
+    /// applied to the store *before* the next index's name is computed, two legacy indexes whose bases
+    /// collide are disambiguated deterministically (the ascending `(label_token, prop_key)` iteration
+    /// order is stable). Once persisted here, every name is read back verbatim on the next open, so the
+    /// migration is stable regardless.
+    ///
+    /// Errors interning/committing are swallowed best-effort: a failed backfill leaves the affected
+    /// indexes nameless (reconciled on the next open), and [`list_node_property_indexes`]
+    /// (Self::list_node_property_indexes) falls back to the freshly-computed auto-name meanwhile, so
+    /// reads stay correct. Startup is allowed to block (the engine is not yet serving).
+    fn backfill_recovered_index_names(
+        store: &Rc<RefCell<RecordStore<D, S>>>,
+        next_txn_id: u64,
+    ) -> u64 {
+        // Which declared node-property indexes carry no durable name? (Legacy anonymous indexes.)
+        let nameless: Vec<(u32, u32)> = {
+            let store = store.borrow();
+            store
+                .node_property_indexes()
+                .into_iter()
+                .filter(|(lt, pk, _)| store.node_property_index_name_for(*lt, *pk).is_none())
+                .map(|(lt, pk, _)| (lt, pk))
+                .collect()
+        };
+        if nameless.is_empty() {
+            return next_txn_id;
+        }
+
+        let txn = TxnId(next_txn_id + 1);
+        store.borrow_mut().begin(txn);
+        {
+            let mut store = store.borrow_mut();
+            for (label_token, prop_key) in nameless {
+                // Resolve the tokens to names; skip (leave nameless, retried next open) if a token has no
+                // resolvable name — a defensive impossibility for a live token.
+                let (Some(label), Some(property)) = (
+                    store
+                        .token_name(Namespace::Label, label_token)
+                        .map(str::to_owned),
+                    store
+                        .token_name(Namespace::PropKey, prop_key)
+                        .map(str::to_owned),
+                ) else {
+                    continue;
+                };
+                // Compute against the *current* store state (including names assigned earlier in this
+                // same pass) so colliding bases are disambiguated deterministically.
+                let name =
+                    Self::unique_auto_index_name(&store, &label, &property, label_token, prop_key);
+                store.set_node_property_index_name(name, label_token, prop_key);
+            }
+        }
+        // The txn advanced an id whether or not the commit lands (mirrors the promote path). A failed
+        // backfill commit is a best-effort no-op that self-heals: the auto-names stay in memory for
+        // this session and are recomputed (identically, being a pure function of durable tokens) on
+        // the next open, so a startup I/O error here never corrupts the catalog (`rmp` #624 audit,
+        // LOW). Reads remain correct meanwhile; only DROP-by-auto-name would miss until the reopen.
+        // Surface the durability event to stderr for observability rather than swallowing it silently
+        // (startup only — the engine is not yet serving; the core crate carries no logging facade, so
+        // this matches the top-level `graphus-server` fault convention).
+        if let Err(e) = store.borrow_mut().commit(txn) {
+            eprintln!(
+                "graphus-cypher: WARN best-effort node-property index name backfill commit failed \
+                 (auto-names stay in memory, recomputed on next open): {e}"
+            );
         }
         next_txn_id + 1
     }
@@ -618,6 +751,81 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // path — and discard the build's dirty flag so it does not leak into the next user statement.
         let high_water = store.borrow().snapshot_ts();
         index.borrow_mut().reset_ft_spatial_marker(high_water);
+    }
+
+    /// Whether `name` is already used by **any** schema catalog — a node-property index name, a
+    /// full-text index, a spatial index, or a constraint (`rmp` task #624). The global name-uniqueness
+    /// predicate a named `CREATE INDEX` consults before recording its name.
+    fn name_in_use(store: &RecordStore<D, S>, name: &str) -> bool {
+        store.node_property_index_name(name).is_some()
+            || store.fulltext_index(name).is_some()
+            || store.spatial_index(name).is_some()
+            || store.constraint(name).is_some()
+    }
+
+    /// Whether `name` is used by a schema catalog **other than** `own` (`rmp` task #624). Lets a
+    /// `CREATE` in the `own` catalog reject a cross-catalog name collision while preserving that
+    /// catalog's own re-declare (replace) semantics for a name it already owns.
+    fn name_used_by_other_catalog(store: &RecordStore<D, S>, name: &str, own: NameCatalog) -> bool {
+        (own != NameCatalog::NodeProperty && store.node_property_index_name(name).is_some())
+            || (own != NameCatalog::Fulltext && store.fulltext_index(name).is_some())
+            || (own != NameCatalog::Spatial && store.spatial_index(name).is_some())
+            || (own != NameCatalog::Constraint && store.constraint(name).is_some())
+    }
+
+    /// Whether `name` is used by any schema rule **other than** the node-property index on
+    /// `(label_token, prop_token)` (`rmp` task #624). Distinguishing "used by this same index" from
+    /// "used by something else" is what keeps [`auto-naming`](auto_index_name) idempotent: recomputing
+    /// the auto-name of an index that already carries that name is **not** a collision.
+    fn name_used_by_other_target(
+        store: &RecordStore<D, S>,
+        name: &str,
+        label_token: u32,
+        prop_token: u32,
+    ) -> bool {
+        store.fulltext_index(name).is_some()
+            || store.spatial_index(name).is_some()
+            || store.constraint(name).is_some()
+            || matches!(
+                store.node_property_index_name(name),
+                Some(target) if target != (label_token, prop_token)
+            )
+    }
+
+    /// A globally-unique, deterministic auto-name for the node-property index on `(label, property)`
+    /// (`rmp` task #624). Returns the [`auto_index_name`] base when it is free (or already owned by this
+    /// same index), else the deterministic token-suffixed form `<base>_<label_token>_<prop_token>` — the
+    /// tokens uniquely identify the index, so the suffixed form is unique among auto-names.
+    fn unique_auto_index_name(
+        store: &RecordStore<D, S>,
+        label: &str,
+        property: &str,
+        label_token: u32,
+        prop_token: u32,
+    ) -> String {
+        let base = auto_index_name(label, property);
+        if !Self::name_used_by_other_target(store, &base, label_token, prop_token) {
+            return base;
+        }
+        // The token-suffixed form uniquely identifies the index *among auto-names*, but it can still
+        // collide with an explicit, user-chosen name in any catalog. Verify the candidate is free and,
+        // on a residual collision, iterate a deterministic counter until it is — so the returned name
+        // is guaranteed unused by any *other* schema rule. Without this final check, a collision would
+        // let two names map to the same target (a state `decode_index_name_catalog` rejects → the
+        // store would fail to reopen) or let a nameless CREATE steal an existing index's name
+        // (`rmp` #624 durability audit, HIGH + MEDIUM).
+        let suffixed = format!("{base}_{label_token}_{prop_token}");
+        if !Self::name_used_by_other_target(store, &suffixed, label_token, prop_token) {
+            return suffixed;
+        }
+        let mut n: u64 = 2;
+        loop {
+            let candidate = format!("{suffixed}_{n}");
+            if !Self::name_used_by_other_target(store, &candidate, label_token, prop_token) {
+                return candidate;
+            }
+            n += 1;
+        }
     }
 
     /// Inserts node `id`'s current composite tuples into every registered composite index whose covered
@@ -996,6 +1204,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             // tokens; a crash mid-create recovers to the last committed catalog (no entry), and the
             // failed create leaves no orphan registration.
             store.set_node_property_index(label_token, prop_key, IndexState::Online);
+            // Record a deterministic auto-name (`rmp` task #624) so this index is named end-to-end (it
+            // shows up in `SHOW INDEXES` with a name and is droppable by name). Idempotent: recomputing
+            // the auto-name of an index that already carries it is not a collision, so re-declaring the
+            // same `(label, property)` keeps the same name.
+            let name = Self::unique_auto_index_name(&store, label, property, label_token, prop_key);
+            store.set_node_property_index_name(name, label_token, prop_key);
             (label_token, prop_key)
         };
         self.store.borrow_mut().commit(txn)?;
@@ -1533,10 +1747,88 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// # Errors
     /// Returns a storage error if interning either token, recording the catalog entry, the committing
     /// transaction, or the initial snapshot scan fails. On any error the index is left undeclared.
+    ///
+    /// # Naming
+    /// This positional form is the internal / test / bench entry point: it assigns a deterministic
+    /// **auto-name** (`rmp` task #624) and is **idempotent** on the covered `(label, property)` — a
+    /// re-declare is a clean no-op success. The named server surface (a Cypher `CREATE INDEX`) goes
+    /// through [`begin_online_node_property_index_named`](Self::begin_online_node_property_index_named),
+    /// which enforces global name uniqueness and Neo4j `IF NOT EXISTS` semantics.
     pub fn begin_online_node_property_index(&mut self, label: &str, property: &str) -> Result<()> {
-        // Intern the tokens and record the durable catalog entry as `Populating`, in one committed
-        // transaction — exactly like `create_node_property_index` but for the in-progress state, so an
-        // interrupted build recovers `Populating` and is completed by the open-time rebuild.
+        // `if_not_exists = true` preserves the historical idempotent-on-redeclare behaviour of this
+        // positional API (a second declare of the same index is a no-op, never an error). The
+        // created-vs-no-op flag is irrelevant to the positional callers, so it is discarded here.
+        self.begin_online_node_property_index_named(None, label, property, true)
+            .map(|_created| ())
+    }
+
+    /// Declares a **named** node-property index on `(label, property)` and starts a **non-blocking**
+    /// background build of it, enforcing Neo4j-conformant schema semantics (`rmp` tasks #91, #624):
+    ///
+    /// - `name` is the requested server-unique name, or [`None`] to auto-generate a deterministic one
+    ///   ([`auto_index_name`]);
+    /// - the covered `(label, property)` must not already be indexed by an **equivalent** index, and
+    ///   the resolved name must not already be used by **any** schema catalog (node-property, full-text,
+    ///   spatial, constraint) — names are globally unique;
+    /// - `if_not_exists` turns both "already exists" cases (equivalent index / name in use) into a
+    ///   **no-op success** instead of an error, matching `CREATE INDEX … IF NOT EXISTS`.
+    ///
+    /// Returns whether the index was **actually created** (`true`) or the call was an idempotent no-op
+    /// (`false`, an `IF NOT EXISTS` that changed nothing) — the executor turns `false` into a `0`
+    /// `indexes-added` counter (`rmp` task #626 follow-up: Neo4j-conformant idempotent-DDL summary).
+    ///
+    /// The build snapshot / no-missed-results contract is identical to the positional
+    /// [`begin_online_node_property_index`](Self::begin_online_node_property_index) (see its docs); this
+    /// method only adds the naming + idempotency layer around it.
+    ///
+    /// # Errors
+    /// - `Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists` (no `IF NOT EXISTS`) when an
+    ///   equivalent index on `(label, property)` already exists;
+    /// - `Neo.ClientError.Schema.IndexWithNameAlreadyExists` (no `IF NOT EXISTS`) when `name` is already
+    ///   taken by another schema rule;
+    /// - a storage error if interning a token, recording the catalog entry, committing, or the initial
+    ///   snapshot scan fails. On any error the index is left undeclared.
+    pub fn begin_online_node_property_index_named(
+        &mut self,
+        name: Option<&str>,
+        label: &str,
+        property: &str,
+        if_not_exists: bool,
+    ) -> Result<bool> {
+        // 1. Equivalent-index check (read-only, by token *lookup* — an absent token means no index).
+        let equivalent_exists = {
+            let store = self.store.borrow();
+            matches!(
+                (
+                    store.token_id(Namespace::Label, label),
+                    store.token_id(Namespace::PropKey, property),
+                ),
+                (Some(lt), Some(pk)) if store.node_property_index_state(lt, pk).is_some()
+            )
+        };
+        if equivalent_exists {
+            return if if_not_exists {
+                Ok(false) // idempotent no-op: nothing was added.
+            } else {
+                Err(equivalent_index_exists(label, property))
+            };
+        }
+
+        // 2. Explicit-name global uniqueness (read-only). An omitted name is auto-generated in step 3
+        //    (it needs the interned tokens for its deterministic collision suffix).
+        if let Some(n) = name
+            && Self::name_in_use(&self.store.borrow(), n)
+        {
+            return if if_not_exists {
+                Ok(false) // idempotent no-op: nothing was added.
+            } else {
+                Err(index_name_in_use(n))
+            };
+        }
+
+        // 3. Intern the tokens and record the durable catalog entry (`Populating`) + its name, in one
+        //    committed transaction — so the schema change survives a crash atomically, and an interrupted
+        //    build recovers `Populating` and is completed by the open-time rebuild.
         self.next_txn_id += 1;
         let txn = TxnId(self.next_txn_id);
         self.store.borrow_mut().begin(txn);
@@ -1558,7 +1850,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     return Err(e);
                 }
             };
+            let effective_name = match name {
+                Some(n) => n.to_owned(),
+                None => {
+                    Self::unique_auto_index_name(&store, label, property, label_token, prop_key)
+                }
+            };
             store.set_node_property_index(label_token, prop_key, IndexState::Populating);
+            store.set_node_property_index_name(effective_name, label_token, prop_key);
             (label_token, prop_key)
         };
         self.store.borrow_mut().commit(txn)?;
@@ -1580,7 +1879,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             snapshot,
             cursor: 0,
         });
-        Ok(())
+        Ok(true) // the index was created.
     }
 
     /// Declares a **full-text index** named `name` over `(label, properties)` analyzed with
@@ -1614,6 +1913,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             return Err(GraphusError::Storage(
                 "a full-text index must cover at least one property".to_owned(),
             ));
+        }
+        // Names are globally unique across every schema catalog (`rmp` task #624): reject a name already
+        // used by a *different* catalog. Re-declaring within the full-text catalog keeps its historical
+        // replace semantics (a name it already owns is not "used by another catalog").
+        if Self::name_used_by_other_catalog(&self.store.borrow(), name, NameCatalog::Fulltext) {
+            return Err(index_name_in_use(name));
         }
 
         // Intern the label + property-key tokens and record the durable catalog entry `Populating`, in
@@ -1678,15 +1983,19 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// committed transaction, unregisters it from the in-memory [`IndexSet`], and cancels any
     /// in-progress build. Idempotent on a never-declared name (a clean no-op success).
     ///
+    /// Returns whether an index was **actually removed** (`true`) or the call was a no-op (`false`, no
+    /// such index) — the executor turns `false` into a `0` `indexes-removed` counter (`rmp` task #626
+    /// follow-up: Neo4j-conformant idempotent-DDL summary).
+    ///
     /// # Errors
     /// Returns a storage error if the committing transaction fails.
-    pub fn drop_fulltext_index(&mut self, name: &str) -> Result<()> {
+    pub fn drop_fulltext_index(&mut self, name: &str) -> Result<bool> {
         // A no-op when the index is not declared (avoids an empty committed transaction).
         if self.store.borrow().fulltext_index(name).is_none() {
             // Still cancel any in-flight build + in-memory registration defensively, then succeed.
             self.pending_fulltext_builds.retain(|b| b.name != name);
             self.index.borrow_mut().unregister_fulltext(name);
-            return Ok(());
+            return Ok(false); // nothing removed.
         }
         self.next_txn_id += 1;
         let txn = TxnId(self.next_txn_id);
@@ -1696,7 +2005,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
 
         self.pending_fulltext_builds.retain(|b| b.name != name);
         self.index.borrow_mut().unregister_fulltext(name);
-        Ok(())
+        Ok(true) // an index was removed.
     }
 
     /// Lists every declared full-text index as `(name, label, properties, analyzer, state)`
@@ -1743,6 +2052,11 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// Returns a storage error if interning either token, recording the catalog entry, the committing
     /// transaction, or the initial snapshot scan fails. On any error the index is left undeclared.
     pub fn create_point_index(&mut self, name: &str, label: &str, property: &str) -> Result<()> {
+        // Names are globally unique across every schema catalog (`rmp` task #624): reject a name already
+        // used by a *different* catalog (a re-declare within the spatial catalog keeps replace semantics).
+        if Self::name_used_by_other_catalog(&self.store.borrow(), name, NameCatalog::Spatial) {
+            return Err(index_name_in_use(name));
+        }
         // Intern the label + property-key tokens and record the durable catalog entry `Populating`, in
         // one committed transaction (so the schema change survives a crash atomically).
         self.next_txn_id += 1;
@@ -1805,14 +2119,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ///
     /// # Errors
     /// Returns a storage error if the committing transaction fails.
-    pub fn drop_point_index(&mut self, name: &str) -> Result<()> {
+    pub fn drop_point_index(&mut self, name: &str) -> Result<bool> {
         // Resolve the covered `(label_token, prop_key)` from the durable entry so we can unregister the
         // right grid from the in-memory set (which is keyed by tokens, not by name).
         let entry = self.store.borrow().spatial_index(name);
         let Some(entry) = entry else {
-            // Not declared: still cancel any in-flight build defensively, then succeed.
+            // Not declared: still cancel any in-flight build defensively, then succeed (no-op).
             self.pending_spatial_builds.retain(|b| b.name != name);
-            return Ok(());
+            return Ok(false); // nothing removed.
         };
 
         self.next_txn_id += 1;
@@ -1825,7 +2139,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.index
             .borrow_mut()
             .unregister_spatial(entry.label_token, entry.property_token);
-        Ok(())
+        Ok(true) // an index was removed.
     }
 
     /// Lists every declared spatial (point) index as `(name, label, property, state)` (`rmp` task
@@ -1914,6 +2228,11 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             !properties.is_empty(),
             "a constraint covers at least one property"
         );
+        // Names are globally unique across every schema catalog (`rmp` task #624): reject a name already
+        // used by a *different* catalog (a re-declare within the constraint catalog keeps its semantics).
+        if Self::name_used_by_other_catalog(&self.store.borrow(), name, NameCatalog::Constraint) {
+            return Err(index_name_in_use(name));
+        }
         self.next_txn_id += 1;
         let txn = TxnId(self.next_txn_id);
         self.store.borrow_mut().begin(txn);
@@ -2152,14 +2471,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ///
     /// # Errors
     /// Returns a storage error if the committing transaction fails.
-    pub fn drop_constraint(&mut self, name: &str) -> Result<()> {
+    pub fn drop_constraint(&mut self, name: &str) -> Result<bool> {
         // Resolve the entry first so a node key's backing composite index can be unregistered by its
         // covered `(label, property tuple)` after the durable removal.
         let entry = self.store.borrow().constraint(name);
         let Some(entry) = entry else {
             // A no-op when the constraint is not declared (avoids an empty committed transaction).
             self.index.borrow_mut().unregister_constraint(name);
-            return Ok(());
+            return Ok(false); // nothing removed.
         };
         self.next_txn_id += 1;
         let txn = TxnId(self.next_txn_id);
@@ -2171,7 +2490,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         if entry.kind == ConstraintKind::NodeKey {
             idx.unregister_composite(entry.label_token, &entry.property_tokens);
         }
-        Ok(())
+        Ok(true) // a constraint was removed.
     }
 
     /// Lists every declared constraint as a [`ConstraintInfo`] (`rmp` tasks #99, #100) for a
@@ -2427,9 +2746,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// interned): an unknown label/property means no such index can exist, so the call is a clean
     /// no-op success.
     ///
+    /// Returns whether an index was **actually removed** (`true`) or the call was a no-op (`false`, no
+    /// such index) — the executor turns `false` into a `0` `indexes-removed` counter (`rmp` task #626
+    /// follow-up: Neo4j-conformant idempotent-DDL summary).
+    ///
     /// # Errors
     /// Returns a storage error if the committing transaction fails.
-    pub fn drop_node_property_index(&mut self, label: &str, property: &str) -> Result<()> {
+    pub fn drop_node_property_index(&mut self, label: &str, property: &str) -> Result<bool> {
         // Resolve the tokens by lookup only; a missing token means the index cannot exist.
         let tokens = {
             let store = self.store.borrow();
@@ -2437,21 +2760,32 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 store.token_id(Namespace::Label, label),
                 store.token_id(Namespace::PropKey, property),
             ) {
-                (Some(label_token), Some(prop_key)) => Some((label_token, prop_key)),
+                // Only an actually-declared index is a real drop; tokens can exist with no index.
+                (Some(label_token), Some(prop_key))
+                    if store
+                        .node_property_index_state(label_token, prop_key)
+                        .is_some() =>
+                {
+                    Some((label_token, prop_key))
+                }
                 _ => None,
             }
         };
         let Some((label_token, prop_key)) = tokens else {
-            return Ok(()); // no such tokens → no such index → clean no-op.
+            return Ok(false); // no such index → clean no-op, nothing removed.
         };
 
-        // Remove the durable catalog entry in its own committed transaction (mirrors the create path).
+        // Remove the durable catalog entry AND its name entry in one committed transaction (mirrors the
+        // create path, which records both). Clearing the name alongside the index keeps the two in sync
+        // and frees the name for reuse.
         self.next_txn_id += 1;
         let txn = TxnId(self.next_txn_id);
         self.store.borrow_mut().begin(txn);
-        self.store
-            .borrow_mut()
-            .remove_node_property_index(label_token, prop_key);
+        {
+            let mut store = self.store.borrow_mut();
+            store.remove_node_property_index(label_token, prop_key);
+            store.remove_node_property_index_name_for(label_token, prop_key);
+        }
         self.store.borrow_mut().commit(txn)?;
 
         // Cancel any in-progress build for this index and unregister it from the in-memory set.
@@ -2460,15 +2794,67 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.index
             .borrow_mut()
             .unregister_node_property(label_token, prop_key);
-        Ok(())
+        Ok(true) // an index was removed.
     }
 
-    /// Lists every declared node-property index as `(label, property, state)` (`rmp` task #91), for a
-    /// `SHOW INDEXES` surface. Reads the durable catalog and resolves the tokens back to names; an
-    /// index whose tokens have no resolvable name (a defensively-skipped impossibility for a live
-    /// token) is omitted. Ordered by the catalog's ascending `(label_token, prop_key)` key.
+    /// Drops the node-property index named `name` (`rmp` task #624), the `DROP INDEX <name>` surface:
+    /// resolves the name to its covered `(label, property)`, removes the durable catalog + name entries
+    /// in one committed transaction, cancels any in-progress build and unregisters it from the in-memory
+    /// [`IndexSet`].
+    ///
+    /// `if_exists` controls the missing-name case: `true` (a `DROP INDEX <name> IF EXISTS`) makes a
+    /// never-declared name a clean no-op success; `false` returns
+    /// `Neo.ClientError.Schema.IndexDropFailed`.
+    ///
+    /// Returns whether an index was **actually removed** (`true`) or the call was a no-op (`false`, an
+    /// `IF EXISTS` drop of a missing name) — the executor turns `false` into a `0` `indexes-removed`
+    /// counter (`rmp` task #626 follow-up: Neo4j-conformant idempotent-DDL summary).
+    ///
+    /// # Errors
+    /// - `Neo.ClientError.Schema.IndexDropFailed` (no `IF EXISTS`) when no index of that name exists;
+    /// - a storage error if the committing transaction fails.
+    pub fn drop_node_property_index_by_name(
+        &mut self,
+        name: &str,
+        if_exists: bool,
+    ) -> Result<bool> {
+        let target = self.store.borrow().node_property_index_name(name);
+        let Some((label_token, prop_key)) = target else {
+            return if if_exists {
+                Ok(false) // idempotent no-op: nothing removed.
+            } else {
+                Err(index_drop_not_found(name))
+            };
+        };
+
+        // Remove the durable index catalog entry + its name in one committed transaction.
+        self.next_txn_id += 1;
+        let txn = TxnId(self.next_txn_id);
+        self.store.borrow_mut().begin(txn);
+        {
+            let mut store = self.store.borrow_mut();
+            store.remove_node_property_index(label_token, prop_key);
+            store.remove_node_property_index_name(name);
+        }
+        self.store.borrow_mut().commit(txn)?;
+
+        // Cancel any in-progress build for this index and unregister it from the in-memory set.
+        self.pending_builds
+            .retain(|b| !(b.label_token == label_token && b.prop_key == prop_key));
+        self.index
+            .borrow_mut()
+            .unregister_node_property(label_token, prop_key);
+        Ok(true) // an index was removed.
+    }
+
+    /// Lists every declared node-property index as `(name, label, property, state)` (`rmp` tasks #91,
+    /// #624), for a `SHOW INDEXES` surface. Reads the durable catalog and resolves the tokens back to
+    /// names; the index **name** is the durable name if recorded, else the deterministic
+    /// [`auto_index_name`] (a defensive fallback for a not-yet-backfilled legacy index). An index whose
+    /// tokens have no resolvable name (a defensively-skipped impossibility for a live token) is omitted.
+    /// Ordered by the catalog's ascending `(label_token, prop_key)` key.
     #[must_use]
-    pub fn list_node_property_indexes(&self) -> Vec<(String, String, IndexState)> {
+    pub fn list_node_property_indexes(&self) -> Vec<(String, String, String, IndexState)> {
         let store = self.store.borrow();
         store
             .node_property_indexes()
@@ -2476,7 +2862,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             .filter_map(|(label_token, prop_key, state)| {
                 let label = store.token_name(Namespace::Label, label_token)?;
                 let property = store.token_name(Namespace::PropKey, prop_key)?;
-                Some((label.to_owned(), property.to_owned(), state))
+                let name = store
+                    .node_property_index_name_for(label_token, prop_key)
+                    .unwrap_or_else(|| auto_index_name(label, property));
+                Some((name, label.to_owned(), property.to_owned(), state))
             })
             .collect()
     }

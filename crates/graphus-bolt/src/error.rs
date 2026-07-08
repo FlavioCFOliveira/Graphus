@@ -24,7 +24,9 @@
 
 use std::fmt;
 
-use graphus_core::{CONSTRAINT_VIOLATION_PREFIX, GraphusError};
+use graphus_core::{
+    CONSTRAINT_VIOLATION_PREFIX, GraphusError, SCHEMA_RULE_ERROR_PREFIX, SCHEMA_RULE_ERROR_SEP,
+};
 
 /// The crate-wide result alias for protocol/codec operations.
 pub type BoltResult<T> = std::result::Result<T, BoltError>;
@@ -131,6 +133,18 @@ pub fn failure_from_error(error: &GraphusError) -> Failure {
         && let Some(stripped) = message.strip_prefix(CONSTRAINT_VIOLATION_PREFIX)
     {
         return Failure::new(CODE_CONSTRAINT_VALIDATION, stripped.to_owned());
+    }
+
+    // A schema-rule declaration error (`rmp` task #624) — an index/constraint name collision, an
+    // equivalent rule, or a missing-rule drop — is a `GraphusError::Runtime` whose message carries the
+    // sentinel `SCHEMA_RULE_ERROR_PREFIX` followed by `<Neo4j leaf code>\u{1f}<human message>`. Emit the
+    // precise `Neo.ClientError.Schema.*` leaf verbatim, stripping the sentinel + code from the wire
+    // message. This is the TCK-faithful class the Neo4j driver ecosystem asserts for such a failure.
+    if let GraphusError::Runtime(_) = error
+        && let Some(rest) = message.strip_prefix(SCHEMA_RULE_ERROR_PREFIX)
+        && let Some((leaf_code, human)) = rest.split_once(SCHEMA_RULE_ERROR_SEP)
+    {
+        return Failure::new(leaf_code, human.to_owned());
     }
 
     let code = match error {
@@ -271,6 +285,18 @@ mod tests {
         // A plain runtime error (no sentinel) still maps to the generic argument class.
         let plain = failure_from_error(&GraphusError::Runtime("/ by zero".to_owned()));
         assert_eq!(plain.code, CODE_RUNTIME_ARGUMENT);
+    }
+
+    #[test]
+    fn schema_rule_error_maps_to_its_leaf_code_and_strips_the_sentinel() {
+        // A schema-rule error (`rmp` task #624) carries `<PREFIX><leaf code>\u{1f}<message>`; the
+        // renderer must emit the leaf code verbatim and strip the sentinel + code from the message.
+        let msg = format!(
+            "{SCHEMA_RULE_ERROR_PREFIX}Neo.ClientError.Schema.IndexWithNameAlreadyExists{SCHEMA_RULE_ERROR_SEP}There already exists an index named `ix`."
+        );
+        let f = failure_from_error(&GraphusError::Runtime(msg));
+        assert_eq!(f.code, "Neo.ClientError.Schema.IndexWithNameAlreadyExists");
+        assert_eq!(f.message, "There already exists an index named `ix`.");
     }
 
     #[test]

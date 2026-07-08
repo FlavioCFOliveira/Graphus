@@ -543,9 +543,12 @@ fn extract_json_string(body: &str, key: &str) -> Option<String> {
     Some(rest[..end].to_owned())
 }
 
-/// One `SHOW INDEXES` row, decoded from the wire shape (`label`, `property`, `state`).
+/// One `SHOW INDEXES` row, decoded from the Neo4j-conformant wire shape (`rmp` task #626):
+/// `name, type, entityType, labelsOrTypes, properties, state`. The single covered label / property
+/// are read out of the `labelsOrTypes` / `properties` single-element lists for the assertions.
 #[derive(Debug)]
 struct IndexRow {
+    name: String,
     label: String,
     property: String,
     state: String,
@@ -561,16 +564,42 @@ async fn show_indexes_on(client: &mut BoltClient, db: Option<&str>) -> Vec<Index
     let rows = client.run_ok("SHOW INDEXES", db).await;
     rows.into_iter()
         .map(|row| {
-            assert_eq!(row.len(), 3, "label, property, state: {row:?}");
+            assert_eq!(
+                row.len(),
+                6,
+                "name, type, entityType, labelsOrTypes, properties, state: {row:?}"
+            );
             let mut it = row.into_iter();
-            let mut next_string = |what: &str| match it.next() {
-                Some(Value::String(s)) => s,
-                other => panic!("{what} must be a string: {other:?}"),
+            let mut next = || it.next().expect("column present");
+            let name = match next() {
+                Value::String(s) => s,
+                other => panic!("name must be a string: {other:?}"),
+            };
+            let _type = next(); // "RANGE"
+            let entity = next(); // "NODE"
+            assert_eq!(
+                entity,
+                Value::String("NODE".to_owned()),
+                "entityType is NODE"
+            );
+            let single = |v: Value, what: &str| match v {
+                Value::List(mut items) if items.len() == 1 => match items.remove(0) {
+                    Value::String(s) => s,
+                    other => panic!("{what} element must be a string: {other:?}"),
+                },
+                other => panic!("{what} must be a single-element list: {other:?}"),
+            };
+            let label = single(next(), "labelsOrTypes");
+            let property = single(next(), "properties");
+            let state = match next() {
+                Value::String(s) => s,
+                other => panic!("state must be a string: {other:?}"),
             };
             IndexRow {
-                label: next_string("label"),
-                property: next_string("property"),
-                state: next_string("state"),
+                name,
+                label,
+                property,
+                state,
             }
         })
         .collect()
@@ -622,6 +651,11 @@ async fn bolt_create_index_is_non_blocking_and_reaches_online() {
             .iter()
             .find(|r| r.label == "Person" && r.property == "age")
             .expect("the index is listed throughout the build");
+        // The anonymous `CREATE INDEX` gets the deterministic auto-name (`rmp` tasks #624/#626).
+        assert_eq!(
+            row.name, "index_Person_age",
+            "SHOW INDEXES surfaces the auto-name"
+        );
         state = row.state.clone();
         assert!(
             state == "online" || state == "populating",
@@ -650,6 +684,75 @@ async fn bolt_create_index_is_non_blocking_and_reaches_online() {
             .any(|r| r.label == "Person" && r.property == "age"),
         "the dropped index is gone: {idx:?}"
     );
+
+    c.goodbye().await;
+    server.shutdown().await.expect("clean shutdown");
+}
+
+/// The **named** node-property index surface end to end over Bolt (`rmp` tasks #624/#625/#626): a
+/// `CREATE INDEX <name> …` records the name (surfaced by `SHOW INDEXES`), `DROP INDEX <name>` drops by
+/// name, `IF NOT EXISTS` / `IF EXISTS` are idempotent, and a duplicate name / a plain drop of a missing
+/// index are rejected with the precise `Neo.ClientError.Schema.*` codes.
+#[tokio::test]
+async fn bolt_named_index_lifecycle_and_idempotency() {
+    let temp = TempStore::new("bolt-named-index");
+    let server = boot(base_config(&temp)).await;
+    let uds = server.uds_path.clone().expect("UDS enabled");
+
+    let mut c = BoltClient::connect(&uds).await;
+    c.handshake_and_logon("alice", "admin-pw8").await;
+
+    // Named create records the name (verified via SHOW INDEXES).
+    c.run_ok("CREATE INDEX ix_person FOR (p:PERSON) ON (p.name)", None)
+        .await;
+    let idx = show_indexes(&mut c).await;
+    let row = idx
+        .iter()
+        .find(|r| r.name == "ix_person")
+        .expect("the named index is listed");
+    assert_eq!(row.label, "PERSON");
+    assert_eq!(row.property, "name");
+
+    // CREATE … IF NOT EXISTS on the same name/schema is an idempotent no-op success.
+    c.run_ok(
+        "CREATE INDEX ix_person IF NOT EXISTS FOR (p:PERSON) ON (p.name)",
+        None,
+    )
+    .await;
+
+    // A duplicate name on a *different* schema is rejected (name-collision schema class).
+    let f = c
+        .run_on_db(
+            "CREATE INDEX ix_person FOR (c:COMPANY) ON (c.founded)",
+            None,
+        )
+        .await
+        .expect_err("duplicate index name must be rejected");
+    assert!(
+        f.code.contains("Schema.IndexWithNameAlreadyExists"),
+        "expected the name-collision schema class, got: {f:?}"
+    );
+    c.reset().await; // a FAILURE puts the connection in the fail-state; recover it.
+
+    // DROP by name removes it; a second plain DROP then fails (missing), but IF EXISTS is a no-op.
+    c.run_ok("DROP INDEX ix_person", None).await;
+    assert!(
+        !show_indexes(&mut c)
+            .await
+            .iter()
+            .any(|r| r.name == "ix_person"),
+        "the index was dropped by name"
+    );
+    let f = c
+        .run_on_db("DROP INDEX ix_person", None)
+        .await
+        .expect_err("dropping a missing index must fail without IF EXISTS");
+    assert!(
+        f.code.contains("Schema.IndexDropFailed"),
+        "expected the drop-failed schema class, got: {f:?}"
+    );
+    c.reset().await; // recover from the fail-state before the idempotent drop.
+    c.run_ok("DROP INDEX ix_person IF EXISTS", None).await;
 
     c.goodbye().await;
     server.shutdown().await.expect("clean shutdown");
@@ -1409,6 +1512,44 @@ async fn admin_and_ddl_result_summary_on_the_bolt_wire() {
     assert_eq!(summary_type(&m), Some("s"));
     assert_eq!(summary_stat(&m, "indexes-removed"), Some(Value::Integer(1)));
 
+    // ---- Idempotent no-op DDL → type `s` but 0 counters (Neo4j parity, `rmp` #626 follow-up) ----
+    // A named create, then a repeat under IF NOT EXISTS: the repeat changes nothing, so it must report
+    // `indexes-added: 0` (absent counter) and NO `contains-updates` — not `indexes-added: 1`.
+    c.run_ok("CREATE INDEX cnt_test FOR (n:Person) ON (n.name)", None)
+        .await;
+    let m = c
+        .run_pull_summary(
+            "CREATE INDEX cnt_test IF NOT EXISTS FOR (n:Person) ON (n.name)",
+            None,
+        )
+        .await;
+    assert_eq!(
+        summary_type(&m),
+        Some("s"),
+        "a no-op CREATE is still a schema write"
+    );
+    assert_eq!(
+        summary_stat(&m, "indexes-added"),
+        None,
+        "an IF NOT EXISTS no-op reports 0 indexes-added (absent counter)"
+    );
+    assert_eq!(
+        summary_stat(&m, "contains-updates"),
+        None,
+        "an idempotent no-op does not flip contains-updates"
+    );
+    // A DROP … IF EXISTS of a now-missing index is likewise a no-op → 0 removed.
+    c.run_ok("DROP INDEX cnt_test", None).await;
+    let m = c
+        .run_pull_summary("DROP INDEX cnt_test IF EXISTS", None)
+        .await;
+    assert_eq!(summary_type(&m), Some("s"));
+    assert_eq!(
+        summary_stat(&m, "indexes-removed"),
+        None,
+        "an IF EXISTS drop of a missing index reports 0 indexes-removed"
+    );
+
     // ---- Constraint DDL → type `s`, constraints-added / constraints-removed ----
     let m = c
         .run_pull_summary(
@@ -1432,6 +1573,14 @@ async fn admin_and_ddl_result_summary_on_the_bolt_wire() {
     assert_eq!(
         summary_stat(&m, "constraints-removed"),
         Some(Value::Integer(1))
+    );
+    // A repeat DROP of the now-missing constraint is a no-op → 0 removed (shared counting path).
+    let m = c.run_pull_summary("DROP CONSTRAINT uniq_email", None).await;
+    assert_eq!(summary_type(&m), Some("s"));
+    assert_eq!(
+        summary_stat(&m, "constraints-removed"),
+        None,
+        "a no-op DROP CONSTRAINT reports 0 removed"
     );
 
     // ---- System commands → type `s`, system-updates >= 1 (+ contains-system-updates) ----

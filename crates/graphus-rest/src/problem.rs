@@ -43,7 +43,7 @@
 //! matching the Bolt `TransientError` classification drivers act on.
 
 use graphus_auth::AuthError;
-use graphus_core::GraphusError;
+use graphus_core::{GraphusError, SCHEMA_RULE_ERROR_PREFIX, SCHEMA_RULE_ERROR_SEP};
 use http::StatusCode;
 use serde::Serialize;
 
@@ -116,6 +116,25 @@ impl Problem {
     /// matching the Bolt renderer.
     #[must_use]
     pub fn from_graphus_error(error: &GraphusError) -> Self {
+        // A schema-rule declaration error (`rmp` task #624) is a `GraphusError::Runtime` carrying the
+        // `SCHEMA_RULE_ERROR_PREFIX` sentinel + `<Neo4j leaf code>\u{1f}<message>`. Surface it as a
+        // client-fault **400** with the precise `Neo.ClientError.Schema.*` code and the stripped human
+        // message — the REST sibling of `graphus_bolt::failure_from_error`'s schema classification.
+        if let GraphusError::Runtime(_) = error {
+            let stripped = strip_layer_prefix(&error.to_string());
+            if let Some(rest) = stripped.strip_prefix(SCHEMA_RULE_ERROR_PREFIX)
+                && let Some((leaf, human)) = rest.split_once(SCHEMA_RULE_ERROR_SEP)
+            {
+                return Problem::new(
+                    StatusCode::BAD_REQUEST,
+                    "schema",
+                    "schema rule error",
+                    human.to_owned(),
+                )
+                .with_code(leaf);
+            }
+        }
+
         // `server_fault` marks the 5xx (server-side) classes whose raw `detail` must NOT reach the
         // untrusted client (rmp #187, CWE-209): an internal/storage fault would otherwise disclose
         // file paths, offsets, and low-level causes. For those, the wire `detail` is a stable generic

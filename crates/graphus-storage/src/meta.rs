@@ -456,6 +456,28 @@ pub struct Statistics {
     /// enforcing them. An entry is present **iff** a constraint of that name is declared. The map
     /// rides the **identical** durability lifecycle as the other catalogs.
     pub constraints: BTreeMap<String, ConstraintEntry>,
+    /// The durable **node-property index name catalog** (`rmp` task #623): the server-unique **name**
+    /// of each declared node-property index, keyed by name and mapping to the index's covered
+    /// `(label_token, property_key_token)`.
+    ///
+    /// # Why a *separate* name map (and not a field on the anonymous catalog)
+    ///
+    /// The core node-property index catalog
+    /// ([`node_property_indexes`](Self#structfield.node_property_indexes)) is keyed by
+    /// `(label_token, property_key_token)` and carries no name — it predates named indexes. Rather
+    /// than widen that block's per-entry record (which a pre-#623 reader could not skip, breaking the
+    /// on-disk format for old images), the names live in their own appended, name-keyed block. A
+    /// pre-#623 image ends after the constraint type-descriptor block, so this block decodes **empty**
+    /// and every declared index is simply *nameless* — a legacy anonymous index. The Cypher layer
+    /// backfills a deterministic auto-name for such indexes on open (`rmp` task #624), so nameless is
+    /// only ever the transient pre-migration state.
+    ///
+    /// An entry is present **iff** a name is recorded for that index; the target `(label, property)`
+    /// **must** name a declared node-property index (the two are set and removed together), which
+    /// [`decode`](Self::decode) enforces. Names are globally unique across *all* schema catalogs — the
+    /// uniqueness rule is enforced by the Cypher layer at declaration time, not here. This map rides
+    /// the **identical** durability lifecycle as the other catalogs.
+    pub node_property_index_names: BTreeMap<String, (u32, u32)>,
 }
 
 impl Statistics {
@@ -655,6 +677,90 @@ impl Statistics {
             .collect()
     }
 
+    /// The `(label_token, prop_token)` a named node-property index covers, or [`None`] if no index of
+    /// that name is declared (`rmp` task #623). The name → target resolver behind `DROP INDEX <name>`
+    /// and the global name-uniqueness check.
+    #[must_use]
+    pub fn node_property_index_name(&self, name: &str) -> Option<(u32, u32)> {
+        self.node_property_index_names.get(name).copied()
+    }
+
+    /// The declared **name** of the node-property index on `(label_token, prop_token)`, or [`None`] if
+    /// the index is nameless (a legacy anonymous index not yet backfilled) (`rmp` task #623). A linear
+    /// scan of the (small) name map — there is no reverse index, and the map holds one entry per named
+    /// index, so this is cheap in practice.
+    #[must_use]
+    pub fn node_property_index_name_for(&self, label_token: u32, prop_token: u32) -> Option<&str> {
+        self.node_property_index_names
+            .iter()
+            .find(|&(_, &target)| target == (label_token, prop_token))
+            .map(|(name, _)| name.as_str())
+    }
+
+    /// Records the name of the node-property index on `(label_token, prop_token)`, **enforcing the
+    /// one-name-per-target invariant** (`rmp` task #623). Global name uniqueness across catalogs is the
+    /// Cypher layer's responsibility (its `unique_auto_index_name` / explicit-name checks guarantee
+    /// `name` is free or already owned by this same target before calling); this is the durable write
+    /// behind it.
+    pub(crate) fn set_node_property_index_name(
+        &mut self,
+        name: String,
+        label_token: u32,
+        prop_token: u32,
+    ) {
+        // Debug-time mirror of the decode invariants (`decode_index_name_catalog`): a name maps to at
+        // most one target. A name already mapping to a *different* target is a name-theft (the caller's
+        // uniqueness check failed) that would produce an image decode still accepts but which points
+        // `DROP INDEX <name>` at the wrong index — catch it at the source in debug builds
+        // (`rmp` #624 durability audit, MEDIUM).
+        debug_assert!(
+            self.node_property_index_names
+                .get(&name)
+                .is_none_or(|&t| t == (label_token, prop_token)),
+            "index name {name:?} already maps to a different target than ({label_token}, {prop_token})"
+        );
+        // Write-path invariant: at most one name per target. Clear any prior name mapping to this
+        // `(label_token, prop_token)` before inserting the new one, so the durable catalog can never
+        // hold two names for the same target — a state `decode_index_name_catalog` rejects, which
+        // would leave the store unable to reopen (`rmp` #624 durability audit, HIGH). Enforcing the
+        // invariant here (not only at decode time) makes it hold for every caller, including the
+        // positional `create_node_property_index` API used by benches/tools.
+        self.remove_node_property_index_name_for(label_token, prop_token);
+        self.node_property_index_names
+            .insert(name, (label_token, prop_token));
+    }
+
+    /// Removes the name entry `name`, if present (`rmp` task #623). Removing an absent entry is a
+    /// harmless no-op. Used by `DROP INDEX <name>`.
+    pub(crate) fn remove_node_property_index_name(&mut self, name: &str) {
+        self.node_property_index_names.remove(name);
+    }
+
+    /// Removes whatever name maps to `(label_token, prop_token)`, if any (`rmp` task #623). Used by
+    /// the by-target `DROP INDEX FOR (n:L) ON (n.p)` shape so the name entry is cleared alongside the
+    /// index. A no-op for a nameless (legacy) index.
+    pub(crate) fn remove_node_property_index_name_for(
+        &mut self,
+        label_token: u32,
+        prop_token: u32,
+    ) {
+        // Collect first (the map is small) to avoid holding an iterator borrow across the removal.
+        if let Some(name) = self.node_property_index_name_for(label_token, prop_token) {
+            let name = name.to_owned();
+            self.node_property_index_names.remove(&name);
+        }
+    }
+
+    /// Lists every named node-property index as `(name, label_token, prop_token)`, ascending by name
+    /// (the [`BTreeMap`] order, deterministic) (`rmp` task #623).
+    #[must_use]
+    pub fn node_property_index_names(&self) -> Vec<(String, u32, u32)> {
+        self.node_property_index_names
+            .iter()
+            .map(|(name, &(label_token, prop_token))| (name.clone(), label_token, prop_token))
+            .collect()
+    }
+
     /// The durable full-text index entry named `name`, or [`None`] if no such index is declared
     /// (`rmp` task #72).
     #[must_use]
@@ -765,8 +871,11 @@ impl Statistics {
     /// catalog by the same rule, so a pre-#99 image decodes to an empty constraint catalog. The
     /// constraint type-descriptor block (`rmp` task #100) is appended **after** the constraint catalog
     /// by the same rule, so a pre-#100 image (ending after the constraint catalog) decodes with every
-    /// constraint's `type_descriptor` left `None`. No format-version byte is needed because every prior
-    /// block is length-exact and self-describing, so each parse position is unambiguous.
+    /// constraint's `type_descriptor` left `None`. The node-property index **name** catalog (`rmp` task
+    /// #623) is appended **after** the type-descriptor block by the same rule, so a pre-#623 image
+    /// decodes to an empty name catalog (every declared index nameless, backfilled on open). No
+    /// format-version byte is needed because every prior block is length-exact and self-describing, so
+    /// each parse position is unambiguous.
     ///
     /// # Why the property-type descriptors are a *separate* trailing block (`rmp` task #100)
     ///
@@ -803,6 +912,7 @@ impl Statistics {
         Self::encode_spatial_catalog(&mut out, &self.spatial_indexes);
         Self::encode_constraint_catalog(&mut out, &self.constraints);
         Self::encode_constraint_type_block(&mut out, &self.constraints);
+        Self::encode_index_name_catalog(&mut out, &self.node_property_index_names);
         out
     }
 
@@ -979,6 +1089,35 @@ impl Statistics {
         }
     }
 
+    /// Encodes the node-property index **name** catalog block (`rmp` task #623), appended after the
+    /// constraint type-descriptor block so a pre-#623 image (ending after that block) decodes to an
+    /// empty name catalog — i.e. every declared node-property index is nameless (a legacy anonymous
+    /// index), which the Cypher layer backfills a deterministic auto-name for on open.
+    ///
+    /// Layout: `n(u32) | [ name_len(u32) | name_bytes[name_len] | label_token(u32) |
+    /// prop_token(u32) ]*`, entries in ascending-name ([`BTreeMap`]) order so the image is
+    /// deterministic. Mirrors the spatial block (single property token) but carries a name → target
+    /// mapping with **no** state byte — the build state lives in the anonymous index catalog, keyed by
+    /// the same `(label_token, prop_token)`.
+    fn encode_index_name_catalog(out: &mut Vec<u8>, map: &BTreeMap<String, (u32, u32)>) {
+        debug_assert!(
+            map.len() <= u32::MAX as usize,
+            "index-name catalog entry count exceeds u32"
+        );
+        out.extend_from_slice(&(map.len() as u32).to_le_bytes());
+        for (name, &(label_token, prop_token)) in map {
+            let name_bytes = name.as_bytes();
+            debug_assert!(
+                name_bytes.len() <= u32::MAX as usize,
+                "index name exceeds u32 length"
+            );
+            out.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(name_bytes);
+            out.extend_from_slice(&label_token.to_le_bytes());
+            out.extend_from_slice(&prop_token.to_le_bytes());
+        }
+    }
+
     /// Rebuilds the statistics from an image produced by [`encode`](Self::encode).
     ///
     /// # Errors
@@ -1005,6 +1144,12 @@ impl Statistics {
         // constraints. A pre-#100 image ends after the constraint catalog, so this block decodes empty
         // and every entry keeps the `type_descriptor: None` the catalog decode already set.
         Self::decode_constraint_type_block(bytes, &mut cur, &mut constraints)?;
+        // Decode the trailing node-property index **name** catalog (`rmp` task #623). A pre-#623 image
+        // ends after the type-descriptor block, so this block decodes empty and every declared index is
+        // nameless (backfilled with an auto-name by the Cypher layer on open). Validated against the
+        // anonymous index catalog: every name must target a declared index.
+        let node_property_index_names =
+            Self::decode_index_name_catalog(bytes, &mut cur, &node_property_indexes)?;
         Ok(Self {
             total_nodes,
             total_relationships,
@@ -1015,6 +1160,7 @@ impl Statistics {
             fulltext_indexes,
             spatial_indexes,
             constraints,
+            node_property_index_names,
         })
     }
 
@@ -1333,6 +1479,64 @@ impl Statistics {
             }
         }
         Ok(())
+    }
+
+    /// Decodes the trailing node-property index **name** catalog block (`rmp` task #623). Like every
+    /// later block, end-of-input where its count `u32` would start means "no name catalog" (a pre-#623
+    /// image), not truncation — leaving every declared index nameless (backfilled on open).
+    ///
+    /// # Errors
+    /// Returns a storage error on truncation, a repeated / empty / non-UTF-8 name, a repeated
+    /// `(label, property)` **target** (an index has at most one name), or a name whose target is **not**
+    /// a declared node-property index (an orphan name — never produced by [`encode`](Self::encode),
+    /// which only ever records a name alongside a declared index).
+    fn decode_index_name_catalog(
+        bytes: &[u8],
+        cur: &mut usize,
+        node_property_indexes: &BTreeMap<(u32, u32), IndexState>,
+    ) -> Result<BTreeMap<String, (u32, u32)>> {
+        let mut map = BTreeMap::new();
+        // Backward compatibility (`rmp` task #623): a pre-#623 image ends exactly here.
+        if *cur == bytes.len() {
+            return Ok(map);
+        }
+        let n = read_u32(bytes, cur)? as usize;
+        // Track targets so two names cannot claim the same index.
+        let mut seen_targets: BTreeMap<(u32, u32), ()> = BTreeMap::new();
+        for _ in 0..n {
+            let name_len = read_u32(bytes, cur)? as usize;
+            let end = take(bytes, cur, name_len)?;
+            let name = String::from_utf8(bytes[end - name_len..end].to_vec()).map_err(|_| {
+                GraphusError::Storage("index-name catalog name is not valid UTF-8".to_owned())
+            })?;
+            if name.is_empty() {
+                return Err(GraphusError::Storage(
+                    "index-name catalog holds an empty index name".to_owned(),
+                ));
+            }
+            let label_token = read_u32(bytes, cur)?;
+            let prop_token = read_u32(bytes, cur)?;
+            if !node_property_indexes.contains_key(&(label_token, prop_token)) {
+                return Err(GraphusError::Storage(format!(
+                    "index-name catalog names {name:?} for ({label_token}, {prop_token}), which is \
+                     not a declared node-property index"
+                )));
+            }
+            if seen_targets.insert((label_token, prop_token), ()).is_some() {
+                return Err(GraphusError::Storage(format!(
+                    "index-name catalog gives a second name {name:?} to ({label_token}, {prop_token})"
+                )));
+            }
+            if map
+                .insert(name.clone(), (label_token, prop_token))
+                .is_some()
+            {
+                return Err(GraphusError::Storage(format!(
+                    "index-name catalog repeats index name {name:?}"
+                )));
+            }
+        }
+        Ok(map)
     }
 }
 
@@ -2343,6 +2547,192 @@ mod tests {
         let mut bytes = s.encode();
         bytes.truncate(bytes.len() - 1); // drop the state byte of the only entry
         assert!(Statistics::decode(&bytes).is_err());
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Node-property index NAME catalog (`rmp` task #623)
+    // ---------------------------------------------------------------------------------------------
+
+    /// Builds an image whose preamble (through the empty constraint blocks) is produced by the real
+    /// encoder for a `Statistics` declaring the index `target`, with its trailing empty (`0`-count)
+    /// name block replaced by `name_block`. Lets the rejection tests hand-craft only the name block.
+    fn image_with_index_and_name_block(target: (u32, u32), name_block: &[u8]) -> Vec<u8> {
+        let mut s = Statistics::new();
+        s.set_node_property_index(target.0, target.1, IndexState::Online);
+        let mut bytes = s.encode();
+        // The last 4 bytes are the empty (`0`-count) name block the encoder appends; drop them.
+        bytes.truncate(bytes.len() - 4);
+        bytes.extend_from_slice(name_block);
+        bytes
+    }
+
+    #[test]
+    fn statistics_index_name_catalog_round_trips() {
+        // Empty name catalog: the block is just a `0` count, and the round-trip is identity.
+        let empty = Statistics::new();
+        assert_eq!(Statistics::decode(&empty.encode()).unwrap(), empty);
+
+        let mut s = Statistics::new();
+        s.set_node_property_index(2, 3, IndexState::Online);
+        s.set_node_property_index(7, 1, IndexState::Populating);
+        s.set_node_property_index_name("ix_a".to_owned(), 2, 3);
+        s.set_node_property_index_name("ix_b".to_owned(), 7, 1);
+        // Interleave counts + a histogram to prove the name block is read after every prior block
+        // (its parse position is unambiguous).
+        s.inc_label(4);
+        s.set_property_histogram(2, 3, vec![0xAB, 0xCD]);
+        let back = Statistics::decode(&s.encode()).unwrap();
+        assert_eq!(back, s);
+        // Forward and reverse resolution both work.
+        assert_eq!(back.node_property_index_name("ix_a"), Some((2, 3)));
+        assert_eq!(back.node_property_index_name("ix_b"), Some((7, 1)));
+        assert_eq!(back.node_property_index_name("missing"), None);
+        assert_eq!(back.node_property_index_name_for(2, 3), Some("ix_a"));
+        assert_eq!(back.node_property_index_name_for(7, 1), Some("ix_b"));
+        assert_eq!(back.node_property_index_name_for(9, 9), None);
+        // Listing is ascending by name.
+        assert_eq!(
+            back.node_property_index_names(),
+            vec![("ix_a".to_owned(), 2, 3), ("ix_b".to_owned(), 7, 1)]
+        );
+    }
+
+    #[test]
+    fn set_resolve_and_remove_node_property_index_name() {
+        let mut s = Statistics::new();
+        s.set_node_property_index(1, 2, IndexState::Online);
+        assert_eq!(s.node_property_index_name("ix"), None);
+        s.set_node_property_index_name("ix".to_owned(), 1, 2);
+        assert_eq!(s.node_property_index_name("ix"), Some((1, 2)));
+        assert_eq!(s.node_property_index_name_for(1, 2), Some("ix"));
+        // Removal by name.
+        s.remove_node_property_index_name("ix");
+        assert_eq!(s.node_property_index_name("ix"), None);
+        // Removal by target clears whatever name maps to it; a no-op for a nameless index.
+        s.set_node_property_index_name("ix2".to_owned(), 1, 2);
+        s.remove_node_property_index_name_for(1, 2);
+        assert!(s.node_property_index_names.is_empty());
+        s.remove_node_property_index_name_for(9, 9); // absent target: harmless.
+        s.remove_node_property_index_name("absent"); // absent name: harmless.
+    }
+
+    #[test]
+    fn statistics_decode_accepts_a_pre_task_623_image_as_empty_name_catalog() {
+        // A pre-#623 image ends after the constraint type-descriptor block (no name block). An index
+        // that still carries a name-catalog entry in a newer image loses none of its declared indexes
+        // when read as pre-#623 — it is simply nameless (backfilled on open by the Cypher layer).
+        let mut s = Statistics::new();
+        s.set_node_property_index(5, 6, IndexState::Online);
+        s.inc_label(5);
+        let mut bytes = s.encode();
+        // Drop the trailing empty (`0`-count) name block: this is a byte-exact pre-#623 image.
+        bytes.truncate(bytes.len() - 4);
+        let back = Statistics::decode(&bytes).unwrap();
+        assert_eq!(
+            back.node_property_indexes(),
+            vec![(5, 6, IndexState::Online)],
+            "the declared index survives"
+        );
+        assert!(
+            back.node_property_index_names.is_empty(),
+            "a pre-#623 image has no names (every index nameless)"
+        );
+        // Re-encoding appends an explicit (empty) name block; the round-trip is then stable.
+        assert_eq!(Statistics::decode(&back.encode()).unwrap(), back);
+    }
+
+    #[test]
+    fn statistics_decode_rejects_a_duplicate_index_name() {
+        // Two name entries with the same name must be rejected (encode never produces them).
+        let mut nb = Vec::new();
+        nb.extend_from_slice(&2u32.to_le_bytes()); // 2 name entries
+        for _ in 0..2 {
+            nb.extend_from_slice(&2u32.to_le_bytes()); // name_len 2
+            nb.extend_from_slice(b"ix"); // name "ix" (same both times)
+            nb.extend_from_slice(&1u32.to_le_bytes()); // label token 1
+            nb.extend_from_slice(&2u32.to_le_bytes()); // prop token 2
+        }
+        assert!(Statistics::decode(&image_with_index_and_name_block((1, 2), &nb)).is_err());
+    }
+
+    #[test]
+    fn statistics_decode_rejects_an_empty_index_name() {
+        let mut nb = Vec::new();
+        nb.extend_from_slice(&1u32.to_le_bytes()); // 1 name entry
+        nb.extend_from_slice(&0u32.to_le_bytes()); // name_len 0 (empty)
+        nb.extend_from_slice(&1u32.to_le_bytes()); // label token 1
+        nb.extend_from_slice(&2u32.to_le_bytes()); // prop token 2
+        assert!(Statistics::decode(&image_with_index_and_name_block((1, 2), &nb)).is_err());
+    }
+
+    #[test]
+    fn statistics_decode_rejects_a_non_utf8_index_name() {
+        let mut nb = Vec::new();
+        nb.extend_from_slice(&1u32.to_le_bytes()); // 1 name entry
+        nb.extend_from_slice(&2u32.to_le_bytes()); // name_len 2
+        nb.extend_from_slice(&[0xFF, 0xFE]); // invalid UTF-8
+        nb.extend_from_slice(&1u32.to_le_bytes()); // label token 1
+        nb.extend_from_slice(&2u32.to_le_bytes()); // prop token 2
+        assert!(Statistics::decode(&image_with_index_and_name_block((1, 2), &nb)).is_err());
+    }
+
+    #[test]
+    fn statistics_decode_rejects_an_orphan_index_name() {
+        // A name whose target is not a declared node-property index is corruption (encode only ever
+        // records a name alongside a declared index). The declared index here is (1, 2); the name
+        // targets (9, 9), which is not declared.
+        let mut nb = Vec::new();
+        nb.extend_from_slice(&1u32.to_le_bytes()); // 1 name entry
+        nb.extend_from_slice(&2u32.to_le_bytes()); // name_len 2
+        nb.extend_from_slice(b"ix");
+        nb.extend_from_slice(&9u32.to_le_bytes()); // label token 9 (no such index)
+        nb.extend_from_slice(&9u32.to_le_bytes()); // prop token 9
+        assert!(Statistics::decode(&image_with_index_and_name_block((1, 2), &nb)).is_err());
+    }
+
+    #[test]
+    fn statistics_decode_rejects_a_second_name_for_the_same_target() {
+        // Two distinct names claiming the same declared index (1, 2): an index has at most one name.
+        let mut nb = Vec::new();
+        nb.extend_from_slice(&2u32.to_le_bytes()); // 2 name entries
+        for name in [b"ix_a", b"ix_b"] {
+            nb.extend_from_slice(&2u32.to_le_bytes()); // name_len 2
+            nb.extend_from_slice(name);
+            nb.extend_from_slice(&1u32.to_le_bytes()); // label token 1 (same target both times)
+            nb.extend_from_slice(&2u32.to_le_bytes()); // prop token 2
+        }
+        assert!(Statistics::decode(&image_with_index_and_name_block((1, 2), &nb)).is_err());
+    }
+
+    #[test]
+    fn set_node_property_index_name_enforces_one_name_per_target_and_reopens() {
+        // Write-path invariant (rmp #624 durability audit, HIGH): setting a second name for the same
+        // target REPLACES the first, so the durable catalog can never hold two names for one target —
+        // the exact state `statistics_decode_rejects_a_second_name_for_the_same_target` shows makes a
+        // store unopenable. Here the write path prevents it at the source, and the image reopens.
+        let mut s = Statistics::new();
+        s.set_node_property_index(1, 2, IndexState::Online);
+        s.set_node_property_index_name("ix_a".to_owned(), 1, 2);
+        s.set_node_property_index_name("ix_b".to_owned(), 1, 2); // same target -> replaces ix_a
+        assert_eq!(
+            s.node_property_index_names(),
+            vec![("ix_b".to_owned(), 1, 2)]
+        );
+        assert_eq!(s.node_property_index_name("ix_a"), None);
+        assert_eq!(s.node_property_index_name("ix_b"), Some((1, 2)));
+        // The resulting image round-trips (the store reopens) rather than being rejected on decode.
+        let back = Statistics::decode(&s.encode()).expect("one-name-per-target image must reopen");
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn statistics_decode_rejects_index_name_catalog_truncation() {
+        // The count word promises an entry the bytes do not hold: a genuine truncation, distinct from
+        // the clean pre-#623 end-of-input that lands exactly on the count word's start.
+        let mut nb = Vec::new();
+        nb.extend_from_slice(&1u32.to_le_bytes()); // promises 1 entry
+        nb.extend_from_slice(&2u32.to_le_bytes()); // name_len 2 ... but no name bytes follow
+        assert!(Statistics::decode(&image_with_index_and_name_block((1, 2), &nb)).is_err());
     }
 
     #[test]

@@ -52,7 +52,7 @@ pub use bulk_load::{BulkImportBatchInput, BulkImportBatchOutcome};
 pub use bulk_load_b::{BulkImportModeBChunkInput, BulkImportModeBChunkOutcome};
 pub use command::{
     AccessMode, CheckpointReply, ConstraintCommand, EngineCommand, IndexCommand, IndexDdlReply,
-    RunReply, RunSummary,
+    NodePropertyIndexRef, RunReply, RunSummary,
 };
 pub use handle::{EngineHandle, ServerBusy};
 // `EngineDegraded` is defined in this module (below); re-export note: it is `pub` here.
@@ -2515,36 +2515,72 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
     command: &IndexCommand,
 ) -> Result<IndexDdlReply> {
     match command {
-        IndexCommand::CreateNodePropertyIndex { label, property } => {
-            coordinator.begin_online_node_property_index(label, property)?;
-            Ok(IndexDdlReply::default())
+        IndexCommand::CreateNodePropertyIndex {
+            name,
+            label,
+            property,
+            if_not_exists,
+        } => {
+            // `mutated == false` is an idempotent `IF NOT EXISTS` no-op → the seam reports 0 added.
+            let mutated = coordinator.begin_online_node_property_index_named(
+                name.as_deref(),
+                label,
+                property,
+                *if_not_exists,
+            )?;
+            Ok(IndexDdlReply::mutation(mutated))
         }
-        IndexCommand::DropNodePropertyIndex { label, property } => {
-            coordinator.drop_node_property_index(label, property)?;
-            Ok(IndexDdlReply::default())
+        IndexCommand::DropNodePropertyIndex { index, if_exists } => {
+            // `mutated == false` is a no-op drop (missing index) → the seam reports 0 removed.
+            let mutated = match index {
+                NodePropertyIndexRef::Named(name) => {
+                    coordinator.drop_node_property_index_by_name(name, *if_exists)?
+                }
+                // The by-target form is already idempotent (a no-op success on a missing target), so
+                // `IF EXISTS` needs no extra handling here.
+                NodePropertyIndexRef::Target { label, property } => {
+                    coordinator.drop_node_property_index(label, property)?
+                }
+            };
+            Ok(IndexDdlReply::mutation(mutated))
         }
         IndexCommand::ShowIndexes => {
+            // Neo4j-conformant column shape (`rmp` task #626): the real driver ecosystem reads
+            // `name, type, entityType, labelsOrTypes, properties, state`. `type` is `RANGE` (the
+            // node-property index kind), `entityType` is `NODE`, and `labelsOrTypes` / `properties`
+            // are single-element lists. The `state` string stays lower-case for coherence with the
+            // full-text / point `SHOW … INDEXES` surfaces.
             let fields = vec![
-                "label".to_owned(),
-                "property".to_owned(),
+                "name".to_owned(),
+                "type".to_owned(),
+                "entityType".to_owned(),
+                "labelsOrTypes".to_owned(),
+                "properties".to_owned(),
                 "state".to_owned(),
             ];
             let rows = coordinator
                 .list_node_property_indexes()
                 .into_iter()
-                .map(|(label, property, state)| {
+                .map(|(name, label, property, state)| {
                     let state = match state {
                         IndexState::Online => "online",
                         IndexState::Populating => "populating",
                     };
                     vec![
-                        Value::String(label),
-                        Value::String(property),
+                        Value::String(name),
+                        Value::String("RANGE".to_owned()),
+                        Value::String("NODE".to_owned()),
+                        Value::List(vec![Value::String(label)]),
+                        Value::List(vec![Value::String(property)]),
                         Value::String(state.to_owned()),
                     ]
                 })
                 .collect();
-            Ok(IndexDdlReply { fields, rows })
+            Ok(IndexDdlReply {
+                fields,
+                rows,
+                mutated: false, // a SHOW is a read; the mutated flag is unused.
+            })
         }
         IndexCommand::CreateFulltextIndex {
             name,
@@ -2559,12 +2595,14 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
                     "unknown full-text analyzer {analyzer:?}; expected 'standard' or 'keyword'"
                 ))
             })?;
+            // A full-text create always mutates (a re-declare replaces): 1 added.
             coordinator.create_fulltext_index(name, label, properties, analyzer)?;
-            Ok(IndexDdlReply::default())
+            Ok(IndexDdlReply::mutation(true))
         }
         IndexCommand::DropFulltextIndex { name } => {
-            coordinator.drop_fulltext_index(name)?;
-            Ok(IndexDdlReply::default())
+            // `mutated == false` is a no-op drop of a missing index → 0 removed.
+            let mutated = coordinator.drop_fulltext_index(name)?;
+            Ok(IndexDdlReply::mutation(mutated))
         }
         IndexCommand::ShowFulltextIndexes => {
             let fields = vec![
@@ -2592,7 +2630,11 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
                     ]
                 })
                 .collect();
-            Ok(IndexDdlReply { fields, rows })
+            Ok(IndexDdlReply {
+                fields,
+                rows,
+                mutated: false, // a SHOW is a read; the mutated flag is unused.
+            })
         }
         IndexCommand::CreatePointIndex {
             name,
@@ -2600,13 +2642,14 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
             property,
         } => {
             // A spatial index has no analyzer to validate (unlike the full-text index): start the
-            // non-blocking online build directly (`rmp` task #98).
+            // non-blocking online build directly (`rmp` task #98). A create always mutates: 1 added.
             coordinator.create_point_index(name, label, property)?;
-            Ok(IndexDdlReply::default())
+            Ok(IndexDdlReply::mutation(true))
         }
         IndexCommand::DropPointIndex { name } => {
-            coordinator.drop_point_index(name)?;
-            Ok(IndexDdlReply::default())
+            // `mutated == false` is a no-op drop of a missing index → 0 removed.
+            let mutated = coordinator.drop_point_index(name)?;
+            Ok(IndexDdlReply::mutation(mutated))
         }
         IndexCommand::ShowPointIndexes => {
             let fields = vec![
@@ -2631,7 +2674,11 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
                     ]
                 })
                 .collect();
-            Ok(IndexDdlReply { fields, rows })
+            Ok(IndexDdlReply {
+                fields,
+                rows,
+                mutated: false, // a SHOW is a read; the mutated flag is unused.
+            })
         }
     }
 }
@@ -2712,7 +2759,7 @@ fn handle_constraint_ddl<D: BlockDevice, S: LogSink>(
             property,
         } => {
             coordinator.create_constraint(name, label, property, ConstraintKind::Unique)?;
-            Ok(IndexDdlReply::default())
+            Ok(IndexDdlReply::mutation(true))
         }
         ConstraintCommand::CreateExistence {
             name,
@@ -2720,7 +2767,7 @@ fn handle_constraint_ddl<D: BlockDevice, S: LogSink>(
             property,
         } => {
             coordinator.create_constraint(name, label, property, ConstraintKind::Existence)?;
-            Ok(IndexDdlReply::default())
+            Ok(IndexDdlReply::mutation(true))
         }
         ConstraintCommand::CreateNodeKey {
             name,
@@ -2735,7 +2782,7 @@ fn handle_constraint_ddl<D: BlockDevice, S: LogSink>(
                 ConstraintKind::NodeKey,
                 None,
             )?;
-            Ok(IndexDdlReply::default())
+            Ok(IndexDdlReply::mutation(true))
         }
         ConstraintCommand::CreatePropertyType {
             name,
@@ -2750,11 +2797,12 @@ fn handle_constraint_ddl<D: BlockDevice, S: LogSink>(
                 ConstraintKind::PropertyType,
                 Some(declared_type.clone()),
             )?;
-            Ok(IndexDdlReply::default())
+            Ok(IndexDdlReply::mutation(true))
         }
         ConstraintCommand::Drop { name } => {
-            coordinator.drop_constraint(name)?;
-            Ok(IndexDdlReply::default())
+            // `mutated == false` is a no-op drop of a missing constraint → 0 removed.
+            let mutated = coordinator.drop_constraint(name)?;
+            Ok(IndexDdlReply::mutation(mutated))
         }
         ConstraintCommand::Show => {
             let fields = vec![
@@ -2792,7 +2840,11 @@ fn handle_constraint_ddl<D: BlockDevice, S: LogSink>(
                     ]
                 })
                 .collect();
-            Ok(IndexDdlReply { fields, rows })
+            Ok(IndexDdlReply {
+                fields,
+                rows,
+                mutated: false, // a SHOW is a read; the mutated flag is unused.
+            })
         }
     }
 }

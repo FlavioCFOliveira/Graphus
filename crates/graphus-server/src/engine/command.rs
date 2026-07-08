@@ -118,6 +118,22 @@ pub struct RunReply {
     pub summary: SummarySink,
 }
 
+/// How a `DROP INDEX` identifies the node-property index to drop (`rmp` task #624): by its
+/// server-unique **name** (`DROP INDEX <name>`) or by its covered `(label, property)` **target**
+/// (the openCypher `DROP INDEX FOR (n:L) ON (n.p)` / legacy `DROP INDEX ON :L(p)` shapes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodePropertyIndexRef {
+    /// `DROP INDEX <name>` — identify the index by its server-unique name.
+    Named(String),
+    /// `DROP INDEX FOR (n:L) ON (n.p)` / `DROP INDEX ON :L(p)` — identify by covered label + property.
+    Target {
+        /// The covered node label.
+        label: String,
+        /// The covered property key.
+        property: String,
+    },
+}
+
 /// An **index-DDL** statement routed to the engine thread (`rmp` task #91), where the
 /// node-property index catalog lives (on the single-threaded coordinator). Unlike the DATABASE
 /// admin commands — which act on the off-engine async [`crate::dbcatalog::DatabaseCatalog`] — index
@@ -127,21 +143,30 @@ pub struct RunReply {
 /// them up / interns them through the coordinator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IndexCommand {
-    /// `CREATE INDEX …` on `(label, property)`: starts a **non-blocking** build (the index is
-    /// `Populating` and built in the background; the command returns promptly).
+    /// `CREATE INDEX [<name>] [IF NOT EXISTS] FOR (n:<Label>) ON (n.<property>)` on
+    /// `(label, property)`: starts a **non-blocking** build (the index is `Populating` and built in the
+    /// background; the command returns promptly). `name` is the requested server-unique name, or
+    /// [`None`] to auto-generate a deterministic one (`rmp` task #624); `if_not_exists` makes an
+    /// already-existing index (by name or equivalent schema) a no-op success rather than an error.
     CreateNodePropertyIndex {
+        /// The requested server-unique name, or [`None`] to auto-generate one.
+        name: Option<String>,
         /// The node label the index is declared on.
         label: String,
         /// The property key the index is declared on.
         property: String,
+        /// Whether `IF NOT EXISTS` was given (a duplicate becomes a no-op success).
+        if_not_exists: bool,
     },
-    /// `DROP INDEX …` on `(label, property)`: removes the index (durable + in-memory), cancelling
-    /// any in-progress build.
+    /// `DROP INDEX <name> [IF EXISTS]` (by name) or `DROP INDEX FOR (n:<Label>) ON (n.<property>)` /
+    /// `DROP INDEX ON :<Label>(<property>)` (by target): removes the index (durable + in-memory),
+    /// cancelling any in-progress build. `if_exists` (by-name form only) makes a missing index a no-op
+    /// success rather than an error (`rmp` task #624).
     DropNodePropertyIndex {
-        /// The node label of the index to drop.
-        label: String,
-        /// The property key of the index to drop.
-        property: String,
+        /// Which index to drop — by name or by covered `(label, property)`.
+        index: NodePropertyIndexRef,
+        /// Whether `IF EXISTS` was given (a missing index becomes a no-op success).
+        if_exists: bool,
     },
     /// `SHOW INDEXES`: lists every declared node-property index with its build state.
     ShowIndexes,
@@ -261,6 +286,27 @@ pub struct IndexDdlReply {
     pub fields: Vec<String>,
     /// The result rows (one per index for `SHOW INDEXES`).
     pub rows: Vec<Vec<Value>>,
+    /// Whether the DDL **actually mutated** the schema (`rmp` task #626 follow-up). A
+    /// `CREATE … IF NOT EXISTS` on an existing rule and a `DROP … IF EXISTS` (or a by-target drop) of a
+    /// missing rule are **no-ops** (`mutated == false`): the seam then reports `indexes-added` /
+    /// `indexes-removed` / `constraints-*` of `0` (empty counters, no `contains-updates`), matching
+    /// Neo4j's idempotent-DDL summary. A real mutation is `true`. Irrelevant for a `SHOW` (always
+    /// `false`; the read summary ignores it).
+    pub mutated: bool,
+}
+
+impl IndexDdlReply {
+    /// A rows-less reply for a `CREATE`/`DROP` DDL, recording whether it actually mutated the schema
+    /// (`rmp` task #626 follow-up). `mutated == false` is an idempotent no-op (`IF NOT EXISTS` /
+    /// `IF EXISTS` / by-target drop of a missing rule) and the seam reports a `0` counter for it.
+    #[must_use]
+    pub fn mutation(mutated: bool) -> Self {
+        Self {
+            fields: Vec::new(),
+            rows: Vec::new(),
+            mutated,
+        }
+    }
 }
 
 /// One request to the engine task. Every variant carries a `oneshot` sender for its reply, so the
@@ -470,13 +516,20 @@ pub struct RunSummary {
 }
 
 /// Builds a **schema-mutation** result summary for DDL (`rmp` #513): query type `"s"` (SCHEMA_WRITE)
-/// plus, on success, the single fired counter `key: 1` and the Neo4j `contains-updates` flag — index
-/// and constraint counters both feed `SummaryCounters.containsUpdates()`, mirroring how the data path
-/// appends `contains-updates` (see `exec::counters_to_stats`). A failed mutation (`ok == false`)
-/// carries the `"s"` type with no counters; in practice the seam returns the engine error before it
-/// ever builds a result stream, so only the success shape reaches the wire.
-fn schema_mutation_summary(key: &str, ok: bool) -> RunSummary {
-    let stats = if ok {
+/// plus, **when the DDL actually mutated the schema**, the single fired counter `key: 1` and the Neo4j
+/// `contains-updates` flag — index and constraint counters both feed
+/// `SummaryCounters.containsUpdates()`, mirroring how the data path appends `contains-updates` (see
+/// `exec::counters_to_stats`).
+///
+/// An **idempotent no-op** (`mutated == false`) — a `CREATE … IF NOT EXISTS` on an existing rule, or a
+/// `DROP … IF EXISTS` (or by-target drop) of a missing rule — carries the `"s"` type with **no
+/// counters** (`rmp` task #626 follow-up): the driver then sees `key = 0` and
+/// `containsUpdates() == false`, exactly as Neo4j reports an idempotent DDL that changed nothing. A
+/// failed mutation likewise reaches this with no counters, but in practice the seam returns the engine
+/// error before it ever builds a result stream, so only the success (mutated / no-op) shapes reach the
+/// wire.
+fn schema_mutation_summary(key: &str, mutated: bool) -> RunSummary {
+    let stats = if mutated {
         vec![
             (key.to_owned(), Value::Integer(1)),
             ("contains-updates".to_owned(), Value::Boolean(true)),
@@ -493,14 +546,15 @@ fn schema_mutation_summary(key: &str, ok: bool) -> RunSummary {
 /// The result summary for an [`IndexCommand`] (`rmp` #513), following the Neo4j `SummaryCounters`
 /// wire contract: a `CREATE … INDEX` reports query type `"s"` with `indexes-added: 1`; a `DROP …
 /// INDEX` reports `indexes-removed: 1`; the read-only `SHOW … INDEXES` listings report query type
-/// `"r"` with no counters. `ok` is whether the DDL succeeded (a failure carries no counters — see
-/// [`schema_mutation_summary`]).
+/// `"r"` with no counters. `mutated` is whether the DDL actually changed the schema — an idempotent
+/// no-op (`IF NOT EXISTS` / `IF EXISTS` / a by-target drop of a missing index) reports the `0` counter
+/// shape (empty counters, no `contains-updates`), matching Neo4j (see [`schema_mutation_summary`]).
 ///
 /// Shared by both connectivity seams ([`crate::engine::BoltEngineExecutor`] /
 /// [`crate::engine::RestEngineAdapter`]) so Bolt and REST spell every key identically: the wire-key
 /// naming lives here in the server layer while the engine's [`IndexCommand`] stays protocol-agnostic.
 #[must_use]
-pub fn index_ddl_summary(command: &IndexCommand, ok: bool) -> RunSummary {
+pub fn index_ddl_summary(command: &IndexCommand, mutated: bool) -> RunSummary {
     match command {
         IndexCommand::ShowIndexes
         | IndexCommand::ShowFulltextIndexes
@@ -510,24 +564,30 @@ pub fn index_ddl_summary(command: &IndexCommand, ok: bool) -> RunSummary {
         },
         IndexCommand::CreateNodePropertyIndex { .. }
         | IndexCommand::CreateFulltextIndex { .. }
-        | IndexCommand::CreatePointIndex { .. } => schema_mutation_summary("indexes-added", ok),
+        | IndexCommand::CreatePointIndex { .. } => {
+            schema_mutation_summary("indexes-added", mutated)
+        }
         IndexCommand::DropNodePropertyIndex { .. }
         | IndexCommand::DropFulltextIndex { .. }
-        | IndexCommand::DropPointIndex { .. } => schema_mutation_summary("indexes-removed", ok),
+        | IndexCommand::DropPointIndex { .. } => {
+            schema_mutation_summary("indexes-removed", mutated)
+        }
     }
 }
 
 /// The result summary for a [`ConstraintCommand`] (`rmp` #513), following the Neo4j `SummaryCounters`
 /// wire contract: a `CREATE CONSTRAINT` reports query type `"s"` with `constraints-added: 1`; a `DROP
 /// CONSTRAINT` reports `constraints-removed: 1`; the read-only `SHOW CONSTRAINTS` reports query type
-/// `"r"` with no counters. `ok` is whether the DDL succeeded (see [`schema_mutation_summary`]).
+/// `"r"` with no counters. `mutated` is whether the DDL actually changed the schema — a `DROP
+/// CONSTRAINT` of a missing constraint is an idempotent no-op that reports the `0` counter shape
+/// (empty counters, no `contains-updates`), matching Neo4j (see [`schema_mutation_summary`]).
 ///
 /// A uniqueness / node-key constraint is enforced by an implicit backing index, but — matching Neo4j,
 /// whose `CREATE CONSTRAINT` result summary reports `constraintsAdded` **without** an accompanying
 /// `indexesAdded` for that backing index — only `constraints-added` is reported here (`rmp` #513's
 /// empirical decision). Shared by both seams for identical wire keys.
 #[must_use]
-pub fn constraint_ddl_summary(command: &ConstraintCommand, ok: bool) -> RunSummary {
+pub fn constraint_ddl_summary(command: &ConstraintCommand, mutated: bool) -> RunSummary {
     match command {
         ConstraintCommand::Show => RunSummary {
             query_type: Some("r".to_owned()),
@@ -537,9 +597,9 @@ pub fn constraint_ddl_summary(command: &ConstraintCommand, ok: bool) -> RunSumma
         | ConstraintCommand::CreateExistence { .. }
         | ConstraintCommand::CreateNodeKey { .. }
         | ConstraintCommand::CreatePropertyType { .. } => {
-            schema_mutation_summary("constraints-added", ok)
+            schema_mutation_summary("constraints-added", mutated)
         }
-        ConstraintCommand::Drop { .. } => schema_mutation_summary("constraints-removed", ok),
+        ConstraintCommand::Drop { .. } => schema_mutation_summary("constraints-removed", mutated),
     }
 }
 
@@ -554,8 +614,10 @@ mod tests {
     fn index_ddl_summary_create_drop_show() {
         let create = index_ddl_summary(
             &IndexCommand::CreateNodePropertyIndex {
+                name: None,
                 label: "Person".to_owned(),
                 property: "name".to_owned(),
+                if_not_exists: false,
             },
             true,
         );
@@ -571,8 +633,8 @@ mod tests {
 
         let drop = index_ddl_summary(
             &IndexCommand::DropNodePropertyIndex {
-                label: "Person".to_owned(),
-                property: "name".to_owned(),
+                index: NodePropertyIndexRef::Named("ix".to_owned()),
+                if_exists: false,
             },
             true,
         );
@@ -618,19 +680,38 @@ mod tests {
         }
     }
 
-    /// `rmp` #513: a failed schema mutation keeps the `s` type but reports no counters (in practice the
-    /// seam returns the engine error before building a stream, so only the success shape is wired).
+    /// `rmp` #626 follow-up: an **idempotent no-op** DDL (`mutated == false`) keeps the `s` type but
+    /// reports **no counters** — so a `CREATE … IF NOT EXISTS` on an existing index and a `DROP …
+    /// IF EXISTS` of a missing one surface `indexes-added`/`indexes-removed` of `0` and no
+    /// `contains-updates`, matching Neo4j. (A genuine failure reaches the same shape, but the seam
+    /// returns the engine error before building a stream, so only the mutated / no-op shapes are wired.)
     #[test]
-    fn index_ddl_summary_failure_has_no_counters() {
-        let s = index_ddl_summary(
+    fn index_ddl_summary_noop_has_no_counters() {
+        let create_noop = index_ddl_summary(
             &IndexCommand::CreateNodePropertyIndex {
+                name: None,
                 label: "Person".to_owned(),
                 property: "name".to_owned(),
+                if_not_exists: true,
             },
-            false,
+            false, // mutated == false: an IF NOT EXISTS that changed nothing.
         );
-        assert_eq!(s.query_type.as_deref(), Some("s"));
-        assert!(s.stats.is_empty());
+        assert_eq!(create_noop.query_type.as_deref(), Some("s"));
+        assert!(
+            create_noop.stats.is_empty(),
+            "a no-op CREATE reports 0 (empty counters, no contains-updates): {:?}",
+            create_noop.stats
+        );
+
+        let drop_noop = index_ddl_summary(
+            &IndexCommand::DropNodePropertyIndex {
+                index: NodePropertyIndexRef::Named("missing".to_owned()),
+                if_exists: true,
+            },
+            false, // mutated == false: an IF EXISTS drop of a missing index.
+        );
+        assert_eq!(drop_noop.query_type.as_deref(), Some("s"));
+        assert!(drop_noop.stats.is_empty(), "a no-op DROP reports 0");
     }
 
     /// `rmp` #513 GATE: a constraint `CREATE` reports query type `s` with `constraints-added: 1` +

@@ -100,8 +100,10 @@ fn index_ddl_invalidates_the_plan_cache() {
     // before returning, so the catalog now exposes the new index — every plan compiled under the old
     // schema is stale and must be invalidated.
     eng.index_ddl(IndexCommand::CreateNodePropertyIndex {
+        name: None,
         label: "Person".to_owned(),
         property: "age".to_owned(),
+        if_not_exists: false,
     })
     .expect("create index");
 
@@ -129,8 +131,10 @@ fn index_ddl_invalidates_the_plan_cache() {
 fn drop_index_also_invalidates() {
     let mut eng = engine();
     eng.index_ddl(IndexCommand::CreateNodePropertyIndex {
+        name: None,
         label: "Person".to_owned(),
         property: "age".to_owned(),
+        if_not_exists: false,
     })
     .expect("create index");
 
@@ -142,8 +146,11 @@ fn drop_index_also_invalidates() {
 
     // Dropping the index changes the planner-visible catalog → invalidate.
     eng.index_ddl(IndexCommand::DropNodePropertyIndex {
-        label: "Person".to_owned(),
-        property: "age".to_owned(),
+        index: graphus_server::engine::NodePropertyIndexRef::Target {
+            label: "Person".to_owned(),
+            property: "age".to_owned(),
+        },
+        if_exists: false,
     })
     .expect("drop index");
 

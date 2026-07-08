@@ -613,8 +613,10 @@ async fn secondary_indexes_are_rebuilt_not_verified_on_open() {
             .engine
             .index_ddl(
                 graphus_server::engine::command::IndexCommand::CreateNodePropertyIndex {
+                    name: None,
                     label: "Person".to_owned(),
                     property: "email".to_owned(),
+                    if_not_exists: false,
                 },
             )
             .await

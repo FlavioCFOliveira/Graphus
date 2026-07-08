@@ -143,6 +143,7 @@ pub mod read_source;
 pub mod record_graph;
 pub mod result;
 pub mod runtime;
+pub mod schema_error;
 pub mod semantics;
 pub mod snapshot;
 pub(crate) mod spatial_fns;
@@ -167,7 +168,9 @@ pub use catalog::{
     IndexCatalog, IndexCatalogBuilder, IndexDescriptor, IndexId, IndexKind, IndexTarget,
 };
 pub use constraint::{CONSTRAINT_VIOLATION_PREFIX, ConstraintViolation};
-pub use coordinator::{ConstraintInfo, CoordinatorStatistics, ReadTaskInputs, TxnCoordinator};
+pub use coordinator::{
+    ConstraintInfo, CoordinatorStatistics, ReadTaskInputs, TxnCoordinator, auto_index_name,
+};
 pub use cost::{CostEstimate, estimate_cost};
 pub use counters::QueryCounters;
 pub use equality::{equals, is_in, not_equals};
@@ -223,6 +226,10 @@ pub use result::{
 };
 pub use runtime::{
     NodeRef, RelRef, Row, RowSchema, RowValue, cmp_row_values, row_values_equivalent,
+};
+pub use schema_error::{
+    SCHEMA_RULE_ERROR_PREFIX, SchemaRuleError, equivalent_index_exists, index_drop_not_found,
+    index_name_in_use,
 };
 pub use semantics::{
     ValidatedQuery, analyze, analyze_to_graphus, analyze_with_extensions, analyze_with_procedures,

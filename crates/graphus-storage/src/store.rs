@@ -5040,6 +5040,66 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.catalog_dirty = true;
     }
 
+    /// The `(label_token, prop_token)` a named node-property index covers, or [`None`] if no index of
+    /// that name is declared (`rmp` task #623) — the durable resolver behind `DROP INDEX <name>` and
+    /// the global name-uniqueness check.
+    #[must_use]
+    pub fn node_property_index_name(&self, name: &str) -> Option<(u32, u32)> {
+        self.statistics.node_property_index_name(name)
+    }
+
+    /// The declared **name** of the node-property index on `(label_token, prop_token)`, or [`None`] if
+    /// the index is nameless (a not-yet-backfilled legacy index) (`rmp` task #623). Returned owned so a
+    /// caller holding a `borrow()` of the store need not keep the borrow to read the name.
+    #[must_use]
+    pub fn node_property_index_name_for(
+        &self,
+        label_token: u32,
+        prop_token: u32,
+    ) -> Option<String> {
+        self.statistics
+            .node_property_index_name_for(label_token, prop_token)
+            .map(str::to_owned)
+    }
+
+    /// Records (or replaces) the name of the node-property index on `(label_token, prop_token)` in the
+    /// durable catalog (`rmp` task #623). In-memory here; durable at the enclosing transaction's
+    /// commit, discarded on rollback (like [`set_node_property_index`](Self::set_node_property_index)).
+    /// Global name uniqueness is the Cypher layer's responsibility, enforced before this is called.
+    pub fn set_node_property_index_name(
+        &mut self,
+        name: String,
+        label_token: u32,
+        prop_token: u32,
+    ) {
+        self.statistics
+            .set_node_property_index_name(name, label_token, prop_token);
+        self.catalog_dirty = true;
+    }
+
+    /// Removes the name entry `name` from the durable catalog, if present (`rmp` task #623) — the
+    /// durable half of `DROP INDEX <name>`. In-memory here; durable at commit, discarded on rollback.
+    pub fn remove_node_property_index_name(&mut self, name: &str) {
+        self.statistics.remove_node_property_index_name(name);
+        self.catalog_dirty = true;
+    }
+
+    /// Removes whatever name maps to `(label_token, prop_token)`, if any (`rmp` task #623) — used by the
+    /// by-target `DROP INDEX FOR (n:L) ON (n.p)` shape so the name is cleared alongside the index. A
+    /// no-op for a nameless (legacy) index. In-memory here; durable at commit, discarded on rollback.
+    pub fn remove_node_property_index_name_for(&mut self, label_token: u32, prop_token: u32) {
+        self.statistics
+            .remove_node_property_index_name_for(label_token, prop_token);
+        self.catalog_dirty = true;
+    }
+
+    /// Lists every named node-property index as `(name, label_token, prop_token)` from the durable
+    /// catalog (`rmp` task #623), ascending by name.
+    #[must_use]
+    pub fn node_property_index_names(&self) -> Vec<(String, u32, u32)> {
+        self.statistics.node_property_index_names()
+    }
+
     /// The durable full-text index entry named `name`, or [`None`] if no such index is declared
     /// (`rmp` task #72). Tokens are returned as ids; the caller resolves their names via the token
     /// store. Cloned so the borrow of `self` does not outlive the call.

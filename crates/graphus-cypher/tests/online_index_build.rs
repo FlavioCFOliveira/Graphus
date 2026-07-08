@@ -221,7 +221,12 @@ fn online_build_with_interleaved_writes_equals_scan_and_ends_online() {
     // planner now routes seeks.
     assert_eq!(
         coord.list_node_property_indexes(),
-        vec![("Person".to_owned(), "age".to_owned(), IndexState::Online)],
+        vec![(
+            "index_Person_age".to_owned(),
+            "Person".to_owned(),
+            "age".to_owned(),
+            IndexState::Online
+        )],
         "the durable catalog must read Online after the build completes"
     );
     let indexed = coord.catalog();
@@ -416,8 +421,13 @@ fn drop_index_removes_it_from_planner_and_catalog() {
     )));
     assert_eq!(
         coord.list_node_property_indexes(),
-        vec![("Person".to_owned(), "age".to_owned(), IndexState::Online)],
-        "SHOW INDEXES lists the online index"
+        vec![(
+            "index_Person_age".to_owned(),
+            "Person".to_owned(),
+            "age".to_owned(),
+            IndexState::Online
+        )],
+        "SHOW INDEXES lists the online index with its auto-name"
     );
 
     // Drop it: the planner must stop routing seeks, the catalog is empty, and queries still answer
@@ -483,9 +493,19 @@ fn two_builds_queue_and_complete_in_order() {
     assert_eq!(
         listed,
         vec![
-            ("Person".to_owned(), "age".to_owned(), IndexState::Online),
-            ("Tag".to_owned(), "name".to_owned(), IndexState::Online),
+            (
+                "index_Person_age".to_owned(),
+                "Person".to_owned(),
+                "age".to_owned(),
+                IndexState::Online
+            ),
+            (
+                "index_Tag_name".to_owned(),
+                "Tag".to_owned(),
+                "name".to_owned(),
+                IndexState::Online
+            ),
         ],
-        "both queued builds complete Online"
+        "both queued builds complete Online, each with its deterministic auto-name"
     );
 }

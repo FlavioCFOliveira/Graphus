@@ -85,8 +85,10 @@ fn engine() -> Eng {
 fn declare_rank_index(eng: &mut Eng) -> bool {
     eng.index_ddl(
         graphus_server::engine::IndexCommand::CreateNodePropertyIndex {
+            name: None,
             label: "Person".to_owned(),
             property: "rank".to_owned(),
+            if_not_exists: false,
         },
     )
     .is_ok()

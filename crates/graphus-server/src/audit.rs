@@ -1186,13 +1186,26 @@ fn priv_scope_str(scope: &crate::admin::PrivScope) -> String {
 /// (index DDL carries no secret). E.g. `"CREATE INDEX ON :Person(name)"`.
 #[must_use]
 pub fn redact_index_detail(cmd: &crate::engine::IndexCommand) -> String {
-    use crate::engine::IndexCommand as I;
+    use crate::engine::{IndexCommand as I, NodePropertyIndexRef as Ref};
     match cmd {
-        I::CreateNodePropertyIndex { label, property } => {
-            format!("CREATE INDEX ON :{label}({property})")
+        I::CreateNodePropertyIndex {
+            name,
+            label,
+            property,
+            if_not_exists,
+        } => {
+            let named = name.as_deref().map(|n| format!("{n} ")).unwrap_or_default();
+            let if_ne = if *if_not_exists { " IF NOT EXISTS" } else { "" };
+            format!("CREATE INDEX {named}FOR (:{label}) ON ({property}){if_ne}")
         }
-        I::DropNodePropertyIndex { label, property } => {
-            format!("DROP INDEX ON :{label}({property})")
+        I::DropNodePropertyIndex { index, if_exists } => {
+            let if_e = if *if_exists { " IF EXISTS" } else { "" };
+            match index {
+                Ref::Named(name) => format!("DROP INDEX {name}{if_e}"),
+                Ref::Target { label, property } => {
+                    format!("DROP INDEX ON :{label}({property})")
+                }
+            }
         }
         I::ShowIndexes => "SHOW INDEXES".to_owned(),
         // Full-text index DDL (`rmp` task #72) carries no secret either: the index name, label,
