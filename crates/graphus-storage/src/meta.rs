@@ -174,11 +174,24 @@ pub enum ConstraintKind {
     /// A property-type constraint (`rmp` task #100): the covered property, when present on a node of
     /// the label, has a value matching the declared [`ConstraintTypeDescriptor`].
     PropertyType,
+    /// A **relationship** uniqueness constraint (`rmp` #638): the covered property's value is unique
+    /// across all relationships of the type. The [`ConstraintEntry::label_token`] holds the
+    /// relationship-**type** token (not a label token) for every `Rel*` kind.
+    RelUnique,
+    /// A **relationship** existence (`NOT NULL`) constraint (`rmp` #638): every relationship of the
+    /// type must carry the covered property.
+    RelExistence,
+    /// A **relationship** key constraint (`rmp` #638): the covered property *tuple* is present on, and
+    /// unique across, every relationship of the type.
+    RelKey,
+    /// A **relationship** property-type constraint (`rmp` #638): the covered property, when present on
+    /// a relationship of the type, matches the declared [`ConstraintTypeDescriptor`].
+    RelPropertyType,
 }
 
 impl ConstraintKind {
-    /// The single-byte wire discriminant (`rmp` tasks #99, #100). Discriminants `4..` are reserved for
-    /// a future relationship-property constraint kind.
+    /// The single-byte wire discriminant (`rmp` tasks #99, #100, #638). Discriminants `4..=7` carry the
+    /// relationship-constraint kinds (`rmp` #638); `8..` remain reserved.
     #[must_use]
     pub const fn as_byte(self) -> u8 {
         match self {
@@ -186,6 +199,10 @@ impl ConstraintKind {
             Self::Existence => 1,
             Self::NodeKey => 2,
             Self::PropertyType => 3,
+            Self::RelUnique => 4,
+            Self::RelExistence => 5,
+            Self::RelKey => 6,
+            Self::RelPropertyType => 7,
         }
     }
 
@@ -197,8 +214,22 @@ impl ConstraintKind {
             1 => Some(Self::Existence),
             2 => Some(Self::NodeKey),
             3 => Some(Self::PropertyType),
+            4 => Some(Self::RelUnique),
+            5 => Some(Self::RelExistence),
+            6 => Some(Self::RelKey),
+            7 => Some(Self::RelPropertyType),
             _ => None,
         }
+    }
+
+    /// Whether this is a **relationship** constraint kind (`rmp` #638) — i.e. its covering token is a
+    /// relationship-type token, and it is validated/enforced against relationships rather than nodes.
+    #[must_use]
+    pub const fn is_relationship(self) -> bool {
+        matches!(
+            self,
+            Self::RelUnique | Self::RelExistence | Self::RelKey | Self::RelPropertyType
+        )
     }
 }
 
@@ -304,7 +335,10 @@ impl ConstraintTypeDescriptor {
 /// [`None`] for every other kind — see its docs for the backward-compatible encoding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConstraintEntry {
-    /// The node label-namespace token the constraint covers.
+    /// The covering token: a **node label** token for the node kinds
+    /// (`Unique`/`Existence`/`NodeKey`/`PropertyType`), or a **relationship-type** token for the
+    /// `Rel*` kinds (`rmp` #638). Which namespace it lives in is selected by
+    /// [`ConstraintKind::is_relationship`].
     pub label_token: u32,
     /// The property-key-namespace tokens the constraint covers, in declared order (one or more; one
     /// for `Unique`/`Existence`/`PropertyType`, one-or-more for a composite `NodeKey`).
@@ -1971,6 +2005,28 @@ mod tests {
                 type_descriptor: Some(ConstraintTypeDescriptor::List(Box::new(
                     ConstraintTypeDescriptor::Integer,
                 ))),
+            },
+        );
+        // Relationship constraints (`rmp` #638) round-trip through the same catalog: the covering token
+        // is a relationship-type token, and the `Rel*` kinds use the reserved discriminants 4..=7. A
+        // relationship key (composite) + a relationship property-type (typed) exercise both the
+        // multi-property `Vec` and the trailing type-descriptor block for the relationship kinds.
+        m.statistics.set_constraint(
+            "rated_key".to_owned(),
+            ConstraintEntry {
+                label_token: 0,
+                property_tokens: vec![1, 2],
+                kind: ConstraintKind::RelKey,
+                type_descriptor: None,
+            },
+        );
+        m.statistics.set_constraint(
+            "weighs_typed".to_owned(),
+            ConstraintEntry {
+                label_token: 0,
+                property_tokens: vec![1],
+                kind: ConstraintKind::RelPropertyType,
+                type_descriptor: Some(ConstraintTypeDescriptor::Integer),
             },
         );
 

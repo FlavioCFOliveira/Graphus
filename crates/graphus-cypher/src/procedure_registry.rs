@@ -116,6 +116,16 @@ impl FieldType {
         }
     }
 
+    /// A **required** (non-null) field of `class` — the form the engine's own built-in signatures
+    /// declare for their inputs and outputs (`db.*` catalogue procedures, `dbms.components`, …), where
+    /// the value is always present.
+    pub const fn required(class: ValueClass) -> Self {
+        Self {
+            class,
+            nullable: false,
+        }
+    }
+
     /// Whether a **statically-known** argument value satisfies this type, applying Cypher's
     /// argument coercions: `INTEGER` is acceptable where `FLOAT` or `NUMBER` is declared, `FLOAT`
     /// where `NUMBER` is declared, and `null` wherever the type is nullable.
@@ -444,6 +454,95 @@ impl ProcedureSet {
             ),
             Box::new(|args, graph| fulltext_query_nodes(args, graph)),
         );
+        // `db.index.fulltext.queryRelationships(indexName, queryString) YIELD relationship, score` —
+        // the relationship analogue of `queryNodes` (`rmp` task #639). Graphus full-text indexes cover
+        // **nodes only** (a [`FulltextIndexEntry`](graphus_storage::FulltextIndexEntry) records a node
+        // *label* token, and the [`GraphAccess`] seam exposes only node full-text via
+        // [`fulltext_query`](GraphAccess::fulltext_query)), so this procedure is registered — so it is
+        // listed by `SHOW PROCEDURES` and type-checks under `YIELD` for driver/tooling compatibility —
+        // but its body returns a **clear runtime error** rather than silently-empty results (which would
+        // mislead a caller into thinking their relationship index simply matched nothing). Output
+        // `relationship` is declared `ANY`: Neo4j types it `RELATIONSHIP`, but the v1 registry
+        // [`ValueClass`] models `NODE` structurally and not `RELATIONSHIP`; since no row is ever yielded,
+        // no structural relationship is materialized. Kept in step with the two-input `queryNodes`
+        // signature (the registry has no optional-argument support for Neo4j's third `options` MAP).
+        set.register_reader_safe(
+            ProcedureSignature::new(
+                "db.index.fulltext.queryRelationships",
+                vec![
+                    FieldSpec::new("indexName", FieldType::required(ValueClass::String)),
+                    FieldSpec::new("queryString", FieldType::required(ValueClass::String)),
+                ],
+                vec![
+                    FieldSpec::new("relationship", FieldType::required(ValueClass::Any)),
+                    FieldSpec::new("score", FieldType::required(ValueClass::Float)),
+                ],
+            ),
+            Box::new(|_args, _graph| fulltext_query_relationships()),
+        );
+        // `dbms.components() YIELD name, versions, edition` — the product/version/edition triple every
+        // Neo4j driver and admin tool reads at connect time to render the server banner and gate
+        // feature negotiation (`rmp` task #639). Neo4j returns `name`, a `LIST<STRING>` `versions`, and
+        // `edition`; Graphus reports `name = "Graphus"`, `versions = [<workspace version>]` and
+        // `edition = "community"`. The product name is fixed to `"Graphus"` (the task's default): a
+        // Neo4j-compat override keyed on the server's `bolt_server_agent` config is out of reach here —
+        // a procedure handler receives only its arguments and the `GraphAccess` seam, never the server
+        // configuration — and modern drivers do not parse this string. `versions` is declared `ANY`
+        // (the v1 registry `ValueClass` has no list class; the value is a `Value::List` of one string).
+        set.register_reader_safe(
+            ProcedureSignature::new(
+                "dbms.components",
+                Vec::new(),
+                vec![
+                    FieldSpec::new("name", FieldType::required(ValueClass::String)),
+                    FieldSpec::new("versions", FieldType::required(ValueClass::Any)),
+                    FieldSpec::new("edition", FieldType::required(ValueClass::String)),
+                ],
+            ),
+            Box::new(|_args, _graph| Ok(dbms_components_rows())),
+        );
+        // `db.awaitIndexes(timeOutSeconds)` — block until every index is ONLINE, or the timeout elapses
+        // (`rmp` task #639). A **VOID** procedure (no yielded columns). Graphus builds every index
+        // **synchronously** at `CREATE INDEX` time — an index is ONLINE the moment its DDL commits, so
+        // there is never a pending population to await. The body is therefore a genuine no-op that
+        // returns immediately regardless of the timeout, which is the correct behaviour (nothing to wait
+        // for), not a stub. The Neo4j argument name (`timeOutSeconds`, INTEGER, default 300) is kept
+        // verbatim for signature fidelity; the registry's strict arity means the timeout is required
+        // here (v1 has no optional/default-argument support).
+        set.register_reader_safe(
+            ProcedureSignature::new(
+                "db.awaitIndexes",
+                vec![FieldSpec::new(
+                    "timeOutSeconds",
+                    FieldType::required(ValueClass::Integer),
+                )],
+                Vec::new(),
+            ),
+            Box::new(|_args, _graph| Ok(Vec::new())),
+        );
+        // `db.resampleIndex(indexName)` and `db.resampleOutdatedIndexes()` — schedule a re-sampling of
+        // index statistics (`rmp` task #639). Both are **VOID** no-ops in Graphus: the planner's
+        // statistics are maintained **automatically** — live per-label/per-type counts and equi-depth
+        // property histograms rebuilt from the store on open (see [`crate::statistics`] /
+        // `graphus-index::histogram`) — so there is no separately-sampled index statistic that could go
+        // stale and need an explicit resample. They are registered for driver/tooling compatibility and
+        // complete successfully with no effect. `indexName` is not validated against the catalog (the
+        // `GraphAccess` seam exposes no index-catalog listing), matching the lenient no-op contract.
+        set.register_reader_safe(
+            ProcedureSignature::new(
+                "db.resampleIndex",
+                vec![FieldSpec::new(
+                    "indexName",
+                    FieldType::required(ValueClass::String),
+                )],
+                Vec::new(),
+            ),
+            Box::new(|_args, _graph| Ok(Vec::new())),
+        );
+        set.register_reader_safe(
+            ProcedureSignature::new("db.resampleOutdatedIndexes", Vec::new(), Vec::new()),
+            Box::new(|_args, _graph| Ok(Vec::new())),
+        );
         set
     }
 
@@ -653,6 +752,50 @@ fn distinct_rel_types(graph: &dyn GraphAccess) -> Vec<String> {
         }
     }
     types.into_iter().collect()
+}
+
+/// The product name `dbms.components()` reports. Fixed to the Graphus product name; see the
+/// registration site for why the Neo4j-compat override is not wired at this layer.
+const SERVER_PRODUCT_NAME: &str = "Graphus";
+
+/// The server version `dbms.components()` reports. Taken from this crate's `CARGO_PKG_VERSION`, which
+/// is the single workspace version (`version.workspace = true`), so it tracks every release bump with
+/// no hand-maintained constant to drift.
+const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The edition `dbms.components()` reports. Graphus ships a single edition, reported as `community`
+/// (the Neo4j-compatible spelling drivers expect).
+const SERVER_EDITION: &str = "community";
+
+/// The single-row result of `dbms.components()` (`rmp` task #639): `[name, versions, edition]`, where
+/// `versions` is a one-element `LIST<STRING>` carrying the server version. Neo4j-shaped so a driver's
+/// connect-time banner/version probe reads it exactly as it reads a Neo4j server.
+fn dbms_components_rows() -> Vec<Vec<Value>> {
+    vec![vec![
+        Value::String(SERVER_PRODUCT_NAME.to_owned()),
+        Value::List(vec![Value::String(SERVER_VERSION.to_owned())]),
+        Value::String(SERVER_EDITION.to_owned()),
+    ]]
+}
+
+/// The `db.index.fulltext.queryRelationships(indexName, queryString)` body (`rmp` task #639).
+///
+/// Graphus full-text indexes cover **nodes only** (there is no relationship full-text backing on the
+/// [`GraphAccess`] seam), so this always fails with a clear, actionable message rather than returning
+/// silently-empty results that would masquerade as "no matches". The procedure is still *registered*
+/// (so `SHOW PROCEDURES` lists it and `YIELD relationship, score` type-checks) for driver/tooling
+/// compatibility.
+///
+/// # Errors
+///
+/// Always returns a [`ProcedureFailure`] explaining that relationship full-text indexes are not
+/// supported and pointing to the node-index procedure.
+fn fulltext_query_relationships() -> Result<Vec<Vec<Value>>, ProcedureFailure> {
+    Err(ProcedureFailure::new(
+        "db.index.fulltext.queryRelationships",
+        "relationship full-text indexes are not supported: Graphus full-text indexes cover nodes \
+         only — use db.index.fulltext.queryNodes for node full-text search",
+    ))
 }
 
 /// The `db.index.fulltext.queryNodes(indexName, queryString)` body (`rmp` task #72).
@@ -976,6 +1119,140 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn dbms_components_reports_graphus_community_and_workspace_version() {
+        // `rmp` task #639: `CALL dbms.components()` returns exactly one row of
+        // `[name, versions, edition]`, where `versions` is a one-element LIST<STRING> of the server
+        // version. Drivers read this at connect time.
+        let mut g = MemGraph::new();
+        let rows = builtins()
+            .invoke("dbms.components", &[], &mut g)
+            .expect("invoke");
+        assert_eq!(
+            rows,
+            vec![vec![
+                Value::String("Graphus".into()),
+                Value::List(vec![Value::String(env!("CARGO_PKG_VERSION").into())]),
+                Value::String("community".into()),
+            ]]
+        );
+    }
+
+    #[test]
+    fn dbms_components_signature_has_name_versions_edition_outputs() {
+        let set = ProcedureSet::with_builtins();
+        let sig = set.signature("dbms.components").expect("registered");
+        assert!(sig.inputs.is_empty());
+        let out_names: Vec<&str> = sig.outputs.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(out_names, ["name", "versions", "edition"]);
+        // Case-insensitive, like every other built-in.
+        assert!(set.signature("DBMS.Components").is_some());
+        assert!(set.is_reader_safe("dbms.components"));
+    }
+
+    #[test]
+    fn db_await_indexes_is_a_void_noop() {
+        // `rmp` task #639: a VOID no-op (indexes are ONLINE synchronously, nothing to await). Takes the
+        // required INTEGER timeout and yields no rows.
+        let set = ProcedureSet::with_builtins();
+        let sig = set.signature("db.awaitIndexes").expect("registered");
+        assert_eq!(sig.inputs.len(), 1);
+        assert_eq!(sig.inputs[0].name, "timeOutSeconds");
+        assert_eq!(sig.inputs[0].ty.class, ValueClass::Integer);
+        assert!(sig.outputs.is_empty(), "db.awaitIndexes is VOID");
+
+        let mut g = MemGraph::new();
+        let rows = set
+            .invoke("db.awaitIndexes", &[Value::Integer(30)], &mut g)
+            .expect("invoke");
+        assert!(rows.is_empty());
+        // Wrong arity still fails (strict, like every built-in).
+        assert!(set.invoke("db.awaitIndexes", &[], &mut g).is_err());
+    }
+
+    #[test]
+    fn db_resample_index_and_outdated_are_void_noops() {
+        // `rmp` task #639: both VOID no-ops (planner statistics are maintained automatically, so there
+        // is nothing to resample). `db.resampleIndex` takes a STRING index name; the outdated form is
+        // nullary.
+        let set = ProcedureSet::with_builtins();
+
+        let sig = set.signature("db.resampleIndex").expect("registered");
+        assert_eq!(sig.inputs.len(), 1);
+        assert_eq!(sig.inputs[0].name, "indexName");
+        assert_eq!(sig.inputs[0].ty.class, ValueClass::String);
+        assert!(sig.outputs.is_empty());
+
+        let sig2 = set
+            .signature("db.resampleOutdatedIndexes")
+            .expect("registered");
+        assert!(sig2.inputs.is_empty());
+        assert!(sig2.outputs.is_empty());
+
+        let mut g = MemGraph::new();
+        assert!(
+            set.invoke(
+                "db.resampleIndex",
+                &[Value::String("some_index".into())],
+                &mut g,
+            )
+            .expect("invoke")
+            .is_empty()
+        );
+        assert!(
+            set.invoke("db.resampleOutdatedIndexes", &[], &mut g)
+                .expect("invoke")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn fulltext_query_relationships_is_registered_but_errors_clearly() {
+        // `rmp` task #639: registered (so SHOW PROCEDURES lists it and YIELD type-checks) with the
+        // Neo4j `relationship, score` outputs, but errors clearly — Graphus full-text indexes cover
+        // nodes only.
+        let set = ProcedureSet::with_builtins();
+        let sig = set
+            .signature("db.index.fulltext.queryRelationships")
+            .expect("registered");
+        assert_eq!(sig.inputs.len(), 2);
+        let out_names: Vec<&str> = sig.outputs.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(out_names, ["relationship", "score"]);
+        assert_eq!(sig.outputs[1].ty.class, ValueClass::Float);
+        assert!(set.is_reader_safe("db.index.fulltext.queryRelationships"));
+
+        let mut g = MemGraph::new();
+        let err = set
+            .invoke(
+                "db.index.fulltext.queryRelationships",
+                &[
+                    Value::String("rel_ix".into()),
+                    Value::String("query".into()),
+                ],
+                &mut g,
+            )
+            .expect_err("relationship full-text must error");
+        let msg = format!("{err}");
+        assert!(msg.contains("nodes only"), "message was: {msg}");
+        assert!(msg.contains("queryNodes"), "message was: {msg}");
+    }
+
+    #[test]
+    fn new_admin_procedures_are_reader_safe() {
+        // Every procedure added in `rmp` #639 is read-only / no-op, so all are reader-safe (dispatchable
+        // to the off-thread reader pool; keeps `SHOW PROCEDURES` mode = READ).
+        let set = ProcedureSet::with_builtins();
+        for name in [
+            "dbms.components",
+            "db.awaitIndexes",
+            "db.resampleIndex",
+            "db.resampleOutdatedIndexes",
+            "db.index.fulltext.queryRelationships",
+        ] {
+            assert!(set.is_reader_safe(name), "`{name}` must be reader-safe");
+        }
     }
 
     #[test]

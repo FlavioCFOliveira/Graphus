@@ -1265,36 +1265,43 @@ pub fn redact_index_detail(cmd: &crate::engine::IndexCommand) -> String {
 /// `"CREATE CONSTRAINT c1 FOR (:Person) REQUIRE email IS UNIQUE"`.
 #[must_use]
 pub fn redact_constraint_detail(cmd: &crate::engine::ConstraintCommand) -> String {
-    use crate::engine::ConstraintCommand as C;
+    use crate::engine::{ConstraintCommand as C, ConstraintCreateKind as K, ConstraintEntity as E};
     match cmd {
-        C::CreateUnique {
-            name,
-            label,
-            property,
-        } => format!("CREATE CONSTRAINT {name} FOR (:{label}) REQUIRE {property} IS UNIQUE"),
-        C::CreateExistence {
-            name,
-            label,
-            property,
-        } => format!("CREATE CONSTRAINT {name} FOR (:{label}) REQUIRE {property} IS NOT NULL"),
-        C::CreateNodeKey {
-            name,
-            label,
-            properties,
-        } => format!(
-            "CREATE CONSTRAINT {name} FOR (:{label}) REQUIRE ({}) IS NODE KEY",
-            properties.join(", ")
-        ),
-        C::CreatePropertyType {
-            name,
-            label,
-            property,
-            declared_type,
-        } => format!(
-            "CREATE CONSTRAINT {name} FOR (:{label}) REQUIRE {property} IS :: {}",
-            graphus_cypher::constraint::type_descriptor_name(declared_type)
-        ),
-        C::Drop { name } => format!("DROP CONSTRAINT {name}"),
+        C::Create(c) => {
+            let or_replace = if c.or_replace { "OR REPLACE " } else { "" };
+            let if_ne = if c.if_not_exists {
+                " IF NOT EXISTS"
+            } else {
+                ""
+            };
+            let for_clause = match &c.entity {
+                E::Node { label } => format!("(:{label})"),
+                E::Relationship { rel_type } => format!("()-[:{rel_type}]-()"),
+            };
+            let props = c.properties.join(", ");
+            let entity_kw = if c.entity.is_relationship() {
+                "RELATIONSHIP"
+            } else {
+                "NODE"
+            };
+            let require = match &c.kind {
+                K::Unique => format!("({props}) IS {entity_kw} UNIQUE"),
+                K::Existence => format!("{props} IS NOT NULL"),
+                K::Key => format!("({props}) IS {entity_kw} KEY"),
+                K::PropertyType { declared_type } => format!(
+                    "{props} IS :: {}",
+                    graphus_cypher::constraint::type_descriptor_name(declared_type)
+                ),
+            };
+            let name = &c.name;
+            format!(
+                "CREATE {or_replace}CONSTRAINT {name}{if_ne} FOR {for_clause} REQUIRE {require}"
+            )
+        }
+        C::Drop { name, if_exists } => {
+            let if_e = if *if_exists { " IF EXISTS" } else { "" };
+            format!("DROP CONSTRAINT {name}{if_e}")
+        }
         C::Show => "SHOW CONSTRAINTS".to_owned(),
     }
 }

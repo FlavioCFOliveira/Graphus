@@ -212,66 +212,106 @@ pub enum IndexCommand {
     ShowPointIndexes,
 }
 
+/// The entity a constraint covers (`rmp` #638): a node label (the `FOR (n:Label)` pattern) or a
+/// relationship type (the `FOR ()-[r:TYPE]-()` pattern). The entity selects the token namespace the
+/// covering name interns into and the store domain — nodes vs relationships — that a `CREATE`
+/// validates against and the write path enforces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConstraintEntity {
+    /// A node constraint over `label` (the `FOR (n:Label)` pattern, `rmp` tasks #99/#100).
+    Node {
+        /// The node label the constraint covers.
+        label: String,
+    },
+    /// A relationship constraint over `rel_type` (the `FOR ()-[r:TYPE]-()` pattern, `rmp` #638).
+    Relationship {
+        /// The relationship type the constraint covers.
+        rel_type: String,
+    },
+}
+
+impl ConstraintEntity {
+    /// The covering schema name — the label for a node entity, the relationship type for a
+    /// relationship entity — used for interning and diagnostic messages.
+    #[must_use]
+    pub fn covering_name(&self) -> &str {
+        match self {
+            Self::Node { label } => label,
+            Self::Relationship { rel_type } => rel_type,
+        }
+    }
+
+    /// Whether this is a relationship entity (`rmp` #638).
+    #[must_use]
+    pub fn is_relationship(&self) -> bool {
+        matches!(self, Self::Relationship { .. })
+    }
+}
+
+/// The kind of a `CREATE CONSTRAINT` rule, entity-agnostic (`rmp` #638): the same four kinds apply to
+/// either a node or a relationship entity, and [`CreateConstraint`] pairs one with a
+/// [`ConstraintEntity`]. The engine maps the `(entity, kind)` pair onto the durable
+/// [`graphus_storage::ConstraintKind`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConstraintCreateKind {
+    /// `IS [NODE|REL[ATIONSHIP]] UNIQUE` — the covered single property is unique across the domain.
+    Unique,
+    /// `IS NOT NULL` — the covered single property must be present + non-null (existence).
+    Existence,
+    /// `IS [NODE|REL[ATIONSHIP]] KEY` — the covered property tuple (one or more) is present + unique.
+    Key,
+    /// `IS :: <TYPE>` — the covered single property, when present, matches `declared_type`.
+    PropertyType {
+        /// The declared value type the property must match.
+        declared_type: graphus_storage::ConstraintTypeDescriptor,
+    },
+}
+
+/// The parsed body of a `CREATE CONSTRAINT` statement (`rmp` tasks #99, #100, #638). The admin matcher
+/// validates/normalizes the identifiers before this is built; the engine interns them through the
+/// coordinator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateConstraint {
+    /// The server-unique constraint name.
+    pub name: String,
+    /// The entity (node label / relationship type) the constraint covers.
+    pub entity: ConstraintEntity,
+    /// The covered properties in declared order (one for `Unique`/`Existence`/`PropertyType`,
+    /// one-or-more for a composite `Key`).
+    pub properties: Vec<String>,
+    /// The constraint kind.
+    pub kind: ConstraintCreateKind,
+    /// `IF NOT EXISTS` (`rmp` #638): an equivalent existing constraint — same name, or same
+    /// schema — makes creation an idempotent no-op success (`0` counters) rather than an error.
+    /// Mutually exclusive with `or_replace` (the parser rejects both at once).
+    pub if_not_exists: bool,
+    /// `OR REPLACE` (`rmp` #638): drop any same-named constraint first, then create. A **Graphus
+    /// superset** of the Neo4j surface (which offers only `IF NOT EXISTS` for constraints). Mutually
+    /// exclusive with `if_not_exists`.
+    pub or_replace: bool,
+}
+
 /// A **constraint-DDL** statement routed to the engine thread (`rmp` task #99), where the constraint
 /// catalog lives (on the single-threaded coordinator). Like [`IndexCommand`] — and unlike the
 /// DATABASE admin commands, which act on the off-engine async catalog — constraint DDL must reach the
 /// [`graphus_cypher::TxnCoordinator`], so it travels as its own engine command.
 ///
-/// The name/label/property are validated/normalized by the admin matcher before this is built; the
-/// engine looks them up / interns them through the coordinator. Unlike an index, a constraint
-/// `CREATE` is **synchronous and validated** (it scans existing data and may fail) — there is no
-/// non-blocking build phase.
+/// Unlike an index, a constraint `CREATE` is **synchronous and validated** (it scans existing data and
+/// may fail) — there is no non-blocking build phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConstraintCommand {
-    /// `CREATE CONSTRAINT <name> FOR (n:<Label>) REQUIRE n.<prop> IS UNIQUE` (`rmp` task #99):
-    /// declares a **uniqueness** constraint after validating existing data conforms.
-    CreateUnique {
-        /// The server-unique constraint name.
-        name: String,
-        /// The node label the constraint covers.
-        label: String,
-        /// The property the constraint covers (exactly one in v1).
-        property: String,
-    },
-    /// `CREATE CONSTRAINT <name> FOR (n:<Label>) REQUIRE n.<prop> IS NOT NULL` (`rmp` task #99):
-    /// declares an **existence** (`NOT NULL`) constraint after validating existing data conforms.
-    CreateExistence {
-        /// The server-unique constraint name.
-        name: String,
-        /// The node label the constraint covers.
-        label: String,
-        /// The property the constraint covers (exactly one).
-        property: String,
-    },
-    /// `CREATE CONSTRAINT <name> FOR (n:<Label>) REQUIRE (n.a, n.b, …) IS NODE KEY` (`rmp` task #100):
-    /// declares a **node-key** constraint over a composite property tuple (present + unique) after
-    /// validating existing data conforms.
-    CreateNodeKey {
-        /// The server-unique constraint name.
-        name: String,
-        /// The node label the constraint covers.
-        label: String,
-        /// The properties forming the key, in declared order (one or more).
-        properties: Vec<String>,
-    },
-    /// `CREATE CONSTRAINT <name> FOR (n:<Label>) REQUIRE n.<prop> IS :: <TYPE>` (`rmp` task #100):
-    /// declares a **property-type** constraint requiring the covered property — when present — to hold
-    /// a value of `declared_type`, after validating existing data conforms.
-    CreatePropertyType {
-        /// The server-unique constraint name.
-        name: String,
-        /// The node label the constraint covers.
-        label: String,
-        /// The property the constraint covers (exactly one).
-        property: String,
-        /// The declared value type the property must match.
-        declared_type: graphus_storage::ConstraintTypeDescriptor,
-    },
-    /// `DROP CONSTRAINT <name>` (`rmp` task #99): removes the constraint (durable + in-memory), so the
-    /// write path stops enforcing it.
+    /// `CREATE [OR REPLACE] CONSTRAINT <name> [IF NOT EXISTS] FOR … REQUIRE … IS …` (`rmp` tasks #99,
+    /// #100, #638): declares a constraint after validating existing data conforms. See
+    /// [`CreateConstraint`].
+    Create(CreateConstraint),
+    /// `DROP CONSTRAINT <name> [IF EXISTS]` (`rmp` tasks #99, #638): removes the constraint (durable +
+    /// in-memory), so the write path stops enforcing it. With `if_exists`, a missing constraint is an
+    /// idempotent no-op success (`0` removed) rather than an error.
     Drop {
         /// The constraint name to drop.
         name: String,
+        /// Whether `IF EXISTS` was given (a missing constraint becomes a no-op success).
+        if_exists: bool,
     },
     /// `SHOW CONSTRAINTS` (`rmp` task #99): lists every declared constraint.
     Show,
@@ -593,12 +633,7 @@ pub fn constraint_ddl_summary(command: &ConstraintCommand, mutated: bool) -> Run
             query_type: Some("r".to_owned()),
             stats: Vec::new(),
         },
-        ConstraintCommand::CreateUnique { .. }
-        | ConstraintCommand::CreateExistence { .. }
-        | ConstraintCommand::CreateNodeKey { .. }
-        | ConstraintCommand::CreatePropertyType { .. } => {
-            schema_mutation_summary("constraints-added", mutated)
-        }
+        ConstraintCommand::Create(_) => schema_mutation_summary("constraints-added", mutated),
         ConstraintCommand::Drop { .. } => schema_mutation_summary("constraints-removed", mutated),
     }
 }
@@ -720,11 +755,16 @@ mod tests {
     #[test]
     fn constraint_ddl_summary_create_drop_show() {
         let create = constraint_ddl_summary(
-            &ConstraintCommand::CreateUnique {
+            &ConstraintCommand::Create(CreateConstraint {
                 name: "u".to_owned(),
-                label: "Person".to_owned(),
-                property: "email".to_owned(),
-            },
+                entity: ConstraintEntity::Node {
+                    label: "Person".to_owned(),
+                },
+                properties: vec!["email".to_owned()],
+                kind: ConstraintCreateKind::Unique,
+                if_not_exists: false,
+                or_replace: false,
+            }),
             true,
         );
         assert_eq!(create.query_type.as_deref(), Some("s"));
@@ -743,6 +783,7 @@ mod tests {
         let drop = constraint_ddl_summary(
             &ConstraintCommand::Drop {
                 name: "u".to_owned(),
+                if_exists: false,
             },
             true,
         );

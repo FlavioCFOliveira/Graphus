@@ -51,8 +51,9 @@ use graphus_wal::LogSink;
 pub use bulk_load::{BulkImportBatchInput, BulkImportBatchOutcome};
 pub use bulk_load_b::{BulkImportModeBChunkInput, BulkImportModeBChunkOutcome};
 pub use command::{
-    AccessMode, CheckpointReply, ConstraintCommand, EngineCommand, IndexCommand, IndexDdlReply,
-    NodePropertyIndexRef, RunReply, RunSummary,
+    AccessMode, CheckpointReply, ConstraintCommand, ConstraintCreateKind, ConstraintEntity,
+    CreateConstraint, EngineCommand, IndexCommand, IndexDdlReply, NodePropertyIndexRef, RunReply,
+    RunSummary,
 };
 pub use handle::{EngineHandle, ServerBusy};
 // `EngineDegraded` is defined in this module (below); re-export note: it is `pub` here.
@@ -2748,68 +2749,71 @@ fn handle_checkpoint<D: BlockDevice, S: LogSink>(
 /// Runs on the engine thread, so it may touch the (`!Send`) coordinator directly. Unlike index DDL
 /// there is no non-blocking build: a uniqueness constraint's backing index is (re)built synchronously
 /// inside `create_constraint`, which is acceptable because schema DDL is rare and serialised.
+/// Maps a parsed [`CreateConstraint`]'s `(entity, kind)` pair onto the durable
+/// [`ConstraintKind`] wire discriminant + optional type descriptor (`rmp` #638). Relationship
+/// entities select the reserved relationship discriminants; node entities the original four.
+fn constraint_storage_kind(
+    create: &CreateConstraint,
+) -> (
+    ConstraintKind,
+    Option<graphus_storage::ConstraintTypeDescriptor>,
+) {
+    let is_rel = create.entity.is_relationship();
+    match (&create.kind, is_rel) {
+        (ConstraintCreateKind::Unique, false) => (ConstraintKind::Unique, None),
+        (ConstraintCreateKind::Existence, false) => (ConstraintKind::Existence, None),
+        (ConstraintCreateKind::Key, false) => (ConstraintKind::NodeKey, None),
+        (ConstraintCreateKind::PropertyType { declared_type }, false) => {
+            (ConstraintKind::PropertyType, Some(declared_type.clone()))
+        }
+        (ConstraintCreateKind::Unique, true) => (ConstraintKind::RelUnique, None),
+        (ConstraintCreateKind::Existence, true) => (ConstraintKind::RelExistence, None),
+        (ConstraintCreateKind::Key, true) => (ConstraintKind::RelKey, None),
+        (ConstraintCreateKind::PropertyType { declared_type }, true) => {
+            (ConstraintKind::RelPropertyType, Some(declared_type.clone()))
+        }
+    }
+}
+
 fn handle_constraint_ddl<D: BlockDevice, S: LogSink>(
     coordinator: &mut TxnCoordinator<D, S>,
     command: &ConstraintCommand,
 ) -> Result<IndexDdlReply> {
     match command {
-        ConstraintCommand::CreateUnique {
-            name,
-            label,
-            property,
-        } => {
-            coordinator.create_constraint(name, label, property, ConstraintKind::Unique)?;
-            Ok(IndexDdlReply::mutation(true))
-        }
-        ConstraintCommand::CreateExistence {
-            name,
-            label,
-            property,
-        } => {
-            coordinator.create_constraint(name, label, property, ConstraintKind::Existence)?;
-            Ok(IndexDdlReply::mutation(true))
-        }
-        ConstraintCommand::CreateNodeKey {
-            name,
-            label,
-            properties,
-        } => {
-            let props: Vec<&str> = properties.iter().map(String::as_str).collect();
-            coordinator.create_constraint_general(
-                name,
-                label,
+        ConstraintCommand::Create(create) => {
+            let (kind, descriptor) = constraint_storage_kind(create);
+            let props: Vec<&str> = create.properties.iter().map(String::as_str).collect();
+            // The idempotent entry point (`rmp` #638) handles `IF NOT EXISTS` (equivalent existing →
+            // no-op, `mutated == false`) and `OR REPLACE` (drop same-named then create) around the
+            // synchronous validate-and-declare path.
+            let mutated = coordinator.create_constraint_ddl(
+                &create.name,
+                create.entity.covering_name(),
                 &props,
-                ConstraintKind::NodeKey,
-                None,
+                kind,
+                descriptor,
+                create.if_not_exists,
+                create.or_replace,
             )?;
-            Ok(IndexDdlReply::mutation(true))
+            Ok(IndexDdlReply::mutation(mutated))
         }
-        ConstraintCommand::CreatePropertyType {
-            name,
-            label,
-            property,
-            declared_type,
-        } => {
-            coordinator.create_constraint_general(
-                name,
-                label,
-                &[property],
-                ConstraintKind::PropertyType,
-                Some(declared_type.clone()),
-            )?;
-            Ok(IndexDdlReply::mutation(true))
-        }
-        ConstraintCommand::Drop { name } => {
-            // `mutated == false` is a no-op drop of a missing constraint → 0 removed.
+        ConstraintCommand::Drop { name, if_exists } => {
+            // `mutated == false` is a no-op drop of a missing constraint → 0 removed. With `IF EXISTS`
+            // a missing constraint is always a clean no-op; without it the current behaviour is
+            // likewise lenient (a missing constraint is a no-op success — see `drop_constraint`).
+            let _ = if_exists;
             let mutated = coordinator.drop_constraint(name)?;
             Ok(IndexDdlReply::mutation(mutated))
         }
         ConstraintCommand::Show => {
+            // `label` carries the covered node label or relationship type; `entityType` (`rmp` #638)
+            // disambiguates them (`NODE` / `RELATIONSHIP`), matching Neo4j's `SHOW CONSTRAINTS` column.
             let fields = vec![
                 "name".to_owned(),
                 "label".to_owned(),
                 "property".to_owned(),
                 "type".to_owned(),
+                "entityType".to_owned(),
             ];
             let rows = coordinator
                 .list_constraints()
@@ -2817,26 +2821,43 @@ fn handle_constraint_ddl<D: BlockDevice, S: LogSink>(
                 .map(|info| {
                     // Neo4j-compatible `type` strings for `SHOW CONSTRAINTS`. A property-type constraint
                     // additionally appends its declared type (e.g. `NODE_PROPERTY_TYPE INTEGER`) so the
-                    // declared type is visible in the listing.
+                    // declared type is visible in the listing. `rmp` #638 adds the relationship kinds.
+                    let type_string = |suffix: &str| match &info.type_descriptor {
+                        Some(d) => {
+                            format!(
+                                "{suffix} {}",
+                                graphus_cypher::constraint::type_descriptor_name(d)
+                            )
+                        }
+                        None => suffix.to_owned(),
+                    };
                     let kind = match info.kind {
                         ConstraintKind::Unique => "UNIQUENESS".to_owned(),
                         ConstraintKind::Existence => "NODE_PROPERTY_EXISTENCE".to_owned(),
                         ConstraintKind::NodeKey => "NODE_KEY".to_owned(),
-                        ConstraintKind::PropertyType => match &info.type_descriptor {
-                            Some(d) => format!(
-                                "NODE_PROPERTY_TYPE {}",
-                                graphus_cypher::constraint::type_descriptor_name(d)
-                            ),
-                            None => "NODE_PROPERTY_TYPE".to_owned(),
-                        },
+                        ConstraintKind::PropertyType => type_string("NODE_PROPERTY_TYPE"),
+                        ConstraintKind::RelUnique => "RELATIONSHIP_UNIQUENESS".to_owned(),
+                        ConstraintKind::RelExistence => {
+                            "RELATIONSHIP_PROPERTY_EXISTENCE".to_owned()
+                        }
+                        ConstraintKind::RelKey => "RELATIONSHIP_KEY".to_owned(),
+                        ConstraintKind::RelPropertyType => {
+                            type_string("RELATIONSHIP_PROPERTY_TYPE")
+                        }
                     };
-                    // A composite node key lists its whole tuple, comma-separated.
+                    let entity_type = if info.kind.is_relationship() {
+                        "RELATIONSHIP"
+                    } else {
+                        "NODE"
+                    };
+                    // A composite key lists its whole tuple, comma-separated.
                     let property = info.properties.join(", ");
                     vec![
                         Value::String(info.name),
                         Value::String(info.label),
                         Value::String(property),
                         Value::String(kind),
+                        Value::String(entity_type.to_owned()),
                     ]
                 })
                 .collect();

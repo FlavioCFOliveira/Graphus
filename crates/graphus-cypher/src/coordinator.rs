@@ -55,10 +55,13 @@ use graphus_txn::{CommitRegistry, IsolationLevel, LockTable, Snapshot, SsiReadBu
 use graphus_wal::LogSink;
 
 use crate::catalog::IndexCatalog;
-use crate::constraint::ConstraintViolation;
+use crate::constraint::{ConstraintViolation, ViolationEntity};
 use crate::index_set::IndexSet;
 use crate::record_graph::RecordStoreGraph;
-use crate::schema_error::{equivalent_index_exists, index_drop_not_found, index_name_in_use};
+use crate::schema_error::{
+    constraint_name_in_use, equivalent_constraint_exists, equivalent_index_exists,
+    index_drop_not_found, index_name_in_use,
+};
 use crate::statistics::Statistics;
 use crate::store_statistics;
 
@@ -305,6 +308,17 @@ pub fn auto_index_name(label: &str, property: &str) -> String {
         sanitize_identifier(label),
         sanitize_identifier(property)
     )
+}
+
+/// The token namespace a constraint's covering name lives in (`rmp` #638): a node label for the
+/// node kinds, a relationship type for the relationship kinds. Used by the `IF NOT EXISTS`
+/// equivalence check to resolve the covering token in the right namespace.
+fn constraint_covering_namespace(kind: ConstraintKind) -> Namespace {
+    if kind.is_relationship() {
+        Namespace::RelType
+    } else {
+        Namespace::Label
+    }
 }
 
 /// Maps every character outside the identifier charset `[A-Za-z0-9_]` to `_`, so an auto-generated
@@ -687,7 +701,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     ConstraintKind::NodeKey => {
                         idx.register_composite(entry.label_token, entry.property_tokens.clone());
                     }
-                    ConstraintKind::Existence | ConstraintKind::PropertyType => {}
+                    // No backing index: pure per-node predicates, and every relationship constraint
+                    // (`rmp` #638, scan-based enforcement).
+                    ConstraintKind::Existence
+                    | ConstraintKind::PropertyType
+                    | ConstraintKind::RelUnique
+                    | ConstraintKind::RelExistence
+                    | ConstraintKind::RelKey
+                    | ConstraintKind::RelPropertyType => {}
                 }
             }
         }
@@ -2160,6 +2181,100 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             .collect()
     }
 
+    /// Idempotency-aware `CREATE CONSTRAINT` entry point (`rmp` #638): wraps
+    /// [`create_constraint_general`](Self::create_constraint_general) with `IF NOT EXISTS` and
+    /// `OR REPLACE` handling, returning whether the schema was **actually mutated** (which drives the
+    /// DDL summary's `constraints-added` counter — a no-op reports `0`).
+    ///
+    /// * `or_replace` — drop any same-named constraint first, then create; a replace always mutates
+    ///   (`Ok(true)`). A **Graphus superset** of the Neo4j constraint surface (which offers only
+    ///   `IF NOT EXISTS`).
+    /// * `if_not_exists` — if a constraint with the same `name`, or an **equivalent** one (same
+    ///   covering token + property tuple + kind + declared type, possibly under another name), already
+    ///   exists, this is an idempotent no-op success (`Ok(false)`); otherwise it creates (`Ok(true)`).
+    /// * neither — create, surfacing a name-in-use error on a colliding name.
+    ///
+    /// `covering` is the label name (node kinds) or the relationship-type name (relationship kinds);
+    /// the namespace is derived from `kind`.
+    ///
+    /// # Errors
+    /// Propagates any [`create_constraint_general`](Self::create_constraint_general) or
+    /// [`drop_constraint`](Self::drop_constraint) error (a constraint violation or storage fault); on
+    /// any error the schema is left unchanged (the drop-then-create is not atomic across the two, but
+    /// each step is individually transactional, and a failed create after a successful `OR REPLACE`
+    /// drop leaves the name free — matching the operator's intent to replace).
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_constraint_ddl(
+        &mut self,
+        name: &str,
+        covering: &str,
+        properties: &[&str],
+        kind: ConstraintKind,
+        type_descriptor: Option<ConstraintTypeDescriptor>,
+        if_not_exists: bool,
+        or_replace: bool,
+    ) -> Result<bool> {
+        if or_replace {
+            // Drop any existing constraint of this name, then (re)create. A replace always mutates.
+            let _ = self.drop_constraint(name)?;
+            self.create_constraint_general(name, covering, properties, kind, type_descriptor)?;
+            return Ok(true);
+        }
+        // Detect any conflict once (read-only): a same-name constraint, or an equivalent-schema one.
+        let name_taken = self.store.borrow().constraint(name).is_some();
+        let schema_taken =
+            self.constraint_schema_exists(covering, properties, kind, type_descriptor.as_ref());
+        if if_not_exists {
+            // `IF NOT EXISTS`: an equivalent existing constraint (by name or schema) is a no-op.
+            if name_taken || schema_taken {
+                return Ok(false); // idempotent no-op: nothing added.
+            }
+        } else {
+            // Plain `CREATE CONSTRAINT`: a same-name or same-schema constraint is a conflict (matching
+            // Neo4j, which requires `IF NOT EXISTS`/`OR REPLACE` to reconcile). This is what makes
+            // `IF NOT EXISTS` semantically meaningful.
+            if name_taken {
+                return Err(constraint_name_in_use(name));
+            }
+            if schema_taken {
+                return Err(equivalent_constraint_exists(covering, properties));
+            }
+        }
+        self.create_constraint_general(name, covering, properties, kind, type_descriptor)?;
+        Ok(true)
+    }
+
+    /// Whether a constraint with the **same schema** — covering token + property tuple + kind + type
+    /// descriptor (possibly under a different name) — already exists (`rmp` #638). Read-only; an absent
+    /// covering/property token means the covered label/type or property has never been seen, so no such
+    /// schema exists yet.
+    fn constraint_schema_exists(
+        &self,
+        covering: &str,
+        properties: &[&str],
+        kind: ConstraintKind,
+        type_descriptor: Option<&ConstraintTypeDescriptor>,
+    ) -> bool {
+        let store = self.store.borrow();
+        let namespace = constraint_covering_namespace(kind);
+        let Some(covering_token) = store.token_id(namespace, covering) else {
+            return false;
+        };
+        let mut prop_tokens = Vec::with_capacity(properties.len());
+        for p in properties {
+            match store.token_id(Namespace::PropKey, p) {
+                Some(t) => prop_tokens.push(t),
+                None => return false,
+            }
+        }
+        store.constraints().into_iter().any(|(_n, entry)| {
+            entry.label_token == covering_token
+                && entry.property_tokens == prop_tokens
+                && entry.kind == kind
+                && entry.type_descriptor.as_ref() == type_descriptor
+        })
+    }
+
     /// Declares a **constraint** named `name` over `(label, property)` of `kind`, **validating it
     /// against existing data first** and only then **durably recording it** (`rmp` task #99) — the
     /// constraint analogue of [`create_point_index`](Self::create_point_index), but synchronous and
@@ -2237,10 +2352,17 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let txn = TxnId(self.next_txn_id);
         self.store.borrow_mut().begin(txn);
 
-        // Intern the label + every property-key token (rolled back with the transaction on any failure).
+        // Intern the covering token — a node **label** for the node kinds, a relationship **type** for
+        // the `Rel*` kinds (`rmp` #638) — plus every property-key token (rolled back with the
+        // transaction on any failure).
+        let covering_ns = if kind.is_relationship() {
+            Namespace::RelType
+        } else {
+            Namespace::Label
+        };
         let intern = (|| -> Result<(u32, Vec<u32>)> {
             let mut store = self.store.borrow_mut();
-            let label_token = store.intern_token(Namespace::Label, label)?;
+            let label_token = store.intern_token(covering_ns, label)?;
             let mut prop_keys = Vec::with_capacity(properties.len());
             for property in properties {
                 prop_keys.push(store.intern_token(Namespace::PropKey, property)?);
@@ -2257,16 +2379,30 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
 
         // Validate existing data BEFORE recording anything. A violation rolls back the whole
         // transaction (so the interned tokens never become durable for a rejected create) and reports
-        // the offending node precisely.
-        if let Err(e) = self.validate_existing_against_constraint(
-            name,
-            label,
-            properties,
-            label_token,
-            &prop_keys,
-            kind,
-            type_descriptor.as_ref(),
-        ) {
+        // the offending entity precisely. Relationship constraints scan relationships of the type; node
+        // constraints scan nodes carrying the label.
+        let validation = if kind.is_relationship() {
+            self.validate_existing_rels_against_constraint(
+                name,
+                label,
+                properties,
+                label_token,
+                &prop_keys,
+                kind,
+                type_descriptor.as_ref(),
+            )
+        } else {
+            self.validate_existing_against_constraint(
+                name,
+                label,
+                properties,
+                label_token,
+                &prop_keys,
+                kind,
+                type_descriptor.as_ref(),
+            )
+        };
+        if let Err(e) = validation {
             let _ = self.store.borrow_mut().rollback(txn);
             return Err(e);
         }
@@ -2306,7 +2442,16 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     idx.register_composite(label_token, prop_keys.clone());
                     true
                 }
-                ConstraintKind::Existence | ConstraintKind::PropertyType => false,
+                // Existence + property-type are pure per-entity predicates; relationship constraints
+                // (`rmp` #638) have no backing index either — their uniqueness/key checks scan the
+                // relationships of the type at write time (there is no durable relationship-property
+                // index yet). None of these need an index rebuild.
+                ConstraintKind::Existence
+                | ConstraintKind::PropertyType
+                | ConstraintKind::RelUnique
+                | ConstraintKind::RelExistence
+                | ConstraintKind::RelKey
+                | ConstraintKind::RelPropertyType => false,
             }
         };
         if needs_rebuild {
@@ -2356,6 +2501,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     if value.as_ref().is_none_or(graphus_core::Value::is_null) {
                         return Err(ConstraintViolation::Existence {
                             name: name.to_owned(),
+                            entity: ViolationEntity::Node,
                             label: label.to_owned(),
                             property: properties[0].to_owned(),
                         }
@@ -2377,6 +2523,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     {
                         return Err(ConstraintViolation::Uniqueness {
                             name: name.to_owned(),
+                            entity: ViolationEntity::Node,
                             label: label.to_owned(),
                             property: properties[0].to_owned(),
                             value: render_value(&value),
@@ -2404,6 +2551,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     if !complete {
                         return Err(ConstraintViolation::NodeKeyMissing {
                             name: name.to_owned(),
+                            entity: ViolationEntity::Node,
                             label: label.to_owned(),
                             properties: properties.iter().map(|p| (*p).to_owned()).collect(),
                         }
@@ -2413,6 +2561,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     if seen_tuples.iter().any(|seen| tuples_equal(seen, &tuple)) {
                         return Err(ConstraintViolation::NodeKeyDuplicate {
                             name: name.to_owned(),
+                            entity: ViolationEntity::Node,
                             label: label.to_owned(),
                             properties: properties.iter().map(|p| (*p).to_owned()).collect(),
                             values: render_tuple(&tuple),
@@ -2435,6 +2584,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     if !crate::constraint::value_matches_descriptor(&value, descriptor) {
                         return Err(ConstraintViolation::PropertyType {
                             name: name.to_owned(),
+                            entity: ViolationEntity::Node,
                             label: label.to_owned(),
                             property: properties[0].to_owned(),
                             expected: crate::constraint::type_descriptor_name(descriptor),
@@ -2443,6 +2593,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                         .into_error());
                     }
                 }
+                // The relationship kinds are validated by `validate_existing_rels_against_constraint`;
+                // the caller never routes them here, so treat them as "no node violation".
+                ConstraintKind::RelUnique
+                | ConstraintKind::RelExistence
+                | ConstraintKind::RelKey
+                | ConstraintKind::RelPropertyType => continue,
             }
         }
         Ok(())
@@ -2457,6 +2613,158 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             .into_iter()
             .find(|(_pid, key, _value)| *key == prop_key)
             .map(|(_pid, _key, value)| value)
+    }
+
+    /// The newest value relationship `id` holds for property-key token `prop_key` (`rmp` #638), or
+    /// [`None`] if the relationship has no such property (or a read fault occurs). The relationship
+    /// analogue of [`node_value_for_key`](Self::node_value_for_key).
+    fn rel_value_for_key(&self, id: u64, prop_key: u32) -> Option<Value> {
+        let chain = self.store.borrow().rel_property_values(id).ok()?;
+        chain
+            .into_iter()
+            .find(|(_pid, key, _value)| *key == prop_key)
+            .map(|(_pid, _key, value)| value)
+    }
+
+    /// Scans every currently-slot-occupied relationship of the type token `type_token` and rejects if
+    /// any violates the relationship constraint of `kind` on `prop_keys` (`rmp` #638) — the
+    /// relationship analogue of
+    /// [`validate_existing_against_constraint`](Self::validate_existing_against_constraint). Used by
+    /// [`create_constraint_general`](Self::create_constraint_general) to refuse a relationship
+    /// constraint that existing data does not satisfy. No-op success when no relationship carries the
+    /// type. A relationship whose record cannot be read is skipped best-effort (matching the node path).
+    ///
+    /// # Errors
+    /// Returns a [`ConstraintViolation`]-wrapped runtime error (with `entity: Relationship`) naming the
+    /// first offending relationship / duplicate value.
+    #[allow(clippy::too_many_arguments)]
+    fn validate_existing_rels_against_constraint(
+        &self,
+        name: &str,
+        rel_type: &str,
+        properties: &[&str],
+        type_token: u32,
+        prop_keys: &[u32],
+        kind: ConstraintKind,
+        type_descriptor: Option<&ConstraintTypeDescriptor>,
+    ) -> Result<()> {
+        let rel_ids = self.store.borrow().scan_rel_ids()?;
+        // Single-property uniqueness: values seen so far, to detect a duplicate.
+        let mut seen: Vec<(Value, u64)> = Vec::new();
+        // Composite key uniqueness: full tuples seen so far.
+        let mut seen_tuples: Vec<Vec<Value>> = Vec::new();
+        for id in rel_ids {
+            // Read this relationship's type token; skip a read-faulting slot best-effort.
+            let this_type = match self.store.borrow().rel(id) {
+                Ok(r) => r.type_id,
+                Err(_) => continue,
+            };
+            if this_type != type_token {
+                continue; // relationship does not carry the covered type
+            }
+            match kind {
+                ConstraintKind::RelExistence => {
+                    let value = self.rel_value_for_key(id, prop_keys[0]);
+                    if value.as_ref().is_none_or(graphus_core::Value::is_null) {
+                        return Err(ConstraintViolation::Existence {
+                            name: name.to_owned(),
+                            entity: ViolationEntity::Relationship,
+                            label: rel_type.to_owned(),
+                            property: properties[0].to_owned(),
+                        }
+                        .into_error());
+                    }
+                }
+                ConstraintKind::RelUnique => {
+                    let Some(value) = self
+                        .rel_value_for_key(id, prop_keys[0])
+                        .filter(|v| !v.is_null())
+                    else {
+                        continue;
+                    };
+                    if seen
+                        .iter()
+                        .any(|(v, _)| crate::equality::equals(v, &value).is_true())
+                    {
+                        return Err(ConstraintViolation::Uniqueness {
+                            name: name.to_owned(),
+                            entity: ViolationEntity::Relationship,
+                            label: rel_type.to_owned(),
+                            property: properties[0].to_owned(),
+                            value: render_value(&value),
+                        }
+                        .into_error());
+                    }
+                    seen.push((value, id));
+                }
+                ConstraintKind::RelKey => {
+                    // Existence half: every covered property must be present and non-null.
+                    let mut tuple = Vec::with_capacity(prop_keys.len());
+                    let mut complete = true;
+                    for &prop_key in prop_keys {
+                        match self
+                            .rel_value_for_key(id, prop_key)
+                            .filter(|v| !v.is_null())
+                        {
+                            Some(v) => tuple.push(v),
+                            None => {
+                                complete = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !complete {
+                        return Err(ConstraintViolation::NodeKeyMissing {
+                            name: name.to_owned(),
+                            entity: ViolationEntity::Relationship,
+                            label: rel_type.to_owned(),
+                            properties: properties.iter().map(|p| (*p).to_owned()).collect(),
+                        }
+                        .into_error());
+                    }
+                    // Uniqueness half: the complete tuple must not have been seen before.
+                    if seen_tuples.iter().any(|seen| tuples_equal(seen, &tuple)) {
+                        return Err(ConstraintViolation::NodeKeyDuplicate {
+                            name: name.to_owned(),
+                            entity: ViolationEntity::Relationship,
+                            label: rel_type.to_owned(),
+                            properties: properties.iter().map(|p| (*p).to_owned()).collect(),
+                            values: render_tuple(&tuple),
+                        }
+                        .into_error());
+                    }
+                    seen_tuples.push(tuple);
+                }
+                ConstraintKind::RelPropertyType => {
+                    let Some(value) = self
+                        .rel_value_for_key(id, prop_keys[0])
+                        .filter(|v| !v.is_null())
+                    else {
+                        continue;
+                    };
+                    let descriptor = type_descriptor
+                        .expect("INVARIANT: a PropertyType constraint always carries a descriptor");
+                    if !crate::constraint::value_matches_descriptor(&value, descriptor) {
+                        return Err(ConstraintViolation::PropertyType {
+                            name: name.to_owned(),
+                            entity: ViolationEntity::Relationship,
+                            label: rel_type.to_owned(),
+                            property: properties[0].to_owned(),
+                            expected: crate::constraint::type_descriptor_name(descriptor),
+                            actual: crate::constraint::value_type_name(&value),
+                        }
+                        .into_error());
+                    }
+                }
+                // The node kinds are validated by `validate_existing_against_constraint`; the caller
+                // never routes them here.
+                ConstraintKind::Unique
+                | ConstraintKind::Existence
+                | ConstraintKind::NodeKey
+                | ConstraintKind::PropertyType => continue,
+            }
+        }
+        Ok(())
     }
 
     /// Drops the constraint named `name` (`rmp` tasks #99, #100): removes its durable catalog entry in
@@ -2505,7 +2813,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             .constraints()
             .into_iter()
             .filter_map(|(name, entry)| {
-                let label = store.token_name(Namespace::Label, entry.label_token)?;
+                // Resolve the covering token in its namespace — a relationship type for the `Rel*`
+                // kinds (`rmp` #638), a node label otherwise.
+                let covering_ns = constraint_covering_namespace(entry.kind);
+                let label = store.token_name(covering_ns, entry.label_token)?;
                 // Resolve every covered property token's name (one for non-composite kinds, the whole
                 // tuple for a node key). A token with no resolvable name skips the whole entry.
                 let mut properties = Vec::with_capacity(entry.property_tokens.len());

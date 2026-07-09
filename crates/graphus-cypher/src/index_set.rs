@@ -468,15 +468,32 @@ impl IndexSet {
         self.constraints.contains_key(name)
     }
 
-    /// The constraint rules that apply to `label_token` (`rmp` task #99): every registered constraint
-    /// whose covered label is `label_token`. Used by the write path to enforce only the relevant rules
-    /// for a node carrying that label. Returned by value (cloned) so the caller does not hold the
-    /// `IndexSet` borrow across the per-rule store re-checks.
+    /// The **node** constraint rules that apply to `label_token` (`rmp` task #99): every registered
+    /// node constraint whose covered label is `label_token`. Used by the write path to enforce only the
+    /// relevant rules for a node carrying that label. The `!is_relationship()` guard is load-bearing
+    /// (`rmp` #638): a relationship constraint's covering token is a relationship-**type** token whose
+    /// numeric value can coincide with a node label token, so filtering by token value alone would
+    /// wrongly apply a relationship rule to a node. Returned by value (cloned) so the caller does not
+    /// hold the `IndexSet` borrow across the per-rule store re-checks.
     #[must_use]
     pub fn constraints_for_label(&self, label_token: u32) -> Vec<ConstraintRule> {
         self.constraints
             .values()
-            .filter(|rule| rule.label_token == label_token)
+            .filter(|rule| rule.label_token == label_token && !rule.kind.is_relationship())
+            .cloned()
+            .collect()
+    }
+
+    /// The **relationship** constraint rules that apply to `type_token` (`rmp` #638): every registered
+    /// relationship constraint whose covered relationship type is `type_token` — the relationship
+    /// analogue of [`constraints_for_label`](Self::constraints_for_label). The `is_relationship()`
+    /// guard keeps a node rule (whose label token could share the numeric value) from being applied to
+    /// a relationship.
+    #[must_use]
+    pub fn constraints_for_rel_type(&self, type_token: u32) -> Vec<ConstraintRule> {
+        self.constraints
+            .values()
+            .filter(|rule| rule.label_token == type_token && rule.kind.is_relationship())
             .cloned()
             .collect()
     }

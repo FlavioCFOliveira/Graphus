@@ -23,7 +23,10 @@ use graphus_cypher::{CONSTRAINT_VIOLATION_PREFIX, MaterializedValue};
 use graphus_server::config::{
     AdmissionConfig, AuthBootstrap, ServerConfig, TimingConfig, TlsConfig,
 };
-use graphus_server::engine::{AccessMode, ConstraintCommand, EngineHandle, IndexDdlReply};
+use graphus_server::engine::{
+    AccessMode, ConstraintCommand, ConstraintCreateKind, ConstraintEntity, CreateConstraint,
+    EngineHandle, IndexDdlReply,
+};
 use graphus_server::{Server, ServerHandle};
 
 struct TempStore {
@@ -162,28 +165,54 @@ async fn person_count(handle: &EngineHandle) -> i64 {
     }
 }
 
-fn create_unique(name: &str, label: &str, property: &str) -> ConstraintCommand {
-    ConstraintCommand::CreateUnique {
+/// Builds a node `CREATE CONSTRAINT` command (`rmp` #638 unified shape) with idempotency flags off.
+fn node_create(
+    name: &str,
+    label: &str,
+    properties: &[&str],
+    kind: ConstraintCreateKind,
+) -> ConstraintCommand {
+    ConstraintCommand::Create(CreateConstraint {
         name: name.to_owned(),
-        label: label.to_owned(),
-        property: property.to_owned(),
-    }
+        entity: ConstraintEntity::Node {
+            label: label.to_owned(),
+        },
+        properties: properties.iter().map(|p| (*p).to_owned()).collect(),
+        kind,
+        if_not_exists: false,
+        or_replace: false,
+    })
+}
+
+/// Builds a **relationship** `CREATE CONSTRAINT` command (`rmp` #638 unified shape).
+fn rel_create(
+    name: &str,
+    rel_type: &str,
+    properties: &[&str],
+    kind: ConstraintCreateKind,
+) -> ConstraintCommand {
+    ConstraintCommand::Create(CreateConstraint {
+        name: name.to_owned(),
+        entity: ConstraintEntity::Relationship {
+            rel_type: rel_type.to_owned(),
+        },
+        properties: properties.iter().map(|p| (*p).to_owned()).collect(),
+        kind,
+        if_not_exists: false,
+        or_replace: false,
+    })
+}
+
+fn create_unique(name: &str, label: &str, property: &str) -> ConstraintCommand {
+    node_create(name, label, &[property], ConstraintCreateKind::Unique)
 }
 
 fn create_existence(name: &str, label: &str, property: &str) -> ConstraintCommand {
-    ConstraintCommand::CreateExistence {
-        name: name.to_owned(),
-        label: label.to_owned(),
-        property: property.to_owned(),
-    }
+    node_create(name, label, &[property], ConstraintCreateKind::Existence)
 }
 
 fn create_node_key(name: &str, label: &str, properties: &[&str]) -> ConstraintCommand {
-    ConstraintCommand::CreateNodeKey {
-        name: name.to_owned(),
-        label: label.to_owned(),
-        properties: properties.iter().map(|p| (*p).to_owned()).collect(),
-    }
+    node_create(name, label, properties, ConstraintCreateKind::Key)
 }
 
 fn create_property_type(
@@ -192,12 +221,12 @@ fn create_property_type(
     property: &str,
     declared_type: graphus_storage::ConstraintTypeDescriptor,
 ) -> ConstraintCommand {
-    ConstraintCommand::CreatePropertyType {
-        name: name.to_owned(),
-        label: label.to_owned(),
-        property: property.to_owned(),
-        declared_type,
-    }
+    node_create(
+        name,
+        label,
+        &[property],
+        ConstraintCreateKind::PropertyType { declared_type },
+    )
 }
 
 async fn show_constraints(handle: &EngineHandle) -> IndexDdlReply {
@@ -346,7 +375,8 @@ async fn show_constraints_lists_declared_constraints() {
             "name".to_owned(),
             "label".to_owned(),
             "property".to_owned(),
-            "type".to_owned()
+            "type".to_owned(),
+            "entityType".to_owned(),
         ]
     );
     assert_eq!(reply.rows.len(), 2);
@@ -356,6 +386,7 @@ async fn show_constraints_lists_declared_constraints() {
         reply.rows[0][3],
         Value::String("NODE_PROPERTY_EXISTENCE".to_owned())
     );
+    assert_eq!(reply.rows[0][4], Value::String("NODE".to_owned()));
     assert_eq!(reply.rows[1][0], Value::String("uniq_email".to_owned()));
     assert_eq!(reply.rows[1][3], Value::String("UNIQUENESS".to_owned()));
 
@@ -380,6 +411,7 @@ async fn drop_constraint_removes_enforcement() {
     engine
         .constraint_ddl(ConstraintCommand::Drop {
             name: "uniq_email".to_owned(),
+            if_exists: false,
         })
         .await
         .expect("drop constraint");
@@ -699,4 +731,271 @@ async fn show_constraints_lists_all_four_kinds() {
     assert_eq!(reply.rows[3][3], Value::String("UNIQUENESS".to_owned()));
 
     handle.shutdown().await.expect("graceful shutdown");
+}
+
+/// `rmp` #638: `CREATE CONSTRAINT … IF NOT EXISTS` is an idempotent no-op when an equivalent
+/// constraint already exists — by the same name **or** the same schema — reporting `mutated == false`;
+/// creating a duplicate name **without** `IF NOT EXISTS` is an error.
+#[tokio::test]
+async fn create_constraint_if_not_exists_is_idempotent() {
+    let temp = TempStore::new("ifnotexists");
+    let handle = boot(config(&temp)).await;
+    let engine = handle.engine.clone();
+
+    // First create: mutates.
+    let first = engine
+        .constraint_ddl(create_unique("uniq_email", "Person", "email"))
+        .await
+        .expect("first create");
+    assert!(first.mutated, "the first create mutates the schema");
+
+    // Same-name IF NOT EXISTS: no-op.
+    let same_name = engine
+        .constraint_ddl(ConstraintCommand::Create(CreateConstraint {
+            name: "uniq_email".to_owned(),
+            entity: ConstraintEntity::Node {
+                label: "Person".to_owned(),
+            },
+            properties: vec!["email".to_owned()],
+            kind: ConstraintCreateKind::Unique,
+            if_not_exists: true,
+            or_replace: false,
+        }))
+        .await
+        .expect("if-not-exists same name");
+    assert!(!same_name.mutated, "an existing name is a no-op");
+
+    // Equivalent schema under a DIFFERENT name, with IF NOT EXISTS: still a no-op.
+    let same_schema = engine
+        .constraint_ddl(ConstraintCommand::Create(CreateConstraint {
+            name: "another_name".to_owned(),
+            entity: ConstraintEntity::Node {
+                label: "Person".to_owned(),
+            },
+            properties: vec!["email".to_owned()],
+            kind: ConstraintCreateKind::Unique,
+            if_not_exists: true,
+            or_replace: false,
+        }))
+        .await
+        .expect("if-not-exists same schema");
+    assert!(!same_schema.mutated, "an equivalent schema is a no-op");
+
+    // Still exactly one constraint.
+    assert_eq!(show_constraints(&engine).await.rows.len(), 1);
+
+    // A duplicate name WITHOUT IF NOT EXISTS is an error.
+    engine
+        .constraint_ddl(create_unique("uniq_email", "Person", "email"))
+        .await
+        .expect_err("duplicate name without IF NOT EXISTS is rejected");
+
+    handle.shutdown().await.expect("graceful shutdown");
+}
+
+/// `rmp` #638: `CREATE OR REPLACE CONSTRAINT` drops any same-named constraint and creates the new one,
+/// replacing a rule of a different kind and re-establishing enforcement for the new one.
+#[tokio::test]
+async fn create_or_replace_constraint_drops_and_recreates() {
+    let temp = TempStore::new("orreplace");
+    let handle = boot(config(&temp)).await;
+    let engine = handle.engine.clone();
+
+    // Start with an existence constraint named `c`.
+    engine
+        .constraint_ddl(create_existence("c", "Person", "email"))
+        .await
+        .expect("create existence");
+    // A node missing `email` is now rejected.
+    try_run(&engine, "CREATE (:Person {name: 'no-email'})")
+        .await
+        .expect_err("existence enforced");
+
+    // OR REPLACE the same name with a uniqueness rule.
+    let replaced = engine
+        .constraint_ddl(ConstraintCommand::Create(CreateConstraint {
+            name: "c".to_owned(),
+            entity: ConstraintEntity::Node {
+                label: "Person".to_owned(),
+            },
+            properties: vec!["email".to_owned()],
+            kind: ConstraintCreateKind::Unique,
+            if_not_exists: false,
+            or_replace: true,
+        }))
+        .await
+        .expect("or replace");
+    assert!(replaced.mutated, "OR REPLACE mutates");
+
+    // Exactly one constraint remains, and it is now the uniqueness rule.
+    let reply = show_constraints(&engine).await;
+    assert_eq!(reply.rows.len(), 1);
+    assert_eq!(reply.rows[0][0], Value::String("c".to_owned()));
+    assert_eq!(reply.rows[0][3], Value::String("UNIQUENESS".to_owned()));
+
+    // Existence is no longer enforced (a missing email is allowed) but uniqueness now is.
+    run(&engine, "CREATE (:Person {name: 'no-email'})").await;
+    run(&engine, "CREATE (:Person {email: 'a@x.com'})").await;
+    try_run(&engine, "CREATE (:Person {email: 'a@x.com'})")
+        .await
+        .expect_err("uniqueness enforced after replace");
+
+    handle.shutdown().await.expect("graceful shutdown");
+}
+
+/// `rmp` #638: a **relationship existence** constraint (`FOR ()-[r:KNOWS]-() REQUIRE r.since IS NOT
+/// NULL`) is enforced on `CREATE` and on `SET r.since = null`.
+#[tokio::test]
+async fn relationship_existence_enforced_on_create_and_set() {
+    let temp = TempStore::new("rel_existence");
+    let handle = boot(config(&temp)).await;
+    let engine = handle.engine.clone();
+
+    run(&engine, "CREATE (:Person {id: 1}), (:Person {id: 2})").await;
+    engine
+        .constraint_ddl(rel_create(
+            "knows_since",
+            "KNOWS",
+            &["since"],
+            ConstraintCreateKind::Existence,
+        ))
+        .await
+        .expect("create rel existence");
+
+    // A relationship with `since` is allowed.
+    run(
+        &engine,
+        "MATCH (a:Person {id: 1}), (b:Person {id: 2}) CREATE (a)-[:KNOWS {since: 2020}]->(b)",
+    )
+    .await;
+    // A relationship without `since` is rejected.
+    let err = try_run(
+        &engine,
+        "MATCH (a:Person {id: 1}), (b:Person {id: 2}) CREATE (a)-[:KNOWS]->(b)",
+    )
+    .await
+    .expect_err("existence enforced on create");
+    assert_constraint_violation(&err);
+
+    // Removing `since` from an existing relationship is rejected.
+    try_run(&engine, "MATCH ()-[r:KNOWS]->() SET r.since = null")
+        .await
+        .expect_err("existence enforced on set-null");
+
+    handle.shutdown().await.expect("graceful shutdown");
+}
+
+/// `rmp` #638: a **relationship key** constraint (`FOR ()-[r:RATED]-() REQUIRE (r.user, r.movie) IS
+/// RELATIONSHIP KEY`) enforces both the existence half (all covered properties present) and the
+/// uniqueness half (the tuple is unique across relationships of the type), including at creation-time
+/// validation against existing data.
+#[tokio::test]
+async fn relationship_key_enforced_and_creation_validation() {
+    let temp = TempStore::new("rel_key");
+    let handle = boot(config(&temp)).await;
+    let engine = handle.engine.clone();
+
+    run(&engine, "CREATE (:U {id: 1}), (:M {id: 10})").await;
+    engine
+        .constraint_ddl(rel_create(
+            "rated_key",
+            "RATED",
+            &["user", "movie"],
+            ConstraintCreateKind::Key,
+        ))
+        .await
+        .expect("create rel key");
+
+    // A complete tuple is allowed.
+    run(
+        &engine,
+        "MATCH (u:U {id: 1}), (m:M {id: 10}) CREATE (u)-[:RATED {user: 1, movie: 10, stars: 5}]->(m)",
+    )
+    .await;
+    // A missing covered property (existence half) is rejected.
+    try_run(
+        &engine,
+        "MATCH (u:U {id: 1}), (m:M {id: 10}) CREATE (u)-[:RATED {user: 1}]->(m)",
+    )
+    .await
+    .expect_err("rel-key existence half enforced");
+    // A duplicate tuple (uniqueness half) is rejected.
+    let err = try_run(
+        &engine,
+        "MATCH (u:U {id: 1}), (m:M {id: 10}) CREATE (u)-[:RATED {user: 1, movie: 10}]->(m)",
+    )
+    .await
+    .expect_err("rel-key uniqueness half enforced");
+    assert_constraint_violation(&err);
+
+    // Creation-time validation: a fresh constraint over data that already violates it is rejected.
+    run(
+        &engine,
+        "MATCH (u:U {id: 1}), (m:M {id: 10}) CREATE (u)-[:LINK {a: 1}]->(m), (u)-[:LINK {a: 1}]->(m)",
+    )
+    .await;
+    engine
+        .constraint_ddl(rel_create(
+            "link_unique",
+            "LINK",
+            &["a"],
+            ConstraintCreateKind::Unique,
+        ))
+        .await
+        .expect_err("creation-time validation rejects duplicate rel values");
+
+    handle.shutdown().await.expect("graceful shutdown");
+}
+
+/// `rmp` #638: relationship constraints are durable — they survive a full server restart (reloaded
+/// from the durable catalog and enforced again) — and `SHOW CONSTRAINTS` reports `entityType`
+/// `RELATIONSHIP`.
+#[tokio::test]
+async fn relationship_constraints_survive_restart_and_show_entity_type() {
+    let temp = TempStore::new("rel_restart");
+    let cfg = config(&temp);
+
+    {
+        let handle = boot(cfg.clone()).await;
+        let engine = handle.engine.clone();
+        run(&engine, "CREATE (:A {id: 1}), (:B {id: 2})").await;
+        engine
+            .constraint_ddl(rel_create(
+                "paid_ref",
+                "PAID",
+                &["ref"],
+                ConstraintCreateKind::Unique,
+            ))
+            .await
+            .expect("create rel unique");
+        // A SHOW reports the relationship entityType.
+        let reply = show_constraints(&engine).await;
+        assert_eq!(reply.rows.len(), 1);
+        assert_eq!(reply.rows[0][0], Value::String("paid_ref".to_owned()));
+        assert_eq!(
+            reply.rows[0][3],
+            Value::String("RELATIONSHIP_UNIQUENESS".to_owned())
+        );
+        assert_eq!(reply.rows[0][4], Value::String("RELATIONSHIP".to_owned()));
+        run(
+            &engine,
+            "MATCH (a:A {id: 1}), (b:B {id: 2}) CREATE (a)-[:PAID {ref: 'x'}]->(b)",
+        )
+        .await;
+        handle.shutdown().await.expect("graceful shutdown");
+    }
+
+    // Restart: the relationship constraint is reloaded and still enforced.
+    {
+        let handle = boot(cfg).await;
+        let engine = handle.engine.clone();
+        assert_eq!(show_constraints(&engine).await.rows.len(), 1);
+        try_run(
+            &engine,
+            "MATCH (a:A {id: 1}), (b:B {id: 2}) CREATE (a)-[:PAID {ref: 'x'}]->(b)",
+        )
+        .await
+        .expect_err("rel uniqueness enforced after restart");
+        handle.shutdown().await.expect("graceful shutdown");
+    }
 }

@@ -35,61 +35,103 @@ use graphus_storage::{ConstraintKind, ConstraintTypeDescriptor};
 /// detects + strips it from the `FAILURE` message it sends.
 pub use graphus_core::CONSTRAINT_VIOLATION_PREFIX;
 
-/// A declared constraint a write would violate (`rmp` task #99). Carries enough context to render a
-/// precise, human message naming the constraint, the label, the property and the offending value.
+/// Whether a violated constraint covers **nodes** or **relationships** (`rmp` #638), for
+/// entity-aware message rendering. The `token` in [`render`](Self::render) is the covered node label
+/// or relationship type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViolationEntity {
+    /// A node constraint (`FOR (n:Label)`) — the token is a node label.
+    Node,
+    /// A relationship constraint (`FOR ()-[r:TYPE]-()`) — the token is a relationship type.
+    Relationship,
+}
+
+impl ViolationEntity {
+    /// Renders the entity reference for a message: `Node(:Label)` or `Relationship[:TYPE]`.
+    #[must_use]
+    fn render(self, token: &str) -> String {
+        match self {
+            Self::Node => format!("Node(:{token})"),
+            Self::Relationship => format!("Relationship[:{token}]"),
+        }
+    }
+
+    /// The constraint-kind label word for a message: `"node-key"` / `"relationship-key"`, etc.
+    #[must_use]
+    fn word(self) -> &'static str {
+        match self {
+            Self::Node => "node",
+            Self::Relationship => "relationship",
+        }
+    }
+}
+
+/// A declared constraint a write would violate (`rmp` task #99, #638). Carries enough context to
+/// render a precise, human message naming the constraint, the covered entity (node label or
+/// relationship type), the property and the offending value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConstraintViolation {
-    /// A **uniqueness** constraint was violated: a node carrying `label` already holds `value` for
+    /// A **uniqueness** constraint was violated: an entity of `label` already holds `value` for
     /// `property`, so a second one cannot.
     Uniqueness {
         /// The declared constraint's name.
         name: String,
-        /// The covered node label.
+        /// Whether the covered entity is a node or a relationship.
+        entity: ViolationEntity,
+        /// The covered node label / relationship type.
         label: String,
         /// The covered property key.
         property: String,
         /// A short rendering of the duplicate value (for the human message).
         value: String,
     },
-    /// An **existence** (`NOT NULL`) constraint was violated: a node carrying `label` lacks the
-    /// required `property` (or set it to null).
+    /// An **existence** (`NOT NULL`) constraint was violated: an entity of `label` lacks the required
+    /// `property` (or set it to null).
     Existence {
         /// The declared constraint's name.
         name: String,
-        /// The covered node label.
+        /// Whether the covered entity is a node or a relationship.
+        entity: ViolationEntity,
+        /// The covered node label / relationship type.
         label: String,
         /// The required property key.
         property: String,
     },
-    /// A **node-key** constraint was violated because the covered composite tuple is **incomplete**: a
-    /// node carrying `label` lacks (or nulled) at least one of the key's `properties` (`rmp` task #100).
+    /// A **key** constraint was violated because the covered composite tuple is **incomplete**: an
+    /// entity of `label` lacks (or nulled) at least one of the key's `properties` (`rmp` task #100).
     NodeKeyMissing {
         /// The declared constraint's name.
         name: String,
-        /// The covered node label.
+        /// Whether the covered entity is a node or a relationship.
+        entity: ViolationEntity,
+        /// The covered node label / relationship type.
         label: String,
         /// The key's covered properties, in declared order.
         properties: Vec<String>,
     },
-    /// A **node-key** constraint was violated because the covered composite tuple is **not unique**:
-    /// another node carrying `label` already holds the same tuple of `properties` values (`rmp` task
+    /// A **key** constraint was violated because the covered composite tuple is **not unique**:
+    /// another entity of `label` already holds the same tuple of `properties` values (`rmp` task
     /// #100).
     NodeKeyDuplicate {
         /// The declared constraint's name.
         name: String,
-        /// The covered node label.
+        /// Whether the covered entity is a node or a relationship.
+        entity: ViolationEntity,
+        /// The covered node label / relationship type.
         label: String,
         /// The key's covered properties, in declared order.
         properties: Vec<String>,
         /// A short rendering of the duplicate composite tuple (for the human message).
         values: String,
     },
-    /// A **property-type** constraint was violated: a node carrying `label` holds a value for
-    /// `property` whose type is `actual`, but the constraint requires `expected` (`rmp` task #100).
+    /// A **property-type** constraint was violated: an entity of `label` holds a value for `property`
+    /// whose type is `actual`, but the constraint requires `expected` (`rmp` task #100).
     PropertyType {
         /// The declared constraint's name.
         name: String,
-        /// The covered node label.
+        /// Whether the covered entity is a node or a relationship.
+        entity: ViolationEntity,
+        /// The covered node label / relationship type.
         label: String,
         /// The covered property key.
         property: String,
@@ -101,13 +143,50 @@ pub enum ConstraintViolation {
 }
 
 impl ConstraintViolation {
-    /// The constraint kind this violation concerns.
-    pub fn kind(&self) -> ConstraintKind {
+    /// The covered entity of this violation (`rmp` #638).
+    fn entity(&self) -> ViolationEntity {
         match self {
-            Self::Uniqueness { .. } => ConstraintKind::Unique,
-            Self::Existence { .. } => ConstraintKind::Existence,
-            Self::NodeKeyMissing { .. } | Self::NodeKeyDuplicate { .. } => ConstraintKind::NodeKey,
-            Self::PropertyType { .. } => ConstraintKind::PropertyType,
+            Self::Uniqueness { entity, .. }
+            | Self::Existence { entity, .. }
+            | Self::NodeKeyMissing { entity, .. }
+            | Self::NodeKeyDuplicate { entity, .. }
+            | Self::PropertyType { entity, .. } => *entity,
+        }
+    }
+
+    /// The constraint kind this violation concerns — the node or relationship discriminant per the
+    /// covered [`entity`](Self::entity) (`rmp` #638).
+    pub fn kind(&self) -> ConstraintKind {
+        let rel = self.entity() == ViolationEntity::Relationship;
+        match self {
+            Self::Uniqueness { .. } => {
+                if rel {
+                    ConstraintKind::RelUnique
+                } else {
+                    ConstraintKind::Unique
+                }
+            }
+            Self::Existence { .. } => {
+                if rel {
+                    ConstraintKind::RelExistence
+                } else {
+                    ConstraintKind::Existence
+                }
+            }
+            Self::NodeKeyMissing { .. } | Self::NodeKeyDuplicate { .. } => {
+                if rel {
+                    ConstraintKind::RelKey
+                } else {
+                    ConstraintKind::NodeKey
+                }
+            }
+            Self::PropertyType { .. } => {
+                if rel {
+                    ConstraintKind::RelPropertyType
+                } else {
+                    ConstraintKind::PropertyType
+                }
+            }
         }
     }
 
@@ -118,49 +197,61 @@ impl ConstraintViolation {
         match self {
             Self::Uniqueness {
                 name,
+                entity,
                 label,
                 property,
                 value,
             } => format!(
-                "Node(:{label}) already exists with property `{property}` = {value} \
-                 (uniqueness constraint `{name}`)"
+                "{} already exists with property `{property}` = {value} \
+                 (uniqueness constraint `{name}`)",
+                entity.render(label)
             ),
             Self::Existence {
                 name,
+                entity,
                 label,
                 property,
             } => format!(
-                "Node(:{label}) must have the property `{property}` \
-                 (existence constraint `{name}`)"
+                "{} must have the property `{property}` \
+                 (existence constraint `{name}`)",
+                entity.render(label)
             ),
             Self::NodeKeyMissing {
                 name,
+                entity,
                 label,
                 properties,
             } => format!(
-                "Node(:{label}) must have all properties {} \
-                 (node-key constraint `{name}`)",
-                render_property_list(properties)
+                "{} must have all properties {} \
+                 ({}-key constraint `{name}`)",
+                entity.render(label),
+                render_property_list(properties),
+                entity.word(),
             ),
             Self::NodeKeyDuplicate {
                 name,
+                entity,
                 label,
                 properties,
                 values,
             } => format!(
-                "Node(:{label}) already exists with properties {} = {values} \
-                 (node-key constraint `{name}`)",
-                render_property_list(properties)
+                "{} already exists with properties {} = {values} \
+                 ({}-key constraint `{name}`)",
+                entity.render(label),
+                render_property_list(properties),
+                entity.word(),
             ),
             Self::PropertyType {
                 name,
+                entity,
                 label,
                 property,
                 expected,
                 actual,
             } => format!(
-                "Node(:{label}) property `{property}` must be of type {expected} but was {actual} \
-                 (property-type constraint `{name}`)"
+                "{} property `{property}` must be of type {expected} but was {actual} \
+                 (property-type constraint `{name}`)",
+                entity.render(label)
             ),
         }
     }
@@ -271,12 +362,13 @@ mod tests {
     fn uniqueness_message_names_constraint_label_property_value() {
         let v = ConstraintViolation::Uniqueness {
             name: "c1".to_owned(),
+            entity: ViolationEntity::Node,
             label: "Person".to_owned(),
             property: "email".to_owned(),
             value: "'a@x.com'".to_owned(),
         };
         let m = v.message();
-        assert!(m.contains("Person"), "{m}");
+        assert!(m.contains("Node(:Person)"), "{m}");
         assert!(m.contains("email"), "{m}");
         assert!(m.contains("'a@x.com'"), "{m}");
         assert!(m.contains("c1"), "{m}");
@@ -287,6 +379,7 @@ mod tests {
     fn existence_message_names_constraint_label_property() {
         let v = ConstraintViolation::Existence {
             name: "c2".to_owned(),
+            entity: ViolationEntity::Node,
             label: "Person".to_owned(),
             property: "name".to_owned(),
         };
@@ -298,9 +391,58 @@ mod tests {
     }
 
     #[test]
+    fn relationship_violation_message_and_kind_are_entity_aware() {
+        // `rmp` #638: a relationship existence violation renders `Relationship[:TYPE]` and reports the
+        // relationship kind.
+        let v = ConstraintViolation::Existence {
+            name: "rc".to_owned(),
+            entity: ViolationEntity::Relationship,
+            label: "KNOWS".to_owned(),
+            property: "since".to_owned(),
+        };
+        let m = v.message();
+        assert!(m.contains("Relationship[:KNOWS]"), "{m}");
+        assert!(!m.contains("Node("), "{m}");
+        assert_eq!(v.kind(), ConstraintKind::RelExistence);
+
+        // A relationship key violation reports the relationship-key kind + `relationship-key` wording.
+        let dup = ConstraintViolation::NodeKeyDuplicate {
+            name: "rk".to_owned(),
+            entity: ViolationEntity::Relationship,
+            label: "RATED".to_owned(),
+            properties: vec!["user".to_owned(), "movie".to_owned()],
+            values: "(1, 2)".to_owned(),
+        };
+        let dm = dup.message();
+        assert!(dm.contains("Relationship[:RATED]"), "{dm}");
+        assert!(dm.contains("relationship-key constraint"), "{dm}");
+        assert_eq!(dup.kind(), ConstraintKind::RelKey);
+
+        let uniq = ConstraintViolation::Uniqueness {
+            name: "ru".to_owned(),
+            entity: ViolationEntity::Relationship,
+            label: "PAID".to_owned(),
+            property: "ref".to_owned(),
+            value: "'x'".to_owned(),
+        };
+        assert_eq!(uniq.kind(), ConstraintKind::RelUnique);
+
+        let ty = ConstraintViolation::PropertyType {
+            name: "rt".to_owned(),
+            entity: ViolationEntity::Relationship,
+            label: "WEIGHS".to_owned(),
+            property: "kg".to_owned(),
+            expected: "INTEGER".to_owned(),
+            actual: "STRING".to_owned(),
+        };
+        assert_eq!(ty.kind(), ConstraintKind::RelPropertyType);
+    }
+
+    #[test]
     fn wire_message_carries_the_sentinel_prefix_exactly_once() {
         let v = ConstraintViolation::Existence {
             name: "c".to_owned(),
+            entity: ViolationEntity::Node,
             label: "L".to_owned(),
             property: "p".to_owned(),
         };
@@ -314,6 +456,7 @@ mod tests {
     fn into_error_is_a_runtime_error_with_the_wire_message() {
         let v = ConstraintViolation::Existence {
             name: "c".to_owned(),
+            entity: ViolationEntity::Node,
             label: "L".to_owned(),
             property: "p".to_owned(),
         };
@@ -328,6 +471,7 @@ mod tests {
     fn node_key_and_property_type_messages_and_kinds() {
         let missing = ConstraintViolation::NodeKeyMissing {
             name: "k".to_owned(),
+            entity: ViolationEntity::Node,
             label: "Person".to_owned(),
             properties: vec!["first".to_owned(), "last".to_owned()],
         };
@@ -340,6 +484,7 @@ mod tests {
 
         let dup = ConstraintViolation::NodeKeyDuplicate {
             name: "k".to_owned(),
+            entity: ViolationEntity::Node,
             label: "Person".to_owned(),
             properties: vec!["first".to_owned(), "last".to_owned()],
             values: "('Ada', 'Byron')".to_owned(),
@@ -353,6 +498,7 @@ mod tests {
 
         let ty = ConstraintViolation::PropertyType {
             name: "t".to_owned(),
+            entity: ViolationEntity::Node,
             label: "Person".to_owned(),
             property: "age".to_owned(),
             expected: "INTEGER".to_owned(),

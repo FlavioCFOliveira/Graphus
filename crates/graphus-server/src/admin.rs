@@ -104,7 +104,8 @@ use crate::audit::{
 use crate::config::ServerConfig;
 use crate::dbcatalog::{CatalogError, DatabaseCatalog, DbState, normalize_db_name};
 use crate::engine::{
-    ConstraintCommand, EngineHandle, IndexCommand, NodePropertyIndexRef, RunSummary,
+    ConstraintCommand, ConstraintCreateKind, ConstraintEntity, CreateConstraint, EngineHandle,
+    IndexCommand, NodePropertyIndexRef, RunSummary,
 };
 use crate::security::{SecurityCatalog, SecurityError};
 
@@ -645,10 +646,39 @@ pub fn parse_admin_statement(query: &str) -> AdminParse {
     // USER(S)/ROLE(S)/PRIVILEGES (security surface). (Reading it cannot legitimately fail for real
     // Cypher here — a backtick directly after these verbs is not valid Cypher either — but an
     // unterminated quote is still just "not ours" at this point.)
-    let second = match lex.next_tok() {
+    let mut second = match lex.next_tok() {
         Ok(Some(t)) => t,
         _ => return AdminParse::NotAdmin,
     };
+
+    // --- `CREATE OR REPLACE CONSTRAINT …` prefix (`rmp` #638) ---
+    // `OR` right after CREATE is never a valid Cypher statement start, so consuming the `OR REPLACE`
+    // prefix here CLAIMS the statement. `OR REPLACE` is a **Graphus superset** of the Neo4j surface
+    // (which offers only `IF NOT EXISTS` for schema DDL) and is supported for CONSTRAINT only.
+    let mut or_replace = false;
+    if verb == "CREATE" && is_keyword(&second, "OR") {
+        match lex.next_tok() {
+            Ok(Some(ref t)) if is_keyword(t, "REPLACE") => {}
+            Ok(Some(other)) => {
+                return AdminParse::Invalid(unexpected_generic(&other, "REPLACE after CREATE OR"));
+            }
+            _ => return AdminParse::Invalid("expected REPLACE after CREATE OR".to_owned()),
+        }
+        or_replace = true;
+        second = match lex.next_tok() {
+            Ok(Some(t)) => t,
+            _ => {
+                return AdminParse::Invalid(
+                    "expected CONSTRAINT after CREATE OR REPLACE".to_owned(),
+                );
+            }
+        };
+        if !is_keyword(&second, "CONSTRAINT") {
+            return AdminParse::Invalid(
+                "OR REPLACE is only supported for CREATE OR REPLACE CONSTRAINT".to_owned(),
+            );
+        }
+    }
 
     // --- Security surface (rmp #92): CREATE/DROP USER, CREATE/DROP ROLE, SHOW USERS/ROLES/PRIVILEGES ---
     if is_keyword(&second, "USER")
@@ -693,6 +723,19 @@ pub fn parse_admin_statement(query: &str) -> AdminParse {
         };
     }
 
+    // --- Typed search-performance index surface (`rmp` #638): RANGE / TEXT / LOOKUP INDEX(ES) … ---
+    // `RANGE` / `TEXT` / `LOOKUP` directly after a verb are never valid Cypher, so the statement is
+    // CLAIMED once the verb + kind keyword is seen (mirroring FULLTEXT/POINT). RANGE is a full synonym
+    // of the node-property index; TEXT maps to it (served by the same B-tree); LOOKUP is declined
+    // (Graphus maintains token lookup indexes implicitly).
+    if is_keyword(&second, "RANGE") || is_keyword(&second, "TEXT") || is_keyword(&second, "LOOKUP")
+    {
+        return match parse_claimed_typed_index(&verb, &second, &mut lex) {
+            Ok(cmd) => AdminParse::Index(cmd),
+            Err(msg) => AdminParse::Invalid(msg),
+        };
+    }
+
     // --- Full-text index surface (`rmp` task #72): CREATE/DROP/SHOW FULLTEXT INDEX(ES) … ---
     // The third token must be INDEX/INDEXES; `FULLTEXT` alone is never valid Cypher, so the statement
     // is CLAIMED once the verb + FULLTEXT prefix is seen.
@@ -724,7 +767,7 @@ pub fn parse_admin_statement(query: &str) -> AdminParse {
                 "expected CONSTRAINT after {verb} (CONSTRAINTS is only valid in SHOW CONSTRAINTS)"
             ));
         }
-        return match parse_claimed_constraint(&verb, plural, &mut lex) {
+        return match parse_claimed_constraint(&verb, plural, or_replace, &mut lex) {
             Ok(cmd) => AdminParse::Constraint(cmd),
             Err(msg) => AdminParse::Invalid(msg),
         };
@@ -787,6 +830,68 @@ fn parse_claimed_index(
         // `parse_admin_statement` only routes CREATE/DROP/SHOW here; START/STOP never reach this.
         other => Err(format!("unsupported index verb {other}")),
     }
+}
+
+/// Parses a **typed** search-performance index statement (`rmp` #638) whose first two tokens are
+/// `verb` (`CREATE`/`DROP`/`SHOW`) + the kind keyword `kind_kw` (`RANGE`/`TEXT`/`LOOKUP`); the third
+/// token must be `INDEX`/`INDEXES`:
+///
+/// ```text
+/// CREATE RANGE INDEX [<name>] [IF NOT EXISTS] FOR (n:Label) ON (n.property)   -- full node-property synonym
+/// CREATE TEXT  INDEX [<name>] [IF NOT EXISTS] FOR (n:Label) ON (n.property)   -- maps to the node-property B-tree
+/// DROP   RANGE|TEXT INDEX <name> [IF EXISTS]
+/// SHOW   RANGE|TEXT INDEXES
+/// ```
+///
+/// - **RANGE** is a full synonym of the plain node-property index (`CREATE INDEX`): the create/drop/show
+///   are delegated verbatim to [`parse_claimed_index`], so a range index is nameable, droppable and
+///   listed under `SHOW INDEXES` (with `type` `RANGE`).
+/// - **TEXT** maps to the same node-property index — Graphus serves `STARTS WITH` / `=` string
+///   predicates from the RANGE B-tree — so it is routed identically (and appears as `RANGE` in
+///   `SHOW INDEXES`). This is a documented equivalence, not a distinct backing store.
+/// - **LOOKUP** is **declined** with an informative message: Graphus maintains node-label and
+///   relationship-type lookup indexes **implicitly** (always-on), so label/type scans are already
+///   index-backed and no explicit LOOKUP index is required.
+///
+/// The relationship form (`FOR ()-[r:TYPE]-()`) of RANGE/TEXT is not yet supported (it needs a durable
+/// relationship-property index) and is reported by the delegated node-property target parser.
+fn parse_claimed_typed_index(
+    verb: &str,
+    kind_kw: &Tok,
+    lex: &mut Lexer<'_>,
+) -> Result<IndexCommand, String> {
+    let kind = keyword_text(kind_kw); // "RANGE" / "TEXT" / "LOOKUP"
+    // The next token must be INDEX (CREATE/DROP) or INDEXES (SHOW).
+    let kw = lex
+        .next_tok()?
+        .ok_or_else(|| format!("expected INDEX or INDEXES after {verb} {kind}"))?;
+    let plural = is_keyword(&kw, "INDEXES");
+    if !is_keyword(&kw, "INDEX") && !plural {
+        return Err(unexpected_generic(
+            &kw,
+            &format!("INDEX or INDEXES after {verb} {kind}"),
+        ));
+    }
+    if plural && verb != "SHOW" {
+        return Err(format!(
+            "expected INDEX after {verb} {kind} (INDEXES is only valid in SHOW {kind} INDEXES)"
+        ));
+    }
+
+    if is_keyword(kind_kw, "LOOKUP") {
+        // Token lookup indexes are implicit and always-on in Graphus (`rmp` #638): label and
+        // relationship-type scans are already index-backed, so there is nothing to create, drop or list.
+        return Err(
+            "LOOKUP index DDL is not supported: Graphus maintains node-label and relationship-type \
+             lookup indexes implicitly (always-on), so label/type scans are already index-backed and \
+             no explicit LOOKUP index is required"
+                .to_owned(),
+        );
+    }
+
+    // RANGE / TEXT: a full node-property synonym — the `verb` + `INDEX`/`INDEXES` are already read, so
+    // hand the remainder to the existing node-property parser verbatim.
+    parse_claimed_index(verb, plural, lex)
 }
 
 /// Parses a `CREATE INDEX [<name>] [IF NOT EXISTS] <target>` tail (`rmp` task #624): an optional name,
@@ -893,6 +998,13 @@ fn parse_index_target(verb: &str, lex: &mut Lexer<'_>) -> Result<(String, String
 fn parse_index_for_on(verb: &str, lex: &mut Lexer<'_>) -> Result<(String, String), String> {
     // FOR ( <var> : <Label> )
     expect_symbol(lex, '(', verb)?;
+    // A relationship-property index pattern opens with an empty node `()` (`FOR ()-[r:TYPE]-()`);
+    // give a targeted message until a durable relationship-property index lands (`rmp` #638 follow-up).
+    if peek_symbol(lex, ')')? {
+        return Err(
+            "relationship property indexes (FOR ()-[r:TYPE]-()) are not yet supported".to_owned(),
+        );
+    }
     let _var = expect_word(lex, "a variable", verb)?;
     expect_symbol(lex, ':', verb)?;
     let label = expect_name(lex, "a label", verb)?;
@@ -1150,24 +1262,28 @@ fn parse_point_create_tail(lex: &mut Lexer<'_>) -> Result<(String, String), Stri
 }
 
 /// Parses the remainder of a claimed **constraint** statement (`verb` + `CONSTRAINT`/`CONSTRAINTS`
-/// already read), for the six shapes (`rmp` tasks #99, #100):
+/// already read; `or_replace` set when a `CREATE OR REPLACE` prefix was consumed), for the shapes
+/// (`rmp` tasks #99, #100, #638):
 ///
 /// ```text
-/// CREATE CONSTRAINT <name> FOR (<var>:<Label>) REQUIRE <var>.<prop> IS UNIQUE
-/// CREATE CONSTRAINT <name> FOR (<var>:<Label>) REQUIRE <var>.<prop> IS NOT NULL
-/// CREATE CONSTRAINT <name> FOR (<var>:<Label>) REQUIRE (<var>.a, <var>.b, …) IS NODE KEY
-/// CREATE CONSTRAINT <name> FOR (<var>:<Label>) REQUIRE <var>.<prop> IS :: <TYPE>
-/// DROP   CONSTRAINT <name>
+/// CREATE [OR REPLACE] CONSTRAINT <name> [IF NOT EXISTS] FOR (<var>:<Label>) REQUIRE <var>.<prop> IS [NODE] UNIQUE
+/// CREATE [OR REPLACE] CONSTRAINT <name> [IF NOT EXISTS] FOR (<var>:<Label>) REQUIRE <var>.<prop> IS NOT NULL
+/// CREATE [OR REPLACE] CONSTRAINT <name> [IF NOT EXISTS] FOR (<var>:<Label>) REQUIRE (<var>.a, …) IS [NODE] KEY
+/// CREATE [OR REPLACE] CONSTRAINT <name> [IF NOT EXISTS] FOR (<var>:<Label>) REQUIRE <var>.<prop> IS :: <TYPE>
+/// DROP   CONSTRAINT <name> [IF EXISTS]
 /// SHOW   CONSTRAINTS
 /// ```
 ///
 /// A constraint is identified by **name** (Neo4j-compatible), like a full-text / point index. The
 /// `REQUIRE … IS …` tail distinguishes the kind; the `<var>` text is irrelevant (single-variable
 /// shape, reusing [`parse_property_ref`]). `<TYPE>` is an openCypher type name — `INTEGER`, `FLOAT`,
-/// `STRING`, `BOOLEAN`, or `LIST<…>` — parsed by [`parse_constraint_type`].
+/// `STRING`, `BOOLEAN`, or `LIST<…>` — parsed by [`parse_constraint_type`]. `IF NOT EXISTS` and
+/// `OR REPLACE` are mutually exclusive (`rmp` #638). The relationship pattern (`FOR ()-[r:TYPE]-()`)
+/// lands in a follow-up slice of `rmp` #638 (rejected with a clear message for now).
 fn parse_claimed_constraint(
     verb: &str,
     plural: bool,
+    or_replace: bool,
     lex: &mut Lexer<'_>,
 ) -> Result<ConstraintCommand, String> {
     if plural {
@@ -1187,75 +1303,48 @@ fn parse_claimed_constraint(
 
     match verb {
         "DROP" => {
+            let if_exists = parse_optional_if(lex, /* with_not */ false)?;
             expect_end(lex, "DROP CONSTRAINT")?;
-            Ok(ConstraintCommand::Drop { name })
+            Ok(ConstraintCommand::Drop { name, if_exists })
         }
         "CREATE" => {
-            let (label, tail) = parse_constraint_create_tail(lex)?;
-            Ok(match tail {
-                ConstraintTail::Unique { property } => ConstraintCommand::CreateUnique {
-                    name,
-                    label,
-                    property,
-                },
-                ConstraintTail::Existence { property } => ConstraintCommand::CreateExistence {
-                    name,
-                    label,
-                    property,
-                },
-                ConstraintTail::NodeKey { properties } => ConstraintCommand::CreateNodeKey {
-                    name,
-                    label,
-                    properties,
-                },
-                ConstraintTail::PropertyType {
-                    property,
-                    declared_type,
-                } => ConstraintCommand::CreatePropertyType {
-                    name,
-                    label,
-                    property,
-                    declared_type,
-                },
-            })
+            // `IF NOT EXISTS` follows the name (Neo4j positions it there); `OR REPLACE` was consumed by
+            // the dispatcher before the surface keyword. The two are mutually exclusive.
+            let if_not_exists = parse_optional_if(lex, /* with_not */ true)?;
+            if or_replace && if_not_exists {
+                return Err(
+                    "CREATE CONSTRAINT cannot combine OR REPLACE with IF NOT EXISTS".to_owned(),
+                );
+            }
+            let (entity, properties, kind) = parse_constraint_create_tail(lex)?;
+            Ok(ConstraintCommand::Create(CreateConstraint {
+                name,
+                entity,
+                properties,
+                kind,
+                if_not_exists,
+                or_replace,
+            }))
         }
         // `parse_admin_statement` only routes CREATE/DROP/SHOW here; START/STOP never reach this.
         other => Err(format!("unsupported constraint verb {other}")),
     }
 }
 
-/// The parsed `REQUIRE … IS …` body of a `CREATE CONSTRAINT` statement (`rmp` tasks #99, #100), one per
-/// constraint kind. The label is returned separately by [`parse_constraint_create_tail`].
-enum ConstraintTail {
-    /// `IS UNIQUE` over a single property.
-    Unique { property: String },
-    /// `IS NOT NULL` over a single property.
-    Existence { property: String },
-    /// `IS NODE KEY` over a composite property tuple (one or more, in declared order).
-    NodeKey { properties: Vec<String> },
-    /// `IS :: <TYPE>` over a single property, with the declared value type.
-    PropertyType {
-        property: String,
-        declared_type: graphus_storage::ConstraintTypeDescriptor,
-    },
-}
-
-/// Parses the `FOR (<var>:<Label>) REQUIRE … IS …` tail of a `CREATE CONSTRAINT <name>` statement
-/// (`rmp` tasks #99, #100). Returns `(label, tail)`. Mirrors the openCypher `FOR (n:Label) … (n.prop)`
-/// node-property shape, reusing [`parse_property_ref`].
+/// Parses the `FOR <entity> REQUIRE … IS …` tail of a `CREATE CONSTRAINT <name>` statement
+/// (`rmp` tasks #99, #100, #638). Returns `(entity, properties, kind)`. Mirrors the openCypher
+/// `FOR (n:Label) … (n.prop)` node-property shape, reusing [`parse_property_ref`].
 ///
 /// The `REQUIRE` target is a single bare/parenthesised property (`UNIQUE` / `NOT NULL` / `:: TYPE`) or
-/// a parenthesised composite tuple `(n.a, n.b, …)` (only valid with `NODE KEY`). The closing keyword
-/// after `IS` selects the kind. A multi-property tuple with any kind other than `NODE KEY` is rejected.
-fn parse_constraint_create_tail(lex: &mut Lexer<'_>) -> Result<(String, ConstraintTail), String> {
+/// a parenthesised composite tuple `(n.a, n.b, …)` (only valid with `KEY`). The clause after `IS`
+/// selects the kind. A multi-property tuple with any kind other than `KEY` is rejected.
+fn parse_constraint_create_tail(
+    lex: &mut Lexer<'_>,
+) -> Result<(ConstraintEntity, Vec<String>, ConstraintCreateKind), String> {
     const VERB: &str = "CONSTRAINT";
-    // FOR ( <var> : <Label> )
+    // FOR <entity-pattern>
     expect_keyword(lex, "FOR", VERB)?;
-    expect_symbol(lex, '(', VERB)?;
-    let _var = expect_word(lex, "a variable", VERB)?;
-    expect_symbol(lex, ':', VERB)?;
-    let label = expect_name(lex, "a label", VERB)?;
-    expect_symbol(lex, ')', VERB)?;
+    let entity = parse_constraint_entity(lex)?;
     // REQUIRE <var>.<property>  — Neo4j uses `REQUIRE`; `ASSERT` is the legacy spelling, also accepted.
     let req = lex
         .next_tok()?
@@ -1283,76 +1372,163 @@ fn parse_constraint_create_tail(lex: &mut Lexer<'_>) -> Result<(String, Constrai
     } else {
         properties.push(parse_property_ref(VERB, lex)?);
     }
-    // IS (UNIQUE | NOT NULL | NODE KEY | :: <TYPE>)
+    // IS ( [NODE|REL[ATIONSHIP]] UNIQUE | NOT NULL | [NODE|REL[ATIONSHIP]] KEY | :: <TYPE> | TYPED <TYPE> )
     expect_keyword(lex, "IS", VERB)?;
+    let kind = parse_constraint_is_clause(lex, entity.is_relationship())?;
+    // Arity: only a composite KEY may cover more than one property.
+    if properties.len() != 1 && !matches!(kind, ConstraintCreateKind::Key) {
+        return Err(match kind {
+            ConstraintCreateKind::Unique => {
+                "a uniqueness constraint (IS UNIQUE) covers exactly one property".to_owned()
+            }
+            ConstraintCreateKind::Existence => {
+                "an existence constraint (IS NOT NULL) covers exactly one property".to_owned()
+            }
+            ConstraintCreateKind::PropertyType { .. } => {
+                "a property-type constraint (IS :: <TYPE>) covers exactly one property".to_owned()
+            }
+            ConstraintCreateKind::Key => unreachable!("KEY was excluded by the guard above"),
+        });
+    }
+    expect_end(lex, "CREATE CONSTRAINT")?;
+    Ok((entity, properties, kind))
+}
 
-    // `::` opens a property-type clause (`IS :: <TYPE>`); it is two adjacent `:` symbols.
+/// Parses the entity pattern after `FOR` in a `CREATE CONSTRAINT` (`rmp` #638): the node pattern
+/// `(<var>:<Label>)` or the (undirected) relationship pattern `()-[<var>:<TYPE>]-()`. The relationship
+/// pattern is detected by its leading empty node `()`.
+///
+/// # Tokenization note
+///
+/// The lexer treats `-` as a word character, so a lone dash between the empty node and the `[…]`
+/// segment lexes as the single word `"-"` (a following `[`/`(` symbol breaks it); [`expect_dash`]
+/// consumes exactly that. Only the **undirected** form is accepted (Neo4j's constraint surface); a
+/// directed arrow (`->` / `<-`) is a syntax error.
+fn parse_constraint_entity(lex: &mut Lexer<'_>) -> Result<ConstraintEntity, String> {
+    const VERB: &str = "CONSTRAINT";
+    expect_symbol(lex, '(', VERB)?;
+    // A relationship constraint pattern opens with an empty node `()`.
+    if peek_symbol(lex, ')')? {
+        // ()-[ <var> : <TYPE> ]-()
+        expect_symbol(lex, ')', VERB)?; // close the empty start node
+        expect_dash(lex, VERB)?;
+        expect_symbol(lex, '[', VERB)?;
+        let _var = expect_word(lex, "a variable", VERB)?;
+        expect_symbol(lex, ':', VERB)?;
+        let rel_type = expect_name(lex, "a relationship type", VERB)?;
+        expect_symbol(lex, ']', VERB)?;
+        expect_dash(lex, VERB)?;
+        expect_symbol(lex, '(', VERB)?;
+        expect_symbol(lex, ')', VERB)?;
+        return Ok(ConstraintEntity::Relationship { rel_type });
+    }
+    let _var = expect_word(lex, "a variable", VERB)?;
+    expect_symbol(lex, ':', VERB)?;
+    let label = expect_name(lex, "a label", VERB)?;
+    expect_symbol(lex, ')', VERB)?;
+    Ok(ConstraintEntity::Node { label })
+}
+
+/// Expects the lone dash token `-` (a [`Tok::Word`] because `-` is a lexer word character) that joins
+/// the segments of a relationship pattern (`rmp` #638). A directed arrow lexes as `-` + `>` (or `<` +
+/// `-`), so the following symbol check in [`parse_constraint_entity`] rejects the directed form.
+fn expect_dash(lex: &mut Lexer<'_>, verb: &str) -> Result<(), String> {
+    match lex.next_tok()? {
+        Some(Tok::Word(w)) if w == "-" => Ok(()),
+        Some(other) => Err(unexpected_generic(
+            &other,
+            &format!("`-` in the relationship pattern after {verb}"),
+        )),
+        None => Err(format!(
+            "expected `-` in the relationship pattern after {verb}"
+        )),
+    }
+}
+
+/// Parses the clause after `IS` in a `REQUIRE … IS …` constraint tail (`rmp` tasks #100, #638),
+/// returning the [`ConstraintCreateKind`]. Accepts:
+///
+/// - `:: <TYPE>` and `TYPED <TYPE>` → a property-type constraint;
+/// - `UNIQUE` / `[NODE|REL[ATIONSHIP]] UNIQUE` → uniqueness;
+/// - `KEY` / `[NODE|REL[ATIONSHIP]] KEY` → key;
+/// - `NOT NULL` → existence.
+///
+/// An explicit `NODE` / `REL[ATIONSHIP]` qualifier must match the entity pattern (`is_rel`); a
+/// mismatch (e.g. `IS RELATIONSHIP KEY` on a `FOR (n:Label)` pattern) is a clear error.
+fn parse_constraint_is_clause(
+    lex: &mut Lexer<'_>,
+    is_rel: bool,
+) -> Result<ConstraintCreateKind, String> {
+    const VERB: &str = "CONSTRAINT";
+    // `IS :: <TYPE>` — `::` is two adjacent `:` symbols.
     if peek_symbol(lex, ':')? {
         expect_symbol(lex, ':', VERB)?;
         expect_symbol(lex, ':', VERB)?;
         let declared_type = parse_constraint_type(lex)?;
-        expect_end(lex, "CREATE CONSTRAINT")?;
-        let [property] = properties.as_slice() else {
-            return Err(
-                "a property-type constraint (IS :: <TYPE>) covers exactly one property".to_owned(),
-            );
-        };
-        return Ok((
-            label,
-            ConstraintTail::PropertyType {
-                property: property.clone(),
-                declared_type,
-            },
-        ));
+        return Ok(ConstraintCreateKind::PropertyType { declared_type });
     }
-
-    let next = lex
-        .next_tok()?
-        .ok_or_else(|| "expected UNIQUE, NOT NULL, NODE KEY or :: <TYPE> after IS".to_owned())?;
-    let tail = if is_keyword(&next, "UNIQUE") {
-        let [property] = properties.as_slice() else {
-            return Err(
-                "a uniqueness constraint (IS UNIQUE) covers exactly one property".to_owned(),
-            );
-        };
-        ConstraintTail::Unique {
-            property: property.clone(),
-        }
-    } else if is_keyword(&next, "NOT") {
-        // NOT NULL
+    let next = lex.next_tok()?.ok_or_else(|| {
+        "expected UNIQUE, NOT NULL, KEY, TYPED or :: <TYPE> after IS in CONSTRAINT".to_owned()
+    })?;
+    // `IS TYPED <TYPE>` — the alternative spelling of the property-type clause.
+    if is_keyword(&next, "TYPED") {
+        let declared_type = parse_constraint_type(lex)?;
+        return Ok(ConstraintCreateKind::PropertyType { declared_type });
+    }
+    if is_keyword(&next, "UNIQUE") {
+        return Ok(ConstraintCreateKind::Unique);
+    }
+    if is_keyword(&next, "KEY") {
+        return Ok(ConstraintCreateKind::Key);
+    }
+    if is_keyword(&next, "NOT") {
         let null = lex
             .next_tok()?
             .ok_or_else(|| "expected NULL after NOT in CONSTRAINT".to_owned())?;
         if !is_keyword(&null, "NULL") {
             return Err(unexpected_generic(&null, "NULL after NOT in CONSTRAINT"));
         }
-        let [property] = properties.as_slice() else {
-            return Err(
-                "an existence constraint (IS NOT NULL) covers exactly one property".to_owned(),
-            );
-        };
-        ConstraintTail::Existence {
-            property: property.clone(),
-        }
-    } else if is_keyword(&next, "NODE") {
-        // NODE KEY
-        let key = lex
-            .next_tok()?
-            .ok_or_else(|| "expected KEY after NODE in CONSTRAINT".to_owned())?;
-        if !is_keyword(&key, "KEY") {
-            return Err(unexpected_generic(&key, "KEY after NODE in CONSTRAINT"));
-        }
-        ConstraintTail::NodeKey {
-            properties: properties.clone(),
-        }
+        return Ok(ConstraintCreateKind::Existence);
+    }
+    // Optional entity qualifier: NODE (node) or REL / RELATIONSHIP (relationship) before UNIQUE/KEY.
+    let qualifier_is_rel = if is_keyword(&next, "NODE") {
+        false
+    } else if is_keyword(&next, "REL") || is_keyword(&next, "RELATIONSHIP") {
+        true
     } else {
         return Err(unexpected_generic(
             &next,
-            "UNIQUE, NOT NULL, NODE KEY or :: <TYPE> after IS in CONSTRAINT",
+            "UNIQUE, NOT NULL, KEY, a NODE/RELATIONSHIP qualifier, TYPED or :: <TYPE> after IS in CONSTRAINT",
         ));
     };
-    expect_end(lex, "CREATE CONSTRAINT")?;
-    Ok((label, tail))
+    if qualifier_is_rel != is_rel {
+        return Err(format!(
+            "the {} qualifier does not match the {} pattern in CONSTRAINT",
+            if qualifier_is_rel {
+                "RELATIONSHIP"
+            } else {
+                "NODE"
+            },
+            if is_rel {
+                "relationship (FOR ()-[r:TYPE]-())"
+            } else {
+                "node (FOR (n:Label))"
+            },
+        ));
+    }
+    let kw = lex
+        .next_tok()?
+        .ok_or_else(|| "expected UNIQUE or KEY after the qualifier in CONSTRAINT".to_owned())?;
+    if is_keyword(&kw, "UNIQUE") {
+        Ok(ConstraintCreateKind::Unique)
+    } else if is_keyword(&kw, "KEY") {
+        Ok(ConstraintCreateKind::Key)
+    } else {
+        Err(unexpected_generic(
+            &kw,
+            "UNIQUE or KEY after the qualifier in CONSTRAINT",
+        ))
+    }
 }
 
 /// Parses an openCypher constraint **type name** for a `IS :: <TYPE>` clause (`rmp` task #100):
@@ -3249,6 +3425,26 @@ mod tests {
         }
     }
 
+    /// Builds the expected `CREATE CONSTRAINT` command for a **node** constraint (`rmp` #638 test
+    /// helper), with the idempotency flags off by default.
+    fn node_constraint(
+        name: &str,
+        label: &str,
+        properties: &[&str],
+        kind: ConstraintCreateKind,
+    ) -> ConstraintCommand {
+        ConstraintCommand::Create(CreateConstraint {
+            name: name.to_owned(),
+            entity: ConstraintEntity::Node {
+                label: label.to_owned(),
+            },
+            properties: properties.iter().map(|p| (*p).to_owned()).collect(),
+            kind,
+            if_not_exists: false,
+            or_replace: false,
+        })
+    }
+
     fn invalid(query: &str) -> String {
         match parse_admin_statement(query) {
             AdminParse::Invalid(m) => m,
@@ -3780,6 +3976,56 @@ mod tests {
     }
 
     #[test]
+    fn typed_range_and_text_indexes_are_node_property_synonyms() {
+        // RANGE is a full synonym of the node-property index (`rmp` #638).
+        assert_eq!(
+            index_cmd("CREATE RANGE INDEX ix FOR (n:Person) ON (n.name)"),
+            IndexCommand::CreateNodePropertyIndex {
+                name: Some("ix".to_owned()),
+                label: "Person".to_owned(),
+                property: "name".to_owned(),
+                if_not_exists: false,
+            }
+        );
+        // TEXT maps to the same node-property index (served by the RANGE B-tree).
+        assert_eq!(
+            index_cmd("CREATE TEXT INDEX t IF NOT EXISTS FOR (n:Person) ON (n.nick)"),
+            IndexCommand::CreateNodePropertyIndex {
+                name: Some("t".to_owned()),
+                label: "Person".to_owned(),
+                property: "nick".to_owned(),
+                if_not_exists: true,
+            }
+        );
+        // DROP + SHOW for the typed surfaces delegate to the node-property forms.
+        assert_eq!(
+            index_cmd("DROP RANGE INDEX ix"),
+            IndexCommand::DropNodePropertyIndex {
+                index: NodePropertyIndexRef::Named("ix".to_owned()),
+                if_exists: false,
+            }
+        );
+        assert_eq!(index_cmd("SHOW RANGE INDEXES"), IndexCommand::ShowIndexes);
+        assert_eq!(index_cmd("SHOW TEXT INDEXES"), IndexCommand::ShowIndexes);
+    }
+
+    #[test]
+    fn lookup_index_and_relationship_index_are_declined_with_a_clear_message() {
+        // LOOKUP is implicit / always-on in Graphus.
+        let msg = invalid("CREATE LOOKUP INDEX ix FOR (n) ON EACH labels(n)");
+        assert!(msg.contains("LOOKUP index DDL is not supported"), "{msg}");
+        // Relationship-property indexes are not yet supported — for the plain and typed surfaces.
+        for q in [
+            "CREATE INDEX FOR ()-[r:KNOWS]-() ON (r.since)",
+            "CREATE RANGE INDEX ix FOR ()-[r:KNOWS]-() ON (r.since)",
+            "CREATE TEXT INDEX ix FOR ()-[r:KNOWS]-() ON (r.text)",
+        ] {
+            let msg = invalid(q);
+            assert!(msg.contains("relationship property indexes"), "{q}: {msg}");
+        }
+    }
+
+    #[test]
     fn drop_index_by_target_and_show_indexes() {
         assert_eq!(
             index_cmd("DROP INDEX ON :Person(age)"),
@@ -4010,29 +4256,22 @@ mod tests {
     fn create_constraint_unique_and_not_null() {
         assert_eq!(
             constraint_cmd("CREATE CONSTRAINT c1 FOR (n:Person) REQUIRE n.email IS UNIQUE"),
-            ConstraintCommand::CreateUnique {
-                name: "c1".to_owned(),
-                label: "Person".to_owned(),
-                property: "email".to_owned(),
-            }
+            node_constraint("c1", "Person", &["email"], ConstraintCreateKind::Unique),
         );
         assert_eq!(
             constraint_cmd("CREATE CONSTRAINT c2 FOR (n:Person) REQUIRE n.name IS NOT NULL"),
-            ConstraintCommand::CreateExistence {
-                name: "c2".to_owned(),
-                label: "Person".to_owned(),
-                property: "name".to_owned(),
-            }
+            node_constraint("c2", "Person", &["name"], ConstraintCreateKind::Existence),
         );
         // Case-insensitive keywords, the legacy `ASSERT` spelling, and a parenthesised property all
         // parse to the same command.
         assert_eq!(
             constraint_cmd("create constraint c3 for (x:Account) assert (x.iban) is unique"),
-            ConstraintCommand::CreateUnique {
-                name: "c3".to_owned(),
-                label: "Account".to_owned(),
-                property: "iban".to_owned(),
-            }
+            node_constraint("c3", "Account", &["iban"], ConstraintCreateKind::Unique),
+        );
+        // The optional `NODE` qualifier (`IS NODE UNIQUE`, `rmp` #638) parses identically.
+        assert_eq!(
+            constraint_cmd("CREATE CONSTRAINT c4 FOR (n:Person) REQUIRE n.email IS NODE UNIQUE"),
+            node_constraint("c4", "Person", &["email"], ConstraintCreateKind::Unique),
         );
     }
 
@@ -4043,20 +4282,22 @@ mod tests {
             constraint_cmd(
                 "CREATE CONSTRAINT pk FOR (n:Person) REQUIRE (n.first, n.last) IS NODE KEY"
             ),
-            ConstraintCommand::CreateNodeKey {
-                name: "pk".to_owned(),
-                label: "Person".to_owned(),
-                properties: vec!["first".to_owned(), "last".to_owned()],
-            }
+            node_constraint(
+                "pk",
+                "Person",
+                &["first", "last"],
+                ConstraintCreateKind::Key
+            ),
         );
         // A single-property node key is also valid (the degenerate composite); case-insensitive.
         assert_eq!(
             constraint_cmd("create constraint k for (a:Account) require (a.iban) is node key"),
-            ConstraintCommand::CreateNodeKey {
-                name: "k".to_owned(),
-                label: "Account".to_owned(),
-                properties: vec!["iban".to_owned()],
-            }
+            node_constraint("k", "Account", &["iban"], ConstraintCreateKind::Key),
+        );
+        // The bare `IS KEY` form (optional `NODE`, `rmp` #638) parses identically.
+        assert_eq!(
+            constraint_cmd("CREATE CONSTRAINT k2 FOR (n:Person) REQUIRE (n.a, n.b) IS KEY"),
+            node_constraint("k2", "Person", &["a", "b"], ConstraintCreateKind::Key),
         );
     }
 
@@ -4065,53 +4306,156 @@ mod tests {
         use graphus_storage::ConstraintTypeDescriptor as T;
         assert_eq!(
             constraint_cmd("CREATE CONSTRAINT t FOR (n:Person) REQUIRE n.age IS :: INTEGER"),
-            ConstraintCommand::CreatePropertyType {
-                name: "t".to_owned(),
-                label: "Person".to_owned(),
-                property: "age".to_owned(),
-                declared_type: T::Integer,
-            }
+            node_constraint(
+                "t",
+                "Person",
+                &["age"],
+                ConstraintCreateKind::PropertyType {
+                    declared_type: T::Integer,
+                },
+            ),
         );
-        // Each scalar type, case-insensitive, and a parenthesised property.
+        // Each scalar type, case-insensitive, a parenthesised property, and the `IS TYPED` spelling.
         for (src, expected) in [
             ("REQUIRE n.x IS :: FLOAT", T::Float),
             ("REQUIRE n.x IS :: STRING", T::String),
             ("require n.x is :: boolean", T::Boolean),
             ("REQUIRE (n.x) IS :: STRING", T::String),
+            ("REQUIRE n.x IS TYPED INTEGER", T::Integer),
         ] {
             let q = format!("CREATE CONSTRAINT t FOR (n:Person) {src}");
             assert_eq!(
                 constraint_cmd(&q),
-                ConstraintCommand::CreatePropertyType {
-                    name: "t".to_owned(),
-                    label: "Person".to_owned(),
-                    property: "x".to_owned(),
-                    declared_type: expected,
-                },
+                node_constraint(
+                    "t",
+                    "Person",
+                    &["x"],
+                    ConstraintCreateKind::PropertyType {
+                        declared_type: expected,
+                    },
+                ),
                 "{q}"
             );
         }
         // A LIST<…> type, including a nested list.
         assert_eq!(
             constraint_cmd("CREATE CONSTRAINT t FOR (n:Person) REQUIRE n.tags IS :: LIST<STRING>"),
-            ConstraintCommand::CreatePropertyType {
-                name: "t".to_owned(),
-                label: "Person".to_owned(),
-                property: "tags".to_owned(),
-                declared_type: T::List(Box::new(T::String)),
-            }
+            node_constraint(
+                "t",
+                "Person",
+                &["tags"],
+                ConstraintCreateKind::PropertyType {
+                    declared_type: T::List(Box::new(T::String)),
+                },
+            ),
         );
         assert_eq!(
             constraint_cmd(
                 "CREATE CONSTRAINT t FOR (n:Person) REQUIRE n.matrix IS :: LIST<LIST<INTEGER>>"
             ),
-            ConstraintCommand::CreatePropertyType {
-                name: "t".to_owned(),
-                label: "Person".to_owned(),
-                property: "matrix".to_owned(),
-                declared_type: T::List(Box::new(T::List(Box::new(T::Integer)))),
-            }
+            node_constraint(
+                "t",
+                "Person",
+                &["matrix"],
+                ConstraintCreateKind::PropertyType {
+                    declared_type: T::List(Box::new(T::List(Box::new(T::Integer)))),
+                },
+            ),
         );
+    }
+
+    #[test]
+    fn create_constraint_if_not_exists_and_or_replace() {
+        // `IF NOT EXISTS` after the name (`rmp` #638).
+        assert_eq!(
+            constraint_cmd(
+                "CREATE CONSTRAINT c IF NOT EXISTS FOR (n:Person) REQUIRE n.email IS UNIQUE"
+            ),
+            ConstraintCommand::Create(CreateConstraint {
+                name: "c".to_owned(),
+                entity: ConstraintEntity::Node {
+                    label: "Person".to_owned(),
+                },
+                properties: vec!["email".to_owned()],
+                kind: ConstraintCreateKind::Unique,
+                if_not_exists: true,
+                or_replace: false,
+            }),
+        );
+        // `CREATE OR REPLACE CONSTRAINT` (a Graphus superset).
+        assert_eq!(
+            constraint_cmd(
+                "CREATE OR REPLACE CONSTRAINT c FOR (n:Person) REQUIRE n.email IS UNIQUE"
+            ),
+            ConstraintCommand::Create(CreateConstraint {
+                name: "c".to_owned(),
+                entity: ConstraintEntity::Node {
+                    label: "Person".to_owned(),
+                },
+                properties: vec!["email".to_owned()],
+                kind: ConstraintCreateKind::Unique,
+                if_not_exists: false,
+                or_replace: true,
+            }),
+        );
+        // Combining the two is rejected; OR REPLACE on a non-constraint surface is rejected.
+        invalid(
+            "CREATE OR REPLACE CONSTRAINT c IF NOT EXISTS FOR (n:Person) REQUIRE n.x IS UNIQUE",
+        );
+        invalid("CREATE OR REPLACE INDEX ix FOR (n:Person) ON (n.email)");
+        invalid("CREATE OR WEIRD CONSTRAINT c FOR (n:Person) REQUIRE n.x IS UNIQUE");
+    }
+
+    #[test]
+    fn relationship_constraint_patterns_parse() {
+        // Relationship existence (`rmp` #638): FOR ()-[r:TYPE]-() REQUIRE r.p IS NOT NULL.
+        assert_eq!(
+            constraint_cmd("CREATE CONSTRAINT c FOR ()-[r:KNOWS]-() REQUIRE r.since IS NOT NULL"),
+            ConstraintCommand::Create(CreateConstraint {
+                name: "c".to_owned(),
+                entity: ConstraintEntity::Relationship {
+                    rel_type: "KNOWS".to_owned(),
+                },
+                properties: vec!["since".to_owned()],
+                kind: ConstraintCreateKind::Existence,
+                if_not_exists: false,
+                or_replace: false,
+            }),
+        );
+        // RELATIONSHIP KEY over a composite tuple (both `REL KEY` and `RELATIONSHIP KEY` qualifiers).
+        assert_eq!(
+            constraint_cmd(
+                "CREATE CONSTRAINT rk FOR ()-[r:RATED]-() REQUIRE (r.user, r.movie) IS RELATIONSHIP KEY"
+            ),
+            ConstraintCommand::Create(CreateConstraint {
+                name: "rk".to_owned(),
+                entity: ConstraintEntity::Relationship {
+                    rel_type: "RATED".to_owned(),
+                },
+                properties: vec!["user".to_owned(), "movie".to_owned()],
+                kind: ConstraintCreateKind::Key,
+                if_not_exists: false,
+                or_replace: false,
+            }),
+        );
+        assert_eq!(
+            constraint_cmd("CREATE CONSTRAINT rk2 FOR ()-[r:R]-() REQUIRE r.k IS REL KEY"),
+            ConstraintCommand::Create(CreateConstraint {
+                name: "rk2".to_owned(),
+                entity: ConstraintEntity::Relationship {
+                    rel_type: "R".to_owned(),
+                },
+                properties: vec!["k".to_owned()],
+                kind: ConstraintCreateKind::Key,
+                if_not_exists: false,
+                or_replace: false,
+            }),
+        );
+        // A NODE/RELATIONSHIP qualifier mismatched with the pattern is a clear error, in both directions.
+        invalid("CREATE CONSTRAINT c FOR (n:Person) REQUIRE n.email IS RELATIONSHIP UNIQUE");
+        invalid("CREATE CONSTRAINT c FOR ()-[r:KNOWS]-() REQUIRE r.since IS NODE UNIQUE");
+        // A directed relationship pattern is rejected (constraints are undirected).
+        invalid("CREATE CONSTRAINT c FOR ()-[r:KNOWS]->() REQUIRE r.since IS NOT NULL");
     }
 
     #[test]
@@ -4138,7 +4482,16 @@ mod tests {
         assert_eq!(
             constraint_cmd("DROP CONSTRAINT c1"),
             ConstraintCommand::Drop {
-                name: "c1".to_owned()
+                name: "c1".to_owned(),
+                if_exists: false,
+            }
+        );
+        // `DROP CONSTRAINT <name> IF EXISTS` (`rmp` #638).
+        assert_eq!(
+            constraint_cmd("DROP CONSTRAINT c1 IF EXISTS"),
+            ConstraintCommand::Drop {
+                name: "c1".to_owned(),
+                if_exists: true,
             }
         );
         assert_eq!(constraint_cmd("SHOW CONSTRAINTS"), ConstraintCommand::Show);

@@ -31,6 +31,8 @@ const CODE_EQUIVALENT_EXISTS: &str = "Neo.ClientError.Schema.EquivalentSchemaRul
 const CODE_INDEX_NAME_EXISTS: &str = "Neo.ClientError.Schema.IndexWithNameAlreadyExists";
 /// Neo4j status code: a `DROP INDEX <name>` failed because no such index exists.
 const CODE_INDEX_DROP_FAILED: &str = "Neo.ClientError.Schema.IndexDropFailed";
+/// Neo4j status code: a constraint with the requested name already exists (`rmp` #638).
+const CODE_CONSTRAINT_NAME_EXISTS: &str = "Neo.ClientError.Schema.ConstraintWithNameAlreadyExists";
 
 /// A schema-rule declaration error (`rmp` task #624), carrying the precise Neo4j leaf `code` and a
 /// human `message`. Rendered onto the wire as a [`GraphusError::Runtime`] via [`into_error`](Self::into_error).
@@ -86,6 +88,38 @@ pub fn index_name_in_use(name: &str) -> GraphusError {
         message: format!(
             "There already exists an index or constraint named `{name}`. \
              Use `IF NOT EXISTS` to make the create idempotent."
+        ),
+    }
+    .into_error()
+}
+
+/// A `CREATE CONSTRAINT <name>` whose `name` is already used by another constraint, with no
+/// `IF NOT EXISTS` (`Neo.ClientError.Schema.ConstraintWithNameAlreadyExists`) (`rmp` #638). Names are
+/// unique across every schema catalog; a name colliding with an **index** raises
+/// [`index_name_in_use`] instead (that check runs first in the create path).
+#[must_use]
+pub fn constraint_name_in_use(name: &str) -> GraphusError {
+    SchemaRuleError {
+        code: CODE_CONSTRAINT_NAME_EXISTS,
+        message: format!(
+            "There already exists a constraint named `{name}`. \
+             Use `IF NOT EXISTS` to make the create idempotent, or `OR REPLACE` to replace it."
+        ),
+    }
+    .into_error()
+}
+
+/// A `CREATE CONSTRAINT` whose covered schema (label/type + property tuple + kind) is already
+/// constrained by an equivalent rule, with no `IF NOT EXISTS`
+/// (`Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists`) (`rmp` #638).
+#[must_use]
+pub fn equivalent_constraint_exists(covering: &str, properties: &[&str]) -> GraphusError {
+    SchemaRuleError {
+        code: CODE_EQUIVALENT_EXISTS,
+        message: format!(
+            "An equivalent constraint already exists for `{covering}` on ({}). \
+             Use `IF NOT EXISTS` to make the create idempotent.",
+            properties.join(", ")
         ),
     }
     .into_error()

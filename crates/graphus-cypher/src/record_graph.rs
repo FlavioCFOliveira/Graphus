@@ -239,7 +239,7 @@ fn tuples_match(a: &[Value], b: &[Value]) -> bool {
             .all(|(x, y)| crate::equality::equals(x, y).is_true())
 }
 
-use crate::constraint::ConstraintViolation;
+use crate::constraint::{ConstraintViolation, ViolationEntity};
 use crate::graph_access::{
     DeletedEntity, ExpandDirection, GraphAccess, Incident, NodeId, RelData, RelId,
 };
@@ -1435,6 +1435,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                         self.capture(
                             ConstraintViolation::Existence {
                                 name: constraint_name,
+                                entity: ViolationEntity::Node,
                                 label: label_name,
                                 property: property_name.clone(),
                             }
@@ -1460,6 +1461,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                         self.capture(
                             ConstraintViolation::Uniqueness {
                                 name: constraint_name,
+                                entity: ViolationEntity::Node,
                                 label: label_name,
                                 property: property_name.clone(),
                                 value: render_value(&value),
@@ -1500,6 +1502,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                         self.capture(
                             ConstraintViolation::PropertyType {
                                 name: constraint_name,
+                                entity: ViolationEntity::Node,
                                 label: label_name,
                                 property: property_name.clone(),
                                 expected: crate::constraint::type_descriptor_name(descriptor),
@@ -1510,8 +1513,293 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                         return;
                     }
                 }
+                // Relationship constraints (`rmp` #638) are enforced by `enforce_constraints_for_rel`,
+                // never here — `constraints_for_label` filters them out, so these are unreachable.
+                ConstraintKind::RelUnique
+                | ConstraintKind::RelExistence
+                | ConstraintKind::RelKey
+                | ConstraintKind::RelPropertyType => continue,
             }
         }
+    }
+
+    /// Enforces every declared **relationship** constraint (`rmp` #638) that applies to `rel`'s type,
+    /// capturing a [`ConstraintViolation`] runtime error (with `entity: Relationship`) on the first
+    /// breach so the statement aborts and the transaction rolls back **before commit** — the
+    /// relationship analogue of [`enforce_constraints_for_node`](Self::enforce_constraints_for_node). A
+    /// no-op on the standalone path (no coordinator ⇒ no constraint registry) and when no relationship
+    /// constraint applies.
+    ///
+    /// Called after a relationship write has been applied but **before** commit, at every site that can
+    /// introduce a violation: after `create_rel`'s property loop (checked **once**, so a
+    /// [`RelKey`](ConstraintKind::RelKey)'s existence half is not falsely tripped mid-build), and after
+    /// a standalone `set_rel_property` (value change / removal). Existing data is checked at
+    /// `CREATE CONSTRAINT` time by the coordinator, so this only guards **incremental** writes.
+    ///
+    /// # Uniqueness / key — scan-based (no backing index yet)
+    ///
+    /// There is no durable relationship-property index, so a relationship uniqueness/key duplicate
+    /// search scans the relationships of the type (visible to this transaction) and re-checks each — an
+    /// `O(rels-of-type)` per-write cost that is correct but not index-accelerated (a relationship-property
+    /// index is the planned optimisation). Existence and property-type are pure per-relationship
+    /// predicates read straight from `rel`.
+    fn enforce_constraints_for_rel(&self, rel: RelId) {
+        // No coordinator ⇒ no constraint registry (standalone path); nothing to enforce.
+        let Some(index) = &self.index else {
+            return;
+        };
+        // The relationship's current type token (store borrow released before consulting the registry).
+        let type_token = {
+            let store = self.store.borrow();
+            match store.rel(rel.0) {
+                Ok(r) => r.type_id,
+                Err(_) => return, // cannot read the relationship: a captured store error already aborts
+            }
+        };
+        let rules: Vec<ConstraintRule> = index.borrow().constraints_for_rel_type(type_token);
+        if rules.is_empty() {
+            return;
+        }
+        for rule in rules {
+            // Resolve the covered relationship-type name + every covered property name for a precise
+            // message. A token with no resolvable name cannot apply to a live relationship, so the whole
+            // rule is skipped defensively.
+            let (type_name, property_names) = {
+                let store = self.store.borrow();
+                let Some(type_name) = store
+                    .token_name(Namespace::RelType, rule.label_token)
+                    .map(ToOwned::to_owned)
+                else {
+                    continue;
+                };
+                let mut names = Vec::with_capacity(rule.property_tokens.len());
+                let mut ok = true;
+                for &prop_key in &rule.property_tokens {
+                    match store.token_name(Namespace::PropKey, prop_key) {
+                        Some(p) => names.push(p.to_owned()),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+                (type_name, names)
+            };
+            let constraint_name = index
+                .borrow()
+                .registered_constraints()
+                .into_iter()
+                .find(|(_, r)| *r == rule)
+                .map(|(name, _)| name)
+                .unwrap_or_default();
+
+            match rule.kind {
+                ConstraintKind::RelExistence => {
+                    let property_name = &property_names[0];
+                    let own_value = self.rel_property(rel, property_name);
+                    if own_value.as_ref().is_none_or(Value::is_null) {
+                        self.capture(
+                            ConstraintViolation::Existence {
+                                name: constraint_name,
+                                entity: ViolationEntity::Relationship,
+                                label: type_name,
+                                property: property_name.clone(),
+                            }
+                            .into_error(),
+                        );
+                        return;
+                    }
+                }
+                ConstraintKind::RelUnique => {
+                    let property_name = &property_names[0];
+                    let Some(value) = self
+                        .rel_property(rel, property_name)
+                        .filter(|v| !v.is_null())
+                    else {
+                        continue;
+                    };
+                    if self
+                        .rel_unique_conflict(&type_name, property_name, &value, rel)
+                        .is_some()
+                    {
+                        self.capture(
+                            ConstraintViolation::Uniqueness {
+                                name: constraint_name,
+                                entity: ViolationEntity::Relationship,
+                                label: type_name,
+                                property: property_name.clone(),
+                                value: render_value(&value),
+                            }
+                            .into_error(),
+                        );
+                        return;
+                    }
+                }
+                ConstraintKind::RelKey => {
+                    if let Some(violation) =
+                        self.rel_key_conflict(&constraint_name, &type_name, &property_names, rel)
+                    {
+                        self.capture(violation.into_error());
+                        return;
+                    }
+                }
+                ConstraintKind::RelPropertyType => {
+                    let property_name = &property_names[0];
+                    let Some(value) = self
+                        .rel_property(rel, property_name)
+                        .filter(|v| !v.is_null())
+                    else {
+                        continue;
+                    };
+                    let Some(descriptor) = rule.type_descriptor.as_ref() else {
+                        continue;
+                    };
+                    if !crate::constraint::value_matches_descriptor(&value, descriptor) {
+                        self.capture(
+                            ConstraintViolation::PropertyType {
+                                name: constraint_name,
+                                entity: ViolationEntity::Relationship,
+                                label: type_name,
+                                property: property_name.clone(),
+                                expected: crate::constraint::type_descriptor_name(descriptor),
+                                actual: crate::constraint::value_type_name(&value),
+                            }
+                            .into_error(),
+                        );
+                        return;
+                    }
+                }
+                // Node kinds are enforced by `enforce_constraints_for_node`, never here.
+                ConstraintKind::Unique
+                | ConstraintKind::Existence
+                | ConstraintKind::NodeKey
+                | ConstraintKind::PropertyType => continue,
+            }
+        }
+    }
+
+    /// Finds **another** relationship of type `type_name`, visible to this transaction, whose current
+    /// value for `property` equals `value` by Cypher equality, excluding `self_rel` (`rmp` #638).
+    /// Scan-based (no relationship-property index): walks the relationships of the type and re-checks
+    /// each visible one. Returns the conflicting id, or [`None`].
+    fn rel_unique_conflict(
+        &self,
+        type_name: &str,
+        property: &str,
+        value: &Value,
+        self_rel: RelId,
+    ) -> Option<u64> {
+        let ids = self.store.borrow().scan_rel_ids().ok()?;
+        for id in ids {
+            if id == self_rel.0 {
+                continue;
+            }
+            let r = RelId(id);
+            // Visible + of the covered type? `rel_data` returns `None` for a relationship not visible
+            // to this transaction's snapshot (and SIREAD-marks the examined relationship).
+            let Some(data) = self.rel_data(r) else {
+                continue;
+            };
+            if data.rel_type != type_name {
+                continue;
+            }
+            if let Some(v) = self.rel_property(r, property)
+                && crate::equality::equals(&v, value).is_true()
+            {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    /// Checks a relationship-key constraint for `rel` (`rmp` #638): the covered composite tuple of
+    /// `property_names` must be (a) **complete** — every covered property present and non-null — and
+    /// (b) **unique** among the other relationships of the type. Returns the [`ConstraintViolation`] to
+    /// capture on the first breach, or [`None`] when `rel` conforms. The relationship analogue of
+    /// [`node_key_conflict`](Self::node_key_conflict); scan-based (no backing index).
+    fn rel_key_conflict(
+        &self,
+        constraint_name: &str,
+        type_name: &str,
+        property_names: &[String],
+        rel: RelId,
+    ) -> Option<ConstraintViolation> {
+        // Existence half: build this relationship's own current tuple; a single absent/null covered
+        // property is a key-incomplete breach.
+        let mut tuple = Vec::with_capacity(property_names.len());
+        for property_name in property_names {
+            match self
+                .rel_property(rel, property_name)
+                .filter(|v| !v.is_null())
+            {
+                Some(v) => tuple.push(v),
+                None => {
+                    return Some(ConstraintViolation::NodeKeyMissing {
+                        name: constraint_name.to_owned(),
+                        entity: ViolationEntity::Relationship,
+                        label: type_name.to_owned(),
+                        properties: property_names.to_vec(),
+                    });
+                }
+            }
+        }
+        // Uniqueness half: the complete tuple must not be held by another relationship of the type.
+        if self
+            .rel_key_tuple_conflict(type_name, property_names, &tuple, rel)
+            .is_some()
+        {
+            return Some(ConstraintViolation::NodeKeyDuplicate {
+                name: constraint_name.to_owned(),
+                entity: ViolationEntity::Relationship,
+                label: type_name.to_owned(),
+                properties: property_names.to_vec(),
+                values: render_tuple(&tuple),
+            });
+        }
+        None
+    }
+
+    /// Finds **another** relationship of type `type_name`, visible to this transaction, whose current
+    /// tuple of `property_names` equals `tuple`, excluding `self_rel` (`rmp` #638). Scan-based.
+    fn rel_key_tuple_conflict(
+        &self,
+        type_name: &str,
+        property_names: &[String],
+        tuple: &[Value],
+        self_rel: RelId,
+    ) -> Option<u64> {
+        let ids = self.store.borrow().scan_rel_ids().ok()?;
+        for id in ids {
+            if id == self_rel.0 {
+                continue;
+            }
+            let r = RelId(id);
+            let Some(data) = self.rel_data(r) else {
+                continue;
+            };
+            if data.rel_type != type_name {
+                continue;
+            }
+            // Read this relationship's tuple; an incomplete one is not a duplicate candidate.
+            let mut other = Vec::with_capacity(property_names.len());
+            let mut complete = true;
+            for property_name in property_names {
+                match self.rel_property(r, property_name).filter(|v| !v.is_null()) {
+                    Some(v) => other.push(v),
+                    None => {
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+            if complete && tuples_match(&other, tuple) {
+                return Some(id);
+            }
+        }
+        None
     }
 
     /// Checks a node-key constraint for `node` (`rmp` task #100): the covered composite tuple of
@@ -1544,6 +1832,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 None => {
                     return Some(ConstraintViolation::NodeKeyMissing {
                         name: constraint_name.to_owned(),
+                        entity: ViolationEntity::Node,
                         label: label_name.to_owned(),
                         properties: property_names.to_vec(),
                     });
@@ -1558,6 +1847,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         {
             return Some(ConstraintViolation::NodeKeyDuplicate {
                 name: constraint_name.to_owned(),
+                entity: ViolationEntity::Node,
                 label: label_name.to_owned(),
                 properties: property_names.to_vec(),
                 values: render_tuple(&tuple),
@@ -3030,10 +3320,19 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // Relationship properties are stored over `RelRecord.first_prop` (`rmp` task #44), exactly
         // like node properties on `create_node`. A null entry is not stored (Cypher does not persist
         // nulls); a non-persistable class captures a runtime error rather than dropping it silently.
+        // Defer the per-property relationship-constraint check (`rmp` #638) so a RELATIONSHIP KEY's
+        // existence half is validated **once** on the fully-built edge, not falsely mid-build.
+        self.defer_constraint_check.set(true);
         for (k, v) in properties {
             if !v.is_null() {
                 self.set_rel_property(rel, k, v.clone());
             }
+        }
+        self.defer_constraint_check.set(false);
+        // Enforce relationship constraints once, on the complete relationship (`rmp` #638). A captured
+        // error aborts the statement and rolls the transaction back before commit.
+        if !self.has_error() {
+            self.enforce_constraints_for_rel(rel);
         }
         rel
     }
@@ -3122,6 +3421,11 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 .remove_rel_property_value(self.txn, rel.0, key_id)
             {
                 self.capture(e);
+            } else if !self.defer_constraint_check.get() {
+                // A removal can violate a relationship existence / key constraint (`rmp` #638): enforce
+                // after the removal so the now-absent property is detected. Suppressed while a
+                // multi-property write is mid-flight (the caller checks once at the end).
+                self.enforce_constraints_for_rel(rel);
             }
             return;
         }
@@ -3140,6 +3444,11 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             // `rmp` #510: a non-null relationship property write counts (the `null` branch above is a
             // removal and returned early); count only on store success.
             self.bump(|c| c.properties_set += 1);
+            // Enforce relationship constraints on the now-current value (`rmp` #638) unless a
+            // multi-property write is deferring the single end-of-write check.
+            if !self.defer_constraint_check.get() {
+                self.enforce_constraints_for_rel(rel);
+            }
         }
     }
 
@@ -3311,7 +3620,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     fn replace_rel_properties(&mut self, rel: RelId, properties: &[(String, Value)]) {
         // `SET r = map` replaces the whole property set: clear the existing relationship properties
         // (freeing any overflow chains), then set each non-null entry of the map. Mirrors
-        // `replace_node_properties`; relationships carry no constraints, so no deferred check.
+        // `replace_node_properties`.
         if !self.rel_exists(rel) {
             return;
         }
@@ -3323,10 +3632,18 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             self.capture(e);
             return;
         }
+        // Defer the per-property relationship-constraint check across the overlay, then check once
+        // (`rmp` #638): an interim value could momentarily match another relationship, so a single
+        // final check on the settled state is the correct granularity.
+        self.defer_constraint_check.set(true);
         for (k, v) in properties {
             if !v.is_null() {
                 self.set_rel_property(rel, k, v.clone());
             }
+        }
+        self.defer_constraint_check.set(false);
+        if !self.has_error() {
+            self.enforce_constraints_for_rel(rel);
         }
     }
 
@@ -3336,8 +3653,15 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         if !self.rel_exists(rel) {
             return;
         }
+        // Defer the per-property relationship-constraint check across the overlay, then check once
+        // (`rmp` #638) — see `replace_rel_properties`.
+        self.defer_constraint_check.set(true);
         for (k, v) in properties {
             self.set_rel_property(rel, k, v.clone());
+        }
+        self.defer_constraint_check.set(false);
+        if !self.has_error() {
+            self.enforce_constraints_for_rel(rel);
         }
     }
 
