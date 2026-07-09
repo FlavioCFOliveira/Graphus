@@ -1143,3 +1143,76 @@ async fn remove_property_is_rejected_by_relationship_key_constraint() {
 
     handle.shutdown().await.expect("graceful shutdown");
 }
+
+// =================================================================================================
+// `rmp` #652 — the full Neo4j-5.x property-type set for `IS :: <TYPE>` constraints: temporal,
+// spatial (POINT), closed unions, and `LIST<X NOT NULL>`, enforced end-to-end against real values.
+// =================================================================================================
+
+#[tokio::test]
+async fn property_type_constraint_temporal_point_union_and_list_enforced() {
+    use graphus_storage::ConstraintTypeDescriptor as T;
+    let temp = TempStore::new("proptype_full");
+    let handle = boot(config(&temp)).await;
+    let engine = handle.engine.clone();
+
+    // --- DATE ---
+    run(&engine, "CREATE (:D {id: 1, d: date('2020-01-01')})").await;
+    engine
+        .constraint_ddl(create_property_type("d_is_date", "D", "d", T::Date))
+        .await
+        .expect("DATE property-type constraint over conforming data");
+    run(&engine, "CREATE (:D {id: 2, d: date('2021-06-01')})").await; // conforming
+    run(&engine, "CREATE (:D {id: 3})").await; // absent property is allowed (type ≠ existence)
+    let err = try_run(&engine, "CREATE (:D {id: 4, d: 5})")
+        .await
+        .expect_err("an INTEGER value violates a DATE type constraint");
+    assert_constraint_violation(&err);
+
+    // --- POINT ---
+    engine
+        .constraint_ddl(create_property_type("loc_is_point", "Loc", "p", T::Point))
+        .await
+        .expect("POINT property-type constraint");
+    run(&engine, "CREATE (:Loc {id: 1, p: point({x: 1.0, y: 2.0})})").await;
+    let err = try_run(&engine, "CREATE (:Loc {id: 2, p: 'here'})")
+        .await
+        .expect_err("a STRING value violates a POINT type constraint");
+    assert_constraint_violation(&err);
+
+    // --- Closed union INTEGER | STRING ---
+    engine
+        .constraint_ddl(create_property_type(
+            "code_union",
+            "Code",
+            "c",
+            T::Union(vec![T::Integer, T::String]),
+        ))
+        .await
+        .expect("union property-type constraint");
+    run(&engine, "CREATE (:Code {id: 1, c: 42})").await;
+    run(&engine, "CREATE (:Code {id: 2, c: 'ABC'})").await;
+    let err = try_run(&engine, "CREATE (:Code {id: 3, c: true})")
+        .await
+        .expect_err("a BOOLEAN value conforms to neither INTEGER nor STRING");
+    assert_constraint_violation(&err);
+
+    // --- LIST<INTEGER NOT NULL> ---
+    engine
+        .constraint_ddl(create_property_type(
+            "tags_list",
+            "Tags",
+            "t",
+            T::List(Box::new(T::Integer)),
+        ))
+        .await
+        .expect("list property-type constraint");
+    run(&engine, "CREATE (:Tags {id: 1, t: [1, 2, 3]})").await;
+    // A homogeneous list of the wrong element type (STRING) is storable but violates LIST<INTEGER>.
+    let err = try_run(&engine, "CREATE (:Tags {id: 2, t: ['a', 'b']})")
+        .await
+        .expect_err("a STRING-element list violates LIST<INTEGER NOT NULL>");
+    assert_constraint_violation(&err);
+
+    handle.shutdown().await.expect("graceful shutdown");
+}

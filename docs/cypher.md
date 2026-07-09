@@ -399,15 +399,41 @@ TERMINATE TRANSACTIONS 'graphus-transaction-42'
 ### Constraint DDL
 
 Constraints support `IF NOT EXISTS`, `OR REPLACE`, and both node and relationship targets. Creating
-one reports `constraints-added: 1`.
+one reports `constraints-added: 1`. The four kinds — uniqueness, existence (`NOT NULL`), key, and
+property type — apply to both nodes (`FOR (n:Label)`) and relationships (`FOR ()-[r:TYPE]-()`).
 
 ```cypher
 CREATE CONSTRAINT uq_email    IF NOT EXISTS FOR (p:Person)      REQUIRE p.email IS UNIQUE
 CREATE CONSTRAINT nk_person   IF NOT EXISTS FOR (p:Person)      REQUIRE (p.first, p.last) IS NODE KEY
 CREATE CONSTRAINT ex_name     IF NOT EXISTS FOR (p:Person)      REQUIRE p.name IS NOT NULL
+CREATE CONSTRAINT ty_age      IF NOT EXISTS FOR (p:Person)      REQUIRE p.age IS :: INTEGER
 CREATE CONSTRAINT rk_rated    IF NOT EXISTS FOR ()-[r:RATED]-() REQUIRE (r.a, r.b) IS RELATIONSHIP KEY
 CREATE CONSTRAINT rex_since   IF NOT EXISTS FOR ()-[r:RATED]-() REQUIRE r.since IS NOT NULL
 CREATE OR REPLACE CONSTRAINT uq_email FOR (p:Person) REQUIRE p.email IS UNIQUE
+```
+
+#### Property type constraints — allowed types
+
+A property type constraint (`REQUIRE n.p IS :: <TYPE>`, equivalently `IS TYPED <TYPE>` or `:: <TYPE>`)
+accepts the full Neo4j-5.x closed set of property types:
+
+- **Scalars** — `BOOLEAN`, `STRING`, `INTEGER`, `FLOAT`, `DATE`, `LOCAL TIME`, `ZONED TIME`,
+  `LOCAL DATETIME`, `ZONED DATETIME`, `DURATION`, `POINT` (openCypher synonyms `BOOL`, `VARCHAR`,
+  `INT`, `SIGNED INTEGER` are accepted).
+- **Lists** — `LIST<X NOT NULL>` where `X` is one of the scalars above (e.g. `LIST<STRING NOT NULL>`).
+- **Closed unions** — any `|`-separated union of the above, e.g. `INTEGER | STRING` or
+  `STRING | LIST<STRING NOT NULL>`.
+
+A type constraint checks only *present, non-null* values (it does **not** imply existence). The
+non-property types `NODE`, `RELATIONSHIP`, `PATH`, `MAP`, `ANY`, `NOTHING`, and `NULL` are rejected.
+`VECTOR<…>` property-type constraints are tracked separately (rmp #647).
+
+```cypher
+CREATE CONSTRAINT ty_born  FOR (p:Person)      REQUIRE p.bornOn IS :: DATE
+CREATE CONSTRAINT ty_loc   FOR (p:Place)       REQUIRE p.location IS :: POINT
+CREATE CONSTRAINT ty_code  FOR (p:Product)     REQUIRE p.code IS :: INTEGER | STRING
+CREATE CONSTRAINT ty_tags  FOR (p:Product)     REQUIRE p.tags IS :: LIST<STRING NOT NULL>
+CREATE CONSTRAINT ty_rwhen FOR ()-[r:RATED]-() REQUIRE r.when IS :: ZONED DATETIME
 ```
 
 `SHOW CONSTRAINTS` lists them with columns `name`, `label`, `property`, `type`, `entityType`.

@@ -1618,11 +1618,36 @@ fn parse_constraint_is_clause(
     }
 }
 
-/// Parses an openCypher constraint **type name** for a `IS :: <TYPE>` clause (`rmp` task #100):
-/// `INTEGER`, `FLOAT`, `STRING`, `BOOLEAN`, or `LIST<<TYPE>>` (recursively). The `LIST<…>` angle
-/// brackets are the single `<` / `>` symbols of the lexer. A bare `LIST` (no element type) is rejected
-/// — the openCypher surface for a property-type constraint always names the element type.
+/// Parses a Neo4j property-type-constraint **type** for a `IS :: <TYPE>` clause (`rmp` tasks #100,
+/// #652): the closed set of property types, a `LIST<X [NOT NULL]>` of one of them, and a `|`-separated
+/// closed union of those (`INTEGER | STRING`). Mirrors the property-type subset of the Cypher
+/// expression type grammar (`graphus_cypher::parser::parse_type`), rejecting the non-property types
+/// (`NODE`/`RELATIONSHIP`/`PATH`/`MAP`/`ANY`/`NOTHING`/`NULL`) a property can never hold.
+///
+/// The allowed scalars are `BOOLEAN`, `STRING`, `INTEGER`, `FLOAT`, `DATE`, `LOCAL TIME`, `ZONED TIME`,
+/// `LOCAL DATETIME`, `ZONED DATETIME`, `DURATION`, `POINT` (with the openCypher synonyms `BOOL`,
+/// `VARCHAR`, `INT`, `SIGNED INTEGER`). The `LIST<…>` angle brackets are the single `<` / `>` symbols
+/// of the lexer; a bare `LIST` (no element) is rejected.
 fn parse_constraint_type(
+    lex: &mut Lexer<'_>,
+) -> Result<graphus_storage::ConstraintTypeDescriptor, String> {
+    use graphus_storage::ConstraintTypeDescriptor as T;
+    // A `|`-separated closed union: parse one member, then greedily fold `| member` while a bare pipe
+    // follows. A lone member collapses to itself (no `Union`), matching the expression type grammar.
+    let mut members = vec![parse_constraint_type_member(lex)?];
+    while peek_symbol(lex, '|')? {
+        expect_symbol(lex, '|', "CONSTRAINT")?;
+        members.push(parse_constraint_type_member(lex)?);
+    }
+    Ok(if members.len() == 1 {
+        members.pop().expect("exactly one member")
+    } else {
+        T::Union(members)
+    })
+}
+
+/// Parses a single union member of a constraint type: a scalar, or `LIST<inner [NOT NULL]>`.
+fn parse_constraint_type_member(
     lex: &mut Lexer<'_>,
 ) -> Result<graphus_storage::ConstraintTypeDescriptor, String> {
     use graphus_storage::ConstraintTypeDescriptor as T;
@@ -1639,20 +1664,79 @@ fn parse_constraint_type(
     let upper = word.to_ascii_uppercase();
     match upper.as_str() {
         "INTEGER" | "INT" => Ok(T::Integer),
+        "SIGNED" => {
+            // `SIGNED INTEGER` — the openCypher synonym for `INTEGER`.
+            expect_keyword(lex, "INTEGER", VERB)?;
+            Ok(T::Integer)
+        }
         "FLOAT" => Ok(T::Float),
-        "STRING" => Ok(T::String),
+        "STRING" | "VARCHAR" => Ok(T::String),
         "BOOLEAN" | "BOOL" => Ok(T::Boolean),
-        "LIST" => {
-            // LIST < <element type> >
+        "DATE" => Ok(T::Date),
+        "DURATION" => Ok(T::Duration),
+        "POINT" => Ok(T::Point),
+        // The two-word temporal types (`LOCAL TIME` / `ZONED DATETIME`, …).
+        "LOCAL" => match expect_type_word(lex)?.as_str() {
+            "TIME" => Ok(T::LocalTime),
+            "DATETIME" => Ok(T::LocalDateTime),
+            other => Err(format!(
+                "expected TIME or DATETIME after LOCAL, got `{other}`"
+            )),
+        },
+        "ZONED" => match expect_type_word(lex)?.as_str() {
+            "TIME" => Ok(T::ZonedTime),
+            "DATETIME" => Ok(T::ZonedDateTime),
+            other => Err(format!(
+                "expected TIME or DATETIME after ZONED, got `{other}`"
+            )),
+        },
+        "LIST" | "ARRAY" => {
+            // LIST < <element type> [NOT NULL] >
             expect_symbol(lex, '<', VERB)?;
-            let inner = parse_constraint_type(lex)?;
+            let inner = parse_constraint_type_member(lex)?;
+            // A Neo4j constraint list element is `NOT NULL`; accept (and require nothing more than) the
+            // optional qualifier — the value model already rejects a null element against a scalar.
+            if peek_word_ci(lex, "NOT") {
+                expect_keyword(lex, "NOT", VERB)?;
+                expect_keyword(lex, "NULL", VERB)?;
+            }
             expect_symbol(lex, '>', VERB)?;
             Ok(T::List(Box::new(inner)))
         }
+        // `VECTOR<…>` property-type constraints are a Cypher-25 feature tracked separately (`rmp` #647).
+        "VECTOR" => Err(
+            "VECTOR property-type constraints are not yet supported (tracked by rmp #647)"
+                .to_owned(),
+        ),
+        // The structural / wildcard types a stored property value can never hold.
+        "NODE" | "RELATIONSHIP" | "PATH" | "MAP" | "ANY" | "NOTHING" | "NULL" => Err(format!(
+            "`{upper}` is not a valid property type for a constraint \
+             (allowed: BOOLEAN, STRING, INTEGER, FLOAT, DATE, LOCAL/ZONED TIME, \
+             LOCAL/ZONED DATETIME, DURATION, POINT, LIST<… NOT NULL>, or a union of these)"
+        )),
         other => Err(format!(
-            "unsupported constraint type `{other}` (expected INTEGER, FLOAT, STRING, BOOLEAN or LIST<…>)"
+            "unsupported constraint type `{other}` (allowed: BOOLEAN, STRING, INTEGER, FLOAT, DATE, \
+             LOCAL/ZONED TIME, LOCAL/ZONED DATETIME, DURATION, POINT, LIST<… NOT NULL>, or a union)"
         )),
     }
+}
+
+/// Consumes the next token, requiring it to be a bare [`Tok::Word`], and returns its ASCII-uppercased
+/// text (for the multi-word temporal type names). Errors if the next token is absent or a symbol.
+fn expect_type_word(lex: &mut Lexer<'_>) -> Result<String, String> {
+    match lex.next_tok()? {
+        Some(Tok::Word(w)) => Ok(w.to_ascii_uppercase()),
+        Some(other) => Err(unexpected_generic(&other, "a type name word in CONSTRAINT")),
+        None => Err("expected a type name word in CONSTRAINT".to_owned()),
+    }
+}
+
+/// Peeks whether the next token is the bare word `kw` (ASCII case-insensitive), without consuming it.
+fn peek_word_ci(lex: &mut Lexer<'_>, kw: &str) -> bool {
+    let mut peek = Lexer {
+        rest: lex.rest.clone(),
+    };
+    matches!(peek.next_tok(), Ok(Some(Tok::Word(w))) if w.eq_ignore_ascii_case(kw))
 }
 
 /// Peeks whether the next token is the single symbol `sym`, without consuming it.
@@ -4699,6 +4783,85 @@ mod tests {
         invalid("CREATE CONSTRAINT c FOR (n:Person) REQUIRE n.x IS :: LIST<STRING");
         // A property-type clause must cover exactly one property.
         invalid("CREATE CONSTRAINT c FOR (n:Person) REQUIRE (n.a, n.b) IS :: INTEGER");
+    }
+
+    #[test]
+    fn property_type_constraint_full_type_set_parses() {
+        use graphus_storage::ConstraintTypeDescriptor as T;
+        let pt = |t: T| ConstraintCreateKind::PropertyType { declared_type: t };
+        // Scalars, including the temporal + spatial types (`rmp` #652).
+        assert_eq!(
+            constraint_cmd("CREATE CONSTRAINT c FOR (n:E) REQUIRE n.p IS :: DATE"),
+            node_constraint("c", "E", &["p"], pt(T::Date))
+        );
+        assert_eq!(
+            constraint_cmd("CREATE CONSTRAINT c FOR (n:E) REQUIRE n.p IS :: LOCAL DATETIME"),
+            node_constraint("c", "E", &["p"], pt(T::LocalDateTime))
+        );
+        assert_eq!(
+            constraint_cmd("CREATE CONSTRAINT c FOR (n:E) REQUIRE n.p IS :: ZONED TIME"),
+            node_constraint("c", "E", &["p"], pt(T::ZonedTime))
+        );
+        assert_eq!(
+            constraint_cmd("CREATE CONSTRAINT c FOR (n:E) REQUIRE n.p IS :: POINT"),
+            node_constraint("c", "E", &["p"], pt(T::Point))
+        );
+        assert_eq!(
+            constraint_cmd("CREATE CONSTRAINT c FOR (n:E) REQUIRE n.p IS :: DURATION"),
+            node_constraint("c", "E", &["p"], pt(T::Duration))
+        );
+        // `LIST<X NOT NULL>` and the lenient `LIST<X>` both fold to the same element type.
+        assert_eq!(
+            constraint_cmd(
+                "CREATE CONSTRAINT c FOR (n:E) REQUIRE n.p IS :: LIST<INTEGER NOT NULL>"
+            ),
+            node_constraint("c", "E", &["p"], pt(T::List(Box::new(T::Integer))))
+        );
+        assert_eq!(
+            constraint_cmd("CREATE CONSTRAINT c FOR (n:E) REQUIRE n.p IS :: LIST<POINT>"),
+            node_constraint("c", "E", &["p"], pt(T::List(Box::new(T::Point))))
+        );
+        // Closed unions (`INTEGER | STRING`), including the `IS TYPED` synonym and a list member.
+        assert_eq!(
+            constraint_cmd("CREATE CONSTRAINT c FOR (n:E) REQUIRE n.p IS :: INTEGER | STRING"),
+            node_constraint("c", "E", &["p"], pt(T::Union(vec![T::Integer, T::String])))
+        );
+        assert_eq!(
+            constraint_cmd(
+                "CREATE CONSTRAINT c FOR (n:E) REQUIRE n.p IS TYPED STRING | LIST<STRING NOT NULL>"
+            ),
+            node_constraint(
+                "c",
+                "E",
+                &["p"],
+                pt(T::Union(vec![T::String, T::List(Box::new(T::String))]))
+            )
+        );
+        // Synonyms: SIGNED INTEGER, BOOL, VARCHAR, INT.
+        assert_eq!(
+            constraint_cmd("CREATE CONSTRAINT c FOR (n:E) REQUIRE n.p IS :: SIGNED INTEGER"),
+            node_constraint("c", "E", &["p"], pt(T::Integer))
+        );
+        assert_eq!(
+            constraint_cmd("CREATE CONSTRAINT c FOR (n:E) REQUIRE n.p IS :: VARCHAR"),
+            node_constraint("c", "E", &["p"], pt(T::String))
+        );
+        // A relationship property-type constraint accepts the same set.
+        assert!(matches!(
+            constraint_cmd("CREATE CONSTRAINT c FOR ()-[r:R]-() REQUIRE r.p IS :: ZONED DATETIME"),
+            ConstraintCommand::Create(_)
+        ));
+        // The non-property (structural / wildcard) types are clear errors.
+        invalid("CREATE CONSTRAINT c FOR (n:E) REQUIRE n.p IS :: NODE");
+        invalid("CREATE CONSTRAINT c FOR (n:E) REQUIRE n.p IS :: RELATIONSHIP");
+        invalid("CREATE CONSTRAINT c FOR (n:E) REQUIRE n.p IS :: PATH");
+        invalid("CREATE CONSTRAINT c FOR (n:E) REQUIRE n.p IS :: MAP");
+        invalid("CREATE CONSTRAINT c FOR (n:E) REQUIRE n.p IS :: ANY");
+        invalid("CREATE CONSTRAINT c FOR (n:E) REQUIRE n.p IS :: NULL");
+        invalid("CREATE CONSTRAINT c FOR (n:E) REQUIRE n.p IS :: NOTHING");
+        invalid("CREATE CONSTRAINT c FOR (n:E) REQUIRE n.p IS :: LOCAL WEIRD");
+        // VECTOR property-type constraints are deferred (`rmp` #647).
+        invalid("CREATE CONSTRAINT c FOR (n:E) REQUIRE n.p IS :: VECTOR<FLOAT>(3)");
     }
 
     #[test]

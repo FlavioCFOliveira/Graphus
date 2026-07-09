@@ -233,22 +233,31 @@ impl ConstraintKind {
     }
 }
 
-/// The declared value type a [`ConstraintKind::PropertyType`] constraint enforces (`rmp` task #100).
+/// The declared value type a [`ConstraintKind::PropertyType`] constraint enforces (`rmp` tasks #100,
+/// #652).
 ///
-/// Models the subset of the openCypher type system a `IS :: <TYPE>` property-type constraint can
-/// declare: the scalar types `INTEGER`, `FLOAT`, `STRING`, `BOOLEAN`, and a `LIST<...>` of an
-/// (optional) element type. Storage carries this descriptor **verbatim** and never matches a value
-/// against it — the query layer (`graphus-cypher`) maps each variant onto the
-/// [`graphus_core::Value`](graphus_core::Value) model and performs the type check (exactly as it
-/// interprets the opaque analyzer / histogram bytes). Defining it here keeps the durable
-/// [`ConstraintEntry`] self-contained and lets the byte encoding live beside the other catalog blocks.
+/// Models the **closed set of property types** a Neo4j-5.x `IS :: <TYPE>` property-type constraint can
+/// declare: the scalar types `BOOLEAN`, `STRING`, `INTEGER`, `FLOAT`, the temporal types (`DATE`,
+/// `LOCAL TIME`, `ZONED TIME`, `LOCAL DATETIME`, `ZONED DATETIME`, `DURATION`), `POINT`; a
+/// `LIST<inner>` of one of those (a Neo4j constraint list element is always `NOT NULL`, which the value
+/// model enforces for free — a `null` never matches a concrete scalar); and a closed dynamic
+/// [`Union`](Self::Union) of the above (`INTEGER | STRING`). Storage carries this descriptor
+/// **verbatim** and never matches a value against it — the query layer (`graphus-cypher`) maps each
+/// variant onto the [`graphus_core::Value`](graphus_core::Value) model and performs the type check.
+/// Defining it here keeps the durable [`ConstraintEntry`] self-contained and lets the byte encoding
+/// live beside the other catalog blocks.
 ///
 /// # Wire encoding
 ///
-/// A scalar is a single tag byte; a list is the [`List`](Self::List) tag byte followed by its element
-/// descriptor's own encoding (so `LIST<INTEGER>` is two bytes and a bare `LIST` — element type
-/// unconstrained — is the list tag followed by the [`Any`](Self::Any) tag). [`Any`](Self::Any) exists
-/// only as a list element placeholder ("any element type"); it is never a top-level constraint type.
+/// A scalar is a single tag byte; a [`List`](Self::List) is its tag byte followed by its element
+/// descriptor's own encoding; a [`Union`](Self::Union) is its tag byte, a `u8` member count, then each
+/// member's own encoding. The scalar tags `0..=5` (`INTEGER`/`FLOAT`/`STRING`/`BOOLEAN`/`LIST`/`ANY`)
+/// keep the exact discriminants of the original #100 encoding, so a pre-#652 image decodes unchanged;
+/// the temporal/point/union tags occupy `6..=13`. [`Any`](Self::Any) survives only for backward
+/// compatibility as a list-element wildcard (legacy `LIST<ANY>`); it is never a valid top-level Neo4j
+/// constraint type. [`decode`](Self::decode) rejects an unknown tag (forward-incompatible image),
+/// a member count that would exceed [`MAX_UNION_MEMBERS`](Self::MAX_UNION_MEMBERS), and a nesting
+/// depth beyond [`MAX_TYPE_DEPTH`](Self::MAX_TYPE_DEPTH) (a defensive bound against a crafted image).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConstraintTypeDescriptor {
     /// openCypher `INTEGER` — a [`Value::Integer`](graphus_core::Value::Integer).
@@ -259,18 +268,48 @@ pub enum ConstraintTypeDescriptor {
     String,
     /// openCypher `BOOLEAN` — a [`Value::Boolean`](graphus_core::Value::Boolean).
     Boolean,
-    /// openCypher `LIST<inner>` — a [`Value::List`](graphus_core::Value::List) whose every element
-    /// matches `inner` (a boxed element descriptor). A bare `LIST` (no element type) carries
-    /// [`Any`](Self::Any) as `inner`.
+    /// openCypher `LIST<inner NOT NULL>` — a [`Value::List`](graphus_core::Value::List) whose every
+    /// element matches `inner` (a boxed element descriptor). A `null` element never matches a concrete
+    /// scalar, so the `NOT NULL` element guarantee holds by construction. Legacy images may carry
+    /// [`Any`](Self::Any) as `inner` (a bare `LIST<ANY>`).
     List(Box<ConstraintTypeDescriptor>),
-    /// "Any type" — only ever a [`List`](Self::List) element placeholder, never a top-level type.
+    /// "Any type" — a legacy [`List`](Self::List) element placeholder (`LIST<ANY>`); never a valid
+    /// top-level Neo4j constraint type. Retained only so a pre-#652 image decodes.
     Any,
+    /// openCypher `DATE` — a [`Value::Date`](graphus_core::Value::Date).
+    Date,
+    /// openCypher `LOCAL TIME` — a [`Value::LocalTime`](graphus_core::Value::LocalTime).
+    LocalTime,
+    /// openCypher `ZONED TIME` — a [`Value::ZonedTime`](graphus_core::Value::ZonedTime).
+    ZonedTime,
+    /// openCypher `LOCAL DATETIME` — a [`Value::LocalDateTime`](graphus_core::Value::LocalDateTime).
+    LocalDateTime,
+    /// openCypher `ZONED DATETIME` — a [`Value::ZonedDateTime`](graphus_core::Value::ZonedDateTime).
+    ZonedDateTime,
+    /// openCypher `DURATION` — a [`Value::Duration`](graphus_core::Value::Duration).
+    Duration,
+    /// openCypher `POINT` — a [`Value::Point`](graphus_core::Value::Point).
+    Point,
+    /// A closed dynamic union `A | B | …` (`INTEGER | STRING`): matches a value conforming to **any**
+    /// member. Always carries two or more members (a lone member collapses to that member at parse
+    /// time).
+    Union(Vec<ConstraintTypeDescriptor>),
 }
 
 impl ConstraintTypeDescriptor {
-    /// The single tag byte for a scalar / list / any descriptor (`rmp` task #100). For a
-    /// [`List`](Self::List) this is just the list tag; its element descriptor is encoded separately by
-    /// [`encode`](Self::encode).
+    /// The upper bound on [`Union`](Self::Union) members accepted by [`decode`](Self::decode). The
+    /// closed property-type set is ~18 members, so a `u8` count (max 255) is generous while bounding a
+    /// crafted image's allocation.
+    const MAX_UNION_MEMBERS: usize = 255;
+
+    /// The maximum descriptor nesting depth accepted by [`decode`](Self::decode). A Neo4j constraint
+    /// type nests at most `LIST<scalar>` inside a `union`, so `8` is far beyond any real declaration
+    /// while preventing a crafted image from exhausting the stack via nested `LIST`/`Union` tags.
+    const MAX_TYPE_DEPTH: usize = 8;
+
+    /// The single tag byte for this descriptor (`rmp` tasks #100, #652). For a [`List`](Self::List)
+    /// this is just the list tag; its element descriptor is encoded separately by
+    /// [`encode`](Self::encode). Discriminants `0..=5` are frozen from the #100 encoding.
     const fn tag_byte(&self) -> u8 {
         match self {
             Self::Integer => 0,
@@ -279,31 +318,86 @@ impl ConstraintTypeDescriptor {
             Self::Boolean => 3,
             Self::List(_) => 4,
             Self::Any => 5,
+            Self::Date => 6,
+            Self::LocalTime => 7,
+            Self::ZonedTime => 8,
+            Self::LocalDateTime => 9,
+            Self::ZonedDateTime => 10,
+            Self::Duration => 11,
+            Self::Point => 12,
+            Self::Union(_) => 13,
         }
     }
 
-    /// Appends the self-describing byte encoding of this descriptor to `out` (`rmp` task #100): the tag
-    /// byte, followed — for a [`List`](Self::List) — by its element descriptor's own encoding.
+    /// Appends the self-describing byte encoding of this descriptor to `out` (`rmp` tasks #100, #652):
+    /// the tag byte, followed — for a [`List`](Self::List) — by its element descriptor's own encoding,
+    /// or — for a [`Union`](Self::Union) — by a `u8` member count then each member's encoding.
     fn encode(&self, out: &mut Vec<u8>) {
         out.push(self.tag_byte());
-        if let Self::List(inner) = self {
-            inner.encode(out);
+        match self {
+            Self::List(inner) => inner.encode(out),
+            Self::Union(members) => {
+                debug_assert!(
+                    members.len() <= Self::MAX_UNION_MEMBERS,
+                    "constraint union exceeds the encodable member count"
+                );
+                out.push(members.len() as u8);
+                for member in members {
+                    member.encode(out);
+                }
+            }
+            _ => {}
         }
     }
 
-    /// Decodes a descriptor from `bytes` starting at `cur`, advancing past it (`rmp` task #100).
+    /// Decodes a descriptor from `bytes` starting at `cur`, advancing past it (`rmp` tasks #100, #652).
     ///
     /// # Errors
-    /// Returns a storage error on truncation or an unknown tag byte (a forward-incompatible image).
+    /// Returns a storage error on truncation, an unknown tag byte (a forward-incompatible image), a
+    /// union member count above [`MAX_UNION_MEMBERS`](Self::MAX_UNION_MEMBERS), or a nesting depth
+    /// beyond [`MAX_TYPE_DEPTH`](Self::MAX_TYPE_DEPTH).
     fn decode(bytes: &[u8], cur: &mut usize) -> Result<Self> {
+        Self::decode_at_depth(bytes, cur, 0)
+    }
+
+    fn decode_at_depth(bytes: &[u8], cur: &mut usize, depth: usize) -> Result<Self> {
+        if depth > Self::MAX_TYPE_DEPTH {
+            return Err(GraphusError::Storage(
+                "constraint type descriptor nests beyond the maximum depth".to_owned(),
+            ));
+        }
         let tag = read_u8(bytes, cur)?;
         match tag {
             0 => Ok(Self::Integer),
             1 => Ok(Self::Float),
             2 => Ok(Self::String),
             3 => Ok(Self::Boolean),
-            4 => Ok(Self::List(Box::new(Self::decode(bytes, cur)?))),
+            4 => Ok(Self::List(Box::new(Self::decode_at_depth(
+                bytes,
+                cur,
+                depth + 1,
+            )?))),
             5 => Ok(Self::Any),
+            6 => Ok(Self::Date),
+            7 => Ok(Self::LocalTime),
+            8 => Ok(Self::ZonedTime),
+            9 => Ok(Self::LocalDateTime),
+            10 => Ok(Self::ZonedDateTime),
+            11 => Ok(Self::Duration),
+            12 => Ok(Self::Point),
+            13 => {
+                let n = read_u8(bytes, cur)? as usize;
+                if n > Self::MAX_UNION_MEMBERS {
+                    return Err(GraphusError::Storage(format!(
+                        "constraint union holds too many members ({n})"
+                    )));
+                }
+                let mut members = Vec::with_capacity(n);
+                for _ in 0..n {
+                    members.push(Self::decode_at_depth(bytes, cur, depth + 1)?);
+                }
+                Ok(Self::Union(members))
+            }
             other => Err(GraphusError::Storage(format!(
                 "constraint type descriptor holds unknown tag byte {other}"
             ))),
@@ -2805,6 +2899,75 @@ mod tests {
             back.node_property_index_names(),
             vec![("ix_a".to_owned(), 2, 3), ("ix_b".to_owned(), 7, 1)]
         );
+    }
+
+    #[test]
+    fn constraint_type_descriptor_full_set_round_trips() {
+        use ConstraintKind as K;
+        use ConstraintTypeDescriptor as T;
+        let mk = |kind: K, td: Option<T>| ConstraintEntry {
+            label_token: 1,
+            property_tokens: vec![2],
+            kind,
+            type_descriptor: td,
+        };
+        let mut s = Statistics::new();
+        // One property-type constraint per new (`rmp` #652) type, plus a list and a nested union.
+        s.set_constraint("c_date".to_owned(), mk(K::PropertyType, Some(T::Date)));
+        s.set_constraint(
+            "c_ltime".to_owned(),
+            mk(K::PropertyType, Some(T::LocalTime)),
+        );
+        s.set_constraint(
+            "c_ztime".to_owned(),
+            mk(K::PropertyType, Some(T::ZonedTime)),
+        );
+        s.set_constraint(
+            "c_ldt".to_owned(),
+            mk(K::PropertyType, Some(T::LocalDateTime)),
+        );
+        s.set_constraint(
+            "c_zdt".to_owned(),
+            mk(K::PropertyType, Some(T::ZonedDateTime)),
+        );
+        s.set_constraint("c_dur".to_owned(), mk(K::PropertyType, Some(T::Duration)));
+        s.set_constraint("c_point".to_owned(), mk(K::PropertyType, Some(T::Point)));
+        s.set_constraint(
+            "c_list".to_owned(),
+            mk(K::PropertyType, Some(T::List(Box::new(T::LocalDateTime)))),
+        );
+        s.set_constraint(
+            "c_union".to_owned(),
+            mk(
+                K::RelPropertyType,
+                Some(T::Union(vec![
+                    T::Integer,
+                    T::String,
+                    T::List(Box::new(T::Point)),
+                ])),
+            ),
+        );
+        let back = Statistics::decode(&s.encode()).expect("full descriptor set must round-trip");
+        assert_eq!(back, s);
+        // A legacy `LIST<ANY>` descriptor (a pre-#652 element wildcard) still decodes unchanged.
+        s.set_constraint(
+            "c_legacy".to_owned(),
+            mk(K::PropertyType, Some(T::List(Box::new(T::Any)))),
+        );
+        assert_eq!(Statistics::decode(&s.encode()).unwrap(), s);
+    }
+
+    #[test]
+    fn constraint_type_descriptor_decode_rejects_unknown_tag_and_overdeep_nesting() {
+        use ConstraintTypeDescriptor as T;
+        // An unknown tag byte is a forward-incompatible image, not a panic.
+        let mut cur = 0;
+        assert!(T::decode(&[99u8], &mut cur).is_err());
+        // A crafted chain of nested LIST tags (tag 4) beyond the depth bound is rejected, not a stack
+        // overflow.
+        let deep = vec![4u8; T::MAX_TYPE_DEPTH + 2];
+        let mut cur = 0;
+        assert!(T::decode(&deep, &mut cur).is_err());
     }
 
     #[test]

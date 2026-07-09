@@ -43,6 +43,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   O(rels-of-type) scan while preserving its serializability footprint). `SHOW INDEXES` lists node and
   relationship rows with `entityType` = `NODE` / `RELATIONSHIP`.
 
+### Added
+
+- **Full property-type set for `IS :: <TYPE>` constraints (rmp #652).** Property type constraints now
+  accept the complete Neo4j-5.x closed set: the temporal scalars (`DATE`, `LOCAL TIME`, `ZONED TIME`,
+  `LOCAL DATETIME`, `ZONED DATETIME`, `DURATION`) and `POINT` in addition to `BOOLEAN`/`STRING`/
+  `INTEGER`/`FLOAT`; `LIST<X NOT NULL>` element types; and closed unions (`INTEGER | STRING`,
+  `STRING | LIST<STRING NOT NULL>`). The `IS TYPED <TYPE>` / `:: <TYPE>` synonyms and the openCypher
+  type-name synonyms (`BOOL`, `VARCHAR`, `INT`, `SIGNED INTEGER`) are accepted; the non-property types
+  (`NODE`/`RELATIONSHIP`/`PATH`/`MAP`/`ANY`/`NOTHING`/`NULL`) are rejected with a clear error. The
+  durable constraint-type descriptor was extended with a backward-compatible, depth- and
+  count-bounded wire encoding, and `SHOW CONSTRAINTS` renders the canonical type spelling (e.g.
+  `LIST<STRING NOT NULL>`).
+
 ### Fixed
 
 - **`REMOVE n.p` / `REMOVE r.p` bypassed existence & key constraints (rmp #650, CWE-617/schema

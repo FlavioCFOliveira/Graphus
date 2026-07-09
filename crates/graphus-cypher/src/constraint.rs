@@ -287,15 +287,32 @@ fn render_property_list(properties: &[String]) -> String {
 /// `SHOW CONSTRAINTS`.
 #[must_use]
 pub fn type_descriptor_name(descriptor: &ConstraintTypeDescriptor) -> String {
+    use ConstraintTypeDescriptor as T;
     match descriptor {
-        ConstraintTypeDescriptor::Integer => "INTEGER".to_owned(),
-        ConstraintTypeDescriptor::Float => "FLOAT".to_owned(),
-        ConstraintTypeDescriptor::String => "STRING".to_owned(),
-        ConstraintTypeDescriptor::Boolean => "BOOLEAN".to_owned(),
-        ConstraintTypeDescriptor::List(inner) => {
-            format!("LIST<{}>", type_descriptor_name(inner))
-        }
-        ConstraintTypeDescriptor::Any => "ANY".to_owned(),
+        T::Integer => "INTEGER".to_owned(),
+        T::Float => "FLOAT".to_owned(),
+        T::String => "STRING".to_owned(),
+        T::Boolean => "BOOLEAN".to_owned(),
+        T::Date => "DATE".to_owned(),
+        T::LocalTime => "LOCAL TIME".to_owned(),
+        T::ZonedTime => "ZONED TIME".to_owned(),
+        T::LocalDateTime => "LOCAL DATETIME".to_owned(),
+        T::ZonedDateTime => "ZONED DATETIME".to_owned(),
+        T::Duration => "DURATION".to_owned(),
+        T::Point => "POINT".to_owned(),
+        // Neo4j renders a property-type list element as `NOT NULL` (the only allowed list form); the
+        // legacy `ANY` wildcard (never producible by the current parser) keeps the bare `LIST<ANY>`.
+        T::List(inner) => match inner.as_ref() {
+            T::Any => "LIST<ANY>".to_owned(),
+            other => format!("LIST<{} NOT NULL>", type_descriptor_name(other)),
+        },
+        T::Any => "ANY".to_owned(),
+        // A closed union renders its members `|`-separated, in declared order (`INTEGER | STRING`).
+        T::Union(members) => members
+            .iter()
+            .map(type_descriptor_name)
+            .collect::<Vec<_>>()
+            .join(" | "),
     }
 }
 
@@ -337,20 +354,37 @@ pub fn value_type_name(value: &Value) -> String {
 /// - [`Any`](ConstraintTypeDescriptor::Any) matches every non-null value (the list-element wildcard).
 #[must_use]
 pub fn value_matches_descriptor(value: &Value, descriptor: &ConstraintTypeDescriptor) -> bool {
+    use ConstraintTypeDescriptor as T;
     match descriptor {
-        ConstraintTypeDescriptor::Integer => matches!(value, Value::Integer(_)),
-        ConstraintTypeDescriptor::Float => matches!(value, Value::Float(_)),
-        ConstraintTypeDescriptor::String => matches!(value, Value::String(_)),
-        ConstraintTypeDescriptor::Boolean => matches!(value, Value::Boolean(_)),
-        ConstraintTypeDescriptor::List(inner) => match value {
+        T::Integer => matches!(value, Value::Integer(_)),
+        T::Float => matches!(value, Value::Float(_)),
+        T::String => matches!(value, Value::String(_)),
+        T::Boolean => matches!(value, Value::Boolean(_)),
+        T::Date => matches!(value, Value::Date(_)),
+        T::LocalTime => matches!(value, Value::LocalTime(_)),
+        T::ZonedTime => matches!(value, Value::ZonedTime(_)),
+        T::LocalDateTime => matches!(value, Value::LocalDateTime(_)),
+        T::ZonedDateTime => matches!(value, Value::ZonedDateTime(_)),
+        T::Duration => matches!(value, Value::Duration(_)),
+        T::Point => matches!(value, Value::Point(_)),
+        T::List(inner) => match value {
             Value::List(items) => items
                 .iter()
                 .all(|item| value_matches_descriptor(item, inner)),
+            // Graphus models a byte string as a `LIST<INTEGER NOT NULL>` of its byte values, mirroring
+            // the `IS ::` predicate matcher in `eval.rs`, so a byte string conforms to `LIST<INTEGER>`.
+            Value::Bytes(bytes) => bytes
+                .iter()
+                .all(|&b| value_matches_descriptor(&Value::Integer(i64::from(b)), inner)),
             _ => false,
         },
         // The list-element wildcard: matches any non-null value. (A null never reaches this function —
         // the caller short-circuits a null/absent value before type-checking.)
-        ConstraintTypeDescriptor::Any => !value.is_null(),
+        T::Any => !value.is_null(),
+        // A closed union matches iff the value conforms to any member.
+        T::Union(members) => members
+            .iter()
+            .any(|member| value_matches_descriptor(value, member)),
     }
 }
 
@@ -519,13 +553,36 @@ mod tests {
         assert_eq!(type_descriptor_name(&T::Float), "FLOAT");
         assert_eq!(type_descriptor_name(&T::String), "STRING");
         assert_eq!(type_descriptor_name(&T::Boolean), "BOOLEAN");
+        // Temporal + spatial scalars (`rmp` #652).
+        assert_eq!(type_descriptor_name(&T::Date), "DATE");
+        assert_eq!(type_descriptor_name(&T::LocalTime), "LOCAL TIME");
+        assert_eq!(type_descriptor_name(&T::ZonedTime), "ZONED TIME");
+        assert_eq!(type_descriptor_name(&T::LocalDateTime), "LOCAL DATETIME");
+        assert_eq!(type_descriptor_name(&T::ZonedDateTime), "ZONED DATETIME");
+        assert_eq!(type_descriptor_name(&T::Duration), "DURATION");
+        assert_eq!(type_descriptor_name(&T::Point), "POINT");
+        // A constraint list element is always `NOT NULL` in the canonical Neo4j spelling.
         assert_eq!(
             type_descriptor_name(&T::List(Box::new(T::String))),
-            "LIST<STRING>"
+            "LIST<STRING NOT NULL>"
         );
+        assert_eq!(
+            type_descriptor_name(&T::List(Box::new(T::Point))),
+            "LIST<POINT NOT NULL>"
+        );
+        // The legacy `ANY` element wildcard keeps the bare `LIST<ANY>`.
         assert_eq!(
             type_descriptor_name(&T::List(Box::new(T::Any))),
             "LIST<ANY>"
+        );
+        // A closed union renders its members `|`-separated in declared order.
+        assert_eq!(
+            type_descriptor_name(&T::Union(vec![T::Integer, T::String])),
+            "INTEGER | STRING"
+        );
+        assert_eq!(
+            type_descriptor_name(&T::Union(vec![T::String, T::List(Box::new(T::String)),])),
+            "STRING | LIST<STRING NOT NULL>"
         );
     }
 
@@ -583,5 +640,23 @@ mod tests {
             &Value::List(vec![Value::List(vec![Value::String("x".to_owned())])]),
             &lli
         ));
+
+        // A closed union (`rmp` #652) matches iff the value conforms to any member.
+        let u = T::Union(vec![T::Integer, T::String]);
+        assert!(value_matches_descriptor(&Value::Integer(7), &u));
+        assert!(value_matches_descriptor(&Value::String("x".to_owned()), &u));
+        assert!(!value_matches_descriptor(&Value::Boolean(true), &u));
+        assert!(!value_matches_descriptor(&Value::Float(1.0), &u));
+        // A union nesting a list member: `STRING | LIST<INTEGER NOT NULL>`.
+        let ul = T::Union(vec![T::String, T::List(Box::new(T::Integer))]);
+        assert!(value_matches_descriptor(
+            &Value::String("x".to_owned()),
+            &ul
+        ));
+        assert!(value_matches_descriptor(
+            &Value::List(vec![Value::Integer(1), Value::Integer(2)]),
+            &ul
+        ));
+        assert!(!value_matches_descriptor(&Value::Integer(1), &ul));
     }
 }
