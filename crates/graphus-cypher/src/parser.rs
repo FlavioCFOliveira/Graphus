@@ -59,12 +59,12 @@ use crate::ast::{
     DeleteClause, ExistsSubquery, Expr, ExprKind, ForeachClause, InTransactions, Label, LabelExpr,
     ListComprehension, Literal, LoadCsvClause, MapKey, MapProjection, MapProjectionSelector,
     MatchClause, MergeAction, MergeClause, NodePattern, NormalForm, PatternChainLink,
-    PatternComprehension, PatternElement, PatternPart, PatternPartKind, PredefinedType,
-    PredicateOp, ProcedureCall, ProjectionBody, ProjectionItem, QuantifierExpr, QuantifierKind,
-    Query, QueryBody, ReduceExpr, RelDirection, RelType, RelationshipPattern, RemoveClause,
-    RemoveItem, ReturnClause, SetClause, SetItem, SingleQuery, SortDirection, SortItem,
-    StandaloneCall, StandaloneYield, SubqueryExpr, TypeExpr, UnaryOp, UnionPart, UnwindClause,
-    UseGraph, VarLengthRange, Variable, WithClause, YieldItem,
+    PatternComprehension, PatternElement, PatternPart, PatternPartKind, PatternQuantifier,
+    PredefinedType, PredicateOp, ProcedureCall, ProjectionBody, ProjectionItem, QppInfo,
+    QuantifierExpr, QuantifierKind, Query, QueryBody, ReduceExpr, RelDirection, RelType,
+    RelationshipPattern, RemoveClause, RemoveItem, ReturnClause, SetClause, SetItem, SingleQuery,
+    SortDirection, SortItem, StandaloneCall, StandaloneYield, SubqueryExpr, TypeExpr, UnaryOp,
+    UnionPart, UnwindClause, UseGraph, VarLengthRange, Variable, WithClause, YieldItem,
 };
 use crate::lexer::{IntLiteral, Span, Token, TokenKind, tokenize};
 use graphus_core::GraphusError;
@@ -1516,25 +1516,51 @@ impl<'t, 's> Parser<'t, 's> {
         Ok((PatternPartKind::Normal, self.parse_pattern_element()?))
     }
 
-    /// Parses `PatternElement = NodePattern, { PatternElementChain }`.
+    /// Parses `PatternElement = NodePattern, { PatternElementChain | QuantifiedPathPattern }`.
+    ///
+    /// Besides ordinary `relationship node` chain links, a chain factor may be a **quantified path
+    /// pattern** (QPP, GPM / Neo4j 5.9+) — a parenthesized interior path pattern followed by a
+    /// quantifier, `((x)-[r]->(y) [WHERE p]){q}` — recognised by a doubled opening parenthesis `((`.
+    /// A QPP has no relationship glyph joining it to the surrounding nodes (they are *juxtaposed*), so
+    /// when a QPP appears at the front of a pattern, or without an explicit trailing boundary node, an
+    /// anonymous boundary node is synthesised.
     fn parse_pattern_element(&mut self) -> Result<PatternElement, SyntaxError> {
         let start = self.here_span().start;
-        let node = self.parse_node_pattern()?;
+        // A QPP at the very front has no leading boundary node in the source; synthesise an anonymous
+        // one (juxtaposed with the QPP's interior start node).
+        let node = if self.at_quantified_path_start() {
+            Self::anonymous_node(self.here_span())
+        } else {
+            self.parse_node_pattern()?
+        };
         let mut chain = Vec::new();
-        // A chain link begins with a relationship: an arrow head (`<`) or a dash (`-`/`--`).
-        while self.at_relationship_start() {
-            // `rmp` #589 (E-1 completeness): each hop of a READ path lowers to one nested `Expand`
-            // operator, and a path is parsed iteratively (no `MAX_EXPR_DEPTH` frame) — so a single
-            // `MATCH ()-->()-->…` of thousands of hops is one clause yet a thousands-deep operator tree
-            // that overflows the engine/reader stack at execution. Charge each hop against the shared
-            // structural budget so an over-long path is a recoverable `SyntaxError`, not a process abort.
-            // `CREATE`/`MERGE` paths materialise iteratively (no per-hop recursion) and are not charged.
-            if !self.suppress_hop_charge {
-                self.charge_structural_unit(self.here_span())?;
+        // A chain factor begins with a relationship (`<-`, `-`, `--`) or a quantified path pattern
+        // (`((`). `rmp` #589 (E-1 completeness): each hop of a READ path lowers to one nested `Expand`
+        // operator, and a path is parsed iteratively (no `MAX_EXPR_DEPTH` frame) — so a single
+        // `MATCH ()-->()-->…` of thousands of hops is one clause yet a thousands-deep operator tree
+        // that overflows the engine/reader stack at execution. Charge each factor against the shared
+        // structural budget so an over-long path is a recoverable `SyntaxError`, not a process abort.
+        // `CREATE`/`MERGE` paths materialise iteratively (no per-hop recursion) and are not charged.
+        loop {
+            if self.at_quantified_path_start() {
+                if !self.suppress_hop_charge {
+                    self.charge_structural_unit(self.here_span())?;
+                }
+                chain.push(self.parse_quantified_path_link()?);
+            } else if self.at_relationship_start() {
+                if !self.suppress_hop_charge {
+                    self.charge_structural_unit(self.here_span())?;
+                }
+                let relationship = self.parse_relationship_pattern()?;
+                let node = self.parse_node_pattern()?;
+                chain.push(PatternChainLink {
+                    relationship,
+                    node,
+                    qpp: None,
+                });
+            } else {
+                break;
             }
-            let relationship = self.parse_relationship_pattern()?;
-            let node = self.parse_node_pattern()?;
-            chain.push(PatternChainLink { relationship, node });
         }
         let end = chain.last().map_or(node.span.end, |l| l.node.span.end);
         Ok(PatternElement {
@@ -1550,6 +1576,142 @@ impl<'t, 's> Parser<'t, 's> {
             self.peek_kind(),
             Some(TokenKind::ArrowLeft | TokenKind::Minus | TokenKind::DashDash)
         )
+    }
+
+    /// Whether the current position begins a **quantified path pattern** — a doubled opening
+    /// parenthesis `((`. A node pattern's content never begins with `(` (it is a variable, `:`, `{`,
+    /// `$`, or `)`), so `((` unambiguously starts a parenthesized path pattern.
+    fn at_quantified_path_start(&self) -> bool {
+        matches!(self.peek_kind(), Some(TokenKind::LParen))
+            && matches!(self.peek_at(1).map(|t| &t.kind), Some(TokenKind::LParen))
+    }
+
+    /// Whether the current token begins a **plain** node pattern (`(`, but not the `((` of a QPP).
+    fn at_plain_node_start(&self) -> bool {
+        matches!(self.peek_kind(), Some(TokenKind::LParen)) && !self.at_quantified_path_start()
+    }
+
+    /// Builds a synthesised anonymous node pattern (no variable, labels, or properties) at `span`,
+    /// used for the implicit boundary nodes juxtaposed with a quantified path pattern that has no
+    /// explicit boundary node written in the source.
+    fn anonymous_node(span: Span) -> NodePattern {
+        NodePattern {
+            variable: None,
+            labels: Vec::new(),
+            label_expr: None,
+            properties: None,
+            span,
+        }
+    }
+
+    /// Parses a **quantified path pattern** factor `((interior) [WHERE p]){quantifier}` plus its
+    /// trailing boundary node, returning it as a [`PatternChainLink`] carrying the [`QppInfo`].
+    ///
+    /// The supported subset is a single-relationship interior `(x)-[r]-(y)`; a multi-relationship
+    /// interior, or a nested QPP, is a clear `SyntaxError` (feature not yet implemented). The trailing
+    /// boundary node `(b)` is consumed when a plain node pattern follows the quantifier; otherwise
+    /// (another QPP, a relationship, or the pattern end follows) an anonymous boundary is synthesised.
+    fn parse_quantified_path_link(&mut self) -> Result<PatternChainLink, SyntaxError> {
+        let start = self.here_span().start;
+        self.expect(&TokenKind::LParen, "'(' to begin a quantified path pattern")?;
+        let interior = self.parse_pattern_element()?;
+        let inner_where = if self.eat(&TokenKind::Where) {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        self.expect(&TokenKind::RParen, "')' to close a quantified path pattern")?;
+        let (quantifier, quant_end) = self.parse_quantifier()?;
+
+        // Subset validation: exactly one relationship between two node patterns, no nested QPP.
+        if interior.chain.len() != 1 {
+            return Err(SyntaxError::new(
+                SyntaxErrorKind::Expected {
+                    expected: "a quantified path pattern with a single relationship between two \
+                               nodes (e.g. `((x)-[r]->(y)){1,3}`)"
+                        .to_owned(),
+                    found: format!("an interior with {} relationship(s)", interior.chain.len()),
+                },
+                interior.span,
+            ));
+        }
+        let interior_start = interior.start;
+        // Exactly one link (checked above): destructure it.
+        let interior_link = interior
+            .chain
+            .into_iter()
+            .next()
+            .expect("INVARIANT: interior.chain.len() == 1 checked above");
+        if interior_link.qpp.is_some() {
+            return Err(SyntaxError::new(
+                SyntaxErrorKind::Expected {
+                    expected: "a non-nested quantified path pattern".to_owned(),
+                    found: "a nested quantified path pattern".to_owned(),
+                },
+                Span::new(start, quant_end),
+            ));
+        }
+        let relationship = interior_link.relationship;
+        let interior_end = interior_link.node;
+
+        // Trailing boundary node: an explicit `(b)` if a plain node pattern follows; else anonymous.
+        let boundary = if self.at_plain_node_start() {
+            self.parse_node_pattern()?
+        } else {
+            Self::anonymous_node(self.here_span())
+        };
+        Ok(PatternChainLink {
+            relationship,
+            node: boundary,
+            qpp: Some(Box::new(QppInfo {
+                interior_start,
+                interior_end,
+                quantifier,
+                inner_where,
+                span: Span::new(start, quant_end),
+            })),
+        })
+    }
+
+    /// Parses a quantified-path-pattern quantifier `+ | * | {n} | {n,m} | {n,} | {,m}`, returning the
+    /// [`PatternQuantifier`] and the end offset of the quantifier (for span bookkeeping).
+    fn parse_quantifier(&mut self) -> Result<(PatternQuantifier, usize), SyntaxError> {
+        match self.peek_kind() {
+            Some(TokenKind::Plus) => {
+                let end = self.here_span().end;
+                self.bump();
+                Ok((PatternQuantifier::Plus, end))
+            }
+            Some(TokenKind::Star) => {
+                let end = self.here_span().end;
+                self.bump();
+                Ok((PatternQuantifier::Star, end))
+            }
+            Some(TokenKind::LBrace) => {
+                self.bump(); // `{`
+                let min = self.try_parse_small_int()?;
+                let quant = if self.eat(&TokenKind::Comma) {
+                    // `{n,m}` / `{n,}` / `{,m}` / `{,}`.
+                    let max = self.try_parse_small_int()?;
+                    PatternQuantifier::Range { min, max }
+                } else {
+                    // `{n}` — exactly n; the bound is required.
+                    match min {
+                        Some(n) => PatternQuantifier::Exactly(n),
+                        None => {
+                            return Err(self.expected_here(
+                                "an integer bound inside a quantifier `{n}` / `{n,m}`",
+                            ));
+                        }
+                    }
+                };
+                let close = self.expect(&TokenKind::RBrace, "'}' to close a quantifier")?;
+                Ok((quant, close.span.end))
+            }
+            _ => Err(self.expected_here(
+                "a quantifier ('+', '*', '{n}', or '{n,m}') after a quantified path pattern",
+            )),
+        }
     }
 
     /// Parses `NodePattern = '(', [Variable], [NodeLabels], [Properties], ')'`.

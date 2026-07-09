@@ -202,6 +202,49 @@ pub enum LogicalOp {
         all: bool,
     },
 
+    /// A **quantified path pattern** (QPP, GPM / Neo4j 5.9+): repeat the interior single-hop pattern
+    /// `(group_start)-[relationship]-(group_end)` between `min` and `max` times (inclusive), starting
+    /// from the bound anchor `from` and arriving at `to`, binding the interior variables as **group
+    /// variables** (lists).
+    ///
+    /// The executor runs a depth-first **trail** walk (no relationship traversed twice — extended by
+    /// `prior_rels` across the whole pattern) from `from`, applying the per-iteration
+    /// `interior_predicate` (interior node label/property constraints, interior relationship
+    /// property/type constraints, and the inner `WHERE`, evaluated with the iteration's *scalar*
+    /// `group_start`/`group_end`/`relationship` bindings). Every accepted `k`-iteration walk
+    /// (`min ≤ k ≤ max`) emits one row binding `group_start`/`group_end`/`relationship` to the ordered
+    /// lists of the iterations' start nodes / end nodes / relationships, and `to` to the final node.
+    QuantifiedPath {
+        /// The upstream relation, which must bind [`from`](Self::QuantifiedPath::from).
+        input: Box<LogicalOp>,
+        /// The bound anchor node the walk starts from (the boundary preceding the QPP).
+        from: Var,
+        /// The trailing boundary node — bound to the final node (or, when already bound by `input`,
+        /// only walks ending there are kept).
+        to: Var,
+        /// The interior **start** group variable: the list of every iteration's start node.
+        group_start: Var,
+        /// The interior **end** group variable: the list of every iteration's end node.
+        group_end: Var,
+        /// The interior relationship group variable: the list of traversed relationships (the trail).
+        relationship: Var,
+        /// The interior relationship's traversal direction.
+        direction: RelDirection,
+        /// The interior relationship-type alternatives (`:A|B`); empty means "any type".
+        types: Vec<RelType>,
+        /// The minimum iteration count (inclusive).
+        min: u64,
+        /// The maximum iteration count (inclusive); `None` = unbounded.
+        max: Option<u64>,
+        /// Relationship variables bound by **earlier** links of the same pattern; trail uniqueness
+        /// spans the whole pattern, so a relationship already bound to one of these is not re-walked.
+        prior_rels: Vec<Var>,
+        /// The per-iteration interior predicate, evaluated with the iteration's scalar
+        /// `group_start`/`group_end`/`relationship` bindings; `None` when the interior imposes no
+        /// per-iteration constraint beyond `types`.
+        interior_predicate: Option<Expr>,
+    },
+
     // ---- relational ---------------------------------------------------------------------------
     /// Keep only the input rows for which `predicate` evaluates to `TRUE` (openCypher `WHERE`, and
     /// the implicit filters from inline pattern predicates).
@@ -727,6 +770,34 @@ impl LogicalOp {
                     arrow_left(*direction),
                     fmt_types(types),
                     fmt_range(&Some(*range)),
+                    arrow_right(*direction),
+                )?;
+                input.fmt_indented(f, depth + 1)
+            }
+
+            Self::QuantifiedPath {
+                input,
+                from,
+                to,
+                group_start,
+                group_end,
+                relationship,
+                direction,
+                types,
+                min,
+                max,
+                prior_rels: _,
+                interior_predicate,
+            } => {
+                let max_str = max.map_or_else(String::new, |m| m.to_string());
+                let pred = interior_predicate
+                    .as_ref()
+                    .map_or_else(String::new, |p| format!(" WHERE {}", fmt_expr(p)));
+                writeln!(
+                    f,
+                    "QuantifiedPath(({from})(({group_start}){}{relationship}{}{}({group_end})){{{min},{max_str}}}({to}){pred})",
+                    arrow_left(*direction),
+                    fmt_types(types),
                     arrow_right(*direction),
                 )?;
                 input.fmt_indented(f, depth + 1)

@@ -38,7 +38,7 @@ pub mod error;
 pub mod execution;
 
 pub use cancel::Cancel;
-pub use catalog::GraphCatalog;
+pub use catalog::{GraphCatalog, NodePropertyValues};
 pub use csr::{
     CsrBuilder, CsrGraph, ExternalId, GraphSource, InternalId, Orientation, SimpleUndirectedCsr,
 };

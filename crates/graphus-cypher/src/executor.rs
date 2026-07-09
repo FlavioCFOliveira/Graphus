@@ -398,6 +398,32 @@ enum Operator {
         pending: VecDeque<Row>,
     },
 
+    /// `QuantifiedPath` (QPP, GPM / Neo4j 5.9+): for each input row (anchor `from` bound), run a
+    /// depth-first **trail** walk that repeats the interior single hop between `min` and `max` times,
+    /// applying `interior_predicate` per iteration (with the iteration's *scalar*
+    /// `group_start`/`group_end`/`relationship` bindings). Each accepted `k`-iteration walk emits one
+    /// row binding the three interior group variables to the ordered lists of iteration start nodes /
+    /// end nodes / relationships, and `to` to the final node. When `into`, only walks ending at the
+    /// already-bound `to` are kept. `pending` holds the not-yet-emitted rows of the current input row.
+    QuantifiedPath {
+        input: Box<Operator>,
+        from: Var,
+        to: Var,
+        group_start: Var,
+        group_end: Var,
+        relationship: Var,
+        direction: RelDirection,
+        /// The interior relationship-type names, resolved to owned `String`s once at construction
+        /// (hoisted out of the per-row expand hot loop, as for [`Expand`](Self::Expand)).
+        type_names: Vec<String>,
+        min: u64,
+        max: Option<u64>,
+        prior_rels: Vec<Var>,
+        interior_predicate: Option<Expr>,
+        into: bool,
+        pending: VecDeque<Row>,
+    },
+
     /// `NamedPath`: for each input row, reconstruct the path value bound by `MATCH p = …` from the
     /// pattern part's `start` node and `steps` relationship bindings, binding `variable` to it.
     NamedPath {
@@ -750,6 +776,47 @@ impl Operator {
                     types,
                     *range,
                     *all,
+                    ctx,
+                    pending,
+                )?;
+            },
+
+            Operator::QuantifiedPath {
+                input,
+                from,
+                to,
+                group_start,
+                group_end,
+                relationship,
+                direction,
+                type_names,
+                min,
+                max,
+                prior_rels,
+                interior_predicate,
+                into,
+                pending,
+            } => loop {
+                if let Some(row) = pending.pop_front() {
+                    return Ok(Some(row));
+                }
+                let Some(base) = input.next(ctx)? else {
+                    return Ok(None);
+                };
+                quantified_path_into_pending(
+                    &base,
+                    from,
+                    to,
+                    group_start,
+                    group_end,
+                    relationship,
+                    *direction,
+                    type_names,
+                    *min,
+                    *max,
+                    prior_rels,
+                    interior_predicate.as_ref(),
+                    *into,
                     ctx,
                     pending,
                 )?;
@@ -1332,6 +1399,224 @@ fn var_expand_into_pending(
         ctx,
         pending,
     )
+}
+
+/// Runs a **quantified path pattern** (QPP, GPM / Neo4j 5.9+) trail walk from the base row's anchor,
+/// producing one pending row per accepted `k`-iteration walk (`min ≤ k ≤ max`).
+///
+/// The interior single hop `(group_start)-[relationship]-(group_end)` is repeated by a depth-first
+/// **trail** walk (no relationship traversed twice — extended by `prior_rels` across the whole
+/// pattern). Each hop is pruned by `interior_predicate` (evaluated with the iteration's *scalar*
+/// `group_start`/`group_end`/`relationship` bindings), so an accepted walk is one whose every
+/// iteration satisfies the interior node label/property constraints, the interior relationship
+/// property/type constraints, and the inner `WHERE`. Every accepted walk emits a row binding the
+/// three interior variables to the ordered **group lists** (each iteration's start node / end node /
+/// relationship) and, when not `into`, `to` to the final node. When `into`, only walks ending at the
+/// already-bound `to` node are kept.
+#[allow(clippy::too_many_arguments)]
+fn quantified_path_into_pending(
+    base: &Row,
+    from: &Var,
+    to: &Var,
+    group_start: &Var,
+    group_end: &Var,
+    relationship: &Var,
+    direction: RelDirection,
+    type_names: &[String],
+    min: u64,
+    max: Option<u64>,
+    prior_rels: &[Var],
+    interior_predicate: Option<&Expr>,
+    into: bool,
+    ctx: &mut Ctx<'_>,
+    pending: &mut VecDeque<Row>,
+) -> Result<(), ExecError> {
+    let Some(anchor) = base.get(&from.name).and_then(RowValue::as_node) else {
+        // The anchor is unbound / not a node (e.g. null from an OPTIONAL); emit nothing.
+        return Ok(());
+    };
+    let target = if into {
+        base.get(&to.name).and_then(RowValue::as_node)
+    } else {
+        None
+    };
+    // An `into` walk whose bound target is not a node (a null from an OPTIONAL) can never match.
+    if into && target.is_none() {
+        return Ok(());
+    }
+    // Relationships earlier links of the same pattern already traversed — forbidden in this walk
+    // (relationship isomorphism / trail spans the whole pattern, not just this segment).
+    let forbidden = used_relationships(base, prior_rels);
+    let dir = ExpandDirection::from_pattern(direction);
+
+    // `nodes` is the path node stack `[anchor, n1, …, n_depth]`; `trail` the relationship stack. At
+    // depth `k`, `group_start = nodes[0..k]` (each iteration's start), `group_end = nodes[1..=k]`
+    // (each iteration's end), `relationship = trail`, and the boundary `to = nodes[k]`.
+    #[allow(clippy::too_many_arguments)]
+    fn dfs(
+        depth: u64,
+        current: NodeId,
+        nodes: &mut Vec<NodeId>,
+        trail: &mut Vec<RelId>,
+        min: u64,
+        max: Option<u64>,
+        target: Option<NodeId>,
+        into: bool,
+        dir: ExpandDirection,
+        type_names: &[String],
+        forbidden: &rustc_hash::FxHashSet<RelId>,
+        interior_predicate: Option<&Expr>,
+        base: &Row,
+        group_start: &Var,
+        group_end: &Var,
+        relationship: &Var,
+        to: &Var,
+        ctx: &mut Ctx<'_>,
+        pending: &mut VecDeque<Row>,
+    ) -> Result<(), ExecError> {
+        ctx.check_cancelled()?;
+        // Emit the current walk when it meets the length bound and (for `into`) ends at the target.
+        if depth >= min && (!into || Some(current) == target) {
+            let d = depth as usize;
+            let mut row = base.clone();
+            row.set(
+                group_start.name.clone(),
+                RowValue::list(
+                    nodes[..d]
+                        .iter()
+                        .map(|&id| RowValue::Node(NodeRef { id }))
+                        .collect(),
+                ),
+            );
+            row.set(
+                group_end.name.clone(),
+                RowValue::list(
+                    nodes[1..d + 1]
+                        .iter()
+                        .map(|&id| RowValue::Node(NodeRef { id }))
+                        .collect(),
+                ),
+            );
+            row.set(
+                relationship.name.clone(),
+                RowValue::list(
+                    trail
+                        .iter()
+                        .map(|&id| RowValue::Rel(RelRef { id }))
+                        .collect(),
+                ),
+            );
+            // The trailing boundary node: bound to the final node (for `into` it already equals the
+            // bound target, so leave the existing binding untouched).
+            if !into {
+                row.set(to.name.clone(), RowValue::Node(NodeRef { id: current }));
+            }
+            pending.push_back(row);
+        }
+        if max.is_some_and(|m| depth >= m) {
+            return Ok(());
+        }
+        // Deduplicate self-loops reported once per side; the trail check enforces relationship
+        // uniqueness across the whole walk.
+        let mut seen_rel = rustc_hash::FxHashSet::default();
+        let incidents = ctx.graph.expand(current, dir, type_names);
+        for inc in incidents {
+            if !seen_rel.insert(inc.rel) || trail.contains(&inc.rel) || forbidden.contains(&inc.rel)
+            {
+                continue;
+            }
+            // Per-iteration interior predicate: prune this hop unless it holds with the iteration's
+            // scalar bindings `group_start = current`, `group_end = neighbour`, `relationship = rel`.
+            if let Some(pred) = interior_predicate {
+                if !interior_predicate_holds(
+                    pred,
+                    base,
+                    current,
+                    inc.neighbour,
+                    inc.rel,
+                    group_start,
+                    group_end,
+                    relationship,
+                    ctx,
+                )? {
+                    continue;
+                }
+            }
+            nodes.push(inc.neighbour);
+            trail.push(inc.rel);
+            dfs(
+                depth + 1,
+                inc.neighbour,
+                nodes,
+                trail,
+                min,
+                max,
+                target,
+                into,
+                dir,
+                type_names,
+                forbidden,
+                interior_predicate,
+                base,
+                group_start,
+                group_end,
+                relationship,
+                to,
+                ctx,
+                pending,
+            )?;
+            trail.pop();
+            nodes.pop();
+        }
+        Ok(())
+    }
+
+    let mut nodes = vec![anchor];
+    let mut trail = Vec::new();
+    dfs(
+        0,
+        anchor,
+        &mut nodes,
+        &mut trail,
+        min,
+        max,
+        target,
+        into,
+        dir,
+        type_names,
+        &forbidden,
+        interior_predicate,
+        base,
+        group_start,
+        group_end,
+        relationship,
+        to,
+        ctx,
+        pending,
+    )
+}
+
+/// Evaluates a quantified path pattern's per-iteration interior predicate with the iteration's
+/// **scalar** bindings: `group_start = x` (this iteration's start node), `group_end = y` (its end
+/// node), `relationship = r` (its relationship). A non-`TRUE` (false / null under three-valued logic)
+/// result prunes the hop.
+#[allow(clippy::too_many_arguments)]
+fn interior_predicate_holds(
+    pred: &Expr,
+    base: &Row,
+    x: NodeId,
+    y: NodeId,
+    r: RelId,
+    group_start: &Var,
+    group_end: &Var,
+    relationship: &Var,
+    ctx: &mut Ctx<'_>,
+) -> Result<bool, ExecError> {
+    let mut probe = base.clone();
+    probe.set(group_start.name.clone(), RowValue::Node(NodeRef { id: x }));
+    probe.set(group_end.name.clone(), RowValue::Node(NodeRef { id: y }));
+    probe.set(relationship.name.clone(), RowValue::Rel(RelRef { id: r }));
+    Ok(predicate_truth(pred, &probe, ctx)?.is_true())
 }
 
 /// Expands a hop whose relationship variable is **already bound on the input row** — a relationship
@@ -1956,6 +2241,36 @@ fn build_operator(
             types: types.clone(),
             range: *range,
             all: *all,
+            pending: VecDeque::new(),
+        }),
+        PhysicalOp::QuantifiedPath {
+            input,
+            from,
+            to,
+            group_start,
+            group_end,
+            relationship,
+            direction,
+            types,
+            min,
+            max,
+            prior_rels,
+            interior_predicate,
+            into,
+        } => Ok(Operator::QuantifiedPath {
+            input: Box::new(build_operator(input, arg, ctx)?),
+            from: from.clone(),
+            to: to.clone(),
+            group_start: group_start.clone(),
+            group_end: group_end.clone(),
+            relationship: relationship.clone(),
+            direction: *direction,
+            type_names: types.iter().map(|t| t.name.clone()).collect(),
+            min: *min,
+            max: *max,
+            prior_rels: prior_rels.clone(),
+            interior_predicate: interior_predicate.clone(),
+            into: *into,
             pending: VecDeque::new(),
         }),
         PhysicalOp::NamedPath {
@@ -7069,6 +7384,24 @@ fn result_columns(op: &PhysicalOp, procedures: &dyn ProcedureRegistry) -> Vec<St
             if let Some(p) = path {
                 if !cols.contains(&p.name) {
                     cols.push(p.name.clone());
+                }
+            }
+            cols
+        }
+        PhysicalOp::QuantifiedPath {
+            input,
+            to,
+            group_start,
+            group_end,
+            relationship,
+            ..
+        } => {
+            // The anchor `from` is bound by `input`; this operator introduces the three interior
+            // group variables and the trailing boundary node.
+            let mut cols = result_columns(input, procedures);
+            for v in [group_start, group_end, relationship, to] {
+                if !cols.contains(&v.name) {
+                    cols.push(v.name.clone());
                 }
             }
             cols

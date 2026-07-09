@@ -337,6 +337,12 @@ static TABLE: &[Signature] = &[
         arity: Arity::Exact(2),
         aggregate: false,
     },
+    Signature {
+        // `point.withinBBox(point, lowerLeft, upperRight)` — bounding-box containment (Neo4j 5.x).
+        name: "point.withinbbox",
+        arity: Arity::Exact(3),
+        aggregate: false,
+    },
     // ---- scalar functions -------------------------------------------------------------------
     Signature {
         name: "abs",
@@ -670,8 +676,20 @@ static TABLE: &[Signature] = &[
     },
     // ---- string functions -------------------------------------------------------------------
     Signature {
+        // `btrim(input [, trimCharacterString])` — trim both ends (Neo4j 5.x).
+        name: "btrim",
+        arity: Arity::Range(1, 2),
+        aggregate: false,
+    },
+    Signature {
         name: "left",
         arity: Arity::Exact(2),
+        aggregate: false,
+    },
+    Signature {
+        // `normalize(input [, normalForm])` — Unicode normalization NFC/NFD/NFKC/NFKD (Neo4j 5.x).
+        name: "normalize",
+        arity: Arity::Range(1, 2),
         aggregate: false,
     },
     Signature {

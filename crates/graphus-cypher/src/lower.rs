@@ -97,11 +97,12 @@
 use std::collections::BTreeSet;
 
 use crate::ast::{
-    CallSubqueryClause, Clause, CreateClause, DeleteClause, Expr, ExprKind, ForeachClause,
-    LabelExpr, Literal, LoadCsvClause, MatchClause, MergeAction, MergeClause, NodePattern,
-    PatternElement, PatternPart, PatternPartKind, ProjectionBody, ProjectionItem, Query, QueryBody,
-    RelType, RelationshipPattern, RemoveClause, RemoveItem, SetClause, SetItem, SingleQuery,
-    StandaloneCall, StandaloneYield, UnionPart, UnwindClause,
+    BinaryOp, CallSubqueryClause, Clause, CreateClause, DeleteClause, Expr, ExprKind,
+    ForeachClause, LabelExpr, Literal, LoadCsvClause, MatchClause, MergeAction, MergeClause,
+    NodePattern, PatternChainLink, PatternElement, PatternPart, PatternPartKind, ProjectionBody,
+    ProjectionItem, QppInfo, Query, QueryBody, RelType, RelationshipPattern, RemoveClause,
+    RemoveItem, SetClause, SetItem, SingleQuery, StandaloneCall, StandaloneYield, UnionPart,
+    UnwindClause,
 };
 use crate::function_registry;
 use crate::lexer::Span;
@@ -121,6 +122,117 @@ fn has_label_expr(entity: &Var, expr: LabelExpr, span: Span) -> Expr {
         },
         span,
     )
+}
+
+/// Combines two optional predicates with a boolean `AND`. `None && p == p` (identity).
+fn and_opt(a: Option<Expr>, b: Option<Expr>) -> Option<Expr> {
+    match (a, b) {
+        (None, x) | (x, None) => x,
+        (Some(lhs), Some(rhs)) => {
+            let span = lhs.span;
+            Some(Expr::new(
+                ExprKind::Binary {
+                    op: BinaryOp::And,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                },
+                span,
+            ))
+        }
+    }
+}
+
+/// Builds the AND of `entity.key = value` equalities for an inline property map (or `entity = $param`
+/// for a parameter map), matching [`Planner::filter_inline_props`] but as a single predicate `Expr`
+/// rather than a chain of `Filter` operators — used to fold a quantified path pattern's interior node
+/// / relationship property constraints into its per-iteration predicate.
+fn props_predicate(entity: &Var, properties: Option<&Expr>) -> Option<Expr> {
+    let props = properties?;
+    match &props.kind {
+        ExprKind::Map(entries) => {
+            let mut pred = None;
+            for (key, value) in entries {
+                let lhs = Expr::new(
+                    ExprKind::Property {
+                        base: Box::new(Expr::new(
+                            ExprKind::Variable(entity.name.clone()),
+                            props.span,
+                        )),
+                        key: key.name.clone(),
+                    },
+                    props.span,
+                );
+                let eq = Expr::new(
+                    ExprKind::Binary {
+                        op: BinaryOp::Eq,
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(value.clone()),
+                    },
+                    props.span,
+                );
+                pred = and_opt(pred, Some(eq));
+            }
+            pred
+        }
+        // A parameter map (`$props`): keep as an opaque `entity = $props` equality (rare here).
+        ExprKind::Parameter(_) => Some(Expr::new(
+            ExprKind::Binary {
+                op: BinaryOp::Eq,
+                lhs: Box::new(Expr::new(
+                    ExprKind::Variable(entity.name.clone()),
+                    props.span,
+                )),
+                rhs: Box::new(props.clone()),
+            },
+            props.span,
+        )),
+        _ => None,
+    }
+}
+
+/// The per-iteration constraint predicate for one interior node of a quantified path pattern: its
+/// inline labels (`(x:Person)`) / label expression, and its inline property map, `AND`ed together.
+fn node_constraint_predicate(entity: &Var, node: &NodePattern) -> Option<Expr> {
+    let label_pred = node
+        .label_expr
+        .clone()
+        .or_else(|| LabelExpr::all_of(&node.labels))
+        .map(|le| has_label_expr(entity, le, node.span));
+    and_opt(
+        label_pred,
+        props_predicate(entity, node.properties.as_ref()),
+    )
+}
+
+/// The per-iteration constraint predicate for a quantified path pattern's interior relationship: its
+/// inline property map and any **general** type expression (`[:!A]`, `[:A&B]`). The disjunctive type
+/// fast path (`[:A|B]`) is carried on the operator's `types` field, not here.
+fn rel_constraint_predicate(entity: &Var, rel: &RelationshipPattern) -> Option<Expr> {
+    let type_pred = rel
+        .type_expr
+        .clone()
+        .map(|te| has_label_expr(entity, te, rel.span));
+    and_opt(type_pred, props_predicate(entity, rel.properties.as_ref()))
+}
+
+/// Folds every per-iteration constraint of a quantified path pattern's interior — the two interior
+/// nodes' labels/properties, the interior relationship's properties/type expression, and the inner
+/// `WHERE` — into one predicate `Expr`, or `None` when the interior imposes no per-iteration
+/// constraint beyond the operator's disjunctive `types`.
+#[allow(clippy::too_many_arguments)]
+fn build_interior_predicate(
+    group_start: &Var,
+    interior_start: &NodePattern,
+    group_end: &Var,
+    interior_end: &NodePattern,
+    rel_var: &Var,
+    rel: &RelationshipPattern,
+    inner_where: Option<&Expr>,
+) -> Option<Expr> {
+    let mut pred = node_constraint_predicate(group_start, interior_start);
+    pred = and_opt(pred, node_constraint_predicate(group_end, interior_end));
+    pred = and_opt(pred, rel_constraint_predicate(rel_var, rel));
+    and_opt(pred, inner_where.cloned())
 }
 
 /// Lowers a [`ValidatedQuery`] into a [logical plan](crate::logical) (`04 §7.1`).
@@ -429,6 +541,19 @@ impl Planner {
         let mut from = anchor_var.clone();
         let mut step_rels = Vec::with_capacity(element.chain.len());
         for link in &element.chain {
+            // A quantified path pattern link lowers to a dedicated repetition operator that binds the
+            // interior variables as group lists; it is not an ordinary single-hop expand.
+            if let Some(qpp) = &link.qpp {
+                let (new_plan, boundary_var, group_rel) =
+                    self.lower_quantified_path(plan, &from, link, qpp, pattern_rels);
+                plan = new_plan;
+                // The trail's relationships participate in the pattern's uniqueness set for later
+                // links, and stand in for the (possibly named) path's step relationships.
+                pattern_rels.push(group_rel.clone());
+                step_rels.push(group_rel);
+                from = boundary_var;
+                continue;
+            }
             let rel_var = self.rel_var(&link.relationship);
             let to_var = self.node_var(&link.node);
             let is_var_length = link.relationship.range.is_some();
@@ -559,6 +684,61 @@ impl Planner {
                 .expect("shortestPath relationship is variable-length"),
             all: part.kind == PatternPartKind::AllShortestPaths,
         }
+    }
+
+    /// Lowers a **quantified path pattern** (QPP) link into a [`QuantifiedPath`](LogicalOp::QuantifiedPath)
+    /// operator over `input`, returning `(plan, boundary_var, group_rel_var)`.
+    ///
+    /// The interior single hop `(interior_start)-[relationship]-(interior_end)` is lowered so its
+    /// three variables become **group** variables (lists), the walk starts at the already-bound
+    /// anchor `from`, and it arrives at the trailing boundary node. All per-iteration constraints —
+    /// the interior nodes' inline labels/properties, the interior relationship's inline properties and
+    /// any general type expression, and the inner `WHERE` — are folded into one interior predicate
+    /// evaluated per iteration; the disjunctive relationship types stay on the operator as the
+    /// index-friendly fast path. The trailing boundary node's own inline labels/properties are applied
+    /// as ordinary post-filters (they constrain only the final node).
+    fn lower_quantified_path(
+        &mut self,
+        input: LogicalOp,
+        from: &Var,
+        link: &PatternChainLink,
+        qpp: &QppInfo,
+        pattern_rels: &[Var],
+    ) -> (LogicalOp, Var, Var) {
+        let group_start = self.node_var(&qpp.interior_start);
+        let group_end = self.node_var(&qpp.interior_end);
+        let group_rel = self.rel_var(&link.relationship);
+        let boundary = self.node_var(&link.node);
+        let (min, max) = qpp.quantifier.bounds();
+
+        let interior_predicate = build_interior_predicate(
+            &group_start,
+            &qpp.interior_start,
+            &group_end,
+            &qpp.interior_end,
+            &group_rel,
+            &link.relationship,
+            qpp.inner_where.as_ref(),
+        );
+
+        let plan = LogicalOp::QuantifiedPath {
+            input: Box::new(input),
+            from: from.clone(),
+            to: boundary.clone(),
+            group_start,
+            group_end,
+            relationship: group_rel.clone(),
+            direction: link.relationship.direction,
+            types: link.relationship.types.clone(),
+            min,
+            max,
+            prior_rels: pattern_rels.to_vec(),
+            interior_predicate,
+        };
+        // The trailing boundary node's own inline predicate constrains only the final node.
+        let plan = self.filter_inline_props(plan, link.node.properties.as_ref(), &boundary);
+        let plan = self.filter_inline_labels(plan, &link.node, &boundary);
+        (plan, boundary, group_rel)
     }
 
     /// Wraps a fresh leaf scan so it reads from an [`Argument`](LogicalOp::Argument) of the carried
@@ -1961,6 +2141,20 @@ fn gather_bound_vars(plan: &LogicalOp, out: &mut Vec<Var>) {
             if let Some(p) = path {
                 push_unique(out, p.clone());
             }
+        }
+        LogicalOp::QuantifiedPath {
+            input,
+            to,
+            group_start,
+            group_end,
+            relationship,
+            ..
+        } => {
+            gather_bound_vars(input, out);
+            push_unique(out, to.clone());
+            push_unique(out, group_start.clone());
+            push_unique(out, group_end.clone());
+            push_unique(out, relationship.clone());
         }
         LogicalOp::Filter { input, .. }
         | LogicalOp::Skip { input, .. }

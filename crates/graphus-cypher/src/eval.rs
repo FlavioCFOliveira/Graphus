@@ -1891,6 +1891,17 @@ fn call_function(
                 a
             });
         }
+        // `exists(<property access>)` — the **function** form of property existence (the `EXISTS {…}`
+        // *subquery* form is a separate `ExprKind::ExistsSubquery`, handled in `eval`). Returns `true`
+        // when the argument evaluates to a **non-null** value (i.e. the property exists and is not
+        // null), else `false` — the long-standing boolean-total property-existence semantics, which is
+        // equivalent to `<property access> IS NOT NULL`. A null base (`exists(null.prop)`) yields
+        // `false` because the property access itself evaluates to null. Evaluated at the `RowValue`
+        // level so a structural/entity argument is treated as present (non-null) rather than collapsed.
+        "exists" => {
+            let v = eval(&args[0], row, params, graph, functions, clock)?;
+            return Ok(RowValue::Value(Value::Boolean(!v.is_null())));
+        }
         _ => {}
     }
 
@@ -1932,6 +1943,14 @@ fn call_function(
         "distance" | "point.distance" => {
             crate::spatial_fns::distance(arg(&argv, 0, lower)?, arg(&argv, 1, lower)?)?
         }
+        // `point.withinBBox(point, lowerLeft, upperRight)` — whether the point lies inside the
+        // bounding box (with geographic longitude antimeridian wraparound); `null` on any null
+        // argument or a CRS mismatch (Neo4j 5.x).
+        "point.withinbbox" => crate::spatial_fns::within_bbox(
+            arg(&argv, 0, lower)?,
+            arg(&argv, 1, lower)?,
+            arg(&argv, 2, lower)?,
+        )?,
         // Temporal difference and truncation functions (rmp #53).
         "duration.between" | "duration.inmonths" | "duration.indays" | "duration.inseconds" => {
             crate::temporal_fns::duration_between(
@@ -2046,6 +2065,14 @@ fn call_function(
             |s| s.trim_end().to_owned(),
             "rtrim",
         )?,
+        // `btrim(input [, trimCharacterString])` — trim from **both** ends (Neo4j 5.x). Without the
+        // second argument all leading/trailing whitespace is removed; with it, the trailing/leading
+        // run of characters **in the set** `trimCharacterString` is removed. `null` in either
+        // position yields `null`.
+        "btrim" => btrim_fn(&argv)?,
+        // `normalize(input [, normalForm])` — Unicode normalization (NFC/NFD/NFKC/NFKD; default NFC).
+        // `null` input (or a null form) yields `null`. See `normalize_fn` for the form-argument note.
+        "normalize" => normalize_fn(&argv)?,
         "substring" => substring_fn(&argv)?,
         "replace" => replace_fn(&argv)?,
         "split" => split_fn(&argv)?,
@@ -2758,6 +2785,119 @@ fn string_unary(v: &Value, f: impl Fn(&str) -> String, fname: &str) -> Result<Va
             context: format!("{fname}() requires a string"),
         }),
     }
+}
+
+/// `btrim(input [, trimCharacterString])` (Neo4j 5.x): trims from **both** ends. Without the second
+/// argument all leading/trailing whitespace is removed (like `trim`); with it, any leading/trailing
+/// run of characters drawn from the **set** `trimCharacterString` is removed (PostgreSQL/Neo4j
+/// `btrim` semantics — a character set, not a substring). A `null` in either argument position
+/// yields `null`; a non-string argument is a runtime [`EvalError::TypeError`]. `btrim` can only
+/// shrink the string, so no per-value budget guard is needed.
+fn btrim_fn(argv: &[Value]) -> Result<Value, EvalError> {
+    let s = match arg(argv, 0, "btrim")? {
+        Value::Null => return Ok(Value::Null),
+        Value::String(s) => s,
+        _ => {
+            return Err(EvalError::TypeError {
+                context: "btrim() requires a string".to_owned(),
+            });
+        }
+    };
+    match argv.get(1) {
+        None => Ok(Value::String(s.trim().to_owned())),
+        // A null trim set propagates null.
+        Some(Value::Null) => Ok(Value::Null),
+        Some(Value::String(set)) => {
+            if set.is_empty() {
+                // An empty character set trims nothing.
+                return Ok(Value::String(s.clone()));
+            }
+            // `str::contains(char)` tests membership of `c` in the trim-character set.
+            Ok(Value::String(
+                s.trim_matches(|c: char| set.contains(c)).to_owned(),
+            ))
+        }
+        Some(_) => Err(EvalError::TypeError {
+            context: "btrim() trimCharacterString must be a string".to_owned(),
+        }),
+    }
+}
+
+/// `normalize(input [, normalForm])` (Neo4j 5.x): Unicode normalization to NFC/NFD/NFKC/NFKD
+/// (default NFC). `null` input — or an explicit null form — yields `null`; a non-string input is a
+/// runtime [`EvalError::TypeError`].
+///
+/// # The form argument
+///
+/// In Neo4j the second argument is a bare *keyword* (`NFC`/`NFD`/`NFKC`/`NFKD`). Graphus accepts it
+/// as a **case-insensitive string** (`normalize(s, 'NFKC')`): the keyword spelling would need parser
+/// support (a separate concern), while the single-argument default-`NFC` form matches Neo4j exactly.
+/// An unrecognised form string is a runtime type error.
+fn normalize_fn(argv: &[Value]) -> Result<Value, EvalError> {
+    let s = match arg(argv, 0, "normalize")? {
+        Value::Null => return Ok(Value::Null),
+        Value::String(s) => s,
+        _ => {
+            return Err(EvalError::TypeError {
+                context: "normalize() requires a string".to_owned(),
+            });
+        }
+    };
+    let form = match argv.get(1) {
+        None => NormalForm::Nfc,
+        Some(Value::Null) => return Ok(Value::Null),
+        Some(Value::String(f)) => parse_normal_form(f)?,
+        Some(_) => {
+            return Err(EvalError::TypeError {
+                context: "normalize() normalization form must be a string".to_owned(),
+            });
+        }
+    };
+    normalized_string(s, form).map(Value::String)
+}
+
+/// Maps a case-insensitive form name (`"NFC"`/`"NFD"`/`"NFKC"`/`"NFKD"`) to a [`NormalForm`].
+fn parse_normal_form(name: &str) -> Result<NormalForm, EvalError> {
+    match name.to_ascii_uppercase().as_str() {
+        "NFC" => Ok(NormalForm::Nfc),
+        "NFD" => Ok(NormalForm::Nfd),
+        "NFKC" => Ok(NormalForm::Nfkc),
+        "NFKD" => Ok(NormalForm::Nfkd),
+        other => Err(EvalError::TypeError {
+            context: format!(
+                "normalize() unknown normalization form {other:?}; expected NFC, NFD, NFKC or NFKD"
+            ),
+        }),
+    }
+}
+
+/// Normalizes `s` to `form`, guarding the output against the per-value byte budget (`SEC-191`,
+/// CWE-770 / CWE-789): compatibility decomposition (NFKD/NFKC) can **expand** the byte length (a
+/// ligature or compatibility character maps to several code points), so an attacker could amplify a
+/// near-budget string. The output byte length is computed exactly by walking the normalization
+/// iterator (no result allocation), rejected if over budget, and only then collected.
+fn normalized_string(s: &str, form: NormalForm) -> Result<String, EvalError> {
+    use unicode_normalization::UnicodeNormalization;
+    let out_len: usize = match form {
+        NormalForm::Nfc => s.nfc().map(char::len_utf8).sum(),
+        NormalForm::Nfd => s.nfd().map(char::len_utf8).sum(),
+        NormalForm::Nfkc => s.nfkc().map(char::len_utf8).sum(),
+        NormalForm::Nfkd => s.nfkd().map(char::len_utf8).sum(),
+    };
+    let limit = crate::value_size::max_value_bytes();
+    if out_len > limit {
+        return Err(EvalError::ResourceLimit {
+            detail: format!(
+                "normalize() would produce a {out_len}-byte string (limit {limit} bytes per value)"
+            ),
+        });
+    }
+    Ok(match form {
+        NormalForm::Nfc => s.nfc().collect(),
+        NormalForm::Nfd => s.nfd().collect(),
+        NormalForm::Nfkc => s.nfkc().collect(),
+        NormalForm::Nfkd => s.nfkd().collect(),
+    })
 }
 
 /// `toUpper`/`toLower` with a per-value budget guard (`SEC-191`, CWE-770 / CWE-789). Unlike
@@ -5948,5 +6088,93 @@ mod tests {
         assert_eq!(evaluate("null IS NORMALIZED"), Value::Null);
         assert_eq!(evaluate("null IS NFD NORMALIZED"), Value::Null);
         assert_eq!(evaluate("[1] IS NORMALIZED"), Value::Null);
+    }
+
+    // --- `rmp` #643: residual string / spatial / predicate functions ---------------------------
+
+    #[test]
+    fn normalize_function_default_nfc_and_explicit_forms() {
+        // Decomposed 'ä' ('a' + U+0308) normalizes (default NFC) to the precomposed U+00E4.
+        assert_eq!(evaluate("normalize('a\\u0308')"), s("\u{00E4}"));
+        assert_eq!(evaluate("normalize('a\\u0308', 'NFC')"), s("\u{00E4}"));
+        // NFD decomposes the precomposed 'ä' back to 'a' + combining diaeresis.
+        assert_eq!(evaluate("normalize('\\u00E4', 'NFD')"), s("a\u{0308}"));
+        // The form string is case-insensitive.
+        assert_eq!(evaluate("normalize('a\\u0308', 'nfc')"), s("\u{00E4}"));
+        // NFKC folds the compatibility ligature 'ﬁ' (U+FB01) to 'fi'.
+        assert_eq!(evaluate("normalize('\\uFB01', 'NFKC')"), s("fi"));
+        assert_eq!(evaluate("normalize('\\uFB01', 'NFKD')"), s("fi"));
+        // A plain-ASCII string is unchanged in every form.
+        assert_eq!(evaluate("normalize('abc')"), s("abc"));
+    }
+
+    #[test]
+    fn normalize_function_null_and_errors() {
+        assert_eq!(evaluate("normalize(null)"), Value::Null);
+        // A null form propagates null.
+        assert_eq!(evaluate("normalize('x', null)"), Value::Null);
+        // A non-string input is a type error; an unknown form is a type error.
+        assert!(eval_in(&MemGraph::new(), &Row::empty(), "normalize(1)").is_err());
+        assert!(eval_in(&MemGraph::new(), &Row::empty(), "normalize('x', 'NFX')").is_err());
+    }
+
+    #[test]
+    fn btrim_function_whitespace_and_character_set() {
+        // Default: trim leading/trailing whitespace from both ends.
+        assert_eq!(evaluate("btrim('  hi  ')"), s("hi"));
+        // With a trim-character set: remove any leading/trailing char in the set (order-independent).
+        assert_eq!(evaluate("btrim('xxyhelloyxx', 'xy')"), s("hello"));
+        assert_eq!(evaluate("btrim('__hi__', '_')"), s("hi"));
+        // A set that does not appear at the ends leaves the string unchanged.
+        assert_eq!(evaluate("btrim('hello', 'z')"), s("hello"));
+        // An empty trim set trims nothing.
+        assert_eq!(evaluate("btrim('  hi  ', '')"), s("  hi  "));
+    }
+
+    #[test]
+    fn btrim_function_null_and_errors() {
+        assert_eq!(evaluate("btrim(null)"), Value::Null);
+        assert_eq!(evaluate("btrim(null, 'x')"), Value::Null);
+        // A null trim-character set propagates null.
+        assert_eq!(evaluate("btrim('hi', null)"), Value::Null);
+        assert!(eval_in(&MemGraph::new(), &Row::empty(), "btrim(1)").is_err());
+    }
+
+    #[test]
+    fn exists_function_on_property_access() {
+        let (g, row) = graph_with_node_and_rel();
+        // The node has `name`; a present, non-null property exists.
+        assert_eq!(eval_in(&g, &row, "exists(n.name)").unwrap(), b(true).into());
+        // A missing property does not exist (boolean-total: false, not null).
+        assert_eq!(
+            eval_in(&g, &row, "exists(n.missing)").unwrap(),
+            b(false).into()
+        );
+        // A relationship property likewise.
+        assert_eq!(eval_in(&g, &row, "exists(r.k)").unwrap(), b(true).into());
+        assert_eq!(
+            eval_in(&g, &row, "exists(r.nope)").unwrap(),
+            b(false).into()
+        );
+        // A null base (`exists(<null>.prop)`) is false — the property access is null.
+        assert_eq!(evaluate("exists(null)"), b(false));
+    }
+
+    #[test]
+    fn within_bbox_function_end_to_end() {
+        // Cartesian containment through the function-call path (constructor + withinBBox).
+        assert_eq!(
+            evaluate("point.withinBBox(point({x:5,y:5}), point({x:0,y:0}), point({x:10,y:10}))"),
+            b(true)
+        );
+        assert_eq!(
+            evaluate("point.withinBBox(point({x:11,y:5}), point({x:0,y:0}), point({x:10,y:10}))"),
+            b(false)
+        );
+        // Any null argument -> null.
+        assert_eq!(
+            evaluate("point.withinBBox(null, point({x:0,y:0}), point({x:10,y:10}))"),
+            Value::Null
+        );
     }
 }

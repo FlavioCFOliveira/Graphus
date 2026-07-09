@@ -128,10 +128,11 @@
 
 use crate::ast::{
     BinaryOp, Clause, CreateClause, DeleteClause, Expr, ExprKind, ForeachClause, Literal,
-    LoadCsvClause, MatchClause, MergeAction, MergeClause, NodePattern, PatternElement, PatternPart,
-    PatternPartKind, ProjectionBody, ProjectionItem, Query, QueryBody, RelDirection,
-    RelationshipPattern, RemoveClause, RemoveItem, SetClause, SetItem, SingleQuery, SortItem,
-    StandaloneCall, StandaloneYield, UnaryOp, UnionPart, UnwindClause, Variable, YieldItem,
+    LoadCsvClause, MatchClause, MergeAction, MergeClause, NodePattern, PatternChainLink,
+    PatternElement, PatternPart, PatternPartKind, ProjectionBody, ProjectionItem, QppInfo, Query,
+    QueryBody, RelDirection, RelationshipPattern, RemoveClause, RemoveItem, SetClause, SetItem,
+    SingleQuery, SortItem, StandaloneCall, StandaloneYield, UnaryOp, UnionPart, UnwindClause,
+    Variable, YieldItem,
 };
 use crate::errors::{SemanticError, SemanticErrorKind, VarKind};
 use crate::function_registry::{self, ArityCheck, FunctionRegistry};
@@ -1670,6 +1671,15 @@ impl Analyzer<'_> {
             f(var)?;
         }
         for link in &element.chain {
+            // A QPP link's interior start/end nodes also introduce (group) variables.
+            if let Some(qpp) = &link.qpp {
+                if let Some(var) = &qpp.interior_start.variable {
+                    f(var)?;
+                }
+                if let Some(var) = &qpp.interior_end.variable {
+                    f(var)?;
+                }
+            }
             if let Some(var) = &link.relationship.variable {
                 f(var)?;
             }
@@ -1748,6 +1758,16 @@ impl Analyzer<'_> {
                 part.element.span,
             ));
         }
+        if let Some(qpp) = &part.element.chain[0].qpp {
+            return Err(SemanticError::new(
+                SemanticErrorKind::InvalidQuantifiedPath {
+                    reason: "a quantified path pattern cannot appear inside \
+                             shortestPath/allShortestPaths"
+                        .to_owned(),
+                },
+                qpp.span,
+            ));
+        }
         let rel = &part.element.chain[0].relationship;
         if rel.range.is_none() {
             return Err(SemanticError::new(
@@ -1785,9 +1805,116 @@ impl Analyzer<'_> {
         }
         self.bind_node_pattern(&element.start, scope, role)?;
         for link in &element.chain {
-            self.bind_relationship_pattern(&link.relationship, scope, role)?;
-            self.bind_node_pattern(&link.node, scope, role)?;
+            if let Some(qpp) = &link.qpp {
+                self.bind_quantified_path(link, qpp, scope, role)?;
+            } else {
+                self.bind_relationship_pattern(&link.relationship, scope, role)?;
+                self.bind_node_pattern(&link.node, scope, role)?;
+            }
         }
+        Ok(())
+    }
+
+    /// Binds the variables of a **quantified path pattern** (QPP) link and validates its shape.
+    ///
+    /// The interior variables (`x`/`y` nodes, `r` relationship) become **group variables** — lists in
+    /// the outer scope — while the trailing boundary node stays a scalar. The interior's inline
+    /// property predicates and inner `WHERE` are validated in a temporary scope where the interior
+    /// variables are *scalars* (their per-iteration bindings). QPP is read-only: it may not appear in
+    /// a `CREATE`/`MERGE` pattern.
+    fn bind_quantified_path(
+        &self,
+        link: &PatternChainLink,
+        qpp: &QppInfo,
+        scope: &mut Scope,
+        role: PatternRole,
+    ) -> Result<(), SemanticError> {
+        // A QPP is a read-only match construct; it never constructs entities.
+        if role.is_write() {
+            return Err(SemanticError::new(
+                SemanticErrorKind::InvalidQuantifiedPath {
+                    reason: "a quantified path pattern cannot appear in a CREATE or MERGE pattern"
+                        .to_owned(),
+                },
+                qpp.span,
+            ));
+        }
+        // Quantifier consistency: the lower bound may not exceed the upper bound.
+        let (min, max) = qpp.quantifier.bounds();
+        if let Some(m) = max {
+            if min > m {
+                return Err(SemanticError::new(
+                    SemanticErrorKind::InvalidQuantifiedPath {
+                        reason: format!(
+                            "the quantifier lower bound {min} exceeds its upper bound {m}"
+                        ),
+                    },
+                    qpp.span,
+                ));
+            }
+        }
+        // The two interior endpoint nodes are *distinct* group variables (each iteration's start and
+        // end). Naming them the same would demand a per-iteration self-loop (`(x)-[]->(x)`) that a
+        // single group binding cannot represent here — a documented deferral, rejected with a clear
+        // error rather than a silently-wrong list.
+        if let (Some(start), Some(end)) = (&qpp.interior_start.variable, &qpp.interior_end.variable)
+        {
+            if start.name == end.name {
+                return Err(SemanticError::new(
+                    SemanticErrorKind::InvalidQuantifiedPath {
+                        reason: format!(
+                            "the interior start and end nodes cannot share the variable `{}` \
+                             (per-iteration self-loop QPP is not yet supported)",
+                            start.name
+                        ),
+                    },
+                    qpp.span,
+                ));
+            }
+        }
+
+        // Validate the interior in a scope where its variables are SCALARS (one iteration's
+        // bindings), so the interior nodes' inline predicates and the inner WHERE type-check as if
+        // over a single hop. This temporary scope does not leak the scalar bindings to the outer
+        // scope; the outer scope instead receives the group (list) bindings below.
+        let mut interior_scope = scope.clone();
+        self.bind_node_pattern(&qpp.interior_start, &mut interior_scope, PatternRole::Read)?;
+        self.bind_relationship_pattern(&link.relationship, &mut interior_scope, PatternRole::Read)?;
+        self.bind_node_pattern(&qpp.interior_end, &mut interior_scope, PatternRole::Read)?;
+        if let Some(where_expr) = &qpp.inner_where {
+            self.check_expr(where_expr, &interior_scope)?;
+            Self::check_pattern_predicate_placement(where_expr, true)?;
+            self.reject_aggregation(where_expr, "a quantified path pattern WHERE")?;
+        }
+
+        // Introduce the group variables into the outer scope: interior nodes are lists of nodes, the
+        // interior relationship is a list of relationships (`04 §GPM` group-variable semantics).
+        if let Some(var) = &qpp.interior_start.variable {
+            scope.bind_typed(
+                &var.name,
+                VarKind::Value,
+                SType::List(Box::new(SType::Node)),
+                var.span,
+            )?;
+        }
+        if let Some(var) = &link.relationship.variable {
+            scope.bind_typed(
+                &var.name,
+                VarKind::Value,
+                SType::List(Box::new(SType::Relationship)),
+                var.span,
+            )?;
+        }
+        if let Some(var) = &qpp.interior_end.variable {
+            scope.bind_typed(
+                &var.name,
+                VarKind::Value,
+                SType::List(Box::new(SType::Node)),
+                var.span,
+            )?;
+        }
+        // The trailing boundary node is a scalar singleton in the outer scope.
+        self.bind_node_pattern(&link.node, scope, role)?;
         Ok(())
     }
 
@@ -2069,6 +2196,7 @@ impl Analyzer<'_> {
                 if let Some(var) = &pc.var {
                     inner.bind(&var.name, VarKind::Value, var.span)?;
                 }
+                reject_qpp_in_element(&pc.element, "a pattern comprehension")?;
                 self.bind_pattern_element(&pc.element, &mut inner, PatternRole::Read)?;
                 if let Some(pred) = &pc.predicate {
                     self.check_expr_refs(pred, &inner)?;
@@ -2126,7 +2254,9 @@ impl Analyzer<'_> {
                     }
                 }
                 // The pattern binds its variables locally (outer bindings stay visible as
-                // constraints); the WHERE predicate sees both.
+                // constraints); the WHERE predicate sees both. The pattern form is matched by the
+                // row-at-a-time evaluator, which does not model quantified path patterns.
+                reject_qpp_in_parts(&ex.pattern, "a pattern-form EXISTS subquery")?;
                 let mut inner = scope.clone();
                 for part in &ex.pattern {
                     self.bind_pattern_part(part, &mut inner, PatternRole::Read)?;
@@ -2179,6 +2309,7 @@ impl Analyzer<'_> {
         // Pattern form (`COUNT { (a)-->(b) [WHERE p] }`); the parser guarantees `COLLECT` is always
         // the full-query form, so a pattern-form `COLLECT` is unreachable.
         debug_assert!(!is_collect, "COLLECT is always the full-query form");
+        reject_qpp_in_parts(&sq.pattern, "a pattern-form COUNT subquery")?;
         let mut inner = scope.clone();
         for part in &sq.pattern {
             self.bind_pattern_part(part, &mut inner, PatternRole::Read)?;
@@ -2968,6 +3099,39 @@ impl PatternRole {
 
 /// Whether any node or relationship variable inside `element` is named `name` (the same-pattern
 /// path-name re-use check, TCK `VariableAlreadyBound`).
+/// Returns an error if `element`'s chain contains any **quantified path pattern** (QPP).
+///
+/// QPP is supported only in top-level `MATCH`/`OPTIONAL MATCH` patterns (and the full-query form of
+/// `EXISTS`/`COUNT`/`COLLECT` subqueries), which the planner lowers to a repetition operator. The
+/// embedded expression-pattern contexts — pattern predicates, pattern comprehensions, and the
+/// *pattern form* of `EXISTS`/`COUNT` subqueries — are matched by the row-at-a-time evaluator
+/// ([`crate::eval`]), which does not model quantification, so a QPP there is a clear compile-time
+/// error rather than a silently-wrong match.
+fn reject_qpp_in_element(
+    element: &PatternElement,
+    context: &'static str,
+) -> Result<(), SemanticError> {
+    for link in &element.chain {
+        if let Some(qpp) = &link.qpp {
+            return Err(SemanticError::new(
+                SemanticErrorKind::InvalidQuantifiedPath {
+                    reason: format!("a quantified path pattern is not supported in {context}"),
+                },
+                qpp.span,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// [`reject_qpp_in_element`] over each part of a pattern-form subquery.
+fn reject_qpp_in_parts(parts: &[PatternPart], context: &'static str) -> Result<(), SemanticError> {
+    for part in parts {
+        reject_qpp_in_element(&part.element, context)?;
+    }
+    Ok(())
+}
+
 fn element_uses_name(element: &PatternElement, name: &str) -> bool {
     let node_uses =
         |node: &crate::ast::NodePattern| node.variable.as_ref().is_some_and(|v| v.name == name);

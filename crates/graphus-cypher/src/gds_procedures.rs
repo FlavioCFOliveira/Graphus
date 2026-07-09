@@ -58,7 +58,9 @@ use graphus_gds::algo::scc::strongly_connected_components;
 use graphus_gds::algo::shortest_path::{bellman_ford, dijkstra};
 use graphus_gds::algo::triangles::triangle_count;
 use graphus_gds::algo::wcc::weakly_connected_components;
-use graphus_gds::{Cancel, CsrBuilder, CsrGraph, GdsError, GraphCatalog, Orientation};
+use graphus_gds::{
+    Cancel, CsrBuilder, CsrGraph, GdsError, GraphCatalog, NodePropertyValues, Orientation,
+};
 
 use crate::graph_access::{ExpandDirection, GraphAccess, NodeId};
 use crate::procedure_registry::{
@@ -443,6 +445,7 @@ pub fn register_gds_procedures(set: &mut ProcedureSet, catalog: GdsCatalogHandle
     register_centrality(set, &catalog);
     register_community(set, &catalog);
     register_pathfinding(set, &catalog);
+    register_execution_modes(set, &catalog);
 }
 
 /// Registers the graph-lifecycle procedures.
@@ -974,6 +977,750 @@ fn shortest_path_rows(
     Ok(rows)
 }
 
+// =================================================================================================
+// Execution modes: `.stats`, `.mutate`, `.write` for the node-property algorithms (`rmp` task #643)
+// =================================================================================================
+//
+// Neo4j GDS runs each algorithm in one of four execution modes: `stream` (already registered above),
+// `stats` (summary statistics only, no writes), `mutate` (write the result as a node property into
+// the **in-memory projection**), and `write` (write the result as a node property back to the
+// **database**). This section adds `stats`/`mutate`/`write` for the node-property-producing
+// algorithms (the path algorithms `dijkstra`/`bellmanFord` write *relationships*/paths, a different
+// seam, and keep their `stream` form only — a documented follow-up).
+//
+// # Faithful, curated column set (CLAUDE.md: never guess; scope and document)
+//
+// Neo4j's YIELD column set is algorithm- and mode-specific and includes distribution *histograms*
+// (`centralityDistribution` / `componentDistribution`) computed with an internal HdrHistogram. This
+// engine emits a **faithful curated subset** whose column **names and types match Neo4j exactly**
+// (so a driver's `YIELD nodePropertiesWritten, computeMillis, …` binds by name), and computes the
+// distribution maps **honestly** from the result vector (a well-defined nearest-rank percentile —
+// see [`distribution_map`] — rather than fabricating Neo4j's exact histogram). The column **order**
+// is normalized across algorithms (Cypher binds `YIELD` by name, so order affects only a standalone
+// `CALL` display). Mode millis are measured; the `preProcessingMillis`/`postProcessingMillis` phases
+// are reported honestly (0 for the negligible ones).
+
+/// A GDS execution mode with a node-property result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Summary statistics only — no property is written anywhere.
+    Stats,
+    /// Write the property into the in-memory projection (the GDS catalog).
+    Mutate,
+    /// Write the property back to the database (through the transactional [`GraphAccess`] seam).
+    Write,
+}
+
+/// The algorithm-specific column shape shared by an algorithm's three mode procedures.
+#[derive(Debug, Clone, Copy)]
+struct ModeColumns {
+    /// Leading summary columns (name + class), matching [`NodePropOutcome::summary`] in order. For
+    /// pageRank this is `[("ranIterations", Integer), ("didConverge", Boolean)]`; for wcc/scc it is
+    /// `[("componentCount", Integer)]`; etc.
+    summary: &'static [(&'static str, ValueClass)],
+    /// The distribution column name, if the algorithm produces one (`"centralityDistribution"` /
+    /// `"componentDistribution"` / `"communityDistribution"`), else `None`.
+    distribution: Option<&'static str>,
+}
+
+/// The result of one node-property algorithm run, ready for the stats/mutate/write emitters.
+struct NodePropOutcome {
+    /// Per-internal-id property values (Double for scores, Long for community/component/count ids),
+    /// sized == the projection's node count.
+    values: NodePropertyValues,
+    /// Summary column **values**, in the order declared by [`ModeColumns::summary`].
+    summary: Vec<Value>,
+    /// The distribution map value — present iff [`ModeColumns::distribution`] is `Some`.
+    distribution: Option<Value>,
+}
+
+/// A node-property algorithm's compute step: resolve config from `args`, run the algorithm on the
+/// projected `graph`, and produce the [`NodePropOutcome`]. Shared by an algorithm's three modes.
+type ComputeFn = Arc<
+    dyn Fn(&str, &CsrGraph, &[Value]) -> Result<NodePropOutcome, ProcedureFailure> + Send + Sync,
+>;
+
+/// One non-nullable `ANY`-classed output field (used for the `Map`-valued columns — [`ValueClass`]
+/// has no dedicated `Map` class, and a [`Value::Map`] egresses through `Any`).
+fn out_map(name: &str) -> FieldSpec {
+    FieldSpec::new(name, FieldType::required(ValueClass::Any))
+}
+
+/// One nullable `ANY`-classed output field (the distribution map, `null` on an empty graph).
+fn out_map_nullable(name: &str) -> FieldSpec {
+    FieldSpec::new(name, FieldType::nullable(ValueClass::Any))
+}
+
+/// Builds the ordered output field list for `mode` given the algorithm's `cols` (kept in lockstep
+/// with [`mode_row`]).
+fn mode_output_fields(cols: &ModeColumns, mode: Mode) -> Vec<FieldSpec> {
+    let mut fields = Vec::new();
+    for (name, class) in cols.summary {
+        fields.push(out(name, *class));
+    }
+    if mode != Mode::Stats {
+        fields.push(out("nodePropertiesWritten", ValueClass::Integer));
+    }
+    fields.push(out("preProcessingMillis", ValueClass::Integer));
+    fields.push(out("computeMillis", ValueClass::Integer));
+    match mode {
+        Mode::Write => fields.push(out("writeMillis", ValueClass::Integer)),
+        Mode::Mutate => fields.push(out("mutateMillis", ValueClass::Integer)),
+        Mode::Stats => {}
+    }
+    fields.push(out("postProcessingMillis", ValueClass::Integer));
+    if let Some(dist) = cols.distribution {
+        fields.push(out_map_nullable(dist));
+    }
+    fields.push(out_map("configuration"));
+    fields
+}
+
+/// The timing components of a mode run (all in whole milliseconds).
+struct ModeTiming {
+    pre_ms: i64,
+    compute_ms: i64,
+    /// The write/mutate phase (ignored for `stats`).
+    mode_ms: i64,
+    post_ms: i64,
+}
+
+/// Builds the single result row for `mode` (kept in lockstep with [`mode_output_fields`]).
+fn mode_row(
+    outcome: &NodePropOutcome,
+    cols: &ModeColumns,
+    mode: Mode,
+    node_props_written: i64,
+    timing: &ModeTiming,
+    configuration: Value,
+) -> Vec<Value> {
+    let mut row = outcome.summary.clone();
+    if mode != Mode::Stats {
+        row.push(Value::Integer(node_props_written));
+    }
+    row.push(Value::Integer(timing.pre_ms));
+    row.push(Value::Integer(timing.compute_ms));
+    match mode {
+        Mode::Write | Mode::Mutate => row.push(Value::Integer(timing.mode_ms)),
+        Mode::Stats => {}
+    }
+    row.push(Value::Integer(timing.post_ms));
+    if cols.distribution.is_some() {
+        row.push(outcome.distribution.clone().unwrap_or(Value::Null));
+    }
+    row.push(configuration);
+    row
+}
+
+/// Whole milliseconds elapsed since `start`, saturated into `i64` (never negative, never overflows).
+fn elapsed_ms(start: Instant) -> i64 {
+    i64::try_from(start.elapsed().as_millis()).unwrap_or(i64::MAX)
+}
+
+/// Echoes the resolved `configuration` map: the user's config map (if any) plus the mode's resolved
+/// property key (`writeProperty` / `mutateProperty`), the latter overriding a user duplicate.
+fn config_echo(args: &[Value], extra: &[(&str, Value)]) -> Value {
+    let mut entries: Vec<(String, Value)> = match args.get(1) {
+        Some(Value::Map(m)) => m.clone(),
+        _ => Vec::new(),
+    };
+    for (k, v) in extra {
+        entries.retain(|(ek, _)| ek != k);
+        entries.push(((*k).to_owned(), v.clone()));
+    }
+    Value::Map(entries)
+}
+
+/// Extracts a required non-empty string config value (`writeProperty` / `mutateProperty`) from the
+/// config map, erroring clearly when it is absent (write/mutate require it, like Neo4j GDS).
+fn required_property(name: &str, args: &[Value], key: &str) -> Result<String, ProcedureFailure> {
+    config_string(args, 1, key).ok_or_else(|| {
+        ProcedureFailure::new(
+            name,
+            format!("the config map must carry a non-empty `{key}` string"),
+        )
+    })
+}
+
+/// A well-defined distribution summary of `values`: `{min, mean, max, p50, p75, p90, p95, p99,
+/// p999}`. Percentiles use the **nearest-rank** method on a sorted copy (NaN-safe via
+/// [`f64::total_cmp`]). An empty input yields an empty map. This is the honest, independently-computed
+/// analogue of Neo4j's `centralityDistribution` / `componentDistribution` (whose exact HdrHistogram
+/// values an independent implementation neither can nor should reproduce).
+fn distribution_map(values: &[f64]) -> Value {
+    if values.is_empty() {
+        return Value::Map(Vec::new());
+    }
+    let mut sorted: Vec<f64> = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let n = sorted.len();
+    let sum: f64 = sorted.iter().sum();
+    let mean = sum / n as f64;
+    // Nearest-rank percentile: the value at ceil(p/100 · n), 1-based, clamped into range.
+    let percentile = |p: f64| -> f64 {
+        let rank = ((p / 100.0) * n as f64).ceil() as usize;
+        sorted[rank.saturating_sub(1).min(n - 1)]
+    };
+    Value::Map(vec![
+        ("min".to_owned(), Value::Float(sorted[0])),
+        ("mean".to_owned(), Value::Float(mean)),
+        ("max".to_owned(), Value::Float(sorted[n - 1])),
+        ("p50".to_owned(), Value::Float(percentile(50.0))),
+        ("p75".to_owned(), Value::Float(percentile(75.0))),
+        ("p90".to_owned(), Value::Float(percentile(90.0))),
+        ("p95".to_owned(), Value::Float(percentile(95.0))),
+        ("p99".to_owned(), Value::Float(percentile(99.0))),
+        ("p999".to_owned(), Value::Float(percentile(99.9))),
+    ])
+}
+
+/// The per-community aggregation shared by wcc / scc / labelPropagation: the property values (each
+/// node's community/component external id), the distinct community count, and the distribution of
+/// community **sizes**. `component[i]` is the internal representative id of node `i`.
+struct CommunityAgg {
+    /// Per-internal-id external community id (the representative's external id).
+    values: Vec<i64>,
+    /// The number of distinct communities.
+    count: i64,
+    /// The distribution of community sizes.
+    distribution: Value,
+}
+
+fn aggregate_communities(graph: &CsrGraph, component: &[u32]) -> CommunityAgg {
+    let externals = graph.external_ids();
+    // Count nodes per representative.
+    let mut sizes: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+    for &c in component {
+        *sizes.entry(c).or_insert(0) += 1;
+    }
+    let count = sizes.len() as i64;
+    let size_vec: Vec<f64> = sizes.values().map(|&s| s as f64).collect();
+    let distribution = distribution_map(&size_vec);
+    // Map each node's representative to its external id (falling back to the raw internal id when the
+    // representative has no external mapping — defensive; every projected node has one).
+    let values: Vec<i64> = component
+        .iter()
+        .map(|&c| externals.get(c as usize).copied().unwrap_or(u64::from(c)) as i64)
+        .collect();
+    CommunityAgg {
+        values,
+        count,
+        distribution,
+    }
+}
+
+/// Writes `values` back to the database as node property `property` (write mode), through the
+/// transactional [`GraphAccess`] seam. Returns the number of nodes written (the projection node
+/// count). Each internal id maps back to its external id, which is the node's [`NodeId`].
+fn write_node_property(
+    graph: &mut dyn GraphAccess,
+    csr: &CsrGraph,
+    property: &str,
+    values: &NodePropertyValues,
+) -> i64 {
+    let externals = csr.external_ids();
+    let mut written = 0i64;
+    match values {
+        NodePropertyValues::Double(v) => {
+            for (i, &val) in v.iter().enumerate() {
+                if let Some(&ext) = externals.get(i) {
+                    graph.set_node_property(NodeId(ext), property, Value::Float(val));
+                    written += 1;
+                }
+            }
+        }
+        NodePropertyValues::Long(v) => {
+            for (i, &val) in v.iter().enumerate() {
+                if let Some(&ext) = externals.get(i) {
+                    graph.set_node_property(NodeId(ext), property, Value::Integer(val));
+                    written += 1;
+                }
+            }
+        }
+    }
+    written
+}
+
+/// Registers the `.stats`, `.mutate` and `.write` procedures of one node-property algorithm sharing
+/// the `compute` step and column shape `cols`. `base` is the dotted prefix (e.g. `"gds.pageRank"`).
+fn register_execution_modes_for(
+    set: &mut ProcedureSet,
+    catalog: &GdsCatalogHandle,
+    base: &'static str,
+    cols: ModeColumns,
+    compute: ComputeFn,
+) {
+    // ---- .stats (read-only: no property written) ----
+    {
+        let cat = Arc::clone(catalog);
+        let compute = Arc::clone(&compute);
+        let name = format!("{base}.stats");
+        let handler_name = name.clone();
+        set.register_reader_safe(
+            ProcedureSignature::new(
+                name,
+                vec![string_in("graphName"), any_in("config")],
+                mode_output_fields(&cols, Mode::Stats),
+            ),
+            Box::new(move |args, _graph| {
+                let pre = Instant::now();
+                let g = get_projected(&handler_name, &cat, args)?;
+                let pre_ms = elapsed_ms(pre);
+                let compute_start = Instant::now();
+                let outcome = compute(&handler_name, &g, args)?;
+                let compute_ms = elapsed_ms(compute_start);
+                let timing = ModeTiming {
+                    pre_ms,
+                    compute_ms,
+                    mode_ms: 0,
+                    post_ms: 0,
+                };
+                let config = config_echo(args, &[]);
+                Ok(vec![mode_row(
+                    &outcome,
+                    &cols,
+                    Mode::Stats,
+                    0,
+                    &timing,
+                    config,
+                )])
+            }),
+        );
+    }
+
+    // ---- .mutate (write into the in-memory projection) ----
+    {
+        let cat = Arc::clone(catalog);
+        let compute = Arc::clone(&compute);
+        let name = format!("{base}.mutate");
+        let handler_name = name.clone();
+        set.register_reader_safe(
+            ProcedureSignature::new(
+                name,
+                vec![string_in("graphName"), any_in("config")],
+                mode_output_fields(&cols, Mode::Mutate),
+            ),
+            Box::new(move |args, _graph| {
+                let graph_name = arg_graph_name(&handler_name, args)?.to_owned();
+                let mutate_property = required_property(&handler_name, args, "mutateProperty")?;
+                let pre = Instant::now();
+                let g = get_projected(&handler_name, &cat, args)?;
+                let pre_ms = elapsed_ms(pre);
+                let compute_start = Instant::now();
+                let outcome = compute(&handler_name, &g, args)?;
+                let compute_ms = elapsed_ms(compute_start);
+                let mutate_start = Instant::now();
+                let written = {
+                    let mut catalog = lock_catalog(&handler_name, &cat)?;
+                    catalog
+                        .mutate_node_property(&graph_name, &mutate_property, outcome.values.clone())
+                        .map_err(|e| gds_failure(&handler_name, e))?
+                } as i64;
+                let mode_ms = elapsed_ms(mutate_start);
+                let timing = ModeTiming {
+                    pre_ms,
+                    compute_ms,
+                    mode_ms,
+                    post_ms: 0,
+                };
+                let config = config_echo(
+                    args,
+                    &[("mutateProperty", Value::String(mutate_property.clone()))],
+                );
+                Ok(vec![mode_row(
+                    &outcome,
+                    &cols,
+                    Mode::Mutate,
+                    written,
+                    &timing,
+                    config,
+                )])
+            }),
+        );
+    }
+
+    // ---- .write (write back to the database) ----
+    // NOT reader-safe: it mutates the transactional store, so the executor keeps it on the engine
+    // thread with the writable `&mut dyn GraphAccess`.
+    {
+        let cat = Arc::clone(catalog);
+        let compute = Arc::clone(&compute);
+        let name = format!("{base}.write");
+        let handler_name = name.clone();
+        set.register(
+            ProcedureSignature::new(
+                name,
+                vec![string_in("graphName"), any_in("config")],
+                mode_output_fields(&cols, Mode::Write),
+            ),
+            Box::new(move |args, graph| {
+                let write_property = required_property(&handler_name, args, "writeProperty")?;
+                let pre = Instant::now();
+                let g = get_projected(&handler_name, &cat, args)?;
+                let pre_ms = elapsed_ms(pre);
+                let compute_start = Instant::now();
+                let outcome = compute(&handler_name, &g, args)?;
+                let compute_ms = elapsed_ms(compute_start);
+                let write_start = Instant::now();
+                let written = write_node_property(graph, &g, &write_property, &outcome.values);
+                let mode_ms = elapsed_ms(write_start);
+                let timing = ModeTiming {
+                    pre_ms,
+                    compute_ms,
+                    mode_ms,
+                    post_ms: 0,
+                };
+                let config = config_echo(
+                    args,
+                    &[("writeProperty", Value::String(write_property.clone()))],
+                );
+                Ok(vec![mode_row(
+                    &outcome,
+                    &cols,
+                    Mode::Write,
+                    written,
+                    &timing,
+                    config,
+                )])
+            }),
+        );
+    }
+}
+
+/// Registers the `.stats`/`.mutate`/`.write` modes for every node-property algorithm (`rmp` #643).
+fn register_execution_modes(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
+    // Centrality (Float score; centralityDistribution). pageRank additionally reports its
+    // iteration/convergence summary.
+    register_execution_modes_for(
+        set,
+        catalog,
+        "gds.pageRank",
+        ModeColumns {
+            summary: &[
+                ("ranIterations", ValueClass::Integer),
+                ("didConverge", ValueClass::Boolean),
+            ],
+            distribution: Some("centralityDistribution"),
+        },
+        Arc::new(pagerank_outcome),
+    );
+    register_execution_modes_for(
+        set,
+        catalog,
+        "gds.degree",
+        ModeColumns {
+            summary: &[],
+            distribution: Some("centralityDistribution"),
+        },
+        Arc::new(degree_outcome),
+    );
+    register_execution_modes_for(
+        set,
+        catalog,
+        "gds.closeness",
+        ModeColumns {
+            summary: &[],
+            distribution: Some("centralityDistribution"),
+        },
+        Arc::new(closeness_outcome),
+    );
+    register_execution_modes_for(
+        set,
+        catalog,
+        "gds.betweenness",
+        ModeColumns {
+            summary: &[],
+            distribution: Some("centralityDistribution"),
+        },
+        Arc::new(betweenness_outcome),
+    );
+
+    // Community / connectivity (Long community/component id; componentDistribution).
+    register_execution_modes_for(
+        set,
+        catalog,
+        "gds.wcc",
+        ModeColumns {
+            summary: &[("componentCount", ValueClass::Integer)],
+            distribution: Some("componentDistribution"),
+        },
+        Arc::new(wcc_outcome),
+    );
+    register_execution_modes_for(
+        set,
+        catalog,
+        "gds.scc",
+        ModeColumns {
+            summary: &[("componentCount", ValueClass::Integer)],
+            distribution: Some("componentDistribution"),
+        },
+        Arc::new(scc_outcome),
+    );
+    register_execution_modes_for(
+        set,
+        catalog,
+        "gds.labelPropagation",
+        ModeColumns {
+            summary: &[
+                ("ranIterations", ValueClass::Integer),
+                ("didConverge", ValueClass::Boolean),
+                ("communityCount", ValueClass::Integer),
+            ],
+            distribution: Some("communityDistribution"),
+        },
+        Arc::new(labelprop_outcome),
+    );
+
+    // Triangle counting (Long per-node triangle count; no distribution — Neo4j reports the global
+    // count and node count instead).
+    register_execution_modes_for(
+        set,
+        catalog,
+        "gds.triangleCount",
+        ModeColumns {
+            summary: &[
+                ("globalTriangleCount", ValueClass::Integer),
+                ("nodeCount", ValueClass::Integer),
+            ],
+            distribution: None,
+        },
+        Arc::new(triangle_outcome),
+    );
+
+    register_node_property_readback(set, catalog);
+}
+
+// ---- per-algorithm compute steps (mirror the `.stream` config parsing / algorithm calls) --------
+
+fn pagerank_outcome(
+    name: &str,
+    g: &CsrGraph,
+    args: &[Value],
+) -> Result<NodePropOutcome, ProcedureFailure> {
+    let mut config = PageRankConfig::default();
+    if let Some(d) = config_f64(args, 1, "dampingFactor") {
+        config.damping = d;
+    }
+    if let Some(m) = config_f64(args, 1, "maxIterations") {
+        config.max_iter = clamp_max_iter(name, m)?;
+    }
+    if let Some(t) = config_f64(args, 1, "tolerance") {
+        config.tolerance = t;
+    }
+    let result = with_deadline(|cancel| {
+        crate::morsel::run_on_analytics_pool(|| {
+            pagerank(g, config, cancel).map_err(|e| gds_failure(name, e))
+        })
+    })?;
+    let distribution = Some(distribution_map(&result.rank));
+    Ok(NodePropOutcome {
+        summary: vec![
+            Value::Integer(i64::from(result.iterations)),
+            Value::Boolean(result.converged),
+        ],
+        distribution,
+        values: NodePropertyValues::Double(result.rank),
+    })
+}
+
+fn degree_outcome(
+    _name: &str,
+    g: &CsrGraph,
+    _args: &[Value],
+) -> Result<NodePropOutcome, ProcedureFailure> {
+    let degrees = crate::morsel::run_on_analytics_pool(|| degree_centrality(g, Direction::Out));
+    let scores: Vec<f64> = degrees.iter().map(|&d| d as f64).collect();
+    let distribution = Some(distribution_map(&scores));
+    Ok(NodePropOutcome {
+        summary: Vec::new(),
+        distribution,
+        values: NodePropertyValues::Double(scores),
+    })
+}
+
+fn closeness_outcome(
+    name: &str,
+    g: &CsrGraph,
+    _args: &[Value],
+) -> Result<NodePropOutcome, ProcedureFailure> {
+    let scores = with_deadline(|cancel| {
+        crate::morsel::run_on_analytics_pool(|| {
+            closeness_centrality(g, cancel).map_err(|e| gds_failure(name, e))
+        })
+    })?;
+    let distribution = Some(distribution_map(&scores));
+    Ok(NodePropOutcome {
+        summary: Vec::new(),
+        distribution,
+        values: NodePropertyValues::Double(scores),
+    })
+}
+
+fn betweenness_outcome(
+    name: &str,
+    g: &CsrGraph,
+    _args: &[Value],
+) -> Result<NodePropOutcome, ProcedureFailure> {
+    let raw = with_deadline(|cancel| {
+        crate::morsel::run_on_analytics_pool(|| {
+            betweenness_centrality(g, cancel).map_err(|e| gds_failure(name, e))
+        })
+    })?;
+    let scores = undirected_scale(g, raw);
+    let distribution = Some(distribution_map(&scores));
+    Ok(NodePropOutcome {
+        summary: Vec::new(),
+        distribution,
+        values: NodePropertyValues::Double(scores),
+    })
+}
+
+fn wcc_outcome(
+    name: &str,
+    g: &CsrGraph,
+    _args: &[Value],
+) -> Result<NodePropOutcome, ProcedureFailure> {
+    let result = with_deadline(|cancel| {
+        crate::morsel::run_on_analytics_pool(|| {
+            weakly_connected_components(g, cancel).map_err(|e| gds_failure(name, e))
+        })
+    })?;
+    let agg = aggregate_communities(g, &result.component);
+    Ok(NodePropOutcome {
+        summary: vec![Value::Integer(agg.count)],
+        distribution: Some(agg.distribution),
+        values: NodePropertyValues::Long(agg.values),
+    })
+}
+
+fn scc_outcome(
+    name: &str,
+    g: &CsrGraph,
+    _args: &[Value],
+) -> Result<NodePropOutcome, ProcedureFailure> {
+    let result = with_deadline(|cancel| {
+        strongly_connected_components(g, cancel).map_err(|e| gds_failure(name, e))
+    })?;
+    let agg = aggregate_communities(g, &result.component);
+    Ok(NodePropOutcome {
+        summary: vec![Value::Integer(agg.count)],
+        distribution: Some(agg.distribution),
+        values: NodePropertyValues::Long(agg.values),
+    })
+}
+
+fn labelprop_outcome(
+    name: &str,
+    g: &CsrGraph,
+    args: &[Value],
+) -> Result<NodePropOutcome, ProcedureFailure> {
+    let mut config = LabelPropagationConfig::default();
+    if let Some(m) = config_f64(args, 1, "maxIterations") {
+        config.max_iter = clamp_max_iter(name, m)?.max(1);
+    }
+    let result = with_deadline(|cancel| {
+        crate::morsel::run_on_analytics_pool(|| {
+            label_propagation(g, config, cancel).map_err(|e| gds_failure(name, e))
+        })
+    })?;
+    let agg = aggregate_communities(g, &result.label);
+    Ok(NodePropOutcome {
+        summary: vec![
+            Value::Integer(i64::from(result.iterations)),
+            Value::Boolean(result.converged),
+            Value::Integer(agg.count),
+        ],
+        distribution: Some(agg.distribution),
+        values: NodePropertyValues::Long(agg.values),
+    })
+}
+
+fn triangle_outcome(
+    name: &str,
+    g: &CsrGraph,
+    _args: &[Value],
+) -> Result<NodePropOutcome, ProcedureFailure> {
+    let result = with_deadline(|cancel| {
+        crate::morsel::run_on_analytics_pool(|| {
+            triangle_count(g, cancel).map_err(|e| gds_failure(name, e))
+        })
+    })?;
+    // Each triangle is counted once at each of its three vertices, so the global count is the
+    // per-node sum divided by three.
+    let per_node_sum: u64 = result
+        .triangles
+        .iter()
+        .copied()
+        .fold(0, u64::saturating_add);
+    let global = (per_node_sum / 3) as i64;
+    let node_count = result.triangles.len() as i64;
+    let values: Vec<i64> = result.triangles.iter().map(|&t| t as i64).collect();
+    Ok(NodePropOutcome {
+        summary: vec![Value::Integer(global), Value::Integer(node_count)],
+        distribution: None,
+        values: NodePropertyValues::Long(values),
+    })
+}
+
+/// Registers `gds.graph.nodeProperty.stream(graphName, nodeProperty)` :: (nodeId, propertyValue),
+/// which streams a **mutated** node property back out of the in-memory projection so a `mutate`-mode
+/// result is observable (and testable) end-to-end (Neo4j `gds.graph.nodeProperty.stream`).
+fn register_node_property_readback(set: &mut ProcedureSet, catalog: &GdsCatalogHandle) {
+    let cat = Arc::clone(catalog);
+    set.register_reader_safe(
+        ProcedureSignature::new(
+            "gds.graph.nodeProperty.stream",
+            vec![string_in("graphName"), string_in("nodeProperty")],
+            vec![
+                out("nodeId", ValueClass::Integer),
+                // A GDS node property is scalar (Float or Integer); `Any` egresses either.
+                out("propertyValue", ValueClass::Any),
+            ],
+        ),
+        Box::new(move |args, _graph| {
+            const NAME: &str = "gds.graph.nodeProperty.stream";
+            let graph_name = arg_graph_name(NAME, args)?.to_owned();
+            let Some(Value::String(property)) = args.get(1).filter(|v| {
+                matches!(v, Value::String(s) if !s.is_empty())
+            }) else {
+                return Err(ProcedureFailure::new(
+                    NAME,
+                    "the second argument must be a non-empty node-property name (a string)",
+                ));
+            };
+            let cat = lock_catalog(NAME, &cat)?;
+            let g = cat.get(&graph_name).map_err(|e| gds_failure(NAME, e))?;
+            let externals = g.external_ids();
+            let Some(values) = cat.node_property(&graph_name, property) else {
+                return Err(ProcedureFailure::new(
+                    NAME,
+                    format!(
+                        "node property '{property}' does not exist in the in-memory graph '{graph_name}'"
+                    ),
+                ));
+            };
+            let mut rows = Vec::with_capacity(externals.len());
+            match values {
+                NodePropertyValues::Double(v) => {
+                    for (i, &val) in v.iter().enumerate() {
+                        if let Some(&ext) = externals.get(i) {
+                            rows.push(vec![Value::Integer(ext as i64), Value::Float(val)]);
+                        }
+                    }
+                }
+                NodePropertyValues::Long(v) => {
+                    for (i, &val) in v.iter().enumerate() {
+                        if let Some(&ext) = externals.get(i) {
+                            rows.push(vec![Value::Integer(ext as i64), Value::Integer(val)]);
+                        }
+                    }
+                }
+            }
+            Ok(rows)
+        }),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1324,5 +2071,353 @@ mod tests {
         let err = betweenness_centrality(&g, &cancel)
             .expect_err("an expired deadline must abort the run");
         assert_eq!(err, GdsError::Cancelled);
+    }
+
+    // ---- execution modes: `.stats` / `.mutate` / `.write` (`rmp` task #643) -------------------
+
+    /// Projects the `triangle_graph` fixture as the named graph `"g"`.
+    fn project_g(set: &ProcedureSet, graph: &mut MemGraph) {
+        set.invoke(
+            "gds.graph.project",
+            &[
+                Value::String("g".into()),
+                Value::String("N".into()),
+                Value::String("R".into()),
+                Value::Null,
+            ],
+            graph,
+        )
+        .expect("project");
+    }
+
+    /// Reads a named output column from a single-row mode result via the procedure signature (so the
+    /// test binds by column name, exactly as a `YIELD` would).
+    fn col(set: &ProcedureSet, proc: &str, row: &[Value], name: &str) -> Value {
+        let sig = set.signature(proc).expect("signature");
+        let idx = sig
+            .outputs
+            .iter()
+            .position(|f| f.name == name)
+            .unwrap_or_else(|| panic!("column {name} not found in {proc}"));
+        row[idx].clone()
+    }
+
+    /// A config map `{key: value}`.
+    fn cfg(pairs: &[(&str, Value)]) -> Value {
+        Value::Map(
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), v.clone()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn pagerank_stats_reports_summary_and_distribution() {
+        let (mut graph, _) = triangle_graph();
+        let (set, _cat) = registry_with_catalog();
+        project_g(&set, &mut graph);
+
+        let rows = set
+            .invoke(
+                "gds.pageRank.stats",
+                &[Value::String("g".into()), Value::Null],
+                &mut graph,
+            )
+            .expect("stats");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        // Summary columns present and honestly typed.
+        assert!(matches!(
+            col(&set, "gds.pageRank.stats", row, "ranIterations"),
+            Value::Integer(n) if n >= 1
+        ));
+        assert!(matches!(
+            col(&set, "gds.pageRank.stats", row, "didConverge"),
+            Value::Boolean(_)
+        ));
+        assert!(matches!(
+            col(&set, "gds.pageRank.stats", row, "computeMillis"),
+            Value::Integer(_)
+        ));
+        // The distribution is a non-empty map with the documented keys.
+        let Value::Map(dist) = col(&set, "gds.pageRank.stats", row, "centralityDistribution")
+        else {
+            panic!("centralityDistribution must be a map");
+        };
+        assert!(dist.iter().any(|(k, _)| k == "max"));
+        assert!(dist.iter().any(|(k, _)| k == "p99"));
+        // stats writes nothing: there is no nodePropertiesWritten column.
+        assert!(
+            set.signature("gds.pageRank.stats")
+                .unwrap()
+                .outputs
+                .iter()
+                .all(|f| f.name != "nodePropertiesWritten")
+        );
+    }
+
+    #[test]
+    fn pagerank_write_sets_node_property_and_counts() {
+        let (mut graph, ids) = triangle_graph();
+        let (set, _cat) = registry_with_catalog();
+        project_g(&set, &mut graph);
+
+        let rows = set
+            .invoke(
+                "gds.pageRank.write",
+                &[
+                    Value::String("g".into()),
+                    cfg(&[("writeProperty", Value::String("pr".into()))]),
+                ],
+                &mut graph,
+            )
+            .expect("write");
+        // 4 node properties written.
+        assert_eq!(
+            col(
+                &set,
+                "gds.pageRank.write",
+                &rows[0],
+                "nodePropertiesWritten"
+            ),
+            Value::Integer(4)
+        );
+        assert!(matches!(
+            col(&set, "gds.pageRank.write", &rows[0], "writeMillis"),
+            Value::Integer(_)
+        ));
+        // The property landed on the actual nodes (through the write seam), as a Float.
+        for id in ids {
+            assert!(matches!(
+                graph.node_property(id, "pr"),
+                Some(Value::Float(f)) if f.is_finite() && f > 0.0
+            ));
+        }
+        // The echoed configuration carries the resolved writeProperty.
+        let Value::Map(config) = col(&set, "gds.pageRank.write", &rows[0], "configuration") else {
+            panic!("configuration must be a map");
+        };
+        assert!(
+            config
+                .iter()
+                .any(|(k, v)| k == "writeProperty" && *v == Value::String("pr".into()))
+        );
+    }
+
+    #[test]
+    fn pagerank_write_requires_write_property() {
+        let (mut graph, _) = triangle_graph();
+        let (set, _cat) = registry_with_catalog();
+        project_g(&set, &mut graph);
+        // No writeProperty in the config -> clean error, nothing written.
+        let err = set
+            .invoke(
+                "gds.pageRank.write",
+                &[Value::String("g".into()), Value::Null],
+                &mut graph,
+            )
+            .expect_err("write requires writeProperty");
+        assert!(format!("{err}").contains("writeProperty"));
+    }
+
+    #[test]
+    fn pagerank_mutate_then_read_back() {
+        let (mut graph, ids) = triangle_graph();
+        let (set, _cat) = registry_with_catalog();
+        project_g(&set, &mut graph);
+
+        let rows = set
+            .invoke(
+                "gds.pageRank.mutate",
+                &[
+                    Value::String("g".into()),
+                    cfg(&[("mutateProperty", Value::String("pr".into()))]),
+                ],
+                &mut graph,
+            )
+            .expect("mutate");
+        assert_eq!(
+            col(
+                &set,
+                "gds.pageRank.mutate",
+                &rows[0],
+                "nodePropertiesWritten"
+            ),
+            Value::Integer(4)
+        );
+        assert!(matches!(
+            col(&set, "gds.pageRank.mutate", &rows[0], "mutateMillis"),
+            Value::Integer(_)
+        ));
+        // The mutate wrote into the in-memory projection, NOT the database (a real node has no `pr`).
+        assert!(graph.node_property(ids[0], "pr").is_none());
+
+        // Read the mutated property back out of the projection.
+        let back = set
+            .invoke(
+                "gds.graph.nodeProperty.stream",
+                &[Value::String("g".into()), Value::String("pr".into())],
+                &mut graph,
+            )
+            .expect("read back");
+        assert_eq!(back.len(), 4);
+        for r in &back {
+            assert!(matches!(r[1], Value::Float(f) if f.is_finite() && f > 0.0));
+        }
+
+        // A second mutate under the same property name is rejected (Neo4j GDS semantics).
+        let err = set
+            .invoke(
+                "gds.pageRank.mutate",
+                &[
+                    Value::String("g".into()),
+                    cfg(&[("mutateProperty", Value::String("pr".into()))]),
+                ],
+                &mut graph,
+            )
+            .expect_err("duplicate mutate property");
+        assert!(format!("{err}").contains("already exists"));
+    }
+
+    #[test]
+    fn wcc_modes_report_component_count_and_write_ids() {
+        // Two disjoint components: a triangle {a,b,c}+pendant d (component 0) and an isolated pair.
+        let mut graph = MemGraph::new();
+        let a = graph.add_node(["N"], [] as [(&str, Value); 0]);
+        let b = graph.add_node(["N"], [] as [(&str, Value); 0]);
+        let c = graph.add_node(["N"], [] as [(&str, Value); 0]);
+        let e = graph.add_node(["N"], [] as [(&str, Value); 0]);
+        let f = graph.add_node(["N"], [] as [(&str, Value); 0]);
+        graph.add_rel("R", a, b, [] as [(&str, Value); 0]);
+        graph.add_rel("R", b, c, [] as [(&str, Value); 0]);
+        graph.add_rel("R", e, f, [] as [(&str, Value); 0]);
+        let (set, _cat) = registry_with_catalog();
+        set.invoke(
+            "gds.graph.project",
+            &[
+                Value::String("g".into()),
+                Value::String("N".into()),
+                Value::String("R".into()),
+                Value::Null,
+            ],
+            &mut graph,
+        )
+        .expect("project");
+
+        // stats: exactly two components.
+        let rows = set
+            .invoke(
+                "gds.wcc.stats",
+                &[Value::String("g".into()), Value::Null],
+                &mut graph,
+            )
+            .expect("wcc stats");
+        assert_eq!(
+            col(&set, "gds.wcc.stats", &rows[0], "componentCount"),
+            Value::Integer(2)
+        );
+
+        // write: each node gets an Integer component id property.
+        let rows = set
+            .invoke(
+                "gds.wcc.write",
+                &[
+                    Value::String("g".into()),
+                    cfg(&[("writeProperty", Value::String("comp".into()))]),
+                ],
+                &mut graph,
+            )
+            .expect("wcc write");
+        assert_eq!(
+            col(&set, "gds.wcc.write", &rows[0], "nodePropertiesWritten"),
+            Value::Integer(5)
+        );
+        // a, b, c share a component; e, f share the other; the two differ.
+        let comp = |id: NodeId| match graph.node_property(id, "comp") {
+            Some(Value::Integer(v)) => v,
+            other => panic!("expected an Integer component id, got {other:?}"),
+        };
+        assert_eq!(comp(a), comp(b));
+        assert_eq!(comp(b), comp(c));
+        assert_eq!(comp(e), comp(f));
+        assert_ne!(comp(a), comp(e));
+    }
+
+    #[test]
+    fn triangle_count_stats_reports_global_and_node_count() {
+        let (mut graph, _) = triangle_graph();
+        let (set, _cat) = registry_with_catalog();
+        project_g(&set, &mut graph);
+        let rows = set
+            .invoke(
+                "gds.triangleCount.stats",
+                &[Value::String("g".into()), Value::Null],
+                &mut graph,
+            )
+            .expect("triangleCount stats");
+        // The fixture has exactly one triangle (a-b-c) and 4 nodes.
+        assert_eq!(
+            col(
+                &set,
+                "gds.triangleCount.stats",
+                &rows[0],
+                "globalTriangleCount"
+            ),
+            Value::Integer(1)
+        );
+        assert_eq!(
+            col(&set, "gds.triangleCount.stats", &rows[0], "nodeCount"),
+            Value::Integer(4)
+        );
+    }
+
+    #[test]
+    fn all_node_property_algorithms_register_three_modes() {
+        let (set, _cat) = registry_with_catalog();
+        for base in [
+            "gds.pageRank",
+            "gds.degree",
+            "gds.closeness",
+            "gds.betweenness",
+            "gds.wcc",
+            "gds.scc",
+            "gds.labelPropagation",
+            "gds.triangleCount",
+        ] {
+            for mode in ["stats", "mutate", "write"] {
+                let proc = format!("{base}.{mode}");
+                assert!(set.signature(&proc).is_some(), "missing procedure {proc}");
+            }
+        }
+        // The mutate read-back procedure is registered too.
+        assert!(set.signature("gds.graph.nodeProperty.stream").is_some());
+        // `.write` is NOT reader-safe (it mutates the store); the read-only modes are.
+        assert!(!set.is_reader_safe("gds.pageRank.write"));
+        assert!(set.is_reader_safe("gds.pageRank.stats"));
+        assert!(set.is_reader_safe("gds.pageRank.mutate"));
+    }
+
+    #[test]
+    fn distribution_map_percentiles_are_well_defined() {
+        // 1..=10: min 1, max 10, mean 5.5; nearest-rank p50 = 5, p90 = 9, p99/p999 = 10.
+        let values: Vec<f64> = (1..=10).map(|n| n as f64).collect();
+        let Value::Map(m) = distribution_map(&values) else {
+            panic!("expected a map");
+        };
+        let get = |k: &str| {
+            m.iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.clone())
+                .unwrap()
+        };
+        assert_eq!(get("min"), Value::Float(1.0));
+        assert_eq!(get("max"), Value::Float(10.0));
+        assert_eq!(get("mean"), Value::Float(5.5));
+        assert_eq!(get("p50"), Value::Float(5.0));
+        assert_eq!(get("p90"), Value::Float(9.0));
+        assert_eq!(get("p999"), Value::Float(10.0));
+        // An empty input yields an empty map (no panic).
+        assert_eq!(distribution_map(&[]), Value::Map(Vec::new()));
     }
 }

@@ -339,6 +339,26 @@ pub fn estimate_cost(op: &PhysicalOp, stats: Option<&dyn Statistics>) -> CostEst
             CostEstimate::new(inner.rows, inner.cost + explored * COST_EXPAND_EDGE)
         }
 
+        // A quantified path pattern is a trail walk that compounds like a var-length expand: it fans
+        // out by `degree^(avg iterations)` per input row and pays one edge-cost per explored edge.
+        PhysicalOp::QuantifiedPath {
+            input,
+            types,
+            min,
+            max,
+            ..
+        } => {
+            let inner = estimate_cost(input, stats);
+            let degree = typed_degree(types, stats);
+            let range = crate::ast::VarLengthRange {
+                min: Some(*min),
+                max: *max,
+                exact: false,
+            };
+            let rows = inner.rows * degree.powf(average_path_length(&range));
+            CostEstimate::new(rows, inner.cost + rows * COST_EXPAND_EDGE)
+        }
+
         // A named path binds one path value per input row — cardinality unchanged, a cheap per-row
         // projection.
         PhysicalOp::NamedPath { input, .. } => passthrough(input, stats, COST_ROW_PROJECT),

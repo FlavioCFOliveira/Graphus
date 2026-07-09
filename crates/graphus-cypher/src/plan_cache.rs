@@ -415,6 +415,20 @@ fn collect_pattern_element_literals(element: &PatternElement, out: &mut Vec<Lite
         if let Some(props) = &link.node.properties {
             collect_expr_literals(props, out);
         }
+        // A quantified path pattern's interior node maps and inner `WHERE` also carry liftable
+        // scalar literals. The quantifier bounds are *structural* (not `Expr` literals) and so stay
+        // pinned in the plan — the plan shape depends on them.
+        if let Some(qpp) = &link.qpp {
+            if let Some(props) = &qpp.interior_start.properties {
+                collect_expr_literals(props, out);
+            }
+            if let Some(props) = &qpp.interior_end.properties {
+                collect_expr_literals(props, out);
+            }
+            if let Some(where_expr) = &qpp.inner_where {
+                collect_expr_literals(where_expr, out);
+            }
+        }
     }
 }
 

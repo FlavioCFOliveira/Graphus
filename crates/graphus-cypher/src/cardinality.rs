@@ -346,6 +346,39 @@ fn estimate(op: &LogicalOp, stats: Option<&dyn Statistics>) -> f64 {
         // Both endpoints are bound by the input, so the cardinality is modelled as a passthrough.
         LogicalOp::ShortestPath { input, .. } => estimate(input, stats),
 
+        // A quantified path pattern compounds like a variable-length expand: `degree^(avg iterations)`
+        // per input row, with an open upper bound clamped so the exponent stays finite.
+        LogicalOp::QuantifiedPath {
+            input,
+            types,
+            min,
+            max,
+            ..
+        } => {
+            let input_rows = estimate(input, stats);
+            let nodes = total_nodes(stats).max(1.0);
+            let degree = if types.is_empty() {
+                average_degree(stats)
+            } else {
+                let typed_rels: f64 = types
+                    .iter()
+                    .map(|t| {
+                        stats
+                            .and_then(|s| s.relationships_with_type(&t.name))
+                            .map(|c| c as f64)
+                            .unwrap_or_else(|| {
+                                total_relationships(stats) * DEFAULT_LABEL_SELECTIVITY
+                            })
+                    })
+                    .sum();
+                typed_rels / nodes
+            };
+            let lo = *min as f64;
+            let hi = max.unwrap_or_else(|| min.saturating_add(DEFAULT_VARLEN_MAX_HOPS)) as f64;
+            let avg_len = (lo + hi.max(lo)) / 2.0;
+            input_rows * degree.powf(avg_len)
+        }
+
         // ---- relational ---------------------------------------------------------------------------
 
         // A filter keeps at most its input (a filter never adds rows). When the predicate is a single
@@ -699,6 +732,7 @@ fn label_for_var(op: &LogicalOp, variable: &str) -> Option<String> {
         | LogicalOp::LoadCsv { input, .. }
         | LogicalOp::Expand { input, .. }
         | LogicalOp::ShortestPath { input, .. }
+        | LogicalOp::QuantifiedPath { input, .. }
         | LogicalOp::NamedPath { input, .. }
         | LogicalOp::Optional { input, .. }
         | LogicalOp::Create { input, .. }

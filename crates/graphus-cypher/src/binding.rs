@@ -476,6 +476,19 @@ fn walk_physical(op: &PhysicalOp, record: &mut impl FnMut(&str, ParamType)) {
             walk_physical(input, record);
         }
 
+        // A quantified path pattern carries its per-iteration interior predicate, which may reference
+        // parameters (e.g. `((x)-[r]->(y) WHERE x.age > $min){1,3}`).
+        PhysicalOp::QuantifiedPath {
+            input,
+            interior_predicate,
+            ..
+        } => {
+            if let Some(pred) = interior_predicate {
+                params_in_expr(pred, ParamType::Any, record);
+            }
+            walk_physical(input, record);
+        }
+
         // ---- joins / branches ---------------------------------------------------------------
         PhysicalOp::NestedLoopJoin { left, right } | PhysicalOp::HashJoin { left, right, .. } => {
             walk_physical(left, record);
@@ -859,6 +872,18 @@ fn params_in_pattern_part(part: &PatternPart, record: &mut impl FnMut(&str, Para
         }
         if let Some(props) = &link.node.properties {
             params_in_expr(props, ParamType::Any, record);
+        }
+        // A quantified path pattern's interior node maps and inner `WHERE` may reference parameters.
+        if let Some(qpp) = &link.qpp {
+            if let Some(props) = &qpp.interior_start.properties {
+                params_in_expr(props, ParamType::Any, record);
+            }
+            if let Some(props) = &qpp.interior_end.properties {
+                params_in_expr(props, ParamType::Any, record);
+            }
+            if let Some(where_expr) = &qpp.inner_where {
+                params_in_expr(where_expr, ParamType::Any, record);
+            }
         }
     }
 }

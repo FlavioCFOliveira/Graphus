@@ -579,6 +579,41 @@ pub enum PhysicalOp {
         all: bool,
     },
 
+    /// **Quantified path pattern** (QPP, GPM / Neo4j 5.9+): a trail walk repeating the interior
+    /// single hop `(group_start)-[relationship]-(group_end)` between `min` and `max` times from the
+    /// bound `from`, binding the interior variables as group lists (carried through from
+    /// [`QuantifiedPath`](crate::logical::LogicalOp::QuantifiedPath)). `into` is `true` when `to` is
+    /// already bound by the input (only walks ending there are kept).
+    QuantifiedPath {
+        /// The upstream relation, binding `from`.
+        input: Box<PhysicalOp>,
+        /// The (bound) anchor node the walk starts from.
+        from: Var,
+        /// The trailing boundary node (bound to the final node, or matched against when `into`).
+        to: Var,
+        /// The interior start group variable (list of each iteration's start node).
+        group_start: Var,
+        /// The interior end group variable (list of each iteration's end node).
+        group_end: Var,
+        /// The interior relationship group variable (the trail).
+        relationship: Var,
+        /// The interior relationship's traversal direction.
+        direction: crate::ast::RelDirection,
+        /// The interior relationship-type alternatives; empty means "any type".
+        types: Vec<RelType>,
+        /// The minimum iteration count (inclusive).
+        min: u64,
+        /// The maximum iteration count (inclusive); `None` = unbounded.
+        max: Option<u64>,
+        /// Relationship variables bound by earlier links of the same pattern (trail extends over
+        /// them).
+        prior_rels: Vec<Var>,
+        /// The per-iteration interior predicate (scalar `group_start`/`group_end`/`relationship`).
+        interior_predicate: Option<Expr>,
+        /// `true` when `to` is already bound by the input (keep only walks ending at that node).
+        into: bool,
+    },
+
     // ---- relational ---------------------------------------------------------------------------
     /// Keep rows whose `predicate` is `TRUE` (residual filter; three-valued logic, `04 §7.6`).
     Filter {
@@ -980,6 +1015,41 @@ impl Planner<'_> {
                 range: *range,
                 all: *all,
             },
+
+            // ---- quantified path pattern -----------------------------------------------------
+            LogicalOp::QuantifiedPath {
+                input,
+                from,
+                to,
+                group_start,
+                group_end,
+                relationship,
+                direction,
+                types,
+                min,
+                max,
+                prior_rels,
+                interior_predicate,
+            } => {
+                let phys_input = self.lower(input, deps);
+                // Into iff the trailing boundary node is already bound by the input (a reused node).
+                let into = bound_vars(&phys_input).iter().any(|v| v.name == to.name);
+                PhysicalOp::QuantifiedPath {
+                    input: Box::new(phys_input),
+                    from: from.clone(),
+                    to: to.clone(),
+                    group_start: group_start.clone(),
+                    group_end: group_end.clone(),
+                    relationship: relationship.clone(),
+                    direction: *direction,
+                    types: types.clone(),
+                    min: *min,
+                    max: *max,
+                    prior_rels: prior_rels.clone(),
+                    interior_predicate: interior_predicate.clone(),
+                    into,
+                }
+            }
 
             // ---- relational ------------------------------------------------------------------
             LogicalOp::Projection {
@@ -1395,6 +1465,7 @@ fn contains_read(op: &PhysicalOp) -> bool {
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::ExpandAll { .. }
         | PhysicalOp::ExpandInto { .. }
+        | PhysicalOp::QuantifiedPath { .. }
         | PhysicalOp::ShortestPath { .. } => true,
         PhysicalOp::Filter { input, .. }
         | PhysicalOp::Projection { input, .. }
@@ -1445,6 +1516,7 @@ fn contains_write(op: &PhysicalOp) -> bool {
         | PhysicalOp::ExpandAll { input, .. }
         | PhysicalOp::ExpandInto { input, .. }
         | PhysicalOp::ShortestPath { input, .. }
+        | PhysicalOp::QuantifiedPath { input, .. }
         | PhysicalOp::NamedPath { input, .. }
         | PhysicalOp::Optional { input, .. } => contains_write(input),
         PhysicalOp::NestedLoopJoin { left, right }
@@ -1491,6 +1563,7 @@ fn contains_procedure_call(op: &PhysicalOp) -> bool {
         | PhysicalOp::ExpandAll { input, .. }
         | PhysicalOp::ExpandInto { input, .. }
         | PhysicalOp::ShortestPath { input, .. }
+        | PhysicalOp::QuantifiedPath { input, .. }
         | PhysicalOp::NamedPath { input, .. }
         | PhysicalOp::Create { input, .. }
         | PhysicalOp::Merge { input, .. }
@@ -1557,6 +1630,7 @@ fn all_procedure_calls_reader_safe(
         | PhysicalOp::ExpandAll { input, .. }
         | PhysicalOp::ExpandInto { input, .. }
         | PhysicalOp::ShortestPath { input, .. }
+        | PhysicalOp::QuantifiedPath { input, .. }
         | PhysicalOp::NamedPath { input, .. }
         | PhysicalOp::Create { input, .. }
         | PhysicalOp::Merge { input, .. }
@@ -1867,6 +1941,35 @@ fn optimize_children(op: PhysicalOp, catalog: &IndexCatalog, stats: &dyn Statist
             types,
             range,
             all,
+        },
+        PhysicalOp::QuantifiedPath {
+            input,
+            from,
+            to,
+            group_start,
+            group_end,
+            relationship,
+            direction,
+            types,
+            min,
+            max,
+            prior_rels,
+            interior_predicate,
+            into,
+        } => PhysicalOp::QuantifiedPath {
+            input: opt(input),
+            from,
+            to,
+            group_start,
+            group_end,
+            relationship,
+            direction,
+            types,
+            min,
+            max,
+            prior_rels,
+            interior_predicate,
+            into,
         },
         PhysicalOp::NamedPath {
             input,
@@ -2507,6 +2610,7 @@ fn contains_argument(op: &PhysicalOp) -> bool {
         | PhysicalOp::ExpandAll { input, .. }
         | PhysicalOp::ExpandInto { input, .. }
         | PhysicalOp::ShortestPath { input, .. }
+        | PhysicalOp::QuantifiedPath { input, .. }
         | PhysicalOp::NamedPath { input, .. }
         | PhysicalOp::Optional { input, .. }
         | PhysicalOp::Create { input, .. }
@@ -2942,6 +3046,7 @@ fn gather_index_dependencies(op: &PhysicalOp, deps: &mut BTreeSet<IndexId>) {
         | PhysicalOp::ExpandAll { input, .. }
         | PhysicalOp::ExpandInto { input, .. }
         | PhysicalOp::ShortestPath { input, .. }
+        | PhysicalOp::QuantifiedPath { input, .. }
         | PhysicalOp::NamedPath { input, .. }
         | PhysicalOp::Optional { input, .. }
         | PhysicalOp::Create { input, .. }
@@ -3453,6 +3558,22 @@ fn gather_bound_vars(plan: &PhysicalOp, out: &mut Vec<Var>) {
                 push_unique(out, p.clone());
             }
         }
+        PhysicalOp::QuantifiedPath {
+            input,
+            to,
+            group_start,
+            group_end,
+            relationship,
+            ..
+        } => {
+            // The anchor `from` is bound by `input`; this op binds the trailing boundary node and the
+            // three interior group variables (start-node list, end-node list, relationship trail).
+            gather_bound_vars(input, out);
+            push_unique(out, to.clone());
+            push_unique(out, group_start.clone());
+            push_unique(out, group_end.clone());
+            push_unique(out, relationship.clone());
+        }
         PhysicalOp::Filter { input, .. }
         | PhysicalOp::Skip { input, .. }
         | PhysicalOp::Limit { input, .. }
@@ -3689,6 +3810,36 @@ impl PhysicalOp {
                     h::arrow_left(*direction),
                     h::types(types),
                     h::range(&Some(*range)),
+                    h::arrow_right(*direction),
+                )?;
+                input.fmt_indented(f, depth + 1)
+            }
+
+            Self::QuantifiedPath {
+                input,
+                from,
+                to,
+                group_start,
+                group_end,
+                relationship,
+                direction,
+                types,
+                min,
+                max,
+                into,
+                ..
+            } => {
+                let max_str = max.map_or_else(String::new, |m| m.to_string());
+                let tag = if *into {
+                    "QuantifiedPathInto"
+                } else {
+                    "QuantifiedPath"
+                };
+                writeln!(
+                    f,
+                    "{tag}(({from})(({group_start}){}{relationship}{}{}({group_end})){{{min},{max_str}}}({to}))",
+                    h::arrow_left(*direction),
+                    h::types(types),
                     h::arrow_right(*direction),
                 )?;
                 input.fmt_indented(f, depth + 1)

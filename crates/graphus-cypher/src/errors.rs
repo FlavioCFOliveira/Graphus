@@ -206,6 +206,12 @@ pub enum SemanticDetail {
     /// Neo4j / openCypher-reference path-search extension absent from the openCypher TCK corpus, so
     /// this detail has **no** TCK counterpart; its spelling is internal.
     InvalidShortestPath,
+    /// `InvalidQuantifiedPath` — a **quantified path pattern** (QPP, GPM / Neo4j 5.9+) is used in an
+    /// unsupported way (in a `CREATE`/`MERGE` write pattern, inside a `shortestPath(...)`, with an
+    /// unsupported interior shape, or with an inconsistent quantifier). QPP is a Neo4j 5.x / GPM
+    /// extension absent from the openCypher TCK corpus, so this detail has **no** TCK counterpart; its
+    /// spelling is internal.
+    InvalidQuantifiedPath,
     /// `UnexpectedSyntax` — a syntactically-formed construct appears in a position the grammar
     /// forbids, e.g. a bare pattern predicate (`(n)-[]->()`) used in a `RETURN`/`WITH` projection,
     /// on the right-hand side of `SET`, or as a function argument (TCK
@@ -258,6 +264,8 @@ impl SemanticDetail {
             Self::InvalidLoadCsvUrl => "InvalidLoadCsvUrl",
             // `shortestPath` is absent from the openCypher TCK; internal spelling, no TCK step.
             Self::InvalidShortestPath => "InvalidShortestPath",
+            // Quantified path patterns (GPM) are absent from the openCypher TCK; internal spelling.
+            Self::InvalidQuantifiedPath => "InvalidQuantifiedPath",
             Self::UnexpectedSyntax => "UnexpectedSyntax",
             Self::RelationshipUniquenessViolation => "RelationshipUniquenessViolation",
             Self::InvalidParameterUse => "InvalidParameterUse",
@@ -486,6 +494,15 @@ pub enum SemanticErrorKind {
         /// A human-readable explanation of why the wrapped pattern is rejected.
         reason: String,
     },
+    /// A **quantified path pattern** (QPP, GPM / Neo4j 5.9+) is used in an unsupported way: inside a
+    /// `CREATE`/`MERGE` write pattern or a `shortestPath(...)` (both read-only / single-relationship
+    /// constructs), with an interior shape the engine does not yet support, or with an inconsistent
+    /// quantifier (e.g. `{3,1}`). QPP is a Neo4j 5.x / GPM extension absent from the openCypher TCK
+    /// corpus, so this detail has **no** TCK counterpart; its spelling is internal.
+    InvalidQuantifiedPath {
+        /// A human-readable explanation of why the quantified path pattern is rejected.
+        reason: String,
+    },
     /// A bare **pattern predicate** (`(n)-[]->()` written directly as a value) appears in a position
     /// the grammar reserves for ordinary expressions — a `RETURN`/`WITH` projection, the right-hand
     /// side of `SET`, or a function argument. A pattern predicate is only valid in a predicate
@@ -575,6 +592,7 @@ impl SemanticErrorKind {
             Self::DifferentColumnsInUnion => SemanticDetail::DifferentColumnsInUnion,
             Self::InvalidLoadCsvUrl => SemanticDetail::InvalidLoadCsvUrl,
             Self::InvalidShortestPath { .. } => SemanticDetail::InvalidShortestPath,
+            Self::InvalidQuantifiedPath { .. } => SemanticDetail::InvalidQuantifiedPath,
             Self::PatternPredicateInExpression => SemanticDetail::UnexpectedSyntax,
             Self::LabelExpressionNotAllowed { .. } => SemanticDetail::UnexpectedSyntax,
             Self::RelationshipUniquenessViolation { .. } => {
@@ -714,6 +732,9 @@ impl fmt::Display for SemanticErrorKind {
             Self::InvalidShortestPath { reason } => {
                 write!(f, "invalid shortestPath/allShortestPaths pattern: {reason}")
             }
+            Self::InvalidQuantifiedPath { reason } => {
+                write!(f, "invalid quantified path pattern: {reason}")
+            }
             Self::PatternPredicateInExpression => f.write_str(
                 "a pattern predicate may only appear in a predicate position (a WHERE or a \
                  boolean operand), not in a projection, on the right-hand side of SET, or as a \
@@ -793,6 +814,10 @@ mod tests {
             // `shortestPath` is a Neo4j / openCypher-reference extension with no TCK detail; pinned
             // here for the same stability guarantee.
             (SemanticDetail::InvalidShortestPath, "InvalidShortestPath"),
+            (
+                SemanticDetail::InvalidQuantifiedPath,
+                "InvalidQuantifiedPath",
+            ),
             (SemanticDetail::UnexpectedSyntax, "UnexpectedSyntax"),
             (
                 SemanticDetail::RelationshipUniquenessViolation,
@@ -891,6 +916,7 @@ mod tests {
                 | SemanticErrorKind::DifferentColumnsInUnion
                 | SemanticErrorKind::InvalidLoadCsvUrl
                 | SemanticErrorKind::InvalidShortestPath { .. }
+                | SemanticErrorKind::InvalidQuantifiedPath { .. }
                 | SemanticErrorKind::PatternPredicateInExpression
                 | SemanticErrorKind::LabelExpressionNotAllowed { .. }
                 | SemanticErrorKind::RelationshipUniquenessViolation { .. }
@@ -950,6 +976,9 @@ mod tests {
             SemanticErrorKind::DifferentColumnsInUnion,
             SemanticErrorKind::InvalidLoadCsvUrl,
             SemanticErrorKind::InvalidShortestPath {
+                reason: "x".to_owned(),
+            },
+            SemanticErrorKind::InvalidQuantifiedPath {
                 reason: "x".to_owned(),
             },
             SemanticErrorKind::PatternPredicateInExpression,

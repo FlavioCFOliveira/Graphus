@@ -674,14 +674,100 @@ pub struct PatternElement {
     pub span: Span,
 }
 
-/// One `relationship node` link of a [`PatternElement`] (openCypher `PatternElementChain`).
+/// One `relationship node` link of a [`PatternElement`] (openCypher `PatternElementChain`), or a
+/// **quantified path pattern** link when [`qpp`](Self::qpp) is present (GPM / Neo4j 5.9+).
 #[derive(Debug, Clone, PartialEq)]
 #[must_use]
 pub struct PatternChainLink {
-    /// The relationship pattern connecting the previous node to [`node`](Self::node).
+    /// The relationship pattern connecting the previous node to [`node`](Self::node). For a
+    /// **quantified path pattern** link ([`qpp`](Self::qpp) is `Some`) this is the QPP interior's
+    /// single relationship `(interior_start)-[relationship]-(interior_end)`.
     pub relationship: RelationshipPattern,
-    /// The node reached through the relationship.
+    /// The boundary node reached after this link. For a plain link it is the relationship's far
+    /// endpoint; for a QPP link it is the QPP's **trailing boundary node** (a *singleton* variable
+    /// juxtaposed with the QPP's interior end node [`QppInfo::interior_end`]). When the source omits
+    /// an explicit trailing boundary node it is a synthesized anonymous node.
     pub node: NodePattern,
+    /// Present iff this link is a **quantified path pattern** (QPP): a parenthesized interior path
+    /// pattern repeated per a quantifier, e.g. `((x)-[r:R]->(y) WHERE x.n > 1){1,3}`. `None` for an
+    /// ordinary single relationship→node link. Boxed to keep the common (non-QPP) link small.
+    pub qpp: Option<Box<QppInfo>>,
+}
+
+/// The interior detail of a **quantified path pattern** (QPP, GPM / Neo4j 5.9+): a parenthesized
+/// sub-pattern repeated per a [`quantifier`](Self::quantifier).
+///
+/// For the pattern `(a) ((x)-[r:R]->(y) WHERE p){n,m} (b)` the QPP is carried by the chain link
+/// whose [`relationship`](PatternChainLink::relationship) is the interior `-[r:R]->` and whose
+/// [`node`](PatternChainLink::node) is the trailing boundary `(b)`. This struct then carries the
+/// interior endpoint node patterns `(x)`/`(y)`, the quantifier, and any inner `WHERE`.
+///
+/// **Semantics** (Neo4j 5.x GPM):
+/// - The interior is matched `k` times with `n ≤ k ≤ m` (greedy, all `k` enumerated).
+/// - Interior variables (`x`, `y`, `r`) become **group variables** (lists) in the outer scope —
+///   `x` is the list of every iteration's start node, `y` of every end node, `r` of every
+///   relationship, in iteration order. The boundary nodes (`a`, `b`) stay singletons.
+/// - **Trail** semantics: no relationship is traversed twice across the whole pattern.
+/// - The inner `WHERE` is scoped to one iteration, seeing `x`/`y`/`r` as *scalars*.
+#[derive(Debug, Clone, PartialEq)]
+#[must_use]
+pub struct QppInfo {
+    /// The interior **start** node `(x)` — a group variable, juxtaposed with the boundary node
+    /// preceding this link in the chain (the outer `(a)`, an earlier link's node, or the element
+    /// start).
+    pub interior_start: NodePattern,
+    /// The interior **end** node `(y)` — a group variable, juxtaposed with this link's trailing
+    /// boundary node [`PatternChainLink::node`].
+    pub interior_end: NodePattern,
+    /// The quantifier applied to the interior pattern.
+    pub quantifier: PatternQuantifier,
+    /// An optional inner `WHERE` predicate scoped to a **single iteration** (its `x`/`y`/`r` are the
+    /// iteration's scalar bindings, not the outer group lists).
+    pub inner_where: Option<Expr>,
+    /// Span of the parenthesized quantified group `( … ){q}`.
+    pub span: Span,
+}
+
+/// The quantifier of a [`quantified path pattern`](QppInfo) (GPM / Neo4j 5.9+): the repetition count
+/// of the parenthesized interior.
+///
+/// `+ | * | {n} | {n,m} | {n,} | {,m}`. All ranges are **inclusive**. Missing lower bound defaults to
+/// `0`, missing upper bound is unbounded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[must_use]
+pub enum PatternQuantifier {
+    /// `+` — one or more (`{1,}`).
+    Plus,
+    /// `*` — zero or more (`{0,}`).
+    Star,
+    /// `{n}` — exactly `n`.
+    Exactly(u64),
+    /// `{n,m}` / `{n,}` / `{,m}` — an inclusive range with optional bounds.
+    Range {
+        /// Lower bound, inclusive; `None` = `0`.
+        min: Option<u64>,
+        /// Upper bound, inclusive; `None` = unbounded.
+        max: Option<u64>,
+    },
+}
+
+impl PatternQuantifier {
+    /// The `(min, max)` hop-count bounds of this quantifier, with `None` upper bound meaning
+    /// unbounded. `min` defaults to `0` when unwritten.
+    pub const fn bounds(self) -> (u64, Option<u64>) {
+        match self {
+            Self::Plus => (1, None),
+            Self::Star => (0, None),
+            Self::Exactly(n) => (n, Some(n)),
+            Self::Range { min, max } => (
+                match min {
+                    Some(m) => m,
+                    None => 0,
+                },
+                max,
+            ),
+        }
+    }
 }
 
 /// A node pattern `(v:Label1:Label2 {props})` (openCypher `NodePattern`). All parts are optional.
@@ -1341,6 +1427,13 @@ impl PatternElement {
                 type_expr.zero_spans_in_place();
             }
             link.node.zero_expr_spans_in_place();
+            if let Some(qpp) = &mut link.qpp {
+                qpp.interior_start.zero_expr_spans_in_place();
+                qpp.interior_end.zero_expr_spans_in_place();
+                if let Some(where_expr) = &mut qpp.inner_where {
+                    where_expr.zero_spans_in_place();
+                }
+            }
         }
     }
 }

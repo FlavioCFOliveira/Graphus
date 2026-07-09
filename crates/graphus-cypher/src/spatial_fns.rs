@@ -250,6 +250,69 @@ fn haversine_metres(p1: &Point, p2: &Point) -> f64 {
 }
 
 // =================================================================================================
+// point.withinBBox(point, lowerLeft, upperRight)
+// =================================================================================================
+
+/// The Cypher `point.withinBBox(point, lowerLeft, upperRight)`: whether `point` lies inside the
+/// axis-aligned bounding box whose opposite corners are `lowerLeft` and `upperRight` (Neo4j 5.x
+/// spatial). Returns `true`/`false`, or `null` when any argument is `null` or the three points do
+/// **not** share one CRS (dimensionality included, so a WGS-84 2D vs 3D mix is `null`).
+///
+/// # Semantics (Neo4j 5.x, confirmed against the Cypher manual)
+///
+/// - **Null propagation:** any `null` argument makes the result `null`.
+/// - **CRS agreement:** all three points must share the same CRS; otherwise the result is `null`
+///   (a mixed-CRS comparison is undefined).
+/// - **Cartesian / non-longitude axes:** a point is inside iff, for each coordinate, `lowerLeft ≤
+///   point ≤ upperRight`. If `lowerLeft` exceeds `upperRight` on an axis (e.g. a latitude the manual
+///   describes as "north of" the other), that axis yields an empty range and the result is `false`.
+/// - **Geographic longitude wraparound:** for a geographic (WGS-84) CRS the **longitude** axis wraps
+///   the ±180° antimeridian. When `lowerLeft.longitude ≤ upperRight.longitude` the range is the usual
+///   closed interval; when `lowerLeft.longitude > upperRight.longitude` the box straddles the 180th
+///   meridian, so a point's longitude is inside iff it is `≥ lowerLeft` **or** `≤ upperRight` (the
+///   manual's crossing-the-180th-meridian behaviour).
+///
+/// # Errors
+/// [`EvalError::TypeError`] if any non-null argument is not a point (mirroring [`distance`]).
+pub(crate) fn within_bbox(point: &Value, lower: &Value, upper: &Value) -> Result<Value, EvalError> {
+    if point.is_null() || lower.is_null() || upper.is_null() {
+        return Ok(Value::Null);
+    }
+    let (Value::Point(p), Value::Point(ll), Value::Point(ur)) = (point, lower, upper) else {
+        return Err(type_err(
+            "point.withinBBox() requires three point arguments",
+        ));
+    };
+    // All three points must share one reference system (Crs distinguishes 2D from 3D, so this also
+    // rejects a dimensionality mismatch) — otherwise the comparison is undefined and Neo4j is `null`.
+    if p.crs != ll.crs || p.crs != ur.crs {
+        return Ok(Value::Null);
+    }
+    let geographic = p.crs.is_geographic();
+    // The three coordinate slices have equal length (same CRS ⇒ same dimensionality).
+    for (dim, ((&pd, &ld), &ud)) in p
+        .coords()
+        .iter()
+        .zip(ll.coords().iter())
+        .zip(ur.coords().iter())
+        .enumerate()
+    {
+        // Dimension 0 is the longitude for a geographic CRS, which wraps the ±180° antimeridian.
+        let inside = if geographic && dim == 0 && ld > ud {
+            // The box straddles the 180th meridian: inside iff at/east of `lowerLeft` OR at/west of
+            // `upperRight`.
+            pd >= ld || pd <= ud
+        } else {
+            pd >= ld && pd <= ud
+        };
+        if !inside {
+            return Ok(Value::Boolean(false));
+        }
+    }
+    Ok(Value::Boolean(true))
+}
+
+// =================================================================================================
 // Component accessors (point.x, point.crs, …)
 // =================================================================================================
 
@@ -393,6 +456,133 @@ mod tests {
         assert!((d - d2).abs() < 1e-6);
         // Zero distance to itself.
         assert_eq!(distance(&london, &london).unwrap(), Value::Float(0.0));
+    }
+
+    #[test]
+    fn within_bbox_cartesian_inclusive_and_outside() {
+        let ll = Value::Point(Point::new_2d(Crs::Cartesian, 0.0, 0.0));
+        let ur = Value::Point(Point::new_2d(Crs::Cartesian, 10.0, 10.0));
+        let inside = Value::Point(Point::new_2d(Crs::Cartesian, 5.0, 5.0));
+        let on_corner = Value::Point(Point::new_2d(Crs::Cartesian, 0.0, 10.0));
+        let outside = Value::Point(Point::new_2d(Crs::Cartesian, 11.0, 5.0));
+        assert_eq!(
+            within_bbox(&inside, &ll, &ur).unwrap(),
+            Value::Boolean(true)
+        );
+        // The box is a closed interval — a point on the boundary is inside.
+        assert_eq!(
+            within_bbox(&on_corner, &ll, &ur).unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            within_bbox(&outside, &ll, &ur).unwrap(),
+            Value::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn within_bbox_cartesian_3d() {
+        let ll = Value::Point(Point::new_3d(Crs::Cartesian3D, 0.0, 0.0, 0.0));
+        let ur = Value::Point(Point::new_3d(Crs::Cartesian3D, 10.0, 10.0, 10.0));
+        let inside = Value::Point(Point::new_3d(Crs::Cartesian3D, 5.0, 5.0, 5.0));
+        let above = Value::Point(Point::new_3d(Crs::Cartesian3D, 5.0, 5.0, 11.0));
+        assert_eq!(
+            within_bbox(&inside, &ll, &ur).unwrap(),
+            Value::Boolean(true)
+        );
+        // Outside on the third (height) axis only.
+        assert_eq!(
+            within_bbox(&above, &ll, &ur).unwrap(),
+            Value::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn within_bbox_geographic_longitude_wraps_antimeridian() {
+        // A box from lon 179° to lon -179° straddles the 180th meridian (Neo4j manual example).
+        let ll = Value::Point(Point::new_2d(Crs::Wgs84, 179.0, 0.0));
+        let ur = Value::Point(Point::new_2d(Crs::Wgs84, -179.0, 10.0));
+        // A point at lon 180° (== -180°) is inside the wrapped box.
+        let at_meridian = Value::Point(Point::new_2d(Crs::Wgs84, 180.0, 5.0));
+        let just_east = Value::Point(Point::new_2d(Crs::Wgs84, 179.5, 5.0));
+        let just_west = Value::Point(Point::new_2d(Crs::Wgs84, -179.5, 5.0));
+        // A point in the "unwrapped" middle (lon 0°) is OUTSIDE the wrapped box.
+        let middle = Value::Point(Point::new_2d(Crs::Wgs84, 0.0, 5.0));
+        assert_eq!(
+            within_bbox(&at_meridian, &ll, &ur).unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            within_bbox(&just_east, &ll, &ur).unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            within_bbox(&just_west, &ll, &ur).unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            within_bbox(&middle, &ll, &ur).unwrap(),
+            Value::Boolean(false)
+        );
+        // Latitude must still be within range even inside the longitude wrap.
+        let wrong_lat = Value::Point(Point::new_2d(Crs::Wgs84, 180.0, 20.0));
+        assert_eq!(
+            within_bbox(&wrong_lat, &ll, &ur).unwrap(),
+            Value::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn within_bbox_geographic_non_wrapping_range() {
+        // A normal (non-wrapping) geographic box: lon -10°..10°, lat -10°..10°.
+        let ll = Value::Point(Point::new_2d(Crs::Wgs84, -10.0, -10.0));
+        let ur = Value::Point(Point::new_2d(Crs::Wgs84, 10.0, 10.0));
+        let inside = Value::Point(Point::new_2d(Crs::Wgs84, 0.0, 0.0));
+        let outside = Value::Point(Point::new_2d(Crs::Wgs84, 20.0, 0.0));
+        assert_eq!(
+            within_bbox(&inside, &ll, &ur).unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            within_bbox(&outside, &ll, &ur).unwrap(),
+            Value::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn within_bbox_null_and_crs_mismatch_yield_null() {
+        let cart = Value::Point(Point::new_2d(Crs::Cartesian, 0.0, 0.0));
+        let cart_ur = Value::Point(Point::new_2d(Crs::Cartesian, 10.0, 10.0));
+        let wgs = Value::Point(Point::new_2d(Crs::Wgs84, 5.0, 5.0));
+        // Any null argument -> null.
+        assert_eq!(
+            within_bbox(&Value::Null, &cart, &cart_ur).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            within_bbox(&cart, &Value::Null, &cart_ur).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            within_bbox(&cart, &cart, &Value::Null).unwrap(),
+            Value::Null
+        );
+        // A CRS mismatch among the three points -> null (point is WGS-84, box is Cartesian).
+        assert_eq!(within_bbox(&wgs, &cart, &cart_ur).unwrap(), Value::Null);
+        // A 2D vs 3D mismatch is also a CRS mismatch -> null.
+        let cart_3d = Value::Point(Point::new_3d(Crs::Cartesian3D, 5.0, 5.0, 5.0));
+        assert_eq!(within_bbox(&cart_3d, &cart, &cart_ur).unwrap(), Value::Null);
+        // A non-point argument is a type error.
+        assert!(within_bbox(&cart, &cart, &Value::Integer(1)).is_err());
+    }
+
+    #[test]
+    fn within_bbox_inverted_latitude_is_empty_range() {
+        // lowerLeft north of upperRight on latitude -> empty range -> always false.
+        let ll = Value::Point(Point::new_2d(Crs::Wgs84, -10.0, 10.0));
+        let ur = Value::Point(Point::new_2d(Crs::Wgs84, 10.0, -10.0));
+        let p = Value::Point(Point::new_2d(Crs::Wgs84, 0.0, 0.0));
+        assert_eq!(within_bbox(&p, &ll, &ur).unwrap(), Value::Boolean(false));
     }
 
     #[test]
