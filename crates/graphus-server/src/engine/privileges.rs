@@ -221,6 +221,20 @@ impl EffectivePrivileges {
             .iter()
             .any(|granted| granted.implies_ref(action, resource))
     }
+
+    /// Whether an explicit deny in the snapshot **blocks** `action` over the borrowed `resource` —
+    /// the deny-only half of [`grants`](Self::grants), consulting **only** the `denied` snapshot
+    /// (rmp #645). This backs the `is_denied_*` negation predicates the
+    /// [`graphus_cypher::AuthorizedGraph`] uses to enforce DENY-across-labels precedence for
+    /// multi-label nodes (CWE-863 fix): a `DENY` on any one label of a node must block it even when
+    /// another label grants the capability, so the decorator needs the negation exposed separately
+    /// from the combined `grants` verdict. Empty on the unrestricted path (a global admin holds no
+    /// deny snapshot and is exempt from DENY), so an unrestricted principal is never denied.
+    fn denies(&self, action: Action, resource: &ResourceRef<'_>) -> bool {
+        self.denied
+            .iter()
+            .any(|deny| deny.blocks_ref(action, resource))
+    }
 }
 
 impl PrivilegeOracle for EffectivePrivileges {
@@ -347,6 +361,59 @@ impl PrivilegeOracle for EffectivePrivileges {
             &ResourceRef::RelType {
                 db: &self.database,
                 rel_type,
+            },
+        )
+    }
+
+    // ---- explicit-DENY predicates (CWE-863 fix, rmp #645) ----------------------------------------
+    //
+    // These answer the negation half against the `denied` snapshot ONLY (via `denies`/`blocks_ref`),
+    // so the `AuthorizedGraph` can enforce "a DENY on any label of a multi-label node blocks it".
+    // They are intentionally NOT memoized: the deny snapshot is empty for the overwhelmingly common
+    // no-DENY principal (so each probe is a trivial `[].iter().any(...)`), and small otherwise, so
+    // the `blocks_ref` walk is cheap without the per-name cache the graded read grants use. The
+    // graded action reversal lives in `Privilege::blocks_ref` (module docs on `blocks`): a
+    // `DENY TRAVERSE` blocks Traverse/Read/Write, a `DENY READ` blocks Read/Write but not Traverse,
+    // a `DENY WRITE` blocks only Write — so probing the operation's own action here is exact.
+
+    fn is_denied_traverse_label(&self, label: &str) -> bool {
+        self.denies(
+            Action::Traverse,
+            &ResourceRef::Label {
+                db: &self.database,
+                label,
+            },
+        )
+    }
+
+    fn is_denied_read_property(&self, label: &str, property: &str) -> bool {
+        self.denies(
+            Action::Read,
+            &ResourceRef::Property {
+                db: &self.database,
+                label,
+                property,
+            },
+        )
+    }
+
+    fn is_denied_write_label(&self, label: &str) -> bool {
+        self.denies(
+            Action::Write,
+            &ResourceRef::Label {
+                db: &self.database,
+                label,
+            },
+        )
+    }
+
+    fn is_denied_write_property(&self, label: &str, property: &str) -> bool {
+        self.denies(
+            Action::Write,
+            &ResourceRef::Property {
+                db: &self.database,
+                label,
+                property,
             },
         )
     }
@@ -762,6 +829,83 @@ mod tests {
             p.is_unrestricted(),
             "global admin stays unrestricted despite the deny"
         );
+    }
+
+    #[test]
+    fn deny_negation_predicates_report_denies_precisely() {
+        // The CWE-863 negation predicates (`is_denied_*`) consult ONLY the deny snapshot and honour
+        // the graded reversal in `Privilege::blocks_ref`: DENY TRAVERSE blocks Traverse+Read+Write,
+        // DENY READ blocks Read+Write but not Traverse, DENY WRITE blocks only Write. These are the
+        // separate negation signal the `AuthorizedGraph` unions DENY-wins across a node's labels.
+        let cat = catalog_with_denies(
+            &[Privilege::on_graph(Action::Write, "db")],
+            &[
+                Privilege::on_label(Action::Traverse, "db", "Classified"),
+                Privilege::on_property(Action::Read, "db", "Report", "contents"),
+                Privilege::on_label(Action::Write, "db", "Locked"),
+            ],
+        );
+        let p = EffectivePrivileges::resolve(cat, Some("alice"), "db");
+
+        // DENY TRAVERSE on :Classified blocks traverse AND (graded) read + write on that label.
+        assert!(p.is_denied_traverse_label("Classified"));
+        assert!(p.is_denied_read_property("Classified", "anything"));
+        assert!(p.is_denied_write_label("Classified"));
+        assert!(p.is_denied_write_property("Classified", "anything"));
+
+        // DENY READ on :Report.contents blocks read + write of THAT property, but not traverse of
+        // :Report (graded reversal) and not another property of :Report.
+        assert!(p.is_denied_read_property("Report", "contents"));
+        assert!(p.is_denied_write_property("Report", "contents"));
+        assert!(!p.is_denied_traverse_label("Report"));
+        assert!(!p.is_denied_read_property("Report", "title"));
+
+        // DENY WRITE on :Locked blocks only writes; traverse/read of :Locked stay intact.
+        assert!(p.is_denied_write_label("Locked"));
+        assert!(!p.is_denied_traverse_label("Locked"));
+        assert!(!p.is_denied_read_property("Locked", "x"));
+
+        // A label with no matching deny reports nothing denied.
+        assert!(!p.is_denied_traverse_label("Public"));
+        assert!(!p.is_denied_write_label("Public"));
+        assert!(!p.is_denied_read_property("Public", "x"));
+        assert!(!p.is_denied_write_property("Public", "x"));
+    }
+
+    #[test]
+    fn deny_predicates_are_db_scoped_and_empty_for_admin() {
+        // Scoping: a deny recorded on db "other" must not block the session pinned to "db".
+        let cat = catalog_with_denies(
+            &[Privilege::on_graph(Action::Read, "db")],
+            &[Privilege::on_label(Action::Traverse, "other", "Classified")],
+        );
+        let p = EffectivePrivileges::resolve(cat, Some("alice"), "db");
+        assert!(
+            !p.is_denied_traverse_label("Classified"),
+            "a deny on another database must not block this one"
+        );
+
+        // A global admin is unrestricted and holds no deny snapshot -> never denied (even a
+        // self-directed deny on the admin role is not consulted — the fast-path exemption).
+        let mut auth = auth_with(&[]);
+        auth.catalog_mut()
+            .deny_privilege(
+                "admin",
+                Privilege::on_label(Action::Traverse, "db", "Classified"),
+            )
+            .unwrap();
+        let cat2 = Arc::new(SecurityCatalog::from_parts(
+            std::env::temp_dir().join("graphus-priv-test-unused"),
+            "root".to_owned(),
+            auth,
+        ));
+        let padmin = EffectivePrivileges::resolve(cat2, Some("root"), "db");
+        assert!(padmin.is_unrestricted());
+        assert!(
+            !padmin.is_denied_traverse_label("Classified"),
+            "a global admin is exempt from DENY"
+        );
+        assert!(!padmin.is_denied_write_label("Classified"));
     }
 
     #[test]

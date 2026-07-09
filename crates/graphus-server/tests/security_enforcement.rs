@@ -668,6 +668,173 @@ async fn deny_precedence_is_enforced_at_query_time() {
     server.shutdown().await.expect("clean shutdown");
 }
 
+/// **DENY-across-labels precedence on multi-label nodes** (CWE-863 regression, fix-forward of rmp
+/// #645). A node carrying two labels `(:Report:Classified)` where a broad `GRANT` reaches both labels
+/// but an explicit `DENY` targets one of them: Neo4j semantics are `(∃l: granted(l)) ∧ (∄l: denied(l))`
+/// — a `DENY` on **any** label of the node blocks it, even when another label grants access. The
+/// pre-fix executor unioned the per-label verdicts with a bare `OR` (`∃l: granted(l) ∧ ¬denied(l)`),
+/// so the node/property/write leaked through the *other*, non-denied label. This proves the fix
+/// end-to-end over the wire for traverse, property-read, and write (SET + CREATE), and confirms the
+/// deny is surgical — a sibling plain `(:Report)` node and non-denied properties/writes are untouched.
+#[tokio::test]
+async fn deny_precedence_across_labels_on_multilabel_nodes() {
+    let temp = TempStore::new("deny-multilabel");
+    let server = boot(base_config(&temp)).await;
+    let uds = server.uds_path.clone().expect("UDS enabled");
+
+    // ---- 1) Admin seeds a plain :Report and a multi-label :Report:Classified. ------------------
+    let mut alice = BoltClient::connect(&uds).await;
+    alice.handshake_and_logon("alice", "admin-pw8").await;
+    alice
+        .run_ok("CREATE (:Report {title: 'Public memo', contents: 'nothing secret'})")
+        .await;
+    alice
+        .run_ok("CREATE (:Report:Classified {title: 'Q3 numbers', contents: 'TOP SECRET'})")
+        .await;
+    alice.goodbye().await;
+
+    // ---- 2) bob: READ on the whole graph, but DENY TRAVERSE on :Classified. --------------------
+    let mut admin = BoltClient::connect(&uds).await;
+    admin.handshake_and_logon("alice", "admin-pw8").await;
+    admin.run_ok("REVOKE ROLE readwrite FROM bob").await;
+    admin.run_ok("CREATE ROLE analyst").await;
+    admin.run_ok("GRANT READ ON GRAPH graphus TO analyst").await;
+    admin
+        .run_ok("DENY TRAVERSE ON LABEL graphus.Classified TO analyst")
+        .await;
+    admin.run_ok("GRANT ROLE analyst TO bob").await;
+
+    let mut bob = BoltClient::connect(&uds).await;
+    bob.handshake_and_logon("bob", "user2-pw8").await;
+
+    // Phase A: a `:Report` match returns ONLY the plain node — the (:Report:Classified) node is
+    // hidden by the DENY on its :Classified label, even though the graph-wide grant reaches :Report.
+    // (This is the exploit: pre-fix, the classified node leaked through its :Report label.)
+    let reports = bob.run_ok("MATCH (n:Report) RETURN n.title").await;
+    let titles = opt_strings(&reports, 0);
+    assert_eq!(
+        titles,
+        vec![Some("Public memo".to_owned())],
+        "only the non-classified :Report is visible; the DENY on :Classified hides the other: {titles:?}"
+    );
+    // A `:Classified` match returns nothing (the node is hidden via its denied label).
+    let classified = bob.run_ok("MATCH (n:Classified) RETURN n.title").await;
+    assert!(
+        classified.is_empty(),
+        "the classified node is hidden through its denied label: {classified:?}"
+    );
+
+    // ---- 3) Reconfigure: revoke the traverse deny, DENY READ on :Classified.contents. ----------
+    admin
+        .run_ok("REVOKE DENY TRAVERSE ON LABEL graphus.Classified FROM analyst")
+        .await;
+    admin
+        .run_ok("DENY READ ON PROPERTY graphus.Classified.contents TO analyst")
+        .await;
+
+    // Phase B: both :Report nodes are now visible (DENY READ leaves traverse intact), but the
+    // classified node's `contents` reads as NULL while the plain node's `contents` is readable — the
+    // property deny is applied per-node via its :Classified label, never leaking the secret.
+    let reports2 = bob
+        .run_ok("MATCH (n:Report) RETURN n.title, n.contents")
+        .await;
+    assert_eq!(
+        opt_strings(&reports2, 0).len(),
+        2,
+        "both :Report nodes are visible after the traverse deny is revoked"
+    );
+    let contents = opt_strings(&reports2, 1);
+    assert!(
+        contents.contains(&Some("nothing secret".to_owned())),
+        "the plain :Report's contents is readable: {contents:?}"
+    );
+    assert!(
+        contents.contains(&None),
+        "the classified node's contents is hidden (NULL): {contents:?}"
+    );
+    assert!(
+        !contents.contains(&Some("TOP SECRET".to_owned())),
+        "the classified secret must NEVER leak via the :Report label: {contents:?}"
+    );
+    // Directly via :Classified: node visible, title reads, contents hidden.
+    let cls = bob
+        .run_ok("MATCH (n:Classified) RETURN n.title, n.contents")
+        .await;
+    assert_eq!(
+        opt_strings(&cls, 0),
+        vec![Some("Q3 numbers".to_owned())],
+        "classified node visible, title reads"
+    );
+    assert_eq!(
+        opt_strings(&cls, 1),
+        vec![None],
+        "classified contents hidden via DENY READ on :Classified.contents"
+    );
+
+    // ---- 4) Reconfigure: WRITE on the graph, DENY WRITE on :Classified.contents. ---------------
+    admin
+        .run_ok("REVOKE DENY READ ON PROPERTY graphus.Classified.contents FROM analyst")
+        .await;
+    admin
+        .run_ok("GRANT WRITE ON GRAPH graphus TO analyst")
+        .await;
+    admin
+        .run_ok("DENY WRITE ON PROPERTY graphus.Classified.contents TO analyst")
+        .await;
+
+    // Phase C: a SET of the denied property on the multi-label node is rejected (Forbidden), even
+    // though the graph-wide WRITE grant reaches contents via :Report.
+    let denied_set = bob
+        .run("MATCH (n:Classified) SET n.contents = 'leaked'")
+        .await
+        .expect_err("DENY WRITE on :Classified.contents rejects the SET");
+    assert!(
+        denied_set.code.contains("Security.Forbidden"),
+        "denied SET classifies as Forbidden: {denied_set:?}"
+    );
+    bob.reset().await;
+    // A CREATE of a new (:Report:Classified {contents}) is likewise rejected — the create's property
+    // check must union DENY-wins across the created labels (the write leaks via :Report pre-fix).
+    let denied_create = bob
+        .run("CREATE (:Report:Classified {contents: 'x'})")
+        .await
+        .expect_err("DENY WRITE on :Classified.contents rejects the CREATE");
+    assert!(
+        denied_create.code.contains("Security.Forbidden"),
+        "denied CREATE classifies as Forbidden: {denied_create:?}"
+    );
+    bob.reset().await;
+    // A non-denied write still succeeds (SET title), proving the deny is surgical, not blanket.
+    bob.run_ok("MATCH (n:Classified) SET n.title = 'edited'")
+        .await;
+
+    // ---- 5) Admin verifies the denied writes had NO side effect. -------------------------------
+    let final_state = admin
+        .run_ok("MATCH (n:Classified) RETURN n.contents, n.title")
+        .await;
+    assert_eq!(
+        opt_strings(&final_state, 0),
+        vec![Some("TOP SECRET".to_owned())],
+        "the denied SET/CREATE left contents unchanged"
+    );
+    assert_eq!(
+        opt_strings(&final_state, 1),
+        vec![Some("edited".to_owned())],
+        "the non-denied title write applied"
+    );
+    // The denied CREATE created no node (still exactly one :Classified node).
+    let count = admin.run_ok("MATCH (n:Classified) RETURN count(n)").await;
+    assert_eq!(
+        ints(&count, 0),
+        vec![1],
+        "the denied CREATE produced no node"
+    );
+
+    admin.goodbye().await;
+    bob.goodbye().await;
+    server.shutdown().await.expect("clean shutdown");
+}
+
 /// A restart durability check for DENY (rmp #645): a `DENY` recorded over the wire survives a full
 /// server restart (persisted in `security.toml` alongside grants) and is still enforced afterwards,
 /// and the deny record is durable but never as a plaintext leak.

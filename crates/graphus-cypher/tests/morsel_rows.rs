@@ -816,6 +816,19 @@ impl PrivilegeOracle for FixedOracle {
     fn can_write_rel_property(&self, _rel_type: &str, _property: &str) -> bool {
         true
     }
+    // This fixture configures no explicit denies -> never denied (CWE-863 negation predicates).
+    fn is_denied_traverse_label(&self, _label: &str) -> bool {
+        false
+    }
+    fn is_denied_read_property(&self, _label: &str, _property: &str) -> bool {
+        false
+    }
+    fn is_denied_write_label(&self, _label: &str) -> bool {
+        false
+    }
+    fn is_denied_write_property(&self, _label: &str, _property: &str) -> bool {
+        false
+    }
 }
 
 /// A restricted principal's `AuthorizedGraph` declines `morsel_label_scan` (`None`) so the executor runs

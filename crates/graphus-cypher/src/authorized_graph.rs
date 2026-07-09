@@ -26,18 +26,24 @@
 //! the question the operation needs.
 //!
 //! - **Node visibility (Traverse).** A node is visible iff the user can traverse **at least one** of
-//!   its labels ([`PrivilegeOracle::can_traverse_label`]) — broader `Graph`/`Database` grants are
-//!   folded into the oracle's answer. A node no label of which is traversable does not exist for this
-//!   statement: it is filtered out of [`scan_nodes`](GraphAccess::scan_nodes),
+//!   its labels ([`PrivilegeOracle::can_traverse_label`]) **and no label of the node is
+//!   traverse-denied** ([`PrivilegeOracle::is_denied_traverse_label`]) — broader `Graph`/`Database`
+//!   grants are folded into the oracle's answer, and an explicit `DENY` on **any one** of the node's
+//!   labels takes precedence over a grant on the others (Neo4j DENY-across-labels precedence; the
+//!   correct rule is `(∃l: granted(l)) ∧ (∄l: denied(l))`, never `∃l: granted(l) ∧ ¬denied(l)`). A
+//!   node that is not visible does not exist for this statement: it is filtered out of
+//!   [`scan_nodes`](GraphAccess::scan_nodes),
 //!   [`scan_nodes_by_label`](GraphAccess::scan_nodes_by_label), index seeks, expands, and as an
 //!   expand endpoint, and its [`node_exists`](GraphAccess::node_exists) reads `false`. **A node with
 //!   no labels at all is visible** (there is nothing to deny; it matches `MATCH (n)`), consistent with
 //!   property-level security where label grants gate only the labelled rows.
 //! - **Property read (Read).** A property `p` of a node is readable iff the user holds Read on `p`
-//!   under **some** label the node carries and can see ([`PrivilegeOracle::can_read_property`]). A
-//!   denied property reads back as **absent** (the node still appears; the key is simply not there) —
-//!   never an error. This is property-level security: a hidden property is `NULL`, the node stays
-//!   visible if traversable.
+//!   under **some** label the node carries and can see ([`PrivilegeOracle::can_read_property`]) **and
+//!   no label of the node read-denies `p`** ([`PrivilegeOracle::is_denied_read_property`]) — a `DENY
+//!   READ` on any one label wins over a grant on the others. A denied property reads back as
+//!   **absent** (the node still appears; the key is simply not there) — never an error. This is
+//!   property-level security: a hidden property is `NULL`, the node stays visible if traversable
+//!   (`DENY READ` leaves traverse intact, so the node is not hidden — only the property).
 //! - **Relationship traverse (Traverse).** A relationship of type `T` is traversable iff the user can
 //!   traverse `T` ([`PrivilegeOracle::can_traverse_rel_type`]) **and both endpoints are visible**. A
 //!   type-denied or now-dangling (endpoint filtered) relationship is removed from expands and
@@ -117,6 +123,46 @@ pub trait PrivilegeOracle {
 
     /// Whether the principal may **write** property `property` on a relationship of type `rel_type`.
     fn can_write_rel_property(&self, rel_type: &str, property: &str) -> bool;
+
+    // ---- explicit-DENY predicates (CWE-863 fix) --------------------------------------------------
+    //
+    // The `can_*` predicates above collapse `grant ∧ ¬deny` into a single per-label boolean, so an
+    // enforcement site that unions them across a multi-label node with a bare `OR`
+    // (`labels.iter().any(can_*)`) computes `∃l: (granted(l) ∧ ¬denied(l))`. That is the **wrong**
+    // rule for DENY, which must take precedence *across* labels: a node bearing labels `[Report,
+    // Classified]` with `GRANT READ ON GRAPH` + `DENY TRAVERSE ON LABEL Classified` must be
+    // invisible, because the correct Neo4j rule is `(∃l: granted(l)) ∧ (∄l: denied(l))` — a DENY on
+    // **any** label of the node blocks it even when another label would grant it.
+    //
+    // These predicates expose the negation half **separately** (consulting only the deny snapshot),
+    // so the [`AuthorizedGraph`] can enforce DENY-wins: `any(can_*) AND NOT any(is_denied_*)`. They
+    // must never be `true` for an unrestricted principal (a global admin is exempt from DENY): the
+    // decorator already short-circuits the unrestricted path before reaching them, and the server
+    // oracle additionally holds no deny snapshot for an admin, so both layers agree.
+    //
+    // Relationships need no deny predicate: a relationship carries exactly **one** type, so there is
+    // no cross-label union — `can_traverse_rel_type` / `can_write_rel_type` already fold the type's
+    // own deny via the oracle's grant/deny composition.
+
+    /// Whether an explicit `DENY` **blocks traversing** nodes carrying `label` (a `DENY TRAVERSE`, or
+    /// any stronger deny that subsumes traverse, on that label or a broader scope). When `true`, a
+    /// node bearing `label` is invisible regardless of any grant on its other labels.
+    fn is_denied_traverse_label(&self, label: &str) -> bool;
+
+    /// Whether an explicit `DENY` **blocks reading** property `property` on a node carrying `label`
+    /// (a `DENY READ` on the property, its label, or a broader scope). When `true`, the property reads
+    /// as absent/NULL regardless of any read grant reachable through the node's other labels.
+    fn is_denied_read_property(&self, label: &str, property: &str) -> bool;
+
+    /// Whether an explicit `DENY` **blocks writing** the label `label` (and the node's data under it).
+    /// When `true`, a whole-node write (create / delete / replace) touching a node that carries
+    /// `label` is rejected regardless of a grant on its other labels.
+    fn is_denied_write_label(&self, label: &str) -> bool;
+
+    /// Whether an explicit `DENY` **blocks writing** property `property` on a node carrying `label`.
+    /// When `true`, setting/removing that property on a node carrying `label` is rejected regardless
+    /// of a write grant reachable through the node's other labels.
+    fn is_denied_write_property(&self, label: &str, property: &str) -> bool;
 }
 
 /// A [`GraphAccess`] decorator that enforces a [`PrivilegeOracle`]'s fine-grained RBAC over an inner
@@ -204,10 +250,36 @@ impl<'g, O: PrivilegeOracle> AuthorizedGraph<'g, O> {
         self.labels_traversable(&labels)
     }
 
-    /// Whether a node carrying `labels` is traversable: no labels ⇒ visible; otherwise at least one
-    /// label must be traversable. Centralises the "node visibility" rule (`04 §8.4`).
+    /// Whether a node carrying `labels` is traversable, with **DENY-across-labels precedence**
+    /// (CWE-863 fix): a `DENY TRAVERSE` on **any** of the node's labels hides it outright, even when
+    /// another label would grant traversal. Otherwise the grant rule applies: no labels ⇒ visible;
+    /// with labels, at least one must be traversable. The full rule is
+    /// `(∄l: denied(l)) ∧ (labels.is_empty() ∨ ∃l: granted(l))` — never the flawed
+    /// `∃l: granted(l) ∧ ¬denied(l)` a bare per-label union would compute. Centralises the "node
+    /// visibility" rule (`04 §8.4`).
     fn labels_traversable(&self, labels: &[String]) -> bool {
+        if labels
+            .iter()
+            .any(|l| self.oracle.is_denied_traverse_label(l))
+        {
+            return false; // DENY on any label wins over any grant on the others
+        }
         labels.is_empty() || labels.iter().any(|l| self.oracle.can_traverse_label(l))
+    }
+
+    /// Whether property `key` is **readable** on a node carrying `labels`, with DENY-across-labels
+    /// precedence (CWE-863 fix): a `DENY READ` on `key` under **any** of the node's labels hides it,
+    /// even when another label would grant the read. Otherwise readable iff some label grants Read on
+    /// `key`. The rule is `(∄l: denied_read(l, key)) ∧ (∃l: granted_read(l, key))`; an unlabelled
+    /// node has no label to grant a read, so its properties stay hidden (unchanged behaviour).
+    fn property_readable(&self, labels: &[String], key: &str) -> bool {
+        if labels
+            .iter()
+            .any(|l| self.oracle.is_denied_read_property(l, key))
+        {
+            return false; // DENY READ on any label wins over any grant on the others
+        }
+        labels.iter().any(|l| self.oracle.can_read_property(l, key))
     }
 
     /// Whether `rel` is traversable: it exists, its type is traversable, **and** both endpoints are
@@ -222,7 +294,8 @@ impl<'g, O: PrivilegeOracle> AuthorizedGraph<'g, O> {
     }
 
     /// Filters `props` of a node carrying `labels` to the readable ones (property hiding): a property
-    /// is kept iff readable under some label the node carries. Used by `node_properties`.
+    /// is kept iff [`property_readable`](Self::property_readable) — some label grants Read on it and
+    /// no label read-denies it (DENY-across-labels precedence). Used by `node_properties`.
     fn filter_node_props(
         &self,
         labels: &[String],
@@ -230,7 +303,7 @@ impl<'g, O: PrivilegeOracle> AuthorizedGraph<'g, O> {
     ) -> Vec<(String, Value)> {
         props
             .into_iter()
-            .filter(|(key, _)| labels.iter().any(|l| self.oracle.can_read_property(l, key)))
+            .filter(|(key, _)| self.property_readable(labels, key))
             .collect()
     }
 
@@ -430,12 +503,13 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         if self.oracle.is_unrestricted() {
             return self.inner.node_property(node, key);
         }
-        // Hidden if the node is invisible, or no label the node carries grants Read on `key`.
+        // Hidden if the node is invisible, or `key` is not readable under the node's labels (no label
+        // grants Read on it, or some label read-denies it — DENY-across-labels precedence).
         let labels = self.inner.node_labels(node)?;
         if !self.labels_traversable(&labels) {
             return None;
         }
-        if !labels.iter().any(|l| self.oracle.can_read_property(l, key)) {
+        if !self.property_readable(&labels, key) {
             return None; // property hidden -> reads as absent/NULL
         }
         self.inner.node_property(node, key)
@@ -588,16 +662,10 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
             }
         }
         for (key, _) in properties {
-            let allowed = if labels.is_empty() {
-                // No label: the property is gated by a graph/database-wide write grant. The oracle
-                // answers that via the empty-label probe (the server maps it to the broad scope).
-                self.oracle.can_write_property("", key)
-            } else {
-                labels
-                    .iter()
-                    .any(|l| self.oracle.can_write_property(l, key))
-            };
-            if !allowed {
+            // Gated by `property_writable`: some created label grants Write on the property and no
+            // created label write-denies it (DENY-across-labels precedence); with no labels, the
+            // graph/database-wide write grant gates it via the empty-label probe.
+            if !self.property_writable(labels, key) {
                 self.deny(Self::forbidden("write", "property", key));
                 return NodeId(u64::MAX);
             }
@@ -727,10 +795,7 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
             return;
         }
         for (key, _) in properties {
-            if !labels
-                .iter()
-                .any(|l| self.oracle.can_write_property(l, key))
-            {
+            if !self.property_writable(&labels, key) {
                 self.deny(Self::forbidden("write", "property", key));
                 return;
             }
@@ -743,16 +808,14 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
             self.inner.merge_node_properties(node, properties);
             return;
         }
-        // `SET n += map` overlays each key; require write on each key under the node's labels.
+        // `SET n += map` overlays each key; require write on each key under the node's labels (with
+        // DENY-across-labels precedence via `property_writable`).
         let labels = match self.inner.node_labels(node) {
             Some(l) => l,
             None => return,
         };
         for (key, _) in properties {
-            if !labels
-                .iter()
-                .any(|l| self.oracle.can_write_property(l, key))
-            {
+            if !self.property_writable(&labels, key) {
                 self.deny(Self::forbidden("write", "property", key));
                 return;
             }
@@ -866,8 +929,32 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
 }
 
 impl<O: PrivilegeOracle> AuthorizedGraph<'_, O> {
+    /// Whether the principal may write property `key` on a node carrying `labels`, with
+    /// DENY-across-labels precedence (CWE-863 fix): a `DENY WRITE` on `key` under **any** of the
+    /// node's labels rejects the write, even when another label would grant it. With labels, allowed
+    /// iff some label grants Write on `key` and no label write-denies it
+    /// (`(∄l: denied(l)) ∧ (∃l: granted(l))`); with no labels, gated by the graph/database-wide write
+    /// grant (empty-label probe — an unlabelled node has no label-level deny to apply, and a
+    /// graph-wide `DENY` is already folded into `can_write_property("", key)` by the oracle).
+    fn property_writable(&self, labels: &[String], key: &str) -> bool {
+        if labels.is_empty() {
+            // No label: gated by the graph/database-wide write grant (empty-label probe).
+            return self.oracle.can_write_property("", key);
+        }
+        if labels
+            .iter()
+            .any(|l| self.oracle.is_denied_write_property(l, key))
+        {
+            return false; // DENY WRITE on any label wins over any grant on the others
+        }
+        labels
+            .iter()
+            .any(|l| self.oracle.can_write_property(l, key))
+    }
+
     /// Whether the principal may write property `key` on `node`, given the node's current labels. A
-    /// node invisible to the principal is treated as not-writable (its labels are non-traversable).
+    /// node invisible to the principal is treated as not-writable (its labels are non-traversable),
+    /// and DENY-across-labels precedence applies via [`property_writable`](Self::property_writable).
     fn node_write_property_allowed(&self, node: NodeId, key: &str) -> bool {
         let Some(labels) = self.inner.node_labels(node) else {
             return false;
@@ -875,14 +962,7 @@ impl<O: PrivilegeOracle> AuthorizedGraph<'_, O> {
         if !self.labels_traversable(&labels) {
             return false;
         }
-        if labels.is_empty() {
-            // No label: gated by the graph/database-wide write grant (empty-label probe).
-            self.oracle.can_write_property("", key)
-        } else {
-            labels
-                .iter()
-                .any(|l| self.oracle.can_write_property(l, key))
-        }
+        self.property_writable(&labels, key)
     }
 
     /// Whether the principal may write property `key` on `rel`, given the rel's current type.
@@ -897,14 +977,19 @@ impl<O: PrivilegeOracle> AuthorizedGraph<'_, O> {
     }
 
     /// Whether the principal has write authority over a node carrying `labels` (for whole-node
-    /// operations: delete, replace). With no labels, the graph/database-wide write grant gates it
-    /// (empty-label probe); otherwise at least one label must be writable.
+    /// operations: delete, replace), with DENY-across-labels precedence (CWE-863 fix): a `DENY WRITE`
+    /// on **any** label refuses the whole-node write, even when another label would grant it. With no
+    /// labels, the graph/database-wide write grant gates it (empty-label probe); otherwise at least
+    /// one label must be writable and none write-denied
+    /// (`(∄l: denied(l)) ∧ (∃l: granted(l))`).
     fn node_labels_writable(&self, labels: &[String]) -> bool {
         if labels.is_empty() {
-            self.oracle.can_write_label("")
-        } else {
-            labels.iter().any(|l| self.oracle.can_write_label(l))
+            return self.oracle.can_write_label("");
         }
+        if labels.iter().any(|l| self.oracle.is_denied_write_label(l)) {
+            return false; // DENY WRITE on any label wins over any grant on the others
+        }
+        labels.iter().any(|l| self.oracle.can_write_label(l))
     }
 }
 
@@ -933,6 +1018,13 @@ mod tests {
         write_rel_types: BTreeSet<String>,
         write_props: BTreeSet<(String, String)>,
         write_rel_props: BTreeSet<(String, String)>,
+        // Explicit denylists (CWE-863 fix): a name here blocks the capability regardless of any
+        // grant, mirroring the server oracle's deny snapshot. A `can_*` grant AND a matching deny may
+        // coexist (a broad grant with a carved hole) — the enforcement combines them DENY-wins.
+        denied_traverse_labels: BTreeSet<String>,
+        denied_read_props: BTreeSet<(String, String)>,
+        denied_write_labels: BTreeSet<String>,
+        denied_write_props: BTreeSet<(String, String)>,
     }
 
     impl StubOracle {
@@ -975,6 +1067,23 @@ mod tests {
             self.write_rel_props.insert((t.to_owned(), p.to_owned()));
             self
         }
+
+        fn deny_traverse_label(mut self, l: &str) -> Self {
+            self.denied_traverse_labels.insert(l.to_owned());
+            self
+        }
+        fn deny_read_property(mut self, l: &str, p: &str) -> Self {
+            self.denied_read_props.insert((l.to_owned(), p.to_owned()));
+            self
+        }
+        fn deny_write_label(mut self, l: &str) -> Self {
+            self.denied_write_labels.insert(l.to_owned());
+            self
+        }
+        fn deny_write_property(mut self, l: &str, p: &str) -> Self {
+            self.denied_write_props.insert((l.to_owned(), p.to_owned()));
+            self
+        }
     }
 
     impl PrivilegeOracle for StubOracle {
@@ -1008,6 +1117,20 @@ mod tests {
         fn can_write_rel_property(&self, rel_type: &str, property: &str) -> bool {
             self.write_rel_props
                 .contains(&(rel_type.to_owned(), property.to_owned()))
+        }
+        fn is_denied_traverse_label(&self, label: &str) -> bool {
+            self.denied_traverse_labels.contains(label)
+        }
+        fn is_denied_read_property(&self, label: &str, property: &str) -> bool {
+            self.denied_read_props
+                .contains(&(label.to_owned(), property.to_owned()))
+        }
+        fn is_denied_write_label(&self, label: &str) -> bool {
+            self.denied_write_labels.contains(label)
+        }
+        fn is_denied_write_property(&self, label: &str, property: &str) -> bool {
+            self.denied_write_props
+                .contains(&(label.to_owned(), property.to_owned()))
         }
     }
 
@@ -1416,5 +1539,166 @@ mod tests {
         assert_eq!(authz.scan_nodes(), vec![n]);
         // ...but a property with no label-grant is still hidden (no label grants Read on it).
         assert_eq!(authz.node_property(n, "k"), None);
+    }
+
+    // ---- DENY-across-labels precedence on multi-label nodes (CWE-863 regression) ------------------
+    //
+    // The exploit these guard: a node bearing labels `[Report, Classified]` where a broad grant
+    // reaches BOTH labels but an explicit DENY targets ONE of them. The pre-fix executor combined the
+    // per-label `can_*` booleans with a bare `OR` union (`labels.iter().any(...)`), computing
+    // `∃l: granted(l) ∧ ¬denied(l)` — so the node/property/write leaked through the *other*
+    // (non-denied) label. The correct Neo4j rule is `(∃l: granted(l)) ∧ (∄l: denied(l))`: a DENY on
+    // ANY label of the node wins. Each test grants the capability on BOTH labels (the faithful stub
+    // model of a graph-wide grant that reaches every label) and denies exactly one.
+
+    /// One multi-label node `(:Report:Classified {contents, title})` for the CWE-863 regression set.
+    fn multilabel() -> (MemGraph, NodeId) {
+        let mut g = MemGraph::new();
+        let n = g.add_node(
+            ["Report", "Classified"],
+            [("contents", s("top-secret")), ("title", s("Q3"))],
+        );
+        (g, n)
+    }
+
+    #[test]
+    fn deny_traverse_on_any_label_hides_multilabel_node() {
+        // DENY TRAVERSE on :Classified hides the whole node, even though :Report grants traverse.
+        let (mut g, n) = multilabel();
+        let oracle = StubOracle::default()
+            .traverse_label("Report")
+            .traverse_label("Classified")
+            .read_property("Report", "contents")
+            .read_property("Classified", "contents")
+            .deny_traverse_label("Classified");
+        let authz = AuthorizedGraph::new(&mut g, oracle);
+        // Invisible through every read path (not just the :Classified one).
+        assert!(!authz.node_exists(n), "a DENY on any label hides the node");
+        assert!(authz.scan_nodes().is_empty(), "scan filters it out");
+        assert!(
+            authz.scan_nodes_by_label("Report").is_empty(),
+            "even a :Report label scan must not leak the denied node"
+        );
+        assert!(authz.scan_nodes_by_label("Classified").is_empty());
+        assert_eq!(authz.node_labels(n), None, "labels report as absent");
+        assert_eq!(
+            authz.node_property(n, "contents"),
+            None,
+            "property unreadable"
+        );
+        assert_eq!(authz.node_properties(n), None);
+    }
+
+    #[test]
+    fn deny_read_property_on_any_label_hides_property_not_multilabel_node() {
+        // DENY READ on :Classified.contents hides that property (NULL) but leaves the node visible
+        // (DENY READ does not block traverse), even though a read grant reaches contents via :Report.
+        let (mut g, n) = multilabel();
+        let oracle = StubOracle::default()
+            .traverse_label("Report")
+            .traverse_label("Classified")
+            .read_property("Report", "contents")
+            .read_property("Classified", "contents")
+            .read_property("Report", "title")
+            .read_property("Classified", "title")
+            .deny_read_property("Classified", "contents");
+        let authz = AuthorizedGraph::new(&mut g, oracle);
+        assert!(authz.node_exists(n), "DENY READ leaves the node visible");
+        assert_eq!(
+            authz.node_property(n, "contents"),
+            None,
+            "the denied property must not leak via :Report"
+        );
+        assert_eq!(
+            authz.node_property(n, "title"),
+            Some(s("Q3")),
+            "other props read"
+        );
+        let props = authz.node_properties(n).expect("node visible");
+        assert_eq!(props.len(), 1, "only the readable prop survives: {props:?}");
+        assert_eq!(props[0], ("title".to_owned(), s("Q3")));
+    }
+
+    #[test]
+    fn deny_write_property_on_any_label_blocks_set_on_multilabel_node() {
+        // SET n.contents: a write grant reaches contents via :Report, but DENY WRITE on
+        // :Classified.contents rejects the write with no side effect.
+        let (mut g, n) = multilabel();
+        let oracle = StubOracle::default()
+            .traverse_label("Report")
+            .traverse_label("Classified")
+            .write_property("Report", "contents")
+            .write_property("Classified", "contents")
+            .deny_write_property("Classified", "contents");
+        let mut authz = AuthorizedGraph::new(&mut g, oracle);
+        authz.set_node_property(n, "contents", s("leaked"));
+        assert!(authz.has_auth_error(), "the denied write is captured");
+        assert_eq!(
+            g.node_property(n, "contents"),
+            Some(s("top-secret")),
+            "no side effect: the property is unchanged"
+        );
+    }
+
+    #[test]
+    fn deny_write_label_on_any_label_blocks_delete_of_multilabel_node() {
+        // DELETE (:Report:Classified): a write grant reaches :Report, but DENY WRITE on :Classified
+        // refuses the whole-node delete.
+        let (mut g, n) = multilabel();
+        let before = g.node_count();
+        let oracle = StubOracle::default()
+            .traverse_label("Report")
+            .traverse_label("Classified")
+            .write_label("Report")
+            .write_label("Classified")
+            .deny_write_label("Classified");
+        let mut authz = AuthorizedGraph::new(&mut g, oracle);
+        authz.delete_node(n);
+        assert!(
+            authz.has_auth_error(),
+            "the denied whole-node write is rejected"
+        );
+        assert_eq!(g.node_count(), before, "no node was deleted");
+    }
+
+    #[test]
+    fn deny_write_property_blocks_create_of_multilabel_node() {
+        // CREATE (:Report:Classified {contents}): write granted on both labels + the property, but a
+        // DENY WRITE on :Classified.contents rejects the create before any side effect.
+        let mut g = MemGraph::new();
+        let before = g.node_count();
+        let oracle = StubOracle::default()
+            .write_label("Report")
+            .write_label("Classified")
+            .write_property("Report", "contents")
+            .write_property("Classified", "contents")
+            .deny_write_property("Classified", "contents");
+        let mut authz = AuthorizedGraph::new(&mut g, oracle);
+        let _ = authz.create_node(
+            &["Report".to_owned(), "Classified".to_owned()],
+            &[("contents".to_owned(), s("top-secret"))],
+        );
+        assert!(
+            authz.has_auth_error(),
+            "the denied property on create is rejected"
+        );
+        assert_eq!(g.node_count(), before, "no node was created");
+    }
+
+    #[test]
+    fn multilabel_node_visible_when_one_label_grants_and_none_denied() {
+        // The GRANT union is PRESERVED: a node (:Report:Classified) with traverse granted on :Report
+        // only (:Classified merely ungranted, NOT denied) stays visible — only an explicit DENY hides
+        // it. This pins that the fix restricts on DENY, never on a mere missing grant.
+        let (mut g, n) = multilabel();
+        let oracle = StubOracle::default()
+            .traverse_label("Report")
+            .read_property("Report", "title");
+        let authz = AuthorizedGraph::new(&mut g, oracle);
+        assert!(
+            authz.node_exists(n),
+            "granted on one label, denied on none -> visible"
+        );
+        assert_eq!(authz.node_property(n, "title"), Some(s("Q3")));
     }
 }
