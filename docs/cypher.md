@@ -404,6 +404,7 @@ property type — apply to both nodes (`FOR (n:Label)`) and relationships (`FOR 
 
 ```cypher
 CREATE CONSTRAINT uq_email    IF NOT EXISTS FOR (p:Person)      REQUIRE p.email IS UNIQUE
+CREATE CONSTRAINT uq_name     IF NOT EXISTS FOR (p:Person)      REQUIRE (p.first, p.last) IS UNIQUE
 CREATE CONSTRAINT nk_person   IF NOT EXISTS FOR (p:Person)      REQUIRE (p.first, p.last) IS NODE KEY
 CREATE CONSTRAINT ex_name     IF NOT EXISTS FOR (p:Person)      REQUIRE p.name IS NOT NULL
 CREATE CONSTRAINT ty_age      IF NOT EXISTS FOR (p:Person)      REQUIRE p.age IS :: INTEGER
@@ -411,6 +412,12 @@ CREATE CONSTRAINT rk_rated    IF NOT EXISTS FOR ()-[r:RATED]-() REQUIRE (r.a, r.
 CREATE CONSTRAINT rex_since   IF NOT EXISTS FOR ()-[r:RATED]-() REQUIRE r.since IS NOT NULL
 CREATE OR REPLACE CONSTRAINT uq_email FOR (p:Person) REQUIRE p.email IS UNIQUE
 ```
+
+Uniqueness constraints may cover a **single property or a composite tuple** (`REQUIRE (a, b) IS
+UNIQUE`), for both nodes and relationships. Like Neo4j, uniqueness is *null-relaxed*: an entity with
+a null (or absent) value in any covered property is not checked, so it never collides — only fully
+present tuples must be unique. (A key constraint additionally requires every covered property to be
+present.)
 
 #### Property type constraints — allowed types
 

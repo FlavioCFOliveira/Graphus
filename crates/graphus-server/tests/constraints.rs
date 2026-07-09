@@ -1216,3 +1216,134 @@ async fn property_type_constraint_temporal_point_union_and_list_enforced() {
 
     handle.shutdown().await.expect("graceful shutdown");
 }
+
+// =================================================================================================
+// `rmp` #651 — composite property uniqueness (node + relationship): the combined values of a tuple
+// must be unique, with null-relaxation (a null in any covered property is never checked), enforced
+// on CREATE/SET/MERGE and at creation time, and durable across restart.
+// =================================================================================================
+
+/// Builds a composite node `IS UNIQUE` command.
+fn create_composite_unique(name: &str, label: &str, properties: &[&str]) -> ConstraintCommand {
+    node_create(name, label, properties, ConstraintCreateKind::Unique)
+}
+
+#[tokio::test]
+async fn composite_node_uniqueness_enforced_with_null_relaxation() {
+    let temp = TempStore::new("composite_node_unique");
+    let handle = boot(config(&temp)).await;
+    let engine = handle.engine.clone();
+
+    run(
+        &engine,
+        "CREATE (:Person {id: 1, first: 'Ada', last: 'Byron'})",
+    )
+    .await;
+    engine
+        .constraint_ddl(create_composite_unique(
+            "uq_name",
+            "Person",
+            &["first", "last"],
+        ))
+        .await
+        .expect("composite uniqueness over conforming data");
+
+    // A different tuple (same first, different last) is allowed.
+    run(
+        &engine,
+        "CREATE (:Person {id: 2, first: 'Ada', last: 'Lovelace'})",
+    )
+    .await;
+    // A duplicate tuple is rejected.
+    let err = try_run(
+        &engine,
+        "CREATE (:Person {id: 3, first: 'Ada', last: 'Byron'})",
+    )
+    .await
+    .expect_err("duplicate composite tuple must be rejected");
+    assert_constraint_violation(&err);
+
+    // Null-relaxation: a node missing a covered property has an incomplete tuple → never collides,
+    // so two such nodes both succeed (Cypher uniqueness treats null as never-equal).
+    run(&engine, "CREATE (:Person {id: 4, first: 'Ada'})").await;
+    run(&engine, "CREATE (:Person {id: 5, first: 'Ada'})").await;
+
+    // A SET that completes a tuple into a duplicate is rejected.
+    let err = try_run(&engine, "MATCH (n:Person {id: 2}) SET n.last = 'Byron'")
+        .await
+        .expect_err("SET into a duplicate composite tuple must be rejected");
+    assert_constraint_violation(&err);
+
+    // Creation-time validation over pre-existing duplicates rejects the constraint.
+    run(&engine, "CREATE (:Dup {a: 1, b: 2})").await;
+    run(&engine, "CREATE (:Dup {a: 1, b: 2})").await;
+    let err = engine
+        .constraint_ddl(create_composite_unique("dk", "Dup", &["a", "b"]))
+        .await
+        .expect_err("composite uniqueness over duplicate data must be rejected");
+    assert_constraint_violation(&err);
+
+    handle.shutdown().await.expect("graceful shutdown");
+}
+
+#[tokio::test]
+async fn composite_relationship_uniqueness_enforced_and_durable() {
+    let temp = TempStore::new("composite_rel_unique");
+    let cfg = config(&temp);
+
+    {
+        let handle = boot(cfg.clone()).await;
+        let engine = handle.engine.clone();
+        run(&engine, "CREATE (:A {id: 1}), (:B {id: 2})").await;
+        engine
+            .constraint_ddl(rel_create(
+                "rq_pair",
+                "PAID",
+                &["x", "y"],
+                ConstraintCreateKind::Unique,
+            ))
+            .await
+            .expect("composite rel uniqueness");
+        run(
+            &engine,
+            "MATCH (a:A {id: 1}), (b:B {id: 2}) CREATE (a)-[:PAID {x: 1, y: 2}]->(b)",
+        )
+        .await;
+        // A different tuple is allowed.
+        run(
+            &engine,
+            "MATCH (a:A {id: 1}), (b:B {id: 2}) CREATE (a)-[:PAID {x: 1, y: 3}]->(b)",
+        )
+        .await;
+        // The duplicate tuple is rejected.
+        let err = try_run(
+            &engine,
+            "MATCH (a:A {id: 1}), (b:B {id: 2}) CREATE (a)-[:PAID {x: 1, y: 2}]->(b)",
+        )
+        .await
+        .expect_err("duplicate composite rel tuple must be rejected");
+        assert_constraint_violation(&err);
+        // Null-relaxation: an incomplete tuple never collides.
+        run(
+            &engine,
+            "MATCH (a:A {id: 1}), (b:B {id: 2}) CREATE (a)-[:PAID {x: 1}]->(b)",
+        )
+        .await;
+        handle.shutdown().await.expect("graceful shutdown");
+    }
+
+    // Restart: the composite rel uniqueness constraint is reloaded and still enforced.
+    {
+        let handle = boot(cfg).await;
+        let engine = handle.engine.clone();
+        assert_eq!(show_constraints(&engine).await.rows.len(), 1);
+        let err = try_run(
+            &engine,
+            "MATCH (a:A {id: 1}), (b:B {id: 2}) CREATE (a)-[:PAID {x: 1, y: 2}]->(b)",
+        )
+        .await
+        .expect_err("composite rel uniqueness enforced after restart");
+        assert_constraint_violation(&err);
+        handle.shutdown().await.expect("graceful shutdown");
+    }
+}

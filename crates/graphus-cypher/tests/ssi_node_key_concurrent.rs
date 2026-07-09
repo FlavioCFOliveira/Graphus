@@ -334,3 +334,97 @@ fn unique_create_after_commit_is_constraint_validation_failed() {
         "the rejected CREATE created nothing"
     );
 }
+
+// =================================================================================================
+// `rmp` #651 — composite IS UNIQUE: concurrent inserts of the same NEW tuple. Composite uniqueness
+// reuses the node-key composite seek-then-check (`composite_seek_eq`, which registers the coarse
+// `PredicateRead::Label`), so it inherits the #401 SSI soundness: exactly one of two concurrent
+// identical-tuple CREATEs commits.
+// =================================================================================================
+
+fn create_person_composite_unique(coord: &mut Coord, name: &str) {
+    coord
+        .create_constraint_general(
+            name,
+            "Person",
+            &["first", "last"],
+            ConstraintKind::Unique,
+            None,
+        )
+        .expect("create composite uniqueness over conforming (empty) data");
+}
+
+#[test]
+fn concurrent_composite_unique_create_same_new_tuple_aborts_exactly_one() {
+    let mut coord = fresh_coord();
+    create_person_composite_unique(&mut coord, "person_uq");
+
+    let t1 = coord.begin_serializable();
+    let t2 = coord.begin_serializable();
+
+    let (_r1, e1) = run_stmt(
+        &coord,
+        t1,
+        "CREATE (:Person {first: 'Ada', last: 'Lovelace'})",
+    );
+    assert!(e1.is_none(), "t1 passes its own write-time check: {e1:?}");
+    let (_r2, e2) = run_stmt(
+        &coord,
+        t2,
+        "CREATE (:Person {first: 'Ada', last: 'Lovelace'})",
+    );
+    assert!(e2.is_none(), "t2 passes its own write-time check: {e2:?}");
+
+    let c1 = coord.commit(t1);
+    let c2 = coord.commit(t2);
+    let committed = [&c1, &c2].iter().filter(|r| r.is_ok()).count();
+    let aborted = [&c1, &c2].iter().filter(|r| r.is_err()).count();
+    assert_eq!(
+        committed, 1,
+        "exactly one concurrent identical composite-unique CREATE may commit (c1={c1:?}, c2={c2:?})"
+    );
+    assert_eq!(aborted, 1, "exactly one is aborted to preserve uniqueness");
+    let err = [c1, c2].into_iter().find_map(Result::err).unwrap();
+    assert!(
+        matches!(err, GraphusError::Transaction(_)),
+        "the concurrent-uniqueness abort is a retriable transaction error: {err}"
+    );
+    assert_eq!(
+        person_count(&mut coord),
+        1,
+        "no duplicate composite-unique node survives"
+    );
+}
+
+#[test]
+fn composite_unique_create_after_commit_is_constraint_validation_failed() {
+    let mut coord = fresh_coord();
+    create_person_composite_unique(&mut coord, "person_uq");
+    run_write_committed(
+        &mut coord,
+        "CREATE (:Person {first: 'Ada', last: 'Lovelace'})",
+    );
+
+    let t = coord.begin_serializable();
+    let (_r, e) = run_stmt(
+        &coord,
+        t,
+        "CREATE (:Person {first: 'Ada', last: 'Lovelace'})",
+    );
+    let e = e.expect("a visible duplicate tuple is rejected at statement time");
+    assert!(
+        e.to_string().contains(CONSTRAINT_VIOLATION_PREFIX),
+        "expected a ConstraintValidationFailed sentinel, got: {e}"
+    );
+    coord.rollback(t).expect("rollback the violating txn");
+
+    // Null-relaxation: two nodes each with an incomplete tuple (missing `last`) both commit — a null
+    // in a covered property never collides.
+    run_write_committed(&mut coord, "CREATE (:Person {first: 'Grace'})");
+    run_write_committed(&mut coord, "CREATE (:Person {first: 'Grace'})");
+    assert_eq!(
+        person_count(&mut coord),
+        3,
+        "one full tuple + two null-relaxed nodes"
+    );
+}

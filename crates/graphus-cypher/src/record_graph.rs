@@ -1529,7 +1529,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                         return;
                     }
                 }
-                ConstraintKind::Unique => {
+                ConstraintKind::Unique if property_names.len() == 1 => {
                     let property_name = &property_names[0];
                     // A null/absent value never participates in uniqueness (Cypher equality: null is
                     // never equal), matching the index's treatment — so it can never collide.
@@ -1550,6 +1550,33 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                                 label: label_name,
                                 property: property_name.clone(),
                                 value: render_value(&value),
+                            }
+                            .into_error(),
+                        );
+                        return;
+                    }
+                }
+                ConstraintKind::Unique => {
+                    // Composite uniqueness (`rmp` #651): the covered property *tuple* must be unique
+                    // across nodes of the label. Unlike a node key there is **no existence
+                    // requirement** — a null/absent value in any covered property relaxes uniqueness
+                    // (a tuple containing a null never collides, matching single-property semantics),
+                    // so an incomplete tuple is skipped rather than a violation. `node_tuple` yields
+                    // `None` when any covered property is absent/null, giving exactly that skip.
+                    let Some(tuple) = self.node_tuple(node, &rule.property_tokens) else {
+                        continue;
+                    };
+                    if self
+                        .node_key_tuple_conflict(&label_name, &rule, &tuple, node)
+                        .is_some()
+                    {
+                        self.capture(
+                            ConstraintViolation::UniquenessComposite {
+                                name: constraint_name,
+                                entity: ViolationEntity::Node,
+                                label: label_name,
+                                properties: property_names.clone(),
+                                values: render_tuple(&tuple),
                             }
                             .into_error(),
                         );
@@ -1698,7 +1725,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                         return;
                     }
                 }
-                ConstraintKind::RelUnique => {
+                ConstraintKind::RelUnique if property_names.len() == 1 => {
                     let property_name = &property_names[0];
                     let prop_key = rule.property_tokens[0];
                     let Some(value) = self
@@ -1725,6 +1752,45 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                                 label: type_name,
                                 property: property_name.clone(),
                                 value: render_value(&value),
+                            }
+                            .into_error(),
+                        );
+                        return;
+                    }
+                }
+                ConstraintKind::RelUnique => {
+                    // Composite relationship uniqueness (`rmp` #651), scan-based (no composite rel
+                    // index yet — the same footprint as `RelKey`). No existence requirement: a null in
+                    // any covered property relaxes uniqueness, so an incomplete tuple is skipped. The
+                    // complete tuple must not be held by another relationship of the type.
+                    let mut tuple = Vec::with_capacity(property_names.len());
+                    let mut complete = true;
+                    for property_name in &property_names {
+                        match self
+                            .rel_property(rel, property_name)
+                            .filter(|v| !v.is_null())
+                        {
+                            Some(v) => tuple.push(v),
+                            None => {
+                                complete = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !complete {
+                        continue;
+                    }
+                    if self
+                        .rel_key_tuple_conflict(&type_name, &property_names, &tuple, rel)
+                        .is_some()
+                    {
+                        self.capture(
+                            ConstraintViolation::UniquenessComposite {
+                                name: constraint_name,
+                                entity: ViolationEntity::Relationship,
+                                label: type_name,
+                                properties: property_names.clone(),
+                                values: render_tuple(&tuple),
                             }
                             .into_error(),
                         );

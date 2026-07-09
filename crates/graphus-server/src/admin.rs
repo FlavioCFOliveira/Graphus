@@ -1462,19 +1462,24 @@ fn parse_constraint_create_tail(
     // IS ( [NODE|REL[ATIONSHIP]] UNIQUE | NOT NULL | [NODE|REL[ATIONSHIP]] KEY | :: <TYPE> | TYPED <TYPE> )
     expect_keyword(lex, "IS", VERB)?;
     let kind = parse_constraint_is_clause(lex, entity.is_relationship())?;
-    // Arity: only a composite KEY may cover more than one property.
-    if properties.len() != 1 && !matches!(kind, ConstraintCreateKind::Key) {
+    // Arity: a composite tuple is valid for KEY and for UNIQUE (`rmp` #651 — composite property
+    // uniqueness); existence and property-type constraints cover exactly one property.
+    if properties.len() != 1
+        && matches!(
+            kind,
+            ConstraintCreateKind::Existence | ConstraintCreateKind::PropertyType { .. }
+        )
+    {
         return Err(match kind {
-            ConstraintCreateKind::Unique => {
-                "a uniqueness constraint (IS UNIQUE) covers exactly one property".to_owned()
-            }
             ConstraintCreateKind::Existence => {
                 "an existence constraint (IS NOT NULL) covers exactly one property".to_owned()
             }
             ConstraintCreateKind::PropertyType { .. } => {
                 "a property-type constraint (IS :: <TYPE>) covers exactly one property".to_owned()
             }
-            ConstraintCreateKind::Key => unreachable!("KEY was excluded by the guard above"),
+            ConstraintCreateKind::Unique | ConstraintCreateKind::Key => {
+                unreachable!("UNIQUE and KEY permit a composite tuple")
+            }
         });
     }
     expect_end(lex, "CREATE CONSTRAINT")?;
@@ -4798,8 +4803,7 @@ mod tests {
 
     #[test]
     fn malformed_node_key_and_property_type_are_syntax_errors() {
-        // A composite tuple is only valid with NODE KEY.
-        invalid("CREATE CONSTRAINT c FOR (n:Person) REQUIRE (n.a, n.b) IS UNIQUE");
+        // A composite tuple is valid for KEY and UNIQUE (`rmp` #651), but not for existence/type.
         invalid("CREATE CONSTRAINT c FOR (n:Person) REQUIRE (n.a, n.b) IS NOT NULL");
         // NODE without KEY.
         invalid("CREATE CONSTRAINT c FOR (n:Person) REQUIRE (n.a) IS NODE");
@@ -4937,6 +4941,39 @@ mod tests {
             vec!["INTEGER"; T::MAX_UNION_MEMBERS + 1].join(" | "),
         );
         invalid(&wide_union);
+    }
+
+    #[test]
+    fn composite_uniqueness_constraint_parses() {
+        // `rmp` #651: a composite tuple `IS UNIQUE` is valid for both nodes and relationships.
+        assert_eq!(
+            constraint_cmd("CREATE CONSTRAINT c FOR (n:Person) REQUIRE (n.a, n.b) IS UNIQUE"),
+            node_constraint("c", "Person", &["a", "b"], ConstraintCreateKind::Unique)
+        );
+        // The NODE qualifier is accepted on the composite form too.
+        assert_eq!(
+            constraint_cmd("CREATE CONSTRAINT c FOR (n:Person) REQUIRE (n.a, n.b) IS NODE UNIQUE"),
+            node_constraint("c", "Person", &["a", "b"], ConstraintCreateKind::Unique)
+        );
+        // Relationship composite uniqueness.
+        assert_eq!(
+            constraint_cmd("CREATE CONSTRAINT rc FOR ()-[r:PAID]-() REQUIRE (r.a, r.b) IS UNIQUE"),
+            ConstraintCommand::Create(CreateConstraint {
+                name: "rc".to_owned(),
+                entity: ConstraintEntity::Relationship {
+                    rel_type: "PAID".to_owned(),
+                },
+                properties: vec!["a".to_owned(), "b".to_owned()],
+                kind: ConstraintCreateKind::Unique,
+                if_not_exists: false,
+                or_replace: false,
+            })
+        );
+        // A single-property `IS UNIQUE` still parses (regression).
+        assert_eq!(
+            constraint_cmd("CREATE CONSTRAINT c FOR (n:Person) REQUIRE n.email IS UNIQUE"),
+            node_constraint("c", "Person", &["email"], ConstraintCreateKind::Unique)
+        );
     }
 
     #[test]

@@ -2829,12 +2829,16 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             idx.register_constraint(name, label_token, prop_keys.clone(), kind, type_descriptor);
             match kind {
                 ConstraintKind::Unique => {
-                    if let [prop_key] = prop_keys.as_slice() {
-                        idx.register_node_property_with_state(
+                    match prop_keys.as_slice() {
+                        [prop_key] => idx.register_node_property_with_state(
                             label_token,
                             *prop_key,
                             IndexState::Online,
-                        );
+                        ),
+                        // Composite uniqueness (`rmp` #651) is backed by a composite index over the
+                        // whole tuple — exactly like a node key — so the write-time duplicate check is
+                        // index-accelerated and its SSI predicate footprint matches the key path.
+                        _ => idx.register_composite(label_token, prop_keys.clone()),
                     }
                     true
                 }
@@ -2919,7 +2923,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                         .into_error());
                     }
                 }
-                ConstraintKind::Unique => {
+                ConstraintKind::Unique if prop_keys.len() == 1 => {
                     // A null/absent value never participates in uniqueness (Cypher equality treats
                     // null as never-equal), matching the index's treatment.
                     let Some(value) = self
@@ -2942,6 +2946,39 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                         .into_error());
                     }
                     seen.push((value, id));
+                }
+                ConstraintKind::Unique => {
+                    // Composite uniqueness (`rmp` #651): no existence requirement — a null in any
+                    // covered property relaxes uniqueness, so an incomplete tuple is skipped; the
+                    // complete tuple must be unique across the scanned nodes.
+                    let mut tuple = Vec::with_capacity(prop_keys.len());
+                    let mut complete = true;
+                    for &prop_key in prop_keys {
+                        match self
+                            .node_value_for_key(id, prop_key)
+                            .filter(|v| !v.is_null())
+                        {
+                            Some(v) => tuple.push(v),
+                            None => {
+                                complete = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !complete {
+                        continue;
+                    }
+                    if seen_tuples.iter().any(|seen| tuples_equal(seen, &tuple)) {
+                        return Err(ConstraintViolation::UniquenessComposite {
+                            name: name.to_owned(),
+                            entity: ViolationEntity::Node,
+                            label: label.to_owned(),
+                            properties: properties.iter().map(|p| (*p).to_owned()).collect(),
+                            values: render_tuple(&tuple),
+                        }
+                        .into_error());
+                    }
+                    seen_tuples.push(tuple);
                 }
                 ConstraintKind::NodeKey => {
                     // Existence half: every covered property must be present and non-null.
@@ -3086,7 +3123,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                         .into_error());
                     }
                 }
-                ConstraintKind::RelUnique => {
+                ConstraintKind::RelUnique if prop_keys.len() == 1 => {
                     let Some(value) = self
                         .rel_value_for_key(id, prop_keys[0])
                         .filter(|v| !v.is_null())
@@ -3107,6 +3144,39 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                         .into_error());
                     }
                     seen.push((value, id));
+                }
+                ConstraintKind::RelUnique => {
+                    // Composite relationship uniqueness (`rmp` #651): no existence requirement — a null
+                    // in any covered property relaxes uniqueness (skip an incomplete tuple); the
+                    // complete tuple must be unique across the scanned relationships.
+                    let mut tuple = Vec::with_capacity(prop_keys.len());
+                    let mut complete = true;
+                    for &prop_key in prop_keys {
+                        match self
+                            .rel_value_for_key(id, prop_key)
+                            .filter(|v| !v.is_null())
+                        {
+                            Some(v) => tuple.push(v),
+                            None => {
+                                complete = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !complete {
+                        continue;
+                    }
+                    if seen_tuples.iter().any(|seen| tuples_equal(seen, &tuple)) {
+                        return Err(ConstraintViolation::UniquenessComposite {
+                            name: name.to_owned(),
+                            entity: ViolationEntity::Relationship,
+                            label: rel_type.to_owned(),
+                            properties: properties.iter().map(|p| (*p).to_owned()).collect(),
+                            values: render_tuple(&tuple),
+                        }
+                        .into_error());
+                    }
+                    seen_tuples.push(tuple);
                 }
                 ConstraintKind::RelKey => {
                     // Existence half: every covered property must be present and non-null.

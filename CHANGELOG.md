@@ -45,6 +45,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Composite property uniqueness constraints (rmp #651).** `REQUIRE (a, b, …) IS UNIQUE` over a
+  property tuple is now supported for both nodes (`FOR (n:L)`) and relationships (`FOR ()-[r:T]-()`),
+  matching Neo4j. Enforced on `CREATE`/`SET`/`MERGE` and at creation time, null-relaxed (an entity
+  with a null in any covered property is never checked, mirroring single-property uniqueness), and
+  serializable-safe: two concurrent inserts of the same brand-new tuple abort exactly one (the node
+  path reuses the composite backing index + SSI predicate footprint of node-key). Durable across
+  restart.
 - **Full property-type set for `IS :: <TYPE>` constraints (rmp #652).** Property type constraints now
   accept the complete Neo4j-5.x closed set: the temporal scalars (`DATE`, `LOCAL TIME`, `ZONED TIME`,
   `LOCAL DATETIME`, `ZONED DATETIME`, `DURATION`) and `POINT` in addition to `BOOLEAN`/`STRING`/

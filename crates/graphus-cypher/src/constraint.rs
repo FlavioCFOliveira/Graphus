@@ -85,6 +85,21 @@ pub enum ConstraintViolation {
         /// A short rendering of the duplicate value (for the human message).
         value: String,
     },
+    /// A **composite uniqueness** constraint was violated (`rmp` #651): another entity of `label`
+    /// already holds the same tuple of `properties` values. Unlike a key constraint this carries no
+    /// existence requirement — an entity with a null in any covered property is simply not checked.
+    UniquenessComposite {
+        /// The declared constraint's name.
+        name: String,
+        /// Whether the covered entity is a node or a relationship.
+        entity: ViolationEntity,
+        /// The covered node label / relationship type.
+        label: String,
+        /// The covered properties, in declared order.
+        properties: Vec<String>,
+        /// A short rendering of the duplicate composite tuple (for the human message).
+        values: String,
+    },
     /// An **existence** (`NOT NULL`) constraint was violated: an entity of `label` lacks the required
     /// `property` (or set it to null).
     Existence {
@@ -147,6 +162,7 @@ impl ConstraintViolation {
     fn entity(&self) -> ViolationEntity {
         match self {
             Self::Uniqueness { entity, .. }
+            | Self::UniquenessComposite { entity, .. }
             | Self::Existence { entity, .. }
             | Self::NodeKeyMissing { entity, .. }
             | Self::NodeKeyDuplicate { entity, .. }
@@ -159,7 +175,7 @@ impl ConstraintViolation {
     pub fn kind(&self) -> ConstraintKind {
         let rel = self.entity() == ViolationEntity::Relationship;
         match self {
-            Self::Uniqueness { .. } => {
+            Self::Uniqueness { .. } | Self::UniquenessComposite { .. } => {
                 if rel {
                     ConstraintKind::RelUnique
                 } else {
@@ -205,6 +221,18 @@ impl ConstraintViolation {
                 "{} already exists with property `{property}` = {value} \
                  (uniqueness constraint `{name}`)",
                 entity.render(label)
+            ),
+            Self::UniquenessComposite {
+                name,
+                entity,
+                label,
+                properties,
+                values,
+            } => format!(
+                "{} already exists with properties {} = {values} \
+                 (uniqueness constraint `{name}`)",
+                entity.render(label),
+                render_property_list(properties),
             ),
             Self::Existence {
                 name,
