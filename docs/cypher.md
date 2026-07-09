@@ -402,6 +402,12 @@ Constraints support `IF NOT EXISTS`, `OR REPLACE`, and both node and relationshi
 one reports `constraints-added: 1`. The four kinds — uniqueness, existence (`NOT NULL`), key, and
 property type — apply to both nodes (`FOR (n:Label)`) and relationships (`FOR ()-[r:TYPE]-()`).
 
+The constraint **name is optional**: when omitted (`CREATE CONSTRAINT FOR (n:L) REQUIRE …`), a
+deterministic Neo4j-style name (`constraint_<hex>`, derived from the schema) is generated, so a
+repeated unnamed `CREATE … IF NOT EXISTS` stays idempotent. A trailing `OPTIONS { … }` map (Neo4j's
+backing-index provider / config) is accepted for DDL compatibility; Graphus has a single built-in
+index provider, so the options have no effect.
+
 ```cypher
 CREATE CONSTRAINT uq_email    IF NOT EXISTS FOR (p:Person)      REQUIRE p.email IS UNIQUE
 CREATE CONSTRAINT uq_name     IF NOT EXISTS FOR (p:Person)      REQUIRE (p.first, p.last) IS UNIQUE

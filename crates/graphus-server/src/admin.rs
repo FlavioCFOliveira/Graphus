@@ -1385,18 +1385,20 @@ fn parse_claimed_constraint(
         );
     }
 
-    // Both CREATE and DROP take a name next.
-    let name = expect_name(lex, "a constraint name", "CONSTRAINT")?;
-
     match verb {
         "DROP" => {
+            // `DROP CONSTRAINT <name>` always names its target.
+            let name = expect_name(lex, "a constraint name", "CONSTRAINT")?;
             let if_exists = parse_optional_if(lex, /* with_not */ false)?;
             expect_end(lex, "DROP CONSTRAINT")?;
             Ok(ConstraintCommand::Drop { name, if_exists })
         }
         "CREATE" => {
-            // `IF NOT EXISTS` follows the name (Neo4j positions it there); `OR REPLACE` was consumed by
-            // the dispatcher before the surface keyword. The two are mutually exclusive.
+            // The name is OPTIONAL (`rmp` #654): Neo4j auto-generates one when omitted, so a bare
+            // `FOR`/`IF` directly after `CONSTRAINT` means "unnamed". `IF NOT EXISTS` follows the name
+            // (Neo4j positions it there); `OR REPLACE` was consumed by the dispatcher before the
+            // surface keyword. The two are mutually exclusive.
+            let explicit_name = parse_optional_constraint_name(lex)?;
             let if_not_exists = parse_optional_if(lex, /* with_not */ true)?;
             if or_replace && if_not_exists {
                 return Err(
@@ -1404,6 +1406,11 @@ fn parse_claimed_constraint(
                 );
             }
             let (entity, properties, kind) = parse_constraint_create_tail(lex)?;
+            // An omitted name is filled in with a deterministic auto-generated name derived from the
+            // constraint's schema, so `IF NOT EXISTS` stays idempotent and `SHOW CONSTRAINTS` reports a
+            // stable name (`rmp` #654).
+            let name =
+                explicit_name.unwrap_or_else(|| auto_constraint_name(&entity, &properties, &kind));
             Ok(ConstraintCommand::Create(CreateConstraint {
                 name,
                 entity,
@@ -1416,6 +1423,57 @@ fn parse_claimed_constraint(
         // `parse_admin_statement` only routes CREATE/DROP/SHOW here; START/STOP never reach this.
         other => Err(format!("unsupported constraint verb {other}")),
     }
+}
+
+/// Parses the OPTIONAL constraint name in `CREATE CONSTRAINT [name] …` (`rmp` #654). Returns [`None`]
+/// (consuming nothing) when the next token is a bare `FOR` or `IF` — i.e. the name was omitted and
+/// Neo4j-style auto-naming applies; otherwise consumes and returns the explicit name. A backtick-quoted
+/// `` `FOR` `` / `` `IF` `` is still a name (only the bare keyword signals "unnamed").
+fn parse_optional_constraint_name(lex: &mut Lexer<'_>) -> Result<Option<String>, String> {
+    let mut peek = Lexer {
+        rest: lex.rest.clone(),
+    };
+    if let Some(Tok::Word(w)) = peek.next_tok()? {
+        if w.eq_ignore_ascii_case("FOR") || w.eq_ignore_ascii_case("IF") {
+            return Ok(None);
+        }
+    }
+    Ok(Some(expect_name(lex, "a constraint name", "CONSTRAINT")?))
+}
+
+/// A deterministic auto-generated constraint name (`rmp` #654), Neo4j-style `constraint_<hex>`, derived
+/// from the constraint's schema (entity kind + covered token + property tuple + kind). Deterministic so
+/// that a repeated `CREATE CONSTRAINT … IF NOT EXISTS` (with no name) resolves to the same name and is
+/// idempotent, and so a restart re-derives the same name. Uses a stable FNV-1a hash (independent of the
+/// std hasher, which is not guaranteed stable across builds).
+fn auto_constraint_name(
+    entity: &ConstraintEntity,
+    properties: &[String],
+    kind: &ConstraintCreateKind,
+) -> String {
+    let (etype, token) = match entity {
+        ConstraintEntity::Node { label } => ("node", label.as_str()),
+        ConstraintEntity::Relationship { rel_type } => ("rel", rel_type.as_str()),
+    };
+    let kind_str = match kind {
+        ConstraintCreateKind::Unique => "unique".to_owned(),
+        ConstraintCreateKind::Existence => "exists".to_owned(),
+        ConstraintCreateKind::Key => "key".to_owned(),
+        ConstraintCreateKind::PropertyType { declared_type } => {
+            format!(
+                "type:{}",
+                graphus_cypher::constraint::type_descriptor_name(declared_type)
+            )
+        }
+    };
+    let canonical = format!("{etype}|{token}|{}|{kind_str}", properties.join(","));
+    // FNV-1a 64-bit — a small, stable, dependency-free hash.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in canonical.as_bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("constraint_{h:016x}")
 }
 
 /// Parses the `FOR <entity> REQUIRE … IS …` tail of a `CREATE CONSTRAINT <name>` statement
@@ -1482,8 +1540,40 @@ fn parse_constraint_create_tail(
             }
         });
     }
+    // An optional trailing `OPTIONS { … }` (`rmp` #654): Neo4j attaches a backing-index provider /
+    // config here on uniqueness & key constraints. Graphus has a single built-in index provider, so
+    // the clause is accepted (for Neo4j-DDL compatibility) and its content ignored.
+    skip_optional_options(lex)?;
     expect_end(lex, "CREATE CONSTRAINT")?;
     Ok((entity, properties, kind))
+}
+
+/// Consumes an optional trailing `OPTIONS { … }` map clause (`rmp` #654), accepting any well-formed
+/// brace-balanced content (nested maps included) and discarding it. A no-op when the next token is not
+/// `OPTIONS`. Errors on an unterminated brace group.
+fn skip_optional_options(lex: &mut Lexer<'_>) -> Result<(), String> {
+    let mut peek = Lexer {
+        rest: lex.rest.clone(),
+    };
+    if !matches!(peek.next_tok()?, Some(t) if is_keyword(&t, "OPTIONS")) {
+        return Ok(()); // no OPTIONS clause
+    }
+    lex.next_tok()?; // consume OPTIONS
+    expect_symbol(lex, '{', "CONSTRAINT")?;
+    let mut depth = 1usize;
+    loop {
+        match lex.next_tok()? {
+            Some(Tok::Symbol('{')) => depth += 1,
+            Some(Tok::Symbol('}')) => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(());
+                }
+            }
+            Some(_) => {}
+            None => return Err("unterminated OPTIONS { … } in CREATE CONSTRAINT".to_owned()),
+        }
+    }
 }
 
 /// Parses the entity pattern after `FOR` in a `CREATE CONSTRAINT` (`rmp` #638): the node pattern
@@ -4974,6 +5064,64 @@ mod tests {
             constraint_cmd("CREATE CONSTRAINT c FOR (n:Person) REQUIRE n.email IS UNIQUE"),
             node_constraint("c", "Person", &["email"], ConstraintCreateKind::Unique)
         );
+    }
+
+    #[test]
+    fn unnamed_constraint_gets_a_deterministic_auto_name() {
+        // `rmp` #654: an omitted name is auto-generated deterministically from the schema.
+        let name_of = |q: &str| match constraint_cmd(q) {
+            ConstraintCommand::Create(c) => c,
+            other => panic!("expected a create, got {other:?}"),
+        };
+        let c = name_of("CREATE CONSTRAINT FOR (n:Person) REQUIRE n.email IS UNIQUE");
+        assert!(
+            c.name.starts_with("constraint_"),
+            "auto name should be Neo4j-style: {}",
+            c.name
+        );
+        // Deterministic: the same schema yields the same name.
+        let c2 = name_of("CREATE CONSTRAINT FOR (n:Person) REQUIRE n.email IS UNIQUE");
+        assert_eq!(c.name, c2.name);
+        // A different schema yields a different name.
+        let c3 = name_of("CREATE CONSTRAINT FOR (n:Person) REQUIRE n.other IS UNIQUE");
+        assert_ne!(c.name, c3.name);
+        // Unnamed + IF NOT EXISTS derives the same name (so idempotency holds).
+        let c4 =
+            name_of("CREATE CONSTRAINT IF NOT EXISTS FOR (n:Person) REQUIRE n.email IS UNIQUE");
+        assert!(c4.if_not_exists);
+        assert_eq!(c4.name, c.name);
+        // A backtick-quoted `for` / `if` is still an explicit name, not the "unnamed" keyword.
+        let c5 = name_of("CREATE CONSTRAINT `for` FOR (n:Person) REQUIRE n.email IS UNIQUE");
+        assert_eq!(c5.name, "for");
+    }
+
+    #[test]
+    fn constraint_options_clause_is_accepted() {
+        // `rmp` #654: an OPTIONS { … } map (any well-formed content, nested maps included) is accepted
+        // for Neo4j-DDL compatibility.
+        assert!(matches!(
+            constraint_cmd(
+                "CREATE CONSTRAINT uq FOR (n:Person) REQUIRE n.email IS UNIQUE OPTIONS {}"
+            ),
+            ConstraintCommand::Create(_)
+        ));
+        assert!(matches!(
+            constraint_cmd(
+                "CREATE CONSTRAINT uq FOR (n:Person) REQUIRE n.email IS UNIQUE \
+                 OPTIONS { indexProvider: 'range-1.0', indexConfig: { `k`: [0, 0] } }"
+            ),
+            ConstraintCommand::Create(_)
+        ));
+        // Unnamed + OPTIONS combine.
+        assert!(matches!(
+            constraint_cmd(
+                "CREATE CONSTRAINT FOR (n:Person) REQUIRE n.email IS UNIQUE \
+                 OPTIONS { indexProvider: 'range-1.0' }"
+            ),
+            ConstraintCommand::Create(_)
+        ));
+        // An unterminated OPTIONS map is a syntax error, not a silent accept.
+        invalid("CREATE CONSTRAINT uq FOR (n:Person) REQUIRE n.email IS UNIQUE OPTIONS { a: 1");
     }
 
     #[test]

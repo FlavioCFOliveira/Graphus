@@ -45,6 +45,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Optional constraint names + `OPTIONS` clause (rmp #654).** `CREATE CONSTRAINT` no longer requires
+  a name: when omitted (`CREATE CONSTRAINT FOR (n:L) REQUIRE …`) a deterministic Neo4j-style name
+  (`constraint_<hex>`, derived from the entity + property tuple + kind via a stable hash) is
+  generated, so a repeated unnamed `CREATE … IF NOT EXISTS` remains idempotent and `SHOW CONSTRAINTS`
+  reports a stable name. A trailing `OPTIONS { … }` map (Neo4j's backing-index provider/config,
+  including nested maps) is accepted for DDL compatibility and ignored (Graphus has a single built-in
+  index provider).
 - **Composite property uniqueness constraints (rmp #651).** `REQUIRE (a, b, …) IS UNIQUE` over a
   property tuple is now supported for both nodes (`FOR (n:L)`) and relationships (`FOR ()-[r:T]-()`),
   matching Neo4j. Enforced on `CREATE`/`SET`/`MERGE` and at creation time, null-relaxed (an entity
