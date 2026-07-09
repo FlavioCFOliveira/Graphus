@@ -155,10 +155,19 @@ fn parses_every_quantifier_form() {
 }
 
 #[test]
-fn rejects_multi_relationship_interior_at_parse() {
-    let err = parse_only("MATCH (a)((x)-[r1]->(m)-[r2]->(y))+(b) RETURN a")
-        .expect_err("multi-hop interior must be rejected");
-    assert!(err.contains("single relationship"), "got: {err}");
+fn parses_multi_relationship_interior() {
+    // A multi-relationship interior (Neo4j 5.x GPM) parses: the first hop lives on the link's flat
+    // fields, every further hop in `QppInfo::interior_extra`.
+    for q in [
+        "MATCH (a)((x)-[r1:R]->(m)-[r2:S]->(y))+(b) RETURN a",
+        "MATCH (a)((x)-[:R]->(m)-[:S]->(y)){1,3}(b) RETURN a",
+        "MATCH (a)((x)-[:R]->(m)<-[:S]-(y))*(b) RETURN a",
+        "MATCH (a)((x)-[:R]->(m)-[:S]->(n)-[:T]->(y))+(b) RETURN a", // three hops
+        "MATCH (a)((x)-[r1:R]->(m)-[r2:S]->(y) WHERE r1.w < r2.w){2}(b) RETURN a",
+        "MATCH ((x)-[:R]->(m)-[:S]->(y))+ RETURN x", // leading QPP, synth boundaries
+    ] {
+        parse_only(q).unwrap_or_else(|e| panic!("expected `{q}` to parse: {e}"));
+    }
 }
 
 #[test]
@@ -166,6 +175,10 @@ fn rejects_nested_quantified_path_at_parse() {
     let err = parse_only("MATCH (a)(((x)-[r]->(y))+)+(b) RETURN a")
         .expect_err("nested QPP must be rejected");
     assert!(err.contains("nested"), "got: {err}");
+    // A nested QPP is still rejected even when it follows another interior hop.
+    let err2 = parse_only("MATCH (a)((x)-[:R]->(m)((u)-[:S]->(v))+(y))+(b) RETURN a")
+        .expect_err("nested QPP inside a multi-hop interior must be rejected");
+    assert!(err2.contains("nested"), "got: {err2}");
 }
 
 // =================================================================================================
@@ -522,4 +535,262 @@ fn disjunctive_interior_relationship_types() {
         &mut g,
     );
     assert_eq!(ints(&rows, "bid"), vec![1, 2]);
+}
+
+// =================================================================================================
+// Multi-relationship interior (Neo4j 5.x GPM): the interior is a longer path repeated per iteration
+// =================================================================================================
+
+/// An alternating chain `0 -[R w:0]-> 1 -[S w:1]-> 2 -[R w:2]-> 3 -[S w:3]-> 4`. A two-relationship
+/// interior `(x)-[:R]->(m)-[:S]->(y)` advances one `R` then one `S` per iteration: from `0`, one
+/// iteration reaches `2`, two iterations reach `4`.
+fn seed_rs_chain() -> MemGraph {
+    let mut g = MemGraph::new();
+    let n: Vec<NodeId> = (0..5).map(|k| g.add_node(["N"], [("id", i(k))])).collect();
+    g.add_rel("R", n[0], n[1], [("w", i(0))]);
+    g.add_rel("S", n[1], n[2], [("w", i(1))]);
+    g.add_rel("R", n[2], n[3], [("w", i(2))]);
+    g.add_rel("S", n[3], n[4], [("w", i(3))]);
+    g
+}
+
+#[test]
+fn multi_hop_plus_enumerates_iteration_endpoints() {
+    let mut g = seed_rs_chain();
+    // Each iteration is a full `R`→`S` interior. From `0`: one iteration → `2`, two iterations → `4`.
+    let rows = run(
+        "MATCH (a {id:0})((x)-[:R]->(m)-[:S]->(y))+(b) RETURN b.id AS bid",
+        &mut g,
+    );
+    assert_eq!(ints(&rows, "bid"), vec![2, 4]);
+}
+
+#[test]
+fn multi_hop_exact_and_range_counts() {
+    let mut g = seed_rs_chain();
+    let one = run(
+        "MATCH (a {id:0})((x)-[:R]->(m)-[:S]->(y)){1}(b) RETURN b.id AS bid",
+        &mut g,
+    );
+    assert_eq!(ints(&one, "bid"), vec![2]);
+    let two = run(
+        "MATCH (a {id:0})((x)-[:R]->(m)-[:S]->(y)){2}(b) RETURN b.id AS bid",
+        &mut g,
+    );
+    assert_eq!(ints(&two, "bid"), vec![4]);
+    let range = run(
+        "MATCH (a {id:0})((x)-[:R]->(m)-[:S]->(y)){1,2}(b) RETURN b.id AS bid",
+        &mut g,
+    );
+    assert_eq!(ints(&range, "bid"), vec![2, 4]);
+}
+
+#[test]
+fn multi_hop_star_includes_the_zero_iteration_walk() {
+    let mut g = seed_rs_chain();
+    // `*` (0+): the zero-iteration walk binds the boundary to the anchor `0`, plus the positive
+    // endpoints `2` and `4`.
+    let rows = run(
+        "MATCH (a {id:0})((x)-[:R]->(m)-[:S]->(y))*(b) RETURN b.id AS bid",
+        &mut g,
+    );
+    assert_eq!(ints(&rows, "bid"), vec![0, 2, 4]);
+}
+
+#[test]
+fn multi_hop_group_variables_aggregate_per_iteration() {
+    let mut g = seed_rs_chain();
+    // The two-iteration walk `0→1→2→3→4`. Every interior variable is a group list with **one element
+    // per iteration** (not per hop): x=[0,2], m=[1,3], y=[2,4], and each relationship group has 2.
+    let rows = run(
+        "MATCH (a {id:0})((x)-[r1:R]->(m)-[r2:S]->(y))+(b) WHERE b.id = 4 \
+         RETURN [n IN x | n.id] AS xs, [n IN m | n.id] AS ms, [n IN y | n.id] AS ys, \
+                size(r1) AS r1c, size(r2) AS r2c",
+        &mut g,
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].value("xs"), Value::List(vec![i(0), i(2)]));
+    assert_eq!(rows[0].value("ms"), Value::List(vec![i(1), i(3)]));
+    assert_eq!(rows[0].value("ys"), Value::List(vec![i(2), i(4)]));
+    assert_eq!(rows[0].value("r1c"), i(2));
+    assert_eq!(rows[0].value("r2c"), i(2));
+}
+
+#[test]
+fn multi_hop_boundary_nodes_stay_scalar() {
+    let mut g = seed_rs_chain();
+    let rows = run(
+        "MATCH (a {id:0})((x)-[:R]->(m)-[:S]->(y))+(b) WHERE b.id = 4 \
+         RETURN a.id AS aid, b.id AS bid",
+        &mut g,
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].value("aid"), i(0));
+    assert_eq!(rows[0].value("bid"), i(4));
+}
+
+#[test]
+fn multi_hop_inner_where_spans_both_hop_relationships() {
+    let mut g = seed_rs_chain();
+    // The inner `WHERE` references both interior relationships of the iteration. On the RS chain the
+    // first iteration has `r1.w + r2.w = 0 + 1 = 1 < 5` (kept), the second `2 + 3 = 5` (pruned), so
+    // only the single-iteration endpoint `2` survives.
+    let rows = run(
+        "MATCH (a {id:0})((x)-[r1:R]->(m)-[r2:S]->(y) WHERE r1.w + r2.w < 5)+(b) RETURN b.id AS bid",
+        &mut g,
+    );
+    assert_eq!(ints(&rows, "bid"), vec![2]);
+}
+
+#[test]
+fn multi_hop_extra_hop_node_label_constrains_each_iteration() {
+    // 0 -[R]-> 1 -[S]-> 2(:VIP) -[R]-> 3 -[S]-> 4  (only node 2 is a :VIP)
+    let mut g = MemGraph::new();
+    let n: Vec<NodeId> = (0..5)
+        .map(|k| {
+            let labels: &[&str] = if k == 2 { &["N", "VIP"] } else { &["N"] };
+            g.add_node(labels.iter().copied(), [("id", i(k))])
+        })
+        .collect();
+    g.add_rel("R", n[0], n[1], NO_PROPS);
+    g.add_rel("S", n[1], n[2], NO_PROPS);
+    g.add_rel("R", n[2], n[3], NO_PROPS);
+    g.add_rel("S", n[3], n[4], NO_PROPS);
+    // Require the extra hop's END node `(y)` to be a :VIP. Iteration one ends at `2` (:VIP ✓); a
+    // second iteration would end at `4` (not :VIP), so it is pruned — reachable b ∈ {2}.
+    let rows = run(
+        "MATCH (a {id:0})((x)-[:R]->(m)-[:S]->(y:VIP))+(b) RETURN b.id AS bid",
+        &mut g,
+    );
+    assert_eq!(ints(&rows, "bid"), vec![2]);
+}
+
+#[test]
+fn multi_hop_extra_hop_relationship_property_filter() {
+    let mut g = seed_rs_chain();
+    // Inline property map on the **second** interior hop: only `S` edges with `w = 1`. Iteration one
+    // uses the S edge `1→2` (w=1 ✓); a second iteration would use `3→4` (w=3 ✗), so it is pruned.
+    let rows = run(
+        "MATCH (a {id:0})((x)-[:R]->(m)-[r2:S {w:1}]->(y))+(b) RETURN b.id AS bid",
+        &mut g,
+    );
+    assert_eq!(ints(&rows, "bid"), vec![2]);
+}
+
+#[test]
+fn multi_hop_mixed_direction_interior() {
+    // 0 -[R]-> 1 <-[S]- 2, and 2 -[R]-> 3 <-[S]- 4. The interior `(x)-[:R]->(m)<-[:S]-(y)` walks one
+    // outgoing R then one incoming S per iteration.
+    let mut g = MemGraph::new();
+    let n: Vec<NodeId> = (0..5).map(|k| g.add_node(["N"], [("id", i(k))])).collect();
+    g.add_rel("R", n[0], n[1], NO_PROPS);
+    g.add_rel("S", n[2], n[1], NO_PROPS); // incoming to 1 from 2
+    g.add_rel("R", n[2], n[3], NO_PROPS);
+    g.add_rel("S", n[4], n[3], NO_PROPS); // incoming to 3 from 4
+    // From 0: iter1 `0-R->1<-S-2` (y=2); iter2 `2-R->3<-S-4` (y=4).
+    let rows = run(
+        "MATCH (a {id:0})((x)-[:R]->(m)<-[:S]-(y))+(b) RETURN b.id AS bid",
+        &mut g,
+    );
+    assert_eq!(ints(&rows, "bid"), vec![2, 4]);
+}
+
+#[test]
+fn multi_hop_trail_forbids_reusing_a_relationship_across_hops() {
+    // A 2-cycle `0 -[R]-> 1 -[S]-> 0`. The interior `(x)-[:R]->(m)-[:S]->(y)` completes exactly one
+    // iteration `0→1→0`; a second iteration would have to reuse the `R` edge `0→1` (already in the
+    // trail), which trail semantics forbid — so exactly the one endpoint `0`.
+    let mut g = MemGraph::new();
+    let a = g.add_node(["N"], [("id", i(0))]);
+    let b = g.add_node(["N"], [("id", i(1))]);
+    g.add_rel("R", a, b, NO_PROPS);
+    g.add_rel("S", b, a, NO_PROPS);
+    let plus = run(
+        "MATCH (a {id:0})((x)-[:R]->(m)-[:S]->(y))+(b) RETURN b.id AS bid",
+        &mut g,
+    );
+    assert_eq!(ints(&plus, "bid"), vec![0]);
+    // Two iterations are impossible without reusing an edge → no rows.
+    let two = run(
+        "MATCH (a {id:0})((x)-[:R]->(m)-[:S]->(y)){2}(b) RETURN count(*) AS c",
+        &mut g,
+    );
+    assert_eq!(two[0].value("c"), i(0));
+}
+
+#[test]
+fn multi_hop_into_binding_keeps_only_walks_reaching_the_bound_boundary() {
+    let mut g = seed_rs_chain();
+    // `b` is bound (id=4) before the QPP: only the two-iteration walk ending at `4` is kept.
+    let rows = run(
+        "MATCH (a {id:0}), (b {id:4}) MATCH (a)((x)-[:R]->(m)-[:S]->(y))+(b) RETURN size(y) AS yc",
+        &mut g,
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].value("yc"), i(2));
+}
+
+#[test]
+fn multi_hop_composes_after_a_fixed_relationship() {
+    let mut g = seed_rs_chain();
+    // One fixed `R` hop from `0` to `1`, then a two-relationship QPP from `1` (starting with `S`).
+    let rows = run(
+        "MATCH (a {id:0})-[:R]->(m0)((x)-[:S]->(mid)-[:R]->(y))+(b) RETURN b.id AS bid",
+        &mut g,
+    );
+    // From 1: iter1 `1-S->2-R->3` (y=3). A second iteration from 3 needs an S edge out of 3 (none), so
+    // just `3`.
+    assert_eq!(ints(&rows, "bid"), vec![3]);
+}
+
+#[test]
+fn three_hop_interior_executes_and_binds_group_lists() {
+    // 0 -[R]-> 1 -[S]-> 2 -[T]-> 3 -[R]-> 4 -[S]-> 5 -[T]-> 6
+    let mut g = MemGraph::new();
+    let n: Vec<NodeId> = (0..7).map(|k| g.add_node(["N"], [("id", i(k))])).collect();
+    for (k, t) in (0..6).zip(["R", "S", "T", "R", "S", "T"]) {
+        g.add_rel(t, n[k], n[k + 1], NO_PROPS);
+    }
+    // Each iteration is a full `R`→`S`→`T` interior. From 0: one iteration → 3, two → 6.
+    let rows = run(
+        "MATCH (a {id:0})((x)-[:R]->(m)-[:S]->(p)-[:T]->(y))+(b) RETURN b.id AS bid",
+        &mut g,
+    );
+    assert_eq!(ints(&rows, "bid"), vec![3, 6]);
+    // Group lists on the two-iteration walk: one element per iteration for every interior variable.
+    let g2 = run(
+        "MATCH (a {id:0})((x)-[r1:R]->(m)-[r2:S]->(p)-[r3:T]->(y))+(b) WHERE b.id = 6 \
+         RETURN [z IN x | z.id] AS xs, [z IN m | z.id] AS ms, [z IN p | z.id] AS ps, \
+                [z IN y | z.id] AS ys, size(r1) AS r1c, size(r2) AS r2c, size(r3) AS r3c",
+        &mut g,
+    );
+    assert_eq!(g2.len(), 1);
+    assert_eq!(g2[0].value("xs"), Value::List(vec![i(0), i(3)]));
+    assert_eq!(g2[0].value("ms"), Value::List(vec![i(1), i(4)]));
+    assert_eq!(g2[0].value("ps"), Value::List(vec![i(2), i(5)]));
+    assert_eq!(g2[0].value("ys"), Value::List(vec![i(3), i(6)]));
+    assert_eq!(g2[0].value("r1c"), i(2));
+    assert_eq!(g2[0].value("r2c"), i(2));
+    assert_eq!(g2[0].value("r3c"), i(2));
+}
+
+#[test]
+fn multi_hop_rejects_sharing_an_interior_variable() {
+    // Two interior elements sharing a variable (`m` as both the second and the third node) cannot be
+    // represented by a single group binding — rejected with a clear error.
+    let err = compile_err("MATCH (a)((x)-[r1:R]->(m)-[r2:S]->(m))+(b) RETURN a");
+    assert!(err.contains("InvalidQuantifiedPath"), "got: {err}");
+    assert!(err.contains("share the variable"), "got: {err}");
+    // A relationship variable reused across hops is likewise rejected.
+    let err2 = compile_err("MATCH (a)((x)-[r:R]->(m)-[r:S]->(y))+(b) RETURN a");
+    assert!(err2.contains("InvalidQuantifiedPath"), "got: {err2}");
+}
+
+#[test]
+fn multi_hop_rejected_in_create_and_pattern_form_exists() {
+    let create = compile_err("CREATE (a)((x)-[:R]->(m)-[:S]->(y))+(b)");
+    assert!(create.contains("InvalidQuantifiedPath"), "got: {create}");
+    let exists =
+        compile_err("MATCH (a) WHERE EXISTS { (a)((x)-[:R]->(m)-[:S]->(y))+(b) } RETURN a");
+    assert!(exists.contains("InvalidQuantifiedPath"), "got: {exists}");
 }

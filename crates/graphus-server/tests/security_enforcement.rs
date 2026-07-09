@@ -93,6 +93,11 @@ impl TempStore {
     fn uds_path(&self) -> PathBuf {
         self.path.join("graphus.sock")
     }
+
+    /// The durable security file path under the store directory (for the DENY-durability test).
+    fn security_file(&self) -> PathBuf {
+        self.store_dir().join("security.toml")
+    }
 }
 
 impl Drop for TempStore {
@@ -526,5 +531,189 @@ async fn admin_path_is_unrestricted() {
     assert_eq!(ints(&a2, 0), vec![10]);
 
     alice.goodbye().await;
+    server.shutdown().await.expect("clean shutdown");
+}
+
+/// **DENY enforcement at query time** (rmp #645): an explicit `DENY` takes precedence over a broad
+/// `GRANT` and is enforced element-by-element exactly like a missing grant would be — but critically
+/// it *carves holes out of* a grant the principal already holds, and the grant is **never erased**
+/// (a `REVOKE DENY` restores access on the next statement). This proves the four-site DENY threading
+/// end-to-end through the real engine: `EffectivePrivileges` snapshots the deny union and the
+/// `AuthorizedGraph` predicates apply it with precedence.
+#[tokio::test]
+async fn deny_precedence_is_enforced_at_query_time() {
+    let temp = TempStore::new("deny-enforce");
+    let server = boot(base_config(&temp)).await;
+    let uds = server.uds_path.clone().expect("UDS enabled");
+
+    // ---- 1) Admin seeds data. ------------------------------------------------------------------
+    let mut alice = BoltClient::connect(&uds).await;
+    alice.handshake_and_logon("alice", "admin-pw8").await;
+    alice
+        .run_ok("CREATE (:Person {name: 'Ada', secret: 'hush'})")
+        .await;
+    alice
+        .run_ok("CREATE (:Person {name: 'Bob', secret: 'shush'})")
+        .await;
+    alice.run_ok("CREATE (:Secret {code: 42})").await;
+    alice.goodbye().await;
+
+    // ---- 2) Give bob a BROAD grant (Write on the whole graph), then DENY specific things. -------
+    // Write on the graph implies Read+Traverse everywhere, so absent any deny bob would see and
+    // write everything; each DENY below must carve a precise hole out of that broad grant.
+    let mut admin = BoltClient::connect(&uds).await;
+    admin.handshake_and_logon("alice", "admin-pw8").await;
+    admin.run_ok("REVOKE ROLE readwrite FROM bob").await;
+    admin.run_ok("CREATE ROLE broad").await;
+    admin.run_ok("GRANT WRITE ON GRAPH graphus TO broad").await;
+    admin.run_ok("GRANT ROLE broad TO bob").await;
+    // DENY TRAVERSE on :Secret (node invisible), DENY READ on :Person.secret (property NULL, node
+    // still visible — the graded reversal), DENY WRITE on :Secret (creation refused).
+    admin
+        .run_ok("DENY TRAVERSE ON LABEL graphus.Secret TO broad")
+        .await;
+    admin
+        .run_ok("DENY READ ON PROPERTY graphus.Person.secret TO broad")
+        .await;
+    admin
+        .run_ok("DENY WRITE ON LABEL graphus.Secret TO broad")
+        .await;
+    // SHOW PRIVILEGES reports the denies with access = DENIED.
+    let privs = admin.run_ok("SHOW PRIVILEGES").await;
+    let broad_denied: Vec<(String, String)> = privs
+        .iter()
+        .filter(|r| {
+            matches!(r.first(), Some(Value::String(s)) if s == "broad")
+                && matches!(&r[1], Value::String(a) if a == "DENIED")
+        })
+        .map(|r| match (&r[2], &r[3]) {
+            (Value::String(a), Value::String(s)) => (a.clone(), s.clone()),
+            other => panic!("priv row shape: {other:?}"),
+        })
+        .collect();
+    assert!(
+        broad_denied.contains(&("traverse".to_owned(), "LABEL graphus.Secret".to_owned())),
+        "DENIED traverse Secret listed: {broad_denied:?}"
+    );
+    assert!(
+        broad_denied.contains(&(
+            "read".to_owned(),
+            "PROPERTY graphus.Person.secret".to_owned()
+        )),
+        "DENIED read Person.secret listed: {broad_denied:?}"
+    );
+    admin.goodbye().await;
+
+    // ---- 3) bob is filtered by the denies despite the graph-wide grant. ------------------------
+    let mut bob = BoltClient::connect(&uds).await;
+    bob.handshake_and_logon("bob", "user2-pw8").await;
+
+    // Person nodes visible + name readable (grant), but `secret` denied → NULL (node still visible:
+    // DENY READ leaves TRAVERSE intact).
+    let people = bob.run_ok("MATCH (n:Person) RETURN n.name, n.secret").await;
+    assert_eq!(opt_strings(&people, 0).len(), 2, "bob sees both Person");
+    assert!(
+        opt_strings(&people, 0).contains(&Some("Ada".to_owned())),
+        "bob reads name despite the deny on secret: {people:?}"
+    );
+    assert!(
+        opt_strings(&people, 1).iter().all(Option::is_none),
+        "DENY READ hides secret (NULL) but not the node: {:?}",
+        opt_strings(&people, 1)
+    );
+    // :Secret label denied-traverse → node invisible even though the graph grant covers it.
+    let secret = bob.run_ok("MATCH (n:Secret) RETURN n.code").await;
+    assert!(
+        secret.is_empty(),
+        "DENY TRAVERSE hides :Secret despite the graph-wide grant: {secret:?}"
+    );
+    // Writing :Person is allowed (grant, no deny) but writing :Secret is refused (deny precedence).
+    bob.run_ok("CREATE (:Person {name: 'Cy'})").await;
+    let denied_write = bob
+        .run("CREATE (:Secret {code: 99})")
+        .await
+        .expect_err("DENY WRITE on :Secret refuses the create");
+    assert!(
+        denied_write.code.contains("Security.Forbidden"),
+        "denied write classifies as Forbidden: {denied_write:?}"
+    );
+    bob.reset().await;
+
+    // ---- 4) REVOKE DENY restores access on bob's NEXT statement (the grant was never erased). ---
+    let mut admin2 = BoltClient::connect(&uds).await;
+    admin2.handshake_and_logon("alice", "admin-pw8").await;
+    admin2
+        .run_ok("REVOKE DENY READ ON PROPERTY graphus.Person.secret FROM broad")
+        .await;
+    admin2
+        .run_ok("REVOKE DENY TRAVERSE ON LABEL graphus.Secret FROM broad")
+        .await;
+    admin2.goodbye().await;
+
+    // bob's next statement: the underlying graph-wide grant is intact, so secret + :Secret return.
+    let people2 = bob.run_ok("MATCH (n:Person) RETURN n.secret").await;
+    let secrets2 = opt_strings(&people2, 0);
+    assert!(
+        secrets2.contains(&Some("hush".to_owned())),
+        "REVOKE DENY restores the secret read on the NEXT statement (grant never erased): {secrets2:?}"
+    );
+    let secret2 = bob.run_ok("MATCH (n:Secret) RETURN n.code").await;
+    assert_eq!(
+        ints(&secret2, 0),
+        vec![42],
+        "REVOKE DENY makes :Secret visible again"
+    );
+
+    bob.goodbye().await;
+    server.shutdown().await.expect("clean shutdown");
+}
+
+/// A restart durability check for DENY (rmp #645): a `DENY` recorded over the wire survives a full
+/// server restart (persisted in `security.toml` alongside grants) and is still enforced afterwards,
+/// and the deny record is durable but never as a plaintext leak.
+#[tokio::test]
+async fn deny_survives_restart_and_is_still_enforced() {
+    let temp = TempStore::new("deny-restart");
+    let config = base_config(&temp);
+
+    {
+        let server = boot(config.clone()).await;
+        let uds = server.uds_path.clone().expect("UDS enabled");
+        let mut alice = BoltClient::connect(&uds).await;
+        alice.handshake_and_logon("alice", "admin-pw8").await;
+        alice.run_ok("CREATE (:Person {name: 'Ada'})").await;
+        alice.run_ok("CREATE (:Secret {code: 7})").await;
+        alice.run_ok("REVOKE ROLE readwrite FROM bob").await;
+        alice.run_ok("CREATE ROLE reader2").await;
+        alice.run_ok("GRANT READ ON GRAPH graphus TO reader2").await;
+        alice
+            .run_ok("DENY TRAVERSE ON LABEL graphus.Secret TO reader2")
+            .await;
+        alice.run_ok("GRANT ROLE reader2 TO bob").await;
+        alice.goodbye().await;
+        server.shutdown().await.expect("clean shutdown");
+    }
+
+    // The persisted file records the deny (deny = true) alongside the grant.
+    let text = std::fs::read_to_string(temp.security_file()).expect("security file");
+    assert!(
+        text.contains("deny = true"),
+        "the deny is persisted: {text}"
+    );
+
+    // Restart: the deny is authoritative and still enforced.
+    let server = boot(config).await;
+    let uds = server.uds_path.clone().expect("UDS enabled");
+    let mut bob = BoltClient::connect(&uds).await;
+    bob.handshake_and_logon("bob", "user2-pw8").await;
+    // Person is readable (grant survived); :Secret is invisible (deny survived).
+    let people = bob.run_ok("MATCH (n:Person) RETURN n.name").await;
+    assert_eq!(opt_strings(&people, 0).len(), 1, "grant survived restart");
+    let secret = bob.run_ok("MATCH (n:Secret) RETURN n.code").await;
+    assert!(
+        secret.is_empty(),
+        "the DENY on :Secret survived the restart and is still enforced: {secret:?}"
+    );
+    bob.goodbye().await;
     server.shutdown().await.expect("clean shutdown");
 }

@@ -138,7 +138,7 @@ use crate::cardinality::estimate_rows;
 use crate::catalog::{IndexCatalog, IndexDescriptor, IndexId};
 use crate::cost::estimate_cost;
 use crate::logical::{
-    CreatePart, LogicalOp, ProjectionColumn, RemoveOp, SetOp, SortKey, Var, YieldColumn,
+    CreatePart, LogicalOp, ProjectionColumn, QppStep, RemoveOp, SetOp, SortKey, Var, YieldColumn,
 };
 use crate::statistics::Statistics;
 use graphus_core::Value;
@@ -595,12 +595,15 @@ pub enum PhysicalOp {
         group_start: Var,
         /// The interior end group variable (list of each iteration's end node).
         group_end: Var,
-        /// The interior relationship group variable (the trail).
+        /// The first interior relationship's group variable (its slice of the trail).
         relationship: Var,
-        /// The interior relationship's traversal direction.
+        /// The first interior relationship's traversal direction.
         direction: crate::ast::RelDirection,
-        /// The interior relationship-type alternatives; empty means "any type".
+        /// The first interior relationship's type alternatives; empty means "any type".
         types: Vec<RelType>,
+        /// Interior hops beyond the first relationship (empty for the single-hop fast path); each
+        /// advances the walk one relationship per iteration and binds its own group variables.
+        extra_hops: Vec<QppStep>,
         /// The minimum iteration count (inclusive).
         min: u64,
         /// The maximum iteration count (inclusive); `None` = unbounded.
@@ -608,7 +611,7 @@ pub enum PhysicalOp {
         /// Relationship variables bound by earlier links of the same pattern (trail extends over
         /// them).
         prior_rels: Vec<Var>,
-        /// The per-iteration interior predicate (scalar `group_start`/`group_end`/`relationship`).
+        /// The per-iteration interior predicate (scalar interior bindings across all hops).
         interior_predicate: Option<Expr>,
         /// `true` when `to` is already bound by the input (keep only walks ending at that node).
         into: bool,
@@ -1026,6 +1029,7 @@ impl Planner<'_> {
                 relationship,
                 direction,
                 types,
+                extra_hops,
                 min,
                 max,
                 prior_rels,
@@ -1043,6 +1047,7 @@ impl Planner<'_> {
                     relationship: relationship.clone(),
                     direction: *direction,
                     types: types.clone(),
+                    extra_hops: extra_hops.clone(),
                     min: *min,
                     max: *max,
                     prior_rels: prior_rels.clone(),
@@ -1951,6 +1956,7 @@ fn optimize_children(op: PhysicalOp, catalog: &IndexCatalog, stats: &dyn Statist
             relationship,
             direction,
             types,
+            extra_hops,
             min,
             max,
             prior_rels,
@@ -1965,6 +1971,7 @@ fn optimize_children(op: PhysicalOp, catalog: &IndexCatalog, stats: &dyn Statist
             relationship,
             direction,
             types,
+            extra_hops,
             min,
             max,
             prior_rels,
@@ -3564,15 +3571,21 @@ fn gather_bound_vars(plan: &PhysicalOp, out: &mut Vec<Var>) {
             group_start,
             group_end,
             relationship,
+            extra_hops,
             ..
         } => {
-            // The anchor `from` is bound by `input`; this op binds the trailing boundary node and the
-            // three interior group variables (start-node list, end-node list, relationship trail).
+            // The anchor `from` is bound by `input`; this op binds the trailing boundary node and
+            // every interior group variable (each iteration-start / iteration-end node list and each
+            // relationship-trail slice, first hop plus every extra hop).
             gather_bound_vars(input, out);
             push_unique(out, to.clone());
             push_unique(out, group_start.clone());
             push_unique(out, group_end.clone());
             push_unique(out, relationship.clone());
+            for step in extra_hops {
+                push_unique(out, step.relationship.clone());
+                push_unique(out, step.end_node.clone());
+            }
         }
         PhysicalOp::Filter { input, .. }
         | PhysicalOp::Skip { input, .. }

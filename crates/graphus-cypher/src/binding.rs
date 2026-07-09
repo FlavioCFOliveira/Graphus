@@ -873,13 +873,22 @@ fn params_in_pattern_part(part: &PatternPart, record: &mut impl FnMut(&str, Para
         if let Some(props) = &link.node.properties {
             params_in_expr(props, ParamType::Any, record);
         }
-        // A quantified path pattern's interior node maps and inner `WHERE` may reference parameters.
+        // A quantified path pattern's interior node maps, extra interior hops, and inner `WHERE` may
+        // reference parameters.
         if let Some(qpp) = &link.qpp {
             if let Some(props) = &qpp.interior_start.properties {
                 params_in_expr(props, ParamType::Any, record);
             }
             if let Some(props) = &qpp.interior_end.properties {
                 params_in_expr(props, ParamType::Any, record);
+            }
+            for hop in &qpp.interior_extra {
+                if let Some(props) = &hop.relationship.properties {
+                    params_in_expr(props, ParamType::Any, record);
+                }
+                if let Some(props) = &hop.node.properties {
+                    params_in_expr(props, ParamType::Any, record);
+                }
             }
             if let Some(where_expr) = &qpp.inner_where {
                 params_in_expr(where_expr, ParamType::Any, record);

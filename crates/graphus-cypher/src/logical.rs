@@ -37,6 +37,28 @@ use crate::ast::{
 };
 use std::fmt;
 
+/// One interior hop of a **multi-relationship** quantified path pattern (GPM / Neo4j 5.9+), **beyond
+/// the first relationship**. The first hop is carried by the [`QuantifiedPath`](LogicalOp::QuantifiedPath)
+/// operator's flat `relationship`/`group_end`/`direction`/`types` fields (the single-hop fast path);
+/// every further hop of the interior path `(x)-[r1]->(m)-[r2]->(y)` is one of these, in source order.
+///
+/// Within a single iteration the walk advances one relationship per step; across iterations each
+/// step's `relationship`/`end_node` group variables aggregate **one element per iteration**, in
+/// iteration order.
+#[derive(Debug, Clone, PartialEq)]
+#[must_use]
+pub struct QppStep {
+    /// The group relationship variable for this hop — the per-iteration list of the relationships
+    /// traversed at this step.
+    pub relationship: Var,
+    /// The group node variable reached **after** this hop — the per-iteration list of its end nodes.
+    pub end_node: Var,
+    /// This hop's traversal direction.
+    pub direction: RelDirection,
+    /// This hop's relationship-type alternatives (`:A|B`); empty means "any type".
+    pub types: Vec<RelType>,
+}
+
 /// A node in a [logical plan](self) tree: one relational-graph algebra operator
 /// (`04 §7.1`).
 ///
@@ -226,12 +248,17 @@ pub enum LogicalOp {
         group_start: Var,
         /// The interior **end** group variable: the list of every iteration's end node.
         group_end: Var,
-        /// The interior relationship group variable: the list of traversed relationships (the trail).
+        /// The **first** interior relationship's group variable: the list of that hop's traversed
+        /// relationships. For a single-hop interior this is the whole trail.
         relationship: Var,
-        /// The interior relationship's traversal direction.
+        /// The **first** interior relationship's traversal direction.
         direction: RelDirection,
-        /// The interior relationship-type alternatives (`:A|B`); empty means "any type".
+        /// The **first** interior relationship's type alternatives (`:A|B`); empty means "any type".
         types: Vec<RelType>,
+        /// Interior hops **beyond the first relationship**, in source order (empty for a single-hop
+        /// interior — the fast path). Each advances the walk one more relationship per iteration and
+        /// binds its own group variables. Trail uniqueness spans every hop of every iteration.
+        extra_hops: Vec<QppStep>,
         /// The minimum iteration count (inclusive).
         min: u64,
         /// The maximum iteration count (inclusive); `None` = unbounded.
@@ -239,9 +266,10 @@ pub enum LogicalOp {
         /// Relationship variables bound by **earlier** links of the same pattern; trail uniqueness
         /// spans the whole pattern, so a relationship already bound to one of these is not re-walked.
         prior_rels: Vec<Var>,
-        /// The per-iteration interior predicate, evaluated with the iteration's scalar
-        /// `group_start`/`group_end`/`relationship` bindings; `None` when the interior imposes no
-        /// per-iteration constraint beyond `types`.
+        /// The per-iteration interior predicate, evaluated with the iteration's scalar interior
+        /// bindings (`group_start`, `group_end`/`relationship`, and every extra hop's `end_node`/
+        /// `relationship`); `None` when the interior imposes no per-iteration constraint beyond the
+        /// per-hop `types`.
         interior_predicate: Option<Expr>,
     },
 
@@ -784,6 +812,7 @@ impl LogicalOp {
                 relationship,
                 direction,
                 types,
+                extra_hops,
                 min,
                 max,
                 prior_rels: _,
@@ -793,9 +822,19 @@ impl LogicalOp {
                 let pred = interior_predicate
                     .as_ref()
                     .map_or_else(String::new, |p| format!(" WHERE {}", fmt_expr(p)));
+                let mut extra = String::new();
+                for step in extra_hops {
+                    extra.push_str(&format!(
+                        "{}{}{}({})",
+                        arrow_left(step.direction),
+                        fmt_types(&step.types),
+                        arrow_right(step.direction),
+                        step.end_node,
+                    ));
+                }
                 writeln!(
                     f,
-                    "QuantifiedPath(({from})(({group_start}){}{relationship}{}{}({group_end})){{{min},{max_str}}}({to}){pred})",
+                    "QuantifiedPath(({from})(({group_start}){}{relationship}{}{}({group_end}){extra}){{{min},{max_str}}}({to}){pred})",
                     arrow_left(*direction),
                     fmt_types(types),
                     arrow_right(*direction),

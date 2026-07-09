@@ -434,22 +434,33 @@ async fn security_commands_full_lifecycle_over_the_wire() {
     assert!(roles.contains(&"admin".to_owned()), "{roles:?}");
     assert!(roles.contains(&"analyst".to_owned()), "{roles:?}");
 
-    // SHOW PRIVILEGES: the analyst's grants are listed with action + scope.
+    // SHOW PRIVILEGES: columns are [role, access, action, scope]; the analyst's grants list with
+    // access = GRANTED (rmp #645).
     let privs = c.run_ok("SHOW PRIVILEGES").await;
-    let analyst_privs: Vec<(String, String)> = privs
+    let analyst_privs: Vec<(String, String, String)> = privs
         .iter()
         .filter(|r| matches!(r.first(), Some(Value::String(s)) if s == "analyst"))
-        .map(|r| match (&r[1], &r[2]) {
-            (Value::String(a), Value::String(s)) => (a.clone(), s.clone()),
+        .map(|r| match (&r[1], &r[2], &r[3]) {
+            (Value::String(access), Value::String(a), Value::String(s)) => {
+                (access.clone(), a.clone(), s.clone())
+            }
             other => panic!("priv row shape: {other:?}"),
         })
         .collect();
     assert!(
-        analyst_privs.contains(&("traverse".to_owned(), "GRAPH graphus".to_owned())),
+        analyst_privs.contains(&(
+            "GRANTED".to_owned(),
+            "traverse".to_owned(),
+            "GRAPH graphus".to_owned()
+        )),
         "{analyst_privs:?}"
     );
     assert!(
-        analyst_privs.contains(&("read".to_owned(), "LABEL graphus.Person".to_owned())),
+        analyst_privs.contains(&(
+            "GRANTED".to_owned(),
+            "read".to_owned(),
+            "LABEL graphus.Person".to_owned()
+        )),
         "{analyst_privs:?}"
     );
 

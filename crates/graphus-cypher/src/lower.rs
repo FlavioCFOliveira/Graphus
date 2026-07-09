@@ -107,7 +107,7 @@ use crate::ast::{
 use crate::function_registry;
 use crate::lexer::Span;
 use crate::logical::{
-    CreatePart, LogicalOp, ProjectionColumn, RemoveOp, SetOp, SortKey, Var, YieldColumn,
+    CreatePart, LogicalOp, ProjectionColumn, QppStep, RemoveOp, SetOp, SortKey, Var, YieldColumn,
 };
 use crate::semantics::ValidatedQuery;
 
@@ -689,14 +689,17 @@ impl Planner {
     /// Lowers a **quantified path pattern** (QPP) link into a [`QuantifiedPath`](LogicalOp::QuantifiedPath)
     /// operator over `input`, returning `(plan, boundary_var, group_rel_var)`.
     ///
-    /// The interior single hop `(interior_start)-[relationship]-(interior_end)` is lowered so its
-    /// three variables become **group** variables (lists), the walk starts at the already-bound
-    /// anchor `from`, and it arrives at the trailing boundary node. All per-iteration constraints —
-    /// the interior nodes' inline labels/properties, the interior relationship's inline properties and
-    /// any general type expression, and the inner `WHERE` — are folded into one interior predicate
-    /// evaluated per iteration; the disjunctive relationship types stay on the operator as the
-    /// index-friendly fast path. The trailing boundary node's own inline labels/properties are applied
-    /// as ordinary post-filters (they constrain only the final node).
+    /// The interior path `(interior_start)-[relationship]-(interior_end)[ -[rN]-(nodeN) …]` is lowered
+    /// so every interior variable becomes a **group** variable (list), the walk starts at the
+    /// already-bound anchor `from`, and it arrives at the trailing boundary node. The first hop's
+    /// relationship/direction/types stay on the operator's flat fields (the single-hop fast path);
+    /// every **further** hop becomes a [`QppStep`] in `extra_hops`. All per-iteration constraints —
+    /// every interior node's inline labels/properties, every interior relationship's inline properties
+    /// and general type expression, and the inner `WHERE` — are folded into one interior predicate
+    /// evaluated **once per iteration** (after the full interior is matched); the disjunctive
+    /// relationship types stay per-hop on the operator as the index-friendly fast path. The trailing
+    /// boundary node's own inline labels/properties are applied as ordinary post-filters (they
+    /// constrain only the final node).
     fn lower_quantified_path(
         &mut self,
         input: LogicalOp,
@@ -711,15 +714,41 @@ impl Planner {
         let boundary = self.node_var(&link.node);
         let (min, max) = qpp.quantifier.bounds();
 
-        let interior_predicate = build_interior_predicate(
+        // Resolve group variables for the interior hops beyond the first relationship.
+        let extra_hops: Vec<QppStep> = qpp
+            .interior_extra
+            .iter()
+            .map(|hop| QppStep {
+                relationship: self.rel_var(&hop.relationship),
+                end_node: self.node_var(&hop.node),
+                direction: hop.relationship.direction,
+                types: hop.relationship.types.clone(),
+            })
+            .collect();
+
+        // Fold every per-iteration constraint into one predicate: the first hop's nodes/relationship
+        // (via `build_interior_predicate`), then each extra hop's relationship and node constraints,
+        // then the inner `WHERE`. The per-hop disjunctive `types` stay on the operator/steps.
+        let mut interior_predicate = build_interior_predicate(
             &group_start,
             &qpp.interior_start,
             &group_end,
             &qpp.interior_end,
             &group_rel,
             &link.relationship,
-            qpp.inner_where.as_ref(),
+            None,
         );
+        for (step, hop) in extra_hops.iter().zip(&qpp.interior_extra) {
+            interior_predicate = and_opt(
+                interior_predicate,
+                rel_constraint_predicate(&step.relationship, &hop.relationship),
+            );
+            interior_predicate = and_opt(
+                interior_predicate,
+                node_constraint_predicate(&step.end_node, &hop.node),
+            );
+        }
+        interior_predicate = and_opt(interior_predicate, qpp.inner_where.clone());
 
         let plan = LogicalOp::QuantifiedPath {
             input: Box::new(input),
@@ -730,6 +759,7 @@ impl Planner {
             relationship: group_rel.clone(),
             direction: link.relationship.direction,
             types: link.relationship.types.clone(),
+            extra_hops,
             min,
             max,
             prior_rels: pattern_rels.to_vec(),
@@ -2148,6 +2178,7 @@ fn gather_bound_vars(plan: &LogicalOp, out: &mut Vec<Var>) {
             group_start,
             group_end,
             relationship,
+            extra_hops,
             ..
         } => {
             gather_bound_vars(input, out);
@@ -2155,6 +2186,10 @@ fn gather_bound_vars(plan: &LogicalOp, out: &mut Vec<Var>) {
             push_unique(out, group_start.clone());
             push_unique(out, group_end.clone());
             push_unique(out, relationship.clone());
+            for step in extra_hops {
+                push_unique(out, step.relationship.clone());
+                push_unique(out, step.end_node.clone());
+            }
         }
         LogicalOp::Filter { input, .. }
         | LogicalOp::Skip { input, .. }

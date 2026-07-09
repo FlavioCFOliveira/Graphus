@@ -709,6 +709,14 @@ pub struct PatternChainLink {
 ///   relationship, in iteration order. The boundary nodes (`a`, `b`) stay singletons.
 /// - **Trail** semantics: no relationship is traversed twice across the whole pattern.
 /// - The inner `WHERE` is scoped to one iteration, seeing `x`/`y`/`r` as *scalars*.
+///
+/// **Multi-relationship interior** (Neo4j 5.x GPM): the interior may be a longer path
+/// `(x)-[r1]->(m)-[r2]->(y)`. The first relationship `-[r1]->` and the node reached after it (`m`)
+/// are carried by [`PatternChainLink::relationship`] and [`interior_end`](Self::interior_end); every
+/// **further** hop `-[rN]->(nodeN)` is carried by [`interior_extra`](Self::interior_extra). All
+/// interior variables (`x`, `m`, `y`, `r1`, `r2`, …) become group variables, each aggregating one
+/// element **per iteration** (not per hop), in iteration order. Trail uniqueness spans **every**
+/// relationship of **every** hop of **every** iteration.
 #[derive(Debug, Clone, PartialEq)]
 #[must_use]
 pub struct QppInfo {
@@ -716,16 +724,38 @@ pub struct QppInfo {
     /// preceding this link in the chain (the outer `(a)`, an earlier link's node, or the element
     /// start).
     pub interior_start: NodePattern,
-    /// The interior **end** node `(y)` — a group variable, juxtaposed with this link's trailing
-    /// boundary node [`PatternChainLink::node`].
+    /// The node reached after the **first** interior relationship
+    /// ([`PatternChainLink::relationship`]). For a single-relationship interior this is the interior
+    /// **end** node `(y)`, juxtaposed with this link's trailing boundary node
+    /// [`PatternChainLink::node`]. For a multi-relationship interior `(x)-[r1]->(m)-[r2]->(y)` it is
+    /// the intermediate node `(m)`, and the remaining hops (through `(y)`) live in
+    /// [`interior_extra`](Self::interior_extra). A group variable.
     pub interior_end: NodePattern,
+    /// The interior hops **beyond the first relationship**, in source order (empty for a
+    /// single-relationship interior). Each element is a `-[rN]-(nodeN)` step; the interior's genuine
+    /// last node (the one juxtaposed with the trailing boundary [`PatternChainLink::node`]) is the
+    /// last hop's node here, or [`interior_end`](Self::interior_end) when this is empty. Every hop's
+    /// relationship and node variables are group variables.
+    pub interior_extra: Vec<QppHop>,
     /// The quantifier applied to the interior pattern.
     pub quantifier: PatternQuantifier,
-    /// An optional inner `WHERE` predicate scoped to a **single iteration** (its `x`/`y`/`r` are the
-    /// iteration's scalar bindings, not the outer group lists).
+    /// An optional inner `WHERE` predicate scoped to a **single iteration** (its interior variables
+    /// are the iteration's scalar bindings, not the outer group lists).
     pub inner_where: Option<Expr>,
     /// Span of the parenthesized quantified group `( … ){q}`.
     pub span: Span,
+}
+
+/// One interior hop `-[rN]-(nodeN)` of a **multi-relationship** [`quantified path pattern`](QppInfo),
+/// beyond the first relationship (GPM / Neo4j 5.9+). Carries the hop's relationship pattern and the
+/// node reached after it; both introduce group variables.
+#[derive(Debug, Clone, PartialEq)]
+#[must_use]
+pub struct QppHop {
+    /// The hop's relationship pattern `-[rN:T]->`.
+    pub relationship: RelationshipPattern,
+    /// The node `(nodeN)` reached after this hop.
+    pub node: NodePattern,
 }
 
 /// The quantifier of a [`quantified path pattern`](QppInfo) (GPM / Neo4j 5.9+): the repetition count
@@ -1430,6 +1460,15 @@ impl PatternElement {
             if let Some(qpp) = &mut link.qpp {
                 qpp.interior_start.zero_expr_spans_in_place();
                 qpp.interior_end.zero_expr_spans_in_place();
+                for hop in &mut qpp.interior_extra {
+                    if let Some(props) = &mut hop.relationship.properties {
+                        props.zero_spans_in_place();
+                    }
+                    if let Some(type_expr) = &mut hop.relationship.type_expr {
+                        type_expr.zero_spans_in_place();
+                    }
+                    hop.node.zero_expr_spans_in_place();
+                }
                 if let Some(where_expr) = &mut qpp.inner_where {
                     where_expr.zero_spans_in_place();
                 }

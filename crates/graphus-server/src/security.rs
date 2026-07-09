@@ -229,6 +229,13 @@ struct PrivilegeRecord {
     /// The property key (`property` scope).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     property: Option<String>,
+    /// Whether this record is an explicit **deny** rather than a grant (rmp #645). Grants and denies
+    /// share one durable `privileges` list, tagged by this flag. Absent/`false` (a grant) is the
+    /// default and is omitted from the file, so pre-existing security files — which have no `deny`
+    /// field — round-trip unchanged and load as grants (no [`SECURITY_FORMAT_VERSION`] bump; the
+    /// `suspended`/`credential_version` additive precedent).
+    #[serde(default, skip_serializing_if = "is_false")]
+    deny: bool,
 }
 
 /// The serialized action.
@@ -281,66 +288,53 @@ enum ScopeKind {
 }
 
 impl PrivilegeRecord {
-    /// Builds a record from a privilege (the serialization direction).
-    fn from_privilege(p: &Privilege) -> Self {
+    /// Builds a record from a privilege and its access sense (`deny = false` for a grant, `true` for
+    /// an explicit deny — rmp #645). This is the single serialization direction for both the grant
+    /// and deny lists of a role.
+    fn from_privilege(p: &Privilege, deny: bool) -> Self {
         let action = p.action.into();
-        match &p.resource {
-            Resource::Database => Self {
-                action,
-                scope: ScopeKind::Database,
-                db: None,
-                label: None,
-                rel_type: None,
-                property: None,
-            },
-            Resource::Graph(db) => Self {
-                action,
-                scope: ScopeKind::Graph,
-                db: Some(db.clone()),
-                label: None,
-                rel_type: None,
-                property: None,
-            },
-            Resource::Label { db, label } => Self {
-                action,
-                scope: ScopeKind::Label,
-                db: Some(db.clone()),
-                label: Some(label.clone()),
-                rel_type: None,
-                property: None,
-            },
-            Resource::RelType { db, rel_type } => Self {
-                action,
-                scope: ScopeKind::RelType,
-                db: Some(db.clone()),
-                label: None,
-                rel_type: Some(rel_type.clone()),
-                property: None,
-            },
+        // Decompose the scope into the flat, self-describing fields; the `deny` flag is orthogonal.
+        let (scope, db, label, rel_type, property) = match &p.resource {
+            Resource::Database => (ScopeKind::Database, None, None, None, None),
+            Resource::Graph(db) => (ScopeKind::Graph, Some(db.clone()), None, None, None),
+            Resource::Label { db, label } => (
+                ScopeKind::Label,
+                Some(db.clone()),
+                Some(label.clone()),
+                None,
+                None,
+            ),
+            Resource::RelType { db, rel_type } => (
+                ScopeKind::RelType,
+                Some(db.clone()),
+                None,
+                Some(rel_type.clone()),
+                None,
+            ),
             Resource::Property {
                 db,
                 label,
                 property,
-            } => Self {
-                action,
-                scope: ScopeKind::Property,
-                db: Some(db.clone()),
-                label: Some(label.clone()),
-                rel_type: None,
-                property: Some(property.clone()),
-            },
-            // `Resource` is `#[non_exhaustive]`; persist an unknown future variant as the
-            // server-wide scope would be unsound (too broad), so reject it at load time instead —
-            // here we cannot, so map to the narrowest representable form and rely on the load-time
-            // re-validation. In practice this arm is unreachable for the variants this build knows.
-            _ => Self {
-                action,
-                scope: ScopeKind::Database,
-                db: None,
-                label: None,
-                rel_type: None,
-                property: None,
-            },
+            } => (
+                ScopeKind::Property,
+                Some(db.clone()),
+                Some(label.clone()),
+                None,
+                Some(property.clone()),
+            ),
+            // `Resource` is `#[non_exhaustive]`; persisting an unknown future variant as the
+            // server-wide scope would be unsound (too broad), so map to the narrowest representable
+            // form and rely on load-time re-validation. Unreachable for the variants this build knows.
+            _ => (ScopeKind::Database, None, None, None, None),
+        };
+        Self {
+            action,
+            scope,
+            db,
+            label,
+            rel_type,
+            property,
+            deny,
         }
     }
 
@@ -418,10 +412,17 @@ fn to_file(auth: &Authenticator) -> SecurityFile {
         .roles()
         .map(|(name, role)| RoleRecord {
             name: name.to_owned(),
+            // Grants (deny = false) then denies (deny = true) share one durable list, each tagged by
+            // the `deny` flag (rmp #645). Deterministic order: BTreeSet iteration + grants-before-denies.
             privileges: role
                 .privileges
                 .iter()
-                .map(PrivilegeRecord::from_privilege)
+                .map(|p| PrivilegeRecord::from_privilege(p, false))
+                .chain(
+                    role.denied
+                        .iter()
+                        .map(|p| PrivilegeRecord::from_privilege(p, true)),
+                )
                 .collect(),
         })
         .collect();
@@ -492,9 +493,16 @@ fn load_into(root: &Path, auth: &mut Authenticator) -> Result<()> {
             .map_err(|_| corrupt(format!("duplicate role {:?}", role.name)))?;
         for rec in &role.privileges {
             let privilege = rec.to_privilege(&path)?;
-            catalog
-                .grant_privilege(&role.name, privilege)
-                .map_err(|e| corrupt(format!("granting to role {:?}: {e}", role.name)))?;
+            if rec.deny {
+                // An explicit deny (rmp #645): route to the denylist, not the allowlist.
+                catalog
+                    .deny_privilege(&role.name, privilege)
+                    .map_err(|e| corrupt(format!("denying on role {:?}: {e}", role.name)))?;
+            } else {
+                catalog
+                    .grant_privilege(&role.name, privilege)
+                    .map_err(|e| corrupt(format!("granting to role {:?}: {e}", role.name)))?;
+            }
         }
     }
 
@@ -666,7 +674,9 @@ impl SecurityCatalog {
         })
     }
 
-    /// Lists every (role, action, scope) grant, role- then privilege-sorted. For `SHOW PRIVILEGES`.
+    /// Lists every (role, access, action, scope) privilege, role- then privilege-sorted, grants
+    /// before denies. For `SHOW PRIVILEGES`. The `access` field distinguishes a `GRANTED` privilege
+    /// from an explicitly `DENIED` one (rmp #645).
     #[must_use]
     pub fn list_privileges(&self) -> Vec<PrivilegeListing> {
         self.with_auth(|auth| {
@@ -675,6 +685,15 @@ impl SecurityCatalog {
                 for privilege in &role_def.privileges {
                     out.push(PrivilegeListing {
                         role: role.to_owned(),
+                        access: PrivilegeAccess::Granted,
+                        action: action_word(privilege.action).to_owned(),
+                        scope: scope_string(&privilege.resource),
+                    });
+                }
+                for privilege in &role_def.denied {
+                    out.push(PrivilegeListing {
+                        role: role.to_owned(),
+                        access: PrivilegeAccess::Denied,
                         action: action_word(privilege.action).to_owned(),
                         scope: scope_string(&privilege.resource),
                     });
@@ -890,8 +909,12 @@ impl SecurityCatalog {
         .await
     }
 
-    /// `REVOKE <action> ON <scope> FROM <role>`. Rejected if it would strip the bootstrap admin of
-    /// global Admin.
+    /// Plain `REVOKE <action> ON <scope> FROM <role>` — removes **both** a grant and a deny of that
+    /// `(action, scope)` from the role (Neo4j's plain `REVOKE` removes whichever exists; rmp #645).
+    /// Rejected if it would strip the bootstrap admin of global Admin.
+    ///
+    /// For the sense-specific forms use [`revoke_granted_privilege`](Self::revoke_granted_privilege)
+    /// (`REVOKE GRANT`) or [`revoke_deny_privilege`](Self::revoke_deny_privilege) (`REVOKE DENY`).
     ///
     /// # Errors
     /// [`SecurityError::WouldLockOutAdmin`], [`SecurityError::Rbac`] ([`AuthError::NotFound`]),
@@ -903,7 +926,73 @@ impl SecurityCatalog {
         );
         let role = role.to_owned();
         self.mutate(&describe, true, move |auth| {
+            // Remove the grant first (this is the mutation that can reduce access, so the NotFound for
+            // an unknown role surfaces here); then remove any matching deny. Both are idempotent.
             auth.catalog_mut().revoke_privilege(&role, &privilege)?;
+            auth.catalog_mut()
+                .revoke_denied_privilege(&role, &privilege)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// `REVOKE GRANT <action> ON <scope> FROM <role>` — removes only the **grant**, leaving any deny
+    /// of the same `(action, scope)` in place (rmp #645). Rejected if it would strip the bootstrap
+    /// admin of global Admin.
+    ///
+    /// # Errors
+    /// [`SecurityError::WouldLockOutAdmin`], [`SecurityError::Rbac`] ([`AuthError::NotFound`]),
+    /// [`SecurityError::Io`].
+    pub async fn revoke_granted_privilege(&self, role: &str, privilege: Privilege) -> Result<()> {
+        let describe = format!(
+            "revoke the grant of {} from the role {role:?}",
+            scope_string(&privilege.resource)
+        );
+        let role = role.to_owned();
+        self.mutate(&describe, true, move |auth| {
+            auth.catalog_mut().revoke_privilege(&role, &privilege)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// `DENY <action> ON <scope> TO <role>` — records an explicit **deny** (rmp #645). A deny takes
+    /// precedence over any grant at authorization time and coexists with it. The lock-out safeguard is
+    /// re-checked, but a deny can never lock out the bootstrap admin: a global-admin principal is
+    /// exempt from DENY (see [`graphus_auth::Catalog::authorize`]).
+    ///
+    /// # Errors
+    /// [`SecurityError::Rbac`] ([`AuthError::NotFound`]) if the role does not exist;
+    /// [`SecurityError::Io`] on persist failure.
+    pub async fn deny_privilege(&self, role: &str, privilege: Privilege) -> Result<()> {
+        let describe = format!(
+            "deny {} to the role {role:?}",
+            scope_string(&privilege.resource)
+        );
+        let role = role.to_owned();
+        self.mutate(&describe, true, move |auth| {
+            auth.catalog_mut().deny_privilege(&role, privilege)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// `REVOKE DENY <action> ON <scope> FROM <role>` — removes only the explicit **deny**, leaving any
+    /// grant of the same `(action, scope)` in place (rmp #645). Removing a deny only ever *widens*
+    /// access, so it can never lock out the bootstrap admin (no lock-out re-check needed).
+    ///
+    /// # Errors
+    /// [`SecurityError::Rbac`] ([`AuthError::NotFound`]) if the role does not exist;
+    /// [`SecurityError::Io`] on persist failure.
+    pub async fn revoke_deny_privilege(&self, role: &str, privilege: Privilege) -> Result<()> {
+        let describe = format!(
+            "revoke the deny of {} from the role {role:?}",
+            scope_string(&privilege.resource)
+        );
+        let role = role.to_owned();
+        self.mutate(&describe, false, move |auth| {
+            auth.catalog_mut()
+                .revoke_denied_privilege(&role, &privilege)?;
             Ok(())
         })
         .await
@@ -1190,11 +1279,34 @@ pub struct RoleListing {
     pub privilege_count: usize,
 }
 
-/// One `SHOW PRIVILEGES` row: a (role, action, scope) grant.
+/// Whether a `SHOW PRIVILEGES` row is a grant or an explicit deny (rmp #645). Renders as the Neo4j
+/// `access` column value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivilegeAccess {
+    /// An allowlisted privilege (`GRANT`).
+    Granted,
+    /// A denylisted privilege (`DENY`) — takes precedence over any grant.
+    Denied,
+}
+
+impl PrivilegeAccess {
+    /// The uppercase `access`-column word (`"GRANTED"` / `"DENIED"`).
+    #[must_use]
+    pub fn as_word(self) -> &'static str {
+        match self {
+            Self::Granted => "GRANTED",
+            Self::Denied => "DENIED",
+        }
+    }
+}
+
+/// One `SHOW PRIVILEGES` row: a (role, access, action, scope) privilege.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrivilegeListing {
-    /// The role the grant belongs to.
+    /// The role the privilege belongs to.
     pub role: String,
+    /// Whether the privilege is granted or denied (the `access` column).
+    pub access: PrivilegeAccess,
     /// The action word (`"traverse"`, `"read"`, …).
     pub action: String,
     /// The human-readable scope (e.g. `"DATABASE"`, `"GRAPH sales"`, `"LABEL sales.Person"`).
@@ -1674,5 +1786,119 @@ mod tests {
             sec.rename_user("root", "superuser").await,
             Err(SecurityError::WouldLockOutAdmin { .. })
         ));
+    }
+
+    // ---- Security DDL: DENY (negative-privilege model, rmp #645) --------------------------------
+
+    #[tokio::test]
+    async fn deny_takes_precedence_and_persists_and_round_trips() {
+        let root = TempRoot::new("deny-roundtrip");
+        {
+            let sec = catalog(&root);
+            sec.create_role("reader").await.expect("role");
+            sec.grant_privilege("reader", Privilege::on_graph(Action::Read, "db"))
+                .await
+                .expect("grant");
+            sec.deny_privilege("reader", Privilege::on_label(Action::Read, "db", "Secret"))
+                .await
+                .expect("deny");
+            sec.create_user("alice", Some("valid-pw"))
+                .await
+                .expect("user");
+            sec.grant_role("alice", "reader").await.expect("grant role");
+
+            // DENY precedence in the live model: graph-wide Read covers Person but the Secret label is
+            // denied despite the covering grant.
+            assert!(sec.with_auth(|a| {
+                a.authorize("alice", &Privilege::on_label(Action::Read, "db", "Person"))
+            }));
+            assert!(!sec.with_auth(|a| {
+                a.authorize("alice", &Privilege::on_label(Action::Read, "db", "Secret"))
+            }));
+
+            // The deny is persisted with `deny = true` (a grant record carries no such flag).
+            let text = std::fs::read_to_string(root.path.join(SECURITY_FILE_NAME)).expect("file");
+            assert!(text.contains("deny = true"), "deny persisted: {text}");
+        }
+        // "Restart": reload and confirm the deny is authoritative after recovery.
+        let mut reloaded = Authenticator::new(b"a-32-byte-or-longer-jwt-signing-secret!!")
+            .expect("secret is >= 32 bytes");
+        load_into(&root.path, &mut reloaded).expect("reload");
+        assert!(reloaded.authorize("alice", &Privilege::on_label(Action::Read, "db", "Person")));
+        assert!(
+            !reloaded.authorize("alice", &Privilege::on_label(Action::Read, "db", "Secret")),
+            "the DENY survived the reload and is still enforced"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_grant_deny_and_plain_revoke_are_distinct() {
+        let root = TempRoot::new("revoke-modes");
+        let sec = catalog(&root);
+        sec.create_role("r").await.expect("role");
+        sec.create_user("alice", None).await.expect("user");
+        sec.grant_role("alice", "r").await.expect("grant role");
+
+        let scope = || Privilege::on_label(Action::Read, "db", "Person");
+
+        // Grant + deny the SAME (action, scope): the deny wins (coexistence + precedence).
+        sec.grant_privilege("r", scope()).await.expect("grant");
+        sec.deny_privilege("r", scope()).await.expect("deny");
+        assert!(
+            !sec.with_auth(|a| a.authorize("alice", &scope())),
+            "deny wins"
+        );
+
+        // REVOKE DENY removes only the deny → the grant re-surfaces (it was never erased).
+        sec.revoke_deny_privilege("r", scope())
+            .await
+            .expect("revoke deny");
+        assert!(
+            sec.with_auth(|a| a.authorize("alice", &scope())),
+            "grant restored after REVOKE DENY"
+        );
+
+        // Re-deny, then REVOKE GRANT removes only the grant → the deny remains (and, with no grant,
+        // access is denied anyway).
+        sec.deny_privilege("r", scope()).await.expect("re-deny");
+        sec.revoke_granted_privilege("r", scope())
+            .await
+            .expect("revoke grant");
+        assert!(!sec.with_auth(|a| a.authorize("alice", &scope())));
+        // The deny is still present in the durable model (only the grant was removed).
+        let text = std::fs::read_to_string(root.path.join(SECURITY_FILE_NAME)).expect("file");
+        assert!(
+            text.contains("deny = true"),
+            "REVOKE GRANT left the deny in place: {text}"
+        );
+
+        // Plain REVOKE removes BOTH: re-grant so both exist, then a single plain REVOKE clears the pair.
+        sec.grant_privilege("r", scope()).await.expect("re-grant");
+        sec.revoke_privilege("r", scope())
+            .await
+            .expect("plain revoke removes both");
+        let text = std::fs::read_to_string(root.path.join(SECURITY_FILE_NAME)).expect("file");
+        assert!(
+            !text.contains("Person"),
+            "plain REVOKE removed both grant and deny: {text}"
+        );
+        assert!(!sec.with_auth(|a| a.authorize("alice", &scope())));
+    }
+
+    #[tokio::test]
+    async fn deny_cannot_lock_out_the_bootstrap_admin() {
+        // A global admin is exempt from DENY, so even a self-directed DENY on the admin role cannot
+        // strip the bootstrap admin of administration — the lock-out safeguard stays sound.
+        let root = TempRoot::new("deny-lockout");
+        let sec = catalog(&root);
+        sec.deny_privilege("admin", Privilege::admin_database())
+            .await
+            .expect(
+                "denying admin on the admin role is accepted but ineffective for the global root",
+            );
+        assert!(
+            sec.with_auth(|a| a.authorize("root", &Privilege::admin_database())),
+            "the bootstrap admin keeps global Admin despite the DENY (global-admin exemption)"
+        );
     }
 }

@@ -1671,13 +1671,22 @@ impl Analyzer<'_> {
             f(var)?;
         }
         for link in &element.chain {
-            // A QPP link's interior start/end nodes also introduce (group) variables.
+            // A QPP link's interior start/end nodes (and every extra interior hop's relationship and
+            // node) also introduce (group) variables.
             if let Some(qpp) = &link.qpp {
                 if let Some(var) = &qpp.interior_start.variable {
                     f(var)?;
                 }
                 if let Some(var) = &qpp.interior_end.variable {
                     f(var)?;
+                }
+                for hop in &qpp.interior_extra {
+                    if let Some(var) = &hop.relationship.variable {
+                        f(var)?;
+                    }
+                    if let Some(var) = &hop.node.variable {
+                        f(var)?;
+                    }
                 }
             }
             if let Some(var) = &link.relationship.variable {
@@ -1853,8 +1862,8 @@ impl Analyzer<'_> {
                 ));
             }
         }
-        // The two interior endpoint nodes are *distinct* group variables (each iteration's start and
-        // end). Naming them the same would demand a per-iteration self-loop (`(x)-[]->(x)`) that a
+        // The first hop's start and end nodes are *distinct* group variables (each iteration's start
+        // and end). Naming them the same would demand a per-iteration self-loop (`(x)-[]->(x)`) that a
         // single group binding cannot represent here — a documented deferral, rejected with a clear
         // error rather than a silently-wrong list.
         if let (Some(start), Some(end)) = (&qpp.interior_start.variable, &qpp.interior_end.variable)
@@ -1872,15 +1881,61 @@ impl Analyzer<'_> {
                 ));
             }
         }
+        // Every interior element (each node and each relationship, across all hops) is its own group
+        // variable, so no two may share a name — a duplicate would try to bind one group list to two
+        // different per-iteration values. Reject it with a clear error rather than a silently-wrong
+        // list. (This also covers a multi-hop cycle back to an earlier interior node.)
+        let mut seen: Vec<&str> = Vec::new();
+        let mut interior_vars: Vec<&Variable> = Vec::new();
+        if let Some(v) = &qpp.interior_start.variable {
+            interior_vars.push(v);
+        }
+        if let Some(v) = &link.relationship.variable {
+            interior_vars.push(v);
+        }
+        if let Some(v) = &qpp.interior_end.variable {
+            interior_vars.push(v);
+        }
+        for hop in &qpp.interior_extra {
+            if let Some(v) = &hop.relationship.variable {
+                interior_vars.push(v);
+            }
+            if let Some(v) = &hop.node.variable {
+                interior_vars.push(v);
+            }
+        }
+        for v in &interior_vars {
+            if seen.contains(&v.name.as_str()) {
+                return Err(SemanticError::new(
+                    SemanticErrorKind::InvalidQuantifiedPath {
+                        reason: format!(
+                            "the interior elements of a quantified path pattern cannot share the \
+                             variable `{}`",
+                            v.name
+                        ),
+                    },
+                    qpp.span,
+                ));
+            }
+            seen.push(&v.name);
+        }
 
         // Validate the interior in a scope where its variables are SCALARS (one iteration's
         // bindings), so the interior nodes' inline predicates and the inner WHERE type-check as if
-        // over a single hop. This temporary scope does not leak the scalar bindings to the outer
-        // scope; the outer scope instead receives the group (list) bindings below.
+        // over a single interior match. This temporary scope does not leak the scalar bindings to the
+        // outer scope; the outer scope instead receives the group (list) bindings below.
         let mut interior_scope = scope.clone();
         self.bind_node_pattern(&qpp.interior_start, &mut interior_scope, PatternRole::Read)?;
         self.bind_relationship_pattern(&link.relationship, &mut interior_scope, PatternRole::Read)?;
         self.bind_node_pattern(&qpp.interior_end, &mut interior_scope, PatternRole::Read)?;
+        for hop in &qpp.interior_extra {
+            self.bind_relationship_pattern(
+                &hop.relationship,
+                &mut interior_scope,
+                PatternRole::Read,
+            )?;
+            self.bind_node_pattern(&hop.node, &mut interior_scope, PatternRole::Read)?;
+        }
         if let Some(where_expr) = &qpp.inner_where {
             self.check_expr(where_expr, &interior_scope)?;
             Self::check_pattern_predicate_placement(where_expr, true)?;
@@ -1888,7 +1943,7 @@ impl Analyzer<'_> {
         }
 
         // Introduce the group variables into the outer scope: interior nodes are lists of nodes, the
-        // interior relationship is a list of relationships (`04 §GPM` group-variable semantics).
+        // interior relationships are lists of relationships (`04 §GPM` group-variable semantics).
         if let Some(var) = &qpp.interior_start.variable {
             scope.bind_typed(
                 &var.name,
@@ -1912,6 +1967,24 @@ impl Analyzer<'_> {
                 SType::List(Box::new(SType::Node)),
                 var.span,
             )?;
+        }
+        for hop in &qpp.interior_extra {
+            if let Some(var) = &hop.relationship.variable {
+                scope.bind_typed(
+                    &var.name,
+                    VarKind::Value,
+                    SType::List(Box::new(SType::Relationship)),
+                    var.span,
+                )?;
+            }
+            if let Some(var) = &hop.node.variable {
+                scope.bind_typed(
+                    &var.name,
+                    VarKind::Value,
+                    SType::List(Box::new(SType::Node)),
+                    var.span,
+                )?;
+            }
         }
         // The trailing boundary node is a scalar singleton in the outer scope.
         self.bind_node_pattern(&link.node, scope, role)?;

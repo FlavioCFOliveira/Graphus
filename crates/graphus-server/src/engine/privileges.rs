@@ -93,6 +93,12 @@ pub struct EffectivePrivileges {
     /// unrestricted path (never consulted there) and for a principal with no grants (deny-by-default).
     /// Owned + immutable, so every predicate answers lock-free against a consistent view.
     snapshot: Arc<[Privilege]>,
+    /// The principal's **effective deny set**, snapshotted under the *same* read lock as `snapshot`
+    /// (rmp #645): the deduplicated union of every explicit deny of every role the principal holds. A
+    /// deny that [blocks](graphus_auth::Privilege::blocks_ref) a request overrides any grant (DENY
+    /// precedence). Empty on the unrestricted path (a global admin is exempt from DENY, so it is never
+    /// consulted there) and for a principal with no denies. Owned + immutable, like `snapshot`.
+    denied: Arc<[Privilege]>,
     /// The canonical (lowercase) database the session is pinned to — every scope is probed against it.
     database: String,
     /// Precomputed at construction (under the same read guard as the snapshot): admin or no-principal
@@ -130,6 +136,7 @@ impl Clone for EffectivePrivileges {
         let memo = self.memo.lock().unwrap_or_else(|e| e.into_inner());
         Self {
             snapshot: Arc::clone(&self.snapshot),
+            denied: Arc::clone(&self.denied),
             database: self.database.clone(),
             unrestricted: self.unrestricted,
             memo: Mutex::new(Memo {
@@ -160,23 +167,33 @@ impl EffectivePrivileges {
         let database = database.into();
         // ONE read guard: decide unrestricted AND capture the privilege snapshot atomically, so the
         // two can never disagree and the snapshot can never be torn by a concurrent GRANT/REVOKE.
-        let (unrestricted, snapshot): (bool, Arc<[Privilege]>) = match principal {
-            // No identity to restrict: the unrestricted internal/TCK/direct path. No snapshot needed.
-            None => (true, Arc::from([])),
-            Some(user) => security.with_auth(|auth| {
-                let catalog = auth.catalog();
-                if catalog.authorize(user, &Privilege::admin_database()) {
-                    // A global admin bypasses all filtering; no per-element snapshot is consulted.
-                    (true, Arc::from([]))
-                } else {
-                    // Restricted: snapshot the principal's effective privilege union under this guard.
-                    let set = catalog.effective_privileges(user);
-                    (false, set.into_iter().collect())
-                }
-            }),
-        };
+        let (unrestricted, snapshot, denied): (bool, Arc<[Privilege]>, Arc<[Privilege]>) =
+            match principal {
+                // No identity to restrict: the unrestricted internal/TCK/direct path. No snapshots.
+                None => (true, Arc::from([]), Arc::from([])),
+                Some(user) => security.with_auth(|auth| {
+                    let catalog = auth.catalog();
+                    if catalog.authorize(user, &Privilege::admin_database()) {
+                        // A global admin bypasses all filtering and is exempt from DENY; no
+                        // per-element snapshot (grant or deny) is ever consulted for it.
+                        (true, Arc::from([]), Arc::from([]))
+                    } else {
+                        // Restricted: snapshot the principal's effective grant AND deny unions under
+                        // this ONE guard, so the two can never be torn apart by a concurrent
+                        // GRANT/DENY/REVOKE (rmp #645).
+                        let granted = catalog.effective_privileges(user);
+                        let denied = catalog.effective_denies(user);
+                        (
+                            false,
+                            granted.into_iter().collect(),
+                            denied.into_iter().collect(),
+                        )
+                    }
+                }),
+            };
         Self {
             snapshot,
+            denied,
             database,
             unrestricted,
             memo: Mutex::new(Memo::default()),
@@ -189,6 +206,17 @@ impl EffectivePrivileges {
     /// `authorize(&Privilege::new(action, owned_resource))` against the live catalog at snapshot time
     /// (proven by the auth-crate `implies_ref`/`effective_privileges` oracle tests).
     fn grants(&self, action: Action, resource: &ResourceRef<'_>) -> bool {
+        // DENY precedence (rmp #645): an explicit deny that blocks the request overrides any grant.
+        // Checked first and short-circuiting, so a denied capability is refused regardless of grants —
+        // byte-for-byte the `authorize` rule (`grant-implies AND NOT deny-blocks`) for a non-global-
+        // admin principal, just resolved against the owned snapshots with zero allocation.
+        if self
+            .denied
+            .iter()
+            .any(|deny| deny.blocks_ref(action, resource))
+        {
+            return false;
+        }
         self.snapshot
             .iter()
             .any(|granted| granted.implies_ref(action, resource))
@@ -330,6 +358,7 @@ impl std::fmt::Debug for EffectivePrivileges {
             .field("database", &self.database)
             .field("unrestricted", &self.unrestricted)
             .field("snapshot_len", &self.snapshot.len())
+            .field("denied_len", &self.denied.len())
             .finish_non_exhaustive()
     }
 }
@@ -392,6 +421,26 @@ mod tests {
             std::env::temp_dir().join("graphus-priv-test-unused"),
             "root".to_owned(),
             auth_with(grants),
+        ))
+    }
+
+    /// Like [`auth_with`] but also **denies** `denies` on alice's `custom` role (rmp #645).
+    fn auth_with_denies(grants: &[Privilege], denies: &[Privilege]) -> Authenticator {
+        let mut auth = auth_with(grants);
+        for d in denies {
+            auth.catalog_mut()
+                .deny_privilege("custom", d.clone())
+                .unwrap();
+        }
+        auth
+    }
+
+    /// A `SecurityCatalog` carrying [`auth_with_denies`]'s grant + deny model.
+    fn catalog_with_denies(grants: &[Privilege], denies: &[Privilege]) -> Arc<SecurityCatalog> {
+        Arc::new(SecurityCatalog::from_parts(
+            std::env::temp_dir().join("graphus-priv-test-unused"),
+            "root".to_owned(),
+            auth_with_denies(grants, denies),
         ))
     }
 
@@ -633,6 +682,86 @@ mod tests {
         assert!(p.can_traverse_label("Person"));
         assert!(p.can_read_property("Person", "name"));
         assert!(!p.can_traverse_label("Company"));
+    }
+
+    #[test]
+    fn deny_overrides_grant_in_the_oracle() {
+        // DENY precedence in the per-statement oracle (rmp #645): a graph-wide Read grant would let
+        // alice traverse/read every label, but an explicit DENY on :Secret carves it back out — the
+        // oracle short-circuits to `false` for the denied element even though a grant implies it.
+        let cat = catalog_with_denies(
+            &[Privilege::on_graph(Action::Read, "db")],
+            &[Privilege::on_label(Action::Traverse, "db", "Secret")],
+        );
+        let p = EffectivePrivileges::resolve(cat, Some("alice"), "db");
+        assert!(!p.is_unrestricted());
+        // Non-denied labels: still granted by the graph-wide Read.
+        assert!(p.can_traverse_label("Person"));
+        assert!(p.can_read_property("Person", "name"));
+        // Denied label: invisible despite the covering grant (DENY TRAVERSE blocks read too).
+        assert!(!p.can_traverse_label("Secret"));
+        assert!(!p.can_read_property("Secret", "code"));
+    }
+
+    #[test]
+    fn deny_read_leaves_traverse_intact_in_the_oracle() {
+        // The graded reversal at the oracle boundary: DENY READ on a property hides the property
+        // (NULL) but leaves the node visible (traverse survives). Grant Read on the label so only the
+        // property-level deny can carve it.
+        let cat = catalog_with_denies(
+            &[Privilege::on_label(Action::Read, "db", "Person")],
+            &[Privilege::on_property(
+                Action::Read,
+                "db",
+                "Person",
+                "secret",
+            )],
+        );
+        let p = EffectivePrivileges::resolve(cat, Some("alice"), "db");
+        assert!(p.can_traverse_label("Person"), "node still visible");
+        assert!(
+            p.can_read_property("Person", "name"),
+            "other props still read"
+        );
+        assert!(
+            !p.can_read_property("Person", "secret"),
+            "the denied property reads as hidden"
+        );
+    }
+
+    #[test]
+    fn deny_blocks_write_with_precedence_in_the_oracle() {
+        // A graph-wide Write grant lets alice write everywhere; a DENY WRITE on :Secret refuses just
+        // that label's writes (precedence), while other labels stay writable.
+        let cat = catalog_with_denies(
+            &[Privilege::on_graph(Action::Write, "db")],
+            &[Privilege::on_label(Action::Write, "db", "Secret")],
+        );
+        let p = EffectivePrivileges::resolve(cat, Some("alice"), "db");
+        assert!(p.can_write_label("Person"));
+        assert!(!p.can_write_label("Secret"), "denied write is refused");
+        assert!(p.can_write_property("Person", "name"));
+    }
+
+    #[test]
+    fn global_admin_ignores_denies_via_the_unrestricted_fast_path() {
+        // A global admin is unrestricted, so even a self-directed DENY on the admin role is never
+        // consulted — `resolve` captures no snapshot for it and every predicate short-circuits. This
+        // is the fast-path counterpart of `Catalog::authorize`'s global-admin exemption.
+        let mut auth = auth_with(&[]);
+        auth.catalog_mut()
+            .deny_privilege("admin", Privilege::on_label(Action::Read, "db", "Person"))
+            .unwrap();
+        let cat = Arc::new(SecurityCatalog::from_parts(
+            std::env::temp_dir().join("graphus-priv-test-unused"),
+            "root".to_owned(),
+            auth,
+        ));
+        let p = EffectivePrivileges::resolve(cat, Some("root"), "db");
+        assert!(
+            p.is_unrestricted(),
+            "global admin stays unrestricted despite the deny"
+        );
     }
 
     #[test]

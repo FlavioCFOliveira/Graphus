@@ -60,7 +60,7 @@ use crate::ast::{
     ListComprehension, Literal, LoadCsvClause, MapKey, MapProjection, MapProjectionSelector,
     MatchClause, MergeAction, MergeClause, NodePattern, NormalForm, PatternChainLink,
     PatternComprehension, PatternElement, PatternPart, PatternPartKind, PatternQuantifier,
-    PredefinedType, PredicateOp, ProcedureCall, ProjectionBody, ProjectionItem, QppInfo,
+    PredefinedType, PredicateOp, ProcedureCall, ProjectionBody, ProjectionItem, QppHop, QppInfo,
     QuantifierExpr, QuantifierKind, Query, QueryBody, ReduceExpr, RelDirection, RelType,
     RelationshipPattern, RemoveClause, RemoveItem, ReturnClause, SetClause, SetItem, SingleQuery,
     SortDirection, SortItem, StandaloneCall, StandaloneYield, SubqueryExpr, TypeExpr, UnaryOp,
@@ -1607,8 +1607,11 @@ impl<'t, 's> Parser<'t, 's> {
     /// Parses a **quantified path pattern** factor `((interior) [WHERE p]){quantifier}` plus its
     /// trailing boundary node, returning it as a [`PatternChainLink`] carrying the [`QppInfo`].
     ///
-    /// The supported subset is a single-relationship interior `(x)-[r]-(y)`; a multi-relationship
-    /// interior, or a nested QPP, is a clear `SyntaxError` (feature not yet implemented). The trailing
+    /// The interior may be a single relationship `(x)-[r]-(y)` **or** a longer path
+    /// `(x)-[r1]->(m)-[r2]->(y)` (Neo4j 5.x GPM): the first hop is carried by the link's
+    /// `relationship`/[`QppInfo::interior_end`] and every further hop by
+    /// [`QppInfo::interior_extra`]. A **nested** QPP (a QPP appearing inside the interior) is not yet
+    /// supported and is a clear `SyntaxError`; so is an empty interior (no relationship). The trailing
     /// boundary node `(b)` is consumed when a plain node pattern follows the quantifier; otherwise
     /// (another QPP, a relationship, or the pattern end follows) an anonymous boundary is synthesised.
     fn parse_quantified_path_link(&mut self) -> Result<PatternChainLink, SyntaxError> {
@@ -1623,26 +1626,20 @@ impl<'t, 's> Parser<'t, 's> {
         self.expect(&TokenKind::RParen, "')' to close a quantified path pattern")?;
         let (quantifier, quant_end) = self.parse_quantifier()?;
 
-        // Subset validation: exactly one relationship between two node patterns, no nested QPP.
-        if interior.chain.len() != 1 {
+        // The interior must contain at least one relationship between two node patterns.
+        if interior.chain.is_empty() {
             return Err(SyntaxError::new(
                 SyntaxErrorKind::Expected {
-                    expected: "a quantified path pattern with a single relationship between two \
+                    expected: "a quantified path pattern with at least one relationship between \
                                nodes (e.g. `((x)-[r]->(y)){1,3}`)"
                         .to_owned(),
-                    found: format!("an interior with {} relationship(s)", interior.chain.len()),
+                    found: "an interior with no relationship".to_owned(),
                 },
                 interior.span,
             ));
         }
-        let interior_start = interior.start;
-        // Exactly one link (checked above): destructure it.
-        let interior_link = interior
-            .chain
-            .into_iter()
-            .next()
-            .expect("INVARIANT: interior.chain.len() == 1 checked above");
-        if interior_link.qpp.is_some() {
+        // Nested QPP (a quantified path pattern inside the interior) is not yet supported.
+        if interior.chain.iter().any(|l| l.qpp.is_some()) {
             return Err(SyntaxError::new(
                 SyntaxErrorKind::Expected {
                     expected: "a non-nested quantified path pattern".to_owned(),
@@ -1651,8 +1648,22 @@ impl<'t, 's> Parser<'t, 's> {
                 Span::new(start, quant_end),
             ));
         }
-        let relationship = interior_link.relationship;
-        let interior_end = interior_link.node;
+
+        let interior_start = interior.start;
+        // Split the interior chain: the first link populates the link's `relationship`/`interior_end`
+        // (the single-hop fast path fields); every remaining link becomes an extra interior hop.
+        let mut links = interior.chain.into_iter();
+        let first = links
+            .next()
+            .expect("INVARIANT: interior.chain is non-empty (checked above)");
+        let relationship = first.relationship;
+        let interior_end = first.node;
+        let interior_extra: Vec<QppHop> = links
+            .map(|l| QppHop {
+                relationship: l.relationship,
+                node: l.node,
+            })
+            .collect();
 
         // Trailing boundary node: an explicit `(b)` if a plain node pattern follows; else anonymous.
         let boundary = if self.at_plain_node_start() {
@@ -1666,6 +1677,7 @@ impl<'t, 's> Parser<'t, 's> {
             qpp: Some(Box::new(QppInfo {
                 interior_start,
                 interior_end,
+                interior_extra,
                 quantifier,
                 inner_where,
                 span: Span::new(start, quant_end),

@@ -346,11 +346,14 @@ fn estimate(op: &LogicalOp, stats: Option<&dyn Statistics>) -> f64 {
         // Both endpoints are bound by the input, so the cardinality is modelled as a passthrough.
         LogicalOp::ShortestPath { input, .. } => estimate(input, stats),
 
-        // A quantified path pattern compounds like a variable-length expand: `degree^(avg iterations)`
-        // per input row, with an open upper bound clamped so the exponent stays finite.
+        // A quantified path pattern compounds like a variable-length expand: `degree^(avg edges)` per
+        // input row, with an open upper bound clamped so the exponent stays finite. A
+        // multi-relationship interior traverses `1 + extra_hops.len()` edges per iteration, so the
+        // exponent scales by the hops-per-iteration.
         LogicalOp::QuantifiedPath {
             input,
             types,
+            extra_hops,
             min,
             max,
             ..
@@ -375,8 +378,9 @@ fn estimate(op: &LogicalOp, stats: Option<&dyn Statistics>) -> f64 {
             };
             let lo = *min as f64;
             let hi = max.unwrap_or_else(|| min.saturating_add(DEFAULT_VARLEN_MAX_HOPS)) as f64;
-            let avg_len = (lo + hi.max(lo)) / 2.0;
-            input_rows * degree.powf(avg_len)
+            let avg_iters = (lo + hi.max(lo)) / 2.0;
+            let hops_per_iter = (1 + extra_hops.len()) as f64;
+            input_rows * degree.powf(avg_iters * hops_per_iter)
         }
 
         // ---- relational ---------------------------------------------------------------------------

@@ -425,6 +425,14 @@ fn collect_pattern_element_literals(element: &PatternElement, out: &mut Vec<Lite
             if let Some(props) = &qpp.interior_end.properties {
                 collect_expr_literals(props, out);
             }
+            for hop in &qpp.interior_extra {
+                if let Some(props) = &hop.relationship.properties {
+                    collect_expr_literals(props, out);
+                }
+                if let Some(props) = &hop.node.properties {
+                    collect_expr_literals(props, out);
+                }
+            }
             if let Some(where_expr) = &qpp.inner_where {
                 collect_expr_literals(where_expr, out);
             }

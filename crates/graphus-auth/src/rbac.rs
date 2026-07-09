@@ -394,6 +394,17 @@ impl Privilege {
         )
     }
 
+    /// Returns `true` if `self` is the **global-admin** grant — [`Action::Admin`] over the
+    /// server-wide [`Resource::Database`] scope (the global root). A principal holding this grant is
+    /// *unrestricted*: [`Catalog::authorize`] short-circuits to `true` for it, and — the security
+    /// invariant this anchors — an explicit `DENY` never restricts it. This keeps the unrestricted
+    /// fast path (`EffectivePrivileges`) and the lock-out safeguard sound: no `DENY` can lock the
+    /// bootstrap admin out of administration.
+    #[must_use]
+    pub fn is_global_admin(&self) -> bool {
+        self.action == Action::Admin && self.resource == Resource::Database
+    }
+
     /// Returns `true` if holding `self` is sufficient to satisfy a request for `wanted`.
     ///
     /// This composes the two containment dimensions (deny-by-default is enforced by the *caller*
@@ -426,24 +437,74 @@ impl Privilege {
     pub fn implies_ref(&self, wanted_action: Action, wanted_resource: &ResourceRef<'_>) -> bool {
         self.resource.covers_ref(wanted_resource) && self.action.implies(wanted_action)
     }
+
+    /// Returns `true` if `self`, used as an explicit **deny**, blocks a request for `wanted`
+    /// (the DENY-precedence twin of [`implies`](Self::implies)).
+    ///
+    /// A deny composes the same **resource containment** as a grant — a deny on a broader scope
+    /// blocks every narrower request within it (`Database ⊇ Graph ⊇ {Label,RelType,Property}`,
+    /// `Label ⊇ Property`; scopes never cross databases) — but the **action** dimension is
+    /// *reversed*: a deny of action `D` blocks a request for action `A` iff **`A` implies `D`**
+    /// (`wanted.action.implies(self.action)`), not the other way round.
+    ///
+    /// The reversal is what makes DENY behave correctly against the graded `Traverse ⊂ Read ⊂ Write`
+    /// chain (module docs), where a stronger action *requires* the weaker read-side capabilities:
+    ///
+    /// - `DENY TRAVERSE` blocks `Traverse`, `Read` **and** `Write` (each requires seeing the element).
+    /// - `DENY READ` blocks `Read` and `Write` but **not** `Traverse` (you may still see the element,
+    ///   just not read its properties) — matching Neo4j, where `DENY READ` leaves traversal intact.
+    /// - `DENY WRITE` blocks only `Write`, leaving `Read`/`Traverse` intact.
+    /// - `Schema`/`Admin` are matched exactly (only a request for the same action, or the stronger
+    ///   `Admin`, implies them).
+    ///
+    /// Deny-by-default is unaffected: this answers only "does this deny block the request?"; the
+    /// caller still requires a grant to *allow* it. Precedence is the caller's rule
+    /// ([`Catalog::authorize`]): a blocking deny overrides any grant.
+    #[must_use]
+    pub fn blocks(&self, wanted: &Privilege) -> bool {
+        self.resource.covers(&wanted.resource) && wanted.action.implies(self.action)
+    }
+
+    /// The allocation-free twin of [`blocks`](Self::blocks): whether `self` (an explicit deny) blocks
+    /// a request for `wanted_action` over the **borrowed** `wanted_resource`. Identical composition to
+    /// [`blocks`](Self::blocks) — resource containment ([`Resource::covers_ref`]) **and** the reversed
+    /// action containment ([`Action::implies`], with the *requested* action on the left) — so the
+    /// fine-grained DENY-precedence hot path probes per-element denials without allocating an owned
+    /// [`Resource`]/[`Privilege`] per row. Pinned byte-for-byte equal to `blocks` by an exhaustive
+    /// oracle test.
+    #[must_use]
+    pub fn blocks_ref(&self, wanted_action: Action, wanted_resource: &ResourceRef<'_>) -> bool {
+        self.resource.covers_ref(wanted_resource) && wanted_action.implies(self.action)
+    }
 }
 
-/// A named role: a set of [`Privilege`]s. Users gain privileges by membership in roles.
+/// A named role: a set of granted [`Privilege`]s plus a set of explicitly **denied** ones. Users
+/// gain (and are denied) privileges by membership in roles.
+///
+/// A grant and a deny for the same `(action, scope)` **coexist** — a `DENY` does not erase a
+/// `GRANT` (Neo4j semantics). The two sets are combined only at authorization time, where
+/// [`Catalog::authorize`] gives DENY precedence over GRANT.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Role {
     /// The role's unique name.
     pub name: String,
-    /// The privileges granted by this role.
+    /// The privileges **granted** by this role (the allowlist).
     pub privileges: BTreeSet<Privilege>,
+    /// The privileges explicitly **denied** by this role (the denylist). A deny here overrides any
+    /// grant that would otherwise imply the request (DENY precedence). Empty for a role that has
+    /// only ever been granted privileges — which keeps pre-existing security files, whose records
+    /// carry no deny flag, round-tripping unchanged.
+    pub denied: BTreeSet<Privilege>,
 }
 
 impl Role {
-    /// Creates an empty role with the given name.
+    /// Creates an empty role (no grants, no denies) with the given name.
     #[must_use]
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             privileges: BTreeSet::new(),
+            denied: BTreeSet::new(),
         }
     }
 }
@@ -824,7 +885,8 @@ impl Catalog {
         Ok(())
     }
 
-    /// Revokes a privilege from a role (idempotent).
+    /// Revokes a **granted** privilege from a role (idempotent). Leaves any deny of the same
+    /// `(action, scope)` untouched — `REVOKE GRANT` in the admin grammar.
     ///
     /// # Errors
     /// [`AuthError::NotFound`] if the role does not exist.
@@ -839,38 +901,108 @@ impl Catalog {
         Ok(())
     }
 
+    /// Explicitly **denies** a privilege to a role (idempotent). A deny coexists with any grant of
+    /// the same `(action, scope)` and takes **precedence** at authorization time
+    /// ([`Catalog::authorize`]) — `DENY <action> ON <scope> TO <role>` in the admin grammar.
+    ///
+    /// # Errors
+    /// [`AuthError::NotFound`] if the role does not exist.
+    pub fn deny_privilege(&mut self, role: &str, privilege: Privilege) -> Result<()> {
+        let r = self
+            .roles
+            .get_mut(role)
+            .ok_or_else(|| AuthError::NotFound {
+                what: format!("role {role}"),
+            })?;
+        r.denied.insert(privilege);
+        Ok(())
+    }
+
+    /// Revokes an explicit **deny** from a role (idempotent). Leaves any grant of the same
+    /// `(action, scope)` untouched — `REVOKE DENY` in the admin grammar.
+    ///
+    /// # Errors
+    /// [`AuthError::NotFound`] if the role does not exist.
+    pub fn revoke_denied_privilege(&mut self, role: &str, privilege: &Privilege) -> Result<()> {
+        let r = self
+            .roles
+            .get_mut(role)
+            .ok_or_else(|| AuthError::NotFound {
+                what: format!("role {role}"),
+            })?;
+        r.denied.remove(privilege);
+        Ok(())
+    }
+
     // ---- Authorization -----------------------------------------------------------------------
 
-    /// Returns `true` iff `user` holds (directly through any of their roles) a privilege that
-    /// implies `wanted`. **Deny by default**: an unknown user, a user with no roles, or a user
-    /// whose roles grant nothing that implies `wanted`, all return `false`.
+    /// Returns `true` iff `user` is authorized for `wanted`, composing GRANT, DENY and the global-admin
+    /// exemption. **Deny by default**: an unknown user, a user with no roles, or a user whose roles
+    /// grant nothing that implies `wanted`, all return `false`.
     ///
-    /// The resolution unions the privileges across all the user's roles and asks
-    /// [`Privilege::implies`] for each, so a single global `Admin` grant satisfies every request
-    /// (`04 §8.4` "admin implies").
+    /// The decision, evaluated over the union of the user's roles, is:
+    ///
+    /// 1. **Global-admin exemption** — a principal holding the global `Admin` grant
+    ///    ([`Privilege::is_global_admin`]: `Admin` on the server-wide [`Resource::Database`]) is
+    ///    *unrestricted*: `authorize` returns `true` for **every** request, and a `DENY` never
+    ///    restricts it. This keeps the unrestricted fast path and the lock-out safeguard sound (no
+    ///    `DENY` can lock the bootstrap admin out). It is a deliberate, narrow Graphus deviation from
+    ///    Neo4j (whose `DENY` can restrict even admins), scoped to the *global* root only — a
+    ///    graph-scoped `Admin` is **not** exempt.
+    /// 2. **DENY precedence** — otherwise, if any role explicitly denies a privilege that
+    ///    [blocks](Privilege::blocks) `wanted`, the request is denied regardless of any grant
+    ///    (Neo4j "access = `GRANT` and not `DENY`"). Grant and deny coexist; the deny simply wins.
+    /// 3. **GRANT** — otherwise, `true` iff some granted privilege [implies](Privilege::implies)
+    ///    `wanted` (the graded `Traverse ⊂ Read ⊂ Write` chain + scope containment fold in here, so a
+    ///    single broader grant satisfies a narrower request).
     #[must_use]
     pub fn authorize(&self, user: &str, wanted: &Privilege) -> bool {
         let Some(user) = self.users.get(user) else {
             return false;
         };
-        user.roles
+        // The user's roles, resolved once (a user references roles by name; `drop_role`/`rename_role`
+        // keep memberships consistent, so this never skips a dangling name).
+        let roles: Vec<&Role> = user
+            .roles
             .iter()
             .filter_map(|role_name| self.roles.get(role_name))
+            .collect();
+        // (1) Global-admin exemption: unrestricted, DENY never applies.
+        if roles
+            .iter()
+            .any(|role| role.privileges.iter().any(Privilege::is_global_admin))
+        {
+            return true;
+        }
+        // (2) DENY precedence: a blocking deny overrides any grant.
+        if roles
+            .iter()
+            .any(|role| role.denied.iter().any(|d| d.blocks(wanted)))
+        {
+            return false;
+        }
+        // (3) GRANT: some granted privilege must imply the request.
+        roles
+            .iter()
             .flat_map(|role| role.privileges.iter())
             .any(|granted| granted.implies(wanted))
     }
 
-    /// Snapshots `user`'s **effective privilege set**: the union of every privilege granted by every
-    /// role the user holds, deduplicated and in deterministic order (rmp #320).
+    /// Snapshots `user`'s effective **granted** privilege set: the union of every privilege granted by
+    /// every role the user holds, deduplicated and in deterministic order (rmp #320).
     ///
-    /// This is the consistent, owned view a caller captures under a **single** read lock at statement
-    /// start, so per-element authorization can then be answered against the snapshot
-    /// ([`Privilege::implies`] / [`Privilege::implies_ref`]) without re-walking the roles indirection
-    /// or re-taking the lock for every probe. An unknown user, or one with no roles / no grants,
-    /// yields an empty set (deny-by-default is preserved: a request implied by *nothing* is denied).
+    /// This is the allowlist half of the consistent, owned view a caller captures under a **single**
+    /// read lock at statement start (pair it with [`effective_denies`](Self::effective_denies) for the
+    /// denylist half), so per-element authorization can then be answered against the snapshot
+    /// ([`Privilege::implies`] / [`Privilege::implies_ref`] for grants,
+    /// [`Privilege::blocks`] / [`Privilege::blocks_ref`] for denies) without re-walking the roles
+    /// indirection or re-taking the lock for every probe. An unknown user, or one with no roles / no
+    /// grants, yields an empty set (deny-by-default is preserved).
     ///
-    /// The set is exactly the privileges [`authorize`](Self::authorize) iterates: for any `wanted`,
-    /// `self.authorize(user, &wanted) == self.effective_privileges(user).iter().any(|p| p.implies(&wanted))`.
+    /// Together with [`effective_denies`](Self::effective_denies) this reproduces
+    /// [`authorize`](Self::authorize) exactly for any non-global-admin principal: for any `wanted`,
+    /// `authorize(user, &wanted)` iff some granted privilege implies it **and** no denied privilege
+    /// blocks it (the global-admin exemption is a separate short-circuit — see `authorize`).
     #[must_use]
     pub fn effective_privileges(&self, user: &str) -> BTreeSet<Privilege> {
         let Some(user) = self.users.get(user) else {
@@ -880,6 +1012,26 @@ impl Catalog {
             .iter()
             .filter_map(|role_name| self.roles.get(role_name))
             .flat_map(|role| role.privileges.iter().cloned())
+            .collect()
+    }
+
+    /// Snapshots `user`'s effective **denied** privilege set: the union of every privilege explicitly
+    /// denied by every role the user holds, deduplicated and in deterministic order — the denylist
+    /// twin of [`effective_privileges`](Self::effective_privileges).
+    ///
+    /// A caller captures both under the same read guard to answer per-element authorization with DENY
+    /// precedence lock-free: a request is allowed iff a grant implies it **and** no deny in this set
+    /// [blocks](Privilege::blocks) it. An unknown user, or one whose roles deny nothing, yields an
+    /// empty set (no denial).
+    #[must_use]
+    pub fn effective_denies(&self, user: &str) -> BTreeSet<Privilege> {
+        let Some(user) = self.users.get(user) else {
+            return BTreeSet::new();
+        };
+        user.roles
+            .iter()
+            .filter_map(|role_name| self.roles.get(role_name))
+            .flat_map(|role| role.denied.iter().cloned())
             .collect()
     }
 }
@@ -1202,10 +1354,198 @@ mod tests {
     }
 
     #[test]
+    fn blocks_matrix_is_exhaustive_and_composed() {
+        // The DENY-matching oracle: a deny blocks a request iff the deny's SCOPE contains the request
+        // (same containment as a grant) AND the request's ACTION implies the deny's action (the
+        // *reversed* action direction — `wanted.action.implies(deny.action)`). Pin the full 25×25
+        // cross-product against the two independent oracles (`resource_covers_expected` for scope,
+        // `action_implies_expected` for the reversed action).
+        for &da in &actions() {
+            for deny_scope in scopes() {
+                let deny = Privilege::new(da, deny_scope.clone());
+                for &wa in &actions() {
+                    for wanted_scope in scopes() {
+                        let wanted = Privilege::new(wa, wanted_scope.clone());
+                        let expected = resource_covers_expected(&deny_scope, &wanted_scope)
+                            // reversed: the WANTED action must imply the DENY action.
+                            && action_implies_expected(wa, da);
+                        assert_eq!(
+                            deny.blocks(&wanted),
+                            expected,
+                            "deny {da:?}@{deny_scope:?} blocks {wa:?}@{wanted_scope:?}?"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blocks_ref_is_byte_identical_to_blocks() {
+        // The allocation-free DENY hot path (`blocks_ref` over a `ResourceRef`) must return EXACTLY
+        // what the owned `blocks` returns, across the full 25×25 cross-product — so the fine-grained
+        // DENY-precedence probe never diverges from the canonical decision.
+        for &da in &actions() {
+            for deny_scope in scopes() {
+                let deny = Privilege::new(da, deny_scope.clone());
+                for &wa in &actions() {
+                    for wanted_scope in scopes() {
+                        let wanted = Privilege::new(wa, wanted_scope.clone());
+                        let owned = deny.blocks(&wanted);
+                        let borrowed = deny.blocks_ref(wa, &as_ref(&wanted_scope));
+                        assert_eq!(
+                            owned, borrowed,
+                            "deny {da:?}@{deny_scope:?} vs wanted {wa:?}@{wanted_scope:?}: \
+                             owned={owned} borrowed={borrowed}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deny_takes_precedence_over_grant() {
+        // An explicit DENY overrides a GRANT that would otherwise imply the request (Neo4j
+        // "access = GRANT and not DENY"). The grant and deny coexist — the deny simply wins.
+        let mut c = Catalog::new();
+        c.create_user("alice").unwrap();
+        c.create_role("r").unwrap();
+        c.grant_privilege("r", Privilege::on_graph(Action::Read, "db"))
+            .unwrap();
+        c.deny_privilege("r", Privilege::on_label(Action::Read, "db", "Secret"))
+            .unwrap();
+        c.grant_role("alice", "r").unwrap();
+        // Granted graph-wide Read still covers a non-denied label...
+        assert!(c.authorize("alice", &Privilege::on_label(Action::Read, "db", "Person")));
+        // ...but the denied label is refused despite the covering grant, at label and property level.
+        assert!(!c.authorize("alice", &Privilege::on_label(Action::Read, "db", "Secret")));
+        assert!(!c.authorize(
+            "alice",
+            &Privilege::on_property(Action::Read, "db", "Secret", "ssn")
+        ));
+        // The grant is not erased: revoking the deny restores access (REVOKE DENY independence).
+        c.revoke_denied_privilege("r", &Privilege::on_label(Action::Read, "db", "Secret"))
+            .unwrap();
+        assert!(c.authorize("alice", &Privilege::on_label(Action::Read, "db", "Secret")));
+    }
+
+    #[test]
+    fn deny_read_leaves_traverse_intact_but_blocks_write() {
+        // The reversed action grading: `DENY READ` blocks Read and Write (both require the read
+        // capability in the graded model) but NOT Traverse (you may still see the element), matching
+        // Neo4j's `DENY READ`. `DENY TRAVERSE` blocks all three; `DENY WRITE` blocks only Write.
+        let mut c = Catalog::new();
+        c.create_user("alice").unwrap();
+        c.create_role("r").unwrap();
+        // Grant everything on the label so only the deny can carve it back.
+        c.grant_privilege("r", Privilege::on_label(Action::Write, "db", "Person"))
+            .unwrap();
+        c.grant_role("alice", "r").unwrap();
+
+        // DENY READ: traverse survives, read + write are blocked.
+        c.deny_privilege("r", Privilege::on_label(Action::Read, "db", "Person"))
+            .unwrap();
+        assert!(c.authorize(
+            "alice",
+            &Privilege::on_label(Action::Traverse, "db", "Person")
+        ));
+        assert!(!c.authorize("alice", &Privilege::on_label(Action::Read, "db", "Person")));
+        assert!(!c.authorize("alice", &Privilege::on_label(Action::Write, "db", "Person")));
+        c.revoke_denied_privilege("r", &Privilege::on_label(Action::Read, "db", "Person"))
+            .unwrap();
+
+        // DENY WRITE: read + traverse survive, only write is blocked.
+        c.deny_privilege("r", Privilege::on_label(Action::Write, "db", "Person"))
+            .unwrap();
+        assert!(c.authorize(
+            "alice",
+            &Privilege::on_label(Action::Traverse, "db", "Person")
+        ));
+        assert!(c.authorize("alice", &Privilege::on_label(Action::Read, "db", "Person")));
+        assert!(!c.authorize("alice", &Privilege::on_label(Action::Write, "db", "Person")));
+        c.revoke_denied_privilege("r", &Privilege::on_label(Action::Write, "db", "Person"))
+            .unwrap();
+
+        // DENY TRAVERSE: everything on the element is blocked (you cannot see it at all).
+        c.deny_privilege("r", Privilege::on_label(Action::Traverse, "db", "Person"))
+            .unwrap();
+        assert!(!c.authorize(
+            "alice",
+            &Privilege::on_label(Action::Traverse, "db", "Person")
+        ));
+        assert!(!c.authorize("alice", &Privilege::on_label(Action::Read, "db", "Person")));
+        assert!(!c.authorize("alice", &Privilege::on_label(Action::Write, "db", "Person")));
+    }
+
+    #[test]
+    fn deny_scope_containment_blocks_narrower_only_where_it_covers() {
+        // A DENY on a broader scope blocks every narrower request within it; a DENY on a narrower
+        // scope leaves siblings intact. Scopes never cross database boundaries.
+        let mut c = Catalog::new();
+        c.create_user("alice").unwrap();
+        c.create_role("r").unwrap();
+        c.grant_privilege("r", Privilege::read_database()).unwrap(); // server-wide Read
+        c.deny_privilege("r", Privilege::on_graph(Action::Read, "db"))
+            .unwrap(); // deny one whole database
+        c.grant_role("alice", "r").unwrap();
+        // Everything in "db" is denied (the graph-wide deny covers all its labels/props/rels)...
+        assert!(!c.authorize("alice", &Privilege::on_graph(Action::Read, "db")));
+        assert!(!c.authorize("alice", &Privilege::on_label(Action::Read, "db", "Person")));
+        assert!(!c.authorize(
+            "alice",
+            &Privilege::on_property(Action::Read, "db", "Person", "name")
+        ));
+        // ...but a different database is untouched (deny scopes never cross databases).
+        assert!(c.authorize("alice", &Privilege::on_graph(Action::Read, "other")));
+        assert!(c.authorize(
+            "alice",
+            &Privilege::on_label(Action::Read, "other", "Person")
+        ));
+    }
+
+    #[test]
+    fn global_admin_is_exempt_from_deny() {
+        // The narrow Graphus exemption: a global-admin principal is unrestricted, so a DENY never
+        // restricts it (this is what keeps the lock-out safeguard sound — no DENY can lock the
+        // bootstrap admin out). A graph-scoped Admin is NOT exempt.
+        let mut c = Catalog::new();
+        c.create_user("root").unwrap();
+        c.create_role("admin").unwrap();
+        c.grant_privilege("admin", Privilege::admin_database())
+            .unwrap();
+        // Even a self-directed DENY on the admin role cannot restrict the global root.
+        c.deny_privilege("admin", Privilege::on_label(Action::Read, "db", "Person"))
+            .unwrap();
+        c.deny_privilege("admin", Privilege::admin_database())
+            .unwrap();
+        c.grant_role("root", "admin").unwrap();
+        assert!(c.authorize("root", &Privilege::on_label(Action::Read, "db", "Person")));
+        assert!(c.authorize("root", &Privilege::admin_database()));
+        assert!(c.authorize("root", &Privilege::on_graph(Action::Write, "any")));
+
+        // A GRAPH-scoped admin, by contrast, IS restricted by a deny within that graph.
+        let mut c2 = Catalog::new();
+        c2.create_user("mgr").unwrap();
+        c2.create_role("dbadmin").unwrap();
+        c2.grant_privilege("dbadmin", Privilege::on_graph(Action::Admin, "db"))
+            .unwrap();
+        c2.deny_privilege("dbadmin", Privilege::on_label(Action::Read, "db", "Secret"))
+            .unwrap();
+        c2.grant_role("mgr", "dbadmin").unwrap();
+        assert!(c2.authorize("mgr", &Privilege::on_label(Action::Read, "db", "Person")));
+        assert!(!c2.authorize("mgr", &Privilege::on_label(Action::Read, "db", "Secret")));
+    }
+
+    #[test]
     fn effective_privileges_matches_authorize() {
         // The snapshot the server captures under one read lock (rmp #320) must answer every request
-        // exactly as `authorize` does: for any `wanted`, `authorize(user, wanted)` iff some privilege
-        // in `effective_privileges(user)` implies it.
+        // exactly as `authorize` does. With DENY, the snapshot is TWO sets — grants + denies — and the
+        // reconstructed decision is `grant-implies AND NOT deny-blocks` (the global-admin exemption is
+        // a separate short-circuit, exercised by `global_admin_is_exempt_from_deny`). This pins the
+        // server's four-site DENY threading (rbac ↔ authorize ↔ effective_privileges/denies ↔
+        // EffectivePrivileges): the two snapshot sets must reproduce `authorize` across the full
+        // action × scope cross-product.
         let mut c = Catalog::new();
         c.create_user("alice").unwrap();
         c.create_role("reader").unwrap();
@@ -1214,22 +1554,45 @@ mod tests {
             .unwrap();
         c.grant_privilege("writer", Privilege::on_graph(Action::Write, "db"))
             .unwrap();
+        // A DENY that carves a hole out of the graph-wide Write grant: writes to KNOWS are denied even
+        // though `writer` grants Write on the whole graph (DENY precedence).
+        c.deny_privilege(
+            "writer",
+            Privilege::on_rel_type(Action::Write, "db", "KNOWS"),
+        )
+        .unwrap();
         c.grant_role("alice", "reader").unwrap();
         c.grant_role("alice", "writer").unwrap();
 
-        let snapshot = c.effective_privileges("alice");
+        let granted = c.effective_privileges("alice");
+        let denied = c.effective_denies("alice");
+        // alice is not a global admin, so the exemption never fires here.
+        assert!(!c.authorize("alice", &Privilege::admin_database()));
         for &a in &actions() {
             for scope in scopes() {
                 let wanted = Privilege::new(a, scope);
+                let reconstructed = granted.iter().any(|p| p.implies(&wanted))
+                    && !denied.iter().any(|d| d.blocks(&wanted));
                 assert_eq!(
                     c.authorize("alice", &wanted),
-                    snapshot.iter().any(|p| p.implies(&wanted)),
-                    "snapshot must agree with authorize for {wanted:?}"
+                    reconstructed,
+                    "snapshot (grant-implies AND NOT deny-blocks) must agree with authorize for {wanted:?}"
                 );
             }
         }
-        // An unknown user yields an empty (deny-everything) snapshot.
+        // The DENY actually bit: Write on KNOWS is refused despite the graph-wide grant...
+        assert!(!c.authorize(
+            "alice",
+            &Privilege::on_rel_type(Action::Write, "db", "KNOWS")
+        ));
+        // ...while Write elsewhere in the graph still works.
+        assert!(c.authorize(
+            "alice",
+            &Privilege::on_rel_type(Action::Write, "db", "LIKES")
+        ));
+        // An unknown user yields empty (deny-everything) snapshots.
         assert!(c.effective_privileges("ghost").is_empty());
+        assert!(c.effective_denies("ghost").is_empty());
     }
 
     #[test]

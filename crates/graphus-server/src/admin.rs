@@ -203,7 +203,18 @@ pub enum AdminCommand {
         /// The role to grant to.
         role: String,
     },
-    /// `REVOKE <action> ON <scope> FROM <role>`.
+    /// `DENY <action> ON <scope> TO <role>` (`rmp` #645). Records an explicit deny that takes
+    /// precedence over any grant of the same `(action, scope)` at authorization time.
+    DenyPrivilege {
+        /// The parsed action.
+        action: PrivAction,
+        /// The parsed scope.
+        scope: PrivScope,
+        /// The role to deny on.
+        role: String,
+    },
+    /// `REVOKE [GRANT | DENY] <action> ON <scope> FROM <role>` (`rmp` #645). The `mode` selects which
+    /// of the grant / deny of that `(action, scope)` to remove; plain `REVOKE` removes both.
     RevokePrivilege {
         /// The parsed action.
         action: PrivAction,
@@ -211,6 +222,8 @@ pub enum AdminCommand {
         scope: PrivScope,
         /// The role to revoke from.
         role: String,
+        /// Which access sense(s) to remove (`GRANT` / `DENY` / both).
+        mode: RevokeMode,
     },
     /// `SHOW USERS`.
     ShowUsers,
@@ -326,8 +339,20 @@ impl RestorePoint {
     }
 }
 
-/// A grantable action in the `GRANT`/`REVOKE` grammar (mirrors [`graphus_auth::Action`] but kept
-/// separate so the grammar is decoupled from the auth crate's `#[non_exhaustive]` enum).
+/// Which access sense(s) a `REVOKE` removes (`rmp` #645). Neo4j's `REVOKE GRANT`/`REVOKE DENY` remove
+/// exactly one; a plain `REVOKE` removes whichever exists ([`RevokeMode::Both`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevokeMode {
+    /// Plain `REVOKE`: remove both the grant and the deny of the `(action, scope)`.
+    Both,
+    /// `REVOKE GRANT`: remove only the grant, leaving any deny in place.
+    GrantOnly,
+    /// `REVOKE DENY`: remove only the deny, leaving any grant in place.
+    DenyOnly,
+}
+
+/// A grantable action in the `GRANT`/`REVOKE`/`DENY` grammar (mirrors [`graphus_auth::Action`] but
+/// kept separate so the grammar is decoupled from the auth crate's `#[non_exhaustive]` enum).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrivAction {
     /// `TRAVERSE`.
@@ -587,9 +612,9 @@ pub fn parse_admin_statement(query: &str) -> AdminParse {
         _ => return AdminParse::NotAdmin,
     };
 
-    // GRANT / REVOKE are never valid Cypher statement starts, so they are CLAIMED on the first token
-    // alone (the security surface, rmp #92). Their remainder must then parse exactly.
-    if verb == "GRANT" || verb == "REVOKE" {
+    // GRANT / REVOKE / DENY are never valid Cypher statement starts, so they are CLAIMED on the first
+    // token alone (the security surface, rmp #92 / #645). Their remainder must then parse exactly.
+    if verb == "GRANT" || verb == "REVOKE" || verb == "DENY" {
         return match parse_grant_revoke(&verb, &mut lex) {
             Ok(cmd) => AdminParse::Command(cmd),
             Err(msg) => AdminParse::Invalid(msg),
@@ -1881,40 +1906,67 @@ fn parse_optional_set_password(lex: &mut Lexer<'_>) -> Result<Option<String>, St
     }
 }
 
-/// Parses `GRANT`/`REVOKE` (the verb already read, the statement already CLAIMED — GRANT/REVOKE are
-/// never valid Cypher). Two shapes:
+/// Parses `GRANT`/`REVOKE`/`DENY` (the verb already read, the statement already CLAIMED — none is
+/// ever valid Cypher). Shapes (`rmp` #92 / #645):
 ///
 /// ```text
-/// GRANT  ROLE <role> TO   <user>      REVOKE ROLE <role> FROM <user>
-/// GRANT  <action> ON <scope> TO <role>
-/// REVOKE <action> ON <scope> FROM <role>
+/// GRANT  ROLE <role> TO   <user>            REVOKE ROLE <role> FROM <user>
+/// GRANT               <action> ON <scope> TO   <role>
+/// DENY                <action> ON <scope> TO   <role>
+/// REVOKE [GRANT|DENY] <action> ON <scope> FROM <role>
 /// ```
 ///
 /// `<action>` is `TRAVERSE`/`READ`/`WRITE`/`SCHEMA`/`ADMIN`; `<scope>` is parsed by
-/// [`parse_priv_scope`]. The trailing keyword is `TO` for `GRANT`, `FROM` for `REVOKE`.
+/// [`parse_priv_scope`]. The trailing keyword is `TO` for `GRANT`/`DENY`, `FROM` for `REVOKE`. A
+/// leading `GRANT`/`DENY` after `REVOKE` selects [`RevokeMode::GrantOnly`]/[`RevokeMode::DenyOnly`];
+/// plain `REVOKE` is [`RevokeMode::Both`]. `DENY` applies only to privileges (there is no
+/// `DENY ROLE`).
 fn parse_grant_revoke(verb: &str, lex: &mut Lexer<'_>) -> Result<AdminCommand, String> {
-    let granting = verb == "GRANT";
-    let connective = if granting { "TO" } else { "FROM" };
+    let denying = verb == "DENY";
+    let revoking = verb == "REVOKE";
+    // The trailing connective: FROM for REVOKE, TO for GRANT/DENY.
+    let connective = if revoking { "FROM" } else { "TO" };
 
     let second = lex
         .next_tok()?
         .ok_or_else(|| format!("expected ROLE or an action after {verb}"))?;
 
-    // GRANT/REVOKE ROLE <role> TO/FROM <user>
+    // GRANT/REVOKE ROLE <role> TO/FROM <user>. (There is no `DENY ROLE`: a role assignment is not a
+    // privilege, so it cannot be denied.)
     if is_keyword(&second, "ROLE") {
+        if denying {
+            return Err(
+                "DENY does not apply to role assignment (use REVOKE ROLE to unassign a role)"
+                    .to_owned(),
+            );
+        }
         let role = expect_security_name(lex, &format!("a role name after {verb} ROLE"))?;
         expect_security_keyword(lex, connective, verb)?;
         let user = expect_security_name(lex, &format!("a user name after {connective}"))?;
         expect_end(lex, &format!("{verb} ROLE"))?;
-        return Ok(if granting {
-            AdminCommand::GrantRole { role, user }
-        } else {
+        return Ok(if revoking {
             AdminCommand::RevokeRole { role, user }
+        } else {
+            AdminCommand::GrantRole { role, user }
         });
     }
 
-    // GRANT/REVOKE <action> ON <scope> TO/FROM <role>
-    let action = match &second {
+    // REVOKE GRANT / REVOKE DENY prefix: select the access sense to remove, then read the real action.
+    let mut mode = RevokeMode::Both;
+    let action_tok = if revoking && is_keyword(&second, "GRANT") {
+        mode = RevokeMode::GrantOnly;
+        lex.next_tok()?
+            .ok_or_else(|| "expected an action after REVOKE GRANT".to_owned())?
+    } else if revoking && is_keyword(&second, "DENY") {
+        mode = RevokeMode::DenyOnly;
+        lex.next_tok()?
+            .ok_or_else(|| "expected an action after REVOKE DENY".to_owned())?
+    } else {
+        second
+    };
+
+    // <action> ON <scope> TO/FROM <role>
+    let action = match &action_tok {
         Tok::Word(w) => PrivAction::from_keyword(w).ok_or_else(|| {
             format!("unknown privilege action `{w}`; expected ROLE, TRAVERSE, READ, WRITE, SCHEMA or ADMIN")
         })?,
@@ -1930,14 +1982,21 @@ fn parse_grant_revoke(verb: &str, lex: &mut Lexer<'_>) -> Result<AdminCommand, S
     expect_security_keyword(lex, connective, verb)?;
     let role = expect_security_name(lex, &format!("a role name after {connective}"))?;
     expect_end(lex, verb)?;
-    Ok(if granting {
-        AdminCommand::GrantPrivilege {
+    Ok(if denying {
+        AdminCommand::DenyPrivilege {
             action,
             scope,
             role,
         }
-    } else {
+    } else if revoking {
         AdminCommand::RevokePrivilege {
+            action,
+            scope,
+            role,
+            mode,
+        }
+    } else {
+        AdminCommand::GrantPrivilege {
             action,
             scope,
             role,
@@ -2757,7 +2816,7 @@ impl AdminContext {
                 let privilege = Privilege::new(action.to_action(), scope.to_resource());
                 move || async move { security.grant_privilege(&role, privilege).await }
             }),
-            AdminCommand::RevokePrivilege {
+            AdminCommand::DenyPrivilege {
                 action,
                 scope,
                 role,
@@ -2765,7 +2824,32 @@ impl AdminContext {
                 let security = Arc::clone(&self.security);
                 let role = role.clone();
                 let privilege = Privilege::new(action.to_action(), scope.to_resource());
-                move || async move { security.revoke_privilege(&role, privilege).await }
+                move || async move { security.deny_privilege(&role, privilege).await }
+            }),
+            AdminCommand::RevokePrivilege {
+                action,
+                scope,
+                role,
+                mode,
+            } => self.run_security(false, false, {
+                let security = Arc::clone(&self.security);
+                let role = role.clone();
+                let privilege = Privilege::new(action.to_action(), scope.to_resource());
+                let mode = *mode;
+                move || async move {
+                    match mode {
+                        // Plain REVOKE: remove whichever of grant/deny exists.
+                        RevokeMode::Both => security.revoke_privilege(&role, privilege).await,
+                        // REVOKE GRANT: the grant only.
+                        RevokeMode::GrantOnly => {
+                            security.revoke_granted_privilege(&role, privilege).await
+                        }
+                        // REVOKE DENY: the deny only.
+                        RevokeMode::DenyOnly => {
+                            security.revoke_deny_privilege(&role, privilege).await
+                        }
+                    }
+                }
             }),
             AdminCommand::ShowUsers => Ok(show_users(&self.security.list_users())),
             AdminCommand::ShowRoles => Ok(show_roles(&self.security.list_roles())),
@@ -2967,6 +3051,7 @@ fn admin_command_summary(cmd: &AdminCommand) -> RunSummary {
         | A::GrantRole { .. }
         | A::RevokeRole { .. }
         | A::GrantPrivilege { .. }
+        | A::DenyPrivilege { .. }
         | A::RevokePrivilege { .. }
         | A::AlterUserPassword { .. }
         | A::AlterUserStatus { .. }
@@ -3070,14 +3155,22 @@ fn show_roles(roles: &[crate::security::RoleListing]) -> AdminResult {
     }
 }
 
-/// Builds the `SHOW PRIVILEGES` result: `role` (string), `action` (string), `scope` (string).
+/// Builds the `SHOW PRIVILEGES` result: `role` (string), `access` (`"GRANTED"`/`"DENIED"`),
+/// `action` (string), `scope` (string). The `access` column distinguishes a granted privilege from
+/// an explicitly denied one (`rmp` #645).
 fn show_privileges(privs: &[crate::security::PrivilegeListing]) -> AdminResult {
-    let fields = vec!["role".to_owned(), "action".to_owned(), "scope".to_owned()];
+    let fields = vec![
+        "role".to_owned(),
+        "access".to_owned(),
+        "action".to_owned(),
+        "scope".to_owned(),
+    ];
     let rows = privs
         .iter()
         .map(|p| {
             vec![
                 Value::String(p.role.clone()),
+                Value::String(p.access.as_word().to_owned()),
                 Value::String(p.action.clone()),
                 Value::String(p.scope.clone()),
             ]
@@ -3570,9 +3663,33 @@ mod tests {
         );
         for row in &r.rows {
             assert_eq!(row.len(), 5);
-            // db.* + gds.* are all reader-safe → mode READ.
-            assert_eq!(row[3], Value::String("READ".to_owned()));
+            // Every procedure reports a valid mode (`READ` for reader-safe procedures, `WRITE` for
+            // the mutating `gds.*.write` / `gds.*.mutate` surface landed in rmp #643) and none works
+            // on the system database.
+            assert!(
+                matches!(&row[3], Value::String(m) if m == "READ" || m == "WRITE"),
+                "procedure mode must be READ or WRITE: {row:?}"
+            );
             assert_eq!(row[4], Value::Boolean(false));
+        }
+        // The read-only `db.*` built-ins are reader-safe (mode READ)...
+        let db_labels = r
+            .rows
+            .iter()
+            .find(|row| row[0] == Value::String("db.labels".to_owned()))
+            .expect("db.labels is a built-in");
+        assert_eq!(db_labels[3], Value::String("READ".to_owned()));
+        // ...while a `gds.*.write` procedure, if present, reports mode WRITE (rmp #643).
+        if let Some(gds_write) = r
+            .rows
+            .iter()
+            .find(|row| matches!(&row[0], Value::String(n) if n.ends_with(".write")))
+        {
+            assert_eq!(
+                gds_write[3],
+                Value::String("WRITE".to_owned()),
+                "a gds.*.write procedure must report mode WRITE: {gds_write:?}"
+            );
         }
     }
 
@@ -4693,6 +4810,7 @@ mod tests {
                     property: "ssn".to_owned(),
                 },
                 role: "reader".to_owned(),
+                mode: RevokeMode::Both,
             }
         );
         // Schema + Admin actions.
@@ -4712,6 +4830,48 @@ mod tests {
                 role: "dba".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn deny_and_revoke_mode_forms() {
+        // DENY <action> ON <scope> TO <role> (rmp #645).
+        assert_eq!(
+            cmd("DENY READ ON LABEL sales.Secret TO reader"),
+            AdminCommand::DenyPrivilege {
+                action: PrivAction::Read,
+                scope: PrivScope::Label {
+                    db: "sales".to_owned(),
+                    label: "Secret".to_owned(),
+                },
+                role: "reader".to_owned(),
+            }
+        );
+        // REVOKE GRANT / REVOKE DENY select the access sense; plain REVOKE removes both.
+        assert_eq!(
+            cmd("REVOKE GRANT WRITE ON GRAPH sales FROM writer"),
+            AdminCommand::RevokePrivilege {
+                action: PrivAction::Write,
+                scope: PrivScope::Graph {
+                    db: "sales".to_owned()
+                },
+                role: "writer".to_owned(),
+                mode: RevokeMode::GrantOnly,
+            }
+        );
+        assert_eq!(
+            cmd("revoke deny read on label sales.Secret from reader"),
+            AdminCommand::RevokePrivilege {
+                action: PrivAction::Read,
+                scope: PrivScope::Label {
+                    db: "sales".to_owned(),
+                    label: "Secret".to_owned(),
+                },
+                role: "reader".to_owned(),
+                mode: RevokeMode::DenyOnly,
+            }
+        );
+        // DENY ROLE is rejected (a role assignment is not a deniable privilege).
+        let _ = invalid("DENY ROLE reader TO alice");
     }
 
     #[test]

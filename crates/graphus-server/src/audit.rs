@@ -1028,6 +1028,7 @@ pub fn classify_admin(cmd: &crate::admin::AdminCommand) -> AuditClass {
         | A::GrantRole { .. }
         | A::RevokeRole { .. }
         | A::GrantPrivilege { .. }
+        | A::DenyPrivilege { .. }
         | A::RevokePrivilege { .. }
         | A::AlterUserPassword { .. }
         | A::AlterUserStatus { .. }
@@ -1072,6 +1073,7 @@ pub fn is_mutating_admin(cmd: &crate::admin::AdminCommand) -> bool {
             | A::GrantRole { .. }
             | A::RevokeRole { .. }
             | A::GrantPrivilege { .. }
+            | A::DenyPrivilege { .. }
             | A::RevokePrivilege { .. }
             | A::AlterUserPassword { .. }
             | A::AlterUserStatus { .. }
@@ -1141,15 +1143,33 @@ pub fn redact_admin_detail(cmd: &crate::admin::AdminCommand) -> String {
             priv_action_str(*action),
             priv_scope_str(scope)
         ),
-        A::RevokePrivilege {
+        A::DenyPrivilege {
             action,
             scope,
             role,
         } => format!(
-            "REVOKE {} ON {} FROM {role}",
+            "DENY {} ON {} TO {role}",
             priv_action_str(*action),
             priv_scope_str(scope)
         ),
+        A::RevokePrivilege {
+            action,
+            scope,
+            role,
+            mode,
+        } => {
+            use crate::admin::RevokeMode as M;
+            let sense = match mode {
+                M::Both => "",
+                M::GrantOnly => "GRANT ",
+                M::DenyOnly => "DENY ",
+            };
+            format!(
+                "REVOKE {sense}{} ON {} FROM {role}",
+                priv_action_str(*action),
+                priv_scope_str(scope)
+            )
+        }
         A::ShowUsers => "SHOW USERS".to_owned(),
         A::ShowRoles => "SHOW ROLES".to_owned(),
         A::ShowPrivileges => "SHOW PRIVILEGES".to_owned(),

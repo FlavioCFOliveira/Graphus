@@ -340,10 +340,13 @@ pub fn estimate_cost(op: &PhysicalOp, stats: Option<&dyn Statistics>) -> CostEst
         }
 
         // A quantified path pattern is a trail walk that compounds like a var-length expand: it fans
-        // out by `degree^(avg iterations)` per input row and pays one edge-cost per explored edge.
+        // out by `degree^(avg edges)` per input row and pays one edge-cost per explored edge. A
+        // multi-relationship interior traverses `1 + extra_hops.len()` edges per iteration, so the
+        // effective path length scales by the hops-per-iteration.
         PhysicalOp::QuantifiedPath {
             input,
             types,
+            extra_hops,
             min,
             max,
             ..
@@ -355,7 +358,8 @@ pub fn estimate_cost(op: &PhysicalOp, stats: Option<&dyn Statistics>) -> CostEst
                 max: *max,
                 exact: false,
             };
-            let rows = inner.rows * degree.powf(average_path_length(&range));
+            let hops_per_iter = (1 + extra_hops.len()) as f64;
+            let rows = inner.rows * degree.powf(average_path_length(&range) * hops_per_iter);
             CostEstimate::new(rows, inner.cost + rows * COST_EXPAND_EDGE)
         }
 
