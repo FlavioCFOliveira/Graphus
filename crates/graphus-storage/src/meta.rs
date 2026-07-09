@@ -299,13 +299,34 @@ pub enum ConstraintTypeDescriptor {
 impl ConstraintTypeDescriptor {
     /// The upper bound on [`Union`](Self::Union) members accepted by [`decode`](Self::decode). The
     /// closed property-type set is ~18 members, so a `u8` count (max 255) is generous while bounding a
-    /// crafted image's allocation.
-    const MAX_UNION_MEMBERS: usize = 255;
+    /// crafted image's allocation. **The write path MUST reject a descriptor exceeding this** (the DDL
+    /// parser in `graphus-server`) so nothing undecodable is ever persisted (`rmp` #652).
+    pub const MAX_UNION_MEMBERS: usize = 255;
 
-    /// The maximum descriptor nesting depth accepted by [`decode`](Self::decode). A Neo4j constraint
-    /// type nests at most `LIST<scalar>` inside a `union`, so `8` is far beyond any real declaration
-    /// while preventing a crafted image from exhausting the stack via nested `LIST`/`Union` tags.
-    const MAX_TYPE_DEPTH: usize = 8;
+    /// The maximum descriptor nesting depth accepted by [`decode`](Self::decode) — the storage-decode
+    /// depth of the deepest node (a top-level scalar is depth `0`; `LIST<scalar>` puts its element at
+    /// depth `1`; a `Union` puts each member one deeper). A Neo4j constraint type nests at most
+    /// `LIST<scalar>` inside a `union`, so `8` is far beyond any real declaration while preventing a
+    /// crafted image from exhausting the stack via nested `LIST`/`Union` tags. **The write path MUST
+    /// reject a descriptor whose [`storage_depth`](Self::storage_depth) exceeds this** (the DDL parser
+    /// in `graphus-server`) so a committed `CREATE CONSTRAINT` can never persist an image `decode`
+    /// rejects — which would leave the store unopenable (`rmp` #652).
+    pub const MAX_TYPE_DEPTH: usize = 8;
+
+    /// The maximum storage-decode depth of any node in this descriptor — the depth
+    /// [`decode`](Self::decode) reaches: a scalar is `0`, a [`List`](Self::List) is `1 +
+    /// inner.storage_depth()`, and a [`Union`](Self::Union) is `1 + max(member depth)`. The write path
+    /// (the DDL parser) rejects a descriptor whose value exceeds
+    /// [`MAX_TYPE_DEPTH`](Self::MAX_TYPE_DEPTH), guaranteeing every persisted descriptor round-trips
+    /// through [`decode`](Self::decode) (`rmp` #652).
+    #[must_use]
+    pub fn storage_depth(&self) -> usize {
+        match self {
+            Self::List(inner) => 1 + inner.storage_depth(),
+            Self::Union(members) => 1 + members.iter().map(Self::storage_depth).max().unwrap_or(0),
+            _ => 0,
+        }
+    }
 
     /// The single tag byte for this descriptor (`rmp` tasks #100, #652). For a [`List`](Self::List)
     /// this is just the list tag; its element descriptor is encoded separately by
@@ -2955,6 +2976,47 @@ mod tests {
             mk(K::PropertyType, Some(T::List(Box::new(T::Any)))),
         );
         assert_eq!(Statistics::decode(&s.encode()).unwrap(), s);
+    }
+
+    #[test]
+    fn constraint_type_descriptor_storage_depth_matches_decode_depth() {
+        use ConstraintTypeDescriptor as T;
+        // A scalar is depth 0; each LIST / Union level adds one; a union takes its deepest member.
+        assert_eq!(T::Integer.storage_depth(), 0);
+        assert_eq!(T::List(Box::new(T::Integer)).storage_depth(), 1);
+        assert_eq!(
+            T::List(Box::new(T::List(Box::new(T::Integer)))).storage_depth(),
+            2
+        );
+        assert_eq!(T::Union(vec![T::Integer, T::String]).storage_depth(), 1);
+        assert_eq!(
+            T::Union(vec![T::Integer, T::List(Box::new(T::Point))]).storage_depth(),
+            2
+        );
+        // A descriptor at exactly MAX_TYPE_DEPTH round-trips; storage_depth must agree so the write
+        // path's boundary matches the decoder's (`rmp` #652).
+        let mut deepest = T::Integer;
+        for _ in 0..T::MAX_TYPE_DEPTH {
+            deepest = T::List(Box::new(deepest));
+        }
+        assert_eq!(deepest.storage_depth(), T::MAX_TYPE_DEPTH);
+        let mut bytes = Vec::new();
+        deepest.encode(&mut bytes);
+        let mut cur = 0;
+        assert!(
+            T::decode(&bytes, &mut cur).is_ok(),
+            "a descriptor at storage_depth == MAX_TYPE_DEPTH must decode"
+        );
+        // One level deeper is exactly what the decoder rejects.
+        let over = T::List(Box::new(deepest));
+        assert_eq!(over.storage_depth(), T::MAX_TYPE_DEPTH + 1);
+        let mut bytes = Vec::new();
+        over.encode(&mut bytes);
+        let mut cur = 0;
+        assert!(
+            T::decode(&bytes, &mut cur).is_err(),
+            "a descriptor one level past MAX_TYPE_DEPTH must be rejected by decode"
+        );
     }
 
     #[test]

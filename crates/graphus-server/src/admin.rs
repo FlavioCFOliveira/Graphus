@@ -1634,24 +1634,54 @@ fn parse_constraint_type(
     use graphus_storage::ConstraintTypeDescriptor as T;
     // A `|`-separated closed union: parse one member, then greedily fold `| member` while a bare pipe
     // follows. A lone member collapses to itself (no `Union`), matching the expression type grammar.
-    let mut members = vec![parse_constraint_type_member(lex)?];
+    // The member count is capped at `MAX_UNION_MEMBERS` so the write path never produces a descriptor
+    // the durable decoder rejects (`rmp` #652 — an over-wide union would truncate on the `u8` wire
+    // count and mis-frame the meta image on reopen).
+    let mut members = vec![parse_constraint_type_member(lex, 0)?];
     while peek_symbol(lex, '|')? {
         expect_symbol(lex, '|', "CONSTRAINT")?;
-        members.push(parse_constraint_type_member(lex)?);
+        if members.len() >= T::MAX_UNION_MEMBERS {
+            return Err(format!(
+                "a constraint type union may not exceed {} members",
+                T::MAX_UNION_MEMBERS
+            ));
+        }
+        members.push(parse_constraint_type_member(lex, 0)?);
     }
-    Ok(if members.len() == 1 {
+    let descriptor = if members.len() == 1 {
         members.pop().expect("exactly one member")
     } else {
         T::Union(members)
-    })
+    };
+    // Reject a descriptor the durable decoder would reject on reopen (`rmp` #652). A union adds a
+    // nesting level over its members, so a union of an already-deep `LIST` can exceed the bound even
+    // though each member parsed within it. Enforcing the exact storage-decode depth on the write path
+    // guarantees a committed `CREATE CONSTRAINT` never persists an image that bricks the store.
+    if descriptor.storage_depth() > T::MAX_TYPE_DEPTH {
+        return Err(format!(
+            "a constraint type may not nest deeper than {} levels",
+            T::MAX_TYPE_DEPTH
+        ));
+    }
+    Ok(descriptor)
 }
 
-/// Parses a single union member of a constraint type: a scalar, or `LIST<inner [NOT NULL]>`.
+/// Parses a single union member of a constraint type: a scalar, or `LIST<inner [NOT NULL]>`. `depth`
+/// is the member's storage-decode nesting level (`0` at the top); it bounds `LIST` recursion at
+/// [`MAX_TYPE_DEPTH`](graphus_storage::ConstraintTypeDescriptor::MAX_TYPE_DEPTH) so a crafted
+/// `LIST<LIST<…>>` cannot overflow the parser stack (a DoS) nor build an image the decoder rejects.
 fn parse_constraint_type_member(
     lex: &mut Lexer<'_>,
+    depth: usize,
 ) -> Result<graphus_storage::ConstraintTypeDescriptor, String> {
     use graphus_storage::ConstraintTypeDescriptor as T;
     const VERB: &str = "CONSTRAINT";
+    if depth > T::MAX_TYPE_DEPTH {
+        return Err(format!(
+            "a constraint type may not nest deeper than {} levels",
+            T::MAX_TYPE_DEPTH
+        ));
+    }
     let tok = lex
         .next_tok()?
         .ok_or_else(|| "expected a type after IS :: in CONSTRAINT".to_owned())?;
@@ -1693,7 +1723,7 @@ fn parse_constraint_type_member(
         "LIST" | "ARRAY" => {
             // LIST < <element type> [NOT NULL] >
             expect_symbol(lex, '<', VERB)?;
-            let inner = parse_constraint_type_member(lex)?;
+            let inner = parse_constraint_type_member(lex, depth + 1)?;
             // A Neo4j constraint list element is `NOT NULL`; accept (and require nothing more than) the
             // optional qualifier — the value model already rejects a null element against a scalar.
             if peek_word_ci(lex, "NOT") {
@@ -4862,6 +4892,51 @@ mod tests {
         invalid("CREATE CONSTRAINT c FOR (n:E) REQUIRE n.p IS :: LOCAL WEIRD");
         // VECTOR property-type constraints are deferred (`rmp` #647).
         invalid("CREATE CONSTRAINT c FOR (n:E) REQUIRE n.p IS :: VECTOR<FLOAT>(3)");
+    }
+
+    #[test]
+    fn property_type_constraint_rejects_undecodable_depth_and_union_width() {
+        use graphus_storage::ConstraintTypeDescriptor as T;
+        // `rmp` #652 write-path guard: a descriptor the durable decoder would reject on reopen must be
+        // rejected at parse time, so a committed CREATE CONSTRAINT can never leave the store unopenable.
+
+        // A LIST nested exactly MAX_TYPE_DEPTH deep is the boundary and is accepted...
+        let ok = format!(
+            "CREATE CONSTRAINT c FOR (n:E) REQUIRE n.p IS :: {}INTEGER{}",
+            "LIST<".repeat(T::MAX_TYPE_DEPTH),
+            ">".repeat(T::MAX_TYPE_DEPTH),
+        );
+        assert!(
+            matches!(constraint_cmd(&ok), ConstraintCommand::Create(_)),
+            "a LIST nested MAX_TYPE_DEPTH deep must parse"
+        );
+        // ...one level deeper is rejected (would fail to decode on reopen / overflow the parser).
+        let too_deep = format!(
+            "CREATE CONSTRAINT c FOR (n:E) REQUIRE n.p IS :: {}INTEGER{}",
+            "LIST<".repeat(T::MAX_TYPE_DEPTH + 1),
+            ">".repeat(T::MAX_TYPE_DEPTH + 1),
+        );
+        invalid(&too_deep);
+        // A pathological deep nesting must not overflow the parser stack — it is a clean error.
+        let pathological = format!(
+            "CREATE CONSTRAINT c FOR (n:E) REQUIRE n.p IS :: {}INTEGER{}",
+            "LIST<".repeat(5000),
+            ">".repeat(5000),
+        );
+        invalid(&pathological);
+        // A union adds a nesting level: a union of a MAX_TYPE_DEPTH-deep LIST exceeds the bound.
+        let union_over_depth = format!(
+            "CREATE CONSTRAINT c FOR (n:E) REQUIRE n.p IS :: INTEGER | {}INTEGER{}",
+            "LIST<".repeat(T::MAX_TYPE_DEPTH),
+            ">".repeat(T::MAX_TYPE_DEPTH),
+        );
+        invalid(&union_over_depth);
+        // A union wider than MAX_UNION_MEMBERS is rejected (the durable count is a single byte).
+        let wide_union = format!(
+            "CREATE CONSTRAINT c FOR (n:E) REQUIRE n.p IS :: {}",
+            vec!["INTEGER"; T::MAX_UNION_MEMBERS + 1].join(" | "),
+        );
+        invalid(&wide_union);
     }
 
     #[test]
