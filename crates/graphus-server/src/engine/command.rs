@@ -210,6 +210,46 @@ pub enum IndexCommand {
     },
     /// `SHOW POINT INDEXES` (`rmp` task #98): lists every declared spatial index.
     ShowPointIndexes,
+    /// `CREATE INDEX [<name>] [IF NOT EXISTS] FOR ()-[r:<TYPE>]-() ON (r.<property>)` on
+    /// `(rel_type, property)` (`rmp` task #646): the relationship analogue of
+    /// [`CreateNodePropertyIndex`](Self::CreateNodePropertyIndex). Synchronously builds the index from
+    /// the existing relationships (ending `Online`). `name` is the requested server-unique name, or
+    /// [`None`] to auto-generate a deterministic one; `if_not_exists` makes a duplicate a no-op success.
+    CreateRelPropertyIndex {
+        /// The requested server-unique name, or [`None`] to auto-generate one.
+        name: Option<String>,
+        /// The relationship type the index is declared on.
+        rel_type: String,
+        /// The property key the index is declared on.
+        property: String,
+        /// Whether `IF NOT EXISTS` was given (a duplicate becomes a no-op success).
+        if_not_exists: bool,
+    },
+    /// `DROP INDEX <name> [IF EXISTS]` (by name) or `DROP INDEX FOR ()-[r:<TYPE>]-() ON (r.<property>)`
+    /// (by target) for a relationship-property index (`rmp` task #646). `if_exists` (by-name form only)
+    /// makes a missing index a no-op success.
+    DropRelPropertyIndex {
+        /// Which index to drop — by name or by covered `(rel_type, property)`.
+        index: RelPropertyIndexRef,
+        /// Whether `IF EXISTS` was given (a missing index becomes a no-op success).
+        if_exists: bool,
+    },
+}
+
+/// How a `DROP INDEX` identifies the relationship-property index to drop (`rmp` task #646): by its
+/// server-unique **name** (`DROP INDEX <name>`) or by its covered `(rel_type, property)` **target**
+/// (`DROP INDEX FOR ()-[r:T]-() ON (r.p)`). The relationship analogue of [`NodePropertyIndexRef`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelPropertyIndexRef {
+    /// `DROP INDEX <name>` — identify the index by its server-unique name.
+    Named(String),
+    /// `DROP INDEX FOR ()-[r:T]-() ON (r.p)` — identify by covered relationship type + property.
+    Target {
+        /// The covered relationship type.
+        rel_type: String,
+        /// The covered property key.
+        property: String,
+    },
 }
 
 /// The entity a constraint covers (`rmp` #638): a node label (the `FOR (n:Label)` pattern) or a
@@ -603,11 +643,13 @@ pub fn index_ddl_summary(command: &IndexCommand, mutated: bool) -> RunSummary {
             stats: Vec::new(),
         },
         IndexCommand::CreateNodePropertyIndex { .. }
+        | IndexCommand::CreateRelPropertyIndex { .. }
         | IndexCommand::CreateFulltextIndex { .. }
         | IndexCommand::CreatePointIndex { .. } => {
             schema_mutation_summary("indexes-added", mutated)
         }
         IndexCommand::DropNodePropertyIndex { .. }
+        | IndexCommand::DropRelPropertyIndex { .. }
         | IndexCommand::DropFulltextIndex { .. }
         | IndexCommand::DropPointIndex { .. } => {
             schema_mutation_summary("indexes-removed", mutated)

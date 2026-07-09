@@ -35,7 +35,7 @@ use graphus_index::bitmap::{self, BitmapIndex};
 use graphus_index::fulltext::{Analyzer, InvertedIndex, MatchSemantics};
 use graphus_index::recovery::SharedWal;
 use graphus_index::spatial::SpatialIndex;
-use graphus_index::{BTree, CompositeIndex, PropertyIndex, TokenIndex};
+use graphus_index::{BTree, CompositeIndex, PropertyIndex, RelPropertyIndex, TokenIndex};
 use graphus_io::MemBlockDevice;
 use graphus_storage::{ConstraintKind, ConstraintTypeDescriptor, IndexState};
 use graphus_wal::{DiscardingLogSink, WalManager};
@@ -93,6 +93,15 @@ pub struct IndexSet {
     /// [`online_node_properties`](Self::online_node_properties) so the planner never routes a seek to a
     /// half-built index — it falls back to a label-scan + filter until the index is promoted `Online`.
     node_props: HashMap<(u32, u32), NodePropertyIndex>,
+    /// Declared **relationship-property** indexes (`rmp` task #646), keyed by `(rel_type_token,
+    /// prop_key)`. The relationship analogue of [`node_props`](Self#structfield.node_props): each value
+    /// is the backing [`RelPropertyIndex`] (keyed internally on `(prop_key, property_value, rel_id)`)
+    /// plus its build [`IndexState`], mirrored from the durable catalog. Like every derived index the
+    /// backing tree is **ephemeral** (rebuilt from the store on open); only the *registration* is
+    /// durable. A `Populating` index is maintained (harmlessly) but withheld from
+    /// [`online_rel_properties`](Self::online_rel_properties) so the planner never routes a seek to a
+    /// half-built index.
+    rel_props: HashMap<(u32, u32), RelationshipPropertyIndex>,
     /// Declared **full-text** indexes (`rmp` task #72), keyed by their server-unique **name**. Each
     /// value carries the covered label, the covered property keys, the analyzer, the build state and
     /// the in-memory [`InvertedIndex`]. Like the property indexes the inverted index is **ephemeral**
@@ -231,6 +240,17 @@ struct NodePropertyIndex {
     state: IndexState,
 }
 
+/// A declared relationship-property index plus its durable build [`IndexState`] (`rmp` task #646) —
+/// the relationship analogue of [`NodePropertyIndex`].
+struct RelationshipPropertyIndex {
+    /// The backing in-memory relationship-property B+-tree (keyed `(prop_key, value, rel_id)`).
+    index: RelPropertyIndex<Dev, Sink>,
+    /// The build state, mirrored from the durable catalog. Only an [`IndexState::Online`] index is
+    /// surfaced to the planner / index-backed enforcement; a [`IndexState::Populating`] one is
+    /// maintained but not yet exposed.
+    state: IndexState,
+}
+
 /// A declared full-text index plus its build [`IndexState`] and the in-memory inverted index
 /// (`rmp` task #72). The `label_token` + `prop_keys` + `analyzer` mirror the durable catalog entry;
 /// the `index` is ephemeral (rebuilt from the store on open).
@@ -267,6 +287,7 @@ impl IndexSet {
         Self {
             labels: TokenIndex::new(fresh_tree()),
             node_props: HashMap::new(),
+            rel_props: HashMap::new(),
             fulltext: HashMap::new(),
             spatial: HashMap::new(),
             constraints: HashMap::new(),
@@ -522,6 +543,12 @@ impl IndexSet {
         for np in self.node_props.values_mut() {
             np.index = PropertyIndex::new(fresh_tree());
         }
+        // Relationship-property indexes (`rmp` task #646): recreate each backing tree to drop its
+        // entries while keeping the registered `(rel_type_token, prop_key)` set + state, exactly like
+        // the node-property indexes above.
+        for rp in self.rel_props.values_mut() {
+            rp.index = RelPropertyIndex::new(fresh_tree());
+        }
         // Full-text indexes: drop the inverted-index entries but keep the registration + state
         // (`rmp` task #72), mirroring the node-property handling.
         for ft in self.fulltext.values_mut() {
@@ -707,6 +734,135 @@ impl IndexSet {
             .node_props
             .iter()
             .filter(|(_, np)| np.state == IndexState::Online)
+            .map(|(&key, _)| key)
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    // ============================================================================================
+    // Relationship-property indexes (`rmp` task #646)
+    // ============================================================================================
+    // Structural twins of the node-property index methods above, keyed by `(rel_type_token, prop_key)`
+    // and backed by a `RelPropertyIndex`. Same candidate-vs-answer contract (a seek returns a superset
+    // the caller re-checks against the store) and the same state gating (only an `Online` index is
+    // surfaced to the planner / index-backed enforcement).
+
+    /// Declares a relationship-property index on `(type_token, prop_key)` at [`IndexState::Online`]
+    /// (`rmp` task #646). Idempotent: a no-op if one is already registered (its state is left
+    /// unchanged), otherwise creates the backing [`RelPropertyIndex`].
+    pub fn register_rel_property(&mut self, type_token: u32, prop_key: u32) {
+        self.register_rel_property_with_state(type_token, prop_key, IndexState::Online);
+    }
+
+    /// Declares a relationship-property index on `(type_token, prop_key)` at `state` (`rmp` task #646).
+    /// Idempotent on the key: if one is already registered its backing tree is kept but its state is
+    /// updated to `state` (so a recovered `Online` declaration promotes a freshly-created entry).
+    pub fn register_rel_property_with_state(
+        &mut self,
+        type_token: u32,
+        prop_key: u32,
+        state: IndexState,
+    ) {
+        self.rel_props
+            .entry((type_token, prop_key))
+            .and_modify(|rp| rp.state = state)
+            .or_insert_with(|| RelationshipPropertyIndex {
+                index: RelPropertyIndex::new(fresh_tree()),
+                state,
+            });
+    }
+
+    /// Sets the build [`IndexState`] of an already-registered `(type_token, prop_key)` rel index
+    /// (`rmp` task #646). A no-op if no such index is registered.
+    pub fn set_rel_property_state(&mut self, type_token: u32, prop_key: u32, state: IndexState) {
+        if let Some(rp) = self.rel_props.get_mut(&(type_token, prop_key)) {
+            rp.state = state;
+        }
+    }
+
+    /// Unregisters the relationship-property index on `(type_token, prop_key)`, dropping its backing
+    /// tree (`rmp` task #646, `DROP INDEX`). A no-op if no such index is registered.
+    pub fn unregister_rel_property(&mut self, type_token: u32, prop_key: u32) {
+        self.rel_props.remove(&(type_token, prop_key));
+    }
+
+    /// Whether a relationship-property index is registered for `(type_token, prop_key)` (in **any**
+    /// state) (`rmp` task #646).
+    #[must_use]
+    pub fn has_rel_property(&self, type_token: u32, prop_key: u32) -> bool {
+        self.rel_props.contains_key(&(type_token, prop_key))
+    }
+
+    /// Whether **any** relationship-property index is registered (`rmp` task #646) — an O(1) gate the
+    /// per-write maintenance path checks before decoding a relationship's property chain, so a store
+    /// with no rel index pays nothing for the maintenance hook.
+    #[must_use]
+    pub fn has_any_rel_property(&self) -> bool {
+        !self.rel_props.is_empty()
+    }
+
+    /// The build [`IndexState`] of the `(type_token, prop_key)` rel index, or [`None`] if unregistered
+    /// (`rmp` task #646).
+    #[must_use]
+    pub fn rel_property_state(&self, type_token: u32, prop_key: u32) -> Option<IndexState> {
+        self.rel_props
+            .get(&(type_token, prop_key))
+            .map(|rp| rp.state)
+    }
+
+    /// Records that relationship `rel_id` has `value` for the `(type_token, prop_key)` index, if such
+    /// an index is registered (else a no-op) (`rmp` task #646). Maintained regardless of state (a
+    /// `Populating` index is kept up to date, harmlessly). A `Null` value is unindexable and correctly
+    /// skipped — a `Null` property is absent for index purposes, matching the node-property handling.
+    pub fn insert_rel_property(
+        &mut self,
+        type_token: u32,
+        prop_key: u32,
+        value: &Value,
+        rel_id: u64,
+    ) {
+        if let Some(rp) = self.rel_props.get_mut(&(type_token, prop_key)) {
+            // in-memory index: a BTree op cannot fail in practice; an insert failure leaves the entry
+            // simply absent (the caller re-checks, so a missing candidate degrades to a full scan,
+            // never to a wrong answer).
+            let _ = rp.index.insert(EPHEMERAL_TXN, prop_key, value, rel_id);
+        }
+    }
+
+    /// Candidate relationship ids for `(type_token, prop_key) == value`, ascending (`rmp` task #646).
+    /// [`None`] if no such index is registered; otherwise a candidate set the caller re-checks
+    /// (visibility, current type, current value). `Some(vec![])` — "registered but no candidate" — is
+    /// distinct from `None`.
+    pub fn seek_rel_property_eq(
+        &mut self,
+        type_token: u32,
+        prop_key: u32,
+        value: &Value,
+    ) -> Option<Vec<u64>> {
+        let rp = self.rel_props.get_mut(&(type_token, prop_key))?;
+        Some(rp.index.seek_eq(prop_key, value).unwrap_or_default())
+    }
+
+    /// The registered relationship-property index keys `(type_token, prop_key)` in **any** state,
+    /// ascending and de-duplicated (`rmp` task #646). Used by the coordinator's index rebuild to decide
+    /// which relationship property values to index.
+    #[must_use]
+    pub fn registered_rel_properties(&self) -> Vec<(u32, u32)> {
+        let mut keys: Vec<(u32, u32)> = self.rel_props.keys().copied().collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// The **`Online`** relationship-property index keys `(type_token, prop_key)`, ascending and
+    /// de-duplicated (`rmp` task #646). Used to build the planner's relationship-property catalog and to
+    /// gate index-backed uniqueness enforcement: only an `Online` index may serve a seek.
+    #[must_use]
+    pub fn online_rel_properties(&self) -> Vec<(u32, u32)> {
+        let mut keys: Vec<(u32, u32)> = self
+            .rel_props
+            .iter()
+            .filter(|(_, rp)| rp.state == IndexState::Online)
             .map(|(&key, _)| key)
             .collect();
         keys.sort_unstable();

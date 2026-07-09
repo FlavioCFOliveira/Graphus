@@ -78,6 +78,21 @@ pub fn equivalent_index_exists(label: &str, property: &str) -> GraphusError {
     .into_error()
 }
 
+/// A `CREATE INDEX FOR ()-[r:TYPE]-() ON (r.property)` whose covered `(type, property)` is already
+/// indexed (`Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists`) (`rmp` task #646). The
+/// relationship analogue of [`equivalent_index_exists`], rendering the relationship pattern syntax.
+#[must_use]
+pub fn equivalent_rel_index_exists(rel_type: &str, property: &str) -> GraphusError {
+    SchemaRuleError {
+        code: CODE_EQUIVALENT_EXISTS,
+        message: format!(
+            "An equivalent index already exists for ()-[:{rel_type} {{{property}}}]-(). \
+             Use `IF NOT EXISTS` to make the create idempotent."
+        ),
+    }
+    .into_error()
+}
+
 /// A `CREATE INDEX <name>` whose `name` is already used by another index or constraint
 /// (`Neo.ClientError.Schema.IndexWithNameAlreadyExists`). Index/constraint names are unique across
 /// every schema catalog (`rmp` task #624).

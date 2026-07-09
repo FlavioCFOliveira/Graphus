@@ -1233,7 +1233,9 @@ fn priv_scope_str(scope: &crate::admin::PrivScope) -> String {
 /// (index DDL carries no secret). E.g. `"CREATE INDEX ON :Person(name)"`.
 #[must_use]
 pub fn redact_index_detail(cmd: &crate::engine::IndexCommand) -> String {
-    use crate::engine::{IndexCommand as I, NodePropertyIndexRef as Ref};
+    use crate::engine::{
+        IndexCommand as I, NodePropertyIndexRef as Ref, RelPropertyIndexRef as RelRef,
+    };
     match cmd {
         I::CreateNodePropertyIndex {
             name,
@@ -1251,6 +1253,27 @@ pub fn redact_index_detail(cmd: &crate::engine::IndexCommand) -> String {
                 Ref::Named(name) => format!("DROP INDEX {name}{if_e}"),
                 Ref::Target { label, property } => {
                     format!("DROP INDEX ON :{label}({property})")
+                }
+            }
+        }
+        // Relationship-property index DDL (`rmp` task #646) carries no secret either: the index name,
+        // relationship type and property key are all schema identifiers.
+        I::CreateRelPropertyIndex {
+            name,
+            rel_type,
+            property,
+            if_not_exists,
+        } => {
+            let named = name.as_deref().map(|n| format!("{n} ")).unwrap_or_default();
+            let if_ne = if *if_not_exists { " IF NOT EXISTS" } else { "" };
+            format!("CREATE INDEX {named}FOR ()-[r:{rel_type}]-() ON (r.{property}){if_ne}")
+        }
+        I::DropRelPropertyIndex { index, if_exists } => {
+            let if_e = if *if_exists { " IF EXISTS" } else { "" };
+            match index {
+                RelRef::Named(name) => format!("DROP INDEX {name}{if_e}"),
+                RelRef::Target { rel_type, property } => {
+                    format!("DROP INDEX FOR ()-[r:{rel_type}]-() ON (r.{property})")
                 }
             }
         }

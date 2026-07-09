@@ -512,6 +512,32 @@ pub struct Statistics {
     /// uniqueness rule is enforced by the Cypher layer at declaration time, not here. This map rides
     /// the **identical** durability lifecycle as the other catalogs.
     pub node_property_index_names: BTreeMap<String, (u32, u32)>,
+    /// The durable **relationship-property index catalog** (`rmp` task #646): the set of declared
+    /// relationship-property indexes and each one's build [`IndexState`], keyed by
+    /// `(rel_type_token, property_key_token)` — the relationship analogue of
+    /// [`node_property_indexes`](Self#structfield.node_property_indexes).
+    ///
+    /// Persisting this set is what makes a relationship-property index *registration* survive a crash:
+    /// the backing in-memory [`crate`]-external `RelPropertyIndex` is ephemeral (rebuilt from the store
+    /// on open, like the derived `IndexSet`), so without this map a recovered store had no record of
+    /// which relationship-property indexes existed and silently lost them. An entry is present **iff**
+    /// the index is declared; the value is its current build state. The covering token is a
+    /// **relationship-type** token (the [`RelType`](crate::tokens::Namespace::RelType) namespace), not a
+    /// label token — a numeric value it can share with a label token, so the two catalogs never mix.
+    /// The map rides the **identical** durability lifecycle as the other catalogs.
+    pub rel_property_indexes: BTreeMap<(u32, u32), IndexState>,
+    /// The durable **relationship-property index name catalog** (`rmp` task #646): the server-unique
+    /// **name** of each declared relationship-property index, keyed by name and mapping to the index's
+    /// covered `(rel_type_token, property_key_token)` — the relationship analogue of
+    /// [`node_property_index_names`](Self#structfield.node_property_index_names).
+    ///
+    /// An entry is present **iff** a name is recorded for that index; the target `(rel_type, property)`
+    /// **must** name a declared relationship-property index (the two are set and removed together),
+    /// which [`decode`](Self::decode) enforces. Names are globally unique across *all* schema catalogs
+    /// (node + relationship indexes, full-text, spatial, constraints) — the uniqueness rule is enforced
+    /// by the Cypher layer at declaration time, not here. This map rides the **identical** durability
+    /// lifecycle as the other catalogs.
+    pub rel_property_index_names: BTreeMap<String, (u32, u32)>,
 }
 
 impl Statistics {
@@ -795,6 +821,116 @@ impl Statistics {
             .collect()
     }
 
+    // ---- Relationship-property index catalog (`rmp` task #646) -------------------------------------
+    // Structural twins of the node-property index accessors above, keyed by
+    // `(rel_type_token, prop_token)` in a **separate** namespace so a numeric collision between a
+    // relationship-type token and a label token never mixes the two catalogs.
+
+    /// The durable build [`IndexState`] of the relationship-property index on
+    /// `(type_token, prop_token)`, or [`None`] if no such index is declared (`rmp` task #646).
+    #[must_use]
+    pub fn rel_property_index_state(&self, type_token: u32, prop_token: u32) -> Option<IndexState> {
+        self.rel_property_indexes
+            .get(&(type_token, prop_token))
+            .copied()
+    }
+
+    /// Declares (or updates the state of) the relationship-property index on `(type_token, prop_token)`
+    /// (`rmp` task #646). Idempotent on the key: re-recording flips the stored state.
+    pub(crate) fn set_rel_property_index(
+        &mut self,
+        type_token: u32,
+        prop_token: u32,
+        state: IndexState,
+    ) {
+        self.rel_property_indexes
+            .insert((type_token, prop_token), state);
+    }
+
+    /// Removes the relationship-property index on `(type_token, prop_token)`, if declared (`rmp` task
+    /// #646). Removing an absent entry is a harmless no-op.
+    pub(crate) fn remove_rel_property_index(&mut self, type_token: u32, prop_token: u32) {
+        self.rel_property_indexes.remove(&(type_token, prop_token));
+    }
+
+    /// Lists every declared relationship-property index as `(type_token, prop_token, state)`, ascending
+    /// by key (the [`BTreeMap`] order, deterministic) (`rmp` task #646).
+    #[must_use]
+    pub fn rel_property_indexes(&self) -> Vec<(u32, u32, IndexState)> {
+        self.rel_property_indexes
+            .iter()
+            .map(|(&(type_token, prop_token), &state)| (type_token, prop_token, state))
+            .collect()
+    }
+
+    /// The `(type_token, prop_token)` a named relationship-property index covers, or [`None`] if no
+    /// index of that name is declared (`rmp` task #646). The name → target resolver behind
+    /// `DROP INDEX <name>` and the global name-uniqueness check.
+    #[must_use]
+    pub fn rel_property_index_name(&self, name: &str) -> Option<(u32, u32)> {
+        self.rel_property_index_names.get(name).copied()
+    }
+
+    /// The declared **name** of the relationship-property index on `(type_token, prop_token)`, or
+    /// [`None`] if the index is nameless (`rmp` task #646). A linear scan of the (small) name map.
+    #[must_use]
+    pub fn rel_property_index_name_for(&self, type_token: u32, prop_token: u32) -> Option<&str> {
+        self.rel_property_index_names
+            .iter()
+            .find(|&(_, &target)| target == (type_token, prop_token))
+            .map(|(name, _)| name.as_str())
+    }
+
+    /// Records the name of the relationship-property index on `(type_token, prop_token)`, **enforcing
+    /// the one-name-per-target invariant** (`rmp` task #646). Global name uniqueness across catalogs is
+    /// the Cypher layer's responsibility; this is the durable write behind it. Mirrors
+    /// [`set_node_property_index_name`](Self::set_node_property_index_name) exactly (including its
+    /// debug-time decode-invariant mirror and its remove-any-prior-name-for-this-target write rule, so
+    /// a re-declare that computes a different name can never persist two names for one target — a state
+    /// [`decode`](Self::decode) rejects, which would leave the store unable to reopen).
+    pub(crate) fn set_rel_property_index_name(
+        &mut self,
+        name: String,
+        type_token: u32,
+        prop_token: u32,
+    ) {
+        debug_assert!(
+            self.rel_property_index_names
+                .get(&name)
+                .is_none_or(|&t| t == (type_token, prop_token)),
+            "rel index name {name:?} already maps to a different target than ({type_token}, {prop_token})"
+        );
+        self.remove_rel_property_index_name_for(type_token, prop_token);
+        self.rel_property_index_names
+            .insert(name, (type_token, prop_token));
+    }
+
+    /// Removes the name entry `name`, if present (`rmp` task #646). A harmless no-op when absent. Used
+    /// by `DROP INDEX <name>`.
+    pub(crate) fn remove_rel_property_index_name(&mut self, name: &str) {
+        self.rel_property_index_names.remove(name);
+    }
+
+    /// Removes whatever name maps to `(type_token, prop_token)`, if any (`rmp` task #646). Used by the
+    /// by-target `DROP INDEX FOR ()-[r:T]-() ON (r.p)` shape so the name entry is cleared alongside the
+    /// index. A no-op for a nameless index.
+    pub(crate) fn remove_rel_property_index_name_for(&mut self, type_token: u32, prop_token: u32) {
+        if let Some(name) = self.rel_property_index_name_for(type_token, prop_token) {
+            let name = name.to_owned();
+            self.rel_property_index_names.remove(&name);
+        }
+    }
+
+    /// Lists every named relationship-property index as `(name, type_token, prop_token)`, ascending by
+    /// name (the [`BTreeMap`] order, deterministic) (`rmp` task #646).
+    #[must_use]
+    pub fn rel_property_index_names(&self) -> Vec<(String, u32, u32)> {
+        self.rel_property_index_names
+            .iter()
+            .map(|(name, &(type_token, prop_token))| (name.clone(), type_token, prop_token))
+            .collect()
+    }
+
     /// The durable full-text index entry named `name`, or [`None`] if no such index is declared
     /// (`rmp` task #72).
     #[must_use]
@@ -907,9 +1043,12 @@ impl Statistics {
     /// by the same rule, so a pre-#100 image (ending after the constraint catalog) decodes with every
     /// constraint's `type_descriptor` left `None`. The node-property index **name** catalog (`rmp` task
     /// #623) is appended **after** the type-descriptor block by the same rule, so a pre-#623 image
-    /// decodes to an empty name catalog (every declared index nameless, backfilled on open). No
-    /// format-version byte is needed because every prior block is length-exact and self-describing, so
-    /// each parse position is unambiguous.
+    /// decodes to an empty name catalog (every declared index nameless, backfilled on open). The
+    /// relationship-property index catalog and its name catalog (`rmp` task #646) are appended **after**
+    /// the node-property index name catalog by the same rule (in that order), so a pre-#646 image
+    /// (ending after the node-property name catalog) decodes both to empty — no declared
+    /// relationship-property index. No format-version byte is needed because every prior block is
+    /// length-exact and self-describing, so each parse position is unambiguous.
     ///
     /// # Why the property-type descriptors are a *separate* trailing block (`rmp` task #100)
     ///
@@ -947,6 +1086,12 @@ impl Statistics {
         Self::encode_constraint_catalog(&mut out, &self.constraints);
         Self::encode_constraint_type_block(&mut out, &self.constraints);
         Self::encode_index_name_catalog(&mut out, &self.node_property_index_names);
+        // The relationship-property index catalog + its name catalog (`rmp` task #646), appended after
+        // every prior block by the same append-only rule, so a pre-#646 image (ending after the
+        // node-property index name catalog) decodes both to empty. Their wire layout is byte-identical
+        // to the node-property index catalog / name catalog, so the same encoders serve both.
+        Self::encode_index_catalog(&mut out, &self.rel_property_indexes);
+        Self::encode_index_name_catalog(&mut out, &self.rel_property_index_names);
         out
     }
 
@@ -1184,6 +1329,13 @@ impl Statistics {
         // anonymous index catalog: every name must target a declared index.
         let node_property_index_names =
             Self::decode_index_name_catalog(bytes, &mut cur, &node_property_indexes)?;
+        // Decode the trailing relationship-property index catalog + its name catalog (`rmp` task #646).
+        // A pre-#646 image ends after the node-property index name catalog, so both blocks decode empty
+        // via the shared decoders' end-of-input guard. The name catalog is validated against the
+        // relationship-property index catalog (every name must target a declared rel-property index).
+        let rel_property_indexes = Self::decode_index_catalog(bytes, &mut cur)?;
+        let rel_property_index_names =
+            Self::decode_index_name_catalog(bytes, &mut cur, &rel_property_indexes)?;
         Ok(Self {
             total_nodes,
             total_relationships,
@@ -1195,6 +1347,8 @@ impl Statistics {
             spatial_indexes,
             constraints,
             node_property_index_names,
+            rel_property_indexes,
+            rel_property_index_names,
         })
     }
 
@@ -2789,6 +2943,121 @@ mod tests {
         nb.extend_from_slice(&1u32.to_le_bytes()); // promises 1 entry
         nb.extend_from_slice(&2u32.to_le_bytes()); // name_len 2 ... but no name bytes follow
         assert!(Statistics::decode(&image_with_index_and_name_block((1, 2), &nb)).is_err());
+    }
+
+    #[test]
+    fn set_resolve_and_remove_rel_property_index_and_name() {
+        // The relationship-property index catalog (`rmp` task #646) is a structural twin of the
+        // node-property catalog, keyed by a separate `(rel_type_token, prop_token)` namespace.
+        let mut s = Statistics::new();
+        assert_eq!(s.rel_property_index_state(3, 4), None);
+        s.set_rel_property_index(3, 4, IndexState::Populating);
+        assert_eq!(
+            s.rel_property_index_state(3, 4),
+            Some(IndexState::Populating)
+        );
+        s.set_rel_property_index(3, 4, IndexState::Online); // idempotent on key: flips state
+        assert_eq!(s.rel_property_index_state(3, 4), Some(IndexState::Online));
+
+        // Name resolution both directions.
+        assert_eq!(s.rel_property_index_name("ix_rel"), None);
+        s.set_rel_property_index_name("ix_rel".to_owned(), 3, 4);
+        assert_eq!(s.rel_property_index_name("ix_rel"), Some((3, 4)));
+        assert_eq!(s.rel_property_index_name_for(3, 4), Some("ix_rel"));
+
+        // A relationship-type token can numerically coincide with a label token; the two catalogs are
+        // independent — declaring a NODE index on (3, 4) must not touch the REL index on (3, 4).
+        s.set_node_property_index(3, 4, IndexState::Online);
+        s.set_node_property_index_name("ix_node".to_owned(), 3, 4);
+        assert_eq!(s.rel_property_index_name("ix_node"), None);
+        assert_eq!(s.node_property_index_name("ix_rel"), None);
+        assert_eq!(
+            s.rel_property_indexes(),
+            vec![(3, 4, IndexState::Online)],
+            "the rel catalog holds exactly its own entry"
+        );
+
+        // Removal by target clears both the entry and its name.
+        s.remove_rel_property_index(3, 4);
+        s.remove_rel_property_index_name_for(3, 4);
+        assert_eq!(s.rel_property_index_state(3, 4), None);
+        assert!(s.rel_property_index_names.is_empty());
+        // The coincident node index is untouched.
+        assert_eq!(s.node_property_index_state(3, 4), Some(IndexState::Online));
+    }
+
+    #[test]
+    fn rel_property_index_catalog_round_trips_after_every_prior_block() {
+        // A rel-property catalog + name catalog round-trips, and rides AFTER the node-property name
+        // catalog (populate node + rel + a mix of counts/histograms/constraints to prove ordering).
+        let mut s = Statistics::new();
+        s.inc_label(4);
+        s.inc_rel_type(2);
+        s.set_property_histogram(0, 0, vec![9, 8, 7]);
+        s.set_node_property_index(1, 2, IndexState::Online);
+        s.set_node_property_index_name("ix_node".to_owned(), 1, 2);
+        s.set_rel_property_index(10, 20, IndexState::Online);
+        s.set_rel_property_index(11, 21, IndexState::Populating);
+        s.set_rel_property_index_name("ix_since".to_owned(), 10, 20);
+        // Leave (11, 21) nameless to prove a rel index may be anonymous.
+
+        let back = Statistics::decode(&s.encode()).unwrap();
+        assert_eq!(back, s);
+        assert_eq!(
+            back.rel_property_indexes(),
+            vec![
+                (10, 20, IndexState::Online),
+                (11, 21, IndexState::Populating)
+            ]
+        );
+        assert_eq!(back.rel_property_index_name("ix_since"), Some((10, 20)));
+        assert_eq!(back.rel_property_index_name_for(11, 21), None);
+    }
+
+    #[test]
+    fn statistics_decode_accepts_a_pre_task_646_image_as_empty_rel_catalog() {
+        // A pre-#646 image ends after the node-property index NAME catalog (no rel blocks). Encoding
+        // then truncating the two trailing empty (`0`-count) rel blocks yields a byte-exact pre-#646
+        // image: it must decode with an empty rel catalog while every earlier block survives intact.
+        let mut s = Statistics::new();
+        s.set_node_property_index(5, 6, IndexState::Online);
+        s.set_node_property_index_name("ix".to_owned(), 5, 6);
+        s.inc_label(5);
+        let mut bytes = s.encode();
+        // Drop the two trailing empty rel blocks (each a bare `0`-count u32): the byte-exact pre-#646
+        // image ends right after the node-property name catalog.
+        bytes.truncate(bytes.len() - 8);
+        let back = Statistics::decode(&bytes).unwrap();
+        assert_eq!(
+            back.node_property_indexes(),
+            vec![(5, 6, IndexState::Online)],
+            "the node index survives a pre-#646 read"
+        );
+        assert_eq!(back.node_property_index_name("ix"), Some((5, 6)));
+        assert!(
+            back.rel_property_indexes.is_empty() && back.rel_property_index_names.is_empty(),
+            "a pre-#646 image has no relationship-property indexes"
+        );
+        // Re-encoding appends the explicit (empty) rel blocks; the round-trip is then stable.
+        assert_eq!(Statistics::decode(&back.encode()).unwrap(), back);
+    }
+
+    #[test]
+    fn set_rel_property_index_name_enforces_one_name_per_target_and_reopens() {
+        // Write-path invariant twin of the node case: a second name for the same rel target REPLACES
+        // the first, so the durable image never holds two names for one target (which decode rejects).
+        let mut s = Statistics::new();
+        s.set_rel_property_index(1, 2, IndexState::Online);
+        s.set_rel_property_index_name("ix_a".to_owned(), 1, 2);
+        s.set_rel_property_index_name("ix_b".to_owned(), 1, 2); // same target -> replaces ix_a
+        assert_eq!(
+            s.rel_property_index_names(),
+            vec![("ix_b".to_owned(), 1, 2)]
+        );
+        assert_eq!(s.rel_property_index_name("ix_a"), None);
+        let back =
+            Statistics::decode(&s.encode()).expect("one-name-per-target rel image must reopen");
+        assert_eq!(back, s);
     }
 
     #[test]

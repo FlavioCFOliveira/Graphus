@@ -79,7 +79,7 @@ use graphus_index::histogram::PropertyHistogram;
 use graphus_index::keycodec::{encode_equality_canonical, encode_single};
 use graphus_index::kinds::DEFAULT_HISTOGRAM_BUCKETS;
 use graphus_io::BlockDevice;
-use graphus_storage::{ConstraintKind, MvccHeader, Namespace, RecordStore};
+use graphus_storage::{ConstraintKind, IndexState, MvccHeader, Namespace, RecordStore};
 use graphus_txn::{
     CommitRegistry, LockOutcome, LockTable, PredicateRead, Snapshot, SsiReadBuffer, SsiTracker,
     is_visible,
@@ -1032,6 +1032,37 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         }
     }
 
+    /// SIREAD-marks **every live relationship** as this transaction's predicate-read footprint
+    /// (`rmp` task #646) — the relationship analogue of [`mark_all_live_nodes`](Self::mark_all_live_nodes).
+    ///
+    /// The **index-backed** relationship-uniqueness check
+    /// ([`rel_unique_conflict`](Self::rel_unique_conflict)) examines only the index *candidates*, not
+    /// every relationship of the type; the scan it replaces re-read (and thus SIREAD-marked) every
+    /// relationship via [`rel_data`](GraphAccess::rel_data). Preserving that blanket footprint here
+    /// keeps SSI **exactly as strong** as the scan: a concurrent transaction that modifies an existing
+    /// relationship *into* the covered value (which the index seek would not surface for this snapshot)
+    /// still forms an rw-antidependency, so the write-skew is caught rather than silently permitting a
+    /// duplicate. Mirrors the node composite path's use of `mark_all_live_nodes`. A no-op with no SSI
+    /// tracker (standalone path); read errors are captured exactly as the scan would have.
+    fn mark_all_live_rels(&self) {
+        if self.ssi.is_none() {
+            return;
+        }
+        let store = self.store.borrow();
+        let ids = match store.scan_rel_ids() {
+            Ok(ids) => ids,
+            Err(e) => {
+                drop(store);
+                self.capture(e);
+                return;
+            }
+        };
+        drop(store);
+        for id in ids {
+            self.note_read(rel_ssi_key(id));
+        }
+    }
+
     /// Filters `ids` (a full-scan id list or an index candidate list) to the nodes that **currently**
     /// carry `token_id` and are **visible** to this snapshot, SIREAD-marking each examined id
     /// (`04 §5.3`/§5.4, `rmp` tasks #42/#45/#46). This is the one per-candidate filter shared by the
@@ -1269,6 +1300,60 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                         zones.record(label_token, prop_key, node.0, value);
                     }
                 }
+            }
+        }
+    }
+
+    /// (Re-)indexes relationship `rel`'s current property values into every registered
+    /// relationship-property index whose covered type it carries (`rmp` task #646) — the relationship
+    /// analogue of [`reindex_node`](Self::reindex_node), driven per relationship write (`create_rel`, a
+    /// standalone / bulk `set_rel_property`, `SET r = map`, `SET r += map`).
+    ///
+    /// Candidate-only, exactly like the node-property path: only the relationship's *current* value is
+    /// inserted (a seek re-checks visibility, current type and current value against the transaction
+    /// snapshot), so a value change leaves a stale entry the seek filters out — no removal hook is
+    /// needed, and a `Null` value is unindexable (absent for index purposes). A no-op on the standalone
+    /// path (no derived index) and when no relationship-property index is declared (the O(1)
+    /// [`has_any_rel_property`](crate::index_set::IndexSet::has_any_rel_property) gate avoids decoding
+    /// the property chain in that common case).
+    fn reindex_rel(&self, rel: RelId) {
+        let Some(index) = &self.index else {
+            return; // standalone path: no derived index to maintain.
+        };
+        // O(1) gate: nothing to maintain unless at least one rel-property index is declared.
+        if !index.borrow().has_any_rel_property() {
+            return;
+        }
+        // The relationship's current type token (store borrow released before the index borrow).
+        let type_token = {
+            let store = self.store.borrow();
+            match store.rel(rel.0) {
+                Ok(r) => r.type_id,
+                Err(_) => return, // cannot read the relationship: skip (a captured error already aborts).
+            }
+        };
+        // Resolve the relationship's current property values (newest-wins per key), keeping only the
+        // keys a registered index over this relationship's type covers, so the index borrow below never
+        // overlaps a store borrow.
+        let resolved: Vec<(u32, Value)> = {
+            let store = self.store.borrow();
+            let chain = match store.rel_property_values(rel.0) {
+                Ok(chain) => chain,
+                Err(_) => return, // a non-storable / read fault: skip this relationship's properties.
+            };
+            let mut out: Vec<(u32, Value)> = Vec::new();
+            for (_pid, key, value) in chain {
+                if out.iter().any(|(k, _)| *k == key) {
+                    continue; // newest-wins: keep only the first (head-most) occurrence per key.
+                }
+                out.push((key, value));
+            }
+            out
+        };
+        let mut index = index.borrow_mut();
+        for (prop_key, value) in &resolved {
+            if index.has_rel_property(type_token, *prop_key) {
+                index.insert_rel_property(type_token, *prop_key, value, rel.0);
             }
         }
     }
@@ -1615,6 +1700,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 }
                 ConstraintKind::RelUnique => {
                     let property_name = &property_names[0];
+                    let prop_key = rule.property_tokens[0];
                     let Some(value) = self
                         .rel_property(rel, property_name)
                         .filter(|v| !v.is_null())
@@ -1622,7 +1708,14 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                         continue;
                     };
                     if self
-                        .rel_unique_conflict(&type_name, property_name, &value, rel)
+                        .rel_unique_conflict(
+                            type_token,
+                            prop_key,
+                            &type_name,
+                            property_name,
+                            &value,
+                            rel,
+                        )
                         .is_some()
                     {
                         self.capture(
@@ -1682,37 +1775,114 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     }
 
     /// Finds **another** relationship of type `type_name`, visible to this transaction, whose current
-    /// value for `property` equals `value` by Cypher equality, excluding `self_rel` (`rmp` #638).
-    /// Scan-based (no relationship-property index): walks the relationships of the type and re-checks
-    /// each visible one. Returns the conflicting id, or [`None`].
+    /// value for `property` equals `value` by Cypher equality, excluding `self_rel` (`rmp` #638/#646).
+    ///
+    /// **Index-backed** via the relationship-property index on `(type_token, prop_key)` when an
+    /// [`IndexState::Online`] one is registered (a relationship uniqueness constraint registers one,
+    /// `rmp` task #646): candidate ids holding the same value are re-checked against the store
+    /// (visibility + current type + current value). With no usable index a full relationship scan +
+    /// per-relationship re-check is the (correct, slower) fallback. Either way every returned id is an
+    /// exact store-re-checked match, so the first one that is not `self_rel` is a genuine duplicate.
     fn rel_unique_conflict(
         &self,
+        type_token: u32,
+        prop_key: u32,
         type_name: &str,
         property: &str,
         value: &Value,
         self_rel: RelId,
     ) -> Option<u64> {
-        let ids = self.store.borrow().scan_rel_ids().ok()?;
-        for id in ids {
-            if id == self_rel.0 {
-                continue;
-            }
-            let r = RelId(id);
-            // Visible + of the covered type? `rel_data` returns `None` for a relationship not visible
-            // to this transaction's snapshot (and SIREAD-marks the examined relationship).
-            let Some(data) = self.rel_data(r) else {
-                continue;
-            };
-            if data.rel_type != type_name {
-                continue;
-            }
-            if let Some(v) = self.rel_property(r, property)
-                && crate::equality::equals(&v, value).is_true()
-            {
-                return Some(id);
-            }
+        let matches: Vec<u64> = self
+            .rel_index_seek_eq(type_token, prop_key, type_name, property, value)
+            .unwrap_or_else(|| self.rel_scan_eq(type_name, property, value));
+        matches.into_iter().find(|&id| id != self_rel.0)
+    }
+
+    /// Index-backed candidate relationship ids of type `type_name` whose current `property` equals
+    /// `value`, re-checked against the store (`rmp` task #646). [`None`] when no [`IndexState::Online`]
+    /// relationship-property index covers `(type_token, prop_key)` — the caller then falls back to
+    /// [`rel_scan_eq`](Self::rel_scan_eq).
+    ///
+    /// # Correctness — state gating and the preserved SSI footprint
+    ///
+    /// Only an **`Online`** index is used: a `Populating` (half-built) one returns a *subset* of the
+    /// true matches, which would MISS a conflict — a uniqueness bypass — so it declines to the scan.
+    /// The candidate seek examines only the relationships holding `value`, not every relationship of the
+    /// type the scan re-read; to keep serializability **exactly as strong** as the scan, this preserves
+    /// the scan's blanket SIREAD footprint via [`mark_all_live_rels`](Self::mark_all_live_rels) (so a
+    /// concurrent modify of an existing relationship *into* `value` — invisible to this snapshot's seek
+    /// — still forms an rw-antidependency). Each surviving candidate is additionally re-checked with
+    /// [`rel_data`](GraphAccess::rel_data), which SIREAD-marks it.
+    fn rel_index_seek_eq(
+        &self,
+        type_token: u32,
+        prop_key: u32,
+        type_name: &str,
+        property: &str,
+        value: &Value,
+    ) -> Option<Vec<u64>> {
+        let index = self.index.as_ref()?;
+        // Only an ONLINE index may serve enforcement (a Populating one is a subset → unsafe here).
+        if index.borrow().rel_property_state(type_token, prop_key) != Some(IndexState::Online) {
+            return None; // no usable index: scan fallback
         }
-        None
+        // Preserve the scan's SSI footprint so the index path is exactly as strong (see the method doc).
+        self.mark_all_live_rels();
+        // Candidate ids for `(type, prop) == value`; the index is candidate-only, so re-check the full
+        // predicate per candidate (visible + current type + current value equals `value`).
+        let candidates = index
+            .borrow_mut()
+            .seek_rel_property_eq(type_token, prop_key, value)
+            .unwrap_or_default();
+        let mut out: Vec<u64> = candidates
+            .into_iter()
+            .filter(|&id| {
+                let r = RelId(id);
+                match self.rel_data(r) {
+                    Some(data) if data.rel_type == type_name => self
+                        .rel_property(r, property)
+                        .is_some_and(|v| crate::equality::equals(&v, value).is_true()),
+                    _ => false,
+                }
+            })
+            .collect();
+        // De-duplicate: a stale + a live index entry can name the same id twice.
+        out.sort_unstable();
+        out.dedup();
+        Some(out)
+    }
+
+    /// Full relationship scan: every relationship of type `type_name`, visible to this transaction,
+    /// whose current `property` equals `value` by Cypher equality (`rmp` #638). The scan fallback for
+    /// [`rel_unique_conflict`](Self::rel_unique_conflict) when no relationship-property index is usable.
+    /// SIREAD-marks each examined relationship via [`rel_data`](GraphAccess::rel_data).
+    ///
+    /// A storage fault enumerating the relationships **fails closed**: the error is captured (aborting
+    /// the enclosing write before commit) rather than swallowed, so a uniqueness check that could not
+    /// complete never silently reports "no conflict" and admits a possible duplicate. The
+    /// index-accelerated path ([`mark_all_live_rels`](Self::mark_all_live_rels)) already fails closed
+    /// the same way; this keeps the fallback's ACID stance identical.
+    fn rel_scan_eq(&self, type_name: &str, property: &str, value: &Value) -> Vec<u64> {
+        let ids = match self.store.borrow().scan_rel_ids() {
+            Ok(ids) => ids,
+            Err(e) => {
+                self.capture(e);
+                return Vec::new();
+            }
+        };
+        ids.into_iter()
+            .filter(|&id| {
+                let r = RelId(id);
+                // Visible + of the covered type? `rel_data` returns `None` for a relationship not
+                // visible to this snapshot (and SIREAD-marks the examined relationship).
+                match self.rel_data(r) {
+                    Some(data) if data.rel_type == type_name => self
+                        .rel_property(r, property)
+                        .is_some_and(|v| crate::equality::equals(&v, value).is_true()),
+                    _ => false,
+                }
+            })
+            .collect()
     }
 
     /// Checks a relationship-key constraint for `rel` (`rmp` #638): the covered composite tuple of
@@ -3449,6 +3619,14 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             if !self.defer_constraint_check.get() {
                 self.enforce_constraints_for_rel(rel);
             }
+            // Index the relationship's now-current value into any registered relationship-property index
+            // (`rmp` task #646), so a subsequent seek / index-backed uniqueness check finds it. A removal
+            // (`SET r.p = null`, handled in the branch above) needs no reindex — dropping a key never
+            // adds a candidate, and the seek re-checks the store so a stale candidate is filtered out.
+            // Runs during `create_rel`'s property loop too (reindexing incrementally), which is why the
+            // final `enforce_constraints_for_rel` in `create_rel` sees the relationship's own entry (it
+            // is excluded by id in the conflict finder).
+            self.reindex_rel(rel);
         }
     }
 

@@ -105,7 +105,7 @@ use crate::config::ServerConfig;
 use crate::dbcatalog::{CatalogError, DatabaseCatalog, DbState, normalize_db_name};
 use crate::engine::{
     ConstraintCommand, ConstraintCreateKind, ConstraintEntity, CreateConstraint, EngineHandle,
-    IndexCommand, NodePropertyIndexRef, RunSummary,
+    IndexCommand, NodePropertyIndexRef, RelPropertyIndexRef, RunSummary,
 };
 use crate::security::{SecurityCatalog, SecurityError};
 
@@ -919,23 +919,57 @@ fn parse_claimed_typed_index(
     parse_claimed_index(verb, plural, lex)
 }
 
-/// Parses a `CREATE INDEX [<name>] [IF NOT EXISTS] <target>` tail (`rmp` task #624): an optional name,
-/// an optional `IF NOT EXISTS`, then the `FOR … ON …` or legacy `ON :Label(property)` target.
+/// The parsed target of an index DDL statement: a **node** label property (`FOR (n:Label) ON
+/// (n.property)` / legacy `ON :Label(property)`) or a **relationship** type property
+/// (`FOR ()-[r:TYPE]-() ON (r.property)`, `rmp` task #646). The entity selects the `IndexCommand`
+/// variant (node vs relationship) so a single target parser serves both CREATE and DROP.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IndexTarget {
+    /// A node-property index target `(label, property)`.
+    Node {
+        /// The covered node label.
+        label: String,
+        /// The covered property key.
+        property: String,
+    },
+    /// A relationship-property index target `(rel_type, property)` (`rmp` task #646).
+    Rel {
+        /// The covered relationship type.
+        rel_type: String,
+        /// The covered property key.
+        property: String,
+    },
+}
+
+/// Parses a `CREATE INDEX [<name>] [IF NOT EXISTS] <target>` tail (`rmp` tasks #624 / #646): an
+/// optional name, an optional `IF NOT EXISTS`, then the `FOR … ON …` (node **or** relationship) or
+/// legacy `ON :Label(property)` (node) target.
 fn parse_create_index(lex: &mut Lexer<'_>) -> Result<IndexCommand, String> {
     let name = parse_optional_index_name(lex)?;
     let if_not_exists = parse_optional_if(lex, /* with_not */ true)?;
-    let (label, property) = parse_index_target("CREATE", lex)?;
-    Ok(IndexCommand::CreateNodePropertyIndex {
-        name,
-        label,
-        property,
-        if_not_exists,
-    })
+    match parse_index_target("CREATE", lex)? {
+        IndexTarget::Node { label, property } => Ok(IndexCommand::CreateNodePropertyIndex {
+            name,
+            label,
+            property,
+            if_not_exists,
+        }),
+        IndexTarget::Rel { rel_type, property } => Ok(IndexCommand::CreateRelPropertyIndex {
+            name,
+            rel_type,
+            property,
+            if_not_exists,
+        }),
+    }
 }
 
-/// Parses a `DROP INDEX …` tail (`rmp` task #624): the by-**target** shape (`FOR …`/`ON …`) or the
-/// by-**name** shape (`<name> [IF EXISTS]`). A leading `FOR`/`ON` keyword selects the target shape;
-/// anything else is read as the index name.
+/// Parses a `DROP INDEX …` tail (`rmp` tasks #624 / #646): the by-**target** shape (`FOR …`/`ON …`,
+/// node or relationship) or the by-**name** shape (`<name> [IF EXISTS]`). A leading `FOR`/`ON` keyword
+/// selects the target shape; anything else is read as the index name.
+///
+/// A by-**name** drop resolves to the [`IndexCommand::DropNodePropertyIndex`] `Named` form regardless
+/// of the index kind: index names are globally unique across the node **and** relationship property
+/// index catalogs, and the engine resolves the name against either (`rmp` task #646).
 fn parse_drop_index(lex: &mut Lexer<'_>) -> Result<IndexCommand, String> {
     // Look ahead: a leading FOR/ON keyword is the by-target shape; otherwise it is a `DROP INDEX <name>`.
     let mut peek = Lexer {
@@ -946,13 +980,19 @@ fn parse_drop_index(lex: &mut Lexer<'_>) -> Result<IndexCommand, String> {
         Some(ref t) if is_keyword(t, "FOR") || is_keyword(t, "ON")
     );
     if by_target {
-        let (label, property) = parse_index_target("DROP", lex)?;
-        return Ok(IndexCommand::DropNodePropertyIndex {
-            index: NodePropertyIndexRef::Target { label, property },
-            if_exists: false,
-        });
+        return match parse_index_target("DROP", lex)? {
+            IndexTarget::Node { label, property } => Ok(IndexCommand::DropNodePropertyIndex {
+                index: NodePropertyIndexRef::Target { label, property },
+                if_exists: false,
+            }),
+            IndexTarget::Rel { rel_type, property } => Ok(IndexCommand::DropRelPropertyIndex {
+                index: RelPropertyIndexRef::Target { rel_type, property },
+                if_exists: false,
+            }),
+        };
     }
-    // By name: `DROP INDEX <name> [IF EXISTS]`.
+    // By name: `DROP INDEX <name> [IF EXISTS]`. The engine resolves the name across the node + rel
+    // property index catalogs (names are globally unique), so the node `Named` variant carries it.
     let name = expect_name(lex, "an index name or a FOR/ON target", "DROP")?;
     let if_exists = parse_optional_if(lex, /* with_not */ false)?;
     expect_end(lex, "DROP INDEX")?;
@@ -997,39 +1037,61 @@ fn parse_optional_index_name(lex: &mut Lexer<'_>) -> Result<Option<String>, Stri
 ///
 /// The leading keyword (`FOR` vs `ON`) disambiguates; anything else is a syntax error naming both
 /// accepted shapes.
-fn parse_index_target(verb: &str, lex: &mut Lexer<'_>) -> Result<(String, String), String> {
+fn parse_index_target(verb: &str, lex: &mut Lexer<'_>) -> Result<IndexTarget, String> {
     match lex.next_tok()? {
         Some(t) if is_keyword(&t, "FOR") => parse_index_for_on(verb, lex),
         Some(t) if is_keyword(&t, "ON") => parse_index_legacy_on(verb, lex),
         Some(other) => Err(unexpected(
             &other,
-            &format!("FOR (n:Label) ON (n.property) or ON :Label(property) after {verb} INDEX"),
+            &format!(
+                "FOR (n:Label) ON (n.property), FOR ()-[r:TYPE]-() ON (r.property) or \
+                 ON :Label(property) after {verb} INDEX"
+            ),
         )),
         None => Err(format!(
-            "expected FOR (n:Label) ON (n.property) or ON :Label(property) after {verb} INDEX"
+            "expected FOR (n:Label) ON (n.property), FOR ()-[r:TYPE]-() ON (r.property) or \
+             ON :Label(property) after {verb} INDEX"
         )),
     }
 }
 
-/// Parses the openCypher-9 `FOR (<var>:<Label>) ON (<var>.<property>)` tail (the `FOR` already
-/// consumed).
+/// Parses the openCypher-9 `FOR (<var>:<Label>) ON (<var>.<property>)` (node) **or**
+/// `FOR ()-[<var>:<TYPE>]-() ON (<var>.<property>)` (relationship, `rmp` task #646) tail (the `FOR`
+/// already consumed). The relationship form is detected by its leading empty node `()`.
 ///
 /// # Tokenization note
 ///
 /// The lexer treats `.` and `-` as word characters (so a hyphenated/dotted name is one token), so
 /// `n.property` lexes as a **single** [`Tok::Word`] (`"n.property"`), not `n` `.` `property`. We
 /// therefore read that one word and split it on the first `.` into `(variable, property)`. The
-/// `(n:Label)` part, by contrast, splits naturally because `:` is a symbol.
-fn parse_index_for_on(verb: &str, lex: &mut Lexer<'_>) -> Result<(String, String), String> {
-    // FOR ( <var> : <Label> )
+/// `(n:Label)` part, by contrast, splits naturally because `:` is a symbol. The lone dash of the
+/// relationship pattern lexes as the single word `"-"` — [`expect_dash`] consumes it; only the
+/// **undirected** form is accepted (a directed arrow `->`/`<-` is a syntax error, mirroring the
+/// constraint surface).
+fn parse_index_for_on(verb: &str, lex: &mut Lexer<'_>) -> Result<IndexTarget, String> {
+    // FOR ( … — a relationship-property index pattern opens with an empty node `()`.
     expect_symbol(lex, '(', verb)?;
-    // A relationship-property index pattern opens with an empty node `()` (`FOR ()-[r:TYPE]-()`);
-    // give a targeted message until a durable relationship-property index lands (`rmp` #638 follow-up).
     if peek_symbol(lex, ')')? {
-        return Err(
-            "relationship property indexes (FOR ()-[r:TYPE]-()) are not yet supported".to_owned(),
-        );
+        // FOR ()-[ <var> : <TYPE> ]-() ON ( <var>.<property> )  (`rmp` task #646)
+        expect_symbol(lex, ')', verb)?; // close the empty start node
+        expect_dash(lex, verb)?;
+        expect_symbol(lex, '[', verb)?;
+        let _var = expect_word(lex, "a variable", verb)?;
+        expect_symbol(lex, ':', verb)?;
+        let rel_type = expect_name(lex, "a relationship type", verb)?;
+        expect_symbol(lex, ']', verb)?;
+        expect_dash(lex, verb)?;
+        expect_symbol(lex, '(', verb)?;
+        expect_symbol(lex, ')', verb)?;
+        // ON ( <var>.<property> )
+        expect_keyword(lex, "ON", verb)?;
+        expect_symbol(lex, '(', verb)?;
+        let property = parse_property_ref(verb, lex)?;
+        expect_symbol(lex, ')', verb)?;
+        expect_end(lex, &format!("{verb} INDEX"))?;
+        return Ok(IndexTarget::Rel { rel_type, property });
     }
+    // FOR ( <var> : <Label> )
     let _var = expect_word(lex, "a variable", verb)?;
     expect_symbol(lex, ':', verb)?;
     let label = expect_name(lex, "a label", verb)?;
@@ -1040,7 +1102,7 @@ fn parse_index_for_on(verb: &str, lex: &mut Lexer<'_>) -> Result<(String, String
     let property = parse_property_ref(verb, lex)?;
     expect_symbol(lex, ')', verb)?;
     expect_end(lex, &format!("{verb} INDEX"))?;
-    Ok((label, property))
+    Ok(IndexTarget::Node { label, property })
 }
 
 /// Parses the `<var>.<property>` reference inside an openCypher `ON ( … )` clause.
@@ -1601,15 +1663,16 @@ fn peek_symbol(lex: &mut Lexer<'_>, sym: char) -> Result<bool, String> {
     Ok(matches!(peek.next_tok()?, Some(Tok::Symbol(c)) if c == sym))
 }
 
-/// Parses the legacy `ON :<Label>(<property>)` tail (the `ON` already consumed).
-fn parse_index_legacy_on(verb: &str, lex: &mut Lexer<'_>) -> Result<(String, String), String> {
+/// Parses the legacy `ON :<Label>(<property>)` (node-only) tail (the `ON` already consumed). There is
+/// no legacy relationship form, so this always yields an [`IndexTarget::Node`].
+fn parse_index_legacy_on(verb: &str, lex: &mut Lexer<'_>) -> Result<IndexTarget, String> {
     expect_symbol(lex, ':', verb)?;
     let label = expect_name(lex, "a label", verb)?;
     expect_symbol(lex, '(', verb)?;
     let property = expect_name(lex, "a property", verb)?;
     expect_symbol(lex, ')', verb)?;
     expect_end(lex, &format!("{verb} INDEX"))?;
-    Ok((label, property))
+    Ok(IndexTarget::Node { label, property })
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -4127,19 +4190,63 @@ mod tests {
     }
 
     #[test]
-    fn lookup_index_and_relationship_index_are_declined_with_a_clear_message() {
+    fn lookup_index_is_declined_with_a_clear_message() {
         // LOOKUP is implicit / always-on in Graphus.
         let msg = invalid("CREATE LOOKUP INDEX ix FOR (n) ON EACH labels(n)");
         assert!(msg.contains("LOOKUP index DDL is not supported"), "{msg}");
-        // Relationship-property indexes are not yet supported — for the plain and typed surfaces.
-        for q in [
-            "CREATE INDEX FOR ()-[r:KNOWS]-() ON (r.since)",
-            "CREATE RANGE INDEX ix FOR ()-[r:KNOWS]-() ON (r.since)",
-            "CREATE TEXT INDEX ix FOR ()-[r:KNOWS]-() ON (r.text)",
-        ] {
-            let msg = invalid(q);
-            assert!(msg.contains("relationship property indexes"), "{q}: {msg}");
-        }
+    }
+
+    #[test]
+    fn create_relationship_property_index_plain_named_and_if_not_exists() {
+        // Plain, anonymous relationship-property index (`rmp` task #646).
+        assert_eq!(
+            index_cmd("CREATE INDEX FOR ()-[r:KNOWS]-() ON (r.since)"),
+            IndexCommand::CreateRelPropertyIndex {
+                name: None,
+                rel_type: "KNOWS".to_owned(),
+                property: "since".to_owned(),
+                if_not_exists: false,
+            }
+        );
+        // Named + IF NOT EXISTS, mixed case around the pattern.
+        assert_eq!(
+            index_cmd("CREATE INDEX rel_ix IF NOT EXISTS FOR ()-[e:RATED]-() ON (e.stars)"),
+            IndexCommand::CreateRelPropertyIndex {
+                name: Some("rel_ix".to_owned()),
+                rel_type: "RATED".to_owned(),
+                property: "stars".to_owned(),
+                if_not_exists: true,
+            }
+        );
+        // The typed RANGE / TEXT surfaces accept the relationship form too (served by the same B-tree).
+        assert_eq!(
+            index_cmd("CREATE RANGE INDEX ix FOR ()-[r:KNOWS]-() ON (r.since)"),
+            IndexCommand::CreateRelPropertyIndex {
+                name: Some("ix".to_owned()),
+                rel_type: "KNOWS".to_owned(),
+                property: "since".to_owned(),
+                if_not_exists: false,
+            }
+        );
+    }
+
+    #[test]
+    fn drop_relationship_property_index_by_target_and_directed_is_rejected() {
+        assert_eq!(
+            index_cmd("DROP INDEX FOR ()-[r:KNOWS]-() ON (r.since)"),
+            IndexCommand::DropRelPropertyIndex {
+                index: RelPropertyIndexRef::Target {
+                    rel_type: "KNOWS".to_owned(),
+                    property: "since".to_owned(),
+                },
+                if_exists: false,
+            }
+        );
+        // A directed relationship pattern is a syntax error (only the undirected form is accepted).
+        assert!(
+            !invalid("CREATE INDEX FOR ()-[r:KNOWS]->() ON (r.since)").is_empty(),
+            "a directed rel pattern must be rejected"
+        );
     }
 
     #[test]

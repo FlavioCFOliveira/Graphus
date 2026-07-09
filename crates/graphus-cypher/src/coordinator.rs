@@ -60,7 +60,7 @@ use crate::index_set::IndexSet;
 use crate::record_graph::RecordStoreGraph;
 use crate::schema_error::{
     constraint_name_in_use, equivalent_constraint_exists, equivalent_index_exists,
-    index_drop_not_found, index_name_in_use,
+    equivalent_rel_index_exists, index_drop_not_found, index_name_in_use,
 };
 use crate::statistics::Statistics;
 use crate::store_statistics;
@@ -342,12 +342,27 @@ fn sanitize_identifier(s: &str) -> String {
 enum NameCatalog {
     /// The node-property index name catalog.
     NodeProperty,
+    /// The relationship-property index name catalog (`rmp` task #646).
+    RelProperty,
     /// The full-text index catalog.
     Fulltext,
     /// The spatial (point) index catalog.
     Spatial,
     /// The constraint catalog.
     Constraint,
+}
+
+/// A deterministic auto-name for the relationship-property index on `(rel_type, property)`
+/// (`rmp` task #646) — the relationship analogue of [`auto_index_name`]. A distinct `rel_index_`
+/// prefix keeps a rel index's auto-name from ever colliding with a node index's auto-name over the
+/// same identifiers (they live in the one global name namespace).
+#[must_use]
+pub fn auto_rel_index_name(rel_type: &str, property: &str) -> String {
+    format!(
+        "rel_index_{}_{}",
+        sanitize_identifier(rel_type),
+        sanitize_identifier(property)
+    )
 }
 
 impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
@@ -630,6 +645,17 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             }
         }
 
+        // Recover the durable relationship-property index catalog (`rmp` task #646) the same way: a
+        // fresh coordinator over a recovered store re-registers exactly the rel-property indexes that
+        // were committed, so their backing trees are repopulated by the rel scan below.
+        let durable_rel: Vec<(u32, u32, IndexState)> = store.borrow().rel_property_indexes();
+        {
+            let mut idx = index.borrow_mut();
+            for (type_token, prop_key, state) in durable_rel {
+                idx.register_rel_property_with_state(type_token, prop_key, state);
+            }
+        }
+
         // Recover the durable full-text index catalog (`rmp` task #72) the same way: register each
         // declared index in the in-memory set (analyzer + covered label/properties), so the rebuild
         // scan below populates its inverted index. An entry whose analyzer byte is unknown
@@ -701,11 +727,24 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     ConstraintKind::NodeKey => {
                         idx.register_composite(entry.label_token, entry.property_tokens.clone());
                     }
-                    // No backing index: pure per-node predicates, and every relationship constraint
-                    // (`rmp` #638, scan-based enforcement).
+                    ConstraintKind::RelUnique => {
+                        // A relationship uniqueness constraint (`rmp` #638) is backed by a
+                        // relationship-property index on its single `(type, property)` (`rmp` task #646),
+                        // so the write-time duplicate check is index-accelerated after a crash (the rel
+                        // scan below repopulates it). The covering token is a relationship-**type** token.
+                        if let [prop_key] = entry.property_tokens.as_slice() {
+                            idx.register_rel_property_with_state(
+                                entry.label_token,
+                                *prop_key,
+                                IndexState::Online,
+                            );
+                        }
+                    }
+                    // No backing index: pure per-entity predicates, plus RelKey / RelPropertyType which
+                    // stay scan-based (a relationship COMPOSITE index is deferred; RelPropertyType is a
+                    // pure per-relationship predicate).
                     ConstraintKind::Existence
                     | ConstraintKind::PropertyType
-                    | ConstraintKind::RelUnique
                     | ConstraintKind::RelExistence
                     | ConstraintKind::RelKey
                     | ConstraintKind::RelPropertyType => {}
@@ -763,6 +802,24 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             }
         }
 
+        // Repopulate the relationship-property indexes (`rmp` task #646) from a relationship scan — but
+        // only when at least one is declared, so a store with no rel index pays nothing for the extra
+        // walk. Captured before the scan so the index is not borrowed across a store borrow.
+        let registered_rel: Vec<(u32, u32)> = index.borrow().registered_rel_properties();
+        // A store-read fault enumerating the relationships leaves the rel indexes empty-but-`Online`.
+        // This matches the certified node-property rebuild's trust-once-selected behaviour: storage
+        // faults in Graphus are persistent (checksum / torn page), and both the index seek and the scan
+        // fallback read the SAME store, so they fault identically — an empty index never diverges from a
+        // scan in practice. (A whole-scan fault here is also the same failure the very next query would
+        // hit.) Per-relationship read faults inside `index_one_rel` skip that relationship best-effort.
+        if !registered_rel.is_empty()
+            && let Ok(rel_ids) = store.borrow().scan_rel_ids()
+        {
+            for id in rel_ids {
+                Self::index_one_rel(store, index, id, &registered_rel);
+            }
+        }
+
         // Reset the cross-snapshot full-text/spatial freshness marker (`rmp` task #467). The rebuild
         // above re-inserted every full-text/spatial posting via the instrumented mutation methods,
         // which raised the transient dirty flag (and, on the recovery/DDL paths, may have to clear a
@@ -779,6 +836,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// predicate a named `CREATE INDEX` consults before recording its name.
     fn name_in_use(store: &RecordStore<D, S>, name: &str) -> bool {
         store.node_property_index_name(name).is_some()
+            || store.rel_property_index_name(name).is_some()
             || store.fulltext_index(name).is_some()
             || store.spatial_index(name).is_some()
             || store.constraint(name).is_some()
@@ -789,6 +847,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// catalog's own re-declare (replace) semantics for a name it already owns.
     fn name_used_by_other_catalog(store: &RecordStore<D, S>, name: &str, own: NameCatalog) -> bool {
         (own != NameCatalog::NodeProperty && store.node_property_index_name(name).is_some())
+            || (own != NameCatalog::RelProperty && store.rel_property_index_name(name).is_some())
             || (own != NameCatalog::Fulltext && store.fulltext_index(name).is_some())
             || (own != NameCatalog::Spatial && store.spatial_index(name).is_some())
             || (own != NameCatalog::Constraint && store.constraint(name).is_some())
@@ -843,6 +902,56 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         loop {
             let candidate = format!("{suffixed}_{n}");
             if !Self::name_used_by_other_target(store, &candidate, label_token, prop_token) {
+                return candidate;
+            }
+            n += 1;
+        }
+    }
+
+    /// Whether `name` is used by any schema rule **other than** the relationship-property index on
+    /// `(type_token, prop_token)` (`rmp` task #646) — the relationship analogue of
+    /// [`name_used_by_other_target`](Self::name_used_by_other_target). Keeps a rel index's auto-name
+    /// idempotent (recomputing an index's own name is not a collision).
+    fn rel_name_used_by_other_target(
+        store: &RecordStore<D, S>,
+        name: &str,
+        type_token: u32,
+        prop_token: u32,
+    ) -> bool {
+        store.node_property_index_name(name).is_some()
+            || store.fulltext_index(name).is_some()
+            || store.spatial_index(name).is_some()
+            || store.constraint(name).is_some()
+            || matches!(
+                store.rel_property_index_name(name),
+                Some(target) if target != (type_token, prop_token)
+            )
+    }
+
+    /// A globally-unique, deterministic auto-name for the relationship-property index on
+    /// `(rel_type, property)` (`rmp` task #646) — the relationship analogue of
+    /// [`unique_auto_index_name`](Self::unique_auto_index_name). Returns the [`auto_rel_index_name`]
+    /// base when free (or already owned by this same index), else the deterministic token-suffixed form,
+    /// then a numeric counter — always verifying the candidate is free of *other* schema rules.
+    fn unique_auto_rel_index_name(
+        store: &RecordStore<D, S>,
+        rel_type: &str,
+        property: &str,
+        type_token: u32,
+        prop_token: u32,
+    ) -> String {
+        let base = auto_rel_index_name(rel_type, property);
+        if !Self::rel_name_used_by_other_target(store, &base, type_token, prop_token) {
+            return base;
+        }
+        let suffixed = format!("{base}_{type_token}_{prop_token}");
+        if !Self::rel_name_used_by_other_target(store, &suffixed, type_token, prop_token) {
+            return suffixed;
+        }
+        let mut n: u64 = 2;
+        loop {
+            let candidate = format!("{suffixed}_{n}");
+            if !Self::rel_name_used_by_other_target(store, &candidate, type_token, prop_token) {
                 return candidate;
             }
             n += 1;
@@ -965,6 +1074,58 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     index.insert_node_property(lt, *prop_key, value, id);
                 }
             }
+        }
+    }
+
+    /// Inserts relationship `id`'s current property values into every registered relationship-property
+    /// index whose covered type it carries (`rmp` task #646) — the relationship analogue of
+    /// [`index_one_node`](Self::index_one_node). Candidate-only, exactly like the node path: only the
+    /// current value is inserted (a seek re-checks visibility, current type and current value), so no
+    /// stale-entry removal is needed. Store and index are borrowed in separate, non-overlapping scopes
+    /// (the file's borrow discipline); a read fault skips this relationship best-effort.
+    fn index_one_rel(
+        store: &Rc<RefCell<RecordStore<D, S>>>,
+        index: &Rc<RefCell<IndexSet>>,
+        id: u64,
+        registered: &[(u32, u32)],
+    ) {
+        // The relationship's current type token (store borrow, released before the index borrow).
+        let type_token = match store.borrow().rel(id) {
+            Ok(r) => r.type_id,
+            Err(_) => return, // read fault: skip this relationship's entries.
+        };
+        // Nothing registered for this type ⇒ nothing to index (avoid the property-chain decode).
+        if !registered
+            .iter()
+            .any(|&(reg_type, _)| reg_type == type_token)
+        {
+            return;
+        }
+
+        // Resolve the relationship's current property values (newest-wins per key), keeping only the
+        // keys a registered index over this relationship's type uses.
+        let mut values: Vec<(u32, graphus_core::Value)> = Vec::new();
+        {
+            let chain = match store.borrow().rel_property_values(id) {
+                Ok(chain) => chain,
+                Err(_) => return, // a non-storable / read fault: skip this relationship's properties.
+            };
+            for (_pid, key, value) in chain {
+                if values.iter().any(|(k, _)| *k == key) {
+                    continue; // newest-wins: keep only the first (head-most) occurrence per key.
+                }
+                let used = registered
+                    .iter()
+                    .any(|&(reg_type, prop_key)| reg_type == type_token && prop_key == key);
+                if used {
+                    values.push((key, value));
+                }
+            }
+        }
+
+        let mut index = index.borrow_mut();
+        for (prop_key, value) in &values {
+            index.insert_rel_property(type_token, *prop_key, value, id);
         }
     }
 
@@ -1244,6 +1405,245 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         );
         Self::rebuild_index(&self.store, &self.index);
         Ok(())
+    }
+
+    /// Declares a **relationship-property index** named `name` (or an auto-generated name) over
+    /// `(rel_type, property)`, durably records it, and **synchronously builds** it from the existing
+    /// relationships (`rmp` task #646) — the relationship analogue of
+    /// [`create_node_property_index`](Self::create_node_property_index), plus the named / `IF NOT EXISTS`
+    /// surface. Because the build is synchronous, a successful create ends [`IndexState::Online`].
+    ///
+    /// Returns whether an index was **actually created** (`true`) or the call was an idempotent
+    /// `IF NOT EXISTS` no-op (`false`) — the executor turns `false` into a `0` `indexes-added` counter
+    /// (Neo4j-conformant idempotent-DDL summary).
+    ///
+    /// # Errors
+    /// - `Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists` (no `IF NOT EXISTS`) when an
+    ///   equivalent index on `(rel_type, property)` already exists;
+    /// - `Neo.ClientError.Schema.IndexWithNameAlreadyExists` (no `IF NOT EXISTS`) when `name` is already
+    ///   taken by another schema rule;
+    /// - a storage error if interning a token, recording the catalog entry, or committing fails. On any
+    ///   error the index is left undeclared.
+    pub fn create_rel_property_index_named(
+        &mut self,
+        name: Option<&str>,
+        rel_type: &str,
+        property: &str,
+        if_not_exists: bool,
+    ) -> Result<bool> {
+        // 1. Equivalent-index check (read-only, by token *lookup* — an absent token means no index).
+        let equivalent_exists = {
+            let store = self.store.borrow();
+            matches!(
+                (
+                    store.token_id(Namespace::RelType, rel_type),
+                    store.token_id(Namespace::PropKey, property),
+                ),
+                (Some(tt), Some(pk)) if store.rel_property_index_state(tt, pk).is_some()
+            )
+        };
+        if equivalent_exists {
+            return if if_not_exists {
+                Ok(false)
+            } else {
+                Err(equivalent_rel_index_exists(rel_type, property))
+            };
+        }
+
+        // 2. Explicit-name global uniqueness (read-only). An omitted name is auto-generated in step 3
+        //    (it needs the interned tokens for its deterministic collision suffix).
+        if let Some(n) = name
+            && Self::name_in_use(&self.store.borrow(), n)
+        {
+            return if if_not_exists {
+                Ok(false)
+            } else {
+                Err(index_name_in_use(n))
+            };
+        }
+
+        // 3. Intern the tokens and record the durable catalog entry (`Online`) + its name, in one
+        //    committed transaction — so the schema change (tokens + registration) survives a crash
+        //    atomically even if no relationship yet uses them.
+        self.next_txn_id += 1;
+        let txn = TxnId(self.next_txn_id);
+        self.store.borrow_mut().begin(txn);
+        let (type_token, prop_key) = {
+            let mut store = self.store.borrow_mut();
+            let type_token = match store.intern_token(Namespace::RelType, rel_type) {
+                Ok(t) => t,
+                Err(e) => {
+                    drop(store);
+                    let _ = self.store.borrow_mut().rollback(txn);
+                    return Err(e);
+                }
+            };
+            let prop_key = match store.intern_token(Namespace::PropKey, property) {
+                Ok(t) => t,
+                Err(e) => {
+                    drop(store);
+                    let _ = self.store.borrow_mut().rollback(txn);
+                    return Err(e);
+                }
+            };
+            let effective_name = match name {
+                Some(n) => n.to_owned(),
+                None => Self::unique_auto_rel_index_name(
+                    &store, rel_type, property, type_token, prop_key,
+                ),
+            };
+            store.set_rel_property_index(type_token, prop_key, IndexState::Online);
+            store.set_rel_property_index_name(effective_name, type_token, prop_key);
+            (type_token, prop_key)
+        };
+        self.store.borrow_mut().commit(txn)?;
+
+        // Register the index `Online` in the in-memory set and (re)build it so existing relationships
+        // are indexed. The durable catalog and the in-memory set now agree.
+        self.index.borrow_mut().register_rel_property_with_state(
+            type_token,
+            prop_key,
+            IndexState::Online,
+        );
+        Self::rebuild_index(&self.store, &self.index);
+        Ok(true)
+    }
+
+    /// Drops the relationship-property index covering `(rel_type, property)` (`rmp` task #646), the
+    /// by-**target** `DROP INDEX FOR ()-[r:T]-() ON (r.p)` surface. Idempotent: a no-op success on a
+    /// missing target. Removes the durable catalog + name entries in one committed transaction and
+    /// unregisters the index from the in-memory [`IndexSet`].
+    ///
+    /// Returns whether an index was **actually removed** (`true`) or the call was a no-op (`false`).
+    ///
+    /// # Errors
+    /// Returns a storage error if the committing transaction fails.
+    pub fn drop_rel_property_index(&mut self, rel_type: &str, property: &str) -> Result<bool> {
+        let tokens = {
+            let store = self.store.borrow();
+            match (
+                store.token_id(Namespace::RelType, rel_type),
+                store.token_id(Namespace::PropKey, property),
+            ) {
+                (Some(type_token), Some(prop_key))
+                    if store
+                        .rel_property_index_state(type_token, prop_key)
+                        .is_some() =>
+                {
+                    Some((type_token, prop_key))
+                }
+                _ => None,
+            }
+        };
+        let Some((type_token, prop_key)) = tokens else {
+            return Ok(false); // no such index → clean no-op, nothing removed.
+        };
+
+        self.next_txn_id += 1;
+        let txn = TxnId(self.next_txn_id);
+        self.store.borrow_mut().begin(txn);
+        {
+            let mut store = self.store.borrow_mut();
+            store.remove_rel_property_index(type_token, prop_key);
+            store.remove_rel_property_index_name_for(type_token, prop_key);
+        }
+        self.store.borrow_mut().commit(txn)?;
+
+        self.index
+            .borrow_mut()
+            .unregister_rel_property(type_token, prop_key);
+        Ok(true)
+    }
+
+    /// Drops the relationship-property index named `name` (`rmp` task #646), the `DROP INDEX <name>`
+    /// surface: resolves the name to its covered `(rel_type, property)`, removes the durable catalog +
+    /// name entries in one committed transaction, and unregisters it from the in-memory [`IndexSet`].
+    ///
+    /// `if_exists` controls the missing-name case: `true` makes a never-declared name a clean no-op
+    /// success; `false` returns `Neo.ClientError.Schema.IndexDropFailed`.
+    ///
+    /// Returns whether an index was **actually removed** (`true`) or the call was a no-op (`false`).
+    ///
+    /// # Errors
+    /// - `Neo.ClientError.Schema.IndexDropFailed` (no `IF EXISTS`) when no index of that name exists;
+    /// - a storage error if the committing transaction fails.
+    pub fn drop_rel_property_index_by_name(&mut self, name: &str, if_exists: bool) -> Result<bool> {
+        let target = self.store.borrow().rel_property_index_name(name);
+        let Some((type_token, prop_key)) = target else {
+            return if if_exists {
+                Ok(false)
+            } else {
+                Err(index_drop_not_found(name))
+            };
+        };
+
+        self.next_txn_id += 1;
+        let txn = TxnId(self.next_txn_id);
+        self.store.borrow_mut().begin(txn);
+        {
+            let mut store = self.store.borrow_mut();
+            store.remove_rel_property_index(type_token, prop_key);
+            store.remove_rel_property_index_name(name);
+        }
+        self.store.borrow_mut().commit(txn)?;
+
+        self.index
+            .borrow_mut()
+            .unregister_rel_property(type_token, prop_key);
+        Ok(true)
+    }
+
+    /// Drops the property index named `name` — resolving it against the **node** property index
+    /// catalog first, then the **relationship** property index catalog (`rmp` task #646). Index names
+    /// are globally unique across both catalogs, so at most one matches. This backs the `DROP INDEX
+    /// <name>` surface, which does not spell the index kind.
+    ///
+    /// `if_exists` controls the missing-name case: `true` makes a never-declared name a clean no-op
+    /// success; `false` returns `Neo.ClientError.Schema.IndexDropFailed`.
+    ///
+    /// Returns whether an index was **actually removed** (`true`) or the call was a no-op (`false`).
+    ///
+    /// # Errors
+    /// - `Neo.ClientError.Schema.IndexDropFailed` (no `IF EXISTS`) when no index of that name exists;
+    /// - a storage error if the committing transaction fails.
+    pub fn drop_property_index_by_name(&mut self, name: &str, if_exists: bool) -> Result<bool> {
+        // A node-property index of that name? (Its resolver already handles the missing case, but we
+        // gate here so a rel index of the same-shaped name is not shadowed by the node resolver's
+        // "not found" — names are globally unique, so only one catalog can hold it.)
+        if self.store.borrow().node_property_index_name(name).is_some() {
+            return self.drop_node_property_index_by_name(name, if_exists);
+        }
+        // A relationship-property index of that name?
+        if self.store.borrow().rel_property_index_name(name).is_some() {
+            return self.drop_rel_property_index_by_name(name, if_exists);
+        }
+        // Neither catalog holds the name: honour `IF EXISTS`.
+        if if_exists {
+            Ok(false)
+        } else {
+            Err(index_drop_not_found(name))
+        }
+    }
+
+    /// Lists every declared relationship-property index as `(name, rel_type, property, state)`
+    /// (`rmp` task #646), for a `SHOW INDEXES` surface. Reads the durable catalog and resolves tokens
+    /// back to names; the index **name** is the durable name if recorded, else the deterministic
+    /// [`auto_rel_index_name`] fallback. An index whose tokens have no resolvable name is omitted.
+    #[must_use]
+    pub fn list_rel_property_indexes(&self) -> Vec<(String, String, String, IndexState)> {
+        let store = self.store.borrow();
+        store
+            .rel_property_indexes()
+            .into_iter()
+            .filter_map(|(type_token, prop_key, state)| {
+                let rel_type = store.token_name(Namespace::RelType, type_token)?;
+                let property = store.token_name(Namespace::PropKey, prop_key)?;
+                let name = store
+                    .rel_property_index_name_for(type_token, prop_key)
+                    .unwrap_or_else(|| auto_rel_index_name(rel_type, property));
+                Some((name, rel_type.to_owned(), property.to_owned(), state))
+            })
+            .collect()
     }
 
     /// Declares that the **complementary columnar value cache** (`rmp` tasks #329 / #330) should
@@ -2442,13 +2842,24 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     idx.register_composite(label_token, prop_keys.clone());
                     true
                 }
-                // Existence + property-type are pure per-entity predicates; relationship constraints
-                // (`rmp` #638) have no backing index either — their uniqueness/key checks scan the
-                // relationships of the type at write time (there is no durable relationship-property
-                // index yet). None of these need an index rebuild.
+                ConstraintKind::RelUnique => {
+                    // A relationship uniqueness constraint (`rmp` #638) registers + populates a backing
+                    // relationship-property index on its single `(type, property)` (`rmp` task #646), so
+                    // the write-time duplicate check is index-accelerated (a full rebuild repopulates it).
+                    if let [prop_key] = prop_keys.as_slice() {
+                        idx.register_rel_property_with_state(
+                            label_token,
+                            *prop_key,
+                            IndexState::Online,
+                        );
+                    }
+                    true
+                }
+                // Existence + property-type are pure per-entity predicates; RelKey / RelPropertyType
+                // stay scan-based (a relationship COMPOSITE index is deferred; RelPropertyType is a pure
+                // per-relationship predicate). None of these need an index rebuild.
                 ConstraintKind::Existence
                 | ConstraintKind::PropertyType
-                | ConstraintKind::RelUnique
                 | ConstraintKind::RelExistence
                 | ConstraintKind::RelKey
                 | ConstraintKind::RelPropertyType => false,

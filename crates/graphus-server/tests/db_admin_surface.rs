@@ -758,6 +758,152 @@ async fn bolt_named_index_lifecycle_and_idempotency() {
     server.shutdown().await.expect("clean shutdown");
 }
 
+/// One `SHOW INDEXES` row keeping the `entityType` column, so a **relationship** index (`rmp` task
+/// #646) can be distinguished from a node index over the wire.
+#[derive(Debug)]
+struct IndexRowFull {
+    name: String,
+    entity: String,
+    label_or_type: String,
+    property: String,
+    state: String,
+}
+
+/// Decodes every `SHOW INDEXES` row keeping the `entityType` column (`rmp` task #646).
+async fn show_indexes_full(client: &mut BoltClient) -> Vec<IndexRowFull> {
+    let rows = client.run_ok("SHOW INDEXES", None).await;
+    rows.into_iter()
+        .map(|row| {
+            assert_eq!(row.len(), 6, "6 SHOW INDEXES columns: {row:?}");
+            let mut it = row.into_iter();
+            let mut next = || it.next().expect("column present");
+            let s = |v: Value, what: &str| match v {
+                Value::String(s) => s,
+                other => panic!("{what} must be a string: {other:?}"),
+            };
+            let name = s(next(), "name");
+            let _type = next(); // "RANGE"
+            let entity = s(next(), "entityType");
+            let single = |v: Value, what: &str| match v {
+                Value::List(mut items) if items.len() == 1 => s(items.remove(0), what),
+                other => panic!("{what} must be a single-element list: {other:?}"),
+            };
+            let label_or_type = single(next(), "labelsOrTypes");
+            let property = single(next(), "properties");
+            let state = s(next(), "state");
+            IndexRowFull {
+                name,
+                entity,
+                label_or_type,
+                property,
+                state,
+            }
+        })
+        .collect()
+}
+
+/// The **relationship-property** index surface end to end over Bolt (`rmp` task #646):
+/// `CREATE INDEX [<name>] FOR ()-[r:T]-() ON (r.p)` builds and shows up in `SHOW INDEXES` with
+/// `entityType = RELATIONSHIP`; a named + `IF NOT EXISTS` create is idempotent; `DROP INDEX <name>`
+/// and the by-target `DROP INDEX FOR ()-[r:T]-() ON (r.p)` both remove it. Node and relationship
+/// indexes coexist in one `SHOW INDEXES` listing.
+#[tokio::test]
+async fn bolt_relationship_property_index_lifecycle() {
+    let temp = TempStore::new("bolt-rel-index");
+    let server = boot(base_config(&temp)).await;
+    let uds = server.uds_path.clone().expect("UDS enabled");
+
+    let mut c = BoltClient::connect(&uds).await;
+    c.handshake_and_logon("alice", "admin-pw8").await;
+
+    // Seed some typed relationships so the online build has work.
+    for since in 2018..2023 {
+        c.run_ok(
+            &format!("CREATE (:P)-[:KNOWS {{since: {since}}}]->(:P)"),
+            None,
+        )
+        .await;
+    }
+    // A node index too, to prove the two coexist in one SHOW INDEXES listing.
+    c.run_ok("CREATE INDEX FOR (n:P) ON (n.name)", None).await;
+
+    // Named relationship-property index — no rows returned, then it is listed as RELATIONSHIP/online.
+    let rows = c
+        .run_ok(
+            "CREATE INDEX rel_since FOR ()-[r:KNOWS]-() ON (r.since)",
+            None,
+        )
+        .await;
+    assert!(rows.is_empty(), "CREATE INDEX returns no rows");
+
+    let listing = show_indexes_full(&mut c).await;
+    let rel = listing
+        .iter()
+        .find(|r| r.name == "rel_since")
+        .expect("the relationship index is listed");
+    assert_eq!(rel.entity, "RELATIONSHIP", "entityType is RELATIONSHIP");
+    assert_eq!(rel.label_or_type, "KNOWS");
+    assert_eq!(rel.property, "since");
+    assert_eq!(rel.state, "online", "the synchronous rel build ends online");
+    // The node index is still there with entityType NODE.
+    assert!(
+        listing
+            .iter()
+            .any(|r| r.entity == "NODE" && r.label_or_type == "P" && r.property == "name"),
+        "the node index coexists: {listing:?}"
+    );
+
+    // Anonymous create with IF NOT EXISTS on the same schema is an idempotent no-op success.
+    c.run_ok(
+        "CREATE INDEX IF NOT EXISTS FOR ()-[r:KNOWS]-() ON (r.since)",
+        None,
+    )
+    .await;
+    assert_eq!(
+        show_indexes_full(&mut c)
+            .await
+            .iter()
+            .filter(|r| r.entity == "RELATIONSHIP")
+            .count(),
+        1,
+        "IF NOT EXISTS did not create a second rel index"
+    );
+
+    // Drop by name removes it (the globally-unique name resolves to the rel catalog).
+    c.run_ok("DROP INDEX rel_since", None).await;
+    assert!(
+        !show_indexes_full(&mut c)
+            .await
+            .iter()
+            .any(|r| r.entity == "RELATIONSHIP"),
+        "the rel index was dropped by name"
+    );
+
+    // Recreate (auto-named) and drop by target.
+    c.run_ok("CREATE INDEX FOR ()-[r:KNOWS]-() ON (r.since)", None)
+        .await;
+    assert_eq!(
+        show_indexes_full(&mut c)
+            .await
+            .iter()
+            .filter(|r| r.entity == "RELATIONSHIP")
+            .count(),
+        1
+    );
+    c.run_ok("DROP INDEX FOR ()-[r:KNOWS]-() ON (r.since)", None)
+        .await;
+    assert!(
+        !show_indexes_full(&mut c)
+            .await
+            .iter()
+            .any(|r| r.entity == "RELATIONSHIP"),
+        "the rel index was dropped by target"
+    );
+
+    c.goodbye().await;
+    server.shutdown().await.expect("clean shutdown");
+}
+
 /// Index DDL is on the admin surface: a non-admin principal is denied, and the index commands are
 /// rejected inside an explicit transaction (they are not transactional) — with no side effects.
 #[tokio::test]

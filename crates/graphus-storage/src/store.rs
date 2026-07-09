@@ -5100,6 +5100,94 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.statistics.node_property_index_names()
     }
 
+    // ---- Relationship-property index catalog delegation (`rmp` task #646) -------------------------
+    // Structural twins of the node-property index catalog delegators above. Every mutator flags
+    // `catalog_dirty` and becomes durable at the enclosing transaction's commit / discarded on
+    // rollback, exactly like the node-property catalog.
+
+    /// Lists every declared relationship-property index as `(type_token, prop_token, state)` from the
+    /// durable catalog (`rmp` task #646), ascending by key. What makes a rel-property index
+    /// *registration* survive a crash: a fresh coordinator re-registers these before its index rebuild.
+    #[must_use]
+    pub fn rel_property_indexes(&self) -> Vec<(u32, u32, IndexState)> {
+        self.statistics.rel_property_indexes()
+    }
+
+    /// The durable build [`IndexState`] of the relationship-property index on `(type_token, prop_token)`,
+    /// or [`None`] if no such index is declared (`rmp` task #646).
+    #[must_use]
+    pub fn rel_property_index_state(&self, type_token: u32, prop_token: u32) -> Option<IndexState> {
+        self.statistics
+            .rel_property_index_state(type_token, prop_token)
+    }
+
+    /// Declares (or updates the state of) the relationship-property index on `(type_token, prop_token)`
+    /// in the durable catalog (`rmp` task #646). In-memory here; durable at commit, discarded on
+    /// rollback.
+    pub fn set_rel_property_index(&mut self, type_token: u32, prop_token: u32, state: IndexState) {
+        self.statistics
+            .set_rel_property_index(type_token, prop_token, state);
+        self.catalog_dirty = true;
+    }
+
+    /// Removes the relationship-property index on `(type_token, prop_token)` from the durable catalog,
+    /// if declared (`rmp` task #646). In-memory here; durable at commit, discarded on rollback.
+    pub fn remove_rel_property_index(&mut self, type_token: u32, prop_token: u32) {
+        self.statistics
+            .remove_rel_property_index(type_token, prop_token);
+        self.catalog_dirty = true;
+    }
+
+    /// The `(type_token, prop_token)` a named relationship-property index covers, or [`None`] if no
+    /// index of that name is declared (`rmp` task #646) — the durable resolver behind `DROP INDEX
+    /// <name>` and the global name-uniqueness check.
+    #[must_use]
+    pub fn rel_property_index_name(&self, name: &str) -> Option<(u32, u32)> {
+        self.statistics.rel_property_index_name(name)
+    }
+
+    /// The declared **name** of the relationship-property index on `(type_token, prop_token)`, or
+    /// [`None`] if the index is nameless (`rmp` task #646). Returned owned so a caller holding a
+    /// `borrow()` of the store need not keep the borrow to read the name.
+    #[must_use]
+    pub fn rel_property_index_name_for(&self, type_token: u32, prop_token: u32) -> Option<String> {
+        self.statistics
+            .rel_property_index_name_for(type_token, prop_token)
+            .map(str::to_owned)
+    }
+
+    /// Records (or replaces) the name of the relationship-property index on `(type_token, prop_token)`
+    /// in the durable catalog (`rmp` task #646). In-memory here; durable at commit, discarded on
+    /// rollback. Global name uniqueness is the Cypher layer's responsibility, enforced before this call.
+    pub fn set_rel_property_index_name(&mut self, name: String, type_token: u32, prop_token: u32) {
+        self.statistics
+            .set_rel_property_index_name(name, type_token, prop_token);
+        self.catalog_dirty = true;
+    }
+
+    /// Removes the name entry `name` from the durable catalog, if present (`rmp` task #646) — the
+    /// durable half of `DROP INDEX <name>`. In-memory here; durable at commit, discarded on rollback.
+    pub fn remove_rel_property_index_name(&mut self, name: &str) {
+        self.statistics.remove_rel_property_index_name(name);
+        self.catalog_dirty = true;
+    }
+
+    /// Removes whatever name maps to `(type_token, prop_token)`, if any (`rmp` task #646) — used by the
+    /// by-target `DROP INDEX FOR ()-[r:T]-() ON (r.p)` shape so the name is cleared alongside the index.
+    /// In-memory here; durable at commit, discarded on rollback.
+    pub fn remove_rel_property_index_name_for(&mut self, type_token: u32, prop_token: u32) {
+        self.statistics
+            .remove_rel_property_index_name_for(type_token, prop_token);
+        self.catalog_dirty = true;
+    }
+
+    /// Lists every named relationship-property index as `(name, type_token, prop_token)` from the
+    /// durable catalog (`rmp` task #646), ascending by name.
+    #[must_use]
+    pub fn rel_property_index_names(&self) -> Vec<(String, u32, u32)> {
+        self.statistics.rel_property_index_names()
+    }
+
     /// The durable full-text index entry named `name`, or [`None`] if no such index is declared
     /// (`rmp` task #72). Tokens are returned as ids; the caller resolves their names via the token
     /// store. Cloned so the borrow of `self` does not outlive the call.

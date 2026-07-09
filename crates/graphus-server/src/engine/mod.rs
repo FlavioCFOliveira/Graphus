@@ -52,8 +52,8 @@ pub use bulk_load::{BulkImportBatchInput, BulkImportBatchOutcome};
 pub use bulk_load_b::{BulkImportModeBChunkInput, BulkImportModeBChunkOutcome};
 pub use command::{
     AccessMode, CheckpointReply, ConstraintCommand, ConstraintCreateKind, ConstraintEntity,
-    CreateConstraint, EngineCommand, IndexCommand, IndexDdlReply, NodePropertyIndexRef, RunReply,
-    RunSummary,
+    CreateConstraint, EngineCommand, IndexCommand, IndexDdlReply, NodePropertyIndexRef,
+    RelPropertyIndexRef, RunReply, RunSummary,
 };
 pub use handle::{EngineHandle, ServerBusy};
 // `EngineDegraded` is defined in this module (below); re-export note: it is `pub` here.
@@ -2534,8 +2534,10 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
         IndexCommand::DropNodePropertyIndex { index, if_exists } => {
             // `mutated == false` is a no-op drop (missing index) → the seam reports 0 removed.
             let mutated = match index {
+                // `DROP INDEX <name>` does not spell the index kind: resolve the (globally-unique)
+                // name against both the node and relationship property index catalogs (`rmp` task #646).
                 NodePropertyIndexRef::Named(name) => {
-                    coordinator.drop_node_property_index_by_name(name, *if_exists)?
+                    coordinator.drop_property_index_by_name(name, *if_exists)?
                 }
                 // The by-target form is already idempotent (a no-op success on a missing target), so
                 // `IF EXISTS` needs no extra handling here.
@@ -2559,29 +2561,72 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
                 "properties".to_owned(),
                 "state".to_owned(),
             ];
-            let rows = coordinator
+            let state_str = |state: IndexState| match state {
+                IndexState::Online => "online",
+                IndexState::Populating => "populating",
+            };
+            // Node-property (RANGE, entityType NODE) rows, then relationship-property (RANGE,
+            // entityType RELATIONSHIP) rows (`rmp` task #646) — `SHOW INDEXES` lists both, matching
+            // Neo4j. `labelsOrTypes` carries the covered label OR relationship type per row.
+            let mut rows: Vec<Vec<Value>> = coordinator
                 .list_node_property_indexes()
                 .into_iter()
                 .map(|(name, label, property, state)| {
-                    let state = match state {
-                        IndexState::Online => "online",
-                        IndexState::Populating => "populating",
-                    };
                     vec![
                         Value::String(name),
                         Value::String("RANGE".to_owned()),
                         Value::String("NODE".to_owned()),
                         Value::List(vec![Value::String(label)]),
                         Value::List(vec![Value::String(property)]),
-                        Value::String(state.to_owned()),
+                        Value::String(state_str(state).to_owned()),
                     ]
                 })
                 .collect();
+            rows.extend(coordinator.list_rel_property_indexes().into_iter().map(
+                |(name, rel_type, property, state)| {
+                    vec![
+                        Value::String(name),
+                        Value::String("RANGE".to_owned()),
+                        Value::String("RELATIONSHIP".to_owned()),
+                        Value::List(vec![Value::String(rel_type)]),
+                        Value::List(vec![Value::String(property)]),
+                        Value::String(state_str(state).to_owned()),
+                    ]
+                },
+            ));
             Ok(IndexDdlReply {
                 fields,
                 rows,
                 mutated: false, // a SHOW is a read; the mutated flag is unused.
             })
+        }
+        IndexCommand::CreateRelPropertyIndex {
+            name,
+            rel_type,
+            property,
+            if_not_exists,
+        } => {
+            // `mutated == false` is an idempotent `IF NOT EXISTS` no-op → the seam reports 0 added.
+            let mutated = coordinator.create_rel_property_index_named(
+                name.as_deref(),
+                rel_type,
+                property,
+                *if_not_exists,
+            )?;
+            Ok(IndexDdlReply::mutation(mutated))
+        }
+        IndexCommand::DropRelPropertyIndex { index, if_exists } => {
+            // `mutated == false` is a no-op drop (missing index) → the seam reports 0 removed.
+            let mutated = match index {
+                RelPropertyIndexRef::Named(name) => {
+                    coordinator.drop_rel_property_index_by_name(name, *if_exists)?
+                }
+                // The by-target form is already idempotent (a no-op success on a missing target).
+                RelPropertyIndexRef::Target { rel_type, property } => {
+                    coordinator.drop_rel_property_index(rel_type, property)?
+                }
+            };
+            Ok(IndexDdlReply::mutation(mutated))
         }
         IndexCommand::CreateFulltextIndex {
             name,
