@@ -342,10 +342,11 @@ MATCH (a:N {id:'a'}) ((x)-[r:R]->(y)){1,3} (z:N {id:'d'})
 RETURN [n IN x | n.id] AS trail, size(r) AS hops  -- trail ['a','b','c'] | hops 3
 ```
 
-> **Conformance note.** The quantified group's interior must be a **single relationship between two
-> nodes** (`(x)-[r]->(y)`). A multi-relationship or nested interior is rejected at compile time with
-> a clear message; that generality is a documented deferral (see
-> [Not yet supported](#not-yet-supported--deferred)).
+> **Conformance note.** The quantified group's interior may be a **single relationship** `(x)-[r]->(y)`
+> or a **multi-relationship path** `(x)-[r1]->(m)-[r2]->(y)` (every interior variable becomes a group
+> variable — one entry per iteration — under global **trail** semantics: no relationship repeats
+> across hops or iterations). A **nested** quantified interior (a QPP inside a QPP) is still rejected
+> at compile time with a clear message (see [Not yet supported](#not-yet-supported--deferred)).
 
 ---
 
@@ -506,12 +507,11 @@ message). They are documented here so expectations are exact.
 | ---- | ------ |
 | **Vector index** — `CREATE VECTOR INDEX …` | Not supported (syntax error). |
 | **Vector similarity functions** — `vector.similarity.*`, `gds.similarity.*` | Not supported (unknown function). |
-| **QPP — multi-relationship / nested interior** | Deferred. Only a single-relationship interior `(x)-[r]->(y)` is accepted; anything richer is rejected at compile time. |
-| **GDS path-algorithm write** — `gds.dijkstra.write`, `gds.bellmanFord.write` | Deferred. The path algorithms are **stream-only** today (`gds.dijkstra.stream` works). |
-| **`DENY` privileges** | Deferred. `GRANT` / `REVOKE` are supported (see [security.md](security.md)); `DENY` is not. |
+| **QPP — nested interior** | Deferred. A quantified group inside another quantified group is rejected at compile time. Single- **and** multi-relationship interiors (`(x)-[r1]->(m)-[r2]->(y)`) **are** supported. |
+| **GDS path-algorithm write** — `gds.dijkstra.write`, `gds.bellmanFord.write` | Deferred. The path algorithms are **stream-only** today (`gds.dijkstra.stream` works). Node-property algorithms support `.stats`/`.mutate`/`.write`. |
 | **Database aliases** — `CREATE ALIAS … FOR DATABASE …` | Not supported (syntax error). |
-| **`ALTER USER … SET HOME DATABASE`** and `CHANGE [NOT] REQUIRED` | Not supported — only `SET PASSWORD` and `SET STATUS` follow `ALTER USER … SET`. |
-| **Relationship property index** — `CREATE INDEX FOR ()-[r:TYPE]-() ON (r.prop)` | Not yet supported; it needs a durable relationship-property index. Relationship **constraints** (`RELATIONSHIP KEY`, existence) are supported. |
+| **`ALTER USER … SET HOME DATABASE`** and `CHANGE [NOT] REQUIRED` | Not supported — `SET PASSWORD` and `SET STATUS` are (see below). |
+| **Relationship property index — planner seek** | The index **is** created, durable, maintained, and used to accelerate relationship-uniqueness constraint checks; a `MATCH ()-[r:T {p:v}]-()` does not yet use it as a seek (scans+filters — correct but unoptimised). |
 | **`LOOKUP` index DDL** | Declined by design — label/type lookup indexes are implicit and always-on (see above). |
 
 ---
