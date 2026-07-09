@@ -45,6 +45,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`REMOVE n.p` / `REMOVE r.p` bypassed existence & key constraints (rmp #650, CWE-617/schema
+  integrity).** Unlike `SET … = null`, the `REMOVE` clause dropped a property without enforcing the
+  declared constraints, so `MATCH (n:Person) REMOVE n.name` could silently leave a record violating a
+  `NOT NULL` / `NODE KEY` / `RELATIONSHIP KEY` constraint. `REMOVE` now enforces after the removal
+  (mirroring `SET … = null`) and is rejected + rolled back with
+  `Neo.ClientError.Schema.ConstraintValidationFailed`. Regression tests added (node/relationship,
+  existence + key).
 - **`stdev` / `stdevp` returned a wrong aggregate value (rmp #628).** The sample/population standard
   deviation aggregates silently computed an incorrect result; corrected and covered by regression
   tests.

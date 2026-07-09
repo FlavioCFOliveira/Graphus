@@ -3716,6 +3716,18 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             .remove_node_property_value(self.txn, node.0, key_id)
         {
             self.capture(e);
+            return;
+        }
+        // A `REMOVE n.p` can only *relax* a uniqueness / property-type rule, but — exactly like
+        // `SET n.p = null` — it **violates an existence (NOT NULL) or key constraint** if the node
+        // carries the constrained label (`rmp` #650): dropping a covered property leaves the node
+        // missing a required value / an incomplete key tuple. Enforce after the removal so the
+        // now-absent property is detected; the captured error aborts the statement before commit.
+        // Suppressed while a multi-property write is mid-flight (the caller checks once at the end),
+        // mirroring the `SET n.p = null` path. Without this, `MATCH (n:L) REMOVE n.p` silently left a
+        // record violating a declared constraint (an ACID/schema-integrity defect).
+        if !self.defer_constraint_check.get() {
+            self.enforce_constraints_for_node(node);
         }
         // Keep the bitmap candidate source membership-exact after a property removal (`rmp` #328): the
         // node must leave the column's value-bitmaps (the other index kinds tolerate the stale entry).
@@ -3739,6 +3751,12 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             .remove_rel_property_value(self.txn, rel.0, key_id)
         {
             self.capture(e);
+        } else if !self.defer_constraint_check.get() {
+            // Exactly like `SET r.p = null`, `REMOVE r.p` **violates a relationship existence /
+            // key constraint** if the relationship's type is constrained (`rmp` #650): enforce after
+            // the removal so the now-absent property is detected. Suppressed while a multi-property
+            // write is mid-flight (the caller checks once at the end).
+            self.enforce_constraints_for_rel(rel);
         }
     }
 

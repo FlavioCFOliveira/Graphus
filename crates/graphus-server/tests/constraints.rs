@@ -999,3 +999,147 @@ async fn relationship_constraints_survive_restart_and_show_entity_type() {
         handle.shutdown().await.expect("graceful shutdown");
     }
 }
+
+// =================================================================================================
+// `rmp` #650 — `REMOVE n.p` / `REMOVE r.p` must enforce existence & key constraints (regression).
+//
+// Before the fix, `remove_node_property` / `remove_rel_property` bypassed constraint enforcement
+// (unlike `SET … = null`), so a `REMOVE` could silently leave a record violating a `NOT NULL` /
+// `KEY` constraint — a schema-integrity / ACID defect. These tests assert the `REMOVE` clause is
+// now rejected and rolled back (the property remains present).
+// =================================================================================================
+
+/// The string value of `MATCH (n:Person {id:1}) RETURN n.<key>`, or `None` if absent/null.
+async fn person_prop(handle: &EngineHandle, key: &str) -> Option<String> {
+    let rows = run(
+        handle,
+        &format!("MATCH (n:Person {{id: 1}}) RETURN n.{key} AS v"),
+    )
+    .await;
+    match &rows[0][0] {
+        MaterializedValue::Value(Value::String(s)) => Some(s.clone()),
+        MaterializedValue::Value(Value::Null) => None,
+        other => panic!("unexpected value {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn remove_property_is_rejected_by_node_existence_constraint() {
+    let temp = TempStore::new("remove_node_existence");
+    let handle = boot(config(&temp)).await;
+    let engine = handle.engine.clone();
+
+    run(&engine, "CREATE (:Person {id: 1, name: 'A'})").await;
+    engine
+        .constraint_ddl(create_existence("name_exists", "Person", "name"))
+        .await
+        .expect("create existence constraint");
+
+    // `REMOVE n.name` would leave a Person with no `name` — a NOT NULL violation.
+    let err = try_run(&engine, "MATCH (n:Person {id: 1}) REMOVE n.name")
+        .await
+        .expect_err("REMOVE of a required property must be rejected");
+    assert_constraint_violation(&err);
+    // Rolled back: the property is still present.
+    assert_eq!(person_prop(&engine, "name").await, Some("A".to_owned()));
+
+    handle.shutdown().await.expect("graceful shutdown");
+}
+
+#[tokio::test]
+async fn remove_property_is_rejected_by_node_key_constraint() {
+    let temp = TempStore::new("remove_node_key");
+    let handle = boot(config(&temp)).await;
+    let engine = handle.engine.clone();
+
+    run(
+        &engine,
+        "CREATE (:Person {id: 1, first: 'Ada', last: 'Byron'})",
+    )
+    .await;
+    engine
+        .constraint_ddl(create_node_key("person_key", "Person", &["first", "last"]))
+        .await
+        .expect("create node-key constraint");
+
+    // Removing either covered property makes the key tuple incomplete → rejected, and rolls back.
+    let err = try_run(&engine, "MATCH (n:Person {id: 1}) REMOVE n.last")
+        .await
+        .expect_err("REMOVE of a key property must be rejected");
+    assert_constraint_violation(&err);
+    assert_eq!(person_prop(&engine, "last").await, Some("Byron".to_owned()));
+    let err = try_run(&engine, "MATCH (n:Person {id: 1}) REMOVE n.first")
+        .await
+        .expect_err("REMOVE of a key property must be rejected");
+    assert_constraint_violation(&err);
+    assert_eq!(person_prop(&engine, "first").await, Some("Ada".to_owned()));
+
+    handle.shutdown().await.expect("graceful shutdown");
+}
+
+#[tokio::test]
+async fn remove_property_is_rejected_by_relationship_existence_constraint() {
+    let temp = TempStore::new("remove_rel_existence");
+    let handle = boot(config(&temp)).await;
+    let engine = handle.engine.clone();
+
+    run(&engine, "CREATE (:A {id: 1}), (:B {id: 2})").await;
+    engine
+        .constraint_ddl(rel_create(
+            "since_exists",
+            "KNOWS",
+            &["since"],
+            ConstraintCreateKind::Existence,
+        ))
+        .await
+        .expect("create rel existence constraint");
+    run(
+        &engine,
+        "MATCH (a:A {id: 1}), (b:B {id: 2}) CREATE (a)-[:KNOWS {since: 2020}]->(b)",
+    )
+    .await;
+
+    // `REMOVE r.since` would leave the relationship missing a required property → rejected.
+    let err = try_run(&engine, "MATCH ()-[r:KNOWS]->() REMOVE r.since")
+        .await
+        .expect_err("REMOVE of a required rel property must be rejected");
+    assert_constraint_violation(&err);
+    // Rolled back: the relationship still carries `since`.
+    let rows = run(&engine, "MATCH ()-[r:KNOWS]->() RETURN r.since AS v").await;
+    assert_eq!(rows[0][0], MaterializedValue::Value(Value::Integer(2020)));
+
+    handle.shutdown().await.expect("graceful shutdown");
+}
+
+#[tokio::test]
+async fn remove_property_is_rejected_by_relationship_key_constraint() {
+    let temp = TempStore::new("remove_rel_key");
+    let handle = boot(config(&temp)).await;
+    let engine = handle.engine.clone();
+
+    run(&engine, "CREATE (:A {id: 1}), (:B {id: 2})").await;
+    engine
+        .constraint_ddl(rel_create(
+            "rated_key",
+            "RATED",
+            &["u", "m"],
+            ConstraintCreateKind::Key,
+        ))
+        .await
+        .expect("create rel-key constraint");
+    run(
+        &engine,
+        "MATCH (a:A {id: 1}), (b:B {id: 2}) CREATE (a)-[:RATED {u: 1, m: 2}]->(b)",
+    )
+    .await;
+
+    // Removing a covered key property makes the tuple incomplete → rejected.
+    let err = try_run(&engine, "MATCH ()-[r:RATED]->() REMOVE r.u")
+        .await
+        .expect_err("REMOVE of a rel-key property must be rejected");
+    assert_constraint_violation(&err);
+    let rows = run(&engine, "MATCH ()-[r:RATED]->() RETURN r.u AS v").await;
+    assert_eq!(rows[0][0], MaterializedValue::Value(Value::Integer(1)));
+
+    handle.shutdown().await.expect("graceful shutdown");
+}
