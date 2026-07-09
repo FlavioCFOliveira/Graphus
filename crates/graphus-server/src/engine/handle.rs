@@ -523,7 +523,11 @@ impl EngineHandle {
             Ok(()) => Ok(()),
             Err(std::sync::mpsc::TrySendError::Full(cmd)) => {
                 let tx = self.tx.clone();
-                tokio::task::spawn_blocking(move || tx.send(cmd))
+                // Collapse the blocking `send`'s `SendError<EngineCommand>` to `()` *inside* the
+                // closure: the disconnected case maps to `engine_gone()` regardless, and a small Err
+                // keeps the `spawn_blocking` future off clippy's `result_large_err` (the command enum
+                // is large). Behaviour is unchanged.
+                tokio::task::spawn_blocking(move || tx.send(cmd).map_err(|_| ()))
                     .await
                     .map_err(|e| GraphusError::Runtime(format!("engine submit join: {e}")))?
                     .map_err(|_| engine_gone())
