@@ -152,6 +152,7 @@ fn create_articles_index(props: &[&str], analyzer: &str) -> IndexCommand {
         label: "Article".to_owned(),
         properties: props.iter().map(|p| (*p).to_owned()).collect(),
         analyzer: analyzer.to_owned(),
+        if_not_exists: false,
     }
 }
 
@@ -328,6 +329,7 @@ async fn drop_index_then_query_errors() {
     engine
         .index_ddl(IndexCommand::DropFulltextIndex {
             name: "articles".to_owned(),
+            if_exists: false,
         })
         .await
         .expect("drop");

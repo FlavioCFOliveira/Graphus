@@ -2607,6 +2607,7 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
             label,
             properties,
             analyzer,
+            if_not_exists,
         } => {
             // Validate the analyzer name against the supported set; an unknown one is a clear,
             // side-effect-free error (`rmp` task #72).
@@ -2615,28 +2616,39 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
                     "unknown full-text analyzer {analyzer:?}; expected 'standard' or 'keyword'"
                 ))
             })?;
-            // A full-text create always mutates (a re-declare replaces): 1 added.
-            coordinator.create_fulltext_index(name, label, properties, analyzer)?;
-            Ok(IndexDdlReply::mutation(true))
+            // `mutated == false` is an idempotent `IF NOT EXISTS` no-op → the seam reports 0 added;
+            // otherwise a create (a re-declare replaces) mutates → 1 added (`rmp` tasks #72, #661).
+            let mutated = coordinator.create_fulltext_index(
+                name,
+                label,
+                properties,
+                analyzer,
+                *if_not_exists,
+            )?;
+            Ok(IndexDdlReply::mutation(mutated))
         }
-        IndexCommand::DropFulltextIndex { name } => {
-            // `mutated == false` is a no-op drop of a missing index → 0 removed.
-            let mutated = coordinator.drop_fulltext_index(name)?;
+        IndexCommand::DropFulltextIndex { name, if_exists } => {
+            // `mutated == false` is an `IF EXISTS` no-op drop of a missing index → 0 removed; a missing
+            // index without `IF EXISTS` is an error (`rmp` tasks #72, #661).
+            let mutated = coordinator.drop_fulltext_index(name, *if_exists)?;
             Ok(IndexDdlReply::mutation(mutated))
         }
         IndexCommand::CreatePointIndex {
             name,
             label,
             property,
+            if_not_exists,
         } => {
             // A spatial index has no analyzer to validate (unlike the full-text index): start the
-            // non-blocking online build directly (`rmp` task #98). A create always mutates: 1 added.
-            coordinator.create_point_index(name, label, property)?;
-            Ok(IndexDdlReply::mutation(true))
+            // non-blocking online build directly (`rmp` task #98). `mutated == false` is an idempotent
+            // `IF NOT EXISTS` no-op → 0 added; otherwise 1 added (`rmp` task #661).
+            let mutated = coordinator.create_point_index(name, label, property, *if_not_exists)?;
+            Ok(IndexDdlReply::mutation(mutated))
         }
-        IndexCommand::DropPointIndex { name } => {
-            // `mutated == false` is a no-op drop of a missing index → 0 removed.
-            let mutated = coordinator.drop_point_index(name)?;
+        IndexCommand::DropPointIndex { name, if_exists } => {
+            // `mutated == false` is an `IF EXISTS` no-op drop of a missing index → 0 removed; a missing
+            // index without `IF EXISTS` is an error (`rmp` tasks #98, #661).
+            let mutated = coordinator.drop_point_index(name, *if_exists)?;
             Ok(IndexDdlReply::mutation(mutated))
         }
     }

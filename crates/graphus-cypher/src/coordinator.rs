@@ -1629,10 +1629,11 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         Ok(true)
     }
 
-    /// Drops the property index named `name` — resolving it against the **node** property index
-    /// catalog first, then the **relationship** property index catalog (`rmp` task #646). Index names
-    /// are globally unique across both catalogs, so at most one matches. This backs the `DROP INDEX
-    /// <name>` surface, which does not spell the index kind.
+    /// Drops the index named `name` — resolving it against **every** index catalog so the unified
+    /// Neo4j `DROP INDEX <name>` form (which does not spell the index kind) drops an index of any kind:
+    /// node-property, relationship-property (`rmp` task #646), composite (`rmp` task #657), full-text
+    /// and spatial/point (`rmp` task #661). Index names are globally unique across all catalogs, so at
+    /// most one matches.
     ///
     /// `if_exists` controls the missing-name case: `true` makes a never-declared name a clean no-op
     /// success; `false` returns `Neo.ClientError.Schema.IndexDropFailed`.
@@ -1658,6 +1659,15 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         if let Some(entry) = composite {
             self.remove_composite_index_committed(name, entry.label_token, &entry.property_tokens)?;
             return Ok(true);
+        }
+        // A full-text index of that name (`rmp` task #661)? The name is known-present here, so the
+        // delegate removes it and returns `Ok(true)`.
+        if self.store.borrow().fulltext_index(name).is_some() {
+            return self.drop_fulltext_index(name, if_exists);
+        }
+        // A spatial (point) index of that name (`rmp` task #661)?
+        if self.store.borrow().spatial_index(name).is_some() {
+            return self.drop_point_index(name, if_exists);
         }
         // No catalog holds the name: honour `IF EXISTS`.
         if if_exists {
@@ -2659,11 +2669,18 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         label: &str,
         properties: &[String],
         analyzer: Analyzer,
-    ) -> Result<()> {
+        if_not_exists: bool,
+    ) -> Result<bool> {
         if properties.is_empty() {
             return Err(GraphusError::Storage(
                 "a full-text index must cover at least one property".to_owned(),
             ));
+        }
+        // `IF NOT EXISTS` (`rmp` #661): an equivalent index — the same `name` in the full-text catalog,
+        // or the same covered `(label, ordered property tuple)` under any name — makes this an
+        // idempotent no-op (nothing added), mirroring the node-property path.
+        if if_not_exists && self.fulltext_equivalent_exists(name, label, properties) {
+            return Ok(false);
         }
         // Names are globally unique across every schema catalog (`rmp` task #624): reject a name already
         // used by a *different* catalog. Re-declaring within the full-text catalog keeps its historical
@@ -2727,7 +2744,28 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 snapshot,
                 cursor: 0,
             });
-        Ok(())
+        Ok(true)
+    }
+
+    /// Whether a full-text index equivalent to the requested `(name, label, properties)` already
+    /// exists (`rmp` #661) — the same `name` in the full-text catalog, or the same covered
+    /// `(label, ordered property tuple)` under any name. Backs `CREATE FULLTEXT INDEX … IF NOT EXISTS`
+    /// idempotency. Read-only, by token *lookup* (an unindexable token tuple means no index can cover
+    /// it, so no equivalent exists).
+    fn fulltext_equivalent_exists(&self, name: &str, label: &str, properties: &[String]) -> bool {
+        let store = self.store.borrow();
+        if store.fulltext_index(name).is_some() {
+            return true;
+        }
+        let Some((label_token, property_tokens)) =
+            Self::resolve_property_tokens(&store, label, properties)
+        else {
+            return false;
+        };
+        store
+            .fulltext_indexes()
+            .iter()
+            .any(|(_n, e)| e.label_token == label_token && e.property_tokens == property_tokens)
     }
 
     /// Drops the full-text index named `name` (`rmp` task #72): removes its durable catalog entry in a
@@ -2740,10 +2778,15 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ///
     /// # Errors
     /// Returns a storage error if the committing transaction fails.
-    pub fn drop_fulltext_index(&mut self, name: &str) -> Result<bool> {
-        // A no-op when the index is not declared (avoids an empty committed transaction).
+    pub fn drop_fulltext_index(&mut self, name: &str, if_exists: bool) -> Result<bool> {
+        // Not declared: without `IF EXISTS` this is a `Neo.ClientError.Schema.IndexDropFailed` error
+        // (Neo4j) and side-effect-free (nothing durable to remove). With `IF EXISTS` it is a clean no-op
+        // success — defensively cancel any stray in-flight build + in-memory registration first
+        // (`rmp` tasks #72, #661).
         if self.store.borrow().fulltext_index(name).is_none() {
-            // Still cancel any in-flight build + in-memory registration defensively, then succeed.
+            if !if_exists {
+                return Err(index_drop_not_found(name));
+            }
             self.pending_fulltext_builds.retain(|b| b.name != name);
             self.index.borrow_mut().unregister_fulltext(name);
             return Ok(false); // nothing removed.
@@ -2802,7 +2845,19 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// # Errors
     /// Returns a storage error if interning either token, recording the catalog entry, the committing
     /// transaction, or the initial snapshot scan fails. On any error the index is left undeclared.
-    pub fn create_point_index(&mut self, name: &str, label: &str, property: &str) -> Result<()> {
+    pub fn create_point_index(
+        &mut self,
+        name: &str,
+        label: &str,
+        property: &str,
+        if_not_exists: bool,
+    ) -> Result<bool> {
+        // `IF NOT EXISTS` (`rmp` #661): an equivalent index — the same `name` in the spatial catalog, or
+        // the same covered `(label, property)` under any name — makes this an idempotent no-op (nothing
+        // added), mirroring the node-property path.
+        if if_not_exists && self.point_equivalent_exists(name, label, property) {
+            return Ok(false);
+        }
         // Names are globally unique across every schema catalog (`rmp` task #624): reject a name already
         // used by a *different* catalog (a re-declare within the spatial catalog keeps replace semantics).
         if Self::name_used_by_other_catalog(&self.store.borrow(), name, NameCatalog::Spatial) {
@@ -2861,7 +2916,29 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             snapshot,
             cursor: 0,
         });
-        Ok(())
+        Ok(true)
+    }
+
+    /// Whether a spatial (point) index equivalent to the requested `(name, label, property)` already
+    /// exists (`rmp` #661) — the same `name` in the spatial catalog, or the same covered
+    /// `(label, property)` under any name. Backs `CREATE POINT INDEX … IF NOT EXISTS` idempotency.
+    /// Read-only, by token *lookup*.
+    fn point_equivalent_exists(&self, name: &str, label: &str, property: &str) -> bool {
+        let store = self.store.borrow();
+        if store.spatial_index(name).is_some() {
+            return true;
+        }
+        let props = [property.to_owned()];
+        let Some((label_token, property_tokens)) =
+            Self::resolve_property_tokens(&store, label, &props)
+        else {
+            return false;
+        };
+        let prop_token = property_tokens[0];
+        store
+            .spatial_indexes()
+            .iter()
+            .any(|(_n, e)| e.label_token == label_token && e.property_token == prop_token)
     }
 
     /// Drops the spatial (point) index named `name` (`rmp` task #98): removes its durable catalog
@@ -2870,12 +2947,17 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ///
     /// # Errors
     /// Returns a storage error if the committing transaction fails.
-    pub fn drop_point_index(&mut self, name: &str) -> Result<bool> {
+    pub fn drop_point_index(&mut self, name: &str, if_exists: bool) -> Result<bool> {
         // Resolve the covered `(label_token, prop_key)` from the durable entry so we can unregister the
         // right grid from the in-memory set (which is keyed by tokens, not by name).
         let entry = self.store.borrow().spatial_index(name);
         let Some(entry) = entry else {
-            // Not declared: still cancel any in-flight build defensively, then succeed (no-op).
+            // Not declared: without `IF EXISTS` this is a `Neo.ClientError.Schema.IndexDropFailed`
+            // error (Neo4j) and side-effect-free. With `IF EXISTS` it is a clean no-op success —
+            // defensively cancel any stray in-flight build first (`rmp` tasks #98, #661).
+            if !if_exists {
+                return Err(index_drop_not_found(name));
+            }
             self.pending_spatial_builds.retain(|b| b.name != name);
             return Ok(false); // nothing removed.
         };

@@ -194,7 +194,13 @@ fn a_name_is_unique_across_catalogs() {
     // A full-text index and a node-property index cannot share a name (either declaration order).
     let mut coord = fresh_coord();
     coord
-        .create_fulltext_index("shared", "Doc", &["body".to_owned()], Analyzer::Standard)
+        .create_fulltext_index(
+            "shared",
+            "Doc",
+            &["body".to_owned()],
+            Analyzer::Standard,
+            false,
+        )
         .expect("fulltext create");
     let err = coord
         .begin_online_node_property_index_named(Some("shared"), "Person", "name", false)
@@ -210,7 +216,7 @@ fn a_name_is_unique_across_catalogs() {
         .begin_online_node_property_index_named(Some("np"), "Person", "name", false)
         .expect("node-property create");
     let err = coord
-        .create_fulltext_index("np", "Doc", &["body".to_owned()], Analyzer::Standard)
+        .create_fulltext_index("np", "Doc", &["body".to_owned()], Analyzer::Standard, false)
         .expect_err("full-text name collides with a node-property index");
     assert!(
         err.to_string().contains("IndexWithNameAlreadyExists"),

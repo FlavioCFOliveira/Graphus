@@ -158,6 +158,7 @@ fn create_by_loc_index() -> IndexCommand {
         name: "by_loc".to_owned(),
         label: "City".to_owned(),
         property: "loc".to_owned(),
+        if_not_exists: false,
     }
 }
 
@@ -387,6 +388,7 @@ async fn drop_index_then_query_still_correct() {
     engine
         .index_ddl(IndexCommand::DropPointIndex {
             name: "by_loc".to_owned(),
+            if_exists: false,
         })
         .await
         .expect("drop");

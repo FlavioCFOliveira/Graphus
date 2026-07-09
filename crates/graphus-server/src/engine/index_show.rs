@@ -879,6 +879,7 @@ mod tests {
                 label: "Article".to_owned(),
                 properties: vec!["title".to_owned()],
                 analyzer: "standard".to_owned(),
+                if_not_exists: false,
             }
         );
         // POINT.
@@ -888,6 +889,7 @@ mod tests {
                 name: "by_loc".to_owned(),
                 label: "City".to_owned(),
                 property: "loc".to_owned(),
+                if_not_exists: false,
             }
         );
     }

@@ -492,10 +492,19 @@ CREATE RANGE INDEX ix_age  IF NOT EXISTS FOR (p:Person) ON (p.age)
 CREATE TEXT  INDEX ix_name IF NOT EXISTS FOR (p:Person) ON (p.name)   -- appears as RANGE in SHOW INDEXES
 ```
 
+Every `CREATE INDEX` (plain / `RANGE` / `TEXT` / `POINT` / `FULLTEXT`) accepts a trailing Neo4j
+`OPTIONS { indexProvider: '…', indexConfig { … } }` map. Graphus has one built-in provider and
+synchronous builds, so the clause is validated and accepted but not applied (except the full-text
+`fulltext.analyzer`, which maps to the analyzer). `POINT` and `FULLTEXT` `CREATE`/`DROP` also support
+`IF NOT EXISTS` / `IF EXISTS`, an anonymous (auto-named) `POINT` index, and dropping any kind by the
+unified `DROP INDEX <name>` — see [indexes.md](indexes.md).
+
 `SHOW INDEXES` is a single unified, Neo4j-conformant listing of **every** index kind (node/relationship
 `RANGE`, composite `RANGE`, `FULLTEXT`, `POINT`, and the two token `LOOKUP` indexes), with the full
 Neo4j column set, `UPPER-CASE` state, per-type filters (`SHOW RANGE|TEXT|POINT|LOOKUP|FULLTEXT|VECTOR|ALL
-INDEXES`), and a `YIELD` / `WHERE` / `RETURN` tail — see [indexes.md](indexes.md#listing-indexes--show-indexes).
+INDEX[ES]`), and a `YIELD` / `WHERE` / `RETURN` tail. The singular `SHOW INDEX` / `SHOW <filter> INDEX`
+is accepted as a full synonym of the plural — see
+[indexes.md](indexes.md#listing-indexes--show-indexes).
 
 ### Security DDL
 

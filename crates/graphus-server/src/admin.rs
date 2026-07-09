@@ -24,20 +24,22 @@
 //! SHOW   DATABASES
 //! SHOW   DATABASE <name>
 //!
-//! CREATE INDEX FOR (<var>:<Label>) ON (<var>.<property>)   -- openCypher 9 form
-//! CREATE INDEX ON :<Label>(<property>)                     -- legacy form
+//! CREATE INDEX [<name>] [IF NOT EXISTS] FOR (<var>:<Label>) ON (<var>.<property>) [OPTIONS { … }]
+//! CREATE INDEX [IF NOT EXISTS] ON :<Label>(<property>)     -- legacy form
+//! DROP   INDEX <name> [IF EXISTS]                          -- drops an index of ANY kind by name
 //! DROP   INDEX ON :<Label>(<property>)                     -- (and the FOR … ON … form)
 //! DROP   INDEX FOR (<var>:<Label>) ON (<var>.<property>)
-//! SHOW   INDEXES
+//! SHOW   INDEX[ES]                                         -- singular synonym accepted (rmp #661)
 //!
-//! CREATE POINT INDEX <name> FOR (<var>:<Label>) ON (<var>.<prop>)
-//! DROP   POINT INDEX <name>
-//! SHOW   POINT INDEXES
+//! CREATE POINT INDEX [<name>] [IF NOT EXISTS] FOR (<var>:<Label>) ON (<var>.<prop>) [OPTIONS { … }]
+//! DROP   POINT INDEX <name> [IF EXISTS]
+//! SHOW   POINT INDEX[ES]
 //!
-//! CREATE FULLTEXT INDEX <name> FOR (<var>:<Label>) ON EACH [<var>.<prop>, …]
+//! CREATE FULLTEXT INDEX <name> [IF NOT EXISTS] FOR (<var>:<Label>) ON EACH [<var>.<prop>, …]
 //!                                                  [OPTIONS { analyzer: '<analyzer>' }]   -- rmp #72
-//! DROP   FULLTEXT INDEX <name>
-//! SHOW   FULLTEXT INDEXES
+//!                                                  [OPTIONS { indexConfig { … } }]        -- rmp #661
+//! DROP   FULLTEXT INDEX <name> [IF EXISTS]
+//! SHOW   FULLTEXT INDEX[ES]
 //! ```
 //!
 //! The matcher claims a statement **only** when its first two tokens are exactly an admin verb
@@ -833,8 +835,9 @@ pub fn parse_admin_statement(query: &str) -> AdminParse {
                 "expected INDEX after {verb} (INDEXES is only valid in SHOW INDEXES)"
             ));
         }
-        // CLAIMED by the index surface: parse strictly.
-        return match parse_claimed_index(&verb, plural, &mut lex) {
+        // CLAIMED by the index surface: parse strictly. The `SHOW INDEX[ES]` singular/plural split is
+        // handled inside; `CREATE/DROP INDEXES` was already rejected above.
+        return match parse_claimed_index(&verb, &mut lex) {
             Ok(cmd) => AdminParse::Index(cmd),
             Err(msg) => AdminParse::Invalid(msg),
         };
@@ -861,25 +864,18 @@ pub fn parse_admin_statement(query: &str) -> AdminParse {
 /// target keywords and the `IF` clause by look-ahead: the first token after `CREATE/DROP INDEX` is the
 /// name **unless** it is the bare keyword `FOR`, `ON` or `IF` (a name that collides with one of those
 /// must be back-ticked).
-fn parse_claimed_index(
-    verb: &str,
-    plural: bool,
-    lex: &mut Lexer<'_>,
-) -> Result<IndexCommand, String> {
-    if plural {
-        // SHOW INDEXES [YIELD … | WHERE …] — the unified listing (filter = All), plus an optional
-        // YIELD/WHERE tail (`rmp` #660). The filtered forms (`SHOW <filter> INDEXES`) are dispatched
-        // earlier.
-        let tail = capture_show_tail(lex, "SHOW INDEXES")?;
-        return Ok(IndexCommand::ShowIndexes {
-            filter: IndexTypeFilter::All,
-            tail,
-        });
-    }
+fn parse_claimed_index(verb: &str, lex: &mut Lexer<'_>) -> Result<IndexCommand, String> {
     match verb {
+        // Both `SHOW INDEX` (singular, `rmp` #661) and `SHOW INDEXES` list the unified index set
+        // (filter = All), plus an optional YIELD/WHERE tail (`rmp` #660). Neo4j accepts `INDEX[ES]`;
+        // the singular behaves identically to the plural. The filtered forms (`SHOW <filter> INDEX[ES]`)
+        // are dispatched earlier. The `CREATE/DROP INDEXES` plural is rejected before dispatch.
         "SHOW" => {
-            // `SHOW INDEX` (singular) is not a recognised form; only the plural `SHOW INDEXES`.
-            Err("expected SHOW INDEXES (the singular SHOW INDEX is not supported)".to_owned())
+            let tail = capture_show_tail(lex, "SHOW INDEXES")?;
+            Ok(IndexCommand::ShowIndexes {
+                filter: IndexTypeFilter::All,
+                tail,
+            })
         }
         "CREATE" => parse_create_index(lex),
         "DROP" => parse_drop_index(lex),
@@ -949,8 +945,10 @@ fn parse_claimed_typed_index(
     }
 
     // RANGE / TEXT: a full node-property synonym — the `verb` + `INDEX`/`INDEXES` are already read, so
-    // hand the remainder to the existing node-property parser verbatim.
-    parse_claimed_index(verb, plural, lex)
+    // hand the remainder to the existing node-property parser verbatim. (SHOW RANGE/TEXT INDEX[ES] is
+    // dispatched earlier through the unified `SHOW <filter> INDEXES` surface, so only CREATE/DROP with
+    // the singular `INDEX` reach here.)
+    parse_claimed_index(verb, lex)
 }
 
 /// The parsed target of an index DDL statement: a **node** label property (`FOR (n:Label) ON
@@ -984,7 +982,13 @@ enum IndexTarget {
 fn parse_create_index(lex: &mut Lexer<'_>) -> Result<IndexCommand, String> {
     let name = parse_optional_index_name(lex)?;
     let if_not_exists = parse_optional_if(lex, /* with_not */ true)?;
-    match parse_index_target("CREATE", lex)? {
+    let target = parse_index_target("CREATE", lex)?;
+    // Optional trailing `OPTIONS { indexProvider: '…', indexConfig { … } }` (`rmp` task #661): parsed
+    // and validated, then accepted-and-ignored (Graphus has a single built-in index provider), so a
+    // Neo4j `CREATE INDEX … OPTIONS { … }` is accepted verbatim.
+    parse_optional_index_options(lex)?;
+    expect_end(lex, "CREATE INDEX")?;
+    match target {
         IndexTarget::Node { label, properties } => Ok(IndexCommand::CreateNodePropertyIndex {
             name,
             label,
@@ -1017,7 +1021,9 @@ fn parse_drop_index(lex: &mut Lexer<'_>) -> Result<IndexCommand, String> {
         Some(ref t) if is_keyword(t, "FOR") || is_keyword(t, "ON")
     );
     if by_target {
-        return match parse_index_target("DROP", lex)? {
+        let target = parse_index_target("DROP", lex)?;
+        expect_end(lex, "DROP INDEX")?;
+        return match target {
             IndexTarget::Node { label, properties } => Ok(IndexCommand::DropNodePropertyIndex {
                 index: NodePropertyIndexRef::Target { label, properties },
                 if_exists: false,
@@ -1125,7 +1131,8 @@ fn parse_index_for_on(verb: &str, lex: &mut Lexer<'_>) -> Result<IndexTarget, St
         expect_symbol(lex, '(', verb)?;
         let properties = parse_on_property_list(verb, lex)?;
         expect_symbol(lex, ')', verb)?;
-        expect_end(lex, &format!("{verb} INDEX"))?;
+        // The optional trailing `OPTIONS { … }` and end-of-statement are validated by the caller
+        // (`parse_create_index` / `parse_drop_index`), so this leaf can serve both verbs (`rmp` #661).
         // A composite relationship index needs a durable relationship-composite backing store, which is
         // not yet implemented (`rmp` task #657, coordinator deferral): decline it with a specific error
         // rather than silently build the wrong thing (a single-property rel index over the first key).
@@ -1146,7 +1153,7 @@ fn parse_index_for_on(verb: &str, lex: &mut Lexer<'_>) -> Result<IndexTarget, St
     expect_symbol(lex, '(', verb)?;
     let properties = parse_on_property_list(verb, lex)?;
     expect_symbol(lex, ')', verb)?;
-    expect_end(lex, &format!("{verb} INDEX"))?;
+    // The optional trailing `OPTIONS { … }` and end-of-statement are validated by the caller.
     Ok(IndexTarget::Node { label, properties })
 }
 
@@ -1233,21 +1240,26 @@ fn parse_claimed_fulltext(verb: &str, lex: &mut Lexer<'_>) -> Result<IndexComman
         ));
     }
 
-    // Both CREATE and DROP take a name next.
+    // Both CREATE and DROP take a name next (full-text index names are mandatory in Neo4j).
     let name = expect_name(lex, "a full-text index name", "FULLTEXT")?;
 
     match verb {
         "DROP" => {
+            // `IF EXISTS` (`rmp` #661) turns a missing index into a no-op success.
+            let if_exists = parse_optional_if(lex, /* with_not */ false)?;
             expect_end(lex, "DROP FULLTEXT INDEX")?;
-            Ok(IndexCommand::DropFulltextIndex { name })
+            Ok(IndexCommand::DropFulltextIndex { name, if_exists })
         }
         "CREATE" => {
+            // `IF NOT EXISTS` (`rmp` #661) sits between the name and the `FOR` clause (Neo4j position).
+            let if_not_exists = parse_optional_if(lex, /* with_not */ true)?;
             let (label, properties, analyzer) = parse_fulltext_create_tail(lex)?;
             Ok(IndexCommand::CreateFulltextIndex {
                 name,
                 label,
                 properties,
                 analyzer,
+                if_not_exists,
             })
         }
         // `parse_admin_statement` only routes CREATE/DROP/SHOW here; START/STOP never reach this.
@@ -1287,41 +1299,223 @@ fn parse_fulltext_create_tail(
     Ok((label, properties, analyzer))
 }
 
-/// Parses an optional `OPTIONS { analyzer: '<name>' }` clause (only consumed when the next token is
-/// `OPTIONS`). Returns the analyzer name if the clause was present. Any other recognised option key
-/// is rejected (only `analyzer` is supported in v1); a malformed clause is a syntax error.
+/// Parses an optional full-text-index `OPTIONS { … }` clause (`rmp` tasks #72, #661), only consumed
+/// when the next token is `OPTIONS`. Returns the analyzer name if one was specified. Two shapes are
+/// accepted (in addition to `indexProvider`, accepted and ignored — Graphus has one built-in provider):
+///
+/// ```text
+/// OPTIONS { analyzer: '<name>' }                                                    -- bare (rmp #72)
+/// OPTIONS { indexConfig: { `fulltext.analyzer`: '<name>',
+///                          `fulltext.eventually_consistent`: true } }               -- Neo4j (rmp #661)
+/// ```
+///
+/// `fulltext.analyzer` maps to the analyzer; `fulltext.eventually_consistent` is accepted and ignored
+/// (builds are synchronous). An unknown **top-level** option key is a clear error; unknown
+/// `indexConfig` keys are accepted and ignored (matching the constraint OPTIONS leniency, `rmp` #654).
+/// A malformed clause (unbalanced braces, missing colon, wrong value type) is a syntax error.
 fn parse_optional_fulltext_options(lex: &mut Lexer<'_>) -> Result<Option<String>, String> {
-    // Peek: only consume if the next token is OPTIONS.
+    if !consume_options_keyword(lex)? {
+        return Ok(None);
+    }
+    expect_options_symbol(lex, '{')?;
+    let entries = parse_option_map_body(lex)?;
+    let mut analyzer: Option<String> = None;
+    for (key, value) in &entries {
+        match key.to_ascii_lowercase().as_str() {
+            "analyzer" => analyzer = Some(as_option_string(value, "analyzer")?),
+            // Accepted for Neo4j-DDL compatibility (one built-in provider), then ignored.
+            "indexprovider" => {
+                let _ = as_option_string(value, "indexProvider")?;
+            }
+            "indexconfig" => {
+                for (ckey, cval) in as_option_map(value, "indexConfig")? {
+                    match ckey.to_ascii_lowercase().as_str() {
+                        "fulltext.analyzer" => {
+                            analyzer = Some(as_option_string(cval, "fulltext.analyzer")?);
+                        }
+                        // Accepted and ignored: builds are synchronous, so there is nothing to reflect.
+                        "fulltext.eventually_consistent" => {}
+                        // Any other indexConfig key is accepted and ignored (leniency, `rmp` #654).
+                        _ => {}
+                    }
+                }
+            }
+            other => {
+                return Err(format!(
+                    "unknown full-text index OPTIONS key `{other}`; \
+                     expected analyzer, indexProvider or indexConfig"
+                ));
+            }
+        }
+    }
+    Ok(analyzer)
+}
+
+// ------------------------------------------------------------------------------------------------
+// Index OPTIONS { … } clause (`rmp` task #661)
+// ------------------------------------------------------------------------------------------------
+
+/// One parsed value inside an index `OPTIONS { … }` map (`rmp` task #661): a quoted string, a bare
+/// token (a number / `true` / `false` / identifier), a `[ … ]` list, or a nested `{ … }` map.
+/// Recursive so a nested `indexConfig { … }` map and a spatial `[min, max]` list validate
+/// structurally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OptionValue {
+    /// A `'single'`- / `"double"`-quoted (or `` `backtick` ``) string value.
+    Str(String),
+    /// A bare token: a number, `true` / `false`, or an identifier (the lexer keeps it as one word).
+    Word(String),
+    /// A `[ … ]` list of values (e.g. a spatial `[-100.0, -100.0]` bound).
+    List(Vec<OptionValue>),
+    /// A nested `{ … }` map (e.g. `indexConfig { … }`).
+    Map(Vec<(String, OptionValue)>),
+}
+
+/// Consumes a leading `OPTIONS` keyword if present (peeking on a clone first), returning whether it
+/// was consumed. Shared by every index-kind OPTIONS parser (`rmp` task #661).
+fn consume_options_keyword(lex: &mut Lexer<'_>) -> Result<bool, String> {
     let mut peek = Lexer {
         rest: lex.rest.clone(),
     };
     match peek.next_tok()? {
         Some(t) if is_keyword(&t, "OPTIONS") => {
             lex.rest = peek.rest.clone();
+            Ok(true)
         }
-        _ => return Ok(None),
+        _ => Ok(false),
     }
-    expect_symbol(lex, '{', "FULLTEXT")?;
-    // key : 'value'  (only `analyzer` is supported).
-    let key = expect_name(lex, "an option key (analyzer)", "FULLTEXT")?;
-    if !key.eq_ignore_ascii_case("analyzer") {
-        return Err(format!(
-            "unsupported full-text index option {key:?}; only 'analyzer' is supported"
-        ));
+}
+
+/// Consumes the next token, requiring it to be the single symbol `sym`, framing errors for the
+/// `OPTIONS { … }` context (`rmp` task #661).
+fn expect_options_symbol(lex: &mut Lexer<'_>, sym: char) -> Result<(), String> {
+    match lex.next_tok()? {
+        Some(Tok::Symbol(c)) if c == sym => Ok(()),
+        Some(t) => Err(unexpected(
+            &t,
+            &format!("`{sym}` in an OPTIONS {{ … }} clause"),
+        )),
+        None => Err(format!("expected `{sym}` in an OPTIONS {{ … }} clause")),
     }
-    expect_symbol(lex, ':', "FULLTEXT")?;
-    let analyzer = match lex.next_tok()? {
-        Some(Tok::Str(s)) => s,
-        Some(other) => {
-            return Err(unexpected_generic(
-                &other,
-                "a quoted analyzer name after OPTIONS { analyzer:",
-            ));
+}
+
+/// Reads an `OPTIONS`-map **key**: a bare word (e.g. `indexProvider`, or a dotted/dashed
+/// `spatial.wgs-84.min` the lexer keeps whole), a `` `backtick-quoted` `` key, or a `'quoted'` string
+/// key — matching how Neo4j spells `indexConfig` keys (`rmp` task #661).
+fn expect_option_key(lex: &mut Lexer<'_>) -> Result<String, String> {
+    match lex.next_tok()? {
+        Some(Tok::Word(w)) => Ok(w),
+        Some(Tok::Quoted(q)) => Ok(q),
+        Some(Tok::Str(s)) => Ok(s),
+        Some(t) => Err(unexpected(&t, "an option key in an OPTIONS { … } clause")),
+        None => Err("expected an option key in an OPTIONS { … } clause".to_owned()),
+    }
+}
+
+/// Parses one `OPTIONS`-map value — a string, a bare token, a `[ … ]` list, or a `{ … }` map —
+/// consuming exactly it (`rmp` task #661). Structural validation only: the value's meaning is the
+/// caller's concern.
+fn parse_option_value(lex: &mut Lexer<'_>) -> Result<OptionValue, String> {
+    match lex.next_tok()? {
+        Some(Tok::Str(s)) => Ok(OptionValue::Str(s)),
+        Some(Tok::Quoted(q)) => Ok(OptionValue::Str(q)),
+        Some(Tok::Word(w)) => Ok(OptionValue::Word(w)),
+        Some(Tok::Symbol('[')) => {
+            let mut items = Vec::new();
+            if !peek_symbol(lex, ']')? {
+                loop {
+                    items.push(parse_option_value(lex)?);
+                    if peek_symbol(lex, ',')? {
+                        expect_options_symbol(lex, ',')?;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            expect_options_symbol(lex, ']')?;
+            Ok(OptionValue::List(items))
         }
-        None => return Err("expected a quoted analyzer name after OPTIONS { analyzer:".to_owned()),
-    };
-    expect_symbol(lex, '}', "FULLTEXT")?;
-    Ok(Some(analyzer))
+        Some(Tok::Symbol('{')) => Ok(OptionValue::Map(parse_option_map_body(lex)?)),
+        Some(other) => Err(unexpected(&other, "a value in an OPTIONS { … } clause")),
+        None => Err("expected a value in an OPTIONS { … } clause".to_owned()),
+    }
+}
+
+/// Parses the body of an `OPTIONS` / `indexConfig` map — the `key: value [, …]` pairs after an
+/// **already-consumed** opening `{`, consuming the closing `}` (`rmp` task #661). An empty `{}` is
+/// allowed. Keys are read by [`expect_option_key`], values by [`parse_option_value`].
+fn parse_option_map_body(lex: &mut Lexer<'_>) -> Result<Vec<(String, OptionValue)>, String> {
+    let mut entries = Vec::new();
+    if peek_symbol(lex, '}')? {
+        expect_options_symbol(lex, '}')?;
+        return Ok(entries);
+    }
+    loop {
+        let key = expect_option_key(lex)?;
+        expect_options_symbol(lex, ':')?;
+        let value = parse_option_value(lex)?;
+        entries.push((key, value));
+        if peek_symbol(lex, ',')? {
+            expect_options_symbol(lex, ',')?;
+        } else {
+            break;
+        }
+    }
+    expect_options_symbol(lex, '}')?;
+    Ok(entries)
+}
+
+/// Requires `value` to be a quoted string (`rmp` task #661); errors naming the `key` otherwise.
+fn as_option_string(value: &OptionValue, key: &str) -> Result<String, String> {
+    match value {
+        OptionValue::Str(s) => Ok(s.clone()),
+        _ => Err(format!("OPTIONS `{key}` expects a quoted string value")),
+    }
+}
+
+/// Requires `value` to be a nested `{ … }` map (`rmp` task #661); errors naming the `key` otherwise.
+fn as_option_map<'v>(
+    value: &'v OptionValue,
+    key: &str,
+) -> Result<&'v [(String, OptionValue)], String> {
+    match value {
+        OptionValue::Map(m) => Ok(m),
+        _ => Err(format!("OPTIONS `{key}` expects a `{{ … }}` map value")),
+    }
+}
+
+/// Parses an optional `OPTIONS { indexProvider: '<str>', indexConfig { … } }` clause on a
+/// `CREATE RANGE/TEXT/POINT INDEX` (`rmp` task #661), validating the Neo4j shape. The only recognised
+/// **top-level** keys are `indexProvider` (a quoted string) and `indexConfig` (a `{ … }` map); an
+/// unknown top-level key is a clear error. Graphus has a single built-in index provider and
+/// synchronous builds, so the provider and config are accepted for Neo4j-DDL compatibility and — for
+/// now — **not applied** (parse + validate; applying spatial/provider config is a follow-up). The
+/// `indexConfig` entries are accepted leniently (their keys carried but not interpreted), matching the
+/// constraint OPTIONS leniency (`rmp` #654). A malformed clause is a syntax error. No-op (returns
+/// without consuming) when the next token is not `OPTIONS`.
+fn parse_optional_index_options(lex: &mut Lexer<'_>) -> Result<(), String> {
+    if !consume_options_keyword(lex)? {
+        return Ok(());
+    }
+    expect_options_symbol(lex, '{')?;
+    for (key, value) in parse_option_map_body(lex)? {
+        match key.to_ascii_lowercase().as_str() {
+            "indexprovider" => {
+                let _ = as_option_string(&value, "indexProvider")?;
+            }
+            "indexconfig" => {
+                // Validate it is a map; its entries (spatial bounds, text config, …) are accepted and
+                // carried structurally but not applied (single built-in provider).
+                let _ = as_option_map(&value, "indexConfig")?;
+            }
+            other => {
+                return Err(format!(
+                    "unknown index OPTIONS key `{other}`; expected indexProvider or indexConfig"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Parses the remainder of a claimed **spatial (point)** index statement (`verb` + `POINT` already
@@ -1358,25 +1552,58 @@ fn parse_claimed_point(verb: &str, lex: &mut Lexer<'_>) -> Result<IndexCommand, 
         ));
     }
 
-    // Both CREATE and DROP take a name next.
-    let name = expect_name(lex, "a point index name", "POINT")?;
-
     match verb {
         "DROP" => {
+            // A point-index DROP always names its target.
+            let name = expect_name(lex, "a point index name", "POINT")?;
+            // `IF EXISTS` (`rmp` #661) turns a missing index into a no-op success.
+            let if_exists = parse_optional_if(lex, /* with_not */ false)?;
             expect_end(lex, "DROP POINT INDEX")?;
-            Ok(IndexCommand::DropPointIndex { name })
+            Ok(IndexCommand::DropPointIndex { name, if_exists })
         }
         "CREATE" => {
+            // The name is OPTIONAL (`rmp` #661, Neo4j parity): a bare `FOR`/`IF` directly after INDEX
+            // means "unnamed" → a deterministic auto-name derived from the covered schema. `IF NOT
+            // EXISTS` follows the (optional) name, before the `FOR` clause (Neo4j position).
+            let explicit_name = parse_optional_point_index_name(lex)?;
+            let if_not_exists = parse_optional_if(lex, /* with_not */ true)?;
             let (label, property) = parse_point_create_tail(lex)?;
+            let name = explicit_name.unwrap_or_else(|| auto_point_index_name(&label, &property));
             Ok(IndexCommand::CreatePointIndex {
                 name,
                 label,
                 property,
+                if_not_exists,
             })
         }
         // `parse_admin_statement` only routes CREATE/DROP/SHOW here; START/STOP never reach this.
         other => Err(format!("unsupported point index verb {other}")),
     }
+}
+
+/// Parses the OPTIONAL point-index name in `CREATE POINT INDEX [name] …` (`rmp` #661). Returns [`None`]
+/// (consuming nothing) when the next token is a bare `FOR` or `IF` — i.e. the name was omitted and a
+/// deterministic auto-name applies — otherwise consumes and returns the explicit name. A backtick-quoted
+/// `` `FOR` `` / `` `IF` `` is still a name (only the bare keyword signals "unnamed"). Mirrors
+/// [`parse_optional_constraint_name`].
+fn parse_optional_point_index_name(lex: &mut Lexer<'_>) -> Result<Option<String>, String> {
+    let mut peek = Lexer {
+        rest: lex.rest.clone(),
+    };
+    if let Some(Tok::Word(w)) = peek.next_tok()? {
+        if w.eq_ignore_ascii_case("FOR") || w.eq_ignore_ascii_case("IF") {
+            return Ok(None);
+        }
+    }
+    Ok(Some(expect_name(lex, "a point index name", "POINT")?))
+}
+
+/// A deterministic auto-name for an anonymous point index on `(label, property)` (`rmp` #661),
+/// `point_index_<label>_<property>` — so a repeated anonymous `CREATE POINT INDEX … IF NOT EXISTS`
+/// resolves to the same name (idempotent) and `SHOW INDEXES` reports a stable name. A cross-catalog
+/// name collision is caught by the engine's global name-uniqueness check.
+fn auto_point_index_name(label: &str, property: &str) -> String {
+    format!("point_index_{label}_{property}")
 }
 
 /// Parses the `FOR (<var>:<Label>) ON (<var>.<property>)` tail of a `CREATE POINT INDEX <name>`
@@ -1396,6 +1623,10 @@ fn parse_point_create_tail(lex: &mut Lexer<'_>) -> Result<(String, String), Stri
     expect_symbol(lex, '(', VERB)?;
     let property = parse_property_ref(VERB, lex)?;
     expect_symbol(lex, ')', VERB)?;
+    // Optional trailing `OPTIONS { indexConfig: { 'spatial.cartesian.min': [ … ], … } }` (`rmp` #661):
+    // parsed + validated structurally, then accepted-and-ignored (the spatial config is not yet applied
+    // — a follow-up; the clause must nonetheless parse without error for Neo4j-DDL compatibility).
+    parse_optional_index_options(lex)?;
     expect_end(lex, "CREATE POINT INDEX")?;
     Ok((label, property))
 }
@@ -1506,20 +1737,20 @@ fn show_targets_indexes(lead: &Tok, lex: &Lexer<'_>) -> bool {
     matches!(peek.next_tok(), Ok(Some(t)) if is_keyword(&t, "INDEX") || is_keyword(&t, "INDEXES"))
 }
 
-/// Parses a filtered `SHOW <filter> INDEXES [YIELD … | WHERE …]` (`rmp` #660); `first` is the
-/// already-read leading filter word. The plural `INDEXES` closes the filter — Graphus rejects the
-/// singular `SHOW … INDEX` (matching the bare `SHOW INDEXES` form) — then the optional tail is captured
-/// verbatim (`crate::engine::index_show` translates it).
+/// Parses a filtered `SHOW <filter> INDEX[ES] [YIELD … | WHERE …]` (`rmp` #660, #661); `first` is the
+/// already-read leading filter word. Either the plural `INDEXES` or the singular `INDEX` closes the
+/// filter — Neo4j accepts `INDEX[ES]` and the singular behaves identically (`rmp` #661) — then the
+/// optional tail is captured verbatim (`crate::engine::index_show` translates it).
 fn parse_show_indexes_filtered(first: &Tok, lex: &mut Lexer<'_>) -> Result<IndexCommand, String> {
     let filter = index_type_filter_from_lead(first)?;
-    // The INDEXES keyword closes the filter.
+    // The INDEX / INDEXES keyword closes the filter.
     let kw = lex
         .next_tok()?
-        .ok_or_else(|| "expected INDEXES after the SHOW INDEXES filter".to_owned())?;
-    if !is_keyword(&kw, "INDEXES") {
+        .ok_or_else(|| "expected INDEX or INDEXES after the SHOW INDEXES filter".to_owned())?;
+    if !is_keyword(&kw, "INDEXES") && !is_keyword(&kw, "INDEX") {
         return Err(unexpected_generic(
             &kw,
-            "INDEXES after the SHOW INDEXES filter",
+            "INDEX or INDEXES after the SHOW INDEXES filter",
         ));
     }
     let tail = capture_show_tail(lex, "SHOW INDEXES")?;
@@ -2183,7 +2414,7 @@ fn parse_index_legacy_on(verb: &str, lex: &mut Lexer<'_>) -> Result<IndexTarget,
     expect_symbol(lex, '(', verb)?;
     let property = expect_name(lex, "a property", verb)?;
     expect_symbol(lex, ')', verb)?;
-    expect_end(lex, &format!("{verb} INDEX"))?;
+    // The optional trailing `OPTIONS { … }` and end-of-statement are validated by the caller.
     // The legacy `ON :Label(prop)` form is single-property only (`rmp` task #657): a composite must use
     // the openCypher `FOR (n:L) ON (n.a, n.b)` shape.
     Ok(IndexTarget::Node {
@@ -5039,8 +5270,8 @@ mod tests {
         invalid("CREATE INDEX ix_person"); // a name with no target
         invalid("CREATE INDEX ix IF NOT EXISTS"); // IF NOT EXISTS with no target
         invalid("CREATE INDEXES FOR (n:Person) ON (n.age)"); // plural only for SHOW
-        invalid("SHOW INDEX"); // the singular is not a form
         invalid("SHOW INDEXES extra");
+        invalid("SHOW INDEX extra"); // the singular still rejects trailing junk (`rmp` #661)
         invalid("DROP INDEX"); // missing name/target
         invalid("DROP INDEX ix_person extra"); // by-name + trailing junk
         invalid("DROP INDEX ix_person IF NOT EXISTS"); // DROP takes IF EXISTS, not IF NOT EXISTS
@@ -5058,6 +5289,7 @@ mod tests {
                 label: "Article".to_owned(),
                 properties: vec!["title".to_owned()],
                 analyzer: "standard".to_owned(),
+                if_not_exists: false,
             }
         );
         // Multiple properties + explicit analyzer, case-insensitive keywords + whitespace + `;`.
@@ -5071,6 +5303,7 @@ mod tests {
                 label: "Book".to_owned(),
                 properties: vec!["title".to_owned(), "summary".to_owned()],
                 analyzer: "keyword".to_owned(),
+                if_not_exists: false,
             }
         );
         // Backtick-quoted name/label/property colliding with keywords still parse.
@@ -5081,6 +5314,7 @@ mod tests {
                 label: "Order".to_owned(),
                 properties: vec!["from".to_owned()],
                 analyzer: "standard".to_owned(),
+                if_not_exists: false,
             }
         );
     }
@@ -5090,13 +5324,15 @@ mod tests {
         assert_eq!(
             index_cmd("DROP FULLTEXT INDEX articles"),
             IndexCommand::DropFulltextIndex {
-                name: "articles".to_owned()
+                name: "articles".to_owned(),
+                if_exists: false,
             }
         );
         assert_eq!(
             index_cmd("drop fulltext index `My Index` ;"),
             IndexCommand::DropFulltextIndex {
-                name: "My Index".to_owned()
+                name: "My Index".to_owned(),
+                if_exists: false,
             }
         );
         // `SHOW FULLTEXT INDEXES` folds into the unified listing filtered to FULLTEXT (`rmp` #660).
@@ -5130,8 +5366,8 @@ mod tests {
         invalid(
             "CREATE FULLTEXT INDEX ft FOR (n:Article) ON EACH [n.title] OPTIONS { analyzer: x }",
         ); // unquoted
-        invalid("SHOW FULLTEXT INDEX"); // singular not a form
         invalid("SHOW FULLTEXT INDEXES extra");
+        invalid("SHOW FULLTEXT INDEX extra"); // the singular still rejects trailing junk
         invalid("DROP FULLTEXT INDEX"); // missing name
         invalid("DROP FULLTEXT INDEX ft trailing");
         invalid("CREATE FULLTEXT INDEXES ..."); // plural only for SHOW
@@ -5146,6 +5382,7 @@ mod tests {
                 name: "by_loc".to_owned(),
                 label: "City".to_owned(),
                 property: "location".to_owned(),
+                if_not_exists: false,
             }
         );
         // Case-insensitive keywords + whitespace + trailing `;`.
@@ -5155,6 +5392,7 @@ mod tests {
                 name: "near".to_owned(),
                 label: "Place".to_owned(),
                 property: "geo".to_owned(),
+                if_not_exists: false,
             }
         );
         // Backtick-quoted name/label/property colliding with keywords still parse.
@@ -5164,6 +5402,7 @@ mod tests {
                 name: "INDEX".to_owned(),
                 label: "Order".to_owned(),
                 property: "from".to_owned(),
+                if_not_exists: false,
             }
         );
     }
@@ -5173,13 +5412,15 @@ mod tests {
         assert_eq!(
             index_cmd("DROP POINT INDEX by_loc"),
             IndexCommand::DropPointIndex {
-                name: "by_loc".to_owned()
+                name: "by_loc".to_owned(),
+                if_exists: false,
             }
         );
         assert_eq!(
             index_cmd("drop point index `My Index` ;"),
             IndexCommand::DropPointIndex {
-                name: "My Index".to_owned()
+                name: "My Index".to_owned(),
+                if_exists: false,
             }
         );
         // `SHOW POINT INDEXES` folds into the unified listing filtered to POINT (`rmp` #660).
@@ -5202,17 +5443,199 @@ mod tests {
     #[test]
     fn claimed_but_malformed_point_is_a_syntax_error() {
         invalid("CREATE POINT"); // missing INDEX
-        invalid("CREATE POINT INDEX"); // missing name
+        invalid("CREATE POINT INDEX"); // missing FOR clause (the name is optional since `rmp` #661)
         invalid("CREATE POINT INDEX p"); // missing FOR clause
         invalid("CREATE POINT INDEX p FOR (n:City)"); // missing ON
         invalid("CREATE POINT INDEX p FOR (n:City) ON EACH [n.loc]"); // point uses single ON (...)
         invalid("CREATE POINT INDEX p FOR (n:City) ON (loc)"); // ref must be var.prop
         invalid("CREATE POINT INDEX p FOR (n:City) ON (n.loc) extra");
-        invalid("SHOW POINT INDEX"); // singular not a form
         invalid("SHOW POINT INDEXES extra");
+        invalid("SHOW POINT INDEX extra"); // the singular still rejects trailing junk
         invalid("DROP POINT INDEX"); // missing name
         invalid("DROP POINT INDEX p trailing");
         invalid("CREATE POINT INDEXES ..."); // plural only for SHOW
+    }
+
+    // --- `rmp` #661: OPTIONS clause + IF (NOT) EXISTS + optional POINT name + singular SHOW ---------
+
+    /// `OPTIONS { indexProvider, indexConfig { … } }` parses on RANGE/TEXT (the node-property synonym);
+    /// the clause is accepted and ignored (single built-in provider), so the parsed command is the same
+    /// as without it (`rmp` #661).
+    #[test]
+    fn options_clause_parses_on_range_text_indexes() {
+        let bare = index_cmd("CREATE INDEX ix FOR (n:Person) ON (n.age)");
+        assert_eq!(
+            index_cmd(
+                "CREATE INDEX ix FOR (n:Person) ON (n.age) \
+                 OPTIONS { indexProvider: 'range-1.0', indexConfig: { `spatial.cartesian.min`: [-100.0, -100.0] } }"
+            ),
+            bare,
+            "OPTIONS is accepted and ignored on a RANGE/plain index"
+        );
+        // RANGE + TEXT synonyms accept OPTIONS too.
+        assert_eq!(
+            index_cmd(
+                "CREATE RANGE INDEX r FOR (n:P) ON (n.a) OPTIONS { indexProvider: 'range-1.0' }"
+            ),
+            index_cmd("CREATE RANGE INDEX r FOR (n:P) ON (n.a)")
+        );
+        assert_eq!(
+            index_cmd("CREATE TEXT INDEX t FOR (n:P) ON (n.a) OPTIONS { indexConfig: {} }"),
+            index_cmd("CREATE TEXT INDEX t FOR (n:P) ON (n.a)")
+        );
+        // A malformed / unknown-top-level-key OPTIONS clause is a clear syntax error.
+        invalid("CREATE INDEX ix FOR (n:Person) ON (n.age) OPTIONS { bogus: 'x' }");
+        invalid("CREATE INDEX ix FOR (n:Person) ON (n.age) OPTIONS { indexProvider: 7 }"); // not a string
+        invalid("CREATE INDEX ix FOR (n:Person) ON (n.age) OPTIONS { indexConfig: 'x' }"); // not a map
+        invalid("CREATE INDEX ix FOR (n:Person) ON (n.age) OPTIONS {"); // unterminated
+    }
+
+    /// `OPTIONS { indexConfig: { 'spatial.…': [ … ] } }` parses structurally on a POINT index; the
+    /// spatial config is accepted and not applied, so the parsed command is unchanged (`rmp` #661).
+    #[test]
+    fn options_clause_parses_on_point_index() {
+        assert_eq!(
+            index_cmd(
+                "CREATE POINT INDEX by_loc FOR (n:City) ON (n.loc) \
+                 OPTIONS { indexConfig: { `spatial.cartesian.min`: [-100.0, -100.0], \
+                                          `spatial.cartesian.max`: [100.0, 100.0] } }"
+            ),
+            IndexCommand::CreatePointIndex {
+                name: "by_loc".to_owned(),
+                label: "City".to_owned(),
+                property: "loc".to_owned(),
+                if_not_exists: false,
+            }
+        );
+        invalid("CREATE POINT INDEX p FOR (n:City) ON (n.loc) OPTIONS { analyzer: 'x' }"); // unknown key
+    }
+
+    /// FULLTEXT accepts both the bare `analyzer:` form and the Neo4j `indexConfig { … }` form
+    /// (backtick-quoted keys), mapping `fulltext.analyzer` to the analyzer and accepting
+    /// `fulltext.eventually_consistent` (`rmp` #661).
+    #[test]
+    fn options_clause_parses_on_fulltext_index_configform() {
+        assert_eq!(
+            index_cmd(
+                "CREATE FULLTEXT INDEX ft FOR (n:Doc) ON EACH [n.body] \
+                 OPTIONS { indexConfig: { `fulltext.analyzer`: 'keyword', \
+                                          `fulltext.eventually_consistent`: true } }"
+            ),
+            IndexCommand::CreateFulltextIndex {
+                name: "ft".to_owned(),
+                label: "Doc".to_owned(),
+                properties: vec!["body".to_owned()],
+                analyzer: "keyword".to_owned(),
+                if_not_exists: false,
+            }
+        );
+        // `indexProvider` is accepted and ignored; the default analyzer stays `standard`.
+        assert_eq!(
+            index_cmd(
+                "CREATE FULLTEXT INDEX ft FOR (n:Doc) ON EACH [n.body] \
+                 OPTIONS { indexProvider: 'fulltext-1.0' }"
+            ),
+            IndexCommand::CreateFulltextIndex {
+                name: "ft".to_owned(),
+                label: "Doc".to_owned(),
+                properties: vec!["body".to_owned()],
+                analyzer: "standard".to_owned(),
+                if_not_exists: false,
+            }
+        );
+        // A bad analyzer value type inside indexConfig is a clear error.
+        invalid(
+            "CREATE FULLTEXT INDEX ft FOR (n:Doc) ON EACH [n.body] \
+             OPTIONS { indexConfig: { `fulltext.analyzer`: 7 } }",
+        );
+    }
+
+    /// `IF NOT EXISTS` on CREATE POINT/FULLTEXT and `IF EXISTS` on DROP POINT/FULLTEXT set the
+    /// idempotency flags (`rmp` #661).
+    #[test]
+    fn if_not_exists_and_if_exists_on_point_and_fulltext() {
+        assert_eq!(
+            index_cmd("CREATE POINT INDEX p IF NOT EXISTS FOR (n:City) ON (n.loc)"),
+            IndexCommand::CreatePointIndex {
+                name: "p".to_owned(),
+                label: "City".to_owned(),
+                property: "loc".to_owned(),
+                if_not_exists: true,
+            }
+        );
+        assert_eq!(
+            index_cmd("CREATE FULLTEXT INDEX ft IF NOT EXISTS FOR (n:Doc) ON EACH [n.body]"),
+            IndexCommand::CreateFulltextIndex {
+                name: "ft".to_owned(),
+                label: "Doc".to_owned(),
+                properties: vec!["body".to_owned()],
+                analyzer: "standard".to_owned(),
+                if_not_exists: true,
+            }
+        );
+        assert_eq!(
+            index_cmd("DROP POINT INDEX p IF EXISTS"),
+            IndexCommand::DropPointIndex {
+                name: "p".to_owned(),
+                if_exists: true,
+            }
+        );
+        assert_eq!(
+            index_cmd("DROP FULLTEXT INDEX ft IF EXISTS"),
+            IndexCommand::DropFulltextIndex {
+                name: "ft".to_owned(),
+                if_exists: true,
+            }
+        );
+    }
+
+    /// An anonymous POINT index gets a deterministic auto-name `point_index_<label>_<property>`
+    /// (`rmp` #661), and the anonymous + `IF NOT EXISTS` combination parses.
+    #[test]
+    fn anonymous_point_index_auto_name() {
+        assert_eq!(
+            index_cmd("CREATE POINT INDEX FOR (n:City) ON (n.loc)"),
+            IndexCommand::CreatePointIndex {
+                name: "point_index_City_loc".to_owned(),
+                label: "City".to_owned(),
+                property: "loc".to_owned(),
+                if_not_exists: false,
+            }
+        );
+        assert_eq!(
+            index_cmd("CREATE POINT INDEX IF NOT EXISTS FOR (n:City) ON (n.loc)"),
+            IndexCommand::CreatePointIndex {
+                name: "point_index_City_loc".to_owned(),
+                label: "City".to_owned(),
+                property: "loc".to_owned(),
+                if_not_exists: true,
+            }
+        );
+    }
+
+    /// The singular `SHOW INDEX` / `SHOW <filter> INDEX` behaves identically to the plural
+    /// `SHOW INDEXES` (Neo4j accepts `INDEX[ES]`) (`rmp` #661).
+    #[test]
+    fn singular_show_index_matches_plural() {
+        assert_eq!(index_cmd("SHOW INDEX"), index_cmd("SHOW INDEXES"));
+        assert_eq!(
+            index_cmd("SHOW POINT INDEX"),
+            index_cmd("SHOW POINT INDEXES")
+        );
+        assert_eq!(
+            index_cmd("SHOW FULLTEXT INDEX"),
+            index_cmd("SHOW FULLTEXT INDEXES")
+        );
+        assert_eq!(
+            index_cmd("SHOW RANGE INDEX"),
+            index_cmd("SHOW RANGE INDEXES")
+        );
+        assert_eq!(index_cmd("SHOW ALL INDEX"), index_cmd("SHOW ALL INDEXES"));
+        // The singular is a full synonym, including the YIELD/WHERE tail.
+        assert_eq!(
+            index_cmd("SHOW INDEX YIELD name"),
+            index_cmd("SHOW INDEXES YIELD name")
+        );
     }
 
     #[test]

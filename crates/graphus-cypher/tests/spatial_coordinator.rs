@@ -109,7 +109,7 @@ fn id_of(coord: &mut Coord, name: &str) -> u64 {
 
 fn create_index(coord: &mut Coord) {
     coord
-        .create_point_index("by_loc", "City", "loc")
+        .create_point_index("by_loc", "City", "loc", false)
         .expect("create point index");
     // Drive the (tiny) online build to completion so the index is Online.
     while coord.has_pending_index_builds() {
@@ -292,7 +292,7 @@ fn populating_index_is_withheld_from_the_planner_but_still_correct() {
         );
     }
     coord
-        .create_point_index("by_loc", "City", "loc")
+        .create_point_index("by_loc", "City", "loc", false)
         .expect("create");
     assert!(coord.has_pending_index_builds());
 
@@ -429,7 +429,7 @@ fn drop_index_falls_back_to_scan_still_correct() {
     assert!(plan_uses_spatial_seek(&compile(&src, &indexed)));
     assert_eq!(matched_ids(&mut coord, &indexed, &src), vec![a]);
 
-    coord.drop_point_index("by_loc").expect("drop");
+    coord.drop_point_index("by_loc", false).expect("drop");
     // After the drop the catalog no longer surfaces the index, so the query falls back to a scan and
     // remains correct (a spatial proximity query is never a hard error, unlike a dropped full-text
     // index's procedure call).
@@ -499,4 +499,81 @@ fn spatial_cross_snapshot_reader_sees_its_snapshot_point_467() {
         vec![a],
         "the current snapshot's point is at (100,100)"
     );
+}
+
+// =================================================================================================
+// `rmp` #661: IF NOT EXISTS / IF EXISTS / unified DROP INDEX <name> for point indexes
+// =================================================================================================
+
+/// `CREATE POINT INDEX … IF NOT EXISTS` is idempotent (`rmp` #661): a second create over the same
+/// name — or a *different* name over the same covered `(label, property)` schema — is a no-op
+/// (`mutated == false`), never a replace, and leaves exactly one index.
+#[test]
+fn create_point_index_if_not_exists_is_idempotent() {
+    let mut coord = fresh_coord();
+    run_write(
+        &mut coord,
+        "CREATE (:City {loc: point({x: 0, y: 0}), name: 'a'})",
+    );
+
+    assert!(
+        coord
+            .create_point_index("by_loc", "City", "loc", true)
+            .expect("create"),
+        "the first IF NOT EXISTS create builds the index"
+    );
+    assert!(
+        !coord
+            .create_point_index("by_loc", "City", "loc", true)
+            .expect("re-create"),
+        "a repeated IF NOT EXISTS create over the same name is a no-op"
+    );
+    assert!(
+        !coord
+            .create_point_index("also_loc", "City", "loc", true)
+            .expect("re-create by schema"),
+        "an IF NOT EXISTS create over an already-covered schema is a no-op"
+    );
+    let listed = coord.list_point_indexes();
+    assert_eq!(listed.len(), 1, "exactly one point index remains");
+    assert_eq!(listed[0].0, "by_loc");
+}
+
+/// `DROP POINT INDEX … IF EXISTS` of a never-declared index is a clean no-op success (`mutated ==
+/// false`); the same drop **without** `IF EXISTS` is a `IndexDropFailed` error (`rmp` #661).
+#[test]
+fn drop_point_index_if_exists_no_op_when_missing() {
+    let mut coord = fresh_coord();
+    assert!(
+        !coord
+            .drop_point_index("ghost", true)
+            .expect("IF EXISTS drop of a missing index is a no-op"),
+    );
+    let err = coord
+        .drop_point_index("ghost", false)
+        .expect_err("dropping a missing index without IF EXISTS errors");
+    assert!(err.to_string().contains("IndexDropFailed"), "got: {err}");
+}
+
+/// The unified `DROP INDEX <name>` (no kind keyword) resolves the **spatial** catalog too, so a point
+/// index is droppable by the standard Neo4j form (`rmp` #661).
+#[test]
+fn drop_index_by_name_resolves_point() {
+    let mut coord = fresh_coord();
+    run_write(
+        &mut coord,
+        "CREATE (:City {loc: point({x: 0, y: 0}), name: 'a'})",
+    );
+    coord
+        .create_point_index("by_loc", "City", "loc", false)
+        .expect("create");
+    assert_eq!(coord.list_point_indexes().len(), 1);
+
+    assert!(
+        coord
+            .drop_property_index_by_name("by_loc", false)
+            .expect("drop by name"),
+        "the generic DROP INDEX <name> drops a point index"
+    );
+    assert!(coord.list_point_indexes().is_empty());
 }

@@ -1287,19 +1287,33 @@ pub fn redact_index_detail(cmd: &crate::engine::IndexCommand) -> String {
             label,
             properties,
             analyzer,
-        } => format!(
-            "CREATE FULLTEXT INDEX {name} FOR (:{label}) ON EACH [{}] (analyzer={analyzer})",
-            properties.join(", ")
-        ),
-        I::DropFulltextIndex { name } => format!("DROP FULLTEXT INDEX {name}"),
+            if_not_exists,
+        } => {
+            let if_ne = if *if_not_exists { " IF NOT EXISTS" } else { "" };
+            format!(
+                "CREATE FULLTEXT INDEX {name}{if_ne} FOR (:{label}) ON EACH [{}] (analyzer={analyzer})",
+                properties.join(", ")
+            )
+        }
+        I::DropFulltextIndex { name, if_exists } => {
+            let if_e = if *if_exists { " IF EXISTS" } else { "" };
+            format!("DROP FULLTEXT INDEX {name}{if_e}")
+        }
         // Spatial (point) index DDL (`rmp` task #98) carries no secret either: the index name, label
         // and property key are all schema identifiers.
         I::CreatePointIndex {
             name,
             label,
             property,
-        } => format!("CREATE POINT INDEX {name} FOR (:{label}) ON ({property})"),
-        I::DropPointIndex { name } => format!("DROP POINT INDEX {name}"),
+            if_not_exists,
+        } => {
+            let if_ne = if *if_not_exists { " IF NOT EXISTS" } else { "" };
+            format!("CREATE POINT INDEX {name}{if_ne} FOR (:{label}) ON ({property})")
+        }
+        I::DropPointIndex { name, if_exists } => {
+            let if_e = if *if_exists { " IF EXISTS" } else { "" };
+            format!("DROP POINT INDEX {name}{if_e}")
+        }
     }
 }
 

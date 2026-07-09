@@ -104,7 +104,13 @@ fn id_of(coord: &mut Coord, label: &str, name: &str) -> u64 {
 
 fn create_index(coord: &mut Coord) {
     coord
-        .create_fulltext_index("ft", "Article", &["title".to_owned()], Analyzer::Standard)
+        .create_fulltext_index(
+            "ft",
+            "Article",
+            &["title".to_owned()],
+            Analyzer::Standard,
+            false,
+        )
         .expect("create fulltext index");
     // Drive the (tiny) online build to completion so the index is Online.
     while coord.has_pending_index_builds() {
@@ -237,7 +243,13 @@ fn online_build_indexes_a_populated_store() {
         );
     }
     coord
-        .create_fulltext_index("ft", "Article", &["title".to_owned()], Analyzer::Standard)
+        .create_fulltext_index(
+            "ft",
+            "Article",
+            &["title".to_owned()],
+            Analyzer::Standard,
+            false,
+        )
         .expect("create");
     assert!(coord.has_pending_index_builds());
     // Drive the build in small chunks (the interleaving point).
@@ -303,7 +315,7 @@ fn drop_index_then_query_errors() {
     create_index(&mut coord);
     assert_eq!(query_ids(&mut coord, "ft", "graph").len(), 1);
 
-    coord.drop_fulltext_index("ft").expect("drop");
+    coord.drop_fulltext_index("ft", false).expect("drop");
     // Querying a dropped index is a clear error (the procedure surfaces it), not silently-empty rows.
     let plan = compile("CALL db.index.fulltext.queryNodes('ft', 'graph') YIELD node RETURN node");
     let txn = coord.begin_serializable();
@@ -372,4 +384,99 @@ fn fulltext_cross_snapshot_reader_sees_its_snapshot_term_467() {
         vec![a_id],
         "the current snapshot matches the new term 'dog'"
     );
+}
+
+// =================================================================================================
+// `rmp` #661: IF NOT EXISTS / IF EXISTS / unified DROP INDEX <name> for full-text indexes
+// =================================================================================================
+
+/// `CREATE FULLTEXT INDEX … IF NOT EXISTS` is idempotent (`rmp` #661): a second create over the same
+/// name — or a *different* name over the same covered `(label, properties)` schema — is a no-op
+/// (`mutated == false`), never a replace, and leaves exactly one index.
+#[test]
+fn create_fulltext_index_if_not_exists_is_idempotent() {
+    let mut coord = fresh_coord();
+    write(&mut coord, "CREATE (:Article {title: 'hello', name: 'a'})");
+
+    assert!(
+        coord
+            .create_fulltext_index(
+                "ft",
+                "Article",
+                &["title".to_owned()],
+                Analyzer::Standard,
+                true
+            )
+            .expect("create"),
+        "the first IF NOT EXISTS create builds the index"
+    );
+    assert!(
+        !coord
+            .create_fulltext_index(
+                "ft",
+                "Article",
+                &["title".to_owned()],
+                Analyzer::Standard,
+                true
+            )
+            .expect("re-create"),
+        "a repeated IF NOT EXISTS create over the same name is a no-op"
+    );
+    assert!(
+        !coord
+            .create_fulltext_index(
+                "ft2",
+                "Article",
+                &["title".to_owned()],
+                Analyzer::Standard,
+                true
+            )
+            .expect("re-create by schema"),
+        "an IF NOT EXISTS create over an already-covered schema is a no-op"
+    );
+    let listed = coord.list_fulltext_indexes();
+    assert_eq!(listed.len(), 1, "exactly one full-text index remains");
+    assert_eq!(listed[0].0, "ft");
+}
+
+/// `DROP FULLTEXT INDEX … IF EXISTS` of a never-declared index is a clean no-op success (`mutated ==
+/// false`); the same drop **without** `IF EXISTS` is a `IndexDropFailed` error (`rmp` #661).
+#[test]
+fn drop_fulltext_index_if_exists_no_op_when_missing() {
+    let mut coord = fresh_coord();
+    assert!(
+        !coord
+            .drop_fulltext_index("ghost", true)
+            .expect("IF EXISTS drop of a missing index is a no-op"),
+    );
+    let err = coord
+        .drop_fulltext_index("ghost", false)
+        .expect_err("dropping a missing index without IF EXISTS errors");
+    assert!(err.to_string().contains("IndexDropFailed"), "got: {err}");
+}
+
+/// The unified `DROP INDEX <name>` (no kind keyword) resolves the **full-text** catalog too, so a
+/// full-text index is droppable by the standard Neo4j form (`rmp` #661).
+#[test]
+fn drop_index_by_name_resolves_fulltext() {
+    let mut coord = fresh_coord();
+    write(&mut coord, "CREATE (:Article {title: 'hello', name: 'a'})");
+    coord
+        .create_fulltext_index(
+            "ft",
+            "Article",
+            &["title".to_owned()],
+            Analyzer::Standard,
+            false,
+        )
+        .expect("create");
+    assert_eq!(coord.list_fulltext_indexes().len(), 1);
+
+    assert!(
+        coord
+            .drop_property_index_by_name("ft", false)
+            .expect("drop by name"),
+        "the generic DROP INDEX <name> drops a full-text index"
+    );
+    assert!(coord.list_fulltext_indexes().is_empty());
 }

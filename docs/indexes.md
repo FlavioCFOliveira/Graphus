@@ -70,6 +70,24 @@ Without `IF NOT EXISTS`, re-declaring is an error (with **no** side effect):
 | An index already covers the same `(label, property)` — even under a different name | `Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists` |
 | The requested **name** is already used by another index or constraint | `Neo.ClientError.Schema.IndexWithNameAlreadyExists` |
 
+### `OPTIONS` clause
+
+A `CREATE INDEX` may carry a trailing Neo4j `OPTIONS { … }` map naming a backing-index provider and
+its configuration. Graphus has a **single built-in index provider** and synchronous builds, so the
+clause is **accepted for Neo4j-DDL compatibility and not applied** — the created index is identical
+with or without it. The clause is still fully validated: `indexProvider` must be a quoted string,
+`indexConfig` must be a map, and any *other* top-level key is a clear syntax error; unknown
+`indexConfig` keys are accepted and ignored.
+
+```cypher
+CREATE INDEX ix_person FOR (p:Person) ON (p.name)
+  OPTIONS { indexProvider: 'range-1.0', indexConfig: { } }
+```
+
+The same `OPTIONS` clause is accepted on `CREATE RANGE INDEX`, `CREATE TEXT INDEX`,
+`CREATE POINT INDEX` (whose `indexConfig` may carry the spatial `spatial.cartesian.min|max` /
+`spatial.wgs-84.min|max` bounds), and `CREATE FULLTEXT INDEX` (see below).
+
 ---
 
 ## Dropping an index
@@ -80,6 +98,12 @@ Without `IF NOT EXISTS`, re-declaring is an error (with **no** side effect):
 DROP INDEX ix_person
 DROP INDEX ix_person IF EXISTS   -- no-op (0 removed) if it does not exist
 ```
+
+The unified `DROP INDEX <name>` form does **not** spell the index kind, so it drops an index of
+**any** kind by name — node-property / relationship-property / composite `RANGE`, `FULLTEXT` **and**
+`POINT` — since names are globally unique across every catalog. (The kind-specific
+`DROP POINT INDEX <name>` / `DROP FULLTEXT INDEX <name>` forms still work too, and both accept
+`IF EXISTS`.)
 
 Dropping a name that does not exist **without** `IF EXISTS` is an error:
 `Neo.ClientError.Schema.IndexDropFailed`.
@@ -120,7 +144,11 @@ bare listing returns the **12 default columns**, in Neo4j order:
 
 ```cypher
 SHOW INDEXES
+SHOW INDEX     -- the singular is accepted too, and behaves identically
 ```
+
+Neo4j accepts both `INDEX` and `INDEXES`; the singular is a full synonym everywhere the plural is
+(including the filtered forms and the `YIELD` / `WHERE` / `RETURN` tail).
 
 ### Type filters
 
@@ -151,6 +179,36 @@ config lives here), `failureMessage` (empty), and `createStatement` (a round-tri
 SHOW INDEXES YIELD name, type, state WHERE type = 'RANGE' RETURN name, state
 SHOW INDEXES YIELD *
 ```
+
+---
+
+## Point and full-text index DDL
+
+`POINT` (spatial) and `FULLTEXT` indexes are their own kinds, created and dropped with the Neo4j
+`POINT` / `FULLTEXT` keywords. Both support the same idempotency and `OPTIONS` modifiers as the
+node-property index:
+
+```cypher
+-- POINT: the name is optional (auto-named point_index_<label>_<property>); IF NOT EXISTS / OPTIONS.
+CREATE POINT INDEX by_loc IF NOT EXISTS FOR (c:City) ON (c.location)
+CREATE POINT INDEX FOR (c:City) ON (c.location)          -- anonymous → point_index_City_location
+CREATE POINT INDEX by_loc FOR (c:City) ON (c.location)
+  OPTIONS { indexConfig: { `spatial.cartesian.min`: [-100.0, -100.0],
+                           `spatial.cartesian.max`: [ 100.0,  100.0] } }
+DROP POINT INDEX by_loc IF EXISTS
+
+-- FULLTEXT: named; ON EACH [ … ]; IF NOT EXISTS; analyzer via the bare or indexConfig OPTIONS form.
+CREATE FULLTEXT INDEX ft IF NOT EXISTS FOR (a:Article) ON EACH [a.title, a.body]
+  OPTIONS { analyzer: 'keyword' }
+CREATE FULLTEXT INDEX ft FOR (a:Article) ON EACH [a.title]
+  OPTIONS { indexConfig: { `fulltext.analyzer`: 'standard',
+                           `fulltext.eventually_consistent`: true } }
+DROP FULLTEXT INDEX ft IF EXISTS
+```
+
+For full-text, `fulltext.analyzer` maps to the analyzer (`standard` / `keyword`);
+`fulltext.eventually_consistent` is accepted and ignored (Graphus builds are synchronous). A `POINT`
+or `FULLTEXT` index is also droppable by the unified `DROP INDEX <name>` form.
 
 ---
 

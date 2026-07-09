@@ -191,9 +191,11 @@ pub enum IndexCommand {
         /// The raw `YIELD …` / `WHERE …` tail, or [`None`] for a bare listing.
         tail: Option<String>,
     },
-    /// `CREATE FULLTEXT INDEX <name> FOR (n:<Label>) ON EACH [n.<prop>, …]` (`rmp` task #72): starts
-    /// a **non-blocking** online build of a full-text index over `(label, properties)` analyzed with
-    /// `analyzer` (a lower-cased analyzer name; `standard` by default).
+    /// `CREATE FULLTEXT INDEX <name> [IF NOT EXISTS] FOR (n:<Label>) ON EACH [n.<prop>, …]`
+    /// (`rmp` tasks #72, #661): starts a **non-blocking** online build of a full-text index over
+    /// `(label, properties)` analyzed with `analyzer` (a lower-cased analyzer name; `standard` by
+    /// default). `if_not_exists` makes an already-existing equivalent index (same name or same covered
+    /// schema) a no-op success rather than a replace.
     CreateFulltextIndex {
         /// The server-unique index name.
         name: String,
@@ -204,15 +206,23 @@ pub enum IndexCommand {
         /// The analyzer name (`standard` / `keyword`); validated by the engine against the supported
         /// set so an unknown analyzer is a clear error.
         analyzer: String,
+        /// Whether `IF NOT EXISTS` was given (a duplicate becomes a no-op success) (`rmp` task #661).
+        if_not_exists: bool,
     },
-    /// `DROP INDEX <name>` of a full-text index (`rmp` task #72): removes it (durable + in-memory),
-    /// cancelling any in-progress build.
+    /// `DROP [FULLTEXT] INDEX <name> [IF EXISTS]` of a full-text index (`rmp` tasks #72, #661): removes
+    /// it (durable + in-memory), cancelling any in-progress build. `if_exists` makes a missing index a
+    /// no-op success rather than an error.
     DropFulltextIndex {
         /// The full-text index name to drop.
         name: String,
+        /// Whether `IF EXISTS` was given (a missing index becomes a no-op success) (`rmp` task #661).
+        if_exists: bool,
     },
-    /// `CREATE POINT INDEX <name> FOR (n:<Label>) ON (n.<prop>)` (`rmp` task #98): starts a
-    /// **non-blocking** online build of a grid spatial (point) index over `(label, property)`.
+    /// `CREATE POINT INDEX [<name>] [IF NOT EXISTS] FOR (n:<Label>) ON (n.<prop>)`
+    /// (`rmp` tasks #98, #661): starts a **non-blocking** online build of a grid spatial (point) index
+    /// over `(label, property)`. `name` is the requested server-unique name (auto-generated
+    /// deterministically by the admin matcher when omitted); `if_not_exists` makes an already-existing
+    /// equivalent index (same name or same covered schema) a no-op success rather than a replace.
     CreatePointIndex {
         /// The server-unique index name.
         name: String,
@@ -220,12 +230,17 @@ pub enum IndexCommand {
         label: String,
         /// The point property the index covers (exactly one).
         property: String,
+        /// Whether `IF NOT EXISTS` was given (a duplicate becomes a no-op success) (`rmp` task #661).
+        if_not_exists: bool,
     },
-    /// `DROP POINT INDEX <name>` (`rmp` task #98): removes the spatial index (durable + in-memory),
-    /// cancelling any in-progress build.
+    /// `DROP [POINT] INDEX <name> [IF EXISTS]` (`rmp` tasks #98, #661): removes the spatial index
+    /// (durable + in-memory), cancelling any in-progress build. `if_exists` makes a missing index a
+    /// no-op success rather than an error.
     DropPointIndex {
         /// The spatial index name to drop.
         name: String,
+        /// Whether `IF EXISTS` was given (a missing index becomes a no-op success) (`rmp` task #661).
+        if_exists: bool,
     },
     /// `CREATE INDEX [<name>] [IF NOT EXISTS] FOR ()-[r:<TYPE>]-() ON (r.<property>)` on
     /// `(rel_type, property)` (`rmp` task #646): the relationship analogue of
@@ -859,6 +874,7 @@ mod tests {
                     label: "Doc".to_owned(),
                     properties: vec!["body".to_owned()],
                     analyzer: "standard".to_owned(),
+                    if_not_exists: false,
                 },
                 true,
             )
@@ -868,7 +884,8 @@ mod tests {
         assert_eq!(
             index_ddl_summary(
                 &IndexCommand::DropPointIndex {
-                    name: "p".to_owned()
+                    name: "p".to_owned(),
+                    if_exists: false,
                 },
                 true
             )
