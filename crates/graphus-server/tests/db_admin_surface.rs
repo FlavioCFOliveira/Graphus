@@ -543,9 +543,10 @@ fn extract_json_string(body: &str, key: &str) -> Option<String> {
     Some(rest[..end].to_owned())
 }
 
-/// One `SHOW INDEXES` row, decoded from the Neo4j-conformant wire shape (`rmp` task #626):
-/// `name, type, entityType, labelsOrTypes, properties, state`. The single covered label / property
-/// are read out of the `labelsOrTypes` / `properties` single-element lists for the assertions.
+/// One `SHOW INDEXES` row, decoded from the Neo4j-conformant unified wire shape (`rmp` task #660): the
+/// 12 default columns `id, name, state, populationPercent, type, entityType, labelsOrTypes, properties,
+/// indexProvider, owningConstraint, lastRead, readCount`. The single covered label / property are read
+/// out of the `labelsOrTypes` / `properties` lists (empty for the always-listed token LOOKUP rows).
 #[derive(Debug)]
 struct IndexRow {
     name: String,
@@ -562,48 +563,35 @@ async fn show_indexes(client: &mut BoltClient) -> Vec<IndexRow> {
 /// `SHOW INDEXES` against a specific database (the Bolt `db` extra), or the default when `None`.
 async fn show_indexes_on(client: &mut BoltClient, db: Option<&str>) -> Vec<IndexRow> {
     let rows = client.run_ok("SHOW INDEXES", db).await;
-    rows.into_iter()
-        .map(|row| {
-            assert_eq!(
-                row.len(),
-                7,
-                "name, type, entityType, labelsOrTypes, properties, state, owningConstraint: {row:?}"
-            );
-            let mut it = row.into_iter();
-            let mut next = || it.next().expect("column present");
-            let name = match next() {
-                Value::String(s) => s,
-                other => panic!("name must be a string: {other:?}"),
-            };
-            let _type = next(); // "RANGE"
-            let entity = next(); // "NODE"
-            assert_eq!(
-                entity,
-                Value::String("NODE".to_owned()),
-                "entityType is NODE"
-            );
-            let single = |v: Value, what: &str| match v {
-                Value::List(mut items) if items.len() == 1 => match items.remove(0) {
-                    Value::String(s) => s,
-                    other => panic!("{what} element must be a string: {other:?}"),
-                },
-                other => panic!("{what} must be a single-element list: {other:?}"),
-            };
-            let label = single(next(), "labelsOrTypes");
-            let property = single(next(), "properties");
-            let state = match next() {
-                Value::String(s) => s,
-                other => panic!("state must be a string: {other:?}"),
-            };
-            let _owning_constraint = next(); // `owningConstraint` (String or Null) — `rmp` #653
-            IndexRow {
-                name,
-                label,
-                property,
-                state,
-            }
-        })
-        .collect()
+    rows.into_iter().map(decode_index_row).collect()
+}
+
+/// Decodes one 12-column default `SHOW INDEXES` row into an [`IndexRow`] (`rmp` #660). The covered
+/// label / property are the first element of the `labelsOrTypes` / `properties` lists, or empty for a
+/// token LOOKUP row (whose lists are empty).
+fn decode_index_row(row: Vec<Value>) -> IndexRow {
+    assert_eq!(row.len(), 12, "12 default SHOW INDEXES columns: {row:?}");
+    let string = |v: &Value, what: &str| match v {
+        Value::String(s) => s.clone(),
+        other => panic!("{what} must be a string: {other:?}"),
+    };
+    // The first list element, or "" for an empty list (a token LOOKUP row covers no label/property).
+    let first = |v: &Value, what: &str| match v {
+        Value::List(items) => match items.first() {
+            Some(Value::String(s)) => s.clone(),
+            Some(other) => panic!("{what} element must be a string: {other:?}"),
+            None => String::new(),
+        },
+        other => panic!("{what} must be a list: {other:?}"),
+    };
+    // Columns: id, name, state, populationPercent, type, entityType, labelsOrTypes, properties,
+    // indexProvider, owningConstraint, lastRead, readCount.
+    IndexRow {
+        name: string(&row[1], "name"),
+        state: string(&row[2], "state"),
+        label: first(&row[6], "labelsOrTypes"),
+        property: first(&row[7], "properties"),
+    }
 }
 
 // ================================================================================================
@@ -658,16 +646,17 @@ async fn bolt_create_index_is_non_blocking_and_reaches_online() {
             "SHOW INDEXES surfaces the auto-name"
         );
         state = row.state.clone();
+        // The `state` column is the UPPER-CASE Neo4j string (`rmp` #660).
         assert!(
-            state == "online" || state == "populating",
+            state == "ONLINE" || state == "POPULATING",
             "unexpected index state {state:?}"
         );
-        if state == "online" {
+        if state == "ONLINE" {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
-    assert_eq!(state, "online", "the index must reach online");
+    assert_eq!(state, "ONLINE", "the index must reach online");
 
     // The online index answers an equality query correctly (two Persons aged 25).
     assert_eq!(
@@ -770,35 +759,33 @@ struct IndexRowFull {
     state: String,
 }
 
-/// Decodes every `SHOW INDEXES` row keeping the `entityType` column (`rmp` task #646).
+/// Decodes every `SHOW INDEXES` row keeping the `entityType` column (`rmp` task #646), from the 12
+/// default columns of the unified listing (`rmp` #660).
 async fn show_indexes_full(client: &mut BoltClient) -> Vec<IndexRowFull> {
     let rows = client.run_ok("SHOW INDEXES", None).await;
     rows.into_iter()
         .map(|row| {
-            assert_eq!(row.len(), 7, "7 SHOW INDEXES columns: {row:?}");
-            let mut it = row.into_iter();
-            let mut next = || it.next().expect("column present");
-            let s = |v: Value, what: &str| match v {
-                Value::String(s) => s,
+            assert_eq!(row.len(), 12, "12 default SHOW INDEXES columns: {row:?}");
+            let string = |v: &Value, what: &str| match v {
+                Value::String(s) => s.clone(),
                 other => panic!("{what} must be a string: {other:?}"),
             };
-            let name = s(next(), "name");
-            let _type = next(); // "RANGE"
-            let entity = s(next(), "entityType");
-            let single = |v: Value, what: &str| match v {
-                Value::List(mut items) if items.len() == 1 => s(items.remove(0), what),
-                other => panic!("{what} must be a single-element list: {other:?}"),
+            let first = |v: &Value, what: &str| match v {
+                Value::List(items) => match items.first() {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(other) => panic!("{what} element must be a string: {other:?}"),
+                    None => String::new(),
+                },
+                other => panic!("{what} must be a list: {other:?}"),
             };
-            let label_or_type = single(next(), "labelsOrTypes");
-            let property = single(next(), "properties");
-            let state = s(next(), "state");
-            let _owning_constraint = next(); // `owningConstraint` (String or Null) — `rmp` #653
+            // Columns: id, name, state, populationPercent, type, entityType, labelsOrTypes,
+            // properties, indexProvider, owningConstraint, lastRead, readCount.
             IndexRowFull {
-                name,
-                entity,
-                label_or_type,
-                property,
-                state,
+                name: string(&row[1], "name"),
+                state: string(&row[2], "state"),
+                entity: string(&row[5], "entityType"),
+                label_or_type: first(&row[6], "labelsOrTypes"),
+                property: first(&row[7], "properties"),
             }
         })
         .collect()
@@ -846,7 +833,7 @@ async fn bolt_relationship_property_index_lifecycle() {
     assert_eq!(rel.entity, "RELATIONSHIP", "entityType is RELATIONSHIP");
     assert_eq!(rel.label_or_type, "KNOWS");
     assert_eq!(rel.property, "since");
-    assert_eq!(rel.state, "online", "the synchronous rel build ends online");
+    assert_eq!(rel.state, "ONLINE", "the synchronous rel build ends online");
     // The node index is still there with entityType NODE.
     assert!(
         listing
@@ -865,7 +852,9 @@ async fn bolt_relationship_property_index_lifecycle() {
         show_indexes_full(&mut c)
             .await
             .iter()
-            .filter(|r| r.entity == "RELATIONSHIP")
+            // The unified listing always includes the `rel_type_lookup_index` (entityType
+            // RELATIONSHIP), so match the covered rel type to count only the property index (`rmp` #660).
+            .filter(|r| r.entity == "RELATIONSHIP" && r.label_or_type == "KNOWS")
             .count(),
         1,
         "IF NOT EXISTS did not create a second rel index"
@@ -877,7 +866,8 @@ async fn bolt_relationship_property_index_lifecycle() {
         !show_indexes_full(&mut c)
             .await
             .iter()
-            .any(|r| r.entity == "RELATIONSHIP"),
+            // Exclude the always-present `rel_type_lookup_index` by matching the covered rel type.
+            .any(|r| r.entity == "RELATIONSHIP" && r.label_or_type == "KNOWS"),
         "the rel index was dropped by name"
     );
 
@@ -888,7 +878,9 @@ async fn bolt_relationship_property_index_lifecycle() {
         show_indexes_full(&mut c)
             .await
             .iter()
-            .filter(|r| r.entity == "RELATIONSHIP")
+            // The unified listing always includes the `rel_type_lookup_index` (entityType
+            // RELATIONSHIP), so match the covered rel type to count only the property index (`rmp` #660).
+            .filter(|r| r.entity == "RELATIONSHIP" && r.label_or_type == "KNOWS")
             .count(),
         1
     );
@@ -898,7 +890,8 @@ async fn bolt_relationship_property_index_lifecycle() {
         !show_indexes_full(&mut c)
             .await
             .iter()
-            .any(|r| r.entity == "RELATIONSHIP"),
+            // Exclude the always-present `rel_type_lookup_index` by matching the covered rel type.
+            .any(|r| r.entity == "RELATIONSHIP" && r.label_or_type == "KNOWS"),
         "the rel index was dropped by target"
     );
 
@@ -1023,6 +1016,124 @@ async fn bolt_show_constraints_full_surface() {
         where_rows[0].len(),
         8,
         "terse WHERE returns the 8 default columns"
+    );
+
+    c.goodbye().await;
+    server.shutdown().await.expect("clean shutdown");
+}
+
+/// `SHOW INDEXES` end-to-end over Bolt (`rmp` #660), exercising the whole admin-parse → engine →
+/// seam-translate → (re-run) path for the UNIFIED listing: the 12 default columns of a bare listing
+/// (including the two always-on token LOOKUP rows), the 15 columns of `YIELD *`, the per-type filters
+/// (RANGE / POINT / LOOKUP / VECTOR), a `YIELD … WHERE … RETURN …` projection, and a terse `WHERE`.
+#[tokio::test]
+async fn bolt_show_indexes_full_surface() {
+    let temp = TempStore::new("bolt-show-indexes");
+    let server = boot(base_config(&temp)).await;
+    let uds = server.uds_path.clone().expect("UDS enabled");
+    let mut c = BoltClient::connect(&uds).await;
+    c.handshake_and_logon("alice", "admin-pw8").await;
+
+    // A node RANGE index and a POINT index over the wire.
+    c.run_ok("CREATE INDEX ix_name FOR (p:Person) ON (p.name)", None)
+        .await;
+    c.run_ok("CREATE POINT INDEX by_loc FOR (c:City) ON (c.loc)", None)
+        .await;
+
+    // Bare SHOW INDEXES → the 12 default columns. The two token LOOKUP rows are always present (ids
+    // 1/2), plus the two created indexes → 4 rows, in build order.
+    let rows = c.run_ok("SHOW INDEXES", None).await;
+    assert_eq!(
+        rows.len(),
+        4,
+        "2 token LOOKUPs + 2 created indexes: {rows:?}"
+    );
+    for row in &rows {
+        assert_eq!(row.len(), 12, "12 default columns: {row:?}");
+        // Columns: id, name, state, populationPercent, type, entityType, labelsOrTypes, properties,
+        // indexProvider, owningConstraint, lastRead, readCount. State is the UPPER-CASE Neo4j string.
+        let state = match &row[2] {
+            Value::String(s) => s.clone(),
+            other => panic!("state must be a string: {other:?}"),
+        };
+        assert!(
+            state == "ONLINE" || state == "POPULATING",
+            "UPPER-CASE state: {state}"
+        );
+    }
+    assert_eq!(rows[0][0], Value::Integer(1), "node lookup id is 1");
+    assert_eq!(
+        rows[0][1],
+        Value::String("node_label_lookup_index".to_owned())
+    );
+    assert_eq!(rows[0][4], Value::String("LOOKUP".to_owned()));
+    assert_eq!(rows[1][0], Value::Integer(2), "rel lookup id is 2");
+    assert_eq!(
+        rows[1][1],
+        Value::String("rel_type_lookup_index".to_owned())
+    );
+
+    // YIELD * → the full 15 columns, one of which is the round-trippable createStatement.
+    let full = c.run_ok("SHOW INDEXES YIELD *", None).await;
+    assert_eq!(full.len(), 4);
+    for row in &full {
+        assert_eq!(row.len(), 15, "YIELD * has 15 columns: {row:?}");
+    }
+    assert!(
+        full.iter().any(|r| r
+            .iter()
+            .any(|v| matches!(v, Value::String(s) if s.contains("CREATE") && s.contains("INDEX")))),
+        "one YIELD * column is the createStatement: {full:?}"
+    );
+
+    // A type filter returns only the matching kind (the LOOKUP rows are filtered out).
+    let point = c.run_ok("SHOW POINT INDEXES", None).await;
+    assert_eq!(point.len(), 1);
+    assert_eq!(point[0][1], Value::String("by_loc".to_owned()));
+    assert_eq!(point[0][4], Value::String("POINT".to_owned()));
+
+    let range = c.run_ok("SHOW RANGE INDEXES", None).await;
+    assert_eq!(range.len(), 1);
+    assert_eq!(range[0][1], Value::String("ix_name".to_owned()));
+
+    // SHOW LOOKUP INDEXES → the two always-on token lookups.
+    let lookup = c.run_ok("SHOW LOOKUP INDEXES", None).await;
+    assert_eq!(lookup.len(), 2);
+    assert!(
+        lookup
+            .iter()
+            .all(|r| r[4] == Value::String("LOOKUP".to_owned()))
+    );
+
+    // SHOW VECTOR INDEXES → an empty listing, not a syntax error (`rmp` #660).
+    let vector = c.run_ok("SHOW VECTOR INDEXES", None).await;
+    assert!(vector.is_empty(), "no vector indexes yet: {vector:?}");
+
+    // YIELD name, type WHERE type = 'POINT' RETURN name → filtered + projected to one column.
+    let projected = c
+        .run_ok(
+            "SHOW INDEXES YIELD name, type WHERE type = 'POINT' RETURN name",
+            None,
+        )
+        .await;
+    assert_eq!(projected.len(), 1, "only the point index matches the WHERE");
+    assert_eq!(projected[0].len(), 1, "RETURN name projects to one column");
+    assert_eq!(projected[0][0], Value::String("by_loc".to_owned()));
+
+    // A terse WHERE returns the 12 default columns for the matching rows — here only the always-on
+    // relationship-type LOOKUP index is a RELATIONSHIP row.
+    let where_rows = c
+        .run_ok("SHOW INDEXES WHERE entityType = 'RELATIONSHIP'", None)
+        .await;
+    assert_eq!(where_rows.len(), 1);
+    assert_eq!(
+        where_rows[0].len(),
+        12,
+        "terse WHERE returns the 12 default columns"
+    );
+    assert_eq!(
+        where_rows[0][1],
+        Value::String("rel_type_lookup_index".to_owned())
     );
 
     c.goodbye().await;

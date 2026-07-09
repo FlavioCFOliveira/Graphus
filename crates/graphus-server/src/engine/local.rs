@@ -637,16 +637,27 @@ mod tests {
         })
         .expect("create composite index");
 
+        // The unified `SHOW INDEXES` renders the full Neo4j column set (`rmp` #660); the engine returns
+        // `index_show::COLUMNS_FULL`, so columns are read by name rather than by position.
         let reply = eng
-            .index_ddl(IndexCommand::ShowIndexes)
+            .index_ddl(IndexCommand::ShowIndexes {
+                filter: crate::engine::IndexTypeFilter::All,
+                tail: None,
+            })
             .expect("show indexes");
-        // Fields: name, type, entityType, labelsOrTypes, properties, state, owningConstraint.
-        let props_col = reply
-            .fields
-            .iter()
-            .position(|f| f == "properties")
-            .expect("a properties column");
-        let name_col = reply.fields.iter().position(|f| f == "name").unwrap();
+        let col = |name: &str| {
+            reply
+                .fields
+                .iter()
+                .position(|f| f == name)
+                .unwrap_or_else(|| panic!("a {name} column"))
+        };
+        let (name_col, props_col, type_col, entity_col) = (
+            col("name"),
+            col("properties"),
+            col("type"),
+            col("entityType"),
+        );
 
         // The composite row carries the two-element ordered property list.
         let composite_row = reply
@@ -662,8 +673,8 @@ mod tests {
             ]),
             "composite properties render as a multi-element list [a, b]"
         );
-        assert_eq!(composite_row[1], Value::String("RANGE".to_owned()));
-        assert_eq!(composite_row[2], Value::String("NODE".to_owned()));
+        assert_eq!(composite_row[type_col], Value::String("RANGE".to_owned()));
+        assert_eq!(composite_row[entity_col], Value::String("NODE".to_owned()));
 
         // The single-property row still renders a one-element list.
         let single_row = reply

@@ -58,6 +58,7 @@ use crate::audit::{
 use super::command::{AccessMode, constraint_ddl_summary, index_ddl_summary};
 use super::constraint_show;
 use super::handle::AdmissionPermit;
+use super::index_show;
 use super::privileges::EffectivePrivileges;
 use super::stream::{RowReceiver, SummarySink};
 use super::{EngineHandle, RunSummary, TxTicket};
@@ -216,18 +217,12 @@ impl RestEngineAdapter {
                     );
                     return Some(Err(e));
                 }
-                // `SHOW (FULLTEXT|POINT) INDEXES` is read-only — only the mutating CREATE/DROP are
-                // schema changes (`rmp` task #72/#98 add the full-text / point SHOW to the read-only
-                // set).
-                let mutating = !matches!(
-                    cmd,
-                    crate::engine::IndexCommand::ShowIndexes
-                        | crate::engine::IndexCommand::ShowFulltextIndexes
-                        | crate::engine::IndexCommand::ShowPointIndexes
-                );
+                // The unified `SHOW INDEXES` (every filter form) is read-only — only the mutating
+                // CREATE/DROP are schema changes (`rmp` task #660 folds full-text / point SHOW into it).
+                let mutating = !matches!(cmd, crate::engine::IndexCommand::ShowIndexes { .. });
                 let detail = redact_index_detail(&cmd);
                 // Keep the command shape for the post-outcome summary (counters depend on whether the
-                // DDL actually mutated — `reply.mutated`); cloning is negligible (DDL is rare).
+                // DDL actually mutated — `reply.mutated`) and to detect the `SHOW INDEXES` tail.
                 let summary_cmd = cmd.clone();
                 let outcome = handle.index_ddl_blocking(cmd);
                 if mutating {
@@ -246,16 +241,52 @@ impl RestEngineAdapter {
                         .detail(detail),
                     );
                 }
-                Some(outcome.map(|reply| {
-                    // Query type `s` + `indexes-added`/`indexes-removed` for a real CREATE/DROP, or the
-                    // `0` counter shape for an idempotent no-op (`rmp` #626 follow-up); `r` for a SHOW.
-                    let summary = index_ddl_summary(&summary_cmd, reply.mutated);
-                    RestEngineStream::admin(AdminResult {
-                        fields: reply.fields,
-                        rows: reply.rows,
-                        summary,
-                    })
-                }))
+                let reply = match outcome {
+                    Ok(reply) => reply,
+                    Err(e) => return Some(Err(e)),
+                };
+                // A `SHOW INDEXES` finishes through the shared helper (`rmp` #660): a `YIELD`/`WHERE`
+                // tail re-runs a translated read query over the rendered rows; a bare listing projects
+                // to the default columns. CREATE/DROP fall through to the mutation summary below.
+                if let crate::engine::IndexCommand::ShowIndexes { tail, .. } = &summary_cmd {
+                    let tail = tail.clone();
+                    return Some(index_show::finish(
+                        reply,
+                        tail.as_deref(),
+                        |query, params| {
+                            // Re-run as a normal auto-commit READ on the transaction's pinned engine.
+                            let permit = handle
+                                .try_admit()
+                                .map_err(|busy| GraphusError::Transaction(busy.to_string()))?;
+                            let ticket = handle.begin_auto_commit_blocking(AccessMode::Read)?;
+                            let privileges = Some(EffectivePrivileges::resolve(
+                                std::sync::Arc::clone(self.context.security()),
+                                Some(principal),
+                                db,
+                            ));
+                            let reply = handle.run_blocking(
+                                ticket, query, params, /* auto_commit */ true, privileges,
+                            )?;
+                            Ok(RestEngineStream {
+                                fields: reply.fields,
+                                source: RowSource::Engine {
+                                    rows: reply.rows,
+                                    _permit: permit,
+                                },
+                                summary: reply.summary,
+                            })
+                        },
+                        RestEngineStream::admin,
+                    ));
+                }
+                // Query type `s` + `indexes-added`/`indexes-removed` for a real CREATE/DROP, or the `0`
+                // counter shape for an idempotent no-op (`rmp` #626 follow-up).
+                let summary = index_ddl_summary(&summary_cmd, reply.mutated);
+                Some(Ok(RestEngineStream::admin(AdminResult {
+                    fields: reply.fields,
+                    rows: reply.rows,
+                    summary,
+                })))
             }
             // A constraint-DDL statement (`rmp` task #99): routed identically to an index command.
             AdminParse::Constraint(cmd) => {

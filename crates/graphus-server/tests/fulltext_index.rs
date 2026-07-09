@@ -18,7 +18,7 @@ use graphus_cypher::MaterializedValue;
 use graphus_server::config::{
     AdmissionConfig, AuthBootstrap, ServerConfig, TimingConfig, TlsConfig,
 };
-use graphus_server::engine::{AccessMode, EngineHandle, IndexCommand};
+use graphus_server::engine::{AccessMode, EngineHandle, IndexCommand, IndexTypeFilter};
 use graphus_server::{Server, ServerHandle};
 
 struct TempStore {
@@ -217,13 +217,22 @@ async fn create_query_update_delete_over_a_real_server() {
             .is_empty()
     );
 
-    // SHOW FULLTEXT INDEXES lists the index.
+    // SHOW FULLTEXT INDEXES lists the index (unified listing filtered to FULLTEXT, `rmp` #660). The
+    // engine returns the full column set; `name` is column 1 (`id` is column 0).
     let reply = engine
-        .index_ddl(IndexCommand::ShowFulltextIndexes)
+        .index_ddl(IndexCommand::ShowIndexes {
+            filter: IndexTypeFilter::Fulltext,
+            tail: None,
+        })
         .await
         .expect("show");
     assert_eq!(reply.rows.len(), 1);
-    assert_eq!(reply.rows[0][0], Value::String("articles".to_owned()));
+    assert_eq!(reply.rows[0][1], Value::String("articles".to_owned()));
+    assert_eq!(
+        reply.rows[0][4],
+        Value::String("FULLTEXT".to_owned()),
+        "type"
+    );
 
     handle.shutdown().await.expect("graceful shutdown");
 }
@@ -264,7 +273,10 @@ async fn index_survives_a_full_server_restart() {
     let engine = handle.engine.clone();
 
     let reply = engine
-        .index_ddl(IndexCommand::ShowFulltextIndexes)
+        .index_ddl(IndexCommand::ShowIndexes {
+            filter: IndexTypeFilter::Fulltext,
+            tail: None,
+        })
         .await
         .expect("show after restart");
     assert_eq!(reply.rows.len(), 1, "the index must survive the restart");

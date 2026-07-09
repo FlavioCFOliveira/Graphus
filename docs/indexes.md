@@ -13,7 +13,7 @@ admin rights (see [security.md](security.md)).
 
 Building an index is **non-blocking**: `CREATE INDEX` returns promptly and the build runs in
 the background, so it never stalls concurrent queries. Over an already-populated store the
-index may briefly report `populating` in `SHOW INDEXES` before it becomes `online`.
+index may briefly report `POPULATING` in `SHOW INDEXES` before it becomes `ONLINE`.
 
 ---
 
@@ -98,20 +98,58 @@ DROP INDEX ON :Person(name)             -- legacy form
 
 ## Listing indexes — `SHOW INDEXES`
 
-`SHOW INDEXES` returns one row per node-property index, with the Neo4j column shape the driver
-ecosystem expects:
+`SHOW INDEXES` is a **unified** Neo4j-5.x listing of *every* index kind — node-property and
+relationship-property `RANGE`, composite `RANGE`, `FULLTEXT`, `POINT`, and the two always-on token
+`LOOKUP` indexes (`node_label_lookup_index` / `rel_type_lookup_index`) that Neo4j always lists. A
+bare listing returns the **12 default columns**, in Neo4j order:
 
-| Column          | Type          | Value |
-| --------------- | ------------- | ----- |
-| `name`          | string        | the index name (explicit or auto-generated) |
-| `type`          | string        | `RANGE` (the node-property index kind) |
-| `entityType`    | string        | `NODE` |
-| `labelsOrTypes` | list of string | the single label, e.g. `["Person"]` |
-| `properties`    | list of string | the single property, e.g. `["name"]` |
-| `state`         | string        | `online` (ready) or `populating` (build in progress) |
+| Column              | Type            | Value |
+| ------------------- | --------------- | ----- |
+| `id`                | integer         | a stable-within-a-listing id (the two token LOOKUPs are `1` / `2`) |
+| `name`              | string          | the index name (explicit or auto-generated) |
+| `state`             | string          | `ONLINE` (ready) or `POPULATING` (build in progress) |
+| `populationPercent` | float           | `100.0` when online, else `0.0` |
+| `type`              | string          | `RANGE`, `FULLTEXT`, `POINT` or `LOOKUP` |
+| `entityType`        | string          | `NODE` or `RELATIONSHIP` |
+| `labelsOrTypes`     | list of string  | the covered label(s)/type, e.g. `["Person"]` (empty for `LOOKUP`) |
+| `properties`        | list of string  | the covered property tuple, e.g. `["name"]` or `["first","last"]` |
+| `indexProvider`     | string          | `range-1.0` / `token-lookup-1.0` / `fulltext-1.0` / `point-1.0` |
+| `owningConstraint`  | string or null  | the uniqueness/key constraint this index backs, else `null` |
+| `lastRead`          | null            | index-usage statistics are untracked |
+| `readCount`         | null            | index-usage statistics are untracked |
 
 ```cypher
 SHOW INDEXES
+```
+
+### Type filters
+
+`SHOW <type> INDEXES` restricts the listing to one index kind, matching Neo4j's filtered forms:
+
+```cypher
+SHOW ALL INDEXES        -- every kind (same as SHOW INDEXES)
+SHOW RANGE INDEXES      -- node / relationship / composite range indexes
+SHOW POINT INDEXES      -- spatial (point) indexes
+SHOW FULLTEXT INDEXES   -- full-text indexes
+SHOW LOOKUP INDEXES     -- the two always-on token lookup indexes
+SHOW TEXT INDEXES       -- text indexes (none in Graphus: TEXT is a synonym of RANGE)
+SHOW VECTOR INDEXES     -- vector indexes (none yet; a later release)
+```
+
+> `SHOW FULLTEXT INDEXES` and `SHOW POINT INDEXES` now return the **same unified 12-column shape**
+> filtered to that kind. The full-text analyzer surfaces under the `options` column (via `YIELD *`),
+> not as a bespoke column.
+
+### `YIELD` / `WHERE` / `RETURN`
+
+A `YIELD` / `WHERE` / `RETURN` tail projects, filters and re-orders the listing like any Neo4j
+`SHOW` command. `YIELD *` exposes three further columns — `options` (a map; the full-text analyzer
+config lives here), `failureMessage` (empty), and `createStatement` (a round-trippable
+`CREATE … INDEX` DDL):
+
+```cypher
+SHOW INDEXES YIELD name, type, state WHERE type = 'RANGE' RETURN name, state
+SHOW INDEXES YIELD *
 ```
 
 ---
@@ -149,8 +187,10 @@ curl -sk -X POST https://localhost:7474/db/graphus/tx/commit \
 curl -sk -X POST https://localhost:7474/db/graphus/tx/commit \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"statements":[{"statement":"SHOW INDEXES"}],"access_mode":"READ"}'
-# fields: ["name","type","entityType","labelsOrTypes","properties","state"]
-# row:    ["ix_person","RANGE","NODE",["Person"],["name"],"online"]
+# fields: ["id","name","state","populationPercent","type","entityType",
+#          "labelsOrTypes","properties","indexProvider","owningConstraint","lastRead","readCount"]
+# row:    [3,"ix_person","ONLINE",100.0,"RANGE","NODE",["Person"],["name"],"range-1.0",null,null,null]
+# (the two always-on token LOOKUP indexes are listed first, ids 1 and 2)
 
 # Idempotent re-create: no-op, 0 added.
 curl -sk -X POST https://localhost:7474/db/graphus/tx/commit \
@@ -183,7 +223,9 @@ with driver.session(database="graphus") as s:
     for r in s.run("SHOW INDEXES"):
         print(r["name"], r["type"], r["entityType"],
               r["labelsOrTypes"], r["properties"], r["state"])
-        # ix_person RANGE NODE ['Person'] ['name'] online
+        # node_label_lookup_index LOOKUP NODE [] [] ONLINE
+        # rel_type_lookup_index   LOOKUP RELATIONSHIP [] [] ONLINE
+        # ix_person               RANGE  NODE ['Person'] ['name'] ONLINE
     s.run("DROP INDEX ix_person IF EXISTS").consume()
 driver.close()
 ```

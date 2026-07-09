@@ -105,8 +105,8 @@ use crate::config::ServerConfig;
 use crate::dbcatalog::{CatalogError, DatabaseCatalog, DbState, normalize_db_name};
 use crate::engine::{
     ConstraintCommand, ConstraintCreateKind, ConstraintEntity, ConstraintTypeFilter,
-    CreateConstraint, EngineHandle, IndexCommand, NodePropertyIndexRef, RelPropertyIndexRef,
-    RunSummary,
+    CreateConstraint, EngineHandle, IndexCommand, IndexTypeFilter, NodePropertyIndexRef,
+    RelPropertyIndexRef, RunSummary,
 };
 use crate::security::{SecurityCatalog, SecurityError};
 
@@ -749,11 +749,25 @@ pub fn parse_admin_statement(query: &str) -> AdminParse {
         };
     }
 
-    // --- Typed search-performance index surface (`rmp` #638): RANGE / TEXT / LOOKUP INDEX(ES) … ---
+    // --- Filtered SHOW INDEXES surface (`rmp` task #660): `SHOW <filter> INDEX[ES] [tail]` ---
+    // The index type-filter words (RANGE / TEXT / POINT / LOOKUP / FULLTEXT / VECTOR / ALL) precede the
+    // INDEXES keyword. RANGE/TEXT/LOOKUP/FULLTEXT/POINT are also CREATE/DROP leads (dispatched below for
+    // those verbs); for SHOW they route here to the ONE unified listing. VECTOR (no CREATE/DROP path
+    // yet) and the shared `ALL` lead are handled only here. `ALL` is also a constraint filter, so it is
+    // disambiguated by the terminal keyword (INDEX[ES] vs CONSTRAINT[S]). This is placed before the
+    // typed-index / constraint-filter dispatch so `SHOW <filter> INDEXES` never reaches those paths.
+    if verb == "SHOW" && is_index_filter_lead(&second) && show_targets_indexes(&second, &lex) {
+        return match parse_show_indexes_filtered(&second, &mut lex) {
+            Ok(cmd) => AdminParse::Index(cmd),
+            Err(msg) => AdminParse::Invalid(msg),
+        };
+    }
+
+    // --- Typed search-performance index surface (`rmp` #638): RANGE / TEXT / LOOKUP INDEX … ---
     // `RANGE` / `TEXT` / `LOOKUP` directly after a verb are never valid Cypher, so the statement is
     // CLAIMED once the verb + kind keyword is seen (mirroring FULLTEXT/POINT). RANGE is a full synonym
     // of the node-property index; TEXT maps to it (served by the same B-tree); LOOKUP is declined
-    // (Graphus maintains token lookup indexes implicitly).
+    // (Graphus maintains token lookup indexes implicitly). The SHOW forms are dispatched above.
     if is_keyword(&second, "RANGE") || is_keyword(&second, "TEXT") || is_keyword(&second, "LOOKUP")
     {
         return match parse_claimed_typed_index(&verb, &second, &mut lex) {
@@ -853,9 +867,14 @@ fn parse_claimed_index(
     lex: &mut Lexer<'_>,
 ) -> Result<IndexCommand, String> {
     if plural {
-        // SHOW INDEXES — nothing else allowed.
-        expect_end(lex, "SHOW INDEXES")?;
-        return Ok(IndexCommand::ShowIndexes);
+        // SHOW INDEXES [YIELD … | WHERE …] — the unified listing (filter = All), plus an optional
+        // YIELD/WHERE tail (`rmp` #660). The filtered forms (`SHOW <filter> INDEXES`) are dispatched
+        // earlier.
+        let tail = capture_show_tail(lex, "SHOW INDEXES")?;
+        return Ok(IndexCommand::ShowIndexes {
+            filter: IndexTypeFilter::All,
+            tail,
+        });
     }
     match verb {
         "SHOW" => {
@@ -1206,21 +1225,12 @@ fn parse_claimed_fulltext(verb: &str, lex: &mut Lexer<'_>) -> Result<IndexComman
         ));
     }
 
+    // `SHOW FULLTEXT INDEXES` is dispatched by the unified SHOW-index-filter surface (`rmp` #660), so
+    // only CREATE/DROP FULLTEXT reach here; the plural INDEXES form is therefore always an error.
     if plural {
-        // SHOW FULLTEXT INDEXES — nothing else allowed.
-        if verb != "SHOW" {
-            return Err(format!(
-                "expected INDEX after {verb} FULLTEXT (INDEXES is only valid in SHOW FULLTEXT INDEXES)"
-            ));
-        }
-        expect_end(lex, "SHOW FULLTEXT INDEXES")?;
-        return Ok(IndexCommand::ShowFulltextIndexes);
-    }
-    if verb == "SHOW" {
-        return Err(
-            "expected SHOW FULLTEXT INDEXES (the singular SHOW FULLTEXT INDEX is not supported)"
-                .to_owned(),
-        );
+        return Err(format!(
+            "expected INDEX after {verb} FULLTEXT (SHOW FULLTEXT INDEXES is the only plural form)"
+        ));
     }
 
     // Both CREATE and DROP take a name next.
@@ -1340,21 +1350,12 @@ fn parse_claimed_point(verb: &str, lex: &mut Lexer<'_>) -> Result<IndexCommand, 
         ));
     }
 
+    // `SHOW POINT INDEXES` is dispatched by the unified SHOW-index-filter surface (`rmp` #660), so only
+    // CREATE/DROP POINT reach here; the plural INDEXES form is therefore always an error.
     if plural {
-        // SHOW POINT INDEXES — nothing else allowed.
-        if verb != "SHOW" {
-            return Err(format!(
-                "expected INDEX after {verb} POINT (INDEXES is only valid in SHOW POINT INDEXES)"
-            ));
-        }
-        expect_end(lex, "SHOW POINT INDEXES")?;
-        return Ok(IndexCommand::ShowPointIndexes);
-    }
-    if verb == "SHOW" {
-        return Err(
-            "expected SHOW POINT INDEXES (the singular SHOW POINT INDEX is not supported)"
-                .to_owned(),
-        );
+        return Err(format!(
+            "expected INDEX after {verb} POINT (SHOW POINT INDEXES is the only plural form)"
+        ));
     }
 
     // Both CREATE and DROP take a name next.
@@ -1427,7 +1428,7 @@ fn parse_claimed_constraint(
     if plural {
         // SHOW CONSTRAINTS — the unfiltered listing (filter = All), plus an optional YIELD/WHERE tail
         // (`rmp` #653). The filtered forms (`SHOW <filter> CONSTRAINT[S]`) are dispatched earlier.
-        let tail = capture_show_constraints_tail(lex)?;
+        let tail = capture_show_tail(lex, "SHOW CONSTRAINTS")?;
         return Ok(ConstraintCommand::Show {
             filter: ConstraintTypeFilter::All,
             tail,
@@ -1480,6 +1481,70 @@ fn parse_claimed_constraint(
     }
 }
 
+/// Whether `tok` is a leading word of a `SHOW INDEXES` **type filter** (`rmp` #660) — `ALL` / `RANGE` /
+/// `TEXT` / `POINT` / `LOOKUP` / `FULLTEXT` / `VECTOR` — as opposed to the bare `INDEXES` keyword (which
+/// routes through `parse_claimed_index`). Only meaningful right after `SHOW`.
+fn is_index_filter_lead(tok: &Tok) -> bool {
+    matches!(tok, Tok::Word(w) if matches!(
+        w.to_ascii_uppercase().as_str(),
+        "ALL" | "RANGE" | "TEXT" | "POINT" | "LOOKUP" | "FULLTEXT" | "VECTOR"
+    ))
+}
+
+/// Whether a `SHOW <lead> …` statement targets INDEXES rather than constraints (`rmp` #660). Only the
+/// shared `ALL` lead is ambiguous (it is both an index and a constraint filter); every other index
+/// filter lead is unambiguously an index statement. For `ALL`, peek the terminal keyword: `INDEX[ES]`
+/// selects the index surface, otherwise the statement defers to the constraint filter surface. The peek
+/// is on a clone, so it does not consume from `lex`.
+fn show_targets_indexes(lead: &Tok, lex: &Lexer<'_>) -> bool {
+    if !is_keyword(lead, "ALL") {
+        return true;
+    }
+    let mut peek = Lexer {
+        rest: lex.rest.clone(),
+    };
+    matches!(peek.next_tok(), Ok(Some(t)) if is_keyword(&t, "INDEX") || is_keyword(&t, "INDEXES"))
+}
+
+/// Parses a filtered `SHOW <filter> INDEXES [YIELD … | WHERE …]` (`rmp` #660); `first` is the
+/// already-read leading filter word. The plural `INDEXES` closes the filter — Graphus rejects the
+/// singular `SHOW … INDEX` (matching the bare `SHOW INDEXES` form) — then the optional tail is captured
+/// verbatim (`crate::engine::index_show` translates it).
+fn parse_show_indexes_filtered(first: &Tok, lex: &mut Lexer<'_>) -> Result<IndexCommand, String> {
+    let filter = index_type_filter_from_lead(first)?;
+    // The INDEXES keyword closes the filter.
+    let kw = lex
+        .next_tok()?
+        .ok_or_else(|| "expected INDEXES after the SHOW INDEXES filter".to_owned())?;
+    if !is_keyword(&kw, "INDEXES") {
+        return Err(unexpected_generic(
+            &kw,
+            "INDEXES after the SHOW INDEXES filter",
+        ));
+    }
+    let tail = capture_show_tail(lex, "SHOW INDEXES")?;
+    Ok(IndexCommand::ShowIndexes { filter, tail })
+}
+
+/// Maps a `SHOW INDEXES` filter lead word to its [`IndexTypeFilter`] (`rmp` #660). Each index filter is
+/// a single standalone word (unlike the multi-word `SHOW CONSTRAINTS` filters).
+fn index_type_filter_from_lead(tok: &Tok) -> Result<IndexTypeFilter, String> {
+    let w = match tok {
+        Tok::Word(w) => w.to_ascii_uppercase(),
+        other => return Err(unexpected_generic(other, "a SHOW INDEXES filter word")),
+    };
+    Ok(match w.as_str() {
+        "ALL" => IndexTypeFilter::All,
+        "RANGE" => IndexTypeFilter::Range,
+        "TEXT" => IndexTypeFilter::Text,
+        "POINT" => IndexTypeFilter::Point,
+        "LOOKUP" => IndexTypeFilter::Lookup,
+        "FULLTEXT" => IndexTypeFilter::Fulltext,
+        "VECTOR" => IndexTypeFilter::Vector,
+        other => return Err(format!("unexpected `{other}` in the SHOW INDEXES filter")),
+    })
+}
+
 /// Whether `tok` is a leading word of a `SHOW CONSTRAINTS` **type filter** (`rmp` #653) — `ALL` /
 /// `NODE` / `REL[ATIONSHIP]` / `PROPERTY` / `UNIQUE[NESS]` / `EXIST[ENCE]` / `KEY` / `TYPE` — as opposed
 /// to the bare `CONSTRAINT`/`CONSTRAINTS` keyword (which routes through `parse_claimed_constraint`).
@@ -1511,7 +1576,7 @@ fn parse_show_constraints_filtered(
             "CONSTRAINT or CONSTRAINTS after the SHOW CONSTRAINTS filter",
         ));
     }
-    let tail = capture_show_constraints_tail(lex)?;
+    let tail = capture_show_tail(lex, "SHOW CONSTRAINTS")?;
     Ok(ConstraintCommand::Show { filter, tail })
 }
 
@@ -1621,17 +1686,20 @@ fn parse_constraint_type_filter(
     }
 }
 
-/// Captures the optional `YIELD … | WHERE …` tail of a `SHOW CONSTRAINTS` statement (`rmp` #653),
-/// **without** consuming it from `lex` (so the raw text is preserved). Returns:
+/// Captures the optional `YIELD … | WHERE …` tail of a `SHOW <what>` listing statement (`rmp` #653 for
+/// constraints, #660 for indexes), **without** consuming it from `lex` (so the raw text is preserved).
+/// `what` is the statement label used in error messages (e.g. `"SHOW CONSTRAINTS"` / `"SHOW INDEXES"`).
+/// Returns:
 ///
 /// - [`None`] for the end of the statement (or a lone tolerated trailing `;`);
 /// - `Some(raw)` — the raw tail text (a single trailing `;` stripped) — when it begins with `YIELD` or
 ///   `WHERE`;
-/// - an error for anything else (so `SHOW CONSTRAINTS garbage` stays a syntax error).
+/// - an error for anything else (so `SHOW CONSTRAINTS garbage` / `SHOW INDEXES garbage` stays a syntax
+///   error).
 ///
 /// The tail is handed to the seams verbatim, which translate `YIELD`/`WHERE`/`RETURN` into a Cypher
-/// read query re-run over the rendered rows (`crate::engine::constraint_show`).
-fn capture_show_constraints_tail(lex: &mut Lexer<'_>) -> Result<Option<String>, String> {
+/// read query re-run over the rendered rows (`crate::engine::constraint_show` / `index_show`).
+fn capture_show_tail(lex: &mut Lexer<'_>, what: &str) -> Result<Option<String>, String> {
     // Peek the first token of the tail on a clone so the raw capture below still sees the whole tail.
     let mut peek = Lexer {
         rest: lex.rest.clone(),
@@ -1641,7 +1709,7 @@ fn capture_show_constraints_tail(lex: &mut Lexer<'_>) -> Result<Option<String>, 
         // A lone trailing `;` is tolerated (as `expect_end` does); nothing may follow it.
         Some(Tok::Symbol(';')) => match peek.next_tok()? {
             None => Ok(None),
-            Some(t) => Err(unexpected(&t, "end of SHOW CONSTRAINTS statement")),
+            Some(t) => Err(unexpected(&t, &format!("end of {what} statement"))),
         },
         Some(Tok::Word(w))
             if w.eq_ignore_ascii_case("YIELD") || w.eq_ignore_ascii_case("WHERE") =>
@@ -1655,7 +1723,7 @@ fn capture_show_constraints_tail(lex: &mut Lexer<'_>) -> Result<Option<String>, 
         }
         Some(other) => Err(unexpected(
             &other,
-            "YIELD or WHERE after SHOW CONSTRAINTS, or the end of the statement",
+            &format!("YIELD or WHERE after {what}, or the end of the statement"),
         )),
     }
 }
@@ -4754,15 +4822,90 @@ mod tests {
                 if_exists: false,
             }
         );
-        assert_eq!(index_cmd("SHOW RANGE INDEXES"), IndexCommand::ShowIndexes);
-        assert_eq!(index_cmd("SHOW TEXT INDEXES"), IndexCommand::ShowIndexes);
+        // The `SHOW <filter> INDEXES` forms map to the unified listing filtered by type (`rmp` #660).
+        assert_eq!(
+            index_cmd("SHOW RANGE INDEXES"),
+            IndexCommand::ShowIndexes {
+                filter: IndexTypeFilter::Range,
+                tail: None,
+            }
+        );
+        assert_eq!(
+            index_cmd("SHOW TEXT INDEXES"),
+            IndexCommand::ShowIndexes {
+                filter: IndexTypeFilter::Text,
+                tail: None,
+            }
+        );
+    }
+
+    /// `rmp` #660: every `SHOW <filter> INDEXES` form parses to the ONE unified `ShowIndexes`, filtered
+    /// by index type — including `LOOKUP` (now a listing, not a decline), `VECTOR` (an empty listing,
+    /// not a syntax error) and the shared `ALL` lead. A `YIELD`/`WHERE` tail is captured verbatim.
+    #[test]
+    fn show_indexes_filter_forms_and_tail() {
+        let show = |filter, tail: Option<&str>| IndexCommand::ShowIndexes {
+            filter,
+            tail: tail.map(str::to_owned),
+        };
+        assert_eq!(
+            index_cmd("SHOW ALL INDEXES"),
+            show(IndexTypeFilter::All, None)
+        );
+        assert_eq!(
+            index_cmd("SHOW POINT INDEXES"),
+            show(IndexTypeFilter::Point, None)
+        );
+        assert_eq!(
+            index_cmd("SHOW LOOKUP INDEXES"),
+            show(IndexTypeFilter::Lookup, None)
+        );
+        assert_eq!(
+            index_cmd("SHOW FULLTEXT INDEXES"),
+            show(IndexTypeFilter::Fulltext, None)
+        );
+        assert_eq!(
+            index_cmd("SHOW VECTOR INDEXES"),
+            show(IndexTypeFilter::Vector, None),
+            "SHOW VECTOR INDEXES is an empty listing, not a syntax error"
+        );
+        // A YIELD tail is captured verbatim (translated by the seam).
+        assert_eq!(
+            index_cmd("SHOW INDEXES YIELD name, type WHERE type = 'POINT' RETURN name"),
+            show(
+                IndexTypeFilter::All,
+                Some("YIELD name, type WHERE type = 'POINT' RETURN name")
+            )
+        );
+        // A terse WHERE tail after a filter is captured too.
+        assert_eq!(
+            index_cmd("SHOW RANGE INDEXES WHERE entityType = 'NODE'"),
+            show(IndexTypeFilter::Range, Some("WHERE entityType = 'NODE'"))
+        );
+        // `SHOW ALL CONSTRAINTS` still routes to the constraint surface (the ALL lead is disambiguated
+        // by the terminal keyword), not the index surface.
+        assert_eq!(
+            parse_admin_statement("SHOW ALL CONSTRAINTS"),
+            AdminParse::Constraint(ConstraintCommand::Show {
+                filter: ConstraintTypeFilter::All,
+                tail: None,
+            })
+        );
     }
 
     #[test]
-    fn lookup_index_is_declined_with_a_clear_message() {
-        // LOOKUP is implicit / always-on in Graphus.
+    fn lookup_index_ddl_is_declined_but_show_is_a_listing() {
+        // CREATE/DROP LOOKUP is implicit / always-on in Graphus and declined.
         let msg = invalid("CREATE LOOKUP INDEX ix FOR (n) ON EACH labels(n)");
         assert!(msg.contains("LOOKUP index DDL is not supported"), "{msg}");
+        // But `SHOW LOOKUP INDEXES` is a valid listing (`rmp` #660).
+        assert_eq!(
+            index_cmd("SHOW LOOKUP INDEXES"),
+            IndexCommand::ShowIndexes {
+                filter: IndexTypeFilter::Lookup,
+                tail: None,
+            }
+        );
     }
 
     #[test]
@@ -4840,8 +4983,21 @@ mod tests {
                 if_exists: false,
             }
         );
-        assert_eq!(index_cmd("SHOW INDEXES"), IndexCommand::ShowIndexes);
-        assert_eq!(index_cmd("show indexes ;"), IndexCommand::ShowIndexes);
+        // Bare `SHOW INDEXES` is the unified listing with no filter and no tail (`rmp` #660).
+        assert_eq!(
+            index_cmd("SHOW INDEXES"),
+            IndexCommand::ShowIndexes {
+                filter: IndexTypeFilter::All,
+                tail: None,
+            }
+        );
+        assert_eq!(
+            index_cmd("show indexes ;"),
+            IndexCommand::ShowIndexes {
+                filter: IndexTypeFilter::All,
+                tail: None,
+            }
+        );
     }
 
     #[test]
@@ -4943,13 +5099,20 @@ mod tests {
                 name: "My Index".to_owned()
             }
         );
+        // `SHOW FULLTEXT INDEXES` folds into the unified listing filtered to FULLTEXT (`rmp` #660).
         assert_eq!(
             index_cmd("SHOW FULLTEXT INDEXES"),
-            IndexCommand::ShowFulltextIndexes
+            IndexCommand::ShowIndexes {
+                filter: IndexTypeFilter::Fulltext,
+                tail: None,
+            }
         );
         assert_eq!(
             index_cmd("show fulltext indexes ;"),
-            IndexCommand::ShowFulltextIndexes
+            IndexCommand::ShowIndexes {
+                filter: IndexTypeFilter::Fulltext,
+                tail: None,
+            }
         );
     }
 
@@ -5019,13 +5182,20 @@ mod tests {
                 name: "My Index".to_owned()
             }
         );
+        // `SHOW POINT INDEXES` folds into the unified listing filtered to POINT (`rmp` #660).
         assert_eq!(
             index_cmd("SHOW POINT INDEXES"),
-            IndexCommand::ShowPointIndexes
+            IndexCommand::ShowIndexes {
+                filter: IndexTypeFilter::Point,
+                tail: None,
+            }
         );
         assert_eq!(
             index_cmd("show point indexes ;"),
-            IndexCommand::ShowPointIndexes
+            IndexCommand::ShowIndexes {
+                filter: IndexTypeFilter::Point,
+                tail: None,
+            }
         );
     }
 

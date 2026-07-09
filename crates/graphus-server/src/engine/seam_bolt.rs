@@ -48,6 +48,7 @@ use crate::audit::{
 use super::command::{AccessMode, constraint_ddl_summary, index_ddl_summary};
 use super::constraint_show;
 use super::handle::AdmissionPermit;
+use super::index_show;
 use super::privileges::EffectivePrivileges;
 use super::stream::{RowReceiver, SummarySink};
 use super::{EngineHandle, RunSummary, TxTicket};
@@ -345,15 +346,9 @@ impl BoltExecutor for BoltEngineExecutor {
                     );
                     return Err(e);
                 }
-                // `SHOW (FULLTEXT|POINT) INDEXES` is read-only — only the mutating CREATE/DROP are
-                // schema changes (`rmp` task #72/#98 add the full-text / point SHOW to the read-only
-                // set).
-                let mutating = !matches!(
-                    cmd,
-                    crate::engine::IndexCommand::ShowIndexes
-                        | crate::engine::IndexCommand::ShowFulltextIndexes
-                        | crate::engine::IndexCommand::ShowPointIndexes
-                );
+                // The unified `SHOW INDEXES` (every filter form) is read-only — only the mutating
+                // CREATE/DROP are schema changes (`rmp` task #660 folds full-text / point SHOW into it).
+                let mutating = !matches!(cmd, crate::engine::IndexCommand::ShowIndexes { .. });
                 let detail = redact_index_detail(&cmd);
                 // Keep the command shape for the post-outcome summary (the counters depend on whether
                 // the DDL actually mutated the schema — `reply.mutated`). Cloning is negligible (DDL is
@@ -377,9 +372,27 @@ impl BoltExecutor for BoltEngineExecutor {
                     );
                 }
                 let reply = outcome?;
+                // A `SHOW INDEXES` finishes through the shared helper (`rmp` #660): a `YIELD`/`WHERE`
+                // tail re-runs a translated read query over the rendered rows; a bare listing projects
+                // to the default columns. CREATE/DROP fall through to the mutation summary below.
+                if let crate::engine::IndexCommand::ShowIndexes { tail, .. } = &summary_cmd {
+                    let tail = tail.clone();
+                    return index_show::finish(
+                        reply,
+                        tail.as_deref(),
+                        |query, params| {
+                            // Re-run as a normal auto-commit READ on the target database's engine.
+                            let ticket = handle.begin_auto_commit_blocking(AccessMode::Read)?;
+                            self.run_on(
+                                &handle, ticket, &name, &query, params, /* auto_commit */ true,
+                            )
+                        },
+                        BoltEngineStream::admin,
+                    );
+                }
                 // The result summary (`rmp` #513 / #626 follow-up): query type `s` +
                 // `indexes-added`/`indexes-removed` for a real CREATE/DROP, or the `0` counter shape for
-                // an idempotent no-op (`reply.mutated == false`); type `r` for a `SHOW`.
+                // an idempotent no-op (`reply.mutated == false`).
                 let summary = index_ddl_summary(&summary_cmd, reply.mutated);
                 return Ok(BoltEngineStream::admin(AdminResult {
                     fields: reply.fields,

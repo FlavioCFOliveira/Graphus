@@ -485,12 +485,17 @@ accepted:
 | ------- | --------- |
 | `RANGE` | A full synonym of the node-property index. Nameable, droppable, and listed as `type` `RANGE`. |
 | `TEXT` | Maps to the **same** node-property (`RANGE`) B-tree, which serves `=` and `STARTS WITH` string predicates. A documented equivalence — it is created and then reported as `RANGE` in `SHOW INDEXES`, not a distinct store. |
-| `LOOKUP` | **Declined** by design: Graphus maintains node-label and relationship-type lookup indexes **implicitly** (always-on), so label/type scans are already index-backed and no explicit `LOOKUP` index is needed. |
+| `LOOKUP` | `CREATE`/`DROP LOOKUP INDEX` is **declined** by design: Graphus maintains node-label and relationship-type lookup indexes **implicitly** (always-on), so no explicit `LOOKUP` index is needed. They *are* listed, though — the two token lookups (`node_label_lookup_index` / `rel_type_lookup_index`) always appear in `SHOW INDEXES` and in `SHOW LOOKUP INDEXES`. |
 
 ```cypher
 CREATE RANGE INDEX ix_age  IF NOT EXISTS FOR (p:Person) ON (p.age)
 CREATE TEXT  INDEX ix_name IF NOT EXISTS FOR (p:Person) ON (p.name)   -- appears as RANGE in SHOW INDEXES
 ```
+
+`SHOW INDEXES` is a single unified, Neo4j-conformant listing of **every** index kind (node/relationship
+`RANGE`, composite `RANGE`, `FULLTEXT`, `POINT`, and the two token `LOOKUP` indexes), with the full
+Neo4j column set, `UPPER-CASE` state, per-type filters (`SHOW RANGE|TEXT|POINT|LOOKUP|FULLTEXT|VECTOR|ALL
+INDEXES`), and a `YIELD` / `WHERE` / `RETURN` tail — see [indexes.md](indexes.md#listing-indexes--show-indexes).
 
 ### Security DDL
 

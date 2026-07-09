@@ -1278,7 +1278,8 @@ pub fn redact_index_detail(cmd: &crate::engine::IndexCommand) -> String {
                 }
             }
         }
-        I::ShowIndexes => "SHOW INDEXES".to_owned(),
+        // The unified `SHOW INDEXES` (every filter form) is a read carrying no secret (`rmp` #660).
+        I::ShowIndexes { .. } => "SHOW INDEXES".to_owned(),
         // Full-text index DDL (`rmp` task #72) carries no secret either: the index name, label,
         // property keys and analyzer are all schema identifiers.
         I::CreateFulltextIndex {
@@ -1291,7 +1292,6 @@ pub fn redact_index_detail(cmd: &crate::engine::IndexCommand) -> String {
             properties.join(", ")
         ),
         I::DropFulltextIndex { name } => format!("DROP FULLTEXT INDEX {name}"),
-        I::ShowFulltextIndexes => "SHOW FULLTEXT INDEXES".to_owned(),
         // Spatial (point) index DDL (`rmp` task #98) carries no secret either: the index name, label
         // and property key are all schema identifiers.
         I::CreatePointIndex {
@@ -1300,7 +1300,6 @@ pub fn redact_index_detail(cmd: &crate::engine::IndexCommand) -> String {
             property,
         } => format!("CREATE POINT INDEX {name} FOR (:{label}) ON ({property})"),
         I::DropPointIndex { name } => format!("DROP POINT INDEX {name}"),
-        I::ShowPointIndexes => "SHOW POINT INDEXES".to_owned(),
     }
 }
 

@@ -135,7 +135,9 @@ pub(crate) fn owns_backing_index(kind: ConstraintKind) -> bool {
 /// Graphus's own admin lexer does not un-escape it, so an identifier containing a backtick does not
 /// round-trip back through [`crate::admin::parse_admin_statement`] (identifiers with backticks do not
 /// occur in practice). Identifiers with spaces or keyword collisions round-trip normally.
-fn quote_ident(id: &str) -> String {
+///
+/// Shared with [`crate::engine::index_show`] (`rmp` #660) so the backtick-quoting is single-sourced.
+pub(crate) fn quote_ident(id: &str) -> String {
     format!("`{}`", id.replace('`', "``"))
 }
 
@@ -289,7 +291,9 @@ pub(crate) fn compose_query(tail: &str) -> String {
 
 /// Strips a leading keyword `kw` (ASCII case-insensitive) from `s`, requiring a word boundary after it,
 /// and returns the trimmed remainder. `None` when `s` does not begin with `kw` at a word boundary.
-fn strip_leading_kw<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
+///
+/// Shared with [`crate::engine::index_show`] (`rmp` #660).
+pub(crate) fn strip_leading_kw<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
     let s = s.trim_start();
     let head = s.get(..kw.len())?;
     if !head.eq_ignore_ascii_case(kw) {
@@ -305,7 +309,9 @@ fn strip_leading_kw<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
 
 /// Whether `s` contains the word `RETURN` (case-insensitive) at a word boundary, outside any
 /// single/double/backtick-quoted span. A `\`-escape inside a quoted span skips the next byte.
-fn contains_top_level_return(s: &str) -> bool {
+///
+/// Shared with [`crate::engine::index_show`] (`rmp` #660) so the quote-aware scanner is single-sourced.
+pub(crate) fn contains_top_level_return(s: &str) -> bool {
     let bytes = s.as_bytes();
     let n = bytes.len();
     let mut i = 0;

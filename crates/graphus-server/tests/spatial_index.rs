@@ -24,7 +24,7 @@ use graphus_cypher::MaterializedValue;
 use graphus_server::config::{
     AdmissionConfig, AuthBootstrap, ServerConfig, TimingConfig, TlsConfig,
 };
-use graphus_server::engine::{AccessMode, EngineHandle, IndexCommand};
+use graphus_server::engine::{AccessMode, EngineHandle, IndexCommand, IndexTypeFilter};
 use graphus_server::{Server, ServerHandle};
 
 struct TempStore {
@@ -231,16 +231,34 @@ async fn create_query_update_delete_over_a_real_server() {
     run(&engine, "MATCH (n:City {name: 'b'}) DELETE n").await;
     assert!(proximity_names(&engine, 0.0, 0.0, 2.0).await.is_empty());
 
-    // SHOW POINT INDEXES lists the index.
+    // SHOW POINT INDEXES lists the index (unified listing filtered to POINT, `rmp` #660). The engine
+    // returns the full Neo4j column set: id(0), name(1), state(2), populationPercent(3), type(4),
+    // entityType(5), labelsOrTypes(6), properties(7), ...
     let reply = engine
-        .index_ddl(IndexCommand::ShowPointIndexes)
+        .index_ddl(IndexCommand::ShowIndexes {
+            filter: IndexTypeFilter::Point,
+            tail: None,
+        })
         .await
         .expect("show");
     assert_eq!(reply.rows.len(), 1);
-    assert_eq!(reply.rows[0][0], Value::String("by_loc".to_owned()));
-    assert_eq!(reply.rows[0][1], Value::String("City".to_owned()));
-    assert_eq!(reply.rows[0][2], Value::String("loc".to_owned()));
-    assert_eq!(reply.rows[0][3], Value::String("online".to_owned()));
+    assert_eq!(reply.rows[0][1], Value::String("by_loc".to_owned()), "name");
+    assert_eq!(
+        reply.rows[0][2],
+        Value::String("ONLINE".to_owned()),
+        "state"
+    );
+    assert_eq!(reply.rows[0][4], Value::String("POINT".to_owned()), "type");
+    assert_eq!(
+        reply.rows[0][6],
+        Value::List(vec![Value::String("City".to_owned())]),
+        "labelsOrTypes"
+    );
+    assert_eq!(
+        reply.rows[0][7],
+        Value::List(vec![Value::String("loc".to_owned())]),
+        "properties"
+    );
 
     handle.shutdown().await.expect("graceful shutdown");
 }
@@ -286,11 +304,18 @@ async fn index_survives_a_full_server_restart() {
     let engine = handle.engine.clone();
 
     let reply = engine
-        .index_ddl(IndexCommand::ShowPointIndexes)
+        .index_ddl(IndexCommand::ShowIndexes {
+            filter: IndexTypeFilter::Point,
+            tail: None,
+        })
         .await
         .expect("show after restart");
     assert_eq!(reply.rows.len(), 1, "the index must survive the restart");
-    assert_eq!(reply.rows[0][3], Value::String("online".to_owned()));
+    assert_eq!(
+        reply.rows[0][2],
+        Value::String("ONLINE".to_owned()),
+        "state"
+    );
 
     assert_eq!(
         proximity_names(&engine, 0.0, 0.0, 2.0).await,
@@ -373,7 +398,10 @@ async fn drop_index_then_query_still_correct() {
         vec!["d1".to_owned()]
     );
     let reply = engine
-        .index_ddl(IndexCommand::ShowPointIndexes)
+        .index_ddl(IndexCommand::ShowIndexes {
+            filter: IndexTypeFilter::Point,
+            tail: None,
+        })
         .await
         .expect("show");
     assert!(reply.rows.is_empty(), "the dropped index is gone");

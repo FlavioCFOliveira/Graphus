@@ -174,8 +174,23 @@ pub enum IndexCommand {
         /// Whether `IF EXISTS` was given (a missing index becomes a no-op success).
         if_exists: bool,
     },
-    /// `SHOW INDEXES`: lists every declared node-property index with its build state.
-    ShowIndexes,
+    /// `SHOW [<filter>] INDEX[ES] [YIELD … | WHERE …]` (`rmp` tasks #91, #660): the **unified**
+    /// Neo4j-conformant listing of *every* index kind — node-property and relationship-property
+    /// `RANGE`, composite `RANGE`, `FULLTEXT`, `POINT`, and the two always-on token `LOOKUP` indexes —
+    /// restricted to `filter`'s kinds, with an optional `YIELD`/`WHERE`/`RETURN` tail.
+    ///
+    /// The engine renders the **full column** row set (`crate::engine::index_show::COLUMNS_FULL`,
+    /// filtered by `filter`); the seams then, when `tail` is `Some`, re-run a **translated read query**
+    /// over those rows through the Cypher engine (`crate::engine::index_show::finish`), and otherwise
+    /// project to the default columns. `tail` is the raw post-`INDEX[ES]` text (beginning `YIELD` or
+    /// `WHERE`) captured verbatim by the admin parser. This folds the legacy bespoke-column
+    /// `SHOW FULLTEXT INDEXES` / `SHOW POINT INDEXES` surfaces into one Neo4j-shaped listing.
+    ShowIndexes {
+        /// The index-kind filter (`ALL` / a specific-kind selector).
+        filter: IndexTypeFilter,
+        /// The raw `YIELD …` / `WHERE …` tail, or [`None`] for a bare listing.
+        tail: Option<String>,
+    },
     /// `CREATE FULLTEXT INDEX <name> FOR (n:<Label>) ON EACH [n.<prop>, …]` (`rmp` task #72): starts
     /// a **non-blocking** online build of a full-text index over `(label, properties)` analyzed with
     /// `analyzer` (a lower-cased analyzer name; `standard` by default).
@@ -196,8 +211,6 @@ pub enum IndexCommand {
         /// The full-text index name to drop.
         name: String,
     },
-    /// `SHOW FULLTEXT INDEXES` (`rmp` task #72): lists every declared full-text index.
-    ShowFulltextIndexes,
     /// `CREATE POINT INDEX <name> FOR (n:<Label>) ON (n.<prop>)` (`rmp` task #98): starts a
     /// **non-blocking** online build of a grid spatial (point) index over `(label, property)`.
     CreatePointIndex {
@@ -214,8 +227,6 @@ pub enum IndexCommand {
         /// The spatial index name to drop.
         name: String,
     },
-    /// `SHOW POINT INDEXES` (`rmp` task #98): lists every declared spatial index.
-    ShowPointIndexes,
     /// `CREATE INDEX [<name>] [IF NOT EXISTS] FOR ()-[r:<TYPE>]-() ON (r.<property>)` on
     /// `(rel_type, property)` (`rmp` task #646): the relationship analogue of
     /// [`CreateNodePropertyIndex`](Self::CreateNodePropertyIndex). Synchronously builds the index from
@@ -392,6 +403,50 @@ impl ConstraintTypeFilter {
             Self::NodePropertyType => kind == K::PropertyType,
             Self::RelPropertyType => kind == K::RelPropertyType,
             Self::PropertyType => matches!(kind, K::PropertyType | K::RelPropertyType),
+        }
+    }
+}
+
+/// A type filter for `SHOW INDEXES` (`rmp` task #660): `SHOW <filter> INDEX[ES]` restricts the unified
+/// listing to the index kinds the filter selects, matching Neo4j-5.x's filtered forms
+/// (`SHOW RANGE INDEXES`, `SHOW FULLTEXT INDEXES`, `SHOW POINT INDEXES`, `SHOW LOOKUP INDEXES`, …).
+/// [`All`](Self::All) — and the absent filter of a bare `SHOW INDEXES` — selects every kind. The filter
+/// matches the Neo4j `type` string a row renders (`RANGE` / `FULLTEXT` / `POINT` / `LOOKUP`).
+///
+/// Graphus has no distinct `TEXT` or `VECTOR` index kind: a `TEXT` index is a create-time synonym of a
+/// `RANGE` B-tree (it renders `type = RANGE`), and vector indexes arrive in a later sprint. So
+/// [`Text`](Self::Text) and [`Vector`](Self::Vector) select the (currently empty) set of rows whose
+/// `type` is exactly `TEXT` / `VECTOR` — an empty listing rather than a syntax error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexTypeFilter {
+    /// `ALL` / no filter — every index kind.
+    All,
+    /// `RANGE` — node-property, relationship-property and composite range indexes.
+    Range,
+    /// `TEXT` — text indexes (none in Graphus; a `TEXT` create is a synonym of `RANGE`).
+    Text,
+    /// `POINT` — spatial (point) indexes.
+    Point,
+    /// `LOOKUP` — the two always-on token lookup indexes.
+    Lookup,
+    /// `FULLTEXT` — full-text indexes.
+    Fulltext,
+    /// `VECTOR` — vector indexes (none in Graphus yet; a later sprint).
+    Vector,
+}
+
+impl IndexTypeFilter {
+    /// Whether an index whose Neo4j `type` string is `type_str` is selected by this filter (`rmp` #660).
+    #[must_use]
+    pub fn matches(self, type_str: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Range => type_str == "RANGE",
+            Self::Text => type_str == "TEXT",
+            Self::Point => type_str == "POINT",
+            Self::Lookup => type_str == "LOOKUP",
+            Self::Fulltext => type_str == "FULLTEXT",
+            Self::Vector => type_str == "VECTOR",
         }
     }
 }
@@ -713,9 +768,7 @@ fn schema_mutation_summary(key: &str, mutated: bool) -> RunSummary {
 #[must_use]
 pub fn index_ddl_summary(command: &IndexCommand, mutated: bool) -> RunSummary {
     match command {
-        IndexCommand::ShowIndexes
-        | IndexCommand::ShowFulltextIndexes
-        | IndexCommand::ShowPointIndexes => RunSummary {
+        IndexCommand::ShowIndexes { .. } => RunSummary {
             query_type: Some("r".to_owned()),
             stats: Vec::new(),
         },
@@ -823,11 +876,15 @@ mod tests {
             ("indexes-removed".to_owned(), Value::Integer(1)),
         );
 
-        for show in [
-            IndexCommand::ShowIndexes,
-            IndexCommand::ShowFulltextIndexes,
-            IndexCommand::ShowPointIndexes,
+        // Every `SHOW … INDEXES` filtered form is now the one unified `ShowIndexes` (`rmp` #660).
+        for filter in [
+            IndexTypeFilter::All,
+            IndexTypeFilter::Range,
+            IndexTypeFilter::Fulltext,
+            IndexTypeFilter::Point,
+            IndexTypeFilter::Lookup,
         ] {
+            let show = IndexCommand::ShowIndexes { filter, tail: None };
             let s = index_ddl_summary(&show, true);
             assert_eq!(s.query_type.as_deref(), Some("r"), "{show:?} is a read");
             assert!(s.stats.is_empty(), "a SHOW reports no counters: {show:?}");

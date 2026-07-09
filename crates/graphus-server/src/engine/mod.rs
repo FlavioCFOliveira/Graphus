@@ -30,6 +30,7 @@ pub mod command;
 pub(crate) mod constraint_show;
 mod exec;
 mod handle;
+pub(crate) mod index_show;
 mod local;
 pub mod privileges;
 mod read_pool;
@@ -54,7 +55,7 @@ pub use bulk_load_b::{BulkImportModeBChunkInput, BulkImportModeBChunkOutcome};
 pub use command::{
     AccessMode, CheckpointReply, ConstraintCommand, ConstraintCreateKind, ConstraintEntity,
     ConstraintTypeFilter, CreateConstraint, EngineCommand, IndexCommand, IndexDdlReply,
-    NodePropertyIndexRef, RelPropertyIndexRef, RunReply, RunSummary,
+    IndexTypeFilter, NodePropertyIndexRef, RelPropertyIndexRef, RunReply, RunSummary,
 };
 pub use handle::{EngineHandle, ServerBusy};
 // `EngineDegraded` is defined in this module (below); re-export note: it is `pub` here.
@@ -66,7 +67,7 @@ pub use seam_rest::{RestAuthObserver, RestEngineAdapter};
 use crate::metrics::Metrics;
 use command::EngineCommand as Cmd;
 use graphus_core::{TxnId, Value};
-use graphus_storage::{ConstraintKind, IndexState};
+use graphus_storage::ConstraintKind;
 
 /// How many nodes a single [`TxnCoordinator::advance_index_builds`] call indexes per tick while a
 /// non-blocking index build is in progress (`rmp` task #91).
@@ -2059,12 +2060,7 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             let _ = reply.send(coord.active_count());
         }
         Cmd::IndexDdl { command, reply } => {
-            let mutating = !matches!(
-                command,
-                IndexCommand::ShowIndexes
-                    | IndexCommand::ShowFulltextIndexes
-                    | IndexCommand::ShowPointIndexes
-            );
+            let mutating = !matches!(command, IndexCommand::ShowIndexes { .. });
             let out = handle_index_ddl(coord, &command);
             // Invalidate the plan cache on a successful *mutating* index DDL (`rmp` task #322): a DROP
             // (and a fulltext/spatial CREATE, which is synchronous) changes the planner-visible catalog
@@ -2553,100 +2549,27 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
             };
             Ok(IndexDdlReply::mutation(mutated))
         }
-        IndexCommand::ShowIndexes => {
-            // Neo4j-conformant column shape (`rmp` tasks #626 / #653): the real driver ecosystem reads
-            // `name, type, entityType, labelsOrTypes, properties, state, owningConstraint`. `type` is
-            // `RANGE` (the node-property index kind), `entityType` is `NODE`/`RELATIONSHIP`, and
-            // `labelsOrTypes` / `properties` are single-element lists. The `state` string stays
-            // lower-case for coherence with the full-text / point `SHOW … INDEXES` surfaces.
-            // `owningConstraint` (`rmp` #653) names the uniqueness / key constraint whose backing index
-            // this is (matched by covered `(label/type, single property)`), else `Null`.
-            let fields = vec![
-                "name".to_owned(),
-                "type".to_owned(),
-                "entityType".to_owned(),
-                "labelsOrTypes".to_owned(),
-                "properties".to_owned(),
-                "state".to_owned(),
-                "owningConstraint".to_owned(),
-            ];
-            let state_str = |state: IndexState| match state {
-                IndexState::Online => "online",
-                IndexState::Populating => "populating",
+        IndexCommand::ShowIndexes { filter, tail: _ } => {
+            // The **unified** Neo4j-conformant listing (`rmp` task #660): the engine renders the FULL
+            // column set (`index_show::COLUMNS_FULL`) for *every* index kind — node/relationship-property
+            // and composite RANGE, FULLTEXT, POINT, and the two always-on token LOOKUP indexes —
+            // filtered by `filter`. The seams then project to the default columns (a bare listing) or
+            // re-run the `YIELD`/`WHERE`/`RETURN` `tail` (`index_show::finish`), exactly as
+            // `SHOW CONSTRAINTS` does (`rmp` #653); the `tail` is read off the command by the seam.
+            let sources = index_show::IndexSources {
+                node_property: coordinator.list_node_property_indexes(),
+                composite: coordinator.list_composite_indexes(),
+                rel_property: coordinator.list_rel_property_indexes(),
+                fulltext: coordinator.list_fulltext_indexes(),
+                point: coordinator.list_point_indexes(),
+                constraints: coordinator.list_constraints(),
             };
-            // Attribute a backing index to its owning uniqueness / key constraint by matching the covered
-            // `(entityType, covering token, single property)` (`rmp` #653). A composite node/rel key's
-            // backing index is not a single-property node-property index row, so it never matches here
-            // (its `owningConstraint` stays `Null`) — a documented limitation.
-            let constraints = coordinator.list_constraints();
-            let owning = |is_rel: bool, token: &str, property: &str| -> Value {
-                constraints
-                    .iter()
-                    .find(|c| {
-                        let kind_ok = if is_rel {
-                            matches!(c.kind, ConstraintKind::RelUnique | ConstraintKind::RelKey)
-                        } else {
-                            matches!(c.kind, ConstraintKind::Unique | ConstraintKind::NodeKey)
-                        };
-                        kind_ok
-                            && c.label == token
-                            && c.properties.len() == 1
-                            && c.properties[0] == property
-                    })
-                    .map_or(Value::Null, |c| Value::String(c.name.clone()))
-            };
-            // Node-property (RANGE, entityType NODE) rows, then relationship-property (RANGE,
-            // entityType RELATIONSHIP) rows (`rmp` task #646) — `SHOW INDEXES` lists both, matching
-            // Neo4j. `labelsOrTypes` carries the covered label OR relationship type per row.
-            let mut rows: Vec<Vec<Value>> = coordinator
-                .list_node_property_indexes()
-                .into_iter()
-                .map(|(name, label, property, state)| {
-                    let owning_constraint = owning(false, &label, &property);
-                    vec![
-                        Value::String(name),
-                        Value::String("RANGE".to_owned()),
-                        Value::String("NODE".to_owned()),
-                        Value::List(vec![Value::String(label)]),
-                        Value::List(vec![Value::String(property)]),
-                        Value::String(state_str(state).to_owned()),
-                        owning_constraint,
-                    ]
-                })
-                .collect();
-            rows.extend(coordinator.list_rel_property_indexes().into_iter().map(
-                |(name, rel_type, property, state)| {
-                    let owning_constraint = owning(true, &rel_type, &property);
-                    vec![
-                        Value::String(name),
-                        Value::String("RANGE".to_owned()),
-                        Value::String("RELATIONSHIP".to_owned()),
-                        Value::List(vec![Value::String(rel_type)]),
-                        Value::List(vec![Value::String(property)]),
-                        Value::String(state_str(state).to_owned()),
-                        owning_constraint,
-                    ]
-                },
-            ));
-            // Standalone composite (multi-property) node indexes (`rmp` task #657): `type` stays RANGE,
-            // `entityType` NODE, and `properties` is the multi-element covered tuple (`[a, b, …]`) in
-            // declared order. `owningConstraint` is always `Null` — a standalone composite index is not a
-            // constraint's backing index (its own auto-name is `index_<L>_<a>_<b>`).
-            rows.extend(coordinator.list_composite_indexes().into_iter().map(
-                |(name, label, properties, state)| {
-                    vec![
-                        Value::String(name),
-                        Value::String("RANGE".to_owned()),
-                        Value::String("NODE".to_owned()),
-                        Value::List(vec![Value::String(label)]),
-                        Value::List(properties.into_iter().map(Value::String).collect()),
-                        Value::String(state_str(state).to_owned()),
-                        Value::Null,
-                    ]
-                },
-            ));
+            let rows = index_show::build_rows(*filter, sources);
             Ok(IndexDdlReply {
-                fields,
+                fields: index_show::COLUMNS_FULL
+                    .iter()
+                    .map(|c| (*c).to_owned())
+                    .collect(),
                 rows,
                 mutated: false, // a SHOW is a read; the mutated flag is unused.
             })
@@ -2701,38 +2624,6 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
             let mutated = coordinator.drop_fulltext_index(name)?;
             Ok(IndexDdlReply::mutation(mutated))
         }
-        IndexCommand::ShowFulltextIndexes => {
-            let fields = vec![
-                "name".to_owned(),
-                "label".to_owned(),
-                "properties".to_owned(),
-                "analyzer".to_owned(),
-                "state".to_owned(),
-            ];
-            let rows = coordinator
-                .list_fulltext_indexes()
-                .into_iter()
-                .map(|(name, label, properties, analyzer, state)| {
-                    let state = match state {
-                        IndexState::Online => "online",
-                        IndexState::Populating => "populating",
-                    };
-                    vec![
-                        Value::String(name),
-                        Value::String(label),
-                        // The covered properties as a Cypher list of strings.
-                        Value::List(properties.into_iter().map(Value::String).collect()),
-                        Value::String(analyzer.name().to_owned()),
-                        Value::String(state.to_owned()),
-                    ]
-                })
-                .collect();
-            Ok(IndexDdlReply {
-                fields,
-                rows,
-                mutated: false, // a SHOW is a read; the mutated flag is unused.
-            })
-        }
         IndexCommand::CreatePointIndex {
             name,
             label,
@@ -2747,35 +2638,6 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
             // `mutated == false` is a no-op drop of a missing index → 0 removed.
             let mutated = coordinator.drop_point_index(name)?;
             Ok(IndexDdlReply::mutation(mutated))
-        }
-        IndexCommand::ShowPointIndexes => {
-            let fields = vec![
-                "name".to_owned(),
-                "label".to_owned(),
-                "property".to_owned(),
-                "state".to_owned(),
-            ];
-            let rows = coordinator
-                .list_point_indexes()
-                .into_iter()
-                .map(|(name, label, property, state)| {
-                    let state = match state {
-                        IndexState::Online => "online",
-                        IndexState::Populating => "populating",
-                    };
-                    vec![
-                        Value::String(name),
-                        Value::String(label),
-                        Value::String(property),
-                        Value::String(state.to_owned()),
-                    ]
-                })
-                .collect();
-            Ok(IndexDdlReply {
-                fields,
-                rows,
-                mutated: false, // a SHOW is a read; the mutated flag is unused.
-            })
         }
     }
 }
