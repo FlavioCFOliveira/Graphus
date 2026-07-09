@@ -753,6 +753,16 @@ pub fn is_aggregate(dotted_name: &str) -> bool {
     lookup(dotted_name).is_some_and(|s| s.aggregate)
 }
 
+/// The complete built-in function library, for read-only introspection (`SHOW FUNCTIONS`).
+///
+/// Returns the curated static [`TABLE`] — the engine's own, frozen set of functions (sorted by
+/// name). The slice is process-global and never changes at runtime, so administrative
+/// introspection can enumerate it without any engine round-trip. Extension UDFs registered into a
+/// [`FunctionSet`] are **not** included here (they are a separate, per-deployment surface).
+pub fn builtins() -> &'static [Signature] {
+    TABLE
+}
+
 // =================================================================================================
 // Registrable functions: the user-defined-function (UDF) framework (`rmp` task #75)
 // =================================================================================================

@@ -551,6 +551,24 @@ fn substitute_restated(expr: &Expr, targets: &[&Expr]) -> Expr {
             operand: Box::new(substitute_restated(operand, targets)),
             expr: expr.clone(),
         },
+        ExprKind::TypePredicate {
+            operand,
+            negated,
+            type_expr,
+        } => ExprKind::TypePredicate {
+            operand: Box::new(substitute_restated(operand, targets)),
+            negated: *negated,
+            type_expr: type_expr.clone(),
+        },
+        ExprKind::NormalizedPredicate {
+            operand,
+            negated,
+            form,
+        } => ExprKind::NormalizedPredicate {
+            operand: Box::new(substitute_restated(operand, targets)),
+            negated: *negated,
+            form: *form,
+        },
         ExprKind::FunctionCall {
             name,
             distinct,
@@ -1964,9 +1982,10 @@ impl Analyzer<'_> {
                 self.check_expr_refs(lhs, scope)?;
                 self.check_expr_refs(rhs, scope)
             }
-            ExprKind::Unary { operand, .. } | ExprKind::HasLabels { operand, .. } => {
-                self.check_expr_refs(operand, scope)
-            }
+            ExprKind::Unary { operand, .. }
+            | ExprKind::HasLabels { operand, .. }
+            | ExprKind::TypePredicate { operand, .. }
+            | ExprKind::NormalizedPredicate { operand, .. } => self.check_expr_refs(operand, scope),
             ExprKind::Predicate { operand, rhs, .. } => {
                 self.check_expr_refs(operand, scope)?;
                 if let Some(rhs) = rhs {
@@ -2815,7 +2834,10 @@ impl Analyzer<'_> {
                 f(lhs)?;
                 f(rhs)
             }
-            ExprKind::Unary { operand, .. } | ExprKind::HasLabels { operand, .. } => f(operand),
+            ExprKind::Unary { operand, .. }
+            | ExprKind::HasLabels { operand, .. }
+            | ExprKind::TypePredicate { operand, .. }
+            | ExprKind::NormalizedPredicate { operand, .. } => f(operand),
             ExprKind::Predicate { operand, rhs, .. } => {
                 f(operand)?;
                 if let Some(rhs) = rhs {

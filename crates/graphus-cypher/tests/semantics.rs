@@ -1208,6 +1208,31 @@ mod pattern_predicates {
 }
 
 // =================================================================================================
+// Type / normalization predicates and USE (rmp #636, #640)
+// =================================================================================================
+
+#[test]
+fn type_predicate_operand_scope_is_checked() {
+    // The undefined variable inside the type-predicate operand must be caught (the scope walk
+    // recurses into the operand).
+    assert_detail("RETURN x IS :: INTEGER", SemanticDetail::UndefinedVariable);
+    // A bound operand is fine.
+    ok("MATCH (n) RETURN n.age IS :: INTEGER");
+}
+
+#[test]
+fn normalized_predicate_operand_scope_is_checked() {
+    assert_detail("RETURN x IS NORMALIZED", SemanticDetail::UndefinedVariable);
+    ok("MATCH (n) RETURN n.name IS NFD NORMALIZED");
+}
+
+#[test]
+fn use_clause_query_is_semantically_valid() {
+    ok("USE graphus MATCH (n) RETURN n");
+    ok("USE composite.shard1 RETURN 1 AS one");
+}
+
+// =================================================================================================
 // FOREACH (rmp #122)
 // =================================================================================================
 

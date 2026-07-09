@@ -58,12 +58,13 @@ use crate::ast::{
     BinaryOp, CallClause, CallSubqueryClause, CaseAlternative, CaseExpr, Clause, CreateClause,
     DeleteClause, ExistsSubquery, Expr, ExprKind, ForeachClause, InTransactions, Label, LabelExpr,
     ListComprehension, Literal, LoadCsvClause, MapKey, MapProjection, MapProjectionSelector,
-    MatchClause, MergeAction, MergeClause, NodePattern, PatternChainLink, PatternComprehension,
-    PatternElement, PatternPart, PatternPartKind, PredicateOp, ProcedureCall, ProjectionBody,
-    ProjectionItem, QuantifierExpr, QuantifierKind, Query, QueryBody, ReduceExpr, RelDirection,
-    RelType, RelationshipPattern, RemoveClause, RemoveItem, ReturnClause, SetClause, SetItem,
-    SingleQuery, SortDirection, SortItem, StandaloneCall, StandaloneYield, SubqueryExpr, UnaryOp,
-    UnionPart, UnwindClause, VarLengthRange, Variable, WithClause, YieldItem,
+    MatchClause, MergeAction, MergeClause, NodePattern, NormalForm, PatternChainLink,
+    PatternComprehension, PatternElement, PatternPart, PatternPartKind, PredefinedType,
+    PredicateOp, ProcedureCall, ProjectionBody, ProjectionItem, QuantifierExpr, QuantifierKind,
+    Query, QueryBody, ReduceExpr, RelDirection, RelType, RelationshipPattern, RemoveClause,
+    RemoveItem, ReturnClause, SetClause, SetItem, SingleQuery, SortDirection, SortItem,
+    StandaloneCall, StandaloneYield, SubqueryExpr, TypeExpr, UnaryOp, UnionPart, UnwindClause,
+    UseGraph, VarLengthRange, Variable, WithClause, YieldItem,
 };
 use crate::lexer::{IntLiteral, Span, Token, TokenKind, tokenize};
 use graphus_core::GraphusError;
@@ -560,6 +561,22 @@ impl<'t, 's> Parser<'t, 's> {
     }
 
     /// Builds an "expected {desc}, found {current}" error at the current position (or EOF).
+    /// Builds an [`Expected`](SyntaxErrorKind::Expected) error at an explicit `span` (rather than at
+    /// the current token), describing what was expected and what the current token is. Used when the
+    /// offending region was already consumed, so the error should point back at it.
+    fn error_at(&self, span: Span, desc: &str) -> SyntaxError {
+        let found = self
+            .peek()
+            .map_or_else(|| "end of input".to_owned(), |t| describe(&t.kind));
+        SyntaxError::new(
+            SyntaxErrorKind::Expected {
+                expected: desc.to_owned(),
+                found,
+            },
+            span,
+        )
+    }
+
     fn expected_here(&self, desc: &str) -> SyntaxError {
         match self.peek() {
             Some(t) => SyntaxError::new(
@@ -580,9 +597,11 @@ impl<'t, 's> Parser<'t, 's> {
 
     // --- top level -------------------------------------------------------------------------------
 
-    /// Parses `Query = RegularQuery | StandaloneCall`.
+    /// Parses `Query = [UseClause], (RegularQuery | StandaloneCall)`.
     fn parse_query(&mut self) -> Result<Query, SyntaxError> {
         let start = self.here_span().start;
+        // An optional leading `USE <graph>` selector (`rmp` #640) precedes the query body.
+        let use_graph = self.parse_use_clause()?;
         // A standalone CALL is recognized by a leading `CALL` that is *not* part of a longer single
         // query (i.e. it is the whole statement). The grammar distinguishes `StandaloneCall` (no
         // surrounding clauses) from an `InQueryCall`. We parse a standalone call only when `CALL` is
@@ -598,6 +617,7 @@ impl<'t, 's> Parser<'t, 's> {
             if let Some(call) = self.try_parse_standalone_call()? {
                 let end = call.span.end;
                 return Ok(Query {
+                    use_graph,
                     body: QueryBody::StandaloneCall(call),
                     span: Span::new(start, end),
                 });
@@ -613,9 +633,40 @@ impl<'t, 's> Parser<'t, 's> {
             .last()
             .map_or(head.span.end, |u: &UnionPart| u.span.end);
         Ok(Query {
+            use_graph,
             body: QueryBody::Regular { head, unions },
             span: Span::new(start, end),
         })
+    }
+
+    /// Parses an optional leading `USE <graph>` selector (`rmp` #640). Returns `None` when the next
+    /// token is not `USE`. The graph reference is a dot-separated name (a simple `neo4j` or a
+    /// composite `namespace.constituent`); each segment is an openCypher `SchemaName` (so a
+    /// reserved-word or backtick-quoted database name is accepted). The graph-valued **function**
+    /// forms (`USE graph.byName(...)`) are intentionally not supported — a `(` after the name is a
+    /// clear error rather than a mis-parse.
+    fn parse_use_clause(&mut self) -> Result<Option<UseGraph>, SyntaxError> {
+        if !self.at(&TokenKind::Use) {
+            return Ok(None);
+        }
+        let start = self.here_span().start;
+        self.bump(); // USE
+        let mut name = vec![self.parse_schema_name("a database name after USE")?];
+        let mut end = self.tokens[self.pos - 1].span.end;
+        while self.at(&TokenKind::Dot) {
+            self.bump(); // '.'
+            name.push(self.parse_schema_name("a database name segment after '.'")?);
+            end = self.tokens[self.pos - 1].span.end;
+        }
+        if self.at(&TokenKind::LParen) {
+            return Err(self.expected_here(
+                "a database name (graph functions such as graph.byName(...) are not supported in USE)",
+            ));
+        }
+        Ok(Some(UseGraph {
+            name,
+            span: Span::new(start, end),
+        }))
     }
 
     /// Parses `Union = 'UNION', ['ALL'], SingleQuery`.
@@ -957,6 +1008,8 @@ impl<'t, 's> Parser<'t, 's> {
     /// subroutines the top level uses. The closing `}` is **not** consumed (the caller consumes it).
     fn parse_subquery_block(&mut self) -> Result<Query, SyntaxError> {
         let start = self.here_span().start;
+        // A `CALL { USE <graph> … }` subquery may open with its own `USE` selector (`rmp` #640).
+        let use_graph = self.parse_use_clause()?;
         let head = self.parse_single_query()?;
         let mut unions = Vec::new();
         while self.at(&TokenKind::Union) {
@@ -966,6 +1019,7 @@ impl<'t, 's> Parser<'t, 's> {
             .last()
             .map_or(head.span.end, |u: &UnionPart| u.span.end);
         Ok(Query {
+            use_graph,
             body: QueryBody::Regular { head, unions },
             span: Span::new(start, end),
         })
@@ -2122,6 +2176,7 @@ impl<'t, 's> Parser<'t, 's> {
                         | TokenKind::Contains
                         | TokenKind::RegexMatch
                         | TokenKind::Is
+                        | TokenKind::DoubleColon
                 )
             ) {
                 break;
@@ -2172,21 +2227,24 @@ impl<'t, 's> Parser<'t, 's> {
                     );
                 }
                 Some(TokenKind::Is) => {
-                    // `IS NULL` / `IS NOT NULL`.
+                    // `IS NULL` / `IS NOT NULL` / `IS [NOT] :: <type>` / `IS [NOT] TYPED <type>` /
+                    // `IS [NOT] [<form>] NORMALIZED` (`rmp` #636).
                     self.bump();
-                    let not = self.eat(&TokenKind::Not);
-                    let null_tok = self.expect(&TokenKind::Null, "NULL after IS")?;
-                    let span = Span::new(expr.span.start, null_tok.span.end);
-                    let op = if not {
-                        PredicateOp::IsNotNull
-                    } else {
-                        PredicateOp::IsNull
-                    };
+                    let negated = self.eat(&TokenKind::Not);
+                    expr = self.parse_is_predicate_tail(expr, negated)?;
+                }
+                Some(TokenKind::DoubleColon) => {
+                    // The bare postfix type predicate `expr :: <type>` (no `IS`), equivalent to
+                    // `expr IS :: <type>` (`rmp` #636).
+                    self.bump();
+                    let type_expr = self.parse_type()?;
+                    let end = self.tokens[self.pos - 1].span.end;
+                    let span = Span::new(expr.span.start, end);
                     expr = Expr::new(
-                        ExprKind::Predicate {
-                            op,
+                        ExprKind::TypePredicate {
                             operand: Box::new(expr),
-                            rhs: None,
+                            negated: false,
+                            type_expr,
                         },
                         span,
                     );
@@ -2201,6 +2259,260 @@ impl<'t, 's> Parser<'t, 's> {
     fn expect_keyword_with(&mut self) -> Result<(), SyntaxError> {
         self.expect(&TokenKind::With, "WITH (in STARTS WITH / ENDS WITH)")?;
         Ok(())
+    }
+
+    /// Parses the tail of an `IS` postfix predicate after the `IS [NOT]` prefix has been consumed
+    /// (`rmp` #636). `negated` records whether a `NOT` was seen. Dispatches to one of:
+    /// * `NULL` — the null predicate `IS [NOT] NULL`;
+    /// * `::` / `TYPED` — the type predicate `IS [NOT] :: <type>`;
+    /// * `[<form>] NORMALIZED` — the Unicode-normalization predicate `IS [NOT] [<form>] NORMALIZED`.
+    fn parse_is_predicate_tail(
+        &mut self,
+        operand: Expr,
+        negated: bool,
+    ) -> Result<Expr, SyntaxError> {
+        let start = operand.span.start;
+        // `IS [NOT] NULL`.
+        if self.at(&TokenKind::Null) {
+            let null_tok = self.expect(&TokenKind::Null, "NULL after IS")?;
+            let op = if negated {
+                PredicateOp::IsNotNull
+            } else {
+                PredicateOp::IsNull
+            };
+            return Ok(Expr::new(
+                ExprKind::Predicate {
+                    op,
+                    operand: Box::new(operand),
+                    rhs: None,
+                },
+                Span::new(start, null_tok.span.end),
+            ));
+        }
+        // `IS [NOT] :: <type>` / `IS [NOT] TYPED <type>`.
+        if self.eat(&TokenKind::DoubleColon) || self.eat_keyword_ident("typed") {
+            let type_expr = self.parse_type()?;
+            let end = self.tokens[self.pos - 1].span.end;
+            return Ok(Expr::new(
+                ExprKind::TypePredicate {
+                    operand: Box::new(operand),
+                    negated,
+                    type_expr,
+                },
+                Span::new(start, end),
+            ));
+        }
+        // `IS [NOT] [<form>] NORMALIZED` — an optional leading normalization form, then NORMALIZED.
+        if let Some(form) = self.peek_normalization_form() {
+            // `<form> NORMALIZED`: the form word is only valid when NORMALIZED follows it.
+            if self.peek_keyword_ident_at(1, "normalized") {
+                self.bump(); // <form>
+                let norm_tok = self.expect_keyword_ident_tok("normalized", "NORMALIZED")?;
+                return Ok(Expr::new(
+                    ExprKind::NormalizedPredicate {
+                        operand: Box::new(operand),
+                        negated,
+                        form,
+                    },
+                    Span::new(start, norm_tok),
+                ));
+            }
+        }
+        if self.at_keyword_ident("normalized") {
+            let norm_tok = self.expect_keyword_ident_tok("normalized", "NORMALIZED")?;
+            return Ok(Expr::new(
+                ExprKind::NormalizedPredicate {
+                    operand: Box::new(operand),
+                    negated,
+                    form: NormalForm::Nfc,
+                },
+                Span::new(start, norm_tok),
+            ));
+        }
+        Err(self.expected_here("NULL, :: <type>, TYPED <type>, or [<form>] NORMALIZED after IS"))
+    }
+
+    /// The Unicode normalization form named by the current token, if it is one of the four
+    /// contextual form keywords (`NFC`, `NFD`, `NFKC`, `NFKD`). Does not consume.
+    fn peek_normalization_form(&self) -> Option<NormalForm> {
+        if self.at_keyword_ident("nfc") {
+            Some(NormalForm::Nfc)
+        } else if self.at_keyword_ident("nfd") {
+            Some(NormalForm::Nfd)
+        } else if self.at_keyword_ident("nfkc") {
+            Some(NormalForm::Nfkc)
+        } else if self.at_keyword_ident("nfkd") {
+            Some(NormalForm::Nfkd)
+        } else {
+            None
+        }
+    }
+
+    /// Consumes the contextual keyword `word`, returning the end byte of its span (for the enclosing
+    /// predicate's span), or errors with "expected {desc}".
+    fn expect_keyword_ident_tok(&mut self, word: &str, desc: &str) -> Result<usize, SyntaxError> {
+        if self.at_keyword_ident(word) {
+            let end = self.here_span().end;
+            self.pos += 1;
+            Ok(end)
+        } else {
+            Err(self.expected_here(desc))
+        }
+    }
+
+    /// Parses a GQL / Cypher type after `IS ::` (`rmp` #636): a `|`-separated closed union of type
+    /// members. A top-level `|` unites members only when it is **not** the structural separator of
+    /// an enclosing `|`-delimited body (list / pattern comprehension, `reduce`, `FOREACH`) — there a
+    /// union must be written parenthesised as `ANY<A | B>` (the same ambiguity resolution the label
+    /// expression grammar uses for its `|`). A single member collapses to that member (no `Union`).
+    fn parse_type(&mut self) -> Result<TypeExpr, SyntaxError> {
+        let mut members = vec![self.parse_type_member()?];
+        while !self.pipe_is_separator && self.at(&TokenKind::Pipe) {
+            self.bump();
+            members.push(self.parse_type_member()?);
+        }
+        if members.len() == 1 {
+            Ok(members.pop().expect("INVARIANT: exactly one member"))
+        } else {
+            Ok(TypeExpr::Union(members))
+        }
+    }
+
+    /// Parses a full type inside angle brackets (`LIST< … >` / `ANY< … >`), where a `|` is
+    /// unambiguously a union separator (the brackets self-delimit), so the pipe-separator flag is
+    /// cleared for its extent.
+    fn parse_type_in_angle(&mut self) -> Result<TypeExpr, SyntaxError> {
+        let saved = std::mem::replace(&mut self.pipe_is_separator, false);
+        let result = self.parse_type();
+        self.pipe_is_separator = saved;
+        result
+    }
+
+    /// Parses one union member: a primary type with an optional trailing `NOT NULL`.
+    fn parse_type_member(&mut self) -> Result<TypeExpr, SyntaxError> {
+        let primary = self.parse_type_primary()?;
+        if self.at(&TokenKind::Not) {
+            self.bump(); // NOT
+            self.expect(&TokenKind::Null, "NULL after NOT in a type")?;
+            Ok(apply_not_null(primary))
+        } else {
+            Ok(primary)
+        }
+    }
+
+    /// Parses a primary type: `NULL`, `NOTHING`, `ANY[…]`, `LIST<…>` / `ARRAY<…>`, or a predefined
+    /// named type (with its synonyms).
+    fn parse_type_primary(&mut self) -> Result<TypeExpr, SyntaxError> {
+        // The `NULL` type (the only reserved-word type name).
+        if self.at(&TokenKind::Null) {
+            self.bump();
+            return Ok(TypeExpr::Null);
+        }
+        // `LIST<inner>` / `ARRAY<inner>`.
+        if self.at_keyword_ident("list") || self.at_keyword_ident("array") {
+            self.bump();
+            self.expect(&TokenKind::Lt, "'<' after LIST/ARRAY")?;
+            let inner = self.parse_type_in_angle()?;
+            self.expect(&TokenKind::Gt, "'>' to close LIST<…>/ARRAY<…>")?;
+            return Ok(TypeExpr::List {
+                inner: Box::new(inner),
+                not_null: false,
+            });
+        }
+        // `ANY`, `ANY VALUE`, `ANY<…>`, and the `ANY`-prefixed entity / property-value synonyms.
+        if self.at_keyword_ident("any") {
+            self.bump();
+            if self.eat(&TokenKind::Lt) {
+                // `ANY<A | B | …>` — a closed dynamic union.
+                let inner = self.parse_type_in_angle()?;
+                self.expect(&TokenKind::Gt, "'>' to close ANY<…>")?;
+                return Ok(inner);
+            }
+            if self.eat_keyword_ident("node") || self.eat_keyword_ident("vertex") {
+                return Ok(named_type(PredefinedType::Node));
+            }
+            if self.eat_keyword_ident("relationship") || self.eat_keyword_ident("edge") {
+                return Ok(named_type(PredefinedType::Relationship));
+            }
+            if self.eat_keyword_ident("property") {
+                self.expect_keyword_ident("value", "VALUE after PROPERTY")?;
+                return Ok(named_type(PredefinedType::PropertyValue));
+            }
+            // `ANY VALUE` and bare `ANY`.
+            self.eat_keyword_ident("value");
+            return Ok(TypeExpr::Any { not_null: false });
+        }
+        // `NOTHING`.
+        if self.eat_keyword_ident("nothing") {
+            return Ok(TypeExpr::Nothing);
+        }
+        // A predefined named type (with its single-/multi-word synonyms).
+        self.parse_predefined_type()
+    }
+
+    /// Parses a predefined named type such as `INTEGER`, `LOCAL DATETIME`, `PROPERTY VALUE`,
+    /// resolving the openCypher synonyms (`BOOL`, `INT`, `VARCHAR`, `SIGNED INTEGER`, `VERTEX`,
+    /// `EDGE`, …). The SQL-style temporal long forms (`TIME WITH TIMEZONE`) are intentionally not
+    /// accepted — only the canonical GQL spellings.
+    fn parse_predefined_type(&mut self) -> Result<TypeExpr, SyntaxError> {
+        let word_span = self.here_span();
+        let first = self.expect_type_word()?;
+        let name = match first.as_str() {
+            "boolean" | "bool" => PredefinedType::Boolean,
+            "string" | "varchar" => PredefinedType::String,
+            "integer" | "int" => PredefinedType::Integer,
+            "signed" => {
+                self.expect_type_word_eq("integer", "INTEGER after SIGNED")?;
+                PredefinedType::Integer
+            }
+            "float" => PredefinedType::Float,
+            "date" => PredefinedType::Date,
+            "duration" => PredefinedType::Duration,
+            "point" => PredefinedType::Point,
+            "node" | "vertex" => PredefinedType::Node,
+            "relationship" | "edge" => PredefinedType::Relationship,
+            "path" => PredefinedType::Path,
+            "map" => PredefinedType::Map,
+            "local" => match self.expect_type_word()?.as_str() {
+                "time" => PredefinedType::LocalTime,
+                "datetime" => PredefinedType::LocalDateTime,
+                _ => return Err(self.error_at(word_span, "TIME or DATETIME after LOCAL")),
+            },
+            "zoned" => match self.expect_type_word()?.as_str() {
+                "time" => PredefinedType::ZonedTime,
+                "datetime" => PredefinedType::ZonedDateTime,
+                _ => return Err(self.error_at(word_span, "TIME or DATETIME after ZONED")),
+            },
+            "property" => {
+                self.expect_type_word_eq("value", "VALUE after PROPERTY")?;
+                PredefinedType::PropertyValue
+            }
+            _ => return Err(self.error_at(word_span, "a Cypher type name after ::")),
+        };
+        Ok(named_type(name))
+    }
+
+    /// Consumes an [`Identifier`](TokenKind::Identifier) type word, returning its ASCII-lowercased
+    /// text, or errors with "expected a type name".
+    fn expect_type_word(&mut self) -> Result<String, SyntaxError> {
+        match self.peek().map(|t| &t.kind) {
+            Some(TokenKind::Identifier(name)) => {
+                let lowered = name.to_ascii_lowercase();
+                self.pos += 1;
+                Ok(lowered)
+            }
+            _ => Err(self.expected_here("a Cypher type name")),
+        }
+    }
+
+    /// Consumes a type word that must equal `expected` (ASCII case-insensitive), or errors.
+    fn expect_type_word_eq(&mut self, expected: &str, desc: &str) -> Result<(), SyntaxError> {
+        if self.at_keyword_ident(expected) {
+            self.pos += 1;
+            Ok(())
+        } else {
+            Err(self.expected_here(desc))
+        }
     }
 
     /// `AddOrSubtractExpression = MultiplyDivideModuloExpression, { ('+'|'-') MulDivMod }`
@@ -2866,6 +3178,8 @@ impl<'t, 's> Parser<'t, 's> {
         }
         let query_end = unions.last().map_or(head_end, |u| u.span.end);
         Ok(Query {
+            // An expression subquery (`EXISTS { … }`) has no `USE` selector of its own.
+            use_graph: None,
             body: QueryBody::Regular { head, unions },
             span: Span::new(exists_start, query_end),
         })
@@ -3558,6 +3872,7 @@ fn token_text(kind: &TokenKind) -> &'static str {
         TokenKind::Skip => "SKIP",
         TokenKind::Limit => "LIMIT",
         TokenKind::Union => "UNION",
+        TokenKind::Use => "USE",
         TokenKind::All => "ALL",
         TokenKind::Distinct => "DISTINCT",
         TokenKind::As => "AS",
@@ -3625,6 +3940,39 @@ fn token_text(kind: &TokenKind) -> &'static str {
         | TokenKind::Null
         | TokenKind::Identifier(_)
         | TokenKind::Parameter(_) => "<literal>",
+    }
+}
+
+/// A nullable predefined [`TypeExpr`] (`rmp` #636); the trailing `NOT NULL`, if any, is applied by
+/// [`apply_not_null`] afterwards.
+fn named_type(name: PredefinedType) -> TypeExpr {
+    TypeExpr::Predefined {
+        name,
+        not_null: false,
+    }
+}
+
+/// Applies a trailing `NOT NULL` to a parsed primary type (`rmp` #636), excluding `null` from it.
+///
+/// * A predefined type, `LIST<…>`, or `ANY` gains its non-nullable flag.
+/// * `NULL NOT NULL` and `NOTHING NOT NULL` both denote the empty type [`NOTHING`](TypeExpr::Nothing)
+///   (removing `null` from `{null}` leaves nothing).
+/// * A union (`ANY<A | B> NOT NULL`) pushes the non-nullability into every member.
+fn apply_not_null(ty: TypeExpr) -> TypeExpr {
+    match ty {
+        TypeExpr::Predefined { name, .. } => TypeExpr::Predefined {
+            name,
+            not_null: true,
+        },
+        TypeExpr::List { inner, .. } => TypeExpr::List {
+            inner,
+            not_null: true,
+        },
+        TypeExpr::Any { .. } => TypeExpr::Any { not_null: true },
+        TypeExpr::Null | TypeExpr::Nothing => TypeExpr::Nothing,
+        TypeExpr::Union(members) => {
+            TypeExpr::Union(members.into_iter().map(apply_not_null).collect())
+        }
     }
 }
 

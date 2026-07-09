@@ -39,10 +39,93 @@ use crate::lexer::Span;
 #[derive(Debug, Clone, PartialEq)]
 #[must_use]
 pub struct Query {
+    /// An optional leading `USE <graph>` graph (database) selector (`rmp` #640). Parsed and exposed
+    /// so the server can **route** the statement to the target database; the single-graph Cypher
+    /// engine itself treats it as advisory metadata (see [`UseGraph`]).
+    pub use_graph: Option<UseGraph>,
     /// The body of the query.
     pub body: QueryBody,
     /// The byte span covering the whole statement (excluding any trailing `;`).
     pub span: Span,
+}
+
+impl Query {
+    /// The target graph of a leading `USE` clause, if any (`rmp` #640) — the routing hook the server
+    /// reads to dispatch the statement to the correct per-database engine.
+    #[must_use]
+    pub fn use_graph(&self) -> Option<&UseGraph> {
+        self.use_graph.as_ref()
+    }
+}
+
+/// A `USE <graph>` graph (database) selector (`rmp` #640; openCypher / Neo4j 5.x `UseClause`).
+///
+/// The Cypher engine operates over a **single** graph, so database selection is performed *above* it
+/// (in the server/engine), not inside query execution. This node therefore serves two roles:
+///
+/// 1. **Routing hook** — the parsed target [`name`](Self::name) (a simple name such as `neo4j`, or a
+///    composite `namespace.constituent`) is exposed via [`Query::use_graph`] so the server can route
+///    the statement to the correct database before it ever reaches the engine.
+/// 2. **Self-consistency check** — [`targets`](Self::targets) lets a caller that already knows the
+///    graph it is bound to confirm a `USE` names *that* graph (a no-op) versus a different one.
+///
+/// Graphus does not implement in-query cross-database execution; a `USE` naming a database other than
+/// the one the connection is bound to must be resolved by the server's routing layer (or rejected
+/// there). The engine never silently executes a `USE <other-db>` against the wrong graph — it simply
+/// carries the selector through for the routing layer to honour.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub struct UseGraph {
+    /// The dot-separated graph reference segments, in source order (e.g. `["neo4j"]` for `USE neo4j`,
+    /// `["composite", "shard1"]` for `USE composite.shard1`). Always at least one segment.
+    pub name: Vec<String>,
+    /// The byte span covering the `USE <graph>` clause.
+    pub span: Span,
+}
+
+impl UseGraph {
+    /// The target graph reference rendered as a dotted string (e.g. `composite.shard1`).
+    #[must_use]
+    pub fn target(&self) -> String {
+        self.name.join(".")
+    }
+
+    /// Whether this `USE` selects the graph named `current` (ASCII case-insensitive on each segment),
+    /// i.e. it is a no-op for a connection already bound to that graph. A caller that knows its bound
+    /// graph name uses this to distinguish a redundant `USE <current>` from a `USE <other>` that
+    /// requires routing.
+    #[must_use]
+    pub fn targets(&self, current: &str) -> bool {
+        self.target().eq_ignore_ascii_case(current)
+    }
+
+    /// Resolves this `USE` against the graph the connection is bound to (`current`), for a caller
+    /// (the server's routing layer) that cannot switch databases mid-statement (`rmp` #640):
+    ///
+    /// * `Ok(())` when the `USE` names `current` — a redundant, no-op selector that the engine
+    ///   executes normally against its single bound graph;
+    /// * `Err(..)` when it names a **different** graph — a clear, Neo4j-like compile-time error, since
+    ///   the single-graph engine cannot execute a cross-database query. A server that supports
+    ///   routing should instead dispatch the statement to the target database's engine *before*
+    ///   calling this; this is the fail-safe for when it cannot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GraphusError::Compile`](graphus_core::GraphusError::Compile) when the target differs
+    /// from `current`.
+    pub fn check_target(&self, current: &str) -> Result<(), graphus_core::GraphusError> {
+        if self.targets(current) {
+            Ok(())
+        } else {
+            Err(graphus_core::GraphusError::Compile(format!(
+                "USE clause selects database '{}', but this connection is bound to '{current}'. \
+                 Cross-database queries are not supported on a standard database; connect to '{}' \
+                 directly or route through a composite database.",
+                self.target(),
+                self.target(),
+            )))
+        }
+    }
 }
 
 /// The body of a [`Query`]: a `UNION` chain of single queries, or a standalone `CALL`.
@@ -990,6 +1073,10 @@ impl Expr {
                     rhs.zero_spans_in_place();
                 }
             }
+            ExprKind::TypePredicate { operand, .. }
+            | ExprKind::NormalizedPredicate { operand, .. } => {
+                operand.zero_spans_in_place();
+            }
             ExprKind::Property { base, .. } => base.zero_spans_in_place(),
             ExprKind::Index { base, index } => {
                 base.zero_spans_in_place();
@@ -1395,6 +1482,201 @@ pub enum ExprKind {
     /// `CollectExpression`). Evaluates to a [`List`](Value) of the single returned column's value
     /// across every row the correlated subquery produces. Boxed like the other subquery forms.
     CollectSubquery(Box<SubqueryExpr>),
+
+    /// A GQL / Neo4j 5.x **type predicate** `expr IS [NOT] :: <TYPE>` (equivalently
+    /// `expr IS [NOT] TYPED <TYPE>` or `expr :: <TYPE>`; `rmp` #636). Evaluates to a boolean:
+    /// whether the operand's runtime value conforms to the declared [`TypeExpr`]. Every Cypher type
+    /// is nullable by default, so a `null` operand satisfies any type unless it carries a trailing
+    /// `NOT NULL` (see [`TypeExpr`]). `negated` is `true` for the `IS NOT ::` form.
+    TypePredicate {
+        /// The subject expression whose value is type-checked.
+        operand: Box<Expr>,
+        /// `true` for the negated `IS NOT :: <TYPE>` form.
+        negated: bool,
+        /// The declared target type.
+        type_expr: TypeExpr,
+    },
+    /// A Unicode **normalization predicate** `expr IS [NOT] [<form>] NORMALIZED` (`rmp` #636). Tests
+    /// whether a `STRING` operand is already in the given Unicode normalization form (`NFC` by
+    /// default). Per Neo4j, a `null` or non-`STRING` operand yields `null` (never an error).
+    /// `negated` is `true` for the `IS NOT [<form>] NORMALIZED` form.
+    NormalizedPredicate {
+        /// The subject expression whose string value is tested.
+        operand: Box<Expr>,
+        /// `true` for the negated `IS NOT [<form>] NORMALIZED` form.
+        negated: bool,
+        /// The Unicode normalization form to test against.
+        form: NormalForm,
+    },
+}
+
+/// A Unicode normalization form for the [`NormalizedPredicate`](ExprKind::NormalizedPredicate)
+/// (`rmp` #636). `NFC` is the default when the `IS NORMALIZED` predicate omits an explicit form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[must_use]
+pub enum NormalForm {
+    /// Canonical Decomposition followed by Canonical Composition (the default).
+    #[default]
+    Nfc,
+    /// Canonical Decomposition.
+    Nfd,
+    /// Compatibility Decomposition followed by Canonical Composition.
+    Nfkc,
+    /// Compatibility Decomposition.
+    Nfkd,
+}
+
+impl std::fmt::Display for NormalForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Nfc => "NFC",
+            Self::Nfd => "NFD",
+            Self::Nfkc => "NFKC",
+            Self::Nfkd => "NFKD",
+        })
+    }
+}
+
+/// A predefined (nominal) GQL / Cypher value type used inside a [`TypeExpr`] (`rmp` #636). The
+/// nullability of a written type lives on the enclosing [`TypeExpr`] variant, not here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[must_use]
+pub enum PredefinedType {
+    /// `BOOLEAN` (synonym `BOOL`).
+    Boolean,
+    /// `STRING` (synonym `VARCHAR`).
+    String,
+    /// `INTEGER` (synonyms `INT`, `SIGNED INTEGER`).
+    Integer,
+    /// `FLOAT`.
+    Float,
+    /// `DATE`.
+    Date,
+    /// `LOCAL TIME` (synonym `TIME WITHOUT TIMEZONE`).
+    LocalTime,
+    /// `ZONED TIME` (synonym `TIME WITH TIMEZONE`).
+    ZonedTime,
+    /// `LOCAL DATETIME` (synonym `TIMESTAMP WITHOUT TIMEZONE`).
+    LocalDateTime,
+    /// `ZONED DATETIME` (synonym `TIMESTAMP WITH TIMEZONE`).
+    ZonedDateTime,
+    /// `DURATION`.
+    Duration,
+    /// `POINT`.
+    Point,
+    /// `NODE` (synonyms `ANY NODE`, `VERTEX`, `ANY VERTEX`).
+    Node,
+    /// `RELATIONSHIP` (synonyms `ANY RELATIONSHIP`, `EDGE`, `ANY EDGE`).
+    Relationship,
+    /// `PATH`.
+    Path,
+    /// `MAP`.
+    Map,
+    /// `PROPERTY VALUE` (synonym `ANY PROPERTY VALUE`) — any non-null storable property value.
+    PropertyValue,
+}
+
+impl PredefinedType {
+    /// The canonical openCypher spelling of this type.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Boolean => "BOOLEAN",
+            Self::String => "STRING",
+            Self::Integer => "INTEGER",
+            Self::Float => "FLOAT",
+            Self::Date => "DATE",
+            Self::LocalTime => "LOCAL TIME",
+            Self::ZonedTime => "ZONED TIME",
+            Self::LocalDateTime => "LOCAL DATETIME",
+            Self::ZonedDateTime => "ZONED DATETIME",
+            Self::Duration => "DURATION",
+            Self::Point => "POINT",
+            Self::Node => "NODE",
+            Self::Relationship => "RELATIONSHIP",
+            Self::Path => "PATH",
+            Self::Map => "MAP",
+            Self::PropertyValue => "PROPERTY VALUE",
+        }
+    }
+}
+
+/// A GQL / Cypher value type as written in a type predicate `expr IS :: <TYPE>` (`rmp` #636).
+///
+/// Every type is **nullable** by default — a written `INTEGER` denotes "integer or null", so
+/// `null IS :: INTEGER` is `true`. A trailing `NOT NULL` (carried by the `not_null` flag on the
+/// applicable variants) removes `null` from the type, so `null IS :: INTEGER NOT NULL` is `false`.
+/// The [`Nothing`](Self::Nothing) type is the empty type (matches nothing, not even `null`) and
+/// [`Null`](Self::Null) is the type whose only value is `null`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[must_use]
+pub enum TypeExpr {
+    /// A predefined nominal type (`INTEGER`, `STRING`, `POINT`, `NODE`, …) with its nullability.
+    Predefined {
+        /// The nominal type.
+        name: PredefinedType,
+        /// `true` if written `… NOT NULL` (excludes `null`).
+        not_null: bool,
+    },
+    /// `LIST<inner>` (synonym `ARRAY<inner>`): a list every element of which conforms to `inner`.
+    List {
+        /// The element type.
+        inner: Box<TypeExpr>,
+        /// `true` if written `LIST<inner> NOT NULL` (excludes `null`).
+        not_null: bool,
+    },
+    /// `ANY` / `ANY VALUE`: matches every value. `NOT NULL` (`ANY NOT NULL`) excludes `null`.
+    Any {
+        /// `true` if written `ANY NOT NULL`.
+        not_null: bool,
+    },
+    /// `NOTHING`: the empty type — matches no value (not even `null`).
+    Nothing,
+    /// `NULL`: the type whose only value is `null`.
+    Null,
+    /// A closed dynamic union `A | B | …` (also written `ANY<A | B | …>`): matches a value that
+    /// conforms to **any** member. Always holds two or more members (a single member collapses to
+    /// that member at parse time).
+    Union(Vec<TypeExpr>),
+}
+
+impl std::fmt::Display for TypeExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Predefined { name, not_null } => {
+                f.write_str(name.as_str())?;
+                if *not_null {
+                    f.write_str(" NOT NULL")?;
+                }
+                Ok(())
+            }
+            Self::List { inner, not_null } => {
+                write!(f, "LIST<{inner}>")?;
+                if *not_null {
+                    f.write_str(" NOT NULL")?;
+                }
+                Ok(())
+            }
+            Self::Any { not_null } => {
+                f.write_str("ANY")?;
+                if *not_null {
+                    f.write_str(" NOT NULL")?;
+                }
+                Ok(())
+            }
+            Self::Nothing => f.write_str("NOTHING"),
+            Self::Null => f.write_str("NULL"),
+            Self::Union(members) => {
+                for (i, m) in members.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(" | ")?;
+                    }
+                    write!(f, "{m}")?;
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 /// A literal in the AST (openCypher `Literal`), kept unevaluated; range/encoding checks are deferred

@@ -1029,6 +1029,10 @@ pub fn classify_admin(cmd: &crate::admin::AdminCommand) -> AuditClass {
         | A::RevokeRole { .. }
         | A::GrantPrivilege { .. }
         | A::RevokePrivilege { .. }
+        | A::AlterUserPassword { .. }
+        | A::AlterUserStatus { .. }
+        | A::RenameUser { .. }
+        | A::RenameRole { .. }
         | A::ShowUsers
         | A::ShowRoles
         | A::ShowPrivileges => AuditClass::SecurityChange,
@@ -1040,7 +1044,12 @@ pub fn classify_admin(cmd: &crate::admin::AdminCommand) -> AuditClass {
         | A::ShowDatabase { .. }
         | A::BackupDatabase { .. }
         | A::RestoreDatabase { .. }
-        | A::CheckpointDatabase { .. } => AuditClass::AdminChange,
+        | A::CheckpointDatabase { .. }
+        | A::ShowFunctions
+        | A::ShowProcedures
+        | A::ShowSettings
+        | A::ShowTransactions
+        | A::TerminateTransactions { .. } => AuditClass::AdminChange,
     }
 }
 
@@ -1064,9 +1073,14 @@ pub fn is_mutating_admin(cmd: &crate::admin::AdminCommand) -> bool {
             | A::RevokeRole { .. }
             | A::GrantPrivilege { .. }
             | A::RevokePrivilege { .. }
+            | A::AlterUserPassword { .. }
+            | A::AlterUserStatus { .. }
+            | A::RenameUser { .. }
+            | A::RenameRole { .. }
             | A::BackupDatabase { .. }
             | A::RestoreDatabase { .. }
             | A::CheckpointDatabase { .. }
+            | A::TerminateTransactions { .. }
     )
 }
 
@@ -1139,6 +1153,19 @@ pub fn redact_admin_detail(cmd: &crate::admin::AdminCommand) -> String {
         A::ShowUsers => "SHOW USERS".to_owned(),
         A::ShowRoles => "SHOW ROLES".to_owned(),
         A::ShowPrivileges => "SHOW PRIVILEGES".to_owned(),
+        A::ShowFunctions => "SHOW FUNCTIONS".to_owned(),
+        A::ShowProcedures => "SHOW PROCEDURES".to_owned(),
+        A::ShowSettings => "SHOW SETTINGS".to_owned(),
+        A::ShowTransactions => "SHOW TRANSACTIONS".to_owned(),
+        A::TerminateTransactions { ids } => format!("TERMINATE TRANSACTIONS {}", ids.join(", ")),
+        // NEVER the password value — only that one was set (mirrors CREATE USER).
+        A::AlterUserPassword { name, .. } => format!("ALTER USER {name} SET PASSWORD <redacted>"),
+        A::AlterUserStatus { name, suspended } => format!(
+            "ALTER USER {name} SET STATUS {}",
+            if *suspended { "SUSPENDED" } else { "ACTIVE" }
+        ),
+        A::RenameUser { from, to } => format!("RENAME USER {from} TO {to}"),
+        A::RenameRole { from, to } => format!("RENAME ROLE {from} TO {to}"),
         A::BackupDatabase { name, path } => format!("BACKUP DATABASE {name} TO {path}"),
         A::RestoreDatabase { name, path, point } => {
             use crate::admin::RestorePoint as R;

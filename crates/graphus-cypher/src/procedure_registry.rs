@@ -310,6 +310,22 @@ struct Procedure {
     reader_safe: bool,
 }
 
+/// A read-only snapshot of one registered procedure, for administrative introspection
+/// (`SHOW PROCEDURES`). Carries only the public signature and the reader-safe classification — never
+/// the executable handler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcedureListing {
+    /// The canonical (lower-cased) dotted name (e.g. `"db.labels"`, `"gds.pageRank.stream"`).
+    pub name: String,
+    /// The declared input fields (name + type), in signature order.
+    pub inputs: Vec<FieldSpec>,
+    /// The declared output (YIELD) fields (name + type), in signature order.
+    pub outputs: Vec<FieldSpec>,
+    /// Whether the procedure is **reader-safe** (reads only; dispatchable to the off-thread reader
+    /// pool). The engine built-ins (`db.*`) and the GDS surface (`gds.*`) are reader-safe.
+    pub reader_safe: bool,
+}
+
 /// The concrete, mutable [`ProcedureRegistry`]: a name-indexed set of procedures.
 ///
 /// Build one with [`ProcedureSet::new`] (empty) or [`ProcedureSet::with_builtins`] (pre-loaded
@@ -528,6 +544,26 @@ impl ProcedureSet {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.procedures.is_empty()
+    }
+
+    /// Lists every registered procedure as a read-only [`ProcedureListing`], for administrative
+    /// introspection (`SHOW PROCEDURES`). Sorted by canonical name for a deterministic, stable
+    /// result (the internal map is unordered). Read-only: it clones public signature data and the
+    /// reader-safe flag, never the handler.
+    #[must_use]
+    pub fn list(&self) -> Vec<ProcedureListing> {
+        let mut out: Vec<ProcedureListing> = self
+            .procedures
+            .values()
+            .map(|p| ProcedureListing {
+                name: p.signature.name.clone(),
+                inputs: p.signature.inputs.clone(),
+                outputs: p.signature.outputs.clone(),
+                reader_safe: p.reader_safe,
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
     }
 }
 

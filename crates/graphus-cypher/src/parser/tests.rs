@@ -2051,3 +2051,308 @@ fn parse_count_star_still_an_aggregate_not_a_subquery() {
         ExprKind::CountStar
     ));
 }
+
+// =================================================================================================
+// Type predicates `IS :: <type>` and normalization predicates `IS NORMALIZED` (`rmp` #636)
+// =================================================================================================
+
+#[test]
+fn type_predicate_basic_shape() {
+    let ExprKind::TypePredicate {
+        negated, type_expr, ..
+    } = return_kind("RETURN 1 IS :: INTEGER")
+    else {
+        panic!("expected a TypePredicate");
+    };
+    assert!(!negated);
+    assert_eq!(
+        type_expr,
+        TypeExpr::Predefined {
+            name: PredefinedType::Integer,
+            not_null: false,
+        }
+    );
+}
+
+#[test]
+fn type_predicate_negated_with_not_null() {
+    let ExprKind::TypePredicate {
+        negated, type_expr, ..
+    } = return_kind("RETURN 1 IS NOT :: STRING NOT NULL")
+    else {
+        panic!("expected a TypePredicate");
+    };
+    assert!(negated);
+    assert_eq!(
+        type_expr,
+        TypeExpr::Predefined {
+            name: PredefinedType::String,
+            not_null: true,
+        }
+    );
+}
+
+#[test]
+fn type_predicate_bare_and_typed_syntaxes() {
+    // Bare `::` (no IS).
+    assert!(matches!(
+        return_kind("RETURN 1 :: INTEGER"),
+        ExprKind::TypePredicate { negated: false, .. }
+    ));
+    // `IS TYPED` alias.
+    assert!(matches!(
+        return_kind("RETURN 1 IS TYPED INTEGER"),
+        ExprKind::TypePredicate { negated: false, .. }
+    ));
+    assert!(matches!(
+        return_kind("RETURN 1 IS NOT TYPED INTEGER"),
+        ExprKind::TypePredicate { negated: true, .. }
+    ));
+}
+
+#[test]
+fn type_predicate_list_and_union_and_any() {
+    let ExprKind::TypePredicate { type_expr, .. } = return_kind("RETURN x IS :: LIST<INTEGER>")
+    else {
+        panic!("expected a TypePredicate");
+    };
+    assert_eq!(
+        type_expr,
+        TypeExpr::List {
+            inner: Box::new(TypeExpr::Predefined {
+                name: PredefinedType::Integer,
+                not_null: false,
+            }),
+            not_null: false,
+        }
+    );
+
+    let ExprKind::TypePredicate { type_expr, .. } = return_kind("RETURN x IS :: INTEGER | FLOAT")
+    else {
+        panic!("expected a TypePredicate");
+    };
+    assert_eq!(
+        type_expr,
+        TypeExpr::Union(vec![
+            TypeExpr::Predefined {
+                name: PredefinedType::Integer,
+                not_null: false,
+            },
+            TypeExpr::Predefined {
+                name: PredefinedType::Float,
+                not_null: false,
+            },
+        ])
+    );
+
+    // `ANY<...>` is a closed dynamic union.
+    let ExprKind::TypePredicate { type_expr, .. } =
+        return_kind("RETURN x IS :: ANY<INTEGER | STRING>")
+    else {
+        panic!("expected a TypePredicate");
+    };
+    assert!(matches!(type_expr, TypeExpr::Union(m) if m.len() == 2));
+}
+
+#[test]
+fn type_predicate_pipe_is_comprehension_separator_not_union() {
+    // Inside a list comprehension body the `|` is the projection separator, so the type predicate
+    // must NOT swallow it as a union member: the type is the single `INTEGER`, projection is `x`.
+    let ExprKind::ListComprehension(lc) = return_kind("RETURN [x IN xs WHERE x IS :: INTEGER | x]")
+    else {
+        panic!("expected a list comprehension");
+    };
+    let pred = lc.predicate.expect("predicate present");
+    let ExprKind::TypePredicate { type_expr, .. } = pred.kind else {
+        panic!("expected a TypePredicate predicate");
+    };
+    assert_eq!(
+        type_expr,
+        TypeExpr::Predefined {
+            name: PredefinedType::Integer,
+            not_null: false,
+        }
+    );
+    let proj = lc.projection.expect("projection present");
+    assert!(matches!(proj.kind, ExprKind::Variable(ref v) if v == "x"));
+}
+
+#[test]
+fn type_predicate_union_inside_comprehension_requires_any_brackets() {
+    // A parenthesising `ANY<...>` lets a union appear in a `|`-delimited comprehension body.
+    let ExprKind::ListComprehension(lc) =
+        return_kind("RETURN [x IN xs WHERE x IS :: ANY<INTEGER | FLOAT> | x]")
+    else {
+        panic!("expected a list comprehension");
+    };
+    let pred = lc.predicate.expect("predicate present");
+    let ExprKind::TypePredicate { type_expr, .. } = pred.kind else {
+        panic!("expected a TypePredicate predicate");
+    };
+    assert!(matches!(type_expr, TypeExpr::Union(m) if m.len() == 2));
+}
+
+#[test]
+fn type_predicate_unknown_type_is_syntax_error() {
+    let e = err("RETURN 1 IS :: FOO");
+    assert!(matches!(e.kind, SyntaxErrorKind::Expected { .. }));
+}
+
+#[test]
+fn type_predicate_graph_entity_and_synonyms_parse() {
+    for q in [
+        "RETURN n IS :: NODE",
+        "RETURN n IS :: ANY NODE",
+        "RETURN n IS :: VERTEX",
+        "RETURN r IS :: RELATIONSHIP",
+        "RETURN r IS :: EDGE",
+        "RETURN r IS :: ANY RELATIONSHIP",
+        "RETURN x IS :: PROPERTY VALUE",
+        "RETURN x IS :: LOCAL DATETIME",
+        "RETURN x IS :: ZONED TIME",
+        "RETURN x IS :: NOTHING",
+        "RETURN x IS :: NULL",
+        "RETURN x IS :: ARRAY<STRING>",
+    ] {
+        assert!(
+            matches!(return_kind(q), ExprKind::TypePredicate { .. }),
+            "`{q}` should be a TypePredicate",
+        );
+    }
+}
+
+#[test]
+fn normalized_predicate_shapes() {
+    let ExprKind::NormalizedPredicate { negated, form, .. } = return_kind("RETURN s IS NORMALIZED")
+    else {
+        panic!("expected a NormalizedPredicate");
+    };
+    assert!(!negated);
+    assert_eq!(form, NormalForm::Nfc);
+
+    let ExprKind::NormalizedPredicate { negated, form, .. } =
+        return_kind("RETURN s IS NOT NFKD NORMALIZED")
+    else {
+        panic!("expected a NormalizedPredicate");
+    };
+    assert!(negated);
+    assert_eq!(form, NormalForm::Nfkd);
+
+    for (q, want) in [
+        ("RETURN s IS NFC NORMALIZED", NormalForm::Nfc),
+        ("RETURN s IS NFD NORMALIZED", NormalForm::Nfd),
+        ("RETURN s IS NFKC NORMALIZED", NormalForm::Nfkc),
+        ("RETURN s IS NFKD NORMALIZED", NormalForm::Nfkd),
+    ] {
+        let ExprKind::NormalizedPredicate { form, .. } = return_kind(q) else {
+            panic!("`{q}` should be a NormalizedPredicate");
+        };
+        assert_eq!(form, want, "for `{q}`");
+    }
+}
+
+#[test]
+fn normalized_and_type_predicates_still_allow_is_null() {
+    // The extended IS grammar must not break `IS NULL` / `IS NOT NULL`.
+    assert!(matches!(
+        return_kind("RETURN x IS NULL"),
+        ExprKind::Predicate {
+            op: PredicateOp::IsNull,
+            ..
+        }
+    ));
+    assert!(matches!(
+        return_kind("RETURN x IS NOT NULL"),
+        ExprKind::Predicate {
+            op: PredicateOp::IsNotNull,
+            ..
+        }
+    ));
+}
+
+// =================================================================================================
+// USE graph selector (`rmp` #640)
+// =================================================================================================
+
+#[test]
+fn use_clause_simple_name() {
+    let q = ok("USE graphus MATCH (n) RETURN n");
+    let ug = q.use_graph().expect("USE clause present");
+    assert_eq!(ug.name, vec!["graphus".to_owned()]);
+    assert_eq!(ug.target(), "graphus");
+    assert!(ug.targets("graphus"));
+    assert!(ug.targets("GRAPHUS")); // case-insensitive
+    assert!(!ug.targets("neo4j"));
+    // The body is unchanged: MATCH + RETURN.
+    assert_eq!(clauses(&q).len(), 2);
+}
+
+#[test]
+fn use_clause_composite_name() {
+    let q = ok("USE composite.shard1 RETURN 1");
+    let ug = q.use_graph().expect("USE clause present");
+    assert_eq!(ug.name, vec!["composite".to_owned(), "shard1".to_owned()]);
+    assert_eq!(ug.target(), "composite.shard1");
+    assert!(ug.targets("composite.shard1"));
+}
+
+#[test]
+fn use_clause_absent_is_none() {
+    let q = ok("MATCH (n) RETURN n");
+    assert!(q.use_graph().is_none());
+}
+
+#[test]
+fn use_clause_before_standalone_call() {
+    let q = ok("USE graphus CALL db.labels()");
+    assert!(q.use_graph().is_some());
+    assert!(matches!(q.body, QueryBody::StandaloneCall(_)));
+}
+
+#[test]
+fn use_clause_inside_call_subquery() {
+    let q = ok("CALL { USE shard1 MATCH (n) RETURN n } RETURN 1");
+    // The outer query has no USE.
+    assert!(q.use_graph().is_none());
+    let Clause::CallSubquery(cs) = &clauses(&q)[0] else {
+        panic!("expected a CALL subquery");
+    };
+    let inner_use = cs.query.use_graph().expect("inner USE present");
+    assert_eq!(inner_use.name, vec!["shard1".to_owned()]);
+}
+
+#[test]
+fn use_clause_graph_function_is_rejected() {
+    let e = err("USE graph.byName('x') RETURN 1");
+    assert!(matches!(e.kind, SyntaxErrorKind::Expected { .. }));
+}
+
+#[test]
+fn use_clause_missing_name_is_error() {
+    let e = err("USE");
+    assert!(matches!(
+        e.kind,
+        SyntaxErrorKind::Expected { .. } | SyntaxErrorKind::UnexpectedEof { .. }
+    ));
+}
+
+#[test]
+fn use_is_still_usable_as_a_property_key_and_label() {
+    // `USE` is a reserved word but, per openCypher, reserved words are valid schema names.
+    assert!(ok("MATCH (n:USE) RETURN n.use").use_graph().is_none());
+}
+
+#[test]
+fn use_clause_check_target_no_op_vs_error() {
+    let ug = ok("USE graphus RETURN 1").use_graph().unwrap().clone();
+    // Selecting the bound graph is a no-op.
+    assert!(ug.check_target("graphus").is_ok());
+    assert!(ug.check_target("GRAPHUS").is_ok());
+    // A different graph is a clear compile-time error naming both databases.
+    let err = ug
+        .check_target("neo4j")
+        .expect_err("different DB must error");
+    let msg = err.to_string();
+    assert!(msg.contains("graphus"), "{msg}");
+    assert!(msg.contains("neo4j"), "{msg}");
+}

@@ -935,6 +935,235 @@ impl Default for ServerConfig {
     }
 }
 
+/// One effective configuration setting for `SHOW SETTINGS` (`rmp` #637): a canonical dotted name
+/// and its rendered value (`None` = unset / null). Secrets are pre-redacted by
+/// [`ServerConfig::effective_settings`] so a caller can never accidentally spill them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingRow {
+    /// The canonical, dotted setting name — the Rust field path, e.g. `admission.reader_threads`.
+    pub name: &'static str,
+    /// The rendered value, or `None` when the setting is unset (an `Option` field that is `None`).
+    pub value: Option<String>,
+}
+
+impl ServerConfig {
+    /// The server's effective (post-hardware-auto-tune, validated) configuration as a flat, ordered
+    /// list of `(name, value)` rows, for the read-only `SHOW SETTINGS` introspection (`rmp` #637).
+    ///
+    /// Names are the canonical dotted field paths (e.g. `admission.reader_threads`,
+    /// `timing.statement_timeout_ms`). The values are the **resolved** ones — the auto-tuned
+    /// `buffer_pool_pages` / `admission.reader_threads` / `admission.morsel_parallelism` are reported
+    /// as their concrete effective numbers (a `0` sentinel here would mean auto was left unresolved,
+    /// which never happens after startup).
+    ///
+    /// **Secrets are redacted here** (SEC-183, CWE-532/209): `jwt_secret`, `metrics_scrape_token`,
+    /// and `auth.admin_password` render as `"<redacted>"` when set (never their value); individual
+    /// bootstrap user passwords are never listed (only their count).
+    #[must_use]
+    pub fn effective_settings(&self) -> Vec<SettingRow> {
+        /// A set value.
+        fn set(name: &'static str, value: impl Into<String>) -> SettingRow {
+            SettingRow {
+                name,
+                value: Some(value.into()),
+            }
+        }
+        /// An optional-path value (`None` ⇒ unset).
+        fn path(name: &'static str, p: &Option<PathBuf>) -> SettingRow {
+            SettingRow {
+                name,
+                value: p.as_ref().map(|p| p.display().to_string()),
+            }
+        }
+        /// An optional-string value (`None` ⇒ unset).
+        fn opt(name: &'static str, s: &Option<String>) -> SettingRow {
+            SettingRow {
+                name,
+                value: s.clone(),
+            }
+        }
+        /// A secret: `"<redacted>"` when non-empty, `None` when empty/disabled.
+        fn secret(name: &'static str, s: &str) -> SettingRow {
+            SettingRow {
+                name,
+                value: if s.is_empty() {
+                    None
+                } else {
+                    Some("<redacted>".to_owned())
+                },
+            }
+        }
+
+        let a = &self.admission;
+        let t = &self.timing;
+        let b = &self.bulk_import;
+        vec![
+            // Top-level / storage.
+            set("store_path", self.store_path.display().to_string()),
+            set("default_database", self.default_database.clone()),
+            set("buffer_pool_pages", self.buffer_pool_pages.to_string()),
+            set(
+                "allow_insecure_network",
+                self.allow_insecure_network.to_string(),
+            ),
+            // Listeners.
+            opt("bolt_tcp_addr", &self.bolt_tcp_addr),
+            opt("advertised_bolt_address", &self.advertised_bolt_address),
+            opt("bolt_server_agent", &self.bolt_server_agent),
+            opt("rest_addr", &self.rest_addr),
+            path("uds_path", &self.uds_path),
+            // TLS + encryption.
+            path("tls.cert_path", &self.tls.cert_path),
+            path("tls.key_path", &self.tls.key_path),
+            path("encryption.key_path", &self.encryption.key_path),
+            // Admission control.
+            set(
+                "admission.max_concurrent_queries",
+                a.max_concurrent_queries.to_string(),
+            ),
+            set(
+                "admission.engine_queue_capacity",
+                a.engine_queue_capacity.to_string(),
+            ),
+            set(
+                "admission.result_buffer_capacity",
+                a.result_buffer_capacity.to_string(),
+            ),
+            set("admission.max_connections", a.max_connections.to_string()),
+            set(
+                "admission.max_connections_per_ip",
+                a.max_connections_per_ip.to_string(),
+            ),
+            set("admission.reader_threads", a.reader_threads.to_string()),
+            set(
+                "admission.morsel_parallelism",
+                a.morsel_parallelism.to_string(),
+            ),
+            set(
+                "admission.max_open_transactions",
+                a.max_open_transactions.to_string(),
+            ),
+            set("admission.csr_adjacency", a.csr_adjacency.to_string()),
+            // Timing.
+            set(
+                "timing.slow_query_threshold_ms",
+                t.slow_query_threshold_ms.to_string(),
+            ),
+            set(
+                "timing.shutdown_drain_deadline_ms",
+                t.shutdown_drain_deadline_ms.to_string(),
+            ),
+            set(
+                "timing.handshake_timeout_ms",
+                t.handshake_timeout_ms.to_string(),
+            ),
+            set("timing.idle_timeout_ms", t.idle_timeout_ms.to_string()),
+            set(
+                "timing.header_read_timeout_ms",
+                t.header_read_timeout_ms.to_string(),
+            ),
+            set(
+                "timing.transaction_idle_timeout_ms",
+                t.transaction_idle_timeout_ms.to_string(),
+            ),
+            set(
+                "timing.statement_timeout_ms",
+                t.statement_timeout_ms.to_string(),
+            ),
+            set(
+                "timing.max_transaction_age_ms",
+                t.max_transaction_age_ms.to_string(),
+            ),
+            set(
+                "timing.egress_stall_timeout_ms",
+                t.egress_stall_timeout_ms.to_string(),
+            ),
+            // Auth bootstrap (passwords redacted; individual users not listed).
+            set("auth.admin_user", self.auth.admin_user.clone()),
+            secret("auth.admin_password", &self.auth.admin_password),
+            SettingRow {
+                name: "auth.admin_uid",
+                value: self.auth.admin_uid.map(|u| u.to_string()),
+            },
+            set("auth.bootstrap_users", self.auth.users.len().to_string()),
+            // Audit.
+            set("audit.enabled", self.audit.enabled.to_string()),
+            path("audit.path", &self.audit.path),
+            set(
+                "audit.fsync_security_events",
+                self.audit.fsync_security_events.to_string(),
+            ),
+            set(
+                "audit.audit_data_changes",
+                self.audit.audit_data_changes.to_string(),
+            ),
+            set(
+                "audit.fsync_data_changes",
+                self.audit.fsync_data_changes.to_string(),
+            ),
+            set(
+                "audit.rotate_max_bytes",
+                self.audit.rotate_max_bytes.to_string(),
+            ),
+            set("audit.retain_files", self.audit.retain_files.to_string()),
+            // Bulk import.
+            set(
+                "bulk_import.max_bytes_per_session",
+                b.max_bytes_per_session.to_string(),
+            ),
+            set(
+                "bulk_import.min_free_disk_bytes",
+                b.min_free_disk_bytes.to_string(),
+            ),
+            set(
+                "bulk_import.max_gcol_upload_bytes",
+                b.max_gcol_upload_bytes.to_string(),
+            ),
+            set(
+                "bulk_import.max_gcol_decoded_bytes",
+                b.max_gcol_decoded_bytes.to_string(),
+            ),
+            set(
+                "bulk_import.session_timeout_ms",
+                b.session_timeout_ms.to_string(),
+            ),
+            set(
+                "bulk_import.mode_b_batch_rows",
+                b.mode_b_batch_rows.to_string(),
+            ),
+            set(
+                "bulk_import.mode_b_chunk_rows",
+                b.mode_b_chunk_rows.to_string(),
+            ),
+            set(
+                "bulk_import.mode_b_max_batch_retries",
+                b.mode_b_max_batch_retries.to_string(),
+            ),
+            set(
+                "bulk_import.mode_b_retry_backoff_ms",
+                b.mode_b_retry_backoff_ms.to_string(),
+            ),
+            set(
+                "bulk_import.mode_b_max_concurrent_sessions",
+                b.mode_b_max_concurrent_sessions.to_string(),
+            ),
+            set(
+                "bulk_import.mode_b_session_idle_timeout_ms",
+                b.mode_b_session_idle_timeout_ms.to_string(),
+            ),
+            // Secrets (redacted).
+            secret("jwt_secret", &self.jwt_secret),
+            SettingRow {
+                name: "metrics_scrape_token",
+                value: self
+                    .metrics_scrape_token
+                    .as_deref()
+                    .map(|_| "<redacted>".to_owned()),
+            },
+        ]
+    }
+}
+
 // SEC-183 (CWE-532/209): redact `jwt_secret` and `metrics_scrape_token`; `auth` redacts its own
 // passwords via [`AuthBootstrap`]'s `Debug`. Every other field is non-secret and rendered verbatim
 // so the config stays diagnosable.

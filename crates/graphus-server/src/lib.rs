@@ -39,6 +39,7 @@ pub mod security;
 pub mod server;
 pub mod shutdown;
 pub mod store_device;
+pub mod txn_registry;
 
 pub use audit::{AuditClass, AuditConfig, AuditEvent, AuditLog, AuditOutcome, AuditSource};
 pub use config::{BulkImportConfig, ConfigError, ServerConfig};

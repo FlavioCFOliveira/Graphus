@@ -155,7 +155,9 @@ fn infer(expr: &Expr, env: &TypeEnv) -> SType {
             // overloading); we do not need the precise result, so stay non-committal.
             _ => SType::Unknown,
         },
-        ExprKind::Predicate { .. } => SType::Bool,
+        ExprKind::Predicate { .. }
+        | ExprKind::TypePredicate { .. }
+        | ExprKind::NormalizedPredicate { .. } => SType::Bool,
         ExprKind::Quantifier(_) | ExprKind::ExistsSubquery(_) | ExprKind::HasLabels { .. } => {
             SType::Bool
         }
@@ -237,7 +239,9 @@ pub fn check_expr(expr: &Expr, env: &TypeEnv) -> Result<(), SemanticError> {
                 check_expr(high, env)?;
             }
         }
-        ExprKind::HasLabels { operand, .. } => check_expr(operand, env)?,
+        ExprKind::HasLabels { operand, .. }
+        | ExprKind::TypePredicate { operand, .. }
+        | ExprKind::NormalizedPredicate { operand, .. } => check_expr(operand, env)?,
         ExprKind::FunctionCall { name, args, .. } => {
             for arg in args {
                 check_expr(arg, env)?;

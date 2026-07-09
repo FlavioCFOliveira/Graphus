@@ -2066,7 +2066,9 @@ pub fn is_pure_per_row_expr(expr: &Expr) -> bool {
                 && low.as_deref().is_none_or(is_pure_per_row_expr)
                 && high.as_deref().is_none_or(is_pure_per_row_expr)
         }
-        ExprKind::HasLabels { operand, .. } => is_pure_per_row_expr(operand),
+        ExprKind::HasLabels { operand, .. }
+        | ExprKind::TypePredicate { operand, .. }
+        | ExprKind::NormalizedPredicate { operand, .. } => is_pure_per_row_expr(operand),
         ExprKind::List(items) => items.iter().all(is_pure_per_row_expr),
         ExprKind::Map(entries) => entries.iter().all(|(_, v)| is_pure_per_row_expr(v)),
         ExprKind::Case(case) => {

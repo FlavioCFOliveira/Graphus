@@ -195,6 +195,8 @@ pub enum TokenKind {
     Limit,
     /// `UNION`
     Union,
+    /// `USE` — the graph (database) selector clause (`rmp` #640).
+    Use,
     /// `ALL`
     All,
     /// `DISTINCT`
@@ -1218,6 +1220,7 @@ fn keyword_or_identifier(text: &str) -> TokenKind {
         "skip" => TokenKind::Skip,
         "limit" => TokenKind::Limit,
         "union" => TokenKind::Union,
+        "use" => TokenKind::Use,
         "all" => TokenKind::All,
         "distinct" => TokenKind::Distinct,
         "as" => TokenKind::As,
@@ -1581,6 +1584,17 @@ mod tests {
         assert_eq!(kinds("wherever"), vec![ident("wherever")]);
         // ...but the exact word (any case) is the keyword.
         assert_eq!(kinds("MaTcH"), vec![TokenKind::Match]);
+    }
+
+    #[test]
+    fn use_is_a_reserved_keyword() {
+        // `USE` lexes as the reserved graph-selector keyword (case-insensitive; `rmp` #640).
+        assert_eq!(kinds("USE"), vec![TokenKind::Use]);
+        assert_eq!(kinds("use"), vec![TokenKind::Use]);
+        assert_eq!(kinds("Use"), vec![TokenKind::Use]);
+        // A lookalike stays a plain identifier.
+        assert_eq!(kinds("used"), vec![ident("used")]);
+        assert_eq!(kinds("useful"), vec![ident("useful")]);
     }
 
     #[test]

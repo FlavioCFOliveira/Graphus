@@ -2342,3 +2342,53 @@ fn percentile_out_of_range_is_number_out_of_range_error() {
         "NaN percentile is NumberOutOfRange, got {err:?}"
     );
 }
+
+// =================================================================================================
+// `rmp` #636 / #640: type predicates and the USE selector through the full pipeline
+// =================================================================================================
+
+#[test]
+fn use_clause_is_ignored_by_engine_and_body_executes() {
+    let mut g = MemGraph::new();
+    g.add_node(["Person"], [("name", s("Ada"))]);
+    g.add_node(["Person"], [("name", s("Bob"))]);
+    // A leading `USE <graph>` selects a database *above* the engine; the single-graph engine runs
+    // the body unchanged (the selector is a routing hook, not an execution clause).
+    let rows = run(
+        "USE graphus MATCH (n:Person) RETURN n.name AS name ORDER BY name",
+        &mut g,
+    );
+    assert_eq!(col(&rows, "name"), vec![s("Ada"), s("Bob")]);
+}
+
+#[test]
+fn type_predicate_end_to_end_in_where_and_return() {
+    let mut g = MemGraph::new();
+    g.add_node(["N"], [("v", i(1))]);
+    g.add_node(["N"], [("v", s("x"))]);
+    // In a WHERE, the type predicate filters rows.
+    let rows = run(
+        "MATCH (n:N) WHERE n.v IS :: INTEGER RETURN n.v AS v",
+        &mut g,
+    );
+    assert_eq!(col(&rows, "v"), vec![i(1)]);
+    // In a RETURN, it yields booleans.
+    let rows = run(
+        "RETURN 1 IS :: INTEGER AS a, 'x' IS :: INTEGER AS b, null IS :: INTEGER AS c",
+        &mut g,
+    );
+    assert_eq!(rows[0].value("a"), Value::Boolean(true));
+    assert_eq!(rows[0].value("b"), Value::Boolean(false));
+    assert_eq!(rows[0].value("c"), Value::Boolean(true));
+}
+
+#[test]
+fn normalized_predicate_end_to_end() {
+    let mut g = MemGraph::new();
+    let rows = run(
+        "RETURN 'abc' IS NORMALIZED AS a, 1 IS NORMALIZED AS b",
+        &mut g,
+    );
+    assert_eq!(rows[0].value("a"), Value::Boolean(true));
+    assert_eq!(rows[0].value("b"), Value::Null);
+}

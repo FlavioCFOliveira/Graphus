@@ -440,7 +440,10 @@ fn collect_expr_literals(expr: &Expr, out: &mut Vec<LiteralSite>) {
             collect_expr_literals(lhs, out);
             collect_expr_literals(rhs, out);
         }
-        ExprKind::Unary { operand, .. } | ExprKind::HasLabels { operand, .. } => {
+        ExprKind::Unary { operand, .. }
+        | ExprKind::HasLabels { operand, .. }
+        | ExprKind::TypePredicate { operand, .. }
+        | ExprKind::NormalizedPredicate { operand, .. } => {
             collect_expr_literals(operand, out);
         }
         ExprKind::Predicate { operand, rhs, .. } => {

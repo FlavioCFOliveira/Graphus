@@ -103,6 +103,13 @@ struct OpenTx {
     /// remains. Paired with the registry's open-transaction cap (the URL-facing bound), this is the
     /// engine-side bound on the `seam_rest.txns` map.
     _permit: std::sync::Arc<AdmissionPermit>,
+    /// The live-transaction-registry entry (`rmp` #637): registered on `BEGIN`, it makes this
+    /// transaction visible to `SHOW TRANSACTIONS`, records its current query, and carries the
+    /// `TERMINATE TRANSACTIONS` flag. Held behind an `Arc` (exactly like `_permit`) so `OpenTx`
+    /// stays `Clone`: the guard deregisters the transaction only when the **last** clone drops —
+    /// i.e. once the table entry is `take`n (committed/rolled back/terminated) and no in-flight
+    /// `run` clone of it remains.
+    txn: std::sync::Arc<crate::txn_registry::TxnGuard>,
 }
 
 impl RestEngineAdapter {
@@ -476,6 +483,16 @@ impl RestEngine for RestEngineAdapter {
             .try_admit()
             .map_err(|busy| GraphusError::Transaction(busy.to_string()))?;
         let ticket = handle.begin_blocking(engine_mode)?;
+        // Register the managed transaction in the server-wide live-transaction registry (rmp #637)
+        // now visible to `SHOW TRANSACTIONS` and addressable by `TERMINATE TRANSACTIONS`. Held as an
+        // `Arc` so the `Clone` `OpenTx` deregisters only when its last clone drops.
+        let txn = std::sync::Arc::new(self.context.transactions().register(
+            &name,
+            Some(origin.principal),
+            AuditSource::Rest,
+            engine_mode,
+            None,
+        ));
         // Mint the public id only after the engine accepted the begin (no orphan table entries).
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         self.txns().insert(
@@ -488,6 +505,7 @@ impl RestEngine for RestEngineAdapter {
                 explicit: origin.explicit,
                 mode: engine_mode,
                 _permit: std::sync::Arc::new(permit),
+                txn,
             },
         );
         Ok(TxHandle(id))
@@ -500,6 +518,18 @@ impl RestEngine for RestEngineAdapter {
         parameters: Vec<(String, Value)>,
     ) -> Result<Self::Stream, GraphusError> {
         let open = self.lookup(tx)?;
+
+        // If this transaction was terminated by `TERMINATE TRANSACTIONS` (rmp #637), fail fast:
+        // remove it from the table (releasing its permit + GC pin as the entry drops), roll it back,
+        // and return the non-retryable terminated error.
+        if open.txn.is_terminated() {
+            if let Some(removed) = self.txns().remove(&tx.0) {
+                let _ = removed.handle.rollback_blocking(removed.ticket);
+            }
+            return Err(crate::txn_registry::terminated_error());
+        }
+        // Record the statement as this transaction's current query for `SHOW TRANSACTIONS`.
+        open.txn.set_current_query(query);
 
         // Administrative statements are intercepted BEFORE Cypher compilation (rmp #84/#91); see the
         // module docs for the explicit-vs-auto-commit rule. Shared with `run_autocommit` (rmp #527).

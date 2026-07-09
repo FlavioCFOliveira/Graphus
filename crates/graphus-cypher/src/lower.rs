@@ -1529,6 +1529,24 @@ fn rewrite_order_expr(expr: &Expr, targets: &[(&Expr, &str)]) -> Expr {
             operand: Box::new(rewrite_order_expr(operand, targets)),
             expr: expr.clone(),
         },
+        ExprKind::TypePredicate {
+            operand,
+            negated,
+            type_expr,
+        } => ExprKind::TypePredicate {
+            operand: Box::new(rewrite_order_expr(operand, targets)),
+            negated: *negated,
+            type_expr: type_expr.clone(),
+        },
+        ExprKind::NormalizedPredicate {
+            operand,
+            negated,
+            form,
+        } => ExprKind::NormalizedPredicate {
+            operand: Box::new(rewrite_order_expr(operand, targets)),
+            negated: *negated,
+            form: *form,
+        },
         ExprKind::FunctionCall {
             name,
             distinct,
@@ -1578,7 +1596,10 @@ fn expr_size(expr: &Expr) -> usize {
             count(lhs);
             count(rhs);
         }
-        ExprKind::Unary { operand, .. } | ExprKind::HasLabels { operand, .. } => count(operand),
+        ExprKind::Unary { operand, .. }
+        | ExprKind::HasLabels { operand, .. }
+        | ExprKind::TypePredicate { operand, .. }
+        | ExprKind::NormalizedPredicate { operand, .. } => count(operand),
         ExprKind::Predicate { operand, rhs, .. } => {
             count(operand);
             if let Some(r) = rhs {
@@ -1626,9 +1647,10 @@ fn expr_contains_aggregate(expr: &Expr) -> bool {
         ExprKind::Binary { lhs, rhs, .. } => {
             expr_contains_aggregate(lhs) || expr_contains_aggregate(rhs)
         }
-        ExprKind::Unary { operand, .. } | ExprKind::HasLabels { operand, .. } => {
-            expr_contains_aggregate(operand)
-        }
+        ExprKind::Unary { operand, .. }
+        | ExprKind::HasLabels { operand, .. }
+        | ExprKind::TypePredicate { operand, .. }
+        | ExprKind::NormalizedPredicate { operand, .. } => expr_contains_aggregate(operand),
         ExprKind::Predicate { operand, rhs, .. } => {
             expr_contains_aggregate(operand) || rhs.as_deref().is_some_and(expr_contains_aggregate)
         }
@@ -1802,7 +1824,10 @@ fn collect_referenced_vars(expr: &Expr, out: &mut BTreeSet<String>) {
             collect_referenced_vars(lhs, out);
             collect_referenced_vars(rhs, out);
         }
-        ExprKind::Unary { operand, .. } | ExprKind::HasLabels { operand, .. } => {
+        ExprKind::Unary { operand, .. }
+        | ExprKind::HasLabels { operand, .. }
+        | ExprKind::TypePredicate { operand, .. }
+        | ExprKind::NormalizedPredicate { operand, .. } => {
             collect_referenced_vars(operand, out);
         }
         ExprKind::Predicate { operand, rhs, .. } => {

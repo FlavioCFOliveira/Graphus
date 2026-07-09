@@ -215,8 +215,8 @@ pub use plan_cache::{
     normalize_query,
 };
 pub use procedure_registry::{
-    FieldSpec, FieldType, ProcedureFailure, ProcedureRegistry, ProcedureSet, ProcedureSignature,
-    ValueClass,
+    FieldSpec, FieldType, ProcedureFailure, ProcedureListing, ProcedureRegistry, ProcedureSet,
+    ProcedureSignature, ValueClass,
 };
 pub use read_only_graph::ReadOnlyGraph;
 pub use read_source::{LiveSource, ReadSink, ReadViewSource, StoreReadSource, VisCtx};

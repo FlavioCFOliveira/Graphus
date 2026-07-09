@@ -1166,6 +1166,22 @@ fn fmt_expr(expr: &Expr) -> String {
         ExprKind::HasLabels { operand, expr } => {
             format!("{}:{}", fmt_expr(operand), fmt_label_expr(expr))
         }
+        ExprKind::TypePredicate {
+            operand,
+            negated,
+            type_expr,
+        } => {
+            let op = if *negated { "IS NOT ::" } else { "IS ::" };
+            format!("{} {op} {type_expr}", fmt_expr(operand))
+        }
+        ExprKind::NormalizedPredicate {
+            operand,
+            negated,
+            form,
+        } => {
+            let op = if *negated { "IS NOT" } else { "IS" };
+            format!("{} {op} {form} NORMALIZED", fmt_expr(operand))
+        }
         ExprKind::FunctionCall {
             name,
             distinct,

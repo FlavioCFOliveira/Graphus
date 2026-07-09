@@ -176,6 +176,11 @@ struct UserRecord {
     /// never changed (the common case), keeping pre-existing security files forward-compatible.
     #[serde(default, skip_serializing_if = "is_zero")]
     credential_version: u64,
+    /// Whether the account is suspended (`rmp` #641). Absent/`false` (active) for a user that has
+    /// never been suspended, so pre-existing security files round-trip unchanged (`credential_version`
+    /// precedent).
+    #[serde(default, skip_serializing_if = "is_false")]
+    suspended: bool,
 }
 
 /// Helper for `skip_serializing_if`: a `0` credential epoch is the default and is omitted from the
@@ -183,6 +188,13 @@ struct UserRecord {
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_zero(v: &u64) -> bool {
     *v == 0
+}
+
+/// Helper for `skip_serializing_if`: a `false` (active) status is the default and is omitted from
+/// the file so existing security files round-trip unchanged.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 /// One role's durable record: name + granted privileges.
@@ -399,6 +411,7 @@ fn to_file(auth: &Authenticator) -> SecurityFile {
             password_hash: user.password_hash.clone(),
             roles: user.roles.iter().cloned().collect(),
             credential_version: user.credential_version,
+            suspended: user.suspended,
         })
         .collect();
     let roles = catalog
@@ -508,6 +521,15 @@ fn load_into(root: &Path, auth: &mut Authenticator) -> Result<()> {
                     user.name
                 ))
             })?;
+        // Restore the suspended status (rmp #641).
+        if user.suspended {
+            catalog.set_user_suspended(&user.name, true).map_err(|e| {
+                corrupt(format!(
+                    "restoring suspended status for {:?}: {e}",
+                    user.name
+                ))
+            })?;
+        }
         for role in &user.roles {
             if !catalog.has_role(role) {
                 return Err(corrupt(format!(
@@ -624,6 +646,7 @@ impl SecurityCatalog {
                     name: name.to_owned(),
                     roles: user.roles.iter().cloned().collect(),
                     has_password: user.password_hash.is_some(),
+                    suspended: user.suspended,
                 })
                 .collect()
         })
@@ -885,6 +908,93 @@ impl SecurityCatalog {
         })
         .await
     }
+
+    /// `ALTER USER <name> SET PASSWORD '<pw>'` (`rmp` #641). Re-hashes and stores the new password
+    /// and **bumps the credential epoch** (SEC-180): every Bearer token the user held is invalidated,
+    /// a forced logout on password change. Unlike the old `DROP USER` + `CREATE USER` workaround this
+    /// preserves the user's roles and identity.
+    ///
+    /// # Errors
+    /// [`SecurityError::Rbac`] ([`AuthError::NotFound`]) if the user does not exist;
+    /// [`SecurityError::Io`] on persist failure.
+    pub async fn set_password(&self, name: &str, password: &str) -> Result<()> {
+        let name = name.to_owned();
+        let password = password.to_owned();
+        self.mutate(
+            &format!("set the password of {name:?}"),
+            false,
+            move |auth| {
+                auth.set_password(&name, &password)?;
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    /// `ALTER USER <name> SET STATUS {ACTIVE|SUSPENDED}` (`rmp` #641). Suspending a user rejects it
+    /// at every authentication entry point (password / Bearer / UDS peer-cred) without dropping the
+    /// account; reactivating clears the flag. Suspending the **bootstrap admin** is refused (it must
+    /// stay able to administer).
+    ///
+    /// # Errors
+    /// [`SecurityError::WouldLockOutAdmin`] if `name` is the bootstrap admin and `suspended` is true;
+    /// [`SecurityError::Rbac`] ([`AuthError::NotFound`]) if the user does not exist;
+    /// [`SecurityError::Io`] on persist failure.
+    pub async fn set_user_status(&self, name: &str, suspended: bool) -> Result<()> {
+        if suspended && name == self.bootstrap_admin {
+            return Err(SecurityError::WouldLockOutAdmin {
+                admin: self.bootstrap_admin.clone(),
+                operation: format!("suspend the user {name:?}"),
+            });
+        }
+        let name = name.to_owned();
+        self.mutate(&format!("set the status of {name:?}"), false, move |auth| {
+            auth.catalog_mut().set_user_suspended(&name, suspended)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// `RENAME USER <from> TO <to>` (`rmp` #641). Preserves the user's roles, password, and
+    /// credential epoch. Renaming the **bootstrap admin** is refused: its name is the fixed anchor of
+    /// the lock-out safeguard and (typically) the uid binding for UDS peer-cred auth, so a rename
+    /// would desync both.
+    ///
+    /// # Errors
+    /// [`SecurityError::WouldLockOutAdmin`] if `from` is the bootstrap admin;
+    /// [`SecurityError::Rbac`] ([`AuthError::NotFound`] / [`AuthError::AlreadyExists`]);
+    /// [`SecurityError::Io`] on persist failure.
+    pub async fn rename_user(&self, from: &str, to: &str) -> Result<()> {
+        if from == self.bootstrap_admin {
+            return Err(SecurityError::WouldLockOutAdmin {
+                admin: self.bootstrap_admin.clone(),
+                operation: format!("rename the user {from:?}"),
+            });
+        }
+        let (from, to) = (from.to_owned(), to.to_owned());
+        self.mutate(&format!("rename the user {from:?}"), false, move |auth| {
+            auth.catalog_mut().rename_user(&from, &to)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// `RENAME ROLE <from> TO <to>` (`rmp` #641). Preserves the role's privileges and rewrites every
+    /// user's membership referencing the old name, so the admin keeps its privileges under the new
+    /// role name; the lock-out safeguard re-check confirms it.
+    ///
+    /// # Errors
+    /// [`SecurityError::WouldLockOutAdmin`] if the rename would strip the bootstrap admin of global
+    /// `Admin`; [`SecurityError::Rbac`] ([`AuthError::NotFound`] / [`AuthError::AlreadyExists`]);
+    /// [`SecurityError::Io`] on persist failure.
+    pub async fn rename_role(&self, from: &str, to: &str) -> Result<()> {
+        let (from, to) = (from.to_owned(), to.to_owned());
+        self.mutate(&format!("rename the role {from:?}"), true, move |auth| {
+            auth.catalog_mut().rename_role(&from, &to)?;
+            Ok(())
+        })
+        .await
+    }
 }
 
 impl std::fmt::Debug for SecurityCatalog {
@@ -1067,6 +1177,8 @@ pub struct UserListing {
     pub roles: Vec<String>,
     /// Whether the user has a password set (the hash itself is never exposed).
     pub has_password: bool,
+    /// Whether the account is suspended (`rmp` #641).
+    pub suspended: bool,
 }
 
 /// One `SHOW ROLES` row.
@@ -1449,6 +1561,118 @@ mod tests {
         assert!(matches!(
             sec.create_user("root", None).await,
             Err(SecurityError::Rbac(AuthError::AlreadyExists { .. }))
+        ));
+    }
+
+    // ---- Security DDL: ALTER USER + RENAME (rmp #641) -------------------------------------------
+
+    #[tokio::test]
+    async fn alter_user_set_password_changes_credential_and_persists() {
+        let root = TempRoot::new("alter-pw");
+        let sec = catalog(&root);
+        sec.create_user("alice", Some("old-passwd"))
+            .await
+            .expect("create");
+        let epoch_before = sec.with_auth(|a| a.catalog().credential_version("alice").unwrap());
+
+        sec.set_password("alice", "new-passwd")
+            .await
+            .expect("set password");
+        // The new password authenticates, the old does not.
+        assert_eq!(
+            sec.with_auth(|a| a.authenticate_password("alice", "new-passwd"))
+                .unwrap(),
+            "alice"
+        );
+        assert!(
+            sec.with_auth(|a| a.authenticate_password("alice", "old-passwd"))
+                .is_err()
+        );
+        // The credential epoch bumped (SEC-180 forced logout of outstanding tokens).
+        let epoch_after = sec.with_auth(|a| a.catalog().credential_version("alice").unwrap());
+        assert!(epoch_after > epoch_before);
+        // Setting the password of a non-existent user is an Rbac NotFound.
+        assert!(matches!(
+            sec.set_password("ghost", "x").await,
+            Err(SecurityError::Rbac(AuthError::NotFound { .. }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn suspend_blocks_authentication_and_reactivate_restores_it() {
+        let root = TempRoot::new("suspend");
+        let sec = catalog(&root);
+        sec.create_user("alice", Some("password1"))
+            .await
+            .expect("create");
+        // Active: password authenticates.
+        assert!(
+            sec.with_auth(|a| a.authenticate_password("alice", "password1"))
+                .is_ok()
+        );
+
+        // Suspend: authentication is rejected despite the correct password, and it persists.
+        sec.set_user_status("alice", true).await.expect("suspend");
+        assert!(
+            sec.with_auth(|a| a.authenticate_password("alice", "password1"))
+                .is_err()
+        );
+        assert!(
+            sec.list_users()
+                .iter()
+                .find(|u| u.name == "alice")
+                .unwrap()
+                .suspended
+        );
+        let text = std::fs::read_to_string(root.path.join(SECURITY_FILE_NAME)).expect("file");
+        assert!(text.contains("suspended = true"), "suspension must persist");
+
+        // Reactivate: authentication works again.
+        sec.set_user_status("alice", false)
+            .await
+            .expect("reactivate");
+        assert!(
+            sec.with_auth(|a| a.authenticate_password("alice", "password1"))
+                .is_ok()
+        );
+
+        // The bootstrap admin can never be suspended (lock-out safeguard).
+        assert!(matches!(
+            sec.set_user_status("root", true).await,
+            Err(SecurityError::WouldLockOutAdmin { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn rename_user_and_role_preserve_access_and_guard_the_admin() {
+        let root = TempRoot::new("rename");
+        let sec = catalog(&root);
+        sec.create_role("reader").await.expect("role");
+        sec.create_user("alice", Some("password1"))
+            .await
+            .expect("user");
+        sec.grant_role("alice", "reader").await.expect("grant");
+
+        sec.rename_user("alice", "alicia")
+            .await
+            .expect("rename user");
+        assert!(sec.list_users().iter().any(|u| u.name == "alicia"));
+        assert!(!sec.list_users().iter().any(|u| u.name == "alice"));
+        // The password + role membership survived the rename.
+        assert!(
+            sec.with_auth(|a| a.authenticate_password("alicia", "password1"))
+                .is_ok()
+        );
+
+        sec.rename_role("reader", "viewer")
+            .await
+            .expect("rename role");
+        assert!(sec.list_roles().iter().any(|r| r.name == "viewer"));
+
+        // The bootstrap admin cannot be renamed (its name anchors the lock-out safeguard).
+        assert!(matches!(
+            sec.rename_user("root", "superuser").await,
+            Err(SecurityError::WouldLockOutAdmin { .. })
         ));
     }
 }

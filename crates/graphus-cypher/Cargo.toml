@@ -101,6 +101,12 @@ rustc-hash = "2"
 # `unicode-case`/`unicode-script`/`unicode-bool` tables we do not need; `unicode-perl` is kept so the
 # Perl classes `\d`/`\w`/`\s` behave per Unicode, matching Java's default Unicode-aware classes.
 regex = { version = "1", default-features = false, features = ["std", "unicode-perl"] }
+# The Unicode normalization quick-check functions (`is_nfc`/`is_nfd`/`is_nfkc`/`is_nfkd`) backing the
+# `IS [NOT] [<form>] NORMALIZED` predicate (`rmp` #636, src/eval.rs). Normalization requires the
+# Unicode Character Database decomposition/composition tables, which cannot be hand-rolled correctly;
+# `unicode-normalization` is the de-facto-standard, `forbid(unsafe)`-clean implementation and is
+# already in the build graph (a direct dependency of graphus-index), so this adds no new crate.
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 # Deterministic, seedable RNG for the reproducible cross-check property test.

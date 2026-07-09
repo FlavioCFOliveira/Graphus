@@ -74,6 +74,11 @@ struct OpenTx {
     /// The access mode the transaction was begun in — so a `RUN` inside it can be classified as a
     /// data change (a write) for audit (rmp #70).
     mode: AccessMode,
+    /// The live-transaction-registry entry (`rmp` #637): registered on `BEGIN`, it makes this
+    /// transaction visible to `SHOW TRANSACTIONS`, records its current query, and carries the
+    /// `TERMINATE TRANSACTIONS` flag. Dropping it (on COMMIT/ROLLBACK/disconnect) deregisters the
+    /// transaction, so it can never leak into the registry.
+    txn: crate::txn_registry::TxnGuard,
 }
 
 impl BoltEngineExecutor {
@@ -482,6 +487,18 @@ impl BoltExecutor for BoltEngineExecutor {
                 stream
             }
             TxControl::InExplicit { db } => {
+                // If this transaction was terminated by `TERMINATE TRANSACTIONS` (rmp #637), fail
+                // fast: roll it back (releasing its GC pin) and return a non-retryable terminated
+                // error. Checked at the statement boundary — the idle-in-transaction case an
+                // operator kills — before any work is done.
+                if self
+                    .current_tx
+                    .as_ref()
+                    .is_some_and(|o| o.txn.is_terminated())
+                {
+                    self.rollback_open_tx();
+                    return Err(crate::txn_registry::terminated_error());
+                }
                 let open = self.current_tx.as_ref().ok_or_else(|| {
                     GraphusError::Transaction(
                         "RUN in explicit transaction but none is open".to_owned(),
@@ -499,6 +516,8 @@ impl BoltExecutor for BoltEngineExecutor {
                         )));
                     }
                 }
+                // Record the statement as this transaction's current query for `SHOW TRANSACTIONS`.
+                open.txn.set_current_query(query);
                 let (handle, ticket, pinned_db, tx_mode) =
                     (open.handle.clone(), open.ticket, open.db.clone(), open.mode);
                 let stream = self.run_on(
@@ -531,11 +550,22 @@ impl BoltExecutor for BoltEngineExecutor {
         let (name, handle) = self.context.resolve(db)?;
         let engine_mode = from_bolt_mode(mode);
         let ticket = handle.begin_blocking(engine_mode)?;
+        // Register the managed transaction in the server-wide live-transaction registry (rmp #637):
+        // now visible to `SHOW TRANSACTIONS` and addressable by `TERMINATE TRANSACTIONS`. The guard
+        // deregisters it on COMMIT/ROLLBACK/disconnect (`current_tx` drop).
+        let txn = self.context.transactions().register(
+            &name,
+            self.principal.as_deref(),
+            self.source,
+            engine_mode,
+            None,
+        );
         self.current_tx = Some(OpenTx {
             ticket,
             handle,
             db: name,
             mode: engine_mode,
+            txn,
         });
         Ok(())
     }
@@ -544,6 +574,12 @@ impl BoltExecutor for BoltEngineExecutor {
         let open = self.current_tx.take().ok_or_else(|| {
             GraphusError::Transaction("COMMIT with no open transaction".to_owned())
         })?;
+        // A terminated transaction (rmp #637) must not commit: roll it back and fail with the
+        // non-retryable terminated error. `open` drops here, deregistering it from the registry.
+        if open.txn.is_terminated() {
+            let _ = open.handle.rollback_blocking(open.ticket);
+            return Err(crate::txn_registry::terminated_error());
+        }
         let summary = open.handle.commit_blocking(open.ticket)?;
         Ok(to_bolt_summary(summary))
     }

@@ -101,6 +101,7 @@ use crate::audit::{
     AuditClass, AuditEvent, AuditLog, AuditOutcome, AuditSource, admin_target_database,
     classify_admin, is_mutating_admin, redact_admin_detail,
 };
+use crate::config::ServerConfig;
 use crate::dbcatalog::{CatalogError, DatabaseCatalog, DbState, normalize_db_name};
 use crate::engine::{
     ConstraintCommand, EngineHandle, IndexCommand, NodePropertyIndexRef, RunSummary,
@@ -216,6 +217,52 @@ pub enum AdminCommand {
     ShowRoles,
     /// `SHOW PRIVILEGES`.
     ShowPrivileges,
+    /// `ALTER USER <name> SET PASSWORD '<pw>'` (`rmp` #641). Sets a new password (re-hashed,
+    /// credential epoch bumped) without dropping/recreating the user.
+    AlterUserPassword {
+        /// The username.
+        name: String,
+        /// The new plaintext password (hashed by the security catalog; never stored/logged in clear).
+        password: String,
+    },
+    /// `ALTER USER <name> SET STATUS {ACTIVE|SUSPENDED}` (`rmp` #641). Suspends or reactivates the
+    /// account without dropping it.
+    AlterUserStatus {
+        /// The username.
+        name: String,
+        /// `true` for `SUSPENDED`, `false` for `ACTIVE`.
+        suspended: bool,
+    },
+    /// `RENAME USER <from> TO <to>` (`rmp` #641).
+    RenameUser {
+        /// The current username.
+        from: String,
+        /// The new username.
+        to: String,
+    },
+    /// `RENAME ROLE <from> TO <to>` (`rmp` #641).
+    RenameRole {
+        /// The current role name.
+        from: String,
+        /// The new role name.
+        to: String,
+    },
+
+    // ---- DBMS introspection surface (rmp #637) ----
+    /// `SHOW FUNCTIONS` — the built-in Cypher function library (read-only).
+    ShowFunctions,
+    /// `SHOW PROCEDURES` — the registered procedures (`db.*` built-ins + the GDS surface; read-only).
+    ShowProcedures,
+    /// `SHOW SETTINGS` — the server's effective (post-auto-tune) configuration (read-only).
+    ShowSettings,
+    /// `SHOW TRANSACTIONS` — the live explicit (managed) transactions across the server (read-only).
+    ShowTransactions,
+    /// `TERMINATE TRANSACTIONS '<id>' [, '<id>' ...]` — mark the named live transaction(s) for
+    /// termination (their next interaction aborts). One or more single-quoted transaction ids.
+    TerminateTransactions {
+        /// The transaction ids to terminate, as written (e.g. `"graphus-transaction-42"`).
+        ids: Vec<String>,
+    },
 
     // ---- Operator backup / restore surface (rmp #149) ----
     /// `BACKUP DATABASE <name> TO '<path>'` — capture an online backup chain artifact of `name`
@@ -566,6 +613,30 @@ pub fn parse_admin_statement(query: &str) -> AdminParse {
         };
     }
 
+    // TERMINATE is never a valid Cypher statement start, so it is CLAIMED on the first token alone
+    // (the transaction-management surface, rmp #637).
+    if verb == "TERMINATE" {
+        return match parse_terminate(&verb, &mut lex) {
+            Ok(cmd) => AdminParse::Command(cmd),
+            Err(msg) => AdminParse::Invalid(msg),
+        };
+    }
+
+    // ALTER / RENAME are never valid Cypher statement starts either, so they are CLAIMED on the first
+    // token alone (the security-DDL surface, rmp #641).
+    if verb == "ALTER" {
+        return match parse_alter_user(&verb, &mut lex) {
+            Ok(cmd) => AdminParse::Command(cmd),
+            Err(msg) => AdminParse::Invalid(msg),
+        };
+    }
+    if verb == "RENAME" {
+        return match parse_rename(&verb, &mut lex) {
+            Ok(cmd) => AdminParse::Command(cmd),
+            Err(msg) => AdminParse::Invalid(msg),
+        };
+    }
+
     if !matches!(verb.as_str(), "CREATE" | "DROP" | "START" | "STOP" | "SHOW") {
         return AdminParse::NotAdmin;
     }
@@ -587,6 +658,20 @@ pub fn parse_admin_statement(query: &str) -> AdminParse {
         || is_keyword(&second, "PRIVILEGES")
     {
         return match parse_claimed_security(&verb, &second, &mut lex) {
+            Ok(cmd) => AdminParse::Command(cmd),
+            Err(msg) => AdminParse::Invalid(msg),
+        };
+    }
+
+    // --- DBMS introspection surface (rmp #637): SHOW FUNCTIONS/PROCEDURES/SETTINGS/TRANSACTIONS ---
+    // These plurals directly after a verb are never valid Cypher, so the statement is CLAIMED once
+    // the verb + keyword is seen. Only `SHOW` takes them (nullary listings).
+    if is_keyword(&second, "FUNCTIONS")
+        || is_keyword(&second, "PROCEDURES")
+        || is_keyword(&second, "SETTINGS")
+        || is_keyword(&second, "TRANSACTIONS")
+    {
+        return match parse_claimed_introspection(&verb, &second, &mut lex) {
             Ok(cmd) => AdminParse::Command(cmd),
             Err(msg) => AdminParse::Invalid(msg),
         };
@@ -1426,6 +1511,172 @@ fn parse_claimed_security(
     }
 }
 
+/// Parses a claimed DBMS-introspection listing (`rmp` #637): `SHOW FUNCTIONS`, `SHOW PROCEDURES`,
+/// `SHOW SETTINGS`, or `SHOW TRANSACTIONS`. Each is `SHOW`-only and nullary (the verb + keyword are
+/// already read).
+fn parse_claimed_introspection(
+    verb: &str,
+    second: &Tok,
+    lex: &mut Lexer<'_>,
+) -> Result<AdminCommand, String> {
+    if verb != "SHOW" {
+        let kw = keyword_text(second);
+        return Err(format!(
+            "expected the singular form after {verb} ({kw} is only valid in SHOW {kw})"
+        ));
+    }
+    let what = format!("SHOW {}", keyword_text(second));
+    expect_end(lex, &what)?;
+    Ok(if is_keyword(second, "FUNCTIONS") {
+        AdminCommand::ShowFunctions
+    } else if is_keyword(second, "PROCEDURES") {
+        AdminCommand::ShowProcedures
+    } else if is_keyword(second, "SETTINGS") {
+        AdminCommand::ShowSettings
+    } else {
+        AdminCommand::ShowTransactions
+    })
+}
+
+/// Parses `TERMINATE TRANSACTIONS '<id>' [, '<id>' ...]` (`rmp` #637); the `TERMINATE` verb is
+/// already read and the statement is CLAIMED (`TERMINATE` is never valid Cypher). Requires the
+/// `TRANSACTIONS` keyword and at least one single-/double-quoted id, comma-separated.
+fn parse_terminate(verb: &str, lex: &mut Lexer<'_>) -> Result<AdminCommand, String> {
+    // TRANSACTIONS (accept the singular TRANSACTION too, mirroring Neo4j's lenient keyword).
+    match lex.next_tok()? {
+        Some(t) if is_keyword(&t, "TRANSACTIONS") || is_keyword(&t, "TRANSACTION") => {}
+        Some(other) => {
+            return Err(unexpected_generic(
+                &other,
+                &format!("TRANSACTIONS after {verb}"),
+            ));
+        }
+        None => return Err(format!("expected TRANSACTIONS after {verb}")),
+    }
+    // One or more quoted ids, comma-separated.
+    let mut ids = Vec::new();
+    loop {
+        match lex.next_tok()? {
+            Some(Tok::Str(id)) => ids.push(id),
+            Some(other) => {
+                return Err(unexpected_generic(
+                    &other,
+                    "a quoted transaction id in TERMINATE TRANSACTIONS",
+                ));
+            }
+            None => {
+                return Err("expected a quoted transaction id in TERMINATE TRANSACTIONS".to_owned());
+            }
+        }
+        // Optional trailing comma → another id.
+        let mut peek = Lexer {
+            rest: lex.rest.clone(),
+        };
+        match peek.next_tok()? {
+            Some(Tok::Symbol(',')) => {
+                lex.rest = peek.rest.clone();
+            }
+            _ => break,
+        }
+    }
+    expect_end(lex, "TERMINATE TRANSACTIONS")?;
+    Ok(AdminCommand::TerminateTransactions { ids })
+}
+
+/// Parses `ALTER USER <name> SET {PASSWORD '<pw>' | STATUS {ACTIVE|SUSPENDED}}` (`rmp` #641); the
+/// `ALTER` verb is already read and the statement is CLAIMED (`ALTER` is never valid Cypher). Exactly
+/// one `SET` clause is required. The other Neo4j clauses (`SET HOME DATABASE`, `CHANGE [NOT]
+/// REQUIRED`) are a named follow-up and are rejected here.
+fn parse_alter_user(verb: &str, lex: &mut Lexer<'_>) -> Result<AdminCommand, String> {
+    // USER
+    match lex.next_tok()? {
+        Some(t) if is_keyword(&t, "USER") => {}
+        Some(other) => return Err(unexpected_generic(&other, &format!("USER after {verb}"))),
+        None => return Err(format!("expected USER after {verb}")),
+    }
+    // <name>
+    let name = expect_security_name(lex, &format!("a user name after {verb} USER"))?;
+    // SET
+    match lex.next_tok()? {
+        Some(t) if is_keyword(&t, "SET") => {}
+        Some(other) => {
+            return Err(unexpected_generic(
+                &other,
+                "SET PASSWORD '<password>' or SET STATUS {ACTIVE|SUSPENDED} in ALTER USER",
+            ));
+        }
+        None => {
+            return Err(format!(
+                "expected SET PASSWORD '<password>' or SET STATUS after {verb} USER {name}"
+            ));
+        }
+    }
+    // Dispatch on the clause keyword.
+    let clause = lex
+        .next_tok()?
+        .ok_or_else(|| "expected PASSWORD or STATUS after SET in ALTER USER".to_owned())?;
+    if is_keyword(&clause, "PASSWORD") {
+        let password = match lex.next_tok()? {
+            Some(Tok::Str(pw)) => pw,
+            Some(other) => {
+                return Err(unexpected_generic(
+                    &other,
+                    "a quoted password after SET PASSWORD",
+                ));
+            }
+            None => return Err("expected a quoted password after SET PASSWORD".to_owned()),
+        };
+        expect_end(lex, "ALTER USER")?;
+        Ok(AdminCommand::AlterUserPassword { name, password })
+    } else if is_keyword(&clause, "STATUS") {
+        let status = lex
+            .next_tok()?
+            .ok_or_else(|| "expected ACTIVE or SUSPENDED after SET STATUS".to_owned())?;
+        let suspended = if is_keyword(&status, "SUSPENDED") {
+            true
+        } else if is_keyword(&status, "ACTIVE") {
+            false
+        } else {
+            return Err(unexpected_generic(
+                &status,
+                "ACTIVE or SUSPENDED after SET STATUS",
+            ));
+        };
+        expect_end(lex, "ALTER USER")?;
+        Ok(AdminCommand::AlterUserStatus { name, suspended })
+    } else {
+        Err(unexpected_generic(
+            &clause,
+            "PASSWORD or STATUS after SET (SET HOME DATABASE / CHANGE REQUIRED are not yet supported)",
+        ))
+    }
+}
+
+/// Parses `RENAME USER <from> TO <to>` / `RENAME ROLE <from> TO <to>` (`rmp` #641); the `RENAME`
+/// verb is already read and the statement is CLAIMED (`RENAME` is never valid Cypher).
+fn parse_rename(verb: &str, lex: &mut Lexer<'_>) -> Result<AdminCommand, String> {
+    let kind = lex
+        .next_tok()?
+        .ok_or_else(|| format!("expected USER or ROLE after {verb}"))?;
+    let is_user = is_keyword(&kind, "USER");
+    if !is_user && !is_keyword(&kind, "ROLE") {
+        return Err(unexpected_generic(
+            &kind,
+            &format!("USER or ROLE after {verb}"),
+        ));
+    }
+    let entity = if is_user { "USER" } else { "ROLE" };
+    let from = expect_security_name(lex, &format!("a name after {verb} {entity}"))?;
+    expect_security_keyword(lex, "TO", &format!("{verb} {entity}"))?;
+    let to = expect_security_name(lex, &format!("a new name after {verb} {entity} {from} TO"))?;
+    expect_end(lex, &format!("RENAME {entity}"))?;
+    Ok(if is_user {
+        AdminCommand::RenameUser { from, to }
+    } else {
+        AdminCommand::RenameRole { from, to }
+    })
+}
+
 /// Parses an optional `SET PASSWORD '<pw>'` clause (only consumed when the next token is `SET`).
 /// Returns the plaintext password if the clause was present. A partial clause is a syntax error.
 fn parse_optional_set_password(lex: &mut Lexer<'_>) -> Result<Option<String>, String> {
@@ -1956,6 +2207,13 @@ pub struct AdminContext {
     /// The default database's engine handle — the fast path for sessions that never name a
     /// database, guaranteeing the single-db experience is byte-for-byte today's behaviour.
     default_handle: EngineHandle,
+    /// The server's effective (post-hardware-auto-tune, validated) configuration, for the read-only
+    /// `SHOW SETTINGS` introspection (`rmp` #637). `Arc`-shared so the per-connection clone of
+    /// [`AdminContext`] stays cheap.
+    config: Arc<ServerConfig>,
+    /// The live registry of explicit (managed) transactions across every connectivity seam, for
+    /// `SHOW TRANSACTIONS` / `TERMINATE TRANSACTIONS` (`rmp` #637).
+    txns: Arc<crate::txn_registry::TransactionRegistry>,
 }
 
 impl AdminContext {
@@ -1969,6 +2227,8 @@ impl AdminContext {
         audit: Arc<AuditLog>,
         runtime: Handle,
         default_handle: EngineHandle,
+        config: Arc<ServerConfig>,
+        txns: Arc<crate::txn_registry::TransactionRegistry>,
     ) -> Self {
         Self {
             catalog,
@@ -1976,6 +2236,8 @@ impl AdminContext {
             audit,
             runtime,
             default_handle,
+            config,
+            txns,
         }
     }
 
@@ -1984,6 +2246,14 @@ impl AdminContext {
     #[must_use]
     pub fn security(&self) -> &Arc<SecurityCatalog> {
         &self.security
+    }
+
+    /// Shared access to the live explicit-transaction registry (`rmp` #637), so each connectivity
+    /// seam registers its managed transactions into the one server-wide view that `SHOW
+    /// TRANSACTIONS` / `TERMINATE TRANSACTIONS` read.
+    #[must_use]
+    pub fn transactions(&self) -> &Arc<crate::txn_registry::TransactionRegistry> {
+        &self.txns
     }
 
     /// Shared access to the security audit log (rmp #70) so the seams can record their own events
@@ -2324,6 +2594,37 @@ impl AdminContext {
             AdminCommand::ShowUsers => Ok(show_users(&self.security.list_users())),
             AdminCommand::ShowRoles => Ok(show_roles(&self.security.list_roles())),
             AdminCommand::ShowPrivileges => Ok(show_privileges(&self.security.list_privileges())),
+            AdminCommand::AlterUserPassword { name, password } => {
+                self.run_security(false, false, {
+                    let security = Arc::clone(&self.security);
+                    let (name, password) = (name.clone(), password.clone());
+                    move || async move { security.set_password(&name, &password).await }
+                })
+            }
+            AdminCommand::AlterUserStatus { name, suspended } => self.run_security(false, false, {
+                let security = Arc::clone(&self.security);
+                let (name, suspended) = (name.clone(), *suspended);
+                move || async move { security.set_user_status(&name, suspended).await }
+            }),
+            AdminCommand::RenameUser { from, to } => self.run_security(false, false, {
+                let security = Arc::clone(&self.security);
+                let (from, to) = (from.clone(), to.clone());
+                move || async move { security.rename_user(&from, &to).await }
+            }),
+            AdminCommand::RenameRole { from, to } => self.run_security(false, false, {
+                let security = Arc::clone(&self.security);
+                let (from, to) = (from.clone(), to.clone());
+                move || async move { security.rename_role(&from, &to).await }
+            }),
+
+            // ---- DBMS introspection surface (rmp #637) ----
+            AdminCommand::ShowFunctions => Ok(show_functions()),
+            AdminCommand::ShowProcedures => Ok(show_procedures()),
+            AdminCommand::ShowSettings => Ok(settings_result(&self.config)),
+            AdminCommand::ShowTransactions => Ok(show_transactions(&self.txns.snapshot())),
+            AdminCommand::TerminateTransactions { ids } => {
+                Ok(terminate_transactions(&self.txns.terminate(ids)))
+            }
 
             // ---- Operator backup / restore surface (rmp #149) ----
             AdminCommand::BackupDatabase { name, path } => {
@@ -2470,7 +2771,11 @@ fn admin_command_summary(cmd: &AdminCommand) -> RunSummary {
         | A::ShowDatabase { .. }
         | A::ShowUsers
         | A::ShowRoles
-        | A::ShowPrivileges => RunSummary {
+        | A::ShowPrivileges
+        | A::ShowFunctions
+        | A::ShowProcedures
+        | A::ShowSettings
+        | A::ShowTransactions => RunSummary {
             query_type: Some("r".to_owned()),
             stats: Vec::new(),
         },
@@ -2486,7 +2791,11 @@ fn admin_command_summary(cmd: &AdminCommand) -> RunSummary {
         | A::GrantRole { .. }
         | A::RevokeRole { .. }
         | A::GrantPrivilege { .. }
-        | A::RevokePrivilege { .. } => RunSummary {
+        | A::RevokePrivilege { .. }
+        | A::AlterUserPassword { .. }
+        | A::AlterUserStatus { .. }
+        | A::RenameUser { .. }
+        | A::RenameRole { .. } => RunSummary {
             query_type: Some("s".to_owned()),
             stats: vec![
                 ("system-updates".to_owned(), Value::Integer(1)),
@@ -2494,12 +2803,13 @@ fn admin_command_summary(cmd: &AdminCommand) -> RunSummary {
             ],
         },
         // Operator commands: administrative operations, not countable system-catalog updates.
-        A::BackupDatabase { .. } | A::RestoreDatabase { .. } | A::CheckpointDatabase { .. } => {
-            RunSummary {
-                query_type: Some("s".to_owned()),
-                stats: Vec::new(),
-            }
-        }
+        A::BackupDatabase { .. }
+        | A::RestoreDatabase { .. }
+        | A::CheckpointDatabase { .. }
+        | A::TerminateTransactions { .. } => RunSummary {
+            query_type: Some("s".to_owned()),
+            stats: Vec::new(),
+        },
     }
 }
 
@@ -2539,12 +2849,13 @@ fn show_result(infos: Vec<crate::dbcatalog::DbInfo>) -> AdminResult {
 }
 
 /// Builds the `SHOW USERS` result: `user` (string), `roles` (comma-joined string), `passwordSet`
-/// (bool).
+/// (bool), `suspended` (bool, `rmp` #641).
 fn show_users(users: &[crate::security::UserListing]) -> AdminResult {
     let fields = vec![
         "user".to_owned(),
         "roles".to_owned(),
         "passwordSet".to_owned(),
+        "suspended".to_owned(),
     ];
     let rows = users
         .iter()
@@ -2553,6 +2864,7 @@ fn show_users(users: &[crate::security::UserListing]) -> AdminResult {
                 Value::String(u.name.clone()),
                 Value::String(u.roles.join(", ")),
                 Value::Boolean(u.has_password),
+                Value::Boolean(u.suspended),
             ]
         })
         .collect();
@@ -2592,6 +2904,276 @@ fn show_privileges(privs: &[crate::security::PrivilegeListing]) -> AdminResult {
                 Value::String(p.role.clone()),
                 Value::String(p.action.clone()),
                 Value::String(p.scope.clone()),
+            ]
+        })
+        .collect();
+    AdminResult {
+        fields,
+        rows,
+        summary: RunSummary::default(),
+    }
+}
+
+/// Builds the `SHOW FUNCTIONS` result (`rmp` #637) from the built-in function library
+/// ([`graphus_cypher::function_registry::builtins`]): `name`, `category`, `description`,
+/// `signature`, `isBuiltIn`, `aggregating`.
+///
+/// Only the built-in library is listed (every row has `isBuiltIn = true`). Argument *types* are not
+/// modelled by the registry (its documented v1 scope), so `signature` renders positional argument
+/// names from the accepted arity rather than typed parameters, and `category` is a coarse
+/// classification derived from the function's name/aggregate flag using Neo4j's own category names.
+fn show_functions() -> AdminResult {
+    use graphus_cypher::function_registry as fr;
+    let fields = vec![
+        "name".to_owned(),
+        "category".to_owned(),
+        "description".to_owned(),
+        "signature".to_owned(),
+        "isBuiltIn".to_owned(),
+        "aggregating".to_owned(),
+    ];
+    let rows = fr::builtins()
+        .iter()
+        .map(|sig| {
+            let category = function_category(sig.name, sig.aggregate);
+            vec![
+                Value::String(sig.name.to_owned()),
+                Value::String(category.to_owned()),
+                Value::String(format!("The `{}` built-in function.", sig.name)),
+                Value::String(function_signature_string(sig.name, sig.arity)),
+                Value::Boolean(true),
+                Value::Boolean(sig.aggregate),
+            ]
+        })
+        .collect();
+    AdminResult {
+        fields,
+        rows,
+        summary: RunSummary::default(),
+    }
+}
+
+/// A coarse category (using Neo4j's own category names) for a built-in function, derived from its
+/// name and aggregate flag. Exact per-function categorisation is not modelled in the registry, so
+/// this is a best-effort, documented classification: aggregating functions → `Aggregating`,
+/// temporal/spatial names → `Temporal`/`Spatial`, everything else → `Scalar`.
+fn function_category(name: &str, aggregate: bool) -> &'static str {
+    if aggregate {
+        return "Aggregating";
+    }
+    if name.starts_with("point") {
+        return "Spatial";
+    }
+    if name.starts_with("date")
+        || name.starts_with("datetime")
+        || name.starts_with("time")
+        || name.starts_with("localtime")
+        || name.starts_with("localdatetime")
+        || name.starts_with("duration")
+    {
+        return "Temporal";
+    }
+    "Scalar"
+}
+
+/// Renders a function `signature` string from its name and accepted [`graphus_cypher::function_registry::Arity`].
+/// Argument *types* are not modelled, so arguments are positional placeholders (`argN`, a trailing
+/// `?` for an optional one, `...` for variadic).
+fn function_signature_string(
+    name: &str,
+    arity: graphus_cypher::function_registry::Arity,
+) -> String {
+    use graphus_cypher::function_registry::Arity;
+    let args = match arity {
+        Arity::Exact(n) => (0..n)
+            .map(|i| format!("arg{i}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        Arity::Range(lo, hi) => (0..hi)
+            .map(|i| {
+                if i < lo {
+                    format!("arg{i}")
+                } else {
+                    format!("arg{i}?")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+        Arity::Variadic => "args...".to_owned(),
+    };
+    format!("{name}({args})")
+}
+
+/// Builds the `SHOW PROCEDURES` result (`rmp` #637): `name`, `description`, `signature`, `mode`,
+/// `worksOnSystem`.
+///
+/// Lists the built-in procedures (`db.*`) and the full Graph Data Science surface (`gds.*`), rebuilt
+/// from the same constructors the engine uses ([`graphus_cypher::ProcedureSet::with_builtins`] +
+/// [`graphus_cypher::register_gds_procedures`]). `mode` is `READ` for a reader-safe procedure
+/// (every built-in and GDS procedure is), else `WRITE`. `worksOnSystem` is `false` (these are
+/// graph-level procedures). Deployment-registered sample UDPs are not part of the built-in surface
+/// and are not listed.
+fn show_procedures() -> AdminResult {
+    let fields = vec![
+        "name".to_owned(),
+        "description".to_owned(),
+        "signature".to_owned(),
+        "mode".to_owned(),
+        "worksOnSystem".to_owned(),
+    ];
+    let rows = builtin_procedure_listings()
+        .iter()
+        .map(|p| {
+            vec![
+                Value::String(p.name.clone()),
+                Value::String(format!("The `{}` procedure.", p.name)),
+                Value::String(procedure_signature_string(p)),
+                Value::String(if p.reader_safe { "READ" } else { "WRITE" }.to_owned()),
+                Value::Boolean(false),
+            ]
+        })
+        .collect();
+    AdminResult {
+        fields,
+        rows,
+        summary: RunSummary::default(),
+    }
+}
+
+/// The built-in + GDS procedure listings, rebuilt from the engine's own constructors. Cached: the
+/// set is process-invariant (the GDS catalog handle affects execution, never the listed signatures),
+/// so it is built once on first `SHOW PROCEDURES`.
+fn builtin_procedure_listings() -> &'static [graphus_cypher::ProcedureListing] {
+    static LISTINGS: std::sync::LazyLock<Vec<graphus_cypher::ProcedureListing>> =
+        std::sync::LazyLock::new(|| {
+            let mut set = graphus_cypher::ProcedureSet::with_builtins();
+            graphus_cypher::register_gds_procedures(&mut set, graphus_cypher::new_gds_catalog());
+            set.list()
+        });
+    &LISTINGS
+}
+
+/// Renders a procedure `signature` string from its declared, typed input/output fields (which the
+/// procedure registry *does* model, unlike the function registry): `name(in :: TYPE, …) :: (out ::
+/// TYPE, …)`.
+fn procedure_signature_string(p: &graphus_cypher::ProcedureListing) -> String {
+    let render = |fields: &[graphus_cypher::FieldSpec]| {
+        fields
+            .iter()
+            .map(|f| format!("{} :: {}", f.name, f.ty))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "{}({}) :: ({})",
+        p.name,
+        render(&p.inputs),
+        render(&p.outputs)
+    )
+}
+
+/// Builds the `SHOW SETTINGS` result (`rmp` #637) from the effective configuration: `name`,
+/// `value`, `isDynamic`, `isExplicitlySet`. `isDynamic` is `false` for every setting (Graphus
+/// applies configuration at startup; none is live-reconfigurable). Secrets are already redacted by
+/// [`ServerConfig::effective_settings`].
+fn settings_result(config: &ServerConfig) -> AdminResult {
+    let fields = vec![
+        "name".to_owned(),
+        "value".to_owned(),
+        "isDynamic".to_owned(),
+        "isExplicitlySet".to_owned(),
+    ];
+    let rows = config
+        .effective_settings()
+        .into_iter()
+        .map(|row| {
+            let is_set = row.value.is_some();
+            vec![
+                Value::String(row.name.to_owned()),
+                row.value.map_or(Value::Null, Value::String),
+                Value::Boolean(false),
+                Value::Boolean(is_set),
+            ]
+        })
+        .collect();
+    AdminResult {
+        fields,
+        rows,
+        summary: RunSummary::default(),
+    }
+}
+
+/// Builds the `SHOW TRANSACTIONS` result (`rmp` #637) from the live explicit-transaction registry:
+/// `transactionId`, `database`, `currentQuery`, `username`, `mode`, `status`, `startTime`,
+/// `elapsedTimeMillis`, `protocol`, `clientAddress`. Only explicit (managed) transactions are
+/// tracked; `clientAddress` is `null` when the seam did not record a peer address.
+fn show_transactions(snapshots: &[crate::txn_registry::TxnSnapshot]) -> AdminResult {
+    let fields = vec![
+        "transactionId".to_owned(),
+        "database".to_owned(),
+        "currentQuery".to_owned(),
+        "username".to_owned(),
+        "mode".to_owned(),
+        "status".to_owned(),
+        "startTime".to_owned(),
+        "elapsedTimeMillis".to_owned(),
+        "protocol".to_owned(),
+        "clientAddress".to_owned(),
+    ];
+    let rows = snapshots
+        .iter()
+        .map(|s| {
+            vec![
+                Value::String(s.id.clone()),
+                Value::String(s.database.clone()),
+                s.current_query.clone().map_or(Value::Null, Value::String),
+                s.username.clone().map_or(Value::Null, Value::String),
+                Value::String(s.mode.to_owned()),
+                Value::String(s.status.to_owned()),
+                system_time_to_value(s.started_wall),
+                Value::Integer(i64::try_from(s.elapsed.as_millis()).unwrap_or(i64::MAX)),
+                Value::String(s.protocol.to_owned()),
+                s.client_address.clone().map_or(Value::Null, Value::String),
+            ]
+        })
+        .collect();
+    AdminResult {
+        fields,
+        rows,
+        summary: RunSummary::default(),
+    }
+}
+
+/// Renders a [`SystemTime`](std::time::SystemTime) as a UTC [`Value::LocalDateTime`] (seconds +
+/// nanoseconds since the Unix epoch); a pre-epoch or unrepresentable time falls back to
+/// [`Value::Null`].
+fn system_time_to_value(t: std::time::SystemTime) -> Value {
+    match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => Value::LocalDateTime(graphus_core::LocalDateTime {
+            epoch_seconds: i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+            nanos: d.subsec_nanos(),
+        }),
+        Err(_) => Value::Null,
+    }
+}
+
+/// Builds the `TERMINATE TRANSACTIONS` result (`rmp` #637): one row per requested id —
+/// `transactionId`, `database`, `username`, `message` (`"Terminated"` / `"Transaction not found"`).
+fn terminate_transactions(outcomes: &[crate::txn_registry::TerminateOutcome]) -> AdminResult {
+    let fields = vec![
+        "transactionId".to_owned(),
+        "database".to_owned(),
+        "username".to_owned(),
+        "message".to_owned(),
+    ];
+    let rows = outcomes
+        .iter()
+        .map(|o| {
+            vec![
+                Value::String(o.id.clone()),
+                o.database.clone().map_or(Value::Null, Value::String),
+                o.username.clone().map_or(Value::Null, Value::String),
+                Value::String(o.message.to_owned()),
             ]
         })
         .collect();
@@ -2679,6 +3261,273 @@ mod tests {
             parse_admin_statement(query),
             AdminParse::NotAdmin,
             "{query:?} must pass through to Cypher"
+        );
+    }
+
+    // ---- DBMS introspection surface (rmp #637) --------------------------------------------------
+
+    #[test]
+    fn introspection_show_listings_parse() {
+        assert_eq!(cmd("SHOW FUNCTIONS"), AdminCommand::ShowFunctions);
+        assert_eq!(cmd("SHOW PROCEDURES"), AdminCommand::ShowProcedures);
+        assert_eq!(cmd("SHOW SETTINGS"), AdminCommand::ShowSettings);
+        assert_eq!(cmd("SHOW TRANSACTIONS"), AdminCommand::ShowTransactions);
+        // Case-insensitive keywords + a tolerated trailing `;`.
+        assert_eq!(cmd("show functions"), AdminCommand::ShowFunctions);
+        assert_eq!(cmd("SHOW   Transactions ;"), AdminCommand::ShowTransactions);
+    }
+
+    #[test]
+    fn introspection_rejects_non_show_verb_and_trailing_tokens() {
+        // Only SHOW takes these plurals.
+        assert!(invalid("CREATE FUNCTIONS").contains("SHOW"));
+        assert!(invalid("DROP PROCEDURES").contains("SHOW"));
+        // No trailing tokens.
+        assert!(!invalid("SHOW FUNCTIONS extra").is_empty());
+        // The singular is not a claimed form; it passes through to Cypher untouched.
+        not_admin("SHOW FUNCTION");
+    }
+
+    #[test]
+    fn terminate_transactions_parse() {
+        assert_eq!(
+            cmd("TERMINATE TRANSACTIONS 'graphus-transaction-1'"),
+            AdminCommand::TerminateTransactions {
+                ids: vec!["graphus-transaction-1".to_owned()],
+            }
+        );
+        // Multiple comma-separated ids.
+        assert_eq!(
+            cmd("TERMINATE TRANSACTIONS 'a-transaction-1', 'b-transaction-2'"),
+            AdminCommand::TerminateTransactions {
+                ids: vec!["a-transaction-1".to_owned(), "b-transaction-2".to_owned()],
+            }
+        );
+        // The singular keyword is tolerated (Neo4j-lenient).
+        assert_eq!(
+            cmd("TERMINATE TRANSACTION 'x-transaction-9'"),
+            AdminCommand::TerminateTransactions {
+                ids: vec!["x-transaction-9".to_owned()],
+            }
+        );
+    }
+
+    #[test]
+    fn terminate_transactions_rejects_malformed() {
+        assert!(invalid("TERMINATE TRANSACTIONS").contains("transaction id"));
+        assert!(invalid("TERMINATE").contains("TRANSACTIONS"));
+        // A bare (unquoted) id is not accepted — ids are quoted string literals.
+        assert!(!invalid("TERMINATE TRANSACTIONS foo").is_empty());
+        // A dangling comma with no following id.
+        assert!(!invalid("TERMINATE TRANSACTIONS 'a', ").is_empty());
+    }
+
+    #[test]
+    fn show_functions_result_shape() {
+        let r = show_functions();
+        assert_eq!(
+            r.fields,
+            vec![
+                "name",
+                "category",
+                "description",
+                "signature",
+                "isBuiltIn",
+                "aggregating"
+            ]
+        );
+        // Every built-in is reported (non-empty) and marked isBuiltIn = true.
+        assert!(!r.rows.is_empty());
+        assert_eq!(
+            r.rows.len(),
+            graphus_cypher::function_registry::builtins().len()
+        );
+        for row in &r.rows {
+            assert_eq!(row.len(), 6);
+            assert_eq!(row[4], Value::Boolean(true), "isBuiltIn must be true");
+        }
+        // An aggregating function is categorised + flagged as such.
+        let count_row = r
+            .rows
+            .iter()
+            .find(|row| row[0] == Value::String("count".to_owned()))
+            .expect("count is a built-in");
+        assert_eq!(count_row[1], Value::String("Aggregating".to_owned()));
+        assert_eq!(count_row[5], Value::Boolean(true));
+    }
+
+    #[test]
+    fn show_procedures_result_includes_builtins_and_gds() {
+        let r = show_procedures();
+        assert_eq!(
+            r.fields,
+            vec!["name", "description", "signature", "mode", "worksOnSystem"]
+        );
+        let names: Vec<&Value> = r.rows.iter().map(|row| &row[0]).collect();
+        assert!(names.contains(&&Value::String("db.labels".to_owned())));
+        // The GDS surface is listed (rebuilt from the engine's own constructors).
+        assert!(
+            r.rows
+                .iter()
+                .any(|row| matches!(&row[0], Value::String(n) if n.starts_with("gds."))),
+            "SHOW PROCEDURES must include the gds.* surface"
+        );
+        for row in &r.rows {
+            assert_eq!(row.len(), 5);
+            // db.* + gds.* are all reader-safe → mode READ.
+            assert_eq!(row[3], Value::String("READ".to_owned()));
+            assert_eq!(row[4], Value::Boolean(false));
+        }
+    }
+
+    #[test]
+    fn show_settings_redacts_secrets_and_uses_dotted_names() {
+        let cfg = ServerConfig::default();
+        let r = settings_result(&cfg);
+        assert_eq!(
+            r.fields,
+            vec!["name", "value", "isDynamic", "isExplicitlySet"]
+        );
+        // Dotted, canonical names are present.
+        let names: Vec<String> = r
+            .rows
+            .iter()
+            .map(|row| match &row[0] {
+                Value::String(s) => s.clone(),
+                other => panic!("name must be a string, got {other:?}"),
+            })
+            .collect();
+        assert!(names.iter().any(|n| n == "admission.reader_threads"));
+        assert!(names.iter().any(|n| n == "timing.statement_timeout_ms"));
+        // jwt_secret is present but redacted (never its value).
+        let jwt = r
+            .rows
+            .iter()
+            .find(|row| row[0] == Value::String("jwt_secret".to_owned()))
+            .expect("jwt_secret is listed");
+        assert_eq!(jwt[1], Value::String("<redacted>".to_owned()));
+        // Every setting is startup-only (isDynamic = false).
+        for row in &r.rows {
+            assert_eq!(row[2], Value::Boolean(false));
+        }
+    }
+
+    #[test]
+    fn introspection_summaries_are_read_only_and_terminate_is_system() {
+        use crate::audit::is_mutating_admin;
+        for c in [
+            AdminCommand::ShowFunctions,
+            AdminCommand::ShowProcedures,
+            AdminCommand::ShowSettings,
+            AdminCommand::ShowTransactions,
+        ] {
+            assert_eq!(admin_command_summary(&c).query_type.as_deref(), Some("r"));
+            assert!(!is_mutating_admin(&c), "SHOW * is read-only");
+        }
+        let term = AdminCommand::TerminateTransactions { ids: vec![] };
+        assert_eq!(
+            admin_command_summary(&term).query_type.as_deref(),
+            Some("s")
+        );
+        assert!(
+            is_mutating_admin(&term),
+            "TERMINATE mutates transaction state"
+        );
+    }
+
+    // ---- Security DDL: ALTER USER + RENAME (rmp #641) -------------------------------------------
+
+    #[test]
+    fn alter_user_set_password_parses() {
+        assert_eq!(
+            cmd("ALTER USER alice SET PASSWORD 'secret'"),
+            AdminCommand::AlterUserPassword {
+                name: "alice".to_owned(),
+                password: "secret".to_owned(),
+            }
+        );
+        // A backtick-quoted name + a password containing spaces.
+        assert_eq!(
+            cmd("ALTER USER `weird name` SET PASSWORD 'p a s s'"),
+            AdminCommand::AlterUserPassword {
+                name: "weird name".to_owned(),
+                password: "p a s s".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn alter_user_set_status_parses() {
+        assert_eq!(
+            cmd("ALTER USER alice SET STATUS SUSPENDED"),
+            AdminCommand::AlterUserStatus {
+                name: "alice".to_owned(),
+                suspended: true,
+            }
+        );
+        assert_eq!(
+            cmd("ALTER USER alice SET STATUS ACTIVE"),
+            AdminCommand::AlterUserStatus {
+                name: "alice".to_owned(),
+                suspended: false,
+            }
+        );
+    }
+
+    #[test]
+    fn alter_user_requires_a_supported_set_clause() {
+        // A SET clause is mandatory; `ALTER USER x` alone is a syntax error.
+        assert!(invalid("ALTER USER alice").contains("SET"));
+        // An unsupported clause is rejected clearly (not silently ignored).
+        assert!(invalid("ALTER USER alice SET HOME DATABASE db").contains("PASSWORD or STATUS"));
+        assert!(invalid("ALTER USER alice SET STATUS BOGUS").contains("ACTIVE or SUSPENDED"));
+        assert!(!invalid("ALTER DATABASE x").is_empty());
+    }
+
+    #[test]
+    fn rename_user_and_role_parse() {
+        assert_eq!(
+            cmd("RENAME USER alice TO alicia"),
+            AdminCommand::RenameUser {
+                from: "alice".to_owned(),
+                to: "alicia".to_owned(),
+            }
+        );
+        assert_eq!(
+            cmd("RENAME ROLE reader TO viewer"),
+            AdminCommand::RenameRole {
+                from: "reader".to_owned(),
+                to: "viewer".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn rename_rejects_malformed() {
+        assert!(invalid("RENAME USER alice").contains("TO"));
+        assert!(invalid("RENAME alice TO bob").contains("USER or ROLE"));
+        assert!(!invalid("RENAME USER alice TO bob extra").is_empty());
+    }
+
+    #[test]
+    fn alter_rename_never_swallow_cypher() {
+        // These verbs are claimed only as security DDL; a MATCH/RETURN using them as identifiers is
+        // not affected because ALTER/RENAME are never valid Cypher statement starts.
+        not_admin("MATCH (n) RETURN n");
+    }
+
+    #[test]
+    fn alter_password_redaction_never_leaks() {
+        use crate::audit::redact_admin_detail;
+        let c = AdminCommand::AlterUserPassword {
+            name: "alice".to_owned(),
+            password: "topsecret".to_owned(),
+        };
+        let detail = redact_admin_detail(&c);
+        assert!(detail.contains("<redacted>"));
+        assert!(
+            !detail.contains("topsecret"),
+            "the password must never be logged"
         );
     }
 

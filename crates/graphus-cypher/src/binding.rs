@@ -603,7 +603,10 @@ fn params_in_expr(expr: &Expr, ty: ParamType, record: &mut impl FnMut(&str, Para
             params_in_expr(lhs, ParamType::Any, record);
             params_in_expr(rhs, ParamType::Any, record);
         }
-        ExprKind::Unary { operand, .. } | ExprKind::HasLabels { operand, .. } => {
+        ExprKind::Unary { operand, .. }
+        | ExprKind::HasLabels { operand, .. }
+        | ExprKind::TypePredicate { operand, .. }
+        | ExprKind::NormalizedPredicate { operand, .. } => {
             params_in_expr(operand, ParamType::Any, record);
         }
         ExprKind::Predicate { operand, rhs, .. } => {

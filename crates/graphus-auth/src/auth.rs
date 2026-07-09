@@ -235,6 +235,10 @@ impl Authenticator {
     /// - [`AuthError::Unauthenticated`] on a wrong/missing password or unknown user.
     /// - [`AuthError::PasswordHash`] only if the stored hash is corrupt (operational fault).
     pub fn authenticate_password(&self, user: &str, plaintext: &str) -> Result<String> {
+        // A suspended account is rejected regardless of an otherwise-valid password (rmp #641).
+        if self.catalog.is_user_suspended(user) {
+            return Err(AuthError::Unauthenticated);
+        }
         if self.verify_password(user, plaintext)? {
             Ok(user.to_owned())
         } else {
@@ -273,6 +277,10 @@ impl Authenticator {
         // (3) Targeted revocation: a denylisted `jti` is rejected even while signed, unexpired, and
         // at the current epoch.
         if self.revoked_jtis.contains(&claims.jti) {
+            return Err(AuthError::Unauthenticated);
+        }
+        // (4) Suspension (rmp #641): a suspended account is rejected even with a valid, current token.
+        if self.catalog.is_user_suspended(&claims.sub) {
             return Err(AuthError::Unauthenticated);
         }
         Ok(claims)
@@ -332,7 +340,8 @@ impl Authenticator {
     /// mapped username is not a current catalog user.
     pub fn authenticate_peer(&self, source: &impl PeerCredSource) -> Result<String> {
         let user = self.peers.authenticate(source)?;
-        if self.catalog.has_user(&user) {
+        // The user must exist AND not be suspended (rmp #641).
+        if self.catalog.has_user(&user) && !self.catalog.is_user_suspended(&user) {
             Ok(user)
         } else {
             Err(AuthError::Unauthenticated)
@@ -515,6 +524,57 @@ mod tests {
             a.authenticate_password("alice", "new-strong-password")
                 .unwrap(),
             "alice"
+        );
+    }
+
+    #[test]
+    fn suspension_blocks_every_authentication_path() {
+        let mut a = fixture();
+        // A valid Bearer token minted while active.
+        let token = a.issue_token("alice", 1_000, 3_600).unwrap();
+
+        // Active: all three paths authenticate.
+        assert!(a.authenticate_password("alice", "alice-pw").is_ok());
+        assert!(a.authenticate_bearer(&token, 1_100).is_ok());
+        assert!(
+            a.authenticate_peer(&FixedPeer(PeerCred {
+                uid: 1000,
+                gid: 1000,
+                pid: 1
+            }))
+            .is_ok()
+        );
+
+        // Suspend: every path is rejected regardless of otherwise-valid credentials (rmp #641).
+        a.catalog_mut().set_user_suspended("alice", true).unwrap();
+        assert!(matches!(
+            a.authenticate_password("alice", "alice-pw"),
+            Err(AuthError::Unauthenticated)
+        ));
+        assert!(matches!(
+            a.authenticate_bearer(&token, 1_100),
+            Err(AuthError::Unauthenticated)
+        ));
+        assert!(matches!(
+            a.authenticate_peer(&FixedPeer(PeerCred {
+                uid: 1000,
+                gid: 1000,
+                pid: 1
+            })),
+            Err(AuthError::Unauthenticated)
+        ));
+
+        // Reactivate: all three paths work again.
+        a.catalog_mut().set_user_suspended("alice", false).unwrap();
+        assert!(a.authenticate_password("alice", "alice-pw").is_ok());
+        assert!(a.authenticate_bearer(&token, 1_100).is_ok());
+        assert!(
+            a.authenticate_peer(&FixedPeer(PeerCred {
+                uid: 1000,
+                gid: 1000,
+                pid: 1
+            }))
+            .is_ok()
         );
     }
 

@@ -468,10 +468,16 @@ pub struct User {
     /// password has never changed. Persisted durably by the server's security catalog so the epoch
     /// survives restarts (a token that outlived a restart-spanning reset stays revoked).
     pub credential_version: u64,
+    /// Whether the account is **suspended** (`ALTER USER … SET STATUS SUSPENDED`, `rmp` #641). A
+    /// suspended user is rejected at every authentication entry point (password / Bearer / UDS
+    /// peer-cred) regardless of otherwise-valid credentials, without dropping the account —
+    /// reversible with `SET STATUS ACTIVE`. `false` (active) for a user that has never been
+    /// suspended, so existing security files stay forward-compatible.
+    pub suspended: bool,
 }
 
 impl User {
-    /// Creates a user with no roles, no password, and credential epoch `0`.
+    /// Creates an active user with no roles, no password, and credential epoch `0`.
     #[must_use]
     pub fn new(name: impl Into<String>) -> Self {
         Self {
@@ -479,6 +485,7 @@ impl User {
             roles: BTreeSet::new(),
             password_hash: None,
             credential_version: 0,
+            suspended: false,
         }
     }
 }
@@ -584,6 +591,31 @@ impl Catalog {
         self.users.get(name).map(|u| u.credential_version)
     }
 
+    /// Sets a user's **suspended** flag (`ALTER USER … SET STATUS`, `rmp` #641). A suspended user is
+    /// rejected at every authentication entry point until reactivated. Also the load path of the
+    /// durable security catalog (restoring the persisted status).
+    ///
+    /// # Errors
+    /// [`AuthError::NotFound`] if the user does not exist.
+    pub fn set_user_suspended(&mut self, name: &str, suspended: bool) -> Result<()> {
+        let user = self
+            .users
+            .get_mut(name)
+            .ok_or_else(|| AuthError::NotFound {
+                what: format!("user {name}"),
+            })?;
+        user.suspended = suspended;
+        Ok(())
+    }
+
+    /// Whether a user is currently **suspended** (`rmp` #641). A non-existent user is reported as not
+    /// suspended (the authentication path fails it independently, on liveness), so this is safe to
+    /// consult as a deny-gate.
+    #[must_use]
+    pub fn is_user_suspended(&self, name: &str) -> bool {
+        self.users.get(name).is_some_and(|u| u.suspended)
+    }
+
     /// Increments the user's **credential epoch** (token version, SEC-180), invalidating every Bearer
     /// token issued under the previous epoch. Called on every password change so a credential reset
     /// performs a forced logout of outstanding tokens. Saturating (never wraps).
@@ -651,6 +683,71 @@ impl Catalog {
         }
         for user in self.users.values_mut() {
             user.roles.remove(name);
+        }
+        Ok(())
+    }
+
+    /// Renames a user, preserving its roles, password hash, and credential epoch. A no-op self-rename
+    /// (`from == to`) succeeds iff the user exists.
+    ///
+    /// # Errors
+    /// [`AuthError::NotFound`] if `from` does not exist; [`AuthError::AlreadyExists`] if `to` is
+    /// already taken.
+    pub fn rename_user(&mut self, from: &str, to: &str) -> Result<()> {
+        if from == to {
+            return if self.users.contains_key(from) {
+                Ok(())
+            } else {
+                Err(AuthError::NotFound {
+                    what: format!("user {from}"),
+                })
+            };
+        }
+        if self.users.contains_key(to) {
+            return Err(AuthError::AlreadyExists {
+                what: format!("user {to}"),
+            });
+        }
+        let mut user = self.users.remove(from).ok_or_else(|| AuthError::NotFound {
+            what: format!("user {from}"),
+        })?;
+        user.name = to.to_owned();
+        self.users.insert(to.to_owned(), user);
+        Ok(())
+    }
+
+    /// Renames a role, rewriting every user's membership that referenced the old name so the catalog
+    /// stays internally consistent (no user can reference a role that no longer exists). A no-op
+    /// self-rename (`from == to`) succeeds iff the role exists.
+    ///
+    /// # Errors
+    /// [`AuthError::NotFound`] if `from` does not exist; [`AuthError::AlreadyExists`] if `to` is
+    /// already taken.
+    pub fn rename_role(&mut self, from: &str, to: &str) -> Result<()> {
+        if from == to {
+            return if self.roles.contains_key(from) {
+                Ok(())
+            } else {
+                Err(AuthError::NotFound {
+                    what: format!("role {from}"),
+                })
+            };
+        }
+        if self.roles.contains_key(to) {
+            return Err(AuthError::AlreadyExists {
+                what: format!("role {to}"),
+            });
+        }
+        let mut role = self.roles.remove(from).ok_or_else(|| AuthError::NotFound {
+            what: format!("role {from}"),
+        })?;
+        role.name = to.to_owned();
+        self.roles.insert(to.to_owned(), role);
+        // Rewrite every membership referencing the old name.
+        for user in self.users.values_mut() {
+            if user.roles.remove(from) {
+                user.roles.insert(to.to_owned());
+            }
         }
         Ok(())
     }
@@ -1305,5 +1402,58 @@ mod tests {
             c.revoke_role("ghost", "x"),
             Err(AuthError::NotFound { .. })
         ));
+    }
+
+    #[test]
+    fn rename_user_preserves_roles_and_password() {
+        let mut c = Catalog::new();
+        c.create_role("reader").unwrap();
+        c.create_user("alice").unwrap();
+        c.grant_role("alice", "reader").unwrap();
+        c.set_user_password_hash("alice", Some("$argon2$hash".to_owned()))
+            .unwrap();
+
+        c.rename_user("alice", "alicia").unwrap();
+        assert!(!c.has_user("alice"));
+        let renamed = c.user("alicia").expect("renamed user exists");
+        assert_eq!(renamed.name, "alicia");
+        assert!(renamed.roles.contains("reader"));
+        assert_eq!(renamed.password_hash.as_deref(), Some("$argon2$hash"));
+    }
+
+    #[test]
+    fn rename_user_rejects_collisions_and_unknowns() {
+        let mut c = Catalog::new();
+        c.create_user("alice").unwrap();
+        c.create_user("bob").unwrap();
+        assert!(matches!(
+            c.rename_user("alice", "bob"),
+            Err(AuthError::AlreadyExists { .. })
+        ));
+        assert!(matches!(
+            c.rename_user("ghost", "x"),
+            Err(AuthError::NotFound { .. })
+        ));
+        // A no-op self-rename succeeds when the user exists.
+        c.rename_user("alice", "alice").unwrap();
+    }
+
+    #[test]
+    fn rename_role_rewrites_memberships() {
+        let mut c = Catalog::new();
+        c.create_role("reader").unwrap();
+        c.grant_privilege("reader", Privilege::new(Action::Read, Resource::Database))
+            .unwrap();
+        c.create_user("alice").unwrap();
+        c.grant_role("alice", "reader").unwrap();
+
+        c.rename_role("reader", "viewer").unwrap();
+        assert!(!c.has_role("reader"));
+        assert!(c.has_role("viewer"));
+        // The membership was rewritten, so the user keeps the privilege under the new role name.
+        let alice = c.user("alice").unwrap();
+        assert!(alice.roles.contains("viewer"));
+        assert!(!alice.roles.contains("reader"));
+        assert!(c.authorize("alice", &Privilege::new(Action::Read, Resource::Database)));
     }
 }

@@ -3073,9 +3073,10 @@ fn expr_references_var(expr: &Expr, variable: &str) -> bool {
         ExprKind::Binary { lhs, rhs, .. } => {
             expr_references_var(lhs, variable) || expr_references_var(rhs, variable)
         }
-        ExprKind::Unary { operand, .. } | ExprKind::HasLabels { operand, .. } => {
-            expr_references_var(operand, variable)
-        }
+        ExprKind::Unary { operand, .. }
+        | ExprKind::HasLabels { operand, .. }
+        | ExprKind::TypePredicate { operand, .. }
+        | ExprKind::NormalizedPredicate { operand, .. } => expr_references_var(operand, variable),
         ExprKind::Predicate { operand, rhs, .. } => {
             expr_references_var(operand, variable)
                 || rhs

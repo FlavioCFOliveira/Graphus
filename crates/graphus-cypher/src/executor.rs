@@ -2863,7 +2863,9 @@ fn expr_references_var(expr: &Expr, var: &str) -> bool {
                 || low.as_deref().is_some_and(|e| expr_references_var(e, var))
                 || high.as_deref().is_some_and(|e| expr_references_var(e, var))
         }
-        ExprKind::HasLabels { operand, .. } => expr_references_var(operand, var),
+        ExprKind::HasLabels { operand, .. }
+        | ExprKind::TypePredicate { operand, .. }
+        | ExprKind::NormalizedPredicate { operand, .. } => expr_references_var(operand, var),
         ExprKind::FunctionCall { args, .. } => args.iter().any(|a| expr_references_var(a, var)),
         ExprKind::List(items) => items.iter().any(|e| expr_references_var(e, var)),
         ExprKind::Map(entries) => entries.iter().any(|(_, v)| expr_references_var(v, var)),
@@ -4865,6 +4867,24 @@ fn extract_aggregates(expr: &Expr, subs: &mut Vec<(String, Expr)>, col: usize) -
         ExprKind::HasLabels { operand, expr } => ExprKind::HasLabels {
             operand: rewrite(operand, subs),
             expr: expr.clone(),
+        },
+        ExprKind::TypePredicate {
+            operand,
+            negated,
+            type_expr,
+        } => ExprKind::TypePredicate {
+            operand: rewrite(operand, subs),
+            negated: *negated,
+            type_expr: type_expr.clone(),
+        },
+        ExprKind::NormalizedPredicate {
+            operand,
+            negated,
+            form,
+        } => ExprKind::NormalizedPredicate {
+            operand: rewrite(operand, subs),
+            negated: *negated,
+            form: *form,
         },
         ExprKind::Property { base, key } => ExprKind::Property {
             base: rewrite(base, subs),

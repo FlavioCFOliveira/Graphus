@@ -192,12 +192,18 @@ pub async fn start_all(
     // The shared database-targeting + admin-statement context (rmp #84/#92). One per server: both
     // Bolt loops clone it per connection, the REST adapter holds one. It carries the live
     // `SecurityCatalog` (admin authorization + security-command execution + persistence).
+    // The server-wide live explicit-transaction registry (rmp #637), shared by both connectivity
+    // seams: each registers its managed (BEGIN…COMMIT) transactions here so `SHOW TRANSACTIONS` /
+    // `TERMINATE TRANSACTIONS` see one cross-seam view.
+    let transactions = Arc::new(crate::txn_registry::TransactionRegistry::new());
     let context = AdminContext::new(
         Arc::clone(&catalog),
         Arc::clone(&security),
         Arc::clone(&audit),
         tokio::runtime::Handle::current(),
         engine.clone(),
+        Arc::new(config.clone()),
+        Arc::clone(&transactions),
     );
 
     // ---- UDS-Bolt (peer-cred, no TLS) ----

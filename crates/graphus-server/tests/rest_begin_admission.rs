@@ -155,6 +155,8 @@ async fn boot(temp: &TempStore) -> (Router, String, Arc<Metrics>) {
         audit,
         tokio::runtime::Handle::current(),
         handle,
+        std::sync::Arc::new(graphus_server::config::ServerConfig::default()),
+        std::sync::Arc::new(graphus_server::txn_registry::TransactionRegistry::new()),
     );
 
     let clock: Arc<dyn Clock + Send + Sync> = Arc::new(FixedClock(AtomicU64::new(FIXED_NANOS)));

@@ -32,7 +32,7 @@ use graphus_core::Value;
 
 use crate::ast::{
     BinaryOp, CaseExpr, Expr, ExprKind, LabelExpr, Literal, MapKey, MapProjectionSelector,
-    PredicateOp, UnaryOp,
+    NormalForm, PredefinedType, PredicateOp, TypeExpr, UnaryOp,
 };
 use crate::binding::BoundParameters;
 use crate::equality::{equals, is_in};
@@ -242,6 +242,35 @@ pub fn eval(
         ExprKind::HasLabels { operand, expr } => {
             let base = eval(operand, row, params, graph, functions, clock)?;
             Ok(ternary_value(eval_label_expr(&base, expr, graph)))
+        }
+
+        // A type predicate `expr IS [NOT] :: <type>` (`rmp` #636) is a *total* boolean: even a null
+        // operand yields `true`/`false` (a null satisfies every nullable type), never `null`.
+        ExprKind::TypePredicate {
+            operand,
+            negated,
+            type_expr,
+        } => {
+            let value = eval(operand, row, params, graph, functions, clock)?;
+            let conforms = value_conforms_to_type(&value, type_expr);
+            Ok(RowValue::Value(Value::Boolean(conforms != *negated)))
+        }
+        // A normalization predicate `expr IS [NOT] [<form>] NORMALIZED` (`rmp` #636) is defined only
+        // on strings: a null or non-`STRING` operand yields `null` (per Neo4j), otherwise the boolean
+        // (negated for the `IS NOT` form).
+        ExprKind::NormalizedPredicate {
+            operand,
+            negated,
+            form,
+        } => {
+            let value = eval(operand, row, params, graph, functions, clock)?;
+            match value.as_value() {
+                Some(Value::String(s)) => {
+                    let normalized = is_string_normalized(s, *form);
+                    Ok(RowValue::Value(Value::Boolean(normalized != *negated)))
+                }
+                _ => Ok(RowValue::NULL),
+            }
         }
 
         ExprKind::FunctionCall {
@@ -1096,6 +1125,119 @@ fn eval_predicate(
                 _ => Ok(RowValue::NULL),
             }
         }
+    }
+}
+
+/// Whether a fully-evaluated [`RowValue`] conforms to a declared [`TypeExpr`] (`rmp` #636, the
+/// `IS :: <type>` predicate).
+///
+/// Every Cypher type is **nullable** by default, so a `null` value conforms to any type unless it
+/// carries a trailing `NOT NULL` (or is the empty [`Nothing`](TypeExpr::Nothing) type). A non-null
+/// value conforms iff its runtime shape matches the type's nominal part: structural values (nodes,
+/// relationships, paths, and structural lists/maps that carry them) match only the corresponding
+/// structural type, and every property value is dispatched to [`value_conforms`].
+fn value_conforms_to_type(rv: &RowValue, ty: &TypeExpr) -> bool {
+    match rv {
+        RowValue::Value(v) => value_conforms(v, ty),
+        RowValue::Node(_) => structural_conforms(ty, PredefinedType::Node),
+        RowValue::Rel(_) => structural_conforms(ty, PredefinedType::Relationship),
+        RowValue::Path(_) => structural_conforms(ty, PredefinedType::Path),
+        RowValue::Map(_) => structural_conforms(ty, PredefinedType::Map),
+        RowValue::List(items) => structural_list_conforms(items, ty),
+    }
+}
+
+/// Type conformance of a **non-null structural scalar** (node / relationship / path / structural
+/// map) against `ty`: it matches `ANY`, a union with a matching member, or exactly the predefined
+/// `kind`. It is never `null`, and never conforms to `NOTHING`, `NULL`, or a list type.
+fn structural_conforms(ty: &TypeExpr, kind: PredefinedType) -> bool {
+    match ty {
+        TypeExpr::Any { .. } => true,
+        TypeExpr::Union(members) => members.iter().any(|m| structural_conforms(m, kind)),
+        TypeExpr::Predefined { name, .. } => *name == kind,
+        TypeExpr::List { .. } | TypeExpr::Nothing | TypeExpr::Null => false,
+    }
+}
+
+/// Type conformance of a **non-null structural list** (one carrying nodes/relationships/paths)
+/// against `ty`: it matches `ANY`, a union with a matching member, or a `LIST<inner>` whose every
+/// element conforms to `inner`. A `MAP`, `PROPERTY VALUE`, or scalar predefined type never matches a
+/// list. An empty list trivially conforms to any `LIST<inner>` (including `LIST<NOTHING>`).
+fn structural_list_conforms(items: &[RowValue], ty: &TypeExpr) -> bool {
+    match ty {
+        TypeExpr::Any { .. } => true,
+        TypeExpr::Union(members) => members.iter().any(|m| structural_list_conforms(items, m)),
+        TypeExpr::List { inner, .. } => items.iter().all(|it| value_conforms_to_type(it, inner)),
+        TypeExpr::Predefined { .. } | TypeExpr::Nothing | TypeExpr::Null => false,
+    }
+}
+
+/// Type conformance of a property [`Value`] against `ty` (`rmp` #636). This is where nullability is
+/// resolved: [`Value::Null`] conforms iff the type admits null (nullable, or the `NULL` type).
+fn value_conforms(v: &Value, ty: &TypeExpr) -> bool {
+    match ty {
+        TypeExpr::Union(members) => members.iter().any(|m| value_conforms(v, m)),
+        TypeExpr::Any { not_null } => !*not_null || !v.is_null(),
+        TypeExpr::Nothing => false,
+        TypeExpr::Null => v.is_null(),
+        TypeExpr::List { inner, not_null } => {
+            if v.is_null() {
+                return !*not_null;
+            }
+            match v {
+                Value::List(items) => items.iter().all(|it| value_conforms(it, inner)),
+                // Graphus models a byte string as a `LIST<INTEGER NOT NULL>` of its byte values; the
+                // stack-allocated `Value::Integer` per byte carries no heap allocation.
+                Value::Bytes(bytes) => bytes
+                    .iter()
+                    .all(|&b| value_conforms(&Value::Integer(i64::from(b)), inner)),
+                _ => false,
+            }
+        }
+        TypeExpr::Predefined { name, not_null } => {
+            if v.is_null() {
+                return !*not_null;
+            }
+            value_predefined_admits(v, *name)
+        }
+    }
+}
+
+/// Whether a **non-null** property [`Value`] matches the predefined nominal type `name` (`rmp` #636).
+fn value_predefined_admits(v: &Value, name: PredefinedType) -> bool {
+    use PredefinedType as P;
+    match name {
+        P::Boolean => matches!(v, Value::Boolean(_)),
+        P::Integer => matches!(v, Value::Integer(_)),
+        P::Float => matches!(v, Value::Float(_)),
+        P::String => matches!(v, Value::String(_)),
+        P::Date => matches!(v, Value::Date(_)),
+        P::LocalTime => matches!(v, Value::LocalTime(_)),
+        P::ZonedTime => matches!(v, Value::ZonedTime(_)),
+        P::LocalDateTime => matches!(v, Value::LocalDateTime(_)),
+        P::ZonedDateTime => matches!(v, Value::ZonedDateTime(_)),
+        P::Duration => matches!(v, Value::Duration(_)),
+        P::Point => matches!(v, Value::Point(_)),
+        P::Map => matches!(v, Value::Map(_)),
+        // `PROPERTY VALUE` is any storable property value — every non-null value except a map (maps
+        // are not a storable property type in the LPG model). A byte string is storable.
+        P::PropertyValue => !matches!(v, Value::Null | Value::Map(_)),
+        // A property value is never a graph entity or path (those are structural `RowValue`s handled
+        // in `value_conforms_to_type`, never a `Value`).
+        P::Node | P::Relationship | P::Path => false,
+    }
+}
+
+/// Whether `s` is already in the Unicode normalization `form` (`rmp` #636, the `IS NORMALIZED`
+/// predicate). Uses the `unicode-normalization` quick-check functions, which run without allocating
+/// when the string is already normalized.
+fn is_string_normalized(s: &str, form: NormalForm) -> bool {
+    use unicode_normalization::{is_nfc, is_nfd, is_nfkc, is_nfkd};
+    match form {
+        NormalForm::Nfc => is_nfc(s),
+        NormalForm::Nfd => is_nfd(s),
+        NormalForm::Nfkc => is_nfkc(s),
+        NormalForm::Nfkd => is_nfkd(s),
     }
 }
 
@@ -5653,5 +5795,158 @@ mod tests {
     /// A `Value::String` shorthand for the assertions above.
     fn s(v: &str) -> Value {
         Value::String(v.to_owned())
+    }
+
+    // --- `rmp` #636: type predicate (`IS :: <type>`) evaluation ---------------------------------
+
+    fn b(v: bool) -> Value {
+        Value::Boolean(v)
+    }
+
+    #[test]
+    fn type_predicate_scalar_matches_and_mismatches() {
+        assert_eq!(evaluate("1 IS :: INTEGER"), b(true));
+        assert_eq!(evaluate("1 IS :: STRING"), b(false));
+        assert_eq!(evaluate("1 IS NOT :: STRING"), b(true));
+        assert_eq!(evaluate("1 IS NOT :: INTEGER"), b(false));
+        assert_eq!(evaluate("1.5 IS :: FLOAT"), b(true));
+        // No integer -> float widening: `1 IS :: FLOAT` is exact and false.
+        assert_eq!(evaluate("1 IS :: FLOAT"), b(false));
+        assert_eq!(evaluate("'x' IS :: STRING"), b(true));
+        assert_eq!(evaluate("true IS :: BOOLEAN"), b(true));
+        assert_eq!(evaluate("true IS :: INTEGER"), b(false));
+    }
+
+    #[test]
+    fn type_predicate_bare_and_typed_syntaxes_agree() {
+        // The bare `expr :: TYPE` and the `IS TYPED` alias behave like `IS ::`.
+        assert_eq!(evaluate("1 :: INTEGER"), b(true));
+        assert_eq!(evaluate("1 IS TYPED INTEGER"), b(true));
+        assert_eq!(evaluate("1 IS NOT TYPED STRING"), b(true));
+    }
+
+    #[test]
+    fn type_predicate_null_and_nullability() {
+        // Every type is nullable by default: a null satisfies it.
+        assert_eq!(evaluate("null IS :: INTEGER"), b(true));
+        assert_eq!(evaluate("null IS :: BOOLEAN"), b(true));
+        // `NOT NULL` excludes null.
+        assert_eq!(evaluate("null IS :: INTEGER NOT NULL"), b(false));
+        assert_eq!(evaluate("null IS :: BOOLEAN NOT NULL"), b(false));
+        assert_eq!(evaluate("1 IS :: INTEGER NOT NULL"), b(true));
+        // The negation is a pure boolean flip, including for null.
+        assert_eq!(evaluate("null IS NOT :: STRING"), b(false));
+        assert_eq!(evaluate("(null + 1) IS NOT :: DATE NOT NULL"), b(true));
+    }
+
+    #[test]
+    fn type_predicate_special_types() {
+        // ANY matches everything (including null); NOTHING matches nothing; NULL matches only null.
+        assert_eq!(evaluate("1 IS :: ANY"), b(true));
+        assert_eq!(evaluate("null IS :: ANY"), b(true));
+        assert_eq!(evaluate("1 IS :: NOTHING"), b(false));
+        assert_eq!(evaluate("null IS :: NOTHING"), b(false));
+        assert_eq!(evaluate("null IS :: NULL"), b(true));
+        assert_eq!(evaluate("1 IS :: NULL"), b(false));
+        assert_eq!(evaluate("1 IS :: ANY NOT NULL"), b(true));
+        assert_eq!(evaluate("null IS :: ANY NOT NULL"), b(false));
+    }
+
+    #[test]
+    fn type_predicate_lists() {
+        assert_eq!(evaluate("[1, 2] IS :: LIST<INTEGER>"), b(true));
+        assert_eq!(evaluate("[1, 2.0] IS :: LIST<INTEGER>"), b(false));
+        assert_eq!(evaluate("[1, 2.0] IS :: LIST<INTEGER | FLOAT>"), b(true));
+        // An empty list matches every element type, even NOTHING.
+        assert_eq!(evaluate("[] IS :: LIST<INTEGER>"), b(true));
+        assert_eq!(evaluate("[] IS :: LIST<NOTHING>"), b(true));
+        // Element nullability.
+        assert_eq!(evaluate("[1, null] IS :: LIST<INTEGER>"), b(true));
+        assert_eq!(evaluate("[1, null] IS :: LIST<INTEGER NOT NULL>"), b(false));
+        // ARRAY<...> is a synonym for LIST<...>.
+        assert_eq!(evaluate("[1, 2] IS :: ARRAY<INTEGER>"), b(true));
+        // Nested lists.
+        assert_eq!(evaluate("[[1], [2]] IS :: LIST<LIST<INTEGER>>"), b(true));
+    }
+
+    #[test]
+    fn type_predicate_unions() {
+        assert_eq!(evaluate("1 IS :: INTEGER | FLOAT"), b(true));
+        assert_eq!(evaluate("1.0 IS :: INTEGER | FLOAT"), b(true));
+        assert_eq!(evaluate("'x' IS :: INTEGER | FLOAT"), b(false));
+        // ANY<...> closed dynamic union.
+        assert_eq!(evaluate("'x' IS :: ANY<INTEGER | STRING>"), b(true));
+        // A null satisfies a union whose member is nullable.
+        assert_eq!(evaluate("null IS :: INTEGER | STRING"), b(true));
+        assert_eq!(
+            evaluate("null IS :: INTEGER NOT NULL | STRING NOT NULL"),
+            b(false)
+        );
+    }
+
+    #[test]
+    fn type_predicate_synonyms() {
+        assert_eq!(evaluate("1 IS :: INT"), b(true));
+        assert_eq!(evaluate("1 IS :: SIGNED INTEGER"), b(true));
+        assert_eq!(evaluate("true IS :: BOOL"), b(true));
+        assert_eq!(evaluate("'x' IS :: VARCHAR"), b(true));
+    }
+
+    #[test]
+    fn type_predicate_temporal_and_point_and_map() {
+        assert_eq!(evaluate("date('2020-01-01') IS :: DATE"), b(true));
+        assert_eq!(evaluate("date('2020-01-01') IS :: LOCAL TIME"), b(false));
+        assert_eq!(
+            evaluate("localdatetime('2020-01-01T00:00') IS :: LOCAL DATETIME"),
+            b(true)
+        );
+        assert_eq!(evaluate("duration('P1D') IS :: DURATION"), b(true));
+        assert_eq!(evaluate("point({x: 1, y: 2}) IS :: POINT"), b(true));
+        assert_eq!(evaluate("{a: 1} IS :: MAP"), b(true));
+        assert_eq!(evaluate("{a: 1} IS :: PROPERTY VALUE"), b(false));
+        assert_eq!(evaluate("1 IS :: PROPERTY VALUE"), b(true));
+    }
+
+    #[test]
+    fn type_predicate_entities() {
+        let (g, row) = graph_with_node_and_rel();
+        let check = |src: &str| to_value(eval_in(&g, &row, src).unwrap());
+        assert_eq!(check("n IS :: NODE"), b(true));
+        assert_eq!(check("n IS :: RELATIONSHIP"), b(false));
+        assert_eq!(check("r IS :: RELATIONSHIP"), b(true));
+        assert_eq!(check("r IS :: EDGE"), b(true));
+        assert_eq!(check("n IS :: VERTEX"), b(true));
+        assert_eq!(check("n IS :: ANY NODE"), b(true));
+        assert_eq!(check("r IS :: ANY RELATIONSHIP"), b(true));
+        assert_eq!(check("n IS :: MAP"), b(false));
+        assert_eq!(check("n IS :: ANY"), b(true));
+        assert_eq!(check("n IS :: PROPERTY VALUE"), b(false));
+    }
+
+    // --- `rmp` #636: normalization predicate (`IS NORMALIZED`) evaluation -----------------------
+
+    #[test]
+    fn normalized_predicate_basic() {
+        // 'ä' as a single precomposed code point (U+00E4) is NFC-normalized.
+        assert_eq!(evaluate("'\\u00E4' IS NORMALIZED"), b(true));
+        assert_eq!(evaluate("'\\u00E4' IS NFC NORMALIZED"), b(true));
+        // The same 'ä' decomposed ('a' + combining diaeresis U+0308) is NOT NFC, but IS NFD.
+        assert_eq!(evaluate("'a\\u0308' IS NORMALIZED"), b(false));
+        assert_eq!(evaluate("'a\\u0308' IS NOT NORMALIZED"), b(true));
+        assert_eq!(evaluate("'a\\u0308' IS NFD NORMALIZED"), b(true));
+        assert_eq!(evaluate("'a\\u0308' IS NFC NORMALIZED"), b(false));
+        // ASCII is normalized in every form.
+        assert_eq!(evaluate("'abc' IS NORMALIZED"), b(true));
+        assert_eq!(evaluate("'abc' IS NFKC NORMALIZED"), b(true));
+        assert_eq!(evaluate("'abc' IS NFKD NORMALIZED"), b(true));
+    }
+
+    #[test]
+    fn normalized_predicate_null_and_non_string_yield_null() {
+        assert_eq!(evaluate("1 IS NORMALIZED"), Value::Null);
+        assert_eq!(evaluate("1 IS NOT NORMALIZED"), Value::Null);
+        assert_eq!(evaluate("null IS NORMALIZED"), Value::Null);
+        assert_eq!(evaluate("null IS NFD NORMALIZED"), Value::Null);
+        assert_eq!(evaluate("[1] IS NORMALIZED"), Value::Null);
     }
 }
