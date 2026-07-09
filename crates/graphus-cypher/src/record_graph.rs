@@ -3318,6 +3318,28 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         Some(out)
     }
 
+    fn index_seek_rel_eq(
+        &self,
+        rel_type: &str,
+        property: &str,
+        value: &Value,
+    ) -> Option<Vec<RelId>> {
+        // Only the coordinated path holds the derived `IndexSet` with the relationship-property index;
+        // otherwise the executor falls back to a typed relationship scan + residual equality
+        // (`rmp` task #659).
+        self.index.as_ref()?;
+        // Resolve the type + property tokens; a missing token means no relationship of this
+        // type/property is indexable, so decline (the executor's typed scan covers it).
+        let type_token = self.store.borrow().token_id(Namespace::RelType, rel_type)?;
+        let prop_key = self.store.borrow().token_id(Namespace::PropKey, property)?;
+        // Reuse the index-backed candidate seek that already gates on an `Online` index, preserves the
+        // scan's SSI footprint (`mark_all_live_rels`), and re-checks each candidate (visible + current
+        // type + current value equals `value`) — the same re-checked-candidates contract as the node
+        // `index_seek_eq`. `None` (no usable `Online` index) declines to the executor's scan fallback.
+        let ids = self.rel_index_seek_eq(type_token, prop_key, rel_type, property, value)?;
+        Some(ids.into_iter().map(RelId).collect())
+    }
+
     fn index_seek_spatial(
         &self,
         label: &str,

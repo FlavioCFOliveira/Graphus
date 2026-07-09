@@ -4074,6 +4074,21 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 builder = builder.with_label_composite(label, properties);
             }
         }
+        // Relationship-property indexes (`rmp` task #659): surface every **`Online`** rel-property index
+        // so the physical planner can route a `MATCH ()-[r:T {p: v}]-()` / `WHERE r.p = v` equality to a
+        // `RelIndexSeek` instead of scanning every `:T` relationship and filtering. Only `Online` ones are
+        // exposed (`online_rel_properties` filters by state), so a half-built index never drives a seek —
+        // the planner keeps the scan + filter until it is promoted; the backing tree exists in the
+        // in-memory set (registered on open / create), so the seek the planner emits always finds it.
+        for (type_token, prop_key) in self.index.borrow().online_rel_properties() {
+            let (Some(rel_type), Some(property)) = (
+                store.token_name(Namespace::RelType, type_token),
+                store.token_name(Namespace::PropKey, prop_key),
+            ) else {
+                continue;
+            };
+            builder = builder.with_rel_property(rel_type, property);
+        }
         builder.build()
     }
 

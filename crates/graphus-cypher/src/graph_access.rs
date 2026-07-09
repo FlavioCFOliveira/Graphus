@@ -307,6 +307,28 @@ pub trait GraphAccess {
         None
     }
 
+    /// An **optional relationship-property index equality seek** (`rmp` task #659): the visible
+    /// relationship ids of `rel_type` whose current `property` equals `value` by Cypher equality — the
+    /// relationship analogue of [`index_seek_eq`](Self::index_seek_eq).
+    ///
+    /// Returns `None` when the implementation has no usable **`Online`** relationship-property index on
+    /// `(rel_type, property)` — the executor then falls back to a typed relationship scan + residual
+    /// equality (always correct either way, and the path the off-thread reader always takes). `Some(ids)`
+    /// is a set the seam has **already re-checked** (visibility, current type, current value), so a
+    /// deleted / invisible / re-typed / since-changed relationship never reaches the result, and RBAC
+    /// composes through the [`AuthorizedGraph`](crate::authorized_graph::AuthorizedGraph) decorator. The
+    /// executor materialises each returned relationship's endpoints from its own record, honouring the
+    /// pattern direction (and the undirected pattern's two-orientation semantics). The default returns
+    /// `None` (no relationship-property index available).
+    fn index_seek_rel_eq(
+        &self,
+        _rel_type: &str,
+        _property: &str,
+        _value: &Value,
+    ) -> Option<Vec<RelId>> {
+        None
+    }
+
     /// An **optional** spatial proximity seek (`rmp` task #73): the **candidate** node ids of `label`
     /// whose point `property` lies within `radius` of the centre `(center_x, center_y)`, projected to
     /// 2D (the grid's `(x, y)` buckets).

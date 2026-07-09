@@ -620,6 +620,27 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         )
     }
 
+    fn index_seek_rel_eq(
+        &self,
+        rel_type: &str,
+        property: &str,
+        value: &Value,
+    ) -> Option<Vec<RelId>> {
+        // A relationship-property index seek (`rmp` task #659) is a read path. For an **unrestricted**
+        // principal (no privilege filtering to apply) delegate straight to the inner seam's seek. For a
+        // **restricted** principal decline (`None`) so the executor falls back to the typed relationship
+        // scan, which flows through this decorator's `expand` / `rel_data` / `rel_property` and therefore
+        // enforces relationship-type traversal AND per-property read grants exactly as the pre-#659 scan
+        // path did. The seek re-checks a candidate against the *raw* store value and so cannot observe a
+        // `DENY READ` on the seeked property; declining keeps a restricted principal from ever seeing a
+        // relationship a `WHERE r.p = v` scan would have hidden — no RBAC regression, and the common
+        // unrestricted query keeps the seek (the server only wraps this decorator for restricted ones).
+        if self.oracle.is_unrestricted() {
+            return self.inner.index_seek_rel_eq(rel_type, property, value);
+        }
+        None
+    }
+
     fn index_seek_spatial(
         &self,
         label: &str,

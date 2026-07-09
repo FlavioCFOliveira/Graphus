@@ -580,7 +580,7 @@ message). They are documented here so expectations are exact.
 | **GDS path-algorithm write** — `gds.dijkstra.write`, `gds.bellmanFord.write` | Deferred. The path algorithms are **stream-only** today (`gds.dijkstra.stream` works). Node-property algorithms support `.stats`/`.mutate`/`.write`. |
 | **Database aliases** — `CREATE ALIAS … FOR DATABASE …` | Not supported (syntax error). |
 | **`ALTER USER … SET HOME DATABASE`** and `CHANGE [NOT] REQUIRED` | Not supported — `SET PASSWORD` and `SET STATUS` are (see below). |
-| **Relationship property index — planner seek** | The index **is** created, durable, maintained, and used to accelerate relationship-uniqueness constraint checks; a `MATCH ()-[r:T {p:v}]-()` does not yet use it as a seek (scans+filters — correct but unoptimised). |
+| **Relationship property index — range / composite seek** | An **equality** relationship predicate now uses the index as a **planner seek**: a standalone `MATCH ()-[r:T {p: v}]-()` (or `MATCH ()-[r:T]-() WHERE r.p = v`) seeks the relationship-property index instead of scanning every `:T` relationship and filtering (`rmp` #659). A **range** (`r.p > v`) or **composite** (`{a: …, b: …}`) relationship predicate still scans + filters — those relationship seeks are deferred (composite is `rmp` #666). A variable-length (`-[r:T*]-`), multi-type (`-[r:T1|T2]-`) or `OPTIONAL MATCH` pattern also stays a scan by design. |
 | **`LOOKUP` index DDL** | Declined by design — label/type lookup indexes are implicit and always-on (see above). |
 
 ---

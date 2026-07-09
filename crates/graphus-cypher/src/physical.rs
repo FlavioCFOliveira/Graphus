@@ -534,6 +534,40 @@ pub enum PhysicalOp {
         /// The relationship-type alternatives; empty means "any type".
         types: Vec<RelType>,
     },
+    /// **Relationship-property index equality seek** (`rmp` task #659): the visible relationships of
+    /// `rel_type` whose current `property` equals the seek expression, served by the
+    /// relationship-property index (a candidate seek + re-check) instead of scanning **every**
+    /// `:rel_type` relationship and filtering.
+    ///
+    /// The relationship analogue of [`NodeIndexSeek`](Self::NodeIndexSeek). The planner emits it only
+    /// for a **standalone**, single-type, fixed-length relationship pattern whose endpoints are
+    /// otherwise unconstrained — `MATCH ()-[r:T {p: $x}]-()` / `MATCH (a)-[r:T]->(b) WHERE r.p = $x` —
+    /// so both endpoints can be materialised directly from each matched relationship's own record. It
+    /// therefore replaces the whole `Filter`-over-[`ExpandAll`](Self::ExpandAll)-over-[`AllNodesScan`](Self::AllNodesScan)
+    /// subtree that scan path lowered to. `direction` reproduces the pattern arrow's endpoint binding
+    /// **and** the undirected pattern's two-orientation semantics exactly, so the seek is
+    /// bag-equivalent to that scan path. The seek returns a **candidate** set the seam has already
+    /// re-checked (visibility, current type, current value); the executor falls back to a typed
+    /// relationship scan + residual equality when the seam exposes no usable rel-property index (e.g.
+    /// the off-thread reader — consistent with how the other seeks degrade off-thread).
+    RelIndexSeek {
+        /// The relationship variable bound by each row.
+        relationship: Var,
+        /// The source-endpoint node variable (bound per `direction`).
+        from: Var,
+        /// The target-endpoint node variable (bound per `direction`).
+        to: Var,
+        /// The single relationship type the index covers.
+        rel_type: RelType,
+        /// The indexed property key.
+        property: String,
+        /// The equality seek value (unevaluated AST; commonly a `$param` after auto-parameterisation).
+        value: Expr,
+        /// The arrow direction of the originating pattern (drives endpoint binding + undirected doubling).
+        direction: crate::ast::RelDirection,
+        /// The catalog index backing the seek.
+        index: IndexId,
+    },
     /// The single-row correlation argument of a join (carried through from
     /// [`Argument`](crate::logical::LogicalOp::Argument)).
     Argument {
@@ -1332,6 +1366,15 @@ impl Planner<'_> {
             return self.lower_filter(&scan, &folded, deps);
         }
 
+        // Relationship-property index seek (`rmp` task #659): a filter whose equality on a
+        // relationship variable sits over a standalone single-type, fixed-length `Expand` from a bare
+        // all-nodes scan can seek the rel-property index instead of scanning every `:T` relationship
+        // and filtering. Its input is an `Expand` (never a label scan), so it is disjoint from the
+        // node-oriented paths below; try it first.
+        if let Some(seek) = self.try_rel_index_seek(input, predicate, deps) {
+            return seek;
+        }
+
         // Index selection only fires directly over a label scan (the logical anchor of a labelled
         // node). Anything else: lower the input normally and keep the predicate as a residual filter.
         let LogicalOp::NodeByLabelScan { variable, label } = input else {
@@ -1508,6 +1551,95 @@ impl Planner<'_> {
         }
     }
 
+    /// Attempts to lower a `Filter` carrying an **equality on a relationship variable**, sitting over a
+    /// standalone single-type fixed-length [`Expand`](LogicalOp::Expand) from a bare
+    /// [`AllNodesScan`](LogicalOp::AllNodesScan), into a [`RelIndexSeek`](PhysicalOp::RelIndexSeek)
+    /// (`rmp` task #659). Returns [`None`] (the caller keeps its normal paths) when the shape does not
+    /// qualify or no `Online` rel-property index covers the `(type, property)` the equality names.
+    ///
+    /// Only the **seek-materialisable** shape qualifies: exactly one relationship type (a single-type
+    /// index), fixed length (`range` is `None`), no earlier pattern relationships to exclude
+    /// (`prior_rels` empty), no per-hop var-length property map, and an anchor that is a **bare**
+    /// [`AllNodesScan`](LogicalOp::AllNodesScan) of the expand's `from` — so both endpoints are
+    /// unconstrained and can be materialised directly from each matched relationship's own record.
+    /// `-[r:T*]-` (var-length), `-[r:T1|T2]-` (no single-type index), a label-constrained anchor (a
+    /// label scan, not an all-nodes scan), and an `OPTIONAL MATCH` (whose anchor is an `Apply`-over-
+    /// `Argument`, never a bare scan) therefore all decline here and stay scans. Only an **equality**
+    /// conjunct is consumed; every other conjunct (a range, a residual `HasLabels` on an endpoint,
+    /// another property predicate) is re-attached as a residual [`Filter`](PhysicalOp::Filter) — the
+    /// executor's re-check keeps the result exact either way.
+    fn try_rel_index_seek(
+        &self,
+        input: &LogicalOp,
+        predicate: &Expr,
+        deps: &mut BTreeSet<IndexId>,
+    ) -> Option<PhysicalOp> {
+        // Collect every conjunct of the (possibly nested) filter chain down to the bottom `Expand`, so
+        // a multi-key inline map (`{a: …, b: …}`, which lowers to stacked `Filter`s) still exposes the
+        // relationship-equality conjunct.
+        let (expand, conjuncts) = fold_expand_filter_chain(input, predicate)?;
+        let LogicalOp::Expand {
+            input: exp_input,
+            from,
+            relationship,
+            to,
+            direction,
+            types,
+            range,
+            prior_rels,
+            rel_props,
+        } = expand
+        else {
+            return None;
+        };
+        // Seek-materialisable shape only (see the doc): fixed length, standalone, single type, bare
+        // anchor scan.
+        if range.is_some() || !prior_rels.is_empty() || rel_props.is_some() {
+            return None;
+        }
+        let [rel_type] = types.as_slice() else {
+            return None; // zero or multiple types: no single-type rel-property index applies
+        };
+        let LogicalOp::AllNodesScan { variable: anchor } = exp_input.as_ref() else {
+            return None; // a constrained anchor (label scan / correlated Apply) is not materialisable
+        };
+        if anchor.name != from.name {
+            return None;
+        }
+        // Consume the first equality conjunct on the relationship variable whose `(type, property)` an
+        // `Online` rel-property index covers; re-attach the rest as a residual filter.
+        for (i, conj) in conjuncts.iter().enumerate() {
+            let Some(pp) = analyze_property_predicate(conj, &relationship.name) else {
+                continue;
+            };
+            let PropertyPredicateKind::Equality { value } = pp.kind else {
+                continue; // a range / other rel predicate stays a filter (equality-only, `rmp` #659)
+            };
+            let Some(idx) = self.catalog.rel_property(rel_type, &pp.property) else {
+                continue;
+            };
+            deps.insert(idx.id);
+            let seek = PhysicalOp::RelIndexSeek {
+                relationship: relationship.clone(),
+                from: from.clone(),
+                to: to.clone(),
+                rel_type: rel_type.clone(),
+                property: pp.property,
+                value,
+                direction: *direction,
+                index: idx.id,
+            };
+            let residual: Vec<&Expr> = conjuncts
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, e)| *e)
+                .collect();
+            return Some(attach_residual(seek, &residual));
+        }
+        None
+    }
+
     /// The catalog index that serves `pp` on `label`, if any (equality/range → property/composite).
     fn match_index<'a>(
         &'a self,
@@ -1614,6 +1746,7 @@ fn contains_read(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeIndexStartsWithSeek { .. }
         | PhysicalOp::SpatialIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
+        | PhysicalOp::RelIndexSeek { .. }
         | PhysicalOp::ExpandAll { .. }
         | PhysicalOp::ExpandInto { .. }
         | PhysicalOp::QuantifiedPath { .. }
@@ -1684,6 +1817,7 @@ fn contains_write(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeIndexStartsWithSeek { .. }
         | PhysicalOp::SpatialIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
+        | PhysicalOp::RelIndexSeek { .. }
         | PhysicalOp::Argument { .. }
         | PhysicalOp::Empty => false,
     }
@@ -1745,6 +1879,7 @@ fn contains_procedure_call(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeIndexStartsWithSeek { .. }
         | PhysicalOp::SpatialIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
+        | PhysicalOp::RelIndexSeek { .. }
         | PhysicalOp::Argument { .. }
         | PhysicalOp::Empty => false,
     }
@@ -1816,6 +1951,7 @@ fn all_procedure_calls_reader_safe(
         | PhysicalOp::NodeIndexStartsWithSeek { .. }
         | PhysicalOp::SpatialIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
+        | PhysicalOp::RelIndexSeek { .. }
         | PhysicalOp::Argument { .. }
         | PhysicalOp::Empty => true,
     }
@@ -2034,6 +2170,7 @@ fn optimize_children(op: PhysicalOp, catalog: &IndexCatalog, stats: &dyn Statist
         | PhysicalOp::NodeIndexStartsWithSeek { .. }
         | PhysicalOp::SpatialIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
+        | PhysicalOp::RelIndexSeek { .. }
         | PhysicalOp::Argument { .. }
         | PhysicalOp::Empty => op,
 
@@ -2474,6 +2611,33 @@ fn and_exprs(lhs: Expr, rhs: Expr) -> Expr {
     )
 }
 
+/// If `input` is a (possibly nested) chain of [`Filter`](LogicalOp::Filter)s bottoming out at an
+/// [`Expand`](LogicalOp::Expand), returns that expand plus **every** conjunct in the chain — `top`'s
+/// and each chained filter's, each split on top-level `AND` (outer-to-inner order). This lets
+/// [`Planner::try_rel_index_seek`] pick the relationship-equality conjunct out of a stacked
+/// inline-property / `WHERE` filter (`rmp` task #659). Returns [`None`] when `input` is not such a
+/// chain (the relationship-seek attempt then declines and the normal residual-filter path runs).
+fn fold_expand_filter_chain<'a>(
+    input: &'a LogicalOp,
+    top: &'a Expr,
+) -> Option<(&'a LogicalOp, Vec<&'a Expr>)> {
+    let mut conjuncts: Vec<&Expr> = split_conjuncts(top);
+    let mut cur = input;
+    loop {
+        match cur {
+            LogicalOp::Expand { .. } => return Some((cur, conjuncts)),
+            LogicalOp::Filter {
+                input: inner,
+                predicate,
+            } => {
+                conjuncts.extend(split_conjuncts(predicate));
+                cur = inner;
+            }
+            _ => return None,
+        }
+    }
+}
+
 /// The label/token scan for a `(variable, label)` — a `TokenLookupScan` when the catalog has a
 /// token-lookup index, else a `NodeByLabelScan` (mirrors [`Planner::lower_label_scan`]).
 fn label_or_token_scan(variable: &Var, label: &Label, catalog: &IndexCatalog) -> PhysicalOp {
@@ -2793,6 +2957,7 @@ fn contains_argument(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeIndexStartsWithSeek { .. }
         | PhysicalOp::SpatialIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
+        | PhysicalOp::RelIndexSeek { .. }
         | PhysicalOp::Empty => false,
         PhysicalOp::Filter { input, .. }
         | PhysicalOp::Projection { input, .. }
@@ -3222,7 +3387,8 @@ fn gather_index_dependencies(op: &PhysicalOp, deps: &mut BTreeSet<IndexId>) {
         | PhysicalOp::NodeCompositeIndexSeek { index, .. }
         | PhysicalOp::NodeIndexRangeSeek { index, .. }
         | PhysicalOp::NodeIndexStartsWithSeek { index, .. }
-        | PhysicalOp::SpatialIndexSeek { index, .. } => {
+        | PhysicalOp::SpatialIndexSeek { index, .. }
+        | PhysicalOp::RelIndexSeek { index, .. } => {
             deps.insert(*index);
         }
         // `NodeLabelScanEq` is a full store scan (no derived index), so it declares no index dependency.
@@ -3745,6 +3911,12 @@ fn gather_bound_vars(plan: &PhysicalOp, out: &mut Vec<Var>) {
             from,
             to,
             ..
+        }
+        | PhysicalOp::RelIndexSeek {
+            relationship,
+            from,
+            to,
+            ..
         } => {
             push_unique(out, from.clone());
             push_unique(out, relationship.clone());
@@ -4006,6 +4178,23 @@ impl PhysicalOp {
                 h::arrow_left(*direction),
                 h::arrow_right(*direction),
                 h::types(types),
+            ),
+            Self::RelIndexSeek {
+                relationship,
+                from,
+                to,
+                rel_type,
+                property,
+                value,
+                direction,
+                index,
+            } => writeln!(
+                f,
+                "RelIndexSeek({}{relationship}:{} {property} = {}{}{to} from {from} via {index})",
+                h::arrow_left(*direction),
+                rel_type.name,
+                h::expr(value),
+                h::arrow_right(*direction),
             ),
             Self::Argument { arguments } => writeln!(f, "Argument({})", h::vars(arguments)),
             Self::Empty => writeln!(f, "Empty"),

@@ -2308,6 +2308,40 @@ fn build_operator(
                 rows: nodes_to_rows(variable, ids),
             })
         }
+        PhysicalOp::RelIndexSeek {
+            relationship,
+            from,
+            to,
+            rel_type,
+            property,
+            value,
+            direction,
+            ..
+        } => {
+            // Relationship-property index equality seek (`rmp` task #659): evaluate the seek value, then
+            // ask the seam for the candidate relationship ids of `rel_type` whose current `property`
+            // equals it (already re-checked for visibility + current type + current value). When the seam
+            // exposes no usable rel-property index — the off-thread reader, or a since-dropped index —
+            // fall back to a typed relationship scan + equality filter, which yields the identical
+            // relationship set. Either way, materialise each relationship's endpoints from its own record
+            // honouring the pattern direction (an undirected pattern binds both orientations),
+            // reproducing exactly the `Filter`-over-`ExpandAll`-over-`AllNodesScan` rows this seek replaced.
+            let seek = eval_value(
+                value,
+                &Row::empty(),
+                ctx.params,
+                ctx.graph,
+                ctx.functions,
+                &ctx.clock,
+            )?;
+            let ids = match ctx.graph.index_seek_rel_eq(&rel_type.name, property, &seek) {
+                Some(ids) => ids,
+                None => rel_scan_filter_eq_ids(&rel_type.name, property, &seek, ctx),
+            };
+            Ok(Operator::Buffered {
+                rows: rel_ids_to_rows(relationship, from, to, *direction, ids, ctx),
+            })
+        }
         PhysicalOp::AllRelationshipsScan {
             relationship,
             from,
@@ -2919,6 +2953,96 @@ fn all_rels_rows(
 /// blanket marker produced reciprocal false aborts between transactions matching disjoint keys.
 fn scan_filter_eq(label: &Label, property: &str, seek: &Value, ctx: &Ctx<'_>) -> Vec<NodeId> {
     ctx.graph.scan_filter_eq(&label.name, property, seek)
+}
+
+/// Materialises a re-checked relationship-id set into rows for a
+/// [`RelIndexSeek`](crate::physical::PhysicalOp::RelIndexSeek) (`rmp` task #659): binds `relationship`
+/// plus both endpoints from each relationship's own record, honouring the pattern `direction`.
+///
+/// This reproduces **exactly** the row multiset the scan-path `Filter`-over-`ExpandAll`-over-
+/// `AllNodesScan` produced. A directed pattern binds one orientation per relationship; an **undirected**
+/// pattern binds **both** orientations — `(start, end)` and `(end, start)` — because an `ExpandAll` over
+/// every anchor surfaces each non-self relationship once from each endpoint. A **self-loop**
+/// (`start == end`) an `ExpandAll` reports once per anchor, so it binds a single row here too. Each id is
+/// re-read via [`rel_data`](crate::graph_access::GraphAccess::rel_data), which also SIREAD-marks it and
+/// drops any relationship no longer visible (defensive — the seam's candidates are already
+/// visibility-re-checked; the scan fallback re-checks here).
+fn rel_ids_to_rows(
+    relationship: &Var,
+    from: &Var,
+    to: &Var,
+    direction: RelDirection,
+    ids: Vec<RelId>,
+    ctx: &Ctx<'_>,
+) -> VecDeque<Row> {
+    let mut out = VecDeque::new();
+    for rel in ids {
+        let Some(data) = ctx.graph.rel_data(rel) else {
+            continue; // no longer visible (defensive)
+        };
+        match direction {
+            RelDirection::LeftToRight => {
+                out.push_back(rel_row(from, relationship, to, data.start, rel, data.end));
+            }
+            RelDirection::RightToLeft => {
+                out.push_back(rel_row(from, relationship, to, data.end, rel, data.start));
+            }
+            RelDirection::Undirected => {
+                out.push_back(rel_row(from, relationship, to, data.start, rel, data.end));
+                if data.start != data.end {
+                    out.push_back(rel_row(from, relationship, to, data.end, rel, data.start));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// One relationship row binding `from`/`relationship`/`to` to the given endpoint / relationship /
+/// endpoint ids (`rmp` task #659).
+fn rel_row(from: &Var, relationship: &Var, to: &Var, f: NodeId, rel: RelId, t: NodeId) -> Row {
+    let mut row = Row::empty();
+    row.set(from.name.clone(), RowValue::Node(NodeRef { id: f }));
+    row.set(relationship.name.clone(), RowValue::Rel(RelRef { id: rel }));
+    row.set(to.name.clone(), RowValue::Node(NodeRef { id: t }));
+    row
+}
+
+/// The scan fallback for a [`RelIndexSeek`](crate::physical::PhysicalOp::RelIndexSeek) when the seam
+/// exposes no usable relationship-property index (the off-thread reader, or an index dropped since
+/// planning): the visible relationship ids of `rel_type` whose current `property` equals `seek` by
+/// Cypher equality, **each id once** (`rmp` task #659).
+///
+/// Enumerates every relationship of the type from its start node (one incidence each) through the same
+/// [`scan_nodes`](crate::graph_access::GraphAccess::scan_nodes) / [`expand`](crate::graph_access::GraphAccess::expand)
+/// / [`rel_property`](crate::graph_access::GraphAccess::rel_property) seam the scan-path `ExpandAll` would,
+/// so MVCC visibility and RBAC (relationship-type traversal + per-property read grants) are applied
+/// identically. [`rel_ids_to_rows`] then applies the pattern direction to the returned set, yielding the
+/// same rows the scan path would.
+fn rel_scan_filter_eq_ids(
+    rel_type: &str,
+    property: &str,
+    seek: &Value,
+    ctx: &Ctx<'_>,
+) -> Vec<RelId> {
+    let types = [rel_type.to_owned()];
+    let mut seen = rustc_hash::FxHashSet::default();
+    let mut ids = Vec::new();
+    for node in ctx.graph.scan_nodes() {
+        for inc in ctx.graph.expand(node, ExpandDirection::Outgoing, &types) {
+            if !seen.insert(inc.rel) {
+                continue;
+            }
+            if ctx
+                .graph
+                .rel_property(inc.rel, property)
+                .is_some_and(|v| crate::equality::equals(&v, seek).is_true())
+            {
+                ids.push(inc.rel);
+            }
+        }
+    }
+    ids
 }
 
 /// Fallback composite (multi-property) equality access (`rmp` task #657): scan the label and keep
@@ -7677,6 +7801,12 @@ fn result_columns(op: &PhysicalOp, procedures: &dyn ProcedureRegistry) -> Vec<St
         | PhysicalOp::NodeIndexStartsWithSeek { variable, .. }
         | PhysicalOp::SpatialIndexSeek { variable, .. } => vec![variable.name.clone()],
         PhysicalOp::AllRelationshipsScan {
+            relationship,
+            from,
+            to,
+            ..
+        }
+        | PhysicalOp::RelIndexSeek {
             relationship,
             from,
             to,

@@ -43,10 +43,59 @@ fn fresh_coord() -> Coord {
 }
 
 fn compile(src: &str) -> PhysicalPlan {
+    compile_cat(src, &IndexCatalog::empty())
+}
+
+/// Compiles `src` against a specific `catalog` (so a query can be planned with vs without the
+/// relationship-property index available), for the `rmp` #659 seek tests.
+fn compile_cat(src: &str, catalog: &IndexCatalog) -> PhysicalPlan {
     let toks = tokenize(src).expect("lex");
     let ast = parse_tokens(&toks, src).expect("parse");
     let validated = analyze(&ast).expect("analyze");
-    plan_physical(&lower(&validated), &IndexCatalog::empty())
+    plan_physical(&lower(&validated), catalog)
+}
+
+/// Whether a physical plan uses a [`RelIndexSeek`] anywhere (rendered via the plan's Display).
+fn is_rel_seek(plan: &PhysicalPlan) -> bool {
+    plan.root.to_string().contains("RelIndexSeek")
+}
+
+/// Runs a read query in its own committed transaction, returning the raw result rows (`rmp` #659).
+fn run_read(coord: &mut Coord, plan: &PhysicalPlan, params: &Parameters) -> Vec<Row> {
+    let txn = coord.begin_serializable();
+    let bound = bind_parameters(plan, params).expect("bind");
+    let rows = {
+        let mut graph = coord.statement(txn).expect("statement");
+        let mut cursor = execute(plan, &bound, &mut graph).expect("open cursor");
+        cursor.collect_all().expect("collect")
+    };
+    coord.commit(txn).expect("read commits");
+    rows
+}
+
+fn as_int(v: &Value) -> i64 {
+    match v {
+        Value::Integer(i) => *i,
+        other => panic!("expected an integer, got {other:?}"),
+    }
+}
+
+/// The sorted `(id(a), id(r), id(b))` triples of rows projected as `a`/`rr`/`b` — the row-identity
+/// witness for the seek-vs-scan parity comparison (captures relationship identity AND endpoint
+/// orientation, so an undirected pattern's two orientations and a self-loop are distinguished).
+fn triples(rows: &[Row]) -> Vec<(i64, i64, i64)> {
+    let mut out: Vec<(i64, i64, i64)> = rows
+        .iter()
+        .map(|r| {
+            (
+                as_int(&r.value("a")),
+                as_int(&r.value("rr")),
+                as_int(&r.value("b")),
+            )
+        })
+        .collect();
+    out.sort_unstable();
+    out
 }
 
 /// Runs a write statement and **commits** it, asserting it succeeded with no captured error.
@@ -308,4 +357,222 @@ fn rel_uniqueness_survives_a_crash_and_still_enforces_after_reopen() {
     // A distinct value still succeeds after recovery.
     run_write(&mut coord, "CREATE (:P)-[:KNOWS {since: 2099}]->(:P)");
     assert_eq!(knows_count(&mut coord), 3);
+}
+
+// =================================================================================================
+// Relationship-property index SEEK (`rmp` task #659)
+// =================================================================================================
+
+#[test]
+fn rel_equality_lowers_to_seek_only_when_the_index_is_present() {
+    // A standalone single-type, fixed-length relationship-equality — via the inline map *or* an
+    // explicit `WHERE` — seeks the rel-property index when it covers `(type, property)`; with no such
+    // index (or on a non-covered property/type) it stays a scan + filter (`rmp` task #659).
+    let indexed = IndexCatalog::builder()
+        .with_rel_property("KNOWS", "since")
+        .build();
+    let empty = IndexCatalog::empty();
+
+    for src in [
+        "MATCH ()-[r:KNOWS {since: $x}]-() RETURN r",
+        "MATCH ()-[r:KNOWS]-() WHERE r.since = $x RETURN r",
+        "MATCH (a)-[r:KNOWS {since: $x}]->(b) RETURN r",
+    ] {
+        assert!(
+            is_rel_seek(&compile_cat(src, &indexed)),
+            "expected a RelIndexSeek with the index present: {src}"
+        );
+        assert!(
+            !is_rel_seek(&compile_cat(src, &empty)),
+            "without the index the same query must stay a scan + filter: {src}"
+        );
+    }
+
+    // The index covers only `(KNOWS, since)`: a different property or a different type stays a scan.
+    for src in [
+        "MATCH ()-[r:KNOWS {note: $x}]-() RETURN r", // property not indexed
+        "MATCH ()-[r:LIKES {since: $x}]-() RETURN r", // type not indexed
+    ] {
+        assert!(
+            !is_rel_seek(&compile_cat(src, &indexed)),
+            "a non-covered (type, property) must not seek: {src}"
+        );
+    }
+}
+
+#[test]
+fn non_seekable_rel_shapes_stay_scans() {
+    // Shapes the equality-only, single-type, standalone rel seek must NOT claim (`rmp` task #659):
+    // variable-length, multiple types (no single-type index), a range predicate, `OPTIONAL MATCH`
+    // (its anchor is an `Apply`-over-`Argument`, never a bare all-nodes scan), and a label-constrained
+    // anchor (a label scan, not an all-nodes scan). Each must remain a scan + filter.
+    let indexed = IndexCatalog::builder()
+        .with_rel_property("KNOWS", "since")
+        .build();
+    for src in [
+        "MATCH ()-[r:KNOWS*]-() WHERE r.since = $x RETURN r",
+        "MATCH ()-[r:KNOWS|LIKES {since: $x}]-() RETURN r",
+        "MATCH ()-[r:KNOWS]-() WHERE r.since > $x RETURN r",
+        "OPTIONAL MATCH ()-[r:KNOWS {since: $x}]-() RETURN r",
+        "MATCH (a:P)-[r:KNOWS {since: $x}]->(b) RETURN r",
+    ] {
+        let plan = compile_cat(src, &indexed);
+        assert!(
+            !is_rel_seek(&plan),
+            "this shape must stay a scan, got a seek: {src}\n{}",
+            plan.root
+        );
+    }
+}
+
+#[test]
+fn rel_seek_rows_match_the_scan_filter_rows_across_directions_and_self_loops() {
+    // Execution parity: the `RelIndexSeek` returns the identical row multiset as the
+    // `IndexCatalog::empty()` typed-scan + filter plan over the same populated relationship index —
+    // for a directed, a reverse-directed, and an undirected pattern (the last binding both endpoint
+    // orientations), with a duplicate value, a distinct value, a self-loop and a wrong-type edge in
+    // the graph to exercise every branch (`rmp` task #659).
+    let mut coord = fresh_coord();
+    run_write(&mut coord, "CREATE (:P {n: 1}), (:P {n: 2}), (:P {n: 3})");
+    run_write(
+        &mut coord,
+        "MATCH (a:P {n: 1}), (b:P {n: 2}) CREATE (a)-[:KNOWS {since: 2020}]->(b)",
+    );
+    run_write(
+        &mut coord,
+        "MATCH (a:P {n: 2}), (b:P {n: 3}) CREATE (a)-[:KNOWS {since: 2020}]->(b)",
+    );
+    run_write(
+        &mut coord,
+        "MATCH (a:P {n: 1}), (b:P {n: 3}) CREATE (a)-[:KNOWS {since: 2021}]->(b)",
+    );
+    // A self-loop with the matching value: undirected must bind it exactly once (not twice).
+    run_write(
+        &mut coord,
+        "MATCH (a:P {n: 1}) CREATE (a)-[:KNOWS {since: 2020}]->(a)",
+    );
+    // A wrong-type edge with the matching value: never matched.
+    run_write(
+        &mut coord,
+        "MATCH (a:P {n: 2}), (b:P {n: 3}) CREATE (a)-[:LIKES {since: 2020}]->(b)",
+    );
+    coord
+        .create_rel_property_index_named(Some("ix_since"), "KNOWS", "since", false)
+        .expect("create rel-property index");
+
+    let indexed = coord.catalog();
+    let empty = IndexCatalog::empty();
+    let params = Parameters::new().with("x", Value::Integer(2020));
+
+    for pattern in [
+        "MATCH (a)-[r:KNOWS {since: $x}]->(b) RETURN id(a) AS a, id(r) AS rr, id(b) AS b",
+        "MATCH (a)<-[r:KNOWS {since: $x}]-(b) RETURN id(a) AS a, id(r) AS rr, id(b) AS b",
+        "MATCH (a)-[r:KNOWS {since: $x}]-(b) RETURN id(a) AS a, id(r) AS rr, id(b) AS b",
+    ] {
+        let seek_plan = compile_cat(pattern, &indexed);
+        let scan_plan = compile_cat(pattern, &empty);
+        assert!(
+            is_rel_seek(&seek_plan),
+            "expected a seek for: {pattern}\n{}",
+            seek_plan.root
+        );
+        assert!(
+            !is_rel_seek(&scan_plan),
+            "the empty-catalog plan must scan: {pattern}"
+        );
+
+        let seek_rows = triples(&run_read(&mut coord, &seek_plan, &params));
+        let scan_rows = triples(&run_read(&mut coord, &scan_plan, &params));
+        assert!(!seek_rows.is_empty(), "{pattern} should match something");
+        assert_eq!(
+            seek_rows, scan_rows,
+            "seek and scan+filter rows must be identical for: {pattern}"
+        );
+    }
+}
+
+#[test]
+fn rel_seek_excludes_a_deleted_relationship() {
+    // MVCC re-check: after a matching relationship is deleted, the seek's candidate re-check (via
+    // `rel_data`) drops it even though a stale index entry may still name it — so a deleted
+    // relationship is never returned (`rmp` task #659).
+    let mut coord = fresh_coord();
+    run_write(
+        &mut coord,
+        "CREATE (:P {n: 1})-[:KNOWS {since: 2020}]->(:P {n: 2})",
+    );
+    coord
+        .create_rel_property_index_named(Some("ix_since"), "KNOWS", "since", false)
+        .expect("create rel-property index");
+    let indexed = coord.catalog();
+    let params = Parameters::new().with("x", Value::Integer(2020));
+    let plan = compile_cat(
+        "MATCH ()-[r:KNOWS {since: $x}]->() RETURN id(r) AS rr",
+        &indexed,
+    );
+    assert!(is_rel_seek(&plan), "expected a seek:\n{}", plan.root);
+
+    assert_eq!(
+        run_read(&mut coord, &plan, &params).len(),
+        1,
+        "the live relationship is seeked"
+    );
+    run_write(&mut coord, "MATCH ()-[r:KNOWS {since: 2020}]->() DELETE r");
+    assert!(
+        run_read(&mut coord, &plan, &params).is_empty(),
+        "a deleted relationship must not be returned by the seek"
+    );
+}
+
+#[test]
+fn rel_seek_hides_an_uncommitted_relationship_from_a_concurrent_reader() {
+    // MVCC visibility: a concurrent writer's UNCOMMITTED matching relationship is already present in
+    // the shared in-memory rel index (maintained at write time), yet the seek's per-candidate
+    // visibility re-check drops it for a reader whose snapshot predates the (never-committed) write —
+    // so an uncommitted relationship is never returned (`rmp` task #659).
+    let mut coord = fresh_coord();
+    run_write(&mut coord, "CREATE (:P {n: 1}), (:P {n: 2})");
+    run_write(
+        &mut coord,
+        "MATCH (a:P {n: 1}), (b:P {n: 2}) CREATE (a)-[:KNOWS {since: 2020}]->(b)",
+    );
+    coord
+        .create_rel_property_index_named(Some("ix_since"), "KNOWS", "since", false)
+        .expect("create rel-property index");
+    let indexed = coord.catalog();
+    let params = Parameters::new().with("x", Value::Integer(2020));
+    let plan = compile_cat(
+        "MATCH ()-[r:KNOWS {since: $x}]->() RETURN id(r) AS rr",
+        &indexed,
+    );
+    assert!(is_rel_seek(&plan), "expected a seek:\n{}", plan.root);
+
+    assert_eq!(
+        run_read(&mut coord, &plan, &params).len(),
+        1,
+        "one committed match"
+    );
+
+    // A concurrent writer adds a SECOND matching relationship but does not commit; its maintenance
+    // has already inserted the value into the shared in-memory index.
+    let writer = coord.begin_serializable();
+    {
+        let wplan =
+            compile("MATCH (a:P {n: 1}), (b:P {n: 2}) CREATE (a)-[:KNOWS {since: 2020}]->(b)");
+        let bound = bind_parameters(&wplan, &Parameters::new()).expect("bind");
+        let mut graph = coord.statement(writer).expect("statement");
+        let mut cursor = execute(&wplan, &bound, &mut graph).expect("open cursor");
+        let _ = cursor.collect_all().expect("collect");
+    }
+    assert_eq!(
+        run_read(&mut coord, &plan, &params).len(),
+        1,
+        "the uncommitted relationship must be invisible to the seek"
+    );
+    coord.rollback(writer).expect("rollback the writer");
+    assert_eq!(
+        run_read(&mut coord, &plan, &params).len(),
+        1,
+        "after rollback only the original committed relationship remains"
+    );
 }

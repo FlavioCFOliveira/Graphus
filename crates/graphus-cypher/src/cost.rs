@@ -323,6 +323,26 @@ pub fn estimate_cost(op: &PhysicalOp, stats: Option<&dyn Statistics>) -> CostEst
             CostEstimate::new(rows, rows * COST_ROW_SCAN)
         }
 
+        // A relationship-property equality seek (`rmp` task #659): absent per-property relationship
+        // histograms, estimate its candidate count with the same constant predicate-selectivity a
+        // `rel-scan + filter` would use over the single covered type, and pay the seek setup plus a
+        // cheap per-candidate stream. An undirected pattern surfaces each relationship twice, so double
+        // the estimate to match the scan-path `Filter`-over-`ExpandAll` cardinality it replaces. This
+        // keeps the seek cheaper than the full typed relationship scan it replaces while staying
+        // conservative (the executor's re-check trims the candidate set to the exact result).
+        PhysicalOp::RelIndexSeek {
+            rel_type,
+            direction,
+            ..
+        } => {
+            let type_slice = std::slice::from_ref(rel_type);
+            let mut rows = rel_scan_rows(type_slice, stats) * DEFAULT_PREDICATE_SELECTIVITY;
+            if matches!(direction, crate::ast::RelDirection::Undirected) {
+                rows *= 2.0;
+            }
+            CostEstimate::new(rows, COST_SEEK_SETUP + rows * COST_SEEK_PER_ROW)
+        }
+
         // The correlated-apply argument leaf is a single row, produced for free (it is the outer row
         // handed in).
         PhysicalOp::Argument { .. } => CostEstimate::new(1.0, 0.0),
