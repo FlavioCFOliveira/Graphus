@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Neo4j-conformant named node-property indexes (rmp #623-#627).** `CREATE INDEX <name> FOR (n:L)
+  ON (n.p)` with an optional index name, `DROP INDEX <name>`, and `IF NOT EXISTS` / `IF EXISTS`
+  guards. A durable named-index catalogue (with legacy auto-name migration) enforces global name
+  uniqueness, and `SHOW INDEXES` reports the Neo4j-conformant columns including `name`. Parsed in the
+  server admin DDL layer.
+- **Cypher completeness — Neo4j 5.x surface beyond the openCypher TCK core (rmp #629-#643).** Math
+  function family (trigonometry, `exp`/`log`, `pi`/`e`, `degrees`/`radians`, `isNaN`); scalar/id/list
+  functions (`elementId`, `timestamp`, `randomUUID`, `isEmpty`, `valueType`, `nullIf`,
+  `char_length`, the `toXxxOrNull` / `toXxxList` families); `reduce()` list fold; map projection
+  `n{ .name, .*, key: expr }`; `CALL { }` subqueries (importing `WITH`, inner `UNION`,
+  `IN TRANSACTIONS`); `COUNT { }` and `COLLECT { }` expression subqueries; label/type expressions
+  `:A&B`, `:A|B`, `:!A`, `:%`; type predicates `IS :: TYPE`, `IS NOT :: TYPE`, `IS NORMALIZED`;
+  administrative `SHOW FUNCTIONS/PROCEDURES/TRANSACTIONS/SETTINGS` and `TERMINATE TRANSACTIONS`;
+  constraint & typed/relationship index DDL; `dbms.*` procedures (`dbms.components`),
+  `db.awaitIndexes`, `db.index.fulltext.queryRelationships`; the `USE <db>` graph selector; and GDS
+  write/mutate/stats execution modes plus vector similarity / `VECTOR` index.
+- **Quantified Path Patterns (GPM, rmp #642/#648).** `((x)-[r1:R]->(m)-[r2:S]->(y))+` and `{n,m}`
+  quantifiers through the full parser → semantics → planner → executor pipeline, including a
+  multi-relationship interior (tested to 3 hops) with per-iteration group variables, a global trail
+  (no relationship reused across any hop of any iteration), and a folded per-iteration predicate for
+  cross-relationship `WHERE`. Nested QPP `( ( )+ )+` is deferred with a clear parse error.
+- **Negative privileges — `DENY` (rmp #641/#645).** `DENY <priv> ON <resource> TO <role>` with
+  deny-precedence (a `DENY` beats an implying `GRANT`), reversed action grading (`DENY READ` blocks
+  Read+Write but not Traverse; `DENY TRAVERSE` blocks all three; `DENY WRITE` blocks only Write),
+  `REVOKE GRANT` / `REVOKE DENY` / plain `REVOKE`, and a `SHOW PRIVILEGES` `access` column
+  (`GRANTED`/`DENIED`). The global root-admin can never be locked out. Durable across restart; the
+  per-query effective-privileges snapshot reads grants and denies under a single guard.
+- **Relationship property index (rmp #646).** `CREATE INDEX [name] FOR ()-[r:T]-() ON (r.p)`
+  end-to-end, mirroring the node-property index: durable catalogue on the atomic meta-checkpoint,
+  synchronous online build with rebuild-on-recovery, per-write maintenance at the `set_rel_property`
+  chokepoint, and index-backed relationship-uniqueness enforcement (replacing the prior
+  O(rels-of-type) scan while preserving its serializability footprint). `SHOW INDEXES` lists node and
+  relationship rows with `entityType` = `NODE` / `RELATIONSHIP`.
+
+### Fixed
+
+- **`stdev` / `stdevp` returned a wrong aggregate value (rmp #628).** The sample/population standard
+  deviation aggregates silently computed an incorrect result; corrected and covered by regression
+  tests.
+
 ## [0.0.9] - 2026-07-08
 
 ### Added

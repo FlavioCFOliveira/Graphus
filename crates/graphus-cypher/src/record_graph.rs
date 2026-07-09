@@ -1792,6 +1792,9 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         value: &Value,
         self_rel: RelId,
     ) -> Option<u64> {
+        // AUDIT-FIX PROBE (#646): register the rel-type predicate read so a concurrent insert of the
+        // same brand-new value forms the rw-antidependency (pairs with create_rel's RelType write).
+        self.note_predicate_read(PredicateRead::RelType(type_token));
         let matches: Vec<u64> = self
             .rel_index_seek_eq(type_token, prop_key, type_name, property, value)
             .unwrap_or_else(|| self.rel_scan_eq(type_name, property, value));
