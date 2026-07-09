@@ -305,6 +305,10 @@ pub enum TokenKind {
     RBrace,
     /// `|`
     Pipe,
+    /// `&` (label-expression conjunction, GPM label expressions)
+    Ampersand,
+    /// `!` (label-expression negation, GPM label expressions)
+    Bang,
     /// `->` (right relationship arrow)
     ArrowRight,
     /// `<-` (left relationship arrow)
@@ -632,6 +636,11 @@ impl<'a> Lexer<'a> {
                     Some(b'{') => TokenKind::LBrace,
                     Some(b'}') => TokenKind::RBrace,
                     Some(b'|') => TokenKind::Pipe,
+                    // `&` and `!` are single-byte in Cypher: there is no `&&`/`||` (the boolean
+                    // operators are the `AND`/`OR` keywords) and inequality is `<>`, not `!=`.
+                    // They exist to spell GPM label expressions (`:A&B`, `:!A`).
+                    Some(b'&') => TokenKind::Ampersand,
+                    Some(b'!') => TokenKind::Bang,
                     _ => {
                         // Unknown byte: report the offending *character* (decode it for the span /
                         // message so a multi-byte stray char gets its full byte span).
@@ -1661,6 +1670,34 @@ mod tests {
                 TokenKind::RBrace,
             ]
         );
+    }
+
+    #[test]
+    fn label_expression_operators() {
+        // `&`, `!`, `%`, `|` are the GPM label-expression operators. `&` and `!` are single-byte
+        // (there is no `&&`/`||`/`!=` in Cypher), so a bare `!A` lexes as `Bang` then an identifier.
+        assert_eq!(
+            kinds(":A&B|!C%"),
+            vec![
+                TokenKind::Colon,
+                TokenKind::Identifier("A".to_owned()),
+                TokenKind::Ampersand,
+                TokenKind::Identifier("B".to_owned()),
+                TokenKind::Pipe,
+                TokenKind::Bang,
+                TokenKind::Identifier("C".to_owned()),
+                TokenKind::Percent,
+            ]
+        );
+    }
+
+    #[test]
+    fn bang_is_single_byte_and_spanned() {
+        // `!` is one token even when adjacent to a name; its span covers exactly one byte.
+        let toks = tokenize("!Foo").expect("valid");
+        assert_eq!(toks[0].kind, TokenKind::Bang);
+        assert_eq!(toks[0].span, Span::new(0, 1));
+        assert_eq!(toks[1].kind, TokenKind::Identifier("Foo".to_owned()));
     }
 
     // ----------------------------------------------------------------------------------------

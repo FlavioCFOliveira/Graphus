@@ -31,8 +31,8 @@ use std::fmt;
 use graphus_core::Value;
 
 use crate::ast::{
-    BinaryOp, CaseExpr, Expr, ExprKind, Literal, MapKey, MapProjectionSelector, PredicateOp,
-    UnaryOp,
+    BinaryOp, CaseExpr, Expr, ExprKind, LabelExpr, Literal, MapKey, MapProjectionSelector,
+    PredicateOp, UnaryOp,
 };
 use crate::binding::BoundParameters;
 use crate::equality::{equals, is_in};
@@ -239,10 +239,9 @@ pub fn eval(
             functions,
             clock,
         ),
-        ExprKind::HasLabels { operand, labels } => {
+        ExprKind::HasLabels { operand, expr } => {
             let base = eval(operand, row, params, graph, functions, clock)?;
-            let names: Vec<&str> = labels.iter().map(|l| l.name.as_str()).collect();
-            Ok(ternary_value(has_labels(&base, &names, graph)))
+            Ok(ternary_value(eval_label_expr(&base, expr, graph)))
         }
 
         ExprKind::FunctionCall {
@@ -1336,21 +1335,29 @@ fn eval_case(
 }
 
 /// Tests whether `base` (a node/rel reference) carries **all** of `labels` (3VL: null → NULL).
-fn has_labels(base: &RowValue, labels: &[&str], graph: &dyn GraphAccess) -> Ternary {
+/// Evaluates a [`LabelExpr`] label-expression predicate against a value (Neo4j 5.x semantics).
+///
+/// - **Node**: the expression is evaluated against the node's label set; `%` is true iff the node
+///   carries at least one label, so a node with no labels gives `%` = false and `!A` = true
+///   (`expressions/graph/Graph5.feature`).
+/// - **Relationship**: a relationship always has exactly one type, so the "set" is that single type
+///   and `%` is always true. `A&B` can therefore never match a relationship.
+/// - **`null`**: the predicate is `null` (three-valued), matching `Graph5` [5].
+/// - **Any other value** (has no labels/type): false.
+fn eval_label_expr(base: &RowValue, expr: &LabelExpr, graph: &dyn GraphAccess) -> Ternary {
     match base {
-        RowValue::Node(NodeRef { id }) => match graph.node_labels(*id) {
-            Some(node_labels) => {
-                Ternary::from_bool(labels.iter().all(|l| node_labels.iter().any(|nl| nl == l)))
-            }
-            None => Ternary::False,
-        },
-        // A label predicate on a RELATIONSHIP checks its TYPE: `r:T` is true iff the rel's type equals
-        // the single label name (case-sensitive), else false — never null for a non-null rel
-        // (`expressions/graph/Graph5.feature` [2]). `all` over the (single-element, in the TCK) label
-        // list generalises the type-equality check faithfully.
+        RowValue::Node(NodeRef { id }) => {
+            let node_labels = graph.node_labels(*id).unwrap_or_default();
+            let has_any = !node_labels.is_empty();
+            Ternary::from_bool(expr.evaluate(
+                &|name| node_labels.iter().any(|nl| nl.as_str() == name),
+                has_any,
+            ))
+        }
         RowValue::Rel(RelRef { id }) => match graph.rel_data(*id) {
-            Some(data) => Ternary::from_bool(labels.iter().all(|l| data.rel_type == *l)),
-            None => Ternary::False,
+            Some(data) => Ternary::from_bool(expr.evaluate(&|name| data.rel_type == *name, true)),
+            // A dangling relationship reference carries no type: evaluate against the empty set.
+            None => Ternary::from_bool(expr.evaluate(&|_| false, false)),
         },
         RowValue::Value(Value::Null) => Ternary::Null,
         // Label predicate on any other non-null, non-entity value is FALSE (it has no labels/type).

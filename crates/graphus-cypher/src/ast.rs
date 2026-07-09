@@ -607,8 +607,15 @@ pub struct PatternChainLink {
 pub struct NodePattern {
     /// The optional bound variable.
     pub variable: Option<Variable>,
-    /// The (possibly empty) label list.
+    /// The (possibly empty) **conjunctive** label list — the index-friendly fast path holding
+    /// `:A`, the legacy `:A:B`, or an all-`&` expression `:A&B`. When the label constraint is a
+    /// general [`LabelExpr`] (using `|`, `!`, `%`, or grouping) this is empty and
+    /// [`label_expr`](Self::label_expr) carries it instead. At most one of the two is populated.
     pub labels: Vec<Label>,
+    /// A general [`LabelExpr`] label constraint (`:A|B`, `:!A`, `:%`, `:(A&B)|C`), when the
+    /// constraint is not a pure conjunction of labels; else `None`. Mutually exclusive with a
+    /// non-empty [`labels`](Self::labels).
+    pub label_expr: Option<LabelExpr>,
     /// The optional inline property map / parameter (openCypher `Properties = MapLiteral | Parameter`).
     pub properties: Option<Expr>,
     /// Span from `(` to `)`.
@@ -624,8 +631,16 @@ pub struct RelationshipPattern {
     pub direction: RelDirection,
     /// The optional bound variable.
     pub variable: Option<Variable>,
-    /// The (possibly empty) relationship type alternatives (`:A|B|C`).
+    /// The (possibly empty) **disjunctive** relationship type alternatives (`:A|B|C`) — the
+    /// fast path that drives type-indexed expansion. When the type constraint is a general
+    /// [`LabelExpr`] (using `!`, `&`, or grouping) this is empty and
+    /// [`type_expr`](Self::type_expr) carries it instead. At most one of the two is populated.
     pub types: Vec<RelType>,
+    /// A general [`LabelExpr`] type constraint (`:!A`, `:A&B`, `:(A|B)&!C`), when the constraint
+    /// is not a pure disjunction of types; else `None`. Mutually exclusive with a non-empty
+    /// [`types`](Self::types). The wildcard `:%` on a relationship imposes no constraint (a
+    /// relationship always has a type), so it is normalised to an empty [`types`](Self::types).
+    pub type_expr: Option<LabelExpr>,
     /// The optional variable-length range (`*`, `*2`, `*1..3`, `*..5`).
     pub range: Option<VarLengthRange>,
     /// The optional inline property map / parameter.
@@ -680,6 +695,222 @@ pub struct RelType {
     pub name: String,
     /// Span covering the name.
     pub span: Span,
+}
+
+/// A **label expression** — the GPM / Neo4j 5.x boolean predicate over an entity's label set
+/// (for a node) or its single type (for a relationship).
+///
+/// Built from name [`Leaf`](Self::Leaf)s and the wildcard [`Wildcard`](Self::Wildcard) `%`,
+/// combined with negation `!`, conjunction `&`, and disjunction `|`. Grouping `( … )` is not a
+/// distinct variant: parentheses only reshape the tree, and the tree shape captures the grouping
+/// exactly (`(A&B)|C` is [`Disjunction`](Self::Disjunction) of a [`Conjunction`](Self::Conjunction)
+/// and a [`Leaf`](Self::Leaf), which is structurally distinct from `A&(B|C)`).
+///
+/// **Semantics** (Neo4j 5.x, `expressions/predicates/label-expression-predicates`):
+/// - `&` = AND, `|` = OR, `!` = NOT.
+/// - `%` matches any label (a node with ≥1 label) / any type (a relationship — always, since a
+///   relationship always has exactly one type). A node with **no** labels fails `%` and passes `!A`.
+/// - Operator precedence, tightest first: `!` > `&` > `|`. Parentheses override.
+/// - The legacy colon conjunction `:A:B` is desugared by the parser to `A & B`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[must_use]
+pub enum LabelExpr {
+    /// A single label / type name leaf, e.g. `A`.
+    Leaf {
+        /// The label / type name.
+        name: String,
+        /// Span covering the name (excluding any leading `:`).
+        span: Span,
+    },
+    /// The wildcard `%` — any label (node: matches iff the node carries ≥1 label) / any type
+    /// (relationship: always matches, as a relationship always has exactly one type).
+    Wildcard {
+        /// Span covering `%`.
+        span: Span,
+    },
+    /// Negation `!expr`.
+    Negation {
+        /// The negated sub-expression.
+        operand: Box<LabelExpr>,
+        /// Span covering `!expr`.
+        span: Span,
+    },
+    /// Conjunction `lhs & rhs` (also the desugaring of the legacy colon form `:A:B`).
+    Conjunction {
+        /// Left operand.
+        lhs: Box<LabelExpr>,
+        /// Right operand.
+        rhs: Box<LabelExpr>,
+        /// Span covering the whole conjunction.
+        span: Span,
+    },
+    /// Disjunction `lhs | rhs`.
+    Disjunction {
+        /// Left operand.
+        lhs: Box<LabelExpr>,
+        /// Right operand.
+        rhs: Box<LabelExpr>,
+        /// Span covering the whole disjunction.
+        span: Span,
+    },
+}
+
+impl LabelExpr {
+    /// The byte span of this sub-expression.
+    pub const fn span(&self) -> Span {
+        match self {
+            Self::Leaf { span, .. }
+            | Self::Wildcard { span }
+            | Self::Negation { span, .. }
+            | Self::Conjunction { span, .. }
+            | Self::Disjunction { span, .. } => *span,
+        }
+    }
+
+    /// Whether the expression is exactly the wildcard `%`.
+    #[must_use]
+    pub const fn is_wildcard(&self) -> bool {
+        matches!(self, Self::Wildcard { .. })
+    }
+
+    /// The [`Label`] of a single-leaf expression, or `None` for any compound / wildcard form.
+    #[must_use]
+    pub fn as_single_leaf(&self) -> Option<Label> {
+        match self {
+            Self::Leaf { name, span } => Some(Label {
+                name: name.clone(),
+                span: *span,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The pure conjunction of name leaves (`A`, `A&B`, `A&B&C`), or `None` when the expression
+    /// uses `|`, `!`, or `%`. Lets a conjunctive node-label constraint be routed through the
+    /// index-friendly `Vec<Label>` fast path (a label scan plus residual `HasLabels` filter).
+    #[must_use]
+    pub fn as_conjunction_labels(&self) -> Option<Vec<Label>> {
+        let mut out = Vec::new();
+        self.collect_conjunction(&mut out).then_some(out)
+    }
+
+    fn collect_conjunction(&self, out: &mut Vec<Label>) -> bool {
+        match self {
+            Self::Leaf { name, span } => {
+                out.push(Label {
+                    name: name.clone(),
+                    span: *span,
+                });
+                true
+            }
+            Self::Conjunction { lhs, rhs, .. } => {
+                lhs.collect_conjunction(out) && rhs.collect_conjunction(out)
+            }
+            _ => false,
+        }
+    }
+
+    /// The pure disjunction of name leaves (`A`, `A|B`, `A|B|C`), or `None` when the expression
+    /// uses `&`, `!`, or `%`. Lets a disjunctive relationship-type constraint be routed through the
+    /// existing `Vec<RelType>` fast path (which drives type-indexed expansion).
+    #[must_use]
+    pub fn as_disjunction_types(&self) -> Option<Vec<RelType>> {
+        let mut out = Vec::new();
+        self.collect_disjunction(&mut out).then_some(out)
+    }
+
+    fn collect_disjunction(&self, out: &mut Vec<RelType>) -> bool {
+        match self {
+            Self::Leaf { name, span } => {
+                out.push(RelType {
+                    name: name.clone(),
+                    span: *span,
+                });
+                true
+            }
+            Self::Disjunction { lhs, rhs, .. } => {
+                lhs.collect_disjunction(out) && rhs.collect_disjunction(out)
+            }
+            _ => false,
+        }
+    }
+
+    /// Builds the left-nested conjunction `A & B & …` of `labels`, or `None` for an empty slice.
+    /// The inverse of [`as_conjunction_labels`](Self::as_conjunction_labels); used to lower a
+    /// residual `Vec<Label>` back into a `HasLabels` predicate.
+    #[must_use]
+    pub fn all_of(labels: &[Label]) -> Option<Self> {
+        let mut it = labels.iter();
+        let first = it.next()?;
+        let mut acc = Self::Leaf {
+            name: first.name.clone(),
+            span: first.span,
+        };
+        for l in it {
+            let span = Span::new(acc.span().start, l.span.end);
+            acc = Self::Conjunction {
+                lhs: Box::new(acc),
+                rhs: Box::new(Self::Leaf {
+                    name: l.name.clone(),
+                    span: l.span,
+                }),
+                span,
+            };
+        }
+        Some(acc)
+    }
+
+    /// Evaluates the expression against an entity's label set.
+    ///
+    /// `contains(name)` reports whether the entity carries `name`; `has_any` is whether the entity
+    /// has at least one label (a node) — for a relationship it is always `true`, and the "set" is
+    /// the single type. A node with no labels passes `has_any == false`, so `%` is `false` and
+    /// `!A` is `true` for it (Neo4j 5.x semantics).
+    #[must_use]
+    pub fn evaluate(&self, contains: &impl Fn(&str) -> bool, has_any: bool) -> bool {
+        match self {
+            Self::Leaf { name, .. } => contains(name),
+            Self::Wildcard { .. } => has_any,
+            Self::Negation { operand, .. } => !operand.evaluate(contains, has_any),
+            Self::Conjunction { lhs, rhs, .. } => {
+                lhs.evaluate(contains, has_any) && rhs.evaluate(contains, has_any)
+            }
+            Self::Disjunction { lhs, rhs, .. } => {
+                lhs.evaluate(contains, has_any) || rhs.evaluate(contains, has_any)
+            }
+        }
+    }
+
+    /// Appends every name leaf, in left-to-right order, to `out` (for reference / authorization
+    /// analysis — the set of label/type names a pattern mentions). The wildcard contributes none.
+    pub fn collect_leaf_names<'a>(&'a self, out: &mut Vec<&'a str>) {
+        match self {
+            Self::Leaf { name, .. } => out.push(name),
+            Self::Wildcard { .. } => {}
+            Self::Negation { operand, .. } => operand.collect_leaf_names(out),
+            Self::Conjunction { lhs, rhs, .. } | Self::Disjunction { lhs, rhs, .. } => {
+                lhs.collect_leaf_names(out);
+                rhs.collect_leaf_names(out);
+            }
+        }
+    }
+
+    /// Zeroes every span in the tree, so two structurally identical expressions compare equal
+    /// regardless of source position (mirrors [`Expr::zero_spans_in_place`]).
+    fn zero_spans_in_place(&mut self) {
+        match self {
+            Self::Leaf { span, .. } | Self::Wildcard { span } => *span = Span::new(0, 0),
+            Self::Negation { operand, span } => {
+                *span = Span::new(0, 0);
+                operand.zero_spans_in_place();
+            }
+            Self::Conjunction { lhs, rhs, span } | Self::Disjunction { lhs, rhs, span } => {
+                *span = Span::new(0, 0);
+                lhs.zero_spans_in_place();
+                rhs.zero_spans_in_place();
+            }
+        }
+    }
 }
 
 /// A variable reference (openCypher `Variable = SymbolicName`).
@@ -746,8 +977,12 @@ impl Expr {
                 lhs.zero_spans_in_place();
                 rhs.zero_spans_in_place();
             }
-            ExprKind::Unary { operand, .. } | ExprKind::HasLabels { operand, .. } => {
+            ExprKind::Unary { operand, .. } => {
                 operand.zero_spans_in_place();
+            }
+            ExprKind::HasLabels { operand, expr } => {
+                operand.zero_spans_in_place();
+                expr.zero_spans_in_place();
             }
             ExprKind::Predicate { operand, rhs, .. } => {
                 operand.zero_spans_in_place();
@@ -1015,6 +1250,9 @@ impl PatternElement {
             if let Some(props) = &mut link.relationship.properties {
                 props.zero_spans_in_place();
             }
+            if let Some(type_expr) = &mut link.relationship.type_expr {
+                type_expr.zero_spans_in_place();
+            }
             link.node.zero_expr_spans_in_place();
         }
     }
@@ -1024,6 +1262,9 @@ impl NodePattern {
     fn zero_expr_spans_in_place(&mut self) {
         if let Some(props) = &mut self.properties {
             props.zero_spans_in_place();
+        }
+        if let Some(label_expr) = &mut self.label_expr {
+            label_expr.zero_spans_in_place();
         }
     }
 }
@@ -1091,13 +1332,15 @@ pub enum ExprKind {
         /// The upper bound, if written.
         high: Option<Box<Expr>>,
     },
-    /// A label predicate `expr:Label1:Label2` (openCypher `NonArithmeticOperatorExpression` trailing
-    /// `NodeLabels`) — tests whether the entity has all the listed labels.
+    /// A label-expression predicate `expr:LabelExpr` (openCypher `NonArithmeticOperatorExpression`
+    /// trailing label predicate; Neo4j 5.x label expressions) — evaluates the boolean
+    /// [`LabelExpr`] against the entity's label set (node) or single type (relationship). The legacy
+    /// `expr:A:B` conjunction is one [`LabelExpr`] shape among many.
     HasLabels {
         /// The base expression.
         operand: Box<Expr>,
-        /// The labels tested.
-        labels: Vec<Label>,
+        /// The label expression tested against the entity.
+        expr: LabelExpr,
     },
 
     /// A function call `ns.fn([DISTINCT] args...)` (openCypher `FunctionInvocation`).

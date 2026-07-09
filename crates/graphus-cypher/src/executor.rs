@@ -4862,9 +4862,9 @@ fn extract_aggregates(expr: &Expr, subs: &mut Vec<(String, Expr)>, col: usize) -
             operand: rewrite(operand, subs),
             rhs: rhs.as_deref().map(|e| rewrite(e, subs)),
         },
-        ExprKind::HasLabels { operand, labels } => ExprKind::HasLabels {
+        ExprKind::HasLabels { operand, expr } => ExprKind::HasLabels {
             operand: rewrite(operand, subs),
-            labels: labels.clone(),
+            expr: expr.clone(),
         },
         ExprKind::Property { base, key } => ExprKind::Property {
             base: rewrite(base, subs),

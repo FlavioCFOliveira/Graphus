@@ -56,7 +56,7 @@
 
 use crate::ast::{
     BinaryOp, CallClause, CallSubqueryClause, CaseAlternative, CaseExpr, Clause, CreateClause,
-    DeleteClause, ExistsSubquery, Expr, ExprKind, ForeachClause, InTransactions, Label,
+    DeleteClause, ExistsSubquery, Expr, ExprKind, ForeachClause, InTransactions, Label, LabelExpr,
     ListComprehension, Literal, LoadCsvClause, MapKey, MapProjection, MapProjectionSelector,
     MatchClause, MergeAction, MergeClause, NodePattern, PatternChainLink, PatternComprehension,
     PatternElement, PatternPart, PatternPartKind, PredicateOp, ProcedureCall, ProjectionBody,
@@ -360,6 +360,17 @@ struct Parser<'t, 's> {
     /// recursion — so their hops must not be charged (a legitimate `CREATE ()-->()` × N stays valid).
     /// Set for the duration of a `CREATE`/`MERGE` pattern parse via a save/restore guard.
     suppress_hop_charge: bool,
+    /// When `true`, a top-level `|` is a **structural separator** rather than a label-expression
+    /// disjunction operator, so a label-expression predicate in an expression must not consume it.
+    /// Set while parsing the body of a construct whose grammar uses `|` as a delimiter — a list /
+    /// pattern comprehension predicate + projection, a `reduce(...)` body, a `FOREACH(...)` body —
+    /// and reset to `false` whenever a fresh bracketed/parenthesised sub-context is entered (which
+    /// supplies its own delimiter). Consequence: inside such a body a disjunctive label expression
+    /// must be parenthesised (`[x IN xs WHERE (x:A|B) | x]`); at statement level (`MATCH (n) WHERE
+    /// n:A|B`) the bare form is accepted. This matches how Cypher resolves the ambiguity between a
+    /// label-expression `|` and a comprehension's projection `|`. Label expressions inside a
+    /// **pattern** (node `(…)` / relationship `[…]`) are unaffected — those are `)`/`]`-delimited.
+    pipe_is_separator: bool,
 }
 
 /// An RAII guard that decrements [`Parser::depth`] when it is dropped, so the depth is restored on
@@ -399,6 +410,7 @@ impl<'t, 's> Parser<'t, 's> {
             in_expr: false,
             structural_units: 0,
             suppress_hop_charge: false,
+            pipe_is_separator: false,
         }
     }
 
@@ -766,7 +778,9 @@ impl<'t, 's> Parser<'t, 's> {
         me.expect(&TokenKind::LParen, "'(' to begin a FOREACH")?;
         let variable = me.parse_variable()?;
         me.expect(&TokenKind::In, "IN in a FOREACH")?;
-        let list = me.parse_expr()?;
+        // The list precedes the `|` before the FOREACH update clauses, so a top-level `|` there is
+        // the separator, not a label-expression disjunction (parenthesise to disjunct).
+        let list = me.parse_expr_pipe(true)?;
         me.expect(&TokenKind::Pipe, "'|' before the FOREACH update clauses")?;
 
         let mut body = Vec::new();
@@ -1494,10 +1508,11 @@ impl<'t, 's> Parser<'t, 's> {
         } else {
             None
         };
-        let labels = if self.at(&TokenKind::Colon) {
-            self.parse_node_labels()?
+        // A node pattern is `(`/`)`-delimited, so `|` is always a label-expression disjunction here.
+        let (labels, label_expr) = if self.at(&TokenKind::Colon) {
+            normalize_node_label_expr(self.parse_node_label_expression(true)?)
         } else {
-            Vec::new()
+            (Vec::new(), None)
         };
         let properties = if self.at(&TokenKind::LBrace) || self.is_parameter() {
             Some(self.parse_properties()?)
@@ -1509,6 +1524,7 @@ impl<'t, 's> Parser<'t, 's> {
         Ok(NodePattern {
             variable,
             labels,
+            label_expr,
             properties,
             span: Span::new(start, rparen.span.end),
         })
@@ -1563,13 +1579,15 @@ impl<'t, 's> Parser<'t, 's> {
         }
 
         // --- optional detail bracket (only legal when at most one dash has been consumed) ---------
-        let (mut variable, mut types, mut range, mut properties) = (None, Vec::new(), None, None);
+        let (mut variable, mut types, mut type_expr, mut range, mut properties) =
+            (None, Vec::new(), None, None, None);
         if dashes_consumed == 1 && self.at(&TokenKind::LBracket) {
             let detail = self.parse_relationship_detail()?;
             variable = detail.0;
             types = detail.1;
-            range = detail.2;
-            properties = detail.3;
+            type_expr = detail.2;
+            range = detail.3;
+            properties = detail.4;
         }
 
         // --- trailing side: a second dash and/or an outgoing `>` arrow head ----------------------
@@ -1627,6 +1645,7 @@ impl<'t, 's> Parser<'t, 's> {
             direction,
             variable,
             types,
+            type_expr,
             range,
             properties,
             span: Span::new(start, end),
@@ -1634,7 +1653,8 @@ impl<'t, 's> Parser<'t, 's> {
     }
 
     /// Parses `RelationshipDetail = '[', [Variable], [RelationshipTypes], [RangeLiteral],
-    /// [Properties], ']'`, returning its components.
+    /// [Properties], ']'`, returning its components (the type constraint is normalised into a
+    /// `Vec<RelType>` fast path plus an optional general [`LabelExpr`]).
     #[allow(clippy::type_complexity)]
     fn parse_relationship_detail(
         &mut self,
@@ -1642,6 +1662,7 @@ impl<'t, 's> Parser<'t, 's> {
         (
             Option<Variable>,
             Vec<RelType>,
+            Option<LabelExpr>,
             Option<VarLengthRange>,
             Option<Expr>,
         ),
@@ -1653,10 +1674,10 @@ impl<'t, 's> Parser<'t, 's> {
         } else {
             None
         };
-        let types = if self.at(&TokenKind::Colon) {
-            self.parse_relationship_types()?
+        let (types, type_expr) = if self.at(&TokenKind::Colon) {
+            self.parse_relationship_type_expression()?
         } else {
-            Vec::new()
+            (Vec::new(), None)
         };
         let range = if self.at(&TokenKind::Star) {
             Some(self.parse_range_literal()?)
@@ -1669,27 +1690,30 @@ impl<'t, 's> Parser<'t, 's> {
             None
         };
         self.expect(&TokenKind::RBracket, "']' to close the relationship detail")?;
-        Ok((variable, types, range, properties))
+        Ok((variable, types, type_expr, range, properties))
     }
 
-    /// Parses `RelationshipTypes = ':', RelTypeName, { '|', [':'], RelTypeName }`.
-    fn parse_relationship_types(&mut self) -> Result<Vec<RelType>, SyntaxError> {
+    /// Parses a relationship-type expression `':', LabelExpr` and normalises it: a pure disjunction
+    /// of type names (the common `:A|B|C`, or a single `:A`) is returned as the `Vec<RelType>` fast
+    /// path (drives type-indexed expansion); the wildcard `:%` imposes no constraint (a relationship
+    /// always has a type) and is likewise returned as an empty `Vec<RelType>`; any other expression
+    /// (`:!A`, `:A&B`, grouping) is returned as a general [`LabelExpr`] to be enforced as a filter.
+    ///
+    /// A relationship-type expression is `[`/`]`-delimited, so `|` is always disjunction here.
+    /// openCypher's legacy `'|', [':']` (`[:A|:B]`) is accepted via `rel_context`.
+    fn parse_relationship_type_expression(
+        &mut self,
+    ) -> Result<(Vec<RelType>, Option<LabelExpr>), SyntaxError> {
         self.expect(&TokenKind::Colon, "':' to begin relationship types")?;
-        let mut types = vec![self.parse_rel_type_name()?];
-        while self.eat(&TokenKind::Pipe) {
-            // The optional `:` after `|` (openCypher `'|', [':']`).
-            self.eat(&TokenKind::Colon);
-            types.push(self.parse_rel_type_name()?);
+        let expr = self.parse_label_disjunction(true, true)?;
+        if expr.is_wildcard() {
+            // `:%` on a relationship means "any type" — no constraint at all.
+            return Ok((Vec::new(), None));
         }
-        Ok(types)
-    }
-
-    /// Parses one relationship type name (`SchemaName`); accepts identifiers and keyword-spelled
-    /// names (a `SchemaName` may be a `ReservedWord`).
-    fn parse_rel_type_name(&mut self) -> Result<RelType, SyntaxError> {
-        let span = self.here_span();
-        let name = self.parse_schema_name("a relationship type name")?;
-        Ok(RelType { name, span })
+        match expr.as_disjunction_types() {
+            Some(types) => Ok((types, None)),
+            None => Ok((Vec::new(), Some(expr))),
+        }
     }
 
     /// Parses `RangeLiteral = '*', [IntegerLiteral], ['..', [IntegerLiteral]]`.
@@ -1743,7 +1767,9 @@ impl<'t, 's> Parser<'t, 's> {
         }
     }
 
-    /// Parses `NodeLabels = NodeLabel, { NodeLabel }`, each `NodeLabel = ':', LabelName`.
+    /// Parses `NodeLabels = NodeLabel, { NodeLabel }`, each `NodeLabel = ':', LabelName` — the
+    /// **colon-conjunction-only** label list used by `SET n:A:B` and `REMOVE n:A:B`, where a label
+    /// expression is not permitted (only concrete labels can be added/removed).
     fn parse_node_labels(&mut self) -> Result<Vec<Label>, SyntaxError> {
         let mut labels = Vec::new();
         while self.at(&TokenKind::Colon) {
@@ -1760,6 +1786,155 @@ impl<'t, 's> Parser<'t, 's> {
             return Err(self.expected_here("at least one ':Label'"));
         }
         Ok(labels)
+    }
+
+    /// Parses a node / WHERE **label expression** — the leading `:` followed by a
+    /// [`LabelExpr`](crate::ast::LabelExpr) (GPM / Neo4j 5.x). Supports the operators `&` (AND),
+    /// `|` (OR), `!` (NOT), the wildcard `%`, and grouping `( … )`, with precedence `!` > `&` > `|`.
+    /// The legacy colon conjunction `:A:B` is accepted and desugared to `A & B`; mixing colon
+    /// conjunction with the `&`/`|`/`!`/`%` operators in one expression is a `SyntaxError`
+    /// (matching Neo4j — the two spellings cannot be combined).
+    ///
+    /// `allow_pipe` governs whether a **top-level** `|` is consumed as disjunction: it is `true` in
+    /// pattern contexts (`)`/`]`-delimited) and at statement level, and `false` inside a
+    /// pipe-delimited comprehension / `reduce` / `FOREACH` body (where `|` is the separator and a
+    /// disjunctive label expression must be parenthesised). A `|` inside a `( … )` group is always
+    /// disjunction.
+    fn parse_node_label_expression(&mut self, allow_pipe: bool) -> Result<LabelExpr, SyntaxError> {
+        self.expect(&TokenKind::Colon, "':' to begin a label expression")?;
+        let first = self.parse_label_disjunction(allow_pipe, false)?;
+        // Legacy colon-conjunction chaining `:A:B:C`. Each chained segment must be a bare leaf; a
+        // segment that used a label-expression operator (so is not a single leaf) is an illegal mix
+        // of `:` and `&`/`|`/`!`/`%`.
+        if !self.at(&TokenKind::Colon) {
+            return Ok(first);
+        }
+        let Some(_) = first.as_single_leaf() else {
+            return Err(self.label_expression_mixing_error(first.span()));
+        };
+        let mut acc = first;
+        while self.at(&TokenKind::Colon) {
+            self.bump(); // consume the chaining ':'
+            let rhs = self.parse_label_disjunction(allow_pipe, false)?;
+            if rhs.as_single_leaf().is_none() {
+                return Err(self.label_expression_mixing_error(rhs.span()));
+            }
+            let span = Span::new(acc.span().start, rhs.span().end);
+            acc = LabelExpr::Conjunction {
+                lhs: Box::new(acc),
+                rhs: Box::new(rhs),
+                span,
+            };
+        }
+        Ok(acc)
+    }
+
+    /// The `|`-lowest precedence level of a label expression: `conjunction { '|' [rel ':'] conjunction }`.
+    ///
+    /// `rel_context` enables the legacy optional `:` after `|` in a relationship-type list
+    /// (`[:A|:B]`) and tunes leaf diagnostics ("relationship type" vs "label"). Each `|` fold is
+    /// charged against the expression-fold budget so a huge flat disjunction is a recoverable
+    /// `SyntaxError` rather than unbounded work.
+    fn parse_label_disjunction(
+        &mut self,
+        allow_pipe: bool,
+        rel_context: bool,
+    ) -> Result<LabelExpr, SyntaxError> {
+        let mut lhs = self.parse_label_conjunction(rel_context)?;
+        while allow_pipe && self.at(&TokenKind::Pipe) {
+            self.count_fold()?;
+            self.bump(); // consume '|'
+            if rel_context {
+                // openCypher relationship-type list `'|', [':']` — the optional colon after `|`.
+                self.eat(&TokenKind::Colon);
+            }
+            let rhs = self.parse_label_conjunction(rel_context)?;
+            let span = Span::new(lhs.span().start, rhs.span().end);
+            lhs = LabelExpr::Disjunction {
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                span,
+            };
+        }
+        Ok(lhs)
+    }
+
+    /// The `&` precedence level: `negation { '&' negation }`.
+    fn parse_label_conjunction(&mut self, rel_context: bool) -> Result<LabelExpr, SyntaxError> {
+        let mut lhs = self.parse_label_negation(rel_context)?;
+        while self.at(&TokenKind::Ampersand) {
+            self.count_fold()?;
+            self.bump(); // consume '&'
+            let rhs = self.parse_label_negation(rel_context)?;
+            let span = Span::new(lhs.span().start, rhs.span().end);
+            lhs = LabelExpr::Conjunction {
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                span,
+            };
+        }
+        Ok(lhs)
+    }
+
+    /// The `!` (prefix, right-associative) precedence level: `{ '!' } primary`. Each `!` enters one
+    /// level of recursion so a deeply stacked `!!!…A` is bounded by [`MAX_EXPR_DEPTH`].
+    fn parse_label_negation(&mut self, rel_context: bool) -> Result<LabelExpr, SyntaxError> {
+        if self.at(&TokenKind::Bang) {
+            let mut guard = self.enter_recursion()?;
+            let start = guard.here_span().start;
+            guard.bump(); // consume '!'
+            let operand = guard.parse_label_negation(rel_context)?;
+            let span = Span::new(start, operand.span().end);
+            return Ok(LabelExpr::Negation {
+                operand: Box::new(operand),
+                span,
+            });
+        }
+        self.parse_label_primary(rel_context)
+    }
+
+    /// A label-expression primary: the wildcard `%`, a parenthesised sub-expression `( … )`, or a
+    /// name leaf (a `SchemaName`, so keyword-spelled labels/types are accepted). Each `( … )` group
+    /// enters one level of recursion so a deeply nested expression is bounded by [`MAX_EXPR_DEPTH`].
+    fn parse_label_primary(&mut self, rel_context: bool) -> Result<LabelExpr, SyntaxError> {
+        match self.peek_kind() {
+            Some(TokenKind::Percent) => {
+                let span = self.here_span();
+                self.bump();
+                Ok(LabelExpr::Wildcard { span })
+            }
+            Some(TokenKind::LParen) => {
+                let mut guard = self.enter_recursion()?;
+                guard.bump(); // consume '('
+                // Inside a group, `|` is always disjunction; `rel_context` still tunes leaves.
+                let inner = guard.parse_label_disjunction(true, rel_context)?;
+                guard.expect(&TokenKind::RParen, "')' to close a label expression group")?;
+                Ok(inner)
+            }
+            _ => {
+                let span = self.here_span();
+                let name = self.parse_schema_name(if rel_context {
+                    "a relationship type name"
+                } else {
+                    "a label name"
+                })?;
+                Ok(LabelExpr::Leaf { name, span })
+            }
+        }
+    }
+
+    /// Builds the `SyntaxError` raised when a label expression illegally mixes the legacy colon
+    /// conjunction (`:A:B`) with the `&`/`|`/`!`/`%` operators — Neo4j forbids combining the two.
+    fn label_expression_mixing_error(&self, span: Span) -> SyntaxError {
+        SyntaxError::new(
+            SyntaxErrorKind::Expected {
+                expected: "a label expression that does not mix ':' conjunction with the \
+                           operators '&', '|', '!', '%' (use one style consistently)"
+                    .to_owned(),
+                found: "':'".to_owned(),
+            },
+            span,
+        )
     }
 
     /// Parses `Properties = MapLiteral | Parameter` as an [`Expr`] (a map literal or a parameter).
@@ -1784,6 +1959,19 @@ impl<'t, 's> Parser<'t, 's> {
     /// *parenthesis/`NOT`* nesting, but a left-associative operator chain (`1+1+…+1`) is folded
     /// *iteratively* by the precedence ladder below — so [`Self::count_fold`] bounds it instead, over
     /// the whole top-level expression (every nested sub-expression shares the budget).
+    /// Parses an expression that is one component of a `|`-delimited body (a comprehension /
+    /// `reduce` / `FOREACH` list or predicate) with [`Self::pipe_is_separator`] set to `sep`,
+    /// restoring the previous value afterwards (including on the error path). With `sep == true` a
+    /// trailing `:LabelExpr` predicate at the component's top level will not consume a `|` (it is the
+    /// body's structural separator); nested self-delimited sub-contexts reset this via
+    /// [`parse_atom`](Self::parse_atom).
+    fn parse_expr_pipe(&mut self, sep: bool) -> Result<Expr, SyntaxError> {
+        let saved = std::mem::replace(&mut self.pipe_is_separator, sep);
+        let result = self.parse_expr();
+        self.pipe_is_separator = saved;
+        result
+    }
+
     fn parse_expr(&mut self) -> Result<Expr, SyntaxError> {
         let outermost = !self.in_expr;
         if outermost {
@@ -2178,15 +2366,19 @@ impl<'t, 's> Parser<'t, 's> {
                 _ => break,
             }
         }
-        // Optional trailing label predicate `:L1:L2`.
+        // Optional trailing label-expression predicate `:LabelExpr` (`n:A`, `n:A:B`, `n:A&B`,
+        // `n:A|B`, `n:!A`, `n:%`, `n:(A&B)|C`). A top-level `|` is a disjunction operator only when
+        // it is not acting as a structural separator for an enclosing `|`-delimited body
+        // (comprehension / `reduce` / `FOREACH`); there a disjunctive label expression must be
+        // parenthesised.
         if self.at(&TokenKind::Colon) {
-            let labels = self.parse_node_labels()?;
-            let end = labels.last().map_or(expr.span.end, |l| l.span.end);
-            let span = Span::new(expr.span.start, end);
+            let allow_pipe = !self.pipe_is_separator;
+            let label_expr = self.parse_node_label_expression(allow_pipe)?;
+            let span = Span::new(expr.span.start, label_expr.span().end);
             expr = Expr::new(
                 ExprKind::HasLabels {
                     operand: Box::new(expr),
-                    labels,
+                    expr: label_expr,
                 },
                 span,
             );
@@ -2255,7 +2447,23 @@ impl<'t, 's> Parser<'t, 's> {
 
     /// Parses an `Atom`: literals, parameters, variables, function calls, `count(*)`,
     /// list / map literals, `CASE`, list / pattern comprehensions, and parenthesized expressions.
+    ///
+    /// Every atom is **self-delimited** (`( … )`, `[ … ]`, `{ … }`, `f( … )`), so a `|` appearing in
+    /// its interior belongs to that atom, not to an enclosing `|`-delimited body — it is therefore a
+    /// label-expression disjunction again. This wrapper clears [`Self::pipe_is_separator`] for the
+    /// atom's interior and restores it on exit; the restored value is what the enclosing
+    /// [`parse_postfix_expr`](Self::parse_postfix_expr) sees when deciding whether a trailing
+    /// `:LabelExpr` predicate may consume a `|` (so an enclosing comprehension / `reduce` / `FOREACH`
+    /// separator is preserved exactly at that top level).
     fn parse_atom(&mut self) -> Result<Expr, SyntaxError> {
+        let saved = std::mem::replace(&mut self.pipe_is_separator, false);
+        let result = self.parse_atom_inner();
+        self.pipe_is_separator = saved;
+        result
+    }
+
+    /// The body of [`parse_atom`](Self::parse_atom); see that wrapper for the pipe-separator reset.
+    fn parse_atom_inner(&mut self) -> Result<Expr, SyntaxError> {
         let tok = self
             .peek()
             .ok_or_else(|| self.expected_here("an expression"))?;
@@ -2473,7 +2681,9 @@ impl<'t, 's> Parser<'t, 's> {
         self.expect(&TokenKind::Comma, "',' after the reduce initial value")?;
         let variable = self.parse_variable()?;
         self.expect(&TokenKind::In, "IN in reduce")?;
-        let list = Box::new(self.parse_expr()?);
+        // The list precedes the `|` before the reduce body, so a top-level `|` there is the
+        // separator, not a label-expression disjunction (parenthesise to disjunct).
+        let list = Box::new(self.parse_expr_pipe(true)?);
         self.expect(&TokenKind::Pipe, "'|' before the reduce expression")?;
         let body = Box::new(self.parse_expr()?);
         let rp = self.expect(&TokenKind::RParen, "')' to close reduce")?;
@@ -3040,13 +3250,16 @@ impl<'t, 's> Parser<'t, 's> {
     fn finish_list_comprehension(&mut self, start: usize) -> Result<Expr, SyntaxError> {
         let variable = self.parse_variable()?;
         self.expect(&TokenKind::In, "IN in a list comprehension")?;
-        let list = self.parse_expr()?;
+        // The list and predicate precede the `|` projection separator, so a top-level `|` there is
+        // the separator, not a label-expression disjunction (parenthesise to disjunct).
+        let list = self.parse_expr_pipe(true)?;
         let predicate = if self.eat(&TokenKind::Where) {
-            Some(Box::new(self.parse_expr()?))
+            Some(Box::new(self.parse_expr_pipe(true)?))
         } else {
             None
         };
         let projection = if self.eat(&TokenKind::Pipe) {
+            // After the separator, `|` is a label-expression disjunction again.
             Some(Box::new(self.parse_expr()?))
         } else {
             None
@@ -3076,8 +3289,10 @@ impl<'t, 's> Parser<'t, 's> {
             None
         };
         let element = self.parse_pattern_element()?;
+        // The predicate precedes the mandatory `|` projection separator, so a top-level `|` there is
+        // the separator, not a label-expression disjunction (parenthesise to disjunct).
         let predicate = if self.eat(&TokenKind::Where) {
-            Some(Box::new(self.parse_expr()?))
+            Some(Box::new(self.parse_expr_pipe(true)?))
         } else {
             None
         };
@@ -3294,6 +3509,18 @@ impl<'t, 's> Parser<'t, 's> {
     }
 }
 
+/// Normalises a node-pattern [`LabelExpr`] into the `(Vec<Label>, Option<LabelExpr>)` split stored
+/// on [`NodePattern`]: a pure conjunction of labels (`:A`, the legacy `:A:B`, or an all-`&`
+/// expression `:A&B`) becomes the index-friendly `Vec<Label>` fast path with no general expression;
+/// any expression using `|`, `!`, `%`, or grouping is kept as the general [`LabelExpr`] with an
+/// empty label list. Exactly one side is populated.
+fn normalize_node_label_expr(expr: LabelExpr) -> (Vec<Label>, Option<LabelExpr>) {
+    match expr.as_conjunction_labels() {
+        Some(labels) => (labels, None),
+        None => (Vec::new(), Some(expr)),
+    }
+}
+
 /// Describes a [`TokenKind`] for "found X" error messages.
 fn describe(kind: &TokenKind) -> String {
     match kind {
@@ -3385,6 +3612,8 @@ fn token_text(kind: &TokenKind) -> &'static str {
         TokenKind::LBrace => "{",
         TokenKind::RBrace => "}",
         TokenKind::Pipe => "|",
+        TokenKind::Ampersand => "&",
+        TokenKind::Bang => "!",
         TokenKind::ArrowRight => "->",
         TokenKind::ArrowLeft => "<-",
         TokenKind::DashDash => "--",

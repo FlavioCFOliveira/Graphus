@@ -620,14 +620,14 @@ fn unary_minus_then_postfix() {
 
 #[test]
 fn label_predicate_on_variable() {
-    // n:Label  ==  HasLabels(n, [Label])
+    // n:Label  ==  HasLabels(n, Leaf(Label))
     let kind = return_kind("RETURN n:Label");
-    let ExprKind::HasLabels { operand, labels } = &kind else {
+    let ExprKind::HasLabels { operand, expr } = &kind else {
         panic!("expected a label predicate, got {kind:?}")
     };
     assert!(matches!(operand.kind, ExprKind::Variable(_)));
-    assert_eq!(labels.len(), 1);
-    assert_eq!(labels[0].name, "Label");
+    let leaf = expr.as_single_leaf().expect("a single-label leaf");
+    assert_eq!(leaf.name, "Label");
 }
 
 #[test]
@@ -1070,6 +1070,132 @@ fn anonymous_node_pattern() {
     assert!(node.variable.is_none());
     assert!(node.labels.is_empty());
     assert!(node.properties.is_none());
+}
+
+// ---- Label expressions (GPM / Neo4j 5.x): AST shape --------------------------------------------
+
+/// The normalised label constraint of the first node pattern in a `MATCH` query: the conjunctive
+/// fast-path label names, and the general [`LabelExpr`] (if any).
+fn first_node_label(q: &str) -> (Vec<String>, Option<LabelExpr>) {
+    let query = ok(q);
+    let Clause::Match(m) = &clauses(&query)[0] else {
+        panic!("expected MATCH")
+    };
+    let node = &m.pattern[0].element.start;
+    (
+        node.labels.iter().map(|l| l.name.clone()).collect(),
+        node.label_expr.clone(),
+    )
+}
+
+#[test]
+fn conjunctions_normalise_to_the_label_fast_path() {
+    // `:A`, legacy `:A:B`, and `:A&B&C` all collapse to the index-friendly `Vec<Label>` with no
+    // general expression — semantically identical conjunctions.
+    for (q, want) in [
+        ("MATCH (n:A) RETURN n", vec!["A"]),
+        ("MATCH (n:A:B) RETURN n", vec!["A", "B"]),
+        ("MATCH (n:A&B&C) RETURN n", vec!["A", "B", "C"]),
+    ] {
+        let (labels, expr) = first_node_label(q);
+        assert_eq!(labels, want, "labels for `{q}`");
+        assert!(expr.is_none(), "no general expr for `{q}`");
+    }
+}
+
+#[test]
+fn disjunction_negation_wildcard_keep_a_general_expr() {
+    for q in [
+        "MATCH (n:A|B) RETURN n",
+        "MATCH (n:!A) RETURN n",
+        "MATCH (n:%) RETURN n",
+        "MATCH (n:(A&B)|C) RETURN n",
+    ] {
+        let (labels, expr) = first_node_label(q);
+        assert!(labels.is_empty(), "no fast-path labels for `{q}`");
+        assert!(expr.is_some(), "general expr present for `{q}`");
+    }
+}
+
+#[test]
+fn negation_binds_tighter_than_conjunction_in_ast() {
+    // `!A&B` parses as `(!A) & B`, not `!(A & B)`.
+    let (_, expr) = first_node_label("MATCH (n:!A&B) RETURN n");
+    let LabelExpr::Conjunction { lhs, rhs, .. } = expr.expect("a conjunction") else {
+        panic!("root should be a conjunction");
+    };
+    assert!(matches!(*lhs, LabelExpr::Negation { .. }), "lhs is !A");
+    assert!(matches!(*rhs, LabelExpr::Leaf { .. }), "rhs is B");
+}
+
+#[test]
+fn conjunction_binds_tighter_than_disjunction_in_ast() {
+    // `A|B&C` parses as `A | (B & C)`.
+    let (_, expr) = first_node_label("MATCH (n:A|B&C) RETURN n");
+    let LabelExpr::Disjunction { lhs, rhs, .. } = expr.expect("a disjunction") else {
+        panic!("root should be a disjunction");
+    };
+    assert!(matches!(*lhs, LabelExpr::Leaf { .. }), "lhs is A");
+    assert!(
+        matches!(*rhs, LabelExpr::Conjunction { .. }),
+        "rhs is (B & C)"
+    );
+}
+
+#[test]
+fn grouping_overrides_precedence_in_ast() {
+    // `(A|B)&C` parses as `(A | B) & C`.
+    let (_, expr) = first_node_label("MATCH (n:(A|B)&C) RETURN n");
+    let LabelExpr::Conjunction { lhs, rhs, .. } = expr.expect("a conjunction") else {
+        panic!("root should be a conjunction");
+    };
+    assert!(
+        matches!(*lhs, LabelExpr::Disjunction { .. }),
+        "lhs is (A | B)"
+    );
+    assert!(matches!(*rhs, LabelExpr::Leaf { .. }), "rhs is C");
+}
+
+#[test]
+fn relationship_type_disjunction_uses_fast_path() {
+    // `[:A|B]` keeps the disjunctive `Vec<RelType>` fast path.
+    let query = ok("MATCH (a)-[r:A|B]->(b) RETURN r");
+    let Clause::Match(m) = &clauses(&query)[0] else {
+        panic!("expected MATCH")
+    };
+    let rel = &m.pattern[0].element.chain[0].relationship;
+    assert_eq!(
+        rel.types.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
+        vec!["A", "B"]
+    );
+    assert!(rel.type_expr.is_none());
+}
+
+#[test]
+fn relationship_type_negation_and_wildcard() {
+    let rel_of = |q: &str| {
+        let query = ok(q);
+        let Clause::Match(m) = &clauses(&query)[0] else {
+            panic!("expected MATCH")
+        };
+        m.pattern[0].element.chain[0].relationship.clone()
+    };
+    // `[r:!A]` — a general type expression, empty fast path.
+    let rel = rel_of("MATCH (a)-[r:!A]->(b) RETURN r");
+    assert!(rel.types.is_empty());
+    assert!(matches!(rel.type_expr, Some(LabelExpr::Negation { .. })));
+    // `[:%]` — any type imposes no constraint (empty types, no general expr).
+    let rel = rel_of("MATCH (a)-[:%]->(b) RETURN a");
+    assert!(rel.types.is_empty());
+    assert!(rel.type_expr.is_none());
+}
+
+#[test]
+fn mixing_colon_and_operators_rejected_by_parser() {
+    assert!(err("MATCH (n:A:B&C) RETURN n").span.start <= "MATCH (n:A:B&C) RETURN n".len());
+    // Both orderings of the mix are rejected.
+    let _ = err("MATCH (n:A&B:C) RETURN n");
+    let _ = err("MATCH (n:A:B|C) RETURN n");
 }
 
 #[test]

@@ -32,7 +32,9 @@
 //! implementation renders the tree leaf-deepest-indented, which the golden plan-shape tests in
 //! `tests/logical_planner.rs` assert against.
 
-use crate::ast::{Expr, Label, MapKey, RelDirection, RelType, SortDirection, VarLengthRange};
+use crate::ast::{
+    Expr, Label, LabelExpr, MapKey, RelDirection, RelType, SortDirection, VarLengthRange,
+};
 use std::fmt;
 
 /// A node in a [logical plan](self) tree: one relational-graph algebra operator
@@ -934,6 +936,40 @@ fn fmt_types(types: &[RelType]) -> String {
     }
 }
 
+/// Renders a [`LabelExpr`] for plan display, with parentheses inserted only where operator
+/// precedence (`!` > `&` > `|`) would otherwise change the meaning. The rendered form omits the
+/// leading `:` (the caller supplies it).
+fn fmt_label_expr(expr: &LabelExpr) -> String {
+    /// Binding tightness: disjunction (loosest) < conjunction < negation < atom (tightest).
+    const fn prec(e: &LabelExpr) -> u8 {
+        match e {
+            LabelExpr::Disjunction { .. } => 1,
+            LabelExpr::Conjunction { .. } => 2,
+            LabelExpr::Negation { .. } => 3,
+            LabelExpr::Leaf { .. } | LabelExpr::Wildcard { .. } => 4,
+        }
+    }
+    fn go(e: &LabelExpr, parent: u8) -> String {
+        let body = match e {
+            LabelExpr::Leaf { name, .. } => name.clone(),
+            LabelExpr::Wildcard { .. } => "%".to_owned(),
+            LabelExpr::Negation { operand, .. } => format!("!{}", go(operand, 3)),
+            LabelExpr::Conjunction { lhs, rhs, .. } => {
+                format!("{}&{}", go(lhs, 2), go(rhs, 2))
+            }
+            LabelExpr::Disjunction { lhs, rhs, .. } => {
+                format!("{}|{}", go(lhs, 1), go(rhs, 1))
+            }
+        };
+        if prec(e) < parent {
+            format!("({body})")
+        } else {
+            body
+        }
+    }
+    go(expr, 0)
+}
+
 fn fmt_range(range: &Option<VarLengthRange>) -> String {
     match range {
         None => String::new(),
@@ -1127,9 +1163,8 @@ fn fmt_expr(expr: &Expr) -> String {
             low.as_deref().map(fmt_expr).unwrap_or_default(),
             high.as_deref().map(fmt_expr).unwrap_or_default(),
         ),
-        ExprKind::HasLabels { operand, labels } => {
-            let label_str: String = labels.iter().map(|l| format!(":{}", l.name)).collect();
-            format!("{}{label_str}", fmt_expr(operand))
+        ExprKind::HasLabels { operand, expr } => {
+            format!("{}:{}", fmt_expr(operand), fmt_label_expr(expr))
         }
         ExprKind::FunctionCall {
             name,

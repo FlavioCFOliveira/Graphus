@@ -492,6 +492,16 @@ pub enum SemanticErrorKind {
     /// position (a `WHERE`, or an operand of the boolean operators / `NOT`). TCK detail
     /// `UnexpectedSyntax` (`expressions/pattern/Pattern1` [22]–[24], `expressions/list/List6` [6]).
     PatternPredicateInExpression,
+    /// A **label expression** (`:A|B`, `:!A`, `:%`, or a grouped form) appears where only a fixed
+    /// set of concrete labels/types is allowed: a `CREATE`/`MERGE` node pattern (which *constructs*
+    /// an entity and so must name the exact labels to add), or a variable-length relationship
+    /// (whose per-hop type filtering does not model a general type expression). Neo4j classifies
+    /// this as a `SyntaxError`; TCK detail `UnexpectedSyntax` (no dedicated TCK step — label
+    /// expressions are a Neo4j 5.x / GPM extension).
+    LabelExpressionNotAllowed {
+        /// A short human description of the disallowing context (e.g. `"a CREATE pattern"`).
+        context: &'static str,
+    },
     /// The **same** relationship variable is used twice within one `MATCH` pattern
     /// (`MATCH (a)-[r]->()-[r]->(a)`). Cypher relationship isomorphism forbids a relationship being
     /// traversed twice in a pattern, so reusing its variable is rejected at compile time. TCK detail
@@ -566,6 +576,7 @@ impl SemanticErrorKind {
             Self::InvalidLoadCsvUrl => SemanticDetail::InvalidLoadCsvUrl,
             Self::InvalidShortestPath { .. } => SemanticDetail::InvalidShortestPath,
             Self::PatternPredicateInExpression => SemanticDetail::UnexpectedSyntax,
+            Self::LabelExpressionNotAllowed { .. } => SemanticDetail::UnexpectedSyntax,
             Self::RelationshipUniquenessViolation { .. } => {
                 SemanticDetail::RelationshipUniquenessViolation
             }
@@ -707,6 +718,11 @@ impl fmt::Display for SemanticErrorKind {
                 "a pattern predicate may only appear in a predicate position (a WHERE or a \
                  boolean operand), not in a projection, on the right-hand side of SET, or as a \
                  function argument",
+            ),
+            Self::LabelExpressionNotAllowed { context } => write!(
+                f,
+                "a label expression (using '&', '|', '!', '%', or grouping) is not allowed in \
+                 {context}; only a fixed set of labels/types may be named there"
             ),
             Self::RelationshipUniquenessViolation { name } => write!(
                 f,
@@ -876,6 +892,7 @@ mod tests {
                 | SemanticErrorKind::InvalidLoadCsvUrl
                 | SemanticErrorKind::InvalidShortestPath { .. }
                 | SemanticErrorKind::PatternPredicateInExpression
+                | SemanticErrorKind::LabelExpressionNotAllowed { .. }
                 | SemanticErrorKind::RelationshipUniquenessViolation { .. }
                 | SemanticErrorKind::InvalidParameterUse => kind.classification(),
             }
@@ -936,6 +953,9 @@ mod tests {
                 reason: "x".to_owned(),
             },
             SemanticErrorKind::PatternPredicateInExpression,
+            SemanticErrorKind::LabelExpressionNotAllowed {
+                context: "a CREATE pattern",
+            },
             SemanticErrorKind::RelationshipUniquenessViolation {
                 name: "r".to_owned(),
             },

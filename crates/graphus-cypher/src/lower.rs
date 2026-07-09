@@ -97,11 +97,11 @@
 use std::collections::BTreeSet;
 
 use crate::ast::{
-    CallSubqueryClause, Clause, CreateClause, DeleteClause, Expr, ExprKind, ForeachClause, Literal,
-    LoadCsvClause, MatchClause, MergeAction, MergeClause, NodePattern, PatternElement, PatternPart,
-    PatternPartKind, ProjectionBody, ProjectionItem, Query, QueryBody, RelType,
-    RelationshipPattern, RemoveClause, RemoveItem, SetClause, SetItem, SingleQuery, StandaloneCall,
-    StandaloneYield, UnionPart, UnwindClause,
+    CallSubqueryClause, Clause, CreateClause, DeleteClause, Expr, ExprKind, ForeachClause,
+    LabelExpr, Literal, LoadCsvClause, MatchClause, MergeAction, MergeClause, NodePattern,
+    PatternElement, PatternPart, PatternPartKind, ProjectionBody, ProjectionItem, Query, QueryBody,
+    RelType, RelationshipPattern, RemoveClause, RemoveItem, SetClause, SetItem, SingleQuery,
+    StandaloneCall, StandaloneYield, UnionPart, UnwindClause,
 };
 use crate::function_registry;
 use crate::lexer::Span;
@@ -109,6 +109,19 @@ use crate::logical::{
     CreatePart, LogicalOp, ProjectionColumn, RemoveOp, SetOp, SortKey, Var, YieldColumn,
 };
 use crate::semantics::ValidatedQuery;
+
+/// Builds a [`HasLabels`](ExprKind::HasLabels) predicate over `entity` for the label expression
+/// `expr`, spanned at `span`. Used to lower an inline / residual label-expression constraint into a
+/// [`Filter`](LogicalOp::Filter) predicate.
+fn has_label_expr(entity: &Var, expr: LabelExpr, span: Span) -> Expr {
+    Expr::new(
+        ExprKind::HasLabels {
+            operand: Box::new(Expr::new(ExprKind::Variable(entity.name.clone()), span)),
+            expr,
+        },
+        span,
+    )
+}
 
 /// Lowers a [`ValidatedQuery`] into a [logical plan](crate::logical) (`04 §7.1`).
 ///
@@ -408,12 +421,7 @@ impl Planner {
         // A reused anchor's inline labels were not applied by a scan; enforce them here so an added
         // label predicate on an already-bound node actually filters (`Match3` [25]).
         if anchor_reused {
-            plan = self.filter_inline_labels(
-                plan,
-                &element.start.labels,
-                &anchor_var,
-                element.start.span,
-            );
+            plan = self.filter_inline_labels(plan, &element.start, &anchor_var);
         }
         plan = self.filter_inline_props(plan, element.start.properties.as_ref(), &anchor_var);
 
@@ -450,13 +458,28 @@ impl Planner {
             if !is_var_length {
                 plan =
                     self.filter_inline_props(plan, link.relationship.properties.as_ref(), &rel_var);
+                // A general relationship-type expression (`[r:!REL]`, `[:A&B]`, grouping) cannot be
+                // reduced to the disjunctive `types` fast path, so the Expand traverses every type
+                // and the boolean predicate is enforced here as a `HasLabels` filter on the single
+                // relationship binding. (Var-length hops with a general type expression are rejected
+                // by `semantics`, since per-hop general-type filtering is not modelled by `Expand`.)
+                if let Some(type_expr) = &link.relationship.type_expr {
+                    plan = LogicalOp::Filter {
+                        input: Box::new(plan),
+                        predicate: has_label_expr(
+                            &rel_var,
+                            type_expr.clone(),
+                            link.relationship.span,
+                        ),
+                    };
+                }
             }
             plan = self.filter_inline_props(plan, link.node.properties.as_ref(), &to_var);
             // The target node's inline labels (`(a)-[r]->(b:X)`) constrain `b` to entities carrying
             // all listed labels. The anchor's labels are handled by its scan (`scan_node`), but an
             // expand target is reached through the relationship, never scanned, so its labels must be
             // applied here as a `HasLabels` filter (`WithOrderBy4` [15] regression guard).
-            plan = self.filter_inline_labels(plan, &link.node.labels, &to_var, link.node.span);
+            plan = self.filter_inline_labels(plan, &link.node, &to_var);
             step_rels.push(rel_var);
             from = to_var;
         }
@@ -566,23 +589,25 @@ impl Planner {
                 label: first.clone(),
             };
             if node.labels.len() > 1 {
-                // Residual labels become a HasLabels filter over the remaining labels.
-                let predicate = Expr::new(
-                    ExprKind::HasLabels {
-                        operand: Box::new(Expr::new(
-                            ExprKind::Variable(var.name.clone()),
-                            node.span,
-                        )),
-                        labels: node.labels[1..].to_vec(),
-                    },
-                    node.span,
-                );
-                plan = LogicalOp::Filter {
-                    input: Box::new(plan),
-                    predicate,
-                };
+                // Residual labels become a HasLabels filter over the remaining labels' conjunction.
+                if let Some(residual) = LabelExpr::all_of(&node.labels[1..]) {
+                    plan = LogicalOp::Filter {
+                        input: Box::new(plan),
+                        predicate: has_label_expr(var, residual, node.span),
+                    };
+                }
             }
             plan
+        } else if let Some(label_expr) = &node.label_expr {
+            // A general label expression (`:A|B`, `:!A`, `:%`, grouping) cannot anchor a single
+            // label scan, so scan all nodes and enforce the boolean predicate as a filter. The
+            // physical planner may still rewrite a disjunction into a union of label scans later.
+            LogicalOp::Filter {
+                input: Box::new(LogicalOp::AllNodesScan {
+                    variable: var.clone(),
+                }),
+                predicate: has_label_expr(var, label_expr.clone(), node.span),
+            }
         } else {
             LogicalOp::AllNodesScan {
                 variable: var.clone(),
@@ -661,29 +686,27 @@ impl Planner {
         }
     }
 
-    /// If `labels` is non-empty, places a [`HasLabels`](ExprKind::HasLabels) [`Filter`] over `entity`
-    /// immediately above `plan`. Used for an expand **target** node's inline labels (`->(b:X)`),
-    /// which — unlike an anchor — is reached through the relationship and so is never label-scanned.
+    /// Places a [`HasLabels`](ExprKind::HasLabels) [`Filter`] over `node`'s inline label constraint
+    /// (its conjunctive `labels` or a general `label_expr`) on `entity`, immediately above `plan`.
+    /// Used for an expand **target** node's inline labels (`->(b:X)`) and for a re-used anchor,
+    /// which — unlike a fresh anchor — is reached through a relationship / prior binding and so is
+    /// never label-scanned. A node with no label constraint leaves `plan` unchanged.
     fn filter_inline_labels(
         &mut self,
         plan: LogicalOp,
-        labels: &[crate::ast::Label],
+        node: &NodePattern,
         entity: &Var,
-        span: Span,
     ) -> LogicalOp {
-        if labels.is_empty() {
+        let label_expr = if let Some(expr) = &node.label_expr {
+            expr.clone()
+        } else if let Some(expr) = LabelExpr::all_of(&node.labels) {
+            expr
+        } else {
             return plan;
-        }
-        let predicate = Expr::new(
-            ExprKind::HasLabels {
-                operand: Box::new(Expr::new(ExprKind::Variable(entity.name.clone()), span)),
-                labels: labels.to_vec(),
-            },
-            span,
-        );
+        };
         LogicalOp::Filter {
             input: Box::new(plan),
-            predicate,
+            predicate: has_label_expr(entity, label_expr, node.span),
         }
     }
 
@@ -1502,9 +1525,9 @@ fn rewrite_order_expr(expr: &Expr, targets: &[(&Expr, &str)]) -> Expr {
                 .as_deref()
                 .map(|e| Box::new(rewrite_order_expr(e, targets))),
         },
-        ExprKind::HasLabels { operand, labels } => ExprKind::HasLabels {
+        ExprKind::HasLabels { operand, expr } => ExprKind::HasLabels {
             operand: Box::new(rewrite_order_expr(operand, targets)),
-            labels: labels.clone(),
+            expr: expr.clone(),
         },
         ExprKind::FunctionCall {
             name,
@@ -2147,8 +2170,8 @@ mod tests {
                 LogicalOp::Filter { input, predicate } => {
                     let hit = matches!(
                         &predicate.kind,
-                        ExprKind::HasLabels { labels, .. }
-                            if labels.iter().any(|l| l.name == "X")
+                        ExprKind::HasLabels { expr, .. }
+                            if expr.as_single_leaf().is_some_and(|l| l.name == "X")
                     );
                     hit || has_x_label_filter(input)
                 }

@@ -133,7 +133,7 @@
 //! tree.
 //! Cost ties break on a stable structural key, so plan choice is deterministic for fixed statistics.
 
-use crate::ast::{BinaryOp, Expr, ExprKind, Label, RelType};
+use crate::ast::{BinaryOp, Expr, ExprKind, Label, LabelExpr, RelType};
 use crate::cardinality::estimate_rows;
 use crate::catalog::{IndexCatalog, IndexDescriptor, IndexId};
 use crate::cost::estimate_cost;
@@ -2365,10 +2365,14 @@ fn reverse_expand_alternative(op: &PhysicalOp, catalog: &IndexCatalog) -> Option
 /// Multi-label predicates are declined: the reversal re-applies `from`'s label as a single
 /// `HasLabels`, and a multi-label seed has no single catalog `label_property` to anchor on.
 fn has_single_label(expr: &Expr, variable: &str) -> Option<Label> {
-    if let ExprKind::HasLabels { operand, labels } = &expr.kind {
+    if let ExprKind::HasLabels {
+        operand,
+        expr: label_expr,
+    } = &expr.kind
+    {
         if let ExprKind::Variable(name) = &operand.kind {
-            if name == variable && labels.len() == 1 {
-                return Some(labels[0].clone());
+            if name == variable {
+                return label_expr.as_single_leaf();
             }
         }
     }
@@ -2382,7 +2386,10 @@ fn has_labels_expr(variable: &Var, label: &Label) -> Expr {
     Expr::new(
         ExprKind::HasLabels {
             operand: Box::new(Expr::new(ExprKind::Variable(variable.name.clone()), span)),
-            labels: vec![label.clone()],
+            expr: LabelExpr::Leaf {
+                name: label.name.clone(),
+                span: label.span,
+            },
         },
         span,
     )

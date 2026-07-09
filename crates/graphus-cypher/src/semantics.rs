@@ -547,9 +547,9 @@ fn substitute_restated(expr: &Expr, targets: &[&Expr]) -> Expr {
                 .as_deref()
                 .map(|e| Box::new(substitute_restated(e, targets))),
         },
-        ExprKind::HasLabels { operand, labels } => ExprKind::HasLabels {
+        ExprKind::HasLabels { operand, expr } => ExprKind::HasLabels {
             operand: Box::new(substitute_restated(operand, targets)),
-            labels: labels.clone(),
+            expr: expr.clone(),
         },
         ExprKind::FunctionCall {
             name,
@@ -1779,6 +1779,23 @@ impl Analyzer<'_> {
         scope: &mut Scope,
         role: PatternRole,
     ) -> Result<(), SemanticError> {
+        // A label expression (`:A|B`, `:!A`, `:%`, grouping) is a *predicate*; it only makes sense
+        // where a pattern matches. A CREATE/MERGE node *constructs* an entity and must name the
+        // exact labels to add, so a general label expression there is a compile-time error (Neo4j).
+        if role.is_write() {
+            if let Some(label_expr) = &node.label_expr {
+                return Err(SemanticError::new(
+                    SemanticErrorKind::LabelExpressionNotAllowed {
+                        context: if role == PatternRole::Merge {
+                            "a MERGE pattern"
+                        } else {
+                            "a CREATE pattern"
+                        },
+                    },
+                    label_expr.span(),
+                ));
+            }
+        }
         if let Some(var) = &node.variable {
             // A bound node variable inside a CREATE/MERGE pattern may only be re-used bare: adding
             // labels or properties to it would redefine the existing node — TCK
@@ -1833,6 +1850,20 @@ impl Analyzer<'_> {
         scope: &mut Scope,
         role: PatternRole,
     ) -> Result<(), SemanticError> {
+        // A general relationship-type expression (`:!A`, `:A&B`, grouping) on a variable-length hop
+        // is rejected: the `Expand` operator filters each hop by the disjunctive `types` fast path
+        // only, so a general per-hop type predicate is not modelled. A disjunction (`:A|B`) still
+        // uses the fast path and is unaffected, as is any fixed-length hop.
+        if rel.range.is_some() {
+            if let Some(type_expr) = &rel.type_expr {
+                return Err(SemanticError::new(
+                    SemanticErrorKind::LabelExpressionNotAllowed {
+                        context: "a variable-length relationship",
+                    },
+                    type_expr.span(),
+                ));
+            }
+        }
         // A CREATE/MERGE always creates a *new* relationship, so its variable must be fresh:
         // re-using an already-bound name is `VariableAlreadyBound` (TCK; e.g.
         // `MATCH ()-[r]->() CREATE ()-[r]->()`). Checked BEFORE the well-formedness rules below —
