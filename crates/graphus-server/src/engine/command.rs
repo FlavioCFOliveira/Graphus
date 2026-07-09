@@ -331,6 +331,65 @@ pub struct CreateConstraint {
     pub or_replace: bool,
 }
 
+/// A type filter for `SHOW CONSTRAINTS` (`rmp` task #653): `SHOW <filter> CONSTRAINT[S]` restricts the
+/// listing to the constraint kinds the filter selects, matching Neo4j-5.x's filtered forms
+/// (`SHOW NODE KEY CONSTRAINTS`, `SHOW UNIQUENESS CONSTRAINTS`, `SHOW REL PROPERTY EXISTENCE
+/// CONSTRAINTS`, …). [`All`](Self::All) — and the absent filter of a bare `SHOW CONSTRAINTS` — selects
+/// every kind. The entity-qualified variants (`Node*`/`Rel*`) select one entity dimension; the
+/// unqualified ones (`Unique`/`Existence`/`Key`/`PropertyType`) select both node and relationship.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstraintTypeFilter {
+    /// `ALL` / no filter — every constraint kind.
+    All,
+    /// `NODE [PROPERTY] UNIQUE[NESS]` — node uniqueness only.
+    NodeUnique,
+    /// `REL[ATIONSHIP] [PROPERTY] UNIQUE[NESS]` — relationship uniqueness only.
+    RelUnique,
+    /// `[PROPERTY] UNIQUE[NESS]` — node **and** relationship uniqueness.
+    Unique,
+    /// `NODE [PROPERTY] EXIST[ENCE]` — node existence only.
+    NodeExistence,
+    /// `REL[ATIONSHIP] [PROPERTY] EXIST[ENCE]` — relationship existence only.
+    RelExistence,
+    /// `[PROPERTY] EXIST[ENCE]` — node **and** relationship existence.
+    Existence,
+    /// `NODE KEY` — node key only.
+    NodeKey,
+    /// `REL[ATIONSHIP] KEY` — relationship key only.
+    RelKey,
+    /// `KEY` — node **and** relationship key.
+    Key,
+    /// `NODE PROPERTY TYPE` — node property-type only.
+    NodePropertyType,
+    /// `REL[ATIONSHIP] PROPERTY TYPE` — relationship property-type only.
+    RelPropertyType,
+    /// `PROPERTY TYPE` — node **and** relationship property-type.
+    PropertyType,
+}
+
+impl ConstraintTypeFilter {
+    /// Whether a constraint of durable `kind` is selected by this filter (`rmp` task #653).
+    #[must_use]
+    pub fn matches(self, kind: graphus_storage::ConstraintKind) -> bool {
+        use graphus_storage::ConstraintKind as K;
+        match self {
+            Self::All => true,
+            Self::NodeUnique => kind == K::Unique,
+            Self::RelUnique => kind == K::RelUnique,
+            Self::Unique => matches!(kind, K::Unique | K::RelUnique),
+            Self::NodeExistence => kind == K::Existence,
+            Self::RelExistence => kind == K::RelExistence,
+            Self::Existence => matches!(kind, K::Existence | K::RelExistence),
+            Self::NodeKey => kind == K::NodeKey,
+            Self::RelKey => kind == K::RelKey,
+            Self::Key => matches!(kind, K::NodeKey | K::RelKey),
+            Self::NodePropertyType => kind == K::PropertyType,
+            Self::RelPropertyType => kind == K::RelPropertyType,
+            Self::PropertyType => matches!(kind, K::PropertyType | K::RelPropertyType),
+        }
+    }
+}
+
 /// A **constraint-DDL** statement routed to the engine thread (`rmp` task #99), where the constraint
 /// catalog lives (on the single-threaded coordinator). Like [`IndexCommand`] — and unlike the
 /// DATABASE admin commands, which act on the off-engine async catalog — constraint DDL must reach the
@@ -353,8 +412,20 @@ pub enum ConstraintCommand {
         /// Whether `IF EXISTS` was given (a missing constraint becomes a no-op success).
         if_exists: bool,
     },
-    /// `SHOW CONSTRAINTS` (`rmp` task #99): lists every declared constraint.
-    Show,
+    /// `SHOW [<filter>] CONSTRAINT[S] [YIELD … | WHERE …]` (`rmp` tasks #99, #653): lists declared
+    /// constraints, restricted to `filter`'s kinds, with an optional `YIELD`/`WHERE`/`RETURN` tail.
+    ///
+    /// The engine renders the **full 10-column** row set (`crate::engine::constraint_show::COLUMNS_FULL`,
+    /// filtered by `filter`); the seams then, when `tail` is `Some`, re-run a **translated read query**
+    /// over those rows through the Cypher engine (`crate::engine::constraint_show::finish`), and
+    /// otherwise project to the 8 default columns. `tail` is the raw post-`CONSTRAINT[S]` text (beginning
+    /// `YIELD` or `WHERE`) captured verbatim by the admin parser.
+    Show {
+        /// The constraint-kind filter (`ALL` / a specific-kind selector).
+        filter: ConstraintTypeFilter,
+        /// The raw `YIELD …` / `WHERE …` tail, or [`None`] for a bare listing.
+        tail: Option<String>,
+    },
 }
 
 /// The buffered result of an [`EngineCommand::IndexDdl`]: column names + rows, streamed back through
@@ -671,7 +742,7 @@ pub fn index_ddl_summary(command: &IndexCommand, mutated: bool) -> RunSummary {
 #[must_use]
 pub fn constraint_ddl_summary(command: &ConstraintCommand, mutated: bool) -> RunSummary {
     match command {
-        ConstraintCommand::Show => RunSummary {
+        ConstraintCommand::Show { .. } => RunSummary {
             query_type: Some("r".to_owned()),
             stats: Vec::new(),
         },
@@ -835,7 +906,13 @@ mod tests {
             ("constraints-removed".to_owned(), Value::Integer(1))
         );
 
-        let show = constraint_ddl_summary(&ConstraintCommand::Show, true);
+        let show = constraint_ddl_summary(
+            &ConstraintCommand::Show {
+                filter: ConstraintTypeFilter::All,
+                tail: None,
+            },
+            true,
+        );
         assert_eq!(show.query_type.as_deref(), Some("r"));
         assert!(show.stats.is_empty());
     }

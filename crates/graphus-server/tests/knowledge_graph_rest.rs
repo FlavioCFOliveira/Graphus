@@ -644,3 +644,55 @@ async fn admin_and_ddl_result_summary_over_rest() {
         );
     }
 }
+
+/// `rmp` #653: `SHOW CONSTRAINTS` over the **REST** seam — the bare listing's 8 default columns, a type
+/// filter, and a `YIELD … WHERE … RETURN …` tail (which the REST seam translates + re-runs through the
+/// engine, mirroring the Bolt seam via the shared `constraint_show::finish`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn show_constraints_yield_where_over_rest() {
+    let temp = TempStore::new();
+    let (app, token) = boot_router(&temp).await;
+
+    // Declare a uniqueness constraint and a composite node key over REST auto-commit.
+    let (st, _) = auto_commit(
+        &app,
+        &token,
+        serde_json::json!([
+            { "statement": "CREATE CONSTRAINT uq_email FOR (n:Person) REQUIRE n.email IS UNIQUE" },
+            { "statement": "CREATE CONSTRAINT nk FOR (n:Person) REQUIRE (n.first, n.last) IS NODE KEY" },
+        ]),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "constraint DDL over REST");
+
+    // A bare listing → 8 default columns, ordered by name (nk, uq_email).
+    let bare = query_rows(&app, &token, "SHOW CONSTRAINTS", Json::Null).await;
+    assert_eq!(bare.len(), 2);
+    assert_eq!(
+        bare[0].len(),
+        8,
+        "bare SHOW CONSTRAINTS has 8 columns: {bare:?}"
+    );
+    // Columns: [id, name, type, entityType, ...]; name at index 1, type at index 2.
+    assert_eq!(bare[0][1], Json::from("nk"));
+    assert_eq!(bare[0][2], Json::from("NODE_KEY"));
+    assert_eq!(bare[1][1], Json::from("uq_email"));
+    assert_eq!(bare[1][2], Json::from("NODE_PROPERTY_UNIQUENESS"));
+
+    // A type filter returns only the matching kind.
+    let keys = query_rows(&app, &token, "SHOW NODE KEY CONSTRAINTS", Json::Null).await;
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0][1], Json::from("nk"));
+
+    // A YIELD … WHERE … RETURN … tail is translated and re-run through the engine (the REST tail path).
+    let projected = query_rows(
+        &app,
+        &token,
+        "SHOW CONSTRAINTS YIELD name, type WHERE type = 'NODE_KEY' RETURN name",
+        Json::Null,
+    )
+    .await;
+    assert_eq!(projected.len(), 1, "only the node key matches the WHERE");
+    assert_eq!(projected[0].len(), 1, "RETURN name projects to one column");
+    assert_eq!(projected[0][0], Json::from("nk"));
+}

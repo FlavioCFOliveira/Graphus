@@ -1345,7 +1345,7 @@ pub fn redact_constraint_detail(cmd: &crate::engine::ConstraintCommand) -> Strin
             let if_e = if *if_exists { " IF EXISTS" } else { "" };
             format!("DROP CONSTRAINT {name}{if_e}")
         }
-        C::Show => "SHOW CONSTRAINTS".to_owned(),
+        C::Show { .. } => "SHOW CONSTRAINTS".to_owned(),
     }
 }
 

@@ -449,7 +449,32 @@ CREATE CONSTRAINT ty_tags  FOR (p:Product)     REQUIRE p.tags IS :: LIST<STRING 
 CREATE CONSTRAINT ty_rwhen FOR ()-[r:RATED]-() REQUIRE r.when IS :: ZONED DATETIME
 ```
 
-`SHOW CONSTRAINTS` lists them with columns `name`, `label`, `property`, `type`, `entityType`.
+#### `SHOW CONSTRAINTS`
+
+`SHOW CONSTRAINTS` lists every declared constraint with the Neo4j-5.x column set. The **default**
+columns are `id`, `name`, `type`, `entityType`, `labelsOrTypes`, `properties`, `ownedIndex`,
+`propertyType`; `YIELD *` additionally returns `options` and `createStatement`. The `type` value is one
+of `NODE_PROPERTY_UNIQUENESS`, `RELATIONSHIP_PROPERTY_UNIQUENESS`, `NODE_PROPERTY_EXISTENCE`,
+`RELATIONSHIP_PROPERTY_EXISTENCE`, `NODE_KEY`, `RELATIONSHIP_KEY`, `NODE_PROPERTY_TYPE`,
+`RELATIONSHIP_PROPERTY_TYPE`. `labelsOrTypes` and `properties` are lists; `ownedIndex` names the backing
+index for a uniqueness/key constraint (else `null`); `propertyType` carries a type constraint's declared
+type (else `null`); `createStatement` is a re-runnable `CREATE CONSTRAINT` DDL; `options` is `{}`
+(Graphus has a single built-in index provider).
+
+Type filters and a `YIELD … [WHERE …] [RETURN …] [ORDER BY …] [SKIP …] [LIMIT …]` (or a terse
+`WHERE …`) sub-clause are supported:
+
+```cypher
+SHOW CONSTRAINTS
+SHOW UNIQUE CONSTRAINTS
+SHOW NODE KEY CONSTRAINTS
+SHOW RELATIONSHIP PROPERTY EXISTENCE CONSTRAINTS
+SHOW PROPERTY TYPE CONSTRAINTS
+SHOW CONSTRAINTS YIELD name, type WHERE type = 'NODE_KEY' RETURN name ORDER BY name
+SHOW CONSTRAINTS WHERE entityType = 'RELATIONSHIP'
+```
+
+(`SHOW INDEXES` gains an `owningConstraint` column naming the constraint that owns a backing index.)
 
 ### Typed index DDL
 

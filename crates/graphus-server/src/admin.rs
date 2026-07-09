@@ -104,8 +104,9 @@ use crate::audit::{
 use crate::config::ServerConfig;
 use crate::dbcatalog::{CatalogError, DatabaseCatalog, DbState, normalize_db_name};
 use crate::engine::{
-    ConstraintCommand, ConstraintCreateKind, ConstraintEntity, CreateConstraint, EngineHandle,
-    IndexCommand, NodePropertyIndexRef, RelPropertyIndexRef, RunSummary,
+    ConstraintCommand, ConstraintCreateKind, ConstraintEntity, ConstraintTypeFilter,
+    CreateConstraint, EngineHandle, IndexCommand, NodePropertyIndexRef, RelPropertyIndexRef,
+    RunSummary,
 };
 use crate::security::{SecurityCatalog, SecurityError};
 
@@ -781,6 +782,17 @@ pub fn parse_admin_statement(query: &str) -> AdminParse {
         };
     }
 
+    // --- Filtered SHOW CONSTRAINTS surface (`rmp` task #653): `SHOW <filter> CONSTRAINT[S] [tail]` ---
+    // The filter words (ALL / NODE / REL[ATIONSHIP] / PROPERTY / UNIQUE[NESS] / EXIST[ENCE] / KEY /
+    // TYPE) precede the CONSTRAINT keyword, so `second` here is a filter lead — never a valid Cypher
+    // statement after `SHOW`. Only `SHOW` takes a constraint filter; CREATE/DROP never reach this.
+    if verb == "SHOW" && is_constraint_filter_lead(&second) {
+        return match parse_show_constraints_filtered(&second, &mut lex) {
+            Ok(cmd) => AdminParse::Constraint(cmd),
+            Err(msg) => AdminParse::Invalid(msg),
+        };
+    }
+
     // --- Constraint surface (`rmp` task #99): CREATE/DROP/SHOW CONSTRAINT(S) … ---
     // `CONSTRAINT`/`CONSTRAINTS` directly after a verb is never valid Cypher, so the statement is
     // CLAIMED once the verb + the keyword is seen (mirroring the INDEX surface).
@@ -1374,9 +1386,13 @@ fn parse_claimed_constraint(
     lex: &mut Lexer<'_>,
 ) -> Result<ConstraintCommand, String> {
     if plural {
-        // SHOW CONSTRAINTS — nothing else allowed.
-        expect_end(lex, "SHOW CONSTRAINTS")?;
-        return Ok(ConstraintCommand::Show);
+        // SHOW CONSTRAINTS — the unfiltered listing (filter = All), plus an optional YIELD/WHERE tail
+        // (`rmp` #653). The filtered forms (`SHOW <filter> CONSTRAINT[S]`) are dispatched earlier.
+        let tail = capture_show_constraints_tail(lex)?;
+        return Ok(ConstraintCommand::Show {
+            filter: ConstraintTypeFilter::All,
+            tail,
+        });
     }
     if verb == "SHOW" {
         // `SHOW CONSTRAINT` (singular) is not a recognised form; only the plural `SHOW CONSTRAINTS`.
@@ -1422,6 +1438,186 @@ fn parse_claimed_constraint(
         }
         // `parse_admin_statement` only routes CREATE/DROP/SHOW here; START/STOP never reach this.
         other => Err(format!("unsupported constraint verb {other}")),
+    }
+}
+
+/// Whether `tok` is a leading word of a `SHOW CONSTRAINTS` **type filter** (`rmp` #653) — `ALL` /
+/// `NODE` / `REL[ATIONSHIP]` / `PROPERTY` / `UNIQUE[NESS]` / `EXIST[ENCE]` / `KEY` / `TYPE` — as opposed
+/// to the bare `CONSTRAINT`/`CONSTRAINTS` keyword (which routes through `parse_claimed_constraint`).
+/// Only meaningful right after `SHOW`.
+fn is_constraint_filter_lead(tok: &Tok) -> bool {
+    matches!(tok, Tok::Word(w) if matches!(
+        w.to_ascii_uppercase().as_str(),
+        "ALL" | "NODE" | "REL" | "RELATIONSHIP" | "PROPERTY"
+            | "UNIQUE" | "UNIQUENESS" | "EXIST" | "EXISTENCE" | "KEY" | "TYPE"
+    ))
+}
+
+/// Parses a filtered `SHOW <filter> CONSTRAINT[S] [YIELD … | WHERE …]` (`rmp` #653); `first` is the
+/// already-read leading filter word. Both the singular `CONSTRAINT` and the plural `CONSTRAINTS` are
+/// accepted for the filtered forms (matching Neo4j's `CONSTRAINT[S]`), then the optional tail is
+/// captured verbatim.
+fn parse_show_constraints_filtered(
+    first: &Tok,
+    lex: &mut Lexer<'_>,
+) -> Result<ConstraintCommand, String> {
+    let filter = parse_constraint_type_filter(first, lex)?;
+    // The CONSTRAINT / CONSTRAINTS keyword closes the filter.
+    let kw = lex.next_tok()?.ok_or_else(|| {
+        "expected CONSTRAINT or CONSTRAINTS after the SHOW CONSTRAINTS filter".to_owned()
+    })?;
+    if !is_keyword(&kw, "CONSTRAINT") && !is_keyword(&kw, "CONSTRAINTS") {
+        return Err(unexpected_generic(
+            &kw,
+            "CONSTRAINT or CONSTRAINTS after the SHOW CONSTRAINTS filter",
+        ));
+    }
+    let tail = capture_show_constraints_tail(lex)?;
+    Ok(ConstraintCommand::Show { filter, tail })
+}
+
+/// Parses the `SHOW CONSTRAINTS` type-filter words (`rmp` #653), leaving the lexer positioned at the
+/// closing `CONSTRAINT[S]` keyword. `first` is the already-read leading word. The grammar is an optional
+/// entity (`NODE` / `REL[ATIONSHIP]`), an optional `PROPERTY`, and a terminal category
+/// (`UNIQUE[NESS]` / `EXIST[ENCE]` / `KEY` / `TYPE`); `ALL` is a standalone filter. `KEY` rejects a
+/// preceding `PROPERTY` and `TYPE` requires one, matching Neo4j's forms.
+fn parse_constraint_type_filter(
+    first: &Tok,
+    lex: &mut Lexer<'_>,
+) -> Result<ConstraintTypeFilter, String> {
+    #[derive(Clone, Copy)]
+    enum Ent {
+        Node,
+        Rel,
+    }
+    let mut entity: Option<Ent> = None;
+    let mut property = false;
+    let mut cur = first.clone();
+    loop {
+        let w = match &cur {
+            Tok::Word(w) => w.to_ascii_uppercase(),
+            other => return Err(unexpected_generic(other, "a SHOW CONSTRAINTS filter word")),
+        };
+        match w.as_str() {
+            // `ALL` is a standalone filter: it selects every kind and takes no further words.
+            "ALL" => return Ok(ConstraintTypeFilter::All),
+            "NODE" => {
+                if entity.is_some() || property {
+                    return Err("unexpected NODE in the SHOW CONSTRAINTS filter".to_owned());
+                }
+                entity = Some(Ent::Node);
+            }
+            "REL" | "RELATIONSHIP" => {
+                if entity.is_some() || property {
+                    return Err("unexpected RELATIONSHIP in the SHOW CONSTRAINTS filter".to_owned());
+                }
+                entity = Some(Ent::Rel);
+            }
+            "PROPERTY" => {
+                if property {
+                    return Err(
+                        "unexpected repeated PROPERTY in the SHOW CONSTRAINTS filter".to_owned(),
+                    );
+                }
+                property = true;
+            }
+            "UNIQUE" | "UNIQUENESS" => {
+                return Ok(match entity {
+                    None => ConstraintTypeFilter::Unique,
+                    Some(Ent::Node) => ConstraintTypeFilter::NodeUnique,
+                    Some(Ent::Rel) => ConstraintTypeFilter::RelUnique,
+                });
+            }
+            "EXIST" | "EXISTENCE" => {
+                return Ok(match entity {
+                    None => ConstraintTypeFilter::Existence,
+                    Some(Ent::Node) => ConstraintTypeFilter::NodeExistence,
+                    Some(Ent::Rel) => ConstraintTypeFilter::RelExistence,
+                });
+            }
+            "KEY" => {
+                if property {
+                    return Err(
+                        "KEY constraints are not property constraints (drop PROPERTY before KEY)"
+                            .to_owned(),
+                    );
+                }
+                return Ok(match entity {
+                    None => ConstraintTypeFilter::Key,
+                    Some(Ent::Node) => ConstraintTypeFilter::NodeKey,
+                    Some(Ent::Rel) => ConstraintTypeFilter::RelKey,
+                });
+            }
+            "TYPE" => {
+                if !property {
+                    return Err(
+                        "expected PROPERTY before TYPE in the SHOW CONSTRAINTS filter".to_owned(),
+                    );
+                }
+                return Ok(match entity {
+                    None => ConstraintTypeFilter::PropertyType,
+                    Some(Ent::Node) => ConstraintTypeFilter::NodePropertyType,
+                    Some(Ent::Rel) => ConstraintTypeFilter::RelPropertyType,
+                });
+            }
+            // The CONSTRAINT keyword arrived before a terminal category — the filter is incomplete.
+            "CONSTRAINT" | "CONSTRAINTS" => {
+                return Err(
+                    "expected a constraint category (UNIQUENESS, EXISTENCE, KEY or PROPERTY TYPE) \
+                     in the SHOW CONSTRAINTS filter"
+                        .to_owned(),
+                );
+            }
+            other => {
+                return Err(format!(
+                    "unexpected `{other}` in the SHOW CONSTRAINTS filter"
+                ));
+            }
+        }
+        // A prefix (NODE / REL / PROPERTY) was consumed; read the next filter word. A terminal category
+        // returns above, so reaching here means more filter words must follow before CONSTRAINT[S].
+        cur = lex.next_tok()?.ok_or_else(|| {
+            "expected a constraint category after the SHOW CONSTRAINTS filter prefix".to_owned()
+        })?;
+    }
+}
+
+/// Captures the optional `YIELD … | WHERE …` tail of a `SHOW CONSTRAINTS` statement (`rmp` #653),
+/// **without** consuming it from `lex` (so the raw text is preserved). Returns:
+///
+/// - [`None`] for the end of the statement (or a lone tolerated trailing `;`);
+/// - `Some(raw)` — the raw tail text (a single trailing `;` stripped) — when it begins with `YIELD` or
+///   `WHERE`;
+/// - an error for anything else (so `SHOW CONSTRAINTS garbage` stays a syntax error).
+///
+/// The tail is handed to the seams verbatim, which translate `YIELD`/`WHERE`/`RETURN` into a Cypher
+/// read query re-run over the rendered rows (`crate::engine::constraint_show`).
+fn capture_show_constraints_tail(lex: &mut Lexer<'_>) -> Result<Option<String>, String> {
+    // Peek the first token of the tail on a clone so the raw capture below still sees the whole tail.
+    let mut peek = Lexer {
+        rest: lex.rest.clone(),
+    };
+    match peek.next_tok()? {
+        None => Ok(None),
+        // A lone trailing `;` is tolerated (as `expect_end` does); nothing may follow it.
+        Some(Tok::Symbol(';')) => match peek.next_tok()? {
+            None => Ok(None),
+            Some(t) => Err(unexpected(&t, "end of SHOW CONSTRAINTS statement")),
+        },
+        Some(Tok::Word(w))
+            if w.eq_ignore_ascii_case("YIELD") || w.eq_ignore_ascii_case("WHERE") =>
+        {
+            let raw = lex.rest.as_str().trim();
+            let raw = match raw.strip_suffix(';') {
+                Some(head) => head.trim_end(),
+                None => raw,
+            };
+            Ok(Some(raw.to_owned()))
+        }
+        Some(other) => Err(unexpected(
+            &other,
+            "YIELD or WHERE after SHOW CONSTRAINTS, or the end of the statement",
+        )),
     }
 }
 
@@ -5141,7 +5337,107 @@ mod tests {
                 if_exists: true,
             }
         );
-        assert_eq!(constraint_cmd("SHOW CONSTRAINTS"), ConstraintCommand::Show);
+        assert_eq!(
+            constraint_cmd("SHOW CONSTRAINTS"),
+            ConstraintCommand::Show {
+                filter: ConstraintTypeFilter::All,
+                tail: None,
+            }
+        );
+    }
+
+    /// Every `SHOW <filter> CONSTRAINT[S]` form parses to its [`ConstraintTypeFilter`] (`rmp` #653),
+    /// case-insensitively, with the optional bracketed words optional and both `CONSTRAINT`/`CONSTRAINTS`
+    /// accepted for the filtered forms.
+    #[test]
+    fn show_constraints_type_filters() {
+        use ConstraintTypeFilter as F;
+        let filter = |q: &str| match constraint_cmd(q) {
+            ConstraintCommand::Show { filter, tail: None } => filter,
+            other => panic!("expected an unfiltered SHOW for {q:?}, got {other:?}"),
+        };
+        assert_eq!(filter("SHOW ALL CONSTRAINTS"), F::All);
+        assert_eq!(filter("SHOW CONSTRAINTS"), F::All);
+        // Uniqueness (node / rel / both), with optional PROPERTY and REL/RELATIONSHIP synonyms.
+        assert_eq!(filter("SHOW NODE UNIQUENESS CONSTRAINTS"), F::NodeUnique);
+        assert_eq!(
+            filter("SHOW NODE PROPERTY UNIQUENESS CONSTRAINTS"),
+            F::NodeUnique
+        );
+        assert_eq!(filter("SHOW REL UNIQUE CONSTRAINTS"), F::RelUnique);
+        assert_eq!(
+            filter("SHOW RELATIONSHIP UNIQUENESS CONSTRAINTS"),
+            F::RelUnique
+        );
+        assert_eq!(filter("SHOW UNIQUENESS CONSTRAINTS"), F::Unique);
+        assert_eq!(filter("SHOW PROPERTY UNIQUENESS CONSTRAINT"), F::Unique);
+        // Existence.
+        assert_eq!(filter("SHOW NODE EXISTENCE CONSTRAINTS"), F::NodeExistence);
+        assert_eq!(
+            filter("SHOW REL PROPERTY EXIST CONSTRAINTS"),
+            F::RelExistence
+        );
+        assert_eq!(filter("SHOW EXISTENCE CONSTRAINTS"), F::Existence);
+        // Key (no PROPERTY).
+        assert_eq!(filter("SHOW NODE KEY CONSTRAINTS"), F::NodeKey);
+        assert_eq!(filter("SHOW RELATIONSHIP KEY CONSTRAINTS"), F::RelKey);
+        assert_eq!(filter("SHOW KEY CONSTRAINTS"), F::Key);
+        // Property type (PROPERTY required).
+        assert_eq!(
+            filter("SHOW NODE PROPERTY TYPE CONSTRAINTS"),
+            F::NodePropertyType
+        );
+        assert_eq!(
+            filter("SHOW REL PROPERTY TYPE CONSTRAINTS"),
+            F::RelPropertyType
+        );
+        assert_eq!(filter("SHOW PROPERTY TYPE CONSTRAINTS"), F::PropertyType);
+        // Case-insensitive.
+        assert_eq!(filter("show node key constraints"), F::NodeKey);
+    }
+
+    /// The optional `YIELD`/`WHERE` tail of `SHOW CONSTRAINTS` is captured verbatim (`rmp` #653), for
+    /// both the unfiltered and filtered forms; a bare listing captures no tail.
+    #[test]
+    fn show_constraints_captures_yield_and_where_tail() {
+        let tail = |q: &str| match constraint_cmd(q) {
+            ConstraintCommand::Show { tail, .. } => tail,
+            other => panic!("expected a SHOW for {q:?}, got {other:?}"),
+        };
+        assert_eq!(tail("SHOW CONSTRAINTS"), None);
+        assert_eq!(tail("SHOW CONSTRAINTS;"), None);
+        assert_eq!(
+            tail("SHOW CONSTRAINTS YIELD name, type"),
+            Some("YIELD name, type".to_owned())
+        );
+        assert_eq!(
+            tail("SHOW CONSTRAINTS WHERE entityType = 'NODE'"),
+            Some("WHERE entityType = 'NODE'".to_owned())
+        );
+        // A trailing `;` is stripped from the captured tail.
+        assert_eq!(
+            tail("SHOW CONSTRAINTS YIELD name RETURN name;"),
+            Some("YIELD name RETURN name".to_owned())
+        );
+        // The tail is captured for filtered forms too.
+        assert_eq!(
+            tail("SHOW NODE KEY CONSTRAINTS YIELD *"),
+            Some("YIELD *".to_owned())
+        );
+    }
+
+    /// Malformed `SHOW … CONSTRAINTS` filters / tails are syntax errors, not silent passes (`rmp` #653).
+    #[test]
+    fn show_constraints_malformed_filter_or_tail_is_a_syntax_error() {
+        invalid("SHOW CONSTRAINT"); // singular unfiltered still rejected
+        invalid("SHOW CONSTRAINTS extra"); // garbage tail
+        invalid("SHOW NODE CONSTRAINTS"); // entity without a category
+        invalid("SHOW PROPERTY CONSTRAINTS"); // PROPERTY without a category
+        invalid("SHOW TYPE CONSTRAINTS"); // TYPE requires PROPERTY
+        invalid("SHOW PROPERTY KEY CONSTRAINTS"); // KEY is not a property constraint
+        invalid("SHOW NODE REL KEY CONSTRAINTS"); // two entity qualifiers
+        invalid("SHOW ALL NODE CONSTRAINTS"); // ALL takes no further filter words
+        invalid("SHOW NODE KEY CONSTRAINTS garbage"); // garbage after the filter
     }
 
     #[test]

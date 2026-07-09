@@ -566,8 +566,8 @@ async fn show_indexes_on(client: &mut BoltClient, db: Option<&str>) -> Vec<Index
         .map(|row| {
             assert_eq!(
                 row.len(),
-                6,
-                "name, type, entityType, labelsOrTypes, properties, state: {row:?}"
+                7,
+                "name, type, entityType, labelsOrTypes, properties, state, owningConstraint: {row:?}"
             );
             let mut it = row.into_iter();
             let mut next = || it.next().expect("column present");
@@ -595,6 +595,7 @@ async fn show_indexes_on(client: &mut BoltClient, db: Option<&str>) -> Vec<Index
                 Value::String(s) => s,
                 other => panic!("state must be a string: {other:?}"),
             };
+            let _owning_constraint = next(); // `owningConstraint` (String or Null) — `rmp` #653
             IndexRow {
                 name,
                 label,
@@ -774,7 +775,7 @@ async fn show_indexes_full(client: &mut BoltClient) -> Vec<IndexRowFull> {
     let rows = client.run_ok("SHOW INDEXES", None).await;
     rows.into_iter()
         .map(|row| {
-            assert_eq!(row.len(), 6, "6 SHOW INDEXES columns: {row:?}");
+            assert_eq!(row.len(), 7, "7 SHOW INDEXES columns: {row:?}");
             let mut it = row.into_iter();
             let mut next = || it.next().expect("column present");
             let s = |v: Value, what: &str| match v {
@@ -791,6 +792,7 @@ async fn show_indexes_full(client: &mut BoltClient) -> Vec<IndexRowFull> {
             let label_or_type = single(next(), "labelsOrTypes");
             let property = single(next(), "properties");
             let state = s(next(), "state");
+            let _owning_constraint = next(); // `owningConstraint` (String or Null) — `rmp` #653
             IndexRowFull {
                 name,
                 entity,
@@ -898,6 +900,129 @@ async fn bolt_relationship_property_index_lifecycle() {
             .iter()
             .any(|r| r.entity == "RELATIONSHIP"),
         "the rel index was dropped by target"
+    );
+
+    c.goodbye().await;
+    server.shutdown().await.expect("clean shutdown");
+}
+
+/// `SHOW CONSTRAINTS` end-to-end over Bolt (`rmp` #653), exercising the whole admin-parse → engine →
+/// seam-translate → (re-run) path: the 8 default columns of a bare listing, the 10 columns of `YIELD *`,
+/// a type filter, a `YIELD … WHERE … RETURN …` projection, and a terse `WHERE`.
+#[tokio::test]
+async fn bolt_show_constraints_full_surface() {
+    let temp = TempStore::new("bolt-show-constraints");
+    let server = boot(base_config(&temp)).await;
+    let uds = server.uds_path.clone().expect("UDS enabled");
+    let mut c = BoltClient::connect(&uds).await;
+    c.handshake_and_logon("alice", "admin-pw8").await;
+
+    // Declare a uniqueness constraint and a composite node key over the wire (CREATE CONSTRAINT is
+    // admin-parsed, not Cypher).
+    c.run_ok(
+        "CREATE CONSTRAINT uq_email FOR (n:Person) REQUIRE n.email IS UNIQUE",
+        None,
+    )
+    .await;
+    c.run_ok(
+        "CREATE CONSTRAINT nk FOR (n:Person) REQUIRE (n.first, n.last) IS NODE KEY",
+        None,
+    )
+    .await;
+
+    // Bare SHOW CONSTRAINTS → the 8 default columns, ordered by name (nk, uq_email).
+    let rows = c.run_ok("SHOW CONSTRAINTS", None).await;
+    assert_eq!(rows.len(), 2);
+    for row in &rows {
+        assert_eq!(
+            row.len(),
+            8,
+            "bare SHOW CONSTRAINTS has 8 default columns: {row:?}"
+        );
+    }
+    // Columns: [id, name, type, entityType, labelsOrTypes, properties, ownedIndex, propertyType].
+    assert!(
+        matches!(&rows[0][0], Value::Integer(n) if *n >= 0),
+        "stable id: {:?}",
+        rows[0][0]
+    );
+    assert_eq!(rows[0][1], Value::String("nk".to_owned()));
+    assert_eq!(rows[0][2], Value::String("NODE_KEY".to_owned()));
+    assert_eq!(rows[0][3], Value::String("NODE".to_owned()));
+    assert_eq!(
+        rows[0][4],
+        Value::List(vec![Value::String("Person".to_owned())]),
+        "labelsOrTypes is a list"
+    );
+    assert_eq!(
+        rows[0][5],
+        Value::List(vec![
+            Value::String("first".to_owned()),
+            Value::String("last".to_owned()),
+        ]),
+        "properties is the whole key tuple"
+    );
+    assert_eq!(
+        rows[0][6],
+        Value::String("nk".to_owned()),
+        "a node key owns its backing index"
+    );
+    assert_eq!(rows[1][1], Value::String("uq_email".to_owned()));
+    assert_eq!(
+        rows[1][2],
+        Value::String("NODE_PROPERTY_UNIQUENESS".to_owned())
+    );
+
+    // `id` is STABLE across calls (derived from the durable name).
+    let rows2 = c.run_ok("SHOW CONSTRAINTS", None).await;
+    assert_eq!(rows[0][0], rows2[0][0], "id is stable across calls");
+
+    // YIELD * → the full 10 columns (the `WITH * RETURN *` translation orders them alphabetically, the
+    // Cypher `RETURN *` semantics), including the extended `options` (a map) and a round-trippable
+    // `createStatement` string.
+    let full = c.run_ok("SHOW CONSTRAINTS YIELD *", None).await;
+    assert_eq!(full.len(), 2);
+    for row in &full {
+        assert_eq!(row.len(), 10, "YIELD * has 10 columns: {row:?}");
+    }
+    assert!(
+        full[0]
+            .iter()
+            .any(|v| matches!(v, Value::String(s) if s.contains("CREATE CONSTRAINT"))),
+        "one column is the createStatement: {:?}",
+        full[0]
+    );
+    assert!(
+        full[0].iter().any(|v| matches!(v, Value::Map(_))),
+        "one column is the (empty) options map: {:?}",
+        full[0]
+    );
+
+    // A type filter returns only the matching kind.
+    let keys = c.run_ok("SHOW NODE KEY CONSTRAINTS", None).await;
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0][1], Value::String("nk".to_owned()));
+
+    // YIELD name, type WHERE type = 'NODE_KEY' RETURN name → filtered + projected to one column.
+    let projected = c
+        .run_ok(
+            "SHOW CONSTRAINTS YIELD name, type WHERE type = 'NODE_KEY' RETURN name",
+            None,
+        )
+        .await;
+    assert_eq!(projected.len(), 1, "only the node key matches the WHERE");
+    assert_eq!(projected[0].len(), 1, "RETURN name projects to one column");
+    assert_eq!(projected[0][0], Value::String("nk".to_owned()));
+
+    // A terse WHERE returns the 8 default columns for the matching rows (both are NODE constraints).
+    let where_rows = c
+        .run_ok("SHOW CONSTRAINTS WHERE entityType = 'NODE'", None)
+        .await;
+    assert_eq!(where_rows.len(), 2);
+    assert_eq!(
+        where_rows[0].len(),
+        8,
+        "terse WHERE returns the 8 default columns"
     );
 
     c.goodbye().await;

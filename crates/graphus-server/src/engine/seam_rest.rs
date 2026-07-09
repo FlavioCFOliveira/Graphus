@@ -56,6 +56,7 @@ use crate::audit::{
 };
 
 use super::command::{AccessMode, constraint_ddl_summary, index_ddl_summary};
+use super::constraint_show;
 use super::handle::AdmissionPermit;
 use super::privileges::EffectivePrivileges;
 use super::stream::{RowReceiver, SummarySink};
@@ -278,10 +279,10 @@ impl RestEngineAdapter {
                     return Some(Err(e));
                 }
                 // `SHOW CONSTRAINTS` is read-only — only the mutating CREATE/DROP are schema changes.
-                let mutating = !matches!(cmd, crate::engine::ConstraintCommand::Show);
+                let mutating = !matches!(cmd, crate::engine::ConstraintCommand::Show { .. });
                 let detail = redact_constraint_detail(&cmd);
                 // Keep the command shape for the post-outcome summary (counters depend on
-                // `reply.mutated`).
+                // `reply.mutated`) and to detect the `SHOW CONSTRAINTS` tail.
                 let summary_cmd = cmd.clone();
                 let outcome = handle.constraint_ddl_blocking(cmd);
                 if mutating {
@@ -300,16 +301,52 @@ impl RestEngineAdapter {
                         .detail(detail),
                     );
                 }
-                Some(outcome.map(|reply| {
-                    // Query type `s` + `constraints-added`/`constraints-removed` for a real CREATE/DROP,
-                    // or the `0` counter shape for a no-op drop (`rmp` #626 follow-up); `r` for a SHOW.
-                    let summary = constraint_ddl_summary(&summary_cmd, reply.mutated);
-                    RestEngineStream::admin(AdminResult {
-                        fields: reply.fields,
-                        rows: reply.rows,
-                        summary,
-                    })
-                }))
+                let reply = match outcome {
+                    Ok(reply) => reply,
+                    Err(e) => return Some(Err(e)),
+                };
+                // A `SHOW CONSTRAINTS` finishes through the shared helper (`rmp` #653): a `YIELD`/`WHERE`
+                // tail re-runs a translated read query over the rendered rows; a bare listing projects
+                // to the 8 default columns. CREATE/DROP fall through to the mutation summary below.
+                if let crate::engine::ConstraintCommand::Show { tail, .. } = &summary_cmd {
+                    let tail = tail.clone();
+                    return Some(constraint_show::finish(
+                        reply,
+                        tail.as_deref(),
+                        |query, params| {
+                            // Re-run as a normal auto-commit READ on the transaction's pinned engine.
+                            let permit = handle
+                                .try_admit()
+                                .map_err(|busy| GraphusError::Transaction(busy.to_string()))?;
+                            let ticket = handle.begin_auto_commit_blocking(AccessMode::Read)?;
+                            let privileges = Some(EffectivePrivileges::resolve(
+                                std::sync::Arc::clone(self.context.security()),
+                                Some(principal),
+                                db,
+                            ));
+                            let reply = handle.run_blocking(
+                                ticket, query, params, /* auto_commit */ true, privileges,
+                            )?;
+                            Ok(RestEngineStream {
+                                fields: reply.fields,
+                                source: RowSource::Engine {
+                                    rows: reply.rows,
+                                    _permit: permit,
+                                },
+                                summary: reply.summary,
+                            })
+                        },
+                        RestEngineStream::admin,
+                    ));
+                }
+                // Query type `s` + `constraints-added`/`constraints-removed` for a real CREATE/DROP,
+                // or the `0` counter shape for a no-op drop (`rmp` #626 follow-up).
+                let summary = constraint_ddl_summary(&summary_cmd, reply.mutated);
+                Some(Ok(RestEngineStream::admin(AdminResult {
+                    fields: reply.fields,
+                    rows: reply.rows,
+                    summary,
+                })))
             }
             AdminParse::Invalid(msg) => Some(Err(GraphusError::Compile(msg))),
             AdminParse::NotAdmin => None,

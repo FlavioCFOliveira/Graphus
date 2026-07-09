@@ -45,6 +45,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Neo4j-complete `SHOW CONSTRAINTS` (rmp #653).** The listing now returns the full Neo4j-5.x column
+  set — `id, name, type, entityType, labelsOrTypes, properties, ownedIndex, propertyType` by default,
+  plus `options, createStatement` via `YIELD *` — with the correct `type` strings
+  (`NODE_PROPERTY_UNIQUENESS`, `RELATIONSHIP_PROPERTY_UNIQUENESS`, `NODE_PROPERTY_EXISTENCE`,
+  `RELATIONSHIP_PROPERTY_EXISTENCE`, `NODE_KEY`, `RELATIONSHIP_KEY`, `NODE_PROPERTY_TYPE`,
+  `RELATIONSHIP_PROPERTY_TYPE`), `labelsOrTypes`/`properties` as lists, an `ownedIndex`, a separate
+  `propertyType`, and a re-runnable `createStatement`. Type filters (`SHOW UNIQUE|NODE KEY|RELATIONSHIP
+  PROPERTY EXISTENCE|PROPERTY TYPE|… CONSTRAINTS`) and a full `YIELD … [WHERE] [RETURN] [ORDER BY]
+  [SKIP] [LIMIT]` / terse `WHERE …` sub-clause are supported (the tail is evaluated by re-running a
+  translated `UNWIND`-based Cypher read query, so `YIELD`/`WHERE`/`RETURN` have full expression
+  fidelity). `SHOW INDEXES` gains an `owningConstraint` column.
 - **Optional constraint names + `OPTIONS` clause (rmp #654).** `CREATE CONSTRAINT` no longer requires
   a name: when omitted (`CREATE CONSTRAINT FOR (n:L) REQUIRE …`) a deterministic Neo4j-style name
   (`constraint_<hex>`, derived from the entity + property tuple + kind via a stable hash) is

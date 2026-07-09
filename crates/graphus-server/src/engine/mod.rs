@@ -27,6 +27,7 @@ pub mod bolt_values;
 pub(crate) mod bulk_load;
 pub(crate) mod bulk_load_b;
 pub mod command;
+pub(crate) mod constraint_show;
 mod exec;
 mod handle;
 mod local;
@@ -52,8 +53,8 @@ pub use bulk_load::{BulkImportBatchInput, BulkImportBatchOutcome};
 pub use bulk_load_b::{BulkImportModeBChunkInput, BulkImportModeBChunkOutcome};
 pub use command::{
     AccessMode, CheckpointReply, ConstraintCommand, ConstraintCreateKind, ConstraintEntity,
-    CreateConstraint, EngineCommand, IndexCommand, IndexDdlReply, NodePropertyIndexRef,
-    RelPropertyIndexRef, RunReply, RunSummary,
+    ConstraintTypeFilter, CreateConstraint, EngineCommand, IndexCommand, IndexDdlReply,
+    NodePropertyIndexRef, RelPropertyIndexRef, RunReply, RunSummary,
 };
 pub use handle::{EngineHandle, ServerBusy};
 // `EngineDegraded` is defined in this module (below); re-export note: it is `pub` here.
@@ -2077,7 +2078,7 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             let _ = reply.send(out);
         }
         Cmd::ConstraintDdl { command, reply } => {
-            let mutating = !matches!(command, ConstraintCommand::Show);
+            let mutating = !matches!(command, ConstraintCommand::Show { .. });
             let out = handle_constraint_ddl(coord, &command);
             // A successful mutating constraint DDL changes the schema (a new/dropped unique/existence/
             // node-key/property-type rule) — invalidate so no plan compiled under the old schema is
@@ -2548,11 +2549,13 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
             Ok(IndexDdlReply::mutation(mutated))
         }
         IndexCommand::ShowIndexes => {
-            // Neo4j-conformant column shape (`rmp` task #626): the real driver ecosystem reads
-            // `name, type, entityType, labelsOrTypes, properties, state`. `type` is `RANGE` (the
-            // node-property index kind), `entityType` is `NODE`, and `labelsOrTypes` / `properties`
-            // are single-element lists. The `state` string stays lower-case for coherence with the
-            // full-text / point `SHOW … INDEXES` surfaces.
+            // Neo4j-conformant column shape (`rmp` tasks #626 / #653): the real driver ecosystem reads
+            // `name, type, entityType, labelsOrTypes, properties, state, owningConstraint`. `type` is
+            // `RANGE` (the node-property index kind), `entityType` is `NODE`/`RELATIONSHIP`, and
+            // `labelsOrTypes` / `properties` are single-element lists. The `state` string stays
+            // lower-case for coherence with the full-text / point `SHOW … INDEXES` surfaces.
+            // `owningConstraint` (`rmp` #653) names the uniqueness / key constraint whose backing index
+            // this is (matched by covered `(label/type, single property)`), else `Null`.
             let fields = vec![
                 "name".to_owned(),
                 "type".to_owned(),
@@ -2560,10 +2563,32 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
                 "labelsOrTypes".to_owned(),
                 "properties".to_owned(),
                 "state".to_owned(),
+                "owningConstraint".to_owned(),
             ];
             let state_str = |state: IndexState| match state {
                 IndexState::Online => "online",
                 IndexState::Populating => "populating",
+            };
+            // Attribute a backing index to its owning uniqueness / key constraint by matching the covered
+            // `(entityType, covering token, single property)` (`rmp` #653). A composite node/rel key's
+            // backing index is not a single-property node-property index row, so it never matches here
+            // (its `owningConstraint` stays `Null`) — a documented limitation.
+            let constraints = coordinator.list_constraints();
+            let owning = |is_rel: bool, token: &str, property: &str| -> Value {
+                constraints
+                    .iter()
+                    .find(|c| {
+                        let kind_ok = if is_rel {
+                            matches!(c.kind, ConstraintKind::RelUnique | ConstraintKind::RelKey)
+                        } else {
+                            matches!(c.kind, ConstraintKind::Unique | ConstraintKind::NodeKey)
+                        };
+                        kind_ok
+                            && c.label == token
+                            && c.properties.len() == 1
+                            && c.properties[0] == property
+                    })
+                    .map_or(Value::Null, |c| Value::String(c.name.clone()))
             };
             // Node-property (RANGE, entityType NODE) rows, then relationship-property (RANGE,
             // entityType RELATIONSHIP) rows (`rmp` task #646) — `SHOW INDEXES` lists both, matching
@@ -2572,6 +2597,7 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
                 .list_node_property_indexes()
                 .into_iter()
                 .map(|(name, label, property, state)| {
+                    let owning_constraint = owning(false, &label, &property);
                     vec![
                         Value::String(name),
                         Value::String("RANGE".to_owned()),
@@ -2579,11 +2605,13 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
                         Value::List(vec![Value::String(label)]),
                         Value::List(vec![Value::String(property)]),
                         Value::String(state_str(state).to_owned()),
+                        owning_constraint,
                     ]
                 })
                 .collect();
             rows.extend(coordinator.list_rel_property_indexes().into_iter().map(
                 |(name, rel_type, property, state)| {
+                    let owning_constraint = owning(true, &rel_type, &property);
                     vec![
                         Value::String(name),
                         Value::String("RANGE".to_owned()),
@@ -2591,6 +2619,7 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
                         Value::List(vec![Value::String(rel_type)]),
                         Value::List(vec![Value::String(property)]),
                         Value::String(state_str(state).to_owned()),
+                        owning_constraint,
                     ]
                 },
             ));
@@ -2850,61 +2879,15 @@ fn handle_constraint_ddl<D: BlockDevice, S: LogSink>(
             let mutated = coordinator.drop_constraint(name)?;
             Ok(IndexDdlReply::mutation(mutated))
         }
-        ConstraintCommand::Show => {
-            // `label` carries the covered node label or relationship type; `entityType` (`rmp` #638)
-            // disambiguates them (`NODE` / `RELATIONSHIP`), matching Neo4j's `SHOW CONSTRAINTS` column.
-            let fields = vec![
-                "name".to_owned(),
-                "label".to_owned(),
-                "property".to_owned(),
-                "type".to_owned(),
-                "entityType".to_owned(),
-            ];
-            let rows = coordinator
-                .list_constraints()
-                .into_iter()
-                .map(|info| {
-                    // Neo4j-compatible `type` strings for `SHOW CONSTRAINTS`. A property-type constraint
-                    // additionally appends its declared type (e.g. `NODE_PROPERTY_TYPE INTEGER`) so the
-                    // declared type is visible in the listing. `rmp` #638 adds the relationship kinds.
-                    let type_string = |suffix: &str| match &info.type_descriptor {
-                        Some(d) => {
-                            format!(
-                                "{suffix} {}",
-                                graphus_cypher::constraint::type_descriptor_name(d)
-                            )
-                        }
-                        None => suffix.to_owned(),
-                    };
-                    let kind = match info.kind {
-                        ConstraintKind::Unique => "UNIQUENESS".to_owned(),
-                        ConstraintKind::Existence => "NODE_PROPERTY_EXISTENCE".to_owned(),
-                        ConstraintKind::NodeKey => "NODE_KEY".to_owned(),
-                        ConstraintKind::PropertyType => type_string("NODE_PROPERTY_TYPE"),
-                        ConstraintKind::RelUnique => "RELATIONSHIP_UNIQUENESS".to_owned(),
-                        ConstraintKind::RelExistence => {
-                            "RELATIONSHIP_PROPERTY_EXISTENCE".to_owned()
-                        }
-                        ConstraintKind::RelKey => "RELATIONSHIP_KEY".to_owned(),
-                        ConstraintKind::RelPropertyType => {
-                            type_string("RELATIONSHIP_PROPERTY_TYPE")
-                        }
-                    };
-                    let entity_type = if info.kind.is_relationship() {
-                        "RELATIONSHIP"
-                    } else {
-                        "NODE"
-                    };
-                    // A composite key lists its whole tuple, comma-separated.
-                    let property = info.properties.join(", ");
-                    vec![
-                        Value::String(info.name),
-                        Value::String(info.label),
-                        Value::String(property),
-                        Value::String(kind),
-                        Value::String(entity_type.to_owned()),
-                    ]
-                })
+        ConstraintCommand::Show { filter, tail: _ } => {
+            // Render the Neo4j-5.x-faithful **full 10-column** row set (`rmp` task #653), filtered by the
+            // requested kind filter. The `tail` (YIELD/WHERE) is handled by the seams, which re-run a
+            // translated read query over these rows (or project to the 8 default columns for a bare
+            // listing) — see `constraint_show`. The engine always produces the full shape.
+            let rows = constraint_show::build_rows(coordinator.list_constraints(), *filter);
+            let fields = constraint_show::COLUMNS_FULL
+                .iter()
+                .map(|c| (*c).to_owned())
                 .collect();
             Ok(IndexDdlReply {
                 fields,

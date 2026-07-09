@@ -24,8 +24,8 @@ use graphus_server::config::{
     AdmissionConfig, AuthBootstrap, ServerConfig, TimingConfig, TlsConfig,
 };
 use graphus_server::engine::{
-    AccessMode, ConstraintCommand, ConstraintCreateKind, ConstraintEntity, CreateConstraint,
-    EngineHandle, IndexDdlReply,
+    AccessMode, ConstraintCommand, ConstraintCreateKind, ConstraintEntity, ConstraintTypeFilter,
+    CreateConstraint, EngineHandle, IndexDdlReply,
 };
 use graphus_server::{Server, ServerHandle};
 
@@ -229,11 +229,30 @@ fn create_property_type(
     )
 }
 
+/// Runs `SHOW CONSTRAINTS` directly against the engine (bypassing the seam), so it yields the FULL
+/// 10-column set (`id, name, type, entityType, labelsOrTypes, properties, ownedIndex, propertyType,
+/// options, createStatement` — the `YIELD *` shape). A real client's bare `SHOW CONSTRAINTS` sees the
+/// 8 default columns (the seam projects them); the tail translation is exercised over Bolt in
+/// `db_admin_surface.rs`.
 async fn show_constraints(handle: &EngineHandle) -> IndexDdlReply {
     handle
-        .constraint_ddl(ConstraintCommand::Show)
+        .constraint_ddl(ConstraintCommand::Show {
+            filter: ConstraintTypeFilter::All,
+            tail: None,
+        })
         .await
         .expect("show constraints")
+}
+
+/// The same, but restricted to a constraint-kind filter (`rmp` #653).
+async fn show_constraints_filtered(
+    handle: &EngineHandle,
+    filter: ConstraintTypeFilter,
+) -> IndexDdlReply {
+    handle
+        .constraint_ddl(ConstraintCommand::Show { filter, tail: None })
+        .await
+        .expect("show constraints (filtered)")
 }
 
 #[tokio::test]
@@ -369,26 +388,54 @@ async fn show_constraints_lists_declared_constraints() {
         .expect("create existence");
 
     let reply = show_constraints(&engine).await;
+    // The full 10-column YIELD-* shape (`rmp` #653), in order.
     assert_eq!(
         reply.fields,
         vec![
+            "id".to_owned(),
             "name".to_owned(),
-            "label".to_owned(),
-            "property".to_owned(),
             "type".to_owned(),
             "entityType".to_owned(),
+            "labelsOrTypes".to_owned(),
+            "properties".to_owned(),
+            "ownedIndex".to_owned(),
+            "propertyType".to_owned(),
+            "options".to_owned(),
+            "createStatement".to_owned(),
         ]
     );
     assert_eq!(reply.rows.len(), 2);
     // Rows are ordered by name: name_exists, uniq_email.
-    assert_eq!(reply.rows[0][0], Value::String("name_exists".to_owned()));
+    // Columns: [id, name, type, entityType, labelsOrTypes, properties, ownedIndex, propertyType, ...].
+    assert_eq!(reply.rows[0][1], Value::String("name_exists".to_owned()));
     assert_eq!(
-        reply.rows[0][3],
+        reply.rows[0][2],
         Value::String("NODE_PROPERTY_EXISTENCE".to_owned())
     );
-    assert_eq!(reply.rows[0][4], Value::String("NODE".to_owned()));
-    assert_eq!(reply.rows[1][0], Value::String("uniq_email".to_owned()));
-    assert_eq!(reply.rows[1][3], Value::String("UNIQUENESS".to_owned()));
+    assert_eq!(reply.rows[0][3], Value::String("NODE".to_owned()));
+    assert_eq!(
+        reply.rows[0][4],
+        Value::List(vec![Value::String("Person".to_owned())]),
+        "labelsOrTypes is a single-element list"
+    );
+    assert_eq!(
+        reply.rows[0][5],
+        Value::List(vec![Value::String("name".to_owned())]),
+        "properties is a list"
+    );
+    assert_eq!(reply.rows[0][6], Value::Null, "existence owns no index");
+    assert_eq!(reply.rows[1][1], Value::String("uniq_email".to_owned()));
+    assert_eq!(
+        reply.rows[1][2],
+        Value::String("NODE_PROPERTY_UNIQUENESS".to_owned())
+    );
+    assert_eq!(
+        reply.rows[1][6],
+        Value::String("uniq_email".to_owned()),
+        "a uniqueness constraint owns its backing index"
+    );
+    // `id` is a stable non-negative integer.
+    assert!(matches!(reply.rows[0][0], Value::Integer(n) if n >= 0));
 
     handle.shutdown().await.expect("graceful shutdown");
 }
@@ -713,22 +760,109 @@ async fn show_constraints_lists_all_four_kinds() {
 
     let reply = show_constraints(&engine).await;
     assert_eq!(reply.rows.len(), 4);
-    // Rows are ordered by name: e, k, t, u.
-    assert_eq!(reply.rows[0][0], Value::String("e".to_owned()));
+    // Rows are ordered by name: e, k, t, u. Columns:
+    // [id, name, type, entityType, labelsOrTypes, properties, ownedIndex, propertyType, ...].
+    assert_eq!(reply.rows[0][1], Value::String("e".to_owned()));
     assert_eq!(
-        reply.rows[0][3],
+        reply.rows[0][2],
         Value::String("NODE_PROPERTY_EXISTENCE".to_owned())
     );
-    assert_eq!(reply.rows[1][0], Value::String("k".to_owned()));
-    assert_eq!(reply.rows[1][2], Value::String("first, last".to_owned()));
-    assert_eq!(reply.rows[1][3], Value::String("NODE_KEY".to_owned()));
-    assert_eq!(reply.rows[2][0], Value::String("t".to_owned()));
+    assert_eq!(reply.rows[1][1], Value::String("k".to_owned()));
+    // A composite node key lists its whole property tuple as a list; type is NODE_KEY (no folded type).
     assert_eq!(
-        reply.rows[2][3],
-        Value::String("NODE_PROPERTY_TYPE INTEGER".to_owned())
+        reply.rows[1][5],
+        Value::List(vec![
+            Value::String("first".to_owned()),
+            Value::String("last".to_owned()),
+        ])
     );
-    assert_eq!(reply.rows[3][0], Value::String("u".to_owned()));
-    assert_eq!(reply.rows[3][3], Value::String("UNIQUENESS".to_owned()));
+    assert_eq!(reply.rows[1][2], Value::String("NODE_KEY".to_owned()));
+    assert_eq!(
+        reply.rows[1][6],
+        Value::String("k".to_owned()),
+        "a node key owns its backing index"
+    );
+    assert_eq!(reply.rows[2][1], Value::String("t".to_owned()));
+    // The property type is NOT folded into `type`; it goes in the `propertyType` column.
+    assert_eq!(
+        reply.rows[2][2],
+        Value::String("NODE_PROPERTY_TYPE".to_owned())
+    );
+    assert_eq!(
+        reply.rows[2][7],
+        Value::String("INTEGER".to_owned()),
+        "propertyType column carries the declared type"
+    );
+    assert_eq!(reply.rows[3][1], Value::String("u".to_owned()));
+    assert_eq!(
+        reply.rows[3][2],
+        Value::String("NODE_PROPERTY_UNIQUENESS".to_owned())
+    );
+
+    handle.shutdown().await.expect("graceful shutdown");
+}
+
+/// `rmp` #653: a `SHOW <filter> CONSTRAINTS` type filter returns only the matching kinds. Exercises the
+/// engine's filtered rendering directly (the seam path is covered end-to-end over Bolt in
+/// `db_admin_surface.rs`).
+#[tokio::test]
+async fn show_constraints_type_filter_selects_matching_kinds() {
+    use graphus_storage::ConstraintTypeDescriptor as T;
+    let temp = TempStore::new("show_filter");
+    let handle = boot(config(&temp)).await;
+    let engine = handle.engine.clone();
+
+    engine
+        .constraint_ddl(create_unique("u", "Person", "email"))
+        .await
+        .expect("unique");
+    engine
+        .constraint_ddl(create_node_key("k", "Person", &["first", "last"]))
+        .await
+        .expect("node key");
+    engine
+        .constraint_ddl(create_property_type("t", "Person", "age", T::Integer))
+        .await
+        .expect("property type");
+    engine
+        .constraint_ddl(rel_create(
+            "rk",
+            "RATED",
+            &["a", "b"],
+            ConstraintCreateKind::Key,
+        ))
+        .await
+        .expect("rel key");
+
+    // ALL returns everything.
+    assert_eq!(
+        show_constraints_filtered(&engine, ConstraintTypeFilter::All)
+            .await
+            .rows
+            .len(),
+        4
+    );
+    // NODE KEY returns only the node key (name column is index 1).
+    let node_keys = show_constraints_filtered(&engine, ConstraintTypeFilter::NodeKey).await;
+    assert_eq!(node_keys.rows.len(), 1);
+    assert_eq!(node_keys.rows[0][1], Value::String("k".to_owned()));
+    // KEY returns both node and rel keys.
+    assert_eq!(
+        show_constraints_filtered(&engine, ConstraintTypeFilter::Key)
+            .await
+            .rows
+            .len(),
+        2
+    );
+    // PROPERTY TYPE returns only the property-type constraint.
+    let types = show_constraints_filtered(&engine, ConstraintTypeFilter::PropertyType).await;
+    assert_eq!(types.rows.len(), 1);
+    assert_eq!(types.rows[0][1], Value::String("t".to_owned()));
+    assert_eq!(types.rows[0][7], Value::String("INTEGER".to_owned()));
+    // UNIQUENESS returns only the (node) uniqueness constraint here.
+    let uniq = show_constraints_filtered(&engine, ConstraintTypeFilter::Unique).await;
+    assert_eq!(uniq.rows.len(), 1);
+    assert_eq!(uniq.rows[0][1], Value::String("u".to_owned()));
 
     handle.shutdown().await.expect("graceful shutdown");
 }
@@ -830,8 +964,11 @@ async fn create_or_replace_constraint_drops_and_recreates() {
     // Exactly one constraint remains, and it is now the uniqueness rule.
     let reply = show_constraints(&engine).await;
     assert_eq!(reply.rows.len(), 1);
-    assert_eq!(reply.rows[0][0], Value::String("c".to_owned()));
-    assert_eq!(reply.rows[0][3], Value::String("UNIQUENESS".to_owned()));
+    assert_eq!(reply.rows[0][1], Value::String("c".to_owned()));
+    assert_eq!(
+        reply.rows[0][2],
+        Value::String("NODE_PROPERTY_UNIQUENESS".to_owned())
+    );
 
     // Existence is no longer enforced (a missing email is allowed) but uniqueness now is.
     run(&engine, "CREATE (:Person {name: 'no-email'})").await;
@@ -968,15 +1105,20 @@ async fn relationship_constraints_survive_restart_and_show_entity_type() {
             ))
             .await
             .expect("create rel unique");
-        // A SHOW reports the relationship entityType.
+        // A SHOW reports the relationship entityType and the 5.x rel-uniqueness type string.
         let reply = show_constraints(&engine).await;
         assert_eq!(reply.rows.len(), 1);
-        assert_eq!(reply.rows[0][0], Value::String("paid_ref".to_owned()));
+        assert_eq!(reply.rows[0][1], Value::String("paid_ref".to_owned()));
         assert_eq!(
-            reply.rows[0][3],
-            Value::String("RELATIONSHIP_UNIQUENESS".to_owned())
+            reply.rows[0][2],
+            Value::String("RELATIONSHIP_PROPERTY_UNIQUENESS".to_owned())
         );
-        assert_eq!(reply.rows[0][4], Value::String("RELATIONSHIP".to_owned()));
+        assert_eq!(reply.rows[0][3], Value::String("RELATIONSHIP".to_owned()));
+        assert_eq!(
+            reply.rows[0][4],
+            Value::List(vec![Value::String("PAID".to_owned())]),
+            "labelsOrTypes carries the relationship type"
+        );
         run(
             &engine,
             "MATCH (a:A {id: 1}), (b:B {id: 2}) CREATE (a)-[:PAID {ref: 'x'}]->(b)",
