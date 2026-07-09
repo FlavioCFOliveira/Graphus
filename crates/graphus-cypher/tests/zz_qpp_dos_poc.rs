@@ -1,4 +1,7 @@
-//! TEMPORARY security PoC (audit): QPP resource-exhaustion. Delete after the audit.
+//! Security PoC (audit): QPP / var-length traversal resource-exhaustion — a real, **tracked**
+//! pre-existing DoS (`rmp` #656). Both PoCs are `#[ignore]`d so they do not abort / stall CI; run them
+//! with `cargo test --ignored` to reproduce. They become passing regression tests once #656 lands the
+//! fix (iterative DFS / a validated depth guard + a per-query row/breadth budget).
 use graphus_core::Value;
 use graphus_cypher::binding::{Parameters, bind_parameters};
 use graphus_cypher::catalog::IndexCatalog;
@@ -29,6 +32,7 @@ fn run(src: &str, graph: &mut MemGraph) -> Vec<Row> {
 
 /// PoC A: unbounded DFS recursion depth. A directed chain of N relationships makes the QPP `+`
 /// trail walk recurse ~O(N) deep with NO depth guard -> stack overflow (process abort).
+#[ignore = "reproduces the tracked QPP stack-overflow DoS (rmp #656); aborts the process until fixed"]
 #[test]
 fn poc_a_stack_overflow_long_chain() {
     let n: usize = 50_000;
@@ -51,6 +55,7 @@ fn poc_a_stack_overflow_long_chain() {
 /// PoC B: unbounded `pending` / combinatorial rows. A dense (near-complete) digraph makes the QPP
 /// `+` trail walk enumerate a super-polynomial number of simple (trail) paths, each materialized as
 /// a full Row into an uncapped `pending` VecDeque -> CPU/memory blowup with NO row/memory budget.
+#[ignore = "reproduces the tracked QPP combinatorial trail-path blowup DoS (rmp #656)"]
 #[test]
 fn poc_b_combinatorial_dense_graph() {
     for m in [8usize, 9, 10, 11] {
