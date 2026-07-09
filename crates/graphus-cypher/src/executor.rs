@@ -2198,6 +2198,59 @@ fn build_operator(
                 rows: nodes_to_rows(variable, ids),
             })
         }
+        PhysicalOp::NodeIndexStartsWithSeek {
+            variable,
+            label,
+            property,
+            prefix,
+            ..
+        } => {
+            // `n.p STARTS WITH <prefix>` served by a bounded range seek over `[prefix,
+            // successor(prefix))` (`rmp` task #658). The prefix is evaluated at run time (a literal or,
+            // after auto-parameterisation, a `$param`), so the bounds are computed here — the executor
+            // needs no plan-time knowledge of the value. The seek returns a candidate SUPERSET; the
+            // residual `STARTS WITH` filter above this operator (attached by the planner) restores
+            // exactness (rejecting non-string / non-prefix values), so both the index and the scan
+            // fallback below yield the identical node set.
+            let prefix_val = eval_value(
+                prefix,
+                &Row::empty(),
+                ctx.params,
+                ctx.graph,
+                ctx.functions,
+                &ctx.clock,
+            )?;
+            let ids = match &prefix_val {
+                Value::String(s) => {
+                    let lower = Some((&prefix_val, true)); // inclusive lower = the prefix
+                    // The exclusive upper is the string successor; `None` (an empty or all-`U+10FFFF`
+                    // prefix) leaves the range open above — still a superset (the residual re-checks).
+                    let successor = string_prefix_successor(s).map(Value::String);
+                    let seek = match &successor {
+                        Some(succ) => ctx.graph.index_seek_range(
+                            &label.name,
+                            property,
+                            lower,
+                            Some((succ, false)),
+                        ),
+                        None => ctx
+                            .graph
+                            .index_seek_range(&label.name, property, lower, None),
+                    };
+                    // No usable index at run time (e.g. the off-thread reader declines): fall back to a
+                    // label scan — the residual `STARTS WITH` filter then does the exact trimming, and
+                    // the SSI read footprint matches the scan path (`scan_nodes_by_label`).
+                    seek.unwrap_or_else(|| ctx.graph.scan_nodes_by_label(&label.name))
+                }
+                // A non-string prefix (`STARTS WITH` of a null/number/etc.) matches nothing — every
+                // `STARTS WITH` evaluates to `null`. Scan the label so the residual filter (which also
+                // returns nothing) owns the SSI footprint, identical to the scan-path plan.
+                _ => ctx.graph.scan_nodes_by_label(&label.name),
+            };
+            Ok(Operator::Buffered {
+                rows: nodes_to_rows(variable, ids),
+            })
+        }
         PhysicalOp::SpatialIndexSeek {
             variable,
             label,
@@ -2861,6 +2914,43 @@ fn scan_filter_range(
             }
         })
         .collect()
+}
+
+/// The exclusive upper bound for a `STARTS WITH prefix` range seek (`rmp` task #658): the shortest
+/// string strictly greater than **every** string beginning with `prefix`, so that `[prefix,
+/// successor)` covers exactly the prefix set under Cypher string order (Unicode code point ==
+/// UTF-8 byte-lexicographic — the order [`cmp_values`](crate::ordering::cmp_values) and the
+/// order-preserving property-index keycodec both use).
+///
+/// Computed by incrementing the **last** Unicode scalar of `prefix`; if that scalar is the maximum
+/// (`U+10FFFF`) it **carries** — the trailing max scalar(s) are dropped and the preceding scalar is
+/// incremented (`"a\u{10FFFF}"` -> `"b"`). Returns `None` when no finite successor exists (an empty
+/// prefix, or a prefix of only `U+10FFFF` scalars); the caller then seeks with an open upper bound,
+/// which is still a correct superset since the residual `STARTS WITH` filter restores exactness.
+fn string_prefix_successor(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(last) = chars.pop() {
+        if let Some(next) = next_scalar(last) {
+            let mut out: String = chars.into_iter().collect();
+            out.push(next);
+            return Some(out);
+        }
+        // `last` is `U+10FFFF`: it has been popped (the carry); retry with the preceding scalar.
+    }
+    None
+}
+
+/// The next Unicode scalar value after `c`, skipping the surrogate gap (`U+D800..=U+DFFF` are not
+/// scalar values), or `None` if `c` is the maximum scalar `U+10FFFF`.
+fn next_scalar(c: char) -> Option<char> {
+    let mut n = c as u32 + 1;
+    while n <= 0x10_FFFF {
+        if let Some(ch) = char::from_u32(n) {
+            return Some(ch);
+        }
+        n += 1; // step over the UTF-16 surrogate range (never valid `char`s)
+    }
+    None
 }
 
 /// One side of an index range bound: `(value, inclusive)`. `None` means the side is open.
@@ -7518,6 +7608,7 @@ fn result_columns(op: &PhysicalOp, procedures: &dyn ProcedureRegistry) -> Vec<St
         | PhysicalOp::NodeIndexSeek { variable, .. }
         | PhysicalOp::NodeLabelScanEq { variable, .. }
         | PhysicalOp::NodeIndexRangeSeek { variable, .. }
+        | PhysicalOp::NodeIndexStartsWithSeek { variable, .. }
         | PhysicalOp::SpatialIndexSeek { variable, .. } => vec![variable.name.clone()],
         PhysicalOp::AllRelationshipsScan {
             relationship,
@@ -9420,5 +9511,75 @@ mod tests {
             serial.finish(),
             "collect(DISTINCT) merge must be the order-preserving first-encounter union"
         );
+    }
+
+    // ---- string-prefix successor (STARTS WITH bounded range seek, `rmp` task #658) --------------
+
+    /// The exclusive upper bound is the shortest string strictly greater than every string with the
+    /// prefix: increment the last scalar, carrying over trailing `U+10FFFF`.
+    #[test]
+    fn prefix_successor_basic_and_unicode() {
+        assert_eq!(string_prefix_successor("ab").as_deref(), Some("ac"));
+        assert_eq!(string_prefix_successor("az").as_deref(), Some("a{")); // 'z' (0x7A) -> '{' (0x7B)
+        // Multi-byte last scalar: 'é' (U+00E9) -> 'ê' (U+00EA).
+        assert_eq!(
+            string_prefix_successor("caf\u{00E9}").as_deref(),
+            Some("caf\u{00EA}")
+        );
+    }
+
+    /// An empty prefix (and an all-`U+10FFFF` prefix) has no finite successor -> open upper bound.
+    #[test]
+    fn prefix_successor_open_upper_cases() {
+        assert_eq!(string_prefix_successor(""), None);
+        assert_eq!(string_prefix_successor("\u{10FFFF}"), None);
+        assert_eq!(string_prefix_successor("\u{10FFFF}\u{10FFFF}"), None);
+    }
+
+    /// A trailing max scalar carries: drop it and increment the preceding scalar (a shorter string).
+    #[test]
+    fn prefix_successor_carries_over_max_scalar() {
+        assert_eq!(string_prefix_successor("a\u{10FFFF}").as_deref(), Some("b"));
+        assert_eq!(
+            string_prefix_successor("ab\u{10FFFF}\u{10FFFF}").as_deref(),
+            Some("ac")
+        );
+    }
+
+    /// The successor must skip the UTF-16 surrogate gap (`U+D800..=U+DFFF` are not scalar values):
+    /// incrementing `U+D7FF` yields `U+E000`.
+    #[test]
+    fn prefix_successor_skips_surrogate_gap() {
+        assert_eq!(next_scalar('\u{D7FF}'), Some('\u{E000}'));
+        assert_eq!(next_scalar('\u{10FFFF}'), None);
+        assert_eq!(
+            string_prefix_successor("x\u{D7FF}").as_deref(),
+            Some("x\u{E000}")
+        );
+    }
+
+    /// Property: the successor is strictly greater than the prefix and than `prefix + any suffix`,
+    /// under `cmp_values` (the byte-lexicographic order the seam re-check and the keycodec use). This
+    /// is the soundness invariant of the seek's upper bound — no matching string is ever excluded.
+    #[test]
+    fn prefix_successor_bounds_every_prefixed_string() {
+        use crate::ordering::cmp_values;
+        use std::cmp::Ordering;
+        let prefixes = ["a", "ab", "caf\u{00E9}", "z", "\u{0080}", "hello"];
+        let suffixes = ["", "x", "\u{10FFFF}", "zzz", "\u{00E9}"];
+        for p in prefixes {
+            let Some(succ) = string_prefix_successor(p) else {
+                continue;
+            };
+            let succ_v = Value::String(succ);
+            for s in suffixes {
+                let candidate = Value::String(format!("{p}{s}"));
+                assert_eq!(
+                    cmp_values(&candidate, &succ_v),
+                    Ordering::Less,
+                    "`{p}{s}` must sort below the exclusive upper bound"
+                );
+            }
+        }
     }
 }

@@ -312,6 +312,147 @@ fn range_seek_inclusive_and_open_lower_equal_scan_filter() {
     }
 }
 
+// =================================================================================================
+// STARTS WITH: the string-prefix seek == scan+filter, with the index actually used (rmp #658)
+// =================================================================================================
+
+fn has_starts_with_seek(plan: &PhysicalPlan) -> bool {
+    plan_contains(plan, &|op| {
+        matches!(op, PhysicalOp::NodeIndexStartsWithSeek { .. })
+    })
+}
+
+/// Seeds a `(:Word {id, name})` corpus with ASCII, Unicode, empty-string, missing, mixed-type
+/// (numeric `name`) and other-label rows — the full matrix the string-prefix seek must serve
+/// identically to a scan + `STARTS WITH` filter. Each node carries a unique integer `id` so result
+/// sets compare as sorted id lists.
+fn seed_words(coord: &mut Coord) {
+    for (id, name) in [
+        (1, "alpha"),
+        (2, "alpine"),
+        (3, "beta"),
+        (4, "az"),
+        (5, "a"),
+        (6, "café"),  // U+00E9
+        (7, "cafe"),  // ASCII 'e'
+        (8, "cafés"), // 'café' is a prefix of this
+        (9, "CAFÉ"),  // uppercase — different code points, must not match 'caf'
+        (10, "naïve"),
+        (11, ""), // empty-string name: matches STARTS WITH '' only
+    ] {
+        run_write(
+            coord,
+            &format!("CREATE (:Word {{id: {id}, name: '{name}'}})"),
+        );
+    }
+    // A mixed-type row: `name` is a NUMBER. Every `STARTS WITH` must evaluate to null for it, so it
+    // must never appear — the retained residual filter is what rejects it (the index band excludes it
+    // for a bounded range, but the empty-prefix open-upper range admits it as a candidate).
+    run_write(coord, "CREATE (:Word {id: 12, name: 42})");
+    // A row with no `name` at all (null) — never matches any string predicate.
+    run_write(coord, "CREATE (:Word {id: 13})");
+    // A different label carrying a would-be-matching name — must not leak into `:Word` results.
+    run_write(coord, "CREATE (:Other {id: 14, name: 'alpha'})");
+}
+
+#[test]
+fn starts_with_seek_equals_scan_filter_and_uses_prefix_seek() {
+    let mut coord = fresh_coord();
+    seed_words(&mut coord);
+    coord
+        .create_node_property_index("Word", "name")
+        .expect("create index");
+    let indexed = coord.catalog();
+
+    // (query, expected matching ids) — covers ASCII prefixes, a single-char prefix, Unicode prefixes
+    // (multi-byte last scalar), an exact-length and a prefix-of relationship, the empty prefix
+    // (matches every STRING name but not the numeric/null/other-label rows), a no-match prefix, and a
+    // prefix longer than any value.
+    let cases: &[(&str, &[i64])] = &[
+        ("'al'", &[1, 2]),
+        ("'a'", &[1, 2, 4, 5]),
+        ("'caf'", &[6, 7, 8]),   // not CAFÉ (id 9): 'C' != 'c'
+        ("'café'", &[6, 8]),     // café itself + cafés; NOT cafe (id 7): 'e' != 'é'
+        ("'na\u{00EF}'", &[10]), // 'naï' — multi-byte prefix
+        ("''", &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]), // every string name; NOT 42/null/Other
+        ("'z'", &[]),
+        ("'alphabet'", &[]), // prefix longer than 'alpha'
+    ];
+
+    for (lit, expected) in cases {
+        let src = format!("MATCH (n:Word) WHERE n.name STARTS WITH {lit} RETURN n.id AS a");
+        let plan = compile(&src, &indexed);
+        assert!(
+            has_starts_with_seek(&plan),
+            "`{src}` must use a NodeIndexStartsWithSeek:\n{plan}"
+        );
+        let via_index = read_sorted_ints(&mut coord, &indexed, &src, "a");
+        let via_scan = read_sorted_ints(&mut coord, &IndexCatalog::empty(), &src, "a");
+        assert_eq!(
+            via_index, via_scan,
+            "`{src}`: prefix seek must equal scan+filter"
+        );
+        assert_eq!(
+            via_index,
+            expected.to_vec(),
+            "`{src}`: unexpected match set"
+        );
+    }
+}
+
+#[test]
+fn starts_with_seek_matches_scan_under_param_prefix() {
+    // The prefix arrives as a `$param` (the shape literal auto-parameterisation produces). The
+    // executor computes the bounds from the run-time value, so the param form is served by the same
+    // prefix seek as a literal — and equals the scan path.
+    let mut coord = fresh_coord();
+    seed_words(&mut coord);
+    coord
+        .create_node_property_index("Word", "name")
+        .expect("create index");
+    let indexed = coord.catalog();
+
+    let src = "MATCH (n:Word) WHERE n.name STARTS WITH $p RETURN n.id AS a";
+    let plan = compile(src, &indexed);
+    assert!(
+        has_starts_with_seek(&plan),
+        "the param-prefix plan must still use a NodeIndexStartsWithSeek:\n{plan}"
+    );
+
+    // Bind $p = 'caf' and run both paths, comparing result sets.
+    let run = |coord: &mut Coord, catalog: &IndexCatalog| -> Vec<i64> {
+        let plan = compile(src, catalog);
+        let params = Parameters::new().with("p", Value::String("caf".to_owned()));
+        let bound = bind_parameters(&plan, &params).expect("bind");
+        let txn = coord.begin_serializable();
+        let rows = {
+            let mut graph = coord.statement(txn).expect("statement");
+            let mut cursor = execute(&plan, &bound, &mut graph).expect("open");
+            let rows = cursor.collect_all().expect("collect");
+            assert!(!graph.has_error(), "error: {:?}", graph.take_error());
+            rows
+        };
+        coord.commit(txn).expect("commit");
+        let mut vs: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| match r.value("a") {
+                Value::Integer(k) => Some(k),
+                _ => None,
+            })
+            .collect();
+        vs.sort_unstable();
+        vs
+    };
+    let via_index = run(&mut coord, &indexed);
+    let via_scan = run(&mut coord, &IndexCatalog::empty());
+    assert_eq!(via_index, via_scan, "param prefix: index must equal scan");
+    assert_eq!(
+        via_index,
+        vec![6, 7, 8],
+        "param 'caf' matches café/cafe/cafés"
+    );
+}
+
 #[test]
 fn bare_label_scan_equals_scan_path_and_uses_token_lookup() {
     let mut coord = fresh_coord();

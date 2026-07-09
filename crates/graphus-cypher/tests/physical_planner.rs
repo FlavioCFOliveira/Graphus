@@ -12,6 +12,7 @@
 //! recording for cache invalidation; residual-filter retention; carry-through of write/procedure
 //! operators.
 
+use graphus_cypher::ast::{ExprKind, PredicateOp};
 use graphus_cypher::catalog::{IndexCatalog, IndexKind};
 use graphus_cypher::lexer::tokenize;
 use graphus_cypher::lower::lower;
@@ -173,6 +174,143 @@ fn range_predicate_mirrors_when_property_on_right() {
     if let PhysicalOp::NodeIndexRangeSeek { bound, .. } = seek {
         assert_eq!(*bound, RangeBound::GreaterThan);
     }
+}
+
+/// Whether `op` is a `Filter` whose predicate is (or AND-contains) a `STARTS WITH` predicate — the
+/// residual re-check the string-prefix seek MUST retain above it (`rmp` task #658).
+fn is_starts_with_filter(op: &PhysicalOp) -> bool {
+    fn expr_has_starts_with(e: &graphus_cypher::ast::Expr) -> bool {
+        match &e.kind {
+            ExprKind::Predicate {
+                op: PredicateOp::StartsWith,
+                ..
+            } => true,
+            ExprKind::Binary { lhs, rhs, .. } => {
+                expr_has_starts_with(lhs) || expr_has_starts_with(rhs)
+            }
+            _ => false,
+        }
+    }
+    matches!(op, PhysicalOp::Filter { predicate, .. } if expr_has_starts_with(predicate))
+}
+
+#[test]
+fn starts_with_on_indexed_property_becomes_prefix_seek_with_retained_residual() {
+    // `n.name STARTS WITH 'ab'` over an indexed `(Person, name)` lowers to a bounded prefix range
+    // seek (`NodeIndexStartsWithSeek`) — AND the exact `STARTS WITH` predicate is retained as a
+    // residual `Filter` above it (the seek is only a candidate superset, `rmp` task #658).
+    let catalog = IndexCatalog::builder()
+        .with_label_property("Person", "name")
+        .build();
+    let plan = physical(
+        "MATCH (n:Person) WHERE n.name STARTS WITH 'ab' RETURN n",
+        &catalog,
+    );
+
+    let seek = find(&plan.root, &|op| {
+        matches!(op, PhysicalOp::NodeIndexStartsWithSeek { .. })
+    })
+    .expect("a string-prefix seek");
+    match seek {
+        PhysicalOp::NodeIndexStartsWithSeek {
+            variable,
+            label,
+            property,
+            prefix,
+            index,
+        } => {
+            assert_eq!(variable.name, "n");
+            assert_eq!(label.name, "Person");
+            assert_eq!(property, "name");
+            // The prefix travels unevaluated (a literal here); the executor derives the bounds.
+            assert!(
+                matches!(&prefix.kind, ExprKind::Literal(_)),
+                "prefix should be the literal 'ab': {prefix:?}"
+            );
+            assert!(plan.depends_on(*index));
+        }
+        _ => unreachable!(),
+    }
+    // Exactly one index dependency (the (Person, name) index).
+    assert_eq!(plan.index_dependencies().count(), 1);
+
+    // A `STARTS WITH` residual filter MUST sit somewhere above the seek — exactness is restored by
+    // the re-check, never by the (superset) seek alone.
+    assert!(
+        find(&plan.root, &is_starts_with_filter).is_some(),
+        "the STARTS WITH residual filter must be retained:\n{plan}"
+    );
+    // And the golden rendering carries the operator name.
+    assert!(
+        plan.to_string()
+            .contains("NodeIndexStartsWithSeek(n:Person name STARTS WITH"),
+        "{plan}"
+    );
+}
+
+#[test]
+fn starts_with_on_unindexed_property_stays_scan_filter() {
+    // No index on `(Person, name)`: `STARTS WITH` keeps the label scan + residual filter — no seek.
+    let catalog = IndexCatalog::empty();
+    let plan = physical(
+        "MATCH (n:Person) WHERE n.name STARTS WITH 'ab' RETURN n",
+        &catalog,
+    );
+    assert!(
+        find(&plan.root, &|op| matches!(
+            op,
+            PhysicalOp::NodeIndexStartsWithSeek { .. }
+        ))
+        .is_none(),
+        "no index -> no prefix seek:\n{plan}"
+    );
+    assert!(!plan.to_string().contains("Seek"), "{plan}");
+    assert_eq!(plan.index_dependencies().count(), 0);
+}
+
+#[test]
+fn ends_with_and_contains_are_not_accelerated_even_when_indexed() {
+    // Only STARTS WITH is a contiguous key range. ENDS WITH / CONTAINS stay scan + filter even with
+    // an index on `(Person, name)` (a suffix/substring needs a text index — out of scope, `rmp` #658).
+    let catalog = IndexCatalog::builder()
+        .with_label_property("Person", "name")
+        .build();
+    for src in [
+        "MATCH (n:Person) WHERE n.name ENDS WITH 'ab' RETURN n",
+        "MATCH (n:Person) WHERE n.name CONTAINS 'ab' RETURN n",
+    ] {
+        let plan = physical(src, &catalog);
+        assert!(
+            find(&plan.root, &|op| matches!(
+                op,
+                PhysicalOp::NodeIndexStartsWithSeek { .. } | PhysicalOp::NodeIndexRangeSeek { .. }
+            ))
+            .is_none(),
+            "`{src}` must NOT use a seek:\n{plan}"
+        );
+        assert!(!plan.to_string().contains("Seek"), "`{src}`:\n{plan}");
+    }
+}
+
+#[test]
+fn starts_with_prefix_referencing_the_variable_is_not_a_seek() {
+    // The prefix must be independent of the row. `n.name STARTS WITH n.nick` cannot drive a seek
+    // (its bound depends on the very row being produced) — it stays a residual filter.
+    let catalog = IndexCatalog::builder()
+        .with_label_property("Person", "name")
+        .build();
+    let plan = physical(
+        "MATCH (n:Person) WHERE n.name STARTS WITH n.nick RETURN n",
+        &catalog,
+    );
+    assert!(
+        find(&plan.root, &|op| matches!(
+            op,
+            PhysicalOp::NodeIndexStartsWithSeek { .. }
+        ))
+        .is_none(),
+        "a row-dependent prefix must not seek:\n{plan}"
+    );
 }
 
 #[test]

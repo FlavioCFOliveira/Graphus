@@ -421,6 +421,11 @@ fn walk_physical(op: &PhysicalOp, record: &mut impl FnMut(&str, ParamType)) {
         PhysicalOp::NodeIndexRangeSeek { value, .. } => {
             params_in_expr(value, ParamType::Any, record);
         }
+        PhysicalOp::NodeIndexStartsWithSeek { prefix, .. } => {
+            // The STARTS WITH prefix (`rmp` task #658): commonly a `$param` after literal
+            // auto-parameterisation. No static type expectation, recorded as Any. A leaf — no input.
+            params_in_expr(prefix, ParamType::Any, record);
+        }
         PhysicalOp::Filter { input, predicate } => {
             params_in_expr(predicate, ParamType::Any, record);
             walk_physical(input, record);

@@ -883,9 +883,12 @@ fn parse_claimed_index(
 /// - **RANGE** is a full synonym of the plain node-property index (`CREATE INDEX`): the create/drop/show
 ///   are delegated verbatim to [`parse_claimed_index`], so a range index is nameable, droppable and
 ///   listed under `SHOW INDEXES` (with `type` `RANGE`).
-/// - **TEXT** maps to the same node-property index — Graphus serves `STARTS WITH` / `=` string
-///   predicates from the RANGE B-tree — so it is routed identically (and appears as `RANGE` in
-///   `SHOW INDEXES`). This is a documented equivalence, not a distinct backing store.
+/// - **TEXT** maps to the same node-property index and is routed identically (appearing as `RANGE`
+///   in `SHOW INDEXES`) — a documented equivalence, not a distinct backing store. The RANGE B-tree
+///   serves `=` (equality seek) and, since `rmp` task #658, `STARTS WITH` (a bounded prefix range
+///   seek over `[prefix, successor)`). `ENDS WITH` / `CONTAINS` are **not** accelerated by this index
+///   (a suffix/substring is not a contiguous key range); they stay scan + filter until a dedicated
+///   TEXT index exists.
 /// - **LOOKUP** is **declined** with an informative message: Graphus maintains node-label and
 ///   relationship-type lookup indexes **implicitly** (always-on), so label/type scans are already
 ///   index-backed and no explicit LOOKUP index is required.

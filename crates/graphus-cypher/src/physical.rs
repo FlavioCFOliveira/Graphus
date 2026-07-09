@@ -72,8 +72,9 @@
 //! **Covered:** all [`LogicalOp`](crate::logical::LogicalOp) variants are lowered to a physical
 //! form (the relational, graph, write, and procedure operators carry through; the four decisions
 //! above specialise where they apply). Index selection covers single-property **equality** and
-//! **range** node predicates, the **token-lookup** label scan, and single-property **relationship**
-//! predicates routed through the catalog.
+//! **range** node predicates, the **`STARTS WITH` string-prefix** node predicate (a bounded range
+//! seek over `[prefix, successor)`, `rmp` task #658), the **token-lookup** label scan, and
+//! single-property **relationship** predicates routed through the catalog.
 //!
 //! **Cost-based (task #65, #366), only when statistics are supplied:** selectivity-driven
 //! **access-path choice** (index seek vs label/token scan, [the seek-vs-scan rule](self#cost-based-optimisation)),
@@ -90,8 +91,10 @@
 //! requires a property predicate, lowered when a [`Filter`] supplies one over an expand, which is
 //! itself later territory); (3) **composite multi-key seeks** — only a composite's *leading* key
 //! drives a seek here, matching the catalog's
-//! [`label_property`](crate::catalog::IndexCatalog::label_property) contract; (4) **`IN`-list /
-//! `STARTS WITH` index acceleration** — treated as residual filters in v1.
+//! [`label_property`](crate::catalog::IndexCatalog::label_property) contract; (4) **`IN`-list index
+//! acceleration**, and **`ENDS WITH` / `CONTAINS`** string acceleration (a suffix/substring is not a
+//! contiguous key range — it needs a dedicated text index) — treated as residual filters in v1.
+//! (`STARTS WITH` *is* accelerated, `rmp` task #658; see [`PhysicalOp::NodeIndexStartsWithSeek`].)
 //!
 //! # Cost-based optimisation
 //!
@@ -133,7 +136,7 @@
 //! tree.
 //! Cost ties break on a stable structural key, so plan choice is deterministic for fixed statistics.
 
-use crate::ast::{BinaryOp, Expr, ExprKind, Label, LabelExpr, RelType};
+use crate::ast::{BinaryOp, Expr, ExprKind, Label, LabelExpr, PredicateOp, RelType};
 use crate::cardinality::estimate_rows;
 use crate::catalog::{IndexCatalog, IndexDescriptor, IndexId};
 use crate::cost::estimate_cost;
@@ -436,6 +439,32 @@ pub enum PhysicalOp {
         bound: RangeBound,
         /// The bound value expression (unevaluated AST).
         value: Expr,
+        /// The catalog index backing the seek.
+        index: IndexId,
+    },
+    /// **String-prefix index seek** (`rmp` task #658): records of `label` whose string `property`
+    /// begins with `prefix` (`n.p STARTS WITH <prefix>`), served by a **bounded range seek** over the
+    /// order-preserving property index — `[prefix, successor(prefix))` — instead of a full label scan.
+    ///
+    /// The `prefix` is an unevaluated [`Expr`](crate::ast::Expr) (a string literal or, after literal
+    /// auto-parameterisation, a `$param`), so the seek bounds are computed by the executor **at run
+    /// time** from the evaluated prefix (the exclusive upper is the shortest string strictly greater
+    /// than every string with that prefix; see `string_prefix_successor` in the executor). The seek
+    /// returns a **superset** of the matches (the range can admit non-prefix strings in the
+    /// last-scalar carry window, and — for a mixed-type property — values the bound re-check does not
+    /// exclude), so the exact `STARTS WITH` predicate is **always retained as a residual
+    /// [`Filter`](PhysicalOp::Filter) above this operator** (see [`Planner::lower_filter`]); the index
+    /// only narrows the candidate set, never the result. Only `STARTS WITH` is accelerated —
+    /// `ENDS WITH` / `CONTAINS` need a text index and stay scan + filter.
+    NodeIndexStartsWithSeek {
+        /// The node variable bound by each row.
+        variable: Var,
+        /// The label the index covers.
+        label: Label,
+        /// The indexed property key.
+        property: String,
+        /// The search prefix expression (unevaluated AST; a string literal or an auto-/user-parameter).
+        prefix: Expr,
         /// The catalog index backing the seek.
         index: IndexId,
     },
@@ -1327,6 +1356,27 @@ impl Planner<'_> {
                     }
                 }
             }
+            // A `var.prop STARTS WITH <prefix>` conjunct can drive a **bounded range seek** over the
+            // order-preserving property index when one covers `(label, prop)` — `[prefix,
+            // successor(prefix))` (`rmp` task #658). Like the spatial seek, the range is a candidate
+            // **superset** (it admits non-prefix strings in the last-scalar carry window, and — for a
+            // mixed-type property — values the bound re-check does not exclude), so the exact
+            // `STARTS WITH` predicate MUST be re-checked: we re-attach **all** conjuncts (this one
+            // included) as the residual filter. Only `STARTS WITH` is accelerated here (`ENDS WITH` /
+            // `CONTAINS` need a text index — out of scope; they stay scan + filter).
+            if let Some((property, prefix)) = analyze_starts_with_predicate(conj, &variable.name) {
+                if let Some(idx) = self.catalog.label_property(label, &property) {
+                    deps.insert(idx.id);
+                    let seek = PhysicalOp::NodeIndexStartsWithSeek {
+                        variable: variable.clone(),
+                        label: label.clone(),
+                        property,
+                        prefix: prefix.clone(),
+                        index: idx.id,
+                    };
+                    return attach_residual(seek, &conjuncts);
+                }
+            }
         }
 
         // No index applied. Before falling back to a bare label scan + residual filter, try to fuse a
@@ -1466,6 +1516,7 @@ fn contains_read(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeIndexSeek { .. }
         | PhysicalOp::NodeLabelScanEq { .. }
         | PhysicalOp::NodeIndexRangeSeek { .. }
+        | PhysicalOp::NodeIndexStartsWithSeek { .. }
         | PhysicalOp::SpatialIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::ExpandAll { .. }
@@ -1534,6 +1585,7 @@ fn contains_write(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeIndexSeek { .. }
         | PhysicalOp::NodeLabelScanEq { .. }
         | PhysicalOp::NodeIndexRangeSeek { .. }
+        | PhysicalOp::NodeIndexStartsWithSeek { .. }
         | PhysicalOp::SpatialIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::Argument { .. }
@@ -1593,6 +1645,7 @@ fn contains_procedure_call(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeIndexSeek { .. }
         | PhysicalOp::NodeLabelScanEq { .. }
         | PhysicalOp::NodeIndexRangeSeek { .. }
+        | PhysicalOp::NodeIndexStartsWithSeek { .. }
         | PhysicalOp::SpatialIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::Argument { .. }
@@ -1662,6 +1715,7 @@ fn all_procedure_calls_reader_safe(
         | PhysicalOp::NodeIndexSeek { .. }
         | PhysicalOp::NodeLabelScanEq { .. }
         | PhysicalOp::NodeIndexRangeSeek { .. }
+        | PhysicalOp::NodeIndexStartsWithSeek { .. }
         | PhysicalOp::SpatialIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::Argument { .. }
@@ -1878,6 +1932,7 @@ fn optimize_children(op: PhysicalOp, catalog: &IndexCatalog, stats: &dyn Statist
         | PhysicalOp::NodeIndexSeek { .. }
         | PhysicalOp::NodeLabelScanEq { .. }
         | PhysicalOp::NodeIndexRangeSeek { .. }
+        | PhysicalOp::NodeIndexStartsWithSeek { .. }
         | PhysicalOp::SpatialIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::Argument { .. }
@@ -2601,6 +2656,7 @@ fn contains_argument(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeIndexSeek { .. }
         | PhysicalOp::NodeLabelScanEq { .. }
         | PhysicalOp::NodeIndexRangeSeek { .. }
+        | PhysicalOp::NodeIndexStartsWithSeek { .. }
         | PhysicalOp::SpatialIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::Empty => false,
@@ -3030,6 +3086,7 @@ fn gather_index_dependencies(op: &PhysicalOp, deps: &mut BTreeSet<IndexId>) {
         PhysicalOp::TokenLookupScan { index, .. }
         | PhysicalOp::NodeIndexSeek { index, .. }
         | PhysicalOp::NodeIndexRangeSeek { index, .. }
+        | PhysicalOp::NodeIndexStartsWithSeek { index, .. }
         | PhysicalOp::SpatialIndexSeek { index, .. } => {
             deps.insert(*index);
         }
@@ -3130,6 +3187,33 @@ fn analyze_property_predicate(expr: &Expr, variable: &str) -> Option<PropertyPre
         }
     }
     None
+}
+
+/// If `expr` is `variable.<prop> STARTS WITH <prefix>` where `<prefix>` does **not** reference
+/// `variable`, returns `(prop, prefix)` (`rmp` task #658). The prefix is the searched string (a
+/// literal, or a `$param` after auto-parameterisation); it is evaluated by the executor at run time,
+/// so a parameter prefix is served identically to a literal one.
+///
+/// `STARTS WITH` is **not symmetric**, so only the `property STARTS WITH value` orientation is
+/// recognised (`value STARTS WITH n.p` treats the property as the *search* string, which no
+/// range seek accelerates). A prefix that references `variable` is rejected — an index seek needs a
+/// value independent of the row it produces. `ENDS WITH` / `CONTAINS` are deliberately not matched
+/// (they need a text index, out of scope): a suffix/substring is not a contiguous key range.
+fn analyze_starts_with_predicate<'a>(expr: &'a Expr, variable: &str) -> Option<(String, &'a Expr)> {
+    let ExprKind::Predicate {
+        op: PredicateOp::StartsWith,
+        operand,
+        rhs,
+    } = &expr.kind
+    else {
+        return None;
+    };
+    let property = property_of(operand, variable)?;
+    let prefix = rhs.as_deref()?;
+    if expr_references_var(prefix, variable) {
+        return None;
+    }
+    Some((property, prefix))
 }
 
 /// Builds a [`PropertyPredicate`] from a comparison operator. `property_on_right` mirrors range
@@ -3518,6 +3602,7 @@ fn gather_bound_vars(plan: &PhysicalOp, out: &mut Vec<Var>) {
         | PhysicalOp::NodeIndexSeek { variable, .. }
         | PhysicalOp::NodeLabelScanEq { variable, .. }
         | PhysicalOp::NodeIndexRangeSeek { variable, .. }
+        | PhysicalOp::NodeIndexStartsWithSeek { variable, .. }
         | PhysicalOp::SpatialIndexSeek { variable, .. } => push_unique(out, variable.clone()),
         PhysicalOp::AllRelationshipsScan {
             relationship,
@@ -3728,6 +3813,18 @@ impl PhysicalOp {
                 label.name,
                 bound.symbol(),
                 h::expr(value),
+            ),
+            Self::NodeIndexStartsWithSeek {
+                variable,
+                label,
+                property,
+                prefix,
+                index,
+            } => writeln!(
+                f,
+                "NodeIndexStartsWithSeek({variable}:{} {property} STARTS WITH {} via {index})",
+                label.name,
+                h::expr(prefix),
             ),
             Self::SpatialIndexSeek {
                 variable,
