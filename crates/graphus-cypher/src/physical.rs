@@ -3116,7 +3116,9 @@ fn expr_references_var(expr: &Expr, variable: &str) -> bool {
         | ExprKind::Quantifier(_)
         | ExprKind::Reduce(_)
         | ExprKind::MapProjection(_)
-        | ExprKind::ExistsSubquery(_) => true,
+        | ExprKind::ExistsSubquery(_)
+        | ExprKind::CountSubquery(_)
+        | ExprKind::CollectSubquery(_) => true,
     }
 }
 

@@ -55,15 +55,15 @@
 //! an explicit decision here.
 
 use crate::ast::{
-    BinaryOp, CallClause, CaseAlternative, CaseExpr, Clause, CreateClause, DeleteClause,
-    ExistsSubquery, Expr, ExprKind, ForeachClause, Label, ListComprehension, Literal,
-    LoadCsvClause, MapKey, MapProjection, MapProjectionSelector, MatchClause, MergeAction,
-    MergeClause, NodePattern, PatternChainLink, PatternComprehension, PatternElement, PatternPart,
-    PatternPartKind, PredicateOp, ProcedureCall, ProjectionBody, ProjectionItem, QuantifierExpr,
-    QuantifierKind, Query, QueryBody, ReduceExpr, RelDirection, RelType, RelationshipPattern,
-    RemoveClause, RemoveItem, ReturnClause, SetClause, SetItem, SingleQuery, SortDirection,
-    SortItem, StandaloneCall, StandaloneYield, UnaryOp, UnionPart, UnwindClause, VarLengthRange,
-    Variable, WithClause, YieldItem,
+    BinaryOp, CallClause, CallSubqueryClause, CaseAlternative, CaseExpr, Clause, CreateClause,
+    DeleteClause, ExistsSubquery, Expr, ExprKind, ForeachClause, InTransactions, Label,
+    ListComprehension, Literal, LoadCsvClause, MapKey, MapProjection, MapProjectionSelector,
+    MatchClause, MergeAction, MergeClause, NodePattern, PatternChainLink, PatternComprehension,
+    PatternElement, PatternPart, PatternPartKind, PredicateOp, ProcedureCall, ProjectionBody,
+    ProjectionItem, QuantifierExpr, QuantifierKind, Query, QueryBody, ReduceExpr, RelDirection,
+    RelType, RelationshipPattern, RemoveClause, RemoveItem, ReturnClause, SetClause, SetItem,
+    SingleQuery, SortDirection, SortItem, StandaloneCall, StandaloneYield, SubqueryExpr, UnaryOp,
+    UnionPart, UnwindClause, VarLengthRange, Variable, WithClause, YieldItem,
 };
 use crate::lexer::{IntLiteral, Span, Token, TokenKind, tokenize};
 use graphus_core::GraphusError;
@@ -578,7 +578,11 @@ impl<'t, 's> Parser<'t, 's> {
         // leading CALL that yields `*`, or a CALL followed by end/`;`, is standalone. To keep the
         // phase split clean we parse the first single query and, if it consists of exactly one CALL
         // clause whose YIELD is `*` or absent, surface it as a StandaloneCall.
-        if self.at(&TokenKind::Call) {
+        // `CALL {` begins a subquery clause, never a standalone procedure call — skip the
+        // standalone attempt so the `{` is not mis-parsed as a (missing) procedure name.
+        if self.at(&TokenKind::Call)
+            && !matches!(self.peek_at(1).map(|t| &t.kind), Some(TokenKind::LBrace))
+        {
             if let Some(call) = self.try_parse_standalone_call()? {
                 let end = call.span.end;
                 return Ok(Query {
@@ -683,7 +687,14 @@ impl<'t, 's> Parser<'t, 's> {
         let clause = match kind {
             TokenKind::Optional | TokenKind::Match => Clause::Match(self.parse_match()?),
             TokenKind::Unwind => Clause::Unwind(self.parse_unwind()?),
-            TokenKind::Call => Clause::Call(self.parse_in_query_call()?),
+            TokenKind::Call => {
+                // `CALL {` is a subquery clause; `CALL proc(...)` is an in-query procedure call.
+                if matches!(self.peek_at(1).map(|t| &t.kind), Some(TokenKind::LBrace)) {
+                    Clause::CallSubquery(self.parse_call_subquery()?)
+                } else {
+                    Clause::Call(self.parse_in_query_call()?)
+                }
+            }
             TokenKind::Create => Clause::Create(self.parse_create()?),
             TokenKind::Merge => Clause::Merge(self.parse_merge()?),
             TokenKind::Set => Clause::Set(self.parse_set()?),
@@ -872,6 +883,76 @@ impl<'t, 's> Parser<'t, 's> {
             call,
             yield_items,
             where_clause,
+            span: Span::new(start, end),
+        })
+    }
+
+    /// Parses a `CALL { <subquery> } [IN TRANSACTIONS [OF <expr> ROW[S]]]` subquery clause (Neo4j
+    /// `CallSubquery`).
+    ///
+    /// The caller has confirmed the `CALL` is immediately followed by `{`. The braces hold a complete
+    /// inner query (a possible `UNION` chain), parsed with the same clause-loop / `UNION` subroutine
+    /// the top level uses (a `}` cannot start a clause, so it ends the loop). The optional
+    /// `IN TRANSACTIONS` modifier follows the closing `}`.
+    fn parse_call_subquery(&mut self) -> Result<CallSubqueryClause, SyntaxError> {
+        let start = self.here_span().start;
+        self.expect(&TokenKind::Call, "CALL")?;
+        self.expect(&TokenKind::LBrace, "'{' to begin a CALL subquery")?;
+        let query = self.parse_subquery_block()?;
+        let rb = self.expect(&TokenKind::RBrace, "'}' to close a CALL subquery")?;
+        let mut end = rb.span.end;
+
+        // Optional `IN TRANSACTIONS [OF <expr> ROW[S]]`. `IN` is the reserved membership keyword;
+        // `TRANSACTIONS`/`OF`/`ROW[S]` are contextual identifiers.
+        let in_transactions =
+            if self.at(&TokenKind::In) && self.peek_keyword_ident_at(1, "transactions") {
+                let it_start = self.here_span().start;
+                self.bump(); // IN
+                self.bump(); // TRANSACTIONS
+                let mut it_end = self.tokens[self.pos - 1].span.end;
+                let batch_size = if self.eat_keyword_ident("of") {
+                    let expr = self.parse_expr()?;
+                    // `ROW` or `ROWS` follows the batch-size expression.
+                    if self.eat_keyword_ident("rows") || self.eat_keyword_ident("row") {
+                        it_end = self.tokens[self.pos - 1].span.end;
+                    } else {
+                        return Err(self.expected_here("ROWS after the IN TRANSACTIONS batch size"));
+                    }
+                    Some(expr)
+                } else {
+                    None
+                };
+                end = it_end;
+                Some(InTransactions {
+                    batch_size,
+                    span: Span::new(it_start, it_end),
+                })
+            } else {
+                None
+            };
+
+        Ok(CallSubqueryClause {
+            query: Box::new(query),
+            in_transactions,
+            span: Span::new(start, end),
+        })
+    }
+
+    /// Parses the inner query of a `CALL { ... }` / `COUNT { ... }` / `COLLECT { ... }` subquery: a
+    /// clause list (up to the closing `}`) followed by an optional `UNION` chain, using the same
+    /// subroutines the top level uses. The closing `}` is **not** consumed (the caller consumes it).
+    fn parse_subquery_block(&mut self) -> Result<Query, SyntaxError> {
+        let start = self.here_span().start;
+        let head = self.parse_single_query()?;
+        let mut unions = Vec::new();
+        while self.at(&TokenKind::Union) {
+            unions.push(self.parse_union_part()?);
+        }
+        let end = unions
+            .last()
+            .map_or(head.span.end, |u: &UnionPart| u.span.end);
+        Ok(Query {
+            body: QueryBody::Regular { head, unions },
             span: Span::new(start, end),
         })
     }
@@ -2273,6 +2354,19 @@ impl<'t, 's> Parser<'t, 's> {
             return self.finish_function_call(name, start_span.start);
         }
 
+        // `COUNT { ... }` / `COLLECT { ... }` subquery expressions (Neo4j `CountExpression` /
+        // `CollectExpression`). Recognised by the name plus an immediately-following `{`; disjoint
+        // from the `count(*)` / `count(expr)` aggregate calls (which are followed by `(`). Intercepted
+        // here, before the postfix layer, so a following `{` is never mistaken for a map projection.
+        if self.at(&TokenKind::LBrace) {
+            if first.eq_ignore_ascii_case("count") {
+                return self.parse_count_subquery(start_span.start);
+            }
+            if first.eq_ignore_ascii_case("collect") {
+                return self.parse_collect_subquery(start_span.start);
+            }
+        }
+
         // `count(*)` special-case (case-insensitive `count` already normalized by identifier text).
         if first.eq_ignore_ascii_case("count")
             && self.at(&TokenKind::LParen)
@@ -2565,6 +2659,68 @@ impl<'t, 's> Parser<'t, 's> {
             body: QueryBody::Regular { head, unions },
             span: Span::new(exists_start, query_end),
         })
+    }
+
+    /// Parses a `COUNT { ... }` subquery expression (Neo4j `CountExpression`).
+    ///
+    /// Mirrors [`parse_exists`](Self::parse_exists): the braces hold either a **bare pattern**
+    /// (`COUNT { (a)-->(b) [WHERE p] }`, optionally led by `MATCH`) or a **full query**
+    /// (`COUNT { MATCH ... RETURN ... }`), disambiguated on whether a `}` immediately follows the
+    /// pattern. `start` is the byte offset of the `COUNT` keyword. The caller has confirmed the `{`.
+    fn parse_count_subquery(&mut self, start: usize) -> Result<Expr, SyntaxError> {
+        self.expect(&TokenKind::LBrace, "'{' to begin a COUNT subquery")?;
+        let pattern_start = self.here_span().start;
+        self.eat(&TokenKind::Match);
+        let pattern = self.parse_pattern()?;
+        let predicate = if self.eat(&TokenKind::Where) {
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+        if self.at(&TokenKind::RBrace) {
+            // Pattern form.
+            let rb = self.expect(&TokenKind::RBrace, "'}' to close a COUNT subquery")?;
+            return Ok(Expr::new(
+                ExprKind::CountSubquery(Box::new(SubqueryExpr {
+                    pattern,
+                    predicate,
+                    full_query: None,
+                })),
+                Span::new(start, rb.span.end),
+            ));
+        }
+        // Full-query form: the parsed pattern (+ optional WHERE) is the leading `MATCH` of an inner
+        // query. Reuse the shared full-query builder (identical to the EXISTS full-query form).
+        let query = self.parse_exists_full_query(pattern, predicate, pattern_start, start)?;
+        let rb = self.expect(&TokenKind::RBrace, "'}' to close a COUNT subquery")?;
+        Ok(Expr::new(
+            ExprKind::CountSubquery(Box::new(SubqueryExpr {
+                pattern: vec![],
+                predicate: None,
+                full_query: Some(Box::new(query)),
+            })),
+            Span::new(start, rb.span.end),
+        ))
+    }
+
+    /// Parses a `COLLECT { <full query> }` subquery expression (Neo4j `CollectExpression`).
+    ///
+    /// Unlike `COUNT`, `COLLECT` has **no** bare-pattern form — its inner query must end in a
+    /// single-column `RETURN` (enforced by the semantic pass) — so the braces always hold a complete
+    /// query, parsed with [`parse_subquery_block`](Self::parse_subquery_block). `start` is the byte
+    /// offset of the `COLLECT` keyword. The caller has confirmed the `{`.
+    fn parse_collect_subquery(&mut self, start: usize) -> Result<Expr, SyntaxError> {
+        self.expect(&TokenKind::LBrace, "'{' to begin a COLLECT subquery")?;
+        let query = self.parse_subquery_block()?;
+        let rb = self.expect(&TokenKind::RBrace, "'}' to close a COLLECT subquery")?;
+        Ok(Expr::new(
+            ExprKind::CollectSubquery(Box::new(SubqueryExpr {
+                pattern: vec![],
+                predicate: None,
+                full_query: Some(Box::new(query)),
+            })),
+            Span::new(start, rb.span.end),
+        ))
     }
 
     /// Whether the current `(` begins a *pattern predicate* (`(n)-[]->()`) rather than a

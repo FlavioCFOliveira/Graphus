@@ -687,6 +687,20 @@ fn params_in_expr(expr: &Expr, ty: ParamType, record: &mut impl FnMut(&str, Para
                 params_in_query(q, record);
             }
         }
+        // COUNT / COLLECT subqueries: collect the parameters of the pattern (COUNT pattern form) and
+        // of the inner correlated query, exactly like `ExistsSubquery`, so they are bound alongside
+        // the outer query's parameters.
+        ExprKind::CountSubquery(sq) | ExprKind::CollectSubquery(sq) => {
+            for part in &sq.pattern {
+                params_in_pattern_part(part, record);
+            }
+            if let Some(p) = &sq.predicate {
+                params_in_expr(p, ParamType::Any, record);
+            }
+            if let Some(q) = &sq.full_query {
+                params_in_query(q, record);
+            }
+        }
     }
 }
 
@@ -732,6 +746,14 @@ fn params_in_single_query(sq: &SingleQuery, record: &mut impl FnMut(&str, ParamT
                 }
                 if let Some(w) = &c.where_clause {
                     params_in_expr(w, ParamType::Any, record);
+                }
+            }
+            Clause::CallSubquery(c) => {
+                params_in_query(&c.query, record);
+                if let Some(t) = &c.in_transactions {
+                    if let Some(batch) = &t.batch_size {
+                        params_in_expr(batch, ParamType::Any, record);
+                    }
                 }
             }
             Clause::Create(c) => {

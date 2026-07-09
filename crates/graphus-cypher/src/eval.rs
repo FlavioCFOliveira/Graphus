@@ -319,6 +319,12 @@ pub fn eval(
         ExprKind::ExistsSubquery(ex) => {
             eval_exists_subquery(ex, row, params, graph, functions, clock)
         }
+        ExprKind::CountSubquery(sq) => {
+            eval_count_subquery(sq, row, params, graph, functions, clock)
+        }
+        ExprKind::CollectSubquery(sq) => {
+            eval_collect_subquery(sq, row, params, graph, functions, clock)
+        }
     }
 }
 
@@ -3464,24 +3470,71 @@ impl GraphAccess for ReadOnlyGraph<'_> {
 }
 
 thread_local! {
-    /// Per-thread memo of compiled inner [`EXISTS`] subplans, keyed by a normalised fingerprint of
-    /// `(inner query AST, outer variable names)`.
+    /// Per-thread memo of compiled inner **subquery** subplans (the full-query forms of `EXISTS`,
+    /// `COUNT` and `COLLECT`), keyed by a normalised fingerprint of `(inner query AST, outer
+    /// variable names)`.
     ///
     /// The inner physical plan is parameter-independent and does **not** depend on the outer *row*
     /// (correlation is by the [`Argument`](crate::physical::PhysicalOp::Argument) seed), only on the
-    /// inner query AST and the set of outer variables. `eval_exists_subquery` is re-entered once per
-    /// outer row with the same subquery node, so compiling per row would be quadratic; this memo
-    /// compiles once and reuses. Thread-local because the evaluator is a free function with no
-    /// per-execution handle to hang a cache on, and because [`std::cell::RefCell`] keeps it `!Sync`-
-    /// safe without locking (each executor thread owns its own).
-    static EXISTS_PLAN_CACHE: std::cell::RefCell<
-        std::collections::HashMap<String, std::rc::Rc<ExistsPlan>>,
+    /// inner query AST and the set of outer variables. A subquery is re-entered once per outer row
+    /// with the same node, so compiling per row would be quadratic; this memo compiles once and
+    /// reuses. Thread-local because the evaluator is a free function with no per-execution handle to
+    /// hang a cache on, and because [`std::cell::RefCell`] keeps it `!Sync`-safe without locking
+    /// (each executor thread owns its own).
+    static SUBQUERY_PLAN_CACHE: std::cell::RefCell<
+        std::collections::HashMap<String, std::rc::Rc<CompiledSubplan>>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-/// A compiled inner subplan: the physical plan plus the auto-parameters lifted while lowering it.
-struct ExistsPlan {
+/// A compiled inner subplan: the physical plan wrapped in a ready-to-open [`Executor`].
+///
+/// [`Executor`]: crate::executor::Executor
+struct CompiledSubplan {
     executor: crate::executor::Executor,
+}
+
+/// Compiles (once, memoised per thread) the inner query of a full-query subquery form, correlated
+/// with the outer `row`'s columns.
+///
+/// The subplan lowers the inner query with the outer variables as correlated
+/// [`Argument`](crate::physical::PhysicalOp::Argument) inputs, plans it physically (an empty index
+/// catalogue is correct — the [`ReadOnlyGraph`] still serves any real index seek through the seam),
+/// and binds the inner parameters from the outer (already-bound) parameter set. The result is keyed
+/// by a span-normalised fingerprint of the inner AST plus the driving row's column set, so two outer
+/// rows with the same shape (the steady state) reuse the same compiled plan.
+fn compile_correlated_subplan(
+    inner_query: &crate::ast::Query,
+    row: &Row,
+    params: &BoundParameters,
+) -> Result<std::rc::Rc<CompiledSubplan>, EvalError> {
+    use crate::catalog::IndexCatalog;
+    use crate::logical::Var;
+
+    let outer_vars: Vec<Var> = row.columns().iter().map(Var::named).collect();
+    let mut normalized = inner_query.clone();
+    normalized.zero_expr_spans_in_place();
+    let fingerprint = format!("{:?}|{:?}", normalized, row.columns());
+
+    SUBQUERY_PLAN_CACHE.with(|cache| {
+        if let Some(existing) = cache.borrow().get(&fingerprint) {
+            return Ok(std::rc::Rc::clone(existing));
+        }
+        let logical = crate::lower::lower_correlated(inner_query, &outer_vars);
+        let physical = crate::physical::plan_physical(&logical, &IndexCatalog::empty());
+        let bound =
+            crate::binding::bind_parameters(&physical, &params.as_parameters()).map_err(|e| {
+                EvalError::Subquery {
+                    message: e.to_string(),
+                }
+            })?;
+        let compiled = std::rc::Rc::new(CompiledSubplan {
+            executor: crate::executor::Executor::new(physical, bound),
+        });
+        cache
+            .borrow_mut()
+            .insert(fingerprint.clone(), std::rc::Rc::clone(&compiled));
+        Ok(compiled)
+    })
 }
 
 /// Executes the full-query form of an `EXISTS { ... }` subquery: run the inner read-only query
@@ -3493,50 +3546,14 @@ fn eval_exists_full_query(
     params: &BoundParameters,
     graph: &dyn GraphAccess,
     functions: &dyn FunctionRegistry,
-    // NOTE (`rmp` task #140): an `EXISTS { ... }` full-query subplan opens its own cursor via
-    // `open_seeded`, which captures a fresh statement clock. The outer `clock` is therefore not
-    // forwarded here; the two captures are microseconds apart, and the bare/`.statement` instant
-    // is still fixed *within* the inner subplan. Threading the outer clock into the subplan would
-    // require widening the public `open_*` signatures, which is out of scope for this seam.
+    // NOTE (`rmp` task #140): a full-query subplan opens its own cursor via `open_seeded`, which
+    // captures a fresh statement clock. The outer `clock` is therefore not forwarded here; the two
+    // captures are microseconds apart, and the bare/`.statement` instant is still fixed *within* the
+    // inner subplan. Threading the outer clock into the subplan would require widening the public
+    // `open_*` signatures, which is out of scope for this seam.
     _clock: &StatementClock,
 ) -> EvalResult {
-    use crate::catalog::IndexCatalog;
-    use crate::logical::Var;
-
-    // The outer variables visible to the subquery are exactly the columns of the driving row; the
-    // inner plan correlates only on the ones it references (others are harmless unused arguments).
-    let outer_vars: Vec<Var> = row.columns().iter().map(Var::named).collect();
-
-    // Fingerprint = the span-normalised inner query AST + the outer variable names. Two outer rows
-    // with the same column set (the steady state) hit the same compiled plan.
-    let mut normalized = inner_query.clone();
-    normalized.zero_expr_spans_in_place();
-    let fingerprint = format!("{:?}|{:?}", normalized, row.columns());
-
-    let plan =
-        EXISTS_PLAN_CACHE.with(|cache| {
-            if let Some(existing) = cache.borrow().get(&fingerprint) {
-                return Ok::<_, EvalError>(std::rc::Rc::clone(existing));
-            }
-            // Compile once: lower the inner query correlated with the outer variables, plan it
-            // physically (an empty index catalogue is correct — the ReadOnlyGraph still serves any real
-            // index seek through the seam; with no catalogue the planner simply prefers scans), and bind
-            // the inner parameters from the outer (already-bound) parameter set.
-            let logical = crate::lower::lower_correlated(inner_query, &outer_vars);
-            let physical = crate::physical::plan_physical(&logical, &IndexCatalog::empty());
-            let bound = crate::binding::bind_parameters(&physical, &params.as_parameters())
-                .map_err(|e| EvalError::Subquery {
-                    message: e.to_string(),
-                })?;
-            let compiled = std::rc::Rc::new(ExistsPlan {
-                executor: crate::executor::Executor::new(physical, bound),
-            });
-            cache
-                .borrow_mut()
-                .insert(fingerprint.clone(), std::rc::Rc::clone(&compiled));
-            Ok(compiled)
-        })?;
-
+    let plan = compile_correlated_subplan(inner_query, row, params)?;
     // Run the inner plan over a read-only view, seeded with the outer row, and pull a single row.
     let mut ro = ReadOnlyGraph(graph);
     let token = crate::executor::CancellationToken::new();
@@ -3554,6 +3571,140 @@ fn eval_exists_full_query(
         })?;
     let any = cursor.next().map_err(exec_error_to_eval)?.is_some();
     Ok(RowValue::Value(Value::Boolean(any)))
+}
+
+/// Drains the full-query form of a `COUNT`/`COLLECT` subquery, applying `fold` to every row the
+/// correlated inner query produces (seeded by the outer `row`). Shared by
+/// [`eval_count_subquery`] and [`eval_collect_subquery`].
+fn drive_correlated_subquery(
+    inner_query: &crate::ast::Query,
+    row: &Row,
+    params: &BoundParameters,
+    graph: &dyn GraphAccess,
+    functions: &dyn FunctionRegistry,
+    mut fold: impl FnMut(Row),
+) -> Result<(), EvalError> {
+    let plan = compile_correlated_subplan(inner_query, row, params)?;
+    let mut ro = ReadOnlyGraph(graph);
+    let token = crate::executor::CancellationToken::new();
+    let mut cursor = plan
+        .executor
+        .open_seeded(
+            &mut ro,
+            token,
+            functions,
+            crate::procedure_registry::builtins(),
+            row,
+        )
+        .map_err(|e| EvalError::Subquery {
+            message: e.to_string(),
+        })?;
+    while let Some(inner_row) = cursor.next().map_err(exec_error_to_eval)? {
+        fold(inner_row);
+    }
+    Ok(())
+}
+
+/// Evaluates a `COUNT { ... }` subquery to the [`Integer`](Value::Integer) number of rows the
+/// correlated subquery matches (never `Null`).
+fn eval_count_subquery(
+    sq: &crate::ast::SubqueryExpr,
+    row: &Row,
+    params: &BoundParameters,
+    graph: &dyn GraphAccess,
+    functions: &dyn FunctionRegistry,
+    clock: &StatementClock,
+) -> EvalResult {
+    // Full-query form: run the inner query correlated and count its rows.
+    if let Some(inner_query) = &sq.full_query {
+        let mut n: i64 = 0;
+        drive_correlated_subquery(inner_query, row, params, graph, functions, |_| n += 1)?;
+        return Ok(RowValue::Value(Value::Integer(n)));
+    }
+    // Pattern form: count the pattern's matches (the comma-separated parts join through shared
+    // variables), filtered by the optional `WHERE`.
+    let n = count_pattern_matches(
+        &sq.pattern,
+        sq.predicate.as_deref(),
+        row,
+        params,
+        graph,
+        functions,
+        clock,
+    )?;
+    Ok(RowValue::Value(Value::Integer(n)))
+}
+
+/// Counts the matches of a correlated bare pattern (the `COUNT { (a)-->(b) [WHERE p] }` form),
+/// mirroring the pattern-join semantics of [`eval_exists_subquery`] but tallying every surviving
+/// row instead of short-circuiting on the first.
+fn count_pattern_matches(
+    pattern: &[crate::ast::PatternPart],
+    predicate: Option<&Expr>,
+    row: &Row,
+    params: &BoundParameters,
+    graph: &dyn GraphAccess,
+    functions: &dyn FunctionRegistry,
+    clock: &StatementClock,
+) -> Result<i64, EvalError> {
+    let mut rows = vec![row.clone()];
+    for part in pattern {
+        let path_var = part.var.as_ref().map(|v| v.name.as_str());
+        let mut next = Vec::new();
+        for r in &rows {
+            next.extend(pattern_element_rows(
+                &part.element,
+                r,
+                params,
+                graph,
+                functions,
+                clock,
+                false,
+                path_var,
+            )?);
+        }
+        rows = next;
+    }
+    let count = match predicate {
+        None => rows.len(),
+        Some(pred) => {
+            let mut c = 0usize;
+            for r in &rows {
+                if eval_to_ternary(pred, r, params, graph, functions, clock)?.is_true() {
+                    c += 1;
+                }
+            }
+            c
+        }
+    };
+    Ok(count as i64)
+}
+
+/// Evaluates a `COLLECT { ... }` subquery to a [`List`](RowValue::list) of the single returned
+/// column's value across every row the correlated subquery produces. `COLLECT` is always the
+/// full-query form and its inner query returns exactly one column (both enforced by the semantic
+/// pass); an empty result yields the empty list.
+fn eval_collect_subquery(
+    sq: &crate::ast::SubqueryExpr,
+    row: &Row,
+    params: &BoundParameters,
+    graph: &dyn GraphAccess,
+    functions: &dyn FunctionRegistry,
+    _clock: &StatementClock,
+) -> EvalResult {
+    let inner_query = sq
+        .full_query
+        .as_ref()
+        .expect("COLLECT subquery is always the full-query form");
+    let mut items: Vec<RowValue> = Vec::new();
+    drive_correlated_subquery(inner_query, row, params, graph, functions, |inner_row| {
+        // The inner query returns exactly one column (semantic invariant); collect its value,
+        // preserving structural values (nodes/relationships/paths) via `RowValue`.
+        if let Some(v) = inner_row.values().first() {
+            items.push(v.clone());
+        }
+    })?;
+    Ok(RowValue::list(items))
 }
 
 /// Maps an inner-subquery [`ExecError`](crate::executor::ExecError) to an [`EvalError`]: an inner

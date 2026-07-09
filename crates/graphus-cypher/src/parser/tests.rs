@@ -1802,3 +1802,126 @@ fn moderately_nested_expression_still_parses() {
         let _ = ok(&format!("RETURN {}", items.join(", ")));
     });
 }
+
+// =================================================================================================
+// CALL { ... } subquery clause + COUNT { } / COLLECT { } subquery expressions (rmp #633 / #634)
+// =================================================================================================
+
+#[test]
+fn parse_call_subquery_returning() {
+    let q = ok("UNWIND [1] AS x CALL { WITH x RETURN x AS y } RETURN y");
+    let cs = clauses(&q);
+    let Clause::CallSubquery(c) = &cs[1] else {
+        panic!("expected a CallSubquery clause, got {:?}", cs[1]);
+    };
+    assert!(c.in_transactions.is_none());
+    // The inner query is a Regular query whose head ends in RETURN.
+    let QueryBody::Regular { head, unions } = &c.query.body else {
+        panic!("expected a regular inner query");
+    };
+    assert!(unions.is_empty());
+    assert!(matches!(head.clauses.last(), Some(Clause::Return(_))));
+}
+
+#[test]
+fn parse_call_subquery_unit_no_return() {
+    let q = ok("CALL { CREATE (:N) } RETURN 1 AS x");
+    let Clause::CallSubquery(c) = &clauses(&q)[0] else {
+        panic!("expected a CallSubquery clause");
+    };
+    let QueryBody::Regular { head, .. } = &c.query.body else {
+        panic!("regular");
+    };
+    assert!(!matches!(head.clauses.last(), Some(Clause::Return(_))));
+}
+
+#[test]
+fn parse_call_subquery_union_inside() {
+    let q = ok("CALL { RETURN 1 AS v UNION ALL RETURN 2 AS v } RETURN v");
+    let Clause::CallSubquery(c) = &clauses(&q)[0] else {
+        panic!("expected a CallSubquery clause");
+    };
+    let QueryBody::Regular { unions, .. } = &c.query.body else {
+        panic!("regular");
+    };
+    assert_eq!(unions.len(), 1);
+    assert!(unions[0].all, "UNION ALL flag preserved");
+}
+
+#[test]
+fn parse_call_subquery_in_transactions() {
+    // Default (no OF): batch_size None.
+    let q = ok("UNWIND [1] AS x CALL { CREATE (:N) } IN TRANSACTIONS RETURN x");
+    let Clause::CallSubquery(c) = &clauses(&q)[1] else {
+        panic!("expected a CallSubquery clause");
+    };
+    let it = c.in_transactions.as_ref().expect("IN TRANSACTIONS present");
+    assert!(it.batch_size.is_none());
+
+    // OF n ROWS: batch_size Some.
+    let q = ok("UNWIND [1] AS x CALL { CREATE (:N) } IN TRANSACTIONS OF 100 ROWS RETURN x");
+    let Clause::CallSubquery(c) = &clauses(&q)[1] else {
+        panic!("expected a CallSubquery clause");
+    };
+    let it = c.in_transactions.as_ref().expect("IN TRANSACTIONS present");
+    assert!(matches!(
+        it.batch_size.as_ref().map(|e| &e.kind),
+        Some(ExprKind::Literal(Literal::Integer(100)))
+    ));
+
+    // `ROW` (singular) is also accepted.
+    assert!(
+        parse("UNWIND [1] AS x CALL { CREATE (:N) } IN TRANSACTIONS OF 1 ROW RETURN x").is_ok()
+    );
+}
+
+#[test]
+fn parse_call_subquery_of_without_rows_is_error() {
+    assert!(parse("CALL { CREATE (:N) } IN TRANSACTIONS OF 5 RETURN 1").is_err());
+}
+
+#[test]
+fn parse_count_subquery_pattern_and_full_forms() {
+    // Pattern form.
+    let ExprKind::CountSubquery(sq) = return_kind("MATCH (n) RETURN COUNT { (n)-->() } AS c")
+    else {
+        panic!("expected CountSubquery");
+    };
+    assert!(
+        !sq.pattern.is_empty() && sq.full_query.is_none(),
+        "pattern form"
+    );
+
+    // Full-query form.
+    let ExprKind::CountSubquery(sq) =
+        return_kind("MATCH (n) RETURN COUNT { MATCH (n)-->(m) RETURN m } AS c")
+    else {
+        panic!("expected CountSubquery");
+    };
+    assert!(
+        sq.pattern.is_empty() && sq.full_query.is_some(),
+        "full-query form"
+    );
+}
+
+#[test]
+fn parse_collect_subquery_is_full_query() {
+    let ExprKind::CollectSubquery(sq) =
+        return_kind("MATCH (n) RETURN COLLECT { MATCH (n)-->(m) RETURN m.name } AS names")
+    else {
+        panic!("expected CollectSubquery");
+    };
+    assert!(
+        sq.full_query.is_some(),
+        "COLLECT is always the full-query form"
+    );
+}
+
+#[test]
+fn parse_count_star_still_an_aggregate_not_a_subquery() {
+    // `count(*)` (parens) must stay the CountStar atom, not be mistaken for a subquery.
+    assert!(matches!(
+        return_kind("MATCH (n) RETURN count(*)"),
+        ExprKind::CountStar
+    ));
+}

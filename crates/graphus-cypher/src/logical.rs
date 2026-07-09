@@ -1196,6 +1196,8 @@ fn fmt_expr(expr: &Expr) -> String {
             format!("{}{{{}}}", fmt_expr(&mp.entity), rendered.join(", "))
         }
         ExprKind::ExistsSubquery(_) => "EXISTS{...}".to_owned(),
+        ExprKind::CountSubquery(_) => "COUNT{...}".to_owned(),
+        ExprKind::CollectSubquery(_) => "COLLECT{...}".to_owned(),
     }
 }
 

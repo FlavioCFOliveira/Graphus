@@ -159,6 +159,9 @@ fn infer(expr: &Expr, env: &TypeEnv) -> SType {
         ExprKind::Quantifier(_) | ExprKind::ExistsSubquery(_) | ExprKind::HasLabels { .. } => {
             SType::Bool
         }
+        // A COUNT subquery is an integer; a COLLECT subquery is a list.
+        ExprKind::CountSubquery(_) => SType::Int,
+        ExprKind::CollectSubquery(_) => SType::List(Box::new(SType::Unknown)),
         ExprKind::ListComprehension(_) | ExprKind::PatternComprehension(_) => {
             SType::List(Box::new(SType::Unknown))
         }
@@ -300,6 +303,9 @@ pub fn check_expr(expr: &Expr, env: &TypeEnv) -> Result<(), SemanticError> {
         // typing is not the concern here; its embedded predicate/projection reference graph
         // elements, so we leave them to the runtime (conservative: no static claim).
         ExprKind::PatternComprehension(_) | ExprKind::ExistsSubquery(_) => {}
+        // COUNT / COLLECT subqueries run a correlated sub-pipeline whose bindings are validated by
+        // the semantic pass; there is no value-type claim to check here (conservative, like EXISTS).
+        ExprKind::CountSubquery(_) | ExprKind::CollectSubquery(_) => {}
         ExprKind::Literal(_)
         | ExprKind::Parameter(_)
         | ExprKind::Variable(_)

@@ -300,6 +300,14 @@ fn collect_clause_literals(clause: &Clause, out: &mut Vec<LiteralSite>) {
                 collect_expr_literals(w, out);
             }
         }
+        Clause::CallSubquery(c) => {
+            collect_query_literals(&c.query, out);
+            if let Some(t) = &c.in_transactions {
+                if let Some(batch) = &t.batch_size {
+                    collect_expr_literals(batch, out);
+                }
+            }
+        }
         Clause::Create(c) => collect_pattern_parts_literals(&c.pattern, out),
         Clause::Merge(m) => {
             collect_pattern_element_literals(&m.pattern.element, out);
@@ -503,6 +511,19 @@ fn collect_expr_literals(expr: &Expr, out: &mut Vec<LiteralSite>) {
             // offsets and rewrite correctly. Two *structurally different* inner queries can never
             // collide: their surviving (non-literal) text still differs in the normalised key.
             if let Some(q) = &ex.full_query {
+                collect_query_literals(q, out);
+            }
+        }
+        // COUNT / COLLECT subqueries: lift the pattern-form and inner-query literals exactly like
+        // `ExistsSubquery`, so two subqueries differing only in scalar literals share a cache key.
+        ExprKind::CountSubquery(sq) | ExprKind::CollectSubquery(sq) => {
+            for part in &sq.pattern {
+                collect_pattern_element_literals(&part.element, out);
+            }
+            if let Some(p) = &sq.predicate {
+                collect_expr_literals(p, out);
+            }
+            if let Some(q) = &sq.full_query {
                 collect_query_literals(q, out);
             }
         }

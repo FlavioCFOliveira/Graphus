@@ -97,11 +97,11 @@
 use std::collections::BTreeSet;
 
 use crate::ast::{
-    Clause, CreateClause, DeleteClause, Expr, ExprKind, ForeachClause, LoadCsvClause, MatchClause,
-    MergeAction, MergeClause, NodePattern, PatternElement, PatternPart, PatternPartKind,
-    ProjectionBody, ProjectionItem, Query, QueryBody, RelType, RelationshipPattern, RemoveClause,
-    RemoveItem, SetClause, SetItem, SingleQuery, StandaloneCall, StandaloneYield, UnionPart,
-    UnwindClause,
+    CallSubqueryClause, Clause, CreateClause, DeleteClause, Expr, ExprKind, ForeachClause, Literal,
+    LoadCsvClause, MatchClause, MergeAction, MergeClause, NodePattern, PatternElement, PatternPart,
+    PatternPartKind, ProjectionBody, ProjectionItem, Query, QueryBody, RelType,
+    RelationshipPattern, RemoveClause, RemoveItem, SetClause, SetItem, SingleQuery, StandaloneCall,
+    StandaloneYield, UnionPart, UnwindClause,
 };
 use crate::function_registry;
 use crate::lexer::Span;
@@ -254,6 +254,7 @@ impl Planner {
             Clause::Unwind(u) => self.lower_unwind(u, current),
             Clause::LoadCsv(l) => self.lower_load_csv(l, current),
             Clause::Call(c) => self.lower_in_query_call(c, current),
+            Clause::CallSubquery(c) => self.lower_call_subquery(c, current),
             Clause::Create(c) => self.lower_create(c, current),
             Clause::Merge(m) => self.lower_merge(m, current),
             Clause::Set(s) => self.lower_set(s, current),
@@ -764,6 +765,89 @@ impl Planner {
         } else {
             call
         }
+    }
+
+    /// Lowers a `CALL { <subquery> } [IN TRANSACTIONS [OF n ROWS]]` clause.
+    ///
+    /// The subquery runs **correlated, once per driving row** — realised by seeding every inner
+    /// branch on an [`Argument`](LogicalOp::Argument) leaf carrying that branch's *imported*
+    /// variables (see [`subquery_imports`]), which forces the enclosing join / loop to re-instantiate
+    /// the subplan for each driving row:
+    ///
+    /// - A **returning** subquery lowers to an [`Apply`](LogicalOp::Apply) over the driving plan —
+    ///   its correlated (`Argument`-rooted) right branch becomes a
+    ///   [`NestedLoopJoin`](crate::physical::PhysicalOp::NestedLoopJoin) that re-executes per driving
+    ///   row and multiplies cardinality (`merge_rows` concatenates each returned row onto the driving
+    ///   row); a driving row for which the subquery returns nothing is dropped.
+    /// - A **unit** subquery (no `RETURN`) lowers to a single-iteration
+    ///   [`Foreach`](LogicalOp::Foreach): its body is driven to completion for its side effects and
+    ///   the driving row passes through unchanged (cardinality preserved).
+    ///
+    /// # `IN TRANSACTIONS` limitation
+    ///
+    /// Graphus has no nested sub-transactions, so `IN TRANSACTIONS [OF n ROWS]` is executed with
+    /// batched semantics **inside the enclosing transaction**: the batch size is validated but each
+    /// batch is not committed independently, so the lowering is identical to a plain `CALL { ... }`
+    /// (see [`crate::ast::InTransactions`]). Results are unaffected; only Neo4j's partial-commit
+    /// durability differs.
+    fn lower_call_subquery(
+        &mut self,
+        c: &CallSubqueryClause,
+        current: Option<LogicalOp>,
+    ) -> LogicalOp {
+        let left = current.unwrap_or(LogicalOp::Empty);
+        let body = self.lower_subquery_body(&c.query);
+        if query_is_returning(&c.query) {
+            LogicalOp::Apply {
+                left: Box::new(left),
+                right: Box::new(body),
+            }
+        } else {
+            // Unit subquery: FOREACH over a one-element list drives the body exactly once per driving
+            // row for its side effects and passes the driving row through unchanged. The loop
+            // variable is a fresh synthetic that the body never references.
+            LogicalOp::Foreach {
+                input: Box::new(left),
+                variable: self.fresh_synthetic(),
+                list: unit_iteration_list(c.span),
+                body: Box::new(body),
+            }
+        }
+    }
+
+    /// Lowers the inner query of a `CALL { ... }` subquery, threading a `UNION` chain the same way
+    /// the top level does — but with each branch seeded on an [`Argument`](LogicalOp::Argument) leaf
+    /// (see [`Self::lower_subquery_single`]).
+    fn lower_subquery_body(&mut self, query: &Query) -> LogicalOp {
+        match &query.body {
+            QueryBody::Regular { head, unions } => {
+                let mut acc = self.lower_subquery_single(head);
+                for part in unions {
+                    let right = self.lower_subquery_single(&part.query);
+                    acc = LogicalOp::Union {
+                        left: Box::new(acc),
+                        right: Box::new(right),
+                        all: part.all,
+                    };
+                }
+                acc
+            }
+            QueryBody::StandaloneCall(call) => self.lower_standalone_call(call),
+        }
+    }
+
+    /// Lowers one branch of a `CALL { ... }` subquery, **always** rooted at an
+    /// [`Argument`](LogicalOp::Argument) leaf over the branch's imported variables (even when it
+    /// imports nothing — an empty `Argument` still emits one row per drive). This guarantees the
+    /// branch is treated as *correlated*, so the enclosing `Apply`/`Foreach` re-executes it once per
+    /// driving row (the fundamental CALL-subquery semantics), never buffering a single result set.
+    fn lower_subquery_single(&mut self, sq: &SingleQuery) -> LogicalOp {
+        let imports = subquery_imports(sq);
+        let mut current: Option<LogicalOp> = Some(LogicalOp::Argument { arguments: imports });
+        for clause in &sq.clauses {
+            current = Some(self.lower_clause(clause, current));
+        }
+        current.unwrap_or(LogicalOp::Empty)
     }
 
     /// Lowers a standalone `CALL` (the whole statement is a procedure call).
@@ -1501,7 +1585,9 @@ fn expr_size(expr: &Expr) -> usize {
         | ExprKind::Reduce(_)
         | ExprKind::MapProjection(_)
         | ExprKind::PatternComprehension(_)
-        | ExprKind::ExistsSubquery(_) => {}
+        | ExprKind::ExistsSubquery(_)
+        | ExprKind::CountSubquery(_)
+        | ExprKind::CollectSubquery(_) => {}
     }
     n
 }
@@ -1582,9 +1668,70 @@ fn expr_contains_aggregate(expr: &Expr) -> bool {
                 })
         }
         // Pattern comprehensions / EXISTS subqueries establish pattern-bound scopes; an aggregate
-        // cannot legally appear inside (the semantic pass rejects it).
-        ExprKind::PatternComprehension(_) | ExprKind::ExistsSubquery(_) => false,
+        // cannot legally appear inside (the semantic pass rejects it). COUNT / COLLECT subqueries run
+        // an isolated sub-pipeline whose own aggregates are scoped inside it — they never hoist to
+        // the enclosing projection's aggregation, so they are not "containing an aggregate" here.
+        ExprKind::PatternComprehension(_)
+        | ExprKind::ExistsSubquery(_)
+        | ExprKind::CountSubquery(_)
+        | ExprKind::CollectSubquery(_) => false,
     }
+}
+
+/// The **imported** variables of a `CALL { ... }` subquery branch: the plain variable references of
+/// a leading *importing* `WITH` (see [`crate::semantics`] for the rules the analyser enforces).
+///
+/// A leading `WITH` that is not a pure import (aliasing, expressions, `*`, modifiers, `WHERE`, or
+/// empty) imports nothing — the analyser has already validated that such a `WITH` does not reference
+/// outer variables, so treating it as a regular (non-importing) `WITH` is sound here.
+fn subquery_imports(sq: &SingleQuery) -> Vec<Var> {
+    let Some(Clause::With(w)) = sq.clauses.first() else {
+        return Vec::new();
+    };
+    let pure = !w.body.distinct
+        && !w.body.star
+        && w.body.order_by.is_empty()
+        && w.body.skip.is_none()
+        && w.body.limit.is_none()
+        && w.where_clause.is_none()
+        && !w.body.items.is_empty()
+        && w.body
+            .items
+            .iter()
+            .all(|it| it.alias.is_none() && matches!(&it.expr.kind, ExprKind::Variable(_)));
+    if !pure {
+        return Vec::new();
+    }
+    w.body
+        .items
+        .iter()
+        .filter_map(|it| match &it.expr.kind {
+            ExprKind::Variable(name) => Some(Var::named(name)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether a `CALL { ... }` subquery body is a **returning** subquery (its head ends in `RETURN`).
+/// The analyser guarantees every `UNION` branch agrees, so inspecting the head suffices. A
+/// standalone-`CALL` body exports nothing and is treated as a unit subquery.
+fn query_is_returning(query: &Query) -> bool {
+    match &query.body {
+        QueryBody::Regular { head, .. } => matches!(head.clauses.last(), Some(Clause::Return(_))),
+        QueryBody::StandaloneCall(_) => false,
+    }
+}
+
+/// The single-element list literal `[true]` used to drive a **unit** `CALL { ... }` subquery through
+/// the [`Foreach`](LogicalOp::Foreach) device exactly once per driving row.
+fn unit_iteration_list(span: Span) -> Expr {
+    Expr::new(
+        ExprKind::List(vec![Expr::new(
+            ExprKind::Literal(Literal::Boolean(true)),
+            span,
+        )]),
+        span,
+    )
 }
 
 /// Pushes `var` into `out` only if a variable of the same name is not already present.
@@ -1714,6 +1861,10 @@ fn collect_referenced_vars(expr: &Expr, out: &mut BTreeSet<String>) {
             // refer to the outer scope are handled by the subquery's own correlated-argument
             // collection. Carrying for an EXISTS-only WHERE is not required by the dual-scope cases
             // the TCK exercises; conservatively contribute nothing here.
+        }
+        ExprKind::CountSubquery(_) | ExprKind::CollectSubquery(_) => {
+            // Same rationale as `ExistsSubquery`: the correlated COUNT/COLLECT sub-pipeline handles
+            // its own outer-variable references via its Argument leaf; contribute nothing here.
         }
     }
 }

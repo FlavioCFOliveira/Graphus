@@ -2089,7 +2089,9 @@ pub fn is_pure_per_row_expr(expr: &Expr) -> bool {
         | ExprKind::Quantifier(_)
         | ExprKind::Reduce(_)
         | ExprKind::MapProjection(_)
-        | ExprKind::ExistsSubquery(_) => false,
+        | ExprKind::ExistsSubquery(_)
+        | ExprKind::CountSubquery(_)
+        | ExprKind::CollectSubquery(_) => false,
     }
 }
 

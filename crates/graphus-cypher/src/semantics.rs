@@ -687,6 +687,19 @@ impl Analyzer<'_> {
         sq: &SingleQuery,
         seed: Scope,
     ) -> Result<Option<BTreeSet<String>>, SemanticError> {
+        Ok(self.check_single_query_final_scope(sq, seed)?.0)
+    }
+
+    /// As [`check_single_query_with_scope`](Self::check_single_query_with_scope), but also returns
+    /// the **final [`Scope`]** after the last clause (bindings *with* their kinds). A returning query
+    /// ends with the `RETURN` projection scope; a unit (write-only) query ends with the scope after
+    /// its last clause. Used by `CALL { ... }` to carry the subquery's returned variables — with the
+    /// correct kinds — into the enclosing scope.
+    fn check_single_query_final_scope(
+        &self,
+        sq: &SingleQuery,
+        seed: Scope,
+    ) -> Result<(Option<BTreeSet<String>>, Scope), SemanticError> {
         self.check_clause_composition(sq)?;
 
         let mut scope = seed;
@@ -697,6 +710,7 @@ impl Analyzer<'_> {
                 Clause::Unwind(u) => self.check_unwind(u, &mut scope)?,
                 Clause::LoadCsv(l) => self.check_load_csv(l, &mut scope)?,
                 Clause::Call(c) => self.check_in_query_call(c, &mut scope)?,
+                Clause::CallSubquery(c) => self.check_call_subquery(c, &mut scope)?,
                 Clause::Create(c) => self.check_create(c, &mut scope)?,
                 Clause::Merge(m) => self.check_merge(m, &mut scope)?,
                 Clause::Set(s) => self.check_set(s, &scope)?,
@@ -722,7 +736,7 @@ impl Analyzer<'_> {
                 }
             }
         }
-        Ok(final_columns)
+        Ok((final_columns, scope))
     }
 
     /// Analyses the inner query of an `EXISTS { <full query> }` subquery, **correlated** with the
@@ -754,6 +768,183 @@ impl Analyzer<'_> {
             // correlated read.
             QueryBody::StandaloneCall(call) => self.check_standalone_call(call),
         }
+    }
+
+    /// Validates a `CALL { <subquery> } [IN TRANSACTIONS [OF n ROWS]]` clause and threads its
+    /// effect on the enclosing `scope`.
+    ///
+    /// # Rules (Neo4j 5.x `CallSubquery`)
+    ///
+    /// 1. **Scope isolation.** Unlike `EXISTS`/`COUNT`/`COLLECT`, a `CALL { ... }` subquery sees
+    ///    **only** the outer variables it explicitly imports through a leading *importing* `WITH`
+    ///    (a first clause consisting solely of plain variable references). Every other outer
+    ///    variable is invisible inside; referencing one raises `UndefinedVariable`. With a `UNION`
+    ///    body the importing `WITH` is per-branch (each branch is a separate single query).
+    /// 2. **Returning vs unit.** A **returning** subquery (its final clause is `RETURN` in every
+    ///    branch) exports its returned variables into the outer scope and multiplies cardinality; a
+    ///    **unit** subquery (no `RETURN`) runs for side effects and preserves the row set. Branches
+    ///    must agree: either all return or all are unit.
+    /// 3. **No shadowing.** A returned variable name may not already exist in the outer scope
+    ///    (`VariableAlreadyBound`).
+    /// 4. **Writes are allowed** (a `CALL { ... }` subquery may `CREATE`/`SET`/…), unlike `EXISTS`.
+    fn check_call_subquery(
+        &self,
+        c: &crate::ast::CallSubqueryClause,
+        scope: &mut Scope,
+    ) -> Result<(), SemanticError> {
+        // The `IN TRANSACTIONS OF <n> ROWS` batch size is evaluated in the OUTER scope (it batches
+        // the *driving* rows), like a `LIMIT` count — aggregation is not allowed.
+        if let Some(t) = &c.in_transactions {
+            if let Some(batch) = &t.batch_size {
+                self.check_expr(batch, scope)?;
+                self.reject_aggregation(batch, "IN TRANSACTIONS OF")?;
+            }
+        }
+
+        // Analyse each branch in an isolated scope seeded ONLY with that branch's imports.
+        let branches: Vec<&SingleQuery> = match &c.query.body {
+            QueryBody::Regular { head, unions } => std::iter::once(head)
+                .chain(unions.iter().map(|u| &u.query))
+                .collect(),
+            QueryBody::StandaloneCall(call) => {
+                // A `CALL { CALL proc() }`-shaped body: validate the standalone call; it exports no
+                // variables into the outer scope (treated as a unit subquery).
+                self.check_standalone_call(call)?;
+                return Ok(());
+            }
+        };
+
+        let mut branch_results: Vec<(Option<BTreeSet<String>>, Scope)> =
+            Vec::with_capacity(branches.len());
+        for sq in &branches {
+            let imports = self.importing_with_vars(sq, scope)?;
+            let mut seed = Scope::default();
+            for name in &imports {
+                if let Some(binding) = scope.bindings.get(name) {
+                    seed.bindings.insert(name.clone(), binding.clone());
+                }
+            }
+            branch_results.push(self.check_single_query_final_scope(sq, seed)?);
+        }
+
+        // Returning vs unit: every branch must agree.
+        let all_returning = branch_results.iter().all(|(cols, _)| cols.is_some());
+        let any_returning = branch_results.iter().any(|(cols, _)| cols.is_some());
+        if any_returning && !all_returning {
+            return Err(SemanticError::new(
+                SemanticErrorKind::InvalidClauseComposition {
+                    reason: "all branches of a CALL subquery must either all RETURN or all be unit",
+                },
+                c.span,
+            ));
+        }
+        if !all_returning {
+            // Unit subquery: the outer scope is unchanged (returned nothing).
+            return Ok(());
+        }
+
+        // Returning subquery: all branches share the same column set (UNION compatibility).
+        let head_cols = branch_results[0].0.clone().expect("all branches returning");
+        for (cols, _) in &branch_results[1..] {
+            if cols.as_ref() != Some(&head_cols) {
+                return Err(SemanticError::new(
+                    SemanticErrorKind::DifferentColumnsInUnion,
+                    c.span,
+                ));
+            }
+        }
+
+        // A returned variable may not shadow an existing outer-scope variable.
+        for name in &head_cols {
+            if scope.contains(name) {
+                return Err(SemanticError::new(
+                    SemanticErrorKind::VariableAlreadyBound { name: name.clone() },
+                    c.span,
+                ));
+            }
+        }
+
+        // Export the returned variables into the outer scope, carrying their kinds. When the same
+        // column has different kinds across UNION branches, downgrade it to a plain value of unknown
+        // type (conservative: defers to runtime, never a false static rejection).
+        for name in &head_cols {
+            let head_binding = branch_results[0].1.bindings.get(name);
+            let mut kind = head_binding.map_or(VarKind::Value, |b| b.kind);
+            let mut stype = head_binding.map_or(SType::Unknown, |b| b.stype.clone());
+            for (_, bscope) in &branch_results[1..] {
+                if bscope.kind_of(name) != Some(kind) {
+                    kind = VarKind::Value;
+                    stype = SType::Unknown;
+                }
+            }
+            scope.bind_typed(name, kind, stype, c.span)?;
+        }
+        Ok(())
+    }
+
+    /// Determines the *importing* `WITH` variables of one `CALL`-subquery branch and enforces the
+    /// importing-`WITH` restrictions against the outer `scope`.
+    ///
+    /// An importing `WITH` is a **leading** `WITH` consisting solely of plain variable references —
+    /// no aliasing (`AS`), no expressions, no `*`, no `DISTINCT`/`ORDER BY`/`SKIP`/`LIMIT`, no
+    /// `WHERE` (Neo4j: "an importing WITH can consist only of direct references to outside
+    /// variables"). Every named variable must already be bound in the outer scope. A leading `WITH`
+    /// that is *not* a pure import (e.g. `WITH 1 AS x`) introduces fresh variables and imports
+    /// nothing; but if such a non-pure leading `WITH` references an outer variable directly, that is
+    /// the invalid-importing-`WITH` error rather than a silent fresh binding.
+    fn importing_with_vars(
+        &self,
+        sq: &SingleQuery,
+        outer: &Scope,
+    ) -> Result<Vec<String>, SemanticError> {
+        let Some(Clause::With(w)) = sq.clauses.first() else {
+            return Ok(Vec::new());
+        };
+        let modifiers_clean = !w.body.distinct
+            && !w.body.star
+            && w.body.order_by.is_empty()
+            && w.body.skip.is_none()
+            && w.body.limit.is_none()
+            && w.where_clause.is_none();
+        let all_bare_vars = w
+            .body
+            .items
+            .iter()
+            .all(|it| it.alias.is_none() && matches!(&it.expr.kind, ExprKind::Variable(_)));
+
+        if modifiers_clean && all_bare_vars && !w.body.items.is_empty() {
+            let mut names = Vec::with_capacity(w.body.items.len());
+            for it in &w.body.items {
+                if let ExprKind::Variable(name) = &it.expr.kind {
+                    if !outer.contains(name) {
+                        return Err(SemanticError::new(
+                            SemanticErrorKind::UndefinedVariable { name: name.clone() },
+                            it.expr.span,
+                        ));
+                    }
+                    names.push(name.clone());
+                }
+            }
+            return Ok(names);
+        }
+
+        // Not a pure importing WITH. If it directly references an outer variable (aliased or not —
+        // `WITH x AS z`, `WITH x, 1 AS y`), it is an invalid importing WITH; otherwise it is a
+        // regular leading WITH that introduces fresh variables and imports nothing.
+        for it in &w.body.items {
+            if let ExprKind::Variable(name) = &it.expr.kind {
+                if outer.contains(name) {
+                    return Err(SemanticError::new(
+                        SemanticErrorKind::InvalidClauseComposition {
+                            reason: "an importing WITH in a CALL subquery may consist only of \
+                                     plain references to outer variables",
+                        },
+                        w.span,
+                    ));
+                }
+            }
+        }
+        Ok(Vec::new())
     }
 
     /// Rejects any **writing** clause inside an `EXISTS` subquery's single query — they would mutate
@@ -1895,6 +2086,91 @@ impl Analyzer<'_> {
                 }
                 Ok(())
             }
+            ExprKind::CountSubquery(sq) => self.check_count_collect_subquery(sq, scope, false),
+            ExprKind::CollectSubquery(sq) => self.check_count_collect_subquery(sq, scope, true),
+        }
+    }
+
+    /// Validates a `COUNT { ... }` / `COLLECT { ... }` subquery expression, **correlated** with the
+    /// outer `scope` (like [`ExprKind::ExistsSubquery`], outer variables are visible without an
+    /// import). `is_collect` selects the `COLLECT` rules: it is always the full-query form and its
+    /// final `RETURN` must project **exactly one** column (Neo4j `CollectExpression`).
+    fn check_count_collect_subquery(
+        &self,
+        sq: &crate::ast::SubqueryExpr,
+        scope: &Scope,
+        is_collect: bool,
+    ) -> Result<(), SemanticError> {
+        if let Some(inner_query) = &sq.full_query {
+            let cols = self.check_readonly_full_query_columns(inner_query, scope)?;
+            if is_collect {
+                match &cols {
+                    Some(c) if c.len() == 1 => {}
+                    Some(_) => {
+                        return Err(SemanticError::new(
+                            SemanticErrorKind::InvalidClauseComposition {
+                                reason: "a COLLECT subquery must return exactly one column",
+                            },
+                            inner_query.span,
+                        ));
+                    }
+                    None => {
+                        return Err(SemanticError::new(
+                            SemanticErrorKind::InvalidClauseComposition {
+                                reason: "a COLLECT subquery must end with a RETURN of one column",
+                            },
+                            inner_query.span,
+                        ));
+                    }
+                }
+            }
+            return Ok(());
+        }
+        // Pattern form (`COUNT { (a)-->(b) [WHERE p] }`); the parser guarantees `COLLECT` is always
+        // the full-query form, so a pattern-form `COLLECT` is unreachable.
+        debug_assert!(!is_collect, "COLLECT is always the full-query form");
+        let mut inner = scope.clone();
+        for part in &sq.pattern {
+            self.bind_pattern_part(part, &mut inner, PatternRole::Read)?;
+        }
+        if let Some(pred) = &sq.predicate {
+            self.check_expr_refs(pred, &inner)?;
+        }
+        Ok(())
+    }
+
+    /// Analyses a **read-only, correlated** inner query (the full-query body of a `COUNT`/`COLLECT`
+    /// subquery), rejecting writing clauses in every `UNION` branch and returning the `RETURN`
+    /// column-name set (`None` when the query has no `RETURN`). Mirrors
+    /// [`check_exists_full_query`](Self::check_exists_full_query) but surfaces the column set so
+    /// `COLLECT`'s single-column rule can be enforced.
+    fn check_readonly_full_query_columns(
+        &self,
+        query: &Query,
+        scope: &Scope,
+    ) -> Result<Option<BTreeSet<String>>, SemanticError> {
+        match &query.body {
+            QueryBody::Regular { head, unions } => {
+                Self::reject_writing_clauses(head)?;
+                let head_cols = self.check_single_query_with_scope(head, scope.clone())?;
+                for UnionPart { query: sq, .. } in unions {
+                    Self::reject_writing_clauses(sq)?;
+                    let cols = self.check_single_query_with_scope(sq, scope.clone())?;
+                    if let (Some(a), Some(b)) = (&head_cols, &cols) {
+                        if a != b {
+                            return Err(SemanticError::new(
+                                SemanticErrorKind::DifferentColumnsInUnion,
+                                sq.span,
+                            ));
+                        }
+                    }
+                }
+                Ok(head_cols)
+            }
+            QueryBody::StandaloneCall(call) => {
+                self.check_standalone_call(call)?;
+                Ok(None)
+            }
         }
     }
 
@@ -2015,6 +2291,15 @@ impl Analyzer<'_> {
                 }
                 // The optional `WHERE` of an `EXISTS { ... }` is itself a predicate position.
                 if let Some(pred) = &ex.predicate {
+                    Self::check_pattern_predicate_placement(pred, true)?;
+                }
+                Ok(())
+            }
+            // A COUNT / COLLECT subquery's pattern-form `WHERE` is a predicate position, exactly like
+            // an EXISTS subquery's. (The full-query form's inner clauses are placement-checked when
+            // that inner query is analysed.)
+            ExprKind::CountSubquery(sq) | ExprKind::CollectSubquery(sq) => {
+                if let Some(pred) = &sq.predicate {
                     Self::check_pattern_predicate_placement(pred, true)?;
                 }
                 Ok(())
@@ -2315,8 +2600,13 @@ impl Analyzer<'_> {
                 result
             }
             // Pattern-scoped forms bind their own pattern variables and cannot host aggregates;
-            // they are left to the general scope checks (conservative: never flagged here).
-            ExprKind::PatternComprehension(_) | ExprKind::ExistsSubquery(_) => Ok(()),
+            // they are left to the general scope checks (conservative: never flagged here). COUNT /
+            // COLLECT subqueries run a self-contained sub-pipeline whose references are not subject
+            // to the enclosing aggregation's grouping-key rule, so they are exempt too.
+            ExprKind::PatternComprehension(_)
+            | ExprKind::ExistsSubquery(_)
+            | ExprKind::CountSubquery(_)
+            | ExprKind::CollectSubquery(_) => Ok(()),
             _ => Self::for_each_child(expr, &mut |child| {
                 self.check_aggregate_item_references(child, keys, locals)
             }),
@@ -2412,7 +2702,15 @@ impl Analyzer<'_> {
                 locals.pop();
                 found
             }
-            ExprKind::PatternComprehension(_) | ExprKind::ExistsSubquery(_) => true,
+            // A subquery form correlates on outer variables through an embedded pattern (not a bare
+            // child expr), so `for_each_child` would miss those references. Treat every subquery as
+            // *possibly* referencing a free variable (the conservative, safe answer — the same one
+            // EXISTS gives): a `COUNT { (n)-->() }` where `n` is outer must not be mistaken for a
+            // constant.
+            ExprKind::PatternComprehension(_)
+            | ExprKind::ExistsSubquery(_)
+            | ExprKind::CountSubquery(_)
+            | ExprKind::CollectSubquery(_) => true,
             _ => {
                 let mut found = false;
                 let _ = Self::for_each_child(expr, &mut |child| {
@@ -2574,6 +2872,14 @@ impl Analyzer<'_> {
                 }
                 Ok(())
             }
+            // COUNT / COLLECT subqueries expose their pattern-form `WHERE` as their only bare child
+            // expression (the full-query form embeds a `Query`, not an `Expr`), matching EXISTS.
+            ExprKind::CountSubquery(sq) | ExprKind::CollectSubquery(sq) => {
+                if let Some(pred) = &sq.predicate {
+                    f(pred)?;
+                }
+                Ok(())
+            }
             ExprKind::PatternComprehension(pc) => {
                 if let Some(pred) = &pc.predicate {
                     f(pred)?;
@@ -2662,6 +2968,118 @@ mod tests {
             "MATCH (a) WITH avg(a.age) AS avgAge ORDER BY $age + avg(a.age) - 1000 RETURN avgAge",
         ] {
             assert!(analyze(&ast(q)).is_ok(), "should accept: {q}");
+        }
+    }
+
+    #[test]
+    fn call_subquery_scope_and_result_rules() {
+        // Accepted forms.
+        for q in [
+            // Importing WITH brings `x` in; returned `y` enters the outer scope.
+            "UNWIND [1, 2] AS x CALL { WITH x RETURN x * 10 AS y } RETURN x, y",
+            // Uncorrelated (no import): the subquery is self-contained.
+            "CALL { MATCH (n) RETURN count(n) AS c } RETURN c",
+            // Unit subquery (no RETURN) — writes allowed, exports nothing.
+            "UNWIND [1, 2, 3] AS x CALL { CREATE (:N) } RETURN x",
+            // UNION inside, importing WITH per branch.
+            "MATCH (a) CALL { WITH a RETURN a AS n UNION WITH a RETURN a AS n } RETURN n",
+            // IN TRANSACTIONS OF n ROWS.
+            "UNWIND [1, 2] AS x CALL { CREATE (:T) } IN TRANSACTIONS OF 1 ROWS RETURN x",
+            // A non-pure leading WITH that introduces a fresh variable (not an import).
+            "CALL { WITH 1 AS x RETURN x AS y } RETURN y",
+        ] {
+            assert!(analyze(&ast(q)).is_ok(), "should accept: {q}");
+        }
+    }
+
+    #[test]
+    fn call_subquery_scope_isolation_rejects_unimported_outer_var() {
+        // `x` is in the outer scope but NOT imported → invisible inside the subquery.
+        let err = analyze(&ast("WITH 1 AS x CALL { RETURN x AS y } RETURN y")).unwrap_err();
+        assert!(
+            matches!(err.kind, SemanticErrorKind::UndefinedVariable { .. }),
+            "expected UndefinedVariable, got {:?}",
+            err.kind
+        );
+    }
+
+    #[test]
+    fn call_subquery_returned_name_may_not_shadow_outer() {
+        // A returning subquery may not export a name that already exists outside.
+        let err = analyze(&ast("WITH 1 AS x CALL { WITH x RETURN x AS x } RETURN x")).unwrap_err();
+        assert!(
+            matches!(err.kind, SemanticErrorKind::VariableAlreadyBound { .. }),
+            "expected VariableAlreadyBound, got {:?}",
+            err.kind
+        );
+    }
+
+    #[test]
+    fn call_subquery_importing_with_rejects_aliasing() {
+        // A leading WITH that aliases an OUTER variable is an invalid importing WITH.
+        let err = analyze(&ast(
+            "WITH 1 AS x CALL { WITH x AS z RETURN z AS r } RETURN r",
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err.kind, SemanticErrorKind::InvalidClauseComposition { .. }),
+            "expected InvalidClauseComposition, got {:?}",
+            err.kind
+        );
+    }
+
+    #[test]
+    fn call_subquery_mixed_returning_unit_branches_rejected() {
+        // One UNION branch returns, the other is unit → inconsistent.
+        let err = analyze(&ast("CALL { RETURN 1 AS v UNION CREATE (:X) } RETURN v")).unwrap_err();
+        assert!(
+            matches!(err.kind, SemanticErrorKind::InvalidClauseComposition { .. }),
+            "expected InvalidClauseComposition, got {:?}",
+            err.kind
+        );
+    }
+
+    #[test]
+    fn count_collect_subquery_scope_and_rules() {
+        for q in [
+            "MATCH (n) RETURN COUNT { (n)-->() } AS deg",
+            "MATCH (n) RETURN COUNT { MATCH (n)-->(m) RETURN m } AS deg",
+            "MATCH (n) WHERE COUNT { (n)-->() } > 1 RETURN n",
+            "MATCH (n) RETURN COLLECT { MATCH (n)-->(m) RETURN m.name } AS names",
+            // Outer variable visible without importing.
+            "MATCH (n) RETURN COLLECT { MATCH (n)-->(m) WHERE m.age > n.age RETURN m } AS xs",
+        ] {
+            assert!(analyze(&ast(q)).is_ok(), "should accept: {q}");
+        }
+    }
+
+    #[test]
+    fn collect_subquery_requires_single_column() {
+        // A COLLECT subquery returning two columns is rejected.
+        let err = analyze(&ast(
+            "MATCH (n) RETURN COLLECT { MATCH (n)-->(m) RETURN m, n } AS xs",
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err.kind, SemanticErrorKind::InvalidClauseComposition { .. }),
+            "expected InvalidClauseComposition, got {:?}",
+            err.kind
+        );
+    }
+
+    #[test]
+    fn count_collect_subquery_reject_writing_clause() {
+        // COUNT/COLLECT are read-only, like EXISTS.
+        for q in [
+            "MATCH (n) RETURN COUNT { MATCH (n)-->(m) CREATE (:X) RETURN m } AS c",
+            "MATCH (n) RETURN COLLECT { MATCH (n)-->(m) SET m.x = 1 RETURN m } AS c",
+        ] {
+            let err = analyze(&ast(q)).unwrap_err();
+            assert!(
+                matches!(err.kind, SemanticErrorKind::InvalidClauseComposition { .. }),
+                "expected InvalidClauseComposition for {q}, got {:?}",
+                err.kind
+            );
         }
     }
 

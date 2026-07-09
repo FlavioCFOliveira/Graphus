@@ -107,6 +107,10 @@ pub enum Clause {
     LoadCsv(LoadCsvClause),
     /// `CALL proc(...) [YIELD ...]` used inside a query (openCypher `InQueryCall`).
     Call(CallClause),
+    /// `CALL { <subquery> } [IN TRANSACTIONS [OF n ROWS]]` — a Cypher **subquery** (Neo4j
+    /// `CallSubquery`). The braces hold a complete inner query (which may itself contain
+    /// `UNION` / `UNION ALL`); it runs correlated, once per driving row.
+    CallSubquery(CallSubqueryClause),
     /// `CREATE <pattern>` (openCypher `Create`).
     Create(CreateClause),
     /// `MERGE <pattern-part> { ON CREATE SET ... | ON MATCH SET ... }` (openCypher `Merge`).
@@ -133,6 +137,7 @@ impl Clause {
             Self::Unwind(c) => c.span,
             Self::LoadCsv(c) => c.span,
             Self::Call(c) => c.span,
+            Self::CallSubquery(c) => c.span,
             Self::Create(c) => c.span,
             Self::Merge(c) => c.span,
             Self::Set(c) => c.span,
@@ -426,6 +431,58 @@ pub struct CallClause {
     /// The optional `WHERE` filter attached to `YIELD` (openCypher `YieldItems ... [Where]`).
     pub where_clause: Option<Expr>,
     /// Span from `CALL` to the end of the call / `YIELD`.
+    pub span: Span,
+}
+
+/// `CALL { <subquery> } [IN TRANSACTIONS [OF n ROWS]]` — a Cypher **subquery** clause (Neo4j
+/// `CallSubquery`).
+///
+/// The braces hold a complete inner [`Query`] (openCypher `RegularQuery`), which may itself contain
+/// a `UNION` / `UNION ALL` chain. The subquery runs **correlated**, **once per driving row** of the
+/// enclosing query:
+///
+/// - A **returning** subquery (its final clause, in every `UNION` branch, is `RETURN`) multiplies
+///   cardinality: each driving row is combined with each row the subquery returns for it, and its
+///   returned variables enter the outer scope. A driving row for which the subquery returns nothing
+///   is dropped (inner-apply semantics).
+/// - A **unit** subquery (no `RETURN`) runs purely for its side effects and passes each driving row
+///   through **unchanged** (cardinality preserved).
+///
+/// **Scope isolation:** unlike [`ExprKind::CountSubquery`] / [`ExprKind::CollectSubquery`] (which see
+/// the outer scope implicitly), a `CALL { ... }` subquery sees **only** the variables it explicitly
+/// imports via a leading *importing* `WITH` (a first clause consisting solely of bare variable
+/// references). See [`crate::semantics`] for the importing-`WITH` rules.
+#[derive(Debug, Clone, PartialEq)]
+#[must_use]
+pub struct CallSubqueryClause {
+    /// The inner query (a `RegularQuery`; may contain `UNION` / `UNION ALL`). Boxed to keep
+    /// [`Clause`] small.
+    pub query: Box<Query>,
+    /// The `IN TRANSACTIONS [OF n ROWS]` modifier, if present.
+    pub in_transactions: Option<InTransactions>,
+    /// Span from `CALL` to the closing `}` (or the end of the `IN TRANSACTIONS` modifier).
+    pub span: Span,
+}
+
+/// The `IN TRANSACTIONS [OF <expr> ROW[S]]` modifier of a [`CallSubqueryClause`] (Neo4j
+/// `SubqueryInTransactionsParameters`).
+///
+/// # Engine limitation
+///
+/// Graphus runs on a **single-writer** transactional engine that does not support nested
+/// sub-transactions. `IN TRANSACTIONS` is therefore executed with **batched semantics inside the
+/// enclosing transaction**: the subquery still runs once per driving row and the (optional) batch
+/// size is accepted and validated, but each batch is **not** committed as an independent
+/// transaction. Consequently the results are identical to a plain `CALL { ... }` subquery; only the
+/// durability/partial-commit behaviour of Neo4j's real sub-transactions differs. This limitation is
+/// documented in `specification` and surfaced to the user in the manual.
+#[derive(Debug, Clone, PartialEq)]
+#[must_use]
+pub struct InTransactions {
+    /// The `OF <expr> ROW[S]` batch size, if given (must evaluate to a positive integer). `None`
+    /// means the default batch size (Neo4j: 1000 rows).
+    pub batch_size: Option<Expr>,
+    /// Span from `IN` to the last token of the modifier.
     pub span: Span,
 }
 
@@ -789,6 +846,17 @@ impl Expr {
                     q.zero_expr_spans_in_place();
                 }
             }
+            ExprKind::CountSubquery(sq) | ExprKind::CollectSubquery(sq) => {
+                // Same conservative treatment as `ExistsSubquery`: zero the embedded expression
+                // spans (the pattern-form `WHERE` and every expression of the full inner query),
+                // leaving structural clause/pattern spans as-is.
+                if let Some(pred) = &mut sq.predicate {
+                    pred.zero_spans_in_place();
+                }
+                if let Some(q) = &mut sq.full_query {
+                    q.zero_expr_spans_in_place();
+                }
+            }
         }
     }
 }
@@ -844,6 +912,14 @@ impl Clause {
                 }
                 if let Some(w) = &mut c.where_clause {
                     w.zero_spans_in_place();
+                }
+            }
+            Self::CallSubquery(c) => {
+                c.query.zero_expr_spans_in_place();
+                if let Some(t) = &mut c.in_transactions {
+                    if let Some(batch) = &mut t.batch_size {
+                        batch.zero_spans_in_place();
+                    }
                 }
             }
             Self::Create(c) => {
@@ -1067,6 +1143,15 @@ pub enum ExprKind {
     /// `ExistentialSubquery`). Boxed for the same embedded-pattern reason as
     /// [`PatternComprehension`](Self::PatternComprehension).
     ExistsSubquery(Box<ExistsSubquery>),
+    /// A counting subquery `COUNT { [MATCH] pattern [WHERE p] }` or `COUNT { <full query> }` (Neo4j
+    /// `CountExpression`). Evaluates to the [`Integer`](Value::Integer) number of rows the correlated
+    /// subquery matches. Boxed for the same embedded-pattern reason as
+    /// [`PatternComprehension`](Self::PatternComprehension).
+    CountSubquery(Box<SubqueryExpr>),
+    /// A collecting subquery `COLLECT { <full query with a single-column RETURN> }` (Neo4j
+    /// `CollectExpression`). Evaluates to a [`List`](Value) of the single returned column's value
+    /// across every row the correlated subquery produces. Boxed like the other subquery forms.
+    CollectSubquery(Box<SubqueryExpr>),
 }
 
 /// A literal in the AST (openCypher `Literal`), kept unevaluated; range/encoding checks are deferred
@@ -1348,6 +1433,37 @@ pub struct ExistsSubquery {
     /// (`EXISTS { MATCH ... RETURN ... }`) rather than a bare pattern. The other three fields are
     /// then inert (`pattern` empty, `predicate` `None`, `from_pattern_predicate` `false`).
     pub full_query: Option<Box<Query>>,
+}
+
+/// The body of a [`COUNT`](ExprKind::CountSubquery) / [`COLLECT`](ExprKind::CollectSubquery)
+/// subquery expression: a bare pattern (`COUNT` only) or a full inner query.
+///
+/// Structurally mirrors the read-only, correlated shape of [`ExistsSubquery`] (the two are siblings —
+/// all three see the outer scope implicitly and reject writing clauses), but with different result
+/// semantics: `COUNT` yields the row count and `COLLECT` yields the list of a single returned column.
+///
+/// - **Pattern form** (`COUNT { (a)-->(b) [WHERE p] }`): [`pattern`](Self::pattern) is non-empty,
+///   [`predicate`](Self::predicate) is the optional `WHERE`, and [`full_query`](Self::full_query) is
+///   `None`. `COLLECT` never uses this form (its `RETURN` is mandatory).
+/// - **Full-query form** (`COUNT { MATCH ... RETURN ... }`, `COLLECT { MATCH ... RETURN x }`):
+///   [`full_query`](Self::full_query) is `Some` and the other two fields are inert.
+#[derive(Debug, Clone, PartialEq)]
+#[must_use]
+pub struct SubqueryExpr {
+    /// The pattern parts (comma-separated) — **pattern form only** (empty in the full-query form).
+    pub pattern: Vec<PatternPart>,
+    /// The optional `WHERE` predicate over the pattern's bindings — **pattern form only**.
+    pub predicate: Option<Box<Expr>>,
+    /// The **full-query form**: when `Some`, the braces held a complete Cypher query.
+    pub full_query: Option<Box<Query>>,
+}
+
+impl SubqueryExpr {
+    /// Whether this is the **full-query** arm rather than the bare-pattern arm.
+    #[must_use]
+    pub fn is_full_query(&self) -> bool {
+        self.full_query.is_some()
+    }
 }
 
 impl ExistsSubquery {

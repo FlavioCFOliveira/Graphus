@@ -2887,7 +2887,9 @@ fn expr_references_var(expr: &Expr, var: &str) -> bool {
         | ExprKind::Quantifier(_)
         | ExprKind::Reduce(_)
         | ExprKind::MapProjection(_)
-        | ExprKind::ExistsSubquery(_) => false,
+        | ExprKind::ExistsSubquery(_)
+        | ExprKind::CountSubquery(_)
+        | ExprKind::CollectSubquery(_) => false,
     }
 }
 
@@ -4944,9 +4946,13 @@ fn extract_aggregates(expr: &Expr, subs: &mut Vec<(String, Expr)>, col: usize) -
             }
             ExprKind::MapProjection(Box::new(mp))
         }
-        // Pattern comprehensions / EXISTS subqueries cannot contain aggregates (their scopes are
-        // pattern-bound; the semantic pass rejects aggregation inside them), so pass them through.
-        k @ (ExprKind::PatternComprehension(_) | ExprKind::ExistsSubquery(_)) => k.clone(),
+        // Pattern comprehensions / EXISTS / COUNT / COLLECT subqueries cannot host an *outer*
+        // aggregate (their scopes are self-contained; the semantic pass rejects hoisting), so pass
+        // them through unchanged.
+        k @ (ExprKind::PatternComprehension(_)
+        | ExprKind::ExistsSubquery(_)
+        | ExprKind::CountSubquery(_)
+        | ExprKind::CollectSubquery(_)) => k.clone(),
     };
     Expr::new(kind, expr.span)
 }
@@ -8458,6 +8464,312 @@ mod tests {
         let mut g = exists_tck_graph();
         let props = qualifying_props("MATCH (n) WHERE (n)-->() RETURN n", &mut g);
         assert_eq!(props, vec![1], "bare pattern predicate still selects A");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // CALL { ... } subquery clause (rmp #633)
+    // ---------------------------------------------------------------------------------------------
+
+    /// A sorted `(x, y)` pair projection of the result rows (both integer columns).
+    fn int_pairs(rows: &[Row], a: &str, b: &str) -> Vec<(i64, i64)> {
+        let mut out: Vec<(i64, i64)> = rows
+            .iter()
+            .filter_map(|r| match (r.value(a), r.value(b)) {
+                (Value::Integer(x), Value::Integer(y)) => Some((x, y)),
+                _ => None,
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    #[test]
+    fn call_subquery_importing_with_correlated() {
+        // Neo4j manual example: `UNWIND [1,2] AS x CALL { WITH x RETURN x*10 AS y } RETURN x, y`
+        // → (1,10),(2,20). The importing WITH is the ONLY way `x` enters the subquery.
+        let mut g = MemGraph::new();
+        let rows = run(
+            "UNWIND [1, 2] AS x CALL { WITH x RETURN x * 10 AS y } RETURN x, y",
+            &mut g,
+        );
+        assert_eq!(int_pairs(&rows, "x", "y"), vec![(1, 10), (2, 20)]);
+    }
+
+    #[test]
+    fn call_subquery_returns_aggregate() {
+        // `CALL { MATCH (n) RETURN count(n) AS c } RETURN c` — a leading (uncorrelated) subquery.
+        let mut g = exists_tck_graph(); // 4 nodes
+        let rows = run("CALL { MATCH (n) RETURN count(n) AS c } RETURN c", &mut g);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].value("c"), Value::Integer(4));
+    }
+
+    #[test]
+    fn call_subquery_cardinality_multiplies() {
+        // A returning subquery multiplies cardinality: 2 outer rows × 2 inner rows = 4.
+        let mut g = MemGraph::new();
+        let rows = run(
+            "UNWIND [1, 2] AS x CALL { UNWIND [10, 20] AS y RETURN y } RETURN x, y",
+            &mut g,
+        );
+        assert_eq!(
+            int_pairs(&rows, "x", "y"),
+            vec![(1, 10), (1, 20), (2, 10), (2, 20)]
+        );
+    }
+
+    #[test]
+    fn call_subquery_empty_result_drops_outer_row() {
+        // A returning subquery that yields nothing for a driving row drops that row (inner-apply).
+        let mut g = MemGraph::new();
+        let rows = run(
+            "UNWIND [1, 2, 3] AS x CALL { WITH x UNWIND (CASE WHEN x = 2 THEN [] ELSE [x] END) AS y RETURN y } RETURN x",
+            &mut g,
+        );
+        let mut xs: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| match r.value("x") {
+                Value::Integer(k) => Some(k),
+                _ => None,
+            })
+            .collect();
+        xs.sort_unstable();
+        assert_eq!(
+            xs,
+            vec![1, 3],
+            "x=2 produced no inner row, so it is dropped"
+        );
+    }
+
+    #[test]
+    fn call_subquery_unit_side_effect_preserves_cardinality() {
+        // A UNIT subquery (no RETURN) runs for side effects and passes each driving row through
+        // unchanged: 3 driving rows → 3 output rows AND 3 created nodes.
+        let mut g = MemGraph::new();
+        let rows = run(
+            "UNWIND [1, 2, 3] AS x CALL { CREATE (:N) } RETURN x",
+            &mut g,
+        );
+        assert_eq!(
+            rows.len(),
+            3,
+            "unit subquery preserves the driving row count"
+        );
+        assert_eq!(
+            g.scan_nodes_by_label("N").len(),
+            3,
+            "one node created per driving row"
+        );
+    }
+
+    #[test]
+    fn call_subquery_returning_write_reexecutes_per_row() {
+        // A RETURNING subquery with a write must re-execute per driving row (NestedLoop rebuilds the
+        // right branch), creating one node per row — never buffering a single result set.
+        let mut g = MemGraph::new();
+        let rows = run(
+            "UNWIND [1, 2] AS x CALL { CREATE (n:M) RETURN n } RETURN x",
+            &mut g,
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(g.scan_nodes_by_label("M").len(), 2, "one M per driving row");
+    }
+
+    #[test]
+    fn call_subquery_union_inside() {
+        // UNION inside the subquery: both branches contribute rows.
+        let mut g = MemGraph::new();
+        let rows = run(
+            "CALL { RETURN 1 AS v UNION RETURN 2 AS v } RETURN v",
+            &mut g,
+        );
+        let mut vs: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| match r.value("v") {
+                Value::Integer(k) => Some(k),
+                _ => None,
+            })
+            .collect();
+        vs.sort_unstable();
+        assert_eq!(vs, vec![1, 2]);
+    }
+
+    #[test]
+    fn call_subquery_in_transactions_of_rows() {
+        // `IN TRANSACTIONS OF n ROWS` parses, plans and executes (batched within the outer txn — a
+        // documented engine limitation): 3 driving rows → 3 created nodes, cardinality preserved.
+        let mut g = MemGraph::new();
+        let rows = run(
+            "UNWIND [1, 2, 3] AS x CALL { CREATE (:T) } IN TRANSACTIONS OF 2 ROWS RETURN x",
+            &mut g,
+        );
+        assert_eq!(rows.len(), 3);
+        assert_eq!(g.scan_nodes_by_label("T").len(), 3);
+    }
+
+    #[test]
+    fn call_subquery_correlated_match() {
+        // The subquery is correlated by the imported `n`; it must count only n's own neighbours.
+        // A(prop 1) has 3 outgoing rels; the others have none.
+        let mut g = exists_tck_graph();
+        let rows = run(
+            "MATCH (n) CALL { WITH n MATCH (n)-->(m) RETURN count(m) AS deg } RETURN n.prop AS p, deg",
+            &mut g,
+        );
+        let mut pairs: Vec<(i64, i64)> = rows
+            .iter()
+            .filter_map(|r| match (r.value("p"), r.value("deg")) {
+                (Value::Integer(p), Value::Integer(d)) => Some((p, d)),
+                _ => None,
+            })
+            .collect();
+        pairs.sort_unstable();
+        // A has 3; B/C/D have 0, but with an INNER count subquery each still returns one row (count
+        // over zero matches = 0), so all four appear.
+        assert_eq!(
+            pairs,
+            vec![(1, 3), (1, 0), (2, 0), (3, 0)]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn call_subquery_trailing_returning_no_outer_return() {
+        // A query whose LAST clause is a returning CALL subquery (no trailing outer RETURN) is a
+        // valid statement whose result columns are the subquery's returned columns.
+        let mut g = MemGraph::new();
+        let rows = run("CALL { RETURN 1 AS x }", &mut g);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].value("x"), Value::Integer(1));
+        assert_eq!(rows[0].columns(), &["x".to_owned()]);
+    }
+
+    #[test]
+    fn call_subquery_nested() {
+        // A CALL subquery nested inside another CALL subquery.
+        let mut g = MemGraph::new();
+        let rows = run(
+            "CALL { CALL { RETURN 1 AS a } RETURN a * 2 AS b } RETURN b",
+            &mut g,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].value("b"), Value::Integer(2));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // COUNT { ... } / COLLECT { ... } subquery expressions (rmp #634)
+    // ---------------------------------------------------------------------------------------------
+
+    #[test]
+    fn count_subquery_top_level_uncorrelated() {
+        // `RETURN COUNT { ... }` with no driving MATCH — evaluated over the single implicit row.
+        let mut g = exists_tck_graph(); // 4 nodes, 3 rels
+        let rows = run("RETURN COUNT { MATCH (n) RETURN n } AS c", &mut g);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].value("c"), Value::Integer(4));
+    }
+
+    #[test]
+    fn count_subquery_pattern_form() {
+        // `COUNT { (n)-->() }` — degree of each node. A has 3; others 0.
+        let mut g = exists_tck_graph();
+        let rows = run(
+            "MATCH (n) RETURN n.prop AS p, COUNT { (n)-->() } AS deg",
+            &mut g,
+        );
+        let mut pairs: Vec<(i64, i64)> = rows
+            .iter()
+            .filter_map(|r| match (r.value("p"), r.value("deg")) {
+                (Value::Integer(p), Value::Integer(d)) => Some((p, d)),
+                _ => None,
+            })
+            .collect();
+        pairs.sort_unstable();
+        assert_eq!(
+            pairs,
+            vec![(1, 3), (1, 0), (2, 0), (3, 0)]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn count_subquery_full_query_form() {
+        // `COUNT { MATCH (n)-->(m) RETURN m }` — same degree, via the full-query form.
+        let mut g = exists_tck_graph();
+        let rows = run(
+            "MATCH (n) WHERE COUNT { MATCH (n)-->(m) RETURN m } > 1 RETURN n.prop AS p",
+            &mut g,
+        );
+        let ps: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| match r.value("p") {
+                Value::Integer(k) => Some(k),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ps, vec![1], "only A has >1 outgoing relationship");
+    }
+
+    #[test]
+    fn collect_subquery_full_query() {
+        // `COLLECT { MATCH (n) RETURN n.prop ORDER BY n.prop }` gathers the single column into a list.
+        let mut g = exists_tck_graph();
+        let rows = run(
+            "RETURN COLLECT { MATCH (n) RETURN n.prop AS p ORDER BY p } AS props",
+            &mut g,
+        );
+        assert_eq!(rows.len(), 1);
+        // A list of scalars collapses to a pure `RowValue::Value(Value::List(..))`; `as_list_elems`
+        // reads either representation.
+        let items = rows[0]
+            .get("props")
+            .and_then(RowValue::as_list_elems)
+            .expect("props is a list");
+        let vals: Vec<Value> = items
+            .iter()
+            .map(|it| match it {
+                RowValue::Value(v) => v.clone(),
+                _ => Value::Null,
+            })
+            .collect();
+        assert_eq!(
+            vals,
+            vec![
+                Value::Integer(1),
+                Value::Integer(1),
+                Value::Integer(2),
+                Value::Integer(3)
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_subquery_correlated() {
+        // Correlated COLLECT: the neighbours' props of each node.
+        let mut g = exists_tck_graph();
+        let rows = run(
+            "MATCH (n) RETURN n.prop AS p, COLLECT { MATCH (n)-->(m) RETURN m.prop AS mp ORDER BY mp } AS neighbours",
+            &mut g,
+        );
+        // A (prop 1) collects [1,2,3]; the rest collect []. Find the row whose neighbour list is
+        // non-empty and assert it has 3 elements.
+        let non_empty: Vec<usize> = rows
+            .iter()
+            .filter_map(|r| r.get("neighbours").and_then(RowValue::as_list_elems))
+            .map(|l| l.len())
+            .filter(|&n| n > 0)
+            .collect();
+        assert_eq!(
+            non_empty,
+            vec![3],
+            "only A has 3 neighbours; the rest collect []"
+        );
     }
 
     // ---- rmp #360: the Accumulator merge mechanics the grouped morsel tier relies on -------------
