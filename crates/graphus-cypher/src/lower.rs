@@ -415,10 +415,7 @@ impl Planner {
     fn lower_required_match(&mut self, m: &MatchClause, current: Option<LogicalOp>) -> LogicalOp {
         let mut plan = self.lower_pattern_parts(&m.pattern, current);
         if let Some(pred) = &m.where_clause {
-            plan = LogicalOp::Filter {
-                input: Box::new(plan),
-                predicate: pred.clone(),
-            };
+            plan = push_where_onto_scans(plan, pred);
         }
         plan
     }
@@ -509,6 +506,9 @@ impl Planner {
         // re-scanned, so its inline labels are *not* applied by `scan_node` and must be enforced by a
         // `HasLabels` filter below (`MATCH (a)-[r]->() WITH a MATCH (a:X)-[r]->()`, TCK `Match3` [25]).
         let mut anchor_reused = false;
+        // Whether this anchor's inline property map was already pushed onto its own fresh scan
+        // (the fresh-disconnected-component path below), so it must not be re-applied above `plan`.
+        let mut props_pushed = false;
         let mut plan = match current {
             // Already have a plan: if it binds the anchor, the node is shared (correlated); we do
             // not re-scan. Otherwise a comma-pattern introduces a fresh disconnected component,
@@ -519,8 +519,28 @@ impl Planner {
                 plan
             }
             Some(plan) => {
-                let scan = self.scan_node(&element.start, &anchor_var);
+                let mut scan = self.scan_node(&element.start, &anchor_var);
                 let args = collect_bound_vars(&plan);
+                // Push this fresh component's inline property map onto its OWN scan, *below* the
+                // `Apply`, so the physical planner's index selection (which only fires on a `Filter`
+                // sitting directly over a label/token scan) can turn `{id: $y}` into a
+                // `NodeIndexSeek` instead of a full label scan stranded above the (cartesian) join —
+                // the fix that makes a two-anchor edge create O(E·log N) instead of O(E·N)
+                // (`rmp` #303/#312).
+                //
+                // Only sound when the map references neither a **carried** binding (the fresh scan
+                // is the Apply's *uncorrelated* right branch and cannot see the left's columns — e.g.
+                // `UNWIND $rows AS r MATCH (y:L {k: r.k})` must keep its filter above the join) nor an
+                // opaque subquery scope. Otherwise the inline filter stays above the `Apply` (applied
+                // below via `filter_inline_props`).
+                if props_pushable_onto_fresh_scan(element.start.properties.as_ref(), &args) {
+                    scan = self.filter_inline_props(
+                        scan,
+                        element.start.properties.as_ref(),
+                        &anchor_var,
+                    );
+                    props_pushed = true;
+                }
                 // Correlate the new component with the carried bindings.
                 let scan = self.correlate_scan(scan, args);
                 LogicalOp::Apply {
@@ -535,7 +555,13 @@ impl Planner {
         if anchor_reused {
             plan = self.filter_inline_labels(plan, &element.start, &anchor_var);
         }
-        plan = self.filter_inline_props(plan, element.start.properties.as_ref(), &anchor_var);
+        // Apply the anchor's inline property map above `plan` unless it was already pushed onto the
+        // fresh scan above. For the leading anchor (`None`) this `Filter` sits directly over the
+        // scan, so index selection still reaches it; for a reused anchor it sits above the shared
+        // binding (as it must).
+        if !props_pushed {
+            plan = self.filter_inline_props(plan, element.start.properties.as_ref(), &anchor_var);
+        }
 
         // Each chain link: expand to the next node, then filter the link's inline props.
         let mut from = anchor_var.clone();
@@ -1987,6 +2013,361 @@ fn unit_iteration_list(span: Span) -> Expr {
         )]),
         span,
     )
+}
+
+/// Collects `expr`'s free variable names into `out`, returning `true` only when the collection is
+/// **exhaustive** — every free variable was captured.
+///
+/// Returns `false` (with a possibly-partial `out`) as soon as `expr` contains a construct whose free
+/// variables this walker does not fully model: an `EXISTS` / `COUNT` / `COLLECT` subquery (a bare
+/// **pattern predicate** desugars to `ExistsSubquery`), a pattern comprehension, a map projection, or
+/// — via the catch-all — any future variant. A `false` result means a caller must not treat `out` as
+/// the complete free-variable set. Binder-introducing forms (list comprehensions, quantifiers,
+/// `reduce`) ARE fully descended: their binder-locals are over-collected (harmless), never a free
+/// variable missed. This is the completeness guarantee the WHERE / inline-property pushdown relies on
+/// (a conjunct is only relocated when its every free variable is known).
+fn collect_free_vars_complete(expr: &Expr, out: &mut BTreeSet<String>) -> bool {
+    match &expr.kind {
+        ExprKind::Variable(name) => {
+            out.insert(name.clone());
+            true
+        }
+        ExprKind::Literal(_) | ExprKind::Parameter(_) | ExprKind::CountStar => true,
+        ExprKind::Binary { lhs, rhs, .. } => {
+            let a = collect_free_vars_complete(lhs, out);
+            let b = collect_free_vars_complete(rhs, out);
+            a && b
+        }
+        ExprKind::Unary { operand, .. }
+        | ExprKind::HasLabels { operand, .. }
+        | ExprKind::TypePredicate { operand, .. }
+        | ExprKind::NormalizedPredicate { operand, .. } => collect_free_vars_complete(operand, out),
+        ExprKind::Predicate { operand, rhs, .. } => {
+            let a = collect_free_vars_complete(operand, out);
+            let b = rhs
+                .as_ref()
+                .map(|r| collect_free_vars_complete(r, out))
+                .unwrap_or(true);
+            a && b
+        }
+        ExprKind::Property { base, .. } => collect_free_vars_complete(base, out),
+        ExprKind::Index { base, index } => {
+            let a = collect_free_vars_complete(base, out);
+            let b = collect_free_vars_complete(index, out);
+            a && b
+        }
+        ExprKind::Slice { base, low, high } => {
+            let a = collect_free_vars_complete(base, out);
+            let b = low
+                .as_ref()
+                .map(|l| collect_free_vars_complete(l, out))
+                .unwrap_or(true);
+            let c = high
+                .as_ref()
+                .map(|h| collect_free_vars_complete(h, out))
+                .unwrap_or(true);
+            a && b && c
+        }
+        // `.all` short-circuits on the first incomplete sub-expression, which is sound here: a
+        // `false` result means the caller discards `out`, so the (then partial) collection is never
+        // observed; a `true` result visited every element, so `out` is exhaustive.
+        ExprKind::FunctionCall { args, .. } | ExprKind::List(args) => {
+            args.iter().all(|a| collect_free_vars_complete(a, out))
+        }
+        ExprKind::Map(entries) => entries
+            .iter()
+            .all(|(_, v)| collect_free_vars_complete(v, out)),
+        ExprKind::Case(case) => {
+            let mut complete = true;
+            if let Some(subject) = &case.subject {
+                complete = collect_free_vars_complete(subject, out) && complete;
+            }
+            for alt in &case.alternatives {
+                complete = collect_free_vars_complete(&alt.when, out) && complete;
+                complete = collect_free_vars_complete(&alt.then, out) && complete;
+            }
+            if let Some(else_expr) = &case.else_expr {
+                complete = collect_free_vars_complete(else_expr, out) && complete;
+            }
+            complete
+        }
+        ExprKind::ListComprehension(lc) => {
+            let mut complete = collect_free_vars_complete(&lc.list, out);
+            if let Some(p) = &lc.predicate {
+                complete = collect_free_vars_complete(p, out) && complete;
+            }
+            if let Some(p) = &lc.projection {
+                complete = collect_free_vars_complete(p, out) && complete;
+            }
+            complete
+        }
+        ExprKind::Quantifier(q) => {
+            let a = collect_free_vars_complete(&q.list, out);
+            let b = collect_free_vars_complete(&q.predicate, out);
+            a && b
+        }
+        ExprKind::Reduce(r) => {
+            let a = collect_free_vars_complete(&r.init, out);
+            let b = collect_free_vars_complete(&r.list, out);
+            let c = collect_free_vars_complete(&r.body, out);
+            a && b && c
+        }
+        // Constructs whose free-variable capture this walker does NOT fully model — a pattern
+        // comprehension omits the pattern's own outer references, a map projection omits identifier
+        // selectors, and a subquery embeds a whole pattern. Report incompleteness (and, by the
+        // catch-all `_`, any future variant defaults to "not fully captured" — the safe direction).
+        ExprKind::PatternComprehension(_)
+        | ExprKind::MapProjection(_)
+        | ExprKind::ExistsSubquery(_)
+        | ExprKind::CountSubquery(_)
+        | ExprKind::CollectSubquery(_) => false,
+    }
+}
+
+/// Whether a fresh disconnected anchor's inline property map may be pushed onto its own (uncorrelated)
+/// scan below the `Apply`. True iff the map's value expressions reference no **carried** binding
+/// (`carried` = the columns the `Apply`'s left side provides, invisible to the right scan) and every
+/// free variable is fully captured (no subquery / pattern comprehension / map projection). A
+/// parameter-form map (`$props`) references no query variable and is always pushable.
+fn props_pushable_onto_fresh_scan(props: Option<&Expr>, carried: &[Var]) -> bool {
+    let Some(props) = props else {
+        return false;
+    };
+    let mut refs = BTreeSet::new();
+    if !collect_free_vars_complete(props, &mut refs) {
+        return false;
+    }
+    !carried.iter().any(|v| refs.contains(&v.name))
+}
+
+/// Places a required `MATCH`'s trailing `WHERE` predicate, pushing each **single-variable** conjunct
+/// down onto the scan that binds that variable (when it is a bare label/all scan leaf in `plan`) and
+/// keeping every other conjunct as one `Filter` above the whole pattern.
+///
+/// This is a sound selection-pushdown. When a conjunct's free variables are **fully captured** and
+/// amount to the single variable `v`, it is a pure function of `v`'s binding and can be evaluated the
+/// moment `v` is bound. Filtering it immediately above `v`'s scan removes exactly the rows it would
+/// above the pattern (σ commutes below the cartesian product / an expand that only *adds* columns),
+/// and Cypher's three-valued `AND` is commutative and associative, so regrouping conjuncts across
+/// `AND` preserves the result. Placing the conjunct directly over the scan lets the physical planner
+/// turn `v.p = $x` into a `NodeIndexSeek` instead of a full scan stranded above a cartesian join — the
+/// fix for a two-anchor edge create whose second anchor's equality otherwise lands out of index
+/// selection's reach (`rmp` #303/#312).
+///
+/// A conjunct is pushed only when [`collect_free_vars_complete`] reports its free-variable set was
+/// captured **exhaustively** and equals exactly one variable that is a bare scan leaf. Conjuncts that
+/// reference zero or ≥2 variables (a constant, or a genuine two-variable join predicate such as
+/// `a.id = b.id`), those hiding a subquery / pattern predicate whose free variables are not fully
+/// modelled (e.g. `a.id = 0 AND (a)-[:T]->(b) OR (a)-[:T*]->(b)`, whose desugared pattern existentials
+/// reference `b`), and single-variable conjuncts whose variable is not a bare scan leaf (an expand
+/// target, a group/path variable, or a binding carried from a prior clause behind a projection or
+/// write boundary) all stay in the top `Filter` — never pushed.
+fn push_where_onto_scans(plan: LogicalOp, predicate: &Expr) -> LogicalOp {
+    let conjuncts = collect_and_conjuncts(predicate);
+    // Partition conjuncts into per-variable pushable groups (order-preserving) and a residual set.
+    let mut residual: Vec<Expr> = Vec::new();
+    let mut groups: Vec<(String, Vec<Expr>)> = Vec::new();
+    for conj in &conjuncts {
+        let mut refs = BTreeSet::new();
+        let complete = collect_free_vars_complete(conj, &mut refs);
+        if complete && refs.len() == 1 {
+            let var = refs
+                .into_iter()
+                .next()
+                .expect("exactly one referenced variable");
+            if let Some(entry) = groups.iter_mut().find(|(v, _)| *v == var) {
+                entry.1.push((*conj).clone());
+            } else {
+                groups.push((var, vec![(*conj).clone()]));
+            }
+        } else {
+            residual.push((*conj).clone());
+        }
+    }
+
+    // Nothing is pushable: keep the original predicate verbatim (byte-identical to the pre-fix plan).
+    if groups.is_empty() {
+        return LogicalOp::Filter {
+            input: Box::new(plan),
+            predicate: predicate.clone(),
+        };
+    }
+
+    let mut plan = plan;
+    for (var, conjs) in groups {
+        // AND the group into one predicate so the physical planner picks the strongest index among
+        // them (mirroring the single-`Filter` multi-conjunct index selection for inline props).
+        let pred = and_all(conjs);
+        let (next, pushed) = push_conjunct_to_scan_leaf(plan, &var, &pred);
+        plan = next;
+        // No bare scan leaf binds `var` (expand target / carried binding): keep it above.
+        if !pushed {
+            residual.push(pred);
+        }
+    }
+
+    if let Some(pred) = and_all_opt(residual) {
+        plan = LogicalOp::Filter {
+            input: Box::new(plan),
+            predicate: pred,
+        };
+    }
+    plan
+}
+
+/// Wraps the bare scan leaf binding `var` in `Filter(scan, predicate)`, returning the rewritten plan
+/// and `true`.
+///
+/// Descends only the pattern-spine operators that can sit above an anchor scan without rebinding
+/// `var` (`Filter`, `Expand`, `Apply`, `NamedPath`); returns the plan unchanged with `false` when no
+/// such leaf is reachable (the variable is an expand target, a group/path variable, or lives behind a
+/// projection or write boundary), so the caller keeps the predicate above the pattern. A variable is
+/// bound by at most one scan, so wrapping the first match found is exact.
+fn push_conjunct_to_scan_leaf(plan: LogicalOp, var: &str, predicate: &Expr) -> (LogicalOp, bool) {
+    if scan_leaf_var(&plan) == Some(var) {
+        return (
+            LogicalOp::Filter {
+                input: Box::new(plan),
+                predicate: predicate.clone(),
+            },
+            true,
+        );
+    }
+    match plan {
+        LogicalOp::Filter {
+            input,
+            predicate: p,
+        } => {
+            let (inner, pushed) = push_conjunct_to_scan_leaf(*input, var, predicate);
+            (
+                LogicalOp::Filter {
+                    input: Box::new(inner),
+                    predicate: p,
+                },
+                pushed,
+            )
+        }
+        LogicalOp::Expand {
+            input,
+            from,
+            relationship,
+            to,
+            direction,
+            types,
+            range,
+            prior_rels,
+            rel_props,
+        } => {
+            let (inner, pushed) = push_conjunct_to_scan_leaf(*input, var, predicate);
+            (
+                LogicalOp::Expand {
+                    input: Box::new(inner),
+                    from,
+                    relationship,
+                    to,
+                    direction,
+                    types,
+                    range,
+                    prior_rels,
+                    rel_props,
+                },
+                pushed,
+            )
+        }
+        LogicalOp::NamedPath {
+            input,
+            variable,
+            start,
+            steps,
+        } => {
+            let (inner, pushed) = push_conjunct_to_scan_leaf(*input, var, predicate);
+            (
+                LogicalOp::NamedPath {
+                    input: Box::new(inner),
+                    variable,
+                    start,
+                    steps,
+                },
+                pushed,
+            )
+        }
+        LogicalOp::Apply { left, right } => {
+            let (new_left, pushed_left) = push_conjunct_to_scan_leaf(*left, var, predicate);
+            if pushed_left {
+                return (
+                    LogicalOp::Apply {
+                        left: Box::new(new_left),
+                        right,
+                    },
+                    true,
+                );
+            }
+            let (new_right, pushed_right) = push_conjunct_to_scan_leaf(*right, var, predicate);
+            (
+                LogicalOp::Apply {
+                    left: Box::new(new_left),
+                    right: Box::new(new_right),
+                },
+                pushed_right,
+            )
+        }
+        other => (other, false),
+    }
+}
+
+/// The variable name bound by a bare scan leaf (`NodeByLabelScan` / `AllNodesScan`), else `None`.
+fn scan_leaf_var(op: &LogicalOp) -> Option<&str> {
+    match op {
+        LogicalOp::NodeByLabelScan { variable, .. } | LogicalOp::AllNodesScan { variable } => {
+            Some(&variable.name)
+        }
+        _ => None,
+    }
+}
+
+/// Flattens a predicate's top-level `AND` spine into its conjuncts (mirrors the physical planner's
+/// `split_conjuncts`, kept local to the logical layer). A non-`AND` expression is a single conjunct.
+fn collect_and_conjuncts(expr: &Expr) -> Vec<&Expr> {
+    fn go<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+        if let ExprKind::Binary {
+            op: BinaryOp::And,
+            lhs,
+            rhs,
+        } = &e.kind
+        {
+            go(lhs, out);
+            go(rhs, out);
+        } else {
+            out.push(e);
+        }
+    }
+    let mut out = Vec::new();
+    go(expr, &mut out);
+    out
+}
+
+/// AND-folds `conjuncts` left-associatively into one predicate (the same shape the parser builds for
+/// `a AND b AND c`), or `None` when empty.
+fn and_all_opt(conjuncts: Vec<Expr>) -> Option<Expr> {
+    let mut it = conjuncts.into_iter();
+    let mut acc = it.next()?;
+    for rhs in it {
+        let span = Span::new(acc.span.start, rhs.span.end);
+        acc = Expr::new(
+            ExprKind::Binary {
+                op: BinaryOp::And,
+                lhs: Box::new(acc),
+                rhs: Box::new(rhs),
+            },
+            span,
+        );
+    }
+    Some(acc)
+}
+
+/// AND-folds a **non-empty** conjunct list into one predicate.
+fn and_all(conjuncts: Vec<Expr>) -> Expr {
+    and_all_opt(conjuncts).expect("and_all requires at least one conjunct")
 }
 
 /// Pushes `var` into `out` only if a variable of the same name is not already present.

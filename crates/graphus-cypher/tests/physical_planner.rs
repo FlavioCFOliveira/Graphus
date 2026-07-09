@@ -59,6 +59,7 @@ fn children(op: &PhysicalOp) -> Vec<&PhysicalOp> {
         | PhysicalOp::Limit { input, .. }
         | PhysicalOp::Unwind { input, .. }
         | PhysicalOp::Optional { input, .. }
+        | PhysicalOp::Eager { input, .. }
         | PhysicalOp::Create { input, .. }
         | PhysicalOp::Merge { input, .. }
         | PhysicalOp::SetClause { input, .. }
@@ -565,5 +566,149 @@ fn golden_render_topn_plan() {
     assert_eq!(
         r,
         "TopN(age DESC LIMIT 2)\n  Projection(n.age AS age)\n    AllNodesScan(n)\n"
+    );
+}
+
+// =================================================================================================
+// Two-anchor edge create: index-seek BOTH disconnected anchors (`rmp` #303 / #312)
+// =================================================================================================
+//
+// `MATCH (a:L {..}), (b:L {..}) CREATE (a)-[:R]->(b)` (and its trailing-`WHERE` twin) lowers the
+// second, disconnected anchor over an `Apply` (a cartesian join). Before the fix, the second anchor's
+// equality landed as a `Filter` *above* that join, out of index selection's reach, so `b` fell back to
+// a full label scan (per-edge create O(E·N)). The logical planner now pushes each single-variable
+// equality onto its own anchor's scan, so BOTH anchors become a `NodeIndexSeek` (O(E·log N)).
+
+/// Counts `NodeIndexSeek` operators in the physical tree.
+fn count_seeks(plan: &PhysicalPlan) -> usize {
+    fn walk(op: &PhysicalOp) -> usize {
+        let here = usize::from(matches!(op, PhysicalOp::NodeIndexSeek { .. }));
+        here + children(op).iter().map(|c| walk(c)).sum::<usize>()
+    }
+    walk(&plan.root)
+}
+
+/// The set of variable names that a `NodeIndexSeek` in the tree binds.
+fn seek_vars(plan: &PhysicalOp) -> Vec<String> {
+    let mut out = Vec::new();
+    fn walk(op: &PhysicalOp, out: &mut Vec<String>) {
+        if let PhysicalOp::NodeIndexSeek { variable, .. } = op {
+            out.push(variable.name.clone());
+        }
+        for c in children(op) {
+            walk(c, out);
+        }
+    }
+    walk(plan, &mut out);
+    out.sort();
+    out
+}
+
+#[test]
+fn two_anchor_inline_props_both_anchors_seek() {
+    let catalog = IndexCatalog::builder()
+        .with_label_property("User", "id")
+        .build();
+    let plan = physical(
+        "MATCH (a:User {id: 1}), (b:User {id: 2}) CREATE (a)-[:FRIEND]->(b)",
+        &catalog,
+    );
+    assert_eq!(
+        count_seeks(&plan),
+        2,
+        "both anchors must index-seek:\n{plan}"
+    );
+    assert_eq!(
+        seek_vars(&plan.root),
+        vec!["a".to_string(), "b".to_string()],
+        "the two seeks bind the two anchors a and b:\n{plan}"
+    );
+    // No anchor should be stranded on a full scan / scan-eq.
+    assert!(
+        find(&plan.root, &|op| matches!(
+            op,
+            PhysicalOp::NodeByLabelScan { .. } | PhysicalOp::NodeLabelScanEq { .. }
+        ))
+        .is_none(),
+        "no anchor should fall back to a label scan:\n{plan}"
+    );
+    assert_eq!(plan.index_dependencies().count(), 1); // one index (User.id), depended on by both seeks
+}
+
+#[test]
+fn two_anchor_trailing_where_both_anchors_seek() {
+    let catalog = IndexCatalog::builder()
+        .with_label_property("User", "id")
+        .build();
+    // The `WHERE a.id = $x AND b.id = $y` form: a single top `Filter` over the whole pattern before the
+    // fix, so NEITHER anchor sought. Each single-variable conjunct is now pushed onto its anchor's scan.
+    let plan = physical(
+        "MATCH (a:User), (b:User) WHERE a.id = 1 AND b.id = 2 CREATE (a)-[:FRIEND]->(b)",
+        &catalog,
+    );
+    assert_eq!(
+        count_seeks(&plan),
+        2,
+        "both anchors must index-seek:\n{plan}"
+    );
+    assert_eq!(
+        seek_vars(&plan.root),
+        vec!["a".to_string(), "b".to_string()],
+        "the two seeks bind the two anchors a and b:\n{plan}"
+    );
+}
+
+#[test]
+fn two_variable_join_predicate_stays_a_join_filter() {
+    // A predicate spanning TWO pattern variables (`a.id = b.id`) is a genuine join condition: it must
+    // NOT be pushed onto either anchor's scan (that would be unsound — the scan cannot see the other
+    // variable). It stays a `Filter` above the cartesian join, and neither anchor seeks.
+    let catalog = IndexCatalog::builder()
+        .with_label_property("User", "id")
+        .build();
+    let plan = physical(
+        "MATCH (a:User), (b:User) WHERE a.id = b.id RETURN a, b",
+        &catalog,
+    );
+    assert_eq!(
+        count_seeks(&plan),
+        0,
+        "a two-variable predicate must not drive any anchor seek:\n{plan}"
+    );
+    assert!(
+        find(&plan.root, &|op| matches!(
+            op,
+            PhysicalOp::NestedLoopJoin { .. } | PhysicalOp::HashJoin { .. }
+        ))
+        .is_some(),
+        "the two independent anchors join:\n{plan}"
+    );
+    assert!(
+        find(&plan.root, &|op| matches!(op, PhysicalOp::Filter { .. })).is_some(),
+        "the join predicate remains a residual Filter above the join:\n{plan}"
+    );
+}
+
+#[test]
+fn where_on_near_anchor_of_expand_seeks_that_anchor() {
+    // A bonus of the same pushdown: `WHERE a.id = $x` over a connected `(a)-[]->(b)` pattern pushes the
+    // single-variable equality onto `a`'s scan (a bare leaf), so the anchor of the expansion seeks —
+    // whereas a predicate on the expand *target* `b` (not a scan leaf) correctly stays above.
+    let catalog = IndexCatalog::builder()
+        .with_label_property("User", "id")
+        .build();
+    let plan = physical(
+        "MATCH (a:User)-[:FRIEND]->(b:User) WHERE a.id = 1 RETURN b",
+        &catalog,
+    );
+    assert_eq!(
+        count_seeks(&plan),
+        1,
+        "the near anchor a must seek:\n{plan}"
+    );
+    assert_eq!(seek_vars(&plan.root), vec!["a".to_string()], "{plan}");
+    assert!(
+        find(&plan.root, &|op| matches!(op, PhysicalOp::ExpandAll { .. })).is_some(),
+        "the expansion is preserved:\n{plan}"
     );
 }

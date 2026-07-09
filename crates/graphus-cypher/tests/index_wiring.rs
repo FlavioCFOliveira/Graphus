@@ -123,6 +123,7 @@ fn children(op: &PhysicalOp) -> Vec<&PhysicalOp> {
         | PhysicalOp::Limit { input, .. }
         | PhysicalOp::Unwind { input, .. }
         | PhysicalOp::Optional { input, .. }
+        | PhysicalOp::Eager { input, .. }
         | PhysicalOp::Create { input, .. }
         | PhysicalOp::Merge { input, .. }
         | PhysicalOp::SetClause { input, .. }
@@ -650,4 +651,156 @@ fn populating_index_is_not_used_by_planner_while_online_is() {
         "a",
     );
     assert_eq!(via_index, via_scan, "Online seek must equal scan+filter");
+}
+
+// =================================================================================================
+// Two-anchor edge create: BOTH disconnected anchors index-seek, with result parity (`rmp` #303/#312)
+// =================================================================================================
+
+/// Counts `NodeIndexSeek` operators anywhere in the physical tree.
+fn count_index_seeks(plan: &PhysicalPlan) -> usize {
+    fn walk(op: &PhysicalOp) -> usize {
+        usize::from(matches!(op, PhysicalOp::NodeIndexSeek { .. }))
+            + children(op).iter().map(|c| walk(c)).sum::<usize>()
+    }
+    walk(&plan.root)
+}
+
+/// Seeds `:User {id: 1..=5}` (unique ids) plus a couple of non-`User` decoys that carry an `id` but
+/// must never be reachable through a `:User` anchor.
+fn seed_users(coord: &mut Coord) {
+    for id in 1..=5 {
+        run_write(coord, &format!("CREATE (:User {{id: {id}}})"));
+    }
+    run_write(coord, "CREATE (:Company {id: 2})"); // non-User carrying id 2 (must not match a :User anchor)
+    run_write(coord, "CREATE (:Company {id: 4})");
+}
+
+#[test]
+fn two_anchor_create_inline_both_seek_and_matches_scan_path() {
+    let mut coord = fresh_coord();
+    seed_users(&mut coord);
+    coord
+        .create_node_property_index("User", "id")
+        .expect("create index");
+    let indexed = coord.catalog();
+
+    // The endpoint-resolving MATCH of a two-anchor edge create — the exact shape that previously
+    // scanned the second anchor. Both anchors must now index-seek.
+    let src = "MATCH (a:User {id: 2}), (b:User {id: 4}) RETURN a.id * 100 + b.id AS a";
+    let plan = compile(src, &indexed);
+    assert_eq!(
+        count_index_seeks(&plan),
+        2,
+        "both disconnected anchors must index-seek:\n{plan}"
+    );
+
+    // Result parity: the seek path returns exactly the scan+filter path's rows.
+    let via_index = read_sorted_ints(&mut coord, &indexed, src, "a");
+    let via_scan = read_sorted_ints(&mut coord, &IndexCatalog::empty(), src, "a");
+    assert_eq!(via_index, vec![204], "the single (2,4) pair"); // 2*100 + 4
+    assert_eq!(
+        via_index, via_scan,
+        "two-anchor seek path must equal the scan+filter path (inline form)"
+    );
+}
+
+#[test]
+fn two_anchor_create_trailing_where_both_seek_and_matches_scan_path() {
+    let mut coord = fresh_coord();
+    seed_users(&mut coord);
+    coord
+        .create_node_property_index("User", "id")
+        .expect("create index");
+    let indexed = coord.catalog();
+
+    // The trailing-`WHERE` twin: a single top `Filter` over the whole pattern before the fix, so
+    // NEITHER anchor sought. Each single-variable equality is now pushed onto its anchor's scan.
+    let src = "MATCH (a:User), (b:User) WHERE a.id = 2 AND b.id = 4 RETURN a.id * 100 + b.id AS a";
+    let plan = compile(src, &indexed);
+    assert_eq!(
+        count_index_seeks(&plan),
+        2,
+        "both anchors must index-seek in the WHERE form:\n{plan}"
+    );
+
+    let via_index = read_sorted_ints(&mut coord, &indexed, src, "a");
+    let via_scan = read_sorted_ints(&mut coord, &IndexCatalog::empty(), src, "a");
+    assert_eq!(via_index, vec![204]);
+    assert_eq!(
+        via_index, via_scan,
+        "two-anchor seek path must equal the scan+filter path (WHERE form)"
+    );
+}
+
+#[test]
+fn two_variable_join_predicate_still_correct_and_not_pushed() {
+    // A genuine two-variable predicate must stay a join condition (no anchor seek), and still produce
+    // the correct pairs — identical whether the catalog carries the index or not.
+    let mut coord = fresh_coord();
+    seed_users(&mut coord);
+    coord
+        .create_node_property_index("User", "id")
+        .expect("create index");
+    let indexed = coord.catalog();
+
+    // Ordered distinct pairs from the same 5-user set; `a.id = b.id - 1` spans both variables.
+    let src = "MATCH (a:User), (b:User) WHERE a.id = b.id - 1 RETURN a.id * 100 + b.id AS a";
+    let plan = compile(src, &indexed);
+    assert_eq!(
+        count_index_seeks(&plan),
+        0,
+        "a two-variable predicate must not drive any anchor seek:\n{plan}"
+    );
+
+    let via_index = read_sorted_ints(&mut coord, &indexed, src, "a");
+    let via_scan = read_sorted_ints(&mut coord, &IndexCatalog::empty(), src, "a");
+    // (1,2),(2,3),(3,4),(4,5) -> 102,203,304,405
+    assert_eq!(via_index, vec![102, 203, 304, 405]);
+    assert_eq!(
+        via_index, via_scan,
+        "join predicate result must be catalog-independent"
+    );
+}
+
+#[test]
+fn two_anchor_create_edge_executes_over_the_seek_path() {
+    // End-to-end: run the actual `CREATE (a)-[:FRIEND]->(b)` over the index (seek) path, then verify
+    // the edge landed between exactly the right endpoints.
+    let mut coord = fresh_coord();
+    seed_users(&mut coord);
+    coord
+        .create_node_property_index("User", "id")
+        .expect("create index");
+    let indexed = coord.catalog();
+
+    let create_src = "MATCH (a:User {id: 2}), (b:User {id: 4}) CREATE (a)-[:FRIEND]->(b)";
+    let create_plan = compile(create_src, &indexed);
+    assert_eq!(
+        count_index_seeks(&create_plan),
+        2,
+        "the create's endpoint resolution must use two index seeks:\n{create_plan}"
+    );
+
+    // Execute the create over the seek path in its own committed write transaction.
+    let txn = coord.begin_serializable();
+    let _ = run_plan(&coord, txn, &create_plan);
+    coord.commit(txn).expect("edge create commits");
+
+    // The FRIEND edge exists from user 2 to user 4 (and to no one else).
+    let targets = read_sorted_ints(
+        &mut coord,
+        &indexed,
+        "MATCH (a:User {id: 2})-[:FRIEND]->(b:User) RETURN b.id AS a",
+        "a",
+    );
+    assert_eq!(targets, vec![4], "the edge points 2 -> 4");
+    // No stray reverse edge.
+    let reverse = read_sorted_ints(
+        &mut coord,
+        &indexed,
+        "MATCH (a:User {id: 4})-[:FRIEND]->(b:User) RETURN b.id AS a",
+        "a",
+    );
+    assert!(reverse.is_empty(), "no reverse 4 -> 2 edge was created");
 }
