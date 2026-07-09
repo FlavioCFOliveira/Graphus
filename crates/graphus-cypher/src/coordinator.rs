@@ -48,8 +48,9 @@ use graphus_index::fulltext::Analyzer;
 use graphus_index::histogram::PropertyHistogram;
 use graphus_io::BlockDevice;
 use graphus_storage::{
-    ConstraintEntry, ConstraintKind, ConstraintTypeDescriptor, FulltextIndexEntry, GcPassReport,
-    IndexState, Namespace, RecordStore, SpatialIndexEntry, StoreReadView, TokenSnapshot,
+    CompositeIndexEntry, ConstraintEntry, ConstraintKind, ConstraintTypeDescriptor,
+    FulltextIndexEntry, GcPassReport, IndexState, Namespace, RecordStore, SpatialIndexEntry,
+    StoreReadView, TokenSnapshot,
 };
 use graphus_txn::{CommitRegistry, IsolationLevel, LockTable, Snapshot, SsiReadBuffer, SsiTracker};
 use graphus_wal::LogSink;
@@ -59,8 +60,8 @@ use crate::constraint::{ConstraintViolation, ViolationEntity};
 use crate::index_set::IndexSet;
 use crate::record_graph::RecordStoreGraph;
 use crate::schema_error::{
-    constraint_name_in_use, equivalent_constraint_exists, equivalent_index_exists,
-    equivalent_rel_index_exists, index_drop_not_found, index_name_in_use,
+    constraint_name_in_use, equivalent_composite_index_exists, equivalent_constraint_exists,
+    equivalent_index_exists, equivalent_rel_index_exists, index_drop_not_found, index_name_in_use,
 };
 use crate::statistics::Statistics;
 use crate::store_statistics;
@@ -350,6 +351,22 @@ enum NameCatalog {
     Spatial,
     /// The constraint catalog.
     Constraint,
+    /// The composite (multi-property) node index catalog (`rmp` task #657).
+    Composite,
+}
+
+/// A deterministic auto-name for the composite (multi-property) node index on `(label, properties)`
+/// (`rmp` task #657) — the composite analogue of [`auto_index_name`]. Reuses the `index_` prefix and
+/// appends each covered property in declared order (`index_<label>_<a>_<b>`), so the name is stable and
+/// the covered tuple order is reflected in the name.
+#[must_use]
+pub fn auto_composite_index_name(label: &str, properties: &[String]) -> String {
+    let mut name = format!("index_{}", sanitize_identifier(label));
+    for property in properties {
+        name.push('_');
+        name.push_str(&sanitize_identifier(property));
+    }
+    name
 }
 
 /// A deterministic auto-name for the relationship-property index on `(rel_type, property)`
@@ -752,6 +769,23 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             }
         }
 
+        // Register every durable **standalone composite index** (`rmp` task #657) in the in-memory set,
+        // so the write path maintains it and the rebuild scan below repopulates its backing tree. This
+        // is distinct from a node-key constraint's backing composite (registered above): a standalone
+        // composite enforces no uniqueness. It is recorded `Online` in the durable catalog (a synchronous
+        // build), so recovery repopulates a fully-online index, never a half-built one. The in-memory
+        // composite map is keyed by `(label_token, property tuple)`, so a standalone composite and a
+        // node key over the *same* tuple share one backing tree — always correct (both are pure
+        // candidate sources re-checked against the store).
+        let durable_composites: Vec<(String, CompositeIndexEntry)> =
+            store.borrow().composite_indexes();
+        {
+            let mut idx = index.borrow_mut();
+            for (_name, entry) in durable_composites {
+                idx.register_composite(entry.label_token, entry.property_tokens);
+            }
+        }
+
         index.borrow_mut().clear();
 
         // The set of registered node-property indexes (any state), captured before walking the store so
@@ -840,6 +874,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             || store.fulltext_index(name).is_some()
             || store.spatial_index(name).is_some()
             || store.constraint(name).is_some()
+            || store.composite_index(name).is_some()
     }
 
     /// Whether `name` is used by a schema catalog **other than** `own` (`rmp` task #624). Lets a
@@ -851,6 +886,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             || (own != NameCatalog::Fulltext && store.fulltext_index(name).is_some())
             || (own != NameCatalog::Spatial && store.spatial_index(name).is_some())
             || (own != NameCatalog::Constraint && store.constraint(name).is_some())
+            || (own != NameCatalog::Composite && store.composite_index(name).is_some())
     }
 
     /// Whether `name` is used by any schema rule **other than** the node-property index on
@@ -1617,12 +1653,104 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         if self.store.borrow().rel_property_index_name(name).is_some() {
             return self.drop_rel_property_index_by_name(name, if_exists);
         }
-        // Neither catalog holds the name: honour `IF EXISTS`.
+        // A standalone composite (multi-property) index of that name (`rmp` task #657)?
+        let composite = self.store.borrow().composite_index(name);
+        if let Some(entry) = composite {
+            self.remove_composite_index_committed(name, entry.label_token, &entry.property_tokens)?;
+            return Ok(true);
+        }
+        // No catalog holds the name: honour `IF EXISTS`.
         if if_exists {
             Ok(false)
         } else {
             Err(index_drop_not_found(name))
         }
+    }
+
+    /// Drops the **standalone composite** index over `(label, properties)` — the by-target
+    /// `DROP INDEX FOR (n:L) ON (n.a, n.b)` shape (`rmp` task #657). Resolves the covered composite by
+    /// its label + ordered property tuple; a missing target is a clean no-op success. Returns whether an
+    /// index was actually removed.
+    ///
+    /// # Errors
+    /// Returns a storage error if the committing transaction fails.
+    pub fn drop_node_composite_index(
+        &mut self,
+        label: &str,
+        properties: &[String],
+    ) -> Result<bool> {
+        let resolved = {
+            let store = self.store.borrow();
+            match Self::resolve_property_tokens(&store, label, properties) {
+                Some((label_token, property_tokens)) => store
+                    .composite_index_name_for(label_token, &property_tokens)
+                    .map(|name| (name.to_owned(), label_token, property_tokens)),
+                None => None,
+            }
+        };
+        let Some((name, label_token, property_tokens)) = resolved else {
+            return Ok(false); // no such composite index → clean no-op.
+        };
+        self.remove_composite_index_committed(&name, label_token, &property_tokens)?;
+        Ok(true)
+    }
+
+    /// Removes the durable composite index catalog entry named `name` in one committed transaction and
+    /// unregisters its in-memory backing tree — **unless** a node-key constraint over the *same*
+    /// `(label, tuple)` still needs it (`rmp` task #657). A standalone composite index and a node-key
+    /// constraint over the same tuple share one in-memory tree (keyed by target, not name), so dropping
+    /// the index must not tear the tree out from under a still-live constraint.
+    ///
+    /// # Errors
+    /// Returns a storage error if the committing transaction fails.
+    fn remove_composite_index_committed(
+        &mut self,
+        name: &str,
+        label_token: u32,
+        property_tokens: &[u32],
+    ) -> Result<()> {
+        self.next_txn_id += 1;
+        let txn = TxnId(self.next_txn_id);
+        self.store.borrow_mut().begin(txn);
+        self.store.borrow_mut().remove_composite_index(name);
+        self.store.borrow_mut().commit(txn)?;
+
+        // Keep the backing tree iff a node-key constraint over the same tuple still shares it.
+        let still_backs_node_key = self
+            .index
+            .borrow()
+            .constraints_for_label(label_token)
+            .iter()
+            .any(|rule| {
+                rule.kind == ConstraintKind::NodeKey && rule.property_tokens == property_tokens
+            });
+        if !still_backs_node_key {
+            self.index
+                .borrow_mut()
+                .unregister_composite(label_token, property_tokens);
+        }
+        Ok(())
+    }
+
+    /// Lists every declared standalone composite index as `(name, label, properties, state)`
+    /// (`rmp` task #657), for a `SHOW INDEXES` surface. Reads the durable catalog and resolves the
+    /// tokens back to names; an entry whose tokens have no resolvable name (a defensively-skipped
+    /// impossibility for a live token) is omitted. Ordered by the catalog's ascending name.
+    #[must_use]
+    pub fn list_composite_indexes(&self) -> Vec<(String, String, Vec<String>, IndexState)> {
+        let store = self.store.borrow();
+        store
+            .composite_indexes()
+            .into_iter()
+            .filter_map(|(name, entry)| {
+                let label = store.token_name(Namespace::Label, entry.label_token)?;
+                let mut properties = Vec::with_capacity(entry.property_tokens.len());
+                for pk in &entry.property_tokens {
+                    properties.push(store.token_name(Namespace::PropKey, *pk)?.to_owned());
+                }
+                Some((name, label.to_owned(), properties, entry.state))
+            })
+            .collect()
     }
 
     /// Lists every declared relationship-property index as `(name, rel_type, property, state)`
@@ -2301,6 +2429,208 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             cursor: 0,
         });
         Ok(true) // the index was created.
+    }
+
+    /// Declares a node index over `(label, properties)` — a **single-property** RANGE index when
+    /// `properties` has arity 1, or a **composite** (multi-property) RANGE index when arity ≥ 2
+    /// (`rmp` task #657) — enforcing Neo4j-conformant schema semantics.
+    ///
+    /// This is the single server entry point behind `CREATE INDEX FOR (n:L) ON (n.a[, n.b, …])`:
+    ///
+    /// - **arity 1** delegates verbatim to
+    ///   [`begin_online_node_property_index_named`](Self::begin_online_node_property_index_named), so the
+    ///   single-property (non-blocking, `Populating` → `Online`) path is untouched — nothing regresses;
+    /// - **arity ≥ 2** declares a **standalone** composite index — distinct from a node-key constraint's
+    ///   backing composite (`rmp` task #100), it enforces **no uniqueness**. The label + property-key
+    ///   tokens are interned **durably** and the named catalog entry is recorded as
+    ///   [`IndexState::Online`] in one committed transaction (so the *registration* survives a crash),
+    ///   then the index is registered in the in-memory [`IndexSet`] and **synchronously built** from the
+    ///   current nodes. The synchronous build is crash-safe: the backing tree is ephemeral and rebuilt
+    ///   from the durable catalog + store on open, so a crash mid-build recovers the `Online`
+    ///   registration and repopulates it — recovery never observes a half-built index.
+    ///
+    /// The composite key **order is significant** (`(a, b)` differs from `(b, a)`). Returns whether the
+    /// index was **actually created** (`true`) or the call was an idempotent no-op (`false`, an
+    /// `IF NOT EXISTS` that changed nothing).
+    ///
+    /// # Errors
+    /// - `Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists` (no `IF NOT EXISTS`) when an
+    ///   equivalent composite index on `(label, ordered tuple)` already exists;
+    /// - `Neo.ClientError.Schema.IndexWithNameAlreadyExists` (no `IF NOT EXISTS`) when `name` is already
+    ///   taken by another schema rule;
+    /// - a storage error if interning a token, recording the catalog entry, committing, or the build
+    ///   scan fails. On any error the index is left undeclared.
+    ///
+    /// # Panics
+    /// Panics if `properties` is empty (the parser guarantees at least one property; a composite has two
+    /// or more).
+    pub fn begin_online_node_composite_index_named(
+        &mut self,
+        name: Option<&str>,
+        label: &str,
+        properties: &[String],
+        if_not_exists: bool,
+    ) -> Result<bool> {
+        assert!(
+            !properties.is_empty(),
+            "a node index covers at least one property"
+        );
+        // Arity 1: keep the single-property path (non-blocking build, no regression).
+        if let [property] = properties {
+            return self.begin_online_node_property_index_named(
+                name,
+                label,
+                property,
+                if_not_exists,
+            );
+        }
+
+        // ---- Arity ≥ 2: a standalone composite index (`rmp` task #657) --------------------------------
+
+        // 1. Equivalent-index check (read-only, by token *lookup* — an absent token means no index can
+        //    cover this tuple, so no equivalent exists).
+        let equivalent_exists = {
+            let store = self.store.borrow();
+            match Self::resolve_property_tokens(&store, label, properties) {
+                Some((label_token, property_tokens)) => store
+                    .composite_index_name_for(label_token, &property_tokens)
+                    .is_some(),
+                None => false,
+            }
+        };
+        if equivalent_exists {
+            return if if_not_exists {
+                Ok(false) // idempotent no-op: nothing was added.
+            } else {
+                Err(equivalent_composite_index_exists(label, properties))
+            };
+        }
+
+        // 2. Explicit-name global uniqueness (read-only). An omitted name is auto-generated in step 3.
+        if let Some(n) = name
+            && Self::name_in_use(&self.store.borrow(), n)
+        {
+            return if if_not_exists {
+                Ok(false)
+            } else {
+                Err(index_name_in_use(n))
+            };
+        }
+
+        // 3. Intern the tokens and record the durable catalog entry (`Online`) in one committed
+        //    transaction — so the schema change survives a crash atomically.
+        self.next_txn_id += 1;
+        let txn = TxnId(self.next_txn_id);
+        self.store.borrow_mut().begin(txn);
+        let (label_token, property_tokens, effective_name) = {
+            let mut store = self.store.borrow_mut();
+            let label_token = match store.intern_token(Namespace::Label, label) {
+                Ok(t) => t,
+                Err(e) => {
+                    drop(store);
+                    let _ = self.store.borrow_mut().rollback(txn);
+                    return Err(e);
+                }
+            };
+            let mut property_tokens = Vec::with_capacity(properties.len());
+            for property in properties {
+                match store.intern_token(Namespace::PropKey, property) {
+                    Ok(t) => property_tokens.push(t),
+                    Err(e) => {
+                        drop(store);
+                        let _ = self.store.borrow_mut().rollback(txn);
+                        return Err(e);
+                    }
+                }
+            }
+            let effective_name = match name {
+                Some(n) => n.to_owned(),
+                None => Self::unique_auto_composite_index_name(
+                    &store,
+                    label,
+                    properties,
+                    label_token,
+                    &property_tokens,
+                ),
+            };
+            store.set_composite_index(
+                effective_name.clone(),
+                CompositeIndexEntry {
+                    label_token,
+                    property_tokens: property_tokens.clone(),
+                    state: IndexState::Online,
+                },
+            );
+            (label_token, property_tokens, effective_name)
+        };
+        let _ = effective_name; // recorded durably above; the in-memory tree is keyed by target, not name.
+        self.store.borrow_mut().commit(txn)?;
+
+        // Register the composite in the in-memory set so concurrent writes maintain it from now on, then
+        // synchronously index the existing nodes into its backing tree. The tree is ephemeral (rebuilt on
+        // open from the durable catalog + store), so this synchronous fill is a pure in-memory build with
+        // no durability surface — a crash before it finishes recovers the `Online` registration and the
+        // open-time rebuild repopulates the tree store-consistently.
+        self.index
+            .borrow_mut()
+            .register_composite(label_token, property_tokens.clone());
+        let node_ids = self.store.borrow_mut().scan_node_ids()?;
+        let registered = vec![(label_token, property_tokens)];
+        for id in node_ids {
+            Self::index_one_node_composite(&self.store, &self.index, id, &registered);
+        }
+        Ok(true) // the index was created.
+    }
+
+    /// Resolves `(label, properties)` to `(label_token, property_tokens)` by **token lookup** (never
+    /// interning) (`rmp` task #657). Returns [`None`] if the label or **any** property key has no
+    /// interned token — meaning no index can cover this tuple, so no equivalent index exists.
+    fn resolve_property_tokens(
+        store: &RecordStore<D, S>,
+        label: &str,
+        properties: &[String],
+    ) -> Option<(u32, Vec<u32>)> {
+        let label_token = store.token_id(Namespace::Label, label)?;
+        let mut property_tokens = Vec::with_capacity(properties.len());
+        for property in properties {
+            property_tokens.push(store.token_id(Namespace::PropKey, property)?);
+        }
+        Some((label_token, property_tokens))
+    }
+
+    /// A globally-unique, deterministic auto-name for the composite index on `(label, properties)`
+    /// (`rmp` task #657) — the composite analogue of
+    /// [`unique_auto_index_name`](Self::unique_auto_index_name). The equivalence check in the caller has
+    /// already guaranteed no composite index covers this exact target, so the base name can only collide
+    /// with an *unrelated* schema rule; a deterministic token-suffixed form, then a numeric counter,
+    /// resolves any residual collision so the returned name is free across **every** catalog.
+    fn unique_auto_composite_index_name(
+        store: &RecordStore<D, S>,
+        label: &str,
+        properties: &[String],
+        label_token: u32,
+        property_tokens: &[u32],
+    ) -> String {
+        let base = auto_composite_index_name(label, properties);
+        if !Self::name_in_use(store, &base) {
+            return base;
+        }
+        let mut suffixed = format!("{base}_{label_token}");
+        for t in property_tokens {
+            suffixed.push('_');
+            suffixed.push_str(&t.to_string());
+        }
+        if !Self::name_in_use(store, &suffixed) {
+            return suffixed;
+        }
+        let mut n: u64 = 2;
+        loop {
+            let candidate = format!("{suffixed}_{n}");
+            if !Self::name_in_use(store, &candidate) {
+                return candidate;
+            }
+            n += 1;
+        }
     }
 
     /// Declares a **full-text index** named `name` over `(label, properties)` analyzed with
@@ -3274,9 +3604,18 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.store.borrow_mut().begin(txn);
         self.store.borrow_mut().remove_constraint(name);
         self.store.borrow_mut().commit(txn)?;
+        // A node key's backing composite tree may be **shared** with a standalone composite index over
+        // the same `(label, tuple)` (`rmp` task #657): keep it if such an index still needs it, so
+        // dropping the constraint does not silently disable the standalone index's acceleration.
+        let shared_with_composite_index = entry.kind == ConstraintKind::NodeKey
+            && self
+                .store
+                .borrow()
+                .composite_index_name_for(entry.label_token, &entry.property_tokens)
+                .is_some();
         let mut idx = self.index.borrow_mut();
         idx.unregister_constraint(name);
-        if entry.kind == ConstraintKind::NodeKey {
+        if entry.kind == ConstraintKind::NodeKey && !shared_with_composite_index {
             idx.unregister_composite(entry.label_token, &entry.property_tokens);
         }
         Ok(true) // a constraint was removed.
@@ -3706,6 +4045,34 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 continue;
             };
             builder = builder.with_label_spatial(label, property);
+        }
+        // Standalone composite (multi-property) node indexes (`rmp` task #657): surface every
+        // **`Online`** one so the physical planner can consume a leading run of equality conjuncts into
+        // one composite `NodeIndexSeek`. Read from the **durable** catalog (the source of a standalone
+        // composite's registration), filtered to `Online` — a `Populating` one is withheld exactly like a
+        // half-built single-property index. The backing tree exists in the in-memory set (registered on
+        // open / create), so the seek the planner emits always finds it.
+        for (_name, entry) in store.composite_indexes() {
+            if entry.state != IndexState::Online {
+                continue;
+            }
+            let Some(label) = store.token_name(Namespace::Label, entry.label_token) else {
+                continue;
+            };
+            let mut properties = Vec::with_capacity(entry.property_tokens.len());
+            let mut resolvable = true;
+            for pk in &entry.property_tokens {
+                match store.token_name(Namespace::PropKey, *pk) {
+                    Some(p) => properties.push(p.to_owned()),
+                    None => {
+                        resolvable = false;
+                        break;
+                    }
+                }
+            }
+            if resolvable {
+                builder = builder.with_label_composite(label, properties);
+            }
         }
         builder.build()
     }

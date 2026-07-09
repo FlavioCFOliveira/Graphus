@@ -125,12 +125,15 @@ pub struct RunReply {
 pub enum NodePropertyIndexRef {
     /// `DROP INDEX <name>` — identify the index by its server-unique name.
     Named(String),
-    /// `DROP INDEX FOR (n:L) ON (n.p)` / `DROP INDEX ON :L(p)` — identify by covered label + property.
+    /// `DROP INDEX FOR (n:L) ON (n.p)` / `DROP INDEX ON :L(p)` — identify by covered label + covered
+    /// property tuple. A single-element list targets a single-property node index; a multi-element list
+    /// targets the composite (multi-property) index over that exact ordered tuple (`rmp` task #657).
     Target {
         /// The covered node label.
         label: String,
-        /// The covered property key.
-        property: String,
+        /// The covered property keys, in declared order (one for a single-property index, two or more
+        /// for a composite index).
+        properties: Vec<String>,
     },
 }
 
@@ -143,18 +146,21 @@ pub enum NodePropertyIndexRef {
 /// them up / interns them through the coordinator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IndexCommand {
-    /// `CREATE INDEX [<name>] [IF NOT EXISTS] FOR (n:<Label>) ON (n.<property>)` on
-    /// `(label, property)`: starts a **non-blocking** build (the index is `Populating` and built in the
-    /// background; the command returns promptly). `name` is the requested server-unique name, or
-    /// [`None`] to auto-generate a deterministic one (`rmp` task #624); `if_not_exists` makes an
-    /// already-existing index (by name or equivalent schema) a no-op success rather than an error.
+    /// `CREATE INDEX [<name>] [IF NOT EXISTS] FOR (n:<Label>) ON (n.<a>[, n.<b>, …])` on
+    /// `(label, properties)`: starts a **non-blocking** build (the index is `Populating` and built in
+    /// the background; the command returns promptly). A single-element `properties` is a single-property
+    /// RANGE index; a two-or-more-element list is a **composite** (multi-property) RANGE index over the
+    /// ordered property tuple (`rmp` task #657). `name` is the requested server-unique name, or [`None`]
+    /// to auto-generate a deterministic one (`rmp` task #624); `if_not_exists` makes an already-existing
+    /// index (by name or equivalent schema) a no-op success rather than an error.
     CreateNodePropertyIndex {
         /// The requested server-unique name, or [`None`] to auto-generate one.
         name: Option<String>,
         /// The node label the index is declared on.
         label: String,
-        /// The property key the index is declared on.
-        property: String,
+        /// The property keys the index is declared on, in declared order (one for a single-property
+        /// index, two or more for a composite index; the order is significant for a composite).
+        properties: Vec<String>,
         /// Whether `IF NOT EXISTS` was given (a duplicate becomes a no-op success).
         if_not_exists: bool,
     },
@@ -764,7 +770,7 @@ mod tests {
             &IndexCommand::CreateNodePropertyIndex {
                 name: None,
                 label: "Person".to_owned(),
-                property: "name".to_owned(),
+                properties: vec!["name".to_owned()],
                 if_not_exists: false,
             },
             true,
@@ -839,7 +845,7 @@ mod tests {
             &IndexCommand::CreateNodePropertyIndex {
                 name: None,
                 label: "Person".to_owned(),
-                property: "name".to_owned(),
+                properties: vec!["name".to_owned()],
                 if_not_exists: true,
             },
             false, // mutated == false: an IF NOT EXISTS that changed nothing.

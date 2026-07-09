@@ -413,6 +413,13 @@ fn walk_physical(op: &PhysicalOp, record: &mut impl FnMut(&str, ParamType)) {
             // runtime concern); record as Any. (A seek is a leaf — no input to recurse into.)
             params_in_expr(value, ParamType::Any, record);
         }
+        PhysicalOp::NodeCompositeIndexSeek { values, .. } => {
+            // Composite index-seek values (`rmp` task #657): one per key, each treated like a single
+            // seek value — no static type expectation, recorded as Any. A leaf, so no input to recurse.
+            for value in values {
+                params_in_expr(value, ParamType::Any, record);
+            }
+        }
         PhysicalOp::NodeLabelScanEq { value, .. } => {
             // The precise equality-scan value (`rmp` task #325): same treatment as a seek value — no
             // static type expectation, recorded as Any. A leaf, so no input to recurse into.

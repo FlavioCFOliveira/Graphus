@@ -285,6 +285,28 @@ pub trait GraphAccess {
         None
     }
 
+    /// An **optional COMPOSITE (multi-property) index equality seek** (`rmp` task #657): the
+    /// **candidate** node ids of `label` whose current values of `properties` (in the given order)
+    /// equal `values` element-wise by Cypher equality.
+    ///
+    /// `properties` and `values` are parallel and of equal length (the covered ordered tuple); the
+    /// caller guarantees both are the composite index's full key. Returns `None` when **no composite
+    /// index covers `(label, properties)`** as its full ordered tuple — the executor then falls back to
+    /// a label scan + residual equality filters (always correct either way). `Some(ids)` is a
+    /// **candidate** set: the caller (the composite `NodeIndexSeek` operator's residual filters) re-checks
+    /// each candidate's visibility, current label and current per-property values, so a deleted /
+    /// invisible / re-labelled / since-changed node never reaches the result, and RBAC composes for free
+    /// through the [`AuthorizedGraph`](crate::authorized_graph::AuthorizedGraph) decorator. The default
+    /// returns `None` (no composite index available).
+    fn index_seek_composite_eq(
+        &self,
+        _label: &str,
+        _properties: &[String],
+        _values: &[Value],
+    ) -> Option<Vec<NodeId>> {
+        None
+    }
+
     /// An **optional** spatial proximity seek (`rmp` task #73): the **candidate** node ids of `label`
     /// whose point `property` lies within `radius` of the centre `(center_x, center_y)`, projected to
     /// 2D (the grid's `(x, y)` buckets).

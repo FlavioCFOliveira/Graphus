@@ -940,14 +940,17 @@ fn parse_claimed_typed_index(
 /// variant (node vs relationship) so a single target parser serves both CREATE and DROP.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum IndexTarget {
-    /// A node-property index target `(label, property)`.
+    /// A node-property index target `(label, properties)` — one property for a single-property RANGE
+    /// index, two or more for a composite (multi-property) RANGE index (`rmp` task #657). The property
+    /// order is significant for a composite.
     Node {
         /// The covered node label.
         label: String,
-        /// The covered property key.
-        property: String,
+        /// The covered property keys, in declared order (one or more).
+        properties: Vec<String>,
     },
-    /// A relationship-property index target `(rel_type, property)` (`rmp` task #646).
+    /// A relationship-property index target `(rel_type, property)` (`rmp` task #646). Single-property
+    /// only — a composite relationship index is not yet supported and is declined at parse time.
     Rel {
         /// The covered relationship type.
         rel_type: String,
@@ -963,10 +966,10 @@ fn parse_create_index(lex: &mut Lexer<'_>) -> Result<IndexCommand, String> {
     let name = parse_optional_index_name(lex)?;
     let if_not_exists = parse_optional_if(lex, /* with_not */ true)?;
     match parse_index_target("CREATE", lex)? {
-        IndexTarget::Node { label, property } => Ok(IndexCommand::CreateNodePropertyIndex {
+        IndexTarget::Node { label, properties } => Ok(IndexCommand::CreateNodePropertyIndex {
             name,
             label,
-            property,
+            properties,
             if_not_exists,
         }),
         IndexTarget::Rel { rel_type, property } => Ok(IndexCommand::CreateRelPropertyIndex {
@@ -996,8 +999,8 @@ fn parse_drop_index(lex: &mut Lexer<'_>) -> Result<IndexCommand, String> {
     );
     if by_target {
         return match parse_index_target("DROP", lex)? {
-            IndexTarget::Node { label, property } => Ok(IndexCommand::DropNodePropertyIndex {
-                index: NodePropertyIndexRef::Target { label, property },
+            IndexTarget::Node { label, properties } => Ok(IndexCommand::DropNodePropertyIndex {
+                index: NodePropertyIndexRef::Target { label, properties },
                 if_exists: false,
             }),
             IndexTarget::Rel { rel_type, property } => Ok(IndexCommand::DropRelPropertyIndex {
@@ -1087,7 +1090,7 @@ fn parse_index_for_on(verb: &str, lex: &mut Lexer<'_>) -> Result<IndexTarget, St
     // FOR ( … — a relationship-property index pattern opens with an empty node `()`.
     expect_symbol(lex, '(', verb)?;
     if peek_symbol(lex, ')')? {
-        // FOR ()-[ <var> : <TYPE> ]-() ON ( <var>.<property> )  (`rmp` task #646)
+        // FOR ()-[ <var> : <TYPE> ]-() ON ( <var>.<property>[, …] )  (`rmp` task #646)
         expect_symbol(lex, ')', verb)?; // close the empty start node
         expect_dash(lex, verb)?;
         expect_symbol(lex, '[', verb)?;
@@ -1098,12 +1101,19 @@ fn parse_index_for_on(verb: &str, lex: &mut Lexer<'_>) -> Result<IndexTarget, St
         expect_dash(lex, verb)?;
         expect_symbol(lex, '(', verb)?;
         expect_symbol(lex, ')', verb)?;
-        // ON ( <var>.<property> )
+        // ON ( <var>.<property>[, …] )
         expect_keyword(lex, "ON", verb)?;
         expect_symbol(lex, '(', verb)?;
-        let property = parse_property_ref(verb, lex)?;
+        let properties = parse_on_property_list(verb, lex)?;
         expect_symbol(lex, ')', verb)?;
         expect_end(lex, &format!("{verb} INDEX"))?;
+        // A composite relationship index needs a durable relationship-composite backing store, which is
+        // not yet implemented (`rmp` task #657, coordinator deferral): decline it with a specific error
+        // rather than silently build the wrong thing (a single-property rel index over the first key).
+        let [property] = <[String; 1]>::try_from(properties).map_err(|_| {
+            "composite relationship indexes are not yet supported (FOR ()-[r:T]-() ON (r.a, r.b))"
+                .to_owned()
+        })?;
         return Ok(IndexTarget::Rel { rel_type, property });
     }
     // FOR ( <var> : <Label> )
@@ -1111,13 +1121,39 @@ fn parse_index_for_on(verb: &str, lex: &mut Lexer<'_>) -> Result<IndexTarget, St
     expect_symbol(lex, ':', verb)?;
     let label = expect_name(lex, "a label", verb)?;
     expect_symbol(lex, ')', verb)?;
-    // ON ( <var>.<property> )
+    // ON ( <var>.<a>[, <var>.<b>, …] ) — one property is a single-property RANGE index, two or more a
+    // composite (multi-property) RANGE index over the ordered tuple (`rmp` task #657).
     expect_keyword(lex, "ON", verb)?;
     expect_symbol(lex, '(', verb)?;
-    let property = parse_property_ref(verb, lex)?;
+    let properties = parse_on_property_list(verb, lex)?;
     expect_symbol(lex, ')', verb)?;
     expect_end(lex, &format!("{verb} INDEX"))?;
-    Ok(IndexTarget::Node { label, property })
+    Ok(IndexTarget::Node { label, properties })
+}
+
+/// Parses a comma-separated `<var>.<a>[, <var>.<b>, …]` property list inside an openCypher `ON ( … )`
+/// index clause (the opening `(` already consumed, the closing `)` left for the caller) (`rmp` task
+/// #657). Returns the properties in declared order. Rejects a **duplicate** property in the list (an
+/// index over `(a, a)` is degenerate) with a clear error; the list is always non-empty (the loop reads
+/// at least one property, or the underlying [`parse_property_ref`] errors).
+fn parse_on_property_list(verb: &str, lex: &mut Lexer<'_>) -> Result<Vec<String>, String> {
+    let mut properties = Vec::new();
+    loop {
+        properties.push(parse_property_ref(verb, lex)?);
+        if peek_symbol(lex, ',')? {
+            expect_symbol(lex, ',', verb)?;
+        } else {
+            break;
+        }
+    }
+    for (i, p) in properties.iter().enumerate() {
+        if properties[..i].contains(p) {
+            return Err(format!(
+                "duplicate property `{p}` in the index property list ON ( … )"
+            ));
+        }
+    }
+    Ok(properties)
 }
 
 /// Parses the `<var>.<property>` reference inside an openCypher `ON ( … )` clause.
@@ -2080,7 +2116,12 @@ fn parse_index_legacy_on(verb: &str, lex: &mut Lexer<'_>) -> Result<IndexTarget,
     let property = expect_name(lex, "a property", verb)?;
     expect_symbol(lex, ')', verb)?;
     expect_end(lex, &format!("{verb} INDEX"))?;
-    Ok(IndexTarget::Node { label, property })
+    // The legacy `ON :Label(prop)` form is single-property only (`rmp` task #657): a composite must use
+    // the openCypher `FOR (n:L) ON (n.a, n.b)` shape.
+    Ok(IndexTarget::Node {
+        label,
+        properties: vec![property],
+    })
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -4490,7 +4531,17 @@ mod tests {
         IndexCommand::CreateNodePropertyIndex {
             name: None,
             label: label.to_owned(),
-            property: property.to_owned(),
+            properties: vec![property.to_owned()],
+            if_not_exists: false,
+        }
+    }
+
+    /// A composite `CreateNodePropertyIndex` with the anonymous / no-`IF` defaults (`rmp` task #657).
+    fn create_np_composite(label: &str, properties: &[&str]) -> IndexCommand {
+        IndexCommand::CreateNodePropertyIndex {
+            name: None,
+            label: label.to_owned(),
+            properties: properties.iter().map(|p| (*p).to_owned()).collect(),
             if_not_exists: false,
         }
     }
@@ -4527,7 +4578,7 @@ mod tests {
             IndexCommand::CreateNodePropertyIndex {
                 name: Some("ix_person".to_owned()),
                 label: "Person".to_owned(),
-                property: "name".to_owned(),
+                properties: vec!["name".to_owned()],
                 if_not_exists: false,
             }
         );
@@ -4537,7 +4588,7 @@ mod tests {
             IndexCommand::CreateNodePropertyIndex {
                 name: Some("ix_person".to_owned()),
                 label: "PERSON".to_owned(),
-                property: "name".to_owned(),
+                properties: vec!["name".to_owned()],
                 if_not_exists: true,
             }
         );
@@ -4547,7 +4598,7 @@ mod tests {
             IndexCommand::CreateNodePropertyIndex {
                 name: None,
                 label: "Person".to_owned(),
-                property: "age".to_owned(),
+                properties: vec!["age".to_owned()],
                 if_not_exists: true,
             }
         );
@@ -4557,7 +4608,117 @@ mod tests {
             IndexCommand::CreateNodePropertyIndex {
                 name: Some("for".to_owned()),
                 label: "Person".to_owned(),
-                property: "age".to_owned(),
+                properties: vec!["age".to_owned()],
+                if_not_exists: false,
+            }
+        );
+    }
+
+    #[test]
+    fn create_composite_index_parses_property_tuple() {
+        // Composite (multi-property) node index (`rmp` task #657): the `ON (n.a, n.b)` tuple parses to a
+        // multi-element `properties` list in declared order.
+        assert_eq!(
+            index_cmd("CREATE INDEX FOR (n:Person) ON (n.first, n.last)"),
+            create_np_composite("Person", &["first", "last"])
+        );
+        // Three keys, whitespace + trailing `;` + backtick-quoted names + a different variable letter.
+        assert_eq!(
+            index_cmd("  create index  for ( p : `Sales-Rep` ) on ( p.a , p.`b.c` , p.d ) ;"),
+            create_np_composite("Sales-Rep", &["a", "b.c", "d"])
+        );
+        // Named + IF NOT EXISTS composite, and the RANGE synonym over a tuple.
+        assert_eq!(
+            index_cmd("CREATE INDEX ix IF NOT EXISTS FOR (n:Person) ON (n.a, n.b)"),
+            IndexCommand::CreateNodePropertyIndex {
+                name: Some("ix".to_owned()),
+                label: "Person".to_owned(),
+                properties: vec!["a".to_owned(), "b".to_owned()],
+                if_not_exists: true,
+            }
+        );
+        assert_eq!(
+            index_cmd("CREATE RANGE INDEX r FOR (n:Person) ON (n.a, n.b)"),
+            IndexCommand::CreateNodePropertyIndex {
+                name: Some("r".to_owned()),
+                label: "Person".to_owned(),
+                properties: vec!["a".to_owned(), "b".to_owned()],
+                if_not_exists: false,
+            }
+        );
+        // Order is significant: (a, b) parses distinctly from (b, a).
+        assert_ne!(
+            index_cmd("CREATE INDEX FOR (n:Person) ON (n.a, n.b)"),
+            index_cmd("CREATE INDEX FOR (n:Person) ON (n.b, n.a)")
+        );
+    }
+
+    #[test]
+    fn single_property_index_stays_one_element_list() {
+        // A single-property `ON (n.p)` and the legacy `ON :L(p)` both yield a 1-element list — identical
+        // to the pre-composite behaviour (`rmp` task #657).
+        assert_eq!(
+            index_cmd("CREATE INDEX FOR (n:Person) ON (n.age)"),
+            IndexCommand::CreateNodePropertyIndex {
+                name: None,
+                label: "Person".to_owned(),
+                properties: vec!["age".to_owned()],
+                if_not_exists: false,
+            }
+        );
+        assert_eq!(
+            index_cmd("CREATE INDEX ON :Person(age)"),
+            IndexCommand::CreateNodePropertyIndex {
+                name: None,
+                label: "Person".to_owned(),
+                properties: vec!["age".to_owned()],
+                if_not_exists: false,
+            }
+        );
+    }
+
+    #[test]
+    fn composite_index_rejects_empty_and_duplicate_property_lists() {
+        // An empty property list `ON ()` is a syntax error (no property to index).
+        assert!(!invalid("CREATE INDEX FOR (n:Person) ON ()").is_empty());
+        // A duplicate property in the tuple is rejected with a clear message.
+        let dup = invalid("CREATE INDEX FOR (n:Person) ON (n.a, n.a)");
+        assert!(dup.contains("duplicate property"), "{dup}");
+        let dup3 = invalid("CREATE INDEX FOR (n:Person) ON (n.a, n.b, n.a)");
+        assert!(dup3.contains("duplicate property"), "{dup3}");
+    }
+
+    #[test]
+    fn drop_composite_index_by_target_parses_property_tuple() {
+        // The by-target drop of a composite index carries the ordered property tuple (`rmp` task #657).
+        assert_eq!(
+            index_cmd("DROP INDEX FOR (n:Person) ON (n.a, n.b)"),
+            IndexCommand::DropNodePropertyIndex {
+                index: NodePropertyIndexRef::Target {
+                    label: "Person".to_owned(),
+                    properties: vec!["a".to_owned(), "b".to_owned()],
+                },
+                if_exists: false,
+            }
+        );
+    }
+
+    #[test]
+    fn composite_relationship_index_is_declined() {
+        // A relationship composite `ON (r.a, r.b)` is declined with a specific message (`rmp` task #657):
+        // the durable relationship-composite backing store is deferred.
+        let msg = invalid("CREATE INDEX FOR ()-[r:KNOWS]-() ON (r.a, r.b)");
+        assert!(
+            msg.contains("composite relationship indexes are not yet supported"),
+            "{msg}"
+        );
+        // A single-property relationship index still parses (unchanged).
+        assert_eq!(
+            index_cmd("CREATE INDEX FOR ()-[r:KNOWS]-() ON (r.since)"),
+            IndexCommand::CreateRelPropertyIndex {
+                name: None,
+                rel_type: "KNOWS".to_owned(),
+                property: "since".to_owned(),
                 if_not_exists: false,
             }
         );
@@ -4571,7 +4732,7 @@ mod tests {
             IndexCommand::CreateNodePropertyIndex {
                 name: Some("ix".to_owned()),
                 label: "Person".to_owned(),
-                property: "name".to_owned(),
+                properties: vec!["name".to_owned()],
                 if_not_exists: false,
             }
         );
@@ -4581,7 +4742,7 @@ mod tests {
             IndexCommand::CreateNodePropertyIndex {
                 name: Some("t".to_owned()),
                 label: "Person".to_owned(),
-                property: "nick".to_owned(),
+                properties: vec!["nick".to_owned()],
                 if_not_exists: true,
             }
         );
@@ -4664,7 +4825,7 @@ mod tests {
             IndexCommand::DropNodePropertyIndex {
                 index: NodePropertyIndexRef::Target {
                     label: "Person".to_owned(),
-                    property: "age".to_owned(),
+                    properties: vec!["age".to_owned()],
                 },
                 if_exists: false,
             }
@@ -4674,7 +4835,7 @@ mod tests {
             IndexCommand::DropNodePropertyIndex {
                 index: NodePropertyIndexRef::Target {
                     label: "Person".to_owned(),
-                    property: "age".to_owned(),
+                    properties: vec!["age".to_owned()],
                 },
                 if_exists: false,
             }

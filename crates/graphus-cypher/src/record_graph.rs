@@ -3267,6 +3267,57 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         Some(out)
     }
 
+    fn index_seek_composite_eq(
+        &self,
+        label: &str,
+        properties: &[String],
+        values: &[Value],
+    ) -> Option<Vec<NodeId>> {
+        // Only the coordinated path has a derived index; otherwise fall back to a scan + filter
+        // (`rmp` task #657).
+        let index = self.index.as_ref()?;
+        // Resolve the label + every property-key token; a missing token means no composite index can
+        // cover this tuple, so decline (the executor's scan covers it).
+        let label_token = self.label_id_existing(label)?;
+        let mut property_tokens = Vec::with_capacity(properties.len());
+        for property in properties {
+            property_tokens.push(self.store.borrow().token_id(Namespace::PropKey, property)?);
+        }
+        if !index.borrow().has_composite(label_token, &property_tokens) {
+            return None; // no usable composite index: scan fallback
+        }
+
+        // SSI predicate footprint: mirror the node-key composite seek (`node_key_tuple_conflict` /
+        // `composite_seek_eq`, `rmp` #401). The composite index has no precise multi-property `Equality`
+        // marker, so we register the coarse `PredicateRead::Label` (which pairs with every node insert's
+        // `Label(L)` write footprint, closing the composite-absence phantom the physical-key SIREADs
+        // alone miss) plus `mark_all_live_nodes` — exactly the footprint the label-scan fallback this
+        // seek replaces would register. Conservative but never wrong; it only adds an rw-edge between
+        // concurrent same-label writers, as the scan fallback already did.
+        self.note_predicate_read(PredicateRead::Label(label_token));
+        self.mark_all_live_nodes();
+
+        // Candidate ids whose composite tuple equals `values`. The index is candidate-only, so re-check
+        // the FULL predicate per candidate: visible + carries the label (`filter_label_candidates`) +
+        // the *current* per-property tuple equals `values` element-wise by Cypher equality.
+        let candidates = index
+            .borrow_mut()
+            .seek_composite_eq(label_token, &property_tokens, values)
+            .unwrap_or_default();
+        let labelled = self.filter_label_candidates(label_token, candidates);
+        let mut out: Vec<NodeId> = labelled
+            .into_iter()
+            .filter(|id| {
+                self.node_tuple(*id, &property_tokens)
+                    .is_some_and(|tuple| tuples_match(&tuple, values))
+            })
+            .collect();
+        // De-duplicate: a stale + a live index entry can name the same id twice.
+        out.sort_unstable();
+        out.dedup();
+        Some(out)
+    }
+
     fn index_seek_spatial(
         &self,
         label: &str,

@@ -404,6 +404,29 @@ pub enum PhysicalOp {
         /// The catalog index backing the seek.
         index: IndexId,
     },
+    /// **Composite (multi-property) index equality seek** (`rmp` task #657): records of `label` whose
+    /// current values of `properties` (in the composite key's declared order) equal `values`
+    /// element-wise — served by the composite B+-tree in a **single** seek, consuming a run of leading
+    /// equality conjuncts (`MATCH (n:L {a: …, b: …})` / `WHERE n.a = … AND n.b = …`) that would
+    /// otherwise be a leading-key seek + residual filter.
+    ///
+    /// `properties` and `values` are parallel and cover the composite index's **full** ordered key
+    /// tuple (the planner only emits this when every key has an equality conjunct). The seek returns a
+    /// **candidate** set; the executor re-checks each candidate's visibility, current label and current
+    /// per-property values, so an over-broad candidate never reaches the result — and it falls back to a
+    /// label scan + residual equality filters when the seam has no usable composite index.
+    NodeCompositeIndexSeek {
+        /// The node variable bound by each row.
+        variable: Var,
+        /// The label the composite index covers.
+        label: Label,
+        /// The indexed property keys, in the composite key's declared order (two or more).
+        properties: Vec<String>,
+        /// The per-key equality seek values (parallel to `properties`; unevaluated AST).
+        values: Vec<Expr>,
+        /// The catalog index backing the seek.
+        index: IndexId,
+    },
     /// **Precise equality-filtered label scan** (`rmp` task #325): records of `label` whose `property`
     /// equals the seek expression, served by a **full store scan** (the path chosen when no derived
     /// property index covers `(label, property)`).
@@ -1297,6 +1320,18 @@ impl Planner<'_> {
         predicate: &Expr,
         deps: &mut BTreeSet<IndexId>,
     ) -> PhysicalOp {
+        // A multi-key inline map (`MATCH (n:L {a: …, b: …})`) lowers each key to its **own** nested
+        // `Filter` (see `lower::filter_inline_props`), so a composite index seek (`rmp` task #657) —
+        // which needs to see every key together — would never fire. Fold a chain of `Filter`s over a
+        // label scan into a single conjunction and re-enter, so the index-selection logic below sees all
+        // conjuncts at once. Harmless for every existing single-key path (the folded conjunction splits
+        // back into the same conjuncts a `WHERE a AND b` already produced).
+        if matches!(input, LogicalOp::Filter { .. })
+            && let Some((scan, folded)) = fold_label_scan_filter_chain(input, predicate)
+        {
+            return self.lower_filter(&scan, &folded, deps);
+        }
+
         // Index selection only fires directly over a label scan (the logical anchor of a labelled
         // node). Anything else: lower the input normally and keep the predicate as a residual filter.
         let LogicalOp::NodeByLabelScan { variable, label } = input else {
@@ -1307,6 +1342,65 @@ impl Planner<'_> {
         };
 
         let conjuncts = split_conjuncts(predicate);
+
+        // Composite (multi-property) seek (`rmp` task #657): collect the top-level equality conjuncts on
+        // this variable, and if a composite index's FULL ordered key tuple is entirely covered by them,
+        // consume exactly those conjuncts into ONE composite `NodeCompositeIndexSeek` (instead of a
+        // leading-key seek + residual filters). Runs before the single-conjunct index loop so a
+        // full-key composite match takes priority over consuming just the leading key.
+        let eq_conjuncts: Vec<(usize, String, &Expr)> = conjuncts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, conj)| {
+                let pp = analyze_property_predicate(conj, &variable.name)?;
+                match pp.kind {
+                    // Defer cloning the value to the consumed keys only: keep the conjunct by reference.
+                    PropertyPredicateKind::Equality { value: _ } => Some((i, pp.property, *conj)),
+                    _ => None,
+                }
+            })
+            .collect();
+        if eq_conjuncts.len() >= 2 {
+            let available: Vec<&str> = eq_conjuncts.iter().map(|(_, p, _)| p.as_str()).collect();
+            if let Some(idx) = self.catalog.label_composite_full_eq(label, &available) {
+                deps.insert(idx.id);
+                // Build the per-key value list in the composite's declared key order, recording which
+                // conjuncts are consumed (the first matching conjunct per key, so a repeated key leaves
+                // its later conjuncts as residual filters — correct: the residual restores exactness).
+                let mut values: Vec<Expr> = Vec::with_capacity(idx.properties.len());
+                let mut consumed: Vec<usize> = Vec::with_capacity(idx.properties.len());
+                for key in &idx.properties {
+                    let (ci, _, conj) = eq_conjuncts
+                        .iter()
+                        .find(|(ci, p, _)| p == key && !consumed.contains(ci))
+                        .or_else(|| eq_conjuncts.iter().find(|(_, p, _)| p == key))
+                        .expect("label_composite_full_eq guarantees every key is available");
+                    let value = analyze_property_predicate(conj, &variable.name)
+                        .and_then(|pp| match pp.kind {
+                            PropertyPredicateKind::Equality { value } => Some(value),
+                            _ => None,
+                        })
+                        .expect("eq_conjuncts holds only equality predicates");
+                    values.push(value);
+                    consumed.push(*ci);
+                }
+                let seek = PhysicalOp::NodeCompositeIndexSeek {
+                    variable: variable.clone(),
+                    label: label.clone(),
+                    properties: idx.properties.clone(),
+                    values,
+                    index: idx.id,
+                };
+                let residual: Vec<&Expr> = conjuncts
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| !consumed.contains(j))
+                    .map(|(_, e)| *e)
+                    .collect();
+                return attach_residual(seek, &residual);
+            }
+        }
+
         // Find the first conjunct that names an index-usable predicate on this variable+label.
         for (i, conj) in conjuncts.iter().enumerate() {
             if let Some(pp) = analyze_property_predicate(conj, &variable.name) {
@@ -1514,6 +1608,7 @@ fn contains_read(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeByLabelScan { .. }
         | PhysicalOp::TokenLookupScan { .. }
         | PhysicalOp::NodeIndexSeek { .. }
+        | PhysicalOp::NodeCompositeIndexSeek { .. }
         | PhysicalOp::NodeLabelScanEq { .. }
         | PhysicalOp::NodeIndexRangeSeek { .. }
         | PhysicalOp::NodeIndexStartsWithSeek { .. }
@@ -1583,6 +1678,7 @@ fn contains_write(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeByLabelScan { .. }
         | PhysicalOp::TokenLookupScan { .. }
         | PhysicalOp::NodeIndexSeek { .. }
+        | PhysicalOp::NodeCompositeIndexSeek { .. }
         | PhysicalOp::NodeLabelScanEq { .. }
         | PhysicalOp::NodeIndexRangeSeek { .. }
         | PhysicalOp::NodeIndexStartsWithSeek { .. }
@@ -1643,6 +1739,7 @@ fn contains_procedure_call(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeByLabelScan { .. }
         | PhysicalOp::TokenLookupScan { .. }
         | PhysicalOp::NodeIndexSeek { .. }
+        | PhysicalOp::NodeCompositeIndexSeek { .. }
         | PhysicalOp::NodeLabelScanEq { .. }
         | PhysicalOp::NodeIndexRangeSeek { .. }
         | PhysicalOp::NodeIndexStartsWithSeek { .. }
@@ -1713,6 +1810,7 @@ fn all_procedure_calls_reader_safe(
         | PhysicalOp::NodeByLabelScan { .. }
         | PhysicalOp::TokenLookupScan { .. }
         | PhysicalOp::NodeIndexSeek { .. }
+        | PhysicalOp::NodeCompositeIndexSeek { .. }
         | PhysicalOp::NodeLabelScanEq { .. }
         | PhysicalOp::NodeIndexRangeSeek { .. }
         | PhysicalOp::NodeIndexStartsWithSeek { .. }
@@ -1930,6 +2028,7 @@ fn optimize_children(op: PhysicalOp, catalog: &IndexCatalog, stats: &dyn Statist
         | PhysicalOp::NodeByLabelScan { .. }
         | PhysicalOp::TokenLookupScan { .. }
         | PhysicalOp::NodeIndexSeek { .. }
+        | PhysicalOp::NodeCompositeIndexSeek { .. }
         | PhysicalOp::NodeLabelScanEq { .. }
         | PhysicalOp::NodeIndexRangeSeek { .. }
         | PhysicalOp::NodeIndexStartsWithSeek { .. }
@@ -2329,6 +2428,40 @@ fn property_comparison_expr(variable: &Var, property: &str, op: BinaryOp, value:
 }
 
 /// AND-combines two predicates into one (`lhs AND rhs`), spanning both.
+/// If `input` is a (possibly nested) chain of [`Filter`](LogicalOp::Filter)s bottoming out at a
+/// [`NodeByLabelScan`](LogicalOp::NodeByLabelScan), returns that scan (cloned) plus the **conjunction**
+/// of `top` and every predicate in the chain (top-down order), so [`Planner::lower_filter`] can do
+/// index selection over all conjuncts at once (`rmp` task #657). Returns [`None`] when `input` is not
+/// such a chain (e.g. a filter over an expand), so the caller keeps its normal residual-filter path.
+///
+/// Only invoked when `input` is itself a `Filter` (a nested chain), so the folded result always has at
+/// least two predicates — exactly the multi-key inline-map / stacked-filter shape a composite seek
+/// needs to see together.
+fn fold_label_scan_filter_chain(input: &LogicalOp, top: &Expr) -> Option<(LogicalOp, Expr)> {
+    let mut predicates: Vec<Expr> = vec![top.clone()];
+    let mut cur = input;
+    loop {
+        match cur {
+            LogicalOp::NodeByLabelScan { .. } => {
+                let mut it = predicates.into_iter();
+                let mut acc = it.next()?; // always Some: `top` is pushed first.
+                for p in it {
+                    acc = and_exprs(acc, p);
+                }
+                return Some((cur.clone(), acc));
+            }
+            LogicalOp::Filter {
+                input: inner,
+                predicate,
+            } => {
+                predicates.push(predicate.clone());
+                cur = inner;
+            }
+            _ => return None,
+        }
+    }
+}
+
 fn and_exprs(lhs: Expr, rhs: Expr) -> Expr {
     let span = crate::lexer::Span::new(lhs.span.start, rhs.span.end);
     Expr::new(
@@ -2654,6 +2787,7 @@ fn contains_argument(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeByLabelScan { .. }
         | PhysicalOp::TokenLookupScan { .. }
         | PhysicalOp::NodeIndexSeek { .. }
+        | PhysicalOp::NodeCompositeIndexSeek { .. }
         | PhysicalOp::NodeLabelScanEq { .. }
         | PhysicalOp::NodeIndexRangeSeek { .. }
         | PhysicalOp::NodeIndexStartsWithSeek { .. }
@@ -3085,6 +3219,7 @@ fn gather_index_dependencies(op: &PhysicalOp, deps: &mut BTreeSet<IndexId>) {
     match op {
         PhysicalOp::TokenLookupScan { index, .. }
         | PhysicalOp::NodeIndexSeek { index, .. }
+        | PhysicalOp::NodeCompositeIndexSeek { index, .. }
         | PhysicalOp::NodeIndexRangeSeek { index, .. }
         | PhysicalOp::NodeIndexStartsWithSeek { index, .. }
         | PhysicalOp::SpatialIndexSeek { index, .. } => {
@@ -3600,6 +3735,7 @@ fn gather_bound_vars(plan: &PhysicalOp, out: &mut Vec<Var>) {
         | PhysicalOp::NodeByLabelScan { variable, .. }
         | PhysicalOp::TokenLookupScan { variable, .. }
         | PhysicalOp::NodeIndexSeek { variable, .. }
+        | PhysicalOp::NodeCompositeIndexSeek { variable, .. }
         | PhysicalOp::NodeLabelScanEq { variable, .. }
         | PhysicalOp::NodeIndexRangeSeek { variable, .. }
         | PhysicalOp::NodeIndexStartsWithSeek { variable, .. }
@@ -3789,6 +3925,25 @@ impl PhysicalOp {
                 label.name,
                 h::expr(value),
             ),
+            Self::NodeCompositeIndexSeek {
+                variable,
+                label,
+                properties,
+                values,
+                index,
+            } => {
+                let keys = properties
+                    .iter()
+                    .zip(values.iter())
+                    .map(|(p, v)| format!("{p} = {}", h::expr(v)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                writeln!(
+                    f,
+                    "NodeCompositeIndexSeek({variable}:{} {keys} via {index})",
+                    label.name,
+                )
+            }
             Self::NodeLabelScanEq {
                 variable,
                 label,
@@ -4527,6 +4682,78 @@ mod tests {
         // The anchored end of an expand uses the seek too.
         let plan = physical("MATCH (a:Person {id: 5})-[:KNOWS]->(b) RETURN b", &catalog);
         assert!(plan.to_string().contains("NodeIndexSeek"), "{plan}");
+    }
+
+    #[test]
+    fn composite_full_key_equality_becomes_one_composite_seek() {
+        // `rmp` task #657: a composite index on (a, b) and a query with equality on BOTH keys must fuse
+        // into ONE `NodeCompositeIndexSeek`, consuming both conjuncts (no residual Filter), whether the
+        // predicate is spelled as an inline map or as `WHERE ... AND ...`, and in either conjunct order.
+        let catalog = IndexCatalog::builder()
+            .with_label_composite("Person", ["a", "b"])
+            .build();
+
+        for src in [
+            "MATCH (n:Person {a: 1, b: 2}) RETURN n",
+            "MATCH (n:Person) WHERE n.a = 1 AND n.b = 2 RETURN n",
+            "MATCH (n:Person) WHERE n.b = 2 AND n.a = 1 RETURN n",
+        ] {
+            let plan = physical(src, &catalog);
+            let rendered = plan.to_string();
+            assert!(
+                rendered.contains("NodeCompositeIndexSeek"),
+                "{src}: {rendered}"
+            );
+            assert!(!rendered.contains("Filter"), "{src}: {rendered}");
+            assert!(!rendered.contains("NodeByLabelScan"), "{src}: {rendered}");
+            assert_eq!(plan.index_dependencies().count(), 1, "{src}");
+        }
+
+        // A third, non-covered equality conjunct stays a residual Filter above the composite seek.
+        let plan = physical(
+            "MATCH (n:Person) WHERE n.a = 1 AND n.b = 2 AND n.c = 3 RETURN n",
+            &catalog,
+        );
+        let rendered = plan.to_string();
+        assert!(rendered.contains("NodeCompositeIndexSeek"), "{rendered}");
+        assert!(rendered.contains("Filter"), "{rendered}");
+    }
+
+    #[test]
+    fn composite_leading_key_only_does_not_use_composite_seek() {
+        // `rmp` task #657: a predicate on ONLY the leading key does not emit a composite seek — the
+        // composite serves it as a single-property leading-prefix (existing `label_property` behaviour),
+        // which lowers to a `NodeIndexSeek` on the leading key (the seam falls back to a scan for a
+        // composite-only tree, but the PLAN shape is the single-key seek, never the composite seek).
+        let catalog = IndexCatalog::builder()
+            .with_label_composite("Person", ["a", "b"])
+            .build();
+        let plan = physical("MATCH (n:Person {a: 1}) RETURN n", &catalog);
+        let rendered = plan.to_string();
+        assert!(
+            !rendered.contains("NodeCompositeIndexSeek"),
+            "leading-only must not use the composite seek: {rendered}"
+        );
+        assert!(rendered.contains("NodeIndexSeek"), "{rendered}");
+    }
+
+    #[test]
+    fn composite_non_leading_key_only_stays_a_filter() {
+        // `rmp` task #657: a predicate on ONLY a non-leading key (`b`) cannot use the composite (the
+        // leading key `a` is unbound) — it stays a scan + filter (the precise `NodeLabelScanEq` here,
+        // since it is a single equality), never a composite or single-key seek.
+        let catalog = IndexCatalog::builder()
+            .with_label_composite("Person", ["a", "b"])
+            .build();
+        let plan = physical("MATCH (n:Person {b: 2}) RETURN n", &catalog);
+        let rendered = plan.to_string();
+        assert!(
+            !rendered.contains("CompositeIndexSeek"),
+            "non-leading-only must not use the composite seek: {rendered}"
+        );
+        assert!(!rendered.contains("NodeIndexSeek"), "{rendered}");
+        // A single non-leading equality still narrows the SSI footprint via the precise scan path.
+        assert!(rendered.contains("NodeLabelScanEq"), "{rendered}");
     }
 
     #[test]

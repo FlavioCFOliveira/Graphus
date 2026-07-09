@@ -246,6 +246,26 @@ pub fn estimate_cost(op: &PhysicalOp, stats: Option<&dyn Statistics>) -> CostEst
             CostEstimate::new(rows, COST_SEEK_SETUP + rows * COST_SEEK_PER_ROW)
         }
 
+        // A composite (multi-property) equality seek (`rmp` task #657): the selectivity is the product of
+        // the per-key equality selectivities (independence assumption), so a full-key composite seek is
+        // highly selective — far cheaper than any single-key seek + residual filters. The estimate is
+        // floored at one candidate so the seek stays a cheap-but-nonzero leaf access path.
+        PhysicalOp::NodeCompositeIndexSeek {
+            label,
+            properties,
+            values,
+            ..
+        } => {
+            let label_rows = label_scan_rows(&label.name, stats).max(1.0);
+            let mut rows = label_rows;
+            for (property, value) in properties.iter().zip(values.iter()) {
+                let key_sel = seek_eq_rows(&label.name, property, value, stats) / label_rows;
+                rows *= key_sel;
+            }
+            let rows = rows.max(1.0);
+            CostEstimate::new(rows, COST_SEEK_SETUP + rows * COST_SEEK_PER_ROW)
+        }
+
         // A precise equality-filtered label scan (`rmp` task #325): it visits *every* node of the label
         // (full-scan work, like a `NodeByLabelScan`) but **emits** only the equality-selective rows — so
         // its row estimate is the seek's selective estimate while its cost is the full label scan. This

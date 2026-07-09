@@ -246,6 +246,31 @@ impl IndexCatalog {
         })
     }
 
+    /// A composite node index on `label` whose **full ordered property tuple** is entirely covered by
+    /// the equality-predicate properties `available` (`rmp` task #657).
+    ///
+    /// Returns a [`IndexKind::Composite`] index (arity ≥ 2) whose every key appears in `available` — so
+    /// a `MATCH (n:L {a: …, b: …})` (both keys have an equality conjunct) drives one full-key composite
+    /// seek. When several composites qualify, the one with the **most** keys is preferred (the most
+    /// selective). A composite whose leading key alone is present (a strict prefix) is **not** returned
+    /// here — that case is served by [`label_property`](Self::label_property)'s leading-prefix contract.
+    #[must_use]
+    pub fn label_composite_full_eq(
+        &self,
+        label: &Label,
+        available: &[&str],
+    ) -> Option<&IndexDescriptor> {
+        self.indexes
+            .iter()
+            .filter(|d| {
+                d.kind == IndexKind::Composite
+                    && d.covers_label(&label.name)
+                    && d.properties.len() >= 2
+                    && d.properties.iter().all(|p| available.contains(&p.as_str()))
+            })
+            .max_by_key(|d| d.properties.len())
+    }
+
     /// A spatial index on `(label, point-property)` usable for a proximity / bounding-box predicate
     /// (`rmp` task #73). The planner consults this for a `distance(n.prop, $p) <= r` or
     /// coordinate-range predicate on a labelled point property.
@@ -452,6 +477,49 @@ mod tests {
         assert!(catalog.rel_property(&rel_type("KNOWS"), "since").is_some());
         assert!(catalog.rel_property(&rel_type("KNOWS"), "weight").is_none());
         assert!(catalog.rel_property(&rel_type("LIKES"), "since").is_none());
+    }
+
+    #[test]
+    fn composite_full_eq_needs_every_key_available() {
+        // `rmp` task #657: a composite (a, b) is returned only when BOTH keys are available equality
+        // predicates; a strict prefix (only `a`) is not (that is `label_property`'s leading-prefix job).
+        let catalog = IndexCatalog::builder()
+            .with_label_composite("Person", ["a", "b"])
+            .build();
+        let l = label("Person");
+        assert!(catalog.label_composite_full_eq(&l, &["a", "b"]).is_some());
+        // Order of availability is irrelevant (it is a set membership test); extra keys are fine.
+        assert!(
+            catalog
+                .label_composite_full_eq(&l, &["b", "a", "c"])
+                .is_some()
+        );
+        // A strict prefix (only the leading key) does NOT match.
+        assert!(catalog.label_composite_full_eq(&l, &["a"]).is_none());
+        assert!(catalog.label_composite_full_eq(&l, &["b"]).is_none());
+        // Wrong label / a single-property index never qualifies.
+        assert!(
+            catalog
+                .label_composite_full_eq(&label("Other"), &["a", "b"])
+                .is_none()
+        );
+        let single = IndexCatalog::builder()
+            .with_label_property("Person", "a")
+            .build();
+        assert!(single.label_composite_full_eq(&l, &["a", "b"]).is_none());
+    }
+
+    #[test]
+    fn composite_full_eq_prefers_the_widest_key() {
+        // When two composites qualify, the one with the most keys (most selective) is preferred.
+        let catalog = IndexCatalog::builder()
+            .with_label_composite("Person", ["a", "b"])
+            .with_label_composite("Person", ["a", "b", "c"])
+            .build();
+        let chosen = catalog
+            .label_composite_full_eq(&label("Person"), &["a", "b", "c"])
+            .unwrap();
+        assert_eq!(chosen.properties, vec!["a", "b", "c"]);
     }
 
     #[test]

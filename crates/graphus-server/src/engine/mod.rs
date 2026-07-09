@@ -2520,14 +2520,16 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
         IndexCommand::CreateNodePropertyIndex {
             name,
             label,
-            property,
+            properties,
             if_not_exists,
         } => {
-            // `mutated == false` is an idempotent `IF NOT EXISTS` no-op → the seam reports 0 added.
-            let mutated = coordinator.begin_online_node_property_index_named(
+            // `mutated == false` is an idempotent `IF NOT EXISTS` no-op → the seam reports 0 added. The
+            // coordinator entry point delegates arity-1 to the single-property path and builds a
+            // standalone composite index for arity ≥ 2 (`rmp` task #657).
+            let mutated = coordinator.begin_online_node_composite_index_named(
                 name.as_deref(),
                 label,
-                property,
+                properties,
                 *if_not_exists,
             )?;
             Ok(IndexDdlReply::mutation(mutated))
@@ -2536,15 +2538,18 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
             // `mutated == false` is a no-op drop (missing index) → the seam reports 0 removed.
             let mutated = match index {
                 // `DROP INDEX <name>` does not spell the index kind: resolve the (globally-unique)
-                // name against both the node and relationship property index catalogs (`rmp` task #646).
+                // name against the node, relationship and composite property index catalogs
+                // (`rmp` tasks #646 / #657).
                 NodePropertyIndexRef::Named(name) => {
                     coordinator.drop_property_index_by_name(name, *if_exists)?
                 }
                 // The by-target form is already idempotent (a no-op success on a missing target), so
-                // `IF EXISTS` needs no extra handling here.
-                NodePropertyIndexRef::Target { label, property } => {
-                    coordinator.drop_node_property_index(label, property)?
-                }
+                // `IF EXISTS` needs no extra handling here. A single-property tuple drops the
+                // single-property index; a multi-property tuple drops the composite (`rmp` task #657).
+                NodePropertyIndexRef::Target { label, properties } => match properties.as_slice() {
+                    [property] => coordinator.drop_node_property_index(label, property)?,
+                    _ => coordinator.drop_node_composite_index(label, properties)?,
+                },
             };
             Ok(IndexDdlReply::mutation(mutated))
         }
@@ -2620,6 +2625,23 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
                         Value::List(vec![Value::String(property)]),
                         Value::String(state_str(state).to_owned()),
                         owning_constraint,
+                    ]
+                },
+            ));
+            // Standalone composite (multi-property) node indexes (`rmp` task #657): `type` stays RANGE,
+            // `entityType` NODE, and `properties` is the multi-element covered tuple (`[a, b, …]`) in
+            // declared order. `owningConstraint` is always `Null` — a standalone composite index is not a
+            // constraint's backing index (its own auto-name is `index_<L>_<a>_<b>`).
+            rows.extend(coordinator.list_composite_indexes().into_iter().map(
+                |(name, label, properties, state)| {
+                    vec![
+                        Value::String(name),
+                        Value::String("RANGE".to_owned()),
+                        Value::String("NODE".to_owned()),
+                        Value::List(vec![Value::String(label)]),
+                        Value::List(properties.into_iter().map(Value::String).collect()),
+                        Value::String(state_str(state).to_owned()),
+                        Value::Null,
                     ]
                 },
             ));

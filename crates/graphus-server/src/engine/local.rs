@@ -600,4 +600,80 @@ mod tests {
         let _ = err; // the precise message is asserted by the seam tests; here we only need the reject
         eng.rollback(tx).expect("rollback");
     }
+
+    #[test]
+    fn show_indexes_renders_composite_property_tuple() {
+        // `rmp` task #657: a composite index shows `type` RANGE, `entityType` NODE and a MULTI-element
+        // `properties` list (`[a, b]`), alongside single-property indexes.
+        use graphus_core::Value;
+
+        let mut eng = engine(sim_clock(0));
+        // Seed a node so the label exists, then declare a single-property and a composite index.
+        let tx = eng.begin_auto_commit(AccessMode::Write).expect("begin");
+        let mut reply = eng
+            .run(
+                tx,
+                "CREATE (:Person {a: 1, b: 2, c: 3})",
+                vec![],
+                true,
+                None,
+            )
+            .expect("create runs");
+        let _ = drain(&mut reply);
+        drop(reply);
+
+        eng.index_ddl(IndexCommand::CreateNodePropertyIndex {
+            name: Some("ix_a".to_owned()),
+            label: "Person".to_owned(),
+            properties: vec!["a".to_owned()],
+            if_not_exists: false,
+        })
+        .expect("create single-property index");
+        eng.index_ddl(IndexCommand::CreateNodePropertyIndex {
+            name: Some("ix_ab".to_owned()),
+            label: "Person".to_owned(),
+            properties: vec!["a".to_owned(), "b".to_owned()],
+            if_not_exists: false,
+        })
+        .expect("create composite index");
+
+        let reply = eng
+            .index_ddl(IndexCommand::ShowIndexes)
+            .expect("show indexes");
+        // Fields: name, type, entityType, labelsOrTypes, properties, state, owningConstraint.
+        let props_col = reply
+            .fields
+            .iter()
+            .position(|f| f == "properties")
+            .expect("a properties column");
+        let name_col = reply.fields.iter().position(|f| f == "name").unwrap();
+
+        // The composite row carries the two-element ordered property list.
+        let composite_row = reply
+            .rows
+            .iter()
+            .find(|r| matches!(&r[name_col], Value::String(n) if n == "ix_ab"))
+            .expect("the composite index is listed");
+        assert_eq!(
+            composite_row[props_col],
+            Value::List(vec![
+                Value::String("a".to_owned()),
+                Value::String("b".to_owned())
+            ]),
+            "composite properties render as a multi-element list [a, b]"
+        );
+        assert_eq!(composite_row[1], Value::String("RANGE".to_owned()));
+        assert_eq!(composite_row[2], Value::String("NODE".to_owned()));
+
+        // The single-property row still renders a one-element list.
+        let single_row = reply
+            .rows
+            .iter()
+            .find(|r| matches!(&r[name_col], Value::String(n) if n == "ix_a"))
+            .expect("the single-property index is listed");
+        assert_eq!(
+            single_row[props_col],
+            Value::List(vec![Value::String("a".to_owned())])
+        );
+    }
 }

@@ -2148,6 +2148,41 @@ fn build_operator(
                 rows: nodes_to_rows(variable, ids),
             })
         }
+        PhysicalOp::NodeCompositeIndexSeek {
+            variable,
+            label,
+            properties,
+            values,
+            ..
+        } => {
+            // Composite (multi-property) equality seek (`rmp` task #657): evaluate each key's seek value
+            // at run time (a literal or a `$param`), then route to the composite index seam. The seam
+            // returns a candidate SUPERSET which it has already re-checked for the current per-key tuple;
+            // when no composite index is available it returns `None` and we fall back to a label scan
+            // filtered by every key (the operator consumed the equality conjuncts, so the fallback must
+            // re-apply them). Both paths yield the identical node set.
+            let mut seek_values = Vec::with_capacity(values.len());
+            for value in values {
+                seek_values.push(eval_value(
+                    value,
+                    &Row::empty(),
+                    ctx.params,
+                    ctx.graph,
+                    ctx.functions,
+                    &ctx.clock,
+                )?);
+            }
+            let ids = match ctx
+                .graph
+                .index_seek_composite_eq(&label.name, properties, &seek_values)
+            {
+                Some(ids) => ids,
+                None => scan_filter_composite_eq(label, properties, &seek_values, ctx),
+            };
+            Ok(Operator::Buffered {
+                rows: nodes_to_rows(variable, ids),
+            })
+        }
         PhysicalOp::NodeLabelScanEq {
             variable,
             label,
@@ -2884,6 +2919,36 @@ fn all_rels_rows(
 /// blanket marker produced reciprocal false aborts between transactions matching disjoint keys.
 fn scan_filter_eq(label: &Label, property: &str, seek: &Value, ctx: &Ctx<'_>) -> Vec<NodeId> {
     ctx.graph.scan_filter_eq(&label.name, property, seek)
+}
+
+/// Fallback composite (multi-property) equality access (`rmp` task #657): scan the label and keep
+/// nodes whose current value of **every** key equals the corresponding seek value by Cypher equality.
+///
+/// The path taken when the [`GraphAccess`](crate::graph_access::GraphAccess) seam has no usable
+/// composite index (`index_seek_composite_eq` returned `None`) — a reference / off-thread read graph.
+/// The composite [`NodeCompositeIndexSeek`](crate::physical::PhysicalOp::NodeCompositeIndexSeek)
+/// operator **consumes** the equality conjuncts (they are not re-attached as a residual filter), so
+/// this fallback must apply the full per-key equality predicate itself.
+fn scan_filter_composite_eq(
+    label: &Label,
+    properties: &[String],
+    values: &[Value],
+    ctx: &Ctx<'_>,
+) -> Vec<NodeId> {
+    ctx.graph
+        .scan_nodes_by_label(&label.name)
+        .into_iter()
+        .filter(|id| {
+            properties
+                .iter()
+                .zip(values.iter())
+                .all(|(property, value)| {
+                    ctx.graph
+                        .node_property(*id, property)
+                        .is_some_and(|v| crate::equality::equals(&v, value).is_true())
+                })
+        })
+        .collect()
 }
 
 /// Fallback range access: scan the label and keep nodes whose property satisfies the range bound.
@@ -7606,6 +7671,7 @@ fn result_columns(op: &PhysicalOp, procedures: &dyn ProcedureRegistry) -> Vec<St
         | PhysicalOp::NodeByLabelScan { variable, .. }
         | PhysicalOp::TokenLookupScan { variable, .. }
         | PhysicalOp::NodeIndexSeek { variable, .. }
+        | PhysicalOp::NodeCompositeIndexSeek { variable, .. }
         | PhysicalOp::NodeLabelScanEq { variable, .. }
         | PhysicalOp::NodeIndexRangeSeek { variable, .. }
         | PhysicalOp::NodeIndexStartsWithSeek { variable, .. }

@@ -41,7 +41,8 @@ use crate::heap::{self, BLOCK_PAYLOAD, HeapBlock, STRINGS_RECORD_SIZE};
 use crate::idalloc::{ElementIdAllocator, FreeList, NULL_ID, PhysicalAllocator};
 use crate::labels;
 use crate::meta::{
-    ConstraintEntry, FulltextIndexEntry, IndexState, Meta, SpatialIndexEntry, Statistics, StoreMeta,
+    CompositeIndexEntry, ConstraintEntry, FulltextIndexEntry, IndexState, Meta, SpatialIndexEntry,
+    Statistics, StoreMeta,
 };
 use crate::paging;
 use crate::read_view::{self, MetaSnapshot, StoreMetaSnapshot, StorePages, StoreReadView};
@@ -5259,6 +5260,57 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// discarded on rollback.
     pub fn remove_spatial_index(&mut self, name: &str) {
         self.statistics.remove_spatial_index(name);
+        self.catalog_dirty = true;
+    }
+
+    /// The durable composite (multi-property) node index entry named `name`, or [`None`] if no such
+    /// index is declared (`rmp` task #657). Tokens are returned as ids; the caller resolves their names
+    /// via the token store. Cloned so the borrow of `self` does not outlive the call.
+    #[must_use]
+    pub fn composite_index(&self, name: &str) -> Option<CompositeIndexEntry> {
+        self.statistics.composite_index(name).cloned()
+    }
+
+    /// Lists every declared composite index as `(name, entry)` from the durable catalog (`rmp` task
+    /// #657), ascending by name. Like [`fulltext_indexes`](Self::fulltext_indexes) this is what makes a
+    /// composite index *registration* survive a crash: a fresh coordinator reads this to re-register
+    /// the previously-declared composite indexes before rebuilding their B+-tree from the store.
+    #[must_use]
+    pub fn composite_indexes(&self) -> Vec<(String, CompositeIndexEntry)> {
+        self.statistics.composite_indexes()
+    }
+
+    /// The **name** of the composite index covering exactly `(label_token, property_tokens)` — same
+    /// label and same **ordered** property tuple — or [`None`] if none is declared (`rmp` task #657).
+    /// Backs the `IF NOT EXISTS` schema-equivalence check.
+    #[must_use]
+    pub fn composite_index_name_for(
+        &self,
+        label_token: u32,
+        property_tokens: &[u32],
+    ) -> Option<String> {
+        self.statistics
+            .composite_index_name_for(label_token, property_tokens)
+            .map(str::to_owned)
+    }
+
+    /// Declares (or replaces) the composite index named `name` in the durable catalog (`rmp` task
+    /// #657).
+    ///
+    /// The mutation is purely in-memory here; like the spatial index mutators it becomes **durable when
+    /// the enclosing transaction commits** (the catalog is checkpointed at commit) and is **discarded
+    /// on rollback** (the catalog is reloaded from the last committed metadata page). Re-recording an
+    /// existing name overwrites the entry (e.g. to flip its state).
+    pub fn set_composite_index(&mut self, name: String, entry: CompositeIndexEntry) {
+        self.statistics.set_composite_index(name, entry);
+        self.catalog_dirty = true;
+    }
+
+    /// Removes the composite index named `name` from the durable catalog, if declared (`rmp` task
+    /// #657). Removing an absent entry is a harmless no-op. Durable at the enclosing transaction's
+    /// commit, discarded on rollback.
+    pub fn remove_composite_index(&mut self, name: &str) {
+        self.statistics.remove_composite_index(name);
         self.catalog_dirty = true;
     }
 

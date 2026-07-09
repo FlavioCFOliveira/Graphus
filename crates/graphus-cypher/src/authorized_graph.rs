@@ -598,6 +598,28 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         )
     }
 
+    fn index_seek_composite_eq(
+        &self,
+        label: &str,
+        properties: &[String],
+        values: &[Value],
+    ) -> Option<Vec<NodeId>> {
+        // A composite index seek is a read path: filter its candidates exactly like a scan / single-key
+        // seek, so the index-accelerated and scan-fallback paths return the same visible rows
+        // (`rmp` task #657).
+        let ids = self
+            .inner
+            .index_seek_composite_eq(label, properties, values)?;
+        if self.oracle.is_unrestricted() {
+            return Some(ids);
+        }
+        Some(
+            ids.into_iter()
+                .filter(|&id| self.node_visible(id))
+                .collect(),
+        )
+    }
+
     fn index_seek_spatial(
         &self,
         label: &str,

@@ -1240,19 +1240,20 @@ pub fn redact_index_detail(cmd: &crate::engine::IndexCommand) -> String {
         I::CreateNodePropertyIndex {
             name,
             label,
-            property,
+            properties,
             if_not_exists,
         } => {
             let named = name.as_deref().map(|n| format!("{n} ")).unwrap_or_default();
             let if_ne = if *if_not_exists { " IF NOT EXISTS" } else { "" };
-            format!("CREATE INDEX {named}FOR (:{label}) ON ({property}){if_ne}")
+            let props = properties.join(", ");
+            format!("CREATE INDEX {named}FOR (:{label}) ON ({props}){if_ne}")
         }
         I::DropNodePropertyIndex { index, if_exists } => {
             let if_e = if *if_exists { " IF EXISTS" } else { "" };
             match index {
                 Ref::Named(name) => format!("DROP INDEX {name}{if_e}"),
-                Ref::Target { label, property } => {
-                    format!("DROP INDEX ON :{label}({property})")
+                Ref::Target { label, properties } => {
+                    format!("DROP INDEX ON :{label}({})", properties.join(", "))
                 }
             }
         }

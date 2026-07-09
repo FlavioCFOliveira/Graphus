@@ -93,6 +93,23 @@ pub fn equivalent_rel_index_exists(rel_type: &str, property: &str) -> GraphusErr
     .into_error()
 }
 
+/// A `CREATE INDEX FOR (n:Label) ON (n.a, n.b, …)` whose covered `(label, ordered property tuple)` is
+/// already indexed by an equivalent composite index
+/// (`Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists`) (`rmp` task #657). The composite
+/// analogue of [`equivalent_index_exists`]; the property order is significant.
+#[must_use]
+pub fn equivalent_composite_index_exists(label: &str, properties: &[String]) -> GraphusError {
+    SchemaRuleError {
+        code: CODE_EQUIVALENT_EXISTS,
+        message: format!(
+            "An equivalent index already exists for (:{label} {{{}}}). \
+             Use `IF NOT EXISTS` to make the create idempotent.",
+            properties.join(", ")
+        ),
+    }
+    .into_error()
+}
+
 /// A `CREATE INDEX <name>` whose `name` is already used by another index or constraint
 /// (`Neo.ClientError.Schema.IndexWithNameAlreadyExists`). Index/constraint names are unique across
 /// every schema catalog (`rmp` task #624).

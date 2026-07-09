@@ -102,7 +102,7 @@ fn index_ddl_invalidates_the_plan_cache() {
     eng.index_ddl(IndexCommand::CreateNodePropertyIndex {
         name: None,
         label: "Person".to_owned(),
-        property: "age".to_owned(),
+        properties: vec!["age".to_owned()],
         if_not_exists: false,
     })
     .expect("create index");
@@ -133,7 +133,7 @@ fn drop_index_also_invalidates() {
     eng.index_ddl(IndexCommand::CreateNodePropertyIndex {
         name: None,
         label: "Person".to_owned(),
-        property: "age".to_owned(),
+        properties: vec!["age".to_owned()],
         if_not_exists: false,
     })
     .expect("create index");
@@ -148,7 +148,7 @@ fn drop_index_also_invalidates() {
     eng.index_ddl(IndexCommand::DropNodePropertyIndex {
         index: graphus_server::engine::NodePropertyIndexRef::Target {
             label: "Person".to_owned(),
-            property: "age".to_owned(),
+            properties: vec!["age".to_owned()],
         },
         if_exists: false,
     })

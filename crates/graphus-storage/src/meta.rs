@@ -135,6 +135,32 @@ pub struct SpatialIndexEntry {
     pub state: IndexState,
 }
 
+/// A durable **composite (multi-property) node index** catalog entry (`rmp` task #657).
+///
+/// A composite RANGE index is identified by a server-unique **name** (like a full-text or spatial
+/// index, and unlike a single-property node index which `(label_token, prop_key)` identifies),
+/// covers one node label and **two or more** property tokens **in declared order** (the key order is
+/// significant — `(a, b)` differs from `(b, a)`). It is the multi-key generalisation of the
+/// single-property node index: a `MATCH (n:L {a: …, b: …})` consumes the leading equality conjuncts
+/// into one composite seek. Unlike a node-key constraint's backing composite (`rmp` task #100), a
+/// standalone composite index enforces **no uniqueness** — it is a pure query accelerator.
+///
+/// This rides the **identical** durability lifecycle as the full-text / spatial index catalogs:
+/// checkpointed at commit, reloaded on rollback and on open. Its presence invariant is "an entry
+/// exists iff a composite index of that name is declared". The backing B+-tree *data* itself is never
+/// persisted (it is ephemeral and rebuilt from the store on open, like the derived `IndexSet`), so
+/// only this catalog entry needs durability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompositeIndexEntry {
+    /// The node label-namespace token the index covers.
+    pub label_token: u32,
+    /// The property-key-namespace tokens the index covers, **in declared order** (two or more; the
+    /// arity-1 case is served by the single-property node-property index, never recorded here).
+    pub property_tokens: Vec<u32>,
+    /// The build state of the index (the same state machine as a node-property / full-text index).
+    pub state: IndexState,
+}
+
 /// The kind of a declared constraint (`rmp` tasks #99, #100).
 ///
 /// A constraint is one of four schema rules over the nodes of a label:
@@ -653,6 +679,18 @@ pub struct Statistics {
     /// by the Cypher layer at declaration time, not here. This map rides the **identical** durability
     /// lifecycle as the other catalogs.
     pub rel_property_index_names: BTreeMap<String, (u32, u32)>,
+    /// The durable **composite (multi-property) node index catalog** (`rmp` task #657): the set of
+    /// declared standalone composite indexes keyed by their server-unique **name**, each carrying the
+    /// covered label token, the covered property-key tokens (in declared order, two or more) and the
+    /// build [`IndexState`]. See [`CompositeIndexEntry`].
+    ///
+    /// Persisting this set is what makes a composite index *registration* survive a crash: the backing
+    /// B+-tree is ephemeral (rebuilt from the store on open, like the derived `IndexSet`), so without
+    /// this map a recovered store would have no record of which composite indexes existed and would
+    /// silently lose them. An entry is present **iff** an index of that name is declared. The map rides
+    /// the **identical** durability lifecycle as the other catalogs; it holds **only** arity-≥2 indexes
+    /// (a single-property index lives in [`node_property_indexes`](Self#structfield.node_property_indexes)).
+    pub composite_indexes: BTreeMap<String, CompositeIndexEntry>,
 }
 
 impl Statistics {
@@ -1046,6 +1084,54 @@ impl Statistics {
             .collect()
     }
 
+    // ---- Composite (multi-property) node index catalog (`rmp` task #657) --------------------------
+
+    /// The durable composite index entry named `name`, or [`None`] if no such index is declared
+    /// (`rmp` task #657).
+    #[must_use]
+    pub fn composite_index(&self, name: &str) -> Option<&CompositeIndexEntry> {
+        self.composite_indexes.get(name)
+    }
+
+    /// Declares (or replaces) the composite index named `name` (`rmp` task #657). Idempotent on the
+    /// name: re-recording overwrites the entry (e.g. to flip its state `Populating` → `Online`).
+    pub(crate) fn set_composite_index(&mut self, name: String, entry: CompositeIndexEntry) {
+        self.composite_indexes.insert(name, entry);
+    }
+
+    /// Removes the composite index named `name`, if declared (`rmp` task #657). Removing an absent
+    /// entry is a harmless no-op.
+    pub(crate) fn remove_composite_index(&mut self, name: &str) {
+        self.composite_indexes.remove(name);
+    }
+
+    /// Lists every declared composite index as `(name, entry)`, ascending by name (the [`BTreeMap`]
+    /// order, deterministic) (`rmp` task #657).
+    #[must_use]
+    pub fn composite_indexes(&self) -> Vec<(String, CompositeIndexEntry)> {
+        self.composite_indexes
+            .iter()
+            .map(|(name, entry)| (name.clone(), entry.clone()))
+            .collect()
+    }
+
+    /// The **name** of the composite index covering exactly `(label_token, property_tokens)` — same
+    /// label and same **ordered** property tuple — or [`None`] if no such index is declared (`rmp` task
+    /// #657). Backs the `IF NOT EXISTS` schema-equivalence check (composite key order is significant).
+    #[must_use]
+    pub fn composite_index_name_for(
+        &self,
+        label_token: u32,
+        property_tokens: &[u32],
+    ) -> Option<&str> {
+        self.composite_indexes
+            .iter()
+            .find(|&(_, entry)| {
+                entry.label_token == label_token && entry.property_tokens == property_tokens
+            })
+            .map(|(name, _)| name.as_str())
+    }
+
     /// The durable full-text index entry named `name`, or [`None`] if no such index is declared
     /// (`rmp` task #72).
     #[must_use]
@@ -1207,6 +1293,10 @@ impl Statistics {
         // to the node-property index catalog / name catalog, so the same encoders serve both.
         Self::encode_index_catalog(&mut out, &self.rel_property_indexes);
         Self::encode_index_name_catalog(&mut out, &self.rel_property_index_names);
+        // The standalone composite (multi-property) node index catalog (`rmp` task #657), appended
+        // after every prior block by the same append-only rule, so a pre-#657 image (ending after the
+        // relationship-property index name catalog) decodes it to empty.
+        Self::encode_composite_catalog(&mut out, &self.composite_indexes);
         out
     }
 
@@ -1412,6 +1502,42 @@ impl Statistics {
         }
     }
 
+    /// Encodes the composite (multi-property) node index catalog block (`rmp` task #657), appended
+    /// last so a pre-#657 image (ending after the relationship-property index name catalog) decodes to
+    /// an empty composite catalog.
+    ///
+    /// Layout: `n(u32) | [ name_len(u32) | name_bytes[name_len] | label_token(u32) |
+    /// n_props(u32) | prop_token(u32)*n_props | state(u8) ]*`, entries in ascending-name
+    /// ([`BTreeMap`]) order so the image is deterministic. Mirrors the full-text block (one or more
+    /// property tokens) but carries a build-[`IndexState`] byte in place of the analyzer + state bytes
+    /// (a composite index has a build state but no analyzer).
+    fn encode_composite_catalog(out: &mut Vec<u8>, map: &BTreeMap<String, CompositeIndexEntry>) {
+        debug_assert!(
+            map.len() <= u32::MAX as usize,
+            "composite catalog entry count exceeds u32"
+        );
+        out.extend_from_slice(&(map.len() as u32).to_le_bytes());
+        for (name, entry) in map {
+            let name_bytes = name.as_bytes();
+            debug_assert!(
+                name_bytes.len() <= u32::MAX as usize,
+                "composite index name exceeds u32 length"
+            );
+            out.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(name_bytes);
+            out.extend_from_slice(&entry.label_token.to_le_bytes());
+            debug_assert!(
+                entry.property_tokens.len() <= u32::MAX as usize,
+                "composite property-token count exceeds u32"
+            );
+            out.extend_from_slice(&(entry.property_tokens.len() as u32).to_le_bytes());
+            for &prop in &entry.property_tokens {
+                out.extend_from_slice(&prop.to_le_bytes());
+            }
+            out.push(entry.state.as_byte());
+        }
+    }
+
     /// Rebuilds the statistics from an image produced by [`encode`](Self::encode).
     ///
     /// # Errors
@@ -1451,6 +1577,10 @@ impl Statistics {
         let rel_property_indexes = Self::decode_index_catalog(bytes, &mut cur)?;
         let rel_property_index_names =
             Self::decode_index_name_catalog(bytes, &mut cur, &rel_property_indexes)?;
+        // Decode the trailing composite (multi-property) node index catalog (`rmp` task #657). A
+        // pre-#657 image ends after the relationship-property index name catalog, so this block decodes
+        // empty via the end-of-input guard.
+        let composite_indexes = Self::decode_composite_catalog(bytes, &mut cur)?;
         Ok(Self {
             total_nodes,
             total_relationships,
@@ -1464,6 +1594,7 @@ impl Statistics {
             node_property_index_names,
             rel_property_indexes,
             rel_property_index_names,
+            composite_indexes,
         })
     }
 
@@ -1660,6 +1791,74 @@ impl Statistics {
             {
                 return Err(GraphusError::Storage(format!(
                     "spatial catalog repeats index name {name:?}"
+                )));
+            }
+        }
+        Ok(map)
+    }
+
+    /// Decodes the composite (multi-property) node index catalog block (`rmp` task #657). Like every
+    /// later block, end-of-input where its count `u32` would start means "no composite catalog" (a
+    /// pre-#657 image), not truncation.
+    ///
+    /// The `state` byte is range-checked. A repeated name, an empty name, or a zero property-token
+    /// count is rejected (none is ever produced by [`encode`](Self::encode)). A single-property entry
+    /// (`n_props == 1`) is not rejected here (the block is self-describing), but the Cypher layer never
+    /// writes one — arity-1 lives in the single-property node index catalog.
+    fn decode_composite_catalog(
+        bytes: &[u8],
+        cur: &mut usize,
+    ) -> Result<BTreeMap<String, CompositeIndexEntry>> {
+        let mut map = BTreeMap::new();
+        // Backward compatibility (`rmp` task #657): a pre-#657 image ends exactly here.
+        if *cur == bytes.len() {
+            return Ok(map);
+        }
+        let n = read_u32(bytes, cur)? as usize;
+        for _ in 0..n {
+            let name_len = read_u32(bytes, cur)? as usize;
+            let end = take(bytes, cur, name_len)?;
+            let name = String::from_utf8(bytes[end - name_len..end].to_vec()).map_err(|_| {
+                GraphusError::Storage("composite catalog name is not valid UTF-8".to_owned())
+            })?;
+            if name.is_empty() {
+                return Err(GraphusError::Storage(
+                    "composite catalog holds an empty index name".to_owned(),
+                ));
+            }
+            let label_token = read_u32(bytes, cur)?;
+            let n_props = read_u32(bytes, cur)? as usize;
+            if n_props == 0 {
+                return Err(GraphusError::Storage(format!(
+                    "composite index {name:?} covers no properties"
+                )));
+            }
+            // Cap by the bytes remaining (see the full-text decoder above): `n_props` is an untrusted
+            // u32 and each property is a 4-byte read, so capacity never legitimately exceeds
+            // `bytes.len()`. Prevents an OOM from a forged count before the per-element reads validate.
+            let mut property_tokens = Vec::with_capacity(n_props.min(bytes.len()));
+            for _ in 0..n_props {
+                property_tokens.push(read_u32(bytes, cur)?);
+            }
+            let state_byte = read_u8(bytes, cur)?;
+            let state = IndexState::from_byte(state_byte).ok_or_else(|| {
+                GraphusError::Storage(format!(
+                    "composite index {name:?} holds unknown state byte {state_byte}"
+                ))
+            })?;
+            if map
+                .insert(
+                    name.clone(),
+                    CompositeIndexEntry {
+                        label_token,
+                        property_tokens,
+                        state,
+                    },
+                )
+                .is_some()
+            {
+                return Err(GraphusError::Storage(format!(
+                    "composite catalog repeats index name {name:?}"
                 )));
             }
         }
@@ -2435,6 +2634,67 @@ mod tests {
         let decoded = Statistics::decode(&image).unwrap();
         assert!(decoded.constraints().is_empty());
         assert_eq!(decoded.spatial_indexes().len(), 1);
+    }
+
+    #[test]
+    fn statistics_composite_catalog_round_trips_and_pre_657_image_decodes_empty() {
+        // Empty map: the composite block is just a `0` count, and the round-trip is identity.
+        let empty = Statistics::new();
+        assert_eq!(Statistics::decode(&empty.encode()).unwrap(), empty);
+
+        // One entry, then several (varying arity + order), keyed by name.
+        let mut s = Statistics::new();
+        s.set_composite_index(
+            "index_Person_a_b".to_owned(),
+            CompositeIndexEntry {
+                label_token: 1,
+                property_tokens: vec![2, 3],
+                state: IndexState::Online,
+            },
+        );
+        assert_eq!(Statistics::decode(&s.encode()).unwrap(), s);
+        // Order is significant: (b, a) is a distinct entry from (a, b).
+        s.set_composite_index(
+            "index_Person_b_a".to_owned(),
+            CompositeIndexEntry {
+                label_token: 1,
+                property_tokens: vec![3, 2],
+                state: IndexState::Populating,
+            },
+        );
+        s.set_composite_index(
+            "index_Doc_x_y_z".to_owned(),
+            CompositeIndexEntry {
+                label_token: 9,
+                property_tokens: vec![4, 5, 6],
+                state: IndexState::Online,
+            },
+        );
+        let back = Statistics::decode(&s.encode()).unwrap();
+        assert_eq!(back, s);
+        assert_eq!(back.composite_indexes().len(), 3);
+        // The equivalence resolver finds the exact ordered tuple, and distinguishes (a,b) from (b,a).
+        assert_eq!(
+            back.composite_index_name_for(1, &[2, 3]),
+            Some("index_Person_a_b")
+        );
+        assert_eq!(
+            back.composite_index_name_for(1, &[3, 2]),
+            Some("index_Person_b_a")
+        );
+        assert_eq!(back.composite_index_name_for(1, &[2, 4]), None);
+
+        // A pre-#657 image (a rel-property-name-catalog-terminated image with NO composite block)
+        // decodes to an empty composite catalog, not a truncation error. Build such an image by encoding
+        // a value with no composite indexes and truncating off the trailing zero-count composite block
+        // (a 4-byte `u32` of `0`).
+        let mut pre657 = Statistics::new();
+        pre657.set_node_property_index(1, 2, IndexState::Online);
+        let mut image = pre657.encode();
+        image.truncate(image.len() - 4);
+        let decoded = Statistics::decode(&image).unwrap();
+        assert!(decoded.composite_indexes().is_empty());
+        assert_eq!(decoded.node_property_indexes().len(), 1);
     }
 
     #[test]
