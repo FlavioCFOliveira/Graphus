@@ -1340,8 +1340,10 @@ dependencies = [
  "graphus-io",
  "graphus-storage",
  "graphus-wal",
+ "rustls",
  "serde",
  "serde_json",
+ "webpki-roots",
 ]
 
 [[package]]

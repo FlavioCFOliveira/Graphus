@@ -46,6 +46,20 @@
 //! pre-first-byte compile error surfaces as the non-200 status directly). This loader decodes
 //! `Transfer-Encoding: chunked` so the buffered and streamed paths parse uniformly.
 //!
+//! # Two transports
+//!
+//! - **REST bulk-import (Mode A)** — the default, driven by `--rest <host:port>` against a plaintext
+//!   loopback dev server: the full modern flow above (bulk upload + VECTOR/TEXT/property-type schema +
+//!   the index-backed query asserts).
+//! - **Bolt attach (`--bolt <url>`, `rmp` #693)** — for an ALREADY-RUNNING, possibly remote instance
+//!   (e.g. pi516) over Bolt-over-TCP + TLS (`bolt+ssc://` accepts a self-signed cert). Here the harness
+//!   already carved out the isolated `--db`, so this loader does **not** create/drop it: it declares a
+//!   **version-tolerant** minimal schema (best-effort range indexes on `User.id` / `Product.id` so the
+//!   anchor seeks are index-backed; modern VECTOR/TEXT/property-type schema is skipped — an old server
+//!   may not support it), streams the node + relationship rows in `UNWIND`-batched writes, and asserts
+//!   the graph shape + that every recommendation family returns a well-formed result. The full modern
+//!   schema is validated in REST/local mode against a current server.
+//!
 //! ## Exit contract
 //!
 //! On full success it prints exactly one machine-readable sentinel line to stdout —
@@ -58,11 +72,13 @@
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use graphus_core::Value;
 use graphus_reco_gen::Generator;
+use graphus_reco_gen::client::{BoltClient, BoltUrl};
 use graphus_reco_gen::queries::READ_BATTERY;
 use graphus_reco_gen::schema;
 use serde_json::{Value as Json, json};
@@ -95,7 +111,14 @@ fn main() -> ExitCode {
         }
     };
 
-    match run(&args) {
+    // Bolt attach mode (`--bolt`) loads over Bolt-over-TCP+TLS into a harness-created isolated DB;
+    // the default REST mode drives the network bulk-import (Mode A) happy path.
+    let result = if args.bolt.is_some() {
+        run_bolt(&args)
+    } else {
+        run(&args)
+    };
+    match result {
         Ok(()) => {
             // The single success sentinel the example's `run.sh` greps for.
             println!(
@@ -111,20 +134,28 @@ fn main() -> ExitCode {
     }
 }
 
-const USAGE: &str = "usage: reco_load --rest <host:port> --default-db <name> --db <name> \
---data-dir <dir> \\\n\
-    \x20                --user <name> --password <pw> \\\n\
-    \x20                --expect-users <N> --expect-products <N> --expect-friends <N> \
---expect-purchased <N>\n\
-Drives the reco graph into a running graphus-server via network bulk-import Mode A (REST-only),\n\
+const USAGE: &str = "usage (REST bulk-import):\n\
+    \x20 reco_load --rest <host:port> --default-db <name> --db <name> --data-dir <dir> \\\n\
+    \x20           --user <name> --password <pw> \\\n\
+    \x20           --expect-users <N> --expect-products <N> --expect-friends <N> --expect-purchased <N>\n\
+usage (Bolt attach into a pre-created isolated DB, rmp #693):\n\
+    \x20 reco_load --bolt <bolt+ssc://host:7687> --db <name> --data-dir <dir> \\\n\
+    \x20           --user <name> --password <pw> \\\n\
+    \x20           --expect-users <N> --expect-products <N> --expect-friends <N> --expect-purchased <N>\n\
+Drives the reco graph into a running graphus-server (REST bulk-import Mode A, or Bolt UNWIND writes),\n\
 declares the read-path indexes, and asserts the graph shape + that every recommendation query\n\
 returns a well-formed result. Prints GRAPHUS_RECO_LOAD_OK on success.\n";
 
-/// The fully-parsed command line. Every flag is required; `--expect-*` are the asserted counts and
-/// double as the success-sentinel payload.
+/// The fully-parsed command line. `--db`, `--data-dir`, `--user`, `--password` and the four
+/// `--expect-*` counts are always required; exactly one transport is required — `--rest` (+
+/// `--default-db`) for bulk-import Mode A, or `--bolt <url>` for the Bolt attach path.
 struct Args {
-    rest: String,
-    default_db: String,
+    /// REST endpoint (`host:port`) for bulk-import Mode A; `None` in Bolt attach mode.
+    rest: Option<String>,
+    /// The server's default database (admin statements route through it); REST mode only.
+    default_db: Option<String>,
+    /// Bolt URL (`bolt[+s|+ssc]://host:port`) for the attach path; `None` in REST mode.
+    bolt: Option<String>,
     db: String,
     data_dir: PathBuf,
     user: String,
@@ -136,11 +167,12 @@ struct Args {
 }
 
 impl Args {
-    /// Parses `--flag value` (and `--flag=value`) pairs. All flags are mandatory; a missing or
-    /// malformed one is a clear error (not a silent default).
+    /// Parses `--flag value` (and `--flag=value`) pairs. Common flags are mandatory; a missing or
+    /// malformed one is a clear error (not a silent default). Exactly one of `--rest` / `--bolt`
+    /// selects the transport.
     ///
     /// # Errors
-    /// A human-readable message naming the missing/invalid flag.
+    /// A human-readable message naming the missing/invalid flag or an ambiguous transport.
     fn parse(argv: impl Iterator<Item = String>) -> Result<Self, String> {
         let mut map: HashMap<String, String> = HashMap::new();
         let mut it = argv;
@@ -173,9 +205,26 @@ impl Args {
                 .map_err(|_| format!("--{k} must be a non-negative integer, got {v:?}"))
         };
 
+        let rest = map.get("rest").cloned();
+        let bolt = map.get("bolt").cloned();
+        match (&rest, &bolt) {
+            (None, None) => return Err("one of --rest or --bolt is required".to_owned()),
+            (Some(_), Some(_)) => {
+                return Err("--rest and --bolt are mutually exclusive (pick one transport)".to_owned());
+            }
+            _ => {}
+        }
+        // `--default-db` is only meaningful (and required) for the REST bulk-import path.
+        let default_db = if rest.is_some() {
+            Some(text("default-db")?)
+        } else {
+            None
+        };
+
         Ok(Self {
-            rest: text("rest")?,
-            default_db: text("default-db")?,
+            rest,
+            default_db,
+            bolt,
             db: text("db")?,
             data_dir: PathBuf::from(text("data-dir")?),
             user: text("user")?,
@@ -191,16 +240,25 @@ impl Args {
 /// Runs the whole load + assert pipeline. Returns `Ok(())` only when every step succeeded and every
 /// assertion held; the `Err` string is the already-formatted `<what failed>: <server status/body>`.
 fn run(args: &Args) -> Result<(), String> {
+    let rest_addr = args
+        .rest
+        .as_deref()
+        .ok_or("REST mode requires --rest <host:port>")?;
+    let default_db = args
+        .default_db
+        .as_deref()
+        .ok_or("REST mode requires --default-db <name>")?;
+
     // 1. Authenticate → Bearer token for every later call.
-    let token = login(&args.rest, &args.user, &args.password)?;
+    let token = login(rest_addr, &args.user, &args.password)?;
     let rest = Rest {
-        addr: &args.rest,
+        addr: rest_addr,
         token: &token,
     };
 
     // 2. Create the fresh, empty Mode A target database (admin statement runs against the default db).
     rest.statement(
-        &args.default_db,
+        default_db,
         "CREATE DATABASE",
         &format!("CREATE DATABASE {}", args.db),
         None,
@@ -300,7 +358,7 @@ fn run(args: &Args) -> Result<(), String> {
 
     // 4. Mode A leaves the database Offline; bring it online explicitly.
     rest.statement(
-        &args.default_db,
+        default_db,
         "START DATABASE",
         &format!("START DATABASE {}", args.db),
         None,
@@ -373,6 +431,353 @@ fn run(args: &Args) -> Result<(), String> {
     assert_constraints_reject(&rest, &args.db)?;
 
     Ok(())
+}
+
+// ================================================================================================
+// Bolt attach load (`--bolt`, rmp #693) — UNWIND-batched writes into a pre-created isolated DB
+// ================================================================================================
+
+/// Node rows per `UNWIND` write (one transaction/fsync per batch).
+const NODE_BATCH: usize = 1000;
+/// Relationship rows per `UNWIND` write (each row is a 2-seek MATCH + CREATE).
+const EDGE_BATCH: usize = 500;
+/// Per-read socket timeout for the attach loader: generous (a batch commit fsyncs on the server) but
+/// still bounds a truly wedged connection.
+const BOLT_IO_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Loads the reco graph over Bolt-over-TCP+TLS into the harness-created isolated `--db`. Does NOT
+/// create or drop the database (the shell harness owns its lifecycle). Declares a version-tolerant
+/// minimal schema (best-effort range indexes on the anchor properties), streams the node then
+/// relationship rows in `UNWIND` batches, and asserts the graph shape + that every recommendation
+/// family returns a well-formed result.
+///
+/// # Errors
+/// Any connect/login failure, a server `FAILURE` on a write, a shape mismatch, or a recommendation
+/// family that does not return a well-formed result.
+fn run_bolt(args: &Args) -> Result<(), String> {
+    let url_str = args.bolt.as_deref().ok_or("Bolt mode requires --bolt <url>")?;
+    let url = BoltUrl::parse(url_str)?;
+    let mut load = BoltLoad::connect(&url, &args.db, &args.user, &args.password)?;
+    eprintln!(
+        "reco_load: Bolt attach to {url} db={:?} (version-tolerant UNWIND load)",
+        args.db
+    );
+
+    // 1. Version-tolerant read-path indexes on the anchor properties so `(:User {id})` /
+    //    `(:Product {id})` seeks are index-backed (not scans) BEFORE the edge MATCH-by-id load. On an
+    //    empty label the index is online immediately; a rejected/duplicate CREATE is tolerated (an
+    //    older server may differ in DDL surface — the load still succeeds, only slower via a scan).
+    load.best_effort_index("User", "id");
+    load.best_effort_index("Product", "id");
+
+    // 2. Stream nodes, then relationships, in UNWIND batches (parameterised — one plan per shape).
+    let users = parse_users(&args.data_dir)?;
+    let products = parse_products(&args.data_dir)?;
+    let friends = parse_friends(&args.data_dir)?;
+    let purchased = parse_purchased(&args.data_dir)?;
+
+    for chunk in users.chunks(NODE_BATCH) {
+        let rows: Vec<Value> = chunk
+            .iter()
+            .map(|(id, name, country)| {
+                Value::Map(vec![
+                    ("id".into(), Value::String(id.clone())),
+                    ("name".into(), Value::String(name.clone())),
+                    ("country".into(), Value::String(country.clone())),
+                ])
+            })
+            .collect();
+        load.write(
+            "load User nodes",
+            "UNWIND $rows AS row CREATE (:User {id: row.id, name: row.name, country: row.country})",
+            vec![("rows".into(), Value::List(rows))],
+        )?;
+    }
+    eprintln!("reco_load: loaded {} User nodes", users.len());
+
+    for chunk in products.chunks(NODE_BATCH) {
+        let rows: Vec<Value> = chunk
+            .iter()
+            .map(|(id, name, category, price)| {
+                Value::Map(vec![
+                    ("id".into(), Value::String(id.clone())),
+                    ("name".into(), Value::String(name.clone())),
+                    ("category".into(), Value::String(category.clone())),
+                    ("price".into(), Value::Integer(*price)),
+                ])
+            })
+            .collect();
+        load.write(
+            "load Product nodes",
+            "UNWIND $rows AS row \
+             CREATE (:Product {id: row.id, name: row.name, category: row.category, price: row.price})",
+            vec![("rows".into(), Value::List(rows))],
+        )?;
+    }
+    eprintln!("reco_load: loaded {} Product nodes", products.len());
+
+    for chunk in friends.chunks(EDGE_BATCH) {
+        let rows: Vec<Value> = chunk
+            .iter()
+            .map(|(a, b, since)| {
+                Value::Map(vec![
+                    ("a".into(), Value::String(a.clone())),
+                    ("b".into(), Value::String(b.clone())),
+                    ("since".into(), Value::Integer(*since)),
+                ])
+            })
+            .collect();
+        load.write(
+            "load FRIEND edges",
+            "UNWIND $rows AS row MATCH (a:User {id: row.a}), (b:User {id: row.b}) \
+             CREATE (a)-[:FRIEND {since: row.since}]->(b)",
+            vec![("rows".into(), Value::List(rows))],
+        )?;
+    }
+    eprintln!("reco_load: loaded {} FRIEND edges", friends.len());
+
+    for chunk in purchased.chunks(EDGE_BATCH) {
+        let rows: Vec<Value> = chunk
+            .iter()
+            .map(|(u, p, ts, qty)| {
+                Value::Map(vec![
+                    ("u".into(), Value::String(u.clone())),
+                    ("p".into(), Value::String(p.clone())),
+                    ("ts".into(), Value::Integer(*ts)),
+                    ("qty".into(), Value::Integer(*qty)),
+                ])
+            })
+            .collect();
+        load.write(
+            "load PURCHASED edges",
+            "UNWIND $rows AS row MATCH (u:User {id: row.u}), (p:Product {id: row.p}) \
+             CREATE (u)-[:PURCHASED {ts: row.ts, qty: row.qty}]->(p)",
+            vec![("rows".into(), Value::List(rows))],
+        )?;
+    }
+    eprintln!("reco_load: loaded {} PURCHASED edges", purchased.len());
+
+    // 3. Shape assertions (deterministic for a fixed seed + profile).
+    load.assert_count(
+        "MATCH (u:User) RETURN count(u)",
+        "User node count",
+        args.expect_users,
+    )?;
+    load.assert_count(
+        "MATCH (p:Product) RETURN count(p)",
+        "Product node count",
+        args.expect_products,
+    )?;
+    load.assert_count(
+        "MATCH ()-[r:PURCHASED]->() RETURN count(r)",
+        "PURCHASED edge count",
+        args.expect_purchased,
+    )?;
+    // FRIEND is stored once but traversed from both ends by `-[r:FRIEND]-`; tolerate either the
+    // undirected double-count (2×) or a single count, so an older engine's traversal semantics do not
+    // false-fail the load (both mean "every friendship is present").
+    load.assert_count_either(
+        "MATCH ()-[r:FRIEND]-() RETURN count(r)",
+        "FRIEND traversal count",
+        args.expect_friends.saturating_mul(2),
+        args.expect_friends,
+    )?;
+
+    // 4. Recommendation smoke: every family must return a well-formed, non-erroring result on a real
+    //    sample user id (surfaces any unsupported Cypher in the battery against this server version).
+    let sample_id = Generator::user_id(0);
+    for spec in READ_BATTERY {
+        load.write(
+            &format!("recommendation family '{}'", spec.name),
+            spec.cypher,
+            vec![("id".into(), Value::String(sample_id.clone()))],
+        )?;
+    }
+    eprintln!(
+        "reco_load: every recommendation family returned a well-formed result ({} families)",
+        READ_BATTERY.len()
+    );
+
+    load.goodbye();
+    Ok(())
+}
+
+/// A minimal authenticated Bolt session bound to one target database, for the attach load path.
+struct BoltLoad {
+    client: BoltClient,
+    db: String,
+}
+
+impl BoltLoad {
+    /// Connects + logs in over the Bolt URL.
+    fn connect(url: &BoltUrl, db: &str, user: &str, password: &str) -> Result<Self, String> {
+        let mut client = BoltClient::connect_bolt(url, BOLT_IO_TIMEOUT)
+            .map_err(|e| format!("connecting to {url} failed: {e}"))?;
+        client
+            .login(user, password)
+            .map_err(|e| format!("login as {user:?} on {url} failed: {e}"))?;
+        Ok(Self {
+            client,
+            db: db.to_owned(),
+        })
+    }
+
+    /// Runs one write/statement, discarding the rows; a server `FAILURE` is surfaced as an `Err`.
+    fn write(&mut self, what: &str, cypher: &str, params: Vec<(String, Value)>) -> Result<(), String> {
+        self.client
+            .run(cypher, params, &self.db)
+            .map(|_| ())
+            .map_err(|e| format!("{what} failed: {e}"))
+    }
+
+    /// Best-effort index creation: a failure (already-exists, unsupported DDL surface) is noted, not
+    /// fatal — the load still completes (anchor seeks fall back to a scan).
+    fn best_effort_index(&mut self, label: &str, prop: &str) {
+        let cypher = format!("CREATE INDEX FOR (n:{label}) ON (n.{prop})");
+        if let Err(e) = self.client.run(&cypher, vec![], &self.db) {
+            eprintln!(
+                "reco_load: note: best-effort index on {label}.{prop} not created ({e}); \
+                 anchor seeks may scan on this server"
+            );
+        } else {
+            eprintln!("reco_load: created range index on {label}.{prop}");
+        }
+    }
+
+    /// Runs a `RETURN count(...)` and returns the scalar.
+    fn count(&mut self, cypher: &str) -> Result<u64, String> {
+        let qr = self
+            .client
+            .run(cypher, vec![], &self.db)
+            .map_err(|e| format!("count query {cypher:?} failed: {e}"))?;
+        let got = qr
+            .first_scalar()
+            .ok_or_else(|| format!("count query {cypher:?} did not return a scalar integer"))?;
+        u64::try_from(got).map_err(|_| format!("count query {cypher:?} returned a negative count {got}"))
+    }
+
+    /// Asserts a count equals `expected`.
+    fn assert_count(&mut self, cypher: &str, what: &str, expected: u64) -> Result<(), String> {
+        let got = self.count(cypher)?;
+        if got != expected {
+            return Err(format!("{what}: expected {expected}, got {got}"));
+        }
+        eprintln!("reco_load: {what} = {got} (ok)");
+        Ok(())
+    }
+
+    /// Asserts a count equals one of two accepted values (version-tolerant, e.g. undirected 2× vs 1×).
+    fn assert_count_either(
+        &mut self,
+        cypher: &str,
+        what: &str,
+        expected_a: u64,
+        expected_b: u64,
+    ) -> Result<(), String> {
+        let got = self.count(cypher)?;
+        if got != expected_a && got != expected_b {
+            return Err(format!(
+                "{what}: expected {expected_a} or {expected_b}, got {got}"
+            ));
+        }
+        eprintln!("reco_load: {what} = {got} (ok)");
+        Ok(())
+    }
+
+    /// Sends `GOODBYE` (best-effort).
+    fn goodbye(&mut self) {
+        let _ = self.client.goodbye();
+    }
+}
+
+/// Reads a CSV file and returns its non-empty data lines (the header row and any blank tail stripped),
+/// each split on `,`. The reco generator never emits a comma/quote/newline inside a field, so a plain
+/// split is exact.
+fn read_data_rows(dir: &Path, name: &str) -> Result<Vec<Vec<String>>, String> {
+    let bytes = read_csv(dir, name)?;
+    let text = String::from_utf8(bytes).map_err(|e| format!("{name} is not UTF-8: {e}"))?;
+    Ok(text
+        .lines()
+        .skip(1) // header
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.split(',').map(str::to_owned).collect())
+        .collect())
+}
+
+/// Parses one integer column of a CSV row, with a file/column-named error.
+fn row_int(cells: &[String], col: usize, name: &str) -> Result<i64, String> {
+    cells
+        .get(col)
+        .ok_or_else(|| format!("{name}: row has no column {col}"))?
+        .trim()
+        .parse::<i64>()
+        .map_err(|e| format!("{name}: column {col} is not an integer: {e}"))
+}
+
+/// Parses one string column of a CSV row, with a file/column-named error.
+fn row_str(cells: &[String], col: usize, name: &str) -> Result<String, String> {
+    cells
+        .get(col)
+        .cloned()
+        .ok_or_else(|| format!("{name}: row has no column {col}"))
+}
+
+/// `users.csv` → `(id, name, country)` (node CSV columns 2, 3, 4).
+fn parse_users(dir: &Path) -> Result<Vec<(String, String, String)>, String> {
+    read_data_rows(dir, "users.csv")?
+        .into_iter()
+        .map(|c| {
+            Ok((
+                row_str(&c, 2, "users.csv")?,
+                row_str(&c, 3, "users.csv")?,
+                row_str(&c, 4, "users.csv")?,
+            ))
+        })
+        .collect()
+}
+
+/// `products.csv` → `(id, name, category, price)` (node CSV columns 2, 3, 4, 5; embedding skipped).
+fn parse_products(dir: &Path) -> Result<Vec<(String, String, String, i64)>, String> {
+    read_data_rows(dir, "products.csv")?
+        .into_iter()
+        .map(|c| {
+            Ok((
+                row_str(&c, 2, "products.csv")?,
+                row_str(&c, 3, "products.csv")?,
+                row_str(&c, 4, "products.csv")?,
+                row_int(&c, 5, "products.csv")?,
+            ))
+        })
+        .collect()
+}
+
+/// `friends.csv` → `(start_id, end_id, since)` (rel CSV columns 0, 1, 3).
+fn parse_friends(dir: &Path) -> Result<Vec<(String, String, i64)>, String> {
+    read_data_rows(dir, "friends.csv")?
+        .into_iter()
+        .map(|c| {
+            Ok((
+                row_str(&c, 0, "friends.csv")?,
+                row_str(&c, 1, "friends.csv")?,
+                row_int(&c, 3, "friends.csv")?,
+            ))
+        })
+        .collect()
+}
+
+/// `purchased.csv` → `(user_id, product_id, ts, qty)` (rel CSV columns 0, 1, 3, 4).
+fn parse_purchased(dir: &Path) -> Result<Vec<(String, String, i64, i64)>, String> {
+    read_data_rows(dir, "purchased.csv")?
+        .into_iter()
+        .map(|c| {
+            Ok((
+                row_str(&c, 0, "purchased.csv")?,
+                row_str(&c, 1, "purchased.csv")?,
+                row_int(&c, 3, "purchased.csv")?,
+                row_int(&c, 4, "purchased.csv")?,
+            ))
+        })
+        .collect()
 }
 
 /// Captures `SHOW INDEXES` / `SHOW CONSTRAINTS` as human-readable evidence (printed between

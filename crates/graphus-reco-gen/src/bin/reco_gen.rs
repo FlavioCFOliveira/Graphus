@@ -35,7 +35,7 @@ fn main() -> ExitCode {
         match arg.as_str() {
             "--profile" => match args.next() {
                 Some(v) => profile = v,
-                None => return fail("--profile requires a value (fast|large|huge)"),
+                None => return fail("--profile requires a value (tiny|fast|large|huge)"),
             },
             "--out-dir" => match args.next() {
                 Some(v) => out_dir = PathBuf::from(v),
@@ -43,7 +43,7 @@ fn main() -> ExitCode {
             },
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: reco_gen --profile <fast|large|huge> --out-dir <dir>\n\
+                    "usage: reco_gen --profile <tiny|fast|large|huge> --out-dir <dir>\n\
                      Writes users.csv, products.csv, friends.csv, purchased.csv (the neo4j-admin\n\
                      import / network bulk-import CSV shape) for the resolved profile, and prints a\n\
                      one-line key=value summary of the realised graph shape to stdout."
@@ -58,7 +58,7 @@ fn main() -> ExitCode {
         Some(c) => c,
         None => {
             return fail(&format!(
-                "unknown profile '{profile}' (expected fast|large|huge)"
+                "unknown profile '{profile}' (expected tiny|fast|large|huge)"
             ));
         }
     };

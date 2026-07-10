@@ -36,6 +36,18 @@ graphus-bolt = { path = "../graphus-bolt" }
 # emits its CPU/RAM/storage/throughput evidence through. A dev-only leaf crate, never in the server.
 graphus-examples-harness = { path = "../graphus-examples-harness" }
 
+# --- Bolt-over-TCP + TLS attach transport (rmp #693) -------------------------------------------------
+# The `reco_bench` / `reco_load` clients reach an ALREADY-RUNNING instance (local or remote, e.g.
+# pi516) over Bolt-over-TCP with TLS. This is the SAME synchronous stack `graphus-cli` uses (rustls
+# 0.23 + the default `aws_lc_rs` provider): both crates are already in the workspace lock (the CLI
+# added them for rmp #688), so reusing them here adds NO new transitive dependency tree. The client is
+# synchronous, so it uses rustls' blocking `ClientConnection` + `StreamOwned` over a `std::net::TcpStream`.
+rustls = "0.23"
+# The Mozilla trust anchors backing `bolt+s://` (verified) TLS. A single pure-data crate (its only
+# dependency, `rustls-pki-types`, is already in the lock), so it adds no runtime/native code.
+# `bolt+ssc://` (self-signed, the pi516 mode) does not consult these roots — it accepts any cert.
+webpki-roots = "1"
+
 # The deterministic generator binary: streams the generated recommendation-graph CSV file set + a
 # summary for a profile. Usage:
 #   cargo run -p graphus-reco-gen --bin reco_gen -- --profile fast --out-dir <dir>

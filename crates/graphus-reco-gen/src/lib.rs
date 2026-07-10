@@ -390,6 +390,28 @@ pub struct GenConfig {
 }
 
 impl GenConfig {
+    /// The **tiny** profile — a small graph for the **external attach** path (`rmp` #693). Sized so the
+    /// whole graph (≈ 300 customers, degree band 3–9 ≈ 900 FRIEND edges, 50 products, ≈ 4
+    /// purchases/user ≈ 1 200 PURCHASED edges, ≈ 2 100 relationships total) loads quickly over Bolt
+    /// `UNWIND` writes even against a small/remote box (e.g. a Raspberry Pi) or an OLDER server whose
+    /// planner does not index-seek on an `UNWIND`-row-valued anchor and falls back to a scan. It still
+    /// has enough friend fan-out for a 3-hop traversal and enough co-purchase density for the
+    /// collaborative-filtering query to return results — enough to exercise the reader-pool-scaling
+    /// ladder. The full-size graph is exercised by the local `fast`/`large` profiles and against a
+    /// current server.
+    #[must_use]
+    pub fn tiny() -> Self {
+        Self {
+            seed: 0x05EC_011E_C710_0001,
+            users: 300,
+            products: 50,
+            friend_min: 3,
+            friend_max: 9,
+            avg_purchases_per_user: 4,
+            popularity_skew: 3,
+        }
+    }
+
     /// The **fast** profile — small, CI-runnable: a couple of thousand customers with a modest friend
     /// fan-out and a small catalogue. Sized so the determinism test **and the bulk-import validity
     /// test** stay quick (a few seconds) under a default `cargo test`, including in the slower debug
@@ -442,11 +464,12 @@ impl GenConfig {
         }
     }
 
-    /// Resolves a profile name (`"fast"` / `"large"` / `"huge"`) to its config, or `None` for an
-    /// unknown name.
+    /// Resolves a profile name (`"tiny"` / `"fast"` / `"large"` / `"huge"`) to its config, or `None`
+    /// for an unknown name.
     #[must_use]
     pub fn profile(name: &str) -> Option<Self> {
         match name {
+            "tiny" => Some(Self::tiny()),
             "fast" => Some(Self::fast()),
             "large" => Some(Self::large()),
             "huge" => Some(Self::huge()),
