@@ -277,9 +277,13 @@ fn resolve_implicit_call_arguments(query: &mut Query, procedures: &dyn Procedure
         return;
     };
     let span = call.call.span;
+    // Only the **required** inputs (no default) become implicit `$param` arguments (`rmp` task #667);
+    // trailing optionals fall to their declared defaults during invocation, exactly as Neo4j resolves
+    // an implicit call of a procedure with optional arguments.
     call.call.args = Some(
         sig.inputs
             .iter()
+            .filter(|input| input.default.is_none())
             .map(|input| Expr::new(ExprKind::Parameter(input.name.clone()), span))
             .collect(),
     );
@@ -336,7 +340,9 @@ pub fn check_implicit_call_parameters(
         return Ok(());
     };
     for input in &sig.inputs {
-        if supplied.get(&input.name).is_none() {
+        // A trailing **optional** input (with a default, `rmp` task #667) needs no supplied parameter
+        // — it falls to its default. Only a required input's missing parameter is a compile error.
+        if input.default.is_none() && supplied.get(&input.name).is_none() {
             return Err(SemanticError::new(
                 SemanticErrorKind::MissingParameter {
                     name: input.name.clone(),
@@ -1288,16 +1294,28 @@ impl Analyzer<'_> {
             self.check_expr(a, scope)?;
             self.reject_aggregation(a, "a procedure CALL argument")?;
         }
-        if args.len() != sig.inputs.len() {
+        // Arity is a *range* `[required_arity, inputs.len()]` (`rmp` task #667): a procedure may
+        // declare trailing optional inputs (each with a default), so a call omitting them is valid.
+        // When every input is required the range collapses to the exact count — byte-identical to the
+        // old strict check for every fixture / built-in procedure with no optional args.
+        let min = sig.required_arity();
+        let max = sig.inputs.len();
+        if args.len() < min || args.len() > max {
             return Err(SemanticError::new(
                 SemanticErrorKind::InvalidNumberOfArguments {
                     name: sig.name.clone(),
-                    expected: sig.inputs.len().to_string(),
+                    expected: if min == max {
+                        max.to_string()
+                    } else {
+                        format!("{min}..{max}")
+                    },
                     got: args.len(),
                 },
                 call.span,
             ));
         }
+        // Only the supplied arguments are type-checked; omitted trailing optionals take their
+        // (already-valid) declared defaults. `zip` truncates to `args.len()`, so this is automatic.
         for (arg, input) in args.iter().zip(&sig.inputs) {
             if literal_violates_type(arg, input.ty) {
                 return Err(SemanticError::new(

@@ -4337,7 +4337,18 @@ fn procedure_signature_string(p: &graphus_cypher::ProcedureListing) -> String {
     let render = |fields: &[graphus_cypher::FieldSpec]| {
         fields
             .iter()
-            .map(|f| format!("{} :: {}", f.name, f.ty))
+            .map(|f| match &f.default {
+                // An optional input renders Neo4j's `name = default :: TYPE` (`rmp` task #667).
+                Some(default) => {
+                    format!(
+                        "{} = {} :: {}",
+                        f.name,
+                        render_default_literal(default),
+                        f.ty
+                    )
+                }
+                None => format!("{} :: {}", f.name, f.ty),
+            })
             .collect::<Vec<_>>()
             .join(", ")
     };
@@ -4347,6 +4358,23 @@ fn procedure_signature_string(p: &graphus_cypher::ProcedureListing) -> String {
         render(&p.inputs),
         render(&p.outputs)
     )
+}
+
+/// Renders a procedure input's default value as a compact Cypher literal for the `SHOW PROCEDURES`
+/// signature string (`rmp` task #667). Only the value kinds that appear as declared defaults are
+/// handled precisely (an integer such as `300`, an empty map `{}`); anything else falls back to a
+/// `?` placeholder rather than a wrong rendering.
+fn render_default_literal(v: &Value) -> String {
+    match v {
+        Value::Null => "null".to_owned(),
+        Value::Boolean(b) => b.to_string(),
+        Value::Integer(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::String(s) => format!("'{s}'"),
+        Value::List(l) if l.is_empty() => "[]".to_owned(),
+        Value::Map(m) if m.is_empty() => "{}".to_owned(),
+        _ => "?".to_owned(),
+    }
 }
 
 /// Builds the `SHOW SETTINGS` result (`rmp` #637) from the effective configuration: `name`,
@@ -4699,6 +4727,55 @@ mod tests {
                 "a gds.*.write procedure must report mode WRITE: {gds_write:?}"
             );
         }
+    }
+
+    #[test]
+    fn show_procedures_lists_new_index_procedures_with_signatures() {
+        // `rmp` task #667: the new index procedures are listed, and the optional-argument default
+        // renders in the signature string (`timeOutSeconds = 300 :: INTEGER`).
+        let r = show_procedures();
+        let row_for = |name: &str| {
+            r.rows
+                .iter()
+                .find(|row| row[0] == Value::String(name.to_owned()))
+                .unwrap_or_else(|| panic!("SHOW PROCEDURES must list `{name}`"))
+                .clone()
+        };
+        // Procedure names are stored canonically lower-cased (case-insensitive lookup), so the listed
+        // `name` column is lower-cased; the argument names keep their casing (`indexName`, …).
+        for name in [
+            "db.awaitindex",
+            "db.index.fulltext.awaiteventuallyconsistentindexrefresh",
+            "db.index.fulltext.listavailableanalyzers",
+        ] {
+            let _ = row_for(name);
+        }
+        // The optional-argument default is rendered Neo4j-style in the signature string.
+        let await_index = row_for("db.awaitindex");
+        let Value::String(sig) = &await_index[2] else {
+            panic!("signature column must be a string");
+        };
+        assert!(
+            sig.contains("timeOutSeconds = 300 :: INTEGER"),
+            "db.awaitIndex signature must render the optional default: {sig}"
+        );
+        assert!(sig.contains("indexName :: STRING"), "signature: {sig}");
+        // listAvailableAnalyzers renders its three output columns.
+        let analyzers = row_for("db.index.fulltext.listavailableanalyzers");
+        let Value::String(asig) = &analyzers[2] else {
+            panic!("signature column must be a string");
+        };
+        assert!(asig.contains("analyzer :: STRING"), "signature: {asig}");
+        assert!(asig.contains("stopwords :: ANY"), "signature: {asig}");
+        // queryNodes renders the optional options MAP default `{}`.
+        let query_nodes = row_for("db.index.fulltext.querynodes");
+        let Value::String(qsig) = &query_nodes[2] else {
+            panic!("signature column must be a string");
+        };
+        assert!(
+            qsig.contains("options = {} :: ANY"),
+            "queryNodes must render the optional options default: {qsig}"
+        );
     }
 
     #[test]

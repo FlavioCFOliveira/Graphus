@@ -169,21 +169,44 @@ impl fmt::Display for FieldType {
 }
 
 /// One named, typed field of a procedure signature (an input parameter or an output column).
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Not `Eq`: a `FieldSpec` may carry a default [`Value`] (`rmp` task #667), which is only `PartialEq`
+// (it can hold an `f64`). `PartialEq` is enough for the tests and admin introspection.
+#[derive(Debug, Clone, PartialEq)]
 #[must_use]
 pub struct FieldSpec {
     /// The field name (an input parameter name, or a `YIELD`-able result column name).
     pub name: String,
     /// The declared type.
     pub ty: FieldType,
+    /// For an **input** field, the default value substituted when the caller omits this (trailing)
+    /// argument — the Neo4j `arg = default :: TYPE` optional-argument form (e.g.
+    /// `db.awaitIndexes(timeOutSeconds = 300 :: INTEGER)`, `rmp` task #667). `None` means the argument
+    /// is **required**. Always `None` for an output column (a result field is never defaulted).
+    ///
+    /// Optional inputs must be **trailing** — every input after the first optional one is also
+    /// optional — matching Neo4j; [`ProcedureSignature::required_arity`] relies on that invariant.
+    pub default: Option<Value>,
 }
 
 impl FieldSpec {
-    /// Builds a field spec.
+    /// Builds a **required** field spec (no default): the form for every output column and every
+    /// mandatory input.
     pub fn new(name: impl Into<String>, ty: FieldType) -> Self {
         Self {
             name: name.into(),
             ty,
+            default: None,
+        }
+    }
+
+    /// Builds an **optional input** field spec whose `default` value is substituted when the caller
+    /// omits the trailing argument (Neo4j's `arg = default :: TYPE`, `rmp` task #667). Optional inputs
+    /// must be trailing.
+    pub fn optional(name: impl Into<String>, ty: FieldType, default: Value) -> Self {
+        Self {
+            name: name.into(),
+            ty,
+            default: Some(default),
         }
     }
 }
@@ -194,7 +217,8 @@ impl FieldSpec {
 /// A procedure with **no outputs** is a *void* procedure: in-query it passes each driving row
 /// through unchanged (it adds no columns), and standalone it produces no client-facing result rows
 /// — the openCypher TCK's `test.doNothing() :: ()` semantics.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Not `Eq`: contains `FieldSpec`s that may carry a default [`Value`] (only `PartialEq`).
+#[derive(Debug, Clone, PartialEq)]
 #[must_use]
 pub struct ProcedureSignature {
     /// The canonical lower-cased dotted name (e.g. `"db.labels"`).
@@ -213,6 +237,20 @@ impl ProcedureSignature {
             inputs,
             outputs,
         }
+    }
+
+    /// The **minimum** number of arguments a caller must supply: the count of leading **required**
+    /// inputs (those with no [`FieldSpec::default`]). Optional inputs are trailing (`rmp` task #667),
+    /// so any argument count in `required_arity()..=inputs.len()` is a valid arity — a shorter call
+    /// has its omitted trailing optionals filled from their declared defaults by
+    /// [`ProcedureSet::invoke`]. When every input is required this equals `inputs.len()` (strict
+    /// arity, unchanged).
+    #[must_use]
+    pub fn required_arity(&self) -> usize {
+        self.inputs
+            .iter()
+            .take_while(|f| f.default.is_none())
+            .count()
     }
 }
 
@@ -331,7 +369,8 @@ struct Procedure {
 /// A read-only snapshot of one registered procedure, for administrative introspection
 /// (`SHOW PROCEDURES`). Carries only the public signature and the reader-safe classification — never
 /// the executable handler.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Not `Eq`: `inputs` may carry default [`Value`]s (only `PartialEq`).
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProcedureListing {
     /// The canonical (lower-cased) dotted name (e.g. `"db.labels"`, `"gds.pageRank.stream"`).
     pub name: String,
@@ -442,6 +481,16 @@ impl ProcedureSet {
                             nullable: false,
                         },
                     ),
+                    // Optional Neo4j `options` MAP (`rmp` task #667): `{skip, limit, analyzer, …}`.
+                    // `skip`/`limit` trim the result; `analyzer` is validated but the index's own
+                    // analyzer governs matching; unknown keys are accepted-and-ignored. There is no
+                    // `MAP` value class in the v1 registry, so it rides as `ANY` (like `dbms.components`
+                    // `versions`), nullable with a `{}` default so the 2-arg form still resolves.
+                    FieldSpec::optional(
+                        "options",
+                        FieldType::nullable(ValueClass::Any),
+                        Value::Map(Vec::new()),
+                    ),
                 ],
                 vec![
                     FieldSpec::new(
@@ -478,6 +527,12 @@ impl ProcedureSet {
                 vec![
                     FieldSpec::new("indexName", FieldType::required(ValueClass::String)),
                     FieldSpec::new("queryString", FieldType::required(ValueClass::String)),
+                    // Optional Neo4j `options` MAP (`rmp` task #667), identical to `queryNodes`.
+                    FieldSpec::optional(
+                        "options",
+                        FieldType::nullable(ValueClass::Any),
+                        Value::Map(Vec::new()),
+                    ),
                 ],
                 vec![
                     FieldSpec::new(
@@ -510,24 +565,80 @@ impl ProcedureSet {
             ),
             Box::new(|_args, _graph| Ok(dbms_components_rows())),
         );
-        // `db.awaitIndexes(timeOutSeconds)` — block until every index is ONLINE, or the timeout elapses
-        // (`rmp` task #639). A **VOID** procedure (no yielded columns). Graphus builds every index
-        // **synchronously** at `CREATE INDEX` time — an index is ONLINE the moment its DDL commits, so
-        // there is never a pending population to await. The body is therefore a genuine no-op that
-        // returns immediately regardless of the timeout, which is the correct behaviour (nothing to wait
-        // for), not a stub. The Neo4j argument name (`timeOutSeconds`, INTEGER, default 300) is kept
-        // verbatim for signature fidelity; the registry's strict arity means the timeout is required
-        // here (v1 has no optional/default-argument support).
+        // `db.awaitIndexes(timeOutSeconds = 300)` — block until every index is ONLINE, or the timeout
+        // elapses (`rmp` tasks #639, #667). A **VOID** procedure (no yielded columns). Graphus builds
+        // every index **synchronously** at `CREATE INDEX` time — an index is ONLINE the moment its DDL
+        // commits, so there is never a pending population to await. The body is therefore a genuine
+        // no-op that returns immediately regardless of the timeout, which is the correct behaviour
+        // (nothing to wait for), not a stub. The Neo4j argument (`timeOutSeconds`, INTEGER, **default
+        // 300**) is now **optional** (`rmp` task #667), so both `CALL db.awaitIndexes()` and
+        // `CALL db.awaitIndexes(60)` are valid, exactly as Neo4j allows.
         set.register_reader_safe(
             ProcedureSignature::new(
                 "db.awaitIndexes",
-                vec![FieldSpec::new(
+                vec![FieldSpec::optional(
                     "timeOutSeconds",
                     FieldType::required(ValueClass::Integer),
+                    Value::Integer(300),
                 )],
                 Vec::new(),
             ),
             Box::new(|_args, _graph| Ok(Vec::new())),
+        );
+        // `db.awaitIndex(indexName, timeOutSeconds = 300)` — the **singular** form: await one named
+        // index (`rmp` task #667). A **VOID** no-op for the same reason as `db.awaitIndexes` (indexes
+        // are ONLINE synchronously), **but** it rejects a genuinely-unknown index name — Neo4j raises on
+        // an index that does not exist. Existence is checked across **every** index kind (node/rel
+        // property, composite, full-text, spatial/point, text) through the [`GraphAccess`] seam's
+        // `index_exists_by_name`, the same name namespace the `DROP INDEX <name>` resolver searches; a
+        // seam without name-catalog visibility answers `None` and the await stays a lenient no-op.
+        // Registered **not** reader-safe (unlike its plural sibling) so it always runs inline over the
+        // store-backed seam, where the durable name catalog is authoritative.
+        set.register(
+            ProcedureSignature::new(
+                "db.awaitIndex",
+                vec![
+                    FieldSpec::new("indexName", FieldType::required(ValueClass::String)),
+                    FieldSpec::optional(
+                        "timeOutSeconds",
+                        FieldType::required(ValueClass::Integer),
+                        Value::Integer(300),
+                    ),
+                ],
+                Vec::new(),
+            ),
+            Box::new(db_await_index),
+        );
+        // `db.index.fulltext.awaitEventuallyConsistentIndexRefresh()` — a **VOID** no-op (`rmp` task
+        // #667). Graphus full-text indexes are **not** eventually-consistent: every index is maintained
+        // synchronously on the committing write, so there is no asynchronous refresh queue to drain.
+        // Registered for driver/tooling compatibility (so `SHOW PROCEDURES` lists it and a `CALL`
+        // type-checks) and completes immediately with no effect.
+        set.register_reader_safe(
+            ProcedureSignature::new(
+                "db.index.fulltext.awaitEventuallyConsistentIndexRefresh",
+                Vec::new(),
+                Vec::new(),
+            ),
+            Box::new(|_args, _graph| Ok(Vec::new())),
+        );
+        // `db.index.fulltext.listAvailableAnalyzers() YIELD analyzer, description, stopwords` — the
+        // full-text analyzers Graphus supports (`rmp` task #667). Graphus ships the `standard` and
+        // `keyword` analyzers ([`graphus_index::fulltext::Analyzer`]); this yields one row each with a
+        // short description and the analyzer's stop-word list (`standard`'s documented English set;
+        // `keyword` has none). `stopwords` is a `LIST<STRING>`, carried as `ANY` (the v1 registry has no
+        // list value class, exactly like `dbms.components` `versions`). A real listing, not a stub.
+        set.register_reader_safe(
+            ProcedureSignature::new(
+                "db.index.fulltext.listAvailableAnalyzers",
+                Vec::new(),
+                vec![
+                    FieldSpec::new("analyzer", FieldType::required(ValueClass::String)),
+                    FieldSpec::new("description", FieldType::required(ValueClass::String)),
+                    FieldSpec::new("stopwords", FieldType::required(ValueClass::Any)),
+                ],
+            ),
+            Box::new(|_args, _graph| Ok(list_available_analyzers_rows())),
         );
         // `db.resampleIndex(indexName)` and `db.resampleOutdatedIndexes()` — schedule a re-sampling of
         // index statistics (`rmp` task #639). Both are **VOID** no-ops in Graphus: the planner's
@@ -699,17 +810,35 @@ impl ProcedureRegistry for ProcedureSet {
                 "procedure is not registered (compile/execute registry mismatch)",
             ));
         };
-        if args.len() != proc.signature.inputs.len() {
+        // Arity is a *range* `[required_arity, inputs.len()]` (`rmp` task #667): trailing optional
+        // inputs may be omitted. When every input is required the range collapses to the exact count,
+        // so this is byte-identical to the old strict check for every existing procedure.
+        let min = proc.signature.required_arity();
+        let max = proc.signature.inputs.len();
+        if args.len() < min || args.len() > max {
             return Err(ProcedureFailure::new(
                 dotted_name,
-                format!(
-                    "expected {} argument(s), got {}",
-                    proc.signature.inputs.len(),
-                    args.len()
-                ),
+                if min == max {
+                    format!("expected {max} argument(s), got {}", args.len())
+                } else {
+                    format!("expected {min}..={max} argument(s), got {}", args.len())
+                },
             ));
         }
-        (proc.handler)(args, graph)
+        if args.len() == max {
+            // Full argument list — no substitution needed (the overwhelmingly common path).
+            (proc.handler)(args, graph)
+        } else {
+            // Substitute the declared defaults for the omitted trailing optionals, so the handler
+            // always sees a full argument list (Neo4j's optional-argument semantics).
+            let mut full: Vec<Value> = args.to_vec();
+            for input in &proc.signature.inputs[args.len()..] {
+                full.push(input.default.clone().expect(
+                    "INVARIANT: an input beyond required_arity() is optional and carries a default",
+                ));
+            }
+            (proc.handler)(&full, graph)
+        }
     }
 
     fn is_reader_safe(&self, dotted_name: &str) -> bool {
@@ -787,6 +916,164 @@ fn dbms_components_rows() -> Vec<Vec<Value>> {
     ]]
 }
 
+/// The `db.awaitIndex(indexName, timeOutSeconds)` body (`rmp` task #667).
+///
+/// A **VOID** no-op — Graphus builds every index synchronously, so a named index is ONLINE the moment
+/// its DDL commits and there is nothing to await — **except** that it rejects a genuinely-unknown index
+/// name, matching Neo4j (which raises on an index that does not exist). Existence is checked across
+/// **every** index kind through [`GraphAccess::index_exists_by_name`], the same name namespace the
+/// `DROP INDEX <name>` resolver searches. The `timeOutSeconds` argument (defaulted to 300 when omitted)
+/// is accepted for signature fidelity and ignored — there is never a pending build to time out on.
+///
+/// # Errors
+/// Returns a [`ProcedureFailure`] if the first argument is not a string, or if the seam reports
+/// authoritatively (`Some(false)`) that no index of that name exists. A seam without name-catalog
+/// visibility (`None`) leaves the await a lenient no-op.
+fn db_await_index(
+    args: &[Value],
+    graph: &mut dyn GraphAccess,
+) -> Result<Vec<Vec<Value>>, ProcedureFailure> {
+    const NAME: &str = "db.awaitIndex";
+    let index_name = match args.first() {
+        Some(Value::String(s)) => s.as_str(),
+        _ => {
+            return Err(ProcedureFailure::new(
+                NAME,
+                "the first argument (indexName) must be a string",
+            ));
+        }
+    };
+    // `Some(false)` = the seam is authoritative and no index of that name exists → error (Neo4j
+    // behaviour). `Some(true)` (exists) and `None` (seam cannot tell) both keep the no-op contract.
+    if graph.index_exists_by_name(index_name) == Some(false) {
+        return Err(ProcedureFailure::new(
+            NAME,
+            format!("there is no index named {index_name:?}"),
+        ));
+    }
+    Ok(Vec::new())
+}
+
+/// The single-column-per-analyzer result of `db.index.fulltext.listAvailableAnalyzers()` (`rmp` task
+/// #667): one row `[analyzer (STRING), description (STRING), stopwords (LIST<STRING> as ANY)]` for each
+/// analyzer Graphus supports ([`graphus_index::fulltext::Analyzer`] — `keyword` and `standard`), sorted
+/// by analyzer name ascending (a deterministic order; Neo4j leaves it unspecified).
+fn list_available_analyzers_rows() -> Vec<Vec<Value>> {
+    let stopwords = |words: &[&str]| {
+        Value::List(
+            words
+                .iter()
+                .map(|w| Value::String((*w).to_owned()))
+                .collect(),
+        )
+    };
+    vec![
+        vec![
+            Value::String("keyword".to_owned()),
+            Value::String(
+                "Keeps the entire input as a single lowercased, NFC-normalized term \
+                 (no tokenization, no stop-word removal)."
+                    .to_owned(),
+            ),
+            stopwords(&[]),
+        ],
+        vec![
+            Value::String("standard".to_owned()),
+            Value::String(
+                "Unicode tokenization with lowercasing and English stop-word removal (NFC-normalized)."
+                    .to_owned(),
+            ),
+            stopwords(graphus_index::fulltext::STANDARD_STOP_WORDS),
+        ],
+    ]
+}
+
+/// The parsed, **honoured** subset of the `db.index.fulltext.query*` options MAP (`rmp` task #667).
+/// Only `skip`/`limit` change results; other Neo4j keys (`analyzer`, `sort`, …) are validated or
+/// accepted-and-ignored (see [`parse_fulltext_options`]).
+struct FulltextQueryOptions {
+    /// Rows to drop from the front of the relevance-ordered result (`skip`, default 0).
+    skip: usize,
+    /// Maximum rows to return (`limit`); `None` = unbounded.
+    limit: Option<usize>,
+}
+
+/// Parses the optional `options` MAP third argument of `db.index.fulltext.queryNodes` /
+/// `queryRelationships` (`rmp` task #667).
+///
+/// **Honoured:** `skip` and `limit` (non-negative integers), applied to the relevance-ordered result.
+/// **Validated but not re-applied:** `analyzer` — the value must name a supported analyzer
+/// ([`graphus_index::fulltext::Analyzer::from_name`]), but the index's own analyzer governs matching
+/// (Graphus does not re-analyze the query with a different analyzer), a documented limitation.
+/// **Accepted-and-ignored:** any other key (e.g. Neo4j's `sort`), so a Neo4j-shaped 3-arg call runs.
+///
+/// A `null` / absent options argument, or an empty map, yields the defaults (no skip, no limit).
+///
+/// # Errors
+/// Returns a [`ProcedureFailure`] if `options` is neither a map nor null, if `skip`/`limit` is not a
+/// non-negative integer, or if `analyzer` is not a string naming a supported analyzer.
+fn parse_fulltext_options(
+    name: &str,
+    arg: Option<&Value>,
+) -> Result<FulltextQueryOptions, ProcedureFailure> {
+    let mut opts = FulltextQueryOptions {
+        skip: 0,
+        limit: None,
+    };
+    let entries = match arg {
+        None | Some(Value::Null) => return Ok(opts),
+        Some(Value::Map(entries)) => entries,
+        Some(_) => {
+            return Err(ProcedureFailure::new(
+                name,
+                "the third argument (options) must be a map",
+            ));
+        }
+    };
+    for (key, value) in entries {
+        match key.as_str() {
+            "skip" => opts.skip = non_negative_usize(name, "skip", value)?,
+            "limit" => opts.limit = Some(non_negative_usize(name, "limit", value)?),
+            "analyzer" => match value {
+                Value::String(s) if graphus_index::fulltext::Analyzer::from_name(s).is_some() => {}
+                Value::String(s) => {
+                    return Err(ProcedureFailure::new(
+                        name,
+                        format!(
+                            "unknown analyzer {s:?}; supported analyzers are 'standard' and 'keyword'"
+                        ),
+                    ));
+                }
+                _ => {
+                    return Err(ProcedureFailure::new(
+                        name,
+                        "the 'analyzer' option must be a string",
+                    ));
+                }
+            },
+            // Neo4j accepts further keys (e.g. `sort`); accept-and-ignore so a Neo4j-shaped call runs.
+            _ => {}
+        }
+    }
+    Ok(opts)
+}
+
+/// Coerces an `options`-map integer (`skip` / `limit`) to a `usize`, rejecting a non-integer or a
+/// negative value with a clear [`ProcedureFailure`] (`rmp` task #667).
+fn non_negative_usize(name: &str, key: &str, value: &Value) -> Result<usize, ProcedureFailure> {
+    match value {
+        Value::Integer(i) if *i >= 0 => Ok(*i as usize),
+        Value::Integer(_) => Err(ProcedureFailure::new(
+            name,
+            format!("the '{key}' option must be a non-negative integer"),
+        )),
+        _ => Err(ProcedureFailure::new(
+            name,
+            format!("the '{key}' option must be an integer"),
+        )),
+    }
+}
+
 /// The `db.index.fulltext.queryRelationships(indexName, queryString)` body (`rmp` task #663).
 ///
 /// The relationship analogue of [`fulltext_query_nodes`]: resolves candidate relationship ids from the
@@ -824,6 +1111,8 @@ fn fulltext_query_relationships(
             ));
         }
     };
+    // Optional Neo4j `options` MAP (`rmp` task #667): `skip`/`limit` trim the result.
+    let options = parse_fulltext_options(NAME, args.get(2))?;
 
     // Candidate ids from the relationship full-text index; `None` means no such index is declared —
     // a node index name given here yields `None` too (it is not a *relationship* full-text index), so a
@@ -851,6 +1140,9 @@ fn fulltext_query_relationships(
 
     Ok(scored
         .into_iter()
+        // Apply the options MAP's `skip`/`limit` AFTER relevance ordering (Neo4j semantics).
+        .skip(options.skip)
+        .take(options.limit.unwrap_or(usize::MAX))
         .map(|(score, id)| {
             // The rel id rides as an Integer; the `relationship` output is `RELATIONSHIP`-classed, so
             // the executor binds it as a structural relationship. The score is a Float (Neo4j-compatible).
@@ -895,6 +1187,8 @@ fn fulltext_query_nodes(
             ));
         }
     };
+    // Optional Neo4j `options` MAP (`rmp` task #667): `skip`/`limit` trim the result.
+    let options = parse_fulltext_options(NAME, args.get(2))?;
 
     // Candidate ids from the index; `None` means no such index is declared (a clear error).
     let Some(candidates) = graph.fulltext_query(index_name, query_string) else {
@@ -921,6 +1215,9 @@ fn fulltext_query_nodes(
 
     Ok(scored
         .into_iter()
+        // Apply the options MAP's `skip`/`limit` AFTER relevance ordering (Neo4j semantics).
+        .skip(options.skip)
+        .take(options.limit.unwrap_or(usize::MAX))
         .map(|(score, id)| {
             // The node id rides as an Integer; the `node` output is `NODE`-classed, so the executor
             // binds it as a structural node. The score is a Float (Neo4j-compatible).
@@ -1114,7 +1411,9 @@ mod tests {
         let sig = set
             .signature("db.index.fulltext.queryNodes")
             .expect("registered");
-        assert_eq!(sig.inputs.len(), 2);
+        // `indexName`, `queryString`, and the optional `options` MAP (`rmp` task #667).
+        assert_eq!(sig.inputs.len(), 3);
+        assert_eq!(sig.required_arity(), 2);
         assert_eq!(sig.outputs.len(), 2);
         assert_eq!(sig.outputs[0].name, "node");
         assert_eq!(sig.outputs[0].ty.class, ValueClass::Node);
@@ -1215,22 +1514,43 @@ mod tests {
 
     #[test]
     fn db_await_indexes_is_a_void_noop() {
-        // `rmp` task #639: a VOID no-op (indexes are ONLINE synchronously, nothing to await). Takes the
-        // required INTEGER timeout and yields no rows.
+        // `rmp` tasks #639/#667: a VOID no-op (indexes are ONLINE synchronously, nothing to await). The
+        // INTEGER timeout is **optional** (default 300), so both `()` and `(n)` are valid.
         let set = ProcedureSet::with_builtins();
         let sig = set.signature("db.awaitIndexes").expect("registered");
         assert_eq!(sig.inputs.len(), 1);
         assert_eq!(sig.inputs[0].name, "timeOutSeconds");
         assert_eq!(sig.inputs[0].ty.class, ValueClass::Integer);
+        assert_eq!(
+            sig.inputs[0].default,
+            Some(Value::Integer(300)),
+            "the timeout defaults to 300"
+        );
+        assert_eq!(sig.required_arity(), 0, "the timeout is optional");
         assert!(sig.outputs.is_empty(), "db.awaitIndexes is VOID");
 
         let mut g = MemGraph::new();
-        let rows = set
-            .invoke("db.awaitIndexes", &[Value::Integer(30)], &mut g)
-            .expect("invoke");
-        assert!(rows.is_empty());
-        // Wrong arity still fails (strict, like every built-in).
-        assert!(set.invoke("db.awaitIndexes", &[], &mut g).is_err());
+        // With an explicit timeout: no-op.
+        assert!(
+            set.invoke("db.awaitIndexes", &[Value::Integer(30)], &mut g)
+                .expect("invoke")
+                .is_empty()
+        );
+        // With no argument (default 300): now valid (`rmp` #667), still a no-op.
+        assert!(
+            set.invoke("db.awaitIndexes", &[], &mut g)
+                .expect("invoke with default timeout")
+                .is_empty()
+        );
+        // Too many arguments still fails (arity ceiling).
+        assert!(
+            set.invoke(
+                "db.awaitIndexes",
+                &[Value::Integer(1), Value::Integer(2)],
+                &mut g,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1278,7 +1598,9 @@ mod tests {
         let sig = set
             .signature("db.index.fulltext.queryRelationships")
             .expect("registered");
-        assert_eq!(sig.inputs.len(), 2);
+        // `indexName`, `queryString`, and the optional `options` MAP (`rmp` task #667).
+        assert_eq!(sig.inputs.len(), 3);
+        assert_eq!(sig.required_arity(), 2);
         let out_names: Vec<&str> = sig.outputs.iter().map(|o| o.name.as_str()).collect();
         assert_eq!(out_names, ["relationship", "score"]);
         assert_eq!(sig.outputs[0].ty.class, ValueClass::Relationship);
@@ -1371,7 +1693,7 @@ mod tests {
 
     #[test]
     fn new_admin_procedures_are_reader_safe() {
-        // The `rmp` #639 admin procedures are read-only / no-op, and `queryRelationships`
+        // The `rmp` #639/#667 admin procedures are read-only / no-op, and `queryRelationships`
         // (`rmp` #663) is a real read served off-thread via the captured catalogue — so all are
         // reader-safe (`SHOW PROCEDURES` mode = READ; off-thread-pool eligible).
         let set = ProcedureSet::with_builtins();
@@ -1381,8 +1703,277 @@ mod tests {
             "db.resampleIndex",
             "db.resampleOutdatedIndexes",
             "db.index.fulltext.queryRelationships",
+            "db.index.fulltext.awaitEventuallyConsistentIndexRefresh",
+            "db.index.fulltext.listAvailableAnalyzers",
         ] {
             assert!(set.is_reader_safe(name), "`{name}` must be reader-safe");
+        }
+        // `db.awaitIndex` (singular) is deliberately **not** reader-safe (`rmp` #667): it needs the
+        // authoritative store-backed name catalog, so it always runs inline.
+        assert!(
+            !set.is_reader_safe("db.awaitIndex"),
+            "db.awaitIndex must run inline (authoritative catalog)"
+        );
+    }
+
+    #[test]
+    fn optional_argument_arity_and_default_substitution() {
+        // `rmp` task #667: the registry supports trailing optional arguments (a `FieldSpec` default).
+        let mut set = ProcedureSet::new();
+        set.register(
+            ProcedureSignature::new(
+                "test.opt",
+                vec![
+                    FieldSpec::new("a", FieldType::required(ValueClass::Integer)),
+                    FieldSpec::optional(
+                        "b",
+                        FieldType::required(ValueClass::Integer),
+                        Value::Integer(99),
+                    ),
+                ],
+                vec![
+                    FieldSpec::new("a", FieldType::required(ValueClass::Integer)),
+                    FieldSpec::new("b", FieldType::required(ValueClass::Integer)),
+                ],
+            ),
+            // Echo the (post-substitution) arguments back so we can observe the default.
+            Box::new(|args, _g| Ok(vec![args.to_vec()])),
+        );
+        let sig = set.signature("test.opt").expect("registered");
+        assert_eq!(sig.required_arity(), 1);
+        assert_eq!(sig.inputs.len(), 2);
+
+        let mut g = MemGraph::new();
+        // Omitting the trailing optional substitutes its default (99).
+        let rows = set
+            .invoke("test.opt", &[Value::Integer(1)], &mut g)
+            .expect("invoke with default");
+        assert_eq!(rows, vec![vec![Value::Integer(1), Value::Integer(99)]]);
+        // Supplying it uses the caller's value.
+        let rows = set
+            .invoke("test.opt", &[Value::Integer(1), Value::Integer(2)], &mut g)
+            .expect("invoke full");
+        assert_eq!(rows, vec![vec![Value::Integer(1), Value::Integer(2)]]);
+        // Below the required floor, and above the ceiling, both fail.
+        assert!(set.invoke("test.opt", &[], &mut g).is_err());
+        assert!(
+            set.invoke(
+                "test.opt",
+                &[Value::Integer(1), Value::Integer(2), Value::Integer(3)],
+                &mut g,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn db_await_index_singular_registered_with_optional_timeout() {
+        // `rmp` task #667: `db.awaitIndex(indexName, timeOutSeconds = 300) :: VOID`.
+        let set = ProcedureSet::with_builtins();
+        let sig = set.signature("db.awaitIndex").expect("registered");
+        assert_eq!(sig.inputs.len(), 2);
+        assert_eq!(sig.inputs[0].name, "indexName");
+        assert_eq!(sig.inputs[0].ty.class, ValueClass::String);
+        assert_eq!(sig.inputs[1].name, "timeOutSeconds");
+        assert_eq!(sig.inputs[1].default, Some(Value::Integer(300)));
+        assert_eq!(sig.required_arity(), 1, "only indexName is required");
+        assert!(sig.outputs.is_empty(), "db.awaitIndex is VOID");
+        // Case-insensitive, like every built-in.
+        assert!(set.signature("DB.AwaitIndex").is_some());
+    }
+
+    #[test]
+    fn db_await_index_noops_on_known_index_and_errors_on_unknown() {
+        // `rmp` task #667: a no-op for a real index, an error for a nonexistent one (Neo4j behaviour),
+        // exercised over the reference `MemGraph` (authoritative for its full-text index names).
+        let mut g = MemGraph::new();
+        let _ = g.add_node(["Doc"], [("t", Value::String("graph".into()))]);
+        g.create_fulltext_index(
+            "doc_ft",
+            "Doc",
+            ["t"],
+            graphus_index::fulltext::Analyzer::Standard,
+        );
+        let set = ProcedureSet::with_builtins();
+
+        // Known index → no-op success (both with and without the optional timeout).
+        assert!(
+            set.invoke("db.awaitIndex", &[Value::String("doc_ft".into())], &mut g)
+                .expect("known index, default timeout")
+                .is_empty()
+        );
+        assert!(
+            set.invoke(
+                "db.awaitIndex",
+                &[Value::String("doc_ft".into()), Value::Integer(60)],
+                &mut g,
+            )
+            .expect("known index, explicit timeout")
+            .is_empty()
+        );
+        // Unknown index → error.
+        let err = set
+            .invoke("db.awaitIndex", &[Value::String("nope".into())], &mut g)
+            .expect_err("unknown index must error");
+        assert!(format!("{err}").contains("nope"));
+        // Non-string first argument → error.
+        assert!(
+            set.invoke("db.awaitIndex", &[Value::Integer(1)], &mut g)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn await_eventually_consistent_refresh_is_a_void_noop() {
+        // `rmp` task #667: a nullary VOID no-op (Graphus full-text is synchronous, not eventually
+        // consistent).
+        let set = ProcedureSet::with_builtins();
+        let sig = set
+            .signature("db.index.fulltext.awaitEventuallyConsistentIndexRefresh")
+            .expect("registered");
+        assert!(sig.inputs.is_empty());
+        assert!(sig.outputs.is_empty(), "VOID");
+        let mut g = MemGraph::new();
+        assert!(
+            set.invoke(
+                "db.index.fulltext.awaitEventuallyConsistentIndexRefresh",
+                &[],
+                &mut g,
+            )
+            .expect("invoke")
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn list_available_analyzers_yields_standard_and_keyword() {
+        // `rmp` task #667: one row per supported analyzer with (analyzer, description, stopwords).
+        let set = ProcedureSet::with_builtins();
+        let sig = set
+            .signature("db.index.fulltext.listAvailableAnalyzers")
+            .expect("registered");
+        assert!(sig.inputs.is_empty());
+        let out_names: Vec<&str> = sig.outputs.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(out_names, ["analyzer", "description", "stopwords"]);
+
+        let mut g = MemGraph::new();
+        let rows = set
+            .invoke("db.index.fulltext.listAvailableAnalyzers", &[], &mut g)
+            .expect("invoke");
+        // Two analyzers, name-sorted ascending: keyword then standard.
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], Value::String("keyword".into()));
+        assert_eq!(rows[1][0], Value::String("standard".into()));
+        // keyword has no stop-words; standard carries the documented English set.
+        assert_eq!(rows[0][2], Value::List(Vec::new()));
+        let Value::List(standard_stops) = &rows[1][2] else {
+            panic!("standard stopwords must be a LIST");
+        };
+        assert!(!standard_stops.is_empty());
+        assert!(standard_stops.contains(&Value::String("the".into())));
+    }
+
+    #[test]
+    fn query_nodes_options_map_trims_with_skip_and_limit() {
+        // `rmp` task #667: the optional 3-arg options MAP `{skip, limit}` trims the relevance-ordered
+        // result. Three docs match "graph" with distinct scores → deterministic order a, b, c.
+        use graphus_index::fulltext::Analyzer;
+        let mut g = MemGraph::new();
+        let a = g.add_node(["Doc"], [("t", Value::String("graph graph graph".into()))]);
+        let b = g.add_node(["Doc"], [("t", Value::String("graph graph".into()))]);
+        let c = g.add_node(["Doc"], [("t", Value::String("graph".into()))]);
+        g.create_fulltext_index("ix", "Doc", ["t"], Analyzer::Standard);
+        let set = ProcedureSet::with_builtins();
+
+        // Baseline (2-arg, no options): all three, ordered by score then id.
+        let all = set
+            .invoke(
+                "db.index.fulltext.queryNodes",
+                &[Value::String("ix".into()), Value::String("graph".into())],
+                &mut g,
+            )
+            .expect("2-arg");
+        let ids: Vec<i64> = all
+            .iter()
+            .map(|r| match r[0] {
+                Value::Integer(i) => i,
+                _ => panic!("node id must be an Integer"),
+            })
+            .collect();
+        assert_eq!(ids, vec![a.0 as i64, b.0 as i64, c.0 as i64]);
+
+        // 3-arg with skip:1, limit:1 → just the second (b).
+        let opts = Value::Map(vec![
+            ("skip".to_owned(), Value::Integer(1)),
+            ("limit".to_owned(), Value::Integer(1)),
+        ]);
+        let trimmed = set
+            .invoke(
+                "db.index.fulltext.queryNodes",
+                &[
+                    Value::String("ix".into()),
+                    Value::String("graph".into()),
+                    opts,
+                ],
+                &mut g,
+            )
+            .expect("3-arg options");
+        assert_eq!(trimmed.len(), 1);
+        assert_eq!(trimmed[0][0], Value::Integer(b.0 as i64));
+
+        // A recognized analyzer override and an unknown key are accepted (shape works).
+        let opts2 = Value::Map(vec![
+            ("analyzer".to_owned(), Value::String("standard".into())),
+            ("sort".to_owned(), Value::String("ignored".into())),
+        ]);
+        assert!(
+            set.invoke(
+                "db.index.fulltext.queryNodes",
+                &[
+                    Value::String("ix".into()),
+                    Value::String("graph".into()),
+                    opts2,
+                ],
+                &mut g,
+            )
+            .is_ok()
+        );
+        // A bogus analyzer name is rejected.
+        let bad = Value::Map(vec![(
+            "analyzer".to_owned(),
+            Value::String("nonsense".into()),
+        )]);
+        assert!(
+            set.invoke(
+                "db.index.fulltext.queryNodes",
+                &[
+                    Value::String("ix".into()),
+                    Value::String("graph".into()),
+                    bad,
+                ],
+                &mut g,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn query_nodes_and_relationships_declare_optional_options_map() {
+        // `rmp` task #667: the options MAP is a trailing optional 3rd input on both query procedures.
+        let set = ProcedureSet::with_builtins();
+        for name in [
+            "db.index.fulltext.queryNodes",
+            "db.index.fulltext.queryRelationships",
+        ] {
+            let sig = set.signature(name).expect("registered");
+            assert_eq!(sig.inputs.len(), 3, "{name} gains an options input");
+            assert_eq!(sig.inputs[2].name, "options");
+            assert_eq!(
+                sig.required_arity(),
+                2,
+                "{name}: options is optional (2-arg form stays valid)"
+            );
+            assert_eq!(sig.inputs[2].default, Some(Value::Map(Vec::new())));
         }
     }
 

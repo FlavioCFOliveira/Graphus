@@ -473,6 +473,26 @@ pub trait GraphAccess {
         None
     }
 
+    /// Whether an index named `name` exists in the schema, across **every** index kind — node /
+    /// relationship property, composite, full-text, spatial (point) and text (trigram) — the same
+    /// name namespace the `DROP INDEX <name>` resolver searches (`rmp` task #667). Used by
+    /// `db.awaitIndex(indexName, …)` to reject a typo'd / nonexistent index name (Neo4j behaviour)
+    /// while staying a genuine no-op for a real index (Graphus builds every index synchronously, so it
+    /// is ONLINE the moment its DDL commits — there is never a pending population to await).
+    ///
+    /// Returns:
+    /// - `Some(true)` — an index of that name exists;
+    /// - `Some(false)` — authoritatively, no index of that name exists (the caller raises an error);
+    /// - `None` — this seam has no name-catalog visibility and cannot tell; the caller then treats the
+    ///   await as a lenient no-op rather than erroring.
+    ///
+    /// The default returns `None`. The store-backed [`RecordStoreGraph`](crate::record_graph) answers
+    /// authoritatively from the durable index catalog; [`MemGraph`] answers from its declared full-text
+    /// indexes (enough for the procedure tests).
+    fn index_exists_by_name(&self, _name: &str) -> Option<bool> {
+        None
+    }
+
     /// The **snapshot-correct full-text scan fallback** for a stale reader (`rmp` task #467): an
     /// internal seam helper. The default is a no-op (`Vec::new()`); the store-backed
     /// [`RecordStoreGraph`](crate::record_graph) overrides it to compute the matching node set directly
@@ -1160,6 +1180,15 @@ impl GraphAccess for MemGraph {
             }
         }
         Some(score)
+    }
+
+    fn index_exists_by_name(&self, name: &str) -> Option<bool> {
+        // The reference backend tracks only name-keyed full-text indexes (node + relationship); its
+        // property/spatial/text indexes are keyed by `(label, property)`, not by name. That is enough
+        // for the `db.awaitIndex` procedure tests (a known full-text name is a no-op; an unknown name
+        // errors). `Some(_)` — never `None` — because MemGraph *is* authoritative for the names it can
+        // hold.
+        Some(self.fulltext.contains_key(name) || self.fulltext_rel.contains_key(name))
     }
 
     fn index_seek_spatial(

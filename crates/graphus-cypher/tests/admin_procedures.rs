@@ -176,6 +176,112 @@ fn fulltext_query_relationships_unknown_index_is_a_clear_error() {
     );
 }
 
+#[test]
+fn await_indexes_default_and_await_index_singular_end_to_end() {
+    // `rmp` task #667: `db.awaitIndexes()` (no arg, default timeout) and the singular
+    // `db.awaitIndex(name)` both run through the whole pipeline as VOID no-ops. `db.awaitIndex`
+    // additionally errors on an index that does not exist.
+    let mut g = MemGraph::new();
+    let _ = g.add_node(["Doc"], [("t", s("graph databases"))]);
+    g.create_fulltext_index("doc_ft", "Doc", ["t"], graphus_cypher::Analyzer::Standard);
+
+    // db.awaitIndexes() with no argument (default 300): one seed row, zero columns.
+    let rows = run("CALL db.awaitIndexes()", &mut g);
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].is_empty(), "db.awaitIndexes() is VOID");
+
+    // db.awaitIndex on a real index: VOID no-op, both with and without the optional timeout.
+    for src in [
+        "CALL db.awaitIndex('doc_ft')",
+        "CALL db.awaitIndex('doc_ft', 5)",
+    ] {
+        let rows = run(src, &mut g);
+        assert_eq!(rows.len(), 1, "`{src}` preserves the seed row");
+        assert!(rows[0].is_empty(), "`{src}` is VOID");
+    }
+
+    // db.awaitIndex on a nonexistent index: a clear error naming the index.
+    let err = run_expect_err("CALL db.awaitIndex('missing')", &mut g);
+    assert!(
+        err.contains("missing") && err.contains("index"),
+        "error should name the missing index, got: {err}"
+    );
+}
+
+#[test]
+fn list_available_analyzers_and_await_refresh_end_to_end() {
+    // `rmp` task #667: `listAvailableAnalyzers` yields one row per supported analyzer, and
+    // `awaitEventuallyConsistentIndexRefresh` is a VOID no-op — both through the full pipeline.
+    let mut g = MemGraph::new();
+    let rows = run(
+        "CALL db.index.fulltext.listAvailableAnalyzers() YIELD analyzer, description, stopwords \
+         RETURN analyzer, stopwords ORDER BY analyzer",
+        &mut g,
+    );
+    assert_eq!(rows.len(), 2, "keyword + standard");
+    // Name-sorted: keyword then standard.
+    match &rows[0][0] {
+        MaterializedValue::Value(Value::String(a)) => assert_eq!(a, "keyword"),
+        other => panic!("expected analyzer String, got {other:?}"),
+    }
+    match &rows[1][0] {
+        MaterializedValue::Value(Value::String(a)) => assert_eq!(a, "standard"),
+        other => panic!("expected analyzer String, got {other:?}"),
+    }
+    // The stopwords column egresses as a materialized LIST; standard is non-empty, keyword empty.
+    match &rows[0][1] {
+        MaterializedValue::Value(Value::List(items)) => assert!(items.is_empty()),
+        other => panic!("expected keyword stopwords List, got {other:?}"),
+    }
+    match &rows[1][1] {
+        MaterializedValue::Value(Value::List(items)) => {
+            assert!(items.contains(&Value::String("the".into())));
+        }
+        other => panic!("expected standard stopwords List, got {other:?}"),
+    }
+
+    // The eventually-consistent refresh no-op preserves the seed row and yields no columns.
+    let rows = run(
+        "CALL db.index.fulltext.awaitEventuallyConsistentIndexRefresh()",
+        &mut g,
+    );
+    assert_eq!(rows.len(), 1);
+    assert!(
+        rows[0].is_empty(),
+        "awaitEventuallyConsistentIndexRefresh is VOID"
+    );
+}
+
+#[test]
+fn query_nodes_options_map_paginates_end_to_end() {
+    // `rmp` task #667: the optional 3-arg options MAP `{skip, limit}` trims the relevance-ordered
+    // full-text result through the whole pipeline (parse of a 3-arg CALL with a map literal included).
+    let mut g = MemGraph::new();
+    let _a = g.add_node(["Doc"], [("t", s("graph graph graph"))]);
+    let b = g.add_node(["Doc"], [("t", s("graph graph"))]);
+    let _c = g.add_node(["Doc"], [("t", s("graph"))]);
+    g.create_fulltext_index("ix", "Doc", ["t"], graphus_cypher::Analyzer::Standard);
+
+    // skip 1, limit 1 → exactly the second-ranked node (b).
+    let rows = run(
+        "CALL db.index.fulltext.queryNodes('ix', 'graph', {skip: 1, limit: 1}) YIELD node, score \
+         RETURN node",
+        &mut g,
+    );
+    assert_eq!(rows.len(), 1);
+    match &rows[0][0] {
+        MaterializedValue::Node(node) => assert_eq!(node.id, b.0),
+        other => panic!("expected a structural node, got {other:?}"),
+    }
+
+    // The 2-arg form still works (options optional): all three nodes.
+    let all = run(
+        "CALL db.index.fulltext.queryNodes('ix', 'graph') YIELD node RETURN node",
+        &mut g,
+    );
+    assert_eq!(all.len(), 3, "2-arg form remains valid");
+}
+
 fn s(v: &str) -> Value {
     Value::String(v.to_owned())
 }

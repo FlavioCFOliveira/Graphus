@@ -3248,6 +3248,24 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         )
     }
 
+    fn index_exists_by_name(&self, name: &str) -> Option<bool> {
+        // Authoritative cross-kind existence over the **durable** index-name catalog (`rmp` task
+        // #667), the same name namespace the coordinator's `drop_*_by_name` resolvers search. Names are
+        // globally unique across catalogs, so at most one kind holds any given name. A pure metadata
+        // read of the schema — no MVCC snapshot, no entity visibility, no SIREAD marker (an index name
+        // is not row data). `Some(_)` always: the store catalog *is* authoritative.
+        let store = self.store.borrow();
+        Some(
+            store.node_property_index_name(name).is_some()
+                || store.rel_property_index_name(name).is_some()
+                || store.composite_index(name).is_some()
+                || store.rel_composite_index(name).is_some()
+                || store.fulltext_index(name).is_some()
+                || store.spatial_index(name).is_some()
+                || store.text_index(name).is_some(),
+        )
+    }
+
     fn node_labels(&self, node: NodeId) -> Option<Vec<String>> {
         // The shared lifted body (`rmp` task #336): existence check, then the node's label names
         // mapped + name-sorted; an overflow-form bitmap is captured and reported as `Some(vec![])`

@@ -586,16 +586,29 @@ Call procedures with `CALL … [YIELD …]`.
 | Procedure | Purpose |
 | --------- | ------- |
 | `dbms.components()` | product name, version list, and edition (`Graphus`, `["0.0.x"]`, `community`) |
-| `db.awaitIndexes(timeoutSeconds)` | block until every index is `online` or the timeout elapses — the timeout argument is **required** |
-| `db.resampleIndex(indexName)` | schedule a re-sampling of one index's statistics |
+| `db.awaitIndexes(timeOutSeconds = 300)` | block until every index is `online` or the timeout elapses — the timeout is **optional** (defaults to 300) |
+| `db.awaitIndex(indexName, timeOutSeconds = 300)` | await one named index; a no-op for a real index, an **error** if no index of that name exists |
+| `db.resampleIndex(indexName)`, `db.resampleOutdatedIndexes()` | schedule a re-sampling of index statistics (no-op; statistics are maintained automatically) |
+| `db.index.fulltext.queryNodes(indexName, queryString [, options])` | full-text node search; optional `options` map honours `skip` / `limit` |
+| `db.index.fulltext.queryRelationships(indexName, queryString [, options])` | full-text relationship search; same optional `options` map |
+| `db.index.fulltext.listAvailableAnalyzers()` | list the supported full-text analyzers (`standard`, `keyword`) with their stop-words |
+| `db.index.fulltext.awaitEventuallyConsistentIndexRefresh()` | no-op (Graphus full-text is maintained synchronously, not eventually-consistent) |
 | `db.labels()`, `db.propertyKeys()`, `db.relationshipTypes()` | catalogue introspection |
 
 ```cypher
 CALL dbms.components() YIELD name, versions, edition RETURN name, versions, edition
 -- 'Graphus' | ['0.0.9'] | 'community'
 
-CALL db.awaitIndexes(300)          -- block up to 300 s for pending builds
+CALL db.awaitIndexes()             -- block up to the default 300 s for pending builds
+CALL db.awaitIndexes(60)           -- ... or an explicit timeout
+CALL db.awaitIndex('ix_age')       -- await a single named index (errors if it does not exist)
 CALL db.resampleIndex('ix_age')
+
+CALL db.index.fulltext.listAvailableAnalyzers() YIELD analyzer, description, stopwords
+
+-- Paginate a full-text search with the options map (skip/limit apply after relevance ordering):
+CALL db.index.fulltext.queryNodes('posts', 'graph databases', {skip: 10, limit: 5})
+  YIELD node, score RETURN node, score
 ```
 
 ### Graph Data Science (GDS) execution modes

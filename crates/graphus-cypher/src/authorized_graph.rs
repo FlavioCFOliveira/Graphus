@@ -774,6 +774,13 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         self.inner.fulltext_score_rel(name, rel, search)
     }
 
+    fn index_exists_by_name(&self, name: &str) -> Option<bool> {
+        // Schema metadata, not row data (`rmp` task #667): an index name's existence carries no
+        // entity-level information to filter, so it delegates to the inner seam verbatim regardless of
+        // RBAC restriction — exactly as the unrestricted fast path would.
+        self.inner.index_exists_by_name(name)
+    }
+
     // ---- writes ----------------------------------------------------------------------------------
 
     fn create_node(&mut self, labels: &[String], properties: &[(String, Value)]) -> NodeId {
