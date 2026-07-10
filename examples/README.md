@@ -89,14 +89,21 @@ end, writes an evidence directory, and (given a baseline path) diffs against it.
 <a name="evidence-schema"></a>
 ## Evidence schema (`report.json`)
 
-Every example emits `report.json` against this **stable, versioned schema** (`SCHEMA_VERSION = 1`).
+Every example emits `report.json` against this **stable, versioned schema** (`SCHEMA_VERSION = 2`).
 Field names are fixed snake_case so external tooling and the baseline-diff helper can rely on them.
-Reports deserialize leniently (each section added after v1 carries `#[serde(default)]`), so an
-older-but-compatible report still loads.
+Reports deserialize leniently (each field added after v1 carries `#[serde(default)]`), so an
+older-but-compatible report still loads — a v1 `report.json` deserializes against the v2 schema, with
+`measurement_mode` defaulting to `"local"` and `server_metrics` absent.
+
+Schema history:
+
+- **v1** — metadata, host, CPU, memory, storage, throughput.
+- **v2** (`rmp #684`) — adds the top-level `measurement_mode` (`"local"` / `"external"`) and the
+  optional `server_metrics` section scraped from the server's Prometheus `/metrics` endpoint.
 
 ```jsonc
 {
-  "version": 1,                       // schema version (integer, bump-aware)
+  "version": 2,                       // schema version (integer, bump-aware)
   "metadata": {
     "scenario": "fraud-oltp",         // STABLE scenario key (the baseline-diff join key)
     "description": "…",
@@ -144,11 +151,40 @@ older-but-compatible report still loads.
     "ops_per_sec": 200000.0,
     "p50_latency_ms": 0.004,
     "p99_latency_ms": 0.012,
-    "p999_latency_ms": 0.031
+    "p999_latency_ms": 0.031,
+    "abort_rate": 0.0                  // fraction of write txns lost to conflict (0.0 = N/A)
+  },
+  "measurement_mode": "local",        // v2: "local" (this host) | "external" (remote /metrics only)
+  "server_metrics": {                 // v2: server-side /metrics deltas over the workload window
+    "database": "graphus",            // db the db-scoped deltas are attributed to (null = aggregate)
+    "transactions_committed": 190,    // committed_total delta
+    "transactions_aborted": 5,        // aborted_total delta
+    "abort_rate": 0.0256,             // aborted / (committed + aborted)
+    "slow_queries": 0,                // slow_queries_total delta
+    "statement_panics": 0,            // statement_panics_total delta — MUST be 0 on a healthy server
+    "engine_recovery_panics": 0,      // engine_recovery_panics_total delta — MUST be 0
+    "engine_force_detached": 0,       // engine_force_detached_total delta — MUST be 0
+    "engine_force_detached_active": 0,// force_detached_active gauge (after) — MUST be 0
+    "ssi_tracked_before": 12,         // ssi_tracked_transactions gauge before the workload
+    "ssi_tracked_after": 190,         // …and after (residual can signal a GC-watermark pin)
+    "query_count": 46,                // query_duration_seconds _count delta
+    "query_duration_mean_ms": 0.488,  // _sum delta / _count delta, in ms
+    "query_duration_p50_ms": 0.30,    // approx p50 from bucket deltas (histogram_quantile), ms
+    "query_duration_p99_ms": 2.10,    // approx p99 from bucket deltas, ms
+    "scope_note": ""                  // set when no per-db series existed and figures are aggregate
   },
   "notes": [ "…" ]                    // free-form observations / proxy caveats
 }
 ```
+
+`measurement_mode` distinguishes a **local** run (the example boots the server on this host and can
+read `/proc`, `getrusage`, and the store/WAL files directly) from an **external** run (the example
+targets a *remote* instance where those are inaccessible, so its only server-side evidence is the
+Prometheus `/metrics` endpoint). `server_metrics` is present whenever the example scraped `/metrics`
+before and after its workload; it is **omitted** (not `null`) when not collected. The db-scoped
+figures are attributed to a target `database` when Graphus exposes the per-database `graphus_db_*`
+series (`rmp #463`); otherwise they fall back to the server-wide aggregate and `scope_note` records
+the fallback. The panic/force-detach counters and the SSI gauge are always server-global.
 
 `report.md` is the human-readable rendering of the same data: a header (scenario, dataset, host,
 toolchain) followed by one table per vector (CPU / memory / storage+amplification /

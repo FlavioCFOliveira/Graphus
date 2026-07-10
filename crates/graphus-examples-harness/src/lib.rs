@@ -29,6 +29,12 @@
 //! | [`MemorySection`]   | peak / final RSS bytes |
 //! | [`StorageSection`]  | store / WAL bytes + pages, bytes fsynced, write-amp, space-amp |
 //! | [`ThroughputSection`] | operations, ops/sec, p50 / p99 / p999 latency (ms) |
+//! | [`ServerMetricsSection`] | server-side `/metrics` deltas: committed/aborted txns, abort rate, slow queries, panic/force-detach counters, SSI gauge, query-duration histogram |
+//!
+//! Every report also carries a top-level [`EvidenceReport::measurement_mode`]
+//! ([`MeasurementMode`]) recording whether the evidence was collected against a **local** server
+//! (this host, with `/proc` + store-file access) or an **external** one (a remote instance, where
+//! only the `/metrics` endpoint is reachable).
 //!
 //! ## Baseline-diff regression detection
 //!
@@ -80,6 +86,7 @@ pub mod diff;
 pub mod host;
 pub mod metrics;
 pub mod resource;
+pub mod scrape;
 
 pub use diff::{ComparisonReport, MetricDelta, RegressionThresholds};
 pub use host::HostInfo;
@@ -88,6 +95,7 @@ pub use resource::{
     CpuMeter, CpuTimes, ResourceMeter, RssSample, RssSampler, Target, cumulative_cpu_times,
     current_rss_bytes,
 };
+pub use scrape::{Bucket, Histogram, MetricsSnapshot};
 
 /// Current evidence-schema version.
 ///
@@ -95,7 +103,13 @@ pub use resource::{
 /// It is serialized as the top-level `version` field of every `report.json`, so external tooling and
 /// the baseline-diff helper can detect format drift. Reports are deserialized leniently (every added
 /// section defaults via `#[serde(default)]`), so an *older-but-compatible* report still loads.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// - `1` — the original scaffold: metadata, host, CPU, memory, storage, throughput.
+/// - `2` — adds the top-level [`measurement_mode`](EvidenceReport::measurement_mode)
+///   ([`MeasurementMode`]) and the optional server-side [`ServerMetricsSection`]
+///   ([`server_metrics`](EvidenceReport::server_metrics)) scraped from `/metrics` (`rmp #684`). Both
+///   are additive `#[serde(default)]` fields, so a v1 `report.json` still deserializes.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// The size of the dataset an example exercised.
 ///
@@ -262,6 +276,253 @@ pub struct ThroughputSection {
     pub abort_rate: f64,
 }
 
+/// Where a run's evidence was collected from — the top-level `measurement_mode` (`rmp #684`).
+///
+/// A **local** run boots (or shares a host with) the `graphus-server` it measures, so it can read
+/// `/proc`, `getrusage`, and the on-disk store/WAL directly (the [`resource`]/[`metrics`] meters).
+/// An **external** run targets a *remote* instance where those are inaccessible: its only server-side
+/// evidence is the Prometheus `/metrics` endpoint, captured into the [`ServerMetricsSection`].
+///
+/// Serialized lowercase (`"local"` / `"external"`). Defaults to [`Local`](Self::Local) so a v1
+/// report — which predates the field — deserializes to the historically-correct mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MeasurementMode {
+    /// The server was measured on this host (full `/proc` + store-file access).
+    #[default]
+    Local,
+    /// The server was measured over the network via `/metrics` only (no `/proc` / store access).
+    External,
+}
+
+/// Server-side evidence scraped from the Prometheus `/metrics` endpoint, as **before → after**
+/// deltas over the example's workload window (`rmp #684`).
+///
+/// This is the evidence the reliability/perf audits flagged as the single biggest gap: it is visible
+/// **both** for a local server and for a remote instance where `/proc` and the store files cannot be
+/// read. The db-scoped figures (committed/aborted/slow/query-duration) are attributed to a target
+/// [`database`](Self::database) when Graphus exposes the per-database `graphus_db_*` family
+/// (`rmp #463`); otherwise they fall back to the server-wide aggregate and [`scope_note`](Self::scope_note)
+/// records the fallback. The process-wide reliability signals (panic/force-detach counters, the SSI
+/// gauge) are always server-global.
+///
+/// Build it from two [`MetricsSnapshot`]s with [`from_snapshots`](Self::from_snapshots).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ServerMetricsSection {
+    /// The database the db-scoped deltas are attributed to, or `None` when no per-database series
+    /// existed and the figures are a server-wide aggregate (see [`scope_note`](Self::scope_note)).
+    #[serde(default)]
+    pub database: Option<String>,
+    /// Transactions committed during the window (`transactions_committed_total` delta).
+    #[serde(default)]
+    pub transactions_committed: u64,
+    /// Transactions aborted / rolled back during the window (`transactions_aborted_total` delta).
+    #[serde(default)]
+    pub transactions_aborted: u64,
+    /// Abort / conflict rate over the window: `aborted / (committed + aborted)`, or `0.0` when the
+    /// window committed and aborted nothing.
+    #[serde(default)]
+    pub abort_rate: f64,
+    /// Queries exceeding the slow-query threshold during the window (`slow_queries_total` delta).
+    #[serde(default)]
+    pub slow_queries: u64,
+    /// Statements caught panicking at the engine boundary during the window
+    /// (`statement_panics_total` delta). On a healthy server this MUST be `0`.
+    #[serde(default)]
+    pub statement_panics: u64,
+    /// Statement-recovery double-panics during the window (`engine_recovery_panics_total` delta).
+    /// MUST be `0`.
+    #[serde(default)]
+    pub engine_recovery_panics: u64,
+    /// Wedged engines force-detached during the window (`engine_force_detached_total` delta). MUST
+    /// be `0`.
+    #[serde(default)]
+    pub engine_force_detached: u64,
+    /// Force-detached zombies still believed to hold their store-open lock at the end of the run
+    /// (`engine_force_detached_active` gauge). MUST be `0`.
+    #[serde(default)]
+    pub engine_force_detached_active: u64,
+    /// Retained SSI conflict records **before** the workload (`ssi_tracked_transactions` gauge).
+    #[serde(default)]
+    pub ssi_tracked_before: u64,
+    /// Retained SSI conflict records **after** the workload. A large residual after a quiescent
+    /// window can signal a long-lived reader pinning the GC watermark (`rmp #591`).
+    #[serde(default)]
+    pub ssi_tracked_after: u64,
+    /// Queries recorded in the query-duration histogram during the window (`_count` delta).
+    #[serde(default)]
+    pub query_count: u64,
+    /// Mean query duration over the window, in **milliseconds** (`_sum` delta / `_count` delta).
+    #[serde(default)]
+    pub query_duration_mean_ms: f64,
+    /// Approximate p50 query duration over the window, in **milliseconds**, from the histogram bucket
+    /// deltas (Prometheus `histogram_quantile` interpolation).
+    #[serde(default)]
+    pub query_duration_p50_ms: f64,
+    /// Approximate p99 query duration over the window, in **milliseconds**, from the histogram bucket
+    /// deltas.
+    #[serde(default)]
+    pub query_duration_p99_ms: f64,
+    /// A caveat recording any scope fallback (e.g. that no per-database series existed for the
+    /// requested database, so the db-scoped figures are a server-wide aggregate). Empty when the
+    /// per-database series were used directly.
+    #[serde(default)]
+    pub scope_note: String,
+}
+
+impl ServerMetricsSection {
+    // -- Global series names ---------------------------------------------------------------------
+    const COMMITTED: &'static str = "graphus_transactions_committed_total";
+    const ABORTED: &'static str = "graphus_transactions_aborted_total";
+    const SLOW: &'static str = "graphus_slow_queries_total";
+    const QUERY_DURATION: &'static str = "graphus_query_duration_seconds";
+    const STATEMENT_PANICS: &'static str = "graphus_statement_panics_total";
+    const RECOVERY_PANICS: &'static str = "graphus_engine_recovery_panics_total";
+    const FORCE_DETACHED: &'static str = "graphus_engine_force_detached_total";
+    const FORCE_DETACHED_ACTIVE: &'static str = "graphus_engine_force_detached_active";
+    const SSI_TRACKED: &'static str = "graphus_ssi_tracked_transactions";
+    // -- Per-database series names ---------------------------------------------------------------
+    const DB_COMMITTED: &'static str = "graphus_db_transactions_committed_total";
+    const DB_ABORTED: &'static str = "graphus_db_transactions_aborted_total";
+    const DB_SLOW: &'static str = "graphus_db_slow_queries_total";
+    const DB_QUERY_DURATION: &'static str = "graphus_db_query_duration_seconds";
+
+    /// Computes the server-side evidence as before → after deltas, attributed to `database`.
+    ///
+    /// The db-scoped figures (committed/aborted/slow/query-duration) use the per-database
+    /// `graphus_db_*` series when `after` carries them for `database`; otherwise they fall back to the
+    /// server-wide aggregate and [`scope_note`](Self::scope_note) records the fallback. The
+    /// process-wide reliability signals are always taken from the global series. Counter deltas are
+    /// clamped at `0` (Prometheus counters only increase); the SSI figures are the absolute gauge
+    /// before and after.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use graphus_examples_harness::{scrape, ServerMetricsSection};
+    ///
+    /// let before = scrape::parse("graphus_transactions_committed_total 10\n");
+    /// let after = scrape::parse("graphus_transactions_committed_total 25\n");
+    /// let section = ServerMetricsSection::from_snapshots(&before, &after, "graphus");
+    /// assert_eq!(section.transactions_committed, 15);
+    /// ```
+    #[must_use]
+    pub fn from_snapshots(
+        before: &MetricsSnapshot,
+        after: &MetricsSnapshot,
+        database: &str,
+    ) -> Self {
+        let per_db = after.has_database(database);
+
+        // db-scoped figures: per-database when available, else the server-wide aggregate.
+        let (committed, aborted, slow, before_hist, after_hist, db_field, scope_note) = if per_db {
+            (
+                delta_u64(
+                    before.db_scalar(database, Self::DB_COMMITTED),
+                    after.db_scalar(database, Self::DB_COMMITTED),
+                ),
+                delta_u64(
+                    before.db_scalar(database, Self::DB_ABORTED),
+                    after.db_scalar(database, Self::DB_ABORTED),
+                ),
+                delta_u64(
+                    before.db_scalar(database, Self::DB_SLOW),
+                    after.db_scalar(database, Self::DB_SLOW),
+                ),
+                before.db_histogram(database, Self::DB_QUERY_DURATION),
+                after.db_histogram(database, Self::DB_QUERY_DURATION),
+                Some(database.to_string()),
+                String::new(),
+            )
+        } else {
+            (
+                delta_u64(
+                    before.scalar(Self::COMMITTED),
+                    after.scalar(Self::COMMITTED),
+                ),
+                delta_u64(before.scalar(Self::ABORTED), after.scalar(Self::ABORTED)),
+                delta_u64(before.scalar(Self::SLOW), after.scalar(Self::SLOW)),
+                before.histogram(Self::QUERY_DURATION),
+                after.histogram(Self::QUERY_DURATION),
+                None,
+                format!(
+                    "no per-database series for {database:?}; committed/aborted/slow_queries/\
+                     query_duration are server-wide aggregates across all databases"
+                ),
+            )
+        };
+
+        let total = committed + aborted;
+        let abort_rate = if total > 0 {
+            aborted as f64 / total as f64
+        } else {
+            0.0
+        };
+
+        // Query-duration histogram delta → count, mean, and interpolated percentiles (ms).
+        let (query_count, mean_ms, p50_ms, p99_ms) = match after_hist {
+            Some(after_h) => {
+                let delta = after_h.delta(before_hist);
+                let count = delta.count.max(0.0).round() as u64;
+                let mean_ms = if delta.count > 0.0 {
+                    delta.sum / delta.count * 1_000.0
+                } else {
+                    0.0
+                };
+                (
+                    count,
+                    mean_ms,
+                    delta.quantile(0.50) * 1_000.0,
+                    delta.quantile(0.99) * 1_000.0,
+                )
+            }
+            None => (0, 0.0, 0.0, 0.0),
+        };
+
+        Self {
+            database: db_field,
+            transactions_committed: committed,
+            transactions_aborted: aborted,
+            abort_rate,
+            slow_queries: slow,
+            // Process-wide reliability signals are always global (no per-database breakdown exists).
+            statement_panics: delta_u64(
+                before.scalar(Self::STATEMENT_PANICS),
+                after.scalar(Self::STATEMENT_PANICS),
+            ),
+            engine_recovery_panics: delta_u64(
+                before.scalar(Self::RECOVERY_PANICS),
+                after.scalar(Self::RECOVERY_PANICS),
+            ),
+            engine_force_detached: delta_u64(
+                before.scalar(Self::FORCE_DETACHED),
+                after.scalar(Self::FORCE_DETACHED),
+            ),
+            engine_force_detached_active: gauge_u64(after.scalar(Self::FORCE_DETACHED_ACTIVE)),
+            ssi_tracked_before: gauge_u64(before.scalar(Self::SSI_TRACKED)),
+            ssi_tracked_after: gauge_u64(after.scalar(Self::SSI_TRACKED)),
+            query_count,
+            query_duration_mean_ms: mean_ms,
+            query_duration_p50_ms: p50_ms,
+            query_duration_p99_ms: p99_ms,
+            scope_note,
+        }
+    }
+}
+
+/// A non-negative counter delta `after - before` (treating an absent series as `0`), rounded to a
+/// `u64`. Clamped at `0` because Prometheus counters only increase and a scrape gap must not underflow.
+fn delta_u64(before: Option<f64>, after: Option<f64>) -> u64 {
+    let before = before.unwrap_or(0.0);
+    let after = after.unwrap_or(0.0);
+    (after - before).max(0.0).round() as u64
+}
+
+/// The absolute value of a gauge series (absent ⇒ `0`), rounded to a `u64`.
+fn gauge_u64(value: Option<f64>) -> u64 {
+    value.unwrap_or(0.0).max(0.0).round() as u64
+}
+
 /// A single named phase of the scenario together with its measured wall-clock duration.
 ///
 /// Phase timing is the one metric the scaffold records itself today (via
@@ -302,6 +563,16 @@ pub struct EvidenceReport {
     pub storage: StorageSection,
     /// Throughput + latency-percentile evidence.
     pub throughput: ThroughputSection,
+    /// Where this run's server-side evidence was collected from — **local** (this host) or
+    /// **external** (a remote instance via `/metrics` only). Additive field (`rmp #684`,
+    /// [`SCHEMA_VERSION`] `2`); a v1 report defaults it to [`MeasurementMode::Local`].
+    #[serde(default)]
+    pub measurement_mode: MeasurementMode,
+    /// Server-side `/metrics` evidence (before → after deltas), when the example scraped it.
+    /// Additive field (`rmp #684`, [`SCHEMA_VERSION`] `2`); absent in v1 reports and omitted from the
+    /// JSON when not collected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_metrics: Option<ServerMetricsSection>,
     /// Free-form notes carried into the report (scenario-specific observations, proxy caveats, …).
     #[serde(default)]
     pub notes: Vec<String>,
@@ -381,6 +652,14 @@ impl EvidenceReport {
         let _ = writeln!(s, "_{}_", m.description);
         let _ = writeln!(s);
         let _ = writeln!(s, "- Schema version: `{}`", self.version);
+        let _ = writeln!(
+            s,
+            "- Measurement mode: `{}`",
+            match self.measurement_mode {
+                MeasurementMode::Local => "local",
+                MeasurementMode::External => "external",
+            }
+        );
         let _ = writeln!(
             s,
             "- Dataset: `{}` nodes, `{}` relationships{}",
@@ -491,6 +770,68 @@ impl EvidenceReport {
         );
         let _ = writeln!(s);
 
+        if let Some(sm) = &self.server_metrics {
+            let _ = writeln!(s, "## Server metrics (/metrics deltas)");
+            let _ = writeln!(s);
+            let _ = writeln!(
+                s,
+                "- Scope: {}",
+                match &sm.database {
+                    Some(db) => format!("database `{db}`"),
+                    None => "server-wide aggregate".to_string(),
+                }
+            );
+            if !sm.scope_note.is_empty() {
+                let _ = writeln!(s, "- Note: {}", sm.scope_note);
+            }
+            let _ = writeln!(s);
+            let _ = writeln!(s, "| Metric | Value |");
+            let _ = writeln!(s, "|--------|-------|");
+            let _ = writeln!(
+                s,
+                "| transactions committed | {} |",
+                sm.transactions_committed
+            );
+            let _ = writeln!(s, "| transactions aborted | {} |", sm.transactions_aborted);
+            let _ = writeln!(s, "| abort / conflict rate | {:.3} |", sm.abort_rate);
+            let _ = writeln!(s, "| slow queries | {} |", sm.slow_queries);
+            let _ = writeln!(s, "| statement panics | {} |", sm.statement_panics);
+            let _ = writeln!(
+                s,
+                "| engine recovery panics | {} |",
+                sm.engine_recovery_panics
+            );
+            let _ = writeln!(
+                s,
+                "| engine force-detached | {} |",
+                sm.engine_force_detached
+            );
+            let _ = writeln!(
+                s,
+                "| engine force-detached (active) | {} |",
+                sm.engine_force_detached_active
+            );
+            let _ = writeln!(s, "| SSI tracked (before) | {} |", sm.ssi_tracked_before);
+            let _ = writeln!(s, "| SSI tracked (after) | {} |", sm.ssi_tracked_after);
+            let _ = writeln!(s, "| query count | {} |", sm.query_count);
+            let _ = writeln!(
+                s,
+                "| query duration mean (ms) | {:.3} |",
+                sm.query_duration_mean_ms
+            );
+            let _ = writeln!(
+                s,
+                "| query duration p50 (ms) | {:.3} |",
+                sm.query_duration_p50_ms
+            );
+            let _ = writeln!(
+                s,
+                "| query duration p99 (ms) | {:.3} |",
+                sm.query_duration_p99_ms
+            );
+            let _ = writeln!(s);
+        }
+
         if !self.notes.is_empty() {
             let _ = writeln!(s, "## Notes");
             let _ = writeln!(s);
@@ -533,6 +874,8 @@ impl EvidenceCollector {
                 memory: MemorySection::default(),
                 storage: StorageSection::default(),
                 throughput: ThroughputSection::default(),
+                measurement_mode: MeasurementMode::default(),
+                server_metrics: None,
                 notes: Vec::new(),
             },
             started: None,
@@ -660,6 +1003,31 @@ impl EvidenceCollector {
             ThroughputSection::from_collectors_over(throughput, latency, window);
     }
 
+    /// Sets where this run's evidence was collected from ([`MeasurementMode::Local`] /
+    /// [`External`](MeasurementMode::External)). Defaults to [`Local`](MeasurementMode::Local).
+    pub fn set_measurement_mode(&mut self, mode: MeasurementMode) {
+        self.report.measurement_mode = mode;
+    }
+
+    /// Records a pre-computed server-side [`ServerMetricsSection`] onto the report.
+    pub fn record_server_metrics(&mut self, section: ServerMetricsSection) {
+        self.report.server_metrics = Some(section);
+    }
+
+    /// Computes and records the server-side `/metrics` evidence from two [`MetricsSnapshot`]s (scraped
+    /// before and after the workload), attributed to `database`. A convenience over
+    /// [`ServerMetricsSection::from_snapshots`] + [`record_server_metrics`](Self::record_server_metrics).
+    pub fn record_server_metrics_from(
+        &mut self,
+        before: &MetricsSnapshot,
+        after: &MetricsSnapshot,
+        database: &str,
+    ) {
+        self.report.server_metrics = Some(ServerMetricsSection::from_snapshots(
+            before, after, database,
+        ));
+    }
+
     /// Mutable access to the storage section, for `rmp #247` to populate.
     pub fn storage_mut(&mut self) -> &mut StorageSection {
         &mut self.report.storage
@@ -737,6 +1105,25 @@ mod tests {
             p999_latency_ms: 3.4,
             abort_rate: 0.05,
         };
+        c.set_measurement_mode(MeasurementMode::External);
+        c.record_server_metrics(ServerMetricsSection {
+            database: Some("graphus".to_string()),
+            transactions_committed: 190,
+            transactions_aborted: 5,
+            abort_rate: 5.0 / 195.0,
+            slow_queries: 0,
+            statement_panics: 0,
+            engine_recovery_panics: 0,
+            engine_force_detached: 0,
+            engine_force_detached_active: 0,
+            ssi_tracked_before: 12,
+            ssi_tracked_after: 190,
+            query_count: 46,
+            query_duration_mean_ms: 0.488,
+            query_duration_p50_ms: 0.3,
+            query_duration_p99_ms: 2.1,
+            scope_note: String::new(),
+        });
         c.note("fully populated for the schema test");
         c.finish()
     }
@@ -797,6 +1184,19 @@ mod tests {
             report.storage.write_amplification
         );
         assert_eq!(parsed.throughput.ops_per_sec, report.throughput.ops_per_sec);
+        // The v2 additions (`rmp #684`) survive the round-trip.
+        assert_eq!(parsed.version, SCHEMA_VERSION);
+        assert_eq!(parsed.version, 2);
+        assert_eq!(parsed.measurement_mode, MeasurementMode::External);
+        assert_eq!(parsed.server_metrics, report.server_metrics);
+        let sm = parsed
+            .server_metrics
+            .as_ref()
+            .expect("server_metrics present");
+        assert_eq!(sm.database.as_deref(), Some("graphus"));
+        assert_eq!(sm.transactions_committed, 190);
+        assert_eq!(sm.statement_panics, 0);
+        assert_eq!(sm.query_count, 46);
 
         // The documented top-level keys are all present in the JSON.
         for key in [
@@ -807,16 +1207,22 @@ mod tests {
             "\"memory\"",
             "\"storage\"",
             "\"throughput\"",
+            "\"measurement_mode\"",
+            "\"server_metrics\"",
         ] {
             assert!(json.contains(key), "JSON must contain top-level {key}");
         }
+        // Measurement mode serializes lowercase.
+        assert!(json.contains("\"external\""));
     }
 
     #[test]
     fn older_compatible_report_still_loads() {
-        // A minimal report missing every `#[serde(default)]` section (host, dataset, workload,
-        // amplification, notes) must still deserialize — the versioned-but-lenient contract.
-        let minimal = r#"{
+        // A genuine **v1** `report.json` — missing every field added after v1 (host, dataset,
+        // workload, amplification, notes, AND the v2 `measurement_mode` + `server_metrics`) — must
+        // still deserialize via `#[serde(default)]`. This is the versioned-but-lenient contract that
+        // lets a v1 baseline load against the current (v2) schema.
+        let v1 = r#"{
             "version": 1,
             "metadata": { "scenario": "legacy", "description": "old", "started_unix_secs": 1 },
             "total_millis": 1.0,
@@ -827,7 +1233,8 @@ mod tests {
             "throughput": { "operations": 0, "ops_per_sec": 0.0,
                             "p50_latency_ms": 0.0, "p99_latency_ms": 0.0, "p999_latency_ms": 0.0 }
         }"#;
-        let parsed: EvidenceReport = serde_json::from_str(minimal).expect("lenient deserialize");
+        let parsed: EvidenceReport = serde_json::from_str(v1).expect("lenient v1 deserialize");
+        assert_eq!(parsed.version, 1);
         assert_eq!(parsed.metadata.scenario, "legacy");
         assert_eq!(parsed.metadata.dataset, DatasetScale::default());
         assert!(parsed.metadata.workload.is_empty());
@@ -835,6 +1242,84 @@ mod tests {
         assert_eq!(parsed.storage.write_amplification, 0.0);
         // The additive `abort_rate` (rmp #253) defaults to 0.0 when absent from an older report.
         assert_eq!(parsed.throughput.abort_rate, 0.0);
+        // The v2 additions (rmp #684) default cleanly: mode is Local, and there is no server metrics.
+        assert_eq!(parsed.measurement_mode, MeasurementMode::Local);
+        assert!(parsed.server_metrics.is_none());
+    }
+
+    #[test]
+    fn server_metrics_section_from_snapshots_computes_deltas() {
+        // Two scrapes bracketing a workload window, with both per-database series and the global
+        // reliability counters.
+        let before = crate::scrape::parse(
+            "graphus_transactions_committed_total 100\n\
+             graphus_transactions_aborted_total 4\n\
+             graphus_statement_panics_total 0\n\
+             graphus_engine_force_detached_total 0\n\
+             graphus_ssi_tracked_transactions 3\n\
+             graphus_db_transactions_committed_total{database=\"graphus\"} 100\n\
+             graphus_db_transactions_aborted_total{database=\"graphus\"} 4\n\
+             graphus_db_slow_queries_total{database=\"graphus\"} 0\n\
+             # TYPE graphus_db_query_duration_seconds histogram\n\
+             graphus_db_query_duration_seconds_bucket{database=\"graphus\",le=\"0.001\"} 0\n\
+             graphus_db_query_duration_seconds_bucket{database=\"graphus\",le=\"0.01\"} 0\n\
+             graphus_db_query_duration_seconds_bucket{database=\"graphus\",le=\"+Inf\"} 0\n\
+             graphus_db_query_duration_seconds_sum{database=\"graphus\"} 0.0\n\
+             graphus_db_query_duration_seconds_count{database=\"graphus\"} 0\n",
+        );
+        let after = crate::scrape::parse(
+            "graphus_transactions_committed_total 130\n\
+             graphus_transactions_aborted_total 14\n\
+             graphus_statement_panics_total 0\n\
+             graphus_engine_force_detached_total 0\n\
+             graphus_engine_force_detached_active 0\n\
+             graphus_ssi_tracked_transactions 40\n\
+             graphus_db_transactions_committed_total{database=\"graphus\"} 130\n\
+             graphus_db_transactions_aborted_total{database=\"graphus\"} 14\n\
+             graphus_db_slow_queries_total{database=\"graphus\"} 2\n\
+             # TYPE graphus_db_query_duration_seconds histogram\n\
+             graphus_db_query_duration_seconds_bucket{database=\"graphus\",le=\"0.001\"} 0\n\
+             graphus_db_query_duration_seconds_bucket{database=\"graphus\",le=\"0.01\"} 10\n\
+             graphus_db_query_duration_seconds_bucket{database=\"graphus\",le=\"+Inf\"} 10\n\
+             graphus_db_query_duration_seconds_sum{database=\"graphus\"} 0.05\n\
+             graphus_db_query_duration_seconds_count{database=\"graphus\"} 10\n",
+        );
+
+        let sm = ServerMetricsSection::from_snapshots(&before, &after, "graphus");
+        assert_eq!(sm.database.as_deref(), Some("graphus"));
+        assert!(sm.scope_note.is_empty(), "per-db series → no fallback note");
+        // db-scoped deltas taken from the per-database series.
+        assert_eq!(sm.transactions_committed, 30);
+        assert_eq!(sm.transactions_aborted, 10);
+        assert_eq!(sm.slow_queries, 2);
+        // abort_rate = 10 / (30 + 10).
+        assert!((sm.abort_rate - 0.25).abs() < 1e-12);
+        // Global reliability signals stay zero on a healthy server.
+        assert_eq!(sm.statement_panics, 0);
+        assert_eq!(sm.engine_recovery_panics, 0);
+        assert_eq!(sm.engine_force_detached, 0);
+        assert_eq!(sm.engine_force_detached_active, 0);
+        // SSI gauge captured before and after.
+        assert_eq!(sm.ssi_tracked_before, 3);
+        assert_eq!(sm.ssi_tracked_after, 40);
+        // Query-duration histogram delta: 10 queries in (0.001, 0.01], sum 0.05s → mean 5ms.
+        assert_eq!(sm.query_count, 10);
+        assert!((sm.query_duration_mean_ms - 5.0).abs() < 1e-9);
+        // p50 = 0.001 + 0.009 * (5/10) = 0.0055s = 5.5ms; p99 = 0.001 + 0.009*(9.9/10) = 9.91ms.
+        assert!((sm.query_duration_p50_ms - 5.5).abs() < 1e-9);
+        assert!((sm.query_duration_p99_ms - 9.91).abs() < 1e-9);
+    }
+
+    #[test]
+    fn server_metrics_section_falls_back_to_aggregate_without_per_db_series() {
+        // No `graphus_db_*` series: the section falls back to the server-wide counters and records
+        // the fallback in `scope_note`, leaving `database` unset.
+        let before = crate::scrape::parse("graphus_transactions_committed_total 10\n");
+        let after = crate::scrape::parse("graphus_transactions_committed_total 25\n");
+        let sm = ServerMetricsSection::from_snapshots(&before, &after, "graphus");
+        assert_eq!(sm.database, None);
+        assert!(sm.scope_note.contains("no per-database series"));
+        assert_eq!(sm.transactions_committed, 15);
     }
 
     #[test]
@@ -862,6 +1347,11 @@ mod tests {
         assert!(md.contains("## Storage"));
         assert!(md.contains("write amplification"));
         assert!(md.contains("## Throughput & latency"));
+        // The v2 server-metrics table + measurement mode render (rmp #684).
+        assert!(md.contains("- Measurement mode: `external`"));
+        assert!(md.contains("## Server metrics (/metrics deltas)"));
+        assert!(md.contains("| statement panics | 0 |"));
+        assert!(md.contains("| transactions committed | 190 |"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
