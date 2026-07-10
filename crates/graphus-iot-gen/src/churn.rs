@@ -11,13 +11,13 @@
 //!
 //! # Why this drives the engine INLINE (not over Bolt/TCP) — and why that is still the real engine
 //!
-//! Graphus's MVCC garbage collection ([`RecordStore::gc`]) is a **maintenance operation**: it is
+//! Graphus's MVCC garbage collection ([`RecordStore::gc`](graphus_storage::RecordStore::gc)) is a **maintenance operation**: it is
 //! WAL-logged and crash-safe, but the live server has **no automatic, scheduled, or wire-reachable
 //! trigger** for it (there is no GC `EngineCommand`, Cypher procedure, or admin statement — verified
 //! against `graphus-server`'s command surface; filed as improvement `rmp #305`). Without a GC pass
 //! the delete-old/insert-new churn only tombstones records, so the footprint grows **linearly** with
 //! total-ingested. The reclamation this example proves therefore requires invoking GC, reachable only
-//! through the in-process store seam ([`TxnCoordinator::with_store_mut`]). So the workload drives the
+//! through the in-process store seam ([`TxnCoordinator::with_store_mut`](graphus_cypher::coordinator::TxnCoordinator::with_store_mut)). So the workload drives the
 //! **production command-dispatch code path** — `TxnCoordinator::statement` + `execute`, *exactly*
 //! what the server's `handle_run` calls per `RUN` — inline and single-threaded (the same approach
 //! `graphus-fraud-gen`'s `dst_contention` and `graphus-dst` use), interleaving the GC maintenance
@@ -27,11 +27,11 @@
 use graphus_core::{TxnId, Value};
 use graphus_cypher::coordinator::TxnCoordinator;
 use graphus_cypher::{
-    IndexCatalog, Parameters, Row, RowValue, analyze, bind_parameters, execute, lower,
-    parse_tokens, plan_physical, tokenize,
+    ConstraintKind, IndexCatalog, Parameters, Row, RowValue, analyze, bind_parameters, execute,
+    lower, parse_tokens, plan_physical, tokenize,
 };
 use graphus_io::{BlockDevice, MemBlockDevice, PAGE_SIZE};
-use graphus_storage::RecordStore;
+use graphus_storage::{ConstraintTypeDescriptor, RecordStore};
 use graphus_wal::{MemLogSink, WalManager};
 
 use crate::{GenConfig, Generator};
@@ -155,6 +155,66 @@ fn exec_commit(coord: &mut Coord, src: &str) {
     coord.commit(txn).expect("commit");
 }
 
+/// Applies the geo/time **schema** ([`Generator::schema_ddl`]) through the coordinator's typed schema
+/// seam, before any data lands, so every sensor CREATE and every churn insert is constraint-checked
+/// and index-maintained.
+///
+/// The typed coordinator calls here are the exact methods the server's admin-DDL surface dispatches
+/// to after parsing the equivalent `CREATE INDEX` / `CREATE CONSTRAINT` statement — the string form
+/// this driver's `schema_ddl()` emits is proven to parse to precisely this schema by the hermetic
+/// `graphus-server/tests/iot_timeseries_schema.rs`, which drives those statements through
+/// `parse_admin_statement` → `LocalEngine::{index_ddl, constraint_ddl}`. Each `IF NOT EXISTS`-style
+/// call is idempotent, matching the DDL block's `IF NOT EXISTS` forms.
+fn apply_schema(coord: &mut Coord) {
+    // POINT (spatial) index on Sensor.location — a Cartesian grid over the fleet's geo positions.
+    coord
+        .create_point_index("sensor_location_point", "Sensor", "location", true)
+        .expect("create POINT index on Sensor.location");
+    // Composite RANGE index on Reading(sensor, seq) — per-sensor windowed reads.
+    coord
+        .begin_online_node_composite_index_named(
+            Some("reading_sensor_seq"),
+            "Reading",
+            &["sensor".to_owned(), "seq".to_owned()],
+            true,
+        )
+        .expect("create composite RANGE index on Reading(sensor, seq)");
+    // Single-property RANGE retention index on Reading.seq — the aged-out DELETE key.
+    coord
+        .begin_online_node_property_index_named(Some("reading_seq"), "Reading", "seq", true)
+        .expect("create RANGE index on Reading.seq");
+    // NODE KEY on Sensor.id (present + unique).
+    coord
+        .create_constraint_general(
+            "sensor_id_key",
+            "Sensor",
+            &["id"],
+            ConstraintKind::NodeKey,
+            None,
+        )
+        .expect("create NODE KEY on Sensor.id");
+    // Existence: every Reading carries a value.
+    coord
+        .create_constraint_general(
+            "reading_value_exists",
+            "Reading",
+            &["value"],
+            ConstraintKind::Existence,
+            None,
+        )
+        .expect("create existence constraint on Reading.value");
+    // Property-type: Reading.ts is an epoch-ms INTEGER.
+    coord
+        .create_constraint_general(
+            "reading_ts_integer",
+            "Reading",
+            &["ts"],
+            ConstraintKind::PropertyType,
+            Some(ConstraintTypeDescriptor::Integer),
+        )
+        .expect("create property-type constraint on Reading.ts");
+}
+
 /// The current live `Reading` count, read in its own committed snapshot transaction.
 fn live_readings(coord: &mut Coord) -> u64 {
     let txn = coord.begin_serializable();
@@ -213,9 +273,11 @@ where
     let mut generator = Generator::new(cfg.clone());
     let mut gc_seq: u64 = 0;
 
-    // Bootstrap: the sensor fleet, each in its own auto-commit txn. (The index DDL the full
-    // `stream.cypher` / a server run executes is a separate engine-command path, not the row-executor
-    // seam this inline workload drives; the retention DELETE is correct either way — index or scan.)
+    // Bootstrap: apply the geo/time schema (constraints + indexes) through the typed coordinator
+    // seam, then create the sensor fleet, each in its own auto-commit txn. The schema is applied
+    // FIRST so the sensor fleet — and every subsequent churn insert/delete — is constraint-checked
+    // and index-maintained, exercising the write-path enforcement + index maintenance under churn.
+    apply_schema(&mut coord);
     for stmt in generator.sensor_cypher() {
         exec_commit(&mut coord, &stmt);
     }

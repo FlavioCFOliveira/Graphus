@@ -85,20 +85,57 @@ scalar() {
   cypher "$1" | awk -F'|' '
     /^\|/ { rows++; if (rows == 2) { v = $2; gsub(/^[ \t"]+|[ \t"]+$/, "", v); print v } }'
 }
+# EPOCH_MS + seq * TICK_MS (mirrors graphus_iot_gen so a Reading.ts is a real epoch-ms integer, as
+# the `Reading.ts IS :: INTEGER` property-type constraint requires).
+EPOCH_MS=1704067200000
+TICK_MS=1000
+# The Cartesian location of sensor i, clustered by site (mirrors Generator::sensor_location): the four
+# sites form a 2×2 grid 1000 apart; same-site sensors are nudged 5 units per slot. A
+# `point.distance(s.location, <site centre>) <= 50` query therefore returns exactly that site's sensors.
+loc_x() { local i="$1"; echo $(( ($i % 4 % 2) * 1000 + ($i / 4) * 5 )); }
+loc_y() { local i="$1"; echo $(( ($i % 4 / 2) * 1000 + ($i / 4) * 5 )); }
+
+CHECKS=0
+FAILS=0
+# assert_eq <description> <expected> <actual>
+assert_eq() {
+  CHECKS=$((CHECKS + 1))
+  if [ "$2" = "$3" ]; then
+    echo "  ${GREEN}✓${RESET} $1 ${DIM}(= $3)${RESET}"
+  else
+    FAILS=$((FAILS + 1))
+    echo "  ${RED}✗${RESET} $1 — expected [$2], got [$3]"
+  fi
+}
 
 echo "${DIM}wire demo: server pid $SERVER_PID on $SOCKET — ticks=$TICKS rate=$RATE window=$WINDOW sensors=$SENSORS${RESET}"
 
-# Sensor fleet (created once).
+# --------------------------------------------------------------------------------------------------
+# Schema (constraints + indexes) — the geo/time schema, applied schema-first over the real admin
+# surface (Bolt). These mirror graphus_iot_gen::Generator::schema_ddl() (proven to parse to the same
+# typed schema by crates/graphus-server/tests/iot_timeseries_schema.rs).
+# --------------------------------------------------------------------------------------------------
+cypher "CREATE CONSTRAINT sensor_id_key IF NOT EXISTS FOR (s:Sensor) REQUIRE s.id IS NODE KEY" >/dev/null
+cypher "CREATE CONSTRAINT reading_value_exists IF NOT EXISTS FOR (r:Reading) REQUIRE r.value IS NOT NULL" >/dev/null
+cypher "CREATE CONSTRAINT reading_ts_integer IF NOT EXISTS FOR (r:Reading) REQUIRE r.ts IS :: INTEGER" >/dev/null
+cypher "CREATE POINT INDEX sensor_location_point IF NOT EXISTS FOR (s:Sensor) ON (s.location)" >/dev/null
+cypher "CREATE INDEX reading_sensor_seq IF NOT EXISTS FOR (r:Reading) ON (r.sensor, r.seq)" >/dev/null
+cypher "CREATE INDEX reading_seq IF NOT EXISTS FOR (r:Reading) ON (r.seq)" >/dev/null
+
+# Sensor fleet (created once), each carrying a Cartesian `location` point (indexed by the POINT index).
 for i in $(seq 0 $((SENSORS - 1))); do
-  cypher "CREATE (:Sensor {id: 's-$i', kind: 'temperature', site: $((i % 4))})" >/dev/null
+  cypher "CREATE (:Sensor {id: 's-$i', kind: 'temperature', site: $((i % 4)), location: point({x: $(loc_x "$i"), y: $(loc_y "$i")})})" >/dev/null
 done
 
-# Churn loop: insert RATE readings per tick, then delete readings aged out of the window.
+# Churn loop: insert RATE readings per tick (each with a `sensor`, monotonic `seq`, epoch-ms `ts` and a
+# `value` — every one satisfying the existence + property-type constraints), then delete readings aged
+# out of the window. The retention DELETE removes whole readings, so it never leaves a constraint violated.
 seq_no=0
 for t in $(seq 0 $((TICKS - 1))); do
   for _ in $(seq 1 "$RATE"); do
     sensor=$((seq_no % SENSORS))
-    cypher "MATCH (s:Sensor {id: 's-$sensor'}) CREATE (s)-[:EMITTED]->(:Reading {seq: $seq_no, value: $((seq_no % 1000))})" >/dev/null
+    ts=$((EPOCH_MS + seq_no * TICK_MS))
+    cypher "MATCH (s:Sensor {id: 's-$sensor'}) CREATE (s)-[:EMITTED]->(:Reading {sensor: 's-$sensor', seq: $seq_no, ts: $ts, value: $((seq_no % 1000))})" >/dev/null
     seq_no=$((seq_no + 1))
   done
   if [ "$seq_no" -gt "$WINDOW" ]; then
@@ -107,15 +144,63 @@ for t in $(seq 0 $((TICKS - 1))); do
   fi
 done
 
-# Assert the steady-state live count is within the band [window, window+rate).
+# --------------------------------------------------------------------------------------------------
+# Assertions over the real wire
+# --------------------------------------------------------------------------------------------------
+
+# 1. Steady-state live count within the band [window, window+rate).
 live="$(scalar "MATCH (r:Reading) RETURN count(r) AS c")"
 lo="$WINDOW"
 hi=$((WINDOW + RATE))
+CHECKS=$((CHECKS + 1))
 if [ "${live:-0}" -ge "$lo" ] && [ "${live:-0}" -lt "$hi" ]; then
   echo "  ${GREEN}✓${RESET} wire ingest+retention reached steady state: live=$live in [$lo, $hi)"
+else
+  FAILS=$((FAILS + 1))
+  echo "  ${RED}✗${RESET} wire steady-state live count $live outside [$lo, $hi)"
+fi
+
+# 2. Spatial query (POINT index): sensors within radius 50 of site 0's centre (0, 0) are exactly the
+#    sensors whose site == 0 — i.e. {s-0, s-4, …}. Known ground truth: ceil(SENSORS / 4).
+near0="$(scalar "MATCH (s:Sensor) WHERE point.distance(s.location, point({x: 0, y: 0})) <= 50 RETURN count(s) AS c")"
+expected_site0=$(((SENSORS + 3) / 4))
+assert_eq "spatial: sensors near site 0 centre" "$expected_site0" "${near0:-0}"
+
+# 3. Per-sensor windowed read (composite index): a bounded-seq query for s-0 must return the SAME
+#    readings as the (:Sensor)-[:EMITTED]->(:Reading) traversal (a self-validating cross-check — the
+#    `sensor` property equals the emitter's id by construction). Query the whole live window.
+wlo=$((seq_no - WINDOW))
+whi=$seq_no
+by_prop="$(scalar "MATCH (r:Reading) WHERE r.sensor = 's-0' AND r.seq >= $wlo AND r.seq < $whi RETURN count(r) AS c")"
+by_edge="$(scalar "MATCH (:Sensor {id: 's-0'})-[:EMITTED]->(r:Reading) WHERE r.seq >= $wlo AND r.seq < $whi RETURN count(r) AS c")"
+assert_eq "composite windowed read for s-0 matches the EMITTED traversal" "${by_edge:-x}" "${by_prop:-y}"
+if [ "${by_prop:-0}" -le 0 ]; then
+  CHECKS=$((CHECKS + 1)); FAILS=$((FAILS + 1))
+  echo "  ${RED}✗${RESET} the s-0 windowed read returned nothing — the composite path was not exercised"
+fi
+
+# 4. Constraint enforcement (NODE KEY): a duplicate Sensor.id is REJECTED over the wire.
+dup_out="$(cypher "CREATE (:Sensor {id: 's-0', kind: 'temperature', site: 0, location: point({x: 0, y: 0})})" 2>&1 || true)"
+if printf '%s' "$dup_out" | grep -qiE 'constraint|violation|already exists|ConstraintValidationFailed'; then
+  assert_eq "duplicate Sensor.id rejected (NODE KEY)" "rejected" "rejected"
+else
+  assert_eq "duplicate Sensor.id rejected (NODE KEY)" "rejected" "accepted"
+fi
+# The rejected write created nothing — sensor count unchanged.
+scount="$(scalar "MATCH (s:Sensor) RETURN count(s) AS c")"
+assert_eq "sensor count unchanged after the rejected duplicate" "$SENSORS" "${scount:-0}"
+
+# 5. Evidence: capture the declared schema (the operator-visible SHOW output).
+echo "${DIM}--- SHOW INDEXES (name, type, entityType, state) ---${RESET}"
+cypher "SHOW INDEXES YIELD name, type, entityType, state RETURN name, type, entityType, state" | sed 's/^/  /'
+echo "${DIM}--- SHOW CONSTRAINTS (name, type, entityType) ---${RESET}"
+cypher "SHOW CONSTRAINTS YIELD name, type, entityType RETURN name, type, entityType" | sed 's/^/  /'
+
+if [ "$FAILS" -eq 0 ]; then
+  echo "  ${GREEN}✓${RESET} wire demo: all $CHECKS checks passed (steady state, spatial POINT query, composite windowed read, NODE KEY enforcement)"
   echo "GRAPHUS_IOT_WIRE_OK"
   exit 0
 else
-  echo "  ${RED}✗${RESET} wire steady-state live count $live outside [$lo, $hi)"
+  echo "  ${RED}✗${RESET} wire demo: $FAILS of $CHECKS checks failed"
   exit 1
 fi

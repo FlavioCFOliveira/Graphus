@@ -14,8 +14,28 @@
 //!
 //! | Node label | Key properties | Meaning |
 //! | --- | --- | --- |
-//! | `(:Sensor {id, kind, site})` | `id` (stable, `s-<n>`) | a physical sensor / device |
+//! | `(:Sensor {id, kind, site, location})` | `id` (stable, `s-<n>`), `location` (Cartesian `point`) | a physical sensor / device |
 //! | `(:Reading {sensor, seq, ts, value})` | `seq` (global monotonic) | one time-stamped sample |
+//!
+//! ## Schema — indexes & constraints ([`Generator::schema_ddl`])
+//!
+//! The bootstrap declares a production-realistic geo/time schema over this model, exercising five of
+//! the newer index & constraint kinds (all Neo4j-5.x-shaped):
+//!
+//! | DDL | Kind | Why the workload needs it |
+//! | --- | --- | --- |
+//! | `Sensor.id IS NODE KEY` | `NODE KEY` constraint | the fleet's primary key: present + unique |
+//! | `Reading.value IS NOT NULL` | existence constraint | every telemetry sample must carry a value |
+//! | `Reading.ts IS :: INTEGER` | property-type constraint | `ts` is an epoch-ms **integer**, never a float |
+//! | `Sensor.location` | `POINT` (spatial) index | Cartesian proximity ("sensors near a site") |
+//! | `Reading(sensor, seq)` | composite `RANGE` index | per-sensor windowed reads (leading eq + seq range) |
+//! | `Reading.seq` | `RANGE` index | the retention key the aged-out `DELETE` seeks on |
+//!
+//! Every churn insert satisfies the constraints by construction (a `Reading` always carries an
+//! integer `ts` and a `value`; a `Sensor` always carries a unique `id`), and the retention `DELETE`
+//! only removes whole readings, so it can never leave a constraint violated. The `Reading` indexes
+//! are therefore **maintained under churn** — a realistic production stress the reclamation proof
+//! runs the engine through.
 //!
 //! One relationship type carries the time-series edge:
 //!
@@ -98,6 +118,24 @@ pub const EPOCH_MS: u64 = 1_704_067_200_000;
 /// Milliseconds of modelled time between two consecutive readings (one global `seq` step). Fixed so
 /// `ts = EPOCH_MS + seq * TICK_MS` is a pure function of `seq`.
 pub const TICK_MS: u64 = 1_000;
+
+/// Number of distinct physical **sites** the sensor fleet is spread over (a `Sensor.site` is
+/// `id % SITES`). The four sites form a 2×2 grid in the Cartesian [`Generator::sensor_location`] plane.
+pub const SITES: u64 = 4;
+
+/// Cartesian distance between adjacent site centres (see [`Generator::site_centre`]). Chosen large
+/// relative to [`SITE_JITTER`] × the fleet size so every site's sensors form a well-separated cluster.
+pub const SITE_SPACING: i64 = 1_000;
+
+/// Cartesian step between two sensors sharing a site (see [`Generator::sensor_location`]). Small
+/// relative to [`SITE_SPACING`] so same-site sensors stay tightly clustered around their site centre.
+pub const SITE_JITTER: i64 = 5;
+
+/// The proximity radius that selects exactly one site's sensors: larger than any within-site offset,
+/// far smaller than [`SITE_SPACING`]. A `point.distance(s.location, <site centre>) <= SITE_RADIUS`
+/// predicate therefore returns precisely the sensors with that `site` — the spatial query's known
+/// ground truth.
+pub const SITE_RADIUS: i64 = 50;
 
 /// Configuration for one generation run. A pure value: identical configs yield identical streams.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -205,7 +243,7 @@ pub struct Generator {
 }
 
 impl Generator {
-    /// Creates a generator for `cfg`. The sensor fleet is emitted by [`Generator::schema_cypher`];
+    /// Creates a generator for `cfg`. The sensor fleet is emitted by [`Generator::sensor_cypher`];
     /// reading generation starts at `seq = 0`, `tick = 0`.
     #[must_use]
     pub fn new(cfg: GenConfig) -> Self {
@@ -230,15 +268,69 @@ impl Generator {
         format!("s-{i}")
     }
 
-    /// The one-time index-DDL bootstrap: a range index on `Reading.seq`, the retention key the
-    /// aged-out DELETE seeks on (the realistic shape for a TTL sweep). Returned separately from the
-    /// sensor fleet because index DDL is a distinct engine command path (`CREATE INDEX` is routed to
-    /// the index catalog, not the row executor): a workload driving the bare statement seam runs
-    /// [`Generator::sensor_cypher`] only, while a full server run (`stream.cypher`, `graphus-cli`)
-    /// executes this DDL first.
+    /// The deterministic **Cartesian** location `(x, y)` of sensor `i`, clustered by its `site`.
+    ///
+    /// The four sites sit on a 2×2 grid spaced `SITE_SPACING` (1000) units apart; sensors sharing a
+    /// site are nudged by a small per-slot step (`SITE_JITTER`, 5) that stays far inside the inter-site
+    /// gap. So every sensor with `site == s` lies within a tight cluster around that site's centre
+    /// [`site_centre`](Self::site_centre), and a Cartesian proximity query
+    /// `point.distance(s.location, <site centre>) <= SITE_RADIUS` (50) selects **exactly** the sensors
+    /// of that site — a known, enumerable answer set. Integer coordinates keep the emitted Cypher (and
+    /// therefore the whole churn stream) byte-identical across runs and platforms.
     #[must_use]
-    pub fn index_ddl(&self) -> Vec<String> {
-        vec!["CREATE INDEX reading_seq IF NOT EXISTS FOR (r:Reading) ON (r.seq)".to_owned()]
+    pub fn sensor_location(i: u64) -> (i64, i64) {
+        let site = i % SITES;
+        let slot = (i / SITES) as i64; // which sensor-at-this-site: 0, 1, 2, …
+        let (cx, cy) = Self::site_centre(site);
+        (cx + slot * SITE_JITTER, cy + slot * SITE_JITTER)
+    }
+
+    /// The Cartesian centre `(x, y)` of `site` (`0..SITES`) — the point a "sensors near this site"
+    /// proximity query is anchored at. The four sites form a 2×2 grid `SITE_SPACING` apart.
+    #[must_use]
+    pub fn site_centre(site: u64) -> (i64, i64) {
+        let sx = (site % 2) as i64 * SITE_SPACING;
+        let sy = (site / 2) as i64 * SITE_SPACING;
+        (sx, sy)
+    }
+
+    /// The one-time **schema** bootstrap: the full index & constraint DDL block declared over the
+    /// geo/time model (a `NODE KEY` on `Sensor.id`, an existence + a property-type constraint on the
+    /// reading, a `POINT` index on `Sensor.location`, a composite `RANGE` index on `Reading(sensor,
+    /// seq)`, and the single-property `RANGE` retention index on `Reading.seq`). See the module docs
+    /// for the table.
+    ///
+    /// Returned separately from the sensor fleet because schema DDL is a distinct engine command path
+    /// (`CREATE INDEX` / `CREATE CONSTRAINT` are routed to the index/constraint catalogs, not the row
+    /// executor): a workload driving the bare statement seam applies this DDL through the typed
+    /// coordinator seam first (see `churn::apply_schema`), while a full server run (`stream.cypher`,
+    /// `graphus-cli`) submits these statements through the admin-DDL surface. Every form is
+    /// `IF NOT EXISTS`, so re-running the bootstrap on a warm store is an idempotent no-op.
+    #[must_use]
+    pub fn schema_ddl(&self) -> Vec<String> {
+        vec![
+            // Sensor.id is the fleet's primary key: present + unique across the fleet.
+            "CREATE CONSTRAINT sensor_id_key IF NOT EXISTS FOR (s:Sensor) REQUIRE s.id IS NODE KEY"
+                .to_owned(),
+            // Every reading must carry a `value` (existence), and its `ts` — when present — is an
+            // epoch-ms INTEGER, never a float (property-type). Together they are the telemetry
+            // integrity invariants every ingest is checked against.
+            "CREATE CONSTRAINT reading_value_exists IF NOT EXISTS FOR (r:Reading) REQUIRE r.value IS NOT NULL"
+                .to_owned(),
+            "CREATE CONSTRAINT reading_ts_integer IF NOT EXISTS FOR (r:Reading) REQUIRE r.ts IS :: INTEGER"
+                .to_owned(),
+            // POINT (spatial) index on the sensor geo location — accelerates the Cartesian proximity
+            // ("sensors near a site") query.
+            "CREATE POINT INDEX sensor_location_point IF NOT EXISTS FOR (s:Sensor) ON (s.location)"
+                .to_owned(),
+            // Composite RANGE index accelerating per-sensor windowed reads (a leading `sensor`
+            // equality followed by a `seq` range).
+            "CREATE INDEX reading_sensor_seq IF NOT EXISTS FOR (r:Reading) ON (r.sensor, r.seq)"
+                .to_owned(),
+            // The retention key: the aged-out DELETE seeks `Reading.seq` on this single-property RANGE
+            // index (the realistic shape for a TTL sweep).
+            "CREATE INDEX reading_seq IF NOT EXISTS FOR (r:Reading) ON (r.seq)".to_owned(),
+        ]
     }
 
     /// The one-time sensor-fleet bootstrap: a `CREATE` per sensor. Returned as a `Vec` of statements
@@ -255,9 +347,10 @@ impl Generator {
                 1 => "humidity",
                 _ => "pressure",
             };
-            let site = i % 4; // four sites
+            let site = i % SITES;
+            let (lx, ly) = Self::sensor_location(i);
             out.push(format!(
-                "CREATE (:Sensor {{id: '{}', kind: '{kind}', site: {site}}})",
+                "CREATE (:Sensor {{id: '{}', kind: '{kind}', site: {site}, location: point({{x: {lx}, y: {ly}}})}})",
                 Self::sensor_id(i),
             ));
         }
@@ -341,8 +434,8 @@ impl Generator {
             g.cfg.ticks,
             g.cfg.total_readings(),
         );
-        out.push_str("// --- schema (index DDL) + sensor fleet ---\n");
-        for stmt in g.index_ddl() {
+        out.push_str("// --- schema (constraints + indexes) + sensor fleet ---\n");
+        for stmt in g.schema_ddl() {
             out.push_str(&stmt);
             out.push_str(";\n");
         }
@@ -470,13 +563,77 @@ mod tests {
     }
 
     #[test]
-    fn schema_emits_index_ddl_plus_one_node_per_sensor() {
+    fn schema_emits_full_ddl_block_plus_one_node_per_sensor() {
         let g = Generator::new(cfg());
-        let ddl = g.index_ddl();
-        assert_eq!(ddl.len(), 1);
-        assert!(ddl[0].contains("CREATE INDEX"));
+        let ddl = g.schema_ddl();
+        // NODE KEY + existence + property-type constraints, plus POINT + composite + retention indexes.
+        assert_eq!(ddl.len(), 6);
+        assert_eq!(
+            ddl.iter()
+                .filter(|s| s.starts_with("CREATE CONSTRAINT"))
+                .count(),
+            3,
+            "three constraints (node key, existence, property-type)"
+        );
+        assert!(
+            ddl.iter()
+                .any(|s| s.contains("POINT INDEX") && s.contains("(s.location)")),
+            "a POINT index on Sensor.location"
+        );
+        assert!(
+            ddl.iter().any(|s| s.contains("(r.sensor, r.seq)")),
+            "a composite RANGE index on Reading(sensor, seq)"
+        );
+        assert!(
+            ddl.iter()
+                .any(|s| s.contains("reading_seq") && s.contains("(r.seq)")),
+            "the single-property retention RANGE index on Reading.seq"
+        );
+        // Every statement is a schema-DDL form (starts CREATE CONSTRAINT, or CREATE … INDEX …).
+        for stmt in &ddl {
+            assert!(
+                stmt.starts_with("CREATE CONSTRAINT")
+                    || (stmt.starts_with("CREATE") && stmt.contains(" INDEX ")),
+                "not a schema-DDL statement: {stmt}"
+            );
+        }
+
         let sensors = g.sensor_cypher();
         assert_eq!(sensors.len(), cfg().sensors as usize);
         assert!(sensors[0].contains("s-0"));
+        // Each sensor carries a Cartesian point location.
+        assert!(
+            sensors[0].contains("location: point({x: 0, y: 0})"),
+            "sensor 0 sits at its site-0 centre: {}",
+            sensors[0]
+        );
+    }
+
+    #[test]
+    fn sensor_location_clusters_by_site_within_the_proximity_radius() {
+        // Every sensor of a site lies within SITE_RADIUS of that site's centre, and every sensor of a
+        // *different* site lies strictly outside it — so a proximity query selects exactly one site.
+        let sensors = 12u64; // 3 per site across the 4 sites
+        for i in 0..sensors {
+            let site = i % SITES;
+            let (lx, ly) = Generator::sensor_location(i);
+            let (cx, cy) = Generator::site_centre(site);
+            let d2_own = (lx - cx).pow(2) + (ly - cy).pow(2);
+            assert!(
+                d2_own <= SITE_RADIUS * SITE_RADIUS,
+                "sensor {i} must be within SITE_RADIUS of its own site {site}"
+            );
+            for other in 0..SITES {
+                if other == site {
+                    continue;
+                }
+                let (ox, oy) = Generator::site_centre(other);
+                let d2_other = (lx - ox).pow(2) + (ly - oy).pow(2);
+                assert!(
+                    d2_other > SITE_RADIUS * SITE_RADIUS,
+                    "sensor {i} (site {site}) must be OUTSIDE SITE_RADIUS of site {other}"
+                );
+            }
+        }
     }
 }

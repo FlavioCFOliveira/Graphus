@@ -21,11 +21,14 @@ full E2E run emits a standardized, schema-versioned evidence report gated agains
 
 | Capability | How it is exercised |
 | --- | --- |
-| **Time-series event-graph modelling** | a `(:Sensor)-[:EMITTED]->(:Reading {seq, ts, value})` LPG, one reading per discrete tick |
+| **Time-series event-graph modelling** | a `(:Sensor {…, location})-[:EMITTED]->(:Reading {sensor, seq, ts, value})` LPG, one reading per discrete tick |
 | **Retention / TTL policy** | a sliding window: each tick `DETACH DELETE`s every reading older than `window` readings |
 | **Sustained ingest + deletion to a steady state** | a long churn loop drives the real engine to a steady state where the live reading count stabilises around `window` |
 | **MVCC delete + tombstone + GC reclamation** | deleted readings are MVCC-tombstoned; a GC maintenance pass physically reclaims their slots into a free-list new inserts reuse |
 | **Bounded on-disk footprint under churn** | the durable footprint **plateaus** — bounded despite total-ingested ≫ window — and the page **high-water mark** is reported |
+| **Geo/time schema — indexes & constraints** | a `POINT` (spatial) index on `Sensor.location`, a composite `RANGE` index on `Reading(sensor, seq)`, a `NODE KEY` on `Sensor.id`, a property-type (`Reading.ts IS :: INTEGER`) + an existence (`Reading.value IS NOT NULL`) constraint — all maintained/enforced under churn |
+| **Spatial + windowed + existence query paths** | a Cartesian proximity query served by the `POINT` index, a per-sensor windowed read served by the composite index, and an `IS NOT NULL` existence scan |
+| **Write-path constraint enforcement** | negative writes (duplicate `Sensor.id`, null `Reading.value`, non-integer `Reading.ts`) are rejected over the real wire |
 | **Deterministic, reproducible workload** | a seeded generator emits a byte-identical churn stream; the whole proof is reproducible |
 
 ---
@@ -36,7 +39,7 @@ A directed Label Property Graph modelling a sensor fleet and its telemetry:
 
 | Node label | Key properties | Meaning |
 | --- | --- | --- |
-| `(:Sensor {id, kind, site})` | `id` = `s-<n>` | a physical sensor / device (created once; never churned) |
+| `(:Sensor {id, kind, site, location})` | `id` = `s-<n>`, `location` = Cartesian `point` | a physical sensor / device (created once; never churned) |
 | `(:Reading {sensor, seq, ts, value})` | `seq` = global monotonic | one time-stamped sample (the churned record) |
 
 One relationship type carries the time-series edge:
@@ -49,6 +52,63 @@ Readings are modelled as **nodes** (not relationship-only payloads) deliberately
 with `DETACH DELETE` tombstones a **node** record, its **property** versions, *and* its incident
 `:EMITTED` **relationship** — so every store kind (node / rel / property / overflow) is recycled
 under churn, which is exactly what the reclamation proof targets.
+
+Each sensor carries a deterministic **Cartesian `location`** point, clustered by its `site`: the four
+sites form a 2×2 grid 1000 units apart, and sensors sharing a site are nudged a few units per slot, so
+a proximity query around a site centre returns exactly that site's sensors.
+
+### Schema — indexes & constraints
+
+The bootstrap declares a production-realistic geo/time schema over the model (six statements, all
+`IF NOT EXISTS`), exercising five of the newer index & constraint kinds. The `iot_churn` in-process
+driver applies these through the typed coordinator seam (`churn::apply_schema`) at bootstrap; a full
+server run (`stream.cypher`, `graphus-cli`) submits the identical statements through the admin surface
+— and the hermetic
+[`iot_timeseries_schema.rs`](../../crates/graphus-server/tests/iot_timeseries_schema.rs) proves the
+string form parses to precisely that typed schema:
+
+```cypher
+CREATE CONSTRAINT sensor_id_key         IF NOT EXISTS FOR (s:Sensor)  REQUIRE s.id IS NODE KEY;
+CREATE CONSTRAINT reading_value_exists  IF NOT EXISTS FOR (r:Reading) REQUIRE r.value IS NOT NULL;
+CREATE CONSTRAINT reading_ts_integer    IF NOT EXISTS FOR (r:Reading) REQUIRE r.ts IS :: INTEGER;
+CREATE POINT INDEX sensor_location_point IF NOT EXISTS FOR (s:Sensor)  ON (s.location);
+CREATE INDEX reading_sensor_seq         IF NOT EXISTS FOR (r:Reading) ON (r.sensor, r.seq);
+CREATE INDEX reading_seq                IF NOT EXISTS FOR (r:Reading) ON (r.seq);
+```
+
+| DDL | Kind | Role |
+| --- | --- | --- |
+| `Sensor.id IS NODE KEY` | `NODE KEY` constraint | the fleet's primary key: present + unique |
+| `Reading.value IS NOT NULL` | existence constraint | every telemetry sample must carry a value |
+| `Reading.ts IS :: INTEGER` | property-type constraint | `ts` is an epoch-ms **integer**, never a float |
+| `Sensor.location` | `POINT` (spatial) index | Cartesian proximity ("sensors near a site") |
+| `Reading(sensor, seq)` | composite `RANGE` index | per-sensor windowed reads (leading `sensor` eq + `seq` range) |
+| `Reading.seq` | `RANGE` index | the retention key the aged-out `DELETE` seeks on |
+
+Every churn insert satisfies the constraints by construction (a `Reading` always carries an integer
+`ts` and a `value`; a `Sensor` always carries a unique `id`), and the retention `DELETE` only removes
+whole readings, so it can never leave a constraint violated. The `Reading` indexes are therefore
+**maintained under churn** — a realistic production stress the reclamation proof runs the engine
+through.
+
+**Empirically-verified index utilisation** (asserted honestly on the real planner in
+`iot_timeseries_schema.rs`, and demonstrated over the wire by
+[`data/churn_cli.sh`](data/churn_cli.sh)):
+
+- **`POINT` index — USED.** A Cartesian `point.distance(s.location, point({x, y})) <= 50` predicate
+  lowers to a `SpatialIndexSeek` (a grid candidate superset with the exact `distance` re-checked as a
+  residual filter, so the index only changes the speed, never the answer). "Sensors near site 0's
+  centre `(0, 0)`" returns **exactly the sensors whose `site == 0`**.
+- **Composite `RANGE` index — USED (leading-key seek).** A per-sensor `sensor = 's-0' AND seq ∈ [a, b)`
+  query lowers to a `NodeIndexSeek` on the composite index for the leading `sensor` equality, with the
+  `seq` range kept as a residual filter. The result equals the `(:Sensor)-[:EMITTED]->(:Reading)`
+  traversal for the same window — a self-validating cross-check.
+- **Existence scan.** `seq IS NOT NULL` (over the indexed `Reading.seq`) lowers to a `NodeIndexScan`
+  (Graphus's existence-scan access path). `value IS NOT NULL` — there being no `RANGE` index on
+  `value`, only the existence *constraint* — stays a correct label scan + residual filter; both count
+  every reading.
+- **Enforcement.** A duplicate `Sensor.id` (NODE KEY), a null `Reading.value` (existence) and a
+  non-integer `Reading.ts` (property-type) are each rejected, leaving the counts unchanged.
 
 ### Logical time and the retention window
 
@@ -121,9 +181,14 @@ steady-state and the plateau are reproducible and assertable. It follows the sam
 binaries.
 
 To *also* show the churn over a real **Bolt-over-UDS wire**, `run.sh` optionally runs
-[`data/churn_cli.sh`](data/churn_cli.sh): it boots a real `graphus-server`, drives ingest + retention
-over a Unix Domain Socket with `graphus-cli`, and asserts the steady-state live count over the wire
-(the wire path tombstones; it does not — and by design cannot — run GC).
+[`data/churn_cli.sh`](data/churn_cli.sh): it boots a real `graphus-server`, declares the geo/time
+**schema** (constraints + indexes) over the real admin surface, drives ingest + retention over a Unix
+Domain Socket with `graphus-cli`, and asserts — over the wire — the steady-state live count, the
+**spatial `POINT` query** (sensors near a site), the **composite windowed read** (cross-checked against
+the `:EMITTED` traversal), and **NODE KEY enforcement** (a rejected duplicate `Sensor.id`), then prints
+`SHOW INDEXES` / `SHOW CONSTRAINTS` as operator-visible evidence. The wire path tombstones deleted
+readings; it does not — and by design cannot — run GC (so it proves the schema + query paths, not the
+storage plateau).
 
 ---
 
@@ -204,8 +269,10 @@ The script:
    reporting the page high-water mark. Captures machine-readable per-round samples.
 3. **No-GC contrast** — a short `--no-gc` slice, showing the linear-growth curve GC flattens
    (informational).
-4. *(optional)* **Bolt-over-UDS wire demo** — boots a real server and drives ingest + retention over
-   a UDS with `graphus-cli`, asserting the steady-state live count over the real wire.
+4. *(optional)* **Bolt-over-UDS wire demo** — boots a real server, declares the geo/time schema over
+   the real admin surface, and drives ingest + retention over a UDS with `graphus-cli`, asserting the
+   steady-state live count, the spatial `POINT` query, the composite windowed read and NODE KEY
+   enforcement over the real wire, and printing `SHOW INDEXES` / `SHOW CONSTRAINTS` as evidence.
 5. **Evidence + baseline gate** — runs `iot_evidence` to emit the standardized `report.json` +
    `report.md` (footprint time series + page high-water + `plateau_ratio` + RSS series + throughput +
    time) into the git-ignored `evidence/` dir, then gates a fresh fast/default run against
@@ -226,6 +293,15 @@ asserts the footprint is *exactly flat* post-warmup (`plateau_ratio == 1.0`), th
 count holds in `[window, window+rate)`, **and** that *without* GC the footprint does **not** plateau
 (so the plateau is demonstrably caused by reclamation, not a no-op). It runs as part of
 `cargo test --all`.
+
+The geo/time **schema** is likewise guarded hermetically in the default `cargo test` by
+[`crates/graphus-server/tests/iot_timeseries_schema.rs`](../../crates/graphus-server/tests/iot_timeseries_schema.rs):
+it drives `Generator::schema_ddl()` through the REAL admin-DDL seam
+(`parse_admin_statement` → `LocalEngine::{index_ddl, constraint_ddl}`) and asserts, in-process, that
+`SHOW INDEXES` / `SHOW CONSTRAINTS` list every declared kind `ONLINE`, that the planner routes the
+proximity / composite / existence queries as documented above, that the query results are correct, and
+that the three constraint negatives are rejected. It is the string-form counterpart of the typed
+coordinator seam the `iot_churn` driver applies, so a drift between the two would fail the suite.
 
 ---
 
