@@ -96,9 +96,11 @@ fn collect_ids(eng: &mut Eng, query: &str) -> Vec<i64> {
 }
 
 /// A `;`-terminated statement iterator over the generated Cypher script, dropping `//` comment lines
-/// and the schema DDL (`CREATE CONSTRAINT` / `CREATE INDEX`) — the engine's `run` path loads data
-/// CREATEs only; the DDL is a performance optimisation the official-driver path applies over Bolt,
-/// not a correctness precondition for detection.
+/// and **every** schema-DDL form now emitted — `CREATE CONSTRAINT …` and any `CREATE [TEXT|RANGE|
+/// POINT|FULLTEXT|VECTOR|LOOKUP] INDEX …` (`rmp` #673 broadened the schema to relationship RANGE,
+/// property-type/existence rel constraints, NODE KEY, and a TEXT index). The engine's `run` path
+/// loads data CREATEs only; the schema DDL is a performance/integrity layer the admin path applies
+/// (exercised end-to-end in `fraud_oltp_schema.rs`), not a correctness precondition for detection.
 fn data_statements(script: &str) -> Vec<String> {
     script
         .lines()
@@ -107,10 +109,15 @@ fn data_statements(script: &str) -> Vec<String> {
         .join("\n")
         .split(';')
         .map(|s| s.trim().to_owned())
-        .filter(|s| {
-            !s.is_empty() && !s.starts_with("CREATE CONSTRAINT") && !s.starts_with("CREATE INDEX")
-        })
+        .filter(|s| !s.is_empty() && !is_schema_ddl(s))
         .collect()
+}
+
+/// Whether `stmt` is a schema-DDL statement (any `CREATE CONSTRAINT` or any `CREATE … INDEX` form,
+/// including `CREATE TEXT INDEX`), which the data-only load path drops.
+fn is_schema_ddl(stmt: &str) -> bool {
+    stmt.starts_with("CREATE CONSTRAINT")
+        || (stmt.starts_with("CREATE") && stmt.contains(" INDEX "))
 }
 
 #[test]

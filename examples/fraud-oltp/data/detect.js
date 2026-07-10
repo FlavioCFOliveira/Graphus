@@ -90,6 +90,36 @@ async function collectIds(driver, query, key) {
   }
 }
 
+// Run a query and return its raw records (used for the SHOW INDEXES / SHOW CONSTRAINTS evidence).
+async function runRecords(driver, query) {
+  const s = driver.session();
+  try {
+    return (await s.run(query)).records;
+  } finally {
+    await s.close();
+  }
+}
+
+// Assert that a write is REJECTED by the schema. The driver observes the rejection as a thrown error;
+// if the write is accepted, that is an integrity failure and we fail loudly.
+async function expectRejected(driver, desc, stmt) {
+  const s = driver.session();
+  let rejected = false;
+  let message = '';
+  try {
+    await s.run(stmt);
+  } catch (e) {
+    rejected = true;
+    message = e.code ? `${e.code}` : e.message;
+  } finally {
+    await s.close();
+  }
+  if (!rejected) {
+    fail(`negative test "${desc}": the write was ACCEPTED but the schema must REJECT it`);
+  }
+  console.log(`  negative test OK: ${desc} rejected (${message})`);
+}
+
 // ---- Detection queries (verified against the real Graphus engine) -------------------------------
 //
 // RINGS: an explicit 3-hop closed cycle a->b->c->a where every TRANSFER is above the fraud amount
@@ -195,6 +225,89 @@ RETURN s.id AS id ORDER BY volume DESC, id`;
 
     console.log(
       `detection matched ground truth EXACTLY: ${gtRings.length} ring-accounts, ${gtMules.length} mules, ${expectedAll.length} fraud accounts total (0 false positives, 0 false negatives)`
+    );
+
+    // ---- TEXT-index investigator query -----------------------------------------------------------
+    // An analyst "find every holder whose name contains …" look-up, accelerated by the TEXT index on
+    // Customer.name. Customer ids are 0..acctCount-1 (one holder per account), so the expected match
+    // set is derivable deterministically without the dataset file.
+    const nameSubstr = 'customer-1';
+    const expectedHolders = [];
+    for (let id = 0; id < acctCount; id++) {
+      if (`customer-${id}`.includes(nameSubstr)) expectedHolders.push(id);
+    }
+    const foundHolders = await collectIds(
+      driver,
+      `MATCH (c:Customer) WHERE c.name CONTAINS '${nameSubstr}' RETURN c.id AS id`,
+      'id'
+    );
+    if (!sameSet(foundHolders, expectedHolders)) {
+      fail(
+        `name CONTAINS '${nameSubstr}' mismatch.\n  detected(${foundHolders.length}): ${JSON.stringify(foundHolders.sort((x, y) => x - y))}\n  expected(${expectedHolders.length}): ${JSON.stringify(expectedHolders)}`
+      );
+    }
+    console.log(`name CONTAINS '${nameSubstr}': ${foundHolders.length} holders (matches expected — TEXT index path)`);
+
+    // ---- Negative integrity tests: the schema must REJECT bad writes -----------------------------
+    // A duplicate Account.id (NODE KEY) and a null-amount TRANSFER (relationship existence) must both
+    // be rejected; the driver observes each rejection as a thrown error.
+    console.log('negative integrity tests (the schema must reject these):');
+    await expectRejected(
+      driver,
+      'duplicate Account.id (NODE KEY)',
+      "CREATE (:Account {id: 0, holder: 0, balance: 1, risk_score: 1, opened_ts: 1, country: 'PT'})"
+    );
+    await expectRejected(
+      driver,
+      'null-amount TRANSFER (relationship existence)',
+      "MATCH (a:Account {id: 0}), (b:Account {id: 1}) CREATE (a)-[:TRANSFER {ts: 1, device: 1, ip: '10.0.0.1'}]->(b)"
+    );
+
+    // ---- Schema evidence: capture SHOW INDEXES + SHOW CONSTRAINTS --------------------------------
+    // Emitted between machine-readable markers so run.sh can persist the listing into the evidence
+    // dir, plus a `GRAPHUS_SCHEMA {json}` counts line the harness harvests.
+    const idxRecords = await runRecords(driver, 'SHOW INDEXES');
+    const consRecords = await runRecords(driver, 'SHOW CONSTRAINTS');
+    const cell = (rec, key) => {
+      if (!rec.keys.includes(key)) return null;
+      const v = rec.get(key);
+      return Array.isArray(v) ? v.map(toNum) : toNum(v);
+    };
+    console.log('GRAPHUS_SCHEMA_BEGIN');
+    console.log('INDEXES:');
+    for (const rec of idxRecords) {
+      console.log(
+        `  ${JSON.stringify({ name: cell(rec, 'name'), type: cell(rec, 'type'), entityType: cell(rec, 'entityType'), labelsOrTypes: cell(rec, 'labelsOrTypes'), properties: cell(rec, 'properties'), state: cell(rec, 'state') })}`
+      );
+    }
+    console.log('CONSTRAINTS:');
+    for (const rec of consRecords) {
+      console.log(
+        `  ${JSON.stringify({ name: cell(rec, 'name'), type: cell(rec, 'type'), entityType: cell(rec, 'entityType'), properties: cell(rec, 'properties'), propertyType: cell(rec, 'propertyType') })}`
+      );
+    }
+    console.log('GRAPHUS_SCHEMA_END');
+
+    // Assert the new index & constraint kinds are actually declared (fail loudly if not).
+    const idxByName = new Map(idxRecords.map((r) => [r.get('name'), r]));
+    const consByName = new Map(consRecords.map((r) => [r.get('name'), r]));
+    const requireIndex = (name, type) => {
+      const r = idxByName.get(name);
+      if (!r) fail(`SHOW INDEXES is missing the '${name}' index`);
+      if (r.get('type') !== type) fail(`index '${name}' should be ${type}, got ${r.get('type')}`);
+    };
+    const requireConstraint = (name, type) => {
+      const r = consByName.get(name);
+      if (!r) fail(`SHOW CONSTRAINTS is missing the '${name}' constraint`);
+      if (r.get('type') !== type) fail(`constraint '${name}' should be ${type}, got ${r.get('type')}`);
+    };
+    requireIndex('transfer_amount_range', 'RANGE');
+    requireIndex('customer_name_text', 'TEXT');
+    requireConstraint('account_id_key', 'NODE_KEY');
+    requireConstraint('transfer_amount_exists', 'RELATIONSHIP_PROPERTY_EXISTENCE');
+    requireConstraint('transfer_amount_integer', 'RELATIONSHIP_PROPERTY_TYPE');
+    console.log(
+      `GRAPHUS_SCHEMA ${JSON.stringify({ indexes: idxRecords.length, constraints: consRecords.length })}`
     );
     // Machine-readable evidence for the run.sh harness: operation count + latency percentiles (ms).
     const stats = {

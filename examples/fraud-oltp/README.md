@@ -17,19 +17,21 @@ and it exits non-zero if any assertion fails.
 |---|------------|-----------------|
 | 1 | **Deterministic, seeded generation** | `graphus-fraud-gen` emits a byte-identical graph + ground truth per profile (fast / large). |
 | 2 | **Bolt-over-TCP + TLS** | Boots `graphus-server` with a self-signed cert; the official driver connects with `bolt+ssc://`. |
-| 3 | **Schema DDL + bulk load + detection** | Over Bolt via the official `neo4j-driver`; asserts the detection finds **exactly** the planted fraud (0 FP, 0 FN). |
-| 4 | **Extreme-concurrency SSI** | Overlapping writer/reader transactions on hot accounts; reports commit/abort tallies; proves **no lost update**. |
-| 5 | **Standardized performance evidence** | Meters the live server (CPU/RSS), the on-disk store/WAL footprint, throughput + latency percentiles + abort rate → `report.json` + `report.md`; gates a fresh run against a committed baseline. |
-| 6 | **Deterministic SSI repro** | The in-process `dst_contention` binary reproduces the contention byte-identically for a fixed seed (the DST discipline). |
+| 3 | **Production-realistic schema (indexes + constraints)** | A `NODE KEY`, a node `UNIQUE`, two **relationship** constraints (`IS NOT NULL`, `IS :: INTEGER`) on `TRANSFER.amount`, node `RANGE` indexes, a **relationship `RANGE` index** on `TRANSFER.amount`, and a **`TEXT` index** on `Customer.name` — declared over Bolt, then exercised (`SHOW INDEXES` / `SHOW CONSTRAINTS`, enforcement, and the `CONTAINS` text path). |
+| 4 | **Schema DDL + bulk load + detection** | Over Bolt via the official `neo4j-driver`; asserts the detection finds **exactly** the planted fraud (0 FP, 0 FN). |
+| 5 | **Constraint enforcement (negative tests)** | The driver observes that a duplicate `Account.id` and a null-`amount` `TRANSFER` are both **rejected** (fails loudly if either is accepted). |
+| 6 | **Extreme-concurrency SSI** | Overlapping writer/reader transactions on hot accounts; reports commit/abort tallies; proves **no lost update**. |
+| 7 | **Standardized performance evidence** | Meters the live server (CPU/RSS), the on-disk store/WAL footprint, throughput + latency percentiles + abort rate → `report.json` + `report.md` + a `schema.txt` listing; gates a fresh run against a committed baseline. |
+| 8 | **Deterministic SSI repro** | The in-process `dst_contention` binary reproduces the contention byte-identically for a fixed seed (the DST discipline). |
 
 ## The data model (Label Property Graph)
 
 | Element | Shape |
 |---------|-------|
-| `(:Customer {id, name, country})` | the account holder |
-| `(:Account {id, holder, balance, risk_score, opened_ts, country})` | a financial account; **`id` is unique** |
+| `(:Customer {id, name, country})` | the account holder; **`id` is `UNIQUE`**, **`name` has a `TEXT` index** |
+| `(:Account {id, holder, balance, risk_score, opened_ts, country})` | a financial account; **`id` is a `NODE KEY`** (present + unique) |
 | `(:Customer)-[:OWNS]->(:Account)` | ownership |
-| `(:Account)-[:TRANSFER {amount, ts, device, ip}]->(:Account)` | a money transfer (the edge detection traverses) |
+| `(:Account)-[:TRANSFER {amount, ts, device, ip}]->(:Account)` | a money transfer (the edge detection traverses); **`amount` is `NOT NULL` + `IS :: INTEGER` + `RANGE`-indexed** |
 
 ### Injected ground truth
 
@@ -50,20 +52,52 @@ negatives**.
 
 Graphus accepts schema DDL as raw statements over Bolt (intercepted by the server's admin matcher,
 **not** the Cypher parser — they must run as auto-commit statements, never inside an explicit
-transaction). The verified, supported forms this example uses:
+transaction). The example declares a **production-realistic** schema that exercises several index and
+constraint kinds — node and relationship, RANGE and TEXT — over exactly the properties the risk model
+reasons about:
 
 ```cypher
-CREATE CONSTRAINT account_id_unique  FOR (a:Account)  REQUIRE a.id IS UNIQUE;
-CREATE CONSTRAINT customer_id_unique FOR (c:Customer) REQUIRE c.id IS UNIQUE;
-CREATE INDEX FOR (a:Account)  ON (a.risk_score);
-CREATE INDEX FOR (c:Customer) ON (c.country);
+-- Node constraints: Account.id is a NODE KEY (present + unique); Customer.id is UNIQUE.
+CREATE CONSTRAINT account_id_key        FOR (a:Account)  REQUIRE a.id IS NODE KEY;
+CREATE CONSTRAINT customer_id_unique    FOR (c:Customer) REQUIRE c.id IS UNIQUE;
+-- Relationship constraints on the money: every TRANSFER must carry an INTEGER amount.
+CREATE CONSTRAINT transfer_amount_exists  FOR ()-[t:TRANSFER]-() REQUIRE t.amount IS NOT NULL;
+CREATE CONSTRAINT transfer_amount_integer FOR ()-[t:TRANSFER]-() REQUIRE t.amount IS :: INTEGER;
+-- Node RANGE indexes on the properties the risk model filters / sorts on.
+CREATE INDEX account_risk_score_range   FOR (a:Account)  ON (a.risk_score);
+CREATE INDEX customer_country_range     FOR (c:Customer) ON (c.country);
+-- Relationship RANGE index on the amount the detection queries filter on.
+CREATE INDEX transfer_amount_range      FOR ()-[t:TRANSFER]-() ON (t.amount);
+-- TEXT (trigram) index accelerating investigator CONTAINS / STARTS WITH / ENDS WITH by name.
+CREATE TEXT INDEX customer_name_text    FOR (c:Customer) ON (c.name);
 ```
 
-> Note: Graphus's **Cypher parser** does not accept `CREATE CONSTRAINT` / `CREATE INDEX` as query
-> clauses; the **server's admin path** does, over Bolt. This is the supported, tested surface (see
-> `crates/graphus-server/tests/db_admin_surface.rs`). The example uses exactly these forms — no
-> invented syntax. The schema is a performance optimisation, not a detection precondition: the
-> hermetic cargo mirror (below) loads the data only and still finds the same fraud.
+Note that `t.amount` is an **INTEGER** in the model (an `i64`), so its property-type constraint is
+`IS :: INTEGER` — never `FLOAT`. The seed data conforms to every constraint, so a schema-first load
+succeeds; the schema is loaded before the data over the live Bolt path (each statement auto-commit).
+
+> **Cypher parser vs admin path.** Graphus's **Cypher parser** does not accept `CREATE CONSTRAINT` /
+> `CREATE INDEX` as query clauses; the **server's admin path** does, over Bolt. This is the supported,
+> tested surface (see `crates/graphus-server/tests/db_admin_surface.rs`). The example uses exactly
+> these forms — no invented syntax. The schema is a performance/integrity layer, not a detection
+> precondition: the data-only hermetic mirror (`fraud_oltp_detection.rs`) loads the CREATEs only and
+> still finds the same fraud.
+
+### What the relationship RANGE index actually optimises (measured)
+
+The detection queries filter transfers by amount with **range** predicates (`t.amount >= 9000`,
+`>= 2000`). We verified empirically (in `fraud_oltp_schema.rs`, against Graphus's real planner) what
+the relationship `RANGE` index on `TRANSFER.amount` serves:
+
+- an **equality** predicate on a relationship property (`t.amount = 9000`) **is** served from the
+  index — it lowers to a `RelIndexSeek`;
+- a **range** predicate (`t.amount >= 9000`) is **not** served — a relationship index seek is
+  equality-only, so the range predicate stays a full traversal + residual `Filter`.
+
+So the index is genuinely built and `ONLINE` (an equality seek returns the seeded rows), but the
+detection queries — being all `>=` — scan and filter rather than seek. We assert this **honestly**:
+the example does not claim range-seek utilisation the engine does not provide. (Node RANGE indexes do
+serve range predicates; the relationship-index seek path is equality-only.)
 
 ## Detection queries
 
@@ -80,6 +114,25 @@ identical** between the official-driver path (`data/detect.js`) and the hermetic
   volume — independently re-identifies the mules.
 
 The detector asserts the union of ring + mule findings equals the planted `fraud_accounts` set.
+
+## Schema exercise, investigator query, and negative tests
+
+After detection, the official-driver path (`data/detect.js`) also exercises the schema itself:
+
+- **TEXT-index investigator query** — `MATCH (c:Customer) WHERE c.name CONTAINS 'customer-1' RETURN
+  c.id`. Customer ids are `0..acctCount-1` (one holder per account), so the expected match set is
+  derived deterministically and asserted exactly (it demonstrates substring matching, not equality).
+- **Negative integrity tests** — the driver attempts a **duplicate `Account.id`** (rejected by the
+  `NODE KEY`) and a **null-`amount` `TRANSFER`** (rejected by the relationship existence constraint),
+  and fails loudly if either is *accepted*. Each rejection surfaces as
+  `Neo.ClientError.Schema.ConstraintValidationFailed` on the wire.
+- **Schema evidence** — it captures `SHOW INDEXES` and `SHOW CONSTRAINTS` and writes the listing to
+  `evidence/schema.txt`, asserting the relationship `RANGE` index, the `TEXT` index, the `NODE KEY`,
+  and the two relationship constraints are all declared.
+
+The hermetic cargo mirror `crates/graphus-server/tests/fraud_oltp_schema.rs` asserts the same things
+in-process (plus a third negative — a non-integer `amount`, rejected by the `IS :: INTEGER`
+constraint — and the empirical planner utilisation of the relationship RANGE index).
 
 ## Running it
 
@@ -101,10 +154,13 @@ RUN_DRIVER=0 examples/fraud-oltp/run.sh
 A successful run ends with:
 
 ```
-10 checks run, 0 failures.
+14 checks run, 0 failures.
 evidence: .../examples/fraud-oltp/evidence {report.json, report.md}
 FRAUD-OLTP DEMONSTRATION PASSED — ...
 ```
+
+(The hermetic `RUN_DRIVER=0` path runs a subset — 5 checks — since the official-driver load/detect,
+concurrency, evidence, and schema steps are skipped.)
 
 The official-driver steps (2–5) require `node`, `npm`, `openssl`, and network access for
 `npm install neo4j-driver`; they are opt-in (auto-enabled when `node`/`npm` are present, via
@@ -168,12 +224,21 @@ across the developer/CI machines a single committed baseline is shared between. 
 
 ## CI coverage (hermetic, default `cargo test`)
 
-The official-driver path needs Node; CI's default `cargo test` does not. The npm-free counterpart is
-`crates/graphus-server/tests/fraud_oltp_detection.rs`: it generates the **same** fast-profile graph +
-ground truth (`graphus-fraud-gen`), loads it into the real engine **in process** via `LocalEngine`
-(no Bolt, no Node, no network), runs the **same** detection queries, and asserts the **same** exact
-ground-truth match. It is part of the default test run; the official-driver E2E stays feature-gated
-(`RUN_DRIVER` for the shell, `neo4j-interop` for the Rust interop test).
+The official-driver path needs Node; CI's default `cargo test` does not. Two npm-free counterparts run
+in the default test run (no Bolt, no Node, no network — both in-process via `LocalEngine`):
+
+- `crates/graphus-server/tests/fraud_oltp_detection.rs` — the **detection mirror**: generates the
+  **same** fast-profile graph + ground truth, loads the data, runs the **same** detection queries, and
+  asserts the **same** exact ground-truth match.
+- `crates/graphus-server/tests/fraud_oltp_schema.rs` — the **schema mirror** (`rmp` #673): drives the
+  generator's DDL block through the real admin path (`parse_admin_statement` →
+  `LocalEngine::{index_ddl, constraint_ddl}`), loads the graph **schema-first**, and asserts the new
+  index/constraint kinds are `ONLINE` (`SHOW INDEXES` / `SHOW CONSTRAINTS`), constraint enforcement
+  (duplicate id, null amount, non-integer amount all rejected), the empirical rel-index utilisation
+  (equality served, range not), and the `TEXT` `CONTAINS` path.
+
+The official-driver E2E stays feature-gated (`RUN_DRIVER` for the shell, `neo4j-interop` for the Rust
+interop test).
 
 ## Where the pieces live
 
@@ -186,8 +251,11 @@ ground-truth match. It is part of the default test run; the official-driver E2E 
   - determinism is guarded by `crates/graphus-fraud-gen/tests/determinism.rs`.
 - **Detection + concurrency Node scripts**: `data/detect.js`, `data/concurrency.js` (official driver;
   both emit a machine-readable `GRAPHUS_STATS {…}` line the harness consumes).
-- **Hermetic cargo mirror**: `crates/graphus-server/tests/fraud_oltp_detection.rs` (default test run).
+- **Hermetic cargo mirrors** (default test run): `crates/graphus-server/tests/fraud_oltp_detection.rs`
+  (detection) and `crates/graphus-server/tests/fraud_oltp_schema.rs` (schema: indexes, constraints,
+  enforcement, planner utilisation, TEXT path).
 - **Evidence harness**: `crates/graphus-examples-harness` (`measure_server`, the report schema, the
   `compare_to_baseline` regression diff).
-- **Evidence output**: `report.json` + `report.md` in `evidence/` (git-ignored). The committed
-  reference run is `baseline.json`.
+- **Evidence output**: `report.json` + `report.md` + `schema.txt` (the captured `SHOW INDEXES` /
+  `SHOW CONSTRAINTS` listing) in `evidence/` (git-ignored). The committed reference run is
+  `baseline.json`.

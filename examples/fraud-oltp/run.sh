@@ -294,6 +294,24 @@ EOF
   DETECT_P99="$(json_field "$DETECT_STATS" p99_ms)"
   DETECT_P999="$(json_field "$DETECT_STATS" p999_ms)"
 
+  # Harvest the schema evidence the detector captured (SHOW INDEXES / SHOW CONSTRAINTS), plus the
+  # counts line. The listing is persisted into the evidence dir in Step 5 (below); here we assert it
+  # was captured and lists the declared index/constraint kinds.
+  SCHEMA_EVIDENCE_FILE="$WORKDIR/schema.txt"
+  printf '%s\n' "$DETECT_OUT" \
+    | sed -n '/GRAPHUS_SCHEMA_BEGIN/,/GRAPHUS_SCHEMA_END/p' > "$SCHEMA_EVIDENCE_FILE"
+  SCHEMA_STATS="$(printf '%s' "$DETECT_OUT" | sed -n 's/^GRAPHUS_SCHEMA //p' | head -n1)"
+  SCHEMA_INDEXES="$(json_field "$SCHEMA_STATS" indexes)"
+  SCHEMA_CONSTRAINTS="$(json_field "$SCHEMA_STATS" constraints)"
+  assert "schema evidence (SHOW INDEXES/CONSTRAINTS) captured" "yes" \
+    "$([ -s "$SCHEMA_EVIDENCE_FILE" ] && echo yes || echo no)"
+  # 6 indexes (2 always-on LOOKUP + 2 node RANGE + 1 rel RANGE + 1 TEXT); 4 constraints (NODE KEY,
+  # node UNIQUE, rel existence, rel property-type). `>=` keeps the gate robust to future additions.
+  assert "SHOW INDEXES lists the declared index kinds" "yes" \
+    "$([ "${SCHEMA_INDEXES:-0}" -ge 6 ] 2>/dev/null && echo yes || echo no)"
+  assert "SHOW CONSTRAINTS lists the declared constraint kinds" "yes" \
+    "$([ "${SCHEMA_CONSTRAINTS:-0}" -ge 4 ] 2>/dev/null && echo yes || echo no)"
+
   # ------------------------------------------------------------------------------------------------
   # Step 4 — extreme-concurrency SSI driver
   # ------------------------------------------------------------------------------------------------
@@ -391,6 +409,17 @@ EOF
     info "measure_server unavailable or server not alive; skipping evidence collection (non-fatal)"
   fi
 
+  # Persist the schema evidence (SHOW INDEXES / SHOW CONSTRAINTS) into the evidence dir, whether or not
+  # the measure harness ran (a fresh listing each run; the dir is git-ignored). This is the human-
+  # readable proof of the exercised index/constraint kinds (rmp #673).
+  if [ -s "$SCHEMA_EVIDENCE_FILE" ]; then
+    mkdir -p "$EVIDENCE_DIR"
+    cp "$SCHEMA_EVIDENCE_FILE" "$EVIDENCE_DIR/schema.txt"
+    assert "schema evidence (SHOW INDEXES/CONSTRAINTS) written to evidence dir" "yes" \
+      "$([ -f "$EVIDENCE_DIR/schema.txt" ] && echo yes || echo no)"
+    info "schema evidence written to $EVIDENCE_DIR/schema.txt"
+  fi
+
   stop_pid="$SERVER_PID"
   kill -TERM "$stop_pid" 2>/dev/null || true
   wait "$stop_pid" 2>/dev/null || true
@@ -420,7 +449,7 @@ assert "DST repro is byte-identical for a fixed seed" "yes" \
 section "Result"
 printf '%s checks run, %s failures.\n' "$CHECKS" "$FAILURES"
 if [ "$RUN_DRIVER" = "1" ] && [ -f "$EVIDENCE_DIR/report.json" ]; then
-  printf 'evidence: %s {report.json, report.md}\n' "$EVIDENCE_DIR"
+  printf 'evidence: %s {report.json, report.md, schema.txt}\n' "$EVIDENCE_DIR"
 fi
 if [ "$FAILURES" -eq 0 ]; then
   if [ "$RUN_DRIVER" = "1" ]; then

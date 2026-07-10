@@ -14,12 +14,14 @@
 //!
 //! # The model
 //!
-//! - `(:Customer {id, name, country})` — the human/legal account holder.
-//! - `(:Account {id, holder, balance, risk_score, opened_ts, country})` — a financial account, with
-//!   a **unique `id`** (the workload declares a `UNIQUE` constraint on it).
+//! - `(:Customer {id, name, country})` — the human/legal account holder (the workload declares a
+//!   `UNIQUE` constraint on its `id` and a `TEXT` index on its `name`).
+//! - `(:Account {id, holder, balance, risk_score, opened_ts, country})` — a financial account, whose
+//!   `id` is a **`NODE KEY`** (present + unique; the workload declares the constraint on it).
 //! - `(:Customer)-[:OWNS]->(:Account)` — ownership.
 //! - `(:Account)-[:TRANSFER {amount, ts, device, ip}]->(:Account)` — a money transfer, the edge the
-//!   detection traverses.
+//!   detection traverses. `amount` carries an **`IS NOT NULL`** and an **`IS :: INTEGER`**
+//!   relationship constraint and a **relationship `RANGE` index** (the detection queries filter on it).
 //!
 //! # Injected ground truth
 //!
@@ -171,7 +173,7 @@ pub struct GenConfig {
 /// A generated account.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Account {
-    /// Unique account id (the workload declares a `UNIQUE` constraint on this).
+    /// Unique account id (the workload declares a `NODE KEY` constraint on this).
     pub id: i64,
     /// Owning customer id.
     pub holder: i64,
@@ -527,16 +529,33 @@ impl Dataset {
     pub fn to_cypher(&self) -> String {
         let mut s = String::with_capacity(self.accounts.len() * 96 + self.transfers.len() * 96);
 
-        // --- Schema (admin DDL — runs as auto-commit statements). Forms verified against the
-        // graphus-server admin matcher: `CREATE CONSTRAINT <name> FOR (n:L) REQUIRE n.p IS UNIQUE`
-        // and `CREATE INDEX FOR (n:L) ON (n.p)`. ---
+        // --- Schema (admin DDL — runs as auto-commit statements). Every form is verified against the
+        // graphus-server admin matcher (see `crates/graphus-server/tests/fraud_oltp_schema.rs`, which
+        // parses this exact block off `parse_admin_statement` and drives it through the real engine).
+        // The seed data conforms to every constraint, so a schema-first load succeeds. ---
         s.push_str("// schema\n");
-        s.push_str("CREATE CONSTRAINT account_id_unique FOR (a:Account) REQUIRE a.id IS UNIQUE;\n");
+        // Node constraints — Account.id is a NODE KEY (present + unique); Customer.id is UNIQUE.
+        s.push_str("CREATE CONSTRAINT account_id_key FOR (a:Account) REQUIRE a.id IS NODE KEY;\n");
         s.push_str(
             "CREATE CONSTRAINT customer_id_unique FOR (c:Customer) REQUIRE c.id IS UNIQUE;\n",
         );
-        s.push_str("CREATE INDEX FOR (a:Account) ON (a.risk_score);\n");
-        s.push_str("CREATE INDEX FOR (c:Customer) ON (c.country);\n");
+        // Relationship constraints on the money the detection reasons about — every TRANSFER must
+        // carry an `amount`, and it must be an INTEGER (`amount` is an i64 in the model, never a FLOAT).
+        s.push_str(
+            "CREATE CONSTRAINT transfer_amount_exists FOR ()-[t:TRANSFER]-() REQUIRE t.amount IS NOT NULL;\n",
+        );
+        s.push_str(
+            "CREATE CONSTRAINT transfer_amount_integer FOR ()-[t:TRANSFER]-() REQUIRE t.amount IS :: INTEGER;\n",
+        );
+        // Node RANGE indexes on the properties the risk model filters / sorts on.
+        s.push_str("CREATE INDEX account_risk_score_range FOR (a:Account) ON (a.risk_score);\n");
+        s.push_str("CREATE INDEX customer_country_range FOR (c:Customer) ON (c.country);\n");
+        // Relationship RANGE index on the amount the detection queries filter on (the exact production
+        // optimisation for the ring / mule / velocity amount floors).
+        s.push_str("CREATE INDEX transfer_amount_range FOR ()-[t:TRANSFER]-() ON (t.amount);\n");
+        // TEXT (trigram) index accelerating investigator `CONTAINS` / `STARTS WITH` / `ENDS WITH`
+        // look-ups by customer name.
+        s.push_str("CREATE TEXT INDEX customer_name_text FOR (c:Customer) ON (c.name);\n");
 
         // --- Customers ---
         s.push_str("// customers\n");
