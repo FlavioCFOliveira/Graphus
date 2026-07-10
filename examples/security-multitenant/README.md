@@ -1,14 +1,25 @@
 # security-multitenant
 
 A realistic, end-to-end demonstration of **fine-grained, multi-tenant security** on Graphus. It
-boots a real, **encrypted-at-rest** `graphus-server` (AES-256-GCM), provisions **isolated tenant
-databases** plus a set of **roles / users / grants** at runtime, and then drives a complete
-**allow/deny authorization matrix** against it from **two** wire protocols — the **REST** API
-(HTTPS + Bearer-JWT, a pure-stdlib `python3` client) and **Bolt-over-TCP** (TLS, the **official
-Neo4j driver**) — asserting every cell. Alongside the live matrix, a **hermetic in-process verifier**
-proves the encryption-at-rest guarantees: the sensitive data is **ciphertext on disk**, the master
-key **rotates offline** with the old key failing closed, and an **encrypted backup round-trips
-losslessly**.
+provisions **isolated tenant databases** plus a set of **roles / users / grants / DENYs** at runtime,
+then drives a complete **authorization surface** — the allow/deny matrix, a **fine-grained DENY**
+(property-scope + label-scope), and **broadened cross-tenant no-leak** probes — against a live server
+from **two** wire protocols: the **REST** API (HTTPS + a Bearer obtained from `POST /auth/login`, a
+pure-stdlib `python3` client) and **Bolt-over-TCP** (TLS, the **official Neo4j driver**), asserting
+every cell over both. It runs in **two modes**:
+
+- **LOCAL (default)** — boots a real, **encrypted-at-rest** `graphus-server` (AES-256-GCM), drives the
+  full surface, measures the encryption overhead against a cleartext twin, runs a **hermetic in-process
+  verifier** of the encryption-at-rest guarantees (ciphertext on disk, offline key rotation, encrypted
+  backup roundtrip), and collects the full evidence set (server CPU/RSS, on-disk **tenant** store/WAL
+  footprint, a committed-baseline regression gate) plus a server-side `/metrics` delta.
+- **EXTERNAL / ATTACH** — when any of `GRAPHUS_TARGET_{BOLT,REST,UDS}` is set, it does **not** boot a
+  server: it attaches to an **already-running** instance (local or remote, e.g. `pi516`) via the shared
+  external-target seam, authenticates with `POST /auth/login`, provisions an **isolated, namespaced**
+  set of tenants/roles/users (idempotent, `IF NOT EXISTS`), drives the RBAC + cross-tenant + DENY
+  (feature-detected) wire legs, scrapes the target's `/metrics` (incl. the auth-failure signal) via
+  `measure_target` (`measurement_mode=external`), then **tears everything down** (`DROP` database/role/
+  user) on exit so the target is left exactly as it was found.
 
 It doubles as an executable E2E test: `run.sh` exits non-zero the moment any assertion fails.
 
@@ -17,36 +28,32 @@ It doubles as an executable E2E test: `run.sh` exits non-zero the moment any ass
 | Capability | How |
 | --- | --- |
 | Tenant isolation | one Graphus **database per tenant** (`CREATE DATABASE` at runtime — a hard isolation boundary) |
-| Fine-grained RBAC | `CREATE ROLE/USER` + `GRANT <action> ON <scope>` with graded actions (Traverse ⊂ Read ⊂ Write) and a containment model (Database ⊇ Graph(db) ⊇ {Label, RelType, Property}) |
-| Authorization matrix | read/write/admin × {tenant_a, tenant_b} × {allow, deny}, plus unauthenticated, asserted per cell |
-| Two wire protocols | the **same** matrix driven over **REST** (HTTPS + JWT) and **Bolt** (TLS + official driver), from one manifest |
-| Cross-tenant denial | a tenant_a-scoped user is denied tenant_b — 403 over REST, value-level filtered (zero rows, no leak) over Bolt |
-| Encryption at rest | AES-256-GCM page + WAL encryption via an HKDF keyring from a 32-byte master key file |
-| Ciphertext-on-disk proof | a known sensitive token is **absent** from the raw encrypted store but **present** in a cleartext store |
-| Offline key rotation | `rotate_master_key` re-keys the database; data intact across, **old key fails closed** |
-| Encrypted backup | `backup_store` → `seal_backup` (no plaintext in the sealed bytes) → `open_backup` → `restore` (lossless) |
-| Encryption overhead | the same seed workload run encrypted vs cleartext, reporting the time + storage delta |
+| Fine-grained RBAC | `GRANT <action> ON <scope>` with graded actions (Traverse ⊂ Read ⊂ Write) and the containment model (Database ⊇ Graph(db) ⊇ {Label, RelType, Property}) |
+| **Negative privilege (DENY)** | `DENY READ ON PROPERTY db.Label.prop` (property reads back **NULL**) and `DENY TRAVERSE ON LABEL db.Label` (node **invisible**), layered over a GRANT with **deny-precedence** — incl. the multi-label `#645` regression guard |
+| Authorization matrix | read/write/admin × {tenant_a, tenant_b} × {allow, deny}, plus unauthenticated, asserted per cell over both protocols |
+| **Cross-tenant no-leak** | as a tenant_a user against tenant_b, `Patient.ssn` / `Record.secret_token` / all nodes / `count(n)` each return **no data** — over REST **and** Bolt |
+| Two wire protocols | the **same** surface driven over **REST** (HTTPS + JWT via `/auth/login`) and **Bolt** (TLS + official driver), from one manifest |
+| Remote-capable | the RBAC/DENY/cross-tenant/auth wire legs run against an **already-running** instance (`--base-url` / a Bolt URI), isolated + torn down |
+| Encryption at rest *(LOCAL-only)* | AES-256-GCM page + WAL encryption; ciphertext-on-disk proof; offline key rotation; encrypted backup roundtrip; encryption overhead |
+| /metrics auth-failure signal | scrapes `graphus_auth_failures_total` before→after and asserts it moved (with the confirmed REST-parity finding) |
 
 ## The sensitive multi-tenant model
 
-Each tenant lives in its **own database** — a hard isolation boundary. Within a tenant the graph
-models sensitive healthcare PII:
+Each tenant lives in its **own database** — a hard isolation boundary. Within a tenant the graph models
+sensitive healthcare PII:
 
-| Node label | Key properties | Meaning |
-| --- | --- | --- |
-| `(:Patient {id, name, ssn, country})` | | a patient holding sensitive PII (`ssn` is a pseudo-SSN) |
-| `(:Record {id, patient, diagnosis, secret_token})` | | a clinical record; `secret_token` is a per-record secret |
-| `(:Secret {name})` | | one canary per tenant (`A_SECRET` / `B_SECRET`) — the exact probe the RBAC matrix reads |
+| Node label | Meaning |
+| --- | --- |
+| `(:Patient {id, name, ssn, country})` | a patient holding sensitive PII (`ssn` is a pseudo-SSN) |
+| `(:Record {id, patient, diagnosis, secret_token})` | a clinical record; `secret_token` is a per-record secret |
+| `(:Secret {name})` | one canary per tenant (`A_SECRET` / `B_SECRET`) — the exact probe the RBAC matrix reads |
+| `(:Secret:Confidential {name})` *(DENY demo)* | a **multi-label** node (`A_CONFIDENTIAL`) the `#645` deny-precedence guard keys on |
 
 | Relationship | Direction | Meaning |
 | --- | --- | --- |
 | `:HAS_RECORD` | `(:Patient)→(:Record)` | a patient owns a clinical record |
 
-The first record of each tenant carries a **stable sensitive token** (`TENANT_A_SECRET_TOKEN` /
-`TENANT_B_SECRET_TOKEN`) — the fixed plaintext the **ciphertext-on-disk** proof greps for in the raw
-device bytes.
-
-## The RBAC model (roles · users · grants)
+## The RBAC model (roles · users · grants · DENYs)
 
 | Role | Grant | Meaning |
 | --- | --- | --- |
@@ -56,251 +63,195 @@ device bytes.
 
 | User | Role | |
 | --- | --- | --- |
-| `alice` | `reader_a` | |
+| `alice` | `reader_a` | additionally **DENY**-ed `Patient.ssn` (property) and `Confidential` (label) |
 | `wendy` | `writer_a` | |
 | `ana` | `analyst` | |
-| `neo4j` | — (bootstrap) | holds the global **Admin** privilege; provisions everything; read/write any tenant |
+| `neo4j`/target admin | — (bootstrap) | holds the global **Admin** privilege; provisions everything; read/write any tenant |
 
-### The allow/deny matrix (asserted on every run)
-
-The generator emits this matrix into `manifest.json`; both the REST and the Bolt workload drive and
-assert **every cell** from it:
+### The allow/deny matrix (asserted on every run, over both protocols)
 
 | User | tenant_a READ | tenant_a WRITE | tenant_b READ | tenant_b WRITE |
 | --- | --- | --- | --- | --- |
 | `alice` (reader_a) | **allow** | deny | deny *(cross-tenant)* | deny |
 | `wendy` (writer_a) | allow *(write⊇read)* | **allow** | deny | deny |
 | `ana` (analyst) | allow | deny | **allow** *(server-wide)* | deny |
-| `neo4j` (admin) | allow | **allow** | allow | **allow** |
+| admin | allow | **allow** | allow | **allow** |
 | _unauthenticated_ | **401** | — | — | — |
 
-`allow` ⇒ HTTP 200 / no Bolt error; `deny` ⇒ HTTP 403 (`Neo.ClientError.Security.Forbidden`);
-unauthenticated ⇒ HTTP 401 (`Neo.ClientError.Security.Unauthorized`).
+`allow` ⇒ HTTP 200 / no Bolt error; a denied **write** ⇒ HTTP 403 (`Neo.ClientError.Security.Forbidden`)
+/ Bolt Forbidden throw; a denied **read** ⇒ 403 (REST coarse gate) **or** zero rows (Bolt value-level
+filter) — **no leak either way**; unauthenticated ⇒ HTTP 401 (`Neo.ClientError.Security.Unauthorized`).
 
-### How tenants are provisioned (runtime DDL — this works)
+### Fine-grained DENY (property + label scope; the `#645` regression guard)
 
-Tenants are created **at runtime** by the admin via Graphus's RBAC admin grammar (intercepted before
-Cypher, runs over Bolt **or** REST, and persists to `security.toml`). The generator's
-`provision.cypher` is exactly this sequence, run as the admin over `/db/graphus/tx/commit` (admin DDL
-is database-agnostic and must run as auto-commit — it is rejected inside an explicit transaction):
+Layered over `reader_a`'s `GRANT READ ON GRAPH tenant_a`:
 
 ```cypher
-CREATE DATABASE tenant_a IF NOT EXISTS;
-CREATE DATABASE tenant_b IF NOT EXISTS;
-CREATE ROLE reader_a IF NOT EXISTS;
-CREATE ROLE writer_a IF NOT EXISTS;
-CREATE ROLE analyst  IF NOT EXISTS;
-GRANT READ  ON GRAPH tenant_a TO reader_a;
-GRANT WRITE ON GRAPH tenant_a TO writer_a;
-GRANT READ  ON DATABASE       TO analyst;
-CREATE USER alice SET PASSWORD 'alice-secret-pw' IF NOT EXISTS;
-CREATE USER wendy SET PASSWORD 'wendy-secret-pw' IF NOT EXISTS;
-CREATE USER ana   SET PASSWORD 'ana-analyst-pw'  IF NOT EXISTS;
-GRANT ROLE reader_a TO alice;
-GRANT ROLE writer_a TO wendy;
-GRANT ROLE analyst  TO ana;
+DENY READ ON PROPERTY tenant_a.Patient.ssn TO reader_a;
+DENY TRAVERSE ON LABEL tenant_a.Confidential TO reader_a;
 ```
 
-### Honest note — how READ deny differs over REST vs Bolt
+With **deny-precedence**, the workloads assert (as `alice`, and re-checked as the admin to prove the
+data exists and only the DENY hides it):
 
-The two wire protocols both **deny** the wrong tenant and **never leak** data across the boundary,
-but they enforce a denied **read** through different layers, which is worth stating precisely:
+- **property NULL** — `MATCH (p:Patient) RETURN p.ssn` returns rows, but every `ssn` reads back **NULL**
+  for `alice` (non-NULL for the admin);
+- **node invisible** — `MATCH (c:Confidential) RETURN c` returns **zero rows** for `alice` (≥1 for the
+  admin);
+- **`#645` multi-label precedence** — `MATCH (s:Secret) WHERE s.name = 'A_CONFIDENTIAL' RETURN s`
+  returns **zero rows** for `alice`: the node stays hidden **even when queried via its *other*
+  (`:Secret`) label**. This is the exact regression guard for the `rmp #645` bug where an OR-union of
+  labels dropped DENY-precedence on multi-label nodes.
 
-- **REST** has a coarse up-front gate (`authorize_mode` in `crates/graphus-rest/src/router.rs`):
-  before running anything it checks `Privilege::on_graph(action, db)` for the *target* database, so a
-  cross-tenant read is rejected with **403** before a single row is scanned.
-- **Bolt** has no such coarse gate; it relies on Graphus's **fine-grained, value-level RBAC filter**
-  (`AuthorizedGraph` + `EffectivePrivileges` in `crates/graphus-cypher` / `graphus-server`): an
-  ungranted label is **filtered out of the scan**, so a cross-tenant read **succeeds but returns zero
-  rows** — the canary `:Secret` is invisible. **No sensitive data crosses the tenant boundary** in
-  either case; the difference is *403 (REST) vs empty result (Bolt)*. A denied **write** throws
-  `Neo.ClientError.Security.Forbidden` on both. The Bolt client asserts exactly this: an allowed read
-  returns ≥1 canary row, a denied/cross-tenant read returns **0 rows**, a denied write throws
-  Forbidden.
+**Version tolerance.** `DENY` is a newer part of the security grammar. The wire legs **feature-detect**
+it: if the target rejects `DENY` (an older build answers a `400` SyntaxError on the leading `DENY`), the
+demo **records the version gap** and skips the DENY assertions rather than failing — while still
+asserting the full GRANT-scoped RBAC and cross-tenant isolation. The full modern DENY coverage (incl.
+the `#645` guard) is asserted against a **current** server (LOCAL mode). See "Confirmed findings".
 
-### A real security bug this example caught and fixed (`#287`)
+### Broadened cross-tenant no-leak probes
 
-Building this demonstration surfaced — and fixed — a genuine authorization bug in the REST path: the
-coarse up-front gate (`authorize_mode`) was checking the privilege against the **server-wide
-`Database` scope** rather than the **graph scope of the target tenant database**. The effect was that
-a *graph-scoped* grant (`GRANT READ ON GRAPH tenant_a TO reader_a` — exactly this example's RBAC
-model) was **false-denied on its own tenant over REST**: `alice` could not read `tenant_a` even though
-her grant authorized it. The fix makes the gate authorize against `Privilege::on_graph(action, db)`
-for the *target* database, so a graph-scoped grant correctly **allows its own tenant** while still
-**denying every sibling tenant**. The matrix's `alice → tenant_a [allow]` / `alice → tenant_b [deny]`
-cells are the direct regression guard, asserted over REST in `run.sh` **and** held in the default
-`cargo test` run by the hermetic mirror (below).
+As `alice` (tenant_a-scoped) against **tenant_b**, over **both** protocols, the demo asserts that none
+of the following ever returns any of the other tenant's data:
+
+```cypher
+MATCH (p:Patient) RETURN p.ssn        -- no cross-tenant PII
+MATCH (r:Record)  RETURN r.secret_token
+MATCH (n)         RETURN n            -- no cross-tenant node at all
+MATCH (n)         RETURN count(n)     -- the cross-tenant count is 0
+```
+
+Over **REST** the coarse up-front gate answers **403**; over **Bolt** the value-level RBAC filter
+answers **zero rows / count 0**. Either way **no sensitive datum crosses the tenant boundary** — a
+broadening of the original single `:Secret`-canary check to the full PII surface.
+
+## Encryption at rest (LOCAL-only)
+
+The live LOCAL server is booted **encrypted** (`[encryption] key_path = <32-byte master key>`), deriving
+per-purpose AES-256-GCM subkeys via an HKDF keyring for every store page and WAL frame. These legs read
+**raw store bytes** and therefore **cannot** target a remote server; in EXTERNAL mode they are skipped
+with a clear note.
+
+- **Ciphertext on disk** — a known sensitive token (`TENANT_A_SECRET_TOKEN`) is **absent** from the raw
+  encrypted store and **present** in a cleartext store built identically.
+- **Offline key rotation** — `rotate_master_key` re-keys the database; data intact across, **old key
+  fails closed** (KCV `Security` error, never a silent misread).
+- **Encrypted backup roundtrip** — `backup_store` → `seal_backup` (no plaintext in the sealed bytes) →
+  `open_backup` → `restore` (lossless); a wrong key fails closed.
+- **Encryption overhead** — the **same** seeded dataset is loaded into an **isolated** database on
+  **both** the encrypted server (`overhead_enc`) and a cleartext twin (`overhead_clear`), and **only
+  those two db stores** are compared (see "Evidence fixes"), so the store-byte delta is purely the
+  bounded per-page GCM tag/nonce cost.
+
+## Confirmed findings (server)
+
+Two confirmed server behaviours are documented and exercised here (both **outside** this example's
+edit scope — reported for fixing, not fixed here):
+
+1. **REST auth-failure metric parity gap** — `graphus_auth_failures_total` is incremented **only** by
+   Bolt authentication failures (`listeners/bolt.rs`) and by a bad Bearer on the `/metrics` endpoint
+   itself (`listeners/extra_routes.rs`). A REST **data-plane** 401 (missing/invalid Bearer on
+   `/db/*/tx/commit`) and a `/auth/login` failure do **not** bump it — they only emit an audit record
+   via `RestAuthObserver::on_auth_failure` (`engine/seam_rest.rs`). **Repro (pi516, verified this
+   session):** counter `4` → bad-Bearer `GET /metrics` → `5`; a data-plane `POST /db/graphus/tx/commit`
+   with no Bearer (401) and a `POST /auth/login` with bad creds (401) both leave it at `5`. The demo
+   therefore moves the counter with a deliberate bad-Bearer `GET /metrics` (and, when the Bolt leg
+   runs, the unauthenticated Bolt connection), and asserts the before→after delta ≥ 1.
+2. **`verify_password` unknown-user timing oracle (`rmp #500`)** — a login for an **unknown** user
+   skips the Argon2 verification a wrong-password-for-an-existing-user performs, so response-time
+   differs (a user-enumeration side-channel). The REST `/auth/login` path already returns a **uniform**
+   401 body for both cases (no user-exists oracle in the response), and throttles per account, but the
+   **timing** oracle in `verify_password` remains. (Not exercised as a hard assertion — timing
+   assertions are flaky across hosts — but documented with its `rmp` id.)
+
+3. **DENY grammar version gap (observed on pi516)** — the pinned pi516 build predates the `DENY`
+   security DDL and rejects it with a `400` SyntaxError; the demo records this and validates the full
+   modern DENY coverage against a current server.
+
+## Evidence fixes (`rmp #696`)
+
+Two methodology defects in the prior evidence were corrected:
+
+- **(a) storage measured the wrong store.** The prior run metered the empty default `graphus` database.
+  It now meters a **real tenant database store** (`databases/tenant_a/graphus.store`) as the primary
+  storage vector, and reports the **all-tenants** store/WAL **sum** as `tenant_store_bytes` /
+  `tenant_wal_bytes` params (`measure_server` walks a single path per vector). The committed
+  `baseline.json` was regenerated against the tenant store.
+- **(b) encryption overhead was apples-to-oranges.** The prior comparison measured the whole encrypted
+  tree (two seeded tenants) against a nearly-empty cleartext tree. It now seeds the **identical**
+  `tenant_a` dataset into an **isolated** database on each side (`overhead_enc` / `overhead_clear`) and
+  compares **only those two db stores**, so the delta is purely encryption overhead.
 
 ## A hermetic mirror in the default `cargo test` run
 
-The wire demonstration above needs `openssl` + `python3` (and `node`/`npm` for the Bolt leg). So the
-example is **also** mirrored by an in-process integration test that runs in the ordinary, dependency-
-free `cargo test` — `crates/graphus-server/tests/security_multitenant.rs`. It is the regression gate
-for both halves of the scenario:
-
-- **RBAC matrix** — it generates the *same* deterministic fast-profile scenario (`graphus-security-gen`),
-  boots the **real `graphus_rest` axum router** over a real engine, and drives **every** matrix cell
-  through `tower::oneshot` (no TLS, no socket, no python, no Node): provisioning + per-tenant seed as
-  the admin, then each `(user, tenant, access_mode)` probe with that user's **live** Bearer JWT,
-  asserting `allow ⇒ 200` / `deny ⇒ 403` (`Neo.ClientError.Security.Forbidden`) / `unauth ⇒ 401`. The
-  `#287` allow/deny pair is asserted explicitly.
-- **Encryption at rest** — it drives the *same* crypto stack `security_verify` proves
-  (`graphus-crypto` + `graphus-storage` + `key_rotation`), asserting ciphertext-on-disk, offline key
-  rotation (old key fails closed), and the encrypted-backup roundtrip — in process, deterministically.
-
-The test depends on `graphus-security-gen` only with its **default (serde-only) features** — never the
-`dst-repro` feature (which depends on `graphus-server` and would form a cycle); the crypto leg uses
-`graphus-server`'s own direct dependencies. It is a **test-target dev-dependency**: it never enters
-the production build.
-
-## Encryption at rest
-
-The live server is booted **encrypted** (`run.sh` step 3). The configuration adds an `[encryption]`
-section pointing at a 32-byte master key file:
-
-```toml
-[encryption]
-key_path = "<workdir>/master.key"     # raw 32 bytes (or 64 hex chars) => AES-256-GCM + HKDF keyring
-```
-
-`run.sh` generates the key with `head -c 32 /dev/urandom > master.key`. From this master key Graphus
-derives, via an **HKDF keyring**, the per-purpose subkeys that encrypt every **store page** and every
-**WAL frame** with AES-256-GCM (each page/frame authenticated by its own GCM tag; a key-check value,
-KCV, in the device + WAL headers makes a wrong key **fail closed** rather than misread).
-
-### Ciphertext on disk (proof)
-
-The hermetic verifier seeds a known sensitive plaintext (`TENANT_A_SECRET_TOKEN`) into an encrypted
-store, then greps the raw `graphus.store` bytes: the token must be **ABSENT**. To prove the test is
-*meaningful* (the absence is encryption, not a mis-seed) it builds the **same** graph in a
-**cleartext** store and confirms the token **IS present** there in the clear.
-
-### Offline key rotation (stop → rotate → swap key → restart)
-
-Key rotation is an **offline** operation, **not** an online admin command. The verifier drives
-`graphus_server::key_rotation::rotate_master_key(db_dir, device_file, wal_file, old, new)` directly
-against a store it created. The operator procedure is:
-
-1. **stop** the server (the database must be offline — rotation rewrites the device + WAL),
-2. call `rotate_master_key` per database directory (it recovers, re-encrypts the device + WAL under
-   the new key, and swaps them atomically via a crash-safe commit marker),
-3. **replace** the key file at `encryption.key_path` with the new key,
-4. **restart** the server.
-
-The verifier asserts the data is intact + readable **across** the rotation (decrypted pages are
-byte-for-byte identical) and that the **OLD key fails closed** (a `Security` error via the KCV — never
-a silent misread). The rotation is crash-safe at every window (see the per-window analysis in
-`crates/graphus-server/src/key_rotation.rs`).
-
-### Encrypted backup round-trip
-
-`graphus_storage::backup::backup_store` snapshots a (possibly encrypted) store to a **plaintext**
-artifact (it reads page *images* above the device seam — which is exactly why the artifact must be
-sealed before it leaves the machine). The verifier:
-
-1. `backup_store` → a plaintext artifact (asserted to **contain** the secret in the clear);
-2. `graphus_crypto::backup_envelope::seal_backup(artifact, master)` → an **encrypted** artifact,
-   asserted to **NOT contain** the secret nor a verbatim prefix of the plaintext;
-3. `open_backup(sealed, master)` → `verify_backup` → `restore(...)` into a **fresh** store, asserted
-   **lossless** (the restored graph is identical);
-4. a **wrong** master key fails `open_backup` closed.
-
-It measures the backup/restore time and the artifact + sealed sizes.
+The example is also mirrored by an in-process integration test in the ordinary, dependency-free
+`cargo test` — `crates/graphus-server/tests/security_multitenant.rs`. It generates the *same*
+deterministic fast-profile scenario, boots the real `graphus_rest` axum router over a real engine, and
+drives **every base matrix cell** through `tower::oneshot` (no TLS, no socket, no python, no Node),
+asserting `allow ⇒ 200` / `deny ⇒ 403` / `unauth ⇒ 401`; it also drives the same crypto stack the
+verifier proves. The generator's additive DENY / cross-tenant sections are consumed only by the wire
+clients and leave this mirror's base matrix (7 allow / 7 deny / 1 unauth) unchanged.
 
 ## The deterministic generator — `crates/graphus-security-gen`
 
-A **dev-only leaf crate** (`publish = false`, depended upon by nothing — in particular **not**
-`graphus-server`, so it adds zero overhead to the shipped binary). It emits:
+A **dev-only leaf crate** (`publish = false`, depended upon by nothing in the production build). It
+emits, for a `(profile[, namespace])`:
 
-- `provision.cypher` — the admin RBAC DDL above (databases, roles, grants, users);
-- `tenant_a.cypher` / `tenant_b.cypher` — each tenant's canary `:Secret` + sensitive patient/record
-  PII (run inside that tenant's database, as the admin);
-- `manifest.json` — the tenants, users (with passwords), roles, grants and the expected allow/deny
-  matrix the workloads drive and assert from.
+- `provision.cypher` — the admin RBAC DDL (databases, roles, grants, users; all `IF NOT EXISTS`);
+- `deny.cypher` — the fine-grained DENY grants;
+- `teardown.cypher` — the idempotent `DROP` of every database/role/user (`STOP` then `DROP DATABASE`);
+- `<database>.cypher` — each tenant's canary `:Secret` + sensitive patient/record PII;
+- `manifest.json` — the tenants, users (with passwords), roles, grants, the allow/deny matrix, the DENY
+  grants + seed + checks, and the cross-tenant probes the workloads drive and assert from.
 
-Generation is a pure function of `(seed, profile)` (an internal `SplitMix64` PRNG; no floats, no
-`HashMap` iteration, no clock), so the artifacts are **byte-identical** across runs, hosts, and
-platforms. `cargo test -p graphus-security-gen` proves this. The RBAC matrix is **structural** and
-identical regardless of profile; only the PII volume differs.
+`--namespace <ns>` prefixes every tenant-database / role / user name (the bootstrap admin is never
+namespaced) so a **shared** external target hosts collision-free, cleanly torn-down provisioning.
+Generation is a pure function of `(seed, profile, namespace)` — with **no** namespace the output is
+byte-identical to the historical generator (`cargo test -p graphus-security-gen` proves determinism).
 
 | Profile | Patients / tenant | Use |
 | --- | --- | --- |
-| `fast` (default) | 40 | CI + the live RBAC-matrix E2E assertions |
-| `large` | 1500 | evidence-scale (bigger encrypted store footprint) |
-
-```bash
-cargo run -p graphus-security-gen --bin security_gen -- --profile fast --out-dir /tmp/sec
-```
-
-The crate also ships:
-
-- `security_verify` (behind the `dst-repro` feature) — the hermetic in-process
-  encryption/rotation/backup verifier described above (prints `GRAPHUS_SECURITY_VERIFY_OK` +
-  a `GRAPHUS_STATS {…}` line). Run with no network:
-
-  ```bash
-  cargo run -p graphus-security-gen --features dst-repro --bin security_verify
-  ```
-
-- `sec_baseline_cmp` — the committed-baseline regression gate (the structural-only comparator, named
-  distinctly to avoid a binary-name collision with the other example crates' comparators).
+| `fast` (default) | 40 | CI + the live matrix E2E assertions |
+| `large` | 1500 | evidence-scale (bigger store footprint) |
 
 ## Running it
 
 From the repository root:
 
 ```bash
+# LOCAL — boots an encrypted server, runs everything, collects evidence + baseline gate:
 examples/security-multitenant/run.sh
-```
 
-Reuse pre-built binaries and tune the profile:
-
-```bash
-cargo build --release -p graphus-server
-cargo build --release -p graphus-security-gen --bin security_gen --bin sec_baseline_cmp
-cargo build --release -p graphus-security-gen --features dst-repro --bin security_verify
+# Reuse pre-built binaries / tune the profile:
 GRAPHUS_BIN_DIR=target/release SEC_PROFILE=large examples/security-multitenant/run.sh
+
+# EXTERNAL / ATTACH — against an already-running instance (e.g. pi516), isolated + torn down:
+GRAPHUS_TARGET_REST=https://100.89.148.30:7474 \
+  GRAPHUS_TARGET_BOLT=bolt+ssc://100.89.148.30:7687 \
+  GRAPHUS_TARGET_USER=graphus GRAPHUS_TARGET_PASSWORD=graphus-local \
+  GRAPHUS_TARGET_TLS_INSECURE=1 examples/security-multitenant/run.sh
 ```
 
 | Env var | Default | Meaning |
 | --- | --- | --- |
-| `GRAPHUS_BIN_DIR` | `target/release` | where to find `graphus-server` / `security_gen` / `security_verify` (built if missing) |
+| `GRAPHUS_BIN_DIR` | `target/release` | where to find `graphus-server` / `security_gen` / `security_verify` (built if missing, LOCAL) |
 | `SEC_PROFILE` | `fast` | dataset scale (`fast` / `large`) |
 | `RUN_DRIVER` | `auto` | run the Bolt leg via the official driver (`1`/`0`; auto = on when node/npm present) |
+| `GRAPHUS_TARGET_*` | — | set any of `REST`/`BOLT`/`UDS` to switch to EXTERNAL/attach mode (see `_harness/harness.sh`) |
 
-**Requirements:** a Unix host (Linux/macOS), `bash`, `openssl` (self-signed cert), and `python3`
-(3.8+, **stdlib only** — no pip packages). The Bolt leg additionally needs `node` (v18+), `npm`, and
-network/cache access (for `npm install neo4j-driver`). The generator and the crypto verifier are
-hermetic and CI-runnable on their own; if `openssl`/`python3` (or node/npm for Bolt) are absent, the
-corresponding leg is skipped with a clear note while the hermetic assertions still run.
+**Requirements:** a Unix host, `bash`, `python3` (3.8+, **stdlib only**). LOCAL also needs `openssl`
+(self-signed cert); EXTERNAL needs `curl`. The Bolt leg additionally needs `node` (v18+), `npm`, and
+network/cache access (`npm install neo4j-driver`), and in EXTERNAL mode `GRAPHUS_TARGET_BOLT`.
 
 ## Evidence
 
-The python client emits a single machine-readable `GRAPHUS_STATS {…}` line (tenants, roles, users,
-matrix cell tallies, seeded statements); `run.sh` feeds it — together with the verifier's
-rotation/backup numbers, the **live server process's** CPU + peak RSS, the on-disk store/WAL
-footprint, and the **encryption-overhead** measurement — into the dev-only `measure_server` harness,
-which writes the standardized, schema-versioned **`evidence/report.json` + `evidence/report.md`** (the
-`evidence/` dir is git-ignored). The path is printed in the run summary.
-
-### What is measured
-
-| Vector | Source |
-| --- | --- |
-| **RBAC matrix** | allow/deny/401 cell tallies, asserted over REST and Bolt |
-| **Ciphertext on disk** | sensitive token absent from the encrypted store, present in cleartext |
-| **Key rotation** | rotation time; data intact across; old key rejected |
-| **Encrypted backup** | artifact + sealed sizes; backup/restore time; lossless; wrong key rejected |
-| **Encryption overhead** | seed time + on-disk store bytes, encrypted vs cleartext |
-| **Server CPU / RAM** | the live server PID's cumulative CPU + sampled peak RSS |
-| **Storage footprint** | on-disk store + WAL bytes/pages after the seed |
-| **Dataset size** | nodes + relationships across both tenants |
-
-### STABLE vs MACHINE-VARIANT
-
-The committed-baseline gate (`sec_baseline_cmp`) holds only the **deterministic / structural**
-metrics — the dataset size and the on-disk store/WAL footprint, byte-stable for a fixed seed +
-profile — to a tight 15 % band, and ignores the **machine-variant** families (CPU, RSS, latency,
-throughput, and the single-run encryption-overhead *timing*; the storage *delta* is the stable
-overhead signal — bounded per-page GCM tag/nonce cost). A drift in the deterministic metrics **fails
-the run**.
+LOCAL emits the standardized, schema-versioned `evidence/report.json` + `report.md` via `measure_server`
+(server CPU + peak RSS, the on-disk **tenant** store/WAL footprint, dataset size, the RBAC/DENY/
+cross-tenant tallies, the encryption-overhead deltas, the verifier's rotation/backup numbers, and the
+auth-failure delta), gated against the committed `baseline.json` on the **structural** metrics only.
+EXTERNAL emits `report.json` in `measurement_mode=external` via `measure_target`: the process CPU/RSS +
+on-disk storage vectors are N/A remotely, and the payload is the server-side `/metrics` before→after
+**delta** for the run's dedicated tenant database (committed/aborted txns, query-duration histogram, the
+health invariants, and the auth-failure signal as params), with a host-independent invariant gate
+(`--assert`: zero statement panics / recovery panics / force-detach; the server observed the workload).
+The `evidence/` dir is git-ignored.

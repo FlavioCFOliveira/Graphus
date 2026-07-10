@@ -248,6 +248,46 @@ pub struct MatrixCell {
     pub why: String,
 }
 
+/// One **negative-privilege (DENY)** assertion: an already-authorized user is additionally *denied*
+/// a property or a label, and the demonstration proves the denied property reads back **NULL** or the
+/// denied node is **invisible** (returns zero rows) — the deny-precedence regression guard for the
+/// multi-label DENY bug (`rmp #645`). Each check is run twice by the workloads: once as `user` (must
+/// be denied) and once as the bootstrap admin (must still see the data), so the guard proves the DENY
+/// hides the data *only for the denied principal* — never that the data was simply absent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DenyCheck {
+    /// The denied principal (a provisioned user; never the admin).
+    pub user: String,
+    /// The tenant database the check runs inside.
+    pub tenant: String,
+    /// The kind of denial being proved: `property_null` (a `DENY READ ON PROPERTY` ⇒ the property
+    /// reads back NULL for the denied user) or `node_invisible` (a `DENY TRAVERSE ON LABEL` ⇒ the node
+    /// is filtered out of every scan, even one keyed on the node's *other* label — the `#645` guard).
+    pub kind: String,
+    /// The Cypher probe. Its projected column is always aliased `v`, so the client reads a single
+    /// column uniformly. For `property_null` every returned row's `v` must be NULL (for the denied
+    /// user) and non-NULL (for the admin). For `node_invisible` the denied user must get zero rows and
+    /// the admin at least one.
+    pub query: String,
+    /// A short human-readable rationale (carried into the printed matrix table).
+    pub why: String,
+}
+
+/// One **cross-tenant no-leak** probe: run as a tenant_a-scoped user *against tenant_b*, it must never
+/// return any of the other tenant's data. Over REST the coarse up-front gate answers **403**; over
+/// Bolt the value-level RBAC filter answers **zero rows / count 0**. Either way **no sensitive datum
+/// crosses the boundary** — which is exactly what the workloads assert for each probe, over both wire
+/// protocols. Broadens the original single `:Secret`-canary check to the full PII surface.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CrossTenantProbe {
+    /// The Cypher probe (its projected column is aliased `v`).
+    pub query: String,
+    /// `rows` ⇒ the read must yield zero rows; `count` ⇒ the single `count(n)` row must be `0`.
+    pub kind: String,
+    /// A short human-readable rationale.
+    pub why: String,
+}
+
 /// The whole deterministic security scenario: the tenants (with their sensitive data), the RBAC
 /// roles/users, and the expected authorization matrix. Serialized to `manifest.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -266,6 +306,27 @@ pub struct Manifest {
     pub users: Vec<User>,
     /// The expected allow/deny/unauthenticated matrix.
     pub matrix: Vec<MatrixCell>,
+    /// The **fine-grained DENY** grants (rendered admin DDL, one statement per entry) that layer a
+    /// negative privilege over an already-granted role. Feature-detected by the workloads: a target
+    /// whose grammar predates `DENY` (e.g. an older server) rejects these, and the workload records
+    /// the version gap instead of asserting the DENY checks. Empty on a manifest that predates this
+    /// field (kept `serde(default)` so old `manifest.json` still deserializes).
+    #[serde(default)]
+    pub deny_grants: Vec<String>,
+    /// Extra seed statements the DENY demo needs (run inside the denied tenant's database, as admin):
+    /// the multi-label `(:Secret:Confidential)` node the `#645` precedence guard keys on.
+    #[serde(default)]
+    pub deny_seed: Vec<String>,
+    /// The DENY assertions the workloads drive once the DENY grants are in place.
+    #[serde(default)]
+    pub deny_checks: Vec<DenyCheck>,
+    /// The broadened cross-tenant no-leak probes (run as a tenant_a user against tenant_b).
+    #[serde(default)]
+    pub cross_tenant_probes: Vec<CrossTenantProbe>,
+    /// The tenant database the DENY grants + checks target (a manifest tenant name; namespaced when a
+    /// namespace was applied). Empty when there are no DENY grants.
+    #[serde(default)]
+    pub deny_tenant: String,
 }
 
 /// A fully-materialized dataset: the per-tenant sensitive data + the manifest. Produced by
@@ -290,13 +351,37 @@ fn pick<'a>(set: &'a [&'a str], v: u64) -> &'a str {
 /// The two tenant databases this scenario provisions at runtime via `CREATE DATABASE`.
 pub const TENANTS: [&str; 2] = ["tenant_a", "tenant_b"];
 
-/// Generates the full [`Dataset`] from a [`GenConfig`].
+/// Prefixes a canonical name with a run namespace: `""` leaves the name untouched (the default,
+/// byte-identical to the pre-namespace generator), any non-empty `ns` yields `<ns>_<base>`. Used so a
+/// SHARED external target (e.g. a staging box) can host isolated, collision-free tenant databases,
+/// roles and users that are torn down cleanly after the run.
+#[must_use]
+fn ns_name(ns: &str, base: &str) -> String {
+    if ns.is_empty() {
+        base.to_owned()
+    } else {
+        format!("{ns}_{base}")
+    }
+}
+
+/// Generates the full [`Dataset`] from a [`GenConfig`] with **no namespace** (canonical `tenant_a` /
+/// `reader_a` / `alice` names). Byte-identical to the historical generator.
 ///
 /// The per-tenant data is laid out in a strictly ordered fashion (patients `0..N`, then each
 /// patient's records in id order) so the emitted Cypher and the manifest JSON are a deterministic
 /// function of the config alone.
 #[must_use]
 pub fn generate(config: GenConfig, profile: &str) -> Dataset {
+    generate_namespaced(config, profile, "")
+}
+
+/// Generates the full [`Dataset`], prefixing every tenant-database / role / user name with `namespace`
+/// (via [`ns_name`]). An empty `namespace` is exactly [`generate`]. A non-empty namespace lets the
+/// same deterministic scenario be provisioned into a **shared** target without colliding with any
+/// pre-existing `tenant_a` (and torn down unambiguously). The bootstrap **admin** user is never
+/// namespaced — it is the target's own admin, resolved by the workload at runtime.
+#[must_use]
+pub fn generate_namespaced(config: GenConfig, profile: &str, namespace: &str) -> Dataset {
     let mut rng = SplitMix64::new(config.seed);
 
     let mut tenants: Vec<Tenant> = Vec::with_capacity(TENANTS.len());
@@ -351,7 +436,7 @@ pub fn generate(config: GenConfig, profile: &str) -> Dataset {
         // Keep the canary deterministic regardless of which tenant index this is.
         let _ = t_idx;
         tenants.push(Tenant {
-            database: db.to_owned(),
+            database: ns_name(namespace, db),
             canary_secret,
             sensitive_token,
             patients,
@@ -359,44 +444,114 @@ pub fn generate(config: GenConfig, profile: &str) -> Dataset {
         });
     }
 
+    // Resolved (namespace-aware) names the roles / users / matrix / DENY sections all reference.
+    let db_a = ns_name(namespace, "tenant_a");
+    let db_b = ns_name(namespace, "tenant_b");
+    let reader_a = ns_name(namespace, "reader_a");
+    let writer_a = ns_name(namespace, "writer_a");
+    let analyst = ns_name(namespace, "analyst");
+    let alice = ns_name(namespace, "alice");
+    let wendy = ns_name(namespace, "wendy");
+    let ana = ns_name(namespace, "ana");
+
     // --- RBAC roles / users (fixed; the matrix below references them by name). ---
     let roles = vec![
         Role {
-            name: "reader_a".to_owned(),
+            name: reader_a.clone(),
             action: "READ".to_owned(),
-            scope: "GRAPH tenant_a".to_owned(),
+            scope: format!("GRAPH {db_a}"),
         },
         Role {
-            name: "writer_a".to_owned(),
+            name: writer_a.clone(),
             action: "WRITE".to_owned(),
-            scope: "GRAPH tenant_a".to_owned(),
+            scope: format!("GRAPH {db_a}"),
         },
         Role {
-            name: "analyst".to_owned(),
+            name: analyst.clone(),
             action: "READ".to_owned(),
             scope: "DATABASE".to_owned(),
         },
     ];
     let users = vec![
         User {
-            name: "alice".to_owned(),
+            name: alice.clone(),
             password: "alice-secret-pw".to_owned(),
-            role: "reader_a".to_owned(),
+            role: reader_a.clone(),
         },
         User {
-            name: "wendy".to_owned(),
+            name: wendy.clone(),
             password: "wendy-secret-pw".to_owned(),
-            role: "writer_a".to_owned(),
+            role: writer_a.clone(),
         },
         User {
-            name: "ana".to_owned(),
+            name: ana.clone(),
             password: "ana-analyst-pw".to_owned(),
-            role: "analyst".to_owned(),
+            role: analyst.clone(),
         },
     ];
 
     let admin_user = "neo4j".to_owned();
-    let matrix = build_matrix(&admin_user);
+    let matrix = build_matrix(&admin_user, &alice, &wendy, &ana, &db_a, &db_b);
+
+    // --- Fine-grained DENY (negative privilege layered over reader_a's GRANT) + the #645 guard. ---
+    // The confidential canary is a stable, greppable data value (never namespaced) planted inside the
+    // denied tenant as a MULTI-LABEL `(:Secret:Confidential)` node.
+    let confidential = "A_CONFIDENTIAL".to_owned();
+    let deny_grants = vec![
+        format!("DENY READ ON PROPERTY {db_a}.Patient.ssn TO {reader_a}"),
+        format!("DENY TRAVERSE ON LABEL {db_a}.Confidential TO {reader_a}"),
+    ];
+    let deny_seed = vec![format!("CREATE (:Secret:Confidential {{name: '{confidential}'}})")];
+    let deny_checks = vec![
+        DenyCheck {
+            user: alice.clone(),
+            tenant: db_a.clone(),
+            kind: "property_null".to_owned(),
+            query: "MATCH (p:Patient) RETURN p.ssn AS v".to_owned(),
+            why: "DENY READ ON PROPERTY Patient.ssn => ssn reads back NULL (deny-precedence)"
+                .to_owned(),
+        },
+        DenyCheck {
+            user: alice.clone(),
+            tenant: db_a.clone(),
+            kind: "node_invisible".to_owned(),
+            query: "MATCH (c:Confidential) RETURN c AS v".to_owned(),
+            why: "DENY TRAVERSE ON LABEL Confidential => node invisible".to_owned(),
+        },
+        DenyCheck {
+            user: alice.clone(),
+            tenant: db_a.clone(),
+            kind: "node_invisible".to_owned(),
+            query: format!("MATCH (s:Secret) WHERE s.name = '{confidential}' RETURN s AS v"),
+            why: "#645 multi-label precedence: the Confidential node stays hidden even via its \
+                  :Secret label"
+                .to_owned(),
+        },
+    ];
+
+    // --- Broadened cross-tenant no-leak probes (run as alice against tenant_b). ---
+    let cross_tenant_probes = vec![
+        CrossTenantProbe {
+            query: "MATCH (p:Patient) RETURN p.ssn AS v".to_owned(),
+            kind: "rows".to_owned(),
+            why: "no cross-tenant patient PII (ssn) leaks".to_owned(),
+        },
+        CrossTenantProbe {
+            query: "MATCH (r:Record) RETURN r.secret_token AS v".to_owned(),
+            kind: "rows".to_owned(),
+            why: "no cross-tenant record secret_token leaks".to_owned(),
+        },
+        CrossTenantProbe {
+            query: "MATCH (n) RETURN n AS v".to_owned(),
+            kind: "rows".to_owned(),
+            why: "no cross-tenant node at all is visible".to_owned(),
+        },
+        CrossTenantProbe {
+            query: "MATCH (n) RETURN count(n) AS v".to_owned(),
+            kind: "count".to_owned(),
+            why: "the cross-tenant node count is zero".to_owned(),
+        },
+    ];
 
     let manifest = Manifest {
         profile: profile.to_owned(),
@@ -406,14 +561,27 @@ pub fn generate(config: GenConfig, profile: &str) -> Dataset {
         roles,
         users,
         matrix,
+        deny_grants,
+        deny_seed,
+        deny_checks,
+        cross_tenant_probes,
+        deny_tenant: db_a,
     };
 
     Dataset { config, manifest }
 }
 
 /// Builds the deterministic allow/deny/unauthenticated matrix. Covers read/write/admin ×
-/// {tenant_a, tenant_b} × {allow, deny} per user, plus the unauthenticated probe.
-fn build_matrix(admin_user: &str) -> Vec<MatrixCell> {
+/// {tenant_a, tenant_b} × {allow, deny} per user, plus the unauthenticated probe. The user and tenant
+/// names are already namespace-resolved by the caller.
+fn build_matrix(
+    admin_user: &str,
+    alice: &str,
+    wendy: &str,
+    ana: &str,
+    db_a: &str,
+    db_b: &str,
+) -> Vec<MatrixCell> {
     let cell =
         |user: Option<&str>, tenant: &str, mode: &str, outcome: Outcome, why: &str| MatrixCell {
             user: user.map(str::to_owned),
@@ -425,102 +593,84 @@ fn build_matrix(admin_user: &str) -> Vec<MatrixCell> {
     vec![
         // alice — reader_a (READ ON GRAPH tenant_a): reads tenant_a, nothing else, no writes.
         cell(
-            Some("alice"),
-            "tenant_a",
+            Some(alice),
+            db_a,
             "READ",
             Outcome::Allow,
             "reader_a: READ ON GRAPH tenant_a",
         ),
+        cell(Some(alice), db_a, "WRITE", Outcome::Deny, "reader_a has no WRITE"),
         cell(
-            Some("alice"),
-            "tenant_a",
-            "WRITE",
-            Outcome::Deny,
-            "reader_a has no WRITE",
-        ),
-        cell(
-            Some("alice"),
-            "tenant_b",
+            Some(alice),
+            db_b,
             "READ",
             Outcome::Deny,
             "reader_a grant is scoped to tenant_a",
         ),
         cell(
-            Some("alice"),
-            "tenant_b",
+            Some(alice),
+            db_b,
             "WRITE",
             Outcome::Deny,
             "reader_a grant is scoped to tenant_a",
         ),
         // wendy — writer_a (WRITE ON GRAPH tenant_a): write ⊇ read on tenant_a, nothing on tenant_b.
         cell(
-            Some("wendy"),
-            "tenant_a",
+            Some(wendy),
+            db_a,
             "WRITE",
             Outcome::Allow,
             "writer_a: WRITE ON GRAPH tenant_a",
         ),
         cell(
-            Some("wendy"),
-            "tenant_a",
+            Some(wendy),
+            db_a,
             "READ",
             Outcome::Allow,
             "write ⊇ read (graded actions)",
         ),
         cell(
-            Some("wendy"),
-            "tenant_b",
+            Some(wendy),
+            db_b,
             "WRITE",
             Outcome::Deny,
             "writer_a grant is scoped to tenant_a",
         ),
         cell(
-            Some("wendy"),
-            "tenant_b",
+            Some(wendy),
+            db_b,
             "READ",
             Outcome::Deny,
             "writer_a grant is scoped to tenant_a",
         ),
         // ana — analyst (READ ON DATABASE): server-wide read across BOTH tenants, no writes.
         cell(
-            Some("ana"),
-            "tenant_a",
+            Some(ana),
+            db_a,
             "READ",
             Outcome::Allow,
             "analyst: READ ON DATABASE (server-wide)",
         ),
         cell(
-            Some("ana"),
-            "tenant_b",
+            Some(ana),
+            db_b,
             "READ",
             Outcome::Allow,
             "analyst: READ ON DATABASE (server-wide)",
         ),
-        cell(
-            Some("ana"),
-            "tenant_a",
-            "WRITE",
-            Outcome::Deny,
-            "analyst has READ only",
-        ),
-        cell(
-            Some("ana"),
-            "tenant_b",
-            "WRITE",
-            Outcome::Deny,
-            "analyst has READ only",
-        ),
+        cell(Some(ana), db_a, "WRITE", Outcome::Deny, "analyst has READ only"),
+        cell(Some(ana), db_b, "WRITE", Outcome::Deny, "analyst has READ only"),
         // admin — global Admin: read/write any tenant.
         cell(
             Some(admin_user),
-            "tenant_a",
+            db_a,
             "WRITE",
             Outcome::Allow,
             "bootstrap admin holds global Admin",
         ),
         cell(
             Some(admin_user),
-            "tenant_b",
+            db_b,
             "WRITE",
             Outcome::Allow,
             "bootstrap admin holds global Admin",
@@ -528,7 +678,7 @@ fn build_matrix(admin_user: &str) -> Vec<MatrixCell> {
         // unauthenticated — rejected before authorization.
         cell(
             None,
-            "tenant_a",
+            db_a,
             "READ",
             Outcome::Unauthenticated,
             "no credentials => 401",
@@ -629,6 +779,61 @@ impl Dataset {
                 pid = r.patient,
                 rid = r.id
             );
+        }
+        s
+    }
+
+    /// Renders the **fine-grained DENY** provisioning DDL — the negative privileges layered over
+    /// `reader_a`'s GRANT (`DENY READ ON PROPERTY …` + `DENY TRAVERSE ON LABEL …`), one `;`-terminated
+    /// statement per line. Run as the admin over the system database, exactly like [`provision_cypher`]
+    /// (`provision_cypher`). Feature-detected by the workloads: a target whose grammar predates `DENY`
+    /// rejects these and the workload records the version gap instead of asserting the DENY checks.
+    ///
+    /// [`provision_cypher`]: Self::provision_cypher
+    #[must_use]
+    pub fn deny_cypher(&self) -> String {
+        let mut s = String::with_capacity(256);
+        s.push_str("// fine-grained DENY (negative privilege layered over reader_a's GRANT)\n");
+        for g in &self.manifest.deny_grants {
+            let _ = writeln!(s, "{g};");
+        }
+        s
+    }
+
+    /// Renders the extra **DENY seed** the demo needs: the multi-label `(:Secret:Confidential)` node
+    /// the `#645` precedence guard keys on. Run *inside* the denied tenant's database, as the admin,
+    /// AFTER [`tenant_cypher`](Self::tenant_cypher).
+    #[must_use]
+    pub fn deny_seed_cypher(&self) -> String {
+        let mut s = String::with_capacity(128);
+        s.push_str("// DENY demo seed — the multi-label node the #645 guard hides\n");
+        for c in &self.manifest.deny_seed {
+            let _ = writeln!(s, "{c};");
+        }
+        s
+    }
+
+    /// Renders the **teardown** DDL that removes everything [`provision_cypher`](Self::provision_cypher)
+    /// created, so a SHARED external target is left exactly as it was found: `DROP USER` (each user),
+    /// `DROP ROLE` (each role), then `STOP DATABASE` + `DROP DATABASE` (each tenant — a database must be
+    /// offline before it can be dropped). Every statement is `IF EXISTS`, so replaying the teardown is
+    /// idempotent and safe from a cleanup trap even if provisioning only partly ran.
+    ///
+    /// Order matters: users (which reference roles) before roles, and databases last.
+    #[must_use]
+    pub fn teardown_cypher(&self) -> String {
+        let m = &self.manifest;
+        let mut s = String::with_capacity(256);
+        s.push_str("// teardown — drop everything provisioning created (users, roles, databases)\n");
+        for u in &m.users {
+            let _ = writeln!(s, "DROP USER {} IF EXISTS;", u.name);
+        }
+        for r in &m.roles {
+            let _ = writeln!(s, "DROP ROLE {} IF EXISTS;", r.name);
+        }
+        for t in &m.tenants {
+            let _ = writeln!(s, "STOP DATABASE {};", t.database);
+            let _ = writeln!(s, "DROP DATABASE {} IF EXISTS;", t.database);
         }
         s
     }
@@ -770,5 +975,106 @@ mod tests {
         assert_eq!(fast.manifest.matrix, large.manifest.matrix);
         assert_eq!(fast.manifest.roles, large.manifest.roles);
         assert_eq!(fast.manifest.users, large.manifest.users);
+    }
+
+    // -- New: fine-grained DENY + broadened cross-tenant negatives + namespacing -------------------
+
+    #[test]
+    fn no_namespace_is_byte_identical_to_generate() {
+        // The namespaced generator with an empty namespace MUST equal the historical generator, so the
+        // determinism test + the in-process hermetic server test are unaffected.
+        let cfg = Profile::Fast.config();
+        let plain = generate(cfg, "fast");
+        let empty_ns = generate_namespaced(cfg, "fast", "");
+        assert_eq!(plain.provision_cypher(), empty_ns.provision_cypher());
+        assert_eq!(plain.tenant_cypher("tenant_a"), empty_ns.tenant_cypher("tenant_a"));
+        assert_eq!(
+            plain.manifest_json().unwrap(),
+            empty_ns.manifest_json().unwrap()
+        );
+    }
+
+    #[test]
+    fn deny_grants_cover_property_and_label_precedence() {
+        let d = generate(Profile::Fast.config(), "fast");
+        let deny = d.deny_cypher();
+        // A property-level DENY (ssn reads back NULL) and a label-level DENY (node invisible).
+        assert!(deny.contains("DENY READ ON PROPERTY tenant_a.Patient.ssn TO reader_a;"));
+        assert!(deny.contains("DENY TRAVERSE ON LABEL tenant_a.Confidential TO reader_a;"));
+        // The multi-label seed the #645 precedence guard keys on.
+        assert!(
+            d.deny_seed_cypher()
+                .contains("CREATE (:Secret:Confidential {name: 'A_CONFIDENTIAL'});")
+        );
+        // The manifest carries the checks (property_null + two node_invisible, incl. the #645 guard).
+        let checks = &d.manifest.deny_checks;
+        assert!(checks.iter().any(|c| c.kind == "property_null"));
+        assert_eq!(
+            checks.iter().filter(|c| c.kind == "node_invisible").count(),
+            2
+        );
+        assert!(checks.iter().all(|c| c.user == "alice"));
+        assert_eq!(d.manifest.deny_tenant, "tenant_a");
+    }
+
+    #[test]
+    fn cross_tenant_probes_cover_the_full_pii_surface() {
+        let d = generate(Profile::Fast.config(), "fast");
+        let probes = &d.manifest.cross_tenant_probes;
+        assert!(probes.iter().any(|p| p.query.contains("p.ssn")));
+        assert!(probes.iter().any(|p| p.query.contains("r.secret_token")));
+        assert!(probes.iter().any(|p| p.query == "MATCH (n) RETURN n AS v"));
+        let count = probes.iter().find(|p| p.kind == "count").expect("a count probe");
+        assert!(count.query.contains("count(n)"));
+    }
+
+    #[test]
+    fn namespace_prefixes_every_provisioned_name_consistently() {
+        let ns = "ex_secmt_1_2";
+        let d = generate_namespaced(Profile::Fast.config(), "fast", ns);
+        // Databases, roles, users are all prefixed.
+        assert_eq!(d.manifest.tenants[0].database, "ex_secmt_1_2_tenant_a");
+        assert_eq!(d.manifest.tenants[1].database, "ex_secmt_1_2_tenant_b");
+        assert!(d.manifest.roles.iter().any(|r| r.name == "ex_secmt_1_2_reader_a"
+            && r.scope == "GRAPH ex_secmt_1_2_tenant_a"));
+        assert!(d.manifest.users.iter().any(|u| u.name == "ex_secmt_1_2_alice"
+            && u.role == "ex_secmt_1_2_reader_a"));
+        // The admin is NEVER namespaced (it is the target's own admin).
+        assert_eq!(d.manifest.admin_user, "neo4j");
+        // Provisioning + DENY + teardown all reference the namespaced names.
+        let p = d.provision_cypher();
+        assert!(p.contains("CREATE DATABASE ex_secmt_1_2_tenant_a IF NOT EXISTS;"));
+        assert!(p.contains("GRANT READ ON GRAPH ex_secmt_1_2_tenant_a TO ex_secmt_1_2_reader_a;"));
+        assert!(
+            d.deny_cypher()
+                .contains("DENY READ ON PROPERTY ex_secmt_1_2_tenant_a.Patient.ssn TO ex_secmt_1_2_reader_a;")
+        );
+        let t = d.teardown_cypher();
+        assert!(t.contains("DROP USER ex_secmt_1_2_alice IF EXISTS;"));
+        assert!(t.contains("DROP ROLE ex_secmt_1_2_reader_a IF EXISTS;"));
+        assert!(t.contains("STOP DATABASE ex_secmt_1_2_tenant_a;"));
+        assert!(t.contains("DROP DATABASE ex_secmt_1_2_tenant_a IF EXISTS;"));
+        // The matrix cells reference the namespaced user + tenant names.
+        assert!(d.manifest.matrix.iter().any(|c| c.user.as_deref()
+            == Some("ex_secmt_1_2_alice")
+            && c.tenant == "ex_secmt_1_2_tenant_b"));
+        // The DENY checks + cross-tenant probes are still populated under a namespace.
+        assert_eq!(d.manifest.deny_tenant, "ex_secmt_1_2_tenant_a");
+        assert!(d.manifest.deny_checks.iter().all(|c| c.user == "ex_secmt_1_2_alice"));
+    }
+
+    #[test]
+    fn teardown_is_byte_identical_and_idempotent_shaped() {
+        let d = generate(Profile::Fast.config(), "fast");
+        let t = d.teardown_cypher();
+        // Every teardown statement is IF EXISTS / STOP (safe to replay from a cleanup trap).
+        for line in t.lines().filter(|l| !l.starts_with("//") && !l.is_empty()) {
+            assert!(
+                line.contains("IF EXISTS") || line.starts_with("STOP DATABASE"),
+                "teardown statement is not idempotent-safe: {line}"
+            );
+        }
+        // Byte-identical across runs (determinism).
+        assert_eq!(t, generate(Profile::Fast.config(), "fast").teardown_cypher());
     }
 }
