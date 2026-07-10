@@ -350,7 +350,9 @@ async fn fast_profile_rest_discovery_matches_reference_with_ndjson_and_cbor() {
     // rejected inside an explicit txn — the same rule the python loader follows).
     let (ddl, data): (Vec<&String>, Vec<&String>) = statements.iter().partition(|s| {
         let u = s.trim_start().to_uppercase();
-        u.starts_with("CREATE CONSTRAINT") || u.starts_with("CREATE INDEX")
+        // Any `CREATE CONSTRAINT` or any `CREATE … INDEX` form — including `CREATE FULLTEXT INDEX`
+        // and `CREATE TEXT INDEX` — must run as a standalone auto-commit statement.
+        u.starts_with("CREATE CONSTRAINT") || (u.starts_with("CREATE") && u.contains(" INDEX "))
     });
     for stmt in &ddl {
         let (st, body) =

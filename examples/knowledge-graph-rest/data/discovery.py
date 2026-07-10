@@ -211,11 +211,17 @@ class RestClient:
 
     def stream(self, statement, params=None):
         """Runs a single query requesting NDJSON; returns ``(status, response_obj, headers)`` so the
-        caller can iterate the body line-by-line as it arrives."""
+        caller can iterate the body line-by-line as it arrives.
+
+        ``access_mode: READ`` is REQUIRED for the streaming path: the router only streams a
+        single-statement auto-commit when the request is a READ (rmp #527/#530 — a single-statement
+        WRITE is buffered so a commit-time serialization conflict becomes a clean 409 rather than a
+        dropped body). An absent ``access_mode`` defaults to WRITE, which buffers the result as JSON
+        instead of streaming NDJSON."""
         stmt = {"statement": statement}
         if params is not None:
             stmt["parameters"] = params
-        body = {"statements": [stmt]}
+        body = {"statements": [stmt], "access_mode": "READ"}
         return self._request(
             "POST", f"/db/{self.db}/tx/commit", body,
             accept="application/x-ndjson", stream=True,
@@ -296,12 +302,22 @@ def parse_statements(cypher_path):
     return statements
 
 
+def is_schema_ddl(stmt):
+    """Whether ``stmt`` is a schema-DDL statement — any ``CREATE CONSTRAINT`` or any ``CREATE … INDEX``
+    form, including ``CREATE FULLTEXT INDEX`` (and ``CREATE TEXT INDEX``). Each must run as a standalone
+    auto-commit statement: Graphus rejects admin DDL inside an explicit transaction, and a DDL statement
+    may not share an auto-commit batch with data writes."""
+    u = stmt.lstrip().upper()
+    return u.startswith("CREATE CONSTRAINT") or (u.startswith("CREATE") and " INDEX " in u)
+
+
 def load_graph(client, statements, batch_size):
     """Loads the graph over REST: the schema DDL as standalone auto-commit statements (admin DDL is
     rejected inside an explicit txn), then the data in batched auto-commit transactions."""
-    # The first statements are the schema DDL (CONSTRAINT/INDEX); each must run standalone.
-    ddl = [s for s in statements if s.lstrip().upper().startswith(("CREATE CONSTRAINT", "CREATE INDEX"))]
-    data = [s for s in statements if s not in ddl]
+    # The first statements are the schema DDL (CONSTRAINT / RANGE / FULLTEXT INDEX); each must run
+    # standalone.
+    ddl = [s for s in statements if is_schema_ddl(s)]
+    data = [s for s in statements if not is_schema_ddl(s)]
 
     t0 = time.time()
     for stmt in ddl:
@@ -399,6 +415,84 @@ def discovery_queries(client, ref):
             "RETURN length(p) AS len",
             {"f": ref["path_from_concept_id"], "t": ref["path_to_concept_id"]})[1])
     check("(5) concept path length", rows[0][0] if rows else None, ref["path_length"])
+
+
+# The reference documents carry realistic, fixed titles (disjoint from the "Document <n>" background):
+#   ref-d-0 "On Graph Storage" | ref-d-1 "Traversal Methods" | ref-d-2 "Indexed Graphs".
+# The `standard` analyzer tokenizes on non-alphanumeric boundaries, lowercases and drops stop-words,
+# but does NOT stem — so `graph` and `graphs` are DISTINCT terms. The known, enumerable answer set for
+# each search term over the whole corpus is therefore exactly:
+FULLTEXT_EXPECTATIONS = [
+    ("graph", ["ref-d-0"]),      # "On Graph Storage" — NOT "Indexed Graphs" (no stemming: graph≠graphs)
+    ("graphs", ["ref-d-2"]),     # "Indexed Graphs" — the no-stemming contrast to "graph"
+    ("storage", ["ref-d-0"]),    # "On Graph Storage"
+    ("traversal", ["ref-d-1"]),  # "Traversal Methods"
+    ("on", []),                  # a stop-word-only query matches nothing
+]
+
+
+def fulltext_discovery(client):
+    """Runs the FULLTEXT title search over the corpus and asserts each term returns exactly the known
+    reference documents — including the empirically-verified no-stemming analyzer behaviour."""
+    for term, expected in FULLTEXT_EXPECTATIONS:
+        _, rows = result_rows(
+            client.query(
+                "CALL db.index.fulltext.queryNodes('document_fulltext', $q) YIELD node "
+                "RETURN node.id AS id ORDER BY id",
+                {"q": term})[1])
+        got = sorted(r[0] for r in rows)
+        check(f"fulltext '{term}'", got, sorted(expected))
+
+
+def schema_evidence(client):
+    """Captures SHOW INDEXES / SHOW CONSTRAINTS as evidence and asserts the new search schema is
+    declared and ONLINE. Returns ``(indexes, constraints)`` — each a list of ``[name, type, entity]``
+    rows — for the machine-readable ``GRAPHUS_SCHEMA`` evidence line."""
+    _, idx_rows = result_rows(client.query(
+        "SHOW INDEXES YIELD name, type, entityType, state "
+        "RETURN name, type, entityType, state ORDER BY name")[1])
+    _, con_rows = result_rows(client.query(
+        "SHOW CONSTRAINTS YIELD name, type, entityType "
+        "RETURN name, type, entityType ORDER BY name")[1])
+
+    def find(rows, name):
+        return next((r for r in rows if r[0] == name), None)
+
+    ft = find(idx_rows, "document_fulltext")
+    check("FULLTEXT index declared", ft[1] if ft else None, "FULLTEXT")
+    check("FULLTEXT index is a NODE index", ft[2] if ft else None, "NODE")
+    check("FULLTEXT index is ONLINE", ft[3] if ft else None, "ONLINE")
+    rng = find(idx_rows, "document_year_range")
+    check("RANGE index declared", rng[1] if rng else None, "RANGE")
+    yt = find(con_rows, "document_year_integer")
+    check("property-type constraint declared", yt[1] if yt else None, "NODE_PROPERTY_TYPE")
+    te = find(con_rows, "document_title_exists")
+    check("existence constraint declared", te[1] if te else None, "NODE_PROPERTY_EXISTENCE")
+
+    print("  indexes:")
+    for r in idx_rows:
+        print(f"    {r[0]:<22} {r[1]:<10} {r[2]:<12} {r[3]}")
+    print("  constraints:")
+    for r in con_rows:
+        print(f"    {r[0]:<22} {r[1]:<28} {r[2]}")
+    return ([r[:3] for r in idx_rows], [r[:3] for r in con_rows])
+
+
+def constraint_enforcement(client):
+    """Asserts the node property-type + existence constraints are ENFORCED over REST: a violating write
+    must be rejected with a client error (HTTP 400, an RFC 9457 problem+json), never silently accepted."""
+    # Property-type: a non-integer Document.year is rejected.
+    st, body, _ = client.auto_commit(
+        [{"statement": "CREATE (:Document {id: 'bad-type', title: 'Bad Year', year: 'twenty-twenty'})"}])
+    check("property-type violation rejected (non-integer year => 400)", st, 400)
+    # Existence: a Document without a title is rejected.
+    st, body, _ = client.auto_commit(
+        [{"statement": "CREATE (:Document {id: 'bad-exists', year: 2020})"}])
+    check("existence violation rejected (missing title => 400)", st, 400)
+    # And the rejected writes created nothing (they rolled back atomically).
+    _, rows = result_rows(client.query(
+        "MATCH (d:Document) WHERE d.id IN ['bad-type','bad-exists'] RETURN count(d) AS c")[1])
+    check("rejected writes created no Document", rows[0][0] if rows else None, 0)
 
 
 def ndjson_stream(client):
@@ -524,6 +618,9 @@ def main():
     loaded, load_secs = load_graph(client, statements, args.batch_size)
     print(f"  loaded {loaded} statements in {load_secs:.2f}s")
 
+    print("== schema evidence (SHOW INDEXES / SHOW CONSTRAINTS)")
+    indexes, constraints = schema_evidence(client)
+
     print("== explicit transaction lifecycle (begin / commit / rollback)")
     demo_explicit_tx(client)
 
@@ -531,6 +628,12 @@ def main():
     with open(args.reference) as f:
         ref = json.load(f)
     discovery_queries(client, ref)
+
+    print("== full-text title search (db.index.fulltext.queryNodes)")
+    fulltext_discovery(client)
+
+    print("== constraint enforcement (property-type + existence negative writes)")
+    constraint_enforcement(client)
 
     print("== NDJSON streaming")
     ndjson_rows, ndjson_bytes, ndjson_secs, _ = ndjson_stream(client)
@@ -552,9 +655,15 @@ def main():
 
     if FAILURES == 0:
         print("GRAPHUS_KG_REST_OK")
+        # A machine-readable snapshot of the declared schema (the SHOW INDEXES / SHOW CONSTRAINTS
+        # evidence), persisted by run.sh alongside the performance report.
+        print("GRAPHUS_SCHEMA " + json.dumps(
+            {"indexes": indexes, "constraints": constraints}, separators=(",", ":")))
         stats = {
             "loaded_statements": loaded,
             "load_secs": round(load_secs, 3),
+            "indexes_total": len(indexes),
+            "constraints_total": len(constraints),
             "ndjson_rows": ndjson_rows,
             "ndjson_bytes": ndjson_bytes,
             "ndjson_secs": round(ndjson_secs, 4),

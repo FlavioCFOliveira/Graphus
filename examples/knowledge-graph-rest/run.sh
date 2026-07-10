@@ -11,11 +11,15 @@
 #   2. boots the REAL `graphus-server` exposing the REST API over HTTPS with a self-signed TLS cert
 #      and a real `jwt_secret` (production REST requires both TLS and a non-default JWT secret);
 #   3. runs the python REST workload (`data/discovery.py`), which: mints a Bearer JWT out of band,
-#      proves an unauthenticated request is rejected 401, loads the graph in BATCHED auto-commit
-#      transactions, demonstrates the explicit begin/commit/rollback lifecycle, asserts the five
-#      discovery queries (lookup / multi-hop traversal / recommendation / aggregation / concept
-#      path) against `reference.json`, streams a large result as NDJSON, negotiates CBOR vs JSON and
-#      compares payload sizes, and drives concurrent HTTP clients with zero errors.
+#      proves an unauthenticated request is rejected 401, loads the graph SCHEMA-FIRST (unique-id +
+#      node property-type + node existence constraints, a `Document.year` RANGE index and a FULLTEXT
+#      title index) in BATCHED auto-commit transactions, captures SHOW INDEXES / SHOW CONSTRAINTS as
+#      evidence, demonstrates the explicit begin/commit/rollback lifecycle, asserts the five discovery
+#      queries (lookup / multi-hop traversal / recommendation / aggregation / concept path) against
+#      `reference.json`, runs the FULLTEXT title search asserting the known reference documents, proves
+#      a property-type and an existence violation are both rejected, streams a large result as NDJSON,
+#      negotiates CBOR vs JSON and compares payload sizes, and drives concurrent HTTP clients with zero
+#      errors.
 #
 # The generator (step 1) is HERMETIC and CI-runnable on its own (`cargo test -p graphus-kg-gen`
 # proves byte-identical output per seed). Steps 2 + 3 need `openssl` (for the self-signed cert) and
@@ -277,6 +281,11 @@ EOF
       "$([ -s "$EVIDENCE_DIR/workload_stats.json" ] && echo yes || echo no)"
   fi
 
+  # Harvest the machine-readable schema snapshot (SHOW INDEXES / SHOW CONSTRAINTS evidence, rmp #674).
+  # It is persisted after the evidence report is (re)built below, so it survives the report's fresh
+  # `rm -rf "$EVIDENCE_DIR"`.
+  SCHEMA_JSON="$(printf '%s' "$REST_OUT" | sed -n 's/^[[:space:]]*GRAPHUS_SCHEMA //p' | head -n1)"
+
   # Pull the per-metric figures the python client measured (latency percentiles, payload sizes,
   # streaming throughput) out of the stats line for the standardized report.
   W_OPS="$(json_field "$STATS" concurrency_ops)"
@@ -291,6 +300,8 @@ EOF
   W_NDJSON_RPS="$(json_field "$STATS" ndjson_rows_per_sec)"
   W_NDJSON_BPS="$(json_field "$STATS" ndjson_bytes_per_sec)"
   W_OPS_PER_SEC="$(json_field "$STATS" ops_per_sec)"
+  W_INDEXES="$(json_field "$STATS" indexes_total)"
+  W_CONSTRAINTS="$(json_field "$STATS" constraints_total)"
 
   # ------------------------------------------------------------------------------------------------
   # Step 4 — collect standardized performance evidence (CPU / RAM / storage / throughput) (rmp #282)
@@ -343,6 +354,8 @@ EOF
       --param "ndjson_rows_per_sec=${W_NDJSON_RPS:-0}" \
       --param "ndjson_bytes_per_sec=${W_NDJSON_BPS:-0}" \
       --param "http_ops_per_sec=${W_OPS_PER_SEC:-0}" \
+      --param "indexes_total=${W_INDEXES:-0}" \
+      --param "constraints_total=${W_CONSTRAINTS:-0}" \
       --note "Throughput is the concurrency driver's HTTP requests over the server uptime window (a coarse proxy); the per-request latency percentiles + the payload sizes per encoding (json_bytes/cbor_bytes/cbor_ratio) + the NDJSON streaming throughput are measured by the python client (GRAPHUS_STATS) and ride in as throughput inputs + workload params." \
       --note "Payload sizes per encoding (json_bytes, cbor_bytes, cbor_ratio) and the dataset size are DETERMINISTIC for a fixed seed+profile and are gated tightly; req/s, latency, CPU and RSS are machine-variant and are NOT gated (see kg_baseline_cmp)." \
       && info "evidence written to $EVIDENCE_DIR" \
@@ -376,6 +389,16 @@ EOF
     info "measure_server unavailable or server not alive; skipping evidence collection (non-fatal)"
   fi
 
+  # Persist the schema snapshot (SHOW INDEXES / SHOW CONSTRAINTS) as durable evidence, AFTER the report
+  # rebuild above so it is not wiped by the report's fresh `rm -rf "$EVIDENCE_DIR"`.
+  if [ -n "$SCHEMA_JSON" ]; then
+    mkdir -p "$EVIDENCE_DIR"
+    printf '%s\n' "$SCHEMA_JSON" > "$EVIDENCE_DIR/schema_evidence.json"
+    info "schema evidence written to $EVIDENCE_DIR/schema_evidence.json"
+    assert "SHOW INDEXES / SHOW CONSTRAINTS evidence captured" "yes" \
+      "$([ -s "$EVIDENCE_DIR/schema_evidence.json" ] && echo yes || echo no)"
+  fi
+
   stop_pid="$SERVER_PID"
   kill -TERM "$stop_pid" 2>/dev/null || true
   wait "$stop_pid" 2>/dev/null || true
@@ -392,7 +415,11 @@ fi
 section "Result"
 printf '%s checks run, %s failures.\n' "$CHECKS" "$FAILURES"
 if [ "$RUN_REST" = "1" ] && [ -f "$EVIDENCE_DIR/report.json" ]; then
-  printf 'evidence: %s {report.json, report.md}\n' "$EVIDENCE_DIR"
+  if [ -f "$EVIDENCE_DIR/schema_evidence.json" ]; then
+    printf 'evidence: %s {report.json, report.md, schema_evidence.json}\n' "$EVIDENCE_DIR"
+  else
+    printf 'evidence: %s {report.json, report.md}\n' "$EVIDENCE_DIR"
+  fi
 elif [ "$RUN_REST" = "1" ] && [ -f "$EVIDENCE_DIR/workload_stats.json" ]; then
   printf 'workload stats: %s\n' "$EVIDENCE_DIR/workload_stats.json"
 fi
@@ -400,10 +427,12 @@ if [ "$FAILURES" -eq 0 ]; then
   if [ "$RUN_REST" = "1" ]; then
     printf '%s%sKNOWLEDGE-GRAPH-REST DEMONSTRATION PASSED%s — Graphus served a seeded knowledge graph\n' "$BOLD" "$GREEN" "$RESET"
     printf 'over the REST API (HTTPS + Bearer JWT): an unauthenticated request was rejected, the graph\n'
-    printf 'loaded over batched auto-commit transactions, the explicit begin/commit/rollback lifecycle\n'
-    printf 'worked, every discovery query matched the known reference answers, a large result streamed\n'
-    printf 'as NDJSON, CBOR and JSON negotiated to the same logical result, and concurrent clients ran\n'
-    printf 'with zero errors.\n'
+    printf 'loaded schema-first (unique-id + property-type + existence constraints, a year RANGE index\n'
+    printf 'and a FULLTEXT title index) over batched auto-commit transactions, the explicit\n'
+    printf 'begin/commit/rollback lifecycle worked, every discovery query matched the known reference\n'
+    printf 'answers, the full-text title search returned exactly the known documents, property-type and\n'
+    printf 'existence violations were rejected, a large result streamed as NDJSON, CBOR and JSON\n'
+    printf 'negotiated to the same logical result, and concurrent clients ran with zero errors.\n'
   else
     printf '%s%sKNOWLEDGE-GRAPH-REST DEMONSTRATION PASSED%s — the hermetic generator produced a\n' "$BOLD" "$GREEN" "$RESET"
     printf 'byte-identical seeded knowledge graph + reference answers. (The REST/TLS/JWT workload was\n'

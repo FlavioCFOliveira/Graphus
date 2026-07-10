@@ -2,10 +2,13 @@
 
 A realistic, end-to-end demonstration of serving a **knowledge graph over the Graphus REST API**.
 It boots a real `graphus-server` exposing the REST transactional API over **HTTPS + Bearer-JWT
-auth**, loads a deterministic, seeded knowledge graph, and drives the five canonical
-knowledge-graph **discovery** queries against it from a **pure-stdlib `python3` client** — asserting
-every answer against a known reference, demonstrating transactional begin/commit/rollback, streaming
-a large result as **NDJSON**, negotiating **CBOR vs JSON**, and sustaining **concurrent** clients.
+auth**, loads a deterministic, seeded knowledge graph **schema-first** (a **FULLTEXT** title-search
+index, a `Document.year` **RANGE** index, four unique-id constraints and node **property-type** +
+**existence** constraints), and drives the canonical knowledge-graph **discovery** queries against it
+from a **pure-stdlib `python3` client** — asserting every answer against a known reference, running the
+**full-text title search** and proving property-type/existence violations are **rejected**,
+demonstrating transactional begin/commit/rollback, streaming a large result as **NDJSON**, negotiating
+**CBOR vs JSON**, and sustaining **concurrent** clients.
 
 It doubles as an executable E2E test: `run.sh` exits non-zero the moment any assertion fails.
 
@@ -16,7 +19,10 @@ It doubles as an executable E2E test: `run.sh` exits non-zero the moment any ass
 | REST transactional API | autocommit (`POST /db/{db}/tx/commit`) + explicit tx (`/tx` → `/tx/{id}` → `/tx/{id}/commit`) + rollback (`DELETE /tx/{id}`) |
 | TLS | the REST listener terminates TLS with a self-signed cert (production REST requires TLS) |
 | Bearer-JWT auth | the client mints an HS256 JWT out of band and sends `Authorization: Bearer …`; an unauthenticated request is rejected `401` |
-| Schema DDL over REST | `CREATE CONSTRAINT … REQUIRE … IS UNIQUE` (indexed entity lookup) + `CREATE INDEX … ON …` |
+| Schema DDL over REST | `CREATE CONSTRAINT … REQUIRE … IS UNIQUE` (indexed entity lookup), node **property-type** (`… IS :: INTEGER`) + **existence** (`… IS NOT NULL`) constraints, a `Document.year` **RANGE** index, and a **FULLTEXT** title index (`CREATE FULLTEXT INDEX … ON EACH [d.title]`) |
+| Schema evidence | `SHOW INDEXES` / `SHOW CONSTRAINTS` captured to `evidence/schema_evidence.json`, asserting the FULLTEXT/RANGE indexes and the constraints are declared and `ONLINE` |
+| Full-text search | `CALL db.index.fulltext.queryNodes('document_fulltext', '<term>')` — analyzer-tokenized, relevance-ranked title search asserted against the known reference documents |
+| Constraint enforcement | a Document with a non-integer `year` (property-type) and one with a missing `title` (existence) are each rejected `400` (RFC 9457 problem+json) |
 | Knowledge-graph discovery | entity lookup, multi-hop semantic traversal, recommendation, aggregation, concept-path — asserted against a known reference |
 | NDJSON streaming | `Accept: application/x-ndjson` → one JSON object per line, parsed incrementally client-side |
 | Content negotiation | the same query as JSON and CBOR, both decoding to the same logical result, with payload-size comparison |
@@ -44,7 +50,46 @@ wrote them, the concepts they discuss, and the topics they are about:
 
 Every entity carries a globally-unique string id (`a-<n>`, `d-<n>`, `c-<n>`, `t-<n>`). The loader
 declares a `UNIQUE` constraint on each id, so entity lookups (`MATCH (c:Concept {id:…})`) are an
-indexed seek, and a `Document.year` range index is declared too.
+indexed seek.
+
+### The search schema (declared over REST, schema-first)
+
+Beyond the unique-id constraints, the loader declares a production-realistic **search + integrity**
+schema. The seed data conforms to every constraint, so the schema-first load succeeds:
+
+| DDL | Kind | Purpose |
+| --- | --- | --- |
+| `CREATE FULLTEXT INDEX document_fulltext FOR (d:Document) ON EACH [d.title]` | **FULLTEXT** index | the canonical knowledge-graph **title search** — analyzer-tokenized, relevance-ranked, over the whole corpus |
+| `CREATE INDEX document_year_range FOR (d:Document) ON (d.year)` | **RANGE** index | accelerate year filters / sorts |
+| `CREATE CONSTRAINT document_year_integer FOR (d:Document) REQUIRE d.year IS :: INTEGER` | node **property-type** | every `Document.year` is an `INTEGER` (never a `FLOAT`) |
+| `CREATE CONSTRAINT document_title_exists FOR (d:Document) REQUIRE d.title IS NOT NULL` | node **existence** | every `Document` carries a `title` |
+| `CREATE CONSTRAINT <label>_id_unique FOR (x:<Label>) REQUIRE x.id IS UNIQUE` (×4) | node **uniqueness** | indexed entity lookup by id |
+
+**Full-text title search.** The FULLTEXT index is queried with the built-in procedure:
+
+```cypher
+CALL db.index.fulltext.queryNodes('document_fulltext', 'graph') YIELD node, score
+  RETURN node.id AS id, score
+```
+
+The `standard` analyzer tokenizes on non-alphanumeric boundaries, lowercases, and drops stop-words,
+but **does not stem** — so `graph` and `graphs` are *distinct* terms. Over the fixed reference
+documents (`ref-d-0` "On Graph Storage", `ref-d-1` "Traversal Methods", `ref-d-2` "Indexed Graphs")
+the workload asserts the exact, enumerable answer for each term (the `Document <n>` background titles
+never contain these terms):
+
+| Search term | Matches | Why |
+| --- | --- | --- |
+| `graph` | `[ref-d-0]` | "On **Graph** Storage" — **not** "Indexed Graphs" (`graphs` ≠ `graph`, no stemming) |
+| `graphs` | `[ref-d-2]` | "Indexed **Graphs**" — the no-stemming contrast to `graph` |
+| `storage` | `[ref-d-0]` | "On Graph **Storage**" |
+| `traversal` | `[ref-d-1]` | "**Traversal** Methods" |
+| `on` | `[]` | a stop-word-only query matches nothing |
+
+**Constraint enforcement (negative tests).** The workload also proves the constraints are *enforced*,
+not merely declared: a `Document` written with a non-integer `year` (property-type) and one written
+without a `title` (existence) are each **rejected `400`** (an RFC 9457 problem+json), and the count of
+`Document` nodes is unchanged (the rejected writes rolled back atomically).
 
 ### The reference subgraph (known discovery answers)
 
@@ -134,9 +179,11 @@ carries exactly one statement.
 
 ### Loading the graph
 
-The schema DDL (`CREATE CONSTRAINT` / `CREATE INDEX`) runs as **standalone autocommit** statements
-(Graphus rejects admin DDL inside an explicit transaction). The data then loads in **batched
-autocommit transactions** — many `CREATE`/`MATCH…CREATE` statements per HTTP request — which is both
+The schema DDL (`CREATE CONSTRAINT` / `CREATE INDEX` / `CREATE FULLTEXT INDEX`) runs as **standalone
+autocommit** statements (Graphus rejects admin DDL inside an explicit transaction, and a DDL statement
+may not share an auto-commit batch with data writes — the loader's DDL splitter recognises every
+`CREATE … INDEX` form, including `FULLTEXT`). The data then loads in **batched autocommit
+transactions** — many `CREATE`/`MATCH…CREATE` statements per HTTP request — which is both
 a transactional-semantics demonstration (each batch commits atomically) and a ~40× speedup over
 one statement per request (measured: 1.9 s batched vs 85 s unbatched for the `fast` profile, where
 edge creation resolves endpoints by a label scan).
@@ -176,8 +223,10 @@ byte-identical-generator assertion still runs.
 The python client emits a single machine-readable `GRAPHUS_STATS {…}` line; `run.sh` parses it and
 feeds it — together with the **live server process's** CPU + peak RSS and the on-disk store/WAL
 footprint — into the dev-only `measure_server` harness, which writes the standardized, schema-versioned
-**`evidence/report.json` + `evidence/report.md`** (the `evidence/` dir is git-ignored). The path is
-printed in the run summary.
+**`evidence/report.json` + `evidence/report.md`** (the `evidence/` dir is git-ignored). The client also
+emits a machine-readable `GRAPHUS_SCHEMA {…}` line — the `SHOW INDEXES` / `SHOW CONSTRAINTS` snapshot —
+which `run.sh` persists to **`evidence/schema_evidence.json`**. The paths are printed in the run
+summary.
 
 ### What is measured
 
@@ -186,7 +235,8 @@ printed in the run summary.
 | **HTTP requests/sec** | concurrency driver ops over the uptime window | ≈ 490 ops/s |
 | **Latency p50 / p99 / p999** | per-request, measured client-side | ≈ 24.9 / 33.3 / 43.6 ms |
 | **NDJSON streaming throughput** | rows/sec + bytes/sec of the streamed result | ≈ 403 rows, ≈ 348k rows/s, ≈ 13 MB/s |
-| **Payload size per encoding** | response bytes for the SAME query as JSON vs CBOR | JSON `11665` B, CBOR `7207` B → **CBOR ≈ 61.8 % of JSON** |
+| **Payload size per encoding** | response bytes for the SAME query as JSON vs CBOR | JSON `11664` B, CBOR `7208` B → **CBOR ≈ 61.8 % of JSON** |
+| **Declared schema** | `SHOW INDEXES` / `SHOW CONSTRAINTS` counts (`evidence/schema_evidence.json`) | `4` indexes (FULLTEXT + RANGE + 2 always-on LOOKUP), `6` constraints |
 | **Server CPU** | the live server PID's cumulative user+system seconds | ≈ 2.0 user + 0.2 sys s |
 | **Peak server RAM (RSS)** | sampled from the live PID during the workload | ≈ 205 MB |
 | **Storage footprint** | on-disk store + WAL bytes/pages after the load | store ≈ 0.72 MB, WAL ≈ 5.2 MB |
@@ -196,12 +246,24 @@ The headline `GRAPHUS_STATS` line (parsed into the report's `workload` + `throug
 
 ```jsonc
 {
-  "loaded_statements": 4391, "load_secs": 1.83,
-  "ndjson_rows": 403, "ndjson_bytes": 14869,
+  "loaded_statements": 4394, "load_secs": 0.46,
+  "indexes_total": 4, "constraints_total": 6,
+  "ndjson_rows": 403, "ndjson_bytes": 14868,
   "ndjson_rows_per_sec": 347513, "ndjson_bytes_per_sec": 12821774,
-  "json_bytes": 11665, "cbor_bytes": 7207, "cbor_ratio": 0.618,  // CBOR ≈ 62% of JSON
+  "json_bytes": 11664, "cbor_bytes": 7208, "cbor_ratio": 0.618,  // CBOR ≈ 62% of JSON
   "concurrency_clients": 16, "concurrency_ops": 320, "concurrency_errors": 0,
   "ops_per_sec": 477, "p50_ms": 25.4, "p99_ms": 44.6, "p999_ms": 45.1
+}
+```
+
+Alongside it the client emits a `GRAPHUS_SCHEMA {…}` line — the declared indexes + constraints —
+persisted to `evidence/schema_evidence.json`:
+
+```jsonc
+{
+  "indexes": [["document_fulltext","FULLTEXT","NODE"], ["document_year_range","RANGE","NODE"], …],
+  "constraints": [["document_year_integer","NODE_PROPERTY_TYPE","NODE"],
+                  ["document_title_exists","NODE_PROPERTY_EXISTENCE","NODE"], …]
 }
 ```
 
@@ -246,6 +308,20 @@ unauthenticated request is asserted to be rejected `401`. Run it with:
 cargo test -p graphus-server --test knowledge_graph_rest
 ```
 
-Where this hermetic test proves the **REST router semantics + serialization** in CI, the shell
-`run.sh` proves the full **wire path** (HTTPS + Bearer-JWT over a real socket, driven by the stdlib
-python client) plus the standardized evidence collection.
+A second hermetic test, `crates/graphus-server/tests/knowledge_graph_rest_schema.rs`, proves the
+**search schema** end-to-end against the real engine (no REST, no python): it drives the generator's
+DDL block through the admin seam (`parse_admin_statement` → `LocalEngine::{index_ddl,
+constraint_ddl}`), loads the graph **schema-first**, then asserts (a) `SHOW INDEXES` / `SHOW
+CONSTRAINTS` list the FULLTEXT + RANGE indexes and the property-type / existence / unique constraints
+as `ONLINE`; (b) `CALL db.index.fulltext.queryNodes('document_fulltext', …)` returns exactly the known
+reference documents for each term (including the empirically-verified **no-stemming** behaviour —
+`graph` ≠ `graphs`); and (c) a non-integer `year` and a missing `title` are each **rejected** with the
+constraint-violation error class. Run it with:
+
+```bash
+cargo test -p graphus-server --test knowledge_graph_rest_schema
+```
+
+Where these hermetic tests prove the **REST router semantics + serialization** and the **schema** in
+CI, the shell `run.sh` proves the full **wire path** (HTTPS + Bearer-JWT over a real socket, driven by
+the stdlib python client) plus the standardized evidence collection.

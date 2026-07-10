@@ -25,7 +25,12 @@
 //! | `:RELATED_TO {weight}` | `(:Concept)->(:Concept)` | a semantic link between two concepts |
 //!
 //! Every entity carries a globally-unique string id (`a-<n>`, `d-<n>`, `c-<n>`, `t-<n>`), which the
-//! workload declares a `UNIQUE` constraint on so entity lookups are an indexed seek.
+//! workload declares a `UNIQUE` constraint on so entity lookups are an indexed seek. On top of the
+//! unique-id constraints the schema declares a production-realistic **search + integrity** layer over
+//! documents: a **FULLTEXT** index on `Document.title` (the canonical knowledge-graph title search,
+//! queried by `db.index.fulltext.queryNodes`), a `Document.year` **RANGE** index, a node
+//! **property-type** constraint (`Document.year IS :: INTEGER`) and a node **existence** constraint
+//! (`Document.title IS NOT NULL`). The seed data conforms to every constraint.
 //!
 //! # The reference subgraph (known discovery-query answers)
 //!
@@ -593,17 +598,32 @@ impl Dataset {
             self.documents.len() * 192 + self.concepts.len() * 64 + self.authors.len() * 64,
         );
 
-        // --- Schema (admin DDL — runs as auto-commit statements). Forms verified against the
-        // graphus-server admin matcher: `CREATE CONSTRAINT <name> FOR (n:L) REQUIRE n.p IS UNIQUE`
-        // and `CREATE INDEX FOR (n:L) ON (n.p)` (no `IF NOT EXISTS`, INDEX takes no name). ---
-        s.push_str("// schema — unique id constraints (indexed entity lookup) + a topic index\n");
+        // --- Schema (admin DDL — runs as auto-commit statements). Every form is verified against the
+        // graphus-server admin matcher — see `crates/graphus-server/tests/knowledge_graph_rest_schema.rs`,
+        // which parses this exact block off `parse_admin_statement` and drives it through the real
+        // engine. The seed data conforms to every constraint, so a schema-first load succeeds. ---
+        s.push_str("// schema\n");
+        // Unique id constraints — every entity lookup (`MATCH (x {id:…})`) is an indexed seek.
         s.push_str("CREATE CONSTRAINT author_id_unique FOR (a:Author) REQUIRE a.id IS UNIQUE;\n");
         s.push_str(
             "CREATE CONSTRAINT document_id_unique FOR (d:Document) REQUIRE d.id IS UNIQUE;\n",
         );
         s.push_str("CREATE CONSTRAINT concept_id_unique FOR (c:Concept) REQUIRE c.id IS UNIQUE;\n");
         s.push_str("CREATE CONSTRAINT topic_id_unique FOR (t:Topic) REQUIRE t.id IS UNIQUE;\n");
-        s.push_str("CREATE INDEX FOR (d:Document) ON (d.year);\n");
+        // Node property-type + existence constraints on the document metadata the workload reasons
+        // about — every Document.year is an INTEGER (never a FLOAT) and every Document has a title.
+        s.push_str(
+            "CREATE CONSTRAINT document_year_integer FOR (d:Document) REQUIRE d.year IS :: INTEGER;\n",
+        );
+        s.push_str(
+            "CREATE CONSTRAINT document_title_exists FOR (d:Document) REQUIRE d.title IS NOT NULL;\n",
+        );
+        // Node RANGE index on the year the workload filters / sorts documents by.
+        s.push_str("CREATE INDEX document_year_range FOR (d:Document) ON (d.year);\n");
+        // FULLTEXT index over document titles — the canonical knowledge-graph SEARCH feature, queried
+        // by `CALL db.index.fulltext.queryNodes('document_fulltext', '<terms>')` (analyzer-tokenized,
+        // relevance-ranked title search over the whole corpus).
+        s.push_str("CREATE FULLTEXT INDEX document_fulltext FOR (d:Document) ON EACH [d.title];\n");
 
         // --- Topics ---
         s.push_str("// topics\n");
