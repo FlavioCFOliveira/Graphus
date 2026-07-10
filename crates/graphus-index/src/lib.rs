@@ -27,6 +27,11 @@
 //!   points for proximity (`distance(n.loc, $p) <= r`) and bounding-box predicates. Like
 //!   [`fulltext`] it is a self-contained, store-independent data structure whose catalog durability
 //!   and MVCC re-check are layered on in `graphus-cypher`/`graphus-storage`.
+//! - [`vector`] — the vector index (`rmp` task #668): an [`HNSW`](vector::VectorIndex)
+//!   approximate-nearest-neighbour graph over dense `f32` embeddings, with cosine / euclidean
+//!   similarity. Like [`fulltext`] and [`spatial`] it is a self-contained, store-independent data
+//!   structure; its catalog durability and MVCC re-check are layered on later in
+//!   `graphus-cypher`/`graphus-storage`.
 //! - [`constraint`] — uniqueness (via a unique index, commit-time validated) and existence
 //!   (checked on write) constraints (`04 §6.5`).
 //! - [`histogram`] — equi-depth property histograms over the order-preserving encoding, plus a
@@ -73,6 +78,7 @@ pub mod node;
 pub mod recovery;
 pub mod spatial;
 pub mod text;
+pub mod vector;
 
 pub use bitmap::{BitmapIndex, intersect as bitmap_intersect};
 pub use btree::BTree;
@@ -84,3 +90,7 @@ pub use kinds::{CompositeIndex, PropertyIndex, RelPropertyIndex, TokenIndex};
 pub use recovery::{SharedWal, recover_index_device};
 pub use spatial::{DEFAULT_CELL_SIZE, SpatialIndex};
 pub use text::{Gram, Trigram, TrigramIndex};
+pub use vector::{
+    DEFAULT_EF_CONSTRUCTION, DEFAULT_EF_SEARCH, DEFAULT_M, Similarity, VectorIndex,
+    VectorIndexError,
+};
