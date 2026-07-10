@@ -151,6 +151,30 @@ fn has_token_lookup(plan: &PhysicalPlan) -> bool {
     plan_contains(plan, &|op| matches!(op, PhysicalOp::TokenLookupScan { .. }))
 }
 
+fn has_index_scan(plan: &PhysicalPlan) -> bool {
+    plan_contains(plan, &|op| matches!(op, PhysicalOp::NodeIndexScan { .. }))
+}
+
+fn has_sort(plan: &PhysicalPlan) -> bool {
+    plan_contains(plan, &|op| matches!(op, PhysicalOp::Sort { .. }))
+}
+
+/// Runs `src` in a fresh committed read transaction, returning the integer values of result column
+/// `col` **in result order** (unlike [`read_sorted_ints`], which sorts). Used to assert `ORDER BY`
+/// output order across the Sort-elided and Sort-kept plans.
+fn read_ints_in_order(coord: &mut Coord, catalog: &IndexCatalog, src: &str, col: &str) -> Vec<i64> {
+    let plan = compile(src, catalog);
+    let txn = coord.begin_serializable();
+    let rows = run_plan(coord, txn, &plan);
+    coord.commit(txn).expect("read commits");
+    rows.iter()
+        .filter_map(|r| match r.value(col) {
+            Value::Integer(k) => Some(k),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Seeds a representative graph: many `(:Person {age: N})` with consistent integer ages, a few
 /// `:Person` with no `age`, and a few non-`Person` nodes (which must never leak into a `:Person`
 /// result whether scanned or sought).
@@ -282,6 +306,121 @@ fn range_seek_equals_scan_filter_and_uses_node_index_range_seek() {
     assert_eq!(
         via_index, via_scan,
         "index range seek must equal scan+filter (range)"
+    );
+}
+
+// =================================================================================================
+// rmp #665: existence (IS NOT NULL) index scan + ORDER BY served by the index, over the real store
+// =================================================================================================
+
+#[test]
+fn existence_scan_equals_scan_filter_and_uses_node_index_scan() {
+    // `rmp` task #665 (A): `IS NOT NULL` over an indexed property is served by a `NodeIndexScan` (a
+    // full index scan) and must return exactly the scan+filter result — including under a delete that
+    // leaves a stale index entry the re-check must drop.
+    let mut coord = fresh_coord();
+    seed_people(&mut coord);
+    coord
+        .create_node_property_index("Person", "age")
+        .expect("create index");
+
+    let src = "MATCH (n:Person) WHERE n.age IS NOT NULL RETURN n.age AS a";
+    let indexed = coord.catalog();
+
+    let plan = compile(src, &indexed);
+    assert!(
+        has_index_scan(&plan),
+        "the index-aware plan must use a NodeIndexScan:\n{plan}"
+    );
+
+    let via_index = read_sorted_ints(&mut coord, &indexed, src, "a");
+    let via_scan = read_sorted_ints(&mut coord, &IndexCatalog::empty(), src, "a");
+    assert_eq!(
+        via_index, via_scan,
+        "existence index scan must equal scan+filter"
+    );
+    // Every Person carrying an age (20..=40 plus the duplicate 30); the two no-age Persons and the
+    // Company aged 30 must not appear.
+    let mut expected: Vec<i64> = (20..=40).collect();
+    expected.push(30);
+    expected.sort_unstable();
+    assert_eq!(via_index, expected, "exactly the age-bearing Persons");
+
+    // Delete an age-40 Person: its index entry lingers (stale) until GC, but the candidate re-check
+    // drops the now-invisible node — both paths still agree, and 40 is gone.
+    run_write(&mut coord, "MATCH (n:Person) WHERE n.age = 40 DELETE n");
+    let via_index2 = read_sorted_ints(&mut coord, &indexed, src, "a");
+    let via_scan2 = read_sorted_ints(&mut coord, &IndexCatalog::empty(), src, "a");
+    assert_eq!(
+        via_index2, via_scan2,
+        "still equal after the delete leaves a stale index entry"
+    );
+    assert!(
+        !via_index2.contains(&40),
+        "the deleted node must not leak through the stale index entry:\n{via_index2:?}"
+    );
+}
+
+#[test]
+fn order_by_indexed_key_elides_sort_and_matches_sorted_scan_over_real_store() {
+    // `rmp` task #665 (B): an `ORDER BY` on the range-seek key is served by the index order, so the
+    // planner elides the `Sort`. The elided plan must produce the SAME ordered rows as the Sort-kept
+    // (unindexed) plan — including duplicate values and a value updated mid-life (which leaves a stale
+    // index entry under the OLD value; the ordered scan must re-read the CURRENT value).
+    let mut coord = fresh_coord();
+    for (age, tag) in [(30, "a"), (10, "b"), (20, "c"), (10, "d"), (30, "e")] {
+        run_write(
+            &mut coord,
+            &format!("CREATE (:P {{age: {age}, tag: '{tag}'}})"),
+        );
+    }
+    coord
+        .create_node_property_index("P", "age")
+        .expect("create index");
+    let indexed = coord.catalog();
+
+    let src = "MATCH (n:P) WHERE n.age > 0 RETURN n.age AS a ORDER BY n.age";
+
+    // The index-aware plan uses an ordered range seek and DROPS the Sort; the unindexed plan keeps it.
+    let plan = compile(src, &indexed);
+    assert!(
+        has_index_range_seek(&plan),
+        "the index-aware plan must use a NodeIndexRangeSeek:\n{plan}"
+    );
+    assert!(
+        !has_sort(&plan),
+        "the Sort over the ordered range seek must be elided:\n{plan}"
+    );
+    assert!(
+        has_sort(&compile(src, &IndexCatalog::empty())),
+        "the unindexed plan must keep its Sort"
+    );
+
+    let via_index = read_ints_in_order(&mut coord, &indexed, src, "a");
+    let via_scan = read_ints_in_order(&mut coord, &IndexCatalog::empty(), src, "a");
+    assert_eq!(
+        via_index, via_scan,
+        "eliding the Sort must yield the identical ordered rows"
+    );
+    assert_eq!(
+        via_index,
+        vec![10, 10, 20, 30, 30],
+        "ascending by age, duplicates preserved"
+    );
+
+    // Update one age-30 node to age 5 (now the smallest). The old value 30's index entry lingers as a
+    // stale entry until GC; the ordered index scan must re-read the live value (5) and order by it.
+    run_write(&mut coord, "MATCH (n:P) WHERE n.tag = 'a' SET n.age = 5");
+    let via_index2 = read_ints_in_order(&mut coord, &indexed, src, "a");
+    let via_scan2 = read_ints_in_order(&mut coord, &IndexCatalog::empty(), src, "a");
+    assert_eq!(
+        via_index2, via_scan2,
+        "the elided order must track the update like the Sort (no stale value leaks)"
+    );
+    assert_eq!(
+        via_index2,
+        vec![5, 10, 10, 20, 30],
+        "the updated node sorts first by its NEW value, exactly once"
     );
 }
 

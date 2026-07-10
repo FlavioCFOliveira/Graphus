@@ -587,6 +587,7 @@ fn walk_physical(op: &PhysicalOp, record: &mut impl FnMut(&str, ParamType)) {
         PhysicalOp::AllNodesScan { .. }
         | PhysicalOp::NodeByLabelScan { .. }
         | PhysicalOp::TokenLookupScan { .. }
+        | PhysicalOp::NodeIndexScan { .. }
         | PhysicalOp::SpatialIndexSeek { .. }
         | PhysicalOp::RelSpatialIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }

@@ -2152,6 +2152,7 @@ fn build_operator(
             label,
             property,
             value,
+            ordered,
             ..
         } => {
             let seek = eval_value(
@@ -2167,6 +2168,7 @@ fn build_operator(
                 // No index in the seam: fall back to a label scan + equality residual.
                 None => scan_filter_eq(label, property, &seek, ctx),
             };
+            let ids = order_ids_if_requested(ids, property, *ordered, ctx);
             Ok(Operator::Buffered {
                 rows: nodes_to_rows(variable, ids),
             })
@@ -2234,6 +2236,7 @@ fn build_operator(
             property,
             bound,
             value,
+            ordered,
             ..
         } => {
             let bound_val = eval_value(
@@ -2252,6 +2255,33 @@ fn build_operator(
                 Some(ids) => ids,
                 None => scan_filter_range(label, property, *bound, &bound_val, ctx),
             };
+            let ids = order_ids_if_requested(ids, property, *ordered, ctx);
+            Ok(Operator::Buffered {
+                rows: nodes_to_rows(variable, ids),
+            })
+        }
+        PhysicalOp::NodeIndexScan {
+            variable,
+            label,
+            property,
+            ordered,
+            ..
+        } => {
+            // Existence via a full property-index scan (`rmp` task #665): an unbounded range over the
+            // order-preserving index yields exactly the visible labelled nodes with a non-null value
+            // for `property` (every index entry has a present value; the seam re-checks each candidate).
+            // With no derived index in the seam (the off-thread reader, or a `MemGraph` reference seam)
+            // this returns `None`; we fall back to a full label scan and rely on the residual
+            // `IS NOT NULL` filter the planner attached above to trim the null-valued nodes — both paths
+            // yield the identical node set.
+            let ids = match ctx
+                .graph
+                .index_seek_range(&label.name, property, None, None)
+            {
+                Some(ids) => ids,
+                None => ctx.graph.scan_nodes_by_label(&label.name),
+            };
+            let ids = order_ids_if_requested(ids, property, *ordered, ctx);
             Ok(Operator::Buffered {
                 rows: nodes_to_rows(variable, ids),
             })
@@ -2997,6 +3027,43 @@ fn build_operator_with_arg(
 /// Rows for a label scan (each matching node bound to `variable`).
 fn label_scan_rows(variable: &Var, label: &Label, ctx: &Ctx<'_>) -> VecDeque<Row> {
     nodes_to_rows(variable, ctx.graph.scan_nodes_by_label(&label.name))
+}
+
+/// Sorts `ids` into ascending Cypher `property` order (ties broken by node id) when `ordered` is set,
+/// else returns them untouched (`rmp` task #665, part B — provided-order `ORDER BY`).
+///
+/// This is the executor half of the `Sort`-elision rewrite ([`elide_sort_over_ordered_index`](crate::physical)):
+/// an index access marked `ordered` sorts its own candidate set by the property value, so an
+/// `ORDER BY property ASC` above it needs no separate [`Sort`](crate::physical::PhysicalOp::Sort). It
+/// reads the **current** visible value via `node_property` — the same value the elided `Sort` would
+/// have evaluated for its key — so the result is a conforming `ORDER BY property ASC` total order on
+/// **every** access path (the indexed seam, the scan fallback, the off-thread reader, the RBAC
+/// decorator), independent of the order the candidates were produced in. A missing property is treated
+/// as `null`, which the Cypher order ([`crate::ordering::cmp_values`]) ranks last — matching `ORDER BY`
+/// semantics (these ops never actually emit a null-valued row, since the seam re-check and the residual
+/// filter both drop them, but the fallback is defined regardless).
+fn order_ids_if_requested(
+    ids: Vec<NodeId>,
+    property: &str,
+    ordered: bool,
+    ctx: &Ctx<'_>,
+) -> Vec<NodeId> {
+    if !ordered {
+        return ids;
+    }
+    // Decorate-sort-undecorate: fetch each node's current property value exactly once (a comparator
+    // that re-fetched would be O(n log n) property reads), then sort by (value ASC, node id ASC).
+    let mut keyed: Vec<(Value, NodeId)> = ids
+        .into_iter()
+        .map(|id| {
+            (
+                ctx.graph.node_property(id, property).unwrap_or(Value::Null),
+                id,
+            )
+        })
+        .collect();
+    keyed.sort_by(|(va, ia), (vb, ib)| crate::ordering::cmp_values(va, vb).then(ia.cmp(ib)));
+    keyed.into_iter().map(|(_, id)| id).collect()
 }
 
 /// Wraps node ids into single-binding rows for `variable`.
@@ -7924,6 +7991,7 @@ fn result_columns(op: &PhysicalOp, procedures: &dyn ProcedureRegistry) -> Vec<St
         | PhysicalOp::NodeCompositeIndexSeek { variable, .. }
         | PhysicalOp::NodeLabelScanEq { variable, .. }
         | PhysicalOp::NodeIndexRangeSeek { variable, .. }
+        | PhysicalOp::NodeIndexScan { variable, .. }
         | PhysicalOp::NodeIndexStartsWithSeek { variable, .. }
         | PhysicalOp::SpatialIndexSeek { variable, .. }
         | PhysicalOp::NodeTextIndexSeek { variable, .. } => vec![variable.name.clone()],
@@ -8895,6 +8963,184 @@ mod tests {
         assert!(
             plan.to_string().contains("NodeTextIndexSeek"),
             "the indexed plan must route through the text seek:\n{plan}"
+        );
+    }
+
+    // ---- rmp #665: existence (IS NOT NULL) index scan + ORDER BY served by the index ----------
+
+    #[test]
+    fn existence_index_scan_returns_exactly_the_scan_filter_result() {
+        // `rmp` task #665 (A): the existence `NodeIndexScan` must NEVER change results — only speed.
+        // Seed a *sparse* property (some nodes lack it, one is explicitly null), then assert the indexed
+        // (NodeIndexScan) and the plain (scan + filter) paths return the IDENTICAL node set.
+        use crate::catalog::IndexCatalog;
+
+        fn ids(src: &str, graph: &mut MemGraph, catalog: &IndexCatalog) -> Vec<u64> {
+            let mut out: Vec<u64> = run_with_catalog(src, graph, catalog)
+                .iter()
+                .filter_map(|r| r.get("n").and_then(RowValue::as_node))
+                .map(|id| id.0)
+                .collect();
+            out.sort_unstable();
+            out
+        }
+
+        let seed = |g: &mut MemGraph| {
+            g.add_node(["Person"], [("email", Value::String("a@x".to_owned()))]); // id 0: present
+            g.add_node(["Person"], [("name", Value::String("no-email".to_owned()))]); // id 1: absent
+            g.add_node(["Person"], [("email", Value::Null)]); // id 2: explicit null → excluded
+            g.add_node(["Person"], [("email", Value::String("b@x".to_owned()))]); // id 3: present
+        };
+        let mut indexed = MemGraph::new();
+        seed(&mut indexed);
+        let mut plain = MemGraph::new();
+        seed(&mut plain);
+
+        let with_index = IndexCatalog::builder()
+            .with_label_property("Person", "email")
+            .build();
+        let no_index = IndexCatalog::empty();
+
+        let q = "MATCH (n:Person) WHERE n.email IS NOT NULL RETURN n";
+        let scan_ids = ids(q, &mut indexed, &with_index);
+        let plain_ids = ids(q, &mut plain, &no_index);
+        assert_eq!(
+            scan_ids, plain_ids,
+            "the index scan must not change results"
+        );
+        assert_eq!(
+            scan_ids,
+            vec![0, 3],
+            "only the two email-bearing nodes; the absent and the explicit-null node are excluded"
+        );
+
+        // Sanity: the indexed plan really does route through the NodeIndexScan with a retained residual.
+        let plan = {
+            let toks = tokenize(q).expect("lex");
+            let ast = parse_tokens(&toks, q).expect("parse");
+            plan_physical(&lower(&analyze(&ast).expect("analyze")), &with_index)
+        };
+        let rendered = plan.to_string();
+        assert!(
+            rendered.contains("NodeIndexScan") && rendered.contains("IS NOT NULL"),
+            "the indexed plan must route through NodeIndexScan with a residual IS NOT NULL:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn order_by_index_elision_matches_the_sort_including_duplicates() {
+        // `rmp` task #665 (B): eliding the `Sort` over an ordered index access must produce the SAME
+        // ordered rows as keeping the `Sort`. Seed duplicate ages in non-sorted insertion order so the
+        // ordering is non-trivial, then compare the indexed (Sort elided) path against the plain (Sort
+        // kept) path row-for-row.
+        use crate::catalog::IndexCatalog;
+
+        fn ages(src: &str, graph: &mut MemGraph, catalog: &IndexCatalog) -> Vec<i64> {
+            run_with_catalog(src, graph, catalog)
+                .iter()
+                .filter_map(|r| match r.get("age") {
+                    Some(RowValue::Value(Value::Integer(a))) => Some(*a),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let seed = |g: &mut MemGraph| {
+            g.add_node(["P"], [("age", Value::Integer(30))]); // id 0
+            g.add_node(["P"], [("age", Value::Integer(10))]); // id 1
+            g.add_node(["P"], [("age", Value::Integer(20))]); // id 2
+            g.add_node(["P"], [("age", Value::Integer(10))]); // id 3 (duplicate value)
+            g.add_node(["P"], [("age", Value::Integer(30))]); // id 4 (duplicate value)
+        };
+        let mut indexed = MemGraph::new();
+        seed(&mut indexed);
+        let mut plain = MemGraph::new();
+        seed(&mut plain);
+
+        let with_index = IndexCatalog::builder()
+            .with_label_property("P", "age")
+            .build();
+        let no_index = IndexCatalog::empty();
+
+        let q = "MATCH (n:P) WHERE n.age > 0 RETURN n.age AS age ORDER BY n.age";
+        let elided = ages(q, &mut indexed, &with_index); // Sort elided (ordered range seek)
+        let sorted = ages(q, &mut plain, &no_index); // Sort kept
+        assert_eq!(
+            elided, sorted,
+            "eliding the Sort must yield the identical ordered rows"
+        );
+        assert_eq!(
+            elided,
+            vec![10, 10, 20, 30, 30],
+            "ascending by age, duplicates preserved"
+        );
+
+        // Sanity: the indexed plan elides the Sort (and marks the seek ordered); the plain plan keeps it.
+        let plan_of = |catalog: &IndexCatalog| {
+            let toks = tokenize(q).expect("lex");
+            let ast = parse_tokens(&toks, q).expect("parse");
+            plan_physical(&lower(&analyze(&ast).expect("analyze")), catalog).to_string()
+        };
+        let indexed_plan = plan_of(&with_index);
+        assert!(
+            !indexed_plan.contains("Sort") && indexed_plan.contains("ordered asc"),
+            "the indexed plan must elide the Sort onto an ordered seek:\n{indexed_plan}"
+        );
+        assert!(
+            plan_of(&no_index).contains("Sort"),
+            "the unindexed plan keeps its Sort"
+        );
+    }
+
+    #[test]
+    fn order_by_index_elision_reflects_a_value_updated_mid_life() {
+        // `rmp` task #665 (B): the ordered emission must sort by the node's CURRENT property value
+        // (`node_property`), not any earlier value — so a value changed after seeding reorders the
+        // result exactly as the `Sort` would. Guards the "stale entry" concern at the executor level:
+        // the ordered access re-reads the live value, so an out-of-date ordering can never leak.
+        use crate::catalog::IndexCatalog;
+
+        fn ages(src: &str, graph: &mut MemGraph, catalog: &IndexCatalog) -> Vec<i64> {
+            run_with_catalog(src, graph, catalog)
+                .iter()
+                .filter_map(|r| match r.get("age") {
+                    Some(RowValue::Value(Value::Integer(a))) => Some(*a),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let with_index = IndexCatalog::builder()
+            .with_label_property("P", "age")
+            .build();
+        let no_index = IndexCatalog::empty();
+
+        let build = |g: &mut MemGraph| {
+            g.add_node(["P"], [("age", Value::Integer(30))]); // id 0
+            g.add_node(["P"], [("age", Value::Integer(10))]); // id 1
+            g.add_node(["P"], [("age", Value::Integer(20))]); // id 2
+        };
+        let mut indexed = MemGraph::new();
+        build(&mut indexed);
+        let mut plain = MemGraph::new();
+        build(&mut plain);
+
+        // Move node 0 from age 30 to age 5 (now the smallest) in both graphs.
+        let bump = "MATCH (n:P) WHERE n.age = 30 SET n.age = 5";
+        run_with_catalog(bump, &mut indexed, &with_index);
+        run_with_catalog(bump, &mut plain, &no_index);
+
+        let q = "MATCH (n:P) WHERE n.age > 0 RETURN n.age AS age ORDER BY n.age";
+        let elided = ages(q, &mut indexed, &with_index);
+        let sorted = ages(q, &mut plain, &no_index);
+        assert_eq!(
+            elided, sorted,
+            "the elided order must track the updated value like the Sort"
+        );
+        assert_eq!(
+            elided,
+            vec![5, 10, 20],
+            "the updated node sorts first by its NEW value"
         );
     }
 

@@ -136,7 +136,7 @@
 //! tree.
 //! Cost ties break on a stable structural key, so plan choice is deterministic for fixed statistics.
 
-use crate::ast::{BinaryOp, Expr, ExprKind, Label, LabelExpr, PredicateOp, RelType};
+use crate::ast::{BinaryOp, Expr, ExprKind, Label, LabelExpr, PredicateOp, RelType, SortDirection};
 use crate::cardinality::estimate_rows;
 use crate::catalog::{IndexCatalog, IndexDescriptor, IndexId};
 use crate::cost::estimate_cost;
@@ -427,6 +427,11 @@ pub enum PhysicalOp {
         property: String,
         /// The equality seek value (unevaluated AST; commonly a parameter after auto-parameterisation).
         value: Expr,
+        /// Emit candidates in ascending Cypher `property` order (ties broken by node id) so a matching
+        /// single-key `ORDER BY property` above can elide its [`Sort`](Self::Sort) (`rmp` task #665,
+        /// part B); `false` leaves the emission order unspecified (node-id order in practice). Set only
+        /// by [`elide_sort_over_ordered_index`].
+        ordered: bool,
         /// The catalog index backing the seek.
         index: IndexId,
     },
@@ -488,7 +493,43 @@ pub enum PhysicalOp {
         bound: RangeBound,
         /// The bound value expression (unevaluated AST).
         value: Expr,
+        /// Emit candidates in ascending Cypher `property` order (ties broken by node id) so a matching
+        /// single-key `ORDER BY property` above can elide its [`Sort`](Self::Sort) (`rmp` task #665,
+        /// part B); `false` leaves the emission order unspecified (node-id order in practice). Set only
+        /// by [`elide_sort_over_ordered_index`].
+        ordered: bool,
         /// The catalog index backing the seek.
+        index: IndexId,
+    },
+    /// **Full property-index scan** (`rmp` task #665, part A): every visible node of `label` that has a
+    /// **non-null** value for `property`, streamed from the order-preserving range index instead of a
+    /// full store scan. Serves `MATCH (n:L) WHERE n.p IS NOT NULL` (an *existence* predicate): every
+    /// entry in a property index has a present, non-null value, so scanning the whole index yields
+    /// exactly the nodes that carry the property — cheaper than a store scan when the property is
+    /// sparse (the Neo4j `NodeIndexScan` access path).
+    ///
+    /// The scan returns a **candidate** set the seam re-checks (visible + carries the label + the
+    /// current value is non-null), so a stale index entry (the value was since deleted or changed) is
+    /// dropped; and the exact `IS NOT NULL` predicate is **also retained as a residual
+    /// [`Filter`](Self::Filter) above this operator** (see [`Planner::lower_filter`]), so the
+    /// scan-fallback path — a full label scan taken when no derived index is available at run time (the
+    /// off-thread reader, or a seam with no index) — is trimmed to the identical result. `IS NULL` is
+    /// **not** served here (an index cannot witness *absence*) and stays a scan + filter.
+    ///
+    /// When `ordered` is set the executor emits the candidates in ascending Cypher `property` order
+    /// (ties broken by node id), so an `ORDER BY n.property` above needs no separate
+    /// [`Sort`](Self::Sort) (see [`elide_sort_over_ordered_index`]).
+    NodeIndexScan {
+        /// The node variable bound by each row.
+        variable: Var,
+        /// The label the index covers.
+        label: Label,
+        /// The indexed property key (present and non-null for every emitted node).
+        property: String,
+        /// Emit candidates in ascending Cypher `property` order (ties broken by node id) to satisfy a
+        /// provided-order `ORDER BY property`; `false` leaves the emission order unspecified.
+        ordered: bool,
+        /// The catalog index backing the scan.
         index: IndexId,
     },
     /// **String-prefix index seek** (`rmp` task #658): records of `label` whose string `property`
@@ -1039,9 +1080,12 @@ pub fn plan_physical(logical: &LogicalOp, catalog: &IndexCatalog) -> PhysicalPla
 /// [cardinality estimate](PhysicalPlan::estimated_rows) ([`estimate_rows`]) and the [cost
 /// model](crate::cost) the optimiser minimises.
 ///
-/// * With **`stats = None`** this is exactly [`plan_physical`]: the rule-based operator tree, the
-///   recorded index dependencies, and the result set are byte-for-byte identical, and the estimate
-///   uses the estimator's documented constant fallbacks.
+/// * With **`stats = None`** this is exactly [`plan_physical`]: the rule-based operator tree (no
+///   cost-based rewrites), the recorded index dependencies, and the result set are identical, and the
+///   estimate uses the estimator's documented constant fallbacks. The order-preserving
+///   [`Sort`-elision pass](elide_provided_order_sorts) still runs (it is rule-based, not cost-based:
+///   it only drops a `Sort` already provided by an index access), so an `ORDER BY` served by the
+///   index carries no `Sort` on either path.
 /// * With **`stats = Some(..)`** the planner first builds that same rule-based tree (the sound,
 ///   correct starting point) and then applies the [cost-based optimiser](self#cost-based-optimisation):
 ///   it may reorder independent inner joins, flip a hash join's build side, and choose index-seek vs
@@ -1061,16 +1105,25 @@ pub fn plan_physical_with_stats(
     let mut deps = BTreeSet::new();
     let rule_based = Planner { catalog }.lower(logical, &mut deps);
 
-    // With statistics, refine the rule-based tree by the cost model; without, keep it verbatim (this
-    // is exactly `plan_physical`, byte-for-byte). The optimiser is bag-preserving, so only the shape
-    // changes — and the index dependencies are recomputed from the final tree it produces.
+    // With statistics, refine the rule-based tree by the cost model; without, keep its shape (no
+    // cost-based rewrites). The optimiser is bag-preserving, so only the shape changes — and the index
+    // dependencies are recomputed from the final tree it produces. Either way the provided-order
+    // Sort-elision pass (`rmp` #665) runs last on the final tree; it is order-preserving (not
+    // cost-based), so it applies on both paths without changing the result multiset.
     let (root, index_dependencies) = match stats {
         Some(s) => {
             let optimized = optimize(rule_based, catalog, s);
+            // Provided-order Sort elision (`rmp` task #665, part B) runs as the FINAL pass, after the
+            // cost-based optimiser has settled every access path — so it only elides a Sort when the
+            // subtree kept an ordered-capable index access (a cost-reverted scan keeps its Sort).
+            let optimized = elide_provided_order_sorts(optimized);
             let deps = collect_index_dependencies(&optimized);
             (optimized, deps)
         }
-        None => (rule_based, deps),
+        // No stats: the rule-based tree is final (no access-path rewrites), so the elision pass is
+        // sound to run directly on it. It preserves index ops (only marks one ordered), so the
+        // dependencies gathered during lowering stay correct.
+        None => (elide_provided_order_sorts(rule_based), deps),
     };
 
     PhysicalPlan {
@@ -1668,6 +1721,32 @@ impl Planner<'_> {
             }
         }
 
+        // Existence via a full property-index scan (`rmp` task #665): a `var.prop IS NOT NULL` conjunct
+        // over an indexed `(label, prop)` is served by a `NodeIndexScan` — every index entry has a
+        // present, non-null value, so scanning the whole index yields exactly the nodes carrying the
+        // property, cheaper than a full store scan when the property is sparse (the Neo4j access path).
+        // Runs **after** the `NodeLabelScanEq` loop, so a same-filter equality (`n.q = 5 AND
+        // n.p IS NOT NULL`) still takes the precise equality scan (preserving its tight SSI footprint,
+        // `rmp` #325) and the existence scan only fires when *no* equality conjunct is present. The scan
+        // returns a candidate superset the seam re-checks, so the exact predicate is re-attached with
+        // **all** conjuncts as the residual filter (which also trims the scan-fallback's full label scan
+        // to the non-null nodes). `IS NULL` is deliberately not matched — an index cannot witness absence.
+        for conj in &conjuncts {
+            if let Some(property) = analyze_is_not_null(conj, &variable.name) {
+                if let Some(idx) = self.catalog.label_property(label, &property) {
+                    deps.insert(idx.id);
+                    let scan = PhysicalOp::NodeIndexScan {
+                        variable: variable.clone(),
+                        label: label.clone(),
+                        property,
+                        ordered: false,
+                        index: idx.id,
+                    };
+                    return attach_residual(scan, &conjuncts);
+                }
+            }
+        }
+
         // No index and no equality predicate: label scan (possibly token-lookup) + the full predicate as
         // a filter.
         let scan = self.lower_label_scan(variable, label, deps);
@@ -1952,6 +2031,7 @@ fn contains_read(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeCompositeIndexSeek { .. }
         | PhysicalOp::NodeLabelScanEq { .. }
         | PhysicalOp::NodeIndexRangeSeek { .. }
+        | PhysicalOp::NodeIndexScan { .. }
         | PhysicalOp::NodeIndexStartsWithSeek { .. }
         | PhysicalOp::SpatialIndexSeek { .. }
         | PhysicalOp::NodeTextIndexSeek { .. }
@@ -2025,6 +2105,7 @@ fn contains_write(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeCompositeIndexSeek { .. }
         | PhysicalOp::NodeLabelScanEq { .. }
         | PhysicalOp::NodeIndexRangeSeek { .. }
+        | PhysicalOp::NodeIndexScan { .. }
         | PhysicalOp::NodeIndexStartsWithSeek { .. }
         | PhysicalOp::SpatialIndexSeek { .. }
         | PhysicalOp::NodeTextIndexSeek { .. }
@@ -2089,6 +2170,7 @@ fn contains_procedure_call(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeCompositeIndexSeek { .. }
         | PhysicalOp::NodeLabelScanEq { .. }
         | PhysicalOp::NodeIndexRangeSeek { .. }
+        | PhysicalOp::NodeIndexScan { .. }
         | PhysicalOp::NodeIndexStartsWithSeek { .. }
         | PhysicalOp::SpatialIndexSeek { .. }
         | PhysicalOp::NodeTextIndexSeek { .. }
@@ -2163,6 +2245,7 @@ fn all_procedure_calls_reader_safe(
         | PhysicalOp::NodeCompositeIndexSeek { .. }
         | PhysicalOp::NodeLabelScanEq { .. }
         | PhysicalOp::NodeIndexRangeSeek { .. }
+        | PhysicalOp::NodeIndexScan { .. }
         | PhysicalOp::NodeIndexStartsWithSeek { .. }
         | PhysicalOp::SpatialIndexSeek { .. }
         | PhysicalOp::NodeTextIndexSeek { .. }
@@ -2365,289 +2448,17 @@ fn optimize_inner(
     optimize_join_region(op, stats)
 }
 
-/// Optimises every child subtree of `op` in place, leaving `op`'s own shape untouched. The single
-/// place the recursion descends, so each operator variant lists its children exactly once.
+/// Optimises every child subtree of `op` in place, leaving `op`'s own shape untouched.
 ///
 /// A reorderable join's children inherit `in_join_region = true` (they continue the same region the
 /// flattener will walk); every other operator resets it to `false` (its children are region leaves,
 /// optimised in their own right). This mirrors [`flatten_join_region`], which descends only through
-/// reorderable joins.
+/// reorderable joins. The child enumeration itself lives once in [`map_children`].
 fn optimize_children(op: PhysicalOp, catalog: &IndexCatalog, stats: &dyn Statistics) -> PhysicalOp {
     let child_in_region = is_reorderable_join(&op);
-    let opt = |b: Box<PhysicalOp>| Box::new(optimize_inner(*b, catalog, stats, child_in_region));
-    match op {
-        // Leaves: nothing to descend into.
-        PhysicalOp::AllNodesScan { .. }
-        | PhysicalOp::NodeByLabelScan { .. }
-        | PhysicalOp::TokenLookupScan { .. }
-        | PhysicalOp::NodeIndexSeek { .. }
-        | PhysicalOp::NodeCompositeIndexSeek { .. }
-        | PhysicalOp::NodeLabelScanEq { .. }
-        | PhysicalOp::NodeIndexRangeSeek { .. }
-        | PhysicalOp::NodeIndexStartsWithSeek { .. }
-        | PhysicalOp::SpatialIndexSeek { .. }
-        | PhysicalOp::NodeTextIndexSeek { .. }
-        | PhysicalOp::AllRelationshipsScan { .. }
-        | PhysicalOp::RelIndexSeek { .. }
-        | PhysicalOp::RelSpatialIndexSeek { .. }
-        | PhysicalOp::Argument { .. }
-        | PhysicalOp::Empty => op,
-
-        // Single-input operators.
-        PhysicalOp::ExpandAll {
-            input,
-            from,
-            relationship,
-            to,
-            direction,
-            types,
-            range,
-            prior_rels,
-            rel_props,
-        } => PhysicalOp::ExpandAll {
-            input: opt(input),
-            from,
-            relationship,
-            to,
-            direction,
-            types,
-            range,
-            prior_rels,
-            rel_props,
-        },
-        PhysicalOp::ExpandInto {
-            input,
-            from,
-            relationship,
-            to,
-            direction,
-            types,
-            range,
-            prior_rels,
-            rel_props,
-        } => PhysicalOp::ExpandInto {
-            input: opt(input),
-            from,
-            relationship,
-            to,
-            direction,
-            types,
-            range,
-            prior_rels,
-            rel_props,
-        },
-        PhysicalOp::ShortestPath {
-            input,
-            from,
-            to,
-            relationship,
-            path,
-            direction,
-            types,
-            range,
-            all,
-        } => PhysicalOp::ShortestPath {
-            input: opt(input),
-            from,
-            to,
-            relationship,
-            path,
-            direction,
-            types,
-            range,
-            all,
-        },
-        PhysicalOp::QuantifiedPath {
-            input,
-            from,
-            to,
-            group_start,
-            group_end,
-            relationship,
-            direction,
-            types,
-            extra_hops,
-            min,
-            max,
-            prior_rels,
-            interior_predicate,
-            into,
-        } => PhysicalOp::QuantifiedPath {
-            input: opt(input),
-            from,
-            to,
-            group_start,
-            group_end,
-            relationship,
-            direction,
-            types,
-            extra_hops,
-            min,
-            max,
-            prior_rels,
-            interior_predicate,
-            into,
-        },
-        PhysicalOp::NamedPath {
-            input,
-            variable,
-            start,
-            steps,
-        } => PhysicalOp::NamedPath {
-            input: opt(input),
-            variable,
-            start,
-            steps,
-        },
-        PhysicalOp::Filter { input, predicate } => PhysicalOp::Filter {
-            input: opt(input),
-            predicate,
-        },
-        PhysicalOp::Projection {
-            input,
-            items,
-            distinct,
-        } => PhysicalOp::Projection {
-            input: opt(input),
-            items,
-            distinct,
-        },
-        PhysicalOp::Aggregation {
-            input,
-            group_keys,
-            aggregates,
-        } => PhysicalOp::Aggregation {
-            input: opt(input),
-            group_keys,
-            aggregates,
-        },
-        PhysicalOp::Sort { input, keys } => PhysicalOp::Sort {
-            input: opt(input),
-            keys,
-        },
-        PhysicalOp::TopN { input, keys, limit } => PhysicalOp::TopN {
-            input: opt(input),
-            keys,
-            limit,
-        },
-        PhysicalOp::Skip { input, count } => PhysicalOp::Skip {
-            input: opt(input),
-            count,
-        },
-        PhysicalOp::Limit { input, count } => PhysicalOp::Limit {
-            input: opt(input),
-            count,
-        },
-        PhysicalOp::Eager { input } => PhysicalOp::Eager { input: opt(input) },
-        PhysicalOp::Unwind {
-            input,
-            list,
-            variable,
-        } => PhysicalOp::Unwind {
-            input: opt(input),
-            list,
-            variable,
-        },
-        PhysicalOp::LoadCsv {
-            input,
-            with_headers,
-            url,
-            variable,
-            field_terminator,
-        } => PhysicalOp::LoadCsv {
-            input: opt(input),
-            with_headers,
-            url,
-            variable,
-            field_terminator,
-        },
-        PhysicalOp::Optional {
-            input,
-            null_variables,
-        } => PhysicalOp::Optional {
-            input: opt(input),
-            null_variables,
-        },
-
-        // Two-input operators.
-        PhysicalOp::NestedLoopJoin { left, right } => PhysicalOp::NestedLoopJoin {
-            left: opt(left),
-            right: opt(right),
-        },
-        PhysicalOp::HashJoin {
-            left,
-            right,
-            join_keys,
-        } => PhysicalOp::HashJoin {
-            left: opt(left),
-            right: opt(right),
-            join_keys,
-        },
-        PhysicalOp::Union { left, right, all } => PhysicalOp::Union {
-            left: opt(left),
-            right: opt(right),
-            all,
-        },
-
-        // Write operators (single input).
-        PhysicalOp::Create { input, pattern } => PhysicalOp::Create {
-            input: opt(input),
-            pattern,
-        },
-        PhysicalOp::Merge {
-            input,
-            pattern,
-            on_create,
-            on_match,
-        } => PhysicalOp::Merge {
-            input: opt(input),
-            pattern,
-            on_create,
-            on_match,
-        },
-        PhysicalOp::SetClause { input, ops } => PhysicalOp::SetClause {
-            input: opt(input),
-            ops,
-        },
-        PhysicalOp::Delete {
-            input,
-            detach,
-            exprs,
-        } => PhysicalOp::Delete {
-            input: opt(input),
-            detach,
-            exprs,
-        },
-        PhysicalOp::Remove { input, ops } => PhysicalOp::Remove {
-            input: opt(input),
-            ops,
-        },
-        PhysicalOp::Foreach {
-            input,
-            variable,
-            list,
-            body,
-        } => PhysicalOp::Foreach {
-            input: opt(input),
-            variable,
-            list,
-            // The body is a self-contained correlated sub-plan; optimise it like any other child.
-            body: opt(body),
-        },
-
-        // Procedure call (optional input).
-        PhysicalOp::ProcedureCall {
-            input,
-            name,
-            args,
-            yields,
-        } => PhysicalOp::ProcedureCall {
-            input: input.map(opt),
-            name,
-            args,
-            yields,
-        },
-    }
+    map_children(op, &|child| {
+        optimize_inner(child, catalog, stats, child_in_region)
+    })
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -3098,6 +2909,478 @@ fn cheaper(a: PhysicalOp, b: PhysicalOp, stats: &dyn Statistics) -> PhysicalOp {
 }
 
 // -------------------------------------------------------------------------------------------------
+// (D) Provided-order Sort elision (`rmp` task #665, part B)
+// -------------------------------------------------------------------------------------------------
+
+/// Applies the provided-order [`Sort`](PhysicalOp::Sort) elision ([`elide_sort_over_ordered_index`])
+/// at **every** node of `op`, bottom-up (`rmp` task #665, part B).
+///
+/// Run as the **final** pass over the fully-planned tree — after the cost-based optimiser (when stats
+/// are supplied) has settled every access path — so a `Sort` is only elided when the subtree beneath
+/// it really did keep an ordered-capable index access. It is the single entry point for the rewrite, so
+/// it fires identically on the rule-based (`plan_physical`, no stats) and cost-based paths. It is
+/// order- and bag-preserving: it only removes a redundant sort (delegating the order to the index
+/// access) or leaves the tree untouched, never reorders or drops rows.
+fn elide_provided_order_sorts(op: PhysicalOp) -> PhysicalOp {
+    // Rewrite children first (a nested `Sort` — e.g. in a `WITH … ORDER BY`, a `UNION` branch or a
+    // `CALL {}` subquery — is elided in its own right), then attempt elision at this node.
+    let op = map_children(op, &|child| elide_provided_order_sorts(child));
+    elide_sort_over_ordered_index(op)
+}
+
+/// Rebuilds `op` with `f` applied to each of its immediate child subplans, leaving `op`'s own shape
+/// otherwise untouched. **The single place the plan recursion lists each operator's children** — every
+/// variant appears exactly once, so a new operator variant is a compile error until classified here.
+/// Shared by [`optimize_children`] (the cost-based pass) and [`elide_provided_order_sorts`] (the
+/// provided-order pass), so the two walkers can never drift out of sync.
+fn map_children(op: PhysicalOp, f: &dyn Fn(PhysicalOp) -> PhysicalOp) -> PhysicalOp {
+    let go = |b: Box<PhysicalOp>| Box::new(f(*b));
+    match op {
+        // Leaves: no children.
+        PhysicalOp::AllNodesScan { .. }
+        | PhysicalOp::NodeByLabelScan { .. }
+        | PhysicalOp::TokenLookupScan { .. }
+        | PhysicalOp::NodeIndexSeek { .. }
+        | PhysicalOp::NodeCompositeIndexSeek { .. }
+        | PhysicalOp::NodeLabelScanEq { .. }
+        | PhysicalOp::NodeIndexRangeSeek { .. }
+        | PhysicalOp::NodeIndexScan { .. }
+        | PhysicalOp::NodeIndexStartsWithSeek { .. }
+        | PhysicalOp::SpatialIndexSeek { .. }
+        | PhysicalOp::NodeTextIndexSeek { .. }
+        | PhysicalOp::AllRelationshipsScan { .. }
+        | PhysicalOp::RelIndexSeek { .. }
+        | PhysicalOp::RelSpatialIndexSeek { .. }
+        | PhysicalOp::Argument { .. }
+        | PhysicalOp::Empty => op,
+
+        // Single-input operators.
+        PhysicalOp::ExpandAll {
+            input,
+            from,
+            relationship,
+            to,
+            direction,
+            types,
+            range,
+            prior_rels,
+            rel_props,
+        } => PhysicalOp::ExpandAll {
+            input: go(input),
+            from,
+            relationship,
+            to,
+            direction,
+            types,
+            range,
+            prior_rels,
+            rel_props,
+        },
+        PhysicalOp::ExpandInto {
+            input,
+            from,
+            relationship,
+            to,
+            direction,
+            types,
+            range,
+            prior_rels,
+            rel_props,
+        } => PhysicalOp::ExpandInto {
+            input: go(input),
+            from,
+            relationship,
+            to,
+            direction,
+            types,
+            range,
+            prior_rels,
+            rel_props,
+        },
+        PhysicalOp::ShortestPath {
+            input,
+            from,
+            to,
+            relationship,
+            path,
+            direction,
+            types,
+            range,
+            all,
+        } => PhysicalOp::ShortestPath {
+            input: go(input),
+            from,
+            to,
+            relationship,
+            path,
+            direction,
+            types,
+            range,
+            all,
+        },
+        PhysicalOp::QuantifiedPath {
+            input,
+            from,
+            to,
+            group_start,
+            group_end,
+            relationship,
+            direction,
+            types,
+            extra_hops,
+            min,
+            max,
+            prior_rels,
+            interior_predicate,
+            into,
+        } => PhysicalOp::QuantifiedPath {
+            input: go(input),
+            from,
+            to,
+            group_start,
+            group_end,
+            relationship,
+            direction,
+            types,
+            extra_hops,
+            min,
+            max,
+            prior_rels,
+            interior_predicate,
+            into,
+        },
+        PhysicalOp::NamedPath {
+            input,
+            variable,
+            start,
+            steps,
+        } => PhysicalOp::NamedPath {
+            input: go(input),
+            variable,
+            start,
+            steps,
+        },
+        PhysicalOp::Filter { input, predicate } => PhysicalOp::Filter {
+            input: go(input),
+            predicate,
+        },
+        PhysicalOp::Projection {
+            input,
+            items,
+            distinct,
+        } => PhysicalOp::Projection {
+            input: go(input),
+            items,
+            distinct,
+        },
+        PhysicalOp::Aggregation {
+            input,
+            group_keys,
+            aggregates,
+        } => PhysicalOp::Aggregation {
+            input: go(input),
+            group_keys,
+            aggregates,
+        },
+        PhysicalOp::Sort { input, keys } => PhysicalOp::Sort {
+            input: go(input),
+            keys,
+        },
+        PhysicalOp::TopN { input, keys, limit } => PhysicalOp::TopN {
+            input: go(input),
+            keys,
+            limit,
+        },
+        PhysicalOp::Skip { input, count } => PhysicalOp::Skip {
+            input: go(input),
+            count,
+        },
+        PhysicalOp::Limit { input, count } => PhysicalOp::Limit {
+            input: go(input),
+            count,
+        },
+        PhysicalOp::Eager { input } => PhysicalOp::Eager { input: go(input) },
+        PhysicalOp::Unwind {
+            input,
+            list,
+            variable,
+        } => PhysicalOp::Unwind {
+            input: go(input),
+            list,
+            variable,
+        },
+        PhysicalOp::LoadCsv {
+            input,
+            with_headers,
+            url,
+            variable,
+            field_terminator,
+        } => PhysicalOp::LoadCsv {
+            input: go(input),
+            with_headers,
+            url,
+            variable,
+            field_terminator,
+        },
+        PhysicalOp::Optional {
+            input,
+            null_variables,
+        } => PhysicalOp::Optional {
+            input: go(input),
+            null_variables,
+        },
+
+        // Two-input operators.
+        PhysicalOp::NestedLoopJoin { left, right } => PhysicalOp::NestedLoopJoin {
+            left: go(left),
+            right: go(right),
+        },
+        PhysicalOp::HashJoin {
+            left,
+            right,
+            join_keys,
+        } => PhysicalOp::HashJoin {
+            left: go(left),
+            right: go(right),
+            join_keys,
+        },
+        PhysicalOp::Union { left, right, all } => PhysicalOp::Union {
+            left: go(left),
+            right: go(right),
+            all,
+        },
+
+        // Write operators.
+        PhysicalOp::Create { input, pattern } => PhysicalOp::Create {
+            input: go(input),
+            pattern,
+        },
+        PhysicalOp::Merge {
+            input,
+            pattern,
+            on_create,
+            on_match,
+        } => PhysicalOp::Merge {
+            input: go(input),
+            pattern,
+            on_create,
+            on_match,
+        },
+        PhysicalOp::SetClause { input, ops } => PhysicalOp::SetClause {
+            input: go(input),
+            ops,
+        },
+        PhysicalOp::Delete {
+            input,
+            detach,
+            exprs,
+        } => PhysicalOp::Delete {
+            input: go(input),
+            detach,
+            exprs,
+        },
+        PhysicalOp::Remove { input, ops } => PhysicalOp::Remove {
+            input: go(input),
+            ops,
+        },
+        PhysicalOp::Foreach {
+            input,
+            variable,
+            body,
+            list,
+        } => PhysicalOp::Foreach {
+            input: go(input),
+            variable,
+            body: go(body),
+            list,
+        },
+        PhysicalOp::ProcedureCall {
+            input,
+            name,
+            args,
+            yields,
+        } => PhysicalOp::ProcedureCall {
+            input: input.map(go),
+            name,
+            args,
+            yields,
+        },
+    }
+}
+
+/// Elides a redundant `Sort` when the plan beneath it already provides exactly the requested order.
+///
+/// Fires only for a **single ascending key** `v.p` (`ORDER BY v.p`) whose input is an ordered-capable
+/// index access on `(v, p)` — a [`NodeIndexScan`](PhysicalOp::NodeIndexScan) /
+/// [`NodeIndexRangeSeek`](PhysicalOp::NodeIndexRangeSeek) / [`NodeIndexSeek`](PhysicalOp::NodeIndexSeek)
+/// — reached through a chain of strictly **order-preserving** passthroughs (a non-`DISTINCT`
+/// [`Projection`](PhysicalOp::Projection) that carries `v` unchanged, and/or a
+/// [`Filter`](PhysicalOp::Filter)). It marks that access `ordered` (so the executor emits its rows in
+/// ascending Cypher `p` order, ties by node id — see [`order_ids_by_property`](crate::executor)) and
+/// returns the input **without** the `Sort`.
+///
+/// # Soundness
+///
+/// An `ordered` index access materialises its result **sorted by `(cmp_values(p) ASC, node id ASC)`**,
+/// which is a valid total order for `ORDER BY p ASC` (ORDER BY leaves ties unspecified, so the node-id
+/// tie-break is a conforming choice). Every op we descend through preserves both row order and each
+/// surviving row's `v`/`v.p`, so the ordered access's order reaches the elided `Sort`'s position
+/// unchanged. It is additionally **byte-identical** to the retained `Sort` whenever the access's
+/// pre-`Sort` emission order was node-id ascending (the indexed path's `out.sort_unstable()`), because
+/// a *stable* sort by `p` of a node-id-ordered sequence equals `(p, node id)` order.
+///
+/// Deliberately **not** elided (each keeps its `Sort`): a `DESC` key (would need a reverse scan —
+/// tracked as a follow-up), a multi-key or non-`v.p` `ORDER BY`, a renamed sort variable, a `DISTINCT`
+/// projection or an [`Aggregation`](PhysicalOp::Aggregation) between (row-collapsing, not
+/// order-preserving), and a subtree whose access path is a plain scan (no index to provide order).
+fn elide_sort_over_ordered_index(op: PhysicalOp) -> PhysicalOp {
+    let PhysicalOp::Sort { input, keys } = op else {
+        return op;
+    };
+    // Single ascending key only; anything else keeps the Sort.
+    let [key] = keys.as_slice() else {
+        return PhysicalOp::Sort { input, keys };
+    };
+    if key.direction != SortDirection::Ascending {
+        return PhysicalOp::Sort { input, keys };
+    }
+    let Some((sort_var, sort_prop)) = property_ref(&key.expr) else {
+        return PhysicalOp::Sort { input, keys };
+    };
+    let (result, provided) = mark_ordered_index(*input, sort_var, sort_prop);
+    if provided {
+        // Provided in order: drop the Sort, keeping the (now-ordered) input.
+        result
+    } else {
+        // Not provided: restore the Sort untouched (the subtree is rebuilt but behaviourally identical).
+        PhysicalOp::Sort {
+            input: Box::new(result),
+            keys,
+        }
+    }
+}
+
+/// If `expr` is exactly `variable.property`, returns `(variable, property)`; else `None`. The
+/// order-provided key must be a bare property access (a compound `ORDER BY v.p + 1` is not served by
+/// a `(v, p)` index).
+fn property_ref(expr: &Expr) -> Option<(&str, &str)> {
+    let ExprKind::Property { base, key } = &expr.kind else {
+        return None;
+    };
+    let ExprKind::Variable(var) = &base.kind else {
+        return None;
+    };
+    Some((var.as_str(), key.as_str()))
+}
+
+/// Descends `op` through order-preserving passthroughs to an ordered-capable index access on
+/// `(var, prop)`, returning `(op_with_access_marked_ordered, true)` when found, or `(op, false)`
+/// (the subtree rebuilt but behaviourally unchanged) otherwise. Returned as a `(op, bool)` pair
+/// rather than `Result<PhysicalOp, PhysicalOp>` because both outcomes carry a `PhysicalOp` (the two
+/// arms are "transformed" vs "unchanged", not "ok" vs "error") and the large-by-value op would trip
+/// `clippy::result_large_err`. See [`elide_sort_over_ordered_index`] for the soundness contract.
+fn mark_ordered_index(op: PhysicalOp, var: &str, prop: &str) -> (PhysicalOp, bool) {
+    match op {
+        // The ordered-capable index accesses on a single property: mark them ordered when they key on
+        // exactly `(var, prop)`.
+        PhysicalOp::NodeIndexScan {
+            variable,
+            label,
+            property,
+            ordered: _,
+            index,
+        } if variable.name == var && property == prop => (
+            PhysicalOp::NodeIndexScan {
+                variable,
+                label,
+                property,
+                ordered: true,
+                index,
+            },
+            true,
+        ),
+        PhysicalOp::NodeIndexRangeSeek {
+            variable,
+            label,
+            property,
+            bound,
+            value,
+            ordered: _,
+            index,
+        } if variable.name == var && property == prop => (
+            PhysicalOp::NodeIndexRangeSeek {
+                variable,
+                label,
+                property,
+                bound,
+                value,
+                ordered: true,
+                index,
+            },
+            true,
+        ),
+        PhysicalOp::NodeIndexSeek {
+            variable,
+            label,
+            property,
+            value,
+            ordered: _,
+            index,
+        } if variable.name == var && property == prop => (
+            PhysicalOp::NodeIndexSeek {
+                variable,
+                label,
+                property,
+                value,
+                ordered: true,
+                index,
+            },
+            true,
+        ),
+        // A `Filter` preserves row order (it only drops rows), so descend and re-wrap.
+        PhysicalOp::Filter { input, predicate } => {
+            let (inner, provided) = mark_ordered_index(*input, var, prop);
+            (
+                PhysicalOp::Filter {
+                    input: Box::new(inner),
+                    predicate,
+                },
+                provided,
+            )
+        }
+        // A non-`DISTINCT` projection is 1:1 and order-preserving. Descend only when it carries the sort
+        // variable through **unchanged** (`var AS var`); a rename or a rebinding of `var` to a different
+        // expression would mean the `Sort`'s `var.prop` is not the index's ordering key, so decline.
+        PhysicalOp::Projection {
+            input,
+            items,
+            distinct: false,
+        } if projects_var_through(&items, var) => {
+            let (inner, provided) = mark_ordered_index(*input, var, prop);
+            (
+                PhysicalOp::Projection {
+                    input: Box::new(inner),
+                    items,
+                    distinct: false,
+                },
+                provided,
+            )
+        }
+        // Any other operator is not a known order-preserving passthrough: decline (keep the Sort).
+        other => (other, false),
+    }
+}
+
+/// Whether `items` re-emits `var` **unchanged** — a column `var AS var` whose source expression is the
+/// bare variable `var`. Only then does the `Sort`'s `var.prop` above the projection denote the same
+/// node the index access below it ordered by.
+fn projects_var_through(items: &[ProjectionColumn], var: &str) -> bool {
+    items
+        .iter()
+        .any(|c| c.alias == var && matches!(&c.expr.kind, ExprKind::Variable(name) if name == var))
+}
+
+// -------------------------------------------------------------------------------------------------
 // (A) Join reordering + build-side selection (System-R-style bottom-up DP)
 // -------------------------------------------------------------------------------------------------
 
@@ -3173,6 +3456,7 @@ fn contains_argument(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeCompositeIndexSeek { .. }
         | PhysicalOp::NodeLabelScanEq { .. }
         | PhysicalOp::NodeIndexRangeSeek { .. }
+        | PhysicalOp::NodeIndexScan { .. }
         | PhysicalOp::NodeIndexStartsWithSeek { .. }
         | PhysicalOp::SpatialIndexSeek { .. }
         | PhysicalOp::NodeTextIndexSeek { .. }
@@ -3607,6 +3891,7 @@ fn gather_index_dependencies(op: &PhysicalOp, deps: &mut BTreeSet<IndexId>) {
         | PhysicalOp::NodeIndexSeek { index, .. }
         | PhysicalOp::NodeCompositeIndexSeek { index, .. }
         | PhysicalOp::NodeIndexRangeSeek { index, .. }
+        | PhysicalOp::NodeIndexScan { index, .. }
         | PhysicalOp::NodeIndexStartsWithSeek { index, .. }
         | PhysicalOp::SpatialIndexSeek { index, .. }
         | PhysicalOp::NodeTextIndexSeek { index, .. }
@@ -3738,6 +4023,25 @@ fn analyze_starts_with_predicate<'a>(expr: &'a Expr, variable: &str) -> Option<(
         return None;
     }
     Some((property, prefix))
+}
+
+/// If `expr` is exactly `variable.<prop> IS NOT NULL`, returns `prop` (`rmp` task #665). Backs the
+/// existence [`NodeIndexScan`](PhysicalOp::NodeIndexScan): every entry in a property index has a
+/// present, non-null value, so a full index scan serves the existence predicate.
+///
+/// `IS NULL` is **not** matched — an index witnesses presence, never absence, so `IS NULL` stays a
+/// full scan + filter. The operand must be a bare `variable.<prop>` access (a compound expression such
+/// as `n.p + 1 IS NOT NULL` is not an index-usable existence predicate).
+fn analyze_is_not_null(expr: &Expr, variable: &str) -> Option<String> {
+    let ExprKind::Predicate {
+        op: PredicateOp::IsNotNull,
+        operand,
+        rhs: _,
+    } = &expr.kind
+    else {
+        return None;
+    };
+    property_of(operand, variable)
 }
 
 /// If `expr` is `variable.<prop> CONTAINS|ENDS WITH|STARTS WITH <needle>` where `<needle>` does **not**
@@ -3880,7 +4184,9 @@ fn expr_references_var(expr: &Expr, variable: &str) -> bool {
     }
 }
 
-/// Builds the physical seek operator for a matched [`PropertyPredicate`].
+/// Builds the physical seek operator for a matched [`PropertyPredicate`]. The seek is created
+/// `ordered: false` (emission order unspecified); [`elide_sort_over_ordered_index`] flips that on
+/// later when a matching `ORDER BY` can be served from the index (`rmp` task #665).
 fn build_seek(variable: &Var, label: &Label, pp: &PropertyPredicate, index: IndexId) -> PhysicalOp {
     match &pp.kind {
         PropertyPredicateKind::Equality { value } => PhysicalOp::NodeIndexSeek {
@@ -3888,6 +4194,7 @@ fn build_seek(variable: &Var, label: &Label, pp: &PropertyPredicate, index: Inde
             label: label.clone(),
             property: pp.property.clone(),
             value: value.clone(),
+            ordered: false,
             index,
         },
         PropertyPredicateKind::Range { bound, value } => PhysicalOp::NodeIndexRangeSeek {
@@ -3896,9 +4203,17 @@ fn build_seek(variable: &Var, label: &Label, pp: &PropertyPredicate, index: Inde
             property: pp.property.clone(),
             bound: *bound,
             value: value.clone(),
+            ordered: false,
             index,
         },
     }
+}
+
+/// The `Display` suffix marking a value-orderable index op as emitting in ascending key order
+/// (`rmp` task #665). Empty for the default (order-unspecified) op, so existing plan renderings are
+/// byte-identical; ` ordered asc` when the provided-order rewrite has elided a `Sort` onto it.
+fn ordered_suffix(ordered: bool) -> &'static str {
+    if ordered { " ordered asc" } else { "" }
 }
 
 /// Re-attaches the residual conjuncts (everything not consumed by a seek) as a single
@@ -4157,6 +4472,7 @@ fn gather_bound_vars(plan: &PhysicalOp, out: &mut Vec<Var>) {
         | PhysicalOp::NodeCompositeIndexSeek { variable, .. }
         | PhysicalOp::NodeLabelScanEq { variable, .. }
         | PhysicalOp::NodeIndexRangeSeek { variable, .. }
+        | PhysicalOp::NodeIndexScan { variable, .. }
         | PhysicalOp::NodeIndexStartsWithSeek { variable, .. }
         | PhysicalOp::SpatialIndexSeek { variable, .. }
         | PhysicalOp::NodeTextIndexSeek { variable, .. } => push_unique(out, variable.clone()),
@@ -4350,12 +4666,14 @@ impl PhysicalOp {
                 label,
                 property,
                 value,
+                ordered,
                 index,
             } => writeln!(
                 f,
-                "NodeIndexSeek({variable}:{} {property} = {} via {index})",
+                "NodeIndexSeek({variable}:{} {property} = {} via {index}{})",
                 label.name,
                 h::expr(value),
+                ordered_suffix(*ordered),
             ),
             Self::NodeCompositeIndexSeek {
                 variable,
@@ -4393,13 +4711,27 @@ impl PhysicalOp {
                 property,
                 bound,
                 value,
+                ordered,
                 index,
             } => writeln!(
                 f,
-                "NodeIndexRangeSeek({variable}:{} {property} {} {} via {index})",
+                "NodeIndexRangeSeek({variable}:{} {property} {} {} via {index}{})",
                 label.name,
                 bound.symbol(),
                 h::expr(value),
+                ordered_suffix(*ordered),
+            ),
+            Self::NodeIndexScan {
+                variable,
+                label,
+                property,
+                ordered,
+                index,
+            } => writeln!(
+                f,
+                "NodeIndexScan({variable}:{} {property} via {index}{})",
+                label.name,
+                ordered_suffix(*ordered),
             ),
             Self::NodeIndexStartsWithSeek {
                 variable,
@@ -5640,6 +5972,206 @@ mod tests {
         assert!(
             limit_at < proj_at,
             "Limit must be above DISTINCT: {rendered}"
+        );
+    }
+
+    // ---- (A) existence via a full property-index scan (`rmp` task #665) -----------------------
+
+    #[test]
+    fn is_not_null_over_an_indexed_property_plans_a_node_index_scan_with_retained_residual() {
+        let catalog = IndexCatalog::builder()
+            .with_label_property("Person", "email")
+            .build();
+        let plan = physical(
+            "MATCH (n:Person) WHERE n.email IS NOT NULL RETURN n",
+            &catalog,
+        );
+        let rendered = plan.to_string();
+        // The existence predicate is served by the index scan, not a full label scan.
+        assert!(
+            rendered.contains("NodeIndexScan(n:Person email"),
+            "IS NOT NULL over an indexed property must plan a NodeIndexScan:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("NodeByLabelScan"),
+            "must not fall back to a bare label scan:\n{rendered}"
+        );
+        // The exact predicate is retained as a residual Filter above the scan (an index entry can be
+        // stale, and the scan-fallback path is a full label scan that the filter trims).
+        let filter_at = rendered.find("Filter").expect("residual filter present");
+        let scan_at = rendered.find("NodeIndexScan").expect("scan present");
+        assert!(
+            filter_at < scan_at,
+            "the residual IS NOT NULL Filter must sit above the NodeIndexScan:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn is_not_null_without_an_index_stays_scan_plus_filter() {
+        // No index on `(Person, email)`: the existence predicate stays a full label scan + filter.
+        let plan = physical(
+            "MATCH (n:Person) WHERE n.email IS NOT NULL RETURN n",
+            &IndexCatalog::empty(),
+        );
+        let rendered = plan.to_string();
+        assert!(
+            !rendered.contains("NodeIndexScan"),
+            "an unindexed property must not plan a NodeIndexScan:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("NodeByLabelScan(n:Person)"),
+            "an unindexed existence predicate stays a label scan + filter:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn is_null_never_uses_an_index_scan() {
+        // An index witnesses *presence*, never *absence*: `IS NULL` must stay a scan + filter even
+        // when `(Person, email)` is indexed.
+        let catalog = IndexCatalog::builder()
+            .with_label_property("Person", "email")
+            .build();
+        let plan = physical("MATCH (n:Person) WHERE n.email IS NULL RETURN n", &catalog);
+        let rendered = plan.to_string();
+        assert!(
+            !rendered.contains("NodeIndexScan"),
+            "IS NULL cannot be served by an index scan:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("NodeByLabelScan(n:Person)"),
+            "IS NULL stays a label scan + filter:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn is_not_null_yields_to_a_more_selective_equality_seek() {
+        // A same-filter equality on an indexed property must still drive the (more selective) seek,
+        // with the existence predicate demoted to a residual filter.
+        let catalog = IndexCatalog::builder()
+            .with_label_property("Person", "email")
+            .with_label_property("Person", "age")
+            .build();
+        let plan = physical(
+            "MATCH (n:Person) WHERE n.email IS NOT NULL AND n.age = 30 RETURN n",
+            &catalog,
+        );
+        let rendered = plan.to_string();
+        assert!(
+            rendered.contains("NodeIndexSeek(n:Person age = "),
+            "the equality seek must win over the existence scan:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("NodeIndexScan"),
+            "a selective equality seek preempts the existence scan:\n{rendered}"
+        );
+    }
+
+    // ---- (B) provided-order Sort elision (`rmp` task #665) ------------------------------------
+
+    #[test]
+    fn order_by_indexed_range_key_elides_the_sort() {
+        let catalog = IndexCatalog::builder()
+            .with_label_property("Person", "age")
+            .build();
+        let plan = physical(
+            "MATCH (n:Person) WHERE n.age > 0 RETURN n ORDER BY n.age",
+            &catalog,
+        );
+        let rendered = plan.to_string();
+        // The range seek already visits keys in ascending order, so the Sort is elided and the seek is
+        // marked ordered.
+        assert!(
+            !rendered.contains("Sort"),
+            "ORDER BY on the range-seek key must elide the Sort:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("NodeIndexRangeSeek(n:Person age > ")
+                && rendered.contains("ordered asc"),
+            "the range seek must be marked ordered:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn order_by_indexed_existence_scan_key_elides_the_sort() {
+        // The same provided-order elision applies over a NodeIndexScan (IS NOT NULL).
+        let catalog = IndexCatalog::builder()
+            .with_label_property("Person", "age")
+            .build();
+        let plan = physical(
+            "MATCH (n:Person) WHERE n.age IS NOT NULL RETURN n ORDER BY n.age",
+            &catalog,
+        );
+        let rendered = plan.to_string();
+        assert!(
+            !rendered.contains("Sort"),
+            "ORDER BY on the index-scan key must elide the Sort:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("NodeIndexScan(n:Person age") && rendered.contains("ordered asc"),
+            "the index scan must be marked ordered:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn order_by_desc_keeps_the_sort() {
+        // ASC-only: a descending order would need a reverse scan (a documented follow-up).
+        let catalog = IndexCatalog::builder()
+            .with_label_property("Person", "age")
+            .build();
+        let plan = physical(
+            "MATCH (n:Person) WHERE n.age > 0 RETURN n ORDER BY n.age DESC",
+            &catalog,
+        );
+        let rendered = plan.to_string();
+        assert!(
+            rendered.contains("Sort"),
+            "ORDER BY DESC must keep the Sort (no reverse scan yet):\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("ordered asc"),
+            "the seek must not be marked ordered for a DESC order:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn order_by_a_non_index_key_keeps_the_sort() {
+        // The seek orders by `age`; an ORDER BY on a different property is not provided by it.
+        let catalog = IndexCatalog::builder()
+            .with_label_property("Person", "age")
+            .build();
+        let plan = physical(
+            "MATCH (n:Person) WHERE n.age > 0 RETURN n ORDER BY n.name",
+            &catalog,
+        );
+        let rendered = plan.to_string();
+        assert!(
+            rendered.contains("Sort"),
+            "ORDER BY a non-index key must keep the Sort:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("ordered asc"),
+            "the seek must not be marked ordered for a different key:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn multi_key_order_by_keeps_the_sort() {
+        // A multi-key ORDER BY is not served by a single-key index order.
+        let catalog = IndexCatalog::builder()
+            .with_label_property("Person", "age")
+            .build();
+        let plan = physical(
+            "MATCH (n:Person) WHERE n.age > 0 RETURN n ORDER BY n.age, n.name",
+            &catalog,
+        );
+        let rendered = plan.to_string();
+        assert!(
+            rendered.contains("Sort"),
+            "a multi-key ORDER BY must keep the Sort:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("ordered asc"),
+            "the seek must not be marked ordered for a multi-key order:\n{rendered}"
         );
     }
 }

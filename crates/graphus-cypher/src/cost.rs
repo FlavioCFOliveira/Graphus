@@ -295,6 +295,17 @@ pub fn estimate_cost(op: &PhysicalOp, stats: Option<&dyn Statistics>) -> CostEst
             CostEstimate::new(rows, COST_SEEK_SETUP + rows * COST_SEEK_PER_ROW)
         }
 
+        // A full property-index scan (`rmp` task #665): serves `IS NOT NULL` by streaming every entry of
+        // the order-preserving index for `(label, property)`. Absent per-property null-fraction
+        // statistics, its candidate count is estimated as the whole label (the property may be present
+        // on every node), and its cost is a seek setup plus a cheap per-candidate index stream —
+        // strictly cheaper *per row* than the full store scan a `NodeByLabelScan + Filter` would pay,
+        // which is why the index scan wins when the property is sparse.
+        PhysicalOp::NodeIndexScan { label, .. } => {
+            let rows = label_scan_rows(&label.name, stats);
+            CostEstimate::new(rows, COST_SEEK_SETUP + rows * COST_SEEK_PER_ROW)
+        }
+
         // A spatial proximity seek (`rmp` task #73): the grid returns a geometric superset of the
         // matching nodes, so — absent dedicated spatial histograms — we estimate its candidate count
         // with the same constant predicate-selectivity fallback a `label-scan + filter` would use,
@@ -836,6 +847,7 @@ mod tests {
             label: label("Person"),
             property: "age".to_owned(),
             value: int_expr(42),
+            ordered: false,
             index: IndexId(0),
         }
     }
