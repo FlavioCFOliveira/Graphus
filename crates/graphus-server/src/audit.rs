@@ -1357,6 +1357,33 @@ pub fn redact_index_detail(cmd: &crate::engine::IndexCommand) -> String {
             let if_e = if *if_exists { " IF EXISTS" } else { "" };
             format!("DROP TEXT INDEX {name}{if_e}")
         }
+        // Vector (HNSW) index DDL (`rmp` task #671) carries no secret either: the index name, label/type,
+        // property key and embedding shape are all schema identifiers. The `entity` renders the node vs
+        // relationship pattern.
+        I::CreateVectorIndex {
+            name,
+            entity,
+            label_or_type,
+            property,
+            dimensions,
+            if_not_exists,
+            ..
+        } => {
+            let named = name.as_deref().map(|n| format!("{n} ")).unwrap_or_default();
+            let if_ne = if *if_not_exists { " IF NOT EXISTS" } else { "" };
+            let pattern = if entity.is_relationship() {
+                format!("()-[:{label_or_type}]-()")
+            } else {
+                format!("(:{label_or_type})")
+            };
+            format!(
+                "CREATE VECTOR INDEX {named}{if_ne} FOR {pattern} ON ({property}) (dimensions={dimensions})"
+            )
+        }
+        I::DropVectorIndex { name, if_exists } => {
+            let if_e = if *if_exists { " IF EXISTS" } else { "" };
+            format!("DROP VECTOR INDEX {name}{if_e}")
+        }
     }
 }
 

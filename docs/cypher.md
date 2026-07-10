@@ -519,9 +519,10 @@ MATCH (p:Person) WHERE p.name ENDS WITH 'son'  RETURN p   -- index-served (was s
 Every `CREATE INDEX` (plain / `RANGE` / `TEXT` / `POINT` / `FULLTEXT`) accepts a trailing Neo4j
 `OPTIONS { indexProvider: '…', indexConfig { … } }` map. Graphus has one built-in provider and
 synchronous builds, so the clause is validated and accepted but not applied (except the full-text
-`fulltext.analyzer`, which maps to the analyzer). `POINT` and `FULLTEXT` `CREATE`/`DROP` also support
-`IF NOT EXISTS` / `IF EXISTS`, an anonymous (auto-named) `POINT` index, and dropping any kind by the
-unified `DROP INDEX <name>` — see [indexes.md](indexes.md).
+`fulltext.analyzer`, which maps to the analyzer, and the `VECTOR` index config, which **is** applied —
+see below). `POINT`, `FULLTEXT` and `VECTOR` `CREATE`/`DROP` also support `IF NOT EXISTS` / `IF EXISTS`,
+an anonymous (auto-named) index, and dropping any kind by the unified `DROP INDEX <name>` — see
+[indexes.md](indexes.md).
 
 Point (spatial) indexes cover **nodes** (`FOR (n:L) ON (n.p)`) or **relationships**
 (`FOR ()-[r:T]-() ON (r.p)`, undirected only), and serve an upper-bounded Cartesian proximity filter as
@@ -554,11 +555,37 @@ Both re-check each candidate for MVCC visibility, its current label/type and RBA
 name — or a node index name given to `queryRelationships` (and vice versa) — is a clear error, not
 silently-empty results. See [indexes.md](indexes.md#node-vs-relationship-single-vs-multi-label-full-text).
 
+Vector (HNSW) indexes are approximate-nearest-neighbour indexes over a dense `f32` embedding property.
+They cover **nodes** (`FOR (n:L) ON (n.p)`) or **relationships** (`FOR ()-[r:T]-() ON (r.p)`, undirected
+only), and require an `OPTIONS { indexConfig: { … } }` clause carrying the embedding shape:
+
+```cypher
+CREATE VECTOR INDEX doc_emb IF NOT EXISTS FOR (d:Doc) ON (d.embedding)
+  OPTIONS { indexConfig: {
+    `vector.dimensions`:          1536,        -- REQUIRED integer, 1..=4096
+    `vector.similarity_function`: 'cosine',    -- REQUIRED 'cosine' | 'euclidean' (case-insensitive)
+    `vector.hnsw.m`:              16,           -- optional, default 16
+    `vector.hnsw.ef_construction`: 100          -- optional, default 100
+  } }
+
+CREATE VECTOR INDEX rel_emb FOR ()-[r:SIMILAR]-() ON (r.vec)
+  OPTIONS { indexConfig: { `vector.dimensions`: 3, `vector.similarity_function`: 'euclidean' } }
+DROP VECTOR INDEX doc_emb IF EXISTS
+```
+
+`vector.dimensions` and `vector.similarity_function` are **mandatory** (the `OPTIONS { indexConfig: … }`
+clause is therefore required); a missing or out-of-range dimension (must be `1..=4096`), an unknown
+similarity, a non-positive HNSW parameter, or a missing required key is a clear, side-effect-free error.
+An unrecognised `indexConfig` key is accepted and ignored (Neo4j leniency); an unrecognised **top-level**
+`OPTIONS` key is rejected. The name is optional (auto-named when omitted). A `VECTOR` index is a distinct
+kind — it never backs a constraint — and is listed under `SHOW INDEXES` with `type` `VECTOR`,
+`indexProvider` `vector-2.0` and its `indexConfig` in `options`.
+
 `SHOW INDEXES` is a single unified, Neo4j-conformant listing of **every** index kind (node/relationship
-`RANGE`, composite `RANGE`, `TEXT`, `FULLTEXT`, `POINT`, and the two token `LOOKUP` indexes), with the full
-Neo4j column set, `UPPER-CASE` state, per-type filters (`SHOW RANGE|TEXT|POINT|LOOKUP|FULLTEXT|VECTOR|ALL
-INDEX[ES]`), and a `YIELD` / `WHERE` / `RETURN` tail. The singular `SHOW INDEX` / `SHOW <filter> INDEX`
-is accepted as a full synonym of the plural — see
+`RANGE`, composite `RANGE`, `TEXT`, `FULLTEXT`, `POINT`, `VECTOR`, and the two token `LOOKUP` indexes),
+with the full Neo4j column set, `UPPER-CASE` state, per-type filters
+(`SHOW RANGE|TEXT|POINT|LOOKUP|FULLTEXT|VECTOR|ALL INDEX[ES]`), and a `YIELD` / `WHERE` / `RETURN` tail.
+The singular `SHOW INDEX` / `SHOW <filter> INDEX` is accepted as a full synonym of the plural — see
 [indexes.md](indexes.md#listing-indexes--show-indexes).
 
 ### Security DDL
@@ -651,8 +678,7 @@ message). They are documented here so expectations are exact.
 
 | Area | Status |
 | ---- | ------ |
-| **Vector index** — `CREATE VECTOR INDEX …` | Not supported (syntax error). |
-| **Vector similarity functions** — `vector.similarity.*`, `gds.similarity.*` | Not supported (unknown function). |
+| **Vector similarity functions** — `vector.similarity.*`, `gds.similarity.*` | Not supported (unknown function). The vector **index** itself is supported — see below. |
 | **QPP — nested interior** | Deferred. A quantified group inside another quantified group is rejected at compile time. Single- **and** multi-relationship interiors (`(x)-[r1]->(m)-[r2]->(y)`) **are** supported. |
 | **GDS path-algorithm write** — `gds.dijkstra.write`, `gds.bellmanFord.write` | Deferred. The path algorithms are **stream-only** today (`gds.dijkstra.stream` works). Node-property algorithms support `.stats`/`.mutate`/`.write`. |
 | **Database aliases** — `CREATE ALIAS … FOR DATABASE …` | Not supported (syntax error). |

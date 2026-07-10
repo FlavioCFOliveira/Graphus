@@ -274,6 +274,44 @@ pub enum IndexCommand {
         /// Whether `IF EXISTS` was given (a missing index becomes a no-op success) (`rmp` task #662).
         if_exists: bool,
     },
+    /// `CREATE VECTOR INDEX [<name>] [IF NOT EXISTS] FOR (n:<Label>) ON (n.<prop>)` (node) or
+    /// `… FOR ()-[r:<Type>]-() ON (r.<prop>)` (relationship), followed by a required
+    /// `OPTIONS { indexConfig: { … } }` clause (`rmp` task #671): declares an approximate-nearest-neighbour
+    /// **vector (HNSW) index** over `(entity, label_or_type, property)`. The embedding shape — the
+    /// `dimensions`, the `similarity` metric and the HNSW `m` / `ef_construction` build parameters — is
+    /// parsed and validated from the `indexConfig` map by the admin matcher. Built synchronously (ending
+    /// `Online`). `name` is the requested server-unique name, or [`None`] to auto-generate a deterministic
+    /// one (`rmp` #669); `if_not_exists` makes an already-existing equivalent index (same name or same
+    /// covered schema) a no-op success rather than an error.
+    CreateVectorIndex {
+        /// The requested server-unique name, or [`None`] to auto-generate one.
+        name: Option<String>,
+        /// Whether the index covers a node label or a relationship type.
+        entity: graphus_cypher::VectorEntity,
+        /// The node label (node index) or relationship type (relationship index) the index covers.
+        label_or_type: String,
+        /// The embedding property the index covers (exactly one).
+        property: String,
+        /// The embedding dimension (validated `1..=4096` by the admin matcher).
+        dimensions: usize,
+        /// The similarity metric the HNSW graph navigates by.
+        similarity: graphus_cypher::VectorSimilarity,
+        /// The HNSW `m` build parameter (target out-degree per layer; default `16`).
+        m: usize,
+        /// The HNSW `ef_construction` build parameter (construction candidate-list size; default `100`).
+        ef_construction: usize,
+        /// Whether `IF NOT EXISTS` was given (a duplicate becomes a no-op success).
+        if_not_exists: bool,
+    },
+    /// `DROP [VECTOR] INDEX <name> [IF EXISTS]` (`rmp` task #671): removes the vector (HNSW) index
+    /// (durable catalog entry + in-memory graph). `if_exists` makes a missing index a no-op success rather
+    /// than an error.
+    DropVectorIndex {
+        /// The vector index name to drop.
+        name: String,
+        /// Whether `IF EXISTS` was given (a missing index becomes a no-op success).
+        if_exists: bool,
+    },
     /// `CREATE INDEX [<name>] [IF NOT EXISTS] FOR ()-[r:<TYPE>]-() ON (r.<a>[, r.<b>, …])` on
     /// `(rel_type, properties)` (`rmp` tasks #646 / #666): the relationship analogue of
     /// [`CreateNodePropertyIndex`](Self::CreateNodePropertyIndex). A single-element `properties` is a
@@ -467,17 +505,17 @@ impl ConstraintTypeFilter {
 /// [`All`](Self::All) — and the absent filter of a bare `SHOW INDEXES` — selects every kind. The filter
 /// matches the Neo4j `type` string a row renders (`RANGE` / `FULLTEXT` / `POINT` / `LOOKUP`).
 ///
-/// Graphus has no distinct `TEXT` or `VECTOR` index kind: a `TEXT` index is a create-time synonym of a
-/// `RANGE` B-tree (it renders `type = RANGE`), and vector indexes arrive in a later sprint. So
-/// [`Text`](Self::Text) and [`Vector`](Self::Vector) select the (currently empty) set of rows whose
-/// `type` is exactly `TEXT` / `VECTOR` — an empty listing rather than a syntax error.
+/// [`Text`](Self::Text) selects the distinct native trigram string index (`rmp` task #662); a `TEXT`
+/// index renders `type = TEXT`. [`Vector`](Self::Vector) selects the vector (HNSW) index (`rmp` tasks
+/// #668–#671); a `VECTOR` index renders `type = VECTOR`. Both are their own index kinds, not synonyms of
+/// `RANGE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexTypeFilter {
     /// `ALL` / no filter — every index kind.
     All,
     /// `RANGE` — node-property, relationship-property and composite range indexes.
     Range,
-    /// `TEXT` — text indexes (none in Graphus; a `TEXT` create is a synonym of `RANGE`).
+    /// `TEXT` — text (trigram) indexes (a distinct native string index, `rmp` task #662).
     Text,
     /// `POINT` — spatial (point) indexes.
     Point,
@@ -485,7 +523,7 @@ pub enum IndexTypeFilter {
     Lookup,
     /// `FULLTEXT` — full-text indexes.
     Fulltext,
-    /// `VECTOR` — vector indexes (none in Graphus yet; a later sprint).
+    /// `VECTOR` — vector (HNSW) indexes (`rmp` tasks #668–#671).
     Vector,
 }
 
@@ -830,12 +868,18 @@ pub fn index_ddl_summary(command: &IndexCommand, mutated: bool) -> RunSummary {
         | IndexCommand::CreateRelPropertyIndex { .. }
         | IndexCommand::CreateFulltextIndex { .. }
         | IndexCommand::CreatePointIndex { .. }
-        | IndexCommand::CreateTextIndex { .. } => schema_mutation_summary("indexes-added", mutated),
+        | IndexCommand::CreateTextIndex { .. }
+        | IndexCommand::CreateVectorIndex { .. } => {
+            schema_mutation_summary("indexes-added", mutated)
+        }
         IndexCommand::DropNodePropertyIndex { .. }
         | IndexCommand::DropRelPropertyIndex { .. }
         | IndexCommand::DropFulltextIndex { .. }
         | IndexCommand::DropPointIndex { .. }
-        | IndexCommand::DropTextIndex { .. } => schema_mutation_summary("indexes-removed", mutated),
+        | IndexCommand::DropTextIndex { .. }
+        | IndexCommand::DropVectorIndex { .. } => {
+            schema_mutation_summary("indexes-removed", mutated)
+        }
     }
 }
 

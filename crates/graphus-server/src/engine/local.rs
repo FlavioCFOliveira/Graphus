@@ -687,4 +687,183 @@ mod tests {
             Value::List(vec![Value::String("a".to_owned())])
         );
     }
+
+    /// `rmp` task #671 end-to-end: a `CREATE VECTOR INDEX … OPTIONS { indexConfig { … } }` parsed off the
+    /// admin grammar and driven through the engine builds an `Online` index that `SHOW INDEXES` renders
+    /// as `type = VECTOR` (with the full `indexConfig` in `options` and a round-trippable
+    /// `createStatement`); `SHOW VECTOR INDEXES` filters to it; the unified `DROP INDEX <name>` resolves
+    /// the vector catalog and removes it; and an `IF NOT EXISTS` re-create is an idempotent no-op.
+    #[test]
+    fn vector_index_create_show_filter_and_drop() {
+        use crate::admin::{AdminParse, parse_admin_statement};
+        use crate::engine::IndexTypeFilter;
+        use graphus_core::Value;
+
+        // Parses an index-DDL statement off the admin grammar into an `IndexCommand`.
+        let parse = |stmt: &str| match parse_admin_statement(stmt) {
+            AdminParse::Index(cmd) => cmd,
+            other => panic!("expected an index command for {stmt:?}, got {other:?}"),
+        };
+
+        let mut eng = engine(sim_clock(0));
+
+        // Seed a node carrying a 4-dimensional embedding so the index has content to build from.
+        let tx = eng.begin_auto_commit(AccessMode::Write).expect("begin");
+        let mut reply = eng
+            .run(
+                tx,
+                "CREATE (:Doc {embedding: [1.0, 2.0, 3.0, 4.0]})",
+                vec![],
+                true,
+                None,
+            )
+            .expect("create runs");
+        let _ = drain(&mut reply);
+        drop(reply);
+
+        // CREATE VECTOR INDEX through the full parse → engine path.
+        let create = parse(
+            "CREATE VECTOR INDEX emb FOR (n:Doc) ON (n.embedding) \
+             OPTIONS { indexConfig: { `vector.dimensions`: 4, \
+             `vector.similarity_function`: 'cosine', `vector.hnsw.m`: 16, \
+             `vector.hnsw.ef_construction`: 100 } }",
+        );
+        let created = eng.index_ddl(create).expect("create vector index");
+        assert!(created.mutated, "a fresh CREATE mutates the schema");
+
+        // SHOW INDEXES renders the full Neo4j column set; read columns by name.
+        let reply = eng
+            .index_ddl(IndexCommand::ShowIndexes {
+                filter: IndexTypeFilter::All,
+                tail: None,
+            })
+            .expect("show indexes");
+        let col = |name: &str| {
+            reply
+                .fields
+                .iter()
+                .position(|f| f == name)
+                .unwrap_or_else(|| panic!("a {name} column"))
+        };
+        let (name_c, type_c, entity_c, labels_c, props_c, provider_c, state_c, options_c, create_c) = (
+            col("name"),
+            col("type"),
+            col("entityType"),
+            col("labelsOrTypes"),
+            col("properties"),
+            col("indexProvider"),
+            col("state"),
+            col("options"),
+            col("createStatement"),
+        );
+        let vrow = reply
+            .rows
+            .iter()
+            .find(|r| matches!(&r[name_c], Value::String(n) if n == "emb"))
+            .expect("the vector index is listed under SHOW INDEXES");
+        assert_eq!(vrow[type_c], Value::String("VECTOR".to_owned()));
+        assert_eq!(vrow[entity_c], Value::String("NODE".to_owned()));
+        assert_eq!(
+            vrow[labels_c],
+            Value::List(vec![Value::String("Doc".to_owned())])
+        );
+        assert_eq!(
+            vrow[props_c],
+            Value::List(vec![Value::String("embedding".to_owned())])
+        );
+        assert_eq!(vrow[provider_c], Value::String("vector-2.0".to_owned()));
+        assert_eq!(
+            vrow[state_c],
+            Value::String("ONLINE".to_owned()),
+            "a synchronously-built vector index is Online"
+        );
+        assert_eq!(
+            vrow[options_c],
+            Value::Map(vec![(
+                "indexConfig".to_owned(),
+                Value::Map(vec![
+                    ("vector.dimensions".to_owned(), Value::Integer(4)),
+                    (
+                        "vector.similarity_function".to_owned(),
+                        Value::String("cosine".to_owned()),
+                    ),
+                    ("vector.hnsw.m".to_owned(), Value::Integer(16)),
+                    (
+                        "vector.hnsw.ef_construction".to_owned(),
+                        Value::Integer(100),
+                    ),
+                ]),
+            )]),
+            "the embedding shape surfaces in options.indexConfig"
+        );
+        // The createStatement re-parses to an equivalent CreateVectorIndex.
+        let Value::String(create_stmt) = &vrow[create_c] else {
+            panic!("createStatement is a string");
+        };
+        assert_eq!(
+            parse(create_stmt),
+            IndexCommand::CreateVectorIndex {
+                name: Some("emb".to_owned()),
+                entity: graphus_cypher::VectorEntity::Node,
+                label_or_type: "Doc".to_owned(),
+                property: "embedding".to_owned(),
+                dimensions: 4,
+                similarity: graphus_cypher::VectorSimilarity::Cosine,
+                m: 16,
+                ef_construction: 100,
+                if_not_exists: false,
+            },
+            "the reported createStatement round-trips: {create_stmt}"
+        );
+
+        // SHOW VECTOR INDEXES filters to exactly the one vector row.
+        let filtered = eng
+            .index_ddl(IndexCommand::ShowIndexes {
+                filter: IndexTypeFilter::Vector,
+                tail: None,
+            })
+            .expect("show vector indexes");
+        assert_eq!(
+            filtered.rows.len(),
+            1,
+            "only the vector index matches VECTOR"
+        );
+        assert_eq!(filtered.rows[0][name_c], Value::String("emb".to_owned()));
+
+        // An `IF NOT EXISTS` re-create is an idempotent no-op (does not mutate).
+        let recreate = parse(
+            "CREATE VECTOR INDEX emb IF NOT EXISTS FOR (n:Doc) ON (n.embedding) \
+             OPTIONS { indexConfig: { `vector.dimensions`: 4, \
+             `vector.similarity_function`: 'cosine' } }",
+        );
+        assert!(
+            !eng.index_ddl(recreate)
+                .expect("idempotent recreate")
+                .mutated,
+            "IF NOT EXISTS on an existing index is a no-op"
+        );
+
+        // The unified `DROP INDEX <name>` (no VECTOR keyword) resolves the vector catalog and removes it.
+        let dropped = eng
+            .index_ddl(parse("DROP INDEX emb"))
+            .expect("unified drop by name");
+        assert!(
+            dropped.mutated,
+            "the vector index is removed by unified DROP"
+        );
+
+        let after = eng
+            .index_ddl(IndexCommand::ShowIndexes {
+                filter: IndexTypeFilter::All,
+                tail: None,
+            })
+            .expect("show indexes after drop");
+        assert!(
+            !after
+                .rows
+                .iter()
+                .any(|r| matches!(&r[name_c], Value::String(n) if n == "emb")),
+            "the vector index is gone after DROP"
+        );
+    }
 }

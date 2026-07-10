@@ -97,7 +97,7 @@ use std::sync::Arc;
 
 use graphus_auth::{AuthError, Privilege};
 use graphus_core::{GraphusError, Value};
-use graphus_cypher::{FulltextEntity, SpatialEntity};
+use graphus_cypher::{FulltextEntity, SpatialEntity, VectorEntity, VectorSimilarity};
 use tokio::runtime::Handle;
 
 use crate::audit::{
@@ -794,6 +794,17 @@ pub fn parse_admin_statement(query: &str) -> AdminParse {
     // CLAIMED once the verb + POINT prefix is seen.
     if is_keyword(&second, "POINT") {
         return match parse_claimed_point(&verb, &mut lex) {
+            Ok(cmd) => AdminParse::Index(cmd),
+            Err(msg) => AdminParse::Invalid(msg),
+        };
+    }
+
+    // --- Vector (HNSW) index surface (`rmp` task #671): CREATE/DROP VECTOR INDEX … ---
+    // Like FULLTEXT/POINT, `VECTOR` directly after a verb is never valid Cypher, so the statement is
+    // CLAIMED once the verb + VECTOR prefix is seen. `SHOW VECTOR INDEXES` is dispatched by the unified
+    // SHOW-index-filter surface above (`rmp` #660), so only CREATE/DROP reach here.
+    if is_keyword(&second, "VECTOR") {
+        return match parse_claimed_vector(&verb, &mut lex) {
             Ok(cmd) => AdminParse::Index(cmd),
             Err(msg) => AdminParse::Invalid(msg),
         };
@@ -1826,6 +1837,295 @@ fn parse_point_pattern(lex: &mut Lexer<'_>) -> Result<(SpatialEntity, String), S
     let label = expect_name(lex, "a label", VERB)?;
     expect_symbol(lex, ')', VERB)?;
     Ok((SpatialEntity::Node, label))
+}
+
+// ------------------------------------------------------------------------------------------------
+// Vector (HNSW) index surface (`rmp` task #671)
+// ------------------------------------------------------------------------------------------------
+
+/// The validated `indexConfig` of a `CREATE VECTOR INDEX … OPTIONS { indexConfig: { … } }` clause
+/// (`rmp` task #671): the embedding [`dimensions`](Self::dimensions), the [`similarity`](Self::similarity)
+/// metric and the HNSW [`m`](Self::m) / [`ef_construction`](Self::ef_construction) build parameters.
+struct VectorOptions {
+    dimensions: usize,
+    similarity: VectorSimilarity,
+    m: usize,
+    ef_construction: usize,
+}
+
+/// The default HNSW `vector.hnsw.m` when omitted (`rmp` task #671, Neo4j parity).
+const DEFAULT_VECTOR_M: usize = 16;
+/// The default HNSW `vector.hnsw.ef_construction` when omitted (`rmp` task #671, Neo4j parity).
+const DEFAULT_VECTOR_EF_CONSTRUCTION: usize = 100;
+/// The maximum embedding dimension a vector index accepts (`rmp` task #671, Neo4j parity).
+const MAX_VECTOR_DIMENSIONS: i64 = 4096;
+
+/// Parses the remainder of a claimed **vector (HNSW)** index statement (`verb` + `VECTOR` already read),
+/// for the two mutating shapes (`rmp` task #671):
+///
+/// ```text
+/// CREATE VECTOR INDEX [<name>] [IF NOT EXISTS] FOR (<var>:<Label>) ON (<var>.<prop>)
+///        OPTIONS { indexConfig: { `vector.dimensions`: <int>, `vector.similarity_function`: '<metric>' [, …] } }
+/// CREATE VECTOR INDEX [<name>] [IF NOT EXISTS] FOR ()-[<var>:<Type>]-() ON (<var>.<prop>) OPTIONS { … }
+/// DROP   VECTOR INDEX <name> [IF EXISTS]
+/// ```
+///
+/// A vector index is identified by **name** (Neo4j-compatible), like the other named index kinds; the
+/// name is optional on `CREATE` (a deterministic auto-name applies, `rmp` #669). `SHOW VECTOR INDEXES`
+/// is dispatched earlier by the unified SHOW-index-filter surface (`rmp` #660), so the plural `INDEXES`
+/// never reaches here.
+fn parse_claimed_vector(verb: &str, lex: &mut Lexer<'_>) -> Result<IndexCommand, String> {
+    // The next token must be INDEX (CREATE/DROP) or INDEXES (SHOW). `VECTOR` alone never reaches Cypher,
+    // so a wrong follower is an admin syntax error.
+    let kw = lex
+        .next_tok()?
+        .ok_or_else(|| format!("expected INDEX or INDEXES after {verb} VECTOR"))?;
+    let plural = is_keyword(&kw, "INDEXES");
+    if !is_keyword(&kw, "INDEX") && !plural {
+        return Err(unexpected_generic(
+            &kw,
+            &format!("INDEX or INDEXES after {verb} VECTOR"),
+        ));
+    }
+    // `SHOW VECTOR INDEXES` is dispatched by the unified SHOW-index-filter surface (`rmp` #660), so only
+    // CREATE/DROP VECTOR reach here; the plural INDEXES form is therefore always an error.
+    if plural {
+        return Err(format!(
+            "expected INDEX after {verb} VECTOR (SHOW VECTOR INDEXES is the only plural form)"
+        ));
+    }
+
+    match verb {
+        "DROP" => {
+            // A vector-index DROP always names its target.
+            let name = expect_name(lex, "a vector index name", "VECTOR")?;
+            // `IF EXISTS` turns a missing index into a no-op success.
+            let if_exists = parse_optional_if(lex, /* with_not */ false)?;
+            expect_end(lex, "DROP VECTOR INDEX")?;
+            Ok(IndexCommand::DropVectorIndex { name, if_exists })
+        }
+        "CREATE" => {
+            // The name is OPTIONAL (`rmp` #669, Neo4j parity): a bare `FOR`/`IF` directly after INDEX
+            // means "unnamed" → the coordinator derives a deterministic auto-name. `IF NOT EXISTS`
+            // follows the (optional) name, before the `FOR` clause (Neo4j position).
+            let name = parse_optional_vector_index_name(lex)?;
+            let if_not_exists = parse_optional_if(lex, /* with_not */ true)?;
+            let (entity, label_or_type, property, opts) = parse_vector_create_tail(lex)?;
+            Ok(IndexCommand::CreateVectorIndex {
+                name,
+                entity,
+                label_or_type,
+                property,
+                dimensions: opts.dimensions,
+                similarity: opts.similarity,
+                m: opts.m,
+                ef_construction: opts.ef_construction,
+                if_not_exists,
+            })
+        }
+        // `parse_admin_statement` only routes CREATE/DROP/SHOW here; START/STOP never reach this.
+        other => Err(format!("unsupported vector index verb {other}")),
+    }
+}
+
+/// Parses the OPTIONAL vector-index name in `CREATE VECTOR INDEX [name] …` (`rmp` task #671). Returns
+/// [`None`] (consuming nothing) when the next token is a bare `FOR` or `IF` — i.e. the name was omitted
+/// and the coordinator auto-names — otherwise consumes and returns the explicit name. A backtick-quoted
+/// `` `FOR` `` / `` `IF` `` is still a name. Mirrors [`parse_optional_point_index_name`].
+fn parse_optional_vector_index_name(lex: &mut Lexer<'_>) -> Result<Option<String>, String> {
+    let mut peek = Lexer {
+        rest: lex.rest.clone(),
+    };
+    if let Some(Tok::Word(w)) = peek.next_tok()? {
+        if w.eq_ignore_ascii_case("FOR") || w.eq_ignore_ascii_case("IF") {
+            return Ok(None);
+        }
+    }
+    Ok(Some(expect_name(lex, "a vector index name", "VECTOR")?))
+}
+
+/// Parses the `FOR (<var>:<Label>) ON (<var>.<property>) OPTIONS { … }` (node) or
+/// `FOR ()-[<var>:<Type>]-() ON (<var>.<property>) OPTIONS { … }` (relationship) tail of a
+/// `CREATE VECTOR INDEX <name>` statement (`rmp` task #671). Returns `(entity, label_or_type, property,
+/// options)`. The `OPTIONS { indexConfig: { … } }` clause is **required** (the embedding dimensions and
+/// similarity metric can only be given there, and both are mandatory). Only the **undirected**
+/// relationship form is accepted (a directed `->` / `<-` arrow is a syntax error), like the other index
+/// surfaces.
+fn parse_vector_create_tail(
+    lex: &mut Lexer<'_>,
+) -> Result<(VectorEntity, String, String, VectorOptions), String> {
+    const VERB: &str = "VECTOR";
+    // FOR <node or relationship pattern>
+    expect_keyword(lex, "FOR", VERB)?;
+    let (entity, label_or_type) = parse_vector_pattern(lex)?;
+    // ON ( <var>.<property> )
+    expect_keyword(lex, "ON", VERB)?;
+    expect_symbol(lex, '(', VERB)?;
+    let property = parse_property_ref(VERB, lex)?;
+    expect_symbol(lex, ')', VERB)?;
+    // OPTIONS { indexConfig: { … } } — REQUIRED (carries the mandatory dimensions + similarity).
+    let options = parse_vector_index_options(lex)?;
+    expect_end(lex, "CREATE VECTOR INDEX")?;
+    Ok((entity, label_or_type, property, options))
+}
+
+/// Parses a vector index `FOR` pattern (`rmp` task #671): a node pattern `(<var>:<Label>)` or an
+/// undirected relationship pattern `()-[<var>:<Type>]-()`, returning the [`VectorEntity`] and the single
+/// covered label/type. A directed relationship arrow (`->` / `<-`) is a syntax error. Mirrors
+/// [`parse_point_pattern`].
+fn parse_vector_pattern(lex: &mut Lexer<'_>) -> Result<(VectorEntity, String), String> {
+    const VERB: &str = "VECTOR";
+    expect_symbol(lex, '(', VERB)?;
+    // A relationship pattern opens with an empty node `()`.
+    if peek_symbol(lex, ')')? {
+        // ()-[ <var> : <Type> ]-()
+        expect_symbol(lex, ')', VERB)?; // close the empty start node
+        expect_dash(lex, VERB)?;
+        expect_symbol(lex, '[', VERB)?;
+        let _var = expect_word(lex, "a variable", VERB)?;
+        expect_symbol(lex, ':', VERB)?;
+        let rel_type = expect_name(lex, "a relationship type", VERB)?;
+        expect_symbol(lex, ']', VERB)?;
+        expect_dash(lex, VERB)?;
+        expect_symbol(lex, '(', VERB)?;
+        expect_symbol(lex, ')', VERB)?;
+        return Ok((VectorEntity::Relationship, rel_type));
+    }
+    // (<var> : <Label>)
+    let _var = expect_word(lex, "a variable", VERB)?;
+    expect_symbol(lex, ':', VERB)?;
+    let label = expect_name(lex, "a label", VERB)?;
+    expect_symbol(lex, ')', VERB)?;
+    Ok((VectorEntity::Node, label))
+}
+
+/// Parses the **required** `OPTIONS { [indexProvider: '<str>',] indexConfig: { … } }` clause of a
+/// `CREATE VECTOR INDEX` and validates the embedding shape (`rmp` task #671), reusing the shared
+/// OPTIONS-map machinery (`rmp` #661).
+///
+/// The `indexConfig` map's recognised keys are:
+/// - `` `vector.dimensions` `` — **required** integer, validated to `1..=4096`;
+/// - `` `vector.similarity_function` `` — **required** string, `'cosine'` / `'euclidean'`
+///   (case-insensitive);
+/// - `` `vector.hnsw.m` `` — optional positive integer, default `16`;
+/// - `` `vector.hnsw.ef_construction` `` — optional positive integer, default `100`.
+///
+/// A top-level `indexProvider` string is accepted and ignored (Graphus has a single built-in provider);
+/// an unknown **top-level** OPTIONS key is a clear error (matching the range/text/point OPTIONS parser).
+/// An unknown `indexConfig` key is **accepted and ignored** (Neo4j leniency, matching #661's lenient
+/// treatment of `indexConfig` entries). A missing OPTIONS clause, a missing `indexConfig`, a missing
+/// required key, an out-of-range dimension, an unknown similarity or a non-positive HNSW parameter are
+/// each a clear, side-effect-free error.
+fn parse_vector_index_options(lex: &mut Lexer<'_>) -> Result<VectorOptions, String> {
+    if !consume_options_keyword(lex)? {
+        return Err(
+            "CREATE VECTOR INDEX requires an OPTIONS { indexConfig: { `vector.dimensions`: <int>, \
+             `vector.similarity_function`: 'cosine'|'euclidean' } } clause"
+                .to_owned(),
+        );
+    }
+    expect_options_symbol(lex, '{')?;
+    let mut index_config: Option<Vec<(String, OptionValue)>> = None;
+    for (key, value) in parse_option_map_body(lex)? {
+        match key.to_ascii_lowercase().as_str() {
+            "indexprovider" => {
+                let _ = as_option_string(&value, "indexProvider")?;
+            }
+            "indexconfig" => {
+                index_config = Some(as_option_map(&value, "indexConfig")?.to_vec());
+            }
+            other => {
+                return Err(format!(
+                    "unknown vector index OPTIONS key `{other}`; expected indexProvider or indexConfig"
+                ));
+            }
+        }
+    }
+    let config = index_config.ok_or_else(|| {
+        "CREATE VECTOR INDEX requires an `indexConfig` map inside OPTIONS { … }".to_owned()
+    })?;
+
+    let mut dimensions: Option<i64> = None;
+    let mut similarity: Option<VectorSimilarity> = None;
+    let mut m: Option<usize> = None;
+    let mut ef_construction: Option<usize> = None;
+    for (key, value) in &config {
+        match key.to_ascii_lowercase().as_str() {
+            "vector.dimensions" => {
+                dimensions = Some(as_option_integer(value, "vector.dimensions")?);
+            }
+            "vector.similarity_function" => {
+                let name = as_option_string(value, "vector.similarity_function")?;
+                similarity = Some(parse_vector_similarity(&name)?);
+            }
+            "vector.hnsw.m" => {
+                m = Some(positive_hnsw_param(
+                    as_option_integer(value, "vector.hnsw.m")?,
+                    "vector.hnsw.m",
+                )?);
+            }
+            "vector.hnsw.ef_construction" => {
+                ef_construction = Some(positive_hnsw_param(
+                    as_option_integer(value, "vector.hnsw.ef_construction")?,
+                    "vector.hnsw.ef_construction",
+                )?);
+            }
+            // Unknown `indexConfig` keys are accepted and ignored (Neo4j leniency, `rmp` #661).
+            _ => {}
+        }
+    }
+
+    let dimensions = dimensions.ok_or_else(|| {
+        "CREATE VECTOR INDEX requires `vector.dimensions` in its indexConfig".to_owned()
+    })?;
+    if !(1..=MAX_VECTOR_DIMENSIONS).contains(&dimensions) {
+        return Err(format!(
+            "`vector.dimensions` must be between 1 and {MAX_VECTOR_DIMENSIONS}, got {dimensions}"
+        ));
+    }
+    let similarity = similarity.ok_or_else(|| {
+        "CREATE VECTOR INDEX requires `vector.similarity_function` in its indexConfig".to_owned()
+    })?;
+    Ok(VectorOptions {
+        // The `1..=MAX_VECTOR_DIMENSIONS` range check guarantees a lossless `usize` cast.
+        dimensions: dimensions as usize,
+        similarity,
+        m: m.unwrap_or(DEFAULT_VECTOR_M),
+        ef_construction: ef_construction.unwrap_or(DEFAULT_VECTOR_EF_CONSTRUCTION),
+    })
+}
+
+/// Validates an HNSW build parameter (`vector.hnsw.m` / `vector.hnsw.ef_construction`) is a positive
+/// integer, returning it as a `usize` (`rmp` task #671). A non-positive value is a clear error.
+fn positive_hnsw_param(value: i64, key: &str) -> Result<usize, String> {
+    if value < 1 {
+        return Err(format!("`{key}` must be a positive integer, got {value}"));
+    }
+    Ok(value as usize)
+}
+
+/// Maps a `vector.similarity_function` string to a [`VectorSimilarity`] (`rmp` task #671),
+/// case-insensitively. `'cosine'` → [`Cosine`](VectorSimilarity::Cosine), `'euclidean'` →
+/// [`Euclidean`](VectorSimilarity::Euclidean); anything else is a clear error.
+fn parse_vector_similarity(name: &str) -> Result<VectorSimilarity, String> {
+    match name.to_ascii_lowercase().as_str() {
+        "cosine" => Ok(VectorSimilarity::Cosine),
+        "euclidean" => Ok(VectorSimilarity::Euclidean),
+        other => Err(format!(
+            "unknown `vector.similarity_function` {other:?}; expected 'cosine' or 'euclidean'"
+        )),
+    }
+}
+
+/// Requires `value` to be a bare integer token (`rmp` task #671); errors naming the `key` otherwise.
+/// A negative integer lexes as a single `-…` word, so it parses here and is range-checked by the caller.
+fn as_option_integer(value: &OptionValue, key: &str) -> Result<i64, String> {
+    match value {
+        OptionValue::Word(w) => w
+            .parse::<i64>()
+            .map_err(|_| format!("OPTIONS `{key}` expects an integer value, got `{w}`")),
+        _ => Err(format!("OPTIONS `{key}` expects an integer value")),
+    }
 }
 
 /// Parses the remainder of a claimed **constraint** statement (`verb` + `CONSTRAINT`/`CONSTRAINTS`
@@ -5864,6 +6164,333 @@ mod tests {
         invalid("DROP POINT INDEX"); // missing name
         invalid("DROP POINT INDEX p trailing");
         invalid("CREATE POINT INDEXES ..."); // plural only for SHOW
+    }
+
+    // --- `rmp` #671: CREATE/DROP VECTOR INDEX + OPTIONS { indexConfig { … } } ----------------------
+
+    /// Builds the expected `CREATE VECTOR INDEX` command for a **node** index (`rmp` #671 test helper).
+    #[allow(clippy::too_many_arguments)]
+    fn vector_node_cmd(
+        name: Option<&str>,
+        label: &str,
+        property: &str,
+        dimensions: usize,
+        similarity: VectorSimilarity,
+        m: usize,
+        ef_construction: usize,
+        if_not_exists: bool,
+    ) -> IndexCommand {
+        IndexCommand::CreateVectorIndex {
+            name: name.map(str::to_owned),
+            entity: VectorEntity::Node,
+            label_or_type: label.to_owned(),
+            property: property.to_owned(),
+            dimensions,
+            similarity,
+            m,
+            ef_construction,
+            if_not_exists,
+        }
+    }
+
+    #[test]
+    fn create_vector_index_node_form() {
+        // The Neo4j-compatible node shape with a full indexConfig (backtick-quoted config keys).
+        assert_eq!(
+            index_cmd(
+                "CREATE VECTOR INDEX emb FOR (n:Doc) ON (n.embedding) \
+                 OPTIONS { indexConfig: { `vector.dimensions`: 1536, \
+                 `vector.similarity_function`: 'cosine', `vector.hnsw.m`: 16, \
+                 `vector.hnsw.ef_construction`: 100 } }"
+            ),
+            vector_node_cmd(
+                Some("emb"),
+                "Doc",
+                "embedding",
+                1536,
+                VectorSimilarity::Cosine,
+                16,
+                100,
+                false,
+            )
+        );
+        // Case-insensitive keywords + similarity, bare (un-backticked) dotted config keys, `indexProvider`
+        // accepted-and-ignored, whitespace + trailing `;`.
+        assert_eq!(
+            index_cmd(
+                "  create vector index near for ( p : Place ) on ( p.vec ) \
+                 options { indexProvider: 'vector-2.0', indexConfig: { vector.dimensions: 3, \
+                 vector.similarity_function: 'EUCLIDEAN' } } ;"
+            ),
+            vector_node_cmd(
+                Some("near"),
+                "Place",
+                "vec",
+                3,
+                VectorSimilarity::Euclidean,
+                16,  // default m
+                100, // default ef_construction
+                false,
+            )
+        );
+        // Backtick-quoted name/label/property colliding with keywords still parse.
+        assert_eq!(
+            index_cmd(
+                "CREATE VECTOR INDEX `INDEX` FOR (n:`Order`) ON (n.`from`) \
+                 OPTIONS { indexConfig: { `vector.dimensions`: 8, \
+                 `vector.similarity_function`: 'cosine' } }"
+            ),
+            vector_node_cmd(
+                Some("INDEX"),
+                "Order",
+                "from",
+                8,
+                VectorSimilarity::Cosine,
+                16,
+                100,
+                false,
+            )
+        );
+    }
+
+    #[test]
+    fn create_vector_index_relationship_form() {
+        // The undirected relationship pattern `FOR ()-[r:T]-() ON (r.p)` yields a relationship vector
+        // index (entity Relationship, the covered token is a rel type).
+        assert_eq!(
+            index_cmd(
+                "CREATE VECTOR INDEX rel_emb FOR ()-[r:SIMILAR]-() ON (r.vec) \
+                 OPTIONS { indexConfig: { `vector.dimensions`: 3, \
+                 `vector.similarity_function`: 'euclidean', `vector.hnsw.m`: 24, \
+                 `vector.hnsw.ef_construction`: 200 } }"
+            ),
+            IndexCommand::CreateVectorIndex {
+                name: Some("rel_emb".to_owned()),
+                entity: VectorEntity::Relationship,
+                label_or_type: "SIMILAR".to_owned(),
+                property: "vec".to_owned(),
+                dimensions: 3,
+                similarity: VectorSimilarity::Euclidean,
+                m: 24,
+                ef_construction: 200,
+                if_not_exists: false,
+            }
+        );
+        // A directed arrow is a syntax error (only the undirected form is accepted, like POINT/FULLTEXT).
+        invalid(
+            "CREATE VECTOR INDEX rel_emb FOR ()-[r:SIMILAR]->() ON (r.vec) \
+             OPTIONS { indexConfig: { `vector.dimensions`: 3, `vector.similarity_function`: 'cosine' } }",
+        );
+    }
+
+    #[test]
+    fn create_vector_index_optional_name_and_if_not_exists() {
+        // An anonymous vector index → name None (the coordinator auto-names).
+        assert_eq!(
+            index_cmd(
+                "CREATE VECTOR INDEX FOR (n:Doc) ON (n.embedding) \
+                 OPTIONS { indexConfig: { `vector.dimensions`: 4, \
+                 `vector.similarity_function`: 'cosine' } }"
+            ),
+            vector_node_cmd(
+                None,
+                "Doc",
+                "embedding",
+                4,
+                VectorSimilarity::Cosine,
+                16,
+                100,
+                false
+            )
+        );
+        // `IF NOT EXISTS` after the (omitted) name.
+        assert_eq!(
+            index_cmd(
+                "CREATE VECTOR INDEX IF NOT EXISTS FOR (n:Doc) ON (n.embedding) \
+                 OPTIONS { indexConfig: { `vector.dimensions`: 4, \
+                 `vector.similarity_function`: 'cosine' } }"
+            ),
+            vector_node_cmd(
+                None,
+                "Doc",
+                "embedding",
+                4,
+                VectorSimilarity::Cosine,
+                16,
+                100,
+                true
+            )
+        );
+        // `IF NOT EXISTS` after an explicit name.
+        assert_eq!(
+            index_cmd(
+                "CREATE VECTOR INDEX emb IF NOT EXISTS FOR (n:Doc) ON (n.embedding) \
+                 OPTIONS { indexConfig: { `vector.dimensions`: 4, \
+                 `vector.similarity_function`: 'cosine' } }"
+            ),
+            vector_node_cmd(
+                Some("emb"),
+                "Doc",
+                "embedding",
+                4,
+                VectorSimilarity::Cosine,
+                16,
+                100,
+                true
+            )
+        );
+    }
+
+    #[test]
+    fn create_vector_index_accepts_unknown_indexconfig_key() {
+        // An unknown `indexConfig` key is accepted and ignored (Neo4j leniency, matching `rmp` #661).
+        assert_eq!(
+            index_cmd(
+                "CREATE VECTOR INDEX emb FOR (n:Doc) ON (n.embedding) \
+                 OPTIONS { indexConfig: { `vector.dimensions`: 4, \
+                 `vector.similarity_function`: 'cosine', `vector.quantization.enabled`: true } }"
+            ),
+            vector_node_cmd(
+                Some("emb"),
+                "Doc",
+                "embedding",
+                4,
+                VectorSimilarity::Cosine,
+                16,
+                100,
+                false
+            )
+        );
+    }
+
+    #[test]
+    fn create_vector_index_option_validation() {
+        // Missing OPTIONS entirely.
+        assert!(
+            invalid("CREATE VECTOR INDEX emb FOR (n:Doc) ON (n.embedding)")
+                .contains("requires an OPTIONS")
+        );
+        // Missing indexConfig map.
+        assert!(
+            invalid(
+                "CREATE VECTOR INDEX emb FOR (n:Doc) ON (n.embedding) \
+                 OPTIONS { indexProvider: 'vector-2.0' }"
+            )
+            .contains("requires an `indexConfig`")
+        );
+        // Missing required `vector.dimensions`.
+        assert!(
+            invalid(
+                "CREATE VECTOR INDEX emb FOR (n:Doc) ON (n.embedding) \
+                 OPTIONS { indexConfig: { `vector.similarity_function`: 'cosine' } }"
+            )
+            .contains("requires `vector.dimensions`")
+        );
+        // Missing required `vector.similarity_function`.
+        assert!(
+            invalid(
+                "CREATE VECTOR INDEX emb FOR (n:Doc) ON (n.embedding) \
+                 OPTIONS { indexConfig: { `vector.dimensions`: 4 } }"
+            )
+            .contains("requires `vector.similarity_function`")
+        );
+        // Dimension out of range (0 and > 4096).
+        assert!(
+            invalid(
+                "CREATE VECTOR INDEX emb FOR (n:Doc) ON (n.embedding) \
+                 OPTIONS { indexConfig: { `vector.dimensions`: 0, \
+                 `vector.similarity_function`: 'cosine' } }"
+            )
+            .contains("between 1 and 4096")
+        );
+        assert!(
+            invalid(
+                "CREATE VECTOR INDEX emb FOR (n:Doc) ON (n.embedding) \
+                 OPTIONS { indexConfig: { `vector.dimensions`: 4097, \
+                 `vector.similarity_function`: 'cosine' } }"
+            )
+            .contains("between 1 and 4096")
+        );
+        // Non-integer dimensions.
+        assert!(
+            invalid(
+                "CREATE VECTOR INDEX emb FOR (n:Doc) ON (n.embedding) \
+                 OPTIONS { indexConfig: { `vector.dimensions`: 'lots', \
+                 `vector.similarity_function`: 'cosine' } }"
+            )
+            .contains("integer")
+        );
+        // Unknown similarity.
+        assert!(
+            invalid(
+                "CREATE VECTOR INDEX emb FOR (n:Doc) ON (n.embedding) \
+                 OPTIONS { indexConfig: { `vector.dimensions`: 4, \
+                 `vector.similarity_function`: 'jaccard' } }"
+            )
+            .contains("similarity_function")
+        );
+        // Non-positive HNSW parameter.
+        assert!(
+            invalid(
+                "CREATE VECTOR INDEX emb FOR (n:Doc) ON (n.embedding) \
+                 OPTIONS { indexConfig: { `vector.dimensions`: 4, \
+                 `vector.similarity_function`: 'cosine', `vector.hnsw.m`: 0 } }"
+            )
+            .contains("positive integer")
+        );
+        // Unknown TOP-LEVEL OPTIONS key is a clear error (unlike a lenient indexConfig key).
+        assert!(
+            invalid(
+                "CREATE VECTOR INDEX emb FOR (n:Doc) ON (n.embedding) \
+                 OPTIONS { bogus: 1, indexConfig: { `vector.dimensions`: 4, \
+                 `vector.similarity_function`: 'cosine' } }"
+            )
+            .contains("unknown vector index OPTIONS key")
+        );
+    }
+
+    #[test]
+    fn drop_and_show_vector() {
+        assert_eq!(
+            index_cmd("DROP VECTOR INDEX emb"),
+            IndexCommand::DropVectorIndex {
+                name: "emb".to_owned(),
+                if_exists: false,
+            }
+        );
+        assert_eq!(
+            index_cmd("drop vector index `My Index` if exists ;"),
+            IndexCommand::DropVectorIndex {
+                name: "My Index".to_owned(),
+                if_exists: true,
+            }
+        );
+        // `SHOW VECTOR INDEXES` folds into the unified listing filtered to VECTOR (`rmp` #660).
+        assert_eq!(
+            index_cmd("SHOW VECTOR INDEXES"),
+            IndexCommand::ShowIndexes {
+                filter: IndexTypeFilter::Vector,
+                tail: None,
+            }
+        );
+    }
+
+    #[test]
+    fn claimed_but_malformed_vector_is_a_syntax_error() {
+        invalid("CREATE VECTOR"); // missing INDEX
+        invalid("CREATE VECTOR INDEX"); // missing FOR clause (the name is optional)
+        invalid("CREATE VECTOR INDEX v"); // missing FOR clause
+        invalid("CREATE VECTOR INDEX v FOR (n:Doc)"); // missing ON
+        invalid("CREATE VECTOR INDEX v FOR (n:Doc) ON EACH [n.e]"); // vector uses single ON (...)
+        invalid("CREATE VECTOR INDEX v FOR (n:Doc) ON (e)"); // ref must be var.prop
+        // Well-formed pattern but trailing junk after a complete OPTIONS clause.
+        invalid(
+            "CREATE VECTOR INDEX v FOR (n:Doc) ON (n.e) \
+             OPTIONS { indexConfig: { `vector.dimensions`: 4, `vector.similarity_function`: 'cosine' } } extra",
+        );
+        invalid("DROP VECTOR INDEX"); // missing name
+        invalid("DROP VECTOR INDEX v trailing");
+        invalid("CREATE VECTOR INDEXES ..."); // plural only for SHOW
     }
 
     // --- `rmp` #661: OPTIONS clause + IF (NOT) EXISTS + optional POINT name + singular SHOW ---------

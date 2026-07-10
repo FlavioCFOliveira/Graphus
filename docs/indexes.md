@@ -157,7 +157,7 @@ A bare listing returns the **12 default columns**, in Neo4j order:
 | `entityType`        | string          | `NODE` or `RELATIONSHIP` |
 | `labelsOrTypes`     | list of string  | the covered label(s)/type, e.g. `["Person"]` (empty for `LOOKUP`) |
 | `properties`        | list of string  | the covered property tuple, e.g. `["name"]` or `["first","last"]` |
-| `indexProvider`     | string          | `range-1.0` / `text-1.0` / `token-lookup-1.0` / `fulltext-1.0` / `point-1.0` |
+| `indexProvider`     | string          | `range-1.0` / `text-1.0` / `token-lookup-1.0` / `fulltext-1.0` / `point-1.0` / `vector-2.0` |
 | `owningConstraint`  | string or null  | the uniqueness/key constraint this index backs, else `null` |
 | `lastRead`          | null            | index-usage statistics are untracked |
 | `readCount`         | null            | index-usage statistics are untracked |
@@ -181,7 +181,7 @@ SHOW TEXT INDEXES       -- text (trigram) indexes
 SHOW POINT INDEXES      -- spatial (point) indexes
 SHOW FULLTEXT INDEXES   -- full-text indexes
 SHOW LOOKUP INDEXES     -- the two always-on token lookup indexes
-SHOW VECTOR INDEXES     -- vector indexes (none yet; a later release)
+SHOW VECTOR INDEXES     -- vector (HNSW) indexes
 ```
 
 > `SHOW FULLTEXT INDEXES` and `SHOW POINT INDEXES` now return the **same unified 12-column shape**
@@ -335,10 +335,55 @@ lists the covered label/type under `labelsOrTypes`.
 
 ---
 
+## Vector (HNSW) index DDL
+
+A `VECTOR` index is an approximate-nearest-neighbour (ANN) index over a dense `f32` embedding property,
+built on an HNSW graph. It covers **one node label or relationship type** and **exactly one** embedding
+property, and — unlike every other kind — its `CREATE` **requires** an `OPTIONS { indexConfig: { … } }`
+clause carrying the embedding shape:
+
+```cypher
+-- node vector index (backtick-quote the dotted config keys, Neo4j-style):
+CREATE VECTOR INDEX doc_emb IF NOT EXISTS FOR (d:Doc) ON (d.embedding)
+  OPTIONS { indexConfig: {
+    `vector.dimensions`:           1536,      -- REQUIRED integer, 1..=4096
+    `vector.similarity_function`:  'cosine',  -- REQUIRED 'cosine' | 'euclidean' (case-insensitive)
+    `vector.hnsw.m`:               16,         -- optional, default 16
+    `vector.hnsw.ef_construction`: 100         -- optional, default 100
+  } }
+
+-- relationship vector index (undirected only), defaults for the two HNSW parameters:
+CREATE VECTOR INDEX rel_emb FOR ()-[r:SIMILAR]-() ON (r.vec)
+  OPTIONS { indexConfig: { `vector.dimensions`: 3, `vector.similarity_function`: 'euclidean' } }
+
+DROP VECTOR INDEX doc_emb IF EXISTS
+DROP INDEX doc_emb                 -- the unified by-name drop resolves the vector catalog too
+```
+
+The `indexConfig` keys:
+
+| Key                            | Required | Type    | Default | Validation |
+| ------------------------------ | -------- | ------- | ------- | ---------- |
+| `vector.dimensions`            | yes      | integer | —       | must be `1..=4096` |
+| `vector.similarity_function`   | yes      | string  | —       | `'cosine'` or `'euclidean'`, case-insensitive |
+| `vector.hnsw.m`                | no       | integer | `16`    | must be a positive integer |
+| `vector.hnsw.ef_construction`  | no       | integer | `100`   | must be a positive integer |
+
+A missing `OPTIONS`/`indexConfig`, a missing required key, an out-of-range dimension, an unknown
+similarity or a non-positive HNSW parameter is a clear, side-effect-free error. An unrecognised
+`indexConfig` key is **accepted and ignored** (Neo4j leniency); an unrecognised **top-level** `OPTIONS`
+key is rejected. The name is optional (auto-named deterministically when omitted), and `IF NOT EXISTS` /
+`IF EXISTS` behave as for the other kinds. `SHOW INDEXES` lists a vector index with `type` `VECTOR`,
+`indexProvider` `vector-2.0`, its covered label/type under `labelsOrTypes`, and its `indexConfig` under
+the `options` column (via `YIELD *`); its `createStatement` round-trips back to the same DDL. A `VECTOR`
+index is its own kind — it never backs a constraint (`owningConstraint` is always `null`).
+
+---
+
 ## Names are unique and durable
 
 - **Unique across the whole schema.** An index name may not collide with the name of any
-  other index (node-property, composite, relationship-property, text, full-text, or point)
+  other index (node-property, composite, relationship-property, text, full-text, point, or vector)
   *or* any constraint. A collision is rejected with
   `Neo.ClientError.Schema.IndexWithNameAlreadyExists`.
 - **Durable.** A name is persisted and survives a restart, crash recovery, and backup/restore.

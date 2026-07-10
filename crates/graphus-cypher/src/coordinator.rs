@@ -79,6 +79,38 @@ pub type FulltextIndexListing = (
     Analyzer,
     IndexState,
 );
+
+/// One row of [`TxnCoordinator::list_vector_index_listings`] (`rmp` task #671): every field a
+/// `SHOW INDEXES` VECTOR row needs — the index name, its [`VectorEntity`], its covered label / type,
+/// its covered embedding property, the embedding `dimensions`, the [`VectorSimilarity`] metric, the
+/// HNSW `m` / `ef_construction` build parameters and its build state.
+///
+/// Unlike the thinner [`TxnCoordinator::list_vector_indexes`] tuple (`(name, label, property, state)`,
+/// `rmp` #669), this carries the full `indexConfig` so the unified index listing can render the
+/// `options` map and a round-trippable `createStatement`. A struct (rather than a wide tuple) keeps the
+/// nine fields self-documenting at every use site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorIndexListing {
+    /// The server-unique index name.
+    pub name: String,
+    /// Whether the index covers a node label or a relationship type.
+    pub entity: VectorEntity,
+    /// The covered node label ([`Node`](VectorEntity::Node)) or relationship type
+    /// ([`Relationship`](VectorEntity::Relationship)).
+    pub label_or_type: String,
+    /// The covered embedding property (exactly one).
+    pub property: String,
+    /// The embedding dimension (`> 0`).
+    pub dimensions: u32,
+    /// The similarity metric the HNSW graph navigates by.
+    pub similarity: VectorSimilarity,
+    /// The HNSW `m` build parameter (target out-degree per layer).
+    pub m: u32,
+    /// The HNSW `ef_construction` build parameter (construction candidate-list size).
+    pub ef_construction: u32,
+    /// The build state of the index.
+    pub state: IndexState,
+}
 use crate::store_statistics;
 
 /// Renders a [`Value`] compactly for a constraint-violation message (`rmp` task #99): a string is
@@ -2215,6 +2247,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // A text (trigram) index of that name (`rmp` task #662)?
         if self.store.borrow().text_index(name).is_some() {
             return self.drop_text_index(name, if_exists);
+        }
+        // A vector (HNSW) index of that name (`rmp` task #671)?
+        if self.store.borrow().vector_index(name).is_some() {
+            return self.drop_vector_index(name, if_exists);
         }
         // No catalog holds the name: honour `IF EXISTS`.
         if if_exists {
@@ -4586,6 +4622,40 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 let rel_type = store.token_name(Namespace::RelType, entry.token)?;
                 let property = store.token_name(Namespace::PropKey, entry.property_token)?;
                 Some((name, rel_type.to_owned(), property.to_owned(), entry.state))
+            })
+            .collect()
+    }
+
+    /// Lists every declared vector index — node **and** relationship — as a [`VectorIndexListing`]
+    /// carrying its full `indexConfig` (`rmp` task #671), for the unified `SHOW INDEXES` VECTOR rows.
+    /// Reads the durable catalog and resolves each covered token (by [`entity`](VectorIndexListing::entity)
+    /// namespace) plus the property token back to names; an entry whose tokens have no resolvable name is
+    /// omitted. Ordered by name (the catalog's [`BTreeMap`](std::collections::BTreeMap) order).
+    #[must_use]
+    pub fn list_vector_index_listings(&self) -> Vec<VectorIndexListing> {
+        let store = self.store.borrow();
+        store
+            .vector_indexes()
+            .into_iter()
+            .filter_map(|(name, entry)| {
+                let namespace = if entry.entity.is_relationship() {
+                    Namespace::RelType
+                } else {
+                    Namespace::Label
+                };
+                let label_or_type = store.token_name(namespace, entry.token)?;
+                let property = store.token_name(Namespace::PropKey, entry.property_token)?;
+                Some(VectorIndexListing {
+                    name,
+                    entity: entry.entity,
+                    label_or_type: label_or_type.to_owned(),
+                    property: property.to_owned(),
+                    dimensions: entry.dimensions,
+                    similarity: entry.similarity,
+                    m: entry.m,
+                    ef_construction: entry.ef_construction,
+                    state: entry.state,
+                })
             })
             .collect()
     }

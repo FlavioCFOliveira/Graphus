@@ -2565,6 +2565,7 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
                 point: coordinator.list_point_indexes(),
                 point_rel: coordinator.list_point_rel_indexes(),
                 text: coordinator.list_text_indexes(),
+                vector: coordinator.list_vector_index_listings(),
                 constraints: coordinator.list_constraints(),
             };
             let rows = index_show::build_rows(*filter, sources);
@@ -2697,6 +2698,40 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
             // `mutated == false` is an `IF EXISTS` no-op drop of a missing index → 0 removed; a missing
             // index without `IF EXISTS` is an error (`rmp` task #662).
             let mutated = coordinator.drop_text_index(name, *if_exists)?;
+            Ok(IndexDdlReply::mutation(mutated))
+        }
+        IndexCommand::CreateVectorIndex {
+            name,
+            entity,
+            label_or_type,
+            property,
+            dimensions,
+            similarity,
+            m,
+            ef_construction,
+            if_not_exists,
+        } => {
+            // A vector (HNSW) index is declared durably then built synchronously from the current data
+            // (ending `Online`), routing to the #669 coordinator entry point (which auto-names when `name`
+            // is `None`). `mutated == false` is an idempotent `IF NOT EXISTS` no-op → 0 added; otherwise 1
+            // added (`rmp` task #671).
+            let mutated = coordinator.begin_online_vector_index_named(
+                name.as_deref(),
+                *entity,
+                label_or_type,
+                property,
+                *dimensions,
+                *similarity,
+                *m,
+                *ef_construction,
+                *if_not_exists,
+            )?;
+            Ok(IndexDdlReply::mutation(mutated))
+        }
+        IndexCommand::DropVectorIndex { name, if_exists } => {
+            // `mutated == false` is an `IF EXISTS` no-op drop of a missing index → 0 removed; a missing
+            // index without `IF EXISTS` is an error (`rmp` task #671).
+            let mutated = coordinator.drop_vector_index(name, *if_exists)?;
             Ok(IndexDdlReply::mutation(mutated))
         }
     }

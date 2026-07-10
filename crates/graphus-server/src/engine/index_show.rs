@@ -37,16 +37,18 @@
 //! * `state` — the **UPPER-CASE** Neo4j string `ONLINE` / `POPULATING`.
 //! * `populationPercent` — `100.0` when `Online`, else `0.0` (Graphus does not surface a fractional
 //!   build progress from the listing APIs; a `Populating` index reports `0.0`).
-//! * `type` — one of `RANGE` / `TEXT` / `FULLTEXT` / `POINT` / `LOOKUP` (`TEXT` is a distinct native
-//!   string index for `CONTAINS` / `ENDS WITH` / `STARTS WITH`, `rmp` task #662; Graphus has no
-//!   `VECTOR` index kind yet — those arrive later).
+//! * `type` — one of `RANGE` / `TEXT` / `FULLTEXT` / `POINT` / `VECTOR` / `LOOKUP` (`TEXT` is a distinct
+//!   native string index for `CONTAINS` / `ENDS WITH` / `STARTS WITH`, `rmp` task #662; `VECTOR` is the
+//!   HNSW approximate-nearest-neighbour index, `rmp` tasks #668–#671).
 //! * `indexProvider` — a Neo4j-like provider string per kind: `range-1.0`, `text-1.0`,
-//!   `token-lookup-1.0`, `fulltext-1.0`, `point-1.0`.
+//!   `token-lookup-1.0`, `fulltext-1.0`, `point-1.0`, `vector-2.0`.
 //! * `owningConstraint` — for a **single-property** `RANGE` index that is a uniqueness / key
 //!   constraint's backing index, the constraint's name (matched by covered `(entityType, token,
 //!   property)`, `rmp` #653); `Null` otherwise (composite, fulltext, point, lookup).
 //! * `options` — the empty map `{}` for most kinds; for a `FULLTEXT` index, the analyzer config
-//!   `{ indexConfig: { \`fulltext.analyzer\`: "<name>" } }` (the Neo4j shape).
+//!   `{ indexConfig: { \`fulltext.analyzer\`: "<name>" } }`; for a `VECTOR` index, the HNSW config
+//!   `{ indexConfig: { \`vector.dimensions\`: d, \`vector.similarity_function\`: "cosine"|"euclidean",
+//!   \`vector.hnsw.m\`: m, \`vector.hnsw.ef_construction\`: ef } }` (the Neo4j shape).
 //! * `createStatement` — a Graphus-native, round-trippable `CREATE … INDEX` DDL that recreates the
 //!   index ([`create_range_node`] / [`create_range_rel`] / [`create_fulltext`] / [`create_point`]);
 //!   the two synthetic `LOOKUP` rows carry the Neo4j-standard `CREATE LOOKUP INDEX … ON EACH labels(n)`
@@ -56,7 +58,10 @@
 //! * `lastRead` / `readCount` — `Null` (index-usage statistics are untracked).
 
 use graphus_core::{GraphusError, Value};
-use graphus_cypher::{Analyzer, ConstraintInfo, FulltextEntity, FulltextIndexListing};
+use graphus_cypher::{
+    Analyzer, ConstraintInfo, FulltextEntity, FulltextIndexListing, VectorIndexListing,
+    VectorSimilarity,
+};
 use graphus_storage::{ConstraintKind, IndexState};
 
 use crate::admin::AdminResult;
@@ -156,6 +161,9 @@ pub(crate) struct IndexSources {
     pub point_rel: Vec<(String, String, String, IndexState)>,
     /// `(name, label, property, state)` per `TEXT` (trigram) index (`rmp` task #662).
     pub text: Vec<(String, String, String, IndexState)>,
+    /// Every declared `VECTOR` (HNSW) index — node or relationship — with its full `indexConfig`
+    /// (`rmp` task #671).
+    pub vector: Vec<VectorIndexListing>,
     /// Every declared constraint, for the `owningConstraint` attribution.
     pub constraints: Vec<ConstraintInfo>,
 }
@@ -379,6 +387,73 @@ pub(crate) fn create_text(name: &str, label: &str, property: &str) -> String {
     )
 }
 
+/// The lower-case Neo4j `vector.similarity_function` string for a [`VectorSimilarity`] (`rmp` task
+/// #671), the value that appears in a `VECTOR` index's `options.indexConfig` and its round-trippable
+/// `createStatement`. The admin matcher parses these case-insensitively, so this round-trips.
+const fn similarity_name(similarity: VectorSimilarity) -> &'static str {
+    match similarity {
+        VectorSimilarity::Cosine => "cosine",
+        VectorSimilarity::Euclidean => "euclidean",
+    }
+}
+
+/// The `options` map for a `VECTOR` (HNSW) index (`rmp` task #671): the embedding shape under Neo4j's
+/// `indexConfig` map, keyed by the four vector config keys in their canonical order —
+/// `vector.dimensions`, `vector.similarity_function`, `vector.hnsw.m`, `vector.hnsw.ef_construction`.
+fn vector_options(listing: &VectorIndexListing) -> Value {
+    Value::Map(vec![(
+        "indexConfig".to_owned(),
+        Value::Map(vec![
+            (
+                "vector.dimensions".to_owned(),
+                Value::Integer(i64::from(listing.dimensions)),
+            ),
+            (
+                "vector.similarity_function".to_owned(),
+                Value::String(similarity_name(listing.similarity).to_owned()),
+            ),
+            (
+                "vector.hnsw.m".to_owned(),
+                Value::Integer(i64::from(listing.m)),
+            ),
+            (
+                "vector.hnsw.ef_construction".to_owned(),
+                Value::Integer(i64::from(listing.ef_construction)),
+            ),
+        ]),
+    )])
+}
+
+/// A round-trippable `CREATE VECTOR INDEX` DDL for a `VECTOR` (HNSW) index (`rmp` task #671). Renders a
+/// node pattern `(n:L)` or an undirected relationship pattern `()-[r:T]-()` per the listing's
+/// [`entity`](VectorIndexListing::entity), followed by the required `OPTIONS { indexConfig: { … } }`
+/// carrying the full embedding shape (backtick-quoted config keys). Re-parsing it through
+/// [`crate::admin::parse_admin_statement`] yields an equivalent `CreateVectorIndex` (regression-tested).
+#[must_use]
+pub(crate) fn create_vector(listing: &VectorIndexListing) -> String {
+    let is_rel = listing.entity.is_relationship();
+    let var = if is_rel { "r" } else { "n" };
+    let pattern = if is_rel {
+        format!("()-[{var}:{}]-()", quote_ident(&listing.label_or_type))
+    } else {
+        format!("({var}:{})", quote_ident(&listing.label_or_type))
+    };
+    format!(
+        "CREATE VECTOR INDEX {} FOR {pattern} ON ({var}.{}) \
+         OPTIONS {{ indexConfig: {{ {}: {}, {}: '{}', {}: {}, {}: {} }} }}",
+        quote_ident(&listing.name),
+        quote_ident(&listing.property),
+        quote_ident("vector.dimensions"),
+        listing.dimensions,
+        quote_ident("vector.similarity_function"),
+        similarity_name(listing.similarity),
+        quote_ident("vector.hnsw.m"),
+        listing.m,
+        quote_ident("vector.hnsw.ef_construction"),
+        listing.ef_construction,
+    )
+}
+
 /// The Neo4j-standard `createStatement` for a synthetic token `LOOKUP` row (`rmp` #660). Informational
 /// only — Graphus maintains node-label / relationship-type lookups implicitly and does not accept their
 /// DDL, so this does **not** round-trip through the admin grammar.
@@ -432,6 +507,7 @@ pub(crate) fn build_rows(filter: IndexTypeFilter, sources: IndexSources) -> Vec<
         point,
         point_rel,
         text,
+        vector,
         constraints,
     } = sources;
 
@@ -598,6 +674,38 @@ pub(crate) fn build_rows(filter: IndexTypeFilter, sources: IndexSources) -> Vec<
             create_statement: create,
         });
     }
+    // VECTOR (HNSW) — node or relationship (`rmp` task #671); the embedding shape (dimensions,
+    // similarity, HNSW m / ef_construction) goes into the `options.indexConfig` map. Never a constraint's
+    // backing index.
+    for listing in vector {
+        let create = create_vector(&listing);
+        let options = vector_options(&listing);
+        let VectorIndexListing {
+            name,
+            entity,
+            label_or_type,
+            property,
+            state,
+            ..
+        } = listing;
+        specs.push(RowSpec {
+            id: alloc(),
+            name,
+            state,
+            type_str: "VECTOR",
+            entity_type: if entity.is_relationship() {
+                "RELATIONSHIP"
+            } else {
+                "NODE"
+            },
+            labels_or_types: vec![label_or_type],
+            properties: vec![property],
+            index_provider: "vector-2.0",
+            owning_constraint: Value::Null,
+            options,
+            create_statement: create,
+        });
+    }
 
     specs
         .into_iter()
@@ -702,7 +810,7 @@ mod tests {
     use super::*;
     use crate::admin::{AdminParse, parse_admin_statement};
     use crate::engine::IndexCommand;
-    use graphus_cypher::SpatialEntity;
+    use graphus_cypher::{SpatialEntity, VectorEntity};
 
     fn empty_sources() -> IndexSources {
         IndexSources {
@@ -714,7 +822,33 @@ mod tests {
             point: Vec::new(),
             point_rel: Vec::new(),
             text: Vec::new(),
+            vector: Vec::new(),
             constraints: Vec::new(),
+        }
+    }
+
+    /// Builds a node [`VectorIndexListing`] test fixture (`rmp` task #671).
+    #[allow(clippy::too_many_arguments)]
+    fn vector_node(
+        name: &str,
+        label: &str,
+        property: &str,
+        dimensions: u32,
+        similarity: VectorSimilarity,
+        m: u32,
+        ef_construction: u32,
+        state: IndexState,
+    ) -> VectorIndexListing {
+        VectorIndexListing {
+            name: name.to_owned(),
+            entity: VectorEntity::Node,
+            label_or_type: label.to_owned(),
+            property: property.to_owned(),
+            dimensions,
+            similarity,
+            m,
+            ef_construction,
+            state,
         }
     }
 
@@ -837,12 +971,23 @@ mod tests {
                 "name".to_owned(),
                 IndexState::Online,
             )],
+            vector: vec![vector_node(
+                "vec_doc",
+                "Doc",
+                "embedding",
+                1536,
+                VectorSimilarity::Cosine,
+                16,
+                100,
+                IndexState::Online,
+            )],
             constraints: Vec::new(),
         };
         let rows = build_rows(IndexTypeFilter::All, sources);
-        // 2 lookups + 8 declared indexes (`rmp` #666 added the composite relationship index).
-        assert_eq!(rows.len(), 10);
-        // Ids: lookups 1/2, then 3..=10 in build order.
+        // 2 lookups + 9 declared indexes (`rmp` #666 added the composite relationship index; `rmp` #671
+        // added the vector index).
+        assert_eq!(rows.len(), 11);
+        // Ids: lookups 1/2, then 3..=11 in build order.
         let ids: Vec<i64> = rows
             .iter()
             .map(|r| match r[0] {
@@ -850,7 +995,7 @@ mod tests {
                 _ => panic!("id must be an integer"),
             })
             .collect();
-        assert_eq!(ids, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(ids, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
 
         // The composite row: type RANGE, entityType NODE, properties = [first, last], Populating.
         let composite = rows
@@ -957,6 +1102,21 @@ mod tests {
             "text index covers a single property"
         );
         assert_eq!(tx[9], Value::Null, "a text index has no owning constraint");
+
+        // The vector index (`rmp` task #671): type VECTOR, entityType NODE, provider vector-2.0, the
+        // embedding shape in options.indexConfig, no owning constraint.
+        let vec = rows
+            .iter()
+            .find(|r| r[1] == Value::String("vec_doc".to_owned()))
+            .expect("vector listed");
+        assert_eq!(vec[4], Value::String("VECTOR".to_owned()));
+        assert_eq!(vec[5], Value::String("NODE".to_owned()));
+        assert_eq!(vec[8], Value::String("vector-2.0".to_owned()));
+        assert_eq!(
+            vec[9],
+            Value::Null,
+            "a vector index has no owning constraint"
+        );
     }
 
     /// Each filter selects only the matching `type`, and the ids stay stable (assigned over the full
@@ -1009,6 +1169,166 @@ mod tests {
         );
         // VECTOR → empty (Graphus has no distinct VECTOR index kind yet).
         assert!(build_rows(IndexTypeFilter::Vector, sources()).is_empty());
+    }
+
+    /// A `VECTOR` index renders `type = VECTOR`, `indexProvider = vector-2.0`, the covered
+    /// label/property, and the full `indexConfig` (dimensions / similarity / HNSW m / ef_construction) in
+    /// `options`, for both a node and a relationship index (`rmp` task #671).
+    #[test]
+    fn vector_index_renders_type_provider_and_indexconfig() {
+        let sources = IndexSources {
+            vector: vec![
+                vector_node(
+                    "emb",
+                    "Doc",
+                    "embedding",
+                    1536,
+                    VectorSimilarity::Cosine,
+                    16,
+                    100,
+                    IndexState::Online,
+                ),
+                VectorIndexListing {
+                    name: "rel_emb".to_owned(),
+                    entity: VectorEntity::Relationship,
+                    label_or_type: "SIMILAR".to_owned(),
+                    property: "vec".to_owned(),
+                    dimensions: 3,
+                    similarity: VectorSimilarity::Euclidean,
+                    m: 24,
+                    ef_construction: 200,
+                    state: IndexState::Populating,
+                },
+            ],
+            ..empty_sources()
+        };
+        let rows = build_rows(IndexTypeFilter::Vector, sources);
+        assert_eq!(
+            rows.len(),
+            2,
+            "both vector indexes select under the VECTOR filter"
+        );
+
+        // The node vector index.
+        let node = rows
+            .iter()
+            .find(|r| r[1] == Value::String("emb".to_owned()))
+            .expect("node vector index listed");
+        assert_eq!(node[4], Value::String("VECTOR".to_owned()));
+        assert_eq!(node[5], Value::String("NODE".to_owned()));
+        assert_eq!(node[6], Value::List(vec![Value::String("Doc".to_owned())]));
+        assert_eq!(
+            node[7],
+            Value::List(vec![Value::String("embedding".to_owned())])
+        );
+        assert_eq!(node[8], Value::String("vector-2.0".to_owned()));
+        assert_eq!(node[9], Value::Null, "a vector index owns no constraint");
+        assert_eq!(
+            node[10],
+            Value::Map(vec![(
+                "indexConfig".to_owned(),
+                Value::Map(vec![
+                    ("vector.dimensions".to_owned(), Value::Integer(1536)),
+                    (
+                        "vector.similarity_function".to_owned(),
+                        Value::String("cosine".to_owned()),
+                    ),
+                    ("vector.hnsw.m".to_owned(), Value::Integer(16)),
+                    (
+                        "vector.hnsw.ef_construction".to_owned(),
+                        Value::Integer(100),
+                    ),
+                ]),
+            )]),
+            "the embedding shape surfaces in options.indexConfig"
+        );
+
+        // The relationship vector index: entityType RELATIONSHIP, euclidean, Populating → 0.0.
+        let rel = rows
+            .iter()
+            .find(|r| r[1] == Value::String("rel_emb".to_owned()))
+            .expect("relationship vector index listed");
+        assert_eq!(rel[4], Value::String("VECTOR".to_owned()));
+        assert_eq!(rel[5], Value::String("RELATIONSHIP".to_owned()));
+        assert_eq!(rel[2], Value::String("POPULATING".to_owned()));
+        assert_eq!(rel[3], Value::Float(0.0));
+        assert_eq!(
+            rel[6],
+            Value::List(vec![Value::String("SIMILAR".to_owned())])
+        );
+        assert_eq!(
+            rel[10],
+            Value::Map(vec![(
+                "indexConfig".to_owned(),
+                Value::Map(vec![
+                    ("vector.dimensions".to_owned(), Value::Integer(3)),
+                    (
+                        "vector.similarity_function".to_owned(),
+                        Value::String("euclidean".to_owned()),
+                    ),
+                    ("vector.hnsw.m".to_owned(), Value::Integer(24)),
+                    (
+                        "vector.hnsw.ef_construction".to_owned(),
+                        Value::Integer(200),
+                    ),
+                ]),
+            )]),
+        );
+    }
+
+    /// A `VECTOR` index's `createStatement` re-parses to an equivalent `CreateVectorIndex` (node + rel),
+    /// round-tripping the covered schema and the full `indexConfig` (`rmp` task #671).
+    #[test]
+    fn vector_create_statement_round_trips() {
+        let node = vector_node(
+            "emb",
+            "Doc",
+            "embedding",
+            1536,
+            VectorSimilarity::Cosine,
+            16,
+            100,
+            IndexState::Online,
+        );
+        assert_eq!(
+            parse_index(&create_vector(&node)),
+            IndexCommand::CreateVectorIndex {
+                name: Some("emb".to_owned()),
+                entity: VectorEntity::Node,
+                label_or_type: "Doc".to_owned(),
+                property: "embedding".to_owned(),
+                dimensions: 1536,
+                similarity: VectorSimilarity::Cosine,
+                m: 16,
+                ef_construction: 100,
+                if_not_exists: false,
+            }
+        );
+        let rel = VectorIndexListing {
+            name: "rel_emb".to_owned(),
+            entity: VectorEntity::Relationship,
+            label_or_type: "SIMILAR".to_owned(),
+            property: "vec".to_owned(),
+            dimensions: 3,
+            similarity: VectorSimilarity::Euclidean,
+            m: 24,
+            ef_construction: 200,
+            state: IndexState::Online,
+        };
+        assert_eq!(
+            parse_index(&create_vector(&rel)),
+            IndexCommand::CreateVectorIndex {
+                name: Some("rel_emb".to_owned()),
+                entity: VectorEntity::Relationship,
+                label_or_type: "SIMILAR".to_owned(),
+                property: "vec".to_owned(),
+                dimensions: 3,
+                similarity: VectorSimilarity::Euclidean,
+                m: 24,
+                ef_construction: 200,
+                if_not_exists: false,
+            }
+        );
     }
 
     /// A single-property RANGE index that backs a uniqueness constraint names it in `owningConstraint`.
