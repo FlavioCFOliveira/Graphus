@@ -72,6 +72,7 @@ pub mod kinds;
 pub mod node;
 pub mod recovery;
 pub mod spatial;
+pub mod text;
 
 pub use bitmap::{BitmapIndex, intersect as bitmap_intersect};
 pub use btree::BTree;
@@ -82,3 +83,4 @@ pub use keycodec::{KeyEncodeError, encode_composite, encode_single, encode_value
 pub use kinds::{CompositeIndex, PropertyIndex, RelPropertyIndex, TokenIndex};
 pub use recovery::{SharedWal, recover_index_device};
 pub use spatial::{DEFAULT_CELL_SIZE, SpatialIndex};
+pub use text::{Gram, Trigram, TrigramIndex};

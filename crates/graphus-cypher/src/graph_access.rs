@@ -353,6 +353,30 @@ pub trait GraphAccess {
         None
     }
 
+    /// An **optional** text (trigram) index seek (`rmp` task #662): the **candidate** node ids of
+    /// `label` whose string `property` may satisfy the `op` predicate (`CONTAINS` / `ENDS WITH` /
+    /// `STARTS WITH`) against `needle`.
+    ///
+    /// Returns `None` when no text index covers `(label, property)`, or when `needle` is too short to
+    /// narrow (fewer than the trigram minimum) — the executor then falls back to a label scan (the
+    /// residual predicate above the seek restores exactness either way). `Some(ids)` is a candidate
+    /// **superset**: the caller (the
+    /// [`NodeTextIndexSeek`](crate::physical::PhysicalOp::NodeTextIndexSeek) operator's residual filter)
+    /// re-checks every candidate's visibility, current label, current value, and the exact string
+    /// predicate, so a deleted / invisible / re-labelled / non-matching node never reaches the result,
+    /// and RBAC composes for free through the
+    /// [`AuthorizedGraph`](crate::authorized_graph::AuthorizedGraph) decorator. The default returns
+    /// `None` (no text index available).
+    fn index_seek_text(
+        &self,
+        _label: &str,
+        _property: &str,
+        _op: crate::physical::TextSeekOp,
+        _needle: &str,
+    ) -> Option<Vec<NodeId>> {
+        None
+    }
+
     /// A **full-text** index query (`rmp` task #72): the **candidate** node ids matching the
     /// `search` string against the full-text index named `name`, analyzed with the index's own
     /// analyzer (OR-of-terms by default).
@@ -685,6 +709,12 @@ pub struct MemGraph {
     /// the real grid index from the executor's perspective: a geometric superset re-checked exactly by
     /// the residual `distance` filter above the seek.
     spatial: std::collections::BTreeSet<(String, String)>,
+    /// Declared text (trigram) indexes for executor tests (`rmp` task #662), keyed by `(label,
+    /// property)`. Like the full-text / spatial reference impls, candidates are computed on the fly from
+    /// the live nodes at query time (building a [`TrigramIndex`](graphus_index::text::TrigramIndex) over
+    /// the covered string property), so the seek behaves exactly like the real backend from the
+    /// executor's perspective: a candidate superset re-checked exactly by the residual string predicate.
+    text: std::collections::BTreeSet<(String, String)>,
     /// The exact side-effect tally for the statement run against this graph (`rmp` task #510),
     /// surfaced by [`write_counters`](GraphAccess::write_counters). Incremented at the same logical
     /// chokepoints (and following the same Neo4j operation-count rules) as the live
@@ -773,6 +803,14 @@ impl MemGraph {
     /// idempotent.
     pub fn create_spatial_index(&mut self, label: impl Into<String>, property: impl Into<String>) {
         self.spatial.insert((label.into(), property.into()));
+    }
+
+    /// Declares a text (trigram) index over `(label, property)` (`rmp` task #662; test/setup helper).
+    /// The index computes candidates lazily at query time (a trigram-intersection superset over the live
+    /// nodes' string property), so it immediately covers existing and future nodes. Re-declaring is
+    /// idempotent.
+    pub fn create_text_index(&mut self, label: impl Into<String>, property: impl Into<String>) {
+        self.text.insert((label.into(), property.into()));
     }
 
     /// The analyzed terms of node `id`'s covered properties for the full-text index `idx`. The same
@@ -973,6 +1011,39 @@ impl GraphAccess for MemGraph {
             .collect();
         out.sort_unstable();
         Some(out)
+    }
+
+    fn index_seek_text(
+        &self,
+        label: &str,
+        property: &str,
+        op: crate::physical::TextSeekOp,
+        needle: &str,
+    ) -> Option<Vec<NodeId>> {
+        use crate::physical::TextSeekOp;
+        // Only serve the seek when a text index is declared on `(label, property)`; else `None` so the
+        // executor falls back to a label scan (`rmp` task #662).
+        if !self.text.contains(&(label.to_owned(), property.to_owned())) {
+            return None;
+        }
+        // Build a trigram index from the live nodes of `label` with a string value for `property`, then
+        // query it — exercising the *same* superset logic as the real backend, so a `None` (needle too
+        // short) here signals the scan fallback identically. A non-string / missing value is not indexed.
+        let mut idx = graphus_index::text::TrigramIndex::new();
+        for (id, node) in &self.nodes {
+            if !node.labels.iter().any(|l| l == label) {
+                continue;
+            }
+            if let Some(Value::String(s)) = node.props.get(property) {
+                idx.index_value(id.0, s);
+            }
+        }
+        let candidates = match op {
+            TextSeekOp::Contains => idx.query_contains(needle),
+            TextSeekOp::EndsWith => idx.query_ends_with(needle),
+            TextSeekOp::StartsWith => idx.query_starts_with(needle),
+        }?;
+        Some(candidates.into_iter().map(NodeId).collect())
     }
 
     fn create_node(&mut self, labels: &[String], properties: &[(String, Value)]) -> NodeId {

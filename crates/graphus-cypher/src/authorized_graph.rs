@@ -666,6 +666,28 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         )
     }
 
+    fn index_seek_text(
+        &self,
+        label: &str,
+        property: &str,
+        op: crate::physical::TextSeekOp,
+        needle: &str,
+    ) -> Option<Vec<NodeId>> {
+        let ids = self.inner.index_seek_text(label, property, op, needle)?;
+        if self.oracle.is_unrestricted() {
+            return Some(ids);
+        }
+        // A text (trigram) seek is a read path (`rmp` task #662): filter the candidate ids exactly like
+        // a scan, so an RBAC-invisible node never reaches the result. The seek's residual string
+        // predicate additionally re-checks each candidate's current value/label through this same
+        // decorator, so the filters compose (visibility + label + value + RBAC).
+        Some(
+            ids.into_iter()
+                .filter(|&id| self.node_visible(id))
+                .collect(),
+        )
+    }
+
     fn fulltext_query(&self, name: &str, search: &str) -> Option<Vec<NodeId>> {
         let ids = self.inner.fulltext_query(name, search)?;
         if self.oracle.is_unrestricted() {

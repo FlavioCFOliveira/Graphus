@@ -890,26 +890,28 @@ fn parse_claimed_index(verb: &str, lex: &mut Lexer<'_>) -> Result<IndexCommand, 
 ///
 /// ```text
 /// CREATE RANGE INDEX [<name>] [IF NOT EXISTS] FOR (n:Label) ON (n.property)   -- full node-property synonym
-/// CREATE TEXT  INDEX [<name>] [IF NOT EXISTS] FOR (n:Label) ON (n.property)   -- maps to the node-property B-tree
+/// CREATE TEXT  INDEX [<name>] [IF NOT EXISTS] FOR (n:Label) ON (n.property)   -- distinct trigram string index
 /// DROP   RANGE|TEXT INDEX <name> [IF EXISTS]
 /// SHOW   RANGE|TEXT INDEXES
 /// ```
 ///
 /// - **RANGE** is a full synonym of the plain node-property index (`CREATE INDEX`): the create/drop/show
 ///   are delegated verbatim to [`parse_claimed_index`], so a range index is nameable, droppable and
-///   listed under `SHOW INDEXES` (with `type` `RANGE`).
-/// - **TEXT** maps to the same node-property index and is routed identically (appearing as `RANGE`
-///   in `SHOW INDEXES`) — a documented equivalence, not a distinct backing store. The RANGE B-tree
-///   serves `=` (equality seek) and, since `rmp` task #658, `STARTS WITH` (a bounded prefix range
-///   seek over `[prefix, successor)`). `ENDS WITH` / `CONTAINS` are **not** accelerated by this index
-///   (a suffix/substring is not a contiguous key range); they stay scan + filter until a dedicated
-///   TEXT index exists.
+///   listed under `SHOW INDEXES` (with `type` `RANGE`). The RANGE B-tree serves `=` (equality seek) and,
+///   since `rmp` task #658, `STARTS WITH` (a bounded prefix range seek over `[prefix, successor)`).
+/// - **TEXT** is a **distinct native trigram string index** (`rmp` task #662), NOT a synonym of RANGE:
+///   it is the only index that serves `CONTAINS` / `ENDS WITH` (a substring/suffix is not a contiguous
+///   key range) and is preferred over RANGE for `STARTS WITH` when present. Routed to
+///   [`parse_claimed_text_tail`], producing `CreateTextIndex`/`DropTextIndex`, and listed under
+///   `SHOW INDEXES` with `type` `TEXT`. A RANGE and a TEXT index may coexist on the same
+///   `(label, property)` (they are different kinds).
 /// - **LOOKUP** is **declined** with an informative message: Graphus maintains node-label and
 ///   relationship-type lookup indexes **implicitly** (always-on), so label/type scans are already
 ///   index-backed and no explicit LOOKUP index is required.
 ///
 /// The relationship form (`FOR ()-[r:TYPE]-()`) of RANGE/TEXT is not yet supported (it needs a durable
-/// relationship-property index) and is reported by the delegated node-property target parser.
+/// relationship-property index); RANGE reports it via the delegated node-property target parser, and
+/// TEXT covers a node property only (relationship TEXT is a follow-up).
 fn parse_claimed_typed_index(
     verb: &str,
     kind_kw: &Tok,
@@ -944,11 +946,115 @@ fn parse_claimed_typed_index(
         );
     }
 
-    // RANGE / TEXT: a full node-property synonym — the `verb` + `INDEX`/`INDEXES` are already read, so
-    // hand the remainder to the existing node-property parser verbatim. (SHOW RANGE/TEXT INDEX[ES] is
-    // dispatched earlier through the unified `SHOW <filter> INDEXES` surface, so only CREATE/DROP with
-    // the singular `INDEX` reach here.)
+    // TEXT is a **distinct** native string index (`rmp` task #662) — NOT a synonym of RANGE — that
+    // accelerates `CONTAINS` / `ENDS WITH` / `STARTS WITH`, which a forward-ordered B-tree cannot serve.
+    // Route it to the dedicated text-index parser (which produces `CreateTextIndex`/`DropTextIndex`),
+    // rather than the RANGE node-property parser. The `verb` + `INDEX` are already read, so the text
+    // parser resumes from the (optional) name / `FOR` clause. (SHOW TEXT INDEX[ES] is dispatched earlier
+    // through the unified `SHOW <filter> INDEXES` surface, so only CREATE/DROP reach here.)
+    if is_keyword(kind_kw, "TEXT") {
+        return parse_claimed_text_tail(verb, lex);
+    }
+
+    // RANGE: a full node-property synonym — the `verb` + `INDEX`/`INDEXES` are already read, so hand the
+    // remainder to the existing node-property parser verbatim. (SHOW RANGE INDEX[ES] is dispatched
+    // earlier through the unified `SHOW <filter> INDEXES` surface, so only CREATE/DROP with the singular
+    // `INDEX` reach here.)
     parse_claimed_index(verb, lex)
+}
+
+/// Parses the remainder of a claimed **text (trigram)** index statement (`verb` + `TEXT` + `INDEX`
+/// already read), for the two mutating shapes (`rmp` task #662):
+///
+/// ```text
+/// CREATE TEXT INDEX [<name>] [IF NOT EXISTS] FOR (<var>:<Label>) ON (<var>.<property>) [OPTIONS { … }]
+/// DROP   TEXT INDEX <name> [IF EXISTS]
+/// ```
+///
+/// A text index is identified by **name** (Neo4j-compatible), covers **exactly one** node string
+/// property, and — like the point index — accepts an optional trailing `OPTIONS { … }` that is parsed,
+/// validated structurally, then accepted-and-ignored (Graphus's trigram index has no analyzer to
+/// configure; the clause must nonetheless parse for Neo4j-DDL compatibility). `SHOW TEXT INDEXES` is
+/// handled by the unified SHOW-index-filter surface, so only CREATE/DROP reach here. Mirrors
+/// [`parse_claimed_point`].
+fn parse_claimed_text_tail(verb: &str, lex: &mut Lexer<'_>) -> Result<IndexCommand, String> {
+    match verb {
+        "DROP" => {
+            // A text-index DROP always names its target.
+            let name = expect_name(lex, "a text index name", "TEXT")?;
+            // `IF EXISTS` turns a missing index into a no-op success.
+            let if_exists = parse_optional_if(lex, /* with_not */ false)?;
+            expect_end(lex, "DROP TEXT INDEX")?;
+            Ok(IndexCommand::DropTextIndex { name, if_exists })
+        }
+        "CREATE" => {
+            // The name is OPTIONAL (Neo4j parity): a bare `FOR`/`IF` directly after INDEX means
+            // "unnamed" → a deterministic auto-name derived from the covered schema. `IF NOT EXISTS`
+            // follows the (optional) name, before the `FOR` clause (Neo4j position).
+            let explicit_name = parse_optional_text_index_name(lex)?;
+            let if_not_exists = parse_optional_if(lex, /* with_not */ true)?;
+            let (label, property) = parse_text_create_tail(lex)?;
+            let name = explicit_name.unwrap_or_else(|| auto_text_index_name(&label, &property));
+            Ok(IndexCommand::CreateTextIndex {
+                name,
+                label,
+                property,
+                if_not_exists,
+            })
+        }
+        // `parse_admin_statement` only routes CREATE/DROP/SHOW here; START/STOP never reach this.
+        other => Err(format!("unsupported text index verb {other}")),
+    }
+}
+
+/// Parses the OPTIONAL text-index name in `CREATE TEXT INDEX [name] …` (`rmp` task #662). Returns
+/// [`None`] (consuming nothing) when the next token is a bare `FOR` or `IF` — i.e. the name was omitted
+/// and a deterministic auto-name applies — otherwise consumes and returns the explicit name. A
+/// backtick-quoted `` `FOR` `` / `` `IF` `` is still a name (only the bare keyword signals "unnamed").
+/// Mirrors [`parse_optional_point_index_name`].
+fn parse_optional_text_index_name(lex: &mut Lexer<'_>) -> Result<Option<String>, String> {
+    let mut peek = Lexer {
+        rest: lex.rest.clone(),
+    };
+    if let Some(Tok::Word(w)) = peek.next_tok()? {
+        if w.eq_ignore_ascii_case("FOR") || w.eq_ignore_ascii_case("IF") {
+            return Ok(None);
+        }
+    }
+    Ok(Some(expect_name(lex, "a text index name", "TEXT")?))
+}
+
+/// A deterministic auto-name for an anonymous text index on `(label, property)` (`rmp` task #662),
+/// `text_index_<label>_<property>` — so a repeated anonymous `CREATE TEXT INDEX … IF NOT EXISTS`
+/// resolves to the same name (idempotent) and `SHOW INDEXES` reports a stable name. A cross-catalog
+/// name collision is caught by the engine's global name-uniqueness check.
+fn auto_text_index_name(label: &str, property: &str) -> String {
+    format!("text_index_{label}_{property}")
+}
+
+/// Parses the `FOR (<var>:<Label>) ON (<var>.<property>) [OPTIONS { … }]` tail of a
+/// `CREATE TEXT INDEX <name>` statement (`rmp` task #662). Returns `(label, property)`. Mirrors the
+/// single-property point-index tail ([`parse_point_create_tail`]).
+fn parse_text_create_tail(lex: &mut Lexer<'_>) -> Result<(String, String), String> {
+    const VERB: &str = "TEXT";
+    // FOR ( <var> : <Label> )
+    expect_keyword(lex, "FOR", VERB)?;
+    expect_symbol(lex, '(', VERB)?;
+    let _var = expect_word(lex, "a variable", VERB)?;
+    expect_symbol(lex, ':', VERB)?;
+    let label = expect_name(lex, "a label", VERB)?;
+    expect_symbol(lex, ')', VERB)?;
+    // ON ( <var>.<property> )
+    expect_keyword(lex, "ON", VERB)?;
+    expect_symbol(lex, '(', VERB)?;
+    let property = parse_property_ref(VERB, lex)?;
+    expect_symbol(lex, ')', VERB)?;
+    // Optional trailing `OPTIONS { … }`: parsed + validated structurally, then accepted-and-ignored
+    // (Graphus's trigram index has no analyzer/provider config; the clause must parse for Neo4j-DDL
+    // compatibility).
+    parse_optional_index_options(lex)?;
+    expect_end(lex, "CREATE TEXT INDEX")?;
+    Ok((label, property))
 }
 
 /// The parsed target of an index DDL statement: a **node** label property (`FOR (n:Label) ON
@@ -5024,7 +5130,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_range_and_text_indexes_are_node_property_synonyms() {
+    fn typed_range_is_a_node_property_synonym_and_text_is_a_distinct_kind() {
         // RANGE is a full synonym of the node-property index (`rmp` #638).
         assert_eq!(
             index_cmd("CREATE RANGE INDEX ix FOR (n:Person) ON (n.name)"),
@@ -5035,17 +5141,35 @@ mod tests {
                 if_not_exists: false,
             }
         );
-        // TEXT maps to the same node-property index (served by the RANGE B-tree).
+        // TEXT is a DISTINCT native trigram string index, NOT a RANGE synonym (`rmp` task #662): it
+        // produces its own `CreateTextIndex` command.
         assert_eq!(
             index_cmd("CREATE TEXT INDEX t IF NOT EXISTS FOR (n:Person) ON (n.nick)"),
-            IndexCommand::CreateNodePropertyIndex {
-                name: Some("t".to_owned()),
+            IndexCommand::CreateTextIndex {
+                name: "t".to_owned(),
                 label: "Person".to_owned(),
-                properties: vec!["nick".to_owned()],
+                property: "nick".to_owned(),
                 if_not_exists: true,
             }
         );
-        // DROP + SHOW for the typed surfaces delegate to the node-property forms.
+        // An anonymous TEXT create gets a deterministic auto-name; a trailing OPTIONS clause parses.
+        assert_eq!(
+            index_cmd("CREATE TEXT INDEX FOR (n:Person) ON (n.bio) OPTIONS {}"),
+            IndexCommand::CreateTextIndex {
+                name: "text_index_Person_bio".to_owned(),
+                label: "Person".to_owned(),
+                property: "bio".to_owned(),
+                if_not_exists: false,
+            }
+        );
+        // DROP TEXT produces its own command; DROP RANGE delegates to the node-property form.
+        assert_eq!(
+            index_cmd("DROP TEXT INDEX t IF EXISTS"),
+            IndexCommand::DropTextIndex {
+                name: "t".to_owned(),
+                if_exists: true,
+            }
+        );
         assert_eq!(
             index_cmd("DROP RANGE INDEX ix"),
             IndexCommand::DropNodePropertyIndex {

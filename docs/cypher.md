@@ -483,13 +483,22 @@ accepted:
 
 | Keyword | Behaviour |
 | ------- | --------- |
-| `RANGE` | A full synonym of the node-property index. Nameable, droppable, and listed as `type` `RANGE`. |
-| `TEXT` | Maps to the **same** node-property (`RANGE`) B-tree, which serves `=` and `STARTS WITH` string predicates. A documented equivalence — it is created and then reported as `RANGE` in `SHOW INDEXES`, not a distinct store. |
+| `RANGE` | A full synonym of the node-property index. Nameable, droppable, and listed as `type` `RANGE`. Serves `=`, range (`<`/`>`/…) and — since a bounded prefix seek — `STARTS WITH`. |
+| `TEXT` | A **distinct native trigram string index** (not a synonym of `RANGE`) that accelerates `CONTAINS`, `ENDS WITH` and `STARTS WITH` on a single node string property — the substring/suffix predicates a forward-ordered B-tree cannot serve. Nameable (or auto-named), droppable, and listed as `type` `TEXT`. A `RANGE` and a `TEXT` index may coexist on the same `(label, property)`; when a `TEXT` index is present it is preferred for `STARTS WITH` too. Node property only (relationship `TEXT` is a follow-up). |
 | `LOOKUP` | `CREATE`/`DROP LOOKUP INDEX` is **declined** by design: Graphus maintains node-label and relationship-type lookup indexes **implicitly** (always-on), so no explicit `LOOKUP` index is needed. They *are* listed, though — the two token lookups (`node_label_lookup_index` / `rel_type_lookup_index`) always appear in `SHOW INDEXES` and in `SHOW LOOKUP INDEXES`. |
 
 ```cypher
 CREATE RANGE INDEX ix_age  IF NOT EXISTS FOR (p:Person) ON (p.age)
-CREATE TEXT  INDEX ix_name IF NOT EXISTS FOR (p:Person) ON (p.name)   -- appears as RANGE in SHOW INDEXES
+CREATE TEXT  INDEX ix_name IF NOT EXISTS FOR (p:Person) ON (p.name)   -- serves CONTAINS/ENDS WITH/STARTS WITH
+CREATE TEXT  INDEX         FOR (p:Person) ON (p.bio)                  -- anonymous → text_index_Person_bio
+DROP   TEXT  INDEX ix_name IF EXISTS
+```
+
+With that index in place, a substring or suffix filter is index-served instead of a full label scan:
+
+```cypher
+MATCH (p:Person) WHERE p.name CONTAINS 'obe'   RETURN p   -- index-served (was scan + filter)
+MATCH (p:Person) WHERE p.name ENDS WITH 'son'  RETURN p   -- index-served (was scan + filter)
 ```
 
 Every `CREATE INDEX` (plain / `RANGE` / `TEXT` / `POINT` / `FULLTEXT`) accepts a trailing Neo4j
@@ -500,7 +509,7 @@ synchronous builds, so the clause is validated and accepted but not applied (exc
 unified `DROP INDEX <name>` — see [indexes.md](indexes.md).
 
 `SHOW INDEXES` is a single unified, Neo4j-conformant listing of **every** index kind (node/relationship
-`RANGE`, composite `RANGE`, `FULLTEXT`, `POINT`, and the two token `LOOKUP` indexes), with the full
+`RANGE`, composite `RANGE`, `TEXT`, `FULLTEXT`, `POINT`, and the two token `LOOKUP` indexes), with the full
 Neo4j column set, `UPPER-CASE` state, per-type filters (`SHOW RANGE|TEXT|POINT|LOOKUP|FULLTEXT|VECTOR|ALL
 INDEX[ES]`), and a `YIELD` / `WHERE` / `RETURN` tail. The singular `SHOW INDEX` / `SHOW <filter> INDEX`
 is accepted as a full synonym of the plural — see

@@ -161,6 +161,28 @@ pub struct CompositeIndexEntry {
     pub state: IndexState,
 }
 
+/// A durable **text (trigram) node index** catalog entry (`rmp` task #662).
+///
+/// A `TEXT` index is a **distinct native string index** — not a synonym of `RANGE` — that accelerates
+/// the `CONTAINS`, `ENDS WITH` and `STARTS WITH` predicates a forward-ordered B-tree cannot serve
+/// (substring/suffix are not a contiguous key range). Like a spatial index it is identified by a
+/// server-unique **name**, covers **one** node label and **exactly one** string property, and its
+/// backing structure (`graphus_index::TrigramIndex`) is derived/ephemeral (rebuilt from the store on
+/// open, like the derived `IndexSet`), so **only this catalog entry needs durability**.
+///
+/// This rides the **identical** durability lifecycle as the full-text / spatial / composite index
+/// catalogs: checkpointed at commit, reloaded on rollback and on open. Its presence invariant is "an
+/// entry exists iff a text index of that name is declared".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextIndexEntry {
+    /// The node label-namespace token the index covers.
+    pub label_token: u32,
+    /// The property-key-namespace token the index covers (exactly one — a text index is single-property).
+    pub property_token: u32,
+    /// The build state of the index (the same state machine as a node-property / spatial index).
+    pub state: IndexState,
+}
+
 /// The kind of a declared constraint (`rmp` tasks #99, #100).
 ///
 /// A constraint is one of four schema rules over the nodes of a label:
@@ -691,6 +713,16 @@ pub struct Statistics {
     /// the **identical** durability lifecycle as the other catalogs; it holds **only** arity-≥2 indexes
     /// (a single-property index lives in [`node_property_indexes`](Self#structfield.node_property_indexes)).
     pub composite_indexes: BTreeMap<String, CompositeIndexEntry>,
+    /// The durable **text (trigram) node index catalog** (`rmp` task #662): the set of declared text
+    /// indexes keyed by their server-unique **name**, each carrying the covered label token, the single
+    /// covered property token and the build [`IndexState`]. See [`TextIndexEntry`].
+    ///
+    /// Persisting this set is what makes a text index *registration* survive a crash: the backing
+    /// trigram index is ephemeral (rebuilt from the store on open, like the derived `IndexSet`), so
+    /// without this map a recovered store would have no record of which text indexes existed and would
+    /// silently lose them. An entry is present **iff** an index of that name is declared. The map rides
+    /// the **identical** durability lifecycle as the other catalogs.
+    pub text_indexes: BTreeMap<String, TextIndexEntry>,
 }
 
 impl Statistics {
@@ -1132,6 +1164,49 @@ impl Statistics {
             .map(|(name, _)| name.as_str())
     }
 
+    // ---- Text (trigram) node index catalog (`rmp` task #662) --------------------------------------
+
+    /// The durable text index entry named `name`, or [`None`] if no such index is declared
+    /// (`rmp` task #662).
+    #[must_use]
+    pub fn text_index(&self, name: &str) -> Option<&TextIndexEntry> {
+        self.text_indexes.get(name)
+    }
+
+    /// Declares (or replaces) the text index named `name` (`rmp` task #662). Idempotent on the name:
+    /// re-recording overwrites the entry (e.g. to flip its state `Populating` → `Online`).
+    pub(crate) fn set_text_index(&mut self, name: String, entry: TextIndexEntry) {
+        self.text_indexes.insert(name, entry);
+    }
+
+    /// Removes the text index named `name`, if declared (`rmp` task #662). Removing an absent entry is
+    /// a harmless no-op.
+    pub(crate) fn remove_text_index(&mut self, name: &str) {
+        self.text_indexes.remove(name);
+    }
+
+    /// Lists every declared text index as `(name, entry)`, ascending by name (the [`BTreeMap`] order,
+    /// deterministic) (`rmp` task #662).
+    #[must_use]
+    pub fn text_indexes(&self) -> Vec<(String, TextIndexEntry)> {
+        self.text_indexes
+            .iter()
+            .map(|(name, entry)| (name.clone(), entry.clone()))
+            .collect()
+    }
+
+    /// The **name** of the text index covering exactly `(label_token, property_token)`, or [`None`] if
+    /// no such index is declared (`rmp` task #662). Backs the `IF NOT EXISTS` schema-equivalence check.
+    #[must_use]
+    pub fn text_index_name_for(&self, label_token: u32, property_token: u32) -> Option<&str> {
+        self.text_indexes
+            .iter()
+            .find(|&(_, entry)| {
+                entry.label_token == label_token && entry.property_token == property_token
+            })
+            .map(|(name, _)| name.as_str())
+    }
+
     /// The durable full-text index entry named `name`, or [`None`] if no such index is declared
     /// (`rmp` task #72).
     #[must_use]
@@ -1297,6 +1372,9 @@ impl Statistics {
         // after every prior block by the same append-only rule, so a pre-#657 image (ending after the
         // relationship-property index name catalog) decodes it to empty.
         Self::encode_composite_catalog(&mut out, &self.composite_indexes);
+        // The text (trigram) node index catalog (`rmp` task #662), appended LAST by the same append-only
+        // rule, so a pre-#662 image (ending after the composite catalog) decodes it to empty.
+        Self::encode_text_catalog(&mut out, &self.text_indexes);
         out
     }
 
@@ -1538,6 +1616,33 @@ impl Statistics {
         }
     }
 
+    /// Encodes the text (trigram) node index catalog block (`rmp` task #662), appended last so a
+    /// pre-#662 image (ending after the composite catalog) decodes to an empty text catalog.
+    ///
+    /// Layout: `n(u32) | [ name_len(u32) | name_bytes[name_len] | label_token(u32) |
+    /// property_token(u32) | state(u8) ]*`, entries in ascending-name ([`BTreeMap`]) order so the image
+    /// is deterministic. Byte-identical to the spatial block (one label token + one property token +
+    /// a state byte) — a text index, like a spatial index, covers exactly one property.
+    fn encode_text_catalog(out: &mut Vec<u8>, map: &BTreeMap<String, TextIndexEntry>) {
+        debug_assert!(
+            map.len() <= u32::MAX as usize,
+            "text catalog entry count exceeds u32"
+        );
+        out.extend_from_slice(&(map.len() as u32).to_le_bytes());
+        for (name, entry) in map {
+            let name_bytes = name.as_bytes();
+            debug_assert!(
+                name_bytes.len() <= u32::MAX as usize,
+                "text index name exceeds u32 length"
+            );
+            out.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(name_bytes);
+            out.extend_from_slice(&entry.label_token.to_le_bytes());
+            out.extend_from_slice(&entry.property_token.to_le_bytes());
+            out.push(entry.state.as_byte());
+        }
+    }
+
     /// Rebuilds the statistics from an image produced by [`encode`](Self::encode).
     ///
     /// # Errors
@@ -1581,6 +1686,9 @@ impl Statistics {
         // pre-#657 image ends after the relationship-property index name catalog, so this block decodes
         // empty via the end-of-input guard.
         let composite_indexes = Self::decode_composite_catalog(bytes, &mut cur)?;
+        // Decode the trailing text (trigram) node index catalog (`rmp` task #662). A pre-#662 image ends
+        // after the composite catalog, so this block decodes empty via the end-of-input guard.
+        let text_indexes = Self::decode_text_catalog(bytes, &mut cur)?;
         Ok(Self {
             total_nodes,
             total_relationships,
@@ -1595,6 +1703,7 @@ impl Statistics {
             rel_property_indexes,
             rel_property_index_names,
             composite_indexes,
+            text_indexes,
         })
     }
 
@@ -1859,6 +1968,61 @@ impl Statistics {
             {
                 return Err(GraphusError::Storage(format!(
                     "composite catalog repeats index name {name:?}"
+                )));
+            }
+        }
+        Ok(map)
+    }
+
+    /// Decodes the text (trigram) node index catalog block (`rmp` task #662). Like every later block,
+    /// end-of-input where its count `u32` would start means "no text catalog" (a pre-#662 image), not
+    /// truncation.
+    ///
+    /// The `state` byte is range-checked; a repeated name or an empty name is rejected (neither is ever
+    /// produced by [`encode`](Self::encode)). Byte-for-byte mirrors the spatial decoder (one label
+    /// token + one property token + a state byte).
+    fn decode_text_catalog(
+        bytes: &[u8],
+        cur: &mut usize,
+    ) -> Result<BTreeMap<String, TextIndexEntry>> {
+        let mut map = BTreeMap::new();
+        // Backward compatibility (`rmp` task #662): a pre-#662 image ends exactly here.
+        if *cur == bytes.len() {
+            return Ok(map);
+        }
+        let n = read_u32(bytes, cur)? as usize;
+        for _ in 0..n {
+            let name_len = read_u32(bytes, cur)? as usize;
+            let end = take(bytes, cur, name_len)?;
+            let name = String::from_utf8(bytes[end - name_len..end].to_vec()).map_err(|_| {
+                GraphusError::Storage("text catalog name is not valid UTF-8".to_owned())
+            })?;
+            if name.is_empty() {
+                return Err(GraphusError::Storage(
+                    "text catalog holds an empty index name".to_owned(),
+                ));
+            }
+            let label_token = read_u32(bytes, cur)?;
+            let property_token = read_u32(bytes, cur)?;
+            let state_byte = read_u8(bytes, cur)?;
+            let state = IndexState::from_byte(state_byte).ok_or_else(|| {
+                GraphusError::Storage(format!(
+                    "text index {name:?} holds unknown state byte {state_byte}"
+                ))
+            })?;
+            if map
+                .insert(
+                    name.clone(),
+                    TextIndexEntry {
+                        label_token,
+                        property_token,
+                        state,
+                    },
+                )
+                .is_some()
+            {
+                return Err(GraphusError::Storage(format!(
+                    "text catalog repeats index name {name:?}"
                 )));
             }
         }
@@ -2694,6 +2858,51 @@ mod tests {
         image.truncate(image.len() - 4);
         let decoded = Statistics::decode(&image).unwrap();
         assert!(decoded.composite_indexes().is_empty());
+        assert_eq!(decoded.node_property_indexes().len(), 1);
+    }
+
+    #[test]
+    fn statistics_text_catalog_round_trips_and_pre_662_image_decodes_empty() {
+        // Empty map: the text block is just a `0` count, and the round-trip is identity.
+        let empty = Statistics::new();
+        assert_eq!(Statistics::decode(&empty.encode()).unwrap(), empty);
+
+        // One entry, then several (varying label/property/state), keyed by name.
+        let mut s = Statistics::new();
+        s.set_text_index(
+            "text_Person_name".to_owned(),
+            TextIndexEntry {
+                label_token: 1,
+                property_token: 2,
+                state: IndexState::Online,
+            },
+        );
+        assert_eq!(Statistics::decode(&s.encode()).unwrap(), s);
+        s.set_text_index(
+            "text_Doc_title".to_owned(),
+            TextIndexEntry {
+                label_token: 9,
+                property_token: 4,
+                state: IndexState::Populating,
+            },
+        );
+        let back = Statistics::decode(&s.encode()).unwrap();
+        assert_eq!(back, s);
+        assert_eq!(back.text_indexes().len(), 2);
+        // The equivalence resolver finds the exact `(label, property)`.
+        assert_eq!(back.text_index_name_for(1, 2), Some("text_Person_name"));
+        assert_eq!(back.text_index_name_for(9, 4), Some("text_Doc_title"));
+        assert_eq!(back.text_index_name_for(1, 4), None);
+
+        // A pre-#662 image (a composite-catalog-terminated image with NO text block) decodes to an
+        // empty text catalog, not a truncation error. Build such an image by encoding a value with no
+        // text indexes and truncating off the trailing zero-count text block (a 4-byte `u32` of `0`).
+        let mut pre662 = Statistics::new();
+        pre662.set_node_property_index(1, 2, IndexState::Online);
+        let mut image = pre662.encode();
+        image.truncate(image.len() - 4);
+        let decoded = Statistics::decode(&image).unwrap();
+        assert!(decoded.text_indexes().is_empty());
         assert_eq!(decoded.node_property_indexes().len(), 1);
     }
 

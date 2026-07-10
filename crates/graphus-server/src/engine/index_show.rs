@@ -37,10 +37,11 @@
 //! * `state` — the **UPPER-CASE** Neo4j string `ONLINE` / `POPULATING`.
 //! * `populationPercent` — `100.0` when `Online`, else `0.0` (Graphus does not surface a fractional
 //!   build progress from the listing APIs; a `Populating` index reports `0.0`).
-//! * `type` — one of `RANGE` / `FULLTEXT` / `POINT` / `LOOKUP` (Graphus has no distinct `TEXT` or
-//!   `VECTOR` index kind — a `TEXT` create is a synonym of `RANGE`, and vector indexes arrive later).
-//! * `indexProvider` — a Neo4j-like provider string per kind: `range-1.0`, `token-lookup-1.0`,
-//!   `fulltext-1.0`, `point-1.0`.
+//! * `type` — one of `RANGE` / `TEXT` / `FULLTEXT` / `POINT` / `LOOKUP` (`TEXT` is a distinct native
+//!   string index for `CONTAINS` / `ENDS WITH` / `STARTS WITH`, `rmp` task #662; Graphus has no
+//!   `VECTOR` index kind yet — those arrive later).
+//! * `indexProvider` — a Neo4j-like provider string per kind: `range-1.0`, `text-1.0`,
+//!   `token-lookup-1.0`, `fulltext-1.0`, `point-1.0`.
 //! * `owningConstraint` — for a **single-property** `RANGE` index that is a uniqueness / key
 //!   constraint's backing index, the constraint's name (matched by covered `(entityType, token,
 //!   property)`, `rmp` #653); `Null` otherwise (composite, fulltext, point, lookup).
@@ -147,6 +148,8 @@ pub(crate) struct IndexSources {
     pub fulltext: Vec<(String, String, Vec<String>, Analyzer, IndexState)>,
     /// `(name, label, property, state)` per `POINT` index.
     pub point: Vec<(String, String, String, IndexState)>,
+    /// `(name, label, property, state)` per `TEXT` (trigram) index (`rmp` task #662).
+    pub text: Vec<(String, String, String, IndexState)>,
     /// Every declared constraint, for the `owningConstraint` attribution.
     pub constraints: Vec<ConstraintInfo>,
 }
@@ -313,6 +316,18 @@ pub(crate) fn create_point(name: &str, label: &str, property: &str) -> String {
     )
 }
 
+/// A round-trippable `CREATE TEXT INDEX` DDL (`rmp` task #662). Re-parsing it yields an equivalent
+/// `CreateTextIndex`.
+#[must_use]
+pub(crate) fn create_text(name: &str, label: &str, property: &str) -> String {
+    format!(
+        "CREATE TEXT INDEX {} FOR (n:{}) ON (n.{})",
+        quote_ident(name),
+        quote_ident(label),
+        quote_ident(property)
+    )
+}
+
 /// The Neo4j-standard `createStatement` for a synthetic token `LOOKUP` row (`rmp` #660). Informational
 /// only — Graphus maintains node-label / relationship-type lookups implicitly and does not accept their
 /// DDL, so this does **not** round-trip through the admin grammar.
@@ -363,6 +378,7 @@ pub(crate) fn build_rows(filter: IndexTypeFilter, sources: IndexSources) -> Vec<
         rel_property,
         fulltext,
         point,
+        text,
         constraints,
     } = sources;
 
@@ -465,6 +481,24 @@ pub(crate) fn build_rows(filter: IndexTypeFilter, sources: IndexSources) -> Vec<
             labels_or_types: vec![label],
             properties: vec![property],
             index_provider: "point-1.0",
+            owning_constraint: Value::Null,
+            options: Value::Map(Vec::new()),
+            create_statement: create,
+        });
+    }
+    // TEXT (trigram) — a distinct native string index (`rmp` task #662), never a constraint's backing
+    // index.
+    for (name, label, property, state) in text {
+        let create = create_text(&name, &label, &property);
+        specs.push(RowSpec {
+            id: alloc(),
+            name,
+            state,
+            type_str: "TEXT",
+            entity_type: "NODE",
+            labels_or_types: vec![label],
+            properties: vec![property],
+            index_provider: "text-1.0",
             owning_constraint: Value::Null,
             options: Value::Map(Vec::new()),
             create_statement: create,
@@ -582,6 +616,7 @@ mod tests {
             rel_property: Vec::new(),
             fulltext: Vec::new(),
             point: Vec::new(),
+            text: Vec::new(),
             constraints: Vec::new(),
         }
     }
@@ -686,12 +721,18 @@ mod tests {
                 "loc".to_owned(),
                 IndexState::Online,
             )],
+            text: vec![(
+                "tx_person_name".to_owned(),
+                "Person".to_owned(),
+                "name".to_owned(),
+                IndexState::Online,
+            )],
             constraints: Vec::new(),
         };
         let rows = build_rows(IndexTypeFilter::All, sources);
-        // 2 lookups + 5 declared indexes.
-        assert_eq!(rows.len(), 7);
-        // Ids: lookups 1/2, then 3..8 in build order.
+        // 2 lookups + 6 declared indexes.
+        assert_eq!(rows.len(), 8);
+        // Ids: lookups 1/2, then 3..9 in build order.
         let ids: Vec<i64> = rows
             .iter()
             .map(|r| match r[0] {
@@ -699,7 +740,7 @@ mod tests {
                 _ => panic!("id must be an integer"),
             })
             .collect();
-        assert_eq!(ids, vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(ids, vec![1, 2, 3, 4, 5, 6, 7, 8]);
 
         // The composite row: type RANGE, entityType NODE, properties = [first, last], Populating.
         let composite = rows
@@ -753,6 +794,22 @@ mod tests {
             .expect("point listed");
         assert_eq!(pt[4], Value::String("POINT".to_owned()));
         assert_eq!(pt[8], Value::String("point-1.0".to_owned()));
+
+        // The text index (`rmp` task #662): type TEXT (distinct from RANGE), entityType NODE, provider
+        // text-1.0, single property, no owning constraint.
+        let tx = rows
+            .iter()
+            .find(|r| r[1] == Value::String("tx_person_name".to_owned()))
+            .expect("text listed");
+        assert_eq!(tx[4], Value::String("TEXT".to_owned()));
+        assert_eq!(tx[5], Value::String("NODE".to_owned()));
+        assert_eq!(tx[8], Value::String("text-1.0".to_owned()));
+        assert_eq!(
+            tx[7],
+            Value::List(vec![Value::String("name".to_owned())]),
+            "text index covers a single property"
+        );
+        assert_eq!(tx[9], Value::Null, "a text index has no owning constraint");
     }
 
     /// Each filter selects only the matching `type`, and the ids stay stable (assigned over the full
@@ -772,6 +829,12 @@ mod tests {
                 "loc".to_owned(),
                 IndexState::Online,
             )],
+            text: vec![(
+                "tx".to_owned(),
+                "Person".to_owned(),
+                "name".to_owned(),
+                IndexState::Online,
+            )],
             ..empty_sources()
         };
         // RANGE → only the node index (id 3); LOOKUP filtered out.
@@ -783,6 +846,12 @@ mod tests {
         let point = build_rows(IndexTypeFilter::Point, sources());
         assert_eq!(point.len(), 1);
         assert_eq!(point[0][0], Value::Integer(4), "id stable across filters");
+        // TEXT → only the text index (id 5), a distinct kind (`rmp` task #662).
+        let text = build_rows(IndexTypeFilter::Text, sources());
+        assert_eq!(text.len(), 1);
+        assert_eq!(text[0][1], Value::String("tx".to_owned()));
+        assert_eq!(text[0][4], Value::String("TEXT".to_owned()));
+        assert_eq!(text[0][0], Value::Integer(5), "id stable across filters");
         // LOOKUP → the two always-on lookups.
         let lookup = build_rows(IndexTypeFilter::Lookup, sources());
         assert_eq!(lookup.len(), 2);
@@ -791,8 +860,7 @@ mod tests {
                 .iter()
                 .all(|r| r[4] == Value::String("LOOKUP".to_owned()))
         );
-        // TEXT / VECTOR → empty (Graphus has no distinct TEXT/VECTOR index kind).
-        assert!(build_rows(IndexTypeFilter::Text, sources()).is_empty());
+        // VECTOR → empty (Graphus has no distinct VECTOR index kind yet).
         assert!(build_rows(IndexTypeFilter::Vector, sources()).is_empty());
     }
 

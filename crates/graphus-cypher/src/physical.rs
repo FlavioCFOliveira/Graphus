@@ -356,6 +356,32 @@ impl RangeBound {
     }
 }
 
+/// Which string predicate a [`NodeTextIndexSeek`](PhysicalOp::NodeTextIndexSeek) serves (`rmp` task
+/// #662). The trigram text index accelerates all three, using unanchored / head-anchored /
+/// tail-anchored trigrams respectively; the executor picks the matching
+/// [`TrigramIndex`](graphus_index::TrigramIndex) query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[must_use]
+pub enum TextSeekOp {
+    /// `n.p CONTAINS <needle>` — substring match (unanchored trigrams).
+    Contains,
+    /// `n.p ENDS WITH <needle>` — suffix match (tail-anchored trigrams).
+    EndsWith,
+    /// `n.p STARTS WITH <needle>` — prefix match (head-anchored trigrams).
+    StartsWith,
+}
+
+impl TextSeekOp {
+    /// The operator spelling for plan rendering.
+    const fn symbol(self) -> &'static str {
+        match self {
+            Self::Contains => "CONTAINS",
+            Self::EndsWith => "ENDS WITH",
+            Self::StartsWith => "STARTS WITH",
+        }
+    }
+}
+
 /// A node in a [physical plan](PhysicalPlan) tree: one executor-ready operator (`04 §7.1`).
 ///
 /// The relational, graph, write, and procedure operators mirror their [logical
@@ -517,6 +543,35 @@ pub enum PhysicalOp {
         center_y: f64,
         /// The constant proximity radius (in the property CRS's distance units).
         radius: f64,
+        /// The catalog index backing the seek.
+        index: IndexId,
+    },
+    /// **Text (trigram) index seek** (`rmp` task #662): records of `label` whose string `property`
+    /// satisfies a `CONTAINS` / `ENDS WITH` / `STARTS WITH` predicate, served by the trigram text index
+    /// instead of a full label scan. A forward-ordered range index cannot serve `CONTAINS`/`ENDS WITH`
+    /// (substring/suffix are not a contiguous key range); the text index is the distinct native string
+    /// index for exactly these.
+    ///
+    /// The trigram index returns a **candidate superset** (the trigram intersection is a *necessary*,
+    /// not sufficient, condition — see [`graphus_index::TrigramIndex`]), so the exact predicate
+    /// (`op`) is **always retained as a residual [`Filter`](PhysicalOp::Filter) above this operator**
+    /// (see [`Planner::lower_filter`]); the index only narrows the candidate set, never the result. The
+    /// `needle` is an unevaluated [`Expr`](crate::ast::Expr) (a string literal or, after literal
+    /// auto-parameterisation, a `$param`) so it is evaluated by the executor **at run time**; a needle
+    /// too short to form a trigram, a non-string needle, or an unavailable index at run time each fall
+    /// back to a label scan (the residual filter then does the exact trimming — both paths yield the
+    /// identical node set).
+    NodeTextIndexSeek {
+        /// The node variable bound by each row.
+        variable: Var,
+        /// The label the text index covers.
+        label: Label,
+        /// The indexed string property key.
+        property: String,
+        /// Which string predicate the seek serves (`CONTAINS` / `ENDS WITH` / `STARTS WITH`).
+        op: TextSeekOp,
+        /// The searched string expression (unevaluated AST; a string literal or an auto-/user-parameter).
+        needle: Expr,
         /// The catalog index backing the seek.
         index: IndexId,
     },
@@ -1493,14 +1548,38 @@ impl Planner<'_> {
                     }
                 }
             }
+            // A `var.prop CONTAINS/ENDS WITH/STARTS WITH <needle>` conjunct can drive the **text
+            // (trigram) index** when one covers `(label, prop)` (`rmp` task #662) — the only index that
+            // serves `CONTAINS`/`ENDS WITH` (substring/suffix are not a contiguous key range). The
+            // trigram intersection is a candidate **superset** (a *necessary*, not sufficient,
+            // condition), so the exact predicate MUST be re-checked: we re-attach **all** conjuncts
+            // (this one included) as the residual filter. Runs BEFORE the range-index `STARTS WITH`
+            // prefix seek below, so a declared text index is preferred for `STARTS WITH` too (and it is
+            // the *only* path for `CONTAINS`/`ENDS WITH`). See [`PhysicalOp::NodeTextIndexSeek`].
+            if let Some((property, text_op, needle)) = analyze_text_predicate(conj, &variable.name)
+            {
+                if let Some(idx) = self.catalog.label_text(label, &property) {
+                    deps.insert(idx.id);
+                    let seek = PhysicalOp::NodeTextIndexSeek {
+                        variable: variable.clone(),
+                        label: label.clone(),
+                        property,
+                        op: text_op,
+                        needle: needle.clone(),
+                        index: idx.id,
+                    };
+                    return attach_residual(seek, &conjuncts);
+                }
+            }
             // A `var.prop STARTS WITH <prefix>` conjunct can drive a **bounded range seek** over the
             // order-preserving property index when one covers `(label, prop)` — `[prefix,
             // successor(prefix))` (`rmp` task #658). Like the spatial seek, the range is a candidate
             // **superset** (it admits non-prefix strings in the last-scalar carry window, and — for a
             // mixed-type property — values the bound re-check does not exclude), so the exact
             // `STARTS WITH` predicate MUST be re-checked: we re-attach **all** conjuncts (this one
-            // included) as the residual filter. Only `STARTS WITH` is accelerated here (`ENDS WITH` /
-            // `CONTAINS` need a text index — out of scope; they stay scan + filter).
+            // included) as the residual filter. Reached only when NO text index covers `(label, prop)`
+            // (the text-index check above returns first when one does); `ENDS WITH` / `CONTAINS` without
+            // a text index stay scan + filter (a range index cannot serve them).
             if let Some((property, prefix)) = analyze_starts_with_predicate(conj, &variable.name) {
                 if let Some(idx) = self.catalog.label_property(label, &property) {
                     deps.insert(idx.id);
@@ -1745,6 +1824,7 @@ fn contains_read(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeIndexRangeSeek { .. }
         | PhysicalOp::NodeIndexStartsWithSeek { .. }
         | PhysicalOp::SpatialIndexSeek { .. }
+        | PhysicalOp::NodeTextIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::RelIndexSeek { .. }
         | PhysicalOp::ExpandAll { .. }
@@ -1816,6 +1896,7 @@ fn contains_write(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeIndexRangeSeek { .. }
         | PhysicalOp::NodeIndexStartsWithSeek { .. }
         | PhysicalOp::SpatialIndexSeek { .. }
+        | PhysicalOp::NodeTextIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::RelIndexSeek { .. }
         | PhysicalOp::Argument { .. }
@@ -1878,6 +1959,7 @@ fn contains_procedure_call(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeIndexRangeSeek { .. }
         | PhysicalOp::NodeIndexStartsWithSeek { .. }
         | PhysicalOp::SpatialIndexSeek { .. }
+        | PhysicalOp::NodeTextIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::RelIndexSeek { .. }
         | PhysicalOp::Argument { .. }
@@ -1950,6 +2032,7 @@ fn all_procedure_calls_reader_safe(
         | PhysicalOp::NodeIndexRangeSeek { .. }
         | PhysicalOp::NodeIndexStartsWithSeek { .. }
         | PhysicalOp::SpatialIndexSeek { .. }
+        | PhysicalOp::NodeTextIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::RelIndexSeek { .. }
         | PhysicalOp::Argument { .. }
@@ -2169,6 +2252,7 @@ fn optimize_children(op: PhysicalOp, catalog: &IndexCatalog, stats: &dyn Statist
         | PhysicalOp::NodeIndexRangeSeek { .. }
         | PhysicalOp::NodeIndexStartsWithSeek { .. }
         | PhysicalOp::SpatialIndexSeek { .. }
+        | PhysicalOp::NodeTextIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::RelIndexSeek { .. }
         | PhysicalOp::Argument { .. }
@@ -2956,6 +3040,7 @@ fn contains_argument(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeIndexRangeSeek { .. }
         | PhysicalOp::NodeIndexStartsWithSeek { .. }
         | PhysicalOp::SpatialIndexSeek { .. }
+        | PhysicalOp::NodeTextIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::RelIndexSeek { .. }
         | PhysicalOp::Empty => false,
@@ -3388,6 +3473,7 @@ fn gather_index_dependencies(op: &PhysicalOp, deps: &mut BTreeSet<IndexId>) {
         | PhysicalOp::NodeIndexRangeSeek { index, .. }
         | PhysicalOp::NodeIndexStartsWithSeek { index, .. }
         | PhysicalOp::SpatialIndexSeek { index, .. }
+        | PhysicalOp::NodeTextIndexSeek { index, .. }
         | PhysicalOp::RelIndexSeek { index, .. } => {
             deps.insert(*index);
         }
@@ -3515,6 +3601,36 @@ fn analyze_starts_with_predicate<'a>(expr: &'a Expr, variable: &str) -> Option<(
         return None;
     }
     Some((property, prefix))
+}
+
+/// If `expr` is `variable.<prop> CONTAINS|ENDS WITH|STARTS WITH <needle>` where `<needle>` does **not**
+/// reference `variable`, returns `(prop, op, needle)` (`rmp` task #662). Backs the text-index seek.
+///
+/// The three string predicates are **not symmetric**, so only the `property <op> value` orientation is
+/// recognised (`value CONTAINS n.p` treats the property as the *search* string, which the trigram
+/// index does not accelerate). A needle that references `variable` is rejected — an index seek needs a
+/// value independent of the row it produces. The needle is evaluated by the executor at run time (a
+/// literal, or a `$param` after auto-parameterisation), so a parameter is served identically to a
+/// literal.
+fn analyze_text_predicate<'a>(
+    expr: &'a Expr,
+    variable: &str,
+) -> Option<(String, TextSeekOp, &'a Expr)> {
+    let ExprKind::Predicate { op, operand, rhs } = &expr.kind else {
+        return None;
+    };
+    let text_op = match op {
+        PredicateOp::Contains => TextSeekOp::Contains,
+        PredicateOp::EndsWith => TextSeekOp::EndsWith,
+        PredicateOp::StartsWith => TextSeekOp::StartsWith,
+        _ => return None,
+    };
+    let property = property_of(operand, variable)?;
+    let needle = rhs.as_deref()?;
+    if expr_references_var(needle, variable) {
+        return None;
+    }
+    Some((property, text_op, needle))
 }
 
 /// Builds a [`PropertyPredicate`] from a comparison operator. `property_on_right` mirrors range
@@ -3905,7 +4021,8 @@ fn gather_bound_vars(plan: &PhysicalOp, out: &mut Vec<Var>) {
         | PhysicalOp::NodeLabelScanEq { variable, .. }
         | PhysicalOp::NodeIndexRangeSeek { variable, .. }
         | PhysicalOp::NodeIndexStartsWithSeek { variable, .. }
-        | PhysicalOp::SpatialIndexSeek { variable, .. } => push_unique(out, variable.clone()),
+        | PhysicalOp::SpatialIndexSeek { variable, .. }
+        | PhysicalOp::NodeTextIndexSeek { variable, .. } => push_unique(out, variable.clone()),
         PhysicalOp::AllRelationshipsScan {
             relationship,
             from,
@@ -4165,6 +4282,20 @@ impl PhysicalOp {
                 f,
                 "SpatialIndexSeek({variable}:{} {property} within {radius} of ({center_x}, {center_y}) via {index})",
                 label.name,
+            ),
+            Self::NodeTextIndexSeek {
+                variable,
+                label,
+                property,
+                op,
+                needle,
+                index,
+            } => writeln!(
+                f,
+                "NodeTextIndexSeek({variable}:{} {property} {} {} via {index})",
+                label.name,
+                op.symbol(),
+                h::expr(needle),
             ),
             Self::AllRelationshipsScan {
                 relationship,
@@ -5025,6 +5156,77 @@ mod tests {
         assert!(rendered.contains("distance"), "{rendered}");
         assert!(!rendered.contains("NodeByLabelScan"), "{rendered}");
         assert_eq!(plan.index_dependencies().count(), 1);
+    }
+
+    #[test]
+    fn text_predicates_on_text_indexed_property_become_text_seek_with_retained_residual() {
+        // `rmp` task #662: with a TEXT index on `(Person, name)`, each of CONTAINS / ENDS WITH /
+        // STARTS WITH lowers to a `NodeTextIndexSeek` — with the exact predicate RETAINED as a residual
+        // `Filter` (the trigram index is a candidate superset, so the filter restores exactness).
+        let catalog = IndexCatalog::builder()
+            .with_label_text("Person", "name")
+            .build();
+        for (pred, needle) in [
+            ("CONTAINS", "'ob'"),
+            ("ENDS WITH", "'son'"),
+            ("STARTS WITH", "'Ro'"),
+        ] {
+            let q = format!("MATCH (n:Person) WHERE n.name {pred} {needle} RETURN n");
+            let plan = physical(&q, &catalog);
+            let rendered = plan.to_string();
+            assert!(rendered.contains("NodeTextIndexSeek"), "{pred}: {rendered}");
+            // The exact predicate is re-checked above the seek (never dropped).
+            assert!(rendered.contains("Filter"), "{pred}: {rendered}");
+            assert!(rendered.contains(pred), "{pred}: {rendered}");
+            assert!(!rendered.contains("NodeByLabelScan"), "{pred}: {rendered}");
+            assert_eq!(plan.index_dependencies().count(), 1, "{pred}");
+        }
+    }
+
+    #[test]
+    fn text_predicates_without_text_index_stay_scan_and_filter() {
+        // `rmp` task #662: without a TEXT index, CONTAINS / ENDS WITH keep the bare label scan + filter
+        // (a range index cannot serve substring/suffix). A RANGE index on the same property does NOT
+        // make them a text seek.
+        let catalog = IndexCatalog::builder()
+            .with_label_property("Person", "name")
+            .build();
+        for pred in ["CONTAINS", "ENDS WITH"] {
+            let q = format!("MATCH (n:Person) WHERE n.name {pred} 'x' RETURN n");
+            let plan = physical(&q, &catalog);
+            let rendered = plan.to_string();
+            assert!(rendered.contains("NodeByLabelScan"), "{pred}: {rendered}");
+            assert!(rendered.contains("Filter"), "{pred}: {rendered}");
+            assert!(!rendered.contains("TextIndexSeek"), "{pred}: {rendered}");
+        }
+    }
+
+    #[test]
+    fn starts_with_prefers_text_index_over_range_prefix_seek() {
+        // `rmp` task #662: when BOTH a TEXT and a RANGE index cover `(label, property)`, `STARTS WITH`
+        // routes to the TEXT seek (checked first). With only a RANGE index it stays the #658 prefix seek.
+        let both = IndexCatalog::builder()
+            .with_label_property("Person", "name")
+            .with_label_text("Person", "name")
+            .build();
+        let plan = physical(
+            "MATCH (n:Person) WHERE n.name STARTS WITH 'Ro' RETURN n",
+            &both,
+        );
+        let rendered = plan.to_string();
+        assert!(rendered.contains("NodeTextIndexSeek"), "{rendered}");
+        assert!(!rendered.contains("NodeIndexStartsWithSeek"), "{rendered}");
+
+        let range_only = IndexCatalog::builder()
+            .with_label_property("Person", "name")
+            .build();
+        let plan = physical(
+            "MATCH (n:Person) WHERE n.name STARTS WITH 'Ro' RETURN n",
+            &range_only,
+        );
+        let rendered = plan.to_string();
+        assert!(rendered.contains("NodeIndexStartsWithSeek"), "{rendered}");
+        assert!(!rendered.contains("NodeTextIndexSeek"), "{rendered}");
     }
 
     #[test]

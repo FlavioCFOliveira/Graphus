@@ -82,6 +82,12 @@ pub enum IndexKind {
     /// full-text index its backing structure is derived/ephemeral (`graphus_index::SpatialIndex`);
     /// the descriptor records only its shape for planning.
     Spatial,
+    /// Text (trigram) index over a **node** string property, keyed `(label, string-property)`: backs
+    /// the `CONTAINS` / `ENDS WITH` / `STARTS WITH` predicates a forward-ordered range index cannot
+    /// serve (substring/suffix are not a contiguous key range) (`rmp` task #662). Like a full-text /
+    /// spatial index its backing structure is derived/ephemeral (`graphus_index::TrigramIndex`); the
+    /// descriptor records only its shape for planning.
+    Text,
 }
 
 impl IndexKind {
@@ -94,6 +100,7 @@ impl IndexKind {
             Self::Composite => "composite",
             Self::RelProperty => "rel-property",
             Self::Spatial => "spatial",
+            Self::Text => "text",
         }
     }
 }
@@ -283,6 +290,20 @@ impl IndexCatalog {
         })
     }
 
+    /// A text (trigram) index on `(label, string-property)` usable for a `CONTAINS` / `ENDS WITH` /
+    /// `STARTS WITH` predicate (`rmp` task #662). The planner consults this for a substring / suffix /
+    /// prefix predicate on a labelled string property; when present it is preferred over the range-index
+    /// prefix seek for `STARTS WITH` (a text index also serves the substring and suffix forms a range
+    /// index cannot).
+    #[must_use]
+    pub fn label_text(&self, label: &Label, property: &str) -> Option<&IndexDescriptor> {
+        self.indexes.iter().find(|d| {
+            d.kind == IndexKind::Text
+                && d.covers_label(&label.name)
+                && d.properties.first().map(String::as_str) == Some(property)
+        })
+    }
+
     /// A relationship-property index on `(rel_type, property)` for an equality or range predicate
     /// (`04 §6.2`).
     #[must_use]
@@ -396,6 +417,15 @@ impl IndexCatalogBuilder {
     pub fn with_label_spatial(self, label: impl Into<String>, property: impl Into<String>) -> Self {
         self.with_descriptor(
             IndexKind::Spatial,
+            IndexTarget::label(label),
+            vec![property.into()],
+        )
+    }
+
+    /// Appends a text (trigram) index over `(label, string-property)` (`rmp` task #662).
+    pub fn with_label_text(self, label: impl Into<String>, property: impl Into<String>) -> Self {
+        self.with_descriptor(
+            IndexKind::Text,
             IndexTarget::label(label),
             vec![property.into()],
         )
@@ -544,5 +574,25 @@ mod tests {
         assert!(catalog.label_spatial(&label("City"), "name").is_none());
         // A spatial index is NOT returned by the (B-tree) property lookup.
         assert!(catalog.label_property(&label("City"), "loc").is_none());
+    }
+
+    #[test]
+    fn text_index_is_found_by_label_and_property() {
+        let catalog = IndexCatalog::builder()
+            .with_label_text("Person", "name")
+            .build();
+        let chosen = catalog.label_text(&label("Person"), "name").unwrap();
+        assert_eq!(chosen.kind, IndexKind::Text);
+        assert_eq!(chosen.kind.tag(), "text");
+        // Not matched for a different label or property.
+        assert!(catalog.label_text(&label("Other"), "name").is_none());
+        assert!(catalog.label_text(&label("Person"), "age").is_none());
+        // A text index is NOT returned by the (B-tree) property lookup, and a range index is NOT
+        // returned by the text lookup — they are distinct kinds serving distinct predicates.
+        assert!(catalog.label_property(&label("Person"), "name").is_none());
+        let range = IndexCatalog::builder()
+            .with_label_property("Person", "name")
+            .build();
+        assert!(range.label_text(&label("Person"), "name").is_none());
     }
 }

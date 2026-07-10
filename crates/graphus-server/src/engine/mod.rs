@@ -2562,6 +2562,7 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
                 rel_property: coordinator.list_rel_property_indexes(),
                 fulltext: coordinator.list_fulltext_indexes(),
                 point: coordinator.list_point_indexes(),
+                text: coordinator.list_text_indexes(),
                 constraints: coordinator.list_constraints(),
             };
             let rows = index_show::build_rows(*filter, sources);
@@ -2649,6 +2650,24 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
             // `mutated == false` is an `IF EXISTS` no-op drop of a missing index → 0 removed; a missing
             // index without `IF EXISTS` is an error (`rmp` tasks #98, #661).
             let mutated = coordinator.drop_point_index(name, *if_exists)?;
+            Ok(IndexDdlReply::mutation(mutated))
+        }
+        IndexCommand::CreateTextIndex {
+            name,
+            label,
+            property,
+            if_not_exists,
+        } => {
+            // A text (trigram) index is built synchronously (ending `Online`) like a composite / rel
+            // index, so this returns once the build completes (`rmp` task #662). `mutated == false` is an
+            // idempotent `IF NOT EXISTS` no-op → 0 added; otherwise 1 added.
+            let mutated = coordinator.create_text_index(name, label, property, *if_not_exists)?;
+            Ok(IndexDdlReply::mutation(mutated))
+        }
+        IndexCommand::DropTextIndex { name, if_exists } => {
+            // `mutated == false` is an `IF EXISTS` no-op drop of a missing index → 0 removed; a missing
+            // index without `IF EXISTS` is an error (`rmp` task #662).
+            let mutated = coordinator.drop_text_index(name, *if_exists)?;
             Ok(IndexDdlReply::mutation(mutated))
         }
     }

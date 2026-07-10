@@ -2308,6 +2308,45 @@ fn build_operator(
                 rows: nodes_to_rows(variable, ids),
             })
         }
+        PhysicalOp::NodeTextIndexSeek {
+            variable,
+            label,
+            property,
+            op,
+            needle,
+            ..
+        } => {
+            // `n.p CONTAINS/ENDS WITH/STARTS WITH <needle>` served by the trigram text index
+            // (`rmp` task #662). The needle is evaluated at run time (a literal or, after
+            // auto-parameterisation, a `$param`). The seek returns a candidate SUPERSET; the residual
+            // predicate above this operator (attached by the planner) restores exactness (rejecting
+            // non-string / non-matching values), so both the index and the scan fallback below yield
+            // the identical node set. A non-string needle, a needle too short to form a trigram, or an
+            // unavailable index at run time (e.g. the off-thread reader declines) all fall back to a
+            // label scan — the residual filter then does the exact trimming, with the SSI read footprint
+            // matching the scan path (`scan_nodes_by_label`).
+            let needle_val = eval_value(
+                needle,
+                &Row::empty(),
+                ctx.params,
+                ctx.graph,
+                ctx.functions,
+                &ctx.clock,
+            )?;
+            let ids = match &needle_val {
+                Value::String(s) => ctx
+                    .graph
+                    .index_seek_text(&label.name, property, *op, s)
+                    .unwrap_or_else(|| ctx.graph.scan_nodes_by_label(&label.name)),
+                // A non-string needle: the predicate evaluates to `null` for every node, so nothing
+                // matches. Scan the label so the residual filter (which also returns nothing) owns the
+                // SSI footprint, identical to the scan-path plan.
+                _ => ctx.graph.scan_nodes_by_label(&label.name),
+            };
+            Ok(Operator::Buffered {
+                rows: nodes_to_rows(variable, ids),
+            })
+        }
         PhysicalOp::RelIndexSeek {
             relationship,
             from,
@@ -7799,7 +7838,8 @@ fn result_columns(op: &PhysicalOp, procedures: &dyn ProcedureRegistry) -> Vec<St
         | PhysicalOp::NodeLabelScanEq { variable, .. }
         | PhysicalOp::NodeIndexRangeSeek { variable, .. }
         | PhysicalOp::NodeIndexStartsWithSeek { variable, .. }
-        | PhysicalOp::SpatialIndexSeek { variable, .. } => vec![variable.name.clone()],
+        | PhysicalOp::SpatialIndexSeek { variable, .. }
+        | PhysicalOp::NodeTextIndexSeek { variable, .. } => vec![variable.name.clone()],
         PhysicalOp::AllRelationshipsScan {
             relationship,
             from,
@@ -8689,6 +8729,79 @@ mod tests {
         assert!(
             plan.to_string().contains("SpatialIndexSeek"),
             "the indexed plan must route through the spatial seek:\n{plan}"
+        );
+    }
+
+    #[test]
+    fn text_index_seek_returns_exactly_the_scan_result() {
+        // `rmp` task #662: the TEXT (trigram) index must NEVER change results — only speed. For each of
+        // CONTAINS / ENDS WITH / STARTS WITH (plus unicode, empty needle, mixed-type property, and a
+        // no-match needle), the indexed seek path and the plain scan+filter path must return the
+        // IDENTICAL node set.
+        use crate::catalog::IndexCatalog;
+
+        fn ids(src: &str, graph: &mut MemGraph, catalog: &IndexCatalog) -> Vec<u64> {
+            let mut out: Vec<u64> = run_with_catalog(src, graph, catalog)
+                .iter()
+                .filter_map(|r| r.get("n").and_then(RowValue::as_node))
+                .map(|id| id.0)
+                .collect();
+            out.sort_unstable();
+            out
+        }
+
+        // Two identically-seeded graphs: one with a declared text index, one without. A mixed-type row
+        // (`name` is an integer) and a non-string node exercise the "non-string value is not indexed and
+        // not matched" path in BOTH the seek and the residual re-check.
+        let seed = |g: &mut MemGraph| {
+            g.add_node(["Person"], [("name", Value::String("Robert".to_owned()))]);
+            g.add_node(["Person"], [("name", Value::String("roberta".to_owned()))]);
+            g.add_node(["Person"], [("name", Value::String("Bobby".to_owned()))]);
+            g.add_node(["Person"], [("name", Value::String("Álvaro".to_owned()))]); // unicode
+            g.add_node(["Person"], [("name", Value::Integer(42))]); // mixed-type property
+            g.add_node(["Person"], [("age", Value::Integer(30))]); // property absent
+        };
+        let mut indexed = MemGraph::new();
+        seed(&mut indexed);
+        indexed.create_text_index("Person", "name");
+        let mut plain = MemGraph::new();
+        seed(&mut plain);
+
+        let with_index = IndexCatalog::builder()
+            .with_label_text("Person", "name")
+            .build();
+        let no_index = IndexCatalog::empty();
+
+        // A spread of needles across the three predicates + edge cases. Every one must agree.
+        let queries = [
+            "MATCH (n:Person) WHERE n.name CONTAINS 'obe' RETURN n", // Robert, roberta
+            "MATCH (n:Person) WHERE n.name CONTAINS 'bb' RETURN n",  // Bobby
+            "MATCH (n:Person) WHERE n.name ENDS WITH 'ert' RETURN n", // Robert (not roberta)
+            "MATCH (n:Person) WHERE n.name ENDS WITH 'ta' RETURN n", // roberta
+            "MATCH (n:Person) WHERE n.name STARTS WITH 'Rob' RETURN n", // Robert
+            "MATCH (n:Person) WHERE n.name STARTS WITH 'rob' RETURN n", // roberta (case-sensitive)
+            "MATCH (n:Person) WHERE n.name CONTAINS 'lvar' RETURN n", // Álvaro (unicode)
+            "MATCH (n:Person) WHERE n.name CONTAINS 'zzz' RETURN n", // no match
+            "MATCH (n:Person) WHERE n.name CONTAINS '' RETURN n", // empty needle (short → all strings)
+            "MATCH (n:Person) WHERE n.name CONTAINS 'o' RETURN n", // short needle (< 3 chars)
+            "MATCH (n:Person) WHERE n.name STARTS WITH 'R' RETURN n", // short prefix (< 2 chars)
+        ];
+        for q in queries {
+            let seek = ids(q, &mut indexed, &with_index);
+            let scan = ids(q, &mut plain, &no_index);
+            assert_eq!(seek, scan, "text index must not change results for: {q}");
+        }
+
+        // Sanity: the indexed plan really does route through the text seek.
+        let q = "MATCH (n:Person) WHERE n.name CONTAINS 'obe' RETURN n";
+        let plan = {
+            let toks = tokenize(q).expect("lex");
+            let ast = parse_tokens(&toks, q).expect("parse");
+            plan_physical(&lower(&analyze(&ast).expect("analyze")), &with_index)
+        };
+        assert!(
+            plan.to_string().contains("NodeTextIndexSeek"),
+            "the indexed plan must route through the text seek:\n{plan}"
         );
     }
 

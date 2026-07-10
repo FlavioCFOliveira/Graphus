@@ -1314,6 +1314,21 @@ pub fn redact_index_detail(cmd: &crate::engine::IndexCommand) -> String {
             let if_e = if *if_exists { " IF EXISTS" } else { "" };
             format!("DROP POINT INDEX {name}{if_e}")
         }
+        // Text (trigram) index DDL (`rmp` task #662) carries no secret either: the index name, label
+        // and property key are all schema identifiers.
+        I::CreateTextIndex {
+            name,
+            label,
+            property,
+            if_not_exists,
+        } => {
+            let if_ne = if *if_not_exists { " IF NOT EXISTS" } else { "" };
+            format!("CREATE TEXT INDEX {name}{if_ne} FOR (:{label}) ON ({property})")
+        }
+        I::DropTextIndex { name, if_exists } => {
+            let if_e = if *if_exists { " IF EXISTS" } else { "" };
+            format!("DROP TEXT INDEX {name}{if_e}")
+        }
     }
 }
 

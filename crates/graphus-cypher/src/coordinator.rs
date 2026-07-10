@@ -50,7 +50,7 @@ use graphus_io::BlockDevice;
 use graphus_storage::{
     CompositeIndexEntry, ConstraintEntry, ConstraintKind, ConstraintTypeDescriptor,
     FulltextIndexEntry, GcPassReport, IndexState, Namespace, RecordStore, SpatialIndexEntry,
-    StoreReadView, TokenSnapshot,
+    StoreReadView, TextIndexEntry, TokenSnapshot,
 };
 use graphus_txn::{CommitRegistry, IsolationLevel, LockTable, Snapshot, SsiReadBuffer, SsiTracker};
 use graphus_wal::LogSink;
@@ -353,6 +353,8 @@ enum NameCatalog {
     Constraint,
     /// The composite (multi-property) node index catalog (`rmp` task #657).
     Composite,
+    /// The text (trigram) node index catalog (`rmp` task #662).
+    Text,
 }
 
 /// A deterministic auto-name for the composite (multi-property) node index on `(label, properties)`
@@ -786,6 +788,18 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             }
         }
 
+        // Register every durable **text (trigram) index** (`rmp` task #662) in the in-memory set, so the
+        // write path maintains it and the rebuild scan below repopulates its trigram index. It is
+        // recorded `Online` in the durable catalog (a synchronous build), so recovery repopulates a
+        // fully-online index, never a half-built one. Keyed by `(label_token, prop_key)`, like spatial.
+        let durable_text: Vec<(String, TextIndexEntry)> = store.borrow().text_indexes();
+        {
+            let mut idx = index.borrow_mut();
+            for (_name, entry) in durable_text {
+                idx.register_text(entry.label_token, entry.property_token, IndexState::Online);
+            }
+        }
+
         index.borrow_mut().clear();
 
         // The set of registered node-property indexes (any state), captured before walking the store so
@@ -805,6 +819,9 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // The registered spatial index keys `(label_token, prop_key)`, captured before the scan so the
         // index is not borrowed across a store borrow (`rmp` task #98).
         let registered_spatial: Vec<(u32, u32)> = index.borrow().registered_spatial();
+        // The registered text (trigram) index keys `(label_token, prop_key)` (`rmp` task #662), captured
+        // before the scan so the index is not borrowed across a store borrow.
+        let registered_text: Vec<(u32, u32)> = index.borrow().registered_text();
         // The registered composite index keys `(label_token, property tuple)` — a node-key constraint's
         // backing index (`rmp` task #100). Captured before the scan so the index is not borrowed across
         // a store borrow.
@@ -823,6 +840,11 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             // is declared.
             if !registered_spatial.is_empty() {
                 Self::index_one_node_spatial(store, index, id, &registered_spatial);
+            }
+            // Repopulate the text (trigram) indexes from the same scan (`rmp` task #662), only when at
+            // least one is declared.
+            if !registered_text.is_empty() {
+                Self::index_one_node_text(store, index, id, &registered_text);
             }
             // Repopulate the composite indexes from the same scan (`rmp` task #100), only when at least
             // one node-key constraint is declared.
@@ -875,6 +897,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             || store.spatial_index(name).is_some()
             || store.constraint(name).is_some()
             || store.composite_index(name).is_some()
+            || store.text_index(name).is_some()
     }
 
     /// Whether `name` is used by a schema catalog **other than** `own` (`rmp` task #624). Lets a
@@ -887,6 +910,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             || (own != NameCatalog::Spatial && store.spatial_index(name).is_some())
             || (own != NameCatalog::Constraint && store.constraint(name).is_some())
             || (own != NameCatalog::Composite && store.composite_index(name).is_some())
+            || (own != NameCatalog::Text && store.text_index(name).is_some())
     }
 
     /// Whether `name` is used by any schema rule **other than** the node-property index on
@@ -902,6 +926,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         store.fulltext_index(name).is_some()
             || store.spatial_index(name).is_some()
             || store.constraint(name).is_some()
+            || store.text_index(name).is_some()
             || matches!(
                 store.node_property_index_name(name),
                 Some(target) if target != (label_token, prop_token)
@@ -958,6 +983,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             || store.fulltext_index(name).is_some()
             || store.spatial_index(name).is_some()
             || store.constraint(name).is_some()
+            || store.text_index(name).is_some()
             || matches!(
                 store.rel_property_index_name(name),
                 Some(target) if target != (type_token, prop_token)
@@ -1257,6 +1283,57 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             for &lt in &label_tokens {
                 if index.has_spatial(lt, *prop_key) {
                     index.insert_spatial_point(lt, *prop_key, value, id);
+                }
+            }
+        }
+    }
+
+    /// (Re)indexes node `id`'s current string value into each `registered` `(label_token, prop_key)`
+    /// text (trigram) index it matches (`rmp` task #662). The text analogue of
+    /// [`index_one_node_spatial`](Self::index_one_node_spatial): the same single per-node code path the
+    /// full rebuild ([`rebuild_index`](Self::rebuild_index)) and the synchronous create build both drive,
+    /// so a recovered store rebuilds the trigram indexes store-consistently. Only the **string**-valued
+    /// properties a registered index covers are read; a node not carrying the covered label, or whose
+    /// covered property is absent / non-string, contributes nothing (the trigram index is a candidate
+    /// set, so a missing candidate degrades to the scan fallback for that reader — never a wrong row).
+    /// The store and index are borrowed in **separate, non-overlapping** scopes (this file's borrow
+    /// discipline).
+    fn index_one_node_text(
+        store: &Rc<RefCell<RecordStore<D, S>>>,
+        index: &Rc<RefCell<IndexSet>>,
+        id: u64,
+        registered: &[(u32, u32)],
+    ) {
+        let label_tokens = match store.borrow_mut().node_labels(id) {
+            Ok(tokens) => tokens,
+            Err(_) => return,
+        };
+        // The node's current property values, keyed by prop-key (newest-wins per key), keeping only the
+        // string values a registered text index covers for one of this node's labels.
+        let mut values: Vec<(u32, Value)> = Vec::new();
+        {
+            let chain = match store.borrow_mut().node_property_values(id) {
+                Ok(chain) => chain,
+                Err(_) => return,
+            };
+            for (_pid, key, value) in chain {
+                if values.iter().any(|(k, _)| *k == key) {
+                    continue; // newest-wins: keep only the first occurrence of each key.
+                }
+                let used = registered.iter().any(|&(reg_label, prop_key)| {
+                    prop_key == key && label_tokens.contains(&reg_label)
+                });
+                if used && matches!(value, Value::String(_)) {
+                    values.push((key, value));
+                }
+            }
+        }
+
+        let mut index = index.borrow_mut();
+        for (prop_key, value) in &values {
+            for &lt in &label_tokens {
+                if index.has_text(lt, *prop_key) {
+                    index.insert_text_value(lt, *prop_key, value, id);
                 }
             }
         }
@@ -1668,6 +1745,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // A spatial (point) index of that name (`rmp` task #661)?
         if self.store.borrow().spatial_index(name).is_some() {
             return self.drop_point_index(name, if_exists);
+        }
+        // A text (trigram) index of that name (`rmp` task #662)?
+        if self.store.borrow().text_index(name).is_some() {
+            return self.drop_text_index(name, if_exists);
         }
         // No catalog holds the name: honour `IF EXISTS`.
         if if_exists {
@@ -2993,6 +3074,191 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             .collect()
     }
 
+    /// Declares a text (trigram) node index named `name` over `(label, property)` (`rmp` task #662),
+    /// enforcing Neo4j-conformant schema semantics. A `TEXT` index accelerates `CONTAINS` / `ENDS WITH`
+    /// / `STARTS WITH` — the substring/suffix predicates a forward-ordered range index cannot serve.
+    ///
+    /// The label + property-key tokens are interned **durably** and the named catalog entry is recorded
+    /// as [`IndexState::Online`] in one committed transaction (so the *registration* survives a crash),
+    /// then the index is registered in the in-memory [`IndexSet`] and **synchronously built** from the
+    /// current nodes. The synchronous build is crash-safe: the backing trigram index is ephemeral and
+    /// rebuilt from the durable catalog + store on open, so a crash mid-build recovers the `Online`
+    /// registration and repopulates it — recovery never observes a half-built index. This mirrors the
+    /// composite index (`rmp` task #657) rather than the non-blocking spatial/full-text builds.
+    ///
+    /// Returns whether the index was **actually created** (`true`) or the call was an idempotent no-op
+    /// (`false`, an `IF NOT EXISTS` that changed nothing).
+    ///
+    /// # Errors
+    /// - `Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists` (no `IF NOT EXISTS`) when an
+    ///   equivalent text index on `(label, property)` already exists;
+    /// - `Neo.ClientError.Schema.IndexWithNameAlreadyExists` (no `IF NOT EXISTS`) when `name` is already
+    ///   taken by another schema catalog;
+    /// - a storage error if interning a token, recording the catalog entry, committing, or the build
+    ///   scan fails. On any error the index is left undeclared.
+    pub fn create_text_index(
+        &mut self,
+        name: &str,
+        label: &str,
+        property: &str,
+        if_not_exists: bool,
+    ) -> Result<bool> {
+        // 1. Equivalent-index check (a text index on the same `(label, property)` under any name, or the
+        //    same `name`): `IF NOT EXISTS` makes it an idempotent no-op, else it is an error. A text
+        //    index is DISTINCT from a range index over the same `(label, property)` — both may coexist in
+        //    Neo4j — so this consults only the text catalog.
+        if self.text_equivalent_exists(name, label, property) {
+            return if if_not_exists {
+                Ok(false)
+            } else {
+                Err(equivalent_index_exists(label, property))
+            };
+        }
+        // 2. Names are globally unique across every schema catalog (`rmp` task #624): reject a name
+        //    already used by a *different* catalog (a re-declare within the text catalog is caught by the
+        //    equivalence check above, so it never reaches here).
+        if Self::name_used_by_other_catalog(&self.store.borrow(), name, NameCatalog::Text) {
+            return if if_not_exists {
+                Ok(false)
+            } else {
+                Err(index_name_in_use(name))
+            };
+        }
+        // 3. Intern the label + property-key tokens and record the durable catalog entry `Online` in one
+        //    committed transaction — so the schema change survives a crash atomically.
+        self.next_txn_id += 1;
+        let txn = TxnId(self.next_txn_id);
+        self.store.borrow_mut().begin(txn);
+        let (label_token, prop_key) = {
+            let mut store = self.store.borrow_mut();
+            let label_token = match store.intern_token(Namespace::Label, label) {
+                Ok(t) => t,
+                Err(e) => {
+                    drop(store);
+                    let _ = self.store.borrow_mut().rollback(txn);
+                    return Err(e);
+                }
+            };
+            let prop_key = match store.intern_token(Namespace::PropKey, property) {
+                Ok(t) => t,
+                Err(e) => {
+                    drop(store);
+                    let _ = self.store.borrow_mut().rollback(txn);
+                    return Err(e);
+                }
+            };
+            store.set_text_index(
+                name.to_owned(),
+                TextIndexEntry {
+                    label_token,
+                    property_token: prop_key,
+                    state: IndexState::Online,
+                },
+            );
+            (label_token, prop_key)
+        };
+        self.store.borrow_mut().commit(txn)?;
+
+        // 4. Register the trigram index in the in-memory set so concurrent writes maintain it from now
+        //    on, then synchronously index the existing nodes. The index is ephemeral (rebuilt on open
+        //    from the durable catalog + store), so this synchronous fill is a pure in-memory build with
+        //    no durability surface — a crash before it finishes recovers the `Online` registration and
+        //    the open-time rebuild repopulates it store-consistently.
+        self.index
+            .borrow_mut()
+            .register_text(label_token, prop_key, IndexState::Online);
+        let node_ids = self.store.borrow_mut().scan_node_ids()?;
+        let registered = vec![(label_token, prop_key)];
+        for id in node_ids {
+            Self::index_one_node_text(&self.store, &self.index, id, &registered);
+        }
+
+        // 5. Stamp the cross-snapshot freshness marker (`rmp` task #467): the trigram index now reflects
+        //    committed state at the store's current high-water, and the build raised the transient dirty
+        //    flag on every insert. Bump the marker to the high-water so a reader whose snapshot predates
+        //    the build declines to the always-correct scan path, and clear the build's dirty flag so it
+        //    does not leak into the next user statement (as `bump_ft_spatial_marker_after_build` does).
+        let high_water = self.store.borrow().snapshot_ts();
+        self.index
+            .borrow_mut()
+            .bump_ft_spatial_marker_after_build(high_water);
+        Ok(true) // the index was created.
+    }
+
+    /// Whether a text (trigram) index equivalent to the requested `(name, label, property)` already
+    /// exists (`rmp` task #662) — the same `name` in the text catalog, or the same covered
+    /// `(label, property)` under any name. Backs `CREATE TEXT INDEX … IF NOT EXISTS` idempotency.
+    /// Read-only, by token *lookup*. Consults ONLY the text catalog: a range/point index over the same
+    /// `(label, property)` is a different kind and does not make a text index "equivalent".
+    fn text_equivalent_exists(&self, name: &str, label: &str, property: &str) -> bool {
+        let store = self.store.borrow();
+        if store.text_index(name).is_some() {
+            return true;
+        }
+        let props = [property.to_owned()];
+        let Some((label_token, property_tokens)) =
+            Self::resolve_property_tokens(&store, label, &props)
+        else {
+            return false;
+        };
+        let prop_token = property_tokens[0];
+        store
+            .text_indexes()
+            .iter()
+            .any(|(_n, e)| e.label_token == label_token && e.property_token == prop_token)
+    }
+
+    /// Drops the text (trigram) index named `name` (`rmp` task #662): removes its durable catalog entry
+    /// in a committed transaction and unregisters its trigram index from the in-memory [`IndexSet`].
+    /// Idempotent on a never-declared name (a clean no-op success under `if_exists`).
+    ///
+    /// # Errors
+    /// - `Neo.ClientError.Schema.IndexDropFailed` when the index is not declared and `if_exists` is
+    ///   `false`;
+    /// - a storage error if the committing transaction fails.
+    pub fn drop_text_index(&mut self, name: &str, if_exists: bool) -> Result<bool> {
+        // Resolve the covered `(label_token, prop_key)` from the durable entry so we can unregister the
+        // right trigram index from the in-memory set (which is keyed by tokens, not by name).
+        let entry = self.store.borrow().text_index(name);
+        let Some(entry) = entry else {
+            // Not declared: without `IF EXISTS` this is a `Neo.ClientError.Schema.IndexDropFailed` error
+            // (Neo4j) and side-effect-free. With `IF EXISTS` it is a clean no-op success.
+            if !if_exists {
+                return Err(index_drop_not_found(name));
+            }
+            return Ok(false); // nothing removed.
+        };
+
+        self.next_txn_id += 1;
+        let txn = TxnId(self.next_txn_id);
+        self.store.borrow_mut().begin(txn);
+        self.store.borrow_mut().remove_text_index(name);
+        self.store.borrow_mut().commit(txn)?;
+
+        self.index
+            .borrow_mut()
+            .unregister_text(entry.label_token, entry.property_token);
+        Ok(true) // an index was removed.
+    }
+
+    /// Lists every declared text (trigram) index as `(name, label, property, state)` (`rmp` task #662),
+    /// for a `SHOW INDEXES` surface. Reads the durable catalog and resolves the tokens back to names; an
+    /// entry whose tokens have no resolvable name (a defensively-skipped impossibility for a live token)
+    /// is omitted. Ordered by name.
+    #[must_use]
+    pub fn list_text_indexes(&self) -> Vec<(String, String, String, IndexState)> {
+        let store = self.store.borrow();
+        store
+            .text_indexes()
+            .into_iter()
+            .filter_map(|(name, entry)| {
+                let label = store.token_name(Namespace::Label, entry.label_token)?;
+                let property = store.token_name(Namespace::PropKey, entry.property_token)?;
+                Some((name, label.to_owned(), property.to_owned(), entry.state))
+            })
+            .collect()
+    }
+
     /// Idempotency-aware `CREATE CONSTRAINT` entry point (`rmp` #638): wraps
     /// [`create_constraint_general`](Self::create_constraint_general) with `IF NOT EXISTS` and
     /// `OR REPLACE` handling, returning whether the schema was **actually mutated** (which drives the
@@ -4127,6 +4393,21 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 continue;
             };
             builder = builder.with_label_spatial(label, property);
+        }
+        // Text (trigram) indexes (`rmp` task #662): surface every **`Online`** text index so the
+        // physical planner can route a `CONTAINS` / `ENDS WITH` / `STARTS WITH` predicate to a
+        // `NodeTextIndexSeek`. Like the other kinds only `Online` ones are exposed (`online_text` filters
+        // by state), so a half-built text index never drives a seek — the planner keeps the scan + filter
+        // until it is promoted; the backing trigram index exists in the in-memory set (registered on open
+        // / create), so the seek the planner emits always finds it.
+        for (label_token, prop_key) in self.index.borrow().online_text() {
+            let (Some(label), Some(property)) = (
+                store.token_name(Namespace::Label, label_token),
+                store.token_name(Namespace::PropKey, prop_key),
+            ) else {
+                continue;
+            };
+            builder = builder.with_label_text(label, property);
         }
         // Standalone composite (multi-property) node indexes (`rmp` task #657): surface every
         // **`Online`** one so the physical planner can consume a leading run of equality conjuncts into

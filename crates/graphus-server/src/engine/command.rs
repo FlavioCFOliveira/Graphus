@@ -242,6 +242,31 @@ pub enum IndexCommand {
         /// Whether `IF EXISTS` was given (a missing index becomes a no-op success) (`rmp` task #661).
         if_exists: bool,
     },
+    /// `CREATE TEXT INDEX [<name>] [IF NOT EXISTS] FOR (n:<Label>) ON (n.<prop>)` (`rmp` task #662):
+    /// declares a **text (trigram) index** — a distinct native string index, NOT a synonym of `RANGE` —
+    /// that accelerates `CONTAINS` / `ENDS WITH` / `STARTS WITH` over `(label, property)`. Built
+    /// synchronously (ending `Online`), like a relationship / composite index. `name` is the requested
+    /// server-unique name (auto-generated deterministically by the admin matcher when omitted);
+    /// `if_not_exists` makes an already-existing equivalent index (same name or same covered schema) a
+    /// no-op success rather than an error.
+    CreateTextIndex {
+        /// The server-unique index name.
+        name: String,
+        /// The node label the index covers.
+        label: String,
+        /// The string property the index covers (exactly one).
+        property: String,
+        /// Whether `IF NOT EXISTS` was given (a duplicate becomes a no-op success) (`rmp` task #662).
+        if_not_exists: bool,
+    },
+    /// `DROP [TEXT] INDEX <name> [IF EXISTS]` (`rmp` task #662): removes the text (trigram) index
+    /// (durable + in-memory). `if_exists` makes a missing index a no-op success rather than an error.
+    DropTextIndex {
+        /// The text index name to drop.
+        name: String,
+        /// Whether `IF EXISTS` was given (a missing index becomes a no-op success) (`rmp` task #662).
+        if_exists: bool,
+    },
     /// `CREATE INDEX [<name>] [IF NOT EXISTS] FOR ()-[r:<TYPE>]-() ON (r.<property>)` on
     /// `(rel_type, property)` (`rmp` task #646): the relationship analogue of
     /// [`CreateNodePropertyIndex`](Self::CreateNodePropertyIndex). Synchronously builds the index from
@@ -790,15 +815,13 @@ pub fn index_ddl_summary(command: &IndexCommand, mutated: bool) -> RunSummary {
         IndexCommand::CreateNodePropertyIndex { .. }
         | IndexCommand::CreateRelPropertyIndex { .. }
         | IndexCommand::CreateFulltextIndex { .. }
-        | IndexCommand::CreatePointIndex { .. } => {
-            schema_mutation_summary("indexes-added", mutated)
-        }
+        | IndexCommand::CreatePointIndex { .. }
+        | IndexCommand::CreateTextIndex { .. } => schema_mutation_summary("indexes-added", mutated),
         IndexCommand::DropNodePropertyIndex { .. }
         | IndexCommand::DropRelPropertyIndex { .. }
         | IndexCommand::DropFulltextIndex { .. }
-        | IndexCommand::DropPointIndex { .. } => {
-            schema_mutation_summary("indexes-removed", mutated)
-        }
+        | IndexCommand::DropPointIndex { .. }
+        | IndexCommand::DropTextIndex { .. } => schema_mutation_summary("indexes-removed", mutated),
     }
 }
 

@@ -1215,6 +1215,29 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             }
         }
 
+        // Text (trigram) indexes are maintained per-write the same wholesale way as the spatial index
+        // (`rmp` task #662): for every registered text index `(label_token, prop_key)`, if the node
+        // currently carries the covered label AND has a String value for the covered property, that
+        // value is (re)indexed into the trigram index; in every other case (the node lost the label, the
+        // property is absent, or it is no longer a string) the node is removed so a seek never sees a
+        // phantom. Like the full-text/spatial index this is a wholesale per-node re-index (the trigram
+        // index keeps only the latest state, so a removed/changed value must not linger), and it rides
+        // the SAME cross-snapshot freshness marker (`note_ft_spatial_mutator` below) since it too holds
+        // only latest state.
+        for (label_token, prop_key) in index.registered_text() {
+            let covered = label_tokens.contains(&label_token);
+            let string = covered.then(|| {
+                resolved_props
+                    .iter()
+                    .find(|(k, v)| *k == prop_key && matches!(v, Value::String(_)))
+                    .map(|(_, v)| v)
+            });
+            match string {
+                Some(Some(value)) => index.insert_text_value(label_token, prop_key, value, node.0),
+                _ => index.remove_text(label_token, prop_key, node.0),
+            }
+        }
+
         // Bitmap (low-cardinality) indexes are maintained membership-EXACT the same wholesale way
         // (`rmp` task #328): unlike the read-only columnar cache, a bitmap is a candidate SOURCE, so a
         // node it wrongly OMITS would make a query miss a row (a subset — never correct). For each
@@ -3389,6 +3412,71 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         let labelled = self.filter_label_candidates(label_token, candidates);
 
         let mut out = labelled;
+        out.sort_unstable();
+        out.dedup();
+        Some(out)
+    }
+
+    fn index_seek_text(
+        &self,
+        label: &str,
+        property: &str,
+        op: crate::physical::TextSeekOp,
+        needle: &str,
+    ) -> Option<Vec<NodeId>> {
+        use crate::physical::TextSeekOp;
+        // Only the coordinated path has the derived `IndexSet` holding the trigram text index; otherwise
+        // the executor falls back to a label scan (`rmp` task #662).
+        let index = self.index.as_ref()?;
+        let label_token = self.label_id_existing(label)?;
+        let prop_key = self.store.borrow().token_id(Namespace::PropKey, property)?;
+        if !index.borrow().has_text(label_token, prop_key) {
+            return None; // no usable text index: scan fallback
+        }
+
+        // Cross-snapshot freshness gate (`rmp` task #467): the trigram index — like the full-text and
+        // spatial indexes — keeps only the LATEST state (a write re-keys a node's trigrams wholesale), so
+        // if this reader's MVCC snapshot PREDATES the last committed (or any in-flight / rolled-back)
+        // full-text/spatial/text mutation, the index may have been re-keyed by a writer this snapshot
+        // cannot see, and could return a strict SUBSET of this snapshot's matches (a false negative the
+        // residual re-check cannot repair — it filters false positives but cannot resurrect a missing
+        // candidate). Decline to the scan fallback: the executor's `scan_nodes_by_label` + residual
+        // filter re-reads each node's SNAPSHOT-visible value via MVCC `node_property`, which is correct
+        // for this stale reader. The early return is BEFORE any marking, so the scan fallback owns the
+        // SSI markers exactly once.
+        if self.snapshot.ts < index.borrow().effective_ft_spatial_marker() {
+            return None;
+        }
+
+        // Candidate ids from the trigram index. `None` means the needle is too short to form a trigram —
+        // the index cannot narrow — so decline to the scan fallback (which the caller runs and which owns
+        // the SSI footprint). We attempt the seek BEFORE marking so a too-short-needle decline does not
+        // register a redundant `mark_all_live_nodes` footprint that the scan path then re-registers; the
+        // footprint is stamped below ONLY when the index is actually used.
+        let candidates = match op {
+            TextSeekOp::Contains => {
+                index
+                    .borrow()
+                    .seek_text_contains(label_token, prop_key, needle)
+            }
+            TextSeekOp::EndsWith => {
+                index
+                    .borrow()
+                    .seek_text_ends_with(label_token, prop_key, needle)
+            }
+            TextSeekOp::StartsWith => {
+                index
+                    .borrow()
+                    .seek_text_starts_with(label_token, prop_key, needle)
+            }
+        }?;
+
+        // SSI predicate footprint: an indexed text predicate replaces the label-scan + filter fallback
+        // (which read every node via `scan_nodes_by_label`). Preserve that exact read footprint so the
+        // index path and the scan fallback are indistinguishable to SSI (`04 §5.4`).
+        self.mark_all_live_nodes();
+
+        let mut out = self.filter_label_candidates(label_token, candidates);
         out.sort_unstable();
         out.dedup();
         Some(out)

@@ -438,6 +438,11 @@ fn walk_physical(op: &PhysicalOp, record: &mut impl FnMut(&str, ParamType)) {
             // auto-parameterisation. No static type expectation, recorded as Any. A leaf — no input.
             params_in_expr(prefix, ParamType::Any, record);
         }
+        PhysicalOp::NodeTextIndexSeek { needle, .. } => {
+            // The CONTAINS/ENDS WITH/STARTS WITH needle (`rmp` task #662): commonly a `$param` after
+            // literal auto-parameterisation. No static type expectation, recorded as Any. A leaf.
+            params_in_expr(needle, ParamType::Any, record);
+        }
         PhysicalOp::Filter { input, predicate } => {
             params_in_expr(predicate, ParamType::Any, record);
             walk_physical(input, record);

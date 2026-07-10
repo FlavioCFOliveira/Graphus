@@ -42,7 +42,7 @@ use crate::idalloc::{ElementIdAllocator, FreeList, NULL_ID, PhysicalAllocator};
 use crate::labels;
 use crate::meta::{
     CompositeIndexEntry, ConstraintEntry, FulltextIndexEntry, IndexState, Meta, SpatialIndexEntry,
-    Statistics, StoreMeta,
+    Statistics, StoreMeta, TextIndexEntry,
 };
 use crate::paging;
 use crate::read_view::{self, MetaSnapshot, StoreMetaSnapshot, StorePages, StoreReadView};
@@ -5311,6 +5311,51 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// commit, discarded on rollback.
     pub fn remove_composite_index(&mut self, name: &str) {
         self.statistics.remove_composite_index(name);
+        self.catalog_dirty = true;
+    }
+
+    /// The durable text (trigram) node index entry named `name`, or [`None`] if no such index is
+    /// declared (`rmp` task #662). Tokens are returned as ids; the caller resolves their names via the
+    /// token store. Cloned so the borrow of `self` does not outlive the call.
+    #[must_use]
+    pub fn text_index(&self, name: &str) -> Option<TextIndexEntry> {
+        self.statistics.text_index(name).cloned()
+    }
+
+    /// Lists every declared text index as `(name, entry)` from the durable catalog (`rmp` task #662),
+    /// ascending by name. Like [`spatial_indexes`](Self::spatial_indexes) this is what makes a text
+    /// index *registration* survive a crash: a fresh coordinator reads this to re-register the
+    /// previously-declared text indexes before rebuilding their trigram index from the store.
+    #[must_use]
+    pub fn text_indexes(&self) -> Vec<(String, TextIndexEntry)> {
+        self.statistics.text_indexes()
+    }
+
+    /// The **name** of the text index covering exactly `(label_token, property_token)`, or [`None`] if
+    /// none is declared (`rmp` task #662). Backs the `IF NOT EXISTS` schema-equivalence check.
+    #[must_use]
+    pub fn text_index_name_for(&self, label_token: u32, property_token: u32) -> Option<String> {
+        self.statistics
+            .text_index_name_for(label_token, property_token)
+            .map(str::to_owned)
+    }
+
+    /// Declares (or replaces) the text index named `name` in the durable catalog (`rmp` task #662).
+    ///
+    /// The mutation is purely in-memory here; like the spatial index mutators it becomes **durable when
+    /// the enclosing transaction commits** (the catalog is checkpointed at commit) and is **discarded
+    /// on rollback** (the catalog is reloaded from the last committed metadata page). Re-recording an
+    /// existing name overwrites the entry (e.g. to flip its state).
+    pub fn set_text_index(&mut self, name: String, entry: TextIndexEntry) {
+        self.statistics.set_text_index(name, entry);
+        self.catalog_dirty = true;
+    }
+
+    /// Removes the text index named `name` from the durable catalog, if declared (`rmp` task #662).
+    /// Removing an absent entry is a harmless no-op. Durable at the enclosing transaction's commit,
+    /// discarded on rollback.
+    pub fn remove_text_index(&mut self, name: &str) {
+        self.statistics.remove_text_index(name);
         self.catalog_dirty = true;
     }
 

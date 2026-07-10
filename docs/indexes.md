@@ -123,9 +123,9 @@ DROP INDEX ON :Person(name)             -- legacy form
 ## Listing indexes — `SHOW INDEXES`
 
 `SHOW INDEXES` is a **unified** Neo4j-5.x listing of *every* index kind — node-property and
-relationship-property `RANGE`, composite `RANGE`, `FULLTEXT`, `POINT`, and the two always-on token
-`LOOKUP` indexes (`node_label_lookup_index` / `rel_type_lookup_index`) that Neo4j always lists. A
-bare listing returns the **12 default columns**, in Neo4j order:
+relationship-property `RANGE`, composite `RANGE`, `TEXT`, `FULLTEXT`, `POINT`, and the two always-on
+token `LOOKUP` indexes (`node_label_lookup_index` / `rel_type_lookup_index`) that Neo4j always lists.
+A bare listing returns the **12 default columns**, in Neo4j order:
 
 | Column              | Type            | Value |
 | ------------------- | --------------- | ----- |
@@ -133,11 +133,11 @@ bare listing returns the **12 default columns**, in Neo4j order:
 | `name`              | string          | the index name (explicit or auto-generated) |
 | `state`             | string          | `ONLINE` (ready) or `POPULATING` (build in progress) |
 | `populationPercent` | float           | `100.0` when online, else `0.0` |
-| `type`              | string          | `RANGE`, `FULLTEXT`, `POINT` or `LOOKUP` |
+| `type`              | string          | `RANGE`, `TEXT`, `FULLTEXT`, `POINT` or `LOOKUP` |
 | `entityType`        | string          | `NODE` or `RELATIONSHIP` |
 | `labelsOrTypes`     | list of string  | the covered label(s)/type, e.g. `["Person"]` (empty for `LOOKUP`) |
 | `properties`        | list of string  | the covered property tuple, e.g. `["name"]` or `["first","last"]` |
-| `indexProvider`     | string          | `range-1.0` / `token-lookup-1.0` / `fulltext-1.0` / `point-1.0` |
+| `indexProvider`     | string          | `range-1.0` / `text-1.0` / `token-lookup-1.0` / `fulltext-1.0` / `point-1.0` |
 | `owningConstraint`  | string or null  | the uniqueness/key constraint this index backs, else `null` |
 | `lastRead`          | null            | index-usage statistics are untracked |
 | `readCount`         | null            | index-usage statistics are untracked |
@@ -157,10 +157,10 @@ Neo4j accepts both `INDEX` and `INDEXES`; the singular is a full synonym everywh
 ```cypher
 SHOW ALL INDEXES        -- every kind (same as SHOW INDEXES)
 SHOW RANGE INDEXES      -- node / relationship / composite range indexes
+SHOW TEXT INDEXES       -- text (trigram) indexes
 SHOW POINT INDEXES      -- spatial (point) indexes
 SHOW FULLTEXT INDEXES   -- full-text indexes
 SHOW LOOKUP INDEXES     -- the two always-on token lookup indexes
-SHOW TEXT INDEXES       -- text indexes (none in Graphus: TEXT is a synonym of RANGE)
 SHOW VECTOR INDEXES     -- vector indexes (none yet; a later release)
 ```
 
@@ -179,6 +179,40 @@ config lives here), `failureMessage` (empty), and `createStatement` (a round-tri
 SHOW INDEXES YIELD name, type, state WHERE type = 'RANGE' RETURN name, state
 SHOW INDEXES YIELD *
 ```
+
+---
+
+## Text (trigram) index DDL
+
+A `TEXT` index is a **distinct native string index** — *not* a synonym of `RANGE` — that accelerates
+the `CONTAINS`, `ENDS WITH` and `STARTS WITH` predicates a forward-ordered B-tree cannot serve (a
+substring or suffix is not a contiguous key range). It covers **one node label and one string
+property**, is built **synchronously** (it is `ONLINE` as soon as `CREATE` returns), and supports the
+same idempotency / `OPTIONS` modifiers as the node-property index. A `RANGE` and a `TEXT` index may
+coexist on the same `(label, property)` (different kinds); when a `TEXT` index is present it also
+serves `STARTS WITH` (preferred over the range prefix seek).
+
+```cypher
+-- TEXT: the name is optional (auto-named text_index_<label>_<property>); IF NOT EXISTS / OPTIONS.
+CREATE TEXT INDEX ix_name IF NOT EXISTS FOR (p:Person) ON (p.name)
+CREATE TEXT INDEX FOR (p:Person) ON (p.bio)              -- anonymous → text_index_Person_bio
+DROP TEXT INDEX ix_name IF EXISTS
+```
+
+With the index in place, a substring / suffix / prefix filter is index-served (a candidate seek plus
+an exact re-check) instead of a full label scan:
+
+```cypher
+MATCH (p:Person) WHERE p.name CONTAINS 'obe'  RETURN p
+MATCH (p:Person) WHERE p.name ENDS WITH 'son' RETURN p
+```
+
+Internally the index stores the set of character **trigrams** (three-character windows, with
+head/tail sentinels so short strings, prefixes and suffixes work) of each value and intersects the
+needle's trigrams to produce a candidate superset; the exact predicate re-check makes the result
+identical to a scan. Matching is on raw Unicode scalar values (case-sensitive, no normalization),
+exactly like Cypher's `CONTAINS` / `STARTS WITH` / `ENDS WITH`. Relationship `TEXT` indexes are a
+follow-up.
 
 ---
 
@@ -207,16 +241,17 @@ DROP FULLTEXT INDEX ft IF EXISTS
 ```
 
 For full-text, `fulltext.analyzer` maps to the analyzer (`standard` / `keyword`);
-`fulltext.eventually_consistent` is accepted and ignored (Graphus builds are synchronous). A `POINT`
-or `FULLTEXT` index is also droppable by the unified `DROP INDEX <name>` form.
+`fulltext.eventually_consistent` is accepted and ignored (Graphus builds are synchronous). A `TEXT`,
+`POINT` or `FULLTEXT` index is also droppable by the unified `DROP INDEX <name>` form.
 
 ---
 
 ## Names are unique and durable
 
 - **Unique across the whole schema.** An index name may not collide with the name of any
-  other index (node-property, full-text, or point) *or* any constraint. A collision is
-  rejected with `Neo.ClientError.Schema.IndexWithNameAlreadyExists`.
+  other index (node-property, composite, relationship-property, text, full-text, or point)
+  *or* any constraint. A collision is rejected with
+  `Neo.ClientError.Schema.IndexWithNameAlreadyExists`.
 - **Durable.** A name is persisted and survives a restart, crash recovery, and backup/restore.
 - **Backfilled on upgrade.** An anonymous index created before named indexes existed is given
   its stable auto-name (`index_<label>_<property>`) the first time the store is opened, so it,

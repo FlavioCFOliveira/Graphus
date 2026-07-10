@@ -35,6 +35,7 @@ use graphus_index::bitmap::{self, BitmapIndex};
 use graphus_index::fulltext::{Analyzer, InvertedIndex, MatchSemantics};
 use graphus_index::recovery::SharedWal;
 use graphus_index::spatial::SpatialIndex;
+use graphus_index::text::TrigramIndex;
 use graphus_index::{BTree, CompositeIndex, PropertyIndex, RelPropertyIndex, TokenIndex};
 use graphus_io::MemBlockDevice;
 use graphus_storage::{ConstraintKind, ConstraintTypeDescriptor, IndexState};
@@ -111,6 +112,11 @@ pub struct IndexSet {
     /// carries the build state and the in-memory [`SpatialIndex`] grid over the covered point
     /// property. Ephemeral and rebuilt on open, exactly like the property and full-text indexes.
     spatial: HashMap<(u32, u32), SpatialEntry>,
+    /// Declared **text (trigram)** indexes (`rmp` task #662), keyed by `(label_token, prop_key)`. Each
+    /// value carries the build state and the in-memory [`TrigramIndex`] over the covered string
+    /// property, accelerating `CONTAINS` / `ENDS WITH` / `STARTS WITH`. Ephemeral and rebuilt on open,
+    /// exactly like the spatial index; only the *registration* is durable (the storage catalog).
+    text: HashMap<(u32, u32), TextEntry>,
     /// Declared **constraints** (`rmp` tasks #99, #100), keyed by their server-unique **name**. Each
     /// value is a [`ConstraintRule`] carrying the covered label token, the covered property tokens, the
     /// [`ConstraintKind`] and (for a property-type constraint) the declared type descriptor. Unlike the
@@ -279,6 +285,17 @@ struct SpatialEntry {
     index: SpatialIndex,
 }
 
+/// A declared text (trigram) index plus its build [`IndexState`] and the in-memory trigram index
+/// (`rmp` task #662). The `(label_token, prop_key)` key (the map key) mirrors the durable catalog
+/// entry; the trigram index is ephemeral (rebuilt from the store on open).
+struct TextEntry {
+    /// The build state, mirrored from the durable catalog. A `Populating` index is maintained but not
+    /// yet surfaced to the planner; a query still works against it (candidate-set contract).
+    state: IndexState,
+    /// The backing in-memory trigram inverted index over the covered string property.
+    index: TrigramIndex,
+}
+
 impl IndexSet {
     /// An empty index set: a single label [`TokenIndex`] (always present, auto-maintained) and no
     /// property indexes yet.
@@ -290,6 +307,7 @@ impl IndexSet {
             rel_props: HashMap::new(),
             fulltext: HashMap::new(),
             spatial: HashMap::new(),
+            text: HashMap::new(),
             constraints: HashMap::new(),
             composite: HashMap::new(),
             bitmap: HashMap::new(),
@@ -557,6 +575,11 @@ impl IndexSet {
         // Spatial indexes: clear the grid entries, keep the registration + state (`rmp` task #73).
         for sp in self.spatial.values_mut() {
             sp.index.clear();
+        }
+        // Text (trigram) indexes: clear the trigram entries, keep the registration + state
+        // (`rmp` task #662), exactly like the spatial index.
+        for tx in self.text.values_mut() {
+            tx.index.clear();
         }
         // Composite indexes (`rmp` task #100): recreate each backing tree to drop its entries while
         // keeping the registered `(label_token, property_tokens)` set, exactly like the property indexes.
@@ -1261,6 +1284,166 @@ impl IndexSet {
     ) -> Option<Vec<u64>> {
         let sp = self.spatial.get(&(label_token, prop_key))?;
         Some(sp.index.query_bbox(min_x, max_x, min_y, max_y))
+    }
+
+    // ============================================================================================
+    // Text (trigram) indexes (`rmp` task #662)
+    // ============================================================================================
+
+    /// Declares a text (trigram) index on `(label_token, prop_key)` at `state` (`rmp` task #662).
+    /// Idempotent on the key: if one is already registered its trigram index is kept but its state is
+    /// updated (so a recovered `Online` declaration promotes a freshly-created entry); otherwise a
+    /// fresh trigram index is created.
+    pub fn register_text(&mut self, label_token: u32, prop_key: u32, state: IndexState) {
+        self.text
+            .entry((label_token, prop_key))
+            .and_modify(|tx| tx.state = state)
+            .or_insert_with(|| TextEntry {
+                state,
+                index: TrigramIndex::new(),
+            });
+    }
+
+    /// Sets the build [`IndexState`] of the `(label_token, prop_key)` text index, e.g. promoting
+    /// `Populating` → `Online`. A no-op if no such index is registered.
+    pub fn set_text_state(&mut self, label_token: u32, prop_key: u32, state: IndexState) {
+        if let Some(tx) = self.text.get_mut(&(label_token, prop_key)) {
+            tx.state = state;
+        }
+    }
+
+    /// Unregisters the text index on `(label_token, prop_key)`, dropping its trigram index (`rmp` task
+    /// #662, `DROP INDEX`). A no-op if no such index is registered.
+    pub fn unregister_text(&mut self, label_token: u32, prop_key: u32) {
+        self.text.remove(&(label_token, prop_key));
+    }
+
+    /// Whether a text index is registered for `(label_token, prop_key)` (in any state).
+    #[must_use]
+    pub fn has_text(&self, label_token: u32, prop_key: u32) -> bool {
+        self.text.contains_key(&(label_token, prop_key))
+    }
+
+    /// The build [`IndexState`] of the `(label_token, prop_key)` text index, or [`None`] if
+    /// unregistered.
+    #[must_use]
+    pub fn text_state(&self, label_token: u32, prop_key: u32) -> Option<IndexState> {
+        self.text.get(&(label_token, prop_key)).map(|tx| tx.state)
+    }
+
+    /// The registered text index keys `(label_token, prop_key)` in any state, ascending. Used by the
+    /// coordinator's rebuild to know which string properties to (re-)index.
+    #[must_use]
+    pub fn registered_text(&self) -> Vec<(u32, u32)> {
+        let mut keys: Vec<(u32, u32)> = self.text.keys().copied().collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// The **`Online`** text index keys `(label_token, prop_key)`, ascending. Used to build the
+    /// planner's catalog: only an `Online` text index may serve a `CONTAINS`/`ENDS WITH`/`STARTS WITH`
+    /// seek.
+    #[must_use]
+    pub fn online_text(&self) -> Vec<(u32, u32)> {
+        let mut keys: Vec<(u32, u32)> = self
+            .text
+            .iter()
+            .filter(|(_, tx)| tx.state == IndexState::Online)
+            .map(|(&key, _)| key)
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// Records that node `node_id` has string `value` for the `(label_token, prop_key)` text index, if
+    /// such an index is registered (else a no-op). A non-string `value` removes the node from the index
+    /// (a text index covers strings only) — mirroring the spatial index's non-point handling. Maintained
+    /// regardless of state (a `Populating` index is kept up to date, harmlessly).
+    pub fn insert_text_value(
+        &mut self,
+        label_token: u32,
+        prop_key: u32,
+        value: &Value,
+        node_id: u64,
+    ) {
+        if let Some(tx) = self.text.get_mut(&(label_token, prop_key)) {
+            if let Value::String(s) = value {
+                tx.index.index_value(node_id, s);
+                // A value was (re)indexed: a real trigram change. Flag the freshness marker dirty so the
+                // statement seam records this writer as a full-text/spatial mutator (`rmp` task #467) —
+                // the text index rides the same cross-snapshot marker (it too keeps only latest state).
+                self.ft_spatial_dirty = true;
+            } else if tx.index.remove(node_id) {
+                // The property is no longer a string (e.g. an update changed its type) — drop the stale
+                // entry so a re-check never sees a phantom. Only a real removal flags dirty.
+                self.ft_spatial_dirty = true;
+            }
+        }
+    }
+
+    /// Removes `node_id` from the `(label_token, prop_key)` text index (a delete, a type change, or a
+    /// node that lost the covered label). A no-op if no such index is registered.
+    pub fn remove_text(&mut self, label_token: u32, prop_key: u32, node_id: u64) {
+        if let Some(tx) = self.text.get_mut(&(label_token, prop_key)) {
+            // Flag the freshness marker dirty only when a trigram entry actually existed and was removed
+            // (`remove` returns whether the node was present), so the per-write wholesale re-index's
+            // unconditional `remove_text` over UNcovered nodes does not needlessly force concurrent
+            // readers off the fast path (`rmp` task #467).
+            if tx.index.remove(node_id) {
+                self.ft_spatial_dirty = true;
+            }
+        }
+    }
+
+    /// Candidate node ids whose `(label_token, prop_key)` string may **contain** `needle`, ascending.
+    /// [`None`] when no such index is registered **or** `needle` is too short to narrow (the caller then
+    /// scans the label); otherwise a candidate **superset** (`rmp` task #662) the caller re-checks with
+    /// the exact `CONTAINS` predicate.
+    #[must_use]
+    pub fn seek_text_contains(
+        &self,
+        label_token: u32,
+        prop_key: u32,
+        needle: &str,
+    ) -> Option<Vec<u64>> {
+        self.text
+            .get(&(label_token, prop_key))?
+            .index
+            .query_contains(needle)
+    }
+
+    /// Candidate node ids whose `(label_token, prop_key)` string may **start with** `prefix`, ascending.
+    /// [`None`] when no such index is registered **or** `prefix` is too short to narrow; otherwise a
+    /// candidate **superset** (`rmp` task #662) the caller re-checks with the exact `STARTS WITH`
+    /// predicate.
+    #[must_use]
+    pub fn seek_text_starts_with(
+        &self,
+        label_token: u32,
+        prop_key: u32,
+        prefix: &str,
+    ) -> Option<Vec<u64>> {
+        self.text
+            .get(&(label_token, prop_key))?
+            .index
+            .query_starts_with(prefix)
+    }
+
+    /// Candidate node ids whose `(label_token, prop_key)` string may **end with** `suffix`, ascending.
+    /// [`None`] when no such index is registered **or** `suffix` is too short to narrow; otherwise a
+    /// candidate **superset** (`rmp` task #662) the caller re-checks with the exact `ENDS WITH`
+    /// predicate.
+    #[must_use]
+    pub fn seek_text_ends_with(
+        &self,
+        label_token: u32,
+        prop_key: u32,
+        suffix: &str,
+    ) -> Option<Vec<u64>> {
+        self.text
+            .get(&(label_token, prop_key))?
+            .index
+            .query_ends_with(suffix)
     }
 
     // ============================================================================================
@@ -2302,6 +2485,61 @@ mod tests {
         set.unregister_spatial(1, 5);
         assert!(!set.has_spatial(1, 5));
         assert!(set.registered_spatial().is_empty());
+    }
+
+    #[test]
+    fn text_register_insert_seek_and_maintenance() {
+        let mut set = IndexSet::new();
+        set.register_text(1, 5, IndexState::Online);
+        assert!(set.has_text(1, 5));
+        assert_eq!(set.text_state(1, 5), Some(IndexState::Online));
+
+        set.insert_text_value(1, 5, &s("database"), 100);
+        set.insert_text_value(1, 5, &s("warehouse"), 101);
+        // A non-string value is skipped (not indexed).
+        set.insert_text_value(1, 5, &Value::Integer(7), 102);
+
+        // CONTAINS / ENDS WITH / STARTS WITH candidate seeks.
+        assert_eq!(set.seek_text_contains(1, 5, "atab"), Some(vec![100]));
+        assert_eq!(set.seek_text_ends_with(1, 5, "house"), Some(vec![101]));
+        assert_eq!(set.seek_text_starts_with(1, 5, "data"), Some(vec![100]));
+        // The non-string node was never indexed.
+        assert!(!set.seek_text_contains(1, 5, "abas").unwrap().contains(&102));
+
+        // Update: 100's value changes → its old trigrams are gone (wholesale replace).
+        set.insert_text_value(1, 5, &s("archive"), 100);
+        assert_eq!(set.seek_text_contains(1, 5, "atab"), Some(Vec::new()));
+        assert_eq!(set.seek_text_contains(1, 5, "rchi"), Some(vec![100]));
+
+        // Delete 101.
+        set.remove_text(1, 5, 101);
+        assert_eq!(set.seek_text_ends_with(1, 5, "house"), Some(Vec::new()));
+
+        // A short needle → None (cannot narrow, the caller scans); no such index → None.
+        assert_eq!(set.seek_text_contains(1, 5, "ab"), None);
+        assert_eq!(set.seek_text_contains(9, 9, "abc"), None);
+    }
+
+    #[test]
+    fn text_state_gates_planner_exposure() {
+        let mut set = IndexSet::new();
+        set.register_text(1, 5, IndexState::Populating);
+        // Maintained while populating...
+        set.insert_text_value(1, 5, &s("database"), 100);
+        assert_eq!(set.seek_text_contains(1, 5, "atab"), Some(vec![100]));
+        // ...but not surfaced to the planner until Online.
+        assert_eq!(set.registered_text(), vec![(1, 5)]);
+        assert!(set.online_text().is_empty());
+        set.set_text_state(1, 5, IndexState::Online);
+        assert_eq!(set.online_text(), vec![(1, 5)]);
+        // Clear drops the entries but keeps the registration + state (like the other kinds).
+        set.clear();
+        assert!(set.has_text(1, 5));
+        assert_eq!(set.seek_text_contains(1, 5, "atab"), Some(Vec::new()));
+        // Drop removes it entirely.
+        set.unregister_text(1, 5);
+        assert!(!set.has_text(1, 5));
+        assert!(set.registered_text().is_empty());
     }
 
     #[test]
