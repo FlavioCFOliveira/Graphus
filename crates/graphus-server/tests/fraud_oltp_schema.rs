@@ -10,12 +10,15 @@
 //!
 //! - the new index & constraint kinds are declared and `Online` (`SHOW INDEXES` / `SHOW CONSTRAINTS`):
 //!   a relationship `RANGE` index on `TRANSFER.amount`, a `TEXT` index on `Customer.name`, the node
-//!   `RANGE` indexes, a `NODE KEY`, a node `UNIQUE`, and the two relationship constraints;
+//!   `RANGE` indexes, a `NODE KEY`, a node `UNIQUE`, a **`RELATIONSHIP KEY`** on `TRANSFER.tx_id`, and
+//!   the two relationship property constraints;
 //! - the **empirical planner utilisation** of the relationship `RANGE` index: Graphus serves an
 //!   *equality* predicate on a relationship property from it (a `RelIndexSeek`) but **not** a `>=`
 //!   range predicate (that stays a scan + filter) — asserted honestly on the real planner;
-//! - **constraint enforcement**: a duplicate `Account.id`, a null-`amount` `TRANSFER`, and a
-//!   non-integer `amount` `TRANSFER` are each rejected with the constraint-violation error class;
+//! - **constraint enforcement**: a duplicate `Account.id`, a null-`amount` `TRANSFER`, a non-integer
+//!   `amount` `TRANSFER`, a **duplicate** `TRANSFER.tx_id`, and a **missing** `TRANSFER.tx_id` are each
+//!   rejected with the constraint-violation error class (the `RELATIONSHIP KEY` enforces present +
+//!   unique on `tx_id`);
 //! - the **TEXT** index path: `WHERE c.name CONTAINS '…'` returns exactly the expected customers.
 //!
 //! Determining the substrate empirically (`rmp` #673 asked): `LocalEngine::run` does **not** accept
@@ -88,9 +91,9 @@ fn load_schema_first() -> (Eng, Dataset) {
     let (ddl, data): (Vec<String>, Vec<String>) =
         statements.into_iter().partition(|s| is_schema_ddl(s));
 
-    // At least the eight schema statements this example declares.
+    // At least the nine schema statements this example declares (5 constraints + 4 indexes).
     assert!(
-        ddl.len() >= 8,
+        ddl.len() >= 9,
         "expected the full schema DDL block, got {} statements: {ddl:?}",
         ddl.len()
     );
@@ -316,6 +319,21 @@ fn schema_first_load_declares_new_index_and_constraint_kinds() {
         Value::String("INTEGER".to_owned()),
         "the declared relationship property type is INTEGER (amount is an i64, never a FLOAT)"
     );
+
+    // The RELATIONSHIP KEY on TRANSFER.tx_id — a relationship-scoped key (present + unique), the
+    // relationship analogue of a NODE KEY. Its `type` renders `RELATIONSHIP_KEY`, its entity is the
+    // relationship, and it covers exactly `[tx_id]`.
+    let rel_key = row_by_name(&cons, "transfer_tx_id_key");
+    assert_eq!(
+        rel_key[ctype_c],
+        Value::String("RELATIONSHIP_KEY".to_owned()),
+        "TRANSFER.tx_id is a RELATIONSHIP KEY"
+    );
+    assert_eq!(rel_key[centity_c], Value::String("RELATIONSHIP".to_owned()));
+    assert_eq!(
+        rel_key[cprops_c],
+        Value::List(vec![Value::String("tx_id".to_owned())])
+    );
 }
 
 #[test]
@@ -437,32 +455,64 @@ fn schema_enforces_constraints_with_negative_writes() {
         "duplicate Account.id must be a constraint violation, got: {dup}"
     );
 
-    // Relationship existence: a TRANSFER without `amount` is rejected.
+    // Relationship existence: a TRANSFER without `amount` is rejected. It carries a valid, unique
+    // `tx_id` so this isolates the amount-existence constraint (not the RELATIONSHIP KEY below).
     let missing = expect_rejected(
         &mut eng,
-        "MATCH (a:Account {id: 0}), (b:Account {id: 1}) CREATE (a)-[:TRANSFER {ts: 1, device: 1, ip: '10.0.0.1'}]->(b)",
+        "MATCH (a:Account {id: 0}), (b:Account {id: 1}) CREATE (a)-[:TRANSFER {tx_id: 'TX-NEG-EXISTS', ts: 1, device: 1, ip: '10.0.0.1'}]->(b)",
     );
     assert!(
         missing.contains(CONSTRAINT_VIOLATION_PREFIX),
         "a null/missing TRANSFER.amount must be a constraint violation, got: {missing}"
     );
 
-    // Relationship property-type: a non-integer `amount` is rejected.
+    // Relationship property-type: a non-integer `amount` is rejected (again with a valid unique tx_id).
     let wrong_type = expect_rejected(
         &mut eng,
-        "MATCH (a:Account {id: 0}), (b:Account {id: 1}) CREATE (a)-[:TRANSFER {amount: 'lots', ts: 1, device: 1, ip: '10.0.0.1'}]->(b)",
+        "MATCH (a:Account {id: 0}), (b:Account {id: 1}) CREATE (a)-[:TRANSFER {tx_id: 'TX-NEG-TYPE', amount: 'lots', ts: 1, device: 1, ip: '10.0.0.1'}]->(b)",
     );
     assert!(
         wrong_type.contains(CONSTRAINT_VIOLATION_PREFIX),
         "a non-integer TRANSFER.amount must be a constraint violation, got: {wrong_type}"
     );
 
-    // The rejected writes rolled back — the account/transfer counts are unchanged from the load.
+    // RELATIONSHIP KEY (existence half): a TRANSFER without `tx_id` is rejected — the amount is valid,
+    // so only the key's present-requirement can trip.
+    let missing_tx = expect_rejected(
+        &mut eng,
+        "MATCH (a:Account {id: 0}), (b:Account {id: 1}) CREATE (a)-[:TRANSFER {amount: 5000, ts: 1, device: 1, ip: '10.0.0.1'}]->(b)",
+    );
+    assert!(
+        missing_tx.contains(CONSTRAINT_VIOLATION_PREFIX),
+        "a missing TRANSFER.tx_id must be a RELATIONSHIP KEY (existence) violation, got: {missing_tx}"
+    );
+
+    // RELATIONSHIP KEY (uniqueness half): a TRANSFER re-using an already-seeded `tx_id` is rejected.
+    // Derive a genuine existing id from the loaded dataset (its first transfer) so the clash is real.
+    let existing_tx = dataset.transfers[0].tx_id.clone();
+    let dup_tx = expect_rejected(
+        &mut eng,
+        &format!(
+            "MATCH (a:Account {{id: 0}}), (b:Account {{id: 1}}) CREATE (a)-[:TRANSFER {{tx_id: '{existing_tx}', amount: 5000, ts: 1, device: 1, ip: '10.0.0.1'}}]->(b)"
+        ),
+    );
+    assert!(
+        dup_tx.contains(CONSTRAINT_VIOLATION_PREFIX),
+        "a duplicate TRANSFER.tx_id must be a RELATIONSHIP KEY (uniqueness) violation, got: {dup_tx}"
+    );
+
+    // The rejected writes rolled back — the account AND transfer counts are unchanged from the load.
     let account_count = collect_ids(&mut eng, "MATCH (a:Account) RETURN count(a) AS id");
     assert_eq!(
         account_count,
         vec![dataset.accounts.len() as i64],
-        "the rejected duplicate created nothing"
+        "the rejected duplicate node created nothing"
+    );
+    let transfer_count = collect_ids(&mut eng, "MATCH ()-[t:TRANSFER]->() RETURN count(t) AS id");
+    assert_eq!(
+        transfer_count,
+        vec![dataset.transfers.len() as i64],
+        "the rejected TRANSFER writes created nothing"
     );
 }
 

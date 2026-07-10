@@ -92,11 +92,14 @@ function lcg(seed) {
             id: int(hot),
             v: int(cur + delta),
           });
-          // Also ingest a TRANSFER edge to make the write set realistic (a second hot node).
+          // Also ingest a TRANSFER edge to make the write set realistic (a second hot node). Every
+          // TRANSFER carries a globally-unique tx_id (the RELATIONSHIP KEY the schema declares): the
+          // (clientId, op) pair is unique across all writers, so committed edges never collide — the
+          // writes exercise genuine SSI contention, not constraint rejection.
           const other = (hot + 1) % HOT;
           await tx.run(
-            'MATCH (a:Hot {id: $a}), (b:Hot {id: $b}) CREATE (a)-[:TRANSFER {amount: $amt}]->(b)',
-            { a: int(hot), b: int(other), amt: int(delta) }
+            'MATCH (a:Hot {id: $a}), (b:Hot {id: $b}) CREATE (a)-[:TRANSFER {tx_id: $tx, amount: $amt}]->(b)',
+            { a: int(hot), b: int(other), amt: int(delta), tx: `CONC-${clientId}-${op}` }
           );
           await tx.commit();
           commits += 1;

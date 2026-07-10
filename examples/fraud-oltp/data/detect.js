@@ -249,8 +249,9 @@ RETURN s.id AS id ORDER BY volume DESC, id`;
     console.log(`name CONTAINS '${nameSubstr}': ${foundHolders.length} holders (matches expected — TEXT index path)`);
 
     // ---- Negative integrity tests: the schema must REJECT bad writes -----------------------------
-    // A duplicate Account.id (NODE KEY) and a null-amount TRANSFER (relationship existence) must both
-    // be rejected; the driver observes each rejection as a thrown error.
+    // A duplicate Account.id (NODE KEY), a null-amount TRANSFER (relationship existence), and both a
+    // duplicate and a missing TRANSFER.tx_id (RELATIONSHIP KEY = present + unique) must all be
+    // rejected; the driver observes each rejection as a thrown error.
     console.log('negative integrity tests (the schema must reject these):');
     await expectRejected(
       driver,
@@ -260,7 +261,21 @@ RETURN s.id AS id ORDER BY volume DESC, id`;
     await expectRejected(
       driver,
       'null-amount TRANSFER (relationship existence)',
-      "MATCH (a:Account {id: 0}), (b:Account {id: 1}) CREATE (a)-[:TRANSFER {ts: 1, device: 1, ip: '10.0.0.1'}]->(b)"
+      "MATCH (a:Account {id: 0}), (b:Account {id: 1}) CREATE (a)-[:TRANSFER {tx_id: 'TX-NEG-EXISTS', ts: 1, device: 1, ip: '10.0.0.1'}]->(b)"
+    );
+    // RELATIONSHIP KEY negatives. Fetch a real, already-loaded tx_id so the duplicate clash is genuine.
+    const anyTx = toNum(
+      (await runRecords(driver, 'MATCH ()-[t:TRANSFER]->() RETURN t.tx_id AS tx LIMIT 1'))[0].get('tx')
+    );
+    await expectRejected(
+      driver,
+      `duplicate TRANSFER.tx_id (RELATIONSHIP KEY, id='${anyTx}')`,
+      `MATCH (a:Account {id: 0}), (b:Account {id: 1}) CREATE (a)-[:TRANSFER {tx_id: '${anyTx}', amount: 5000, ts: 1, device: 1, ip: '10.0.0.1'}]->(b)`
+    );
+    await expectRejected(
+      driver,
+      'missing TRANSFER.tx_id (RELATIONSHIP KEY, present half)',
+      "MATCH (a:Account {id: 0}), (b:Account {id: 1}) CREATE (a)-[:TRANSFER {amount: 5000, ts: 1, device: 1, ip: '10.0.0.1'}]->(b)"
     );
 
     // ---- Schema evidence: capture SHOW INDEXES + SHOW CONSTRAINTS --------------------------------
@@ -306,6 +321,7 @@ RETURN s.id AS id ORDER BY volume DESC, id`;
     requireConstraint('account_id_key', 'NODE_KEY');
     requireConstraint('transfer_amount_exists', 'RELATIONSHIP_PROPERTY_EXISTENCE');
     requireConstraint('transfer_amount_integer', 'RELATIONSHIP_PROPERTY_TYPE');
+    requireConstraint('transfer_tx_id_key', 'RELATIONSHIP_KEY');
     console.log(
       `GRAPHUS_SCHEMA ${JSON.stringify({ indexes: idxRecords.length, constraints: consRecords.length })}`
     );

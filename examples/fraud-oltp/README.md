@@ -17,9 +17,9 @@ and it exits non-zero if any assertion fails.
 |---|------------|-----------------|
 | 1 | **Deterministic, seeded generation** | `graphus-fraud-gen` emits a byte-identical graph + ground truth per profile (fast / large). |
 | 2 | **Bolt-over-TCP + TLS** | Boots `graphus-server` with a self-signed cert; the official driver connects with `bolt+ssc://`. |
-| 3 | **Production-realistic schema (indexes + constraints)** | A `NODE KEY`, a node `UNIQUE`, two **relationship** constraints (`IS NOT NULL`, `IS :: INTEGER`) on `TRANSFER.amount`, node `RANGE` indexes, a **relationship `RANGE` index** on `TRANSFER.amount`, and a **`TEXT` index** on `Customer.name` — declared over Bolt, then exercised (`SHOW INDEXES` / `SHOW CONSTRAINTS`, enforcement, and the `CONTAINS` text path). |
+| 3 | **Production-realistic schema (indexes + constraints)** | A `NODE KEY`, a node `UNIQUE`, a **`RELATIONSHIP KEY`** on `TRANSFER.tx_id`, two **relationship** property constraints (`IS NOT NULL`, `IS :: INTEGER`) on `TRANSFER.amount`, node `RANGE` indexes, a **relationship `RANGE` index** on `TRANSFER.amount`, and a **`TEXT` index** on `Customer.name` — declared over Bolt, then exercised (`SHOW INDEXES` / `SHOW CONSTRAINTS`, enforcement, and the `CONTAINS` text path). |
 | 4 | **Schema DDL + bulk load + detection** | Over Bolt via the official `neo4j-driver`; asserts the detection finds **exactly** the planted fraud (0 FP, 0 FN). |
-| 5 | **Constraint enforcement (negative tests)** | The driver observes that a duplicate `Account.id` and a null-`amount` `TRANSFER` are both **rejected** (fails loudly if either is accepted). |
+| 5 | **Constraint enforcement (negative tests)** | The driver observes that a duplicate `Account.id`, a null-`amount` `TRANSFER`, and both a duplicate and a missing `TRANSFER.tx_id` (the `RELATIONSHIP KEY`) are all **rejected** (fails loudly if any is accepted). |
 | 6 | **Extreme-concurrency SSI** | Overlapping writer/reader transactions on hot accounts; reports commit/abort tallies; proves **no lost update**. |
 | 7 | **Standardized performance evidence** | Meters the live server (CPU/RSS), the on-disk store/WAL footprint, throughput + latency percentiles + abort rate → `report.json` + `report.md` + a `schema.txt` listing; gates a fresh run against a committed baseline. |
 | 8 | **Deterministic SSI repro** | The in-process `dst_contention` binary reproduces the contention byte-identically for a fixed seed (the DST discipline). |
@@ -31,7 +31,7 @@ and it exits non-zero if any assertion fails.
 | `(:Customer {id, name, country})` | the account holder; **`id` is `UNIQUE`**, **`name` has a `TEXT` index** |
 | `(:Account {id, holder, balance, risk_score, opened_ts, country})` | a financial account; **`id` is a `NODE KEY`** (present + unique) |
 | `(:Customer)-[:OWNS]->(:Account)` | ownership |
-| `(:Account)-[:TRANSFER {amount, ts, device, ip}]->(:Account)` | a money transfer (the edge detection traverses); **`amount` is `NOT NULL` + `IS :: INTEGER` + `RANGE`-indexed** |
+| `(:Account)-[:TRANSFER {tx_id, amount, ts, device, ip}]->(:Account)` | a money transfer (the edge detection traverses); **`tx_id` is a `RELATIONSHIP KEY`** (present + unique — every transfer has a globally-unique id), **`amount` is `NOT NULL` + `IS :: INTEGER` + `RANGE`-indexed** |
 
 ### Injected ground truth
 
@@ -63,6 +63,8 @@ CREATE CONSTRAINT customer_id_unique    FOR (c:Customer) REQUIRE c.id IS UNIQUE;
 -- Relationship constraints on the money: every TRANSFER must carry an INTEGER amount.
 CREATE CONSTRAINT transfer_amount_exists  FOR ()-[t:TRANSFER]-() REQUIRE t.amount IS NOT NULL;
 CREATE CONSTRAINT transfer_amount_integer FOR ()-[t:TRANSFER]-() REQUIRE t.amount IS :: INTEGER;
+-- Every money transfer carries a globally-unique id — a RELATIONSHIP KEY (present + unique) on tx_id.
+CREATE CONSTRAINT transfer_tx_id_key      FOR ()-[t:TRANSFER]-() REQUIRE t.tx_id IS RELATIONSHIP KEY;
 -- Node RANGE indexes on the properties the risk model filters / sorts on.
 CREATE INDEX account_risk_score_range   FOR (a:Account)  ON (a.risk_score);
 CREATE INDEX customer_country_range     FOR (c:Customer) ON (c.country);
@@ -123,16 +125,18 @@ After detection, the official-driver path (`data/detect.js`) also exercises the 
   c.id`. Customer ids are `0..acctCount-1` (one holder per account), so the expected match set is
   derived deterministically and asserted exactly (it demonstrates substring matching, not equality).
 - **Negative integrity tests** — the driver attempts a **duplicate `Account.id`** (rejected by the
-  `NODE KEY`) and a **null-`amount` `TRANSFER`** (rejected by the relationship existence constraint),
-  and fails loudly if either is *accepted*. Each rejection surfaces as
-  `Neo.ClientError.Schema.ConstraintValidationFailed` on the wire.
+  `NODE KEY`), a **null-`amount` `TRANSFER`** (rejected by the relationship existence constraint), a
+  **duplicate `TRANSFER.tx_id`** and a **missing `TRANSFER.tx_id`** (both rejected by the
+  `RELATIONSHIP KEY` — its unique and present halves), and fails loudly if any is *accepted*. Each
+  rejection surfaces as `Neo.ClientError.Schema.ConstraintValidationFailed` on the wire.
 - **Schema evidence** — it captures `SHOW INDEXES` and `SHOW CONSTRAINTS` and writes the listing to
   `evidence/schema.txt`, asserting the relationship `RANGE` index, the `TEXT` index, the `NODE KEY`,
   and the two relationship constraints are all declared.
 
 The hermetic cargo mirror `crates/graphus-server/tests/fraud_oltp_schema.rs` asserts the same things
-in-process (plus a third negative — a non-integer `amount`, rejected by the `IS :: INTEGER`
-constraint — and the empirical planner utilisation of the relationship RANGE index).
+in-process (plus a non-integer `amount` rejected by the `IS :: INTEGER` constraint, the `RELATIONSHIP
+KEY` present + unique halves on `tx_id`, and the empirical planner utilisation of the relationship
+RANGE index).
 
 ## Running it
 
@@ -233,9 +237,10 @@ in the default test run (no Bolt, no Node, no network — both in-process via `L
 - `crates/graphus-server/tests/fraud_oltp_schema.rs` — the **schema mirror** (`rmp` #673): drives the
   generator's DDL block through the real admin path (`parse_admin_statement` →
   `LocalEngine::{index_ddl, constraint_ddl}`), loads the graph **schema-first**, and asserts the new
-  index/constraint kinds are `ONLINE` (`SHOW INDEXES` / `SHOW CONSTRAINTS`), constraint enforcement
-  (duplicate id, null amount, non-integer amount all rejected), the empirical rel-index utilisation
-  (equality served, range not), and the `TEXT` `CONTAINS` path.
+  index/constraint kinds are `ONLINE` (`SHOW INDEXES` / `SHOW CONSTRAINTS`, including the `RELATIONSHIP
+  KEY` on `TRANSFER.tx_id`), constraint enforcement (duplicate id, null amount, non-integer amount,
+  duplicate tx_id, missing tx_id all rejected), the empirical rel-index utilisation (equality served,
+  range not), and the `TEXT` `CONTAINS` path.
 
 The official-driver E2E stays feature-gated (`RUN_DRIVER` for the shell, `neo4j-interop` for the Rust
 interop test).

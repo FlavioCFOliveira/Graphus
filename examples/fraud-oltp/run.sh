@@ -305,12 +305,12 @@ EOF
   SCHEMA_CONSTRAINTS="$(json_field "$SCHEMA_STATS" constraints)"
   assert "schema evidence (SHOW INDEXES/CONSTRAINTS) captured" "yes" \
     "$([ -s "$SCHEMA_EVIDENCE_FILE" ] && echo yes || echo no)"
-  # 6 indexes (2 always-on LOOKUP + 2 node RANGE + 1 rel RANGE + 1 TEXT); 4 constraints (NODE KEY,
-  # node UNIQUE, rel existence, rel property-type). `>=` keeps the gate robust to future additions.
+  # 6 indexes (2 always-on LOOKUP + 2 node RANGE + 1 rel RANGE + 1 TEXT); 5 constraints (NODE KEY,
+  # node UNIQUE, rel existence, rel property-type, rel KEY). `>=` keeps the gate robust to additions.
   assert "SHOW INDEXES lists the declared index kinds" "yes" \
     "$([ "${SCHEMA_INDEXES:-0}" -ge 6 ] 2>/dev/null && echo yes || echo no)"
   assert "SHOW CONSTRAINTS lists the declared constraint kinds" "yes" \
-    "$([ "${SCHEMA_CONSTRAINTS:-0}" -ge 4 ] 2>/dev/null && echo yes || echo no)"
+    "$([ "${SCHEMA_CONSTRAINTS:-0}" -ge 5 ] 2>/dev/null && echo yes || echo no)"
 
   # ------------------------------------------------------------------------------------------------
   # Step 4 — extreme-concurrency SSI driver

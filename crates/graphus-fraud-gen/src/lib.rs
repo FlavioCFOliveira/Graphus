@@ -19,9 +19,12 @@
 //! - `(:Account {id, holder, balance, risk_score, opened_ts, country})` — a financial account, whose
 //!   `id` is a **`NODE KEY`** (present + unique; the workload declares the constraint on it).
 //! - `(:Customer)-[:OWNS]->(:Account)` — ownership.
-//! - `(:Account)-[:TRANSFER {amount, ts, device, ip}]->(:Account)` — a money transfer, the edge the
-//!   detection traverses. `amount` carries an **`IS NOT NULL`** and an **`IS :: INTEGER`**
-//!   relationship constraint and a **relationship `RANGE` index** (the detection queries filter on it).
+//! - `(:Account)-[:TRANSFER {tx_id, amount, ts, device, ip}]->(:Account)` — a money transfer, the
+//!   edge the detection traverses. `tx_id` is a **globally-unique, deterministic** transaction id and
+//!   carries a **`RELATIONSHIP KEY`** constraint (present + unique — every money transfer has a unique
+//!   id, the relationship analogue of a primary key). `amount` carries an **`IS NOT NULL`** and an
+//!   **`IS :: INTEGER`** relationship constraint and a **relationship `RANGE` index** (the detection
+//!   queries filter on it).
 //!
 //! # Injected ground truth
 //!
@@ -205,6 +208,11 @@ pub struct Transfer {
     pub from: i64,
     /// Destination account id.
     pub to: i64,
+    /// Globally-unique, deterministic transaction id, formatted `TX-<zero-padded ordinal>`. The
+    /// workload declares a **`RELATIONSHIP KEY`** constraint on it (present + unique): every money
+    /// transfer carries a unique id — the relationship analogue of a primary key. Unique across **all**
+    /// transfers in a dataset and byte-identical per seed (the ordinal is the transfer's mint order).
+    pub tx_id: String,
     /// Transfer amount in whole currency units.
     pub amount: i64,
     /// Transfer timestamp (epoch seconds; deterministic).
@@ -325,9 +333,13 @@ pub fn generate(config: GenConfig, profile: &str) -> Dataset {
     }
     let legit_end = next_id; // [legit_start, legit_end)
 
-    // A deterministic transfer minter (free function so it does not capture rng).
+    // A deterministic transfer minter (free function so it does not capture rng). `tx_ordinal` is a
+    // monotonic per-transfer counter it consumes and advances, so every minted transfer gets a
+    // distinct `TX-<ordinal>` id in mint order — globally unique across the whole dataset and stable
+    // per seed. Zero-padded to 12 digits so the id sorts lexicographically in numeric order.
     fn mint_transfer(
         rng: &mut SplitMix64,
+        tx_ordinal: &mut u64,
         from: i64,
         to: i64,
         base_ts: i64,
@@ -341,15 +353,23 @@ pub fn generate(config: GenConfig, profile: &str) -> Dataset {
             rng.below(256),
             rng.below(256)
         );
+        let tx_id = format!("TX-{:012}", *tx_ordinal);
+        *tx_ordinal += 1;
         Transfer {
             from,
             to,
+            tx_id,
             amount,
             ts,
             device,
             ip,
         }
     }
+
+    // The transaction-id allocator: incremented once per minted transfer, in benign → ring → mule
+    // order (which is exactly the order transfers are appended below), so the ids are `TX-0…`, `TX-1…`,
+    // … contiguous and unique.
+    let mut tx_ordinal: u64 = 0;
 
     // 2a. Plant rings/cycles. Each ring mints `ring_len` fresh fraud accounts and a closed cycle of
     //     TRANSFER edges among them.
@@ -460,7 +480,14 @@ pub fn generate(config: GenConfig, profile: &str) -> Dataset {
                 to = legit_start + ((from - legit_start + 1) % span as i64);
             }
             let amount = rng.range_i64(1, 900); // benign: under the fraud amount floor
-            transfers.push(mint_transfer(&mut rng, from, to, base_ts, amount));
+            transfers.push(mint_transfer(
+                &mut rng,
+                &mut tx_ordinal,
+                from,
+                to,
+                base_ts,
+                amount,
+            ));
         }
     }
 
@@ -471,7 +498,14 @@ pub fn generate(config: GenConfig, profile: &str) -> Dataset {
             let from = ring.accounts[i];
             let to = ring.accounts[(i + 1) % n];
             let amount = rng.range_i64(9_000, 50_000); // fraud: above the amount floor
-            transfers.push(mint_transfer(&mut rng, from, to, base_ts, amount));
+            transfers.push(mint_transfer(
+                &mut rng,
+                &mut tx_ordinal,
+                from,
+                to,
+                base_ts,
+                amount,
+            ));
         }
     }
 
@@ -479,11 +513,25 @@ pub fn generate(config: GenConfig, profile: &str) -> Dataset {
     for chain in &mules {
         for &src in &chain.sources {
             let amount = rng.range_i64(2_000, 20_000);
-            transfers.push(mint_transfer(&mut rng, src, chain.mule, base_ts, amount));
+            transfers.push(mint_transfer(
+                &mut rng,
+                &mut tx_ordinal,
+                src,
+                chain.mule,
+                base_ts,
+                amount,
+            ));
         }
         for &dst in &chain.destinations {
             let amount = rng.range_i64(2_000, 20_000);
-            transfers.push(mint_transfer(&mut rng, chain.mule, dst, base_ts, amount));
+            transfers.push(mint_transfer(
+                &mut rng,
+                &mut tx_ordinal,
+                chain.mule,
+                dst,
+                base_ts,
+                amount,
+            ));
         }
     }
 
@@ -547,6 +595,12 @@ impl Dataset {
         s.push_str(
             "CREATE CONSTRAINT transfer_amount_integer FOR ()-[t:TRANSFER]-() REQUIRE t.amount IS :: INTEGER;\n",
         );
+        // Every money transfer carries a globally-unique transaction id — a RELATIONSHIP KEY
+        // (present + unique) on TRANSFER.tx_id, the relationship analogue of a primary key. A missing
+        // or duplicate tx_id is rejected at write time (verified in `fraud_oltp_schema.rs`).
+        s.push_str(
+            "CREATE CONSTRAINT transfer_tx_id_key FOR ()-[t:TRANSFER]-() REQUIRE t.tx_id IS RELATIONSHIP KEY;\n",
+        );
         // Node RANGE indexes on the properties the risk model filters / sorts on.
         s.push_str("CREATE INDEX account_risk_score_range FOR (a:Account) ON (a.risk_score);\n");
         s.push_str("CREATE INDEX customer_country_range FOR (c:Customer) ON (c.country);\n");
@@ -593,9 +647,10 @@ impl Dataset {
         for t in &self.transfers {
             let _ = writeln!(
                 s,
-                "MATCH (a:Account {{id: {from}}}), (b:Account {{id: {to}}}) CREATE (a)-[:TRANSFER {{amount: {amount}, ts: {ts}, device: {device}, ip: '{ip}'}}]->(b);",
+                "MATCH (a:Account {{id: {from}}}), (b:Account {{id: {to}}}) CREATE (a)-[:TRANSFER {{tx_id: '{tx_id}', amount: {amount}, ts: {ts}, device: {device}, ip: '{ip}'}}]->(b);",
                 from = t.from,
                 to = t.to,
+                tx_id = t.tx_id,
                 amount = t.amount,
                 ts = t.ts,
                 device = t.device,
@@ -681,6 +736,59 @@ mod tests {
         for &f in &gt.fraud_accounts {
             assert!(ids.contains(&f), "fraud account {f} missing from node set");
         }
+    }
+
+    #[test]
+    fn tx_ids_are_globally_unique_and_present() {
+        // The RELATIONSHIP KEY on TRANSFER.tx_id requires every transfer to carry a present, unique id.
+        // Assert the generator honours that invariant on both profiles, so a schema-first load succeeds.
+        for profile in [Profile::Fast, Profile::Large] {
+            let d = generate(profile.config(), profile.name());
+            let mut ids: Vec<&str> = d.transfers.iter().map(|t| t.tx_id.as_str()).collect();
+            for t in &d.transfers {
+                assert!(!t.tx_id.is_empty(), "{}: a tx_id is empty", profile.name());
+            }
+            let total = ids.len();
+            ids.sort_unstable();
+            ids.dedup();
+            assert_eq!(
+                ids.len(),
+                total,
+                "{}: tx_ids must be globally unique across all {total} transfers",
+                profile.name()
+            );
+        }
+    }
+
+    #[test]
+    fn tx_ids_render_into_the_transfer_edges() {
+        // The tx_id must reach the emitted Cypher (the RELATIONSHIP KEY has nothing to enforce
+        // otherwise). Every TRANSFER CREATE carries a `tx_id: '…'` literal.
+        let d = generate(Profile::Fast.config(), "fast");
+        let cypher = d.to_cypher();
+        let transfer_lines = cypher
+            .lines()
+            .filter(|l| l.contains("[:TRANSFER {"))
+            .count();
+        assert_eq!(
+            transfer_lines,
+            d.transfers.len(),
+            "one TRANSFER CREATE per transfer"
+        );
+        for t in &d.transfers {
+            assert!(
+                cypher.contains(&format!("tx_id: '{}'", t.tx_id)),
+                "the TRANSFER render must carry tx_id {}",
+                t.tx_id
+            );
+        }
+        // And the RELATIONSHIP KEY DDL is declared in the schema block.
+        assert!(
+            cypher.contains(
+                "CREATE CONSTRAINT transfer_tx_id_key FOR ()-[t:TRANSFER]-() REQUIRE t.tx_id IS RELATIONSHIP KEY"
+            ),
+            "the schema block must declare the RELATIONSHIP KEY on TRANSFER.tx_id"
+        );
     }
 
     #[test]
