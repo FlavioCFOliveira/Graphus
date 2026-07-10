@@ -95,7 +95,7 @@ pub use incremental::{
 };
 pub use labels::{LabelError, MAX_INLINE_LABEL_ID, OVERFLOW_BIT};
 pub use meta::{
-    CompositeIndexEntry, ConstraintEntry, ConstraintKind, ConstraintTypeDescriptor,
+    CompositeIndexEntry, ConstraintEntry, ConstraintKind, ConstraintTypeDescriptor, FulltextEntity,
     FulltextIndexEntry, IndexState, Meta, SpatialIndexEntry, Statistics, StoreMeta, TextIndexEntry,
 };
 pub use propenc::{

@@ -2605,7 +2605,8 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
         }
         IndexCommand::CreateFulltextIndex {
             name,
-            label,
+            entity,
+            labels_or_types,
             properties,
             analyzer,
             if_not_exists,
@@ -2618,14 +2619,26 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
                 ))
             })?;
             // `mutated == false` is an idempotent `IF NOT EXISTS` no-op → the seam reports 0 added;
-            // otherwise a create (a re-declare replaces) mutates → 1 added (`rmp` tasks #72, #661).
-            let mutated = coordinator.create_fulltext_index(
-                name,
-                label,
-                properties,
-                analyzer,
-                *if_not_exists,
-            )?;
+            // otherwise a create (a re-declare replaces) mutates → 1 added (`rmp` tasks #72, #661, #663).
+            // Route by entity: a node index builds non-blockingly; a relationship index builds
+            // synchronously (`rmp` #663).
+            let mutated = if entity.is_relationship() {
+                coordinator.create_fulltext_rel_index(
+                    name,
+                    labels_or_types,
+                    properties,
+                    analyzer,
+                    *if_not_exists,
+                )?
+            } else {
+                coordinator.create_fulltext_index(
+                    name,
+                    labels_or_types,
+                    properties,
+                    analyzer,
+                    *if_not_exists,
+                )?
+            };
             Ok(IndexDdlReply::mutation(mutated))
         }
         IndexCommand::DropFulltextIndex { name, if_exists } => {

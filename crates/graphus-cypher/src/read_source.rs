@@ -140,6 +140,11 @@ pub trait StoreReadSource {
     /// The slot-occupied node ids in `1..high_water`, ascending.
     fn scan_node_ids(&self) -> Result<Vec<u64>, GraphusError>;
 
+    /// The slot-occupied relationship ids in `1..high_water`, ascending (`rmp` task #663) — the rel
+    /// analogue of [`scan_node_ids`](Self::scan_node_ids), used by the off-thread relationship full-text
+    /// scan fallback.
+    fn scan_rel_ids(&self) -> Result<Vec<u64>, GraphusError>;
+
     /// The `Label`-namespace token ids of node `id`'s labels, ascending.
     fn node_labels(&self, id: u64) -> Result<Vec<u32>, GraphusError>;
 
@@ -197,6 +202,9 @@ impl<D: BlockDevice, S: LogSink> StoreReadSource for LiveSource<'_, D, S> {
     fn scan_node_ids(&self) -> Result<Vec<u64>, GraphusError> {
         self.0.scan_node_ids()
     }
+    fn scan_rel_ids(&self) -> Result<Vec<u64>, GraphusError> {
+        self.0.scan_rel_ids()
+    }
     fn node_labels(&self, id: u64) -> Result<Vec<u32>, GraphusError> {
         self.0.node_labels(id)
     }
@@ -253,6 +261,9 @@ impl<D: BlockDevice, S: LogSink> StoreReadSource for ReadViewSource<'_, D, S> {
     }
     fn scan_node_ids(&self) -> Result<Vec<u64>, GraphusError> {
         self.view.scan_node_ids()
+    }
+    fn scan_rel_ids(&self) -> Result<Vec<u64>, GraphusError> {
+        self.view.scan_rel_ids()
     }
     fn node_labels(&self, id: u64) -> Result<Vec<u32>, GraphusError> {
         self.view.node_labels(id)
@@ -468,6 +479,49 @@ pub fn filter_label_candidates<S: StoreReadSource, K: ReadSink>(
                 sink.capture(e);
                 return Vec::new();
             }
+        }
+    }
+    out
+}
+
+/// Filters `ids` to the nodes that **currently** carry **any** of `token_ids` and are **visible**,
+/// SIREAD-marking each examined id exactly once (`rmp` task #663) — the multi-label generalisation of
+/// [`filter_label_candidates`] for a multi-label full-text index. An empty `token_ids` keeps nothing.
+/// On a storage fault / overflow-form bitmap the error is captured and an empty result returned.
+pub fn filter_any_label_candidates<S: StoreReadSource, K: ReadSink>(
+    src: &S,
+    ctx: &VisCtx,
+    sink: &K,
+    token_ids: &[u32],
+    ids: Vec<u64>,
+) -> Vec<NodeId> {
+    let mut out = Vec::new();
+    for id in ids {
+        let visible = match src.node(id) {
+            Ok(rec) => ctx.visible(rec.mvcc),
+            Err(_) => continue,
+        };
+        // SIREAD-mark every examined node exactly once, visible or not.
+        sink.note_read(node_ssi_key(id));
+        if !visible {
+            continue;
+        }
+        let mut carries = false;
+        for &token_id in token_ids {
+            match src.node_has_label(id, token_id) {
+                Ok(true) => {
+                    carries = true;
+                    break;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    sink.capture(e);
+                    return Vec::new();
+                }
+            }
+        }
+        if carries {
+            out.push(NodeId(id));
         }
     }
     out
@@ -1053,72 +1107,123 @@ pub fn node_property<S: StoreReadSource, K: ReadSink>(
 // Full-text off-thread support (`rmp` task #546)
 // =================================================================================================
 
-/// The covered target of one declared full-text index: the label token, the covered property-key
-/// tokens (in declared order), and the analyzer (`rmp` task #546). Mirrors the tuple
-/// `IndexSet::fulltext_target` returns, but owned + `Send + Sync` so it can be captured into the
-/// off-thread [`ReadTaskInputs`](crate::coordinator::ReadTaskInputs).
+/// The covered target of one declared (node) full-text index: the covered label tokens, the covered
+/// property-key tokens (in declared order), and the analyzer (`rmp` tasks #546, #663). Mirrors the
+/// tuple `IndexSet::fulltext_target` returns, but owned + `Send + Sync` so it can be captured into the
+/// off-thread [`ReadTaskInputs`](crate::coordinator::ReadTaskInputs). A multi-label index carries every
+/// covered label token; a node with **any** of them is a candidate.
 #[derive(Debug, Clone)]
 pub struct FulltextTarget {
-    /// The `Label`-namespace token the index covers.
-    pub label_token: u32,
+    /// The `Label`-namespace tokens the index covers (one or more, `rmp` #663). A node carrying **any**
+    /// of these labels is a candidate.
+    pub label_tokens: Vec<u32>,
     /// The covered `PropKey`-namespace tokens, in the index's declared property order.
     pub prop_keys: Vec<u32>,
     /// The analyzer applied at index and query time.
     pub analyzer: Analyzer,
 }
 
-/// An owned, `Send + Sync` snapshot of the coordinator's declared full-text indexes (`rmp` task #546),
-/// keyed by index name — captured on the engine thread and moved into an off-thread read so a
-/// `CALL db.index.fulltext.queryNodes(name, …)` resolves the index by name without touching the
-/// coordinator's `!Send` [`IndexSet`](crate::index_set::IndexSet).
+/// The covered target of one declared **relationship** full-text index (`rmp` task #663): the covered
+/// relationship-type tokens, the covered property-key tokens (in declared order), and the analyzer —
+/// the relationship analogue of [`FulltextTarget`], owned + `Send + Sync` for the off-thread read.
+#[derive(Debug, Clone)]
+pub struct FulltextRelTarget {
+    /// The `RelType`-namespace tokens the index covers (one or more). A relationship of **any** covered
+    /// type is a candidate.
+    pub type_tokens: Vec<u32>,
+    /// The covered `PropKey`-namespace tokens, in the index's declared property order.
+    pub prop_keys: Vec<u32>,
+    /// The analyzer applied at index and query time.
+    pub analyzer: Analyzer,
+}
+
+/// An owned, `Send + Sync` snapshot of the coordinator's declared full-text indexes (`rmp` tasks #546,
+/// #663), keyed by index name — captured on the engine thread and moved into an off-thread read so a
+/// `CALL db.index.fulltext.queryNodes(name, …)` / `…queryRelationships(name, …)` resolves the index by
+/// name without touching the coordinator's `!Send` [`IndexSet`](crate::index_set::IndexSet).
 ///
-/// It carries the index **catalogue** (name → covered `(label, props, analyzer)`), **not** the
+/// It carries the index **catalogue** (name → covered `(labels/types, props, analyzer)`), **not** the
 /// inverted-index postings: the off-thread full-text query recomputes its matches directly from the
-/// reader's MVCC snapshot (a snapshot-correct full scan — [`fulltext_scan_fallback`]), so it never
-/// depends on the ephemeral postings and is immune to the cross-snapshot staleness `rmp` #467 guards
-/// against. The catalogue is small (one entry per declared index) and usually empty, so capturing it
-/// per read is negligible.
+/// reader's MVCC snapshot (a snapshot-correct full scan — [`fulltext_scan_fallback`] /
+/// [`fulltext_rel_scan_fallback`]), so it never depends on the ephemeral postings and is immune to the
+/// cross-snapshot staleness `rmp` #467 guards against. The catalogue is small (one entry per declared
+/// index) and usually empty, so capturing it per read is negligible.
 #[derive(Debug, Clone, Default)]
 pub struct FulltextReadSnapshot {
     targets: HashMap<String, FulltextTarget>,
+    rel_targets: HashMap<String, FulltextRelTarget>,
 }
 
 impl FulltextReadSnapshot {
-    /// Builds a snapshot from `(name, (label_token, prop_keys, analyzer))` tuples — exactly what
-    /// `IndexSet::fulltext_target` yields per registered index name.
+    /// Builds a snapshot from `(name, (label_tokens, prop_keys, analyzer))` **node** tuples — exactly
+    /// what `IndexSet::fulltext_target` yields per registered node index name (`rmp` tasks #546, #663).
+    /// Chain [`with_rel_targets`](Self::with_rel_targets) to add the relationship indexes.
     #[must_use]
     pub fn from_targets(
-        entries: impl IntoIterator<Item = (String, (u32, Vec<u32>, Analyzer))>,
+        entries: impl IntoIterator<Item = (String, (Vec<u32>, Vec<u32>, Analyzer))>,
     ) -> Self {
         Self {
             targets: entries
                 .into_iter()
-                .map(|(name, (label_token, prop_keys, analyzer))| {
+                .map(|(name, (label_tokens, prop_keys, analyzer))| {
                     (
                         name,
                         FulltextTarget {
-                            label_token,
+                            label_tokens,
                             prop_keys,
                             analyzer,
                         },
                     )
                 })
                 .collect(),
+            rel_targets: HashMap::new(),
         }
     }
 
-    /// The covered target of the full-text index named `name`, or `None` if no such index is declared
-    /// (the caller turns `None` into the "no such full-text index" procedure error — identical to the
-    /// inline `IndexSet::fulltext_target(name).is_none()` outcome).
+    /// Adds the **relationship** full-text targets from `(name, (type_tokens, prop_keys, analyzer))`
+    /// tuples — exactly what `IndexSet::fulltext_rel_target` yields per registered relationship index
+    /// name (`rmp` task #663).
+    #[must_use]
+    pub fn with_rel_targets(
+        mut self,
+        entries: impl IntoIterator<Item = (String, (Vec<u32>, Vec<u32>, Analyzer))>,
+    ) -> Self {
+        self.rel_targets = entries
+            .into_iter()
+            .map(|(name, (type_tokens, prop_keys, analyzer))| {
+                (
+                    name,
+                    FulltextRelTarget {
+                        type_tokens,
+                        prop_keys,
+                        analyzer,
+                    },
+                )
+            })
+            .collect();
+        self
+    }
+
+    /// The covered target of the **node** full-text index named `name`, or `None` if no such node index
+    /// is declared (the caller turns `None` into the "no such full-text index" procedure error —
+    /// identical to the inline `IndexSet::fulltext_target(name).is_none()` outcome).
     #[must_use]
     pub fn target(&self, name: &str) -> Option<&FulltextTarget> {
         self.targets.get(name)
     }
 
-    /// Whether no full-text index is declared (the common case — capture is then free).
+    /// The covered target of the **relationship** full-text index named `name`, or `None` if no such
+    /// relationship index is declared (`rmp` task #663).
+    #[must_use]
+    pub fn rel_target(&self, name: &str) -> Option<&FulltextRelTarget> {
+        self.rel_targets.get(name)
+    }
+
+    /// Whether no full-text index of either flavour is declared (the common case — capture is then
+    /// free).
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.targets.is_empty()
+        self.targets.is_empty() && self.rel_targets.is_empty()
     }
 }
 
@@ -1162,7 +1267,8 @@ pub fn fulltext_scan_fallback<S: StoreReadSource, K: ReadSink>(
             return Vec::new();
         }
     };
-    let labelled = filter_label_candidates(src, ctx, sink, target.label_token, all_ids);
+    // Multi-label (`rmp` #663): a node carrying **any** covered label is a candidate.
+    let labelled = filter_any_label_candidates(src, ctx, sink, &target.label_tokens, all_ids);
 
     // Resolve the covered prop-key tokens to names once. A token without a name was never interned and
     // cannot occur on any node, so it is skipped (contributes no terms).
@@ -1234,6 +1340,112 @@ pub fn fulltext_score_recompute<S: StoreReadSource, K: ReadSink>(
     }
     // Count each DISTINCT query term at most once, and only if the document has it (the
     // `InvertedIndex::score` contract).
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut score = 0u64;
+    for term in target.analyzer.analyze(search) {
+        if seen.insert(term.clone()) && doc_terms.contains(&term) {
+            score += 1;
+        }
+    }
+    score
+}
+
+/// The **snapshot-correct relationship full-text scan fallback**, lifted over a [`StoreReadSource`]
+/// (`rmp` task #663) so an off-thread [`ReadOnlyGraph`](crate::read_only_graph::ReadOnlyGraph) computes
+/// the same relationship full-text match set as the inline store-backed path — the relationship
+/// analogue of [`fulltext_scan_fallback`]. It marks every live relationship (the blanket SSI footprint
+/// the inline `rel_index_seek_eq` / relationship full-text path uses), then keeps each snapshot-visible
+/// relationship of a covered type whose covered STRING text shares at least one analyzed term with the
+/// analyzed `search` (the `Or` rule of [`InvertedIndex::query`](graphus_index::fulltext::InvertedIndex)).
+pub fn fulltext_rel_scan_fallback<S: StoreReadSource, K: ReadSink>(
+    src: &S,
+    ctx: &VisCtx,
+    sink: &K,
+    target: &FulltextRelTarget,
+    search: &str,
+) -> Vec<RelId> {
+    // SSI: mark every live relationship (blanket footprint), then examine each candidate via `rel_data`
+    // (which SIREAD-marks it), exactly as the inline path does.
+    let all_ids = match src.scan_rel_ids() {
+        Ok(ids) => ids,
+        Err(e) => {
+            sink.capture(e);
+            return Vec::new();
+        }
+    };
+    for id in &all_ids {
+        sink.note_read(rel_ssi_key(*id));
+    }
+
+    // Resolve the covered type + property names once (a never-interned token cannot occur on any rel).
+    let type_names: BTreeSet<String> = target
+        .type_tokens
+        .iter()
+        .filter_map(|tt| src.token_name(Namespace::RelType, *tt))
+        .collect();
+    let prop_names: Vec<String> = target
+        .prop_keys
+        .iter()
+        .filter_map(|pk| src.token_name(Namespace::PropKey, *pk))
+        .collect();
+
+    let search_terms: BTreeSet<String> = target.analyzer.analyze(search).into_iter().collect();
+    if search_terms.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out: Vec<RelId> = Vec::new();
+    for id in all_ids {
+        let rel = RelId(id);
+        // Visible + of a covered type? `rel_data` returns `None` for a not-visible relationship.
+        let Some(data) = rel_data(src, ctx, sink, rel) else {
+            continue;
+        };
+        if !type_names.contains(&data.rel_type) {
+            continue;
+        }
+        let mut matched = false;
+        'props: for name in &prop_names {
+            let Some(Value::String(text)) = rel_property(src, ctx, sink, rel, name) else {
+                continue;
+            };
+            for term in target.analyzer.analyze(&text) {
+                if search_terms.contains(&term) {
+                    matched = true;
+                    break 'props;
+                }
+            }
+        }
+        if matched {
+            out.push(rel);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The off-thread twin of `IndexSet::fulltext_rel_score` (`rmp` task #663): the best-effort relevance
+/// of relationship `rel` for `search` under `target`, recomputed from the relationship's
+/// snapshot-visible covered properties — the relationship analogue of [`fulltext_score_recompute`].
+#[must_use]
+pub fn fulltext_rel_score_recompute<S: StoreReadSource, K: ReadSink>(
+    src: &S,
+    ctx: &VisCtx,
+    sink: &K,
+    target: &FulltextRelTarget,
+    rel: RelId,
+    search: &str,
+) -> u64 {
+    let mut doc_terms: BTreeSet<String> = BTreeSet::new();
+    for pk in &target.prop_keys {
+        let Some(name) = src.token_name(Namespace::PropKey, *pk) else {
+            continue;
+        };
+        if let Some(Value::String(text)) = rel_property(src, ctx, sink, rel, &name) {
+            doc_terms.extend(target.analyzer.analyze(&text));
+        }
+    }
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut score = 0u64;
     for term in target.analyzer.analyze(search) {

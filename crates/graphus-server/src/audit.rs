@@ -1284,14 +1284,22 @@ pub fn redact_index_detail(cmd: &crate::engine::IndexCommand) -> String {
         // property keys and analyzer are all schema identifiers.
         I::CreateFulltextIndex {
             name,
-            label,
+            entity,
+            labels_or_types,
             properties,
             analyzer,
             if_not_exists,
         } => {
             let if_ne = if *if_not_exists { " IF NOT EXISTS" } else { "" };
+            let tokens = labels_or_types.join("|");
+            // Render the entity shape (`rmp` task #663): a node pattern or a relationship pattern.
+            let pattern = if entity.is_relationship() {
+                format!("()-[:{tokens}]-()")
+            } else {
+                format!("(:{tokens})")
+            };
             format!(
-                "CREATE FULLTEXT INDEX {name}{if_ne} FOR (:{label}) ON EACH [{}] (analyzer={analyzer})",
+                "CREATE FULLTEXT INDEX {name}{if_ne} FOR {pattern} ON EACH [{}] (analyzer={analyzer})",
                 properties.join(", ")
             )
         }

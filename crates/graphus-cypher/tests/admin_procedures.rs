@@ -126,15 +126,56 @@ fn void_admin_procedure_passes_driving_rows_through_unchanged() {
 }
 
 #[test]
-fn fulltext_query_relationships_errors_clearly_end_to_end() {
+fn fulltext_query_relationships_yields_structural_relationships_end_to_end() {
+    // `rmp` task #663: `queryRelationships` returns a structural RELATIONSHIP result column, driven
+    // through the whole plan → execute → materialize seam.
+    let mut g = MemGraph::new();
+    let a = g.add_node(["N"], [] as [(&str, Value); 0]);
+    let b = g.add_node(["N"], [] as [(&str, Value); 0]);
+    let r = g.add_rel("KNOWS", a, b, [("note", s("graph database"))]);
+    g.create_fulltext_rel_index(
+        "rel_ix",
+        ["KNOWS"],
+        ["note"],
+        graphus_cypher::Analyzer::Standard,
+    );
+
+    let rows = run(
+        "CALL db.index.fulltext.queryRelationships('rel_ix', 'database') YIELD relationship, score \
+         RETURN relationship, score",
+        &mut g,
+    );
+    assert_eq!(rows.len(), 1);
+    match &rows[0][0] {
+        MaterializedValue::Relationship(rel) => {
+            assert_eq!(rel.id, r.0);
+            assert_eq!(rel.rel_type, "KNOWS");
+            assert_eq!(rel.start, a.0);
+            assert_eq!(rel.end, b.0);
+        }
+        other => panic!("expected a structural relationship, got {other:?}"),
+    }
+    match &rows[0][1] {
+        MaterializedValue::Value(Value::Float(f)) => assert!(*f >= 1.0),
+        other => panic!("expected a float score, got {other:?}"),
+    }
+}
+
+#[test]
+fn fulltext_query_relationships_unknown_index_is_a_clear_error() {
+    // An unknown relationship-index name (or a *node* index name given here) is a clear error.
     let mut g = MemGraph::new();
     let err = run_expect_err(
-        "CALL db.index.fulltext.queryRelationships('rel_ix', 'query') YIELD relationship, score \
+        "CALL db.index.fulltext.queryRelationships('nope', 'query') YIELD relationship, score \
          RETURN relationship, score",
         &mut g,
     );
     assert!(
-        err.contains("nodes only") && err.contains("queryNodes"),
-        "error should explain node-only full-text support, got: {err}"
+        err.contains("nope") && err.contains("relationship full-text index"),
+        "error should name the missing relationship full-text index, got: {err}"
     );
+}
+
+fn s(v: &str) -> Value {
+    Value::String(v.to_owned())
 }

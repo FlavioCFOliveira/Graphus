@@ -191,16 +191,20 @@ pub enum IndexCommand {
         /// The raw `YIELD …` / `WHERE …` tail, or [`None`] for a bare listing.
         tail: Option<String>,
     },
-    /// `CREATE FULLTEXT INDEX <name> [IF NOT EXISTS] FOR (n:<Label>) ON EACH [n.<prop>, …]`
-    /// (`rmp` tasks #72, #661): starts a **non-blocking** online build of a full-text index over
-    /// `(label, properties)` analyzed with `analyzer` (a lower-cased analyzer name; `standard` by
-    /// default). `if_not_exists` makes an already-existing equivalent index (same name or same covered
-    /// schema) a no-op success rather than a replace.
+    /// `CREATE FULLTEXT INDEX <name> [IF NOT EXISTS] FOR (n:<Label>[|<Label>…]) ON EACH [n.<prop>, …]`
+    /// (node) or `… FOR ()-[r:<Type>[|<Type>…]]-() ON EACH [r.<prop>, …]` (relationship)
+    /// (`rmp` tasks #72, #661, #663): starts an online build of a full-text index over
+    /// `(entity, labels_or_types, properties)` analyzed with `analyzer` (a lower-cased analyzer name;
+    /// `standard` by default). `if_not_exists` makes an already-existing equivalent index (same name or
+    /// same covered schema) a no-op success rather than a replace.
     CreateFulltextIndex {
         /// The server-unique index name.
         name: String,
-        /// The node label the index covers.
-        label: String,
+        /// Whether the index covers node labels or relationship types (`rmp` task #663).
+        entity: graphus_cypher::FulltextEntity,
+        /// The node labels (node index) or relationship types (relationship index) the index covers,
+        /// in declared order (one or more, `rmp` task #663).
+        labels_or_types: Vec<String>,
         /// The property keys the index covers, in declared order (one or more).
         properties: Vec<String>,
         /// The analyzer name (`standard` / `keyword`); validated by the engine against the supported
@@ -894,7 +898,8 @@ mod tests {
             index_ddl_summary(
                 &IndexCommand::CreateFulltextIndex {
                     name: "ft".to_owned(),
-                    label: "Doc".to_owned(),
+                    entity: graphus_cypher::FulltextEntity::Node,
+                    labels_or_types: vec!["Doc".to_owned()],
                     properties: vec!["body".to_owned()],
                     analyzer: "standard".to_owned(),
                     if_not_exists: false,

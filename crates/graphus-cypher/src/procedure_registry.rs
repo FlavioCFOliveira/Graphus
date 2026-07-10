@@ -72,6 +72,13 @@ pub enum ValueClass {
     /// materializes it into a full structural node (rmp #96) — composing MVCC visibility + RBAC for
     /// free. No procedure declares a `NODE` **input** (entity-valued arguments remain deferred).
     Node,
+    /// `RELATIONSHIP` — a **structural relationship** result column (`rmp` task #663), the relationship
+    /// analogue of [`Node`](Self::Node). **Output-only**: a procedure that declares a `RELATIONSHIP`
+    /// output yields the relationship's id as a [`Value::Integer`], and the executor's `ProcedureCall`
+    /// operator converts it into a [`RowValue::Rel`](crate::runtime::RowValue::Rel) so result egress
+    /// materializes it into a full structural relationship (type/properties/endpoints through the same
+    /// seam, composing MVCC + RBAC). Used by `db.index.fulltext.queryRelationships`.
+    Relationship,
 }
 
 impl ValueClass {
@@ -86,6 +93,7 @@ impl ValueClass {
             Self::Float => "FLOAT",
             Self::Number => "NUMBER",
             Self::Node => "NODE",
+            Self::Relationship => "RELATIONSHIP",
         }
     }
 }
@@ -455,17 +463,15 @@ impl ProcedureSet {
             Box::new(|args, graph| fulltext_query_nodes(args, graph)),
         );
         // `db.index.fulltext.queryRelationships(indexName, queryString) YIELD relationship, score` —
-        // the relationship analogue of `queryNodes` (`rmp` task #639). Graphus full-text indexes cover
-        // **nodes only** (a [`FulltextIndexEntry`](graphus_storage::FulltextIndexEntry) records a node
-        // *label* token, and the [`GraphAccess`] seam exposes only node full-text via
-        // [`fulltext_query`](GraphAccess::fulltext_query)), so this procedure is registered — so it is
-        // listed by `SHOW PROCEDURES` and type-checks under `YIELD` for driver/tooling compatibility —
-        // but its body returns a **clear runtime error** rather than silently-empty results (which would
-        // mislead a caller into thinking their relationship index simply matched nothing). Output
-        // `relationship` is declared `ANY`: Neo4j types it `RELATIONSHIP`, but the v1 registry
-        // [`ValueClass`] models `NODE` structurally and not `RELATIONSHIP`; since no row is ever yielded,
-        // no structural relationship is materialized. Kept in step with the two-input `queryNodes`
-        // signature (the registry has no optional-argument support for Neo4j's third `options` MAP).
+        // the relationship analogue of `queryNodes` (`rmp` tasks #639, #663), now backed by a real
+        // relationship full-text index. `relationship` is a **structural RELATIONSHIP** result (the
+        // yielded id is materialized into a full relationship at result egress, composing MVCC + RBAC);
+        // `score` is the best-effort term-overlap relevance count (a FLOAT, as Neo4j returns).
+        //
+        // Registered **reader-safe** (`rmp` #663), exactly like `queryNodes`: it only reads the graph
+        // through the `GraphAccess` seam, and the off-thread reader pool serves it from the captured
+        // full-text catalogue via the snapshot-correct relationship scan fallback
+        // (`read_source::fulltext_rel_scan_fallback`), byte-identical to the inline store-backed path.
         set.register_reader_safe(
             ProcedureSignature::new(
                 "db.index.fulltext.queryRelationships",
@@ -474,11 +480,14 @@ impl ProcedureSet {
                     FieldSpec::new("queryString", FieldType::required(ValueClass::String)),
                 ],
                 vec![
-                    FieldSpec::new("relationship", FieldType::required(ValueClass::Any)),
+                    FieldSpec::new(
+                        "relationship",
+                        FieldType::required(ValueClass::Relationship),
+                    ),
                     FieldSpec::new("score", FieldType::required(ValueClass::Float)),
                 ],
             ),
-            Box::new(|_args, _graph| fulltext_query_relationships()),
+            Box::new(fulltext_query_relationships),
         );
         // `dbms.components() YIELD name, versions, edition` — the product/version/edition triple every
         // Neo4j driver and admin tool reads at connect time to render the server banner and gate
@@ -778,24 +787,76 @@ fn dbms_components_rows() -> Vec<Vec<Value>> {
     ]]
 }
 
-/// The `db.index.fulltext.queryRelationships(indexName, queryString)` body (`rmp` task #639).
+/// The `db.index.fulltext.queryRelationships(indexName, queryString)` body (`rmp` task #663).
 ///
-/// Graphus full-text indexes cover **nodes only** (there is no relationship full-text backing on the
-/// [`GraphAccess`] seam), so this always fails with a clear, actionable message rather than returning
-/// silently-empty results that would masquerade as "no matches". The procedure is still *registered*
-/// (so `SHOW PROCEDURES` lists it and `YIELD relationship, score` type-checks) for driver/tooling
-/// compatibility.
+/// The relationship analogue of [`fulltext_query_nodes`]: resolves candidate relationship ids from the
+/// named relationship full-text index (analyzed with the index's own analyzer), **MVCC-/RBAC-filters**
+/// them by re-checking each through the same [`GraphAccess`] seam (a deleted / invisible / unauthorized
+/// relationship is dropped — when `graph` is an `AuthorizedGraph` the filtering composes for free),
+/// computes a best-effort relevance `score`, and emits one row `[rel_id (Value::Integer, bound to a
+/// structural RELATIONSHIP), score (Value::Float)]` per match, ordered by descending score then
+/// ascending id.
 ///
 /// # Errors
-///
-/// Always returns a [`ProcedureFailure`] explaining that relationship full-text indexes are not
-/// supported and pointing to the node-index procedure.
-fn fulltext_query_relationships() -> Result<Vec<Vec<Value>>, ProcedureFailure> {
-    Err(ProcedureFailure::new(
-        "db.index.fulltext.queryRelationships",
-        "relationship full-text indexes are not supported: Graphus full-text indexes cover nodes \
-         only — use db.index.fulltext.queryNodes for node full-text search",
-    ))
+/// Returns a [`ProcedureFailure`] if an argument is not a string, or if **no relationship full-text
+/// index of that name is declared** (so a typo — or a *node* index name given here — is a clear error,
+/// not silently-empty results).
+fn fulltext_query_relationships(
+    args: &[Value],
+    graph: &mut dyn GraphAccess,
+) -> Result<Vec<Vec<Value>>, ProcedureFailure> {
+    const NAME: &str = "db.index.fulltext.queryRelationships";
+    let index_name = match args.first() {
+        Some(Value::String(s)) => s.as_str(),
+        _ => {
+            return Err(ProcedureFailure::new(
+                NAME,
+                "the first argument (indexName) must be a string",
+            ));
+        }
+    };
+    let query_string = match args.get(1) {
+        Some(Value::String(s)) => s.as_str(),
+        _ => {
+            return Err(ProcedureFailure::new(
+                NAME,
+                "the second argument (queryString) must be a string",
+            ));
+        }
+    };
+
+    // Candidate ids from the relationship full-text index; `None` means no such index is declared —
+    // a node index name given here yields `None` too (it is not a *relationship* full-text index), so a
+    // wrong-kind name is a clear error rather than silently-empty results.
+    let Some(candidates) = graph.fulltext_query_rel(index_name, query_string) else {
+        return Err(ProcedureFailure::new(
+            NAME,
+            format!("there is no relationship full-text index named {index_name:?}"),
+        ));
+    };
+
+    // Re-check each candidate's visibility through the same seam (composes MVCC + RBAC), compute its
+    // score, and collect `(score, id)` so we can order relevance-first.
+    let mut scored: Vec<(u64, u64)> = candidates
+        .into_iter()
+        .filter(|&id| graph.rel_exists(id))
+        .map(|id| {
+            let score = graph
+                .fulltext_score_rel(index_name, id, query_string)
+                .unwrap_or(0);
+            (score, id.0)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+
+    Ok(scored
+        .into_iter()
+        .map(|(score, id)| {
+            // The rel id rides as an Integer; the `relationship` output is `RELATIONSHIP`-classed, so
+            // the executor binds it as a structural relationship. The score is a Float (Neo4j-compatible).
+            vec![Value::Integer(id as i64), Value::Float(score as f64)]
+        })
+        .collect())
 }
 
 /// The `db.index.fulltext.queryNodes(indexName, queryString)` body (`rmp` task #72).
@@ -1209,10 +1270,10 @@ mod tests {
     }
 
     #[test]
-    fn fulltext_query_relationships_is_registered_but_errors_clearly() {
-        // `rmp` task #639: registered (so SHOW PROCEDURES lists it and YIELD type-checks) with the
-        // Neo4j `relationship, score` outputs, but errors clearly — Graphus full-text indexes cover
-        // nodes only.
+    fn fulltext_query_relationships_is_registered_with_relationship_and_score_outputs() {
+        // `rmp` task #663: registered with the Neo4j `relationship, score` outputs, where `relationship`
+        // is a structural RELATIONSHIP class. Registered NOT reader-safe (stays inline; no off-thread
+        // relationship full-text scan-fallback path).
         let set = ProcedureSet::with_builtins();
         let sig = set
             .signature("db.index.fulltext.queryRelationships")
@@ -1220,29 +1281,99 @@ mod tests {
         assert_eq!(sig.inputs.len(), 2);
         let out_names: Vec<&str> = sig.outputs.iter().map(|o| o.name.as_str()).collect();
         assert_eq!(out_names, ["relationship", "score"]);
+        assert_eq!(sig.outputs[0].ty.class, ValueClass::Relationship);
         assert_eq!(sig.outputs[1].ty.class, ValueClass::Float);
         assert!(set.is_reader_safe("db.index.fulltext.queryRelationships"));
+        // Case-insensitive resolution like the other built-ins.
+        assert!(
+            set.signature("DB.Index.Fulltext.QueryRelationships")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn fulltext_query_relationships_returns_matching_rels_with_scores() {
+        use crate::graph_access::MemGraph;
+        use graphus_index::fulltext::Analyzer;
 
         let mut g = MemGraph::new();
-        let err = set
+        let a = g.add_node(["N"], NO_PROPS);
+        let b = g.add_node(["N"], NO_PROPS);
+        let c = g.add_node(["N"], NO_PROPS);
+        let r1 = g.add_rel(
+            "KNOWS",
+            a,
+            b,
+            [("note", Value::String("graph database fast".into()))],
+        );
+        let r2 = g.add_rel(
+            "KNOWS",
+            b,
+            c,
+            [("note", Value::String("graph theory".into()))],
+        );
+        g.create_fulltext_rel_index("rel_ix", ["KNOWS"], ["note"], Analyzer::Standard);
+
+        // "graph database": r1 matches both terms (score 2), r2 matches one (score 1) -> r1 first.
+        let rows = builtins()
             .invoke(
                 "db.index.fulltext.queryRelationships",
                 &[
                     Value::String("rel_ix".into()),
-                    Value::String("query".into()),
+                    Value::String("graph database".into()),
                 ],
                 &mut g,
             )
-            .expect_err("relationship full-text must error");
-        let msg = format!("{err}");
-        assert!(msg.contains("nodes only"), "message was: {msg}");
-        assert!(msg.contains("queryNodes"), "message was: {msg}");
+            .expect("invoke");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            vec![Value::Integer(r1.0 as i64), Value::Float(2.0)]
+        );
+        assert_eq!(
+            rows[1],
+            vec![Value::Integer(r2.0 as i64), Value::Float(1.0)]
+        );
+    }
+
+    #[test]
+    fn fulltext_query_relationships_errors_on_unknown_or_node_index() {
+        use crate::graph_access::MemGraph;
+        let mut g = MemGraph::new();
+        // A wholly-unknown name errors.
+        let err = builtins()
+            .invoke(
+                "db.index.fulltext.queryRelationships",
+                &[Value::String("nope".into()), Value::String("x".into())],
+                &mut g,
+            )
+            .expect_err("unknown relationship index must error");
+        assert!(format!("{err}").contains("nope"));
+
+        // A *node* full-text index name given to queryRelationships also errors (wrong kind).
+        g.create_fulltext_index(
+            "node_ix",
+            "Doc",
+            ["t"],
+            graphus_index::fulltext::Analyzer::Standard,
+        );
+        assert!(
+            builtins()
+                .invoke(
+                    "db.index.fulltext.queryRelationships",
+                    &[Value::String("node_ix".into()), Value::String("x".into())],
+                    &mut g,
+                )
+                .is_err(),
+            "a node index name given to queryRelationships must error"
+        );
     }
 
     #[test]
     fn new_admin_procedures_are_reader_safe() {
-        // Every procedure added in `rmp` #639 is read-only / no-op, so all are reader-safe (dispatchable
-        // to the off-thread reader pool; keeps `SHOW PROCEDURES` mode = READ).
+        // The `rmp` #639 admin procedures are read-only / no-op, and `queryRelationships`
+        // (`rmp` #663) is a real read served off-thread via the captured catalogue — so all are
+        // reader-safe (`SHOW PROCEDURES` mode = READ; off-thread-pool eligible).
         let set = ProcedureSet::with_builtins();
         for name in [
             "dbms.components",

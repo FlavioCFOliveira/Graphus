@@ -48,7 +48,7 @@ use graphus_index::fulltext::Analyzer;
 use graphus_index::histogram::PropertyHistogram;
 use graphus_io::BlockDevice;
 use graphus_storage::{
-    CompositeIndexEntry, ConstraintEntry, ConstraintKind, ConstraintTypeDescriptor,
+    CompositeIndexEntry, ConstraintEntry, ConstraintKind, ConstraintTypeDescriptor, FulltextEntity,
     FulltextIndexEntry, GcPassReport, IndexState, Namespace, RecordStore, SpatialIndexEntry,
     StoreReadView, TextIndexEntry, TokenSnapshot,
 };
@@ -64,6 +64,18 @@ use crate::schema_error::{
     equivalent_index_exists, equivalent_rel_index_exists, index_drop_not_found, index_name_in_use,
 };
 use crate::statistics::Statistics;
+
+/// One row of [`TxnCoordinator::list_fulltext_indexes`] (`rmp` tasks #72, #663): the index name, its
+/// [`FulltextEntity`], its covered labels/types (one or more), its covered properties, its analyzer and
+/// its build state — the tuple a `SHOW FULLTEXT INDEXES` surface renders.
+pub type FulltextIndexListing = (
+    String,
+    FulltextEntity,
+    Vec<String>,
+    Vec<String>,
+    Analyzer,
+    IndexState,
+);
 use crate::store_statistics;
 
 /// Renders a [`Value`] compactly for a constraint-violation message (`rmp` task #99): a string is
@@ -687,13 +699,27 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 let Some(analyzer) = Analyzer::from_byte(entry.analyzer) else {
                     continue;
                 };
-                idx.register_fulltext(
-                    &name,
-                    entry.label_token,
-                    entry.property_tokens,
-                    analyzer,
-                    entry.state,
-                );
+                // Route by entity (`rmp` task #663): a node index registers into the node full-text map
+                // (covered by labels), a relationship index into the separate relationship full-text map
+                // (covered by rel types). The rebuild scan below repopulates whichever inverted index
+                // was registered here.
+                if entry.entity.is_relationship() {
+                    idx.register_fulltext_rel(
+                        &name,
+                        entry.tokens,
+                        entry.property_tokens,
+                        analyzer,
+                        entry.state,
+                    );
+                } else {
+                    idx.register_fulltext(
+                        &name,
+                        entry.tokens,
+                        entry.property_tokens,
+                        analyzer,
+                        entry.state,
+                    );
+                }
             }
         }
 
@@ -858,21 +884,30 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             }
         }
 
-        // Repopulate the relationship-property indexes (`rmp` task #646) from a relationship scan — but
-        // only when at least one is declared, so a store with no rel index pays nothing for the extra
-        // walk. Captured before the scan so the index is not borrowed across a store borrow.
+        // Repopulate the relationship-property indexes (`rmp` task #646) and the relationship full-text
+        // indexes (`rmp` task #663) from a relationship scan — but only when at least one of either is
+        // declared, so a store with no relationship index pays nothing for the extra walk. Captured
+        // before the scan so the index is not borrowed across a store borrow.
         let registered_rel: Vec<(u32, u32)> = index.borrow().registered_rel_properties();
+        let has_rel_fulltext = index.borrow().has_any_fulltext_rel();
         // A store-read fault enumerating the relationships leaves the rel indexes empty-but-`Online`.
         // This matches the certified node-property rebuild's trust-once-selected behaviour: storage
         // faults in Graphus are persistent (checksum / torn page), and both the index seek and the scan
         // fallback read the SAME store, so they fault identically — an empty index never diverges from a
         // scan in practice. (A whole-scan fault here is also the same failure the very next query would
-        // hit.) Per-relationship read faults inside `index_one_rel` skip that relationship best-effort.
-        if !registered_rel.is_empty()
+        // hit.) Per-relationship read faults inside `index_one_rel*` skip that relationship best-effort.
+        if (!registered_rel.is_empty() || has_rel_fulltext)
             && let Ok(rel_ids) = store.borrow().scan_rel_ids()
         {
             for id in rel_ids {
-                Self::index_one_rel(store, index, id, &registered_rel);
+                if !registered_rel.is_empty() {
+                    Self::index_one_rel(store, index, id, &registered_rel);
+                }
+                // Repopulate the relationship full-text inverted indexes (`rmp` task #663), only when at
+                // least one is declared.
+                if has_rel_fulltext {
+                    Self::index_one_rel_fulltext(store, index, id);
+                }
             }
         }
 
@@ -1233,6 +1268,41 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         index
             .borrow_mut()
             .reindex_fulltext_node(id, &label_tokens, &string_props);
+    }
+
+    /// Re-indexes relationship `id` in **every** registered relationship full-text index from its
+    /// current type token and **string** property values (`rmp` task #663) — the relationship analogue
+    /// of [`index_one_node_fulltext`](Self::index_one_node_fulltext). Read faults skip the relationship
+    /// best-effort (the candidate-set contract). The store and the index are borrowed in **separate,
+    /// non-overlapping** scopes, the load-bearing discipline of this file.
+    fn index_one_rel_fulltext(
+        store: &Rc<RefCell<RecordStore<D, S>>>,
+        index: &Rc<RefCell<IndexSet>>,
+        id: u64,
+    ) {
+        let type_token = match store.borrow().rel(id) {
+            Ok(r) => r.type_id,
+            Err(_) => return,
+        };
+        // The relationship's current string property values, keyed by prop-key (newest-wins per key).
+        let mut string_props: Vec<(u32, String)> = Vec::new();
+        {
+            let chain = match store.borrow().rel_property_values(id) {
+                Ok(chain) => chain,
+                Err(_) => return,
+            };
+            for (_pid, key, value) in chain {
+                if string_props.iter().any(|(k, _)| *k == key) {
+                    continue; // newest-wins: keep only the first occurrence of each key.
+                }
+                if let graphus_core::Value::String(s) = value {
+                    string_props.push((key, s));
+                }
+            }
+        }
+        index
+            .borrow_mut()
+            .reindex_fulltext_rel(id, type_token, &string_props);
     }
 
     /// Inserts node `id`'s current point value into each `registered` `(label_token, prop_key)`
@@ -2747,7 +2817,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     pub fn create_fulltext_index(
         &mut self,
         name: &str,
-        label: &str,
+        labels: &[String],
         properties: &[String],
         analyzer: Analyzer,
         if_not_exists: bool,
@@ -2757,10 +2827,17 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 "a full-text index must cover at least one property".to_owned(),
             ));
         }
+        if labels.is_empty() {
+            return Err(GraphusError::Storage(
+                "a node full-text index must cover at least one label".to_owned(),
+            ));
+        }
         // `IF NOT EXISTS` (`rmp` #661): an equivalent index — the same `name` in the full-text catalog,
-        // or the same covered `(label, ordered property tuple)` under any name — makes this an
-        // idempotent no-op (nothing added), mirroring the node-property path.
-        if if_not_exists && self.fulltext_equivalent_exists(name, label, properties) {
+        // or the same covered `(entity, ordered label/type tuple, ordered property tuple)` under any
+        // name — makes this an idempotent no-op (nothing added), mirroring the node-property path.
+        if if_not_exists
+            && self.fulltext_equivalent_exists(name, FulltextEntity::Node, labels, properties)
+        {
             return Ok(false);
         }
         // Names are globally unique across every schema catalog (`rmp` task #624): reject a name already
@@ -2777,14 +2854,22 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.store.borrow_mut().begin(txn);
         let entry = {
             let mut store = self.store.borrow_mut();
-            let label_token = match store.intern_token(Namespace::Label, label) {
-                Ok(t) => t,
-                Err(e) => {
-                    drop(store);
-                    let _ = self.store.borrow_mut().rollback(txn);
-                    return Err(e);
+            let mut label_tokens = Vec::with_capacity(labels.len());
+            for label in labels {
+                match store.intern_token(Namespace::Label, label) {
+                    Ok(t) => {
+                        // De-duplicate a repeated label (`FOR (n:A|A)`) so the token set stays minimal.
+                        if !label_tokens.contains(&t) {
+                            label_tokens.push(t);
+                        }
+                    }
+                    Err(e) => {
+                        drop(store);
+                        let _ = self.store.borrow_mut().rollback(txn);
+                        return Err(e);
+                    }
                 }
-            };
+            }
             let mut property_tokens = Vec::with_capacity(properties.len());
             for property in properties {
                 match store.intern_token(Namespace::PropKey, property) {
@@ -2797,7 +2882,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 }
             }
             let entry = FulltextIndexEntry {
-                label_token,
+                entity: FulltextEntity::Node,
+                tokens: label_tokens,
                 property_tokens,
                 analyzer: analyzer.as_byte(),
                 state: IndexState::Populating,
@@ -2810,7 +2896,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // Register the index `Populating` in the in-memory set so concurrent writes maintain it.
         self.index.borrow_mut().register_fulltext(
             name,
-            entry.label_token,
+            entry.tokens,
             entry.property_tokens,
             analyzer,
             IndexState::Populating,
@@ -2828,25 +2914,153 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         Ok(true)
     }
 
-    /// Whether a full-text index equivalent to the requested `(name, label, properties)` already
-    /// exists (`rmp` #661) — the same `name` in the full-text catalog, or the same covered
-    /// `(label, ordered property tuple)` under any name. Backs `CREATE FULLTEXT INDEX … IF NOT EXISTS`
-    /// idempotency. Read-only, by token *lookup* (an unindexable token tuple means no index can cover
-    /// it, so no equivalent exists).
-    fn fulltext_equivalent_exists(&self, name: &str, label: &str, properties: &[String]) -> bool {
+    /// Declares a **relationship** full-text index named `name` over `types` (one or more relationship
+    /// types) + `properties`, analyzed by `analyzer`, and **synchronously builds** it (`rmp` task #663)
+    /// — the relationship analogue of [`create_fulltext_index`](Self::create_fulltext_index).
+    ///
+    /// Unlike the node full-text index (which builds non-blockingly), the relationship index is built
+    /// **synchronously and recorded `Online`** in one committed transaction, then a full
+    /// [`rebuild_index`](Self::rebuild_index) repopulates its rel-keyed inverted index from the store —
+    /// exactly the pattern the relationship-property index (`rmp` #646) uses. `rebuild_index` also
+    /// resets the shared full-text/spatial freshness marker to the store's high-water, so a reader whose
+    /// snapshot predates the build declines to the correct scan path.
+    ///
+    /// # Errors
+    /// Returns a storage error if `types` or `properties` is empty, interning any token, recording the
+    /// catalog entry, or the committing transaction fails. On any error the index is left undeclared.
+    pub fn create_fulltext_rel_index(
+        &mut self,
+        name: &str,
+        types: &[String],
+        properties: &[String],
+        analyzer: Analyzer,
+        if_not_exists: bool,
+    ) -> Result<bool> {
+        if properties.is_empty() {
+            return Err(GraphusError::Storage(
+                "a full-text index must cover at least one property".to_owned(),
+            ));
+        }
+        if types.is_empty() {
+            return Err(GraphusError::Storage(
+                "a relationship full-text index must cover at least one type".to_owned(),
+            ));
+        }
+        if if_not_exists
+            && self.fulltext_equivalent_exists(
+                name,
+                FulltextEntity::Relationship,
+                types,
+                properties,
+            )
+        {
+            return Ok(false);
+        }
+        if Self::name_used_by_other_catalog(&self.store.borrow(), name, NameCatalog::Fulltext) {
+            return Err(index_name_in_use(name));
+        }
+
+        self.next_txn_id += 1;
+        let txn = TxnId(self.next_txn_id);
+        self.store.borrow_mut().begin(txn);
+        let entry = {
+            let mut store = self.store.borrow_mut();
+            let mut type_tokens = Vec::with_capacity(types.len());
+            for ty in types {
+                match store.intern_token(Namespace::RelType, ty) {
+                    Ok(t) => {
+                        if !type_tokens.contains(&t) {
+                            type_tokens.push(t);
+                        }
+                    }
+                    Err(e) => {
+                        drop(store);
+                        let _ = self.store.borrow_mut().rollback(txn);
+                        return Err(e);
+                    }
+                }
+            }
+            let mut property_tokens = Vec::with_capacity(properties.len());
+            for property in properties {
+                match store.intern_token(Namespace::PropKey, property) {
+                    Ok(t) => property_tokens.push(t),
+                    Err(e) => {
+                        drop(store);
+                        let _ = self.store.borrow_mut().rollback(txn);
+                        return Err(e);
+                    }
+                }
+            }
+            // Synchronous build → recorded `Online` (the relationship-property/composite precedent).
+            let entry = FulltextIndexEntry {
+                entity: FulltextEntity::Relationship,
+                tokens: type_tokens,
+                property_tokens,
+                analyzer: analyzer.as_byte(),
+                state: IndexState::Online,
+            };
+            store.set_fulltext_index(name.to_owned(), entry.clone());
+            entry
+        };
+        self.store.borrow_mut().commit(txn)?;
+
+        // Register the index `Online` in the in-memory set and (re)build it so existing relationships
+        // are indexed — `rebuild_index` scans the relationships, populates the rel-keyed inverted index,
+        // and resets the shared full-text/spatial marker to the store's high-water.
+        self.index.borrow_mut().register_fulltext_rel(
+            name,
+            entry.tokens,
+            entry.property_tokens,
+            analyzer,
+            IndexState::Online,
+        );
+        Self::rebuild_index(&self.store, &self.index);
+        Ok(true)
+    }
+
+    /// Whether a full-text index equivalent to the requested `(name, entity, tokens, properties)`
+    /// already exists (`rmp` #661, #663) — the same `name` in the full-text catalog, or the same covered
+    /// `(entity, ordered label/type tuple, ordered property tuple)` under any name. Backs
+    /// `CREATE FULLTEXT INDEX … IF NOT EXISTS` idempotency. Read-only, by token *lookup* (an unindexable
+    /// token tuple means no index can cover it, so no equivalent exists).
+    fn fulltext_equivalent_exists(
+        &self,
+        name: &str,
+        entity: FulltextEntity,
+        tokens: &[String],
+        properties: &[String],
+    ) -> bool {
         let store = self.store.borrow();
         if store.fulltext_index(name).is_some() {
             return true;
         }
-        let Some((label_token, property_tokens)) =
-            Self::resolve_property_tokens(&store, label, properties)
-        else {
-            return false;
+        // Resolve the covering tokens in the right namespace (labels for a node index, rel types for a
+        // relationship index) and the property tokens. A never-interned token means no index can cover
+        // it, so no equivalent exists.
+        let namespace = if entity.is_relationship() {
+            Namespace::RelType
+        } else {
+            Namespace::Label
         };
-        store
-            .fulltext_indexes()
-            .iter()
-            .any(|(_n, e)| e.label_token == label_token && e.property_tokens == property_tokens)
+        let mut token_ids = Vec::with_capacity(tokens.len());
+        for tok in tokens {
+            let Some(t) = store.token_id(namespace, tok) else {
+                return false;
+            };
+            if !token_ids.contains(&t) {
+                token_ids.push(t);
+            }
+        }
+        let mut property_tokens = Vec::with_capacity(properties.len());
+        for property in properties {
+            let Some(t) = store.token_id(Namespace::PropKey, property) else {
+                return false;
+            };
+            property_tokens.push(t);
+        }
+        store.fulltext_indexes().iter().any(|(_n, e)| {
+            e.entity == entity && e.tokens == token_ids && e.property_tokens == property_tokens
+        })
     }
 
     /// Drops the full-text index named `name` (`rmp` task #72): removes its durable catalog entry in a
@@ -2869,7 +3083,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 return Err(index_drop_not_found(name));
             }
             self.pending_fulltext_builds.retain(|b| b.name != name);
+            // The name is unique across catalogs, so at most one of these unregisters anything
+            // (`rmp` task #663): one is a no-op.
             self.index.borrow_mut().unregister_fulltext(name);
+            self.index.borrow_mut().unregister_fulltext_rel(name);
             return Ok(false); // nothing removed.
         }
         self.next_txn_id += 1;
@@ -2879,30 +3096,47 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.store.borrow_mut().commit(txn)?;
 
         self.pending_fulltext_builds.retain(|b| b.name != name);
+        // Unregister from whichever in-memory map holds it (node or relationship, `rmp` #663).
         self.index.borrow_mut().unregister_fulltext(name);
+        self.index.borrow_mut().unregister_fulltext_rel(name);
         Ok(true) // an index was removed.
     }
 
-    /// Lists every declared full-text index as `(name, label, properties, analyzer, state)`
-    /// (`rmp` task #72) for a `SHOW FULLTEXT INDEXES` surface. Reads the durable catalog and resolves
-    /// the tokens back to names; an entry whose tokens have no resolvable name (a defensively-skipped
-    /// impossibility for a live token) or an unknown analyzer byte is omitted. Ordered by name.
+    /// Lists every declared full-text index as `(name, entity, labels-or-types, properties, analyzer,
+    /// state)` (`rmp` tasks #72, #663) for a `SHOW FULLTEXT INDEXES` surface. Reads the durable catalog
+    /// and resolves the tokens back to names in the entity's namespace (labels for a node index, rel
+    /// types for a relationship index); an entry whose tokens have no resolvable name (a
+    /// defensively-skipped impossibility for a live token) or an unknown analyzer byte is omitted.
+    /// Ordered by name.
     #[must_use]
-    pub fn list_fulltext_indexes(
-        &self,
-    ) -> Vec<(String, String, Vec<String>, Analyzer, IndexState)> {
+    pub fn list_fulltext_indexes(&self) -> Vec<FulltextIndexListing> {
         let store = self.store.borrow();
         store
             .fulltext_indexes()
             .into_iter()
             .filter_map(|(name, entry)| {
-                let label = store.token_name(Namespace::Label, entry.label_token)?;
+                let token_namespace = if entry.entity.is_relationship() {
+                    Namespace::RelType
+                } else {
+                    Namespace::Label
+                };
+                let mut labels_or_types = Vec::with_capacity(entry.tokens.len());
+                for tok in &entry.tokens {
+                    labels_or_types.push(store.token_name(token_namespace, *tok)?.to_owned());
+                }
                 let mut properties = Vec::with_capacity(entry.property_tokens.len());
                 for pk in &entry.property_tokens {
                     properties.push(store.token_name(Namespace::PropKey, *pk)?.to_owned());
                 }
                 let analyzer = Analyzer::from_byte(entry.analyzer)?;
-                Some((name, label.to_owned(), properties, analyzer, entry.state))
+                Some((
+                    name,
+                    entry.entity,
+                    labels_or_types,
+                    properties,
+                    analyzer,
+                    entry.state,
+                ))
             })
             .collect()
     }

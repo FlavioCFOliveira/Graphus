@@ -106,7 +106,7 @@ fn create_index(coord: &mut Coord) {
     coord
         .create_fulltext_index(
             "ft",
-            "Article",
+            &["Article".to_owned()],
             &["title".to_owned()],
             Analyzer::Standard,
             false,
@@ -245,7 +245,7 @@ fn online_build_indexes_a_populated_store() {
     coord
         .create_fulltext_index(
             "ft",
-            "Article",
+            &["Article".to_owned()],
             &["title".to_owned()],
             Analyzer::Standard,
             false,
@@ -402,7 +402,7 @@ fn create_fulltext_index_if_not_exists_is_idempotent() {
         coord
             .create_fulltext_index(
                 "ft",
-                "Article",
+                &["Article".to_owned()],
                 &["title".to_owned()],
                 Analyzer::Standard,
                 true
@@ -414,7 +414,7 @@ fn create_fulltext_index_if_not_exists_is_idempotent() {
         !coord
             .create_fulltext_index(
                 "ft",
-                "Article",
+                &["Article".to_owned()],
                 &["title".to_owned()],
                 Analyzer::Standard,
                 true
@@ -426,7 +426,7 @@ fn create_fulltext_index_if_not_exists_is_idempotent() {
         !coord
             .create_fulltext_index(
                 "ft2",
-                "Article",
+                &["Article".to_owned()],
                 &["title".to_owned()],
                 Analyzer::Standard,
                 true
@@ -464,7 +464,7 @@ fn drop_index_by_name_resolves_fulltext() {
     coord
         .create_fulltext_index(
             "ft",
-            "Article",
+            &["Article".to_owned()],
             &["title".to_owned()],
             Analyzer::Standard,
             false,

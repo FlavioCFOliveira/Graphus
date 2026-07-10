@@ -56,7 +56,7 @@
 //! * `lastRead` / `readCount` — `Null` (index-usage statistics are untracked).
 
 use graphus_core::{GraphusError, Value};
-use graphus_cypher::{Analyzer, ConstraintInfo};
+use graphus_cypher::{Analyzer, ConstraintInfo, FulltextEntity, FulltextIndexListing};
 use graphus_storage::{ConstraintKind, IndexState};
 
 use crate::admin::AdminResult;
@@ -144,8 +144,9 @@ pub(crate) struct IndexSources {
     pub composite: Vec<(String, String, Vec<String>, IndexState)>,
     /// `(name, rel_type, property, state)` per relationship-property `RANGE` index.
     pub rel_property: Vec<(String, String, String, IndexState)>,
-    /// `(name, label, properties, analyzer, state)` per `FULLTEXT` index.
-    pub fulltext: Vec<(String, String, Vec<String>, Analyzer, IndexState)>,
+    /// `(name, entity, labels_or_types, properties, analyzer, state)` per `FULLTEXT` index — node or
+    /// relationship, one or more covered labels/types (`rmp` task #663).
+    pub fulltext: Vec<FulltextIndexListing>,
     /// `(name, label, property, state)` per `POINT` index.
     pub point: Vec<(String, String, String, IndexState)>,
     /// `(name, label, property, state)` per `TEXT` (trigram) index (`rmp` task #662).
@@ -281,25 +282,38 @@ pub(crate) fn create_range_rel(name: &str, rel_type: &str, property: &str) -> St
     )
 }
 
-/// A round-trippable `CREATE FULLTEXT INDEX` DDL (`rmp` #660). Uses Graphus's native
+/// A round-trippable `CREATE FULLTEXT INDEX` DDL (`rmp` #660, #663). Uses Graphus's native
 /// `OPTIONS { analyzer: '<name>' }` clause (not Neo4j's `indexConfig` map) so it re-parses through the
-/// admin grammar to an equivalent `CreateFulltextIndex`.
+/// admin grammar to an equivalent `CreateFulltextIndex`. Renders a node pattern `(v:A|B)` or an
+/// undirected relationship pattern `()-[v:A|B]-()` per `entity`, with the variable bound to `n` (node)
+/// / `r` (relationship) so the `ON EACH [<var>.<prop>]` references match.
 #[must_use]
 pub(crate) fn create_fulltext(
     name: &str,
-    label: &str,
+    entity: FulltextEntity,
+    labels_or_types: &[String],
     properties: &[String],
     analyzer: Analyzer,
 ) -> String {
+    let var = if entity.is_relationship() { "r" } else { "n" };
+    let tokens = labels_or_types
+        .iter()
+        .map(|t| quote_ident(t))
+        .collect::<Vec<_>>()
+        .join("|");
+    let pattern = if entity.is_relationship() {
+        format!("()-[{var}:{tokens}]-()")
+    } else {
+        format!("({var}:{tokens})")
+    };
     let props = properties
         .iter()
-        .map(|p| format!("n.{}", quote_ident(p)))
+        .map(|p| format!("{var}.{}", quote_ident(p)))
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "CREATE FULLTEXT INDEX {} FOR (n:{}) ON EACH [{props}] OPTIONS {{ analyzer: '{}' }}",
+        "CREATE FULLTEXT INDEX {} FOR {pattern} ON EACH [{props}] OPTIONS {{ analyzer: '{}' }}",
         quote_ident(name),
-        quote_ident(label),
         analyzer.name()
     )
 }
@@ -452,16 +466,20 @@ pub(crate) fn build_rows(filter: IndexTypeFilter, sources: IndexSources) -> Vec<
             create_statement: create,
         });
     }
-    // FULLTEXT — the analyzer goes into the `options` map.
-    for (name, label, properties, analyzer, state) in fulltext {
-        let create = create_fulltext(&name, &label, &properties, analyzer);
+    // FULLTEXT — node or relationship (`rmp` #663); the analyzer goes into the `options` map.
+    for (name, entity, labels_or_types, properties, analyzer, state) in fulltext {
+        let create = create_fulltext(&name, entity, &labels_or_types, &properties, analyzer);
         specs.push(RowSpec {
             id: alloc(),
             name,
             state,
             type_str: "FULLTEXT",
-            entity_type: "NODE",
-            labels_or_types: vec![label],
+            entity_type: if entity.is_relationship() {
+                "RELATIONSHIP"
+            } else {
+                "NODE"
+            },
+            labels_or_types,
             properties,
             index_provider: "fulltext-1.0",
             owning_constraint: Value::Null,
@@ -710,7 +728,8 @@ mod tests {
             )],
             fulltext: vec![(
                 "articles".to_owned(),
-                "Article".to_owned(),
+                FulltextEntity::Node,
+                vec!["Article".to_owned()],
                 vec!["title".to_owned(), "body".to_owned()],
                 analyzer("standard"),
                 IndexState::Online,
@@ -934,18 +953,39 @@ mod tests {
                 if_not_exists: false,
             }
         );
-        // FULLTEXT.
+        // FULLTEXT (node, single label).
         assert_eq!(
             parse_index(&create_fulltext(
                 "articles",
-                "Article",
+                FulltextEntity::Node,
+                &["Article".to_owned()],
                 &["title".to_owned()],
                 analyzer("standard")
             )),
             IndexCommand::CreateFulltextIndex {
                 name: "articles".to_owned(),
-                label: "Article".to_owned(),
+                entity: FulltextEntity::Node,
+                labels_or_types: vec!["Article".to_owned()],
                 properties: vec!["title".to_owned()],
+                analyzer: "standard".to_owned(),
+                if_not_exists: false,
+            }
+        );
+        // FULLTEXT (relationship, multi-type) — round-trips through the entity-aware create DDL
+        // (`rmp` #663).
+        assert_eq!(
+            parse_index(&create_fulltext(
+                "rel_ft",
+                FulltextEntity::Relationship,
+                &["KNOWS".to_owned(), "RATED".to_owned()],
+                &["note".to_owned()],
+                analyzer("standard")
+            )),
+            IndexCommand::CreateFulltextIndex {
+                name: "rel_ft".to_owned(),
+                entity: FulltextEntity::Relationship,
+                labels_or_types: vec!["KNOWS".to_owned(), "RATED".to_owned()],
+                properties: vec!["note".to_owned()],
                 analyzer: "standard".to_owned(),
                 if_not_exists: false,
             }

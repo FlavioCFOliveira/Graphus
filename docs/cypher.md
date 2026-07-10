@@ -508,6 +508,22 @@ synchronous builds, so the clause is validated and accepted but not applied (exc
 `IF NOT EXISTS` / `IF EXISTS`, an anonymous (auto-named) `POINT` index, and dropping any kind by the
 unified `DROP INDEX <name>` — see [indexes.md](indexes.md).
 
+Full-text indexes cover **nodes** (`FOR (n:A|B)`) or **relationships** (`FOR ()-[r:T|U]-()`), each over
+one or more labels/types (Neo4j's `A|B` syntax — a node/relationship of **any** covered label/type is
+indexed) and searched by the two full-text procedures, which return the matching entity as a structural
+value plus a relevance `score`:
+
+```cypher
+CALL db.index.fulltext.queryNodes('posts', 'graph databases') YIELD node, score
+  RETURN node, score
+CALL db.index.fulltext.queryRelationships('rel_notes', 'graph') YIELD relationship, score
+  RETURN relationship, score
+```
+
+Both re-check each candidate for MVCC visibility, its current label/type and RBAC; an unknown index
+name — or a node index name given to `queryRelationships` (and vice versa) — is a clear error, not
+silently-empty results. See [indexes.md](indexes.md#node-vs-relationship-single-vs-multi-label-full-text).
+
 `SHOW INDEXES` is a single unified, Neo4j-conformant listing of **every** index kind (node/relationship
 `RANGE`, composite `RANGE`, `TEXT`, `FULLTEXT`, `POINT`, and the two token `LOOKUP` indexes), with the full
 Neo4j column set, `UPPER-CASE` state, per-type filters (`SHOW RANGE|TEXT|POINT|LOOKUP|FULLTEXT|VECTOR|ALL

@@ -149,7 +149,8 @@ async fn query_names(handle: &EngineHandle, index: &str, search: &str) -> Vec<St
 fn create_articles_index(props: &[&str], analyzer: &str) -> IndexCommand {
     IndexCommand::CreateFulltextIndex {
         name: "articles".to_owned(),
-        label: "Article".to_owned(),
+        entity: graphus_cypher::FulltextEntity::Node,
+        labels_or_types: vec!["Article".to_owned()],
         properties: props.iter().map(|p| (*p).to_owned()).collect(),
         analyzer: analyzer.to_owned(),
         if_not_exists: false,
@@ -421,4 +422,337 @@ async fn fulltext_procedure_feeding_an_expand_is_served_inline_not_misrouted() {
     );
 
     handle.shutdown().await.expect("graceful shutdown");
+}
+
+// ================================================================================================
+// Relationship + multi-label full-text indexes (`rmp` task #663)
+// ================================================================================================
+
+/// A `CREATE FULLTEXT INDEX` command over a **relationship** pattern (`rmp` #663).
+fn create_rel_fulltext(name: &str, types: &[&str], props: &[&str]) -> IndexCommand {
+    IndexCommand::CreateFulltextIndex {
+        name: name.to_owned(),
+        entity: graphus_cypher::FulltextEntity::Relationship,
+        labels_or_types: types.iter().map(|t| (*t).to_owned()).collect(),
+        properties: props.iter().map(|p| (*p).to_owned()).collect(),
+        analyzer: "standard".to_owned(),
+        if_not_exists: false,
+    }
+}
+
+/// A **multi-label** node `CREATE FULLTEXT INDEX` command (`rmp` #663).
+fn create_multi_label_fulltext(name: &str, labels: &[&str], props: &[&str]) -> IndexCommand {
+    IndexCommand::CreateFulltextIndex {
+        name: name.to_owned(),
+        entity: graphus_cypher::FulltextEntity::Node,
+        labels_or_types: labels.iter().map(|l| (*l).to_owned()).collect(),
+        properties: props.iter().map(|p| (*p).to_owned()).collect(),
+        analyzer: "standard".to_owned(),
+        if_not_exists: false,
+    }
+}
+
+/// Queries a relationship full-text index and returns the matching relationships' `note` property
+/// values, sorted. The `relationship` column egresses as a structural relationship.
+async fn query_rel_notes(handle: &EngineHandle, index: &str, search: &str) -> Vec<String> {
+    let q = format!(
+        "CALL db.index.fulltext.queryRelationships('{index}', '{search}') YIELD relationship \
+         RETURN relationship"
+    );
+    let rows = run(handle, &q).await;
+    let mut notes: Vec<String> = rows
+        .iter()
+        .filter_map(|r| match r.first() {
+            Some(MaterializedValue::Relationship(rel)) => rel
+                .properties
+                .iter()
+                .find(|(k, _)| k == "note")
+                .and_then(|(_, v)| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                }),
+            _ => None,
+        })
+        .collect();
+    notes.sort();
+    notes
+}
+
+#[tokio::test]
+async fn relationship_fulltext_query_over_a_real_server() {
+    let temp = TempStore::new("rel-ft");
+    let handle = boot(config(&temp)).await;
+    let engine = handle.engine.clone();
+
+    // Seed relationships carrying text.
+    run(
+        &engine,
+        "CREATE (:P {name: 'a'})-[:KNOWS {note: 'graph databases are great'}]->(:P {name: 'b'})",
+    )
+    .await;
+    run(
+        &engine,
+        "CREATE (:P {name: 'c'})-[:KNOWS {note: 'relational databases'}]->(:P {name: 'd'})",
+    )
+    .await;
+    run(
+        &engine,
+        "CREATE (:P {name: 'e'})-[:LIKES {note: 'graph theory'}]->(:P {name: 'f'})",
+    )
+    .await; // wrong type
+
+    engine
+        .index_ddl(create_rel_fulltext("rel_notes", &["KNOWS"], &["note"]))
+        .await
+        .expect("create relationship fulltext index");
+
+    // Tokenized query returns the matching KNOWS relationships (not the LIKES one).
+    assert_eq!(
+        query_rel_notes(&engine, "rel_notes", "databases").await,
+        vec![
+            "graph databases are great".to_owned(),
+            "relational databases".to_owned()
+        ]
+    );
+    // "graph" matches only the KNOWS relationship (the LIKES one is a different, uncovered type).
+    assert_eq!(
+        query_rel_notes(&engine, "rel_notes", "graph").await,
+        vec!["graph databases are great".to_owned()]
+    );
+
+    // An update to a relationship property is reflected.
+    run(
+        &engine,
+        "MATCH ()-[r:KNOWS {note: 'relational databases'}]->() SET r.note = 'graph only now'",
+    )
+    .await;
+    assert_eq!(
+        query_rel_notes(&engine, "rel_notes", "relational").await,
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        query_rel_notes(&engine, "rel_notes", "graph").await,
+        vec![
+            "graph databases are great".to_owned(),
+            "graph only now".to_owned()
+        ]
+    );
+
+    // Querying an unknown relationship index name errors, not empty.
+    let ticket = engine
+        .begin_auto_commit(AccessMode::Write)
+        .await
+        .expect("begin");
+    let result = engine
+        .run(
+            ticket,
+            "CALL db.index.fulltext.queryRelationships('nope', 'graph') YIELD relationship \
+             RETURN relationship"
+                .to_owned(),
+            Vec::new(),
+            true,
+            None,
+        )
+        .await;
+    let errored = match result {
+        Err(_) => true,
+        Ok(reply) => tokio::task::spawn_blocking(move || {
+            let mut rx = reply.rows;
+            rx.next().is_err()
+        })
+        .await
+        .expect("drain"),
+    };
+    assert!(errored, "querying an unknown relationship index must error");
+
+    handle.shutdown().await.expect("graceful shutdown");
+}
+
+#[tokio::test]
+async fn multi_label_node_fulltext_matches_any_covered_label() {
+    let temp = TempStore::new("multi-label");
+    let handle = boot(config(&temp)).await;
+    let engine = handle.engine.clone();
+
+    // Three nodes: an Article, a Blog, and an uncovered Note.
+    run(
+        &engine,
+        "CREATE (:Article {title: 'graph databases', name: 'art'})",
+    )
+    .await;
+    run(
+        &engine,
+        "CREATE (:Blog {title: 'graph theory', name: 'blog'})",
+    )
+    .await;
+    run(
+        &engine,
+        "CREATE (:Note {title: 'graph stuff', name: 'note'})",
+    )
+    .await;
+
+    // A single index over BOTH Article and Blog.
+    engine
+        .index_ddl(create_multi_label_fulltext(
+            "posts",
+            &["Article", "Blog"],
+            &["title"],
+        ))
+        .await
+        .expect("create multi-label fulltext index");
+
+    // "graph" matches the Article AND the Blog (any covered label) — but NOT the uncovered Note.
+    assert_eq!(
+        query_names(&engine, "posts", "graph").await,
+        vec!["art".to_owned(), "blog".to_owned()]
+    );
+    // A term unique to one covered label still matches through the shared index.
+    assert_eq!(
+        query_names(&engine, "posts", "theory").await,
+        vec!["blog".to_owned()]
+    );
+
+    handle.shutdown().await.expect("graceful shutdown");
+}
+
+#[tokio::test]
+async fn show_indexes_reports_relationship_entity_and_multi_label_types() {
+    let temp = TempStore::new("show-663");
+    let handle = boot(config(&temp)).await;
+    let engine = handle.engine.clone();
+
+    engine
+        .index_ddl(create_rel_fulltext(
+            "rel_ft",
+            &["KNOWS", "RATED"],
+            &["note"],
+        ))
+        .await
+        .expect("create rel fulltext");
+    engine
+        .index_ddl(create_multi_label_fulltext(
+            "node_ft",
+            &["Article", "Blog"],
+            &["title"],
+        ))
+        .await
+        .expect("create multi-label fulltext");
+
+    let reply = engine
+        .index_ddl(IndexCommand::ShowIndexes {
+            filter: IndexTypeFilter::Fulltext,
+            tail: None,
+        })
+        .await
+        .expect("show");
+    assert_eq!(reply.rows.len(), 2, "both full-text indexes are listed");
+
+    // Columns: id(0), name(1), state(2), populationPercent(3), type(4), entityType(5),
+    // labelsOrTypes(6), properties(7), ...
+    for row in &reply.rows {
+        let name = match &row[1] {
+            Value::String(s) => s.clone(),
+            other => panic!("name column: {other:?}"),
+        };
+        let entity_type = &row[5];
+        let labels_or_types = match &row[6] {
+            Value::List(items) => items
+                .iter()
+                .map(|v| match v {
+                    Value::String(s) => s.clone(),
+                    other => panic!("labelsOrTypes element: {other:?}"),
+                })
+                .collect::<Vec<_>>(),
+            other => panic!("labelsOrTypes column: {other:?}"),
+        };
+        match name.as_str() {
+            "rel_ft" => {
+                assert_eq!(*entity_type, Value::String("RELATIONSHIP".to_owned()));
+                assert_eq!(
+                    labels_or_types,
+                    vec!["KNOWS".to_owned(), "RATED".to_owned()]
+                );
+            }
+            "node_ft" => {
+                assert_eq!(*entity_type, Value::String("NODE".to_owned()));
+                assert_eq!(
+                    labels_or_types,
+                    vec!["Article".to_owned(), "Blog".to_owned()]
+                );
+            }
+            other => panic!("unexpected index name {other}"),
+        }
+    }
+
+    handle.shutdown().await.expect("graceful shutdown");
+}
+
+#[tokio::test]
+async fn relationship_and_multi_label_index_survive_restart() {
+    let temp = TempStore::new("restart-663");
+    let cfg = config(&temp);
+
+    // Boot #1: seed, create a relationship index and a multi-label node index, confirm, shut down.
+    {
+        let handle = boot(cfg.clone()).await;
+        let engine = handle.engine.clone();
+        run(
+            &engine,
+            "CREATE (:Article {title: 'graph survives', name: 'art'})",
+        )
+        .await;
+        run(
+            &engine,
+            "CREATE (:Blog {title: 'blog survives', name: 'blog'})",
+        )
+        .await;
+        run(
+            &engine,
+            "CREATE (:P {name: 'x'})-[:KNOWS {note: 'graph edge survives'}]->(:P {name: 'y'})",
+        )
+        .await;
+        engine
+            .index_ddl(create_rel_fulltext("rel_notes", &["KNOWS"], &["note"]))
+            .await
+            .expect("create rel fulltext");
+        engine
+            .index_ddl(create_multi_label_fulltext(
+                "posts",
+                &["Article", "Blog"],
+                &["title"],
+            ))
+            .await
+            .expect("create multi-label fulltext");
+        assert_eq!(
+            query_rel_notes(&engine, "rel_notes", "survives").await,
+            vec!["graph edge survives".to_owned()]
+        );
+        handle.shutdown().await.expect("shutdown");
+    }
+
+    // Boot #2: both indexes must survive (durable catalog incl. the extension block + rebuild).
+    let handle = boot(cfg).await;
+    let engine = handle.engine.clone();
+
+    let reply = engine
+        .index_ddl(IndexCommand::ShowIndexes {
+            filter: IndexTypeFilter::Fulltext,
+            tail: None,
+        })
+        .await
+        .expect("show after restart");
+    assert_eq!(reply.rows.len(), 2, "both indexes must survive the restart");
+
+    // The relationship index still returns the matching edge (rebuilt rel inverted index).
+    assert_eq!(
+        query_rel_notes(&engine, "rel_notes", "graph").await,
+        vec!["graph edge survives".to_owned()]
+    );
+    // The multi-label node index still matches across both covered labels.
+    assert_eq!(
+        query_names(&engine, "posts", "survives").await,
+        vec!["art".to_owned(), "blog".to_owned()]
+    );
+
+    handle.shutdown().await.expect("shutdown");
 }

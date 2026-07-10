@@ -374,6 +374,33 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         ))
     }
 
+    // Relationship full-text (`rmp` task #663): served off-thread from the captured catalogue via the
+    // snapshot-correct relationship scan fallback, byte-identical to the inline store-backed path (never
+    // the coordinator's `!Send` inverted-index postings). A name the catalogue does not know yields
+    // `None`, exactly as the inline `IndexSet::fulltext_rel_target(name).is_none()` path does.
+    fn fulltext_query_rel(&self, name: &str, search: &str) -> Option<Vec<RelId>> {
+        let target = self.fulltext.rel_target(name)?;
+        Some(read_source::fulltext_rel_scan_fallback(
+            &self.source(),
+            &self.ctx(),
+            self,
+            target,
+            search,
+        ))
+    }
+
+    fn fulltext_score_rel(&self, name: &str, rel: RelId, search: &str) -> Option<u64> {
+        let target = self.fulltext.rel_target(name)?;
+        Some(read_source::fulltext_rel_score_recompute(
+            &self.source(),
+            &self.ctx(),
+            self,
+            target,
+            rel,
+            search,
+        ))
+    }
+
     // ---- morsel intra-query parallelism (off-thread, `rmp` task #575-g.1) ---------------------------
 
     fn frontier_morsel_source(&self) -> Option<crate::morsel::MorselFrontierSource> {

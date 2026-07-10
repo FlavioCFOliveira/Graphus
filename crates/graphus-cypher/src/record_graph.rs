@@ -1105,6 +1105,134 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         out
     }
 
+    /// The multi-label generalisation of [`filter_label_candidates`](Self::filter_label_candidates)
+    /// (`rmp` task #663): keeps `ids` that are **visible** and currently carry **any** of `token_ids`,
+    /// SIREAD-marking each examined id exactly once. Used by a multi-label full-text query, where a node
+    /// with any covered label matches (Neo4j semantics). An empty `token_ids` keeps nothing. On a
+    /// storage fault / overflow-form bitmap the error is captured and an empty result returned.
+    fn filter_any_label_candidates(&self, token_ids: &[u32], ids: Vec<u64>) -> Vec<NodeId> {
+        let store = self.store.borrow();
+        let mut out = Vec::new();
+        for id in ids {
+            let visible = match store.node(id) {
+                Ok(rec) => self.visible(rec.mvcc),
+                Err(_) => continue,
+            };
+            // SIREAD-mark every examined node exactly once, visible or not.
+            self.note_read(node_ssi_key(id));
+            if !visible {
+                continue;
+            }
+            let mut carries = false;
+            for &token_id in token_ids {
+                match store.node_has_label(id, token_id) {
+                    Ok(true) => {
+                        carries = true;
+                        break;
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        drop(store);
+                        self.capture(e);
+                        return Vec::new();
+                    }
+                }
+            }
+            if carries {
+                out.push(NodeId(id));
+            }
+        }
+        out
+    }
+
+    /// Whether the relationship-type name `rel_type` interns to the type token `type_token` in this
+    /// store (`rmp` task #663). Used to re-check a relationship full-text candidate's current type
+    /// against the index's covered type set. A never-interned name (no live token) never matches.
+    fn rel_type_token_matches(&self, rel_type: &str, type_token: u32) -> bool {
+        self.store
+            .borrow()
+            .token_id(Namespace::RelType, rel_type)
+            .is_some_and(|t| t == type_token)
+    }
+
+    /// The **snapshot-correct relationship full-text scan fallback** for a stale reader (`rmp` #663) —
+    /// the relationship analogue of `fulltext_scan_fallback`. Computes the matching relationship set
+    /// directly from the store at this MVCC snapshot, mirroring
+    /// [`InvertedIndex::query`](graphus_index::fulltext::InvertedIndex) under `Or`, with the identical
+    /// SSI footprint ([`mark_all_live_rels`](Self::mark_all_live_rels) + per-candidate
+    /// [`rel_data`](GraphAccess::rel_data)).
+    fn fulltext_rel_scan_fallback(
+        &self,
+        type_tokens: &[u32],
+        prop_keys: &[u32],
+        analyzer: graphus_index::fulltext::Analyzer,
+        search: &str,
+    ) -> Vec<RelId> {
+        use std::collections::BTreeSet;
+
+        // SSI: mark every live relationship, exactly as the fast path does.
+        self.mark_all_live_rels();
+
+        let all_ids = match self.store.borrow().scan_rel_ids() {
+            Ok(ids) => ids,
+            Err(e) => {
+                self.capture(e);
+                return Vec::new();
+            }
+        };
+
+        // The covered type names (resolve once), and the covered property names, so the index borrow
+        // never overlaps a store borrow during the per-relationship value reads below.
+        let (type_names, prop_names): (Vec<String>, Vec<String>) = {
+            let store = self.store.borrow();
+            let type_names = type_tokens
+                .iter()
+                .filter_map(|tt| store.token_name(Namespace::RelType, *tt).map(str::to_owned))
+                .collect();
+            let prop_names = prop_keys
+                .iter()
+                .filter_map(|pk| store.token_name(Namespace::PropKey, *pk).map(str::to_owned))
+                .collect();
+            (type_names, prop_names)
+        };
+
+        let search_terms: BTreeSet<String> = analyzer.analyze(search).into_iter().collect();
+        if search_terms.is_empty() {
+            return Vec::new();
+        }
+
+        let mut out: Vec<RelId> = Vec::new();
+        for id in all_ids {
+            let rel = RelId(id);
+            // Visible + of a covered type? `rel_data` returns `None` for a not-visible relationship
+            // (and SIREAD-marks the examined relationship).
+            let Some(data) = self.rel_data(rel) else {
+                continue;
+            };
+            if !type_names.contains(&data.rel_type) {
+                continue;
+            }
+            let mut matched = false;
+            'props: for name in &prop_names {
+                let Some(Value::String(text)) = self.rel_property(rel, name) else {
+                    continue;
+                };
+                for term in analyzer.analyze(&text) {
+                    if search_terms.contains(&term) {
+                        matched = true;
+                        break 'props;
+                    }
+                }
+            }
+            if matched {
+                out.push(rel);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// Re-derives `node`'s entries in the coordinator's [`IndexSet`] from the node's **current**
     /// state at this transaction's snapshot (`rmp` task #48); a no-op on the standalone path (no
     /// index). Called at the end of every node write (`create_node`, `set_node_property`,
@@ -1327,24 +1455,29 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         }
     }
 
-    /// (Re-)indexes relationship `rel`'s current property values into every registered
-    /// relationship-property index whose covered type it carries (`rmp` task #646) — the relationship
-    /// analogue of [`reindex_node`](Self::reindex_node), driven per relationship write (`create_rel`, a
-    /// standalone / bulk `set_rel_property`, `SET r = map`, `SET r += map`).
+    /// (Re-)indexes relationship `rel` into every registered relationship-property index (`rmp` #646)
+    /// **and** every registered relationship full-text index (`rmp` #663) whose covered type it carries
+    /// — the relationship analogue of [`reindex_node`](Self::reindex_node), driven per relationship
+    /// write (`create_rel`, a standalone / bulk `set_rel_property`, `SET r = map`, `SET r += map`).
     ///
-    /// Candidate-only, exactly like the node-property path: only the relationship's *current* value is
-    /// inserted (a seek re-checks visibility, current type and current value against the transaction
-    /// snapshot), so a value change leaves a stale entry the seek filters out — no removal hook is
-    /// needed, and a `Null` value is unindexable (absent for index purposes). A no-op on the standalone
-    /// path (no derived index) and when no relationship-property index is declared (the O(1)
-    /// [`has_any_rel_property`](crate::index_set::IndexSet::has_any_rel_property) gate avoids decoding
-    /// the property chain in that common case).
+    /// The relationship-property half is candidate-only (a seek re-checks visibility / current type /
+    /// current value, so a stale entry is filtered out and no removal hook is needed). The relationship
+    /// full-text half is a wholesale per-relationship re-index (like the node full-text path): the
+    /// relationship's covered string text replaces its previous terms, and a type change that dropped
+    /// coverage removes it. A no-op on the standalone path (no derived index) and when **neither** a
+    /// relationship-property nor a relationship full-text index is declared (the O(1) `has_any_*` gates
+    /// avoid decoding the property chain in that common case).
     fn reindex_rel(&self, rel: RelId) {
         let Some(index) = &self.index else {
             return; // standalone path: no derived index to maintain.
         };
-        // O(1) gate: nothing to maintain unless at least one rel-property index is declared.
-        if !index.borrow().has_any_rel_property() {
+        // O(1) gate: nothing to maintain unless at least one relationship-property OR relationship
+        // full-text index is declared.
+        let (has_rel_prop, has_rel_ft) = {
+            let idx = index.borrow();
+            (idx.has_any_rel_property(), idx.has_any_fulltext_rel())
+        };
+        if !has_rel_prop && !has_rel_ft {
             return;
         }
         // The relationship's current type token (store borrow released before the index borrow).
@@ -1355,9 +1488,8 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 Err(_) => return, // cannot read the relationship: skip (a captured error already aborts).
             }
         };
-        // Resolve the relationship's current property values (newest-wins per key), keeping only the
-        // keys a registered index over this relationship's type covers, so the index borrow below never
-        // overlaps a store borrow.
+        // Resolve the relationship's current property values (newest-wins per key), so the index borrow
+        // below never overlaps a store borrow.
         let resolved: Vec<(u32, Value)> = {
             let store = self.store.borrow();
             let chain = match store.rel_property_values(rel.0) {
@@ -1373,11 +1505,31 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             }
             out
         };
+        // The relationship's current STRING property values, for full-text maintenance (`rmp` #663):
+        // a full-text index covers text, so only string values participate.
+        let string_props: Vec<(u32, String)> = resolved
+            .iter()
+            .filter_map(|(prop_key, value)| match value {
+                Value::String(s) => Some((*prop_key, s.clone())),
+                _ => None,
+            })
+            .collect();
         let mut index = index.borrow_mut();
-        for (prop_key, value) in &resolved {
-            if index.has_rel_property(type_token, *prop_key) {
-                index.insert_rel_property(type_token, *prop_key, value, rel.0);
+        if has_rel_prop {
+            for (prop_key, value) in &resolved {
+                if index.has_rel_property(type_token, *prop_key) {
+                    index.insert_rel_property(type_token, *prop_key, value, rel.0);
+                }
             }
+        }
+        if has_rel_ft {
+            // Wholesale per-relationship re-index of every covering relationship full-text index; sets
+            // the shared full-text/spatial dirty flag if a posting changed.
+            index.reindex_fulltext_rel(rel.0, type_token, &string_props);
+            // Record THIS transaction as a full-text/spatial mutator if a posting changed (`rmp` #467,
+            // shared marker) — exactly as `reindex_node` does — so a concurrent stale reader of this
+            // relationship full-text index declines to the correct scan path until the txn retires.
+            let _ = index.note_ft_spatial_mutator(self.txn);
         }
     }
 
@@ -3489,7 +3641,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         let index = self.index.as_ref()?;
         // The full-text index must be declared (by name). If it is not, return `None` so the
         // procedure raises a clear error rather than silently empty results.
-        let (label_token, prop_keys, analyzer) = index.borrow().fulltext_target(name)?;
+        let (label_tokens, prop_keys, analyzer) = index.borrow().fulltext_target(name)?;
 
         // Cross-snapshot freshness gate (`rmp` task #467): if this reader's MVCC snapshot PREDATES the
         // last committed (or any in-flight / rolled-back) full-text/spatial mutation, the inverted
@@ -3498,10 +3650,10 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // cannot repair). Unlike the spatial seek we CANNOT signal "fall back" with `None` — the
         // procedure treats `None` as "no such index" — so we run a snapshot-correct full-text SCAN
         // fallback INTERNALLY and return `Some(correct_set)`. The fallback reproduces the SAME SSI
-        // footprint (`mark_all_live_nodes` + per-candidate `filter_label_candidates`) as this fast path,
-        // so serializability is unchanged.
+        // footprint (`mark_all_live_nodes` + per-candidate `filter_any_label_candidates`) as this fast
+        // path, so serializability is unchanged.
         if self.snapshot.ts < index.borrow().effective_ft_spatial_marker() {
-            return Some(self.fulltext_scan_fallback(label_token, &prop_keys, analyzer, search));
+            return Some(self.fulltext_scan_fallback(&label_tokens, &prop_keys, analyzer, search));
         }
 
         // SSI predicate footprint: a full-text query reads the candidate documents; preserve the same
@@ -3510,17 +3662,74 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         self.mark_all_live_nodes();
 
         // Candidate ids from the inverted index (analyzed with the index's analyzer). Candidate-only,
-        // so re-check visibility + current label via `filter_label_candidates` (which also records the
-        // SIREAD markers). The inverted index is maintained on every write (`reindex_node`), so a
-        // surviving candidate's terms are the node's current committed/own-transaction text.
+        // so re-check visibility + current label via `filter_any_label_candidates` (which also records
+        // the SIREAD markers). Multi-label (`rmp` #663): a node carrying **any** covered label survives.
+        // The inverted index is maintained on every write (`reindex_node`), so a surviving candidate's
+        // terms are the node's current committed/own-transaction text.
         let candidates = index
             .borrow()
             .query_fulltext(name, search, graphus_index::fulltext::MatchSemantics::Or)
             .unwrap_or_default();
-        let mut out = self.filter_label_candidates(label_token, candidates);
+        let mut out = self.filter_any_label_candidates(&label_tokens, candidates);
         out.sort_unstable();
         out.dedup();
         Some(out)
+    }
+
+    /// A **relationship** full-text index query (`rmp` task #663): the candidate relationship ids
+    /// matching `search` against the relationship full-text index named `name`, MVCC-/SSI-correct.
+    ///
+    /// The relationship analogue of [`fulltext_query`](Self::fulltext_query): same
+    /// [candidate-set contract](crate::index_set), same cross-snapshot freshness gate (`rmp` #467, the
+    /// shared full-text/spatial marker also tracks relationship full-text mutations), and the same
+    /// SSI footprint the [`rel_index_seek_eq`](Self::rel_index_seek_eq) path uses
+    /// ([`mark_all_live_rels`](Self::mark_all_live_rels) + per-candidate [`rel_data`](GraphAccess::rel_data)).
+    /// Returns `None` when no such index is declared (the procedure turns that into a clear error).
+    fn fulltext_query_rel(&self, name: &str, search: &str) -> Option<Vec<RelId>> {
+        let index = self.index.as_ref()?;
+        let (type_tokens, prop_keys, analyzer) = index.borrow().fulltext_rel_target(name)?;
+
+        // Cross-snapshot freshness gate (`rmp` #467): a stale reader falls back to a snapshot-correct
+        // relationship scan (the shared marker also reflects relationship full-text mutations).
+        if self.snapshot.ts < index.borrow().effective_ft_spatial_marker() {
+            return Some(self.fulltext_rel_scan_fallback(
+                &type_tokens,
+                &prop_keys,
+                analyzer,
+                search,
+            ));
+        }
+
+        // Preserve the scan's blanket SSI footprint so the fast path is exactly as strong (the same
+        // stance `rel_index_seek_eq` documents).
+        self.mark_all_live_rels();
+
+        let candidates = index
+            .borrow()
+            .query_fulltext_rel(name, search, graphus_index::fulltext::MatchSemantics::Or)
+            .unwrap_or_default();
+        // Re-check each candidate: visible + currently of a covered type (`rel_data` SIREAD-marks it).
+        let mut out: Vec<RelId> = candidates
+            .into_iter()
+            .map(RelId)
+            .filter(|&r| {
+                self.rel_data(r).is_some_and(|data| {
+                    type_tokens
+                        .iter()
+                        .any(|&tt| self.rel_type_token_matches(&data.rel_type, tt))
+                })
+            })
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        Some(out)
+    }
+
+    /// The best-effort relevance score of relationship `rel` against `search` for the relationship
+    /// full-text index named `name` (`rmp` task #663). [`None`] if no such index is declared.
+    fn fulltext_score_rel(&self, name: &str, rel: RelId, search: &str) -> Option<u64> {
+        let index = self.index.as_ref()?;
+        index.borrow().fulltext_rel_score(name, rel.0, search)
     }
 
     /// The **snapshot-correct full-text scan fallback** for a stale reader (`rmp` task #467).
@@ -3552,7 +3761,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     /// rw-edges close.
     fn fulltext_scan_fallback(
         &self,
-        label_token: u32,
+        label_tokens: &[u32],
         prop_keys: &[u32],
         analyzer: graphus_index::fulltext::Analyzer,
         search: &str,
@@ -3562,7 +3771,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // SSI: mark every live node, exactly as the fast path does (`04 §5.4`).
         self.mark_all_live_nodes();
 
-        // Enumerate every live node id, then narrow to the snapshot-visible nodes carrying the covered
+        // Enumerate every live node id, then narrow to the snapshot-visible nodes carrying any covered
         // label via the SAME shared re-check the fast path uses on its candidates — registering the
         // per-candidate SIREAD markers identically (so the footprint matches). Read-only store access
         // (`rmp` #337 Slice 2): `scan_node_ids` is `&self`, a shared borrow suffices.
@@ -3573,7 +3782,8 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 return Vec::new();
             }
         };
-        let labelled = self.filter_label_candidates(label_token, all_ids);
+        // Multi-label (`rmp` #663): a node carrying **any** covered label is a candidate.
+        let labelled = self.filter_any_label_candidates(label_tokens, all_ids);
 
         // Resolve the covered prop-key tokens to names once (so the index borrow does not overlap a
         // store borrow during the per-node value reads below). A token without a name was never

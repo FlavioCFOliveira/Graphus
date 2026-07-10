@@ -669,7 +669,7 @@ fn fulltext_query_off_thread_is_byte_identical_to_inline() {
         let mut idx = coord.index.borrow_mut();
         idx.register_fulltext(
             "people_bio",
-            l_person,
+            vec![l_person],
             vec![k_bio],
             graphus_index::fulltext::Analyzer::Standard,
             IndexState::Online,
@@ -771,5 +771,147 @@ fn fulltext_query_off_thread_is_byte_identical_to_inline() {
         graph_hits,
         vec![NodeId(person_ids[0]), NodeId(person_ids[2])],
         "\"graph\" must match exactly the two Person bios that contain it (not the Company node)"
+    );
+}
+
+/// `rmp` task #663: the **relationship** full-text query is byte-identical off-thread vs inline
+/// (candidate set, per-candidate score, unknown-index `None`, and — the load-bearing ACID assertion —
+/// the SIREAD marker sets), the relationship analogue of
+/// `fulltext_query_off_thread_is_byte_identical_to_inline`. The live seam takes the fast inverted-index
+/// arm; the reader takes the snapshot-correct relationship scan-fallback arm.
+#[test]
+fn fulltext_query_rel_off_thread_is_byte_identical_to_inline() {
+    let notes = [
+        "graph database engineer",
+        "rust systems programmer",
+        "database and graph theory",
+    ];
+    let mut s = fresh();
+    let txn = TxnId(1);
+    s.begin(txn);
+    let t_knows = s.intern_token(Namespace::RelType, "KNOWS").unwrap();
+    let t_likes = s.intern_token(Namespace::RelType, "LIKES").unwrap();
+    let k_note = s.intern_token(Namespace::PropKey, "note").unwrap();
+    // A tiny node scaffold to anchor the relationships.
+    let mut nodes = Vec::new();
+    for _ in 0..(notes.len() + 2) {
+        let (n, _) = s.create_node(txn).unwrap();
+        nodes.push(n);
+    }
+    // KNOWS relationships carrying the covered text.
+    let mut knows_ids = Vec::new();
+    for (i, note) in notes.iter().enumerate() {
+        let (r, _) = s.create_rel(txn, t_knows, nodes[i], nodes[i + 1]).unwrap();
+        s.set_rel_property_value(txn, r, k_note, &Value::String((*note).to_owned()))
+            .unwrap();
+        knows_ids.push(r);
+    }
+    // A LIKES relationship whose note ALSO contains "graph" — must be excluded by BOTH routes (the index
+    // is type-scoped; the scan fallback filters by type), proving the type scoping.
+    let (likes, _) = s.create_rel(txn, t_likes, nodes[0], nodes[1]).unwrap();
+    s.set_rel_property_value(
+        txn,
+        likes,
+        k_note,
+        &Value::String("graph excluded by type".to_owned()),
+    )
+    .unwrap();
+    s.commit(txn).unwrap();
+    let ts = s.snapshot_ts();
+
+    let coord = Coordinated::new(s);
+    {
+        let mut idx = coord.index.borrow_mut();
+        idx.register_fulltext_rel(
+            "knows_notes",
+            vec![t_knows],
+            vec![k_note],
+            graphus_index::fulltext::Analyzer::Standard,
+            IndexState::Online,
+        );
+        for (i, note) in notes.iter().enumerate() {
+            idx.reindex_fulltext_rel(knows_ids[i], t_knows, &[(k_note, (*note).to_owned())]);
+        }
+        idx.clear_ft_spatial_dirty();
+    }
+
+    for search in [
+        "graph",
+        "database",
+        "rust",
+        "graph database",
+        "nonexistentterm",
+        "",
+    ] {
+        let live = coord.live_at(TxnId(100), ts);
+        let ro = coord
+            .reader_at(TxnId(100), ts)
+            .with_fulltext(coord.index.borrow().fulltext_snapshot());
+
+        let live_q = live.fulltext_query_rel("knows_notes", search);
+        let ro_q = ro.fulltext_query_rel("knows_notes", search);
+        assert_eq!(
+            live_q, ro_q,
+            "fulltext_query_rel({search:?}): off-thread candidate set differs from inline"
+        );
+
+        if let Some(cands) = &live_q {
+            for &c in cands {
+                assert_eq!(
+                    live.fulltext_score_rel("knows_notes", c, search),
+                    ro.fulltext_score_rel("knows_notes", c, search),
+                    "fulltext_score_rel({search:?}, {c:?}): off-thread score differs from inline"
+                );
+            }
+        }
+
+        // An unknown relationship index name is `None` on BOTH routes.
+        assert_eq!(
+            live.fulltext_query_rel("no_such_index", search),
+            ro.fulltext_query_rel("no_such_index", search),
+            "fulltext_query_rel on an unknown index must agree (both None)"
+        );
+        assert!(live.fulltext_query_rel("no_such_index", search).is_none());
+
+        // SIREAD markers byte-identical: both routes mark every live relationship.
+        let live_buf = live
+            .take_read_buffer()
+            .expect("coordinated live seam holds a SIREAD buffer");
+        let ro_buf = ro.take_buffer();
+        let (live_reader, live_keys, live_preds) = canonical(live_buf);
+        let (ro_reader, ro_keys, ro_preds) = canonical(ro_buf);
+        assert_eq!(
+            live_reader, ro_reader,
+            "{search:?}: SIREAD reader id differs"
+        );
+        assert_eq!(
+            live_keys, ro_keys,
+            "{search:?}: per-record SIREAD key markers differ (sorted+deduped)"
+        );
+        assert_eq!(
+            live_preds, ro_preds,
+            "{search:?}: predicate SIREAD markers differ (sorted+deduped)"
+        );
+        assert!(
+            !live_keys.is_empty(),
+            "{search:?}: expected non-empty SIREAD key markers (assertion would be vacuous)"
+        );
+        assert_eq!(
+            live.take_error().map(|e| e.to_string()),
+            ro.take_error().map(|e| e.to_string()),
+            "{search:?}: captured-error Display differs between the seams"
+        );
+    }
+
+    // Cross-check: "graph" matches exactly the two KNOWS relationships whose note contains it (never
+    // the LIKES one), ascending by id.
+    let live = coord.live_at(TxnId(101), ts);
+    let graph_hits = live
+        .fulltext_query_rel("knows_notes", "graph")
+        .expect("index exists");
+    assert_eq!(
+        graph_hits,
+        vec![RelId(knows_ids[0]), RelId(knows_ids[2])],
+        "\"graph\" must match exactly the two KNOWS relationships that contain it"
     );
 }

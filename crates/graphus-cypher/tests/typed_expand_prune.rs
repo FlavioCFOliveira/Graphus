@@ -54,6 +54,9 @@ impl StoreReadSource for Counting<'_> {
     fn scan_node_ids(&self) -> Result<Vec<u64>, graphus_core::error::GraphusError> {
         self.inner.scan_node_ids()
     }
+    fn scan_rel_ids(&self) -> Result<Vec<u64>, graphus_core::error::GraphusError> {
+        self.inner.scan_rel_ids()
+    }
     fn node_labels(&self, id: u64) -> Result<Vec<u32>, graphus_core::error::GraphusError> {
         self.inner.node_labels(id)
     }

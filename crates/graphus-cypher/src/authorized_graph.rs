@@ -710,6 +710,23 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         self.inner.fulltext_score(name, node, search)
     }
 
+    fn fulltext_query_rel(&self, name: &str, search: &str) -> Option<Vec<RelId>> {
+        let ids = self.inner.fulltext_query_rel(name, search)?;
+        if self.oracle.is_unrestricted() {
+            return Some(ids);
+        }
+        // A relationship full-text query is a read path (`rmp` task #663): filter the candidate ids
+        // exactly like a scan, so an RBAC-invisible relationship (traverse denied, or an endpoint not
+        // visible) never reaches the result. The procedure body additionally re-checks each candidate's
+        // current type through this same decorator, so the filters compose (visibility + type + RBAC).
+        Some(ids.into_iter().filter(|&id| self.rel_visible(id)).collect())
+    }
+
+    fn fulltext_score_rel(&self, name: &str, rel: RelId, search: &str) -> Option<u64> {
+        // Advisory, only requested for an already-visible candidate (the procedure filters first).
+        self.inner.fulltext_score_rel(name, rel, search)
+    }
+
     // ---- writes ----------------------------------------------------------------------------------
 
     fn create_node(&mut self, labels: &[String], properties: &[(String, Value)]) -> NodeId {

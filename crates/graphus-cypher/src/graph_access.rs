@@ -400,6 +400,30 @@ pub trait GraphAccess {
         None
     }
 
+    /// A **relationship** full-text index query (`rmp` task #663): the **candidate** relationship ids
+    /// matching `search` against the relationship full-text index named `name`, analyzed with the
+    /// index's own analyzer (OR-of-terms by default) — the relationship analogue of
+    /// [`fulltext_query`](Self::fulltext_query).
+    ///
+    /// Returns `None` when **no relationship full-text index of that name is declared** (the
+    /// `db.index.fulltext.queryRelationships` procedure turns this into a `ProcedureFailure` so a typo /
+    /// wrong-kind name is a clear error, not silently-empty results). `Some(ids)` is a **candidate**
+    /// set — the caller re-checks each id's visibility and current type through this same seam, so a
+    /// deleted / invisible / re-typed relationship never reaches the result, and (when this seam is an
+    /// [`AuthorizedGraph`](crate::authorized_graph::AuthorizedGraph)) RBAC composes for free. The
+    /// default returns `None` (no relationship full-text index available).
+    fn fulltext_query_rel(&self, _name: &str, _search: &str) -> Option<Vec<RelId>> {
+        None
+    }
+
+    /// The **best-effort relevance score** of relationship `rel` against `search` for the relationship
+    /// full-text index named `name` (`rmp` task #663) — the relationship analogue of
+    /// [`fulltext_score`](Self::fulltext_score). Returns `None` when no such index is declared, or when
+    /// the relationship is not in the index. The default returns `None`.
+    fn fulltext_score_rel(&self, _name: &str, _rel: RelId, _search: &str) -> Option<u64> {
+        None
+    }
+
     /// The **snapshot-correct full-text scan fallback** for a stale reader (`rmp` task #467): an
     /// internal seam helper. The default is a no-op (`Vec::new()`); the store-backed
     /// [`RecordStoreGraph`](crate::record_graph) overrides it to compute the matching node set directly
@@ -410,7 +434,7 @@ pub trait GraphAccess {
     /// other seams keep the no-op default.
     fn fulltext_scan_fallback(
         &self,
-        _label_token: u32,
+        _label_tokens: &[u32],
         _prop_keys: &[u32],
         _analyzer: graphus_index::fulltext::Analyzer,
         _search: &str,
@@ -703,6 +727,11 @@ pub struct MemGraph {
     /// maintenance hooks — exactly the candidate-set behaviour the real backend produces after its
     /// per-write maintenance + MVCC re-check.
     fulltext: BTreeMap<String, MemFulltextIndex>,
+    /// Declared **relationship** full-text indexes for executor/procedure tests (`rmp` task #663), keyed
+    /// by name. Like the node full-text reference impl, candidates are computed on the fly from the live
+    /// relationships at query time (re-analyzing the covered property text), so updates and deletes are
+    /// reflected with no maintenance hooks.
+    fulltext_rel: BTreeMap<String, MemFulltextRelIndex>,
     /// Declared spatial indexes for executor tests (`rmp` task #73), keyed by `(label, property)`.
     /// Like the full-text reference impl, candidates are computed on the fly from the live nodes at
     /// query time (a bounding-box superset over the point property), so the seek behaves exactly like
@@ -723,11 +752,23 @@ pub struct MemGraph {
     counters: crate::counters::QueryCounters,
 }
 
-/// A declared full-text index in [`MemGraph`] (`rmp` task #72): the covered label, properties and
-/// analyzer. The reference impl holds no inverted index — it analyzes nodes lazily at query time.
+/// A declared node full-text index in [`MemGraph`] (`rmp` tasks #72, #663): the covered labels,
+/// properties and analyzer. The reference impl holds no inverted index — it analyzes nodes lazily at
+/// query time. A node carrying **any** covered label matches (multi-label semantics).
 #[derive(Debug, Clone)]
 struct MemFulltextIndex {
-    label: String,
+    labels: Vec<String>,
+    properties: Vec<String>,
+    analyzer: graphus_index::fulltext::Analyzer,
+}
+
+/// A declared **relationship** full-text index in [`MemGraph`] (`rmp` task #663): the covered
+/// relationship types, properties and analyzer. Like the node reference impl it holds no inverted
+/// index — it analyzes relationships lazily at query time. A relationship of **any** covered type
+/// matches (multi-type semantics).
+#[derive(Debug, Clone)]
+struct MemFulltextRelIndex {
+    types: Vec<String>,
     properties: Vec<String>,
     analyzer: graphus_index::fulltext::Analyzer,
 }
@@ -773,9 +814,9 @@ impl MemGraph {
         self.create_rel(&rel_type.into(), start, end, &props)
     }
 
-    /// Declares a full-text index named `name` over `(label, properties)` with `analyzer`
-    /// (`rmp` task #72; test/setup helper). The index computes matches lazily at query time, so it
-    /// immediately covers existing and future nodes. Re-declaring the same name replaces it.
+    /// Declares a node full-text index named `name` over a single `label` + `properties` with
+    /// `analyzer` (`rmp` task #72; test/setup helper). The index computes matches lazily at query time,
+    /// so it immediately covers existing and future nodes. Re-declaring the same name replaces it.
     pub fn create_fulltext_index<P, S>(
         &mut self,
         name: impl Into<String>,
@@ -786,11 +827,58 @@ impl MemGraph {
         P: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        let label = label.into();
+        self.create_fulltext_index_multi(name, [label], properties, analyzer);
+    }
+
+    /// Declares a **multi-label** node full-text index named `name` over `labels` + `properties`
+    /// (`rmp` task #663; test/setup helper). A node carrying **any** covered label matches. Re-declaring
+    /// the same name replaces it.
+    pub fn create_fulltext_index_multi<L, LS, P, S>(
+        &mut self,
+        name: impl Into<String>,
+        labels: L,
+        properties: P,
+        analyzer: graphus_index::fulltext::Analyzer,
+    ) where
+        L: IntoIterator<Item = LS>,
+        LS: Into<String>,
+        P: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let labels: Vec<String> = labels.into_iter().map(Into::into).collect();
         let properties: Vec<String> = properties.into_iter().map(Into::into).collect();
         self.fulltext.insert(
             name.into(),
             MemFulltextIndex {
-                label: label.into(),
+                labels,
+                properties,
+                analyzer,
+            },
+        );
+    }
+
+    /// Declares a **relationship** full-text index named `name` over `types` + `properties`
+    /// (`rmp` task #663; test/setup helper). A relationship of **any** covered type matches. Re-declaring
+    /// the same name replaces it.
+    pub fn create_fulltext_rel_index<T, TS, P, S>(
+        &mut self,
+        name: impl Into<String>,
+        types: T,
+        properties: P,
+        analyzer: graphus_index::fulltext::Analyzer,
+    ) where
+        T: IntoIterator<Item = TS>,
+        TS: Into<String>,
+        P: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let types: Vec<String> = types.into_iter().map(Into::into).collect();
+        let properties: Vec<String> = properties.into_iter().map(Into::into).collect();
+        self.fulltext_rel.insert(
+            name.into(),
+            MemFulltextRelIndex {
+                types,
                 properties,
                 analyzer,
             },
@@ -823,6 +911,21 @@ impl MemGraph {
         let mut terms = Vec::new();
         for prop in &idx.properties {
             if let Some(Value::String(text)) = node.props.get(prop) {
+                terms.extend(idx.analyzer.analyze(text));
+            }
+        }
+        terms
+    }
+
+    /// The analyzed terms of relationship `id`'s covered properties for the relationship full-text index
+    /// `idx` (`rmp` task #663). Skips a non-string property value (a full-text index covers text).
+    fn mem_fulltext_rel_terms(&self, idx: &MemFulltextRelIndex, id: RelId) -> Vec<String> {
+        let Some(rel) = self.rels.get(&id) else {
+            return Vec::new();
+        };
+        let mut terms = Vec::new();
+        for prop in &idx.properties {
+            if let Some(Value::String(text)) = rel.props.get(prop) {
                 terms.extend(idx.analyzer.analyze(text));
             }
         }
@@ -943,12 +1046,13 @@ impl GraphAccess for MemGraph {
         if query_terms.is_empty() {
             return Some(Vec::new());
         }
-        // OR-of-terms over the live nodes carrying the index's label (the reference impl computes the
-        // candidate set directly from current state — updates/deletes are reflected automatically).
+        // OR-of-terms over the live nodes carrying ANY covered label (`rmp` #663 multi-label semantics;
+        // the reference impl computes the candidate set directly from current state — updates/deletes
+        // are reflected automatically).
         let mut out: Vec<NodeId> = self
             .nodes
             .iter()
-            .filter(|(_, n)| n.labels.iter().any(|l| l == &idx.label))
+            .filter(|(_, n)| n.labels.iter().any(|l| idx.labels.contains(l)))
             .filter(|(id, _)| {
                 let terms = self.mem_fulltext_terms(idx, **id);
                 query_terms.iter().any(|q| terms.contains(q))
@@ -964,6 +1068,41 @@ impl GraphAccess for MemGraph {
         let query_terms = idx.analyzer.analyze(search);
         let doc_terms = self.mem_fulltext_terms(idx, node);
         // Distinct-query-term overlap count (mirrors `InvertedIndex::score`).
+        let mut seen = std::collections::BTreeSet::new();
+        let mut score = 0u64;
+        for term in &query_terms {
+            if seen.insert(term) && doc_terms.contains(term) {
+                score += 1;
+            }
+        }
+        Some(score)
+    }
+
+    fn fulltext_query_rel(&self, name: &str, search: &str) -> Option<Vec<RelId>> {
+        let idx = self.fulltext_rel.get(name)?;
+        let query_terms = idx.analyzer.analyze(search);
+        if query_terms.is_empty() {
+            return Some(Vec::new());
+        }
+        // OR-of-terms over the live relationships of ANY covered type (`rmp` #663 multi-type semantics).
+        let mut out: Vec<RelId> = self
+            .rels
+            .iter()
+            .filter(|(_, r)| idx.types.iter().any(|t| t == &r.rel_type))
+            .filter(|(id, _)| {
+                let terms = self.mem_fulltext_rel_terms(idx, **id);
+                query_terms.iter().any(|q| terms.contains(q))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        out.sort_unstable();
+        Some(out)
+    }
+
+    fn fulltext_score_rel(&self, name: &str, rel: RelId, search: &str) -> Option<u64> {
+        let idx = self.fulltext_rel.get(name)?;
+        let query_terms = idx.analyzer.analyze(search);
+        let doc_terms = self.mem_fulltext_rel_terms(idx, rel);
         let mut seen = std::collections::BTreeSet::new();
         let mut score = 0u64;
         for term in &query_terms {

@@ -97,6 +97,7 @@ use std::sync::Arc;
 
 use graphus_auth::{AuthError, Privilege};
 use graphus_core::{GraphusError, Value};
+use graphus_cypher::FulltextEntity;
 use tokio::runtime::Handle;
 
 use crate::audit::{
@@ -1359,10 +1360,11 @@ fn parse_claimed_fulltext(verb: &str, lex: &mut Lexer<'_>) -> Result<IndexComman
         "CREATE" => {
             // `IF NOT EXISTS` (`rmp` #661) sits between the name and the `FOR` clause (Neo4j position).
             let if_not_exists = parse_optional_if(lex, /* with_not */ true)?;
-            let (label, properties, analyzer) = parse_fulltext_create_tail(lex)?;
+            let (entity, labels_or_types, properties, analyzer) = parse_fulltext_create_tail(lex)?;
             Ok(IndexCommand::CreateFulltextIndex {
                 name,
-                label,
+                entity,
+                labels_or_types,
                 properties,
                 analyzer,
                 if_not_exists,
@@ -1373,21 +1375,18 @@ fn parse_claimed_fulltext(verb: &str, lex: &mut Lexer<'_>) -> Result<IndexComman
     }
 }
 
-/// Parses the `FOR (<var>:<Label>) ON EACH [<var>.<prop>, …] [OPTIONS { analyzer: '<name>' }]` tail
-/// of a `CREATE FULLTEXT INDEX <name>` statement (`rmp` task #72). Returns
-/// `(label, properties, analyzer_name)`; the analyzer defaults to `"standard"` when no `OPTIONS`
-/// clause is present.
+/// Parses the `FOR <pattern> ON EACH [<var>.<prop>, …] [OPTIONS { analyzer: '<name>' }]` tail of a
+/// `CREATE FULLTEXT INDEX <name>` statement (`rmp` tasks #72, #663). `<pattern>` is either a node
+/// pattern `(<var>:<Label>[|<Label>…])` or an undirected relationship pattern
+/// `()-[<var>:<Type>[|<Type>…]]-()`. Returns `(entity, labels_or_types, properties, analyzer_name)`;
+/// the analyzer defaults to `"standard"` when no `OPTIONS` clause is present.
 fn parse_fulltext_create_tail(
     lex: &mut Lexer<'_>,
-) -> Result<(String, Vec<String>, String), String> {
+) -> Result<(FulltextEntity, Vec<String>, Vec<String>, String), String> {
     const VERB: &str = "FULLTEXT";
-    // FOR ( <var> : <Label> )
+    // FOR <node or relationship pattern>
     expect_keyword(lex, "FOR", VERB)?;
-    expect_symbol(lex, '(', VERB)?;
-    let _var = expect_word(lex, "a variable", VERB)?;
-    expect_symbol(lex, ':', VERB)?;
-    let label = expect_name(lex, "a label", VERB)?;
-    expect_symbol(lex, ')', VERB)?;
+    let (entity, labels_or_types) = parse_fulltext_pattern(lex)?;
     // ON EACH [ <var>.<prop> , … ]
     expect_keyword(lex, "ON", VERB)?;
     expect_keyword(lex, "EACH", VERB)?;
@@ -1402,7 +1401,51 @@ fn parse_fulltext_create_tail(
     // Optional OPTIONS { analyzer: '<name>' }
     let analyzer = parse_optional_fulltext_options(lex)?.unwrap_or_else(|| "standard".to_owned());
     expect_end(lex, "CREATE FULLTEXT INDEX")?;
-    Ok((label, properties, analyzer))
+    Ok((entity, labels_or_types, properties, analyzer))
+}
+
+/// Parses a full-text index `FOR` pattern (`rmp` task #663): a node pattern `(<var>:<Label>[|<Label>…])`
+/// or an undirected relationship pattern `()-[<var>:<Type>[|<Type>…]]-()`, returning the
+/// [`FulltextEntity`] and the ordered, `|`-separated label/type list (one or more). Multi-label/-type
+/// is Neo4j's `A|B` syntax; a directed relationship arrow (`->` / `<-`) is a syntax error (only the
+/// undirected form is accepted, like the constraint surface).
+fn parse_fulltext_pattern(lex: &mut Lexer<'_>) -> Result<(FulltextEntity, Vec<String>), String> {
+    const VERB: &str = "FULLTEXT";
+    expect_symbol(lex, '(', VERB)?;
+    // A relationship pattern opens with an empty node `()`.
+    if peek_symbol(lex, ')')? {
+        // ()-[ <var> : <Type>[|<Type>…] ]-()
+        expect_symbol(lex, ')', VERB)?; // close the empty start node
+        expect_dash(lex, VERB)?;
+        expect_symbol(lex, '[', VERB)?;
+        let _var = expect_word(lex, "a variable", VERB)?;
+        expect_symbol(lex, ':', VERB)?;
+        let types = parse_fulltext_token_list(lex, "a relationship type")?;
+        expect_symbol(lex, ']', VERB)?;
+        expect_dash(lex, VERB)?;
+        expect_symbol(lex, '(', VERB)?;
+        expect_symbol(lex, ')', VERB)?;
+        return Ok((FulltextEntity::Relationship, types));
+    }
+    // (<var> : <Label>[|<Label>…])
+    let _var = expect_word(lex, "a variable", VERB)?;
+    expect_symbol(lex, ':', VERB)?;
+    let labels = parse_fulltext_token_list(lex, "a label")?;
+    expect_symbol(lex, ')', VERB)?;
+    Ok((FulltextEntity::Node, labels))
+}
+
+/// Parses a `|`-separated list of label / relationship-type names (`rmp` task #663), one or more, in
+/// declared order. `what` names the token kind for error messages (`"a label"` / `"a relationship
+/// type"`). Mirrors the constraint type-union `|` fold.
+fn parse_fulltext_token_list(lex: &mut Lexer<'_>, what: &str) -> Result<Vec<String>, String> {
+    const VERB: &str = "FULLTEXT";
+    let mut tokens = vec![expect_name(lex, what, VERB)?];
+    while peek_symbol(lex, '|')? {
+        expect_symbol(lex, '|', VERB)?;
+        tokens.push(expect_name(lex, what, VERB)?);
+    }
+    Ok(tokens)
 }
 
 /// Parses an optional full-text-index `OPTIONS { … }` clause (`rmp` tasks #72, #661), only consumed
@@ -5410,7 +5453,8 @@ mod tests {
             index_cmd("CREATE FULLTEXT INDEX articles FOR (n:Article) ON EACH [n.title]"),
             IndexCommand::CreateFulltextIndex {
                 name: "articles".to_owned(),
-                label: "Article".to_owned(),
+                entity: FulltextEntity::Node,
+                labels_or_types: vec!["Article".to_owned()],
                 properties: vec!["title".to_owned()],
                 analyzer: "standard".to_owned(),
                 if_not_exists: false,
@@ -5424,7 +5468,8 @@ mod tests {
             ),
             IndexCommand::CreateFulltextIndex {
                 name: "books".to_owned(),
-                label: "Book".to_owned(),
+                entity: FulltextEntity::Node,
+                labels_or_types: vec!["Book".to_owned()],
                 properties: vec!["title".to_owned(), "summary".to_owned()],
                 analyzer: "keyword".to_owned(),
                 if_not_exists: false,
@@ -5435,11 +5480,59 @@ mod tests {
             index_cmd("CREATE FULLTEXT INDEX `INDEX` FOR (n:`Order`) ON EACH [n.`from`]"),
             IndexCommand::CreateFulltextIndex {
                 name: "INDEX".to_owned(),
-                label: "Order".to_owned(),
+                entity: FulltextEntity::Node,
+                labels_or_types: vec!["Order".to_owned()],
                 properties: vec!["from".to_owned()],
                 analyzer: "standard".to_owned(),
                 if_not_exists: false,
             }
+        );
+    }
+
+    #[test]
+    fn create_fulltext_multi_label_node_and_relationship() {
+        // `rmp` task #663: multi-label node index (`A|B`).
+        assert_eq!(
+            index_cmd("CREATE FULLTEXT INDEX ml FOR (n:Article|Blog) ON EACH [n.title]"),
+            IndexCommand::CreateFulltextIndex {
+                name: "ml".to_owned(),
+                entity: FulltextEntity::Node,
+                labels_or_types: vec!["Article".to_owned(), "Blog".to_owned()],
+                properties: vec!["title".to_owned()],
+                analyzer: "standard".to_owned(),
+                if_not_exists: false,
+            }
+        );
+        // Relationship index, single type (undirected `()-[r:T]-()`).
+        assert_eq!(
+            index_cmd("CREATE FULLTEXT INDEX rf FOR ()-[r:KNOWS]-() ON EACH [r.note]"),
+            IndexCommand::CreateFulltextIndex {
+                name: "rf".to_owned(),
+                entity: FulltextEntity::Relationship,
+                labels_or_types: vec!["KNOWS".to_owned()],
+                properties: vec!["note".to_owned()],
+                analyzer: "standard".to_owned(),
+                if_not_exists: false,
+            }
+        );
+        // Relationship index, multi-type + explicit analyzer, whitespace/case-insensitive.
+        assert_eq!(
+            index_cmd(
+                "create fulltext index rm for ()-[ e : RATED | REVIEWED ]-() on each \
+                 [ e.body , e.title ] options { analyzer: 'keyword' }"
+            ),
+            IndexCommand::CreateFulltextIndex {
+                name: "rm".to_owned(),
+                entity: FulltextEntity::Relationship,
+                labels_or_types: vec!["RATED".to_owned(), "REVIEWED".to_owned()],
+                properties: vec!["body".to_owned(), "title".to_owned()],
+                analyzer: "keyword".to_owned(),
+                if_not_exists: false,
+            }
+        );
+        // A directed relationship arrow is rejected (only the undirected form is accepted).
+        assert!(
+            !invalid("CREATE FULLTEXT INDEX rf FOR ()-[r:KNOWS]->() ON EACH [r.note]").is_empty()
         );
     }
 
@@ -5647,7 +5740,8 @@ mod tests {
             ),
             IndexCommand::CreateFulltextIndex {
                 name: "ft".to_owned(),
-                label: "Doc".to_owned(),
+                entity: FulltextEntity::Node,
+                labels_or_types: vec!["Doc".to_owned()],
                 properties: vec!["body".to_owned()],
                 analyzer: "keyword".to_owned(),
                 if_not_exists: false,
@@ -5661,7 +5755,8 @@ mod tests {
             ),
             IndexCommand::CreateFulltextIndex {
                 name: "ft".to_owned(),
-                label: "Doc".to_owned(),
+                entity: FulltextEntity::Node,
+                labels_or_types: vec!["Doc".to_owned()],
                 properties: vec!["body".to_owned()],
                 analyzer: "standard".to_owned(),
                 if_not_exists: false,
@@ -5691,7 +5786,8 @@ mod tests {
             index_cmd("CREATE FULLTEXT INDEX ft IF NOT EXISTS FOR (n:Doc) ON EACH [n.body]"),
             IndexCommand::CreateFulltextIndex {
                 name: "ft".to_owned(),
-                label: "Doc".to_owned(),
+                entity: FulltextEntity::Node,
+                labels_or_types: vec!["Doc".to_owned()],
                 properties: vec!["body".to_owned()],
                 analyzer: "standard".to_owned(),
                 if_not_exists: true,

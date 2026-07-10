@@ -3683,6 +3683,21 @@ impl GraphAccess for ReadOnlyGraph<'_> {
     ) -> Option<u64> {
         self.0.fulltext_score(name, node, search)
     }
+    fn fulltext_query_rel(
+        &self,
+        name: &str,
+        search: &str,
+    ) -> Option<Vec<crate::graph_access::RelId>> {
+        self.0.fulltext_query_rel(name, search)
+    }
+    fn fulltext_score_rel(
+        &self,
+        name: &str,
+        rel: crate::graph_access::RelId,
+        search: &str,
+    ) -> Option<u64> {
+        self.0.fulltext_score_rel(name, rel, search)
+    }
     fn statistics(&self) -> Option<&dyn crate::statistics::Statistics> {
         self.0.statistics()
     }

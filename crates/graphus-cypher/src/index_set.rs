@@ -103,11 +103,20 @@ pub struct IndexSet {
     /// [`online_rel_properties`](Self::online_rel_properties) so the planner never routes a seek to a
     /// half-built index.
     rel_props: HashMap<(u32, u32), RelationshipPropertyIndex>,
-    /// Declared **full-text** indexes (`rmp` task #72), keyed by their server-unique **name**. Each
-    /// value carries the covered label, the covered property keys, the analyzer, the build state and
-    /// the in-memory [`InvertedIndex`]. Like the property indexes the inverted index is **ephemeral**
-    /// (rebuilt from the store on open); only the *registration* is durable (the storage catalog).
+    /// Declared **node** full-text indexes (`rmp` tasks #72, #663), keyed by their server-unique
+    /// **name**. Each value carries the covered labels, the covered property keys, the analyzer, the
+    /// build state and the in-memory [`InvertedIndex`]. Like the property indexes the inverted index is
+    /// **ephemeral** (rebuilt from the store on open); only the *registration* is durable (the storage
+    /// catalog).
     fulltext: HashMap<String, FulltextEntry>,
+    /// Declared **relationship** full-text indexes (`rmp` task #663), keyed by their server-unique
+    /// **name** — the relationship analogue of [`fulltext`](Self#structfield.fulltext). Each value
+    /// carries the covered relationship types, the covered property keys, the analyzer, the build state
+    /// and an in-memory [`InvertedIndex`] whose postings are **relationship** ids. Kept in a separate
+    /// map from the node full-text indexes (a numeric collision between a label token and a rel-type
+    /// token never mixes the two), exactly as `rel_props` is separate from `node_props`. Ephemeral,
+    /// rebuilt from the store on open; only the *registration* is durable.
+    fulltext_rel: HashMap<String, FulltextRelEntry>,
     /// Declared **spatial** indexes (`rmp` task #73), keyed by `(label_token, prop_key)`. Each value
     /// carries the build state and the in-memory [`SpatialIndex`] grid over the covered point
     /// property. Ephemeral and rebuilt on open, exactly like the property and full-text indexes.
@@ -257,12 +266,15 @@ struct RelationshipPropertyIndex {
     state: IndexState,
 }
 
-/// A declared full-text index plus its build [`IndexState`] and the in-memory inverted index
-/// (`rmp` task #72). The `label_token` + `prop_keys` + `analyzer` mirror the durable catalog entry;
-/// the `index` is ephemeral (rebuilt from the store on open).
+/// A declared **node** full-text index plus its build [`IndexState`] and the in-memory inverted index
+/// (`rmp` tasks #72, #663). The `label_tokens` + `prop_keys` + `analyzer` mirror the durable catalog
+/// entry; the `index` is ephemeral (rebuilt from the store on open). A node carrying **any** of the
+/// covered labels is indexed (Neo4j multi-label semantics — `rmp` #663 widened this from a single
+/// label token).
 struct FulltextEntry {
-    /// The label-namespace token the index covers.
-    label_token: u32,
+    /// The label-namespace tokens the index covers (one or more). A node with **any** of these labels
+    /// is indexed (`rmp` task #663 multi-label semantics).
+    label_tokens: Vec<u32>,
     /// The property-key tokens the index covers, in declared order (one or more).
     prop_keys: Vec<u32>,
     /// The analyzer applied at both index time and query time (same instance, by construction).
@@ -271,6 +283,25 @@ struct FulltextEntry {
     /// maintained but not yet "complete"; a query still works against it (candidate-set contract).
     state: IndexState,
     /// The backing in-memory inverted index (term → sorted postings + forward map).
+    index: InvertedIndex,
+}
+
+/// A declared **relationship** full-text index plus its build [`IndexState`] and the in-memory
+/// inverted index (`rmp` task #663) — the relationship analogue of [`FulltextEntry`]. The
+/// `type_tokens` + `prop_keys` + `analyzer` mirror the durable catalog entry; the `index` (whose
+/// postings are **relationship** ids) is ephemeral (rebuilt from the store on open). A relationship of
+/// **any** of the covered types is indexed (Neo4j multi-type semantics).
+struct FulltextRelEntry {
+    /// The relationship-type-namespace tokens the index covers (one or more). A relationship of **any**
+    /// of these types is indexed.
+    type_tokens: Vec<u32>,
+    /// The property-key tokens the index covers, in declared order (one or more).
+    prop_keys: Vec<u32>,
+    /// The analyzer applied at both index time and query time (same instance, by construction).
+    analyzer: Analyzer,
+    /// The build state, mirrored from the durable catalog.
+    state: IndexState,
+    /// The backing in-memory inverted index — postings are **relationship** ids (`rmp` task #663).
     index: InvertedIndex,
 }
 
@@ -306,6 +337,7 @@ impl IndexSet {
             node_props: HashMap::new(),
             rel_props: HashMap::new(),
             fulltext: HashMap::new(),
+            fulltext_rel: HashMap::new(),
             spatial: HashMap::new(),
             text: HashMap::new(),
             constraints: HashMap::new(),
@@ -570,6 +602,11 @@ impl IndexSet {
         // Full-text indexes: drop the inverted-index entries but keep the registration + state
         // (`rmp` task #72), mirroring the node-property handling.
         for ft in self.fulltext.values_mut() {
+            ft.index.clear();
+        }
+        // Relationship full-text indexes (`rmp` task #663): drop the rel-keyed inverted-index entries
+        // but keep the registration + state, exactly like the node full-text indexes above.
+        for ft in self.fulltext_rel.values_mut() {
             ft.index.clear();
         }
         // Spatial indexes: clear the grid entries, keep the registration + state (`rmp` task #73).
@@ -907,7 +944,7 @@ impl IndexSet {
     pub fn register_fulltext(
         &mut self,
         name: &str,
-        label_token: u32,
+        label_tokens: Vec<u32>,
         prop_keys: Vec<u32>,
         analyzer: Analyzer,
         state: IndexState,
@@ -916,10 +953,14 @@ impl IndexSet {
             !prop_keys.is_empty(),
             "full-text index needs at least one property"
         );
+        assert!(
+            !label_tokens.is_empty(),
+            "full-text index needs at least one label"
+        );
         self.fulltext.insert(
             name.to_owned(),
             FulltextEntry {
-                label_token,
+                label_tokens,
                 prop_keys,
                 analyzer,
                 state,
@@ -954,14 +995,15 @@ impl IndexSet {
         self.fulltext.get(name).map(|ft| ft.state)
     }
 
-    /// The covered `(label_token, prop_keys, analyzer)` of the full-text index named `name`, or
-    /// [`None`] if unregistered. The coordinator's rebuild/maintenance uses this to know which
-    /// property values to analyze for a node.
+    /// The covered `(label_tokens, prop_keys, analyzer)` of the full-text index named `name`, or
+    /// [`None`] if unregistered (`rmp` tasks #72, #663). The coordinator's rebuild/maintenance uses this
+    /// to know which property values to analyze for a node; a multi-label index reports every covered
+    /// label token.
     #[must_use]
-    pub fn fulltext_target(&self, name: &str) -> Option<(u32, Vec<u32>, Analyzer)> {
+    pub fn fulltext_target(&self, name: &str) -> Option<(Vec<u32>, Vec<u32>, Analyzer)> {
         self.fulltext
             .get(name)
-            .map(|ft| (ft.label_token, ft.prop_keys.clone(), ft.analyzer))
+            .map(|ft| (ft.label_tokens.clone(), ft.prop_keys.clone(), ft.analyzer))
     }
 
     /// An owned, `Send + Sync` snapshot of every declared full-text index's covered target, keyed by
@@ -980,10 +1022,18 @@ impl IndexSet {
             |(name, ft)| {
                 (
                     name.clone(),
-                    (ft.label_token, ft.prop_keys.clone(), ft.analyzer),
+                    (ft.label_tokens.clone(), ft.prop_keys.clone(), ft.analyzer),
                 )
             },
         ))
+        // Include the relationship full-text indexes (`rmp` task #663) so an off-thread
+        // `db.index.fulltext.queryRelationships` resolves them from the captured catalogue too.
+        .with_rel_targets(self.fulltext_rel.iter().map(|(name, ft)| {
+            (
+                name.clone(),
+                (ft.type_tokens.clone(), ft.prop_keys.clone(), ft.analyzer),
+            )
+        }))
     }
 
     /// The registered full-text index names (in any state), ascending. Used by the coordinator's
@@ -995,9 +1045,10 @@ impl IndexSet {
         names
     }
 
-    /// All full-text indexes that cover `label_token`, as `(name, prop_keys, analyzer)`, ascending by
-    /// name (`rmp` task #72). The coordinator's per-write maintenance uses this: for each index a
-    /// written node's label matches, it re-analyzes the node's covered property values.
+    /// All node full-text indexes that cover `label_token`, as `(name, prop_keys, analyzer)`, ascending
+    /// by name (`rmp` tasks #72, #663). The coordinator's per-write maintenance uses this: for each
+    /// index a written node's label matches, it re-analyzes the node's covered property values. A
+    /// multi-label index matches if `label_token` is **any** of its covered labels.
     #[must_use]
     pub fn fulltext_indexes_for_label(
         &self,
@@ -1006,7 +1057,7 @@ impl IndexSet {
         let mut out: Vec<(String, Vec<u32>, Analyzer)> = self
             .fulltext
             .iter()
-            .filter(|(_, ft)| ft.label_token == label_token)
+            .filter(|(_, ft)| ft.label_tokens.contains(&label_token))
             .map(|(name, ft)| (name.clone(), ft.prop_keys.clone(), ft.analyzer))
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1068,8 +1119,10 @@ impl IndexSet {
             let Some(ft) = self.fulltext.get(&name) else {
                 continue;
             };
-            if !label_tokens.contains(&ft.label_token) {
-                // The node does not (or no longer) carries the covered label: drop it from this index.
+            // Multi-label semantics (`rmp` task #663): the node is covered iff it carries **any** of
+            // the index's covered labels.
+            if !ft.label_tokens.iter().any(|lt| label_tokens.contains(lt)) {
+                // The node does not (or no longer) carries any covered label: drop it from this index.
                 // `remove_document` reports whether it was present (a real posting change).
                 if self
                     .fulltext
@@ -1133,6 +1186,199 @@ impl IndexSet {
         let ft = self.fulltext.get(name)?;
         let terms = ft.analyzer.analyze(search);
         Some(ft.index.score(node_id, &terms))
+    }
+
+    // ============================================================================================
+    // Relationship full-text indexes (`rmp` task #663)
+    // ============================================================================================
+    // Structural twins of the node full-text accessors above, keyed by index name in a **separate**
+    // map (`fulltext_rel`) whose inverted-index postings are relationship ids and whose covering tokens
+    // are relationship-type tokens, so a numeric collision between a label token and a rel-type token
+    // never mixes the two catalogs.
+
+    /// Declares (or replaces) the **relationship** full-text index named `name` over `type_tokens`
+    /// (one or more relationship types) + `prop_keys`, analyzed by `analyzer`, at `state`
+    /// (`rmp` task #663). Idempotent on the name: re-declaring resets its inverted index.
+    ///
+    /// # Panics
+    /// Panics if `prop_keys` or `type_tokens` is empty (a relationship full-text index covers at least
+    /// one property and one type — the surface and the durable catalog both enforce this).
+    pub fn register_fulltext_rel(
+        &mut self,
+        name: &str,
+        type_tokens: Vec<u32>,
+        prop_keys: Vec<u32>,
+        analyzer: Analyzer,
+        state: IndexState,
+    ) {
+        assert!(
+            !prop_keys.is_empty(),
+            "relationship full-text index needs at least one property"
+        );
+        assert!(
+            !type_tokens.is_empty(),
+            "relationship full-text index needs at least one type"
+        );
+        self.fulltext_rel.insert(
+            name.to_owned(),
+            FulltextRelEntry {
+                type_tokens,
+                prop_keys,
+                analyzer,
+                state,
+                index: InvertedIndex::new(),
+            },
+        );
+    }
+
+    /// Sets the build [`IndexState`] of the relationship full-text index named `name`. No-op if
+    /// unregistered.
+    pub fn set_fulltext_rel_state(&mut self, name: &str, state: IndexState) {
+        if let Some(ft) = self.fulltext_rel.get_mut(name) {
+            ft.state = state;
+        }
+    }
+
+    /// Unregisters the relationship full-text index named `name`, dropping its inverted index. No-op if
+    /// unregistered.
+    pub fn unregister_fulltext_rel(&mut self, name: &str) {
+        self.fulltext_rel.remove(name);
+    }
+
+    /// Whether a relationship full-text index named `name` is registered (in any state).
+    #[must_use]
+    pub fn has_fulltext_rel(&self, name: &str) -> bool {
+        self.fulltext_rel.contains_key(name)
+    }
+
+    /// Whether **any** relationship full-text index is registered — the O(1) gate the write path uses to
+    /// skip relationship full-text maintenance when none is declared (`rmp` task #663).
+    #[must_use]
+    pub fn has_any_fulltext_rel(&self) -> bool {
+        !self.fulltext_rel.is_empty()
+    }
+
+    /// The build [`IndexState`] of the relationship full-text index named `name`, or [`None`].
+    #[must_use]
+    pub fn fulltext_rel_state(&self, name: &str) -> Option<IndexState> {
+        self.fulltext_rel.get(name).map(|ft| ft.state)
+    }
+
+    /// The covered `(type_tokens, prop_keys, analyzer)` of the relationship full-text index named
+    /// `name`, or [`None`] if unregistered (`rmp` task #663).
+    #[must_use]
+    pub fn fulltext_rel_target(&self, name: &str) -> Option<(Vec<u32>, Vec<u32>, Analyzer)> {
+        self.fulltext_rel
+            .get(name)
+            .map(|ft| (ft.type_tokens.clone(), ft.prop_keys.clone(), ft.analyzer))
+    }
+
+    /// The registered relationship full-text index names (in any state), ascending (`rmp` task #663).
+    #[must_use]
+    pub fn registered_fulltext_rel(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.fulltext_rel.keys().cloned().collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// All relationship full-text indexes that cover `type_token`, as `(name, prop_keys, analyzer)`,
+    /// ascending by name (`rmp` task #663) — the per-write-maintenance driver. A multi-type index
+    /// matches if `type_token` is **any** of its covered types.
+    #[must_use]
+    pub fn fulltext_rel_indexes_for_type(
+        &self,
+        type_token: u32,
+    ) -> Vec<(String, Vec<u32>, Analyzer)> {
+        let mut out: Vec<(String, Vec<u32>, Analyzer)> = self
+            .fulltext_rel
+            .iter()
+            .filter(|(_, ft)| ft.type_tokens.contains(&type_token))
+            .map(|(name, ft)| (name.clone(), ft.prop_keys.clone(), ft.analyzer))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Re-derives relationship `rel_id`'s entries in **every** registered relationship full-text index
+    /// from the relationship's current type token and string property values (`rmp` task #663) — the
+    /// relationship analogue of [`reindex_fulltext_node`](Self::reindex_fulltext_node).
+    ///
+    /// For each index: if `type_token` is one of the index's covered types, the relationship's covered
+    /// string property values (the `(prop_key, text)` pairs in `string_props` the index covers, in the
+    /// index's declared property order) are concatenated, analyzed, and the document is (re-)indexed —
+    /// a wholesale term replace, so an update is reflected. If the relationship's type is not covered
+    /// (a value/type change that dropped coverage), the relationship is **removed** from that index.
+    pub fn reindex_fulltext_rel(
+        &mut self,
+        rel_id: u64,
+        type_token: u32,
+        string_props: &[(u32, String)],
+    ) {
+        let names: Vec<String> = self.fulltext_rel.keys().cloned().collect();
+        let mut changed = false;
+        for name in names {
+            let Some(ft) = self.fulltext_rel.get(&name) else {
+                continue;
+            };
+            if !ft.type_tokens.contains(&type_token) {
+                if self
+                    .fulltext_rel
+                    .get_mut(&name)
+                    .expect("index present")
+                    .index
+                    .remove_document(rel_id)
+                {
+                    changed = true;
+                }
+                continue;
+            }
+            let analyzer = ft.analyzer;
+            let prop_keys = ft.prop_keys.clone();
+            let mut terms: Vec<String> = Vec::new();
+            for pk in &prop_keys {
+                if let Some((_, text)) = string_props.iter().find(|(k, _)| k == pk) {
+                    terms.extend(analyzer.analyze(text));
+                }
+            }
+            // Any covered re-index is a posting change (the same over-mark-is-safe rule as
+            // `reindex_fulltext_node`): it only makes concurrent readers conservatively decline.
+            changed = true;
+            self.fulltext_rel
+                .get_mut(&name)
+                .expect("index present")
+                .index
+                .index_document(rel_id, &terms);
+        }
+        if changed {
+            // Reuse the shared full-text/spatial freshness marker (`rmp` task #467) so a stale reader of
+            // this relationship full-text index declines to the snapshot-correct scan fallback, exactly
+            // as it does for a node full-text mutation.
+            self.ft_spatial_dirty = true;
+        }
+    }
+
+    /// The **candidate** relationship ids matching `search` under the analyzer of the relationship
+    /// full-text index named `name`, ascending (`rmp` task #663). [`None`] if unregistered. The caller
+    /// re-checks visibility + current type + current text against the transaction snapshot.
+    #[must_use]
+    pub fn query_fulltext_rel(
+        &self,
+        name: &str,
+        search: &str,
+        semantics: MatchSemantics,
+    ) -> Option<Vec<u64>> {
+        let ft = self.fulltext_rel.get(name)?;
+        let terms = ft.analyzer.analyze(search);
+        Some(ft.index.query(&terms, semantics))
+    }
+
+    /// The per-distinct-term overlap **score** of relationship `rel_id` against `search` for the
+    /// relationship full-text index named `name` (`rmp` task #663). [`None`] if unregistered.
+    #[must_use]
+    pub fn fulltext_rel_score(&self, name: &str, rel_id: u64, search: &str) -> Option<u64> {
+        let ft = self.fulltext_rel.get(name)?;
+        let terms = ft.analyzer.analyze(search);
+        Some(ft.index.score(rel_id, &terms))
     }
 
     // ============================================================================================
@@ -2300,12 +2546,18 @@ mod tests {
     fn fulltext_register_index_query_and_state() {
         let mut set = IndexSet::new();
         assert!(!set.has_fulltext("ft"));
-        set.register_fulltext("ft", 1, vec![5, 6], Analyzer::Standard, IndexState::Online);
+        set.register_fulltext(
+            "ft",
+            vec![1],
+            vec![5, 6],
+            Analyzer::Standard,
+            IndexState::Online,
+        );
         assert!(set.has_fulltext("ft"));
         assert_eq!(set.fulltext_state("ft"), Some(IndexState::Online));
         assert_eq!(
             set.fulltext_target("ft"),
-            Some((1, vec![5, 6], Analyzer::Standard))
+            Some((vec![1], vec![5, 6], Analyzer::Standard))
         );
         assert_eq!(set.registered_fulltext(), vec!["ft".to_owned()]);
 
@@ -2336,7 +2588,13 @@ mod tests {
     #[test]
     fn fulltext_update_delete_and_unregister() {
         let mut set = IndexSet::new();
-        set.register_fulltext("ft", 1, vec![5], Analyzer::Standard, IndexState::Populating);
+        set.register_fulltext(
+            "ft",
+            vec![1],
+            vec![5],
+            Analyzer::Standard,
+            IndexState::Populating,
+        );
         set.index_fulltext_document("ft", 100, &Analyzer::Standard.analyze("graph database"));
         assert_eq!(
             set.query_fulltext("ft", "database", MatchSemantics::Or),
@@ -2372,21 +2630,100 @@ mod tests {
     #[test]
     fn fulltext_indexes_for_label_filters_by_label_token() {
         let mut set = IndexSet::new();
-        set.register_fulltext("a", 1, vec![5], Analyzer::Standard, IndexState::Online);
-        set.register_fulltext("b", 1, vec![6], Analyzer::Keyword, IndexState::Online);
-        set.register_fulltext("c", 2, vec![7], Analyzer::Standard, IndexState::Online);
+        set.register_fulltext(
+            "a",
+            vec![1],
+            vec![5],
+            Analyzer::Standard,
+            IndexState::Online,
+        );
+        set.register_fulltext("b", vec![1], vec![6], Analyzer::Keyword, IndexState::Online);
+        set.register_fulltext(
+            "c",
+            vec![2],
+            vec![7],
+            Analyzer::Standard,
+            IndexState::Online,
+        );
+        // A multi-label index over labels {2, 3} is matched for label 2 (any covered label, `rmp` #663).
+        set.register_fulltext(
+            "d",
+            vec![2, 3],
+            vec![8],
+            Analyzer::Standard,
+            IndexState::Online,
+        );
         let for_1 = set.fulltext_indexes_for_label(1);
         assert_eq!(for_1.len(), 2);
         assert_eq!(for_1[0].0, "a");
         assert_eq!(for_1[1].0, "b");
-        assert_eq!(set.fulltext_indexes_for_label(2).len(), 1);
+        assert_eq!(set.fulltext_indexes_for_label(2).len(), 2); // "c" + multi-label "d"
+        assert_eq!(set.fulltext_indexes_for_label(3).len(), 1); // multi-label "d"
         assert_eq!(set.fulltext_indexes_for_label(9).len(), 0);
+    }
+
+    #[test]
+    fn fulltext_rel_register_index_query_and_state() {
+        // `rmp` task #663: the relationship full-text index mirrors the node one over a separate map.
+        let mut set = IndexSet::new();
+        assert!(!set.has_fulltext_rel("rt"));
+        assert!(!set.has_any_fulltext_rel());
+        set.register_fulltext_rel(
+            "rt",
+            vec![1, 2],
+            vec![5],
+            Analyzer::Standard,
+            IndexState::Online,
+        );
+        assert!(set.has_fulltext_rel("rt"));
+        assert!(set.has_any_fulltext_rel());
+        assert_eq!(set.fulltext_rel_state("rt"), Some(IndexState::Online));
+        assert_eq!(
+            set.fulltext_rel_target("rt"),
+            Some((vec![1, 2], vec![5], Analyzer::Standard))
+        );
+        assert_eq!(set.registered_fulltext_rel(), vec!["rt".to_owned()]);
+        // A multi-type index over types {1, 2} is matched for either type.
+        assert_eq!(set.fulltext_rel_indexes_for_type(1).len(), 1);
+        assert_eq!(set.fulltext_rel_indexes_for_type(2).len(), 1);
+        assert_eq!(set.fulltext_rel_indexes_for_type(9).len(), 0);
+
+        // Maintain + query by rel id.
+        set.reindex_fulltext_rel(100, 1, &[(5, "graph database".to_owned())]);
+        set.reindex_fulltext_rel(200, 2, &[(5, "graph theory".to_owned())]);
+        assert_eq!(
+            set.query_fulltext_rel("rt", "graph", MatchSemantics::Or),
+            Some(vec![100, 200])
+        );
+        assert_eq!(
+            set.query_fulltext_rel("rt", "database", MatchSemantics::Or),
+            Some(vec![100])
+        );
+        assert_eq!(set.fulltext_rel_score("rt", 100, "graph database"), Some(2));
+
+        // A type change that drops coverage removes the rel from the index.
+        set.reindex_fulltext_rel(100, 9, &[(5, "graph database".to_owned())]);
+        assert_eq!(
+            set.query_fulltext_rel("rt", "graph", MatchSemantics::Or),
+            Some(vec![200])
+        );
+
+        set.unregister_fulltext_rel("rt");
+        assert!(!set.has_fulltext_rel("rt"));
+        assert!(!set.has_any_fulltext_rel());
+        assert_eq!(set.query_fulltext_rel("rt", "x", MatchSemantics::Or), None);
     }
 
     #[test]
     fn fulltext_clear_preserves_registration_drops_entries() {
         let mut set = IndexSet::new();
-        set.register_fulltext("ft", 1, vec![5], Analyzer::Standard, IndexState::Online);
+        set.register_fulltext(
+            "ft",
+            vec![1],
+            vec![5],
+            Analyzer::Standard,
+            IndexState::Online,
+        );
         set.index_fulltext_document("ft", 100, &Analyzer::Standard.analyze("graph"));
         set.clear();
         // Registration + state survive; entries are gone.
@@ -2401,7 +2738,13 @@ mod tests {
     #[test]
     fn fulltext_score_uses_index_analyzer() {
         let mut set = IndexSet::new();
-        set.register_fulltext("ft", 1, vec![5], Analyzer::Standard, IndexState::Online);
+        set.register_fulltext(
+            "ft",
+            vec![1],
+            vec![5],
+            Analyzer::Standard,
+            IndexState::Online,
+        );
         set.index_fulltext_document(
             "ft",
             100,

@@ -491,16 +491,32 @@ enum Operator {
         /// the implicit form to parameter expressions).
         args: Vec<Expr>,
         /// The output bindings, resolved at build time: `(variable name, index into the procedure's
-        /// result row, is_node)`. `is_node` is `true` when the bound output column's declared class is
-        /// [`ValueClass::Node`](crate::procedure_registry::ValueClass::Node) (`rmp` task #72): the
-        /// yielded id [`Value`] is then bound as a structural [`RowValue::Node`] (so result egress
-        /// materializes it, composing MVCC + RBAC), instead of a plain [`RowValue::Value`].
-        bindings: Vec<(String, usize, bool)>,
+        /// result row, output kind)`. The [`ProcOutputKind`] marks a
+        /// [`ValueClass::Node`](crate::procedure_registry::ValueClass::Node) (`rmp` task #72) or
+        /// [`ValueClass::Relationship`](crate::procedure_registry::ValueClass::Relationship)
+        /// (`rmp` task #663) output, whose yielded id [`Value`] is bound as a structural
+        /// [`RowValue::Node`] / [`RowValue::Rel`] (so result egress materializes it, composing MVCC +
+        /// RBAC) instead of a plain [`RowValue::Value`].
+        bindings: Vec<(String, usize, ProcOutputKind)>,
         /// `true` when the signature declares no outputs (the void pass-through case).
         void: bool,
         /// The driving row plus its pending procedure result rows.
         current: Option<(Row, VecDeque<Vec<Value>>)>,
     },
+}
+
+/// How a `CALL … YIELD` output column materializes into a result-row cell: a plain value, a structural
+/// node ([`ValueClass::Node`](crate::procedure_registry::ValueClass::Node), `rmp` #72), or a structural
+/// relationship ([`ValueClass::Relationship`](crate::procedure_registry::ValueClass::Relationship),
+/// `rmp` #663). Resolved once at build time from the output field's declared class.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProcOutputKind {
+    /// A plain property value — bound as [`RowValue::Value`].
+    Plain,
+    /// A structural node — the yielded id is bound as [`RowValue::Node`].
+    Node,
+    /// A structural relationship — the yielded id is bound as [`RowValue::Rel`].
+    Rel,
 }
 
 /// The kind of write a [`Operator::Write`] performs (mirrors the write [`PhysicalOp`]s).
@@ -957,19 +973,26 @@ impl Operator {
                 if let Some((base, queue)) = current {
                     if let Some(out) = queue.pop_front() {
                         let mut row = base.clone();
-                        for (variable, idx, is_node) in bindings.iter() {
+                        for (variable, idx, kind) in bindings.iter() {
                             // `idx` was resolved against the signature's outputs at build time and
                             // the registry contract aligns each result row with them, so a short
                             // row is a registry bug — surface `null` rather than panic.
                             let value = out.get(*idx).cloned().unwrap_or(Value::Null);
-                            // A `NODE`-classed output (`rmp` task #72) carries the node id as a
-                            // `Value::Integer`; bind it as a structural `RowValue::Node` so result
-                            // egress materializes it (labels/properties through the same seam,
-                            // composing MVCC + RBAC). A `null` id (no node) stays a null cell.
-                            let cell = match (is_node, &value) {
-                                (true, Value::Integer(id)) => RowValue::Node(NodeRef {
-                                    id: NodeId(*id as u64),
-                                }),
+                            // A `NODE`/`RELATIONSHIP`-classed output (`rmp` tasks #72, #663) carries the
+                            // entity id as a `Value::Integer`; bind it as a structural `RowValue::Node` /
+                            // `RowValue::Rel` so result egress materializes it (labels/type/properties
+                            // through the same seam, composing MVCC + RBAC). A `null` id stays a null cell.
+                            let cell = match (kind, &value) {
+                                (ProcOutputKind::Node, Value::Integer(id)) => {
+                                    RowValue::Node(NodeRef {
+                                        id: NodeId(*id as u64),
+                                    })
+                                }
+                                (ProcOutputKind::Rel, Value::Integer(id)) => {
+                                    RowValue::Rel(RelRef {
+                                        id: RelId(*id as u64),
+                                    })
+                                }
                                 _ => RowValue::Value(value),
                             };
                             row.set(variable.clone(), cell);
@@ -2866,10 +2889,12 @@ fn build_operator(
             // Resolve the output bindings once: `YIELD [field AS] var` columns by declared result
             // field, or — for the standalone / `YIELD *` form (`yields: None`) — every declared
             // output verbatim.
-            let is_node_output = |idx: usize| {
-                sig.outputs[idx].ty.class == crate::procedure_registry::ValueClass::Node
+            let output_kind = |idx: usize| match sig.outputs[idx].ty.class {
+                crate::procedure_registry::ValueClass::Node => ProcOutputKind::Node,
+                crate::procedure_registry::ValueClass::Relationship => ProcOutputKind::Rel,
+                _ => ProcOutputKind::Plain,
             };
-            let bindings: Vec<(String, usize, bool)> = match yields {
+            let bindings: Vec<(String, usize, ProcOutputKind)> = match yields {
                 Some(items) => {
                     let mut out = Vec::with_capacity(items.len());
                     for y in items {
@@ -2880,7 +2905,7 @@ fn build_operator(
                                 format!("YIELD names unknown result field `{field}`"),
                             )));
                         };
-                        out.push((y.variable.name.clone(), idx, is_node_output(idx)));
+                        out.push((y.variable.name.clone(), idx, output_kind(idx)));
                     }
                     out
                 }
@@ -2888,7 +2913,7 @@ fn build_operator(
                     .outputs
                     .iter()
                     .enumerate()
-                    .map(|(i, o)| (o.name.clone(), i, is_node_output(i)))
+                    .map(|(i, o)| (o.name.clone(), i, output_kind(i)))
                     .collect(),
             };
             // The implicit form was resolved to parameter expressions by semantic analysis; a

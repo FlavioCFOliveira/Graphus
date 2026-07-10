@@ -238,11 +238,46 @@ CREATE FULLTEXT INDEX ft FOR (a:Article) ON EACH [a.title]
   OPTIONS { indexConfig: { `fulltext.analyzer`: 'standard',
                            `fulltext.eventually_consistent`: true } }
 DROP FULLTEXT INDEX ft IF EXISTS
+
+-- FULLTEXT over MULTIPLE labels (Neo4j `A|B` syntax): a node carrying ANY covered label is indexed.
+CREATE FULLTEXT INDEX posts FOR (n:Article|Blog) ON EACH [n.title, n.body]
+
+-- FULLTEXT over RELATIONSHIPS (undirected `()-[r:T]-()` pattern), single or multiple types.
+CREATE FULLTEXT INDEX rel_notes FOR ()-[r:KNOWS]-() ON EACH [r.note]
+CREATE FULLTEXT INDEX rel_reviews FOR ()-[r:RATED|REVIEWED]-() ON EACH [r.body]
+  OPTIONS { analyzer: 'standard' }
+DROP FULLTEXT INDEX rel_notes IF EXISTS
 ```
 
 For full-text, `fulltext.analyzer` maps to the analyzer (`standard` / `keyword`);
 `fulltext.eventually_consistent` is accepted and ignored (Graphus builds are synchronous). A `TEXT`,
 `POINT` or `FULLTEXT` index is also droppable by the unified `DROP INDEX <name>` form.
+
+### Node vs relationship, single vs multi-label full-text
+
+Full-text indexes come in two flavours (Neo4j-compatible):
+
+- **Node** — `FOR (n:Label…)`, queried by `db.index.fulltext.queryNodes(name, query)`.
+- **Relationship** — `FOR ()-[r:Type…]-()` (only the *undirected* pattern; a directed arrow is a
+  syntax error), queried by `db.index.fulltext.queryRelationships(name, query)`.
+
+Either flavour may cover **one or more** labels/types with the `A|B` syntax; a node/relationship
+carrying **any** covered label/type is indexed. `SHOW INDEXES` reports `entityType` = `NODE` or
+`RELATIONSHIP` and lists every covered label/type under `labelsOrTypes`.
+
+Both procedures return `(entity, score)` rows — `queryNodes` a structural **node** and a relevance
+`score`, `queryRelationships` a structural **relationship** and a `score` — ordered by descending score
+then ascending id, with each candidate re-checked for MVCC visibility, its current label/type and RBAC:
+
+```cypher
+CALL db.index.fulltext.queryNodes('posts', 'graph databases') YIELD node, score
+  RETURN node, score
+CALL db.index.fulltext.queryRelationships('rel_notes', 'graph') YIELD relationship, score
+  RETURN relationship, score
+```
+
+Passing a **node** index name to `queryRelationships` (or a relationship index name to `queryNodes`)
+is a clear error, not silently-empty results.
 
 ---
 

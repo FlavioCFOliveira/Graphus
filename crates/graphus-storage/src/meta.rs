@@ -87,29 +87,126 @@ impl IndexState {
     }
 }
 
-/// A durable **full-text index** catalog entry (`rmp` task #72).
+/// The **entity dimension** a full-text index covers: node labels or relationship types
+/// (`rmp` task #663).
+///
+/// Neo4j-5.x full-text indexes come in two flavours — one over **nodes** (`FOR (n:A|B)`, queried by
+/// `db.index.fulltext.queryNodes`) and one over **relationships** (`FOR ()-[r:T]-()`, queried by
+/// `db.index.fulltext.queryRelationships`). Both share the analyzer, the covered property set and the
+/// inverted-index machinery; only the covered token namespace ([`Label`](crate::tokens::Namespace::Label)
+/// vs [`RelType`](crate::tokens::Namespace::RelType)) and the query surface differ. This one-byte
+/// discriminant records which flavour a [`FulltextIndexEntry`] is.
+///
+/// # Wire encoding
+///
+/// Encoded as a single byte in the **backward-compatible full-text extension block** (see
+/// [`Statistics::encode`]), never in the base full-text catalog block. A pre-#663 image has no
+/// extension block, so every legacy entry decodes as [`Node`](Self::Node) — the only flavour that
+/// existed before #663. [`from_byte`](Self::from_byte) rejects an unknown byte (a forward-incompatible
+/// image), mirroring [`IndexState::from_byte`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[must_use]
+pub enum FulltextEntity {
+    /// The index covers **node labels** (`FOR (n:Label…)`), queried by `db.index.fulltext.queryNodes`.
+    /// The default and the only flavour a pre-#663 image knows.
+    #[default]
+    Node,
+    /// The index covers **relationship types** (`FOR ()-[r:Type…]-()`), queried by
+    /// `db.index.fulltext.queryRelationships` (`rmp` task #663).
+    Relationship,
+}
+
+impl FulltextEntity {
+    /// The single-byte wire discriminant (`rmp` task #663). Discriminants `2..` are reserved.
+    #[must_use]
+    pub const fn as_byte(self) -> u8 {
+        match self {
+            Self::Node => 0,
+            Self::Relationship => 1,
+        }
+    }
+
+    /// Decodes a single-byte wire discriminant, or [`None`] for an unknown (reserved/future) byte.
+    #[must_use]
+    pub const fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::Node),
+            1 => Some(Self::Relationship),
+            _ => None,
+        }
+    }
+
+    /// Whether this is a **relationship** full-text index (its covered tokens are
+    /// [`RelType`](crate::tokens::Namespace::RelType) tokens, queried by `queryRelationships`).
+    #[must_use]
+    pub const fn is_relationship(self) -> bool {
+        matches!(self, Self::Relationship)
+    }
+}
+
+/// A durable **full-text index** catalog entry (`rmp` tasks #72, #663).
 ///
 /// A full-text index is identified by a server-unique **name** (unlike a node-property index, which
-/// `(label_token, prop_key)` identifies), covers one node label and **one or more** string
-/// properties, and is analyzed by a fixed analyzer recorded as a single byte (the
-/// [`graphus_index::Analyzer`] discriminant — storage does not depend on `graphus-index`, so the
-/// byte is stored verbatim and interpreted by the query layer, exactly as the histogram blobs are).
+/// `(label_token, prop_key)` identifies), covers — per its [`entity`](Self::entity) —  **one or more**
+/// node labels *or* relationship types (the [`tokens`](Self::tokens) set, `rmp` #663 widened this from
+/// a single label token) and **one or more** string properties, and is analyzed by a fixed analyzer
+/// recorded as a single byte (the [`graphus_index::Analyzer`] discriminant — storage does not depend
+/// on `graphus-index`, so the byte is stored verbatim and interpreted by the query layer, exactly as
+/// the histogram blobs are).
 ///
 /// This rides the **identical** durability lifecycle as the node-property index catalog and the
 /// counts/histograms: checkpointed at commit, reloaded on rollback and on open. Its presence
 /// invariant is "an entry exists iff a full-text index of that name is declared". The inverted index
 /// *data* itself is never persisted (it is ephemeral and rebuilt from the store on open, like the
 /// derived `IndexSet`), so only this catalog entry needs durability.
+///
+/// # Backward-compatible encoding (`rmp` task #663)
+///
+/// The base full-text catalog block still writes a **single** covering token (`tokens[0]`) so its byte
+/// layout is unchanged; a pre-#663 image decodes to `entity: Node` + `tokens: [that token]`. The
+/// `entity` and any **additional** covering tokens (`tokens[1..]`) live in a trailing extension block
+/// keyed by name (present only for a relationship index or a multi-token one), so a legacy single-label
+/// node index needs no extension entry. See [`Statistics::encode`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FulltextIndexEntry {
-    /// The node label-namespace token the index covers.
-    pub label_token: u32,
+    /// Whether the index covers node labels or relationship types (`rmp` task #663).
+    pub entity: FulltextEntity,
+    /// The covering tokens the index spans, in declared order (one or more): node
+    /// [`Label`](crate::tokens::Namespace::Label) tokens when [`entity`](Self::entity) is
+    /// [`Node`](FulltextEntity::Node), relationship [`RelType`](crate::tokens::Namespace::RelType)
+    /// tokens when it is [`Relationship`](FulltextEntity::Relationship). A node with **any** covered
+    /// label (a relationship of **any** covered type) is indexed — Neo4j multi-label/-type semantics.
+    pub tokens: Vec<u32>,
     /// The property-key-namespace tokens the index covers, in declared order (one or more).
     pub property_tokens: Vec<u32>,
     /// The analyzer discriminant byte (the [`graphus_index::Analyzer`] `as_byte`, stored verbatim).
     pub analyzer: u8,
     /// The build state of the index (the same state machine as a node-property index).
     pub state: IndexState,
+}
+
+impl FulltextIndexEntry {
+    /// The **primary** covering token — the single token the base catalog block persists (`tokens[0]`).
+    ///
+    /// # Panics
+    /// Panics if `tokens` is empty; the write path and [`decode`](Statistics::decode) both guarantee at
+    /// least one covering token (a full-text index always covers ≥1 label/type).
+    #[must_use]
+    pub fn primary_token(&self) -> u32 {
+        *self
+            .tokens
+            .first()
+            .expect("INVARIANT: a full-text index covers at least one label/type token")
+    }
+
+    /// Whether the base + extension encoding must emit an **extension entry** for this index: a
+    /// relationship index (to record `entity`) or any multi-token index (to record `tokens[1..]`). A
+    /// single-token **node** index needs none (the base block's single token + the default
+    /// [`FulltextEntity::Node`] fully describe it), keeping a legacy image extension-free.
+    #[must_use]
+    fn needs_extension(&self) -> bool {
+        self.entity.is_relationship() || self.tokens.len() > 1
+    }
 }
 
 /// A durable **spatial (point) index** catalog entry (`rmp` task #98).
@@ -1372,9 +1469,14 @@ impl Statistics {
         // after every prior block by the same append-only rule, so a pre-#657 image (ending after the
         // relationship-property index name catalog) decodes it to empty.
         Self::encode_composite_catalog(&mut out, &self.composite_indexes);
-        // The text (trigram) node index catalog (`rmp` task #662), appended LAST by the same append-only
+        // The text (trigram) node index catalog (`rmp` task #662), appended by the same append-only
         // rule, so a pre-#662 image (ending after the composite catalog) decodes it to empty.
         Self::encode_text_catalog(&mut out, &self.text_indexes);
+        // The full-text extension block (`rmp` task #663), appended LAST — carrying the entity + extra
+        // covering tokens of any relationship / multi-token full-text index — so a pre-#663 image
+        // (ending after the text catalog) decodes it empty and every legacy full-text entry keeps its
+        // node + single-token shape.
+        Self::encode_fulltext_extension_block(&mut out, &self.fulltext_indexes);
         out
     }
 
@@ -1423,12 +1525,20 @@ impl Statistics {
         }
     }
 
-    /// Encodes the full-text index catalog block (`rmp` task #72), appended last so a pre-#72 image
-    /// (ending after the node-property index catalog) decodes to an empty full-text catalog.
+    /// Encodes the full-text index catalog block (`rmp` task #72), appended after the node-property
+    /// index catalog so a pre-#72 image (ending after it) decodes to an empty full-text catalog.
     ///
-    /// Layout: `n(u32) | [ name_len(u32) | name_bytes[name_len] | label_token(u32) |
+    /// Layout: `n(u32) | [ name_len(u32) | name_bytes[name_len] | primary_token(u32) |
     /// n_props(u32) | prop_token(u32)*n_props | analyzer(u8) | state(u8) ]*`, entries in
     /// ascending-name ([`BTreeMap`]) order so the image is deterministic.
+    ///
+    /// # Single primary token (`rmp` task #663)
+    ///
+    /// This block persists exactly **one** covering token (`tokens[0]`), byte-for-byte as the pre-#663
+    /// `label_token` slot, so the layout is unchanged and a pre-#663 image decodes here as a node index
+    /// over that one token. The [`entity`](FulltextIndexEntry::entity) and any additional covering
+    /// tokens (`tokens[1..]`) — a relationship index or a multi-label/-type one — ride the trailing
+    /// [`encode_fulltext_extension_block`](Self::encode_fulltext_extension_block).
     fn encode_fulltext_catalog(out: &mut Vec<u8>, map: &BTreeMap<String, FulltextIndexEntry>) {
         debug_assert!(
             map.len() <= u32::MAX as usize,
@@ -1443,7 +1553,14 @@ impl Statistics {
             );
             out.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
             out.extend_from_slice(name_bytes);
-            out.extend_from_slice(&entry.label_token.to_le_bytes());
+            // The single primary token (`tokens[0]`), byte-identical to the pre-#663 `label_token` slot.
+            // `tokens` is non-empty at every write-path construction site; assert it in debug so a future
+            // empty-token entry is caught here rather than panicking inside `primary_token()`.
+            debug_assert!(
+                !entry.tokens.is_empty(),
+                "full-text catalog entry has no covering token"
+            );
+            out.extend_from_slice(&entry.primary_token().to_le_bytes());
             debug_assert!(
                 entry.property_tokens.len() <= u32::MAX as usize,
                 "full-text property-token count exceeds u32"
@@ -1454,6 +1571,61 @@ impl Statistics {
             }
             out.push(entry.analyzer);
             out.push(entry.state.as_byte());
+        }
+    }
+
+    /// Encodes the trailing full-text **extension block** (`rmp` task #663), appended **last** (after
+    /// the text catalog) so a pre-#663 image — ending after the text catalog — decodes it as empty and
+    /// every legacy full-text entry keeps the [`FulltextEntity::Node`] + single-token shape the base
+    /// block decoded.
+    ///
+    /// Layout: `n(u32) | [ name_len(u32) | name_bytes[name_len] | entity(u8) | n_extra(u32) |
+    /// extra_token(u32)*n_extra ]*`, one entry **per full-text index that needs it** — a relationship
+    /// index (to record its [`FulltextEntity`]) or any multi-token index (to record its additional
+    /// covering tokens `tokens[1..]`) — in ascending-name ([`BTreeMap`]) order so the image is
+    /// deterministic. A single-token **node** index contributes nothing (its base row + the default
+    /// entity fully describe it), so a store using only pre-#663-shaped indexes writes an empty
+    /// (`0`-count) block, keeping the extension byte-cost zero for the common case.
+    fn encode_fulltext_extension_block(
+        out: &mut Vec<u8>,
+        map: &BTreeMap<String, FulltextIndexEntry>,
+    ) {
+        let extended: Vec<(&String, &FulltextIndexEntry)> = map
+            .iter()
+            .filter(|(_, entry)| entry.needs_extension())
+            .collect();
+        debug_assert!(
+            extended.len() <= u32::MAX as usize,
+            "full-text extension entry count exceeds u32"
+        );
+        out.extend_from_slice(&(extended.len() as u32).to_le_bytes());
+        for (name, entry) in extended {
+            let name_bytes = name.as_bytes();
+            debug_assert!(
+                name_bytes.len() <= u32::MAX as usize,
+                "full-text index name exceeds u32 length"
+            );
+            out.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(name_bytes);
+            out.push(entry.entity.as_byte());
+            // The additional covering tokens beyond the base block's `tokens[0]`. `needs_extension()`
+            // only selected relationship / multi-token entries, both of which carry ≥1 token; the write
+            // path (the coordinator's create sites) guarantees `tokens` is non-empty for every entry, so
+            // the slice never underflows. Asserted in debug as defense-in-depth against a future path
+            // that constructs an entry with empty `tokens` (which would panic mid-checkpoint here).
+            debug_assert!(
+                !entry.tokens.is_empty(),
+                "full-text extension entry has no covering token"
+            );
+            let extra = &entry.tokens[1..];
+            debug_assert!(
+                extra.len() <= u32::MAX as usize,
+                "full-text extra-token count exceeds u32"
+            );
+            out.extend_from_slice(&(extra.len() as u32).to_le_bytes());
+            for &tok in extra {
+                out.extend_from_slice(&tok.to_le_bytes());
+            }
         }
     }
 
@@ -1662,7 +1834,10 @@ impl Statistics {
         let rels_per_type = Self::decode_map(bytes, &mut cur, "rels_per_type")?;
         let node_prop_histograms = Self::decode_histograms(bytes, &mut cur)?;
         let node_property_indexes = Self::decode_index_catalog(bytes, &mut cur)?;
-        let fulltext_indexes = Self::decode_fulltext_catalog(bytes, &mut cur)?;
+        // Kept mutable: the trailing full-text extension block (`rmp` task #663), decoded after the text
+        // catalog, patches each relationship / multi-token index's entity + additional covering tokens
+        // back onto its entry here (exactly as the constraint type-descriptor block patches constraints).
+        let mut fulltext_indexes = Self::decode_fulltext_catalog(bytes, &mut cur)?;
         let spatial_indexes = Self::decode_spatial_catalog(bytes, &mut cur)?;
         let mut constraints = Self::decode_constraint_catalog(bytes, &mut cur)?;
         // Merge the trailing property-type descriptor block (`rmp` task #100) back onto its named
@@ -1689,6 +1864,10 @@ impl Statistics {
         // Decode the trailing text (trigram) node index catalog (`rmp` task #662). A pre-#662 image ends
         // after the composite catalog, so this block decodes empty via the end-of-input guard.
         let text_indexes = Self::decode_text_catalog(bytes, &mut cur)?;
+        // Merge the trailing full-text extension block (`rmp` task #663) back onto its named indexes. A
+        // pre-#663 image ends after the text catalog, so this block decodes empty and every full-text
+        // entry keeps the node + single-token shape the catalog decode set.
+        Self::decode_fulltext_extension_block(bytes, &mut cur, &mut fulltext_indexes)?;
         Ok(Self {
             total_nodes,
             total_relationships,
@@ -1810,7 +1989,7 @@ impl Statistics {
                     "full-text catalog holds an empty index name".to_owned(),
                 ));
             }
-            let label_token = read_u32(bytes, cur)?;
+            let primary_token = read_u32(bytes, cur)?;
             let n_props = read_u32(bytes, cur)? as usize;
             if n_props == 0 {
                 return Err(GraphusError::Storage(format!(
@@ -1835,8 +2014,13 @@ impl Statistics {
             if map
                 .insert(
                     name.clone(),
+                    // The base row always decodes as a **node** index over the single primary token
+                    // (`rmp` task #663); a trailing extension block (if any) patches the entity and
+                    // appends the additional covering tokens. A pre-#663 image has no extension, so
+                    // this node + single-token shape is final — matching the legacy semantics exactly.
                     FulltextIndexEntry {
-                        label_token,
+                        entity: FulltextEntity::Node,
+                        tokens: vec![primary_token],
                         property_tokens,
                         analyzer,
                         state,
@@ -1850,6 +2034,73 @@ impl Statistics {
             }
         }
         Ok(map)
+    }
+
+    /// Decodes the trailing full-text **extension block** (`rmp` task #663) and merges each entry's
+    /// entity + additional covering tokens onto its named index in `fulltext_indexes`. Like every later
+    /// block, end-of-input where its count `u32` would start means "no extension block" (a pre-#663
+    /// image), not truncation — leaving every entry with the [`FulltextEntity::Node`] + single-token
+    /// shape [`decode_fulltext_catalog`](Self::decode_fulltext_catalog) already set.
+    ///
+    /// # Errors
+    /// Returns a storage error on truncation, a repeated / empty / non-UTF-8 name, an unknown entity
+    /// byte (a forward-incompatible image), or a name with no matching full-text index (an orphan
+    /// extension — never produced by [`encode`](Self::encode), which only ever writes an extension for a
+    /// declared index).
+    fn decode_fulltext_extension_block(
+        bytes: &[u8],
+        cur: &mut usize,
+        fulltext_indexes: &mut BTreeMap<String, FulltextIndexEntry>,
+    ) -> Result<()> {
+        // Backward compatibility (`rmp` task #663): a pre-#663 image ends exactly here.
+        if *cur == bytes.len() {
+            return Ok(());
+        }
+        let n = read_u32(bytes, cur)? as usize;
+        let mut seen: BTreeMap<String, ()> = BTreeMap::new();
+        for _ in 0..n {
+            let name_len = read_u32(bytes, cur)? as usize;
+            let end = take(bytes, cur, name_len)?;
+            let name = String::from_utf8(bytes[end - name_len..end].to_vec()).map_err(|_| {
+                GraphusError::Storage("full-text extension name is not valid UTF-8".to_owned())
+            })?;
+            if name.is_empty() {
+                return Err(GraphusError::Storage(
+                    "full-text extension block holds an empty index name".to_owned(),
+                ));
+            }
+            let entity_byte = read_u8(bytes, cur)?;
+            let entity = FulltextEntity::from_byte(entity_byte).ok_or_else(|| {
+                GraphusError::Storage(format!(
+                    "full-text index {name:?} holds unknown entity byte {entity_byte}"
+                ))
+            })?;
+            let n_extra = read_u32(bytes, cur)? as usize;
+            // Cap the pre-allocation by the bytes remaining (see the base decoder): `n_extra` is an
+            // untrusted on-disk u32 and each token is a 4-byte read, so the real count cannot exceed
+            // `bytes.len()`. Prevents an OOM from a forged count before the per-element reads validate.
+            let mut extra = Vec::with_capacity(n_extra.min(bytes.len()));
+            for _ in 0..n_extra {
+                extra.push(read_u32(bytes, cur)?);
+            }
+            if seen.insert(name.clone(), ()).is_some() {
+                return Err(GraphusError::Storage(format!(
+                    "full-text extension block repeats index name {name:?}"
+                )));
+            }
+            match fulltext_indexes.get_mut(&name) {
+                Some(entry) => {
+                    entry.entity = entity;
+                    entry.tokens.extend(extra);
+                }
+                None => {
+                    return Err(GraphusError::Storage(format!(
+                        "full-text extension block names unknown index {name:?}"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Decodes the spatial (point) index catalog block (`rmp` task #98). Like the full-text catalog
@@ -2412,6 +2663,46 @@ mod tests {
         // No property-token bytes follow: the first per-property read is truncated.
         let mut cur = 0usize;
         assert!(Statistics::decode_fulltext_catalog(&bytes, &mut cur).is_err());
+    }
+
+    /// Regression (`rmp` #663 storage audit, residual LOW): a forged full-text **extension** block whose
+    /// `n_extra` field is a huge untrusted u32 must not drive a multi-gigabyte pre-allocation. The
+    /// decoder caps `Vec::with_capacity` at the input length and then fails fast when the (absent)
+    /// per-token reads run — returning an error, not aborting on an allocation.
+    #[test]
+    fn decode_fulltext_extension_block_with_forged_n_extra_does_not_oom() {
+        // A base full-text catalog with one entry "idx" (so the extension names an existing index and
+        // gets past the orphan check to reach the `n_extra` allocation), then an extension entry with a
+        // forged `n_extra = u32::MAX` and no token bytes.
+        let mut base = Statistics::new();
+        base.set_fulltext_index(
+            "idx".to_owned(),
+            FulltextIndexEntry {
+                entity: FulltextEntity::Node,
+                tokens: vec![7],
+                property_tokens: vec![9],
+                analyzer: 0,
+                state: IndexState::Online,
+            },
+        );
+        // Decode the base catalog to obtain the map the extension patches.
+        let mut fulltext = {
+            let mut image = Vec::new();
+            Statistics::encode_fulltext_catalog(&mut image, &base.fulltext_indexes);
+            let mut cur = 0usize;
+            Statistics::decode_fulltext_catalog(&image, &mut cur).unwrap()
+        };
+        // A forged extension block: 1 entry naming "idx", entity Node, n_extra = u32::MAX, no tokens.
+        let mut ext = Vec::new();
+        ext.extend_from_slice(&1u32.to_le_bytes()); // 1 extension entry
+        ext.extend_from_slice(&3u32.to_le_bytes()); // name_len 3
+        ext.extend_from_slice(b"idx");
+        ext.push(FulltextEntity::Node.as_byte());
+        ext.extend_from_slice(&u32::MAX.to_le_bytes()); // forged n_extra
+        let mut cur = 0usize;
+        assert!(
+            Statistics::decode_fulltext_extension_block(&ext, &mut cur, &mut fulltext).is_err()
+        );
     }
 
     /// Regression (storage audit, finding 3 / SEV 3): same OOM guard for the constraint catalog.
@@ -3012,7 +3303,8 @@ mod tests {
         s.set_fulltext_index(
             "ft".to_owned(),
             FulltextIndexEntry {
-                label_token: 9,
+                entity: FulltextEntity::Node,
+                tokens: vec![9],
                 property_tokens: vec![1],
                 analyzer: 0,
                 state: IndexState::Online,
@@ -3031,7 +3323,8 @@ mod tests {
         pre98.set_fulltext_index(
             "ft".to_owned(),
             FulltextIndexEntry {
-                label_token: 9,
+                entity: FulltextEntity::Node,
+                tokens: vec![9],
                 property_tokens: vec![1],
                 analyzer: 0,
                 state: IndexState::Online,
@@ -3763,7 +4056,8 @@ mod tests {
         s.set_fulltext_index(
             "articles".to_owned(),
             FulltextIndexEntry {
-                label_token: 3,
+                entity: FulltextEntity::Node,
+                tokens: vec![3],
                 property_tokens: vec![7, 8],
                 analyzer: 0, // standard
                 state: IndexState::Online,
@@ -3772,7 +4066,8 @@ mod tests {
         s.set_fulltext_index(
             "tags".to_owned(),
             FulltextIndexEntry {
-                label_token: 5,
+                entity: FulltextEntity::Node,
+                tokens: vec![5],
                 property_tokens: vec![9],
                 analyzer: 1, // keyword
                 state: IndexState::Populating,
@@ -3796,6 +4091,138 @@ mod tests {
         );
         assert_eq!(back.fulltext_index("missing"), None);
         assert_eq!(back.fulltext_indexes().len(), 2);
+    }
+
+    #[test]
+    fn statistics_fulltext_extension_round_trips_node_multilabel_and_relationship() {
+        // `rmp` task #663: a relationship full-text index and a multi-label node full-text index carry
+        // their entity + additional covering tokens in the trailing extension block. Both must
+        // round-trip, and a plain single-label node index (no extension entry) must too.
+        let mut s = Statistics::new();
+        // A single-label node index: no extension entry.
+        s.set_fulltext_index(
+            "node_single".to_owned(),
+            FulltextIndexEntry {
+                entity: FulltextEntity::Node,
+                tokens: vec![3],
+                property_tokens: vec![7],
+                analyzer: 0,
+                state: IndexState::Online,
+            },
+        );
+        // A multi-label node index: entity Node + extra tokens [5, 6] in the extension.
+        s.set_fulltext_index(
+            "node_multi".to_owned(),
+            FulltextIndexEntry {
+                entity: FulltextEntity::Node,
+                tokens: vec![4, 5, 6],
+                property_tokens: vec![7, 8],
+                analyzer: 1,
+                state: IndexState::Online,
+            },
+        );
+        // A relationship index (single type): entity Relationship, no extra tokens.
+        s.set_fulltext_index(
+            "rel_single".to_owned(),
+            FulltextIndexEntry {
+                entity: FulltextEntity::Relationship,
+                tokens: vec![9],
+                property_tokens: vec![7],
+                analyzer: 0,
+                state: IndexState::Online,
+            },
+        );
+        // A relationship index over multiple types: entity Relationship + extra tokens [11].
+        s.set_fulltext_index(
+            "rel_multi".to_owned(),
+            FulltextIndexEntry {
+                entity: FulltextEntity::Relationship,
+                tokens: vec![10, 11],
+                property_tokens: vec![7, 8],
+                analyzer: 1,
+                state: IndexState::Populating,
+            },
+        );
+        let back = Statistics::decode(&s.encode()).unwrap();
+        assert_eq!(
+            back, s,
+            "every full-text entity/token shape must round-trip"
+        );
+        // Spot-check the recovered shapes.
+        assert_eq!(
+            back.fulltext_index("node_multi").map(|e| e.tokens.clone()),
+            Some(vec![4, 5, 6])
+        );
+        assert_eq!(
+            back.fulltext_index("rel_single").map(|e| e.entity),
+            Some(FulltextEntity::Relationship)
+        );
+        assert_eq!(
+            back.fulltext_index("rel_multi").map(|e| e.tokens.clone()),
+            Some(vec![10, 11])
+        );
+        assert_eq!(
+            back.fulltext_index("node_single").map(|e| e.entity),
+            Some(FulltextEntity::Node)
+        );
+    }
+
+    #[test]
+    fn statistics_decode_accepts_a_pre_task_663_image_as_node_single_label() {
+        // A pre-#663 image ends after the text catalog (no full-text extension block). Build one that
+        // carries a full-text entry via the base catalog block only, and confirm it decodes as a
+        // single-label NODE index — the exact legacy shape — with the extension block absent.
+        let mut pre663 = Statistics::new();
+        pre663.set_fulltext_index(
+            "legacy".to_owned(),
+            FulltextIndexEntry {
+                entity: FulltextEntity::Node,
+                tokens: vec![42],
+                property_tokens: vec![7, 8],
+                analyzer: 0,
+                state: IndexState::Online,
+            },
+        );
+        let mut image = pre663.encode();
+        // Drop the trailing 4-byte full-text extension count word so the image ends right after the
+        // text catalog — exactly where a pre-#663 image ends.
+        image.truncate(image.len() - 4);
+        let decoded = Statistics::decode(&image).unwrap();
+        let entry = decoded
+            .fulltext_index("legacy")
+            .expect("legacy index decodes");
+        assert_eq!(entry.entity, FulltextEntity::Node);
+        assert_eq!(entry.tokens, vec![42]);
+        assert_eq!(entry.property_tokens, vec![7, 8]);
+    }
+
+    #[test]
+    fn statistics_decode_rejects_orphan_fulltext_extension() {
+        // An extension entry naming an index not present in the base catalog is corrupt (never produced
+        // by encode). Build a minimal image: empty base full-text catalog, then an extension block that
+        // names "ghost".
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // total_nodes
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // total_relationships
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 label entries
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 rel-type entries
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 histogram entries
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 index-catalog entries
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 full-text entries
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 spatial entries
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 constraint entries
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 constraint type-descriptors
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 node index names
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 rel-property indexes
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 rel-property index names
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 composite entries
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 text entries
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // 1 full-text EXTENSION entry
+        bytes.extend_from_slice(&5u32.to_le_bytes()); // name_len 5
+        bytes.extend_from_slice(b"ghost"); // name "ghost" (no matching base entry)
+        bytes.push(FulltextEntity::Relationship.as_byte()); // entity
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // 0 extra tokens
+        assert!(Statistics::decode(&bytes).is_err());
     }
 
     #[test]
@@ -3867,7 +4294,8 @@ mod tests {
         s.set_fulltext_index(
             "a".to_owned(),
             FulltextIndexEntry {
-                label_token: 1,
+                entity: FulltextEntity::Node,
+                tokens: vec![1],
                 property_tokens: vec![2],
                 analyzer: 0,
                 state: IndexState::Online,
