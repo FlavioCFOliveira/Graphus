@@ -16,8 +16,12 @@
 #   2. boots a REAL `graphus-server` exposing Bolt-over-UDS (the read driver) + plaintext-loopback
 #      REST (the bulk-import upload path), on a private temp store;
 #   3. LOADS the graph over the wire via the ratified network bulk-import Mode A (`reco_load`):
-#      CREATE DATABASE -> streaming CSV upload -> START DATABASE -> CREATE INDEX -> asserts the graph
-#      shape and that every recommendation query returns a well-formed result;
+#      CREATE DATABASE -> streaming CSV upload -> START DATABASE -> declares the production-realistic
+#      read-path SCHEMA (a VECTOR/HNSW index on Product.embedding for "similar products" retrieval, a
+#      TEXT index on Product.name, a NODE KEY on User.id, a UNIQUE on Product.id, and a property-type
+#      constraint Product.price IS :: INTEGER) -> asserts the graph shape, the index-backed query paths
+#      (a vector k-NN "similar products" seek + a TEXT CONTAINS search), constraint enforcement, and
+#      that every recommendation query returns a well-formed result;
 #   4. drives the read-heavy CONCURRENCY LADDER (`reco_bench`): many simultaneous UDS-Bolt
 #      connections issuing the recommendation read battery (with a few concurrent writes), sweeping
 #      the connection count to find the saturation knee, while sampling the SERVER's CPU (total +
@@ -220,16 +224,36 @@ LOAD_OUT="$("$LOAD" \
   --data-dir "$DATA_DIR" --user "$ADMIN_USER" --password "$ADMIN_PW" \
   --expect-users "$GEN_USERS" --expect-products "$GEN_PRODUCTS" \
   --expect-friends "$GEN_FRIENDS" --expect-purchased "$GEN_PURCHASED" 2>&1)" || true
-# Show the loader's diagnostics (delete the machine-readable sentinel line, indent the rest). Use
-# `sed` (not `grep -v`, which exits 1 on no-match and would trip `set -o pipefail`/`set -e` when the
-# loader prints only the sentinel).
-printf '%s\n' "$LOAD_OUT" | sed '/^GRAPHUS_RECO_LOAD_OK/d; s/^/  /'
-assert "graph loaded + indexed + every recommendation query well-formed" "yes" \
+# Show the loader's diagnostics (delete the machine-readable sentinels + the schema evidence block —
+# persisted separately below — and indent the rest). Use `sed` (not `grep -v`, which exits 1 on no-match
+# and would trip `set -o pipefail`/`set -e` when the loader prints only the sentinel).
+printf '%s\n' "$LOAD_OUT" \
+  | sed '/^GRAPHUS_RECO_LOAD_OK/d; /^GRAPHUS_RECO_SCHEMA /d; /GRAPHUS_RECO_SCHEMA_BEGIN/,/GRAPHUS_RECO_SCHEMA_END/d; s/^/  /'
+assert "graph loaded + schema declared + every recommendation query well-formed" "yes" \
   "$(printf '%s' "$LOAD_OUT" | grep -q 'GRAPHUS_RECO_LOAD_OK' && echo yes || echo no)"
 if ! printf '%s' "$LOAD_OUT" | grep -q 'GRAPHUS_RECO_LOAD_OK'; then
   echo "${RED}load failed; aborting the concurrency ladder.${RESET}" >&2
   exit 1
 fi
+
+# Harvest the schema evidence the loader captured (the SHOW INDEXES / SHOW CONSTRAINTS dump between the
+# GRAPHUS_RECO_SCHEMA_BEGIN/_END sentinels), and assert it lists the declared index/constraint kinds.
+# The loader also runs the VECTOR k-NN "similar products" seek, the TEXT CONTAINS search, and the two
+# constraint-enforcement negatives; a GRAPHUS_RECO_LOAD_OK above means those all held.
+SCHEMA_EVIDENCE_FILE="$WORKDIR/schema.txt"
+printf '%s\n' "$LOAD_OUT" \
+  | sed -n '/GRAPHUS_RECO_SCHEMA_BEGIN/,/GRAPHUS_RECO_SCHEMA_END/p' > "$SCHEMA_EVIDENCE_FILE"
+RECO_SCHEMA_STATS="$(printf '%s' "$LOAD_OUT" | sed -n 's/^GRAPHUS_RECO_SCHEMA //p' | head -n1)"
+SCHEMA_INDEXES="$(kv "$RECO_SCHEMA_STATS" indexes)"
+SCHEMA_CONSTRAINTS="$(kv "$RECO_SCHEMA_STATS" constraints)"
+assert "schema evidence (SHOW INDEXES/CONSTRAINTS) captured" "yes" \
+  "$([ -s "$SCHEMA_EVIDENCE_FILE" ] && echo yes || echo no)"
+# 4 indexes (2 always-on LOOKUP + TEXT on Product.name + VECTOR on Product.embedding); 3 constraints
+# (NODE KEY User.id + UNIQUE Product.id + property-type Product.price IS :: INTEGER).
+assert "SHOW INDEXES lists the TEXT + VECTOR index kinds" "yes" \
+  "$([ "${SCHEMA_INDEXES:-0}" -ge 4 ] 2>/dev/null && echo yes || echo no)"
+assert "SHOW CONSTRAINTS lists the NODE KEY + UNIQUE + property-type kinds" "yes" \
+  "$([ "${SCHEMA_CONSTRAINTS:-0}" -ge 3 ] 2>/dev/null && echo yes || echo no)"
 
 # ==================================================================================================
 # Step 4 — the read-heavy CONCURRENCY LADDER + server resource sampling + evidence
@@ -248,6 +272,16 @@ assert "evidence report.json was produced" "yes" \
   "$([ -f "$EVIDENCE_DIR/report.json" ] && echo yes || echo no)"
 assert "evidence report.md was produced" "yes" \
   "$([ -f "$EVIDENCE_DIR/report.md" ] && echo yes || echo no)"
+
+# Persist the schema evidence (the SHOW INDEXES / SHOW CONSTRAINTS dump) into the evidence dir alongside
+# the concurrency report, as durable, human-readable proof of the exercised index/constraint kinds
+# (VECTOR + TEXT indexes, NODE KEY + UNIQUE + property-type constraints, rmp #676).
+if [ -s "${SCHEMA_EVIDENCE_FILE:-/nonexistent}" ]; then
+  cp "$SCHEMA_EVIDENCE_FILE" "$EVIDENCE_DIR/schema.txt"
+  assert "schema evidence (SHOW INDEXES/CONSTRAINTS) written to evidence dir" "yes" \
+    "$([ -f "$EVIDENCE_DIR/schema.txt" ] && echo yes || echo no)"
+  info "schema evidence written to $EVIDENCE_DIR/schema.txt"
+fi
 
 # ==================================================================================================
 # Step 5 — regression gate vs the committed baseline (fast profile only; structural metrics)

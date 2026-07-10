@@ -16,10 +16,18 @@
 //! | Node label | Key properties | Meaning |
 //! | --- | --- | --- |
 //! | `(:User {id, name, country, signup})` | `id` (24 lowercase hex chars, unique) | a customer |
-//! | `(:Product {id, name, category, price})` | `id` (24 lowercase hex chars, unique) | a catalogue item |
+//! | `(:Product {id, name, category, price, embedding})` | `id` (24 lowercase hex chars, unique) | a catalogue item |
 //!
 //! `price` is always an **integer number of cents** — never a float, so the emitted bytes stay
 //! platform-stable (see [Determinism](#determinism)).
+//!
+//! Each `Product` also carries an **`embedding`** — a fixed-length [`EMBED_DIM`]-dimensional
+//! `LIST<FLOAT>` vector (emitted as a `float[]` CSV column) **clustered by category**: one orthogonal
+//! axis per category, so a `Product`'s dominant component is its [category axis](Generator::product_category_index)
+//! and different categories stay (cosine-)orthogonal. This is the substrate a `VECTOR` (HNSW) index and
+//! a `db.index.vector.queryNodes` "customers who bought this might like…" **similar-products** ANN query
+//! exercise. The embedding is emitted through **pure integer formatting** (fixed 3-decimal thousandths),
+//! so — like `price` — no `f32` ever reaches the wire and the bytes stay platform-stable.
 //!
 //! Two relationship types:
 //!
@@ -66,8 +74,9 @@
 //!
 //! Generation is a pure function of [`GenConfig`]: the only randomness is an internal [`SplitMix64`]
 //! PRNG seeded from `seed` (degree draws, the shuffle, name/country/category assembly, price + purchase
-//! sampling, timestamps). For a given config the emitted CSV is **byte-identical** across runs, hosts,
-//! and platforms (no floats on the wire, no `HashMap` iteration in any emitted-order path, no clock,
+//! sampling, the category-clustered embedding, timestamps). For a given config the emitted CSV is
+//! **byte-identical** across runs, hosts, and platforms (no floats on the wire — the `embedding` column
+//! too is rendered by integer formatting — no `HashMap` iteration in any emitted-order path, no clock,
 //! no thread scheduling). This is asserted by `tests/determinism.rs`, and the CSV is proven a valid
 //! bulk-import artifact by `tests/bulk_import_validity.rs`.
 
@@ -89,6 +98,12 @@ pub mod client;
 /// summarisation, the `/proc/<pid>` field parsers, the concurrency-ladder CSV parser, and the
 /// read-battery family-index lookup — all unit-testable without a running server.
 pub mod bench;
+
+/// The production-realistic **read-path schema** the example declares after the bulk load — a NODE KEY
+/// + UNIQUE identity pair, a `price` property-type constraint, a `TEXT` name index, and a `VECTOR`
+/// (HNSW) embedding index — as a single shared DDL block so `reco_load` and the hermetic server mirror
+/// drive byte-identical statements.
+pub mod schema;
 
 /// A tiny, fast, fully-deterministic PRNG (SplitMix64 — Steele, Lea & Flood 2014). Chosen because it
 /// is a *pure* integer mixing function: identical output for identical seeds on every platform, with
@@ -150,6 +165,20 @@ pub const PRICE_MAX_CENTS: u64 = 250_000;
 pub const QTY_MIN: u64 = 1;
 /// The maximum `PURCHASED` quantity, inclusive.
 pub const QTY_MAX: u64 = 5;
+
+/// The `Product.embedding` dimensionality: **one orthogonal axis per product category**, so category
+/// clusters are maximally (cosine-)separated — a `db.index.vector.queryNodes` seek at a category's
+/// [centroid](Generator::category_centroid) retrieves that category's products with a wide score margin.
+/// Small (equal to the number of categories) so the `VECTOR` index stays cheap in the `fast` profile.
+pub const EMBED_DIM: usize = CATEGORIES.len();
+
+/// The category-centroid component, in integer **thousandths** (`1000` ⇒ `1.000`): the dominant axis of
+/// every embedding. Integer-only ⇒ byte-deterministic (see [Determinism](#determinism)).
+const EMBED_CENTROID_MILLIS: u64 = 1000;
+/// The maximum per-axis **jitter**, in integer thousandths (`50` ⇒ `0.050`). Small enough that the
+/// category axis (`≥ 1.000`) always dominates every other axis (`≤ 0.050`), so clusters stay separable,
+/// yet non-zero so same-category embeddings are distinct and realistic. Integer-only ⇒ byte-deterministic.
+const EMBED_JITTER_MILLIS: u64 = 50;
 
 // --- Deterministic Portuguese-name fragment pools -----------------------------------------------
 //
@@ -567,11 +596,91 @@ impl Generator {
         COUNTRIES[r.below(COUNTRIES.len() as u64) as usize]
     }
 
-    /// A deterministic category for `Product` `i`, from the [`CATEGORIES`] pool.
-    fn product_category(seed: u64, i: u64) -> &'static str {
+    /// The deterministic **category index** (into [`CATEGORIES`], `0..EMBED_DIM`) for `Product` `i` — the
+    /// single draw [`product_category`](Self::product_category) resolves to a name, exposed so the
+    /// embedding can cluster by it and a reader can map a category name back to its centroid axis.
+    #[must_use]
+    pub fn product_category_index(seed: u64, i: u64) -> usize {
         let mut r =
             SplitMix64::new(seed ^ Self::PRODUCT_SALT ^ i.wrapping_mul(0xEBCA_1A6C_6D8B_2F17));
-        CATEGORIES[r.below(CATEGORIES.len() as u64) as usize]
+        r.below(CATEGORIES.len() as u64) as usize
+    }
+
+    /// A deterministic category for `Product` `i`, from the [`CATEGORIES`] pool.
+    fn product_category(seed: u64, i: u64) -> &'static str {
+        CATEGORIES[Self::product_category_index(seed, i)]
+    }
+
+    /// The name of category index `c` (into [`CATEGORIES`]) — the inverse of
+    /// [`product_category_index`](Self::product_category_index) for asserting a k-NN hit's category.
+    ///
+    /// # Panics
+    /// If `c >= EMBED_DIM` (there are exactly [`EMBED_DIM`] categories).
+    #[must_use]
+    pub fn category_name(c: usize) -> &'static str {
+        CATEGORIES[c]
+    }
+
+    /// The **centroid** (query vector) for category index `c`: a unit one-hot on axis `c`. A
+    /// `db.index.vector.queryNodes` cosine seek with this vector retrieves category `c`'s products
+    /// (they cluster tightly around it), the "similar products" recommendation query.
+    ///
+    /// # Panics
+    /// If `c >= EMBED_DIM`.
+    #[must_use]
+    pub fn category_centroid(c: usize) -> Vec<f32> {
+        assert!(
+            c < EMBED_DIM,
+            "category index {c} out of range 0..{EMBED_DIM}"
+        );
+        let mut v = vec![0.0_f32; EMBED_DIM];
+        v[c] = 1.0;
+        v
+    }
+
+    /// The deterministic embedding for `Product` `i` as integer **thousandths** (component `d` is
+    /// `millis[d] / 1000.0`): a one-hot [`EMBED_CENTROID_MILLIS`] centroid on the product's
+    /// [category axis](Self::product_category_index) plus a small per-axis [`EMBED_JITTER_MILLIS`]
+    /// jitter, so same-category products cluster tightly while different categories stay orthogonal.
+    /// Integer-only ⇒ byte-deterministic across platforms.
+    fn product_embedding_millis(seed: u64, i: u64) -> Vec<u64> {
+        let cat = Self::product_category_index(seed, i);
+        let mut r =
+            SplitMix64::new(seed ^ Self::PRODUCT_SALT ^ i.wrapping_mul(0x2F72_D9B1_A2B8_C31D));
+        (0..EMBED_DIM)
+            .map(|d| {
+                let base = if d == cat { EMBED_CENTROID_MILLIS } else { 0 };
+                base + r.below(EMBED_JITTER_MILLIS + 1)
+            })
+            .collect()
+    }
+
+    /// The deterministic embedding for `Product` `i` as `f32` components (component `d` is
+    /// `millis[d] / 1000.0`) — the value the `embedding:float[]` column
+    /// [`stream_product_csv`](Self::stream_product_csv) emits (and the vector index stores). Used off the
+    /// wire only (the hermetic mirror / building query vectors); the emitted CSV is integer-formatted.
+    #[must_use]
+    pub fn product_embedding(seed: u64, i: u64) -> Vec<f32> {
+        Self::product_embedding_millis(seed, i)
+            .into_iter()
+            .map(milli_to_f32)
+            .collect()
+    }
+
+    /// The `embedding` CSV cell for `Product` `i`: the [`EMBED_DIM`] integer-thousandths components
+    /// joined by `;` (the bulk importer's `float[]` element separator), each a fixed 3-decimal string
+    /// (`1023` ⇒ `"1.023"`). Pure integer formatting ⇒ byte-deterministic; contains no comma / quote /
+    /// newline, so it is a clean single CSV field.
+    fn product_embedding_cell(seed: u64, i: u64) -> String {
+        let millis = Self::product_embedding_millis(seed, i);
+        let mut cell = String::with_capacity(millis.len() * 6);
+        for (k, m) in millis.iter().enumerate() {
+            if k > 0 {
+                cell.push(';');
+            }
+            cell.push_str(&fmt_milli(*m));
+        }
+        cell
     }
 
     /// A deterministic price for `Product` `i`, in **integer cents** in `[PRICE_MIN_CENTS,
@@ -782,9 +891,10 @@ impl Generator {
     pub const USER_CSV_HEADER: &'static str =
         ":ID,:LABEL,id:string,name:string,country:string,signup:long\n";
     /// The header row of the `Product` node CSV: `:ID` + `:LABEL` + stored `id` + `name` + `category`
-    /// + `price` (integer cents).
+    /// + `price` (integer cents) + `embedding` (a `float[]` list column: `;`-separated floats parsed
+    ///   by the bulk importer into a `LIST<FLOAT>` property the `VECTOR` index covers).
     pub const PRODUCT_CSV_HEADER: &'static str =
-        ":ID,:LABEL,id:string,name:string,category:string,price:long\n";
+        ":ID,:LABEL,id:string,name:string,category:string,price:long,embedding:float[]\n";
     /// The header row of the `FRIEND` relationship CSV.
     pub const FRIEND_CSV_HEADER: &'static str = ":START_ID,:END_ID,:TYPE,since:long\n";
     /// The header row of the `PURCHASED` relationship CSV.
@@ -813,8 +923,8 @@ impl Generator {
     }
 
     /// Streams the `Product` node CSV to `sink`, one chunk at a time: the header chunk first, then
-    /// chunks of up to [`BATCH`] data rows `<id>,Product,<id>,<name>,<category>,<price>`. No edge list
-    /// is built; peak memory is one chunk.
+    /// chunks of up to [`BATCH`] data rows `<id>,Product,<id>,<name>,<category>,<price>,<embedding>`
+    /// (the `embedding` a `;`-separated `float[]` cell). No edge list is built; peak memory is one chunk.
     pub fn stream_product_csv<F: FnMut(Vec<u8>)>(&self, mut sink: F) {
         sink(Self::PRODUCT_CSV_HEADER.as_bytes().to_vec());
         let mut buf = String::new();
@@ -824,7 +934,11 @@ impl Generator {
             let name = escape_csv(&Self::product_name(self.cfg.seed, i));
             let category = escape_csv(Self::product_category(self.cfg.seed, i));
             let price = Self::product_price_cents(self.cfg.seed, i);
-            let _ = writeln!(buf, "{id},Product,{id},{name},{category},{price}");
+            let embedding = Self::product_embedding_cell(self.cfg.seed, i);
+            let _ = writeln!(
+                buf,
+                "{id},Product,{id},{name},{category},{price},{embedding}"
+            );
             in_chunk += 1;
             if in_chunk == BATCH || i + 1 == self.cfg.products {
                 sink(std::mem::take(&mut buf).into_bytes());
@@ -929,6 +1043,19 @@ impl Generator {
             self.cfg.popularity_skew,
         )
     }
+}
+
+/// Formats an integer-thousandths embedding component as a fixed 3-decimal string (`1023` ⇒ `"1.023"`,
+/// `7` ⇒ `"0.007"`), using **pure integer arithmetic** so no `f32` ever reaches the wire (the module's
+/// platform-stability contract). The bulk importer parses it back as a `float[]` element.
+fn fmt_milli(m: u64) -> String {
+    format!("{}.{:03}", m / 1000, m % 1000)
+}
+
+/// An `f32` view of an integer-thousandths component (`1023` ⇒ `1.023`). Used only off the wire (query
+/// vectors / the hermetic mirror), never in the emitted CSV bytes.
+fn milli_to_f32(m: u64) -> f32 {
+    m as f32 / 1000.0
 }
 
 /// Truncates a `String` to at most `max_bytes`, never splitting a UTF-8 char. Cheap when already
@@ -1089,7 +1216,7 @@ mod tests {
         );
         assert_eq!(
             Generator::PRODUCT_CSV_HEADER,
-            ":ID,:LABEL,id:string,name:string,category:string,price:long\n"
+            ":ID,:LABEL,id:string,name:string,category:string,price:long,embedding:float[]\n"
         );
         assert_eq!(
             Generator::FRIEND_CSV_HEADER,
@@ -1153,15 +1280,29 @@ mod tests {
                 "ID join key == stored id property: {line}"
             );
         }
-        // ...and likewise for every Product data row.
+        // ...and likewise for every Product data row (now 7 columns: the `embedding:float[]` cell is a
+        // single `;`-separated field with no comma, so `split(',')` still yields exactly 7).
         for line in products_csv.lines().skip(1) {
             let cols: Vec<&str> = line.split(',').collect();
-            assert_eq!(cols.len(), 6, "Product row has 6 columns: {line}");
+            assert_eq!(cols.len(), 7, "Product row has 7 columns: {line}");
             assert_eq!(cols[1], "Product", "Product :LABEL column: {line}");
             assert_eq!(
                 cols[0], cols[2],
                 "ID join key == stored id property: {line}"
             );
+            // The `embedding` cell (col 6) is a `;`-separated float[] of exactly EMBED_DIM elements.
+            let embedding: Vec<&str> = cols[6].split(';').collect();
+            assert_eq!(
+                embedding.len(),
+                EMBED_DIM,
+                "embedding has EMBED_DIM components: {line}"
+            );
+            for e in embedding {
+                assert!(
+                    e.parse::<f64>().is_ok(),
+                    "each embedding component parses as a float: {e:?} in {line}"
+                );
+            }
         }
     }
 
@@ -1185,5 +1326,92 @@ mod tests {
              product {} appeared {unpopular} times",
             products - 1
         );
+    }
+
+    /// The embedding's dominant (max) component is exactly the product's category axis, so a query at a
+    /// category centroid retrieves that category — the property the `VECTOR` "similar products" query
+    /// relies on. Also asserts the cell round-trips to [`EMBED_DIM`] finite floats.
+    #[test]
+    fn embeddings_cluster_by_category() {
+        let c = cfg();
+        for i in 0..c.products {
+            let cat = Generator::product_category_index(c.seed, i);
+            let emb = Generator::product_embedding(c.seed, i);
+            assert_eq!(
+                emb.len(),
+                EMBED_DIM,
+                "embedding {i} has EMBED_DIM components"
+            );
+
+            // The category axis is the strict argmax (centroid ≥ 1.0 dominates every ≤ 0.05 jitter axis).
+            let argmax = emb
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).expect("finite"))
+                .map(|(d, _)| d)
+                .expect("EMBED_DIM > 0");
+            assert_eq!(
+                argmax, cat,
+                "product {i}: the embedding's dominant axis ({argmax}) must be its category axis ({cat})"
+            );
+            assert!(
+                emb[cat] >= 1.0,
+                "product {i}: the category axis component ({}) must be ≥ 1.0",
+                emb[cat]
+            );
+            for (d, &v) in emb.iter().enumerate() {
+                assert!(v.is_finite(), "component {d} is finite");
+                if d != cat {
+                    assert!(
+                        v <= 0.05 + f32::EPSILON,
+                        "product {i}: non-category axis {d} component ({v}) must be ≤ 0.05 jitter"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Two products in **different** categories are cosine-orthogonal-ish (near 0), while a product and
+    /// its own category centroid are near-parallel (near 1) — the wide margin the k-NN seek depends on.
+    #[test]
+    fn cross_category_embeddings_are_well_separated() {
+        let c = cfg();
+        let cos = |a: &[f32], b: &[f32]| -> f32 {
+            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+            let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+            dot / (na * nb)
+        };
+        // Find one product per category to compare across clusters.
+        let mut rep: Vec<Option<u64>> = vec![None; EMBED_DIM];
+        for i in 0..c.products {
+            let cat = Generator::product_category_index(c.seed, i);
+            rep[cat].get_or_insert(i);
+        }
+        for (cat, &maybe_i) in rep.iter().enumerate() {
+            let Some(i) = maybe_i else { continue };
+            let emb = Generator::product_embedding(c.seed, i);
+            let centroid = Generator::category_centroid(cat);
+            let self_sim = cos(&emb, &centroid);
+            assert!(
+                self_sim > 0.9,
+                "product {i} (category {cat}) must align with its own centroid: cos = {self_sim}"
+            );
+            // Its similarity to any *other* category's centroid is far lower.
+            for other in 0..EMBED_DIM {
+                if other == cat {
+                    continue;
+                }
+                let cross = cos(&emb, &Generator::category_centroid(other));
+                assert!(
+                    cross < 0.2,
+                    "product {i} (category {cat}) must be far from centroid {other}: cos = {cross}"
+                );
+                assert!(
+                    self_sim > cross + 0.5,
+                    "product {i}: own-centroid margin too small ({self_sim} vs {cross})"
+                );
+            }
+        }
     }
 }

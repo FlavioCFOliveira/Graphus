@@ -1399,6 +1399,7 @@ dependencies = [
  "graphus-io",
  "graphus-iot-gen",
  "graphus-kg-gen",
+ "graphus-reco-gen",
  "graphus-rest",
  "graphus-security-gen",
  "graphus-sim",

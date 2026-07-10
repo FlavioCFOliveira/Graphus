@@ -195,6 +195,16 @@ graphus-kg-gen = { path = "../graphus-kg-gen" }
 # deps are serde + the evidence harness only and it does NOT depend on `graphus-server`, so this
 # introduces no cycle; it is a TEST-TARGET dev-dependency that never enters the production build.
 graphus-iot-gen = { path = "../graphus-iot-gen", default-features = false }
+# The deterministic product-recommendation generator, so the hermetic product-recommendations schema
+# mirror (`tests/product_recommendations_schema.rs`) can generate the SAME seeded products (with their
+# category-clustered embeddings) the example loads and assert the new read-path schema (VECTOR + TEXT
+# indexes, NODE KEY + UNIQUE + property-type constraints) — including the `db.index.vector.queryNodes`
+# k-NN "similar products" seek and the `TEXT CONTAINS` search — through the REAL admin-DDL + `LocalEngine`
+# seam, fully in-process, no Node/network. reco-gen has no feature flags; its lib deps are serde +
+# graphus-core + graphus-bolt + the evidence harness (all already in this build graph), and it does NOT
+# depend on `graphus-server`, so this introduces no cycle and no `dst` leakage; it is a TEST-TARGET
+# dev-dependency that never enters the production build.
+graphus-reco-gen = { path = "../graphus-reco-gen" }
 # The deterministic multi-tenant security generator (DEFAULT features = serde-only generator: the
 # `dataset`/`manifest` + the allow/deny matrix; its only deps are serde + the evidence harness), so
 # the hermetic security-multitenant cargo mirror (`tests/security_multitenant.rs`) can drive the

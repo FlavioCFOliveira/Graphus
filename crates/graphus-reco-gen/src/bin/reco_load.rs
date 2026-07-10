@@ -5,8 +5,22 @@
 //! **already-running** `graphus-server` over the wire, using the ratified network bulk-import **Mode
 //! A** happy path (`specification/08-network-bulk-import.md`, `rmp` #518/#519): create a fresh empty
 //! database, stream the node files then the relationship files, `end` the session, then bring the
-//! database online, declare the read-path indexes, and assert the graph shape plus that every
-//! recommendation query in the read battery returns a well-formed (non-erroring) result.
+//! database online, declare the production-realistic **read-path schema**, and assert the graph shape,
+//! the index-backed query paths, and constraint enforcement.
+//!
+//! # The schema it declares (`rmp` #676)
+//!
+//! Once the graph is online, the loader applies the shared [`graphus_reco_gen::schema::schema_ddl`]
+//! block — a **`NODE KEY`** on `User.id` and a **`UNIQUE`** on `Product.id` (the identity constraints
+//! whose backing indexes serve the `(:User {id})` / `(:Product {id})` anchor seeks every recommendation
+//! query starts from), a **property-type** constraint `Product.price IS :: INTEGER`, a **`TEXT`** index
+//! on `Product.name`, and a **`VECTOR`** (HNSW) index on `Product.embedding` — then waits for every
+//! backing index to reach `online`, captures `SHOW INDEXES` / `SHOW CONSTRAINTS` as evidence, and
+//! asserts three index-backed query paths against the known dataset: a **vector k-NN** "similar
+//! products" seek (`db.index.vector.queryNodes` at a category centroid returns that category's
+//! products), a **`TEXT` `CONTAINS`** search (finds a known product by a fragment of its name), and two
+//! **constraint-enforcement negatives** (a duplicate `Product.id` and a non-integer `price` are both
+//! rejected). Every recommendation query in the read battery must also return a well-formed result.
 //!
 //! # Wire protocol
 //!
@@ -50,6 +64,7 @@ use std::time::{Duration, Instant};
 
 use graphus_reco_gen::Generator;
 use graphus_reco_gen::queries::READ_BATTERY;
+use graphus_reco_gen::schema;
 use serde_json::{Value as Json, json};
 
 /// Bounds a hung connect without failing a healthy loopback (which resolves instantly).
@@ -291,22 +306,18 @@ fn run(args: &Args) -> Result<(), String> {
         None,
     )?;
 
-    // 5. Declare the read-path indexes (the anchor of every recommendation query is a `:User(id)` /
-    //    `:Product(id)` seek).
-    rest.statement(
-        &args.db,
-        "CREATE INDEX User(id)",
-        "CREATE INDEX FOR (u:User) ON (u.id)",
-        None,
-    )?;
-    rest.statement(
-        &args.db,
-        "CREATE INDEX Product(id)",
-        "CREATE INDEX FOR (p:Product) ON (p.id)",
-        None,
-    )?;
+    // 5. Declare the production-realistic read-path SCHEMA (`rmp` #676) — the shared DDL block the
+    //    hermetic mirror also drives: identity constraints (a NODE KEY on User.id, a UNIQUE on
+    //    Product.id) whose backing indexes serve the `(:User {id})` / `(:Product {id})` anchor seeks AND
+    //    enforce catalogue identity, a `price IS :: INTEGER` property-type constraint, a TEXT index for
+    //    name search, and a VECTOR (HNSW) index for the "similar products" ANN query.
+    for stmt in graphus_reco_gen::schema::schema_ddl() {
+        rest.statement(&args.db, &stmt, &stmt, None)?;
+    }
 
-    // 6. Poll SHOW INDEXES until BOTH builds report `online` (each poll also advances the build).
+    // 6. Poll SHOW INDEXES until every backing index reports `online` (each poll also advances any
+    //    still-building index). Constraint-backed / TEXT / VECTOR indexes build synchronously, so this
+    //    is a wide safety margin rather than the expected duration.
     wait_for_indexes(&rest, &args.db)?;
 
     // 7. Shape assertions.
@@ -352,7 +363,294 @@ fn run(args: &Args) -> Result<(), String> {
             .map_err(|e| format!("{e} (family {:?} is not a well-formed result)", spec.name))?;
     }
 
+    // 9. Schema evidence + the new index-backed query paths (`rmp` #676): dump SHOW INDEXES / SHOW
+    //    CONSTRAINTS as human-readable evidence, then assert the VECTOR k-NN "similar products" seek and
+    //    the TEXT `CONTAINS` search return the known dataset results.
+    schema_evidence_and_query_asserts(&rest, &args.db)?;
+
+    // 10. Constraint enforcement negatives: a duplicate `Product.id` (UNIQUE) and a non-integer `price`
+    //     (property-type) must each be REJECTED by the server (a rolled-back, non-2xx write).
+    assert_constraints_reject(&rest, &args.db)?;
+
     Ok(())
+}
+
+/// Captures `SHOW INDEXES` / `SHOW CONSTRAINTS` as human-readable evidence (printed between
+/// `GRAPHUS_RECO_SCHEMA_BEGIN`/`_END` sentinels for the example's `run.sh` to persist) and asserts the
+/// two new index-backed query paths against the known dataset:
+///
+/// * the **VECTOR k-NN** "similar products" seek — `db.index.vector.queryNodes` at category 0's centroid
+///   returns products **all of category 0**, with descending, high scores (an index hit, not a scan);
+/// * the **TEXT `CONTAINS`** search — a fragment of a known product's name resolves back to that product.
+///
+/// # Errors
+/// Any statement failure, a malformed result shape, or an assertion that does not hold.
+fn schema_evidence_and_query_asserts(rest: &Rest<'_>, db: &str) -> Result<(), String> {
+    // --- Evidence: SHOW INDEXES / SHOW CONSTRAINTS (printed for run.sh to persist). ---
+    let indexes = rest.statement(db, "SHOW INDEXES", "SHOW INDEXES", None)?;
+    let constraints = rest.statement(db, "SHOW CONSTRAINTS", "SHOW CONSTRAINTS", None)?;
+    let n_indexes = result_row_count(&indexes);
+    let n_constraints = result_row_count(&constraints);
+    eprintln!("GRAPHUS_RECO_SCHEMA_BEGIN");
+    eprintln!("SHOW INDEXES ({n_indexes} rows):");
+    for line in render_schema_rows(
+        &indexes,
+        &[
+            "name",
+            "type",
+            "entityType",
+            "labelsOrTypes",
+            "properties",
+            "state",
+        ],
+    ) {
+        eprintln!("  {line}");
+    }
+    eprintln!("SHOW CONSTRAINTS ({n_constraints} rows):");
+    for line in render_schema_rows(
+        &constraints,
+        &[
+            "name",
+            "type",
+            "entityType",
+            "labelsOrTypes",
+            "properties",
+            "propertyType",
+        ],
+    ) {
+        eprintln!("  {line}");
+    }
+    eprintln!("GRAPHUS_RECO_SCHEMA_END");
+    eprintln!("GRAPHUS_RECO_SCHEMA indexes={n_indexes} constraints={n_constraints}");
+
+    // --- VECTOR k-NN "similar products": a seek at category 0's centroid returns category-0 products. ---
+    let category = 0usize;
+    let expected_category = Generator::category_name(category);
+    let query_vec = Generator::category_centroid(category);
+    let k = 5usize;
+    let knn = rest.statement(
+        db,
+        "vector k-NN queryNodes",
+        &format!(
+            "CALL db.index.vector.queryNodes('{}', {k}, {}) YIELD node, score \
+             RETURN node.category AS category, score",
+            schema::PRODUCT_EMBEDDING_VECTOR,
+            cypher_f32_list(&query_vec),
+        ),
+        None,
+    )?;
+    let rows = knn
+        .pointer("/results/0/data")
+        .and_then(Json::as_array)
+        .ok_or_else(|| {
+            format!(
+                "vector k-NN: missing results[0].data: {}",
+                clip_str(&knn.to_string())
+            )
+        })?;
+    if rows.is_empty() {
+        return Err("vector k-NN returned no products (the VECTOR index built empty?)".to_owned());
+    }
+    if rows.len() > k {
+        return Err(format!(
+            "vector k-NN returned {} rows, more than k={k}",
+            rows.len()
+        ));
+    }
+    let mut prev_score = f64::INFINITY;
+    for row in rows {
+        let cells = row
+            .as_array()
+            .ok_or_else(|| "vector k-NN: a data row is not an array".to_owned())?;
+        let cat = jolt_str(&cells[0]).ok_or_else(|| {
+            format!(
+                "vector k-NN: category cell is not a Jolt string: {}",
+                cells[0]
+            )
+        })?;
+        if cat != expected_category {
+            return Err(format!(
+                "vector k-NN at category {category}'s centroid returned a '{cat}' product, expected all \
+                 '{expected_category}' (the category clusters are not separated?)"
+            ));
+        }
+        let score = jolt_float(&cells[1])
+            .ok_or_else(|| format!("vector k-NN: score cell is not a Jolt float: {}", cells[1]))?;
+        if score > prev_score {
+            return Err(format!(
+                "vector k-NN scores must be descending (nearest first), saw {score} after {prev_score}"
+            ));
+        }
+        prev_score = score;
+    }
+    // The nearest neighbour of the exact centroid must be a strong cosine match.
+    let top_score = jolt_float(&rows[0].as_array().expect("checked")[1]).expect("checked");
+    if top_score < 0.9 {
+        return Err(format!(
+            "vector k-NN top score {top_score} is too low for a centroid query (index not used / clusters bad)"
+        ));
+    }
+
+    // --- TEXT `CONTAINS`: a fragment of a known product's name resolves back to that product. ---
+    let pid = Generator::product_id(0);
+    let name_json = rest.statement(
+        db,
+        "product 0 name point-read",
+        "MATCH (p:Product {id: $id}) RETURN p.name AS name",
+        Some(json!({ "id": pid })),
+    )?;
+    let name = name_json
+        .pointer("/results/0/data/0/0")
+        .and_then(jolt_str)
+        .ok_or_else(|| {
+            format!(
+                "product 0 name point-read returned no name: {}",
+                clip_str(&name_json.to_string())
+            )
+        })?
+        .to_owned();
+    // The product name is `<noun> <adjective> [brand]`; the leading noun is a stable, comma-free
+    // fragment guaranteed present. Search for it and require product 0 to be among the matches.
+    let fragment = name.split(' ').next().unwrap_or(&name).to_owned();
+    let contains = rest.statement(
+        db,
+        "TEXT CONTAINS search",
+        "MATCH (p:Product) WHERE p.name CONTAINS $fragment RETURN p.id AS id",
+        Some(json!({ "fragment": fragment })),
+    )?;
+    let match_rows = contains
+        .pointer("/results/0/data")
+        .and_then(Json::as_array)
+        .ok_or_else(|| {
+            format!(
+                "TEXT CONTAINS: missing results[0].data: {}",
+                clip_str(&contains.to_string())
+            )
+        })?;
+    let found_pid = match_rows
+        .iter()
+        .filter_map(|row| row.as_array())
+        .filter_map(|cells| cells.first())
+        .any(|cell| jolt_str(cell) == Some(pid.as_str()));
+    if !found_pid {
+        return Err(format!(
+            "TEXT CONTAINS '{fragment}' did not return product 0 (id {pid}), whose name is '{name}'"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Asserts the two constraint-enforcement negatives are REJECTED by the server (a rolled-back write, so
+/// `rest.statement` returns an `Err`): a **duplicate `Product.id`** (violates the `UNIQUE` constraint)
+/// and a **non-integer `price`** (violates the `IS :: INTEGER` property-type constraint).
+///
+/// # Errors
+/// If either write is *accepted* (the constraint did not enforce), or the point-read of product 0's id
+/// fails.
+fn assert_constraints_reject(rest: &Rest<'_>, db: &str) -> Result<(), String> {
+    let existing_pid = Generator::product_id(0);
+
+    // Duplicate Product.id → UNIQUE violation.
+    expect_rejected(
+        rest,
+        db,
+        "duplicate Product.id (UNIQUE)",
+        "CREATE (:Product {id: $id, name: 'dup', category: 'x', price: 100})",
+        Some(json!({ "id": existing_pid })),
+    )?;
+
+    // Non-integer price → property-type violation. A fresh, unique (non-hex) id keeps the write's *only*
+    // defect the float price, so the rejection is unambiguously the property-type constraint.
+    expect_rejected(
+        rest,
+        db,
+        "non-integer Product.price (IS :: INTEGER)",
+        "CREATE (:Product {id: 'reco-neg-price-test', name: 'p', category: 'x', price: 9.99})",
+        None,
+    )?;
+
+    Ok(())
+}
+
+/// Runs a write that MUST be rejected by a constraint: succeeds (`Ok`) only when the server *rejects* it
+/// (`rest.statement` returns an `Err` — a constraint violation surfaces as a non-2xx problem+json).
+///
+/// # Errors
+/// `<what> was ACCEPTED but must be rejected …` if the write succeeded.
+fn expect_rejected(
+    rest: &Rest<'_>,
+    db: &str,
+    what: &str,
+    statement: &str,
+    params: Option<Json>,
+) -> Result<(), String> {
+    match rest.statement(db, what, statement, params) {
+        Ok(_) => Err(format!(
+            "{what} was ACCEPTED but must be rejected by its constraint"
+        )),
+        Err(_) => Ok(()),
+    }
+}
+
+/// Formats an `f32` slice as a Cypher list literal (`[1.0, 0.0, …]`). `{x:?}` keeps a decimal point so
+/// each element lexes as a Cypher `Float`, never an `Integer` (the vector index's query dimension check
+/// widens integers, but a decimal literal is unambiguous).
+fn cypher_f32_list(v: &[f32]) -> String {
+    let elems: Vec<String> = v.iter().map(|x| format!("{x:?}")).collect();
+    format!("[{}]", elems.join(", "))
+}
+
+/// The number of data rows in a `{"results":[{"data":[…]}]}` envelope (`0` if absent).
+fn result_row_count(json: &Json) -> usize {
+    json.pointer("/results/0/data")
+        .and_then(Json::as_array)
+        .map_or(0, Vec::len)
+}
+
+/// Renders each row of a `SHOW INDEXES` / `SHOW CONSTRAINTS` result as a compact `col=value …` evidence
+/// line, selecting `columns` by name (robust to the full column set). List cells render as `[a, b]`.
+fn render_schema_rows(json: &Json, columns: &[&str]) -> Vec<String> {
+    let Some(fields) = json.pointer("/results/0/fields").and_then(Json::as_array) else {
+        return Vec::new();
+    };
+    let idx = |name: &str| fields.iter().position(|f| f.as_str() == Some(name));
+    let Some(rows) = json.pointer("/results/0/data").and_then(Json::as_array) else {
+        return Vec::new();
+    };
+    rows.iter()
+        .filter_map(|row| row.as_array())
+        .map(|cells| {
+            let mut parts = Vec::new();
+            for &col in columns {
+                if let Some(i) = idx(col)
+                    && let Some(cell) = cells.get(i)
+                {
+                    parts.push(format!("{col}={}", render_jolt_cell(cell)));
+                }
+            }
+            parts.join(" ")
+        })
+        .collect()
+}
+
+/// Renders a single strict-Jolt cell for the evidence dump: a string/int payload, a `[a, b]` list, or a
+/// compact JSON fallback.
+fn render_jolt_cell(cell: &Json) -> String {
+    if let Some(s) = jolt_str(cell) {
+        return s.to_owned();
+    }
+    if let Some(i) = jolt_int(cell) {
+        return i.to_string();
+    }
+    if let Some(items) = cell.as_array() {
+        let inner: Vec<String> = items.iter().map(render_jolt_cell).collect();
+        return format!("[{}]", inner.join(", "));
+    }
+    if cell.is_null() {
+        return "null".to_owned();
+    }
+    cell.to_string()
 }
 
 /// The `Content-Type` for every CSV bulk-upload body.
@@ -497,26 +795,37 @@ fn login(addr: &str, user: &str, password: &str) -> Result<String, String> {
         })
 }
 
-/// Polls `SHOW INDEXES` until both the `User(id)` and `Product(id)` builds report `online`
-/// (case-insensitive), or the [`INDEX_ONLINE_TIMEOUT`] elapses. Each poll is itself an engine command,
-/// which advances the in-progress online builds.
+/// The `(label, property)` **durable** indexes awaited `online` after the schema DDL: the TEXT index
+/// (Product.name) and the VECTOR index (Product.embedding). The identity constraints' backing indexes
+/// (User.id NODE KEY, Product.id UNIQUE) drive the anchor seeks through the in-memory index set but are
+/// surfaced under `SHOW CONSTRAINTS`, **not** `SHOW INDEXES` (which lists only durable index
+/// declarations), so they are awaited via the constraint listing, not here.
+const REQUIRED_INDEXES: &[(&str, &str)] = &[("Product", "name"), ("Product", "embedding")];
+
+/// Polls `SHOW INDEXES` until every [`REQUIRED_INDEXES`] index reports `online` (case-insensitive), or
+/// the [`INDEX_ONLINE_TIMEOUT`] elapses. Each poll is itself an engine command, which advances any
+/// still-building online index.
 ///
 /// # Errors
-/// A message with the last observed states on timeout, or any statement failure.
+/// A message naming the still-pending indexes on timeout, or any statement failure.
 fn wait_for_indexes(rest: &Rest<'_>, db: &str) -> Result<(), String> {
     let deadline = Instant::now() + INDEX_ONLINE_TIMEOUT;
     loop {
         let json = rest.statement(db, "SHOW INDEXES", "SHOW INDEXES", None)?;
-        let user_online = index_is_online(&json, "User", "id")?;
-        let product_online = index_is_online(&json, "Product", "id")?;
-        if user_online && product_online {
+        let mut pending = Vec::new();
+        for &(label, property) in REQUIRED_INDEXES {
+            if !index_is_online(&json, label, property)? {
+                pending.push(format!("{label}({property})"));
+            }
+        }
+        if pending.is_empty() {
             return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(format!(
-                "indexes did not reach `online` within {}s (User(id) online={user_online}, \
-                 Product(id) online={product_online}); last SHOW INDEXES: {}",
+                "indexes did not reach `online` within {}s (pending: {}); last SHOW INDEXES: {}",
                 INDEX_ONLINE_TIMEOUT.as_secs(),
+                pending.join(", "),
                 clip_str(&json.to_string())
             ));
         }
@@ -524,13 +833,33 @@ fn wait_for_indexes(rest: &Rest<'_>, db: &str) -> Result<(), String> {
     }
 }
 
-/// Whether the `(label, property)` index row in a decoded `SHOW INDEXES` result reports `online`.
-/// Returns `false` (not an error) when the row is not yet present. The row cells are strict-Jolt
-/// strings (`{"U":"…"}`) in `[label, property, state]` order.
+/// Whether the `SHOW INDEXES` result has a row covering `(label, property)` in state `online`. Columns
+/// are resolved **by name** from `results[0].fields` (robust to the full unified column set — `rmp`
+/// #660 made `SHOW INDEXES` a 12-column Neo4j listing, not a bare `[label, property, state]` triple).
+/// `labelsOrTypes` and `properties` are strict-Jolt **list** cells (plain JSON arrays of `{"U":"…"}`);
+/// a row matches when its label list contains `label` and its property list is exactly `[property]`.
+/// Returns `false` (not an error) when no such row is present yet.
 ///
 /// # Errors
-/// When the response has no `results[0].data` array (a shape the server should never emit).
+/// When the response has no `results[0].fields` / `results[0].data`, or is missing the columns needed.
 fn index_is_online(json: &Json, label: &str, property: &str) -> Result<bool, String> {
+    let fields = json
+        .pointer("/results/0/fields")
+        .and_then(Json::as_array)
+        .ok_or_else(|| {
+            format!(
+                "SHOW INDEXES: missing results[0].fields array: {}",
+                clip_str(&json.to_string())
+            )
+        })?;
+    let col = |name: &str| fields.iter().position(|f| f.as_str() == Some(name));
+    let (Some(labels_c), Some(props_c), Some(state_c)) =
+        (col("labelsOrTypes"), col("properties"), col("state"))
+    else {
+        return Err(format!(
+            "SHOW INDEXES: missing labelsOrTypes/properties/state columns in fields {fields:?}"
+        ));
+    };
     let rows = json
         .pointer("/results/0/data")
         .and_then(Json::as_array)
@@ -540,18 +869,31 @@ fn index_is_online(json: &Json, label: &str, property: &str) -> Result<bool, Str
                 clip_str(&json.to_string())
             )
         })?;
+    let max_c = labels_c.max(props_c).max(state_c);
     for row in rows {
         let Some(cells) = row.as_array() else {
             continue;
         };
-        if cells.len() < 3 {
+        if cells.len() <= max_c {
             continue;
         }
-        if jolt_str(&cells[0]) == Some(label) && jolt_str(&cells[1]) == Some(property) {
-            return Ok(jolt_str(&cells[2]).is_some_and(|s| s.eq_ignore_ascii_case("online")));
+        if jolt_list_contains(&cells[labels_c], label) && jolt_list_is(&cells[props_c], property) {
+            return Ok(jolt_str(&cells[state_c]).is_some_and(|s| s.eq_ignore_ascii_case("online")));
         }
     }
     Ok(false)
+}
+
+/// Whether a strict-Jolt **list** cell (a plain JSON array of `{"U":"…"}` strings) contains `s`.
+fn jolt_list_contains(cell: &Json, s: &str) -> bool {
+    cell.as_array()
+        .is_some_and(|xs| xs.iter().any(|e| jolt_str(e) == Some(s)))
+}
+
+/// Whether a strict-Jolt **list** cell is exactly the single-element list `[s]`.
+fn jolt_list_is(cell: &Json, s: &str) -> bool {
+    cell.as_array()
+        .is_some_and(|xs| xs.len() == 1 && jolt_str(&xs[0]) == Some(s))
 }
 
 /// Runs a `RETURN count(...)` statement and asserts the single scalar equals `expected`.
@@ -602,6 +944,11 @@ fn jolt_str(cell: &Json) -> Option<&str> {
 /// The i64 payload of a strict-Jolt integer cell `{"Z":"<decimal>"}` (the int53-safe string encoding).
 fn jolt_int(cell: &Json) -> Option<i64> {
     cell.get("Z")?.as_str()?.parse().ok()
+}
+
+/// The f64 payload of a strict-Jolt float cell `{"R":"<decimal>"}` (the vector-score encoding).
+fn jolt_float(cell: &Json) -> Option<f64> {
+    cell.get("R")?.as_str()?.parse().ok()
 }
 
 /// A top-level plain-JSON `u64` field (the bulk-import stats body is plain JSON, not Jolt).
