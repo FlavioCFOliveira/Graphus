@@ -3276,7 +3276,9 @@ mod tests {
     /// bundle must drop the reference-model "failure" ONLY when the read-back hard-failed because the
     /// engine surfaced a latent-sector-error the harness itself injected (a page in
     /// `latent_fault_pages`) — and must STILL flag every silent committed-data discrepancy and every
-    /// untied error. This is the exact distinction the false-positive seed 47251 exposed.
+    /// untied error. This is the exact distinction the false-positive seed 47251 originally exposed
+    /// (the live end-to-end pin, being layout-coupled, has since moved to seed 702583 — see
+    /// `tests/vopr_surfaced_injected_fault.rs`).
     #[test]
     fn evaluate_safety_excuses_surfaced_injected_lse_only() {
         use crate::vopr_oracle::SurfacedFault;
