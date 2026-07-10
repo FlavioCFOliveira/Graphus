@@ -117,6 +117,78 @@ fn fast_profile_loads_and_traverses() {
 }
 
 #[test]
+fn fast_profile_declares_search_schema_and_searches_headlines() {
+    let cfg = GenConfig::fast();
+
+    let dir = TempDir::new("schema");
+    let out = run_load_isolated(&cfg, &dir.path, LoadOpts::default());
+
+    // --- The production-realistic search schema is declared, correctly typed, and Online. ---------
+    assert!(out.schema_applied, "the search schema must be applied");
+    let online = |name: &str, kind: &str, entity: &str| {
+        let idx = out
+            .index(name)
+            .unwrap_or_else(|| panic!("index {name} present: {:?}", out.indexes));
+        assert_eq!(idx.kind, kind, "{name} type");
+        assert_eq!(idx.entity, entity, "{name} entity");
+        assert_eq!(idx.state, "ONLINE", "{name} state");
+    };
+    // The two always-on token LOOKUP indexes are surfaced.
+    online("node_label_lookup_index", "LOOKUP", "NODE");
+    online("rel_type_lookup_index", "LOOKUP", "RELATIONSHIP");
+    // The id read-path RANGE indexes are retained.
+    online("user_id_range", "RANGE", "NODE");
+    online("article_id_range", "RANGE", "NODE");
+    // The new index kinds: TEXT + FULLTEXT (node), relationship RANGE, composite (node) RANGE.
+    online("article_name_text", "TEXT", "NODE");
+    online("article_headline_fulltext", "FULLTEXT", "NODE");
+    online("like_date_range", "RANGE", "RELATIONSHIP");
+    online("article_catalog_composite", "RANGE", "NODE");
+
+    // The existence constraint on ARTICLE.name is declared.
+    let cons = out
+        .constraint("article_name_exists")
+        .expect("existence constraint present");
+    assert_eq!(cons.kind, "NODE_PROPERTY_EXISTENCE");
+    assert_eq!(cons.properties, vec!["name".to_owned()]);
+
+    // --- The headline search: TEXT CONTAINS and FULLTEXT queryNodes return the SAME, generator-
+    //     derived article set (the term is a single-token subject word). ---------------------------
+    assert!(
+        out.search_expected > 1,
+        "the headline term must match multiple articles: {} -> {}",
+        out.search_term,
+        out.search_expected
+    );
+    let text = out.query("text_contains").expect("text_contains probe");
+    let ft = out.query("fulltext").expect("fulltext probe");
+    assert_eq!(
+        text.scalar,
+        Some(out.search_expected as i64),
+        "TEXT CONTAINS '{}' returns the generator's {} articles",
+        out.search_term,
+        out.search_expected
+    );
+    assert_eq!(
+        ft.scalar,
+        Some(out.search_expected as i64),
+        "FULLTEXT queryNodes('{}') returns the same {} articles (analyzer lowercases, no stemming)",
+        out.search_term.to_lowercase(),
+        out.search_expected
+    );
+
+    // --- The LIKE.date range predicate (a scan + residual filter — the rel RANGE index is
+    //     equality-only) returns a non-trivial recent slice: 0 < recent < |LIKE|. -----------------
+    let recent = out.query("like_recent").expect("like_recent probe");
+    let recent_n = recent.scalar.unwrap_or(-1);
+    assert!(
+        recent_n > 0 && (recent_n as u64) < out.like_count,
+        "LIKE.date recent-half range is a non-trivial slice: 0 < {recent_n} < {}",
+        out.like_count
+    );
+}
+
+#[test]
 fn fast_profile_load_is_deterministic() {
     // Two independent loads of the same config into two independent on-disk stores must read back the
     // identical realised shape and identical query answers — the load is a pure function of the
@@ -133,12 +205,30 @@ fn fast_profile_load_is_deterministic() {
     assert_eq!(a.friend_count, b.friend_count, "FRIEND count stable");
     assert_eq!(a.like_count, b.like_count, "LIKE count stable");
 
-    for name in ["friends", "fof", "mutual", "top_liked", "degree"] {
+    for name in [
+        "friends",
+        "fof",
+        "mutual",
+        "top_liked",
+        "degree",
+        "text_contains",
+        "fulltext",
+        "like_recent",
+    ] {
         let qa = a.query(name).expect("probe a");
         let qb = b.query(name).expect("probe b");
         assert_eq!(qa.rows, qb.rows, "{name} row count stable");
         assert_eq!(qa.scalar, qb.scalar, "{name} scalar stable");
     }
+
+    // The declared search schema + the headline ground truth are deterministic too.
+    assert_eq!(a.search_term, b.search_term, "search term stable");
+    assert_eq!(
+        a.search_expected, b.search_expected,
+        "search expected stable"
+    );
+    assert_eq!(a.indexes, b.indexes, "index listing stable");
+    assert_eq!(a.constraints, b.constraints, "constraint listing stable");
 
     // The durable device footprint is also deterministic (same graph, same on-disk layout).
     assert_eq!(

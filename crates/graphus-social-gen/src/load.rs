@@ -66,13 +66,16 @@ use graphus_bulk::{BulkImporter, DEFAULT_BATCH_SIZE};
 use graphus_core::{TxnId, Value};
 use graphus_cypher::coordinator::TxnCoordinator;
 use graphus_cypher::{
-    IndexCatalog, Parameters, Row, RowValue, analyze, bind_parameters, execute, lower,
-    parse_tokens, plan_physical, tokenize,
+    Analyzer, ConstraintInfo, ConstraintKind, FulltextEntity, IndexCatalog, Parameters, Row,
+    RowValue, analyze, bind_parameters, execute, lower, parse_tokens, plan_physical, tokenize,
 };
 use graphus_io::FileBlockDevice;
-use graphus_storage::RecordStore;
+use graphus_storage::{IndexState, RecordStore};
 use graphus_txn::IsolationLevel;
 use graphus_wal::{FileLogSink, WalManager};
+
+use crate::EPOCH_S;
+use crate::REG_SPAN_S;
 
 use crate::{GenConfig, Generator};
 
@@ -89,6 +92,70 @@ const POOL_PAGES: usize = 4_096;
 
 /// The element-id seed handed to [`RecordStore::create`] (the production default the server uses).
 const ELEMENT_ID_SEED: u128 = 1;
+
+// --- Search-schema object names (the DDL this loader declares) -----------------------------------
+//
+// These are the exact names a Bolt/REST operator would pass to `CREATE … INDEX <name> …` /
+// `CREATE CONSTRAINT <name> …`; the hermetic `graphus-server/tests/social_network_large_schema.rs`
+// drives the *string* DDL forms carrying these same names through `parse_admin_statement` →
+// `LocalEngine::{index_ddl, constraint_ddl}`, so a drift between the typed seam this loader uses and
+// the string admin grammar would fail that test.
+
+/// Node `RANGE` index on `USER.id` — the friendship-traversal anchor lookup.
+const IDX_USER_ID: &str = "user_id_range";
+/// Node `RANGE` index on `ARTICLE.id` — the like-traversal anchor lookup.
+const IDX_ARTICLE_ID: &str = "article_id_range";
+/// `TEXT` (trigram) index on `ARTICLE.name` — accelerates `CONTAINS` / `STARTS WITH` / `ENDS WITH`
+/// headline substring search.
+const IDX_ARTICLE_NAME_TEXT: &str = "article_name_text";
+/// `FULLTEXT` (analyzer-tokenized) index on `ARTICLE.name` — the headline word search queried by
+/// `db.index.fulltext.queryNodes`.
+const IDX_ARTICLE_HEADLINE_FT: &str = "article_headline_fulltext";
+/// Relationship `RANGE` index on `LIKE.date` — an equality-seekable like-timestamp index (Graphus's
+/// relationship RANGE index is equality-only; a `date` *range* predicate stays a scan + filter).
+const IDX_LIKE_DATE: &str = "like_date_range";
+/// Composite node `RANGE` index on `ARTICLE(registered, id)` — time-ordered catalogue reads (leading
+/// `registered` equality seek + trailing `id` residual).
+const IDX_ARTICLE_CATALOG: &str = "article_catalog_composite";
+/// Node existence constraint: every `ARTICLE` must carry a `name` (the searchable headline).
+const CONS_ARTICLE_NAME_EXISTS: &str = "article_name_exists";
+
+/// The two **always-on** token-lookup index names Graphus surfaces from `SHOW INDEXES` (they back
+/// every label / relationship-type scan and are never created explicitly). Named here so the loader's
+/// listing and the wire demo can point at them; the hermetic schema test asserts them via the real
+/// `SHOW INDEXES` column set.
+pub const NODE_LABEL_LOOKUP_INDEX: &str = "node_label_lookup_index";
+/// The relationship-type token-lookup index name (see [`NODE_LABEL_LOOKUP_INDEX`]).
+pub const REL_TYPE_LOOKUP_INDEX: &str = "rel_type_lookup_index";
+
+/// One `SHOW INDEXES`-style row the loader captures as evidence: an index's server-unique name, its
+/// `type` (`RANGE` / `TEXT` / `FULLTEXT` / `LOOKUP`), its `entityType` (`NODE` / `RELATIONSHIP`), and
+/// its build `state` (`ONLINE` / `POPULATING`). Mirrors the subset of the real `SHOW INDEXES` columns
+/// this example asserts on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexListing {
+    /// The server-unique index name.
+    pub name: String,
+    /// The index type: `RANGE`, `TEXT`, `FULLTEXT`, or `LOOKUP`.
+    pub kind: String,
+    /// The indexed entity: `NODE` or `RELATIONSHIP`.
+    pub entity: String,
+    /// The build state: `ONLINE` or `POPULATING`.
+    pub state: String,
+}
+
+/// One `SHOW CONSTRAINTS`-style row the loader captures as evidence: the constraint's server-unique
+/// name, its `type` (Neo4j-style, e.g. `NODE_PROPERTY_EXISTENCE`), its `entityType`, and its covered
+/// properties.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstraintListing {
+    /// The server-unique constraint name.
+    pub name: String,
+    /// The Neo4j-style constraint type (e.g. `NODE_PROPERTY_EXISTENCE`).
+    pub kind: String,
+    /// The covered properties, in declared order.
+    pub properties: Vec<String>,
+}
 
 /// Knobs for one load run.
 #[derive(Debug, Clone)]
@@ -184,6 +251,24 @@ pub struct LoadOutcome {
     pub friend_count: u64,
     /// `LIKE` edge count read back from the engine after the load.
     pub like_count: u64,
+    /// Whether the production-realistic **search schema** (the TEXT + FULLTEXT + relationship-RANGE +
+    /// composite indexes and the `ARTICLE.name` existence constraint) was declared. Always `true` when
+    /// the load is indexed; `false` only under the `--no-index` scan contrast.
+    pub schema_applied: bool,
+    /// The `SHOW INDEXES`-style listing captured after the schema was declared (the id + search indexes
+    /// the loader built, plus the two always-on `LOOKUP` token indexes). Empty when `schema_applied` is
+    /// `false`.
+    pub indexes: Vec<IndexListing>,
+    /// The `SHOW CONSTRAINTS`-style listing captured after the schema was declared. Empty when
+    /// `schema_applied` is `false`.
+    pub constraints: Vec<ConstraintListing>,
+    /// The headline term the TEXT / FULLTEXT search probes searched for — the single-token subject word
+    /// that appears in the most `ARTICLE` headlines (deterministic; empty when no schema was applied).
+    pub search_term: String,
+    /// The number of `ARTICLE`s whose headline contains [`search_term`](Self::search_term), derived
+    /// **from the generator** (the ground truth the TEXT `CONTAINS` and FULLTEXT `queryNodes` probes
+    /// must both return). `0` when no schema was applied.
+    pub search_expected: u64,
     /// The read-query battery's measured samples, in run order.
     pub queries: Vec<QuerySample>,
 }
@@ -228,6 +313,18 @@ impl LoadOutcome {
     #[must_use]
     pub fn query(&self, name: &str) -> Option<&QuerySample> {
         self.queries.iter().find(|q| q.name == name)
+    }
+
+    /// Looks up a captured index listing by its `name`.
+    #[must_use]
+    pub fn index(&self, name: &str) -> Option<&IndexListing> {
+        self.indexes.iter().find(|i| i.name == name)
+    }
+
+    /// Looks up a captured constraint listing by its `name`.
+    #[must_use]
+    pub fn constraint(&self, name: &str) -> Option<&ConstraintListing> {
+        self.constraints.iter().find(|c| c.name == name)
     }
 }
 
@@ -449,22 +546,102 @@ pub fn run_load(cfg: &GenConfig, dir: &Path, opts: LoadOpts) -> LoadOutcome {
     // --- Build a coordinator over the SAME store (no reopen) for the index build + read battery. --
     let mut coord = TxnCoordinator::new(store);
 
-    // --- Index build (schema op via the dedicated coordinator method, online over loaded data). ---
-    // This is what makes the read battery's id-anchored point lookups seek instead of scan.
+    // --- Schema build (indexes + constraint via the typed coordinator seam, online over loaded data).
+    // These are the exact methods the server's Bolt/REST admin surface dispatches to after parsing the
+    // equivalent `CREATE … INDEX` / `CREATE CONSTRAINT` statement; the hermetic
+    // `graphus-server/tests/social_network_large_schema.rs` drives those *string* DDL forms (carrying
+    // the same object names) through `parse_admin_statement` → `LocalEngine::{index_ddl, constraint_ddl}`
+    // and asserts the identical schema, so a drift between the two seams would fail there.
     let mut index_build_millis = 0u64;
+    let mut schema_applied = false;
     if opts.index_ids {
         let t = Instant::now();
+
+        // (1) The id read-path RANGE indexes — the friendship / like point-lookup anchors, so every
+        //     `MATCH (:USER {id: …})` in the read battery is an index SEEK, not a label scan.
         coord
-            .create_node_property_index("USER", "id")
-            .expect("create :USER(id) index");
+            .begin_online_node_property_index_named(Some(IDX_USER_ID), "USER", "id", true)
+            .expect("create :USER(id) RANGE index");
         coord
-            .create_node_property_index("ARTICLE", "id")
-            .expect("create :ARTICLE(id) index");
+            .begin_online_node_property_index_named(Some(IDX_ARTICLE_ID), "ARTICLE", "id", true)
+            .expect("create :ARTICLE(id) RANGE index");
+
+        // (2) The production-realistic SEARCH schema over the ARTICLE headlines + the LIKE timeline:
+        //     - a TEXT (trigram) index for headline substring search (`CONTAINS` / `STARTS WITH`);
+        //     - a FULLTEXT (analyzer-tokenized) index for headline WORD search via
+        //       `db.index.fulltext.queryNodes`;
+        //     - a relationship RANGE index on LIKE.date (equality-seekable; Graphus's relationship RANGE
+        //       index is equality-only, so a `date` *range* predicate stays a scan + residual filter);
+        //     - a composite node RANGE index on ARTICLE(registered, id) for time-ordered catalogue reads.
+        coord
+            .create_text_index(IDX_ARTICLE_NAME_TEXT, "ARTICLE", "name", true)
+            .expect("create TEXT index on ARTICLE.name");
+        coord
+            .create_fulltext_index(
+                IDX_ARTICLE_HEADLINE_FT,
+                &["ARTICLE".to_owned()],
+                &["name".to_owned()],
+                Analyzer::Standard,
+                true,
+            )
+            .expect("create FULLTEXT index on ARTICLE.name");
+        coord
+            .create_rel_property_index_named(Some(IDX_LIKE_DATE), "LIKE", "date", true)
+            .expect("create relationship RANGE index on LIKE.date");
+        coord
+            .begin_online_node_composite_index_named(
+                Some(IDX_ARTICLE_CATALOG),
+                "ARTICLE",
+                &["registered".to_owned(), "id".to_owned()],
+                true,
+            )
+            .expect("create composite RANGE index on ARTICLE(registered, id)");
+
+        // (3) The node existence constraint: every ARTICLE carries a `name` (the searchable headline).
+        //     Validated against the just-loaded data — the load only reaches here because every seeded
+        //     ARTICLE has a name, so the constraint is accepted.
+        coord
+            .create_constraint_general(
+                CONS_ARTICLE_NAME_EXISTS,
+                "ARTICLE",
+                &["name"],
+                ConstraintKind::Existence,
+                None,
+            )
+            .expect("create existence constraint on ARTICLE.name");
+
+        // Drive every non-blocking build (the single-property id RANGE indexes and the FULLTEXT index)
+        // to completion so they are Online before the read battery — the same `advance_index_builds`
+        // pump the server's engine loop runs between commands, here run to quiescence in one shot (the
+        // TEXT, composite and relationship RANGE indexes build synchronously and are already Online).
+        while coord.advance_index_builds(usize::MAX) {}
+
         index_build_millis = t.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        schema_applied = true;
     }
     // The live catalog the read phases compile against: reflects the indexes just built so the planner
     // emits `NodeIndexSeek` for every id-keyed MATCH.
     let catalog = coord.catalog();
+
+    // Capture the SHOW INDEXES / SHOW CONSTRAINTS listings as evidence (empty when not indexed).
+    let indexes = if schema_applied {
+        collect_index_listings(&coord)
+    } else {
+        Vec::new()
+    };
+    let constraints = if schema_applied {
+        collect_constraint_listings(&coord)
+    } else {
+        Vec::new()
+    };
+    // The headline term the search probes look for + its ground-truth hit count, derived from the
+    // generator (the known article set the TEXT `CONTAINS` and FULLTEXT `queryNodes` probes must both
+    // return). Empty / zero when no schema was applied.
+    let (search_term, search_expected) = if schema_applied {
+        dominant_headline_term(cfg)
+    } else {
+        (String::new(), 0)
+    };
 
     // --- Flush + sync so the durable image on disk reflects every committed page, then measure. ---
     coord
@@ -495,8 +672,12 @@ pub fn run_load(cfg: &GenConfig, dir: &Path, opts: LoadOpts) -> LoadOutcome {
         "MATCH ()-[r:LIKE]->() RETURN count(r) AS c",
     );
 
-    // --- The read-query battery. ------------------------------------------------------------------
-    let queries = run_query_battery(&mut coord, &catalog, &generator);
+    // --- The read-query battery: the traversal probes, then (when a schema was declared) the search
+    //     probes that exercise the TEXT / FULLTEXT / relationship-RANGE index paths. --------------------
+    let mut queries = run_query_battery(&mut coord, &catalog, &generator);
+    if schema_applied {
+        queries.extend(run_search_battery(&mut coord, &catalog, &search_term));
+    }
 
     LoadOutcome {
         cfg: cfg.clone(),
@@ -514,6 +695,11 @@ pub fn run_load(cfg: &GenConfig, dir: &Path, opts: LoadOpts) -> LoadOutcome {
         article_count,
         friend_count,
         like_count,
+        schema_applied,
+        indexes,
+        constraints,
+        search_term,
+        search_expected,
         queries,
     }
 }
@@ -617,6 +803,224 @@ fn run_query_battery(
     out
 }
 
+/// Runs the three **search** probes that exercise the new index kinds, returning a measured
+/// [`QuerySample`] per probe (each a `count(…)` so its `scalar` is the hit count):
+///
+/// 1. `text_contains` — headline substring search over the TEXT-indexed `ARTICLE.name`
+///    (`WHERE a.name CONTAINS '<term>'`), the "find every article whose headline mentions X" query.
+/// 2. `fulltext`      — headline WORD search via `CALL db.index.fulltext.queryNodes` over the FULLTEXT
+///    index (`<term>` lower-cased to the analyzer token). By construction this returns the SAME article
+///    set as `text_contains` (`<term>` is a single-token subject word appearing nowhere else), so the
+///    caller cross-checks both against the generator's ground truth.
+/// 3. `like_recent`   — a `LIKE.date` **range** predicate (`WHERE l.date >= <midpoint>`). Graphus's
+///    relationship RANGE index is *equality-only*, so this range predicate is served by a correct
+///    scan-plus-residual-filter (NOT the `like_date_range` index); the probe still returns a
+///    well-defined, non-trivial slice of the like timeline (the recent half).
+fn run_search_battery(coord: &mut Coord, catalog: &IndexCatalog, term: &str) -> Vec<QuerySample> {
+    let mut out = Vec::with_capacity(3);
+
+    // 1) TEXT-index headline substring search.
+    let q = format!("MATCH (a:ARTICLE) WHERE a.name CONTAINS '{term}' RETURN count(a) AS hits");
+    let (rows, latency_us) = timed_read(coord, catalog, &q);
+    out.push(QuerySample {
+        name: "text_contains".to_owned(),
+        query: q,
+        latency_us,
+        rows: rows.len() as u64,
+        scalar: first_scalar(&rows),
+    });
+
+    // 2) FULLTEXT headline word search (lower-case the term to the standard-analyzer token).
+    let term_lc = term.to_lowercase();
+    let q = format!(
+        "CALL db.index.fulltext.queryNodes('{IDX_ARTICLE_HEADLINE_FT}', '{term_lc}') \
+         YIELD node RETURN count(node) AS hits"
+    );
+    let (rows, latency_us) = timed_read(coord, catalog, &q);
+    out.push(QuerySample {
+        name: "fulltext".to_owned(),
+        query: q,
+        latency_us,
+        rows: rows.len() as u64,
+        scalar: first_scalar(&rows),
+    });
+
+    // 3) LIKE.date range (the recent half). Every generated LIKE date lies in
+    //    `[EPOCH_S, EPOCH_S + REG_SPAN_S)`, so `date >= EPOCH_S + REG_SPAN_S/2` is the upper (recent)
+    //    half of the timeline — a well-defined, non-trivial slice. The relationship RANGE index is
+    //    equality-only, so this predicate is a correct scan + residual filter, not an index seek.
+    let midpoint = EPOCH_S + REG_SPAN_S / 2;
+    let q =
+        format!("MATCH ()-[l:LIKE]->(:ARTICLE) WHERE l.date >= {midpoint} RETURN count(l) AS hits");
+    let (rows, latency_us) = timed_read(coord, catalog, &q);
+    out.push(QuerySample {
+        name: "like_recent".to_owned(),
+        query: q,
+        latency_us,
+        rows: rows.len() as u64,
+        scalar: first_scalar(&rows),
+    });
+
+    out
+}
+
+/// Picks the headline term the search probes assert on, and returns `(term, expected_hits)` where
+/// `expected_hits` is the number of `ARTICLE`s whose headline contains `term` — the ground truth read
+/// **straight from the deterministic generator**, so the TEXT `CONTAINS` and FULLTEXT `queryNodes`
+/// probes can be cross-checked against a value the engine never produced.
+///
+/// The candidates are the single-word, ASCII-only headline **subject** words. Each is the *leading*
+/// token of the articles whose headline uses that subject and appears **nowhere else** in the headline
+/// fragment pools (no verb / object / tail contains it), so for any of them the three sets — "articles
+/// whose `name` CONTAINS the word", "articles the FULLTEXT index returns for the lower-cased token",
+/// and "articles with that subject" — are identical. Restricting to ASCII, single-word subjects keeps
+/// the query literal quote-free and side-steps any analyzer diacritic / multi-token subtlety, so the
+/// cross-check is exact and robust. The most frequent candidate is chosen so the asserted set is
+/// non-trivial (more than one article) at every profile.
+fn dominant_headline_term(cfg: &GenConfig) -> (String, u64) {
+    // Single-word, ASCII-only subjects (or ASCII leading words of multi-word subjects) from the
+    // generator's `HEAD_SUBJECT` pool — each unique to its subject and free of diacritics.
+    const ASCII_SUBJECTS: &[&str] = &[
+        "Governo",
+        "Universidade",
+        "Banco",
+        "Empresa",
+        "Investigadores",
+        "Autarquia",
+        "Mercado",
+        "Sector",
+    ];
+    let mut best = (ASCII_SUBJECTS[0].to_owned(), 0u64);
+    for &word in ASCII_SUBJECTS {
+        let count = (0..cfg.articles)
+            .filter(|&i| Generator::article_name(cfg.seed, i).contains(word))
+            .count() as u64;
+        if count > best.1 {
+            best = (word.to_owned(), count);
+        }
+    }
+    best
+}
+
+/// Reads the `SHOW INDEXES`-style listing from the coordinator's index catalogs, in a stable order:
+/// the two always-on `LOOKUP` token indexes first, then the node-property, composite, relationship-
+/// property, TEXT and FULLTEXT indexes this loader declared.
+fn collect_index_listings(coord: &Coord) -> Vec<IndexListing> {
+    fn state_str(s: IndexState) -> String {
+        match s {
+            IndexState::Online => "ONLINE",
+            IndexState::Populating => "POPULATING",
+        }
+        .to_owned()
+    }
+
+    let mut out = Vec::new();
+
+    // The two ALWAYS-ON token-lookup indexes. Graphus backs every label / relationship-type scan with
+    // these; they are never created explicitly and are always Online. The server's `SHOW INDEXES`
+    // surfaces them under these names (the hermetic schema test asserts that against the real column
+    // set); here we list them so the load evidence shows the complete index picture, LOOKUP included.
+    out.push(IndexListing {
+        name: NODE_LABEL_LOOKUP_INDEX.to_owned(),
+        kind: "LOOKUP".to_owned(),
+        entity: "NODE".to_owned(),
+        state: "ONLINE".to_owned(),
+    });
+    out.push(IndexListing {
+        name: REL_TYPE_LOOKUP_INDEX.to_owned(),
+        kind: "LOOKUP".to_owned(),
+        entity: "RELATIONSHIP".to_owned(),
+        state: "ONLINE".to_owned(),
+    });
+
+    // Single-property node RANGE indexes (the id anchors).
+    for (name, _label, _prop, state) in coord.list_node_property_indexes() {
+        out.push(IndexListing {
+            name,
+            kind: "RANGE".to_owned(),
+            entity: "NODE".to_owned(),
+            state: state_str(state),
+        });
+    }
+    // Composite node RANGE indexes.
+    for (name, _label, _props, state) in coord.list_composite_indexes() {
+        out.push(IndexListing {
+            name,
+            kind: "RANGE".to_owned(),
+            entity: "NODE".to_owned(),
+            state: state_str(state),
+        });
+    }
+    // Relationship-property RANGE indexes.
+    for (name, _rel, _prop, state) in coord.list_rel_property_indexes() {
+        out.push(IndexListing {
+            name,
+            kind: "RANGE".to_owned(),
+            entity: "RELATIONSHIP".to_owned(),
+            state: state_str(state),
+        });
+    }
+    // TEXT indexes.
+    for (name, _label, _prop, state) in coord.list_text_indexes() {
+        out.push(IndexListing {
+            name,
+            kind: "TEXT".to_owned(),
+            entity: "NODE".to_owned(),
+            state: state_str(state),
+        });
+    }
+    // FULLTEXT indexes.
+    for (name, entity, _labels, _props, _analyzer, state) in coord.list_fulltext_indexes() {
+        let entity = match entity {
+            FulltextEntity::Node => "NODE",
+            FulltextEntity::Relationship => "RELATIONSHIP",
+        };
+        out.push(IndexListing {
+            name,
+            kind: "FULLTEXT".to_owned(),
+            entity: entity.to_owned(),
+            state: state_str(state),
+        });
+    }
+
+    out
+}
+
+/// Reads the `SHOW CONSTRAINTS`-style listing from the coordinator's constraint catalog, mapping each
+/// [`ConstraintKind`] to its Neo4j-style `type` string (the same mapping the server's `SHOW
+/// CONSTRAINTS` renders).
+fn collect_constraint_listings(coord: &Coord) -> Vec<ConstraintListing> {
+    fn kind_str(kind: ConstraintKind) -> &'static str {
+        match kind {
+            ConstraintKind::Unique => "NODE_PROPERTY_UNIQUENESS",
+            ConstraintKind::Existence => "NODE_PROPERTY_EXISTENCE",
+            ConstraintKind::NodeKey => "NODE_KEY",
+            ConstraintKind::PropertyType => "NODE_PROPERTY_TYPE",
+            ConstraintKind::RelUnique => "RELATIONSHIP_PROPERTY_UNIQUENESS",
+            ConstraintKind::RelExistence => "RELATIONSHIP_PROPERTY_EXISTENCE",
+            ConstraintKind::RelKey => "RELATIONSHIP_KEY",
+            ConstraintKind::RelPropertyType => "RELATIONSHIP_PROPERTY_TYPE",
+        }
+    }
+
+    coord
+        .list_constraints()
+        .into_iter()
+        .map(
+            |ConstraintInfo {
+                 name,
+                 properties,
+                 kind,
+                 ..
+             }| ConstraintListing {
+                name,
+                kind: kind_str(kind).to_owned(),
+                properties,
+            },
+        )
+        .collect()
+}
+
 /// The worker-thread stack size for a load run (`128 MiB`), matching the openCypher TCK harness's
 /// per-scenario stack. The engine's recursive front-end (parser → analyzer → physical planner) and
 /// the recursive cursor tree can nest deeply for a read query; running the load on a generously-sized
@@ -681,6 +1085,28 @@ pub fn outcome_json(out: &LoadOutcome) -> String {
     let _ = write!(s, "\"articles\":{},", out.article_count);
     let _ = write!(s, "\"friend_edges\":{},", out.friend_count);
     let _ = write!(s, "\"like_edges\":{},", out.like_count);
+    let _ = write!(s, "\"schema_applied\":{},", out.schema_applied);
+    let _ = write!(s, "\"search_term\":\"{}\",", out.search_term);
+    let _ = write!(s, "\"search_expected\":{},", out.search_expected);
+    s.push_str("\"indexes\":[");
+    for (i, idx) in out.indexes.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        let _ = write!(
+            s,
+            "{{\"name\":\"{}\",\"type\":\"{}\",\"entity\":\"{}\",\"state\":\"{}\"}}",
+            idx.name, idx.kind, idx.entity, idx.state
+        );
+    }
+    s.push_str("],\"constraints\":[");
+    for (i, c) in out.constraints.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        let _ = write!(s, "{{\"name\":\"{}\",\"type\":\"{}\"}}", c.name, c.kind);
+    }
+    s.push_str("],");
     let _ = write!(s, "\"properties\":{},", out.import_properties);
     let _ = write!(s, "\"logical_csv_bytes\":{},", out.logical_csv_bytes);
     let _ = write!(s, "\"device_bytes\":{},", out.device_bytes);

@@ -1403,6 +1403,7 @@ dependencies = [
  "graphus-rest",
  "graphus-security-gen",
  "graphus-sim",
+ "graphus-social-gen",
  "graphus-storage",
  "graphus-sysres",
  "graphus-txn",

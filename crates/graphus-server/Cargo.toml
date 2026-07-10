@@ -205,6 +205,17 @@ graphus-iot-gen = { path = "../graphus-iot-gen", default-features = false }
 # depend on `graphus-server`, so this introduces no cycle and no `dst` leakage; it is a TEST-TARGET
 # dev-dependency that never enters the production build.
 graphus-reco-gen = { path = "../graphus-reco-gen" }
+# The deterministic social-network generator, PURE part only (`default-features = false` — the heavy
+# `engine` feature, which would pull `graphus-cypher/dst` + `graphus-storage/dst`, is NOT enabled
+# here), so the hermetic social-network-large schema mirror (`tests/social_network_large_schema.rs`)
+# can generate the SAME seeded USER/ARTICLE + FRIEND/LIKE graph the example bulk-loads and assert the
+# new search schema (TEXT + FULLTEXT + relationship-RANGE + composite indexes, the two always-on
+# LOOKUP token indexes, and the ARTICLE.name existence constraint) — including the headline `TEXT
+# CONTAINS` + `db.index.fulltext.queryNodes` searches — through the REAL admin-DDL + `LocalEngine` seam,
+# fully in-process, no Node/network. social-gen's pure deps are serde + the evidence harness only and it
+# does NOT depend on `graphus-server`, so this introduces no cycle and no `dst` leakage; it is a
+# TEST-TARGET dev-dependency that never enters the production build.
+graphus-social-gen = { path = "../graphus-social-gen", default-features = false }
 # The deterministic multi-tenant security generator (DEFAULT features = serde-only generator: the
 # `dataset`/`manifest` + the allow/deny matrix; its only deps are serde + the evidence harness), so
 # the hermetic security-multitenant cargo mirror (`tests/security_multitenant.rs`) can drive the

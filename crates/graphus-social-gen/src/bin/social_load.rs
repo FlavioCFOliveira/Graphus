@@ -154,11 +154,43 @@ fn main() -> ExitCode {
     println!("    name         latency_us   rows   scalar");
     for q in &out.queries {
         println!(
-            "    {:<11}  {:>9}  {:>5}   {}",
+            "    {:<13}  {:>9}  {:>5}   {}",
             q.name,
             q.latency_us,
             q.rows,
             q.scalar.map_or_else(|| "-".to_owned(), |n| n.to_string()),
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Search schema: the SHOW INDEXES / SHOW CONSTRAINTS listing + the headline search cross-check.
+    // ---------------------------------------------------------------------------------------------
+    if out.schema_applied {
+        println!("  SHOW INDEXES (search schema + always-on LOOKUP):");
+        println!("    name                        type      entity        state");
+        for idx in &out.indexes {
+            println!(
+                "    {:<26}  {:<8}  {:<12}  {}",
+                idx.name, idx.kind, idx.entity, idx.state
+            );
+        }
+        println!("  SHOW CONSTRAINTS:");
+        for c in &out.constraints {
+            println!("    {:<26}  {}  {:?}", c.name, c.kind, c.properties);
+        }
+        let text = out.query("text_contains").map(|q| q.scalar.unwrap_or(-1));
+        let ft = out.query("fulltext").map(|q| q.scalar.unwrap_or(-1));
+        let recent = out.query("like_recent").map(|q| q.scalar.unwrap_or(-1));
+        println!(
+            "  headline search: term='{}' expected={} | TEXT CONTAINS={} | FULLTEXT queryNodes={}",
+            out.search_term,
+            out.search_expected,
+            text.map_or_else(|| "-".to_owned(), |n| n.to_string()),
+            ft.map_or_else(|| "-".to_owned(), |n| n.to_string()),
+        );
+        println!(
+            "  LIKE.date recent-half range (scan + filter, rel RANGE is equality-only)={}",
+            recent.map_or_else(|| "-".to_owned(), |n| n.to_string()),
         );
     }
 
@@ -261,6 +293,92 @@ fn main() -> ExitCode {
         degree.scalar.unwrap_or(0) > 0,
         format!("degree non-empty (got {})", degree.scalar.unwrap_or(0)),
     );
+
+    // The search schema: the new index kinds must be declared + Online, the existence constraint
+    // present, and the TEXT `CONTAINS` + FULLTEXT `queryNodes` probes must both return exactly the
+    // generator's ground-truth article set (the headline term appears in `search_expected` articles).
+    if out.schema_applied {
+        // Every declared index kind is present, correctly typed, and Online — and the two always-on
+        // LOOKUP token indexes are surfaced.
+        let index_present = |name: &str, kind: &str, entity: &str| {
+            out.index(name)
+                .is_some_and(|i| i.kind == kind && i.entity == entity && i.state == "ONLINE")
+        };
+        check(
+            index_present("node_label_lookup_index", "LOOKUP", "NODE"),
+            "always-on node LOOKUP index surfaced (node_label_lookup_index)".to_owned(),
+        );
+        check(
+            index_present("rel_type_lookup_index", "LOOKUP", "RELATIONSHIP"),
+            "always-on relationship LOOKUP index surfaced (rel_type_lookup_index)".to_owned(),
+        );
+        check(
+            index_present("article_name_text", "TEXT", "NODE"),
+            "TEXT index on ARTICLE.name is Online (article_name_text)".to_owned(),
+        );
+        check(
+            index_present("article_headline_fulltext", "FULLTEXT", "NODE"),
+            "FULLTEXT index on ARTICLE.name is Online (article_headline_fulltext)".to_owned(),
+        );
+        check(
+            index_present("like_date_range", "RANGE", "RELATIONSHIP"),
+            "relationship RANGE index on LIKE.date is Online (like_date_range)".to_owned(),
+        );
+        check(
+            index_present("article_catalog_composite", "RANGE", "NODE"),
+            "composite RANGE index on ARTICLE(registered, id) is Online (article_catalog_composite)"
+                .to_owned(),
+        );
+        check(
+            out.constraint("article_name_exists")
+                .is_some_and(|c| c.kind == "NODE_PROPERTY_EXISTENCE"),
+            "existence constraint on ARTICLE.name is declared (article_name_exists)".to_owned(),
+        );
+
+        // The headline search cross-check: the term is a single-token subject word, so TEXT CONTAINS
+        // and FULLTEXT queryNodes must BOTH return exactly the generator's ground-truth article set.
+        let text_hits = out
+            .query("text_contains")
+            .and_then(|q| q.scalar)
+            .unwrap_or(-1);
+        let ft_hits = out.query("fulltext").and_then(|q| q.scalar).unwrap_or(-1);
+        check(
+            out.search_expected > 1,
+            format!(
+                "headline term '{}' matches multiple articles (expected {})",
+                out.search_term, out.search_expected
+            ),
+        );
+        check(
+            text_hits == out.search_expected as i64,
+            format!(
+                "TEXT CONTAINS '{}' returns the generator's {} articles (got {text_hits})",
+                out.search_term, out.search_expected
+            ),
+        );
+        check(
+            ft_hits == out.search_expected as i64,
+            format!(
+                "FULLTEXT queryNodes('{}') returns the same {} articles (got {ft_hits})",
+                out.search_term.to_lowercase(),
+                out.search_expected
+            ),
+        );
+
+        // The LIKE.date range predicate (a scan + residual filter — the rel RANGE index is
+        // equality-only) returns a non-trivial recent slice: 0 < recent < |LIKE|.
+        let recent = out
+            .query("like_recent")
+            .and_then(|q| q.scalar)
+            .unwrap_or(-1);
+        check(
+            recent > 0 && (recent as u64) < out.like_count,
+            format!(
+                "LIKE.date recent-half range is a non-trivial slice: 0 < {recent} < {}",
+                out.like_count
+            ),
+        );
+    }
 
     println!();
     if failures == 0 {

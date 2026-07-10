@@ -57,10 +57,50 @@ of its size.
 |---|------------|-----------------|
 | 1 | **Deterministic large-graph generation** | `social_gen` emits the graph twice and the bytes are diffed identical. |
 | 2 | **High-throughput bulk ingest at scale** | The graph is loaded via the production **`graphus-bulk`** path (`O(E)` endpoint resolution) into an on-disk store — nodes then relationships, in committed batches. |
-| 3 | **Index-backed point lookups** | `:USER(id)` and `:ARTICLE(id)` property indexes are built so each `MATCH (:USER {id: …})` is an index **seek**. |
-| 4 | **Traversals on a large graph** | A Cypher read battery: direct friends, **friend-of-friend** (2-hop), **mutual friends**, **top-liked articles** (aggregation + `ORDER BY` + `LIMIT`), and degree. |
-| 5 | **The same model over the wire** | An opt-in Bolt-over-UDS slice creates a small slice of the identical model via `graphus-cli` against a booted `graphus-server` and runs a friend-of-friend + top-liked query over the socket. |
-| 6 | **Explicit evidence** | A schema-versioned `report.json` + `report.md`: ingest throughput, durable on-disk footprint + amplification, peak RSS, CPU, and per-query latency. |
+| 3 | **Index-backed point lookups** | `:USER(id)` and `:ARTICLE(id)` RANGE indexes are built so each `MATCH (:USER {id: …})` is an index **seek**. |
+| 4 | **A production search schema** (see [below](#the-search-schema-indexes--constraint)) | A **TEXT** and a **FULLTEXT** index over `ARTICLE.name`, a **relationship RANGE** index on `LIKE.date`, a **composite** node index on `ARTICLE(registered, id)`, the two always-on **LOOKUP** token indexes surfaced by `SHOW INDEXES`, and an **existence** constraint on `ARTICLE.name` — all declared over the loaded graph and asserted `ONLINE`. |
+| 5 | **Traversals on a large graph** | A Cypher read battery: direct friends, **friend-of-friend** (2-hop), **mutual friends**, **top-liked articles** (aggregation + `ORDER BY` + `LIMIT`), and degree. |
+| 6 | **Headline search** | A **TEXT `CONTAINS`** substring search and a **FULLTEXT `db.index.fulltext.queryNodes`** word search over `ARTICLE.name`, cross-checked to return exactly the generator's known article set; plus a **`LIKE.date` range** query (a correct scan + filter — the relationship RANGE index is equality-only). |
+| 7 | **The same model over the wire** | An opt-in Bolt-over-UDS slice creates a small slice of the identical model via `graphus-cli` against a booted `graphus-server`, declares the headline search schema over the socket, runs `SHOW INDEXES` (surfacing the two `LOOKUP` indexes) + a `db.index.fulltext.queryNodes` search, and a friend-of-friend + top-liked query. |
+| 8 | **Explicit evidence** | A schema-versioned `report.json` + `report.md`: ingest throughput, durable on-disk footprint + amplification, peak RSS, CPU, and per-query latency. |
+
+## The search schema (indexes + constraint)
+
+After the graph is bulk-loaded, the example declares — through the same typed coordinator seam the
+server's Bolt/REST admin surface dispatches to after parsing `CREATE … INDEX` / `CREATE CONSTRAINT` —
+a production-realistic **search schema** over the article headlines and the like timeline, then serves
+search queries against it:
+
+| Object | DDL (the equivalent admin-grammar form) | Purpose |
+|--------|-----------------------------------------|---------|
+| `user_id_range` | `CREATE INDEX user_id_range FOR (u:USER) ON (u.id)` | friendship-traversal anchor seek |
+| `article_id_range` | `CREATE INDEX article_id_range FOR (a:ARTICLE) ON (a.id)` | like-traversal anchor seek |
+| `article_name_text` | `CREATE TEXT INDEX article_name_text FOR (a:ARTICLE) ON (a.name)` | headline **substring** search (`CONTAINS` / `STARTS WITH` / `ENDS WITH`) |
+| `article_headline_fulltext` | `CREATE FULLTEXT INDEX article_headline_fulltext FOR (a:ARTICLE) ON EACH [a.name]` | headline **word** search via `db.index.fulltext.queryNodes` |
+| `like_date_range` | `CREATE INDEX like_date_range FOR ()-[l:LIKE]-() ON (l.date)` | **relationship** RANGE index on the like timestamp |
+| `article_catalog_composite` | `CREATE INDEX article_catalog_composite FOR (a:ARTICLE) ON (a.registered, a.id)` | **composite** node index (time-ordered catalogue reads) |
+| `node_label_lookup_index`, `rel_type_lookup_index` | *(always-on — never created explicitly)* | the two token **LOOKUP** indexes backing every label / relationship-type scan, surfaced by `SHOW INDEXES` |
+| `article_name_exists` | `CREATE CONSTRAINT article_name_exists FOR (a:ARTICLE) REQUIRE a.name IS NOT NULL` | every article must carry a searchable headline |
+
+**Headline search cross-check.** The article headlines are assembled deterministically from
+subject/verb/object/tail fragment pools, so the example picks the most frequent single-word **subject**
+term and derives — straight from the generator — the exact set of articles whose headline contains it.
+It then asserts that **both** `MATCH (a:ARTICLE) WHERE a.name CONTAINS '<term>'` (TEXT index) and
+`CALL db.index.fulltext.queryNodes('article_headline_fulltext', '<term>')` (FULLTEXT index) return
+**exactly** that set. This also pins the analyzer's behaviour empirically: the standard analyzer
+**lowercases and tokenizes the Portuguese headlines per word (diacritics preserved) but does not
+stem**, so the whole-word subject token matches precisely the articles that use that subject — the
+same set the case-sensitive substring `CONTAINS` returns.
+
+**Honest relationship-RANGE utilisation.** Graphus's relationship RANGE index is **equality-only**: an
+*equality* predicate `l.date = X` lowers to a `RelIndexSeek`, but a **range** predicate `l.date >= X`
+stays a correct **scan + residual filter** (verified on the real planner in the hermetic schema test).
+So the example's `LIKE.date` range query is served correctly *without* the index — reported honestly
+rather than claimed as an index seek.
+
+The schema adds **no durable pages** — the TEXT / FULLTEXT / composite / relationship index data is
+ephemeral (rebuilt from the durable catalog on open) and only the small catalog entries are persisted —
+so the deterministic store footprint the baseline gate holds is unchanged by it.
 
 ## Transport — why the load + read battery run in-process
 
@@ -110,7 +150,7 @@ Knobs: `SOCIAL_PROFILE` (`fast` default), `RUN_WIRE` (`1` default; `0` skips the
 A successful `fast` run ends with:
 
 ```
-13 checks run, 0 failures.
+18 checks run, 0 failures.
 SOCIAL-NETWORK-LARGE DEMONSTRATION PASSED — ...
 ```
 
@@ -141,6 +181,16 @@ without flaking on hardware differences.
 ## CI coverage
 
 The crate's own `cargo test` (which runs under the project's default `cargo test --all`) exercises the
-`fast`-profile bulk load + the read-query battery + the shape invariants (`tests/load_fast.rs`) and the
-generator's byte-identical determinism + degree-band + id/name invariants (`tests/determinism.rs`), so
-the example's guarantees are protected against regression on every build.
+`fast`-profile bulk load + the read-query battery + the shape invariants **and the search schema**
+(`graphus-social-gen`'s `tests/load_fast.rs`: the TEXT / FULLTEXT / relationship-RANGE / composite /
+LOOKUP indexes are `ONLINE` and the headline `CONTAINS` + `queryNodes` searches return the generator's
+known article set) and the generator's byte-identical determinism + degree-band + id/name invariants
+(`tests/determinism.rs`).
+
+The search schema is additionally pinned by a **hermetic schema mirror**,
+`graphus-server/tests/social_network_large_schema.rs`, which drives the equivalent `CREATE … INDEX` /
+`CREATE CONSTRAINT` **strings** through the REAL admin-DDL + `LocalEngine` seam (the exact seam the
+Bolt/REST admin surfaces use) and asserts the full `SHOW INDEXES` / `SHOW CONSTRAINTS` column set, the
+honest relationship-RANGE planner utilisation (`RelIndexSeek` for equality, scan + filter for a range),
+the TEXT/FULLTEXT known-set search, and the existence-constraint enforcement. So the example's search
+guarantees are protected against regression on every build.

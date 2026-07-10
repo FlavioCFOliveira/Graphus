@@ -210,6 +210,19 @@ fn run() -> Result<(), String> {
         );
         // The per-probe read latencies (compact `name:latency_us`), for human inspection.
         w.insert("query_latencies".into(), query_latency_series(&outcome));
+        // The declared search schema (informational; NOT gated — it adds no durable pages, index data
+        // being ephemeral/catalog-only, so the structural gate is unaffected).
+        w.insert("schema_applied".into(), outcome.schema_applied.to_string());
+        w.insert("index_count".into(), outcome.indexes.len().to_string());
+        w.insert(
+            "constraint_count".into(),
+            outcome.constraints.len().to_string(),
+        );
+        w.insert("search_term".into(), outcome.search_term.clone());
+        w.insert(
+            "search_expected".into(),
+            outcome.search_expected.to_string(),
+        );
         for (k, v) in &args.params {
             w.insert(k.clone(), v.clone());
         }
@@ -297,6 +310,35 @@ fn run() -> Result<(), String> {
          of graph size.",
         query_latency_human(&outcome),
     ));
+    if outcome.schema_applied {
+        let hits = |name: &str| {
+            outcome
+                .query(name)
+                .and_then(|q| q.scalar)
+                .map_or_else(|| "-".to_owned(), |n| n.to_string())
+        };
+        collector.note(format!(
+            "SEARCH SCHEMA (declared over the loaded graph; informational, NOT gated — index data is \
+             ephemeral/catalog-only so it adds no durable pages): {} indexes surfaced by SHOW INDEXES \
+             (the two always-on LOOKUP token indexes, the id RANGE anchors, a TEXT index \
+             `article_name_text` + a FULLTEXT index `article_headline_fulltext` over ARTICLE.name, a \
+             relationship RANGE index `like_date_range` on LIKE.date, and a composite RANGE index \
+             `article_catalog_composite` on ARTICLE(registered, id)) plus the ARTICLE.name existence \
+             constraint. Headline search: TEXT `CONTAINS '{}'` returned {} articles and FULLTEXT \
+             `queryNodes('{}')` returned {} — both matching the generator's ground truth of {} (the \
+             standard analyzer lowercases and tokenizes but does not stem). The LIKE.date recent-half \
+             range predicate — a correct scan + residual filter, since Graphus's relationship RANGE \
+             index is equality-only — returned {} of {} LIKE edges.",
+            outcome.indexes.len(),
+            outcome.search_term,
+            hits("text_contains"),
+            outcome.search_term.to_lowercase(),
+            hits("fulltext"),
+            outcome.search_expected,
+            hits("like_recent"),
+            outcome.like_count,
+        ));
+    }
     for note in &args.notes {
         collector.note(note.clone());
     }

@@ -221,6 +221,15 @@ EOF
     }
 
     if [ "$BOUND" = "yes" ]; then
+      # Declare the headline SEARCH SCHEMA over the wire, schema-first, exactly as an operator would:
+      # a FULLTEXT + TEXT index over ARTICLE.name, a relationship RANGE index on LIKE.date, and an
+      # existence constraint on ARTICLE.name. Created before the data below so each index is maintained
+      # as the articles land — the same production "declare the schema, then load + serve" flow.
+      cypher "CREATE FULLTEXT INDEX article_headline_fulltext FOR (a:ARTICLE) ON EACH [a.name]" > /dev/null
+      cypher "CREATE TEXT INDEX article_name_text FOR (a:ARTICLE) ON (a.name)" > /dev/null
+      cypher "CREATE INDEX like_date_range FOR ()-[l:LIKE]-() ON (l.date)" > /dev/null
+      cypher "CREATE CONSTRAINT article_name_exists FOR (a:ARTICLE) REQUIRE a.name IS NOT NULL" > /dev/null
+
       # A small, hand-written slice of the SAME model: USERs befriended in a chain (so a
       # friend-of-friend query has a non-empty answer), ARTICLEs, and LIKE edges — created over the
       # wire exactly as an operator would, proving the model round-trips over Bolt/UDS.
@@ -249,6 +258,22 @@ RETURN count(*) AS created" > /dev/null
       # Most-liked article (aggregation + ORDER BY + LIMIT): a0 has 2 likes, a1 has 1.
       assert "wire: top-liked article is a0" "0000000000000000000000a0" \
         "$(scalar "MATCH (:USER)-[:LIKE]->(a:ARTICLE) WITH a, count(*) AS likes RETURN a.id AS id ORDER BY likes DESC LIMIT 1")"
+
+      # The search schema over the wire: SHOW INDEXES surfaces the two always-on token LOOKUP indexes
+      # plus our FULLTEXT headline index, and the headline searches find the matching articles.
+      SHOW_OUT="$(cypher "SHOW INDEXES")"
+      assert "wire: SHOW INDEXES surfaces node_label_lookup_index (LOOKUP)" "yes" \
+        "$(printf '%s' "$SHOW_OUT" | grep -q 'node_label_lookup_index' && echo yes || echo no)"
+      assert "wire: SHOW INDEXES surfaces rel_type_lookup_index (LOOKUP)" "yes" \
+        "$(printf '%s' "$SHOW_OUT" | grep -q 'rel_type_lookup_index' && echo yes || echo no)"
+      assert "wire: SHOW INDEXES surfaces the FULLTEXT headline index" "yes" \
+        "$(printf '%s' "$SHOW_OUT" | grep -q 'article_headline_fulltext' && echo yes || echo no)"
+      # FULLTEXT word search over the wire: 'parlamento' is a token of a1's headline only.
+      assert "wire: FULLTEXT queryNodes('parlamento') finds article a1" "0000000000000000000000a1" \
+        "$(scalar "CALL db.index.fulltext.queryNodes('article_headline_fulltext', 'parlamento') YIELD node RETURN node.id AS id")"
+      # TEXT CONTAINS substring search over the wire: 'Economia' is a substring of a0's headline only.
+      assert "wire: TEXT CONTAINS 'Economia' finds article a0" "0000000000000000000000a0" \
+        "$(scalar "MATCH (a:ARTICLE) WHERE a.name CONTAINS 'Economia' RETURN a.id AS id")"
     fi
 
     wire_cleanup
