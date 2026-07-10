@@ -42,7 +42,8 @@ use crate::idalloc::{ElementIdAllocator, FreeList, NULL_ID, PhysicalAllocator};
 use crate::labels;
 use crate::meta::{
     CompositeIndexEntry, ConstraintEntry, FulltextIndexEntry, IndexState, Meta,
-    RelCompositeIndexEntry, SpatialIndexEntry, Statistics, StoreMeta, TextIndexEntry,
+    RelCompositeIndexEntry, SpatialIndexEntry, Statistics, StoreMeta, TextIndexEntry, VectorEntity,
+    VectorIndexEntry,
 };
 use crate::paging;
 use crate::read_view::{self, MetaSnapshot, StoreMetaSnapshot, StorePages, StoreReadView};
@@ -5403,6 +5404,55 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// discarded on rollback.
     pub fn remove_text_index(&mut self, name: &str) {
         self.statistics.remove_text_index(name);
+        self.catalog_dirty = true;
+    }
+
+    /// The durable vector (HNSW) index entry named `name`, or [`None`] if no such index is declared
+    /// (`rmp` task #669). Tokens are returned as ids; the caller resolves their names via the token
+    /// store. Cloned so the borrow of `self` does not outlive the call.
+    #[must_use]
+    pub fn vector_index(&self, name: &str) -> Option<VectorIndexEntry> {
+        self.statistics.vector_index(name).cloned()
+    }
+
+    /// Lists every declared vector index as `(name, entry)` from the durable catalog (`rmp` task #669),
+    /// ascending by name. Like [`text_indexes`](Self::text_indexes) this is what makes a vector index
+    /// *registration* survive a crash: a fresh coordinator reads this to re-register the previously-
+    /// declared vector indexes before rebuilding their HNSW graph from the store.
+    #[must_use]
+    pub fn vector_indexes(&self) -> Vec<(String, VectorIndexEntry)> {
+        self.statistics.vector_indexes()
+    }
+
+    /// The **name** of the vector index covering exactly `(entity, token, property_token)`, or [`None`]
+    /// if none is declared (`rmp` task #669). Backs the `IF NOT EXISTS` schema-equivalence check; the
+    /// [`VectorEntity`] disambiguates a node label token from a numerically-equal relationship-type
+    /// token.
+    #[must_use]
+    pub fn vector_index_name_for(
+        &self,
+        entity: VectorEntity,
+        token: u32,
+        property_token: u32,
+    ) -> Option<String> {
+        self.statistics
+            .vector_index_name_for(entity, token, property_token)
+            .map(str::to_owned)
+    }
+
+    /// Declares (or replaces) the vector index named `name` in the durable catalog (`rmp` task #669).
+    /// Purely in-memory here; becomes **durable when the enclosing transaction commits** and is
+    /// **discarded on rollback**, exactly like [`set_text_index`](Self::set_text_index).
+    pub fn set_vector_index(&mut self, name: String, entry: VectorIndexEntry) {
+        self.statistics.set_vector_index(name, entry);
+        self.catalog_dirty = true;
+    }
+
+    /// Removes the vector index named `name` from the durable catalog, if declared (`rmp` task #669).
+    /// Removing an absent entry is a harmless no-op. Durable at the enclosing transaction's commit,
+    /// discarded on rollback.
+    pub fn remove_vector_index(&mut self, name: &str) {
+        self.statistics.remove_vector_index(name);
         self.catalog_dirty = true;
     }
 

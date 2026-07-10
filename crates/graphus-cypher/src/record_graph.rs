@@ -1366,6 +1366,31 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             }
         }
 
+        // Vector (HNSW) indexes are maintained per-write the same wholesale way as the spatial / text
+        // index (`rmp` task #669): for every registered node vector index `(label_token, prop_key)`, if
+        // the node currently carries the covered label AND has a valid embedding (a numeric list of the
+        // declared dimension) for the covered property, that embedding is (re)inserted into the ANN
+        // graph; in every other case (the node lost the label, the property is absent, or its value is
+        // not a well-formed embedding) the node is removed so a seek never sees a phantom. The graph
+        // keeps only the latest state, so like the full-text / spatial / text index it rides the SAME
+        // cross-snapshot freshness marker (`note_ft_spatial_mutator` below). `insert_vector_value` itself
+        // removes the node when the value is not a valid embedding of the covered dimension.
+        for (label_token, prop_key) in index.registered_vector() {
+            let value = label_tokens
+                .contains(&label_token)
+                .then(|| {
+                    resolved_props
+                        .iter()
+                        .find(|(k, _)| *k == prop_key)
+                        .map(|(_, v)| v)
+                })
+                .flatten();
+            match value {
+                Some(value) => index.insert_vector_value(label_token, prop_key, value, node.0),
+                None => index.remove_vector(label_token, prop_key, node.0),
+            }
+        }
+
         // Bitmap (low-cardinality) indexes are maintained membership-EXACT the same wholesale way
         // (`rmp` task #328): unlike the read-only columnar cache, a bitmap is a candidate SOURCE, so a
         // node it wrongly OMITS would make a query miss a row (a subset — never correct). For each
@@ -1472,17 +1497,20 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             return; // standalone path: no derived index to maintain.
         };
         // O(1) gate: nothing to maintain unless at least one relationship-property OR relationship
-        // composite OR relationship full-text OR relationship spatial index is declared.
-        let (has_rel_prop, has_rel_composite, has_rel_ft, has_rel_spatial) = {
+        // composite OR relationship full-text OR relationship spatial OR relationship vector index is
+        // declared.
+        let (has_rel_prop, has_rel_composite, has_rel_ft, has_rel_spatial, has_rel_vector) = {
             let idx = index.borrow();
             (
                 idx.has_any_rel_property(),
                 idx.has_any_rel_composite(),
                 idx.has_any_fulltext_rel(),
                 idx.has_any_spatial_rel(),
+                idx.has_any_vector_rel(),
             )
         };
-        if !has_rel_prop && !has_rel_composite && !has_rel_ft && !has_rel_spatial {
+        if !has_rel_prop && !has_rel_composite && !has_rel_ft && !has_rel_spatial && !has_rel_vector
+        {
             return;
         }
         // The relationship's current type token (store borrow released before the index borrow).
@@ -1589,11 +1617,35 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             // the shared full-text/spatial dirty flag if a posting changed.
             index.reindex_fulltext_rel(rel.0, type_token, &string_props);
         }
-        if has_rel_ft || has_rel_spatial {
+        // Relationship vector (HNSW) indexes (`rmp` task #669) are maintained per-write the same
+        // wholesale way as the relationship spatial index above: for every registered relationship
+        // vector index `(type_token, prop_key)`, if this relationship currently carries the covered type
+        // AND has a valid embedding for the covered property, that embedding is (re)inserted into the ANN
+        // graph; in every other case (a different type, the property absent, or a malformed value) the
+        // relationship is removed so a seek never sees a phantom. Rides the shared cross-snapshot marker.
+        if has_rel_vector {
+            for (reg_type, prop_key) in index.registered_vector_rel() {
+                let value = (reg_type == type_token)
+                    .then(|| {
+                        resolved
+                            .iter()
+                            .find(|(k, _)| *k == prop_key)
+                            .map(|(_, v)| v)
+                    })
+                    .flatten();
+                match value {
+                    Some(value) => {
+                        index.insert_vector_rel_value(reg_type, prop_key, value, rel.0);
+                    }
+                    None => index.remove_vector_rel(reg_type, prop_key, rel.0),
+                }
+            }
+        }
+        if has_rel_ft || has_rel_spatial || has_rel_vector {
             // Record THIS transaction as a full-text/spatial mutator if a posting changed (`rmp` #467,
             // shared marker) — exactly as `reindex_node` does — so a concurrent stale reader of this
-            // relationship full-text / spatial index declines to the correct scan path until the txn
-            // retires.
+            // relationship full-text / spatial / vector index declines to the correct scan path until the
+            // txn retires.
             let _ = index.note_ft_spatial_mutator(self.txn);
         }
     }

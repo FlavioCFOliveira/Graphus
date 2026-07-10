@@ -395,6 +395,145 @@ pub struct TextIndexEntry {
     pub state: IndexState,
 }
 
+/// The **entity dimension** a vector (HNSW) index covers: node labels or relationship types
+/// (`rmp` task #669) — the vector analogue of [`FulltextEntity`] / [`SpatialEntity`].
+///
+/// A vector index comes in two flavours — one over **nodes** (`FOR (n:Label) ON (n.embedding)`) and
+/// one over **relationships** (`FOR ()-[r:Type]-() ON (r.embedding)`). Both share the HNSW machinery,
+/// the covered embedding property, the dimension, the similarity metric and the build parameters; only
+/// the covered token namespace ([`Label`](crate::tokens::Namespace::Label) vs
+/// [`RelType`](crate::tokens::Namespace::RelType)) differs. This one-byte discriminant records which
+/// flavour a [`VectorIndexEntry`] is.
+///
+/// # Wire encoding
+///
+/// Encoded verbatim as a single byte inside the vector catalog block (see [`Statistics::encode`]).
+/// Unlike the full-text / spatial entity (which rides a trailing extension block for byte-compatibility
+/// with a pre-existing base block), the vector catalog is a **wholly new** trailing block, so the
+/// entity is stored inline. [`from_byte`](Self::from_byte) rejects an unknown byte (a
+/// forward-incompatible image), mirroring [`IndexState::from_byte`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[must_use]
+pub enum VectorEntity {
+    /// The index covers **node labels** (`FOR (n:Label) ON (n.embedding)`). The default.
+    #[default]
+    Node,
+    /// The index covers **relationship types** (`FOR ()-[r:Type]-() ON (r.embedding)`).
+    Relationship,
+}
+
+impl VectorEntity {
+    /// The single-byte wire discriminant (`rmp` task #669). Discriminants `2..` are reserved.
+    #[must_use]
+    pub const fn as_byte(self) -> u8 {
+        match self {
+            Self::Node => 0,
+            Self::Relationship => 1,
+        }
+    }
+
+    /// Decodes a single-byte wire discriminant, or [`None`] for an unknown (reserved/future) byte.
+    #[must_use]
+    pub const fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::Node),
+            1 => Some(Self::Relationship),
+            _ => None,
+        }
+    }
+
+    /// Whether this is a **relationship** vector index (its covered token is a
+    /// [`RelType`](crate::tokens::Namespace::RelType) token).
+    #[must_use]
+    pub const fn is_relationship(self) -> bool {
+        matches!(self, Self::Relationship)
+    }
+}
+
+/// The similarity metric a vector (HNSW) index uses (`rmp` task #669), fixed at declaration.
+///
+/// Mirrors `graphus_index::Similarity`, but storage does **not** depend on `graphus-index` (exactly as
+/// the full-text analyzer byte is interpreted by the query layer, not storage). The query layer maps
+/// this durable discriminant to the in-memory `Similarity` when it (re)builds the HNSW graph on open.
+/// [`from_byte`](Self::from_byte) rejects an unknown byte so a forward-incompatible image is caught
+/// rather than silently mis-decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[must_use]
+pub enum VectorSimilarity {
+    /// Cosine similarity (vectors unit-normalised on insert). The default.
+    #[default]
+    Cosine,
+    /// Euclidean similarity (squared L2 distance).
+    Euclidean,
+}
+
+impl VectorSimilarity {
+    /// The single-byte wire discriminant (`rmp` task #669). Discriminants `2..` are reserved.
+    #[must_use]
+    pub const fn as_byte(self) -> u8 {
+        match self {
+            Self::Cosine => 0,
+            Self::Euclidean => 1,
+        }
+    }
+
+    /// Decodes a single-byte wire discriminant, or [`None`] for an unknown (reserved/future) byte.
+    #[must_use]
+    pub const fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::Cosine),
+            1 => Some(Self::Euclidean),
+            _ => None,
+        }
+    }
+}
+
+/// A durable **vector (HNSW) index** catalog entry (`rmp` task #669).
+///
+/// A vector index is an approximate-nearest-neighbour (ANN) index over a dense `f32` embedding
+/// property, built on an HNSW graph (`graphus_index::VectorIndex`, `rmp` task #668). It is identified by
+/// a server-unique **name** (like a full-text / spatial / text index), covers — per its
+/// [`entity`](Self::entity) — **one** node label *or* relationship type and **exactly one** embedding
+/// property, and carries its fixed shape: the embedding [`dimensions`](Self::dimensions), the
+/// [`similarity`](Self::similarity) metric and the HNSW build parameters
+/// [`m`](Self::m) / [`ef_construction`](Self::ef_construction).
+///
+/// Its backing HNSW graph is derived/ephemeral (rebuilt from the store on open, like every other
+/// derived index), so **only this catalog entry needs durability**. It rides the **identical**
+/// durability lifecycle as the full-text / spatial / composite / text index catalogs: checkpointed at
+/// commit, reloaded on rollback and on open. Its presence invariant is "an entry exists iff a vector
+/// index of that name is declared".
+///
+/// # Wire encoding (`rmp` task #669)
+///
+/// Encoded in its **own** trailing catalog block, appended LAST (after the relationship composite
+/// block), so a pre-#669 image — ending after that block — decodes to an empty vector catalog via the
+/// end-of-input guard. Because the block is wholly new (no pre-existing base block to stay
+/// byte-compatible with), every field — including the [`entity`](Self::entity) — is stored inline; there
+/// is no split base + extension block as full-text / spatial use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorIndexEntry {
+    /// Whether the index covers a node label or a relationship type (`rmp` task #669).
+    pub entity: VectorEntity,
+    /// The covered token: a node [`Label`](crate::tokens::Namespace::Label) token when
+    /// [`entity`](Self::entity) is [`Node`](VectorEntity::Node), a relationship
+    /// [`RelType`](crate::tokens::Namespace::RelType) token when it is
+    /// [`Relationship`](VectorEntity::Relationship).
+    pub token: u32,
+    /// The property-key-namespace token the embedding property occupies (exactly one).
+    pub property_token: u32,
+    /// The embedding dimension (`> 0`; the covered property must be a numeric list of this length).
+    pub dimensions: u32,
+    /// The similarity metric the HNSW graph navigates by (`rmp` task #669).
+    pub similarity: VectorSimilarity,
+    /// The HNSW `m` build parameter (target out-degree per layer).
+    pub m: u32,
+    /// The HNSW `ef_construction` build parameter (construction candidate-list size).
+    pub ef_construction: u32,
+    /// The build state of the index (the same state machine as a node-property / spatial index).
+    pub state: IndexState,
+}
+
 /// The kind of a declared constraint (`rmp` tasks #99, #100).
 ///
 /// A constraint is one of four schema rules over the nodes of a label:
@@ -948,6 +1087,18 @@ pub struct Statistics {
     /// silently lose them. An entry is present **iff** an index of that name is declared. The map rides
     /// the **identical** durability lifecycle as the other catalogs.
     pub text_indexes: BTreeMap<String, TextIndexEntry>,
+    /// The durable **vector (HNSW) index catalog** (`rmp` task #669): the set of declared vector indexes
+    /// keyed by their server-unique **name**, each carrying the covered entity + token, the single
+    /// covered embedding property token, the embedding dimensions, the similarity metric, the HNSW build
+    /// parameters and the build [`IndexState`]. See [`VectorIndexEntry`].
+    ///
+    /// Persisting this set is what makes a vector index *registration* survive a crash: the backing HNSW
+    /// graph is ephemeral (rebuilt from the store on open, like the derived `IndexSet`), so without this
+    /// map a recovered store would have no record of which vector indexes existed and would silently lose
+    /// them. An entry is present **iff** an index of that name is declared. A single map holds both node
+    /// and relationship vector indexes (distinguished by [`VectorIndexEntry::entity`]); it rides the
+    /// **identical** durability lifecycle as the other catalogs.
+    pub vector_indexes: BTreeMap<String, VectorIndexEntry>,
 }
 
 impl Statistics {
@@ -1481,6 +1632,58 @@ impl Statistics {
             .map(|(name, _)| name.as_str())
     }
 
+    // ---- Vector (HNSW) index catalog (`rmp` task #669) --------------------------------------------
+
+    /// The durable vector index entry named `name`, or [`None`] if no such index is declared
+    /// (`rmp` task #669).
+    #[must_use]
+    pub fn vector_index(&self, name: &str) -> Option<&VectorIndexEntry> {
+        self.vector_indexes.get(name)
+    }
+
+    /// Declares (or replaces) the vector index named `name` (`rmp` task #669). Idempotent on the name:
+    /// re-recording overwrites the entry (e.g. to flip its state `Populating` → `Online`).
+    pub(crate) fn set_vector_index(&mut self, name: String, entry: VectorIndexEntry) {
+        self.vector_indexes.insert(name, entry);
+    }
+
+    /// Removes the vector index named `name`, if declared (`rmp` task #669). Removing an absent entry is
+    /// a harmless no-op.
+    pub(crate) fn remove_vector_index(&mut self, name: &str) {
+        self.vector_indexes.remove(name);
+    }
+
+    /// Lists every declared vector index as `(name, entry)`, ascending by name (the [`BTreeMap`] order,
+    /// deterministic) (`rmp` task #669).
+    #[must_use]
+    pub fn vector_indexes(&self) -> Vec<(String, VectorIndexEntry)> {
+        self.vector_indexes
+            .iter()
+            .map(|(name, entry)| (name.clone(), entry.clone()))
+            .collect()
+    }
+
+    /// The **name** of the vector index covering exactly `(entity, token, property_token)`, or [`None`]
+    /// if no such index is declared (`rmp` task #669). Backs the `IF NOT EXISTS` schema-equivalence
+    /// check; the [`VectorEntity`] disambiguates a node label token from a numerically-equal
+    /// relationship-type token.
+    #[must_use]
+    pub fn vector_index_name_for(
+        &self,
+        entity: VectorEntity,
+        token: u32,
+        property_token: u32,
+    ) -> Option<&str> {
+        self.vector_indexes
+            .iter()
+            .find(|&(_, entry)| {
+                entry.entity == entity
+                    && entry.token == token
+                    && entry.property_token == property_token
+            })
+            .map(|(name, _)| name.as_str())
+    }
+
     /// The durable full-text index entry named `name`, or [`None`] if no such index is declared
     /// (`rmp` task #72).
     #[must_use]
@@ -1659,10 +1862,15 @@ impl Statistics {
         // every legacy spatial entry keeps its node shape.
         Self::encode_spatial_extension_block(&mut out, &self.spatial_indexes);
         // The standalone composite (multi-property) **relationship** index catalog (`rmp` task #666),
-        // appended LAST by the same append-only rule, so a pre-#666 image (ending after the spatial
+        // appended by the same append-only rule, so a pre-#666 image (ending after the spatial
         // extension block) decodes it to empty. Byte layout mirrors the node composite catalog exactly
         // (the `type_token` occupies the slot the node block's `label_token` does).
         Self::encode_rel_composite_catalog(&mut out, &self.rel_composite_indexes);
+        // The vector (HNSW) index catalog (`rmp` task #669), appended LAST by the same append-only rule,
+        // so a pre-#669 image (ending after the relationship composite block) decodes it to empty. It is
+        // a wholly new block, so every field — including the entity — is stored inline (no base +
+        // extension split).
+        Self::encode_vector_catalog(&mut out, &self.vector_indexes);
         out
     }
 
@@ -2057,6 +2265,39 @@ impl Statistics {
         }
     }
 
+    /// Encodes the vector (HNSW) index catalog block (`rmp` task #669), appended LAST so a pre-#669
+    /// image (ending after the relationship composite catalog) decodes to an empty vector catalog.
+    ///
+    /// Layout: `n(u32) | [ name_len(u32) | name_bytes[name_len] | entity(u8) | token(u32) |
+    /// property_token(u32) | dimensions(u32) | similarity(u8) | m(u32) | ef_construction(u32) |
+    /// state(u8) ]*`, entries in ascending-name ([`BTreeMap`]) order so the image is deterministic. A
+    /// wholly new block: unlike the full-text / spatial catalogs there is no base + trailing-extension
+    /// split, so the entity + the full HNSW shape are all stored inline.
+    fn encode_vector_catalog(out: &mut Vec<u8>, map: &BTreeMap<String, VectorIndexEntry>) {
+        debug_assert!(
+            map.len() <= u32::MAX as usize,
+            "vector catalog entry count exceeds u32"
+        );
+        out.extend_from_slice(&(map.len() as u32).to_le_bytes());
+        for (name, entry) in map {
+            let name_bytes = name.as_bytes();
+            debug_assert!(
+                name_bytes.len() <= u32::MAX as usize,
+                "vector index name exceeds u32 length"
+            );
+            out.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(name_bytes);
+            out.push(entry.entity.as_byte());
+            out.extend_from_slice(&entry.token.to_le_bytes());
+            out.extend_from_slice(&entry.property_token.to_le_bytes());
+            out.extend_from_slice(&entry.dimensions.to_le_bytes());
+            out.push(entry.similarity.as_byte());
+            out.extend_from_slice(&entry.m.to_le_bytes());
+            out.extend_from_slice(&entry.ef_construction.to_le_bytes());
+            out.push(entry.state.as_byte());
+        }
+    }
+
     /// Encodes the text (trigram) node index catalog block (`rmp` task #662), appended last so a
     /// pre-#662 image (ending after the composite catalog) decodes to an empty text catalog.
     ///
@@ -2144,9 +2385,13 @@ impl Statistics {
         // every spatial entry keeps the node shape the catalog decode set.
         Self::decode_spatial_extension_block(bytes, &mut cur, &mut spatial_indexes)?;
         // Decode the trailing composite (multi-property) **relationship** index catalog (`rmp` task
-        // #666), the LAST block. A pre-#666 image ends after the spatial extension block, so this block
-        // decodes empty via the end-of-input guard.
+        // #666). A pre-#666 image ends after the spatial extension block, so this block decodes empty
+        // via the end-of-input guard.
         let rel_composite_indexes = Self::decode_rel_composite_catalog(bytes, &mut cur)?;
+        // Decode the trailing vector (HNSW) index catalog (`rmp` task #669), the LAST block. A pre-#669
+        // image ends after the relationship composite block, so this block decodes empty via the
+        // end-of-input guard.
+        let vector_indexes = Self::decode_vector_catalog(bytes, &mut cur)?;
         Ok(Self {
             total_nodes,
             total_relationships,
@@ -2163,6 +2408,7 @@ impl Statistics {
             composite_indexes,
             rel_composite_indexes,
             text_indexes,
+            vector_indexes,
         })
     }
 
@@ -2630,6 +2876,86 @@ impl Statistics {
             {
                 return Err(GraphusError::Storage(format!(
                     "relationship composite catalog repeats index name {name:?}"
+                )));
+            }
+        }
+        Ok(map)
+    }
+
+    /// Decodes the vector (HNSW) index catalog block (`rmp` task #669) — the LAST block. End-of-input
+    /// where its count `u32` would start means "no vector catalog" (a pre-#669 image), not truncation.
+    ///
+    /// The `entity`, `similarity` and `state` bytes are each range-checked (an unknown byte is a
+    /// forward-incompatible image, rejected). A repeated name, an empty name, or a **zero dimension** is
+    /// rejected — none is ever produced by [`encode`](Self::encode), and a zero dimension would make the
+    /// backing HNSW graph unconstructable on rebuild.
+    fn decode_vector_catalog(
+        bytes: &[u8],
+        cur: &mut usize,
+    ) -> Result<BTreeMap<String, VectorIndexEntry>> {
+        let mut map = BTreeMap::new();
+        // Backward compatibility (`rmp` task #669): a pre-#669 image ends exactly here.
+        if *cur == bytes.len() {
+            return Ok(map);
+        }
+        let n = read_u32(bytes, cur)? as usize;
+        for _ in 0..n {
+            let name_len = read_u32(bytes, cur)? as usize;
+            let end = take(bytes, cur, name_len)?;
+            let name = String::from_utf8(bytes[end - name_len..end].to_vec()).map_err(|_| {
+                GraphusError::Storage("vector catalog name is not valid UTF-8".to_owned())
+            })?;
+            if name.is_empty() {
+                return Err(GraphusError::Storage(
+                    "vector catalog holds an empty index name".to_owned(),
+                ));
+            }
+            let entity_byte = read_u8(bytes, cur)?;
+            let entity = VectorEntity::from_byte(entity_byte).ok_or_else(|| {
+                GraphusError::Storage(format!(
+                    "vector index {name:?} holds unknown entity byte {entity_byte}"
+                ))
+            })?;
+            let token = read_u32(bytes, cur)?;
+            let property_token = read_u32(bytes, cur)?;
+            let dimensions = read_u32(bytes, cur)?;
+            if dimensions == 0 {
+                return Err(GraphusError::Storage(format!(
+                    "vector index {name:?} declares a zero dimension"
+                )));
+            }
+            let similarity_byte = read_u8(bytes, cur)?;
+            let similarity = VectorSimilarity::from_byte(similarity_byte).ok_or_else(|| {
+                GraphusError::Storage(format!(
+                    "vector index {name:?} holds unknown similarity byte {similarity_byte}"
+                ))
+            })?;
+            let m = read_u32(bytes, cur)?;
+            let ef_construction = read_u32(bytes, cur)?;
+            let state_byte = read_u8(bytes, cur)?;
+            let state = IndexState::from_byte(state_byte).ok_or_else(|| {
+                GraphusError::Storage(format!(
+                    "vector index {name:?} holds unknown state byte {state_byte}"
+                ))
+            })?;
+            if map
+                .insert(
+                    name.clone(),
+                    VectorIndexEntry {
+                        entity,
+                        token,
+                        property_token,
+                        dimensions,
+                        similarity,
+                        m,
+                        ef_construction,
+                        state,
+                    },
+                )
+                .is_some()
+            {
+                return Err(GraphusError::Storage(format!(
+                    "vector catalog repeats index name {name:?}"
                 )));
             }
         }
@@ -3633,8 +3959,9 @@ mod tests {
 
         // A pre-#666 image (ending after the spatial extension block, with NO relationship composite
         // block) decodes to an empty relationship composite catalog, not a truncation error. Build such
-        // an image by encoding a value with no relationship composite indexes and truncating off the
-        // trailing zero-count block (a 4-byte `u32` of `0`), which is now the LAST block.
+        // an image by encoding a value with no relationship composite indexes and truncating off the two
+        // trailing zero-count blocks (a 4-byte `u32` of `0` each): the relationship composite block and,
+        // now that it exists, the vector block (`rmp` task #669) which is the LAST block.
         let mut pre666 = Statistics::new();
         pre666.set_composite_index(
             "index_Person_a_b".to_owned(),
@@ -3645,10 +3972,111 @@ mod tests {
             },
         );
         let mut image = pre666.encode();
-        image.truncate(image.len() - 4);
+        image.truncate(image.len() - 8);
         let decoded = Statistics::decode(&image).unwrap();
         assert!(decoded.rel_composite_indexes().is_empty());
+        assert!(decoded.vector_indexes().is_empty());
         assert_eq!(decoded.composite_indexes().len(), 1);
+    }
+
+    #[test]
+    fn statistics_vector_catalog_round_trips_and_pre_669_image_decodes_empty() {
+        // `rmp` task #669: the vector (HNSW) index catalog rides the same append-only trailing-block
+        // discipline as every other catalog, and is the LAST block. Empty map: the block is just a `0`
+        // count, and the round-trip is identity.
+        let empty = Statistics::new();
+        assert_eq!(Statistics::decode(&empty.encode()).unwrap(), empty);
+
+        // A node entry (cosine) and a relationship entry (euclidean) over the SAME numeric token: the
+        // `entity` byte disambiguates them, so both survive and the equivalence resolver never conflates
+        // a node label token with a relationship-type token.
+        let mut s = Statistics::new();
+        s.set_vector_index(
+            "vector_index_Doc_embedding".to_owned(),
+            VectorIndexEntry {
+                entity: VectorEntity::Node,
+                token: 1,
+                property_token: 2,
+                dimensions: 384,
+                similarity: VectorSimilarity::Cosine,
+                m: 16,
+                ef_construction: 200,
+                state: IndexState::Online,
+            },
+        );
+        assert_eq!(Statistics::decode(&s.encode()).unwrap(), s);
+        s.set_vector_index(
+            "vector_rel_index_SIMILAR_vec".to_owned(),
+            VectorIndexEntry {
+                entity: VectorEntity::Relationship,
+                token: 1,
+                property_token: 2,
+                dimensions: 3,
+                similarity: VectorSimilarity::Euclidean,
+                m: 32,
+                ef_construction: 100,
+                state: IndexState::Populating,
+            },
+        );
+        let back = Statistics::decode(&s.encode()).unwrap();
+        assert_eq!(back, s);
+        assert_eq!(back.vector_indexes().len(), 2);
+        // The equivalence resolver keys on (entity, token, property): the node and rel entries over the
+        // same (1, 2) are distinct.
+        assert_eq!(
+            back.vector_index_name_for(VectorEntity::Node, 1, 2),
+            Some("vector_index_Doc_embedding")
+        );
+        assert_eq!(
+            back.vector_index_name_for(VectorEntity::Relationship, 1, 2),
+            Some("vector_rel_index_SIMILAR_vec")
+        );
+        assert_eq!(back.vector_index_name_for(VectorEntity::Node, 1, 9), None);
+
+        // A pre-#669 image (ending after the relationship composite block, with NO vector block) decodes
+        // to an empty vector catalog, not a truncation error. Build one by encoding a value with no
+        // vector indexes and truncating off the trailing zero-count block (a 4-byte `u32` of `0`), which
+        // is now the LAST block.
+        let mut pre669 = Statistics::new();
+        pre669.set_text_index(
+            "text_Person_name".to_owned(),
+            TextIndexEntry {
+                label_token: 1,
+                property_token: 2,
+                state: IndexState::Online,
+            },
+        );
+        let mut image = pre669.encode();
+        image.truncate(image.len() - 4);
+        let decoded = Statistics::decode(&image).unwrap();
+        assert!(decoded.vector_indexes().is_empty());
+        assert_eq!(decoded.text_indexes().len(), 1);
+
+        // An unknown similarity byte (a forward-incompatible image) is rejected, not silently
+        // mis-decoded — the same defense-in-depth as the state / entity bytes. Encode a single-entry
+        // catalog (the vector block is last, so its lone entry trails the whole image) and corrupt its
+        // similarity byte.
+        let mut one = Statistics::new();
+        one.set_vector_index(
+            "v".to_owned(),
+            VectorIndexEntry {
+                entity: VectorEntity::Node,
+                token: 7,
+                property_token: 8,
+                dimensions: 4,
+                similarity: VectorSimilarity::Cosine,
+                m: 16,
+                ef_construction: 200,
+                state: IndexState::Online,
+            },
+        );
+        let mut forged = one.encode();
+        // The lone entry trails the image as: … | similarity(1) | m(4) | ef_construction(4) | state(1),
+        // so the similarity byte is `1 + 4 + 4 = 9` bytes before the final `state` byte, i.e. at
+        // `len - 10`. Corrupt it to `2` (a reserved discriminant).
+        let sim_pos = forged.len() - 10;
+        forged[sim_pos] = 2;
+        assert!(Statistics::decode(&forged).is_err());
     }
 
     #[test]

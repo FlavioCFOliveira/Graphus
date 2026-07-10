@@ -36,7 +36,11 @@ use graphus_index::fulltext::{Analyzer, InvertedIndex, MatchSemantics};
 use graphus_index::recovery::SharedWal;
 use graphus_index::spatial::SpatialIndex;
 use graphus_index::text::TrigramIndex;
-use graphus_index::{BTree, CompositeIndex, PropertyIndex, RelPropertyIndex, TokenIndex};
+use graphus_index::vector::VectorIndex;
+use graphus_index::{
+    BTree, CompositeIndex, PropertyIndex, RelPropertyIndex, Similarity, TokenIndex,
+    VectorIndexError,
+};
 use graphus_io::MemBlockDevice;
 use graphus_storage::{ConstraintKind, ConstraintTypeDescriptor, IndexState};
 use graphus_wal::{DiscardingLogSink, WalManager};
@@ -134,6 +138,18 @@ pub struct IndexSet {
     /// property, accelerating `CONTAINS` / `ENDS WITH` / `STARTS WITH`. Ephemeral and rebuilt on open,
     /// exactly like the spatial index; only the *registration* is durable (the storage catalog).
     text: HashMap<(u32, u32), TextEntry>,
+    /// Declared **vector (HNSW)** node indexes (`rmp` task #669), keyed by `(label_token, prop_key)`.
+    /// Each value carries the build state and the in-memory [`VectorIndex`] (an approximate-nearest-
+    /// neighbour graph) over the covered embedding property. Ephemeral and rebuilt on open, exactly like
+    /// the spatial / text index; only the *registration* is durable (the storage catalog). Because the
+    /// HNSW graph keeps only the latest state (no version history), it rides the SAME cross-snapshot
+    /// freshness marker as the full-text / spatial / text indexes.
+    vector: HashMap<(u32, u32), VectorEntry>,
+    /// Declared **vector (HNSW)** relationship indexes (`rmp` task #669), keyed by `(type_token,
+    /// prop_key)` — the relationship analogue of [`vector`](Self#structfield.vector). Kept in a
+    /// **separate** map (a numeric collision between a label token and a relationship-type token never
+    /// mixes the two), exactly as `spatial_rel` / `fulltext_rel` are separate from their node maps.
+    vector_rel: HashMap<(u32, u32), VectorEntry>,
     /// Declared **constraints** (`rmp` tasks #99, #100), keyed by their server-unique **name**. Each
     /// value is a [`ConstraintRule`] carrying the covered label token, the covered property tokens, the
     /// [`ConstraintKind`] and (for a property-type constraint) the declared type descriptor. Unlike the
@@ -344,6 +360,60 @@ struct TextEntry {
     index: TrigramIndex,
 }
 
+/// A declared vector (HNSW) index plus its build [`IndexState`] and the in-memory ANN graph
+/// (`rmp` task #669). The `(token, prop_key)` key (the map key) mirrors the durable catalog entry; the
+/// HNSW graph is ephemeral (rebuilt from the store on open).
+struct VectorEntry {
+    /// The build state, mirrored from the durable catalog. A `Populating` index is maintained but not
+    /// yet surfaced to the planner; a query still works against it (candidate-set contract).
+    state: IndexState,
+    /// The backing in-memory HNSW approximate-nearest-neighbour graph over the covered embedding.
+    index: VectorIndex,
+}
+
+/// Extracts a dense `f32` embedding of exactly `dim` elements from `value` (`rmp` task #669).
+///
+/// The value must be a [`Value::List`] of **finite** numbers ([`Value::Integer`] / [`Value::Float`])
+/// of length `dim`. A value that is absent (handled by the caller), not a list, holds a non-numeric or
+/// **non-finite** (`NaN` / ±∞) element, or has the wrong length yields [`None`] — the entity is then
+/// simply **not indexed** (exactly like a node missing a covered property), never an error on the write
+/// path. Rejecting non-finite values matches Neo4j (a vector with `NaN`/`Inf` is not a valid embedding)
+/// and keeps the HNSW distance order well-defined (a `NaN` distance would otherwise rank first under the
+/// `total_cmp` result ordering; `rmp` #669 storage-audit follow-up).
+fn extract_embedding(value: &Value, dim: usize) -> Option<Vec<f32>> {
+    let Value::List(items) = value else {
+        return None;
+    };
+    if items.len() != dim {
+        return None;
+    }
+    let mut out = Vec::with_capacity(dim);
+    for item in items {
+        let x = match item {
+            Value::Integer(i) => *i as f32,
+            Value::Float(f) => *f as f32,
+            _ => return None, // a non-numeric element makes the whole list an invalid embedding.
+        };
+        if !x.is_finite() {
+            return None; // NaN / ±∞ is not a valid embedding (Neo4j parity) — leave the entity unindexed.
+        }
+        out.push(x);
+    }
+    Some(out)
+}
+
+/// A deterministic HNSW seed for the vector index on `(token, prop_key)` (`rmp` task #669).
+///
+/// The durable catalog does not persist a seed (it is an internal build detail), so the seed is derived
+/// from the index's identity. This makes an index's graph **reproducible across a reopen** (the rebuild
+/// re-inserts the same nodes in id order with the same seed), and gives two distinct indexes distinct
+/// graphs. The ANN query is approximate, so the exact graph shape never affects correctness — only the
+/// determinism the project's tests and simulator rely on.
+#[must_use]
+fn vector_seed(token: u32, prop_key: u32) -> u64 {
+    (u64::from(token) << 32) | u64::from(prop_key)
+}
+
 impl IndexSet {
     /// An empty index set: a single label [`TokenIndex`] (always present, auto-maintained) and no
     /// property indexes yet.
@@ -358,6 +428,8 @@ impl IndexSet {
             spatial: HashMap::new(),
             spatial_rel: HashMap::new(),
             text: HashMap::new(),
+            vector: HashMap::new(),
+            vector_rel: HashMap::new(),
             constraints: HashMap::new(),
             composite: HashMap::new(),
             rel_composite: HashMap::new(),
@@ -737,6 +809,15 @@ impl IndexSet {
         // (`rmp` task #662), exactly like the spatial index.
         for tx in self.text.values_mut() {
             tx.index.clear();
+        }
+        // Vector (HNSW) indexes: clear the ANN graph entries but keep the registration + state + build
+        // parameters (`rmp` task #669), exactly like the spatial / text index. `VectorIndex::clear`
+        // preserves the configured dimension / similarity / m / ef_construction.
+        for v in self.vector.values_mut() {
+            v.index.clear();
+        }
+        for v in self.vector_rel.values_mut() {
+            v.index.clear();
         }
         // Composite indexes (`rmp` task #100): recreate each backing tree to drop its entries while
         // keeping the registered `(label_token, property_tokens)` set, exactly like the property indexes.
@@ -1954,6 +2035,280 @@ impl IndexSet {
     }
 
     // ============================================================================================
+    // Vector (HNSW) indexes (`rmp` task #669)
+    // ============================================================================================
+
+    /// Declares a **node** vector (HNSW) index on `(label_token, prop_key)` at `state` (`rmp` task
+    /// #669). Idempotent on the key: if one is already registered its HNSW graph is kept but its state
+    /// is updated (so a recovered `Online` declaration promotes a freshly-created entry); otherwise a
+    /// fresh HNSW graph is created with the declared `dim` / `similarity` / `m` / `ef_construction`. The
+    /// seed is derived deterministically from the key so the graph is reproducible across a reopen.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_vector(
+        &mut self,
+        label_token: u32,
+        prop_key: u32,
+        dim: usize,
+        similarity: Similarity,
+        m: usize,
+        ef_construction: usize,
+        state: IndexState,
+    ) {
+        let seed = vector_seed(label_token, prop_key);
+        self.vector
+            .entry((label_token, prop_key))
+            .and_modify(|v| v.state = state)
+            .or_insert_with(|| VectorEntry {
+                state,
+                index: VectorIndex::new(dim, similarity, m, ef_construction, seed)
+                    .expect("INVARIANT: vector dimension validated > 0 at create + decode"),
+            });
+    }
+
+    /// Sets the build [`IndexState`] of the `(label_token, prop_key)` node vector index, e.g. promoting
+    /// `Populating` → `Online`. A no-op if no such index is registered.
+    pub fn set_vector_state(&mut self, label_token: u32, prop_key: u32, state: IndexState) {
+        if let Some(v) = self.vector.get_mut(&(label_token, prop_key)) {
+            v.state = state;
+        }
+    }
+
+    /// Unregisters the node vector index on `(label_token, prop_key)`, dropping its HNSW graph
+    /// (`rmp` task #669, `DROP INDEX`). A no-op if no such index is registered.
+    pub fn unregister_vector(&mut self, label_token: u32, prop_key: u32) {
+        self.vector.remove(&(label_token, prop_key));
+    }
+
+    /// Whether a node vector index is registered for `(label_token, prop_key)` (in any state).
+    #[must_use]
+    pub fn has_vector(&self, label_token: u32, prop_key: u32) -> bool {
+        self.vector.contains_key(&(label_token, prop_key))
+    }
+
+    /// The build [`IndexState`] of the `(label_token, prop_key)` node vector index, or [`None`] if
+    /// unregistered.
+    #[must_use]
+    pub fn vector_state(&self, label_token: u32, prop_key: u32) -> Option<IndexState> {
+        self.vector.get(&(label_token, prop_key)).map(|v| v.state)
+    }
+
+    /// The registered node vector index keys `(label_token, prop_key)` in any state, ascending. Used by
+    /// the coordinator's rebuild to know which embedding properties to (re-)index.
+    #[must_use]
+    pub fn registered_vector(&self) -> Vec<(u32, u32)> {
+        let mut keys: Vec<(u32, u32)> = self.vector.keys().copied().collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// The **`Online`** node vector index keys `(label_token, prop_key)`, ascending. Used to build the
+    /// planner's catalog: only an `Online` vector index may drive a k-NN seek.
+    #[must_use]
+    pub fn online_vector(&self) -> Vec<(u32, u32)> {
+        let mut keys: Vec<(u32, u32)> = self
+            .vector
+            .iter()
+            .filter(|(_, v)| v.state == IndexState::Online)
+            .map(|(&key, _)| key)
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// Records that node `node_id` has embedding `value` for the `(label_token, prop_key)` node vector
+    /// index, if such an index is registered (else a no-op). A `value` that is not a numeric list of the
+    /// declared dimension is treated as **absent**: the node is removed from the graph (so a re-check
+    /// never sees a phantom), exactly mirroring the spatial index's non-point handling. Maintained
+    /// regardless of state (a `Populating` index is kept up to date, harmlessly).
+    pub fn insert_vector_value(
+        &mut self,
+        label_token: u32,
+        prop_key: u32,
+        value: &Value,
+        node_id: u64,
+    ) {
+        if let Some(v) = self.vector.get_mut(&(label_token, prop_key)) {
+            match extract_embedding(value, v.index.dim()) {
+                Some(embedding) => {
+                    // `insert` is last-wins, so this also serves the update case. A dimension mismatch is
+                    // impossible here (`extract_embedding` already checked length), so the result is Ok.
+                    if v.index.insert(node_id, &embedding).is_ok() {
+                        self.ft_spatial_dirty = true;
+                    }
+                }
+                None => {
+                    // Absent / malformed embedding: drop any stale graph entry so a seek never sees a
+                    // phantom. Only a real removal flags the freshness marker dirty.
+                    if v.index.remove(node_id) {
+                        self.ft_spatial_dirty = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Removes `node_id` from the `(label_token, prop_key)` node vector index (a delete, a type change,
+    /// or a node that lost the covered label). A no-op if no such index is registered.
+    pub fn remove_vector(&mut self, label_token: u32, prop_key: u32, node_id: u64) {
+        if let Some(v) = self.vector.get_mut(&(label_token, prop_key)) {
+            if v.index.remove(node_id) {
+                self.ft_spatial_dirty = true;
+            }
+        }
+    }
+
+    /// The `k` nearest node ids to `query` in the `(label_token, prop_key)` node vector index, as
+    /// `(id, score)` pairs by descending score (`rmp` task #669). [`None`] when no such index is
+    /// registered; `Some(Err)` on a query-dimension mismatch; otherwise `Some(Ok(hits))`. The caller
+    /// re-checks visibility / current label / current value against the store (the ANN graph is a
+    /// candidate set).
+    #[must_use]
+    pub fn seek_vector_knn(
+        &self,
+        label_token: u32,
+        prop_key: u32,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+    ) -> Option<Result<Vec<(u64, f32)>, VectorIndexError>> {
+        let v = self.vector.get(&(label_token, prop_key))?;
+        Some(v.index.query_knn(query, k, ef_search))
+    }
+
+    /// Declares a **relationship** vector index on `(type_token, prop_key)` (`rmp` task #669) — the
+    /// relationship analogue of [`register_vector`](Self::register_vector).
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_vector_rel(
+        &mut self,
+        type_token: u32,
+        prop_key: u32,
+        dim: usize,
+        similarity: Similarity,
+        m: usize,
+        ef_construction: usize,
+        state: IndexState,
+    ) {
+        let seed = vector_seed(type_token, prop_key);
+        self.vector_rel
+            .entry((type_token, prop_key))
+            .and_modify(|v| v.state = state)
+            .or_insert_with(|| VectorEntry {
+                state,
+                index: VectorIndex::new(dim, similarity, m, ef_construction, seed)
+                    .expect("INVARIANT: vector dimension validated > 0 at create + decode"),
+            });
+    }
+
+    /// Sets the build [`IndexState`] of the `(type_token, prop_key)` relationship vector index. A no-op
+    /// if none is registered.
+    pub fn set_vector_rel_state(&mut self, type_token: u32, prop_key: u32, state: IndexState) {
+        if let Some(v) = self.vector_rel.get_mut(&(type_token, prop_key)) {
+            v.state = state;
+        }
+    }
+
+    /// Unregisters the relationship vector index on `(type_token, prop_key)`. A no-op if none is
+    /// registered.
+    pub fn unregister_vector_rel(&mut self, type_token: u32, prop_key: u32) {
+        self.vector_rel.remove(&(type_token, prop_key));
+    }
+
+    /// Whether a relationship vector index is registered for `(type_token, prop_key)` (in any state).
+    #[must_use]
+    pub fn has_vector_rel(&self, type_token: u32, prop_key: u32) -> bool {
+        self.vector_rel.contains_key(&(type_token, prop_key))
+    }
+
+    /// Whether **any** relationship vector index is declared (the O(1) gate `reindex_rel` consults
+    /// before decoding a relationship's property chain).
+    #[must_use]
+    pub fn has_any_vector_rel(&self) -> bool {
+        !self.vector_rel.is_empty()
+    }
+
+    /// The build [`IndexState`] of the `(type_token, prop_key)` relationship vector index, or [`None`].
+    #[must_use]
+    pub fn vector_rel_state(&self, type_token: u32, prop_key: u32) -> Option<IndexState> {
+        self.vector_rel
+            .get(&(type_token, prop_key))
+            .map(|v| v.state)
+    }
+
+    /// The registered relationship vector index keys `(type_token, prop_key)` in any state, ascending.
+    #[must_use]
+    pub fn registered_vector_rel(&self) -> Vec<(u32, u32)> {
+        let mut keys: Vec<(u32, u32)> = self.vector_rel.keys().copied().collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// The **`Online`** relationship vector index keys `(type_token, prop_key)`, ascending. Used to
+    /// build the planner's catalog.
+    #[must_use]
+    pub fn online_vector_rel(&self) -> Vec<(u32, u32)> {
+        let mut keys: Vec<(u32, u32)> = self
+            .vector_rel
+            .iter()
+            .filter(|(_, v)| v.state == IndexState::Online)
+            .map(|(&key, _)| key)
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// Records that relationship `rel_id` has embedding `value` for the `(type_token, prop_key)`
+    /// relationship vector index, if registered (else a no-op) — the relationship analogue of
+    /// [`insert_vector_value`](Self::insert_vector_value).
+    pub fn insert_vector_rel_value(
+        &mut self,
+        type_token: u32,
+        prop_key: u32,
+        value: &Value,
+        rel_id: u64,
+    ) {
+        if let Some(v) = self.vector_rel.get_mut(&(type_token, prop_key)) {
+            match extract_embedding(value, v.index.dim()) {
+                Some(embedding) => {
+                    if v.index.insert(rel_id, &embedding).is_ok() {
+                        self.ft_spatial_dirty = true;
+                    }
+                }
+                None => {
+                    if v.index.remove(rel_id) {
+                        self.ft_spatial_dirty = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Removes `rel_id` from the `(type_token, prop_key)` relationship vector index. A no-op if none is
+    /// registered.
+    pub fn remove_vector_rel(&mut self, type_token: u32, prop_key: u32, rel_id: u64) {
+        if let Some(v) = self.vector_rel.get_mut(&(type_token, prop_key)) {
+            if v.index.remove(rel_id) {
+                self.ft_spatial_dirty = true;
+            }
+        }
+    }
+
+    /// The `k` nearest relationship ids to `query` in the `(type_token, prop_key)` relationship vector
+    /// index (`rmp` task #669) — the relationship analogue of
+    /// [`seek_vector_knn`](Self::seek_vector_knn).
+    #[must_use]
+    pub fn seek_vector_rel_knn(
+        &self,
+        type_token: u32,
+        prop_key: u32,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+    ) -> Option<Result<Vec<(u64, f32)>, VectorIndexError>> {
+        let v = self.vector_rel.get(&(type_token, prop_key))?;
+        Some(v.index.query_knn(query, k, ef_search))
+    }
+
+    // ============================================================================================
     // Cross-snapshot full-text + spatial freshness marker (`rmp` task #467)
     // ============================================================================================
     //
@@ -3144,6 +3499,207 @@ mod tests {
         set.unregister_text(1, 5);
         assert!(!set.has_text(1, 5));
         assert!(set.registered_text().is_empty());
+    }
+
+    // ---- Vector (HNSW) index (`rmp` task #669) ------------------------------------------------
+
+    /// A 3-D embedding [`Value::List`] from integer coordinates (round-trip through `extract_embedding`).
+    fn emb(x: i64, y: i64, z: i64) -> Value {
+        Value::List(vec![
+            Value::Integer(x),
+            Value::Integer(y),
+            Value::Integer(z),
+        ])
+    }
+
+    #[test]
+    fn vector_register_insert_seek_and_maintenance() {
+        let mut set = IndexSet::new();
+        set.register_vector(1, 5, 3, Similarity::Euclidean, 16, 200, IndexState::Online);
+        assert!(set.has_vector(1, 5));
+        assert_eq!(set.vector_state(1, 5), Some(IndexState::Online));
+
+        set.insert_vector_value(1, 5, &emb(0, 0, 0), 100);
+        set.insert_vector_value(1, 5, &emb(10, 0, 0), 101);
+        set.insert_vector_value(1, 5, &emb(0, 10, 0), 102);
+        // A malformed value (wrong length / non-list / non-numeric / non-finite) is NOT indexed.
+        set.insert_vector_value(1, 5, &Value::List(vec![Value::Integer(1)]), 200); // wrong length
+        set.insert_vector_value(1, 5, &Value::Integer(7), 201); // not a list
+        // NaN / ±∞ are invalid embeddings (Neo4j parity, `rmp` #669 audit follow-up): a `NaN` distance
+        // would otherwise rank first under the `total_cmp` result order. They stay out of the graph.
+        set.insert_vector_value(
+            1,
+            5,
+            &Value::List(vec![
+                Value::Float(f64::NAN),
+                Value::Float(0.0),
+                Value::Float(0.0),
+            ]),
+            202,
+        ); // NaN element
+        set.insert_vector_value(
+            1,
+            5,
+            &Value::List(vec![
+                Value::Float(f64::INFINITY),
+                Value::Float(0.0),
+                Value::Float(0.0),
+            ]),
+            203,
+        ); // +inf element
+
+        // The nearest neighbour of ~origin is node 100.
+        let hits = set
+            .seek_vector_knn(1, 5, &[0.0, 1.0, 0.0], 3, 64)
+            .expect("registered")
+            .expect("dim matches");
+        assert_eq!(hits[0].0, 100, "node 100 (at origin) is nearest to [0,1,0]");
+        // The malformed rows never entered the graph.
+        let all: Vec<u64> = set
+            .seek_vector_knn(1, 5, &[0.0, 0.0, 0.0], 10, 64)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(all.len(), 3, "only the three valid embeddings are indexed");
+        assert!(!all.contains(&200) && !all.contains(&201));
+        assert!(
+            !all.contains(&202) && !all.contains(&203),
+            "NaN / +inf embeddings are rejected, never indexed"
+        );
+
+        // Update: 100 moves far away → it is no longer nearest to the origin.
+        set.insert_vector_value(1, 5, &emb(100, 100, 100), 100);
+        let hits = set
+            .seek_vector_knn(1, 5, &[0.0, 0.0, 0.0], 1, 64)
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            hits[0].0, 100,
+            "the moved node is no longer nearest the origin"
+        );
+
+        // A value that becomes malformed removes the node (a re-check never sees a phantom).
+        set.insert_vector_value(1, 5, &Value::Integer(0), 101);
+        let ids: Vec<u64> = set
+            .seek_vector_knn(1, 5, &[10.0, 0.0, 0.0], 10, 64)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(
+            !ids.contains(&101),
+            "node 101 was removed when its value went bad"
+        );
+
+        // Explicit delete.
+        set.remove_vector(1, 5, 102);
+        let ids: Vec<u64> = set
+            .seek_vector_knn(1, 5, &[0.0, 10.0, 0.0], 10, 64)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(!ids.contains(&102));
+
+        // A query-dimension mismatch is a `Some(Err)`; an unregistered key is `None`.
+        assert!(
+            set.seek_vector_knn(1, 5, &[1.0, 0.0], 1, 64)
+                .unwrap()
+                .is_err()
+        );
+        assert!(set.seek_vector_knn(9, 9, &[0.0, 0.0, 0.0], 1, 64).is_none());
+    }
+
+    #[test]
+    fn vector_state_gates_planner_exposure_and_clear_preserves_registration() {
+        let mut set = IndexSet::new();
+        set.register_vector(1, 5, 3, Similarity::Cosine, 16, 200, IndexState::Populating);
+        // Maintained while populating…
+        set.insert_vector_value(1, 5, &emb(1, 0, 0), 100);
+        assert_eq!(
+            set.seek_vector_knn(1, 5, &[1.0, 0.0, 0.0], 1, 64)
+                .unwrap()
+                .unwrap()[0]
+                .0,
+            100
+        );
+        // …but not surfaced to the planner until Online.
+        assert_eq!(set.registered_vector(), vec![(1, 5)]);
+        assert!(set.online_vector().is_empty());
+        set.set_vector_state(1, 5, IndexState::Online);
+        assert_eq!(set.online_vector(), vec![(1, 5)]);
+
+        // Clear drops the graph entries but keeps the registration + state + parameters (like the other
+        // kinds): the graph is empty but the seek still works (returns nothing), and dim is preserved.
+        set.clear();
+        assert!(set.has_vector(1, 5));
+        assert_eq!(set.vector_state(1, 5), Some(IndexState::Online));
+        assert_eq!(
+            set.seek_vector_knn(1, 5, &[1.0, 0.0, 0.0], 1, 64)
+                .unwrap()
+                .unwrap(),
+            Vec::new()
+        );
+        // The preserved dimension still rejects a mismatched query.
+        assert!(
+            set.seek_vector_knn(1, 5, &[1.0, 0.0], 1, 64)
+                .unwrap()
+                .is_err()
+        );
+
+        // Drop removes it entirely.
+        set.unregister_vector(1, 5);
+        assert!(!set.has_vector(1, 5));
+        assert!(set.registered_vector().is_empty());
+    }
+
+    #[test]
+    fn vector_rel_is_separate_from_node_over_the_same_tokens() {
+        // A node vector index and a relationship vector index over the SAME numeric tokens are distinct.
+        let mut set = IndexSet::new();
+        set.register_vector(1, 5, 2, Similarity::Euclidean, 16, 200, IndexState::Online);
+        set.register_vector_rel(1, 5, 2, Similarity::Euclidean, 16, 200, IndexState::Online);
+        assert!(set.has_vector(1, 5) && set.has_vector_rel(1, 5));
+        assert!(set.has_any_vector_rel());
+
+        set.insert_vector_value(
+            1,
+            5,
+            &Value::List(vec![Value::Float(1.0), Value::Float(0.0)]),
+            10,
+        );
+        set.insert_vector_rel_value(
+            1,
+            5,
+            &Value::List(vec![Value::Float(0.0), Value::Float(1.0)]),
+            20,
+        );
+        // Each side sees only its own element id.
+        assert_eq!(
+            set.seek_vector_knn(1, 5, &[1.0, 0.0], 5, 64)
+                .unwrap()
+                .unwrap()[0]
+                .0,
+            10
+        );
+        assert_eq!(
+            set.seek_vector_rel_knn(1, 5, &[0.0, 1.0], 5, 64)
+                .unwrap()
+                .unwrap()[0]
+                .0,
+            20
+        );
+
+        // Dropping the node side leaves the relationship side intact.
+        set.unregister_vector(1, 5);
+        assert!(!set.has_vector(1, 5));
+        assert!(set.has_vector_rel(1, 5));
+        set.unregister_vector_rel(1, 5);
+        assert!(!set.has_any_vector_rel());
     }
 
     #[test]

@@ -46,11 +46,13 @@ use graphus_core::error::{GraphusError, Result};
 use graphus_core::{Lsn, Timestamp, TxnId};
 use graphus_index::fulltext::Analyzer;
 use graphus_index::histogram::PropertyHistogram;
+use graphus_index::{Similarity, VectorIndexError};
 use graphus_io::BlockDevice;
 use graphus_storage::{
     CompositeIndexEntry, ConstraintEntry, ConstraintKind, ConstraintTypeDescriptor, FulltextEntity,
     FulltextIndexEntry, GcPassReport, IndexState, Namespace, RecordStore, RelCompositeIndexEntry,
-    SpatialEntity, SpatialIndexEntry, StoreReadView, TextIndexEntry, TokenSnapshot,
+    SpatialEntity, SpatialIndexEntry, StoreReadView, TextIndexEntry, TokenSnapshot, VectorEntity,
+    VectorIndexEntry, VectorSimilarity,
 };
 use graphus_txn::{CommitRegistry, IsolationLevel, LockTable, Snapshot, SsiReadBuffer, SsiTracker};
 use graphus_wal::LogSink;
@@ -370,6 +372,8 @@ enum NameCatalog {
     RelComposite,
     /// The text (trigram) node index catalog (`rmp` task #662).
     Text,
+    /// The vector (HNSW) index catalog (`rmp` task #669).
+    Vector,
 }
 
 /// A deterministic auto-name for the composite (multi-property) node index on `(label, properties)`
@@ -412,6 +416,42 @@ pub fn auto_rel_composite_index_name(rel_type: &str, properties: &[String]) -> S
         name.push_str(&sanitize_identifier(property));
     }
     name
+}
+
+/// A deterministic auto-name for the **node** vector (HNSW) index on `(label, property)`
+/// (`rmp` task #669). A distinct `vector_index_` prefix keeps it from ever colliding with any other
+/// index kind's auto-name over the same identifiers (they share the one global name namespace).
+#[must_use]
+pub fn auto_vector_index_name(label: &str, property: &str) -> String {
+    format!(
+        "vector_index_{}_{}",
+        sanitize_identifier(label),
+        sanitize_identifier(property)
+    )
+}
+
+/// A deterministic auto-name for the **relationship** vector (HNSW) index on `(rel_type, property)`
+/// (`rmp` task #669) — the relationship analogue of [`auto_vector_index_name`]. The distinct
+/// `vector_rel_index_` prefix keeps it from ever colliding with a node vector index's auto-name over
+/// the same identifiers.
+#[must_use]
+pub fn auto_vector_rel_index_name(rel_type: &str, property: &str) -> String {
+    format!(
+        "vector_rel_index_{}_{}",
+        sanitize_identifier(rel_type),
+        sanitize_identifier(property)
+    )
+}
+
+/// Maps a durable [`VectorSimilarity`] discriminant to the in-memory `graphus_index::Similarity`
+/// (`rmp` task #669). Storage does not depend on `graphus-index`, so the metric is stored as its own
+/// byte enum and translated here when the query layer (re)builds the HNSW graph.
+#[must_use]
+fn similarity_from_storage(similarity: VectorSimilarity) -> Similarity {
+    match similarity {
+        VectorSimilarity::Cosine => Similarity::Cosine,
+        VectorSimilarity::Euclidean => Similarity::Euclidean,
+    }
 }
 
 impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
@@ -883,6 +923,42 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             }
         }
 
+        // Register every durable **vector (HNSW) index** (`rmp` task #669) in the in-memory set BEFORE
+        // the rebuild scan below, so the write path maintains it and the scan repopulates its ANN graph.
+        // It is recorded `Online` in the durable catalog (a synchronous build), so recovery repopulates a
+        // fully-online index. Route by entity: a node index into the node-keyed `vector` map (covered by
+        // labels), a relationship index into the separate rel-keyed `vector_rel` map (covered by rel
+        // types). The declared dimension / similarity / m / ef_construction come straight from the durable
+        // entry, so the rebuilt graph has exactly the shape the create recorded.
+        let durable_vector: Vec<(String, VectorIndexEntry)> = store.borrow().vector_indexes();
+        {
+            let mut idx = index.borrow_mut();
+            for (_name, entry) in durable_vector {
+                let similarity = similarity_from_storage(entry.similarity);
+                if entry.entity.is_relationship() {
+                    idx.register_vector_rel(
+                        entry.token,
+                        entry.property_token,
+                        entry.dimensions as usize,
+                        similarity,
+                        entry.m as usize,
+                        entry.ef_construction as usize,
+                        entry.state,
+                    );
+                } else {
+                    idx.register_vector(
+                        entry.token,
+                        entry.property_token,
+                        entry.dimensions as usize,
+                        similarity,
+                        entry.m as usize,
+                        entry.ef_construction as usize,
+                        entry.state,
+                    );
+                }
+            }
+        }
+
         index.borrow_mut().clear();
 
         // The set of registered node-property indexes (any state), captured before walking the store so
@@ -905,6 +981,9 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // The registered text (trigram) index keys `(label_token, prop_key)` (`rmp` task #662), captured
         // before the scan so the index is not borrowed across a store borrow.
         let registered_text: Vec<(u32, u32)> = index.borrow().registered_text();
+        // The registered node vector index keys `(label_token, prop_key)` (`rmp` task #669), captured
+        // before the scan so the index is not borrowed across a store borrow.
+        let registered_vector: Vec<(u32, u32)> = index.borrow().registered_vector();
         // The registered composite index keys `(label_token, property tuple)` — a node-key constraint's
         // backing index (`rmp` task #100). Captured before the scan so the index is not borrowed across
         // a store borrow.
@@ -928,6 +1007,11 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             // least one is declared.
             if !registered_text.is_empty() {
                 Self::index_one_node_text(store, index, id, &registered_text);
+            }
+            // Repopulate the vector (HNSW) indexes from the same scan (`rmp` task #669), only when at
+            // least one is declared.
+            if !registered_vector.is_empty() {
+                Self::index_one_node_vector(store, index, id, &registered_vector);
             }
             // Repopulate the composite indexes from the same scan (`rmp` task #100), only when at least
             // one node-key constraint is declared.
@@ -954,6 +1038,9 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // #666), captured before the scan like the others.
         let registered_rel_composite: Vec<(u32, Vec<u32>)> =
             index.borrow().registered_rel_composite();
+        // The registered relationship vector index keys `(type_token, prop_key)` (`rmp` task #669),
+        // captured before the scan like the others.
+        let registered_rel_vector: Vec<(u32, u32)> = index.borrow().registered_vector_rel();
         // A store-read fault enumerating the relationships leaves the rel indexes empty-but-`Online`.
         // This matches the certified node-property rebuild's trust-once-selected behaviour: storage
         // faults in Graphus are persistent (checksum / torn page), and both the index seek and the scan
@@ -963,7 +1050,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         if (!registered_rel.is_empty()
             || has_rel_fulltext
             || !registered_rel_spatial.is_empty()
-            || !registered_rel_composite.is_empty())
+            || !registered_rel_composite.is_empty()
+            || !registered_rel_vector.is_empty())
             && let Ok(rel_ids) = store.borrow().scan_rel_ids()
         {
             for id in rel_ids {
@@ -984,6 +1072,11 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 // is declared.
                 if !registered_rel_composite.is_empty() {
                     Self::index_one_rel_composite(store, index, id, &registered_rel_composite);
+                }
+                // Repopulate the relationship vector (HNSW) indexes (`rmp` task #669), only when at least
+                // one is declared.
+                if !registered_rel_vector.is_empty() {
+                    Self::index_one_rel_vector(store, index, id, &registered_rel_vector);
                 }
             }
         }
@@ -1011,6 +1104,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             || store.composite_index(name).is_some()
             || store.rel_composite_index(name).is_some()
             || store.text_index(name).is_some()
+            || store.vector_index(name).is_some()
     }
 
     /// Whether `name` is used by a schema catalog **other than** `own` (`rmp` task #624). Lets a
@@ -1025,6 +1119,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             || (own != NameCatalog::Composite && store.composite_index(name).is_some())
             || (own != NameCatalog::RelComposite && store.rel_composite_index(name).is_some())
             || (own != NameCatalog::Text && store.text_index(name).is_some())
+            || (own != NameCatalog::Vector && store.vector_index(name).is_some())
     }
 
     /// Whether `name` is used by any schema rule **other than** the node-property index on
@@ -1041,6 +1136,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             || store.spatial_index(name).is_some()
             || store.constraint(name).is_some()
             || store.text_index(name).is_some()
+            || store.vector_index(name).is_some()
             || matches!(
                 store.node_property_index_name(name),
                 Some(target) if target != (label_token, prop_token)
@@ -1098,6 +1194,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             || store.spatial_index(name).is_some()
             || store.constraint(name).is_some()
             || store.text_index(name).is_some()
+            || store.vector_index(name).is_some()
             || matches!(
                 store.rel_property_index_name(name),
                 Some(target) if target != (type_token, prop_token)
@@ -1602,6 +1699,98 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 if index.has_text(lt, *prop_key) {
                     index.insert_text_value(lt, *prop_key, value, id);
                 }
+            }
+        }
+    }
+
+    /// (Re)indexes node `id`'s current embedding into each `registered` `(label_token, prop_key)` vector
+    /// (HNSW) index it matches (`rmp` task #669). The vector analogue of
+    /// [`index_one_node_text`](Self::index_one_node_text): the same single per-node code path the full
+    /// rebuild ([`rebuild_index`](Self::rebuild_index)) drives, so a recovered store rebuilds the ANN
+    /// graphs store-consistently. Only the covered property is read; its value is handed verbatim to
+    /// [`insert_vector_value`](crate::index_set::IndexSet::insert_vector_value), which indexes it iff it
+    /// is a valid embedding (a numeric list of the declared dimension) and otherwise leaves the node out
+    /// — so a node not carrying the covered label, or whose covered property is absent / malformed,
+    /// contributes nothing. Store and index are borrowed in **separate, non-overlapping** scopes.
+    fn index_one_node_vector(
+        store: &Rc<RefCell<RecordStore<D, S>>>,
+        index: &Rc<RefCell<IndexSet>>,
+        id: u64,
+        registered: &[(u32, u32)],
+    ) {
+        let label_tokens = match store.borrow_mut().node_labels(id) {
+            Ok(tokens) => tokens,
+            Err(_) => return,
+        };
+        // The node's current property values, keyed by prop-key (newest-wins per key), keeping only the
+        // values a registered vector index covers for one of this node's labels. The value type is NOT
+        // pre-filtered here (unlike text/spatial): `insert_vector_value` validates the embedding shape.
+        let mut values: Vec<(u32, Value)> = Vec::new();
+        {
+            let chain = match store.borrow_mut().node_property_values(id) {
+                Ok(chain) => chain,
+                Err(_) => return,
+            };
+            for (_pid, key, value) in chain {
+                if values.iter().any(|(k, _)| *k == key) {
+                    continue; // newest-wins: keep only the first occurrence of each key.
+                }
+                let used = registered.iter().any(|&(reg_label, prop_key)| {
+                    prop_key == key && label_tokens.contains(&reg_label)
+                });
+                if used {
+                    values.push((key, value));
+                }
+            }
+        }
+
+        let mut index = index.borrow_mut();
+        for (prop_key, value) in &values {
+            for &lt in &label_tokens {
+                if index.has_vector(lt, *prop_key) {
+                    index.insert_vector_value(lt, *prop_key, value, id);
+                }
+            }
+        }
+    }
+
+    /// (Re)indexes relationship `id`'s current embedding into each `registered` `(type_token, prop_key)`
+    /// vector (HNSW) index it matches (`rmp` task #669) — the relationship analogue of
+    /// [`index_one_node_vector`](Self::index_one_node_vector) (its structure mirrors
+    /// [`index_one_rel_spatial`](Self::index_one_rel_spatial)).
+    fn index_one_rel_vector(
+        store: &Rc<RefCell<RecordStore<D, S>>>,
+        index: &Rc<RefCell<IndexSet>>,
+        id: u64,
+        registered: &[(u32, u32)],
+    ) {
+        let type_token = match store.borrow().rel(id) {
+            Ok(r) => r.type_id,
+            Err(_) => return,
+        };
+        let mut values: Vec<(u32, Value)> = Vec::new();
+        {
+            let chain = match store.borrow().rel_property_values(id) {
+                Ok(chain) => chain,
+                Err(_) => return,
+            };
+            for (_pid, key, value) in chain {
+                if values.iter().any(|(k, _)| *k == key) {
+                    continue; // newest-wins: keep only the first occurrence of each key.
+                }
+                let used = registered
+                    .iter()
+                    .any(|&(reg_type, prop_key)| prop_key == key && reg_type == type_token);
+                if used {
+                    values.push((key, value));
+                }
+            }
+        }
+
+        let mut index = index.borrow_mut();
+        for (prop_key, value) in &values {
+            if index.has_vector_rel(type_token, *prop_key) {
+                index.insert_vector_rel_value(type_token, *prop_key, value, id);
             }
         }
     }
@@ -4115,6 +4304,345 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             .collect()
     }
 
+    // ---- Vector (HNSW) index surface (`rmp` task #669) --------------------------------------------
+
+    /// Declares a **vector (HNSW) index** — over a node label (`entity == VectorEntity::Node`) or a
+    /// relationship type (`entity == VectorEntity::Relationship`) — named `name` (or an auto-name when
+    /// `None`) over `(covering, property)`, **durably records it**, and **synchronously builds** it from
+    /// the current data (`rmp` task #669). The single coordinator entry point behind
+    /// `CREATE VECTOR INDEX … FOR (n:L) ON (n.p)` / `FOR ()-[r:T]-() ON (r.p)` (the DDL surface is
+    /// `rmp` #671, part C/D).
+    ///
+    /// The covering + property-key tokens are interned **durably** and the named catalog entry — carrying
+    /// the entity, the embedding `dimensions`, the `similarity` metric and the HNSW `m` /
+    /// `ef_construction` parameters — is recorded [`IndexState::Online`] in one committed transaction (so
+    /// the *registration* survives a crash), then the HNSW graph is registered in the in-memory
+    /// [`IndexSet`] and synchronously filled from the current nodes / relationships. The synchronous fill
+    /// is crash-safe: the graph is ephemeral and rebuilt from the durable catalog + store on open, so a
+    /// crash mid-build recovers the `Online` registration and repopulates it store-consistently — exactly
+    /// like the text (`rmp` #662) and composite (`rmp` #657) indexes.
+    ///
+    /// Returns whether the index was **actually created** (`true`) or the call was an idempotent no-op
+    /// (`false`, an `IF NOT EXISTS` that changed nothing).
+    ///
+    /// # Errors
+    /// - a storage error when `dimensions == 0` (a zero-dimension embedding is meaningless);
+    /// - `Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists` (no `IF NOT EXISTS`) when an
+    ///   equivalent vector index on `(entity, covering, property)` already exists;
+    /// - `Neo.ClientError.Schema.IndexWithNameAlreadyExists` (no `IF NOT EXISTS`) when `name` is already
+    ///   taken by another schema rule;
+    /// - a storage error if interning a token, recording the catalog entry, committing, or the build scan
+    ///   fails. On any error the index is left undeclared.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_online_vector_index_named(
+        &mut self,
+        name: Option<&str>,
+        entity: VectorEntity,
+        covering: &str,
+        property: &str,
+        dimensions: usize,
+        similarity: VectorSimilarity,
+        m: usize,
+        ef_construction: usize,
+        if_not_exists: bool,
+    ) -> Result<bool> {
+        if dimensions == 0 {
+            return Err(GraphusError::Runtime(
+                "a vector index dimension must be greater than zero".to_owned(),
+            ));
+        }
+        let namespace = if entity.is_relationship() {
+            Namespace::RelType
+        } else {
+            Namespace::Label
+        };
+
+        // 1. Equivalent-index check (read-only, by token *lookup*): the same covered
+        //    `(entity, covering, property)` under any name makes this an idempotent no-op (or an error
+        //    without `IF NOT EXISTS`). An absent token means no index can cover this target.
+        let equivalent_exists = {
+            let store = self.store.borrow();
+            match (
+                store.token_id(namespace, covering),
+                store.token_id(Namespace::PropKey, property),
+            ) {
+                (Some(token), Some(prop_token)) => store
+                    .vector_index_name_for(entity, token, prop_token)
+                    .is_some(),
+                _ => false,
+            }
+        };
+        if equivalent_exists {
+            return if if_not_exists {
+                Ok(false)
+            } else if entity.is_relationship() {
+                Err(equivalent_rel_index_exists(covering, property))
+            } else {
+                Err(equivalent_index_exists(covering, property))
+            };
+        }
+
+        // 2. Explicit-name global uniqueness (read-only). An omitted name is auto-generated in step 3.
+        if let Some(n) = name
+            && Self::name_in_use(&self.store.borrow(), n)
+        {
+            return if if_not_exists {
+                Ok(false)
+            } else {
+                Err(index_name_in_use(n))
+            };
+        }
+
+        // 3. Intern the tokens and record the durable catalog entry (`Online`) in one committed
+        //    transaction — so the schema change survives a crash atomically.
+        self.next_txn_id += 1;
+        let txn = TxnId(self.next_txn_id);
+        self.store.borrow_mut().begin(txn);
+        let (token, prop_key) = {
+            let mut store = self.store.borrow_mut();
+            let token = match store.intern_token(namespace, covering) {
+                Ok(t) => t,
+                Err(e) => {
+                    drop(store);
+                    let _ = self.store.borrow_mut().rollback(txn);
+                    return Err(e);
+                }
+            };
+            let prop_key = match store.intern_token(Namespace::PropKey, property) {
+                Ok(t) => t,
+                Err(e) => {
+                    drop(store);
+                    let _ = self.store.borrow_mut().rollback(txn);
+                    return Err(e);
+                }
+            };
+            let effective_name = match name {
+                Some(n) => n.to_owned(),
+                None => Self::unique_auto_vector_index_name(&store, entity, covering, property),
+            };
+            store.set_vector_index(
+                effective_name,
+                VectorIndexEntry {
+                    entity,
+                    token,
+                    property_token: prop_key,
+                    dimensions: dimensions as u32,
+                    similarity,
+                    m: m as u32,
+                    ef_construction: ef_construction as u32,
+                    state: IndexState::Online,
+                },
+            );
+            (token, prop_key)
+        };
+        self.store.borrow_mut().commit(txn)?;
+
+        // 4. Register the HNSW graph `Online` in the in-memory set so concurrent writes maintain it, then
+        //    synchronously index the existing nodes / relationships into it. The graph is ephemeral
+        //    (rebuilt on open), so this synchronous fill has no durability surface.
+        let sim = similarity_from_storage(similarity);
+        if entity.is_relationship() {
+            self.index.borrow_mut().register_vector_rel(
+                token,
+                prop_key,
+                dimensions,
+                sim,
+                m,
+                ef_construction,
+                IndexState::Online,
+            );
+            let rel_ids = self.store.borrow().scan_rel_ids()?;
+            let registered = vec![(token, prop_key)];
+            for id in rel_ids {
+                Self::index_one_rel_vector(&self.store, &self.index, id, &registered);
+            }
+        } else {
+            self.index.borrow_mut().register_vector(
+                token,
+                prop_key,
+                dimensions,
+                sim,
+                m,
+                ef_construction,
+                IndexState::Online,
+            );
+            let node_ids = self.store.borrow_mut().scan_node_ids()?;
+            let registered = vec![(token, prop_key)];
+            for id in node_ids {
+                Self::index_one_node_vector(&self.store, &self.index, id, &registered);
+            }
+        }
+
+        // 5. Stamp the cross-snapshot freshness marker (`rmp` task #467): the HNSW graph now reflects
+        //    committed state at the store's high-water, and the build raised the transient dirty flag on
+        //    every insert. Bump the marker so a reader whose snapshot predates the build declines to the
+        //    always-correct scan path, and clear the build's dirty flag so it does not leak into the next
+        //    statement — exactly like the text index create.
+        let high_water = self.store.borrow().snapshot_ts();
+        self.index
+            .borrow_mut()
+            .bump_ft_spatial_marker_after_build(high_water);
+        Ok(true)
+    }
+
+    /// A globally-unique, deterministic auto-name for the vector index on `(entity, covering, property)`
+    /// (`rmp` task #669) — the vector analogue of
+    /// [`unique_auto_index_name`](Self::unique_auto_index_name). The equivalence check in the caller has
+    /// already guaranteed no vector index covers this exact target, so the base name can only collide
+    /// with an *unrelated* schema rule; a numeric counter resolves any residual collision so the returned
+    /// name is free across **every** catalog.
+    fn unique_auto_vector_index_name(
+        store: &RecordStore<D, S>,
+        entity: VectorEntity,
+        covering: &str,
+        property: &str,
+    ) -> String {
+        let base = if entity.is_relationship() {
+            auto_vector_rel_index_name(covering, property)
+        } else {
+            auto_vector_index_name(covering, property)
+        };
+        if !Self::name_in_use(store, &base) {
+            return base;
+        }
+        let mut n: u64 = 2;
+        loop {
+            let candidate = format!("{base}_{n}");
+            if !Self::name_in_use(store, &candidate) {
+                return candidate;
+            }
+            n += 1;
+        }
+    }
+
+    /// Drops the vector (HNSW) index named `name` (`rmp` task #669): removes its durable catalog entry in
+    /// a committed transaction and unregisters its HNSW graph from the in-memory [`IndexSet`] (routing by
+    /// entity to the node- or relationship-keyed map). Idempotent on a never-declared name under
+    /// `if_exists`.
+    ///
+    /// # Errors
+    /// - `Neo.ClientError.Schema.IndexDropFailed` when the index is not declared and `if_exists` is
+    ///   `false`;
+    /// - a storage error if the committing transaction fails.
+    pub fn drop_vector_index(&mut self, name: &str, if_exists: bool) -> Result<bool> {
+        // Resolve the covered `(entity, token, prop_key)` from the durable entry so we can unregister the
+        // right graph from the in-memory set (which is keyed by tokens, not by name).
+        let entry = self.store.borrow().vector_index(name);
+        let Some(entry) = entry else {
+            if !if_exists {
+                return Err(index_drop_not_found(name));
+            }
+            return Ok(false); // nothing removed.
+        };
+
+        self.next_txn_id += 1;
+        let txn = TxnId(self.next_txn_id);
+        self.store.borrow_mut().begin(txn);
+        self.store.borrow_mut().remove_vector_index(name);
+        self.store.borrow_mut().commit(txn)?;
+
+        if entry.entity.is_relationship() {
+            self.index
+                .borrow_mut()
+                .unregister_vector_rel(entry.token, entry.property_token);
+        } else {
+            self.index
+                .borrow_mut()
+                .unregister_vector(entry.token, entry.property_token);
+        }
+        Ok(true) // an index was removed.
+    }
+
+    /// Lists every declared **node** vector index as `(name, label, property, state)` (`rmp` task #669)
+    /// for a `SHOW VECTOR INDEXES` surface. Reads the durable catalog and resolves the tokens back to
+    /// names; a **relationship** vector index and an entry whose tokens have no resolvable name are
+    /// omitted. Ordered by name.
+    #[must_use]
+    pub fn list_vector_indexes(&self) -> Vec<(String, String, String, IndexState)> {
+        let store = self.store.borrow();
+        store
+            .vector_indexes()
+            .into_iter()
+            .filter(|(_n, entry)| !entry.entity.is_relationship())
+            .filter_map(|(name, entry)| {
+                let label = store.token_name(Namespace::Label, entry.token)?;
+                let property = store.token_name(Namespace::PropKey, entry.property_token)?;
+                Some((name, label.to_owned(), property.to_owned(), entry.state))
+            })
+            .collect()
+    }
+
+    /// Lists every declared **relationship** vector index as `(name, type, property, state)`
+    /// (`rmp` task #669) — the relationship analogue of
+    /// [`list_vector_indexes`](Self::list_vector_indexes). Ordered by name.
+    #[must_use]
+    pub fn list_vector_rel_indexes(&self) -> Vec<(String, String, String, IndexState)> {
+        let store = self.store.borrow();
+        store
+            .vector_indexes()
+            .into_iter()
+            .filter(|(_n, entry)| entry.entity.is_relationship())
+            .filter_map(|(name, entry)| {
+                let rel_type = store.token_name(Namespace::RelType, entry.token)?;
+                let property = store.token_name(Namespace::PropKey, entry.property_token)?;
+                Some((name, rel_type.to_owned(), property.to_owned(), entry.state))
+            })
+            .collect()
+    }
+
+    /// The `k` nearest **node** ids to `query` in the vector index over `(label, property)`, as
+    /// `(id, score)` by descending score (`rmp` task #669) — the seek primitive the query planner
+    /// (`rmp` #671) will build on. [`None`] when the label / property tokens are unknown or no vector
+    /// index covers them; `Some(Err)` on a query-dimension mismatch; otherwise `Some(Ok(hits))`.
+    ///
+    /// The returned ids are **candidates**: the query planner layers MVCC visibility + current-label +
+    /// current-value re-checks (and the cross-snapshot freshness gate) on top. `ef_search` defaults are
+    /// the caller's; [`graphus_index::DEFAULT_EF_SEARCH`] is a sensible starting point.
+    #[must_use]
+    pub fn vector_query_nodes(
+        &self,
+        label: &str,
+        property: &str,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+    ) -> Option<std::result::Result<Vec<(u64, f32)>, VectorIndexError>> {
+        let (label_token, prop_key) = {
+            let store = self.store.borrow();
+            (
+                store.token_id(Namespace::Label, label)?,
+                store.token_id(Namespace::PropKey, property)?,
+            )
+        };
+        self.index
+            .borrow()
+            .seek_vector_knn(label_token, prop_key, query, k, ef_search)
+    }
+
+    /// The `k` nearest **relationship** ids to `query` in the vector index over `(rel_type, property)`
+    /// (`rmp` task #669) — the relationship analogue of
+    /// [`vector_query_nodes`](Self::vector_query_nodes).
+    #[must_use]
+    pub fn vector_query_rels(
+        &self,
+        rel_type: &str,
+        property: &str,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+    ) -> Option<std::result::Result<Vec<(u64, f32)>, VectorIndexError>> {
+        let (type_token, prop_key) = {
+            let store = self.store.borrow();
+            (
+                store.token_id(Namespace::RelType, rel_type)?,
+                store.token_id(Namespace::PropKey, property)?,
+            )
+        };
+        self.index
+            .borrow()
+            .seek_vector_rel_knn(type_token, prop_key, query, k, ef_search)
+    }
+
     /// Idempotency-aware `CREATE CONSTRAINT` entry point (`rmp` #638): wraps
     /// [`create_constraint_general`](Self::create_constraint_general) with `IF NOT EXISTS` and
     /// `OR REPLACE` handling, returning whether the schema was **actually mutated** (which drives the
@@ -5350,6 +5878,31 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             if resolvable {
                 builder = builder.with_rel_composite(rel_type, properties);
             }
+        }
+        // Vector (HNSW) indexes (`rmp` task #669): surface every **`Online`** node / relationship vector
+        // index so the query planner (`rmp` #671) can route a k-NN query to a vector index seek. Only
+        // `Online` ones are exposed (`online_vector` / `online_vector_rel` filter by state); vector
+        // indexes are created synchronous-`Online`, so this is always the full set. The backing HNSW
+        // graph exists in the in-memory set (registered on open / create), so the seek the planner emits
+        // always finds it. Without this surfacing the planner (#671) would never see the index — the
+        // #659 trap.
+        for (label_token, prop_key) in self.index.borrow().online_vector() {
+            let (Some(label), Some(property)) = (
+                store.token_name(Namespace::Label, label_token),
+                store.token_name(Namespace::PropKey, prop_key),
+            ) else {
+                continue;
+            };
+            builder = builder.with_label_vector(label, property);
+        }
+        for (type_token, prop_key) in self.index.borrow().online_vector_rel() {
+            let (Some(rel_type), Some(property)) = (
+                store.token_name(Namespace::RelType, type_token),
+                store.token_name(Namespace::PropKey, prop_key),
+            ) else {
+                continue;
+            };
+            builder = builder.with_rel_vector(rel_type, property);
         }
         builder.build()
     }

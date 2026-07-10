@@ -100,6 +100,14 @@ pub enum IndexKind {
     /// composite its backing B+-tree is derived/ephemeral (rebuilt from the store on open); the
     /// descriptor records only its shape for planning.
     RelComposite,
+    /// Vector (HNSW) index over a **node** embedding property, keyed `(label, embedding-property)`:
+    /// backs an approximate-nearest-neighbour (k-NN) query over a dense `f32` embedding (`rmp` task
+    /// #669). Its backing structure is a derived/ephemeral HNSW graph (`graphus_index::VectorIndex`);
+    /// the descriptor records only its shape for planning (the query planner is `rmp` #671).
+    Vector,
+    /// Vector (HNSW) index over a **relationship** embedding property, keyed `(reltype,
+    /// embedding-property)` (`rmp` task #669) — the relationship analogue of [`Vector`](Self::Vector).
+    RelVector,
 }
 
 impl IndexKind {
@@ -115,6 +123,8 @@ impl IndexKind {
             Self::Text => "text",
             Self::RelSpatial => "rel-spatial",
             Self::RelComposite => "rel-composite",
+            Self::Vector => "vector",
+            Self::RelVector => "rel-vector",
         }
     }
 }
@@ -386,6 +396,29 @@ impl IndexCatalog {
                 && d.properties.first().map(String::as_str) == Some(property)
         })
     }
+
+    /// A vector (HNSW) index on `(label, embedding-property)` usable for an approximate-nearest-neighbour
+    /// (k-NN) query over a dense embedding (`rmp` task #669). The query planner (`rmp` #671) consults
+    /// this to route a k-NN query on a labelled embedding property to a vector index seek.
+    #[must_use]
+    pub fn label_vector(&self, label: &Label, property: &str) -> Option<&IndexDescriptor> {
+        self.indexes.iter().find(|d| {
+            d.kind == IndexKind::Vector
+                && d.covers_label(&label.name)
+                && d.properties.first().map(String::as_str) == Some(property)
+        })
+    }
+
+    /// A relationship vector (HNSW) index on `(rel_type, embedding-property)` usable for a k-NN query
+    /// (`rmp` task #669) — the relationship analogue of [`label_vector`](Self::label_vector).
+    #[must_use]
+    pub fn rel_vector(&self, rel_type: &RelType, property: &str) -> Option<&IndexDescriptor> {
+        self.indexes.iter().find(|d| {
+            d.kind == IndexKind::RelVector
+                && d.covers_rel_type(&rel_type.name)
+                && d.properties.first().map(String::as_str) == Some(property)
+        })
+    }
 }
 
 /// A declarative builder for an [`IndexCatalog`] (`04 §6.6`).
@@ -528,6 +561,25 @@ impl IndexCatalogBuilder {
             IndexKind::RelComposite,
             IndexTarget::rel_type(rel_type),
             props,
+        )
+    }
+
+    /// Appends a vector (HNSW) index over `(label, embedding-property)` (`rmp` task #669).
+    pub fn with_label_vector(self, label: impl Into<String>, property: impl Into<String>) -> Self {
+        self.with_descriptor(
+            IndexKind::Vector,
+            IndexTarget::label(label),
+            vec![property.into()],
+        )
+    }
+
+    /// Appends a relationship vector (HNSW) index over `(rel_type, embedding-property)`
+    /// (`rmp` task #669).
+    pub fn with_rel_vector(self, rel_type: impl Into<String>, property: impl Into<String>) -> Self {
+        self.with_descriptor(
+            IndexKind::RelVector,
+            IndexTarget::rel_type(rel_type),
+            vec![property.into()],
         )
     }
 
