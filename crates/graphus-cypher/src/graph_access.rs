@@ -353,6 +353,33 @@ pub trait GraphAccess {
         None
     }
 
+    /// An **optional** relationship spatial proximity seek (`rmp` task #664): the **candidate**
+    /// relationship ids of `rel_type` whose point `property` lies within `radius` of the centre
+    /// `(center_x, center_y)`, projected to 2D — the relationship analogue of
+    /// [`index_seek_spatial`](Self::index_seek_spatial).
+    ///
+    /// Returns `None` when no relationship spatial index covers `(rel_type, property)` — the executor
+    /// then falls back to a typed relationship scan (the residual `distance(...) <= r` filter above the
+    /// seek restores exactness either way, and the path the off-thread reader always takes). `Some(ids)`
+    /// is a **geometric superset** the seam has **already re-checked** for visibility + current type; the
+    /// caller (the [`RelSpatialIndexSeek`](crate::physical::PhysicalOp::RelSpatialIndexSeek) operator's
+    /// residual filter) re-checks the exact `distance(...) <= radius` predicate, CRS, and current value,
+    /// and materialises each returned relationship's endpoints from its own record honouring the pattern
+    /// direction (an undirected pattern binds both orientations). RBAC composes through the
+    /// [`AuthorizedGraph`](crate::authorized_graph::AuthorizedGraph) decorator (which declines for a
+    /// restricted principal, routing to the RBAC-enforcing scan). The default returns `None` (no
+    /// relationship spatial index available).
+    fn index_seek_spatial_rel(
+        &self,
+        _rel_type: &str,
+        _property: &str,
+        _center_x: f64,
+        _center_y: f64,
+        _radius: f64,
+    ) -> Option<Vec<RelId>> {
+        None
+    }
+
     /// An **optional** text (trigram) index seek (`rmp` task #662): the **candidate** node ids of
     /// `label` whose string `property` may satisfy the `op` predicate (`CONTAINS` / `ENDS WITH` /
     /// `STARTS WITH`) against `needle`.

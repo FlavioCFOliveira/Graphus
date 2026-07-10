@@ -2404,6 +2404,42 @@ fn build_operator(
                 rows: rel_ids_to_rows(relationship, from, to, *direction, ids, ctx),
             })
         }
+        PhysicalOp::RelSpatialIndexSeek {
+            relationship,
+            from,
+            to,
+            rel_type,
+            property,
+            center_x,
+            center_y,
+            radius,
+            direction,
+            ..
+        } => {
+            // Relationship spatial proximity seek (`rmp` task #664): ask the seam for the candidate
+            // relationship ids of `rel_type` whose current point `property` is within `radius` of the
+            // constant centre (already re-checked for visibility + current type). When the seam exposes
+            // no usable relationship spatial index — the off-thread reader, or a since-dropped index —
+            // fall back to a typed relationship scan (each relationship of the type once). Either way the
+            // residual `distance(...) <op> r` filter above this operator does the exact trimming and MVCC
+            // current-value re-check, so the index-accelerated and scan paths return the identical
+            // relationship set (`rmp` task #664). Materialise each relationship's endpoints from its own
+            // record honouring the pattern direction (an undirected pattern binds both orientations),
+            // reproducing exactly the `Filter`-over-`ExpandAll`-over-`AllNodesScan` rows this seek replaced.
+            let ids = match ctx.graph.index_seek_spatial_rel(
+                &rel_type.name,
+                property,
+                *center_x,
+                *center_y,
+                *radius,
+            ) {
+                Some(ids) => ids,
+                None => rel_scan_typed_ids(&rel_type.name, ctx),
+            };
+            Ok(Operator::Buffered {
+                rows: rel_ids_to_rows(relationship, from, to, *direction, ids, ctx),
+            })
+        }
         PhysicalOp::AllRelationshipsScan {
             relationship,
             from,
@@ -3102,6 +3138,32 @@ fn rel_scan_filter_eq_ids(
                 .rel_property(inc.rel, property)
                 .is_some_and(|v| crate::equality::equals(&v, seek).is_true())
             {
+                ids.push(inc.rel);
+            }
+        }
+    }
+    ids
+}
+
+/// The scan fallback for a [`RelSpatialIndexSeek`](crate::physical::PhysicalOp::RelSpatialIndexSeek)
+/// when the seam exposes no usable relationship spatial index (the off-thread reader, or an index
+/// dropped since planning): the visible relationship ids of `rel_type`, **each id once** (`rmp` task
+/// #664).
+///
+/// Enumerates every relationship of the type from its start node (one incidence each) through the same
+/// [`scan_nodes`](crate::graph_access::GraphAccess::scan_nodes) /
+/// [`expand`](crate::graph_access::GraphAccess::expand) seam the scan-path `ExpandAll` would, so MVCC
+/// visibility and RBAC (relationship-type traversal) are applied identically. Unlike
+/// [`rel_scan_filter_eq_ids`] it applies **no** property filter — the residual `distance(...) <op> r`
+/// filter above the operator does the exact trimming, so this need only return the typed candidate set.
+/// [`rel_ids_to_rows`] then applies the pattern direction, yielding the same rows the scan path would.
+fn rel_scan_typed_ids(rel_type: &str, ctx: &Ctx<'_>) -> Vec<RelId> {
+    let types = [rel_type.to_owned()];
+    let mut seen = rustc_hash::FxHashSet::default();
+    let mut ids = Vec::new();
+    for node in ctx.graph.scan_nodes() {
+        for inc in ctx.graph.expand(node, ExpandDirection::Outgoing, &types) {
+            if seen.insert(inc.rel) {
                 ids.push(inc.rel);
             }
         }
@@ -7872,6 +7934,12 @@ fn result_columns(op: &PhysicalOp, procedures: &dyn ProcedureRegistry) -> Vec<St
             ..
         }
         | PhysicalOp::RelIndexSeek {
+            relationship,
+            from,
+            to,
+            ..
+        }
+        | PhysicalOp::RelSpatialIndexSeek {
             relationship,
             from,
             to,

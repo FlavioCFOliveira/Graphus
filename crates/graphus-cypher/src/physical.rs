@@ -623,6 +623,44 @@ pub enum PhysicalOp {
         /// The catalog index backing the seek.
         index: IndexId,
     },
+    /// **Relationship spatial (point) index proximity seek** (`rmp` task #664): the visible
+    /// relationships of `rel_type` whose current point `property` lies within `radius` of a constant
+    /// centre, served by the relationship spatial (grid) index instead of scanning **every** `:rel_type`
+    /// relationship and filtering.
+    ///
+    /// The relationship analogue of [`SpatialIndexSeek`](Self::SpatialIndexSeek), lowered from the same
+    /// standalone single-type fixed-length pattern shape as [`RelIndexSeek`](Self::RelIndexSeek)
+    /// (`MATCH ()-[r:T]-() WHERE point.distance(r.p, <const>) <= <const>`). Like the node spatial seek
+    /// the grid returns only a geometric **superset** (it buckets the 2D projection), so the exact
+    /// `distance(...) <op> radius` predicate is **always retained as a residual
+    /// [`Filter`](Self::Filter) above this operator** — the index only narrows the candidate set, never
+    /// the result. `direction` reproduces the pattern arrow's endpoint binding **and** the undirected
+    /// pattern's two-orientation semantics exactly, so the seek is bag-equivalent to the scan path. The
+    /// seek returns a **candidate** set the seam has already re-checked (visibility, current type); the
+    /// executor falls back to a typed relationship scan + residual proximity filter when the seam exposes
+    /// no usable relationship spatial index (the off-thread reader, or a since-dropped index).
+    RelSpatialIndexSeek {
+        /// The relationship variable bound by each row.
+        relationship: Var,
+        /// The source-endpoint node variable (bound per `direction`).
+        from: Var,
+        /// The target-endpoint node variable (bound per `direction`).
+        to: Var,
+        /// The single relationship type the index covers.
+        rel_type: RelType,
+        /// The indexed point property key.
+        property: String,
+        /// The constant centre's `x` coordinate (the grid's first projected axis).
+        center_x: f64,
+        /// The constant centre's `y` coordinate (the grid's second projected axis).
+        center_y: f64,
+        /// The constant proximity radius (in the property CRS's distance units).
+        radius: f64,
+        /// The arrow direction of the originating pattern (drives endpoint binding + undirected doubling).
+        direction: crate::ast::RelDirection,
+        /// The catalog index backing the seek.
+        index: IndexId,
+    },
     /// The single-row correlation argument of a join (carried through from
     /// [`Argument`](crate::logical::LogicalOp::Argument)).
     Argument {
@@ -1430,6 +1468,15 @@ impl Planner<'_> {
             return seek;
         }
 
+        // Relationship spatial (point) index seek (`rmp` task #664): a filter whose proximity predicate
+        // `distance(r.p, <const>) <= <const>` on a relationship variable sits over the same standalone
+        // single-type, fixed-length `Expand` from a bare all-nodes scan can seek the relationship spatial
+        // grid instead of scanning every `:T` relationship and filtering. Like `try_rel_index_seek` its
+        // input is an `Expand` (never a label scan), so it is disjoint from the node-oriented paths below.
+        if let Some(seek) = self.try_rel_spatial_index_seek(input, predicate, deps) {
+            return seek;
+        }
+
         // Index selection only fires directly over a label scan (the logical anchor of a labelled
         // node). Anything else: lower the input normally and keep the predicate as a residual filter.
         let LogicalOp::NodeByLabelScan { variable, label } = input else {
@@ -1719,6 +1766,89 @@ impl Planner<'_> {
         None
     }
 
+    /// Attempts to lower a `Filter` carrying a **proximity predicate on a relationship variable**
+    /// (`distance(r.p, <const>) <op> <const>`) sitting over a standalone single-type fixed-length
+    /// [`Expand`](LogicalOp::Expand) from a bare [`AllNodesScan`](LogicalOp::AllNodesScan), into a
+    /// [`RelSpatialIndexSeek`](PhysicalOp::RelSpatialIndexSeek) (`rmp` task #664) — the relationship
+    /// analogue of the node [`SpatialIndexSeek`](PhysicalOp::SpatialIndexSeek) lowering, sharing the
+    /// seek-materialisable shape check with [`try_rel_index_seek`](Self::try_rel_index_seek).
+    ///
+    /// Returns [`None`] (the caller keeps its normal paths) when the shape does not qualify, the centre
+    /// is **geographic** (a WGS-84 centre measures `distance` in metres while the grid buckets degrees —
+    /// the same soundness decline as the node seek, `rmp` #465), or no `Online` relationship spatial
+    /// index covers the `(type, property)` the predicate names. Like the node spatial seek the grid is a
+    /// superset, so **every** conjunct (the proximity predicate included) is re-attached as a residual
+    /// [`Filter`](PhysicalOp::Filter) — the executor's re-check keeps the result exact.
+    fn try_rel_spatial_index_seek(
+        &self,
+        input: &LogicalOp,
+        predicate: &Expr,
+        deps: &mut BTreeSet<IndexId>,
+    ) -> Option<PhysicalOp> {
+        let (expand, conjuncts) = fold_expand_filter_chain(input, predicate)?;
+        let LogicalOp::Expand {
+            input: exp_input,
+            from,
+            relationship,
+            to,
+            direction,
+            types,
+            range,
+            prior_rels,
+            rel_props,
+        } = expand
+        else {
+            return None;
+        };
+        // Seek-materialisable shape only (shared with `try_rel_index_seek`): fixed length, standalone,
+        // single type, bare anchor scan.
+        if range.is_some() || !prior_rels.is_empty() || rel_props.is_some() {
+            return None;
+        }
+        let [rel_type] = types.as_slice() else {
+            return None; // zero or multiple types: no single-type rel spatial index applies
+        };
+        let LogicalOp::AllNodesScan { variable: anchor } = exp_input.as_ref() else {
+            return None; // a constrained anchor (label scan / correlated Apply) is not materialisable
+        };
+        if anchor.name != from.name {
+            return None;
+        }
+        // Consume the first proximity conjunct on the relationship variable whose `(type, property)` a
+        // relationship spatial index covers; re-attach **all** conjuncts (this one included) as a
+        // residual filter (the grid is a geometric superset — the filter restores exactness).
+        for conj in conjuncts.iter() {
+            let Some(sp) = analyze_spatial_predicate(conj, &relationship.name) else {
+                continue;
+            };
+            // A geographic (WGS-84) centre measures `distance` in great-circle metres while the grid
+            // buckets the 2D projection in coordinate degrees, so the seek is unsound near the
+            // antimeridian/poles — decline and keep the exact predicate on the scan path (`rmp` #465),
+            // exactly like the node spatial seek. Sound for a Cartesian CRS (degrees == distance unit).
+            if sp.crs.is_geographic() {
+                continue;
+            }
+            let Some(idx) = self.catalog.rel_spatial(rel_type, &sp.property) else {
+                continue;
+            };
+            deps.insert(idx.id);
+            let seek = PhysicalOp::RelSpatialIndexSeek {
+                relationship: relationship.clone(),
+                from: from.clone(),
+                to: to.clone(),
+                rel_type: rel_type.clone(),
+                property: sp.property,
+                center_x: sp.center_x,
+                center_y: sp.center_y,
+                radius: sp.radius,
+                direction: *direction,
+                index: idx.id,
+            };
+            return Some(attach_residual(seek, &conjuncts));
+        }
+        None
+    }
+
     /// The catalog index that serves `pp` on `label`, if any (equality/range → property/composite).
     fn match_index<'a>(
         &'a self,
@@ -1827,6 +1957,7 @@ fn contains_read(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeTextIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::RelIndexSeek { .. }
+        | PhysicalOp::RelSpatialIndexSeek { .. }
         | PhysicalOp::ExpandAll { .. }
         | PhysicalOp::ExpandInto { .. }
         | PhysicalOp::QuantifiedPath { .. }
@@ -1899,6 +2030,7 @@ fn contains_write(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeTextIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::RelIndexSeek { .. }
+        | PhysicalOp::RelSpatialIndexSeek { .. }
         | PhysicalOp::Argument { .. }
         | PhysicalOp::Empty => false,
     }
@@ -1962,6 +2094,7 @@ fn contains_procedure_call(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeTextIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::RelIndexSeek { .. }
+        | PhysicalOp::RelSpatialIndexSeek { .. }
         | PhysicalOp::Argument { .. }
         | PhysicalOp::Empty => false,
     }
@@ -2035,6 +2168,7 @@ fn all_procedure_calls_reader_safe(
         | PhysicalOp::NodeTextIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::RelIndexSeek { .. }
+        | PhysicalOp::RelSpatialIndexSeek { .. }
         | PhysicalOp::Argument { .. }
         | PhysicalOp::Empty => true,
     }
@@ -2255,6 +2389,7 @@ fn optimize_children(op: PhysicalOp, catalog: &IndexCatalog, stats: &dyn Statist
         | PhysicalOp::NodeTextIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::RelIndexSeek { .. }
+        | PhysicalOp::RelSpatialIndexSeek { .. }
         | PhysicalOp::Argument { .. }
         | PhysicalOp::Empty => op,
 
@@ -3043,6 +3178,7 @@ fn contains_argument(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeTextIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::RelIndexSeek { .. }
+        | PhysicalOp::RelSpatialIndexSeek { .. }
         | PhysicalOp::Empty => false,
         PhysicalOp::Filter { input, .. }
         | PhysicalOp::Projection { input, .. }
@@ -3474,7 +3610,8 @@ fn gather_index_dependencies(op: &PhysicalOp, deps: &mut BTreeSet<IndexId>) {
         | PhysicalOp::NodeIndexStartsWithSeek { index, .. }
         | PhysicalOp::SpatialIndexSeek { index, .. }
         | PhysicalOp::NodeTextIndexSeek { index, .. }
-        | PhysicalOp::RelIndexSeek { index, .. } => {
+        | PhysicalOp::RelIndexSeek { index, .. }
+        | PhysicalOp::RelSpatialIndexSeek { index, .. } => {
             deps.insert(*index);
         }
         // `NodeLabelScanEq` is a full store scan (no derived index), so it declares no index dependency.
@@ -4034,6 +4171,12 @@ fn gather_bound_vars(plan: &PhysicalOp, out: &mut Vec<Var>) {
             from,
             to,
             ..
+        }
+        | PhysicalOp::RelSpatialIndexSeek {
+            relationship,
+            from,
+            to,
+            ..
         } => {
             push_unique(out, from.clone());
             push_unique(out, relationship.clone());
@@ -4325,6 +4468,24 @@ impl PhysicalOp {
                 h::arrow_left(*direction),
                 rel_type.name,
                 h::expr(value),
+                h::arrow_right(*direction),
+            ),
+            Self::RelSpatialIndexSeek {
+                relationship,
+                from,
+                to,
+                rel_type,
+                property,
+                center_x,
+                center_y,
+                radius,
+                direction,
+                index,
+            } => writeln!(
+                f,
+                "RelSpatialIndexSeek({}{relationship}:{} {property} within {radius} of ({center_x}, {center_y}) {}{to} from {from} via {index})",
+                h::arrow_left(*direction),
+                rel_type.name,
                 h::arrow_right(*direction),
             ),
             Self::Argument { arguments } => writeln!(f, "Argument({})", h::vars(arguments)),
@@ -5329,6 +5490,134 @@ mod tests {
             &catalog,
         );
         assert!(!plan.to_string().contains("SpatialIndexSeek"), "{plan}");
+    }
+
+    #[test]
+    fn relationship_proximity_lowers_to_rel_spatial_seek() {
+        // `rmp` task #664: a standalone single-type fixed-length relationship pattern with a Cartesian
+        // proximity predicate on the relationship variable, over a declared relationship spatial index,
+        // lowers to a `RelSpatialIndexSeek` — the relationship analogue of the node `SpatialIndexSeek`.
+        // The exact `distance` predicate is retained as a residual Filter (the grid is a superset).
+        let catalog = IndexCatalog::builder()
+            .with_rel_spatial("VISITED", "at")
+            .build();
+        for pattern in [
+            "()-[r:VISITED]->()",
+            "()<-[r:VISITED]-()",
+            "()-[r:VISITED]-()",
+        ] {
+            let q =
+                format!("MATCH {pattern} WHERE distance(r.at, point({{x:0, y:0}})) <= 5 RETURN r");
+            let plan = physical(&q, &catalog);
+            let rendered = plan.to_string();
+            assert!(
+                rendered.contains("RelSpatialIndexSeek"),
+                "pattern {pattern}: {rendered}"
+            );
+            // The exact predicate is re-checked above the seek (never dropped), and the whole
+            // Filter-over-Expand-over-AllNodesScan subtree is replaced (no bare AllNodesScan anchor).
+            assert!(rendered.contains("Filter"), "{rendered}");
+            assert!(rendered.contains("distance"), "{rendered}");
+            assert!(!rendered.contains("ExpandAll"), "{rendered}");
+            assert_eq!(plan.index_dependencies().count(), 1);
+        }
+        // The namespaced spelling + symmetric argument order also drive the seek.
+        let plan = physical(
+            "MATCH ()-[r:VISITED]-() WHERE point.distance(point({x:0, y:0}), r.at) < 3 RETURN r",
+            &catalog,
+        );
+        assert!(plan.to_string().contains("RelSpatialIndexSeek"), "{plan}");
+    }
+
+    #[test]
+    fn relationship_proximity_without_index_stays_scan_filter() {
+        // `rmp` task #664: without a relationship spatial index the proximity predicate stays a residual
+        // Filter over the Expand — never a `RelSpatialIndexSeek`. (A relationship-PROPERTY index on the
+        // same key does NOT make it a spatial seek either.)
+        for catalog in [
+            IndexCatalog::empty(),
+            IndexCatalog::builder()
+                .with_rel_property("VISITED", "at")
+                .build(),
+        ] {
+            let plan = physical(
+                "MATCH ()-[r:VISITED]-() WHERE distance(r.at, point({x:0, y:0})) < 5 RETURN r",
+                &catalog,
+            );
+            let rendered = plan.to_string();
+            assert!(!rendered.contains("RelSpatialIndexSeek"), "{rendered}");
+            assert!(rendered.contains("ExpandAll"), "{rendered}");
+            assert!(rendered.contains("Filter"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn relationship_proximity_on_geographic_crs_declines_the_seek() {
+        // `rmp` #664 / #465: a geographic (WGS-84) centre measures `distance` in metres while the grid
+        // buckets degrees, so the relationship spatial seek MUST decline for a geographic centre (exactly
+        // like the node seek) and keep the exact predicate on the scan path. The Cartesian sibling over
+        // the same indexed key MUST still use the seek (contrast).
+        let catalog = IndexCatalog::builder()
+            .with_rel_spatial("VISITED", "at")
+            .build();
+        let geo = physical(
+            "MATCH ()-[r:VISITED]-() WHERE distance(r.at, point({longitude:0, latitude:0})) < 5 RETURN r",
+            &catalog,
+        );
+        let geo_s = geo.to_string();
+        assert!(
+            !geo_s.contains("RelSpatialIndexSeek"),
+            "geographic: {geo_s}"
+        );
+        assert!(geo_s.contains("ExpandAll"), "{geo_s}");
+        assert_eq!(geo.index_dependencies().count(), 0);
+        let cart = physical(
+            "MATCH ()-[r:VISITED]-() WHERE distance(r.at, point({x:0, y:0})) < 5 RETURN r",
+            &catalog,
+        );
+        assert!(
+            cart.to_string().contains("RelSpatialIndexSeek"),
+            "Cartesian: {cart}"
+        );
+    }
+
+    #[test]
+    fn relationship_proximity_bbox_and_multi_type_and_labeled_anchor_decline() {
+        // `rmp` task #664: shapes that do NOT lower to a relationship spatial seek — a `point.withinBBox`
+        // predicate (the grid seek serves only upper-bounded `distance`, exactly like the node seek), a
+        // multi-type pattern (no single-type index), and a label-constrained anchor (not a bare
+        // AllNodesScan) — each keep the scan + filter.
+        let catalog = IndexCatalog::builder()
+            .with_rel_spatial("VISITED", "at")
+            .build();
+        // bbox: not an upper-bounded distance, so it stays scan + filter.
+        let bbox = physical(
+            "MATCH ()-[r:VISITED]-() \
+             WHERE point.withinBBox(r.at, point({x:0, y:0}), point({x:9, y:9})) RETURN r",
+            &catalog,
+        );
+        assert!(
+            !bbox.to_string().contains("RelSpatialIndexSeek"),
+            "bbox: {bbox}"
+        );
+        // multi-type: no single-type relationship spatial index applies.
+        let multi = physical(
+            "MATCH ()-[r:VISITED|RATED]-() WHERE distance(r.at, point({x:0, y:0})) < 5 RETURN r",
+            &catalog,
+        );
+        assert!(
+            !multi.to_string().contains("RelSpatialIndexSeek"),
+            "multi-type: {multi}"
+        );
+        // labeled anchor: the anchor lowers to a NodeByLabelScan, not a bare AllNodesScan.
+        let labeled = physical(
+            "MATCH (a:P)-[r:VISITED]-() WHERE distance(r.at, point({x:0, y:0})) < 5 RETURN r",
+            &catalog,
+        );
+        assert!(
+            !labeled.to_string().contains("RelSpatialIndexSeek"),
+            "labeled anchor: {labeled}"
+        );
     }
 
     #[test]

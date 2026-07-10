@@ -581,13 +581,14 @@ fn walk_physical(op: &PhysicalOp, record: &mut impl FnMut(&str, ParamType)) {
         }
 
         // ---- leaves with no expressions -----------------------------------------------------
-        // `SpatialIndexSeek`'s centre and radius are plan-time-folded `f64` constants (never
-        // `$param`s — a non-constant proximity predicate is declined by the planner), so it carries
-        // no parameter references (`rmp` task #73).
+        // `SpatialIndexSeek` / `RelSpatialIndexSeek`'s centre and radius are plan-time-folded `f64`
+        // constants (never `$param`s — a non-constant proximity predicate is declined by the planner),
+        // so they carry no parameter references (`rmp` tasks #73, #664).
         PhysicalOp::AllNodesScan { .. }
         | PhysicalOp::NodeByLabelScan { .. }
         | PhysicalOp::TokenLookupScan { .. }
         | PhysicalOp::SpatialIndexSeek { .. }
+        | PhysicalOp::RelSpatialIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::Argument { .. }
         | PhysicalOp::Empty => {}

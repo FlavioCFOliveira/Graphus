@@ -97,7 +97,7 @@ use std::sync::Arc;
 
 use graphus_auth::{AuthError, Privilege};
 use graphus_core::{GraphusError, Value};
-use graphus_cypher::FulltextEntity;
+use graphus_cypher::{FulltextEntity, SpatialEntity};
 use tokio::runtime::Handle;
 
 use crate::audit::{
@@ -1716,10 +1716,12 @@ fn parse_claimed_point(verb: &str, lex: &mut Lexer<'_>) -> Result<IndexCommand, 
             // EXISTS` follows the (optional) name, before the `FOR` clause (Neo4j position).
             let explicit_name = parse_optional_point_index_name(lex)?;
             let if_not_exists = parse_optional_if(lex, /* with_not */ true)?;
-            let (label, property) = parse_point_create_tail(lex)?;
-            let name = explicit_name.unwrap_or_else(|| auto_point_index_name(&label, &property));
+            let (entity, label, property) = parse_point_create_tail(lex)?;
+            let name =
+                explicit_name.unwrap_or_else(|| auto_point_index_name(entity, &label, &property));
             Ok(IndexCommand::CreatePointIndex {
                 name,
+                entity,
                 label,
                 property,
                 if_not_exists,
@@ -1747,26 +1749,32 @@ fn parse_optional_point_index_name(lex: &mut Lexer<'_>) -> Result<Option<String>
     Ok(Some(expect_name(lex, "a point index name", "POINT")?))
 }
 
-/// A deterministic auto-name for an anonymous point index on `(label, property)` (`rmp` #661),
-/// `point_index_<label>_<property>` — so a repeated anonymous `CREATE POINT INDEX … IF NOT EXISTS`
-/// resolves to the same name (idempotent) and `SHOW INDEXES` reports a stable name. A cross-catalog
-/// name collision is caught by the engine's global name-uniqueness check.
-fn auto_point_index_name(label: &str, property: &str) -> String {
-    format!("point_index_{label}_{property}")
+/// A deterministic auto-name for an anonymous point index on `(entity, label_or_type, property)`
+/// (`rmp` tasks #661, #664), `point_index_<label>_<property>` for a node index and
+/// `point_index_rel_<type>_<property>` for a relationship index (the `rel_` infix keeps a node and a
+/// relationship point index over numerically-colliding tokens from auto-naming to the same string) — so
+/// a repeated anonymous `CREATE POINT INDEX … IF NOT EXISTS` resolves to the same name (idempotent) and
+/// `SHOW INDEXES` reports a stable name. A cross-catalog name collision is caught by the engine's global
+/// name-uniqueness check.
+fn auto_point_index_name(entity: SpatialEntity, label_or_type: &str, property: &str) -> String {
+    if entity.is_relationship() {
+        format!("point_index_rel_{label_or_type}_{property}")
+    } else {
+        format!("point_index_{label_or_type}_{property}")
+    }
 }
 
-/// Parses the `FOR (<var>:<Label>) ON (<var>.<property>)` tail of a `CREATE POINT INDEX <name>`
-/// statement (`rmp` task #98). Returns `(label, property)`. Mirrors the openCypher-9 node-property
-/// `FOR … ON …` shape (a single property), reusing [`parse_property_ref`] for the property reference.
-fn parse_point_create_tail(lex: &mut Lexer<'_>) -> Result<(String, String), String> {
+/// Parses the `FOR (<var>:<Label>) ON (<var>.<property>)` (node) or
+/// `FOR ()-[<var>:<Type>]-() ON (<var>.<property>)` (relationship) tail of a `CREATE POINT INDEX <name>`
+/// statement (`rmp` tasks #98, #664). Returns `(entity, label_or_type, property)`. Mirrors the
+/// openCypher node-property `FOR … ON …` shape (a single property, single label/type), reusing
+/// [`parse_property_ref`]. Like the full-text and constraint surfaces, only the **undirected**
+/// relationship form is accepted (a directed `->` / `<-` arrow is a syntax error).
+fn parse_point_create_tail(lex: &mut Lexer<'_>) -> Result<(SpatialEntity, String, String), String> {
     const VERB: &str = "POINT";
-    // FOR ( <var> : <Label> )
+    // FOR <node or relationship pattern>
     expect_keyword(lex, "FOR", VERB)?;
-    expect_symbol(lex, '(', VERB)?;
-    let _var = expect_word(lex, "a variable", VERB)?;
-    expect_symbol(lex, ':', VERB)?;
-    let label = expect_name(lex, "a label", VERB)?;
-    expect_symbol(lex, ')', VERB)?;
+    let (entity, label_or_type) = parse_point_pattern(lex)?;
     // ON ( <var>.<property> )
     expect_keyword(lex, "ON", VERB)?;
     expect_symbol(lex, '(', VERB)?;
@@ -1777,7 +1785,38 @@ fn parse_point_create_tail(lex: &mut Lexer<'_>) -> Result<(String, String), Stri
     // — a follow-up; the clause must nonetheless parse without error for Neo4j-DDL compatibility).
     parse_optional_index_options(lex)?;
     expect_end(lex, "CREATE POINT INDEX")?;
-    Ok((label, property))
+    Ok((entity, label_or_type, property))
+}
+
+/// Parses a point index `FOR` pattern (`rmp` task #664): a node pattern `(<var>:<Label>)` or an
+/// undirected relationship pattern `()-[<var>:<Type>]-()`, returning the [`SpatialEntity`] and the
+/// single covered label/type. Unlike the full-text pattern a point index covers a **single** label/type
+/// (no `A|B` union). A directed relationship arrow (`->` / `<-`) is a syntax error (only the undirected
+/// form is accepted, like the full-text / constraint surfaces). Mirrors [`parse_fulltext_pattern`].
+fn parse_point_pattern(lex: &mut Lexer<'_>) -> Result<(SpatialEntity, String), String> {
+    const VERB: &str = "POINT";
+    expect_symbol(lex, '(', VERB)?;
+    // A relationship pattern opens with an empty node `()`.
+    if peek_symbol(lex, ')')? {
+        // ()-[ <var> : <Type> ]-()
+        expect_symbol(lex, ')', VERB)?; // close the empty start node
+        expect_dash(lex, VERB)?;
+        expect_symbol(lex, '[', VERB)?;
+        let _var = expect_word(lex, "a variable", VERB)?;
+        expect_symbol(lex, ':', VERB)?;
+        let rel_type = expect_name(lex, "a relationship type", VERB)?;
+        expect_symbol(lex, ']', VERB)?;
+        expect_dash(lex, VERB)?;
+        expect_symbol(lex, '(', VERB)?;
+        expect_symbol(lex, ')', VERB)?;
+        return Ok((SpatialEntity::Relationship, rel_type));
+    }
+    // (<var> : <Label>)
+    let _var = expect_word(lex, "a variable", VERB)?;
+    expect_symbol(lex, ':', VERB)?;
+    let label = expect_name(lex, "a label", VERB)?;
+    expect_symbol(lex, ')', VERB)?;
+    Ok((SpatialEntity::Node, label))
 }
 
 /// Parses the remainder of a claimed **constraint** statement (`verb` + `CONSTRAINT`/`CONSTRAINTS`
@@ -5597,6 +5636,7 @@ mod tests {
             index_cmd("CREATE POINT INDEX by_loc FOR (n:City) ON (n.location)"),
             IndexCommand::CreatePointIndex {
                 name: "by_loc".to_owned(),
+                entity: SpatialEntity::Node,
                 label: "City".to_owned(),
                 property: "location".to_owned(),
                 if_not_exists: false,
@@ -5607,6 +5647,7 @@ mod tests {
             index_cmd("  create   point index  near  for ( p : Place ) on ( p.geo ) ;"),
             IndexCommand::CreatePointIndex {
                 name: "near".to_owned(),
+                entity: SpatialEntity::Node,
                 label: "Place".to_owned(),
                 property: "geo".to_owned(),
                 if_not_exists: false,
@@ -5617,11 +5658,42 @@ mod tests {
             index_cmd("CREATE POINT INDEX `INDEX` FOR (n:`Order`) ON (n.`from`)"),
             IndexCommand::CreatePointIndex {
                 name: "INDEX".to_owned(),
+                entity: SpatialEntity::Node,
                 label: "Order".to_owned(),
                 property: "from".to_owned(),
                 if_not_exists: false,
             }
         );
+    }
+
+    #[test]
+    fn create_point_index_relationship_form() {
+        // `rmp` task #664: the undirected relationship pattern `FOR ()-[r:T]-() ON (r.p)` yields a
+        // relationship point index (entity Relationship, the covered token is a rel type).
+        assert_eq!(
+            index_cmd("CREATE POINT INDEX rel_at FOR ()-[r:VISITED]-() ON (r.at)"),
+            IndexCommand::CreatePointIndex {
+                name: "rel_at".to_owned(),
+                entity: SpatialEntity::Relationship,
+                label: "VISITED".to_owned(),
+                property: "at".to_owned(),
+                if_not_exists: false,
+            }
+        );
+        // An anonymous relationship point index auto-names with the `rel_` infix, keeping it distinct
+        // from a node index over the same-named token.
+        assert_eq!(
+            index_cmd("CREATE POINT INDEX FOR ()-[r:VISITED]-() ON (r.at)"),
+            IndexCommand::CreatePointIndex {
+                name: "point_index_rel_VISITED_at".to_owned(),
+                entity: SpatialEntity::Relationship,
+                label: "VISITED".to_owned(),
+                property: "at".to_owned(),
+                if_not_exists: false,
+            }
+        );
+        // A directed arrow is a syntax error (only the undirected form is accepted, like FULLTEXT).
+        invalid("CREATE POINT INDEX rel_at FOR ()-[r:VISITED]->() ON (r.at)");
     }
 
     #[test]
@@ -5719,6 +5791,7 @@ mod tests {
             ),
             IndexCommand::CreatePointIndex {
                 name: "by_loc".to_owned(),
+                entity: SpatialEntity::Node,
                 label: "City".to_owned(),
                 property: "loc".to_owned(),
                 if_not_exists: false,
@@ -5777,6 +5850,7 @@ mod tests {
             index_cmd("CREATE POINT INDEX p IF NOT EXISTS FOR (n:City) ON (n.loc)"),
             IndexCommand::CreatePointIndex {
                 name: "p".to_owned(),
+                entity: SpatialEntity::Node,
                 label: "City".to_owned(),
                 property: "loc".to_owned(),
                 if_not_exists: true,
@@ -5817,6 +5891,7 @@ mod tests {
             index_cmd("CREATE POINT INDEX FOR (n:City) ON (n.loc)"),
             IndexCommand::CreatePointIndex {
                 name: "point_index_City_loc".to_owned(),
+                entity: SpatialEntity::Node,
                 label: "City".to_owned(),
                 property: "loc".to_owned(),
                 if_not_exists: false,
@@ -5826,6 +5901,7 @@ mod tests {
             index_cmd("CREATE POINT INDEX IF NOT EXISTS FOR (n:City) ON (n.loc)"),
             IndexCommand::CreatePointIndex {
                 name: "point_index_City_loc".to_owned(),
+                entity: SpatialEntity::Node,
                 label: "City".to_owned(),
                 property: "loc".to_owned(),
                 if_not_exists: true,

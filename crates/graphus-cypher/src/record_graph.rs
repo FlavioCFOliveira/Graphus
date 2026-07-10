@@ -1472,12 +1472,16 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             return; // standalone path: no derived index to maintain.
         };
         // O(1) gate: nothing to maintain unless at least one relationship-property OR relationship
-        // full-text index is declared.
-        let (has_rel_prop, has_rel_ft) = {
+        // full-text OR relationship spatial index is declared.
+        let (has_rel_prop, has_rel_ft, has_rel_spatial) = {
             let idx = index.borrow();
-            (idx.has_any_rel_property(), idx.has_any_fulltext_rel())
+            (
+                idx.has_any_rel_property(),
+                idx.has_any_fulltext_rel(),
+                idx.has_any_spatial_rel(),
+            )
         };
-        if !has_rel_prop && !has_rel_ft {
+        if !has_rel_prop && !has_rel_ft && !has_rel_spatial {
             return;
         }
         // The relationship's current type token (store borrow released before the index borrow).
@@ -1522,13 +1526,39 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 }
             }
         }
+        // Relationship spatial (point) indexes (`rmp` task #664) are maintained per-write the same
+        // wholesale way as the node spatial index (`reindex_node`): for every registered relationship
+        // spatial index `(type_token, prop_key)`, if this relationship currently carries the covered
+        // type AND has a point value for the covered property, that point is (re)inserted into the grid;
+        // in every other case (a different type, the property absent, or it is no longer a point) the
+        // relationship is removed from the grid so a seek never sees a phantom. The grid is keyed by rel
+        // id, so a removed/changed point must not linger.
+        if has_rel_spatial {
+            for (reg_type, prop_key) in index.registered_spatial_rel() {
+                let point = (reg_type == type_token)
+                    .then(|| {
+                        resolved
+                            .iter()
+                            .find(|(k, v)| *k == prop_key && matches!(v, Value::Point(_)))
+                            .map(|(_, v)| v)
+                    })
+                    .flatten();
+                match point {
+                    Some(value) => index.insert_spatial_rel_point(reg_type, prop_key, value, rel.0),
+                    None => index.remove_spatial_rel_point(reg_type, prop_key, rel.0),
+                }
+            }
+        }
         if has_rel_ft {
             // Wholesale per-relationship re-index of every covering relationship full-text index; sets
             // the shared full-text/spatial dirty flag if a posting changed.
             index.reindex_fulltext_rel(rel.0, type_token, &string_props);
+        }
+        if has_rel_ft || has_rel_spatial {
             // Record THIS transaction as a full-text/spatial mutator if a posting changed (`rmp` #467,
             // shared marker) — exactly as `reindex_node` does — so a concurrent stale reader of this
-            // relationship full-text index declines to the correct scan path until the txn retires.
+            // relationship full-text / spatial index declines to the correct scan path until the txn
+            // retires.
             let _ = index.note_ft_spatial_mutator(self.txn);
         }
     }
@@ -3567,6 +3597,64 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         out.sort_unstable();
         out.dedup();
         Some(out)
+    }
+
+    fn index_seek_spatial_rel(
+        &self,
+        rel_type: &str,
+        property: &str,
+        center_x: f64,
+        center_y: f64,
+        radius: f64,
+    ) -> Option<Vec<RelId>> {
+        // Only the coordinated path holds the derived `IndexSet` with the relationship spatial grid;
+        // otherwise the executor falls back to a typed relationship scan + residual proximity filter
+        // (`rmp` task #664). The relationship analogue of [`index_seek_spatial`](Self::index_seek_spatial).
+        let index = self.index.as_ref()?;
+        // Resolve the type + property tokens; a missing token means no relationship of this
+        // type/property is indexable, so decline (the executor's typed scan covers it).
+        let type_token = self.store.borrow().token_id(Namespace::RelType, rel_type)?;
+        let prop_key = self.store.borrow().token_id(Namespace::PropKey, property)?;
+        if !index.borrow().has_spatial_rel(type_token, prop_key) {
+            return None; // no usable relationship spatial index: scan fallback
+        }
+
+        // Cross-snapshot freshness gate (`rmp` task #467): if this reader's MVCC snapshot PREDATES the
+        // last committed (or any in-flight / rolled-back) full-text/spatial mutation, the grid may have
+        // been re-keyed by a writer this snapshot cannot see and could return a strict SUBSET of this
+        // snapshot's matches (a false negative the residual `distance(...) <= r` re-check cannot repair).
+        // Decline to the scan fallback: the executor's typed relationship scan re-reads each
+        // relationship's SNAPSHOT-visible coordinate via MVCC `rel_property`, which is correct for this
+        // stale reader. The early return is BEFORE `mark_all_live_rels()`, so the scan fallback owns the
+        // SSI footprint exactly once (no double-marking).
+        if self.snapshot.ts < index.borrow().effective_ft_spatial_marker() {
+            return None;
+        }
+
+        // SSI predicate footprint: an indexed proximity seek replaces the typed-relationship scan +
+        // filter fallback (which read every relationship of the type). Preserve that exact read footprint
+        // so the index path and the scan fallback are indistinguishable to SSI (`04 §5.4`), exactly as
+        // `rel_index_seek_eq` does.
+        self.mark_all_live_rels();
+
+        // Candidate relationship ids whose point lies within the radius of the centre's 2D projection — a
+        // geometric superset (the grid buckets by `(x, y)`). The residual `distance(...) <= r` filter
+        // re-checks the exact predicate, CRS, current value, and visibility per candidate, so this need
+        // only narrow to relationships that currently carry the covered type (each candidate re-read via
+        // `rel_data`, which also SIREAD-marks it and drops a no-longer-visible relationship).
+        let candidates = index
+            .borrow()
+            .seek_spatial_rel_within(type_token, prop_key, center_x, center_y, radius)
+            .unwrap_or_default();
+        let mut out: Vec<u64> = candidates
+            .into_iter()
+            .filter(
+                |&id| matches!(self.rel_data(RelId(id)), Some(data) if data.rel_type == rel_type),
+            )
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        Some(out.into_iter().map(RelId).collect())
     }
 
     fn index_seek_text(

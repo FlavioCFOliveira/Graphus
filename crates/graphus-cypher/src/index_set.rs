@@ -121,6 +121,14 @@ pub struct IndexSet {
     /// carries the build state and the in-memory [`SpatialIndex`] grid over the covered point
     /// property. Ephemeral and rebuilt on open, exactly like the property and full-text indexes.
     spatial: HashMap<(u32, u32), SpatialEntry>,
+    /// Declared **relationship** spatial indexes (`rmp` task #664), keyed by `(type_token, prop_key)` —
+    /// the relationship analogue of [`spatial`](Self#structfield.spatial). Each value carries the build
+    /// state and the in-memory [`SpatialIndex`] grid whose postings are **relationship** ids (the grid is
+    /// already `u64`-generic, exactly as the rel-keyed [`InvertedIndex`] is). Kept in a separate map from
+    /// the node spatial indexes (a numeric collision between a label token and a rel-type token never
+    /// mixes the two), exactly as `fulltext_rel` is separate from `fulltext`. Ephemeral, rebuilt on open;
+    /// only the *registration* is durable.
+    spatial_rel: HashMap<(u32, u32), SpatialEntry>,
     /// Declared **text (trigram)** indexes (`rmp` task #662), keyed by `(label_token, prop_key)`. Each
     /// value carries the build state and the in-memory [`TrigramIndex`] over the covered string
     /// property, accelerating `CONTAINS` / `ENDS WITH` / `STARTS WITH`. Ephemeral and rebuilt on open,
@@ -339,6 +347,7 @@ impl IndexSet {
             fulltext: HashMap::new(),
             fulltext_rel: HashMap::new(),
             spatial: HashMap::new(),
+            spatial_rel: HashMap::new(),
             text: HashMap::new(),
             constraints: HashMap::new(),
             composite: HashMap::new(),
@@ -611,6 +620,11 @@ impl IndexSet {
         }
         // Spatial indexes: clear the grid entries, keep the registration + state (`rmp` task #73).
         for sp in self.spatial.values_mut() {
+            sp.index.clear();
+        }
+        // Relationship spatial indexes (`rmp` task #664): clear the rel-keyed grid entries but keep the
+        // registration + state, exactly like the node spatial indexes above.
+        for sp in self.spatial_rel.values_mut() {
             sp.index.clear();
         }
         // Text (trigram) indexes: clear the trigram entries, keep the registration + state
@@ -1530,6 +1544,141 @@ impl IndexSet {
     ) -> Option<Vec<u64>> {
         let sp = self.spatial.get(&(label_token, prop_key))?;
         Some(sp.index.query_bbox(min_x, max_x, min_y, max_y))
+    }
+
+    // ============================================================================================
+    // Relationship spatial indexes (`rmp` task #664)
+    // ============================================================================================
+
+    /// Declares a **relationship** spatial index on `(type_token, prop_key)` at `state` with `cell_size`
+    /// (`rmp` task #664) — the relationship analogue of [`register_spatial`](Self::register_spatial).
+    /// Idempotent on the key: if one is already registered its grid is kept but its state is updated
+    /// (so a recovered `Online` declaration promotes a freshly-created entry); otherwise a fresh grid is
+    /// created.
+    pub fn register_spatial_rel(
+        &mut self,
+        type_token: u32,
+        prop_key: u32,
+        cell_size: f64,
+        state: IndexState,
+    ) {
+        self.spatial_rel
+            .entry((type_token, prop_key))
+            .and_modify(|sp| sp.state = state)
+            .or_insert_with(|| SpatialEntry {
+                state,
+                index: SpatialIndex::new(cell_size),
+            });
+    }
+
+    /// Sets the build [`IndexState`] of the `(type_token, prop_key)` relationship spatial index
+    /// (`rmp` task #664). A no-op if no such index is registered.
+    pub fn set_spatial_rel_state(&mut self, type_token: u32, prop_key: u32, state: IndexState) {
+        if let Some(sp) = self.spatial_rel.get_mut(&(type_token, prop_key)) {
+            sp.state = state;
+        }
+    }
+
+    /// Unregisters the relationship spatial index on `(type_token, prop_key)`, dropping its grid
+    /// (`rmp` task #664, `DROP INDEX`). A no-op if no such index is registered.
+    pub fn unregister_spatial_rel(&mut self, type_token: u32, prop_key: u32) {
+        self.spatial_rel.remove(&(type_token, prop_key));
+    }
+
+    /// Whether a relationship spatial index is registered for `(type_token, prop_key)` (in any state).
+    #[must_use]
+    pub fn has_spatial_rel(&self, type_token: u32, prop_key: u32) -> bool {
+        self.spatial_rel.contains_key(&(type_token, prop_key))
+    }
+
+    /// Whether **any** relationship spatial index is registered (`rmp` task #664). The O(1) gate the
+    /// write path uses to skip relationship spatial maintenance when none is declared.
+    #[must_use]
+    pub fn has_any_spatial_rel(&self) -> bool {
+        !self.spatial_rel.is_empty()
+    }
+
+    /// The build [`IndexState`] of the `(type_token, prop_key)` relationship spatial index, or [`None`]
+    /// if unregistered.
+    #[must_use]
+    pub fn spatial_rel_state(&self, type_token: u32, prop_key: u32) -> Option<IndexState> {
+        self.spatial_rel
+            .get(&(type_token, prop_key))
+            .map(|sp| sp.state)
+    }
+
+    /// The registered relationship spatial index keys `(type_token, prop_key)` in any state, ascending.
+    /// Used by the coordinator's rebuild to know which relationship point properties to (re-)index.
+    #[must_use]
+    pub fn registered_spatial_rel(&self) -> Vec<(u32, u32)> {
+        let mut keys: Vec<(u32, u32)> = self.spatial_rel.keys().copied().collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// The **`Online`** relationship spatial index keys `(type_token, prop_key)`, ascending. Used to
+    /// build the planner's catalog: only an `Online` relationship spatial index may serve a proximity
+    /// seek.
+    #[must_use]
+    pub fn online_spatial_rel(&self) -> Vec<(u32, u32)> {
+        let mut keys: Vec<(u32, u32)> = self
+            .spatial_rel
+            .iter()
+            .filter(|(_, sp)| sp.state == IndexState::Online)
+            .map(|(&key, _)| key)
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// Records that relationship `rel_id` has point `value` for the `(type_token, prop_key)` relationship
+    /// spatial index, if such an index is registered (else a no-op) — the relationship analogue of
+    /// [`insert_spatial_point`](Self::insert_spatial_point). A non-point `value` drops the stale grid
+    /// entry. Maintained regardless of state.
+    pub fn insert_spatial_rel_point(
+        &mut self,
+        type_token: u32,
+        prop_key: u32,
+        value: &Value,
+        rel_id: u64,
+    ) {
+        if let Some(sp) = self.spatial_rel.get_mut(&(type_token, prop_key)) {
+            if let Value::Point(p) = value {
+                sp.index.index_point(rel_id, *p);
+                self.ft_spatial_dirty = true;
+            } else if sp.index.remove(rel_id) {
+                self.ft_spatial_dirty = true;
+            }
+        }
+    }
+
+    /// Removes `rel_id` from the `(type_token, prop_key)` relationship spatial index (a delete, a type
+    /// change, or a relationship that lost the covered point property) — the relationship analogue of
+    /// [`remove_spatial_point`](Self::remove_spatial_point). A no-op if no such index is registered.
+    pub fn remove_spatial_rel_point(&mut self, type_token: u32, prop_key: u32, rel_id: u64) {
+        if let Some(sp) = self.spatial_rel.get_mut(&(type_token, prop_key)) {
+            if sp.index.remove(rel_id) {
+                self.ft_spatial_dirty = true;
+            }
+        }
+    }
+
+    /// Candidate relationship ids whose `(type_token, prop_key)` point lies within `radius` of
+    /// `(center_x, center_y)`, ascending (`rmp` task #664). `None` if no such index is registered;
+    /// otherwise a **geometric superset** — the caller re-checks visibility, current type, current value,
+    /// CRS, and the exact `distance(loc, center) <= radius` predicate. The relationship analogue of
+    /// [`seek_spatial_within`](Self::seek_spatial_within).
+    #[must_use]
+    pub fn seek_spatial_rel_within(
+        &self,
+        type_token: u32,
+        prop_key: u32,
+        center_x: f64,
+        center_y: f64,
+        radius: f64,
+    ) -> Option<Vec<u64>> {
+        let sp = self.spatial_rel.get(&(type_token, prop_key))?;
+        Some(sp.index.query_within(center_x, center_y, radius))
     }
 
     // ============================================================================================

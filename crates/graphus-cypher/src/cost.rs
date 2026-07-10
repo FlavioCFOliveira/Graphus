@@ -354,6 +354,25 @@ pub fn estimate_cost(op: &PhysicalOp, stats: Option<&dyn Statistics>) -> CostEst
             CostEstimate::new(rows, COST_SEEK_SETUP + rows * COST_SEEK_PER_ROW)
         }
 
+        // A relationship spatial proximity seek (`rmp` task #664): the grid returns a geometric superset
+        // of the matching relationships, so — absent per-type relationship spatial statistics — estimate
+        // its candidate count with the same constant predicate-selectivity a `rel-scan + filter` would
+        // use over the single covered type, plus the seek setup and a cheap per-candidate stream, and —
+        // like the relationship-property seek — double it for an undirected pattern (each relationship
+        // surfaces twice). The residual `distance` filter above trims the superset to the exact result.
+        PhysicalOp::RelSpatialIndexSeek {
+            rel_type,
+            direction,
+            ..
+        } => {
+            let type_slice = std::slice::from_ref(rel_type);
+            let mut rows = rel_scan_rows(type_slice, stats) * DEFAULT_PREDICATE_SELECTIVITY;
+            if matches!(direction, crate::ast::RelDirection::Undirected) {
+                rows *= 2.0;
+            }
+            CostEstimate::new(rows, COST_SEEK_SETUP + rows * COST_SEEK_PER_ROW)
+        }
+
         // The correlated-apply argument leaf is a single row, produced for free (it is the outer row
         // handed in).
         PhysicalOp::Argument { .. } => CostEstimate::new(1.0, 0.0),

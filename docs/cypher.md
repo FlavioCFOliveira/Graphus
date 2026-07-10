@@ -508,6 +508,21 @@ synchronous builds, so the clause is validated and accepted but not applied (exc
 `IF NOT EXISTS` / `IF EXISTS`, an anonymous (auto-named) `POINT` index, and dropping any kind by the
 unified `DROP INDEX <name>` — see [indexes.md](indexes.md).
 
+Point (spatial) indexes cover **nodes** (`FOR (n:L) ON (n.p)`) or **relationships**
+(`FOR ()-[r:T]-() ON (r.p)`, undirected only), and serve an upper-bounded Cartesian proximity filter as
+a planner seek instead of a scan:
+
+```cypher
+CREATE POINT INDEX by_loc FOR (c:City) ON (c.location)
+CREATE POINT INDEX rel_at FOR ()-[r:VISITED]-() ON (r.at)
+MATCH (c:City)         WHERE distance(c.location, point({x:0, y:0})) <= 5 RETURN c   -- node seek
+MATCH ()-[r:VISITED]-() WHERE distance(r.at,       point({x:0, y:0})) <= 5 RETURN r   -- rel  seek
+```
+
+The exact `distance` predicate is always re-checked above the seek (the grid returns a superset), a
+geographic (WGS-84) centre or a `point.withinBBox(…)` predicate falls back to a scan, and without a
+matching point index the query stays a scan + filter — always correct, never index-required.
+
 Full-text indexes cover **nodes** (`FOR (n:A|B)`) or **relationships** (`FOR ()-[r:T|U]-()`), each over
 one or more labels/types (Neo4j's `A|B` syntax — a node/relationship of **any** covered label/type is
 indexed) and searched by the two full-text procedures, which return the matching entity as a structural

@@ -577,3 +577,151 @@ fn drop_index_by_name_resolves_point() {
     );
     assert!(coord.list_point_indexes().is_empty());
 }
+
+// =================================================================================================
+// Relationship point index (`rmp` task #664)
+// =================================================================================================
+
+fn plan_uses_rel_spatial_seek(plan: &PhysicalPlan) -> bool {
+    fn walk(op: &PhysicalOp) -> bool {
+        if matches!(op, PhysicalOp::RelSpatialIndexSeek { .. }) {
+            return true;
+        }
+        children(op).iter().any(|c| walk(c))
+    }
+    walk(&plan.root)
+}
+
+/// The sorted `(id(a), id(r), id(b))` triples a relationship proximity `src` returns over `catalog`.
+/// Includes orientation in the identity so an undirected pattern's two orientations (and a self-loop's
+/// single row) are compared exactly (`rmp` task #664).
+fn rel_triples(coord: &mut Coord, catalog: &IndexCatalog, src: &str) -> Vec<(i64, i64, i64)> {
+    let plan = compile(src, catalog);
+    let txn = coord.begin_serializable();
+    let rows = run_plan(coord, txn, &plan);
+    coord.commit(txn).expect("read commits");
+    let int = |row: &Row, col: &str| match row.value(col) {
+        Value::Integer(i) => i,
+        other => panic!("expected an integer for {col}, got {other:?}"),
+    };
+    let mut triples: Vec<(i64, i64, i64)> = rows
+        .iter()
+        .map(|r| (int(r, "a"), int(r, "r"), int(r, "b")))
+        .collect();
+    triples.sort_unstable();
+    triples
+}
+
+/// A relationship proximity query over `:VISITED.at` (Cartesian) within `r`, spelled with the given
+/// pattern `arrow` (`""` undirected, `"->"` directed), returning the endpoint + rel ids.
+fn rel_proximity(arrow: &str, cx: f64, cy: f64, r: f64) -> String {
+    let pattern = if arrow == "->" {
+        "(a)-[rel:VISITED]->(b)"
+    } else {
+        "(a)-[rel:VISITED]-(b)"
+    };
+    format!(
+        "MATCH {pattern} \
+         WHERE distance(rel.at, point({{x: {cx}, y: {cy}}})) <= {r} \
+         RETURN id(a) AS a, id(rel) AS r, id(b) AS b"
+    )
+}
+
+#[test]
+fn relationship_proximity_uses_index_and_matches_the_scan() {
+    // `rmp` task #664: a relationship point index must serve directed, undirected AND self-loop proximity
+    // patterns with the EXACT same `(a, r, b)` triple multiset as the scan path — the grid never changes
+    // the answer, it only accelerates it. Compared as sorted orientation-carrying triples so the
+    // undirected two-orientation semantics and the self-loop single-row semantics are exercised.
+    let mut coord = fresh_coord();
+    run_write(&mut coord, "CREATE (:P {name: 'p1'}), (:P {name: 'p2'})");
+    // A near, a mid (dist 5) and a far VISITED between p1 and p2, plus a self-loop on p1 near the origin.
+    for (x, y, tag) in [(0.0, 0.0, "near"), (3.0, 4.0, "mid"), (100.0, 100.0, "far")] {
+        run_write(
+            &mut coord,
+            &format!(
+                "MATCH (a:P {{name: 'p1'}}), (b:P {{name: 'p2'}}) \
+                 CREATE (a)-[:VISITED {{at: point({{x: {x}, y: {y}}}), tag: '{tag}'}}]->(b)"
+            ),
+        );
+    }
+    run_write(
+        &mut coord,
+        "MATCH (a:P {name: 'p1'}) \
+         CREATE (a)-[:VISITED {at: point({x: 1, y: 0}), tag: 'loop'}]->(a)",
+    ); // a self-loop near the origin
+    coord
+        .create_point_rel_index("rel_at", "VISITED", "at", false)
+        .expect("create rel point index");
+
+    let indexed = coord.catalog();
+    let empty = IndexCatalog::empty();
+
+    for arrow in ["", "->"] {
+        // r=2: the near rel + the self-loop (dist 1) are within; mid (dist 5) and far are out.
+        let q = rel_proximity(arrow, 0.0, 0.0, 2.0);
+        // The indexed plan actually routes through the relationship spatial seek.
+        assert!(
+            plan_uses_rel_spatial_seek(&compile(&q, &indexed)),
+            "arrow {arrow:?}: the indexed plan must use RelSpatialIndexSeek:\n{}",
+            compile(&q, &indexed)
+        );
+        let seek = rel_triples(&mut coord, &indexed, &q);
+        let scan = rel_triples(&mut coord, &empty, &q);
+        assert_eq!(seek, scan, "arrow {arrow:?}: index must not change results");
+        assert!(!seek.is_empty(), "arrow {arrow:?}: near + loop must match");
+
+        // A wider r=10 admits mid (dist 5) too, still exactly matching the scan.
+        let qw = rel_proximity(arrow, 0.0, 0.0, 10.0);
+        assert_eq!(
+            rel_triples(&mut coord, &indexed, &qw),
+            rel_triples(&mut coord, &empty, &qw),
+            "arrow {arrow:?}: wider radius still matches the scan"
+        );
+    }
+}
+
+#[test]
+fn relationship_point_index_survives_a_crash_and_reopen() {
+    // `rmp` task #664 durability AC: the relationship point index's durable catalog entry (carrying the
+    // relationship entity in the trailing extension block) survives a crash, and the ephemeral grid is
+    // rebuilt from the recovered store on reopen — a proximity query stays correct and index-accelerated.
+    let mut coord = fresh_coord();
+    run_write(&mut coord, "CREATE (:P {name: 'p1'}), (:P {name: 'p2'})");
+    run_write(
+        &mut coord,
+        "MATCH (a:P {name: 'p1'}), (b:P {name: 'p2'}) \
+         CREATE (a)-[:VISITED {at: point({x: 0, y: 0}), tag: 'near'}]->(b)",
+    );
+    run_write(
+        &mut coord,
+        "MATCH (a:P {name: 'p1'}), (b:P {name: 'p2'}) \
+         CREATE (a)-[:VISITED {at: point({x: 200, y: 200}), tag: 'far'}]->(b)",
+    );
+    coord
+        .create_point_rel_index("rel_at", "VISITED", "at", false)
+        .expect("create");
+
+    // Snapshot the store, recover into a fresh coordinator (grid rebuilt from the recovered store).
+    let store = coord.into_store();
+    let recovered = recover_no_force(&store);
+    let mut coord2 = TxnCoordinator::new(recovered);
+
+    // The catalog entry survived (with the relationship entity), so the planner still emits the seek.
+    let q = rel_proximity("", 0.0, 0.0, 2.0);
+    assert!(
+        plan_uses_rel_spatial_seek(&compile(&q, &coord2.catalog())),
+        "the recovered coordinator must still route through the relationship spatial seek"
+    );
+    // The near rel matches (grid rebuilt), the far one never does — and it equals the scan path.
+    let indexed = coord2.catalog();
+    let empty = IndexCatalog::empty();
+    assert_eq!(
+        rel_triples(&mut coord2, &indexed, &q),
+        rel_triples(&mut coord2, &empty, &q),
+    );
+    assert!(
+        !rel_triples(&mut coord2, &indexed, &q).is_empty(),
+        "the near relationship must match after recovery"
+    );
+}

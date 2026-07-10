@@ -49,8 +49,8 @@ use graphus_index::histogram::PropertyHistogram;
 use graphus_io::BlockDevice;
 use graphus_storage::{
     CompositeIndexEntry, ConstraintEntry, ConstraintKind, ConstraintTypeDescriptor, FulltextEntity,
-    FulltextIndexEntry, GcPassReport, IndexState, Namespace, RecordStore, SpatialIndexEntry,
-    StoreReadView, TextIndexEntry, TokenSnapshot,
+    FulltextIndexEntry, GcPassReport, IndexState, Namespace, RecordStore, SpatialEntity,
+    SpatialIndexEntry, StoreReadView, TextIndexEntry, TokenSnapshot,
 };
 use graphus_txn::{CommitRegistry, IsolationLevel, LockTable, Snapshot, SsiReadBuffer, SsiTracker};
 use graphus_wal::LogSink;
@@ -558,7 +558,18 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             idx.set_fulltext_state(&name, IndexState::Online);
         }
         for (_, entry) in populating_spatial {
-            idx.set_spatial_state(entry.label_token, entry.property_token, IndexState::Online);
+            // Route by entity (`rmp` task #664): a relationship point index promotes in the rel-keyed
+            // map. (Relationship point indexes are created synchronous-`Online`, so in practice they are
+            // never left `Populating` — this stays correct if one ever were.)
+            if entry.entity.is_relationship() {
+                idx.set_spatial_rel_state(
+                    entry.label_token,
+                    entry.property_token,
+                    IndexState::Online,
+                );
+            } else {
+                idx.set_spatial_state(entry.label_token, entry.property_token, IndexState::Online);
+            }
         }
         next_txn_id + 1
     }
@@ -731,12 +742,25 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         {
             let mut idx = index.borrow_mut();
             for (_name, entry) in durable_spatial {
-                idx.register_spatial(
-                    entry.label_token,
-                    entry.property_token,
-                    graphus_index::DEFAULT_CELL_SIZE,
-                    entry.state,
-                );
+                // Route by entity (`rmp` task #664): a node point index registers into the node-keyed
+                // spatial map (covered by labels), a relationship point index into the separate
+                // relationship-keyed spatial map (covered by rel types). The rebuild scan below
+                // repopulates whichever grid was registered here.
+                if entry.entity.is_relationship() {
+                    idx.register_spatial_rel(
+                        entry.label_token,
+                        entry.property_token,
+                        graphus_index::DEFAULT_CELL_SIZE,
+                        entry.state,
+                    );
+                } else {
+                    idx.register_spatial(
+                        entry.label_token,
+                        entry.property_token,
+                        graphus_index::DEFAULT_CELL_SIZE,
+                        entry.state,
+                    );
+                }
             }
         }
 
@@ -890,13 +914,16 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // before the scan so the index is not borrowed across a store borrow.
         let registered_rel: Vec<(u32, u32)> = index.borrow().registered_rel_properties();
         let has_rel_fulltext = index.borrow().has_any_fulltext_rel();
+        // The registered relationship spatial index keys `(type_token, prop_key)` (`rmp` task #664),
+        // captured before the scan so the index is not borrowed across a store borrow.
+        let registered_rel_spatial: Vec<(u32, u32)> = index.borrow().registered_spatial_rel();
         // A store-read fault enumerating the relationships leaves the rel indexes empty-but-`Online`.
         // This matches the certified node-property rebuild's trust-once-selected behaviour: storage
         // faults in Graphus are persistent (checksum / torn page), and both the index seek and the scan
         // fallback read the SAME store, so they fault identically — an empty index never diverges from a
         // scan in practice. (A whole-scan fault here is also the same failure the very next query would
         // hit.) Per-relationship read faults inside `index_one_rel*` skip that relationship best-effort.
-        if (!registered_rel.is_empty() || has_rel_fulltext)
+        if (!registered_rel.is_empty() || has_rel_fulltext || !registered_rel_spatial.is_empty())
             && let Ok(rel_ids) = store.borrow().scan_rel_ids()
         {
             for id in rel_ids {
@@ -907,6 +934,11 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 // least one is declared.
                 if has_rel_fulltext {
                     Self::index_one_rel_fulltext(store, index, id);
+                }
+                // Repopulate the relationship spatial grids (`rmp` task #664), only when at least one is
+                // declared.
+                if !registered_rel_spatial.is_empty() {
+                    Self::index_one_rel_spatial(store, index, id, &registered_rel_spatial);
                 }
             }
         }
@@ -1303,6 +1335,54 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         index
             .borrow_mut()
             .reindex_fulltext_rel(id, type_token, &string_props);
+    }
+
+    /// Inserts relationship `id`'s current point value into each `registered` `(type_token, prop_key)`
+    /// relationship spatial index it matches (`rmp` task #664). The relationship analogue of
+    /// [`index_one_node_spatial`](Self::index_one_node_spatial): the same single per-relationship code
+    /// path the full rebuild ([`rebuild_index`](Self::rebuild_index)) and the synchronous create build
+    /// both drive, so a recovered store rebuilds the relationship grids store-consistently. Only the
+    /// **point**-valued properties a registered index covers are read; a relationship of a different
+    /// type, or whose covered property is absent / non-point, contributes nothing (the grid is a
+    /// candidate set). The store and index are borrowed in **separate, non-overlapping** scopes.
+    fn index_one_rel_spatial(
+        store: &Rc<RefCell<RecordStore<D, S>>>,
+        index: &Rc<RefCell<IndexSet>>,
+        id: u64,
+        registered: &[(u32, u32)],
+    ) {
+        let type_token = match store.borrow().rel(id) {
+            Ok(r) => r.type_id,
+            Err(_) => return,
+        };
+        // The relationship's current property values, keyed by prop-key (newest-wins per key), keeping
+        // only the point values a registered relationship spatial index covers for this relationship's
+        // type.
+        let mut values: Vec<(u32, Value)> = Vec::new();
+        {
+            let chain = match store.borrow().rel_property_values(id) {
+                Ok(chain) => chain,
+                Err(_) => return,
+            };
+            for (_pid, key, value) in chain {
+                if values.iter().any(|(k, _)| *k == key) {
+                    continue; // newest-wins: keep only the first occurrence of each key.
+                }
+                let used = registered
+                    .iter()
+                    .any(|&(reg_type, prop_key)| prop_key == key && reg_type == type_token);
+                if used && matches!(value, Value::Point(_)) {
+                    values.push((key, value));
+                }
+            }
+        }
+
+        let mut index = index.borrow_mut();
+        for (prop_key, value) in &values {
+            if index.has_spatial_rel(type_token, *prop_key) {
+                index.insert_spatial_rel_point(type_token, *prop_key, value, id);
+            }
+        }
     }
 
     /// Inserts node `id`'s current point value into each `registered` `(label_token, prop_key)`
@@ -3204,6 +3284,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             store.set_spatial_index(
                 name.to_owned(),
                 SpatialIndexEntry {
+                    entity: SpatialEntity::Node,
                     label_token,
                     property_token: prop_key,
                     state: IndexState::Populating,
@@ -3234,6 +3315,99 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         Ok(true)
     }
 
+    /// Declares a **relationship** spatial (point) index named `name` over `(rel_type, property)`
+    /// (`rmp` task #664) — the relationship analogue of [`create_point_index`](Self::create_point_index).
+    ///
+    /// Unlike the node point index (which builds non-blockingly), the relationship index is built
+    /// **synchronously and recorded `Online`** in one committed transaction, then a full
+    /// [`rebuild_index`](Self::rebuild_index) repopulates its rel-keyed grid from the store — exactly the
+    /// pattern the relationship full-text (`rmp` #663) and relationship-property (`rmp` #646) indexes
+    /// use. `rebuild_index` also resets the shared full-text/spatial freshness marker to the store's
+    /// high-water, so a reader whose snapshot predates the build declines to the correct scan path.
+    ///
+    /// Returns whether the index was **actually created** (`true`) or the call was an idempotent no-op
+    /// (`false`, an `IF NOT EXISTS` that changed nothing).
+    ///
+    /// # Errors
+    /// Returns a storage error if interning any token, recording the catalog entry, or the committing
+    /// transaction fails; `Neo.ClientError.Schema.IndexWithNameAlreadyExists` when `name` is already
+    /// taken by another schema catalog. On any error the index is left undeclared.
+    pub fn create_point_rel_index(
+        &mut self,
+        name: &str,
+        rel_type: &str,
+        property: &str,
+        if_not_exists: bool,
+    ) -> Result<bool> {
+        // `IF NOT EXISTS` (`rmp` #661): an equivalent relationship point index — the same name, or the
+        // same covered `(type, property)` under any name — makes this an idempotent no-op.
+        if if_not_exists && self.point_rel_equivalent_exists(name, rel_type, property) {
+            return Ok(false);
+        }
+        // Names are globally unique across every schema catalog (`rmp` task #624).
+        if Self::name_used_by_other_catalog(&self.store.borrow(), name, NameCatalog::Spatial) {
+            return Err(index_name_in_use(name));
+        }
+        // Intern the rel-type + property-key tokens and record the durable catalog entry `Online`
+        // (synchronous build), in one committed transaction (so the schema change survives a crash).
+        self.next_txn_id += 1;
+        let txn = TxnId(self.next_txn_id);
+        self.store.borrow_mut().begin(txn);
+        {
+            let mut store = self.store.borrow_mut();
+            let type_token = match store.intern_token(Namespace::RelType, rel_type) {
+                Ok(t) => t,
+                Err(e) => {
+                    drop(store);
+                    let _ = self.store.borrow_mut().rollback(txn);
+                    return Err(e);
+                }
+            };
+            let prop_key = match store.intern_token(Namespace::PropKey, property) {
+                Ok(t) => t,
+                Err(e) => {
+                    drop(store);
+                    let _ = self.store.borrow_mut().rollback(txn);
+                    return Err(e);
+                }
+            };
+            store.set_spatial_index(
+                name.to_owned(),
+                SpatialIndexEntry {
+                    entity: SpatialEntity::Relationship,
+                    label_token: type_token,
+                    property_token: prop_key,
+                    state: IndexState::Online,
+                },
+            );
+        }
+        self.store.borrow_mut().commit(txn)?;
+
+        // Register the grid `Online` in the in-memory set and (re)build it so existing relationships are
+        // indexed — `rebuild_index` scans the relationships, populates the rel-keyed grid, and resets the
+        // shared full-text/spatial marker to the store's high-water.
+        let type_token = self
+            .store
+            .borrow()
+            .token_id(Namespace::RelType, rel_type)
+            .expect("INVARIANT: the rel-type token was just interned in the committed transaction");
+        let prop_key = self
+            .store
+            .borrow()
+            .token_id(Namespace::PropKey, property)
+            .expect(
+                "INVARIANT: the property-key token was just interned in the committed transaction",
+            );
+        self.index.borrow_mut().register_spatial_rel(
+            type_token,
+            prop_key,
+            graphus_index::DEFAULT_CELL_SIZE,
+            IndexState::Online,
+        );
+        Self::rebuild_index(&self.store, &self.index);
+        Ok(true)
+    }
+
     /// Whether a spatial (point) index equivalent to the requested `(name, label, property)` already
     /// exists (`rmp` #661) — the same `name` in the spatial catalog, or the same covered
     /// `(label, property)` under any name. Backs `CREATE POINT INDEX … IF NOT EXISTS` idempotency.
@@ -3250,10 +3424,35 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             return false;
         };
         let prop_token = property_tokens[0];
-        store
-            .spatial_indexes()
-            .iter()
-            .any(|(_n, e)| e.label_token == label_token && e.property_token == prop_token)
+        store.spatial_indexes().iter().any(|(_n, e)| {
+            // A node index equivalence: a relationship point index (same numeric token in a different
+            // namespace) is never equivalent (`rmp` task #664).
+            !e.entity.is_relationship()
+                && e.label_token == label_token
+                && e.property_token == prop_token
+        })
+    }
+
+    /// Whether a **relationship** spatial (point) index equivalent to the requested `(name, type,
+    /// property)` already exists (`rmp` task #664) — the same `name` in the spatial catalog, or the same
+    /// covered `(type, property)` under any name. Backs `CREATE POINT INDEX … FOR ()-[r:T]-() … IF NOT
+    /// EXISTS` idempotency. Read-only, by token *lookup*.
+    fn point_rel_equivalent_exists(&self, name: &str, rel_type: &str, property: &str) -> bool {
+        let store = self.store.borrow();
+        if store.spatial_index(name).is_some() {
+            return true;
+        }
+        let Some(type_token) = store.token_id(Namespace::RelType, rel_type) else {
+            return false;
+        };
+        let Some(prop_token) = store.token_id(Namespace::PropKey, property) else {
+            return false;
+        };
+        store.spatial_indexes().iter().any(|(_n, e)| {
+            e.entity.is_relationship()
+                && e.label_token == type_token
+                && e.property_token == prop_token
+        })
     }
 
     /// Drops the spatial (point) index named `name` (`rmp` task #98): removes its durable catalog
@@ -3284,26 +3483,56 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.store.borrow_mut().commit(txn)?;
 
         self.pending_spatial_builds.retain(|b| b.name != name);
-        self.index
-            .borrow_mut()
-            .unregister_spatial(entry.label_token, entry.property_token);
+        // Route the unregister by entity (`rmp` task #664): a relationship point index lives in the
+        // rel-keyed grid map, a node one in the node-keyed map (both keyed by `(token, prop_key)`).
+        if entry.entity.is_relationship() {
+            self.index
+                .borrow_mut()
+                .unregister_spatial_rel(entry.label_token, entry.property_token);
+        } else {
+            self.index
+                .borrow_mut()
+                .unregister_spatial(entry.label_token, entry.property_token);
+        }
         Ok(true) // an index was removed.
     }
 
-    /// Lists every declared spatial (point) index as `(name, label, property, state)` (`rmp` task
-    /// #98) for a `SHOW POINT INDEXES` surface. Reads the durable catalog and resolves the tokens back
-    /// to names; an entry whose tokens have no resolvable name (a defensively-skipped impossibility for
-    /// a live token) is omitted. Ordered by name.
+    /// Lists every declared **node** spatial (point) index as `(name, label, property, state)`
+    /// (`rmp` tasks #98, #664) for a `SHOW POINT INDEXES` surface. Reads the durable catalog and resolves
+    /// the tokens back to names; a **relationship** point index (`rmp` #664) and an entry whose tokens
+    /// have no resolvable name (a defensively-skipped impossibility for a live token) are omitted.
+    /// Ordered by name.
     #[must_use]
     pub fn list_point_indexes(&self) -> Vec<(String, String, String, IndexState)> {
         let store = self.store.borrow();
         store
             .spatial_indexes()
             .into_iter()
+            .filter(|(_n, entry)| !entry.entity.is_relationship())
             .filter_map(|(name, entry)| {
                 let label = store.token_name(Namespace::Label, entry.label_token)?;
                 let property = store.token_name(Namespace::PropKey, entry.property_token)?;
                 Some((name, label.to_owned(), property.to_owned(), entry.state))
+            })
+            .collect()
+    }
+
+    /// Lists every declared **relationship** spatial (point) index as `(name, type, property, state)`
+    /// (`rmp` task #664) for the `SHOW INDEXES` surface. Reads the durable catalog and resolves the rel
+    /// type + property tokens back to names; a node point index and an entry whose tokens have no
+    /// resolvable name are omitted. Ordered by name — the relationship analogue of
+    /// [`list_point_indexes`](Self::list_point_indexes).
+    #[must_use]
+    pub fn list_point_rel_indexes(&self) -> Vec<(String, String, String, IndexState)> {
+        let store = self.store.borrow();
+        store
+            .spatial_indexes()
+            .into_iter()
+            .filter(|(_n, entry)| entry.entity.is_relationship())
+            .filter_map(|(name, entry)| {
+                let rel_type = store.token_name(Namespace::RelType, entry.label_token)?;
+                let property = store.token_name(Namespace::PropKey, entry.property_token)?;
+                Some((name, rel_type.to_owned(), property.to_owned(), entry.state))
             })
             .collect()
     }
@@ -4685,6 +4914,21 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 continue;
             };
             builder = builder.with_rel_property(rel_type, property);
+        }
+        // Relationship spatial (point) indexes (`rmp` task #664): surface every **`Online`** relationship
+        // spatial index so the physical planner can route a `MATCH ()-[r:T]-() WHERE distance(r.p, $c) <=
+        // $d` proximity to a `RelSpatialIndexSeek` instead of scanning every `:T` relationship. Only
+        // `Online` ones are exposed (`online_spatial_rel` filters by state); relationship spatial indexes
+        // are created synchronous-`Online`, so this is always the full set. The backing grid exists in the
+        // in-memory set (registered on open / create), so the seek the planner emits always finds it.
+        for (type_token, prop_key) in self.index.borrow().online_spatial_rel() {
+            let (Some(rel_type), Some(property)) = (
+                store.token_name(Namespace::RelType, type_token),
+                store.token_name(Namespace::PropKey, prop_key),
+            ) else {
+                continue;
+            };
+            builder = builder.with_rel_spatial(rel_type, property);
         }
         builder.build()
     }

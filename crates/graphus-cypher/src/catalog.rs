@@ -88,6 +88,12 @@ pub enum IndexKind {
     /// spatial index its backing structure is derived/ephemeral (`graphus_index::TrigramIndex`); the
     /// descriptor records only its shape for planning.
     Text,
+    /// Spatial grid index over a **relationship** point property, keyed `(reltype, point-property)`:
+    /// backs a proximity (`distance(r.loc, $p) <= r`) predicate on a typed relationship point property
+    /// (`rmp` task #664) — the relationship analogue of [`Spatial`](Self::Spatial). Like it, the backing
+    /// grid is derived/ephemeral (`graphus_index::SpatialIndex` over relationship ids); the descriptor
+    /// records only its shape for planning.
+    RelSpatial,
 }
 
 impl IndexKind {
@@ -101,6 +107,7 @@ impl IndexKind {
             Self::RelProperty => "rel-property",
             Self::Spatial => "spatial",
             Self::Text => "text",
+            Self::RelSpatial => "rel-spatial",
         }
     }
 }
@@ -314,6 +321,19 @@ impl IndexCatalog {
                 && d.properties.first().map(String::as_str) == Some(property)
         })
     }
+
+    /// A relationship spatial index on `(rel_type, point-property)` usable for a proximity predicate
+    /// (`rmp` task #664) — the relationship analogue of [`label_spatial`](Self::label_spatial). The
+    /// planner consults this for a `distance(r.prop, $p) <= r` predicate on a typed relationship point
+    /// property.
+    #[must_use]
+    pub fn rel_spatial(&self, rel_type: &RelType, property: &str) -> Option<&IndexDescriptor> {
+        self.indexes.iter().find(|d| {
+            d.kind == IndexKind::RelSpatial
+                && d.covers_rel_type(&rel_type.name)
+                && d.properties.first().map(String::as_str) == Some(property)
+        })
+    }
 }
 
 /// A declarative builder for an [`IndexCatalog`] (`04 §6.6`).
@@ -427,6 +447,19 @@ impl IndexCatalogBuilder {
         self.with_descriptor(
             IndexKind::Text,
             IndexTarget::label(label),
+            vec![property.into()],
+        )
+    }
+
+    /// Appends a relationship spatial index over `(rel_type, point-property)` (`rmp` task #664).
+    pub fn with_rel_spatial(
+        self,
+        rel_type: impl Into<String>,
+        property: impl Into<String>,
+    ) -> Self {
+        self.with_descriptor(
+            IndexKind::RelSpatial,
+            IndexTarget::rel_type(rel_type),
             vec![property.into()],
         )
     }

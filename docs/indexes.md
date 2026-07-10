@@ -231,6 +231,12 @@ CREATE POINT INDEX by_loc FOR (c:City) ON (c.location)
                            `spatial.cartesian.max`: [ 100.0,  100.0] } }
 DROP POINT INDEX by_loc IF EXISTS
 
+-- POINT over RELATIONSHIPS (undirected `()-[r:T]-()` pattern, single type). Anonymous rel point
+-- indexes auto-name point_index_rel_<type>_<property>.
+CREATE POINT INDEX rel_at FOR ()-[r:VISITED]-() ON (r.at)
+CREATE POINT INDEX FOR ()-[r:VISITED]-() ON (r.at)       -- anonymous → point_index_rel_VISITED_at
+DROP POINT INDEX rel_at IF EXISTS
+
 -- FULLTEXT: named; ON EACH [ … ]; IF NOT EXISTS; analyzer via the bare or indexConfig OPTIONS form.
 CREATE FULLTEXT INDEX ft IF NOT EXISTS FOR (a:Article) ON EACH [a.title, a.body]
   OPTIONS { analyzer: 'keyword' }
@@ -278,6 +284,34 @@ CALL db.index.fulltext.queryRelationships('rel_notes', 'graph') YIELD relationsh
 
 Passing a **node** index name to `queryRelationships` (or a relationship index name to `queryNodes`)
 is a clear error, not silently-empty results.
+
+### Node vs relationship point index
+
+Point (spatial) indexes likewise come in two flavours (Neo4j-compatible):
+
+- **Node** — `FOR (n:Label) ON (n.prop)`.
+- **Relationship** — `FOR ()-[r:Type]-() ON (r.prop)` (only the *undirected* pattern; a directed arrow
+  is a syntax error). A point index covers **exactly one** label/type and **one** point property.
+
+Both accelerate an **upper-bounded Cartesian proximity** predicate — `distance(x.prop, <const point>)
+<= <const r>` (or `<`; the namespaced `point.distance(…)` spelling and the symmetric argument order are
+equivalent). The grid returns a candidate superset and the exact `distance` predicate is always
+re-checked above the seek, so the index never changes the answer — only the speed:
+
+```cypher
+-- node proximity (served by a node point index when one covers (:City, location)):
+MATCH (c:City) WHERE distance(c.location, point({x: 0, y: 0})) <= 5 RETURN c
+
+-- relationship proximity (served by a relationship point index over ()-[r:VISITED]-() on r.at):
+MATCH ()-[r:VISITED]-() WHERE distance(r.at, point({x: 0, y: 0})) <= 5 RETURN r
+```
+
+A **geographic** (WGS-84) centre is measured in metres while the grid buckets degrees, so the planner
+declines the seek for a geographic centre and keeps the exact predicate on a scan (still correct). A
+`point.withinBBox(…)` predicate is not an upper-bounded distance and likewise stays a scan + filter.
+Without a matching point index either query falls back to a scan + filter — always correct, just not
+index-accelerated. `SHOW INDEXES` reports `entityType` = `NODE` or `RELATIONSHIP` for point indexes and
+lists the covered label/type under `labelsOrTypes`.
 
 ---
 

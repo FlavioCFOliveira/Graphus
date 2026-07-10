@@ -156,10 +156,49 @@ async fn proximity_names(handle: &EngineHandle, cx: f64, cy: f64, r: f64) -> Vec
 fn create_by_loc_index() -> IndexCommand {
     IndexCommand::CreatePointIndex {
         name: "by_loc".to_owned(),
+        entity: graphus_cypher::SpatialEntity::Node,
         label: "City".to_owned(),
         property: "loc".to_owned(),
         if_not_exists: false,
     }
+}
+
+/// A **relationship** point index over `(:VISITED)` on `at` (`rmp` task #664).
+fn create_rel_at_index() -> IndexCommand {
+    IndexCommand::CreatePointIndex {
+        name: "rel_at".to_owned(),
+        entity: graphus_cypher::SpatialEntity::Relationship,
+        label: "VISITED".to_owned(),
+        property: "at".to_owned(),
+        if_not_exists: false,
+    }
+}
+
+/// Runs an undirected relationship proximity query over `:VISITED.at` centred at `(cx, cy)` within `r`,
+/// returning the matched relationships' `tag` property values, sorted with duplicates (an undirected
+/// pattern binds each relationship twice). The `r` column egresses as a structural relationship
+/// (`rmp` task #664).
+async fn rel_proximity_tags(handle: &EngineHandle, cx: f64, cy: f64, r: f64) -> Vec<String> {
+    let q = format!(
+        "MATCH ()-[r:VISITED]-() WHERE distance(r.at, point({{x: {cx}, y: {cy}}})) <= {r} RETURN r"
+    );
+    let rows = run(handle, &q).await;
+    let mut tags: Vec<String> = rows
+        .iter()
+        .filter_map(|row| match row.first() {
+            Some(MaterializedValue::Relationship(rel)) => rel
+                .properties
+                .iter()
+                .find(|(k, _)| k == "tag")
+                .and_then(|(_, v)| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                }),
+            _ => None,
+        })
+        .collect();
+    tags.sort();
+    tags
 }
 
 #[tokio::test]
@@ -407,6 +446,136 @@ async fn drop_index_then_query_still_correct() {
         .await
         .expect("show");
     assert!(reply.rows.is_empty(), "the dropped index is gone");
+
+    handle.shutdown().await.expect("shutdown");
+}
+
+/// `rmp` task #664: a **relationship** point index serves an undirected proximity query with the exact
+/// same result multiset as a scan+filter, reflects updates/deletes, survives a full restart (durable
+/// catalog + rebuild-from-store), and `SHOW POINT INDEXES` reports `entityType = RELATIONSHIP`.
+#[tokio::test]
+async fn relationship_point_index_end_to_end_with_restart() {
+    let temp = TempStore::new("rel");
+    let cfg = config(&temp);
+
+    // Boot #1: seed relationships each carrying a point `at`, verify parity, restart.
+    {
+        let handle = boot(cfg.clone()).await;
+        let engine = handle.engine.clone();
+
+        // Two anchors and several VISITED relationships between them, each with a point `at` + `tag`.
+        run(&engine, "CREATE (:P {name: 'p1'}), (:P {name: 'p2'})").await;
+        run(
+            &engine,
+            "MATCH (a:P {name: 'p1'}), (b:P {name: 'p2'}) \
+             CREATE (a)-[:VISITED {at: point({x: 0, y: 0}), tag: 'near'}]->(b)",
+        )
+        .await;
+        run(
+            &engine,
+            "MATCH (a:P {name: 'p1'}), (b:P {name: 'p2'}) \
+             CREATE (a)-[:VISITED {at: point({x: 3, y: 4}), tag: 'mid'}]->(b)",
+        )
+        .await; // dist 5
+        run(
+            &engine,
+            "MATCH (a:P {name: 'p1'}), (b:P {name: 'p2'}) \
+             CREATE (a)-[:VISITED {at: point({x: 100, y: 100}), tag: 'far'}]->(b)",
+        )
+        .await;
+
+        // Baseline (no index): an undirected proximity query binds each matching rel twice.
+        let scan_near = rel_proximity_tags(&engine, 0.0, 0.0, 2.0).await;
+        assert_eq!(scan_near, vec!["near".to_owned(), "near".to_owned()]);
+
+        // Create the relationship point index (synchronous online build).
+        engine
+            .index_ddl(create_rel_at_index())
+            .await
+            .expect("create rel point index");
+
+        // The index path returns the identical multiset as the scan path (the overriding AC).
+        assert_eq!(rel_proximity_tags(&engine, 0.0, 0.0, 2.0).await, scan_near);
+        // A wider radius admits 'mid' (dist 5), each twice, but never 'far'.
+        assert_eq!(
+            rel_proximity_tags(&engine, 0.0, 0.0, 10.0).await,
+            vec![
+                "mid".to_owned(),
+                "mid".to_owned(),
+                "near".to_owned(),
+                "near".to_owned()
+            ]
+        );
+
+        // Update is reflected: move 'near' far away.
+        run(
+            &engine,
+            "MATCH ()-[r:VISITED {tag: 'near'}]-() SET r.at = point({x: 50, y: 50})",
+        )
+        .await;
+        assert!(rel_proximity_tags(&engine, 0.0, 0.0, 2.0).await.is_empty());
+        assert_eq!(
+            rel_proximity_tags(&engine, 50.0, 50.0, 1.0).await,
+            vec!["near".to_owned(), "near".to_owned()]
+        );
+
+        // Delete is reflected: drop 'mid'.
+        run(&engine, "MATCH ()-[r:VISITED {tag: 'mid'}]-() DELETE r").await;
+        assert!(rel_proximity_tags(&engine, 0.0, 0.0, 10.0).await.is_empty());
+
+        // SHOW POINT INDEXES reports entityType RELATIONSHIP + the covered type in labelsOrTypes.
+        let reply = engine
+            .index_ddl(IndexCommand::ShowIndexes {
+                filter: IndexTypeFilter::Point,
+                tail: None,
+            })
+            .await
+            .expect("show");
+        assert_eq!(reply.rows.len(), 1);
+        assert_eq!(reply.rows[0][1], Value::String("rel_at".to_owned()), "name");
+        assert_eq!(reply.rows[0][4], Value::String("POINT".to_owned()), "type");
+        assert_eq!(
+            reply.rows[0][5],
+            Value::String("RELATIONSHIP".to_owned()),
+            "entityType"
+        );
+        assert_eq!(
+            reply.rows[0][6],
+            Value::List(vec![Value::String("VISITED".to_owned())]),
+            "labelsOrTypes"
+        );
+
+        handle.shutdown().await.expect("shutdown");
+    }
+
+    // Boot #2: the relationship point index must still be declared (durable catalog) and return correct
+    // matches (grid rebuilt from the recovered store) — the durability acceptance criterion.
+    let handle = boot(cfg).await;
+    let engine = handle.engine.clone();
+
+    let reply = engine
+        .index_ddl(IndexCommand::ShowIndexes {
+            filter: IndexTypeFilter::Point,
+            tail: None,
+        })
+        .await
+        .expect("show after restart");
+    assert_eq!(
+        reply.rows.len(),
+        1,
+        "the rel index must survive the restart"
+    );
+    assert_eq!(
+        reply.rows[0][5],
+        Value::String("RELATIONSHIP".to_owned()),
+        "entityType survives restart"
+    );
+    // 'near' was moved to (50, 50); the rebuilt grid finds it there and nowhere near the origin.
+    assert_eq!(
+        rel_proximity_tags(&engine, 50.0, 50.0, 1.0).await,
+        vec!["near".to_owned(), "near".to_owned()]
+    );
+    assert!(rel_proximity_tags(&engine, 0.0, 0.0, 2.0).await.is_empty());
 
     handle.shutdown().await.expect("shutdown");
 }

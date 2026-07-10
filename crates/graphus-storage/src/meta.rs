@@ -209,27 +209,109 @@ impl FulltextIndexEntry {
     }
 }
 
-/// A durable **spatial (point) index** catalog entry (`rmp` task #98).
+/// The **entity dimension** a spatial (point) index covers: node labels or relationship types
+/// (`rmp` task #664).
+///
+/// Neo4j-5.x point indexes come in two flavours — one over **nodes** (`FOR (n:L) ON (n.p)`) and one
+/// over **relationships** (`FOR ()-[r:T]-() ON (r.p)`). Both share the grid machinery and the
+/// single-point-property shape; only the covered token namespace ([`Label`](crate::tokens::Namespace::Label)
+/// vs [`RelType`](crate::tokens::Namespace::RelType)) and the access path (a node label scan vs a typed
+/// relationship traversal) differ. This one-byte discriminant records which flavour a
+/// [`SpatialIndexEntry`] is — the exact twin of [`FulltextEntity`].
+///
+/// # Wire encoding
+///
+/// Encoded as a single byte in the **backward-compatible spatial extension block** (see
+/// [`Statistics::encode`]), never in the base spatial catalog block. A pre-#664 image has no extension
+/// block, so every legacy entry decodes as [`Node`](Self::Node) — the only flavour that existed before
+/// #664. [`from_byte`](Self::from_byte) rejects an unknown byte (a forward-incompatible image),
+/// mirroring [`IndexState::from_byte`] / [`FulltextEntity::from_byte`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[must_use]
+pub enum SpatialEntity {
+    /// The index covers **node labels** (`FOR (n:L) ON (n.p)`). The default and the only flavour a
+    /// pre-#664 image knows.
+    #[default]
+    Node,
+    /// The index covers **relationship types** (`FOR ()-[r:T]-() ON (r.p)`, `rmp` task #664).
+    Relationship,
+}
+
+impl SpatialEntity {
+    /// The single-byte wire discriminant (`rmp` task #664). Discriminants `2..` are reserved.
+    #[must_use]
+    pub const fn as_byte(self) -> u8 {
+        match self {
+            Self::Node => 0,
+            Self::Relationship => 1,
+        }
+    }
+
+    /// Decodes a single-byte wire discriminant, or [`None`] for an unknown (reserved/future) byte.
+    #[must_use]
+    pub const fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::Node),
+            1 => Some(Self::Relationship),
+            _ => None,
+        }
+    }
+
+    /// Whether this is a **relationship** point index (its covered token is a
+    /// [`RelType`](crate::tokens::Namespace::RelType) token, served by a typed relationship traversal).
+    #[must_use]
+    pub const fn is_relationship(self) -> bool {
+        matches!(self, Self::Relationship)
+    }
+}
+
+/// A durable **spatial (point) index** catalog entry (`rmp` tasks #98, #664).
 ///
 /// A spatial index is identified by a server-unique **name** (like a full-text index, and unlike a
-/// node-property index which `(label_token, prop_key)` identifies), covers one node label and
-/// **exactly one** point property, and — unlike the full-text index — carries **no analyzer**: a
-/// grid spatial index simply buckets the covered point property's coordinates, so only the covered
-/// label, the covered property and the build state need to be recorded.
+/// node-property index which `(label_token, prop_key)` identifies), covers — per its
+/// [`entity`](Self::entity) — one node label *or* one relationship type (the
+/// [`label_token`](Self::label_token) slot) and **exactly one** point property, and — unlike the
+/// full-text index — carries **no analyzer**: a grid spatial index simply buckets the covered point
+/// property's coordinates, so only the covered label/type, the covered property and the build state
+/// need to be recorded.
 ///
 /// This rides the **identical** durability lifecycle as the full-text index catalog and the
 /// counts/histograms: checkpointed at commit, reloaded on rollback and on open. Its presence
 /// invariant is "an entry exists iff a spatial index of that name is declared". The grid *data*
 /// itself is never persisted (it is ephemeral and rebuilt from the store on open, like the derived
 /// `IndexSet`), so only this catalog entry needs durability.
+///
+/// # Backward-compatible encoding (`rmp` task #664)
+///
+/// The base spatial catalog block still writes the covered token in the same `label_token` slot so its
+/// byte layout is unchanged; a pre-#664 image decodes to `entity: Node` + that token. The
+/// [`entity`](Self::entity) lives in a trailing extension block keyed by name (present only for a
+/// relationship index), so a legacy node index needs no extension entry. See [`Statistics::encode`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpatialIndexEntry {
-    /// The node label-namespace token the index covers.
+    /// Whether the index covers a node label or a relationship type (`rmp` task #664).
+    pub entity: SpatialEntity,
+    /// The covered token: a node [`Label`](crate::tokens::Namespace::Label) token when
+    /// [`entity`](Self::entity) is [`Node`](SpatialEntity::Node), a relationship
+    /// [`RelType`](crate::tokens::Namespace::RelType) token when it is
+    /// [`Relationship`](SpatialEntity::Relationship). Persisted verbatim in the base block's single
+    /// token slot, so a pre-#664 image decodes this as a node label token.
     pub label_token: u32,
     /// The property-key-namespace token the index covers (a single point property).
     pub property_token: u32,
     /// The build state of the index (the same state machine as a node-property / full-text index).
     pub state: IndexState,
+}
+
+impl SpatialIndexEntry {
+    /// Whether the base + extension encoding must emit an **extension entry** for this index: a
+    /// relationship index (to record its [`SpatialEntity`]). A **node** index needs none (the base
+    /// block's token + the default [`SpatialEntity::Node`] fully describe it), keeping a legacy image
+    /// extension-free — the twin of [`FulltextIndexEntry::needs_extension`].
+    #[must_use]
+    fn needs_extension(&self) -> bool {
+        self.entity.is_relationship()
+    }
 }
 
 /// A durable **composite (multi-property) node index** catalog entry (`rmp` task #657).
@@ -1472,11 +1554,15 @@ impl Statistics {
         // The text (trigram) node index catalog (`rmp` task #662), appended by the same append-only
         // rule, so a pre-#662 image (ending after the composite catalog) decodes it to empty.
         Self::encode_text_catalog(&mut out, &self.text_indexes);
-        // The full-text extension block (`rmp` task #663), appended LAST — carrying the entity + extra
-        // covering tokens of any relationship / multi-token full-text index — so a pre-#663 image
-        // (ending after the text catalog) decodes it empty and every legacy full-text entry keeps its
-        // node + single-token shape.
+        // The full-text extension block (`rmp` task #663), appended after the text catalog — carrying
+        // the entity + extra covering tokens of any relationship / multi-token full-text index — so a
+        // pre-#663 image (ending after the text catalog) decodes it empty and every legacy full-text
+        // entry keeps its node + single-token shape.
         Self::encode_fulltext_extension_block(&mut out, &self.fulltext_indexes);
+        // The spatial extension block (`rmp` task #664), appended LAST — carrying the entity of any
+        // relationship point index — so a pre-#664 image (ending after the full-text extension block)
+        // decodes it empty and every legacy spatial entry keeps its node shape.
+        Self::encode_spatial_extension_block(&mut out, &self.spatial_indexes);
         out
     }
 
@@ -1629,6 +1715,43 @@ impl Statistics {
         }
     }
 
+    /// Encodes the trailing spatial **extension block** (`rmp` task #664), appended **last** (after the
+    /// full-text extension block) so a pre-#664 image — ending after the full-text extension block —
+    /// decodes it as empty and every legacy spatial entry keeps the [`SpatialEntity::Node`] shape the
+    /// base block decoded.
+    ///
+    /// Layout: `n(u32) | [ name_len(u32) | name_bytes[name_len] | entity(u8) ]*`, one entry **per
+    /// spatial index that needs it** — a relationship index (to record its [`SpatialEntity`]) — in
+    /// ascending-name ([`BTreeMap`]) order so the image is deterministic. A **node** index contributes
+    /// nothing (its base row + the default entity fully describe it), so a store using only
+    /// pre-#664-shaped (node) point indexes writes an empty (`0`-count) block, keeping the extension
+    /// byte-cost zero for the common case. Unlike the full-text extension block there are no extra
+    /// covering tokens (a spatial index covers exactly one label/type).
+    fn encode_spatial_extension_block(
+        out: &mut Vec<u8>,
+        map: &BTreeMap<String, SpatialIndexEntry>,
+    ) {
+        let extended: Vec<(&String, &SpatialIndexEntry)> = map
+            .iter()
+            .filter(|(_, entry)| entry.needs_extension())
+            .collect();
+        debug_assert!(
+            extended.len() <= u32::MAX as usize,
+            "spatial extension entry count exceeds u32"
+        );
+        out.extend_from_slice(&(extended.len() as u32).to_le_bytes());
+        for (name, entry) in extended {
+            let name_bytes = name.as_bytes();
+            debug_assert!(
+                name_bytes.len() <= u32::MAX as usize,
+                "spatial index name exceeds u32 length"
+            );
+            out.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(name_bytes);
+            out.push(entry.entity.as_byte());
+        }
+    }
+
     /// Encodes the spatial (point) index catalog block (`rmp` task #98), appended last so a pre-#98
     /// image (ending after the full-text catalog) decodes to an empty spatial catalog.
     ///
@@ -1636,6 +1759,13 @@ impl Statistics {
     /// property_token(u32) | state(u8) ]*`, entries in ascending-name ([`BTreeMap`]) order so the
     /// image is deterministic. Unlike the full-text block there is no analyzer byte and exactly one
     /// property token (a spatial index covers a single point property).
+    ///
+    /// # Single covered token (`rmp` task #664)
+    ///
+    /// This block persists the covered token in the same slot regardless of entity, byte-for-byte as
+    /// the pre-#664 `label_token` slot, so the layout is unchanged and a pre-#664 image decodes here as
+    /// a node index over that token. The [`entity`](SpatialIndexEntry::entity) — a relationship index —
+    /// rides the trailing [`encode_spatial_extension_block`](Self::encode_spatial_extension_block).
     fn encode_spatial_catalog(out: &mut Vec<u8>, map: &BTreeMap<String, SpatialIndexEntry>) {
         debug_assert!(
             map.len() <= u32::MAX as usize,
@@ -1838,7 +1968,9 @@ impl Statistics {
         // catalog, patches each relationship / multi-token index's entity + additional covering tokens
         // back onto its entry here (exactly as the constraint type-descriptor block patches constraints).
         let mut fulltext_indexes = Self::decode_fulltext_catalog(bytes, &mut cur)?;
-        let spatial_indexes = Self::decode_spatial_catalog(bytes, &mut cur)?;
+        // Kept mutable: the trailing spatial extension block (`rmp` task #664), decoded last, patches
+        // each relationship point index's entity back onto its entry here (like the full-text one).
+        let mut spatial_indexes = Self::decode_spatial_catalog(bytes, &mut cur)?;
         let mut constraints = Self::decode_constraint_catalog(bytes, &mut cur)?;
         // Merge the trailing property-type descriptor block (`rmp` task #100) back onto its named
         // constraints. A pre-#100 image ends after the constraint catalog, so this block decodes empty
@@ -1868,6 +2000,10 @@ impl Statistics {
         // pre-#663 image ends after the text catalog, so this block decodes empty and every full-text
         // entry keeps the node + single-token shape the catalog decode set.
         Self::decode_fulltext_extension_block(bytes, &mut cur, &mut fulltext_indexes)?;
+        // Merge the trailing spatial extension block (`rmp` task #664) back onto its named indexes. A
+        // pre-#664 image ends after the full-text extension block, so this block decodes empty and
+        // every spatial entry keeps the node shape the catalog decode set.
+        Self::decode_spatial_extension_block(bytes, &mut cur, &mut spatial_indexes)?;
         Ok(Self {
             total_nodes,
             total_relationships,
@@ -2103,6 +2239,62 @@ impl Statistics {
         Ok(())
     }
 
+    /// Decodes the trailing spatial **extension block** (`rmp` task #664) and merges each entry's entity
+    /// onto its named index in `spatial_indexes`. Like every later block, end-of-input where its count
+    /// `u32` would start means "no extension block" (a pre-#664 image), not truncation — leaving every
+    /// entry with the [`SpatialEntity::Node`] shape [`decode_spatial_catalog`](Self::decode_spatial_catalog)
+    /// already set.
+    ///
+    /// # Errors
+    /// Returns a storage error on truncation, a repeated / empty / non-UTF-8 name, an unknown entity
+    /// byte (a forward-incompatible image), or a name with no matching spatial index (an orphan
+    /// extension — never produced by [`encode`](Self::encode), which only ever writes an extension for a
+    /// declared relationship index).
+    fn decode_spatial_extension_block(
+        bytes: &[u8],
+        cur: &mut usize,
+        spatial_indexes: &mut BTreeMap<String, SpatialIndexEntry>,
+    ) -> Result<()> {
+        // Backward compatibility (`rmp` task #664): a pre-#664 image ends exactly here.
+        if *cur == bytes.len() {
+            return Ok(());
+        }
+        let n = read_u32(bytes, cur)? as usize;
+        let mut seen: BTreeMap<String, ()> = BTreeMap::new();
+        for _ in 0..n {
+            let name_len = read_u32(bytes, cur)? as usize;
+            let end = take(bytes, cur, name_len)?;
+            let name = String::from_utf8(bytes[end - name_len..end].to_vec()).map_err(|_| {
+                GraphusError::Storage("spatial extension name is not valid UTF-8".to_owned())
+            })?;
+            if name.is_empty() {
+                return Err(GraphusError::Storage(
+                    "spatial extension block holds an empty index name".to_owned(),
+                ));
+            }
+            let entity_byte = read_u8(bytes, cur)?;
+            let entity = SpatialEntity::from_byte(entity_byte).ok_or_else(|| {
+                GraphusError::Storage(format!(
+                    "spatial index {name:?} holds unknown entity byte {entity_byte}"
+                ))
+            })?;
+            if seen.insert(name.clone(), ()).is_some() {
+                return Err(GraphusError::Storage(format!(
+                    "spatial extension block repeats index name {name:?}"
+                )));
+            }
+            match spatial_indexes.get_mut(&name) {
+                Some(entry) => entry.entity = entity,
+                None => {
+                    return Err(GraphusError::Storage(format!(
+                        "spatial extension block names unknown index {name:?}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Decodes the spatial (point) index catalog block (`rmp` task #98). Like the full-text catalog
     /// this is the last block, so end-of-input where its count `u32` would start means "no spatial
     /// catalog" (a pre-#98 image), not truncation.
@@ -2141,7 +2333,11 @@ impl Statistics {
             if map
                 .insert(
                     name.clone(),
+                    // The base row always decodes as a **node** index over the covered token (`rmp`
+                    // task #664); a trailing extension block (if any) patches the entity. A pre-#664
+                    // image has no extension, so this node shape is final — matching legacy semantics.
                     SpatialIndexEntry {
+                        entity: SpatialEntity::Node,
                         label_token,
                         property_token,
                         state,
@@ -2875,6 +3071,7 @@ mod tests {
         m.statistics.set_spatial_index(
             "by_loc".to_owned(),
             SpatialIndexEntry {
+                entity: SpatialEntity::Node,
                 label_token: 0,
                 property_token: 3,
                 state: IndexState::Online,
@@ -2883,6 +3080,7 @@ mod tests {
         m.statistics.set_spatial_index(
             "by_home".to_owned(),
             SpatialIndexEntry {
+                entity: SpatialEntity::Node,
                 label_token: 5,
                 property_token: 7,
                 state: IndexState::Populating,
@@ -2980,6 +3178,7 @@ mod tests {
         assert_eq!(
             back.statistics.spatial_index("by_loc"),
             Some(&SpatialIndexEntry {
+                entity: SpatialEntity::Node,
                 label_token: 0,
                 property_token: 3,
                 state: IndexState::Online,
@@ -2988,6 +3187,7 @@ mod tests {
         assert_eq!(
             back.statistics.spatial_index("by_home"),
             Some(&SpatialIndexEntry {
+                entity: SpatialEntity::Node,
                 label_token: 5,
                 property_token: 7,
                 state: IndexState::Populating,
@@ -3077,6 +3277,7 @@ mod tests {
         pre99.set_spatial_index(
             "loc".to_owned(),
             SpatialIndexEntry {
+                entity: SpatialEntity::Node,
                 label_token: 1,
                 property_token: 2,
                 state: IndexState::Online,
@@ -3285,6 +3486,7 @@ mod tests {
         s.set_spatial_index(
             "a".to_owned(),
             SpatialIndexEntry {
+                entity: SpatialEntity::Node,
                 label_token: 1,
                 property_token: 2,
                 state: IndexState::Online,
@@ -3294,6 +3496,7 @@ mod tests {
         s.set_spatial_index(
             "b".to_owned(),
             SpatialIndexEntry {
+                entity: SpatialEntity::Node,
                 label_token: 3,
                 property_token: 4,
                 state: IndexState::Populating,
@@ -3336,6 +3539,144 @@ mod tests {
         let decoded = Statistics::decode(&image).unwrap();
         assert!(decoded.spatial_indexes().is_empty());
         assert_eq!(decoded.fulltext_indexes().len(), 1);
+    }
+
+    #[test]
+    fn statistics_spatial_extension_round_trips_relationship_and_node_needs_none() {
+        // `rmp` task #664: a RELATIONSHIP point index records its entity in the trailing spatial
+        // extension block; a plain NODE index (no extension entry) round-trips too, and the extension
+        // block stays empty for a node-only store.
+        let mut s = Statistics::new();
+        // A node point index: no extension entry.
+        s.set_spatial_index(
+            "by_loc".to_owned(),
+            SpatialIndexEntry {
+                entity: SpatialEntity::Node,
+                label_token: 0,
+                property_token: 3,
+                state: IndexState::Online,
+            },
+        );
+        // A relationship point index: entity Relationship carried in the extension.
+        s.set_spatial_index(
+            "rel_at".to_owned(),
+            SpatialIndexEntry {
+                entity: SpatialEntity::Relationship,
+                label_token: 7,
+                property_token: 2,
+                state: IndexState::Populating,
+            },
+        );
+        let back = Statistics::decode(&s.encode()).unwrap();
+        assert_eq!(back, s);
+        assert_eq!(
+            back.spatial_index("by_loc").map(|e| e.entity),
+            Some(SpatialEntity::Node)
+        );
+        assert_eq!(
+            back.spatial_index("rel_at").map(|e| e.entity),
+            Some(SpatialEntity::Relationship)
+        );
+
+        // A node-only store writes a 0-count (4-byte) spatial extension block as the LAST bytes.
+        let mut node_only = Statistics::new();
+        node_only.set_spatial_index(
+            "by_loc".to_owned(),
+            SpatialIndexEntry {
+                entity: SpatialEntity::Node,
+                label_token: 1,
+                property_token: 2,
+                state: IndexState::Online,
+            },
+        );
+        let image = node_only.encode();
+        assert_eq!(
+            &image[image.len() - 4..],
+            &0u32.to_le_bytes(),
+            "a node-only store's spatial extension block must be empty (0 count)"
+        );
+    }
+
+    #[test]
+    fn statistics_pre_664_image_decodes_relationship_slot_as_node() {
+        // `rmp` task #664: a pre-#664 image ends after the full-text extension block (no spatial
+        // extension block). A point index — the exact legacy shape — must decode as a NODE index over
+        // the base token slot, exactly as a pre-#664 build would have written it.
+        let mut pre664 = Statistics::new();
+        pre664.set_spatial_index(
+            "loc".to_owned(),
+            SpatialIndexEntry {
+                entity: SpatialEntity::Node,
+                label_token: 5,
+                property_token: 9,
+                state: IndexState::Online,
+            },
+        );
+        let mut image = pre664.encode();
+        // Drop the trailing 4-byte spatial-extension count word so the image ends right after the
+        // full-text extension block — the exact byte image a pre-#664 build would have produced.
+        image.truncate(image.len() - 4);
+        let decoded = Statistics::decode(&image).unwrap();
+        assert_eq!(
+            decoded.spatial_index("loc"),
+            Some(&SpatialIndexEntry {
+                entity: SpatialEntity::Node,
+                label_token: 5,
+                property_token: 9,
+                state: IndexState::Online,
+            })
+        );
+    }
+
+    #[test]
+    fn statistics_decode_rejects_orphan_spatial_extension() {
+        // `rmp` task #664: an extension entry naming an index not present in the base catalog is corrupt
+        // (never produced by encode). Build a minimal image: empty base spatial catalog, then an
+        // extension block that names a non-existent index. Decode must reject it.
+        let empty = Statistics::new();
+        let base = empty.encode();
+        let mut ext = Vec::new();
+        ext.extend_from_slice(&1u32.to_le_bytes()); // 1 extension entry
+        ext.extend_from_slice(&(3u32).to_le_bytes()); // name_len
+        ext.extend_from_slice(b"idx");
+        ext.push(SpatialEntity::Relationship.as_byte());
+        // Drop the empty base image's own trailing 4-byte spatial-extension count and splice ours in.
+        let mut image = base[..base.len() - 4].to_vec();
+        image.extend_from_slice(&ext);
+        let mut cur = image.len() - ext.len();
+        let mut spatial: BTreeMap<String, SpatialIndexEntry> = BTreeMap::new();
+        assert!(
+            Statistics::decode_spatial_extension_block(&image, &mut cur, &mut spatial).is_err(),
+            "an orphan spatial extension entry must be rejected"
+        );
+    }
+
+    #[test]
+    fn statistics_decode_rejects_unknown_spatial_entity_byte() {
+        // `rmp` task #664: a forward-incompatible entity byte (`2..`) in the extension is rejected, like
+        // an unknown state byte — never silently mapped to a known flavour.
+        let mut s = Statistics::new();
+        s.set_spatial_index(
+            "idx".to_owned(),
+            SpatialIndexEntry {
+                entity: SpatialEntity::Node,
+                label_token: 1,
+                property_token: 2,
+                state: IndexState::Online,
+            },
+        );
+        let base = s.encode();
+        let mut ext = Vec::new();
+        ext.extend_from_slice(&1u32.to_le_bytes()); // 1 extension entry naming the real index
+        ext.extend_from_slice(&(3u32).to_le_bytes());
+        ext.extend_from_slice(b"idx");
+        ext.push(2); // unknown entity byte
+        let mut image = base[..base.len() - 4].to_vec();
+        image.extend_from_slice(&ext);
+        assert!(
+            Statistics::decode(&image).is_err(),
+            "an unknown spatial entity byte must be rejected"
+        );
     }
 
     #[test]

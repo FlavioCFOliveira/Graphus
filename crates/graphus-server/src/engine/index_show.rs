@@ -147,8 +147,10 @@ pub(crate) struct IndexSources {
     /// `(name, entity, labels_or_types, properties, analyzer, state)` per `FULLTEXT` index — node or
     /// relationship, one or more covered labels/types (`rmp` task #663).
     pub fulltext: Vec<FulltextIndexListing>,
-    /// `(name, label, property, state)` per `POINT` index.
+    /// `(name, label, property, state)` per **node** `POINT` index.
     pub point: Vec<(String, String, String, IndexState)>,
+    /// `(name, rel_type, property, state)` per **relationship** `POINT` index (`rmp` task #664).
+    pub point_rel: Vec<(String, String, String, IndexState)>,
     /// `(name, label, property, state)` per `TEXT` (trigram) index (`rmp` task #662).
     pub text: Vec<(String, String, String, IndexState)>,
     /// Every declared constraint, for the `owningConstraint` attribution.
@@ -318,7 +320,7 @@ pub(crate) fn create_fulltext(
     )
 }
 
-/// A round-trippable `CREATE POINT INDEX` DDL (`rmp` #660). Re-parsing it yields an equivalent
+/// A round-trippable **node** `CREATE POINT INDEX` DDL (`rmp` #660). Re-parsing it yields an equivalent
 /// `CreatePointIndex`.
 #[must_use]
 pub(crate) fn create_point(name: &str, label: &str, property: &str) -> String {
@@ -326,6 +328,18 @@ pub(crate) fn create_point(name: &str, label: &str, property: &str) -> String {
         "CREATE POINT INDEX {} FOR (n:{}) ON (n.{})",
         quote_ident(name),
         quote_ident(label),
+        quote_ident(property)
+    )
+}
+
+/// A round-trippable **relationship** `CREATE POINT INDEX` DDL (`rmp` task #664). Re-parsing it yields
+/// an equivalent relationship `CreatePointIndex` (an undirected `()-[r:T]-()` pattern).
+#[must_use]
+pub(crate) fn create_point_rel(name: &str, rel_type: &str, property: &str) -> String {
+    format!(
+        "CREATE POINT INDEX {} FOR ()-[r:{}]-() ON (r.{})",
+        quote_ident(name),
+        quote_ident(rel_type),
         quote_ident(property)
     )
 }
@@ -392,6 +406,7 @@ pub(crate) fn build_rows(filter: IndexTypeFilter, sources: IndexSources) -> Vec<
         rel_property,
         fulltext,
         point,
+        point_rel,
         text,
         constraints,
     } = sources;
@@ -487,7 +502,7 @@ pub(crate) fn build_rows(filter: IndexTypeFilter, sources: IndexSources) -> Vec<
             create_statement: create,
         });
     }
-    // POINT.
+    // POINT — node.
     for (name, label, property, state) in point {
         let create = create_point(&name, &label, &property);
         specs.push(RowSpec {
@@ -497,6 +512,24 @@ pub(crate) fn build_rows(filter: IndexTypeFilter, sources: IndexSources) -> Vec<
             type_str: "POINT",
             entity_type: "NODE",
             labels_or_types: vec![label],
+            properties: vec![property],
+            index_provider: "point-1.0",
+            owning_constraint: Value::Null,
+            options: Value::Map(Vec::new()),
+            create_statement: create,
+        });
+    }
+    // POINT — relationship (`rmp` task #664): entityType RELATIONSHIP, round-trips through the
+    // `()-[r:T]-()` create DDL.
+    for (name, rel_type, property, state) in point_rel {
+        let create = create_point_rel(&name, &rel_type, &property);
+        specs.push(RowSpec {
+            id: alloc(),
+            name,
+            state,
+            type_str: "POINT",
+            entity_type: "RELATIONSHIP",
+            labels_or_types: vec![rel_type],
             properties: vec![property],
             index_provider: "point-1.0",
             owning_constraint: Value::Null,
@@ -626,6 +659,7 @@ mod tests {
     use super::*;
     use crate::admin::{AdminParse, parse_admin_statement};
     use crate::engine::IndexCommand;
+    use graphus_cypher::SpatialEntity;
 
     fn empty_sources() -> IndexSources {
         IndexSources {
@@ -634,6 +668,7 @@ mod tests {
             rel_property: Vec::new(),
             fulltext: Vec::new(),
             point: Vec::new(),
+            point_rel: Vec::new(),
             text: Vec::new(),
             constraints: Vec::new(),
         }
@@ -740,6 +775,12 @@ mod tests {
                 "loc".to_owned(),
                 IndexState::Online,
             )],
+            point_rel: vec![(
+                "rel_at".to_owned(),
+                "VISITED".to_owned(),
+                "at".to_owned(),
+                IndexState::Online,
+            )],
             text: vec![(
                 "tx_person_name".to_owned(),
                 "Person".to_owned(),
@@ -749,9 +790,9 @@ mod tests {
             constraints: Vec::new(),
         };
         let rows = build_rows(IndexTypeFilter::All, sources);
-        // 2 lookups + 6 declared indexes.
-        assert_eq!(rows.len(), 8);
-        // Ids: lookups 1/2, then 3..9 in build order.
+        // 2 lookups + 7 declared indexes.
+        assert_eq!(rows.len(), 9);
+        // Ids: lookups 1/2, then 3..10 in build order.
         let ids: Vec<i64> = rows
             .iter()
             .map(|r| match r[0] {
@@ -759,7 +800,7 @@ mod tests {
                 _ => panic!("id must be an integer"),
             })
             .collect();
-        assert_eq!(ids, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(ids, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
 
         // The composite row: type RANGE, entityType NODE, properties = [first, last], Populating.
         let composite = rows
@@ -806,13 +847,28 @@ mod tests {
             "the analyzer surfaces in options.indexConfig"
         );
 
-        // The point index: type POINT, provider point-1.0.
+        // The point index: type POINT, entityType NODE, provider point-1.0.
         let pt = rows
             .iter()
             .find(|r| r[1] == Value::String("by_loc".to_owned()))
             .expect("point listed");
         assert_eq!(pt[4], Value::String("POINT".to_owned()));
+        assert_eq!(pt[5], Value::String("NODE".to_owned()));
         assert_eq!(pt[8], Value::String("point-1.0".to_owned()));
+
+        // The relationship point index (`rmp` task #664): type POINT, entityType RELATIONSHIP, provider
+        // point-1.0, the covered rel type in labelsOrTypes.
+        let pt_rel = rows
+            .iter()
+            .find(|r| r[1] == Value::String("rel_at".to_owned()))
+            .expect("relationship point listed");
+        assert_eq!(pt_rel[4], Value::String("POINT".to_owned()));
+        assert_eq!(pt_rel[5], Value::String("RELATIONSHIP".to_owned()));
+        assert_eq!(pt_rel[8], Value::String("point-1.0".to_owned()));
+        assert_eq!(
+            pt_rel[6],
+            Value::List(vec![Value::String("VISITED".to_owned())])
+        );
 
         // The text index (`rmp` task #662): type TEXT (distinct from RANGE), entityType NODE, provider
         // text-1.0, single property, no owning constraint.
@@ -990,13 +1046,25 @@ mod tests {
                 if_not_exists: false,
             }
         );
-        // POINT.
+        // POINT (node).
         assert_eq!(
             parse_index(&create_point("by_loc", "City", "loc")),
             IndexCommand::CreatePointIndex {
                 name: "by_loc".to_owned(),
+                entity: SpatialEntity::Node,
                 label: "City".to_owned(),
                 property: "loc".to_owned(),
+                if_not_exists: false,
+            }
+        );
+        // POINT (relationship) — round-trips through the entity-aware create DDL (`rmp` #664).
+        assert_eq!(
+            parse_index(&create_point_rel("rel_at", "VISITED", "at")),
+            IndexCommand::CreatePointIndex {
+                name: "rel_at".to_owned(),
+                entity: SpatialEntity::Relationship,
+                label: "VISITED".to_owned(),
+                property: "at".to_owned(),
                 if_not_exists: false,
             }
         );

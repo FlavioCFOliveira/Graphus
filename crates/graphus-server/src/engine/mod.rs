@@ -2562,6 +2562,7 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
                 rel_property: coordinator.list_rel_property_indexes(),
                 fulltext: coordinator.list_fulltext_indexes(),
                 point: coordinator.list_point_indexes(),
+                point_rel: coordinator.list_point_rel_indexes(),
                 text: coordinator.list_text_indexes(),
                 constraints: coordinator.list_constraints(),
             };
@@ -2649,14 +2650,20 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
         }
         IndexCommand::CreatePointIndex {
             name,
+            entity,
             label,
             property,
             if_not_exists,
         } => {
-            // A spatial index has no analyzer to validate (unlike the full-text index): start the
-            // non-blocking online build directly (`rmp` task #98). `mutated == false` is an idempotent
-            // `IF NOT EXISTS` no-op → 0 added; otherwise 1 added (`rmp` task #661).
-            let mutated = coordinator.create_point_index(name, label, property, *if_not_exists)?;
+            // A spatial index has no analyzer to validate (unlike the full-text index). Route by entity
+            // (`rmp` task #664): a node index builds non-blockingly (`rmp` #98); a relationship index
+            // builds synchronously-`Online` (like the relationship full-text / property indexes).
+            // `mutated == false` is an idempotent `IF NOT EXISTS` no-op → 0 added; otherwise 1 added.
+            let mutated = if entity.is_relationship() {
+                coordinator.create_point_rel_index(name, label, property, *if_not_exists)?
+            } else {
+                coordinator.create_point_index(name, label, property, *if_not_exists)?
+            };
             Ok(IndexDdlReply::mutation(mutated))
         }
         IndexCommand::DropPointIndex { name, if_exists } => {

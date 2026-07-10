@@ -222,15 +222,18 @@ pub enum IndexCommand {
         /// Whether `IF EXISTS` was given (a missing index becomes a no-op success) (`rmp` task #661).
         if_exists: bool,
     },
-    /// `CREATE POINT INDEX [<name>] [IF NOT EXISTS] FOR (n:<Label>) ON (n.<prop>)`
-    /// (`rmp` tasks #98, #661): starts a **non-blocking** online build of a grid spatial (point) index
-    /// over `(label, property)`. `name` is the requested server-unique name (auto-generated
-    /// deterministically by the admin matcher when omitted); `if_not_exists` makes an already-existing
-    /// equivalent index (same name or same covered schema) a no-op success rather than a replace.
+    /// `CREATE POINT INDEX [<name>] [IF NOT EXISTS] FOR (n:<Label>) ON (n.<prop>)` (node) or
+    /// `… FOR ()-[r:<Type>]-() ON (r.<prop>)` (relationship) (`rmp` tasks #98, #661, #664): starts a
+    /// build of a grid spatial (point) index over `(entity, label_or_type, property)` — non-blocking for
+    /// a node index, synchronous-`Online` for a relationship index. `name` is the requested server-unique
+    /// name (auto-generated deterministically by the admin matcher when omitted); `if_not_exists` makes an
+    /// already-existing equivalent index (same name or same covered schema) a no-op success.
     CreatePointIndex {
         /// The server-unique index name.
         name: String,
-        /// The node label the index covers.
+        /// Whether the index covers a node label or a relationship type (`rmp` task #664).
+        entity: graphus_cypher::SpatialEntity,
+        /// The node label (node index) or relationship type (relationship index) the index covers.
         label: String,
         /// The point property the index covers (exactly one).
         property: String,

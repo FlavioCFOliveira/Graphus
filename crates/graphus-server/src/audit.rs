@@ -1307,16 +1307,23 @@ pub fn redact_index_detail(cmd: &crate::engine::IndexCommand) -> String {
             let if_e = if *if_exists { " IF EXISTS" } else { "" };
             format!("DROP FULLTEXT INDEX {name}{if_e}")
         }
-        // Spatial (point) index DDL (`rmp` task #98) carries no secret either: the index name, label
-        // and property key are all schema identifiers.
+        // Spatial (point) index DDL (`rmp` tasks #98, #664) carries no secret either: the index name,
+        // label/type and property key are all schema identifiers. The `entity` renders the node vs
+        // relationship pattern.
         I::CreatePointIndex {
             name,
+            entity,
             label,
             property,
             if_not_exists,
         } => {
             let if_ne = if *if_not_exists { " IF NOT EXISTS" } else { "" };
-            format!("CREATE POINT INDEX {name}{if_ne} FOR (:{label}) ON ({property})")
+            let pattern = if entity.is_relationship() {
+                format!("()-[:{label}]-()")
+            } else {
+                format!("(:{label})")
+            };
+            format!("CREATE POINT INDEX {name}{if_ne} FOR {pattern} ON ({property})")
         }
         I::DropPointIndex { name, if_exists } => {
             let if_e = if *if_exists { " IF EXISTS" } else { "" };
