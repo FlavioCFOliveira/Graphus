@@ -21,7 +21,7 @@
 //! design.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -29,6 +29,7 @@ use clap::{Parser, Subcommand};
 use graphus_cli::client::{BoltClient, ClientError};
 use graphus_cli::render::render_table;
 use graphus_cli::repl::Repl;
+use graphus_cli::transport::{BoltUrl, Transport};
 
 /// The conventional default UDS path: Graphus's `ServerConfig` default `uds_path` is `graphus.sock`
 /// (relative to the server's working directory). The CLI mirrors that default and lets `--uds`
@@ -38,13 +39,30 @@ const DEFAULT_UDS_PATH: &str = "graphus.sock";
 /// The environment variable consulted for the password when `--password` is omitted.
 const PASSWORD_ENV: &str = "GRAPHUS_PASSWORD";
 
-/// Interactive Cypher shell and admin client for the Graphus graph database (over Bolt/UDS).
+/// Interactive Cypher shell and admin client for the Graphus graph database (over Bolt).
+///
+/// The default transport is a local **Unix domain socket** (`--uds`). To reach a remote instance,
+/// pass a **Bolt URL** with `--bolt` (`bolt://` plaintext, `bolt+s://` TLS-verified, or `bolt+ssc://`
+/// TLS accepting a self-signed certificate). `--uds` and `--bolt` are mutually exclusive; when
+/// neither is given the CLI connects over the default socket path.
 #[derive(Debug, Parser)]
 #[command(name = "graphus-cli", version, about)]
 struct Args {
-    /// Path to the server's Unix domain socket.
-    #[arg(long, value_name = "PATH", default_value = DEFAULT_UDS_PATH)]
-    uds: PathBuf,
+    /// Path to the server's Unix domain socket (the default transport, `graphus.sock`). Mutually
+    /// exclusive with `--bolt`.
+    #[arg(long, value_name = "PATH", conflicts_with = "bolt")]
+    uds: Option<PathBuf>,
+
+    /// Bolt URL of a remote server: `bolt://host:port` (plaintext), `bolt+s://host:port` (TLS,
+    /// certificate verified against the Mozilla root store), or `bolt+ssc://host:port` (TLS accepting
+    /// any/self-signed certificate). The port defaults to `7687`. Mutually exclusive with `--uds`.
+    #[arg(long, value_name = "URL")]
+    bolt: Option<String>,
+
+    /// The session database every statement runs against (the Bolt 5.x `db` field). When omitted, the
+    /// server's configured default database is used.
+    #[arg(long, value_name = "NAME")]
+    database: Option<String>,
 
     /// The user to authenticate as (Bolt `basic` scheme).
     #[arg(long, short = 'u', value_name = "USER", default_value = "neo4j")]
@@ -152,19 +170,29 @@ fn main() -> ExitCode {
     }
 }
 
-/// Resolves credentials, connects + logs in, then runs `-c` once or starts the REPL.
+/// Resolves credentials, connects (over UDS or Bolt-over-TCP/TLS) + logs in, then runs `-c` once or
+/// starts the REPL.
 fn run(args: Args) -> Result<(), String> {
     let password = resolve_password(args.password, args.password_file)?;
 
-    let mut client = BoltClient::connect_uds(&args.uds).map_err(|e| match e {
-        ClientError::Io(io) => format!("cannot connect to {}: {io}", args.uds.display()),
-        other => other.to_string(),
+    // Select the transport: an explicit `--bolt` URL (TCP/TLS) or the Unix socket (the default,
+    // either an explicit `--uds` path or the conventional `graphus.sock`). clap guarantees the two
+    // flags are mutually exclusive.
+    let (transport, target) = connect_transport(args.bolt.as_deref(), args.uds.as_deref())?;
+
+    let mut client = BoltClient::with_stream(transport).map_err(|e| match e {
+        ClientError::Io(io) => format!("cannot connect to {target}: {io}"),
+        other => format!("cannot connect to {target}: {other}"),
     })?;
     client
         .login(&args.user, &password)
         .map_err(|e| format!("login failed: {e}"))?;
     // The password is dropped here; it lives only as long as the single LOGON send needed it.
     drop(password);
+
+    // Pin the session database (the Bolt 5.x `db` field on every RUN), if one was requested. Applies
+    // over any transport; an absent/empty name leaves the server's default in effect.
+    client.set_database(args.database);
 
     // An operator subcommand (backup/restore) takes precedence: build its admin statement and run it
     // once. Otherwise fall back to `-c` (one-shot) or the interactive REPL.
@@ -175,12 +203,36 @@ fn run(args: Args) -> Result<(), String> {
     match args.command {
         // One-shot: run the statement, render it, send GOODBYE, exit with a status reflecting success.
         Some(statement) => run_once(client, &statement),
-        // Interactive REPL.
+        // Interactive REPL. The `target` label (socket path or Bolt URL) is what `:status` reports.
         None => {
-            let mut repl = Repl::new(client, args.uds);
+            let mut repl = Repl::new(client, PathBuf::from(target));
             repl.run_interactive().map_err(|e| e.to_string())
         }
     }
+}
+
+/// Opens the transport implied by the flags and returns it alongside a human-readable target label
+/// (the socket path or the Bolt URL) for diagnostics and `:status`.
+///
+/// `bolt` (a `--bolt` URL) wins when present; otherwise a Unix socket is opened at `uds` or, when that
+/// is absent too, at the conventional [`DEFAULT_UDS_PATH`].
+fn connect_transport(
+    bolt: Option<&str>,
+    uds: Option<&std::path::Path>,
+) -> Result<(Transport, String), String> {
+    if let Some(url) = bolt {
+        let parsed = BoltUrl::parse(url)?;
+        let target = parsed.to_string();
+        let transport = Transport::connect_bolt(&parsed)
+            .map_err(|e| format!("cannot connect to {target}: {e}"))?;
+        return Ok((transport, target));
+    }
+
+    let path = uds.map_or_else(|| PathBuf::from(DEFAULT_UDS_PATH), Path::to_path_buf);
+    let target = path.display().to_string();
+    let transport =
+        Transport::connect_uds(&path).map_err(|e| format!("cannot connect to {target}: {e}"))?;
+    Ok((transport, target))
 }
 
 /// Runs a single statement and renders it to stdout, then closes the session.
@@ -188,10 +240,7 @@ fn run(args: Args) -> Result<(), String> {
 /// A query *failure* (syntax/runtime) is reported to stderr and surfaced as an `Err`, so `-c` has a
 /// non-zero exit status that scripts and the integration test can assert on. A successful query
 /// (even with zero rows) exits `Ok`.
-fn run_once(
-    mut client: BoltClient<std::os::unix::net::UnixStream>,
-    statement: &str,
-) -> Result<(), String> {
+fn run_once(mut client: BoltClient<Transport>, statement: &str) -> Result<(), String> {
     let outcome = client.run(statement);
     let _ = client.goodbye();
     match outcome {
@@ -287,8 +336,13 @@ mod tests {
 
     #[test]
     fn args_parse_with_defaults() {
+        // Neither transport flag: both are `None`; `run` then falls back to the default UDS path
+        // (see `connect_transport`). This keeps UDS the default transport without a clap
+        // `default_value`, which would otherwise fight the `--uds`/`--bolt` conflict.
         let args = Args::try_parse_from(["graphus-cli"]).expect("defaults parse");
-        assert_eq!(args.uds, PathBuf::from(DEFAULT_UDS_PATH));
+        assert!(args.uds.is_none());
+        assert!(args.bolt.is_none());
+        assert!(args.database.is_none());
         assert_eq!(args.user, "neo4j");
         assert!(args.password.is_none());
         assert!(args.command.is_none());
@@ -306,9 +360,47 @@ mod tests {
             "RETURN 1",
         ])
         .expect("explicit args parse");
-        assert_eq!(args.uds, PathBuf::from("/tmp/g.sock"));
+        assert_eq!(args.uds, Some(PathBuf::from("/tmp/g.sock")));
         assert_eq!(args.user, "alice");
         assert_eq!(args.command.as_deref(), Some("RETURN 1"));
+    }
+
+    #[test]
+    fn args_parse_bolt_url_and_database() {
+        let args = Args::try_parse_from([
+            "graphus-cli",
+            "--bolt",
+            "bolt+ssc://100.89.148.30:7687",
+            "--database",
+            "analytics",
+            "-u",
+            "graphus",
+            "-c",
+            "RETURN 1 AS one",
+        ])
+        .expect("bolt args parse");
+        assert!(args.uds.is_none());
+        assert_eq!(args.bolt.as_deref(), Some("bolt+ssc://100.89.148.30:7687"));
+        assert_eq!(args.database.as_deref(), Some("analytics"));
+        assert_eq!(args.user, "graphus");
+        assert_eq!(args.command.as_deref(), Some("RETURN 1 AS one"));
+    }
+
+    #[test]
+    fn uds_and_bolt_are_mutually_exclusive() {
+        // A user must pick one transport; specifying both is a clap-level conflict, not a silent
+        // last-wins.
+        let parsed = Args::try_parse_from([
+            "graphus-cli",
+            "--uds",
+            "/tmp/g.sock",
+            "--bolt",
+            "bolt://localhost:7687",
+        ]);
+        assert!(
+            parsed.is_err(),
+            "--uds and --bolt must conflict at the clap level"
+        );
     }
 
     #[test]

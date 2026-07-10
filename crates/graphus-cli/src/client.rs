@@ -126,6 +126,9 @@ pub struct BoltClient<S: Read + Write> {
     stream: S,
     dechunker: Dechunker,
     info: Option<ServerInfo>,
+    /// The session database each `RUN` targets (Bolt 5.x `db` field), if pinned via `--database`.
+    /// `None` (the default) leaves the server to serve its configured default database.
+    database: Option<String>,
 }
 
 impl BoltClient<UnixStream> {
@@ -164,7 +167,15 @@ impl<S: Read + Write> BoltClient<S> {
                 server_agent: String::new(),
                 connection_id: String::new(),
             }),
+            database: None,
         })
+    }
+
+    /// Pins the session database every subsequent [`BoltClient::run`] targets (the Bolt 5.x `db`
+    /// field on `RUN`). Passing `None` — or an empty name — restores the server's configured default
+    /// database. This is the `--database` passthrough (rmp #688); it applies over any transport.
+    pub fn set_database(&mut self, database: Option<String>) {
+        self.database = database.filter(|db| !db.is_empty());
     }
 
     /// Performs the 4-slot handshake: proposes 5.0..=5.4 and reads the negotiated version.
@@ -271,10 +282,16 @@ impl<S: Read + Write> BoltClient<S> {
     /// [`ClientError::Protocol`] on an out-of-place message; [`ClientError::Io`] on a transport fault.
     pub fn run(&mut self, query: &str) -> ClientResult<QueryResult> {
         let started = Instant::now();
+        // A pinned session database rides on the `RUN` `extra` map's `db` field (Bolt 5.x); the
+        // server resolves an absent/empty `db` to its configured default (the unchanged fast path).
+        let extra = match &self.database {
+            Some(db) => vec![("db".to_owned(), Value::String(db.clone()))],
+            None => vec![],
+        };
         self.send(&Request::Run {
             query: query.to_owned(),
             parameters: vec![],
-            extra: vec![],
+            extra,
         })?;
         let fields = match self.recv()? {
             Response::Success { metadata } => extract_fields(&metadata),
@@ -572,6 +589,54 @@ mod tests {
         assert_eq!(
             map_get_string(&result.summary, "type"),
             Some("r".to_owned())
+        );
+    }
+
+    #[test]
+    fn set_database_puts_db_on_the_run_extra() {
+        let mut script = negotiated_54().to_vec();
+        script.extend(framed(&Response::Success { metadata: vec![] })); // HELLO
+        script.extend(framed(&Response::Success { metadata: vec![] })); // LOGON
+        script.extend(framed(&Response::Success { metadata: vec![] })); // RUN SUCCESS (no fields)
+        script.extend(framed(&Response::Success { metadata: vec![] })); // trailing summary (no records)
+
+        let mut client = BoltClient::with_stream(ScriptedStream::new(script)).unwrap();
+        client.login("alice", "pw").unwrap();
+        client.set_database(Some("analytics".to_owned()));
+        client.run("RETURN 1").unwrap();
+
+        // The pinned database must appear on the wire as the `db` field of the RUN extra map. Both the
+        // key and the value are PackStream strings, so a byte-substring check is a faithful proxy.
+        let sent = String::from_utf8_lossy(&client.stream.from_client);
+        assert!(sent.contains("db"), "RUN extra must carry a `db` key");
+        assert!(
+            sent.contains("analytics"),
+            "RUN extra must carry the pinned database name"
+        );
+    }
+
+    #[test]
+    fn empty_database_is_byte_identical_to_the_default_path() {
+        // `--database ''` must NOT pin a database: the RUN extra stays empty so the server serves its
+        // configured default. Proven by byte-equivalence — a client that pins an empty name sends the
+        // exact same wire bytes as one that never sets a database at all (the unchanged fast path).
+        fn run_and_capture(db: Option<String>) -> Vec<u8> {
+            let mut script = negotiated_54().to_vec();
+            script.extend(framed(&Response::Success { metadata: vec![] })); // HELLO
+            script.extend(framed(&Response::Success { metadata: vec![] })); // LOGON
+            script.extend(framed(&Response::Success { metadata: vec![] })); // RUN SUCCESS
+            script.extend(framed(&Response::Success { metadata: vec![] })); // trailing summary
+            let mut client = BoltClient::with_stream(ScriptedStream::new(script)).unwrap();
+            client.login("alice", "pw").unwrap();
+            client.set_database(db);
+            client.run("RETURN 1").unwrap();
+            client.stream.from_client
+        }
+
+        assert_eq!(
+            run_and_capture(Some(String::new())),
+            run_and_capture(None),
+            "an empty --database must be indistinguishable from no --database on the wire"
         );
     }
 

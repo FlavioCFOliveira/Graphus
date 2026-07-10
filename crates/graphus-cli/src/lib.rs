@@ -12,8 +12,12 @@
 //! interactive, single-connection, request/response REPL (no async runtime needed; the codec is pure
 //! sync byte ops).
 //!
-//! - [`client`] — the synchronous Bolt-over-UDS client: connect → handshake → `HELLO`/`LOGON` →
-//!   `RUN`/`PULL` → `GOODBYE`, surfacing a server `FAILURE` as a clean error.
+//! - [`client`] — the synchronous Bolt client (connect → handshake → `HELLO`/`LOGON` →
+//!   `RUN`/`PULL` → `GOODBYE`, surfacing a server `FAILURE` as a clean error), generic over any
+//!   [`Read`](std::io::Read) + [`Write`](std::io::Write) byte stream.
+//! - [`transport`] — transport selection: the default Unix domain socket, or **Bolt-over-TCP** with
+//!   optional **TLS** ([`transport::BoltUrl`] / [`transport::Transport`]) for reaching a remote
+//!   instance (`--bolt bolt://` / `bolt+s://` / `bolt+ssc://`, rmp #688).
 //! - [`render`] — Cypher-ish [`graphus_core::Value`] formatting and an aligned ASCII result table.
 //! - [`repl`] — statement accumulation (`;`-terminated, multi-line), meta-commands (`:help`,
 //!   `:status`, `:clear`, `:quit`), and result rendering, all over a [`client::BoltClient`].
@@ -22,3 +26,4 @@
 pub mod client;
 pub mod render;
 pub mod repl;
+pub mod transport;

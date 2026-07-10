@@ -39,6 +39,18 @@ clap = { version = "4", features = ["derive"] }
 # target-gated). Avoids hand-rolling `unsafe` termios toggling for a tiny, well-trodden need.
 rpassword = "7"
 
+# Synchronous TLS client for the Bolt-over-TCP transport (`--bolt bolt+s://` / `bolt+ssc://`, rmp
+# #688). This is the SAME stack the server terminates TLS with (rustls 0.23 + the default `aws_lc_rs`
+# provider, `graphus-auth`/`graphus-server`), so no second rustls/crypto backend enters the graph —
+# `rustls` + `aws-lc-rs` are already in the workspace lock. The CLI is synchronous, so it uses
+# rustls' blocking `ClientConnection` + `StreamOwned` over a `std::net::TcpStream` (not tokio-rustls).
+rustls = "0.23"
+# The Mozilla trust anchors backing `bolt+s://` (verified) TLS. A single, pure-data crate (its only
+# dependency, `rustls-pki-types`, is already in the lock), so it adds no runtime/native code — the
+# minimal way to give the CLI a real root store without pulling in the OS-trust-store machinery.
+# `bolt+ssc://` (self-signed) does not consult these roots (it accepts any cert).
+webpki-roots = "1"
+
 [dev-dependencies]
 # The AC integration test boots a REAL server in-process and drives the CLI client over its UDS
 # socket. Booting the async server needs Tokio; the CLI client itself stays synchronous.
