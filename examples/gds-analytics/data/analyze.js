@@ -1,58 +1,91 @@
 'use strict';
 //
-// analyze.js — the Graph-Data-Science analytics workload, driven over Bolt-over-TCP+TLS with the
-// OFFICIAL `neo4j-driver` npm package (the exact wire path the Neo4j driver ecosystem uses).
+// analyze.js — the Graph-Data-Science analytics workload, driven over Bolt (+TLS) with the OFFICIAL
+// `neo4j-driver` npm package (the exact wire path the Neo4j driver ecosystem uses).
 //
-// It:
-//   1. connects with `bolt+ssc://` (trusts the server's self-signed cert),
-//   2. loads the schema DDL + the generated influence network (from graph.cypher): a UNIQUE + two
-//      `IS ::` node property-type constraints (field_name :: STRING, h_index :: INTEGER), a node RANGE
-//      index (Author.field) and a relationship RANGE index (CITES.weight); then :Author nodes,
-//      intra-field :CITES edges, sparse inter-field :CROSS edges, and a small :Ref/:LINKS reference
-//      subgraph. It captures the live SHOW CONSTRAINTS / SHOW INDEXES catalog as evidence and proves
-//      the property-type constraint rejects a non-string field_name (rmp #679),
-//   3. projects the graph into the in-memory CSR via `CALL gds.graph.project(...)` and runs the FULL
-//      algorithm suite through the `CALL gds.*.stream(...)` procedure surface — PageRank, degree +
-//      betweenness + closeness centrality, WCC + SCC, triangleCount, label propagation (community),
-//      and Dijkstra/Bellman-Ford shortest paths — then DROPS the projections,
-//   4. asserts the reference-subgraph outputs match the analytically-known ground truth
-//      (reference.json) within a documented tolerance: the exact WCC partition, the highest-
-//      betweenness (bridge) nodes, the degree sequence, a shortest-path distance vector, the
-//      triangle-count signature of the two planted cliques, PageRank symmetry + ordering, and the
-//      recovery of the planted FIELD communities via WCC over the :CITES-only projection.
+// It runs UNCHANGED against a self-booted local server OR an already-running instance (local or
+// remote, e.g. pi516): the caller passes a full Bolt URI and — for the attach path — the name of the
+// run-scoped, isolated database the harness carved out. Every session is bound to that database.
 //
-// On full success it prints `GRAPHUS_GDS_OK` and exits 0; on any mismatch it prints a clear
-// diagnosis and exits 1.
+// What it exercises (rmp #690):
+//   1. connects (bolt:// or bolt+ssc:// for a self-signed target) and pins every session to --database,
+//   2. TEARS DOWN first (DETACH DELETE :Author/:Ref + drop leftover GDS projections) so a second
+//      consecutive run against the SAME database is clean — the workload is idempotent and safe-on-shared,
+//   3. loads the schema DDL + the generated influence network from graph.cypher. The schema DDL is
+//      IDEMPOTENT (`IF NOT EXISTS`) and applied VERSION-TOLERANTLY: a statement an older server cannot
+//      parse (named/relationship indexes, `IF NOT EXISTS`) is skipped with a note, so the SAME script
+//      loads on a current build and on an older instance alike,
+//   4. asserts the analytically-known reference-subgraph ground truth (reference.json) via gds.*.stream,
+//   5. runs a WEIGHTED-vs-UNWEIGHTED comparison — the headline of a real GDS workload: weighted vs
+//      unweighted PageRank rankings, and weighted vs unweighted Dijkstra distances (relationshipWeight-
+//      Property='weight'), asserting the two genuinely differ and reporting the top rankings,
+//   6. streams the FULL (nodeId, score) result set of weighted PageRank (no count(*) collapse),
+//   7. exercises the WRITE / MUTATE / STATS execution modes when the server registers them (feature-
+//      detected): gds.pageRank.write{writeProperty:'pagerank'} then a MATCH…WHERE pagerank>x ORDER BY
+//      readback asserting nodePropertiesWritten==authorCount; gds.pageRank.stats asserting a summary
+//      field; gds.pageRank.mutate then gds.graph.nodeProperty.stream readback,
+//   8. tears down again (drops projections + DETACH DELETE) and reports machine-readable stats.
+//
+// On full success it prints `GRAPHUS_GDS_OK` and exits 0; on any assertion mismatch it prints a clear
+// diagnosis and exits 1. Skips (older-server capability gaps) are printed but never fail the run.
 //
 // IMPORTANT — verified procedure-surface facts (empirically confirmed against the real engine):
 //   * gds.* procedures use STRICT ARITY: `gds.graph.project` needs 4 args (name, nodeFilter,
 //     relFilter, config) and every `gds.*.stream` needs 2 (name, config). A trailing `{}` / null is
 //     mandatory, never omitted.
-//   * `exists` is a reserved word, so `gds.graph.exists` yields must be escaped (we avoid it here).
+//   * `relationshipWeightProperty` is a PROJECTION-time config: a graph projected with it is weighted,
+//     and PageRank / Dijkstra / closeness then use the weights. betweenness is Brandes over UNWEIGHTED
+//     BFS in this engine (it ignores weights — see crates/graphus-gds/src/algo/centrality.rs), so we
+//     deliberately do NOT claim a weighted betweenness.
 //   * The streamed `nodeId` is the engine's INTERNAL node id, not the `id` property; we read the
-//     id<->property mapping with `MATCH (r:Ref) RETURN id(r), r.id` and translate.
-//   * Graphus has NO Louvain and NO node-similarity procedure (verified: "no procedure registered");
-//     community detection uses labelPropagation, and the planted FIELD partition is recovered via WCC
-//     over the :CITES-only projection (synchronous LPA over-merges dense graphs — documented).
+//     id<->property mapping with `MATCH (a:Author) RETURN id(a), a.id` and translate.
+//   * The .write/.stats/.mutate execution modes and gds.graph.nodeProperty.stream are a newer surface
+//     (rmp #643); an older instance may not register them, so we feature-detect and skip cleanly.
 //
 // Usage:
-//   node analyze.js <port> <user> <password> <graph.cypher> <reference.json>
+//   node analyze.js --uri <bolt-uri> --user <u> --password <p> [--database <db>] \
+//                   --graph <graph.cypher> --reference <reference.json>
 
 const fs = require('fs');
 const neo4j = require('neo4j-driver');
 
-const [, , port, user, password, cypherPath, refPath] = process.argv;
-if (!port || !user || !password || !cypherPath || !refPath) {
-  console.error('usage: node analyze.js <port> <user> <password> <graph.cypher> <reference.json>');
+// ---- CLI ---------------------------------------------------------------------------------------
+function parseArgs(argv) {
+  const out = { uri: '', user: '', password: '', database: '', graph: '', reference: '' };
+  for (let i = 0; i < argv.length; i += 1) {
+    const a = argv[i];
+    const next = () => argv[(i += 1)];
+    switch (a) {
+      case '--uri': out.uri = next(); break;
+      case '--user': out.user = next(); break;
+      case '--password': out.password = next(); break;
+      case '--database': out.database = next(); break;
+      case '--graph': out.graph = next(); break;
+      case '--reference': out.reference = next(); break;
+      default:
+        console.error(`analyze.js: unknown argument '${a}'`);
+        process.exit(2);
+    }
+  }
+  return out;
+}
+
+const args = parseArgs(process.argv.slice(2));
+if (!args.uri || !args.user || !args.password || !args.graph || !args.reference) {
+  console.error(
+    'usage: node analyze.js --uri <bolt-uri> --user <u> --password <p> [--database <db>] ' +
+      '--graph <graph.cypher> --reference <reference.json>'
+  );
   process.exit(2);
 }
 
-const uri = `bolt+ssc://127.0.0.1:${port}`;
 const toNum = (v) => (neo4j.isInt(v) ? v.toNumber() : v);
 
-// PageRank float comparison tolerance (the engine returns IEEE-754 doubles; we assert symmetry and
-// ordering within this epsilon, never bit-exact equality).
+// PageRank float comparison tolerance (the engine returns IEEE-754 doubles; assertions on equality
+// use this epsilon, never bit-exact).
 const PR_EPSILON = 1e-9;
+// The magnitude a weighted score must differ from its unweighted counterpart to count as "changed".
+const WEIGHT_DELTA = 1e-6;
 
 // ---- Evidence: per-operation latency sample + nearest-rank percentiles (ms) --------------------
 const latenciesMs = [];
@@ -83,9 +116,29 @@ function sameSet(a, b) {
   return true;
 }
 
-// Split a .cypher script into individual statements on `;` at end-of-line; drop `//` comment lines.
-// The schema DDL MUST run as auto-commit statements (Graphus rejects admin DDL inside an explicit
-// transaction), so each statement runs in its own auto-commit `session.run`.
+// An error the CURRENT server cannot honour because it is an OLDER build (unknown procedure, or a
+// newer DDL surface it cannot parse). Such statements are skipped, never fatal — the same script must
+// run on a current build and on an older instance alike.
+function isCapabilityGap(e) {
+  const m = (e && (e.message || String(e))) || '';
+  const code = (e && e.code) || '';
+  return (
+    m.includes('no procedure registered') ||
+    m.includes('there is no procedure') ||
+    code === 'Neo.ClientError.Statement.SyntaxError' ||
+    m.includes('compile-time error') ||
+    /unexpected `/.test(m)
+  );
+}
+
+// A benign "the object already exists" schema outcome — treated as idempotent success on a server that
+// does not support `IF NOT EXISTS` (so a second consecutive run against a shared DB still passes).
+function isAlreadyExists(e) {
+  const m = (e && (e.message || String(e))) || '';
+  return /already exists|equivalent (constraint|index)|already declared/i.test(m);
+}
+
+// Split a .cypher script into individual statements on `;`; drop `//` comment lines.
 function statements(script) {
   return script
     .split('\n')
@@ -96,138 +149,210 @@ function statements(script) {
     .filter((s) => s.length > 0);
 }
 
-// Run a read/proc query and return the raw records.
-async function runQuery(driver, query, params) {
-  const s = driver.session();
-  try {
-    const r = await timed(() => s.run(query, params || {}));
-    return r.records;
-  } finally {
-    await s.close();
-  }
-}
-
-// Run a write that MUST be rejected by a constraint; fail loudly if the engine ACCEPTS it. Returns the
-// server's error message (for the evidence log). A silently-accepted violation is a correctness bug.
-async function runExpectReject(driver, query, what) {
-  const s = driver.session();
-  try {
-    await s.run(query);
-    fail(`constraint enforcement broken: ${what} was ACCEPTED but must be rejected`);
-  } catch (e) {
-    return e.message || String(e);
-  } finally {
-    await s.close();
-  }
+// Schema DDL: any `CREATE CONSTRAINT …` or any `CREATE … INDEX …` (mirrors the server tests' filter).
+function isSchemaDdl(stmt) {
+  return (
+    stmt.startsWith('CREATE CONSTRAINT') ||
+    (stmt.startsWith('CREATE') && stmt.includes(' INDEX '))
+  );
 }
 
 (async () => {
-  const script = fs.readFileSync(cypherPath, 'utf8');
-  const ref = JSON.parse(fs.readFileSync(refPath, 'utf8'));
+  const script = fs.readFileSync(args.graph, 'utf8');
+  const ref = JSON.parse(fs.readFileSync(args.reference, 'utf8'));
 
-  const driver = neo4j.driver(uri, neo4j.auth.basic(user, password));
+  const driver = neo4j.driver(args.uri, neo4j.auth.basic(args.user, args.password));
+  const sess = () => (args.database ? driver.session({ database: args.database }) : driver.session());
+
+  // Run a read/proc query, returning the raw records.
+  async function runQuery(query, params) {
+    const s = sess();
+    try {
+      const r = await timed(() => s.run(query, params || {}));
+      return r.records;
+    } finally {
+      await s.close();
+    }
+  }
+
+  // Run a statement that may not be supported by an older server. Returns {ok, records, err}.
+  async function runOptional(query, params) {
+    const s = sess();
+    try {
+      const r = await timed(() => s.run(query, params || {}));
+      return { ok: true, records: r.records };
+    } catch (e) {
+      return { ok: false, err: e };
+    } finally {
+      await s.close();
+    }
+  }
+
+  // Drop a GDS projection if it exists (never fatal).
+  async function dropGraph(name) {
+    await runOptional(`CALL gds.graph.drop('${name}') YIELD graphName RETURN graphName`);
+  }
+
+  // Drop every registered GDS projection (idempotent teardown of the in-memory catalog).
+  async function dropAllProjections() {
+    const r = await runOptional('CALL gds.graph.list() YIELD graphName RETURN graphName');
+    if (!r.ok) return; // older server without gds.graph.list — nothing we can enumerate
+    for (const rec of r.records) {
+      await dropGraph(rec.get('graphName'));
+    }
+  }
+
+  // DETACH DELETE the example's own nodes (clean slate). Safe on an empty database.
+  async function deleteExampleData() {
+    for (const label of ['Author', 'Ref']) {
+      await runOptional(`MATCH (n:${label}) DETACH DELETE n`);
+    }
+  }
+
   try {
     await driver.verifyConnectivity();
+    console.log(`connected: ${args.uri}  database=${args.database || '(home)'}`);
 
-    // ---- 1. Load the schema + graph (each statement its own auto-commit run).
+    // =============================================================================================
+    // 0. TEARDOWN-FIRST — idempotent, safe-on-shared. A second consecutive run starts from a clean
+    //    slate whether the target is a fresh isolated DB or an operator-owned shared DB.
+    // =============================================================================================
+    await dropAllProjections();
+    await deleteExampleData();
+
+    // =============================================================================================
+    // 1. LOAD — schema (idempotent + version-tolerant) then data (batched write transactions).
+    // =============================================================================================
     const stmts = statements(script);
+    const schema = stmts.filter(isSchemaDdl);
+    const data = stmts.filter((s) => !isSchemaDdl(s));
+
+    // Schema DDL runs auto-commit (admin DDL is rejected inside an explicit txn). Each application is
+    // version-tolerant. On a current build every form (named + relationship indexes, `IF NOT EXISTS`)
+    // applies directly and is idempotent. On an OLDER instance that cannot parse `IF NOT EXISTS`, we
+    // retry the plain form (recovering, e.g., the named CONSTRAINTs an older build still supports);
+    // a form the old build cannot parse at all (named/relationship indexes) is skipped with a note.
+    // An "already exists" outcome (a re-run against a shared DB with no `IF NOT EXISTS`) is benign.
+    const createdConstraints = new Set();
+    const noteApplied = (stmt) => {
+      const m = stmt.match(/^CREATE CONSTRAINT (\w+)/);
+      if (m) createdConstraints.add(m[1]);
+    };
+    // Apply one schema statement. Returns 'applied' | 'skipped' (never throws for a capability gap).
+    async function applySchema(stmt) {
+      let r = await runOptional(stmt);
+      if (r.ok || isAlreadyExists(r.err)) { noteApplied(stmt); return 'applied'; }
+      if (!isCapabilityGap(r.err)) fail(`schema statement failed: ${stmt.slice(0, 120)}\n  ${r.err.message}`);
+      // Older server: if the clause is `IF NOT EXISTS`, retry the plain form.
+      if (/ IF NOT EXISTS /.test(stmt)) {
+        const plain = stmt.replace(' IF NOT EXISTS ', ' ');
+        r = await runOptional(plain);
+        if (r.ok || isAlreadyExists(r.err)) { noteApplied(plain); return 'applied'; }
+        if (!isCapabilityGap(r.err)) fail(`schema statement failed: ${plain.slice(0, 120)}\n  ${r.err.message}`);
+      }
+      console.log(`  · schema skipped (server capability gap): ${stmt.slice(0, 68)}…`);
+      return 'skipped';
+    }
+    let schemaApplied = 0;
+    let schemaSkipped = 0;
+    for (const stmt of schema) {
+      if ((await applySchema(stmt)) === 'applied') schemaApplied += 1;
+      else schemaSkipped += 1;
+    }
+    console.log(`schema: ${schemaApplied} applied, ${schemaSkipped} skipped (older-server DDL gaps)`);
+
+    // Data CREATEs load in batched write transactions (far fewer round-trips than one-at-a-time —
+    // important over a network link). Each batch is one commit.
+    const BATCH = 250;
     let loaded = 0;
-    for (const stmt of stmts) {
-      const s = driver.session();
+    for (let i = 0; i < data.length; i += BATCH) {
+      const chunk = data.slice(i, i + BATCH);
+      const s = sess();
       try {
-        await timed(() => s.run(stmt));
-        loaded += 1;
+        await timed(() =>
+          s.executeWrite(async (tx) => {
+            for (const stmt of chunk) await tx.run(stmt);
+          })
+        );
+        loaded += chunk.length;
       } catch (e) {
-        fail(`load statement #${loaded + 1} failed: ${stmt.slice(0, 120)}\n  ${e.message}`);
+        fail(`data load failed near statement #${loaded + 1}: ${e.message}`);
       } finally {
         await s.close();
       }
     }
-    console.log(`loaded ${loaded} statements (schema + influence network + reference subgraph)`);
+    console.log(`loaded ${loaded} data statements (influence network + reference subgraph)`);
 
     const authorCount = toNum(
-      (await runQuery(driver, 'MATCH (a:Author) RETURN count(a) AS c'))[0].get('c')
+      (await runQuery('MATCH (a:Author) RETURN count(a) AS c'))[0].get('c')
     );
     console.log(`authors loaded: ${authorCount}`);
+    if (authorCount === 0) fail('no authors were loaded — the data load did not reach this database');
 
-    // =============================================================================================
-    // 1b. SCHEMA EVIDENCE + CONSTRAINT ENFORCEMENT (rmp #679)
-    //     The load above ran schema-first (a UNIQUE + two `IS ::` property-type constraints, a node
-    //     RANGE index, and a relationship RANGE index on CITES.weight). Capture the live catalog as
-    //     evidence and prove the property-type constraints actually reject non-conforming writes.
-    // =============================================================================================
-    console.log('\n-- schema (constraints + indexes) --');
-    const showCol = (rec, name) => {
-      const v = rec.has(name) ? rec.get(name) : null;
-      if (Array.isArray(v)) return v.map(toNum).join('+');
-      return v === null || v === undefined ? '' : toNum(v);
-    };
-    for (const rec of await runQuery(driver, 'SHOW CONSTRAINTS')) {
-      console.log(
-        `  constraint ${showCol(rec, 'name')}: ${showCol(rec, 'type')} on ` +
-          `${showCol(rec, 'entityType')}(${showCol(rec, 'labelsOrTypes')}).` +
-          `${showCol(rec, 'properties')}` +
-          (showCol(rec, 'propertyType') ? ` :: ${showCol(rec, 'propertyType')}` : '')
-      );
+    // Internal nodeId <-> author id property mapping (the .stream surface returns internal ids).
+    const authNidToPid = new Map();
+    for (const rec of await runQuery('MATCH (a:Author) RETURN id(a) AS nid, a.id AS pid')) {
+      authNidToPid.set(toNum(rec.get('nid')), toNum(rec.get('pid')));
     }
-    for (const rec of await runQuery(driver, 'SHOW INDEXES')) {
-      console.log(
-        `  index ${showCol(rec, 'name')}: ${showCol(rec, 'type')} on ` +
-          `${showCol(rec, 'entityType')}(${showCol(rec, 'labelsOrTypes')}).` +
-          `${showCol(rec, 'properties')} [${showCol(rec, 'state')}]`
-      );
-    }
-
-    // Negative test: a non-string `field_name` MUST be rejected by the node property-type constraint
-    // (`author_field_name_string`). A fresh id keeps the only violation the type mismatch.
-    const rejectMsg = await runExpectReject(
-      driver,
-      "CREATE (:Author {id: 9999999, name: 'bad', field: 0, field_name: 123, h_index: 5})",
-      'an Author with a non-string field_name'
-    );
-    console.log(`  ✓ non-string field_name rejected: ${rejectMsg.split('\n')[0].slice(0, 120)}`);
-    // Sanity: the rejected write created nothing (count unchanged).
-    const afterReject = toNum(
-      (await runQuery(driver, 'MATCH (a:Author) RETURN count(a) AS c'))[0].get('c')
-    );
-    if (afterReject !== authorCount) {
-      fail(`rejected write leaked: author count ${afterReject} != ${authorCount}`);
-    }
-
-    // ---- nodeId (internal) <-> id (property) mapping for the :Ref nodes, so we can translate the
-    //      procedure surface's internal nodeIds back to the stable reference ids in reference.json.
-    const refMap = new Map(); // internal nodeId -> property id
-    const refRevMap = new Map(); // property id -> internal nodeId
-    for (const rec of await runQuery(driver, 'MATCH (r:Ref) RETURN id(r) AS nid, r.id AS pid')) {
-      const nid = toNum(rec.get('nid'));
-      const pid = toNum(rec.get('pid'));
-      refMap.set(nid, pid);
-      refRevMap.set(pid, nid);
-    }
-    const refProp = (nid) => {
-      const p = refMap.get(nid);
-      if (p === undefined) fail(`internal nodeId ${nid} has no :Ref property mapping`);
+    const authPid = (nid) => {
+      const p = authNidToPid.get(nid);
+      if (p === undefined) fail(`internal nodeId ${nid} has no :Author mapping`);
       return p;
     };
 
     // =============================================================================================
-    // 2. THE REFERENCE SUBGRAPH — project :Ref/:LINKS (undirected) and assert the ground truth.
+    // 1b. CONSTRAINT ENFORCEMENT (feature-gated on the constraint having actually been created).
+    // =============================================================================================
+    if (createdConstraints.has('author_field_name_string')) {
+      const s = sess();
+      let rejected = false;
+      let rejMsg = '';
+      try {
+        await s.run(
+          "CREATE (:Author {id: 9999999, name: 'bad', field: 0, field_name: 123, h_index: 5})"
+        );
+      } catch (e) {
+        rejected = true;
+        rejMsg = (e.message || String(e)).split('\n')[0].slice(0, 120);
+      } finally {
+        await s.close();
+      }
+      if (!rejected) fail('constraint enforcement broken: a non-string field_name was ACCEPTED');
+      const after = toNum((await runQuery('MATCH (a:Author) RETURN count(a) AS c'))[0].get('c'));
+      if (after !== authorCount) fail(`rejected write leaked: author count ${after} != ${authorCount}`);
+      console.log(`  ✓ property-type constraint rejected a non-string field_name: ${rejMsg}`);
+    } else {
+      console.log('  · constraint-enforcement demo skipped (no property-type constraint on this server)');
+    }
+
+    // =============================================================================================
+    // 2. THE REFERENCE SUBGRAPH — analytically-known ground truth (gds.*.stream).
     // =============================================================================================
     console.log('\n-- reference subgraph (analytically-known ground truth) --');
+    const refNidToPid = new Map();
+    const refPidToNid = new Map();
+    for (const rec of await runQuery('MATCH (r:Ref) RETURN id(r) AS nid, r.id AS pid')) {
+      const nid = toNum(rec.get('nid'));
+      const pid = toNum(rec.get('pid'));
+      refNidToPid.set(nid, pid);
+      refPidToNid.set(pid, nid);
+    }
+    const refPid = (nid) => {
+      const p = refNidToPid.get(nid);
+      if (p === undefined) fail(`internal nodeId ${nid} has no :Ref mapping`);
+      return p;
+    };
+
     await runQuery(
-      driver,
       "CALL gds.graph.project('ref','Ref','LINKS',{}) YIELD nodeCount, relationshipCount RETURN nodeCount, relationshipCount"
     );
 
-    // (a) WCC: a single component containing exactly the reference ids.
-    const wccRows = await runQuery(
-      driver,
-      'CALL gds.wcc.stream($g,{}) YIELD nodeId, componentId RETURN nodeId, componentId',
-      { g: 'ref' }
-    );
+    // (a) WCC: one component = the reference ids.
     const wccByComp = new Map();
-    for (const rec of wccRows) {
-      const pid = refProp(toNum(rec.get('nodeId')));
+    for (const rec of await runQuery(
+      "CALL gds.wcc.stream('ref',{}) YIELD nodeId, componentId RETURN nodeId, componentId"
+    )) {
+      const pid = refPid(toNum(rec.get('nodeId')));
       const comp = toNum(rec.get('componentId'));
       if (!wccByComp.has(comp)) wccByComp.set(comp, []);
       wccByComp.get(comp).push(pid);
@@ -235,218 +360,264 @@ async function runExpectReject(driver, query, what) {
     if (wccByComp.size !== 1) fail(`reference WCC expected 1 component, got ${wccByComp.size}`);
     const wccMembers = [...wccByComp.values()][0].sort((x, y) => x - y);
     if (!sameSet(wccMembers, ref.component)) {
-      fail(`reference WCC partition mismatch.\n  got: ${JSON.stringify(wccMembers)}\n  exp: ${JSON.stringify(ref.component)}`);
+      fail(`reference WCC partition mismatch: got ${JSON.stringify(wccMembers)} exp ${JSON.stringify(ref.component)}`);
     }
     console.log(`  WCC: 1 component = ${JSON.stringify(wccMembers)} (matches ground truth)`);
 
     // (b) Degree sequence.
-    const degRows = await runQuery(
-      driver,
-      'CALL gds.degree.stream($g,{}) YIELD nodeId, score RETURN nodeId, score',
-      { g: 'ref' }
-    );
-    const gotDeg = degRows
-      .map((r) => [refProp(toNum(r.get('nodeId'))), Math.round(toNum(r.get('score')))])
+    const gotDeg = (
+      await runQuery("CALL gds.degree.stream('ref',{}) YIELD nodeId, score RETURN nodeId, score")
+    )
+      .map((r) => [refPid(toNum(r.get('nodeId'))), Math.round(toNum(r.get('score')))])
       .sort((a, b) => a[0] - b[0]);
     const expDeg = [...ref.degrees].sort((a, b) => a[0] - b[0]);
     if (JSON.stringify(gotDeg) !== JSON.stringify(expDeg)) {
-      fail(`reference degree sequence mismatch.\n  got: ${JSON.stringify(gotDeg)}\n  exp: ${JSON.stringify(expDeg)}`);
+      fail(`reference degree mismatch: got ${JSON.stringify(gotDeg)} exp ${JSON.stringify(expDeg)}`);
     }
     console.log(`  degree: ${JSON.stringify(gotDeg)} (matches ground truth)`);
 
     // (c) Betweenness: the two bridge endpoints are strictly highest.
-    const btwRows = await runQuery(
-      driver,
-      'CALL gds.betweenness.stream($g,{}) YIELD nodeId, score RETURN nodeId, score',
-      { g: 'ref' }
-    );
-    const btw = btwRows
-      .map((r) => ({ id: refProp(toNum(r.get('nodeId'))), s: toNum(r.get('score')) }))
+    const btw = (
+      await runQuery(
+        "CALL gds.betweenness.stream('ref',{}) YIELD nodeId, score RETURN nodeId, score"
+      )
+    )
+      .map((r) => ({ id: refPid(toNum(r.get('nodeId'))), s: toNum(r.get('score')) }))
       .sort((a, b) => b.s - a.s);
     const topBtw = btw.slice(0, 2).map((x) => x.id).sort((x, y) => x - y);
     const restMax = Math.max(...btw.slice(2).map((x) => x.s));
     if (!sameSet(topBtw, ref.top_betweenness_nodes)) {
-      fail(`reference top-betweenness mismatch.\n  got: ${JSON.stringify(topBtw)}\n  exp: ${JSON.stringify(ref.top_betweenness_nodes)}`);
+      fail(`reference top-betweenness mismatch: got ${JSON.stringify(topBtw)} exp ${JSON.stringify(ref.top_betweenness_nodes)}`);
     }
-    if (!(btw[1].s > restMax)) {
-      fail(`reference betweenness not strictly separated: 2nd=${btw[1].s} restMax=${restMax}`);
-    }
-    console.log(`  betweenness: top-2 = ${JSON.stringify(topBtw)} (bridge endpoints, strictly highest at ${btw[0].s.toFixed(1)})`);
+    if (!(btw[1].s > restMax)) fail(`betweenness not strictly separated: 2nd=${btw[1].s} restMax=${restMax}`);
+    console.log(`  betweenness: top-2 = ${JSON.stringify(topBtw)} (bridge endpoints, highest at ${btw[0].s.toFixed(1)})`);
 
-    // (d) Closeness: the bridge endpoints are the most central (highest closeness).
-    const closeRows = await runQuery(
-      driver,
-      'CALL gds.closeness.stream($g,{}) YIELD nodeId, score RETURN nodeId, score',
-      { g: 'ref' }
-    );
-    const close = closeRows
-      .map((r) => ({ id: refProp(toNum(r.get('nodeId'))), s: toNum(r.get('score')) }))
-      .sort((a, b) => b.s - a.s);
-    const topClose = close.slice(0, 2).map((x) => x.id).sort((x, y) => x - y);
-    if (!sameSet(topClose, ref.top_betweenness_nodes)) {
-      fail(`reference closeness top-2 expected the bridge endpoints, got ${JSON.stringify(topClose)}`);
+    // (d) triangleCount: two planted 3-cliques => every node in exactly one triangle.
+    const tri = (
+      await runQuery(
+        "CALL gds.triangleCount.stream('ref',{}) YIELD nodeId, triangleCount RETURN nodeId, triangleCount"
+      )
+    ).map((r) => toNum(r.get('triangleCount')));
+    if (tri.length !== 6 || !tri.every((t) => t === 1)) {
+      fail(`reference triangleCount expected six nodes each in one triangle, got ${JSON.stringify(tri)}`);
     }
-    console.log(`  closeness: top-2 = ${JSON.stringify(topClose)} (bridge endpoints, highest at ${close[0].s.toFixed(4)})`);
+    console.log('  triangleCount: all 6 nodes in exactly 1 triangle (two planted 3-cliques)');
+    await dropGraph('ref');
 
-    // (e) triangleCount: each of the two planted cliques is a triangle, so every node is in exactly 1.
-    const triRows = await runQuery(
-      driver,
-      'CALL gds.triangleCount.stream($g,{}) YIELD nodeId, triangleCount RETURN nodeId, triangleCount',
-      { g: 'ref' }
-    );
-    const tri = triRows.map((r) => toNum(r.get('triangleCount')));
-    if (!tri.every((t) => t === 1) || tri.length !== 6) {
-      fail(`reference triangleCount expected every node in exactly 1 triangle, got ${JSON.stringify(tri)}`);
-    }
-    console.log(`  triangleCount: all 6 nodes in exactly 1 triangle (two planted 3-cliques)`);
-
-    // (f) PageRank: symmetry within structural-equivalence classes + bridge endpoints ranked top.
-    //     The two clique-internal pairs on each side are structurally equivalent, so their PageRanks
-    //     match within epsilon; the two bridge endpoints share the top score.
-    const prRows = await runQuery(
-      driver,
-      'CALL gds.pageRank.stream($g,{}) YIELD nodeId, score RETURN nodeId, score',
-      { g: 'ref' }
-    );
-    const pr = new Map();
-    for (const r of prRows) pr.set(refProp(toNum(r.get('nodeId'))), toNum(r.get('score')));
-    const [b0, b1, b2, b3, b4, b5] = ref.ref_ids;
-    // Bridge endpoints (b2, b3) are the unique maximum.
-    const prMax = Math.max(...pr.values());
-    if (Math.abs(pr.get(b2) - prMax) > PR_EPSILON || Math.abs(pr.get(b3) - prMax) > PR_EPSILON) {
-      fail(`reference PageRank: bridge endpoints (${b2},${b3}) should hold the max score ${prMax}`);
-    }
-    // Structural symmetry: b0==b1, b4==b5 (the clique-internal non-bridge nodes), and b2==b3.
-    const symPairs = [[b0, b1], [b4, b5], [b2, b3]];
-    for (const [x, y] of symPairs) {
-      if (Math.abs(pr.get(x) - pr.get(y)) > PR_EPSILON) {
-        fail(`reference PageRank symmetry broken: PR(${x})=${pr.get(x)} != PR(${y})=${pr.get(y)}`);
-      }
-    }
-    console.log(`  pageRank: bridge endpoints hold the max (${prMax.toFixed(6)}); structural symmetry holds within ${PR_EPSILON}`);
-
-    await runQuery(driver, "CALL gds.graph.drop('ref') YIELD nodeCount RETURN nodeCount");
-
-    // (g) Shortest paths: project DIRECTED+UNWEIGHTED is not how :LINKS reads (it is undirected), so
-    //     project undirected unweighted and run Dijkstra from b0 — unit weights => hop distances.
-    await runQuery(
-      driver,
-      "CALL gds.graph.project('refp','Ref','LINKS',{}) YIELD nodeCount RETURN nodeCount"
-    );
-    const src = refRevMap.get(ref.shortest_paths_from_first[0][0]); // internal id of b0
-    const spRows = await runQuery(
-      driver,
-      'CALL gds.dijkstra.stream($g,{sourceNode:$s}) YIELD nodeId, distance RETURN nodeId, distance',
-      { g: 'refp', s: neo4j.int(src) }
-    );
-    const gotSp = spRows
-      .map((r) => [refProp(toNum(r.get('nodeId'))), Math.round(toNum(r.get('distance')))])
+    // (e) Dijkstra hop distances from b0 over the undirected projection.
+    await runQuery("CALL gds.graph.project('refp','Ref','LINKS',{}) YIELD nodeCount RETURN nodeCount");
+    const src0 = refPidToNid.get(ref.shortest_paths_from_first[0][0]);
+    const gotSp = (
+      await runQuery(
+        'CALL gds.dijkstra.stream($g,{sourceNode:$s}) YIELD nodeId, distance RETURN nodeId, distance',
+        { g: 'refp', s: neo4j.int(src0) }
+      )
+    )
+      .map((r) => [refPid(toNum(r.get('nodeId'))), Math.round(toNum(r.get('distance')))])
       .sort((a, b) => a[0] - b[0]);
     const expSp = [...ref.shortest_paths_from_first].sort((a, b) => a[0] - b[0]);
     if (JSON.stringify(gotSp) !== JSON.stringify(expSp)) {
-      fail(`reference shortest-path vector mismatch.\n  got: ${JSON.stringify(gotSp)}\n  exp: ${JSON.stringify(expSp)}`);
+      fail(`reference shortest-path mismatch: got ${JSON.stringify(gotSp)} exp ${JSON.stringify(expSp)}`);
     }
     console.log(`  dijkstra from ${ref.shortest_paths_from_first[0][0]}: ${JSON.stringify(gotSp.map((x) => x[1]))} hops (matches ground truth)`);
-    await runQuery(driver, "CALL gds.graph.drop('refp') YIELD nodeCount RETURN nodeCount");
+    await dropGraph('refp');
 
     // =============================================================================================
-    // 3. THE INFLUENCE NETWORK — the full algorithm suite + planted-field community recovery.
+    // 3. WEIGHTED vs UNWEIGHTED — the headline of a real GDS workload (rmp #690).
+    //    relationshipWeightProperty='weight' is a PROJECTION-time knob; PageRank and Dijkstra then use
+    //    the weights. We assert weighted and unweighted genuinely differ and report both top rankings.
     // =============================================================================================
-    console.log('\n-- influence network (full algorithm suite) --');
-
-    // (a) Community recovery: WCC over the :CITES-only projection must recover the planted field
-    //     blocks — exactly `planted_field_count` components, each of size `planted_field_size`.
+    console.log('\n-- weighted vs unweighted analytics (relationshipWeightProperty=weight) --');
     await runQuery(
-      driver,
-      "CALL gds.graph.project('comm','Author','CITES',{}) YIELD nodeCount, relationshipCount RETURN nodeCount, relationshipCount"
-    );
-    const commRows = await runQuery(
-      driver,
-      'CALL gds.wcc.stream($g,{}) YIELD nodeId, componentId RETURN nodeId, componentId',
-      { g: 'comm' }
-    );
-    const commSizes = new Map();
-    for (const r of commRows) {
-      const c = toNum(r.get('componentId'));
-      commSizes.set(c, (commSizes.get(c) || 0) + 1);
-    }
-    const fieldCount = ref.planted_field_count;
-    const fieldSize = ref.planted_field_size;
-    if (commSizes.size !== fieldCount) {
-      fail(`community recovery: expected ${fieldCount} planted fields, WCC found ${commSizes.size} components`);
-    }
-    for (const [c, sz] of commSizes) {
-      if (sz !== fieldSize) fail(`community recovery: component ${c} has size ${sz}, expected ${fieldSize}`);
-    }
-    console.log(`  community (WCC over :CITES): recovered exactly ${fieldCount} planted fields, each size ${fieldSize}`);
-    await runQuery(driver, "CALL gds.graph.drop('comm') YIELD nodeCount RETURN nodeCount");
-
-    // (b) The full algorithm suite over the WHOLE influence network (all rel types: :CITES+:CROSS).
-    //     Undirected projection for the symmetric algorithms; directed for SCC + Dijkstra.
-    await runQuery(
-      driver,
-      "CALL gds.graph.project('inf','Author',null,{}) YIELD nodeCount, relationshipCount RETURN nodeCount, relationshipCount"
+      "CALL gds.graph.project('infl_u','Author',null,{orientation:'NATURAL'}) YIELD nodeCount, relationshipCount RETURN nodeCount, relationshipCount"
     );
     await runQuery(
-      driver,
-      "CALL gds.graph.project('infd','Author',null,{orientation:'NATURAL'}) YIELD nodeCount RETURN nodeCount"
+      "CALL gds.graph.project('infl_w','Author',null,{orientation:'NATURAL',relationshipWeightProperty:'weight'}) YIELD nodeCount, relationshipCount RETURN nodeCount, relationshipCount"
     );
 
-    // A valid source for the single-source shortest-path procedures: the internal node id of the
-    // author with property id 0 (internal ids are not guaranteed to start at 0 — the engine reserves
-    // low ids — so we look it up rather than assuming `sourceNode:0`).
-    const srcAuthor = neo4j.int(
-      toNum((await runQuery(driver, 'MATCH (a:Author {id:0}) RETURN id(a) AS nid'))[0].get('nid'))
-    );
-
-    const suite = [
-      ['pageRank', "CALL gds.pageRank.stream('infd',{}) YIELD nodeId, score RETURN count(*) AS c"],
-      ['degree', "CALL gds.degree.stream('inf',{}) YIELD nodeId, score RETURN count(*) AS c"],
-      ['betweenness', "CALL gds.betweenness.stream('inf',{}) YIELD nodeId, score RETURN count(*) AS c"],
-      ['closeness', "CALL gds.closeness.stream('inf',{}) YIELD nodeId, score RETURN count(*) AS c"],
-      ['wcc', "CALL gds.wcc.stream('inf',{}) YIELD nodeId, componentId RETURN count(*) AS c"],
-      ['scc', "CALL gds.scc.stream('infd',{}) YIELD nodeId, componentId RETURN count(*) AS c"],
-      ['triangleCount', "CALL gds.triangleCount.stream('inf',{}) YIELD nodeId, triangleCount RETURN count(*) AS c"],
-      ['labelPropagation', "CALL gds.labelPropagation.stream('inf',{}) YIELD nodeId, communityId RETURN count(*) AS c"],
-      ['dijkstra', "CALL gds.dijkstra.stream('infd',{sourceNode:$src}) YIELD nodeId, distance RETURN count(*) AS c"],
-      ['bellmanFord', "CALL gds.bellmanFord.stream('infd',{sourceNode:$src}) YIELD nodeId, distance RETURN count(*) AS c"],
-    ];
-    for (const [name, q] of suite) {
-      const c = toNum((await runQuery(driver, q, { src: srcAuthor }))[0].get('c'));
-      if (name === 'bellmanFord' || name === 'dijkstra') {
-        // single-source: at least the source is reachable (the whole net need not be).
-        if (c < 1) fail(`influence-net ${name} returned ${c} rows`);
-      } else if (c !== authorCount) {
-        fail(`influence-net ${name} returned ${c} rows, expected ${authorCount} (one per author)`);
+    // (a) PageRank — full (nodeId, score) result sets (no count(*) collapse), mapped to author ids.
+    const prMap = async (g) => {
+      const m = new Map();
+      for (const r of await runQuery(
+        `CALL gds.pageRank.stream('${g}',{}) YIELD nodeId, score RETURN nodeId, score`
+      )) {
+        m.set(authPid(toNum(r.get('nodeId'))), toNum(r.get('score')));
       }
-      console.log(`  ${name}: ${c} rows`);
+      return m;
+    };
+    const prU = await prMap('infl_u');
+    const prW = await prMap('infl_w');
+    if (prU.size !== authorCount || prW.size !== authorCount) {
+      fail(`pageRank streamed ${prU.size}/${prW.size} rows, expected ${authorCount} authors each`);
+    }
+    // The two score vectors must genuinely differ (weights ∈ [1,10] make this all but certain).
+    let maxDelta = 0;
+    let changed = 0;
+    for (const [id, u] of prU) {
+      const d = Math.abs((prW.get(id) ?? 0) - u);
+      if (d > WEIGHT_DELTA) changed += 1;
+      if (d > maxDelta) maxDelta = d;
+    }
+    if (!(maxDelta > WEIGHT_DELTA)) {
+      fail(`weighted and unweighted PageRank are indistinguishable (maxΔ=${maxDelta}) — weighting had no effect`);
+    }
+    const topK = (m, k) =>
+      [...m.entries()].sort((a, b) => b[1] - a[1] || a[0] - b[0]).slice(0, k).map(([id]) => id);
+    const topU = topK(prU, 5);
+    const topW = topK(prW, 5);
+    const shared = topU.filter((id) => topW.includes(id)).length;
+    console.log(`  pageRank streamed ${prU.size} (nodeId,score) rows per projection`);
+    console.log(`  weighted changed ${changed}/${authorCount} authors' scores (maxΔ=${maxDelta.toExponential(3)})`);
+    console.log(`  top-5 unweighted authors: ${JSON.stringify(topU)}`);
+    console.log(`  top-5 weighted   authors: ${JSON.stringify(topW)}  (shared with unweighted: ${shared}/5)`);
+
+    // (b) Dijkstra — weighted vs unweighted distances from author 0. Weighted uses cumulative edge
+    //     weight as cost; unweighted counts hops. The distance vectors must differ.
+    const src = neo4j.int(
+      toNum((await runQuery('MATCH (a:Author {id:0}) RETURN id(a) AS nid'))[0].get('nid'))
+    );
+    const dijk = async (g) => {
+      const m = new Map();
+      for (const r of await runQuery(
+        'CALL gds.dijkstra.stream($g,{sourceNode:$s}) YIELD nodeId, distance RETURN nodeId, distance',
+        { g, s: src }
+      )) {
+        m.set(authPid(toNum(r.get('nodeId'))), toNum(r.get('distance')));
+      }
+      return m;
+    };
+    const dU = await dijk('infl_u');
+    const dW = await dijk('infl_w');
+    let dijkstraDiffers = false;
+    for (const [id, u] of dU) {
+      if (Math.abs((dW.get(id) ?? Infinity) - u) > WEIGHT_DELTA) {
+        dijkstraDiffers = true;
+        break;
+      }
+    }
+    if (!dijkstraDiffers) fail('weighted and unweighted Dijkstra produced identical distances');
+    console.log(`  dijkstra from author 0: weighted reached ${dW.size} nodes, unweighted ${dU.size}; distance vectors differ (weights applied)`);
+
+    await dropGraph('infl_u');
+
+    // =============================================================================================
+    // 4. WRITE / MUTATE / STATS execution modes (feature-detected — a newer surface, rmp #643).
+    //    Re-uses the weighted projection 'infl_w'. Probe with .stats (read-only); if the modes are
+    //    absent (older server) skip the whole section cleanly.
+    // =============================================================================================
+    console.log('\n-- write / mutate / stats execution modes --');
+    let modesSupported = false;
+    let nodesWritten = 0;
+    const statsProbe = await runOptional(
+      "CALL gds.pageRank.stats('infl_w',{}) YIELD ranIterations, didConverge, centralityDistribution RETURN ranIterations, didConverge, centralityDistribution"
+    );
+    if (!statsProbe.ok && isCapabilityGap(statsProbe.err)) {
+      console.log('  · SKIPPED — this server does not register gds.*.{write,stats,mutate}');
+      console.log('    (the execution modes are a newer surface: rmp #643 / a current build). The');
+      console.log('    weighted analytics above already ran against this instance.');
+    } else if (!statsProbe.ok) {
+      fail(`gds.pageRank.stats failed unexpectedly: ${statsProbe.err.message}`);
+    } else {
+      modesSupported = true;
+
+      // ---- .stats — assert a summary field is present and sane.
+      const st = statsProbe.records[0];
+      const ranIters = toNum(st.get('ranIterations'));
+      const didConverge = st.get('didConverge');
+      if (!(ranIters >= 1)) fail(`.stats ranIterations should be >= 1, got ${ranIters}`);
+      if (typeof didConverge !== 'boolean') fail(`.stats didConverge should be a boolean, got ${didConverge}`);
+      console.log(`  stats: ranIterations=${ranIters} didConverge=${didConverge} (summary asserted)`);
+
+      // ---- .write — write pagerank back to the database; assert nodePropertiesWritten==authorCount.
+      const wr = (
+        await runQuery(
+          "CALL gds.pageRank.write('infl_w',{writeProperty:'pagerank'}) YIELD nodePropertiesWritten, ranIterations, didConverge RETURN nodePropertiesWritten, ranIterations, didConverge"
+        )
+      )[0];
+      nodesWritten = toNum(wr.get('nodePropertiesWritten'));
+      if (nodesWritten !== authorCount) {
+        fail(`.write nodePropertiesWritten=${nodesWritten}, expected authorCount=${authorCount}`);
+      }
+      // Readback: MATCH … WHERE pagerank > x ORDER BY pagerank — the property is queryable and every
+      // author received it (x=0: PageRank scores are strictly positive).
+      const nonNull = toNum(
+        (await runQuery('MATCH (a:Author) WHERE a.pagerank IS NOT NULL RETURN count(a) AS c'))[0].get('c')
+      );
+      const positive = toNum(
+        (await runQuery('MATCH (a:Author) WHERE a.pagerank > 0 RETURN count(a) AS c'))[0].get('c')
+      );
+      if (nonNull !== authorCount || positive !== authorCount) {
+        fail(`.write readback: ${nonNull} non-null / ${positive} positive, expected ${authorCount} each`);
+      }
+      const topWritten = await runQuery(
+        'MATCH (a:Author) WHERE a.pagerank > 0 RETURN a.id AS id, a.field AS field, a.pagerank AS pr ORDER BY pr DESC LIMIT 5'
+      );
+      const topList = topWritten.map((r) => ({
+        id: toNum(r.get('id')),
+        field: toNum(r.get('field')),
+        pr: toNum(r.get('pr')),
+      }));
+      console.log(`  write: nodePropertiesWritten=${nodesWritten} == authorCount; ${nonNull} readable, all > 0`);
+      console.log(`  write readback top-5 (MATCH…WHERE pagerank>0 ORDER BY pagerank DESC LIMIT 5):`);
+      for (const t of topList) console.log(`    author id=${t.id} field=${t.field} pagerank=${t.pr.toFixed(6)}`);
+
+      // ---- .mutate — write into the in-memory projection, then read it back via nodeProperty.stream.
+      const mu = (
+        await runQuery(
+          "CALL gds.pageRank.mutate('infl_w',{mutateProperty:'pr_mut'}) YIELD nodePropertiesWritten RETURN nodePropertiesWritten"
+        )
+      )[0];
+      const mutated = toNum(mu.get('nodePropertiesWritten'));
+      const streamed = await runQuery(
+        "CALL gds.graph.nodeProperty.stream('infl_w','pr_mut') YIELD nodeId, propertyValue RETURN nodeId, propertyValue"
+      );
+      if (streamed.length !== mutated) {
+        fail(`.mutate/readback mismatch: mutated ${mutated}, nodeProperty.stream returned ${streamed.length}`);
+      }
+      if (mutated !== authorCount) fail(`.mutate nodePropertiesWritten=${mutated}, expected ${authorCount}`);
+      // The mutated projection property equals the score we just wrote to the DB (same computation).
+      const writtenByPid = new Map();
+      for (const r of await runQuery('MATCH (a:Author) RETURN a.id AS id, a.pagerank AS pr')) {
+        writtenByPid.set(toNum(r.get('id')), toNum(r.get('pr')));
+      }
+      let mutateMismatch = 0;
+      for (const r of streamed) {
+        const pid = authPid(toNum(r.get('nodeId')));
+        const v = toNum(r.get('propertyValue'));
+        if (Math.abs(v - (writtenByPid.get(pid) ?? NaN)) > PR_EPSILON) mutateMismatch += 1;
+      }
+      if (mutateMismatch !== 0) {
+        fail(`.mutate values diverge from .write for ${mutateMismatch} authors (same computation expected)`);
+      }
+      console.log(`  mutate: nodePropertiesWritten=${mutated}; gds.graph.nodeProperty.stream read back ${streamed.length} values, all == the written pagerank`);
     }
 
-    // Top-PageRank author on the directed influence network (the most "influential" researcher).
-    const topPr = await runQuery(
-      driver,
-      "CALL gds.pageRank.stream('infd',{}) YIELD nodeId, score WITH nodeId, score ORDER BY score DESC LIMIT 1 MATCH (a:Author) WHERE id(a)=nodeId RETURN a.id AS id, a.field AS field, score"
-    );
-    const tp = topPr[0];
-    console.log(`  top-influence author: id=${toNum(tp.get('id'))} field=${toNum(tp.get('field'))} pageRank=${toNum(tp.get('score')).toFixed(6)}`);
+    await dropGraph('infl_w');
 
-    await runQuery(driver, "CALL gds.graph.drop('inf') YIELD nodeCount RETURN nodeCount");
-    await runQuery(driver, "CALL gds.graph.drop('infd') YIELD nodeCount RETURN nodeCount");
-
-    // Confirm the CSR catalog is empty (projections released cleanly).
-    const listRows = await runQuery(
-      driver,
-      'CALL gds.graph.list() YIELD graphName RETURN count(*) AS c'
-    );
-    const remaining = toNum(listRows[0].get('c'));
-    if (remaining !== 0) fail(`expected 0 projections after drop, ${remaining} remain (CSR not released)`);
-    console.log(`  all CSR projections released cleanly (catalog empty)`);
+    // =============================================================================================
+    // 5. TEARDOWN-LAST — drop projections + DETACH DELETE (constraints/indexes persist harmlessly).
+    // =============================================================================================
+    await dropAllProjections();
+    await deleteExampleData();
+    const remaining = await runOptional('CALL gds.graph.list() YIELD graphName RETURN count(*) AS c');
+    if (remaining.ok) {
+      const c = toNum(remaining.records[0].get('c'));
+      if (c !== 0) fail(`expected 0 projections after teardown, ${c} remain`);
+      console.log('\n  all GDS projections released; example data deleted (idempotent teardown)');
+    }
 
     // ---- Machine-readable evidence for run.sh.
+    const totalSecs =
+      latenciesMs.reduce((a, b) => a + b, 0) / 1000; // client-side busy time (approx wall for a serial driver)
     const stats = {
+      schema_applied: schemaApplied,
+      schema_skipped: schemaSkipped,
       load_statements: loaded,
       authors_loaded: authorCount,
+      modes_supported: modesSupported,
+      nodes_written: nodesWritten,
       operations: latenciesMs.length,
+      workload_secs: Number(totalSecs.toFixed(3)),
       p50_ms: percentileMs(0.5),
       p99_ms: percentileMs(0.99),
       p999_ms: percentileMs(0.999),

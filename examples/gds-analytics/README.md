@@ -7,28 +7,43 @@ in-memory CSR projection through the **procedure surface**, assert the results a
 scales — both with graph size (per-algorithm time + CSR footprint) and, at a fixed size, with **core
 count** (a real sequential-vs-parallel speedup that is deterministic across thread widths).
 
-The official **Neo4j driver** (Node.js, `bolt+ssc://`) drives the live workload, exactly as the
-driver ecosystem would. A **hermetic cargo mirror** (`crates/graphus-server/tests/gds_analytics.rs`)
-asserts the same reference ground truth in-process, in the default `cargo test` run, with no
-Node/network.
+The official **Neo4j driver** (Node.js, `bolt://` / `bolt+ssc://`) drives the live workload, exactly
+as the driver ecosystem would — against a **self-booted local server** *or* an **already-running
+instance** (local or remote) via the shared external-target seam (see
+[Running against an external target](#running-against-an-external-target-attach-mode)). A **hermetic
+cargo mirror** (`crates/graphus-server/tests/gds_analytics.rs`) asserts the same reference ground truth
+in-process, in the default `cargo test` run, with no Node/network.
 
 ## What it demonstrates
 
-- **The `gds.*` procedure surface end to end** — `gds.graph.project` → the algorithm `*.stream`
-  procedures → `gds.graph.drop`, over a real persistent store via the official driver.
+- **The `gds.*` procedure surface end to end** — `gds.graph.project` → the algorithm procedures in
+  **every execution mode** (`.stream`, `.stats`, `.mutate`, `.write`) → `gds.graph.drop`, over a real
+  persistent store via the official driver.
+- **Weighted vs unweighted analytics** — the headline of a real GDS workload: PageRank and Dijkstra run
+  **weighted** (`relationshipWeightProperty='weight'`) and **unweighted** over the same influence
+  network, and the example asserts the two genuinely differ and reports both top rankings (see
+  [Weighted vs unweighted](#weighted-vs-unweighted)).
+- **The write / mutate / stats execution modes** — `gds.pageRank.write{writeProperty:'pagerank'}` then
+  a `MATCH…WHERE pagerank>x ORDER BY pagerank` readback (asserting `nodePropertiesWritten == authorCount`),
+  a `.stats` summary, and a `.mutate` + `gds.graph.nodeProperty.stream` readback (see
+  [Execution modes](#execution-modes-write--mutate--stats)).
 - **A production-realistic schema** — a node `UNIQUE`, two node **property-type** constraints
   (`field_name :: STRING`, `h_index :: INTEGER`), a node `RANGE` index and a **relationship** `RANGE`
-  index (`CITES.weight`), loaded schema-first and enforced on every write (see
-  [Schema exercised](#schema-exercised-constraints--indexes)).
+  index (`CITES.weight`), loaded schema-first (idempotent `IF NOT EXISTS`) and enforced on every write
+  (see [Schema exercised](#schema-exercised-constraints--indexes)).
 - **The full algorithm library**: PageRank, degree / betweenness / closeness centrality, weakly- and
   strongly-connected components (WCC / SCC), triangle counting, Label Propagation community
   detection, and weighted shortest paths (Dijkstra / Bellman-Ford).
 - **Correctness against ground truth** — a small reference subgraph with hand-derived outputs the
   workload asserts EXACTLY (within a documented float tolerance).
-- **Honest performance characterisation** — a scalability + CSR-footprint + parallelism sweep that
-  reports only what is *actually* measured on the run: per-algorithm scaling with graph size, and a
-  **real sequential-vs-parallel speedup** across thread widths (proven bit-identical across widths) —
-  never a fabricated curve — captured into a standardized, schema-versioned evidence report.
+- **Attach to any running instance, isolated & idempotent** — set `GRAPHUS_TARGET_*` and the SAME
+  workload runs against a live server in a dedicated **isolated database**, tears down after itself
+  (so two consecutive runs both pass), and collects **server-side evidence** from the target's
+  Prometheus `/metrics` into `report.json` (`measurement_mode=external`).
+- **Honest performance characterisation** (local mode) — a scalability + CSR-footprint + parallelism
+  sweep that reports only what is *actually* measured on the run: per-algorithm scaling with graph
+  size, and a **real sequential-vs-parallel speedup** across thread widths (proven bit-identical across
+  widths) — never a fabricated curve — captured into a standardized, schema-versioned evidence report.
 
 ## Algorithms covered (and the honest notes)
 
@@ -94,11 +109,21 @@ constraint and a **relationship RANGE** index:
 
 | DDL | Kind | Why |
 |-----|------|-----|
-| `CREATE CONSTRAINT author_id_unique FOR (a:Author) REQUIRE a.id IS UNIQUE` | node `UNIQUE` | every author id is distinct (owns a backing RANGE index) |
-| `CREATE CONSTRAINT author_field_name_string FOR (a:Author) REQUIRE a.field_name IS :: STRING` | node **property-type** (`STRING`) | the research-field **label** is always a string |
-| `CREATE CONSTRAINT author_h_index_integer FOR (a:Author) REQUIRE a.h_index IS :: INTEGER` | node **property-type** (`INTEGER`) | the h-index is always an integer |
-| `CREATE INDEX author_field_range FOR (a:Author) ON (a.field)` | node `RANGE` | the community filter / grouping access path |
-| `CREATE INDEX cites_weight_range FOR ()-[c:CITES]-() ON (c.weight)` | **relationship** `RANGE` | a "high-weight citations" access path on the citation count |
+| `CREATE CONSTRAINT author_id_unique IF NOT EXISTS FOR (a:Author) REQUIRE a.id IS UNIQUE` | node `UNIQUE` | every author id is distinct (owns a backing RANGE index) |
+| `CREATE CONSTRAINT author_field_name_string IF NOT EXISTS FOR (a:Author) REQUIRE a.field_name IS :: STRING` | node **property-type** (`STRING`) | the research-field **label** is always a string |
+| `CREATE CONSTRAINT author_h_index_integer IF NOT EXISTS FOR (a:Author) REQUIRE a.h_index IS :: INTEGER` | node **property-type** (`INTEGER`) | the h-index is always an integer |
+| `CREATE INDEX author_field_range IF NOT EXISTS FOR (a:Author) ON (a.field)` | node `RANGE` | the community filter / grouping access path |
+| `CREATE INDEX cites_weight_range IF NOT EXISTS FOR ()-[c:CITES]-() ON (c.weight)` | **relationship** `RANGE` | a "high-weight citations" access path on the citation count |
+
+> **Idempotent + version-tolerant load (`rmp` #690).** Every schema statement carries `IF NOT EXISTS`,
+> so a second consecutive run against the same database — or an operator-owned shared one — is a no-op
+> rather than a duplicate-object error. `data/analyze.js` also applies the DDL **version-tolerantly**:
+> if the target is an **older build** that cannot parse a clause (a server predating `IF NOT EXISTS`,
+> named indexes, or relationship indexes), it retries the plain form and, failing that, **skips the
+> statement with a note** and continues — the analysis does not depend on the indexes, and the
+> property-type / uniqueness constraints (which older builds still support un-claused) are recovered by
+> the retry so their enforcement demo still runs. The same script therefore loads on a current build
+> and on an older instance alike.
 
 > **Property-name note.** The model stores the planted community as an **integer** `field` id
 > (`0..community_count`) and its human-readable **string** label as `field_name` (e.g.
@@ -149,15 +174,54 @@ both the official-driver workload (`data/analyze.js`) and the hermetic cargo mir
 | **Dijkstra from `b0`** (unit weights) | hop distances `0,1,1,2,3,3` |
 | **Community (planted fields)** | WCC over the `:CITES`-only projection recovers exactly `community_count` components, each of size `field_size` |
 
+## Weighted vs unweighted
+
+`relationshipWeightProperty` is a **projection-time** knob: a graph projected with it is *weighted*,
+and the algorithms then use the edge `weight` (the citation count). The workload projects the directed
+influence network twice — unweighted and weighted (`relationshipWeightProperty='weight'`) — and:
+
+- **PageRank** — streams the **full** `(nodeId, score)` result set for both, asserts the two score
+  vectors genuinely differ (weighted PageRank distributes a node's rank in proportion to edge weight,
+  not uniformly), and reports both top-5 author rankings and how many authors' scores changed. On the
+  fast profile a typical run changes ~158/160 authors' scores and reorders the top-5.
+- **Dijkstra** — single-source distances from author 0, weighted (cumulative edge weight as cost) vs
+  unweighted (hop count), asserting the distance vectors differ.
+
+> **Honest note — betweenness is unweighted here.** Graphus's betweenness is Brandes over **unweighted
+> BFS** (`crates/graphus-gds/src/algo/centrality.rs`) — it ignores edge weights — so the example
+> deliberately does **not** claim a weighted betweenness. PageRank, Dijkstra and closeness are the
+> weight-aware algorithms.
+
+## Execution modes (write / mutate / stats)
+
+Beyond `.stream`, each node-property algorithm registers three more Neo4j-GDS execution modes, which
+the workload exercises on the weighted projection (feature-detected — see the note below):
+
+- **`.write`** — `gds.pageRank.write{writeProperty:'pagerank'}` writes the score back to the database.
+  The example asserts `nodePropertiesWritten == authorCount`, then reads it back with a
+  `MATCH (a:Author) WHERE a.pagerank > x RETURN … ORDER BY a.pagerank DESC` query (every author received
+  a strictly-positive score) and prints the top-5 most-influential authors.
+- **`.stats`** — `gds.pageRank.stats` returns summary statistics only (no write); the example asserts a
+  summary field (`ranIterations ≥ 1`, `didConverge` a boolean).
+- **`.mutate`** — `gds.pageRank.mutate{mutateProperty:'pr_mut'}` writes the score into the **in-memory
+  projection**; the example reads it back with `gds.graph.nodeProperty.stream` and asserts the mutated
+  values equal the ones just written to the database (same computation).
+
+> **Version note.** The `.write` / `.stats` / `.mutate` modes and `gds.graph.nodeProperty.stream` are a
+> newer procedure surface (`rmp` #643). Against an **older instance** that does not register them the
+> example **feature-detects their absence and skips this section with a clear note** — the reference
+> ground truth and the weighted-vs-unweighted comparison still run and still assert. To exercise the
+> execution modes over the wire, attach to a current build (v0.0.9+).
+
 ## How to run it
 
 From the repository root:
 
 ```bash
-examples/gds-analytics/run.sh                      # fast profile; official driver if node/npm present
-GDS_PROFILE=large examples/gds-analytics/run.sh    # evidence-scale dataset
-RUN_DRIVER=0      examples/gds-analytics/run.sh     # skip the official-driver step (hermetic only)
-GDS_SWEEP_SIZES=40,120,360 examples/gds-analytics/run.sh   # custom sweep field sizes
+examples/gds-analytics/run.sh                      # LOCAL: fast profile; official driver if node/npm present
+GDS_PROFILE=large examples/gds-analytics/run.sh    # LOCAL: evidence-scale dataset
+RUN_DRIVER=0      examples/gds-analytics/run.sh     # LOCAL: skip the official-driver step (hermetic only)
+GDS_SWEEP_SIZES=40,120,360 examples/gds-analytics/run.sh   # LOCAL: custom sweep field sizes
 ```
 
 > The committed baseline gate (below) is a **fast-profile** reference recorded with the **default**
@@ -184,6 +248,47 @@ The script:
    gates a fresh fast-profile run against the committed `baseline.json`;
 5. tears everything down (trap-driven: the server is killed and the private temp dir removed on exit)
    and exits non-zero if any assertion failed.
+
+### Running against an external target (attach mode)
+
+Set any of `GRAPHUS_TARGET_{BOLT,REST,UDS}` and the SAME workload attaches to an **already-running**
+instance instead of self-booting — the shared seam in `examples/_harness/harness.sh`. The example does
+**not** touch the operator's data: it carves out a dedicated, **isolated database**, runs the analysis
+over the wire, and drops that database again on exit. Because the server is not co-located, the process
+CPU/RSS and on-disk storage vectors are **N/A** (no `/proc`, no store path) and the local sweep +
+baseline gate are skipped; the evidence is the server's own Prometheus **`/metrics`**, scraped **before
+and after** the workload and turned into `report.json` (`measurement_mode=external`, `server_metrics`
+deltas) by the `measure_target` harness binary.
+
+```bash
+# Attach to a remote instance (here a Raspberry-Pi 5 over Tailscale). BOLT drives the driver; REST
+# handles login, the isolated-DB DDL and /metrics.
+GRAPHUS_TARGET_BOLT=bolt+ssc://100.89.148.30:7687 \
+GRAPHUS_TARGET_REST=https://100.89.148.30:7474 \
+GRAPHUS_TARGET_USER=graphus GRAPHUS_TARGET_PASSWORD=graphus-local \
+GRAPHUS_TARGET_TLS_INSECURE=1 \
+examples/gds-analytics/run.sh
+```
+
+| Environment | Meaning |
+|-------------|---------|
+| `GRAPHUS_TARGET_BOLT`         | Bolt endpoint the official driver connects to (`bolt://` or `bolt+ssc://` for a self-signed cert). **Required** for attach mode (the driver speaks Bolt). |
+| `GRAPHUS_TARGET_REST`         | REST base URL — used for `/auth/login`, the isolated-DB DDL, and `/metrics`. **Required** for attach mode. |
+| `GRAPHUS_TARGET_USER/PASSWORD`| login (defaults `graphus` / `graphus-local`). |
+| `GRAPHUS_TARGET_DB`           | when set, use this **existing** database and never create/drop one (the operator owns it); the workload still tears down its own data. When unset, a unique `ex_gds-analytics_<epoch>_<pid>` DB is created and dropped. |
+| `GRAPHUS_TARGET_TLS_INSECURE` | `1` to accept a self-signed TLS cert on the target (REST `curl -k`). |
+
+The attach run asserts: the workload reached the instance (`GRAPHUS_GDS_OK`), the `/metrics` snapshots
+were captured, `measure_target`'s **external invariants** held (no statement/recovery panics, no
+force-detach, and the server actually observed committed transactions over the window), and the report
+is tagged `measurement_mode=external` with a `server_metrics` block. The isolated database is dropped on
+exit.
+
+> Attach mode is what `examples/CLAUDE.md` mandates for every example (“runnable against an
+> already-running Graphus instance — local or remote”). It is **version-tolerant**: against an older
+> instance the schema DDL and the write/mutate/stats modes it cannot honour are skipped with a note (see
+> the schema and execution-mode version notes above), while the reference ground truth and the
+> weighted-vs-unweighted comparison still run and assert.
 
 ### The hermetic default-`cargo test` mirror
 
@@ -327,5 +432,11 @@ algorithm library), `graphus-storage` + `graphus-wal` (the durable store the pro
 from, plus the durable constraint/index catalog and the node/relationship RANGE indexes), and
 `graphus-auth` (Bolt basic-auth over TLS). The hermetic mirror exercises the same `gds.*` semantics
 in-process via `LocalEngine`; the evidence is produced by the dev-only `graphus-examples-harness` +
-`graphus-gds-gen` (`gds_sweep`, `gds_evidence`, `gds_baseline_cmp`) — none of which enter the
-production `graphus-server` build.
+`graphus-gds-gen` (`gds_sweep`, `gds_evidence`, `gds_baseline_cmp` for local mode; `measure_target` +
+the `harness.sh` external-target seam for attach mode) — none of which enter the production
+`graphus-server` build.
+
+In **attach mode** the exercised surface shifts to the wire + control plane: `graphus-server`'s REST
+`/auth/login`, the `CREATE/STOP/DROP DATABASE` DDL that carves out and reclaims the isolated database,
+and the Prometheus `/metrics` endpoint (the per-database transaction / query-duration / health-invariant
+counters the server-side evidence is computed from) — all over the same Bolt+TLS driver path.

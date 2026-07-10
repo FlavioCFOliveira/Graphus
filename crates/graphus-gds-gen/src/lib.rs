@@ -478,6 +478,14 @@ impl Dataset {
         // which parses this exact block off `parse_admin_statement` and drives it through the real
         // engine). The generated authors conform to every constraint, so a schema-first load succeeds.
         //
+        // IDEMPOTENCY (`rmp` #690): every schema statement carries `IF NOT EXISTS`, so re-running the
+        // load against an instance that already declared the schema (e.g. a shared/operator-owned
+        // database, or a second consecutive run) is a no-op success rather than a duplicate-object
+        // error. `IF NOT EXISTS` is parsed by `parse_admin_statement` for both CONSTRAINT and INDEX and
+        // the engine turns the already-exists case into a success (see `graphus-server/src/admin.rs`),
+        // and the `is_schema_ddl` prefix filter the server tests use (`starts_with("CREATE CONSTRAINT")`
+        // / `starts_with("CREATE") && contains(" INDEX ")`) is unaffected by the extra clause.
+        //
         // NOTE on the property names: the influence-network model stores the planted community as an
         // INTEGER `field` id (0..community_count) and its human-readable label as a STRING `field_name`
         // (e.g. 'graph-theory'). The property-type constraints therefore sit on the *actual* string /
@@ -485,19 +493,25 @@ impl Dataset {
         // `field`, so the load succeeds by construction. ---
         s.push_str("// schema\n");
         // Uniqueness: every author has a distinct id (owns a backing RANGE index).
-        s.push_str("CREATE CONSTRAINT author_id_unique FOR (a:Author) REQUIRE a.id IS UNIQUE;\n");
+        s.push_str(
+            "CREATE CONSTRAINT author_id_unique IF NOT EXISTS FOR (a:Author) REQUIRE a.id IS UNIQUE;\n",
+        );
         // Node property-type constraints: the field label is a STRING and the h-index an INTEGER.
         s.push_str(
-            "CREATE CONSTRAINT author_field_name_string FOR (a:Author) REQUIRE a.field_name IS :: STRING;\n",
+            "CREATE CONSTRAINT author_field_name_string IF NOT EXISTS FOR (a:Author) REQUIRE a.field_name IS :: STRING;\n",
         );
         s.push_str(
-            "CREATE CONSTRAINT author_h_index_integer FOR (a:Author) REQUIRE a.h_index IS :: INTEGER;\n",
+            "CREATE CONSTRAINT author_h_index_integer IF NOT EXISTS FOR (a:Author) REQUIRE a.h_index IS :: INTEGER;\n",
         );
         // Node RANGE index on the planted field id (the community filter / grouping access path).
-        s.push_str("CREATE INDEX author_field_range FOR (a:Author) ON (a.field);\n");
+        s.push_str(
+            "CREATE INDEX author_field_range IF NOT EXISTS FOR (a:Author) ON (a.field);\n",
+        );
         // Relationship RANGE index on the citation weight — the "high-weight citations" access path
         // (Graphus serves an equality seek from it; a `>=` range stays a scan + filter — rmp #680).
-        s.push_str("CREATE INDEX cites_weight_range FOR ()-[c:CITES]-() ON (c.weight);\n");
+        s.push_str(
+            "CREATE INDEX cites_weight_range IF NOT EXISTS FOR ()-[c:CITES]-() ON (c.weight);\n",
+        );
 
         // --- Authors ---
         s.push_str("// authors\n");
