@@ -224,6 +224,61 @@ cargo build --release -p graphus-server -p graphus-cli
 GRAPHUS_BIN_DIR=target/release examples/<scenario-name>/run.sh
 ```
 
+## Running against an external target (local or remote)
+
+By default every example **boots its own co-located server** and measures it directly (`/proc` CPU
+and RSS, on-disk store/WAL bytes) — a `measurement_mode: "local"` run. An example that opts into the
+shared **external-target seam** can instead be pointed at an **already-running instance**, local or
+remote, and will *skip booting a server*, run its workload against that endpoint, and collect only
+the vectors observable over the wire (`measurement_mode: "external"`).
+
+Set any `GRAPHUS_TARGET_*` variable to switch a seam-aware example into external mode:
+
+| Variable | Meaning | Default |
+|----------|---------|---------|
+| `GRAPHUS_TARGET_BOLT` | Bolt URL of the target (`bolt://` / `bolt+s://` / `bolt+ssc://host:port`) | — |
+| `GRAPHUS_TARGET_REST` | REST base URL of the target (`https://host:7474`) | — |
+| `GRAPHUS_TARGET_UDS` | UDS path of an already-running **local** server | — |
+| `GRAPHUS_TARGET_USER` | Principal to authenticate as | `graphus` |
+| `GRAPHUS_TARGET_PASSWORD` | Password (prefer `..._PASSWORD` env over a flag) | `graphus-local` |
+| `GRAPHUS_TARGET_DB` | Pre-provisioned scratch database to use (operator-owned; not created/dropped) | — |
+| `GRAPHUS_TARGET_METRICS` | `/metrics` base URL for server-side evidence | `= GRAPHUS_TARGET_REST` |
+| `GRAPHUS_TARGET_METRICS_TOKEN` | Prometheus scrape token | admin Bearer from `/auth/login` |
+| `GRAPHUS_TARGET_TLS_INSECURE` | `1` = accept a self-signed cert | inferred from a `+ssc` scheme |
+| `GRAPHUS_TARGET_SYSTEM_DB` | Database that `CREATE/STOP/DROP DATABASE` DDL is issued against | `graphus` |
+
+**Isolation — a dedicated database.** To avoid clobbering the target's existing data, an external run
+creates a unique run-scoped database (`CREATE DATABASE ex_<scenario>_<epoch>_<pid> IF NOT EXISTS`),
+runs its whole workload inside it, and drops it on exit (`STOP DATABASE` then `DROP DATABASE`, since
+Graphus requires a database to be offline before it can be dropped). Passing `GRAPHUS_TARGET_DB`
+reuses an operator-provisioned database instead and leaves its lifecycle to you. The per-database
+`graphus_db_*{database="…"}` metric series let the evidence attribute committed/aborted/slow/latency
+figures to *just this run's* database even on a busy shared instance.
+
+**What is (and is not) collectable remotely.** Client-side throughput/latency/abort are always
+measured by the driver. Server-side counters come from the target's Prometheus `/metrics`, scraped
+before and after the workload and reported as deltas (`server_metrics` section) — including the
+health invariants `statement_panics` / `engine_recovery_panics` / `engine_force_detached`, which
+`measure_target --assert` gates to `0`. The **process** vectors (CPU, peak RSS) and the **on-disk**
+storage vector require a co-located PID and filesystem, so they are **N/A** in external mode and left
+zeroed with an explicit note. Consequently, **a committed baseline must always be captured from a
+local boot run** — an external run is never a baseline candidate, and `measure_target` replaces the
+host-specific baseline diff with the host-independent invariant gate above.
+
+Example — drive a seam-aware example against the live demo instance over TLS:
+
+```bash
+GRAPHUS_TARGET_REST=https://100.89.148.30:7474 \
+GRAPHUS_TARGET_BOLT=bolt+ssc://100.89.148.30:7687 \
+GRAPHUS_TARGET_USER=graphus GRAPHUS_TARGET_PASSWORD=graphus-local \
+GRAPHUS_TARGET_TLS_INSECURE=1 \
+examples/<scenario-name>/run.sh
+```
+
+Durability/crash-recovery examples (`social-network-uds`, `durability-crash-recovery`) are
+**local-only by construction** — they own the server lifecycle to inject a crash and prove recovery,
+so they cannot target a shared/remote instance.
+
 ## The examples
 
 | Example | Demonstrates |
