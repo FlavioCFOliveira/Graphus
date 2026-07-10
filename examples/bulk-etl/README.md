@@ -2,17 +2,22 @@
 
 > **Status:** complete. `rmp #264` (dataset + generator), `#265` (import / export / round-trip),
 > `#266` (storage footprint + amplification), `#267` (evidence instrumentation), `#268` (`run.sh`),
-> `#269` (dev-only cargo mirror), and `#270` (evidence report + committed baseline + this README) are
-> all implemented and proven.
+> `#269` (dev-only cargo mirror), `#270` (evidence report + committed baseline + this README), and
+> `#678` (online schema-hardening: the new constraint & index kinds an operator declares after a bulk
+> load — a composite `UNIQUE`, a `NODE KEY`, a relationship existence + property-type, a node
+> property-type, and `TEXT` / `FULLTEXT` / composite `RANGE` indexes) are all implemented and proven.
 
 This example demonstrates Graphus's **offline bulk data pipeline**: the `graphus-bulk` CLI that
 **imports** node/relationship CSV into a fresh store and **dumps** a whole graph back to CSV, with
 **no server and no Bolt driver** in the loop. It is the path you use to load a dataset before the
 server ever starts, and to export it for backup / migration / interchange.
 
-Unlike `social-network-uds`, `fraud-oltp`, and `gds-analytics` (which boot a real `graphus-server`),
-**bulk-etl is fully offline and hermetic** — which makes it the simplest example to run and the
-easiest to reason about for storage characterisation.
+The offline import / dump / round-trip / storage / baseline **core is fully offline and hermetic** —
+which makes it the simplest example to run and the easiest to reason about for storage
+characterisation. On top of it, this example also demonstrates the **online schema-hardening** that
+follows a bulk load in production (`rmp #678`): the constraints and indexes an operator declares once
+the freshly-loaded data is online — proven both by an always-run hermetic cargo mirror and by an
+opt-in live Bolt-over-UDS server step (see [Online schema-hardening](#online-schema-hardening--the-production-sequel-to-a-bulk-load-rmp-678)).
 
 ## What it demonstrates
 
@@ -89,22 +94,63 @@ seed/scale** across runs and platforms. All logical counts are **derivable from 
 emitted to `manifest.json` (nodes per label, relationships per type, total properties, logical CSV
 bytes) — the ground truth every assertion checks against.
 
-## Indexes & constraints — what is (and is not) built offline
+## Online schema-hardening — the production sequel to a bulk load (`rmp #678`)
 
-The dataset **implies** a `UNIQUE` constraint on each label's `id` plus lookup indexes on it. **Be
-honest about what the offline path builds:**
+The offline importer builds a **fresh store directly** through the low-level record API
+(`create_node` / `set_node_labels` / `set_node_property_value` / `create_rel` / …). It does **not**
+build secondary indexes and does **not** enforce constraints — there is no index/constraint code in
+the crate. (It *does* fail-closed on a duplicate non-empty external `:ID` — a data-integrity guard,
+not a graph constraint.) What follows a bulk load in production is **online schema-hardening**: you
+bring the freshly-loaded data online and **declare, via DDL on the live server, the constraints and
+indexes it is now ready to carry.**
 
-- The `graphus-bulk` importer builds a **fresh store directly** through the low-level record API
-  (`create_node` / `set_node_labels` / `set_node_property_value` / `create_rel` / …). It does **not**
-  build secondary indexes and does **not** enforce constraints — there is no index/constraint code in
-  the crate. (It *does* fail-closed on a duplicate non-empty external `:ID`, a data-integrity guard,
-  not a graph constraint.)
-- The generator guarantees the dataset **satisfies** the unique-id invariant by construction (every
-  `:ID` is distinct), so the implied constraints would validate cleanly.
-- Those constraints/indexes would be **declared via DDL on a live server** *after* a bulk load
-  (`CREATE CONSTRAINT … REQUIRE n.id IS UNIQUE`, `CREATE INDEX … ON (n.id)`). The exact statements are
-  recorded in `manifest.json` under `implied_constraints` for reference. This example, being offline,
-  does not start a server and therefore does not create them.
+The generator is built so that **every rule** in that production schema is *satisfied by
+construction*, so each creation-time validation passes cleanly. The full palette is recorded verbatim
+in `manifest.json` under `implied_schema` — honest documentation of what an operator would declare,
+not a built artifact:
+
+| Kind | Statement | Why it holds on this data |
+|------|-----------|---------------------------|
+| **NODE KEY** | `CREATE CONSTRAINT person_id_key FOR (n:Person) REQUIRE n.id IS NODE KEY` | every `Person.id` is present and distinct |
+| **composite UNIQUE** | `CREATE CONSTRAINT post_id_created_unique FOR (n:Post) REQUIRE (n.id, n.createdAt) IS UNIQUE` | trivially unique via the distinct `Post.id` |
+| **UNIQUE** | `CREATE CONSTRAINT forum_id_unique FOR (n:Forum) REQUIRE n.id IS UNIQUE` | every `Forum.id` is distinct |
+| **UNIQUE** | `CREATE CONSTRAINT comment_id_unique FOR (n:Comment) REQUIRE n.id IS UNIQUE` | every `Comment.id` is distinct |
+| **node property-type** | `CREATE CONSTRAINT post_length_integer FOR (n:Post) REQUIRE n.length IS :: INTEGER` | `Post.length` is always an `int` |
+| **relationship existence** | `CREATE CONSTRAINT likes_created_exists FOR ()-[r:LIKES]-() REQUIRE r.creationDate IS NOT NULL` | every `LIKES` carries a `creationDate` |
+| **relationship property-type** | `CREATE CONSTRAINT has_creator_weight_integer FOR ()-[r:HAS_CREATOR]-() REQUIRE r.weight IS :: INTEGER` | `HAS_CREATOR.weight` is always an `int` |
+| **TEXT index** | `CREATE TEXT INDEX post_content_text FOR (n:Post) ON (n.content)` | substring search over post content |
+| **FULLTEXT index** | `CREATE FULLTEXT INDEX post_content_fulltext FOR (n:Post) ON EACH [n.content]` | tokenized word search over post content |
+| **composite RANGE index** | `CREATE INDEX post_catalog_composite FOR (n:Post) ON (n.createdAt, n.id)` | ordered "catalog by time" read path |
+
+The id read path is served by the **backing indexes** of the id constraints (a `NODE KEY` / `UNIQUE`
+constraint owns a RANGE index; the composite `UNIQUE`'s leading key is `id`). **No relationship
+property is naturally unique** — every relationship type here carries exactly one, non-key property —
+so the schema uses a relationship *existence* + *property-type* constraint rather than a
+`RELATIONSHIP KEY`.
+
+### How it is proven
+
+- **Hermetic cargo mirror** (always-run, `cargo test -p graphus-server --test bulk_etl_schema`): loads
+  the SAME seeded model **schema-first** through the real engine (the admin-DDL command path +
+  `LocalEngine`), then asserts `SHOW INDEXES` / `SHOW CONSTRAINTS` list every kind `ONLINE` with the
+  right type strings/entities/properties; that a composite-`UNIQUE` duplicate, a `NODE KEY` duplicate,
+  and a `LIKES` edge missing `creationDate` are each **rejected**; and that the search paths return the
+  exact generator-derived sets (a `TEXT CONTAINS` substring set — lowering to a `NodeTextIndexSeek` —
+  and `FULLTEXT queryNodes` for the shared token / a unique number token / an absent term) plus a
+  composite `(createdAt, id)` seek — lowering to a `NodeCompositeIndexSeek`.
+- **Live wire demo** (`run.sh` Step 5, opt-in via `RUN_WIRE`, default on): boots a **real
+  `graphus-server`** and, over Bolt-over-UDS, loads a small slice of the model, applies the whole
+  palette as an operator would *after* a load, proves one enforcement rejection, and captures
+  `SHOW CONSTRAINTS` / `SHOW INDEXES` (full columns) into `evidence/`.
+
+  **Empirical note — why the live demo uses the server's own fresh store, not the bulk-imported one**
+  (verified against the code): the offline importer writes a flat `<dir>/graph.store` + `graph.wal`
+  pair and does **not** persist the CSV `:ID` column as a queryable node property (it is consumed only
+  as the physical-id join key), whereas the server resolves its store as
+  `<store_path>/databases/<name>/graphus.store` (with a database catalog) and the id-anchored schema
+  needs an `id` property. So the id column is carried as a property when loading over the wire — exactly
+  as an online client does after a bulk load — and the hermetic mirror is the rigorous proof over the
+  generator's exact dataset.
 
 ## How it is built — the dev-only generator crate
 
@@ -131,7 +177,12 @@ The library is covered by unit + integration tests in the DEFAULT `cargo test`:
   no-subprocess, no-disk (`MemBlockDevice`) `generate → import → dump → re-import` through the real
   `graphus-bulk` **library** API (`BulkImporter`), asserting the re-imported **counts** and the
   id-independent **content hash** match the original — the same losslessness the core proves, run
-  hermetically on every `cargo test`.
+  hermetically on every `cargo test`;
+- `graphus-server/tests/bulk_etl_schema.rs` — the **online schema-hardening mirror** (`rmp #678`):
+  loads the SAME seeded model schema-first through the real engine and asserts the full constraint +
+  index palette is declared `ONLINE`, enforced (negative writes rejected), and utilised by the planner
+  (`SHOW INDEXES` / `SHOW CONSTRAINTS`, `TEXT CONTAINS`, `FULLTEXT queryNodes`, composite seek) — also
+  on every `cargo test`.
 
 ## Capabilities exercised
 
@@ -145,17 +196,24 @@ The library is covered by unit + integration tests in the DEFAULT `cargo test`:
 | **Peak RAM / CPU / time** | poll the import child's PID (`/proc` / `ps`) | `report.json` `memory.peak_rss_bytes`, `cpu.*`, `phases[import]` |
 | **Storage footprint + amplification** | `bulk_storage` walks the on-disk store + WAL | `report.json` `storage.*` + `storage.json` |
 | **Regression gate** | `bulk_baseline_cmp` vs committed `baseline.json` | `GRAPHUS_BASELINE_OK` |
+| **Online schema-hardening** (`rmp #678`) | hermetic `bulk_etl_schema.rs` + opt-in live server step (`run.sh` Step 5) | `SHOW CONSTRAINTS` / `SHOW INDEXES` list the full palette `ONLINE`; enforcement rejections; `evidence/schema_*.txt` |
 
 ## Running it
 
-The standardized, self-asserting entry point is `run.sh` (fully offline — no server, no driver, no
-network). It builds the binaries if needed, then runs the whole pipeline, prints an `N checks run, M
-failures` summary + the evidence path, and exits non-zero on any failed assertion. A `trap` removes
-the temp workspace on exit (success **or** failure), so it leaves no residue.
+The standardized, self-asserting entry point is `run.sh`. Its offline core (Steps 1–4) needs no
+server, driver, or network; the opt-in online schema-hardening demo (Step 5) boots a real
+`graphus-server` over Bolt-over-UDS and is enabled by default (`RUN_WIRE=1`). It builds the binaries
+if needed, runs the whole pipeline, prints an `N checks run, M failures` summary + the evidence path,
+and exits non-zero on any failed assertion. A `trap` removes the temp workspace on exit (success **or**
+failure), so it leaves no residue.
 
 ```bash
 # Fast profile (default): 800 nodes / 4,029 rels — the CI/E2E scale, gated against the baseline.
+# Also runs the live online schema-hardening demo (Step 5) unless RUN_WIRE=0.
 examples/bulk-etl/run.sh
+
+# Offline core only — skip the live server step (a host without a server/cli build).
+RUN_WIRE=0 examples/bulk-etl/run.sh
 
 # Large profile: 24,400 nodes / 139,989 rels — the evidence/volume scale (not baseline-gated).
 BULK_PROFILE=large examples/bulk-etl/run.sh

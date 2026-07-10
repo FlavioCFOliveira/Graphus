@@ -1389,6 +1389,7 @@ dependencies = [
  "graphus-auth",
  "graphus-bolt",
  "graphus-bulk",
+ "graphus-bulk-gen",
  "graphus-cli",
  "graphus-core",
  "graphus-crypto",

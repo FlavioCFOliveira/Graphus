@@ -56,11 +56,21 @@
 //! The offline `graphus-bulk` importer builds a **fresh store directly** through the low-level record
 //! API (`create_node` / `set_node_labels` / `set_node_property_value` / `create_rel` / …). It does
 //! **not** build secondary indexes or enforce constraints — there is no index/constraint code in the
-//! crate. The dataset *implies* a `UNIQUE` constraint on each label's `id` (the external-id join key)
-//! and lookup indexes on it; those would be **declared via DDL on a live server** (`CREATE
-//! CONSTRAINT … REQUIRE … IS UNIQUE`, `CREATE INDEX …`) after a bulk load, not built by the offline
-//! importer. The generator guarantees the dataset *satisfies* that unique-id invariant by
-//! construction (every `:ID` is distinct); see [`Manifest::implied_constraints`].
+//! crate. What follows a bulk load in production is **online schema-hardening**: an operator declares,
+//! via DDL on the live server, the constraints and indexes the freshly-loaded data is now ready to
+//! carry. The dataset is generated so that **every** rule in that production schema is *satisfied by
+//! construction*, so each creation-time validation passes. The full palette — a `NODE KEY` on
+//! `Person.id`, a composite `UNIQUE` on `Post(id, createdAt)`, `UNIQUE` on `Forum.id` / `Comment.id`,
+//! a node property-type (`Post.length IS :: INTEGER`), a relationship existence
+//! (`LIKES.creationDate IS NOT NULL`) and a relationship property-type
+//! (`HAS_CREATOR.weight IS :: INTEGER`), plus `TEXT` + `FULLTEXT` indexes on `Post.content` and a
+//! composite `RANGE` index on `Post(createdAt, id)` — is recorded verbatim in the manifest under
+//! [`Manifest::implied_schema`]. It is **honest documentation of what an operator would declare**, not
+//! a built artifact: the offline importer never applies it. (No relationship property is naturally
+//! unique — every relationship type here carries exactly one, non-key property — so the schema uses a
+//! relationship existence + property-type constraint rather than a `RELATIONSHIP KEY`.) The exact same
+//! schema is exercised end-to-end against the real engine by the hermetic
+//! `graphus-server/tests/bulk_etl_schema.rs` mirror.
 
 #![forbid(unsafe_code)]
 
@@ -341,9 +351,14 @@ pub struct Manifest {
     /// The logical, uncompressed byte size of the dataset content (sum of every emitted CSV file's
     /// length). The space-amplification denominator: on-disk store bytes / this.
     pub logical_csv_bytes: u64,
-    /// The constraints/indexes the dataset *implies* but the OFFLINE importer does **not** build
-    /// (they would be declared via DDL on a live server). Honest documentation, not a built artifact.
-    pub implied_constraints: Vec<String>,
+    /// The production **online schema-hardening** palette the dataset is built to satisfy but the
+    /// OFFLINE importer does **not** build: the exact `CREATE CONSTRAINT` / `CREATE … INDEX` DDL an
+    /// operator would declare on the live server after a bulk load (a `NODE KEY`, a composite `UNIQUE`,
+    /// `UNIQUE`s, a node + a relationship property-type, a relationship existence, and `TEXT` /
+    /// `FULLTEXT` / composite `RANGE` indexes). Honest documentation of what would be declared, not a
+    /// built artifact — every rule here is satisfied by the seeded data by construction, and the same
+    /// DDL is exercised end-to-end by `graphus-server/tests/bulk_etl_schema.rs`.
+    pub implied_schema: Vec<String>,
 }
 
 /// Generates a [`Dataset`] from a [`GenConfig`].
@@ -663,11 +678,32 @@ pub fn generate(config: GenConfig, profile: &str) -> Dataset {
         .chain(rel_files.iter().map(|r| r.csv.len() as u64))
         .sum();
 
-    let implied_constraints = vec![
-        "CREATE CONSTRAINT person_id FOR (n:Person) REQUIRE n.id IS UNIQUE".to_owned(),
-        "CREATE CONSTRAINT forum_id FOR (n:Forum) REQUIRE n.id IS UNIQUE".to_owned(),
-        "CREATE CONSTRAINT post_id FOR (n:Post) REQUIRE n.id IS UNIQUE".to_owned(),
-        "CREATE CONSTRAINT comment_id FOR (n:Comment) REQUIRE n.id IS UNIQUE".to_owned(),
+    // The production online schema-hardening palette (`rmp` #678): the exact DDL an operator would
+    // declare on the live server after this bulk load. Every rule is SATISFIED by the seeded data by
+    // construction (each id is distinct; every post length / authorship weight is an integer; every
+    // like carries a creationDate), so each creation-time validation passes. Documentation only — the
+    // offline importer never applies it; the hermetic `bulk_etl_schema.rs` mirror proves it works.
+    let implied_schema = vec![
+        // NODE KEY + UNIQUE on the external-id join keys (the point-lookup anchors, id read path).
+        "CREATE CONSTRAINT person_id_key FOR (n:Person) REQUIRE n.id IS NODE KEY".to_owned(),
+        "CREATE CONSTRAINT forum_id_unique FOR (n:Forum) REQUIRE n.id IS UNIQUE".to_owned(),
+        "CREATE CONSTRAINT comment_id_unique FOR (n:Comment) REQUIRE n.id IS UNIQUE".to_owned(),
+        // Composite UNIQUE on Post(id, createdAt) — trivially unique via the distinct post id.
+        "CREATE CONSTRAINT post_id_created_unique FOR (n:Post) REQUIRE (n.id, n.createdAt) IS UNIQUE"
+            .to_owned(),
+        // Node property-type: a post's length is always an integer.
+        "CREATE CONSTRAINT post_length_integer FOR (n:Post) REQUIRE n.length IS :: INTEGER"
+            .to_owned(),
+        // Relationship constraints — no rel property is naturally unique, so an existence + a
+        // property-type rather than a RELATIONSHIP KEY.
+        "CREATE CONSTRAINT likes_created_exists FOR ()-[r:LIKES]-() REQUIRE r.creationDate IS NOT NULL"
+            .to_owned(),
+        "CREATE CONSTRAINT has_creator_weight_integer FOR ()-[r:HAS_CREATOR]-() REQUIRE r.weight IS :: INTEGER"
+            .to_owned(),
+        // Search + catalog indexes over post content and the post timeline.
+        "CREATE TEXT INDEX post_content_text FOR (n:Post) ON (n.content)".to_owned(),
+        "CREATE FULLTEXT INDEX post_content_fulltext FOR (n:Post) ON EACH [n.content]".to_owned(),
+        "CREATE INDEX post_catalog_composite FOR (n:Post) ON (n.createdAt, n.id)".to_owned(),
     ];
 
     let manifest = Manifest {
@@ -679,7 +715,7 @@ pub fn generate(config: GenConfig, profile: &str) -> Dataset {
         total_relationships,
         total_properties: props,
         logical_csv_bytes,
-        implied_constraints,
+        implied_schema,
     };
 
     Dataset {
@@ -787,6 +823,46 @@ mod tests {
             + 3 * cfg.comment_count(); // Comment
         let rel_props: u64 = d.manifest.total_relationships; // exactly one property per rel
         assert_eq!(d.manifest.total_properties, node_props + rel_props);
+    }
+
+    #[test]
+    fn implied_schema_documents_the_full_hardening_palette() {
+        // `rmp` #678: the manifest records the exact production online schema-hardening DDL — a NODE
+        // KEY, a composite UNIQUE, two UNIQUEs, a node + a relationship property-type, a relationship
+        // existence, and TEXT + FULLTEXT + composite RANGE indexes. This is the contract the hermetic
+        // `bulk_etl_schema.rs` mirror applies verbatim against the real engine, so it must stay in sync.
+        let d = generate(Profile::Fast.config(), "fast");
+        let schema = &d.manifest.implied_schema;
+        assert_eq!(
+            schema.len(),
+            10,
+            "the full palette is ten statements: {schema:?}"
+        );
+        // Every documented statement is one of the two admin-DDL kinds (a constraint or an index).
+        for stmt in schema {
+            assert!(
+                stmt.starts_with("CREATE CONSTRAINT") || stmt.contains(" INDEX "),
+                "not a schema-DDL statement: {stmt}"
+            );
+        }
+        let joined = schema.join("\n");
+        for needle in [
+            "person_id_key FOR (n:Person) REQUIRE n.id IS NODE KEY",
+            "post_id_created_unique FOR (n:Post) REQUIRE (n.id, n.createdAt) IS UNIQUE",
+            "forum_id_unique FOR (n:Forum) REQUIRE n.id IS UNIQUE",
+            "comment_id_unique FOR (n:Comment) REQUIRE n.id IS UNIQUE",
+            "post_length_integer FOR (n:Post) REQUIRE n.length IS :: INTEGER",
+            "likes_created_exists FOR ()-[r:LIKES]-() REQUIRE r.creationDate IS NOT NULL",
+            "has_creator_weight_integer FOR ()-[r:HAS_CREATOR]-() REQUIRE r.weight IS :: INTEGER",
+            "CREATE TEXT INDEX post_content_text FOR (n:Post) ON (n.content)",
+            "CREATE FULLTEXT INDEX post_content_fulltext FOR (n:Post) ON EACH [n.content]",
+            "CREATE INDEX post_catalog_composite FOR (n:Post) ON (n.createdAt, n.id)",
+        ] {
+            assert!(
+                joined.contains(needle),
+                "missing schema statement: {needle}"
+            );
+        }
     }
 
     #[test]

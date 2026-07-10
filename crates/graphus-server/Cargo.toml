@@ -227,6 +227,17 @@ graphus-social-gen = { path = "../graphus-social-gen", default-features = false 
 # direct deps of `graphus-server` — so the serde-only generator is all this dev-dep contributes and
 # no cycle is introduced. TEST-TARGET dev-dependency only; never enters the production build.
 graphus-security-gen = { path = "../graphus-security-gen" }
+# The deterministic LDBC-SNB-like social-network CSV generator for the bulk-etl example, so the
+# hermetic bulk-etl schema mirror (`tests/bulk_etl_schema.rs`) can generate the SAME seeded
+# Person/Forum/Post/Comment + KNOWS/HAS_MEMBER/… dataset the example bulk-loads and assert the
+# production online schema-hardening it now documents (a NODE KEY + composite UNIQUE + UNIQUEs, a node
+# + a relationship property-type, a relationship existence, and TEXT + FULLTEXT + composite RANGE
+# indexes) — including the headline `TEXT CONTAINS` + `db.index.fulltext.queryNodes` searches — through
+# the REAL admin-DDL + `LocalEngine` seam, fully in-process, no Node/network. bulk-gen has no feature
+# flags; its lib deps are serde + graphus-bulk/core/io/storage/wal + the evidence harness (all already
+# in this build graph), and it does NOT depend on `graphus-server`, so this introduces no cycle and no
+# `dst` leakage; it is a TEST-TARGET dev-dependency that never enters the production build.
+graphus-bulk-gen = { path = "../graphus-bulk-gen" }
 # The HTTP request/response types + body collector to drive the REST `axum::Router` via
 # `tower::ServiceExt::oneshot` in the hermetic mirror (the same no-socket pattern `graphus-rest`'s
 # own router tests use). `http` tracks the `1` line `graphus-rest` already pins, so no duplicate
