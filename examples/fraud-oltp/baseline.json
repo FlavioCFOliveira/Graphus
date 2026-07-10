@@ -8,10 +8,12 @@
       "relationships": 588
     },
     "workload": {
-      "concurrency_aborts": "207",
-      "concurrency_commits": "63",
+      "concurrency_aborts": "255",
+      "concurrency_commits": "15",
+      "concurrency_write_p99_ms": "80.0",
       "connection": "bolt-tcp-tls",
       "driver": "official neo4j-driver",
+      "point_lookup_p99_ms": "6.0",
       "profile": "fast"
     },
     "started_unix_secs": 1783701393
@@ -50,12 +52,13 @@
     "p50_latency_ms": 2.0629999935626984,
     "p99_latency_ms": 2.8620000034570694,
     "p999_latency_ms": 6.50900000333786,
-    "abort_rate": 0.766667
+    "abort_rate": 0.9
   },
   "notes": [
     "storage.bytes_fsynced is a proxy: the WAL on-disk byte count (every committed WAL byte is fsynced before commit acknowledgement), not a directly-observed fsync counter.",
     "Throughput window is the detection workload's ops over server uptime (a coarse proxy); latency percentiles + abort rate are measured by the drivers (GRAPHUS_STATS).",
     "Live measurement of graphus-server over 4.000s uptime; CPU is the server's cumulative since-boot usage (the process is dedicated to this workload), RSS is sampled from the live process.",
-    "COMMITTED BASELINE (rmp #256; re-baselined under #673 when the production-realistic index/constraint schema was added, and again under #682 when a RELATIONSHIP KEY on TRANSFER.tx_id was added): the fast-profile reference run for the regression gate. The #682 re-baseline is legitimate on two structural axes — (1) the extra globally-unique tx_id string property on every TRANSFER grows the on-disk store (376832 -> 442368 bytes), and (2) the scan-based RELATIONSHIP KEY uniqueness check marks all live relationships as SIREAD, enlarging each writer's read footprint and raising the SSI abort rate (0.4741 -> 0.7667) while the no-lost-update invariant still holds. Only STABLE STRUCTURAL metrics (storage bytes/pages, operation count, abort-rate band) are compared against it; CPU/RAM/latency/throughput are machine-variant and are NOT gated (see baseline_cmp). Recorded on linux/x86_64."
+    "COMMITTED BASELINE (rmp #256; re-baselined under #673 for the production-realistic index/constraint schema, #682 for the RELATIONSHIP KEY on TRANSFER.tx_id). The gate compares only STABLE STRUCTURAL metrics (storage bytes/pages, operation count) at 15% and keeps a tight one-sided abort-rate livelock-drift guard (+10% rise); CPU/RAM/latency/throughput are machine-variant and NOT gated (see baseline_cmp). Recorded on linux/x86_64.",
+    "rmp #689 abort_rate re-baseline: the extreme-concurrency phase now contends the REAL mule :Account supernodes (was synthetic :Hot nodes), so the abort rate rises into the ~0.9+ regime (measured ~0.944 attaching to pi516; a target that also enforces the scan-based RELATIONSHIP KEY aborts even more). The PRIMARY abort gate is now the two-sided absolute band asserted first-class in data/concurrency.js (FRAUD_ABORT_FLOOR..CEIL, default 0.40..0.995); this baseline value (0.90) only anchors baseline_cmp's +10% livelock-drift guard (fires past ~0.99). The storage footprint is unchanged within the 15% band (the load dominates and is deterministic for a fixed seed+profile; the device/ip collusion values and the handful of concurrency deposit edges move it negligibly)."
   ]
 }

@@ -61,6 +61,14 @@ path = "src/bin/gen.rs"
 name = "baseline_cmp"
 path = "src/bin/baseline_cmp.rs"
 
+# Local-mode server_metrics injector: folds the /metrics before/after delta into a measure_server
+# report.json so the LOCAL path carries the same server-side evidence external (attach) mode gets from
+# measure_target. Hermetic — needs only the harness, no engine, so it is always available.
+# Usage: `cargo run -p graphus-fraud-gen --bin inject_server_metrics -- <evidence-dir> <before> <after> <db>`
+[[bin]]
+name = "inject_server_metrics"
+path = "src/bin/inject_server_metrics.rs"
+
 # The deterministic in-process SSI-contention repro (opt-in: needs the `dst-repro` feature).
 # Usage: `cargo run -p graphus-fraud-gen --features dst-repro --bin dst_contention -- --seed 42`
 [[bin]]

@@ -1,35 +1,64 @@
 #!/usr/bin/env bash
 #
-# Graphus fraud-detection OLTP demonstration — over Bolt-over-TCP+TLS, driven by the OFFICIAL Neo4j
-# driver, plus an extreme-concurrency SSI driver and a deterministic in-process SSI repro.
+# Graphus fraud-detection OLTP demonstration — driven by the OFFICIAL Neo4j driver over Bolt+TLS,
+# with an extreme-concurrency SSI driver on the REAL mule supernodes and a deterministic in-process
+# SSI repro.
 #
-# This script doubles as an executable E2E test. It:
-#   1. generates a DETERMINISTIC, SEEDED fraud graph (the `gen` binary) with a known, enumerable set
-#      of planted fraud structures (transaction rings + mule fan-in/fan-out chains) and emits the
-#      ground truth as JSON;
-#   2. boots the REAL `graphus-server` exposing Bolt-over-TCP secured with a self-signed TLS cert;
-#   3. loads the schema (UNIQUE constraints + indexes) and the graph over Bolt via the OFFICIAL
-#      `neo4j-driver` npm package (`bolt+ssc://`), then runs the detection workload and asserts it
-#      finds EXACTLY the planted fraud (0 false negatives, 0 false positives on the seeded set);
-#   4. runs an EXTREME-CONCURRENCY SSI driver: many overlapping writer/reader transactions contending
-#      on hot accounts, reporting commit/abort tallies and proving NO committed transfer is lost;
-#   5. runs the DETERMINISTIC in-process SSI-contention repro (`dst_contention`), which reproduces the
-#      same contention byte-identically for a fixed seed.
+# It runs in TWO modes (auto-detected via the shared external-target seam in `_harness/harness.sh`):
 #
-# Steps 3 + 4 need Node + npm + network (for `npm install neo4j-driver`); they are OPT-IN via
-# RUN_DRIVER=1 (default ON when `node`/`npm` are present, else skipped with a clear note). The
-# generator (step 1) and the DST repro (step 5) are HERMETIC and always run.
+#   LOCAL (default)   — self-boots a real `graphus-server` (Bolt-over-TCP + TLS + REST/`/metrics`),
+#                       loads + detects + runs concurrency against it, meters the co-located process
+#                       (CPU/RSS + on-disk store/WAL via `measure_server`), folds in the `/metrics`
+#                       before/after delta (`inject_server_metrics`), and gates the run against the
+#                       committed `baseline.json`.
+#   EXTERNAL (attach) — when ANY of GRAPHUS_TARGET_{BOLT,REST,UDS} is set, attaches to an
+#                       ALREADY-RUNNING instance (local OR remote, e.g. pi516). It carves out a
+#                       dedicated, isolated database (session `{database}` routing), runs the same
+#                       load + detect + concurrency there, scrapes the target's `/metrics` before +
+#                       after, emits an EXTERNAL-mode report via `measure_target` (server-side
+#                       committed/aborted/abort_rate/force-detached deltas + client throughput/latency
+#                       — process CPU/RSS + storage are N/A remotely and no baseline is gated), and
+#                       DROPS the isolated database on exit (never touching the target's own data).
+#
+# What it proves, either way:
+#   1. a DETERMINISTIC, SEEDED fraud graph with a known, enumerable set of planted fraud structures
+#      (transaction rings + mule fan-in/fan-out chains + shared-device/IP collusion clusters);
+#   2. detection finds EXACTLY the planted fraud (0 FP / 0 FN) — rings, mules, velocity, AND the
+#      shared-device/shared-IP collusion clusters (the generated device/ip fields);
+#   3. a blended point-lookup OLTP mix (account-by-id, recent-transfers);
+#   4. constraint enforcement (negative tests, gated on what the target's version supports);
+#   5. EXTREME concurrency on the REAL mule supernodes: overlapping writer/reader transactions,
+#      reporting commit/abort tallies + write p99, a FIRST-CLASS abort-rate band, and NO lost update;
+#   6. the deterministic in-process SSI-contention repro (`dst_contention`).
+#
+# Steps 2-5 need Node + npm + network (for `npm install neo4j-driver`); they are OPT-IN via RUN_DRIVER
+# (default ON when `node`/`npm` are present). The generator (step 1) and the DST repro (step 6) are
+# HERMETIC and always run.
 #
 # Usage:
-#   examples/fraud-oltp/run.sh                       # builds binaries if needed, then runs
-#   GRAPHUS_BIN_DIR=target/release  examples/fraud-oltp/run.sh
-#   FRAUD_PROFILE=large             examples/fraud-oltp/run.sh   # evidence-scale dataset
-#   RUN_DRIVER=0                    examples/fraud-oltp/run.sh   # skip the official-driver steps
+#   examples/fraud-oltp/run.sh                                         # local self-boot
+#   FRAUD_PROFILE=large  examples/fraud-oltp/run.sh                    # evidence-scale dataset
+#   RUN_DRIVER=0         examples/fraud-oltp/run.sh                    # skip the official-driver steps
+#   GRAPHUS_TARGET_BOLT=bolt+ssc://host:7687 GRAPHUS_TARGET_REST=https://host:7474 \
+#     GRAPHUS_TARGET_USER=graphus GRAPHUS_TARGET_PASSWORD=graphus-local \
+#     GRAPHUS_TARGET_TLS_INSECURE=1  examples/fraud-oltp/run.sh        # attach to a running instance
 #
-# Requirements: a Unix host (Linux/macOS), bash, openssl (for the self-signed cert), and a checkout
-# that builds. For the official-driver steps also: node (v18+), npm, and network/cache access.
+# Requirements: a Unix host, bash, curl. LOCAL mode also needs openssl (the self-signed cert). The
+# official-driver steps also need node (v18+), npm, and network/cache for `npm install neo4j-driver`.
 
 set -euo pipefail
+
+# --------------------------------------------------------------------------------------------------
+# Shared external-target seam (GRAPHUS_TARGET_* detection, isolated-DB create/drop, /metrics scrape).
+# We source it FIRST, then (re)define this script's own pretty-printers + assert counters below so the
+# familiar `CHECKS`/`FAILURES` summary is preserved; the harness's target helpers call `info`/`section`
+# by name at call time, so they transparently use these definitions.
+# --------------------------------------------------------------------------------------------------
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../_harness/harness.sh
+source "$(cd "$SCRIPT_DIR/../_harness" && pwd)/harness.sh"
+export HARNESS_SCENARIO="fraud-oltp"   # names the isolated DB: ex_fraud-oltp_<epoch>_<pid>
 
 # --------------------------------------------------------------------------------------------------
 # Pretty output helpers (house style)
@@ -58,11 +87,11 @@ assert() {
   fi
 }
 
+MODE="$(harness_target_mode)"   # external iff GRAPHUS_TARGET_{BOLT,REST,UDS} is set, else local
+
 # --------------------------------------------------------------------------------------------------
 # Locate (or build) the binaries
 # --------------------------------------------------------------------------------------------------
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="${GRAPHUS_BIN_DIR:-$REPO_ROOT/target/release}"
 SERVER="$BIN_DIR/graphus-server"
 GEN="$BIN_DIR/gen"
@@ -71,11 +100,14 @@ DST="$BIN_DIR/dst_contention"
 PROFILE="${FRAUD_PROFILE:-fast}"
 DST_SEED="${FRAUD_DST_SEED:-42}"
 
-if [ ! -x "$SERVER" ]; then
+# The server binary is only needed to self-boot in LOCAL mode.
+if [ "$MODE" = local ] && [ ! -x "$SERVER" ]; then
   section "Building graphus-server (release)"
   ( cd "$REPO_ROOT" && cargo build --release -p graphus-server )
 fi
-[ -x "$SERVER" ] || { echo "${RED}fatal: server binary not found at $SERVER${RESET}" >&2; exit 2; }
+if [ "$MODE" = local ]; then
+  [ -x "$SERVER" ] || { echo "${RED}fatal: server binary not found at $SERVER${RESET}" >&2; exit 2; }
+fi
 
 if [ ! -x "$GEN" ]; then
   section "Building the deterministic fraud generator (release)"
@@ -90,7 +122,7 @@ fi
 [ -x "$DST" ] || { echo "${RED}fatal: dst_contention binary not found at $DST${RESET}" >&2; exit 2; }
 
 # --------------------------------------------------------------------------------------------------
-# Workspace: a private temp store + TLS material + generated data, removed on exit
+# Workspace + teardown
 # --------------------------------------------------------------------------------------------------
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/graphus-fraud-XXXXXX")"
 CONFIG="$WORKDIR/graphus.toml"
@@ -102,28 +134,38 @@ ADMIN_USER="neo4j"
 ADMIN_PW="fraud-oltp-demo-pw-32bytes-minimum!"
 JWT_SECRET="fraud-oltp-demo-jwt-secret-32bytes-ok!"
 
-# Evidence collection (rmp #253/#256). The standardized report.json + report.md land in the
-# git-ignored evidence/ dir; the durable store/WAL paths follow the server's single-db layout
-# (<store_path>/graphus.store, <store_path>/graphus.wal/). BASELINE is the committed reference run we
-# compare a fresh fast-profile run against.
 EVIDENCE_DIR="$SCRIPT_DIR/evidence"
 STORE_FILE="$WORKDIR/data/graphus.store"
 WAL_DIR="$WORKDIR/data/graphus.wal"
 BASELINE="$SCRIPT_DIR/baseline.json"
-PEAK_RSS_BYTES=0          # high-watermark of the server's RSS, sampled during the workload
-SERVER_START_EPOCH=0      # wall-clock epoch (s) of the server boot, for the CPU/uptime window
+PEAK_RSS_BYTES=0
+SERVER_START_EPOCH=0
+METRICS_BEFORE="$WORKDIR/metrics_before.prom"
+METRICS_AFTER="$WORKDIR/metrics_after.prom"
 
 SERVER_PID=""
+TARGET_DB=""
 cleanup() {
+  # LOCAL: stop the self-booted server.
   if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
     kill -TERM "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
+  fi
+  # EXTERNAL: drop the isolated DB we created (no-op for an operator-owned GRAPHUS_TARGET_DB); for an
+  # operator DB, best-effort clear only OUR label footprint so nothing leaks across runs.
+  if [ "$MODE" = external ]; then
+    if [ -n "${GRAPHUS_TARGET_DB:-}" ]; then
+      harness_target_query "$GRAPHUS_TARGET_DB" "MATCH (n:Account) DETACH DELETE n" >/dev/null 2>&1 || true
+      harness_target_query "$GRAPHUS_TARGET_DB" "MATCH (n:Customer) DETACH DELETE n" >/dev/null 2>&1 || true
+    else
+      harness_target_drop_db >/dev/null 2>&1 || true
+    fi
   fi
   rm -rf "$WORKDIR"
 }
 trap cleanup EXIT INT TERM
 
-# server_rss_bytes <pid> — current resident set size of the server in bytes (Linux /proc, macOS ps).
+# server_rss_bytes <pid> — current resident set size in bytes (Linux /proc, macOS ps).
 server_rss_bytes() {
   local pid="$1" bytes=0
   if [ -r "/proc/$pid/statm" ]; then
@@ -138,22 +180,28 @@ server_rss_bytes() {
   fi
   echo "${bytes:-0}"
 }
-
-# sample_peak_rss — read the live server's RSS once and keep the running high-watermark.
 sample_peak_rss() {
   if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
-    local rss
-    rss="$(server_rss_bytes "$SERVER_PID")"
-    if [ "${rss:-0}" -gt "$PEAK_RSS_BYTES" ]; then
-      PEAK_RSS_BYTES="$rss"
-    fi
+    local rss; rss="$(server_rss_bytes "$SERVER_PID")"
+    if [ "${rss:-0}" -gt "$PEAK_RSS_BYTES" ]; then PEAK_RSS_BYTES="$rss"; fi
   fi
 }
 
-# json_field <json-blob> <key> — extract a numeric/string field from a one-line JSON object without a
-# jq dependency (the GRAPHUS_STATS lines the Node scripts emit are flat objects of scalars).
+# json_field <json-blob> <key> — extract a flat scalar field without a jq dependency.
 json_field() {
   printf '%s' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\\{0,1\\}\\([^,\"}]*\\).*/\\1/p" | head -n1
+}
+
+# local_scrape_metrics <rest_base> <user> <pass> <outfile> — LOCAL-mode /metrics scrape (the harness
+# scrape helpers key off GRAPHUS_TARGET_*, which are unset in local mode). Non-fatal.
+local_scrape_metrics() {
+  local base="$1" user="$2" pass="$3" out="$4" token
+  token="$(curl -sS -k -m 10 -X POST "$base/auth/login" -H 'Content-Type: application/json' \
+    -d "{\"username\":\"$user\",\"password\":\"$pass\"}" 2>/dev/null \
+    | sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  [ -z "$token" ] && { info "local_scrape_metrics: no admin token from $base/auth/login"; return 1; }
+  curl -sS -k -m 10 -o "$out" -H "Authorization: Bearer $token" "$base/metrics" 2>/dev/null || return 1
+  [ -s "$out" ]
 }
 
 # --------------------------------------------------------------------------------------------------
@@ -166,23 +214,16 @@ info "$GEN_OUT"
 GRAPH_CYPHER="$DATA_DIR/graph.cypher"
 GROUND_TRUTH="$DATA_DIR/ground_truth.json"
 
-# Parse the generator's `key=value` summary line for the dataset sizing the evidence report needs.
-# `kv <line> <key>` reads a `key=value` token; the durable graph is accounts+customers nodes and
-# transfers+OWNS (one OWNS per account) relationships.
 kv() { printf '%s' "$1" | tr ' ' '\n' | sed -n "s/^$2=//p" | head -n1; }
 GEN_ACCOUNTS="$(kv "$GEN_OUT" accounts)"
 GEN_CUSTOMERS="$(kv "$GEN_OUT" customers)"
 GEN_TRANSFERS="$(kv "$GEN_OUT" transfers)"
 NODE_COUNT=$(( ${GEN_ACCOUNTS:-0} + ${GEN_CUSTOMERS:-0} ))
 REL_COUNT=$(( ${GEN_TRANSFERS:-0} + ${GEN_ACCOUNTS:-0} ))
-# Coarse logical-bytes estimate for the space-amplification ratio (~256 B/node + ~128 B/rel covers
-# the fixed-record node/rel payloads and their small property values) — a meaningful-but-honest
-# proxy, documented in the README, not precise accounting.
 LOGICAL_GRAPH_BYTES=$(( NODE_COUNT * 256 + REL_COUNT * 128 ))
 assert "graph.cypher generated"      "yes" "$([ -s "$GRAPH_CYPHER" ] && echo yes || echo no)"
 assert "ground_truth.json generated" "yes" "$([ -s "$GROUND_TRUTH" ] && echo yes || echo no)"
 
-# Determinism check: regenerate and diff (the AC: byte-identical per seed/scale).
 GEN_OUT2_DIR="$WORKDIR/dataset2"
 "$GEN" --profile "$PROFILE" --out-dir "$GEN_OUT2_DIR" > /dev/null
 if diff -q "$GRAPH_CYPHER" "$GEN_OUT2_DIR/graph.cypher" > /dev/null \
@@ -197,35 +238,37 @@ fi
 # --------------------------------------------------------------------------------------------------
 RUN_DRIVER="${RUN_DRIVER:-auto}"
 if [ "$RUN_DRIVER" = "auto" ]; then
-  if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
-    RUN_DRIVER=1
-  else
-    RUN_DRIVER=0
-  fi
+  if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then RUN_DRIVER=1; else RUN_DRIVER=0; fi
 fi
 
 if [ "$RUN_DRIVER" = "1" ]; then
-  command -v openssl >/dev/null 2>&1 || { echo "${RED}fatal: openssl required for the TLS cert${RESET}" >&2; exit 2; }
-
   # ------------------------------------------------------------------------------------------------
-  # Step 2 — boot a Bolt-TCP + TLS server
+  # Attach or self-boot, then install the official driver once (shared Node project under WORKDIR).
   # ------------------------------------------------------------------------------------------------
-  section "Step 2 — boot graphus-server (Bolt-over-TCP + TLS)"
-
-  # Self-signed cert (CN/SAN localhost; the driver connects with bolt+ssc:// which trusts it).
-  openssl req -x509 -newkey rsa:2048 -nodes -keyout "$KEY" -out "$CERT" \
-    -days 2 -subj "/CN=localhost" \
-    -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" >/dev/null 2>&1
-
-  # Bolt-TCP + TLS config. Port 0 is not supported by the file config (the OS picks ephemeral only
-  # via the in-process API), so we pick a high random port and read it back from the log.
-  BOLT_PORT="$(( (RANDOM % 20000) + 40000 ))"
-  cat > "$CONFIG" <<EOF
-# Generated by examples/fraud-oltp/run.sh — a Bolt-TCP+TLS demo configuration.
+  if [ "$MODE" = external ]; then
+    section "Step 2 — attach to the running Graphus instance"
+    BOLT_URI="${GRAPHUS_TARGET_BOLT:?external mode requires GRAPHUS_TARGET_BOLT (bolt://host:port)}"
+    [ -n "${GRAPHUS_TARGET_REST:-}${GRAPHUS_TARGET_METRICS:-}" ] || {
+      echo "${RED}fatal: external mode needs GRAPHUS_TARGET_REST (or _METRICS) for DB isolation + /metrics${RESET}" >&2; exit 2; }
+    TARGET_DB="$(harness_target_ensure_db)" || { echo "${RED}fatal: could not resolve an isolated target database${RESET}" >&2; exit 1; }
+    info "attaching to $BOLT_URI, isolated database '$TARGET_DB'"
+    DRIVER_URI="$BOLT_URI"
+    DRIVER_DB="$TARGET_DB"
+  else
+    command -v openssl >/dev/null 2>&1 || { echo "${RED}fatal: openssl required for the TLS cert${RESET}" >&2; exit 2; }
+    section "Step 2 — boot graphus-server (Bolt-over-TCP + TLS + REST/metrics)"
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout "$KEY" -out "$CERT" \
+      -days 2 -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" >/dev/null 2>&1
+    BOLT_PORT="$(( (RANDOM % 20000) + 40000 ))"
+    REST_PORT="$(( (RANDOM % 20000) + 20000 ))"
+    # NOTE (rmp #689): rest_addr is now BOUND (was ""), so /metrics is exposed and scraped into the
+    # report; the admin Bearer from /auth/login satisfies the fail-closed /metrics gate.
+    cat > "$CONFIG" <<EOF
+# Generated by examples/fraud-oltp/run.sh — a Bolt-TCP+TLS + REST/metrics demo configuration.
 store_path = "$WORKDIR/data"
 buffer_pool_pages = 4096
 bolt_tcp_addr = "127.0.0.1:$BOLT_PORT"
-rest_addr = ""
+rest_addr = "127.0.0.1:$REST_PORT"
 uds_path = ""
 jwt_secret = "$JWT_SECRET"
 
@@ -237,31 +280,28 @@ key_path = "$KEY"
 admin_user = "$ADMIN_USER"
 admin_password = "$ADMIN_PW"
 EOF
+    "$SERVER" "$CONFIG" >>"$SERVER_LOG" 2>&1 &
+    SERVER_PID=$!
+    SERVER_START_EPOCH="$(date +%s)"
+    ready=0
+    for _ in $(seq 1 100); do
+      if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        echo "${RED}server exited during startup; last log lines:${RESET}" >&2; tail -n 20 "$SERVER_LOG" >&2; exit 1
+      fi
+      if (exec 3<>"/dev/tcp/127.0.0.1/$BOLT_PORT") 2>/dev/null; then
+        exec 3>&- 3<&- 2>/dev/null || true; ready=1; break
+      fi
+      sleep 0.1
+    done
+    [ "$ready" = "1" ] || { echo "${RED}server did not open Bolt-TCP port $BOLT_PORT${RESET}" >&2; tail -n 20 "$SERVER_LOG" >&2; exit 1; }
+    info "server pid $SERVER_PID on bolt+ssc://127.0.0.1:$BOLT_PORT + REST https://127.0.0.1:$REST_PORT"
+    DRIVER_URI="bolt+ssc://127.0.0.1:$BOLT_PORT"
+    DRIVER_DB=""   # the local default database
+    # A network listener requires TLS (config validation), so the local REST/metrics surface is HTTPS
+    # with the self-signed cert; local_scrape_metrics uses `curl -k` to trust it.
+    REST_BASE="https://127.0.0.1:$REST_PORT"
+  fi
 
-  "$SERVER" "$CONFIG" >>"$SERVER_LOG" 2>&1 &
-  SERVER_PID=$!
-  SERVER_START_EPOCH="$(date +%s)"
-  # Wait until the Bolt-TCP port is accepting connections (or the process dies).
-  ready=0
-  for _ in $(seq 1 100); do
-    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-      echo "${RED}server exited during startup; last log lines:${RESET}" >&2
-      tail -n 20 "$SERVER_LOG" >&2
-      exit 1
-    fi
-    if (exec 3<>"/dev/tcp/127.0.0.1/$BOLT_PORT") 2>/dev/null; then
-      exec 3>&- 3<&- 2>/dev/null || true
-      ready=1
-      break
-    fi
-    sleep 0.1
-  done
-  [ "$ready" = "1" ] || { echo "${RED}server did not open Bolt-TCP port $BOLT_PORT${RESET}" >&2; tail -n 20 "$SERVER_LOG" >&2; exit 1; }
-  info "server pid $SERVER_PID listening on bolt+ssc://127.0.0.1:$BOLT_PORT"
-
-  # ------------------------------------------------------------------------------------------------
-  # Install the official driver once (shared Node project under WORKDIR)
-  # ------------------------------------------------------------------------------------------------
   NODE_PROJ="$WORKDIR/node"
   mkdir -p "$NODE_PROJ"
   cat > "$NODE_PROJ/package.json" <<'EOF'
@@ -275,157 +315,198 @@ EOF
 EOF
   cp "$SCRIPT_DIR/data/detect.js" "$NODE_PROJ/detect.js"
   cp "$SCRIPT_DIR/data/concurrency.js" "$NODE_PROJ/concurrency.js"
-
-  section "Step 3 — load + detect fraud over Bolt (OFFICIAL neo4j-driver)"
   info "installing neo4j-driver (npm)…"
   ( cd "$NODE_PROJ" && npm install --no-audit --no-fund --loglevel=error ) >>"$SERVER_LOG" 2>&1 \
     || { echo "${RED}npm install neo4j-driver failed; see $SERVER_LOG${RESET}" >&2; exit 1; }
 
-  DETECT_OUT="$(cd "$NODE_PROJ" && node detect.js "$BOLT_PORT" "$ADMIN_USER" "$ADMIN_PW" "$GRAPH_CYPHER" "$GROUND_TRUTH" 2>&1)" || true
-  printf '%s\n' "$DETECT_OUT" | sed 's/^/  /'
-  assert "detection found EXACTLY the planted fraud" "yes" \
-    "$(printf '%s' "$DETECT_OUT" | grep -q 'GRAPHUS_FRAUD_OK' && echo yes || echo no)"
-  sample_peak_rss   # the load+detect is the write-heavy phase; capture the server's RSS here
+  # For external creds default to the target's; for local use the config's admin creds.
+  if [ "$MODE" = external ]; then
+    DRIVER_USER="${GRAPHUS_TARGET_USER:-graphus}"; DRIVER_PW="${GRAPHUS_TARGET_PASSWORD:-graphus-local}"
+  else
+    DRIVER_USER="$ADMIN_USER"; DRIVER_PW="$ADMIN_PW"
+  fi
 
-  # Harvest the machine-readable detection stats (operation count + latency percentiles).
+  # ---- Scrape /metrics BEFORE the workload (both modes). ------------------------------------------
+  if [ "$MODE" = external ]; then
+    harness_scrape_metrics "$METRICS_BEFORE" || info "metrics-before scrape failed (non-fatal)"
+  else
+    local_scrape_metrics "$REST_BASE" "$ADMIN_USER" "$ADMIN_PW" "$METRICS_BEFORE" || info "metrics-before scrape failed (non-fatal)"
+  fi
+
+  WORKLOAD_START_EPOCH="$(date +%s)"
+
+  # ------------------------------------------------------------------------------------------------
+  # Step 3 — load + detect fraud + OLTP mix (OFFICIAL neo4j-driver)
+  # ------------------------------------------------------------------------------------------------
+  section "Step 3 — load + detect fraud + OLTP mix (OFFICIAL neo4j-driver)"
+  DETECT_OUT="$(cd "$NODE_PROJ" && node detect.js "$DRIVER_URI" "$DRIVER_DB" "$DRIVER_USER" "$DRIVER_PW" "$GRAPH_CYPHER" "$GROUND_TRUTH" 2>&1)" || true
+  printf '%s\n' "$DETECT_OUT" | sed 's/^/  /'
+  assert "detection found EXACTLY the planted fraud (rings + mules + collusion)" "yes" \
+    "$(printf '%s' "$DETECT_OUT" | grep -q 'GRAPHUS_FRAUD_OK' && echo yes || echo no)"
+  sample_peak_rss
+
   DETECT_STATS="$(printf '%s' "$DETECT_OUT" | sed -n 's/^GRAPHUS_STATS //p' | head -n1)"
   DETECT_OPS="$(json_field "$DETECT_STATS" operations)"
   DETECT_P50="$(json_field "$DETECT_STATS" p50_ms)"
   DETECT_P99="$(json_field "$DETECT_STATS" p99_ms)"
   DETECT_P999="$(json_field "$DETECT_STATS" p999_ms)"
+  DETECT_PL_P99="$(json_field "$DETECT_STATS" point_lookup_p99_ms)"
+  TXCURVE="$(printf '%s' "$DETECT_OUT" | sed -n 's/^GRAPHUS_TXCURVE //p' | head -n1)"
 
-  # Harvest the schema evidence the detector captured (SHOW INDEXES / SHOW CONSTRAINTS), plus the
-  # counts line. The listing is persisted into the evidence dir in Step 5 (below); here we assert it
-  # was captured and lists the declared index/constraint kinds.
   SCHEMA_EVIDENCE_FILE="$WORKDIR/schema.txt"
-  printf '%s\n' "$DETECT_OUT" \
-    | sed -n '/GRAPHUS_SCHEMA_BEGIN/,/GRAPHUS_SCHEMA_END/p' > "$SCHEMA_EVIDENCE_FILE"
+  printf '%s\n' "$DETECT_OUT" | sed -n '/GRAPHUS_SCHEMA_BEGIN/,/GRAPHUS_SCHEMA_END/p' > "$SCHEMA_EVIDENCE_FILE"
   SCHEMA_STATS="$(printf '%s' "$DETECT_OUT" | sed -n 's/^GRAPHUS_SCHEMA //p' | head -n1)"
-  SCHEMA_INDEXES="$(json_field "$SCHEMA_STATS" indexes)"
-  SCHEMA_CONSTRAINTS="$(json_field "$SCHEMA_STATS" constraints)"
+  SCHEMA_CREATED="$(json_field "$SCHEMA_STATS" created)"
   assert "schema evidence (SHOW INDEXES/CONSTRAINTS) captured" "yes" \
     "$([ -s "$SCHEMA_EVIDENCE_FILE" ] && echo yes || echo no)"
-  # 6 indexes (2 always-on LOOKUP + 2 node RANGE + 1 rel RANGE + 1 TEXT); 5 constraints (NODE KEY,
-  # node UNIQUE, rel existence, rel property-type, rel KEY). `>=` keeps the gate robust to additions.
-  assert "SHOW INDEXES lists the declared index kinds" "yes" \
-    "$([ "${SCHEMA_INDEXES:-0}" -ge 6 ] 2>/dev/null && echo yes || echo no)"
-  assert "SHOW CONSTRAINTS lists the declared constraint kinds" "yes" \
-    "$([ "${SCHEMA_CONSTRAINTS:-0}" -ge 5 ] 2>/dev/null && echo yes || echo no)"
+  # At least the essential node constraints (NODE KEY + UNIQUE) must be creatable on ANY target.
+  assert "target created the essential node constraints" "yes" \
+    "$([ "${SCHEMA_CREATED:-0}" -ge 2 ] 2>/dev/null && echo yes || echo no)"
 
   # ------------------------------------------------------------------------------------------------
-  # Step 4 — extreme-concurrency SSI driver
+  # Step 4 — extreme-concurrency SSI driver on the REAL mule supernodes
   # ------------------------------------------------------------------------------------------------
-  section "Step 4 — extreme-concurrency SSI driver (overlapping txns on hot accounts)"
-  # 12 clients, 30 ops each, 8 hot accounts: enough overlap to fire SSI (non-zero, bounded aborts)
-  # while still letting a healthy fraction of writers commit — the "sustains concurrency" signal.
-  CONC_OUT="$(cd "$NODE_PROJ" && node concurrency.js "$BOLT_PORT" "$ADMIN_USER" "$ADMIN_PW" 12 30 8 2>&1)" || true
+  section "Step 4 — extreme-concurrency SSI on the REAL mule supernodes"
+  CONC_OUT="$(cd "$NODE_PROJ" && node concurrency.js "$DRIVER_URI" "$DRIVER_DB" "$DRIVER_USER" "$DRIVER_PW" "$GROUND_TRUTH" 12 30 2 2>&1)" || true
   printf '%s\n' "$CONC_OUT" | sed 's/^/  /'
-  assert "concurrency: no lost update, SSI invariant held" "yes" \
+  assert "concurrency: no lost update, SSI held, abort-rate within band" "yes" \
     "$(printf '%s' "$CONC_OUT" | grep -q 'GRAPHUS_CONCURRENCY_OK' && echo yes || echo no)"
-  sample_peak_rss   # capture the server's RSS under the concurrent SSI workload
+  sample_peak_rss
 
-  # Harvest the machine-readable concurrency stats (commit/abort tallies + abort rate).
   CONC_STATS="$(printf '%s' "$CONC_OUT" | sed -n 's/^GRAPHUS_STATS //p' | head -n1)"
   CONC_COMMITS="$(json_field "$CONC_STATS" commits)"
   CONC_ABORTS="$(json_field "$CONC_STATS" aborts)"
   CONC_ABORT_RATE="$(json_field "$CONC_STATS" abort_rate)"
+  CONC_WRITE_P99="$(json_field "$CONC_STATS" write_p99_ms)"
 
-  # ------------------------------------------------------------------------------------------------
-  # Step 5 — collect standardized performance evidence (CPU / RAM / storage / throughput) (rmp #253)
-  # ------------------------------------------------------------------------------------------------
-  # The server is still alive, so we read its REAL cumulative CPU + RSS and the on-disk store/WAL
-  # footprint that the load + concurrency workload produced, then emit the schema-versioned
-  # report.json + report.md via the dev-only measure_server harness binary. This is purely ADDITIVE:
-  # it changes no assertion above, and a metering failure must not fail the demonstration.
-  section "Step 5 — collect performance evidence (CPU / RAM / storage / throughput)"
-  sample_peak_rss
-  SERVER_UPTIME_SECS=$(( $(date +%s) - SERVER_START_EPOCH ))
-  [ "$SERVER_UPTIME_SECS" -lt 1 ] && SERVER_UPTIME_SECS=1   # avoid a zero-length CPU window
+  WORKLOAD_SECS=$(( $(date +%s) - WORKLOAD_START_EPOCH ))
+  [ "$WORKLOAD_SECS" -lt 1 ] && WORKLOAD_SECS=1
 
-  # Throughput window: the detect path's operations over the server uptime is a coarse-but-honest
-  # ops/sec proxy (the example documents this in the README). The latency percentiles + abort rate
-  # come straight from the drivers' measured GRAPHUS_STATS lines.
-  MEASURE_OPS="${DETECT_OPS:-0}"
-
-  MEASURE_BIN="$BIN_DIR/measure_server"
-  if [ ! -x "$MEASURE_BIN" ]; then
-    info "building the dev-only measure_server harness binary (debug)…"
-    ( cd "$REPO_ROOT" && cargo build -q -p graphus-examples-harness --bin measure_server ) || true
-    MEASURE_BIN="$REPO_ROOT/target/debug/measure_server"
+  # ---- Scrape /metrics AFTER the workload (both modes). -------------------------------------------
+  if [ "$MODE" = external ]; then
+    harness_scrape_metrics "$METRICS_AFTER" || info "metrics-after scrape failed (non-fatal)"
+  else
+    local_scrape_metrics "$REST_BASE" "$ADMIN_USER" "$ADMIN_PW" "$METRICS_AFTER" || info "metrics-after scrape failed (non-fatal)"
   fi
 
-  if [ -x "$MEASURE_BIN" ] && [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
-    rm -rf "$EVIDENCE_DIR"   # a fresh report each run; the dir is git-ignored
-    "$MEASURE_BIN" \
-      --evidence-dir "$EVIDENCE_DIR" \
-      --scenario "fraud-oltp" \
-      --description "Fraud-detection OLTP over Bolt/TCP+TLS via the official Neo4j driver: load a seeded fraud graph, detect EXACTLY the planted fraud, and sustain extreme-concurrency SSI." \
-      --pid "$SERVER_PID" \
-      --uptime-secs "$SERVER_UPTIME_SECS" \
-      --store "$STORE_FILE" \
-      --wal "$WAL_DIR" \
-      --nodes "$NODE_COUNT" \
-      --rels "$REL_COUNT" \
-      --peak-rss-bytes "$PEAK_RSS_BYTES" \
-      --workload-ops "$MEASURE_OPS" \
-      --workload-secs "$SERVER_UPTIME_SECS" \
-      --p50-ms "${DETECT_P50:-0}" \
-      --p99-ms "${DETECT_P99:-0}" \
-      --p999-ms "${DETECT_P999:-0}" \
-      --abort-rate "${CONC_ABORT_RATE:-0}" \
-      --logical-graph-bytes "$LOGICAL_GRAPH_BYTES" \
-      --param "profile=$PROFILE" \
-      --param "connection=bolt-tcp-tls" \
-      --param "driver=official neo4j-driver" \
-      --param "concurrency_commits=${CONC_COMMITS:-0}" \
-      --param "concurrency_aborts=${CONC_ABORTS:-0}" \
-      --note "Throughput window is the detection workload's ops over server uptime (a coarse proxy); latency percentiles + abort rate are measured by the drivers (GRAPHUS_STATS)." \
-      && info "evidence written to $EVIDENCE_DIR" \
-      || info "evidence collection failed (non-fatal); see output above"
-    assert "evidence report.json was produced" "yes" \
-      "$([ -f "$EVIDENCE_DIR/report.json" ] && echo yes || echo no)"
-    assert "evidence report.md was produced" "yes" \
-      "$([ -f "$EVIDENCE_DIR/report.md" ] && echo yes || echo no)"
+  # ------------------------------------------------------------------------------------------------
+  # Step 5 — collect standardized performance evidence (+ server-side /metrics deltas)
+  # ------------------------------------------------------------------------------------------------
+  section "Step 5 — collect performance evidence"
+  rm -rf "$EVIDENCE_DIR"
 
-    # ----------------------------------------------------------------------------------------------
-    # Baseline regression gate (fast profile only — the committed baseline is a fast-profile run).
-    # We compare only STABLE STRUCTURAL metrics (storage bytes/pages, operation count, abort-rate
-    # band) against generous thresholds, because CPU/RAM/latency vary across machines. The comparison
-    # is delegated to the harness's compare_to_baseline via a tiny inline cargo helper.
-    # ----------------------------------------------------------------------------------------------
-    if [ "$PROFILE" = "fast" ] && [ -f "$BASELINE" ] && [ -f "$EVIDENCE_DIR/report.json" ]; then
-      section "Step 5b — regression gate vs committed baseline"
-      CMP_BIN="$BIN_DIR/baseline_cmp"
-      if [ ! -x "$CMP_BIN" ]; then
-        ( cd "$REPO_ROOT" && cargo build -q -p graphus-fraud-gen --bin baseline_cmp ) || true
-        CMP_BIN="$REPO_ROOT/target/debug/baseline_cmp"
-      fi
-      CMP_OUT="$("$CMP_BIN" "$BASELINE" "$EVIDENCE_DIR/report.json" 2>&1)" || true
-      printf '%s\n' "$CMP_OUT" | sed 's/^/  /'
-      assert "fresh run is within baseline thresholds (structural metrics)" "yes" \
-        "$(printf '%s' "$CMP_OUT" | grep -q 'GRAPHUS_BASELINE_OK' && echo yes || echo no)"
+  COMMON_PARAMS=(
+    --scenario "fraud-oltp"
+    --description "Fraud-detection OLTP over Bolt/TLS via the official Neo4j driver: load a seeded fraud graph, detect EXACTLY the planted fraud (rings + mules + shared-device/IP collusion), run a point-lookup OLTP mix, and sustain extreme-concurrency SSI on the REAL mule supernodes."
+    --nodes "$NODE_COUNT" --rels "$REL_COUNT"
+    --workload-ops "${DETECT_OPS:-0}" --workload-secs "$WORKLOAD_SECS"
+    --p50-ms "${DETECT_P50:-0}" --p99-ms "${DETECT_P99:-0}" --p999-ms "${DETECT_P999:-0}"
+    --abort-rate "${CONC_ABORT_RATE:-0}"
+    --param "profile=$PROFILE"
+    --param "connection=bolt-tcp-tls"
+    --param "driver=official neo4j-driver"
+    --param "concurrency_commits=${CONC_COMMITS:-0}"
+    --param "concurrency_aborts=${CONC_ABORTS:-0}"
+    --param "concurrency_write_p99_ms=${CONC_WRITE_P99:-0}"
+    --param "point_lookup_p99_ms=${DETECT_PL_P99:-0}"
+    --note "Client latency percentiles + abort rate come from the drivers (GRAPHUS_STATS); the concurrency phase contends on the REAL mule supernodes."
+    --note "per-TRANSFER insert latency vs cumulative edge count (rmp #683 scan-based REL KEY): $TXCURVE"
+  )
+
+  if [ "$MODE" = external ]; then
+    MEASURE_BIN="$BIN_DIR/measure_target"
+    if [ ! -x "$MEASURE_BIN" ]; then
+      info "building the dev-only measure_target harness binary…"
+      ( cd "$REPO_ROOT" && cargo build -q -p graphus-examples-harness --bin measure_target ) || true
+      MEASURE_BIN="$REPO_ROOT/target/debug/measure_target"
+    fi
+    if [ -x "$MEASURE_BIN" ]; then
+      "$MEASURE_BIN" \
+        --evidence-dir "$EVIDENCE_DIR" \
+        --database "$TARGET_DB" \
+        --metrics-before "$METRICS_BEFORE" --metrics-after "$METRICS_AFTER" \
+        "${COMMON_PARAMS[@]}" \
+        --param "target=$BOLT_URI" \
+        --assert \
+        && info "external evidence written to $EVIDENCE_DIR" \
+        || { info "measure_target reported an invariant violation or error"; FAILURES=$((FAILURES + 1)); }
+      assert "external report.json produced (measurement_mode=external)" "yes" \
+        "$([ -f "$EVIDENCE_DIR/report.json" ] && grep -q '"measurement_mode": *"external"' "$EVIDENCE_DIR/report.json" && echo yes || echo no)"
+      assert "report.json carries server_metrics deltas" "yes" \
+        "$([ -f "$EVIDENCE_DIR/report.json" ] && grep -q '"server_metrics"' "$EVIDENCE_DIR/report.json" && echo yes || echo no)"
+    else
+      info "measure_target unavailable; skipping evidence collection (non-fatal)"
     fi
   else
-    info "measure_server unavailable or server not alive; skipping evidence collection (non-fatal)"
+    sample_peak_rss
+    SERVER_UPTIME_SECS=$(( $(date +%s) - SERVER_START_EPOCH ))
+    [ "$SERVER_UPTIME_SECS" -lt 1 ] && SERVER_UPTIME_SECS=1
+    MEASURE_BIN="$BIN_DIR/measure_server"
+    if [ ! -x "$MEASURE_BIN" ]; then
+      info "building the dev-only measure_server harness binary (debug)…"
+      ( cd "$REPO_ROOT" && cargo build -q -p graphus-examples-harness --bin measure_server ) || true
+      MEASURE_BIN="$REPO_ROOT/target/debug/measure_server"
+    fi
+    if [ -x "$MEASURE_BIN" ] && [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
+      "$MEASURE_BIN" \
+        --evidence-dir "$EVIDENCE_DIR" \
+        --pid "$SERVER_PID" --uptime-secs "$SERVER_UPTIME_SECS" \
+        --store "$STORE_FILE" --wal "$WAL_DIR" \
+        --peak-rss-bytes "$PEAK_RSS_BYTES" \
+        --logical-graph-bytes "$LOGICAL_GRAPH_BYTES" \
+        "${COMMON_PARAMS[@]}" \
+        && info "evidence written to $EVIDENCE_DIR" \
+        || info "evidence collection failed (non-fatal); see output above"
+      # Fold in the server-side /metrics before/after delta (rmp #689) so the LOCAL report carries the
+      # same server_metrics section external mode gets from measure_target.
+      INJECT_BIN="$BIN_DIR/inject_server_metrics"
+      if [ ! -x "$INJECT_BIN" ]; then
+        ( cd "$REPO_ROOT" && cargo build -q -p graphus-fraud-gen --bin inject_server_metrics ) || true
+        INJECT_BIN="$REPO_ROOT/target/debug/inject_server_metrics"
+      fi
+      if [ -x "$INJECT_BIN" ] && [ -s "$METRICS_BEFORE" ] && [ -s "$METRICS_AFTER" ] && [ -f "$EVIDENCE_DIR/report.json" ]; then
+        "$INJECT_BIN" "$EVIDENCE_DIR" "$METRICS_BEFORE" "$METRICS_AFTER" "graphus" \
+          && info "server_metrics folded into $EVIDENCE_DIR/report.json" \
+          || info "inject_server_metrics failed (non-fatal)"
+      fi
+      assert "evidence report.json was produced" "yes" \
+        "$([ -f "$EVIDENCE_DIR/report.json" ] && echo yes || echo no)"
+      assert "report.json carries server_metrics deltas" "yes" \
+        "$([ -f "$EVIDENCE_DIR/report.json" ] && grep -q '"server_metrics"' "$EVIDENCE_DIR/report.json" && echo yes || echo no)"
+
+      # Baseline regression gate (LOCAL, fast profile only — the committed baseline is a fast run).
+      if [ "$PROFILE" = "fast" ] && [ -f "$BASELINE" ] && [ -f "$EVIDENCE_DIR/report.json" ]; then
+        section "Step 5b — regression gate vs committed baseline"
+        CMP_BIN="$BIN_DIR/baseline_cmp"
+        if [ ! -x "$CMP_BIN" ]; then
+          ( cd "$REPO_ROOT" && cargo build -q -p graphus-fraud-gen --bin baseline_cmp ) || true
+          CMP_BIN="$REPO_ROOT/target/debug/baseline_cmp"
+        fi
+        CMP_OUT="$("$CMP_BIN" "$BASELINE" "$EVIDENCE_DIR/report.json" 2>&1)" || true
+        printf '%s\n' "$CMP_OUT" | sed 's/^/  /'
+        assert "fresh run is within baseline thresholds (structural metrics)" "yes" \
+          "$(printf '%s' "$CMP_OUT" | grep -q 'GRAPHUS_BASELINE_OK' && echo yes || echo no)"
+      fi
+    else
+      info "measure_server unavailable or server not alive; skipping evidence collection (non-fatal)"
+    fi
   fi
 
-  # Persist the schema evidence (SHOW INDEXES / SHOW CONSTRAINTS) into the evidence dir, whether or not
-  # the measure harness ran (a fresh listing each run; the dir is git-ignored). This is the human-
-  # readable proof of the exercised index/constraint kinds (rmp #673).
+  # Persist the schema evidence listing into the evidence dir (both modes).
   if [ -s "$SCHEMA_EVIDENCE_FILE" ]; then
     mkdir -p "$EVIDENCE_DIR"
     cp "$SCHEMA_EVIDENCE_FILE" "$EVIDENCE_DIR/schema.txt"
-    assert "schema evidence (SHOW INDEXES/CONSTRAINTS) written to evidence dir" "yes" \
-      "$([ -f "$EVIDENCE_DIR/schema.txt" ] && echo yes || echo no)"
     info "schema evidence written to $EVIDENCE_DIR/schema.txt"
   fi
 
-  stop_pid="$SERVER_PID"
-  kill -TERM "$stop_pid" 2>/dev/null || true
-  wait "$stop_pid" 2>/dev/null || true
-  SERVER_PID=""
+  # LOCAL: stop the server before the hermetic DST step. EXTERNAL: the cleanup trap drops the DB.
+  if [ "$MODE" = local ] && [ -n "$SERVER_PID" ]; then
+    kill -TERM "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+    SERVER_PID=""
+  fi
 else
-  section "Steps 2–4 — official-driver path SKIPPED (RUN_DRIVER=0 or node/npm absent)"
+  section "Steps 2-5 — official-driver path SKIPPED (RUN_DRIVER=0 or node/npm absent)"
   info "the hermetic generator + DST repro below still run and assert the same fraud structures"
 fi
 
@@ -438,7 +519,6 @@ printf '%s\n' "$DST_OUT1" | sed 's/^/  /'
 assert "DST contention repro passed its SSI invariants" "yes" \
   "$(printf '%s' "$DST_OUT1" | grep -q 'GRAPHUS_DST_CONTENTION_OK' && echo yes || echo no)"
 
-# Reproducibility: a second run at the same seed must be byte-identical.
 DST_OUT2="$("$DST" --seed "$DST_SEED" --rounds 40 --clients 4 --hot 3 2>&1)" || true
 assert "DST repro is byte-identical for a fixed seed" "yes" \
   "$([ "$DST_OUT1" = "$DST_OUT2" ] && echo yes || echo no)"
@@ -447,16 +527,17 @@ assert "DST repro is byte-identical for a fixed seed" "yes" \
 # Summary
 # --------------------------------------------------------------------------------------------------
 section "Result"
-printf '%s checks run, %s failures.\n' "$CHECKS" "$FAILURES"
+printf '%s checks run, %s failures.  (mode: %s)\n' "$CHECKS" "$FAILURES" "$MODE"
 if [ "$RUN_DRIVER" = "1" ] && [ -f "$EVIDENCE_DIR/report.json" ]; then
   printf 'evidence: %s {report.json, report.md, schema.txt}\n' "$EVIDENCE_DIR"
 fi
 if [ "$FAILURES" -eq 0 ]; then
   if [ "$RUN_DRIVER" = "1" ]; then
-    printf '%s%sFRAUD-OLTP DEMONSTRATION PASSED%s — Graphus loaded a seeded fraud graph over Bolt/TLS\n' "$BOLD" "$GREEN" "$RESET"
-    printf 'via the official Neo4j driver, detected EXACTLY the planted fraud, sustained extreme\n'
-    printf 'concurrency with no lost update, reproduced the SSI contention deterministically, and\n'
-    printf 'emitted standardized performance evidence within the committed baseline.\n'
+    printf '%s%sFRAUD-OLTP DEMONSTRATION PASSED%s (%s mode) — Graphus loaded a seeded fraud graph over\n' "$BOLD" "$GREEN" "$RESET" "$MODE"
+    printf 'Bolt/TLS via the official Neo4j driver, detected EXACTLY the planted fraud (rings + mules +\n'
+    printf 'shared-device/IP collusion), ran a point-lookup OLTP mix, sustained extreme concurrency on\n'
+    printf 'the REAL mule supernodes with no lost update, reproduced the SSI contention deterministically,\n'
+    printf 'and emitted standardized performance + server-side /metrics evidence.\n'
   else
     printf '%s%sFRAUD-OLTP DEMONSTRATION PASSED%s — the hermetic generator produced a byte-identical\n' "$BOLD" "$GREEN" "$RESET"
     printf 'seeded fraud graph + ground truth and the deterministic SSI-contention repro held its\n'

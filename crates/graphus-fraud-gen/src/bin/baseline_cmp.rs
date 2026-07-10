@@ -16,8 +16,19 @@
 //! |---------------|-----------|-----------|
 //! | storage bytes / pages | **15%** | deterministic for a fixed seed+profile; a real footprint regression |
 //! | amplification ratios  | **15%** | derived from the same deterministic on-disk footprint |
-//! | abort / conflict rate | **+0.50 band** | concurrency-dependent, so a generous band, not a hair-trigger |
+//! | abort / conflict rate | **+10% rise** | a tight livelock-drift guard (see below) |
 //! | throughput ops/sec    | ignored (∞) | varies with machine speed |
+//!
+//! ## The abort-rate gate (rmp #689)
+//!
+//! The extreme-concurrency phase deliberately over-contends the real mule supernodes, so its abort
+//! rate is EXPECTED to be high (~0.9+). The PRIMARY abort gate is therefore the two-sided **absolute**
+//! band asserted first-class by `data/concurrency.js` (`FRAUD_ABORT_FLOOR`..`FRAUD_ABORT_CEIL`), which
+//! is meaningful for a near-1.0 rate. Here we keep only a **tight one-sided +10% rise** as a
+//! livelock-drift guard: against a ~0.9 baseline it fires if a fresh run's abort rate climbs past
+//! ~0.99 (writers approaching total livelock). The old **+0.50** rise was a NO-OP — a fractional rise
+//! that large can never fire against a high baseline (0.9 * 1.5 > 1.0), which is exactly the gap #689
+//! closes.
 //! | latency p50/p99/p999  | ignored (∞) | varies with machine speed + scheduling |
 //! | CPU seconds           | ignored (∞) | varies with machine speed |
 //! | peak RSS              | ignored (∞) | varies with allocator/OS/machine |
@@ -69,7 +80,9 @@ fn main() -> ExitCode {
         storage_rise: 0.15,
         amplification_rise: 0.15,
         cpu_rise: IGNORE,
-        abort_rate_rise: 0.50,
+        // A tight livelock-drift guard: against a ~0.9 baseline this fires past ~0.99 (see the module
+        // docs). The primary, two-sided abort band is asserted first-class in data/concurrency.js.
+        abort_rate_rise: 0.10,
     };
 
     let cmp = candidate.compare_to_baseline(&baseline, &thresholds);

@@ -243,6 +243,31 @@ pub struct MuleChain {
     pub destinations: Vec<i64>,
 }
 
+/// One planted **collusion cluster**: a fraud structure (a ring or a mule chain) whose `TRANSFER`
+/// edges were all minted from a **single shared device fingerprint and IP** — the digital-forensics
+/// signal that one operator controls the whole structure. The detector re-identifies each cluster by
+/// the shared `device` (every benign transfer carries a unique device, so any `device` used by two or
+/// more transfers is a planted cluster) and corroborates it by the shared `ip` (the fraud clusters
+/// use the disjoint `172.16.0.0/12` space; benign transfers use `10.0.0.0/8`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CollusionCluster {
+    /// The shared device fingerprint every edge in this cluster carries. Unique per cluster and drawn
+    /// from a namespace disjoint from the (unique-per-transfer) benign device ids, so a
+    /// `count(*) >= 2` group-by-device query returns exactly the planted clusters.
+    pub device: i64,
+    /// The shared originating IP every edge in this cluster carries (a `172.16.x.y` / `172.17.x.y`
+    /// address, disjoint from the benign `10.x.y.z` space).
+    pub ip: String,
+    /// The cluster kind: `"mule"` or `"ring"`.
+    pub kind: String,
+    /// How many `TRANSFER` edges carry this shared device (`= ring_len` for a ring; `= fan_in +
+    /// fan_out` for a mule chain). Equals the `count(*)` a group-by-device detector observes.
+    pub edge_count: usize,
+    /// The distinct account ids the cluster's shared-device transfers touch (the ring members, or the
+    /// mule plus its sources and destinations), sorted ascending.
+    pub accounts: Vec<i64>,
+}
+
 /// The enumerable ground-truth fraud set, serialized to `ground_truth.json`. The detector loads this
 /// and asserts it found exactly these structures.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -258,6 +283,11 @@ pub struct GroundTruth {
     /// The sorted, de-duplicated set of **all** fraudulent account ids (every account that is part of
     /// any ring or is a mule). The detection workload's union of findings must equal this set.
     pub fraud_accounts: Vec<i64>,
+    /// The planted shared-device/shared-IP collusion clusters (one per ring and per mule chain). The
+    /// detector's shared-device query must return exactly these `device`s with exactly these
+    /// `edge_count`s. Additive (`serde(default)`) so an older `ground_truth.json` still deserializes.
+    #[serde(default)]
+    pub collusion: Vec<CollusionCluster>,
 }
 
 /// A fully-materialized dataset: the nodes, the edges, and the ground truth. Produced by
@@ -280,6 +310,18 @@ pub struct Dataset {
 
 /// A small fixed set of country codes, indexed deterministically by id.
 const COUNTRIES: [&str; 6] = ["PT", "ES", "FR", "DE", "GB", "NL"];
+
+/// Device-fingerprint namespaces for the shared-device collusion signal. Benign transfers each get a
+/// **unique** device id in `[BENIGN_DEVICE_BASE, BENIGN_DEVICE_BASE + benign_transfers)`, so a
+/// group-by-device `count(*) >= 2` never flags benign traffic. Each fraud **cluster** shares one
+/// device drawn from a disjoint high namespace (`MULE_*` / `RING_*`), so the same query returns
+/// exactly the planted clusters. The bases are chosen far above any realistic transfer count so the
+/// three ranges never overlap (a large-profile run mints ~12 000 benign transfers).
+const BENIGN_DEVICE_BASE: i64 = 0;
+/// Base of the mule-cluster shared-device namespace (one device per mule chain: `+ mule_index`).
+const MULE_DEVICE_BASE: i64 = 1_000_000;
+/// Base of the ring-cluster shared-device namespace (one device per ring: `+ ring_index`).
+const RING_DEVICE_BASE: i64 = 2_000_000;
 
 /// The high-risk country a detector might weight; kept fixed for determinism.
 fn country_for(seed_val: u64) -> &'static str {
@@ -473,66 +515,90 @@ pub fn generate(config: GenConfig, profile: &str) -> Dataset {
     //     detector's amount/cycle-length thresholds exclude benign noise — documented in the README).
     if legit_end > legit_start + 1 {
         let span = (legit_end - legit_start) as u64;
-        for _ in 0..config.benign_transfers {
+        for benign_idx in 0..config.benign_transfers {
             let from = legit_start + rng.below(span) as i64;
             let mut to = legit_start + rng.below(span) as i64;
             if to == from {
                 to = legit_start + ((from - legit_start + 1) % span as i64);
             }
             let amount = rng.range_i64(1, 900); // benign: under the fraud amount floor
-            transfers.push(mint_transfer(
-                &mut rng,
-                &mut tx_ordinal,
-                from,
-                to,
-                base_ts,
-                amount,
-            ));
+            let mut t = mint_transfer(&mut rng, &mut tx_ordinal, from, to, base_ts, amount);
+            // Give every benign transfer a UNIQUE device fingerprint (its ordinal in the benign
+            // block). This is the discriminator for the shared-device collusion signal: because no two
+            // benign transfers share a device, any device seen on >= 2 transfers is a planted fraud
+            // cluster. The random `device`/`ip` drawn by `mint_transfer` are overwritten here WITHOUT
+            // changing the PRNG stream, so amounts/timestamps (and thus the detection outcome) stay
+            // byte-stable — only the device/ip VALUES change. Benign IPs keep their random `10.x.y.z`.
+            t.device = BENIGN_DEVICE_BASE + benign_idx as i64;
+            transfers.push(t);
         }
     }
 
+    // The planted shared-device/shared-IP collusion clusters, populated as fraud edges are minted.
+    let mut collusion: Vec<CollusionCluster> = Vec::new();
+
     // 3b. Ring edges: a closed cycle a0 -> a1 -> ... -> a_{n-1} -> a0, each a large "layering" amount.
-    for ring in &rings {
+    //     Every edge in a ring shares ONE device + IP (the ring operator's fingerprint) so the
+    //     shared-device detector re-identifies the whole cycle.
+    for (r_idx, ring) in rings.iter().enumerate() {
+        let device = RING_DEVICE_BASE + r_idx as i64;
+        let ip = format!("172.17.{}.0", r_idx % 256);
         let n = ring.accounts.len();
         for i in 0..n {
             let from = ring.accounts[i];
             let to = ring.accounts[(i + 1) % n];
             let amount = rng.range_i64(9_000, 50_000); // fraud: above the amount floor
-            transfers.push(mint_transfer(
-                &mut rng,
-                &mut tx_ordinal,
-                from,
-                to,
-                base_ts,
-                amount,
-            ));
+            let mut t = mint_transfer(&mut rng, &mut tx_ordinal, from, to, base_ts, amount);
+            t.device = device; // overwrite (no PRNG-stream change — see the benign block)
+            t.ip = ip.clone();
+            transfers.push(t);
         }
+        let mut accounts = ring.accounts.clone();
+        accounts.sort_unstable();
+        accounts.dedup();
+        collusion.push(CollusionCluster {
+            device,
+            ip,
+            kind: "ring".to_owned(),
+            edge_count: n,
+            accounts,
+        });
     }
 
-    // 3c. Mule edges: every source -> mule, then mule -> every destination, all large amounts.
-    for chain in &mules {
+    // 3c. Mule edges: every source -> mule, then mule -> every destination, all large amounts. Every
+    //     edge of a chain shares ONE device + IP (the smurfing operator's fingerprint) so the
+    //     shared-device detector re-identifies the whole fan-in/fan-out structure from a single node.
+    for (m_idx, chain) in mules.iter().enumerate() {
+        let device = MULE_DEVICE_BASE + m_idx as i64;
+        let ip = format!("172.16.{}.0", m_idx % 256);
         for &src in &chain.sources {
             let amount = rng.range_i64(2_000, 20_000);
-            transfers.push(mint_transfer(
-                &mut rng,
-                &mut tx_ordinal,
-                src,
-                chain.mule,
-                base_ts,
-                amount,
-            ));
+            let mut t = mint_transfer(&mut rng, &mut tx_ordinal, src, chain.mule, base_ts, amount);
+            t.device = device; // overwrite (no PRNG-stream change — see the benign block)
+            t.ip = ip.clone();
+            transfers.push(t);
         }
         for &dst in &chain.destinations {
             let amount = rng.range_i64(2_000, 20_000);
-            transfers.push(mint_transfer(
-                &mut rng,
-                &mut tx_ordinal,
-                chain.mule,
-                dst,
-                base_ts,
-                amount,
-            ));
+            let mut t = mint_transfer(&mut rng, &mut tx_ordinal, chain.mule, dst, base_ts, amount);
+            t.device = device;
+            t.ip = ip.clone();
+            transfers.push(t);
         }
+        // The cluster touches the mule plus all its sources and destinations.
+        let mut accounts = Vec::with_capacity(1 + chain.sources.len() + chain.destinations.len());
+        accounts.push(chain.mule);
+        accounts.extend_from_slice(&chain.sources);
+        accounts.extend_from_slice(&chain.destinations);
+        accounts.sort_unstable();
+        accounts.dedup();
+        collusion.push(CollusionCluster {
+            device,
+            ip,
+            kind: "mule".to_owned(),
+            edge_count: chain.sources.len() + chain.destinations.len(),
+            accounts,
+        });
     }
 
     // Build the enumerable fraud-account set: every ring member + every mule.
@@ -546,12 +612,17 @@ pub fn generate(config: GenConfig, profile: &str) -> Dataset {
     fraud_accounts.sort_unstable();
     fraud_accounts.dedup();
 
+    // Stable, detector-friendly order (ascending device); the ring/mule enumeration already made it
+    // deterministic, this just pins a single obvious ordering for the emitted JSON.
+    collusion.sort_by_key(|c| c.device);
+
     let ground_truth = GroundTruth {
         profile: profile.to_owned(),
         seed: config.seed,
         rings,
         mules,
         fraud_accounts,
+        collusion,
     };
 
     Dataset {
@@ -797,5 +868,101 @@ mod tests {
         let large = generate(Profile::Large.config(), "large");
         assert_ne!(fast.to_cypher(), large.to_cypher());
         assert!(large.accounts.len() > fast.accounts.len());
+    }
+
+    #[test]
+    fn shared_device_collusion_signal_is_planted_and_enumerable() {
+        // The shared-device signal must be detectable by "any device on >= 2 transfers is a cluster":
+        // benign transfers each carry a UNIQUE device, every fraud cluster shares ONE device, and the
+        // per-device edge counts equal the planted `collusion` ground truth exactly.
+        for profile in [Profile::Fast, Profile::Large] {
+            let d = generate(profile.config(), profile.name());
+            let gt = &d.ground_truth;
+
+            // Tally device -> edge count over ALL transfers.
+            let mut by_device: std::collections::BTreeMap<i64, usize> = std::collections::BTreeMap::new();
+            for t in &d.transfers {
+                *by_device.entry(t.device).or_default() += 1;
+            }
+            // Devices seen on >= 2 transfers == exactly the planted collusion devices, same counts.
+            let observed: std::collections::BTreeMap<i64, usize> = by_device
+                .iter()
+                .filter(|&(_, &c)| c >= 2)
+                .map(|(&d, &c)| (d, c))
+                .collect();
+            let expected: std::collections::BTreeMap<i64, usize> = gt
+                .collusion
+                .iter()
+                .map(|c| (c.device, c.edge_count))
+                .collect();
+            assert_eq!(
+                observed,
+                expected,
+                "{}: shared-device (count>=2) set must equal the planted collusion clusters",
+                profile.name()
+            );
+
+            // One cluster per ring + per mule; a mule cluster shares fan_in+fan_out edges, a ring
+            // cluster shares ring_len edges; all fraud devices live in the high namespaces and every
+            // fraud IP is in 172.16/172.17 (disjoint from benign 10.x).
+            assert_eq!(
+                gt.collusion.len(),
+                gt.rings.len() + gt.mules.len(),
+                "{}: one collusion cluster per fraud structure",
+                profile.name()
+            );
+            for c in &gt.collusion {
+                assert!(c.device >= MULE_DEVICE_BASE, "{}: fraud device in high namespace", profile.name());
+                assert!(
+                    c.ip.starts_with("172.16.") || c.ip.starts_with("172.17."),
+                    "{}: fraud IP in 172.16/172.17, got {}",
+                    profile.name(),
+                    c.ip
+                );
+                assert!(c.edge_count >= 2, "{}: a cluster shares >= 2 edges", profile.name());
+            }
+            // Benign transfers never touch a 172.x IP.
+            let benign_ip_leak = d.transfers.iter().any(|t| {
+                (t.ip.starts_with("172.16.") || t.ip.starts_with("172.17."))
+                    && !gt.collusion.iter().any(|c| c.device == t.device)
+            });
+            assert!(!benign_ip_leak, "{}: no benign edge carries a fraud IP", profile.name());
+        }
+    }
+
+    #[test]
+    fn detection_relevant_invariants_are_preserved() {
+        // The device/ip override must NOT disturb anything the (un-editable) server-side mirrors rely
+        // on: the account/customer/transfer COUNTS, the amount floors that separate fraud from benign,
+        // and the fraud-account set. This pins the contract the collusion plant must never break.
+        for profile in [Profile::Fast, Profile::Large] {
+            let cfg = profile.config();
+            let d = generate(cfg, profile.name());
+
+            let benign = (cfg.legit_accounts) as usize;
+            let _ = benign;
+            // One customer per account; accounts = legit + ring members + (mule + fan_in + fan_out).
+            assert_eq!(d.customers.len(), d.accounts.len(), "{}: one customer per account", profile.name());
+
+            // Amount floors: fraud edges (172.x device namespace) are >= 2000; benign edges are < 900.
+            for t in &d.transfers {
+                let is_fraud = d.ground_truth.collusion.iter().any(|c| c.device == t.device);
+                if is_fraud {
+                    assert!(t.amount >= 2_000, "{}: fraud edge amount below floor: {}", profile.name(), t.amount);
+                } else {
+                    // Benign amounts are drawn from the inclusive range [1, 900], well under the
+                    // mule (>= 2000) and ring (>= 9000) detection floors.
+                    assert!(t.amount <= 900, "{}: benign edge amount above floor: {}", profile.name(), t.amount);
+                }
+            }
+
+            // fraud_accounts == {ring members} ∪ {mules}, and every collusion account is a real node.
+            let ids: std::collections::BTreeSet<i64> = d.accounts.iter().map(|a| a.id).collect();
+            for c in &d.ground_truth.collusion {
+                for a in &c.accounts {
+                    assert!(ids.contains(a), "{}: collusion account {a} missing from node set", profile.name());
+                }
+            }
+        }
     }
 }
