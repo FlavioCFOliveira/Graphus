@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Knowledge-graph discovery workload over the Graphus REST API (rmp #280 + #281).
+"""Knowledge-graph discovery workload over the Graphus REST API (rmp #280 + #281 + #692).
 
-A pure-stdlib client (``urllib`` + ``ssl`` + ``hmac``/``hashlib``/``base64`` + ``json``) that drives
-the **REST transactional API** over HTTPS against a live ``graphus-server``:
+A pure-stdlib client (``http.client`` + ``ssl`` + ``json``) that drives the **REST transactional
+API** over HTTPS against a live ``graphus-server`` — self-booted locally, or an ALREADY-RUNNING
+instance (local or remote) the run attaches to:
 
-1. **Auth** — mints a Bearer JWT (HS256) out of band (the server has no login endpoint; tokens are
-   minted by anyone holding the shared ``jwt_secret``), and proves an **unauthenticated** request is
-   rejected ``401``.
+1. **Auth** — obtains a Bearer token from ``POST /auth/login`` (username + password), and proves an
+   **unauthenticated** request is rejected ``401``.
 2. **Load** — replays the generator's ``graph.cypher`` over the REST one-shot ``/db/{db}/tx/commit``
    endpoint, **batching** many statements per HTTP request (the schema DDL runs as standalone
-   auto-commit statements first). Each batch is one atomic auto-commit transaction.
+   auto-commit statements first). Each batch is one atomic auto-commit **WRITE** transaction.
 3. **Transactional lifecycle** — opens an **explicit** transaction (``POST /db/{db}/tx`` → run in it
    → ``/commit``) and a **rollback**, proving begin/commit/rollback semantics over the API.
 4. **Discovery** — issues the five canonical knowledge-graph discovery queries (entity lookup,
@@ -23,62 +23,30 @@ the **REST transactional API** over HTTPS against a live ``graphus-server``:
 7. **Concurrency** — drives ``--clients`` concurrent HTTP clients issuing the discovery workload,
    asserting **zero errors** and reporting throughput + latency percentiles.
 
+Every read query carries ``access_mode: "READ"`` so it dispatches to the server's **off-thread
+reader pool** (rmp #527/#543) — a single-statement WRITE auto-commit would run inline on the engine
+thread and would NOT scale across cores. Each client keeps a **persistent (keep-alive) HTTPS
+connection** so throughput/latency reflect the server, not per-op TCP+TLS handshakes.
+
 On success it prints ``GRAPHUS_KG_REST_OK`` and a single machine-readable ``GRAPHUS_STATS {...}`` line
 (parsed by ``run.sh`` for the evidence report). Any failed assertion prints the mismatch and exits
 non-zero.
 
 Usage::
 
-    discovery.py --port <p> --secret <s> --user <u> --cypher <graph.cypher> \
-                 --reference <reference.json> [--clients N] [--ops-per-client M]
+    discovery.py --base-url https://host:port --user <u> --password <p> \
+                 --database <db> --cypher <graph.cypher> --reference <reference.json> \
+                 [--token <bearer>] [--insecure] [--clients N] [--ops-per-client M]
 """
 
 import argparse
+import http.client
 import json
-import time
 import ssl
-import hmac
-import hashlib
-import base64
 import struct
 import threading
-import urllib.request
-import urllib.error
-
-
-# --------------------------------------------------------------------------------------------------
-# JWT (HS256) — minted with the stdlib only (no PyJWT dependency).
-# --------------------------------------------------------------------------------------------------
-def _b64u(b: bytes) -> bytes:
-    return base64.urlsafe_b64encode(b).rstrip(b"=")
-
-
-def mint_jwt(secret: bytes, subject: str, ttl_secs: int = 3600) -> str:
-    """Mints an HS256 JWT the Graphus server accepts.
-
-    The server validates the signature (HS256), the ``iss``/``aud`` binding (both ``"graphus"`` by
-    default), required ``sub``/``exp``/``iss``/``aud`` claims, that ``sub`` names a live catalog user
-    (the bootstrap admin qualifies), and that the token's ``ver`` is ``>=`` the user's credential
-    epoch (a fresh admin is at epoch ``0``). See ``crates/graphus-auth/src/token.rs``.
-    """
-    now = int(time.time())
-    header = {"alg": "HS256", "typ": "JWT"}
-    payload = {
-        "sub": subject,
-        "iat": now,
-        "exp": now + ttl_secs,
-        "iss": "graphus",
-        "aud": "graphus",
-        "jti": f"kg-rest-{now}-{subject}",
-        "ver": 0,
-    }
-    signing_input = (
-        _b64u(json.dumps(header, separators=(",", ":")).encode())
-        + b"."
-        + _b64u(json.dumps(payload, separators=(",", ":")).encode())
-    )
-    sig = hmac.new(secret, signing_input, hashlib.sha256).digest()
-    return (signing_input + b"." + _b64u(sig)).decode()
+import time
+import urllib.parse
 
 
 # --------------------------------------------------------------------------------------------------
@@ -165,49 +133,107 @@ def _float16(b: bytes) -> float:
 
 
 # --------------------------------------------------------------------------------------------------
-# REST client.
+# REST client — a thin HTTPS client for the Graphus transactional API over a PERSISTENT (keep-alive)
+# connection. Each client owns ONE `http.client.HTTPSConnection`, reused across requests so latency
+# and throughput reflect the server rather than a fresh TCP+TLS handshake per operation. The
+# connection is not thread-safe, so every concurrency worker builds its OWN client (one connection
+# per worker thread).
 # --------------------------------------------------------------------------------------------------
 class RestClient:
-    """A thin HTTPS REST client for the Graphus transactional API (self-signed TLS, Bearer JWT)."""
+    """A keep-alive HTTPS REST client for the Graphus transactional API (self-signed-TLS aware,
+    Bearer-JWT authenticated via ``POST /auth/login``)."""
 
-    def __init__(self, port, token, database="graphus"):
-        self.base = f"https://127.0.0.1:{port}"
+    def __init__(self, base_url, token=None, database="graphus", insecure=True):
+        parts = urllib.parse.urlsplit(base_url)
+        self.scheme = parts.scheme or "https"
+        self.host = parts.hostname or "127.0.0.1"
+        self.port = parts.port or (443 if self.scheme == "https" else 80)
+        self.base = f"{self.scheme}://{self.host}:{self.port}"
         self.token = token
         self.db = database
-        # Self-signed cert: trust it explicitly (this is a local demo cert, not the public web).
+        self.insecure = insecure
+        # Self-signed cert (local demo cert, or a remote box's self-signed cert): trust it explicitly
+        # when --insecure is set. This is a demo/attach convenience, not the public web.
         self.ctx = ssl.create_default_context()
-        self.ctx.check_hostname = False
-        self.ctx.verify_mode = ssl.CERT_NONE
+        if insecure:
+            self.ctx.check_hostname = False
+            self.ctx.verify_mode = ssl.CERT_NONE
+        self._conn = None
+
+    def _connection(self):
+        if self._conn is None:
+            if self.scheme == "https":
+                self._conn = http.client.HTTPSConnection(
+                    self.host, self.port, context=self.ctx, timeout=120)
+            else:
+                self._conn = http.client.HTTPConnection(self.host, self.port, timeout=120)
+        return self._conn
+
+    def _close(self):
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
 
     def _request(self, method, path, body=None, accept="application/json",
                  content_type="application/json", token=True, stream=False):
         data = body if isinstance(body, (bytes, type(None))) else json.dumps(body).encode()
-        req = urllib.request.Request(self.base + path, data=data, method=method)
-        req.add_header("Accept", accept)
+        headers = {"Accept": accept}
         if data is not None:
-            req.add_header("Content-Type", content_type)
+            headers["Content-Type"] = content_type
         if token and self.token:
-            req.add_header("Authorization", "Bearer " + self.token)
-        try:
-            resp = urllib.request.urlopen(req, context=self.ctx)
-            if stream:
-                return resp.status, resp, dict(resp.headers)
-            return resp.status, resp.read(), dict(resp.headers)
-        except urllib.error.HTTPError as e:
-            return e.code, e.read(), dict(e.headers)
+            headers["Authorization"] = "Bearer " + self.token
+        # Reuse the persistent connection; on a broken/stale keep-alive socket (the server closed an
+        # idle connection, or the previous response was drained) reconnect and retry EXACTLY once.
+        last_exc = None
+        for attempt in (0, 1):
+            conn = self._connection()
+            try:
+                conn.request(method, path, body=data, headers=headers)
+                resp = conn.getresponse()
+                hdrs = {k: v for k, v in resp.getheaders()}
+                if stream:
+                    # The caller iterates the response line-by-line; it MUST drain it fully before
+                    # the next request on this connection (http.client contract).
+                    return resp.status, resp, hdrs
+                return resp.status, resp.read(), hdrs
+            except (http.client.HTTPException, ConnectionError, OSError) as exc:
+                last_exc = exc
+                self._close()
+        raise last_exc
+
+    # --- auth -----------------------------------------------------------------------------------
+    def login(self, user, password):
+        """Obtains a Bearer token via ``POST /auth/login`` and stores it on the client."""
+        st, body, _ = self._request(
+            "POST", "/auth/login", {"username": user, "password": password}, token=False)
+        if st != 200:
+            raise SystemExit(f"login failed: HTTP {st}: {body[:200]!r}")
+        self.token = json.loads(body)["token"]
+        return self.token
 
     # --- one-shot auto-commit -------------------------------------------------------------------
-    def auto_commit(self, statements, accept="application/json", token=True):
-        """Runs a batch of statements as one atomic auto-commit transaction."""
+    def auto_commit(self, statements, accept="application/json", token=True, access_mode=None):
+        """Runs a batch of statements as one atomic auto-commit transaction. ``access_mode`` (``READ``
+        / ``WRITE``) is sent verbatim when given; absent, the server defaults to ``WRITE``."""
         body = {"statements": statements}
+        if access_mode is not None:
+            body["access_mode"] = access_mode
         return self._request("POST", f"/db/{self.db}/tx/commit", body, accept=accept, token=token)
 
     def query(self, statement, params=None, accept="application/json"):
-        """Runs a single read query via auto-commit, returning ``(status, body_bytes, headers)``."""
+        """Runs a single **READ** query via auto-commit, returning ``(status, body_bytes, headers)``.
+
+        ``access_mode: "READ"`` is what makes a single-statement auto-commit dispatch to the server's
+        **off-thread reader pool** (rmp #527/#543): the router runs it through the engine's own
+        auto-commit READ path so reads scale across the reader threads. Without it the request
+        defaults to WRITE and runs inline on the engine thread (a ~1-core ceiling under concurrency)."""
         stmt = {"statement": statement}
         if params is not None:
             stmt["parameters"] = params
-        return self.auto_commit([stmt], accept=accept)
+        return self.auto_commit([stmt], accept=accept, access_mode="READ")
 
     def stream(self, statement, params=None):
         """Runs a single query requesting NDJSON; returns ``(status, response_obj, headers)`` so the
@@ -505,7 +531,8 @@ def ndjson_stream(client):
     n_fields = n_rows = n_summary = n_bytes = 0
     t0 = time.time()
     # Iterating the response object yields the body line-by-line as it is read off the socket: the
-    # client never materializes the whole result before processing rows.
+    # client never materializes the whole result before processing rows. Draining it fully also
+    # returns the keep-alive connection to a reusable state for the next request.
     for raw in resp:
         n_bytes += len(raw)
         raw = raw.strip()
@@ -536,7 +563,7 @@ def content_negotiation(client):
     json_doc = json.loads(jbody)
     cbor_doc, _ = cbor_decode(cbody)
     check("CBOR decodes to the SAME logical result as JSON", cbor_doc == json_doc, True)
-    return len(jbody), len(cbor_doc and cbody or cbody)
+    return len(jbody), len(cbody)
 
 
 def concurrency(client_factory, clients, ops_per_client):
@@ -564,6 +591,7 @@ def concurrency(client_factory, clients, ops_per_client):
                 with lock:
                     errors[0] += 1
             local.append(time.time() - t0)
+        c._close()
         with lat_lock:
             latencies.extend(local)
 
@@ -594,9 +622,14 @@ def concurrency(client_factory, clients, ops_per_client):
 
 def main():
     ap = argparse.ArgumentParser(description="Graphus knowledge-graph discovery workload over REST")
-    ap.add_argument("--port", required=True)
-    ap.add_argument("--secret", required=True)
-    ap.add_argument("--user", default="neo4j")
+    ap.add_argument("--base-url", help="REST base URL, e.g. https://127.0.0.1:7474 or a remote box")
+    ap.add_argument("--port", help="convenience: builds --base-url as https://127.0.0.1:<port>")
+    ap.add_argument("--user", default="graphus")
+    ap.add_argument("--password", help="login password for POST /auth/login (unless --token is given)")
+    ap.add_argument("--token", help="a pre-issued Bearer token (skips POST /auth/login)")
+    ap.add_argument("--database", default="graphus")
+    ap.add_argument("--insecure", action="store_true",
+                    help="accept a self-signed TLS cert (curl -k equivalent)")
     ap.add_argument("--cypher", required=True)
     ap.add_argument("--reference", required=True)
     ap.add_argument("--batch-size", type=int, default=200)
@@ -604,11 +637,23 @@ def main():
     ap.add_argument("--ops-per-client", type=int, default=20)
     args = ap.parse_args()
 
-    secret = args.secret.encode()
-    token = mint_jwt(secret, args.user)
-    print(f"== minted HS256 JWT for '{args.user}' ({len(token)} chars)")
+    base_url = args.base_url
+    if not base_url:
+        if not args.port:
+            raise SystemExit("one of --base-url or --port is required")
+        base_url = f"https://127.0.0.1:{args.port}"
 
-    client = RestClient(args.port, token)
+    client = RestClient(base_url, token=args.token, database=args.database, insecure=args.insecure)
+    if args.token:
+        print(f"== using pre-issued Bearer token ({len(args.token)} chars)")
+    else:
+        if args.password is None:
+            raise SystemExit("--password is required unless --token is given")
+        token = client.login(args.user, args.password)
+        print(f"== authenticated '{args.user}' via POST /auth/login ({len(token)} chars)")
+    token = client.token
+
+    print(f"== target {base_url} database={args.database}")
 
     print("== auth enforcement")
     assert_auth_enforced(client)
@@ -647,9 +692,10 @@ def main():
     ratio = cbor_bytes / json_bytes if json_bytes else 0.0
     print(f"  JSON={json_bytes} B  CBOR={cbor_bytes} B  (CBOR is {ratio * 100:.1f}% of JSON)")
 
-    print("== concurrency")
+    print("== concurrency (access_mode READ → off-thread reader pool)")
     total_ops, errors, conc_secs, p50, p99, p999, throughput = concurrency(
-        lambda: RestClient(args.port, token), args.clients, args.ops_per_client)
+        lambda: RestClient(base_url, token=token, database=args.database, insecure=args.insecure),
+        args.clients, args.ops_per_client)
     print(f"  clients={args.clients} ops={total_ops} errors={errors} "
           f"throughput={throughput:.0f} ops/s p50={p50:.1f}ms p99={p99:.1f}ms p999={p999:.1f}ms")
 

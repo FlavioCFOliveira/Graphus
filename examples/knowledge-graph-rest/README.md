@@ -2,15 +2,20 @@
 
 A realistic, end-to-end demonstration of serving a **knowledge graph over the Graphus REST API**.
 It boots a real `graphus-server` exposing the REST transactional API over **HTTPS + Bearer-JWT
-auth**, loads a deterministic, seeded knowledge graph **schema-first** (a **FULLTEXT** title-search
-index, a `Document.year` **RANGE** index, four unique-id constraints and node **property-type** +
-**existence** constraints), and drives the canonical knowledge-graph **discovery** queries against it
-from a **pure-stdlib `python3` client** — asserting every answer against a known reference, running the
-**full-text title search** and proving property-type/existence violations are **rejected**,
-demonstrating transactional begin/commit/rollback, streaming a large result as **NDJSON**, negotiating
-**CBOR vs JSON**, and sustaining **concurrent** clients.
+auth** (obtained from **`POST /auth/login`**), loads a deterministic, seeded knowledge graph
+**schema-first** (a **FULLTEXT** title-search index, a `Document.year` **RANGE** index, four unique-id
+constraints and node **property-type** + **existence** constraints), and drives the canonical
+knowledge-graph **discovery** queries against it from a **pure-stdlib `python3` client** — asserting
+every answer against a known reference, running the **full-text title search** and proving
+property-type/existence violations are **rejected**, demonstrating transactional
+begin/commit/rollback, streaming a large result as **NDJSON**, negotiating **CBOR vs JSON**, and
+sustaining **concurrent READ** clients (each read carries `access_mode: "READ"` so it engages the
+server's **off-thread reader pool** and scales across cores).
 
-It doubles as an executable E2E test: `run.sh` exits non-zero the moment any assertion fails.
+It doubles as an executable E2E test: `run.sh` exits non-zero the moment any assertion fails. It runs
+either against a **self-booted** local server (default) or, via the shared external-target seam,
+against an **already-running** instance — local or remote — isolated in a dedicated database (see
+[Running against an external target](#running-against-an-external-target)).
 
 ## What it demonstrates
 
@@ -18,7 +23,7 @@ It doubles as an executable E2E test: `run.sh` exits non-zero the moment any ass
 | --- | --- |
 | REST transactional API | autocommit (`POST /db/{db}/tx/commit`) + explicit tx (`/tx` → `/tx/{id}` → `/tx/{id}/commit`) + rollback (`DELETE /tx/{id}`) |
 | TLS | the REST listener terminates TLS with a self-signed cert (production REST requires TLS) |
-| Bearer-JWT auth | the client mints an HS256 JWT out of band and sends `Authorization: Bearer …`; an unauthenticated request is rejected `401` |
+| Bearer-JWT auth | the client obtains a token from `POST /auth/login` (username + password) and sends `Authorization: Bearer …`; an unauthenticated request is rejected `401` |
 | Schema DDL over REST | `CREATE CONSTRAINT … REQUIRE … IS UNIQUE` (indexed entity lookup), node **property-type** (`… IS :: INTEGER`) + **existence** (`… IS NOT NULL`) constraints, a `Document.year` **RANGE** index, and a **FULLTEXT** title index (`CREATE FULLTEXT INDEX … ON EACH [d.title]`) |
 | Schema evidence | `SHOW INDEXES` / `SHOW CONSTRAINTS` captured to `evidence/schema_evidence.json`, asserting the FULLTEXT/RANGE indexes and the constraints are declared and `ONLINE` |
 | Full-text search | `CALL db.index.fulltext.queryNodes('document_fulltext', '<term>')` — analyzer-tokenized, relevance-ranked title search asserted against the known reference documents |
@@ -26,7 +31,7 @@ It doubles as an executable E2E test: `run.sh` exits non-zero the moment any ass
 | Knowledge-graph discovery | entity lookup, multi-hop semantic traversal, recommendation, aggregation, concept-path — asserted against a known reference |
 | NDJSON streaming | `Accept: application/x-ndjson` → one JSON object per line, parsed incrementally client-side |
 | Content negotiation | the same query as JSON and CBOR, both decoding to the same logical result, with payload-size comparison |
-| Concurrency | many concurrent HTTPS clients issuing the discovery workload with zero errors |
+| Concurrency | many concurrent HTTPS clients issuing the discovery workload with zero errors — each read sent `access_mode: "READ"` so it dispatches to the **off-thread reader pool**, over a **keep-alive** connection per client |
 
 ## The knowledge-graph model
 
@@ -131,22 +136,47 @@ cargo run -p graphus-kg-gen --bin kg_gen -- --profile fast --out-dir /tmp/kg
 
 ## How the REST API is used
 
-### Authentication (Bearer JWT, minted out of band)
+### Authentication (Bearer JWT via `POST /auth/login`)
 
-Graphus's REST API has **no login endpoint** — Bearer tokens are minted out of band by anyone
-holding the server's `jwt_secret`. The token is an **HS256 JWT** (`crates/graphus-auth/src/token.rs`)
-carrying `sub` (the username), `exp`/`iat`, `iss`/`aud` (both `"graphus"`), a random `jti`, and a
-credential-epoch `ver`. The server validates the signature, the `iss`/`aud` binding, that `sub`
-names a live catalog user (the bootstrap admin qualifies), and that `ver ≥` the user's epoch (a fresh
-admin is at epoch `0`). The python client mints this with the **standard library only**
-(`hmac`/`hashlib`/`base64`/`json`) — no `PyJWT` dependency. An unauthenticated request is rejected
-`401`, which the workload asserts.
+Graphus's REST API exposes a **login endpoint**: `POST /auth/login` (`crates/graphus-rest`, rmp #499)
+takes a JSON `{"username","password"}` body and returns `{"token","token_type":"Bearer",
+"expires_at_unix_secs"}`. The python client posts the admin credentials and uses the returned token as
+`Authorization: Bearer …` on every subsequent request — **no client-side token minting and no shared
+`jwt_secret` on the client**. (The server still needs a non-default `jwt_secret` to *sign* the token
+it mints; the client never sees it.)
+
+The token is an **HS256 JWT** (`crates/graphus-auth/src/token.rs`) carrying `sub` (the username),
+`exp`/`iat`, `iss`/`aud` (both `"graphus"`), a random `jti`, and a credential-epoch `ver`. The server
+validates the signature, the `iss`/`aud` binding, that `sub` names a live catalog user (the bootstrap
+admin qualifies), and that `ver ≥` the user's epoch. An unauthenticated request to a transactional
+endpoint is rejected `401`, which the workload asserts. The client uses the **standard library only**
+(`http.client` + `ssl` + `json`) — no `PyJWT`, no `requests`.
+
+### Reads engage the off-thread reader pool (`access_mode: "READ"`)
+
+Every read the client issues — the five discovery queries, the full-text search, the `SHOW INDEXES` /
+`SHOW CONSTRAINTS` introspection, and the concurrency worker query — is sent as a **single-statement
+auto-commit with `access_mode: "READ"`**. That is what makes the router run it through the engine's
+own auto-commit READ path so it **dispatches to the off-thread reader pool** and scales across the
+reader threads (rmp #527/#543). An auto-commit **without** `access_mode` defaults to `WRITE` and runs
+inline on the single engine thread — a ~1-core ceiling under concurrency, and the reason a naive
+"concurrency" driver can report a 1-core result as if it were a success. The write path (the batched
+graph load, the explicit-transaction demo, and the negative constraint writes) is left in `WRITE`
+mode, exactly as it must be.
+
+### Keep-alive connections
+
+Each client keeps **one persistent (keep-alive) HTTPS connection** (`http.client.HTTPSConnection`,
+reused across requests) rather than opening a fresh TCP+TLS connection per operation. Every
+concurrency worker owns its own connection (the connection object is not thread-safe), so the reported
+latency/throughput reflect the server and the reader pool — not a per-operation TLS handshake.
 
 ### Request / response shapes (verified against `crates/graphus-rest`)
 
 | Method & path | Purpose | Request body | Response |
 | --- | --- | --- | --- |
-| `POST /db/{db}/tx/commit` | one-shot autocommit | `{"statements":[{"statement":"…","parameters":{…}}]}` | `200` `{"results":[{"fields":[…],"data":[[…]],"summary":{…}}]}` |
+| `POST /db/{db}/tx/commit` | one-shot autocommit (reads add `"access_mode":"READ"`) | `{"statements":[{"statement":"…","parameters":{…}}],"access_mode":"READ"}` | `200` `{"results":[{"fields":[…],"data":[[…]],"summary":{…}}]}` |
+| `POST /auth/login` | obtain a Bearer token | `{"username":"…","password":"…"}` | `200` `{"token":"…","token_type":"Bearer","expires_at_unix_secs":…}` |
 | `POST /db/{db}/tx` | open explicit tx | `{"statements":[],"access_mode":"WRITE"}` | `201` `{"id":"tx-1","commit":"…","expires_at_nanos":…,"access_mode":"WRITE"}` |
 | `POST /db/{db}/tx/{id}` | run in tx | `{"statements":[…]}` | `200` `{"results":[…],"id":"tx-1","expires_at_nanos":…}` |
 | `POST /db/{db}/tx/{id}/commit` | commit | `{"statements":[]}` | `200` `{"results":[…]}` |
@@ -213,33 +243,97 @@ GRAPHUS_BIN_DIR=target/release \
 | `KG_OPS` | `20` | discovery queries per client |
 | `KG_BATCH` | `200` | statements per load batch |
 
-**Requirements:** a Unix host (Linux/macOS), `bash`, `openssl` (self-signed cert), and `python3`
-(3.8+, **stdlib only** — no pip packages). The generator is hermetic and CI-runnable on its own; if
-`openssl` or `python3` is absent, the REST workload is skipped with a clear note while the
-byte-identical-generator assertion still runs.
+**Requirements:** a Unix host (Linux/macOS), `bash`, and `python3` (3.8+, **stdlib only** — no pip
+packages). A **local** run also needs `openssl` (self-signed cert); an **external** run also needs
+`curl` (the harness uses it for `/metrics` + database DDL). The generator is hermetic and CI-runnable
+on its own; if the tools for the selected mode are absent, the REST workload is skipped with a clear
+note while the byte-identical-generator assertion still runs.
+
+### Running against an external target
+
+By default the example self-boots a local server. Set any of `GRAPHUS_TARGET_{BOLT,REST,UDS}` and it
+switches to **attach mode** instead: it does **not** boot a server, authenticates to the
+already-running instance via `POST /auth/login`, carves out an **isolated dedicated database**, drives
+the same discovery + concurrency workload into it, scrapes the target's Prometheus `/metrics`
+before + after, emits the server-side evidence via the `measure_target` harness
+(`measurement_mode=external`), and **DROPs the database on exit** — leaving the target exactly as it
+was found. This is the shared external-target seam in `examples/_harness/harness.sh`; see the
+"Running against an external target" section of `examples/README.md` for the full `GRAPHUS_TARGET_*`
+contract.
+
+```bash
+# attach to an already-running instance (e.g. pi516), isolated + cleaned up:
+GRAPHUS_TARGET_REST=https://100.89.148.30:7474 \
+  GRAPHUS_TARGET_USER=graphus GRAPHUS_TARGET_PASSWORD=graphus-local \
+  GRAPHUS_TARGET_TLS_INSECURE=1 \
+  examples/knowledge-graph-rest/run.sh
+```
+
+| `GRAPHUS_TARGET_*` | Meaning |
+| --- | --- |
+| `GRAPHUS_TARGET_REST` | REST base URL (`https://host:7474`) — setting it enables attach mode |
+| `GRAPHUS_TARGET_USER` / `GRAPHUS_TARGET_PASSWORD` | login credentials (defaults `graphus` / `graphus-local`) |
+| `GRAPHUS_TARGET_TLS_INSECURE` | `1` to accept a self-signed TLS cert (`curl -k` / no client verification) |
+| `GRAPHUS_TARGET_DB` | reuse an existing DB (never created/dropped); unset → an isolated DB is created + dropped |
+| `GRAPHUS_TARGET_SYSTEM_DB` | DB through which the `CREATE/STOP/DROP DATABASE` DDL routes (default `graphus`) |
+
+In attach mode the process CPU/RSS and on-disk store/WAL vectors are **N/A** (no `/proc` or store-path
+access on a remote host) and the host-specific baseline gate is skipped; the server-side evidence is
+the `/metrics` counter delta (below). The workload exercises current-HEAD Cypher/DDL (named indexes,
+`SHOW … YIELD`, property-type constraints), so an attach target must run a server at least as new as
+that feature set.
 
 ## Evidence
 
 The python client emits a single machine-readable `GRAPHUS_STATS {…}` line; `run.sh` parses it and
 feeds it — together with the **live server process's** CPU + peak RSS and the on-disk store/WAL
-footprint — into the dev-only `measure_server` harness, which writes the standardized, schema-versioned
-**`evidence/report.json` + `evidence/report.md`** (the `evidence/` dir is git-ignored). The client also
-emits a machine-readable `GRAPHUS_SCHEMA {…}` line — the `SHOW INDEXES` / `SHOW CONSTRAINTS` snapshot —
-which `run.sh` persists to **`evidence/schema_evidence.json`**. The paths are printed in the run
-summary.
+footprint (local mode only) — into the dev-only `measure_server` harness, which writes the
+standardized, schema-versioned **`evidence/report.json` + `evidence/report.md`** (the `evidence/` dir
+is git-ignored). The client also emits a machine-readable `GRAPHUS_SCHEMA {…}` line — the
+`SHOW INDEXES` / `SHOW CONSTRAINTS` snapshot — which `run.sh` persists to
+**`evidence/schema_evidence.json`**. The paths are printed in the run summary.
+
+**Server-side `/metrics` evidence.** In **both** modes `run.sh` scrapes the server's Prometheus
+`/metrics` immediately **before** and **after** the workload window and computes the before → after
+delta, attributed to the run's database:
+
+- **External mode** — the delta is the *primary* server-side evidence: `measure_target` writes it into
+  `evidence/report.json` as a top-level `measurement_mode: "external"` plus a `server_metrics` section
+  (committed / aborted transactions, abort rate, slow queries, the query-duration histogram, the SSI
+  gauge, and the health invariants). The run **fails** if any statement panicked, an engine was
+  force-detached, or the abort rate exceeds the bound (`--assert`).
+- **Local mode** — the co-located `measure_server` report (CPU/RSS/storage + the baseline gate) stays
+  the primary `evidence/report.json`; the same `/metrics` delta is additionally written to
+  `evidence/server-metrics/report.json` as a companion (best-effort, needs `curl`).
+
+The `server_metrics` section from a real attach run (into an isolated database):
+
+```jsonc
+{
+  "database": "ex_knowledge-graph-rest_…",
+  "transactions_committed": 370, "transactions_aborted": 3, "abort_rate": 0.008,
+  "slow_queries": 0,
+  "statement_panics": 0, "engine_recovery_panics": 0,
+  "engine_force_detached": 0, "engine_force_detached_active": 0,
+  "ssi_tracked_before": 1, "ssi_tracked_after": 371,
+  "query_count": 4390, "query_duration_mean_ms": 0.03,
+  "query_duration_p50_ms": 0.25, "query_duration_p99_ms": 0.50
+}
+```
 
 ### What is measured
 
 | Vector | Source | Example (`fast` profile, one developer machine) |
 | --- | --- | --- |
-| **HTTP requests/sec** | concurrency driver ops over the uptime window | ≈ 490 ops/s |
-| **Latency p50 / p99 / p999** | per-request, measured client-side | ≈ 24.9 / 33.3 / 43.6 ms |
-| **NDJSON streaming throughput** | rows/sec + bytes/sec of the streamed result | ≈ 403 rows, ≈ 348k rows/s, ≈ 13 MB/s |
-| **Payload size per encoding** | response bytes for the SAME query as JSON vs CBOR | JSON `11664` B, CBOR `7208` B → **CBOR ≈ 61.8 % of JSON** |
+| **HTTP requests/sec** | concurrent READ driver over a keep-alive connection per client | ≈ 1200 ops/s (machine-variant; `access_mode READ` + keep-alive engage the reader pool) |
+| **Latency p50 / p99 / p999** | per-request, measured client-side | ≈ 3 / 8 / 10 ms (machine-variant) |
+| **NDJSON streaming throughput** | rows/sec + bytes/sec of the streamed result | ≈ 403 rows, tens–hundreds of k rows/s (machine-variant) |
+| **Payload size per encoding** | response bytes for the SAME query as JSON vs CBOR | JSON `11664` B, CBOR `7208` B → **CBOR ≈ 61.8 % of JSON** (deterministic) |
 | **Declared schema** | `SHOW INDEXES` / `SHOW CONSTRAINTS` counts (`evidence/schema_evidence.json`) | `4` indexes (FULLTEXT + RANGE + 2 always-on LOOKUP), `6` constraints |
-| **Server CPU** | the live server PID's cumulative user+system seconds | ≈ 2.0 user + 0.2 sys s |
-| **Peak server RAM (RSS)** | sampled from the live PID during the workload | ≈ 205 MB |
-| **Storage footprint** | on-disk store + WAL bytes/pages after the load | store ≈ 0.72 MB, WAL ≈ 5.2 MB |
+| **Server-side counters** | `/metrics` before → after delta (`server_metrics` section) | committed / aborted txns, slow queries, query-duration histogram, SSI gauge, panic/force-detach invariants |
+| **Server CPU** *(local mode)* | the live server PID's cumulative user+system seconds | ≈ 2.0 user + 0.2 sys s |
+| **Peak server RAM (RSS)** *(local mode)* | sampled from the live PID during the workload | ≈ 205 MB |
+| **Storage footprint** *(local mode)* | on-disk store + WAL bytes/pages after the load | store ≈ 0.72 MB, WAL ≈ 5.2 MB |
 | **Dataset size** | nodes + relationships in the loaded graph | `616` nodes, `3770` relationships |
 
 The headline `GRAPHUS_STATS` line (parsed into the report's `workload` + `throughput` sections):
