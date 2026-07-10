@@ -16,6 +16,10 @@ Node/network.
 
 - **The `gds.*` procedure surface end to end** — `gds.graph.project` → the algorithm `*.stream`
   procedures → `gds.graph.drop`, over a real persistent store via the official driver.
+- **A production-realistic schema** — a node `UNIQUE`, two node **property-type** constraints
+  (`field_name :: STRING`, `h_index :: INTEGER`), a node `RANGE` index and a **relationship** `RANGE`
+  index (`CITES.weight`), loaded schema-first and enforced on every write (see
+  [Schema exercised](#schema-exercised-constraints--indexes)).
 - **The full algorithm library**: PageRank, degree / betweenness / closeness centrality, weakly- and
   strongly-connected components (WCC / SCC), triangle counting, Label Propagation community
   detection, and weighted shortest paths (Dijkstra / Bellman-Ford).
@@ -80,6 +84,36 @@ Intra-field (`:CITES`) and inter-field (`:CROSS`) citations are split by **relat
 purpose: a community projection over **`:CITES` only** recovers the planted field blocks exactly via
 WCC, while a projection over **all** rel types sees the fully-linked influence network for PageRank /
 centrality / shortest paths.
+
+### Schema exercised (constraints & indexes)
+
+The graph is loaded **schema-first**: the generated `graph.cypher` opens with a DDL block the workload
+runs as auto-commit admin statements over Bolt, so every subsequent write is constraint-checked and
+index-maintained. It rounds out the campaign's constraint/index coverage with a **node property-type**
+constraint and a **relationship RANGE** index:
+
+| DDL | Kind | Why |
+|-----|------|-----|
+| `CREATE CONSTRAINT author_id_unique FOR (a:Author) REQUIRE a.id IS UNIQUE` | node `UNIQUE` | every author id is distinct (owns a backing RANGE index) |
+| `CREATE CONSTRAINT author_field_name_string FOR (a:Author) REQUIRE a.field_name IS :: STRING` | node **property-type** (`STRING`) | the research-field **label** is always a string |
+| `CREATE CONSTRAINT author_h_index_integer FOR (a:Author) REQUIRE a.h_index IS :: INTEGER` | node **property-type** (`INTEGER`) | the h-index is always an integer |
+| `CREATE INDEX author_field_range FOR (a:Author) ON (a.field)` | node `RANGE` | the community filter / grouping access path |
+| `CREATE INDEX cites_weight_range FOR ()-[c:CITES]-() ON (c.weight)` | **relationship** `RANGE` | a "high-weight citations" access path on the citation count |
+
+> **Property-name note.** The model stores the planted community as an **integer** `field` id
+> (`0..community_count`) and its human-readable **string** label as `field_name` (e.g.
+> `'graph-theory'`). The `STRING` property-type constraint therefore sits on `field_name`, and the
+> node RANGE index on the integer `field` id — not the other way round — so a schema-first load
+> succeeds by construction.
+
+> **Relationship RANGE index — honest planner note (`rmp` #680).** Graphus serves an **equality**
+> predicate on a relationship property from the index (`WHERE c.weight = 5` lowers to a `RelIndexSeek`),
+> but a **range** predicate (`WHERE c.weight >= 5`) stays a full `ExpandAll` + `Filter` scan. This is
+> asserted honestly by `crates/graphus-server/tests/gds_analytics_schema.rs` against the real planner.
+
+The live workload (`data/analyze.js`) additionally captures the live `SHOW CONSTRAINTS` / `SHOW
+INDEXES` catalog as evidence and proves the property-type constraint **rejects** a non-string
+`field_name` write (failing loudly if the engine were to accept it).
 
 ### Two profiles
 
@@ -163,6 +197,17 @@ planted-field community recovery). It runs in the default `cargo test` — no No
 
 ```bash
 cargo test -p graphus-server --test gds_analytics
+```
+
+A companion hermetic test, `crates/graphus-server/tests/gds_analytics_schema.rs`, proves the **schema**
+the example declares works end-to-end: it drives the generated DDL block through the real engine's
+admin path, loads the influence network schema-first, and asserts `SHOW CONSTRAINTS` / `SHOW INDEXES`
+report the constraints and indexes with the right kinds/types/entities (all `ONLINE`), that the
+relationship RANGE index serves an equality seek but not a `>=` range (`rmp` #680), and that the
+property-type / uniqueness constraints reject non-conforming writes:
+
+```bash
+cargo test -p graphus-server --test gds_analytics_schema
 ```
 
 ## Scalability, footprint & parallelism — what we measure (and why)
@@ -274,9 +319,12 @@ rounding a report round-trip can introduce.
 
 ## Components exercised
 
-`graphus-server` (Bolt-TCP + TLS), `graphus-bolt` + PackStream (the wire path), `graphus-cypher` (the
-`gds.*` procedure surface + `CALL`/`YIELD`), `graphus-gds` (the CSR projection + algorithm library),
-`graphus-storage` + `graphus-wal` (the durable store the projection is drained from), and
+`graphus-server` (Bolt-TCP + TLS; the admin DDL path for `CREATE CONSTRAINT` / `CREATE INDEX` +
+`SHOW CONSTRAINTS` / `SHOW INDEXES`), `graphus-bolt` + PackStream (the wire path), `graphus-cypher`
+(the `gds.*` procedure surface + `CALL`/`YIELD`, the node property-type + uniqueness constraint
+enforcement, and the relationship-index planner utilisation), `graphus-gds` (the CSR projection +
+algorithm library), `graphus-storage` + `graphus-wal` (the durable store the projection is drained
+from, plus the durable constraint/index catalog and the node/relationship RANGE indexes), and
 `graphus-auth` (Bolt basic-auth over TLS). The hermetic mirror exercises the same `gds.*` semantics
 in-process via `LocalEngine`; the evidence is produced by the dev-only `graphus-examples-harness` +
 `graphus-gds-gen` (`gds_sweep`, `gds_evidence`, `gds_baseline_cmp`) — none of which enter the

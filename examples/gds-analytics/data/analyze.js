@@ -5,9 +5,12 @@
 //
 // It:
 //   1. connects with `bolt+ssc://` (trusts the server's self-signed cert),
-//   2. loads the schema DDL + the generated influence network (from graph.cypher): :Author nodes,
+//   2. loads the schema DDL + the generated influence network (from graph.cypher): a UNIQUE + two
+//      `IS ::` node property-type constraints (field_name :: STRING, h_index :: INTEGER), a node RANGE
+//      index (Author.field) and a relationship RANGE index (CITES.weight); then :Author nodes,
 //      intra-field :CITES edges, sparse inter-field :CROSS edges, and a small :Ref/:LINKS reference
-//      subgraph,
+//      subgraph. It captures the live SHOW CONSTRAINTS / SHOW INDEXES catalog as evidence and proves
+//      the property-type constraint rejects a non-string field_name (rmp #679),
 //   3. projects the graph into the in-memory CSR via `CALL gds.graph.project(...)` and runs the FULL
 //      algorithm suite through the `CALL gds.*.stream(...)` procedure surface — PageRank, degree +
 //      betweenness + closeness centrality, WCC + SCC, triangleCount, label propagation (community),
@@ -104,6 +107,20 @@ async function runQuery(driver, query, params) {
   }
 }
 
+// Run a write that MUST be rejected by a constraint; fail loudly if the engine ACCEPTS it. Returns the
+// server's error message (for the evidence log). A silently-accepted violation is a correctness bug.
+async function runExpectReject(driver, query, what) {
+  const s = driver.session();
+  try {
+    await s.run(query);
+    fail(`constraint enforcement broken: ${what} was ACCEPTED but must be rejected`);
+  } catch (e) {
+    return e.message || String(e);
+  } finally {
+    await s.close();
+  }
+}
+
 (async () => {
   const script = fs.readFileSync(cypherPath, 'utf8');
   const ref = JSON.parse(fs.readFileSync(refPath, 'utf8'));
@@ -132,6 +149,50 @@ async function runQuery(driver, query, params) {
       (await runQuery(driver, 'MATCH (a:Author) RETURN count(a) AS c'))[0].get('c')
     );
     console.log(`authors loaded: ${authorCount}`);
+
+    // =============================================================================================
+    // 1b. SCHEMA EVIDENCE + CONSTRAINT ENFORCEMENT (rmp #679)
+    //     The load above ran schema-first (a UNIQUE + two `IS ::` property-type constraints, a node
+    //     RANGE index, and a relationship RANGE index on CITES.weight). Capture the live catalog as
+    //     evidence and prove the property-type constraints actually reject non-conforming writes.
+    // =============================================================================================
+    console.log('\n-- schema (constraints + indexes) --');
+    const showCol = (rec, name) => {
+      const v = rec.has(name) ? rec.get(name) : null;
+      if (Array.isArray(v)) return v.map(toNum).join('+');
+      return v === null || v === undefined ? '' : toNum(v);
+    };
+    for (const rec of await runQuery(driver, 'SHOW CONSTRAINTS')) {
+      console.log(
+        `  constraint ${showCol(rec, 'name')}: ${showCol(rec, 'type')} on ` +
+          `${showCol(rec, 'entityType')}(${showCol(rec, 'labelsOrTypes')}).` +
+          `${showCol(rec, 'properties')}` +
+          (showCol(rec, 'propertyType') ? ` :: ${showCol(rec, 'propertyType')}` : '')
+      );
+    }
+    for (const rec of await runQuery(driver, 'SHOW INDEXES')) {
+      console.log(
+        `  index ${showCol(rec, 'name')}: ${showCol(rec, 'type')} on ` +
+          `${showCol(rec, 'entityType')}(${showCol(rec, 'labelsOrTypes')}).` +
+          `${showCol(rec, 'properties')} [${showCol(rec, 'state')}]`
+      );
+    }
+
+    // Negative test: a non-string `field_name` MUST be rejected by the node property-type constraint
+    // (`author_field_name_string`). A fresh id keeps the only violation the type mismatch.
+    const rejectMsg = await runExpectReject(
+      driver,
+      "CREATE (:Author {id: 9999999, name: 'bad', field: 0, field_name: 123, h_index: 5})",
+      'an Author with a non-string field_name'
+    );
+    console.log(`  ✓ non-string field_name rejected: ${rejectMsg.split('\n')[0].slice(0, 120)}`);
+    // Sanity: the rejected write created nothing (count unchanged).
+    const afterReject = toNum(
+      (await runQuery(driver, 'MATCH (a:Author) RETURN count(a) AS c'))[0].get('c')
+    );
+    if (afterReject !== authorCount) {
+      fail(`rejected write leaked: author count ${afterReject} != ${authorCount}`);
+    }
 
     // ---- nodeId (internal) <-> id (property) mapping for the :Ref nodes, so we can translate the
     //      procedure surface's internal nodeIds back to the stable reference ids in reference.json.

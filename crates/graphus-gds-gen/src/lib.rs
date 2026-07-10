@@ -473,12 +473,31 @@ impl Dataset {
     pub fn to_cypher(&self) -> String {
         let mut s = String::with_capacity(self.authors.len() * 96 + self.citations.len() * 96);
 
-        // --- Schema (admin DDL — runs as auto-commit statements). Forms verified against the
-        // graphus-server admin matcher: `CREATE CONSTRAINT <name> FOR (n:L) REQUIRE n.p IS UNIQUE`
-        // and `CREATE INDEX FOR (n:L) ON (n.p)`. ---
+        // --- Schema (admin DDL — runs as auto-commit statements). Every form is verified against the
+        // graphus-server admin matcher (see `crates/graphus-server/tests/gds_analytics_schema.rs`,
+        // which parses this exact block off `parse_admin_statement` and drives it through the real
+        // engine). The generated authors conform to every constraint, so a schema-first load succeeds.
+        //
+        // NOTE on the property names: the influence-network model stores the planted community as an
+        // INTEGER `field` id (0..community_count) and its human-readable label as a STRING `field_name`
+        // (e.g. 'graph-theory'). The property-type constraints therefore sit on the *actual* string /
+        // integer properties — `field_name` (STRING) and `h_index` (INTEGER) — not on the integer
+        // `field`, so the load succeeds by construction. ---
         s.push_str("// schema\n");
+        // Uniqueness: every author has a distinct id (owns a backing RANGE index).
         s.push_str("CREATE CONSTRAINT author_id_unique FOR (a:Author) REQUIRE a.id IS UNIQUE;\n");
-        s.push_str("CREATE INDEX FOR (a:Author) ON (a.field);\n");
+        // Node property-type constraints: the field label is a STRING and the h-index an INTEGER.
+        s.push_str(
+            "CREATE CONSTRAINT author_field_name_string FOR (a:Author) REQUIRE a.field_name IS :: STRING;\n",
+        );
+        s.push_str(
+            "CREATE CONSTRAINT author_h_index_integer FOR (a:Author) REQUIRE a.h_index IS :: INTEGER;\n",
+        );
+        // Node RANGE index on the planted field id (the community filter / grouping access path).
+        s.push_str("CREATE INDEX author_field_range FOR (a:Author) ON (a.field);\n");
+        // Relationship RANGE index on the citation weight — the "high-weight citations" access path
+        // (Graphus serves an equality seek from it; a `>=` range stays a scan + filter — rmp #680).
+        s.push_str("CREATE INDEX cites_weight_range FOR ()-[c:CITES]-() ON (c.weight);\n");
 
         // --- Authors ---
         s.push_str("// authors\n");

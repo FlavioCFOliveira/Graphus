@@ -108,10 +108,16 @@ fn as_float(cell: &MaterializedValue) -> f64 {
 }
 
 /// A `;`-terminated statement iterator over the generated Cypher script, dropping `//` comment lines
-/// and the schema DDL (`CREATE CONSTRAINT` / `CREATE INDEX`) — the in-process load path runs data
-/// `CREATE`s only; the DDL is a load optimisation the official-driver path applies over Bolt, not a
-/// correctness precondition for projection/algorithms. (Mirrors `fraud_oltp_detection.rs`.)
+/// and every schema-DDL form (`CREATE CONSTRAINT …` and any `CREATE … INDEX …`) — the in-process load
+/// path runs data `CREATE`s only; the DDL is a load optimisation the official-driver path applies over
+/// Bolt (and the dedicated `gds_analytics_schema.rs` exercises), not a correctness precondition for
+/// projection/algorithms. The predicate matches the schema block in `graphus-gds-gen`'s `to_cypher`
+/// (a `UNIQUE` + two `IS ::` property-type constraints, a node RANGE index, and a relationship RANGE
+/// index) and mirrors `fraud_oltp_detection.rs`'s defensive `is_schema_ddl` filter.
 fn data_statements(script: &str) -> Vec<String> {
+    let is_schema_ddl = |s: &str| {
+        s.starts_with("CREATE CONSTRAINT") || (s.starts_with("CREATE") && s.contains(" INDEX "))
+    };
     script
         .lines()
         .filter(|l| !l.trim_start().starts_with("//"))
@@ -119,9 +125,7 @@ fn data_statements(script: &str) -> Vec<String> {
         .join("\n")
         .split(';')
         .map(|s| s.trim().to_owned())
-        .filter(|s| {
-            !s.is_empty() && !s.starts_with("CREATE CONSTRAINT") && !s.starts_with("CREATE INDEX")
-        })
+        .filter(|s| !s.is_empty() && !is_schema_ddl(s))
         .collect()
 }
 
