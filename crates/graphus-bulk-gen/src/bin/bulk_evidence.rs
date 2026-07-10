@@ -44,7 +44,9 @@
 //!
 //! - **`storage`** — the durable footprint: `store_bytes`/`wal_bytes` + pages, plus
 //!   `space_amplification = bytes_per_node` and `write_amplification = bytes_per_edge` (the gated,
-//!   deterministic per-element costs). The honest store/total CSV-relative amplifications go into the
+//!   deterministic per-element costs). Because that overloads two field names, the SAME per-element
+//!   costs are ALSO published under the explicit, unambiguous workload params `storage_bytes_per_node`
+//!   / `storage_bytes_per_edge`. The honest store/total CSV-relative amplifications go into the
 //!   workload params for human visibility.
 //! - **`throughput`** — `operations = nodes + relationships`, `ops_per_sec` = elements/sec.
 //! - **`cpu` / `memory`** — the import child's CPU + peak/final RSS.
@@ -214,6 +216,18 @@ fn run() -> Result<(), String> {
             "csv_write_amplification".into(),
             format!("{:.4}", storage.write_amplification),
         );
+        // EXPLICITLY-NAMED per-element on-disk costs, so a reader never has to know that the fixed
+        // `storage` section reuses its `space_amplification`/`write_amplification` fields to carry
+        // bytes-per-node / bytes-per-edge (the deterministic, gated figures). Same numbers, unambiguous
+        // names.
+        w.insert(
+            "storage_bytes_per_node".into(),
+            format!("{:.4}", storage.bytes_per_node),
+        );
+        w.insert(
+            "storage_bytes_per_edge".into(),
+            format!("{:.4}", storage.bytes_per_edge),
+        );
         if let Some(h) = &args.content_hash {
             w.insert("content_hash".into(), h.clone());
         }
@@ -278,8 +292,11 @@ fn run() -> Result<(), String> {
          + retained graph.wal redo log measured for the SAME dataset (from bulk_storage's \
          storage.json). storage.space_amplification = on-disk STORE bytes-per-node and \
          storage.write_amplification = on-disk STORE bytes-per-edge — the DETERMINISTIC per-element \
-         costs the baseline gate holds to a tight band. The CSV-relative amplifications \
-         (store/total/write vs logical_csv_bytes) are in the workload params for human visibility."
+         costs the baseline gate holds to a tight band (the fixed storage section reuses those two \
+         fields to carry the per-element costs; the SAME numbers are also published under the \
+         explicit workload params storage_bytes_per_node / storage_bytes_per_edge so nothing is \
+         mislabelled). The CSV-relative amplifications (store/total/write vs logical_csv_bytes) are \
+         in the workload params for human visibility."
             .to_string(),
     );
     if let Some(h) = &args.content_hash {

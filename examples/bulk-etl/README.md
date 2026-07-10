@@ -1,23 +1,33 @@
-# bulk-etl — high-throughput bulk ingest & ETL (offline)
+# bulk-etl — high-throughput bulk ingest & ETL (offline core + network wire step)
 
 > **Status:** complete. `rmp #264` (dataset + generator), `#265` (import / export / round-trip),
 > `#266` (storage footprint + amplification), `#267` (evidence instrumentation), `#268` (`run.sh`),
-> `#269` (dev-only cargo mirror), `#270` (evidence report + committed baseline + this README), and
-> `#678` (online schema-hardening: the new constraint & index kinds an operator declares after a bulk
-> load — a composite `UNIQUE`, a `NODE KEY`, a relationship existence + property-type, a node
-> property-type, and `TEXT` / `FULLTEXT` / composite `RANGE` indexes) are all implemented and proven.
+> `#269` (dev-only cargo mirror), `#270` (evidence report + committed baseline + this README),
+> `#678` (online schema-hardening: the constraint & index kinds an operator declares after a bulk
+> load), and `#695` (**network bulk-import (Mode A) wire step + server-side `/metrics` evidence**:
+> stream the SAME generated CSVs into a running server over the wire and prove the server's ingest
+> tally + queried counts equal the manifest) are all implemented and proven.
 
-This example demonstrates Graphus's **offline bulk data pipeline**: the `graphus-bulk` CLI that
-**imports** node/relationship CSV into a fresh store and **dumps** a whole graph back to CSV, with
-**no server and no Bolt driver** in the loop. It is the path you use to load a dataset before the
-server ever starts, and to export it for backup / migration / interchange.
+This example demonstrates Graphus's **bulk data pipeline**, end to end and in two stages:
 
-The offline import / dump / round-trip / storage / baseline **core is fully offline and hermetic** —
-which makes it the simplest example to run and the easiest to reason about for storage
-characterisation. On top of it, this example also demonstrates the **online schema-hardening** that
-follows a bulk load in production (`rmp #678`): the constraints and indexes an operator declares once
-the freshly-loaded data is online — proven both by an always-run hermetic cargo mirror and by an
-opt-in live Bolt-over-UDS server step (see [Online schema-hardening](#online-schema-hardening--the-production-sequel-to-a-bulk-load-rmp-678)).
+1. an **offline core** — the `graphus-bulk` CLI that **imports** node/relationship CSV into a fresh
+   store and **dumps** a whole graph back to CSV, with **no server and no Bolt driver** in the loop.
+   It is the path you use to load a dataset before the server ever starts, and to export it for backup
+   / migration / interchange. This core is **fully offline and hermetic** — the simplest thing to run
+   and the easiest to reason about for storage characterisation.
+2. a **network bulk-import wire step** (`rmp #695`) — the SAME generated CSVs streamed into a
+   **running server** over the ratified network bulk-import **Mode A** path
+   (`POST /admin/db/{db}/bulk-import?phase=nodes|relationships` then `?end=true`), proving the server's
+   own final ingest tally **and** the queried row counts equal the manifest, and collecting
+   **server-side evidence** from the target's Prometheus `/metrics`. It runs against a self-booted
+   local plaintext-loopback REST server by default, or **attaches** to an already-running instance
+   (local OR remote, e.g. `pi516`) via the shared external-target seam (see
+   [Network bulk-import over the wire](#network-bulk-import-over-the-wire-mode-a--rmp-695)).
+
+On top of both, the example also documents the **online schema-hardening** that follows a bulk load in
+production (`rmp #678`): the constraints and indexes an operator declares once the freshly-loaded data
+is online — proven by an always-run hermetic cargo mirror (see
+[Online schema-hardening](#online-schema-hardening--the-production-sequel-to-a-bulk-load-rmp-678)).
 
 ## What it demonstrates
 
@@ -138,19 +148,106 @@ so the schema uses a relationship *existence* + *property-type* constraint rathe
   exact generator-derived sets (a `TEXT CONTAINS` substring set — lowering to a `NodeTextIndexSeek` —
   and `FULLTEXT queryNodes` for the shared token / a unique number token / an absent term) plus a
   composite `(createdAt, id)` seek — lowering to a `NodeCompositeIndexSeek`.
-- **Live wire demo** (`run.sh` Step 5, opt-in via `RUN_WIRE`, default on): boots a **real
-  `graphus-server`** and, over Bolt-over-UDS, loads a small slice of the model, applies the whole
-  palette as an operator would *after* a load, proves one enforcement rejection, and captures
-  `SHOW CONSTRAINTS` / `SHOW INDEXES` (full columns) into `evidence/`.
+- **Live network wire step** (`run.sh` Step 5, opt-in via `RUN_WIRE`, default on): streams the SAME
+  generated CSVs into a **running server** over the network bulk-import Mode A path and, over that
+  actually-loaded data, applies a **version-tolerant** subset of the palette and captures
+  `SHOW CONSTRAINTS` / `SHOW INDEXES` into `evidence/wire/`. See
+  [Network bulk-import over the wire](#network-bulk-import-over-the-wire-mode-a--rmp-695) for the full
+  step, including which DDL is applied over bulk-imported data and why.
 
-  **Empirical note — why the live demo uses the server's own fresh store, not the bulk-imported one**
-  (verified against the code): the offline importer writes a flat `<dir>/graph.store` + `graph.wal`
-  pair and does **not** persist the CSV `:ID` column as a queryable node property (it is consumed only
-  as the physical-id join key), whereas the server resolves its store as
-  `<store_path>/databases/<name>/graphus.store` (with a database catalog) and the id-anchored schema
-  needs an `id` property. So the id column is carried as a property when loading over the wire — exactly
-  as an online client does after a bulk load — and the hermetic mirror is the rigorous proof over the
-  generator's exact dataset.
+  **Empirical note — the CSV `:ID` is a join key, not a stored property** (verified against a live
+  server): neither the offline importer nor the network Mode-A import persists the CSV `:ID` column as
+  a queryable node property — it is consumed only as the physical-id join key, so a loaded
+  `(:Person)` carries `keys(n) = [age, browserUsed, firstName, gender, lastName, locationIP, tags]`
+  with **no `id`**. The **id-anchored** palette above (a `NODE KEY` / `UNIQUE` on `.id`, the composite
+  `UNIQUE` whose leading key is `id`) therefore applies to a graph where `id` has been **materialised
+  as a real property** (as an online client would after a load), which is exactly what the hermetic
+  `bulk_etl_schema.rs` mirror does — it is the rigorous end-to-end proof of the full palette over the
+  generator's exact dataset. The wire step, running over the un-materialised bulk-imported data,
+  exercises the DDL that *is* meaningful there (see below).
+
+## Network bulk-import over the wire (Mode A) — `rmp #695`
+
+After the offline core characterises the load, `run.sh` **Step 5** brings the SAME data online the way
+an operator does in production: it streams the generator's node + relationship CSVs into a **running
+server** over the ratified network bulk-import **Mode A** happy path
+(`specification/08-network-bulk-import.md`), asserts the server's own ingest tally **and** the queried
+row counts equal the manifest, and folds **server-side** evidence from the target's Prometheus
+`/metrics` into a wire `report.json`.
+
+### The wire sequence
+
+1. **Isolated database.** A dedicated, uniquely-named database (`ex_bulk-etl_<epoch>_<pid>`) is created
+   via the shared external-target seam (`harness_target_ensure_db`) and **dropped on exit**
+   (`harness_target_drop_db`, from the `trap`) — so a run never touches an operator's data and leaves no
+   residue, local or remote.
+2. **Stream the files.** Each per-label node file is streamed as one
+   `POST /admin/db/{db}/bulk-import?phase=nodes` (`Content-Type: text/csv`), then each per-type
+   relationship file as `?phase=relationships`. The first call takes the empty database over exclusively
+   (the `Loading` state); every subsequent call continues the same session. Each response reports the
+   session's cumulative `{"nodes","relationships","properties"}`.
+3. **End + bring online.** `?end=true` returns the final cumulative tally and moves the database to
+   `Offline`; `START DATABASE` then brings it `Online`.
+4. **Assert against the manifest.** Both the server's **end-of-session ingest tally** *and* the
+   **queried** counts (`MATCH (n) RETURN count(n)`, `MATCH ()-[r]->() RETURN count(r)`) must equal the
+   generator manifest — nodes, relationships, and (for the ingest tally) the property count.
+5. **Server-side evidence.** `/metrics` is scraped **before** and **after** the wire workload and the
+   deltas are folded into `evidence/wire/report.json` via the shared `measure_target` binary
+   (`measurement_mode = external`): committed/aborted transactions attributed to the run's database, the
+   query-duration histogram, and the health invariants (`statement_panics`, `engine_recovery_panics`,
+   `engine_force_detached*` — all asserted `0` by `measure_target --assert`).
+
+### Two ways to run it
+
+- **Local self-boot (default).** With no `GRAPHUS_TARGET_*` set, Step 5 boots a real `graphus-server`
+  exposing a **plaintext-loopback REST** listener (`allow_insecure_network = true`, so the upload needs
+  no TLS/cert) plus a UDS socket, points the seam at `http://127.0.0.1:<port>`, runs the wire sequence,
+  and stops the server on exit.
+- **Attach to a running instance.** Set a `GRAPHUS_TARGET_REST` endpoint and Step 5 **attaches** to it
+  instead of booting anything — local or remote (e.g. a staging box or `pi516`). TLS with a self-signed
+  cert is accepted with `GRAPHUS_TARGET_TLS_INSECURE=1`.
+
+  ```bash
+  GRAPHUS_TARGET_REST=https://100.89.148.30:7474 \
+    GRAPHUS_TARGET_USER=graphus GRAPHUS_TARGET_PASSWORD=graphus-local \
+    GRAPHUS_TARGET_TLS_INSECURE=1 \
+    examples/bulk-etl/run.sh
+  ```
+
+### DDL over bulk-imported data (version-tolerant)
+
+Because the CSV `:ID` is the physical join key and **not** a stored property (see the empirical note
+above), the id-anchored palette (`NODE KEY` / `UNIQUE` on `.id`) is **not** applied over the wire
+directly — it is documented in `manifest.json` and proven by the hermetic mirror over a graph where
+`id` is materialised. What the wire step *does* exercise over the actually-loaded data, best-effort and
+**non-fatal**, is the DDL that is meaningful there: a **RANGE index** on a real timeline property
+(`Post.createdAt`) and **property-type constraints** (`Post.length IS :: INTEGER`, satisfied by
+construction). Each accepted statement is counted (`online_ddl_accepted` in the report), and the plain
+`SHOW CONSTRAINTS` / `SHOW INDEXES` listings are captured to `evidence/wire/schema_*.json`.
+
+### Verified against an older server (`pi516`)
+
+The wire step was validated against a live, **older** Graphus build (`pi516`, REST + TLS). Findings:
+
+- **The network Mode-A path is fully supported by the older build.** The complete sequence — login,
+  `CREATE DATABASE`, streaming `?phase=nodes|relationships` (`text/csv`), `?end=true`, `START DATABASE`,
+  the count queries, the `/metrics` scrape, and `STOP`+`DROP` — all succeed, and the server's ingest
+  tally (`800` nodes / `4,029` relationships / `7,349` properties) matched the manifest **exactly**.
+- **The older build rejects some modern DDL** (why the wire schema step is version-tolerant): typed
+  index DDL such as `CREATE TEXT INDEX …` is a **syntax error** on `pi516`, and the `SHOW CONSTRAINTS /
+  SHOW INDEXES … YIELD …` projection form is rejected — so the wire step avoids both (plain `SHOW`, no
+  typed-index DDL) and the full modern palette is validated against a **current** server (local mode)
+  and the hermetic mirror. Relationship property-type DDL was also not accepted on `pi516`
+  (`2/3` version-tolerant statements applied there); this is recorded, not failed.
+
+### `rmp #681` — the offline store is not directly server-openable (surfaced, not sidestepped)
+
+`run.sh` **Step 6** imports the dataset into a probe store and checks its layout: the offline importer
+writes a **flat** `graph.store` + `graph.wal` pair, whereas a `graphus-server` resolves its store as
+`<store_path>/databases/<name>/graphus.store` (plus a database catalog). So an offline-produced store is
+**not** directly openable by a server — which is why the online demo reaches the same data through the
+**network bulk-import path** (Step 5) rather than by pointing a server at the offline store. The probe
+surfaces this as an explicit finding rather than silently working around it.
 
 ## How it is built — the dev-only generator crate
 
@@ -196,24 +293,34 @@ The library is covered by unit + integration tests in the DEFAULT `cargo test`:
 | **Peak RAM / CPU / time** | poll the import child's PID (`/proc` / `ps`) | `report.json` `memory.peak_rss_bytes`, `cpu.*`, `phases[import]` |
 | **Storage footprint + amplification** | `bulk_storage` walks the on-disk store + WAL | `report.json` `storage.*` + `storage.json` |
 | **Regression gate** | `bulk_baseline_cmp` vs committed `baseline.json` | `GRAPHUS_BASELINE_OK` |
-| **Online schema-hardening** (`rmp #678`) | hermetic `bulk_etl_schema.rs` + opt-in live server step (`run.sh` Step 5) | `SHOW CONSTRAINTS` / `SHOW INDEXES` list the full palette `ONLINE`; enforcement rejections; `evidence/schema_*.txt` |
+| **Network bulk-import (Mode A)** (`rmp #695`) | stream the SAME CSVs into a running server (`POST /admin/db/{db}/bulk-import?phase=…` / `?end=true`); local self-boot or external attach | server ingest tally + queried counts asserted == `manifest.json` |
+| **Isolated database + teardown** (`rmp #695`) | `harness_target_ensure_db` creates a dedicated DB; `harness_target_drop_db` (from the `trap`) drops it on exit | leaves the target clean, local or remote |
+| **Server-side `/metrics` evidence** (`rmp #695`) | `/metrics` scraped before/after the wire load; deltas folded in by `measure_target` (`--assert` health gate) | `evidence/wire/report.json` (`measurement_mode=external`, `server_metrics`) |
+| **Online schema-hardening** (`rmp #678`) | hermetic `bulk_etl_schema.rs` (full palette) + version-tolerant DDL over the wire-loaded data (`run.sh` Step 5) | `SHOW CONSTRAINTS` / `SHOW INDEXES` list the palette `ONLINE`; enforcement rejections; `evidence/wire/schema_*.json` |
 
 ## Running it
 
 The standardized, self-asserting entry point is `run.sh`. Its offline core (Steps 1–4) needs no
-server, driver, or network; the opt-in online schema-hardening demo (Step 5) boots a real
-`graphus-server` over Bolt-over-UDS and is enabled by default (`RUN_WIRE=1`). It builds the binaries
-if needed, runs the whole pipeline, prints an `N checks run, M failures` summary + the evidence path,
-and exits non-zero on any failed assertion. A `trap` removes the temp workspace on exit (success **or**
-failure), so it leaves no residue.
+server, driver, or network; the network bulk-import **wire step** (Step 5) streams the SAME CSVs into a
+running server and is enabled by default (`RUN_WIRE=1`) — booting a local plaintext-loopback REST
+server, or attaching to a `GRAPHUS_TARGET_REST` endpoint when one is set. It builds the binaries if
+needed, runs the whole pipeline, prints an `N checks run, M failures` summary + the evidence paths, and
+exits non-zero on any failed assertion. A `trap` removes the temp workspace **and drops any isolated
+wire database** on exit (success **or** failure), so it leaves no residue — local or remote.
 
 ```bash
 # Fast profile (default): 800 nodes / 4,029 rels — the CI/E2E scale, gated against the baseline.
-# Also runs the live online schema-hardening demo (Step 5) unless RUN_WIRE=0.
+# Also runs the network bulk-import wire step (Step 5) against a self-booted local server unless RUN_WIRE=0.
 examples/bulk-etl/run.sh
 
-# Offline core only — skip the live server step (a host without a server/cli build).
+# Offline core only — skip the wire step (a host without a server build, or an offline CI).
 RUN_WIRE=0 examples/bulk-etl/run.sh
+
+# Stream the wire step into an ALREADY-RUNNING instance (local OR remote, e.g. pi516) over REST + TLS.
+GRAPHUS_TARGET_REST=https://100.89.148.30:7474 \
+  GRAPHUS_TARGET_USER=graphus GRAPHUS_TARGET_PASSWORD=graphus-local \
+  GRAPHUS_TARGET_TLS_INSECURE=1 \
+  examples/bulk-etl/run.sh
 
 # Large profile: 24,400 nodes / 139,989 rels — the evidence/volume scale (not baseline-gated).
 BULK_PROFILE=large examples/bulk-etl/run.sh
@@ -252,8 +359,36 @@ example), assembled by `bulk_evidence`. The headline metrics:
 | `storage.wal_bytes` / `wal_pages` | the retained `graph.wal` redo log |
 | `storage.space_amplification` | on-disk **store bytes-per-node** (the gated per-element cost) |
 | `storage.write_amplification` | on-disk **store bytes-per-edge** (the gated per-element cost) |
+| `workload.storage_bytes_per_node` / `storage_bytes_per_edge` | the SAME per-element costs under **explicit, unambiguous names** — because the fixed `storage` section reuses its `space_amplification` / `write_amplification` fields to carry them (`rmp #695`) |
 | `workload.store_space_amplification` / `total_space_amplification` / `csv_write_amplification` | the CSV-relative amplifications (human visibility, not gated) |
 | `workload.content_hash` | the round-trip content hash (lossless evidence) |
+
+> **Field disambiguation (`rmp #695`).** The shared evidence schema's `storage` section has exactly two
+> per-element float fields, which this example overloads to carry **bytes-per-node** (`space_amplification`)
+> and **bytes-per-edge** (`write_amplification`) — the deterministic figures the baseline gate holds. To
+> avoid any mislabelling, the SAME numbers are also published under the explicitly-named workload params
+> `storage_bytes_per_node` / `storage_bytes_per_edge`. (True *amplification* ratios vs the logical CSV
+> input are the `*_amplification` workload params.)
+
+### Wire (server-side) evidence — `evidence/wire/`
+
+The network bulk-import wire step (Step 5) writes a **separate** report so it never clobbers the offline
+one: `evidence/wire/report.json` + `report.md` (via `measure_target`, `measurement_mode = external`)
+plus `schema_constraints.json` / `schema_indexes.json`. Its headline block is `server_metrics` — the
+target's `/metrics` **before → after deltas**, attributed to the run's isolated database:
+
+| `server_metrics` field | Meaning |
+|------------------------|---------|
+| `database` | the isolated run database the deltas are attributed to (per-database `graphus_db_*` series) |
+| `transactions_committed` / `transactions_aborted` / `abort_rate` | write activity the server saw over the wire window |
+| `query_count` / `query_duration_{mean,p50,p99}_ms` | the query-duration histogram delta |
+| `statement_panics` / `engine_recovery_panics` / `engine_force_detached{,_active}` | health invariants — a healthy server keeps these `0` (asserted by `measure_target --assert`) |
+| `ssi_tracked_before` / `ssi_tracked_after` | retained SSI conflict records around the window |
+
+Process CPU/RSS and on-disk storage are **N/A** in this external mode (no co-located PID or store path)
+and are left zeroed with an explicit note — the honest, portable channel against a remote server is
+`/metrics`. The workload params carry the server's ingest tally (`server_ingest_{nodes,relationships,
+properties}`) and the count of accepted version-tolerant DDL statements (`online_ddl_accepted`).
 
 `bulk_storage` also writes the lower-level `storage.json` (the footprint source `bulk_evidence`
 folds in); its `store_space_amplification` / `space_amplification` / `write_amplification` are the
