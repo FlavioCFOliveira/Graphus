@@ -581,6 +581,40 @@ An unrecognised `indexConfig` key is accepted and ignored (Neo4j leniency); an u
 kind — it never backs a constraint — and is listed under `SHOW INDEXES` with `type` `VECTOR`,
 `indexProvider` `vector-2.0` and its `indexConfig` in `options`.
 
+A declared vector index is queried with the Neo4j-compatible **k-NN procedures**, and two **similarity
+functions** compute the same normalized score directly in an expression:
+
+```cypher
+-- k nearest :Doc nodes to a query embedding, most-similar first (score in (0, 1])
+CALL db.index.vector.queryNodes('doc_emb', 5, [0.1, 0.2, …]) YIELD node, score
+RETURN node.title, score
+
+-- the relationship analogue
+CALL db.index.vector.queryRelationships('rel_emb', 5, [0.1, 0.2, …]) YIELD relationship, score
+RETURN relationship, score
+
+-- the raw similarity of two vectors (no index needed)
+RETURN vector.similarity.cosine([1.0, 0.0], [0.0, 1.0]) AS s      -- 0.5  ((1 + cos) / 2)
+RETURN vector.similarity.euclidean([0.0], [2.0]) AS s             -- 0.2  (1 / (1 + d²))
+```
+
+`db.index.vector.queryNodes(indexName :: STRING, numberOfNearestNeighbours :: INTEGER, query :: ANY)
+:: (node :: NODE, score :: FLOAT)` resolves the named **node** vector index, runs the HNSW k-NN with the
+index's similarity metric, and yields the visible nodes with their score in descending order.
+`db.index.vector.queryRelationships(…) :: (relationship :: RELATIONSHIP, score :: FLOAT)` is the
+relationship analogue. `query` is a `LIST<FLOAT | INTEGER>` of the index's dimension. Each hit is
+**re-checked against the caller's transaction snapshot** — a deleted, re-labelled/re-typed or
+re-embedded entity, or one the caller lacks read privileges for, is dropped — so results honour MVCC and
+RBAC. An unknown index, an index of the **wrong kind** (a relationship vector index through `queryNodes`
+or vice-versa), a non-list / non-finite / wrong-dimension query vector, or a non-positive `k` is a clear
+error. These procedures run **inline** (a read; `SHOW PROCEDURES` reports `mode` `READ`).
+
+`vector.similarity.cosine(a :: LIST<FLOAT>, b :: LIST<FLOAT>) :: FLOAT` and
+`vector.similarity.euclidean(a, b) :: FLOAT` return the **same normalized score in `(0, 1]`** the index
+uses — cosine `(1 + cos) / 2` (`1.0` for identical, `0.5` for orthogonal vectors), euclidean
+`1 / (1 + ‖a − b‖²)`. A `null` operand yields `null`; a dimension mismatch or a non-finite element is a
+runtime error. INTEGER elements widen to FLOAT.
+
 `SHOW INDEXES` is a single unified, Neo4j-conformant listing of **every** index kind (node/relationship
 `RANGE`, composite `RANGE`, `TEXT`, `FULLTEXT`, `POINT`, `VECTOR`, and the two token `LOOKUP` indexes),
 with the full Neo4j column set, `UPPER-CASE` state, per-type filters
@@ -678,7 +712,7 @@ message). They are documented here so expectations are exact.
 
 | Area | Status |
 | ---- | ------ |
-| **Vector similarity functions** — `vector.similarity.*`, `gds.similarity.*` | Not supported (unknown function). The vector **index** itself is supported — see below. |
+| **GDS node-similarity functions** — `gds.similarity.*` | Not supported (unknown function). The `vector.similarity.cosine` / `vector.similarity.euclidean` functions **are** supported, as is the whole `VECTOR` index surface (DDL + `db.index.vector.query*`) — see [Indexes](#indexes). |
 | **QPP — nested interior** | Deferred. A quantified group inside another quantified group is rejected at compile time. Single- **and** multi-relationship interiors (`(x)-[r1]->(m)-[r2]->(y)`) **are** supported. |
 | **GDS path-algorithm write** — `gds.dijkstra.write`, `gds.bellmanFord.write` | Deferred. The path algorithms are **stream-only** today (`gds.dijkstra.stream` works). Node-property algorithms support `.stats`/`.mutate`/`.write`. |
 | **Database aliases** — `CREATE ALIAS … FOR DATABASE …` | Not supported (syntax error). |

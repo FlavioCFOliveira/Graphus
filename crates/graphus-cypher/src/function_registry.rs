@@ -737,6 +737,20 @@ static TABLE: &[Signature] = &[
         arity: Arity::Exact(1),
         aggregate: false,
     },
+    // ---- vector similarity functions (rmp #671) -----------------------------------------------
+    // `vector.similarity.cosine(a, b)` / `vector.similarity.euclidean(a, b)` take two equal-length
+    // numeric lists and return the FLOAT similarity score in (0, 1] the vector index uses (cosine
+    // `(1 + cos) / 2`, euclidean `1 / (1 + d²)`).
+    Signature {
+        name: "vector.similarity.cosine",
+        arity: Arity::Exact(2),
+        aggregate: false,
+    },
+    Signature {
+        name: "vector.similarity.euclidean",
+        arity: Arity::Exact(2),
+        aggregate: false,
+    },
 ];
 
 /// A lower-cased-name → [`Signature`] index, built once on first use.

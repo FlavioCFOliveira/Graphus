@@ -92,5 +92,5 @@ pub use spatial::{DEFAULT_CELL_SIZE, SpatialIndex};
 pub use text::{Gram, Trigram, TrigramIndex};
 pub use vector::{
     DEFAULT_EF_CONSTRUCTION, DEFAULT_EF_SEARCH, DEFAULT_M, Similarity, VectorIndex,
-    VectorIndexError,
+    VectorIndexError, similarity_score,
 };

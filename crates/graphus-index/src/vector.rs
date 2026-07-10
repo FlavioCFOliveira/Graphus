@@ -229,6 +229,58 @@ fn score(similarity: Similarity, dist: f32) -> f32 {
     }
 }
 
+/// Unit-normalises `v` for cosine (leaving a zero/degenerate/non-finite-norm vector untouched — its dot
+/// product with anything is `0`).
+///
+/// Shared by [`VectorIndex::prepare_vector`] (the query/insert path) and [`similarity_score`] (the
+/// `vector.similarity.cosine` function), so both fold the identical arithmetic and can never drift.
+#[inline]
+fn normalize_cosine(v: &[f32]) -> Vec<f32> {
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 && norm.is_finite() {
+        v.iter().map(|x| x / norm).collect()
+    } else {
+        v.to_vec()
+    }
+}
+
+/// The Neo4j vector-similarity **score** in `[0, 1]` between two raw (un-normalised) vectors `a` and
+/// `b` under `similarity` — the exact value the `vector.similarity.cosine` /
+/// `vector.similarity.euclidean` Cypher functions return (`rmp` task #671).
+///
+/// This is the standalone-function twin of the score a [`VectorIndex::query_knn`] hit carries: it
+/// reuses the index's own [`distance`] + [`score`] arithmetic, so a function call and an index hit can
+/// never drift. For [`Similarity::Cosine`] both vectors are unit-normalised first (a zero/degenerate
+/// vector is left untouched, its dot product with anything being `0`, so its score is `0.5`); the
+/// result is `(1 + cos) / 2`. For [`Similarity::Euclidean`] the raw squared L2 distance is used; the
+/// result is `1 / (1 + ‖a - b‖²)`.
+///
+/// `a` and `b` must have the same length — the caller (the function body) validates the dimension and
+/// element finiteness before calling; a length mismatch here would silently zip to the shorter vector.
+///
+/// # Examples
+///
+/// ```
+/// use graphus_index::{Similarity, similarity_score};
+///
+/// // Identical vectors: cosine score is 1.0.
+/// assert!((similarity_score(Similarity::Cosine, &[3.0, 4.0], &[3.0, 4.0]) - 1.0).abs() < 1e-6);
+/// // Orthogonal vectors: cosine score is 0.5.
+/// assert!((similarity_score(Similarity::Cosine, &[1.0, 0.0], &[0.0, 1.0]) - 0.5).abs() < 1e-6);
+/// // Squared L2 distance 4: euclidean score is 1/(1+4) = 0.2.
+/// assert!((similarity_score(Similarity::Euclidean, &[0.0], &[2.0]) - 0.2).abs() < 1e-6);
+/// ```
+#[must_use]
+pub fn similarity_score(similarity: Similarity, a: &[f32], b: &[f32]) -> f32 {
+    match similarity {
+        Similarity::Cosine => {
+            let (na, nb) = (normalize_cosine(a), normalize_cosine(b));
+            score(similarity, distance(similarity, &na, &nb))
+        }
+        Similarity::Euclidean => score(similarity, distance(similarity, a, b)),
+    }
+}
+
 /// An HNSW approximate-nearest-neighbour index over fixed-dimension `f32` embeddings.
 ///
 /// See the [module docs](self) for the algorithm, parameters and score formulas.
@@ -579,14 +631,7 @@ impl VectorIndex {
     /// anything is `0`), or copies verbatim for euclidean.
     fn prepare_vector(&self, v: &[f32]) -> Vec<f32> {
         match self.similarity {
-            Similarity::Cosine => {
-                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-                if norm > 0.0 && norm.is_finite() {
-                    v.iter().map(|x| x / norm).collect()
-                } else {
-                    v.to_vec()
-                }
-            }
+            Similarity::Cosine => normalize_cosine(v),
             Similarity::Euclidean => v.to_vec(),
         }
     }
@@ -1177,6 +1222,41 @@ mod tests {
         let eh = e.query_knn(&[0.0], 2, 50).unwrap();
         assert!((eh.iter().find(|(id, _)| *id == 1).unwrap().1 - 1.0).abs() < 1e-6);
         assert!((eh.iter().find(|(id, _)| *id == 2).unwrap().1 - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn similarity_score_matches_query_scores_and_neo4j_formulas() {
+        // Cosine self-similarity: cos = 1 => (1 + 1) / 2 = 1.0 (independent of magnitude — the raw
+        // vectors are unit-normalised first, exactly as the index normalises on insert).
+        assert!(
+            (similarity_score(Similarity::Cosine, &[3.0, 4.0], &[3.0, 4.0]) - 1.0).abs() < 1e-6
+        );
+        assert!(
+            (similarity_score(Similarity::Cosine, &[3.0, 4.0], &[6.0, 8.0]) - 1.0).abs() < 1e-6
+        );
+
+        // Orthogonal: cos = 0 => (1 + 0) / 2 = 0.5. Opposite: cos = -1 => 0.0 (clamped floor).
+        assert!(
+            (similarity_score(Similarity::Cosine, &[1.0, 0.0], &[0.0, 1.0]) - 0.5).abs() < 1e-6
+        );
+        assert!(similarity_score(Similarity::Cosine, &[1.0, 0.0], &[-1.0, 0.0]).abs() < 1e-6);
+
+        // Euclidean: squared L2 distance 4 => 1 / (1 + 4) = 0.2; distance 0 => 1.0.
+        assert!((similarity_score(Similarity::Euclidean, &[0.0], &[2.0]) - 0.2).abs() < 1e-6);
+        assert!(
+            (similarity_score(Similarity::Euclidean, &[1.0, 2.0], &[1.0, 2.0]) - 1.0).abs() < 1e-6
+        );
+
+        // The function is the exact twin of the score a `query_knn` hit carries (no drift): build a
+        // 1-element cosine index and compare the function to the seek score for the same pair.
+        let mut c = VectorIndex::new(2, Similarity::Cosine, 16, 200, 7).unwrap();
+        c.insert(1, &[2.0, 1.0]).unwrap();
+        let seek = c.query_knn(&[1.0, 3.0], 1, 50).unwrap()[0].1;
+        let func = similarity_score(Similarity::Cosine, &[1.0, 3.0], &[2.0, 1.0]);
+        assert!(
+            (seek - func).abs() < 1e-6,
+            "function score {func} must equal the seek score {seek}"
+        );
     }
 
     #[test]

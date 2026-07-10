@@ -242,6 +242,7 @@ fn tuples_match(a: &[Value], b: &[Value]) -> bool {
 use crate::constraint::{ConstraintViolation, ViolationEntity};
 use crate::graph_access::{
     DeletedEntity, ExpandDirection, GraphAccess, Incident, NodeId, RelData, RelId,
+    VectorQueryResult,
 };
 use crate::index_set::{ConstraintRule, IndexSet};
 use crate::read_source::{self, LiveSource, ReadSink, VisCtx};
@@ -3929,6 +3930,147 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         out.sort_unstable();
         out.dedup();
         Some(out)
+    }
+
+    /// The **node** vector (HNSW) index k-NN seam behind `db.index.vector.queryNodes` (`rmp` task
+    /// #671). Resolves the index by name against the durable catalog, runs the ANN query over the
+    /// derived [`IndexSet`], and returns candidate `(id, score)` hits the procedure re-checks against
+    /// this reader's MVCC snapshot + RBAC.
+    ///
+    /// The HNSW reflects the **latest committed** graph state (it is maintained on every write, like
+    /// the full-text inverted index), so a returned candidate is re-checked by the procedure for
+    /// snapshot visibility, current covered label and current valid embedding — dropping any false
+    /// positive. Unlike the full-text query there is no exact scan fallback for a snapshot that
+    /// predates a concurrent vector mutation (an HNSW is an *approximate* structure — a brute-force
+    /// re-rank would diverge from it), so a stale reader may miss a since-mutated near neighbour; for
+    /// an auto-commit read (snapshot == latest committed) this cannot arise.
+    fn vector_query_nodes(&self, name: &str, query: &[f32], k: usize) -> VectorQueryResult {
+        // Only the coordinated path carries the derived `IndexSet` that holds the HNSW graph.
+        let Some(index) = self.index.as_ref() else {
+            return VectorQueryResult::NoSuchIndex;
+        };
+        // Resolve the durable catalog entry (node + relationship vector indexes share the name
+        // namespace, distinguished by `entity`).
+        let Some(entry) = self.store.borrow().vector_index(name) else {
+            return VectorQueryResult::NoSuchIndex;
+        };
+        // Wrong kind: a *relationship* vector index queried through `queryNodes`.
+        if entry.entity.is_relationship() {
+            return VectorQueryResult::WrongEntity;
+        }
+        // The query vector must match the index's declared embedding dimension.
+        if query.len() != entry.dimensions as usize {
+            return VectorQueryResult::DimensionMismatch {
+                expected: entry.dimensions as usize,
+                got: query.len(),
+            };
+        }
+        // Resolve the covered label + property names for the caller's per-candidate re-check. A token
+        // that no longer resolves means the catalog and token space disagree (never, in practice) —
+        // treat it as no usable index.
+        let (label_or_type, property) = {
+            let store = self.store.borrow();
+            let (Some(label), Some(prop)) = (
+                store
+                    .token_name(Namespace::Label, entry.token)
+                    .map(str::to_owned),
+                store
+                    .token_name(Namespace::PropKey, entry.property_token)
+                    .map(str::to_owned),
+            ) else {
+                return VectorQueryResult::NoSuchIndex;
+            };
+            (label, prop)
+        };
+
+        // SSI predicate footprint: a vector k-NN's result depends on the covered-label embeddings, so
+        // register the same blanket live-node read footprint the seek / full-text procedure paths use
+        // (`04 §5.4`), keeping the query indistinguishable to SSI from a covering scan.
+        self.mark_all_live_nodes();
+
+        match index.borrow().seek_vector_knn(
+            entry.token,
+            entry.property_token,
+            query,
+            k,
+            graphus_index::DEFAULT_EF_SEARCH,
+        ) {
+            // Declared durably but absent from the derived index — treat as no such index.
+            None => VectorQueryResult::NoSuchIndex,
+            Some(Ok(hits)) => VectorQueryResult::Hits {
+                label_or_type,
+                property,
+                dimensions: entry.dimensions as usize,
+                hits,
+            },
+            // Defensive: we already dimension-checked, so this is unreachable in practice.
+            Some(Err(graphus_index::VectorIndexError::DimensionMismatch { expected, got })) => {
+                VectorQueryResult::DimensionMismatch { expected, got }
+            }
+            Some(Err(graphus_index::VectorIndexError::ZeroDimension)) => {
+                VectorQueryResult::NoSuchIndex
+            }
+        }
+    }
+
+    /// The **relationship** vector (HNSW) index k-NN seam behind `db.index.vector.queryRelationships`
+    /// (`rmp` task #671) — the relationship analogue of [`vector_query_nodes`](Self::vector_query_nodes).
+    fn vector_query_rels(&self, name: &str, query: &[f32], k: usize) -> VectorQueryResult {
+        let Some(index) = self.index.as_ref() else {
+            return VectorQueryResult::NoSuchIndex;
+        };
+        let Some(entry) = self.store.borrow().vector_index(name) else {
+            return VectorQueryResult::NoSuchIndex;
+        };
+        // Wrong kind: a *node* vector index queried through `queryRelationships`.
+        if !entry.entity.is_relationship() {
+            return VectorQueryResult::WrongEntity;
+        }
+        if query.len() != entry.dimensions as usize {
+            return VectorQueryResult::DimensionMismatch {
+                expected: entry.dimensions as usize,
+                got: query.len(),
+            };
+        }
+        let (label_or_type, property) = {
+            let store = self.store.borrow();
+            let (Some(rel_type), Some(prop)) = (
+                store
+                    .token_name(Namespace::RelType, entry.token)
+                    .map(str::to_owned),
+                store
+                    .token_name(Namespace::PropKey, entry.property_token)
+                    .map(str::to_owned),
+            ) else {
+                return VectorQueryResult::NoSuchIndex;
+            };
+            (rel_type, prop)
+        };
+
+        // SSI footprint: mirror the relationship seek / full-text procedure blanket marking.
+        self.mark_all_live_rels();
+
+        match index.borrow().seek_vector_rel_knn(
+            entry.token,
+            entry.property_token,
+            query,
+            k,
+            graphus_index::DEFAULT_EF_SEARCH,
+        ) {
+            None => VectorQueryResult::NoSuchIndex,
+            Some(Ok(hits)) => VectorQueryResult::Hits {
+                label_or_type,
+                property,
+                dimensions: entry.dimensions as usize,
+                hits,
+            },
+            Some(Err(graphus_index::VectorIndexError::DimensionMismatch { expected, got })) => {
+                VectorQueryResult::DimensionMismatch { expected, got }
+            }
+            Some(Err(graphus_index::VectorIndexError::ZeroDimension)) => {
+                VectorQueryResult::NoSuchIndex
+            }
+        }
     }
 
     /// A **relationship** full-text index query (`rmp` task #663): the candidate relationship ids

@@ -121,6 +121,50 @@ pub struct RelData {
     pub end: NodeId,
 }
 
+/// The outcome of resolving and running a **named vector (HNSW) index** k-NN query through the
+/// [`GraphAccess`] seam (`rmp` task #671) — the primitive the `db.index.vector.queryNodes` /
+/// `db.index.vector.queryRelationships` procedures build on.
+///
+/// The variants let the procedure surface a **clear, distinct** error for each failure the Neo4j
+/// vector procedures distinguish, rather than collapsing them into one message:
+/// - [`NoSuchIndex`](Self::NoSuchIndex) — no vector index of the asked-for entity kind carries that
+///   name (an unknown name, or a name that belongs only to a non-vector index).
+/// - [`WrongEntity`](Self::WrongEntity) — a vector index of that name exists but covers the **other**
+///   entity (a relationship vector index queried through `queryNodes`, or vice-versa).
+/// - [`DimensionMismatch`](Self::DimensionMismatch) — the query vector's length differs from the
+///   index's declared embedding dimension.
+/// - [`Hits`](Self::Hits) — the ANN **candidate** result. The `hits` are `(id, score)` pairs by
+///   descending score; the caller re-checks each against its MVCC snapshot (visibility, current
+///   covered label/type, current valid embedding) and RBAC before yielding, exactly as the
+///   `#659`/`#664` seek re-checks and the full-text procedures do. The covered `label_or_type` and
+///   `property` names and the `dimensions` are returned so the caller can run that re-check.
+#[derive(Debug, Clone, PartialEq)]
+#[must_use]
+pub enum VectorQueryResult {
+    /// No vector index of the requested entity kind is declared under that name.
+    NoSuchIndex,
+    /// A vector index of that name exists, but over the other entity (node vs relationship).
+    WrongEntity,
+    /// The query vector's dimension does not match the index's declared dimension.
+    DimensionMismatch {
+        /// The index's declared embedding dimension.
+        expected: usize,
+        /// The dimension of the supplied query vector.
+        got: usize,
+    },
+    /// Candidate `(id, score)` hits (descending score) plus the covered schema the caller re-checks.
+    Hits {
+        /// The covered node label (node index) or relationship type (relationship index) name.
+        label_or_type: String,
+        /// The covered embedding property name.
+        property: String,
+        /// The declared embedding dimension (used to re-validate each candidate's current embedding).
+        dimensions: usize,
+        /// Candidate `(entity_id, score)` pairs, ordered by descending score.
+        hits: Vec<(u64, f32)>,
+    },
+}
+
 /// The result of a [`columnar_label_property_scan`](GraphAccess::columnar_label_property_scan)
 /// (`rmp` tasks #329 / #330): the matched `(node, value)` rows **plus** the total count of visible
 /// nodes carrying the label.
@@ -471,6 +515,30 @@ pub trait GraphAccess {
     /// the relationship is not in the index. The default returns `None`.
     fn fulltext_score_rel(&self, _name: &str, _rel: RelId, _search: &str) -> Option<u64> {
         None
+    }
+
+    /// Resolves the **node** vector (HNSW) index named `name` and returns its `k` nearest **candidate**
+    /// node ids to `query` (`rmp` task #671) — the seam behind `db.index.vector.queryNodes`.
+    ///
+    /// The returned [`VectorQueryResult::Hits`] is a **candidate** set: the caller (the procedure)
+    /// re-checks each id's visibility, current covered label and current valid embedding through this
+    /// same seam, so a deleted / invisible / re-labelled / re-embedded node never reaches the result,
+    /// and (when this seam is an
+    /// [`AuthorizedGraph`](crate::authorized_graph::AuthorizedGraph)) RBAC composes for free — exactly
+    /// as the full-text query procedures and the `#659`/`#664` seek re-checks do. See
+    /// [`VectorQueryResult`] for the distinct error variants (`NoSuchIndex` / `WrongEntity` /
+    /// `DimensionMismatch`). The default returns [`VectorQueryResult::NoSuchIndex`] (no vector index
+    /// available).
+    fn vector_query_nodes(&self, _name: &str, _query: &[f32], _k: usize) -> VectorQueryResult {
+        VectorQueryResult::NoSuchIndex
+    }
+
+    /// Resolves the **relationship** vector (HNSW) index named `name` and returns its `k` nearest
+    /// **candidate** relationship ids to `query` (`rmp` task #671) — the relationship analogue of
+    /// [`vector_query_nodes`](Self::vector_query_nodes), the seam behind
+    /// `db.index.vector.queryRelationships`. The default returns [`VectorQueryResult::NoSuchIndex`].
+    fn vector_query_rels(&self, _name: &str, _query: &[f32], _k: usize) -> VectorQueryResult {
+        VectorQueryResult::NoSuchIndex
     }
 
     /// Whether an index named `name` exists in the schema, across **every** index kind — node /

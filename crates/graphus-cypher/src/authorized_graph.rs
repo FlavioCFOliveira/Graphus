@@ -74,6 +74,7 @@ use graphus_core::error::GraphusError;
 
 use crate::graph_access::{
     DeletedEntity, ExpandDirection, GraphAccess, Incident, NodeId, RelData, RelId,
+    VectorQueryResult,
 };
 
 /// The narrow privilege interface the [`AuthorizedGraph`] enforces against, resolved **once per
@@ -772,6 +773,61 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
     fn fulltext_score_rel(&self, name: &str, rel: RelId, search: &str) -> Option<u64> {
         // Advisory, only requested for an already-visible candidate (the procedure filters first).
         self.inner.fulltext_score_rel(name, rel, search)
+    }
+
+    fn vector_query_nodes(&self, name: &str, query: &[f32], k: usize) -> VectorQueryResult {
+        let result = self.inner.vector_query_nodes(name, query, k);
+        if self.oracle.is_unrestricted() {
+            return result;
+        }
+        // A vector k-NN is a read path (`rmp` task #671): filter the candidate hits exactly like a
+        // scan, so an RBAC-invisible node never reaches the result. The procedure body additionally
+        // re-checks each surviving candidate's current label + embedding through this same decorator,
+        // so the filters compose (visibility + label + value + RBAC). Scores are preserved verbatim.
+        match result {
+            VectorQueryResult::Hits {
+                label_or_type,
+                property,
+                dimensions,
+                hits,
+            } => VectorQueryResult::Hits {
+                label_or_type,
+                property,
+                dimensions,
+                hits: hits
+                    .into_iter()
+                    .filter(|&(id, _)| self.node_visible(NodeId(id)))
+                    .collect(),
+            },
+            other => other,
+        }
+    }
+
+    fn vector_query_rels(&self, name: &str, query: &[f32], k: usize) -> VectorQueryResult {
+        let result = self.inner.vector_query_rels(name, query, k);
+        if self.oracle.is_unrestricted() {
+            return result;
+        }
+        // The relationship analogue: drop hits on an RBAC-invisible relationship (traverse denied, or
+        // an endpoint not visible); the procedure body re-checks each survivor's current type +
+        // embedding through this decorator, so the filters compose.
+        match result {
+            VectorQueryResult::Hits {
+                label_or_type,
+                property,
+                dimensions,
+                hits,
+            } => VectorQueryResult::Hits {
+                label_or_type,
+                property,
+                dimensions,
+                hits: hits
+                    .into_iter()
+                    .filter(|&(id, _)| self.rel_visible(RelId(id)))
+                    .collect(),
+            },
+            other => other,
+        }
     }
 
     fn index_exists_by_name(&self, name: &str) -> Option<bool> {

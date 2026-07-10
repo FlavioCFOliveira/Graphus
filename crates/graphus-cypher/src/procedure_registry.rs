@@ -41,7 +41,7 @@ use std::sync::LazyLock;
 use graphus_core::Value;
 
 use crate::equivalence::equivalent;
-use crate::graph_access::GraphAccess;
+use crate::graph_access::{GraphAccess, NodeId, RelId, VectorQueryResult};
 
 // =================================================================================================
 // Signature model
@@ -543,6 +543,63 @@ impl ProcedureSet {
                 ],
             ),
             Box::new(fulltext_query_relationships),
+        );
+        // `db.index.vector.queryNodes(indexName, numberOfNearestNeighbours, query) YIELD node, score`
+        // — the vector (HNSW) k-NN search procedure (`rmp` task #671), Neo4j-compatible. `node` is a
+        // **structural NODE** result (rmp #96 materialization composes MVCC + RBAC at egress); `score`
+        // is the index's normalized similarity in `(0, 1]` (cosine `(1 + cos) / 2`, euclidean
+        // `1 / (1 + d²)`), returned by descending score. `query` is a `LIST<FLOAT | INTEGER>` of the
+        // index's dimension, carried as `ANY` (the v1 registry has no LIST value class).
+        //
+        // Registered **not** reader-safe (inline on the engine thread): an HNSW is a large, mutable,
+        // *approximate* structure the off-thread reader pool cannot serve byte-identically — a
+        // captured clone would blow up RSS under load, and a store-recompute would return exact
+        // neighbours diverging from the HNSW. Inline execution runs against the live index through the
+        // `AuthorizedGraph` seam, so MVCC visibility + RBAC are preserved and the statement stays a
+        // read (no write path); only its thread placement differs from the full-text procedures. This
+        // mirrors `db.awaitIndex`, likewise inline for an authoritative live-seam reason.
+        set.register(
+            ProcedureSignature::new(
+                "db.index.vector.queryNodes",
+                vec![
+                    FieldSpec::new("indexName", FieldType::required(ValueClass::String)),
+                    FieldSpec::new(
+                        "numberOfNearestNeighbours",
+                        FieldType::required(ValueClass::Integer),
+                    ),
+                    FieldSpec::new("query", FieldType::required(ValueClass::Any)),
+                ],
+                vec![
+                    FieldSpec::new("node", FieldType::required(ValueClass::Node)),
+                    FieldSpec::new("score", FieldType::required(ValueClass::Float)),
+                ],
+            ),
+            Box::new(vector_query_nodes_proc),
+        );
+        // `db.index.vector.queryRelationships(indexName, numberOfNearestNeighbours, query) YIELD
+        // relationship, score` — the relationship analogue of `queryNodes` (`rmp` task #671).
+        // `relationship` is a **structural RELATIONSHIP** result (materialized at egress, composing
+        // MVCC + RBAC). Registered **not** reader-safe for the same reason as `queryNodes`.
+        set.register(
+            ProcedureSignature::new(
+                "db.index.vector.queryRelationships",
+                vec![
+                    FieldSpec::new("indexName", FieldType::required(ValueClass::String)),
+                    FieldSpec::new(
+                        "numberOfNearestNeighbours",
+                        FieldType::required(ValueClass::Integer),
+                    ),
+                    FieldSpec::new("query", FieldType::required(ValueClass::Any)),
+                ],
+                vec![
+                    FieldSpec::new(
+                        "relationship",
+                        FieldType::required(ValueClass::Relationship),
+                    ),
+                    FieldSpec::new("score", FieldType::required(ValueClass::Float)),
+                ],
+            ),
+            Box::new(vector_query_relationships_proc),
         );
         // `dbms.components() YIELD name, versions, edition` — the product/version/edition triple every
         // Neo4j driver and admin tool reads at connect time to render the server banner and gate
@@ -1071,6 +1128,236 @@ fn non_negative_usize(name: &str, key: &str, value: &Value) -> Result<usize, Pro
             name,
             format!("the '{key}' option must be an integer"),
         )),
+    }
+}
+
+// =================================================================================================
+// Vector (HNSW) index query procedures (`rmp` task #671)
+// =================================================================================================
+
+/// Extracts a required **string** procedure argument, or a clear [`ProcedureFailure`].
+fn string_arg<'a>(
+    proc: &str,
+    value: Option<&'a Value>,
+    field: &str,
+) -> Result<&'a str, ProcedureFailure> {
+    match value {
+        Some(Value::String(s)) => Ok(s.as_str()),
+        _ => Err(ProcedureFailure::new(
+            proc,
+            format!("the `{field}` argument must be a string"),
+        )),
+    }
+}
+
+/// Extracts a required **positive integer** procedure argument (a non-positive or non-integer value is
+/// a clear error — `k` nearest neighbours must be `>= 1`).
+fn positive_int_arg(
+    proc: &str,
+    value: Option<&Value>,
+    field: &str,
+) -> Result<usize, ProcedureFailure> {
+    match value {
+        Some(Value::Integer(i)) if *i > 0 => Ok(*i as usize),
+        Some(Value::Integer(_)) => Err(ProcedureFailure::new(
+            proc,
+            format!("the `{field}` argument must be a positive integer"),
+        )),
+        _ => Err(ProcedureFailure::new(
+            proc,
+            format!("the `{field}` argument must be an integer"),
+        )),
+    }
+}
+
+/// Parses the `query` argument of a `db.index.vector.query*` procedure into an `f32` vector: it must
+/// be a `LIST<FLOAT | INTEGER>` (an INTEGER element widens to FLOAT, matching the stored-embedding
+/// coercion) with only **finite** elements (a `NaN` / ±∞ element is a clear error — an ill-defined
+/// query vector, Neo4j parity). Dimension conformance is checked by the seam against the index.
+fn query_vector_arg(proc: &str, value: Option<&Value>) -> Result<Vec<f32>, ProcedureFailure> {
+    let Some(Value::List(items)) = value else {
+        return Err(ProcedureFailure::new(
+            proc,
+            "the `query` argument must be a list of numbers",
+        ));
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let x = match item {
+            Value::Integer(i) => *i as f32,
+            Value::Float(f) => *f as f32,
+            _ => {
+                return Err(ProcedureFailure::new(
+                    proc,
+                    "the `query` vector must contain only numbers",
+                ));
+            }
+        };
+        if !x.is_finite() {
+            return Err(ProcedureFailure::new(
+                proc,
+                "the `query` vector must not contain NaN or infinite values",
+            ));
+        }
+        out.push(x);
+    }
+    Ok(out)
+}
+
+/// A clear "no such vector index" error (`kind` is `"node"` or `"relationship"`).
+fn no_such_vector_index(proc: &str, name: &str, kind: &str) -> ProcedureFailure {
+    ProcedureFailure::new(
+        proc,
+        format!("there is no {kind} vector index named {name:?}"),
+    )
+}
+
+/// A clear query-dimension-mismatch error.
+fn vector_dim_mismatch(proc: &str, expected: usize, got: usize) -> ProcedureFailure {
+    ProcedureFailure::new(
+        proc,
+        format!("the query vector has dimension {got}, but the vector index expects {expected}"),
+    )
+}
+
+/// Whether `value` is a snapshot-visible embedding of the covered index: a `LIST` of exactly `dim`
+/// **finite** numbers (INTEGER or FLOAT), the shape [`extract_embedding`](crate::index_set) accepts on
+/// the write path. A candidate whose current value fails this (absent, wrong dimension, non-numeric,
+/// non-finite) is dropped from the result — it is no longer a member of the index at this snapshot.
+fn embedding_present(value: Option<&Value>, dim: usize) -> bool {
+    let Some(Value::List(items)) = value else {
+        return false;
+    };
+    items.len() == dim
+        && items.iter().all(|it| match it {
+            Value::Integer(i) => (*i as f32).is_finite(),
+            Value::Float(f) => (*f as f32).is_finite(),
+            _ => false,
+        })
+}
+
+/// The `db.index.vector.queryNodes(indexName, numberOfNearestNeighbours, query)` body (`rmp` task
+/// #671).
+///
+/// Resolves the named **node** vector (HNSW) index, runs the k-NN over the current committed graph,
+/// then **MVCC-/RBAC-filters** the candidates by re-checking each through the same [`GraphAccess`]
+/// seam the cursor holds — a candidate survives only if it is snapshot-visible (`node_exists`), still
+/// carries the covered label (`node_labels`), and still holds a valid embedding of the declared
+/// dimension (`node_property`). When `graph` is an `AuthorizedGraph` the RBAC filtering composes for
+/// free. Emits one row `[node_id (Value::Integer, bound to a structural NODE), score (Value::Float)]`
+/// per survivor, ordered by descending score then ascending id.
+///
+/// # Errors
+/// A [`ProcedureFailure`] on a non-string index name, a non-positive / non-integer `k`, a
+/// non-list / non-finite query vector, an unknown index, a **relationship** vector index of that name
+/// (wrong kind), or a query-dimension mismatch.
+fn vector_query_nodes_proc(
+    args: &[Value],
+    graph: &mut dyn GraphAccess,
+) -> Result<Vec<Vec<Value>>, ProcedureFailure> {
+    const NAME: &str = "db.index.vector.queryNodes";
+    let index_name = string_arg(NAME, args.first(), "indexName")?;
+    let k = positive_int_arg(NAME, args.get(1), "numberOfNearestNeighbours")?;
+    let query = query_vector_arg(NAME, args.get(2))?;
+
+    match graph.vector_query_nodes(index_name, &query, k) {
+        VectorQueryResult::NoSuchIndex => Err(no_such_vector_index(NAME, index_name, "node")),
+        VectorQueryResult::WrongEntity => Err(ProcedureFailure::new(
+            NAME,
+            format!(
+                "index {index_name:?} is a relationship vector index; \
+                 use db.index.vector.queryRelationships"
+            ),
+        )),
+        VectorQueryResult::DimensionMismatch { expected, got } => {
+            Err(vector_dim_mismatch(NAME, expected, got))
+        }
+        VectorQueryResult::Hits {
+            label_or_type,
+            property,
+            dimensions,
+            hits,
+        } => {
+            // Re-check each candidate against the caller's snapshot (MVCC + RBAC compose through the
+            // seam). Collect `(score, id)` so we can order relevance-first after filtering.
+            let mut kept: Vec<(f32, u64)> = hits
+                .into_iter()
+                .filter(|&(id, _)| {
+                    let nid = NodeId(id);
+                    graph.node_exists(nid)
+                        && graph
+                            .node_labels(nid)
+                            .is_some_and(|labels| labels.iter().any(|l| l == &label_or_type))
+                        && embedding_present(
+                            graph.node_property(nid, &property).as_ref(),
+                            dimensions,
+                        )
+                })
+                .map(|(id, score)| (score, id))
+                .collect();
+            // Descending score, ascending id tie-break — deterministic after filtering.
+            kept.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+            Ok(kept
+                .into_iter()
+                .map(|(score, id)| vec![Value::Integer(id as i64), Value::Float(f64::from(score))])
+                .collect())
+        }
+    }
+}
+
+/// The `db.index.vector.queryRelationships(indexName, numberOfNearestNeighbours, query)` body (`rmp`
+/// task #671) — the relationship analogue of [`vector_query_nodes_proc`].
+///
+/// # Errors
+/// As [`vector_query_nodes_proc`], with a **node** vector index of that name reported as the wrong
+/// kind.
+fn vector_query_relationships_proc(
+    args: &[Value],
+    graph: &mut dyn GraphAccess,
+) -> Result<Vec<Vec<Value>>, ProcedureFailure> {
+    const NAME: &str = "db.index.vector.queryRelationships";
+    let index_name = string_arg(NAME, args.first(), "indexName")?;
+    let k = positive_int_arg(NAME, args.get(1), "numberOfNearestNeighbours")?;
+    let query = query_vector_arg(NAME, args.get(2))?;
+
+    match graph.vector_query_rels(index_name, &query, k) {
+        VectorQueryResult::NoSuchIndex => {
+            Err(no_such_vector_index(NAME, index_name, "relationship"))
+        }
+        VectorQueryResult::WrongEntity => Err(ProcedureFailure::new(
+            NAME,
+            format!("index {index_name:?} is a node vector index; use db.index.vector.queryNodes"),
+        )),
+        VectorQueryResult::DimensionMismatch { expected, got } => {
+            Err(vector_dim_mismatch(NAME, expected, got))
+        }
+        VectorQueryResult::Hits {
+            label_or_type,
+            property,
+            dimensions,
+            hits,
+        } => {
+            let mut kept: Vec<(f32, u64)> = hits
+                .into_iter()
+                .filter(|&(id, _)| {
+                    let rid = RelId(id);
+                    graph.rel_exists(rid)
+                        && graph
+                            .rel_data(rid)
+                            .is_some_and(|data| data.rel_type == label_or_type)
+                        && embedding_present(
+                            graph.rel_property(rid, &property).as_ref(),
+                            dimensions,
+                        )
+                })
+                .map(|(id, score)| (score, id))
+                .collect();
+            kept.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+            Ok(kept
+                .into_iter()
+                .map(|(score, id)| vec![Value::Integer(id as i64), Value::Float(f64::from(score))])
+                .collect())
+        }
     }
 }
 

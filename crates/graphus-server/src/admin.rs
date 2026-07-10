@@ -4605,7 +4605,7 @@ fn show_procedures() -> AdminResult {
                 Value::String(p.name.clone()),
                 Value::String(format!("The `{}` procedure.", p.name)),
                 Value::String(procedure_signature_string(p)),
-                Value::String(if p.reader_safe { "READ" } else { "WRITE" }.to_owned()),
+                Value::String(procedure_mode(&p.name, p.reader_safe).to_owned()),
                 Value::Boolean(false),
             ]
         })
@@ -4614,6 +4614,22 @@ fn show_procedures() -> AdminResult {
         fields,
         rows,
         summary: RunSummary::default(),
+    }
+}
+
+/// The `SHOW PROCEDURES` `mode` column: `WRITE` only for a procedure that actually **mutates** the
+/// graph (the GDS `.write` / `.mutate` surface, `rmp` #643), else `READ`.
+///
+/// `reader_safe` is a **threading** property (off-thread-reader-pool eligibility = no writes AND
+/// thread-safe), NOT the access mode: `db.awaitIndex` and the `db.index.vector.query*` procedures
+/// (`rmp` #671) are read procedures that run **inline** (the live HNSW / durable catalog is `!Send`),
+/// so keying `mode` on `reader_safe` alone would mislabel them `WRITE`. Every reader-safe procedure is
+/// unambiguously `READ`; among the non-reader-safe ones only the mutating GDS surface writes.
+fn procedure_mode(name: &str, reader_safe: bool) -> &'static str {
+    if reader_safe || !(name.ends_with(".write") || name.ends_with(".mutate")) {
+        "READ"
+    } else {
+        "WRITE"
     }
 }
 
@@ -5076,6 +5092,65 @@ mod tests {
             qsig.contains("options = {} :: ANY"),
             "queryNodes must render the optional options default: {qsig}"
         );
+    }
+
+    #[test]
+    fn show_procedures_lists_vector_query_procedures_as_read() {
+        // `rmp` task #671: the vector query procedures are listed with their typed signatures and — key
+        // — mode READ (they read the graph; `reader_safe = false` is only a threading property).
+        let r = show_procedures();
+        let row_for = |name: &str| {
+            r.rows
+                .iter()
+                .find(|row| row[0] == Value::String(name.to_owned()))
+                .unwrap_or_else(|| panic!("SHOW PROCEDURES must list `{name}`"))
+                .clone()
+        };
+        for name in [
+            "db.index.vector.querynodes",
+            "db.index.vector.queryrelationships",
+        ] {
+            let row = row_for(name);
+            assert_eq!(row[3], Value::String("READ".to_owned()), "mode: {row:?}");
+        }
+        let Value::String(nodes_sig) = &row_for("db.index.vector.querynodes")[2] else {
+            panic!("signature column must be a string");
+        };
+        assert!(
+            nodes_sig.contains("indexName :: STRING")
+                && nodes_sig.contains("numberOfNearestNeighbours :: INTEGER")
+                && nodes_sig.contains("query :: ANY")
+                && nodes_sig.contains("node :: NODE")
+                && nodes_sig.contains("score :: FLOAT"),
+            "queryNodes signature: {nodes_sig}"
+        );
+        let Value::String(rels_sig) = &row_for("db.index.vector.queryrelationships")[2] else {
+            panic!("signature column must be a string");
+        };
+        assert!(
+            rels_sig.contains("relationship :: RELATIONSHIP")
+                && rels_sig.contains("score :: FLOAT"),
+            "queryRelationships signature: {rels_sig}"
+        );
+    }
+
+    #[test]
+    fn show_functions_lists_vector_similarity_functions() {
+        // `rmp` task #671: the two vector similarity functions appear in the built-in library.
+        let r = show_functions();
+        for name in ["vector.similarity.cosine", "vector.similarity.euclidean"] {
+            let row = r
+                .rows
+                .iter()
+                .find(|row| row[0] == Value::String(name.to_owned()))
+                .unwrap_or_else(|| panic!("SHOW FUNCTIONS must list `{name}`"));
+            assert_eq!(
+                row[1],
+                Value::String("Scalar".to_owned()),
+                "category: {row:?}"
+            );
+            assert_eq!(row[5], Value::Boolean(false), "not aggregating: {row:?}");
+        }
     }
 
     #[test]

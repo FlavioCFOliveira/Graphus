@@ -1951,6 +1951,17 @@ fn call_function(
             arg(&argv, 1, lower)?,
             arg(&argv, 2, lower)?,
         )?,
+        // `vector.similarity.cosine(a, b)` / `vector.similarity.euclidean(a, b)` (`rmp` task #671):
+        // the normalized similarity score in (0, 1] the vector index uses, over two equal-length
+        // numeric lists. Reuses `graphus_index::similarity_score`, so a function call and an index hit
+        // fold the identical arithmetic. `null` on a null operand; a runtime `TypeError` on a
+        // non-list / non-numeric / non-finite element or a dimension mismatch.
+        "vector.similarity.cosine" => {
+            vector_similarity_fn(&argv, graphus_index::Similarity::Cosine, lower)?
+        }
+        "vector.similarity.euclidean" => {
+            vector_similarity_fn(&argv, graphus_index::Similarity::Euclidean, lower)?
+        }
         // Temporal difference and truncation functions (rmp #53).
         "duration.between" | "duration.inmonths" | "duration.indays" | "duration.inseconds" => {
             crate::temporal_fns::duration_between(
@@ -2146,6 +2157,68 @@ fn arg<'a>(argv: &'a [Value], n: usize, fname: &str) -> Result<&'a Value, EvalEr
     argv.get(n).ok_or_else(|| EvalError::ArgumentCount {
         name: fname.to_owned(),
     })
+}
+
+/// Coerces a Cypher `LIST<FLOAT | INTEGER>` value into an `f32` vector for the vector-similarity
+/// functions (`rmp` task #671): an INTEGER element widens to FLOAT (matching the stored-embedding
+/// coercion). A non-list argument, a non-numeric element, or a `NaN` / ±∞ element is a runtime
+/// `TypeError` (an ill-defined vector).
+fn list_to_f32(v: &Value, fname: &str) -> Result<Vec<f32>, EvalError> {
+    let Value::List(items) = v else {
+        return Err(EvalError::TypeError {
+            context: format!("{fname}() requires list arguments"),
+        });
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let x = match item {
+            Value::Integer(i) => *i as f32,
+            Value::Float(f) => *f as f32,
+            _ => {
+                return Err(EvalError::TypeError {
+                    context: format!("{fname}() vectors must contain only numbers"),
+                });
+            }
+        };
+        if !x.is_finite() {
+            return Err(EvalError::TypeError {
+                context: format!("{fname}() vectors must not contain NaN or infinite values"),
+            });
+        }
+        out.push(x);
+    }
+    Ok(out)
+}
+
+/// Evaluates `vector.similarity.cosine` / `vector.similarity.euclidean` (`rmp` task #671): the
+/// normalized similarity score in `(0, 1]` between two equal-length numeric vectors under `sim`,
+/// computed by [`graphus_index::similarity_score`] (so it never drifts from an index hit's score). A
+/// `null` operand yields `null` (Cypher scalar-function null propagation); a dimension mismatch is a
+/// runtime `TypeError`.
+fn vector_similarity_fn(
+    argv: &[Value],
+    sim: graphus_index::Similarity,
+    fname: &str,
+) -> Result<Value, EvalError> {
+    let a = arg(argv, 0, fname)?;
+    let b = arg(argv, 1, fname)?;
+    if matches!(a, Value::Null) || matches!(b, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let va = list_to_f32(a, fname)?;
+    let vb = list_to_f32(b, fname)?;
+    if va.len() != vb.len() {
+        return Err(EvalError::TypeError {
+            context: format!(
+                "{fname}() requires two vectors of the same dimension, got {} and {}",
+                va.len(),
+                vb.len()
+            ),
+        });
+    }
+    Ok(Value::Float(f64::from(graphus_index::similarity_score(
+        sim, &va, &vb,
+    ))))
 }
 
 /// Dispatches the scalar type-conversion functions (`toInteger`/`toFloat`/`toString`/`toBoolean`/
