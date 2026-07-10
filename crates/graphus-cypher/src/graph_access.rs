@@ -329,6 +329,28 @@ pub trait GraphAccess {
         None
     }
 
+    /// An **optional composite (multi-property) relationship index equality seek** (`rmp` task #666):
+    /// the visible relationship ids of `rel_type` whose current values of `properties` (in the given
+    /// order) equal `values` element-wise by Cypher equality — the relationship analogue of
+    /// [`index_seek_composite_eq`](Self::index_seek_composite_eq).
+    ///
+    /// `properties` and `values` are parallel and of equal length (the covered ordered tuple, the
+    /// composite index's full key). Returns `None` when **no composite relationship index covers
+    /// `(rel_type, properties)`** as its full ordered tuple — the executor then falls back to a typed
+    /// relationship scan + residual equality on every key (always correct either way, the path the
+    /// off-thread reader always takes). `Some(ids)` is a set the seam has **already re-checked**
+    /// (visibility, current type, current per-property tuple), and RBAC composes through the
+    /// [`AuthorizedGraph`](crate::authorized_graph::AuthorizedGraph) decorator. The default returns
+    /// `None` (no composite relationship index available).
+    fn index_seek_rel_composite_eq(
+        &self,
+        _rel_type: &str,
+        _properties: &[String],
+        _values: &[Value],
+    ) -> Option<Vec<RelId>> {
+        None
+    }
+
     /// An **optional** spatial proximity seek (`rmp` task #73): the **candidate** node ids of `label`
     /// whose point `property` lies within `radius` of the centre `(center_x, center_y)`, projected to
     /// 2D (the grid's `(x, y)` buckets).

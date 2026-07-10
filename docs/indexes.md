@@ -54,6 +54,26 @@ it is identical across restarts and rebuilds. If two different targets would san
 same base name, or the base collides with an explicit name, Graphus appends a deterministic
 suffix so the resulting name is still unique and stable.
 
+### Node vs relationship, single vs composite
+
+A `RANGE` index covers **one** property or a **composite** ordered tuple of two or more, over either
+**nodes** or **relationships** (the undirected `()-[r:T]-()` pattern; a directed arrow is a syntax
+error). All four combinations are supported:
+
+```cypher
+CREATE INDEX FOR (n:Person)      ON (n.name)           -- single-property node   → index_Person_name
+CREATE INDEX FOR (n:Person)      ON (n.first, n.last)  -- composite node         → index_Person_first_last
+CREATE INDEX FOR ()-[r:KNOWS]-() ON (r.since)          -- single-property rel    → rel_index_KNOWS_since
+CREATE INDEX FOR ()-[r:KNOWS]-() ON (r.a, r.b)         -- composite relationship → rel_index_KNOWS_a_b
+```
+
+A composite index accelerates a `MATCH` that supplies an equality on **every** covered key —
+`MATCH (n:Person {first: 'Ada', last: 'Lovelace'})` or `MATCH ()-[r:KNOWS {a: 1, b: 2}]-()` — as **one**
+seek over the full ordered tuple, and serves a predicate on only its **leading** key as a leading-prefix
+seek. The key **order is significant**: `(a, b)` and `(b, a)` are distinct indexes. Relationship
+auto-names carry a `rel_index_` prefix so a relationship index's auto-name never collides with a node
+index's over the same identifiers.
+
 ### Idempotent create — `IF NOT EXISTS`
 
 `IF NOT EXISTS` makes the create a no-op when an equivalent index (or the same name) already

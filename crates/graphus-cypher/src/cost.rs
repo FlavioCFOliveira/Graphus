@@ -365,6 +365,31 @@ pub fn estimate_cost(op: &PhysicalOp, stats: Option<&dyn Statistics>) -> CostEst
             CostEstimate::new(rows, COST_SEEK_SETUP + rows * COST_SEEK_PER_ROW)
         }
 
+        // A composite (multi-property) relationship equality seek (`rmp` task #666): the selectivity is
+        // the product of the per-key constant predicate-selectivities (independence assumption), so a
+        // full-key composite relationship seek is far more selective than any single-key seek + residual
+        // filters — matching how the node composite seek estimates. An undirected pattern surfaces each
+        // relationship twice, so double the estimate; floored at one candidate so the seek stays a
+        // cheap-but-nonzero access path.
+        PhysicalOp::RelCompositeIndexSeek {
+            rel_type,
+            properties,
+            direction,
+            ..
+        } => {
+            let type_slice = std::slice::from_ref(rel_type);
+            let type_rows = rel_scan_rows(type_slice, stats).max(1.0);
+            let mut rows = type_rows;
+            for _ in properties {
+                rows *= DEFAULT_PREDICATE_SELECTIVITY;
+            }
+            if matches!(direction, crate::ast::RelDirection::Undirected) {
+                rows *= 2.0;
+            }
+            let rows = rows.max(1.0);
+            CostEstimate::new(rows, COST_SEEK_SETUP + rows * COST_SEEK_PER_ROW)
+        }
+
         // A relationship spatial proximity seek (`rmp` task #664): the grid returns a geometric superset
         // of the matching relationships, so — absent per-type relationship spatial statistics — estimate
         // its candidate count with the same constant predicate-selectivity a `rel-scan + filter` would

@@ -151,6 +151,15 @@ pub struct IndexSet {
     /// the constraint *declaration* is durable. The map key carries the whole property tuple because a
     /// label may host several node keys over different property tuples.
     composite: HashMap<(u32, Vec<u32>), CompositeIndex<Dev, Sink>>,
+    /// Declared **composite (multi-property) relationship** indexes (`rmp` task #666), keyed by
+    /// `(type_token, property_tokens)` — the relationship analogue of
+    /// [`composite`](Self#structfield.composite). Kept in a **separate** map from the node composites (a
+    /// numeric collision between a label token and a relationship-type token never mixes the two),
+    /// exactly as `spatial_rel` / `fulltext_rel` are separate from their node maps. Each value is an
+    /// ephemeral [`CompositeIndex`] over the covered relationship-property tuple (rebuilt from the store
+    /// on open); only the *registration* is durable. A standalone composite relationship index is a pure
+    /// query accelerator (no uniqueness), maintained candidate-only by the relationship write path.
+    rel_composite: HashMap<(u32, Vec<u32>), CompositeIndex<Dev, Sink>>,
     /// Declared **low-cardinality Roaring-bitmap** indexes (`rmp` task #328), keyed by `(label_token,
     /// prop_key)`. Each value is an in-memory [`BitmapIndex`] (value → compressed node-id bitmap) over
     /// the covered low-cardinality column. Like every other backing structure it is **ephemeral**
@@ -351,6 +360,7 @@ impl IndexSet {
             text: HashMap::new(),
             constraints: HashMap::new(),
             composite: HashMap::new(),
+            rel_composite: HashMap::new(),
             bitmap: HashMap::new(),
             dirty_bitmap_nodes: HashMap::new(),
             // A fresh, empty index reflects committed state at the genesis timestamp: there is nothing
@@ -534,6 +544,102 @@ impl IndexSet {
         Some(idx.seek_eq(label_token, values).unwrap_or_default())
     }
 
+    // ---- Composite (multi-property) relationship indexes (`rmp` task #666) ------------------------
+    // Structural twins of the node composite methods above, keyed by `(type_token, property_tokens)`
+    // and kept in the separate `rel_composite` map. Same candidate-vs-answer contract (a seek returns a
+    // superset the caller re-checks against the store).
+
+    /// Declares a composite relationship index over `(type_token, property_tokens)` if absent
+    /// (`rmp` task #666). Idempotent on the key: a no-op if one is already registered (its entries are
+    /// kept). The backing [`CompositeIndex`] keys on the property tuple; the relationship composite seek
+    /// probes it.
+    ///
+    /// # Panics
+    /// Panics if `property_tokens` is empty (a composite relationship index covers at least one property
+    /// — the surface and the durable catalog both enforce this before reaching here).
+    pub fn register_rel_composite(&mut self, type_token: u32, property_tokens: Vec<u32>) {
+        assert!(
+            !property_tokens.is_empty(),
+            "composite relationship index needs at least one property"
+        );
+        let arity = property_tokens.len();
+        self.rel_composite
+            .entry((type_token, property_tokens))
+            .or_insert_with(|| CompositeIndex::new(fresh_tree(), arity));
+    }
+
+    /// Unregisters the composite relationship index over `(type_token, property_tokens)`, dropping its
+    /// backing tree (`rmp` task #666, `DROP INDEX`). A no-op if absent.
+    pub fn unregister_rel_composite(&mut self, type_token: u32, property_tokens: &[u32]) {
+        self.rel_composite
+            .remove(&(type_token, property_tokens.to_vec()));
+    }
+
+    /// Whether a composite relationship index is registered for `(type_token, property_tokens)`
+    /// (`rmp` task #666).
+    #[must_use]
+    pub fn has_rel_composite(&self, type_token: u32, property_tokens: &[u32]) -> bool {
+        self.rel_composite
+            .contains_key(&(type_token, property_tokens.to_vec()))
+    }
+
+    /// Whether **any** composite relationship index is registered (`rmp` task #666) — an O(1) gate the
+    /// per-write maintenance path checks before decoding a relationship's property chain, so a store
+    /// with no composite relationship index pays nothing for the maintenance hook.
+    #[must_use]
+    pub fn has_any_rel_composite(&self) -> bool {
+        !self.rel_composite.is_empty()
+    }
+
+    /// The registered composite relationship-index keys `(type_token, property_tokens)`, ascending and
+    /// de-duplicated (`rmp` task #666). Used by the coordinator's index rebuild to know which composite
+    /// tuples to (re)index for each relationship.
+    #[must_use]
+    pub fn registered_rel_composite(&self) -> Vec<(u32, Vec<u32>)> {
+        let mut keys: Vec<(u32, Vec<u32>)> = self.rel_composite.keys().cloned().collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// Records that relationship `rel_id` has the composite tuple `values` for the `(type_token,
+    /// property_tokens)` composite relationship index, if such an index is registered (else a no-op)
+    /// (`rmp` task #666). The whole tuple must be present and non-null — a relationship missing any
+    /// covered property is not indexed for that key (matching the node composite rule).
+    pub fn insert_rel_composite(
+        &mut self,
+        type_token: u32,
+        property_tokens: &[u32],
+        values: &[Value],
+        rel_id: u64,
+    ) {
+        if let Some(idx) = self
+            .rel_composite
+            .get_mut(&(type_token, property_tokens.to_vec()))
+        {
+            // The synthetic per-index token is `type_token` (the map key already partitions by the full
+            // tuple, so any fixed token is sufficient). An in-memory composite op cannot fail in
+            // practice; a failure leaves the entry absent (the caller re-checks via a scan fallback,
+            // degrading to correctness, never to a wrong answer).
+            let _ = idx.insert(EPHEMERAL_TXN, type_token, values, rel_id);
+        }
+    }
+
+    /// Candidate relationship ids whose composite tuple for `(type_token, property_tokens)` equals
+    /// `values`, ascending (`rmp` task #666). [`None`] if no such composite relationship index is
+    /// registered; otherwise a candidate set the caller re-checks (visibility, current type, current
+    /// tuple). `Some(vec![])` — "registered but no candidate" — is distinct from `None`.
+    pub fn seek_rel_composite_eq(
+        &mut self,
+        type_token: u32,
+        property_tokens: &[u32],
+        values: &[Value],
+    ) -> Option<Vec<u64>> {
+        let idx = self
+            .rel_composite
+            .get_mut(&(type_token, property_tokens.to_vec()))?;
+        Some(idx.seek_eq(type_token, values).unwrap_or_default())
+    }
+
     /// Unregisters the constraint named `name`, if registered (`rmp` task #99, `DROP CONSTRAINT`). A
     /// no-op if absent. After this the rule is no longer enforced by the write path. The backing
     /// node-property index of a uniqueness constraint is **not** dropped here — the coordinator owns
@@ -635,6 +741,12 @@ impl IndexSet {
         // Composite indexes (`rmp` task #100): recreate each backing tree to drop its entries while
         // keeping the registered `(label_token, property_tokens)` set, exactly like the property indexes.
         for (key, idx) in &mut self.composite {
+            *idx = CompositeIndex::new(fresh_tree(), key.1.len());
+        }
+        // Composite relationship indexes (`rmp` task #666): recreate each backing tree to drop its
+        // entries while keeping the registered `(type_token, property_tokens)` set, exactly like the
+        // node composite indexes above.
+        for (key, idx) in &mut self.rel_composite {
             *idx = CompositeIndex::new(fresh_tree(), key.1.len());
         }
         // Bitmap indexes (`rmp` task #328): drop the value→id bitmaps but keep the registered

@@ -1472,16 +1472,17 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             return; // standalone path: no derived index to maintain.
         };
         // O(1) gate: nothing to maintain unless at least one relationship-property OR relationship
-        // full-text OR relationship spatial index is declared.
-        let (has_rel_prop, has_rel_ft, has_rel_spatial) = {
+        // composite OR relationship full-text OR relationship spatial index is declared.
+        let (has_rel_prop, has_rel_composite, has_rel_ft, has_rel_spatial) = {
             let idx = index.borrow();
             (
                 idx.has_any_rel_property(),
+                idx.has_any_rel_composite(),
                 idx.has_any_fulltext_rel(),
                 idx.has_any_spatial_rel(),
             )
         };
-        if !has_rel_prop && !has_rel_ft && !has_rel_spatial {
+        if !has_rel_prop && !has_rel_composite && !has_rel_ft && !has_rel_spatial {
             return;
         }
         // The relationship's current type token (store borrow released before the index borrow).
@@ -1523,6 +1524,40 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             for (prop_key, value) in &resolved {
                 if index.has_rel_property(type_token, *prop_key) {
                     index.insert_rel_property(type_token, *prop_key, value, rel.0);
+                }
+            }
+        }
+        // Composite (multi-property) relationship indexes (`rmp` task #666) are maintained per-write the
+        // same candidate-only way as the node composite indexes (`reindex_node`): for every registered
+        // composite relationship index `(type_token, property tuple)`, if this relationship currently
+        // carries the covered type AND holds the whole tuple (every covered property present and
+        // non-null), the current tuple is **inserted**. Stale entries from a prior value are tolerated
+        // because the composite seek re-reads each candidate's *current* tuple — so an over-broad
+        // candidate set is always correct. A relationship missing a covered property is simply not
+        // indexed for that key.
+        if has_rel_composite {
+            for (reg_type, property_tokens) in index.registered_rel_composite() {
+                if reg_type != type_token {
+                    continue;
+                }
+                let mut tuple = Vec::with_capacity(property_tokens.len());
+                let mut complete = true;
+                for prop_key in &property_tokens {
+                    match resolved
+                        .iter()
+                        .find(|(k, _)| k == prop_key)
+                        .map(|(_, v)| v)
+                        .filter(|v| !v.is_null())
+                    {
+                        Some(v) => tuple.push(v.clone()),
+                        None => {
+                            complete = false;
+                            break;
+                        }
+                    }
+                }
+                if complete {
+                    index.insert_rel_composite(type_token, &property_tokens, &tuple, rel.0);
                 }
             }
         }
@@ -3543,6 +3578,68 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // `index_seek_eq`. `None` (no usable `Online` index) declines to the executor's scan fallback.
         let ids = self.rel_index_seek_eq(type_token, prop_key, rel_type, property, value)?;
         Some(ids.into_iter().map(RelId).collect())
+    }
+
+    fn index_seek_rel_composite_eq(
+        &self,
+        rel_type: &str,
+        properties: &[String],
+        values: &[Value],
+    ) -> Option<Vec<RelId>> {
+        // Only the coordinated path holds the derived `IndexSet` with the composite relationship index;
+        // otherwise the executor falls back to a typed relationship scan + residual equality on the full
+        // tuple (`rmp` task #666).
+        let index = self.index.as_ref()?;
+        // Resolve the type + every property-key token; a missing token means no composite index can
+        // cover this tuple, so decline (the executor's typed scan covers it).
+        let type_token = self.store.borrow().token_id(Namespace::RelType, rel_type)?;
+        let mut property_tokens = Vec::with_capacity(properties.len());
+        for property in properties {
+            property_tokens.push(self.store.borrow().token_id(Namespace::PropKey, property)?);
+        }
+        if !index
+            .borrow()
+            .has_rel_composite(type_token, &property_tokens)
+        {
+            return None; // no usable composite relationship index: scan fallback
+        }
+
+        // SSI predicate footprint: mirror the single-property relationship seek (`rel_index_seek_eq`,
+        // `rmp` #659). Register the coarse `PredicateRead::RelType` (which pairs with every relationship
+        // insert's `RelType(T)` write footprint) plus `mark_all_live_rels` — exactly the footprint the
+        // typed relationship-scan fallback this seek replaces would register. Conservative but never
+        // wrong; it only adds an rw-edge between concurrent same-type writers, as the scan already did.
+        self.note_predicate_read(PredicateRead::RelType(type_token));
+        self.mark_all_live_rels();
+
+        // Candidate ids whose composite tuple equals `values`. The index is candidate-only, so re-check
+        // the FULL predicate per candidate: visible + current type + the *current* per-property tuple
+        // equals `values` element-wise by Cypher equality (read each property via `rel_property`, which
+        // SIREAD-marks it, exactly as the single-property rel seek's re-check does).
+        let candidates = index
+            .borrow_mut()
+            .seek_rel_composite_eq(type_token, &property_tokens, values)
+            .unwrap_or_default();
+        let mut out: Vec<u64> = candidates
+            .into_iter()
+            .filter(|&id| {
+                let r = RelId(id);
+                match self.rel_data(r) {
+                    Some(data) if data.rel_type == rel_type => properties
+                        .iter()
+                        .zip(values.iter())
+                        .all(|(property, value)| {
+                            self.rel_property(r, property)
+                                .is_some_and(|v| crate::equality::equals(&v, value).is_true())
+                        }),
+                    _ => false,
+                }
+            })
+            .collect();
+        // De-duplicate: a stale + a live index entry can name the same id twice.
+        out.sort_unstable();
+        out.dedup();
+        Some(out.into_iter().map(RelId).collect())
     }
 
     fn index_seek_spatial(

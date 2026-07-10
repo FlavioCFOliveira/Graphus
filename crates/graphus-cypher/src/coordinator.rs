@@ -49,8 +49,8 @@ use graphus_index::histogram::PropertyHistogram;
 use graphus_io::BlockDevice;
 use graphus_storage::{
     CompositeIndexEntry, ConstraintEntry, ConstraintKind, ConstraintTypeDescriptor, FulltextEntity,
-    FulltextIndexEntry, GcPassReport, IndexState, Namespace, RecordStore, SpatialEntity,
-    SpatialIndexEntry, StoreReadView, TextIndexEntry, TokenSnapshot,
+    FulltextIndexEntry, GcPassReport, IndexState, Namespace, RecordStore, RelCompositeIndexEntry,
+    SpatialEntity, SpatialIndexEntry, StoreReadView, TextIndexEntry, TokenSnapshot,
 };
 use graphus_txn::{CommitRegistry, IsolationLevel, LockTable, Snapshot, SsiReadBuffer, SsiTracker};
 use graphus_wal::LogSink;
@@ -61,7 +61,8 @@ use crate::index_set::IndexSet;
 use crate::record_graph::RecordStoreGraph;
 use crate::schema_error::{
     constraint_name_in_use, equivalent_composite_index_exists, equivalent_constraint_exists,
-    equivalent_index_exists, equivalent_rel_index_exists, index_drop_not_found, index_name_in_use,
+    equivalent_index_exists, equivalent_rel_composite_index_exists, equivalent_rel_index_exists,
+    index_drop_not_found, index_name_in_use,
 };
 use crate::statistics::Statistics;
 
@@ -365,6 +366,8 @@ enum NameCatalog {
     Constraint,
     /// The composite (multi-property) node index catalog (`rmp` task #657).
     Composite,
+    /// The composite (multi-property) relationship index catalog (`rmp` task #666).
+    RelComposite,
     /// The text (trigram) node index catalog (`rmp` task #662).
     Text,
 }
@@ -394,6 +397,21 @@ pub fn auto_rel_index_name(rel_type: &str, property: &str) -> String {
         sanitize_identifier(rel_type),
         sanitize_identifier(property)
     )
+}
+
+/// A deterministic auto-name for the composite (multi-property) relationship index on
+/// `(rel_type, properties)` (`rmp` task #666) — the relationship analogue of
+/// [`auto_composite_index_name`]. The distinct `rel_index_` prefix keeps it from ever colliding with a
+/// node composite's auto-name over the same identifiers; each covered property is appended in declared
+/// order (`rel_index_<type>_<a>_<b>`), so the name is stable and reflects the covered tuple order.
+#[must_use]
+pub fn auto_rel_composite_index_name(rel_type: &str, properties: &[String]) -> String {
+    let mut name = format!("rel_index_{}", sanitize_identifier(rel_type));
+    for property in properties {
+        name.push('_');
+        name.push_str(&sanitize_identifier(property));
+    }
+    name
 }
 
 impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
@@ -838,6 +856,21 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             }
         }
 
+        // Register every durable **standalone composite relationship index** (`rmp` task #666) in the
+        // in-memory set, so the write path maintains it and the rebuild scan below repopulates its
+        // backing tree — the relationship analogue of the node composite registration above. It is
+        // recorded `Online` in the durable catalog (a synchronous build), so recovery repopulates a
+        // fully-online index. Keyed by `(type_token, property tuple)` in the separate `rel_composite`
+        // map (a numeric collision between a label token and a rel-type token never mixes the two).
+        let durable_rel_composites: Vec<(String, RelCompositeIndexEntry)> =
+            store.borrow().rel_composite_indexes();
+        {
+            let mut idx = index.borrow_mut();
+            for (_name, entry) in durable_rel_composites {
+                idx.register_rel_composite(entry.type_token, entry.property_tokens);
+            }
+        }
+
         // Register every durable **text (trigram) index** (`rmp` task #662) in the in-memory set, so the
         // write path maintains it and the rebuild scan below repopulates its trigram index. It is
         // recorded `Online` in the durable catalog (a synchronous build), so recovery repopulates a
@@ -917,13 +950,20 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // The registered relationship spatial index keys `(type_token, prop_key)` (`rmp` task #664),
         // captured before the scan so the index is not borrowed across a store borrow.
         let registered_rel_spatial: Vec<(u32, u32)> = index.borrow().registered_spatial_rel();
+        // The registered composite relationship index keys `(type_token, property tuple)` (`rmp` task
+        // #666), captured before the scan like the others.
+        let registered_rel_composite: Vec<(u32, Vec<u32>)> =
+            index.borrow().registered_rel_composite();
         // A store-read fault enumerating the relationships leaves the rel indexes empty-but-`Online`.
         // This matches the certified node-property rebuild's trust-once-selected behaviour: storage
         // faults in Graphus are persistent (checksum / torn page), and both the index seek and the scan
         // fallback read the SAME store, so they fault identically — an empty index never diverges from a
         // scan in practice. (A whole-scan fault here is also the same failure the very next query would
         // hit.) Per-relationship read faults inside `index_one_rel*` skip that relationship best-effort.
-        if (!registered_rel.is_empty() || has_rel_fulltext || !registered_rel_spatial.is_empty())
+        if (!registered_rel.is_empty()
+            || has_rel_fulltext
+            || !registered_rel_spatial.is_empty()
+            || !registered_rel_composite.is_empty())
             && let Ok(rel_ids) = store.borrow().scan_rel_ids()
         {
             for id in rel_ids {
@@ -939,6 +979,11 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 // declared.
                 if !registered_rel_spatial.is_empty() {
                     Self::index_one_rel_spatial(store, index, id, &registered_rel_spatial);
+                }
+                // Repopulate the composite relationship indexes (`rmp` task #666), only when at least one
+                // is declared.
+                if !registered_rel_composite.is_empty() {
+                    Self::index_one_rel_composite(store, index, id, &registered_rel_composite);
                 }
             }
         }
@@ -964,6 +1009,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             || store.spatial_index(name).is_some()
             || store.constraint(name).is_some()
             || store.composite_index(name).is_some()
+            || store.rel_composite_index(name).is_some()
             || store.text_index(name).is_some()
     }
 
@@ -977,6 +1023,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             || (own != NameCatalog::Spatial && store.spatial_index(name).is_some())
             || (own != NameCatalog::Constraint && store.constraint(name).is_some())
             || (own != NameCatalog::Composite && store.composite_index(name).is_some())
+            || (own != NameCatalog::RelComposite && store.rel_composite_index(name).is_some())
             || (own != NameCatalog::Text && store.text_index(name).is_some())
     }
 
@@ -1255,6 +1302,76 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let mut index = index.borrow_mut();
         for (prop_key, value) in &values {
             index.insert_rel_property(type_token, *prop_key, value, id);
+        }
+    }
+
+    /// Inserts relationship `id`'s current composite tuple into every registered composite relationship
+    /// index whose covered type it carries (`rmp` task #666) — the relationship analogue of
+    /// [`index_one_node_composite`](Self::index_one_node_composite). Candidate-only: only the current
+    /// tuple is inserted (a seek re-checks visibility, current type and current tuple), so no stale-entry
+    /// removal is needed. Store and index are borrowed in separate, non-overlapping scopes; a read fault
+    /// skips this relationship best-effort. A relationship missing a covered property (an incomplete
+    /// tuple) is left unindexed for that key.
+    fn index_one_rel_composite(
+        store: &Rc<RefCell<RecordStore<D, S>>>,
+        index: &Rc<RefCell<IndexSet>>,
+        id: u64,
+        registered: &[(u32, Vec<u32>)],
+    ) {
+        // The relationship's current type token (store borrow released before the index borrow).
+        let type_token = match store.borrow().rel(id) {
+            Ok(r) => r.type_id,
+            Err(_) => return, // read fault: skip this relationship's entries.
+        };
+        // Nothing registered for this type ⇒ nothing to index (avoid the property-chain decode).
+        if !registered
+            .iter()
+            .any(|(reg_type, _)| *reg_type == type_token)
+        {
+            return;
+        }
+        // Resolve the relationship's current property values (newest-wins per key).
+        let props: Vec<(u32, Value)> = {
+            let chain = match store.borrow().rel_property_values(id) {
+                Ok(chain) => chain,
+                Err(_) => return, // a non-storable / read fault: skip this relationship's properties.
+            };
+            let mut out: Vec<(u32, Value)> = Vec::new();
+            for (_pid, key, value) in chain {
+                if out.iter().any(|(k, _)| *k == key) {
+                    continue; // newest-wins: keep only the first (head-most) occurrence per key.
+                }
+                out.push((key, value));
+            }
+            out
+        };
+
+        let mut idx = index.borrow_mut();
+        for (reg_type, property_tokens) in registered {
+            if *reg_type != type_token {
+                continue; // relationship does not carry this composite index's type
+            }
+            // Build the tuple newest-wins; bail on the first absent/null covered property (the tuple is
+            // incomplete, so the relationship is left unindexed for this key).
+            let mut tuple = Vec::with_capacity(property_tokens.len());
+            let mut complete = true;
+            for prop_key in property_tokens {
+                match props
+                    .iter()
+                    .find(|(k, _)| k == prop_key)
+                    .map(|(_, v)| v)
+                    .filter(|v| !v.is_null())
+                {
+                    Some(v) => tuple.push(v.clone()),
+                    None => {
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+            if complete {
+                idx.insert_rel_composite(type_token, property_tokens, &tuple, id);
+            }
         }
     }
 
@@ -1887,6 +2004,16 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             self.remove_composite_index_committed(name, entry.label_token, &entry.property_tokens)?;
             return Ok(true);
         }
+        // A standalone composite relationship index of that name (`rmp` task #666)?
+        let rel_composite = self.store.borrow().rel_composite_index(name);
+        if let Some(entry) = rel_composite {
+            self.remove_rel_composite_index_committed(
+                name,
+                entry.type_token,
+                &entry.property_tokens,
+            )?;
+            return Ok(true);
+        }
         // A full-text index of that name (`rmp` task #661)? The name is known-present here, so the
         // delegate removes it and returns `Ok(true)`.
         if self.store.borrow().fulltext_index(name).is_some() {
@@ -1990,6 +2117,80 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     properties.push(store.token_name(Namespace::PropKey, *pk)?.to_owned());
                 }
                 Some((name, label.to_owned(), properties, entry.state))
+            })
+            .collect()
+    }
+
+    /// Drops the **standalone composite relationship** index over `(rel_type, properties)` — the
+    /// by-target `DROP INDEX FOR ()-[r:T]-() ON (r.a, r.b)` shape (`rmp` task #666). Resolves the covered
+    /// composite by its relationship type + ordered property tuple; a missing target is a clean no-op
+    /// success. Returns whether an index was actually removed.
+    ///
+    /// # Errors
+    /// Returns a storage error if the committing transaction fails.
+    pub fn drop_rel_composite_index(
+        &mut self,
+        rel_type: &str,
+        properties: &[String],
+    ) -> Result<bool> {
+        let resolved = {
+            let store = self.store.borrow();
+            match Self::resolve_rel_property_tokens(&store, rel_type, properties) {
+                Some((type_token, property_tokens)) => store
+                    .rel_composite_index_name_for(type_token, &property_tokens)
+                    .map(|name| (name.to_owned(), type_token, property_tokens)),
+                None => None,
+            }
+        };
+        let Some((name, type_token, property_tokens)) = resolved else {
+            return Ok(false); // no such composite relationship index → clean no-op.
+        };
+        self.remove_rel_composite_index_committed(&name, type_token, &property_tokens)?;
+        Ok(true)
+    }
+
+    /// Removes the durable composite relationship index catalog entry named `name` in one committed
+    /// transaction and unregisters its in-memory backing tree (`rmp` task #666). Unlike the node
+    /// composite (which may share its tree with a node-key constraint), a composite relationship index
+    /// backs no constraint (a relationship-key constraint stays scan-based), so its tree is always
+    /// unregistered.
+    ///
+    /// # Errors
+    /// Returns a storage error if the committing transaction fails.
+    fn remove_rel_composite_index_committed(
+        &mut self,
+        name: &str,
+        type_token: u32,
+        property_tokens: &[u32],
+    ) -> Result<()> {
+        self.next_txn_id += 1;
+        let txn = TxnId(self.next_txn_id);
+        self.store.borrow_mut().begin(txn);
+        self.store.borrow_mut().remove_rel_composite_index(name);
+        self.store.borrow_mut().commit(txn)?;
+        self.index
+            .borrow_mut()
+            .unregister_rel_composite(type_token, property_tokens);
+        Ok(())
+    }
+
+    /// Lists every declared standalone composite relationship index as `(name, rel_type, properties,
+    /// state)` (`rmp` task #666), for a `SHOW INDEXES` surface — the relationship analogue of
+    /// [`list_composite_indexes`](Self::list_composite_indexes). An entry whose tokens have no resolvable
+    /// name is omitted. Ordered by the catalog's ascending name.
+    #[must_use]
+    pub fn list_rel_composite_indexes(&self) -> Vec<(String, String, Vec<String>, IndexState)> {
+        let store = self.store.borrow();
+        store
+            .rel_composite_indexes()
+            .into_iter()
+            .filter_map(|(name, entry)| {
+                let rel_type = store.token_name(Namespace::RelType, entry.type_token)?;
+                let mut properties = Vec::with_capacity(entry.property_tokens.len());
+                for pk in &entry.property_tokens {
+                    properties.push(store.token_name(Namespace::PropKey, *pk)?.to_owned());
+                }
+                Some((name, rel_type.to_owned(), properties, entry.state))
             })
             .collect()
     }
@@ -2857,6 +3058,198 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             return base;
         }
         let mut suffixed = format!("{base}_{label_token}");
+        for t in property_tokens {
+            suffixed.push('_');
+            suffixed.push_str(&t.to_string());
+        }
+        if !Self::name_in_use(store, &suffixed) {
+            return suffixed;
+        }
+        let mut n: u64 = 2;
+        loop {
+            let candidate = format!("{suffixed}_{n}");
+            if !Self::name_in_use(store, &candidate) {
+                return candidate;
+            }
+            n += 1;
+        }
+    }
+
+    /// Declares a relationship index over `(rel_type, properties)` — a **single-property** RANGE index
+    /// when `properties` has arity 1, or a **composite** (multi-property) RANGE index when arity ≥ 2
+    /// (`rmp` task #666) — the relationship analogue of
+    /// [`begin_online_node_composite_index_named`](Self::begin_online_node_composite_index_named).
+    ///
+    /// This is the single server entry point behind `CREATE INDEX FOR ()-[r:T]-() ON (r.a[, r.b, …])`:
+    ///
+    /// - **arity 1** delegates verbatim to
+    ///   [`create_rel_property_index_named`](Self::create_rel_property_index_named), so the
+    ///   single-property relationship path is untouched — nothing regresses;
+    /// - **arity ≥ 2** declares a **standalone** composite relationship index (no uniqueness). The
+    ///   relationship-type + property-key tokens are interned **durably** and the named catalog entry is
+    ///   recorded [`IndexState::Online`] in one committed transaction (so the *registration* survives a
+    ///   crash), then the index is registered in the in-memory [`IndexSet`] and **synchronously built**
+    ///   from the current relationships. The synchronous build is crash-safe: the backing tree is
+    ///   ephemeral and rebuilt from the durable catalog + store on open, so recovery never observes a
+    ///   half-built index.
+    ///
+    /// The composite key **order is significant** (`(a, b)` differs from `(b, a)`). Returns whether the
+    /// index was **actually created** (`true`) or the call was an idempotent no-op (`false`).
+    ///
+    /// # Errors
+    /// - `Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists` (no `IF NOT EXISTS`) when an
+    ///   equivalent composite relationship index on `(rel_type, ordered tuple)` already exists;
+    /// - `Neo.ClientError.Schema.IndexWithNameAlreadyExists` (no `IF NOT EXISTS`) when `name` is already
+    ///   taken by another schema rule;
+    /// - a storage error if interning a token, recording the catalog entry, committing, or the build
+    ///   scan fails. On any error the index is left undeclared.
+    ///
+    /// # Panics
+    /// Panics if `properties` is empty (the parser guarantees at least one property).
+    pub fn begin_online_rel_composite_index_named(
+        &mut self,
+        name: Option<&str>,
+        rel_type: &str,
+        properties: &[String],
+        if_not_exists: bool,
+    ) -> Result<bool> {
+        assert!(
+            !properties.is_empty(),
+            "a relationship index covers at least one property"
+        );
+        // Arity 1: keep the single-property relationship path (no regression).
+        if let [property] = properties {
+            return self.create_rel_property_index_named(name, rel_type, property, if_not_exists);
+        }
+
+        // ---- Arity ≥ 2: a standalone composite relationship index (`rmp` task #666) ------------------
+
+        // 1. Equivalent-index check (read-only, by token *lookup* — an absent token means no index can
+        //    cover this tuple, so no equivalent exists).
+        let equivalent_exists = {
+            let store = self.store.borrow();
+            match Self::resolve_rel_property_tokens(&store, rel_type, properties) {
+                Some((type_token, property_tokens)) => store
+                    .rel_composite_index_name_for(type_token, &property_tokens)
+                    .is_some(),
+                None => false,
+            }
+        };
+        if equivalent_exists {
+            return if if_not_exists {
+                Ok(false) // idempotent no-op: nothing was added.
+            } else {
+                Err(equivalent_rel_composite_index_exists(rel_type, properties))
+            };
+        }
+
+        // 2. Explicit-name global uniqueness (read-only). An omitted name is auto-generated in step 3.
+        if let Some(n) = name
+            && Self::name_in_use(&self.store.borrow(), n)
+        {
+            return if if_not_exists {
+                Ok(false)
+            } else {
+                Err(index_name_in_use(n))
+            };
+        }
+
+        // 3. Intern the tokens and record the durable catalog entry (`Online`) in one committed
+        //    transaction — so the schema change survives a crash atomically.
+        self.next_txn_id += 1;
+        let txn = TxnId(self.next_txn_id);
+        self.store.borrow_mut().begin(txn);
+        let (type_token, property_tokens, effective_name) = {
+            let mut store = self.store.borrow_mut();
+            let type_token = match store.intern_token(Namespace::RelType, rel_type) {
+                Ok(t) => t,
+                Err(e) => {
+                    drop(store);
+                    let _ = self.store.borrow_mut().rollback(txn);
+                    return Err(e);
+                }
+            };
+            let mut property_tokens = Vec::with_capacity(properties.len());
+            for property in properties {
+                match store.intern_token(Namespace::PropKey, property) {
+                    Ok(t) => property_tokens.push(t),
+                    Err(e) => {
+                        drop(store);
+                        let _ = self.store.borrow_mut().rollback(txn);
+                        return Err(e);
+                    }
+                }
+            }
+            let effective_name = match name {
+                Some(n) => n.to_owned(),
+                None => Self::unique_auto_rel_composite_index_name(
+                    &store,
+                    rel_type,
+                    properties,
+                    type_token,
+                    &property_tokens,
+                ),
+            };
+            store.set_rel_composite_index(
+                effective_name.clone(),
+                RelCompositeIndexEntry {
+                    type_token,
+                    property_tokens: property_tokens.clone(),
+                    state: IndexState::Online,
+                },
+            );
+            (type_token, property_tokens, effective_name)
+        };
+        let _ = effective_name; // recorded durably above; the in-memory tree is keyed by target, not name.
+        self.store.borrow_mut().commit(txn)?;
+
+        // Register the composite in the in-memory set so concurrent writes maintain it, then synchronously
+        // index the existing relationships into its backing tree. The tree is ephemeral (rebuilt on open),
+        // so this synchronous fill has no durability surface — a crash recovers the `Online` registration
+        // and the open-time rebuild repopulates the tree store-consistently.
+        self.index
+            .borrow_mut()
+            .register_rel_composite(type_token, property_tokens.clone());
+        let rel_ids = self.store.borrow().scan_rel_ids()?;
+        let registered = vec![(type_token, property_tokens)];
+        for id in rel_ids {
+            Self::index_one_rel_composite(&self.store, &self.index, id, &registered);
+        }
+        Ok(true) // the index was created.
+    }
+
+    /// Resolves `(rel_type, properties)` to `(type_token, property_tokens)` by **token lookup** (never
+    /// interning) (`rmp` task #666) — the relationship analogue of
+    /// [`resolve_property_tokens`](Self::resolve_property_tokens). Returns [`None`] if the relationship
+    /// type or **any** property key has no interned token — meaning no index can cover this tuple.
+    fn resolve_rel_property_tokens(
+        store: &RecordStore<D, S>,
+        rel_type: &str,
+        properties: &[String],
+    ) -> Option<(u32, Vec<u32>)> {
+        let type_token = store.token_id(Namespace::RelType, rel_type)?;
+        let mut property_tokens = Vec::with_capacity(properties.len());
+        for property in properties {
+            property_tokens.push(store.token_id(Namespace::PropKey, property)?);
+        }
+        Some((type_token, property_tokens))
+    }
+
+    /// A globally-unique, deterministic auto-name for the composite relationship index on
+    /// `(rel_type, properties)` (`rmp` task #666) — the relationship analogue of
+    /// [`unique_auto_composite_index_name`](Self::unique_auto_composite_index_name).
+    fn unique_auto_rel_composite_index_name(
+        store: &RecordStore<D, S>,
+        rel_type: &str,
+        properties: &[String],
+        type_token: u32,
+        property_tokens: &[u32],
+    ) -> String {
+        let base = auto_rel_composite_index_name(rel_type, properties);
+        if !Self::name_in_use(store, &base) {
+            return base;
+        }
+        let mut suffixed = format!("{base}_{type_token}");
         for t in property_tokens {
             suffixed.push('_');
             suffixed.push_str(&t.to_string());
@@ -4929,6 +5322,34 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 continue;
             };
             builder = builder.with_rel_spatial(rel_type, property);
+        }
+        // Standalone composite (multi-property) relationship indexes (`rmp` task #666): surface every
+        // **`Online`** one so the physical planner can consume a leading run of equality conjuncts on a
+        // relationship variable into one `RelCompositeIndexSeek` (or serve its leading key as a
+        // single-key `RelIndexSeek`). Read from the **durable** catalog filtered to `Online`, exactly
+        // like the node composite surface above; the backing tree exists in the in-memory `rel_composite`
+        // map (registered on open / create), so the seek the planner emits always finds it.
+        for (_name, entry) in store.rel_composite_indexes() {
+            if entry.state != IndexState::Online {
+                continue;
+            }
+            let Some(rel_type) = store.token_name(Namespace::RelType, entry.type_token) else {
+                continue;
+            };
+            let mut properties = Vec::with_capacity(entry.property_tokens.len());
+            let mut resolvable = true;
+            for pk in &entry.property_tokens {
+                match store.token_name(Namespace::PropKey, *pk) {
+                    Some(p) => properties.push(p.to_owned()),
+                    None => {
+                        resolvable = false;
+                        break;
+                    }
+                }
+            }
+            if resolvable {
+                builder = builder.with_rel_composite(rel_type, properties);
+            }
         }
         builder.build()
     }

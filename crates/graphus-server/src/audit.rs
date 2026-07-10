@@ -1262,19 +1262,32 @@ pub fn redact_index_detail(cmd: &crate::engine::IndexCommand) -> String {
         I::CreateRelPropertyIndex {
             name,
             rel_type,
-            property,
+            properties,
             if_not_exists,
         } => {
             let named = name.as_deref().map(|n| format!("{n} ")).unwrap_or_default();
             let if_ne = if *if_not_exists { " IF NOT EXISTS" } else { "" };
-            format!("CREATE INDEX {named}FOR ()-[r:{rel_type}]-() ON (r.{property}){if_ne}")
+            let props = properties
+                .iter()
+                .map(|p| format!("r.{p}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("CREATE INDEX {named}FOR ()-[r:{rel_type}]-() ON ({props}){if_ne}")
         }
         I::DropRelPropertyIndex { index, if_exists } => {
             let if_e = if *if_exists { " IF EXISTS" } else { "" };
             match index {
                 RelRef::Named(name) => format!("DROP INDEX {name}{if_e}"),
-                RelRef::Target { rel_type, property } => {
-                    format!("DROP INDEX FOR ()-[r:{rel_type}]-() ON (r.{property})")
+                RelRef::Target {
+                    rel_type,
+                    properties,
+                } => {
+                    let props = properties
+                        .iter()
+                        .map(|p| format!("r.{p}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("DROP INDEX FOR ()-[r:{rel_type}]-() ON ({props})")
                 }
             }
         }

@@ -110,6 +110,26 @@ pub fn equivalent_composite_index_exists(label: &str, properties: &[String]) -> 
     .into_error()
 }
 
+/// A `CREATE INDEX FOR ()-[r:T]-() ON (r.a, r.b, …)` whose covered `(type, ordered property tuple)` is
+/// already indexed by an equivalent composite relationship index
+/// (`Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists`) (`rmp` task #666). The relationship
+/// analogue of [`equivalent_composite_index_exists`]; the property order is significant.
+#[must_use]
+pub fn equivalent_rel_composite_index_exists(
+    rel_type: &str,
+    properties: &[String],
+) -> GraphusError {
+    SchemaRuleError {
+        code: CODE_EQUIVALENT_EXISTS,
+        message: format!(
+            "An equivalent index already exists for ()-[:{rel_type} {{{}}}]-(). \
+             Use `IF NOT EXISTS` to make the create idempotent.",
+            properties.join(", ")
+        ),
+    }
+    .into_error()
+}
+
 /// A `CREATE INDEX <name>` whose `name` is already used by another index or constraint
 /// (`Neo.ClientError.Schema.IndexWithNameAlreadyExists`). Index/constraint names are unique across
 /// every schema catalog (`rmp` task #624).

@@ -494,6 +494,21 @@ CREATE TEXT  INDEX         FOR (p:Person) ON (p.bio)                  -- anonymo
 DROP   TEXT  INDEX ix_name IF EXISTS
 ```
 
+A `RANGE` index may cover **one** property or a **composite** ordered tuple of two or more, over **nodes**
+(`FOR (n:L) ON (n.a, n.b)`) or **relationships** (`FOR ()-[r:T]-() ON (r.a, r.b)`, undirected only). A
+`MATCH` whose inline map / `WHERE` supplies an equality on every covered key seeks the composite in **one**
+seek (over the full ordered tuple) instead of a single-key seek + residual filter; a predicate on only the
+leading key uses the composite as a leading-prefix seek. The key order is significant — `(a, b)` and
+`(b, a)` are distinct indexes.
+
+```cypher
+CREATE INDEX ix_pn  FOR (p:Person)      ON (p.first, p.last)   -- composite node index
+CREATE INDEX ix_ks  FOR ()-[r:KNOWS]-() ON (r.since)           -- single-property relationship index
+CREATE INDEX ix_kab FOR ()-[r:KNOWS]-() ON (r.a, r.b)          -- composite relationship index (rmp #666)
+MATCH (p:Person {first: 'Ada', last: 'Lovelace'}) RETURN p     -- one composite node seek
+MATCH ()-[r:KNOWS {a: 1, b: 2}]-() RETURN r                    -- one composite relationship seek
+```
+
 With that index in place, a substring or suffix filter is index-served instead of a full label scan:
 
 ```cypher
@@ -629,7 +644,7 @@ message). They are documented here so expectations are exact.
 | **GDS path-algorithm write** — `gds.dijkstra.write`, `gds.bellmanFord.write` | Deferred. The path algorithms are **stream-only** today (`gds.dijkstra.stream` works). Node-property algorithms support `.stats`/`.mutate`/`.write`. |
 | **Database aliases** — `CREATE ALIAS … FOR DATABASE …` | Not supported (syntax error). |
 | **`ALTER USER … SET HOME DATABASE`** and `CHANGE [NOT] REQUIRED` | Not supported — `SET PASSWORD` and `SET STATUS` are (see below). |
-| **Relationship property index — range / composite seek** | An **equality** relationship predicate now uses the index as a **planner seek**: a standalone `MATCH ()-[r:T {p: v}]-()` (or `MATCH ()-[r:T]-() WHERE r.p = v`) seeks the relationship-property index instead of scanning every `:T` relationship and filtering (`rmp` #659). A **range** (`r.p > v`) or **composite** (`{a: …, b: …}`) relationship predicate still scans + filters — those relationship seeks are deferred (composite is `rmp` #666). A variable-length (`-[r:T*]-`), multi-type (`-[r:T1|T2]-`) or `OPTIONAL MATCH` pattern also stays a scan by design. |
+| **Relationship property index — range seek** | An **equality** relationship predicate uses the index as a **planner seek**: a standalone `MATCH ()-[r:T {p: v}]-()` (or `MATCH ()-[r:T]-() WHERE r.p = v`) seeks the single-property relationship index (`rmp` #659), and a **composite** predicate `MATCH ()-[r:T {a: …, b: …}]-()` seeks a composite relationship index over the full ordered tuple in **one** `RelCompositeIndexSeek` (`rmp` #666). A **range** (`r.p > v`) relationship predicate still scans + filters — that relationship seek is deferred. A variable-length (`-[r:T*]-`), multi-type (`-[r:T1|T2]-`) or `OPTIONAL MATCH` pattern also stays a scan by design. |
 | **`LOOKUP` index DDL** | Declined by design — label/type lookup indexes are implicit and always-on (see above). |
 
 ---

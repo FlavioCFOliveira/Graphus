@@ -2560,6 +2560,7 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
                 node_property: coordinator.list_node_property_indexes(),
                 composite: coordinator.list_composite_indexes(),
                 rel_property: coordinator.list_rel_property_indexes(),
+                rel_composite: coordinator.list_rel_composite_indexes(),
                 fulltext: coordinator.list_fulltext_indexes(),
                 point: coordinator.list_point_indexes(),
                 point_rel: coordinator.list_point_rel_indexes(),
@@ -2579,14 +2580,16 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
         IndexCommand::CreateRelPropertyIndex {
             name,
             rel_type,
-            property,
+            properties,
             if_not_exists,
         } => {
-            // `mutated == false` is an idempotent `IF NOT EXISTS` no-op → the seam reports 0 added.
-            let mutated = coordinator.create_rel_property_index_named(
+            // `mutated == false` is an idempotent `IF NOT EXISTS` no-op → the seam reports 0 added. The
+            // coordinator entry point delegates arity-1 to the single-property relationship path and
+            // builds a standalone composite relationship index for arity ≥ 2 (`rmp` task #666).
+            let mutated = coordinator.begin_online_rel_composite_index_named(
                 name.as_deref(),
                 rel_type,
-                property,
+                properties,
                 *if_not_exists,
             )?;
             Ok(IndexDdlReply::mutation(mutated))
@@ -2597,10 +2600,16 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
                 RelPropertyIndexRef::Named(name) => {
                     coordinator.drop_rel_property_index_by_name(name, *if_exists)?
                 }
-                // The by-target form is already idempotent (a no-op success on a missing target).
-                RelPropertyIndexRef::Target { rel_type, property } => {
-                    coordinator.drop_rel_property_index(rel_type, property)?
-                }
+                // The by-target form is already idempotent (a no-op success on a missing target). A
+                // single-property tuple drops the single-property relationship index; a multi-property
+                // tuple drops the composite relationship index (`rmp` task #666).
+                RelPropertyIndexRef::Target {
+                    rel_type,
+                    properties,
+                } => match properties.as_slice() {
+                    [property] => coordinator.drop_rel_property_index(rel_type, property)?,
+                    _ => coordinator.drop_rel_composite_index(rel_type, properties)?,
+                },
             };
             Ok(IndexDdlReply::mutation(mutated))
         }

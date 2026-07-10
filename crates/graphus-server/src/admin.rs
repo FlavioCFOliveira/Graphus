@@ -1073,13 +1073,14 @@ enum IndexTarget {
         /// The covered property keys, in declared order (one or more).
         properties: Vec<String>,
     },
-    /// A relationship-property index target `(rel_type, property)` (`rmp` task #646). Single-property
-    /// only — a composite relationship index is not yet supported and is declined at parse time.
+    /// A relationship-property index target `(rel_type, properties)` (`rmp` tasks #646 / #666) — one
+    /// property for a single-property RANGE index, two or more for a composite (multi-property) RANGE
+    /// index. The property order is significant for a composite.
     Rel {
         /// The covered relationship type.
         rel_type: String,
-        /// The covered property key.
-        property: String,
+        /// The covered property keys, in declared order (one or more).
+        properties: Vec<String>,
     },
 }
 
@@ -1102,10 +1103,13 @@ fn parse_create_index(lex: &mut Lexer<'_>) -> Result<IndexCommand, String> {
             properties,
             if_not_exists,
         }),
-        IndexTarget::Rel { rel_type, property } => Ok(IndexCommand::CreateRelPropertyIndex {
+        IndexTarget::Rel {
+            rel_type,
+            properties,
+        } => Ok(IndexCommand::CreateRelPropertyIndex {
             name,
             rel_type,
-            property,
+            properties,
             if_not_exists,
         }),
     }
@@ -1135,8 +1139,14 @@ fn parse_drop_index(lex: &mut Lexer<'_>) -> Result<IndexCommand, String> {
                 index: NodePropertyIndexRef::Target { label, properties },
                 if_exists: false,
             }),
-            IndexTarget::Rel { rel_type, property } => Ok(IndexCommand::DropRelPropertyIndex {
-                index: RelPropertyIndexRef::Target { rel_type, property },
+            IndexTarget::Rel {
+                rel_type,
+                properties,
+            } => Ok(IndexCommand::DropRelPropertyIndex {
+                index: RelPropertyIndexRef::Target {
+                    rel_type,
+                    properties,
+                },
                 if_exists: false,
             }),
         };
@@ -1240,14 +1250,13 @@ fn parse_index_for_on(verb: &str, lex: &mut Lexer<'_>) -> Result<IndexTarget, St
         expect_symbol(lex, ')', verb)?;
         // The optional trailing `OPTIONS { … }` and end-of-statement are validated by the caller
         // (`parse_create_index` / `parse_drop_index`), so this leaf can serve both verbs (`rmp` #661).
-        // A composite relationship index needs a durable relationship-composite backing store, which is
-        // not yet implemented (`rmp` task #657, coordinator deferral): decline it with a specific error
-        // rather than silently build the wrong thing (a single-property rel index over the first key).
-        let [property] = <[String; 1]>::try_from(properties).map_err(|_| {
-            "composite relationship indexes are not yet supported (FOR ()-[r:T]-() ON (r.a, r.b))"
-                .to_owned()
-        })?;
-        return Ok(IndexTarget::Rel { rel_type, property });
+        // One property is a single-property RANGE index; two or more a composite (multi-property) RANGE
+        // index over the ordered relationship-property tuple (`rmp` task #666, the durable rel-composite
+        // backing store deferred by `rmp` #657 now exists).
+        return Ok(IndexTarget::Rel {
+            rel_type,
+            properties,
+        });
     }
     // FOR ( <var> : <Label> )
     let _var = expect_word(lex, "a variable", verb)?;
@@ -5191,22 +5200,57 @@ mod tests {
     }
 
     #[test]
-    fn composite_relationship_index_is_declined() {
-        // A relationship composite `ON (r.a, r.b)` is declined with a specific message (`rmp` task #657):
-        // the durable relationship-composite backing store is deferred.
-        let msg = invalid("CREATE INDEX FOR ()-[r:KNOWS]-() ON (r.a, r.b)");
-        assert!(
-            msg.contains("composite relationship indexes are not yet supported"),
-            "{msg}"
+    fn composite_relationship_index_parses_property_tuple() {
+        // A relationship composite `ON (r.a, r.b)` now parses to a multi-element `properties` list in
+        // declared order (`rmp` task #666); the durable relationship-composite backing store exists.
+        assert_eq!(
+            index_cmd("CREATE INDEX FOR ()-[r:KNOWS]-() ON (r.a, r.b)"),
+            IndexCommand::CreateRelPropertyIndex {
+                name: None,
+                rel_type: "KNOWS".to_owned(),
+                properties: vec!["a".to_owned(), "b".to_owned()],
+                if_not_exists: false,
+            }
         );
-        // A single-property relationship index still parses (unchanged).
+        // Named + IF NOT EXISTS composite, three keys, backtick-quoted names, RANGE synonym.
+        assert_eq!(
+            index_cmd(
+                "CREATE RANGE INDEX ix IF NOT EXISTS FOR ()-[r:`R-T`]-() ON (r.a, r.`b.c`, r.d)"
+            ),
+            IndexCommand::CreateRelPropertyIndex {
+                name: Some("ix".to_owned()),
+                rel_type: "R-T".to_owned(),
+                properties: vec!["a".to_owned(), "b.c".to_owned(), "d".to_owned()],
+                if_not_exists: true,
+            }
+        );
+        // Order is significant: (a, b) parses distinctly from (b, a).
+        assert_ne!(
+            index_cmd("CREATE INDEX FOR ()-[r:KNOWS]-() ON (r.a, r.b)"),
+            index_cmd("CREATE INDEX FOR ()-[r:KNOWS]-() ON (r.b, r.a)")
+        );
+        // A duplicate property in the tuple is rejected with a clear message.
+        let dup = invalid("CREATE INDEX FOR ()-[r:KNOWS]-() ON (r.a, r.a)");
+        assert!(dup.contains("duplicate property"), "{dup}");
+        // A single-property relationship index still parses to a 1-element list (unchanged).
         assert_eq!(
             index_cmd("CREATE INDEX FOR ()-[r:KNOWS]-() ON (r.since)"),
             IndexCommand::CreateRelPropertyIndex {
                 name: None,
                 rel_type: "KNOWS".to_owned(),
-                property: "since".to_owned(),
+                properties: vec!["since".to_owned()],
                 if_not_exists: false,
+            }
+        );
+        // The by-target DROP of a composite relationship index carries the ordered property tuple.
+        assert_eq!(
+            index_cmd("DROP INDEX FOR ()-[r:KNOWS]-() ON (r.a, r.b)"),
+            IndexCommand::DropRelPropertyIndex {
+                index: RelPropertyIndexRef::Target {
+                    rel_type: "KNOWS".to_owned(),
+                    properties: vec!["a".to_owned(), "b".to_owned()],
+                },
+                if_exists: false,
             }
         );
     }
@@ -5353,7 +5397,7 @@ mod tests {
             IndexCommand::CreateRelPropertyIndex {
                 name: None,
                 rel_type: "KNOWS".to_owned(),
-                property: "since".to_owned(),
+                properties: vec!["since".to_owned()],
                 if_not_exists: false,
             }
         );
@@ -5363,7 +5407,7 @@ mod tests {
             IndexCommand::CreateRelPropertyIndex {
                 name: Some("rel_ix".to_owned()),
                 rel_type: "RATED".to_owned(),
-                property: "stars".to_owned(),
+                properties: vec!["stars".to_owned()],
                 if_not_exists: true,
             }
         );
@@ -5373,7 +5417,7 @@ mod tests {
             IndexCommand::CreateRelPropertyIndex {
                 name: Some("ix".to_owned()),
                 rel_type: "KNOWS".to_owned(),
-                property: "since".to_owned(),
+                properties: vec!["since".to_owned()],
                 if_not_exists: false,
             }
         );
@@ -5386,7 +5430,7 @@ mod tests {
             IndexCommand::DropRelPropertyIndex {
                 index: RelPropertyIndexRef::Target {
                     rel_type: "KNOWS".to_owned(),
-                    property: "since".to_owned(),
+                    properties: vec!["since".to_owned()],
                 },
                 if_exists: false,
             }

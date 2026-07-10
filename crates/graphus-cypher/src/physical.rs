@@ -664,6 +664,41 @@ pub enum PhysicalOp {
         /// The catalog index backing the seek.
         index: IndexId,
     },
+    /// **Composite (multi-property) relationship index equality seek** (`rmp` task #666): the visible
+    /// relationships of `rel_type` whose current values of `properties` (in the composite key's declared
+    /// order) equal `values` element-wise, served by the composite relationship B+-tree in a **single**
+    /// seek — consuming a run of leading equality conjuncts (`MATCH ()-[r:T {a: …, b: …}]-()` /
+    /// `MATCH ()-[r:T]-() WHERE r.a = … AND r.b = …`) that would otherwise be a single-key seek +
+    /// residual filter.
+    ///
+    /// The relationship analogue of [`NodeCompositeIndexSeek`](Self::NodeCompositeIndexSeek), lowered
+    /// from the same standalone single-type fixed-length pattern shape as
+    /// [`RelIndexSeek`](Self::RelIndexSeek) so both endpoints are materialised directly from each matched
+    /// relationship's own record. `properties` and `values` are parallel and cover the composite index's
+    /// **full** ordered key tuple (the planner only emits this when every key has an equality conjunct).
+    /// `direction` reproduces the pattern arrow's endpoint binding **and** the undirected pattern's
+    /// two-orientation semantics exactly. The seek returns a **candidate** set the seam has already
+    /// re-checked (visibility, current type, current per-property tuple); the executor falls back to a
+    /// typed relationship scan + residual full-tuple equality when the seam exposes no usable composite
+    /// relationship index (e.g. the off-thread reader).
+    RelCompositeIndexSeek {
+        /// The relationship variable bound by each row.
+        relationship: Var,
+        /// The source-endpoint node variable (bound per `direction`).
+        from: Var,
+        /// The target-endpoint node variable (bound per `direction`).
+        to: Var,
+        /// The single relationship type the composite index covers.
+        rel_type: RelType,
+        /// The indexed property keys, in the composite key's declared order (two or more).
+        properties: Vec<String>,
+        /// The per-key equality seek values (parallel to `properties`; unevaluated AST).
+        values: Vec<Expr>,
+        /// The arrow direction of the originating pattern (drives endpoint binding + undirected doubling).
+        direction: crate::ast::RelDirection,
+        /// The catalog index backing the seek.
+        index: IndexId,
+    },
     /// **Relationship spatial (point) index proximity seek** (`rmp` task #664): the visible
     /// relationships of `rel_type` whose current point `property` lies within `radius` of a constant
     /// centre, served by the relationship spatial (grid) index instead of scanning **every** `:rel_type`
@@ -1759,8 +1794,10 @@ impl Planner<'_> {
     /// Attempts to lower a `Filter` carrying an **equality on a relationship variable**, sitting over a
     /// standalone single-type fixed-length [`Expand`](LogicalOp::Expand) from a bare
     /// [`AllNodesScan`](LogicalOp::AllNodesScan), into a [`RelIndexSeek`](PhysicalOp::RelIndexSeek)
-    /// (`rmp` task #659). Returns [`None`] (the caller keeps its normal paths) when the shape does not
-    /// qualify or no `Online` rel-property index covers the `(type, property)` the equality names.
+    /// (`rmp` task #659) or, when a **composite** relationship index's full ordered tuple is covered by
+    /// two or more equality conjuncts, into a single [`RelCompositeIndexSeek`](PhysicalOp::RelCompositeIndexSeek)
+    /// (`rmp` task #666). Returns [`None`] (the caller keeps its normal paths) when the shape does not
+    /// qualify or no `Online` relationship index covers the `(type, property)` the equality names.
     ///
     /// Only the **seek-materialisable** shape qualifies: exactly one relationship type (a single-type
     /// index), fixed length (`range` is `None`), no earlier pattern relationships to exclude
@@ -1811,6 +1848,68 @@ impl Planner<'_> {
         if anchor.name != from.name {
             return None;
         }
+
+        // Composite (multi-property) relationship seek (`rmp` task #666): collect the equality conjuncts
+        // on the relationship variable, and if a composite relationship index's FULL ordered key tuple
+        // is entirely covered by them, consume exactly those conjuncts into ONE `RelCompositeIndexSeek`
+        // (instead of a single leading-key seek + residual filters). Runs before the single-conjunct
+        // loop below so a full-key composite match takes priority over consuming just the leading key.
+        let eq_conjuncts: Vec<(usize, String, &Expr)> = conjuncts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, conj)| {
+                let pp = analyze_property_predicate(conj, &relationship.name)?;
+                match pp.kind {
+                    // Defer cloning the value to the consumed keys only: keep the conjunct by reference.
+                    PropertyPredicateKind::Equality { value: _ } => Some((i, pp.property, *conj)),
+                    _ => None,
+                }
+            })
+            .collect();
+        if eq_conjuncts.len() >= 2 {
+            let available: Vec<&str> = eq_conjuncts.iter().map(|(_, p, _)| p.as_str()).collect();
+            if let Some(idx) = self.catalog.rel_composite_full_eq(rel_type, &available) {
+                deps.insert(idx.id);
+                // Build the per-key value list in the composite's declared key order, recording which
+                // conjuncts are consumed (the first matching conjunct per key, so a repeated key leaves
+                // its later conjuncts as residual filters — the residual restores exactness).
+                let mut values: Vec<Expr> = Vec::with_capacity(idx.properties.len());
+                let mut consumed: Vec<usize> = Vec::with_capacity(idx.properties.len());
+                for key in &idx.properties {
+                    let (ci, _, conj) = eq_conjuncts
+                        .iter()
+                        .find(|(ci, p, _)| p == key && !consumed.contains(ci))
+                        .or_else(|| eq_conjuncts.iter().find(|(_, p, _)| p == key))
+                        .expect("rel_composite_full_eq guarantees every key is available");
+                    let value = analyze_property_predicate(conj, &relationship.name)
+                        .and_then(|pp| match pp.kind {
+                            PropertyPredicateKind::Equality { value } => Some(value),
+                            _ => None,
+                        })
+                        .expect("eq_conjuncts holds only equality predicates");
+                    values.push(value);
+                    consumed.push(*ci);
+                }
+                let seek = PhysicalOp::RelCompositeIndexSeek {
+                    relationship: relationship.clone(),
+                    from: from.clone(),
+                    to: to.clone(),
+                    rel_type: rel_type.clone(),
+                    properties: idx.properties.clone(),
+                    values,
+                    direction: *direction,
+                    index: idx.id,
+                };
+                let residual: Vec<&Expr> = conjuncts
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| !consumed.contains(j))
+                    .map(|(_, e)| *e)
+                    .collect();
+                return Some(attach_residual(seek, &residual));
+            }
+        }
+
         // Consume the first equality conjunct on the relationship variable whose `(type, property)` an
         // `Online` rel-property index covers; re-attach the rest as a residual filter.
         for (i, conj) in conjuncts.iter().enumerate() {
@@ -2037,6 +2136,7 @@ fn contains_read(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeTextIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::RelIndexSeek { .. }
+        | PhysicalOp::RelCompositeIndexSeek { .. }
         | PhysicalOp::RelSpatialIndexSeek { .. }
         | PhysicalOp::ExpandAll { .. }
         | PhysicalOp::ExpandInto { .. }
@@ -2111,6 +2211,7 @@ fn contains_write(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeTextIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::RelIndexSeek { .. }
+        | PhysicalOp::RelCompositeIndexSeek { .. }
         | PhysicalOp::RelSpatialIndexSeek { .. }
         | PhysicalOp::Argument { .. }
         | PhysicalOp::Empty => false,
@@ -2176,6 +2277,7 @@ fn contains_procedure_call(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeTextIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::RelIndexSeek { .. }
+        | PhysicalOp::RelCompositeIndexSeek { .. }
         | PhysicalOp::RelSpatialIndexSeek { .. }
         | PhysicalOp::Argument { .. }
         | PhysicalOp::Empty => false,
@@ -2251,6 +2353,7 @@ fn all_procedure_calls_reader_safe(
         | PhysicalOp::NodeTextIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::RelIndexSeek { .. }
+        | PhysicalOp::RelCompositeIndexSeek { .. }
         | PhysicalOp::RelSpatialIndexSeek { .. }
         | PhysicalOp::Argument { .. }
         | PhysicalOp::Empty => true,
@@ -2950,6 +3053,7 @@ fn map_children(op: PhysicalOp, f: &dyn Fn(PhysicalOp) -> PhysicalOp) -> Physica
         | PhysicalOp::NodeTextIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::RelIndexSeek { .. }
+        | PhysicalOp::RelCompositeIndexSeek { .. }
         | PhysicalOp::RelSpatialIndexSeek { .. }
         | PhysicalOp::Argument { .. }
         | PhysicalOp::Empty => op,
@@ -3462,6 +3566,7 @@ fn contains_argument(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeTextIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::RelIndexSeek { .. }
+        | PhysicalOp::RelCompositeIndexSeek { .. }
         | PhysicalOp::RelSpatialIndexSeek { .. }
         | PhysicalOp::Empty => false,
         PhysicalOp::Filter { input, .. }
@@ -3896,6 +4001,7 @@ fn gather_index_dependencies(op: &PhysicalOp, deps: &mut BTreeSet<IndexId>) {
         | PhysicalOp::SpatialIndexSeek { index, .. }
         | PhysicalOp::NodeTextIndexSeek { index, .. }
         | PhysicalOp::RelIndexSeek { index, .. }
+        | PhysicalOp::RelCompositeIndexSeek { index, .. }
         | PhysicalOp::RelSpatialIndexSeek { index, .. } => {
             deps.insert(*index);
         }
@@ -4488,6 +4594,12 @@ fn gather_bound_vars(plan: &PhysicalOp, out: &mut Vec<Var>) {
             to,
             ..
         }
+        | PhysicalOp::RelCompositeIndexSeek {
+            relationship,
+            from,
+            to,
+            ..
+        }
         | PhysicalOp::RelSpatialIndexSeek {
             relationship,
             from,
@@ -4802,6 +4914,30 @@ impl PhysicalOp {
                 h::expr(value),
                 h::arrow_right(*direction),
             ),
+            Self::RelCompositeIndexSeek {
+                relationship,
+                from,
+                to,
+                rel_type,
+                properties,
+                values,
+                direction,
+                index,
+            } => {
+                let keys = properties
+                    .iter()
+                    .zip(values.iter())
+                    .map(|(p, v)| format!("{p} = {}", h::expr(v)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                writeln!(
+                    f,
+                    "RelCompositeIndexSeek({}{relationship}:{} {keys}{}{to} from {from} via {index})",
+                    h::arrow_left(*direction),
+                    rel_type.name,
+                    h::arrow_right(*direction),
+                )
+            }
             Self::RelSpatialIndexSeek {
                 relationship,
                 from,
@@ -5567,6 +5703,74 @@ mod tests {
         assert!(!rendered.contains("NodeIndexSeek"), "{rendered}");
         // A single non-leading equality still narrows the SSI footprint via the precise scan path.
         assert!(rendered.contains("NodeLabelScanEq"), "{rendered}");
+    }
+
+    #[test]
+    fn rel_composite_full_key_equality_becomes_one_composite_rel_seek() {
+        // `rmp` task #666: a composite relationship index on (a, b) and a query with equality on BOTH
+        // keys must fuse into ONE `RelCompositeIndexSeek`, consuming both conjuncts (no residual Filter),
+        // whether spelled as an inline map or `WHERE ... AND ...`, in either conjunct order and either
+        // arrow direction.
+        let catalog = IndexCatalog::builder()
+            .with_rel_composite("KNOWS", ["a", "b"])
+            .build();
+        for src in [
+            "MATCH ()-[r:KNOWS {a: 1, b: 2}]-() RETURN r",
+            "MATCH ()-[r:KNOWS]-() WHERE r.a = 1 AND r.b = 2 RETURN r",
+            "MATCH ()-[r:KNOWS]-() WHERE r.b = 2 AND r.a = 1 RETURN r",
+            "MATCH (x)-[r:KNOWS {a: 1, b: 2}]->(y) RETURN r",
+        ] {
+            let plan = physical(src, &catalog);
+            let rendered = plan.to_string();
+            assert!(
+                rendered.contains("RelCompositeIndexSeek"),
+                "{src}: {rendered}"
+            );
+            assert!(!rendered.contains("Filter"), "{src}: {rendered}");
+            assert!(!rendered.contains("ExpandAll"), "{src}: {rendered}");
+            assert_eq!(plan.index_dependencies().count(), 1, "{src}");
+        }
+
+        // A third, non-covered equality conjunct stays a residual Filter above the composite seek.
+        let plan = physical(
+            "MATCH ()-[r:KNOWS]-() WHERE r.a = 1 AND r.b = 2 AND r.c = 3 RETURN r",
+            &catalog,
+        );
+        let rendered = plan.to_string();
+        assert!(rendered.contains("RelCompositeIndexSeek"), "{rendered}");
+        assert!(rendered.contains("Filter"), "{rendered}");
+    }
+
+    #[test]
+    fn rel_composite_leading_key_only_uses_single_rel_seek() {
+        // `rmp` task #666: a predicate on ONLY the leading key does not emit a composite rel seek — the
+        // composite serves it as a single-property leading-prefix, which lowers to a `RelIndexSeek` on
+        // the leading key (the seam falls back to a scan for a composite-only tree, but the PLAN shape is
+        // the single-key seek, never the composite seek).
+        let catalog = IndexCatalog::builder()
+            .with_rel_composite("KNOWS", ["a", "b"])
+            .build();
+        let plan = physical("MATCH ()-[r:KNOWS {a: 1}]-() RETURN r", &catalog);
+        let rendered = plan.to_string();
+        assert!(
+            !rendered.contains("RelCompositeIndexSeek"),
+            "leading-only must not use the composite seek: {rendered}"
+        );
+        assert!(rendered.contains("RelIndexSeek"), "{rendered}");
+    }
+
+    #[test]
+    fn rel_composite_non_leading_key_only_stays_a_scan() {
+        // `rmp` task #666: a predicate on ONLY a non-leading key (`b`) cannot use the composite (the
+        // leading key `a` is unbound) — it stays a scan + filter, never a composite or single-key seek.
+        let catalog = IndexCatalog::builder()
+            .with_rel_composite("KNOWS", ["a", "b"])
+            .build();
+        let plan = physical("MATCH ()-[r:KNOWS {b: 2}]-() RETURN r", &catalog);
+        let rendered = plan.to_string();
+        assert!(!rendered.contains("RelCompositeIndexSeek"), "{rendered}");
+        assert!(!rendered.contains("RelIndexSeek"), "{rendered}");
+        assert!(rendered.contains("ExpandAll"), "{rendered}");
     }
 
     #[test]

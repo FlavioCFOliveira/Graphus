@@ -41,8 +41,8 @@ use crate::heap::{self, BLOCK_PAYLOAD, HeapBlock, STRINGS_RECORD_SIZE};
 use crate::idalloc::{ElementIdAllocator, FreeList, NULL_ID, PhysicalAllocator};
 use crate::labels;
 use crate::meta::{
-    CompositeIndexEntry, ConstraintEntry, FulltextIndexEntry, IndexState, Meta, SpatialIndexEntry,
-    Statistics, StoreMeta, TextIndexEntry,
+    CompositeIndexEntry, ConstraintEntry, FulltextIndexEntry, IndexState, Meta,
+    RelCompositeIndexEntry, SpatialIndexEntry, Statistics, StoreMeta, TextIndexEntry,
 };
 use crate::paging;
 use crate::read_view::{self, MetaSnapshot, StoreMetaSnapshot, StorePages, StoreReadView};
@@ -5311,6 +5311,53 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// commit, discarded on rollback.
     pub fn remove_composite_index(&mut self, name: &str) {
         self.statistics.remove_composite_index(name);
+        self.catalog_dirty = true;
+    }
+
+    /// The durable composite (multi-property) **relationship** index entry named `name`, or [`None`] if
+    /// no such index is declared (`rmp` task #666). Tokens are returned as ids; the caller resolves
+    /// their names via the token store. Cloned so the borrow of `self` does not outlive the call.
+    #[must_use]
+    pub fn rel_composite_index(&self, name: &str) -> Option<RelCompositeIndexEntry> {
+        self.statistics.rel_composite_index(name).cloned()
+    }
+
+    /// Lists every declared composite relationship index as `(name, entry)` from the durable catalog
+    /// (`rmp` task #666), ascending by name. Like [`composite_indexes`](Self::composite_indexes) this is
+    /// what makes a composite relationship index *registration* survive a crash: a fresh coordinator
+    /// reads this to re-register the previously-declared indexes before rebuilding their B+-tree.
+    #[must_use]
+    pub fn rel_composite_indexes(&self) -> Vec<(String, RelCompositeIndexEntry)> {
+        self.statistics.rel_composite_indexes()
+    }
+
+    /// The **name** of the composite relationship index covering exactly `(type_token, property_tokens)`
+    /// — same relationship type and same **ordered** property tuple — or [`None`] if none is declared
+    /// (`rmp` task #666). Backs the `IF NOT EXISTS` schema-equivalence check.
+    #[must_use]
+    pub fn rel_composite_index_name_for(
+        &self,
+        type_token: u32,
+        property_tokens: &[u32],
+    ) -> Option<String> {
+        self.statistics
+            .rel_composite_index_name_for(type_token, property_tokens)
+            .map(str::to_owned)
+    }
+
+    /// Declares (or replaces) the composite relationship index named `name` in the durable catalog
+    /// (`rmp` task #666). Purely in-memory here; becomes **durable when the enclosing transaction
+    /// commits** and is **discarded on rollback**, exactly like [`set_composite_index`](Self::set_composite_index).
+    pub fn set_rel_composite_index(&mut self, name: String, entry: RelCompositeIndexEntry) {
+        self.statistics.set_rel_composite_index(name, entry);
+        self.catalog_dirty = true;
+    }
+
+    /// Removes the composite relationship index named `name` from the durable catalog, if declared
+    /// (`rmp` task #666). Removing an absent entry is a harmless no-op. Durable at the enclosing
+    /// transaction's commit, discarded on rollback.
+    pub fn remove_rel_composite_index(&mut self, name: &str) {
+        self.statistics.remove_rel_composite_index(name);
         self.catalog_dirty = true;
     }
 

@@ -144,6 +144,9 @@ pub(crate) struct IndexSources {
     pub composite: Vec<(String, String, Vec<String>, IndexState)>,
     /// `(name, rel_type, property, state)` per relationship-property `RANGE` index.
     pub rel_property: Vec<(String, String, String, IndexState)>,
+    /// `(name, rel_type, properties, state)` per composite (multi-property) relationship `RANGE` index
+    /// (`rmp` task #666).
+    pub rel_composite: Vec<(String, String, Vec<String>, IndexState)>,
     /// `(name, entity, labels_or_types, properties, analyzer, state)` per `FULLTEXT` index — node or
     /// relationship, one or more covered labels/types (`rmp` task #663).
     pub fulltext: Vec<FulltextIndexListing>,
@@ -269,6 +272,26 @@ pub(crate) fn create_range_node(name: &str, label: &str, properties: &[String]) 
         "CREATE RANGE INDEX {} FOR (n:{}) ON ({props})",
         quote_ident(name),
         quote_ident(label)
+    )
+}
+
+/// A round-trippable `CREATE RANGE INDEX` DDL for a **composite** relationship index (`rmp` task #666).
+/// Re-parsing it yields an equivalent composite `CreateRelPropertyIndex` (two or more properties).
+#[must_use]
+pub(crate) fn create_range_rel_composite(
+    name: &str,
+    rel_type: &str,
+    properties: &[String],
+) -> String {
+    let props = properties
+        .iter()
+        .map(|p| format!("r.{}", quote_ident(p)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "CREATE RANGE INDEX {} FOR ()-[r:{}]-() ON ({props})",
+        quote_ident(name),
+        quote_ident(rel_type)
     )
 }
 
@@ -404,6 +427,7 @@ pub(crate) fn build_rows(filter: IndexTypeFilter, sources: IndexSources) -> Vec<
         node_property,
         composite,
         rel_property,
+        rel_composite,
         fulltext,
         point,
         point_rel,
@@ -463,7 +487,7 @@ pub(crate) fn build_rows(filter: IndexTypeFilter, sources: IndexSources) -> Vec<
             create_statement: create,
         });
     }
-    // Relationship-property RANGE.
+    // Relationship-property RANGE (single).
     for (name, rel_type, property, state) in rel_property {
         let owning = owning_constraint(&constraints, true, &rel_type, &property);
         let create = create_range_rel(&name, &rel_type, &property);
@@ -477,6 +501,25 @@ pub(crate) fn build_rows(filter: IndexTypeFilter, sources: IndexSources) -> Vec<
             properties: vec![property],
             index_provider: "range-1.0",
             owning_constraint: owning,
+            options: Value::Map(Vec::new()),
+            create_statement: create,
+        });
+    }
+    // Composite relationship RANGE (`rmp` task #666) — a standalone composite is never a constraint's
+    // backing index, so `owningConstraint` is always `Null`; entityType is RELATIONSHIP with a
+    // multi-element `properties` list.
+    for (name, rel_type, properties, state) in rel_composite {
+        let create = create_range_rel_composite(&name, &rel_type, &properties);
+        specs.push(RowSpec {
+            id: alloc(),
+            name,
+            state,
+            type_str: "RANGE",
+            entity_type: "RELATIONSHIP",
+            labels_or_types: vec![rel_type],
+            properties,
+            index_provider: "range-1.0",
+            owning_constraint: Value::Null,
             options: Value::Map(Vec::new()),
             create_statement: create,
         });
@@ -666,6 +709,7 @@ mod tests {
             node_property: Vec::new(),
             composite: Vec::new(),
             rel_property: Vec::new(),
+            rel_composite: Vec::new(),
             fulltext: Vec::new(),
             point: Vec::new(),
             point_rel: Vec::new(),
@@ -761,6 +805,12 @@ mod tests {
                 "since".to_owned(),
                 IndexState::Online,
             )],
+            rel_composite: vec![(
+                "rel_knows_a_b".to_owned(),
+                "KNOWS".to_owned(),
+                vec!["a".to_owned(), "b".to_owned()],
+                IndexState::Online,
+            )],
             fulltext: vec![(
                 "articles".to_owned(),
                 FulltextEntity::Node,
@@ -790,9 +840,9 @@ mod tests {
             constraints: Vec::new(),
         };
         let rows = build_rows(IndexTypeFilter::All, sources);
-        // 2 lookups + 7 declared indexes.
-        assert_eq!(rows.len(), 9);
-        // Ids: lookups 1/2, then 3..10 in build order.
+        // 2 lookups + 8 declared indexes (`rmp` #666 added the composite relationship index).
+        assert_eq!(rows.len(), 10);
+        // Ids: lookups 1/2, then 3..=10 in build order.
         let ids: Vec<i64> = rows
             .iter()
             .map(|r| match r[0] {
@@ -800,7 +850,7 @@ mod tests {
                 _ => panic!("id must be an integer"),
             })
             .collect();
-        assert_eq!(ids, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(ids, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
 
         // The composite row: type RANGE, entityType NODE, properties = [first, last], Populating.
         let composite = rows
@@ -827,6 +877,28 @@ mod tests {
             .expect("rel index listed");
         assert_eq!(rel[5], Value::String("RELATIONSHIP".to_owned()));
         assert_eq!(rel[8], Value::String("range-1.0".to_owned()));
+
+        // The composite relationship index (`rmp` #666): type RANGE, entityType RELATIONSHIP,
+        // properties = [a, b], no owning constraint.
+        let rel_comp = rows
+            .iter()
+            .find(|r| r[1] == Value::String("rel_knows_a_b".to_owned()))
+            .expect("composite rel index listed");
+        assert_eq!(rel_comp[4], Value::String("RANGE".to_owned()));
+        assert_eq!(rel_comp[5], Value::String("RELATIONSHIP".to_owned()));
+        assert_eq!(
+            rel_comp[7],
+            Value::List(vec![
+                Value::String("a".to_owned()),
+                Value::String("b".to_owned()),
+            ]),
+            "composite rel properties render as a multi-element list"
+        );
+        assert_eq!(
+            rel_comp[9],
+            Value::Null,
+            "a standalone composite owns no constraint"
+        );
 
         // The fulltext index: type FULLTEXT, provider fulltext-1.0, analyzer in options.
         let ft = rows
@@ -1005,7 +1077,21 @@ mod tests {
             IndexCommand::CreateRelPropertyIndex {
                 name: Some("rel_since".to_owned()),
                 rel_type: "KNOWS".to_owned(),
-                property: "since".to_owned(),
+                properties: vec!["since".to_owned()],
+                if_not_exists: false,
+            }
+        );
+        // Relationship RANGE composite (`rmp` #666).
+        assert_eq!(
+            parse_index(&create_range_rel_composite(
+                "rel_ab",
+                "KNOWS",
+                &["a".to_owned(), "b".to_owned()]
+            )),
+            IndexCommand::CreateRelPropertyIndex {
+                name: Some("rel_ab".to_owned()),
+                rel_type: "KNOWS".to_owned(),
+                properties: vec!["a".to_owned(), "b".to_owned()],
                 if_not_exists: false,
             }
         );

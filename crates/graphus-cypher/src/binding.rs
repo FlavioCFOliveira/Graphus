@@ -433,6 +433,13 @@ fn walk_physical(op: &PhysicalOp, record: &mut impl FnMut(&str, ParamType)) {
             // value — no static type expectation, recorded as Any. A leaf — no input to recurse into.
             params_in_expr(value, ParamType::Any, record);
         }
+        PhysicalOp::RelCompositeIndexSeek { values, .. } => {
+            // The composite relationship seek values (`rmp` task #666): one per key, each treated like a
+            // single seek value — no static type expectation, recorded as Any. A leaf — no input.
+            for value in values {
+                params_in_expr(value, ParamType::Any, record);
+            }
+        }
         PhysicalOp::NodeIndexStartsWithSeek { prefix, .. } => {
             // The STARTS WITH prefix (`rmp` task #658): commonly a `$param` after literal
             // auto-parameterisation. No static type expectation, recorded as Any. A leaf — no input.

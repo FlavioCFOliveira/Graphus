@@ -94,6 +94,12 @@ pub enum IndexKind {
     /// grid is derived/ephemeral (`graphus_index::SpatialIndex` over relationship ids); the descriptor
     /// records only its shape for planning.
     RelSpatial,
+    /// Composite index over **relationship** records, keyed `(reltype, v1, …, vk)` in declared order:
+    /// multi-property equality and leading-prefix range over a typed relationship property tuple
+    /// (`rmp` task #666) — the relationship analogue of [`Composite`](Self::Composite). Like the node
+    /// composite its backing B+-tree is derived/ephemeral (rebuilt from the store on open); the
+    /// descriptor records only its shape for planning.
+    RelComposite,
 }
 
 impl IndexKind {
@@ -108,6 +114,7 @@ impl IndexKind {
             Self::Spatial => "spatial",
             Self::Text => "text",
             Self::RelSpatial => "rel-spatial",
+            Self::RelComposite => "rel-composite",
         }
     }
 }
@@ -313,13 +320,58 @@ impl IndexCatalog {
 
     /// A relationship-property index on `(rel_type, property)` for an equality or range predicate
     /// (`04 §6.2`).
+    ///
+    /// Returns a [`IndexKind::RelProperty`] index whose sole key is `property`, **or** a
+    /// [`IndexKind::RelComposite`] index whose **leading** key is `property` (a composite relationship
+    /// index can serve a predicate on its first key as a leading-prefix seek, `rmp` task #666). A pure
+    /// [`IndexKind::RelProperty`] match is preferred when both exist, since it is the most selective for
+    /// a single-property predicate — mirroring [`label_property`](Self::label_property).
     #[must_use]
     pub fn rel_property(&self, rel_type: &RelType, property: &str) -> Option<&IndexDescriptor> {
-        self.indexes.iter().find(|d| {
+        // Prefer an exact single-property relationship index.
+        let exact = self.indexes.iter().find(|d| {
             d.kind == IndexKind::RelProperty
                 && d.covers_rel_type(&rel_type.name)
                 && d.properties.first().map(String::as_str) == Some(property)
+        });
+        if exact.is_some() {
+            return exact;
+        }
+        // Otherwise a composite relationship index whose leading key matches serves a leading-prefix
+        // seek (the plan shape is a single-key `RelIndexSeek`; the executor falls back to a scan for a
+        // composite-only tree, exactly like the node leading-prefix case).
+        self.indexes.iter().find(|d| {
+            d.kind == IndexKind::RelComposite
+                && d.covers_rel_type(&rel_type.name)
+                && d.properties.first().map(String::as_str) == Some(property)
         })
+    }
+
+    /// A composite relationship index on `rel_type` whose **full ordered property tuple** is entirely
+    /// covered by the equality-predicate properties `available` (`rmp` task #666) — the relationship
+    /// analogue of [`label_composite_full_eq`](Self::label_composite_full_eq).
+    ///
+    /// Returns a [`IndexKind::RelComposite`] index (arity ≥ 2) whose every key appears in `available` —
+    /// so a `MATCH ()-[r:T {a: …, b: …}]-()` (both keys have an equality conjunct) drives one full-key
+    /// composite relationship seek. When several composites qualify, the one with the **most** keys is
+    /// preferred (the most selective). A composite whose leading key alone is present (a strict prefix)
+    /// is **not** returned here — that case is served by [`rel_property`](Self::rel_property)'s
+    /// leading-prefix contract.
+    #[must_use]
+    pub fn rel_composite_full_eq(
+        &self,
+        rel_type: &RelType,
+        available: &[&str],
+    ) -> Option<&IndexDescriptor> {
+        self.indexes
+            .iter()
+            .filter(|d| {
+                d.kind == IndexKind::RelComposite
+                    && d.covers_rel_type(&rel_type.name)
+                    && d.properties.len() >= 2
+                    && d.properties.iter().all(|p| available.contains(&p.as_str()))
+            })
+            .max_by_key(|d| d.properties.len())
     }
 
     /// A relationship spatial index on `(rel_type, point-property)` usable for a proximity predicate
@@ -464,6 +516,21 @@ impl IndexCatalogBuilder {
         )
     }
 
+    /// Appends a composite relationship index over `(rel_type, properties…)` in declared order
+    /// (`rmp` task #666).
+    pub fn with_rel_composite<I, S>(self, rel_type: impl Into<String>, properties: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let props: Vec<String> = properties.into_iter().map(Into::into).collect();
+        self.with_descriptor(
+            IndexKind::RelComposite,
+            IndexTarget::rel_type(rel_type),
+            props,
+        )
+    }
+
     /// Finalises the catalog.
     pub fn build(self) -> IndexCatalog {
         IndexCatalog {
@@ -570,6 +637,53 @@ mod tests {
             .with_label_property("Person", "a")
             .build();
         assert!(single.label_composite_full_eq(&l, &["a", "b"]).is_none());
+    }
+
+    #[test]
+    fn rel_composite_full_eq_needs_every_key_available() {
+        // `rmp` task #666: a composite relationship index (a, b) is returned only when BOTH keys are
+        // available equality predicates; a strict prefix (only `a`) is not (that is `rel_property`'s
+        // leading-prefix job).
+        let catalog = IndexCatalog::builder()
+            .with_rel_composite("KNOWS", ["a", "b"])
+            .build();
+        let t = rel_type("KNOWS");
+        assert!(catalog.rel_composite_full_eq(&t, &["a", "b"]).is_some());
+        assert!(
+            catalog
+                .rel_composite_full_eq(&t, &["b", "a", "c"])
+                .is_some()
+        );
+        // A strict prefix (only the leading key) does NOT match the full-key resolver.
+        assert!(catalog.rel_composite_full_eq(&t, &["a"]).is_none());
+        assert!(catalog.rel_composite_full_eq(&t, &["b"]).is_none());
+        // But the leading key IS servable as a single-property leading-prefix seek via `rel_property`.
+        let leading = catalog.rel_property(&t, "a").unwrap();
+        assert_eq!(leading.kind, IndexKind::RelComposite);
+        // A non-leading key alone is not servable from a single-predicate lookup.
+        assert!(catalog.rel_property(&t, "b").is_none());
+        // Wrong type / a single-property rel index never qualifies for the full-key resolver.
+        assert!(
+            catalog
+                .rel_composite_full_eq(&rel_type("LIKES"), &["a", "b"])
+                .is_none()
+        );
+        let single = IndexCatalog::builder()
+            .with_rel_property("KNOWS", "a")
+            .build();
+        assert!(single.rel_composite_full_eq(&t, &["a", "b"]).is_none());
+    }
+
+    #[test]
+    fn rel_property_prefers_exact_over_composite_leading_key() {
+        // A pure single-property rel index is preferred over a composite whose leading key matches,
+        // mirroring the node `label_property` preference (`rmp` task #666).
+        let catalog = IndexCatalog::builder()
+            .with_rel_composite("KNOWS", ["since", "weight"])
+            .with_rel_property("KNOWS", "since")
+            .build();
+        let chosen = catalog.rel_property(&rel_type("KNOWS"), "since").unwrap();
+        assert_eq!(chosen.kind, IndexKind::RelProperty);
     }
 
     #[test]

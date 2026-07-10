@@ -2434,6 +2434,49 @@ fn build_operator(
                 rows: rel_ids_to_rows(relationship, from, to, *direction, ids, ctx),
             })
         }
+        PhysicalOp::RelCompositeIndexSeek {
+            relationship,
+            from,
+            to,
+            rel_type,
+            properties,
+            values,
+            direction,
+            ..
+        } => {
+            // Composite (multi-property) relationship index equality seek (`rmp` task #666): evaluate
+            // each key's seek value, then ask the seam for the candidate relationship ids of `rel_type`
+            // whose current per-property tuple equals them (already re-checked for visibility + current
+            // type + current values). When the seam exposes no usable composite relationship index — the
+            // off-thread reader, or a since-dropped index — fall back to a typed relationship scan +
+            // full-tuple equality filter, which yields the identical relationship set. Either way,
+            // materialise each relationship's endpoints from its own record honouring the pattern
+            // direction, exactly like the single-property relationship seek.
+            let mut seek_values = Vec::with_capacity(values.len());
+            for value in values {
+                seek_values.push(eval_value(
+                    value,
+                    &Row::empty(),
+                    ctx.params,
+                    ctx.graph,
+                    ctx.functions,
+                    &ctx.clock,
+                )?);
+            }
+            let ids = match ctx.graph.index_seek_rel_composite_eq(
+                &rel_type.name,
+                properties,
+                &seek_values,
+            ) {
+                Some(ids) => ids,
+                None => {
+                    rel_scan_filter_composite_eq_ids(&rel_type.name, properties, &seek_values, ctx)
+                }
+            };
+            Ok(Operator::Buffered {
+                rows: rel_ids_to_rows(relationship, from, to, *direction, ids, ctx),
+            })
+        }
         PhysicalOp::RelSpatialIndexSeek {
             relationship,
             from,
@@ -3205,6 +3248,49 @@ fn rel_scan_filter_eq_ids(
                 .rel_property(inc.rel, property)
                 .is_some_and(|v| crate::equality::equals(&v, seek).is_true())
             {
+                ids.push(inc.rel);
+            }
+        }
+    }
+    ids
+}
+
+/// The scan fallback for a
+/// [`RelCompositeIndexSeek`](crate::physical::PhysicalOp::RelCompositeIndexSeek) when the seam exposes
+/// no usable composite relationship index (the off-thread reader, or an index dropped since planning):
+/// the visible relationship ids of `rel_type` whose current value of **every** key equals the
+/// corresponding seek value by Cypher equality, **each id once** (`rmp` task #666).
+///
+/// The composite analogue of [`rel_scan_filter_eq_ids`]: it enumerates each relationship of the type
+/// once (from its start node) through the same
+/// [`scan_nodes`](crate::graph_access::GraphAccess::scan_nodes) /
+/// [`expand`](crate::graph_access::GraphAccess::expand) /
+/// [`rel_property`](crate::graph_access::GraphAccess::rel_property) seam the scan-path `ExpandAll`
+/// would, so MVCC visibility and RBAC compose identically, then keeps only those matching the full
+/// tuple. [`rel_ids_to_rows`] applies the pattern direction to the returned set.
+fn rel_scan_filter_composite_eq_ids(
+    rel_type: &str,
+    properties: &[String],
+    values: &[Value],
+    ctx: &Ctx<'_>,
+) -> Vec<RelId> {
+    let types = [rel_type.to_owned()];
+    let mut seen = rustc_hash::FxHashSet::default();
+    let mut ids = Vec::new();
+    for node in ctx.graph.scan_nodes() {
+        for inc in ctx.graph.expand(node, ExpandDirection::Outgoing, &types) {
+            if !seen.insert(inc.rel) {
+                continue;
+            }
+            let matches = properties
+                .iter()
+                .zip(values.iter())
+                .all(|(property, value)| {
+                    ctx.graph
+                        .rel_property(inc.rel, property)
+                        .is_some_and(|v| crate::equality::equals(&v, value).is_true())
+                });
+            if matches {
                 ids.push(inc.rel);
             }
         }
@@ -8002,6 +8088,12 @@ fn result_columns(op: &PhysicalOp, procedures: &dyn ProcedureRegistry) -> Vec<St
             ..
         }
         | PhysicalOp::RelIndexSeek {
+            relationship,
+            from,
+            to,
+            ..
+        }
+        | PhysicalOp::RelCompositeIndexSeek {
             relationship,
             from,
             to,

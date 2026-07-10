@@ -641,6 +641,27 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         None
     }
 
+    fn index_seek_rel_composite_eq(
+        &self,
+        rel_type: &str,
+        properties: &[String],
+        values: &[Value],
+    ) -> Option<Vec<RelId>> {
+        // A composite relationship index seek (`rmp` task #666) is a read path, handled exactly like the
+        // single-property relationship seek above: an **unrestricted** principal delegates to the inner
+        // seam; a **restricted** principal declines (`None`) so the executor falls back to the typed
+        // relationship scan + full-tuple filter, which flows through this decorator and enforces
+        // relationship-type traversal AND per-property read grants. The raw seek cannot observe a
+        // `DENY READ` on a covered property, so declining keeps a restricted principal from ever seeing a
+        // relationship a `WHERE r.a = x AND r.b = y` scan would have hidden — no RBAC regression.
+        if self.oracle.is_unrestricted() {
+            return self
+                .inner
+                .index_seek_rel_composite_eq(rel_type, properties, values);
+        }
+        None
+    }
+
     fn index_seek_spatial_rel(
         &self,
         rel_type: &str,

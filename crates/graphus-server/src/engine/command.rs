@@ -274,18 +274,21 @@ pub enum IndexCommand {
         /// Whether `IF EXISTS` was given (a missing index becomes a no-op success) (`rmp` task #662).
         if_exists: bool,
     },
-    /// `CREATE INDEX [<name>] [IF NOT EXISTS] FOR ()-[r:<TYPE>]-() ON (r.<property>)` on
-    /// `(rel_type, property)` (`rmp` task #646): the relationship analogue of
-    /// [`CreateNodePropertyIndex`](Self::CreateNodePropertyIndex). Synchronously builds the index from
-    /// the existing relationships (ending `Online`). `name` is the requested server-unique name, or
-    /// [`None`] to auto-generate a deterministic one; `if_not_exists` makes a duplicate a no-op success.
+    /// `CREATE INDEX [<name>] [IF NOT EXISTS] FOR ()-[r:<TYPE>]-() ON (r.<a>[, r.<b>, …])` on
+    /// `(rel_type, properties)` (`rmp` tasks #646 / #666): the relationship analogue of
+    /// [`CreateNodePropertyIndex`](Self::CreateNodePropertyIndex). A single-element `properties` is a
+    /// single-property RANGE index; a two-or-more-element list is a **composite** (multi-property) RANGE
+    /// index over the ordered property tuple (`rmp` task #666). Synchronously builds the index from the
+    /// existing relationships (ending `Online`). `name` is the requested server-unique name, or [`None`]
+    /// to auto-generate a deterministic one; `if_not_exists` makes a duplicate a no-op success.
     CreateRelPropertyIndex {
         /// The requested server-unique name, or [`None`] to auto-generate one.
         name: Option<String>,
         /// The relationship type the index is declared on.
         rel_type: String,
-        /// The property key the index is declared on.
-        property: String,
+        /// The property keys the index is declared on, in declared order (one for a single-property
+        /// index, two or more for a composite index; the order is significant for a composite).
+        properties: Vec<String>,
         /// Whether `IF NOT EXISTS` was given (a duplicate becomes a no-op success).
         if_not_exists: bool,
     },
@@ -307,12 +310,16 @@ pub enum IndexCommand {
 pub enum RelPropertyIndexRef {
     /// `DROP INDEX <name>` — identify the index by its server-unique name.
     Named(String),
-    /// `DROP INDEX FOR ()-[r:T]-() ON (r.p)` — identify by covered relationship type + property.
+    /// `DROP INDEX FOR ()-[r:T]-() ON (r.p[, r.q, …])` — identify by covered relationship type + covered
+    /// property tuple. A single-element list targets a single-property relationship index; a
+    /// multi-element list targets the composite (multi-property) index over that exact ordered tuple
+    /// (`rmp` task #666).
     Target {
         /// The covered relationship type.
         rel_type: String,
-        /// The covered property key.
-        property: String,
+        /// The covered property keys, in declared order (one for a single-property index, two or more
+        /// for a composite index).
+        properties: Vec<String>,
     },
 }
 

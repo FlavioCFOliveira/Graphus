@@ -340,6 +340,39 @@ pub struct CompositeIndexEntry {
     pub state: IndexState,
 }
 
+/// A durable **composite (multi-property) relationship index** catalog entry (`rmp` task #666) — the
+/// relationship analogue of [`CompositeIndexEntry`].
+///
+/// A composite relationship RANGE index is identified by a server-unique **name**, covers one
+/// relationship **type** and **two or more** property tokens **in declared order** (the key order is
+/// significant — `(a, b)` differs from `(b, a)`). It is the multi-key generalisation of the
+/// single-property relationship index (`rmp` task #646): a `MATCH ()-[r:T {a: …, b: …}]-()` consumes
+/// the leading equality conjuncts into one composite relationship seek. It enforces **no uniqueness**
+/// — a pure query accelerator.
+///
+/// It is kept in its **own** durable catalog (not merged into the node [`composite_indexes`] map)
+/// because a relationship-type token and a node-label token share the numeric token space: mixing them
+/// in one map keyed by token could conflate a relationship index with a node index of the same numeric
+/// token. This mirrors how the relationship-property index catalog is kept separate from the
+/// node-property one, and how the in-memory `IndexSet` keeps `spatial_rel` / `fulltext_rel` separate
+/// from their node maps.
+///
+/// This rides the **identical** durability lifecycle as the node composite catalog: checkpointed at
+/// commit, reloaded on rollback and on open. Its presence invariant is "an entry exists iff a composite
+/// relationship index of that name is declared". The backing B+-tree *data* itself is never persisted
+/// (it is ephemeral and rebuilt from the store on open, like the derived `IndexSet`), so only this
+/// catalog entry needs durability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelCompositeIndexEntry {
+    /// The relationship-type-namespace token the index covers.
+    pub type_token: u32,
+    /// The property-key-namespace tokens the index covers, **in declared order** (two or more; the
+    /// arity-1 case is served by the single-property relationship-property index, never recorded here).
+    pub property_tokens: Vec<u32>,
+    /// The build state of the index (the same state machine as a relationship-property index).
+    pub state: IndexState,
+}
+
 /// A durable **text (trigram) node index** catalog entry (`rmp` task #662).
 ///
 /// A `TEXT` index is a **distinct native string index** — not a synonym of `RANGE` — that accelerates
@@ -892,6 +925,19 @@ pub struct Statistics {
     /// the **identical** durability lifecycle as the other catalogs; it holds **only** arity-≥2 indexes
     /// (a single-property index lives in [`node_property_indexes`](Self#structfield.node_property_indexes)).
     pub composite_indexes: BTreeMap<String, CompositeIndexEntry>,
+    /// The durable **composite (multi-property) relationship index catalog** (`rmp` task #666): the set
+    /// of declared standalone composite relationship indexes keyed by their server-unique **name**, each
+    /// carrying the covered relationship-type token, the covered property-key tokens (in declared order,
+    /// two or more) and the build [`IndexState`]. See [`RelCompositeIndexEntry`].
+    ///
+    /// Kept **separate** from [`composite_indexes`](Self#structfield.composite_indexes) so a
+    /// relationship-type token never conflates with a numerically-equal node-label token (exactly as
+    /// [`rel_property_indexes`](Self#structfield.rel_property_indexes) is separate from the node one).
+    /// Persisting this set is what makes a composite relationship index *registration* survive a crash;
+    /// the backing B+-tree is ephemeral (rebuilt from the store on open). It holds **only** arity-≥2
+    /// indexes (a single-property relationship index lives in
+    /// [`rel_property_indexes`](Self#structfield.rel_property_indexes)).
+    pub rel_composite_indexes: BTreeMap<String, RelCompositeIndexEntry>,
     /// The durable **text (trigram) node index catalog** (`rmp` task #662): the set of declared text
     /// indexes keyed by their server-unique **name**, each carrying the covered label token, the single
     /// covered property token and the build [`IndexState`]. See [`TextIndexEntry`].
@@ -1343,6 +1389,55 @@ impl Statistics {
             .map(|(name, _)| name.as_str())
     }
 
+    // ---- Composite (multi-property) relationship index catalog (`rmp` task #666) ------------------
+
+    /// The durable composite relationship index entry named `name`, or [`None`] if no such index is
+    /// declared (`rmp` task #666).
+    #[must_use]
+    pub fn rel_composite_index(&self, name: &str) -> Option<&RelCompositeIndexEntry> {
+        self.rel_composite_indexes.get(name)
+    }
+
+    /// Declares (or replaces) the composite relationship index named `name` (`rmp` task #666).
+    /// Idempotent on the name: re-recording overwrites the entry (e.g. to flip its state).
+    pub(crate) fn set_rel_composite_index(&mut self, name: String, entry: RelCompositeIndexEntry) {
+        self.rel_composite_indexes.insert(name, entry);
+    }
+
+    /// Removes the composite relationship index named `name`, if declared (`rmp` task #666). Removing
+    /// an absent entry is a harmless no-op.
+    pub(crate) fn remove_rel_composite_index(&mut self, name: &str) {
+        self.rel_composite_indexes.remove(name);
+    }
+
+    /// Lists every declared composite relationship index as `(name, entry)`, ascending by name (the
+    /// [`BTreeMap`] order, deterministic) (`rmp` task #666).
+    #[must_use]
+    pub fn rel_composite_indexes(&self) -> Vec<(String, RelCompositeIndexEntry)> {
+        self.rel_composite_indexes
+            .iter()
+            .map(|(name, entry)| (name.clone(), entry.clone()))
+            .collect()
+    }
+
+    /// The **name** of the composite relationship index covering exactly `(type_token,
+    /// property_tokens)` — same relationship type and same **ordered** property tuple — or [`None`] if
+    /// no such index is declared (`rmp` task #666). Backs the `IF NOT EXISTS` schema-equivalence check
+    /// (composite key order is significant).
+    #[must_use]
+    pub fn rel_composite_index_name_for(
+        &self,
+        type_token: u32,
+        property_tokens: &[u32],
+    ) -> Option<&str> {
+        self.rel_composite_indexes
+            .iter()
+            .find(|&(_, entry)| {
+                entry.type_token == type_token && entry.property_tokens == property_tokens
+            })
+            .map(|(name, _)| name.as_str())
+    }
+
     // ---- Text (trigram) node index catalog (`rmp` task #662) --------------------------------------
 
     /// The durable text index entry named `name`, or [`None`] if no such index is declared
@@ -1559,10 +1654,15 @@ impl Statistics {
         // pre-#663 image (ending after the text catalog) decodes it empty and every legacy full-text
         // entry keeps its node + single-token shape.
         Self::encode_fulltext_extension_block(&mut out, &self.fulltext_indexes);
-        // The spatial extension block (`rmp` task #664), appended LAST — carrying the entity of any
-        // relationship point index — so a pre-#664 image (ending after the full-text extension block)
-        // decodes it empty and every legacy spatial entry keeps its node shape.
+        // The spatial extension block (`rmp` task #664) — carrying the entity of any relationship point
+        // index — so a pre-#664 image (ending after the full-text extension block) decodes it empty and
+        // every legacy spatial entry keeps its node shape.
         Self::encode_spatial_extension_block(&mut out, &self.spatial_indexes);
+        // The standalone composite (multi-property) **relationship** index catalog (`rmp` task #666),
+        // appended LAST by the same append-only rule, so a pre-#666 image (ending after the spatial
+        // extension block) decodes it to empty. Byte layout mirrors the node composite catalog exactly
+        // (the `type_token` occupies the slot the node block's `label_token` does).
+        Self::encode_rel_composite_catalog(&mut out, &self.rel_composite_indexes);
         out
     }
 
@@ -1918,6 +2018,45 @@ impl Statistics {
         }
     }
 
+    /// Encodes the composite (multi-property) **relationship** index catalog block (`rmp` task #666),
+    /// appended LAST so a pre-#666 image (ending after the spatial extension block) decodes to an empty
+    /// relationship composite catalog.
+    ///
+    /// Layout: `n(u32) | [ name_len(u32) | name_bytes[name_len] | type_token(u32) |
+    /// n_props(u32) | prop_token(u32)*n_props | state(u8) ]*`, entries in ascending-name
+    /// ([`BTreeMap`]) order so the image is deterministic. Byte-identical to the node composite block
+    /// ([`encode_composite_catalog`](Self::encode_composite_catalog)); the `type_token` occupies the
+    /// slot the node block's `label_token` does.
+    fn encode_rel_composite_catalog(
+        out: &mut Vec<u8>,
+        map: &BTreeMap<String, RelCompositeIndexEntry>,
+    ) {
+        debug_assert!(
+            map.len() <= u32::MAX as usize,
+            "relationship composite catalog entry count exceeds u32"
+        );
+        out.extend_from_slice(&(map.len() as u32).to_le_bytes());
+        for (name, entry) in map {
+            let name_bytes = name.as_bytes();
+            debug_assert!(
+                name_bytes.len() <= u32::MAX as usize,
+                "relationship composite index name exceeds u32 length"
+            );
+            out.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(name_bytes);
+            out.extend_from_slice(&entry.type_token.to_le_bytes());
+            debug_assert!(
+                entry.property_tokens.len() <= u32::MAX as usize,
+                "relationship composite property-token count exceeds u32"
+            );
+            out.extend_from_slice(&(entry.property_tokens.len() as u32).to_le_bytes());
+            for &prop in &entry.property_tokens {
+                out.extend_from_slice(&prop.to_le_bytes());
+            }
+            out.push(entry.state.as_byte());
+        }
+    }
+
     /// Encodes the text (trigram) node index catalog block (`rmp` task #662), appended last so a
     /// pre-#662 image (ending after the composite catalog) decodes to an empty text catalog.
     ///
@@ -2004,6 +2143,10 @@ impl Statistics {
         // pre-#664 image ends after the full-text extension block, so this block decodes empty and
         // every spatial entry keeps the node shape the catalog decode set.
         Self::decode_spatial_extension_block(bytes, &mut cur, &mut spatial_indexes)?;
+        // Decode the trailing composite (multi-property) **relationship** index catalog (`rmp` task
+        // #666), the LAST block. A pre-#666 image ends after the spatial extension block, so this block
+        // decodes empty via the end-of-input guard.
+        let rel_composite_indexes = Self::decode_rel_composite_catalog(bytes, &mut cur)?;
         Ok(Self {
             total_nodes,
             total_relationships,
@@ -2018,6 +2161,7 @@ impl Statistics {
             rel_property_indexes,
             rel_property_index_names,
             composite_indexes,
+            rel_composite_indexes,
             text_indexes,
         })
     }
@@ -2415,6 +2559,77 @@ impl Statistics {
             {
                 return Err(GraphusError::Storage(format!(
                     "composite catalog repeats index name {name:?}"
+                )));
+            }
+        }
+        Ok(map)
+    }
+
+    /// Decodes the composite (multi-property) **relationship** index catalog block (`rmp` task #666) —
+    /// the LAST block. End-of-input where its count `u32` would start means "no relationship composite
+    /// catalog" (a pre-#666 image), not truncation.
+    ///
+    /// The `state` byte is range-checked. A repeated name, an empty name, or a zero property-token
+    /// count is rejected (none is ever produced by [`encode`](Self::encode)). A single-property entry
+    /// (`n_props == 1`) is not rejected here (the block is self-describing), but the Cypher layer never
+    /// writes one — arity-1 lives in the single-property relationship-property index catalog. Byte-for-
+    /// byte mirrors the node composite decoder ([`decode_composite_catalog`](Self::decode_composite_catalog)).
+    fn decode_rel_composite_catalog(
+        bytes: &[u8],
+        cur: &mut usize,
+    ) -> Result<BTreeMap<String, RelCompositeIndexEntry>> {
+        let mut map = BTreeMap::new();
+        // Backward compatibility (`rmp` task #666): a pre-#666 image ends exactly here.
+        if *cur == bytes.len() {
+            return Ok(map);
+        }
+        let n = read_u32(bytes, cur)? as usize;
+        for _ in 0..n {
+            let name_len = read_u32(bytes, cur)? as usize;
+            let end = take(bytes, cur, name_len)?;
+            let name = String::from_utf8(bytes[end - name_len..end].to_vec()).map_err(|_| {
+                GraphusError::Storage(
+                    "relationship composite catalog name is not valid UTF-8".to_owned(),
+                )
+            })?;
+            if name.is_empty() {
+                return Err(GraphusError::Storage(
+                    "relationship composite catalog holds an empty index name".to_owned(),
+                ));
+            }
+            let type_token = read_u32(bytes, cur)?;
+            let n_props = read_u32(bytes, cur)? as usize;
+            if n_props == 0 {
+                return Err(GraphusError::Storage(format!(
+                    "relationship composite index {name:?} covers no properties"
+                )));
+            }
+            // Cap by the bytes remaining (see the node composite decoder above): `n_props` is an
+            // untrusted u32 and each property is a 4-byte read, so capacity never legitimately exceeds
+            // `bytes.len()`. Prevents an OOM from a forged count before the per-element reads validate.
+            let mut property_tokens = Vec::with_capacity(n_props.min(bytes.len()));
+            for _ in 0..n_props {
+                property_tokens.push(read_u32(bytes, cur)?);
+            }
+            let state_byte = read_u8(bytes, cur)?;
+            let state = IndexState::from_byte(state_byte).ok_or_else(|| {
+                GraphusError::Storage(format!(
+                    "relationship composite index {name:?} holds unknown state byte {state_byte}"
+                ))
+            })?;
+            if map
+                .insert(
+                    name.clone(),
+                    RelCompositeIndexEntry {
+                        type_token,
+                        property_tokens,
+                        state,
+                    },
+                )
+                .is_some()
+            {
+                return Err(GraphusError::Storage(format!(
+                    "relationship composite catalog repeats index name {name:?}"
                 )));
             }
         }
@@ -3351,6 +3566,89 @@ mod tests {
         let decoded = Statistics::decode(&image).unwrap();
         assert!(decoded.composite_indexes().is_empty());
         assert_eq!(decoded.node_property_indexes().len(), 1);
+    }
+
+    #[test]
+    fn statistics_rel_composite_catalog_round_trips_and_pre_666_image_decodes_empty() {
+        // `rmp` task #666: the composite RELATIONSHIP index catalog rides the same append-only trailing
+        // block discipline as the node composite catalog. Empty map: the block is just a `0` count.
+        let empty = Statistics::new();
+        assert_eq!(Statistics::decode(&empty.encode()).unwrap(), empty);
+
+        // One entry, then several (varying arity + order), keyed by name.
+        let mut s = Statistics::new();
+        s.set_rel_composite_index(
+            "index_KNOWS_a_b".to_owned(),
+            RelCompositeIndexEntry {
+                type_token: 1,
+                property_tokens: vec![2, 3],
+                state: IndexState::Online,
+            },
+        );
+        assert_eq!(Statistics::decode(&s.encode()).unwrap(), s);
+        // Order is significant: (b, a) is a distinct entry from (a, b).
+        s.set_rel_composite_index(
+            "index_KNOWS_b_a".to_owned(),
+            RelCompositeIndexEntry {
+                type_token: 1,
+                property_tokens: vec![3, 2],
+                state: IndexState::Populating,
+            },
+        );
+        s.set_rel_composite_index(
+            "index_RATED_x_y_z".to_owned(),
+            RelCompositeIndexEntry {
+                type_token: 9,
+                property_tokens: vec![4, 5, 6],
+                state: IndexState::Online,
+            },
+        );
+        let back = Statistics::decode(&s.encode()).unwrap();
+        assert_eq!(back, s);
+        assert_eq!(back.rel_composite_indexes().len(), 3);
+        // The equivalence resolver finds the exact ordered tuple, and distinguishes (a,b) from (b,a).
+        assert_eq!(
+            back.rel_composite_index_name_for(1, &[2, 3]),
+            Some("index_KNOWS_a_b")
+        );
+        assert_eq!(
+            back.rel_composite_index_name_for(1, &[3, 2]),
+            Some("index_KNOWS_b_a")
+        );
+        assert_eq!(back.rel_composite_index_name_for(1, &[2, 4]), None);
+        // A relationship-type token never conflates with a node composite over the same numeric token.
+        let mut mixed = back.clone();
+        mixed.set_composite_index(
+            "index_KNOWS_a_b_node".to_owned(),
+            CompositeIndexEntry {
+                label_token: 1,
+                property_tokens: vec![2, 3],
+                state: IndexState::Online,
+            },
+        );
+        let mixed_back = Statistics::decode(&mixed.encode()).unwrap();
+        assert_eq!(mixed_back, mixed);
+        assert_eq!(mixed_back.rel_composite_indexes().len(), 3);
+        assert_eq!(mixed_back.composite_indexes().len(), 1);
+
+        // A pre-#666 image (ending after the spatial extension block, with NO relationship composite
+        // block) decodes to an empty relationship composite catalog, not a truncation error. Build such
+        // an image by encoding a value with no relationship composite indexes and truncating off the
+        // trailing zero-count block (a 4-byte `u32` of `0`), which is now the LAST block.
+        let mut pre666 = Statistics::new();
+        pre666.set_composite_index(
+            "index_Person_a_b".to_owned(),
+            CompositeIndexEntry {
+                label_token: 1,
+                property_tokens: vec![2, 3],
+                state: IndexState::Online,
+            },
+        );
+        let mut image = pre666.encode();
+        image.truncate(image.len() - 4);
+        let decoded = Statistics::decode(&image).unwrap();
+        assert!(decoded.rel_composite_indexes().is_empty());
+        assert_eq!(decoded.composite_indexes().len(), 1);
     }
 
     #[test]
