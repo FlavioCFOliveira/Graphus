@@ -66,6 +66,31 @@ harness_summary() {
 }
 
 # --------------------------------------------------------------------------------------------------
+# Building the example's binaries (shell-side seam)
+# --------------------------------------------------------------------------------------------------
+# harness_build <label> <cargo args...> — builds the binaries an example drives.
+#
+# It builds UNCONDITIONALLY, because cargo is incremental (a no-op when nothing changed). The
+# tempting alternative — build only when the binary file is ABSENT — silently runs a STALE binary
+# after any source edit, so the example's evidence describes code that is no longer the code under
+# test. For a suite whose entire purpose is to produce trustworthy evidence about the CURRENT server,
+# that is the worst failure mode there is, so it is not an option.
+#
+# The one exception is an explicit GRAPHUS_BIN_DIR: the caller is then deliberately pointing at
+# binaries they built themselves (CI artifacts, a host without cargo). We trust those — the callers of
+# this helper still verify the binaries exist and fail loudly if they do not.
+harness_build() {
+  local label="$1"
+  shift
+  if [ -n "${GRAPHUS_BIN_DIR:-}" ]; then
+    info "using prebuilt binaries from GRAPHUS_BIN_DIR ($label not rebuilt)"
+    return 0
+  fi
+  section "Building $label"
+  ( cd "${REPO_ROOT:?harness_build needs REPO_ROOT}" && cargo build "$@" )
+}
+
+# --------------------------------------------------------------------------------------------------
 # Evidence directory + metrics file (shell-side seam)
 # --------------------------------------------------------------------------------------------------
 # evidence_init <evidence-dir> — creates the (git-ignored) evidence dir and starts a metrics file.

@@ -135,19 +135,11 @@ if [ "${SOCIAL_DEGREE_DIST:-uniform}" = "zipf" ]; then
   case " ${GEN_ARGS[*]} " in *" --friend-max "*) : ;; *) GEN_ARGS+=(--friend-max 500) ;; esac
 fi
 
-# Build UNCONDITIONALLY (cargo is incremental — a no-op when nothing changed). Building only when the
-# binary is ABSENT would silently run a STALE binary after any source edit, so the evidence would
-# describe code that is no longer the code under test. Evidence must always come from current sources.
-# The single exception is an explicit GRAPHUS_BIN_DIR: the caller is then pointing at binaries they
-# built (CI artifacts, a host without cargo), so we trust — but verify — them below.
-if [ -z "${GRAPHUS_BIN_DIR:-}" ]; then
-  section "Building the social-network wire client binaries (release, --features wire, no engine)"
-  ( cd "$REPO_ROOT" && cargo build --release -p graphus-social-gen --no-default-features --features wire \
-      --bin social_gen --bin social_wire_load --bin social_bench --bin social_baseline_cmp )
-  if [ "$MODE" = local ]; then
-    section "Building graphus-server (release)"
-    ( cd "$REPO_ROOT" && cargo build --release -p graphus-server )
-  fi
+harness_build "the social-network wire client binaries (release, --features wire, no engine)" \
+  --release -p graphus-social-gen --no-default-features --features wire \
+  --bin social_gen --bin social_wire_load --bin social_bench --bin social_baseline_cmp
+if [ "$MODE" = local ]; then
+  harness_build "graphus-server (release)" --release -p graphus-server
 fi
 for b in "$GEN" "$LOAD" "$BENCH" "$CMP_BIN"; do
   [ -x "$b" ] || { echo "${RED}fatal: required binary not found at $b${RESET}" >&2; exit 2; }
