@@ -281,10 +281,19 @@ fn run() -> Result<(), String> {
         s.bytes_per_relationship = storage.bytes_per_edge;
     }
 
-    // Throughput: elements loaded over the import window; element rate. (Latency percentiles are not
-    // meaningful for a one-shot batch load and stay 0.0.)
+    // Throughput: elements loaded over the import window; element rate. A one-shot batch load has no
+    // per-operation latency to measure, so the percentiles stay 0.0 — and because the schema cannot
+    // omit a field, that MUST be stated, or a reader cannot tell "not measured" from "zero latency".
     collector.throughput_mut().operations = throughput.count();
     collector.throughput_mut().ops_per_sec = elements_per_sec;
+    collector.note(
+        "throughput.p50/p99/p999_latency_ms are 0.0 because they are NOT MEASURED, not because the \
+         load is instantaneous: this is a one-shot offline batch import with no per-operation \
+         request/response boundary to time. The real figure for this workload is ops_per_sec \
+         (elements/sec), which IS measured. (Evidence-honesty rule: measure it or say it is not \
+         measured — never leave a bare zero to be read as a result.)"
+            .to_string(),
+    );
 
     collector.note(format!(
         "Ingest throughput + CPU/RAM/time are the REAL `graphus-bulk import` child process (pid \
