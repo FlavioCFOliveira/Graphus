@@ -42,7 +42,8 @@ use graphus_sim::SimRng;
 use crate::mix::{LoadProfile, MixProfile, WorkloadGen, WorkloadOp};
 use crate::vopr_fault::{FaultBudget, FaultScheduler};
 use crate::vopr_oracle::{
-    OracleError, ShadowGraph, assert_equivalent, is_surfaced_injected_latent_fault,
+    OracleError, ShadowGraph, assert_equivalent, engine_edge_count,
+    is_surfaced_injected_latent_fault,
 };
 
 /// The single Elle object key the safety oracle records the `:Person` id space under. Every committed
@@ -427,6 +428,16 @@ pub struct VoprReport {
     /// Number of `:Person` nodes actually present at the end (queried back). Must equal
     /// `created_nodes` — a liveness/consistency check: no acked create is lost or duplicated.
     pub persisted_nodes: i64,
+    /// Number of `:KNOWS` relationships whose creating transaction **committed** — the shadow model's
+    /// edge count (`rmp` #698). The relationship twin of [`created_nodes`](Self::created_nodes): the
+    /// relationships recovery is obliged to reproduce.
+    pub created_edges: i64,
+    /// Number of `:KNOWS` relationships actually present at the end (queried back through the same
+    /// read-back the reference-model oracle uses, `rmp` #698), or `-1` if the read-back hard-failed
+    /// (e.g. the engine surfaced an injected latent-sector fault). Must equal
+    /// [`created_edges`](Self::created_edges) — the reference-model arm proves the stronger, per-edge
+    /// multiset equality; this scalar exists so a run's *relationship scale* can be reported honestly.
+    pub persisted_edges: i64,
     /// The maximum number of explicit transactions that were **open simultaneously** at any scheduler
     /// step (the interleaver's overlap depth). `>= 2` proves the cooperative interleaver reached a
     /// genuinely concurrent state — multiple transactions in flight at once, single-threaded.
@@ -978,6 +989,15 @@ fn run_inner(cfg: VoprConfig, mode: RunMode) -> (VoprReport, Vec<ElleTxn>, Liven
     // the number of distinct ids among them. They must be equal — no committed create lost, none
     // duplicated — even though contention aborted some transactions along the way.
     let (persisted_nodes, created_nodes) = person_stats(&mut eng);
+    // The relationship twin of the node probe (rmp #698): how many `:KNOWS` edges the committed-only
+    // shadow model holds, and how many the engine actually serves back. Reported so the run's
+    // relationship scale is stated truthfully (the example's evidence used to hard-code `0` edges even
+    // though the workload relates the nodes it creates). A read-back that hard-fails — the engine
+    // SURFACING an injected latent-sector fault rather than serving corrupt bytes — is recorded as
+    // `-1`, never as a fabricated count. The per-edge multiset equality itself is the reference-model
+    // oracle's job (`assert_equivalent`, above), which shares this exact read-back query.
+    let created_edges = oracle.model.count_edges() as i64;
+    let persisted_edges = engine_edge_count(&mut eng).map_or(-1, |c| c as i64);
     let end_time = sched.now();
 
     // Fault-then-heal recovery probe (rmp #240, liveness mode). The workload ran *under* the fault
@@ -1014,6 +1034,8 @@ fn run_inner(cfg: VoprConfig, mode: RunMode) -> (VoprReport, Vec<ElleTxn>, Liven
         end_time,
         created_nodes,
         persisted_nodes,
+        created_edges,
+        persisted_edges,
         max_open_txns,
         committed_txns,
         aborted_txns,
@@ -3069,6 +3091,36 @@ mod tests {
         );
     }
 
+    /// **Regression (`rmp` #698).** The run must report its **relationship** scale truthfully: the
+    /// safety workload relates the nodes it creates, so a recovered run holds `:KNOWS` edges — the
+    /// example's evidence used to hard-code `0` relationships because the run exposed no edge count at
+    /// all. `created_edges` (committed, from the shadow model) and `persisted_edges` (read back from
+    /// the recovered engine) must both be positive somewhere in a sweep, and must agree on every seed
+    /// (a fabricated or drifting count is exactly what this guards).
+    #[test]
+    fn run_reports_the_recovered_relationship_count_truthfully() {
+        let mut edges_seen = false;
+        for seed in 1u64..=20 {
+            let r = run_safety(VoprConfig::safety(seed));
+            assert!(r.safe, "seed {seed} must be safe: {:?}", r.violations);
+            assert!(
+                r.run.persisted_edges >= 0,
+                "seed {seed}: the edge read-back must succeed on a safe run (-1 = it hard-failed)"
+            );
+            assert_eq!(
+                r.run.created_edges, r.run.persisted_edges,
+                "seed {seed}: every committed relationship must survive recovery, and no in-flight \
+                 relationship may persist"
+            );
+            edges_seen |= r.run.persisted_edges > 0;
+        }
+        assert!(
+            edges_seen,
+            "the safety workload relates nodes, so a sweep must recover at least one :KNOWS edge — \
+             reporting 0 relationships would understate the workload"
+        );
+    }
+
     /// **Acceptance (determinism).** Same seed ⇒ identical [`SafetyReport`] — the safety verdict, the
     /// recorded-history length, the violation list and the full underlying run all replay bit-for-bit
     /// (the recorder never perturbs the workload, trace, or engine).
@@ -3167,6 +3219,8 @@ mod tests {
             end_time: 0,
             created_nodes: 5,
             persisted_nodes: 5,
+            created_edges: 0,
+            persisted_edges: 0,
             max_open_txns: 2,
             committed_txns: 5,
             aborted_txns: 0,
