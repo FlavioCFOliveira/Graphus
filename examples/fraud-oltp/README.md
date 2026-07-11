@@ -4,10 +4,10 @@ This example demonstrates Graphus as an **OLTP fraud-detection store** driven ov
 TLS**, using the **official `neo4j-driver`** — the exact wire path the Neo4j driver ecosystem speaks.
 It plants a **known, enumerable** set of fraud structures (rings, mule chains, and **shared-device/IP
 collusion clusters**) into a deterministic, seeded graph, proves the detection workload finds
-**exactly** them, runs a **blended point-lookup OLTP mix**, then stresses the engine with **extreme
-concurrency on the REAL mule supernodes** to exercise Serializable Snapshot Isolation (SSI) — and
-collects standardized **performance evidence**, including **server-side `/metrics` deltas**, across the
-run.
+**exactly** them, runs a **blended point-lookup OLTP mix**, then drives a **production-shaped OLTP
+client** — managed, **retried** double-entry ledger transfers — under **extreme Serializable Snapshot
+Isolation (SSI) contention on the REAL mule supernodes**, and collects standardized **performance
+evidence**, including **server-side `/metrics` deltas**, across the run.
 
 It runs in **two modes**: a **LOCAL** self-boot (a real `graphus-server` with process CPU/RSS +
 on-disk store/WAL metering and a committed-baseline gate) and an **EXTERNAL attach** mode against an
@@ -29,10 +29,11 @@ and it exits non-zero if any assertion fails.
 | 5 | **Shared-device/IP collusion detection** | The generated `device`/`ip` fields carry a planted signal (every fraud cluster shares one device+IP; benign transfers have unique devices), re-identified by a group-by-device query — asserted **exactly** against ground truth. |
 | 6 | **Blended point-lookup OLTP mix** | `account-by-id` (a NODE KEY point read) and a `recent-transfers` statement-of-account read, timed alongside the analytical detection. |
 | 7 | **Constraint enforcement (negative tests)** | The driver observes that a duplicate `Account.id`, a null-`amount` `TRANSFER`, and both a duplicate and a missing `TRANSFER.tx_id` are **rejected** — gated on which constraints the target actually created. |
-| 8 | **Extreme concurrency on REAL supernodes** | Overlapping writer/reader transactions contending on the **actual mule `:Account` supernodes**; reports commit/abort tallies + **write p99**, a **first-class abort-rate band**, and proves **no lost update**. |
-| 9 | **Standardized performance + server-side evidence** | Meters the live server (CPU/RSS + on-disk store/WAL, LOCAL only), throughput + latency + abort rate, AND the **server-side `/metrics` deltas** (committed/aborted/abort_rate/slow-queries/**force-detached**/panics) → `report.json` + `report.md` + `schema.txt`; LOCAL also gates a fresh run against a committed baseline. |
-| 10 | **Per-TRANSFER insert cost curve** | Per-edge insert latency vs cumulative edge count, surfacing the scan-based `RELATIONSHIP KEY` O(E) cost (rmp #683) where the target enforces it. |
-| 11 | **Deterministic SSI repro** | The in-process `dst_contention` binary reproduces the contention byte-identically for a fixed seed (the DST discipline). |
+| 8 | **A PRODUCTION OLTP client under extreme contention** | Every unit of business work is a **double-entry ledger transfer**, driven as a **managed transaction** (`executeWrite`) so the official driver **retries** an SSI abort with bounded exponential backoff until it commits. Reports **both layers of truth** (engine abort rate *and* application commit rate / retries-per-commit / retry-inclusive p50-p999), and asserts the **ledger reconciles** (conserved; nothing lost, nothing double-applied). |
+| 9 | **The driver's retry classification (rmp #612 regression gate)** | A deterministic probe forces a real SSI abort and asserts the **official driver's own classifier** (`neo4j.Neo4jError.isRetriable`) deems it **retryable**. A poison title (`…Transaction.Terminated`) silently breaks `execute_write` for every driver application — this example now **fails** if that regresses. |
+| 10 | **Standardized performance + server-side evidence** | Meters the live server (CPU/RSS + on-disk store/WAL, LOCAL only), throughput + latency + abort rate, AND the **server-side `/metrics` deltas** (committed/aborted/abort_rate/slow-queries/**force-detached**/panics) → `report.json` + `report.md` + `schema.txt`; LOCAL also gates a fresh run against a committed baseline. |
+| 11 | **Per-TRANSFER insert cost curve** | Per-edge insert latency vs cumulative edge count, surfacing the scan-based `RELATIONSHIP KEY` O(E) cost (rmp #683) where the target enforces it. |
+| 12 | **Deterministic SSI repro** | The in-process `dst_contention` binary reproduces the contention byte-identically for a fixed seed (the DST discipline). |
 
 ## The data model (Label Property Graph)
 
@@ -156,26 +157,84 @@ Beyond the analytical detections, `data/detect.js` also runs:
   (`MATCH (a:Account {id: $mule})-[t:TRANSFER]->(b) … ORDER BY t.ts DESC LIMIT 10`, a
   statement-of-account read). Their latency is reported separately (`point_lookup_p99_ms`).
 
-## Extreme concurrency on the REAL mule supernodes
+## A production OLTP client under extreme contention (`rmp #715`)
 
 `data/concurrency.js` contends on the **actual mule `:Account` supernodes** of the loaded graph (the
 highest-degree fan-in/fan-out hubs — read from `ground_truth.mules`), **not** synthetic `:Hot` nodes.
-Many overlapping transactions from concurrent clients each, in **one explicit transaction**, read a
-mule's balance, `SET` it `+= delta`, and `CREATE` a `CONC-`tagged incoming deposit edge — the balance
-`SET` and the edge being atomic. Reader clients run mule statement-of-account aggregations concurrently.
 
-- **No lost update (ambiguity-proof oracle).** For each mule, `final_balance` **must** equal
-  `initial_balance + sum(amount)` over its `CONC-` deposit edges (the `SET` and edge commit atomically),
-  verified from the graph itself — sound regardless of how many `commit()`s were ambiguous over the wire.
-- **The abort rate is a FIRST-CLASS signal.** Deliberately over-contending a couple of supernodes under
-  SSI is **expected** to abort the large majority of writers — that is the finding, not a defect
-  (measured ~0.94 attaching to a live remote instance; a target that also enforces the scan-based `RELATIONSHIP KEY`,
-  which enlarges every writer's read set, aborts even more). The old `±0.50` fractional baseline band
-  could **never fire** against such a high rate, so it is replaced by a **tight, two-sided, absolute
-  band** asserted here: `FRAUD_ABORT_FLOOR ≤ abort_rate ≤ FRAUD_ABORT_CEIL` (default `0.40 … 0.995`) —
-  the floor proves SSI genuinely fired (real contention), the ceiling proves writers still made
-  progress (not a total livelock). The run also reports **write commit p99** and the server-side
-  **force-detached** counter (which must be 0).
+### The unit of work is a double-entry ledger transfer
+
+One business transaction moves `amount` from the writer's own funded settlement account to a mule, as a
+genuine **double-entry** move, atomically in one transaction:
+
+```
+read src.balance, read mule.balance     ← the read-modify-write SSI must serialize
+check sufficient funds                  ← the business rule
+SET src.balance  -= amount              ← the debit
+SET mule.balance += amount              ← the credit (the contended write)
+CREATE (src)-[:TRANSFER {tx_id:'CONC-<client>-<op>', amount, …}]->(mule)   ← the journal entry
+```
+
+Because every committed transfer debits exactly what it credits, **the ledger must reconcile**. `tx_id`
+is keyed to the **business unit** (client+op), never to the attempt, so a transfer the engine wrongly
+committed twice shows up as a duplicate journal entry. (This example previously credited the mule out of
+thin air and never debited any source — so it *could not* detect money being created.)
+
+### Two modes — the default is the retrying client
+
+| Mode | What it does | Why |
+|------|--------------|-----|
+| **`FRAUD_RETRY=1` (default)** | Every transfer is a **managed transaction** through the official driver's `session.executeWrite()`, so a serialization failure is **retried** with the driver's own bounded exponential backoff until it commits or its declared budget (`maxTransactionRetryTime`, 30 s) is exhausted. | This is what **every** official Neo4j driver does. The application-visible outcome of contention is **"slower", not "lost"**. It is also the *only* configuration that exercises the driver's **retry classifier** — the path `rmp #612` broke. |
+| **`FRAUD_RETRY=0`** | One explicit, single-shot transaction per transfer; no retry, so the **raw** engine abort rate is observed directly. | A legitimate **pure-contention isolation** — and how this example used to run. But it is *not* what a production client does, so it is no longer the default. |
+
+### Two layers of truth — never conflated
+
+Measured on this host (9 writers, 2 mule supernodes, 30 transfers each — the **identical** workload and
+the **identical** transaction shape; the *only* difference is whether the client retries):
+
+| | engine abort rate | application commit rate | phase wall | retry-inclusive p99 |
+|---|---|---|---|---|
+| **`FRAUD_RETRY=0`** (isolation) | **0.907** | **0.093** — 91% of the business work is **LOST** | 0.64 s | 127 ms |
+| **`FRAUD_RETRY=1`** (default) | **0.049** | **1.000** — nothing is lost | 4.6 s | 1 154 ms |
+
+Both rows are true, and reporting either one alone misleads:
+
+- The **engine** layer (`throughput.abort_rate` = aborts / attempts) is the **contention evidence**, and
+  it is kept — SSI genuinely fires, hard. But a raw abort rate is *not* an application outcome.
+- The **application** layer (transfers committed, retries per commit, **retry-inclusive** p50/p99/p999,
+  retry-budget exhaustion) is what a real system experiences.
+
+**A high engine abort rate with a 100 % application commit rate is a healthy system under contention.**
+The striking result is that a retrying client does not merely *survive* contention, it largely
+**dissolves** it: backing off after an abort spreads the writers out in time, so the per-attempt conflict
+rate collapses **~18×** (0.907 → 0.049). The cost is paid in **latency** — a ~4 ms median against a
+~1.2 s p99 and a ~3–7 s p999 — never in lost work. The **tail is the whole story**, which is exactly why
+the no-retry client's headline abort rate is a misleading measure of a real system.
+
+### What it asserts
+
+- **Ledger reconciliation.** The **sum of all balances is conserved** across the contention phase
+  (delta must be 0 — money neither created nor destroyed); every mule's credit and every settlement
+  account's debit equals the sum of its committed journal entries; and the journal holds **exactly one
+  entry per committed transfer**, with all `tx_id`s distinct (**nothing lost, nothing double-applied**).
+- **Progress.** Under the retrying client **every** business transfer must commit (0 budget-exhausted);
+  work that never commits under an honest, bounded retry budget is a **write-liveness defect**, not an
+  acceptable outcome.
+- **`rmp #612` cannot regress unnoticed.** A deterministic probe forces a **real** SSI abort (two
+  overlapping read-modify-writes on one account) and asserts the **official driver's own public
+  classifier**, `neo4j.Neo4jError.isRetriable()` — the very function `executeWrite` consults — deems it
+  **retryable**. Graphus must return `Neo.TransientError.Transaction.Outdated`; a poison title such as
+  `…Transaction.Terminated` is **explicitly excluded from retry** by every official driver, which
+  silently turns `execute_write` into a hard failure and makes contention mean **LOST** instead of
+  slower. The probe exists because `executeWrite` *absorbs* the aborts it retries, so a managed-only run
+  never sees the abort code — the probe is where it becomes visible, and its result is reported as
+  `probe_abort_code` / `probe_driver_retriable`.
+- **The engine abort-rate band** stays a first-class, two-sided, absolute signal:
+  `FRAUD_ABORT_FLOOR ≤ engine abort rate ≤ FRAUD_ABORT_CEIL`. The floor proves SSI genuinely fired; the
+  ceiling proves the engine still progressed. The two modes sit at genuinely different points, so they
+  carry **different defaults** — `0.01 … 0.60` when retrying (5× headroom below the measured ~0.05, 12×
+  above), `0.40 … 0.995` in the no-retry isolation. Both are overridable for a differently-sized target.
+- The server-side **force-detached** and **panic** counters must be 0.
 
 ## Schema exercise, investigator query, and negative tests
 
@@ -213,9 +272,22 @@ GRAPHUS_BIN_DIR=target/release examples/fraud-oltp/run.sh
 # Evidence-scale dataset (an order of magnitude larger graph):
 FRAUD_PROFILE=large examples/fraud-oltp/run.sh
 
+# The PURE-CONTENTION isolation: single-shot transactions, no retry, so the RAW engine abort
+# rate is observed directly (~0.91 — and 91% of the business work is lost, which is exactly why
+# this is an experiment and not the default):
+FRAUD_RETRY=0 examples/fraud-oltp/run.sh
+
 # Skip the official-driver (Node) steps — the hermetic generator + DST repro still run:
 RUN_DRIVER=0 examples/fraud-oltp/run.sh
 ```
+
+| Env var | Meaning | Default |
+|---------|---------|---------|
+| `FRAUD_RETRY` | `1` = production client (managed, retried transactions). `0` = pure-contention isolation (no retry). | `1` |
+| `FRAUD_RETRY_BUDGET_MS` | The application's declared retry budget per transfer (`maxTransactionRetryTime`). | `30000` |
+| `FRAUD_ABORT_FLOOR` / `FRAUD_ABORT_CEIL` | The two-sided **engine** abort-rate band. Mode-dependent defaults. | `0.01`/`0.60` retrying; `0.40`/`0.995` no-retry |
+| `FRAUD_PROFILE` | `fast` (default) or `large`. | `fast` |
+| `RUN_DRIVER` | `0` skips the Node/official-driver steps. | auto |
 
 ### Running against an external target
 
@@ -275,14 +347,29 @@ directory: a machine-readable `report.json` and a human-readable `report.md`. Bo
 
 | Section | Captures |
 |---------|----------|
-| `metadata` | scenario id, dataset scale, workload knobs (profile, connection, commit/abort tallies, write p99, point-lookup p99) |
+| `metadata` | scenario id, dataset scale, and the workload knobs — including **both layers**: the application (`oltp_committed`, `oltp_commit_rate`, `oltp_retries_per_commit`, `oltp_max_retries`, `oltp_retry_budget_exhausted`, `oltp_mode`) and the engine (`engine_txn_attempts`, `engine_txn_aborts`, `engine_abort_rate`), plus the separately-named serial phase (`detect_operations`, `detect_p50/p99/p999_ms`, `point_lookup_p99_ms`) |
 | `measurement_mode` | `local` (co-located metering) or `external` (attach — CPU/RSS/storage are N/A) |
 | `host` | os, arch, cpu cores, hostname, rustc version, timestamp |
 | `cpu` | server user / system CPU seconds, mean core utilisation *(LOCAL only)* |
 | `memory` | peak / final server RSS (bytes) *(LOCAL only)* |
 | `storage` | store / WAL bytes + pages, bytes fsynced, write- & space-amplification *(LOCAL only)*. The per-element costs `bytes_per_node` / `bytes_per_relationship` are deliberately **ABSENT** — see below. |
-| `throughput` | operations, ops/sec, p50 / p99 / p999 latency (ms), **abort / conflict rate** |
+| `throughput` | **the OLTP contention phase, and ONLY it** — see the warning below. `operations` = business transfers **committed** (work *done*), `ops_per_sec` = the rate they committed at, `p50/p99/p999` = their **retry-inclusive** latency, `abort_rate` = the **engine's** abort rate over the **very same** transactions. |
+| `phases` | `load+detect+oltp-mix` and `oltp-contention`, each with its real wall-clock |
 | `server_metrics` | **server-side `/metrics` before→after deltas** for the run's database: committed / aborted / **abort_rate** / slow_queries / query-duration percentiles, and the health invariants **statement_panics / engine_recovery_panics / engine_force_detached** (which MUST be 0), plus the SSI-tracked gauge |
+
+> **The `throughput` section used to describe two disjoint sets of transactions (`rmp #715`).**
+> `operations` / `ops_per_sec` / the latency percentiles came from the **serial detect phase** (914
+> load + detection + lookup queries, which never abort), while `abort_rate` came from the **270
+> transactions of the concurrency phase**, which appeared nowhere in `operations`. A reader seeing
+> `operations: 914, abort_rate: 0.878` could only conclude *"802 of my 914 operations failed"* — false
+> in both directions, and a textbook breach of evidence-honesty rule 3 (*every field carries the
+> quantity its name promises*). Every field in `throughput` now describes **one** coherent set of
+> transactions; the detect-phase figures are kept, explicitly named, in `metadata.workload`.
+>
+> Note that `throughput.abort_rate` (aborts / **attempts in the contention phase**) and
+> `server_metrics.abort_rate` (aborted / **all transactions in the database**, the server's own counter)
+> have **different denominators** on purpose: the first is the contention experiment, the second is the
+> whole run's server-side health. Both are correct; they are not interchangeable.
 
 How the figures are sourced (and their honest caveats):
 
@@ -305,13 +392,17 @@ How the figures are sourced (and their honest caveats):
   > **Evidence honesty (`rmp #699`).** The denominator used to be an *invented* `nodes*256 +
   > rels*128` formula — a fabricated logical size, which made the published ratio a fabrication — and
   > `write_amplification` was left at a `0.0` placeholder. Both are now real.
-- **Latency percentiles** are measured **client-side** by `detect.js` (per-operation timings) and
-  emitted as `GRAPHUS_STATS {…}` (including a separate `point_lookup_p99_ms`). The **write-commit p99**
-  comes from `concurrency.js`.
-- **`ops_per_sec`** is the detection workload's operations over the window they were **actually issued
-  in** (`workload_secs`, the summed wall-time of those serial operations, emitted by `detect.js`). It
-  used to be the detection op count divided by the *whole* load + detect + concurrency window — two
-  different windows, which silently understated the rate (`rmp #699`).
+- **`throughput`'s latency percentiles** are the **retry-inclusive** wall-time of a *business transfer*,
+  measured client-side by `concurrency.js`: the clock starts before the first attempt and stops when the
+  transfer finally **commits**, so it includes every retry and every backoff the driver slept through.
+  That is what the application actually waited, and under contention the **tail is the whole story**
+  (a ~4 ms median against a ~1.2 s p99). The serial detect phase's own percentiles are reported
+  separately as `detect_p50/p99/p999_ms` (plus `point_lookup_p99_ms`), because they measure a different,
+  non-contended workload.
+- **`throughput.ops_per_sec`** is the **committed** business transfers over the **contention phase's**
+  wall-clock (`phase_secs`, emitted by `concurrency.js`) — a rate of **work done**. It counts only
+  transfers that actually committed: a throughput figure that counted failures would not be a number a
+  reader could use.
 - **`total_millis`** is the workload's real wall-clock. `measure_server` runs *after* the workload, so
   it is passed in explicitly via `--total-millis`; an unbracketed report timed only its own emission
   (the old committed baseline read `total_millis: 0.044` — 44 microseconds for a multi-second run).
@@ -324,8 +415,9 @@ How the figures are sourced (and their honest caveats):
 - **`GRAPHUS_TXCURVE`** records per-TRANSFER insert latency vs cumulative edge count (rmp #683): where
   the target enforces the scan-based `RELATIONSHIP KEY`, later inserts get dearer (O(E)); where it does
   not, the curve is flat — the report shows the contrast honestly.
-- **ops/sec** uses the detection workload's operation count over the workload window — a coarse
-  throughput proxy, not a saturating benchmark.
+- **This is a contention experiment, not a saturating benchmark.** `ops_per_sec` is the rate at which
+  9 deliberately-over-contending writers got their transfers committed against 2 supernodes; it is a
+  measure of behaviour **under conflict**, and it is not Graphus's write throughput.
 
 ### Variance and the regression baseline (LOCAL only)
 
@@ -336,9 +428,33 @@ stable structural metrics** and ignores the machine-variant ones (in EXTERNAL mo
 
 | Metric family | Tolerance | Why |
 |---------------|-----------|-----|
-| storage bytes / pages, amplification | **15%** | deterministic for a fixed seed+profile; a real footprint regression. The load dominates and is byte-stable; the device/ip values + a handful of concurrency deposit edges move it negligibly. |
-| abort / conflict rate | **+10% rise** | a **tight livelock-drift guard** only: against the ~0.9 baseline it fires past ~0.99. The PRIMARY abort gate is the two-sided **absolute** band asserted first-class in `concurrency.js` (`FRAUD_ABORT_FLOOR..CEIL`), which is meaningful for a near-1.0 rate — the old `+0.50` fractional rise could never fire against a high baseline. |
+| storage bytes / pages, amplification | **15%** | deterministic for a fixed seed+profile; a real footprint regression. |
+| abort / conflict rate | **+200% rise** | a **livelock-drift guard** over a scheduling-variant rate — see below. The PRIMARY abort gate is the two-sided **absolute** band asserted first-class in `concurrency.js` (`FRAUD_ABORT_FLOOR..CEIL`). |
 | throughput, latency p50/p99/p999, CPU, peak RSS | ignored (∞) | vary with machine speed, allocator, OS, scheduling — flaky to gate across machines. |
+
+**The baseline was re-captured for `rmp #715` by *running* the example** (never by editing numbers).
+Two things moved, both honestly and for the same reason — the client now **retries**:
+
+- **`storage.store_bytes` +27.8 % (442 368 → 565 248) and `wal_bytes` +28.3 % (3 982 455 → 5 107 876).**
+  Not a storage regression: it is **more committed work**. The old no-retry client durably wrote only
+  the 13–33 transfers that happened to survive contention; the retrying client commits **all 270**, so
+  270 journal entries plus 540 balance updates plus the settlement-account funding now reach disk.
+- **`throughput.abort_rate` 0.952 → 0.053.** Not an isolation regression: it is the *engine* abort rate
+  of a *retrying* client, and backoff de-synchronises the writers (see the table above).
+
+This also made the **storage gate stronger**. Under the old default the number of transfers that
+survived contention varied run to run (13, then 25, then 33 of 270 — a 2.5× swing), and every surviving
+transfer is durable bytes, so the footprint the 15 % gate compared **swung with it**. Now exactly
+270 of 270 commit on every run, so the dominant term is fixed; only the handful of retried attempts
+varies (13–15 across runs), moving the store image ~1.5 % — comfortably inside the band, where the old
+2.5× swing in committed work was not.
+
+Conversely the **abort-rate gate had to be loosened**, and that is a real trade, stated plainly: at
+~0.9 the rate was structurally saturated and a **+10 %** rise was a meaningful livelock guard (it fired
+past ~0.99). At ~0.05 it is small and **scheduling-variant** — consecutive runs measured 0.046 / 0.049 /
+0.053 / 0.059, a ±12 % spread that a +10 % gate would have failed **on an unchanged codebase**. So the
+guard is now **+200 %** (fires past ~0.15, i.e. a tripling — a retrying client that lost the
+de-synchronising benefit of backoff), and the *real* two-sided assertion lives in `concurrency.js`.
 
 This keeps the gate meaningful (it fails a genuine storage-footprint regression or a write-liveness
 collapse) without being flaky across the developer/CI machines a single committed baseline is shared

@@ -158,8 +158,11 @@ Consequences you can rely on:
   "phases": [ { "name": "warmup", "millis": 2.061 } ],
   // EVERY field below is emitted ONLY IF MEASURED. An absent field = not measured (v3).
   "cpu": {                            // CPU vector — absent entirely for an external target
-    "user_secs": 0.012,
-    "system_secs": 0.004,
+    "user_secs": 0.012,               // NOTE: the OS reports CPU in USER_HZ clock ticks (10ms), so a
+    "system_secs": 0.004,             //   short-lived child can truthfully consume ZERO WHOLE TICKS of
+                                      //   user or system time. A 0.0 in ONE of these beside a non-zero
+                                      //   OTHER is a MEASURED zero (quantisation), not a placeholder —
+                                      //   run-all.sh's audit accepts exactly that case and no other.
     "mean_core_utilisation": 0.32     // total CPU secs / wall secs (1.0 == one core saturated);
                                       //   absent when there was no wall-clock window to divide by
   },
