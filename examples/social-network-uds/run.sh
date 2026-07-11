@@ -347,7 +347,12 @@ tx() {
 }
 
 # count_lines <glob...> — total lines across the matching tally files (0 when none exist).
-count_lines() { cat "$@" 2>/dev/null | wc -l | tr -d ' '; }
+#
+# The trailing `|| true` is load-bearing: under `set -o pipefail` a `cat` over a glob that matches
+# NOTHING fails the whole pipeline (the `2>/dev/null` hides the message, not the exit status), and
+# `set -e` then kills the run. Zero matches is a perfectly legitimate outcome — a workload that
+# happened to hit ZERO SSI aborts has no `.retry` files — so it must report 0, not abort the example.
+count_lines() { cat "$@" 2>/dev/null | wc -l | tr -d ' ' || true; }
 
 # scalar <stmt> — run a single-column, single-row query and print just the value (untimed: assertions
 # must not pollute the workload's latency distribution).
