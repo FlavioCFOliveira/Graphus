@@ -301,13 +301,17 @@ fn run() -> Result<(), String> {
         cfg.ticks, cfg.window, outcome.steady_min_bytes, outcome.steady_max_bytes, outcome.page_high_water,
     ));
     collector.note(
-        "STORAGE FIELDS NOT MEASURED HERE (rmp #694 / #699 — stated, not zero-filled by accident): this \
-         mirror runs the real engine over an IN-MEMORY device and WAL, so there is no store file, no WAL \
-         file and no fsync. storage.wal_bytes, storage.bytes_fsynced, storage.write_amplification and \
-         storage.space_amplification are therefore 0 = NOT MEASURED, not observations. The real durable \
-         bytes, cumulative WAL volume, fsync volume and true write/space amplification are measured by the \
-         FILE-BACKED wire run (`iot_wire` → evidence-wire/report.json), which drives the same workload over \
-         Bolt against a real graphus-server with a real FileBlockDevice and a real segmented WAL."
+        "THIS IS THE CONTROL, NOT THE EVIDENCE (rmp #694 / #699 / #713). This mirror runs the real engine \
+         over an IN-MEMORY device and WAL, so there is no store file, no WAL file and no fsync. \
+         storage.wal_bytes, storage.bytes_fsynced, storage.write_amplification and \
+         storage.space_amplification are therefore ABSENT from this report — since schema v3 an unmeasured \
+         metric is omitted, never emitted as a `0` that would read like an observation. What this \
+         instrument IS good for is exactly what the real server cannot give: a BYTE-REPRODUCIBLE footprint \
+         curve for a fixed seed, which pins the reclamation LOGIC against a committed baseline. \
+         The durable bytes, the cumulative WAL volume, the fsync volume, the true write/space \
+         amplification and the total on-disk footprint are all measured by the PRIMARY report \
+         (`iot_wire` → evidence/report.json), which drives the same workload over Bolt against a real \
+         graphus-server with a real FileBlockDevice and a real segmented WAL. Read that one for storage."
             .to_string(),
     );
     collector.note(format!(

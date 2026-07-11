@@ -1,41 +1,66 @@
 {
-  "version": 2,
+  "version": 3,
   "metadata": {
     "scenario": "iot-timeseries",
-    "description": "IoT / time-series event graph (DETERMINISTIC in-memory mirror): sustained ingest of time-stamped sensor readings under a sliding-window retention policy (delete-old + insert-new churn), proving the engine reaches a steady state (live count ~ window) and the device footprint PLATEAUS under churn — reclaimed slots demonstrably reused, not unbounded growth. Durable bytes, WAL volume, fsync volume and amplification are NOT measurable here (the device and WAL are in memory); the file-backed `iot_wire` run measures those against a real server.",
+    "description": "IoT / time-series event graph, FILE-BACKED over the wire: sustained ingest of time-stamped sensor readings under a sliding-window retention policy, driven over Bolt against a real graphus-server (real FileBlockDevice + real segmented WAL). Proves the durable on-disk store PLATEAUS under delete-old/insert-new churn while the server's reclamation counters climb — reclaimed space demonstrably reused, not unbounded growth.",
     "dataset": {
       "nodes": 208,
       "relationships": 200
     },
     "workload": {
-      "churn_wall_secs": "1.6152",
-      "connection": "in-process (engine seam)",
-      "footprint_high_water_bytes": "139264",
-      "footprint_series": "0:49152 1:73728 2:90112 3:114688 4:139264 5:139264 6:139264 7:139264 8:139264 9:139264 10:139264 11:139264 12:139264 13:139264 14:139264 15:139264 16:139264 17:139264 18:139264 19:139264 20:139264 21:139264 22:139264 23:139264 24:139264 25:139264 26:139264 27:139264 28:139264 29:139264 30:139264 31:139264 32:139264 33:139264 34:139264 35:139264 36:139264 37:139264 38:139264 39:139264 40:139264 41:139264 42:139264 43:139264 44:139264 45:139264 46:139264 47:139264 48:139264 49:139264 50:139264 51:139264 52:139264 53:139264 54:139264 55:139264 56:139264 57:139264 58:139264 59:139264",
-      "ingest_events_per_sec": "1892.0",
-      "ingest_latency_ms": "p50=0.358 p99=3.589 (n=3000)",
-      "ingest_to_window": "15.00",
-      "page_high_water": "17",
-      "plateau_bytes_per_live_reading": "696.3",
-      "plateau_max_bytes": "139264",
-      "plateau_min_bytes": "139264",
-      "plateau_ratio": "1.0000",
-      "profile": "fast",
+      "check: POINT (spatial) proximity returns exactly site 0's sensors": "PASS — near_site0=2, expected=2",
+      "check: Reading without a `value` rejected (existence constraint)": "PASS — rejected: Neo.ClientError.Schema.ConstraintValidationFailed: Node(:Reading) must have the property `value` (existence constraint `reading_value_exists`)",
+      "check: SHOW INDEXES / SHOW CONSTRAINTS expose the declared schema": "PASS — indexes=5 constraints=3",
+      "check: composite windowed read agrees with the :EMITTED traversal": "PASS — by_property=29, by_traversal=29",
+      "check: duplicate Sensor.id rejected (NODE KEY) and nothing created": "PASS — rejected: Neo.ClientError.Schema.ConstraintValidationFailed: Node(:Sensor) already exists with properties `id` = ('s-0') (node-key constraint `sensor_id_key`); sensors=8 (expected 8)",
+      "check: non-INTEGER Reading.ts rejected (property-type constraint)": "PASS — rejected: Neo.ClientError.Schema.ConstraintValidationFailed: Node(:Reading) property `ts` must be of type INTEGER but was FLOAT (property-type constraint `reading_ts_integer`)",
+      "check: steady-state live :Reading count in [window, window + rate)": "PASS — live=200, band=[200, 250), total_ingested=7000",
+      "check: the three rejected writes created nothing (atomicity)": "PASS — live before=200, after the rejections=200",
+      "checkpoint_database_latency_ms": "p50=8.55 p99=15.34 p999=15.34 (n=28)",
+      "checkpoint_every": "5",
+      "checkpoints_issued": "28",
+      "connection": "bolt-uds",
+      "database": "ex_iot-timeseries_1783808062_710597",
+      "doublewrite_bytes": "8871936 (fixed preallocation, not graph data)",
+      "durable_footprint_final_bytes": "25606508",
+      "durable_footprint_min_bytes": "11171141",
+      "durable_footprint_peak_bytes": "79568372",
+      "durable_footprint_peak_over_store": "347x",
+      "durable_footprint_plateau_ratio": "7.12 — the DATABASE does NOT plateau, though its store does; see notes",
+      "ingest_clients": "2",
+      "ingest_to_window": "35.00",
+      "logical_ingested_bytes": "189000",
+      "maintenance_checkpoints_delta": "45",
+      "maintenance_stamps_frozen_delta": "37816",
+      "maintenance_versions_reclaimed_delta": "13600",
       "rate": "50",
-      "retention_delete_latency_ms": "p50=1.853 p99=9.098 (n=56)",
-      "rss_bounded": "false",
-      "rss_post_warmup_max_bytes": "370499584",
-      "rss_post_warmup_min_bytes": "47173632",
-      "rss_series": "0:17453056 1:23547904 2:29229056 3:35024896 4:41234432 5:47173632 6:53178368 7:59179008 8:65318912 9:71278592 10:77254656 11:83161088 12:89075712 13:95109120 14:101158912 15:107155456 16:113098752 17:119422976 18:125325312 19:131305472 20:137252864 21:143163392 22:149045248 23:154996736 24:160899072 25:166871040 26:172793856 27:178741248 28:185139200 29:191148032 30:197087232 31:203022336 32:208916480 33:214818816 34:221286400 35:227590144 36:233562112 37:239460352 38:245391360 39:251322368 40:257318912 41:263208960 42:269119488 43:275021824 44:280993792 45:286932992 46:292876288 47:298782720 48:304734208 49:310640640 50:316588032 51:322506752 52:328400896 53:334471168 54:340488192 55:346505216 56:352407552 57:358617088 58:364531712 59:370499584 60:339902464",
+      "retention_delete_latency_ms": "p50=2.79 p99=4.10 p999=6.24 (n=136)",
+      "retried_ops": "0",
       "seed": "13907095949916593901",
       "sensors": "8",
+      "server_cpu_measured": "yes",
+      "server_proc_io_write_bytes": "188534784",
+      "server_rss_measured": "yes",
       "steady_state_live": "200",
-      "ticks": "60",
-      "total_ingested": "3000",
-      "warmup_ticks": "5",
+      "storage_measured": "yes",
+      "store_plateau_max_bytes": "229376",
+      "store_plateau_min_bytes": "229376",
+      "store_plateau_ratio": "1.0000",
+      "store_series": "0:49152 1:73728 2:90112 3:114688 4:139264 5:139264 6:155648 7:180224 8:212992 9:229376 10:229376 11:229376 12:229376 13:229376 14:229376 15:229376 16:229376 17:229376 18:229376 19:229376 20:229376 21:229376 22:229376 23:229376 24:229376 25:229376 26:229376 27:229376 28:229376 29:229376 30:229376 31:229376 32:229376 33:229376 34:229376 35:229376 36:229376 37:229376 38:229376 39:229376 40:229376 41:229376 42:229376 43:229376 44:229376 45:229376 46:229376 47:229376 48:229376 49:229376 50:229376 51:229376 52:229376 53:229376 54:229376 55:229376 56:229376 57:229376 58:229376 59:229376 60:229376 61:229376 62:229376 63:229376 64:229376 65:229376 66:229376 67:229376 68:229376 69:229376 70:229376 71:229376 72:229376 73:229376 74:229376 75:229376 76:229376 77:229376 78:229376 79:229376 80:229376 81:229376 82:229376 83:229376 84:229376 85:229376 86:229376 87:229376 88:229376 89:229376 90:229376 91:229376 92:229376 93:229376 94:229376 95:229376 96:229376 97:229376 98:229376 99:229376 100:229376 101:229376 102:229376 103:229376 104:229376 105:229376 106:229376 107:229376 108:229376 109:229376 110:229376 111:229376 112:229376 113:229376 114:229376 115:229376 116:229376 117:229376 118:229376 119:229376 120:229376 121:229376 122:229376 123:229376 124:229376 125:229376 126:229376 127:229376 128:229376 129:229376 130:229376 131:229376 132:229376 133:229376 134:229376 135:229376 136:229376 137:229376 138:229376 139:229376",
+      "ticks": "140",
+      "total_ingested": "7000",
+      "wal_peak_bytes": "70467060",
+      "wal_plateaued": "NO — the WAL sawtooths (64 MiB segment-roll reclaim granularity); see notes",
+      "wal_reclaim_events": "2 (freed 131837460 B of WAL disk; the run wrote 150743014 B, past the 67108864 B segment seal threshold, so reclamation was OBSERVABLE and was observed)",
+      "wal_residual_bytes": "16505196",
+      "wal_series": "0:204380 1:377863 2:553553 3:731580 4:1111851 5:1440307 6:1632909 7:1827400 8:2024308 9:2796568 10:4279919 11:5477670 12:6389821 13:7016372 14:7930646 15:9449520 16:10647271 17:11559422 18:12185973 19:13149007 20:14632358 21:15830109 22:16742260 23:18493514 24:19961052 25:21444403 26:22642154 27:23554305 28:24180856 29:25141770 30:26661344 31:27859095 32:28771246 33:29397797 34:30358711 35:31842062 36:33039813 37:33951964 38:35637418 39:37103108 40:38586459 41:39784210 42:40696361 43:41322912 44:42283826 45:43804800 46:45002551 47:45914702 48:46541253 49:47502167 50:48985518 51:50183269 52:51095420 53:52616374 54:54077444 55:55560795 56:56758546 57:57670697 58:58297248 59:59258162 60:60782636 61:61980387 62:62892538 63:63519089 64:64480003 65:65963354 66:67161105 67:68073256 68:2069829 69:3519349 70:5002700 71:6200451 72:7112602 73:7739153 74:8700067 75:10183418 76:11776472 77:12974223 78:13886374 79:15030512 80:16513863 81:17711614 82:18623765 83:20110759 84:21570905 85:23054256 86:24252007 87:25164158 88:25790709 89:26751623 90:28276797 91:29474548 92:30386699 93:31013250 94:31974164 95:33457515 96:34655266 97:35567417 98:36193968 99:38307666 100:39791017 101:40988768 102:41900919 103:42527470 104:43488384 105:44971735 106:46575289 107:47773040 108:48685191 109:49830253 110:51313604 111:52511355 112:53423506 113:55009465 114:56472648 115:57955999 116:59153750 117:60065901 118:60692452 119:61653366 120:63176440 121:64374191 122:65286342 123:65912893 124:66873807 125:68357158 126:69554909 127:70467060 128:4633027 129:6087629 130:7570980 131:8768731 132:9680882 133:10307433 134:11268347 135:12797721 136:13995472 137:14907623 138:15534174 139:16495088",
+      "wal_to_store_ratio_peak": "307.2",
+      "wal_to_store_ratio_residual": "72.0",
+      "wal_written_bytes": "150743014",
+      "warmup_ticks": "15",
       "window": "200"
     },
-    "started_unix_secs": 1783751427
+    "started_unix_secs": 1783808072
   },
   "host": {
     "os": "linux",
@@ -43,46 +68,68 @@
     "cpu_cores": 16,
     "hostname": "ROG",
     "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
-    "timestamp_unix_secs": 1783751427
+    "timestamp_unix_secs": 1783808072
   },
-  "total_millis": 1615.23421,
+  "total_millis": 9214.0198,
   "phases": [
     {
       "name": "churn",
-      "millis": 1615.23421
+      "millis": 9214.0198
     }
   ],
   "cpu": {
-    "user_secs": 1.053769,
-    "system_secs": 0.282743,
-    "mean_core_utilisation": 0.827441612941073
+    "user_secs": 2.1700000000000004,
+    "system_secs": 1.5599999999999998,
+    "mean_core_utilisation": 0.4048178841551871
   },
   "memory": {
-    "peak_rss_bytes": 370499584,
-    "final_rss_bytes": 339902464
+    "peak_rss_bytes": 889212928,
+    "final_rss_bytes": 889212928
   },
   "storage": {
-    "store_bytes": 139264,
-    "wal_bytes": 0,
-    "store_pages": 17,
-    "wal_pages": 0,
-    "bytes_fsynced": 0,
-    "write_amplification": 0.0,
-    "space_amplification": 0.0
+    "store_bytes": 229376,
+    "wal_bytes": 16505196,
+    "store_pages": 28,
+    "wal_pages": 2015,
+    "bytes_fsynced": 150743014,
+    "write_amplification": 798.7957142857143,
+    "space_amplification": 4741.945925925926,
+    "bytes_per_node": 1102.7692307692307,
+    "bytes_per_relationship": 1146.88,
+    "plateau_ratio": 1.0
   },
   "throughput": {
-    "operations": 3056,
-    "ops_per_sec": 1891.9856829926848,
-    "p50_latency_ms": 0.357879,
-    "p99_latency_ms": 3.589267,
-    "p999_latency_ms": 4.531597,
+    "operations": 7164,
+    "ops_per_sec": 759.7118469400293,
+    "p50_latency_ms": 1.949707,
+    "p99_latency_ms": 5.466455,
+    "p999_latency_ms": 9.972026,
     "abort_rate": 0.0
   },
   "measurement_mode": "local",
+  "server_metrics": {
+    "database": "ex_iot-timeseries_1783808062_710597",
+    "transactions_committed": 7292,
+    "transactions_aborted": 3,
+    "abort_rate": 0.00041124057573680605,
+    "slow_queries": 0,
+    "statement_panics": 0,
+    "engine_recovery_panics": 0,
+    "engine_force_detached": 0,
+    "engine_force_detached_active": 0,
+    "ssi_tracked_before": 1,
+    "ssi_tracked_after": 10,
+    "query_count": 7147,
+    "query_duration_mean_ms": 0.2945496012312859,
+    "query_duration_p50_ms": 0.25638542115081076,
+    "query_duration_p99_ms": 1.5174271844660159,
+    "scope_note": ""
+  },
   "notes": [
-    "STORAGE RECLAMATION PLATEAU (the DETERMINISTIC mirror, GATED): over 60 ticks the workload ingested 3000 readings (15.0× the retention window of 200), yet the device footprint PLATEAUED — post-warmup band [139264, 139264]B (plateau_ratio 1.000, page high-water 17 pages, 696B per live reading). storage.store_bytes is that plateau footprint and store_pages the page high-water; both are byte-stable for a fixed seed+profile, and the baseline gate holds them to a tight band. Reclaimed slots are demonstrably reused, not unbounded growth. Every statement is planned against the coordinator's POPULATED IndexCatalog (rmp #694), so the retention DELETE really does seek the Reading.seq RANGE index rather than full-scanning as it silently did before.",
-    "STORAGE FIELDS NOT MEASURED HERE (rmp #694 / #699 — stated, not zero-filled by accident): this mirror runs the real engine over an IN-MEMORY device and WAL, so there is no store file, no WAL file and no fsync. storage.wal_bytes, storage.bytes_fsynced, storage.write_amplification and storage.space_amplification are therefore 0 = NOT MEASURED, not observations. The real durable bytes, cumulative WAL volume, fsync volume and true write/space amplification are measured by the FILE-BACKED wire run (`iot_wire` → evidence-wire/report.json), which drives the same workload over Bolt against a real graphus-server with a real FileBlockDevice and a real segmented WAL.",
-    "PROCESS RSS (machine- AND allocator-variant, NOT gated, informational): an RSS sample was taken every tick over the same loop (full per-tick rss_series + footprint_series in the workload params). Post-warmup RSS spanned [47173632, 370499584]B (rss_bounded=false at the 1.50× heuristic). IMPORTANT: in this single-process inline driver, process RSS is a HIGH-WATER of allocator reservations, not live engine memory — glibc retains freed arenas, so RSS climbs even though the engine's DURABLE state is fully reclaimed (the footprint plateau at a flat 17 pages proves the engine releases its records). RSS is therefore recorded for visibility only; the deterministic FOOTPRINT PLATEAU above is the bounded-resource proof, not RSS.",
-    "RECLAMATION IS OPERATOR-REACHABLE AND AUTOMATIC (rmp #305 — SHIPPED; the earlier revision of this example claimed the opposite, and that claim was STALE). The live server reclaims through two real paths: (1) `CHECKPOINT DATABASE <name>`, a parsed admin statement issuable over Bolt or REST like any other statement, which runs a reader-safe GC pass plus a sharp checkpoint; and (2) a background maintenance cadence that runs the same pass automatically once the WAL has grown by clamp(4 × store_bytes, 8 MiB, 256 MiB) since the last one, with no operator action at all. The explicit per-tick GC pass THIS mirror interleaves is not a workaround for a missing trigger — it is the DETERMINISTIC STAND-IN for those two paths, placing a reclaim at an exact, reproducible point in the tick loop so the footprint curve is byte-reproducible. The real triggers are exercised over the wire by the file-backed `iot_wire` run, whose report gates on the server's own graphus_maintenance_versions_reclaimed_total climbing while the on-disk store plateaus."
+    "STORAGE RECLAMATION PLATEAU (the headline — FILE-BACKED, over the wire): over 140 ticks the workload ingested 7000 readings (35.0× the retention window of 200) into a REAL graphus-server (real FileBlockDevice + real segmented WAL) over bolt-uds. The durable data image PLATEAUED — post-warmup band [229376, 229376]B, ratio 1.000, page high-water 28 pages — while the server's own reclamation counters CLIMBED: graphus_maintenance_versions_reclaimed_total += 13600, graphus_maintenance_checkpoints_total += 45 over the same window (28 CHECKPOINT DATABASE statements issued). Both halves are needed: a flat store alone would also describe a workload that wrote nothing, and a climbing counter alone would not rule out unbounded growth.",
+    "DURABLE WRITE VOLUME (real, measured): the run wrote 150743014 WAL bytes CUMULATIVELY (the sum of the maximum length of every WAL segment ever seen — segments are append-only, and a checkpoint DELETES those below the reclaim floor, so the 16505196B of WAL still on disk at the end badly understates what was written). storage.bytes_fsynced carries that cumulative figure: every WAL byte is fsynced before its commit is acknowledged, so it is the honest durable-sync volume, not an fsync-syscall byte counter. write_amplification = (cumulative WAL + data image) / 189000 logical bytes ingested. The doublewrite buffer (8871936B) is a FIXED per-database preallocation and is deliberately NOT counted as store data — lumping it in would inflate the store and flatter every ratio. Independent cross-check from OUTSIDE the engine: the kernel accounted 188534784 write_bytes to the server process over the same window (/proc/<pid>/io).",
+    "FINDING — THE STORE PLATEAUS; THE DATABASE ON DISK DOES NOT. Read this next to the green `plateau_ratio: 1.000` above, which describes the STORE ALONE.\nMeasured on this run: the data image held FLAT at 229376 B across the whole post-warmup window, while the TOTAL durable footprint (store + WAL) ranged over [11171141, 79568372] B — a plateau ratio of 7.1, and a peak of 79568372 for a 229376 B graph. At its worst this database occupied 347 bytes of disk per byte of graph it holds. The WAL, not the store, is the entire footprint.\nROOT CAUSE (traced, not guessed — rmp #706): WAL disk is reclaimed in whole SEGMENT units, and the active segment is only sealed at DEFAULT_SEGMENT_TARGET_BYTES = 64 MiB (graphus-wal/src/sink.rs:702; the roll test is `active.len >= segment_target` at :898). The background maintenance cadence is adaptive — it fires every clamp(4 x store_bytes, 8 MiB, 256 MiB), i.e. every 8 MiB for a store this size (rmp #556). So the reclaim FLOOR advances promptly and correctly, and versions_reclaimed climbs — but until 64 MiB has accumulated there is no SEALED segment below the floor to delete, and not one byte of WAL disk is freed. When the segment finally rolls, the whole ~63 MiB is released at once. Hence the sawtooth: the cadence was made store-proportional (#556); the reclaim GRANULARITY was not.\nWHY THE RECLAMATION COUNTERS DO NOT CONTRADICT THIS: graphus_maintenance_versions_reclaimed_total counts MVCC versions freed inside the STORE. It is what keeps the store flat, and it is why the store's plateau is real. It says nothing whatsoever about WAL segment files. A climbing counter beside a monotonically-growing WAL is not a paradox — it IS the defect.\nOBSERVED THIS RUN: the run wrote 150743014 B of WAL, crossing the 67108864 B seal threshold, and the on-disk WAL was seen to SHRINK 2 time(s), returning 131837460 B of disk. So reclamation of WAL disk DOES work — it is simply far too coarse to keep a small database small.\nIMPACT: a database holding a few hundred rows still carries up to ~64 MiB of WAL on disk, indefinitely, PER DATABASE. That is NOT a durability defect — nothing is lost, recovery is unaffected, and every byte is fsynced before its commit is acknowledged — it is a resource-efficiency defect, and an acute one on a small target such as a Raspberry Pi 5 hosting several small databases.\nSUGGESTED DIRECTION (rmp #706): make the segment target adaptive in the same spirit as the cadence — e.g. clamp(k x store_bytes, 1 MiB, 64 MiB) — so reclaim granularity tracks the store it protects. NOTE for whoever fixes it: the existing regression test (crates/graphus-cypher/tests/wal_amplification.rs) runs against a MemLogSink, which frees bytes exactly and has no segments at all — so it passes today and CANNOT observe this. The file-backed guard is this example.",
+    "RECLAMATION IS OPERATOR-REACHABLE AND AUTOMATIC (rmp #305 — shipped; this example's earlier claim to the contrary was STALE and is corrected). Two real triggers exist in the live server: (1) `CHECKPOINT DATABASE <name>`, a parsed admin statement issued over Bolt/REST like any other — this run issued 28 of them over the wire; and (2) a background maintenance cadence that runs the same reader-safe GC + sharp checkpoint automatically once the WAL grows by clamp(4 × store_bytes, 8 MiB, 256 MiB) since the last pass, with no operator action at all. Set --checkpoint-every 0 to lean on the cadence alone.",
+    "CONCURRENCY: ingest ran over 2 concurrent Bolt connections, SHARDED BY SENSOR (a connection only ever writes readings from its own sensors), so no two writers contend for the same node's relationship chain — the realistic 'one gateway per group of devices' shape, and conflict-free by construction. Observed retries under SSI: 0 (abort_rate is that figure over all attempted statements — a real observation, not an assumption). The per-tick retention DELETE runs on the control connection AFTER the tick's ingest has fully drained, so it never races the writers."
   ]
 }
