@@ -5,19 +5,44 @@
 //! `iot_wire` measured (`samples.json`) together with the target's Prometheus `/metrics` scraped
 //! **before** and **after** the workload window, and produces `report.json` + `report.md`.
 //!
-//! # The invariant it gates (`--assert`)
+//! # The invariants it gates (`--assert`)
 //!
-//! > **The on-disk store PLATEAUS while `graphus_maintenance_versions_reclaimed_total` CLIMBS.**
+//! > **The on-disk STORE plateaus while `graphus_maintenance_versions_reclaimed_total` climbs — and the
+//! > durability that costs is MEASURED, BOUNDED, and reported for the DATABASE, not just the store.**
 //!
-//! Both halves are load-bearing, and neither is sufficient alone:
-//!
-//! * A flat store on its own proves nothing — a workload that wrote nothing also has a flat store.
-//! * A climbing reclamation counter on its own proves nothing — an engine could be reclaiming while the
-//!   footprint still grows without bound.
-//!
+//! The plateau half needs both of its own halves, since neither is sufficient alone: a flat store on its
+//! own proves nothing (a workload that wrote nothing is also flat), and a climbing reclamation counter on
+//! its own proves nothing (an engine could reclaim while the footprint still grows without bound).
 //! Together they are the claim: under a *sustained* delete-old/insert-new churn that ingests many times
 //! the retention window, the engine physically reclaims the tombstoned versions and **new inserts reuse
-//! the freed space**, so the durable footprint stops growing.
+//! the freed space**, so the store stops growing.
+//!
+//! But the store is not the database. The gates added in `rmp` #713 exist because the store's plateau was
+//! being published as if it settled the footprint question, while the WAL — 258x the store, and growing
+//! monotonically — sat unexamined in a secondary report nothing read and nothing gated:
+//!
+//! * **Anti-rot** — if write statements were committed, `wal_bytes` / `bytes_fsynced` / the logical
+//!   payload MUST be non-zero. A commit is not durable until its redo record is fsynced, so a real
+//!   file-backed run cannot commit thousands of writes and report no WAL. A zero here is a *measurement*
+//!   defect (classically: classifying the WAL by leaf file name — see [`graphus_iot_gen::footprint`]),
+//!   and it now FAILS the run instead of publishing `write_amplification: 0`.
+//! * **A per-commit WAL FLOOR** — the subtler half, and the one a ceiling can never supply. An
+//!   under-counted WAL makes every amplification figure *fall*, so it sails under any ceiling and reads
+//!   like a triumph. The floor encodes the physics instead: N commits imply at least N fsynced redo
+//!   records, and one record header alone is ~53 B. It is independent of store size, so — unlike an
+//!   amplification floor, which the ~1.2x data image can satisfy by coincidence — it cannot be fooled.
+//! * **Write amplification** — measured, reported, and held under a CEILING. Not a target: the number is
+//!   bad today, and an upper bound is the only honest way to gate a known-bad figure — it cannot be
+//!   satisfied by regressing, and it need not be relaxed to accept a fix.
+//! * **Total durable footprint** — the store + the WAL, banded across the run, with its own plateau ratio
+//!   and its own ceiling. This is the disk an operator actually provisions.
+//! * **WAL reclamation actually happened** — asserted whenever the run wrote enough WAL to seal a
+//!   segment. The maintenance counters cannot stand in for this: they count MVCC versions freed in the
+//!   *store* and climb happily while zero bytes of WAL disk come back.
+//!
+//! Every one of those rules is a pure function of the samples ([`WireSamples::storage_gate`]), and every
+//! one is unit-tested to FIRE on the defect it names. A gate nobody can test is a gate nobody can trust:
+//! the bug being remediated here is, precisely, a gate that could not fire.
 //!
 //! The gate also holds the server's reliability counters to zero (no statement panics, no engine
 //! recovery panics, no force-detached engines) and requires the functional wire checks to have passed.
@@ -36,7 +61,8 @@
 //! ```text
 //! iot_wire_evidence --samples <samples.json> --evidence-dir <dir>
 //!                   [--metrics-before <f.prom>] [--metrics-after <f.prom>]
-//!                   [--plateau-factor 1.10] [--min-ingest-to-window 3.0] [--assert]
+//!                   [--plateau-factor 1.10] [--min-ingest-to-window 3.0]
+//!                   [--max-write-amplification 1000] [--max-footprint-ratio 450] [--assert]
 //! ```
 
 #![forbid(unsafe_code)]
@@ -47,7 +73,7 @@ use std::time::Duration;
 use graphus_examples_harness::{
     DatasetScale, EvidenceCollector, MeasurementMode, RunMetadata, ServerMetricsSection, scrape,
 };
-use graphus_iot_gen::wire_samples::WireSamples;
+use graphus_iot_gen::wire_samples::{StorageGate, WireSamples};
 
 /// Prometheus series the reclamation proof reads directly (the harness's `ServerMetricsSection` covers
 /// the transaction/reliability families, but not the maintenance family, so they are read here).
@@ -175,6 +201,69 @@ fn run() -> Result<bool, String> {
                         "NO — the WAL sawtooths (64 MiB segment-roll reclaim granularity); see notes"
                             .to_owned()
                     }
+                    None => "not measured".to_owned(),
+                },
+            );
+            // ------------------------------------------------------------------------------------
+            // THE TOTAL DURABLE FOOTPRINT — what the DATABASE costs on disk, not what one component
+            // of it costs. `storage.plateau_ratio` reports the STORE's plateau (that is what the
+            // schema defines it as), and the store's plateau is a genuine 1.000. But a reader who
+            // stops there has been told a true thing about a component in place of a false thing
+            // about the whole: the database on disk does NOT plateau, because the WAL does not.
+            // Both numbers, side by side, under names that say which is which (`rmp` #713).
+            // ------------------------------------------------------------------------------------
+            w.insert(
+                "durable_footprint_peak_bytes".into(),
+                st.footprint_peak_bytes.to_string(),
+            );
+            w.insert(
+                "durable_footprint_min_bytes".into(),
+                st.footprint_min_bytes.to_string(),
+            );
+            w.insert(
+                "durable_footprint_final_bytes".into(),
+                st.footprint_final_bytes.to_string(),
+            );
+            if let Some(r) = s.durable_footprint_plateau_ratio() {
+                w.insert(
+                    "durable_footprint_plateau_ratio".into(),
+                    format!(
+                        "{r:.2}{}",
+                        if r <= 1.10 {
+                            " (FLAT)"
+                        } else {
+                            " — the DATABASE does NOT plateau, though its store does; see notes"
+                        }
+                    ),
+                );
+            }
+            if let Some(r) = s.footprint_peak_over_store() {
+                w.insert(
+                    "durable_footprint_peak_over_store".into(),
+                    format!("{r:.0}x"),
+                );
+            }
+            // Did WAL disk physically come back? The maintenance counters cannot answer this: they
+            // count reclaimed MVCC versions in the STORE and climb happily while the WAL frees nothing.
+            w.insert(
+                "wal_reclaim_events".into(),
+                match s.sealed_a_segment() {
+                    Some(true) => format!(
+                        "{} (freed {} B of WAL disk; the run wrote {} B, past the {} B segment seal \
+                         threshold, so reclamation was OBSERVABLE and was observed)",
+                        st.wal_reclaim_events,
+                        st.wal_reclaimed_bytes,
+                        st.wal_written_bytes,
+                        graphus_iot_gen::wire_samples::WAL_SEGMENT_TARGET_BYTES,
+                    ),
+                    Some(false) => format!(
+                        "{} — THE RUN WAS TOO SHORT TO SEAL A SEGMENT: it wrote only {} B of WAL, below \
+                         the {} B seal threshold, so NO WAL disk could be freed however many checkpoints \
+                         ran. Use the `reclaim` profile (the default) to observe the full cycle",
+                        st.wal_reclaim_events,
+                        st.wal_written_bytes,
+                        graphus_iot_gen::wire_samples::WAL_SEGMENT_TARGET_BYTES,
+                    ),
                     None => "not measured".to_owned(),
                 },
             );
@@ -437,19 +526,22 @@ fn gate(
         ));
     }
 
-    // 3. THE PLATEAU (local only — the store lives on this host).
-    if let Some(st) = &s.storage {
-        match s.plateau_ratio() {
-            Some(r) if r <= args.plateau_factor => {}
-            Some(r) => failures.push(format!(
-                "the on-disk store did NOT plateau: the post-warmup data image spans [{}, {}]B, a \
-                 ratio of {r:.3} (> {:.2}) — reclamation is not keeping up with the churn, so the \
-                 footprint is growing without bound",
-                st.plateau_min_data_bytes, st.plateau_max_data_bytes, args.plateau_factor
-            )),
-            None => failures.push("the store plateau could not be computed".to_owned()),
-        }
-    }
+    // 3. THE STORAGE INVARIANTS — the store plateau, the anti-rot gate, the write-amplification and
+    //    total-footprint ceilings, and "did WAL disk actually come back?".
+    //
+    //    They live in the LIBRARY (`WireSamples::storage_gate`), not here, for one reason: a gate nobody
+    //    can test is a gate nobody can trust — and this example is remediating a gate that could not
+    //    fire. As a pure function of the samples, it is unit-tested against a run with a zeroed WAL,
+    //    which PROVES it fails. See `wire_samples::tests`.
+    //
+    //    In attach mode `storage` is absent and this returns nothing: a gate must not punish a run for
+    //    being unable to measure what lives on another host.
+    failures.extend(s.storage_gate(&StorageGate {
+        plateau_factor: args.plateau_factor,
+        max_write_amplification: args.max_write_amplification,
+        max_footprint_ratio: args.max_footprint_ratio,
+        ..StorageGate::default()
+    }));
 
     // 4. RECLAMATION CLIMBED. Without this, a flat store proves nothing (a workload that wrote nothing
     //    is also flat).
@@ -587,34 +679,76 @@ fn add_notes(collector: &mut EvidenceCollector, s: &WireSamples, m: Option<&Main
         // The WAL's behaviour is a separate, real, measured server inefficiency — and an example whose
         // job is evidence must not quietly round it away.
         // ------------------------------------------------------------------------------------------
-        let wal_flat = s.wal_plateaued(1.5).unwrap_or(true);
+        // ------------------------------------------------------------------------------------------
+        // THE HEADLINE CAVEAT, stated where a reader cannot miss it. The example's claim —
+        // "reclamation holds the footprint flat" — is TRUE of the store and FALSE of the database.
+        // Quoting only the store's flat plateau would be a true sentence deployed to create a false
+        // impression, which is precisely the failure mode the evidence-honesty rules exist to stop.
+        // ------------------------------------------------------------------------------------------
         collector.note(format!(
-            "FINDING — THE ON-DISK WAL DOES NOT PLATEAU (the store does; the WAL SAWTOOTHS). Measured on \
-             this run: the data image held flat at {}B while the on-disk WAL climbed to a PEAK of {}B — a \
-             peak WAL/store ratio of {}, against a residual-at-exit ratio of only {} (which is why the \
-             residual figure alone must never be quoted: it depends purely on where in the sawtooth the \
-             run stopped). Post-warmup WAL plateau within 1.5x: {}.\n\
-             ROOT CAUSE (traced, not guessed): WAL disk is reclaimed in whole SEGMENT units, and the \
-             active segment is only sealed at DEFAULT_SEGMENT_TARGET_BYTES = 64 MiB \
-             (graphus-wal/src/sink.rs). The background maintenance cadence, meanwhile, is adaptive — it \
-             fires every clamp(4 x store_bytes, 8 MiB, 256 MiB), i.e. every 8 MiB for a store this size \
-             (rmp #556). So the reclaim FLOOR advances promptly and correctly, but for the first 64 MiB of \
-             WAL there is no SEALED segment below it to delete, and no disk is freed at all. Once the \
-             segment finally rolls, the whole 64 MiB is released at once — hence the sawtooth. The cadence \
-             was made store-proportional; the reclaim GRANULARITY was not.\n\
+            "FINDING — THE STORE PLATEAUS; THE DATABASE ON DISK DOES NOT. Read this next to the green \
+             `plateau_ratio: {:.3}` above, which describes the STORE ALONE.\n\
+             Measured on this run: the data image held FLAT at {} B across the whole post-warmup window, \
+             while the TOTAL durable footprint (store + WAL) ranged over [{}, {}] B — a plateau ratio of \
+             {}, and a peak of {} for a {} B graph. At its worst this database occupied {} of disk per \
+             byte of graph it holds. The WAL, not the store, is the entire footprint.\n\
+             ROOT CAUSE (traced, not guessed — rmp #706): WAL disk is reclaimed in whole SEGMENT units, \
+             and the active segment is only sealed at DEFAULT_SEGMENT_TARGET_BYTES = 64 MiB \
+             (graphus-wal/src/sink.rs:702; the roll test is `active.len >= segment_target` at :898). The \
+             background maintenance cadence is adaptive — it fires every clamp(4 x store_bytes, 8 MiB, \
+             256 MiB), i.e. every 8 MiB for a store this size (rmp #556). So the reclaim FLOOR advances \
+             promptly and correctly, and versions_reclaimed climbs — but until 64 MiB has accumulated \
+             there is no SEALED segment below the floor to delete, and not one byte of WAL disk is freed. \
+             When the segment finally rolls, the whole ~63 MiB is released at once. Hence the sawtooth: \
+             the cadence was made store-proportional (#556); the reclaim GRANULARITY was not.\n\
+             WHY THE RECLAMATION COUNTERS DO NOT CONTRADICT THIS: \
+             graphus_maintenance_versions_reclaimed_total counts MVCC versions freed inside the STORE. It \
+             is what keeps the store flat, and it is why the store's plateau is real. It says nothing \
+             whatsoever about WAL segment files. A climbing counter beside a monotonically-growing WAL is \
+             not a paradox — it IS the defect.\n\
+             OBSERVED THIS RUN: {}\n\
              IMPACT: a database holding a few hundred rows still carries up to ~64 MiB of WAL on disk, \
-             indefinitely. That is not a durability defect (nothing is lost, recovery is unaffected) but \
-             it is a real footprint defect, and it scales per-database — acutely so on a small target like \
-             a Raspberry Pi 5 hosting several small databases.\n\
-             SUGGESTED DIRECTION: make the segment target adaptive in the same spirit as the cadence, e.g. \
-             clamp(k x store_bytes, 1 MiB, 64 MiB), so reclaim granularity tracks the store it protects.",
+             indefinitely, PER DATABASE. That is NOT a durability defect — nothing is lost, recovery is \
+             unaffected, and every byte is fsynced before its commit is acknowledged — it is a \
+             resource-efficiency defect, and an acute one on a small target such as a Raspberry Pi 5 \
+             hosting several small databases.\n\
+             SUGGESTED DIRECTION (rmp #706): make the segment target adaptive in the same spirit as the \
+             cadence — e.g. clamp(k x store_bytes, 1 MiB, 64 MiB) — so reclaim granularity tracks the \
+             store it protects. NOTE for whoever fixes it: the existing regression test \
+             (crates/graphus-cypher/tests/wal_amplification.rs) runs against a MemLogSink, which frees \
+             bytes exactly and has no segments at all — so it passes today and CANNOT observe this. The \
+             file-backed guard is this example.",
+            s.plateau_ratio().unwrap_or(f64::NAN),
             st.data_bytes,
-            st.wal_peak_bytes,
-            s.wal_to_store_ratio_peak()
-                .map_or("not measured".to_owned(), |r| format!("{r:.0}x")),
-            s.wal_to_store_ratio()
-                .map_or("not measured".to_owned(), |r| format!("{r:.0}x")),
-            if wal_flat { "yes" } else { "NO" },
+            st.footprint_min_bytes,
+            st.footprint_peak_bytes,
+            s.durable_footprint_plateau_ratio()
+                .map_or("not measured".to_owned(), |r| format!("{r:.1}")),
+            st.footprint_peak_bytes,
+            st.data_bytes,
+            s.footprint_peak_over_store()
+                .map_or("not measured".to_owned(), |r| format!("{r:.0} bytes")),
+            match s.sealed_a_segment() {
+                Some(true) => format!(
+                    "the run wrote {} B of WAL, crossing the {} B seal threshold, and the on-disk WAL \
+                     was seen to SHRINK {} time(s), returning {} B of disk. So reclamation of WAL disk \
+                     DOES work — it is simply far too coarse to keep a small database small.",
+                    st.wal_written_bytes,
+                    graphus_iot_gen::wire_samples::WAL_SEGMENT_TARGET_BYTES,
+                    st.wal_reclaim_events,
+                    st.wal_reclaimed_bytes,
+                ),
+                Some(false) => format!(
+                    "this run wrote only {} B of WAL — BELOW the {} B segment seal threshold — so it \
+                     never sealed a segment and NOT ONE BYTE of WAL disk was reclaimable, however many \
+                     checkpoints ran. Its WAL climbed monotonically and nothing came back. That is the \
+                     defect in its purest form: a small database never even reaches the granularity at \
+                     which the engine is able to free anything.",
+                    st.wal_written_bytes,
+                    graphus_iot_gen::wire_samples::WAL_SEGMENT_TARGET_BYTES,
+                ),
+                None => "not measured".to_owned(),
+            },
         ));
     }
 
@@ -641,6 +775,32 @@ fn add_notes(collector: &mut EvidenceCollector, s: &WireSamples, m: Option<&Main
 }
 
 fn print_summary(s: &WireSamples, m: Option<&Maintenance>) {
+    // A dedicated, greppable FINDING line, so `run.sh` can surface the durability cost verbatim rather
+    // than fishing it out of a prose summary. The whole point of this example is that this number is
+    // impossible to miss.
+    if let Some(st) = &s.storage {
+        eprintln!(
+            "iot_wire_evidence: FINDING store={} B (PLATEAU ratio {:.3}) | durable_footprint peak={} B \
+             min={} B ratio={} | peak_per_byte_of_graph={} | write_amplification={} | wal_written={} B \
+             ({} B/commit) | wal_reclaim_events={} freeing {} B",
+            st.data_bytes,
+            s.plateau_ratio().unwrap_or(f64::NAN),
+            st.footprint_peak_bytes,
+            st.footprint_min_bytes,
+            s.durable_footprint_plateau_ratio()
+                .map_or("n/a".to_owned(), |r| format!("{r:.2}")),
+            s.footprint_peak_over_store()
+                .map_or("n/a".to_owned(), |r| format!("{r:.0}x")),
+            s.write_amplification()
+                .map_or("NOT MEASURED".to_owned(), |w| format!("{w:.1}x")),
+            st.wal_written_bytes,
+            st.wal_written_bytes
+                .checked_div(s.ingest_ops.saturating_add(s.delete_ops))
+                .unwrap_or(0),
+            st.wal_reclaim_events,
+            st.wal_reclaimed_bytes,
+        );
+    }
     eprint!(
         "iot_wire_evidence: {} ticks, {} ingested ({:.1}× window), steady live {}",
         s.ticks,
@@ -650,8 +810,9 @@ fn print_summary(s: &WireSamples, m: Option<&Maintenance>) {
     );
     if let Some(st) = &s.storage {
         eprint!(
-            " | store plateau [{}, {}]B ratio {:.3} ({} pages) | WAL written {}B, peak {}B, residual \
-             {}B, peak WAL/store {}",
+            " | STORE plateau [{}, {}]B ratio {:.3} ({} pages) | WAL written {}B, peak {}B, residual \
+             {}B, {} reclaim event(s) freeing {}B | DURABLE FOOTPRINT (store+WAL) [{}, {}]B ratio {}, \
+             peak {} per byte of graph",
             st.plateau_min_data_bytes,
             st.plateau_max_data_bytes,
             s.plateau_ratio().unwrap_or(0.0),
@@ -659,7 +820,13 @@ fn print_summary(s: &WireSamples, m: Option<&Maintenance>) {
             st.wal_written_bytes,
             st.wal_peak_bytes,
             st.wal_bytes,
-            s.wal_to_store_ratio_peak()
+            st.wal_reclaim_events,
+            st.wal_reclaimed_bytes,
+            st.footprint_min_bytes,
+            st.footprint_peak_bytes,
+            s.durable_footprint_plateau_ratio()
+                .map_or("n/a".to_owned(), |r| format!("{r:.1}")),
+            s.footprint_peak_over_store()
                 .map_or("n/a".to_owned(), |r| format!("{r:.0}x")),
         );
     }
@@ -723,6 +890,8 @@ struct Args {
     metrics_after: Option<String>,
     plateau_factor: f64,
     min_ingest_to_window: f64,
+    max_write_amplification: f64,
+    max_footprint_ratio: f64,
     assert_invariants: bool,
 }
 
@@ -734,6 +903,13 @@ impl Args {
         let mut metrics_after = None;
         let mut plateau_factor = 1.10;
         let mut min_ingest_to_window = 3.0;
+        // Ceilings, not targets. Both figures are BAD today (`rmp` #706 is open), and these bounds sit
+        // just above the measured values so the example FAILS if the WAL gets worse, while any genuine
+        // improvement — a smaller segment target, a leaner redo record — passes freely. An upper bound
+        // is the only kind of gate that can hold a known-bad number honestly: it cannot be satisfied by
+        // regressing, and it does not have to be relaxed to accept a fix.
+        let mut max_write_amplification = StorageGate::default().max_write_amplification;
+        let mut max_footprint_ratio = StorageGate::default().max_footprint_ratio;
         let mut assert_invariants = false;
 
         let mut it = std::env::args().skip(1);
@@ -754,12 +930,23 @@ impl Args {
                         .parse()
                         .map_err(|_| "--min-ingest-to-window expects a float".to_owned())?;
                 }
+                "--max-write-amplification" => {
+                    max_write_amplification = value()?
+                        .parse()
+                        .map_err(|_| "--max-write-amplification expects a float".to_owned())?;
+                }
+                "--max-footprint-ratio" => {
+                    max_footprint_ratio = value()?
+                        .parse()
+                        .map_err(|_| "--max-footprint-ratio expects a float".to_owned())?;
+                }
                 "--assert" => assert_invariants = true,
                 "-h" | "--help" => {
                     eprintln!(
                         "usage: iot_wire_evidence --samples <samples.json> --evidence-dir <dir> \
                          [--metrics-before <f>] [--metrics-after <f>] [--plateau-factor 1.10] \
-                         [--min-ingest-to-window 3.0] [--assert]"
+                         [--min-ingest-to-window 3.0] [--max-write-amplification 1000] \
+                         [--max-footprint-ratio 450] [--assert]"
                     );
                     std::process::exit(0);
                 }
@@ -775,6 +962,9 @@ impl Args {
         if plateau_factor <= 1.0 {
             return Err("--plateau-factor must be > 1.0".to_owned());
         }
+        if max_write_amplification <= 0.0 || max_footprint_ratio <= 0.0 {
+            return Err("the amplification/footprint ceilings must be > 0".to_owned());
+        }
         Ok(Self {
             samples,
             evidence_dir,
@@ -782,6 +972,8 @@ impl Args {
             metrics_after,
             plateau_factor,
             min_ingest_to_window,
+            max_write_amplification,
+            max_footprint_ratio,
             assert_invariants,
         })
     }

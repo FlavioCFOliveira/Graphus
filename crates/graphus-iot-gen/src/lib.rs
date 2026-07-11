@@ -195,6 +195,37 @@ impl GenConfig {
         }
     }
 
+    /// The **reclaim** profile — the DEFAULT for the file-backed wire run, and the only profile sized
+    /// so the WAL's reclamation cycle is actually *observable* (`rmp` #713).
+    ///
+    /// # Why the fast profile cannot certify reclamation
+    ///
+    /// WAL disk is freed in whole **segment** units, and a segment is only sealed once it reaches
+    /// `DEFAULT_SEGMENT_TARGET_BYTES` = 64 MiB (`graphus-wal/src/sink.rs`). Measured on this workload,
+    /// one reading costs ~21.5 KB of WAL, so the `fast` profile's 3,000 readings produce ~59 MB — it
+    /// stops just *below* the seal threshold. Its WAL therefore climbs monotonically and **not one byte
+    /// is ever reclaimed**: a run that never seals a segment can neither observe reclamation nor prove
+    /// its absence is benign. An example whose headline is "reclamation holds the footprint flat" must
+    /// not be sized so that the reclamation it claims never runs.
+    ///
+    /// # Sizing (measured, not guessed)
+    ///
+    /// 140 ticks × 50 readings = 7,000 readings ≈ 150 MB of cumulative WAL — enough to seal and free
+    /// **two** segments (observed at ticks 68 and 128, each returning ~63 MiB), while ending at a
+    /// ~16.5 MB residual, far from the next seal boundary so the end state is stable rather than a
+    /// coin-flip on which side of the sawtooth the run stopped. The churn loop runs in ~9.5 s, so it
+    /// stays inside a CI budget (`rmp` #704), and it is byte-for-byte reproducible across runs.
+    #[must_use]
+    pub fn reclaim() -> Self {
+        Self {
+            seed: 0xC0FF_EE15_600D_5EED,
+            sensors: 8,
+            rate: 50,
+            window: 200,
+            ticks: 140,
+        }
+    }
+
     /// The **soak** profile — a long, sustained run rather than a burst. The audit of this example
     /// (`rmp` #694) found its scale was "a few-thousand-record burst, not sustained", which is the
     /// wrong shape for a *retention* claim: a plateau only means something if it is held for a long
@@ -216,12 +247,13 @@ impl GenConfig {
         }
     }
 
-    /// Resolves a profile name (`"fast"` / `"large"` / `"soak"`) to a config; unknown names fall back
-    /// to `fast`. The single knob most worth overriding from the CLI — the retention `window` — is
-    /// left to the caller to patch after resolving.
+    /// Resolves a profile name (`"fast"` / `"reclaim"` / `"large"` / `"soak"`) to a config; unknown
+    /// names fall back to `fast`. The single knob most worth overriding from the CLI — the retention
+    /// `window` — is left to the caller to patch after resolving.
     #[must_use]
     pub fn from_profile(name: &str) -> Self {
         match name {
+            "reclaim" => Self::reclaim(),
             "large" => Self::large(),
             "soak" => Self::soak(),
             _ => Self::fast(),

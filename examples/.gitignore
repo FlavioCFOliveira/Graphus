@@ -2,7 +2,13 @@
 # (See examples/README.md — the `evidence/` convention.)
 **/evidence/
 # Some examples emit a SECOND report for a distinct measurement mode, so it can stand beside the first
-# rather than overwrite it (iot-timeseries: `evidence/` is the deterministic in-memory mirror the
-# committed baseline gates; `evidence-wire/` is the file-backed over-the-wire run that carries the real
-# durable-byte evidence). Same rule: generated at run time, never committed.
-**/evidence-wire/
+# rather than overwrite it. In iot-timeseries, `evidence/` is the PRIMARY report — the file-backed run
+# against a real server, which carries the durable-byte evidence — and `evidence-mirror/` is the
+# deterministic in-memory CONTROL beside it. (Before `rmp` #713 those roles were inverted: the simulator
+# was the headline and the real server's report was a side file nothing gated. The rename is the fix.)
+# Same rule: generated at run time, never committed.
+**/evidence-mirror/
+
+# Python bytecode caches from the REST example's generator (never source, never evidence).
+__pycache__/
+*.pyc

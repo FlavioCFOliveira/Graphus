@@ -45,7 +45,7 @@
 //! ```text
 //! iot_wire --socket <path> | --bolt bolt[+ssc]://host:port
 //!          --user U --password P --db <database> --samples <out.json>
-//!          [--profile fast|large|soak] [--sensors N] [--rate N] [--window N] [--ticks N] [--seed N]
+//!          [--profile fast|reclaim|large|soak] [--sensors N] [--rate N] [--window N] [--ticks N] [--seed N]
 //!          [--ingest-clients N] [--checkpoint-every N]
 //!          [--db-store-path <dir>] [--server-pid <pid>]
 //! ```
@@ -359,6 +359,9 @@ fn run() -> Result<bool, String> {
     // segment is append-only, so its maximum length is what the engine wrote into it before a
     // checkpoint reclaimed (deleted) it.
     let mut wal_written: BTreeMap<PathBuf, u64> = BTreeMap::new();
+    // Observed WAL-disk reclamation: how many times the on-disk WAL physically shrank, and by how much.
+    let mut wal_reclaim_events = 0u64;
+    let mut wal_reclaimed_bytes = 0u64;
     let mut total_ingested = 0u64;
     let mut logical_ingested_bytes = 0u64;
     let mut retried_ops = 0u64;
@@ -426,16 +429,20 @@ fn run() -> Result<bool, String> {
 
         // 4. Sample: the live count over the wire, and (locally) the REAL on-disk footprint.
         let live = scalar(&mut control, &db, "MATCH (r:Reading) RETURN count(r) AS c")? as u64;
-        let (store_data_bytes, wal_bytes) = match &args.db_store_path {
+        let (store_data_bytes, store_bytes, wal_bytes) = match &args.db_store_path {
             Some(path) => {
                 let fp = footprint::measure(path);
                 for (seg, len) in footprint::wal_segments(path) {
                     let e = wal_written.entry(seg).or_insert(0);
                     *e = (*e).max(len);
                 }
-                (Some(fp.data_bytes), Some(fp.wal_bytes))
+                (
+                    Some(fp.data_bytes),
+                    Some(fp.store_bytes()),
+                    Some(fp.wal_bytes),
+                )
             }
-            None => (None, None),
+            None => (None, None, None),
         };
         if let Some(pid) = args.server_pid {
             if let Some(rss) = proc_rss_bytes(pid) {
@@ -443,12 +450,23 @@ fn run() -> Result<bool, String> {
             }
         }
 
+        // A WAL that SHRANK since the previous tick is the one directly-observable proof that a sealed
+        // segment was physically deleted and its disk returned. (The maintenance counters cannot show
+        // this: they count reclaimed MVCC versions in the STORE, and they climb happily while the WAL
+        // frees nothing at all — see `rmp` #706.)
+        if let (Some(prev), Some(now)) = (series.last().and_then(|s| s.wal_bytes), wal_bytes) {
+            if now < prev {
+                wal_reclaim_events += 1;
+                wal_reclaimed_bytes += prev - now;
+            }
+        }
         series.push(WireTick {
             tick: t.tick,
             total_ingested,
             live_readings: live,
             checkpointed,
             store_data_bytes,
+            store_bytes,
             wal_bytes,
         });
         if t.tick % 10 == 0 || t.tick + 1 == args.cfg.ticks {
@@ -514,6 +532,27 @@ fn run() -> Result<bool, String> {
             .max()
             .unwrap_or(fp.wal_bytes)
             .max(fp.wal_bytes);
+        // The TOTAL durable footprint band (store + WAL) over the post-warmup window — the disk the
+        // database actually occupies. The store's own band plateaus; this one does not, and an example
+        // that reported only the former would be telling the truth about a component in order to tell a
+        // falsehood about the whole (`rmp` #713).
+        let post_footprint: Vec<u64> = series
+            .iter()
+            .filter(|s| s.tick >= warmup_ticks)
+            .filter_map(WireTick::durable_bytes)
+            .collect();
+        let footprint_final = fp.total_bytes();
+        let footprint_min = post_footprint
+            .iter()
+            .copied()
+            .min()
+            .unwrap_or(footprint_final);
+        let footprint_peak = post_footprint
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(footprint_final)
+            .max(footprint_final);
         WireStorage {
             data_bytes: fp.data_bytes,
             dwb_bytes: fp.dwb_bytes,
@@ -524,6 +563,11 @@ fn run() -> Result<bool, String> {
             plateau_min_data_bytes: plateau_min,
             plateau_max_data_bytes: plateau_max,
             plateau_max_data_pages: plateau_max.div_ceil(PAGE_SIZE),
+            footprint_min_bytes: footprint_min,
+            footprint_peak_bytes: footprint_peak,
+            footprint_final_bytes: footprint_final,
+            wal_reclaim_events,
+            wal_reclaimed_bytes,
             server_io_write_bytes: match (io_before, args.server_pid.and_then(proc_write_bytes)) {
                 (Some(b), Some(a)) => Some(a.saturating_sub(b)),
                 _ => None,
@@ -900,7 +944,7 @@ impl Args {
                 "-h" | "--help" => {
                     eprintln!(
                         "usage: iot_wire (--socket <path> | --bolt <url>) --user U --password P \
-                         --db <database> --samples <out.json> [--profile fast|large|soak] \
+                         --db <database> --samples <out.json> [--profile fast|reclaim|large|soak] \
                          [--sensors N] [--rate N] [--window N] [--ticks N] [--seed N] \
                          [--ingest-clients N] [--checkpoint-every N] [--db-store-path <dir>] \
                          [--server-pid <pid>] [--scenario <name>]"
