@@ -174,7 +174,8 @@ const CODE_RUNTIME_ARGUMENT: &str = "Neo.ClientError.Statement.ArgumentError";
 /// which silently breaks managed-transaction retry (`session.execute_write`) for serialization
 /// conflicts. `Outdated` ("transaction state invalidated by concurrent updates; retry may succeed")
 /// is the semantically-accurate title for an optimistic SSI abort and is NOT rewritten, so drivers
-/// correctly see `is_retryable() == true`. (rmp #612; found via the pi516 real-driver stability run.)
+/// correctly see `is_retryable() == true`. (rmp #612; found via a real-driver stability run against a
+/// live remote instance.)
 const CODE_TXN_CONFLICT_RETRYABLE: &str = "Neo.TransientError.Transaction.Outdated";
 const CODE_DB_UNKNOWN: &str = "Neo.DatabaseError.General.UnknownError";
 const CODE_REQUEST_INVALID: &str = "Neo.ClientError.Request.Invalid";

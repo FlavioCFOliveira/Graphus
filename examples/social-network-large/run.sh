@@ -25,7 +25,7 @@
 #                       (report.json with the server-PID scaling curve + real p50/p99 per rung), and
 #                       gates the STRUCTURAL counts against the committed baseline.
 #   EXTERNAL (attach) — when ANY of GRAPHUS_TARGET_{BOLT,REST,UDS} is set, attaches to an
-#                       ALREADY-RUNNING instance (local OR remote, e.g. pi516) over Bolt-over-TCP + TLS.
+#                       ALREADY-RUNNING instance (local OR remote) over Bolt-over-TCP + TLS.
 #                       It carves out a dedicated, isolated database, loads a SMALL graph over Bolt with
 #                       a version-tolerant schema (an older server may lack the modern FULLTEXT/TEXT
 #                       DDL — the driver's capability preflight drops any family the target cannot

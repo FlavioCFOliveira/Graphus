@@ -370,7 +370,7 @@ mod tests {
         let args = Args::try_parse_from([
             "graphus-cli",
             "--bolt",
-            "bolt+ssc://100.89.148.30:7687",
+            "bolt+ssc://203.0.113.10:7687",
             "--database",
             "analytics",
             "-u",
@@ -380,7 +380,7 @@ mod tests {
         ])
         .expect("bolt args parse");
         assert!(args.uds.is_none());
-        assert_eq!(args.bolt.as_deref(), Some("bolt+ssc://100.89.148.30:7687"));
+        assert_eq!(args.bolt.as_deref(), Some("bolt+ssc://203.0.113.10:7687"));
         assert_eq!(args.database.as_deref(), Some("analytics"));
         assert_eq!(args.user, "graphus");
         assert_eq!(args.command.as_deref(), Some("RETURN 1 AS one"));

@@ -308,15 +308,28 @@ zeroed with an explicit note. Consequently, **a committed baseline must always b
 local boot run** — an external run is never a baseline candidate, and `measure_target` replaces the
 host-specific baseline diff with the host-independent invariant gate above.
 
-Example — drive a seam-aware example against the live demo instance over TLS:
+The target is **any** Graphus instance you can reach — there is no privileged or hard-coded host.
+Point the `GRAPHUS_TARGET_*` variables at it and the same example runs unchanged:
 
 ```bash
-GRAPHUS_TARGET_REST=https://100.89.148.30:7474 \
-GRAPHUS_TARGET_BOLT=bolt+ssc://100.89.148.30:7687 \
-GRAPHUS_TARGET_USER=graphus GRAPHUS_TARGET_PASSWORD=graphus-local \
+# An instance already running on THIS machine (the common case: you booted it yourself):
+GRAPHUS_TARGET_REST=https://127.0.0.1:7474 \
+GRAPHUS_TARGET_BOLT=bolt+ssc://127.0.0.1:7687 \
+GRAPHUS_TARGET_USER=graphus GRAPHUS_TARGET_PASSWORD=… \
 GRAPHUS_TARGET_TLS_INSECURE=1 \
 examples/<scenario-name>/run.sh
+
+# …or an instance on ANOTHER host — staging, a container, a small ARM box, production:
+GRAPHUS_TARGET_REST=https://graphus.example.com:7474 \
+GRAPHUS_TARGET_BOLT=bolt+ssc://graphus.example.com:7687 \
+GRAPHUS_TARGET_USER=graphus GRAPHUS_TARGET_PASSWORD=… \
+examples/<scenario-name>/run.sh
 ```
+
+`GRAPHUS_TARGET_TLS_INSECURE=1` (and the `bolt+ssc://` scheme) accepts a **self-signed** certificate:
+it encrypts, but it does **not** authenticate the peer. That is the right setting for a box you booted
+yourself; against anything else, present a certificate your trust store accepts and use `bolt+s://`
+without the insecure flag.
 
 Durability/crash-recovery examples (`social-network-uds`, `durability-crash-recovery`) are
 **local-only by construction** — they own the server lifecycle to inject a crash and prove recovery,

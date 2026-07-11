@@ -26,8 +26,7 @@
 //!
 //! - **Local (`--socket` + `--server-pid`)** — Bolt-over-UDS against a co-located server whose pid is
 //!   known, so the full `/proc` per-thread scaling diagnosis is available.
-//! - **Attach (`--bolt <url>`)** — Bolt-over-TCP + TLS against an ALREADY-RUNNING, possibly remote /
-//!   older instance (e.g. pi516; `bolt+ssc://` accepts a self-signed cert). No co-located pid, so
+//! - **Attach (`--bolt <url>`)** — Bolt-over-TCP + TLS against an ALREADY-RUNNING, possibly remote / older instance (`bolt+ssc://` accepts a self-signed cert). No co-located pid, so
 //!   `/proc` sampling is off; the server-side channel is the target's `/metrics` scraped by `run.sh`
 //!   and folded in by `measure_target`. The driver prints client-side stats sentinels
 //!   `GRAPHUS_SOCIAL_BENCH_STATS` / `_RUNG` and writes no `report.json` of its own in attach mode.

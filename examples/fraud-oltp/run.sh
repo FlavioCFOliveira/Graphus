@@ -12,7 +12,7 @@
 #                       before/after delta (`inject_server_metrics`), and gates the run against the
 #                       committed `baseline.json`.
 #   EXTERNAL (attach) — when ANY of GRAPHUS_TARGET_{BOLT,REST,UDS} is set, attaches to an
-#                       ALREADY-RUNNING instance (local OR remote, e.g. pi516). It carves out a
+#                       ALREADY-RUNNING instance (local OR remote). It carves out a
 #                       dedicated, isolated database (session `{database}` routing), runs the same
 #                       load + detect + concurrency there, scrapes the target's `/metrics` before +
 #                       after, emits an EXTERNAL-mode report via `measure_target` (server-side

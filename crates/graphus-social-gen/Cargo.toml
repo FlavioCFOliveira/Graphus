@@ -139,7 +139,7 @@ path = "src/bin/social_baseline_cmp.rs"
 
 # The OVER-THE-WIRE loader (`wire` feature): drives the deterministic graph into an ALREADY-RUNNING /
 # self-booted server, either via REST network bulk-import (Mode A, a plaintext-loopback dev server) or
-# via Bolt-over-TCP+TLS UNWIND writes (attach to a remote/older instance, e.g. pi516), asserts the
+# via Bolt-over-TCP+TLS UNWIND writes (attach to a remote/older instance), asserts the
 # round-tripped counts, declares a version-tolerant schema, and smoke-tests every battery family.
 # Usage: cargo run -p graphus-social-gen --features wire --bin social_wire_load -- --rest 127.0.0.1:PORT ...
 [[bin]]

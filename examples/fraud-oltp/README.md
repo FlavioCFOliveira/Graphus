@@ -11,7 +11,7 @@ run.
 
 It runs in **two modes**: a **LOCAL** self-boot (a real `graphus-server` with process CPU/RSS +
 on-disk store/WAL metering and a committed-baseline gate) and an **EXTERNAL attach** mode against an
-**already-running instance** — local or remote (e.g. `pi516`) — into a dedicated, isolated database.
+**already-running instance** — local or remote — into a dedicated, isolated database.
 See [Running against an external target](#running-against-an-external-target).
 
 It is both a runnable **demonstration** and an executable **E2E test**: every step asserts its
@@ -169,7 +169,7 @@ mule's balance, `SET` it `+= delta`, and `CREATE` a `CONC-`tagged incoming depos
   verified from the graph itself — sound regardless of how many `commit()`s were ambiguous over the wire.
 - **The abort rate is a FIRST-CLASS signal.** Deliberately over-contending a couple of supernodes under
   SSI is **expected** to abort the large majority of writers — that is the finding, not a defect
-  (measured ~0.94 attaching to `pi516`; a target that also enforces the scan-based `RELATIONSHIP KEY`,
+  (measured ~0.94 attaching to a live remote instance; a target that also enforces the scan-based `RELATIONSHIP KEY`,
   which enlarges every writer's read set, aborts even more). The old `±0.50` fractional baseline band
   could **never fire** against such a high rate, so it is replaced by a **tight, two-sided, absolute
   band** asserted here: `FRAUD_ABORT_FLOOR ≤ abort_rate ≤ FRAUD_ABORT_CEIL` (default `0.40 … 0.995`) —
@@ -227,9 +227,9 @@ CPU/RSS + storage are N/A remotely and no baseline is gated), and **DROPS the is
 exit** — never touching the target's own data.
 
 ```bash
-# Attach to a remote instance (e.g. pi516) over Bolt+TLS + REST, into an isolated DB:
-GRAPHUS_TARGET_BOLT=bolt+ssc://100.89.148.30:7687 \
-GRAPHUS_TARGET_REST=https://100.89.148.30:7474 \
+# Attach to a remote instance over Bolt+TLS + REST, into an isolated DB:
+GRAPHUS_TARGET_BOLT=bolt+ssc://graphus.example.com:7687 \
+GRAPHUS_TARGET_REST=https://graphus.example.com:7474 \
 GRAPHUS_TARGET_USER=graphus GRAPHUS_TARGET_PASSWORD=graphus-local \
 GRAPHUS_TARGET_TLS_INSECURE=1 \
   examples/fraud-oltp/run.sh

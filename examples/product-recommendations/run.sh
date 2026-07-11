@@ -21,7 +21,7 @@
 #                       emits standardized evidence, and gates the STRUCTURAL metrics against the
 #                       committed baseline.
 #   EXTERNAL (attach) — when ANY of GRAPHUS_TARGET_{BOLT,REST,UDS} is set, attaches to an
-#                       ALREADY-RUNNING instance (local OR remote, e.g. pi516) over Bolt-over-TCP + TLS.
+#                       ALREADY-RUNNING instance (local OR remote) over Bolt-over-TCP + TLS.
 #                       It carves out a dedicated, isolated database, loads the graph over Bolt with a
 #                       VERSION-TOLERANT minimal schema (`reco_load --bolt`; an older server may not
 #                       support the modern VECTOR/property-type DDL), scrapes the target's `/metrics`

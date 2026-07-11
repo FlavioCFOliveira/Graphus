@@ -26,7 +26,7 @@
 # wire load is isolated in a dedicated database dropped on exit.
 #
 # The wire step runs against a self-booted local plaintext-loopback REST server by default, or ATTACHES
-# to an already-running instance (local OR remote, e.g. pi516) when a GRAPHUS_TARGET_* endpoint is set
+# to an already-running instance (local OR remote) when a GRAPHUS_TARGET_* endpoint is set
 # (the shared external-target seam in `_harness/harness.sh`).
 #
 # Usage:
@@ -36,7 +36,7 @@
 #   RUN_WIRE=0                      examples/bulk-etl/run.sh   # offline core only (no server)
 #   GRAPHUS_TARGET_REST=https://host:7474 GRAPHUS_TARGET_USER=graphus \
 #     GRAPHUS_TARGET_PASSWORD=graphus-local GRAPHUS_TARGET_TLS_INSECURE=1 \
-#     examples/bulk-etl/run.sh                     # stream into an already-running instance (e.g. pi516)
+#     examples/bulk-etl/run.sh                     # stream into an already-running instance
 #
 # Requirements: a Unix host (Linux/macOS), bash, curl. The offline core needs no network; the wire step
 # needs a REST-reachable server (self-booted locally, or the GRAPHUS_TARGET_REST target).
@@ -228,7 +228,7 @@ fi
 # isolated in a dedicated database (harness_target_ensure_db) dropped on exit (harness_target_drop_db).
 #
 # It runs against a self-booted local plaintext-loopback REST server by default, or ATTACHES to an
-# already-running instance (local OR remote, e.g. pi516) when a GRAPHUS_TARGET_* endpoint is set.
+# already-running instance (local OR remote) when a GRAPHUS_TARGET_* endpoint is set.
 # ==================================================================================================
 
 # The generator's node + relationship CSV file names, in load order (must match bulk_gen).
@@ -399,7 +399,7 @@ EOF
     #    join key and is NOT stored as a queryable property (verified — `keys(n)` carries no `id`), so
     #    the id-anchored constraint palette (NODE KEY / UNIQUE on `.id`) is documented but not applied
     #    here. What IS exercised: a RANGE index on a real timeline property + property-type constraints
-    #    (satisfied by construction). An OLDER server may reject some DDL (e.g. pi516 rejects the typed
+    #    (satisfied by construction). An OLDER server may reject some DDL (e.g. a staging or production host rejects the typed
     #    TEXT/FULLTEXT index DDL and the `SHOW ... YIELD` projection form) — each statement is therefore
     #    best-effort and NON-FATAL; the count of accepted statements is reported.
     section "Step 5 — version-tolerant online DDL over the network-loaded data + schema evidence"

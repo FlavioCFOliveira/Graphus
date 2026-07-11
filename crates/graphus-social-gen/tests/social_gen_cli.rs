@@ -1,6 +1,7 @@
 //! Integration tests for the `social_gen` binary's CLI surface — specifically the `--format csv`
 //! mode and the `--users`/`--articles`/`--friend-min`/`--friend-max`/`--avg-likes`/`--seed` profile
-//! overrides added for `rmp` task #521 (the network bulk-import pi516 validation, which needed a
+//! overrides added for `rmp` task #521 (the network bulk-import validation against a live remote
+//! instance, which needed a
 //! way to request a custom-scale dataset without inventing a new named profile). The override /
 //! validation logic lives only in the binary (`src/bin/social_gen.rs`), not in the library, so it is
 //! exercised here by spawning the compiled binary rather than by calling `graphus_social_gen`

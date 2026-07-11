@@ -4,7 +4,7 @@
 // `neo4j-driver` npm package (the exact wire path the Neo4j driver ecosystem uses).
 //
 // It runs UNCHANGED against a self-booted local server OR an already-running instance (local or
-// remote, e.g. pi516): the caller passes a full Bolt URI and — for the attach path — the name of the
+// remote, e.g. a staging or production host): the caller passes a full Bolt URI and — for the attach path — the name of the
 // run-scoped, isolated database the harness carved out. Every session is bound to that database.
 //
 // What it exercises (rmp #690):

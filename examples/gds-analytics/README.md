@@ -263,8 +263,8 @@ deltas) by the `measure_target` harness binary.
 ```bash
 # Attach to a remote instance (here a Raspberry-Pi 5 over Tailscale). BOLT drives the driver; REST
 # handles login, the isolated-DB DDL and /metrics.
-GRAPHUS_TARGET_BOLT=bolt+ssc://100.89.148.30:7687 \
-GRAPHUS_TARGET_REST=https://100.89.148.30:7474 \
+GRAPHUS_TARGET_BOLT=bolt+ssc://graphus.example.com:7687 \
+GRAPHUS_TARGET_REST=https://graphus.example.com:7474 \
 GRAPHUS_TARGET_USER=graphus GRAPHUS_TARGET_PASSWORD=graphus-local \
 GRAPHUS_TARGET_TLS_INSECURE=1 \
 examples/gds-analytics/run.sh

@@ -9,7 +9,7 @@ reads scale across CPU cores or hit the single-engine-thread ceiling.
 It runs in two modes. **Local** (default) boots a **real `graphus-server`**, loads a large graph over
 the wire, and drives a **concurrency ladder** of simultaneous Bolt-over-UDS clients while sampling the
 server's per-thread CPU/RSS/IO from `/proc`. **External / attach** (any `GRAPHUS_TARGET_*` set) drives
-the *same* ladder against an **already-running instance** (local or remote, e.g. pi516) over
+the *same* ladder against an **already-running instance** (local or remote) over
 **Bolt-over-TCP + TLS**, in a dedicated isolated database, and collects server-side evidence from the
 target's Prometheus `/metrics` (there is no co-located pid to sample). Either way it collects explicit
 evidence across the performance vectors it can observe (throughput, latency, and — locally — CPU / RAM
@@ -141,15 +141,15 @@ VECTOR/property-type DDL is skipped — an older server may not support it), so 
 ladder runs against whatever schema the target accepts.
 
 ```bash
-GRAPHUS_TARGET_BOLT=bolt+ssc://100.89.148.30:7687 \
-GRAPHUS_TARGET_REST=https://100.89.148.30:7474 \
+GRAPHUS_TARGET_BOLT=bolt+ssc://graphus.example.com:7687 \
+GRAPHUS_TARGET_REST=https://graphus.example.com:7474 \
 GRAPHUS_TARGET_USER=graphus GRAPHUS_TARGET_PASSWORD=graphus-local \
 GRAPHUS_TARGET_TLS_INSECURE=1 \
   examples/product-recommendations/run.sh
 ```
 
 `bolt+ssc://` accepts a self-signed certificate (the traffic stays encrypted; the peer is not
-authenticated) — the mode for demo boxes like pi516; use `bolt+s://` against a server whose cert
+authenticated) — the mode for a demo / staging box with a self-signed cert; use `bolt+s://` against a server whose cert
 chains to a public root. External-mode knobs (all optional): `RECO_EXTERNAL_LADDER` (default
 `1,2,4,8,16`), `RECO_EXTERNAL_OPS` (default `2000`), `RECO_WRITERS` (default `0`),
 `RECO_WRITE_EVERY_MS` (default `0`), `RECO_TARGET_RPS` (default `0` = closed-loop),
@@ -266,7 +266,7 @@ The exact numbers are host-dependent (they vary with core count, allocator, and 
 the committed baseline gates only on the *structural* counts and the performance figures are read off
 each run's `report.md` / `report.json`.
 
-In **attach mode** against a remote box (e.g. pi516, a 4-core Raspberry Pi), the same signal appears
+In **attach mode** against a remote box (e.g. a staging or production host, a 4-core Raspberry Pi), the same signal appears
 as the client-side throughput-vs-concurrency curve rising to a plateau near the host's core count,
 corroborated by the `/metrics` `server_metrics` delta (the committed-transaction count climbing with
 the workload). There is no `/proc` per-thread breakdown remotely, so the client-side scaling verdict

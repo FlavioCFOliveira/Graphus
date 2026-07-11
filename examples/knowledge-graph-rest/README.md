@@ -262,8 +262,8 @@ was found. This is the shared external-target seam in `examples/_harness/harness
 contract.
 
 ```bash
-# attach to an already-running instance (e.g. pi516), isolated + cleaned up:
-GRAPHUS_TARGET_REST=https://100.89.148.30:7474 \
+# attach to an already-running instance, isolated + cleaned up:
+GRAPHUS_TARGET_REST=https://graphus.example.com:7474 \
   GRAPHUS_TARGET_USER=graphus GRAPHUS_TARGET_PASSWORD=graphus-local \
   GRAPHUS_TARGET_TLS_INSECURE=1 \
   examples/knowledge-graph-rest/run.sh

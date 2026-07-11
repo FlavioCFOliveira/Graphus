@@ -512,10 +512,10 @@ fn parse_f64(s: &str) -> Option<f64> {
 mod tests {
     use super::*;
 
-    /// A verbatim `/metrics` scrape captured from a live Graphus instance (pi516). Embedding the real
+    /// A verbatim `/metrics` scrape captured from a live Graphus instance. Embedding the real
     /// output — including the global and per-database `query_duration` histograms — proves the parser
     /// against genuine server exposition rather than a hand-tuned fixture.
-    const PI516_SAMPLE: &str = r#"# HELP graphus_transactions_committed_total Transactions committed successfully.
+    const LIVE_SAMPLE: &str = r#"# HELP graphus_transactions_committed_total Transactions committed successfully.
 # TYPE graphus_transactions_committed_total counter
 graphus_transactions_committed_total 191
 # HELP graphus_transactions_aborted_total Transactions aborted or rolled back.
@@ -610,8 +610,8 @@ graphus_db_query_duration_seconds_count{database="graphus"} 46
 "#;
 
     #[test]
-    fn parses_pi516_sample_scalars_and_gauges() {
-        let snap = parse(PI516_SAMPLE);
+    fn parses_live_sample_scalars_and_gauges() {
+        let snap = parse(LIVE_SAMPLE);
 
         // Plain counters and gauges are keyed by full name.
         assert_eq!(
@@ -643,8 +643,8 @@ graphus_db_query_duration_seconds_count{database="graphus"} 46
     }
 
     #[test]
-    fn parses_pi516_sample_global_histogram() {
-        let snap = parse(PI516_SAMPLE);
+    fn parses_live_sample_global_histogram() {
+        let snap = parse(LIVE_SAMPLE);
         let hist = snap
             .histogram("graphus_query_duration_seconds")
             .expect("global query-duration histogram present");
@@ -662,8 +662,8 @@ graphus_db_query_duration_seconds_count{database="graphus"} 46
     }
 
     #[test]
-    fn parses_pi516_sample_per_database_series() {
-        let snap = parse(PI516_SAMPLE);
+    fn parses_live_sample_per_database_series() {
+        let snap = parse(LIVE_SAMPLE);
 
         // Per-database scalars keyed by the `database` label.
         assert_eq!(

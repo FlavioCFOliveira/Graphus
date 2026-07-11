@@ -13,7 +13,7 @@
 #     set (server CPU/RSS, on-disk TENANT store/WAL footprint, a committed-baseline regression gate)
 #     plus a server-side /metrics delta including the auth-failure signal.
 #   * EXTERNAL / ATTACH — when any of GRAPHUS_TARGET_{BOLT,REST,UDS} is set, it does NOT boot a server:
-#     it attaches to the ALREADY-RUNNING instance (local or remote, e.g. pi516) via the shared
+#     it attaches to the ALREADY-RUNNING instance (local or remote) via the shared
 #     external-target seam in `_harness/harness.sh`, authenticates with POST /auth/login, provisions an
 #     ISOLATED, NAMESPACED set of tenants/roles/users (idempotent, IF NOT EXISTS), drives the RBAC +
 #     cross-tenant + DENY (feature-detected) wire legs against it, scrapes the target's /metrics
@@ -30,8 +30,8 @@
 #   GRAPHUS_BIN_DIR=target/release SEC_PROFILE=large  examples/security-multitenant/run.sh
 #   RUN_DRIVER=0                                      examples/security-multitenant/run.sh
 #
-#   # EXTERNAL / ATTACH — against an already-running instance (e.g. pi516), isolated + cleaned up:
-#   GRAPHUS_TARGET_REST=https://100.89.148.30:7474 GRAPHUS_TARGET_BOLT=bolt+ssc://100.89.148.30:7687 \
+#   # EXTERNAL / ATTACH — against an already-running instance, isolated + cleaned up:
+#   GRAPHUS_TARGET_REST=https://graphus.example.com:7474 GRAPHUS_TARGET_BOLT=bolt+ssc://graphus.example.com:7687 \
 #     GRAPHUS_TARGET_USER=graphus GRAPHUS_TARGET_PASSWORD=graphus-local \
 #     GRAPHUS_TARGET_TLS_INSECURE=1 examples/security-multitenant/run.sh
 

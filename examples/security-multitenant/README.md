@@ -14,7 +14,7 @@ every cell over both. It runs in **two modes**:
   backup roundtrip), and collects the full evidence set (server CPU/RSS, on-disk **tenant** store/WAL
   footprint, a committed-baseline regression gate) plus a server-side `/metrics` delta.
 - **EXTERNAL / ATTACH** — when any of `GRAPHUS_TARGET_{BOLT,REST,UDS}` is set, it does **not** boot a
-  server: it attaches to an **already-running** instance (local or remote, e.g. `pi516`) via the shared
+  server: it attaches to an **already-running** instance (local or remote) via the shared
   external-target seam, authenticates with `POST /auth/login`, provisions an **isolated, namespaced**
   set of tenants/roles/users (idempotent, `IF NOT EXISTS`), drives the RBAC + cross-tenant + DENY
   (feature-detected) wire legs, scrapes the target's `/metrics` (incl. the auth-failure signal) via
@@ -152,7 +152,7 @@ edit scope — reported for fixing, not fixed here):
    Bolt authentication failures (`listeners/bolt.rs`) and by a bad Bearer on the `/metrics` endpoint
    itself (`listeners/extra_routes.rs`). A REST **data-plane** 401 (missing/invalid Bearer on
    `/db/*/tx/commit`) and a `/auth/login` failure do **not** bump it — they only emit an audit record
-   via `RestAuthObserver::on_auth_failure` (`engine/seam_rest.rs`). **Repro (pi516, verified this
+   via `RestAuthObserver::on_auth_failure` (`engine/seam_rest.rs`). **Repro (verified against a live remote instance, this
    session):** counter `4` → bad-Bearer `GET /metrics` → `5`; a data-plane `POST /db/graphus/tx/commit`
    with no Bearer (401) and a `POST /auth/login` with bad creds (401) both leave it at `5`. The demo
    therefore moves the counter with a deliberate bad-Bearer `GET /metrics` (and, when the Bolt leg
@@ -164,7 +164,7 @@ edit scope — reported for fixing, not fixed here):
    **timing** oracle in `verify_password` remains. (Not exercised as a hard assertion — timing
    assertions are flaky across hosts — but documented with its `rmp` id.)
 
-3. **DENY grammar version gap (observed on pi516)** — the pinned pi516 build predates the `DENY`
+3. **DENY grammar version gap (observed on an older build)** — the pinned older build predates the `DENY`
    security DDL and rejects it with a `400` SyntaxError; the demo records this and validates the full
    modern DENY coverage against a current server.
 
@@ -225,9 +225,9 @@ examples/security-multitenant/run.sh
 # Reuse pre-built binaries / tune the profile:
 GRAPHUS_BIN_DIR=target/release SEC_PROFILE=large examples/security-multitenant/run.sh
 
-# EXTERNAL / ATTACH — against an already-running instance (e.g. pi516), isolated + torn down:
-GRAPHUS_TARGET_REST=https://100.89.148.30:7474 \
-  GRAPHUS_TARGET_BOLT=bolt+ssc://100.89.148.30:7687 \
+# EXTERNAL / ATTACH — against an already-running instance, isolated + torn down:
+GRAPHUS_TARGET_REST=https://graphus.example.com:7474 \
+  GRAPHUS_TARGET_BOLT=bolt+ssc://graphus.example.com:7687 \
   GRAPHUS_TARGET_USER=graphus GRAPHUS_TARGET_PASSWORD=graphus-local \
   GRAPHUS_TARGET_TLS_INSECURE=1 examples/security-multitenant/run.sh
 ```

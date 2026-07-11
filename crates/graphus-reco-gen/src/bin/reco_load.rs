@@ -52,7 +52,7 @@
 //!   loopback dev server: the full modern flow above (bulk upload + VECTOR/TEXT/property-type schema +
 //!   the index-backed query asserts).
 //! - **Bolt attach (`--bolt <url>`, `rmp` #693)** — for an ALREADY-RUNNING, possibly remote instance
-//!   (e.g. pi516) over Bolt-over-TCP + TLS (`bolt+ssc://` accepts a self-signed cert). Here the harness
+//!   over Bolt-over-TCP + TLS (`bolt+ssc://` accepts a self-signed cert). Here the harness
 //!   already carved out the isolated `--db`, so this loader does **not** create/drop it: it declares a
 //!   **version-tolerant** minimal schema (best-effort range indexes on `User.id` / `Product.id` so the
 //!   anchor seeks are index-backed; modern VECTOR/TEXT/property-type schema is skipped — an old server

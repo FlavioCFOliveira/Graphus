@@ -39,7 +39,7 @@ const OPS = parseInt(opsArg || '30', 10);
 // The abort-rate band: a FIRST-CLASS, two-sided, documented sanity gate (replacing the old
 // never-firing +/-0.50 baseline band). Deliberately over-contending a couple of :Account supernodes
 // under SSI is EXPECTED to abort the large majority of writers — that is the finding, not a defect.
-// Measured on pi516 (2 mule supernodes): 5 writers -> ~0.77, 6 -> ~0.87, 9 -> ~0.95; a target that
+// Measured against a live remote instance (2 mule supernodes): 5 writers -> ~0.77, 6 -> ~0.87, 9 -> ~0.95; a target that
 // also enforces the scan-based RELATIONSHIP KEY (enlarging every writer's read set) aborts even more.
 //   FLOOR: SSI must GENUINELY fire — an abort rate this low would mean contention never materialised
 //          (a misconfiguration or an SSI regression that could mask lost updates). We always see

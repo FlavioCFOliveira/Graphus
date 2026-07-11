@@ -12,7 +12,7 @@
 #     storage), gated against the committed baseline.json.
 #
 #   * EXTERNAL (attach) — set GRAPHUS_TARGET_BOLT (+ GRAPHUS_TARGET_REST) and the SAME workload runs
-#     against an ALREADY-RUNNING instance (local or remote, e.g. pi516) over the wire, in a dedicated
+#     against an ALREADY-RUNNING instance (local or remote) over the wire, in a dedicated
 #     ISOLATED database the harness carves out and drops again on exit. Evidence is the SERVER's own
 #     Prometheus /metrics, scraped before + after the workload and turned into report.json
 #     (measurement_mode=external, server_metrics deltas) by the `measure_target` harness binary. The
@@ -30,9 +30,9 @@
 #   RUN_DRIVER=0                    examples/gds-analytics/run.sh    # LOCAL, skip the official-driver step
 #   GDS_SWEEP_SIZES=40,120,360      examples/gds-analytics/run.sh    # LOCAL, custom sweep field sizes
 #
-#   # EXTERNAL (attach to a running instance — here pi516):
-#   GRAPHUS_TARGET_BOLT=bolt+ssc://100.89.148.30:7687 \
-#   GRAPHUS_TARGET_REST=https://100.89.148.30:7474 \
+#   # EXTERNAL (attach to an already-running instance, local or remote):
+#   GRAPHUS_TARGET_BOLT=bolt+ssc://graphus.example.com:7687 \
+#   GRAPHUS_TARGET_REST=https://graphus.example.com:7474 \
 #   GRAPHUS_TARGET_USER=graphus GRAPHUS_TARGET_PASSWORD=graphus-local \
 #   GRAPHUS_TARGET_TLS_INSECURE=1  examples/gds-analytics/run.sh
 #

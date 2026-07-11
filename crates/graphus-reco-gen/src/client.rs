@@ -1,6 +1,6 @@
 //! A **synchronous Bolt client** for the `reco_bench` concurrent read driver, over either a **Unix
 //! domain socket** (the co-located local server) or **Bolt-over-TCP with TLS** (an already-running,
-//! possibly remote instance — e.g. pi516; `rmp` #693).
+//! possibly remote instance — e.g. a staging or production host; `rmp` #693).
 //!
 //! This is a purpose-built sibling of `graphus-cli`'s interactive `BoltClient`: a pure-synchronous
 //! Bolt session over a transport-agnostic [`Transport`] (a `UnixStream`, a plaintext `TcpStream`, or a
@@ -65,7 +65,7 @@ pub enum TlsMode {
     /// `bolt+s://` — TLS 1.3 with server-certificate verification against the Mozilla root store.
     Verified,
     /// `bolt+ssc://` — TLS 1.3 that accepts **any** server certificate (self-signed / demo servers,
-    /// e.g. pi516).
+    /// e.g. a staging or production host).
     SelfSignedOk,
 }
 
@@ -260,7 +260,7 @@ fn tls_config_verified() -> ClientResult<Arc<ClientConfig>> {
 }
 
 /// Builds a TLS 1.3-only client config that accepts **any** server certificate (`bolt+ssc://`) — the
-/// self-signed / demo mode (pi516). It encrypts but does not authenticate the peer.
+/// self-signed / demo mode. It encrypts but does not authenticate the peer.
 fn tls_config_accept_any() -> ClientResult<Arc<ClientConfig>> {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     // Advertise exactly the provider's supported signature schemes so the (accepted) CertificateVerify
@@ -770,10 +770,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_the_pi516_self_signed_target() {
+    fn parses_a_self_signed_remote_target() {
         // The exact acceptance-criteria URL: a self-signed remote box addressed by IPv4 literal.
-        let url = BoltUrl::parse("bolt+ssc://100.89.148.30:7687").expect("valid");
-        assert_eq!(url.host, "100.89.148.30");
+        let url = BoltUrl::parse("bolt+ssc://203.0.113.10:7687").expect("valid");
+        assert_eq!(url.host, "203.0.113.10");
         assert_eq!(url.port, 7687);
         assert_eq!(url.tls, TlsMode::SelfSignedOk);
     }
@@ -812,7 +812,7 @@ mod tests {
         for raw in [
             "bolt://example.com:7687",
             "bolt+s://db.internal:7000",
-            "bolt+ssc://100.89.148.30:7687",
+            "bolt+ssc://203.0.113.10:7687",
             "bolt+s://[2001:db8::1]:7000",
         ] {
             let url = BoltUrl::parse(raw).expect("valid");

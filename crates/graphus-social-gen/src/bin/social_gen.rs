@@ -18,7 +18,7 @@
 //! fields of the profile resolved by `--profile`, so a caller can request a **custom scale** while
 //! keeping a named profile's density/shape characteristics (e.g. `--profile huge --users 30000` keeps
 //! `huge`'s 200–2000 friend-degree band and 30,000-article/30-avg-like density but bounds the total
-//! row count for a disk- or time-constrained run) — used by the `rmp` #521 pi516 network bulk-import
+//! row count for a disk- or time-constrained run) — used by the `rmp` #521 network bulk-import
 //! validation to pick the largest dataset the target host's (unknown) free disk can safely absorb
 //! without guessing at a whole new profile.
 //!

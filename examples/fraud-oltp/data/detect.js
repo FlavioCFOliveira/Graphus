@@ -5,7 +5,7 @@
 // ecosystem uses).
 //
 // It runs against EITHER a locally self-booted server (default DB) OR an already-running instance —
-// local or remote (e.g. pi516) — into a dedicated, isolated database the run.sh harness carved out
+// local or remote — into a dedicated, isolated database the run.sh harness carved out
 // (session `{database}` routing). It:
 //   1. connects to <uri> (`bolt+ssc://…`, trusting a self-signed cert),
 //   2. (idempotency) clears any prior Account/Customer footprint so a REUSED database starts clean,

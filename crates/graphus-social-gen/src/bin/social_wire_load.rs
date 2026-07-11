@@ -13,7 +13,7 @@
 //!   The exact recipe mirrors `graphus-server`'s `tests/bulk_import_endpoint.rs` and the sibling
 //!   `reco_load`/`bulk-etl` examples.
 //! - **Bolt attach (`--bolt <url>`)** — Bolt-over-TCP + TLS against an ALREADY-RUNNING, possibly
-//!   remote/older instance (e.g. pi516; `bolt+ssc://` accepts a self-signed cert). The harness already
+//!   remote/older instance (`bolt+ssc://` accepts a self-signed cert). The harness already
 //!   carved out the isolated `--db`, so this loader does NOT create/drop it: it declares best-effort
 //!   anchor indexes, streams the node then relationship rows in `UNWIND`-batched writes, and asserts
 //!   the graph shape + that every battery family returns a well-formed result. Version-tolerant: a

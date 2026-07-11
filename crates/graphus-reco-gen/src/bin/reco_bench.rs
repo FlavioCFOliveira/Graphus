@@ -33,7 +33,7 @@
 //! - **Local (`--socket`)** — Bolt-over-UDS against a co-located server whose pid is known, so the
 //!   full `/proc/<pid>` per-thread knee diagnosis is available.
 //! - **Attach (`--bolt <url>`)** — Bolt-over-TCP + TLS against an ALREADY-RUNNING, possibly remote
-//!   instance (e.g. pi516; `bolt+ssc://` accepts a self-signed cert). There is no co-located pid, so
+//!   instance (`bolt+ssc://` accepts a self-signed cert). There is no co-located pid, so
 //!   the `/proc` sampling is skipped; the server-side channel is the target's Prometheus `/metrics`
 //!   (scraped by the example's `run.sh` before/after and folded in by `measure_target`). The driver
 //!   prints machine-readable client-side stats sentinels (`GRAPHUS_RECO_BENCH_STATS` / `_RUNG`) for

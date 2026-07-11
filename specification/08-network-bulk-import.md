@@ -25,7 +25,7 @@ explicit choices that this revision documents in full:
 
 ## 1. Motivation and problem statement
 
-An empirical load test against the live Graphus instance on host `pi516` (2026-06-30, using
+An empirical load test against a live remote Graphus instance (2026-06-30, using
 `examples/social-network-large`) established that **it is not possible today to load a
 large-scale dataset (order of 1,000,000 users, hundreds of millions of edges) into an
 already-running Graphus server**, whether local or remote. Three independent gaps were
@@ -45,7 +45,7 @@ confirmed by reading the code:
    database to be stopped first (`FR-BR` domain); it is not an incremental-load primitive.
 3. **Cypher over Bolt does not scale to this size.** The only network-reachable write path today
    is ordinary parameterized Cypher (`MATCH ... MATCH ... CREATE` with `UNWIND` for batching).
-   Measured live against `pi516`: creating a relationship that anchors on two node lookups costs
+   Measured live against that remote instance: creating a relationship that anchors on two node lookups costs
    tens of milliseconds, and this cost **does not improve** with larger client-side batches or
    with client concurrency, because all writes against one database serialize onto that
    database's single engine thread (the ratified single-writer model, `D-storage-arch`;

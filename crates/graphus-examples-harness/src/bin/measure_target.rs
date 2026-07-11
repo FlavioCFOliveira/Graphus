@@ -2,7 +2,7 @@
 //!
 //! Where `measure_server` meters a **co-located** server (reading its `/proc/<pid>` CPU/RSS and
 //! walking its on-disk store/WAL), `measure_target` meters a server the example is **attached to**
-//! over the wire — a running instance that may be **remote** (e.g. `pi516`) or simply not owned by
+//! over the wire — a running instance that may be **remote** or simply not owned by
 //! the example. There is no local PID and no local filesystem to read, so the process-level vectors
 //! (CPU, RSS) and the on-disk storage vector are **not collectable** and are honestly left at their
 //! zero defaults with an explicit N/A note. What *is* collectable everywhere:

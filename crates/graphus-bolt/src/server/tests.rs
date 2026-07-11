@@ -543,7 +543,7 @@ fn reset_after_error_inside_explicit_tx_clears_tx_so_next_begin_succeeds() {
     // TxReady/TxStreaming). The executor's transaction then leaked and the NEXT `BEGIN` on the same
     // (pooled) connection failed with "a transaction is already open", poisoning it. RESET must
     // abort the underlying transaction UNCONDITIONALLY so the connection is reusable. Found against
-    // the live pi516 v0.0.7 instance with the real neo4j driver.
+    // a live v0.0.7 instance with the real neo4j driver.
     let exec = MockExecutor::new()
         .on_query_error("RETURN 1/0", GraphusError::Runtime("/ by zero".to_owned()));
     let input = session_input(&[

@@ -23,7 +23,7 @@
 //!
 //! `bolt+ssc://` installs a certificate verifier that accepts **any** server certificate. This keeps
 //! the traffic encrypted but does **not** authenticate the server, so the connection is exposed to an
-//! active man-in-the-middle. It exists for self-signed / demo deployments (e.g. the project's pi516
+//! active man-in-the-middle. It exists for self-signed / demo deployments (e.g. a staging box or a
 //! box) where the operator has explicitly opted out of verification. Prefer `bolt+s://` whenever the
 //! server presents a certificate that chains to a public root.
 
@@ -375,10 +375,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_the_pi516_self_signed_target() {
+    fn parses_a_self_signed_remote_target() {
         // The exact acceptance-criteria URL: a self-signed remote box addressed by IPv4 literal.
-        let url = BoltUrl::parse("bolt+ssc://100.89.148.30:7687").expect("valid");
-        assert_eq!(url.host, "100.89.148.30");
+        let url = BoltUrl::parse("bolt+ssc://203.0.113.10:7687").expect("valid");
+        assert_eq!(url.host, "203.0.113.10");
         assert_eq!(url.port, 7687);
         assert_eq!(url.tls, TlsMode::SelfSignedOk);
     }
@@ -426,7 +426,7 @@ mod tests {
         for raw in [
             "bolt://example.com:7687",
             "bolt+s://db.internal:7000",
-            "bolt+ssc://100.89.148.30:7687",
+            "bolt+ssc://203.0.113.10:7687",
             "bolt+s://[2001:db8::1]:7000",
         ] {
             let url = BoltUrl::parse(raw).expect("valid");

@@ -21,7 +21,7 @@ This example demonstrates Graphus's **bulk data pipeline**, end to end and in tw
    own final ingest tally **and** the queried row counts equal the manifest, and collecting
    **server-side evidence** from the target's Prometheus `/metrics`. It runs against a self-booted
    local plaintext-loopback REST server by default, or **attaches** to an already-running instance
-   (local OR remote, e.g. `pi516`) via the shared external-target seam (see
+   (local OR remote) via the shared external-target seam (see
    [Network bulk-import over the wire](#network-bulk-import-over-the-wire-mode-a--rmp-695)).
 
 On top of both, the example also documents the **online schema-hardening** that follows a bulk load in
@@ -204,11 +204,11 @@ row counts equal the manifest, and folds **server-side** evidence from the targe
   no TLS/cert) plus a UDS socket, points the seam at `http://127.0.0.1:<port>`, runs the wire sequence,
   and stops the server on exit.
 - **Attach to a running instance.** Set a `GRAPHUS_TARGET_REST` endpoint and Step 5 **attaches** to it
-  instead of booting anything — local or remote (e.g. a staging box or `pi516`). TLS with a self-signed
+  instead of booting anything — local or remote (e.g. a staging box). TLS with a self-signed
   cert is accepted with `GRAPHUS_TARGET_TLS_INSECURE=1`.
 
   ```bash
-  GRAPHUS_TARGET_REST=https://100.89.148.30:7474 \
+  GRAPHUS_TARGET_REST=https://graphus.example.com:7474 \
     GRAPHUS_TARGET_USER=graphus GRAPHUS_TARGET_PASSWORD=graphus-local \
     GRAPHUS_TARGET_TLS_INSECURE=1 \
     examples/bulk-etl/run.sh
@@ -225,19 +225,19 @@ directly — it is documented in `manifest.json` and proven by the hermetic mirr
 construction). Each accepted statement is counted (`online_ddl_accepted` in the report), and the plain
 `SHOW CONSTRAINTS` / `SHOW INDEXES` listings are captured to `evidence/wire/schema_*.json`.
 
-### Verified against an older server (`pi516`)
+### Verified against an older server
 
-The wire step was validated against a live, **older** Graphus build (`pi516`, REST + TLS). Findings:
+The wire step was validated against a live, **older** Graphus build over REST + TLS. Findings:
 
 - **The network Mode-A path is fully supported by the older build.** The complete sequence — login,
   `CREATE DATABASE`, streaming `?phase=nodes|relationships` (`text/csv`), `?end=true`, `START DATABASE`,
   the count queries, the `/metrics` scrape, and `STOP`+`DROP` — all succeed, and the server's ingest
   tally (`800` nodes / `4,029` relationships / `7,349` properties) matched the manifest **exactly**.
 - **The older build rejects some modern DDL** (why the wire schema step is version-tolerant): typed
-  index DDL such as `CREATE TEXT INDEX …` is a **syntax error** on `pi516`, and the `SHOW CONSTRAINTS /
+  index DDL such as `CREATE TEXT INDEX …` is a **syntax error** on that older build, and the `SHOW CONSTRAINTS /
   SHOW INDEXES … YIELD …` projection form is rejected — so the wire step avoids both (plain `SHOW`, no
   typed-index DDL) and the full modern palette is validated against a **current** server (local mode)
-  and the hermetic mirror. Relationship property-type DDL was also not accepted on `pi516`
+  and the hermetic mirror. Relationship property-type DDL was also not accepted by that older build
   (`2/3` version-tolerant statements applied there); this is recorded, not failed.
 
 ### `rmp #681` — the offline store is not directly server-openable (surfaced, not sidestepped)
@@ -316,8 +316,8 @@ examples/bulk-etl/run.sh
 # Offline core only — skip the wire step (a host without a server build, or an offline CI).
 RUN_WIRE=0 examples/bulk-etl/run.sh
 
-# Stream the wire step into an ALREADY-RUNNING instance (local OR remote, e.g. pi516) over REST + TLS.
-GRAPHUS_TARGET_REST=https://100.89.148.30:7474 \
+# Stream the wire step into an ALREADY-RUNNING instance (local OR remote) over REST + TLS.
+GRAPHUS_TARGET_REST=https://graphus.example.com:7474 \
   GRAPHUS_TARGET_USER=graphus GRAPHUS_TARGET_PASSWORD=graphus-local \
   GRAPHUS_TARGET_TLS_INSECURE=1 \
   examples/bulk-etl/run.sh

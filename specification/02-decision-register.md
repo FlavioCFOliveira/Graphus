@@ -137,7 +137,7 @@ scope and are propagated into `00-overview.md` and `01-needs-survey.md`:
 > **`D-bulk-import-network` — Network bulk import (remote streaming bulk load).** Unlike the two
 > sprint-19 entries above, this decision was **not** dispositioned by an internal audit against an
 > already-ratified requirement — it was a genuinely new capability, proposed after an empirical
-> load test (2026-06-30, host `pi516`) established that no existing mechanism can load a
+> load test (2026-06-30, against a live remote instance) established that no existing mechanism can load a
 > large-scale dataset (order of 1,000,000 nodes, hundreds of millions of relationships) into an
 > already-running Graphus server, local or remote (`08-network-bulk-import.md` §1). It was
 > presented with options and a recommendation on six facets, and the two highest-impact,

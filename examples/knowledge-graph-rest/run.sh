@@ -10,7 +10,7 @@
 #     workload against it, and collects the full evidence set (server CPU/RSS, on-disk store/WAL, a
 #     committed-baseline regression gate) plus the server-side /metrics snapshots.
 #   * EXTERNAL / ATTACH — when any of GRAPHUS_TARGET_{BOLT,REST,UDS} is set, it does NOT boot a
-#     server: it attaches to the ALREADY-RUNNING instance (local or remote, e.g. pi516) via the
+#     server: it attaches to the ALREADY-RUNNING instance (local or remote) via the
 #     shared external-target seam in `_harness/harness.sh`, authenticates with POST /auth/login,
 #     carves out an ISOLATED dedicated database, drives the same discovery+concurrency workload into
 #     it, scrapes the target's Prometheus /metrics before+after, emits the server-side evidence via
@@ -46,8 +46,8 @@
 #   KG_PROFILE=large                examples/knowledge-graph-rest/run.sh   # evidence-scale dataset
 #   KG_CLIENTS=32 KG_OPS=40         examples/knowledge-graph-rest/run.sh   # heavier concurrency
 #
-#   # EXTERNAL / ATTACH — run against an already-running instance (e.g. pi516), isolated + cleaned up:
-#   GRAPHUS_TARGET_REST=https://100.89.148.30:7474 \
+#   # EXTERNAL / ATTACH — run against an already-running instance, isolated + cleaned up:
+#   GRAPHUS_TARGET_REST=https://graphus.example.com:7474 \
 #     GRAPHUS_TARGET_USER=graphus GRAPHUS_TARGET_PASSWORD=graphus-local \
 #     GRAPHUS_TARGET_TLS_INSECURE=1 examples/knowledge-graph-rest/run.sh
 #
