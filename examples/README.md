@@ -138,13 +138,16 @@ Schema history:
     "final_rss_bytes": 12582912
   },
   "storage": {                        // storage footprint + amplification
-    "store_bytes": 81920,
-    "wal_bytes": 16384,
+    "store_bytes": 81920,             // everything durable that is NOT the redo log
+    "wal_bytes": 16384,               // the redo log — see the WAL-is-a-directory note below
     "store_pages": 10,                // ceil(store_bytes / PAGE_SIZE)
     "wal_pages": 2,
     "bytes_fsynced": 16384,
     "write_amplification": 1.20,      // physical bytes written / logical bytes written (0.0 = N/A)
-    "space_amplification": 1.45       // on-disk bytes / logical graph bytes      (0.0 = N/A)
+    "space_amplification": 1.45,      // on-disk bytes / logical graph bytes      (0.0 = N/A)
+    "bytes_per_node": 102.4,          // per-element COST, not a ratio            (0.0 = N/A)
+    "bytes_per_relationship": 24.6,   // per-element COST, not a ratio            (0.0 = N/A)
+    "plateau_ratio": 1.0              // retention/GC: final size / steady-state  (0.0 = N/A)
   },
   "throughput": {                     // throughput + latency vector
     "operations": 1000,
@@ -189,6 +192,37 @@ the fallback. The panic/force-detach counters and the SSI gauge are always serve
 `report.md` is the human-readable rendering of the same data: a header (scenario, dataset, host,
 toolchain) followed by one table per vector (CPU / memory / storage+amplification /
 throughput+latency).
+
+### Evidence-honesty rules (non-negotiable)
+
+An example exists to tell the truth about the server. Evidence that is subtly wrong is worse than no
+evidence, because it is *believed*. These rules are the scar tissue of real defects found in this
+suite (`rmp` #699) — do not reintroduce them:
+
+1. **Measure it or omit it.** A latency or throughput field is either genuinely measured or left out.
+   Never emit a `0.000` placeholder and never relabel one statement as N operations — a reader cannot
+   distinguish a fabricated zero from a real one.
+2. **`total_millis` is the WORKLOAD's wall-time.** These emitters typically build the report *after*
+   the workload has finished, so a naive `start()`/`finish()` bracket times the report's own emission
+   (hundredths of a millisecond). Pass the measured duration to
+   `EvidenceCollector::record_total_duration`.
+3. **Every field carries the quantity its name promises.** The amplification fields carry
+   amplification *ratios*. Per-element costs go in `bytes_per_node` / `bytes_per_relationship`; a
+   retention plateau goes in `plateau_ratio`. (bulk-etl used to smuggle bytes-per-node into
+   `space_amplification`, so its committed baseline read `1239.04` where the real ratio was `46.78`.)
+4. **Sample the SERVER, not the driver.** When the goal is server evidence, drive the server over the
+   wire and sample the *server's* pid (or its `/metrics`). An in-process battery measures the driver:
+   that is how social-network-large came to report a "~1 core" ceiling that was purely a harness
+   artifact, while the server actually scales to 6+ cores.
+5. **The WAL is a DIRECTORY** (`databases/<db>/graphus.wal/seg.<lsn>`). Classifying store-vs-WAL bytes
+   by the leaf *file name* counts every WAL byte as store and reports `wal_bytes: 0` — silently hiding
+   the entire redo log. Classify by **path**. And decompose the footprint: a lumped total blends the
+   data image (which scales with the graph) with a fixed-size doublewrite preallocation (which does
+   not), producing ratios that look alarming and mean nothing.
+6. **Never run a stale binary.** Build through `harness_build`, which rebuilds unconditionally (cargo
+   is incremental, so it is a no-op when nothing changed). A build-only-if-the-file-is-absent guard
+   silently runs the *previous* binary after any source edit, so the evidence describes code that is
+   no longer the code under test.
 
 ### Baseline-diff regression detection
 
