@@ -856,6 +856,8 @@ impl EvidenceReport {
 pub struct EvidenceCollector {
     report: EvidenceReport,
     started: Option<Instant>,
+    /// Explicit workload duration, when the collector could not bracket the workload itself.
+    total_override: Option<Duration>,
 }
 
 impl EvidenceCollector {
@@ -879,6 +881,7 @@ impl EvidenceCollector {
                 notes: Vec::new(),
             },
             started: None,
+            total_override: None,
         }
     }
 
@@ -1043,11 +1046,25 @@ impl EvidenceCollector {
         self.report.notes.push(note.into());
     }
 
+    /// Records the run's total wall-clock duration **explicitly**, overriding the
+    /// [`start`](Self::start)-to-[`finish`](Self::finish) interval.
+    ///
+    /// Use this whenever the collector cannot bracket the workload itself — e.g. an example that
+    /// measures its phases first and only builds the report afterwards. Without it such a report
+    /// would show the *report-building* time as `total_millis`, which is not the workload's duration.
+    pub fn record_total_duration(&mut self, total: Duration) {
+        self.total_override = Some(total);
+    }
+
     /// Closes the run, finalising the total wall-clock duration, and yields the [`EvidenceReport`].
     ///
-    /// If [`start`](Self::start) was never called, the total duration is left at zero.
+    /// The total is the duration passed to [`record_total_duration`](Self::record_total_duration)
+    /// when one was given, otherwise the [`start`](Self::start)-to-now interval. If neither was
+    /// supplied, the total duration is left at zero.
     pub fn finish(mut self) -> EvidenceReport {
-        if let Some(t0) = self.started {
+        if let Some(total) = self.total_override {
+            self.report.total_millis = total.as_secs_f64() * 1_000.0;
+        } else if let Some(t0) = self.started {
             self.report.total_millis = t0.elapsed().as_secs_f64() * 1_000.0;
         }
         self.report

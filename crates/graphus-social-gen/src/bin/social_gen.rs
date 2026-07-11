@@ -37,7 +37,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use graphus_social_gen::{GenConfig, Generator};
+use graphus_social_gen::{DegreeDist, GenConfig, Generator};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Format {
@@ -55,6 +55,8 @@ fn main() -> ExitCode {
     let mut friend_max: Option<u64> = None;
     let mut avg_likes: Option<u64> = None;
     let mut seed: Option<u64> = None;
+    let mut degree_dist: Option<String> = None;
+    let mut zipf_exponent: Option<u64> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -99,13 +101,32 @@ fn main() -> ExitCode {
                 Ok(v) => seed = Some(v),
                 Err(e) => return fail(&e),
             },
+            "--degree-dist" => match args.next().as_deref() {
+                Some("uniform") => degree_dist = Some("uniform".to_owned()),
+                Some("zipf" | "powerlaw" | "power-law") => {
+                    degree_dist = Some("powerlaw".to_owned())
+                }
+                Some(other) => {
+                    return fail(&format!(
+                        "unknown --degree-dist '{other}' (expected uniform|zipf)"
+                    ));
+                }
+                None => return fail("--degree-dist requires a value (uniform|zipf)"),
+            },
+            "--zipf-exponent" => match parse_u64_arg(&mut args, "--zipf-exponent") {
+                Ok(v) => zipf_exponent = Some(v),
+                Err(e) => return fail(&e),
+            },
             "-h" | "--help" => {
                 eprintln!(
                     "usage: social_gen --profile <fast|large|huge> --out-dir <dir> [--format cypher|csv]\n\
                      \x20      [--users N] [--articles N] [--friend-min N] [--friend-max N] [--avg-likes N] [--seed N]\n\
+                     \x20      [--degree-dist uniform|zipf] [--zipf-exponent N (1..=6, default 2)]\n\
                      --format cypher (default) writes graph.cypher.\n\
                      --format csv writes users.csv, articles.csv, friends.csv, likes.csv (the\n\
                      neo4j-admin import / network bulk-import CSV shape).\n\
+                     --degree-dist zipf draws each user's FRIEND degree from a power law P(k) ∝ k^-exp,\n\
+                     producing SUPERNODES (a heavy hub tail); pair with --friend-min 1 for realism.\n\
                      The override flags replace individual fields of the resolved --profile config,\n\
                      for a custom scale that keeps a named profile's density/shape."
                 );
@@ -115,38 +136,37 @@ fn main() -> ExitCode {
         }
     }
 
-    let mut cfg: GenConfig = match GenConfig::profile(&profile) {
-        Some(c) => c,
-        None => {
-            return fail(&format!(
-                "unknown profile '{profile}' (expected fast|large|huge)"
-            ));
+    // Degree distribution: `uniform` (default) or a power law (`zipf`) with `--zipf-exponent` (default
+    // 2 — the classic social-graph slope). The power-law draw produces SUPERNODES; pair it with a low
+    // `--friend-min` (e.g. 1) and a high `--friend-max` for the most realistic hub structure. The
+    // `--zipf-exponent`-without-`zipf` guard is a CLI concern; the rest of the resolution + validation
+    // is the shared `GenConfig::resolve` (also used by the over-the-wire loader + ladder driver).
+    let resolved_dist = match degree_dist.as_deref() {
+        None | Some("uniform") => {
+            if zipf_exponent.is_some() {
+                return fail("--zipf-exponent requires --degree-dist zipf");
+            }
+            Some(DegreeDist::Uniform)
         }
+        Some("powerlaw") => Some(DegreeDist::PowerLaw {
+            exponent: zipf_exponent.unwrap_or(2) as u32,
+        }),
+        Some(other) => return fail(&format!("unknown degree distribution '{other}'")),
     };
-    if let Some(v) = users {
-        cfg.users = v;
-    }
-    if let Some(v) = articles {
-        cfg.articles = v;
-    }
-    if let Some(v) = friend_min {
-        cfg.friend_min = v;
-    }
-    if let Some(v) = friend_max {
-        cfg.friend_max = v;
-    }
-    if let Some(v) = avg_likes {
-        cfg.avg_likes_per_user = v;
-    }
-    if let Some(v) = seed {
-        cfg.seed = v;
-    }
-    if cfg.friend_min > cfg.friend_max {
-        return fail(&format!(
-            "--friend-min ({}) must be <= --friend-max ({})",
-            cfg.friend_min, cfg.friend_max
-        ));
-    }
+
+    let cfg: GenConfig = match GenConfig::resolve(
+        &profile,
+        users,
+        articles,
+        friend_min,
+        friend_max,
+        avg_likes,
+        seed,
+        resolved_dist,
+    ) {
+        Ok(c) => c,
+        Err(e) => return fail(&e),
+    };
 
     let generator = Generator::new(cfg);
 

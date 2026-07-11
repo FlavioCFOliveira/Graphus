@@ -48,6 +48,18 @@ engine = [
     "graphus-storage/dst",
 ]
 
+# The `wire` feature adds the CLIENT-side stack for the OVER-THE-WIRE bins (`social_wire_load` +
+# `social_bench`): they drive the query battery against an already-running / self-booted server over
+# Bolt (UDS or TCP+TLS) and REST, sampling the SERVER process — the true multicore-read-scaling
+# evidence. It reuses `graphus-reco-gen`'s already-committed, `pub` client (`BoltClient`/`BoltUrl`,
+# mirroring `graphus-cli`'s rustls transport) and `bench` percentile/`/proc`/ladder helpers, so NO
+# Bolt/TLS wire code is reinvented and NO new crate enters the workspace lock (reco-gen already pulls
+# rustls/webpki/graphus-bolt for `rmp` #693). It is CLIENT-ONLY — it never links the engine — so it is
+# independent of `engine` and builds with `--no-default-features --features wire` for a light, fast
+# client build (no engine compile). `graphus-core` (the shared `Value` model) is enabled by both
+# features. graphus-server depends on neither this crate nor reco-gen, so this stays acyclic.
+wire = ["dep:graphus-core", "dep:graphus-reco-gen"]
+
 [dependencies]
 # The generator emits the graph as Cypher text and its summary as key=value / JSON; serde pins match
 # the rest of the workspace.
@@ -66,6 +78,16 @@ graphus-examples-harness = { path = "../graphus-examples-harness" }
 # acyclic. These modules/binaries are added by later tasks; the deps are declared now so the crate is
 # ready. ---
 graphus-core = { path = "../graphus-core", optional = true }
+
+# --- `wire` feature only: the CLIENT-side over-the-wire driver stack. `graphus-reco-gen` is a sibling
+# dev-only example leaf crate (also `publish = false`) whose `pub` `client` module (a synchronous
+# Bolt-over-UDS / Bolt-over-TCP+TLS session mirroring `graphus-cli`'s transport) and `pub` `bench`
+# module (latency-percentile, `/proc/<pid>` and concurrency-ladder helpers) are exactly the client
+# plumbing the wire loader + concurrent ladder need. Reusing it (rather than copying ~700 lines of
+# rustls/Bolt/percentile code) keeps this crate DRY; reco-gen never depends on social-gen, so this is
+# acyclic, and it pulls in NO dependency the workspace lock does not already carry. ---
+graphus-reco-gen = { path = "../graphus-reco-gen", optional = true }
+
 graphus-cypher = { path = "../graphus-cypher", optional = true }
 # Transaction primitives — only for `IsolationLevel::Snapshot`, the correct isolation for this
 # single-threaded bulk loader: there is no concurrency, so the full Serializable SSI commit-validation
@@ -114,3 +136,23 @@ required-features = ["engine"]
 [[bin]]
 name = "social_baseline_cmp"
 path = "src/bin/social_baseline_cmp.rs"
+
+# The OVER-THE-WIRE loader (`wire` feature): drives the deterministic graph into an ALREADY-RUNNING /
+# self-booted server, either via REST network bulk-import (Mode A, a plaintext-loopback dev server) or
+# via Bolt-over-TCP+TLS UNWIND writes (attach to a remote/older instance, e.g. pi516), asserts the
+# round-tripped counts, declares a version-tolerant schema, and smoke-tests every battery family.
+# Usage: cargo run -p graphus-social-gen --features wire --bin social_wire_load -- --rest 127.0.0.1:PORT ...
+[[bin]]
+name = "social_wire_load"
+path = "src/bin/social_wire_load.rs"
+required-features = ["wire"]
+
+# The concurrent OVER-THE-WIRE read ladder (`wire` feature): sweeps a concurrency ladder of C Bolt
+# clients issuing the read battery, sampling the co-located SERVER process's per-thread CPU/RSS from
+# /proc (local) so the report shows read scaling vs C — the project headline — or, in attach mode,
+# emitting client-side throughput/latency sentinels for `measure_target` to fold with the target's
+# /metrics. Usage: cargo run -p graphus-social-gen --features wire --bin social_bench -- --socket <s> ...
+[[bin]]
+name = "social_bench"
+path = "src/bin/social_bench.rs"
+required-features = ["wire"]

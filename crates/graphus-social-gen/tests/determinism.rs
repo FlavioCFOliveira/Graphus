@@ -8,7 +8,91 @@
 
 use std::collections::HashMap;
 
-use graphus_social_gen::{GenConfig, Generator, MAX_NAME_BYTES};
+use graphus_social_gen::{DegreeDist, GenConfig, Generator, MAX_NAME_BYTES};
+
+/// A `fast`-scale power-law config with a wide degree band, for the supernode / determinism tests.
+fn power_law_cfg() -> GenConfig {
+    GenConfig {
+        friend_min: 1,
+        friend_max: 500,
+        degree_dist: DegreeDist::PowerLaw { exponent: 2 },
+        ..GenConfig::fast()
+    }
+}
+
+#[test]
+fn power_law_generation_is_byte_identical_across_runs() {
+    // The power-law degree draw is pure-integer (no `powf`, no float), so a power-law graph must be
+    // just as byte-reproducible as the uniform one — the property the example's supernode evidence is
+    // pinned to.
+    let a = Generator::new(power_law_cfg()).emit_all();
+    let b = Generator::new(power_law_cfg()).emit_all();
+    assert_eq!(a, b, "power-law generation must be byte-identical per seed");
+    // The summary line (degree histogram included) is likewise stable.
+    let s1 = Generator::new(power_law_cfg()).summary_line();
+    let s2 = Generator::new(power_law_cfg()).summary_line();
+    assert_eq!(s1, s2, "power-law summary/histogram must be deterministic");
+}
+
+#[test]
+fn power_law_produces_supernodes_a_uniform_band_cannot() {
+    // The whole point of the power-law mode: a heavy tail of hubs. Compared with a uniform draw over
+    // the SAME band, the power law must reach a materially higher maximum degree (a supernode) while
+    // its median user stays sparse — the shape a real social graph has and the uniform model lacks.
+    let power = Generator::new(power_law_cfg()).summary();
+    let uniform = Generator::new(GenConfig {
+        degree_dist: DegreeDist::Uniform,
+        ..power_law_cfg()
+    })
+    .summary();
+
+    // A uniform draw over [1, 500] concentrates every user near the band's mean (~250); the power law
+    // pushes the MAX far above the uniform mean while pulling the typical degree far below it.
+    assert!(
+        power.degree_max > uniform.degree_avg_x1000 / 1000,
+        "power-law max degree {} should exceed the uniform mean {} (a supernode)",
+        power.degree_max,
+        uniform.degree_avg_x1000 / 1000,
+    );
+    // Most users are sparse under the power law: its mean degree is well below the uniform mean.
+    assert!(
+        power.degree_avg_x1000 < uniform.degree_avg_x1000 / 2,
+        "power-law mean degree x1000 {} should be far below the uniform mean x1000 {}",
+        power.degree_avg_x1000,
+        uniform.degree_avg_x1000,
+    );
+
+    // The log-2 histogram must have a long tail: at least one occupied bucket at/above degree 64 that
+    // the uniform draw (max ~500 but concentrated near 250) does not spread into so sparsely.
+    let hist = Generator::new(power_law_cfg()).degree_histogram();
+    let tail_buckets = hist.iter().filter(|&&(floor, _)| floor >= 64).count();
+    assert!(
+        tail_buckets >= 2,
+        "power-law degree histogram should have a heavy tail (>=2 buckets at/above degree 64): {hist:?}"
+    );
+    // And the sparse head must dominate: the smallest bucket holds more users than any tail bucket.
+    let head = hist.first().map_or(0, |&(_, c)| c);
+    let heaviest_tail = hist
+        .iter()
+        .filter(|&&(floor, _)| floor >= 64)
+        .map(|&(_, c)| c)
+        .max()
+        .unwrap_or(0);
+    assert!(
+        head > heaviest_tail,
+        "the sparse head bucket ({head}) should dominate the heaviest tail bucket ({heaviest_tail})"
+    );
+}
+
+#[test]
+fn uniform_config_omitting_degree_dist_deserializes_to_uniform() {
+    // Forward-compat: an older serialized GenConfig without the `degree_dist` field must still load,
+    // defaulting to Uniform, so no committed baseline / persisted config is invalidated.
+    let json = r#"{"seed":1,"users":10,"articles":2,"friend_min":2,"friend_max":4,"avg_likes_per_user":1}"#;
+    let cfg: GenConfig =
+        serde_json::from_str(json).expect("legacy config without degree_dist loads");
+    assert_eq!(cfg.degree_dist, DegreeDist::Uniform);
+}
 
 #[test]
 fn fast_profile_is_byte_identical_across_runs() {

@@ -1448,6 +1448,7 @@ dependencies = [
  "graphus-cypher",
  "graphus-examples-harness",
  "graphus-io",
+ "graphus-reco-gen",
  "graphus-storage",
  "graphus-txn",
  "graphus-wal",

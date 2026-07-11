@@ -49,7 +49,7 @@ use graphus_server::engine::{
     LocalEngine,
 };
 use graphus_sim::SharedClock;
-use graphus_social_gen::{EPOCH_S, GenConfig, Generator};
+use graphus_social_gen::{DegreeDist, EPOCH_S, GenConfig, Generator};
 use graphus_wal::MemLogSink;
 
 type Eng = LocalEngine<MemBlockDevice, MemLogSink>;
@@ -65,6 +65,7 @@ fn cfg() -> GenConfig {
         friend_min: 3,
         friend_max: 6,
         avg_likes_per_user: 3,
+        degree_dist: DegreeDist::Uniform,
     }
 }
 

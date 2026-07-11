@@ -878,28 +878,9 @@ fn run_search_battery(coord: &mut Coord, catalog: &IndexCatalog, term: &str) -> 
 /// cross-check is exact and robust. The most frequent candidate is chosen so the asserted set is
 /// non-trivial (more than one article) at every profile.
 fn dominant_headline_term(cfg: &GenConfig) -> (String, u64) {
-    // Single-word, ASCII-only subjects (or ASCII leading words of multi-word subjects) from the
-    // generator's `HEAD_SUBJECT` pool — each unique to its subject and free of diacritics.
-    const ASCII_SUBJECTS: &[&str] = &[
-        "Governo",
-        "Universidade",
-        "Banco",
-        "Empresa",
-        "Investigadores",
-        "Autarquia",
-        "Mercado",
-        "Sector",
-    ];
-    let mut best = (ASCII_SUBJECTS[0].to_owned(), 0u64);
-    for &word in ASCII_SUBJECTS {
-        let count = (0..cfg.articles)
-            .filter(|&i| Generator::article_name(cfg.seed, i).contains(word))
-            .count() as u64;
-        if count > best.1 {
-            best = (word.to_owned(), count);
-        }
-    }
-    best
+    // The ground-truth term picker is the hermetic library function (shared with the over-the-wire
+    // driver, so both pick the identical term); this in-process loader just forwards to it.
+    Generator::dominant_headline_term_for(cfg.seed, cfg.articles)
 }
 
 /// Reads the `SHOW INDEXES`-style listing from the coordinator's index catalogs, in a stable order:

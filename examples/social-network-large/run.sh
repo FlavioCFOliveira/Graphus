@@ -1,41 +1,62 @@
 #!/usr/bin/env bash
 #
-# Graphus large-scale social-graph demonstration — a performance evaluation under a LARGE graph.
+# Graphus large-scale social-graph demonstration — OVER-THE-WIRE concurrent read scaling.
 #
 # The model (a multigraph LPG): a social network of (:USER {id, name, registered}) befriended by an
-# UNDIRECTED multigraph (:USER)-[:FRIEND {since}]-(:USER) where each USER has between `friend_min`
-# and `friend_max` friends, a corpus of (:ARTICLE {id, name, registered}) carrying realistic
-# headlines, and (:USER)-[:LIKE {date}]->(:ARTICLE) edges. The literal target this example is built
-# around is 1,000,000 USERs (friend 200..=2000), 30,000 ARTICLEs (the `huge` profile) — see README.md.
+# UNDIRECTED multigraph (:USER)-[:FRIEND {since}]-(:USER), a corpus of (:ARTICLE {id, name,
+# registered}) carrying realistic Portuguese headlines, and directed (:USER)-[:LIKE {date}]->(:ARTICLE)
+# edges. The FRIEND degree is a configuration model — uniform by default, or a power law (Zipf) that
+# produces SUPERNODES via SOCIAL_DEGREE_DIST=zipf.
 #
-# This script doubles as an executable E2E test. It:
-#   1. proves the deterministic, seeded generator (`social_gen`) is BYTE-IDENTICAL per seed by
-#      generating `graph.cypher` twice and diffing;
-#   2. runs the in-process BULK LOAD + traversal workload (`social_load`) against the REAL engine —
-#      ingesting via the production bulk path (graphus-bulk, O(E)) into an on-disk store and then
-#      driving a Cypher read battery (direct friends, friend-of-friend, mutual friends, top-liked
-#      articles, degree) — asserting the graph shape (|USER|, |ARTICLE|, |FRIEND|, |LIKE|) and that
-#      the traversals return well-formed results;
-#   3. emits standardized evidence (`social_evidence`: ingest throughput, on-disk footprint +
-#      amplification, peak RSS, per-query latency) into report.json + report.md and gates the stable
-#      STRUCTURAL metrics against the committed baseline (`social_baseline_cmp`);
-#   4. (optional) drives a small slice of the SAME model over a real Bolt-over-UDS WIRE with
-#      `graphus-cli` against a booted `graphus-server`, asserting a friend-of-friend traversal over
-#      the socket.
+# THE HEADLINE (rmp #691): the 8-query read battery (direct friends, friend-of-friend, mutual friends,
+# top-liked articles, degree, headline TEXT search, recent-LIKE range, FULLTEXT headline search) is
+# driven OVER THE WIRE by a concurrency ladder of C Bolt clients while the CO-LOCATED SERVER PROCESS is
+# sampled from /proc — so the report shows whether reads SCALE ACROSS CORES (the off-thread reader pool)
+# or hit a single-thread ceiling. This corrects the previous in-process battery, whose ~1-core figure
+# was a DRIVER artifact (it bypassed the server's reader pool entirely).
 #
-# Steps 1–3 are HERMETIC (the load driver runs the real engine in-process — see README.md →
-# "Transport" for why the bulk-load + GC-free read evidence is driven in-process). Step 4 is OPT-IN
-# via RUN_WIRE (default ON; set RUN_WIRE=0 to skip).
+# It runs in TWO modes (auto-detected via the shared external-target seam in `_harness/harness.sh`):
+#
+#   LOCAL (default)   — self-boots a REAL `graphus-server` exposing Bolt-over-UDS (the read ladder) +
+#                       plaintext-loopback REST (the network bulk-import upload path), loads the graph
+#                       via REST bulk-import (Mode A) into an isolated database, declares a
+#                       version-tolerant read-path schema, drives the concurrency ladder over UDS while
+#                       sampling the SERVER's per-thread CPU/RSS from /proc, emits standardized evidence
+#                       (report.json with the server-PID scaling curve + real p50/p99 per rung), and
+#                       gates the STRUCTURAL counts against the committed baseline.
+#   EXTERNAL (attach) — when ANY of GRAPHUS_TARGET_{BOLT,REST,UDS} is set, attaches to an
+#                       ALREADY-RUNNING instance (local OR remote, e.g. pi516) over Bolt-over-TCP + TLS.
+#                       It carves out a dedicated, isolated database, loads a SMALL graph over Bolt with
+#                       a version-tolerant schema (an older server may lack the modern FULLTEXT/TEXT
+#                       DDL — the driver's capability preflight drops any family the target cannot
+#                       serve), scrapes the target's `/metrics` before + after the ladder, drives the
+#                       SAME read ladder over Bolt-TCP+TLS (/proc sampling OFF — the server-side channel
+#                       is /metrics), emits an EXTERNAL-mode report via `measure_target`, and DROPS the
+#                       isolated database on exit.
 #
 # Usage:
-#   examples/social-network-large/run.sh                       # builds binaries if needed, then runs
-#   GRAPHUS_BIN_DIR=target/release  examples/social-network-large/run.sh
-#   SOCIAL_PROFILE=large            examples/social-network-large/run.sh   # evidence-scale load
-#   RUN_WIRE=0                      examples/social-network-large/run.sh   # skip the Bolt/UDS wire demo
+#   examples/social-network-large/run.sh                          # local self-boot, fast profile
+#   SOCIAL_PROFILE=large            examples/social-network-large/run.sh   # evidence-scale local run
+#   SOCIAL_DEGREE_DIST=zipf         examples/social-network-large/run.sh   # power-law (supernode) FRIEND graph
+#   SOCIAL_READER_THREADS=4         examples/social-network-large/run.sh   # pin the reader pool (local)
+#   SOCIAL_WRITERS=2 SOCIAL_WRITE_EVERY_MS=50 examples/social-network-large/run.sh  # read/write mix
+#   GRAPHUS_TARGET_BOLT=bolt+ssc://host:7687 GRAPHUS_TARGET_REST=https://host:7474 \
+#     GRAPHUS_TARGET_USER=graphus GRAPHUS_TARGET_PASSWORD=graphus-local \
+#     GRAPHUS_TARGET_TLS_INSECURE=1  examples/social-network-large/run.sh  # attach to a running instance
 #
-# Requirements: a Unix host (Linux/macOS), bash, and a checkout that builds. No network/openssl/node.
+# Requirements: a Unix host, bash, curl. LOCAL mode's /proc server sampling is Linux-specific (the run
+# still works on macOS but the CPU/RSS server evidence is skipped there). No node / openssl needed.
 
 set -euo pipefail
+
+# --------------------------------------------------------------------------------------------------
+# Shared external-target seam (GRAPHUS_TARGET_* detection, isolated-DB create/drop, /metrics scrape).
+# --------------------------------------------------------------------------------------------------
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../_harness/harness.sh
+source "$(cd "$SCRIPT_DIR/../_harness" && pwd)/harness.sh"
+export HARNESS_SCENARIO="social-network-large"
 
 # --------------------------------------------------------------------------------------------------
 # Pretty output helpers (house style)
@@ -45,14 +66,10 @@ if [ -t 1 ]; then
 else
   BOLD=''; GREEN=''; RED=''; BLUE=''; DIM=''; RESET=''
 fi
-
 CHECKS=0
 FAILURES=0
-
 section() { printf '\n%s== %s ==%s\n' "$BOLD$BLUE" "$1" "$RESET"; }
 info()    { printf '%s· %s%s\n' "$DIM" "$1" "$RESET"; }
-
-# assert <description> <expected> <actual>
 assert() {
   CHECKS=$((CHECKS + 1))
   if [ "$2" = "$3" ]; then
@@ -63,103 +80,355 @@ assert() {
       "$RED" "$1" "$RESET" "$BOLD" "$2" "$RESET" "$BOLD" "$3" "$RESET"
   fi
 }
+# kv <summary-line> <key> — pull a `key=value` token out of a generator/driver summary line.
+kv() { printf '%s' "$1" | tr ' ' '\n' | sed -n "s/^$2=//p" | head -n1; }
+
+MODE="$(harness_target_mode)"   # external iff GRAPHUS_TARGET_{BOLT,REST,UDS} is set, else local
 
 # --------------------------------------------------------------------------------------------------
-# Locate (or build) the binaries
+# Locate (or build) the binaries. The wire client bins build WITHOUT the engine (--features wire) for a
+# light, fast client build; the engine is only needed by graphus-server (self-boot, local mode).
 # --------------------------------------------------------------------------------------------------
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="${GRAPHUS_BIN_DIR:-$REPO_ROOT/target/release}"
-
 GEN="$BIN_DIR/social_gen"
-LOAD="$BIN_DIR/social_load"
-EVIDENCE_BIN="$BIN_DIR/social_evidence"
+LOAD="$BIN_DIR/social_wire_load"
+BENCH="$BIN_DIR/social_bench"
 CMP_BIN="$BIN_DIR/social_baseline_cmp"
 SERVER="$BIN_DIR/graphus-server"
-CLI="$BIN_DIR/graphus-cli"
 
 PROFILE="${SOCIAL_PROFILE:-fast}"
-RUN_WIRE="${RUN_WIRE:-1}"
+case "$PROFILE" in
+  fast)  LADDER="1,2,4,8";           OPS_PER_RUNG=1500;  POOL_PAGES=8192 ;;
+  large) LADDER="1,2,4,8,16,32";     OPS_PER_RUNG=20000; POOL_PAGES=49152 ;;
+  huge)  LADDER="1,2,4,8,16,32,64";  OPS_PER_RUNG=40000; POOL_PAGES=131072 ;;
+  *) echo "${RED}fatal: unknown SOCIAL_PROFILE '$PROFILE' (use fast|large|huge)${RESET}" >&2; exit 2 ;;
+esac
 
-# The generator + load driver + evidence emitter + baseline gate all live in the one crate; the load
-# driver + evidence emitter need the `engine` feature (real engine + bulk importer).
-if [ ! -x "$GEN" ] || [ ! -x "$LOAD" ] || [ ! -x "$EVIDENCE_BIN" ] || [ ! -x "$CMP_BIN" ]; then
-  section "Building the social-network-large generator + load + evidence binaries (release)"
-  ( cd "$REPO_ROOT" && cargo build --release -p graphus-social-gen --features engine --bins )
+# External-mode ladder / op budget (independent of the local profile).
+EXT_LADDER="${SOCIAL_EXTERNAL_LADDER:-1,2,4,8}"
+EXT_OPS="${SOCIAL_EXTERNAL_OPS:-2000}"
+MIN_OPS_PER_CLIENT="${SOCIAL_MIN_OPS_PER_CLIENT:-150}"
+AUTO_EXTEND="${SOCIAL_AUTO_EXTEND:-0}"
+WRITERS="${SOCIAL_WRITERS:-0}"
+WRITE_EVERY_MS="${SOCIAL_WRITE_EVERY_MS:-0}"
+
+# Build the shared generator argument list (identical for social_gen, social_wire_load, social_bench so
+# all three reconstruct the SAME deterministic graph). LOCAL uses the ladder profile; EXTERNAL uses a
+# SMALL override set so the whole graph loads quickly over Bolt UNWIND writes even against a small /
+# remote / OLDER server (whose planner may SCAN on an UNWIND-row-valued edge anchor).
+GEN_ARGS=(--profile "$PROFILE")
+if [ "$MODE" = external ]; then
+  GEN_ARGS=(
+    --profile "${SOCIAL_EXTERNAL_PROFILE:-fast}"
+    --users "${SOCIAL_EXTERNAL_USERS:-400}"
+    --articles "${SOCIAL_EXTERNAL_ARTICLES:-40}"
+    --friend-min "${SOCIAL_EXTERNAL_FRIEND_MIN:-2}"
+    --friend-max "${SOCIAL_EXTERNAL_FRIEND_MAX:-8}"
+    --avg-likes "${SOCIAL_EXTERNAL_AVG_LIKES:-3}"
+  )
 fi
-for b in "$GEN" "$LOAD" "$EVIDENCE_BIN" "$CMP_BIN"; do
+# Optional power-law (Zipf) FRIEND-degree mode (supernodes). Applies to both modes.
+if [ "${SOCIAL_DEGREE_DIST:-uniform}" = "zipf" ]; then
+  GEN_ARGS+=(--degree-dist zipf --zipf-exponent "${SOCIAL_ZIPF_EXPONENT:-2}")
+  # A power law wants a low floor + a high ceiling to grow a hub tail (unless already overridden).
+  case " ${GEN_ARGS[*]} " in *" --friend-min "*) : ;; *) GEN_ARGS+=(--friend-min 1) ;; esac
+  case " ${GEN_ARGS[*]} " in *" --friend-max "*) : ;; *) GEN_ARGS+=(--friend-max 500) ;; esac
+fi
+
+# Build UNCONDITIONALLY (cargo is incremental — a no-op when nothing changed). Building only when the
+# binary is ABSENT would silently run a STALE binary after any source edit, so the evidence would
+# describe code that is no longer the code under test. Evidence must always come from current sources.
+# The single exception is an explicit GRAPHUS_BIN_DIR: the caller is then pointing at binaries they
+# built (CI artifacts, a host without cargo), so we trust — but verify — them below.
+if [ -z "${GRAPHUS_BIN_DIR:-}" ]; then
+  section "Building the social-network wire client binaries (release, --features wire, no engine)"
+  ( cd "$REPO_ROOT" && cargo build --release -p graphus-social-gen --no-default-features --features wire \
+      --bin social_gen --bin social_wire_load --bin social_bench --bin social_baseline_cmp )
+  if [ "$MODE" = local ]; then
+    section "Building graphus-server (release)"
+    ( cd "$REPO_ROOT" && cargo build --release -p graphus-server )
+  fi
+fi
+for b in "$GEN" "$LOAD" "$BENCH" "$CMP_BIN"; do
   [ -x "$b" ] || { echo "${RED}fatal: required binary not found at $b${RESET}" >&2; exit 2; }
 done
+[ "$MODE" = local ] && { [ -x "$SERVER" ] || { echo "${RED}fatal: server binary not found at $SERVER${RESET}" >&2; exit 2; }; }
 
 # --------------------------------------------------------------------------------------------------
-# Workspace: a private temp dir for generated artifacts, removed on exit. The evidence/ dir is
-# git-ignored; baseline.json lives at a non-ignored path.
+# Workspace
 # --------------------------------------------------------------------------------------------------
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/graphus-social-XXXXXX")"
 EVIDENCE_DIR="$SCRIPT_DIR/evidence"
 BASELINE="$SCRIPT_DIR/baseline.json"
-cleanup() { rm -rf "$WORKDIR"; }
-trap cleanup EXIT INT TERM
+DATA_DIR="$WORKDIR/gen"
+GENDIR2="$WORKDIR/gen2"
+SOCKET="$WORKDIR/graphus.sock"
+CONFIG="$WORKDIR/graphus.toml"
+SERVER_LOG="$WORKDIR/server.log"
+STORE_DIR="$WORKDIR/store"
+METRICS_BEFORE="$WORKDIR/metrics_before.prom"
+METRICS_AFTER="$WORKDIR/metrics_after.prom"
 mkdir -p "$EVIDENCE_DIR"
 
-# kv <summary-line> <key> — pull a `key=value` token out of a generator/driver summary line.
-kv() { printf '%s' "$1" | tr ' ' '\n' | sed -n "s/^$2=//p" | head -n1; }
+SERVER_PID=""
+TARGET_DB=""
+cleanup() {
+  if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
+    kill -TERM "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+  fi
+  if [ "$MODE" = external ]; then
+    harness_target_drop_db >/dev/null 2>&1 || true
+  fi
+  rm -rf "$WORKDIR"
+}
+trap cleanup EXIT INT TERM
+
+ADMIN_USER="social"
+ADMIN_PW="social-large-demo-pw-1"
+DEFAULT_DB="graphus"
+LOCAL_TARGET_DB="socialdb"
 
 # ==================================================================================================
-# Step 1 — deterministic generator (byte-identical per seed)
+# Step 1 — deterministic generator (byte-identical per seed) — both modes
 # ==================================================================================================
-section "Step 1 — deterministic social-graph generator ($PROFILE profile)"
-GEN_OUT="$("$GEN" --profile "$PROFILE" --out-dir "$WORKDIR/gen1")"
+section "Step 1 — deterministic social-graph generator (${GEN_ARGS[*]})"
+GEN_OUT="$("$GEN" "${GEN_ARGS[@]}" --format csv --out-dir "$DATA_DIR")"
 printf '%s\n' "$GEN_OUT" | sed 's/^/  /'
-assert "graph.cypher generated" "yes" "$([ -s "$WORKDIR/gen1/graph.cypher" ] && echo yes || echo no)"
-
-"$GEN" --profile "$PROFILE" --out-dir "$WORKDIR/gen2" >/dev/null
-if diff -q "$WORKDIR/gen1/graph.cypher" "$WORKDIR/gen2/graph.cypher" >/dev/null; then
+for f in users.csv articles.csv friends.csv likes.csv; do
+  assert "$f generated" "yes" "$([ -s "$DATA_DIR/$f" ] && echo yes || echo no)"
+done
+"$GEN" "${GEN_ARGS[@]}" --format csv --out-dir "$GENDIR2" >/dev/null
+if diff -q "$DATA_DIR/users.csv" "$GENDIR2/users.csv" >/dev/null \
+   && diff -q "$DATA_DIR/friends.csv" "$GENDIR2/friends.csv" >/dev/null; then
   assert "generator is byte-identical per seed" "yes" "yes"
 else
   assert "generator is byte-identical per seed" "yes" "no"
 fi
+rm -rf "$GENDIR2"
 
+SEED="$(kv "$GEN_OUT" seed)"
 GEN_USERS="$(kv "$GEN_OUT" users)"
 GEN_ARTICLES="$(kv "$GEN_OUT" articles)"
 GEN_FRIENDS="$(kv "$GEN_OUT" friend_edges)"
 GEN_LIKES="$(kv "$GEN_OUT" like_edges)"
-GEN_DMIN="$(kv "$GEN_OUT" degree_min)"
-GEN_DMAX="$(kv "$GEN_OUT" degree_max)"
-info "realized degree band: [$GEN_DMIN, $GEN_DMAX]  (configured [$(kv "$GEN_OUT" friend_min), $(kv "$GEN_OUT" friend_max)])"
+DEG_DIST="$(kv "$GEN_OUT" degree_dist)"
+DEG_MIN="$(kv "$GEN_OUT" degree_min)"
+DEG_MAX="$(kv "$GEN_OUT" degree_max)"
+DEG_HIST="$(kv "$GEN_OUT" degree_hist)"
+NODE_COUNT=$(( ${GEN_USERS:-0} + ${GEN_ARTICLES:-0} ))
+REL_COUNT=$(( ${GEN_FRIENDS:-0} + ${GEN_LIKES:-0} ))
+info "graph: $GEN_USERS USER, $GEN_ARTICLES ARTICLE, $GEN_FRIENDS FRIEND, $GEN_LIKES LIKE  (degree_dist=$DEG_DIST)"
+info "realised FRIEND-degree band [$DEG_MIN, $DEG_MAX], log2 histogram: $DEG_HIST"
+if [ "$DEG_DIST" = "uniform" ]; then
+  info "(set SOCIAL_DEGREE_DIST=zipf for a power-law FRIEND graph with supernodes)"
+else
+  # A power-law run must have grown a supernode tail — max degree well above the band midpoint.
+  assert "power-law grew a supernode (max degree >= 32)" "yes" \
+    "$([ "${DEG_MAX:-0}" -ge 32 ] 2>/dev/null && echo yes || echo no)"
+fi
 
 # ==================================================================================================
-# Step 2 — in-process BULK LOAD + traversal + shape asserts (REAL engine)
+# Step 2 — attach to a running instance (external) OR boot a local server (local)
 # ==================================================================================================
-section "Step 2 — in-process bulk load + read-query battery (real engine, on-disk store)"
-LOAD_OUT="$("$LOAD" --profile "$PROFILE" 2>&1)" || true
-printf '%s\n' "$LOAD_OUT" | grep -v '^GRAPHUS_SOCIAL_OK' | sed 's/^/  /'
-assert "load reached the expected graph shape AND traversals returned" "yes" \
-  "$(printf '%s' "$LOAD_OUT" | grep -q 'GRAPHUS_SOCIAL_OK' && echo yes || echo no)"
+if [ "$MODE" = external ]; then
+  section "Step 2 — attach to the running Graphus instance (Bolt-over-TCP + TLS)"
+  BOLT_URI="${GRAPHUS_TARGET_BOLT:?external mode requires GRAPHUS_TARGET_BOLT (bolt://host:port)}"
+  [ -n "${GRAPHUS_TARGET_REST:-}${GRAPHUS_TARGET_METRICS:-}" ] || {
+    echo "${RED}fatal: external mode needs GRAPHUS_TARGET_REST (or _METRICS) for DB isolation + /metrics${RESET}" >&2; exit 2; }
+  TARGET_DB="$(harness_target_ensure_db)" || { echo "${RED}fatal: could not resolve an isolated target database${RESET}" >&2; exit 1; }
+  DRIVER_USER="${GRAPHUS_TARGET_USER:-graphus}"
+  DRIVER_PW="${GRAPHUS_TARGET_PASSWORD:-graphus-local}"
+  info "attaching to $BOLT_URI, isolated database '$TARGET_DB'"
+  assert "isolated target database resolved" "yes" "$([ -n "$TARGET_DB" ] && echo yes || echo no)"
+else
+  section "Step 2 — boot graphus-server (Bolt-over-UDS + plaintext-loopback REST)"
+  free_port() {
+    if command -v python3 >/dev/null 2>&1; then
+      python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'
+    else
+      echo 47475
+    fi
+  }
+  REST_PORT="$(free_port)"
+  REST_ADDR="127.0.0.1:$REST_PORT"
+  TARGET_DB="$LOCAL_TARGET_DB"
+  cat > "$CONFIG" <<EOF
+# Generated by examples/social-network-large/run.sh — a UDS+REST dev configuration.
+store_path = "$STORE_DIR"
+default_database = "$DEFAULT_DB"
+buffer_pool_pages = $POOL_PAGES
+uds_path = "$SOCKET"
+rest_addr = "$REST_ADDR"
+jwt_secret = "graphus-social-network-large-example-uds-rest-secret-32+"
+# Plaintext loopback REST (dev/test only) so the network bulk-import upload needs no TLS/cert.
+allow_insecure_network = true
+
+[auth]
+admin_user = "$ADMIN_USER"
+admin_password = "$ADMIN_PW"
+admin_uid = $(id -u)
+EOF
+  if [ -n "${SOCIAL_READER_THREADS:-}" ]; then
+    printf '\n[admission]\nreader_threads = %s\n' "$SOCIAL_READER_THREADS" >> "$CONFIG"
+    info "reader pool pinned to $SOCIAL_READER_THREADS thread(s)"
+  fi
+
+  "$SERVER" "$CONFIG" >>"$SERVER_LOG" 2>&1 &
+  SERVER_PID=$!
+  BOUND=no
+  for _ in $(seq 1 150); do
+    if [ -S "$SOCKET" ]; then BOUND=yes; break; fi
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then break; fi
+    sleep 0.1
+  done
+  assert "server bound the UDS socket" "yes" "$BOUND"
+  if [ "$BOUND" != "yes" ]; then
+    echo "${RED}server did not come up; last log lines:${RESET}" >&2
+    tail -n 20 "$SERVER_LOG" >&2 || true
+    exit 1
+  fi
+  info "REST on $REST_ADDR, UDS on $SOCKET, server pid $SERVER_PID"
+fi
 
 # ==================================================================================================
-# Step 3 — standardized evidence (throughput + footprint + RSS + latency) + baseline gate
+# Step 3 — load the graph over the wire + version-tolerant schema + round-tripped-count asserts
 # ==================================================================================================
-section "Step 3 — collect performance evidence (throughput + footprint + RSS + latency)"
-rm -f "$EVIDENCE_DIR/report.json" "$EVIDENCE_DIR/report.md"
-EVIDENCE_OUT="$("$EVIDENCE_BIN" --evidence-dir "$EVIDENCE_DIR" --profile "$PROFILE" 2>&1)" || true
-printf '%s\n' "$EVIDENCE_OUT" | sed 's/^/  /'
-assert "evidence report.json was produced" "yes" \
-  "$([ -f "$EVIDENCE_DIR/report.json" ] && echo yes || echo no)"
-assert "evidence report.md was produced" "yes" \
-  "$([ -f "$EVIDENCE_DIR/report.md" ] && echo yes || echo no)"
+LOAD_LOG="$WORKDIR/load.log"
+if [ "$MODE" = external ]; then
+  section "Step 3 — load the graph over Bolt (version-tolerant UNWIND) + round-tripped counts"
+  info "loading over Bolt into '$TARGET_DB'; on a small/remote box this can take a while…"
+  set +e
+  "$LOAD" --bolt "$BOLT_URI" --db "$TARGET_DB" --data-dir "$DATA_DIR" \
+    --user "$DRIVER_USER" --password "$DRIVER_PW" "${GEN_ARGS[@]}" 2>&1 | tee "$LOAD_LOG" | sed 's/^/  /'
+  set -e
+else
+  section "Step 3 — network bulk-import (Mode A) + version-tolerant schema + round-tripped counts"
+  set +e
+  "$LOAD" --rest "$REST_ADDR" --default-db "$DEFAULT_DB" --db "$TARGET_DB" --data-dir "$DATA_DIR" \
+    --user "$ADMIN_USER" --password "$ADMIN_PW" "${GEN_ARGS[@]}" 2>&1 | tee "$LOAD_LOG" | sed 's/^/  /'
+  set -e
+fi
+assert "graph loaded + every battery family well-formed (round-tripped counts asserted)" "yes" \
+  "$(grep -q 'GRAPHUS_SOCIAL_LOAD_OK' "$LOAD_LOG" && echo yes || echo no)"
+if ! grep -q 'GRAPHUS_SOCIAL_LOAD_OK' "$LOAD_LOG"; then
+  echo "${RED}load failed; aborting the concurrency ladder.${RESET}" >&2
+  exit 1
+fi
 
-# Regression gate (fast profile only — the committed baseline is that run). Compares ONLY the stable
-# STRUCTURAL metrics (node/rel counts, durable store bytes/pages, store-only space amplification)
-# against baseline.json; the machine-variant RSS / throughput / CPU / wall-time / WAL families are
-# given an effectively-infinite tolerance (see social_baseline_cmp). A non-fast profile is not
-# baseline-comparable (different scale), so the gate is skipped then.
-if [ "$PROFILE" = "fast" ] && [ -f "$BASELINE" ] && [ -f "$EVIDENCE_DIR/report.json" ]; then
-  section "regression gate vs committed baseline"
+# ==================================================================================================
+# Step 4 — the over-the-wire concurrent read LADDER + evidence
+# ==================================================================================================
+if [ "$MODE" = external ]; then
+  section "Step 4 — concurrent read ladder over Bolt-TCP+TLS (attach) + /metrics evidence"
+  rm -f "$EVIDENCE_DIR/report.json" "$EVIDENCE_DIR/report.md"
+  harness_scrape_metrics "$METRICS_BEFORE" || info "metrics-before scrape failed (non-fatal)"
+  assert "/metrics scraped before the ladder" "yes" "$([ -s "$METRICS_BEFORE" ] && echo yes || echo no)"
+
+  AUTO_FLAG=(); [ "$AUTO_EXTEND" = "1" ] && AUTO_FLAG=(--auto-extend)
+  BENCH_LOG="$WORKDIR/bench.log"
+  set +e
+  "$BENCH" --bolt "$BOLT_URI" --user "$DRIVER_USER" --password "$DRIVER_PW" --db "$TARGET_DB" \
+    --ladder "$EXT_LADDER" --ops-per-rung "$EXT_OPS" --min-ops-per-client "$MIN_OPS_PER_CLIENT" \
+    --write-every-ms "$WRITE_EVERY_MS" --writers "$WRITERS" "${AUTO_FLAG[@]}" \
+    --users "$GEN_USERS" --articles "$GEN_ARTICLES" --friends "$GEN_FRIENDS" --likes "$GEN_LIKES" \
+    --seed "$SEED" --scenario "social-network-large" 2>&1 | tee "$BENCH_LOG" | sed 's/^/  /'
+  set -e
+
+  harness_scrape_metrics "$METRICS_AFTER" || info "metrics-after scrape failed (non-fatal)"
+  assert "/metrics scraped after the ladder" "yes" "$([ -s "$METRICS_AFTER" ] && echo yes || echo no)"
+
+  BENCH_STATS="$(sed -n 's/^GRAPHUS_SOCIAL_BENCH_STATS //p' "$BENCH_LOG" | head -n1)"
+  assert "client-side stats sentinel produced" "yes" "$([ -n "$BENCH_STATS" ] && echo yes || echo no)"
+  BEST_CLIENTS="$(kv "$BENCH_STATS" best_clients)"
+  BEST_OPS_PER_SEC="$(kv "$BENCH_STATS" best_ops_per_sec)"
+  BEST_OPS="$(kv "$BENCH_STATS" best_ops)"
+  BEST_SECS="$(kv "$BENCH_STATS" best_secs)"
+  P50_MS="$(kv "$BENCH_STATS" p50_ms)"
+  P99_MS="$(kv "$BENCH_STATS" p99_ms)"
+  P999_MS="$(kv "$BENCH_STATS" p999_ms)"
+  ABORT_RATE="$(kv "$BENCH_STATS" abort_rate)"
+
+  RUNG_NOTES=()
+  while IFS= read -r line; do
+    [ -n "$line" ] && RUNG_NOTES+=(--note "$line")
+  done < <(grep '^GRAPHUS_SOCIAL_BENCH_RUNG ' "$BENCH_LOG" || true)
+  VERDICT_LINE="$(grep 'CLIENT-SIDE VERDICT' "$BENCH_LOG" | head -n1 || true)"
+  [ -n "$VERDICT_LINE" ] && RUNG_NOTES+=(--note "$VERDICT_LINE")
+
+  MEASURE_BIN="$BIN_DIR/measure_target"
+  if [ ! -x "$MEASURE_BIN" ]; then
+    info "building the dev-only measure_target harness binary…"
+    ( cd "$REPO_ROOT" && cargo build -q -p graphus-examples-harness --bin measure_target ) || true
+    MEASURE_BIN="$REPO_ROOT/target/debug/measure_target"
+  fi
+  if [ -x "$MEASURE_BIN" ] && [ -s "$METRICS_BEFORE" ] && [ -s "$METRICS_AFTER" ] && [ -n "$BENCH_STATS" ]; then
+    "$MEASURE_BIN" \
+      --evidence-dir "$EVIDENCE_DIR" --scenario "social-network-large" \
+      --description "large social network: concurrent read scaling over Bolt-TCP+TLS (attach mode)" \
+      --database "$TARGET_DB" \
+      --metrics-before "$METRICS_BEFORE" --metrics-after "$METRICS_AFTER" \
+      --nodes "$NODE_COUNT" --rels "$REL_COUNT" \
+      --workload-ops "${BEST_OPS:-0}" --workload-secs "${BEST_SECS:-1}" \
+      --p50-ms "${P50_MS:-0}" --p99-ms "${P99_MS:-0}" --p999-ms "${P999_MS:-0}" \
+      --abort-rate "${ABORT_RATE:-0}" \
+      --param "connection=bolt-tcp-tls" --param "target=$BOLT_URI" --param "scenario_db=$TARGET_DB" \
+      --param "ladder=$EXT_LADDER" --param "ops_per_rung=$EXT_OPS" \
+      --param "min_ops_per_client=$MIN_OPS_PER_CLIENT" --param "writers=$WRITERS" \
+      --param "degree_dist=$DEG_DIST" --param "degree_hist=$DEG_HIST" \
+      --param "best_clients=${BEST_CLIENTS:-?}" --param "best_ops_per_sec=${BEST_OPS_PER_SEC:-?}" \
+      --param "user_count=$GEN_USERS" --param "article_count=$GEN_ARTICLES" \
+      --param "friend_count=$GEN_FRIENDS" --param "like_count=$GEN_LIKES" \
+      --param "node_count=$NODE_COUNT" --param "relationship_count=$REL_COUNT" \
+      "${RUNG_NOTES[@]}" \
+      --note "Client throughput/latency are measured by social_bench over Bolt-TCP+TLS; the server-side channel is the /metrics before/after delta (no /proc — remote/attached instance)." \
+      --assert \
+      && info "external evidence written to $EVIDENCE_DIR" \
+      || { info "measure_target reported an invariant violation or error"; FAILURES=$((FAILURES + 1)); }
+    assert "external report.json produced (measurement_mode=external)" "yes" \
+      "$([ -f "$EVIDENCE_DIR/report.json" ] && grep -q '"measurement_mode": *"external"' "$EVIDENCE_DIR/report.json" && echo yes || echo no)"
+    assert "report.json carries server_metrics deltas" "yes" \
+      "$([ -f "$EVIDENCE_DIR/report.json" ] && grep -q '"server_metrics"' "$EVIDENCE_DIR/report.json" && echo yes || echo no)"
+  else
+    info "measure_target unavailable or metrics missing; skipping evidence collection (non-fatal)"
+    FAILURES=$((FAILURES + 1))
+  fi
+else
+  section "Step 4 — concurrent read ladder (many simultaneous UDS-Bolt connections, server-PID sampled)"
+  rm -f "$EVIDENCE_DIR/report.json" "$EVIDENCE_DIR/report.md"
+  # The logical size of the graph (the generator's CSV bytes) anchors the space-amplification ratio:
+  # how many durable bytes (store + WAL) the engine holds per logical byte of graph.
+  LOGICAL_BYTES=0
+  for f in users.csv articles.csv friends.csv likes.csv; do
+    LOGICAL_BYTES=$((LOGICAL_BYTES + $(wc -c < "$DATA_DIR/$f")))
+  done
+  BENCH_OUT="$("$BENCH" --socket "$SOCKET" --user "$ADMIN_USER" --password "$ADMIN_PW" --db "$TARGET_DB" \
+    --server-pid "$SERVER_PID" --store-path "$STORE_DIR" --logical-bytes "$LOGICAL_BYTES" \
+    --ladder "$LADDER" --ops-per-rung "$OPS_PER_RUNG" --min-ops-per-client "$MIN_OPS_PER_CLIENT" \
+    --write-every-ms "$WRITE_EVERY_MS" --writers "$WRITERS" \
+    --users "$GEN_USERS" --articles "$GEN_ARTICLES" --friends "$GEN_FRIENDS" --likes "$GEN_LIKES" \
+    --seed "$SEED" --scenario "social-network-large" --evidence-dir "$EVIDENCE_DIR" 2>&1)" || true
+  printf '%s\n' "$BENCH_OUT" | sed 's/^/  /'
+  assert "evidence report.json was produced" "yes" \
+    "$([ -f "$EVIDENCE_DIR/report.json" ] && echo yes || echo no)"
+  assert "evidence report.md was produced" "yes" \
+    "$([ -f "$EVIDENCE_DIR/report.md" ] && echo yes || echo no)"
+fi
+
+# ==================================================================================================
+# Step 5 — regression gate vs the committed baseline (LOCAL fast profile only; structural counts)
+# ==================================================================================================
+if [ "$MODE" = local ] && [ "$PROFILE" = "fast" ] && [ "${SOCIAL_DEGREE_DIST:-uniform}" = "uniform" ] \
+   && [ -f "$BASELINE" ] && [ -f "$EVIDENCE_DIR/report.json" ]; then
+  section "regression gate vs committed baseline (structural counts)"
   CMP_OUT="$("$CMP_BIN" "$BASELINE" "$EVIDENCE_DIR/report.json" 2>&1)" || true
   printf '%s\n' "$CMP_OUT" | sed 's/^/  /'
-  assert "fresh run is within baseline thresholds (structural metrics)" "yes" \
+  assert "fresh run is within baseline thresholds (structural counts)" "yes" \
     "$(printf '%s' "$CMP_OUT" | grep -q 'GRAPHUS_BASELINE_OK' && echo yes || echo no)"
+elif [ "$MODE" = external ]; then
+  info "regression gate skipped (external attach: the host-independent invariant gate ran in measure_target --assert)."
+elif [ "${SOCIAL_DEGREE_DIST:-uniform}" != "uniform" ]; then
+  info "regression gate skipped (power-law graph: not baseline-comparable to the committed uniform baseline)."
 elif [ ! -f "$BASELINE" ]; then
   info "no committed baseline.json yet — skipping the regression gate."
 else
@@ -167,138 +436,26 @@ else
 fi
 
 # ==================================================================================================
-# Step 4 — (optional) Bolt-over-UDS wire demonstration of the same model
-# ==================================================================================================
-if [ "$RUN_WIRE" = "1" ]; then
-  if [ ! -x "$SERVER" ] || [ ! -x "$CLI" ]; then
-    section "Building graphus-server and graphus-cli (release) for the wire demo"
-    ( cd "$REPO_ROOT" && cargo build --release -p graphus-server -p graphus-cli )
-  fi
-  if [ -x "$SERVER" ] && [ -x "$CLI" ]; then
-    section "Step 4 — Bolt-over-UDS wire demo (the same USER/FRIEND/ARTICLE/LIKE model via graphus-cli)"
-    CONFIG="$WORKDIR/graphus.toml"
-    SOCKET="$WORKDIR/graphus.sock"
-    SERVER_LOG="$WORKDIR/server.log"
-    ADMIN_USER="social"
-    ADMIN_PW="social-large-demo-pw-1"
-    cat > "$CONFIG" <<EOF
-# Generated by examples/social-network-large/run.sh — a UDS-only wire-demo configuration.
-store_path = "$WORKDIR/data"
-buffer_pool_pages = 2048
-uds_path = "$SOCKET"
-rest_addr = ""
-jwt_secret = "graphus-social-large-demo-uds-only-secret-32+"
-
-[auth]
-admin_user = "$ADMIN_USER"
-admin_password = "$ADMIN_PW"
-admin_uid = $(id -u)
-EOF
-    SERVER_PID=""
-    wire_cleanup() {
-      if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
-        kill -TERM "$SERVER_PID" 2>/dev/null || true
-        wait "$SERVER_PID" 2>/dev/null || true
-      fi
-    }
-    trap 'wire_cleanup; cleanup' EXIT INT TERM
-
-    "$SERVER" "$CONFIG" >>"$SERVER_LOG" 2>&1 &
-    SERVER_PID=$!
-    BOUND=no
-    for _ in $(seq 1 100); do
-      if [ -S "$SOCKET" ]; then BOUND=yes; break; fi
-      if ! kill -0 "$SERVER_PID" 2>/dev/null; then break; fi
-      sleep 0.1
-    done
-    assert "server bound the UDS socket" "yes" "$BOUND"
-
-    cypher() { GRAPHUS_PASSWORD="$ADMIN_PW" "$CLI" --uds "$SOCKET" --user "$ADMIN_USER" -c "$1"; }
-    scalar() {
-      cypher "$1" | awk -F'|' '
-        /^\|/ { rows++; if (rows == 2) { v = $2; gsub(/^[ \t"]+|[ \t"]+$/, "", v); print v } }
-      '
-    }
-
-    if [ "$BOUND" = "yes" ]; then
-      # Declare the headline SEARCH SCHEMA over the wire, schema-first, exactly as an operator would:
-      # a FULLTEXT + TEXT index over ARTICLE.name, a relationship RANGE index on LIKE.date, and an
-      # existence constraint on ARTICLE.name. Created before the data below so each index is maintained
-      # as the articles land — the same production "declare the schema, then load + serve" flow.
-      cypher "CREATE FULLTEXT INDEX article_headline_fulltext FOR (a:ARTICLE) ON EACH [a.name]" > /dev/null
-      cypher "CREATE TEXT INDEX article_name_text FOR (a:ARTICLE) ON (a.name)" > /dev/null
-      cypher "CREATE INDEX like_date_range FOR ()-[l:LIKE]-() ON (l.date)" > /dev/null
-      cypher "CREATE CONSTRAINT article_name_exists FOR (a:ARTICLE) REQUIRE a.name IS NOT NULL" > /dev/null
-
-      # A small, hand-written slice of the SAME model: USERs befriended in a chain (so a
-      # friend-of-friend query has a non-empty answer), ARTICLEs, and LIKE edges — created over the
-      # wire exactly as an operator would, proving the model round-trips over Bolt/UDS.
-      cypher "
-CREATE (u0:USER {id:'000000000000000000000000', name:'José António da Silva e Carvalho', registered:1781876640}),
-       (u1:USER {id:'000000000000000000000001', name:'Maria Inês Gonçalves',              registered:1781876700}),
-       (u2:USER {id:'000000000000000000000002', name:'João Pedro Patrícia Sá',            registered:1781876760}),
-       (u3:USER {id:'000000000000000000000003', name:'Ana Rita Fonseca',                  registered:1781876820}),
-       (a0:ARTICLE {id:'0000000000000000000000a0', name:'Economia cresce acima do esperado no trimestre', registered:1781870000}),
-       (a1:ARTICLE {id:'0000000000000000000000a1', name:'Nova política ambiental aprovada no parlamento',  registered:1781871000}),
-       (u0)-[:FRIEND {since:1781876640}]->(u1),
-       (u1)-[:FRIEND {since:1781876700}]->(u2),
-       (u2)-[:FRIEND {since:1781876760}]->(u3),
-       (u0)-[:LIKE {date:1781876900}]->(a0),
-       (u1)-[:LIKE {date:1781876901}]->(a0),
-       (u2)-[:LIKE {date:1781876902}]->(a1)
-RETURN count(*) AS created" > /dev/null
-
-      assert "wire: |USER| created over UDS" "4" "$(scalar "MATCH (u:USER) RETURN count(u) AS c")"
-      assert "wire: |ARTICLE| created over UDS" "2" "$(scalar "MATCH (a:ARTICLE) RETURN count(a) AS c")"
-      assert "wire: |FRIEND| created over UDS" "3" "$(scalar "MATCH ()-[r:FRIEND]->() RETURN count(r) AS c")"
-      assert "wire: |LIKE| created over UDS" "3" "$(scalar "MATCH ()-[r:LIKE]->() RETURN count(r) AS c")"
-      # Friend-of-friend of u0 over the undirected FRIEND relation: u0–u1–u2 ⇒ u2 is the 2-hop friend.
-      assert "wire: friend-of-friend traversal returns u2" "000000000000000000000002" \
-        "$(scalar "MATCH (u:USER {id:'000000000000000000000000'})-[:FRIEND]-(:USER)-[:FRIEND]-(fof:USER) WHERE fof.id <> u.id RETURN fof.id AS id")"
-      # Most-liked article (aggregation + ORDER BY + LIMIT): a0 has 2 likes, a1 has 1.
-      assert "wire: top-liked article is a0" "0000000000000000000000a0" \
-        "$(scalar "MATCH (:USER)-[:LIKE]->(a:ARTICLE) WITH a, count(*) AS likes RETURN a.id AS id ORDER BY likes DESC LIMIT 1")"
-
-      # The search schema over the wire: SHOW INDEXES surfaces the two always-on token LOOKUP indexes
-      # plus our FULLTEXT headline index, and the headline searches find the matching articles.
-      SHOW_OUT="$(cypher "SHOW INDEXES")"
-      assert "wire: SHOW INDEXES surfaces node_label_lookup_index (LOOKUP)" "yes" \
-        "$(printf '%s' "$SHOW_OUT" | grep -q 'node_label_lookup_index' && echo yes || echo no)"
-      assert "wire: SHOW INDEXES surfaces rel_type_lookup_index (LOOKUP)" "yes" \
-        "$(printf '%s' "$SHOW_OUT" | grep -q 'rel_type_lookup_index' && echo yes || echo no)"
-      assert "wire: SHOW INDEXES surfaces the FULLTEXT headline index" "yes" \
-        "$(printf '%s' "$SHOW_OUT" | grep -q 'article_headline_fulltext' && echo yes || echo no)"
-      # FULLTEXT word search over the wire: 'parlamento' is a token of a1's headline only.
-      assert "wire: FULLTEXT queryNodes('parlamento') finds article a1" "0000000000000000000000a1" \
-        "$(scalar "CALL db.index.fulltext.queryNodes('article_headline_fulltext', 'parlamento') YIELD node RETURN node.id AS id")"
-      # TEXT CONTAINS substring search over the wire: 'Economia' is a substring of a0's headline only.
-      assert "wire: TEXT CONTAINS 'Economia' finds article a0" "0000000000000000000000a0" \
-        "$(scalar "MATCH (a:ARTICLE) WHERE a.name CONTAINS 'Economia' RETURN a.id AS id")"
-    fi
-
-    wire_cleanup
-    SERVER_PID=""
-    trap cleanup EXIT INT TERM
-  else
-    section "Step 4 — wire demo SKIPPED (server/cli binaries unavailable)"
-  fi
-else
-  section "Step 4 — Bolt-over-UDS wire demo SKIPPED (RUN_WIRE=0)"
-fi
-
-# ==================================================================================================
 # Summary
 # ==================================================================================================
 section "Result"
-printf '%s checks run, %s failures.\n' "$CHECKS" "$FAILURES"
+printf '%s checks run, %s failures.  (mode: %s, degree_dist: %s)\n' "$CHECKS" "$FAILURES" "$MODE" "$DEG_DIST"
 if [ -f "$EVIDENCE_DIR/report.json" ]; then
   info "standardized evidence: $EVIDENCE_DIR/{report.json, report.md}"
 fi
 if [ "$FAILURES" -eq 0 ]; then
-  printf '%s%sSOCIAL-NETWORK-LARGE DEMONSTRATION PASSED%s — the seeded generator is byte-identical, the\n' "$BOLD" "$GREEN" "$RESET"
-  printf 'bulk load produced a %s-USER / %s-ARTICLE graph (%s FRIEND, %s LIKE) with realized friend\n' "${GEN_USERS:-?}" "${GEN_ARTICLES:-?}" "${GEN_FRIENDS:-?}" "${GEN_LIKES:-?}"
-  printf 'degree within [%s, %s], the Cypher read battery traversed it, and the structural evidence\n' "${GEN_DMIN:-?}" "${GEN_DMAX:-?}"
-  printf 'matched the committed baseline.\n'
+  if [ "$MODE" = external ]; then
+    printf '%s%sSOCIAL-NETWORK-LARGE DEMONSTRATION PASSED%s (external attach) — the seeded generator is\n' "$BOLD" "$GREEN" "$RESET"
+    printf 'byte-identical, the %s-USER / %s-ARTICLE graph (%s FRIEND, %s LIKE) was loaded over Bolt-TCP+TLS\n' "${GEN_USERS:-?}" "${GEN_ARTICLES:-?}" "${GEN_FRIENDS:-?}" "${GEN_LIKES:-?}"
+    printf 'into an isolated database, the concurrent read ladder ran against the live instance over the\n'
+    printf 'wire, and the /metrics before/after delta + client throughput/latency were folded into an\n'
+    printf 'external-mode evidence report (the isolated database was dropped on exit).\n'
+  else
+    printf '%s%sSOCIAL-NETWORK-LARGE DEMONSTRATION PASSED%s — the seeded generator is byte-identical, the\n' "$BOLD" "$GREEN" "$RESET"
+    printf '%s-USER / %s-ARTICLE graph (%s FRIEND, %s LIKE) was network-bulk-loaded over the wire, every\n' "${GEN_USERS:-?}" "${GEN_ARTICLES:-?}" "${GEN_FRIENDS:-?}" "${GEN_LIKES:-?}"
+    printf 'battery family returned a well-formed result, and the concurrent read ladder produced\n'
+    printf 'standardized evidence of the SERVER read-path core-scaling under load (server-PID sampled).\n'
+  fi
   exit 0
 else
   printf '%s%sSOCIAL-NETWORK-LARGE DEMONSTRATION FAILED%s — %s assertion(s) did not hold.\n' "$BOLD" "$RED" "$RESET" "$FAILURES"

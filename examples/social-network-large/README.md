@@ -1,14 +1,24 @@
-# social-network-large — performance under a LARGE social graph
+# social-network-large — do reads scale across cores?
 
-This example evaluates Graphus's behaviour on a **big graph**. It builds a social network of
-**`USER`** nodes befriended by an **undirected multigraph** `FRIEND` relationship, a corpus of
-**`ARTICLE`** nodes carrying realistic headlines, and **`LIKE`** edges from users to articles — then
-**bulk-loads it at scale** into a real on-disk store and measures a **Cypher traversal battery** over
-it, collecting explicit evidence across every performance vector (throughput, storage, RAM, CPU, and
-per-query latency).
+This example evaluates Graphus's read path on a **big social graph** under **real concurrency**. It
+builds a social network of **`USER`** nodes befriended by an **undirected multigraph** `FRIEND`
+relationship, a corpus of **`ARTICLE`** nodes carrying realistic headlines, and **`LIKE`** edges from
+users to articles — loads it into a **running server over the wire**, then drives a **concurrency
+ladder of simultaneous Bolt clients** through a Cypher read battery while **sampling the server
+process itself**.
+
+The headline question is deliberately narrow: **when C clients read at once, does the server spread
+the work across CPU cores, or does it hit a single-thread ceiling?**
 
 It is both a runnable **demonstration** and an executable **E2E test**: every step asserts its
 expected result and `run.sh` exits non-zero if any assertion fails.
+
+> **Why the driver had to change.** An earlier version of this example ran the battery **in-process**
+> through the engine's coordinator. That measured the *driver*, not the server: it bypassed the
+> server's off-thread reader pool entirely, so its "~1 core" figure was an **artifact of the harness**
+> and said nothing about how Graphus serves concurrent readers. The battery now runs over the real
+> Bolt wire against a real server process, which is the only way this question can be answered
+> honestly (`rmp` #691).
 
 ## The graph model (a multigraph LPG)
 
@@ -16,12 +26,8 @@ expected result and `run.sh` exits non-zero if any assertion fails.
 |---------|-------|---------|
 | `(:USER {id, name, registered})` | `id` = 24 hex chars, `name` ≤ 64 chars (realistic Portuguese full names, with diacritics), `registered` = unix ts | a person |
 | `(:ARTICLE {id, name, registered})` | `id` = 24 hex chars, `name` = a realistic news-style headline, `registered` = unix ts | a published article |
-| `(:USER)-[:FRIEND {since}]-(:USER)` | **undirected multigraph**; each `USER` has between `friend_min` and `friend_max` friends | a friendship |
-| `(:USER)-[:LIKE {date}]->(:ARTICLE)` | directed; each user likes a random set of articles | a like |
-
-The model mirrors the goal literally — e.g.
-`CREATE (:USER {id:'000000000000000000000000', name:'José António da Silva e Carvalho', registered:1781876640})`
-and `(:USER)-[:FRIEND {since:1781876640}]-(:USER)`.
+| `(:USER)-[:FRIEND {since}]-(:USER)` | **undirected multigraph** | a friendship |
+| `(:USER)-[:LIKE {date}]->(:ARTICLE)` | directed | a like |
 
 ### Realistic, deterministic data
 
@@ -32,165 +38,151 @@ iteration). Names are assembled from European-Portuguese given-name / surname / 
 (diacritics preserved, bounded to 64 bytes on a char boundary); article titles are assembled from
 realistic headline-fragment pools so they "tend to contain real information".
 
-The `FRIEND` relationship is built with the **configuration model** (stub pairing): each user draws a
-target degree in `[friend_min, friend_max]`, the stubs are deterministically shuffled (Fisher–Yates)
-and paired, with self-loops avoided and multi-edges allowed (Graphus is a multigraph). This yields a
-realised per-user degree **within the configured band** — `O(E)` and scalable to a million users.
+### Two degree distributions — including supernodes
+
+`FRIEND` is built with the **configuration model** (stub pairing: each user draws a target degree,
+stubs are deterministically shuffled and paired, self-loops avoided, multi-edges allowed).
+`SOCIAL_DEGREE_DIST` picks how each user's target degree is drawn:
+
+| Mode | Degree law | Realised (fast profile) | What it exercises |
+|------|-----------|--------------------------|-------------------|
+| `uniform` *(default)* | uniform in `[friend_min, friend_max]` | 15,047 edges, degree ∈ [6, 24] | an evenly-connected graph — no hubs |
+| `zipf` | power law `P(k) ∝ k^-s` | 3,688 edges, degree ∈ **[1, 367]**, log2 histogram `1:1242 2:447 4:180 8:68 16:35 32:10 64:13 128:4 256:1` | a **heavy tail of SUPERNODES** — the realistic social shape, and the adversarial case for traversal |
+
+The power-law run asserts a supernode actually grew (max degree ≥ 32) and prints the degree
+histogram. It is **not** baseline-comparable to the uniform graph, so the structural gate is skipped
+for it (by design, and stated in the run output).
 
 ## Scale profiles
 
 | Profile | Users | Friends / user | Articles | ≈ FRIEND edges | Use |
 |---------|-------|----------------|----------|----------------|-----|
 | `fast`  | 2,000 | 6–24 | 200 | ~15k | CI gate — runs in **seconds**; the committed baseline |
-| `large` | 50,000 | 20–120 | 3,000 | ~1.75M | bounded **evidence** run (release; ~tens of seconds) |
+| `large` | 50,000 | 20–120 | 3,000 | ~1.75M | bounded **evidence** run |
 | `huge`  | **1,000,000** | **200–2000** | **30,000** | **~550M** | the **literal target**; opt-in, heavy (tens of GB, long) |
 
-Select with `SOCIAL_PROFILE=<fast|large|huge>`. The `fast` profile is the default and the only one
-gated against the committed baseline (the others are different scales and are not baseline-comparable).
-The `huge` profile is the full target the example is built around; the loader is structurally capable
-of it (the generator streams the data batch-by-batch, and ingest is `O(E)`), but it is opt-in because
-of its size.
+Select with `SOCIAL_PROFILE=<fast|large|huge>`. Only `fast` is gated against the committed baseline
+(the others are different scales and are not baseline-comparable).
+
+## The two run modes
+
+The example auto-detects its mode through the shared external-target seam (`_harness/harness.sh`).
+
+**LOCAL (default)** — self-boots a real `graphus-server` (Bolt-over-UDS for the ladder + a
+plaintext-loopback REST listener for the upload path), **network-bulk-imports** the graph via
+`POST /admin/db/{db}/bulk-import` (Mode A) into an isolated database, declares the search schema over
+the wire, drives the ladder over UDS while sampling the **server's** per-thread CPU / RSS / IO from
+`/proc`, and gates the structural counts against the committed baseline.
+
+**EXTERNAL (attach)** — when any `GRAPHUS_TARGET_{BOLT,REST,UDS}` is set, it attaches to an
+**already-running instance** (local or remote) over Bolt-TCP + TLS. It carves out a dedicated,
+run-scoped database, loads a small graph over Bolt with a **version-tolerant schema** (a capability
+preflight drops any battery family the target cannot serve — e.g. FULLTEXT on an older server),
+scrapes the target's Prometheus `/metrics` before and after the ladder, drives the **same** battery,
+and **drops the isolated database on exit**. `/proc` sampling is off (there is no co-located PID), so
+the server-side channel is the `/metrics` delta and the host-independent invariant gate.
+
+```bash
+examples/social-network-large/run.sh                                   # local self-boot
+SOCIAL_DEGREE_DIST=zipf  examples/social-network-large/run.sh          # power-law supernodes
+SOCIAL_WRITERS=2 SOCIAL_WRITE_EVERY_MS=20 examples/…/run.sh            # readers contend with live writers
+SOCIAL_PROFILE=large     examples/social-network-large/run.sh          # evidence-scale
+
+GRAPHUS_TARGET_BOLT=bolt+ssc://host:7687 GRAPHUS_TARGET_REST=https://host:7474 \
+GRAPHUS_TARGET_USER=graphus GRAPHUS_TARGET_PASSWORD=… \
+  examples/social-network-large/run.sh                                 # attach to a running instance
+```
+
+Knobs: `SOCIAL_PROFILE`, `SOCIAL_DEGREE_DIST` (+ `SOCIAL_ZIPF_EXPONENT`), `SOCIAL_LADDER`,
+`SOCIAL_WRITERS` / `SOCIAL_WRITE_EVERY_MS`, `SOCIAL_READER_THREADS`, `GRAPHUS_BIN_DIR`.
+
+> The binaries are rebuilt on every run (cargo is incremental, so this is a no-op when nothing
+> changed). Building only when a binary is *absent* would silently run a **stale** binary after any
+> source edit, and the evidence would then describe code that is no longer the code under test.
+> Setting `GRAPHUS_BIN_DIR` explicitly opts out — you are then pointing at binaries you built.
 
 ## What it exercises
 
 | # | Capability | How it is shown |
 |---|------------|-----------------|
 | 1 | **Deterministic large-graph generation** | `social_gen` emits the graph twice and the bytes are diffed identical. |
-| 2 | **High-throughput bulk ingest at scale** | The graph is loaded via the production **`graphus-bulk`** path (`O(E)` endpoint resolution) into an on-disk store — nodes then relationships, in committed batches. |
-| 3 | **Index-backed point lookups** | `:USER(id)` and `:ARTICLE(id)` RANGE indexes are built so each `MATCH (:USER {id: …})` is an index **seek**. |
-| 4 | **A production search schema** (see [below](#the-search-schema-indexes--constraint)) | A **TEXT** and a **FULLTEXT** index over `ARTICLE.name`, a **relationship RANGE** index on `LIKE.date`, a **composite** node index on `ARTICLE(registered, id)`, the two always-on **LOOKUP** token indexes surfaced by `SHOW INDEXES`, and an **existence** constraint on `ARTICLE.name` — all declared over the loaded graph and asserted `ONLINE`. |
-| 5 | **Traversals on a large graph** | A Cypher read battery: direct friends, **friend-of-friend** (2-hop), **mutual friends**, **top-liked articles** (aggregation + `ORDER BY` + `LIMIT`), and degree. |
-| 6 | **Headline search** | A **TEXT `CONTAINS`** substring search and a **FULLTEXT `db.index.fulltext.queryNodes`** word search over `ARTICLE.name`, cross-checked to return exactly the generator's known article set; plus a **`LIKE.date` range** query (a correct scan + filter — the relationship RANGE index is equality-only). |
-| 7 | **The same model over the wire** | An opt-in Bolt-over-UDS slice creates a small slice of the identical model via `graphus-cli` against a booted `graphus-server`, declares the headline search schema over the socket, runs `SHOW INDEXES` (surfacing the two `LOOKUP` indexes) + a `db.index.fulltext.queryNodes` search, and a friend-of-friend + top-liked query. |
-| 8 | **Explicit evidence** | A schema-versioned `report.json` + `report.md`: ingest throughput, durable on-disk footprint + amplification, peak RSS, CPU, and per-query latency. |
-
-## The search schema (indexes + constraint)
-
-After the graph is bulk-loaded, the example declares — through the same typed coordinator seam the
-server's Bolt/REST admin surface dispatches to after parsing `CREATE … INDEX` / `CREATE CONSTRAINT` —
-a production-realistic **search schema** over the article headlines and the like timeline, then serves
-search queries against it:
-
-| Object | DDL (the equivalent admin-grammar form) | Purpose |
-|--------|-----------------------------------------|---------|
-| `user_id_range` | `CREATE INDEX user_id_range FOR (u:USER) ON (u.id)` | friendship-traversal anchor seek |
-| `article_id_range` | `CREATE INDEX article_id_range FOR (a:ARTICLE) ON (a.id)` | like-traversal anchor seek |
-| `article_name_text` | `CREATE TEXT INDEX article_name_text FOR (a:ARTICLE) ON (a.name)` | headline **substring** search (`CONTAINS` / `STARTS WITH` / `ENDS WITH`) |
-| `article_headline_fulltext` | `CREATE FULLTEXT INDEX article_headline_fulltext FOR (a:ARTICLE) ON EACH [a.name]` | headline **word** search via `db.index.fulltext.queryNodes` |
-| `like_date_range` | `CREATE INDEX like_date_range FOR ()-[l:LIKE]-() ON (l.date)` | **relationship** RANGE index on the like timestamp |
-| `article_catalog_composite` | `CREATE INDEX article_catalog_composite FOR (a:ARTICLE) ON (a.registered, a.id)` | **composite** node index (time-ordered catalogue reads) |
-| `node_label_lookup_index`, `rel_type_lookup_index` | *(always-on — never created explicitly)* | the two token **LOOKUP** indexes backing every label / relationship-type scan, surfaced by `SHOW INDEXES` |
-| `article_name_exists` | `CREATE CONSTRAINT article_name_exists FOR (a:ARTICLE) REQUIRE a.name IS NOT NULL` | every article must carry a searchable headline |
-
-**Headline search cross-check.** The article headlines are assembled deterministically from
-subject/verb/object/tail fragment pools, so the example picks the most frequent single-word **subject**
-term and derives — straight from the generator — the exact set of articles whose headline contains it.
-It then asserts that **both** `MATCH (a:ARTICLE) WHERE a.name CONTAINS '<term>'` (TEXT index) and
-`CALL db.index.fulltext.queryNodes('article_headline_fulltext', '<term>')` (FULLTEXT index) return
-**exactly** that set. This also pins the analyzer's behaviour empirically: the standard analyzer
-**lowercases and tokenizes the Portuguese headlines per word (diacritics preserved) but does not
-stem**, so the whole-word subject token matches precisely the articles that use that subject — the
-same set the case-sensitive substring `CONTAINS` returns.
-
-**Honest relationship-RANGE utilisation.** Graphus's relationship RANGE index is **equality-only**: an
-*equality* predicate `l.date = X` lowers to a `RelIndexSeek`, but a **range** predicate `l.date >= X`
-stays a correct **scan + residual filter** (verified on the real planner in the hermetic schema test).
-So the example's `LIKE.date` range query is served correctly *without* the index — reported honestly
-rather than claimed as an index seek.
-
-The schema adds **no durable pages** — the TEXT / FULLTEXT / composite / relationship index data is
-ephemeral (rebuilt from the durable catalog on open) and only the small catalog entries are persisted —
-so the deterministic store footprint the baseline gate holds is unchanged by it.
-
-## Transport — why the load + read battery run in-process
-
-The bulk ingest path (`graphus-bulk`) and the MVCC engine are driven **in-process, single-threaded**
-over an **on-disk** `FileBlockDevice` + WAL — the same durable on-disk layout the production server
-uses. This is the real engine, real bulk import, real WAL-logged storage, just driven deterministically
-in one process so the footprint and structural metrics are reproducible and assertable. Step 4 then
-proves the **same Cypher model** round-trips over the real **Bolt-over-UDS wire** via `graphus-cli`.
-
-> **Why bulk-load instead of per-edge `CREATE`?** Loading hundreds of millions of edges by
-> `MATCH (a:USER {id:X}), (b:USER {id:Y}) CREATE (a)-[:FRIEND]->(b)` is `O(E·N)` today: the planner
-> index-seeks only **one** of the two anchors (the second equality lands as a filter above the
-> cartesian product, out of reach of the index-selection rewrite — filed as an improvement). The
-> `graphus-bulk` importer resolves each endpoint through an internal id→id hash map (`O(1)` per
-> endpoint ⇒ `O(E)` total), which is the correct, production way to load a large graph and lets this
-> example actually reach scale.
-
-> **Loading this dataset into a REMOTE, already-running server** (rather than the in-process
-> demonstration above) is a separate scenario this example's generator also supports: `social_gen
-> --format csv --profile <fast|large|huge> --out-dir <dir> [--users N] [...]` writes the same
-> deterministic graph as `users.csv`/`articles.csv`/`friends.csv`/`likes.csv` (the
-> `neo4j-admin import` shape `graphus-bulk`/the network bulk-import endpoint consume — see
-> `--help`), instead of the single `graph.cypher` file. Stream those files into a live server with
-> `POST /admin/db/{db}/bulk-import` (`docs/rest-api.md` §8.1) to reach scale over the network, not
-> just in-process. This is what `rmp` #521 used to validate the network bulk-import capability
-> end-to-end against a real dataset at the `huge` profile's density (scaled down in user count for
-> a disk-safe run — see the project memory for the full write-up); the `--users`/`--articles`/
-> `--friend-min`/`--friend-max`/`--avg-likes`/`--seed` flags let a caller request a custom scale
-> while keeping a named profile's density/shape.
-
-## Running it
-
-```bash
-# From the repository root. Builds the binaries if they are not already present.
-examples/social-network-large/run.sh
-```
-
-```bash
-# Use pre-built release binaries, run the bounded evidence-scale profile, skip the wire slice:
-cargo build --release -p graphus-social-gen --features engine -p graphus-server -p graphus-cli
-GRAPHUS_BIN_DIR=target/release SOCIAL_PROFILE=large RUN_WIRE=0 examples/social-network-large/run.sh
-```
-
-Knobs: `SOCIAL_PROFILE` (`fast` default), `RUN_WIRE` (`1` default; `0` skips the Bolt/UDS slice),
-`GRAPHUS_BIN_DIR` (where to find/place the binaries).
-
-A successful `fast` run ends with:
-
-```
-18 checks run, 0 failures.
-SOCIAL-NETWORK-LARGE DEMONSTRATION PASSED — ...
-```
+| 2 | **Network bulk import** | The graph is uploaded to a **running server** over REST (`bulk-import`, Mode A) and every structural count is round-tripped back over Bolt. |
+| 3 | **A production search schema** | RANGE (`USER.id`, `ARTICLE.id`), **TEXT** + **FULLTEXT** over `ARTICLE.name`, a **relationship RANGE** on `LIKE.date`, a **composite** node index, the always-on **LOOKUP** token indexes, and an **existence constraint** on `ARTICLE.name` — declared over the wire and asserted `ONLINE`. |
+| 4 | **A concurrent read battery** | Eight families — direct friends, **friend-of-friend**, **mutual friends**, **top-liked** (aggregation + `ORDER BY` + `LIMIT`), degree, **TEXT `CONTAINS`**, **`LIKE.date` range**, and **FULLTEXT** `queryNodes` — driven by C simultaneous Bolt clients. |
+| 5 | **Read scaling across cores** | The **server process** is sampled per-thread from `/proc` at each rung, so the report shows core utilisation and busy-thread count **vs C**. |
+| 6 | **Readers under live writers** | With `SOCIAL_WRITERS`, low-rate writer threads commit while readers run, so the read path is measured under MVCC/SSI contention rather than on a frozen graph. |
+| 7 | **Supernode traversal** | The `zipf` mode grows a heavy-tailed hub structure and runs the same battery over it. |
+| 8 | **Explicit evidence** | A schema-versioned `report.json` + `report.md`: the per-rung scaling curve, real p50/p99/p99.9 per family, server CPU/RSS, and the **decomposed** on-disk footprint. |
 
 ## The evidence it collects
 
-Each run writes a standardized, schema-versioned report to the **git-ignored** `evidence/` directory
-(`report.json` for tooling, `report.md` for humans), via the shared `graphus-examples-harness`. The
-headline figures for the committed `fast` profile (machine-variant numbers will differ on your host):
+Written to the git-ignored `evidence/` directory (`report.json` for tooling, `report.md` for humans).
+Figures below are a `fast`-profile local run on a 16-core x86_64 host — **machine-variant**; yours
+will differ.
+
+### Reads scale across cores — the headline
+
+| Clients | Throughput | p50 | p99 | Server cores | Busy threads |
+|--------:|-----------:|----:|----:|-------------:|-------------:|
+| 1 | 278 ops/s | 2.20 ms | 12.7 ms | 0.66 | 1 |
+| 2 | 519 ops/s | 2.19 ms | 13.2 ms | 1.35 | 16 |
+| 4 | 981 ops/s | 2.19 ms | 15.6 ms | 2.79 | 17 |
+| 8 | **1,684 ops/s** | 2.25 ms | 23.2 ms | **6.08** | 17 |
+
+Throughput rises **6.1× from C=1 to C=8** while p50 stays flat, and at saturation the server burns
+**6.08 cores across 17 busy threads with the busiest single thread at only 0.45 of a core**. That
+spread is the proof: no single thread is the bottleneck — the off-thread reader pool (`rmp`
+#336/#543) is genuinely engaged. The ladder's top rung is still its best, so the plateau lies beyond
+C=8; extend `SOCIAL_LADDER` to find the knee.
+
+### Per-family latency at the top rung (C=8) — where the tail comes from
+
+| Family | p50 | p99 | Note |
+|--------|----:|----:|------|
+| friends, degree, mutual, friend-of-friend, `CONTAINS`, FULLTEXT | ~2.2–2.8 ms | 3.0–4.5 ms | index-backed seeks + bounded traversal |
+| **`like_recent`** (`LIKE.date >= X`) | **15.5 ms** | 20.4 ms | the relationship RANGE index is **equality-only**, so a *range* predicate is a correct **scan + residual filter** — reported honestly, not claimed as a seek (`rmp` #680) |
+| **`top_liked`** (aggregation + `ORDER BY` + `LIMIT`) | **20.5 ms** | 27.0 ms | a full aggregation scan over every `LIKE` edge |
+
+These two families are ~7–9× the cost of every other family and **dominate the tail**. That is the
+example doing its job: it names the two read-path costs worth attacking.
+
+### Resources
 
 | Vector | `fast`-profile evidence |
 |--------|--------------------------|
-| **Graph** | 2,000 USER + 200 ARTICLE nodes; 15,047 FRIEND + 10,020 LIKE edges; realised degree ∈ [6, 24] |
-| **Ingest throughput** | ~120k nodes/s and ~245k rels/s over the production `O(E)` bulk path |
-| **Durable footprint** | store image **4,579,328 B (559 pages)**; store-only space amplification **2.43×** over 1.89 MB logical CSV — *deterministic & gated* |
-| **WAL** | ~28 MB transient redo log — *machine-variant, not gated* |
-| **RAM** | peak RSS ~166 MB |
-| **Read latency** | friends ~3.2 ms, friend-of-friend ~3.4 ms, mutual ~3.6 ms, degree ~3.2 ms, top-liked (full aggregation scan) ~27 ms |
+| **Graph** | 2,000 USER + 200 ARTICLE nodes; 15,047 FRIEND + 10,020 LIKE edges |
+| **RAM** | server peak RSS **430 MiB** at C=8 (317 MiB at C=1 — it grows with connection count) |
+| **Storage — data image** | `graphus.store` **4.4 MiB** = **2.46× the 1.8 MiB logical graph**. This is the ratio that scales with the graph, and it is healthy. |
+| **Storage — doublewrite** | `graphus.dwb` **16.9 MiB** — a **fixed preallocation, one per database**, independent of graph size. It dominates a small graph's footprint and amortises to nothing on a large one. |
+| **Storage — redo log** | `graphus.wal` **41.2 MiB = 9.3× the data image it protects**, and **not truncated over the run**. This is a genuine resource-efficiency defect, filed as `rmp` **#702**. |
+
+> **On reading the storage numbers.** A single lumped "durable bytes ÷ logical bytes" ratio would
+> read as **34×** here — and it would be *misleading*, because it blends the graph's data image with a
+> constant-cost doublewrite buffer and an un-checkpointed redo log. The report therefore
+> **decomposes** the footprint and states which bytes scale with the graph and which do not. (The
+> WAL is a *directory* of `seg.<lsn>` files; a classifier that tests only the leaf file name counts
+> every WAL byte as store and reports `wal = 0`, hiding the redo log entirely — that bug is now
+> pinned by a regression test.)
 
 ### The baseline regression gate
 
 The `fast` profile is compared against the committed `baseline.json` by `social_baseline_cmp`, which
 gates **only the stable, deterministic structural metrics** (node / relationship / USER / ARTICLE /
-FRIEND / LIKE counts, durable store bytes + pages, and store-only space amplification). The
-machine-variant families (RSS, throughput, CPU, wall-time, and the transient WAL) are given an
-effectively-infinite tolerance, so the gate flags a genuine storage-engine or generator regression
-without flaking on hardware differences.
+FRIEND / LIKE counts). The machine-variant families (RSS, throughput, CPU, wall-time, WAL) are given
+an effectively-infinite tolerance, so the gate flags a genuine storage-engine or generator regression
+without flaking on hardware differences. It is skipped for the `zipf` graph and in attach mode (where
+`measure_target --assert` applies the host-independent invariant gate instead: zero statement panics,
+zero recovery panics, zero force-detaches).
 
 ## CI coverage
 
-The crate's own `cargo test` (which runs under the project's default `cargo test --all`) exercises the
-`fast`-profile bulk load + the read-query battery + the shape invariants **and the search schema**
-(`graphus-social-gen`'s `tests/load_fast.rs`: the TEXT / FULLTEXT / relationship-RANGE / composite /
-LOOKUP indexes are `ONLINE` and the headline `CONTAINS` + `queryNodes` searches return the generator's
-known article set) and the generator's byte-identical determinism + degree-band + id/name invariants
-(`tests/determinism.rs`).
+`graphus-social-gen`'s own tests exercise the `fast`-profile load, the read-query battery, the shape
+invariants, the search schema, and the generator's byte-identical determinism + degree-band + id/name
+invariants — including the power-law degree law and the on-disk footprint decomposition.
 
 The search schema is additionally pinned by a **hermetic schema mirror**,
 `graphus-server/tests/social_network_large_schema.rs`, which drives the equivalent `CREATE … INDEX` /
 `CREATE CONSTRAINT` **strings** through the REAL admin-DDL + `LocalEngine` seam (the exact seam the
 Bolt/REST admin surfaces use) and asserts the full `SHOW INDEXES` / `SHOW CONSTRAINTS` column set, the
-honest relationship-RANGE planner utilisation (`RelIndexSeek` for equality, scan + filter for a range),
-the TEXT/FULLTEXT known-set search, and the existence-constraint enforcement. So the example's search
-guarantees are protected against regression on every build.
+honest relationship-RANGE planner utilisation (`RelIndexSeek` for equality, scan + filter for a
+range), the TEXT/FULLTEXT known-set search, and the existence-constraint enforcement.

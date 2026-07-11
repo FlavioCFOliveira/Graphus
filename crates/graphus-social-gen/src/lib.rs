@@ -66,6 +66,125 @@ use std::fmt::Write as _;
 #[cfg(feature = "engine")]
 pub mod load;
 
+/// The read-query **battery** as parameterised Cypher, shared by the over-the-wire loader (smoke) and
+/// the concurrent ladder driver (`social_bench`). Pure text + metadata — no engine, no client deps —
+/// so it is available in every build. The same eight families the in-process `load` battery runs, but
+/// **parameterised** (`$u0`, `$u1`, `$term`, `$since`) so a driver reuses one plan-cache entry per
+/// family with the anchor varying per op.
+pub mod battery {
+    /// The FULLTEXT headline index name the over-the-wire loader declares (best-effort) and the
+    /// `fulltext` family queries. Kept in sync with the in-process loader's `IDX_ARTICLE_HEADLINE_FT`.
+    pub const FULLTEXT_INDEX: &str = "article_headline_fulltext";
+
+    /// The per-op parameter shape a [`Family`] needs, so a driver can build the right `$`-map.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Params {
+        /// No parameters (the top-liked aggregation scans the whole `LIKE` set).
+        None,
+        /// A single `USER` anchor `$u0`.
+        User,
+        /// Two `USER` anchors `$u0`, `$u1` (mutual friends).
+        UserPair,
+        /// A headline search `$term` (a stored-property `CONTAINS` scan).
+        Term,
+        /// A headline search `$term` fed to the FULLTEXT procedure (the driver lower-cases it to the
+        /// analyzer token).
+        FulltextTerm,
+        /// A `$since` timestamp for the recent-`LIKE` range scan.
+        Recent,
+    }
+
+    /// One read-battery family: a stable report name, its parameterised Cypher, whether it is an
+    /// "advanced" multi-hop / aggregation traversal (vs a cheap point read), and its parameter shape.
+    #[derive(Debug, Clone, Copy)]
+    pub struct Family {
+        /// The stable family name (the evidence-report key).
+        pub name: &'static str,
+        /// The parameterised Cypher (one plan-cache entry, anchor varies per op).
+        pub cypher: &'static str,
+        /// `true` for a multi-hop traversal or aggregation, `false` for a point-read.
+        pub advanced: bool,
+        /// The per-op parameter shape this family needs.
+        pub params: Params,
+    }
+
+    /// Direct friends of a sample user (1-hop neighbourhood).
+    pub const FRIENDS: Family = Family {
+        name: "friends",
+        cypher: "MATCH (u:USER {id: $u0})-[:FRIEND]-(f:USER) RETURN count(DISTINCT f) AS friends",
+        advanced: false,
+        params: Params::User,
+    };
+    /// Friend-of-friend (2-hop) of a sample user, excluding the user itself.
+    pub const FOF: Family = Family {
+        name: "fof",
+        cypher: "MATCH (u:USER {id: $u0})-[:FRIEND]-(:USER)-[:FRIEND]-(fof:USER) \
+                 WHERE fof.id <> $u0 RETURN count(DISTINCT fof) AS fof",
+        advanced: true,
+        params: Params::User,
+    };
+    /// Mutual friends shared by two sample users.
+    pub const MUTUAL: Family = Family {
+        name: "mutual",
+        cypher: "MATCH (a:USER {id: $u0})-[:FRIEND]-(m:USER)-[:FRIEND]-(b:USER {id: $u1}) \
+                 RETURN count(DISTINCT m) AS mutual",
+        advanced: true,
+        params: Params::UserPair,
+    };
+    /// The top-5 most-liked articles (aggregation + `ORDER BY` + `LIMIT`) — a whole-`LIKE`-set scan.
+    pub const TOP_LIKED: Family = Family {
+        name: "top_liked",
+        cypher: "MATCH (:USER)-[:LIKE]->(a:ARTICLE) \
+                 RETURN a.name AS article, count(*) AS likes \
+                 ORDER BY likes DESC, article ASC LIMIT 5",
+        advanced: true,
+        params: Params::None,
+    };
+    /// A sample user's friend count (degree).
+    pub const DEGREE: Family = Family {
+        name: "degree",
+        cypher: "MATCH (u:USER {id: $u0})-[:FRIEND]-(f:USER) RETURN count(f) AS degree",
+        advanced: false,
+        params: Params::User,
+    };
+    /// Headline substring search over `ARTICLE.name` (`CONTAINS`) — a TEXT-indexed / scan search.
+    pub const TEXT_CONTAINS: Family = Family {
+        name: "text_contains",
+        cypher: "MATCH (a:ARTICLE) WHERE a.name CONTAINS $term RETURN count(a) AS hits",
+        advanced: false,
+        params: Params::Term,
+    };
+    /// Recent-`LIKE` range scan (`WHERE l.date >= $since`) — the upper half of the like timeline.
+    pub const LIKE_RECENT: Family = Family {
+        name: "like_recent",
+        cypher: "MATCH ()-[l:LIKE]->(:ARTICLE) WHERE l.date >= $since RETURN count(l) AS hits",
+        advanced: false,
+        params: Params::Recent,
+    };
+    /// FULLTEXT headline word search via `db.index.fulltext.queryNodes` — version-fragile (needs the
+    /// FULLTEXT index; an older server that cannot declare it drops this family in the driver's
+    /// capability preflight).
+    pub const FULLTEXT: Family = Family {
+        name: "fulltext",
+        cypher: "CALL db.index.fulltext.queryNodes('article_headline_fulltext', $term) \
+                 YIELD node RETURN count(node) AS hits",
+        advanced: false,
+        params: Params::FulltextTerm,
+    };
+
+    /// The whole read battery, in report order: five traversal families then three search families.
+    pub const ALL: &[Family] = &[
+        FRIENDS,
+        FOF,
+        MUTUAL,
+        TOP_LIKED,
+        DEGREE,
+        TEXT_CONTAINS,
+        LIKE_RECENT,
+        FULLTEXT,
+    ];
+}
+
 /// A tiny, fast, fully-deterministic PRNG (SplitMix64 — Steele, Lea & Flood 2014). Chosen because it
 /// is a *pure* integer mixing function: identical output for identical seeds on every platform, with
 /// no global state, no float, and no allocation. We never use the standard library's `HashMap`-based
@@ -274,6 +393,32 @@ const HEAD_TAIL: &[&str] = &[
 /// boundary if a chained name would overshoot.
 pub const MAX_NAME_BYTES: usize = 64;
 
+/// How each user's target `FRIEND` degree (stub count) is drawn — the shape of the friendship graph.
+///
+/// Real social networks are **not** uniform: a few hub accounts have orders of magnitude more
+/// friends than the median (a heavy-tailed, power-law degree distribution). [`DegreeDist::Uniform`]
+/// is the historical, evenly-connected model (no hubs); [`DegreeDist::PowerLaw`] adds **supernodes**
+/// so the example can stress the dense-adjacency / supernode read-and-write paths a real graph hits.
+///
+/// The exponent is stored as a plain integer (not a float) so [`GenConfig`] stays `Eq` and the whole
+/// construction is **byte-identical across platforms** — no `powf`, no float in the draw (see
+/// [`Generator::build_friend_edges`]).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum DegreeDist {
+    /// Target degree drawn **uniformly** in `[friend_min, friend_max]` — the evenly-connected model
+    /// (every user is similarly connected; there are no hubs). The default.
+    #[default]
+    Uniform,
+    /// Target degree drawn from a **power law** `P(k) ∝ k^-exponent` over `[max(1, friend_min),
+    /// friend_max]` — most users have few friends, a rare heavy tail of **supernodes** has very many.
+    /// A `friend_min` of `1` (with a large `friend_max`) gives the most realistic hub structure.
+    /// `exponent` is the classic Zipf/Barabási slope (typically `2`–`3`; `1` is the heaviest tail).
+    PowerLaw {
+        /// The power-law slope `s` in `P(k) ∝ k^-s`, an integer in `1..=6` (larger ⇒ lighter tail).
+        exponent: u32,
+    },
+}
+
 /// Configuration for one generation run. A pure value: identical configs yield identical graphs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GenConfig {
@@ -290,6 +435,11 @@ pub struct GenConfig {
     /// Mean number of `LIKE` edges per user; the per-user like count is drawn uniformly in
     /// `[0, 2 * avg_likes_per_user]`, so the population mean is `avg_likes_per_user`.
     pub avg_likes_per_user: u64,
+    /// How each user's target `FRIEND` degree is drawn (uniform, or a power law with supernodes).
+    /// Defaults to [`DegreeDist::Uniform`] — including when an older serialized config omits the
+    /// field — so every existing profile and gate is byte-unchanged.
+    #[serde(default)]
+    pub degree_dist: DegreeDist,
 }
 
 impl GenConfig {
@@ -318,6 +468,7 @@ impl GenConfig {
             friend_min: 6,
             friend_max: 24,
             avg_likes_per_user: 5,
+            degree_dist: DegreeDist::Uniform,
         }
     }
 
@@ -333,6 +484,7 @@ impl GenConfig {
             friend_min: 20,
             friend_max: 120,
             avg_likes_per_user: 20,
+            degree_dist: DegreeDist::Uniform,
         }
     }
 
@@ -348,6 +500,7 @@ impl GenConfig {
             friend_min: 200,
             friend_max: 2_000,
             avg_likes_per_user: 30,
+            degree_dist: DegreeDist::Uniform,
         }
     }
 
@@ -361,6 +514,63 @@ impl GenConfig {
             "huge" => Some(Self::huge()),
             _ => None,
         }
+    }
+
+    /// Resolves a base `profile` and then applies each `Some` override, returning the final config —
+    /// the single source of truth for CLI config resolution, shared by `social_gen` (the generator),
+    /// `social_wire_load` (the over-the-wire loader), and `social_bench` (the ladder driver) so all
+    /// three reconstruct the **identical** deterministic graph from the same flags.
+    ///
+    /// # Errors
+    /// `unknown profile …` for an unrecognised profile name; `--friend-min … must be <= --friend-max …`
+    /// if the (possibly overridden) degree band is inverted; `--zipf-exponent must be in 1..=6 …` for
+    /// an out-of-range power-law exponent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolve(
+        profile: &str,
+        users: Option<u64>,
+        articles: Option<u64>,
+        friend_min: Option<u64>,
+        friend_max: Option<u64>,
+        avg_likes: Option<u64>,
+        seed: Option<u64>,
+        degree_dist: Option<DegreeDist>,
+    ) -> Result<Self, String> {
+        let mut cfg = Self::profile(profile)
+            .ok_or_else(|| format!("unknown profile '{profile}' (expected fast|large|huge)"))?;
+        if let Some(v) = users {
+            cfg.users = v;
+        }
+        if let Some(v) = articles {
+            cfg.articles = v;
+        }
+        if let Some(v) = friend_min {
+            cfg.friend_min = v;
+        }
+        if let Some(v) = friend_max {
+            cfg.friend_max = v;
+        }
+        if let Some(v) = avg_likes {
+            cfg.avg_likes_per_user = v;
+        }
+        if let Some(v) = seed {
+            cfg.seed = v;
+        }
+        if let Some(d) = degree_dist {
+            cfg.degree_dist = d;
+        }
+        if cfg.friend_min > cfg.friend_max {
+            return Err(format!(
+                "--friend-min ({}) must be <= --friend-max ({})",
+                cfg.friend_min, cfg.friend_max
+            ));
+        }
+        if let DegreeDist::PowerLaw { exponent } = cfg.degree_dist {
+            if !(1..=6).contains(&exponent) {
+                return Err(format!("--zipf-exponent must be in 1..=6, got {exponent}"));
+            }
+        }
+        Ok(cfg)
     }
 }
 
@@ -503,11 +713,26 @@ impl Generator {
 
         // 1) Draw each user's stub count (target degree) and build the stub array.
         //    Stubs are keyed by a dedicated PRNG so they are independent of name/id/like streams.
+        //    The DRAW itself is `degree_dist`-selected: a uniform band (the historical evenly-connected
+        //    model) or a power law (a heavy tail of SUPERNODES). Both are pure-integer, so the whole
+        //    construction stays byte-identical across platforms (no `powf`, no float in the draw).
         let mut stub_rng = SplitMix64::new(self.cfg.seed ^ 0x5731_0000_0000_0001);
+        // For the power-law draw, precompute the integer inverse-CDF once (cheap: |band| entries).
+        let power_law_cdf = match self.cfg.degree_dist {
+            DegreeDist::Uniform => None,
+            DegreeDist::PowerLaw { exponent } => Some(power_law_cdf(
+                self.cfg.friend_min,
+                self.cfg.friend_max,
+                exponent,
+            )),
+        };
         let mut stub_counts = Vec::with_capacity(users as usize);
         let mut total: u64 = 0;
         for _ in 0..users {
-            let s = stub_rng.in_range(self.cfg.friend_min, self.cfg.friend_max);
+            let s = match &power_law_cdf {
+                None => stub_rng.in_range(self.cfg.friend_min, self.cfg.friend_max),
+                Some(cdf) => power_law_sample(cdf, &mut stub_rng),
+            };
             stub_counts.push(s);
             total = total.saturating_add(s);
         }
@@ -1077,15 +1302,84 @@ impl Generator {
         Self::user_id(i % self.cfg.users.max(1))
     }
 
+    /// The realised per-user `FRIEND`-degree histogram in **log-2 buckets**: a list of
+    /// `(bucket_floor, count)` where `bucket_floor` is `0` then `1, 2, 4, 8, …` and `count` is the
+    /// number of users whose realised degree `d` satisfies `bucket_floor <= d < 2*bucket_floor` (the
+    /// `0` bucket holds degree-0 users). Only non-empty buckets are returned, in ascending order.
+    ///
+    /// This is the evidence that distinguishes the two [`DegreeDist`] models: a [`DegreeDist::Uniform`]
+    /// graph has a single narrow band of occupied buckets, whereas a [`DegreeDist::PowerLaw`] graph has
+    /// a long, thin tail out to the supernode buckets — the log-2 bucketing makes that tail legible in
+    /// a handful of lines regardless of scale.
+    #[must_use]
+    pub fn degree_histogram(&self) -> Vec<(u64, u64)> {
+        let (_edges, degree) = self.build_friend_edges();
+        degree_histogram_of(&degree)
+    }
+
+    /// The dominant single-word, ASCII, diacritic-free headline **subject** term for this config, with
+    /// the number of `ARTICLE`s whose `name` contains it — the ground truth the `text_contains` /
+    /// `fulltext` search probes assert against (a term the engine never produced). Hermetic: a pure
+    /// function of `(seed, articles)`, so both the in-process loader and the over-the-wire driver pick
+    /// the identical term. See [`Generator::dominant_headline_term_for`].
+    #[must_use]
+    pub fn dominant_headline_term(&self) -> (String, u64) {
+        Self::dominant_headline_term_for(self.cfg.seed, self.cfg.articles)
+    }
+
+    /// The dominant headline term for an explicit `(seed, articles)` — the associated-function form so
+    /// a driver that only knows the seed and article count (not a full [`Generator`]) can compute the
+    /// same term. Scans the single-word ASCII subjects and returns the most frequent one with its hit
+    /// count (ties broken by pool order). Returns `("Governo", 0)` for an empty catalogue.
+    #[must_use]
+    pub fn dominant_headline_term_for(seed: u64, articles: u64) -> (String, u64) {
+        // Single-word, ASCII-only subjects (or ASCII leading words of multi-word subjects) from the
+        // `HEAD_SUBJECT` pool — each unique to its subject and free of diacritics, so "articles whose
+        // name CONTAINS the word" and "articles the FULLTEXT index returns for its lower-cased token"
+        // are the same set.
+        const ASCII_SUBJECTS: &[&str] = &[
+            "Governo",
+            "Universidade",
+            "Banco",
+            "Empresa",
+            "Investigadores",
+            "Autarquia",
+            "Mercado",
+            "Sector",
+        ];
+        let mut best = (ASCII_SUBJECTS[0].to_owned(), 0u64);
+        for &word in ASCII_SUBJECTS {
+            let count = (0..articles)
+                .filter(|&i| Self::article_name(seed, i).contains(word))
+                .count() as u64;
+            if count > best.1 {
+                best = (word.to_owned(), count);
+            }
+        }
+        best
+    }
+
     /// A machine-readable one-line summary of the run's realised shape (the `social_gen` binary
-    /// prints it; an example's `run.sh` parses it for dataset sizing).
+    /// prints it; an example's `run.sh` parses it for dataset sizing). Includes the realised degree
+    /// distribution (`degree_dist=uniform|powerlaw:<exp>`) and a compact log-2 degree histogram
+    /// (`degree_hist=<floor>:<count>|…`) so a power-law run's supernode tail is visible in the output.
     #[must_use]
     pub fn summary_line(&self) -> String {
         let s = self.summary();
+        let dist = match self.cfg.degree_dist {
+            DegreeDist::Uniform => "uniform".to_owned(),
+            DegreeDist::PowerLaw { exponent } => format!("powerlaw:{exponent}"),
+        };
+        let hist = self
+            .degree_histogram()
+            .iter()
+            .map(|(floor, count)| format!("{floor}:{count}"))
+            .collect::<Vec<_>>()
+            .join("|");
         format!(
             "seed={} users={} articles={} friend_edges={} like_edges={} \
              friend_min={} friend_max={} degree_min={} degree_max={} degree_avg_x1000={} \
-             avg_likes_per_user={}",
+             avg_likes_per_user={} degree_dist={} degree_hist={}",
             self.cfg.seed,
             s.users,
             s.articles,
@@ -1097,8 +1391,77 @@ impl Generator {
             s.degree_max,
             s.degree_avg_x1000,
             self.cfg.avg_likes_per_user,
+            dist,
+            hist,
         )
     }
+}
+
+/// Builds the integer inverse-CDF for a power-law target-degree draw over `[max(1, lo), hi]` with
+/// slope `exponent`: a cumulative weight array whose step at value `k` is `WEIGHT_SCALE / k^exponent`
+/// (integer division — no float, so it is byte-identical on every platform). Returns the list of
+/// `(value, cumulative_weight)` pairs; the final entry's cumulative weight is the total.
+///
+/// A larger `exponent` steepens the decay (a lighter tail); `exponent == 0` degenerates to a uniform
+/// draw (every weight `WEIGHT_SCALE`). The range is clamped so `k >= 1` (a `0^-s` weight is undefined).
+fn power_law_cdf(lo: u64, hi: u64, exponent: u32) -> Vec<(u64, u128)> {
+    /// Fixed-point weight scale: large enough that `WEIGHT_SCALE / k^exponent` stays positive for
+    /// every `k` in a realistic band (e.g. `k = 2000`, `exponent = 4` ⇒ `1e18 / 1.6e13 ≈ 6e4 > 0`),
+    /// while the cumulative total over any band stays well inside `u128`.
+    const WEIGHT_SCALE: u128 = 1_000_000_000_000_000_000; // 1e18
+    let lo = lo.max(1);
+    let hi = hi.max(lo);
+    let mut cdf = Vec::with_capacity((hi - lo + 1) as usize);
+    let mut acc: u128 = 0;
+    for k in lo..=hi {
+        // k^exponent in u128 (saturating — a pathological exponent just floors the weight to 1).
+        let mut denom: u128 = 1;
+        for _ in 0..exponent {
+            denom = denom.saturating_mul(u128::from(k));
+        }
+        let w = (WEIGHT_SCALE / denom).max(1); // every value keeps a non-zero chance
+        acc = acc.saturating_add(w);
+        cdf.push((k, acc));
+    }
+    cdf
+}
+
+/// Draws one target degree from a [`power_law_cdf`] inverse-CDF using `rng`: a uniform pick in
+/// `[0, total)` mapped through the cumulative weights by binary search. Pure integer arithmetic, so
+/// the draw sequence is identical on every platform for a given seed.
+fn power_law_sample(cdf: &[(u64, u128)], rng: &mut SplitMix64) -> u64 {
+    debug_assert!(!cdf.is_empty(), "power-law CDF must be non-empty");
+    let total = cdf.last().map_or(1, |&(_, c)| c).max(1);
+    // A uniform u128 target in [0, total). SplitMix64 yields 64 bits; total fits comfortably in u64
+    // for every realistic band, but compute in u128 to be safe against a very wide/steep band.
+    let target = u128::from(rng.next_u64()) % total;
+    // First value whose cumulative weight strictly exceeds the target.
+    match cdf.binary_search_by(|&(_, cum)| {
+        if cum <= target {
+            std::cmp::Ordering::Less
+        } else {
+            std::cmp::Ordering::Greater
+        }
+    }) {
+        Ok(i) | Err(i) => cdf[i.min(cdf.len() - 1)].0,
+    }
+}
+
+/// Buckets a realised per-user degree slice into ascending log-2 buckets `(bucket_floor, count)`,
+/// returning only non-empty buckets. Bucket floors are `0, 1, 2, 4, 8, …`; a degree `d >= 1` lands in
+/// the bucket `2^floor(log2(d))`, and `d == 0` in the `0` bucket. Shared by [`Generator::degree_histogram`].
+fn degree_histogram_of(degree: &[u64]) -> Vec<(u64, u64)> {
+    use std::collections::BTreeMap;
+    let mut buckets: BTreeMap<u64, u64> = BTreeMap::new();
+    for &d in degree {
+        let floor = if d == 0 {
+            0
+        } else {
+            1u64 << (63 - d.leading_zeros())
+        };
+        *buckets.entry(floor).or_insert(0) += 1;
+    }
+    buckets.into_iter().collect()
 }
 
 /// Truncates a `String` to at most `max_bytes`, never splitting a UTF-8 char. Cheap when already
@@ -1166,6 +1529,7 @@ mod tests {
             friend_min: 3,
             friend_max: 10,
             avg_likes_per_user: 4,
+            degree_dist: DegreeDist::Uniform,
         }
     }
 
