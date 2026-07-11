@@ -245,13 +245,22 @@ gate exits non-zero when `regressed` is set.
 
 ## Running the examples
 
-From the repository root:
+From the repository root — one example, or the whole suite:
 
 ```bash
-examples/<scenario-name>/run.sh
+examples/<scenario-name>/run.sh          # one example
+examples/run-all.sh                      # the WHOLE suite, one verdict (non-zero if any fails)
+examples/run-all.sh fraud-oltp bulk-etl  # …or just the named ones
 ```
 
-Reuse pre-built binaries from a custom location with `GRAPHUS_BIN_DIR`:
+`run-all.sh` also honours the external-target seam below, so the same command sweeps every
+attach-capable example against an already-running instance. It skips the two durability examples in
+that mode: they must own the server lifecycle to inject a crash, so they are local-only by
+construction.
+
+Each `run.sh` **rebuilds the binaries it drives** (via `harness_build`; cargo is incremental, so this
+is a no-op when nothing changed). To reuse binaries you built yourself — CI artifacts, or a host with
+no cargo — set `GRAPHUS_BIN_DIR`, which opts out of the rebuild:
 
 ```bash
 cargo build --release -p graphus-server -p graphus-cli
@@ -326,5 +335,6 @@ so they cannot target a shared/remote instance.
 | [`knowledge-graph-rest`](knowledge-graph-rest/) | A semantic knowledge graph served and queried over the Web REST API. |
 | [`security-multitenant`](security-multitenant/) | Encryption-at-rest + fine-grained RBAC over a multi-tenant deployment (REST + Bolt). |
 | [`iot-timeseries`](iot-timeseries/) | Sustained IoT/time-series ingest + sliding-window retention churn with a storage-reclamation plateau proof. |
-| [`social-network-large`](social-network-large/) | Performance under a **LARGE** social graph: ~1,000,000 USERs befriended by an undirected multigraph FRIEND (200–2000 friends each), 30,000 ARTICLEs, and USER→LIKE→ARTICLE edges. Bulk-loads at scale (`graphus-bulk`, O(E)) into an on-disk store, then measures a Cypher traversal battery (friends, friend-of-friend, mutual, top-liked, degree); evidence covers ingest throughput, on-disk footprint/amplification, peak RSS, and per-query latency. |
+| [`social-network-large`](social-network-large/) | **Do reads scale across cores?** A large social graph (up to ~1,000,000 USERs on an undirected multigraph FRIEND, plus ARTICLEs and USER→LIKE→ARTICLE edges, with an optional **power-law degree law that grows real supernodes**) is network-bulk-loaded into a running server, then an 8-family Cypher read battery is driven **over the Bolt wire by a concurrency ladder of simultaneous clients** while the **server process** is sampled per-thread from `/proc`. Evidence: the core-scaling curve vs C, real per-family p50/p99, and a **decomposed** on-disk footprint (data image / doublewrite / redo log). |
+| [`clients-go`](clients-go/) | **Third-party driver interoperability** — the only example that drives Graphus through an *external* implementation of its protocols: Bolt-over-TCP through the **official `neo4j-go-driver/v5`**, plus REST and a hand-rolled Bolt-over-UDS client. It is therefore the suite's real conformance check: a PackStream marker or Bolt state-machine drift breaks it. |
 | [`product-recommendations`](product-recommendations/) | **Read-heavy concurrency** evaluation: a product-recommendation service over a `(:User)-[:FRIEND]-(:User)` + `(:User)-[:PURCHASED]->(:Product)` multigraph. Network-bulk-loads the graph over the wire (Mode A), then drives a **concurrency ladder** of many simultaneous Bolt/UDS clients running recommendation queries (direct-friend, 2nd/3rd-level, and similar-consumption-profile) plus a few concurrent writes, sampling the server's per-thread CPU / RSS / IO to **expose the read-path saturation knee** (single-engine-thread vs off-thread reader pool). |
