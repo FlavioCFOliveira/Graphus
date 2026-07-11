@@ -638,10 +638,8 @@ the unauthenticated Bolt connection."
 if [ "$RUN_REST" = "1" ] && [ "$MODE" = "external" ]; then
   section "Step 7 — server-side evidence via /metrics (external mode)"
   MEASURE_TGT="$BIN_DIR/measure_target"
-  if [ ! -x "$MEASURE_TGT" ]; then
-    harness_build "the dev-only measure_target harness binary (debug)" -p graphus-examples-harness --bin measure_target
-    MEASURE_TGT="$REPO_ROOT/target/debug/measure_target"
-  fi
+  harness_build "the dev-only measure_target harness binary (debug)" --release -p graphus-examples-harness --bin measure_target
+  MEASURE_TGT="$BIN_DIR/measure_target"
   if [ -x "$MEASURE_TGT" ] && [ -s "$METRICS_BEFORE" ] && [ -s "$METRICS_AFTER" ]; then
     rm -rf "$EVIDENCE_DIR"
     "$MEASURE_TGT" \
@@ -696,10 +694,8 @@ elif [ "$RUN_REST" = "1" ] && [ "$MODE" = "local" ]; then
   SERVER_UPTIME_SECS=$(( $(date +%s) - SERVER_START_EPOCH )); [ "$SERVER_UPTIME_SECS" -lt 1 ] && SERVER_UPTIME_SECS=1
 
   MEASURE_BIN="$BIN_DIR/measure_server"
-  if [ ! -x "$MEASURE_BIN" ]; then
-    harness_build "the dev-only measure_server harness binary (debug)" -p graphus-examples-harness --bin measure_server
-    MEASURE_BIN="$REPO_ROOT/target/debug/measure_server"
-  fi
+  harness_build "the dev-only measure_server harness binary (debug)" --release -p graphus-examples-harness --bin measure_server
+  MEASURE_BIN="$BIN_DIR/measure_server"
 
   if [ -x "$MEASURE_BIN" ] && [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
     rm -rf "$EVIDENCE_DIR"
@@ -771,10 +767,8 @@ print('yes' if ok else 'no')" 2>/dev/null || echo no)"
     if [ "$PROFILE" = "fast" ] && [ -f "$BASELINE" ] && [ -f "$EVIDENCE_DIR/report.json" ]; then
       section "Step 7b — regression gate vs committed baseline"
       CMP_BIN="$BIN_DIR/sec_baseline_cmp"
-      if [ ! -x "$CMP_BIN" ]; then
-        harness_build "the sec_baseline_cmp gate (debug)" -p graphus-security-gen --bin sec_baseline_cmp
-        CMP_BIN="$REPO_ROOT/target/debug/sec_baseline_cmp"
-      fi
+      harness_build "the sec_baseline_cmp gate (debug)" --release -p graphus-security-gen --bin sec_baseline_cmp
+      CMP_BIN="$BIN_DIR/sec_baseline_cmp"
       CMP_OUT="$("$CMP_BIN" "$BASELINE" "$EVIDENCE_DIR/report.json" 2>&1)" || true
       printf '%s\n' "$CMP_OUT" | sed 's/^/  /'
       assert "fresh run is within baseline thresholds (structural metrics)" "yes" \

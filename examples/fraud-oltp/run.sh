@@ -415,10 +415,8 @@ EOF
 
   if [ "$MODE" = external ]; then
     MEASURE_BIN="$BIN_DIR/measure_target"
-    if [ ! -x "$MEASURE_BIN" ]; then
-      harness_build "the dev-only measure_target harness binary" -p graphus-examples-harness --bin measure_target
-      MEASURE_BIN="$REPO_ROOT/target/debug/measure_target"
-    fi
+    harness_build "the dev-only measure_target harness binary" --release -p graphus-examples-harness --bin measure_target
+    MEASURE_BIN="$BIN_DIR/measure_target"
     if [ -x "$MEASURE_BIN" ]; then
       "$MEASURE_BIN" \
         --evidence-dir "$EVIDENCE_DIR" \
@@ -441,10 +439,8 @@ EOF
     SERVER_UPTIME_SECS=$(( $(date +%s) - SERVER_START_EPOCH ))
     [ "$SERVER_UPTIME_SECS" -lt 1 ] && SERVER_UPTIME_SECS=1
     MEASURE_BIN="$BIN_DIR/measure_server"
-    if [ ! -x "$MEASURE_BIN" ]; then
-      harness_build "the dev-only measure_server harness binary (debug)" -p graphus-examples-harness --bin measure_server
-      MEASURE_BIN="$REPO_ROOT/target/debug/measure_server"
-    fi
+    harness_build "the dev-only measure_server harness binary (debug)" --release -p graphus-examples-harness --bin measure_server
+    MEASURE_BIN="$BIN_DIR/measure_server"
     if [ -x "$MEASURE_BIN" ] && [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
       "$MEASURE_BIN" \
         --evidence-dir "$EVIDENCE_DIR" \
@@ -459,10 +455,8 @@ EOF
       # Fold in the server-side /metrics before/after delta (rmp #689) so the LOCAL report carries the
       # same server_metrics section external mode gets from measure_target.
       INJECT_BIN="$BIN_DIR/inject_server_metrics"
-      if [ ! -x "$INJECT_BIN" ]; then
-        harness_build "the inject_server_metrics helper (debug)" -p graphus-fraud-gen --bin inject_server_metrics
-        INJECT_BIN="$REPO_ROOT/target/debug/inject_server_metrics"
-      fi
+      harness_build "the inject_server_metrics helper (debug)" --release -p graphus-fraud-gen --bin inject_server_metrics
+      INJECT_BIN="$BIN_DIR/inject_server_metrics"
       if [ -x "$INJECT_BIN" ] && [ -s "$METRICS_BEFORE" ] && [ -s "$METRICS_AFTER" ] && [ -f "$EVIDENCE_DIR/report.json" ]; then
         "$INJECT_BIN" "$EVIDENCE_DIR" "$METRICS_BEFORE" "$METRICS_AFTER" "graphus" \
           && info "server_metrics folded into $EVIDENCE_DIR/report.json" \
@@ -492,10 +486,8 @@ print('yes' if ok else 'no')" 2>/dev/null || echo no)"
       if [ "$PROFILE" = "fast" ] && [ -f "$BASELINE" ] && [ -f "$EVIDENCE_DIR/report.json" ]; then
         section "Step 5b — regression gate vs committed baseline"
         CMP_BIN="$BIN_DIR/baseline_cmp"
-        if [ ! -x "$CMP_BIN" ]; then
-          harness_build "the baseline_cmp gate (debug)" -p graphus-fraud-gen --bin baseline_cmp
-          CMP_BIN="$REPO_ROOT/target/debug/baseline_cmp"
-        fi
+        harness_build "the baseline_cmp gate (debug)" --release -p graphus-fraud-gen --bin baseline_cmp
+        CMP_BIN="$BIN_DIR/baseline_cmp"
         CMP_OUT="$("$CMP_BIN" "$BASELINE" "$EVIDENCE_DIR/report.json" 2>&1)" || true
         printf '%s\n' "$CMP_OUT" | sed 's/^/  /'
         assert "fresh run is within baseline thresholds (structural metrics)" "yes" \

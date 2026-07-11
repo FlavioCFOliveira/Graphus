@@ -207,10 +207,8 @@ if [ "$MODE" = external ]; then
 
   # Locate (or build) the measure_target evidence binary from the shared harness crate.
   MEASURE="$BIN_DIR/measure_target"
-  if [ ! -x "$MEASURE" ]; then
-    harness_build "the measure_target harness binary (debug)" -p graphus-examples-harness --bin measure_target
-    MEASURE="$REPO_ROOT/target/debug/measure_target"
-  fi
+  harness_build "the measure_target harness binary (debug)" --release -p graphus-examples-harness --bin measure_target
+  MEASURE="$BIN_DIR/measure_target"
   [ -x "$MEASURE" ] || { echo "${RED}fatal: measure_target binary unavailable${RESET}" >&2; exit 2; }
 
   # Resolve the run's database: an operator-owned GRAPHUS_TARGET_DB (never dropped), else a fresh
@@ -394,11 +392,13 @@ EVIDENCE_BIN="$BIN_DIR/gds_evidence"
 CMP_BIN="$BIN_DIR/gds_baseline_cmp"
 emit_evidence() {
   local pid="$1" uptime="$2" store="$3" wal="$4" peak="$5"
-  if [ ! -x "$EVIDENCE_BIN" ]; then
-    harness_build "the dev-only gds_evidence harness binary (debug)" -p graphus-gds-gen --bin gds_evidence
-    EVIDENCE_BIN="$REPO_ROOT/target/debug/gds_evidence"
-  fi
-  [ -x "$EVIDENCE_BIN" ] || { info "gds_evidence unavailable; skipping evidence (non-fatal)"; return 0; }
+  # Wrapping harness_build in an `[ ! -x ]` guard would defeat its entire purpose: a stale
+  # target/release/gds_evidence left over from an earlier build would be preferred over the current
+  # sources, and the report would describe code that no longer exists. Build unconditionally (cargo is
+  # incremental) and use exactly what we just built.
+  harness_build "the dev-only gds_evidence harness binary (release)" \
+    --release -p graphus-gds-gen --bin gds_evidence
+  [ -x "$EVIDENCE_BIN" ] || { echo "${RED}fatal: gds_evidence not found at $EVIDENCE_BIN${RESET}" >&2; return 1; }
 
   # The run's wall-time: sweep + (when it ran) the official-driver load/analyze. The evidence binary
   # runs after both, so it cannot time them — it must be told (rmp #699).
@@ -427,9 +427,16 @@ emit_evidence() {
   fi
 
   rm -f "$EVIDENCE_DIR/report.json" "$EVIDENCE_DIR/report.md"
-  "$EVIDENCE_BIN" "${args[@]}" >/dev/null 2>&1 \
-    && info "evidence written to $EVIDENCE_DIR" \
-    || info "evidence collection failed (non-fatal); see output above"
+  # Do NOT swallow the emitter's diagnostics: when it fails, its stderr IS the explanation, and a
+  # message pointing at "the output above" while /dev/null eats that output helps nobody.
+  if "$EVIDENCE_BIN" "${args[@]}" > "$WORKDIR/evidence.log" 2>&1; then
+    info "evidence written to $EVIDENCE_DIR"
+  else
+    printf '%s' "$RED" >&2
+    echo "evidence collection FAILED — emitter output:" >&2
+    sed 's/^/    /' "$WORKDIR/evidence.log" >&2
+    printf '%s' "$RESET" >&2
+  fi
   assert "evidence report.json was produced" "yes" \
     "$([ -f "$EVIDENCE_DIR/report.json" ] && echo yes || echo no)"
   # total_millis must be the WORKLOAD's wall-time, never the report emitter's own (rmp #699).
@@ -445,10 +452,8 @@ print('yes' if t >= 1.0 else 'no')
 
   if [ "$PROFILE" = "fast" ] && [ -f "$BASELINE" ] && [ -f "$EVIDENCE_DIR/report.json" ]; then
     section "regression gate vs committed baseline"
-    if [ ! -x "$CMP_BIN" ]; then
-      harness_build "the gds_baseline_cmp gate (debug)" -p graphus-gds-gen --bin gds_baseline_cmp
-      CMP_BIN="$REPO_ROOT/target/debug/gds_baseline_cmp"
-    fi
+    harness_build "the gds_baseline_cmp gate (debug)" --release -p graphus-gds-gen --bin gds_baseline_cmp
+    CMP_BIN="$BIN_DIR/gds_baseline_cmp"
     local cmp_out; cmp_out="$("$CMP_BIN" "$BASELINE" "$EVIDENCE_DIR/report.json" 2>&1)" || true
     printf '%s\n' "$cmp_out" | sed 's/^/  /'
     assert "fresh run is within baseline thresholds (structural metrics)" "yes" \

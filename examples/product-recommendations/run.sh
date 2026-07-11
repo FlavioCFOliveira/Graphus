@@ -392,10 +392,8 @@ if [ "$MODE" = external ]; then
   # Emit the EXTERNAL-mode evidence report via measure_target (server-side /metrics delta + the
   # client-measured throughput/latency; process CPU/RSS + storage are N/A remotely).
   MEASURE_BIN="$BIN_DIR/measure_target"
-  if [ ! -x "$MEASURE_BIN" ]; then
-    harness_build "the dev-only measure_target harness binary" -p graphus-examples-harness --bin measure_target
-    MEASURE_BIN="$REPO_ROOT/target/debug/measure_target"
-  fi
+  harness_build "the dev-only measure_target harness binary" --release -p graphus-examples-harness --bin measure_target
+  MEASURE_BIN="$BIN_DIR/measure_target"
   if [ -x "$MEASURE_BIN" ] && [ -s "$METRICS_BEFORE" ] && [ -s "$METRICS_AFTER" ] && [ -n "$BENCH_STATS" ]; then
     "$MEASURE_BIN" \
       --evidence-dir "$EVIDENCE_DIR" \
