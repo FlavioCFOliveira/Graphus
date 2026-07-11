@@ -27,8 +27,15 @@
 #      shared-device/shared-IP collusion clusters (the generated device/ip fields);
 #   3. a blended point-lookup OLTP mix (account-by-id, recent-transfers);
 #   4. constraint enforcement (negative tests, gated on what the target's version supports);
-#   5. EXTREME concurrency on the REAL mule supernodes: overlapping writer/reader transactions,
-#      reporting commit/abort tallies + write p99, a FIRST-CLASS abort-rate band, and NO lost update;
+#   5. a PRODUCTION-SHAPED OLTP CLIENT under extreme contention on the REAL mule supernodes: every
+#      unit of business work is a DOUBLE-ENTRY ledger transfer driven as a MANAGED transaction through
+#      the official driver (`executeWrite`), so an SSI abort is RETRIED with bounded exponential
+#      backoff until it commits. It reports BOTH layers of truth — the ENGINE's abort rate (the
+#      contention evidence) AND the application-visible outcome (transfers committed, retries per
+#      commit, retry-inclusive p50/p99/p999, retry-budget exhaustion) — and asserts that the LEDGER
+#      RECONCILES (total balance conserved; no transfer lost, none applied twice), that the
+#      application makes PROGRESS, and that a serialization abort is CLASSIFIED RETRYABLE by the real
+#      driver (a regression of rmp #612 FAILS the run);
 #   6. the deterministic in-process SSI-contention repro (`dst_contention`).
 #
 # Steps 2-5 need Node + npm + network (for `npm install neo4j-driver`); they are OPT-IN via RUN_DRIVER
@@ -38,6 +45,8 @@
 # Usage:
 #   examples/fraud-oltp/run.sh                                         # local self-boot
 #   FRAUD_PROFILE=large  examples/fraud-oltp/run.sh                    # evidence-scale dataset
+#   FRAUD_RETRY=0        examples/fraud-oltp/run.sh                    # pure-contention isolation
+#                                                                      #   (single-shot txns, no retry)
 #   RUN_DRIVER=0         examples/fraud-oltp/run.sh                    # skip the official-driver steps
 #   GRAPHUS_TARGET_BOLT=bolt+ssc://host:7687 GRAPHUS_TARGET_REST=https://host:7474 \
 #     GRAPHUS_TARGET_USER=graphus GRAPHUS_TARGET_PASSWORD=graphus-local \
@@ -334,7 +343,9 @@ EOF
   # Step 3 — load + detect fraud + OLTP mix (OFFICIAL neo4j-driver)
   # ------------------------------------------------------------------------------------------------
   section "Step 3 — load + detect fraud + OLTP mix (OFFICIAL neo4j-driver)"
+  DETECT_START_MS="$(_harness_now_ms)"
   DETECT_OUT="$(cd "$NODE_PROJ" && node detect.js "$DRIVER_URI" "$DRIVER_DB" "$DRIVER_USER" "$DRIVER_PW" "$GRAPH_CYPHER" "$GROUND_TRUTH" 2>&1)" || true
+  DETECT_MS=$(( $(_harness_now_ms) - DETECT_START_MS ))
   printf '%s\n' "$DETECT_OUT" | sed 's/^/  /'
   assert "detection found EXACTLY the planted fraud (rings + mules + collusion)" "yes" \
     "$(printf '%s' "$DETECT_OUT" | grep -q 'GRAPHUS_FRAUD_OK' && echo yes || echo no)"
@@ -360,20 +371,46 @@ EOF
     "$([ "${SCHEMA_CREATED:-0}" -ge 2 ] 2>/dev/null && echo yes || echo no)"
 
   # ------------------------------------------------------------------------------------------------
-  # Step 4 — extreme-concurrency SSI driver on the REAL mule supernodes
+  # Step 4 — the PRODUCTION-SHAPED OLTP client under extreme contention on the REAL mule supernodes
+  #
+  # The DEFAULT (FRAUD_RETRY=1) drives every transfer as a MANAGED transaction through the official
+  # driver's executeWrite(), so a serialization failure is RETRIED with bounded exponential backoff
+  # until it commits — what every real Neo4j-driver application does, and the only configuration that
+  # exercises the driver's retry CLASSIFIER (the path rmp #612 silently broke). FRAUD_RETRY=0 keeps the
+  # pure-contention isolation (single-shot transactions, raw engine abort rate).
   # ------------------------------------------------------------------------------------------------
-  section "Step 4 — extreme-concurrency SSI on the REAL mule supernodes"
-  CONC_OUT="$(cd "$NODE_PROJ" && node concurrency.js "$DRIVER_URI" "$DRIVER_DB" "$DRIVER_USER" "$DRIVER_PW" "$GROUND_TRUTH" 12 30 2 2>&1)" || true
+  RETRY_MODE="${FRAUD_RETRY:-1}"
+  if [ "$RETRY_MODE" = "0" ]; then
+    section "Step 4 — OLTP contention on the REAL mule supernodes (NO-RETRY isolation)"
+  else
+    section "Step 4 — PRODUCTION OLTP client (managed/retried txns) under extreme contention"
+  fi
+  CONC_START_MS="$(_harness_now_ms)"
+  CONC_OUT="$(cd "$NODE_PROJ" && FRAUD_RETRY="$RETRY_MODE" node concurrency.js "$DRIVER_URI" "$DRIVER_DB" "$DRIVER_USER" "$DRIVER_PW" "$GROUND_TRUTH" 12 30 2 2>&1)" || true
+  CONC_MS=$(( $(_harness_now_ms) - CONC_START_MS ))
   printf '%s\n' "$CONC_OUT" | sed 's/^/  /'
-  assert "concurrency: no lost update, SSI held, abort-rate within band" "yes" \
+  assert "OLTP: ledger reconciles, application progressed, driver retry classified (rmp #612)" "yes" \
     "$(printf '%s' "$CONC_OUT" | grep -q 'GRAPHUS_CONCURRENCY_OK' && echo yes || echo no)"
   sample_peak_rss
 
   CONC_STATS="$(printf '%s' "$CONC_OUT" | sed -n 's/^GRAPHUS_STATS //p' | head -n1)"
-  CONC_COMMITS="$(json_field "$CONC_STATS" commits)"
-  CONC_ABORTS="$(json_field "$CONC_STATS" aborts)"
-  CONC_ABORT_RATE="$(json_field "$CONC_STATS" abort_rate)"
-  CONC_WRITE_P99="$(json_field "$CONC_STATS" write_p99_ms)"
+  # ENGINE layer — the contention evidence (transaction attempts the engine actually saw).
+  CONC_MODE="$(json_field "$CONC_STATS" mode)"
+  CONC_ATTEMPTS="$(json_field "$CONC_STATS" engine_attempts)"
+  CONC_ENGINE_ABORTS="$(json_field "$CONC_STATS" engine_aborts)"
+  CONC_ABORT_RATE="$(json_field "$CONC_STATS" engine_abort_rate)"
+  # APPLICATION layer — the outcome a real OLTP client sees.
+  CONC_BUSINESS="$(json_field "$CONC_STATS" business_txns)"
+  CONC_COMMITTED="$(json_field "$CONC_STATS" committed)"
+  CONC_COMMIT_RATE="$(json_field "$CONC_STATS" commit_rate)"
+  CONC_EXHAUSTED="$(json_field "$CONC_STATS" retry_budget_exhausted)"
+  CONC_RETRIES_PER_COMMIT="$(json_field "$CONC_STATS" retries_per_commit)"
+  CONC_MAX_RETRIES="$(json_field "$CONC_STATS" max_retries)"
+  # Retry-INCLUSIVE per-business-transfer latency + the phase window they were committed in.
+  CONC_P50="$(json_field "$CONC_STATS" p50_ms)"
+  CONC_P99="$(json_field "$CONC_STATS" p99_ms)"
+  CONC_P999="$(json_field "$CONC_STATS" p999_ms)"
+  CONC_PHASE_SECS="$(json_field "$CONC_STATS" phase_secs)"
 
   # Millisecond resolution: total_millis must be the workload's real wall-time, not a whole-second
   # rounding of it (rmp #699).
@@ -394,23 +431,65 @@ EOF
   section "Step 5 — collect performance evidence"
   rm -rf "$EVIDENCE_DIR"
 
+  # is_num <value> — a value measure_server can parse as a number (a `null` percentile means the run
+  # recorded NO sample, and per schema v3 an unmeasured metric must be ABSENT, never a 0).
+  is_num() { case "${1:-}" in '' | null | NaN) return 1 ;; *) return 0 ;; esac; }
+
+  # The RETRY-INCLUSIVE latency of a business transfer — the tail IS the story under contention.
+  LATENCY_PARAMS=()
+  is_num "$CONC_P50" && LATENCY_PARAMS+=(--p50-ms "$CONC_P50")
+  is_num "$CONC_P99" && LATENCY_PARAMS+=(--p99-ms "$CONC_P99")
+  is_num "$CONC_P999" && LATENCY_PARAMS+=(--p999-ms "$CONC_P999")
+
   COMMON_PARAMS=(
     --scenario "fraud-oltp"
-    --description "Fraud-detection OLTP over Bolt/TLS via the official Neo4j driver: load a seeded fraud graph, detect EXACTLY the planted fraud (rings + mules + shared-device/IP collusion), run a point-lookup OLTP mix, and sustain extreme-concurrency SSI on the REAL mule supernodes."
+    --description "Fraud-detection OLTP over Bolt/TLS via the official Neo4j driver: load a seeded fraud graph, detect EXACTLY the planted fraud (rings + mules + shared-device/IP collusion), run a point-lookup OLTP mix, and drive a PRODUCTION-shaped OLTP client (managed/retried double-entry ledger transfers) under extreme SSI contention on the REAL mule supernodes."
     --nodes "$NODE_COUNT" --rels "$REL_COUNT"
     --total-millis "${WORKLOAD_MS:-0}"
-    --workload-ops "${DETECT_OPS:-0}" --workload-secs "${DETECT_SECS:-0}"
-    --p50-ms "${DETECT_P50:-0}" --p99-ms "${DETECT_P99:-0}" --p999-ms "${DETECT_P999:-0}"
+    # ---------------------------------------------------------------------------------------------
+    # THROUGHPUT — ONE coherent workload: the OLTP contention phase (rmp #715).
+    #
+    # `operations` is the business work DONE (double-entry transfers COMMITTED), `ops_per_sec` is the
+    # rate they committed at, p50/p99/p999 are their RETRY-INCLUSIVE latency, and `abort_rate` is the
+    # ENGINE's abort rate over the VERY SAME transactions. Every field now describes one set of
+    # transactions.
+    #
+    # It used to describe TWO disjoint sets: `operations`/`ops_per_sec`/latency came from the SERIAL
+    # detect phase (914 load+detection+lookup queries, which never abort), while `abort_rate` came
+    # from the 270 transactions of the CONCURRENCY phase, which appear nowhere in `operations`. A
+    # reader seeing `operations: 914, abort_rate: 0.878` could only conclude "802 of my 914 operations
+    # failed" — false in both directions. The detect-phase figures are kept, explicitly named, below.
+    # ---------------------------------------------------------------------------------------------
+    --workload-ops "${CONC_COMMITTED:-0}" --workload-secs "${CONC_PHASE_SECS:-0}"
+    "${LATENCY_PARAMS[@]}"
     --abort-rate "${CONC_ABORT_RATE:-0}"
+    --phase "load+detect+oltp-mix=${DETECT_MS:-0}"
+    --phase "oltp-contention=${CONC_MS:-0}"
     --param "profile=$PROFILE"
     --param "connection=bolt-tcp-tls"
     --param "driver=official neo4j-driver"
-    --param "concurrency_commits=${CONC_COMMITS:-0}"
-    --param "concurrency_aborts=${CONC_ABORTS:-0}"
-    --param "concurrency_write_p99_ms=${CONC_WRITE_P99:-0}"
+    # APPLICATION layer — what a real OLTP client actually experiences.
+    --param "oltp_mode=${CONC_MODE:-unknown}"
+    --param "oltp_business_transfers=${CONC_BUSINESS:-0}"
+    --param "oltp_committed=${CONC_COMMITTED:-0}"
+    --param "oltp_commit_rate=${CONC_COMMIT_RATE:-0}"
+    --param "oltp_retry_budget_exhausted=${CONC_EXHAUSTED:-0}"
+    --param "oltp_retries_per_commit=${CONC_RETRIES_PER_COMMIT:-0}"
+    --param "oltp_max_retries=${CONC_MAX_RETRIES:-0}"
+    # ENGINE layer — the contention evidence, kept in full.
+    --param "engine_txn_attempts=${CONC_ATTEMPTS:-0}"
+    --param "engine_txn_aborts=${CONC_ENGINE_ABORTS:-0}"
+    --param "engine_abort_rate=${CONC_ABORT_RATE:-0}"
+    # The SERIAL load+detect+lookup phase — named for what it is, no longer masquerading as the headline.
+    --param "detect_operations=${DETECT_OPS:-0}"
+    --param "detect_p50_ms=${DETECT_P50:-0}"
+    --param "detect_p99_ms=${DETECT_P99:-0}"
+    --param "detect_p999_ms=${DETECT_P999:-0}"
     --param "point_lookup_p99_ms=${DETECT_PL_P99:-0}"
-    --note "Client latency percentiles + abort rate come from the drivers (GRAPHUS_STATS); the concurrency phase contends on the REAL mule supernodes."
-    --note "storage.bytes_per_node / bytes_per_relationship are deliberately ABSENT (rmp #711): --nodes/--rels are the GENERATOR's seeded counts, while the concurrency phase CREATEs extra CONC- TRANSFER relationships in the same store. Dividing the measured store image by the seed counts would be real arithmetic over a graph the store no longer holds — a figure wrong in a way no reader could see. Absent is the honest state; --per-element-costs is therefore not passed."
+    --note "TWO LAYERS OF TRUTH, never conflated (rmp #715). ENGINE: ${CONC_ENGINE_ABORTS:-0} of ${CONC_ATTEMPTS:-0} transaction attempts were aborted by SSI (throughput.abort_rate = ${CONC_ABORT_RATE:-0}) — real, hard contention on the mule supernodes. APPLICATION: ${CONC_COMMITTED:-0} of ${CONC_BUSINESS:-0} business transfers COMMITTED (commit rate ${CONC_COMMIT_RATE:-0}), at ${CONC_RETRIES_PER_COMMIT:-0} retries per commit, ${CONC_EXHAUSTED:-0} exhausted their retry budget. A high engine abort rate WITH a full application commit rate is a HEALTHY system under contention: the application-visible cost of contention is LATENCY (see the retry-inclusive p99/p999), not lost work."
+    --note "throughput.* describes the OLTP contention phase ONLY — one coherent set of transactions. The serial load+detect+lookup phase is reported separately as the detect_* params (it never aborts). These two used to be spliced into one section, so 'operations' and 'abort_rate' described disjoint transaction sets."
+    --note "The write path is driven as a MANAGED transaction through the OFFICIAL neo4j-driver (executeWrite), so an SSI abort is classified by the driver's real retry logic and retried with bounded exponential backoff. This is the path rmp #612 broke (a '…Transaction.Terminated' poison title makes drivers treat a serialization failure as NON-retryable); the example FAILS if a serialization abort is ever classified non-retryable, so #612 cannot regress unnoticed."
+    --note "storage.bytes_per_node / bytes_per_relationship are deliberately ABSENT (rmp #711): --nodes/--rels are the GENERATOR's seeded counts, while the contention phase CREATEs extra CONC- TRANSFER relationships in the same store. Dividing the measured store image by the seed counts would be real arithmetic over a graph the store no longer holds — a figure wrong in a way no reader could see. Absent is the honest state; --per-element-costs is therefore not passed."
     --note "per-TRANSFER insert latency vs cumulative edge count (rmp #683 scan-based REL KEY): $TXCURVE"
   )
 
@@ -483,8 +562,16 @@ ok = (t >= 1.0
       and st['write_amplification'] > 0.0 and st['space_amplification'] > 0.0)
 print('yes' if ok else 'no')" 2>/dev/null || echo no)"
 
-      # Baseline regression gate (LOCAL, fast profile only — the committed baseline is a fast run).
-      if [ "$PROFILE" = "fast" ] && [ -f "$BASELINE" ] && [ -f "$EVIDENCE_DIR/report.json" ]; then
+      # Baseline regression gate (LOCAL, fast profile, DEFAULT retry mode only).
+      #
+      # The committed baseline is a `fast`-profile run of the DEFAULT (retrying) client, so it can only
+      # be compared against another one. The FRAUD_RETRY=0 isolation is a genuinely DIFFERENT workload —
+      # it commits ~26 of 270 transfers instead of all 270 (so it writes a fraction of the durable
+      # bytes) and its engine abort rate is ~0.90 instead of ~0.05. Diffing those two against each other
+      # would be real arithmetic over mismatched inputs: a red gate that means nothing, which is the
+      # same family of lie as a green gate that cannot fire. So it is SKIPPED, and says so.
+      if [ "$PROFILE" = "fast" ] && [ "$RETRY_MODE" != "0" ] \
+         && [ -f "$BASELINE" ] && [ -f "$EVIDENCE_DIR/report.json" ]; then
         section "Step 5b — regression gate vs committed baseline"
         CMP_BIN="$BIN_DIR/baseline_cmp"
         harness_build "the baseline_cmp gate (debug)" --release -p graphus-fraud-gen --bin baseline_cmp
@@ -493,6 +580,13 @@ print('yes' if ok else 'no')" 2>/dev/null || echo no)"
         printf '%s\n' "$CMP_OUT" | sed 's/^/  /'
         assert "fresh run is within baseline thresholds (structural metrics)" "yes" \
           "$(printf '%s' "$CMP_OUT" | grep -q 'GRAPHUS_BASELINE_OK' && echo yes || echo no)"
+      elif [ "$PROFILE" = "fast" ] && [ "$RETRY_MODE" = "0" ]; then
+        section "Step 5b — regression gate vs committed baseline: SKIPPED"
+        info "FRAUD_RETRY=0 is the pure-contention ISOLATION, a different workload from the committed"
+        info "baseline (which is a run of the DEFAULT retrying client): it commits a fraction of the"
+        info "transfers, so it writes a fraction of the durable bytes and aborts ~18x more per attempt."
+        info "Gating it against that baseline would compare two different things. Re-run without"
+        info "FRAUD_RETRY=0 for the baseline-gated run."
       fi
     else
       info "measure_server unavailable or server not alive; skipping evidence collection (non-fatal)"
@@ -542,9 +636,13 @@ if [ "$FAILURES" -eq 0 ]; then
   if [ "$RUN_DRIVER" = "1" ]; then
     printf '%s%sFRAUD-OLTP DEMONSTRATION PASSED%s (%s mode) — Graphus loaded a seeded fraud graph over\n' "$BOLD" "$GREEN" "$RESET" "$MODE"
     printf 'Bolt/TLS via the official Neo4j driver, detected EXACTLY the planted fraud (rings + mules +\n'
-    printf 'shared-device/IP collusion), ran a point-lookup OLTP mix, sustained extreme concurrency on\n'
-    printf 'the REAL mule supernodes with no lost update, reproduced the SSI contention deterministically,\n'
-    printf 'and emitted standardized performance + server-side /metrics evidence.\n'
+    printf 'shared-device/IP collusion), ran a point-lookup OLTP mix, and sustained a PRODUCTION-shaped\n'
+    printf 'OLTP client under extreme SSI contention on the REAL mule supernodes: the engine aborted\n'
+    printf '%s of %s transaction attempts, yet %s of %s business transfers COMMITTED (%s retries per\n' \
+      "${CONC_ENGINE_ABORTS:-?}" "${CONC_ATTEMPTS:-?}" "${CONC_COMMITTED:-?}" "${CONC_BUSINESS:-?}" "${CONC_RETRIES_PER_COMMIT:-?}"
+    printf 'commit) — the ledger RECONCILES, the driver CLASSIFIED every SSI abort as retryable\n'
+    printf '(rmp #612 cannot regress unnoticed), the SSI contention reproduced deterministically, and\n'
+    printf 'standardized performance + server-side /metrics evidence was emitted.\n'
   else
     printf '%s%sFRAUD-OLTP DEMONSTRATION PASSED%s — the hermetic generator produced a byte-identical\n' "$BOLD" "$GREEN" "$RESET"
     printf 'seeded fraud graph + ground truth and the deterministic SSI-contention repro held its\n'

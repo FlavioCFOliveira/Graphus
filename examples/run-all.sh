@@ -116,9 +116,30 @@ import glob, json, os, sys
 
 root, examples = sys.argv[1], sys.argv[2:]
 # Metrics whose measured value may LEGITIMATELY be zero. Everything else in the four vector sections
-# cannot be: a live process burns CPU and holds RSS, a stored graph occupies bytes, a completed
-# operation takes time, and a real footprint does not amplify by a factor of zero.
+# cannot be: a live process holds RSS, a stored graph occupies bytes, a completed operation takes
+# time, and a real footprint does not amplify by a factor of zero.
 LEGITIMATELY_ZERO = {("throughput", "abort_rate")}
+
+
+def cpu_zero_is_measured(cpu, key):
+    """A CPU figure of 0.0 that is a REAL measurement, not a placeholder (`rmp #715`).
+
+    The OS reports process CPU in USER_HZ clock ticks (10 ms on Linux), so a short-lived child can
+    genuinely consume ZERO WHOLE TICKS of system (or user) time: bulk-etl's `graphus-bulk import`
+    lives ~48 ms and truthfully reports `system_secs: 0.0` beside `user_secs: 0.02` and
+    `mean_core_utilisation: 0.41`. That zero is quantisation, not fabrication — the same family as a
+    measured `abort_rate` of 0.0.
+
+    So a zero in ONE of user/system is accepted only when the OTHER is non-zero, which proves the CPU
+    vector really was sampled. A section where BOTH are zero is still a placeholder and still fails —
+    the audit keeps its teeth.
+    """
+    if key not in ("user_secs", "system_secs"):
+        return False
+    other = "system_secs" if key == "user_secs" else "user_secs"
+    return bool(cpu.get(other))
+
+
 bad, seen = [], 0
 
 for ex in examples:
@@ -134,8 +155,11 @@ for ex in examples:
             bad.append(f"{rel}: schema v{report.get('version')} — pre-#711 (zero placeholders)")
             continue
         for section in ("cpu", "memory", "storage", "throughput"):
-            for key, value in (report.get(section) or {}).items():
+            contents = report.get(section) or {}
+            for key, value in contents.items():
                 if (section, key) in LEGITIMATELY_ZERO:
+                    continue
+                if section == "cpu" and cpu_zero_is_measured(contents, key):
                     continue
                 if isinstance(value, (int, float)) and not isinstance(value, bool) and value == 0:
                     bad.append(f"{rel}: {section}.{key} = {value} — a zero placeholder for an "
