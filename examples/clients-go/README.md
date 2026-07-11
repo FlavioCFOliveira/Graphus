@@ -33,6 +33,36 @@ the UDS example, run the server natively — see below.)
 
 ## Run
 
+### The whole suite, in one command
+
+`run.sh` boots a real `graphus-server` with **all three interfaces live** (REST/TLS, Bolt-TCP/TLS,
+Bolt-UDS), drives all three clients, and **asserts** each one completed its round-trip — so this is a
+runnable regression gate, not just a set of snippets to copy:
+
+```sh
+examples/clients-go/run.sh                       # local self-boot: all three clients
+
+# …or against an ALREADY-RUNNING instance (local or remote):
+GRAPHUS_TARGET_REST=https://host:7474 \
+GRAPHUS_TARGET_BOLT=bolt+ssc://host:7687 \
+GRAPHUS_TARGET_USER=graphus GRAPHUS_TARGET_PASSWORD=… \
+GRAPHUS_TARGET_TLS_INSECURE=1 \
+  examples/clients-go/run.sh
+```
+
+In external (attach) mode the **UDS client is skipped**, and deliberately so: a Unix domain socket is
+not reachable across a host boundary, and its `SO_PEERCRED` gate authenticates the *calling process's*
+OS uid — neither survives a network hop. Run the example locally to exercise the UDS interface.
+
+**Why this example matters beyond didactics.** Every other example drives Graphus through Graphus's
+own client code. This one drives Bolt-TCP through the **official `neo4j-go-driver/v5`** — an external,
+independent implementation of the specification. It is therefore the suite's real interoperability
+proof: if a PackStream marker, a Bolt message field, or a connection-state transition ever drifts from
+the spec, this run fails. That is the project's *100% Bolt / PackStream compliant* requirement being
+checked against something other than itself.
+
+### Individually
+
 ```sh
 cd examples/clients-go
 go mod download            # fetch the Neo4j Go driver (bolt-tcp only)
