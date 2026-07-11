@@ -243,12 +243,30 @@ pub struct StorageSection {
     /// **Write amplification**: physical bytes written / logical bytes written. `0.0` when not
     /// measured (no logical figure supplied). `1.0` is ideal; `> 1.0` quantifies durability I/O
     /// overhead.
+    ///
+    /// This field carries an amplification RATIO and nothing else. An example that wants to report a
+    /// per-element cost or a plateau ratio must use the dedicated fields below — smuggling a
+    /// different quantity in here makes the reports incomparable and silently misleads any reader
+    /// (or gate) that trusts the field name.
     #[serde(default)]
     pub write_amplification: f64,
     /// **Space amplification**: total on-disk bytes / logical graph size. `0.0` when not measured.
     /// `1.0` means the on-disk form equals the logical data size; `> 1.0` captures padding/slack.
+    ///
+    /// A ratio, like [`write_amplification`](Self::write_amplification) — see the note there.
     #[serde(default)]
     pub space_amplification: f64,
+    /// Durable bytes per stored node, when the example tracks node counts. A per-element COST, not a
+    /// ratio — reported here rather than smuggled into an amplification field.
+    #[serde(default)]
+    pub bytes_per_node: f64,
+    /// Durable bytes per stored relationship. A per-element COST, not a ratio.
+    #[serde(default)]
+    pub bytes_per_relationship: f64,
+    /// For retention/GC workloads: the ratio of the store's final size to its steady-state size — how
+    /// far the store grew beyond the plateau reclamation should hold it at. `1.0` = a flat plateau.
+    #[serde(default)]
+    pub plateau_ratio: f64,
 }
 
 /// Throughput / latency evidence for the run.
@@ -1113,6 +1131,7 @@ mod tests {
             bytes_fsynced: 16_384,
             write_amplification: 1.2,
             space_amplification: 1.5,
+            ..Default::default()
         };
         *c.throughput_mut() = ThroughputSection {
             operations: 100_000,

@@ -102,17 +102,11 @@ PROFILE="${BULK_PROFILE:-fast}"
 RUN_WIRE="${RUN_WIRE:-1}"
 
 # The offline importer is its own release binary; the generator + drivers are the dev-only crate's.
-if [ ! -x "$BULK" ]; then
-  section "Building the offline graphus-bulk importer (release)"
-  ( cd "$REPO_ROOT" && cargo build --release -p graphus-bulk --bin graphus-bulk )
-fi
-[ -x "$BULK" ] || { echo "${RED}fatal: graphus-bulk binary not found at $BULK${RESET}" >&2; exit 2; }
-
-if [ ! -x "$GEN" ] || [ ! -x "$ROUNDTRIP" ] || [ ! -x "$STORAGE" ] || [ ! -x "$EVIDENCE_BIN" ] || [ ! -x "$CMP_BIN" ]; then
-  section "Building the dev-only bulk-etl generator + drivers (release)"
-  ( cd "$REPO_ROOT" && cargo build --release -p graphus-bulk-gen --bins )
-fi
-for b in "$GEN" "$ROUNDTRIP" "$STORAGE" "$EVIDENCE_BIN" "$CMP_BIN"; do
+# harness_build rebuilds unconditionally (cargo is incremental) so the evidence always describes the
+# CURRENT sources — a build-only-if-absent guard silently runs a STALE binary after any source edit.
+harness_build "the offline graphus-bulk importer (release)" --release -p graphus-bulk --bin graphus-bulk
+harness_build "the dev-only bulk-etl generator + drivers (release)" --release -p graphus-bulk-gen --bins
+for b in "$BULK" "$GEN" "$ROUNDTRIP" "$STORAGE" "$EVIDENCE_BIN" "$CMP_BIN"; do
   [ -x "$b" ] || { echo "${RED}fatal: required binary not found at $b${RESET}" >&2; exit 2; }
 done
 
@@ -277,9 +271,7 @@ else
     fi
   else
     section "Step 5 — boot a local plaintext-loopback REST server for the network bulk-import wire step"
-    if [ ! -x "$SERVER" ]; then
-      ( cd "$REPO_ROOT" && cargo build --release -p graphus-server ) || true
-    fi
+    harness_build "graphus-server (release)" --release -p graphus-server || true
     if [ ! -x "$SERVER" ]; then
       info "graphus-server binary unavailable — skipping the wire step"
       WIRE_OK=0

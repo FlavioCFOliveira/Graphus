@@ -275,6 +275,26 @@ pub fn compare(
         thresholds.amplification_rise,
         &mut deltas,
     );
+    // Per-element durable cost: a deterministic, machine-independent footprint signal (record layout,
+    // free-list slack, token-catalog growth). Held to the same band as the amplification ratios — this
+    // is what an example that tracks element counts actually wants gated, and it no longer has to
+    // smuggle the figure into an amplification field to get that.
+    push(
+        "storage.bytes_per_node",
+        baseline.storage.bytes_per_node,
+        candidate.storage.bytes_per_node,
+        HigherIsWorse,
+        thresholds.amplification_rise,
+        &mut deltas,
+    );
+    push(
+        "storage.bytes_per_relationship",
+        baseline.storage.bytes_per_relationship,
+        candidate.storage.bytes_per_relationship,
+        HigherIsWorse,
+        thresholds.amplification_rise,
+        &mut deltas,
+    );
 
     // CPU: total seconds higher is worse.
     push(
@@ -378,6 +398,7 @@ mod tests {
             bytes_fsynced: 200_000,
             write_amplification: 1.5,
             space_amplification: 2.0,
+            ..Default::default()
         };
         *c.cpu_mut() = CpuSection {
             user_secs: 4.0,

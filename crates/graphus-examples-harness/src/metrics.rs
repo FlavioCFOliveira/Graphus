@@ -438,6 +438,8 @@ impl StorageSection {
             // left at 0.0 (meaning "not measured") until set via `EvidenceCollector::record_amplification`.
             write_amplification: 0.0,
             space_amplification: 0.0,
+            // Per-element costs / plateau ratio: set explicitly by the examples that track them.
+            ..Self::default()
         }
     }
 }

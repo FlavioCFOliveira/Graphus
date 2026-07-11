@@ -244,6 +244,10 @@ fn run() -> Result<(), String> {
 
     collector.start();
     collector.phase("import", timed.wall);
+    // The import already ran (and was timed) before this report was built, so the collector could not
+    // bracket it: hand it the real workload wall-time. Otherwise total_millis would time the report's
+    // own emission (a few hundredths of a millisecond), not the load.
+    collector.record_total_duration(timed.wall);
 
     // CPU + memory: the import child's, measured by PID while it ran.
     let cpu: CpuSection = cpu_section(
@@ -259,9 +263,9 @@ fn run() -> Result<(), String> {
     collector.memory_mut().peak_rss_bytes = timed.peak_rss_bytes;
     collector.memory_mut().final_rss_bytes = timed.final_rss_bytes;
 
-    // Storage: the durable footprint from storage.json. The GATED per-element costs are encoded into
-    // space_amplification (bytes-per-node) and write_amplification (bytes-per-edge); the raw
-    // store/WAL bytes + pages are recorded faithfully.
+    // Storage: the durable footprint from storage.json. Every figure goes in the field that MEANS it —
+    // the amplification fields carry real amplification ratios, and the per-element costs (which the
+    // baseline gate holds to a tight band) go in the dedicated bytes_per_* fields.
     {
         let s = collector.storage_mut();
         s.store_bytes = storage.store_bytes;
@@ -271,8 +275,10 @@ fn run() -> Result<(), String> {
         // bytes_fsynced: the retained WAL byte count is the honest fsync proxy for an offline load
         // (every committed WAL byte is fsynced before the commit is acknowledged).
         s.bytes_fsynced = storage.wal_bytes;
-        s.space_amplification = storage.bytes_per_node;
-        s.write_amplification = storage.bytes_per_edge;
+        s.space_amplification = storage.space_amplification;
+        s.write_amplification = storage.write_amplification;
+        s.bytes_per_node = storage.bytes_per_node;
+        s.bytes_per_relationship = storage.bytes_per_edge;
     }
 
     // Throughput: elements loaded over the import window; element rate. (Latency percentiles are not
@@ -290,13 +296,12 @@ fn run() -> Result<(), String> {
     collector.note(
         "storage.store_bytes / store_pages / wal_bytes / wal_pages are the durable graph.store image \
          + retained graph.wal redo log measured for the SAME dataset (from bulk_storage's \
-         storage.json). storage.space_amplification = on-disk STORE bytes-per-node and \
-         storage.write_amplification = on-disk STORE bytes-per-edge — the DETERMINISTIC per-element \
-         costs the baseline gate holds to a tight band (the fixed storage section reuses those two \
-         fields to carry the per-element costs; the SAME numbers are also published under the \
-         explicit workload params storage_bytes_per_node / storage_bytes_per_edge so nothing is \
-         mislabelled). The CSV-relative amplifications (store/total/write vs logical_csv_bytes) are \
-         in the workload params for human visibility."
+         storage.json). storage.space_amplification / write_amplification carry REAL amplification \
+         ratios (durable bytes vs the logical CSV), and the DETERMINISTIC per-element costs the \
+         baseline gate holds to a tight band are storage.bytes_per_node / \
+         storage.bytes_per_relationship — each figure in the field that means it. (These two used to \
+         be smuggled into the amplification fields, which made the report incomparable with every \
+         other example and misled anything trusting the field names.)"
             .to_string(),
     );
     if let Some(h) = &args.content_hash {

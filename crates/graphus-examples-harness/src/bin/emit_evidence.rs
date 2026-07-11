@@ -72,6 +72,7 @@ fn main() -> ExitCode {
         bytes_fsynced: 16_384,
         write_amplification: 1.20,
         space_amplification: 1.45,
+        ..Default::default()
     };
     *collector.throughput_mut() = ThroughputSection {
         operations: 1_000,

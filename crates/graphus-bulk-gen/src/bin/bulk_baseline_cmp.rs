@@ -25,8 +25,9 @@
 //!    | Metric (storage section) | Encodes | Tolerance |
 //!    |--------------------------|---------|-----------|
 //!    | `store_bytes`            | durable graph.store image bytes | **15%** |
-//!    | `space_amplification`    | store bytes-per-node            | **15%** |
-//!    | `write_amplification`    | store bytes-per-edge            | **15%** |
+//!    | `bytes_per_node`         | store bytes-per-node            | **15%** |
+//!    | `bytes_per_relationship` | store bytes-per-edge            | **15%** |
+//!    | `space_amplification` / `write_amplification` | REAL amplification ratios (durable bytes vs logical CSV) | **15%** |
 //!    | throughput / latency / CPU / memory | machine-variant   | ignored (∞) |
 //!
 //! The 15% band matches the gds-analytics / fraud-oltp storage gates: tight enough to catch a real
