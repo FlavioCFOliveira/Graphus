@@ -81,7 +81,7 @@ do, the torn-tail fault must really leave a truncated tail — because a fault t
 trivially. The one fault that is **not** physically injected is declared with its reason rather than
 hidden: `fsync-eio` (the controlled-panic fsyncgate path, covered by a `graphus-wal` unit test).
 
-On the run recorded below (Linux x86_64, 16 cores), 6 fault kinds × 25 seeds = **150 cells in 1.6 s**,
+On the run recorded below (Linux x86_64, 16 cores), 6 fault kinds × 25 seeds = **150 cells in 1.3 s**,
 all SAFE, with the steal crash producing 49 undo losers and the torn-tail fault truncating 25 tails.
 
 ## 3. The real server, killed mid-workload
@@ -96,6 +96,33 @@ only prove the easy half of the contract. It now crashes the server with work ge
   it, proves they are visible *inside* the transaction, and then keeps probing inside it until the socket
   dies — so the ledger can state that the transaction was **still open at the instant of the kill**;
 - `SIGKILL` lands while all of them are working.
+
+### The crash window is deterministic, not hoped for (`rmp` #712)
+
+A durability example that only *sometimes* injects the crash it claims to inject is worthless as a
+regression instrument — and this one used to be exactly that. The kill landed whenever it landed, and
+whether the ledger *witnessed* the open transaction was a race the in-flight writer could lose, so the
+run's strongest assertion (`a writer really was inside an OPEN, never-committed transaction at SIGKILL`)
+failed intermittently on a server that had in fact behaved perfectly. Three things now make it a fact:
+
+1. **The writer holds its transaction until it is killed.** It never sends `COMMIT` on any code path, and
+   it is no longer wound down when the server dies: the driver *joins* it and lets it observe its own dead
+   socket first-hand. (The old code raced it with a shutdown flag, so it could wake up, see "stop", and
+   report `open_at_kill = false` for a transaction that had never closed.)
+2. **The kill is sequenced behind fresh, positive proof.** While holding, the writer refreshes a **hold
+   beacon** after every in-transaction round-trip the server *answers*. `run.sh` reads it immediately
+   before the `SIGKILL` and requires that it has **advanced** since the ready marker — so the transaction
+   is provably still being held *now*, not "a moment ago". The server's own
+   `graphus_active_transactions` gauge is scraped at the same moment and must report ≥ 1 open
+   transaction, corroborating it from the other side.
+3. **A weakened proof is refused, never published.** A server *refusal* (the server answering and rolling
+   the transaction back) is no longer mistaken for a dead socket — that false positive would have let the
+   assertion pass over a transaction the server had already discarded. And if the server dies without a
+   writer attesting an open transaction, the driver exits non-zero rather than emitting a ledger whose
+   strongest half is vacuous.
+
+The determinism is pinned by unit tests (`a_server_refusal_is_not_a_connection_death`,
+`the_verdict_refuses_every_way_the_crash_window_can_be_vacuous`), not by luck.
 
 The post-restart verifier then asserts the **three-way partition** — and it is the honesty of the third
 class that makes the first two meaningful:
@@ -117,19 +144,36 @@ A recovery that replays nothing proves nothing. Two checks make sure it is real:
    pointed at the copy. If the committed data were already in the data image, the copy would come back
    whole and the "recovery" would be a no-op. It does not — so the recovery being timed is real redo work.
 
-### Measured on the recorded run (Linux x86_64, 16 cores)
+### What durability actually COST (measured, Linux x86_64, 16 cores)
+
+This is the example's headline evidence: it is a durability proof, so the report a reader opens must be
+able to answer *"what did durability cost here?"* — and every figure below is measured on the real store
+this run crashed and recovered.
 
 | Vector | Value |
 |--------|-------|
-| Redo log at the crash | **871 505 B** of WAL vs a 188 416 B data image |
-| Acknowledged at the crash | **100 commits** (500 accounts + 400 transfers) |
-| In flight at the crash | 1 open transaction holding **6 uncommitted rows**, + 4 undetermined statements |
-| Recovery | **242 ms** wall-clock, `SIGKILL` → UDS bound again |
-| Without the WAL | the store **refuses to open** (`WAL too short to contain a header`) |
-| After recovery | **100/100** acknowledged commits intact · **0** phantom rows · 0 partial · 0 fabricated |
+| **Redo log at the crash** (`storage.wal_bytes`) | **955 098 B** — the WAL bytes that carried the acknowledged commits to durable media |
+| **Store image after replay** (`storage.store_bytes`) | **335 872 B** (196 608 B at the crash — replay grew it) |
+| **Bytes forced to durable media** (`storage.bytes_fsynced`) | **955 098 B** (the redo log; see the caveat below) |
+| WAL residual after recovery | 1 679 942 B — what the log had grown to once recovery and the restarted server had written to it |
+| Doublewrite buffer | 8 871 936 B of **fixed** torn-page-repair overhead (does not scale with the graph) |
+| Acknowledged at the crash | **160 commits** (800 accounts + 640 transfers) |
+| In flight at the crash | 1 open transaction holding **6 uncommitted rows**, held across **12** answered in-transaction probes, + 4 undetermined statements |
+| **Recovery** | **362 ms** wall-clock (`SIGKILL` → UDS bound again), peak replay RSS **37 MB** |
+| Without the WAL | the store **refuses to open** — the redo log is load-bearing |
+| After recovery | **160/160** acknowledged commits intact · **0** phantom rows · 0 partial · 0 fabricated |
 | `graphus_engine_recovery_panics_total` | **0** (scraped from `/metrics`) |
-| Commit latency | p50 **3.1 ms**, p99 **12.1 ms**, p999 **12.5 ms** (measured per commit) |
-| Peak RSS during replay | 153 MB |
+| Commit latency | p50 **3.0 ms**, p99 **33.6 ms**, p999 **33.6 ms** (measured per commit) |
+
+Two honesty caveats the report itself states:
+
+- **`storage.wal_bytes` is the redo log AT THE CRASH, not at report time.** Recovery *consumes* it, so it
+  exists at exactly one instant — and it is measured then, by path. Re-walking the WAL directory after
+  recovery would report the **1 679 942 B residual** instead: a real number describing the wrong thing,
+  and nearly **double** the log the crash actually left behind.
+- **`storage.bytes_fsynced` is a proxy, not a syscall counter.** The server exposes no fsync-byte metric,
+  so the figure reported is the redo log that carried the acknowledged commits — every byte of which was
+  forced to durable media before its commit was acknowledged. It is not claimed to be more than that.
 
 A **graceful-restart companion** then closes the loop: the recovered server is stopped with `SIGTERM` and
 reopened, and the graph must be unchanged — the clean path must not lose anything either.
@@ -138,22 +182,34 @@ reopened, and the graph must be unchanged — the clean path must not lose anyth
 
 Two standardized, schema-versioned reports are written to `evidence/` (git-ignored):
 
-- **`evidence/report.json`** — the deterministic core: the durability verdict, the recovered dataset
-  (nodes **and** relationships), the deterministic recovery-work counts (`recovery_records_replayed`,
-  `recovery_inflight_undone`, `recovery_crashes`), the measured sweep wall-time, and this process's real
-  CPU and peak RSS (the hermetic engine *is* this process).
-- **`evidence/real-server/report.json`** — the real-server crash: the redo log at the crash, the recovery
-  wall-time, the peak replay RSS, the server's CPU, and the measured commit-latency percentiles.
+- **`evidence/report.json`** — **the headline**: the REAL server that was crashed and recovered. It
+  carries the durability vector above (the redo log the crash left behind, the store image it was
+  replayed into, the WAL residual afterwards, the bytes forced to durable media, the wall-clock and peak
+  RSS of the replay), the server's CPU, and the measured commit-latency percentiles.
+- **`evidence/dst-core/report.json`** — the deterministic core: the durability verdict, the recovered
+  dataset (nodes **and** relationships), the deterministic recovery-work counts
+  (`recovery_records_replayed`, `recovery_inflight_undone`, `recovery_crashes`), the measured sweep
+  wall-time, and this process's real CPU and peak RSS (the hermetic engine *is* this process). This is
+  the report the committed baseline gates.
+
+> **Why the headline is the real server (`rmp` #712).** It used to be the DST core's — which runs the
+> engine on an in-memory device and an in-memory WAL sink, and therefore *has* no on-disk footprint. So
+> the project's durability example proved durability with 54 assertions and then reported, in the very
+> report a reader opens, that the crash-recovered store occupied **zero bytes** and fsynced **zero
+> bytes**. The reader was being told that the durability cost of durability is nothing. The real
+> crash-and-recover has a real store and a real WAL on the local filesystem; that is now what the
+> headline measures.
 
 Everything in both reports is **measured or omitted** — since schema v3 (`rmp #711`) an unmeasured metric
-is genuinely **ABSENT** from the JSON rather than written as a `0` that reads like a result. The whole
-`storage` section is absent from the deterministic report *by construction* (the DST core runs on an
-in-memory device and an in-memory WAL sink — there is no on-disk footprint to size), and the report's
-notes say so; its latency percentiles are absent because that sweep does not measure per-operation
-latency. The **real-server** report, by contrast, carries the full durable footprint *and* the
-per-element durable costs (`storage.bytes_per_node` / `bytes_per_relationship`) — the measured store
-image amortised over the node/relationship counts **read back from the recovered store** (`--nodes` /
-`--rels` are the survivors ARIES replayed), so the two inputs describe the same graph by construction.
+is genuinely **ABSENT** from the JSON rather than written as a `0` that reads like a result. The
+`storage` section is absent from the **DST-core** report *by construction* (there is no on-disk footprint
+to size), and its notes say so; its latency percentiles are absent because that sweep does not measure
+per-operation latency. The **headline** report carries the full durable footprint *and* the per-element
+durable costs (`storage.bytes_per_node` / `bytes_per_relationship`) — the measured store image amortised
+over the node/relationship counts **read back from the recovered store** (`--nodes` / `--rels` are the
+survivors ARIES replayed), so the two inputs describe the same graph by construction. And the run asserts
+that the headline report carries a real, non-zero durability vector: a gate that *cannot* fire is the
+same lie wearing a green tick.
 
 ## Baseline & regression gate
 
@@ -215,6 +271,11 @@ A durability oracle is only worth what it can catch. The teeth are proven at two
   acknowledged commit is caught), and `the_verify_verdict_catches_every_class_of_violation` (each class of
   real-server violation — phantom, lost commit, fabricated batch, half-applied transaction, wrong value —
   flips the verdict on its own).
+- **On the crash window itself** (`rmp` #712): `the_verdict_refuses_every_way_the_crash_window_can_be_vacuous`
+  (the run is refused, not published, if the server died without a writer attesting an open transaction)
+  and `a_server_refusal_is_not_a_connection_death` (a server that answers and rolls the transaction back
+  is never mistaken for a `SIGKILL`) — because an oracle that only *sometimes* gets the crash it claims
+  to inject cannot catch anything.
 
 ```bash
 cargo test -p graphus-durability-demo

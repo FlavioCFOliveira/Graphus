@@ -22,6 +22,33 @@
 //!   arrived — it may or may not have committed). It is recorded as such and never asserted either way:
 //!   claiming otherwise would be a lie, not a durability proof.
 //!
+//! # The crash window is DETERMINISTIC, not hoped for (`rmp` #712)
+//!
+//! The strongest claim this example makes — *a writer was inside an open, never-committed transaction
+//! at the `SIGKILL`* — used to be reported by a **racy** observation, so it was only *sometimes* true
+//! in the ledger even though it was *always* true on the server. Three defects, all fixed here:
+//!
+//! 1. **The shutdown race.** `run_workload` set the `stop` flag as soon as the committers died (the
+//!    server was gone), while the in-flight writer was still asleep between two probes. It woke, saw
+//!    `stop`, and wound down *without ever observing its own connection die* — so it reported
+//!    `open_at_kill = false`. The transaction WAS open; the ledger simply failed to witness it. Now
+//!    `stop` is the **safety valve only**: when the committers report the server DIED
+//!    ([`server_died`](CrashFacts::server_died)), the driver does not stop the in-flight writer — it
+//!    **joins** it and lets it observe the dead socket itself, which is guaranteed (a `SIGKILL`ed peer
+//!    makes the very next probe fail) and bounded (one probe interval).
+//! 2. **The false positive.** *Any* error used to be booked as "the connection died with my
+//!    transaction open". A [`ClientError::Failure`] is the opposite: the server ANSWERED and refused,
+//!    so the transaction is no longer open. It is now classified as such, and it FAILS the run instead
+//!    of passing it vacuously.
+//! 3. **A hope, not a fact.** The driver now REFUSES (a hard error) to emit a ledger in which the
+//!    server died but no writer attested an open transaction at the kill — see [`crash_window_verdict`].
+//!    A weakened proof is never silently published.
+//!
+//! While it holds, the in-flight writer refreshes a **hold beacon** ([`WorkloadConfig::hold_file`])
+//! after every successful in-transaction probe. `run.sh` reads it immediately before the `SIGKILL`, so
+//! the kill is sequenced *behind* a fresh, positive proof that the transaction is still being held —
+//! and the server's own `graphus_active_transactions` gauge corroborates it from the other side.
+//!
 //! After the restart, [`verify`] re-connects and asserts the three-way partition:
 //!
 //! | Class | Obligation |
@@ -80,6 +107,11 @@ pub struct WorkloadConfig {
     pub max_secs: u64,
     /// Where to touch the "ready to crash" marker.
     pub ready_file: PathBuf,
+    /// Where the in-flight writer refreshes its **hold beacon** after every successful
+    /// in-transaction probe (`rmp` #712): `probes=<n>` written atomically (tmp + rename), so the
+    /// caller can read a torn-free, *fresh* proof that the never-committed transaction is still being
+    /// held at the instant it decides to `SIGKILL`. Empty ⇒ no beacon is written.
+    pub hold_file: PathBuf,
     /// Where to write the ledger the verifier consumes.
     pub ledger_file: PathBuf,
 }
@@ -107,6 +139,11 @@ pub struct Ledger {
     /// `true` iff the explicit transaction was still **open** (its last in-transaction statement had
     /// just succeeded) when the connection died — i.e. the kill was genuinely mid-transaction.
     pub phantom_txn_open_at_kill: bool,
+    /// How many in-transaction probes the in-flight writer completed while HOLDING the transaction
+    /// open (`rmp` #712). Each one is a round-trip the server answered from inside the never-committed
+    /// transaction, so a non-zero count is positive evidence that the transaction was alive and held
+    /// right up to the kill — not merely that a `BEGIN` was once sent.
+    pub phantom_hold_probes: u64,
     /// The error the in-flight transaction's connection died with (the kill, observed client-side).
     pub phantom_txn_error: String,
     /// Commits the server rejected (e.g. an SSI serialization conflict) — never counted as acked.
@@ -189,6 +226,7 @@ impl Ledger {
                 "no"
             }
         );
+        let _ = writeln!(s, "phantom_hold_probes={}", self.phantom_hold_probes);
         let _ = writeln!(s, "phantom_txn_error={}", self.phantom_txn_error);
         let _ = writeln!(s, "workload_millis={:.3}", self.workload_millis);
         if let Some(p) = self.latency_percentile_ms(50.0) {
@@ -233,6 +271,7 @@ impl Ledger {
                 "phantom_nodes" => l.phantom_nodes = v.parse().unwrap_or(0),
                 "phantom_visible_in_txn" => l.phantom_visible_in_txn = v.parse().unwrap_or(0),
                 "phantom_txn_open_at_kill" => l.phantom_txn_open_at_kill = v == "yes",
+                "phantom_hold_probes" => l.phantom_hold_probes = v.parse().unwrap_or(0),
                 "phantom_txn_error" => l.phantom_txn_error = v.to_owned(),
                 "workload_millis" => l.workload_millis = v.parse().unwrap_or(0.0),
                 _ => {}
@@ -290,18 +329,99 @@ struct CommitterOutcome {
     latencies_ms: Vec<f64>,
 }
 
+/// How long the driver will wait, after the committers report the server DEAD, for the in-flight
+/// writer to observe its own connection die. A `SIGKILL`ed peer makes the very next probe fail
+/// immediately, so this is one probe interval in practice; the bound exists so a pathological stall
+/// becomes a loud failure instead of a silent `open_at_kill = false`.
+const PHANTOM_DEATH_GRACE: Duration = Duration::from_secs(30);
+
+/// How long the in-flight writer sleeps between two in-transaction probes. It bounds how stale the
+/// hold beacon can be when `run.sh` reads it immediately before the `SIGKILL`, and how long the
+/// writer takes to notice the dead socket afterwards.
+const HOLD_PROBE_INTERVAL: Duration = Duration::from_millis(10);
+
+/// The facts about the crash window, as the driver's own threads observed them. They decide whether a
+/// ledger may be published at all ([`crash_window_verdict`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CrashFacts {
+    /// The mid-workload state was reached and announced (open transaction + enough acked commits), so
+    /// the caller was cleared to `SIGKILL`.
+    pub announced: bool,
+    /// At least one committer's connection died mid-statement — i.e. the server really was killed
+    /// under the workload (as opposed to the safety valve firing on a server that never died).
+    pub server_died: bool,
+    /// The in-flight writer's connection died while its transaction was still OPEN and never
+    /// committed — the fact the example's strongest assertion rests on.
+    pub open_at_kill: bool,
+    /// In-transaction probes the in-flight writer completed while holding. `0` would mean it never
+    /// actually held the transaction across a single round-trip.
+    pub hold_probes: u64,
+}
+
+/// Decides whether the observed [`CrashFacts`] constitute the proof the example claims — or whether the
+/// run must be REFUSED (`rmp` #712).
+///
+/// This is the honesty gate that used to be missing. The kill window used to be raced: when the server
+/// died, the driver could wind the in-flight writer down before it noticed its own dead socket, and the
+/// ledger then said `open_at_kill=no` for a transaction that had in fact been open the whole time. The
+/// example's headline assertion therefore only *sometimes* held — a durability example that only
+/// sometimes injects the crash it claims to inject is worthless as a regression instrument.
+///
+/// It is a pure function so the race is pinned by unit tests instead of by luck.
+///
+/// # Errors
+/// Returns the reason the run is not a valid proof.
+pub fn crash_window_verdict(facts: CrashFacts) -> Result<(), String> {
+    if !facts.announced {
+        return Err(
+            "the workload never reached the mid-workload crash state (an open, never-committed \
+             transaction + acknowledged commits), so a crash could not have landed mid-workload"
+                .to_owned(),
+        );
+    }
+    if !facts.server_died {
+        return Err(
+            "the safety valve fired: no committer's connection ever died, so the server was NEVER \
+             killed under the workload — there is no crash to recover from"
+                .to_owned(),
+        );
+    }
+    if facts.hold_probes == 0 {
+        return Err(
+            "the in-flight writer never completed a single in-transaction probe, so it cannot \
+             attest that it HELD its transaction open up to the kill"
+                .to_owned(),
+        );
+    }
+    if !facts.open_at_kill {
+        return Err(
+            "the server was killed, but no writer attested an OPEN, never-committed transaction at \
+             the kill: the strongest half of the committed-or-nothing contract (no in-flight effect \
+             may survive) would be VACUOUS. The proof is refused rather than silently weakened"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
 /// Runs the concurrent OLTP workload and blocks until the server dies under it (or `max_secs` elapses),
 /// then returns the ledger of exactly what was acknowledged.
 ///
-/// The caller (`run.sh`) waits for [`WorkloadConfig::ready_file`] — which appears only once the
-/// in-flight transaction is open *and* commits are being acknowledged — and only then sends `SIGKILL`.
+/// The caller (`run.sh`) waits for [`WorkloadConfig::ready_file`], re-checks the fresh hold beacon
+/// ([`WorkloadConfig::hold_file`]) — positive proof the never-committed transaction is *still* being
+/// held — and only then sends `SIGKILL`.
 ///
 /// # Errors
-/// Returns an [`io::Error`] if the ledger cannot be written, or if the workload never reached the
-/// mid-workload state the crash must land in (a hard failure: it would silently degrade the proof).
+/// Returns an [`io::Error`] if the ledger cannot be written, or if the observed [`CrashFacts`] do not
+/// constitute the proof the example claims (see [`crash_window_verdict`]): a weakened proof is refused,
+/// never silently published.
 pub fn run_workload(cfg: &WorkloadConfig) -> io::Result<Ledger> {
     let stop = Arc::new(AtomicBool::new(false));
     let acked_count = Arc::new(AtomicU64::new(0));
+    // Set by the first committer whose connection dies mid-statement: the server really was killed.
+    // It is what tells the driver NOT to wind the in-flight writer down, but to let it witness the
+    // dead socket itself — the fix for the race that made `open_at_kill` intermittent (`rmp` #712).
+    let server_died = Arc::new(AtomicBool::new(false));
     let started = Instant::now();
 
     // ---- The in-flight writer: opens a transaction, writes into it, and NEVER commits. ------------
@@ -321,8 +441,9 @@ pub fn run_workload(cfg: &WorkloadConfig) -> io::Result<Ledger> {
         let c = cfg.clone();
         let stop = Arc::clone(&stop);
         let acked_count = Arc::clone(&acked_count);
+        let died = Arc::clone(&server_died);
         handles.push(std::thread::spawn(move || {
-            commit_loop(w, &c, &stop, &acked_count)
+            commit_loop(w, &c, &stop, &acked_count, &died)
         }));
     }
 
@@ -344,6 +465,8 @@ pub fn run_workload(cfg: &WorkloadConfig) -> io::Result<Ledger> {
             break;
         }
         if Instant::now() >= deadline {
+            // The SAFETY VALVE, and the ONLY thing that may set `stop`. It means the server was never
+            // killed; the run is not a proof and `crash_window_verdict` will refuse it below.
             stop.store(true, Ordering::Release);
             break;
         }
@@ -363,27 +486,58 @@ pub fn run_workload(cfg: &WorkloadConfig) -> io::Result<Ledger> {
             ledger.commit_latencies_ms.extend(o.latencies_ms);
         }
     }
-    stop.store(true, Ordering::Release);
-    let _ = phantom_thread.join();
-    if let Ok(p) = phantom_rx.recv_timeout(Duration::from_secs(5)) {
+
+    // The in-flight writer is NOT told to stop when the server died: its connection is already dead,
+    // so its very next probe fails and it records — as a first-hand fact — that its transaction was
+    // still open at the kill. Setting `stop` here (as the code used to) raced that observation and
+    // silently downgraded the ledger to `open_at_kill=no` for a transaction that never closed.
+    //
+    // On the safety-valve path `stop` is already set, and the writer winds down reporting honestly
+    // that no kill was ever observed.
+    let died = server_died.load(Ordering::Acquire);
+    let phantom = phantom_rx.recv_timeout(if died {
+        PHANTOM_DEATH_GRACE
+    } else {
+        Duration::from_secs(5)
+    });
+    if let Ok(p) = phantom {
         ledger.phantom_visible_in_txn = p.visible_in_txn;
         ledger.phantom_txn_open_at_kill = p.open_at_kill;
+        ledger.phantom_hold_probes = p.held_probes;
         ledger.phantom_txn_error = p.error;
+    } else {
+        ledger.phantom_txn_error =
+            "the in-flight writer never reported back (it neither observed the kill nor stopped)"
+                .to_owned();
     }
+    // Now that its outcome is in, release the writer unconditionally (it has already returned on
+    // every path that gets here; this only guarantees the thread is not left parked).
+    stop.store(true, Ordering::Release);
+    let _ = phantom_thread.join();
+
     ledger.acked.sort_unstable();
     ledger.undetermined.sort_unstable();
     ledger.workload_millis = started.elapsed().as_secs_f64() * 1_000.0;
 
+    // The ledger is written even when the run is refused: it is the evidence of WHY it was refused.
     std::fs::write(&cfg.ledger_file, ledger.render().as_bytes())?;
 
-    if !announced {
+    let facts = CrashFacts {
+        announced,
+        server_died: died,
+        open_at_kill: ledger.phantom_txn_open_at_kill,
+        hold_probes: ledger.phantom_hold_probes,
+    };
+    if let Err(why) = crash_window_verdict(facts) {
         return Err(io::Error::other(format!(
-            "the workload never reached the mid-workload crash state (open in-flight txn + >= {} \
-             acked commits): acked={} phantom_open={} — the crash would NOT have been mid-workload, \
-             so the proof is refused rather than silently weakened",
-            cfg.min_acked_before_ready,
+            "{why} — facts: acked={} undetermined={} hold_probes={} open_at_kill={} \
+             server_died={} last_error={:?}",
             ledger.acked.len(),
-            phantom_open.load(Ordering::Acquire),
+            ledger.undetermined.len(),
+            ledger.phantom_hold_probes,
+            ledger.phantom_txn_open_at_kill,
+            died,
+            ledger.phantom_txn_error,
         )));
     }
     Ok(ledger)
@@ -393,12 +547,43 @@ pub fn run_workload(cfg: &WorkloadConfig) -> io::Result<Ledger> {
 struct PhantomOutcome {
     visible_in_txn: u64,
     open_at_kill: bool,
+    held_probes: u64,
     error: String,
+}
+
+/// How one in-transaction probe ended, and what that says about the transaction (`rmp` #712).
+///
+/// The distinction the old code missed: a [`ClientError::Failure`] is the server ANSWERING — it
+/// refused the statement, so the transaction is **no longer open**. Booking it (as any error used to
+/// be booked) as "my connection died with my transaction open" is a FALSE POSITIVE that would let the
+/// example's strongest assertion pass on a transaction the server had already rolled back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeOutcome {
+    /// The server answered from inside the transaction: it is still open, still uncommitted.
+    StillOpen,
+    /// The connection died (I/O / protocol): the server was killed with the transaction OPEN.
+    ConnectionDied,
+    /// The server answered and REFUSED: the transaction is no longer open (it was rolled back).
+    ServerRefused,
+}
+
+/// Classifies an in-transaction probe's result. Pure, so the false positive is pinned by a unit test.
+fn classify_probe<T>(result: &Result<T, ClientError>) -> ProbeOutcome {
+    match result {
+        Ok(_) => ProbeOutcome::StillOpen,
+        Err(ClientError::Io(_) | ClientError::Protocol(_)) => ProbeOutcome::ConnectionDied,
+        Err(ClientError::Failure(_)) => ProbeOutcome::ServerRefused,
+    }
 }
 
 /// Opens an explicit transaction, writes `:Phantom` nodes into it, proves they are visible from inside
 /// it, and then holds it open — probing inside the transaction until the connection dies. It NEVER
-/// sends `COMMIT`, so nothing it wrote may ever be observable after recovery.
+/// sends `COMMIT` (there is no commit call on this path at all), so nothing it wrote may ever be
+/// observable after recovery.
+///
+/// After every successful probe it refreshes the **hold beacon** ([`WorkloadConfig::hold_file`]), so
+/// the caller can sequence its `SIGKILL` behind a fresh, positive proof that the transaction is still
+/// being held right now — rather than behind a stale "it was open a moment ago" (`rmp` #712).
 fn hold_open_transaction(
     cfg: &WorkloadConfig,
     open_flag: &AtomicBool,
@@ -407,6 +592,7 @@ fn hold_open_transaction(
     let mut out = PhantomOutcome {
         visible_in_txn: 0,
         open_at_kill: false,
+        held_probes: 0,
         error: String::new(),
     };
     let mut client = match connect(cfg) {
@@ -451,37 +637,76 @@ fn hold_open_transaction(
     }
     open_flag.store(true, Ordering::Release);
 
-    // Hold the transaction OPEN. Each probe that succeeds re-proves the transaction is still open; the
-    // first that fails is the server dying underneath it — with our transaction still open, uncommitted.
+    // Hold the transaction OPEN. Each probe the server answers re-proves it is still open (and
+    // refreshes the beacon); the first that fails with a dead socket IS the kill, observed first-hand,
+    // with our transaction still open and never committed.
+    //
+    // `stop` is the safety valve ONLY — it is set when the server was never killed at all. It is
+    // deliberately NOT set on the kill path any more: doing so used to race this loop and wind the
+    // writer down before it could witness the death, which is precisely how the example's strongest
+    // assertion became intermittent (`rmp` #712).
     loop {
         if stop.load(Ordering::Acquire) {
-            out.error = "workload stopped before the server was killed".to_owned();
+            out.error =
+                "the workload stopped before the server was killed (safety valve; no crash landed)"
+                    .to_owned();
             out.open_at_kill = false;
             // Leave the transaction open and drop the connection: still never committed.
             return out;
         }
-        match client.run_in_txn(
+        let probe = client.run_in_txn(
             &format!("MATCH (p:{PHANTOM_LABEL}) RETURN count(p) AS c"),
             vec![],
-        ) {
-            Ok(_) => std::thread::sleep(Duration::from_millis(20)),
-            Err(e) => {
+        );
+        match classify_probe(&probe) {
+            ProbeOutcome::StillOpen => {
+                out.held_probes += 1;
+                write_hold_beacon(&cfg.hold_file, out.held_probes);
+                std::thread::sleep(HOLD_PROBE_INTERVAL);
+            }
+            ProbeOutcome::ConnectionDied => {
                 // The connection died while the transaction was open and uncommitted — exactly the
-                // in-flight state the crash must discard.
+                // in-flight state the crash must discard. THIS is the fact the ledger records.
                 out.open_at_kill = true;
-                out.error = e.to_string();
+                out.error = probe.err().map_or_else(String::new, |e| e.to_string());
+                return out;
+            }
+            ProbeOutcome::ServerRefused => {
+                // The server ANSWERED and refused: the transaction is no longer open, so the kill
+                // (whenever it lands) will NOT find it in flight. Never booked as an open transaction.
+                out.open_at_kill = false;
+                out.error = format!(
+                    "the server REFUSED an in-transaction probe, so the transaction was rolled back \
+                     before the kill: {}",
+                    probe.err().map_or_else(String::new, |e| e.to_string())
+                );
                 return out;
             }
         }
     }
 }
 
-/// One committer: auto-commit batches until the server dies (or `stop`).
+/// Refreshes the hold beacon atomically (write to a sibling temp file, then `rename`), so a reader can
+/// never observe a torn or empty beacon. A beacon that cannot be written is not fatal to the workload
+/// — the caller's pre-kill check will simply fail loudly instead of silently proceeding.
+fn write_hold_beacon(path: &Path, probes: u64) {
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, format!("probes={probes}\n").as_bytes()).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+/// One committer: auto-commit batches until the server dies (or `stop`). A connection that dies
+/// mid-statement raises `server_died` — the signal that the crash really landed under the workload.
 fn commit_loop(
     w: u64,
     cfg: &WorkloadConfig,
     stop: &AtomicBool,
     acked_count: &AtomicU64,
+    server_died: &AtomicBool,
 ) -> CommitterOutcome {
     let mut out = CommitterOutcome {
         acked: Vec::new(),
@@ -507,9 +732,12 @@ fn commit_loop(
                 acked_count.fetch_add(1, Ordering::AcqRel);
             }
             // The socket died mid-statement: the ack never arrived, so this batch is UNDETERMINED —
-            // it may or may not have committed. Recorded, never asserted either way.
+            // it may or may not have committed. Recorded, never asserted either way. It is also the
+            // first-hand evidence that the SERVER DIED, which is what keeps the driver from winding
+            // the in-flight writer down before it can witness the same death (`rmp` #712).
             Err(ClientError::Io(_) | ClientError::Protocol(_)) => {
                 out.undetermined = Some((w, batch));
+                server_died.store(true, Ordering::Release);
                 return out;
             }
             // The server answered — it just refused (e.g. an SSI serialization conflict). Not acked.
@@ -832,6 +1060,7 @@ mod tests {
             phantom_nodes: 4,
             phantom_visible_in_txn: 4,
             phantom_txn_open_at_kill: true,
+            phantom_hold_probes: 37,
             phantom_txn_error: "I/O error: broken pipe".to_owned(),
             failed_commits: 2,
             commit_latencies_ms: vec![1.0, 2.0, 3.0, 4.0],
@@ -845,6 +1074,123 @@ mod tests {
         assert_eq!(back.acked_rels(), 12);
         assert!(back.phantom_txn_open_at_kill);
         assert_eq!(back.phantom_visible_in_txn, 4);
+        assert_eq!(
+            back.phantom_hold_probes, 37,
+            "the ledger must carry HOW MANY in-transaction probes the writer held across — a \
+             non-zero count is what makes 'the transaction was open at the kill' a fact"
+        );
+    }
+
+    /// **Regression (`rmp` #712), defect 2a — the FALSE POSITIVE.**
+    ///
+    /// The hold loop used to treat *every* error as "my connection died with my transaction open". A
+    /// [`ClientError::Failure`] is the server ANSWERING and refusing: the transaction is rolled back
+    /// and is no longer open. Booking it as an open transaction would let the example's strongest
+    /// assertion ("a writer really was inside an OPEN, never-committed transaction at SIGKILL") pass
+    /// over a transaction the server had already discarded — a green tick over a vacuous proof.
+    #[test]
+    fn a_server_refusal_is_not_a_connection_death() {
+        let refused: Result<(), ClientError> =
+            Err(ClientError::Failure(graphus_bolt::Failure::new(
+                "Neo.TransientError.Transaction.Outdated",
+                "serialization conflict",
+            )));
+        assert_eq!(
+            classify_probe(&refused),
+            ProbeOutcome::ServerRefused,
+            "the server answered and refused: the transaction is NOT open any more"
+        );
+
+        let died: Result<(), ClientError> = Err(ClientError::Io(io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "connection reset by peer",
+        )));
+        assert_eq!(
+            classify_probe(&died),
+            ProbeOutcome::ConnectionDied,
+            "a dead socket IS the kill, observed from inside the open transaction"
+        );
+
+        let protocol: Result<(), ClientError> =
+            Err(ClientError::Protocol("truncated message".to_owned()));
+        assert_eq!(classify_probe(&protocol), ProbeOutcome::ConnectionDied);
+
+        assert_eq!(classify_probe(&Ok(())), ProbeOutcome::StillOpen);
+    }
+
+    /// **Regression (`rmp` #712), defect 2b — the SHUTDOWN RACE, and the gate that now catches it.**
+    ///
+    /// The driver used to publish a ledger saying `open_at_kill=no` whenever the in-flight writer lost
+    /// the race to the `stop` flag — the exact intermittent failure this task exists to kill. The facts
+    /// are now run through [`crash_window_verdict`], which REFUSES the run instead of publishing a
+    /// proof whose strongest half is vacuous.
+    #[test]
+    fn the_verdict_refuses_every_way_the_crash_window_can_be_vacuous() {
+        let good = CrashFacts {
+            announced: true,
+            server_died: true,
+            open_at_kill: true,
+            hold_probes: 12,
+        };
+        assert!(
+            crash_window_verdict(good).is_ok(),
+            "a real mid-workload kill, witnessed from inside the open transaction, is the proof"
+        );
+
+        // THE RACE: the server died, the writer held its transaction — but it was wound down before it
+        // could witness the death, so it reported `open_at_kill = false`. This is what used to be
+        // published as a passing run's ledger (and then failed the run.sh assertion, flakily).
+        let raced = CrashFacts {
+            open_at_kill: false,
+            ..good
+        };
+        let err = crash_window_verdict(raced).expect_err("a vacuous crash window must be REFUSED");
+        assert!(err.contains("VACUOUS"), "unexpected reason: {err}");
+
+        // The safety valve fired: the server was never killed at all.
+        let never_killed = CrashFacts {
+            server_died: false,
+            open_at_kill: false,
+            ..good
+        };
+        assert!(crash_window_verdict(never_killed).is_err());
+
+        // The writer never held the transaction across a single round-trip.
+        let never_held = CrashFacts {
+            hold_probes: 0,
+            ..good
+        };
+        assert!(crash_window_verdict(never_held).is_err());
+
+        // The mid-workload state was never announced, so the caller was never cleared to kill.
+        let never_ready = CrashFacts {
+            announced: false,
+            ..good
+        };
+        assert!(crash_window_verdict(never_ready).is_err());
+    }
+
+    /// The hold beacon must be readable and FRESH — `run.sh` sequences its `SIGKILL` behind it, so a
+    /// torn or empty read would either abort a good run or (worse) wave a bad one through. It is
+    /// written atomically (temp + rename) and always parses.
+    #[test]
+    fn the_hold_beacon_is_written_atomically_and_advances() {
+        let dir = std::env::temp_dir().join(format!("gdur-beacon-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let beacon = dir.join("hold");
+
+        for n in 1..=5u64 {
+            write_hold_beacon(&beacon, n);
+            let text =
+                std::fs::read_to_string(&beacon).expect("the beacon must always be readable");
+            assert_eq!(text.trim(), format!("probes={n}"));
+        }
+        // No temp file is left behind for a reader to trip over.
+        assert!(!beacon.with_extension("tmp").exists());
+
+        // An empty path is a no-op, never a panic (the beacon is optional).
+        write_hold_beacon(Path::new(""), 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Latency percentiles are MEASURED or ABSENT — never a fabricated `0.0` (`rmp` #699).

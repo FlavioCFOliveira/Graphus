@@ -1185,10 +1185,50 @@ impl EvidenceCollector {
         wal_path: impl AsRef<Path>,
         bytes_fsynced: Option<u64>,
     ) -> io::Result<()> {
+        self.record_storage_at(store_path, wal_path, None, bytes_fsynced)
+    }
+
+    /// [`record_storage`](Self::record_storage), but with the WAL byte count supplied by the example
+    /// instead of walked at emission time (`rmp` #712).
+    ///
+    /// # Why an override exists at all
+    ///
+    /// A **crash-recovery** example's load-bearing WAL figure is the redo log that existed **at the
+    /// crash** — the bytes that carried the acknowledged commits and that recovery then replayed. By
+    /// the time the report is emitted, the server has restarted, replayed, and begun checkpointing:
+    /// walking the WAL directory *then* measures the post-recovery **residual**, which is a different
+    /// quantity and a much smaller one. Reporting the residual under `wal_bytes` would tell the reader
+    /// that a crash-recovery run's redo log cost a fraction of what it actually cost.
+    ///
+    /// So the example — which owns the store and measured the WAL *by path*, at the instant that
+    /// matters, with the same walker — passes that measurement in. It is still a MEASUREMENT, taken at
+    /// the only instant at which the quantity exists; it is not a fabrication, and the caller is
+    /// obliged to state in a note which instant its figure describes.
+    ///
+    /// `wal_bytes = None` restores the emission-time walk (what every other example wants).
+    ///
+    /// # Errors
+    ///
+    /// Propagates any I/O error from walking the store or WAL path (a missing path is not an error —
+    /// it is recorded as "not measured").
+    pub fn record_storage_at(
+        &mut self,
+        store_path: impl AsRef<Path>,
+        wal_path: impl AsRef<Path>,
+        wal_bytes: Option<u64>,
+        bytes_fsynced: Option<u64>,
+    ) -> io::Result<()> {
         let store_path = store_path.as_ref();
         let wal_path = wal_path.as_ref();
         let store = StorageMeter::try_measure_path(store_path)?;
-        let wal = StorageMeter::try_measure_path(wal_path)?;
+        // An example-supplied WAL byte count replaces the emission-time walk; the path is still
+        // consulted, so a WAL that does not exist at all is still reported as "not measured".
+        let walked = StorageMeter::try_measure_path(wal_path)?;
+        let wal = match (wal_bytes, walked) {
+            (Some(bytes), Some(_)) => Some(DiskFootprint::from_bytes(bytes)),
+            (Some(_), None) | (None, None) => None,
+            (None, Some(w)) => Some(w),
+        };
 
         if store.is_none() {
             self.report.notes.push(format!(
@@ -1808,6 +1848,100 @@ mod tests {
         assert_eq!(
             report.throughput.operations, None,
             "a zero operation count IS a placeholder — no workload ran zero operations"
+        );
+    }
+
+    // -- The WAL a crash left behind (`rmp #712`) -------------------------------------------------
+
+    /// **Regression (`rmp` #712).** A crash-recovery example's load-bearing WAL is the redo log that
+    /// existed **at the crash**. By emission time the server has restarted, replayed it and begun
+    /// checkpointing, so walking the WAL directory *then* measures the post-recovery **residual** — a
+    /// different, far smaller quantity. Reporting the residual under `wal_bytes` tells the reader that
+    /// a crashed store's redo log cost almost nothing, which is exactly the class of subtly-wrong
+    /// evidence the honesty rules exist to prevent.
+    ///
+    /// [`EvidenceCollector::record_storage_at`] lets the example supply the figure it measured at the
+    /// instant the quantity existed; the page count is derived from THAT, and `bytes_fsynced` follows
+    /// it rather than the residual.
+    #[test]
+    fn a_supplied_wal_byte_count_overrides_the_emission_time_walk() {
+        let dir = temp_store_with_bytes("crash-wal", 8_192);
+        // The WAL as it looks AFTER recovery: a small residual (one reclaimed segment).
+        std::fs::write(
+            dir.join("graphus.wal").join("seg.0000000042"),
+            vec![0u8; 4_096],
+        )
+        .expect("residual segment");
+
+        let mut c = EvidenceCollector::new(RunMetadata::new("unit", "crash-time WAL"));
+        c.start();
+        c.record_storage_at(
+            dir.join("graphus.store"),
+            dir.join("graphus.wal"),
+            Some(1_254_181), // what the example measured, by path, AT THE CRASH
+            Some(1_254_181),
+        )
+        .expect("measure");
+        let report = c.finish();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            report.storage.wal_bytes,
+            Some(1_254_181),
+            "the redo log the crash left behind is the WAL this run wrote — NOT the 4 KiB residual \
+             that happens to be on disk once recovery has replayed and checkpointed it away"
+        );
+        assert_eq!(
+            report.storage.wal_pages,
+            Some(1_254_181u64.div_ceil(PAGE_SIZE)),
+            "the page count must follow the supplied byte count, not the walked residual"
+        );
+        assert_eq!(report.storage.bytes_fsynced, Some(1_254_181));
+        assert_eq!(
+            report.storage.store_bytes,
+            Some(8_192),
+            "the store image is still walked at emission time (it is the image AFTER replay)"
+        );
+    }
+
+    /// The override never *invents* a WAL: if the WAL path does not exist at all, the vector stays
+    /// NOT MEASURED (absent), exactly as it does without the override. A figure supplied for a WAL
+    /// this run never had would be a fabrication, and schema v3 exists to make that impossible.
+    #[test]
+    fn a_supplied_wal_byte_count_cannot_conjure_a_wal_that_does_not_exist() {
+        let dir = temp_store_with_bytes("no-wal", 8_192);
+        let _ = std::fs::remove_dir_all(dir.join("graphus.wal"));
+
+        let mut c = EvidenceCollector::new(RunMetadata::new("unit", "absent WAL"));
+        c.start();
+        c.record_storage_at(
+            dir.join("graphus.store"),
+            dir.join("graphus.wal"),
+            Some(999_999),
+            None,
+        )
+        .expect("measure");
+        let report = c.finish();
+        let storage_json = serde_json::to_string(&report.storage).expect("serialize");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(report.storage.wal_bytes, None);
+        assert_eq!(report.storage.wal_pages, None);
+        assert_eq!(
+            report.storage.bytes_fsynced, None,
+            "with no WAL there is nothing to proxy the fsynced bytes with either"
+        );
+        assert!(
+            !storage_json.contains("wal_bytes"),
+            "a WAL that does not exist is NOT MEASURED — absent from the storage section, never a \
+             supplied number: {storage_json}"
+        );
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|n| n.contains("NOT MEASURED") && n.contains("wal_bytes")),
+            "and the report must SAY why the vector is absent"
         );
     }
 

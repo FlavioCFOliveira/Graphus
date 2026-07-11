@@ -44,6 +44,13 @@ graphus-reco-gen = { path = "../graphus-reco-gen" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+[dev-dependencies]
+# `graphus_bolt::Failure` — needed ONLY to construct a server-refusal error in the `rmp` #712
+# regression test that pins the false positive: an in-transaction probe that the server ANSWERS and
+# REFUSES must never be booked as "my connection died with my transaction open". Test-only; the
+# binaries do not link it.
+graphus-bolt = { path = "../graphus-bolt" }
+
 # The deterministic durability-scenario driver: runs the VOPR safety oracle (OLTP workload + shadow
 # model + crash + ARIES recovery + the four-property durability oracle) over a seed range, surfaces a
 # seed's acked/in-flight CrashSplit partition, and emits the standardized evidence report.
