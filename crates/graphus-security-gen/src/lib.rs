@@ -501,7 +501,9 @@ pub fn generate_namespaced(config: GenConfig, profile: &str, namespace: &str) ->
         format!("DENY READ ON PROPERTY {db_a}.Patient.ssn TO {reader_a}"),
         format!("DENY TRAVERSE ON LABEL {db_a}.Confidential TO {reader_a}"),
     ];
-    let deny_seed = vec![format!("CREATE (:Secret:Confidential {{name: '{confidential}'}})")];
+    let deny_seed = vec![format!(
+        "CREATE (:Secret:Confidential {{name: '{confidential}'}})"
+    )];
     let deny_checks = vec![
         DenyCheck {
             user: alice.clone(),
@@ -599,7 +601,13 @@ fn build_matrix(
             Outcome::Allow,
             "reader_a: READ ON GRAPH tenant_a",
         ),
-        cell(Some(alice), db_a, "WRITE", Outcome::Deny, "reader_a has no WRITE"),
+        cell(
+            Some(alice),
+            db_a,
+            "WRITE",
+            Outcome::Deny,
+            "reader_a has no WRITE",
+        ),
         cell(
             Some(alice),
             db_b,
@@ -658,8 +666,20 @@ fn build_matrix(
             Outcome::Allow,
             "analyst: READ ON DATABASE (server-wide)",
         ),
-        cell(Some(ana), db_a, "WRITE", Outcome::Deny, "analyst has READ only"),
-        cell(Some(ana), db_b, "WRITE", Outcome::Deny, "analyst has READ only"),
+        cell(
+            Some(ana),
+            db_a,
+            "WRITE",
+            Outcome::Deny,
+            "analyst has READ only",
+        ),
+        cell(
+            Some(ana),
+            db_b,
+            "WRITE",
+            Outcome::Deny,
+            "analyst has READ only",
+        ),
         // admin — global Admin: read/write any tenant.
         cell(
             Some(admin_user),
@@ -824,7 +844,9 @@ impl Dataset {
     pub fn teardown_cypher(&self) -> String {
         let m = &self.manifest;
         let mut s = String::with_capacity(256);
-        s.push_str("// teardown — drop everything provisioning created (users, roles, databases)\n");
+        s.push_str(
+            "// teardown — drop everything provisioning created (users, roles, databases)\n",
+        );
         for u in &m.users {
             let _ = writeln!(s, "DROP USER {} IF EXISTS;", u.name);
         }
@@ -987,7 +1009,10 @@ mod tests {
         let plain = generate(cfg, "fast");
         let empty_ns = generate_namespaced(cfg, "fast", "");
         assert_eq!(plain.provision_cypher(), empty_ns.provision_cypher());
-        assert_eq!(plain.tenant_cypher("tenant_a"), empty_ns.tenant_cypher("tenant_a"));
+        assert_eq!(
+            plain.tenant_cypher("tenant_a"),
+            empty_ns.tenant_cypher("tenant_a")
+        );
         assert_eq!(
             plain.manifest_json().unwrap(),
             empty_ns.manifest_json().unwrap()
@@ -1024,7 +1049,10 @@ mod tests {
         assert!(probes.iter().any(|p| p.query.contains("p.ssn")));
         assert!(probes.iter().any(|p| p.query.contains("r.secret_token")));
         assert!(probes.iter().any(|p| p.query == "MATCH (n) RETURN n AS v"));
-        let count = probes.iter().find(|p| p.kind == "count").expect("a count probe");
+        let count = probes
+            .iter()
+            .find(|p| p.kind == "count")
+            .expect("a count probe");
         assert!(count.query.contains("count(n)"));
     }
 
@@ -1035,32 +1063,49 @@ mod tests {
         // Databases, roles, users are all prefixed.
         assert_eq!(d.manifest.tenants[0].database, "ex_secmt_1_2_tenant_a");
         assert_eq!(d.manifest.tenants[1].database, "ex_secmt_1_2_tenant_b");
-        assert!(d.manifest.roles.iter().any(|r| r.name == "ex_secmt_1_2_reader_a"
-            && r.scope == "GRAPH ex_secmt_1_2_tenant_a"));
-        assert!(d.manifest.users.iter().any(|u| u.name == "ex_secmt_1_2_alice"
-            && u.role == "ex_secmt_1_2_reader_a"));
+        assert!(
+            d.manifest
+                .roles
+                .iter()
+                .any(|r| r.name == "ex_secmt_1_2_reader_a"
+                    && r.scope == "GRAPH ex_secmt_1_2_tenant_a")
+        );
+        assert!(
+            d.manifest
+                .users
+                .iter()
+                .any(|u| u.name == "ex_secmt_1_2_alice" && u.role == "ex_secmt_1_2_reader_a")
+        );
         // The admin is NEVER namespaced (it is the target's own admin).
         assert_eq!(d.manifest.admin_user, "neo4j");
         // Provisioning + DENY + teardown all reference the namespaced names.
         let p = d.provision_cypher();
         assert!(p.contains("CREATE DATABASE ex_secmt_1_2_tenant_a IF NOT EXISTS;"));
         assert!(p.contains("GRANT READ ON GRAPH ex_secmt_1_2_tenant_a TO ex_secmt_1_2_reader_a;"));
-        assert!(
-            d.deny_cypher()
-                .contains("DENY READ ON PROPERTY ex_secmt_1_2_tenant_a.Patient.ssn TO ex_secmt_1_2_reader_a;")
-        );
+        assert!(d.deny_cypher().contains(
+            "DENY READ ON PROPERTY ex_secmt_1_2_tenant_a.Patient.ssn TO ex_secmt_1_2_reader_a;"
+        ));
         let t = d.teardown_cypher();
         assert!(t.contains("DROP USER ex_secmt_1_2_alice IF EXISTS;"));
         assert!(t.contains("DROP ROLE ex_secmt_1_2_reader_a IF EXISTS;"));
         assert!(t.contains("STOP DATABASE ex_secmt_1_2_tenant_a;"));
         assert!(t.contains("DROP DATABASE ex_secmt_1_2_tenant_a IF EXISTS;"));
         // The matrix cells reference the namespaced user + tenant names.
-        assert!(d.manifest.matrix.iter().any(|c| c.user.as_deref()
-            == Some("ex_secmt_1_2_alice")
-            && c.tenant == "ex_secmt_1_2_tenant_b"));
+        assert!(
+            d.manifest
+                .matrix
+                .iter()
+                .any(|c| c.user.as_deref() == Some("ex_secmt_1_2_alice")
+                    && c.tenant == "ex_secmt_1_2_tenant_b")
+        );
         // The DENY checks + cross-tenant probes are still populated under a namespace.
         assert_eq!(d.manifest.deny_tenant, "ex_secmt_1_2_tenant_a");
-        assert!(d.manifest.deny_checks.iter().all(|c| c.user == "ex_secmt_1_2_alice"));
+        assert!(
+            d.manifest
+                .deny_checks
+                .iter()
+                .all(|c| c.user == "ex_secmt_1_2_alice")
+        );
     }
 
     #[test]
@@ -1075,6 +1120,9 @@ mod tests {
             );
         }
         // Byte-identical across runs (determinism).
-        assert_eq!(t, generate(Profile::Fast.config(), "fast").teardown_cypher());
+        assert_eq!(
+            t,
+            generate(Profile::Fast.config(), "fast").teardown_cypher()
+        );
     }
 }

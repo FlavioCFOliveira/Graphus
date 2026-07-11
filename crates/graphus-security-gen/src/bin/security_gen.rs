@@ -70,7 +70,9 @@ fn main() -> ExitCode {
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
     {
-        return fail("--namespace must be lowercase [a-z0-9_] (it prefixes database/role/user names)");
+        return fail(
+            "--namespace must be lowercase [a-z0-9_] (it prefixes database/role/user names)",
+        );
     }
 
     let cfg = profile.config();

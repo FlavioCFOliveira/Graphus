@@ -628,7 +628,8 @@ fn run_worker(
         // latency from that SCHEDULED time (so a slow server surfaces as growing latency, not a
         // throttled arrival rate — coordinated-omission-free). Closed-loop: fire immediately and
         // measure the round-trip.
-        let scheduled = interval.map(|iv| t0 + iv.saturating_mul(u32::try_from(ticket).unwrap_or(u32::MAX)));
+        let scheduled =
+            interval.map(|iv| t0 + iv.saturating_mul(u32::try_from(ticket).unwrap_or(u32::MAX)));
         if let Some(due) = scheduled {
             let now = Instant::now();
             if due > now {
@@ -1532,9 +1533,9 @@ impl Args {
                 }
                 "--target-rps" => {
                     let v = value()?;
-                    target_rps = v
-                        .parse()
-                        .map_err(|_| format!("--target-rps must be a non-negative number, got {v:?}"))?;
+                    target_rps = v.parse().map_err(|_| {
+                        format!("--target-rps must be a non-negative number, got {v:?}")
+                    })?;
                     if target_rps < 0.0 {
                         return Err("--target-rps must be >= 0".to_string());
                     }

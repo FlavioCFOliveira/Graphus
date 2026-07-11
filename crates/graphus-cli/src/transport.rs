@@ -131,9 +131,9 @@ fn parse_authority(authority: &str, url: &str) -> Result<(String, u16), String> 
 
     // Bracketed IPv6: `[addr]` or `[addr]:port`.
     if let Some(rest) = authority.strip_prefix('[') {
-        let (addr, after) = rest
-            .split_once(']')
-            .ok_or_else(|| format!("invalid Bolt URL {url:?}: unterminated IPv6 literal (missing ']')"))?;
+        let (addr, after) = rest.split_once(']').ok_or_else(|| {
+            format!("invalid Bolt URL {url:?}: unterminated IPv6 literal (missing ']')")
+        })?;
         if addr.is_empty() {
             return Err(format!("invalid Bolt URL {url:?}: empty IPv6 host"));
         }

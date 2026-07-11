@@ -30,16 +30,20 @@ use graphus_examples_harness::{EvidenceReport, ServerMetricsSection, scrape};
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
-    let (evidence_dir, before_path, after_path, database) =
-        match (args.next(), args.next(), args.next(), args.next()) {
-            (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
-            _ => {
-                eprintln!(
-                    "usage: inject_server_metrics <evidence-dir> <metrics-before> <metrics-after> <database>"
-                );
-                return ExitCode::FAILURE;
-            }
-        };
+    let (evidence_dir, before_path, after_path, database) = match (
+        args.next(),
+        args.next(),
+        args.next(),
+        args.next(),
+    ) {
+        (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+        _ => {
+            eprintln!(
+                "usage: inject_server_metrics <evidence-dir> <metrics-before> <metrics-after> <database>"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
 
     let report_path = format!("{}/report.json", evidence_dir.trim_end_matches('/'));
     let mut report = match EvidenceReport::load(&report_path) {

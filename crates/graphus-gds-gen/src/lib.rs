@@ -504,9 +504,7 @@ impl Dataset {
             "CREATE CONSTRAINT author_h_index_integer IF NOT EXISTS FOR (a:Author) REQUIRE a.h_index IS :: INTEGER;\n",
         );
         // Node RANGE index on the planted field id (the community filter / grouping access path).
-        s.push_str(
-            "CREATE INDEX author_field_range IF NOT EXISTS FOR (a:Author) ON (a.field);\n",
-        );
+        s.push_str("CREATE INDEX author_field_range IF NOT EXISTS FOR (a:Author) ON (a.field);\n");
         // Relationship RANGE index on the citation weight — the "high-weight citations" access path
         // (Graphus serves an equality seek from it; a `>=` range stays a scan + filter — rmp #680).
         s.push_str(

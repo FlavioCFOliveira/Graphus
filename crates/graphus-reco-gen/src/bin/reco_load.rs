@@ -210,7 +210,9 @@ impl Args {
         match (&rest, &bolt) {
             (None, None) => return Err("one of --rest or --bolt is required".to_owned()),
             (Some(_), Some(_)) => {
-                return Err("--rest and --bolt are mutually exclusive (pick one transport)".to_owned());
+                return Err(
+                    "--rest and --bolt are mutually exclusive (pick one transport)".to_owned(),
+                );
             }
             _ => {}
         }
@@ -455,7 +457,10 @@ const BOLT_IO_TIMEOUT: Duration = Duration::from_secs(300);
 /// Any connect/login failure, a server `FAILURE` on a write, a shape mismatch, or a recommendation
 /// family that does not return a well-formed result.
 fn run_bolt(args: &Args) -> Result<(), String> {
-    let url_str = args.bolt.as_deref().ok_or("Bolt mode requires --bolt <url>")?;
+    let url_str = args
+        .bolt
+        .as_deref()
+        .ok_or("Bolt mode requires --bolt <url>")?;
     let url = BoltUrl::parse(url_str)?;
     let mut load = BoltLoad::connect(&url, &args.db, &args.user, &args.password)?;
     eprintln!(
@@ -623,7 +628,12 @@ impl BoltLoad {
     }
 
     /// Runs one write/statement, discarding the rows; a server `FAILURE` is surfaced as an `Err`.
-    fn write(&mut self, what: &str, cypher: &str, params: Vec<(String, Value)>) -> Result<(), String> {
+    fn write(
+        &mut self,
+        what: &str,
+        cypher: &str,
+        params: Vec<(String, Value)>,
+    ) -> Result<(), String> {
         self.client
             .run(cypher, params, &self.db)
             .map(|_| ())
@@ -653,7 +663,8 @@ impl BoltLoad {
         let got = qr
             .first_scalar()
             .ok_or_else(|| format!("count query {cypher:?} did not return a scalar integer"))?;
-        u64::try_from(got).map_err(|_| format!("count query {cypher:?} returned a negative count {got}"))
+        u64::try_from(got)
+            .map_err(|_| format!("count query {cypher:?} returned a negative count {got}"))
     }
 
     /// Asserts a count equals `expected`.

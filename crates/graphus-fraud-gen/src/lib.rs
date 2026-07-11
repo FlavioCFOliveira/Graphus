@@ -880,7 +880,8 @@ mod tests {
             let gt = &d.ground_truth;
 
             // Tally device -> edge count over ALL transfers.
-            let mut by_device: std::collections::BTreeMap<i64, usize> = std::collections::BTreeMap::new();
+            let mut by_device: std::collections::BTreeMap<i64, usize> =
+                std::collections::BTreeMap::new();
             for t in &d.transfers {
                 *by_device.entry(t.device).or_default() += 1;
             }
@@ -912,21 +913,33 @@ mod tests {
                 profile.name()
             );
             for c in &gt.collusion {
-                assert!(c.device >= MULE_DEVICE_BASE, "{}: fraud device in high namespace", profile.name());
+                assert!(
+                    c.device >= MULE_DEVICE_BASE,
+                    "{}: fraud device in high namespace",
+                    profile.name()
+                );
                 assert!(
                     c.ip.starts_with("172.16.") || c.ip.starts_with("172.17."),
                     "{}: fraud IP in 172.16/172.17, got {}",
                     profile.name(),
                     c.ip
                 );
-                assert!(c.edge_count >= 2, "{}: a cluster shares >= 2 edges", profile.name());
+                assert!(
+                    c.edge_count >= 2,
+                    "{}: a cluster shares >= 2 edges",
+                    profile.name()
+                );
             }
             // Benign transfers never touch a 172.x IP.
             let benign_ip_leak = d.transfers.iter().any(|t| {
                 (t.ip.starts_with("172.16.") || t.ip.starts_with("172.17."))
                     && !gt.collusion.iter().any(|c| c.device == t.device)
             });
-            assert!(!benign_ip_leak, "{}: no benign edge carries a fraud IP", profile.name());
+            assert!(
+                !benign_ip_leak,
+                "{}: no benign edge carries a fraud IP",
+                profile.name()
+            );
         }
     }
 
@@ -942,17 +955,36 @@ mod tests {
             let benign = (cfg.legit_accounts) as usize;
             let _ = benign;
             // One customer per account; accounts = legit + ring members + (mule + fan_in + fan_out).
-            assert_eq!(d.customers.len(), d.accounts.len(), "{}: one customer per account", profile.name());
+            assert_eq!(
+                d.customers.len(),
+                d.accounts.len(),
+                "{}: one customer per account",
+                profile.name()
+            );
 
             // Amount floors: fraud edges (172.x device namespace) are >= 2000; benign edges are < 900.
             for t in &d.transfers {
-                let is_fraud = d.ground_truth.collusion.iter().any(|c| c.device == t.device);
+                let is_fraud = d
+                    .ground_truth
+                    .collusion
+                    .iter()
+                    .any(|c| c.device == t.device);
                 if is_fraud {
-                    assert!(t.amount >= 2_000, "{}: fraud edge amount below floor: {}", profile.name(), t.amount);
+                    assert!(
+                        t.amount >= 2_000,
+                        "{}: fraud edge amount below floor: {}",
+                        profile.name(),
+                        t.amount
+                    );
                 } else {
                     // Benign amounts are drawn from the inclusive range [1, 900], well under the
                     // mule (>= 2000) and ring (>= 9000) detection floors.
-                    assert!(t.amount <= 900, "{}: benign edge amount above floor: {}", profile.name(), t.amount);
+                    assert!(
+                        t.amount <= 900,
+                        "{}: benign edge amount above floor: {}",
+                        profile.name(),
+                        t.amount
+                    );
                 }
             }
 
@@ -960,7 +992,11 @@ mod tests {
             let ids: std::collections::BTreeSet<i64> = d.accounts.iter().map(|a| a.id).collect();
             for c in &d.ground_truth.collusion {
                 for a in &c.accounts {
-                    assert!(ids.contains(a), "{}: collusion account {a} missing from node set", profile.name());
+                    assert!(
+                        ids.contains(a),
+                        "{}: collusion account {a} missing from node set",
+                        profile.name()
+                    );
                 }
             }
         }

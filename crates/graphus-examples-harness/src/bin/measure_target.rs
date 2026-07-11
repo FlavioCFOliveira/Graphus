@@ -210,7 +210,10 @@ fn main() -> ExitCode {
 
 /// Checks the host-independent health invariants that replace the baseline diff in external mode.
 /// Returns `Err` with one message per violated invariant.
-fn check_invariants(server: &ServerMetricsSection, max_abort_rate: Option<f64>) -> Result<(), Vec<String>> {
+fn check_invariants(
+    server: &ServerMetricsSection,
+    max_abort_rate: Option<f64>,
+) -> Result<(), Vec<String>> {
     let mut v = Vec::new();
     if server.statement_panics != 0 {
         v.push(format!(
@@ -270,19 +273,32 @@ fn parse_args() -> Result<Args, String> {
             "--nodes" => args.nodes = value()?.parse().map_err(|e| format!("--nodes: {e}"))?,
             "--rels" => args.rels = value()?.parse().map_err(|e| format!("--rels: {e}"))?,
             "--peak-rss-bytes" => {
-                args.peak_rss_bytes =
-                    Some(value()?.parse().map_err(|e| format!("--peak-rss-bytes: {e}"))?)
+                args.peak_rss_bytes = Some(
+                    value()?
+                        .parse()
+                        .map_err(|e| format!("--peak-rss-bytes: {e}"))?,
+                )
             }
             "--workload-ops" => {
-                args.workload_ops =
-                    Some(value()?.parse().map_err(|e| format!("--workload-ops: {e}"))?)
+                args.workload_ops = Some(
+                    value()?
+                        .parse()
+                        .map_err(|e| format!("--workload-ops: {e}"))?,
+                )
             }
             "--workload-secs" => {
-                args.workload_secs =
-                    Some(value()?.parse().map_err(|e| format!("--workload-secs: {e}"))?)
+                args.workload_secs = Some(
+                    value()?
+                        .parse()
+                        .map_err(|e| format!("--workload-secs: {e}"))?,
+                )
             }
-            "--p50-ms" => args.p50_ms = Some(value()?.parse().map_err(|e| format!("--p50-ms: {e}"))?),
-            "--p99-ms" => args.p99_ms = Some(value()?.parse().map_err(|e| format!("--p99-ms: {e}"))?),
+            "--p50-ms" => {
+                args.p50_ms = Some(value()?.parse().map_err(|e| format!("--p50-ms: {e}"))?)
+            }
+            "--p99-ms" => {
+                args.p99_ms = Some(value()?.parse().map_err(|e| format!("--p99-ms: {e}"))?)
+            }
             "--p999-ms" => {
                 args.p999_ms = Some(value()?.parse().map_err(|e| format!("--p999-ms: {e}"))?)
             }
@@ -290,8 +306,11 @@ fn parse_args() -> Result<Args, String> {
                 args.abort_rate = Some(value()?.parse().map_err(|e| format!("--abort-rate: {e}"))?)
             }
             "--max-abort-rate" => {
-                args.max_abort_rate =
-                    Some(value()?.parse().map_err(|e| format!("--max-abort-rate: {e}"))?)
+                args.max_abort_rate = Some(
+                    value()?
+                        .parse()
+                        .map_err(|e| format!("--max-abort-rate: {e}"))?,
+                )
             }
             "--assert" => args.assert_invariants = true,
             "--param" => {
@@ -333,7 +352,11 @@ mod tests {
     use super::*;
 
     fn section(text_before: &str, text_after: &str, db: &str) -> ServerMetricsSection {
-        ServerMetricsSection::from_snapshots(&scrape::parse(text_before), &scrape::parse(text_after), db)
+        ServerMetricsSection::from_snapshots(
+            &scrape::parse(text_before),
+            &scrape::parse(text_after),
+            db,
+        )
     }
 
     #[test]
