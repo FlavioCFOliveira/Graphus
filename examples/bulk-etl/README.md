@@ -357,18 +357,18 @@ example), assembled by `bulk_evidence`. The headline metrics:
 | `phases[import].millis` / `total_millis` | **end-to-end** import wall time |
 | `storage.store_bytes` / `store_pages` | the durable `graph.store` image |
 | `storage.wal_bytes` / `wal_pages` | the retained `graph.wal` redo log |
-| `storage.space_amplification` | on-disk **store bytes-per-node** (the gated per-element cost) |
-| `storage.write_amplification` | on-disk **store bytes-per-edge** (the gated per-element cost) |
-| `workload.storage_bytes_per_node` / `storage_bytes_per_edge` | the SAME per-element costs under **explicit, unambiguous names** — because the fixed `storage` section reuses its `space_amplification` / `write_amplification` fields to carry them (`rmp #695`) |
-| `workload.store_space_amplification` / `total_space_amplification` / `csv_write_amplification` | the CSV-relative amplifications (human visibility, not gated) |
+| `storage.bytes_per_node` / `bytes_per_relationship` | on-disk **store per-element costs** (the gated, deterministic figures) |
+| `storage.space_amplification` / `write_amplification` | the **real amplification ratios** — durable bytes vs the logical CSV input |
+| `workload.store_space_amplification` / `total_space_amplification` / `csv_write_amplification` | the same CSV-relative amplifications, split store-only vs with-WAL (human visibility) |
 | `workload.content_hash` | the round-trip content hash (lossless evidence) |
 
-> **Field disambiguation (`rmp #695`).** The shared evidence schema's `storage` section has exactly two
-> per-element float fields, which this example overloads to carry **bytes-per-node** (`space_amplification`)
-> and **bytes-per-edge** (`write_amplification`) — the deterministic figures the baseline gate holds. To
-> avoid any mislabelling, the SAME numbers are also published under the explicitly-named workload params
-> `storage_bytes_per_node` / `storage_bytes_per_edge`. (True *amplification* ratios vs the logical CSV
-> input are the `*_amplification` workload params.)
+> **Every field carries the quantity its name promises (`rmp #699`).** This example used to **overload**
+> the amplification fields to smuggle the per-element costs it wanted gated: `space_amplification`
+> carried bytes-per-node and `write_amplification` carried bytes-per-edge. The committed baseline
+> therefore read `"space_amplification": 1239.04` — anyone (or any gate) trusting the field name would
+> have concluded the store had **1239× space amplification**, when the real figure is **46.78×**. The
+> schema now has dedicated `bytes_per_node` / `bytes_per_relationship` fields, the harness diff gates
+> those per-element costs directly, and the amplification fields carry only amplification.
 
 ### Wire (server-side) evidence — `evidence/wire/`
 
