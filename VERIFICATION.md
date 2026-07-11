@@ -21,6 +21,7 @@ how CI should schedule it.
 | 6 | Criterion regression gate | `graphus-bench` (`bin/bench_gate`, `baseline.toml`) | every push (release) | ~1–2 s |
 | 7 | Criterion micro-benchmark suites | `graphus-bench/benches/*`, `graphus-io/benches/loopback` | manual / perf job | minutes |
 | 8 | LDBC-SNB macro harness | `graphus-bench` (`bin/ldbc_snb`, `src/ldbc/`) | nightly / perf job | seconds (tiny) |
+| 9 | Examples suite — E2E, both modes | `examples/run-all.sh` via `scripts/examples-gate.sh` | every push | ~2–4 min |
 
 ---
 
@@ -303,10 +304,54 @@ generator's ground-truth by `cargo test -p graphus-bench`.
 
 ---
 
+## 9. Examples suite — end-to-end, in both modes (AC: "every example still passes, against a self-booted AND an already-running instance")
+
+The twelve examples under `examples/` are not documentation: each one boots a **real
+`graphus-server`**, drives it over its public surface (a Neo4j driver / Bolt / REST / UDS), asserts
+every step, and collects evidence across all of Graphus's performance vectors. They are the project's
+instrument for exposing regressions, fragilities and resource inefficiencies in a real end-to-end
+server — which is exactly why they are a **gate** and not a demo.
+
+They earned that status the hard way. For as long as nothing ran them, they rotted in place: a failing
+example sat on `main` unnoticed; reports published fabricated zeros (`bytes_per_node: 0.0` —
+"this graph costs nothing to store" — with a baseline gate comparing 0.0 against 0.0 and passing); and
+a durability example that only *sometimes* injected the crash it claimed to inject still went green.
+Every one of those defects was found the moment the suite was actually executed. An example that is
+never run cannot expose anything.
+
+```sh
+scripts/examples-gate.sh            # both modes — this is what verify.sh runs
+scripts/examples-gate.sh --local    # self-boot mode only
+scripts/examples-gate.sh --attach   # attach mode only (boots the target instance itself)
+```
+
+The gate runs the suite **twice**, because the examples make two distinct promises and each can rot
+on its own:
+
+- **LOCAL** — every example self-boots its own server and measures it directly (`/proc` CPU and RSS,
+  on-disk store and WAL bytes). This is the only mode that can produce the process and storage
+  vectors, so it is also the only mode a committed baseline may be captured from.
+- **ATTACH** — the gate boots ONE instance exactly as the container image does (self-signed TLS,
+  Bolt-TCP + REST + UDS, an admin identity) and points every attach-capable example at it via the
+  `GRAPHUS_TARGET_*` seam; each example isolates itself in a run-scoped database. This proves the
+  "runnable against an already-running Graphus, local **or remote**" promise on every run instead of
+  asserting it in a README. The two durability examples are local-only by construction — they SIGKILL
+  the server to prove crash recovery, so they cannot target a shared instance.
+
+**Expected:** every example passes in both modes; the suite's own **evidence-honesty audit** passes
+(no report emits a zero for a metric it did not measure); and the attach target survives the whole
+suite with **no panic and no force-detach** — a server that dies under the examples is a server
+finding, not a test artefact, and no per-example verdict can see it.
+
+**Runtime:** ~2–4 minutes for both modes at the examples' default profiles. The larger profiles
+(`SOCIAL_PROFILE=large`, `FRAUD_PROFILE=large`, …) are for real evaluation, not for the gate.
+
+---
+
 ## Quick start
 
 ```sh
-# Fast gates only (build/clippy/fmt, anomaly, proptest, regression gate, LDBC) — every push:
+# Fast gates only (build/clippy/fmt, anomaly, proptest, regression gate, LDBC, examples) — every push:
 scripts/verify.sh
 
 # Add the slow gates as needed:

@@ -7,6 +7,7 @@
 #   3. proptest invariants (codec round-trips + order-preserving key codec)
 #   4. the criterion regression gate (vs the committed baseline)
 #   5. the LDBC-SNB macro harness (tiny scale)
+#   6. the examples suite, in BOTH modes (self-boot + attached to a running instance)
 #
 # The SLOW gates are deliberately NOT run here (they are documented in VERIFICATION.md and run on a
 # nightly/manual job): the loom model-check, the miri UB gate, the full Criterion suites, and any
@@ -50,8 +51,16 @@ cargo test -p graphus-cypher --test proptest_keycodec
 step "4/5  criterion regression gate — vs committed baseline (release)"
 cargo run -q -p graphus-bench --release --bin bench_gate
 
-step "5/5  LDBC-SNB macro harness — tiny scale (release)"
+step "5/6  LDBC-SNB macro harness — tiny scale (release)"
 cargo run -q -p graphus-bench --release --bin ldbc_snb
+
+# The examples are the project's instrument for exposing regressions and resource inefficiencies in a
+# REAL, end-to-end server. They only work as an instrument if they are actually run — every one of the
+# evidence defects this gate now guards against (a failing example sitting unnoticed on `main`, reports
+# publishing fabricated zeros, a baseline gate comparing 0.0 to 0.0) survived precisely because nothing
+# executed the suite. It runs BOTH modes: self-boot, and attached to an already-running instance.
+step "6/6  examples suite — E2E, both modes (self-boot + attach to a running instance)"
+scripts/examples-gate.sh
 
 if [ "$WITH_LOOM" = "1" ]; then
     step "loom model-check — buffer-pool latch protocol (slow)"
