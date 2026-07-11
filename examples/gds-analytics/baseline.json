@@ -1,8 +1,8 @@
 {
-  "version": 1,
+  "version": 2,
   "metadata": {
     "scenario": "gds-analytics",
-    "description": "GDS analytics over Bolt/TCP+TLS via the official Neo4j driver: load a seeded influence network, run the full gds.* suite over the CSR projection, assert the analytically-known reference outputs, and characterise multi-threaded per-algorithm scaling (real sequential-vs-parallel speedup, deterministic across thread widths) + CSR footprint.",
+    "description": "GDS analytics over Bolt/TCP+TLS via the official Neo4j driver: load a seeded influence network, assert the analytically-known reference outputs, compare weighted vs unweighted rankings, exercise write/mutate/stats, and characterise multi-threaded per-algorithm scaling + CSR footprint.",
     "dataset": {
       "nodes": 4320,
       "relationships": 86336
@@ -15,19 +15,23 @@
       "host_cores": "16",
       "loaded_network_nodes": "166",
       "loaded_network_rels": "1102",
+      "parallel_demo_field_size": "360",
+      "parallel_demo_node_count": "1440",
+      "parallel_deterministic_across_widths": "true",
+      "parallel_max_speedup": "9.7797",
+      "parallel_thread_widths": "1,2,16",
       "profile": "fast",
-      "reference_csr_bytes": "514332",
-      "reference_csr_bytes_per_edge": "5.9573",
-      "reference_csr_bytes_per_node": "119.0583",
+      "reference_csr_bytes": "514492",
+      "reference_csr_bytes_per_edge": "5.9592",
+      "reference_csr_bytes_per_node": "119.0954",
       "reference_edge_count": "86336",
       "reference_field_size": "1080",
       "reference_node_count": "4320",
-      "server_store_bytes": "262144",
-      "server_wal_bytes": "2990763",
       "sweep_field_sizes": "40,120,360,1080",
+      "sweep_measurements": "36",
       "sweep_repeats": "3"
     },
-    "started_unix_secs": 1781947007
+    "started_unix_secs": 1783750125
   },
   "host": {
     "os": "linux",
@@ -35,76 +39,82 @@
     "cpu_cores": 16,
     "hostname": "ROG",
     "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
-    "timestamp_unix_secs": 1781947007
+    "timestamp_unix_secs": 1783750125
   },
-  "total_millis": 0.064842,
+  "total_millis": 4299.0,
   "phases": [
     {
       "name": "betweenness",
-      "millis": 1805.8059
+      "millis": 285.52509999999995
     },
     {
       "name": "closeness",
-      "millis": 490.876
+      "millis": 50.939699999999995
     },
     {
       "name": "degree",
-      "millis": 0.0023
+      "millis": 0.0034000000000000002
     },
     {
       "name": "dijkstra",
-      "millis": 0.23929999999999998
+      "millis": 0.2947
     },
     {
       "name": "labelPropagation",
-      "millis": 4.2673
+      "millis": 1.8224
     },
     {
       "name": "pageRank",
-      "millis": 1.9200000000000002
+      "millis": 2.0383
     },
     {
       "name": "scc",
-      "millis": 0.1888
+      "millis": 0.23479999999999998
     },
     {
       "name": "triangleCount",
-      "millis": 3.7529
+      "millis": 0.7810999999999999
     },
     {
       "name": "wcc",
-      "millis": 0.2653
+      "millis": 0.3247
     }
   ],
   "cpu": {
-    "user_secs": 2.43,
-    "system_secs": 0.2,
-    "mean_core_utilisation": 0.526
+    "user_secs": 0.26,
+    "system_secs": 0.19,
+    "mean_core_utilisation": 0.225
   },
   "memory": {
-    "peak_rss_bytes": 182132736,
-    "final_rss_bytes": 182132736
+    "peak_rss_bytes": 144273408,
+    "final_rss_bytes": 144273408
   },
   "storage": {
-    "store_bytes": 514332,
-    "wal_bytes": 0,
-    "store_pages": 0,
-    "wal_pages": 0,
-    "bytes_fsynced": 0,
-    "write_amplification": 5.9573,
-    "space_amplification": 119.0583
+    "store_bytes": 270336,
+    "wal_bytes": 1566446,
+    "store_pages": 33,
+    "wal_pages": 192,
+    "bytes_fsynced": 1566446,
+    "write_amplification": 16.54967293172112,
+    "space_amplification": 16.54967293172112,
+    "bytes_per_node": 0.0,
+    "bytes_per_relationship": 0.0,
+    "plateau_ratio": 0.0
   },
   "throughput": {
-    "operations": 1303,
-    "ops_per_sec": 0.0,
-    "p50_latency_ms": 3.0740000009536743,
-    "p99_latency_ms": 5.965999960899353,
-    "p999_latency_ms": 16.866999983787537,
+    "operations": 48,
+    "ops_per_sec": 83.33333333333334,
+    "p50_latency_ms": 2.8320000022649765,
+    "p99_latency_ms": 125.34400000050664,
+    "p999_latency_ms": 125.34400000050664,
     "abort_rate": 0.0
   },
+  "measurement_mode": "local",
   "notes": [
-    "Live CPU/RAM is graphus-server pid 1252958 over 5.000s uptime (the official-driver load + analyze path). The per-algorithm timings + CSR footprint below come from the hermetic, multi-threaded gds_sweep, which runs identically with or without a server. Note: the phase timings here are from the ORIGINAL reference run (linux/x86_64 'ROG', 16 cores) — they are illustrative, machine-variant and NOT gated; the sweep's default-execution algorithms are now parallel above threshold, and the sweep additionally measures a real sequential-vs-parallel speedup that is deterministic across thread widths.",
-    "storage.store_bytes is the reference CSR-projection footprint (CsrGraph::memory_bytes at the largest swept size); storage.space_amplification = CSR bytes-per-node and storage.write_amplification = CSR bytes-per-edge. These DETERMINISTIC structural metrics are what the baseline gate holds to a tight band \u2014 they are identical with or without a live server. CPU/RAM/wall-time and the live server's on-disk store/WAL footprint (workload params server_store_bytes / server_wal_bytes) are machine-/path-variant and are NOT gated.",
-    "COMMITTED BASELINE (rmp #263): the fast-profile reference run for the regression gate. Only STABLE STRUCTURAL metrics are gated by gds_baseline_cmp \u2014 the reference graph size (dataset.nodes/relationships, the largest swept size), the algorithm_count, and the DETERMINISTIC CSR-projection footprint (storage.store_bytes = CSR bytes, storage.space_amplification = CSR bytes-per-node, storage.write_amplification = CSR bytes-per-edge), each within a 15% band. CPU/RAM/wall-time/latency and the live server's on-disk store/WAL are machine-/path-variant and are NOT gated. Recorded on linux/x86_64."
+    "Live CPU/RAM is graphus-server pid 133622 over 2.000s uptime (the official-driver load + analyze path). The per-algorithm timings + CSR footprint below come from the hermetic, multi-threaded gds_sweep, which computes the same results with or without a server.",
+    "storage.bytes_fsynced is a proxy: the WAL on-disk byte count (every committed WAL byte is fsynced before commit acknowledgement), not a directly-observed fsync counter.",
+    "storage.* is the live server's REAL on-disk footprint: the graphus.store image plus the graphus.wal DIRECTORY of segment files (walked by PATH — the WAL is a directory, and a meter keying off the leaf file name would report wal_bytes=0 and hide the redo log). The amplification ratios are the durable bytes over the generator's logical Cypher bytes.",
+    "The GDS engine's RESIDENT CSR projection at the reference size is 514492 bytes (119.10 B/node, 5.96 B/edge) — a MEMORY footprint, not storage. It is DETERMINISTIC (identical with or without a live server) and is what gds_baseline_cmp holds to a tight band, from the reference_csr_bytes / reference_csr_bytes_per_node / reference_csr_bytes_per_edge workload params. It used to be smuggled into storage.store_bytes + the two amplification fields, which made this report incomparable with every other example's (rmp #699).",
+    "Parallelism demonstration (rmp #342/#559): at field_size 360 (1440 nodes) each parallel GDS algorithm was timed sequential-vs-parallel across thread widths [1, 2, 16]. The results were IDENTICAL across every width (deterministic_across_widths=true) — bit-identical for the integer algorithms, within the documented f64 tolerance for PageRank/centrality. Best measured speedup: 9.78x (per algorithm: pageRank 1.01x, betweenness 5.76x, closeness 9.78x, wcc 0.82x, triangleCount 2.11x, degree 0.26x). The speedup magnitude is machine-/load-variant and is NOT gated; the cross-width determinism is an invariant of the GDS Execution knob and holds on every run."
   ]
 }

@@ -40,6 +40,7 @@ import argparse
 import json
 import os
 import ssl
+import time
 import urllib.error
 import urllib.request
 
@@ -59,6 +60,10 @@ class RestClient:
                 self.ctx.verify_mode = ssl.CERT_NONE
         else:
             self.ctx = None
+        # Per-request wall times (ms) of every /db/{db}/tx/commit this client issues — the REAL
+        # latency of an RBAC-enforced REST request. The evidence report used to carry hardcoded
+        # p50/p99/p999 = 0.000 placeholders because nothing ever measured them (rmp #699).
+        self.request_ms = []
 
     def _open(self, req):
         if self.ctx is not None:
@@ -97,16 +102,33 @@ class RestClient:
         req.add_header("Content-Type", "application/json")
         if token is not None:
             req.add_header("Authorization", "Bearer " + token)
+        t0 = time.perf_counter()
         try:
             resp = self._open(req)
-            return resp.status, resp.read()
+            out = (resp.status, resp.read())
         except urllib.error.HTTPError as e:
-            return e.code, e.read()
+            out = (e.code, e.read())
+        # Timed on BOTH paths: a 403 the RBAC gate rejects is as much a served request as a 200, and
+        # excluding it would bias the percentiles towards the allowed cells only.
+        self.request_ms.append((time.perf_counter() - t0) * 1000.0)
+        return out
 
 
 # --------------------------------------------------------------------------------------------------
 # .cypher parsing + strict-Jolt cell decoding.
 # --------------------------------------------------------------------------------------------------
+def percentile_ms(sorted_ms, q):
+    """The ``q``-quantile of an ALREADY-SORTED list of millisecond samples (nearest-rank).
+
+    Returns ``0.0`` only for an empty sample — which honestly means "nothing was measured", never a
+    stand-in for a latency that was simply never collected.
+    """
+    if not sorted_ms:
+        return 0.0
+    k = min(len(sorted_ms) - 1, max(0, int(round(q * (len(sorted_ms) - 1)))))
+    return round(sorted_ms[k], 4)
+
+
 def parse_statements(path):
     """Splits a .cypher file into individual statements (comment/blank lines stripped)."""
     out, buf = [], ""
@@ -423,6 +445,13 @@ def main():
 
     if FAILURES == 0:
         print("GRAPHUS_RBAC_OK")
+        # REAL per-request latency of the RBAC-enforced REST calls this client issued (rmp #699).
+        # `rest_workload_secs` is the summed wall-time of those requests: this client is serial (one
+        # request at a time), so that sum IS the window they were issued in, and
+        # `rest_requests / rest_workload_secs` is a real achieved rate. The report previously carried
+        # p50/p99/p999 = 0.000 placeholders and an ops_per_sec of `seeded_statements / server-uptime`,
+        # neither of which was ever measured.
+        lat = sorted(client.request_ms)
         stats = {
             "tenants": len(manifest["tenants"]),
             "roles": len(manifest["roles"]),
@@ -438,6 +467,11 @@ def main():
             "cross_tenant_probes": xt_asserted,
             "cross_tenant_denied": xt_denied,
             "cross_tenant_empty": xt_empty,
+            "rest_requests": len(lat),
+            "rest_workload_secs": round(sum(lat) / 1000.0, 6),
+            "p50_ms": percentile_ms(lat, 0.50),
+            "p99_ms": percentile_ms(lat, 0.99),
+            "p999_ms": percentile_ms(lat, 0.999),
         }
         print("GRAPHUS_STATS " + json.dumps(stats, separators=(",", ":")))
         return 0

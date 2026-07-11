@@ -24,23 +24,38 @@
 //!   size, each phase's `millis` being that algorithm's wall time. This is exactly what a phase is (a
 //!   named unit of work + its duration), so per-algorithm timing reads naturally in both `report.md`
 //!   (the "Phase timings" table) and `report.json`.
-//! - **`workload`** params — the structural CSR footprint at the reference size (`csr_bytes`,
-//!   `bytes_per_node`, `bytes_per_edge`), the swept sizes, and the algorithm count: the **stable**
-//!   metrics the baseline gate holds to a tight band.
-//! - **`storage`** section — populated EXCLUSIVELY from the reference CSR footprint:
-//!   `store_bytes` = `csr_bytes`, `space_amplification` = `bytes_per_node`, `write_amplification` =
-//!   `bytes_per_edge`. The projection IS the GDS engine's resident "storage", and this footprint is
-//!   DETERMINISTIC (identical with or without a live server), so the harness's `compare_to_baseline`
-//!   gates it with its existing storage thresholds. The live server's PATH-dependent on-disk
-//!   store/WAL footprint is recorded in the workload params (`server_store_bytes` / `server_wal_bytes`)
-//!   for human visibility, NOT in the gated storage section.
+//! - **`workload`** params — the structural CSR footprint at the reference size
+//!   (`reference_csr_bytes`, `reference_csr_bytes_per_node`, `reference_csr_bytes_per_edge`), the
+//!   swept sizes, and the algorithm count: the **stable**, machine-independent metrics the baseline
+//!   gate (`gds_baseline_cmp`) holds to a tight band.
+//! - **`storage`** section — the **real on-disk** store image + WAL **directory** of the live server,
+//!   when the official-driver path ran; honest zeros on the hermetic path (there is no server, so
+//!   there is no on-disk footprint). Every field means exactly what its name says.
 //! - **`dataset`** — the reference graph size (nodes / relationships), byte-stable for a fixed seed.
-//! - **`throughput.operations`** — the per-size × per-algorithm measurement count (how much work the
-//!   sweep did), with `ops_per_sec` left at the honest `0.0` (the sweep reports per-algorithm time,
-//!   not an aggregate ops/sec).
+//! - **`throughput`** — the official-driver workload's real operation count, rate and latency
+//!   percentiles when that path ran; honestly zero (= not measured) when it did not.
 //!
 //! This keeps [`SCHEMA_VERSION`](graphus_examples_harness::SCHEMA_VERSION) stable while giving a
 //! faithful per-algorithm view.
+//!
+//! # Evidence honesty (`rmp #699`)
+//!
+//! Two fields used to carry something other than what they are named, which made this report
+//! incomparable with every other example's and misled anything that trusted the schema:
+//!
+//! * `storage.space_amplification` carried the CSR **bytes-per-node** and `storage.write_amplification`
+//!   the CSR **bytes-per-edge** — per-element COSTS smuggled into amplification RATIO fields (the
+//!   committed baseline read `space_amplification: 119.06`, which anyone would read as a 119x space
+//!   amplification). Those two deterministic figures were always ALSO published, correctly named, as
+//!   the `reference_csr_bytes_per_node` / `_per_edge` workload params, so the gate now reads them
+//!   from there and the amplification fields carry real ratios (durable bytes vs the logical dataset).
+//! * `storage.store_bytes` carried the CSR projection's RESIDENT size while being documented as the
+//!   on-disk store, and `wal_bytes` was left at `0` — so the report claimed the run wrote no redo log
+//!   at all. The section now measures the server's real store file and WAL **directory**.
+//!
+//! `total_millis` likewise timed this binary's own report emission (the sweep and the driver workload
+//! both finished long before it ran); it is now the workload wall-time the example measured and
+//! passes in `--total-millis`.
 //!
 //! # Usage
 //!
@@ -50,15 +65,15 @@
 //!   --scenario gds-analytics --description <text> \
 //!   [--pid <server-pid> --uptime-secs <f64> --store <path> --wal <path> --peak-rss-bytes <u64>] \
 //!   [--nodes <u64> --rels <u64>] \
-//!   [--p50-ms <f64> --p99-ms <f64> --p999-ms <f64> --workload-ops <u64>] \
+//!   [--total-millis <f64>] \
+//!   [--p50-ms <f64> --p99-ms <f64> --p999-ms <f64> --workload-ops <u64> --workload-secs <f64>] \
+//!   [--logical-graph-bytes <u64>] \
 //!   [--param key=value]... [--note <text>]...
 //! ```
 //!
 //! The live-server flags are all optional: when `run.sh` skipped the driver path (`RUN_DRIVER=0` or
-//! no node/npm), the CPU/RAM sections honestly stay zero and the report still carries the full
-//! hermetic per-algorithm + (deterministic) CSR-footprint evidence. `--store`/`--wal` are read only
-//! to record the live server's on-disk footprint as workload params (never into the gated storage
-//! section).
+//! no node/npm), the CPU/RAM/storage/throughput sections honestly stay zero and the report still
+//! carries the full hermetic per-algorithm + (deterministic) CSR-footprint evidence.
 
 #![forbid(unsafe_code)]
 
@@ -120,10 +135,19 @@ struct Args {
     peak_rss_bytes: Option<u64>,
     nodes: Option<u64>,
     rels: Option<u64>,
+    /// The example's measured workload wall-time, in milliseconds. This binary runs AFTER the sweep
+    /// and the driver workload, so it cannot bracket them (`rmp #699`).
+    total_millis: Option<f64>,
     workload_ops: Option<u64>,
+    /// The window the driver's `workload_ops` were issued over — without it `ops_per_sec` cannot be
+    /// derived and stays at the honest `0.0`.
+    workload_secs: Option<f64>,
     p50_ms: Option<f64>,
     p99_ms: Option<f64>,
     p999_ms: Option<f64>,
+    /// Logical size of the loaded dataset (the generator's emitted Cypher bytes), for the REAL
+    /// amplification ratios. `None` ⇒ the ratios stay at "not measured" rather than being invented.
+    logical_graph_bytes: Option<u64>,
     params: Vec<(String, String)>,
     notes: Vec<String>,
 }
@@ -239,6 +263,10 @@ fn main() -> ExitCode {
     }
 
     collector.start();
+    // The sweep AND the driver workload both finished before this binary ran, so the collector cannot
+    // bracket them: use the wall-time the example measured. Otherwise total_millis would time this
+    // report's own emission (a few hundredths of a millisecond that read as if they were the run).
+    collector.record_total_duration_from(args.total_millis, args.workload_secs);
 
     // --- Per-algorithm timings: one PHASE per algorithm at the reference (largest swept) size.
     for (name, ms) in &reference.timings_ms {
@@ -274,43 +302,57 @@ fn main() -> ExitCode {
         );
     }
 
-    // --- Storage: the GDS example's gated "storage" is the DETERMINISTIC CSR-projection footprint,
-    // NOT the live server's on-disk store/WAL (which is path-dependent: huge under the driver path,
-    // zero on the hermetic path — gating it would make the baseline flaky). So the storage section is
-    // populated EXCLUSIVELY from the sweep's reference CSR footprint, keeping it identical with or
-    // without a server:
-    //   - store_bytes           = reference CSR total bytes (CsrGraph::memory_bytes)
-    //   - space_amplification   = CSR bytes-per-node
-    //   - write_amplification   = CSR bytes-per-edge
-    // The live server's on-disk store/WAL footprint, when the driver path measured it, is recorded in
-    // the workload params for human visibility (server_store_bytes / server_wal_bytes), NOT gated.
-    collector.storage_mut().store_bytes = reference.csr_bytes;
-    collector.storage_mut().space_amplification = reference.bytes_per_node;
-    collector.storage_mut().write_amplification = reference.bytes_per_edge;
+    // --- Storage: the live server's REAL on-disk footprint — the store image and the WAL, which is a
+    // DIRECTORY of segment files (`graphus.wal/seg.<lsn>`), walked by path. On the hermetic path there
+    // is no server and therefore no on-disk footprint, so the section honestly stays zero.
+    //
+    // The DETERMINISTIC CSR-projection footprint is NOT storage: it is the GDS engine's RESIDENT
+    // projection. It is published, correctly named, in the workload params (reference_csr_bytes /
+    // _per_node / _per_edge) and that is where `gds_baseline_cmp` gates it to a tight band — it used
+    // to be smuggled into store_bytes + the two amplification fields (rmp #699).
     if let (Some(store), Some(wal)) = (&args.store, &args.wal) {
-        let store_bytes = dir_or_file_bytes(store);
-        let wal_bytes = dir_or_file_bytes(wal);
-        let w = &mut collector.metadata_mut().workload;
-        w.insert("server_store_bytes".into(), store_bytes.to_string());
-        w.insert("server_wal_bytes".into(), wal_bytes.to_string());
+        if let Err(e) = collector.record_storage(store, wal, None) {
+            eprintln!("gds_evidence: failed to measure the on-disk store/WAL: {e}");
+            return ExitCode::FAILURE;
+        }
+        // Amplification: REAL ratios — the durable bytes the load actually produced over the logical
+        // dataset the generator emitted. Absent a logical figure they stay at the honest 0.0.
+        if let Some(logical) = args.logical_graph_bytes.filter(|b| *b > 0) {
+            collector.record_amplification(logical, logical);
+        }
+        collector.note(
+            "storage.* is the live server's REAL on-disk footprint: the graphus.store image plus the \
+             graphus.wal DIRECTORY of segment files (walked by PATH — the WAL is a directory, and a \
+             meter keying off the leaf file name would report wal_bytes=0 and hide the redo log). \
+             The amplification ratios are the durable bytes over the generator's logical Cypher bytes."
+                .to_string(),
+        );
+    } else {
+        collector.note(
+            "Hermetic run: no live server, so there is no on-disk footprint and the storage section \
+             is honestly zero (= not measured), not a stand-in for something else."
+                .to_string(),
+        );
     }
-    collector.note(
-        "storage.store_bytes is the reference CSR-projection footprint (CsrGraph::memory_bytes at \
-         the largest swept size); storage.space_amplification = CSR bytes-per-node and \
-         storage.write_amplification = CSR bytes-per-edge. These DETERMINISTIC structural metrics are \
-         what the baseline gate holds to a tight band — they are identical with or without a live \
-         server. CPU/RAM/wall-time and the live server's on-disk store/WAL footprint (workload \
-         params server_store_bytes / server_wal_bytes) are machine-/path-variant and are NOT gated."
-            .to_string(),
-    );
+    collector.note(format!(
+        "The GDS engine's RESIDENT CSR projection at the reference size is {} bytes ({:.2} B/node, \
+         {:.2} B/edge) — a MEMORY footprint, not storage. It is DETERMINISTIC (identical with or \
+         without a live server) and is what gds_baseline_cmp holds to a tight band, from the \
+         reference_csr_bytes / reference_csr_bytes_per_node / reference_csr_bytes_per_edge workload \
+         params. It used to be smuggled into storage.store_bytes + the two amplification fields, \
+         which made this report incomparable with every other example's (rmp #699).",
+        reference.csr_bytes, reference.bytes_per_node, reference.bytes_per_edge,
+    ));
 
-    // --- Throughput: the sweep's total per-size × per-algorithm measurement count is the honest
-    // "operations" figure; ops/sec is left at 0.0 (the sweep reports per-algorithm time, not an
-    // aggregate rate). The latency percentiles come from the driver path when it ran.
-    let measurements = sweep.sizes.iter().map(|s| s.timings_ms.len() as u64).sum();
-    collector.throughput_mut().operations = measurements;
+    // --- Throughput: the official-driver workload's REAL operations, rate and latency percentiles.
+    // The hermetic sweep reports per-algorithm WALL TIME (the phases above), not an operation rate,
+    // so with no driver path the whole section honestly stays zero rather than carrying the sweep's
+    // measurement COUNT dressed up as "operations" with a 0.0 ops/sec beside it.
     if let Some(ops) = args.workload_ops {
         collector.throughput_mut().operations = ops;
+        if let Some(secs) = args.workload_secs.filter(|s| *s > 0.0) {
+            collector.throughput_mut().ops_per_sec = ops as f64 / secs;
+        }
     }
     if let Some(p) = args.p50_ms {
         collector.throughput_mut().p50_latency_ms = p;
@@ -320,6 +362,11 @@ fn main() -> ExitCode {
     }
     if let Some(p) = args.p999_ms {
         collector.throughput_mut().p999_latency_ms = p;
+    }
+    {
+        let sweep_measurements: u64 = sweep.sizes.iter().map(|s| s.timings_ms.len() as u64).sum();
+        let w = &mut collector.metadata_mut().workload;
+        w.insert("sweep_measurements".into(), sweep_measurements.to_string());
     }
 
     // The parallelism demonstration: a REAL, measured multi-core speedup + the invariant determinism.
@@ -396,11 +443,32 @@ fn parse_args() -> Result<Args, String> {
             }
             "--nodes" => args.nodes = Some(value()?.parse().map_err(|e| format!("--nodes: {e}"))?),
             "--rels" => args.rels = Some(value()?.parse().map_err(|e| format!("--rels: {e}"))?),
+            "--total-millis" => {
+                args.total_millis = Some(
+                    value()?
+                        .parse()
+                        .map_err(|e| format!("--total-millis: {e}"))?,
+                );
+            }
             "--workload-ops" => {
                 args.workload_ops = Some(
                     value()?
                         .parse()
                         .map_err(|e| format!("--workload-ops: {e}"))?,
+                );
+            }
+            "--workload-secs" => {
+                args.workload_secs = Some(
+                    value()?
+                        .parse()
+                        .map_err(|e| format!("--workload-secs: {e}"))?,
+                );
+            }
+            "--logical-graph-bytes" => {
+                args.logical_graph_bytes = Some(
+                    value()?
+                        .parse()
+                        .map_err(|e| format!("--logical-graph-bytes: {e}"))?,
                 );
             }
             "--p50-ms" => {
@@ -433,27 +501,6 @@ fn parse_args() -> Result<Args, String> {
         args.scenario = "gds-analytics".to_string();
     }
     Ok(args)
-}
-
-/// Total byte size of a path: the file size for a regular file, or the recursive sum of the entries
-/// for a directory (the WAL is a directory; the store is a file). Missing/unreadable ⇒ `0` (honest).
-fn dir_or_file_bytes(path: &str) -> u64 {
-    fn walk(p: &std::path::Path) -> u64 {
-        let Ok(meta) = std::fs::symlink_metadata(p) else {
-            return 0;
-        };
-        if meta.is_file() {
-            return meta.len();
-        }
-        if meta.is_dir() {
-            let Ok(entries) = std::fs::read_dir(p) else {
-                return 0;
-            };
-            return entries.flatten().map(|e| walk(&e.path())).sum();
-        }
-        0
-    }
-    walk(std::path::Path::new(path))
 }
 
 /// Loads + parses the sweep JSON (the shape `gds_sweep` emits) into a [`Sweep`].

@@ -372,30 +372,41 @@ schema's existing flexible carriers:
 - **`phases`** — **one phase per algorithm**, at the *reference* (largest swept) graph size, each
   phase's `millis` being that algorithm's wall time. This reads naturally in the report.md
   "Phase timings" table. *Per-algorithm wall time lives here.*
-- **`workload`** params — the structural CSR footprint at the reference size (`reference_csr_bytes`,
-  `reference_csr_bytes_per_node`, `reference_csr_bytes_per_edge`), the swept sizes
-  (`sweep_field_sizes`), the `algorithm_count`, the loaded influence-network size
-  (`loaded_network_nodes/rels`), and — when the driver path ran — the live server's on-disk footprint
-  (`server_store_bytes` / `server_wal_bytes`). *Structural/footprint metrics live here.*
-- **`storage`** section — populated **exclusively** from the deterministic CSR footprint:
-  `store_bytes` = reference CSR total bytes, `space_amplification` = CSR bytes-per-node,
-  `write_amplification` = CSR bytes-per-edge. (The live server's on-disk store/WAL is path-dependent —
-  huge under the driver path, zero hermetically — so it is *not* put in the gated storage section,
-  only in the workload params above.)
+- **`workload`** params — the deterministic CSR-projection footprint at the reference size
+  (`reference_csr_bytes`, `reference_csr_bytes_per_node`, `reference_csr_bytes_per_edge`), the swept
+  sizes (`sweep_field_sizes`), the `algorithm_count`, the sweep's `sweep_measurements` count, and the
+  loaded influence-network size (`loaded_network_nodes/rels`). *The structural footprint lives here —
+  and this is what the baseline gate reads.*
+- **`storage`** section — the live server's **real on-disk footprint**: the `graphus.store` image and
+  the `graphus.wal` **directory** of `seg.<lsn>` segment files, with real `write_amplification` /
+  `space_amplification` ratios against the generator's logical `graph.cypher` bytes. On the hermetic
+  path there is no server, so the section is honestly zero (= not measured).
 - **`dataset`** — the reference (largest swept) graph size (byte-stable for a fixed sweep seed).
 - **`cpu` / `memory`** — the live server's real CPU seconds + peak RSS **when the driver path ran**;
   honest zeros on the hermetic path.
-- **`throughput`** — `operations` = the analyze-workload op count (driver path) or the sweep
-  measurement count (hermetic); `p50/p99/p999` from the driver's measured per-operation latencies.
+- **`throughput`** — the analyze workload's real `operations`, `ops_per_sec` and `p50/p99/p999`, from
+  the driver's measured per-operation latencies. Honestly zero on the hermetic path (the sweep reports
+  per-algorithm *wall time* — the `phases` above — not an operation rate).
+- **`total_millis`** — the run's real wall-clock (sweep + driver load/analyze), passed in explicitly:
+  the evidence binary runs *after* the workload and cannot bracket it.
+
+> **Evidence honesty (`rmp #699`).** The `storage` section used to be populated *exclusively* from the
+> CSR projection: `store_bytes` carried the projection's **resident** size while being documented as
+> the on-disk store, `space_amplification` carried CSR **bytes-per-node** and `write_amplification`
+> CSR **bytes-per-edge**, and `wal_bytes` was left at `0` — so the report claimed the run wrote no
+> redo log at all, and the committed baseline read `space_amplification: 119.06` (a per-element cost
+> sitting in a ratio field). The CSR figures were always *also* published, correctly named, as the
+> `reference_csr_*` workload params, so the gate now reads them from there — same numbers, same 15%
+> band, every field meaning what it says.
 
 ### Documented variance
 
 The metrics fall into two stability classes:
 
 - **Deterministic (byte-stable for a fixed seed + sweep sizes)** — the dataset graph size, the
-  `algorithm_count`, and the CSR footprint (`store_bytes` / `bytes_per_node` / `bytes_per_edge`).
-  These are identical across runs and hosts and across the driver/hermetic paths. *These are what the
-  baseline gate holds to a tight band.*
+  `algorithm_count`, and the CSR footprint (`reference_csr_bytes` / `reference_csr_bytes_per_node` /
+  `reference_csr_bytes_per_edge`). These are identical across runs and hosts and across the
+  driver/hermetic paths. *These are what the baseline gate holds to a tight band.*
 - **Machine-/timing-variant** — per-algorithm wall time (the `phases`), CPU seconds, peak RSS, and
   the latency percentiles. These vary with CPU speed, the allocator, OS scheduling, and the live
   server's on-disk WAL. *These are NOT gated.* On the reference machine (linux/x86_64, 16 cores)
@@ -410,10 +421,11 @@ The metrics fall into two stability classes:
 1. **Structural equality** — the reference graph size (`dataset.nodes/relationships`) and the
    `algorithm_count` must match the baseline **exactly** (integer-stable for a fixed seed). A drift
    here means the generator or the procedure surface changed.
-2. **Tight-band footprint** — the deterministic CSR footprint (`storage.store_bytes`,
-   `space_amplification` = bytes/node, `write_amplification` = bytes/edge) is held to **15%** via the
-   harness's `compare_to_baseline`; throughput / latency / CPU / memory are given an effectively
-   infinite tolerance.
+2. **Tight-band CSR footprint** — the deterministic projection (`reference_csr_bytes`,
+   `reference_csr_bytes_per_node`, `reference_csr_bytes_per_edge`, read from the workload params) is
+   held to **15%**. The report's own sections are all machine- or path-variant here — the `storage`
+   section is the live server's on-disk footprint, huge under the driver path and absent hermetically
+   — so they are printed for visibility but nothing in them gates.
 
 **Why 15% / why structural-only:** for a fixed seed + profile the generated graph — and therefore the
 CSR projection — is byte-stable, so its footprint is the meaningful, reproducible regression signal; a

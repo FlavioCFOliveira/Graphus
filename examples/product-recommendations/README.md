@@ -220,8 +220,17 @@ schema shared by every example) + `report.md` (human-readable), plus `schema.txt
   the per-rung busy-thread count and busiest-thread core-fraction (the single-engine-thread vs
   reader-pool signal).
 - **Memory** — the server's peak and final RSS.
+- **Storage** — the recommendation database's real on-disk footprint: the `graphus.store` image and
+  the `graphus.wal` **directory** of `seg.<lsn>` segment files, plus real `write_amplification` /
+  `space_amplification` ratios against the generator's logical CSV bytes.
 - **The knee** — an explicit diagnosis of the rung at which throughput saturated, whether p99 kept
   climbing past it, and how many cores/threads the server actually used at saturation.
+
+> **Evidence honesty (`rmp #699`).** The whole storage section used to be left at **zero** — store
+> bytes, WAL bytes and both amplification ratios — even though a real store sat on disk for the entire
+> ladder, so the report asserted a durable-write workload had no durable footprint. `total_millis` was
+> likewise the report's own *emission* time (the committed baseline read `0.027` ms for a ~16-second
+> ladder); it is now the ladder's real wall-clock.
 
 **Attach mode** (`measurement_mode: "external"`) — process CPU/RSS and on-disk storage are **N/A**
 (the server is remote/not owned), so they are honestly zeroed. The evidence is:

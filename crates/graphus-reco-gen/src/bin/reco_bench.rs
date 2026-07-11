@@ -1307,6 +1307,13 @@ fn write_evidence(
         );
     }
 
+    // total_millis = the LADDER's wall-time (rmp #699). The whole ladder ran before this report was
+    // built, so the collector could not bracket it: an unbracketed start()/finish() timed only the
+    // report's own emission (the committed baseline read `total_millis: 0.027` — 27 MICROseconds for
+    // a 65-second ladder). The rungs are driven back to back, so their summed wall-time IS the run.
+    let ladder_wall: f64 = rungs.iter().map(|r| r.wall_secs).sum();
+    collector.record_total_duration(Duration::from_secs_f64(ladder_wall));
+
     // Resources (CPU + memory) from the BEST rung — measured on the SERVER process via /proc.
     collector.record_resources((
         CpuSection {
@@ -1399,6 +1406,41 @@ fn write_evidence(
             bench::ns_to_ms(f.pcts.max),
         ));
     }
+    // --- Storage: the recommendation database's REAL on-disk footprint (rmp #699). This section used
+    // to be left ENTIRELY at zero — store_bytes, wal_bytes, both amplification ratios — even though a
+    // real store sat on disk for the whole ladder, so the report asserted the run had no durable
+    // footprint at all. The WAL is a DIRECTORY of segment files (`graphus.wal/seg.<lsn>`): it is
+    // measured by PATH, because a meter keying off the leaf file name would fold every WAL byte into
+    // the store and report `wal_bytes: 0`, hiding the redo log completely.
+    match (&args.store, &args.wal) {
+        (Some(store), Some(wal)) => {
+            collector
+                .record_storage(store, wal, None)
+                .map_err(|e| format!("cannot measure the store/WAL footprint: {e}"))?;
+            // Amplification against the REAL logical dataset (the generator's CSV bytes). Absent that
+            // figure the ratios stay at the honest 0.0 rather than being computed against an invented
+            // per-element size.
+            if args.logical_bytes > 0 {
+                collector.record_amplification(args.logical_bytes, args.logical_bytes);
+            }
+            let s = collector.storage_mut();
+            let (store_bytes, wal_bytes) = (s.store_bytes, s.wal_bytes);
+            collector.note(format!(
+                "storage.* is the REAL on-disk footprint of the '{}' database after the ladder: a {} \
+                 B store image plus a {} B WAL DIRECTORY of segment files (walked by PATH). The \
+                 amplification ratios are those durable bytes over the generator's {} B logical CSV.",
+                args.db, store_bytes, wal_bytes, args.logical_bytes,
+            ));
+        }
+        _ => {
+            collector.note(
+                "storage.* is zero = NOT MEASURED: no --store/--wal path was supplied (attach mode \
+                 has no local store to walk). It is not a claim that the run wrote nothing."
+                    .to_string(),
+            );
+        }
+    }
+
     for line in diagnose_knee(rungs, proc_available, false) {
         collector.note(format!("KNEE: {line}"));
     }
@@ -1450,6 +1492,15 @@ struct Args {
     purchased: u64,
     scenario: String,
     evidence_dir: Option<String>,
+    /// The co-located database's store image (`.../databases/<db>/graphus.store`), for the REAL
+    /// on-disk storage evidence. `None` (attach mode) ⇒ the storage section stays honestly zero.
+    store: Option<String>,
+    /// The co-located database's WAL **directory** (`.../databases/<db>/graphus.wal`, which holds the
+    /// `seg.<lsn>` segment files). Measured by PATH, not by leaf file name.
+    wal: Option<String>,
+    /// Logical size of the loaded graph (the generator's CSV bytes), for the amplification ratios.
+    /// `0` = not supplied, and the ratios stay at "not measured" rather than being invented.
+    logical_bytes: u64,
     write_every_ms: u64,
     writers: usize,
     target_rps: f64,
@@ -1488,6 +1539,9 @@ impl Args {
         let mut purchased = None;
         let mut scenario = "product-recommendations".to_string();
         let mut evidence_dir = None;
+        let mut store = None;
+        let mut wal = None;
+        let mut logical_bytes = 0u64;
         let mut write_every_ms = 0u64;
         let mut writers = 1usize;
         let mut target_rps = 0.0f64;
@@ -1540,6 +1594,9 @@ impl Args {
                         return Err("--target-rps must be >= 0".to_string());
                     }
                 }
+                "--store" => store = Some(value()?),
+                "--wal" => wal = Some(value()?),
+                "--logical-bytes" => logical_bytes = parse_u64(&value()?, "--logical-bytes")?,
                 "--auto-extend" => auto_extend = true,
                 "--read-timeout-ms" => read_timeout_ms = parse_u64(&value()?, "--read-timeout-ms")?,
                 "--seed" => seed = parse_u64(&value()?, "--seed")?,
@@ -1571,6 +1628,9 @@ impl Args {
             password,
             db,
             server_pid,
+            store,
+            wal,
+            logical_bytes,
             ladder,
             ops_per_rung,
             min_ops_per_client,
@@ -1605,6 +1665,7 @@ fn print_usage() {
          \x20   --users <N> --products <N> --friends <N> --purchased <N> \\\n\
          \x20   [--min-ops-per-client <N default 150>] [--scenario product-recommendations] \\\n\
          \x20   [--evidence-dir <dir>] [--write-every-ms <ms default 0>] [--writers <N default 1>] \\\n\
+         \x20   [--store <graphus.store>] [--wal <graphus.wal dir>] [--logical-bytes <N>] \\\n\
          \x20   [--target-rps <R default 0 = closed-loop>] [--auto-extend] \\\n\
          \x20   [--read-timeout-ms <ms default 120000>] [--seed <u64>]"
     );

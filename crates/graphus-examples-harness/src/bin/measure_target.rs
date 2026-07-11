@@ -27,6 +27,7 @@
 //!   --database <name> \
 //!   --metrics-before <file> --metrics-after <file> \
 //!   [--nodes <u64> --rels <u64>] \
+//!   [--total-millis <f64>] \
 //!   [--workload-ops <u64> --workload-secs <f64>] \
 //!   [--p50-ms <f64> --p99-ms <f64> --p999-ms <f64>] [--abort-rate <f64>] \
 //!   [--param key=value]... [--note <text>]... [--phase name=millis]... \
@@ -35,6 +36,11 @@
 //!
 //! The two `--metrics-*` files are the raw Prometheus text captured by the shell harness
 //! (`harness_scrape_metrics`) immediately before and after the workload window.
+//!
+//! `--total-millis` is the workload's measured wall-time. Like `measure_server`, this binary runs
+//! *after* the workload, so an unbracketed `start()`/`finish()` would time the report's own emission
+//! rather than the run (`rmp #699`); `--workload-secs` is the fallback and, absent both, `total_millis`
+//! stays at `0.0` = **not measured**.
 //!
 //! ## External-mode invariant gate (`--assert`)
 //!
@@ -72,6 +78,9 @@ struct Args {
     nodes: u64,
     rels: u64,
     peak_rss_bytes: Option<u64>,
+    /// The workload's measured wall-time, in milliseconds (see the module docs). `None` ⇒ fall back
+    /// to `workload_secs`, else "not measured".
+    total_millis: Option<f64>,
     workload_ops: Option<u64>,
     workload_secs: Option<f64>,
     p50_ms: Option<f64>,
@@ -132,6 +141,9 @@ fn main() -> ExitCode {
             .insert(k.clone(), v.clone());
     }
     collector.start();
+    // The workload already ran before this binary was invoked: hand the collector the wall-time the
+    // example measured, so total_millis is the RUN's duration and not this report's emission time.
+    collector.record_total_duration_from(args.total_millis, args.workload_secs);
 
     for (name, millis) in &args.phases {
         collector.phase(
@@ -277,6 +289,13 @@ fn parse_args() -> Result<Args, String> {
                     value()?
                         .parse()
                         .map_err(|e| format!("--peak-rss-bytes: {e}"))?,
+                )
+            }
+            "--total-millis" => {
+                args.total_millis = Some(
+                    value()?
+                        .parse()
+                        .map_err(|e| format!("--total-millis: {e}"))?,
                 )
             }
             "--workload-ops" => {

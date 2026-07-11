@@ -290,12 +290,23 @@ How the figures are sourced (and their honest caveats):
   fallback elsewhere) by the dev-only `measure_server` harness binary while the server is still up.
 - **Storage** is the real on-disk footprint of `<store>/graphus.store` and the `<store>/graphus.wal/`
   segment directory, measured after the workload. `bytes_fsynced` is the WAL byte count (a faithful
-  proxy: every committed WAL byte is fsynced before acknowledgement). `space_amplification` is on-disk
-  bytes over a coarse logical-graph estimate (~256 B/node + ~128 B/rel), documented as a
-  meaningful-but-honest proxy.
+  proxy: every committed WAL byte is fsynced before acknowledgement). `space_amplification` and
+  `write_amplification` are those durable bytes over the **logical dataset the generator actually
+  emitted** (`wc -c graph.cypher`).
+
+  > **Evidence honesty (`rmp #699`).** The denominator used to be an *invented* `nodes*256 +
+  > rels*128` formula — a fabricated logical size, which made the published ratio a fabrication — and
+  > `write_amplification` was left at a `0.0` placeholder. Both are now real.
 - **Latency percentiles** are measured **client-side** by `detect.js` (per-operation timings) and
   emitted as `GRAPHUS_STATS {…}` (including a separate `point_lookup_p99_ms`). The **write-commit p99**
   comes from `concurrency.js`.
+- **`ops_per_sec`** is the detection workload's operations over the window they were **actually issued
+  in** (`workload_secs`, the summed wall-time of those serial operations, emitted by `detect.js`). It
+  used to be the detection op count divided by the *whole* load + detect + concurrency window — two
+  different windows, which silently understated the rate (`rmp #699`).
+- **`total_millis`** is the workload's real wall-clock. `measure_server` runs *after* the workload, so
+  it is passed in explicitly via `--total-millis`; an unbracketed report timed only its own emission
+  (the old committed baseline read `total_millis: 0.044` — 44 microseconds for a multi-second run).
 - **`server_metrics`** are the server's own Prometheus counters, scraped from `/metrics` **before and
   after** the workload and diffed by `measure_target` (EXTERNAL) or folded in by `inject_server_metrics`
   (LOCAL, `rmp #689`); attributed to the run's database via the per-database `graphus_db_*` series where

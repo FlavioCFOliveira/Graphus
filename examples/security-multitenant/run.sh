@@ -96,23 +96,16 @@ PROFILE="${SEC_PROFILE:-fast}"
 MODE="$(harness_target_mode)"   # local | external
 
 # The deterministic generator is needed in BOTH modes.
-if [ ! -x "$GEN" ]; then
-  section "Building the deterministic security generator (release)"
-  ( cd "$REPO_ROOT" && cargo build --release -p graphus-security-gen --bin security_gen )
-fi
+harness_build "the deterministic security generator (release)" \
+  --release -p graphus-security-gen --bin security_gen
 [ -x "$GEN" ] || { echo "${RED}fatal: security_gen binary not found at $GEN${RESET}" >&2; exit 2; }
 
 # The server + hermetic crypto verifier are needed ONLY in local mode.
 if [ "$MODE" = "local" ]; then
-  if [ ! -x "$SERVER" ]; then
-    section "Building graphus-server (release)"
-    ( cd "$REPO_ROOT" && cargo build --release -p graphus-server )
-  fi
+  harness_build "graphus-server (release)" --release -p graphus-server
   [ -x "$SERVER" ] || { echo "${RED}fatal: server binary not found at $SERVER${RESET}" >&2; exit 2; }
-  if [ ! -x "$VERIFY" ]; then
-    section "Building the hermetic crypto verifier (release)"
-    ( cd "$REPO_ROOT" && cargo build --release -p graphus-security-gen --features dst-repro --bin security_verify )
-  fi
+  harness_build "the hermetic crypto verifier (release)" \
+    --release -p graphus-security-gen --features dst-repro --bin security_verify
   [ -x "$VERIFY" ] || { echo "${RED}fatal: security_verify binary not found at $VERIFY${RESET}" >&2; exit 2; }
 fi
 
@@ -284,8 +277,10 @@ TENANT_B="$DATA_DIR/$DB_B.cypher"
 NODE_COUNT="$(grep -chE '^CREATE \(:' "$TENANT_A" "$TENANT_B" | paste -sd+ - | bc 2>/dev/null || echo 0)"
 REL_COUNT="$(grep -chE 'CREATE \([a-z]\)-\[:' "$TENANT_A" "$TENANT_B" | paste -sd+ - | bc 2>/dev/null || echo 0)"
 NODE_COUNT="${NODE_COUNT:-0}"; REL_COUNT="${REL_COUNT:-0}"
-LOGICAL_GRAPH_BYTES=$(( NODE_COUNT * 256 + REL_COUNT * 128 ))
-info "dataset: $NODE_COUNT nodes, $REL_COUNT relationships across 2 tenants"
+# The logical dataset = the bytes the generator ACTUALLY emitted for the two tenants (the honest
+# denominator for the amplification ratios; it was an invented nodes*256 + rels*128 formula, rmp #699).
+LOGICAL_GRAPH_BYTES=$(( $(wc -c < "$TENANT_A" | tr -d ' ') + $(wc -c < "$TENANT_B" | tr -d ' ') ))
+info "dataset: $NODE_COUNT nodes, $REL_COUNT relationships across 2 tenants; logical: ${LOGICAL_GRAPH_BYTES} B"
 
 # Determinism check: regenerate (same namespace) and diff every artifact.
 GEN_OUT2_DIR="$WORKDIR/dataset2"
@@ -368,7 +363,7 @@ if [ "$RUN_REST" = "1" ] && [ "$MODE" = "external" ]; then
   fi
 
   section "Step 4 — RBAC + DENY + cross-tenant matrix over REST (python3 stdlib, attach mode)"
-  WORKLOAD_START="$(date +%s)"
+  WORKLOAD_START="$(date +%s)"; WORKLOAD_START_MS="$(_harness_now_ms)"
   REST_OUT="$(python3 "$SCRIPT_DIR/data/matrix.py" \
     --base-url "$REST_BASE" \
     --admin-user "${GRAPHUS_TARGET_USER:-graphus}" \
@@ -406,6 +401,7 @@ EOF
     section "Step 5 — Bolt leg SKIPPED (RUN_DRIVER=0, node/npm absent, or GRAPHUS_TARGET_BOLT unset)"
   fi
 
+  WORKLOAD_MS=$(( $(_harness_now_ms) - WORKLOAD_START_MS ))
   WORKLOAD_SECS=$(( $(date +%s) - WORKLOAD_START )); [ "$WORKLOAD_SECS" -lt 1 ] && WORKLOAD_SECS=1
 
   # Deliberate bad-Bearer GET /metrics — an unauthenticated request that IS rejected AND bumps the
@@ -472,7 +468,7 @@ EOF
   fi
 
   section "Step 4 — provision + RBAC + DENY + cross-tenant matrix over REST (python3 stdlib)"
-  WORKLOAD_START="$(date +%s)"
+  WORKLOAD_START="$(date +%s)"; WORKLOAD_START_MS="$(_harness_now_ms)"
   REST_OUT="$(python3 "$SCRIPT_DIR/data/matrix.py" \
     --base-url "https://127.0.0.1:$REST_PORT" \
     --admin-user "$ADMIN_USER" --admin-password "$ADMIN_PW" \
@@ -506,6 +502,7 @@ EOF
   else
     section "Step 5 — Bolt leg SKIPPED (RUN_DRIVER=0 or node/npm absent)"
   fi
+  WORKLOAD_MS=$(( $(_harness_now_ms) - WORKLOAD_START_MS ))
   WORKLOAD_SECS=$(( $(date +%s) - WORKLOAD_START )); [ "$WORKLOAD_SECS" -lt 1 ] && WORKLOAD_SECS=1
 
   # -------- DEFECT-FIX (a): storage = the TENANT database stores under databases/*, NOT the empty
@@ -617,6 +614,15 @@ R_DENY_CHECKS="$(json_field "$REST_STATS" deny_checks)"
 R_XT_PROBES="$(json_field "$REST_STATS" cross_tenant_probes)"
 R_XT_DENIED="$(json_field "$REST_STATS" cross_tenant_denied)"
 R_XT_EMPTY="$(json_field "$REST_STATS" cross_tenant_empty)"
+# The REAL measured REST evidence (rmp #699): the RBAC-enforced request count, the window those
+# requests were actually issued in, and their real latency percentiles. The report used to carry
+# hardcoded p50/p99/p999 = 0.000 and an ops_per_sec of `seeded_statements / server-uptime` — a count
+# of Cypher statements divided by a window they were never issued over.
+R_REQS="$(json_field "$REST_STATS" rest_requests)"
+R_REQ_SECS="$(json_field "$REST_STATS" rest_workload_secs)"
+R_P50="$(json_field "$REST_STATS" p50_ms)"
+R_P99="$(json_field "$REST_STATS" p99_ms)"
+R_P999="$(json_field "$REST_STATS" p999_ms)"
 
 # --------------------------------------------------------------------------------------------------
 # Step 7 — evidence. LOCAL: measure_server (CPU/RSS/tenant-store) + baseline gate + /metrics companion.
@@ -633,8 +639,7 @@ if [ "$RUN_REST" = "1" ] && [ "$MODE" = "external" ]; then
   section "Step 7 — server-side evidence via /metrics (external mode)"
   MEASURE_TGT="$BIN_DIR/measure_target"
   if [ ! -x "$MEASURE_TGT" ]; then
-    info "building the dev-only measure_target harness binary (debug)…"
-    ( cd "$REPO_ROOT" && cargo build -q -p graphus-examples-harness --bin measure_target ) || true
+    harness_build "the dev-only measure_target harness binary (debug)" -p graphus-examples-harness --bin measure_target
     MEASURE_TGT="$REPO_ROOT/target/debug/measure_target"
   fi
   if [ -x "$MEASURE_TGT" ] && [ -s "$METRICS_BEFORE" ] && [ -s "$METRICS_AFTER" ]; then
@@ -647,8 +652,12 @@ if [ "$RUN_REST" = "1" ] && [ "$MODE" = "external" ]; then
       --metrics-before "$METRICS_BEFORE" \
       --metrics-after "$METRICS_AFTER" \
       --nodes "$NODE_COUNT" --rels "$REL_COUNT" \
-      --workload-ops "${R_SEEDED:-0}" --workload-secs "$WORKLOAD_SECS" \
+      --total-millis "${WORKLOAD_MS:-0}" \
+      --workload-ops "${R_REQS:-0}" --workload-secs "${R_REQ_SECS:-0}" \
+      --p50-ms "${R_P50:-0}" --p99-ms "${R_P99:-0}" --p999-ms "${R_P999:-0}" \
       --abort-rate 0.0 \
+      --param "seeded_statements=${R_SEEDED:-0}" \
+      --note "throughput.* is the REST RBAC matrix workload: ${R_REQS:-0} authorization-enforced /db/{db}/tx/commit requests over the window they were issued in, with their REAL latency percentiles (measured by matrix.py). Before rmp #699 the latency percentiles were hardcoded 0.000 placeholders and ops_per_sec was seeded_statements divided by the server UPTIME." \
       --param "profile=$PROFILE" \
       --param "mode=external-attach" \
       --param "namespace=$RUN_NS" \
@@ -688,8 +697,7 @@ elif [ "$RUN_REST" = "1" ] && [ "$MODE" = "local" ]; then
 
   MEASURE_BIN="$BIN_DIR/measure_server"
   if [ ! -x "$MEASURE_BIN" ]; then
-    info "building the dev-only measure_server harness binary (debug)…"
-    ( cd "$REPO_ROOT" && cargo build -q -p graphus-examples-harness --bin measure_server ) || true
+    harness_build "the dev-only measure_server harness binary (debug)" -p graphus-examples-harness --bin measure_server
     MEASURE_BIN="$REPO_ROOT/target/debug/measure_server"
   fi
 
@@ -705,8 +713,12 @@ elif [ "$RUN_REST" = "1" ] && [ "$MODE" = "local" ]; then
       --wal "$TENANT_WAL" \
       --nodes "$NODE_COUNT" --rels "$REL_COUNT" \
       --peak-rss-bytes "$PEAK_RSS_BYTES" \
-      --workload-ops "${R_SEEDED:-0}" --workload-secs "$SERVER_UPTIME_SECS" \
+      --total-millis "${WORKLOAD_MS:-0}" \
+      --workload-ops "${R_REQS:-0}" --workload-secs "${R_REQ_SECS:-0}" \
+      --p50-ms "${R_P50:-0}" --p99-ms "${R_P99:-0}" --p999-ms "${R_P999:-0}" \
+      --logical-bytes-written "$LOGICAL_GRAPH_BYTES" \
       --logical-graph-bytes "$LOGICAL_GRAPH_BYTES" \
+      --param "seeded_statements=${R_SEEDED:-0}" \
       --param "profile=$PROFILE" \
       --param "connection=rest-https-jwt+bolt-tcp-tls" \
       --param "encryption=aes-256-gcm-at-rest" \
@@ -741,12 +753,26 @@ elif [ "$RUN_REST" = "1" ] && [ "$MODE" = "local" ]; then
       "$([ -f "$EVIDENCE_DIR/report.json" ] && echo yes || echo no)"
     assert "evidence report.md was produced" "yes" \
       "$([ -f "$EVIDENCE_DIR/report.md" ] && echo yes || echo no)"
+    # Evidence honesty (rmp #699): the latency percentiles were HARDCODED 0.000 placeholders and
+    # ops_per_sec was `seeded_statements / server-uptime`. Both are now really measured.
+    assert "report evidence is honest (measured latency percentiles, real total_millis, real amplification)" "yes" \
+      "$(python3 -c "
+import json,sys
+try: d = json.load(open('$EVIDENCE_DIR/report.json'))
+except Exception: print('no'); sys.exit()
+t, tp, st = d['total_millis'], d['throughput'], d['storage']
+ok = (t >= 1.0
+      and tp['operations'] > 0 and tp['ops_per_sec'] > 0.0
+      and tp['p50_latency_ms'] > 0.0 and tp['p99_latency_ms'] > 0.0 and tp['p999_latency_ms'] > 0.0
+      and st['store_bytes'] > 0 and st['wal_bytes'] > 0
+      and st['write_amplification'] > 0.0 and st['space_amplification'] > 0.0)
+print('yes' if ok else 'no')" 2>/dev/null || echo no)"
 
     if [ "$PROFILE" = "fast" ] && [ -f "$BASELINE" ] && [ -f "$EVIDENCE_DIR/report.json" ]; then
       section "Step 7b — regression gate vs committed baseline"
       CMP_BIN="$BIN_DIR/sec_baseline_cmp"
       if [ ! -x "$CMP_BIN" ]; then
-        ( cd "$REPO_ROOT" && cargo build -q -p graphus-security-gen --bin sec_baseline_cmp ) || true
+        harness_build "the sec_baseline_cmp gate (debug)" -p graphus-security-gen --bin sec_baseline_cmp
         CMP_BIN="$REPO_ROOT/target/debug/sec_baseline_cmp"
       fi
       CMP_OUT="$("$CMP_BIN" "$BASELINE" "$EVIDENCE_DIR/report.json" 2>&1)" || true
@@ -767,7 +793,8 @@ elif [ "$RUN_REST" = "1" ] && [ "$MODE" = "local" ]; then
           --database "$DB_A" \
           --metrics-before "$METRICS_BEFORE" --metrics-after "$METRICS_AFTER" \
           --nodes "$NODE_COUNT" --rels "$REL_COUNT" \
-          --workload-ops "${R_SEEDED:-0}" --workload-secs "$SERVER_UPTIME_SECS" --abort-rate 0.0 \
+          --total-millis "${WORKLOAD_MS:-0}" \
+          --workload-ops "${R_REQS:-0}" --workload-secs "${R_REQ_SECS:-0}" --abort-rate 0.0 \
           --param "auth_failures_delta=${AUTH_FAIL_DELTA}" \
           --note "$AUTH_FAIL_NOTE" >/dev/null 2>&1 \
           && info "server-side /metrics delta written to $EVIDENCE_DIR/server-metrics/report.json" \

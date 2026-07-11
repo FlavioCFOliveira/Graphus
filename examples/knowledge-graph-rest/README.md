@@ -377,6 +377,15 @@ very differently:
   - HTTP throughput (`ops_per_sec`), latency (`p50`/`p99`/`p999`), NDJSON rows/sec + bytes/sec,
   - server CPU seconds, peak RSS.
 
+> **Evidence honesty (`rmp #699`).** `ops_per_sec` is the concurrency workload's requests over the
+> window they were **actually issued in** (`concurrency_secs`, measured by the python client). It used
+> to be divided by the whole **server uptime**, which mixed two different windows and understated req/s
+> by roughly an order of magnitude (the old baseline read `106.7`; the same workload really sustains
+> ~1250/s). The amplification denominator was an invented `nodes*256 + rels*128` formula and
+> `write_amplification` was a `0.0` placeholder — both are now real, computed against the logical
+> `graph.cypher` bytes. `total_millis` (`0.029` ms) timed the report's own emission and is now the
+> workload's wall-clock.
+
 ### Committed baseline + regression gate
 
 `examples/knowledge-graph-rest/baseline.json` is a committed `fast`-profile reference report. On every

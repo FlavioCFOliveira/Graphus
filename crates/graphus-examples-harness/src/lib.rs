@@ -1074,6 +1074,49 @@ impl EvidenceCollector {
         self.total_override = Some(total);
     }
 
+    /// Resolves `total_millis` for a driver that ran its workload **before** the report was built
+    /// (`rmp #699`) — the shape every `*_evidence` / `measure_*` emitter has.
+    ///
+    /// Such an emitter cannot bracket the workload with [`start`](Self::start) /
+    /// [`finish`](Self::finish): that interval would time the report's own *emission* (a few
+    /// hundredths of a millisecond), which is not the run's duration and reads as if it were
+    /// measured. The honest resolution order is:
+    ///
+    /// 1. `total_millis` — the wall-time the example measured around its workload (preferred);
+    /// 2. `workload_secs` — the timed throughput window, when that is all the driver tracked;
+    /// 3. neither — `total_millis` stays at `0.0` (**not measured**) and a note says so, rather than
+    ///    silently reporting the emitter's own runtime.
+    ///
+    /// Non-finite or negative inputs are rejected as "not supplied" (a malformed figure must never
+    /// become evidence).
+    pub fn record_total_duration_from(
+        &mut self,
+        total_millis: Option<f64>,
+        workload_secs: Option<f64>,
+    ) {
+        let sane = |v: f64| v.is_finite() && v >= 0.0;
+        if let Some(ms) = total_millis.filter(|v| sane(*v)) {
+            self.record_total_duration(Duration::from_secs_f64(ms / 1_000.0));
+            return;
+        }
+        if let Some(secs) = workload_secs.filter(|v| sane(*v) && *v > 0.0) {
+            self.record_total_duration(Duration::from_secs_f64(secs));
+            self.note(
+                "total_millis is the measured WORKLOAD window (--workload-secs): the driver did not \
+                 supply an explicit --total-millis. It is NOT this emitter's own runtime."
+                    .to_string(),
+            );
+            return;
+        }
+        self.record_total_duration(Duration::ZERO);
+        self.note(
+            "total_millis = 0.0 means NOT MEASURED: the driver supplied neither --total-millis nor \
+             --workload-secs. (It is deliberately not the report emitter's own runtime, which is \
+             what an unbracketed start()/finish() would have timed.)"
+                .to_string(),
+        );
+    }
+
     /// Closes the run, finalising the total wall-clock duration, and yields the [`EvidenceReport`].
     ///
     /// The total is the duration passed to [`record_total_duration`](Self::record_total_duration)
@@ -1177,6 +1220,69 @@ mod tests {
         assert!((report.phases[1].millis - 10.0).abs() < 1e-6);
         // total is wall-clock between start/finish; non-negative and at least registers as elapsed.
         assert!(report.total_millis >= 0.0);
+    }
+
+    /// Regression (`rmp #699`): an emitter that builds its report AFTER the workload must report the
+    /// WORKLOAD's wall-time, never the report's own emission time. Every `*_evidence` / `measure_*`
+    /// driver has this shape, and before the fix each one emitted `total_millis ≈ 0.03` — a figure
+    /// that looks measured but times only the serialization of the report.
+    #[test]
+    fn explicit_total_duration_wins_over_the_emitters_own_runtime() {
+        let mut c = EvidenceCollector::new(sample_metadata());
+        c.start();
+        c.record_total_duration_from(Some(18_298.72), Some(1.0));
+        let report = c.finish();
+        // The explicit workload wall-time, NOT the sub-millisecond start()-to-finish() interval.
+        assert!((report.total_millis - 18_298.72).abs() < 1e-6);
+    }
+
+    /// Regression (`rmp #699`): with no explicit total, the timed throughput window is the honest
+    /// fallback — still the workload's duration, not the emitter's.
+    #[test]
+    fn total_duration_falls_back_to_the_measured_workload_window() {
+        let mut c = EvidenceCollector::new(sample_metadata());
+        c.start();
+        c.record_total_duration_from(None, Some(4.5));
+        let report = c.finish();
+        assert!((report.total_millis - 4_500.0).abs() < 1e-6);
+        assert!(
+            report.notes.iter().any(|n| n.contains("--workload-secs")),
+            "the fallback must be disclosed in a note, got {:?}",
+            report.notes
+        );
+    }
+
+    /// Regression (`rmp #699`): when the driver measured NOTHING, `total_millis` must be an honest
+    /// 0.0 ("not measured") with a note — never the emitter's own near-zero runtime, which would read
+    /// as a real measurement.
+    #[test]
+    fn total_duration_is_zero_and_disclosed_when_unmeasured() {
+        let mut c = EvidenceCollector::new(sample_metadata());
+        c.start();
+        std::thread::sleep(Duration::from_millis(2));
+        c.record_total_duration_from(None, None);
+        let report = c.finish();
+        assert_eq!(report.total_millis, 0.0);
+        assert!(
+            report.notes.iter().any(|n| n.contains("NOT MEASURED")),
+            "an unmeasured total must say so, got {:?}",
+            report.notes
+        );
+    }
+
+    /// A malformed figure (NaN / negative) must never become evidence: it is treated as "not
+    /// supplied" and falls through to the next honest source.
+    #[test]
+    fn total_duration_rejects_non_finite_and_negative_inputs() {
+        let mut c = EvidenceCollector::new(sample_metadata());
+        c.start();
+        c.record_total_duration_from(Some(f64::NAN), Some(2.0));
+        assert!((c.finish().total_millis - 2_000.0).abs() < 1e-6);
+
+        let mut c = EvidenceCollector::new(sample_metadata());
+        c.start();
+        c.record_total_duration_from(Some(-5.0), None);
+        assert_eq!(c.finish().total_millis, 0.0);
     }
 
     #[test]

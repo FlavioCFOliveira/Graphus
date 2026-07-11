@@ -249,6 +249,21 @@ LOCAL emits the standardized, schema-versioned `evidence/report.json` + `report.
 (server CPU + peak RSS, the on-disk **tenant** store/WAL footprint, dataset size, the RBAC/DENY/
 cross-tenant tallies, the encryption-overhead deltas, the verifier's rotation/backup numbers, and the
 auth-failure delta), gated against the committed `baseline.json` on the **structural** metrics only.
+
+The **throughput / latency** vector is the RBAC matrix workload itself: every
+`POST /db/{db}/tx/commit` the matrix issues is timed by `matrix.py`, so `operations`, `ops_per_sec` and
+`p50` / `p99` / `p999` are the **real** cost of an authorization-enforced REST request (both the
+allowed 200s and the rejected 403s — excluding the denials would bias the percentiles toward the
+allowed cells). `space_amplification` / `write_amplification` are the durable bytes over the logical
+dataset the generator actually emitted.
+
+> **Evidence honesty (`rmp #699`).** This example was the worst offender in the suite: the latency
+> percentiles were **hardcoded `0.000` placeholders** (nothing ever measured them), `ops_per_sec` was
+> `seeded_statements / server-uptime` — a count of Cypher statements divided by a window they were
+> never issued over, which produced the committed baseline's suspiciously round `410.0` — the
+> amplification denominator was an invented `nodes*256 + rels*128` formula, `write_amplification` was
+> a `0.0` placeholder, and `total_millis` (`0.047` ms) timed the report's own emission. All are now
+> really measured.
 EXTERNAL emits `report.json` in `measurement_mode=external` via `measure_target`: the process CPU/RSS +
 on-disk storage vectors are N/A remotely, and the payload is the server-side `/metrics` before→after
 **delta** for the run's dedicated tenant database (committed/aborted txns, query-duration histogram, the

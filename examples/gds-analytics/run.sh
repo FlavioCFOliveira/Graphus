@@ -100,10 +100,8 @@ SWEEP_SIZES="${GDS_SWEEP_SIZES:-40,120,360,1080}"
 
 MODE="$(harness_target_mode)"
 
-if [ ! -x "$GEN" ]; then
-  section "Building the deterministic influence-network generator (release)"
-  ( cd "$REPO_ROOT" && cargo build --release -p graphus-gds-gen --bin gds_gen )
-fi
+harness_build "the deterministic influence-network generator (release)" \
+  --release -p graphus-gds-gen --bin gds_gen
 [ -x "$GEN" ] || { echo "${RED}fatal: gds_gen binary not found at $GEN${RESET}" >&2; exit 2; }
 
 # --------------------------------------------------------------------------------------------------
@@ -209,10 +207,8 @@ if [ "$MODE" = external ]; then
 
   # Locate (or build) the measure_target evidence binary from the shared harness crate.
   MEASURE="$BIN_DIR/measure_target"
-  [ -x "$MEASURE" ] || MEASURE="$REPO_ROOT/target/debug/measure_target"
   if [ ! -x "$MEASURE" ]; then
-    info "building the measure_target harness binary (debug)…"
-    ( cd "$REPO_ROOT" && cargo build -q -p graphus-examples-harness --bin measure_target ) || true
+    harness_build "the measure_target harness binary (debug)" -p graphus-examples-harness --bin measure_target
     MEASURE="$REPO_ROOT/target/debug/measure_target"
   fi
   [ -x "$MEASURE" ] || { echo "${RED}fatal: measure_target binary unavailable${RESET}" >&2; exit 2; }
@@ -237,12 +233,16 @@ if [ "$MODE" = external ]; then
   fi
 
   section "Step 3 — run the GDS workload against the instance (OFFICIAL neo4j-driver, isolated DB)"
+  # Bracket the workload so total_millis is the RUN's wall-time (rmp #699) — the evidence binary runs
+  # after the workload and cannot time it itself.
+  WORKLOAD_START_MS="$(_harness_now_ms)"
   ANALYZE_OUT="$(cd "$WORKDIR/node" && node analyze.js \
       --uri "$GRAPHUS_TARGET_BOLT" \
       --user "${GRAPHUS_TARGET_USER:-graphus}" \
       --password "${GRAPHUS_TARGET_PASSWORD:-graphus-local}" \
       --database "$DB" \
       --graph "$GRAPH_CYPHER" --reference "$REFERENCE" 2>&1)" || true
+  WORKLOAD_MS=$(( $(_harness_now_ms) - WORKLOAD_START_MS ))
   printf '%s\n' "$ANALYZE_OUT" | sed 's/^/  /'
   assert "GDS workload completed against the instance" "yes" \
     "$(printf '%s' "$ANALYZE_OUT" | grep -q 'GRAPHUS_GDS_OK' && echo yes || echo no)"
@@ -271,6 +271,7 @@ if [ "$MODE" = external ]; then
     --param "driver=official neo4j-driver"
     --param "gds_write_modes=$ANALYZE_MODES"
     --note "Workload: reference-subgraph ground-truth + weighted-vs-unweighted PageRank/Dijkstra + write/mutate/stats (feature-detected). nodes_written(pagerank)=$ANALYZE_WRITTEN."
+    --total-millis "$WORKLOAD_MS"
     --assert
   )
   [ -n "${ANALYZE_OPS:-}" ]  && MEASURE_ARGS+=( --workload-ops "$ANALYZE_OPS" )
@@ -326,16 +327,17 @@ PEAK_RSS_BYTES=0
 SERVER_START_EPOCH=0
 SERVER_UPTIME_SECS=0
 
-if [ ! -x "$SERVER" ]; then
-  section "Building graphus-server (release)"
-  ( cd "$REPO_ROOT" && cargo build --release -p graphus-server )
-fi
+harness_build "graphus-server (release)" --release -p graphus-server
 [ -x "$SERVER" ] || { echo "${RED}fatal: server binary not found at $SERVER${RESET}" >&2; exit 2; }
-if [ ! -x "$SWEEP" ]; then
-  section "Building the hermetic GDS scalability sweep (release)"
-  ( cd "$REPO_ROOT" && cargo build --release -p graphus-gds-gen --bin gds_sweep )
-fi
+harness_build "the hermetic GDS scalability sweep (release)" \
+  --release -p graphus-gds-gen --bin gds_sweep
 [ -x "$SWEEP" ] || { echo "${RED}fatal: gds_sweep binary not found at $SWEEP${RESET}" >&2; exit 2; }
+
+# The logical size of the loaded dataset: the bytes the generator actually emitted. The REAL
+# denominator for the amplification ratios (rmp #699) — previously they were computed against an
+# invented `nodes*256 + rels*128` formula, which made the published ratio a fabrication.
+LOGICAL_GRAPH_BYTES="$(wc -c < "$GRAPH_CYPHER" | tr -d ' ')"
+info "logical dataset (graph.cypher): ${LOGICAL_GRAPH_BYTES} B"
 
 # server_rss_bytes <pid> — current resident set size in bytes (Linux /proc, macOS ps).
 server_rss_bytes() {
@@ -364,6 +366,8 @@ sample_peak_rss() {
 # --------------------------------------------------------------------------------------------------
 section "Step 2 — scalability + CSR-footprint + parallelism sweep (multi-threaded, hermetic)"
 info "graphus-gds is MULTI-THREADED via a deterministic Execution knob (rmp #342/#559) — the sweep varies GRAPH SIZE *and* CORE COUNT"
+# The example's wall-clock starts here: the sweep IS part of the run's work (rmp #699).
+RUN_START_MS="$(_harness_now_ms)"
 "$SWEEP" --out "$SWEEP_JSON" --sizes "$SWEEP_SIZES" --repeats 3 2>&1 | sed 's/^/  /'
 assert "sweep JSON was produced" "yes" "$([ -s "$SWEEP_JSON" ] && echo yes || echo no)"
 assert "sweep honestly reports a multi-threaded engine" "yes" \
@@ -391,24 +395,30 @@ CMP_BIN="$BIN_DIR/gds_baseline_cmp"
 emit_evidence() {
   local pid="$1" uptime="$2" store="$3" wal="$4" peak="$5"
   if [ ! -x "$EVIDENCE_BIN" ]; then
-    info "building the dev-only gds_evidence harness binary (debug)…"
-    ( cd "$REPO_ROOT" && cargo build -q -p graphus-gds-gen --bin gds_evidence ) || true
+    harness_build "the dev-only gds_evidence harness binary (debug)" -p graphus-gds-gen --bin gds_evidence
     EVIDENCE_BIN="$REPO_ROOT/target/debug/gds_evidence"
   fi
   [ -x "$EVIDENCE_BIN" ] || { info "gds_evidence unavailable; skipping evidence (non-fatal)"; return 0; }
+
+  # The run's wall-time: sweep + (when it ran) the official-driver load/analyze. The evidence binary
+  # runs after both, so it cannot time them — it must be told (rmp #699).
+  local total_ms=$(( $(_harness_now_ms) - RUN_START_MS ))
 
   local args=(
     --evidence-dir "$EVIDENCE_DIR"
     --sweep "$SWEEP_JSON"
     --scenario "gds-analytics"
     --description "GDS analytics over Bolt/TCP+TLS via the official Neo4j driver: load a seeded influence network, assert the analytically-known reference outputs, compare weighted vs unweighted rankings, exercise write/mutate/stats, and characterise multi-threaded per-algorithm scaling + CSR footprint."
+    --total-millis "$total_ms"
     --param "profile=$PROFILE"
     --param "connection=bolt-tcp-tls"
   )
   if [ -n "$pid" ]; then
     args+=( --pid "$pid" --uptime-secs "$uptime" --store "$store" --wal "$wal" --peak-rss-bytes "$peak" )
     args+=( --nodes "$NODE_COUNT" --rels "$REL_COUNT" --param "driver=official neo4j-driver" )
+    args+=( --logical-graph-bytes "$LOGICAL_GRAPH_BYTES" )
     [ -n "${ANALYZE_OPS:-}" ]  && args+=( --workload-ops "$ANALYZE_OPS" )
+    [ -n "${ANALYZE_SECS:-}" ] && args+=( --workload-secs "$ANALYZE_SECS" )
     [ -n "${ANALYZE_P50:-}" ]  && args+=( --p50-ms "$ANALYZE_P50" )
     [ -n "${ANALYZE_P99:-}" ]  && args+=( --p99-ms "$ANALYZE_P99" )
     [ -n "${ANALYZE_P999:-}" ] && args+=( --p999-ms "$ANALYZE_P999" )
@@ -422,11 +432,21 @@ emit_evidence() {
     || info "evidence collection failed (non-fatal); see output above"
   assert "evidence report.json was produced" "yes" \
     "$([ -f "$EVIDENCE_DIR/report.json" ] && echo yes || echo no)"
+  # total_millis must be the WORKLOAD's wall-time, never the report emitter's own (rmp #699).
+  assert "report total_millis is the workload wall-time (not the emitter's)" "yes" \
+    "$(python3 -c "
+import json,sys
+try:
+    t = json.load(open('$EVIDENCE_DIR/report.json'))['total_millis']
+except Exception:
+    print('no'); sys.exit()
+print('yes' if t >= 1.0 else 'no')
+" 2>/dev/null || echo no)"
 
   if [ "$PROFILE" = "fast" ] && [ -f "$BASELINE" ] && [ -f "$EVIDENCE_DIR/report.json" ]; then
     section "regression gate vs committed baseline"
     if [ ! -x "$CMP_BIN" ]; then
-      ( cd "$REPO_ROOT" && cargo build -q -p graphus-gds-gen --bin gds_baseline_cmp ) || true
+      harness_build "the gds_baseline_cmp gate (debug)" -p graphus-gds-gen --bin gds_baseline_cmp
       CMP_BIN="$REPO_ROOT/target/debug/gds_baseline_cmp"
     fi
     local cmp_out; cmp_out="$("$CMP_BIN" "$BASELINE" "$EVIDENCE_DIR/report.json" 2>&1)" || true
