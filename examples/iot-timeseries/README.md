@@ -1,19 +1,57 @@
-# IoT / time-series event graph — ingest, churn & storage reclamation
+# IoT / time-series event graph — ingest, retention churn & storage reclamation
 
-A realistic, end-to-end demonstration that Graphus sustains a **continuous IoT telemetry workload**
-— a fleet of sensors emitting time-stamped readings under a **sliding-window retention policy** that
-deletes aged-out readings — and that, under this relentless *delete-old + insert-new churn*, the
-storage engine **recycles freed space** so the on-disk footprint reaches a **stable plateau** rather
-than growing without bound.
+A realistic, end-to-end demonstration that Graphus sustains a **continuous IoT telemetry workload** — a
+fleet of sensors emitting time-stamped readings under a **sliding-window retention policy** that deletes
+aged-out readings — and that, under this relentless *delete-old + insert-new churn*, the storage engine
+**recycles the freed space** so the on-disk footprint reaches a **stable plateau** rather than growing
+without bound.
 
-It is the suite's storage-reclamation example: it proves the corpse / page / slot reclamation
-machinery (`rmp #220`, `#225`) end to end, with real numbers showing the footprint curve flatten.
+The headline, proven over a **real Bolt wire** against a **real `graphus-server`** with a real store file
+and a real segmented WAL on disk:
 
-The headline invariant — **the on-disk footprint plateaus under sustained churn** — is regression-
-guarded in the **default `cargo test`** by a hermetic in-process mirror
-([`tests/churn_plateau.rs`](../../crates/graphus-iot-gen/tests/churn_plateau.rs), `rmp #299`), and the
-full E2E run emits a standardized, schema-versioned evidence report gated against a committed baseline
-(`rmp #297`–`#300`).
+> **the on-disk store PLATEAUS *while* `graphus_maintenance_versions_reclaimed_total` CLIMBS**
+
+Both halves are load-bearing, and neither is worth anything alone:
+
+* a flat store, on its own, also describes a workload that **wrote nothing**;
+* a climbing reclamation counter, on its own, does **not** rule out a footprint growing without bound.
+
+Together they are the claim: under a sustained churn that ingests many times the retention window, the
+engine physically reclaims the tombstoned versions and **new inserts reuse the freed space**.
+
+---
+
+## What changed, and why (rmp #694)
+
+An audit rated this example **2.5/5**. It was right, and the problems were not cosmetic:
+
+| Audit finding | What it actually meant | Status |
+| --- | --- | --- |
+| The central premise — "GC has no wire or automatic trigger" — is **false** | `rmp #305` shipped: `CHECKPOINT DATABASE` is a parsed admin statement, **and** a background cadence reclaims automatically. Five files still asserted the opposite. | **Corrected everywhere.** Both triggers are now exercised. |
+| Storage was **in-memory** (`MemBlockDevice`/`MemLogSink`) | `wal_bytes = 0`. WAL volume, fsync volume and amplification were *structurally unmeasurable* — yet the report emitted them as if measured. | **New file-backed wire run** measures all of them for real. |
+| UDS-only, self-boot only | Could not be pointed at a running instance. | **Attach mode** (`GRAPHUS_TARGET_*`), over Bolt-UDS or Bolt-TCP+TLS. |
+| A few-thousand-record **burst**, not sustained | A *retention* claim means little if the plateau is held for 60 ticks. | **`soak` profile**: 300 ticks, 9 000 readings, 60× the window. |
+
+Three genuine defects were found *while* fixing it, and all three are fixed here:
+
+1. **The in-process driver planned every statement against `IndexCatalog::empty()`.** The schema it so
+   carefully declared was invisible to the planner, so the per-tick retention `DELETE` — whose entire
+   purpose is to seek the `Reading.seq` RANGE index — **full-scanned every `:Reading` on every tick**.
+   Nothing failed: the results were identical and every assertion passed, while the example measured an
+   unindexed engine and reported an indexed one.
+2. **Worse: the indexes were never even built.** `begin_online_node_property_index_named` starts a
+   *non-blocking* build that the server's engine loop pumps with `advance_index_builds`. This driver never
+   pumped it, so the `Reading.seq` RANGE index and the `Sensor.location` POINT index sat `Populating`
+   **forever** — never promoted, never usable. Both are now driven to completion before any data lands.
+   Regression: `churn::tests::the_retention_delete_plans_as_an_index_range_seek_not_a_scan`, which asserts
+   the *planned shape* and proves it has teeth by showing the same statement degrade to a scan under an
+   empty catalog.
+3. **An operator `CHECKPOINT DATABASE` was never counted on `/metrics`.** The maintenance counters
+   document themselves as *"operator `CHECKPOINT DATABASE` **+** the background cadence"*, but only the
+   cadence ever recorded into them — so an operator-triggered reclamation pass freed slots completely
+   invisibly. That is the *only* server-side channel proving a checkpoint did any work on an attached or
+   remote instance. Fixed in `graphus-server/src/engine/mod.rs`; regression:
+   `graphus-server/tests/checkpoint_maintenance_metrics_694.rs`.
 
 ---
 
@@ -21,333 +59,215 @@ full E2E run emits a standardized, schema-versioned evidence report gated agains
 
 | Capability | How it is exercised |
 | --- | --- |
-| **Time-series event-graph modelling** | a `(:Sensor {…, location})-[:EMITTED]->(:Reading {sensor, seq, ts, value})` LPG, one reading per discrete tick |
+| **Time-series event-graph modelling** | `(:Sensor {id, kind, site, location})-[:EMITTED]->(:Reading {sensor, seq, ts, value})`, one reading per discrete tick |
 | **Retention / TTL policy** | a sliding window: each tick `DETACH DELETE`s every reading older than `window` readings |
-| **Sustained ingest + deletion to a steady state** | a long churn loop drives the real engine to a steady state where the live reading count stabilises around `window` |
-| **MVCC delete + tombstone + GC reclamation** | deleted readings are MVCC-tombstoned; a GC maintenance pass physically reclaims their slots into a free-list new inserts reuse |
-| **Bounded on-disk footprint under churn** | the durable footprint **plateaus** — bounded despite total-ingested ≫ window — and the page **high-water mark** is reported |
-| **Geo/time schema — indexes & constraints** | a `POINT` (spatial) index on `Sensor.location`, a composite `RANGE` index on `Reading(sensor, seq)`, a `NODE KEY` on `Sensor.id`, a property-type (`Reading.ts IS :: INTEGER`) + an existence (`Reading.value IS NOT NULL`) constraint — all maintained/enforced under churn |
-| **Spatial + windowed + existence query paths** | a Cartesian proximity query served by the `POINT` index, a per-sensor windowed read served by the composite index, and an `IS NOT NULL` existence scan |
-| **Write-path constraint enforcement** | negative writes (duplicate `Sensor.id`, null `Reading.value`, non-integer `Reading.ts`) are rejected over the real wire |
-| **Deterministic, reproducible workload** | a seeded generator emits a byte-identical churn stream; the whole proof is reproducible |
+| **Index-backed retention sweep** | the aged-out `DELETE` **seeks** the `Reading.seq` RANGE index (asserted at the plan level, not assumed) |
+| **A production-realistic schema** | `NODE KEY` on `Sensor.id`; existence + property-type constraints on the reading; `POINT` index on `Sensor.location`; composite `RANGE` index on `Reading(sensor, seq)`; `RANGE` index on `Reading.seq` |
+| **Schema *enforcement*, over the wire** | a duplicate `Sensor.id`, a float `ts`, and a `value`-less reading are each **rejected** on a live session — and provably create nothing |
+| **Concurrent ingest** | N Bolt connections, **sharded by sensor**, so writers never contend for the same node — the realistic "one gateway per group of devices" shape |
+| **MVCC delete → tombstone → reclamation** | deleted readings are MVCC-tombstoned; a checkpoint's GC pass physically reclaims their slots into a free list new inserts reuse |
+| **The operator trigger** | `CHECKPOINT DATABASE <db>`, issued over the same Bolt connection as everything else |
+| **The automatic trigger** | the background maintenance cadence, firing on WAL growth with no operator at all |
+| **Bounded on-disk footprint** | the durable store **plateaus** — flat, despite total-ingested ≫ window |
+| **Real durable-byte accounting** | store / doublewrite / WAL / catalog, classified **by path**; cumulative WAL volume; kernel `write_bytes` cross-check |
 
 ---
 
-## The time-series model
+## The two runs, and why there are two
 
-A directed Label Property Graph modelling a sensor fleet and its telemetry:
-
-| Node label | Key properties | Meaning |
+| | `evidence/` — the **deterministic mirror** | `evidence-wire/` — the **file-backed wire run** |
 | --- | --- | --- |
-| `(:Sensor {id, kind, site, location})` | `id` = `s-<n>`, `location` = Cartesian `point` | a physical sensor / device (created once; never churned) |
-| `(:Reading {sensor, seq, ts, value})` | `seq` = global monotonic | one time-stamped sample (the churned record) |
+| Engine | real, driven **in-process** | real, driven over **Bolt** |
+| Device / WAL | **in memory** (`MemBlockDevice` / `MemLogSink`) | **on disk** (`FileBlockDevice` + segmented WAL) |
+| Reclamation trigger | an explicit GC pass per tick — the *deterministic stand-in* | the **real** `CHECKPOINT DATABASE` + the background cadence |
+| Footprint curve | **byte-reproducible** for a fixed seed | real, and machine-dependent |
+| Gated by `baseline.json` | **yes** — this is what the committed baseline holds | no (host-dependent) |
+| Durable bytes / WAL / fsync / amplification | **NOT MEASURABLE** (reported as `0` = not measured, and said so out loud) | **measured for real** |
 
-One relationship type carries the time-series edge:
-
-| Relationship | Direction | Meaning |
-| --- | --- | --- |
-| `:EMITTED` | `(:Sensor)->(:Reading)` | the sensor produced this reading |
-
-Readings are modelled as **nodes** (not relationship-only payloads) deliberately: deleting a reading
-with `DETACH DELETE` tombstones a **node** record, its **property** versions, *and* its incident
-`:EMITTED` **relationship** — so every store kind (node / rel / property / overflow) is recycled
-under churn, which is exactly what the reclamation proof targets.
-
-Each sensor carries a deterministic **Cartesian `location`** point, clustered by its `site`: the four
-sites form a 2×2 grid 1000 units apart, and sensors sharing a site are nudged a few units per slot, so
-a proximity query around a site centre returns exactly that site's sensors.
-
-### Schema — indexes & constraints
-
-The bootstrap declares a production-realistic geo/time schema over the model (six statements, all
-`IF NOT EXISTS`), exercising five of the newer index & constraint kinds. The `iot_churn` in-process
-driver applies these through the typed coordinator seam (`churn::apply_schema`) at bootstrap; a full
-server run (`stream.cypher`, `graphus-cli`) submits the identical statements through the admin surface
-— and the hermetic
-[`iot_timeseries_schema.rs`](../../crates/graphus-server/tests/iot_timeseries_schema.rs) proves the
-string form parses to precisely that typed schema:
-
-```cypher
-CREATE CONSTRAINT sensor_id_key         IF NOT EXISTS FOR (s:Sensor)  REQUIRE s.id IS NODE KEY;
-CREATE CONSTRAINT reading_value_exists  IF NOT EXISTS FOR (r:Reading) REQUIRE r.value IS NOT NULL;
-CREATE CONSTRAINT reading_ts_integer    IF NOT EXISTS FOR (r:Reading) REQUIRE r.ts IS :: INTEGER;
-CREATE POINT INDEX sensor_location_point IF NOT EXISTS FOR (s:Sensor)  ON (s.location);
-CREATE INDEX reading_sensor_seq         IF NOT EXISTS FOR (r:Reading) ON (r.sensor, r.seq);
-CREATE INDEX reading_seq                IF NOT EXISTS FOR (r:Reading) ON (r.seq);
-```
-
-| DDL | Kind | Role |
-| --- | --- | --- |
-| `Sensor.id IS NODE KEY` | `NODE KEY` constraint | the fleet's primary key: present + unique |
-| `Reading.value IS NOT NULL` | existence constraint | every telemetry sample must carry a value |
-| `Reading.ts IS :: INTEGER` | property-type constraint | `ts` is an epoch-ms **integer**, never a float |
-| `Sensor.location` | `POINT` (spatial) index | Cartesian proximity ("sensors near a site") |
-| `Reading(sensor, seq)` | composite `RANGE` index | per-sensor windowed reads (leading `sensor` eq + `seq` range) |
-| `Reading.seq` | `RANGE` index | the retention key the aged-out `DELETE` seeks on |
-
-Every churn insert satisfies the constraints by construction (a `Reading` always carries an integer
-`ts` and a `value`; a `Sensor` always carries a unique `id`), and the retention `DELETE` only removes
-whole readings, so it can never leave a constraint violated. The `Reading` indexes are therefore
-**maintained under churn** — a realistic production stress the reclamation proof runs the engine
-through.
-
-**Empirically-verified index utilisation** (asserted honestly on the real planner in
-`iot_timeseries_schema.rs`, and demonstrated over the wire by
-[`data/churn_cli.sh`](data/churn_cli.sh)):
-
-- **`POINT` index — USED.** A Cartesian `point.distance(s.location, point({x, y})) <= 50` predicate
-  lowers to a `SpatialIndexSeek` (a grid candidate superset with the exact `distance` re-checked as a
-  residual filter, so the index only changes the speed, never the answer). "Sensors near site 0's
-  centre `(0, 0)`" returns **exactly the sensors whose `site == 0`**.
-- **Composite `RANGE` index — USED (leading-key seek).** A per-sensor `sensor = 's-0' AND seq ∈ [a, b)`
-  query lowers to a `NodeIndexSeek` on the composite index for the leading `sensor` equality, with the
-  `seq` range kept as a residual filter. The result equals the `(:Sensor)-[:EMITTED]->(:Reading)`
-  traversal for the same window — a self-validating cross-check.
-- **Existence scan.** `seq IS NOT NULL` (over the indexed `Reading.seq`) lowers to a `NodeIndexScan`
-  (Graphus's existence-scan access path). `value IS NOT NULL` — there being no `RANGE` index on
-  `value`, only the existence *constraint* — stays a correct label scan + residual filter; both count
-  every reading.
-- **Enforcement.** A duplicate `Sensor.id` (NODE KEY), a null `Reading.value` (existence) and a
-  non-integer `Reading.ts` (property-type) are each rejected, leaving the counts unchanged.
-
-### Logical time and the retention window
-
-Time is discrete. A global monotonic sequence `seq` (`0, 1, 2, …`) is assigned to readings in order;
-each reading's `ts = EPOCH_MS + seq * TICK_MS`, so `seq` and `ts` are order-equivalent. The
-**retention window** is expressed as a number of readings, `window`: at any tick the policy keeps the
-most-recent `window` readings and deletes everything with `seq < high_water_seq − window`. Because
-the per-tick insert rate is fixed, a window of `W` readings equals a wall-clock window of
-`W × TICK_MS` ms.
-
-The steady-state live `Reading` count therefore converges to `window` (± at most one tick's `rate`,
-i.e. the band `[window, window + rate)`).
+The mirror exists because a plateau you cannot reproduce is not a regression gate. The wire run exists
+because a storage claim you cannot weigh in bytes is not evidence. Neither substitutes for the other, and
+the mirror no longer pretends to storage numbers it cannot have.
 
 ---
 
-## Layout
-
-```
-examples/iot-timeseries/
-├── README.md          # this file
-├── run.sh             # self-contained E2E: generator determinism + churn proof + (optional) wire demo
-├── data/
-│   └── churn_cli.sh   # the optional Bolt-over-UDS wire demonstration (graphus-cli) of ingest+retention
-├── baseline.json      # committed reference evidence report (gated on structural metrics)
-└── evidence/          # written at run time (git-ignored): report.json + report.md
-```
-
-The deterministic generator + the real-engine churn workload live in the dev-only leaf crate
-[`crates/graphus-iot-gen`](../../crates/graphus-iot-gen) (depended on by **nothing** in the
-production build — in particular **not** `graphus-server`, so it adds zero overhead to the shipped
-binary), exposing four binaries (the shared churn engine lives in its `churn` library module, reused
-by the binaries **and** the hermetic test):
-
-- **`iot_gen`** — the hermetic, seeded generator: writes `stream.cypher` (schema + per-tick
-  INSERT/DELETE churn) for a profile. Output is byte-identical per config (CI-runnable, no engine).
-- **`iot_churn`** — the sustained ingest + retention churn workload + the storage-reclamation proof,
-  driving the **real engine** (see *Transport* below).
-- **`iot_evidence`** — drives the *same* in-process churn run, additionally samples process RSS over
-  the loop, and folds the footprint time series + page high-water + `plateau_ratio` + RSS series +
-  throughput + end-to-end time into the standardized `report.json` + `report.md`.
-- **`iot_baseline_cmp`** — the structural-metrics regression gate vs the committed `baseline.json`.
-
----
-
-## Transport — why the reclamation proof runs the engine in-process
-
-> **Honest design note, backed by the code.** Graphus's MVCC garbage collection
-> (`RecordStore::gc`) is a **maintenance operation**: it is WAL-logged and crash-safe, but the live
-> server exposes **no automatic, scheduled, or wire-reachable trigger** for it — there is no GC
-> `EngineCommand`, no `gds`-style Cypher procedure, and no admin statement that runs a GC pass
-> (verified against `graphus-server`'s command surface). Reclamation is reachable only through the
-> in-process store seam (`TxnCoordinator::with_store_mut` → `RecordStore::gc`), as used by the DST
-> harness and the storage test suite. **An operator-reachable GC trigger (an admin statement /
-> EngineCommand) is filed as the improvement `rmp #305`.**
-
-This has a concrete, *measurable* consequence, which the example shows honestly:
-
-- **Over the wire (Bolt / REST), with no GC pass, the footprint grows linearly** with total-ingested
-  — the delete only *tombstones* records; nothing reclaims the slots. This is **not** a bug: the
-  reclamation machinery (free-list reuse + `#220` corpse splice) is correct and proven by the storage
-  test suite; it is simply that the *trigger* is a deliberate maintenance step, not an automatic one.
-- **With the GC maintenance pass interleaved, the footprint plateaus** — freed slots are reused.
-
-So the reclamation proof (`iot_churn`) drives the **production command-dispatch code path**
-(`TxnCoordinator::statement` + `execute` — *exactly* what the server's `handle_run` runs for every
-`RUN`) **inline and single-threaded**, interleaving the GC maintenance pass. This is the real engine,
-real Cypher, real WAL-logged storage — just driven deterministically in one process so the
-steady-state and the plateau are reproducible and assertable. It follows the same precedent as the
-`fraud-oltp` example's `dst_contention` driver and the `bulk-etl` example's offline real-engine
-binaries.
-
-To *also* show the churn over a real **Bolt-over-UDS wire**, `run.sh` optionally runs
-[`data/churn_cli.sh`](data/churn_cli.sh): it boots a real `graphus-server`, declares the geo/time
-**schema** (constraints + indexes) over the real admin surface, drives ingest + retention over a Unix
-Domain Socket with `graphus-cli`, and asserts — over the wire — the steady-state live count, the
-**spatial `POINT` query** (sensors near a site), the **composite windowed read** (cross-checked against
-the `:EMITTED` traversal), and **NODE KEY enforcement** (a rejected duplicate `Sensor.id`), then prints
-`SHOW INDEXES` / `SHOW CONSTRAINTS` as operator-visible evidence. The wire path tombstones deleted
-readings; it does not — and by design cannot — run GC (so it proves the schema + query paths, not the
-storage plateau).
-
----
-
-## The proof, with real numbers (fast profile)
-
-The fast profile churns `rate = 50` readings/tick for `ticks = 60` ticks under a `window = 200`
-retention window — **3 000 readings ingested in total, 15× the window**.
-
-### Steady-state live count (`rmp #295`)
-
-After the window fills (~tick 5), the live `Reading` count holds flat at **200 = `window`** for the
-remaining 55 ticks, with no error:
-
-```
-  tick  total_ingested   live   footprint_B   pages   reclaimed
-     0              50     50        49152       6          0
-     5             300    200       139264      17        100
-    30            1550    200       139264      17        100
-    59            3000    200       139264      17        100
-  ✓ steady-state live count held in [200, 250) for 55 post-warmup ticks
-```
-
-### Storage reclamation — the footprint plateau (`rmp #296`)
-
-With the GC maintenance pass interleaved, the durable footprint reaches a **plateau at 17 pages
-(139 264 B)** by tick 5 and stays *exactly* there through tick 59 — `plateau_ratio = 1.000` — while
-**15× the window** is ingested. Each tick reclaims `100` slots, reused by the next tick's inserts:
-
-```
-  storage: page_high_water=17 footprint_high_water=139264B steady_band=[139264, 139264]B
-           plateau_ratio=1.000 (≤1.50) total_ingested/window=15.0×
-  ✓ footprint PLATEAUED: bounded within 1.50× while ingesting 15.0× the window (reclaimed space reused)
-```
-
-### The honest contrast — what happens *without* a GC pass
-
-Run with `--no-gc` and the same churn (here a 12-tick slice for speed), the footprint grows
-**6 → 35 pages (5.8×) over just 600 readings** while the live count stays at 200 — the tombstones
-accrue without reclamation. This is the curve the GC pass flattens:
-
-```
-  (no-GC contrast) footprint grew 49152B -> 286720B (5.8×) over 600 ingested
-                   — tombstones accrue without a GC pass; this is the curve GC flattens
-```
-
-> **Footprint metric.** The on-disk footprint is the durable device **page high-water × page size**
-> (8 KiB pages) — identical to what a real store file's `length / PAGE_SIZE` reports. The workload
-> runs on the project's deterministic in-memory device so the page high-water is reproducible
-> bit-for-bit; on a file-backed store the same plateau holds, as the storage test suite's
-> file-backed reclamation tests confirm.
-
----
-
-## How to run it
+## Running it
 
 ```bash
-examples/iot-timeseries/run.sh                       # fast profile (CI-fast); builds binaries if needed
-GRAPHUS_BIN_DIR=target/release  examples/iot-timeseries/run.sh
-IOT_PROFILE=large               examples/iot-timeseries/run.sh   # evidence-scale churn
-IOT_TICKS=300                   examples/iot-timeseries/run.sh   # long-running steady-state (plateau held for more ticks)
-RUN_WIRE=0                      examples/iot-timeseries/run.sh   # skip the Bolt-over-UDS wire demo
+examples/iot-timeseries/run.sh                       # local self-boot, fast profile
+IOT_PROFILE=soak      examples/iot-timeseries/run.sh # long, SUSTAINED run (300 ticks, 60x the window)
+IOT_WIRE_PROFILE=soak examples/iot-timeseries/run.sh # soak the WIRE run only
+IOT_CHECKPOINT_EVERY=0 examples/iot-timeseries/run.sh# no operator trigger: lean on the background cadence alone
+IOT_WIRE_CLIENTS=4    examples/iot-timeseries/run.sh # 4 concurrent sensor-sharded ingest connections
+RUN_WIRE=0            examples/iot-timeseries/run.sh # mirror only
 ```
 
-**Profiles & knobs.** `IOT_PROFILE` (`fast` default / `large` evidence-scale) sizes the fleet, rate,
-window and tick count. `IOT_TICKS` is the *long-running steady-state* knob: it overrides only the
-**evidence** run's tick count, so the flat footprint is demonstrated for as long as you ask — the
-deterministic structural metrics the baseline gates (page high-water, plateau footprint) are
-unaffected, only *how long* the plateau is observed. The default (no `IOT_TICKS`, `fast`) is the
-short, CI-fast, baseline-comparable run. A custom-`IOT_TICKS` or non-`fast` run skips the baseline
-gate (it is not byte-comparable to the committed fast/default baseline).
+### Against an already-running instance (attach mode)
 
-The script:
+```bash
+GRAPHUS_TARGET_UDS=/path/to/graphus.sock \
+GRAPHUS_TARGET_REST=http://127.0.0.1:7474 \
+GRAPHUS_TARGET_USER=graphus GRAPHUS_TARGET_PASSWORD=... \
+  examples/iot-timeseries/run.sh
 
-1. **Generator determinism** — generates `stream.cypher` twice and proves it is **byte-identical**
-   per seed (`rmp #294` AC). Hermetic, always runs.
-2. **Sustained ingest + churn + reclamation proof** — runs `iot_churn`, asserting the steady-state
-   live count (`#295`) **and** the footprint plateau despite total-ingested ≫ window (`#296`), and
-   reporting the page high-water mark. Captures machine-readable per-round samples.
-3. **No-GC contrast** — a short `--no-gc` slice, showing the linear-growth curve GC flattens
-   (informational).
-4. *(optional)* **Bolt-over-UDS wire demo** — boots a real server, declares the geo/time schema over
-   the real admin surface, and drives ingest + retention over a UDS with `graphus-cli`, asserting the
-   steady-state live count, the spatial `POINT` query, the composite windowed read and NODE KEY
-   enforcement over the real wire, and printing `SHOW INDEXES` / `SHOW CONSTRAINTS` as evidence.
-5. **Evidence + baseline gate** — runs `iot_evidence` to emit the standardized `report.json` +
-   `report.md` (footprint time series + page high-water + `plateau_ratio` + RSS series + throughput +
-   time) into the git-ignored `evidence/` dir, then gates a fresh fast/default run against
-   `baseline.json` on the **structural** metrics via `iot_baseline_cmp`. The evidence path is printed
-   in the summary.
+# or, over the network:
+GRAPHUS_TARGET_BOLT=bolt+ssc://host:7687 GRAPHUS_TARGET_REST=https://host:7474 \
+GRAPHUS_TARGET_TLS_INSECURE=1 GRAPHUS_TARGET_USER=... GRAPHUS_TARGET_PASSWORD=... \
+  examples/iot-timeseries/run.sh
+```
 
-`run.sh` cleans up after itself (a `trap` removes the private temp workspace on exit; the optional
-wire server is owned + torn down by `data/churn_cli.sh`'s own lifecycle, so this script never holds a
-background server PID — there is no bare-`wait` hazard), and exits non-zero the moment any assertion
-fails — it doubles as an executable E2E test.
-
-### The hermetic default-`cargo test` mirror (`rmp #299`)
-
-The footprint-plateau invariant is *also* guarded in the **default `cargo test`** run with **no
-server, no Bolt driver, no network** — [`tests/churn_plateau.rs`](../../crates/graphus-iot-gen/tests/churn_plateau.rs)
-drives the same in-process churn engine at a tiny, fast config (total-ingested = 10× the window) and
-asserts the footprint is *exactly flat* post-warmup (`plateau_ratio == 1.0`), the steady-state live
-count holds in `[window, window+rate)`, **and** that *without* GC the footprint does **not** plateau
-(so the plateau is demonstrably caused by reclamation, not a no-op). It runs as part of
-`cargo test --all`.
-
-The geo/time **schema** is likewise guarded hermetically in the default `cargo test` by
-[`crates/graphus-server/tests/iot_timeseries_schema.rs`](../../crates/graphus-server/tests/iot_timeseries_schema.rs):
-it drives `Generator::schema_ddl()` through the REAL admin-DDL seam
-(`parse_admin_statement` → `LocalEngine::{index_ddl, constraint_ddl}`) and asserts, in-process, that
-`SHOW INDEXES` / `SHOW CONSTRAINTS` list every declared kind `ONLINE`, that the planner routes the
-proximity / composite / existence queries as documented above, that the query results are correct, and
-that the three constraint negatives are rejected. It is the string-form counterpart of the typed
-coordinator seam the `iot_churn` driver applies, so a drift between the two would fail the suite.
+Attach mode carves out an **isolated database**, runs the churn there, and drops it on exit — the target's
+own data is never touched. The store files and `/proc` belong to the target, so the `storage`, `cpu` and
+`memory` sections carry **nothing**; `measurement_mode: external` and explicit
+`storage_measured=no` / `server_cpu_measured=no` / `server_rss_measured=no` params say so, and the
+server-side evidence is the `/metrics` before → after delta. Note the server **mandates TLS on Bolt-TCP**,
+so an already-running instance on *this* host is attached over `GRAPHUS_TARGET_UDS`.
 
 ---
 
-## Evidence collected
+## Measured evidence
 
-Per the project's *Examples* rule, the example collects explicit evidence across Graphus's
-performance vectors into the standardized, schema-versioned `report.json` + `report.md` (written to
-the git-ignored `evidence/` dir by `iot_evidence`). Four aligned series are captured over the *same*
-churn loop:
+Every figure below is a real measurement from a committed run — none is illustrative. Host: Linux x86_64,
+16 cores (`ROG`), release build, `fast` profile (8 sensors, rate 50/tick, window 200, 60 ticks → 3 000
+readings = **15× the retention window**), 2 concurrent ingest connections, `CHECKPOINT DATABASE` every 5
+ticks. Throughput/latency/CPU/RSS are **machine-variant** and are never gated.
 
-- **Storage footprint time series + plateau (the headline).** A per-tick footprint sample
-  (`footprint_series` = `tick:bytes`), the **page high-water mark** (`storage.store_pages`), the
-  post-warmup **plateau band** (`plateau_min_bytes` / `plateau_max_bytes`, mapped onto
-  `storage.store_bytes`), and the **`plateau_ratio`** (`max / min` of the band — `1.000` means the
-  footprint is *exactly* flat / fully reclaimed). This is the bounded-resource proof: growth then a
-  flat plateau while total-ingested ≫ window.
-- **RSS time series (process RAM).** A per-tick RSS sample (`rss_series` = `tick:bytes`) plus peak /
-  final RSS (`memory.*`). **Read this honestly:** in the single-process inline driver, process RSS is
-  a *high-water of allocator reservations*, not live engine memory — glibc retains freed arenas, so
-  RSS climbs as a high-water even though the engine's durable state is fully reclaimed (the flat
-  footprint above proves the engine *does* release its records). RSS is recorded for visibility only;
-  the **footprint plateau is the bounded-resource signal**, not RSS.
-- **Throughput.** Readings ingested + retention deletes per second over the loop
-  (`throughput.ops_per_sec`, `ingest_events_per_sec`).
-- **End-to-end time.** The churn-loop wall clock (`churn` phase + the run total).
+### The headline: the store plateaus while reclamation climbs
 
-### How to read the evidence — and the threshold split
+```
+store data image (bytes), per tick:
+  49152 → 73728 → 90112 → 114688 → 139264 → 139264 → 155648 → 180224 → 212992 → 229376
+                                                                                    ↑ tick 9
+  then FLAT at 229376 for every one of ticks 10…59, while 2 450 more readings are ingested.
+```
 
-The baseline gate (`iot_baseline_cmp`) deliberately splits the metrics by reproducibility:
+| Metric | Measured |
+| --- | --- |
+| Store data image, post-warmup band | `[229376, 229376]` B — **plateau ratio 1.000** (28 pages) |
+| Total ingested | 3 000 readings (**15×** the window) |
+| Steady-state live `:Reading` count | 200 (the window), held for every post-warmup tick |
+| `graphus_maintenance_versions_reclaimed_total` | **+5 600** over the workload window |
+| `graphus_maintenance_checkpoints_total` | **+18** (12 issued by `CHECKPOINT DATABASE`, 6 by the background cadence) |
+| `graphus_maintenance_stamps_frozen_total` | +15 616 |
+| Transactions committed / aborted | 3 132 / 3 — and the 3 aborts are exactly the 3 constraint violations the example *deliberately* attempts |
+| `statement_panics` | 0 |
 
-| Family | Metrics | Gate |
+**Warmup is derived, not tuned.** The plateau claim starts only after (a) the window has filled and
+(b) reclamation has run **twice** — because the store plateaus by *reusing* freed slots, and one
+checkpoint's freed slots have not been consumed yet. That is `fill_ticks + 2 × checkpoint_every` = tick 15
+here, comfortably after the curve above has already settled at tick 9.
+
+### The no-GC contrast
+
+With the reclamation pass disabled, the same workload's footprint grows **49 152 B → 286 720 B (5.8×)**
+in 12 ticks. That is the curve reclamation flattens — and the reason the plateau is a *result*, not an
+artefact of a workload that simply wrote nothing.
+
+### Real durable bytes (the numbers the old in-memory run could not have)
+
+| Metric | Measured | Note |
 | --- | --- | --- |
-| **Structural (deterministic, tight)** | plateau footprint `storage.store_bytes`, page high-water `storage.store_pages`, `plateau_ratio` (carried as `storage.write_amplification`), per-live-reading cost (`storage.space_amplification`) | **gated ±15 %** |
-| **Machine-variant (ungated)** | RSS (`memory.*`), throughput (`throughput.*`), CPU, wall-time | **∞ tolerance** |
+| Store data image (`graphus.store`) | **229 376 B** | the graph itself |
+| Doublewrite buffer (`graphus.dwb`) | **8 871 936 B** | a **fixed preallocation** per database — not graph data, and deliberately not counted as store |
+| WAL, cumulative bytes written | **59 619 922 B** | every WAL byte is fsynced before its commit is acknowledged |
+| WAL, on-disk peak | **59 619 922 B** | |
+| Kernel `write_bytes` (`/proc/<server-pid>/io`) | **77 049 856 B** | an independent cross-check from *outside* the engine |
+| Logical payload ingested | **81 000 B** | 3 000 readings × (`s-N` + `seq` + `ts` + `value`) |
+| **Write amplification** | **739×** | (cumulative WAL + data image) / logical bytes ingested |
+| **Space amplification** | **12 726×** | total on-disk / logical bytes retained at steady state |
 
-For a fixed seed + profile the churn stream — and therefore the plateaued store footprint it produces
-on the deterministic in-memory device — is byte-reproducible, so a footprint that drifts beyond the
-band is a genuine storage-engine (reclamation) regression worth failing. RSS / throughput / time are
-machine- and timing-dependent and would be flaky to gate across machines, so they are recorded for
-human visibility but given an effectively-infinite tolerance.
+Those last two are staggering, and they are **correct**. They are dominated by the WAL (87 % of the
+footprint) and the fixed doublewrite preallocation (13 %); the graph itself is 0.3 %. Which brings us to
+the finding.
 
-### Honest caveat (carried from `rmp #296` / `#305`)
+### FINDING: the on-disk WAL does **not** plateau — it sawtooths
 
-The plateau is proven by interleaving an **explicit GC maintenance pass** per tick through the
-in-process store seam, because the live server has **no automatic, scheduled, or over-the-wire GC
-trigger** (see *Transport* above) — this is the real engine, real Cypher, real WAL-logged storage,
-just driven deterministically in one process. An operator-reachable GC trigger is filed as the
-improvement **`rmp #305`**; the report's notes carry this caveat verbatim so the evidence is never
-read as claiming an automatic reclamation the server does not yet expose.
+The store plateaus. The WAL does not. Measured on the `soak` profile (300 ticks, 9 000 readings), the
+on-disk WAL climbs to ~67 MB, **drops to 5 MB**, climbs to ~66 MB, drops to 3.3 MB — while the store sits
+flat at 172 032 B throughout. **Peak WAL/store ratio: 260× on `fast`, ~390× on `soak`.**
+
+**Root cause** (traced, not guessed): WAL disk is reclaimed in whole **segment** units, and the active
+segment is only sealed at `DEFAULT_SEGMENT_TARGET_BYTES = 64 MiB`
+([`graphus-wal/src/sink.rs`](../../crates/graphus-wal/src/sink.rs)). The background maintenance cadence,
+meanwhile, *is* adaptive — it fires every `clamp(4 × store_bytes, 8 MiB, 256 MiB)`, i.e. every 8 MiB for a
+store this size (`rmp #556`). So the reclaim **floor advances promptly and correctly**, but for the first
+64 MiB of WAL there is no *sealed* segment below it to delete, and **no disk is freed at all**. When the
+segment finally rolls, the whole 64 MiB is released at once — hence the sawtooth. The *cadence* was made
+store-proportional; the reclaim **granularity** was not.
+
+**Impact.** A database holding a few hundred rows still carries up to ~64 MiB of WAL on disk,
+indefinitely, *per database*. This is **not** a durability defect — nothing is lost and recovery is
+unaffected — but it is a real footprint defect, and it bites hardest exactly where it hurts most: a
+Raspberry Pi 5 hosting several small databases.
+
+**Suggested direction.** Make the segment target adaptive in the same spirit as the cadence — e.g.
+`clamp(k × store_bytes, 1 MiB, 64 MiB)` — so reclaim granularity tracks the store it protects.
+
+The example reports this loudly in `evidence-wire/report.json` and **does not gate on it**: the claim
+under test is that the *store* plateaus while reclamation climbs, and it does. Rounding an inconvenient
+measurement away would be precisely the dishonesty this example was audited for.
+
+### Throughput, latency, CPU, RAM
+
+| Metric | Wire run (real server, over Bolt-UDS) | Deterministic mirror (in-process) |
+| --- | --- | --- |
+| Workload wall-clock | 9.13 s | 1.62 s |
+| Ingest throughput | 329 ops/s | 1 892 ops/s |
+| Ingest latency p50 / p99 / p99.9 | 4.37 / 13.54 / 66.54 ms | 0.36 / 3.59 / 4.53 ms |
+| Retention `DELETE` p50 / p99 | 5.26 / 14.91 ms | (see `retention_delete_latency_ms`) |
+| `CHECKPOINT DATABASE` p50 / p99 | 15.69 / 32.77 ms | n/a |
+| Server CPU over the window | 1.97 s user + 1.52 s system = **0.38 cores** | n/a |
+| Server peak RSS | 445.9 MB | n/a |
+| SSI retries | **0** (sensor-sharded ingest is conflict-free by construction) | n/a |
+
+The server used **0.38 of one core** to sustain this ingest. That is not a CPU ceiling — it is the
+signature of a workload bound by **durability latency** (an `fsync` per commit group), not by compute.
+The wire run is ~5.7× slower than the in-process mirror for exactly that reason: the mirror's WAL is a
+`Vec` in memory and never touches a disk.
+
+**Process RSS is not a bounded-resource proof, and is never gated.** In the in-process mirror it is a
+high-water of *allocator reservations* (glibc retains freed arenas), so it climbs even though the engine's
+durable state is fully reclaimed — the deterministic footprint plateau is what proves the engine releases
+its records. The mirror's report says exactly this, and no longer claims "RAM stays bounded" while
+recording `rss_bounded=false` two fields below.
+
+---
+
+## How the pieces fit
+
+| Component | Path |
+| --- | --- |
+| Deterministic generator + retention policy | [`crates/graphus-iot-gen/src/lib.rs`](../../crates/graphus-iot-gen/src/lib.rs) |
+| In-process churn mirror (real engine, in-memory device) | [`crates/graphus-iot-gen/src/churn.rs`](../../crates/graphus-iot-gen/src/churn.rs) |
+| **File-backed wire driver** (Bolt, real server) | [`crates/graphus-iot-gen/src/bin/iot_wire.rs`](../../crates/graphus-iot-gen/src/bin/iot_wire.rs) |
+| Wire evidence emitter + invariant gate | [`crates/graphus-iot-gen/src/bin/iot_wire_evidence.rs`](../../crates/graphus-iot-gen/src/bin/iot_wire_evidence.rs) |
+| Path-classified footprint accounting | [`crates/graphus-iot-gen/src/footprint.rs`](../../crates/graphus-iot-gen/src/footprint.rs) |
+| Mirror evidence emitter | [`crates/graphus-iot-gen/src/bin/iot_evidence.rs`](../../crates/graphus-iot-gen/src/bin/iot_evidence.rs) |
+| Baseline regression gate | [`crates/graphus-iot-gen/src/bin/iot_baseline_cmp.rs`](../../crates/graphus-iot-gen/src/bin/iot_baseline_cmp.rs) |
+| Hermetic plateau test (runs in the default `cargo test`) | [`crates/graphus-iot-gen/tests/churn_plateau.rs`](../../crates/graphus-iot-gen/tests/churn_plateau.rs) |
+| Schema-parses-to-the-same-thing test | [`crates/graphus-server/tests/iot_timeseries_schema.rs`](../../crates/graphus-server/tests/iot_timeseries_schema.rs) |
+| Checkpoint-metrics regression | [`crates/graphus-server/tests/checkpoint_maintenance_metrics_694.rs`](../../crates/graphus-server/tests/checkpoint_maintenance_metrics_694.rs) |
+
+### A note on the WAL being a *directory*
+
+The server's WAL is `databases/<db>/graphus.wal/` — a **directory** of `seg.<lsn>` files whose leaf names
+contain no "wal" at all. Any code that classifies store-vs-WAL bytes by the **leaf file name** therefore
+counts every WAL byte as store and reports `wal_bytes = 0`. `footprint.rs` classifies **by path**, and a
+unit test builds the real server layout in a temp dir and fails any implementation that does not.
+
+---
+
+## Evidence honesty
+
+This example follows the suite's non-negotiable rules (`examples/README.md` → "Evidence-honesty rules"),
+each of which exists because the opposite was previously done *here*:
+
+* **Measure it or omit it.** No zero placeholders. The mirror's `wal_bytes` / `bytes_fsynced` /
+  amplification are `0` **because they cannot be measured in memory**, and the report says so in a note
+  rather than letting a reader mistake a zero for a result.
+* **`total_millis` is the workload's wall-time.** The previous baseline recorded `0.0247 ms` for a
+  6.6-second run — it was timing the report emission.
+* **Every field carries the quantity its name promises.** `write_amplification` used to smuggle the
+  *plateau ratio* and `space_amplification` the *bytes-per-live-reading*. Both now carry amplification;
+  the plateau ratio has its own name.
+* **Sample the server, not the driver.** CPU, RSS and `write_bytes` are read from `/proc/<server-pid>`.
+* **Never run a stale binary.** `run.sh` builds through the shared `harness_build` seam.

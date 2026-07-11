@@ -28,26 +28,31 @@
 //!    gated.
 //! 4. **End-to-end time** — the churn-loop wall clock, recorded as the `churn` phase + the run total.
 //!
-//! # Schema mapping (no schema widening)
+//! # Schema mapping — and what this report deliberately does NOT claim (`rmp` #694 / #699)
 //!
-//! - **`storage`** — the durable plateau: `store_bytes` = the post-warmup plateau footprint
-//!   (`steady_max_bytes`, deterministic), `store_pages` = `page_high_water`, `wal_bytes` = 0 (the
-//!   in-memory DST WAL is deterministic). `space_amplification` = plateau bytes per steady-state live
-//!   reading (the per-retained-element on-disk cost), `write_amplification` = the `plateau_ratio`
-//!   (≈ 1.0 when fully reclaimed). These four are GATED to a tight band.
-//! - **`throughput`** — `operations` = total churn ops, `ops_per_sec` = events/sec.
+//! - **`storage`** — `store_bytes` = the post-warmup plateau footprint of the in-memory device
+//!   (`steady_max_bytes`, deterministic), `store_pages` = `page_high_water`. **`wal_bytes`,
+//!   `bytes_fsynced`, `write_amplification` and `space_amplification` are NOT MEASURED here and are
+//!   reported as `0` with an explicit note**: the device and WAL are in memory, so there is no store
+//!   file, no WAL file and no fsync to measure. A previous revision papered over that by smuggling the
+//!   *plateau ratio* into `write_amplification` and *bytes-per-live-reading* into
+//!   `space_amplification` — two fields that mean something else entirely. Those figures now live in
+//!   the workload params under their own names, and the REAL durable bytes / WAL volume / fsync volume
+//!   / amplification come from the file-backed `iot_wire` run.
+//! - **`throughput`** — `operations` = total churn ops; `ops_per_sec` = events/sec; the p50/p99/p999
+//!   are the **real, measured** per-statement ingest latencies (an earlier revision emitted `0.0`).
 //! - **`memory`** — peak / final RSS over the loop.
-//! - **`phases`** — one phase, `churn`, with the loop wall time.
+//! - **`phases`** — one phase, `churn`; `total_millis` is the WORKLOAD wall-clock.
 //! - **`workload`** — seed/sensors/rate/window/ticks, the deterministic structural results, the
-//!   footprint + RSS time series (compact), and the `rss_bounded` verdict.
+//!   plateau ratio + bytes-per-live-reading, the footprint + RSS time series, the `rss_bounded` verdict.
 //!
-//! Hermetic: it drives the engine inline under no temp files at all (the DST device + WAL are
-//! in-memory). Deterministic structural metrics; machine-variant RSS/throughput/time.
+//! Hermetic: it drives the engine inline under no temp files at all (the device + WAL are in-memory).
+//! Deterministic structural metrics; machine-variant RSS/throughput/latency/time.
 //!
 //! # Usage
 //!
 //! ```text
-//! iot_evidence --evidence-dir <dir> [--profile fast|large] [--window N] [--ticks N]
+//! iot_evidence --evidence-dir <dir> [--profile fast|large|soak] [--window N] [--ticks N]
 //!              [--scenario iot-timeseries] [--description <text>] [--param k=v]... [--note <t>]...
 //! ```
 
@@ -179,9 +184,40 @@ fn run() -> Result<(), String> {
         );
         w.insert("plateau_ratio".into(), format!("{plateau_ratio:.4}"));
         w.insert(
+            "plateau_bytes_per_live_reading".into(),
+            format!("{bytes_per_live:.1}"),
+        );
+        w.insert(
             "footprint_high_water_bytes".into(),
             outcome.footprint_high_water_bytes.to_string(),
         );
+        // Real, measured statement latencies. The windowed retention DELETE is a structurally different
+        // (and far costlier) statement than a single-reading ingest, so it is reported separately rather
+        // than averaged into the same percentile family — folding them together would misreport both.
+        if let (Some(p50), Some(p99)) = (
+            outcome.insert_latency_ms(500),
+            outcome.insert_latency_ms(990),
+        ) {
+            w.insert(
+                "ingest_latency_ms".into(),
+                format!(
+                    "p50={p50:.3} p99={p99:.3} (n={})",
+                    outcome.insert_latencies_ns.len()
+                ),
+            );
+        }
+        if let (Some(p50), Some(p99)) = (
+            outcome.delete_latency_ms(500),
+            outcome.delete_latency_ms(990),
+        ) {
+            w.insert(
+                "retention_delete_latency_ms".into(),
+                format!(
+                    "p50={p50:.3} p99={p99:.3} (n={})",
+                    outcome.delete_latencies_ns.len()
+                ),
+            );
+        }
         w.insert(
             "ingest_events_per_sec".into(),
             format!("{events_per_sec:.1}"),
@@ -204,6 +240,9 @@ fn run() -> Result<(), String> {
 
     collector.start();
     collector.phase("churn", wall);
+    // `total_millis` must be the WORKLOAD wall-clock, not the report-emission time (`rmp` #699 — the
+    // previous baseline recorded a total of 0.02 ms for a 6.6-second run).
+    collector.record_total_duration(wall);
 
     // CPU: the self-process cumulative time over the run.
     let cpu = cpu_section(cpu_times, wall);
@@ -216,35 +255,57 @@ fn run() -> Result<(), String> {
     collector.memory_mut().peak_rss_bytes = mem.peak_rss_bytes;
     collector.memory_mut().final_rss_bytes = mem.final_rss_bytes;
 
-    // Storage: the DETERMINISTIC plateau, mapped onto the gated fields.
+    // Storage: the DETERMINISTIC plateau of the in-memory device — and NOTHING else.
+    //
+    // `rmp` #694 / #699: the WAL / fsync / amplification fields are left at `0` because they are NOT
+    // MEASURABLE in this mirror (the device and the WAL are in memory: no store file, no WAL file, no
+    // fsync), and the note below says so in as many words. They are emphatically NOT re-used to smuggle
+    // other quantities: `write_amplification` used to carry the plateau ratio and `space_amplification`
+    // the bytes-per-live-reading, which made both fields lie about what they are. Those two figures are
+    // now workload params under their own names, and the real storage evidence — durable bytes, WAL
+    // volume, fsync volume, true write/space amplification — comes from the file-backed `iot_wire` run.
     {
         let s = collector.storage_mut();
         s.store_bytes = outcome.steady_max_bytes;
         s.store_pages = outcome.page_high_water;
-        s.wal_bytes = 0; // the in-memory DST WAL has no durable byte length to report
-        s.wal_pages = 0;
-        s.bytes_fsynced = 0;
-        // space_amplification := plateau bytes per retained (live) reading — the per-element on-disk
-        // cost at steady state. write_amplification := the plateau ratio (≈ 1.0 when fully reclaimed,
-        // i.e. the late-run footprint equals the post-warmup footprint). Both deterministic, GATED.
-        s.space_amplification = bytes_per_live;
-        s.write_amplification = plateau_ratio;
     }
 
-    // Throughput: total churn ops over the loop window; events/sec.
+    // Throughput: total churn ops over the loop window; events/sec; and the REAL measured per-statement
+    // ingest latency percentiles (an earlier revision emitted a fabricated 0.0 for all three).
     collector.throughput_mut().operations = throughput.count();
     collector.throughput_mut().ops_per_sec = events_per_sec;
+    if let Some(p50) = outcome.insert_latency_ms(500) {
+        collector.throughput_mut().p50_latency_ms = p50;
+    }
+    if let Some(p99) = outcome.insert_latency_ms(990) {
+        collector.throughput_mut().p99_latency_ms = p99;
+    }
+    if let Some(p999) = outcome.insert_latency_ms(999) {
+        collector.throughput_mut().p999_latency_ms = p999;
+    }
 
     collector.note(format!(
-        "STORAGE RECLAMATION PLATEAU (the headline, DETERMINISTIC, GATED): over {} ticks the workload \
+        "STORAGE RECLAMATION PLATEAU (the DETERMINISTIC mirror, GATED): over {} ticks the workload \
          ingested {total_ingested} readings ({ingest_to_window:.1}× the retention window of {}), yet the \
-         durable on-disk footprint PLATEAUED — post-warmup band [{}, {}]B (plateau_ratio {plateau_ratio:.3}, \
-         page high-water {} pages). storage.store_bytes is that plateau footprint, store_pages the page \
-         high-water, space_amplification the plateau bytes per live reading, write_amplification the \
-         plateau ratio. These are byte-stable for a fixed seed+profile and the baseline gate holds them \
-         to a tight band; reclaimed slots are demonstrably reused, not unbounded growth.",
+         device footprint PLATEAUED — post-warmup band [{}, {}]B (plateau_ratio {plateau_ratio:.3}, page \
+         high-water {} pages, {bytes_per_live:.0}B per live reading). storage.store_bytes is that plateau \
+         footprint and store_pages the page high-water; both are byte-stable for a fixed seed+profile, \
+         and the baseline gate holds them to a tight band. Reclaimed slots are demonstrably reused, not \
+         unbounded growth. Every statement is planned against the coordinator's POPULATED IndexCatalog \
+         (rmp #694), so the retention DELETE really does seek the Reading.seq RANGE index rather than \
+         full-scanning as it silently did before.",
         cfg.ticks, cfg.window, outcome.steady_min_bytes, outcome.steady_max_bytes, outcome.page_high_water,
     ));
+    collector.note(
+        "STORAGE FIELDS NOT MEASURED HERE (rmp #694 / #699 — stated, not zero-filled by accident): this \
+         mirror runs the real engine over an IN-MEMORY device and WAL, so there is no store file, no WAL \
+         file and no fsync. storage.wal_bytes, storage.bytes_fsynced, storage.write_amplification and \
+         storage.space_amplification are therefore 0 = NOT MEASURED, not observations. The real durable \
+         bytes, cumulative WAL volume, fsync volume and true write/space amplification are measured by the \
+         FILE-BACKED wire run (`iot_wire` → evidence-wire/report.json), which drives the same workload over \
+         Bolt against a real graphus-server with a real FileBlockDevice and a real segmented WAL."
+            .to_string(),
+    );
     collector.note(format!(
         "PROCESS RSS (machine- AND allocator-variant, NOT gated, informational): an RSS sample was taken \
          every tick over the same loop (full per-tick rss_series + footprint_series in the workload \
@@ -257,11 +318,17 @@ fn run() -> Result<(), String> {
         outcome.page_high_water,
     ));
     collector.note(
-        "HONEST CAVEAT (rmp #296 / #305): the MVCC GC maintenance pass that reclaims tombstoned slots has \
-         NO automatic, scheduled, or over-the-wire trigger in the live server (no GC EngineCommand, Cypher \
-         procedure, or admin statement). The plateau is therefore proven by driving the engine inline and \
-         interleaving an explicit GC pass per tick — the real engine, real Cypher, real WAL-logged storage, \
-         just driven deterministically in one process. An operator-reachable GC trigger is filed as rmp #305."
+        "RECLAMATION IS OPERATOR-REACHABLE AND AUTOMATIC (rmp #305 — SHIPPED; the earlier revision of this \
+         example claimed the opposite, and that claim was STALE). The live server reclaims through two real \
+         paths: (1) `CHECKPOINT DATABASE <name>`, a parsed admin statement issuable over Bolt or REST like \
+         any other statement, which runs a reader-safe GC pass plus a sharp checkpoint; and (2) a background \
+         maintenance cadence that runs the same pass automatically once the WAL has grown by \
+         clamp(4 × store_bytes, 8 MiB, 256 MiB) since the last one, with no operator action at all. The \
+         explicit per-tick GC pass THIS mirror interleaves is not a workaround for a missing trigger — it is \
+         the DETERMINISTIC STAND-IN for those two paths, placing a reclaim at an exact, reproducible point in \
+         the tick loop so the footprint curve is byte-reproducible. The real triggers are exercised over the \
+         wire by the file-backed `iot_wire` run, whose report gates on the server's own \
+         graphus_maintenance_versions_reclaimed_total climbing while the on-disk store plateaus."
             .to_string(),
     );
     for note in &args.notes {
@@ -405,12 +472,20 @@ fn parse_args() -> Result<Args, String> {
         args.scenario = "iot-timeseries".to_string();
     }
     if args.description.is_empty() {
+        // NOTE: this deliberately does NOT claim "while RAM stays bounded". The previous revision did,
+        // and the very same report recorded `rss_bounded=false` two fields later — a claim contradicted
+        // by its own evidence. Process RSS in this single-process inline driver is an allocator
+        // high-water, not live engine memory, and it is not a bounded-resource proof of anything (see the
+        // RSS note the report emits). The DETERMINISTIC FOOTPRINT PLATEAU is the claim; RSS is reported
+        // for visibility only.
         args.description =
-            "IoT / time-series event graph: sustained ingest of time-stamped sensor readings under a \
-             sliding-window retention policy (delete-old + insert-new churn), proving the engine reaches \
-             a steady state (live count ~ window) and the on-disk footprint PLATEAUS under churn — \
-             reclaimed slots reused via the MVCC GC maintenance pass, not unbounded growth — while RAM \
-             stays bounded."
+            "IoT / time-series event graph (DETERMINISTIC in-memory mirror): sustained ingest of \
+             time-stamped sensor readings under a sliding-window retention policy (delete-old + \
+             insert-new churn), proving the engine reaches a steady state (live count ~ window) and the \
+             device footprint PLATEAUS under churn — reclaimed slots demonstrably reused, not unbounded \
+             growth. Durable bytes, WAL volume, fsync volume and amplification are NOT measurable here \
+             (the device and WAL are in memory); the file-backed `iot_wire` run measures those against a \
+             real server."
                 .to_string();
     }
     Ok(args)

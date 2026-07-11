@@ -78,6 +78,16 @@ use std::fmt::Write as _;
 #[cfg(feature = "churn")]
 pub mod churn;
 
+/// Decomposed, **path-classified** on-disk footprint accounting for a real `graphus-server` database
+/// directory (data image / doublewrite / WAL / catalog). Pure `std::fs` — no engine, no feature gate —
+/// so the `iot_wire` driver and the tests share exactly one classifier.
+pub mod footprint;
+
+/// The machine-readable result of a file-backed over-the-wire churn run: the contract between the
+/// `iot_wire` driver and the hermetic `iot_wire_evidence` emitter/gate. Serde only — no engine, no
+/// wire stack — so the gate builds and runs anywhere.
+pub mod wire_samples;
+
 /// A tiny, fast, fully-deterministic PRNG (SplitMix64 — Steele, Lea & Flood 2014). Chosen because it
 /// is a *pure* integer mixing function: identical output for identical seeds on every platform, with
 /// no global state, no float, and no allocation. We never use the standard library's `HashMap`-based
@@ -185,13 +195,35 @@ impl GenConfig {
         }
     }
 
-    /// Resolves a profile name (`"fast"` / `"large"`) to a config; unknown names fall back to
-    /// `fast`. The single knob most worth overriding from the CLI — the retention `window` — is left
-    /// to the caller to patch after resolving.
+    /// The **soak** profile — a long, sustained run rather than a burst. The audit of this example
+    /// (`rmp` #694) found its scale was "a few-thousand-record burst, not sustained", which is the
+    /// wrong shape for a *retention* claim: a plateau only means something if it is held for a long
+    /// time under continuous churn. This profile therefore keeps the per-tick ingest rate and the
+    /// window modest (so each tick is cheap and the wire run stays interactive) and instead runs for
+    /// **many** ticks: the run ingests ~60× the retention window and observes the plateau for
+    /// hundreds of consecutive post-warmup ticks.
+    ///
+    /// Sized so the file-backed wire run stays under a few minutes: the cost driver is the number of
+    /// round trips (`rate × ticks` ingest statements) plus one windowed retention `DELETE` per tick.
+    #[must_use]
+    pub fn soak() -> Self {
+        Self {
+            seed: 0xC0FF_EE15_600D_5EED,
+            sensors: 12,
+            rate: 30,
+            window: 150,
+            ticks: 300,
+        }
+    }
+
+    /// Resolves a profile name (`"fast"` / `"large"` / `"soak"`) to a config; unknown names fall back
+    /// to `fast`. The single knob most worth overriding from the CLI — the retention `window` — is
+    /// left to the caller to patch after resolving.
     #[must_use]
     pub fn from_profile(name: &str) -> Self {
         match name {
             "large" => Self::large(),
+            "soak" => Self::soak(),
             _ => Self::fast(),
         }
     }
@@ -205,6 +237,26 @@ impl GenConfig {
     }
 }
 
+/// One generated telemetry reading, in **structured** form — the same data the tick's literal
+/// `CREATE` text encodes, before it is rendered to Cypher.
+///
+/// The in-process driver runs the literal statements (they keep the emitted stream byte-identical and
+/// the determinism proof simple); the over-the-wire driver instead binds these fields as real **Bolt
+/// parameters** (`$sid`, `$seq`, `$ts`, `$value`), which is both the realistic client shape and the one
+/// that exercises the server's parameterized plan cache. Both consume the SAME generated values, so
+/// the two drivers ingest exactly the same telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadingRow {
+    /// The global monotonic sequence number (also the retention key).
+    pub seq: u64,
+    /// Index of the emitting sensor (`0..sensors`); its id is [`Generator::sensor_id`].
+    pub sensor: u64,
+    /// Epoch-ms timestamp: `EPOCH_MS + seq * TICK_MS`.
+    pub ts: u64,
+    /// The telemetry value, in `[0, 1000)`.
+    pub value: u64,
+}
+
 /// The Cypher one tick contributes to the churn: an INSERT batch (new readings) and a DELETE batch
 /// (the readings that aged out of the window this tick). Either may be empty (the DELETE is empty
 /// until the window first fills).
@@ -215,6 +267,9 @@ pub struct TickCypher {
     /// `CREATE` statements for this tick's new readings (one per reading), each wiring the reading to
     /// its sensor via `:EMITTED`.
     pub inserts: Vec<String>,
+    /// The SAME readings in structured form, in the same order as [`inserts`](Self::inserts) — what a
+    /// parameterized client (the over-the-wire driver) binds instead of rendering literal text.
+    pub readings: Vec<ReadingRow>,
     /// A single `DETACH DELETE` statement removing every reading older than the window, or `None`
     /// when nothing has aged out yet.
     pub delete: Option<String>,
@@ -370,6 +425,7 @@ impl Generator {
         let first_seq = self.seq;
 
         let mut inserts = Vec::with_capacity(self.cfg.rate as usize);
+        let mut readings = Vec::with_capacity(self.cfg.rate as usize);
         for _ in 0..self.cfg.rate {
             let seq = self.seq;
             let sensor = self.rng.below(self.cfg.sensors.max(1));
@@ -383,6 +439,12 @@ impl Generator {
                 Self::sensor_id(sensor),
                 Self::sensor_id(sensor),
             ));
+            readings.push(ReadingRow {
+                seq,
+                sensor,
+                ts,
+                value,
+            });
             self.seq += 1;
         }
 
@@ -405,6 +467,7 @@ impl Generator {
         Some(TickCypher {
             tick,
             inserts,
+            readings,
             delete,
             first_seq,
             next_seq: self.seq,

@@ -1,3 +1,8 @@
 # Evidence directories are written at run time by examples and must never be committed.
 # (See examples/README.md — the `evidence/` convention.)
 **/evidence/
+# Some examples emit a SECOND report for a distinct measurement mode, so it can stand beside the first
+# rather than overwrite it (iot-timeseries: `evidence/` is the deterministic in-memory mirror the
+# committed baseline gates; `evidence-wire/` is the file-backed over-the-wire run that carries the real
+# durable-byte evidence). Same rule: generated at run time, never committed.
+**/evidence-wire/

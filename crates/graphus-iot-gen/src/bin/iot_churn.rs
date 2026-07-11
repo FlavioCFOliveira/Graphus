@@ -20,12 +20,27 @@
 //!
 //! The engine-driving logic lives in [`graphus_iot_gen::churn`] (shared with `iot_evidence` and the
 //! hermetic `churn_plateau` cargo test); this binary owns the CLI, the human-readable curve, and the
-//! pass/fail assertions. See that module's docs for why the workload drives the engine inline (the
-//! GC maintenance pass has no over-the-wire trigger — `rmp #305`).
+//! pass/fail assertions.
+//!
+//! # This is the DETERMINISTIC MIRROR, not the storage evidence
+//!
+//! The device and WAL here are **in memory**, so the footprint curve is byte-reproducible for a fixed
+//! seed — which is exactly what makes the plateau assertable and the baseline gate meaningful — but
+//! there is no store file, no WAL file and no fsync to measure. The REAL durable bytes, WAL volume,
+//! fsync volume and amplification are measured by the FILE-BACKED `iot_wire` driver, which drives the
+//! same workload over Bolt against a real `graphus-server`.
+//!
+//! The per-tick GC pass this driver interleaves is **not** a workaround for a missing trigger. As of
+//! `rmp` #305 the live server reclaims through `CHECKPOINT DATABASE <name>` (a parsed admin statement,
+//! issuable over the wire) **and** through a background maintenance cadence that needs no operator at
+//! all; the in-process pass is the deterministic stand-in for those, placing a reclaim at an exact
+//! point in the tick loop. Earlier revisions of this example claimed no such trigger existed — that
+//! claim was stale and has been corrected everywhere.
 //!
 //! Usage:
 //!   cargo run -p graphus-iot-gen --features churn --bin iot_churn -- --profile fast
 //!   cargo run -p graphus-iot-gen --features churn --bin iot_churn -- --profile fast --json <path>
+//!   cargo run -p graphus-iot-gen --features churn --bin iot_churn -- --profile soak
 //!   cargo run -p graphus-iot-gen --features churn --bin iot_churn -- --profile large --no-gc
 
 use std::path::PathBuf;

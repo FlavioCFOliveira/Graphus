@@ -2099,7 +2099,20 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             // progress again, so clear **this engine's own** maintenance-degraded flag (`rmp` #435 —
             // never another engine's). On failure the flag is left as-is (an operator's manual probe
             // does not escalate the background streak).
-            if out.is_ok() {
+            //
+            // `rmp` #694: it must ALSO be COUNTED. `graphus_maintenance_checkpoints_total` /
+            // `_versions_reclaimed_total` / `_stamps_frozen_total` document themselves as "operator
+            // `CHECKPOINT DATABASE` **+** the background cadence" (see `Metrics::render_prometheus`),
+            // yet only the background cadence (`maybe_run_maintenance`) ever recorded into them — an
+            // operator-triggered pass reclaimed slots and froze stamps completely invisibly. Those
+            // counters are the ONLY server-side channel proving a `CHECKPOINT DATABASE` did any work
+            // (an attached/remote instance exposes no `/proc` and no store files), so a counter frozen
+            // at `0` while slots are demonstrably freed is a false negative on the signal operators
+            // alert on. Record exactly what the cadence records, from the same `CheckpointReply`.
+            // Regression: `graphus-server/tests/checkpoint_maintenance_metrics_694.rs`.
+            if let Ok(summary) = &out {
+                metrics
+                    .record_maintenance_checkpoint(summary.reclaimed as u64, summary.frozen as u64);
                 maintenance_degraded.clear();
             }
             let _ = reply.send(out);
