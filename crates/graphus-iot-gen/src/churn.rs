@@ -9,20 +9,42 @@
 //!   [`EvidenceReport`](graphus_examples_harness::EvidenceReport)),
 //! - the hermetic `tests/churn_plateau.rs` cargo test (the default-`cargo test` reclamation gate).
 //!
-//! # Why this drives the engine INLINE (not over Bolt/TCP) — and why that is still the real engine
+//! # What this module is — and what it is NOT
 //!
-//! Graphus's MVCC garbage collection ([`RecordStore::gc`](graphus_storage::RecordStore::gc)) is a **maintenance operation**: it is
-//! WAL-logged and crash-safe, but the live server has **no automatic, scheduled, or wire-reachable
-//! trigger** for it (there is no GC `EngineCommand`, Cypher procedure, or admin statement — verified
-//! against `graphus-server`'s command surface; filed as improvement `rmp #305`). Without a GC pass
-//! the delete-old/insert-new churn only tombstones records, so the footprint grows **linearly** with
-//! total-ingested. The reclamation this example proves therefore requires invoking GC, reachable only
-//! through the in-process store seam ([`TxnCoordinator::with_store_mut`](graphus_cypher::coordinator::TxnCoordinator::with_store_mut)). So the workload drives the
-//! **production command-dispatch code path** — `TxnCoordinator::statement` + `execute`, *exactly*
-//! what the server's `handle_run` calls per `RUN` — inline and single-threaded (the same approach
-//! `graphus-fraud-gen`'s `dst_contention` and `graphus-dst` use), interleaving the GC maintenance
-//! pass. This is the real engine, real Cypher, real WAL-logged storage — just driven deterministically
-//! in one process so the steady-state and plateau are reproducible and assertable.
+//! This is the **deterministic, in-memory mirror** of the reclamation proof: it drives the real engine
+//! inline over an in-memory device + WAL ([`MemBlockDevice`] / [`MemLogSink`]) so the footprint curve is
+//! byte-reproducible for a fixed seed and can be asserted exactly (`tests/churn_plateau.rs` runs in the
+//! default `cargo test`). It drives the **production command-dispatch code path** — `TxnCoordinator::
+//! statement` + `execute`, *exactly* what the server's `handle_run` calls per `RUN` — single-threaded,
+//! and interleaves the same GC maintenance pass the server's checkpoint runs. Real engine, real Cypher,
+//! real WAL-logged storage; just driven in one process so the plateau is reproducible.
+//!
+//! It is **not** the storage evidence. Because the device and WAL are in memory there is no store file
+//! and no WAL file: durable bytes, WAL/store amplification and fsync volume are structurally
+//! unmeasurable here. Those are measured by the FILE-BACKED `iot_wire` run, which drives the same
+//! workload over a real Bolt wire against a real `graphus-server` (real `FileBlockDevice` + real
+//! segmented WAL) and samples the on-disk footprint and the server's `/metrics`.
+//!
+//! # Reclamation has an operator trigger AND an automatic cadence (`rmp` #305 — shipped)
+//!
+//! An earlier revision of this example claimed the MVCC GC maintenance pass had "no automatic,
+//! scheduled, or wire-reachable trigger". **That is no longer true**, and every file that said so has
+//! been corrected. As of `rmp` #305 the live server reclaims through two real, operator-visible paths:
+//!
+//! 1. **`CHECKPOINT DATABASE <name>`** — a parsed admin statement (`graphus-server`'s
+//!    `admin::parse_admin_statement` → `AdminCommand::CheckpointDatabase` → `DbCatalog::checkpoint` →
+//!    `EngineCommand::Checkpoint`), issuable over Bolt or REST like any other statement. It runs a
+//!    reader-safe GC pass plus a sharp checkpoint, and now increments
+//!    `graphus_maintenance_checkpoints_total` / `_versions_reclaimed_total` (`rmp` #694).
+//! 2. **A background maintenance cadence** — `graphus-server`'s engine loop runs the same pass
+//!    automatically once the WAL has grown by `clamp(4 × store_bytes, 8 MiB, 256 MiB)` since the last
+//!    one (`engine::maintenance_interval_bytes`, `rmp` #556), with no operator action at all.
+//!
+//! The in-process GC pass below ([`gc_pass`]) is therefore not a workaround for a missing trigger: it
+//! is the *deterministic stand-in* for those two paths, letting the mirror place a reclaim at an exact,
+//! reproducible point in the tick loop. The wire run exercises the real triggers.
+
+use std::time::{Duration, Instant};
 
 use graphus_core::{TxnId, Value};
 use graphus_cypher::coordinator::TxnCoordinator;
@@ -82,6 +104,13 @@ pub struct ChurnOutcome {
     pub steady_max_bytes: u64,
     /// The tick index at which warmup ends (the window has filled and one GC pass has run).
     pub warmup_ticks: u64,
+    /// Real end-to-end latency (ns) of every single-reading ingest statement (plan + execute + commit),
+    /// in execution order. Machine-variant, never gated — but **measured**, never invented.
+    pub insert_latencies_ns: Vec<u64>,
+    /// Real end-to-end latency (ns) of every per-tick retention `DETACH DELETE`, in execution order.
+    /// Kept separate from the ingest family: a windowed delete is a structurally different (and far
+    /// more expensive) statement, so folding both into one percentile would misreport both.
+    pub delete_latencies_ns: Vec<u64>,
 }
 
 impl ChurnOutcome {
@@ -106,6 +135,21 @@ impl ChurnOutcome {
         self.total_ingested() as f64 / self.cfg.window.max(1) as f64
     }
 
+    /// The `permille`-th percentile (`500` = p50, `990` = p99, `999` = p99.9) of the **ingest**
+    /// statement latencies, in milliseconds, or `None` when nothing was ingested. Real measurements —
+    /// an empty family yields `None` rather than a fabricated `0.0`.
+    #[must_use]
+    pub fn insert_latency_ms(&self, permille: u32) -> Option<f64> {
+        percentile_ms(&self.insert_latencies_ns, permille)
+    }
+
+    /// The `permille`-th percentile of the per-tick **retention `DETACH DELETE`** latencies, in
+    /// milliseconds, or `None` when the window never filled (no delete ever ran).
+    #[must_use]
+    pub fn delete_latency_ms(&self, permille: u32) -> Option<f64> {
+        percentile_ms(&self.delete_latencies_ns, permille)
+    }
+
     /// The steady-state live `:Reading` count (the last post-warmup sample's live count, which holds
     /// in `[window, window + rate)`), or the last sample's when the run was shorter than warmup.
     #[must_use]
@@ -119,6 +163,21 @@ impl ChurnOutcome {
     }
 }
 
+/// The `permille`-th percentile of `latencies_ns`, in milliseconds — `None` for an empty sample (an
+/// unmeasured family must never be reported as `0.0`). Nearest-rank on a copy sorted in place.
+fn percentile_ms(latencies_ns: &[u64], permille: u32) -> Option<f64> {
+    if latencies_ns.is_empty() {
+        return None;
+    }
+    let mut sorted = latencies_ns.to_vec();
+    sorted.sort_unstable();
+    // Nearest-rank: index = ceil(permille/1000 * n) - 1, clamped into range.
+    let n = sorted.len();
+    let rank = ((u64::from(permille) * n as u64).div_ceil(1000)).max(1) as usize;
+    let ns = sorted[rank.min(n) - 1];
+    Some(ns as f64 / 1e6)
+}
+
 fn fresh_coord() -> Coord {
     let device = MemBlockDevice::new(0);
     let wal = WalManager::create(MemLogSink::new()).expect("create wal");
@@ -129,11 +188,19 @@ fn fresh_coord() -> Coord {
 /// Runs one Cypher statement to completion inside `txn` over the coordinator's statement seam (the
 /// production code path), returning the materialised rows. Panics if the statement captured an
 /// engine error — every statement in this workload is well-formed by construction.
-fn run_stmt(coord: &Coord, txn: TxnId, src: &str) -> Vec<Row> {
+///
+/// `catalog` is the coordinator's **populated** [`IndexCatalog`] ([`TxnCoordinator::catalog`]) — the
+/// same snapshot the server's `handle_run` hands the physical planner. `rmp` #694: this driver used to
+/// plan against `IndexCatalog::empty()`, so the schema it so carefully declares (a `RANGE` index on
+/// `Reading.seq`, a composite on `Reading(sensor, seq)`, a `POINT` index on `Sensor.location`) was
+/// invisible to the planner and **every** statement fell back to a full label scan — including the
+/// per-tick retention `DELETE`, whose whole point is to seek the `Reading.seq` range index. The driver
+/// was measuring an unindexed engine while the README described an indexed one.
+fn run_stmt(coord: &Coord, txn: TxnId, src: &str, catalog: &IndexCatalog) -> Vec<Row> {
     let toks = tokenize(src).expect("lex");
     let ast = parse_tokens(&toks, src).expect("parse");
     let validated = analyze(&ast).expect("analyze");
-    let plan = plan_physical(&lower(&validated), &IndexCatalog::empty());
+    let plan = plan_physical(&lower(&validated), catalog);
     let bound = bind_parameters(&plan, &Parameters::new()).expect("bind");
     let mut graph = coord.statement(txn).expect("statement");
     let rows = {
@@ -148,11 +215,14 @@ fn run_stmt(coord: &Coord, txn: TxnId, src: &str) -> Vec<Row> {
     rows
 }
 
-/// Runs `src` in its own committed serializable auto-commit transaction.
-fn exec_commit(coord: &mut Coord, src: &str) {
+/// Runs `src` in its own committed serializable auto-commit transaction, returning the statement's
+/// end-to-end latency (plan + execute + commit) — the real per-operation cost this driver observes.
+fn exec_commit(coord: &mut Coord, src: &str, catalog: &IndexCatalog) -> Duration {
+    let started = Instant::now();
     let txn = coord.begin_serializable();
-    let _ = run_stmt(coord, txn, src);
+    let _ = run_stmt(coord, txn, src, catalog);
     coord.commit(txn).expect("commit");
+    started.elapsed()
 }
 
 /// Applies the geo/time **schema** ([`Generator::schema_ddl`]) through the coordinator's typed schema
@@ -213,12 +283,34 @@ fn apply_schema(coord: &mut Coord) {
             Some(ConstraintTypeDescriptor::Integer),
         )
         .expect("create property-type constraint on Reading.ts");
+
+    // `rmp` #694 — DRIVE THE ONLINE INDEX BUILDS TO COMPLETION.
+    //
+    // `begin_online_node_property_index_named` and `create_point_index` start **non-blocking** builds:
+    // the index is registered `Populating`, and is promoted to `Online` — and therefore becomes visible
+    // to the planner at all ([`TxnCoordinator::catalog`] deliberately WITHHOLDS a `Populating` index, so
+    // a seek is never routed to a half-built structure) — only once `advance_index_builds` has walked its
+    // snapshot to the end. In the live server the engine loop pumps that queue every tick
+    // (`engine::LOCAL_INDEX_BUILD_BUDGET`).
+    //
+    // This driver never pumped it. So the `Reading.seq` RANGE index and the `Sensor.location` POINT index
+    // sat `Populating` for the ENTIRE run — not merely unused by the planner, but never finished. Nothing
+    // failed, because the scan fallback returns identical results, so the example passed every assertion
+    // it had while describing an indexed engine it had never actually built. Pumping here (the store is
+    // still empty, so it completes instantly) is exactly what the server does, and what
+    // `graphus-social-gen`'s loader does.
+    while coord.advance_index_builds(usize::MAX) {}
 }
 
 /// The current live `Reading` count, read in its own committed snapshot transaction.
-fn live_readings(coord: &mut Coord) -> u64 {
+fn live_readings(coord: &mut Coord, catalog: &IndexCatalog) -> u64 {
     let txn = coord.begin_serializable();
-    let rows = run_stmt(coord, txn, "MATCH (r:Reading) RETURN count(r) AS c");
+    let rows = run_stmt(
+        coord,
+        txn,
+        "MATCH (r:Reading) RETURN count(r) AS c",
+        catalog,
+    );
     coord.commit(txn).expect("commit count");
     match rows.first().and_then(|r| r.values().first()) {
         Some(RowValue::Value(Value::Integer(n))) => *n as u64,
@@ -278,8 +370,21 @@ where
     // FIRST so the sensor fleet — and every subsequent churn insert/delete — is constraint-checked
     // and index-maintained, exercising the write-path enforcement + index maintenance under churn.
     apply_schema(&mut coord);
+
+    // The planner's view of that schema (`rmp` #694). Snapshotted ONCE, after the DDL and before any
+    // data: the schema never changes during the churn, so one snapshot is exactly what every statement
+    // must plan against — and it is the same `IndexCatalog` the server's engine hands its planner. It
+    // is asserted non-empty because a silently-empty catalog is precisely the defect this fixes: the
+    // driver would still pass every functional assertion while secretly full-scanning.
+    let catalog = coord.catalog();
+    assert!(
+        !catalog.indexes().is_empty(),
+        "the coordinator's IndexCatalog must be populated after the schema DDL — an empty catalog \
+         means every statement would fall back to a full label scan (rmp #694)"
+    );
+
     for stmt in generator.sensor_cypher() {
-        exec_commit(&mut coord, &stmt);
+        exec_commit(&mut coord, &stmt, &catalog);
     }
 
     // Warmup boundary: the window fills after ceil(window / rate) ticks; we treat the first such
@@ -292,17 +397,23 @@ where
     let mut footprint_high_water_bytes = 0u64;
     let mut steady_min_bytes = u64::MAX;
     let mut steady_max_bytes = 0u64;
+    // Real, per-statement latencies (nanoseconds), kept apart because the two statement shapes have
+    // wildly different costs: a single-reading CREATE vs a windowed retention DELETE. Mixing them into
+    // one percentile family would be dishonest evidence.
+    let mut insert_latencies_ns: Vec<u64> = Vec::with_capacity(cfg.total_readings() as usize);
+    let mut delete_latencies_ns: Vec<u64> = Vec::with_capacity(cfg.ticks as usize);
 
     while let Some(t) = generator.tick() {
         // Insert this tick's new readings, each in its own committed txn (the realistic per-event
-        // ingest shape).
+        // ingest shape). Every statement's real end-to-end latency is recorded.
         for ins in &t.inserts {
-            exec_commit(&mut coord, ins);
+            insert_latencies_ns.push(exec_commit(&mut coord, ins, &catalog).as_nanos() as u64);
             total_ingested += 1;
         }
-        // Apply the retention DELETE (aged-out readings) in its own committed txn.
+        // Apply the retention DELETE (aged-out readings) in its own committed txn. It seeks the
+        // `Reading.seq` RANGE index (the planner sees it — `rmp` #694).
         if let Some(del) = &t.delete {
-            exec_commit(&mut coord, del);
+            delete_latencies_ns.push(exec_commit(&mut coord, del, &catalog).as_nanos() as u64);
         }
         // GC maintenance pass: reclaim the tombstoned slots so new inserts reuse them.
         let reclaimed = if gc_enabled {
@@ -316,7 +427,7 @@ where
         page_high_water = page_high_water.max(pages);
         footprint_high_water_bytes = footprint_high_water_bytes.max(footprint);
 
-        let live = live_readings(&mut coord);
+        let live = live_readings(&mut coord, &catalog);
 
         if t.tick >= warmup_ticks {
             steady_min_bytes = steady_min_bytes.min(footprint);
@@ -350,6 +461,8 @@ where
         steady_min_bytes,
         steady_max_bytes,
         warmup_ticks,
+        insert_latencies_ns,
+        delete_latencies_ns,
     }
 }
 
@@ -390,4 +503,94 @@ pub fn samples_json(out: &ChurnOutcome) -> String {
     }
     s.push_str("]}");
     s
+}
+
+/// Builds a fresh coordinator, applies the geo/time schema DDL through the typed seam, and returns the
+/// resulting **planner catalog** — the exact [`IndexCatalog`] every statement in [`run_churn`] is
+/// planned against. Exposed so the plan-shape regression below (and any future caller) can assert what
+/// the planner actually sees, rather than trusting that the DDL "worked".
+pub fn schema_catalog() -> IndexCatalog {
+    let mut coord = fresh_coord();
+    apply_schema(&mut coord);
+    coord.catalog()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Renders the physical plan of `src` under `catalog` as its `Debug` shape.
+    fn plan_shape(src: &str, catalog: &IndexCatalog) -> String {
+        let toks = tokenize(src).expect("lex");
+        let ast = parse_tokens(&toks, src).expect("parse");
+        let validated = analyze(&ast).expect("analyze");
+        format!("{:?}", plan_physical(&lower(&validated), catalog))
+    }
+
+    /// **Regression for `rmp` #694.** The schema DDL this driver declares must actually reach the
+    /// PLANNER, not merely the catalog.
+    ///
+    /// The driver used to plan every statement against `IndexCatalog::empty()`. Nothing failed: the
+    /// results were identical, the steady-state and plateau assertions all held, and the README happily
+    /// described an index-backed retention sweep — while the engine was in fact FULL-SCANNING every
+    /// `:Reading` on every tick. The example was measuring an unindexed engine and reporting an indexed
+    /// one, which is the worst kind of wrong evidence: the kind that passes.
+    ///
+    /// The load-bearing statement is the retention `DELETE`. It is a `seq < cutoff` range predicate, and
+    /// the whole point of the `Reading.seq` RANGE index is that the sweep SEEKS it. This test asserts
+    /// the planned shape: an index range seek under the populated catalog, and — to prove the test
+    /// itself has teeth — a scan under the empty one.
+    #[test]
+    fn the_retention_delete_plans_as_an_index_range_seek_not_a_scan() {
+        const RETENTION: &str = "MATCH (r:Reading) WHERE r.seq < 1000 DETACH DELETE r";
+
+        let catalog = schema_catalog();
+        assert!(
+            !catalog.indexes().is_empty(),
+            "the schema DDL must populate the planner's IndexCatalog"
+        );
+
+        let planned = plan_shape(RETENTION, &catalog);
+        assert!(
+            planned.contains("NodeIndexRangeSeek"),
+            "the retention DELETE must SEEK the Reading.seq RANGE index; planned as:\n{planned}"
+        );
+
+        // Teeth: under the empty catalog the SAME statement degrades to a scan. This is precisely what
+        // the driver was doing before the fix — and it is why a purely functional assertion could never
+        // have caught it.
+        let unplanned = plan_shape(RETENTION, &IndexCatalog::empty());
+        assert!(
+            !unplanned.contains("NodeIndexRangeSeek"),
+            "control: with an EMPTY catalog the retention DELETE must NOT be index-backed (if it is, \
+             this test proves nothing); planned as:\n{unplanned}"
+        );
+    }
+
+    /// The per-sensor windowed read (a leading `sensor` equality plus a `seq` range) must use the
+    /// composite `RANGE` index on `Reading(sensor, seq)` — the second index the schema declares, and the
+    /// one the README claims accelerates per-sensor reads.
+    #[test]
+    fn the_per_sensor_windowed_read_uses_the_composite_index() {
+        let catalog = schema_catalog();
+        let planned = plan_shape(
+            "MATCH (r:Reading) WHERE r.sensor = 's-0' AND r.seq >= 10 AND r.seq < 20 RETURN r.value",
+            &catalog,
+        );
+        assert!(
+            planned.contains("Index"),
+            "the per-sensor windowed read must be index-backed; planned as:\n{planned}"
+        );
+    }
+
+    /// Latency percentiles must be REAL: an empty family is NOT MEASURED (`None`), never a fabricated
+    /// `0.0` (`rmp` #699).
+    #[test]
+    fn percentiles_are_none_for_an_unmeasured_family() {
+        assert!(percentile_ms(&[], 500).is_none());
+        // Nearest-rank over a known sample: p50 of [1, 2, 3, 4] ms is the 2nd value.
+        let ns = [1_000_000u64, 2_000_000, 3_000_000, 4_000_000];
+        assert!((percentile_ms(&ns, 500).expect("measured") - 2.0).abs() < 1e-9);
+        assert!((percentile_ms(&ns, 999).expect("measured") - 4.0).abs() < 1e-9);
+    }
 }

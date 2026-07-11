@@ -46,6 +46,20 @@ churn = [
     "graphus-storage/dst",
 ]
 
+# The `wire` feature adds the CLIENT-side stack for the FILE-BACKED over-the-wire driver (`iot_wire`):
+# it drives the SAME ingest + retention churn against an already-running / self-booted `graphus-server`
+# over Bolt (UDS or TCP+TLS), issues the real `CHECKPOINT DATABASE` operator trigger, and samples the
+# server's REAL on-disk footprint (`FileBlockDevice` + segmented WAL) — the storage evidence the
+# in-memory `churn` mirror structurally cannot produce (`rmp` #694).
+#
+# It reuses `graphus-reco-gen`'s already-committed, `pub` Bolt client (`BoltClient`/`BoltUrl`, mirroring
+# `graphus-cli`'s rustls transport) and its `bench` percentile / `/proc` helpers — the same reuse
+# `graphus-social-gen` makes — so NO Bolt/TLS wire code is reinvented and NO new dependency enters the
+# workspace lock. It is CLIENT-ONLY (it never links the engine), so it is independent of `churn` and
+# builds with `--no-default-features --features wire` for a light, fast client build.
+# `graphus-server` depends on neither this crate nor reco-gen, so this stays acyclic.
+wire = ["dep:graphus-core", "dep:graphus-reco-gen"]
+
 [dependencies]
 # The generator emits the per-tick Cypher (INSERT new + DELETE aged-out) as text and its summary as
 # JSON; serde pins match the rest of the workspace.
@@ -66,6 +80,14 @@ graphus-cypher = { path = "../graphus-cypher", optional = true }
 graphus-storage = { path = "../graphus-storage", optional = true }
 graphus-io = { path = "../graphus-io", optional = true }
 graphus-wal = { path = "../graphus-wal", optional = true }
+
+# --- `wire` feature only: the CLIENT-side over-the-wire driver stack. `graphus-reco-gen` is a sibling
+# dev-only example leaf crate (also `publish = false`) whose `pub` `client` module (a synchronous Bolt
+# session over UDS or TCP+TLS, mirroring `graphus-cli`'s transport) and `pub` `bench` module (latency
+# percentiles, `/proc/<pid>` sampling) are exactly the plumbing the file-backed wire driver needs.
+# Reusing it — as `graphus-social-gen` already does — keeps this DRY; reco-gen never depends on
+# iot-gen, so this is acyclic, and it pulls in NO dependency the workspace lock does not already carry.
+graphus-reco-gen = { path = "../graphus-reco-gen", optional = true }
 
 # The deterministic generator binary: writes the per-tick Cypher stream + a summary for a profile.
 # Usage: `cargo run -p graphus-iot-gen --bin iot_gen -- --profile fast --out-dir <dir>`
@@ -97,3 +119,23 @@ required-features = ["churn"]
 name = "iot_evidence"
 path = "src/bin/iot_evidence.rs"
 required-features = ["churn"]
+
+# The FILE-BACKED over-the-wire driver (`wire` feature): drives the SAME ingest + retention churn
+# against a running `graphus-server` (real `FileBlockDevice` + real segmented WAL) over Bolt-over-UDS or
+# Bolt-over-TCP+TLS, issues the real `CHECKPOINT DATABASE` operator trigger, samples the REAL on-disk
+# footprint each tick (path-classified: data image / doublewrite / WAL / catalog) and writes a
+# machine-readable `samples.json`. Client-only — it never links the engine.
+# Usage: cargo run -p graphus-iot-gen --no-default-features --features wire --bin iot_wire -- --socket <s> ...
+[[bin]]
+name = "iot_wire"
+path = "src/bin/iot_wire.rs"
+required-features = ["wire"]
+
+# The wire evidence emitter + invariant gate: HERMETIC (harness + serde only, no engine, no wire, no
+# network), so it always builds. It folds `iot_wire`'s `samples.json` together with the target's
+# `/metrics` scrapes (before + after) into a schema-versioned report.json + report.md, and asserts the
+# headline invariants: the on-disk store PLATEAUS while `graphus_maintenance_versions_reclaimed_total`
+# CLIMBS. Usage: cargo run -p graphus-iot-gen --bin iot_wire_evidence -- --samples <j> --evidence-dir <d>
+[[bin]]
+name = "iot_wire_evidence"
+path = "src/bin/iot_wire_evidence.rs"
