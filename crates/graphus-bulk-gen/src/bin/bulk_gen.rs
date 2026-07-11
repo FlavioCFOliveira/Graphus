@@ -10,10 +10,13 @@
 //! Output is a pure function of `(profile)` (each profile pins its own seed), so re-running yields
 //! byte-identical files. Hermetic: serde only, no engine, no network.
 //!
+//! `--profile` selects a rung of the [`Profile`] ladder — one production-shaped graph at four sizes
+//! (`fast` / `default` / `large` / `huge`); see [`Profile`] for what each is for.
+//!
 //! Usage:
 //! ```text
-//! cargo run -p graphus-bulk-gen --bin bulk_gen -- --profile fast  --out-dir <dir>
-//! cargo run -p graphus-bulk-gen --bin bulk_gen -- --profile large --out-dir <dir>
+//! cargo run -p graphus-bulk-gen --bin bulk_gen -- --profile default --out-dir <dir>
+//! cargo run -p graphus-bulk-gen --bin bulk_gen -- --profile huge    --out-dir <dir>
 //! ```
 
 #![forbid(unsafe_code)]
@@ -24,7 +27,7 @@ use std::process::ExitCode;
 use graphus_bulk_gen::{Profile, generate};
 
 fn main() -> ExitCode {
-    let mut profile = Profile::Fast;
+    let mut profile = Profile::Default;
     let mut out_dir = PathBuf::from(".");
 
     let mut args = std::env::args().skip(1);
@@ -33,7 +36,7 @@ fn main() -> ExitCode {
             "--profile" => {
                 let v = match args.next() {
                     Some(v) => v,
-                    None => return fail("--profile requires a value (fast|large)"),
+                    None => return fail("--profile requires a value (fast|default|large|huge)"),
                 };
                 profile = match Profile::parse(&v) {
                     Ok(p) => p,
@@ -48,8 +51,14 @@ fn main() -> ExitCode {
             }
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: bulk_gen --profile <fast|large> --out-dir <dir>\n\
-                     writes per-label node CSVs + per-type relationship CSVs + manifest.json"
+                    "usage: bulk_gen --profile <fast|default|large|huge> --out-dir <dir>\n\
+                     writes per-label node CSVs + per-type relationship CSVs + manifest.json\n\
+                     \n\
+                     profiles (one production-shaped graph at four sizes; default = `default`):\n  \
+                     fast     ~800 nodes / ~4k rels   — hermetic tests + a smoke run (NOT an evidence scale)\n  \
+                     default  ~24k nodes / ~140k rels — production-shaped, moderate; the run.sh default\n  \
+                     large    ~98k nodes / ~560k rels — opt-in: real evaluation scale\n  \
+                     huge    ~390k nodes / ~2.2M rels — opt-in: the memory/WAL ceiling of a big import"
                 );
                 return ExitCode::SUCCESS;
             }

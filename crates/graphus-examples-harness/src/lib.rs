@@ -109,7 +109,7 @@ pub use host::HostInfo;
 pub use metrics::{DiskFootprint, LatencyCollector, PAGE_SIZE, StorageMeter, ThroughputCounter};
 pub use resource::{
     CpuMeter, CpuTimes, ResourceMeter, RssSample, RssSampler, Target, cumulative_cpu_times,
-    current_rss_bytes,
+    current_rss_bytes, peak_rss_self_bytes,
 };
 pub use scrape::{Bucket, Histogram, MetricsSnapshot};
 

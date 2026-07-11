@@ -251,12 +251,19 @@ local_scrape_metrics() {
 # --------------------------------------------------------------------------------------------------
 section "Step 1 — generate the deterministic multi-tenant scenario ($PROFILE profile, $MODE mode)"
 mkdir -p "$DATA_DIR"
+# Capture the generator's WHOLE stdout, then take its first line — never `| head -n1`, which closes the
+# pipe as soon as it has that line and leaves the generator writing into a broken pipe. Rust's `println!`
+# PANICS on EPIPE ("failed printing to stdout: Broken pipe"), so that pipeline aborts the generator
+# intermittently (a race: it only fires when the generator is still writing when `head` exits — which is
+# exactly why it survived, passing most of the time). The same pipeline was flaky-failing
+# knowledge-graph-rest in the examples gate; fixed at every site. `rmp` #716.
 if [ "$MODE" = "external" ]; then
-  GEN_OUT="$("$GEN" --profile "$PROFILE" --namespace "$RUN_NS" --out-dir "$DATA_DIR" | head -n1)"
+  GEN_OUT="$("$GEN" --profile "$PROFILE" --namespace "$RUN_NS" --out-dir "$DATA_DIR")"
   info "namespace: $RUN_NS (isolated tenants on the shared target, torn down on exit)"
 else
-  GEN_OUT="$("$GEN" --profile "$PROFILE" --out-dir "$DATA_DIR" | head -n1)"
+  GEN_OUT="$("$GEN" --profile "$PROFILE" --out-dir "$DATA_DIR")"
 fi
+GEN_OUT="${GEN_OUT%%$'\n'*}"
 info "$GEN_OUT"
 PROVISION="$DATA_DIR/provision.cypher"
 DENY_FILE="$DATA_DIR/deny.cypher"
