@@ -103,6 +103,12 @@ case "$PROFILE" in
   huge)  LADDER="1,2,4,8,16,32,64";  OPS_PER_RUNG=40000; POOL_PAGES=131072 ;;
   *) echo "${RED}fatal: unknown SOCIAL_PROFILE '$PROFILE' (use fast|large|huge)${RESET}" >&2; exit 2 ;;
 esac
+# The profile's ladder is a default, not a cage: the knee diagnosis tells the reader to extend the
+# ladder when the top rung is still the best rung, so the ladder (and the per-rung op budget) must be
+# overridable to actually follow that advice. SOCIAL_LADDER=1 also isolates per-family latency from
+# queueing, which is the only way to tell a slow QUERY apart from a contended one.
+LADDER="${SOCIAL_LADDER:-$LADDER}"
+OPS_PER_RUNG="${SOCIAL_OPS_PER_RUNG:-$OPS_PER_RUNG}"
 
 # External-mode ladder / op budget (independent of the local profile).
 EXT_LADDER="${SOCIAL_EXTERNAL_LADDER:-1,2,4,8}"

@@ -1063,6 +1063,20 @@ fn diagnose_knee(rungs: &[RungResult], proc_available: bool, external: bool) -> 
          thread ran at {:.2} of a core.",
         best.clients, best.server_cores, best.busy_threads, best.busiest_core_frac,
     ));
+    // A scaling verdict needs a CONCURRENCY SWEEP to stand on. With a single-client ladder there is
+    // nothing to spread, so a low busy-thread count says nothing about the server's ability to scale —
+    // asserting a ceiling from it would be an artifact of the ladder, not a property of the server.
+    // (This is the same class of mistake as the in-process battery that measured the driver.)
+    if best.clients <= 1 {
+        out.push(
+            "VERDICT: NOT ASSESSABLE — this ladder never ran more than one concurrent client, so there was no \
+             concurrency to spread across cores. Read scaling can only be judged by sweeping C (run the default \
+             ladder, e.g. SOCIAL_LADDER=1,2,4,8). The single-client figures above are a latency baseline, not a \
+             scaling result."
+                .into(),
+        );
+        return out;
+    }
     let single_thread_ceiling = best.busy_threads <= 1
         || (best.busiest_core_frac >= 0.80 && (best.server_cores - best.busiest_core_frac) < 0.75);
     if single_thread_ceiling {
@@ -1617,12 +1631,50 @@ fn print_usage() {
 
 #[cfg(test)]
 mod tests {
-    use super::du_store;
+    use super::{Pcts, RungResult, diagnose_knee, du_store};
 
     /// The server's WAL is a DIRECTORY of `seg.<lsn>` files, so a classifier that only looks at the
     /// leaf file name counts every WAL byte as store — reporting `wal_bytes = 0` and hiding the redo
     /// log entirely. This pins the real on-disk layout, and the decomposition that keeps the
     /// fixed-cost doublewrite buffer from being mistaken for graph data (regression for both bugs).
+    /// A scaling verdict needs a concurrency sweep. With a single-client ladder there is nothing to
+    /// spread across cores, so the low busy-thread count must NOT be reported as a single-thread
+    /// ceiling — that would be an artifact of the ladder masquerading as a property of the server.
+    #[test]
+    fn single_client_ladder_refuses_to_draw_a_scaling_verdict() {
+        let rung = RungResult {
+            clients: 1,
+            ok_ops: 1500,
+            err_ops: 0,
+            wall_secs: 7.0,
+            ops_per_sec: 212.6,
+            overall: Pcts::default(),
+            per_family: Vec::new(),
+            cpu_user_secs: 4.5,
+            cpu_system_secs: 0.1,
+            // The signature that used to trip the false verdict: one thread above the busy threshold.
+            server_cores: 0.66,
+            busy_threads: 1,
+            busiest_core_frac: 0.05,
+            peak_rss: 0,
+            final_rss: 0,
+            vm_hwm: 0,
+            io_read_bytes: 0,
+            io_available: false,
+            writes_ok: 0,
+            writes_err: 0,
+        };
+        let lines = diagnose_knee(&[rung], true, false).join(" ");
+        assert!(
+            lines.contains("NOT ASSESSABLE"),
+            "a one-rung ladder must decline to judge scaling, got: {lines}"
+        );
+        assert!(
+            !lines.contains("SINGLE-THREAD CEILING"),
+            "must not assert a ceiling it cannot measure, got: {lines}"
+        );
+    }
+
     #[test]
     fn du_store_decomposes_the_real_server_layout() {
         let root = std::env::temp_dir().join(format!("gsocial-du-{}", std::process::id()));

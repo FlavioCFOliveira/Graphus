@@ -93,8 +93,10 @@ GRAPHUS_TARGET_USER=graphus GRAPHUS_TARGET_PASSWORD=… \
   examples/social-network-large/run.sh                                 # attach to a running instance
 ```
 
-Knobs: `SOCIAL_PROFILE`, `SOCIAL_DEGREE_DIST` (+ `SOCIAL_ZIPF_EXPONENT`), `SOCIAL_LADDER`,
-`SOCIAL_WRITERS` / `SOCIAL_WRITE_EVERY_MS`, `SOCIAL_READER_THREADS`, `GRAPHUS_BIN_DIR`.
+Knobs: `SOCIAL_PROFILE`, `SOCIAL_DEGREE_DIST` (+ `SOCIAL_ZIPF_EXPONENT`), `SOCIAL_LADDER` +
+`SOCIAL_OPS_PER_RUNG` (override the profile's ladder — e.g. `SOCIAL_LADDER=1` to isolate per-family
+latency from queueing, or `1,2,4,8,16,32` to chase the knee), `SOCIAL_WRITERS` /
+`SOCIAL_WRITE_EVERY_MS`, `SOCIAL_READER_THREADS`, `GRAPHUS_BIN_DIR`.
 
 > The binaries are rebuilt on every run (cargo is incremental, so this is a no-op when nothing
 > changed). Building only when a binary is *absent* would silently run a **stale** binary after any
@@ -135,16 +137,25 @@ spread is the proof: no single thread is the bottleneck — the off-thread reade
 #336/#543) is genuinely engaged. The ladder's top rung is still its best, so the plateau lies beyond
 C=8; extend `SOCIAL_LADDER` to find the knee.
 
-### Per-family latency at the top rung (C=8) — where the tail comes from
+### Per-family latency — where the tail comes from
 
-| Family | p50 | p99 | Note |
-|--------|----:|----:|------|
-| friends, degree, mutual, friend-of-friend, `CONTAINS`, FULLTEXT | ~2.2–2.8 ms | 3.0–4.5 ms | index-backed seeks + bounded traversal |
-| **`like_recent`** (`LIKE.date >= X`) | **15.5 ms** | 20.4 ms | the relationship RANGE index is **equality-only**, so a *range* predicate is a correct **scan + residual filter** — reported honestly, not claimed as a seek (`rmp` #680) |
-| **`top_liked`** (aggregation + `ORDER BY` + `LIMIT`) | **20.5 ms** | 27.0 ms | a full aggregation scan over every `LIKE` edge |
+Two families cost far more than the rest. To separate a genuinely **slow query** from a merely
+**contended** one, measure both uncontended (`SOCIAL_LADDER=1`, same op budget) and at saturation:
 
-These two families are ~7–9× the cost of every other family and **dominate the tail**. That is the
-example doing its job: it names the two read-path costs worth attacking.
+| Family | p50 @ C=1 (uncontended) | p50 @ C=8 (saturated) | Why |
+|--------|------------------------:|----------------------:|-----|
+| friends, degree, mutual, friend-of-friend, `CONTAINS`, FULLTEXT | ~2.2 ms | ~2.2–2.8 ms | index-backed seeks + bounded traversal |
+| **`like_recent`** (`LIKE.date >= X`) | **10.5 ms** | 15.5 ms | the relationship RANGE index is **equality-only**, so a *range* predicate is a correct **scan + residual filter** — reported honestly, not claimed as a seek (`rmp` #680) |
+| **`top_liked`** (aggregation + `ORDER BY` + `LIMIT`) | **12.6 ms** | 20.5 ms | a full aggregation scan over every `LIKE` edge |
+
+The cost is **intrinsic to the query, not to the contention**: even alone on an idle server these two
+run 5–6× every other family. That is the example doing its job — it names the two read-path costs
+worth attacking.
+
+> **A trap worth knowing.** Run the same isolation with a *smaller* op budget and `top_liked` reads
+> ~58 ms — nearly 5× worse. That is a cold buffer pool, not a slow query: too few iterations for the
+> scan's pages to be resident. Always hold the op budget constant when comparing rungs, or the
+> warm-up will masquerade as a result.
 
 ### Resources
 
