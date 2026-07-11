@@ -145,10 +145,15 @@ Two standardized, schema-versioned reports are written to `evidence/` (git-ignor
 - **`evidence/real-server/report.json`** — the real-server crash: the redo log at the crash, the recovery
   wall-time, the peak replay RSS, the server's CPU, and the measured commit-latency percentiles.
 
-Everything in both reports is **measured or omitted**. Storage is `0` in the deterministic report *by
-construction* (the DST core runs on an in-memory device and an in-memory WAL sink — there is no on-disk
-footprint to size), and the report says so; latency percentiles are absent there because that sweep does
-not measure per-operation latency, rather than being reported as a fabricated `0.0`.
+Everything in both reports is **measured or omitted** — since schema v3 (`rmp #711`) an unmeasured metric
+is genuinely **ABSENT** from the JSON rather than written as a `0` that reads like a result. The whole
+`storage` section is absent from the deterministic report *by construction* (the DST core runs on an
+in-memory device and an in-memory WAL sink — there is no on-disk footprint to size), and the report's
+notes say so; its latency percentiles are absent because that sweep does not measure per-operation
+latency. The **real-server** report, by contrast, carries the full durable footprint *and* the
+per-element durable costs (`storage.bytes_per_node` / `bytes_per_relationship`) — the measured store
+image amortised over the node/relationship counts **read back from the recovered store** (`--nodes` /
+`--rels` are the survivors ARIES replayed), so the two inputs describe the same graph by construction.
 
 ## Baseline & regression gate
 

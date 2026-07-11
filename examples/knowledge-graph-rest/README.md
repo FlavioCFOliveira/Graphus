@@ -277,6 +277,13 @@ GRAPHUS_TARGET_REST=https://graphus.example.com:7474 \
 | `GRAPHUS_TARGET_DB` | reuse an existing DB (never created/dropped); unset → an isolated DB is created + dropped |
 | `GRAPHUS_TARGET_SYSTEM_DB` | DB through which the `CREATE/STOP/DROP DATABASE` DDL routes (default `graphus`) |
 
+The local report carries `storage.bytes_per_node` / `storage.bytes_per_relationship`: the measured
+durable store image amortised over the seeded graph. The workload is **read-only** (discovery queries,
+NDJSON streaming, content negotiation, concurrent readers), so the store holds exactly the seeded
+`dataset.nodes` / `dataset.relationships` and the two inputs provably describe the same graph. Each
+amortises the WHOLE image over one element count, so the two figures are two views of one image and do
+not sum to `store_bytes`.
+
 In attach mode the process CPU/RSS and on-disk store/WAL vectors are **N/A** (no `/proc` or store-path
 access on a remote host) and the host-specific baseline gate is skipped; the server-side evidence is
 the `/metrics` counter delta (below). The workload exercises current-HEAD Cypher/DDL (named indexes,

@@ -257,6 +257,14 @@ allowed 200s and the rejected 403s — excluding the denials would bias the perc
 allowed cells). `space_amplification` / `write_amplification` are the durable bytes over the logical
 dataset the generator actually emitted.
 
+The per-element durable costs `storage.bytes_per_node` / `bytes_per_relationship` are deliberately
+**ABSENT** from this report (`rmp #711`), and their baseline gates are reported as *skipped*. The
+storage vector meters **one** tenant's database (`tenant_a`, the primary store — the cross-tenant totals
+ride in as workload params), while `dataset.nodes` / `dataset.relationships` count **both** tenants'
+seeded graphs. Dividing one store by two stores' elements would be real arithmetic over mismatched
+inputs — a number that looks measured and means nothing. It is omitted until the two inputs describe
+the same graph.
+
 > **Evidence honesty (`rmp #699`).** This example was the worst offender in the suite: the latency
 > percentiles were **hardcoded `0.000` placeholders** (nothing ever measured them), `ops_per_sec` was
 > `seeded_statements / server-uptime` — a count of Cypher statements divided by a window they were

@@ -85,10 +85,15 @@ impl DiskFootprint {
 /// assert_eq!(store.bytes, 16_384);
 /// assert_eq!(store.pages, 2); // 16_384 / 8192
 ///
+/// // A path that does not exist was not MEASURED as empty — it was not measured at all.
+/// assert_eq!(StorageMeter::try_measure_path(dir.join("absent"))?, None);
+///
 /// // write amplification = physical bytes written / logical bytes written
-/// assert_eq!(StorageMeter::write_amplification(16_384, 8_192), 2.0);
+/// assert_eq!(StorageMeter::write_amplification(16_384, 8_192), Some(2.0));
 /// // space amplification = on-disk bytes / logical graph size
-/// assert_eq!(StorageMeter::space_amplification(16_384, 4_096), 4.0);
+/// assert_eq!(StorageMeter::space_amplification(16_384, 4_096), Some(4.0));
+/// // …and with no logical figure there is no ratio to report: absent, not zero.
+/// assert_eq!(StorageMeter::write_amplification(16_384, 0), None);
 /// # std::fs::remove_dir_all(&dir).ok();
 /// # Ok(())
 /// # }
@@ -102,18 +107,35 @@ impl StorageMeter {
     ///
     /// If `path` is a single regular file, its length is returned directly. Symlinks are **not**
     /// followed (their own small entry size is what `symlink_metadata` reports), preventing both
-    /// double-counting and cycles. A non-existent `path` is reported as a zero footprint — an
-    /// example may legitimately ask for a WAL that has not been created yet.
+    /// double-counting and cycles. A non-existent `path` is reported as a zero footprint; use
+    /// [`try_measure_path`](Self::try_measure_path) when the difference between "measured as empty"
+    /// and "not measured" matters — for evidence, it always does.
     ///
     /// # Errors
     ///
     /// Propagates any I/O error encountered while reading directory entries or file metadata (other
     /// than a top-level "not found", which is treated as an empty footprint).
     pub fn measure_path(path: impl AsRef<Path>) -> io::Result<DiskFootprint> {
-        let path = path.as_ref();
-        match dir_size_bytes(path) {
-            Ok(bytes) => Ok(DiskFootprint::from_bytes(bytes)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(DiskFootprint::default()),
+        Ok(Self::try_measure_path(path)?.unwrap_or_default())
+    }
+
+    /// Measures `path`, distinguishing **"not there"** (`Ok(None)`) from **"there and empty"**
+    /// (`Ok(Some(0 bytes))`).
+    ///
+    /// This is the honest primitive behind [`EvidenceCollector::record_storage`]: a store path that
+    /// does not exist for this run was not *measured as zero bytes* — it was **not measured**, and the
+    /// report must omit the figure rather than claim the graph occupies nothing.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any I/O error encountered while reading directory entries or file metadata (a
+    /// top-level "not found" is the `Ok(None)` case, not an error).
+    ///
+    /// [`EvidenceCollector::record_storage`]: crate::EvidenceCollector::record_storage
+    pub fn try_measure_path(path: impl AsRef<Path>) -> io::Result<Option<DiskFootprint>> {
+        match dir_size_bytes(path.as_ref()) {
+            Ok(bytes) => Ok(Some(DiskFootprint::from_bytes(bytes))),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -121,7 +143,8 @@ impl StorageMeter {
     /// Measures the store directory and WAL path together, returning `(store, wal)` footprints.
     ///
     /// Pass the example's known store directory and WAL path (file or directory — Graphus's WAL is a
-    /// directory of segment files). Either may be missing; a missing path yields a zero footprint.
+    /// directory of segment files). Either may be missing; a missing path yields a zero footprint (see
+    /// [`try_measure_path`](Self::try_measure_path) to tell that apart from a real zero).
     ///
     /// # Errors
     ///
@@ -138,27 +161,31 @@ impl StorageMeter {
     /// **Write amplification** = physical bytes written to disk / logical bytes written.
     ///
     /// A ratio of `1.0` is ideal (every logical byte hit disk exactly once); `> 1.0` quantifies the
-    /// extra I/O a durability scheme (WAL + double-write + page padding + …) incurs. Returns `0.0`
-    /// when `logical_bytes_written == 0` (no work to amplify) to avoid a division by zero.
+    /// extra I/O a durability scheme (WAL + double-write + page padding + …) incurs. Returns `None`
+    /// when `logical_bytes_written == 0`: with no logical figure there is no ratio to compute, and an
+    /// unmeasurable ratio is **absent**, never a `0.0` a reader would take for a measurement.
     #[must_use]
-    pub fn write_amplification(physical_bytes_written: u64, logical_bytes_written: u64) -> f64 {
+    pub fn write_amplification(
+        physical_bytes_written: u64,
+        logical_bytes_written: u64,
+    ) -> Option<f64> {
         if logical_bytes_written == 0 {
-            return 0.0;
+            return None;
         }
-        physical_bytes_written as f64 / logical_bytes_written as f64
+        Some(physical_bytes_written as f64 / logical_bytes_written as f64)
     }
 
     /// **Space amplification** = total on-disk bytes / logical graph size.
     ///
     /// A ratio of `1.0` means the on-disk representation is exactly the logical data size; `> 1.0`
     /// captures fixed-record padding, free-list slack, index overhead, and retained WAL. Returns
-    /// `0.0` when `logical_graph_bytes == 0` to avoid a division by zero.
+    /// `None` when `logical_graph_bytes == 0` — see [`write_amplification`](Self::write_amplification).
     #[must_use]
-    pub fn space_amplification(on_disk_bytes: u64, logical_graph_bytes: u64) -> f64 {
+    pub fn space_amplification(on_disk_bytes: u64, logical_graph_bytes: u64) -> Option<f64> {
         if logical_graph_bytes == 0 {
-            return 0.0;
+            return None;
         }
-        on_disk_bytes as f64 / logical_graph_bytes as f64
+        Some(on_disk_bytes as f64 / logical_graph_bytes as f64)
     }
 }
 
@@ -419,26 +446,30 @@ impl ThroughputCounter {
 // ---------------------------------------------------------------------------------------------
 
 impl StorageSection {
-    /// Builds a [`StorageSection`] from measured store/WAL footprints and a `bytes_fsynced` figure.
+    /// Builds a [`StorageSection`] from the measured store/WAL footprints and a `bytes_fsynced`
+    /// figure, each of which may be **absent** (= that path was not measured for this run).
     ///
     /// `bytes_fsynced` is what the example honestly observed to have been forced to durable media. If
     /// the example cannot instrument fsync directly, the WAL byte count is the most faithful proxy
     /// (every committed WAL byte is fsynced before acknowledgement) — see
     /// [`EvidenceCollector::record_storage`](crate::EvidenceCollector::record_storage), which defaults
-    /// it to exactly that.
+    /// it to exactly that when there IS a WAL to measure.
     #[must_use]
-    pub fn from_footprints(store: DiskFootprint, wal: DiskFootprint, bytes_fsynced: u64) -> Self {
+    pub fn from_footprints(
+        store: Option<DiskFootprint>,
+        wal: Option<DiskFootprint>,
+        bytes_fsynced: Option<u64>,
+    ) -> Self {
         Self {
-            store_bytes: store.bytes,
-            wal_bytes: wal.bytes,
-            store_pages: store.pages,
-            wal_pages: wal.pages,
+            store_bytes: store.map(|s| s.bytes),
+            wal_bytes: wal.map(|w| w.bytes),
+            store_pages: store.map(|s| s.pages),
+            wal_pages: wal.map(|w| w.pages),
             bytes_fsynced,
-            // Amplification ratios are only known once the caller supplies the logical figures;
-            // left at 0.0 (meaning "not measured") until set via `EvidenceCollector::record_amplification`.
-            write_amplification: 0.0,
-            space_amplification: 0.0,
-            // Per-element costs / plateau ratio: set explicitly by the examples that track them.
+            // Amplification ratios are only known once the caller supplies the logical figures, and the
+            // per-element costs / plateau ratio only once the caller attests the dataset scale. All stay
+            // ABSENT until set via `record_amplification` / `record_per_element_costs` /
+            // `record_plateau_ratio` — an unmeasured ratio is omitted, never zero-filled.
             ..Self::default()
         }
     }
@@ -447,20 +478,17 @@ impl StorageSection {
 impl ThroughputSection {
     /// Builds a [`ThroughputSection`] from a throughput counter and a latency collector.
     ///
-    /// Percentiles are emitted in **milliseconds** to match the section's field units.
+    /// Percentiles are emitted in **milliseconds** to match the section's field units, and are
+    /// **absent** when the collector recorded no sample (there is no p50 of nothing — a `0.0` would
+    /// read as "instantaneous").
     #[must_use]
     pub fn from_collectors(throughput: &ThroughputCounter, latency: &LatencyCollector) -> Self {
-        let (p50, p99, p999) = latency.percentiles();
-        Self {
-            operations: throughput.count(),
-            ops_per_sec: throughput.ops_per_sec(),
-            p50_latency_ms: duration_to_millis(p50),
-            p99_latency_ms: duration_to_millis(p99),
-            p999_latency_ms: duration_to_millis(p999),
-            // The collectors model successful ops only; abort rate is supplied separately by the
-            // caller (e.g. via `EvidenceCollector::throughput_mut`) when the workload is concurrent.
-            abort_rate: 0.0,
-        }
+        Self::assemble(
+            throughput.count(),
+            throughput.ops_per_sec(),
+            throughput.elapsed(),
+            latency,
+        )
     }
 
     /// Like [`from_collectors`](Self::from_collectors) but with an **injected** throughput window,
@@ -471,15 +499,38 @@ impl ThroughputSection {
         latency: &LatencyCollector,
         window: Duration,
     ) -> Self {
+        Self::assemble(
+            throughput.count(),
+            throughput.ops_per_sec_over(window),
+            window,
+            latency,
+        )
+    }
+
+    /// The shared assembly: every figure is reported only when the collectors actually measured it.
+    fn assemble(
+        operations: u64,
+        ops_per_sec: f64,
+        window: Duration,
+        latency: &LatencyCollector,
+    ) -> Self {
+        // No timed window ⇒ no rate. (`ThroughputCounter` already returns 0.0 for a zero-length
+        // window; that zero is "unmeasurable", not "zero work per second".)
+        let ops_per_sec = (window > Duration::ZERO && ops_per_sec.is_finite())
+            .then_some(ops_per_sec)
+            .filter(|r| *r > 0.0);
         let (p50, p99, p999) = latency.percentiles();
+        let percentile = |d: Duration| (!latency.is_empty()).then(|| duration_to_millis(d));
         Self {
-            operations: throughput.count(),
-            ops_per_sec: throughput.ops_per_sec_over(window),
-            p50_latency_ms: duration_to_millis(p50),
-            p99_latency_ms: duration_to_millis(p99),
-            p999_latency_ms: duration_to_millis(p999),
-            // See `from_collectors`: abort rate is set separately for a concurrent workload.
-            abort_rate: 0.0,
+            operations: (operations > 0).then_some(operations),
+            ops_per_sec,
+            p50_latency_ms: percentile(p50),
+            p99_latency_ms: percentile(p99),
+            p999_latency_ms: percentile(p999),
+            // The collectors model successful ops only; the abort rate is supplied separately by the
+            // caller (e.g. via `EvidenceCollector::throughput_mut`) when the workload is concurrent —
+            // and stays ABSENT when the run never observed aborts at all.
+            abort_rate: None,
         }
     }
 }
@@ -543,12 +594,33 @@ mod tests {
     #[test]
     fn amplification_ratios_are_correct() {
         // write amp: 24 KiB physical for 8 KiB logical => 3.0
-        assert_eq!(StorageMeter::write_amplification(24_576, 8_192), 3.0);
+        assert_eq!(StorageMeter::write_amplification(24_576, 8_192), Some(3.0));
         // space amp: 16 KiB on disk for 4 KiB logical => 4.0
-        assert_eq!(StorageMeter::space_amplification(16_384, 4_096), 4.0);
-        // zero logical => 0.0 (no division by zero)
-        assert_eq!(StorageMeter::write_amplification(100, 0), 0.0);
-        assert_eq!(StorageMeter::space_amplification(100, 0), 0.0);
+        assert_eq!(StorageMeter::space_amplification(16_384, 4_096), Some(4.0));
+        // No logical figure => there is no ratio: ABSENT, not 0.0 (`rmp #711`). A `0.0` here would
+        // tell a reader the store amplifies nothing at all.
+        assert_eq!(StorageMeter::write_amplification(100, 0), None);
+        assert_eq!(StorageMeter::space_amplification(100, 0), None);
+    }
+
+    /// `rmp #711`: a path that is not there was NOT MEASURED — which is not the same statement as
+    /// "measured, and it is empty". The two must be distinguishable at the meter, because the report
+    /// has to distinguish them.
+    #[test]
+    fn try_measure_path_separates_absent_from_empty() {
+        let dir =
+            std::env::temp_dir().join(format!("graphus-metrics-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Not there at all: not measured.
+        assert_eq!(StorageMeter::try_measure_path(&dir).unwrap(), None);
+
+        // There, and genuinely empty: a measured zero.
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(
+            StorageMeter::try_measure_path(&dir).unwrap(),
+            Some(DiskFootprint::from_bytes(0))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -648,21 +720,64 @@ mod tests {
         tp.add(100);
 
         let section = ThroughputSection::from_collectors_over(&tp, &lat, Duration::from_secs(1));
-        assert_eq!(section.operations, 100);
-        assert_eq!(section.ops_per_sec, 100.0);
+        assert_eq!(section.operations, Some(100));
+        assert_eq!(section.ops_per_sec, Some(100.0));
         // p50 over 1..=100 ms: rank = round(0.5*99) = 50 (0-based) -> 51ms.
-        assert!((section.p50_latency_ms - 51.0).abs() < 1e-9);
+        assert_eq!(section.p50_latency_ms, Some(51.0));
         // p999 over 1..=100 ms: rank = round(0.999*99) = round(98.901) = 99 -> 100ms.
-        assert!((section.p999_latency_ms - 100.0).abs() < 1e-9);
+        assert_eq!(section.p999_latency_ms, Some(100.0));
+        // Not a concurrent workload: the abort rate was never observed, so it is ABSENT.
+        assert_eq!(section.abort_rate, None);
+    }
+
+    /// `rmp #711`: a workload with no recorded latency sample has NO percentiles — a `0.0` p50 would
+    /// tell a reader every operation completed instantly. (This is the shape of a one-shot offline
+    /// batch import: real ops/sec, no per-operation request boundary to time.)
+    #[test]
+    fn throughput_section_omits_percentiles_it_never_sampled() {
+        let lat = LatencyCollector::new(); // no samples
+        let mut tp = ThroughputCounter::new();
+        tp.add(50_000);
+
+        let section = ThroughputSection::from_collectors_over(&tp, &lat, Duration::from_secs(2));
+        assert_eq!(section.operations, Some(50_000));
+        assert_eq!(section.ops_per_sec, Some(25_000.0), "ops/sec IS measured");
+        assert_eq!(section.p50_latency_ms, None);
+        assert_eq!(section.p99_latency_ms, None);
+        assert_eq!(section.p999_latency_ms, None);
+    }
+
+    /// An untimed counter has no window to divide by: the rate is ABSENT, not `0.0` ops/sec.
+    #[test]
+    fn throughput_section_omits_the_rate_it_could_not_time() {
+        let lat = LatencyCollector::new();
+        let tp = ThroughputCounter::new(); // never started, no ops
+        let section = ThroughputSection::from_collectors_over(&tp, &lat, Duration::ZERO);
+        assert!(section.is_unmeasured(), "nothing was measured: {section:?}");
     }
 
     #[test]
     fn storage_section_from_footprints() {
         let store = DiskFootprint::from_bytes(20_000);
         let wal = DiskFootprint::from_bytes(5_000);
-        let section = StorageSection::from_footprints(store, wal, wal.bytes);
-        assert_eq!(section.store_bytes, 20_000);
-        assert_eq!(section.wal_bytes, 5_000);
-        assert_eq!(section.bytes_fsynced, 5_000);
+        let section = StorageSection::from_footprints(Some(store), Some(wal), Some(wal.bytes));
+        assert_eq!(section.store_bytes, Some(20_000));
+        assert_eq!(section.wal_bytes, Some(5_000));
+        assert_eq!(section.bytes_fsynced, Some(5_000));
+        // The derived figures are NOT invented here: they stay absent until a caller supplies the
+        // logical bytes / the dataset scale that make them derivable.
+        assert_eq!(section.write_amplification, None);
+        assert_eq!(section.bytes_per_node, None);
+        assert_eq!(section.plateau_ratio, None);
+    }
+
+    /// A footprint nobody could measure (no store path, no WAL) yields an EMPTY section — every field
+    /// absent — not a section full of zeros claiming the graph occupies nothing.
+    #[test]
+    fn storage_section_from_absent_footprints_is_unmeasured() {
+        let section = StorageSection::from_footprints(None, None, None);
+        assert!(section.is_unmeasured());
+        assert_eq!(section.store_bytes, None);
+        assert_eq!(section.wal_bytes, None);
     }
 }

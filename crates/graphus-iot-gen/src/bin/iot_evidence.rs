@@ -246,42 +246,46 @@ fn run() -> Result<(), String> {
 
     // CPU: the self-process cumulative time over the run.
     let cpu = cpu_section(cpu_times, wall);
-    collector.cpu_mut().user_secs = cpu.user_secs;
-    collector.cpu_mut().system_secs = cpu.system_secs;
-    collector.cpu_mut().mean_core_utilisation = cpu.mean_core_utilisation;
+    *collector.cpu_mut() = cpu;
 
     // Memory: the RSS series' peak/final (machine-variant, NOT gated).
     let mem = rss.to_section();
-    collector.memory_mut().peak_rss_bytes = mem.peak_rss_bytes;
-    collector.memory_mut().final_rss_bytes = mem.final_rss_bytes;
+    *collector.memory_mut() = mem.clone();
 
     // Storage: the DETERMINISTIC plateau of the in-memory device — and NOTHING else.
     //
-    // `rmp` #694 / #699: the WAL / fsync / amplification fields are left at `0` because they are NOT
+    // `rmp` #694 / #699 / #711: the WAL / fsync / amplification fields are ABSENT because they are NOT
     // MEASURABLE in this mirror (the device and the WAL are in memory: no store file, no WAL file, no
-    // fsync), and the note below says so in as many words. They are emphatically NOT re-used to smuggle
-    // other quantities: `write_amplification` used to carry the plateau ratio and `space_amplification`
-    // the bytes-per-live-reading, which made both fields lie about what they are. Those two figures are
-    // now workload params under their own names, and the real storage evidence — durable bytes, WAL
-    // volume, fsync volume, true write/space amplification — comes from the file-backed `iot_wire` run.
+    // fsync) — the schema omits them rather than zero-filling them, and the note below says so in as
+    // many words. They are emphatically NOT re-used to smuggle other quantities: `write_amplification`
+    // used to carry the plateau ratio and `space_amplification` the bytes-per-live-reading, which made
+    // both fields lie about what they are. The real durable storage evidence — bytes, WAL volume, fsync
+    // volume, true write/space amplification — comes from the file-backed `iot_wire` run.
     {
         let s = collector.storage_mut();
-        s.store_bytes = outcome.steady_max_bytes;
-        s.store_pages = outcome.page_high_water;
+        s.store_bytes = Some(outcome.steady_max_bytes);
+        s.store_pages = Some(outcome.page_high_water);
     }
+    // The retention PLATEAU is this scenario's defining measurement, and this is the one workload in
+    // the suite that HAS a steady state — so it is the one report that carries `storage.plateau_ratio`
+    // (`rmp #711`). Everywhere else the field is absent, because nowhere else is there a plateau.
+    collector.record_plateau_ratio(plateau_ratio);
+    // Per-element durable cost: the device's steady-state footprint amortised over the steady-state
+    // graph it holds (`metadata.dataset` above IS that graph — the live readings plus their sensors).
+    collector.record_per_element_costs();
 
     // Throughput: total churn ops over the loop window; events/sec; and the REAL measured per-statement
     // ingest latency percentiles (an earlier revision emitted a fabricated 0.0 for all three).
-    collector.throughput_mut().operations = throughput.count();
-    collector.throughput_mut().ops_per_sec = events_per_sec;
+    collector.throughput_mut().operations = Some(throughput.count());
+    collector.throughput_mut().ops_per_sec = Some(events_per_sec);
     if let Some(p50) = outcome.insert_latency_ms(500) {
-        collector.throughput_mut().p50_latency_ms = p50;
+        collector.throughput_mut().p50_latency_ms = Some(p50);
     }
     if let Some(p99) = outcome.insert_latency_ms(990) {
-        collector.throughput_mut().p99_latency_ms = p99;
+        collector.throughput_mut().p99_latency_ms = Some(p99);
     }
     if let Some(p999) = outcome.insert_latency_ms(999) {
-        collector.throughput_mut().p999_latency_ms = p999;
+        collector.throughput_mut().p999_latency_ms = Some(p999);
     }
 
     collector.note(format!(
@@ -347,7 +351,7 @@ fn run() -> Result<(), String> {
         outcome.steady_max_bytes,
         outcome.page_high_water,
         steady_live,
-        mem.peak_rss_bytes,
+        mem.peak_rss_bytes.unwrap_or(0),
         wall.as_secs_f64(),
     );
 

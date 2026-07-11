@@ -386,7 +386,8 @@ target's `/metrics` **before → after deltas**, attributed to the run's isolate
 | `ssi_tracked_before` / `ssi_tracked_after` | retained SSI conflict records around the window |
 
 Process CPU/RSS and on-disk storage are **N/A** in this external mode (no co-located PID or store path)
-and are left zeroed with an explicit note — the honest, portable channel against a remote server is
+and are therefore **absent** from the wire report, with an explicit note (`rmp #711` — an unmeasured
+vector is omitted, never zero-filled) — the honest, portable channel against a remote server is
 `/metrics`. The workload params carry the server's ingest tally (`server_ingest_{nodes,relationships,
 properties}`) and the count of accepted version-tolerant DDL statements (`online_ddl_accepted`).
 

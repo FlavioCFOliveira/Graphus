@@ -27,8 +27,19 @@
 //!   [--workload-ops <u64> --workload-secs <f64>] \
 //!   [--p50-ms <f64> --p99-ms <f64> --p999-ms <f64>] [--abort-rate <f64>] \
 //!   [--logical-bytes-written <u64>] [--logical-graph-bytes <u64>] \
+//!   [--per-element-costs] \
 //!   [--param key=value]... [--note <text>]... [--phase name=millis]...
 //! ```
+//!
+//! ## `--per-element-costs`: derive the durable cost of a node / a relationship (`rmp #711`)
+//!
+//! With this flag the report carries `storage.bytes_per_node` / `storage.bytes_per_relationship`,
+//! derived from the **measured** store image against the `--nodes` / `--rels` scale. It is **opt-in**
+//! because it carries a caller obligation: `--store` must be the store that holds exactly the graph
+//! `--nodes` / `--rels` counts. An example that meters one tenant's database while counting every
+//! tenant's nodes would emit real arithmetic over mismatched inputs — a figure that is wrong in a way
+//! no reader can see. Without the flag the two costs are simply **absent** from the report (and their
+//! baseline gates are reported as skipped), which is the honest state for a run that cannot attest it.
 //!
 //! `--total-millis` (`rmp` #697) is the report's `total_millis`: the wall-clock duration of the
 //! example's WORKLOAD, as the example measured it. Without it the collector would time only its own
@@ -111,6 +122,11 @@ struct Args {
     abort_rate: Option<f64>,
     logical_bytes_written: Option<u64>,
     logical_graph_bytes: Option<u64>,
+    /// `--per-element-costs`: the example ATTESTS that `--store` is the store holding exactly the
+    /// `--nodes` / `--rels` graph, so the per-element durable costs may be derived from it
+    /// (`rmp #711`). Opt-in: an example that meters one tenant's store while counting every tenant's
+    /// nodes would otherwise publish a real division over mismatched inputs.
+    per_element_costs: bool,
     params: Vec<(String, String)>,
     notes: Vec<String>,
     phases: Vec<(String, f64)>,
@@ -134,36 +150,48 @@ fn main() -> ExitCode {
     //    workload no longer exists, so reading `--pid` would attribute the run's CPU to the surviving
     //    (post-recovery) process — a real number describing the wrong thing (`rmp` #697).
     // 2. Otherwise the pid's cumulative since-boot CPU, which IS the workload's CPU when the server
-    //    lived for exactly the workload. If the pid has already gone, the section honestly stays zero.
-    let cpu: CpuSection = match (
+    //    lived for exactly the workload.
+    //
+    // If NEITHER is available (the pid is gone), the CPU vector is NOT MEASURED and stays absent from
+    // the report (`rmp #711`) — a live server does not burn 0.000 CPU seconds, so emitting zeros here
+    // would be a placeholder a reader takes for a measurement.
+    let cpu: Option<CpuSection> = match (
         args.cpu_user_secs,
         args.cpu_system_secs,
         args.cpu_window_secs,
     ) {
-        (Some(user), Some(system), Some(window)) => cpu_section(
+        (Some(user), Some(system), Some(window)) => Some(cpu_section(
             CpuTimes {
                 user_secs: user.max(0.0),
                 system_secs: system.max(0.0),
             },
             Duration::from_secs_f64(window.max(0.0)),
-        ),
+        )),
         _ => match cumulative_cpu_times(target) {
-            Some(times) => cpu_section(times, Duration::from_secs_f64(args.uptime_secs.max(0.0))),
+            Some(times) => Some(cpu_section(
+                times,
+                Duration::from_secs_f64(args.uptime_secs.max(0.0)),
+            )),
             None => {
                 eprintln!(
-                    "measure_server: warning: could not read CPU for pid {} (already exited?); \
-                     leaving CPU section zeroed",
+                    "measure_server: warning: could not read CPU for pid {} (already exited?); the \
+                     CPU vector is NOT MEASURED and will be absent from the report",
                     args.pid
                 );
-                CpuSection::default()
+                None
             }
         },
     };
 
     // --- Memory: one current RSS read of the live server (the "final" RSS). The peak is the high
     // watermark the example sampled while the server was alive (preferred); fall back to this read.
-    let final_rss = current_rss_bytes(target).unwrap_or(0);
-    let peak_rss = args.peak_rss_bytes.unwrap_or(0).max(final_rss);
+    // A process that cannot be read has NO measured RSS — absent, not `0` bytes resident.
+    let final_rss = current_rss_bytes(target);
+    let peak_rss = match (args.peak_rss_bytes, final_rss) {
+        (Some(sampled), Some(read)) => Some(sampled.max(read)),
+        (Some(sampled), None) => Some(sampled),
+        (None, read) => read,
+    };
 
     let metadata = RunMetadata::new(args.scenario.clone(), args.description.clone())
         .with_dataset(DatasetScale::new(args.nodes, args.rels));
@@ -184,14 +212,26 @@ fn main() -> ExitCode {
         collector.phase(name.clone(), Duration::from_secs_f64(millis / 1_000.0));
     }
 
-    collector.cpu_mut().user_secs = cpu.user_secs;
-    collector.cpu_mut().system_secs = cpu.system_secs;
-    collector.cpu_mut().mean_core_utilisation = cpu.mean_core_utilisation;
-    collector.memory_mut().peak_rss_bytes = peak_rss;
-    collector.memory_mut().final_rss_bytes = final_rss;
+    if let Some(cpu) = cpu {
+        *collector.cpu_mut() = cpu;
+    }
+    if let Some(peak) = peak_rss {
+        collector.memory_mut().peak_rss_bytes = Some(peak);
+    }
+    if let Some(rss) = final_rss {
+        collector.memory_mut().final_rss_bytes = Some(rss);
+    }
+    if peak_rss.is_none() {
+        collector.note(format!(
+            "memory.* is NOT MEASURED (absent, not zero): pid {} could not be read (already \
+             exited?) and the example supplied no sampled peak RSS.",
+            args.pid
+        ));
+    }
 
     // --- Storage: measure the real on-disk store + WAL footprint, defaulting bytes_fsynced to the
-    // WAL byte count (the faithful proxy the collector documents).
+    // WAL byte count (the faithful proxy the collector documents). A path that does not exist is
+    // recorded as NOT MEASURED (absent), never as a zero footprint.
     if let Err(e) = collector.record_storage(&args.store, &args.wal, None) {
         eprintln!("measure_server: failed to measure storage: {e}");
         return ExitCode::FAILURE;
@@ -202,12 +242,29 @@ fn main() -> ExitCode {
     if logical_written > 0 || logical_graph > 0 {
         collector.record_amplification(logical_written, logical_graph);
     }
+    // --- Per-element durable costs (`rmp #711`): derived from the MEASURED store image against the
+    // `--nodes` / `--rels` dataset scale — but ONLY when the example asserts, with
+    // `--per-element-costs`, that `--store` holds exactly that graph. An example whose `--store` is one
+    // tenant's database while its counts span every tenant would otherwise publish real arithmetic over
+    // mismatched inputs: a figure that is wrong in a way nobody can see. Opt-in, never assumed.
+    if args.per_element_costs {
+        collector.record_per_element_costs();
+        collector.note(
+            "storage.bytes_per_node / bytes_per_relationship are DERIVED: the measured durable store \
+             image (not the WAL, a transient redo log a checkpoint reclaims) amortised over the \
+             --nodes / --rels the example loaded into exactly that store. They amortise the WHOLE \
+             image (records + property blocks + token catalogs + free-list slack) over each element \
+             count, so they are not per-record sizes and do not sum to store_bytes — they are two \
+             views of the same image, and a deterministic, machine-independent footprint signal."
+                .to_string(),
+        );
+    }
 
     // --- Throughput: only when the example timed a workload window.
     if let (Some(ops), Some(secs)) = (args.workload_ops, args.workload_secs) {
         if secs > 0.0 {
-            collector.throughput_mut().operations = ops;
-            collector.throughput_mut().ops_per_sec = ops as f64 / secs;
+            collector.throughput_mut().operations = Some(ops);
+            collector.throughput_mut().ops_per_sec = Some(ops as f64 / secs);
         }
     }
     // --- Total wall-clock (rmp #699): the report's `total_millis` must be the WORKLOAD's duration, not
@@ -222,18 +279,21 @@ fn main() -> ExitCode {
     }
     // --- Latency percentiles + abort rate: the figures the example's driver measured directly
     // (the harness cannot read per-operation latency / SSI aborts from the server's PID). Each is
-    // applied only when supplied, so an unmeasured percentile stays at its honest 0.0 default.
+    // applied only when supplied, so an unmeasured percentile stays ABSENT from the report rather than
+    // being emitted as a `0.0` that reads like "instantaneous" (`rmp #711`).
     if let Some(p50) = args.p50_ms {
-        collector.throughput_mut().p50_latency_ms = p50;
+        collector.throughput_mut().p50_latency_ms = Some(p50);
     }
     if let Some(p99) = args.p99_ms {
-        collector.throughput_mut().p99_latency_ms = p99;
+        collector.throughput_mut().p99_latency_ms = Some(p99);
     }
     if let Some(p999) = args.p999_ms {
-        collector.throughput_mut().p999_latency_ms = p999;
+        collector.throughput_mut().p999_latency_ms = Some(p999);
     }
+    // The abort rate is the one metric whose measured value may legitimately BE zero (a write workload
+    // with no conflict), so a supplied `--abort-rate 0` is recorded as the real 0.0 it is.
     if let Some(rate) = args.abort_rate {
-        collector.throughput_mut().abort_rate = rate;
+        collector.throughput_mut().abort_rate = Some(rate);
     }
 
     // --- Total wall-clock: the example's measured WORKLOAD window (`rmp` #697), never this binary's
@@ -382,6 +442,7 @@ fn parse_args<I: Iterator<Item = String>>(argv: I) -> Result<Args, String> {
                         .map_err(|e| format!("--logical-graph-bytes: {e}"))?,
                 );
             }
+            "--per-element-costs" => args.per_element_costs = true,
             "--param" => {
                 let raw = value()?;
                 let (k, v) = raw
@@ -524,13 +585,27 @@ mod tests {
             },
             Duration::from_secs_f64(parsed.cpu_window_secs.unwrap()),
         );
-        assert!((section.user_secs - 9.5).abs() < 1e-9);
-        assert!((section.system_secs - 2.5).abs() < 1e-9);
-        assert!(
-            (section.mean_core_utilisation - 2.0).abs() < 1e-9,
-            "12 CPU-seconds over 6 wall-seconds is 2.0 cores, got {}",
-            section.mean_core_utilisation
+        assert_eq!(section.user_secs, Some(9.5));
+        assert_eq!(section.system_secs, Some(2.5));
+        assert_eq!(
+            section.mean_core_utilisation,
+            Some(2.0),
+            "12 CPU-seconds over 6 wall-seconds is 2.0 cores"
         );
+    }
+
+    /// `rmp #711`: the per-element durable costs are **opt-in**. Without the flag they must stay
+    /// absent, because this binary cannot know that `--store` holds exactly the `--nodes`/`--rels`
+    /// graph — and a per-element cost divided over the wrong graph is evidence that lies quietly.
+    #[test]
+    fn per_element_costs_are_opt_in() {
+        let parsed = parse_args(argv(&required())).expect("parses");
+        assert!(!parsed.per_element_costs, "must default to OFF");
+
+        let mut a = required();
+        a.push("--per-element-costs");
+        let parsed = parse_args(argv(&a)).expect("parses");
+        assert!(parsed.per_element_costs);
     }
 
     /// The latency percentiles remain OPTIONAL: an example that cannot measure them must be able to

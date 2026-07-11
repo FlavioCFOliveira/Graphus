@@ -32,24 +32,26 @@
 //! those are the meaningful regression signals the committed baseline holds to a tight band:
 //!
 //! - **`dataset.nodes` / `dataset.relationships`** — exact (integer-stable).
-//! - **`storage.store_bytes` / `store_pages`**, **`bytes_per_node`** (`storage.space_amplification`),
-//!   **`bytes_per_edge`** (`storage.write_amplification`) — within a 15% band.
+//! - **`storage.store_bytes` / `store_pages`** and the per-element durable costs
+//!   **`storage.bytes_per_node` / `storage.bytes_per_relationship`** — within a 15% band.
 //!
 //! The throughput / CPU / peak-RAM / wall-time figures are **machine-variant** and are recorded for
 //! human visibility but NOT gated (see `bulk_baseline_cmp`).
 //!
-//! # Schema mapping (no schema widening)
+//! # Schema mapping — every figure in the field that MEANS it
 //!
-//! [`EvidenceReport`]'s fixed sections carry the bulk metrics through their existing fields:
-//!
-//! - **`storage`** — the durable footprint: `store_bytes`/`wal_bytes` + pages, plus
-//!   `space_amplification = bytes_per_node` and `write_amplification = bytes_per_edge` (the gated,
-//!   deterministic per-element costs). Because that overloads two field names, the SAME per-element
-//!   costs are ALSO published under the explicit, unambiguous workload params `storage_bytes_per_node`
-//!   / `storage_bytes_per_edge`. The honest store/total CSV-relative amplifications go into the
-//!   workload params for human visibility.
-//! - **`throughput`** — `operations = nodes + relationships`, `ops_per_sec` = elements/sec.
-//! - **`cpu` / `memory`** — the import child's CPU + peak/final RSS.
+//! - **`storage`** — the durable footprint: `store_bytes`/`wal_bytes` + pages; the two amplification
+//!   fields carry REAL amplification ratios (durable bytes over the logical CSV); and the per-element
+//!   durable costs go in `bytes_per_node` / `bytes_per_relationship`, the fields named for them.
+//!   (Before `rmp #699` the costs were smuggled into the amplification fields, so the committed
+//!   baseline read `space_amplification: 1239.04` where the real ratio was `46.78`. The costs are also
+//!   published as the `storage_bytes_per_node` / `storage_bytes_per_edge` workload params, kept for
+//!   continuity with the older reports.)
+//! - **`throughput`** — `operations = nodes + relationships`, `ops_per_sec` = elements/sec. A one-shot
+//!   offline import has **no per-operation request boundary**, so its latency percentiles are ABSENT
+//!   from the report rather than emitted as a `0.0` that reads as "instantaneous" (`rmp #711`).
+//! - **`cpu` / `memory`** — the import child's CPU + peak RSS. Its `final_rss_bytes` is ABSENT: the
+//!   child has exited by then, and an exited process has no resident set to read (`rmp #711`).
 //! - **`phases`** — one phase, `import`, with the import wall time.
 //! - **`workload`** — the per-table counts, the `ingest_*` rates, the CSV-relative amplifications,
 //!   and the content hash (lossless round-trip evidence).
@@ -257,41 +259,51 @@ fn run() -> Result<(), String> {
         },
         timed.wall,
     );
-    collector.cpu_mut().user_secs = cpu.user_secs;
-    collector.cpu_mut().system_secs = cpu.system_secs;
-    collector.cpu_mut().mean_core_utilisation = cpu.mean_core_utilisation;
-    collector.memory_mut().peak_rss_bytes = timed.peak_rss_bytes;
+    *collector.cpu_mut() = cpu;
+    collector.memory_mut().peak_rss_bytes =
+        (timed.peak_rss_bytes > 0).then_some(timed.peak_rss_bytes);
     collector.memory_mut().final_rss_bytes = timed.final_rss_bytes;
+    if timed.final_rss_bytes.is_none() {
+        collector.note(
+            "memory.final_rss_bytes is ABSENT = NOT MEASURED: the `graphus-bulk import` child had \
+             already exited by the time the final read was taken, and an exited process has no \
+             resident set. The PEAK RSS, sampled while it ran, IS the memory evidence for this \
+             one-shot offline load. (rmp #711 — it used to be emitted as a bare `0`.)"
+                .to_string(),
+        );
+    }
 
     // Storage: the durable footprint from storage.json. Every figure goes in the field that MEANS it —
     // the amplification fields carry real amplification ratios, and the per-element costs (which the
     // baseline gate holds to a tight band) go in the dedicated bytes_per_* fields.
     {
         let s = collector.storage_mut();
-        s.store_bytes = storage.store_bytes;
-        s.store_pages = storage.store_pages;
-        s.wal_bytes = storage.wal_bytes;
-        s.wal_pages = storage.wal_pages;
+        s.store_bytes = Some(storage.store_bytes);
+        s.store_pages = Some(storage.store_pages);
+        s.wal_bytes = Some(storage.wal_bytes);
+        s.wal_pages = Some(storage.wal_pages);
         // bytes_fsynced: the retained WAL byte count is the honest fsync proxy for an offline load
         // (every committed WAL byte is fsynced before the commit is acknowledged).
-        s.bytes_fsynced = storage.wal_bytes;
-        s.space_amplification = storage.space_amplification;
-        s.write_amplification = storage.write_amplification;
-        s.bytes_per_node = storage.bytes_per_node;
-        s.bytes_per_relationship = storage.bytes_per_edge;
+        s.bytes_fsynced = Some(storage.wal_bytes);
+        s.space_amplification = Some(storage.space_amplification);
+        s.write_amplification = Some(storage.write_amplification);
+        // The per-element durable costs bulk_storage measured over the SAME store image it just
+        // imported this exact dataset into (`rmp #711`: the field is populated, not a dead 0.0).
+        s.bytes_per_node = Some(storage.bytes_per_node);
+        s.bytes_per_relationship = Some(storage.bytes_per_edge);
     }
 
     // Throughput: elements loaded over the import window; element rate. A one-shot batch load has no
-    // per-operation latency to measure, so the percentiles stay 0.0 — and because the schema cannot
-    // omit a field, that MUST be stated, or a reader cannot tell "not measured" from "zero latency".
-    collector.throughput_mut().operations = throughput.count();
-    collector.throughput_mut().ops_per_sec = elements_per_sec;
+    // per-operation latency to measure, so the percentiles are ABSENT from the report (`rmp #711`:
+    // the schema can now omit them, so a reader cannot mistake "not measured" for "zero latency").
+    collector.throughput_mut().operations = Some(throughput.count());
+    collector.throughput_mut().ops_per_sec = Some(elements_per_sec);
     collector.note(
-        "throughput.p50/p99/p999_latency_ms are 0.0 because they are NOT MEASURED, not because the \
-         load is instantaneous: this is a one-shot offline batch import with no per-operation \
+        "throughput.p50/p99/p999_latency_ms are ABSENT because they are NOT MEASURED, not because \
+         the load is instantaneous: this is a one-shot offline batch import with no per-operation \
          request/response boundary to time. The real figure for this workload is ops_per_sec \
-         (elements/sec), which IS measured. (Evidence-honesty rule: measure it or say it is not \
-         measured — never leave a bare zero to be read as a result.)"
+         (elements/sec), which IS measured. (Evidence-honesty rule: measure it or omit it — never \
+         leave a bare zero to be read as a result.)"
             .to_string(),
     );
 
@@ -362,7 +374,10 @@ struct TimedImport {
     user_secs: f64,
     system_secs: f64,
     peak_rss_bytes: u64,
-    final_rss_bytes: u64,
+    /// The child's RSS at the very end of the import, or `None` when the process had already exited
+    /// and no final read was possible — an exited process has no resident set, and a `0` there would
+    /// read as a measurement (`rmp #711`).
+    final_rss_bytes: Option<u64>,
 }
 
 /// Parsed counts from a `graphus-bulk import` run.
@@ -409,10 +424,13 @@ fn timed_import(bulk_bin: &Path, store: &Path, data_dir: &Path) -> Result<TimedI
             Err(e) => return Err(format!("waiting on import child: {e}")),
         }
     }
-    // A final read after the loop (cheap; the PID may already be reaped, in which case we keep the
-    // last in-flight sample, which is the honest high-water mark we observed).
-    let final_rss = current_rss_bytes(target).unwrap_or(0);
-    peak_rss = peak_rss.max(final_rss);
+    // A final read after the loop. The import child has just EXITED, so this read almost always fails
+    // — and an exited process has NO final RSS to report. That is "not measured", not "0 bytes
+    // resident": the figure stays absent (`rmp #711`; it used to be emitted as a flat `0`, which read
+    // as if the importer ended holding no memory at all). The PEAK, sampled while the child was alive,
+    // is the real memory evidence for a one-shot batch import.
+    let final_rss = current_rss_bytes(target);
+    peak_rss = peak_rss.max(final_rss.unwrap_or(0));
 
     let output = child
         .wait_with_output()

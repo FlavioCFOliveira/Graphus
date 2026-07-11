@@ -98,6 +98,64 @@ for ex in "${TARGETS[@]}"; do
   fi
 done
 
+# ------------------------------------------------------------------------------------------------
+# Evidence-honesty audit (rmp #711) — the suite's own guard against a zero placeholder.
+#
+# "Measure it or omit it, never a zero placeholder" is a rule about EVERY report the suite emits, so
+# it is checked HERE, once, over every report the sweep just produced — rather than being restated in
+# twelve run.sh files, where the thirteenth would forget it. Schema 3 makes an unmeasured metric
+# ABSENT, so any metric still present as an exact 0 / 0.0 is, by construction, either a genuinely
+# measured zero (only `throughput.abort_rate` and the server-metrics counters can be) or a resurrected
+# placeholder. The scan fails the suite on the latter — this is precisely how `bytes_per_node` sat at
+# 0.0 in all 11 reports, documented as "durable bytes per stored node", with a green gate over it.
+# ------------------------------------------------------------------------------------------------
+audit_zero_placeholders() {
+  command -v python3 >/dev/null 2>&1 || { printf '  %s(python3 absent — evidence audit skipped)%s\n' "$DIM" "$RESET"; return 0; }
+  python3 - "$SCRIPT_DIR" "${PASSED[@]}" <<'PY'
+import glob, json, os, sys
+
+root, examples = sys.argv[1], sys.argv[2:]
+# Metrics whose measured value may LEGITIMATELY be zero. Everything else in the four vector sections
+# cannot be: a live process burns CPU and holds RSS, a stored graph occupies bytes, a completed
+# operation takes time, and a real footprint does not amplify by a factor of zero.
+LEGITIMATELY_ZERO = {("throughput", "abort_rate")}
+bad, seen = [], 0
+
+for ex in examples:
+    # EVERY report the example emitted — an example may write several (a wire report beside the
+    # in-process one, a real-server report beside the DST one). All of them are evidence.
+    for path in sorted(glob.glob(os.path.join(root, ex, "evidence*", "**", "report.json"),
+                                 recursive=True)):
+        seen += 1
+        rel = os.path.relpath(path, root)
+        with open(path) as fh:
+            report = json.load(fh)
+        if report.get("version", 0) < 3:
+            bad.append(f"{rel}: schema v{report.get('version')} — pre-#711 (zero placeholders)")
+            continue
+        for section in ("cpu", "memory", "storage", "throughput"):
+            for key, value in (report.get(section) or {}).items():
+                if (section, key) in LEGITIMATELY_ZERO:
+                    continue
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and value == 0:
+                    bad.append(f"{rel}: {section}.{key} = {value} — a zero placeholder for an "
+                               f"unmeasured metric (schema 3 OMITS what it did not measure)")
+
+print(f"  audited {seen} report.json file(s) for zero placeholders")
+for b in bad:
+    print(f"  ZERO PLACEHOLDER: {b}")
+sys.exit(1 if bad else 0)
+PY
+}
+
+printf '\n%s== Evidence-honesty audit ==%s\n' "$BOLD" "$RESET"
+if [ "${#PASSED[@]}" -gt 0 ] && ! audit_zero_placeholders; then
+  printf '  %s✗ a report emits a 0 for a metric it did not measure%s\n' "$RED" "$RESET"
+  FAILED+=("evidence-honesty audit")
+else
+  printf '  %s✓ every emitted metric is measured (unmeasured vectors are ABSENT, not zero)%s\n' "$GREEN" "$RESET"
+fi
+
 printf '\n%s== Suite result ==%s\n' "$BOLD" "$RESET"
 printf '  %s%s passed%s' "$GREEN" "${#PASSED[@]}" "$RESET"
 [ "${#FAILED[@]}"  -gt 0 ] && printf ', %s%s FAILED%s' "$RED" "${#FAILED[@]}" "$RESET"

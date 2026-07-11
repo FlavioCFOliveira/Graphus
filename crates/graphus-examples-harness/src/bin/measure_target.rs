@@ -155,34 +155,39 @@ fn main() -> ExitCode {
     collector.record_server_metrics(server.clone());
 
     // --- Throughput / latency: the figures the example's driver measured client-side (the only
-    // place they can come from in external mode). Applied only when supplied.
+    // place they can come from in external mode). Applied only when supplied; an unsupplied figure
+    // stays ABSENT (`rmp #711`), never a zero that reads like a measurement.
     if let (Some(ops), Some(secs)) = (args.workload_ops, args.workload_secs) {
         if secs > 0.0 {
-            collector.throughput_mut().operations = ops;
-            collector.throughput_mut().ops_per_sec = ops as f64 / secs;
+            collector.throughput_mut().operations = Some(ops);
+            collector.throughput_mut().ops_per_sec = Some(ops as f64 / secs);
         }
     }
     if let Some(p50) = args.p50_ms {
-        collector.throughput_mut().p50_latency_ms = p50;
+        collector.throughput_mut().p50_latency_ms = Some(p50);
     }
     if let Some(p99) = args.p99_ms {
-        collector.throughput_mut().p99_latency_ms = p99;
+        collector.throughput_mut().p99_latency_ms = Some(p99);
     }
     if let Some(p999) = args.p999_ms {
-        collector.throughput_mut().p999_latency_ms = p999;
+        collector.throughput_mut().p999_latency_ms = Some(p999);
     }
+    // A measured zero abort rate IS evidence (a write workload with no conflict), so it is recorded
+    // as the real 0.0 it is; an unsupplied one stays absent.
     if let Some(rate) = args.abort_rate {
-        collector.throughput_mut().abort_rate = rate;
+        collector.throughput_mut().abort_rate = Some(rate);
     }
 
     for note in &args.notes {
         collector.note(note.clone());
     }
     collector.note(format!(
-        "External-target measurement (measurement_mode=external): server is NOT co-located, so \
-         cpu/memory/storage vectors are N/A (no /proc or store-path access) and left zeroed. \
-         Server-side evidence is the /metrics before/after delta for database {:?}; \
-         throughput/latency are client-measured.",
+        "External-target measurement (measurement_mode=external): the server is NOT co-located, so \
+         the cpu / memory / storage vectors are N/A (no /proc, no store-path access) and are ABSENT \
+         from this report — including the per-element durable costs, which are derived from a store \
+         image this run cannot read. They are not zeroed: an unmeasured vector must never be \
+         reported as a measured zero (rmp #711). Server-side evidence is the /metrics before/after \
+         delta for database {:?}; throughput/latency are client-measured.",
         args.database
     ));
     if !server.scope_note.is_empty() {

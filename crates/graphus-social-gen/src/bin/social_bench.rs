@@ -1244,27 +1244,31 @@ fn write_evidence(
     collector.record_total_duration(Duration::from_secs_f64(workload_secs));
     collector.record_resources((
         CpuSection {
-            user_secs: best.cpu_user_secs,
-            system_secs: best.cpu_system_secs,
-            mean_core_utilisation: best.server_cores,
+            user_secs: Some(best.cpu_user_secs),
+            system_secs: Some(best.cpu_system_secs),
+            mean_core_utilisation: Some(best.server_cores),
         },
         MemorySection {
-            peak_rss_bytes: best.peak_rss,
-            final_rss_bytes: best.final_rss,
+            peak_rss_bytes: (best.peak_rss > 0).then_some(best.peak_rss),
+            final_rss_bytes: (best.final_rss > 0).then_some(best.final_rss),
         },
     ));
     // The STORAGE vector: in local mode the server is co-located, so its real on-disk footprint is
-    // readable. (Remotely there is no filesystem to walk and the section stays zeroed by contract.)
+    // readable. (Remotely there is no filesystem to walk, and the section is ABSENT by contract —
+    // never zero-filled, which would claim a measured empty store: `rmp #711`.)
     if args.store_path.is_some() {
         *collector.storage_mut() = StorageSection::from_footprints(
-            DiskFootprint::from_bytes(store_bytes),
-            DiskFootprint::from_bytes(wal_bytes),
+            Some(DiskFootprint::from_bytes(store_bytes)),
+            Some(DiskFootprint::from_bytes(wal_bytes)),
             // fsync proxy: every committed WAL byte is fsynced before the commit is acknowledged.
-            wal_bytes,
+            Some(wal_bytes),
         );
-        // Space amplification of the durable image over the logical graph. `0` logical bytes leaves
-        // the ratio at "not measured" rather than inventing one.
+        // Space amplification of the durable image over the logical graph. `0` logical bytes omits the
+        // ratio rather than inventing one.
         collector.record_amplification(0, args.logical_bytes);
+        // Per-element durable cost (`rmp #711`): the measured store image amortised over the graph it
+        // holds — `metadata.dataset` is the generator's node/rel counts for exactly this store.
+        collector.record_per_element_costs();
     }
 
     let total_ops: u64 = rungs.iter().map(|r| r.ok_ops).sum();
@@ -1272,18 +1276,16 @@ fn write_evidence(
         .iter()
         .fold((0, 0), |(o, e), r| (o + r.writes_ok, e + r.writes_err));
     let writer_attempts = writes_ok + writes_err;
-    let abort_rate = if writer_attempts > 0 {
-        writes_err as f64 / writer_attempts as f64
-    } else {
-        0.0
-    };
+    // With no write attempt there is no abort rate to report: absent, not a `0.0` claiming a
+    // conflict-free write workload that never ran (`rmp #711`). With attempts, a zero IS the result.
+    let abort_rate = (writer_attempts > 0).then(|| writes_err as f64 / writer_attempts as f64);
     {
         let t = collector.throughput_mut();
-        t.operations = total_ops;
-        t.ops_per_sec = best.ops_per_sec;
-        t.p50_latency_ms = bench::ns_to_ms(best.overall.p50);
-        t.p99_latency_ms = bench::ns_to_ms(best.overall.p99);
-        t.p999_latency_ms = bench::ns_to_ms(best.overall.p999);
+        t.operations = Some(total_ops);
+        t.ops_per_sec = Some(best.ops_per_sec);
+        t.p50_latency_ms = Some(bench::ns_to_ms(best.overall.p50));
+        t.p99_latency_ms = Some(bench::ns_to_ms(best.overall.p99));
+        t.p999_latency_ms = Some(bench::ns_to_ms(best.overall.p999));
         t.abort_rate = abort_rate;
     }
 

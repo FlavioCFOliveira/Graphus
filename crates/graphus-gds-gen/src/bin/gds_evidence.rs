@@ -280,12 +280,15 @@ fn main() -> ExitCode {
             Some(times) => cpu_section(times, Duration::from_secs_f64(args.uptime_secs.max(0.0))),
             None => CpuSection::default(),
         };
-        collector.cpu_mut().user_secs = cpu.user_secs;
-        collector.cpu_mut().system_secs = cpu.system_secs;
-        collector.cpu_mut().mean_core_utilisation = cpu.mean_core_utilisation;
+        *collector.cpu_mut() = cpu;
 
-        let final_rss = current_rss_bytes(target).unwrap_or(0);
-        let peak_rss = args.peak_rss_bytes.unwrap_or(0).max(final_rss);
+        // An RSS that cannot be read is NOT MEASURED (absent), never `0` bytes resident (`rmp #711`).
+        let final_rss = current_rss_bytes(target);
+        let peak_rss = match (args.peak_rss_bytes, final_rss) {
+            (Some(sampled), Some(read)) => Some(sampled.max(read)),
+            (Some(sampled), None) => Some(sampled),
+            (None, read) => read,
+        };
         collector.memory_mut().peak_rss_bytes = peak_rss;
         collector.memory_mut().final_rss_bytes = final_rss;
         collector.note(format!(
@@ -316,9 +319,23 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
         // Amplification: REAL ratios — the durable bytes the load actually produced over the logical
-        // dataset the generator emitted. Absent a logical figure they stay at the honest 0.0.
+        // dataset the generator emitted. Absent a logical figure they are simply omitted.
         if let Some(logical) = args.logical_graph_bytes.filter(|b| *b > 0) {
             collector.record_amplification(logical, logical);
+        }
+        // Per-element durable costs (`rmp #711`): divided by the LOADED INFLUENCE NETWORK's counts —
+        // the graph that is actually in the store just measured — and NOT by `metadata.dataset`, which
+        // for this example is the hermetic CSR sweep's reference graph (a resident projection that
+        // never touched a disk). Dividing the store image by a graph it never held would be real
+        // arithmetic over mismatched inputs: precisely the subtly-wrong evidence the rule forbids.
+        if let (Some(n), Some(r)) = (args.nodes, args.rels) {
+            collector.record_per_element_costs_for(n, r);
+            collector.note(format!(
+                "storage.bytes_per_node / bytes_per_relationship are the measured durable store image \
+                 amortised over the LOADED influence network ({n} nodes, {r} relationships) — the \
+                 graph that is in that store. They are deliberately NOT divided by metadata.dataset, \
+                 which for this example is the hermetic CSR sweep's reference graph and has no store."
+            ));
         }
         collector.note(
             "storage.* is the live server's REAL on-disk footprint: the graphus.store image plus the \
@@ -346,22 +363,22 @@ fn main() -> ExitCode {
 
     // --- Throughput: the official-driver workload's REAL operations, rate and latency percentiles.
     // The hermetic sweep reports per-algorithm WALL TIME (the phases above), not an operation rate,
-    // so with no driver path the whole section honestly stays zero rather than carrying the sweep's
-    // measurement COUNT dressed up as "operations" with a 0.0 ops/sec beside it.
+    // so with no driver path the whole section is ABSENT rather than carrying the sweep's measurement
+    // COUNT dressed up as "operations" with a 0.0 ops/sec beside it (`rmp #699` / `#711`).
     if let Some(ops) = args.workload_ops {
-        collector.throughput_mut().operations = ops;
+        collector.throughput_mut().operations = Some(ops);
         if let Some(secs) = args.workload_secs.filter(|s| *s > 0.0) {
-            collector.throughput_mut().ops_per_sec = ops as f64 / secs;
+            collector.throughput_mut().ops_per_sec = Some(ops as f64 / secs);
         }
     }
     if let Some(p) = args.p50_ms {
-        collector.throughput_mut().p50_latency_ms = p;
+        collector.throughput_mut().p50_latency_ms = Some(p);
     }
     if let Some(p) = args.p99_ms {
-        collector.throughput_mut().p99_latency_ms = p;
+        collector.throughput_mut().p99_latency_ms = Some(p);
     }
     if let Some(p) = args.p999_ms {
-        collector.throughput_mut().p999_latency_ms = p;
+        collector.throughput_mut().p999_latency_ms = Some(p);
     }
     {
         let sweep_measurements: u64 = sweep.sizes.iter().map(|s| s.timings_ms.len() as u64).sum();

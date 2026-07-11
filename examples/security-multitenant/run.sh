@@ -654,6 +654,7 @@ if [ "$RUN_REST" = "1" ] && [ "$MODE" = "external" ]; then
       --workload-ops "${R_REQS:-0}" --workload-secs "${R_REQ_SECS:-0}" \
       --p50-ms "${R_P50:-0}" --p99-ms "${R_P99:-0}" --p999-ms "${R_P999:-0}" \
       --abort-rate 0.0 \
+      --note "storage.bytes_per_node / bytes_per_relationship are deliberately ABSENT (rmp #711): the storage vector meters ONE tenant's database (tenant_a) while --nodes/--rels count BOTH tenants' seeded graphs, so a per-element cost derived from them would divide one store by two stores' elements. Absent is the honest state; --per-element-costs is therefore not passed. The cross-tenant footprint totals ride in as workload params." \
       --param "seeded_statements=${R_SEEDED:-0}" \
       --note "throughput.* is the REST RBAC matrix workload: ${R_REQS:-0} authorization-enforced /db/{db}/tx/commit requests over the window they were issued in, with their REAL latency percentiles (measured by matrix.py). Before rmp #699 the latency percentiles were hardcoded 0.000 placeholders and ops_per_sec was seeded_statements divided by the server UPTIME." \
       --param "profile=$PROFILE" \
@@ -714,6 +715,7 @@ elif [ "$RUN_REST" = "1" ] && [ "$MODE" = "local" ]; then
       --p50-ms "${R_P50:-0}" --p99-ms "${R_P99:-0}" --p999-ms "${R_P999:-0}" \
       --logical-bytes-written "$LOGICAL_GRAPH_BYTES" \
       --logical-graph-bytes "$LOGICAL_GRAPH_BYTES" \
+      --note "storage.bytes_per_node / bytes_per_relationship are deliberately ABSENT (rmp #711): the storage vector meters ONE tenant's database (tenant_a) while --nodes/--rels count BOTH tenants' seeded graphs, so a per-element cost derived from them would divide one store by two stores' elements. Absent is the honest state; --per-element-costs is therefore not passed. The cross-tenant footprint totals ride in as workload params." \
       --param "seeded_statements=${R_SEEDED:-0}" \
       --param "profile=$PROFILE" \
       --param "connection=rest-https-jwt+bolt-tcp-tls" \

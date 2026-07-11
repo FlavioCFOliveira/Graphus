@@ -138,11 +138,23 @@ fn run() -> Result<(), String> {
     //  - total: store + the retained WAL redo log vs the logical input — the peak footprint right
     //    after a bulk load, before any WAL truncation/checkpoint. The WAL dominates here because the
     //    batched commits logged every page; it is transient, not steady-state.
-    let store_space_amp = StorageMeter::space_amplification(store_fp.bytes, logical);
-    let space_amp = StorageMeter::space_amplification(total_bytes, logical);
+    //
+    // Each ratio needs a logical denominator. A manifest reporting ZERO logical CSV bytes describes a
+    // dataset that was never generated, so there is no ratio to form: fail loudly rather than publish
+    // a `0.0` that reads like a measurement (`rmp #711`).
+    let no_logical = || {
+        "the manifest reports 0 logical CSV bytes: no amplification ratio can be formed (was the \
+         dataset ever generated?)"
+            .to_string()
+    };
+    let store_space_amp =
+        StorageMeter::space_amplification(store_fp.bytes, logical).ok_or_else(no_logical)?;
+    let space_amp =
+        StorageMeter::space_amplification(total_bytes, logical).ok_or_else(no_logical)?;
     // Write amplification uses the total physical bytes written (store + WAL) as an honest lower
     // bound on bytes that hit disk for `logical` bytes of input.
-    let write_amp = StorageMeter::write_amplification(total_bytes, logical);
+    let write_amp =
+        StorageMeter::write_amplification(total_bytes, logical).ok_or_else(no_logical)?;
 
     let report = StorageReport {
         profile: manifest.profile.clone(),

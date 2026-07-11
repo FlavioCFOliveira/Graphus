@@ -49,7 +49,7 @@ assert "report.json names the scenario" "yes" \
 # `1` long after the schema moved to `2`, and nothing noticed, because no CI runs the examples: see
 # examples/run-all.sh, which exists so the suite is actually exercised.)
 assert "report.json carries the schema version" "yes" \
-  "$(grep -q '"version": 2' "$EVIDENCE_DIR/report.json" && echo yes || echo no)"
+  "$(grep -q '"version": 3' "$EVIDENCE_DIR/report.json" && echo yes || echo no)"
 assert "report.json carries the host section" "yes" \
   "$(grep -q '"host"' "$EVIDENCE_DIR/report.json" && echo yes || echo no)"
 

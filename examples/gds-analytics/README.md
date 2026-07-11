@@ -379,11 +379,16 @@ schema's existing flexible carriers:
   and this is what the baseline gate reads.*
 - **`storage`** section — the live server's **real on-disk footprint**: the `graphus.store` image and
   the `graphus.wal` **directory** of `seg.<lsn>` segment files, with real `write_amplification` /
-  `space_amplification` ratios against the generator's logical `graph.cypher` bytes. On the hermetic
-  path there is no server, so the section is honestly zero (= not measured).
+  `space_amplification` ratios against the generator's logical `graph.cypher` bytes, plus the
+  per-element durable costs `bytes_per_node` / `bytes_per_relationship`. Those two are amortised over
+  the **loaded influence network** (`loaded_network_nodes/rels`) — the graph that is actually in the
+  metered store — and NOT over `dataset`, which for this example is the hermetic CSR sweep's reference
+  graph (a resident projection that never touched a disk). On the hermetic path there is no server, so
+  the whole section is **absent** (= not measured; schema v3 omits what it did not measure, rather than
+  reporting zeros a reader would take for a measurement).
 - **`dataset`** — the reference (largest swept) graph size (byte-stable for a fixed sweep seed).
 - **`cpu` / `memory`** — the live server's real CPU seconds + peak RSS **when the driver path ran**;
-  honest zeros on the hermetic path.
+  **absent** on the hermetic path (there is no server process to meter).
 - **`throughput`** — the analyze workload's real `operations`, `ops_per_sec` and `p50/p99/p999`, from
   the driver's measured per-operation latencies. Honestly zero on the hermetic path (the sweep reports
   per-algorithm *wall time* — the `phases` above — not an operation rate).

@@ -410,6 +410,7 @@ EOF
     --param "concurrency_write_p99_ms=${CONC_WRITE_P99:-0}"
     --param "point_lookup_p99_ms=${DETECT_PL_P99:-0}"
     --note "Client latency percentiles + abort rate come from the drivers (GRAPHUS_STATS); the concurrency phase contends on the REAL mule supernodes."
+    --note "storage.bytes_per_node / bytes_per_relationship are deliberately ABSENT (rmp #711): --nodes/--rels are the GENERATOR's seeded counts, while the concurrency phase CREATEs extra CONC- TRANSFER relationships in the same store. Dividing the measured store image by the seed counts would be real arithmetic over a graph the store no longer holds — a figure wrong in a way no reader could see. Absent is the honest state; --per-element-costs is therefore not passed."
     --note "per-TRANSFER insert latency vs cumulative edge count (rmp #683 scan-based REL KEY): $TXCURVE"
   )
 

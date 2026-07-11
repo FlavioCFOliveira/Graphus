@@ -258,28 +258,30 @@ fn run() -> Result<bool, String> {
 
     // ---- Throughput + latency: measured, or omitted. ----
     {
-        let t = collector.throughput_mut();
-        t.operations = s
+        let ops = s
             .ingest_ops
             .saturating_add(s.delete_ops)
             .saturating_add(s.checkpoints_issued);
+        let t = collector.throughput_mut();
+        t.operations = (ops > 0).then_some(ops);
         if let Some(rate) = s.ingest_per_sec() {
-            t.ops_per_sec = rate;
+            t.ops_per_sec = Some(rate);
         }
         // The percentiles are the INGEST family (the workload's dominant statement). The windowed
         // retention DELETE is a structurally different statement, so it gets its own workload params
         // rather than being folded into the same percentile — averaging them would misreport both.
         if let Some(l) = s.insert_latency {
-            t.p50_latency_ms = l.p50_ms;
-            t.p99_latency_ms = l.p99_ms;
-            t.p999_latency_ms = l.p999_ms;
+            t.p50_latency_ms = Some(l.p50_ms);
+            t.p99_latency_ms = Some(l.p99_ms);
+            t.p999_latency_ms = Some(l.p999_ms);
         }
         // Abort rate: the fraction of statements the engine made the client retry. A sensor-sharded
-        // ingest is conflict-free by construction, so this is expected to be 0 — and it is a REAL
-        // observation, not an assumption.
-        let attempted = t.operations.saturating_add(s.retried_ops);
+        // ingest is conflict-free by construction, so this is expected to be 0 — and that zero is a
+        // REAL observation (the one metric whose measured value may legitimately be 0.0), not an
+        // assumption and not a placeholder.
+        let attempted = ops.saturating_add(s.retried_ops);
         if attempted > 0 {
-            t.abort_rate = s.retried_ops as f64 / attempted as f64;
+            t.abort_rate = Some(s.retried_ops as f64 / attempted as f64);
         }
     }
     if let Some(l) = s.delete_latency {
@@ -310,36 +312,44 @@ fn run() -> Result<bool, String> {
         // preallocation per database and the catalog is constant overhead; folding them in here would
         // inflate the store and deflate every ratio derived from it. Both are reported by name in the
         // workload params instead.
-        storage.store_bytes = st.data_bytes;
-        storage.store_pages = st.data_bytes.div_ceil(8192);
-        storage.wal_bytes = st.wal_bytes;
-        storage.wal_pages = st.wal_bytes.div_ceil(8192);
+        storage.store_bytes = Some(st.data_bytes);
+        storage.store_pages = Some(st.data_bytes.div_ceil(8192));
+        storage.wal_bytes = Some(st.wal_bytes);
+        storage.wal_pages = Some(st.wal_bytes.div_ceil(8192));
         // Every WAL byte is fsynced before its commit is acknowledged, so the CUMULATIVE WAL volume the
         // run wrote is the honest durable-sync volume. (The residual on-disk WAL would understate it
         // badly: the checkpoints deleted most of it.) This is the harness's documented WAL-as-fsync-proxy
         // convention, applied to the cumulative figure rather than the leftovers.
-        storage.bytes_fsynced = st.wal_written_bytes;
+        storage.bytes_fsynced = Some(st.wal_written_bytes);
         if let Some(w) = s.write_amplification() {
-            storage.write_amplification = w;
+            storage.write_amplification = Some(w);
         }
         if let Some(a) = s.space_amplification() {
-            storage.space_amplification = a;
+            storage.space_amplification = Some(a);
+        }
+        // Per-element durable cost (`rmp #711`): the measured DATA IMAGE amortised over the graph that
+        // image holds — `metadata.dataset` above is exactly the final live readings plus their sensors.
+        collector.record_per_element_costs();
+        // The durable store's retention PLATEAU, when the run observed one: this is a retention/GC
+        // workload, so it is one of the two reports in the suite that legitimately carries the field.
+        if let Some(ratio) = s.plateau_ratio() {
+            collector.record_plateau_ratio(ratio);
         }
     }
 
     // ---- CPU / RAM of the SERVER process (local only). ----
     if let Some((user, system)) = s.server_cpu_secs {
         let cpu = collector.cpu_mut();
-        cpu.user_secs = user;
-        cpu.system_secs = system;
-        if s.workload_secs > 0.0 {
-            cpu.mean_core_utilisation = (user + system) / s.workload_secs;
-        }
+        cpu.user_secs = Some(user);
+        cpu.system_secs = Some(system);
+        // No workload window ⇒ nothing to divide by ⇒ the utilisation is absent, not `0.0` cores.
+        cpu.mean_core_utilisation =
+            (s.workload_secs > 0.0).then(|| (user + system) / s.workload_secs);
     }
     if let Some(rss) = s.server_peak_rss_bytes {
         let mem = collector.memory_mut();
-        mem.peak_rss_bytes = rss;
-        mem.final_rss_bytes = rss;
+        mem.peak_rss_bytes = Some(rss);
+        mem.final_rss_bytes = Some(rss);
     }
 
     // ---- Server-side /metrics evidence (transactions + the reliability signals). ----

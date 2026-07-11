@@ -534,6 +534,7 @@ if "$MEASURE" \
     --wal "$WAL_PATH" \
     --nodes "$ACCOUNTS_AFTER" \
     --rels "$TRANSFERS_AFTER" \
+    --per-element-costs \
     --peak-rss-bytes "$PEAK_RSS_BYTES" \
     --workload-ops "$ACKED_BATCHES" \
     --workload-secs "$(LC_ALL=C awk "BEGIN{printf \"%.6f\", ${WL_MS}/1000}")" \

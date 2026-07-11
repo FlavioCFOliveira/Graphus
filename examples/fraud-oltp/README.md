@@ -280,7 +280,7 @@ directory: a machine-readable `report.json` and a human-readable `report.md`. Bo
 | `host` | os, arch, cpu cores, hostname, rustc version, timestamp |
 | `cpu` | server user / system CPU seconds, mean core utilisation *(LOCAL only)* |
 | `memory` | peak / final server RSS (bytes) *(LOCAL only)* |
-| `storage` | store / WAL bytes + pages, bytes fsynced, write- & space-amplification *(LOCAL only)* |
+| `storage` | store / WAL bytes + pages, bytes fsynced, write- & space-amplification *(LOCAL only)*. The per-element costs `bytes_per_node` / `bytes_per_relationship` are deliberately **ABSENT** — see below. |
 | `throughput` | operations, ops/sec, p50 / p99 / p999 latency (ms), **abort / conflict rate** |
 | `server_metrics` | **server-side `/metrics` before→after deltas** for the run's database: committed / aborted / **abort_rate** / slow_queries / query-duration percentiles, and the health invariants **statement_panics / engine_recovery_panics / engine_force_detached** (which MUST be 0), plus the SSI-tracked gauge |
 
@@ -288,6 +288,14 @@ How the figures are sourced (and their honest caveats):
 
 - **CPU + RSS** are read from the *live* server process (`/proc/<pid>/{stat,statm}` on Linux, a `ps`
   fallback elsewhere) by the dev-only `measure_server` harness binary while the server is still up.
+- **`storage.bytes_per_node` / `bytes_per_relationship` are deliberately ABSENT** (`rmp #711`), and
+  their baseline gates are reported as *skipped*. A per-element durable cost is only honest if its two
+  inputs describe the **same graph**: here `--nodes`/`--rels` are the *generator's* seeded counts, while
+  the extreme-concurrency phase CREATEs additional `CONC-`tagged `TRANSFER` relationships into the very
+  store being metered. Dividing the measured store image by the seed counts would be real arithmetic
+  over a graph the store no longer holds — a figure wrong in a way no reader could see. In external
+  (attach) mode the whole `storage` / `cpu` / `memory` vectors are likewise absent, not zeroed: the
+  server is not co-located, so there is nothing to measure.
 - **Storage** is the real on-disk footprint of `<store>/graphus.store` and the `<store>/graphus.wal/`
   segment directory, measured after the workload. `bytes_fsynced` is the WAL byte count (a faithful
   proxy: every committed WAL byte is fsynced before acknowledgement). `space_amplification` and

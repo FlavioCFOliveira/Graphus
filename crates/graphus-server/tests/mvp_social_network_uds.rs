@@ -489,7 +489,8 @@ fn mvp_social_network_over_uds_survives_restart_and_crash() {
     let cpu = cumulative_cpu_times(target)
         .map(|t| cpu_section(t, Duration::from_secs(1)))
         .unwrap_or_default();
-    let final_rss = current_rss_bytes(target).unwrap_or(0);
+    // An unreadable RSS is NOT MEASURED (absent), never `0` bytes resident (`rmp #711`).
+    let final_rss = current_rss_bytes(target);
 
     let metadata = RunMetadata::new(
         "social-network-uds",
@@ -508,6 +509,9 @@ fn mvp_social_network_over_uds_survives_restart_and_crash() {
     collector
         .record_storage(ws.store_file(), ws.wal_file(), None)
         .expect("measure store + WAL footprint");
+    // The store just walked holds exactly the graph this workload created, so the per-element durable
+    // costs are derivable from it (`rmp #711`).
+    collector.record_per_element_costs();
     collector.note("Evidence collected by the cargo integration test (mvp_social_network_uds).");
     let report = collector.finish();
 
@@ -524,15 +528,35 @@ fn mvp_social_network_over_uds_survives_restart_and_crash() {
     assert_eq!(loaded.metadata.scenario, "social-network-uds");
     assert_eq!(loaded.metadata.dataset.nodes, nodes_after as u64);
     assert_eq!(loaded.metadata.dataset.relationships, rels_after as u64);
+    let store_bytes = loaded
+        .storage
+        .store_bytes
+        .expect("the store footprint was measured, so it must be PRESENT in the report");
     assert!(
-        loaded.storage.store_bytes > 0,
-        "the on-disk store must have a non-zero footprint after the workload, got {}",
-        loaded.storage.store_bytes
+        store_bytes > 0,
+        "the on-disk store must have a non-zero footprint after the workload, got {store_bytes}"
+    );
+    let final_rss = loaded
+        .memory
+        .final_rss_bytes
+        .expect("the RSS of a live process was read, so it must be PRESENT in the report");
+    assert!(
+        final_rss > 0,
+        "a live server process must report a positive RSS, got {final_rss}"
+    );
+    // `rmp #711`: the per-element durable costs are DERIVED from the measured store against the
+    // measured graph — never the dead 0.0 placeholder this report used to carry.
+    let per_node = loaded
+        .storage
+        .bytes_per_node
+        .expect("bytes_per_node must be populated when the store AND the dataset were measured");
+    assert!(
+        (per_node - store_bytes as f64 / nodes_after as f64).abs() < 1e-6,
+        "bytes_per_node must be the measured store image over the measured node count"
     );
     assert!(
-        loaded.memory.final_rss_bytes > 0,
-        "a live server process must report a positive RSS, got {}",
-        loaded.memory.final_rss_bytes
+        loaded.storage.bytes_per_relationship.is_some(),
+        "bytes_per_relationship must be populated too"
     );
 
     // Clean teardown.

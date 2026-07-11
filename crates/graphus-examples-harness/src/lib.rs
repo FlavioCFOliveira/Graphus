@@ -36,6 +36,22 @@
 //! (this host, with `/proc` + store-file access) or an **external** one (a remote instance, where
 //! only the `/metrics` endpoint is reachable).
 //!
+//! ## Measured, or absent — never a zero placeholder (`rmp #711`)
+//!
+//! Every metric in the four performance-vector sections is an **`Option`**, serialized with
+//! `skip_serializing_if = "Option::is_none"`. A vector an example could not measure — the CPU/RSS of a
+//! server it is only *attached* to, the on-disk footprint of a store it does not own, the per-operation
+//! latency of a one-shot batch import — is therefore **absent from the JSON**, not written as `0.0`.
+//!
+//! This is the schema half of the project's evidence-honesty rule (`examples/README.md`): *measure it
+//! or omit it — never a zero placeholder*. Before `rmp #711` the schema could not express "not
+//! measured", so an unmeasured vector was emitted as an exact `0.0` that reads as a measurement —
+//! `storage.bytes_per_node: 0.0` told every reader that a stored node costs nothing to keep. A gate
+//! built on such a field compares `0.0` to `0.0` and can never fire, which is the same lie wearing a
+//! green tick. The distinction the type now expresses is **"was it measured"**, not "is it zero": a
+//! genuinely measured zero (an `abort_rate` of `0.0` in a write workload that suffered no conflict)
+//! stays a real, present `0.0`.
+//!
 //! ## Baseline-diff regression detection
 //!
 //! [`EvidenceReport::compare_to_baseline`] diffs a run against a committed baseline report and flags
@@ -109,7 +125,18 @@ pub use scrape::{Bucket, Histogram, MetricsSnapshot};
 ///   ([`MeasurementMode`]) and the optional server-side [`ServerMetricsSection`]
 ///   ([`server_metrics`](EvidenceReport::server_metrics)) scraped from `/metrics` (`rmp #684`). Both
 ///   are additive `#[serde(default)]` fields, so a v1 `report.json` still deserializes.
-pub const SCHEMA_VERSION: u32 = 2;
+/// - `3` — **every metric is `Option`** (`rmp #711`): a metric an example did not measure is now
+///   **ABSENT** from the JSON instead of being written as a `0` / `0.0` placeholder that a reader
+///   cannot tell apart from a real zero. See [`EvidenceReport::load`] for how a v1/v2 report's zero
+///   placeholders are normalised on the way in.
+pub const SCHEMA_VERSION: u32 = 3;
+
+/// The schema version from which a metric an example did not measure is **absent** rather than zero.
+const OPTIONAL_METRICS_SINCE: u32 = 3;
+
+/// How an absent (= not measured) metric renders in the human-readable `report.md`. Deliberately a
+/// phrase and not a number: a reader must never be shown a `0.000` for something nobody measured.
+const NOT_MEASURED: &str = "not measured";
 
 /// The size of the dataset an example exercised.
 ///
@@ -201,46 +228,92 @@ impl RunMetadata {
 
 /// CPU-usage evidence for the run.
 ///
-/// **Seam — filled in by `rmp #246`** (`getrusage(RUSAGE_SELF/RUSAGE_CHILDREN)`, `/proc/<pid>/stat`
-/// sampling). Fields are present so example code can already reference the shape; they stay zeroed
-/// until the metering lands.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Populated from the [`resource`] meters (`getrusage`, `/proc/<pid>/stat`). Every field is an
+/// `Option`: a run that could **not** meter a CPU (an external target, whose process is not on this
+/// host) leaves them absent rather than reporting `0.0` seconds of work — see the crate docs.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CpuSection {
-    /// User-mode CPU time consumed by the server process(es), in seconds.
-    pub user_secs: f64,
-    /// Kernel-mode CPU time consumed by the server process(es), in seconds.
-    pub system_secs: f64,
+    /// User-mode CPU time consumed by the server process(es), in seconds. Absent = not measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_secs: Option<f64>,
+    /// Kernel-mode CPU time consumed by the server process(es), in seconds. Absent = not measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_secs: Option<f64>,
     /// Mean CPU utilisation over the run as a fraction of one core (1.0 == one core saturated).
-    pub mean_core_utilisation: f64,
+    /// Absent = not measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean_core_utilisation: Option<f64>,
+}
+
+impl CpuSection {
+    /// Total CPU seconds (user + system), or `None` when either half was not measured — the figure
+    /// the baseline gate compares.
+    #[must_use]
+    pub fn total_secs(&self) -> Option<f64> {
+        match (self.user_secs, self.system_secs) {
+            (Some(u), Some(s)) => Some(u + s),
+            _ => None,
+        }
+    }
+
+    /// `true` when nothing at all was measured (the whole vector is N/A).
+    #[must_use]
+    pub fn is_unmeasured(&self) -> bool {
+        self.user_secs.is_none()
+            && self.system_secs.is_none()
+            && self.mean_core_utilisation.is_none()
+    }
 }
 
 /// Memory-usage evidence for the run.
 ///
-/// **Seam — filled in by `rmp #246`** (peak RSS via `getrusage`/`/proc/<pid>/status`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Populated from the [`resource`] meters (peak RSS via `getrusage` / `/proc/<pid>/status`). Absent
+/// fields mean **not measured** (e.g. an external target), never "zero bytes resident".
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MemorySection {
-    /// Peak resident set size of the server process, in bytes.
-    pub peak_rss_bytes: u64,
-    /// Resident set size sampled at the end of the run, in bytes.
-    pub final_rss_bytes: u64,
+    /// Peak resident set size of the server process, in bytes. Absent = not measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_rss_bytes: Option<u64>,
+    /// Resident set size sampled at the end of the run, in bytes. Absent = not measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_rss_bytes: Option<u64>,
 }
 
-/// Storage-footprint evidence for the run, including the classic amplification ratios.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+impl MemorySection {
+    /// `true` when nothing at all was measured (the whole vector is N/A).
+    #[must_use]
+    pub fn is_unmeasured(&self) -> bool {
+        self.peak_rss_bytes.is_none() && self.final_rss_bytes.is_none()
+    }
+}
+
+/// Storage-footprint evidence for the run, including the classic amplification ratios and the
+/// per-element durable costs.
+///
+/// Every field is an `Option` because every one of them is only *sometimes* measurable: an example
+/// attached to a remote instance can read no store at all; an in-memory mirror has no WAL; a run that
+/// tracks no logical byte count cannot form an amplification ratio; a run whose dataset scale is
+/// unknown cannot form a per-element cost. **Absent means NOT MEASURED** — never "this graph costs
+/// nothing to store".
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StorageSection {
-    /// Total on-disk size of the data store after the run, in bytes.
-    pub store_bytes: u64,
-    /// Total on-disk size of the write-ahead log after the run, in bytes.
-    pub wal_bytes: u64,
+    /// Total on-disk size of the data store after the run, in bytes. Absent = not measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_bytes: Option<u64>,
+    /// Total on-disk size of the write-ahead log after the run, in bytes. Absent = not measured (the
+    /// WAL is a *directory* of `seg.<lsn>` files; an in-memory mirror has none at all).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wal_bytes: Option<u64>,
     /// Equivalent whole-page count of the data store (`ceil(store_bytes / PAGE_SIZE)`).
-    #[serde(default)]
-    pub store_pages: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_pages: Option<u64>,
     /// Equivalent whole-page count of the WAL (`ceil(wal_bytes / PAGE_SIZE)`).
-    #[serde(default)]
-    pub wal_pages: u64,
-    /// Bytes physically `fsync`ed to durable media during the run, if measured.
-    pub bytes_fsynced: u64,
-    /// **Write amplification**: physical bytes written / logical bytes written. `0.0` when not
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wal_pages: Option<u64>,
+    /// Bytes physically `fsync`ed to durable media during the run. Absent = not measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_fsynced: Option<u64>,
+    /// **Write amplification**: physical bytes written / logical bytes written. Absent when not
     /// measured (no logical figure supplied). `1.0` is ideal; `> 1.0` quantifies durability I/O
     /// overhead.
     ///
@@ -248,50 +321,88 @@ pub struct StorageSection {
     /// per-element cost or a plateau ratio must use the dedicated fields below — smuggling a
     /// different quantity in here makes the reports incomparable and silently misleads any reader
     /// (or gate) that trusts the field name.
-    #[serde(default)]
-    pub write_amplification: f64,
-    /// **Space amplification**: total on-disk bytes / logical graph size. `0.0` when not measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_amplification: Option<f64>,
+    /// **Space amplification**: total on-disk bytes / logical graph size. Absent when not measured.
     /// `1.0` means the on-disk form equals the logical data size; `> 1.0` captures padding/slack.
     ///
     /// A ratio, like [`write_amplification`](Self::write_amplification) — see the note there.
-    #[serde(default)]
-    pub space_amplification: f64,
-    /// Durable bytes per stored node, when the example tracks node counts. A per-element COST, not a
-    /// ratio — reported here rather than smuggled into an amplification field.
-    #[serde(default)]
-    pub bytes_per_node: f64,
-    /// Durable bytes per stored relationship. A per-element COST, not a ratio.
-    #[serde(default)]
-    pub bytes_per_relationship: f64,
-    /// For retention/GC workloads: the ratio of the store's final size to its steady-state size — how
-    /// far the store grew beyond the plateau reclamation should hold it at. `1.0` = a flat plateau.
-    #[serde(default)]
-    pub plateau_ratio: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_amplification: Option<f64>,
+    /// **Durable bytes per stored node**: the measured durable **store image** divided by the number
+    /// of nodes the run stored. A per-element COST, not a ratio — reported here rather than smuggled
+    /// into an amplification field. Absent when the store footprint or the dataset scale was not
+    /// measured; see [`EvidenceCollector::record_per_element_costs`].
+    ///
+    /// It amortises the **whole** store image (records + property blocks + token catalogs + free-list
+    /// slack) over the node count, so it is *not* the size of one node record, and
+    /// `bytes_per_node * nodes` does **not** decompose `store_bytes` — it and
+    /// [`bytes_per_relationship`](Self::bytes_per_relationship) are two views of the same image. It is
+    /// a deterministic, machine-independent footprint signal (it moves when the record layout, the
+    /// slack, or the catalog growth moves), which is exactly what makes it worth gating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_per_node: Option<f64>,
+    /// **Durable bytes per stored relationship** — the same amortisation of the measured store image
+    /// over the relationship count. See [`bytes_per_node`](Self::bytes_per_node). Absent = not measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_per_relationship: Option<f64>,
+    /// For retention/GC workloads with a genuine **steady state**: the ratio of the store's largest
+    /// post-warmup footprint to its smallest — how far the store grew beyond the plateau reclamation
+    /// should hold it at. `1.0` = a flat plateau. Absent for every workload that has no steady state
+    /// to observe (which is most of them); see [`EvidenceCollector::record_plateau_ratio`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plateau_ratio: Option<f64>,
+}
+
+impl StorageSection {
+    /// `true` when nothing at all was measured (the whole vector is N/A).
+    #[must_use]
+    pub fn is_unmeasured(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Throughput / latency evidence for the run.
 ///
-/// **Seam — filled in by `rmp #247`** (operation counters + latency histograms).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Populated from the [`metrics`] collectors (operation counters + an exact latency sample), or from
+/// the figures an example's own driver measured. Absent fields mean **not measured**: a one-shot
+/// offline batch import has no per-operation request/response boundary to time, so its latency
+/// percentiles are absent rather than `0.0` — a `0.0` would read as "instantaneous".
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ThroughputSection {
-    /// Total number of operations (queries / writes) executed during the run.
-    pub operations: u64,
-    /// Mean throughput in operations per second across the run.
-    pub ops_per_sec: f64,
-    /// 50th-percentile per-operation latency, in milliseconds.
-    pub p50_latency_ms: f64,
-    /// 99th-percentile per-operation latency, in milliseconds.
-    pub p99_latency_ms: f64,
-    /// 99.9th-percentile per-operation latency, in milliseconds.
-    pub p999_latency_ms: f64,
+    /// Total number of operations (queries / writes) executed during the run. Absent = not measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operations: Option<u64>,
+    /// Mean throughput in operations per second across the run. Absent = not measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ops_per_sec: Option<f64>,
+    /// 50th-percentile per-operation latency, in milliseconds. Absent = not measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p50_latency_ms: Option<f64>,
+    /// 99th-percentile per-operation latency, in milliseconds. Absent = not measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p99_latency_ms: Option<f64>,
+    /// 99.9th-percentile per-operation latency, in milliseconds. Absent = not measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p999_latency_ms: Option<f64>,
     /// Transaction **abort / conflict rate** over the run, in `[0.0, 1.0]`: the fraction of
     /// concurrent write transactions the engine aborted (e.g. under Serializable Snapshot Isolation)
-    /// rather than committed. `0.0` means "no aborts observed (or not a concurrent workload)".
+    /// rather than committed.
     ///
-    /// Additive field (`rmp #253`): older reports that predate it deserialize with `0.0` via
-    /// `#[serde(default)]`, so the schema stays compatible at [`SCHEMA_VERSION`] `1`.
-    #[serde(default)]
-    pub abort_rate: f64,
+    /// This is the one metric whose **zero is a real measurement**: a write workload that suffered no
+    /// conflict genuinely has an abort rate of `0.0`, and that is worth reporting. It is therefore
+    /// `Some(0.0)` when measured and `None` only when the run did not observe aborts at all (e.g. a
+    /// pure read workload, or a driver that does not count them).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abort_rate: Option<f64>,
+}
+
+impl ThroughputSection {
+    /// `true` when nothing at all was measured (the whole vector is N/A).
+    #[must_use]
+    pub fn is_unmeasured(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Where a run's evidence was collected from — the top-level `measurement_mode` (`rmp #684`).
@@ -367,20 +478,23 @@ pub struct ServerMetricsSection {
     /// window can signal a long-lived reader pinning the GC watermark (`rmp #591`).
     #[serde(default)]
     pub ssi_tracked_after: u64,
-    /// Queries recorded in the query-duration histogram during the window (`_count` delta).
+    /// Queries recorded in the query-duration histogram during the window (`_count` delta). A real
+    /// counter delta, so `0` here is measured: the window recorded no query in the histogram.
     #[serde(default)]
     pub query_count: u64,
     /// Mean query duration over the window, in **milliseconds** (`_sum` delta / `_count` delta).
-    #[serde(default)]
-    pub query_duration_mean_ms: f64,
+    /// Absent when the window recorded no query (there is no mean of nothing) — never `0.0`, which
+    /// would read as "every query was instantaneous".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_duration_mean_ms: Option<f64>,
     /// Approximate p50 query duration over the window, in **milliseconds**, from the histogram bucket
-    /// deltas (Prometheus `histogram_quantile` interpolation).
-    #[serde(default)]
-    pub query_duration_p50_ms: f64,
+    /// deltas (Prometheus `histogram_quantile` interpolation). Absent = no query in the window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_duration_p50_ms: Option<f64>,
     /// Approximate p99 query duration over the window, in **milliseconds**, from the histogram bucket
-    /// deltas.
-    #[serde(default)]
-    pub query_duration_p99_ms: f64,
+    /// deltas. Absent = no query in the window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_duration_p99_ms: Option<f64>,
     /// A caveat recording any scope fallback (e.g. that no per-database series existed for the
     /// requested database, so the db-scoped figures are a server-wide aggregate). Empty when the
     /// per-database series were used directly.
@@ -477,24 +591,25 @@ impl ServerMetricsSection {
             0.0
         };
 
-        // Query-duration histogram delta → count, mean, and interpolated percentiles (ms).
+        // Query-duration histogram delta → count, mean, and interpolated percentiles (ms). With no
+        // histogram (or an empty window) there is nothing to average: the three duration figures stay
+        // ABSENT rather than becoming a `0.0` that reads as "instantaneous".
         let (query_count, mean_ms, p50_ms, p99_ms) = match after_hist {
             Some(after_h) => {
                 let delta = after_h.delta(before_hist);
                 let count = delta.count.max(0.0).round() as u64;
-                let mean_ms = if delta.count > 0.0 {
-                    delta.sum / delta.count * 1_000.0
+                if delta.count > 0.0 {
+                    (
+                        count,
+                        Some(delta.sum / delta.count * 1_000.0),
+                        Some(delta.quantile(0.50) * 1_000.0),
+                        Some(delta.quantile(0.99) * 1_000.0),
+                    )
                 } else {
-                    0.0
-                };
-                (
-                    count,
-                    mean_ms,
-                    delta.quantile(0.50) * 1_000.0,
-                    delta.quantile(0.99) * 1_000.0,
-                )
+                    (count, None, None, None)
+                }
             }
-            None => (0, 0.0, 0.0, 0.0),
+            None => (0, None, None, None),
         };
 
         Self {
@@ -539,6 +654,17 @@ fn delta_u64(before: Option<f64>, after: Option<f64>) -> u64 {
 /// The absolute value of a gauge series (absent ⇒ `0`), rounded to a `u64`.
 fn gauge_u64(value: Option<f64>) -> u64 {
     value.unwrap_or(0.0).max(0.0).round() as u64
+}
+
+/// A derived **ratio** — an amplification, a per-element durable cost, a plateau ratio — is evidence
+/// only when it is finite and strictly positive.
+///
+/// None of them can legitimately be `0.0`: a stored element cannot occupy zero durable bytes, and a
+/// real footprint cannot amplify a real workload by a factor of zero. A zero (or a `NaN` from a
+/// division by an unmeasured denominator) therefore means **not measured**, and is recorded as
+/// ABSENT rather than written into the report as a figure a reader would take for a measurement.
+fn measured_ratio(v: f64) -> Option<f64> {
+    (v.is_finite() && v > 0.0).then_some(v)
 }
 
 /// A single named phase of the scenario together with its measured wall-clock duration.
@@ -635,13 +761,84 @@ impl EvidenceReport {
 
     /// Loads an [`EvidenceReport`] from a `report.json` file on disk (e.g. a committed baseline).
     ///
+    /// A **v1 / v2** report (schema `< 3`) is normalised on the way in by
+    /// [`normalize_legacy_zero_placeholders`](Self::normalize_legacy_zero_placeholders): those schemas
+    /// had no way to say "not measured", so every unmeasured metric was written as a `0` / `0.0`
+    /// placeholder. Loading it verbatim would let the baseline comparator treat that placeholder as a
+    /// measurement — and gate a real candidate figure against it (a `0.0 → 1239.04` "+100% regression"
+    /// against a number nobody ever measured).
+    ///
     /// # Errors
     ///
     /// Returns any I/O error from reading the file, and a `serde_json` parse error (surfaced as
     /// [`io::ErrorKind::InvalidData`]) if the contents are not a valid report.
     pub fn load(path: impl AsRef<Path>) -> io::Result<Self> {
         let text = std::fs::read_to_string(path)?;
-        serde_json::from_str(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        let mut report: Self = serde_json::from_str(&text)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if report.version < OPTIONAL_METRICS_SINCE {
+            report.normalize_legacy_zero_placeholders();
+        }
+        Ok(report)
+    }
+
+    /// Rewrites the **zero placeholders** of a pre-v3 report (see [`SCHEMA_VERSION`]) as what they
+    /// always were: metrics that were **not measured**.
+    ///
+    /// Before schema `3` every metric was a bare `u64` / `f64`, so an example that could not measure a
+    /// vector had no choice but to serialize a zero — `report.json` files from that era carry
+    /// `bytes_per_node: 0.0`, `write_amplification: 0.0`, `store_bytes: 0`, `p50_latency_ms: 0.0` for
+    /// vectors nothing ever metered. Every metric mapped here is one whose zero is **physically
+    /// impossible for a real measurement**:
+    ///
+    /// * a live process cannot burn `0` CPU seconds or hold `0` bytes resident;
+    /// * a stored graph cannot occupy `0` durable bytes, cost `0` bytes per node, or amplify by `0`;
+    /// * a timed workload cannot run `0` operations at `0` ops/sec, and a completed operation cannot
+    ///   take exactly `0.0 ms`.
+    ///
+    /// [`throughput.abort_rate`](ThroughputSection::abort_rate) is deliberately **excluded**: a write
+    /// workload that suffered no conflict genuinely measures `0.0`, so treating that zero as "absent"
+    /// would silently disarm a live regression gate.
+    pub fn normalize_legacy_zero_placeholders(&mut self) {
+        fn drop_zero_f64(v: &mut Option<f64>) {
+            if v.is_some_and(|x| !(x.is_finite() && x > 0.0)) {
+                *v = None;
+            }
+        }
+        fn drop_zero_u64(v: &mut Option<u64>) {
+            if v == &Some(0) {
+                *v = None;
+            }
+        }
+
+        let cpu = &mut self.cpu;
+        drop_zero_f64(&mut cpu.user_secs);
+        drop_zero_f64(&mut cpu.system_secs);
+        drop_zero_f64(&mut cpu.mean_core_utilisation);
+
+        let mem = &mut self.memory;
+        drop_zero_u64(&mut mem.peak_rss_bytes);
+        drop_zero_u64(&mut mem.final_rss_bytes);
+
+        let st = &mut self.storage;
+        drop_zero_u64(&mut st.store_bytes);
+        drop_zero_u64(&mut st.wal_bytes);
+        drop_zero_u64(&mut st.store_pages);
+        drop_zero_u64(&mut st.wal_pages);
+        drop_zero_u64(&mut st.bytes_fsynced);
+        drop_zero_f64(&mut st.write_amplification);
+        drop_zero_f64(&mut st.space_amplification);
+        drop_zero_f64(&mut st.bytes_per_node);
+        drop_zero_f64(&mut st.bytes_per_relationship);
+        drop_zero_f64(&mut st.plateau_ratio);
+
+        let tp = &mut self.throughput;
+        drop_zero_u64(&mut tp.operations);
+        drop_zero_f64(&mut tp.ops_per_sec);
+        drop_zero_f64(&mut tp.p50_latency_ms);
+        drop_zero_f64(&mut tp.p99_latency_ms);
+        drop_zero_f64(&mut tp.p999_latency_ms);
+        // `abort_rate` is NOT normalised: 0.0 is a real, measurable outcome (no conflicts).
     }
 
     /// Compares this run against `baseline`, flagging a regression when any key metric degrades
@@ -718,16 +915,21 @@ impl EvidenceReport {
         }
         let _ = writeln!(s);
 
+        // An unmeasured metric renders as an explicit "not measured", never as a `0.000` a reader
+        // would take for a result (`rmp #711` — the same rule the JSON enforces by omitting it).
+        let f = |v: Option<f64>| v.map_or_else(|| NOT_MEASURED.to_string(), |x| format!("{x:.3}"));
+        let u = |v: Option<u64>| v.map_or_else(|| NOT_MEASURED.to_string(), |x| x.to_string());
+
         let _ = writeln!(s, "## CPU");
         let _ = writeln!(s);
         let _ = writeln!(s, "| Metric | Value |");
         let _ = writeln!(s, "|--------|-------|");
-        let _ = writeln!(s, "| user (s) | {:.3} |", self.cpu.user_secs);
-        let _ = writeln!(s, "| system (s) | {:.3} |", self.cpu.system_secs);
+        let _ = writeln!(s, "| user (s) | {} |", f(self.cpu.user_secs));
+        let _ = writeln!(s, "| system (s) | {} |", f(self.cpu.system_secs));
         let _ = writeln!(
             s,
-            "| mean core utilisation | {:.3} |",
-            self.cpu.mean_core_utilisation
+            "| mean core utilisation | {} |",
+            f(self.cpu.mean_core_utilisation)
         );
         let _ = writeln!(s);
 
@@ -735,56 +937,73 @@ impl EvidenceReport {
         let _ = writeln!(s);
         let _ = writeln!(s, "| Metric | Value |");
         let _ = writeln!(s, "|--------|-------|");
-        let _ = writeln!(s, "| peak RSS (bytes) | {} |", self.memory.peak_rss_bytes);
-        let _ = writeln!(s, "| final RSS (bytes) | {} |", self.memory.final_rss_bytes);
+        let _ = writeln!(
+            s,
+            "| peak RSS (bytes) | {} |",
+            u(self.memory.peak_rss_bytes)
+        );
+        let _ = writeln!(
+            s,
+            "| final RSS (bytes) | {} |",
+            u(self.memory.final_rss_bytes)
+        );
         let _ = writeln!(s);
 
         let _ = writeln!(s, "## Storage");
         let _ = writeln!(s);
         let _ = writeln!(s, "| Metric | Value |");
         let _ = writeln!(s, "|--------|-------|");
-        let _ = writeln!(s, "| store (bytes) | {} |", self.storage.store_bytes);
-        let _ = writeln!(s, "| store (pages) | {} |", self.storage.store_pages);
-        let _ = writeln!(s, "| WAL (bytes) | {} |", self.storage.wal_bytes);
-        let _ = writeln!(s, "| WAL (pages) | {} |", self.storage.wal_pages);
-        let _ = writeln!(s, "| fsynced (bytes) | {} |", self.storage.bytes_fsynced);
+        let _ = writeln!(s, "| store (bytes) | {} |", u(self.storage.store_bytes));
+        let _ = writeln!(s, "| store (pages) | {} |", u(self.storage.store_pages));
+        let _ = writeln!(s, "| WAL (bytes) | {} |", u(self.storage.wal_bytes));
+        let _ = writeln!(s, "| WAL (pages) | {} |", u(self.storage.wal_pages));
+        let _ = writeln!(s, "| fsynced (bytes) | {} |", u(self.storage.bytes_fsynced));
         let _ = writeln!(
             s,
-            "| write amplification | {:.3} |",
-            self.storage.write_amplification
+            "| write amplification | {} |",
+            f(self.storage.write_amplification)
         );
         let _ = writeln!(
             s,
-            "| space amplification | {:.3} |",
-            self.storage.space_amplification
+            "| space amplification | {} |",
+            f(self.storage.space_amplification)
         );
+        let _ = writeln!(s, "| bytes per node | {} |", f(self.storage.bytes_per_node));
+        let _ = writeln!(
+            s,
+            "| bytes per relationship | {} |",
+            f(self.storage.bytes_per_relationship)
+        );
+        if let Some(p) = self.storage.plateau_ratio {
+            let _ = writeln!(s, "| plateau ratio | {p:.3} |");
+        }
         let _ = writeln!(s);
 
         let _ = writeln!(s, "## Throughput & latency");
         let _ = writeln!(s);
         let _ = writeln!(s, "| Metric | Value |");
         let _ = writeln!(s, "|--------|-------|");
-        let _ = writeln!(s, "| operations | {} |", self.throughput.operations);
-        let _ = writeln!(s, "| ops/sec | {:.3} |", self.throughput.ops_per_sec);
+        let _ = writeln!(s, "| operations | {} |", u(self.throughput.operations));
+        let _ = writeln!(s, "| ops/sec | {} |", f(self.throughput.ops_per_sec));
         let _ = writeln!(
             s,
-            "| p50 latency (ms) | {:.3} |",
-            self.throughput.p50_latency_ms
+            "| p50 latency (ms) | {} |",
+            f(self.throughput.p50_latency_ms)
         );
         let _ = writeln!(
             s,
-            "| p99 latency (ms) | {:.3} |",
-            self.throughput.p99_latency_ms
+            "| p99 latency (ms) | {} |",
+            f(self.throughput.p99_latency_ms)
         );
         let _ = writeln!(
             s,
-            "| p999 latency (ms) | {:.3} |",
-            self.throughput.p999_latency_ms
+            "| p999 latency (ms) | {} |",
+            f(self.throughput.p999_latency_ms)
         );
         let _ = writeln!(
             s,
-            "| abort / conflict rate | {:.3} |",
-            self.throughput.abort_rate
+            "| abort / conflict rate | {} |",
+            f(self.throughput.abort_rate)
         );
         let _ = writeln!(s);
 
@@ -834,18 +1053,18 @@ impl EvidenceReport {
             let _ = writeln!(s, "| query count | {} |", sm.query_count);
             let _ = writeln!(
                 s,
-                "| query duration mean (ms) | {:.3} |",
-                sm.query_duration_mean_ms
+                "| query duration mean (ms) | {} |",
+                f(sm.query_duration_mean_ms)
             );
             let _ = writeln!(
                 s,
-                "| query duration p50 (ms) | {:.3} |",
-                sm.query_duration_p50_ms
+                "| query duration p50 (ms) | {} |",
+                f(sm.query_duration_p50_ms)
             );
             let _ = writeln!(
                 s,
-                "| query duration p99 (ms) | {:.3} |",
-                sm.query_duration_p99_ms
+                "| query duration p99 (ms) | {} |",
+                f(sm.query_duration_p99_ms)
             );
             let _ = writeln!(s);
         }
@@ -952,28 +1171,53 @@ impl EvidenceCollector {
     /// the faithful proxy (every committed WAL byte is fsynced before a commit is acknowledged), and
     /// a note records that this is a proxy rather than a directly-observed counter.
     ///
+    /// A path that **does not exist** is not a zero footprint — it is a footprint that was **not
+    /// measured**. Its figures are therefore left absent (and a note says so), rather than reporting
+    /// `store_bytes: 0` for a store this run never had access to.
+    ///
     /// # Errors
     ///
-    /// Propagates any I/O error from walking the store or WAL path (a missing path is treated as a
-    /// zero footprint, not an error).
+    /// Propagates any I/O error from walking the store or WAL path (a missing path is not an error —
+    /// it is recorded as "not measured").
     pub fn record_storage(
         &mut self,
         store_path: impl AsRef<Path>,
         wal_path: impl AsRef<Path>,
         bytes_fsynced: Option<u64>,
     ) -> io::Result<()> {
-        let (store, wal) = StorageMeter::measure(store_path, wal_path)?;
-        let fsynced = match bytes_fsynced {
-            Some(b) => b,
-            None => {
+        let store_path = store_path.as_ref();
+        let wal_path = wal_path.as_ref();
+        let store = StorageMeter::try_measure_path(store_path)?;
+        let wal = StorageMeter::try_measure_path(wal_path)?;
+
+        if store.is_none() {
+            self.report.notes.push(format!(
+                "storage.store_bytes / store_pages are NOT MEASURED (absent, not zero): the store \
+                 path {} does not exist for this run.",
+                store_path.display()
+            ));
+        }
+        if wal.is_none() {
+            self.report.notes.push(format!(
+                "storage.wal_bytes / wal_pages are NOT MEASURED (absent, not zero): the WAL path {} \
+                 does not exist for this run.",
+                wal_path.display()
+            ));
+        }
+
+        let fsynced = match (bytes_fsynced, wal) {
+            (Some(b), _) => Some(b),
+            (None, Some(wal)) => {
                 self.report.notes.push(
                     "storage.bytes_fsynced is a proxy: the WAL on-disk byte count (every committed \
                      WAL byte is fsynced before commit acknowledgement), not a directly-observed \
                      fsync counter."
                         .to_string(),
                 );
-                wal.bytes
+                Some(wal.bytes)
             }
+            // No fsync counter AND no WAL to proxy it with: the figure was not measured.
+            (None, None) => None,
         };
         self.report.storage = StorageSection::from_footprints(store, wal, fsynced);
         Ok(())
@@ -984,17 +1228,83 @@ impl EvidenceCollector {
     /// Call **after** [`record_storage`](Self::record_storage): write amplification is derived from
     /// the measured physical store+WAL bytes against `logical_bytes_written`, and space amplification
     /// from the on-disk store+WAL total against `logical_graph_bytes`. Passing `0` for a logical
-    /// figure leaves the corresponding ratio at `0.0` (meaning "not measured").
+    /// figure (or calling this without a measured footprint) leaves the corresponding ratio **absent**
+    /// — an unmeasurable ratio is omitted, never emitted as a `0.0` that reads like a measurement.
     pub fn record_amplification(&mut self, logical_bytes_written: u64, logical_graph_bytes: u64) {
-        let physical = self
-            .report
-            .storage
-            .store_bytes
-            .saturating_add(self.report.storage.wal_bytes);
+        let s = &self.report.storage;
+        // The physical figure needs at least one measured footprint; store or WAL alone is still an
+        // honest lower bound, but with neither there is nothing to divide.
+        let physical = match (s.store_bytes, s.wal_bytes) {
+            (None, None) => return,
+            (store, wal) => store.unwrap_or(0).saturating_add(wal.unwrap_or(0)),
+        };
         self.report.storage.write_amplification =
             StorageMeter::write_amplification(physical, logical_bytes_written);
         self.report.storage.space_amplification =
             StorageMeter::space_amplification(physical, logical_graph_bytes);
+    }
+
+    /// Derives the **per-element durable costs** — `bytes_per_node` and `bytes_per_relationship` —
+    /// from the MEASURED store image and the run's [`DatasetScale`].
+    ///
+    /// Call **after** [`record_storage`](Self::record_storage) and after the dataset scale is set
+    /// (via [`RunMetadata::with_dataset`] or [`metadata_mut`](Self::metadata_mut)). Each figure is
+    /// derived only when both of its inputs were measured:
+    ///
+    /// * no measured `store_bytes` (an external target; a store this run cannot read) ⇒ **both absent**;
+    /// * a dataset scale of `0` nodes (or `0` relationships) ⇒ **that** figure absent.
+    ///
+    /// The denominator is the durable **store image** and not `store + WAL`: the WAL is a transient
+    /// redo log that a checkpoint reclaims, so folding it in would make the "cost of keeping a node"
+    /// depend on how recently the server checkpointed. See [`StorageSection::bytes_per_node`] for what
+    /// the figure does and does not decompose.
+    ///
+    /// # Caller obligation
+    ///
+    /// The store path measured and the dataset scale recorded MUST describe **the same graph**. An
+    /// example that meters one tenant's store while counting every tenant's nodes would produce a
+    /// number that is real arithmetic over mismatched inputs — the exact class of subtly-wrong
+    /// evidence this schema exists to prevent. When that cannot be attested, do not call this.
+    pub fn record_per_element_costs(&mut self) {
+        let dataset = self.report.metadata.dataset.clone();
+        self.record_per_element_costs_for(dataset.nodes, dataset.relationships);
+    }
+
+    /// Like [`record_per_element_costs`](Self::record_per_element_costs) but against an **explicit**
+    /// element count, for the example whose [`DatasetScale`] describes a *different* graph from the
+    /// one in the measured store.
+    ///
+    /// `gds-analytics` is exactly that case: its gated `dataset` is the hermetic CSR-projection sweep
+    /// (which has no store at all), while the store it meters holds the loaded influence network. It
+    /// must therefore divide by the network's counts, not the sweep's — dividing the store image by a
+    /// graph that was never in it would yield a number that is arithmetically real and semantically
+    /// meaningless.
+    pub fn record_per_element_costs_for(&mut self, nodes: u64, relationships: u64) {
+        let Some(store_bytes) = self.report.storage.store_bytes else {
+            return;
+        };
+        let store_bytes = store_bytes as f64;
+        if nodes > 0 {
+            self.report.storage.bytes_per_node = measured_ratio(store_bytes / nodes as f64);
+        }
+        if relationships > 0 {
+            self.report.storage.bytes_per_relationship =
+                measured_ratio(store_bytes / relationships as f64);
+        }
+    }
+
+    /// Records the **retention plateau ratio** for a workload that reaches a genuine steady state:
+    /// the largest post-warmup footprint over the smallest (`1.0` = a perfectly flat plateau).
+    ///
+    /// This belongs to retention / GC workloads only (`iot-timeseries` is the one that has one). An
+    /// example with no steady state to observe must simply not call this, leaving the field absent —
+    /// emitting `1.0` (or `0.0`) for a workload that never plateaued would invent a property the run
+    /// never demonstrated.
+    ///
+    /// A non-finite or non-positive `ratio` is rejected as "not measured" (a malformed figure must
+    /// never become evidence).
+    pub fn record_plateau_ratio(&mut self, ratio: f64) {
+        self.report.storage.plateau_ratio = measured_ratio(ratio);
     }
 
     /// Records the throughput + latency evidence from a finished
@@ -1158,31 +1468,33 @@ mod tests {
         c.phase("load", Duration::from_millis(5));
         c.phase("query", Duration::from_millis(10));
         *c.cpu_mut() = CpuSection {
-            user_secs: 1.5,
-            system_secs: 0.5,
-            mean_core_utilisation: 0.8,
+            user_secs: Some(1.5),
+            system_secs: Some(0.5),
+            mean_core_utilisation: Some(0.8),
         };
         *c.memory_mut() = MemorySection {
-            peak_rss_bytes: 256 * 1024 * 1024,
-            final_rss_bytes: 200 * 1024 * 1024,
+            peak_rss_bytes: Some(256 * 1024 * 1024),
+            final_rss_bytes: Some(200 * 1024 * 1024),
         };
         *c.storage_mut() = StorageSection {
-            store_bytes: 81_920,
-            wal_bytes: 16_384,
-            store_pages: 10,
-            wal_pages: 2,
-            bytes_fsynced: 16_384,
-            write_amplification: 1.2,
-            space_amplification: 1.5,
-            ..Default::default()
+            store_bytes: Some(81_920),
+            wal_bytes: Some(16_384),
+            store_pages: Some(10),
+            wal_pages: Some(2),
+            bytes_fsynced: Some(16_384),
+            write_amplification: Some(1.2),
+            space_amplification: Some(1.5),
+            bytes_per_node: Some(8_192.0),
+            bytes_per_relationship: Some(4_096.0),
+            plateau_ratio: Some(1.02),
         };
         *c.throughput_mut() = ThroughputSection {
-            operations: 100_000,
-            ops_per_sec: 50_000.0,
-            p50_latency_ms: 0.2,
-            p99_latency_ms: 1.1,
-            p999_latency_ms: 3.4,
-            abort_rate: 0.05,
+            operations: Some(100_000),
+            ops_per_sec: Some(50_000.0),
+            p50_latency_ms: Some(0.2),
+            p99_latency_ms: Some(1.1),
+            p999_latency_ms: Some(3.4),
+            abort_rate: Some(0.05),
         };
         c.set_measurement_mode(MeasurementMode::External);
         c.record_server_metrics(ServerMetricsSection {
@@ -1198,9 +1510,9 @@ mod tests {
             ssi_tracked_before: 12,
             ssi_tracked_after: 190,
             query_count: 46,
-            query_duration_mean_ms: 0.488,
-            query_duration_p50_ms: 0.3,
-            query_duration_p99_ms: 2.1,
+            query_duration_mean_ms: Some(0.488),
+            query_duration_p50_ms: Some(0.3),
+            query_duration_p99_ms: Some(2.1),
             scope_note: String::new(),
         });
         c.note("fully populated for the schema test");
@@ -1295,14 +1607,34 @@ mod tests {
         assert!(report.host.cpu_cores >= 1);
     }
 
+    /// **Regression (`rmp #711`).** A collector nobody fed measures nothing, and a report of nothing
+    /// must SAY nothing — every metric absent, and NOT ONE `0` / `0.0` in the emitted JSON that a
+    /// reader could take for a measurement.
     #[test]
-    fn sections_default_to_zero() {
+    fn unmeasured_sections_are_absent_not_zero() {
         let report = EvidenceCollector::new(sample_metadata()).finish();
-        assert_eq!(report.cpu.user_secs, 0.0);
-        assert_eq!(report.memory.peak_rss_bytes, 0);
-        assert_eq!(report.storage.store_bytes, 0);
-        assert_eq!(report.storage.write_amplification, 0.0);
-        assert_eq!(report.throughput.operations, 0);
+        assert!(report.cpu.is_unmeasured());
+        assert!(report.memory.is_unmeasured());
+        assert!(report.storage.is_unmeasured());
+        assert!(report.throughput.is_unmeasured());
+
+        let json = report.to_json().expect("serialize");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        for section in ["cpu", "memory", "storage", "throughput"] {
+            let obj = v[section].as_object().expect("section object");
+            assert!(
+                obj.is_empty(),
+                "an unmeasured `{section}` vector must serialize EMPTY (no zero placeholders), got \
+                 {obj:?}"
+            );
+        }
+        // The three fields this task exists for are simply not there.
+        for dead in ["bytes_per_node", "bytes_per_relationship", "plateau_ratio"] {
+            assert!(
+                !json.contains(dead),
+                "an unmeasured `{dead}` must be ABSENT from the JSON, not emitted as 0.0"
+            );
+        }
     }
 
     #[test]
@@ -1318,17 +1650,17 @@ mod tests {
         assert_eq!(parsed.metadata.dataset, report.metadata.dataset);
         assert_eq!(parsed.metadata.workload, report.metadata.workload);
         assert_eq!(parsed.host, report.host);
-        assert_eq!(parsed.cpu.user_secs, report.cpu.user_secs);
-        assert_eq!(parsed.memory.peak_rss_bytes, report.memory.peak_rss_bytes);
-        assert_eq!(parsed.storage.store_pages, report.storage.store_pages);
-        assert_eq!(
-            parsed.storage.write_amplification,
-            report.storage.write_amplification
-        );
-        assert_eq!(parsed.throughput.ops_per_sec, report.throughput.ops_per_sec);
+        assert_eq!(parsed.cpu, report.cpu);
+        assert_eq!(parsed.memory, report.memory);
+        assert_eq!(parsed.storage, report.storage);
+        assert_eq!(parsed.throughput, report.throughput);
+        // The per-element costs + plateau ratio (`rmp #711`) round-trip as real, present figures.
+        assert_eq!(parsed.storage.bytes_per_node, Some(8_192.0));
+        assert_eq!(parsed.storage.bytes_per_relationship, Some(4_096.0));
+        assert_eq!(parsed.storage.plateau_ratio, Some(1.02));
         // The v2 additions (`rmp #684`) survive the round-trip.
         assert_eq!(parsed.version, SCHEMA_VERSION);
-        assert_eq!(parsed.version, 2);
+        assert_eq!(parsed.version, 3);
         assert_eq!(parsed.measurement_mode, MeasurementMode::External);
         assert_eq!(parsed.server_metrics, report.server_metrics);
         let sm = parsed
@@ -1380,13 +1712,228 @@ mod tests {
         assert_eq!(parsed.metadata.scenario, "legacy");
         assert_eq!(parsed.metadata.dataset, DatasetScale::default());
         assert!(parsed.metadata.workload.is_empty());
-        assert_eq!(parsed.storage.store_pages, 0);
-        assert_eq!(parsed.storage.write_amplification, 0.0);
-        // The additive `abort_rate` (rmp #253) defaults to 0.0 when absent from an older report.
-        assert_eq!(parsed.throughput.abort_rate, 0.0);
+        assert_eq!(parsed.storage.store_pages, None);
+        assert_eq!(parsed.storage.write_amplification, None);
+        // The additive `abort_rate` (rmp #253) is absent from an older report.
+        assert_eq!(parsed.throughput.abort_rate, None);
         // The v2 additions (rmp #684) default cleanly: mode is Local, and there is no server metrics.
         assert_eq!(parsed.measurement_mode, MeasurementMode::Local);
         assert!(parsed.server_metrics.is_none());
+    }
+
+    /// **Regression (`rmp #711`).** A committed **pre-v3 baseline** carries the zero placeholders the
+    /// old schema forced on it (`bytes_per_node: 0.0` for a figure nobody ever measured). Loading it
+    /// verbatim would arm the comparator with a fake measurement and turn the first honest candidate
+    /// figure into a phantom "+100% regression". [`EvidenceReport::load`] normalises those zeros back
+    /// into "not measured" — which is what they always were.
+    #[test]
+    fn a_pre_v3_baselines_zero_placeholders_load_as_not_measured() {
+        let dir = std::env::temp_dir().join(format!("graphus-harness-v2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("baseline.json");
+        // A v2 baseline exactly as `examples/fraud-oltp/baseline.json` was committed.
+        std::fs::write(
+            &path,
+            r#"{
+              "version": 2,
+              "metadata": { "scenario": "fraud-oltp", "description": "b", "started_unix_secs": 1,
+                            "dataset": { "nodes": 310, "relationships": 588 } },
+              "total_millis": 7656.0,
+              "phases": [],
+              "cpu": { "user_secs": 1.91, "system_secs": 0.74, "mean_core_utilisation": 0.294 },
+              "memory": { "peak_rss_bytes": 373026816, "final_rss_bytes": 373026816 },
+              "storage": { "store_bytes": 442368, "wal_bytes": 3982455, "store_pages": 54,
+                           "wal_pages": 487, "bytes_fsynced": 3982455,
+                           "write_amplification": 39.35, "space_amplification": 39.35,
+                           "bytes_per_node": 0.0, "bytes_per_relationship": 0.0,
+                           "plateau_ratio": 0.0 },
+              "throughput": { "operations": 914, "ops_per_sec": 210.36, "p50_latency_ms": 3.984,
+                              "p99_latency_ms": 14.652, "p999_latency_ms": 16.656,
+                              "abort_rate": 0.951852 }
+            }"#,
+        )
+        .expect("write baseline");
+
+        let baseline =
+            EvidenceReport::load(&path).expect("a committed v2 baseline must still parse");
+
+        // The dead placeholders are gone — they were never measurements.
+        assert_eq!(baseline.storage.bytes_per_node, None);
+        assert_eq!(baseline.storage.bytes_per_relationship, None);
+        assert_eq!(baseline.storage.plateau_ratio, None);
+        // …while every figure that WAS measured survives untouched.
+        assert_eq!(baseline.storage.store_bytes, Some(442_368));
+        assert_eq!(baseline.storage.write_amplification, Some(39.35));
+        assert_eq!(baseline.cpu.user_secs, Some(1.91));
+        assert_eq!(baseline.throughput.operations, Some(914));
+        // …including a legitimately-measured non-zero abort rate.
+        assert_eq!(baseline.throughput.abort_rate, Some(0.951852));
+
+        // And the comparator does NOT invent a regression when the candidate finally measures the cost.
+        let mut candidate = baseline.clone();
+        candidate.version = SCHEMA_VERSION;
+        candidate.storage.bytes_per_node = Some(1_427.0);
+        let cmp = candidate.compare_to_baseline(&baseline, &RegressionThresholds::uniform(0.15));
+        assert!(
+            !cmp.regressed,
+            "a newly-measured cost against an unmeasured baseline is not a regression: {}",
+            cmp.summary()
+        );
+        assert!(
+            cmp.skipped
+                .iter()
+                .any(|s| s.metric == "storage.bytes_per_node"),
+            "…it is a SKIPPED gate, and must be reported as one: {}",
+            cmp.summary()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A **measured** zero survives the legacy normalisation: `abort_rate: 0.0` in a write workload
+    /// that suffered no conflict is a real result, and disarming that gate would hide real contention
+    /// appearing later.
+    #[test]
+    fn a_legacy_measured_zero_abort_rate_is_kept() {
+        let mut report = EvidenceCollector::new(sample_metadata()).finish();
+        report.version = 2;
+        report.throughput.abort_rate = Some(0.0);
+        report.throughput.operations = Some(0);
+        report.normalize_legacy_zero_placeholders();
+        assert_eq!(
+            report.throughput.abort_rate,
+            Some(0.0),
+            "a measured zero abort rate is evidence, not a placeholder"
+        );
+        assert_eq!(
+            report.throughput.operations, None,
+            "a zero operation count IS a placeholder — no workload ran zero operations"
+        );
+    }
+
+    // -- Per-element durable costs (`rmp #711`) --------------------------------------------------
+
+    /// **Regression (`rmp #711`).** With no dataset scale there is no denominator, so there is no
+    /// per-element cost — and the report must therefore carry NONE, not a `0.0`.
+    #[test]
+    fn per_element_costs_are_absent_without_a_dataset_scale() {
+        let dir = temp_store_with_bytes("no-scale", 8_192);
+        let mut c = EvidenceCollector::new(RunMetadata::new("unit", "no dataset scale"));
+        c.start();
+        c.record_storage(dir.join("graphus.store"), dir.join("graphus.wal"), None)
+            .expect("measure");
+        c.record_per_element_costs();
+        let report = c.finish();
+
+        assert_eq!(
+            report.storage.store_bytes,
+            Some(8_192),
+            "the store IS measured"
+        );
+        assert_eq!(report.storage.bytes_per_node, None);
+        assert_eq!(report.storage.bytes_per_relationship, None);
+
+        let json = report.to_json().expect("serialize");
+        assert!(
+            !json.contains("bytes_per_node"),
+            "an underivable per-element cost must be ABSENT from the JSON: {json}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With a measured store AND a dataset scale, the per-element cost is derived from both and
+    /// serialized as the real figure — the durable store image amortised over each element count.
+    #[test]
+    fn per_element_costs_are_derived_from_the_measured_store_and_the_dataset() {
+        let dir = temp_store_with_bytes("with-scale", 8_192);
+        let metadata =
+            RunMetadata::new("unit", "with dataset scale").with_dataset(DatasetScale::new(64, 256));
+        let mut c = EvidenceCollector::new(metadata);
+        c.start();
+        c.record_storage(dir.join("graphus.store"), dir.join("graphus.wal"), None)
+            .expect("measure");
+        c.record_per_element_costs();
+        let report = c.finish();
+
+        // 8192 store bytes / 64 nodes = 128 B/node; / 256 rels = 32 B/rel. Derived from the MEASURED
+        // store image — the WAL (a transient redo log a checkpoint reclaims) is deliberately excluded.
+        assert_eq!(report.storage.bytes_per_node, Some(128.0));
+        assert_eq!(report.storage.bytes_per_relationship, Some(32.0));
+
+        let json = report.to_json().expect("serialize");
+        assert!(json.contains("\"bytes_per_node\": 128.0"), "{json}");
+        assert!(json.contains("\"bytes_per_relationship\": 32.0"), "{json}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An external target has no store to read: the storage vector is N/A, so the per-element costs
+    /// MUST be absent even though the dataset scale is perfectly well known.
+    #[test]
+    fn per_element_costs_are_absent_when_the_store_was_not_measured() {
+        let missing = std::env::temp_dir().join("graphus-harness-absent-store-xyz");
+        let _ = std::fs::remove_dir_all(&missing);
+        let metadata =
+            RunMetadata::new("unit", "external target").with_dataset(DatasetScale::new(100, 200));
+        let mut c = EvidenceCollector::new(metadata);
+        c.start();
+        c.record_storage(
+            missing.join("graphus.store"),
+            missing.join("graphus.wal"),
+            None,
+        )
+        .expect("a missing path is not an error — it is 'not measured'");
+        c.record_per_element_costs();
+        c.record_amplification(1_000, 1_000);
+        let report = c.finish();
+
+        assert!(report.storage.is_unmeasured(), "nothing was measurable");
+        assert_eq!(report.storage.store_bytes, None);
+        assert_eq!(report.storage.bytes_per_node, None);
+        assert_eq!(report.storage.write_amplification, None);
+        assert!(
+            report.notes.iter().any(|n| n.contains("NOT MEASURED")),
+            "the absence must be disclosed: {:?}",
+            report.notes
+        );
+    }
+
+    /// The plateau ratio belongs only to a workload with a genuine steady state, and a malformed or
+    /// non-positive figure is never accepted as one.
+    #[test]
+    fn plateau_ratio_is_opt_in_and_rejects_malformed_figures() {
+        let c = EvidenceCollector::new(sample_metadata());
+        assert_eq!(
+            c.finish().storage.plateau_ratio,
+            None,
+            "opt-in: absent by default"
+        );
+
+        let mut c = EvidenceCollector::new(sample_metadata());
+        c.record_plateau_ratio(1.0);
+        assert_eq!(c.finish().storage.plateau_ratio, Some(1.0));
+
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let mut c = EvidenceCollector::new(sample_metadata());
+            c.record_plateau_ratio(bad);
+            assert_eq!(
+                c.finish().storage.plateau_ratio,
+                None,
+                "a malformed plateau ratio ({bad}) must never become evidence"
+            );
+        }
+    }
+
+    /// Builds a temp store layout (`graphus.store` file + `graphus.wal/` directory) of a known size.
+    fn temp_store_with_bytes(tag: &str, bytes: usize) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "graphus-harness-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("graphus.wal")).expect("temp store");
+        std::fs::write(dir.join("graphus.store"), vec![0u8; bytes]).expect("store image");
+        dir
     }
 
     #[test]
@@ -1446,10 +1993,10 @@ mod tests {
         assert_eq!(sm.ssi_tracked_after, 40);
         // Query-duration histogram delta: 10 queries in (0.001, 0.01], sum 0.05s → mean 5ms.
         assert_eq!(sm.query_count, 10);
-        assert!((sm.query_duration_mean_ms - 5.0).abs() < 1e-9);
+        assert!((sm.query_duration_mean_ms.expect("mean") - 5.0).abs() < 1e-9);
         // p50 = 0.001 + 0.009 * (5/10) = 0.0055s = 5.5ms; p99 = 0.001 + 0.009*(9.9/10) = 9.91ms.
-        assert!((sm.query_duration_p50_ms - 5.5).abs() < 1e-9);
-        assert!((sm.query_duration_p99_ms - 9.91).abs() < 1e-9);
+        assert!((sm.query_duration_p50_ms.expect("p50") - 5.5).abs() < 1e-9);
+        assert!((sm.query_duration_p99_ms.expect("p99") - 9.91).abs() < 1e-9);
     }
 
     #[test]

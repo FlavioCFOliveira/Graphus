@@ -148,18 +148,18 @@ pub fn current_rss_bytes(target: Target) -> Option<u64> {
 }
 
 /// Builds a [`CpuSection`] from CPU times and the wall-clock window they were consumed over.
+///
+/// The CPU times ARE the measurement, so they are always reported (a `user_secs` of `0.0` from a real
+/// `getrusage`/`/proc` read is a measured zero — the process genuinely burned no user time). Only
+/// `mean_core_utilisation` can be unmeasurable: with no wall-clock window there is nothing to divide
+/// by, so it is left **absent** rather than reported as `0.0` cores.
 #[must_use]
 pub fn cpu_section(times: CpuTimes, wall: Duration) -> CpuSection {
     let wall_secs = wall.as_secs_f64();
-    let mean = if wall_secs > 0.0 {
-        times.total_secs() / wall_secs
-    } else {
-        0.0
-    };
     CpuSection {
-        user_secs: times.user_secs,
-        system_secs: times.system_secs,
-        mean_core_utilisation: mean,
+        user_secs: Some(times.user_secs),
+        system_secs: Some(times.system_secs),
+        mean_core_utilisation: (wall_secs > 0.0).then(|| times.total_secs() / wall_secs),
     }
 }
 
@@ -261,6 +261,10 @@ impl RssSampler {
     ///
     /// For a [`Target::SelfProcess`] sampler the OS-reported peak (`getrusage`'s `ru_maxrss`) is
     /// authoritative and is folded in, so the peak reflects the high-water mark even between samples.
+    ///
+    /// A sampler that took **no readable sample** (an unreadable / already-exited target) reports
+    /// **absent** figures: a process cannot occupy zero bytes of RAM, so `0` there would not be a
+    /// measurement — it would be a placeholder that reads like one.
     #[must_use]
     pub fn to_section(&self) -> MemorySection {
         let mut peak = self.peak_bytes;
@@ -268,8 +272,8 @@ impl RssSampler {
             peak = peak.max(peak_rss_self_bytes().unwrap_or(0));
         }
         MemorySection {
-            peak_rss_bytes: peak,
-            final_rss_bytes: self.final_bytes(),
+            peak_rss_bytes: (peak > 0).then_some(peak),
+            final_rss_bytes: (self.final_bytes() > 0).then(|| self.final_bytes()),
         }
     }
 }
@@ -598,8 +602,28 @@ mod tests {
 
         // Derived utilisation is finite and non-negative.
         let section = cpu_section(second, _wall2);
-        assert!(section.mean_core_utilisation >= 0.0);
-        assert!(section.mean_core_utilisation.is_finite());
+        let mean = section
+            .mean_core_utilisation
+            .expect("a bracketed window has a wall-clock, so the mean IS derivable");
+        assert!(mean >= 0.0);
+        assert!(mean.is_finite());
+    }
+
+    /// `rmp #711`: with no wall-clock window there is nothing to divide the CPU seconds by, so the
+    /// mean core utilisation is ABSENT — never `0.0` cores, which reads as "the server idled".
+    #[test]
+    fn mean_core_utilisation_is_absent_without_a_window() {
+        let section = cpu_section(
+            CpuTimes {
+                user_secs: 1.0,
+                system_secs: 0.5,
+            },
+            Duration::ZERO,
+        );
+        assert_eq!(section.user_secs, Some(1.0));
+        assert_eq!(section.system_secs, Some(0.5));
+        assert_eq!(section.mean_core_utilisation, None);
+        assert_eq!(section.total_secs(), Some(1.5));
     }
 
     #[test]
@@ -628,8 +652,8 @@ mod tests {
 
         drop(big);
         let section = sampler.to_section();
-        assert!(section.peak_rss_bytes >= after);
-        assert_eq!(section.final_rss_bytes, after);
+        assert!(section.peak_rss_bytes.expect("peak RSS measured") >= after);
+        assert_eq!(section.final_rss_bytes, Some(after));
     }
 
     #[test]

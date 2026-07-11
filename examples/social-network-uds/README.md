@@ -97,8 +97,15 @@ overhead. The `report.json` `space_amplification` field uses the **final** on-di
 include the pages the *aborted* 200k-row write extended (the image grew to 7.6 MB); the committed
 graph's ratio is reported separately as `space_amplification_committed_graph`.
 
-`write_amplification` stays `0.0` — the schema's honest "not measured" — because this example does not
-instrument the logical bytes written per commit.
+`write_amplification` is **absent** from the report — the schema's honest "not measured" (`rmp #711`:
+an unmeasured metric is omitted, never emitted as a `0.0` that reads like a result) — because this
+example does not instrument the logical bytes written per commit.
+
+The report DOES carry `storage.bytes_per_node` / `storage.bytes_per_relationship`: the measured durable
+store image amortised over the node/relationship counts **read back from the server** at measurement
+time (`MATCH (n) RETURN count(n)`), so the two inputs provably describe the same graph. Each amortises
+the WHOLE image (records + property blocks + token catalogs + free-list slack) over one element count,
+so they are not per-record sizes and do not sum to `store_bytes`.
 
 ## Portability
 

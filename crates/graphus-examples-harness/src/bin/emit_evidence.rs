@@ -173,6 +173,10 @@ fn run(evidence_dir: &str, baseline_path: Option<&str>) -> Result<ExitCode, Stri
         .map_err(|e| format!("cannot measure the store/WAL footprint: {e}"))?;
     // Amplification: real physical bytes over the real logical bytes this workload wrote.
     collector.record_amplification(logical_bytes, logical_bytes);
+    // Per-element durable costs (`rmp #711`): the measured store image amortised over the dataset this
+    // workload wrote into exactly that image (RECORDS "nodes", 4×RECORDS "relationships"). Derived
+    // from two measurements — never a placeholder.
+    collector.record_per_element_costs();
 
     collector.note(format!(
         "Smoke run: EVERY figure is measured, none injected. CPU/RSS are this driver process's own \

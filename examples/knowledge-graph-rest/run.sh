@@ -530,6 +530,7 @@ elif [ "$RUN_REST" = "1" ] && [ "$MODE" = "local" ]; then
       --wal "$WAL_DIR" \
       --nodes "$NODE_COUNT" \
       --rels "$REL_COUNT" \
+      --per-element-costs \
       --peak-rss-bytes "$PEAK_RSS_BYTES" \
       --total-millis "${WORKLOAD_MS:-0}" \
       --workload-ops "${W_OPS:-0}" \

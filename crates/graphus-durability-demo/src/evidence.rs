@@ -94,17 +94,18 @@ pub fn build_report(
         .map(|t| cpu_section(t, process_wall.max(Duration::from_millis(1))))
         .unwrap_or_default();
     *c.cpu_mut() = cpu;
-    c.memory_mut().peak_rss_bytes = peak_rss_self_bytes().unwrap_or(0);
-    c.memory_mut().final_rss_bytes = current_rss_bytes(Target::SelfProcess).unwrap_or(0);
+    // An unreadable RSS is NOT MEASURED (absent), never `0` bytes resident (`rmp #711`).
+    c.memory_mut().peak_rss_bytes = peak_rss_self_bytes();
+    c.memory_mut().final_rss_bytes = current_rss_bytes(Target::SelfProcess);
 
     // Throughput: seeds (each a full workload + crash + ARIES recovery + 4-property oracle) per second
     // over the MEASURED sweep window. Latency percentiles are NOT measured by this scenario and are
-    // therefore left at their "not measured" default rather than fabricated (rmp #699); the honest
+    // therefore ABSENT from the report rather than fabricated (rmp #699 / #711); the honest
     // per-scenario cost is stated below as a note.
     let secs = sweep_duration.as_secs_f64().max(1e-9);
     let tp = c.throughput_mut();
-    tp.operations = sweep.count;
-    tp.ops_per_sec = sweep.count as f64 / secs;
+    tp.operations = Some(sweep.count);
+    tp.ops_per_sec = Some(sweep.count as f64 / secs);
 
     c.note(format!(
         "durability oracle: {} seed(s) checked, {} unsafe, {} non-deterministic — properties: {:?}",
@@ -232,17 +233,18 @@ mod tests {
             None,
         );
         assert!(
-            report.cpu.user_secs > 0.0,
+            report.cpu.user_secs.expect("CPU is measured here") > 0.0,
             "the sweep burned real CPU in THIS process; it must be reported"
         );
         assert!(
-            report.memory.peak_rss_bytes > 0,
+            report.memory.peak_rss_bytes.expect("RSS is measured here") > 0,
             "the process has a real peak RSS; it must be reported"
         );
         assert_eq!(
-            report.throughput.p50_latency_ms, 0.0,
-            "an unmeasured percentile stays at its 'not measured' default — never invented"
+            report.throughput.p50_latency_ms, None,
+            "an unmeasured percentile is ABSENT (rmp #711) — never invented, and never a 0.0 that \
+             reads as 'instantaneous'"
         );
-        assert!(report.throughput.ops_per_sec > 0.0);
+        assert!(report.throughput.ops_per_sec.expect("rate is measured") > 0.0);
     }
 }

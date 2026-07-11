@@ -82,7 +82,9 @@ Three genuine defects were found *while* fixing it, and all three are fixed here
 | Reclamation trigger | an explicit GC pass per tick — the *deterministic stand-in* | the **real** `CHECKPOINT DATABASE` + the background cadence |
 | Footprint curve | **byte-reproducible** for a fixed seed | real, and machine-dependent |
 | Gated by `baseline.json` | **yes** — this is what the committed baseline holds | no (host-dependent) |
-| Durable bytes / WAL / fsync / amplification | **NOT MEASURABLE** (reported as `0` = not measured, and said so out loud) | **measured for real** |
+| Durable bytes / WAL / fsync / amplification | **NOT MEASURABLE** — the WAL/fsync/amplification fields are **ABSENT** from the report (schema v3 omits what it did not measure), and the notes say so out loud. `store_bytes` IS measured: it is the in-memory device's steady-state plateau. | **measured for real** |
+| `storage.plateau_ratio` | **measured** — the largest post-warmup footprint over the smallest (`1.0` = a flat plateau). This is the ONE example in the suite with a genuine steady state, so it is the only one that carries the field; everywhere else it is absent, because nowhere else *is* there a plateau. | **measured** |
+| `storage.bytes_per_node` / `bytes_per_relationship` | **measured** — the plateau footprint amortised over the steady-state graph it holds (the live readings plus their sensors) | **measured** over the durable image |
 
 The mirror exists because a plateau you cannot reproduce is not a regression gate. The wire run exists
 because a storage claim you cannot weigh in bytes is not evidence. Neither substitutes for the other, and

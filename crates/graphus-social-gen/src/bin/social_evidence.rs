@@ -250,8 +250,7 @@ fn run() -> Result<(), String> {
 
     // Memory: the RSS series' peak/final (machine-variant, NOT gated).
     let mem = rss.to_section();
-    collector.memory_mut().peak_rss_bytes = mem.peak_rss_bytes;
-    collector.memory_mut().final_rss_bytes = mem.final_rss_bytes;
+    *collector.memory_mut() = mem.clone();
 
     // Storage: measure the REAL on-disk store + WAL files, then fold in the amplification against the
     // logical CSV bytes. `record_storage` walks both paths; `bytes_fsynced=None` records the WAL byte
@@ -270,10 +269,13 @@ fn run() -> Result<(), String> {
     // / logical CSV. The STORE-ONLY space amplification (the stable, gated figure) is in the workload
     // params above; these total figures are informational (the WAL component is machine-variant).
     collector.record_amplification(outcome.logical_csv_bytes, outcome.logical_csv_bytes);
+    // Per-element durable cost (`rmp #711`): the measured store image amortised over the graph the
+    // importer just loaded into it (`metadata.dataset` is the read-back node/relationship count).
+    collector.record_per_element_costs();
 
     // Throughput: nodes + relationships ingested over the deterministic load windows.
-    collector.throughput_mut().operations = total_ingested;
-    collector.throughput_mut().ops_per_sec = ingest_ops_per_sec;
+    collector.throughput_mut().operations = Some(total_ingested);
+    collector.throughput_mut().ops_per_sec = Some(ingest_ops_per_sec);
 
     collector.note(format!(
         "DURABLE ON-DISK FOOTPRINT (the headline, DETERMINISTIC, GATED): bulk-loading the {}-user / \
@@ -354,7 +356,7 @@ fn run() -> Result<(), String> {
         outcome.wal_bytes,
         outcome.import_nodes_per_sec,
         outcome.import_rels_per_sec,
-        mem.peak_rss_bytes,
+        mem.peak_rss_bytes.unwrap_or(0),
         wall.as_secs_f64(),
     );
 

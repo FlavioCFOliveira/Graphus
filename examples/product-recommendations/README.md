@@ -222,7 +222,9 @@ schema shared by every example) + `report.md` (human-readable), plus `schema.txt
 - **Memory** — the server's peak and final RSS.
 - **Storage** — the recommendation database's real on-disk footprint: the `graphus.store` image and
   the `graphus.wal` **directory** of `seg.<lsn>` segment files, plus real `write_amplification` /
-  `space_amplification` ratios against the generator's logical CSV bytes.
+  `space_amplification` ratios against the generator's logical CSV bytes, plus the per-element durable
+  costs `storage.bytes_per_node` / `bytes_per_relationship` — that measured store image amortised over
+  the graph the loader put into it.
 - **The knee** — an explicit diagnosis of the rung at which throughput saturated, whether p99 kept
   climbing past it, and how many cores/threads the server actually used at saturation.
 
@@ -233,7 +235,9 @@ schema shared by every example) + `report.md` (human-readable), plus `schema.txt
 > ladder); it is now the ladder's real wall-clock.
 
 **Attach mode** (`measurement_mode: "external"`) — process CPU/RSS and on-disk storage are **N/A**
-(the server is remote/not owned), so they are honestly zeroed. The evidence is:
+(the server is remote/not owned), so those vectors are **absent** from the report (`rmp #711`: an
+unmeasured vector is omitted, never zero-filled — including the per-element costs, which are derived
+from a store image an attached run cannot read). The evidence is:
 
 - **Client-side** throughput + latency percentiles (best rung) and the full per-rung scaling curve
   (as report notes), plus the client-side scaling verdict.

@@ -1317,13 +1317,13 @@ fn write_evidence(
     // Resources (CPU + memory) from the BEST rung — measured on the SERVER process via /proc.
     collector.record_resources((
         CpuSection {
-            user_secs: best.cpu_user_secs,
-            system_secs: best.cpu_system_secs,
-            mean_core_utilisation: best.server_cores,
+            user_secs: Some(best.cpu_user_secs),
+            system_secs: Some(best.cpu_system_secs),
+            mean_core_utilisation: Some(best.server_cores),
         },
         MemorySection {
-            peak_rss_bytes: best.peak_rss,
-            final_rss_bytes: best.final_rss,
+            peak_rss_bytes: (best.peak_rss > 0).then_some(best.peak_rss),
+            final_rss_bytes: (best.final_rss > 0).then_some(best.final_rss),
         },
     ));
 
@@ -1333,18 +1333,17 @@ fn write_evidence(
         .iter()
         .fold((0, 0), |(o, e), r| (o + r.writes_ok, e + r.writes_err));
     let writer_attempts = writes_ok + writes_err;
-    let abort_rate = if writer_attempts > 0 {
-        writes_err as f64 / writer_attempts as f64
-    } else {
-        0.0
-    };
+    // The abort rate is only EVIDENCE if a writer actually attempted something: with no write attempt
+    // there is no rate to report, and a `0.0` would claim a conflict-free write workload that never
+    // ran (`rmp #711`). With attempts, a zero IS the measurement.
+    let abort_rate = (writer_attempts > 0).then(|| writes_err as f64 / writer_attempts as f64);
     {
         let t = collector.throughput_mut();
-        t.operations = total_ops;
-        t.ops_per_sec = best.ops_per_sec;
-        t.p50_latency_ms = bench::ns_to_ms(best.overall.p50);
-        t.p99_latency_ms = bench::ns_to_ms(best.overall.p99);
-        t.p999_latency_ms = bench::ns_to_ms(best.overall.p999);
+        t.operations = Some(total_ops);
+        t.ops_per_sec = Some(best.ops_per_sec);
+        t.p50_latency_ms = Some(bench::ns_to_ms(best.overall.p50));
+        t.p99_latency_ms = Some(bench::ns_to_ms(best.overall.p99));
+        t.p999_latency_ms = Some(bench::ns_to_ms(best.overall.p999));
         t.abort_rate = abort_rate;
     }
 
@@ -1418,24 +1417,34 @@ fn write_evidence(
                 .record_storage(store, wal, None)
                 .map_err(|e| format!("cannot measure the store/WAL footprint: {e}"))?;
             // Amplification against the REAL logical dataset (the generator's CSV bytes). Absent that
-            // figure the ratios stay at the honest 0.0 rather than being computed against an invented
+            // figure the ratios are simply OMITTED rather than computed against an invented
             // per-element size.
             if args.logical_bytes > 0 {
                 collector.record_amplification(args.logical_bytes, args.logical_bytes);
             }
+            // Per-element durable cost (`rmp #711`): the measured store image of THIS database
+            // amortised over the graph it holds — `metadata.dataset` is the generator's node/rel counts
+            // for exactly the '{db}' store just walked.
+            collector.record_per_element_costs();
             let s = collector.storage_mut();
-            let (store_bytes, wal_bytes) = (s.store_bytes, s.wal_bytes);
+            let (store_bytes, wal_bytes) = (
+                s.store_bytes.unwrap_or_default(),
+                s.wal_bytes.unwrap_or_default(),
+            );
             collector.note(format!(
                 "storage.* is the REAL on-disk footprint of the '{}' database after the ladder: a {} \
                  B store image plus a {} B WAL DIRECTORY of segment files (walked by PATH). The \
-                 amplification ratios are those durable bytes over the generator's {} B logical CSV.",
+                 amplification ratios are those durable bytes over the generator's {} B logical CSV, \
+                 and storage.bytes_per_node / bytes_per_relationship amortise that store image over \
+                 the loaded graph.",
                 args.db, store_bytes, wal_bytes, args.logical_bytes,
             ));
         }
         _ => {
             collector.note(
-                "storage.* is zero = NOT MEASURED: no --store/--wal path was supplied (attach mode \
-                 has no local store to walk). It is not a claim that the run wrote nothing."
+                "storage.* is ABSENT = NOT MEASURED: no --store/--wal path was supplied (attach mode \
+                 has no local store to walk). It is not a claim that the run wrote nothing — the \
+                 schema omits an unmeasured vector rather than zero-filling it (rmp #711)."
                     .to_string(),
             );
         }

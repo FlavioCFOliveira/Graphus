@@ -858,6 +858,7 @@ if [ -x "$MEASURE_BIN" ] && [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev
     --wal "$WAL_DIR" \
     --nodes "$(scalar "MATCH (n) RETURN count(n) AS c")" \
     --rels "$(scalar "MATCH ()-[r]->() RETURN count(r) AS c")" \
+    --per-element-costs \
     --peak-rss-bytes "$PEAK_RSS_BYTES" \
     --total-millis "$RUN_MS" \
     "${CPU_FLAGS[@]}" \

@@ -89,10 +89,10 @@ end, writes an evidence directory, and (given a baseline path) diffs against it.
 <a name="evidence-schema"></a>
 ## Evidence schema (`report.json`)
 
-Every example emits `report.json` against this **stable, versioned schema** (`SCHEMA_VERSION = 2`).
+Every example emits `report.json` against this **stable, versioned schema** (`SCHEMA_VERSION = 3`).
 Field names are fixed snake_case so external tooling and the baseline-diff helper can rely on them.
 Reports deserialize leniently (each field added after v1 carries `#[serde(default)]`), so an
-older-but-compatible report still loads — a v1 `report.json` deserializes against the v2 schema, with
+older-but-compatible report still loads — a v1 `report.json` deserializes against the v3 schema, with
 `measurement_mode` defaulting to `"local"` and `server_metrics` absent.
 
 Schema history:
@@ -100,10 +100,38 @@ Schema history:
 - **v1** — metadata, host, CPU, memory, storage, throughput.
 - **v2** (`rmp #684`) — adds the top-level `measurement_mode` (`"local"` / `"external"`) and the
   optional `server_metrics` section scraped from the server's Prometheus `/metrics` endpoint.
+- **v3** (`rmp #711`) — **every metric is optional: a metric an example did not measure is ABSENT
+  from the JSON, never a `0` / `0.0` placeholder.** See below.
+
+### Measured, or absent — never a zero placeholder (v3)
+
+Every field in the four vector sections (`cpu`, `memory`, `storage`, `throughput`) is emitted **only
+when it was measured**. A vector the run could not measure — the CPU/RSS of a server it is merely
+*attached* to, the on-disk footprint of a store it does not own, the per-operation latency of a
+one-shot batch import — is simply **not there**.
+
+This is the schema half of the evidence-honesty rule below. Until v3 the schema had no way to say
+"not measured", so an unmeasured metric was written as an exact `0.0` that reads exactly like a
+result: `storage.bytes_per_node: 0.0` told every reader that a stored node costs *nothing* to keep,
+and the baseline gate over it compared `0.0` against `0.0` and reported PASS forever. **The
+distinction the type expresses is "was it measured", not "is it zero"** — a genuinely measured zero
+(an `abort_rate` of `0.0` in a write workload that hit no conflict) stays a real, present `0.0`.
+
+Consequences you can rely on:
+
+- an absent field means **NOT MEASURED**, and the report's `notes` say why;
+- `report.md` renders it as `not measured`, never `0.000`;
+- the baseline gate **skips** a metric that either side did not measure, and *names it* as skipped
+  (see [Baseline-diff regression detection](#baseline-diff-regression-detection));
+- a **pre-v3 baseline** (which carries the old zero placeholders) is normalised on load: those zeros
+  become "not measured" again, so a newly-measured figure is never diffed against a number nobody
+  ever measured;
+- `examples/run-all.sh` **audits every emitted report** and fails the suite if any metric that cannot
+  legitimately be zero is emitted as one.
 
 ```jsonc
 {
-  "version": 2,                       // schema version (integer, bump-aware)
+  "version": 3,                       // schema version (integer, bump-aware)
   "metadata": {
     "scenario": "fraud-oltp",         // STABLE scenario key (the baseline-diff join key)
     "description": "…",
@@ -128,34 +156,48 @@ Schema history:
   },
   "total_millis": 5.124,
   "phases": [ { "name": "warmup", "millis": 2.061 } ],
-  "cpu": {                            // CPU vector
+  // EVERY field below is emitted ONLY IF MEASURED. An absent field = not measured (v3).
+  "cpu": {                            // CPU vector — absent entirely for an external target
     "user_secs": 0.012,
     "system_secs": 0.004,
-    "mean_core_utilisation": 0.32     // total CPU secs / wall secs (1.0 == one core saturated)
+    "mean_core_utilisation": 0.32     // total CPU secs / wall secs (1.0 == one core saturated);
+                                      //   absent when there was no wall-clock window to divide by
   },
   "memory": {                         // memory vector (peak RAM)
     "peak_rss_bytes": 18874368,
-    "final_rss_bytes": 12582912
+    "final_rss_bytes": 12582912       // absent when the process had already exited (no RSS to read)
   },
-  "storage": {                        // storage footprint + amplification
+  "storage": {                        // storage footprint + amplification + per-element costs
     "store_bytes": 81920,             // everything durable that is NOT the redo log
-    "wal_bytes": 16384,               // the redo log — see the WAL-is-a-directory note below
+    "wal_bytes": 16384,               // the redo log — see the WAL-is-a-directory note below;
+                                      //   absent for an in-memory mirror, which has no WAL at all
     "store_pages": 10,                // ceil(store_bytes / PAGE_SIZE)
     "wal_pages": 2,
     "bytes_fsynced": 16384,
-    "write_amplification": 1.20,      // physical bytes written / logical bytes written (0.0 = N/A)
-    "space_amplification": 1.45,      // on-disk bytes / logical graph bytes      (0.0 = N/A)
-    "bytes_per_node": 102.4,          // per-element COST, not a ratio            (0.0 = N/A)
-    "bytes_per_relationship": 24.6,   // per-element COST, not a ratio            (0.0 = N/A)
-    "plateau_ratio": 1.0              // retention/GC: final size / steady-state  (0.0 = N/A)
+    "write_amplification": 1.20,      // physical bytes written / logical bytes written
+    "space_amplification": 1.45,      // on-disk bytes / logical graph bytes
+                                      //   (both absent when no logical figure was supplied)
+    "bytes_per_node": 102.4,          // per-element COST, not a ratio: the measured durable STORE
+                                      //   IMAGE amortised over the stored node count. Present only
+                                      //   when the store AND the dataset scale were measured AND the
+                                      //   example can attest they describe the SAME graph.
+    "bytes_per_relationship": 24.6,   // …the same image over the relationship count. The two are two
+                                      //   VIEWS of one image: they do not sum to store_bytes.
+    "plateau_ratio": 1.0              // retention/GC ONLY: the largest post-warmup footprint over the
+                                      //   smallest (1.0 = a flat plateau). Present only for a workload
+                                      //   with a genuine steady state (iot-timeseries); absent
+                                      //   everywhere else, because nowhere else IS there a plateau.
   },
   "throughput": {                     // throughput + latency vector
     "operations": 1000,
     "ops_per_sec": 200000.0,
-    "p50_latency_ms": 0.004,
-    "p99_latency_ms": 0.012,
-    "p999_latency_ms": 0.031,
-    "abort_rate": 0.0                  // fraction of write txns lost to conflict (0.0 = N/A)
+    "p50_latency_ms": 0.004,          // absent when the run recorded no latency sample — e.g. a
+    "p99_latency_ms": 0.012,          //   one-shot offline import has no per-operation request
+    "p999_latency_ms": 0.031,         //   boundary to time (a 0.0 would read as "instantaneous")
+    "abort_rate": 0.0                 // fraction of write txns lost to conflict. THE ONE METRIC whose
+                                      //   zero is a real measurement (a write workload with no
+                                      //   conflict): present as 0.0 when observed, absent when the run
+                                      //   never observed aborts at all (e.g. a read-only workload).
   },
   "measurement_mode": "local",        // v2: "local" (this host) | "external" (remote /metrics only)
   "server_metrics": {                 // v2: server-side /metrics deltas over the workload window
@@ -170,10 +212,11 @@ Schema history:
     "engine_force_detached_active": 0,// force_detached_active gauge (after) — MUST be 0
     "ssi_tracked_before": 12,         // ssi_tracked_transactions gauge before the workload
     "ssi_tracked_after": 190,         // …and after (residual can signal a GC-watermark pin)
-    "query_count": 46,                // query_duration_seconds _count delta
-    "query_duration_mean_ms": 0.488,  // _sum delta / _count delta, in ms
-    "query_duration_p50_ms": 0.30,    // approx p50 from bucket deltas (histogram_quantile), ms
-    "query_duration_p99_ms": 2.10,    // approx p99 from bucket deltas, ms
+    "query_count": 46,                // query_duration_seconds _count delta (a real counter: 0 = the
+                                      //   window recorded no query, which IS a measurement)
+    "query_duration_mean_ms": 0.488,  // _sum delta / _count delta, in ms; the three duration figures
+    "query_duration_p50_ms": 0.30,    //   are ABSENT when the window recorded no query at all —
+    "query_duration_p99_ms": 2.10,    //   there is no mean/percentile of nothing
     "scope_note": ""                  // set when no per-db series existed and figures are aggregate
   },
   "notes": [ "…" ]                    // free-form observations / proxy caveats
@@ -190,8 +233,8 @@ series (`rmp #463`); otherwise they fall back to the server-wide aggregate and `
 the fallback. The panic/force-detach counters and the SSI gauge are always server-global.
 
 `report.md` is the human-readable rendering of the same data: a header (scenario, dataset, host,
-toolchain) followed by one table per vector (CPU / memory / storage+amplification /
-throughput+latency).
+toolchain) followed by one table per vector (CPU / memory / storage+amplification+per-element costs /
+throughput+latency). A metric the run did not measure renders as **`not measured`** — never `0.000`.
 
 ### Evidence-honesty rules (non-negotiable)
 
@@ -199,9 +242,16 @@ An example exists to tell the truth about the server. Evidence that is subtly wr
 evidence, because it is *believed*. These rules are the scar tissue of real defects found in this
 suite (`rmp` #699) — do not reintroduce them:
 
-1. **Measure it or omit it.** A latency or throughput field is either genuinely measured or left out.
+1. **Measure it or omit it.** A metric is either genuinely measured or **absent from the report**.
    Never emit a `0.000` placeholder and never relabel one statement as N operations — a reader cannot
-   distinguish a fabricated zero from a real one.
+   distinguish a fabricated zero from a real one. Since schema **v3** (`rmp #711`) the type system
+   enforces this: every metric is an `Option`, an unmeasured one is omitted from the JSON, and
+   `run-all.sh` fails the suite if a report emits a zero for a metric that cannot legitimately be one.
+   The rule's scar tissue: `storage.bytes_per_node` was added to the schema, documented to the reader
+   as "durable bytes per stored node", gated by the baseline comparator — and then never populated. It
+   read `0.0` in all 11 reports, telling every reader that a stored node costs nothing to keep, while
+   its gate compared `0.0` to `0.0` and passed forever. **A gate that cannot fire is the same lie
+   wearing a green tick.**
 2. **`total_millis` is the WORKLOAD's wall-time.** These emitters typically build the report *after*
    the workload has finished, so a naive `start()`/`finish()` bracket times the report's own emission
    (hundredths of a millisecond). Pass the measured duration to
@@ -210,6 +260,12 @@ suite (`rmp` #699) — do not reintroduce them:
    amplification *ratios*. Per-element costs go in `bytes_per_node` / `bytes_per_relationship`; a
    retention plateau goes in `plateau_ratio`. (bulk-etl used to smuggle bytes-per-node into
    `space_amplification`, so its committed baseline read `1239.04` where the real ratio was `46.78`.)
+   And a per-element cost is only honest if its two inputs describe the **same graph**: the store the
+   example metered must be the store that holds the `nodes`/`relationships` it counted. Where it is
+   not — `fraud-oltp` counts the generator's seed while its concurrency phase writes *more* rows into
+   the same store; `security-multitenant` meters one tenant's database while counting two tenants'
+   graphs — the cost is **omitted**, and the report says why. Real arithmetic over mismatched inputs
+   is still a lie; it is just a harder one to see.
 4. **Sample the SERVER, not the driver.** When the goal is server evidence, drive the server over the
    wire and sample the *server's* pid (or its `/metrics`). An in-process battery measures the driver:
    that is how social-network-large came to report a "~1 core" ceiling that was purely a harness
@@ -234,14 +290,35 @@ baseline `report.json` and flags a **regression** when any key metric degrades b
 |--------|-----------|
 | `throughput.ops_per_sec` | **lower** |
 | `throughput.p50/p99/p999_latency_ms` | **higher** |
+| `throughput.abort_rate` | **higher** |
 | `memory.peak_rss_bytes` | **higher** |
 | `storage.store_bytes` / `wal_bytes` | **higher** |
 | `storage.write_amplification` / `space_amplification` | **higher** |
+| `storage.bytes_per_node` / `bytes_per_relationship` | **higher** |
+| `storage.plateau_ratio` | **higher** |
 | `cpu.total_secs` (user + system) | **higher** |
 
 The returned `ComparisonReport` lists every metric's `baseline → candidate` delta, its `degradation`,
 and a `regressed` flag, plus a `regressed: bool` for the run overall and a `summary()` string. A CI
 gate exits non-zero when `regressed` is set.
+
+**A gate over an unmeasured metric is SKIPPED, not passed** (`rmp #711`). A gate can only compare what
+*both* sides measured, so a metric absent on either side goes into `ComparisonReport::skipped` —
+named, with the reason (`not measured in the baseline` / `in this run` / `on either side`) — and
+`summary()` prints one `~ metric: SKIPPED — …` line for each:
+
+```text
+PASS — no regression vs baseline `bulk-etl` (9 metrics compared within threshold, 5 skipped)
+  ~ throughput.p50_latency_ms: SKIPPED — not measured on either side (not gated)
+  ~ storage.plateau_ratio: SKIPPED — not measured on either side (not gated)
+```
+
+The alternative is worse than having no gate: `storage.bytes_per_node` was `0.0` in every report, so
+the gate compared `0.0` to `0.0`, found no degradation, and printed PASS — for months. A gate that
+cannot fire is a lie of the same family as a zero placeholder. Now the absence is *visible*, and it is
+fixed by capturing the missing measurement (a baseline captured before schema v3 has its zero
+placeholders normalised back to "not measured" on load, so those gates report as skipped until the
+baseline is re-captured from a real run).
 
 ## Running the examples
 
@@ -303,8 +380,10 @@ measured by the driver. Server-side counters come from the target's Prometheus `
 before and after the workload and reported as deltas (`server_metrics` section) — including the
 health invariants `statement_panics` / `engine_recovery_panics` / `engine_force_detached`, which
 `measure_target --assert` gates to `0`. The **process** vectors (CPU, peak RSS) and the **on-disk**
-storage vector require a co-located PID and filesystem, so they are **N/A** in external mode and left
-zeroed with an explicit note. Consequently, **a committed baseline must always be captured from a
+storage vector require a co-located PID and filesystem, so they are **N/A** in external mode: since
+schema v3 (`rmp #711`) they are **absent from the report**, with an explicit note — not zero-filled,
+which would have told a reader the remote server burned no CPU and stored no bytes. Consequently, **a
+committed baseline must always be captured from a
 local boot run** — an external run is never a baseline candidate, and `measure_target` replaces the
 host-specific baseline diff with the host-independent invariant gate above.
 
