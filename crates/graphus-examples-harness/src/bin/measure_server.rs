@@ -22,11 +22,25 @@
 //!   --store <store-file-or-dir> --wal <wal-file-or-dir> \
 //!   --nodes <u64> --rels <u64> \
 //!   [--peak-rss-bytes <u64>] \
+//!   [--total-millis <f64>] \
+//!   [--cpu-user-secs <f64> --cpu-system-secs <f64> --cpu-window-secs <f64>] \
 //!   [--workload-ops <u64> --workload-secs <f64>] \
 //!   [--p50-ms <f64> --p99-ms <f64> --p999-ms <f64>] [--abort-rate <f64>] \
 //!   [--logical-bytes-written <u64>] [--logical-graph-bytes <u64>] \
 //!   [--param key=value]... [--note <text>]... [--phase name=millis]...
 //! ```
+//!
+//! `--total-millis` (`rmp` #697) is the report's `total_millis`: the wall-clock duration of the
+//! example's WORKLOAD, as the example measured it. Without it the collector would time only its own
+//! (millisecond-scale) report-building window and emit *that* as the run's duration — a number that
+//! describes nothing. It is optional, so an example that does not track a workload window simply
+//! leaves `total_millis` at the collector's own bracket rather than reporting a fabricated one.
+//!
+//! `--cpu-user-secs` / `--cpu-system-secs` / `--cpu-window-secs` (`rmp` #697) exist for the same
+//! reason on the CPU vector: an example that RESTARTS or CRASHES its server measures a process that
+//! no longer exists by the time this binary runs, so `--pid`'s cumulative CPU would describe only the
+//! surviving (post-recovery) process. Such an example accumulates the real per-lifetime CPU itself and
+//! passes it here; the three flags must be supplied together and then take precedence over the pid.
 //!
 //! The latency-percentile and abort-rate inputs (`rmp #253`) let a shell example feed the figures
 //! its driver measured (e.g. the official Neo4j-driver workload's per-operation latencies and SSI
@@ -44,8 +58,8 @@ use std::time::Duration;
 
 use graphus_examples_harness::resource::cpu_section;
 use graphus_examples_harness::{
-    CpuSection, DatasetScale, EvidenceCollector, RunMetadata, Target, cumulative_cpu_times,
-    current_rss_bytes,
+    CpuSection, CpuTimes, DatasetScale, EvidenceCollector, RunMetadata, Target,
+    cumulative_cpu_times, current_rss_bytes,
 };
 
 /// Parsed command-line inputs. Required fields have no default; optional metrics default to "not
@@ -65,6 +79,18 @@ struct Args {
     /// RSS after teardown is unreadable, so the example samples it while alive and passes the high
     /// watermark here). `None` ⇒ fall back to the single end-of-run RSS read this binary takes.
     peak_rss_bytes: Option<u64>,
+    /// The wall-clock duration of the example's workload, in milliseconds (`rmp` #697). `None` ⇒ the
+    /// collector's own start-to-finish bracket is used (which, for this binary, is just the
+    /// report-building window — hence the flag).
+    total_millis: Option<f64>,
+    /// CPU seconds the example *itself* accumulated for the measured server(s) (`rmp` #697). An
+    /// example that RESTARTS or CRASHES its server cannot get this from `--pid`: by the time this
+    /// binary runs, the process that did the work is gone and the surviving pid only accounts for its
+    /// own (post-recovery) lifetime. Such an example samples `/proc/<pid>/stat` before each shutdown
+    /// and passes the totals here; they override the pid read. All three must be given together.
+    cpu_user_secs: Option<f64>,
+    cpu_system_secs: Option<f64>,
+    cpu_window_secs: Option<f64>,
     workload_ops: Option<u64>,
     workload_secs: Option<f64>,
     /// Per-operation latency percentiles, in milliseconds, as measured by the example's driver.
@@ -82,7 +108,7 @@ struct Args {
 }
 
 fn main() -> ExitCode {
-    let args = match parse_args() {
+    let args = match parse_args(std::env::args().skip(1)) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("measure_server: {e}");
@@ -92,20 +118,37 @@ fn main() -> ExitCode {
 
     let target = Target::Pid(args.pid);
 
-    // --- CPU: the server is dedicated to this workload for its whole lifetime, so its cumulative
-    // since-boot CPU IS the workload's CPU. Pair it with the process's wall-clock uptime to derive
-    // mean core utilisation. If the PID has already gone (it should not — the example holds it open),
-    // the section honestly stays zero.
-    let cpu: CpuSection = match cumulative_cpu_times(target) {
-        Some(times) => cpu_section(times, Duration::from_secs_f64(args.uptime_secs.max(0.0))),
-        None => {
-            eprintln!(
-                "measure_server: warning: could not read CPU for pid {} (already exited?); \
-                 leaving CPU section zeroed",
-                args.pid
-            );
-            CpuSection::default()
-        }
+    // --- CPU. Two sources, in priority order:
+    //
+    // 1. The example's OWN accounting (`--cpu-user-secs` / `--cpu-system-secs` / `--cpu-window-secs`).
+    //    Mandatory for an example that restarts or CRASHES its server: the process that executed the
+    //    workload no longer exists, so reading `--pid` would attribute the run's CPU to the surviving
+    //    (post-recovery) process — a real number describing the wrong thing (`rmp` #697).
+    // 2. Otherwise the pid's cumulative since-boot CPU, which IS the workload's CPU when the server
+    //    lived for exactly the workload. If the pid has already gone, the section honestly stays zero.
+    let cpu: CpuSection = match (
+        args.cpu_user_secs,
+        args.cpu_system_secs,
+        args.cpu_window_secs,
+    ) {
+        (Some(user), Some(system), Some(window)) => cpu_section(
+            CpuTimes {
+                user_secs: user.max(0.0),
+                system_secs: system.max(0.0),
+            },
+            Duration::from_secs_f64(window.max(0.0)),
+        ),
+        _ => match cumulative_cpu_times(target) {
+            Some(times) => cpu_section(times, Duration::from_secs_f64(args.uptime_secs.max(0.0))),
+            None => {
+                eprintln!(
+                    "measure_server: warning: could not read CPU for pid {} (already exited?); \
+                     leaving CPU section zeroed",
+                    args.pid
+                );
+                CpuSection::default()
+            }
+        },
     };
 
     // --- Memory: one current RSS read of the live server (the "final" RSS). The peak is the high
@@ -170,6 +213,14 @@ fn main() -> ExitCode {
         collector.throughput_mut().abort_rate = rate;
     }
 
+    // --- Total wall-clock: the example's measured WORKLOAD window (`rmp` #697), never this binary's
+    // own report-building time. Only set when the example supplied it.
+    if let Some(millis) = args.total_millis {
+        if millis > 0.0 {
+            collector.record_total_duration(Duration::from_secs_f64(millis / 1_000.0));
+        }
+    }
+
     for note in &args.notes {
         collector.note(note.clone());
     }
@@ -198,9 +249,12 @@ fn main() -> ExitCode {
 }
 
 /// Parses the `--flag value` command line into [`Args`], validating required fields.
-fn parse_args() -> Result<Args, String> {
+///
+/// Takes the argument iterator (rather than reading `std::env::args()` itself) so the parsing —
+/// including the `rmp` #697 `--total-millis` flag — is unit-testable.
+fn parse_args<I: Iterator<Item = String>>(argv: I) -> Result<Args, String> {
     let mut args = Args::default();
-    let mut it = std::env::args().skip(1);
+    let mut it = argv;
     let mut seen_pid = false;
     let mut seen_store = false;
     let mut seen_wal = false;
@@ -235,6 +289,34 @@ fn parse_args() -> Result<Args, String> {
                     value()?
                         .parse()
                         .map_err(|e| format!("--peak-rss-bytes: {e}"))?,
+                );
+            }
+            "--total-millis" => {
+                args.total_millis = Some(
+                    value()?
+                        .parse()
+                        .map_err(|e| format!("--total-millis: {e}"))?,
+                );
+            }
+            "--cpu-user-secs" => {
+                args.cpu_user_secs = Some(
+                    value()?
+                        .parse()
+                        .map_err(|e| format!("--cpu-user-secs: {e}"))?,
+                );
+            }
+            "--cpu-system-secs" => {
+                args.cpu_system_secs = Some(
+                    value()?
+                        .parse()
+                        .map_err(|e| format!("--cpu-system-secs: {e}"))?,
+                );
+            }
+            "--cpu-window-secs" => {
+                args.cpu_window_secs = Some(
+                    value()?
+                        .parse()
+                        .map_err(|e| format!("--cpu-window-secs: {e}"))?,
                 );
             }
             "--workload-ops" => {
@@ -315,4 +397,144 @@ fn parse_args() -> Result<Args, String> {
         return Err("--wal is required".to_string());
     }
     Ok(args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use graphus_examples_harness::EvidenceCollector;
+
+    fn argv(args: &[&str]) -> impl Iterator<Item = String> + use<> {
+        args.iter()
+            .map(|s| (*s).to_string())
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    /// The minimal required flag set, so each test can bolt its own optional flags onto it.
+    fn required() -> Vec<&'static str> {
+        vec![
+            "--evidence-dir",
+            "/tmp/evidence",
+            "--scenario",
+            "unit-test",
+            "--pid",
+            "1",
+            "--store",
+            "/tmp/store",
+            "--wal",
+            "/tmp/wal",
+        ]
+    }
+
+    /// `rmp` #697 regression: `--total-millis` must be accepted and carried through, so an example
+    /// can report the WORKLOAD's wall-clock as `total_millis` instead of this binary's own
+    /// report-building window (the fabricated figure the `social-network-uds` audit found).
+    #[test]
+    fn total_millis_flag_is_parsed() {
+        let mut a = required();
+        a.extend_from_slice(&["--total-millis", "24680.5"]);
+        let parsed = parse_args(argv(&a)).expect("parses");
+        assert_eq!(parsed.total_millis, Some(24680.5));
+    }
+
+    /// Absent the flag, the field stays `None` — the binary then leaves `total_millis` to the
+    /// collector's own bracket rather than inventing a workload duration.
+    #[test]
+    fn total_millis_defaults_to_none() {
+        let parsed = parse_args(argv(&required())).expect("parses");
+        assert_eq!(parsed.total_millis, None);
+    }
+
+    /// A malformed value is a hard error: an example must pass a real measurement, never a silently
+    /// swallowed one.
+    #[test]
+    fn total_millis_rejects_a_malformed_value() {
+        let mut a = required();
+        a.extend_from_slice(&["--total-millis", "not-a-number"]);
+        let err = parse_args(argv(&a)).expect_err("must reject");
+        assert!(err.contains("--total-millis"), "unexpected error: {err}");
+    }
+
+    /// The end-to-end effect of the flag: `record_total_duration` overrides the collector's own
+    /// start-to-finish bracket, so the emitted report carries the workload's duration.
+    #[test]
+    fn recorded_total_duration_lands_in_the_report() {
+        let mut collector = EvidenceCollector::new(graphus_examples_harness::RunMetadata::new(
+            "unit-test",
+            "total-millis wiring",
+        ));
+        collector.start();
+        collector.record_total_duration(Duration::from_secs_f64(12.5));
+        let report = collector.finish();
+        assert!(
+            (report.total_millis - 12_500.0).abs() < 1.0,
+            "total_millis should be the recorded workload window, got {}",
+            report.total_millis
+        );
+    }
+
+    /// `rmp` #697 regression: an example that CRASHES and restarts its server must be able to supply
+    /// the CPU it accumulated across the server's lifetimes, because the pid this binary can read is
+    /// the post-recovery process — it never executed the workload.
+    #[test]
+    fn explicit_cpu_overrides_the_pid_read() {
+        let mut a = required();
+        a.extend_from_slice(&[
+            "--cpu-user-secs",
+            "9.5",
+            "--cpu-system-secs",
+            "2.5",
+            "--cpu-window-secs",
+            "6.0",
+        ]);
+        let parsed = parse_args(argv(&a)).expect("parses");
+        assert_eq!(parsed.cpu_user_secs, Some(9.5));
+        assert_eq!(parsed.cpu_system_secs, Some(2.5));
+        assert_eq!(parsed.cpu_window_secs, Some(6.0));
+
+        // …and the section they build reports 12 CPU-seconds over a 6 s window = 2 cores' worth.
+        let section = cpu_section(
+            CpuTimes {
+                user_secs: parsed.cpu_user_secs.unwrap(),
+                system_secs: parsed.cpu_system_secs.unwrap(),
+            },
+            Duration::from_secs_f64(parsed.cpu_window_secs.unwrap()),
+        );
+        assert!((section.user_secs - 9.5).abs() < 1e-9);
+        assert!((section.system_secs - 2.5).abs() < 1e-9);
+        assert!(
+            (section.mean_core_utilisation - 2.0).abs() < 1e-9,
+            "12 CPU-seconds over 6 wall-seconds is 2.0 cores, got {}",
+            section.mean_core_utilisation
+        );
+    }
+
+    /// The latency percentiles remain OPTIONAL: an example that cannot measure them must be able to
+    /// omit them (they then stay at the honest `0.0` "not measured" default) rather than pass zeros
+    /// that read as a measurement. This guards the other half of the `rmp` #697 evidence-honesty fix.
+    #[test]
+    fn latency_percentiles_are_optional_and_parse_when_given() {
+        let parsed = parse_args(argv(&required())).expect("parses");
+        assert_eq!(parsed.p50_ms, None);
+        assert_eq!(parsed.p99_ms, None);
+        assert_eq!(parsed.p999_ms, None);
+
+        let mut a = required();
+        a.extend_from_slice(&[
+            "--p50-ms",
+            "18.5",
+            "--p99-ms",
+            "210.0",
+            "--p999-ms",
+            "412.25",
+            "--abort-rate",
+            "0.625",
+        ]);
+        let parsed = parse_args(argv(&a)).expect("parses");
+        assert_eq!(parsed.p50_ms, Some(18.5));
+        assert_eq!(parsed.p99_ms, Some(210.0));
+        assert_eq!(parsed.p999_ms, Some(412.25));
+        assert_eq!(parsed.abort_rate, Some(0.625));
+    }
 }

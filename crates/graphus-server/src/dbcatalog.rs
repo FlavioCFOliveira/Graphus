@@ -710,7 +710,25 @@ fn open_or_create_coordinator(
         // skipped and the corrupt page served. `recover_device_with_dwb` first restores every torn
         // home page from its intact DWB copy, then runs the normal recovery.
         let mut dwb = open_or_create_dwb(device_file, master_key)?;
-        recover_device_with_dwb(&mut wal, &mut device, &mut dwb)?;
+        let report = recover_device_with_dwb(&mut wal, &mut device, &mut dwb)?;
+        // Surface WHAT recovery actually did (`rmp` #697). ARIES recovery is the single mechanism the
+        // durability guarantee rests on, and until now its `RecoveryReport` was dropped on the floor:
+        // an operator (or an acceptance test) could not tell a real WAL replay apart from a no-op —
+        // both looked like a silent, successful boot. The counters below are the evidence: a crash
+        // reboot MUST show `records_scanned > 0` and (whenever dirty pages did not reach the device
+        // before the crash) `redo_applied > 0`; `losers` / `clrs_written` quantify the in-flight
+        // transactions rolled back; `tail_truncated` reports that an un-acknowledged, torn WAL tail was
+        // discarded (expected after a hard kill, never after a clean shutdown).
+        tracing::info!(
+            store = %store_dir.display(),
+            records_scanned = report.records_scanned,
+            redo_start_lsn = report.redo_start.0,
+            redo_applied = report.redo_applied,
+            losers = report.losers,
+            clrs_written = report.clrs_written,
+            tail_truncated = report.tail_truncated,
+            "wal recovery complete",
+        );
         // Reopen the WAL fresh for serving (recovery consumed the recovery view).
         let wal = WalManager::open(open_wal_sink(wal_file, keyring.as_ref())?)
             .map_err(|e| GraphusError::Storage(format!("reopening WAL manager: {e}")))?;
