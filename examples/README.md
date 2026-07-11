@@ -327,7 +327,7 @@ so they cannot target a shared/remote instance.
 | Example | Demonstrates |
 |---------|--------------|
 | [`smoke-evidence`](smoke-evidence/) | The scaffold itself: sources the shell helper and invokes the Rust harness to produce an evidence directory. Fast, self-contained — proves the harness works end to end. |
-| [`social-network-uds`](social-network-uds/) | MVP over Bolt/UDS: a social graph stored, searched, manipulated, and preserved across a graceful restart and a hard crash. |
+| [`social-network-uds`](social-network-uds/) | **The MVP, over Bolt/UDS** (local-only by construction — it owns the server's lifecycle). Many simultaneous UDS clients build a social graph under real SSI contention (all of them appending to one celebrity supernode), search and mutate it, and it survives a graceful restart **and a SIGKILL taken MID-WRITE**: the last acked commit lives, a large un-acked write leaves no trace, and the ARIES replay is *asserted* to have run (`records_scanned`/`redo_applied` > 0) — a no-op recovery fails the run. |
 | [`durability-crash-recovery`](durability-crash-recovery/) | DST-driven durability & crash recovery under load: a concurrent OLTP workload under faults + a seeded mid-workload crash, ARIES recovery, and the four ACID-durability properties asserted on the recovered engine (every acked commit survives, no in-flight effect does), with a one-command replay reproducer. |
 | [`fraud-oltp`](fraud-oltp/) | Real-time financial-transaction fraud detection as an OLTP workload over Bolt/TCP. |
 | [`gds-analytics`](gds-analytics/) | Graph Data Science analytics over a large network (influence, communities, paths). |
