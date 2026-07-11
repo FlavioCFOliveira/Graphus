@@ -41,7 +41,7 @@ fn usage() -> String {
      USAGE:\n    \
      durability_oltp --workload  --uds <sock> --user <u> --password <p> [--db <db>] \\\n        \
      [--writers N] [--batch-nodes N] [--phantom-nodes N] [--min-acked N] [--max-secs N] \\\n        \
-     --ready-file <path> --ledger <path>\n    \
+     --ready-file <path> [--hold-file <path>] --ledger <path>\n    \
      durability_oltp --verify    --uds <sock> --user <u> --password <p> [--db <db>] --ledger <path>\n    \
      durability_oltp --footprint --store-dir <dir>\n"
         .to_owned()
@@ -60,6 +60,7 @@ fn parse_args() -> Result<Args, String> {
         min_acked_before_ready: 8,
         max_secs: 120,
         ready_file: PathBuf::new(),
+        hold_file: PathBuf::new(),
         ledger_file: PathBuf::new(),
     };
     let mut store_dir = PathBuf::new();
@@ -104,6 +105,7 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|_| "--max-secs needs an integer")?;
             }
             "--ready-file" => cfg.ready_file = PathBuf::from(val("--ready-file")?),
+            "--hold-file" => cfg.hold_file = PathBuf::from(val("--hold-file")?),
             "--ledger" => cfg.ledger_file = PathBuf::from(val("--ledger")?),
             "--store-dir" => store_dir = PathBuf::from(val("--store-dir")?),
             "-h" | "--help" => return Err(usage()),
@@ -188,10 +190,12 @@ fn main() -> ExitCode {
                     print!("{}", l.render());
                     eprintln!(
                         "durability_oltp: server died with {} acked commit(s), {} undetermined, \
-                         open-txn-at-kill={}",
+                         open-txn-at-kill={} (held across {} in-transaction probes; died with: {})",
                         l.acked.len(),
                         l.undetermined.len(),
-                        l.phantom_txn_open_at_kill
+                        l.phantom_txn_open_at_kill,
+                        l.phantom_hold_probes,
+                        l.phantom_txn_error,
                     );
                     ExitCode::SUCCESS
                 }

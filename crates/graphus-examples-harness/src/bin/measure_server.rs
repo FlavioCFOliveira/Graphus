@@ -27,9 +27,26 @@
 //!   [--workload-ops <u64> --workload-secs <f64>] \
 //!   [--p50-ms <f64> --p99-ms <f64> --p999-ms <f64>] [--abort-rate <f64>] \
 //!   [--logical-bytes-written <u64>] [--logical-graph-bytes <u64>] \
+//!   [--wal-bytes <u64>] [--bytes-fsynced <u64>] \
 //!   [--per-element-costs] \
 //!   [--param key=value]... [--note <text>]... [--phase name=millis]...
 //! ```
+//!
+//! ## `--wal-bytes` / `--bytes-fsynced`: a WAL that no longer exists at emission time (`rmp #712`)
+//!
+//! Normally this binary walks `--wal` when it runs, which is right for an example whose server is
+//! still serving the workload it measured. A **crash-recovery** example is the exception: its
+//! load-bearing WAL figure is the redo log that existed **at the crash** — the bytes that carried the
+//! acknowledged commits and that ARIES then replayed. By the time the report is emitted, the server
+//! has restarted, replayed and begun checkpointing, so an emission-time walk measures the
+//! post-recovery *residual* instead: a different, far smaller quantity that would tell the reader a
+//! crashed store's redo log cost almost nothing.
+//!
+//! `--wal-bytes` therefore lets such an example pass the figure IT measured, by path, at the only
+//! instant at which the quantity exists (it is a measurement, not an estimate — see
+//! [`EvidenceCollector::record_storage_at`]), and `--bytes-fsynced` lets it state the bytes it
+//! observed forced to durable media rather than accepting the collector's WAL-byte proxy. Both are
+//! opt-in; every other example is unaffected.
 //!
 //! ## `--per-element-costs`: derive the durable cost of a node / a relationship (`rmp #711`)
 //!
@@ -122,6 +139,15 @@ struct Args {
     abort_rate: Option<f64>,
     logical_bytes_written: Option<u64>,
     logical_graph_bytes: Option<u64>,
+    /// `--wal-bytes` (`rmp #712`): the WAL byte count the EXAMPLE measured, at the instant that
+    /// matters for its scenario, replacing the emission-time walk of `--wal`. It exists for the
+    /// crash-recovery example, whose load-bearing WAL is the redo log that existed AT THE CRASH — a
+    /// quantity that no longer exists once the server has restarted, replayed and checkpointed. See
+    /// [`EvidenceCollector::record_storage_at`].
+    wal_bytes: Option<u64>,
+    /// `--bytes-fsynced` (`rmp #712`): the bytes the example observed forced to durable media. When
+    /// absent the collector falls back to its documented WAL-byte proxy.
+    bytes_fsynced: Option<u64>,
     /// `--per-element-costs`: the example ATTESTS that `--store` is the store holding exactly the
     /// `--nodes` / `--rels` graph, so the per-element durable costs may be derived from it
     /// (`rmp #711`). Opt-in: an example that meters one tenant's store while counting every tenant's
@@ -229,10 +255,15 @@ fn main() -> ExitCode {
         ));
     }
 
-    // --- Storage: measure the real on-disk store + WAL footprint, defaulting bytes_fsynced to the
-    // WAL byte count (the faithful proxy the collector documents). A path that does not exist is
-    // recorded as NOT MEASURED (absent), never as a zero footprint.
-    if let Err(e) = collector.record_storage(&args.store, &args.wal, None) {
+    // --- Storage: measure the real on-disk store + WAL footprint. `--wal-bytes` lets an example whose
+    // load-bearing WAL no longer exists at emission time (a crash example: the redo log the crash left
+    // behind is consumed by recovery) supply the figure IT measured, by path, at the instant that
+    // matters. `--bytes-fsynced` supplies an observed durable-write figure; without it the collector
+    // falls back to its documented WAL-byte proxy. A path that does not exist is recorded as NOT
+    // MEASURED (absent), never as a zero footprint.
+    if let Err(e) =
+        collector.record_storage_at(&args.store, &args.wal, args.wal_bytes, args.bytes_fsynced)
+    {
         eprintln!("measure_server: failed to measure storage: {e}");
         return ExitCode::FAILURE;
     }
@@ -442,6 +473,16 @@ fn parse_args<I: Iterator<Item = String>>(argv: I) -> Result<Args, String> {
                         .map_err(|e| format!("--logical-graph-bytes: {e}"))?,
                 );
             }
+            "--wal-bytes" => {
+                args.wal_bytes = Some(value()?.parse().map_err(|e| format!("--wal-bytes: {e}"))?);
+            }
+            "--bytes-fsynced" => {
+                args.bytes_fsynced = Some(
+                    value()?
+                        .parse()
+                        .map_err(|e| format!("--bytes-fsynced: {e}"))?,
+                );
+            }
             "--per-element-costs" => args.per_element_costs = true,
             "--param" => {
                 let raw = value()?;
@@ -606,6 +647,33 @@ mod tests {
         a.push("--per-element-costs");
         let parsed = parse_args(argv(&a)).expect("parses");
         assert!(parsed.per_element_costs);
+    }
+
+    /// `rmp #712`: the crash-recovery example must be able to report the redo log that existed AT THE
+    /// CRASH — a quantity that no longer exists by the time this binary runs (recovery replayed it and
+    /// the restarted server checkpoints it away). Both overrides are OPT-IN, so every other example
+    /// keeps the emission-time walk and the documented WAL-byte fsync proxy.
+    #[test]
+    fn wal_bytes_and_bytes_fsynced_are_opt_in_overrides() {
+        let parsed = parse_args(argv(&required())).expect("parses");
+        assert_eq!(parsed.wal_bytes, None, "default: walk the WAL path");
+        assert_eq!(parsed.bytes_fsynced, None, "default: the WAL-byte proxy");
+
+        let mut a = required();
+        a.extend_from_slice(&["--wal-bytes", "1254181", "--bytes-fsynced", "1254181"]);
+        let parsed = parse_args(argv(&a)).expect("parses");
+        assert_eq!(parsed.wal_bytes, Some(1_254_181));
+        assert_eq!(parsed.bytes_fsynced, Some(1_254_181));
+    }
+
+    /// A malformed override is a hard error — an example must pass a real measurement, never a
+    /// silently swallowed one.
+    #[test]
+    fn a_malformed_wal_bytes_override_is_rejected() {
+        let mut a = required();
+        a.extend_from_slice(&["--wal-bytes", "1.2MB"]);
+        let err = parse_args(argv(&a)).expect_err("must reject");
+        assert!(err.contains("--wal-bytes"), "unexpected error: {err}");
     }
 
     /// The latency percentiles remain OPTIONAL: an example that cannot measure them must be able to

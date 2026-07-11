@@ -1226,6 +1226,7 @@ dependencies = [
 name = "graphus-durability-demo"
 version = "0.0.9"
 dependencies = [
+ "graphus-bolt",
  "graphus-core",
  "graphus-dst",
  "graphus-examples-harness",

@@ -140,10 +140,15 @@ pub fn build_report(
         sweep_duration.as_secs_f64() * 1_000.0,
     ));
     c.note(
-        "storage is 0 here BY CONSTRUCTION, not by omission: the DST core runs the engine on an \
-         in-memory device + in-memory WAL sink, so there is no on-disk footprint to size. The real \
-         on-disk store/WAL footprint (and the redo log a crash leaves behind) is measured by the \
-         sibling real-server SIGKILL run, in evidence/real-server/report.json."
+        "the storage vector is ABSENT here BY CONSTRUCTION, not by omission: the DST core runs the \
+         engine on an in-memory device + in-memory WAL sink, so there is no on-disk footprint to \
+         size, and schema v3 omits what it cannot measure rather than emitting a zero. The example's \
+         REAL durability vector — the redo log the crash left behind, the store image it was replayed \
+         into, the WAL residual afterwards, the bytes forced to durable media, and the wall-clock + \
+         peak RSS of the replay — is measured on the real on-disk store of the real-server SIGKILL \
+         run, and is the example's HEADLINE report (evidence/report.json). This report used to BE the \
+         headline, which is how the project's durability example came to tell its reader that \
+         durability cost zero bytes (rmp #712)."
             .to_string(),
     );
     if let Some(n) = fault_matrix_note {
