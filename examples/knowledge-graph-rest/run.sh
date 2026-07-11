@@ -225,7 +225,14 @@ local_scrape_metrics() {
 # --------------------------------------------------------------------------------------------------
 section "Step 1 — generate the deterministic knowledge graph ($PROFILE profile)"
 mkdir -p "$DATA_DIR"
-GEN_OUT="$("$GEN" --profile "$PROFILE" --out-dir "$DATA_DIR" | head -n1)"
+# Capture the generator's WHOLE stdout, then take its first line — never `| head -n1`, which closes the
+# pipe as soon as it has that line and leaves the generator writing into a broken pipe. Rust's `println!`
+# PANICS on EPIPE ("failed printing to stdout: Broken pipe"), so that pipeline aborts the generator
+# roughly one run in six, and the example fails with a panic that has nothing to do with what it tests.
+# It is a race (it only fires when the generator is still writing when `head` exits), which is exactly
+# why it survived: it passes most of the time. Found by the examples gate, `rmp` #716.
+GEN_OUT="$("$GEN" --profile "$PROFILE" --out-dir "$DATA_DIR")"
+GEN_OUT="${GEN_OUT%%$'\n'*}"
 info "$GEN_OUT"
 GRAPH_CYPHER="$DATA_DIR/graph.cypher"
 REFERENCE="$DATA_DIR/reference.json"

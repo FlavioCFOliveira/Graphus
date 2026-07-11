@@ -25,11 +25,12 @@ path = "src/lib.rs"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# The offline bulk importer/dumper, used by the `bulk_roundtrip` + `bulk_storage` binaries to drive
-# the real import -> dump -> re-import round-trip and to measure the on-disk footprint of a loaded
-# store WITHOUT a server. `graphus-bulk` is itself an offline leaf (it does not pull in
-# `graphus-server`), so the round-trip stays hermetic + CI-runnable, and `graphus-server` does NOT
-# depend on this generator crate — the production build is untouched.
+# The offline bulk importer/dumper, used by the `bulk_roundtrip` + `bulk_evidence` + `bulk_reopen`
+# binaries to drive the real import -> dump -> re-import round-trip, to measure the on-disk footprint
+# of a loaded store, and to measure the COST OF REOPENING it (WAL recovery + RecordStore::open — the
+# `rmp` #576/#579 path) — all WITHOUT a server. `graphus-bulk` is itself an offline leaf (it does not
+# pull in `graphus-server`), so the round-trip stays hermetic + CI-runnable, and `graphus-server` does
+# NOT depend on this generator crate — the production build is untouched.
 graphus-bulk = { path = "../graphus-bulk" }
 graphus-core = { path = "../graphus-core" }
 graphus-io = { path = "../graphus-io" }

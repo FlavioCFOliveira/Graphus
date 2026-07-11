@@ -29,7 +29,8 @@
 //!   [--nodes <u64> --rels <u64>] \
 //!   [--total-millis <f64>] \
 //!   [--workload-ops <u64> --workload-secs <f64>] \
-//!   [--p50-ms <f64> --p99-ms <f64> --p999-ms <f64>] [--abort-rate <f64>] \
+//!   [--p50-ms <f64> --p99-ms <f64> --p999-ms <f64>] [--latency-samples-secs <file>] \
+//!   [--abort-rate <f64>] \
 //!   [--param key=value]... [--note <text>]... [--phase name=millis]... \
 //!   [--assert] [--max-abort-rate <f64>]
 //! ```
@@ -60,10 +61,65 @@
 //! honest, robust substitute.
 
 use std::process::ExitCode;
+use std::time::Duration;
 
 use graphus_examples_harness::{
-    DatasetScale, EvidenceCollector, MeasurementMode, RunMetadata, ServerMetricsSection, scrape,
+    DatasetScale, EvidenceCollector, LatencyCollector, MeasurementMode, RunMetadata,
+    ServerMetricsSection, scrape,
 };
+
+/// Which latency percentiles a sample of `n` timed requests can HONESTLY support.
+///
+/// A tail percentile computed over too small a sample is not a tail measurement — it is the maximum
+/// (or the second-highest value) wearing a percentile's name, and publishing it tells a reader
+/// something the run never measured. That is the same family of lie as a `0.0` placeholder, so the
+/// unsupported percentiles are **omitted** from the report and the reason is recorded in a note
+/// (`rmp` #711/#716 — measure it or omit it).
+///
+/// The thresholds, and the actual reasons for them:
+///
+/// - **p50** — any sample at all has a median. `n >= 1`.
+/// - **p99** — `n >= 100`. A 99th percentile is only *supported* when at least **1% of the sample
+///   lies above it** (1% of 100 = one whole sample). This is the binding constraint and it is
+///   stricter than the merely-degenerate one: with this crate's nearest-rank rule
+///   (`rank = round(p * (n - 1))`, mirroring `graphus_bench::ldbc::percentile`) the p99 is literally
+///   the **maximum** for all `n <= 51`, and for `52..=99` it is the *second*-highest value — a "tail"
+///   estimated from a single point. 100 is the conventional minimum, and the one we hold to.
+/// - **p999** — `n >= 1000`, by exactly the same 0.1%-of-the-sample argument.
+///
+/// Returns `(p50, p99, p999)`: whether each may be published.
+fn percentiles_supported_by(n: usize) -> (bool, bool, bool) {
+    (n >= 1, n >= 100, n >= 1000)
+}
+
+/// Reads a file of per-request durations — **one f64 of SECONDS per line** — into a
+/// [`LatencyCollector`]. Blank lines are skipped; a malformed line is an error, never a silently
+/// dropped sample (a latency file that half-parses would publish a percentile over an unknown subset).
+///
+/// Seconds, because that is the unit `curl -w '%{time_total}'` emits — and it emits it C-locale
+/// formatted (a `.` decimal point) regardless of the caller's locale, which is what makes this file a
+/// safe interchange format for a shell-driven example.
+fn read_latency_samples(path: &str) -> Result<LatencyCollector, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let mut collector = LatencyCollector::new();
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let secs: f64 = line
+            .parse()
+            .map_err(|e| format!("line {}: {line:?} is not a float of seconds: {e}", i + 1))?;
+        if !secs.is_finite() || secs < 0.0 {
+            return Err(format!(
+                "line {}: {secs} is not a valid duration in seconds",
+                i + 1
+            ));
+        }
+        collector.record(Duration::from_secs_f64(secs));
+    }
+    Ok(collector)
+}
 
 /// Parsed command-line inputs. Required fields have no default; optional metrics default to "not
 /// measured" (zero), which the report renders honestly.
@@ -86,6 +142,9 @@ struct Args {
     p50_ms: Option<f64>,
     p99_ms: Option<f64>,
     p999_ms: Option<f64>,
+    /// A file of per-request durations (one f64 of SECONDS per line) the driver timed. Percentiles
+    /// are computed from it here, and only the ones the sample size supports are published.
+    latency_samples_secs: Option<String>,
     abort_rate: Option<f64>,
     params: Vec<(String, String)>,
     notes: Vec<String>,
@@ -171,6 +230,62 @@ fn main() -> ExitCode {
     }
     if let Some(p999) = args.p999_ms {
         collector.throughput_mut().p999_latency_ms = Some(p999);
+    }
+    // --- Latency from a RAW SAMPLE FILE (`rmp #716`): the honest way for a shell-driven example to
+    // report percentiles. The driver times each request and appends one duration per line; we compute
+    // the percentiles here with the project's own nearest-rank implementation, and — crucially — only
+    // publish a percentile the SAMPLE SIZE can actually support (see `percentiles_supported_by`).
+    if let Some(path) = &args.latency_samples_secs {
+        match read_latency_samples(path) {
+            Ok(collector_samples) => {
+                let n = collector_samples.count();
+                let (p50, p99, p999) = collector_samples.percentiles();
+                let ms = |d: std::time::Duration| d.as_secs_f64() * 1_000.0;
+                let (want50, want99, want999) = percentiles_supported_by(n);
+                if want50 {
+                    collector.throughput_mut().p50_latency_ms = Some(ms(p50));
+                }
+                if want99 {
+                    collector.throughput_mut().p99_latency_ms = Some(ms(p99));
+                }
+                if want999 {
+                    collector.throughput_mut().p999_latency_ms = Some(ms(p999));
+                }
+                collector
+                    .metadata_mut()
+                    .workload
+                    .insert("latency_samples".into(), n.to_string());
+                let mut note = format!(
+                    "LATENCY: p50{} computed from {n} REAL per-request samples (each one timed \
+                     request/response over the wire), with the project's nearest-rank percentile.",
+                    match (want99, want999) {
+                        (true, true) => "/p99/p999",
+                        (true, false) => "/p99",
+                        _ => "",
+                    }
+                );
+                if !want999 {
+                    note.push_str(&format!(
+                        " p999 is ABSENT: a nearest-rank p999 needs at least 1000 samples to be \
+                         distinct from the maximum, and this run took {n}. Reporting one anyway \
+                         would be the maximum wearing a percentile's name — a number that reads \
+                         like a tail measurement and is not one (rmp #711/#716: measure it or omit \
+                         it)."
+                    ));
+                }
+                if !want99 {
+                    note.push_str(&format!(
+                        " p99 is ABSENT for the same reason: it needs at least 100 samples, and this \
+                         run took {n}."
+                    ));
+                }
+                collector.note(note);
+            }
+            Err(e) => {
+                eprintln!("measure_target: cannot read --latency-samples-secs {path}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
     }
     // A measured zero abort rate IS evidence (a write workload with no conflict), so it is recorded
     // as the real 0.0 it is; an unsupplied one stays absent.
@@ -326,6 +441,7 @@ fn parse_args() -> Result<Args, String> {
             "--p999-ms" => {
                 args.p999_ms = Some(value()?.parse().map_err(|e| format!("--p999-ms: {e}"))?)
             }
+            "--latency-samples-secs" => args.latency_samples_secs = Some(value()?),
             "--abort-rate" => {
                 args.abort_rate = Some(value()?.parse().map_err(|e| format!("--abort-rate: {e}"))?)
             }
@@ -381,6 +497,102 @@ mod tests {
             &scrape::parse(text_after),
             db,
         )
+    }
+
+    // ---- The latency-sample honesty gate (`rmp` #716) ----
+
+    #[test]
+    fn a_percentile_needs_a_sample_size_that_can_support_it() {
+        // The rule the whole gate exists for: a nearest-rank percentile over too small a sample is
+        // just the MAXIMUM wearing a percentile's name. Publishing it would tell a reader something
+        // the run never measured — the same family of lie as a 0.0 placeholder.
+        assert_eq!(percentiles_supported_by(0), (false, false, false));
+        assert_eq!(percentiles_supported_by(1), (true, false, false));
+        assert_eq!(percentiles_supported_by(99), (true, false, false));
+        assert_eq!(percentiles_supported_by(100), (true, true, false));
+        assert_eq!(percentiles_supported_by(165), (true, true, false)); // a `default`-profile run
+        assert_eq!(percentiles_supported_by(999), (true, true, false));
+        assert_eq!(percentiles_supported_by(1000), (true, true, true));
+        assert_eq!(percentiles_supported_by(2631), (true, true, true)); // a `huge`-profile run
+    }
+
+    /// The crate's nearest-rank rule, replicated so the test pins the real arithmetic.
+    fn p99_rank(n: usize) -> usize {
+        (0.99_f64 * (n as f64 - 1.0)).round() as usize
+    }
+
+    #[test]
+    fn the_p99_threshold_is_justified_by_the_arithmetic_not_by_taste() {
+        // (a) The DEGENERATE bound: with nearest rank, the p99 is literally the MAXIMUM up to n = 51.
+        //     Anything published there would be the slowest request relabelled as a tail percentile.
+        for n in 1..=51usize {
+            assert_eq!(
+                p99_rank(n),
+                n - 1,
+                "with {n} samples the nearest-rank p99 IS the maximum"
+            );
+        }
+        assert!(
+            p99_rank(52) < 51,
+            "at n=52 the p99 stops being the maximum (it becomes the 2nd-highest)"
+        );
+
+        // (b) The BINDING bound, and the one we actually gate on: a 99th percentile is only supported
+        //     when at least 1% of the sample lies ABOVE it — one whole sample at n = 100. Between 52
+        //     and 99 the p99 is the second-highest value: a "tail" estimated from a single point.
+        //     That is why the threshold is 100 and not 52.
+        let above = |n: usize| n - 1 - p99_rank(n); // samples strictly above the reported rank
+        assert_eq!(
+            above(52),
+            1,
+            "at n=52 exactly one sample lies above the p99"
+        );
+        assert!(
+            above(100) >= 1,
+            "at n=100 at least one whole sample must lie above the p99"
+        );
+
+        // (c) And the gate itself enforces exactly that.
+        assert!(
+            !percentiles_supported_by(99).1,
+            "99 samples must NOT gate a p99"
+        );
+        assert!(
+            percentiles_supported_by(100).1,
+            "100 samples must gate a p99"
+        );
+    }
+
+    #[test]
+    fn latency_samples_parse_from_a_seconds_per_line_file() {
+        let dir = std::env::temp_dir().join(format!("mt-lat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("samples.txt");
+        // Seconds per line, with a blank line — exactly what `curl -w '%{time_total}'` appends.
+        std::fs::write(&path, "0.010\n0.020\n\n0.030\n").unwrap();
+        let c = read_latency_samples(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            c.count(),
+            3,
+            "the blank line is skipped, the 3 samples are not"
+        );
+        let (p50, _, _) = c.percentiles();
+        assert!((p50.as_secs_f64() - 0.020).abs() < 1e-9, "p50 = {p50:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_malformed_latency_line_is_an_error_not_a_dropped_sample() {
+        // A file that half-parses would publish a percentile over an unknown subset of the run.
+        let dir = std::env::temp_dir().join(format!("mt-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.txt");
+        std::fs::write(&path, "0.010\nnot-a-number\n0.030\n").unwrap();
+        assert!(read_latency_samples(path.to_str().unwrap()).is_err());
+        // …and a negative "duration" is not a duration.
+        std::fs::write(&path, "0.010\n-1.0\n").unwrap();
+        assert!(read_latency_samples(path.to_str().unwrap()).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

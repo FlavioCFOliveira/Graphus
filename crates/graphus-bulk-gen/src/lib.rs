@@ -78,6 +78,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 
 pub mod content_hash;
+pub mod footprint;
 pub mod store_io;
 
 /// A tiny, fully-deterministic PRNG (SplitMix64 — Steele, Lea & Flood 2014). A pure integer mixing
@@ -120,27 +121,63 @@ impl SplitMix64 {
     }
 }
 
-/// The two generation profiles: a small `Fast` dataset for CI/E2E assertions, and a larger `Large`
-/// dataset for evidence collection. Both pin their own seed.
+/// The generation-profile **ladder**: one production-*shaped* dataset at four sizes. Every profile
+/// pins the same seed and the same schema — the graph's *shape* (labels, relationship types, degree
+/// distribution, property mix) is identical across the ladder, and only its **size** changes.
+///
+/// # Why a ladder, and why [`Default`](Self::Default) is the default
+///
+/// The size is the knob; the shape is what makes the example representative. `rmp` #716: the example
+/// whose entire subject is BULK ingestion used to default to [`Fast`](Self::Fast) — a **47-millisecond**
+/// workload of 4,829 elements. A bulk-ETL pipeline that finishes in a twentieth of a second cannot
+/// stress a single thing an ETL actually stresses: sustained ingest, WAL amplification under load, the
+/// loading-mode maintenance cadence, or the **reopen cost of the loaded store** (`rmp` #576 measured a
+/// ~33 s reopen; `rmp` #579 a WAL blow-up on reopen). It passed, so it looked healthy, and it told us
+/// nothing.
+///
+/// So the default is [`Default`](Self::Default): ~164k elements, whose measured load leaves a store
+/// and a **WAL residual several times larger than it**, and whose reopen is a *second*, comparable
+/// cost — all of it measurable and assertable. It is large enough to be judgeable and small enough to
+/// keep the whole examples suite inside its gate budget (`scripts/examples-gate.sh`).
+///
+/// | Profile | Nodes | Relationships | Logical CSV | Purpose |
+/// |---------|-------|---------------|-------------|---------|
+/// | [`Fast`](Self::Fast) | 800 | ~4.0k | ~134 KiB | the crate's own hermetic tests; a smoke run |
+/// | [`Default`](Self::Default) | 24.4k | ~140k | ~4.8 MiB | **the default** — production-shaped, moderate |
+/// | [`Large`](Self::Large) | 97.6k | ~560k | ~20 MiB | opt-in: real evaluation scale |
+/// | [`Huge`](Self::Huge) | 390.4k | ~2.24M | ~82 MiB | opt-in: the memory/WAL ceiling of a big import |
+///
+/// The measured figures each profile actually produces are recorded in `examples/bulk-etl/README.md`,
+/// which states — as the evidence-honesty rules require — **which profile produced which number**, and
+/// never claims production scale from a fast run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Profile {
-    /// Small, fast dataset for CI and the hermetic round-trip/footprint assertions.
+    /// Small, fast dataset for the crate's hermetic round-trip/determinism tests and a smoke run.
+    /// **Not** a scale at which any storage or durability vector means anything.
     Fast,
-    /// Larger dataset for evidence collection (storage/throughput footprint at volume).
+    /// **The default.** Production-shaped at a moderate size: a load whose WAL amplification, store
+    /// growth, fsync cost and reopen time are all measurable and meaningful.
+    Default,
+    /// Opt-in evaluation scale (~4x [`Default`](Self::Default)).
     Large,
+    /// Opt-in stress scale (~4x [`Large`](Self::Large)) — where the memory ceiling and the WAL
+    /// residual of a genuinely big import are exercised.
+    Huge,
 }
 
 impl Profile {
-    /// Parses a profile name (`fast` / `large`), case-insensitively.
+    /// Parses a profile name (`fast` / `default` / `large` / `huge`), case-insensitively.
     ///
     /// # Errors
-    /// Returns `Err` with the offending name if it is neither `fast` nor `large`.
+    /// Returns `Err` with the offending name if it names no profile in the ladder.
     pub fn parse(name: &str) -> Result<Self, String> {
         match name.to_ascii_lowercase().as_str() {
             "fast" => Ok(Self::Fast),
+            "default" => Ok(Self::Default),
             "large" => Ok(Self::Large),
+            "huge" => Ok(Self::Huge),
             other => Err(format!(
-                "unknown profile '{other}' (expected 'fast' or 'large')"
+                "unknown profile '{other}' (expected 'fast', 'default', 'large' or 'huge')"
             )),
         }
     }
@@ -150,18 +187,25 @@ impl Profile {
     pub fn name(self) -> &'static str {
         match self {
             Self::Fast => "fast",
+            Self::Default => "default",
             Self::Large => "large",
+            Self::Huge => "huge",
         }
     }
 
     /// The scale knobs for this profile. Kept here (not in the binary) so the determinism test and
     /// the binary agree by construction.
+    ///
+    /// Every rung shares one seed and one shape: the per-person / per-forum / per-post *degrees* are
+    /// held constant, and only the population scales. That is what makes the ladder a ladder — a
+    /// bigger run is the same graph, not a different one, so its footprint and amplification figures
+    /// are directly comparable with the rung below it.
     #[must_use]
     pub fn config(self) -> GenConfig {
         match self {
             // Small but non-trivial: a few hundred persons + their forums/posts/comments — enough to
             // exercise every node label, every relationship type, arrays, and multi-batch commits,
-            // yet fast enough for a CI round-trip in well under a second.
+            // yet fast enough for a CI round-trip in well under a second. NOT an evidence scale.
             Self::Fast => GenConfig {
                 seed: 0x50C1_A1B0_17E7_0001,
                 persons: 200,
@@ -172,13 +216,39 @@ impl Profile {
                 members_per_forum: 12,
                 likes_per_person: 5,
             },
-            // ~20x larger, for evidence: thousands of persons, tens of thousands of edges.
-            // Deliberately bounded so the example completes promptly while still producing a
-            // meaningful on-disk footprint to characterise (bytes/node, bytes/edge, amplification).
-            Self::Large => GenConfig {
+            // THE DEFAULT (rmp #716). 24,400 nodes + ~140,000 relationships from ~4.8 MiB of CSV.
+            // Measured on the reference host: a ~1.2 s offline load producing a ~30 MB store and a
+            // ~178 MB WAL residual (5.8x the store it just wrote), a ~42x write amplification, and a
+            // ~1.0 s REOPEN — a second cost, of the same order as the load itself, that a 47 ms run
+            // could not see at all. That is the point of the size.
+            Self::Default => GenConfig {
                 seed: 0x50C1_A1B0_17E7_0001,
                 persons: 4_000,
                 forums: 400,
+                posts_per_forum: 10,
+                comments_per_post: 4,
+                knows_per_person: 12,
+                members_per_forum: 30,
+                likes_per_person: 10,
+            },
+            // Opt-in evaluation scale: 4x the default population at the same degrees.
+            Self::Large => GenConfig {
+                seed: 0x50C1_A1B0_17E7_0001,
+                persons: 16_000,
+                forums: 1_600,
+                posts_per_forum: 10,
+                comments_per_post: 4,
+                knows_per_person: 12,
+                members_per_forum: 30,
+                likes_per_person: 10,
+            },
+            // Opt-in stress scale: 16x the default population. This is the rung at which the known
+            // large-import fragilities (the WAL residual a reopen must replay; the peak RSS of a big
+            // load) stop being a curiosity and become the operator's problem.
+            Self::Huge => GenConfig {
+                seed: 0x50C1_A1B0_17E7_0001,
+                persons: 64_000,
+                forums: 6_400,
                 posts_per_forum: 10,
                 comments_per_post: 4,
                 knows_per_person: 12,
@@ -870,6 +940,86 @@ mod tests {
         let fast = generate(Profile::Fast.config(), "fast");
         let large = generate(Profile::Large.config(), "large");
         assert!(large.manifest.total_nodes > fast.manifest.total_nodes);
+    }
+
+    #[test]
+    fn the_profile_ladder_is_strictly_monotonic() {
+        // `rmp` #716: four rungs, each strictly bigger than the one below it, so a caller that asks
+        // for a bigger profile always gets more graph — never a silently equal or smaller one.
+        let ladder = [
+            Profile::Fast,
+            Profile::Default,
+            Profile::Large,
+            Profile::Huge,
+        ];
+        let sizes: Vec<(u64, u64, u64)> = ladder
+            .iter()
+            .map(|p| {
+                let d = generate(p.config(), p.name());
+                (
+                    d.manifest.total_nodes,
+                    d.manifest.total_relationships,
+                    d.manifest.logical_csv_bytes,
+                )
+            })
+            .collect();
+        for w in sizes.windows(2) {
+            assert!(w[1].0 > w[0].0, "node count is not monotonic: {sizes:?}");
+            assert!(w[1].1 > w[0].1, "rel count is not monotonic: {sizes:?}");
+            assert!(w[1].2 > w[0].2, "CSV bytes are not monotonic: {sizes:?}");
+        }
+    }
+
+    #[test]
+    fn every_rung_of_the_ladder_has_the_same_shape() {
+        // The size is the knob; the SHAPE is what makes the example representative. Every rung must
+        // carry the same labels and the same relationship types — a bigger run has to be the same
+        // graph, only more of it, or its footprint figures are not comparable with the rung below.
+        let reference = generate(Profile::Default.config(), "default");
+        let labels: Vec<&String> = reference
+            .manifest
+            .nodes_by_label
+            .iter()
+            .map(|(l, _)| l)
+            .collect();
+        let types: Vec<&String> = reference
+            .manifest
+            .relationships_by_type
+            .iter()
+            .map(|(t, _)| t)
+            .collect();
+        for p in [Profile::Fast, Profile::Large, Profile::Huge] {
+            let d = generate(p.config(), p.name());
+            let l: Vec<&String> = d.manifest.nodes_by_label.iter().map(|(l, _)| l).collect();
+            let t: Vec<&String> = d
+                .manifest
+                .relationships_by_type
+                .iter()
+                .map(|(t, _)| t)
+                .collect();
+            assert_eq!(l, labels, "profile {} changed the label set", p.name());
+            assert_eq!(t, types, "profile {} changed the rel-type set", p.name());
+            // …and the same schema an operator would harden it with.
+            assert_eq!(
+                d.manifest.implied_schema,
+                reference.manifest.implied_schema,
+                "profile {} changed the implied schema",
+                p.name()
+            );
+        }
+    }
+
+    #[test]
+    fn every_profile_name_round_trips_through_parse() {
+        for p in [
+            Profile::Fast,
+            Profile::Default,
+            Profile::Large,
+            Profile::Huge,
+        ] {
+            assert_eq!(Profile::parse(p.name()).unwrap(), p);
+        }
+        assert!(Profile::parse("gigantic").is_err());
     }
 
     #[test]
