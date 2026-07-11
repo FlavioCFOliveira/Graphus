@@ -19,6 +19,11 @@
 //! `graphus-server` does not depend on it, so the production binary is untouched.
 #![forbid(unsafe_code)]
 
+pub mod evidence;
+pub mod faults;
+pub mod footprint;
+pub mod oltp;
+
 use graphus_dst::vopr::run_safety;
 use graphus_dst::{SafetyProperty, SafetyReport, VoprConfig};
 
@@ -62,6 +67,13 @@ pub struct DurabilityRun {
     pub recovered_nodes: i64,
     /// Distinct `:Person` ids whose creating transaction committed — the durability obligation.
     pub committed_nodes: i64,
+    /// `:KNOWS` relationships actually present after recovery (`rmp` #698) — must equal
+    /// [`committed_edges`](Self::committed_edges). The workload relates the nodes it creates, so this is
+    /// a real, non-zero part of the recovered dataset; the example's evidence used to report `0`.
+    pub recovered_edges: i64,
+    /// `:KNOWS` relationships whose creating transaction committed — the relationship durability
+    /// obligation.
+    pub committed_edges: i64,
     /// The per-crash acked/in-flight partition, in fire order (empty only if no crash fired).
     pub crashes: Vec<CrashPartition>,
     /// Each violated safety property's stable name + detail (empty iff [`durable`](Self::durable)).
@@ -92,6 +104,8 @@ impl DurabilityRun {
             faults_injected: r.run.disk_faults + r.run.clock_faults + r.run.transport_faults,
             recovered_nodes: r.run.persisted_nodes,
             committed_nodes: r.run.created_nodes,
+            recovered_edges: r.run.persisted_edges,
+            committed_edges: r.run.created_edges,
             crashes,
             violations: r
                 .violations
@@ -373,6 +387,94 @@ mod tests {
         assert!(
             s.non_vacuous_runs() > 0,
             "at least one sweep run must exercise the contract non-vacuously"
+        );
+    }
+
+    /// **Regression (`rmp` #705 — the baseline-drift investigation).**
+    ///
+    /// The committed baseline recorded 22 recovered `:Person` rows for the focus seed; the engine now
+    /// recovers 44. The question that had to be settled was whether recovery had started surfacing rows
+    /// that no acknowledged commit ever produced (an ACID-D violation) or whether the workload simply
+    /// commits more transactions now. THIS test is the invariant that settles it, permanently and
+    /// independently of any recorded number:
+    ///
+    /// * `recovered_nodes` is read back from the **recovered engine**;
+    /// * `committed_nodes` is the number of distinct ids whose creating transaction was **acknowledged**;
+    /// * the reference-model arm (`SafetyProperty::ReferenceModel`) additionally compares the recovered
+    ///   engine **cell by cell** — id multiset with multiplicities, edge multiset, `count(n)`, and every
+    ///   per-node neighbour row — against a shadow model that is fed ONLY by acknowledged commits (a
+    ///   rolled-back, SSI-aborted or in-flight-at-crash transaction's ops are discarded, never applied).
+    ///
+    /// So a single un-acknowledged row surviving recovery — or a single acknowledged row lost — breaks
+    /// this test, whatever the absolute counts happen to be. The row count is free to move as the engine
+    /// legitimately commits more (or fewer) transactions; what may NEVER move is that the recovered rows
+    /// are EXACTLY the acknowledged ones.
+    ///
+    /// (Root cause of the drift, bisected: `909c484`, the SSI precise-`scan_filter_eq` fix (`rmp` #325),
+    /// which stopped an unindexed label scan from FALSELY aborting disjoint-key writers. Its parent
+    /// commit still reproduces the baseline exactly — 14 checked transactions, 22 rows — and the fix
+    /// takes it to 20 rows/txns, with later engine work moving it on to 24/44. More transactions commit,
+    /// so more committed rows exist to recover. Nothing uncommitted became visible.)
+    #[test]
+    fn every_recovered_row_corresponds_to_an_acknowledged_commit() {
+        for seed in 1..=30u64 {
+            let r = run_seed(seed);
+            assert!(
+                r.durable,
+                "seed {seed}: the four-property oracle must hold on the recovered engine: {:?}",
+                r.violations
+            );
+            assert_eq!(
+                r.recovered_nodes, r.committed_nodes,
+                "seed {seed}: recovery must surface EXACTLY the acknowledged rows — no un-acked row \
+                 may become visible, and no acked row may be lost"
+            );
+            assert_eq!(
+                r.recovered_edges, r.committed_edges,
+                "seed {seed}: the same obligation holds for relationships"
+            );
+            assert!(
+                !r.violations
+                    .iter()
+                    .any(|(p, _)| *p == "reference-model-equivalence"),
+                "seed {seed}: the recovered engine must equal the committed-only shadow model \
+                 cell-by-cell"
+            );
+        }
+    }
+
+    /// **Teeth for `rmp` #705.** The invariant above is only worth something if it would CATCH the
+    /// violation it denies. Inject a **phantom**: one extra recovered row that no acknowledged commit
+    /// produced (exactly what "recovery is surfacing uncommitted data" would look like), and assert the
+    /// example reports it as non-durable. The opposite direction (a LOST acked commit) is covered by
+    /// `durability_oracle_surfaces_an_injected_violation`, below.
+    #[test]
+    fn a_phantom_row_surviving_recovery_would_be_caught() {
+        use graphus_dst::{SafetyProperty, SafetyViolation};
+
+        let mut report = run_safety(VoprConfig::safety(7));
+        assert!(report.safe, "the unmutated run must be durable");
+        let clean = DurabilityRun::from_report(&report);
+        assert_eq!(clean.recovered_nodes, clean.committed_nodes);
+
+        // Inject the ACID-D violation: a row survived recovery that nobody committed.
+        report.safe = false;
+        report.run.persisted_nodes += 1;
+        report.violations.push(SafetyViolation {
+            property: SafetyProperty::Atomicity,
+            detail: "INJECTED: an uncommitted :Person row survived recovery".to_owned(),
+        });
+
+        let run = DurabilityRun::from_report(&report);
+        assert!(!run.durable, "a phantom row must make the run non-durable");
+        assert!(
+            run.recovered_nodes > run.committed_nodes,
+            "the phantom must show as more recovered rows than were ever acknowledged"
+        );
+        assert!(
+            run.violations.iter().any(|(p, _)| *p == "atomicity"),
+            "the violation must be surfaced by name: {:?}",
+            run.violations
         );
     }
 

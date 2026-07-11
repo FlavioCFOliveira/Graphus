@@ -562,6 +562,109 @@ impl BoltClient {
         })
     }
 
+    /// Opens an **explicit transaction** on this connection (`BEGIN`), targeting database `db` (empty
+    /// ⇒ the server's default database). Bolt 5.x carries the database in the `BEGIN` `extra` map, so
+    /// every statement of the transaction runs against it without repeating the selection
+    /// (`04-technical-design.md` §8.1; the Bolt state machine moves `READY` → `TX_READY`).
+    ///
+    /// After `begin`, run statements with [`run_in_txn`](Self::run_in_txn) — **not** [`run`](Self::run),
+    /// whose `RUN` would be an auto-commit statement the server rejects while a transaction is open —
+    /// and close with [`commit`](Self::commit) or [`rollback`](Self::rollback).
+    ///
+    /// Leaving the transaction open and dropping the connection (or crashing the server) is exactly the
+    /// **in-flight** case a durability example needs: nothing it wrote was ever acknowledged, so no
+    /// effect of it may ever be observable (`rmp` #698).
+    ///
+    /// # Errors
+    /// [`ClientError::Failure`] if the server refuses to open the transaction; [`ClientError::Protocol`]
+    /// on an out-of-place reply; [`ClientError::Io`] on a transport fault.
+    pub fn begin(&mut self, db: &str) -> ClientResult<()> {
+        let extra = if db.is_empty() {
+            vec![]
+        } else {
+            vec![("db".to_owned(), Value::String(db.to_owned()))]
+        };
+        self.send(&Request::Begin { extra })?;
+        match self.recv()? {
+            Response::Success { .. } => Ok(()),
+            Response::Failure(f) => Err(ClientError::Failure(f)),
+            other => Err(unexpected("BEGIN", &other)),
+        }
+    }
+
+    /// Runs one statement **inside the open explicit transaction** (`RUN` + `PULL(-1)`), pulling all
+    /// records. The database was fixed by [`begin`](Self::begin), so the `RUN` `extra` map is empty —
+    /// re-sending `db` inside a transaction is not the Bolt 5.x contract.
+    ///
+    /// Its effects are visible only to this transaction until [`commit`](Self::commit) succeeds.
+    ///
+    /// # Errors
+    /// As [`run`](Self::run).
+    pub fn run_in_txn(
+        &mut self,
+        query: &str,
+        parameters: Vec<(String, Value)>,
+    ) -> ClientResult<QueryResult> {
+        let started = Instant::now();
+        self.send(&Request::Run {
+            query: query.to_owned(),
+            parameters,
+            extra: vec![],
+        })?;
+        let fields = match self.recv()? {
+            Response::Success { metadata } => extract_fields(&metadata),
+            Response::Failure(f) => return Err(ClientError::Failure(f)),
+            other => return Err(unexpected("RUN (in txn)", &other)),
+        };
+
+        self.send(&Request::Pull { n: ALL, qid: None })?;
+        let mut records = Vec::new();
+        loop {
+            match self.recv()? {
+                Response::Record { values } => records.push(scalar_row(values)),
+                Response::Success { .. } => break, // trailing summary
+                Response::Failure(f) => return Err(ClientError::Failure(f)),
+                other => return Err(unexpected("PULL (in txn)", &other)),
+            }
+        }
+
+        Ok(QueryResult {
+            fields,
+            records,
+            elapsed: started.elapsed(),
+        })
+    }
+
+    /// Commits the open explicit transaction (`COMMIT`). A `SUCCESS` here is the **acknowledgement**
+    /// that makes every statement of the transaction durable — the exact event a durability proof
+    /// treats as "this MUST survive a crash".
+    ///
+    /// # Errors
+    /// [`ClientError::Failure`] if the server aborts the commit (e.g. an SSI serialization conflict);
+    /// [`ClientError::Protocol`] on an out-of-place reply; [`ClientError::Io`] on a transport fault.
+    pub fn commit(&mut self) -> ClientResult<()> {
+        self.send(&Request::Commit)?;
+        match self.recv()? {
+            Response::Success { .. } => Ok(()),
+            Response::Failure(f) => Err(ClientError::Failure(f)),
+            other => Err(unexpected("COMMIT", &other)),
+        }
+    }
+
+    /// Rolls back the open explicit transaction (`ROLLBACK`): none of its effects may be observable.
+    ///
+    /// # Errors
+    /// [`ClientError::Failure`] on a server-reported failure; [`ClientError::Protocol`] on an
+    /// out-of-place reply; [`ClientError::Io`] on a transport fault.
+    pub fn rollback(&mut self) -> ClientResult<()> {
+        self.send(&Request::Rollback)?;
+        match self.recv()? {
+            Response::Success { .. } => Ok(()),
+            Response::Failure(f) => Err(ClientError::Failure(f)),
+            other => Err(unexpected("ROLLBACK", &other)),
+        }
+    }
+
     /// Sends `GOODBYE`, signalling a clean disconnect.
     ///
     /// # Errors

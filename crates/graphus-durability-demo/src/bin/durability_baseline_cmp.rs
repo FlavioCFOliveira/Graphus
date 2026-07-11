@@ -94,6 +94,22 @@ fn main() -> ExitCode {
         );
     }
 
+    // The recovered RELATIONSHIP count is just as deterministic as the node count, and just as much a
+    // durability obligation (`rmp` #698). It used to be hard-coded `0`, so it gated nothing.
+    if candidate.metadata.dataset.relationships != baseline.metadata.dataset.relationships {
+        eprintln!(
+            "durability_baseline_cmp: recovered relationship count drifted: baseline {}, candidate {} \
+             (a lost/extra recovered :KNOWS edge)",
+            baseline.metadata.dataset.relationships, candidate.metadata.dataset.relationships,
+        );
+        failed = true;
+    } else {
+        println!(
+            "structural: recovered relationship count matches ({} edges)",
+            candidate.metadata.dataset.relationships
+        );
+    }
+
     for key in STRUCTURAL_PARAMS {
         match (
             baseline.metadata.workload.get(key),

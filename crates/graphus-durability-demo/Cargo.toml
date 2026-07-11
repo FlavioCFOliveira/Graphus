@@ -29,6 +29,16 @@ graphus-dst = { path = "../graphus-dst" }
 # crate (never in `graphus-server`), keeping the production build untouched.
 graphus-examples-harness = { path = "../graphus-examples-harness" }
 
+# --- The real-server, MID-WORKLOAD crash driver (rmp #698) -------------------------------------------
+# The `durability_oltp` binary drives a REAL `graphus-server` over its UDS while it is killed, so it
+# needs a Bolt CLIENT that can hold an EXPLICIT transaction open (BEGIN … no COMMIT) at the instant of
+# the SIGKILL. That client already exists and is `pub`: `graphus-reco-gen`'s `BoltClient` (the same one
+# `graphus-social-gen`'s `social_bench` reuses), so no second Bolt client is written here — it gained
+# the explicit-transaction verbs (BEGIN/COMMIT/ROLLBACK) for this task and stays a dev-only leaf crate
+# that `graphus-server` never depends on. `graphus-core` is the shared `Value` model on the wire.
+graphus-core = { path = "../graphus-core" }
+graphus-reco-gen = { path = "../graphus-reco-gen" }
+
 # The replay artifact (and the planted-failure round-trip) serialize to/from JSON; pins match the
 # rest of the workspace.
 serde = { version = "1", features = ["derive"] }
@@ -61,6 +71,25 @@ path = "src/bin/durability_replay.rs"
 [[bin]]
 name = "durability_baseline_cmp"
 path = "src/bin/durability_baseline_cmp.rs"
+
+# The FULL FAULT-CATALOGUE matrix (rmp #698): drives `graphus-dst`'s storage harness through EVERY
+# `FaultKind` it can physically inject — crash(no-force), crash(steal) [undo of stolen pages],
+# torn-wal-tail, torn-data-page [doublewrite repair], write-reordering, write-io-error — over a seed
+# range, asserting each recovers SAFE and deterministically. The example's headline sweep only ever
+# exercised the easiest ARIES case (redo onto a fresh device); this closes that gap.
+# Usage: `durability_faults --seed 1 --seeds 25`
+[[bin]]
+name = "durability_faults"
+path = "src/bin/durability_faults.rs"
+
+# The REAL-SERVER, MID-WORKLOAD crash driver + post-restart verifier (rmp #698): drives concurrent
+# committing writers plus ONE writer holding an EXPLICIT, never-committed transaction open, so the
+# SIGKILL lands with work genuinely in flight; then, after the restart, verifies that every
+# ACKNOWLEDGED commit survived complete and correct and that NO in-flight effect did.
+# Usage: `durability_oltp --workload --uds <sock> …` then `durability_oltp --verify --uds <sock> …`
+[[bin]]
+name = "durability_oltp"
+path = "src/bin/durability_oltp.rs"
 
 [lib]
 name = "graphus_durability_demo"

@@ -154,6 +154,16 @@ fn main() -> ExitCode {
             collector.throughput_mut().ops_per_sec = ops as f64 / secs;
         }
     }
+    // --- Total wall-clock (rmp #699): the report's `total_millis` must be the WORKLOAD's duration, not
+    // this binary's own start()→finish() window. Without this it reported the time it took to *build the
+    // report* — microseconds — as if it were the run's duration, which is a fabricated figure. The
+    // workload window the example measured is the honest total; when the example supplied none, the
+    // collector's own window stands (and is labelled as such by the phases it did record).
+    if let Some(secs) = args.workload_secs {
+        if secs > 0.0 {
+            collector.record_total_duration(Duration::from_secs_f64(secs));
+        }
+    }
     // --- Latency percentiles + abort rate: the figures the example's driver measured directly
     // (the harness cannot read per-operation latency / SSI aborts from the server's PID). Each is
     // applied only when supplied, so an unmeasured percentile stays at its honest 0.0 default.

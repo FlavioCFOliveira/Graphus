@@ -1226,8 +1226,10 @@ dependencies = [
 name = "graphus-durability-demo"
 version = "0.0.9"
 dependencies = [
+ "graphus-core",
  "graphus-dst",
  "graphus-examples-harness",
+ "graphus-reco-gen",
  "serde",
  "serde_json",
 ]

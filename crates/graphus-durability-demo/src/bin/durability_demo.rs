@@ -22,12 +22,11 @@
 #![forbid(unsafe_code)]
 
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use graphus_durability_demo::{
-    DurabilityRun, SweepReport, certified_properties, run_seed, run_sweep,
+    DurabilityRun, SweepReport, certified_properties, evidence, run_seed, run_sweep,
 };
-use graphus_examples_harness::{DatasetScale, EvidenceCollector, RunMetadata};
 
 struct Args {
     start: u64,
@@ -119,6 +118,16 @@ fn print_focus(run: &DurabilityRun) {
             "VIOLATED"
         }
     );
+    println!(
+        "   relationships: recovered :KNOWS edges={} == committed edges={} ({})",
+        run.recovered_edges,
+        run.committed_edges,
+        if run.recovered_edges == run.committed_edges {
+            "HOLDS"
+        } else {
+            "VIOLATED"
+        }
+    );
     if !run.violations.is_empty() {
         println!("   VIOLATIONS:");
         for (prop, detail) in &run.violations {
@@ -127,118 +136,32 @@ fn print_focus(run: &DurabilityRun) {
     }
 }
 
-fn build_collector(sweep: &SweepReport, focus: &DurabilityRun) -> EvidenceCollector {
-    let metadata = RunMetadata::new(
-        "durability-crash-recovery",
-        "Deterministic OLTP durability + crash-recovery under load, driven by the DST simulator: a \
-         concurrent overlapping-transaction workload under disk/clock faults and a seeded mid-workload \
-         crash, rebuilt via ARIES recovery, with the four ACID-durability properties \
-         (serializability / durability / atomicity / reference-model equivalence) asserted on the \
-         recovered engine against the committed-only shadow LPG.",
-    )
-    .with_dataset(DatasetScale::new(
-        focus.committed_nodes.max(0) as u64,
-        // The safety workload relates nodes as it creates them; the recovered-edge count is folded into
-        // the reference-model check rather than reported separately, so we record the node scale only.
-        0,
-    ))
-    .workload_param("scenario", "oltp-durability")
-    .workload_param("driver", "graphus-dst VOPR safety oracle (run_safety)")
-    .workload_param("seeds", format!("{}..{}", sweep.start, sweep.start + sweep.count))
-    .workload_param("clients", "6 (overlapping explicit transactions)")
-    .workload_param("crashes_per_seed", "<=2 (mid-workload crash + ARIES restart)")
-    .workload_param("focus_seed", focus.seed.to_string())
-    // --- Deterministic recovery metrics (rmp #274). These are byte-stable for a fixed seed range
-    // and are the "recovery work" the regression gate holds: the redo set ARIES replayed (= acked
-    // commits, the in-process analogue of WAL redo records), the undo set it discarded, and how many
-    // crash + ARIES restarts fired. The on-disk WAL byte footprint + wall-clock recovery time are
-    // machine-variant and are collected by the sibling REAL-server SIGKILL run (rmp #275), not here.
-    .workload_param(
-        "recovery_records_replayed",
-        sweep.total_acked_durable().to_string(),
-    )
-    .workload_param(
-        "recovery_inflight_undone",
-        sweep.total_inflight_discarded().to_string(),
-    )
-    .workload_param("recovery_crashes", sweep.total_crashes().to_string())
-    .workload_param(
-        "focus_recovery_records_replayed",
-        focus.acked_at_last_crash().to_string(),
-    )
-    .workload_param(
-        "focus_recovered_txns",
-        focus.recovered_txns.to_string(),
+/// Writes the standardized evidence report through the crate's honest evidence builder.
+///
+/// The report's `total_millis` is the MEASURED sweep wall-time (it used to be the report-builder's own
+/// elapsed time — 3.8 microseconds for a 400 ms sweep), the dataset's relationship count is the REAL
+/// recovered `:KNOWS` count (it used to be hard-coded `0`), and CPU/RSS are this process's measured
+/// figures (the hermetic engine IS this process). See `graphus_durability_demo::evidence`.
+fn write_evidence(
+    dir: &str,
+    sweep: &SweepReport,
+    focus: &DurabilityRun,
+    sweep_duration: Duration,
+    process_wall: Duration,
+) {
+    let report = evidence::build_report(
+        sweep,
+        focus,
+        sweep_duration,
+        process_wall,
+        Some(
+            "the FULL fault catalogue (crash steal/no-force, torn WAL tail, torn data page + \
+             doublewrite repair, write reordering, write I/O error) is driven by the sibling \
+             `durability_faults` binary, which this example's run.sh asserts SAFE — this sweep is the \
+             crash-and-redo core, not the whole fault surface."
+                .to_string(),
+        ),
     );
-
-    EvidenceCollector::new(metadata)
-}
-
-fn finalize_evidence(dir: &str, mut c: EvidenceCollector, sweep: &SweepReport, sweep_millis: f64) {
-    // The sweep is the one timed phase (a pure-CPU, hermetic, in-process simulation — no server, no
-    // disk store to size, so storage/memory of a *server* are not applicable; the throughput vector
-    // carries the seed rate honestly).
-    c.phase(
-        "durability sweep (workload + crash + ARIES recovery + 4-property oracle)",
-        std::time::Duration::from_secs_f64(sweep_millis / 1_000.0),
-    );
-
-    // Throughput vector: seeds (each a full crash-recovery scenario) per second — an honest,
-    // deterministic rate for this hermetic CPU workload.
-    let secs = (sweep_millis / 1_000.0).max(1e-9);
-    let tp = c.throughput_mut();
-    tp.operations = sweep.count;
-    tp.ops_per_sec = sweep.count as f64 / secs;
-
-    c.note(format!(
-        "durability oracle: {} seed(s) checked, {} unsafe, {} non-deterministic — properties: {:?}",
-        sweep.count,
-        sweep.unsafe_seeds().len(),
-        sweep.nondeterministic,
-        certified_properties(),
-    ));
-    c.note(format!(
-        "crash + ARIES restarts across sweep: {}; faults injected: {}; acked commits proven durable: \
-         {}; in-flight transactions discarded by undo: {}; non-vacuous runs (both halves of \
-         committed-or-nothing under test): {}/{}",
-        sweep.total_crashes(),
-        sweep.total_faults(),
-        sweep.total_acked_durable(),
-        sweep.total_inflight_discarded(),
-        sweep.non_vacuous_runs(),
-        sweep.count,
-    ));
-    c.note(format!(
-        "recovery work vs WAL/redo size (DETERMINISTIC, rmp #274): ARIES redo replayed {} acked \
-         commits and undo discarded {} in-flight transactions across {} crash + ARIES restart(s) in \
-         this sweep. In-process there is no on-disk WAL to size, so the redo-record count (= acked \
-         commits) is the deterministic analogue of the WAL records replayed during recovery; it is \
-         byte-stable for a fixed seed range. The on-disk WAL byte footprint and the wall-clock \
-         recovery time scale with this redo set and are measured by the sibling REAL-server SIGKILL \
-         run (rmp #275), which records a `recovery` phase timing + the post-crash `storage.wal_bytes` \
-         so recovery-time-vs-WAL-size can be read directly.",
-        sweep.total_acked_durable(),
-        sweep.total_inflight_discarded(),
-        sweep.total_crashes(),
-    ));
-    c.note(
-        "deterministic-vs-machine-variant split: the recovery-work counts (recovery_records_replayed \
-         / recovery_inflight_undone / recovery_crashes), the durability verdict, the recovered \
-         hashes and the dataset size are EXACTLY reproducible (a pure function of the seed range) and \
-         are the structural metrics the committed baseline gates; the sweep wall-time / seed-rate \
-         throughput here, and the real-server WAL bytes / recovery time / peak RSS in the sibling \
-         run, are machine-variant and are NOT gated."
-            .to_string(),
-    );
-    c.note(
-        "hermetic: this scenario runs the storage/WAL/txn engine in-process under the DST simulator \
-         (no server, no Node, no network) — so the report carries the deterministic seed-rate \
-         throughput; server CPU/RAM/on-disk storage are exercised by the sibling real-server SIGKILL \
-         run (rmp #274-276) layered over this same scenario."
-            .to_string(),
-    );
-
-    let report = c.finish();
     match report.write_to(dir) {
         Ok((json, md)) => println!(
             "\nevidence written:\n  {}\n  {}",
@@ -275,9 +198,10 @@ fn main() -> ExitCode {
         certified_properties()
     );
 
+    let process_start = Instant::now();
     let t0 = Instant::now();
     let sweep = run_sweep(args.start, args.count);
-    let sweep_millis = t0.elapsed().as_secs_f64() * 1_000.0;
+    let sweep_duration = t0.elapsed();
 
     println!(
         "\nsweep: {} seed(s) | crashes={} faults={} | acked-durable={} in-flight-discarded={} | \
@@ -295,11 +219,7 @@ fn main() -> ExitCode {
     print_focus(&focus);
 
     if let Some(dir) = &args.evidence_dir {
-        // The collector's own wall-clock window starts here; the authoritative scenario duration is the
-        // sweep phase timing (`sweep_millis`), recorded as the single phase + the throughput window.
-        let mut c = build_collector(&sweep, &focus);
-        c.start();
-        finalize_evidence(dir, c, &sweep, sweep_millis);
+        write_evidence(dir, &sweep, &focus, sweep_duration, process_start.elapsed());
     }
 
     println!();

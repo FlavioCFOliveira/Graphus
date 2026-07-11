@@ -228,6 +228,16 @@ impl ShadowGraph {
             .collect()
     }
 
+    /// Total committed `:KNOWS` edges (sum of multiplicities) — the model's relationship obligation
+    /// (`rmp` #698). The node-side twin of [`count_nodes`](Self::count_nodes): the number of
+    /// relationships whose creating transaction was acknowledged, so recovery MUST reproduce exactly
+    /// this many. Reported by the run so the example's evidence can state its relationship scale
+    /// truthfully instead of hard-coding `0`.
+    #[must_use]
+    pub fn count_edges(&self) -> u64 {
+        self.edges.values().copied().sum()
+    }
+
     /// The `rank` property value shared by every live `:Person` carrying `id`, or `None` if the id is
     /// absent or has no `rank` set (rmp #461). Used by the property-level read-back.
     #[must_use]
@@ -488,6 +498,21 @@ fn engine_node_multiset(eng: &mut SimEngine) -> Result<NodeMultiset, OracleError
 }
 
 /// Reads the engine's `:KNOWS` edge multiset via Cypher: `((src, dst), count)` ascending.
+/// The total number of `:KNOWS` edges the **engine** actually holds, read back through Cypher
+/// (`rmp` #698) — the relationship twin of [`person_stats`](crate::vopr)'s node read-back.
+///
+/// Used by the run report to state the recovered relationship count truthfully. It is a read-only
+/// observer query (its own auto-commit read transaction), never folded into the canonical trace, and
+/// it reuses the exact same read-back the reference-model oracle compares against, so the two can
+/// never drift apart.
+///
+/// # Errors
+/// Propagates the read-back failure as an [`OracleError`] (e.g. the engine surfaced an injected
+/// latent-sector error rather than serving bytes from an unreadable page).
+pub fn engine_edge_count(eng: &mut SimEngine) -> Result<u64, OracleError> {
+    Ok(engine_edge_multiset(eng)?.iter().map(|(_, c)| *c).sum())
+}
+
 fn engine_edge_multiset(eng: &mut SimEngine) -> Result<EdgeMultiset, OracleError> {
     let pairs = read_int_pairs(
         eng,
