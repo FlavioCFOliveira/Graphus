@@ -45,8 +45,11 @@ assert "report.md was produced"   "yes" "$([ -f "$EVIDENCE_DIR/report.md" ] && e
 # The JSON must carry the stable schema: the scenario id, the schema version, and a populated vector.
 assert "report.json names the scenario" "yes" \
   "$(grep -q '"scenario": "smoke-evidence"' "$EVIDENCE_DIR/report.json" && echo yes || echo no)"
+# Pinned to graphus_examples_harness::SCHEMA_VERSION — bump BOTH together. (This assertion sat at
+# `1` long after the schema moved to `2`, and nothing noticed, because no CI runs the examples: see
+# examples/run-all.sh, which exists so the suite is actually exercised.)
 assert "report.json carries the schema version" "yes" \
-  "$(grep -q '"version": 1' "$EVIDENCE_DIR/report.json" && echo yes || echo no)"
+  "$(grep -q '"version": 2' "$EVIDENCE_DIR/report.json" && echo yes || echo no)"
 assert "report.json carries the host section" "yes" \
   "$(grep -q '"host"' "$EVIDENCE_DIR/report.json" && echo yes || echo no)"
 
