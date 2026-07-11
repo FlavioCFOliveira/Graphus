@@ -101,24 +101,16 @@ PROFILE="${FRAUD_PROFILE:-fast}"
 DST_SEED="${FRAUD_DST_SEED:-42}"
 
 # The server binary is only needed to self-boot in LOCAL mode.
-if [ "$MODE" = local ] && [ ! -x "$SERVER" ]; then
-  section "Building graphus-server (release)"
-  ( cd "$REPO_ROOT" && cargo build --release -p graphus-server )
-fi
 if [ "$MODE" = local ]; then
+  harness_build "graphus-server (release)" --release -p graphus-server
   [ -x "$SERVER" ] || { echo "${RED}fatal: server binary not found at $SERVER${RESET}" >&2; exit 2; }
 fi
 
-if [ ! -x "$GEN" ]; then
-  section "Building the deterministic fraud generator (release)"
-  ( cd "$REPO_ROOT" && cargo build --release -p graphus-fraud-gen --bin gen )
-fi
+harness_build "the deterministic fraud generator (release)" --release -p graphus-fraud-gen --bin gen
 [ -x "$GEN" ] || { echo "${RED}fatal: gen binary not found at $GEN${RESET}" >&2; exit 2; }
 
-if [ ! -x "$DST" ]; then
-  section "Building the deterministic DST contention repro (release)"
-  ( cd "$REPO_ROOT" && cargo build --release -p graphus-fraud-gen --features dst-repro --bin dst_contention )
-fi
+harness_build "the deterministic DST contention repro (release)" \
+  --release -p graphus-fraud-gen --features dst-repro --bin dst_contention
 [ -x "$DST" ] || { echo "${RED}fatal: dst_contention binary not found at $DST${RESET}" >&2; exit 2; }
 
 # --------------------------------------------------------------------------------------------------
@@ -220,7 +212,9 @@ GEN_CUSTOMERS="$(kv "$GEN_OUT" customers)"
 GEN_TRANSFERS="$(kv "$GEN_OUT" transfers)"
 NODE_COUNT=$(( ${GEN_ACCOUNTS:-0} + ${GEN_CUSTOMERS:-0} ))
 REL_COUNT=$(( ${GEN_TRANSFERS:-0} + ${GEN_ACCOUNTS:-0} ))
-LOGICAL_GRAPH_BYTES=$(( NODE_COUNT * 256 + REL_COUNT * 128 ))
+# The logical dataset = the bytes the generator ACTUALLY emitted: the honest denominator for the
+# amplification ratios (it was an invented `nodes*256 + rels*128` formula — rmp #699).
+LOGICAL_GRAPH_BYTES="$(wc -c < "$GRAPH_CYPHER" | tr -d ' ')"
 assert "graph.cypher generated"      "yes" "$([ -s "$GRAPH_CYPHER" ] && echo yes || echo no)"
 assert "ground_truth.json generated" "yes" "$([ -s "$GROUND_TRUTH" ] && echo yes || echo no)"
 
@@ -334,6 +328,7 @@ EOF
   fi
 
   WORKLOAD_START_EPOCH="$(date +%s)"
+  WORKLOAD_START_MS="$(_harness_now_ms)"
 
   # ------------------------------------------------------------------------------------------------
   # Step 3 — load + detect fraud + OLTP mix (OFFICIAL neo4j-driver)
@@ -347,6 +342,7 @@ EOF
 
   DETECT_STATS="$(printf '%s' "$DETECT_OUT" | sed -n 's/^GRAPHUS_STATS //p' | head -n1)"
   DETECT_OPS="$(json_field "$DETECT_STATS" operations)"
+  DETECT_SECS="$(json_field "$DETECT_STATS" workload_secs)"
   DETECT_P50="$(json_field "$DETECT_STATS" p50_ms)"
   DETECT_P99="$(json_field "$DETECT_STATS" p99_ms)"
   DETECT_P999="$(json_field "$DETECT_STATS" p999_ms)"
@@ -379,6 +375,9 @@ EOF
   CONC_ABORT_RATE="$(json_field "$CONC_STATS" abort_rate)"
   CONC_WRITE_P99="$(json_field "$CONC_STATS" write_p99_ms)"
 
+  # Millisecond resolution: total_millis must be the workload's real wall-time, not a whole-second
+  # rounding of it (rmp #699).
+  WORKLOAD_MS=$(( $(_harness_now_ms) - WORKLOAD_START_MS ))
   WORKLOAD_SECS=$(( $(date +%s) - WORKLOAD_START_EPOCH ))
   [ "$WORKLOAD_SECS" -lt 1 ] && WORKLOAD_SECS=1
 
@@ -399,7 +398,8 @@ EOF
     --scenario "fraud-oltp"
     --description "Fraud-detection OLTP over Bolt/TLS via the official Neo4j driver: load a seeded fraud graph, detect EXACTLY the planted fraud (rings + mules + shared-device/IP collusion), run a point-lookup OLTP mix, and sustain extreme-concurrency SSI on the REAL mule supernodes."
     --nodes "$NODE_COUNT" --rels "$REL_COUNT"
-    --workload-ops "${DETECT_OPS:-0}" --workload-secs "$WORKLOAD_SECS"
+    --total-millis "${WORKLOAD_MS:-0}"
+    --workload-ops "${DETECT_OPS:-0}" --workload-secs "${DETECT_SECS:-0}"
     --p50-ms "${DETECT_P50:-0}" --p99-ms "${DETECT_P99:-0}" --p999-ms "${DETECT_P999:-0}"
     --abort-rate "${CONC_ABORT_RATE:-0}"
     --param "profile=$PROFILE"
@@ -416,8 +416,7 @@ EOF
   if [ "$MODE" = external ]; then
     MEASURE_BIN="$BIN_DIR/measure_target"
     if [ ! -x "$MEASURE_BIN" ]; then
-      info "building the dev-only measure_target harness binary…"
-      ( cd "$REPO_ROOT" && cargo build -q -p graphus-examples-harness --bin measure_target ) || true
+      harness_build "the dev-only measure_target harness binary" -p graphus-examples-harness --bin measure_target
       MEASURE_BIN="$REPO_ROOT/target/debug/measure_target"
     fi
     if [ -x "$MEASURE_BIN" ]; then
@@ -443,8 +442,7 @@ EOF
     [ "$SERVER_UPTIME_SECS" -lt 1 ] && SERVER_UPTIME_SECS=1
     MEASURE_BIN="$BIN_DIR/measure_server"
     if [ ! -x "$MEASURE_BIN" ]; then
-      info "building the dev-only measure_server harness binary (debug)…"
-      ( cd "$REPO_ROOT" && cargo build -q -p graphus-examples-harness --bin measure_server ) || true
+      harness_build "the dev-only measure_server harness binary (debug)" -p graphus-examples-harness --bin measure_server
       MEASURE_BIN="$REPO_ROOT/target/debug/measure_server"
     fi
     if [ -x "$MEASURE_BIN" ] && [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -453,6 +451,7 @@ EOF
         --pid "$SERVER_PID" --uptime-secs "$SERVER_UPTIME_SECS" \
         --store "$STORE_FILE" --wal "$WAL_DIR" \
         --peak-rss-bytes "$PEAK_RSS_BYTES" \
+        --logical-bytes-written "$LOGICAL_GRAPH_BYTES" \
         --logical-graph-bytes "$LOGICAL_GRAPH_BYTES" \
         "${COMMON_PARAMS[@]}" \
         && info "evidence written to $EVIDENCE_DIR" \
@@ -461,7 +460,7 @@ EOF
       # same server_metrics section external mode gets from measure_target.
       INJECT_BIN="$BIN_DIR/inject_server_metrics"
       if [ ! -x "$INJECT_BIN" ]; then
-        ( cd "$REPO_ROOT" && cargo build -q -p graphus-fraud-gen --bin inject_server_metrics ) || true
+        harness_build "the inject_server_metrics helper (debug)" -p graphus-fraud-gen --bin inject_server_metrics
         INJECT_BIN="$REPO_ROOT/target/debug/inject_server_metrics"
       fi
       if [ -x "$INJECT_BIN" ] && [ -s "$METRICS_BEFORE" ] && [ -s "$METRICS_AFTER" ] && [ -f "$EVIDENCE_DIR/report.json" ]; then
@@ -473,13 +472,28 @@ EOF
         "$([ -f "$EVIDENCE_DIR/report.json" ] && echo yes || echo no)"
       assert "report.json carries server_metrics deltas" "yes" \
         "$([ -f "$EVIDENCE_DIR/report.json" ] && grep -q '"server_metrics"' "$EVIDENCE_DIR/report.json" && echo yes || echo no)"
+      # Evidence honesty (rmp #699): total_millis is the workload's wall-time, ops/sec is the detection
+      # ops over the window they were ISSUED in (not the whole load+detect+concurrency window), and
+      # both amplification ratios are real (write_amplification was a 0.0 placeholder).
+      assert "report evidence is honest (real total_millis, ops/sec, amplification)" "yes" \
+        "$(python3 -c "
+import json,sys
+try: d = json.load(open('$EVIDENCE_DIR/report.json'))
+except Exception: print('no'); sys.exit()
+t, tp, st = d['total_millis'], d['throughput'], d['storage']
+ok = (t >= 1.0
+      and tp['ops_per_sec'] > 0.0
+      and tp['p50_latency_ms'] > 0.0 and tp['p99_latency_ms'] > 0.0 and tp['p999_latency_ms'] > 0.0
+      and st['store_bytes'] > 0 and st['wal_bytes'] > 0
+      and st['write_amplification'] > 0.0 and st['space_amplification'] > 0.0)
+print('yes' if ok else 'no')" 2>/dev/null || echo no)"
 
       # Baseline regression gate (LOCAL, fast profile only — the committed baseline is a fast run).
       if [ "$PROFILE" = "fast" ] && [ -f "$BASELINE" ] && [ -f "$EVIDENCE_DIR/report.json" ]; then
         section "Step 5b — regression gate vs committed baseline"
         CMP_BIN="$BIN_DIR/baseline_cmp"
         if [ ! -x "$CMP_BIN" ]; then
-          ( cd "$REPO_ROOT" && cargo build -q -p graphus-fraud-gen --bin baseline_cmp ) || true
+          harness_build "the baseline_cmp gate (debug)" -p graphus-fraud-gen --bin baseline_cmp
           CMP_BIN="$REPO_ROOT/target/debug/baseline_cmp"
         fi
         CMP_OUT="$("$CMP_BIN" "$BASELINE" "$EVIDENCE_DIR/report.json" 2>&1)" || true

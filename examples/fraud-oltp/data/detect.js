@@ -460,12 +460,21 @@ RETURN device, edges ORDER BY device`;
     console.log('GRAPHUS_TXCURVE ' + JSON.stringify({ rel_key_enforced: createdSchema.has('transfer_tx_id_key'), buckets: curve }));
 
     // Machine-readable evidence for the run.sh harness: operation count + latency percentiles (ms).
+    //
+    // `workload_secs` is the window the `operations` were ACTUALLY issued in — the summed wall-time of
+    // the measured operations themselves. This driver is serial (one op at a time on one session), so
+    // that sum IS the wall-clock spent executing them, and `operations / workload_secs` is therefore a
+    // real achieved rate. Without it, run.sh had to divide the detection ops by the WHOLE workload
+    // window (load + detect + the concurrency phase), which silently understated ops/sec by mixing two
+    // different windows (rmp #699).
+    const workloadSecs = latenciesMs.reduce((a, b) => a + b, 0) / 1000;
     const stats = {
       load_statements: loaded,
       accounts_loaded: acctCount,
       schema_created: createdSchema.size,
       schema_unsupported: unsupportedSchema.length,
       operations: latenciesMs.length,
+      workload_secs: workloadSecs,
       point_lookup_p50_ms: percentileMs(oltpLat, 0.5),
       point_lookup_p99_ms: percentileMs(oltpLat, 0.99),
       p50_ms: percentileMs(latenciesMs, 0.5),

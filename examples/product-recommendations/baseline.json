@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "metadata": {
     "scenario": "product-recommendations",
     "description": "read-heavy product recommendations: concurrent read scaling",
@@ -8,14 +8,14 @@
       "relationships": 30877
     },
     "workload": {
-      "best_busiest_core_frac": "0.994",
-      "best_busy_threads": "1",
-      "best_clients": "2",
-      "best_ops_per_sec": "107.0",
-      "best_p50_ms": "3.4340",
-      "best_p999_ms": "254.2545",
-      "best_p99_ms": "190.2919",
-      "best_server_cores": "1.007",
+      "best_busiest_core_frac": "0.687",
+      "best_busy_threads": "33",
+      "best_clients": "8",
+      "best_ops_per_sec": "725.5",
+      "best_p50_ms": "4.3897",
+      "best_p999_ms": "111.3956",
+      "best_p99_ms": "78.8183",
+      "best_server_cores": "10.515",
       "connection": "uds-bolt (client, per-connection thread)",
       "friend_count": "14994",
       "ladder": "1,2,4,8",
@@ -33,7 +33,7 @@
       "user_count": "2000",
       "write_every_ms": "0"
     },
-    "started_unix_secs": 1783028572
+    "started_unix_secs": 1783750321
   },
   "host": {
     "os": "linux",
@@ -41,70 +41,76 @@
     "cpu_cores": 16,
     "hostname": "ROG",
     "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
-    "timestamp_unix_secs": 1783028572
+    "timestamp_unix_secs": 1783750321
   },
-  "total_millis": 0.027448,
+  "total_millis": 16497.095148,
   "phases": [
     {
       "name": "rung C=1",
-      "millis": 18298.71786
+      "millis": 7829.183436
     },
     {
       "name": "rung C=2",
-      "millis": 14018.779524
+      "millis": 3919.880408
     },
     {
       "name": "rung C=4",
-      "millis": 16979.695775
+      "millis": 2680.426114
     },
     {
       "name": "rung C=8",
-      "millis": 15893.104639000001
+      "millis": 2067.60519
     }
   ],
   "cpu": {
-    "user_secs": 13.9,
-    "system_secs": 0.21,
-    "mean_core_utilisation": 1.0065070198046722
+    "user_secs": 19.7,
+    "system_secs": 2.04,
+    "mean_core_utilisation": 10.51457991358592
   },
   "memory": {
-    "peak_rss_bytes": 514359296,
-    "final_rss_bytes": 514359296
+    "peak_rss_bytes": 507998208,
+    "final_rss_bytes": 507998208
   },
   "storage": {
-    "store_bytes": 0,
-    "wal_bytes": 0,
-    "store_pages": 0,
-    "wal_pages": 0,
-    "bytes_fsynced": 0,
-    "write_amplification": 0.0,
-    "space_amplification": 0.0
+    "store_bytes": 6635520,
+    "wal_bytes": 46388662,
+    "store_pages": 810,
+    "wal_pages": 5663,
+    "bytes_fsynced": 46388662,
+    "write_amplification": 21.792553880120817,
+    "space_amplification": 21.792553880120817,
+    "bytes_per_node": 0.0,
+    "bytes_per_relationship": 0.0,
+    "plateau_ratio": 0.0
   },
   "throughput": {
     "operations": 6000,
-    "ops_per_sec": 106.9993288240261,
-    "p50_latency_ms": 3.433984,
-    "p99_latency_ms": 190.291902,
-    "p999_latency_ms": 254.254522,
+    "ops_per_sec": 725.4769949576302,
+    "p50_latency_ms": 4.389688,
+    "p99_latency_ms": 78.818254,
+    "p999_latency_ms": 111.395612,
     "abort_rate": 0.0
   },
+  "measurement_mode": "local",
   "notes": [
     "CONCURRENCY LADDER (read-heavy, 4 rungs over 1,2,4,8 against 'recodb'): the headline evidence is where throughput SATURATES while latency explodes and only a subset of cores stay busy — the single-engine-thread vs off-thread-reader-pool signature.",
-    "rung clients=1: 82.0 ops/s over 18.299s (1500 ok, 0 err); p50=0.463ms p90=12.240ms p99=186.212ms p99.9=238.314ms max=239.749ms; server 1.00 cores across 1 busy thread(s), busiest 0.99 core; peak RSS 388.2MiB (VmHWM 388.2MiB); disk read IO 0.0MiB",
-    "rung clients=2: 107.0 ops/s over 14.019s (1500 ok, 0 err); p50=3.434ms p90=66.148ms p99=190.292ms p99.9=254.255ms max=255.260ms; server 1.01 cores across 1 busy thread(s), busiest 0.99 core; peak RSS 490.5MiB (VmHWM 490.5MiB); disk read IO 0.0MiB",
-    "rung clients=4: 88.3 ops/s over 16.980s (1500 ok, 0 err); p50=10.538ms p90=154.808ms p99=247.356ms p99.9=381.648ms max=382.222ms; server 1.01 cores across 1 busy thread(s), busiest 1.00 core; peak RSS 628.9MiB (VmHWM 628.9MiB); disk read IO 0.0MiB",
-    "rung clients=8: 94.4 ops/s over 15.893s (1500 ok, 0 err); p50=40.471ms p90=217.364ms p99=361.798ms p99.9=578.239ms max=615.749ms; server 1.01 cores across 1 busy thread(s), busiest 1.00 core; peak RSS 807.1MiB (VmHWM 807.1MiB); disk read IO 0.0MiB",
-    "family s_user (point read) @ clients=8: 299 ok / 0 err; p50=24.523ms p99=355.207ms max=454.164ms",
-    "family s_purchases (point read) @ clients=8: 226 ok / 0 err; p50=18.649ms p99=360.291ms max=412.399ms",
-    "family s_degree (point read) @ clients=8: 139 ok / 0 err; p50=23.410ms p99=428.335ms max=578.239ms",
-    "family r1_friends (advanced traversal) @ clients=8: 302 ok / 0 err; p50=35.394ms p99=330.875ms max=443.661ms",
-    "family r2_fof (advanced traversal) @ clients=8: 189 ok / 0 err; p50=47.464ms p99=361.798ms max=388.724ms",
-    "family r3_fof3 (advanced traversal) @ clients=8: 125 ok / 0 err; p50=160.591ms p99=578.190ms max=615.749ms",
-    "family r4_similar (advanced traversal) @ clients=8: 220 ok / 0 err; p50=27.426ms p99=319.238ms max=442.505ms",
-    "KNEE: Peak throughput 107.0 ops/s at clients=2 (p50=3.434ms p99=190.292ms p99.9=254.255ms).",
-    "KNEE: THROUGHPUT PLATEAUED: raising clients 2→8 changed throughput by -11.8% (within the 10% plateau band) while p99 latency went 190.292ms→361.798ms (p99 rose). Extra clients bought latency, not throughput — the saturation knee is at ~clients=2.",
-    "KNEE: At saturation (clients=2) the server used 1.01 cores across 1 busy thread(s); the busiest single thread ran at 0.99 of a core.",
-    "KNEE: VERDICT: reads hit a SINGLE-THREAD CEILING — one thread near-saturated (0.99 core) while the server's total core usage stayed at 1.01. Throughput is bounded by one engine thread, not by the machine's cores; this is the single-writer/single-engine-thread read path the off-thread reader pool (#336/#527) is meant to relieve.",
+    "rung clients=1: 191.6 ops/s over 7.829s (1500 ok, 0 err); p50=2.189ms p90=10.507ms p99=33.228ms p99.9=41.457ms max=41.528ms; server 2.08 cores across 8 busy thread(s), busiest 0.36 core; peak RSS 330.6MiB (VmHWM 330.6MiB); disk read IO 0.0MiB",
+    "rung clients=2: 382.7 ops/s over 3.920s (1500 ok, 0 err); p50=2.194ms p90=10.913ms p99=33.648ms p99.9=46.627ms max=46.754ms; server 3.62 cores across 12 busy thread(s), busiest 0.49 core; peak RSS 365.8MiB (VmHWM 365.8MiB); disk read IO 0.0MiB",
+    "rung clients=4: 559.6 ops/s over 2.680s (1500 ok, 0 err); p50=2.271ms p90=17.336ms p99=47.664ms p99.9=61.302ms max=61.422ms; server 7.52 cores across 32 busy thread(s), busiest 0.64 core; peak RSS 400.4MiB (VmHWM 400.4MiB); disk read IO 0.0MiB",
+    "rung clients=8: 725.5 ops/s over 2.068s (1500 ok, 0 err); p50=4.390ms p90=28.116ms p99=78.818ms p99.9=111.396ms max=120.975ms; server 10.51 cores across 33 busy thread(s), busiest 0.69 core; peak RSS 484.5MiB (VmHWM 484.5MiB); disk read IO 0.0MiB",
+    "family s_user (point read) @ clients=8: 298 ok / 0 err; p50=2.371ms p99=5.525ms max=7.972ms",
+    "family s_purchases (point read) @ clients=8: 217 ok / 0 err; p50=2.441ms p99=5.657ms max=6.495ms",
+    "family s_degree (point read) @ clients=8: 140 ok / 0 err; p50=2.414ms p99=4.982ms max=6.923ms",
+    "family r1_friends (advanced traversal) @ clients=8: 308 ok / 0 err; p50=4.531ms p99=24.985ms max=31.968ms",
+    "family r2_fof (advanced traversal) @ clients=8: 189 ok / 0 err; p50=18.863ms p99=46.870ms max=63.603ms",
+    "family r3_fof3 (advanced traversal) @ clients=8: 124 ok / 0 err; p50=55.272ms p99=111.396ms max=120.975ms",
+    "family r4_similar (advanced traversal) @ clients=8: 224 ok / 0 err; p50=9.341ms p99=18.185ms max=19.927ms",
+    "storage.bytes_fsynced is a proxy: the WAL on-disk byte count (every committed WAL byte is fsynced before commit acknowledgement), not a directly-observed fsync counter.",
+    "storage.* is the REAL on-disk footprint of the 'recodb' database after the ladder: a 6635520 B store image plus a 46388662 B WAL DIRECTORY of segment files (walked by PATH). The amplification ratios are those durable bytes over the generator's 2433133 B logical CSV.",
+    "KNEE: Peak throughput 725.5 ops/s at clients=8 (p50=4.390ms p99=78.818ms p99.9=111.396ms).",
+    "KNEE: The ladder's top rung is also its best; extend --ladder to observe the plateau.",
+    "KNEE: At saturation (clients=8) the server used 10.51 cores across 33 busy thread(s); the busiest single thread ran at 0.69 of a core.",
+    "KNEE: VERDICT: reads SCALED ACROSS CORES — 33 threads were busy and total core usage reached 10.51, well above any single thread's 0.69. The read path spread work across cores (the off-thread reader pool #336/#527 is engaged).",
     "KNEE: Server disk read IO at the top rung: 0.0 MiB over the rung (reads are largely served from the buffer pool when this stays low)."
   ]
 }

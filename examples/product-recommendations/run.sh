@@ -131,14 +131,10 @@ else
   GEN_PROFILE="$PROFILE"
 fi
 
-if [ ! -x "$GEN" ] || [ ! -x "$LOAD" ] || [ ! -x "$BENCH" ] || [ ! -x "$CMP_BIN" ]; then
-  section "Building the product-recommendations binaries (release)"
-  ( cd "$REPO_ROOT" && cargo build --release -p graphus-reco-gen --bins )
-fi
+harness_build "the product-recommendations binaries (release)" --release -p graphus-reco-gen --bins
 # The server binary is only needed to self-boot in LOCAL mode.
-if [ "$MODE" = local ] && [ ! -x "$SERVER" ]; then
-  section "Building graphus-server (release)"
-  ( cd "$REPO_ROOT" && cargo build --release -p graphus-server )
+if [ "$MODE" = local ]; then
+  harness_build "graphus-server (release)" --release -p graphus-server
 fi
 for b in "$GEN" "$LOAD" "$BENCH" "$CMP_BIN"; do
   [ -x "$b" ] || { echo "${RED}fatal: required binary not found at $b${RESET}" >&2; exit 2; }
@@ -351,6 +347,9 @@ if [ "$MODE" = external ]; then
   # Stream the per-rung progress live (indented) via `tee` while capturing the full output (including
   # the machine-readable sentinels) to BENCH_LOG for parsing below.
   BENCH_LOG="$WORKDIR/bench.log"
+  # Bracket the ladder so total_millis is the RUN's wall-time (rmp #699): measure_target runs after it
+  # and cannot time it, so an unbracketed report timed only its own emission.
+  LADDER_START_MS="$(_harness_now_ms)"
   set +e
   "$BENCH" \
     --bolt "$BOLT_URI" --user "$DRIVER_USER" --password "$DRIVER_PW" --db "$TARGET_DB" \
@@ -363,6 +362,7 @@ if [ "$MODE" = external ]; then
     --scenario "product-recommendations" 2>&1 \
     | tee "$BENCH_LOG" | sed 's/^/  /'
   set -e
+  LADDER_MS=$(( $(_harness_now_ms) - LADDER_START_MS ))
   BENCH_OUT="$(cat "$BENCH_LOG")"
 
   # Scrape /metrics AFTER the ladder.
@@ -393,8 +393,7 @@ if [ "$MODE" = external ]; then
   # client-measured throughput/latency; process CPU/RSS + storage are N/A remotely).
   MEASURE_BIN="$BIN_DIR/measure_target"
   if [ ! -x "$MEASURE_BIN" ]; then
-    info "building the dev-only measure_target harness binary…"
-    ( cd "$REPO_ROOT" && cargo build -q -p graphus-examples-harness --bin measure_target ) || true
+    harness_build "the dev-only measure_target harness binary" -p graphus-examples-harness --bin measure_target
     MEASURE_BIN="$REPO_ROOT/target/debug/measure_target"
   fi
   if [ -x "$MEASURE_BIN" ] && [ -s "$METRICS_BEFORE" ] && [ -s "$METRICS_AFTER" ] && [ -n "$BENCH_STATS" ]; then
@@ -405,6 +404,7 @@ if [ "$MODE" = external ]; then
       --database "$TARGET_DB" \
       --metrics-before "$METRICS_BEFORE" --metrics-after "$METRICS_AFTER" \
       --nodes "$NODE_COUNT" --rels "$REL_COUNT" \
+      --total-millis "$LADDER_MS" \
       --workload-ops "${BEST_OPS:-0}" --workload-secs "${BEST_SECS:-1}" \
       --p50-ms "${P50_MS:-0}" --p99-ms "${P99_MS:-0}" --p999-ms "${P999_MS:-0}" \
       --abort-rate "${ABORT_RATE:-0}" \
@@ -437,12 +437,26 @@ if [ "$MODE" = external ]; then
 else
   section "Step 4 — concurrent read ladder (many simultaneous UDS-Bolt connections)"
   rm -f "$EVIDENCE_DIR/report.json" "$EVIDENCE_DIR/report.md"
+  # The recommendation database's REAL on-disk footprint (rmp #699): the store image and the WAL,
+  # which is a DIRECTORY of `seg.<lsn>` segment files. `recodb` is an additional database, so it lives
+  # under `<store_path>/databases/<db>/`. Without these the whole storage section stayed ZERO — the
+  # report claimed a durable-write workload left no durable footprint.
+  RECO_STORE="$WORKDIR/store/databases/$TARGET_DB/graphus.store"
+  RECO_WAL="$WORKDIR/store/databases/$TARGET_DB/graphus.wal"
+  # The logical dataset: the bytes the generator actually emitted (the amplification denominator).
+  LOGICAL_BYTES=0
+  for f in users.csv products.csv friends.csv purchased.csv; do
+    [ -f "$DATA_DIR/$f" ] && LOGICAL_BYTES=$((LOGICAL_BYTES + $(wc -c < "$DATA_DIR/$f")))
+  done
+  info "store: $RECO_STORE"
+  info "WAL dir: $RECO_WAL ; logical CSV: ${LOGICAL_BYTES} B"
   BENCH_OUT="$("$BENCH" \
     --socket "$SOCKET" --user "$ADMIN_USER" --password "$ADMIN_PW" --db "$TARGET_DB" \
     --server-pid "$SERVER_PID" --ladder "$LADDER" --ops-per-rung "$OPS_PER_RUNG" \
     --min-ops-per-client "$MIN_OPS_PER_CLIENT" \
     --users "$GEN_USERS" --products "$GEN_PRODUCTS" \
     --friends "$GEN_FRIENDS" --purchased "$GEN_PURCHASED" \
+    --store "$RECO_STORE" --wal "$RECO_WAL" --logical-bytes "$LOGICAL_BYTES" \
     --scenario "product-recommendations" --evidence-dir "$EVIDENCE_DIR" \
     --write-every-ms "$WRITE_EVERY_MS" 2>&1)" || true
   printf '%s\n' "$BENCH_OUT" | sed 's/^/  /'
@@ -450,6 +464,20 @@ else
     "$([ -f "$EVIDENCE_DIR/report.json" ] && echo yes || echo no)"
   assert "evidence report.md was produced" "yes" \
     "$([ -f "$EVIDENCE_DIR/report.md" ] && echo yes || echo no)"
+  # Evidence honesty (rmp #699): total_millis must be the LADDER's wall-time, and the storage section
+  # must carry the real store + WAL bytes — both were zero/near-zero before.
+  assert "report total_millis is the ladder wall-time (not the emitter's)" "yes" \
+    "$(python3 -c "
+import json,sys
+try: t = json.load(open('$EVIDENCE_DIR/report.json'))['total_millis']
+except Exception: print('no'); sys.exit()
+print('yes' if t >= 1000.0 else 'no')" 2>/dev/null || echo no)"
+  assert "report carries the real store + WAL footprint" "yes" \
+    "$(python3 -c "
+import json,sys
+try: s = json.load(open('$EVIDENCE_DIR/report.json'))['storage']
+except Exception: print('no'); sys.exit()
+print('yes' if s['store_bytes'] > 0 and s['wal_bytes'] > 0 else 'no')" 2>/dev/null || echo no)"
 
   # Persist the modern schema evidence into the evidence dir alongside the concurrency report.
   if [ -s "${SCHEMA_EVIDENCE_FILE:-/nonexistent}" ]; then

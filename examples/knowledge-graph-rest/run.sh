@@ -114,16 +114,13 @@ BATCH_SIZE="${KG_BATCH:-200}"
 MODE="$(harness_target_mode)"
 
 # The deterministic generator is needed in BOTH modes (it produces the graph + reference answers).
-if [ ! -x "$GEN" ]; then
-  section "Building the deterministic knowledge-graph generator (release)"
-  ( cd "$REPO_ROOT" && cargo build --release -p graphus-kg-gen --bin kg_gen )
-fi
+harness_build "the deterministic knowledge-graph generator (release)" \
+  --release -p graphus-kg-gen --bin kg_gen
 [ -x "$GEN" ] || { echo "${RED}fatal: kg_gen binary not found at $GEN${RESET}" >&2; exit 2; }
 
 # The server binary is needed ONLY in local mode (external attaches to a running instance).
-if [ "$MODE" = "local" ] && [ ! -x "$SERVER" ]; then
-  section "Building graphus-server (release)"
-  ( cd "$REPO_ROOT" && cargo build --release -p graphus-server )
+if [ "$MODE" = "local" ]; then
+  harness_build "graphus-server (release)" --release -p graphus-server
 fi
 if [ "$MODE" = "local" ]; then
   [ -x "$SERVER" ] || { echo "${RED}fatal: server binary not found at $SERVER${RESET}" >&2; exit 2; }
@@ -241,8 +238,11 @@ NODE_COUNT="$(grep -cE '^CREATE \(:' "$GRAPH_CYPHER" || true)"
 REL_COUNT="$(grep -cE 'CREATE \([a-z]\)-\[:' "$GRAPH_CYPHER" || true)"
 NODE_COUNT="${NODE_COUNT:-0}"
 REL_COUNT="${REL_COUNT:-0}"
-LOGICAL_GRAPH_BYTES=$(( NODE_COUNT * 256 + REL_COUNT * 128 ))
-info "dataset: $NODE_COUNT nodes, $REL_COUNT relationships"
+# The logical dataset is the bytes the generator ACTUALLY emitted — the honest denominator for the
+# amplification ratios. It used to be an invented `nodes*256 + rels*128` formula, which made the
+# published space_amplification a fabrication (rmp #699).
+LOGICAL_GRAPH_BYTES="$(wc -c < "$GRAPH_CYPHER" | tr -d ' ')"
+info "dataset: $NODE_COUNT nodes, $REL_COUNT relationships; logical graph.cypher: ${LOGICAL_GRAPH_BYTES} B"
 
 # Determinism check: regenerate and diff (the AC: byte-identical per seed/scale).
 GEN_OUT2_DIR="$WORKDIR/dataset2"
@@ -301,10 +301,11 @@ if [ "$RUN_REST" = "1" ] && [ "$MODE" = "external" ]; then
            --batch-size "$BATCH_SIZE" --clients "$CLIENTS" --ops-per-client "$OPS_PER_CLIENT")
   if _harness_target_insecure; then PY_ARGS+=(--insecure); fi
 
-  WORKLOAD_START="$(date +%s)"
+  WORKLOAD_START_MS="$(_harness_now_ms)"
   REST_OUT="$(python3 "$SCRIPT_DIR/data/discovery.py" "${PY_ARGS[@]}" 2>&1)" || true
+  WORKLOAD_MS=$(( $(_harness_now_ms) - WORKLOAD_START_MS ))
   printf '%s\n' "$REST_OUT" | sed 's/^/  /'
-  WORKLOAD_SECS=$(( $(date +%s) - WORKLOAD_START ))
+  WORKLOAD_SECS=$(( WORKLOAD_MS / 1000 ))
   [ "$WORKLOAD_SECS" -lt 1 ] && WORKLOAD_SECS=1
   assert "REST workload passed every assertion" "yes" \
     "$(printf '%s' "$REST_OUT" | grep -q 'GRAPHUS_KG_REST_OK' && echo yes || echo no)"
@@ -376,6 +377,9 @@ EOF
   fi
 
   section "Step 3 — knowledge-graph discovery over REST (python3 stdlib client)"
+  # Bracket the workload: the evidence binary runs AFTER it and cannot time it, so total_millis would
+  # otherwise be the report's own emission time (rmp #699).
+  WORKLOAD_START_MS="$(_harness_now_ms)"
   REST_OUT="$(python3 "$SCRIPT_DIR/data/discovery.py" \
     --base-url "https://127.0.0.1:$REST_PORT" \
     --user "$ADMIN_USER" \
@@ -387,6 +391,7 @@ EOF
     --batch-size "$BATCH_SIZE" \
     --clients "$CLIENTS" \
     --ops-per-client "$OPS_PER_CLIENT" 2>&1)" || true
+  WORKLOAD_MS=$(( $(_harness_now_ms) - WORKLOAD_START_MS ))
   printf '%s\n' "$REST_OUT" | sed 's/^/  /'
   assert "REST workload passed every assertion" "yes" \
     "$(printf '%s' "$REST_OUT" | grep -q 'GRAPHUS_KG_REST_OK' && echo yes || echo no)"
@@ -446,8 +451,7 @@ if [ "$RUN_REST" = "1" ] && [ "$MODE" = "external" ]; then
   section "Step 4 — server-side evidence via /metrics (external mode)"
   MEASURE_TGT="$BIN_DIR/measure_target"
   if [ ! -x "$MEASURE_TGT" ]; then
-    info "building the dev-only measure_target harness binary (debug)…"
-    ( cd "$REPO_ROOT" && cargo build -q -p graphus-examples-harness --bin measure_target ) || true
+    harness_build "the dev-only measure_target harness binary (debug)" -p graphus-examples-harness --bin measure_target
     MEASURE_TGT="$REPO_ROOT/target/debug/measure_target"
   fi
 
@@ -462,8 +466,9 @@ if [ "$RUN_REST" = "1" ] && [ "$MODE" = "external" ]; then
       --metrics-after "$METRICS_AFTER" \
       --nodes "$NODE_COUNT" \
       --rels "$REL_COUNT" \
+      --total-millis "${WORKLOAD_MS:-0}" \
       --workload-ops "${W_OPS:-0}" \
-      --workload-secs "$WORKLOAD_SECS" \
+      --workload-secs "${W_CONC_SECS:-$WORKLOAD_SECS}" \
       --p50-ms "${W_P50:-0}" \
       --p99-ms "${W_P99:-0}" \
       --p999-ms "${W_P999:-0}" \
@@ -513,8 +518,7 @@ elif [ "$RUN_REST" = "1" ] && [ "$MODE" = "local" ]; then
 
   MEASURE_BIN="$BIN_DIR/measure_server"
   if [ ! -x "$MEASURE_BIN" ]; then
-    info "building the dev-only measure_server harness binary (debug)…"
-    ( cd "$REPO_ROOT" && cargo build -q -p graphus-examples-harness --bin measure_server ) || true
+    harness_build "the dev-only measure_server harness binary (debug)" -p graphus-examples-harness --bin measure_server
     MEASURE_BIN="$REPO_ROOT/target/debug/measure_server"
   fi
 
@@ -531,11 +535,13 @@ elif [ "$RUN_REST" = "1" ] && [ "$MODE" = "local" ]; then
       --nodes "$NODE_COUNT" \
       --rels "$REL_COUNT" \
       --peak-rss-bytes "$PEAK_RSS_BYTES" \
+      --total-millis "${WORKLOAD_MS:-0}" \
       --workload-ops "${W_OPS:-0}" \
-      --workload-secs "$SERVER_UPTIME_SECS" \
+      --workload-secs "${W_CONC_SECS:-0}" \
       --p50-ms "${W_P50:-0}" \
       --p99-ms "${W_P99:-0}" \
       --p999-ms "${W_P999:-0}" \
+      --logical-bytes-written "$LOGICAL_GRAPH_BYTES" \
       --logical-graph-bytes "$LOGICAL_GRAPH_BYTES" \
       --param "profile=$PROFILE" \
       --param "connection=rest-https-jwt" \
@@ -552,7 +558,8 @@ elif [ "$RUN_REST" = "1" ] && [ "$MODE" = "local" ]; then
       --param "http_ops_per_sec=${W_OPS_PER_SEC:-0}" \
       --param "indexes_total=${W_INDEXES:-0}" \
       --param "constraints_total=${W_CONSTRAINTS:-0}" \
-      --note "Throughput is the concurrency driver's HTTP requests over the server uptime window (a coarse proxy); the per-request latency percentiles + the payload sizes per encoding (json_bytes/cbor_bytes/cbor_ratio) + the NDJSON streaming throughput are measured by the python client (GRAPHUS_STATS) and ride in as throughput inputs + workload params. Reads carry access_mode=READ so they engage the off-thread reader pool." \
+      --note "Throughput is the concurrency driver's HTTP requests over the window those requests were ACTUALLY ISSUED IN (concurrency_secs, measured by the python client) — it used to be divided by the whole server UPTIME, which silently understated req/s (rmp #699). The per-request latency percentiles + the payload sizes per encoding (json_bytes/cbor_bytes/cbor_ratio) + the NDJSON streaming throughput are likewise measured by the python client (GRAPHUS_STATS). Reads carry access_mode=READ so they engage the off-thread reader pool." \
+      --note "storage.* is the REAL on-disk footprint: the graphus.store image plus the graphus.wal DIRECTORY of segment files. The amplification ratios are those durable bytes over the generator's logical graph.cypher bytes — previously the denominator was an invented nodes*256 + rels*128 formula and write_amplification was left at a 0.0 placeholder (rmp #699)." \
       --note "Payload sizes per encoding (json_bytes, cbor_bytes, cbor_ratio) and the dataset size are DETERMINISTIC for a fixed seed+profile and are gated tightly; req/s, latency, CPU and RSS are machine-variant and are NOT gated (see kg_baseline_cmp)." \
       && info "evidence written to $EVIDENCE_DIR" \
       || info "evidence collection failed (non-fatal); see output above"
@@ -560,6 +567,20 @@ elif [ "$RUN_REST" = "1" ] && [ "$MODE" = "local" ]; then
       "$([ -f "$EVIDENCE_DIR/report.json" ] && echo yes || echo no)"
     assert "evidence report.md was produced" "yes" \
       "$([ -f "$EVIDENCE_DIR/report.md" ] && echo yes || echo no)"
+    # Evidence honesty (rmp #699): total_millis is the workload's wall-time, every throughput/latency
+    # field is really measured, and both amplification ratios are real (they were 0.0 placeholders).
+    assert "report evidence is honest (real total_millis, no zero-placeholder latency/throughput)" "yes" \
+      "$(python3 -c "
+import json,sys
+try: d = json.load(open('$EVIDENCE_DIR/report.json'))
+except Exception: print('no'); sys.exit()
+t, tp, st = d['total_millis'], d['throughput'], d['storage']
+ok = (t >= 1.0
+      and tp['ops_per_sec'] > 0.0
+      and tp['p50_latency_ms'] > 0.0 and tp['p99_latency_ms'] > 0.0 and tp['p999_latency_ms'] > 0.0
+      and st['store_bytes'] > 0 and st['wal_bytes'] > 0
+      and st['write_amplification'] > 0.0 and st['space_amplification'] > 0.0)
+print('yes' if ok else 'no')" 2>/dev/null || echo no)"
 
     # --------------------------------------------------------------------------------------------
     # Step 4b — regression gate vs committed baseline (fast profile only). Compares the STABLE
@@ -571,7 +592,7 @@ elif [ "$RUN_REST" = "1" ] && [ "$MODE" = "local" ]; then
       section "Step 4b — regression gate vs committed baseline"
       CMP_BIN="$BIN_DIR/kg_baseline_cmp"
       if [ ! -x "$CMP_BIN" ]; then
-        ( cd "$REPO_ROOT" && cargo build -q -p graphus-kg-gen --bin kg_baseline_cmp ) || true
+        harness_build "the kg_baseline_cmp gate (debug)" -p graphus-kg-gen --bin kg_baseline_cmp
         CMP_BIN="$REPO_ROOT/target/debug/kg_baseline_cmp"
       fi
       CMP_OUT="$("$CMP_BIN" "$BASELINE" "$EVIDENCE_DIR/report.json" 2>&1)" || true
@@ -589,7 +610,7 @@ elif [ "$RUN_REST" = "1" ] && [ "$MODE" = "local" ]; then
     if [ -s "$METRICS_BEFORE" ] && [ -s "$METRICS_AFTER" ]; then
       MEASURE_TGT="$BIN_DIR/measure_target"
       if [ ! -x "$MEASURE_TGT" ]; then
-        ( cd "$REPO_ROOT" && cargo build -q -p graphus-examples-harness --bin measure_target ) || true
+        harness_build "the dev-only measure_target harness binary (debug)" -p graphus-examples-harness --bin measure_target
         MEASURE_TGT="$REPO_ROOT/target/debug/measure_target"
       fi
       if [ -x "$MEASURE_TGT" ]; then
@@ -602,8 +623,9 @@ elif [ "$RUN_REST" = "1" ] && [ "$MODE" = "local" ]; then
           --metrics-after "$METRICS_AFTER" \
           --nodes "$NODE_COUNT" \
           --rels "$REL_COUNT" \
+          --total-millis "${WORKLOAD_MS:-0}" \
           --workload-ops "${W_OPS:-0}" \
-          --workload-secs "$SERVER_UPTIME_SECS" \
+          --workload-secs "${W_CONC_SECS:-0}" \
           --abort-rate 0.0 \
           --note "Companion to the co-located measure_server report.json in the parent evidence dir: this is the /metrics before→after counter delta for database '$TARGET_DB'. The process CPU/RSS + on-disk storage vectors live in the parent report (not here)." \
           >/dev/null 2>&1 \

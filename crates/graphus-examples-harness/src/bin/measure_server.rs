@@ -22,6 +22,7 @@
 //!   --store <store-file-or-dir> --wal <wal-file-or-dir> \
 //!   --nodes <u64> --rels <u64> \
 //!   [--peak-rss-bytes <u64>] \
+//!   [--total-millis <f64>] \
 //!   [--workload-ops <u64> --workload-secs <f64>] \
 //!   [--p50-ms <f64> --p99-ms <f64> --p999-ms <f64>] [--abort-rate <f64>] \
 //!   [--logical-bytes-written <u64>] [--logical-graph-bytes <u64>] \
@@ -34,6 +35,15 @@
 //! to `0.0` ("not measured") so an example that cannot supply them stays honest.
 //!
 //! [`ThroughputSection`]: graphus_examples_harness::ThroughputSection
+//!
+//! ## `--total-millis`: the workload's wall-time, not this binary's (`rmp #699`)
+//!
+//! This binary is invoked **after** the example's workload has already finished, so the collector
+//! cannot bracket it: a `start()`-to-`finish()` interval here measures the few hundredths of a
+//! millisecond spent *building the report*. Every example that calls this MUST therefore pass the
+//! workload wall-time it measured via `--total-millis`. When it is absent, `--workload-secs` (the
+//! timed throughput window) is used as the honest fallback; when neither is given, `total_millis`
+//! stays at `0.0` ("not measured") and a note records that — never a fabricated near-zero.
 //!
 //! Every flag is parsed defensively: a missing or malformed value is a hard error (the example must
 //! pass real measured inputs), but every *metric* the server cannot supply is honestly left at its
@@ -65,6 +75,10 @@ struct Args {
     /// RSS after teardown is unreadable, so the example samples it while alive and passes the high
     /// watermark here). `None` ⇒ fall back to the single end-of-run RSS read this binary takes.
     peak_rss_bytes: Option<u64>,
+    /// The workload's measured wall-time, in milliseconds. This binary runs *after* the workload, so
+    /// it cannot bracket it — see the module docs. `None` ⇒ fall back to `workload_secs`, else
+    /// "not measured".
+    total_millis: Option<f64>,
     workload_ops: Option<u64>,
     workload_secs: Option<f64>,
     /// Per-operation latency percentiles, in milliseconds, as measured by the example's driver.
@@ -123,6 +137,10 @@ fn main() -> ExitCode {
             .insert(k.clone(), v.clone());
     }
     collector.start();
+    // The workload already ran (and was timed) before this binary was invoked, so the collector could
+    // not bracket it: hand it the wall-time the example measured. Otherwise total_millis would time
+    // this report's own emission — a few hundredths of a millisecond that read as if measured.
+    collector.record_total_duration_from(args.total_millis, args.workload_secs);
 
     for (name, millis) in &args.phases {
         collector.phase(name.clone(), Duration::from_secs_f64(millis / 1_000.0));
@@ -235,6 +253,13 @@ fn parse_args() -> Result<Args, String> {
                     value()?
                         .parse()
                         .map_err(|e| format!("--peak-rss-bytes: {e}"))?,
+                );
+            }
+            "--total-millis" => {
+                args.total_millis = Some(
+                    value()?
+                        .parse()
+                        .map_err(|e| format!("--total-millis: {e}"))?,
                 );
             }
             "--workload-ops" => {

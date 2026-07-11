@@ -9,19 +9,32 @@
     },
     "workload": {
       "allow_cells": "7",
+      "auth_failures_delta": "1",
+      "backup_artifact_bytes": "24644",
+      "backup_ms": "0.040",
+      "clear_seed_ms": "34.8",
+      "clear_store_bytes": "81920",
       "connection": "rest-https-jwt+bolt-tcp-tls",
       "cross_tenant_empty": "0",
       "cross_tenant_probes": "4",
       "deny_cells": "7",
       "deny_checks": "3",
       "deny_supported": "true",
+      "enc_seed_ms": "39.6",
+      "enc_store_bytes": "98640",
       "encryption": "aes-256-gcm-at-rest",
       "matrix_cells": "15",
       "profile": "fast",
+      "restore_ms": "0.331",
+      "rotation_ms": "16.864",
+      "sealed_backup_bytes": "24700",
+      "seeded_statements": "410",
+      "tenant_store_bytes": "205500",
+      "tenant_wal_bytes": "535532",
       "tenants": "2",
       "unauth_cells": "1"
     },
-    "started_unix_secs": 1783717879
+    "started_unix_secs": 1783750878
   },
   "host": {
     "os": "linux",
@@ -29,39 +42,46 @@
     "cpu_cores": 16,
     "hostname": "ROG",
     "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
-    "timestamp_unix_secs": 1783717879
+    "timestamp_unix_secs": 1783750878
   },
-  "total_millis": 0.046653999999999994,
+  "total_millis": 3362.0,
   "phases": [],
   "cpu": {
-    "user_secs": 0.21,
-    "system_secs": 0.15,
-    "mean_core_utilisation": 0.36
+    "user_secs": 0.83,
+    "system_secs": 0.21,
+    "mean_core_utilisation": 0.20800000000000002
   },
   "memory": {
-    "peak_rss_bytes": 215535616,
-    "final_rss_bytes": 215535616
+    "peak_rss_bytes": 258580480,
+    "final_rss_bytes": 258580480
   },
   "storage": {
     "store_bytes": 106860,
-    "wal_bytes": 269417,
+    "wal_bytes": 273107,
     "store_pages": 14,
-    "wal_pages": 33,
-    "bytes_fsynced": 269417,
-    "write_amplification": 0.0,
-    "space_amplification": 4.4811952172256095
+    "wal_pages": 34,
+    "bytes_fsynced": 273107,
+    "write_amplification": 11.058410942956927,
+    "space_amplification": 11.058410942956927,
+    "bytes_per_node": 0.0,
+    "bytes_per_relationship": 0.0,
+    "plateau_ratio": 0.0
   },
   "throughput": {
-    "operations": 410,
-    "ops_per_sec": 410.0,
-    "p50_latency_ms": 0.0,
-    "p99_latency_ms": 0.0,
-    "p999_latency_ms": 0.0,
+    "operations": 46,
+    "ops_per_sec": 96.73884927035775,
+    "p50_latency_ms": 4.4451,
+    "p99_latency_ms": 52.4342,
+    "p999_latency_ms": 52.4342,
     "abort_rate": 0.0
   },
   "measurement_mode": "local",
   "notes": [
     "storage.bytes_fsynced is a proxy: the WAL on-disk byte count (every committed WAL byte is fsynced before commit acknowledgement), not a directly-observed fsync counter.",
-    "COMMITTED BASELINE (rmp #696): the fast-profile reference for the LOCAL regression gate. Only the DETERMINISTIC structural metrics \u2014 dataset size and the on-disk store/WAL footprint of a REAL TENANT database (databases/tenant_a/graphus.store, NOT the empty default 'graphus' db) \u2014 are gated (15% band) by sec_baseline_cmp; the machine-variant families (CPU, peak RSS, latency, throughput, and the single-run encryption-overhead timing) are NOT gated. Recorded on linux/x86_64 against the current build (DENY supported; the tenant store includes the DENY seed + RBAC WRITE probes)."
+    "STORAGE FIX (rmp #696): the primary storage section meters a REAL tenant database store (tenant_a/graphus.store), not the empty default 'graphus' db; the all-tenants store/WAL SUM rides in as tenant_store_bytes/tenant_wal_bytes params.",
+    "OVERHEAD FIX (rmp #696): enc_store_bytes vs clear_store_bytes now measure two ISOLATED databases (overhead_enc / overhead_clear) each seeded with the IDENTICAL tenant_a dataset, so the delta is purely per-page GCM overhead (apples-to-apples); the timing is a coarse single-run figure.",
+    "RBAC allow/deny/cross-tenant/DENY matrix asserted over BOTH REST and Bolt from one deterministic manifest; the hermetic security_verify proved ciphertext-on-disk, offline key rotation and the encrypted backup roundtrip.",
+    "graphus_auth_failures_total moved by 1 over the window. CONFIRMED server finding: REST DATA-PLANE 401s (missing/invalid Bearer on /db/*/tx/commit) and /auth/login failures do NOT increment this counter (they only emit an audit record via RestAuthObserver); only Bolt auth failures and the /metrics-endpoint auth gate bump it. The demo bumps it with a deliberate bad-Bearer GET /metrics (an unauthenticated request that IS rejected) plus, when the Bolt leg runs, the unauthenticated Bolt connection.",
+    "Live measurement of graphus-server pid 202651 over 5.000s uptime; CPU is the server's cumulative since-boot usage (the process is dedicated to this workload), RSS is sampled from the live process."
   ]
 }
