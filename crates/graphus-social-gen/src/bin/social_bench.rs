@@ -2222,6 +2222,13 @@ fn write_evidence(
         if args.store_path.is_some() {
             w.insert("store_bytes".into(), store_bytes.to_string());
             w.insert("wal_bytes".into(), wal_bytes.to_string());
+            // The cumulative redo written vs. the WAL retained on disk — proves the redo log is
+            // recycled, not accumulated (`rmp` #702). `wal_cumulative_bytes` is derived from the
+            // highest `seg.<lsn>` frontier and so survives the reclaimed prefix's deletion.
+            w.insert(
+                "wal_cumulative_bytes".into(),
+                fp.wal_cumulative_bytes.max(wal_bytes).to_string(),
+            );
         }
         // Headline results (machine-variant, informational).
         w.insert("best_clients".into(), best.clients.to_string());
@@ -2515,13 +2522,33 @@ fn write_evidence(
             mib(fp.data_bytes), mib(fp.dwb_bytes), mib(fp.wal_bytes), mib(fp.other_bytes),
         ));
         if fp.data_bytes > 0 {
+            // `wal_cumulative_bytes` is the highest `seg.<lsn>` frontier — every redo byte the log has
+            // appended over the run, still recoverable after the reclaimed prefix segments were deleted.
+            // `wal_bytes` is what is RETAINED on disk now. Their gap is exactly the WAL that was recycled.
+            let cumulative = fp.wal_cumulative_bytes.max(fp.wal_bytes);
+            let reclaimed = cumulative.saturating_sub(fp.wal_bytes);
+            let reclaimed_pct = if cumulative > 0 {
+                100.0 * reclaimed as f64 / cumulative as f64
+            } else {
+                0.0
+            };
             collector.note(format!(
-                "STORAGE EFFICIENCY: the redo log is {:.1}x the data image it protects ({:.1}MiB WAL vs {:.1}MiB \
-                 data) — it is not checkpointed away over this run. The doublewrite buffers are a FIXED preallocation \
-                 ({:.1}MiB total, one per database, independent of graph size), so on a small graph they dominate the \
-                 footprint while on a large one they amortise to nothing.",
+                "STORAGE EFFICIENCY: the redo log RETAINS {:.1}MiB on disk = {:.1}x the {:.1}MiB data image it \
+                 protects, having WRITTEN {:.1}MiB of cumulative redo over the run — so {:.1}MiB ({:.0}%) was \
+                 RECYCLED, not accumulated. The Mode A bulk-load's redo is reclaimed at load end (`rmp` #579) and \
+                 the WAL segment target is sized to the store (`rmp` #706), so sealed segments below the checkpoint \
+                 floor are freed instead of retained; what remains is the recent redo tail, not the whole log \
+                 (before those fixes the same workload held ~9.3x and grew monotonically, `rmp` #702). The \
+                 doublewrite buffers are a FIXED preallocation ({:.1}MiB total, one per database, independent of \
+                 graph size), so on a small graph they dominate the footprint while on a large one they amortise to \
+                 nothing.",
+                mib(fp.wal_bytes),
                 fp.wal_bytes as f64 / fp.data_bytes as f64,
-                mib(fp.wal_bytes), mib(fp.data_bytes), mib(fp.dwb_bytes),
+                mib(fp.data_bytes),
+                mib(cumulative),
+                mib(reclaimed),
+                reclaimed_pct,
+                mib(fp.dwb_bytes),
             ));
         }
         if args.logical_bytes > 0 && fp.data_bytes > 0 {
@@ -2567,8 +2594,17 @@ struct StoreFootprint {
     data_bytes: u64,
     /// The doublewrite buffers (`graphus.dwb`) — preallocated, fixed size, one per database.
     dwb_bytes: u64,
-    /// The redo log (`graphus.wal/seg.<lsn>`).
+    /// The redo log (`graphus.wal/seg.<lsn>`) currently ON DISK — i.e. after reclamation.
     wal_bytes: u64,
+    /// The CUMULATIVE redo the WAL has written over the run — the highest durable LSN, recovered
+    /// from the highest `seg.<lsn>` base offset plus that segment's size (`rmp` #702). A segment name
+    /// IS its base byte-offset in the logical log, and reclamation only ever *deletes* whole sealed
+    /// segments below the checkpoint floor — it never rewrites the frontier — so the last segment's
+    /// `(base_lsn + size)` still equals every byte the log has ever appended, even after the prefix
+    /// was freed. This lets the report *prove* WAL recycling from its own on-disk state: `wal_bytes`
+    /// (retained) far below `wal_cumulative_bytes` (written) means the redo log is recycled, not
+    /// accumulated. Equal values mean nothing was reclaimed (a workload below the seal threshold).
+    wal_cumulative_bytes: u64,
     /// Catalog/lock/config leftovers (`databases.toml`, `security.toml`, `store.lock`, …).
     other_bytes: u64,
 }
@@ -2594,6 +2630,14 @@ fn du_store(path: &str) -> StoreFootprint {
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.to_ascii_lowercase().contains(needle))
     }
+    // The cumulative-redo frontier: `seg.<lsn>` names the segment's base byte-offset in the logical
+    // log, so `base_lsn + size` of the *highest* segment is the total redo the WAL has ever appended,
+    // recoverable even after the reclaimed prefix segments were deleted (`rmp` #702).
+    fn segment_frontier(p: &std::path::Path) -> Option<u64> {
+        let name = p.file_name()?.to_str()?;
+        let lsn = name.strip_prefix("seg.")?;
+        lsn.parse::<u64>().ok()
+    }
     fn walk(dir: &std::path::Path, in_wal: bool, fp: &mut StoreFootprint) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
@@ -2607,6 +2651,9 @@ fn du_store(path: &str) -> StoreFootprint {
                 let len = meta.len();
                 if wal_here {
                     fp.wal_bytes += len;
+                    if let Some(base_lsn) = segment_frontier(&p) {
+                        fp.wal_cumulative_bytes = fp.wal_cumulative_bytes.max(base_lsn + len);
+                    }
                 } else if name_contains(&p, ".dwb") {
                     fp.dwb_bytes += len;
                 } else if name_contains(&p, ".store") {
@@ -3126,6 +3173,55 @@ mod tests {
             fp.store_bytes(),
             4096 + 1024 + 64,
             "store_bytes = everything that is not WAL"
+        );
+        // The cumulative-redo frontier is `max(base_lsn + size)` over the segments (`rmp` #702):
+        // max(8 + 8192, 9 + 256) = 8200 — the higher of the two segment end-offsets.
+        assert_eq!(
+            fp.wal_cumulative_bytes,
+            8 + 8192,
+            "wal_cumulative_bytes = the highest seg.<lsn> frontier (base_lsn + size)"
+        );
+    }
+
+    /// `rmp` #702: the redo-log RECYCLING that `rmp` #706/#579 deliver must be *provable from the
+    /// evidence itself*. After the reclaimed prefix segments are deleted, only a tail segment remains
+    /// on disk, but its `seg.<lsn>` name still encodes its base byte-offset — so `du_store` recovers the
+    /// full cumulative redo the log ever wrote and the report can show `retained ≪ written`. This test
+    /// pins that: a store whose WAL wrote 12 MiB of redo but had its 10 MiB prefix reclaimed must report
+    /// 2 MiB retained and 12 MiB cumulative (a 10 MiB, 83% reclaim), never a lie in either direction.
+    #[test]
+    fn du_store_cumulative_redo_proves_wal_reclamation() {
+        let root = std::env::temp_dir().join(format!("gsocial-du-reclaim-{}", std::process::id()));
+        let wal = root.join("databases").join("socialdb").join("graphus.wal");
+        std::fs::create_dir_all(&wal).expect("layout");
+
+        // A reclaimed WAL: the 10 MiB prefix (seg.0 .. seg.10485760) was freed on a checkpoint; only
+        // the tail segment — based at LSN 10 MiB, 2 MiB long — remains. Contiguous, non-overlapping.
+        const TEN_MIB: u64 = 10 * 1024 * 1024;
+        const TWO_MIB: usize = 2 * 1024 * 1024;
+        std::fs::write(wal.join(format!("seg.{TEN_MIB:020}")), vec![0u8; TWO_MIB])
+            .expect("tail seg");
+
+        let fp = du_store(root.to_str().expect("utf8"));
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(
+            fp.wal_bytes, TWO_MIB as u64,
+            "only the un-reclaimed tail segment is retained on disk"
+        );
+        assert_eq!(
+            fp.wal_cumulative_bytes,
+            TEN_MIB + TWO_MIB as u64,
+            "the tail segment's base LSN recovers the full 12 MiB of redo ever written"
+        );
+        let reclaimed = fp.wal_cumulative_bytes - fp.wal_bytes;
+        assert_eq!(
+            reclaimed, TEN_MIB,
+            "10 MiB of superseded redo was recycled, not accumulated (rmp #706/#579)"
+        );
+        assert!(
+            fp.wal_cumulative_bytes > fp.wal_bytes,
+            "a reclaimed WAL must report written > retained, or the report cannot prove recycling"
         );
     }
 }
