@@ -44,15 +44,24 @@ use graphus_io::{BlockDevice, PAGE_SIZE};
 use graphus_wal::LogSink;
 
 use crate::node::{
-    CELL_LIMIT, Cell, NodeMut, NodeView, PAGE_TYPE_BTREE_INTERNAL, PAGE_TYPE_BTREE_LEAF,
-    PAGE_TYPE_BTREE_META, SLOT_DIR_START,
+    CELL_LIMIT, Cell, FREE_NEXT_OFF, NodeMut, NodeView, PAGE_TYPE_BTREE_INTERNAL,
+    PAGE_TYPE_BTREE_LEAF, PAGE_TYPE_BTREE_META, SLOT_DIR_START,
 };
 use crate::recovery::{SharedWal, encode_patch};
 
 /// Offset of the meta payload (root page id) within the meta page.
 const META_ROOT_OFF: usize = HEADER_SIZE; // u64 root page id (0 = no root yet)
 const META_VERSION_OFF: usize = HEADER_SIZE + 8; // u32 format version
-const BTREE_FORMAT_VERSION: u32 = 1;
+/// Offset of the persistent free-list head (`rmp` #225): the device page id of the first freed page,
+/// `0` = the free list is empty. Present only in format version `2`; a version-`1` meta page has no
+/// such field (the allocator was append-only), so [`BTree::open`] treats it as `0` for `v1`.
+const META_FREE_HEAD_OFF: usize = HEADER_SIZE + 12; // u64 free-list head (0 = empty), v2+
+/// Format version `1` had `{ root:u64, version:u32 }` and an append-only allocator (no free list).
+/// Version `2` appends the [`META_FREE_HEAD_OFF`] free-list head and is what fresh trees write; a
+/// `v1` meta page still opens (its free list is taken to be empty — the pre-#225 behaviour).
+const BTREE_FORMAT_VERSION: u32 = 2;
+/// The first format version that carries a persistent free-list head (`rmp` #225).
+const BTREE_FORMAT_VERSION_FREELIST: u32 = 2;
 
 /// Byte offset of the `page_type` word within the frozen 24-byte page header (`05 §6`). The
 /// bufpool keeps this private, so it is re-stated here to WAL-log the meta page's type byte (and is
@@ -65,6 +74,52 @@ const SYSTEM_TXN: TxnId = TxnId(u64::MAX);
 
 /// The page within a tree's space that always holds its meta record.
 const META_PAGE_REL: u64 = 0;
+
+/// Which child pointer of an internal node leads to a given descendant (`rmp` #225 reclamation
+/// navigation): the internal `leftmost_child` (`P0`) or the child of slot `i`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildRef {
+    /// The `leftmost_child` (`P0`) — the child holding keys `< key[0]`.
+    Leftmost,
+    /// The child of slot `i` — the child holding keys `>= key[i]` and `< key[i+1]`.
+    Slot(usize),
+}
+
+/// The parent-tracking descent path from the root down to (but not including) a target leaf: each
+/// element is an internal node and the child pointer taken out of it toward the leaf. The last
+/// element is the leaf's immediate parent. Empty when the leaf is the root. Used by empty-leaf
+/// reclamation to locate the separator to detach and the chain predecessor to re-link (`rmp` #225).
+type DescentPath = Vec<(PageId, ChildRef)>;
+
+/// The order in which the four empty-leaf-unlink WAL patches are emitted (`rmp` #225). Production
+/// always uses [`ReclaimOrder::Correct`]; the crash campaign also drives [`ReclaimOrder::PublishFirst`]
+/// to prove the ordering is load-bearing — a mis-ordered publish makes an intermediate durable state
+/// that is both reachable AND free-listed, which the recovery invariant then catches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReclaimOrder {
+    /// detach-from-parent → re-link sibling chain → mark-page-free → publish-free-list-head. The
+    /// publish is strictly last, after the page is unreachable, so no prefix is reachable+free-listed.
+    Correct,
+    /// mark-page-free → publish-free-list-head → detach-from-parent → re-link chain. Publishes the
+    /// page onto the free list while it is *still reachable* — the deliberately unsafe ordering the
+    /// crash campaign uses to prove its recovery invariant has teeth. Only ever constructed by the
+    /// `dst`-gated [`BTree::reclaim_leaf_crash_inject`]; production reclamation is always `Correct`.
+    #[cfg_attr(not(feature = "dst"), allow(dead_code))]
+    PublishFirst,
+}
+
+/// One of the four single-page patches that unlink an empty leaf (`rmp` #225).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnlinkStep {
+    /// (a) Remove the leaf's separator/child pointer from its parent.
+    Detach,
+    /// (b) Re-link the leaf chain so the predecessor leaf skips the empty leaf.
+    Relink,
+    /// (c) Overwrite the leaf as a canonical free page whose successor is the current free-list head.
+    MarkFree,
+    /// (d) Publish the leaf as the new free-list head in the meta page.
+    Publish,
+}
 
 /// A B+-tree over a buffer pool, with WAL-logged mutations recoverable by ARIES.
 ///
@@ -158,17 +213,18 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
             page::set_page_type(p, PAGE_TYPE_BTREE_META);
             page::set_page_lsn(p, lsn_t);
         }
-        // Log the meta payload.
-        let pre = self.pool.page(f)[META_ROOT_OFF..META_VERSION_OFF + 4].to_vec();
-        let mut post = Vec::with_capacity(12);
+        // Log the meta payload: root(u64) | version(u32) | free_head(u64). Version 2 (`rmp` #225)
+        // appends the free-list head (`0` = empty); one contiguous patch keeps the write atomic.
+        let pre = self.pool.page(f)[META_ROOT_OFF..META_FREE_HEAD_OFF + 8].to_vec();
+        let mut post = Vec::with_capacity(20);
         post.extend_from_slice(&0u64.to_le_bytes()); // root = none
         post.extend_from_slice(&BTREE_FORMAT_VERSION.to_le_bytes());
+        post.extend_from_slice(&0u64.to_le_bytes()); // free_head = none
         let redo = encode_patch(META_ROOT_OFF, &post);
         let undo = encode_patch(META_ROOT_OFF, &pre);
         let lsn = self.wal.with(|w| w.log_update(txn, self.base, redo, undo));
         let p = self.pool.page_mut(f);
-        p[META_ROOT_OFF..META_ROOT_OFF + 8].copy_from_slice(&post[0..8]);
-        p[META_VERSION_OFF..META_VERSION_OFF + 4].copy_from_slice(&post[8..12]);
+        p[META_ROOT_OFF..META_FREE_HEAD_OFF + 8].copy_from_slice(&post);
         page::set_page_lsn(p, lsn);
         self.pool.unpin(f);
         Ok(())
@@ -191,8 +247,13 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
                 "B+-tree base page is not a meta page".to_owned(),
             ));
         }
+        // Accept every version this build understands. Version 1 (pre-#225, append-only allocator)
+        // has no free-list head; version 2 appends it. A `v1` page opened here keeps working — its
+        // free list is simply empty and stays append-only until the meta page is upgraded to `v2`
+        // (which the next structural write does, see `ensure_meta_v2`). An unknown/newer version is
+        // rejected rather than silently mis-decoded (forward-incompatible on-disk format).
         let version = read_u32(p, META_VERSION_OFF);
-        if version != BTREE_FORMAT_VERSION {
+        if !(1..=BTREE_FORMAT_VERSION).contains(&version) {
             pool.unpin(f);
             return Err(GraphusError::Storage(format!(
                 "unsupported B+-tree format version {version}"
@@ -357,11 +418,105 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
         }
     }
 
-    /// Allocates a fresh page through the pool, tracking the high-water mark for [`Self::mapped_pages`].
-    fn alloc_page(&mut self) -> Result<(graphus_bufpool::FrameId, PageId)> {
+    /// Allocates a page for `txn`, **reusing a freed page from the persistent free list before
+    /// extending the device** (`rmp` #225). Popping a free page and extending are byte-for-byte
+    /// interchangeable to every caller: both return a pinned frame whose payload is zeroed and whose
+    /// WAL undo image reverts it to its prior on-disk state (a fresh page reverts to zeros, which a
+    /// reopen skips as an orphan; a reused page reverts to its free-page image, back on the free
+    /// list). The high-water mark only advances on the extend path, so a delete-without-reinsert
+    /// workload on a monotonic key space now reuses the pages its drained leaves freed instead of
+    /// stranding one per leaf for the database lifetime.
+    fn alloc_page(&mut self, txn: TxnId) -> Result<(graphus_bufpool::FrameId, PageId)> {
+        if let Some((f, id)) = self.pop_free_page(txn)? {
+            return Ok((f, id));
+        }
         let (f, id) = self.pool.new_page()?;
         self.max_page = self.max_page.max(id.0);
         Ok((f, id))
+    }
+
+    /// Reads the durable free-list head from the meta page (`0` = the free list is empty, which a
+    /// version-1 meta page — no free-list field — always reports).
+    fn meta_free_head(&mut self) -> Result<u64> {
+        let f = self.pool.fetch(self.base)?;
+        let p = self.pool.page(f);
+        let version = read_u32(p, META_VERSION_OFF);
+        let head = if version >= BTREE_FORMAT_VERSION_FREELIST {
+            read_u64(p, META_FREE_HEAD_OFF)
+        } else {
+            0
+        };
+        self.pool.unpin(f);
+        Ok(head)
+    }
+
+    /// WAL-logs a change of the meta page's free-list head to `new_head` under `txn`, upgrading a v1
+    /// meta page to v2 first so the field is honoured on reopen.
+    fn set_meta_free_head(&mut self, txn: TxnId, new_head: u64) -> Result<()> {
+        self.ensure_meta_v2(txn)?;
+        let f = self.pool.fetch(self.base)?;
+        let pre = self.pool.page(f)[META_FREE_HEAD_OFF..META_FREE_HEAD_OFF + 8].to_vec();
+        let post = new_head.to_le_bytes().to_vec();
+        let redo = encode_patch(META_FREE_HEAD_OFF, &post);
+        let undo = encode_patch(META_FREE_HEAD_OFF, &pre);
+        let lsn = self.wal.with(|w| w.log_update(txn, self.base, redo, undo));
+        let p = self.pool.page_mut(f);
+        p[META_FREE_HEAD_OFF..META_FREE_HEAD_OFF + 8].copy_from_slice(&post);
+        page::set_page_lsn(p, lsn);
+        self.pool.unpin(f);
+        Ok(())
+    }
+
+    /// Upgrades a version-1 meta page (which predates the free list) to version 2 in place
+    /// (WAL-logged), initialising the free-list head to `0`. A no-op once the page is already v2+.
+    /// Called before the first free-list publish so a pre-#225 on-disk tree starts reclaiming pages.
+    fn ensure_meta_v2(&mut self, txn: TxnId) -> Result<()> {
+        let f = self.pool.fetch(self.base)?;
+        if read_u32(self.pool.page(f), META_VERSION_OFF) >= BTREE_FORMAT_VERSION_FREELIST {
+            self.pool.unpin(f);
+            return Ok(());
+        }
+        // version:u32 @ META_VERSION_OFF, free_head:u64 @ META_FREE_HEAD_OFF — one contiguous patch.
+        let pre = self.pool.page(f)[META_VERSION_OFF..META_FREE_HEAD_OFF + 8].to_vec();
+        let mut post = Vec::with_capacity(12);
+        post.extend_from_slice(&BTREE_FORMAT_VERSION.to_le_bytes());
+        post.extend_from_slice(&0u64.to_le_bytes());
+        let redo = encode_patch(META_VERSION_OFF, &post);
+        let undo = encode_patch(META_VERSION_OFF, &pre);
+        let lsn = self.wal.with(|w| w.log_update(txn, self.base, redo, undo));
+        let p = self.pool.page_mut(f);
+        p[META_VERSION_OFF..META_FREE_HEAD_OFF + 8].copy_from_slice(&post);
+        page::set_page_lsn(p, lsn);
+        self.pool.unpin(f);
+        Ok(())
+    }
+
+    /// Pops the free-list head page and hands it back as a clean zeroed frame, or `None` if the free
+    /// list is empty. Two WAL patches under `txn`: (1) advance `meta.free_head` to the popped page's
+    /// successor, then (2) zero the popped page's payload with its free-page image as the undo, so a
+    /// rollback threads the page back onto the free list (undo restores the image, then restores the
+    /// head). Ordering is safe under partial durability: the page is not reachable from the tree
+    /// until a caller links it in (logged later), so no prefix leaves it both reachable and free.
+    fn pop_free_page(&mut self, txn: TxnId) -> Result<Option<(graphus_bufpool::FrameId, PageId)>> {
+        let head = self.meta_free_head()?;
+        if head == 0 {
+            return Ok(None);
+        }
+        let id = PageId(head);
+        let f = self.pool.fetch(id)?;
+        let next = read_u64(self.pool.page(f), FREE_NEXT_OFF);
+        // (1) Unlink from the free list.
+        self.set_meta_free_head(txn, next)?;
+        // (2) Repurpose to a zeroed page; undo image is the free-page payload (restores it on abort).
+        let zero_payload = vec![0u8; PAGE_SIZE - HEADER_SIZE];
+        let pre = self.pool.page(f)[HEADER_SIZE..PAGE_SIZE].to_vec();
+        let redo = encode_patch(HEADER_SIZE, &zero_payload);
+        let undo = encode_patch(HEADER_SIZE, &pre);
+        let lsn = self.wal.with(|w| w.log_update(txn, id, redo, undo));
+        let p = self.pool.page_mut(f);
+        p[HEADER_SIZE..PAGE_SIZE].copy_from_slice(&zero_payload);
+        page::set_page_lsn(p, lsn);
+        Ok(Some((f, id)))
     }
 
     // --------------------------------------------------------------------- read
@@ -643,7 +798,15 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
             n.compact();
         }
         self.log_and_apply_payload(txn, leaf, f, &scratch)?;
+        let emptied = NodeView::new(&scratch).slot_count() == 0;
         self.pool.unpin(f);
+        // Whole-page reclamation (`rmp` #225): a delete that drains a non-root leaf to empty unlinks
+        // its page and returns it to the persistent free list, so a delete-without-reinsert workload
+        // on a monotonic key space reuses drained pages instead of stranding them for the database
+        // lifetime. Crash-safe by construction (see [`Self::reclaim_empty_leaf`]).
+        if emptied && leaf != root {
+            self.reclaim_empty_leaf(txn, leaf, key)?;
+        }
         Ok(true)
     }
 
@@ -745,7 +908,7 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
         let (left_cells, right_cells) = cells.split_at(mid);
 
         // Allocate the new right leaf.
-        let (rf, right_id) = self.alloc_page()?;
+        let (rf, right_id) = self.alloc_page(txn)?;
         {
             let mut rn = NodeMut::new(self.pool.page_mut(rf));
             rn.init(0);
@@ -814,7 +977,7 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
         let right_cells = cells[mid + 1..].to_vec();
 
         // New right internal node.
-        let (rf, right_id) = self.alloc_page()?;
+        let (rf, right_id) = self.alloc_page(txn)?;
         {
             let mut rn = NodeMut::new(self.pool.page_mut(rf));
             rn.init(level);
@@ -861,7 +1024,7 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
             self.pool.unpin(f);
             l
         };
-        let (nf, new_root) = self.alloc_page()?;
+        let (nf, new_root) = self.alloc_page(txn)?;
         {
             let mut n = NodeMut::new(self.pool.page_mut(nf));
             n.init(old_level + 1);
@@ -882,7 +1045,7 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
 
     /// Creates the first (leaf) root.
     fn create_root(&mut self, txn: TxnId) -> Result<PageId> {
-        let (f, root) = self.alloc_page()?;
+        let (f, root) = self.alloc_page(txn)?;
         {
             let mut n = NodeMut::new(self.pool.page_mut(f));
             n.init(0);
@@ -907,6 +1070,554 @@ impl<D: BlockDevice, S: LogSink> BTree<D, S> {
         page::set_page_lsn(p, lsn);
         self.pool.unpin(f);
         self.root = Some(root);
+        Ok(())
+    }
+
+    // -------------------------------------------------- page reclamation (#225)
+
+    /// Reclaims an emptied leaf's page back onto the persistent free list (`rmp` #225).
+    ///
+    /// Triggered by [`Self::delete`] when a delete drains its leaf to zero entries (and the leaf is
+    /// not the root). The leaf is unlinked by **four single-page WAL patches in strict order**:
+    /// (a) detach it from its parent (remove the separator) → (b) re-link the leaf chain so the
+    /// predecessor leaf skips it → (c) mark its page a canonical free page whose successor is the
+    /// current free-list head → (d) publish it as the new free-list head. The publish is strictly
+    /// **after** the page is unreachable, so at every durable prefix the page is either reachable
+    /// (not yet free-listed) or unreachable — **never both reachable and free-listed**. A crash
+    /// mid-sequence therefore degrades to a stranded page (today's safe behaviour) or, under the same
+    /// transaction's atomicity, to the leaf fully present (ARIES undo resurrects it) — never to
+    /// corruption.
+    ///
+    /// Edge cases: the leftmost-child leaf takes its chain predecessor from a *different* parent
+    /// (cross-parent, via [`Self::predecessor_leaf`]); a parent that loses its last child is itself
+    /// reclaimed one level up (no key borrow/merge — this is not a rebalance); a single-child internal
+    /// root collapses onto its child ([`Self::collapse_root`]).
+    ///
+    /// Reclamation is **best-effort for safety**: if navigation does not land on the expected empty
+    /// leaf, the call is a no-op (the page stays stranded — safe — rather than risk touching the
+    /// wrong page).
+    ///
+    /// # Errors
+    /// Propagates a buffer-pool or WAL failure.
+    fn reclaim_empty_leaf(&mut self, txn: TxnId, leaf: PageId, key: &[u8]) -> Result<()> {
+        let (path, found) = self.descend_tracking_path(key)?;
+        // Safety guard: only reclaim when the deleted key still routes to *this* leaf and the leaf has
+        // a parent (never reclaim the root leaf). Otherwise leave the page in place (stranded, safe).
+        if found != leaf || path.is_empty() {
+            return Ok(());
+        }
+        let still_empty = {
+            let f = self.pool.fetch(leaf)?;
+            let e = NodeView::new(self.pool.page(f)).slot_count() == 0;
+            self.pool.unpin(f);
+            e
+        };
+        if !still_empty {
+            return Ok(());
+        }
+        let pred = self.predecessor_leaf(&path)?;
+        let right = self.right_sibling_of(leaf)?;
+        let (par, ref_to_leaf) = *path.last().expect("path is non-empty");
+        let mut emptied = self.unlink_node(
+            txn,
+            leaf,
+            par,
+            ref_to_leaf,
+            pred,
+            right,
+            true,
+            ReclaimOrder::Correct,
+            usize::MAX,
+        )?;
+        // Parent-emptying: an internal ancestor that just lost its last child is reclaimed one level
+        // up. Walk the descent path upward; each step detaches the now-childless node from its parent.
+        let mut idx = path.len() - 1; // `par` == path[idx].0
+        while emptied {
+            if idx == 0 {
+                // The now-childless node's parent is the root; `collapse_root` handles it. (Defensive:
+                // this should not arise — a single-child internal root is collapsed before it can be
+                // emptied — but never leave a childless internal node linked.)
+                break;
+            }
+            let node = path[idx].0;
+            let (gp, ref_to_node) = path[idx - 1];
+            let node_right = self.right_sibling_of(node)?;
+            emptied = self.unlink_node(
+                txn,
+                node,
+                gp,
+                ref_to_node,
+                None,
+                node_right,
+                false,
+                ReclaimOrder::Correct,
+                usize::MAX,
+            )?;
+            idx -= 1;
+        }
+        self.collapse_root(txn)?;
+        Ok(())
+    }
+
+    /// Deterministic crash-injection seam for the page-reclamation campaign (`rmp` #225): unlink the
+    /// empty `leaf` emitting only the first `max_steps` of the four patches, in the given order —
+    /// [`ReclaimOrder::Correct`] or the deliberately unsafe [`ReclaimOrder::PublishFirst`]. It never
+    /// recurses (the campaign builds a scenario whose parent keeps ≥1 child), so it exercises exactly
+    /// the single-leaf four-patch unlink at each boundary. Production never reaches this — it is gated
+    /// behind the `dst` feature and used only by `tests/reclaim_crash_dst.rs`.
+    ///
+    /// # Errors
+    /// Propagates a buffer-pool or WAL failure.
+    #[cfg(feature = "dst")]
+    pub fn reclaim_leaf_crash_inject(
+        &mut self,
+        txn: TxnId,
+        leaf: PageId,
+        key: &[u8],
+        publish_first: bool,
+        max_steps: usize,
+    ) -> Result<()> {
+        let (path, found) = self.descend_tracking_path(key)?;
+        if found != leaf || path.is_empty() {
+            return Ok(());
+        }
+        let pred = self.predecessor_leaf(&path)?;
+        let right = self.right_sibling_of(leaf)?;
+        let (par, ref_to_leaf) = *path.last().expect("path is non-empty");
+        let order = if publish_first {
+            ReclaimOrder::PublishFirst
+        } else {
+            ReclaimOrder::Correct
+        };
+        let _ = self.unlink_node(
+            txn,
+            leaf,
+            par,
+            ref_to_leaf,
+            pred,
+            right,
+            true,
+            order,
+            max_steps,
+        )?;
+        Ok(())
+    }
+
+    /// Emits the four unlink patches for `node` in `order`, stopping after `max_steps` of them.
+    /// Returns whether detaching `node` left its `parent` childless (only meaningful when the detach
+    /// step actually ran — i.e. `max_steps` reached it). `is_leaf` gates the chain re-link (step b),
+    /// which applies to the leaf right-sibling chain only; internal nodes carry a B-link chain that no
+    /// read path traverses, so reclaiming one does not re-link it.
+    #[allow(clippy::too_many_arguments)]
+    fn unlink_node(
+        &mut self,
+        txn: TxnId,
+        node: PageId,
+        parent: PageId,
+        ref_to_node: ChildRef,
+        pred: Option<PageId>,
+        node_right: u64,
+        is_leaf: bool,
+        order: ReclaimOrder,
+        max_steps: usize,
+    ) -> Result<bool> {
+        let steps = match order {
+            ReclaimOrder::Correct => [
+                UnlinkStep::Detach,
+                UnlinkStep::Relink,
+                UnlinkStep::MarkFree,
+                UnlinkStep::Publish,
+            ],
+            ReclaimOrder::PublishFirst => [
+                UnlinkStep::MarkFree,
+                UnlinkStep::Publish,
+                UnlinkStep::Detach,
+                UnlinkStep::Relink,
+            ],
+        };
+        let mut parent_emptied = false;
+        for step in steps.iter().take(max_steps) {
+            match step {
+                UnlinkStep::Detach => {
+                    parent_emptied = self.detach_child(txn, parent, ref_to_node)?;
+                }
+                UnlinkStep::Relink => {
+                    if is_leaf {
+                        if let Some(p) = pred {
+                            self.relink_chain(txn, p, node_right)?;
+                        }
+                    }
+                }
+                UnlinkStep::MarkFree => self.mark_page_free(txn, node)?,
+                UnlinkStep::Publish => self.set_meta_free_head(txn, node.0)?,
+            }
+        }
+        Ok(parent_emptied)
+    }
+
+    /// (a) Removes `parent`'s pointer to a child (WAL-logged), returning whether that left `parent`
+    /// childless. A `Slot(i)` child is removed by dropping slot `i` (the leftmost child always
+    /// remains, so this never empties the node). The leftmost child is removed by promoting the
+    /// first slot's child to leftmost and dropping that slot; if the node had no slots (its only
+    /// child was the leftmost) it becomes childless (leftmost set to `0`) and the caller reclaims it.
+    fn detach_child(&mut self, txn: TxnId, parent: PageId, ref_to_child: ChildRef) -> Result<bool> {
+        let f = self.pool.fetch(parent)?;
+        if let Err(e) = self.validate_cached(parent, f) {
+            self.pool.unpin(f);
+            return Err(e);
+        }
+        let mut scratch = self.payload_copy(f);
+        let emptied = {
+            let mut n = NodeMut::new(&mut scratch);
+            match ref_to_child {
+                ChildRef::Slot(i) => {
+                    n.remove_at(i);
+                    false
+                }
+                ChildRef::Leftmost => {
+                    if n.view().slot_count() >= 1 {
+                        let c0 = n.view().child(0);
+                        n.remove_at(0);
+                        n.set_leftmost_child(c0);
+                        false
+                    } else {
+                        n.set_leftmost_child(0);
+                        true
+                    }
+                }
+            }
+        };
+        self.log_and_apply_payload(txn, parent, f, &scratch)?;
+        self.pool.unpin(f);
+        Ok(emptied)
+    }
+
+    /// (b) Re-links the leaf chain so `pred`'s right-sibling pointer skips the leaf being removed and
+    /// points to `new_right` (WAL-logged).
+    fn relink_chain(&mut self, txn: TxnId, pred: PageId, new_right: u64) -> Result<()> {
+        let f = self.pool.fetch(pred)?;
+        let mut scratch = self.payload_copy(f);
+        NodeMut::new(&mut scratch).set_right_sibling(new_right);
+        self.log_and_apply_payload(txn, pred, f, &scratch)?;
+        self.pool.unpin(f);
+        Ok(())
+    }
+
+    /// (c) Overwrites `node` as a canonical free page — a zeroed payload (level `0`, `slot_count 0`)
+    /// whose [`FREE_NEXT_OFF`] successor is the *current* free-list head — WAL-logged so undo restores
+    /// the node's prior contents. Reading the current head here (rather than a value captured earlier)
+    /// keeps the chain correct when several nodes are freed in one reclamation: each links onto the
+    /// head the previous [`Self::set_meta_free_head`] published.
+    fn mark_page_free(&mut self, txn: TxnId, node: PageId) -> Result<()> {
+        let old_head = self.meta_free_head()?;
+        let f = self.pool.fetch(node)?;
+        let mut scratch = self.pool.page(f).to_vec();
+        for b in &mut scratch[HEADER_SIZE..PAGE_SIZE] {
+            *b = 0;
+        }
+        scratch[FREE_NEXT_OFF..FREE_NEXT_OFF + 8].copy_from_slice(&old_head.to_le_bytes());
+        self.log_and_apply_payload(txn, node, f, &scratch)?;
+        self.pool.unpin(f);
+        Ok(())
+    }
+
+    /// Collapses a single-child internal root onto its only child (WAL-logged), freeing the old root
+    /// page, repeating while the new root is again a single-child internal node. Leaf roots and
+    /// internal roots with ≥1 separator (≥2 children) are left untouched. Restores the standard
+    /// invariant that an internal root has ≥2 children, so a reclamation never removes the last child
+    /// of a root.
+    fn collapse_root(&mut self, txn: TxnId) -> Result<()> {
+        loop {
+            let Some(root) = self.root else {
+                return Ok(());
+            };
+            let f = self.pool.fetch(root)?;
+            if let Err(e) = self.validate_cached(root, f) {
+                self.pool.unpin(f);
+                return Err(e);
+            }
+            let v = NodeView::new(self.pool.page(f));
+            if v.is_leaf() || v.slot_count() >= 1 {
+                self.pool.unpin(f);
+                return Ok(());
+            }
+            let leftmost = v.leftmost_child();
+            self.pool.unpin(f);
+            if leftmost == 0 {
+                // Defensive: a childless internal root should never arise (single-child roots collapse
+                // before they can be emptied). Leave it rather than risk corruption.
+                return Ok(());
+            }
+            self.set_root(txn, PageId(leftmost))?;
+            self.mark_page_free(txn, root)?;
+            self.set_meta_free_head(txn, root.0)?;
+        }
+    }
+
+    /// Descends to the leaf that would hold `key`, recording each internal node and the child pointer
+    /// taken out of it. The returned path is the internal nodes from the root down to the leaf's
+    /// parent (empty when the leaf is the root); the second element is the leaf.
+    fn descend_tracking_path(&mut self, key: &[u8]) -> Result<(DescentPath, PageId)> {
+        let Some(root) = self.root else {
+            return Err(GraphusError::Storage(
+                "reclamation navigation on a rootless tree".to_owned(),
+            ));
+        };
+        let mut path: DescentPath = Vec::new();
+        let mut cur = root;
+        loop {
+            let f = self.pool.fetch(cur)?;
+            if let Err(e) = self.validate_cached(cur, f) {
+                self.pool.unpin(f);
+                return Err(e);
+            }
+            let v = NodeView::new(self.pool.page(f));
+            if v.is_leaf() {
+                self.pool.unpin(f);
+                return Ok((path, cur));
+            }
+            let refkind = child_ref_for(&v, key);
+            let child = match refkind {
+                ChildRef::Leftmost => v.leftmost_child(),
+                ChildRef::Slot(i) => v.child(i),
+            };
+            self.pool.unpin(f);
+            if child == 0 {
+                return Err(GraphusError::Storage(
+                    "B+-tree internal node has a null child pointer".to_owned(),
+                ));
+            }
+            path.push((cur, refkind));
+            cur = PageId(child);
+        }
+    }
+
+    /// The leaf chain predecessor of the leaf reached by `path` (the leaf whose right-sibling points
+    /// at it), or `None` if that leaf is the global leftmost leaf (chain head, no predecessor). Found
+    /// by walking the path up to the deepest node where a left step is possible, then descending that
+    /// left-neighbour subtree to its rightmost leaf — which is exactly the in-order previous leaf,
+    /// even when it lives under a different parent (the leftmost-child / cross-parent case).
+    fn predecessor_leaf(&mut self, path: &DescentPath) -> Result<Option<PageId>> {
+        for idx in (0..path.len()).rev() {
+            let (node, refkind) = path[idx];
+            if let ChildRef::Slot(i) = refkind {
+                let f = self.pool.fetch(node)?;
+                if let Err(e) = self.validate_cached(node, f) {
+                    self.pool.unpin(f);
+                    return Err(e);
+                }
+                let v = NodeView::new(self.pool.page(f));
+                let left_root = if i == 0 {
+                    v.leftmost_child()
+                } else {
+                    v.child(i - 1)
+                };
+                self.pool.unpin(f);
+                if left_root == 0 {
+                    return Err(GraphusError::Storage(
+                        "null left-neighbour child during reclamation".to_owned(),
+                    ));
+                }
+                return Ok(Some(self.rightmost_leaf(PageId(left_root))?));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Descends from `from` always taking the rightmost child, returning the rightmost leaf of that
+    /// subtree.
+    fn rightmost_leaf(&mut self, from: PageId) -> Result<PageId> {
+        let mut cur = from;
+        loop {
+            let f = self.pool.fetch(cur)?;
+            if let Err(e) = self.validate_cached(cur, f) {
+                self.pool.unpin(f);
+                return Err(e);
+            }
+            let v = NodeView::new(self.pool.page(f));
+            if v.is_leaf() {
+                self.pool.unpin(f);
+                return Ok(cur);
+            }
+            let sc = v.slot_count();
+            let next = if sc == 0 {
+                v.leftmost_child()
+            } else {
+                v.child(sc - 1)
+            };
+            self.pool.unpin(f);
+            if next == 0 {
+                return Err(GraphusError::Storage(
+                    "null rightmost child during reclamation".to_owned(),
+                ));
+            }
+            cur = PageId(next);
+        }
+    }
+
+    /// The right-sibling page id of `page` (a small fetch helper for reclamation navigation).
+    fn right_sibling_of(&mut self, page: PageId) -> Result<u64> {
+        let f = self.pool.fetch(page)?;
+        let r = NodeView::new(self.pool.page(f)).right_sibling();
+        self.pool.unpin(f);
+        Ok(r)
+    }
+
+    /// The device page ids currently on the persistent free list, head-first (`rmp` #225 inspection).
+    /// Walks the chain from the meta page's free-list head through each page's [`FREE_NEXT_OFF`]
+    /// successor. Bounded and cycle-checked: a repeated id (a corrupt chain) is a hard error rather
+    /// than an infinite loop.
+    ///
+    /// # Errors
+    /// Returns a `Storage` error if the free-list chain contains a cycle or a fetch fails.
+    #[cfg(feature = "dst")]
+    pub fn free_list_page_ids(&mut self) -> Result<Vec<u64>> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        let mut cur = self.meta_free_head()?;
+        while cur != 0 {
+            if !seen.insert(cur) {
+                return Err(GraphusError::Storage(format!(
+                    "free-list cycle detected at page {cur}"
+                )));
+            }
+            out.push(cur);
+            let f = self.pool.fetch(PageId(cur))?;
+            let next = read_u64(self.pool.page(f), FREE_NEXT_OFF);
+            self.pool.unpin(f);
+            cur = next;
+        }
+        Ok(out)
+    }
+
+    /// Every device page id reachable as a live tree page (`rmp` #225 inspection): the meta/base page,
+    /// plus a walk from the root over parent pointers (all internal nodes and leaves), plus a walk of
+    /// the leaf right-sibling chain (so a leaf that is chain-reachable but momentarily off the parent
+    /// tree — a valid mid-unlink prefix — still counts as reachable). Cycle-guarded.
+    ///
+    /// # Errors
+    /// Returns a `Storage` error on a fetch failure or a structural cycle.
+    #[cfg(feature = "dst")]
+    pub fn reachable_page_ids(&mut self) -> Result<HashSet<u64>> {
+        let mut reachable = HashSet::new();
+        reachable.insert(self.base.0);
+        if let Some(root) = self.root {
+            // Parent-tree walk.
+            let mut stack = vec![root];
+            while let Some(p) = stack.pop() {
+                if !reachable.insert(p.0) {
+                    continue;
+                }
+                let f = self.pool.fetch(p)?;
+                let v = NodeView::new(self.pool.page(f));
+                let is_leaf = v.is_leaf();
+                let mut children = Vec::new();
+                if !is_leaf {
+                    let lm = v.leftmost_child();
+                    if lm != 0 {
+                        children.push(PageId(lm));
+                    }
+                    for i in 0..v.slot_count() {
+                        let c = v.child(i);
+                        if c != 0 {
+                            children.push(PageId(c));
+                        }
+                    }
+                }
+                self.pool.unpin(f);
+                stack.extend(children);
+            }
+            // Leaf-chain walk from the leftmost leaf.
+            let mut leaf = self.leftmost_leaf(root)?;
+            let mut guard = 0u64;
+            loop {
+                reachable.insert(leaf.0);
+                let f = self.pool.fetch(leaf)?;
+                let next = NodeView::new(self.pool.page(f)).right_sibling();
+                self.pool.unpin(f);
+                if next == 0 {
+                    break;
+                }
+                guard += 1;
+                if guard > self.max_page + 2 {
+                    return Err(GraphusError::Storage(
+                        "leaf-chain cycle detected during reachability walk".to_owned(),
+                    ));
+                }
+                leaf = PageId(next);
+            }
+        }
+        Ok(reachable)
+    }
+
+    /// Asserts the core reclamation crash-safety invariant (`rmp` #225): **no page is both reachable
+    /// and on the free list**. This is what a mis-ordered publish violates — the whole point of the
+    /// four-patch ordering is that a page is published to the free list strictly after it is
+    /// unreachable, so no durable prefix (hence no recovered state) can leave it reachable-and-free.
+    ///
+    /// # Errors
+    /// Returns a `Storage` error naming the offending page if a reachable page is free-listed, or if
+    /// the free-list chain is malformed.
+    #[cfg(feature = "dst")]
+    pub fn assert_no_reachable_page_is_free(&mut self) -> Result<()> {
+        let free: HashSet<u64> = self.free_list_page_ids()?.into_iter().collect();
+        let reachable = self.reachable_page_ids()?;
+        for &p in &free {
+            if reachable.contains(&p) {
+                return Err(GraphusError::Storage(format!(
+                    "corruption: page {p} is BOTH reachable and on the free list"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The leaf page a `key` routes to (`rmp` #225 crash-campaign scenario setup).
+    ///
+    /// # Errors
+    /// Propagates a fetch error.
+    #[cfg(feature = "dst")]
+    pub fn debug_leaf_for_key(&mut self, key: &[u8]) -> Result<Option<PageId>> {
+        let Some(root) = self.root else {
+            return Ok(None);
+        };
+        Ok(Some(self.descend_to_leaf(root, key)?))
+    }
+
+    /// The encoded keys currently stored in `leaf`, in order (`rmp` #225 crash-campaign scenario
+    /// setup — used to remove the target leaf's keys from the reference model before emptying it).
+    ///
+    /// # Errors
+    /// Propagates a fetch error.
+    #[cfg(feature = "dst")]
+    pub fn debug_leaf_keys(&mut self, leaf: PageId) -> Result<Vec<Vec<u8>>> {
+        let f = self.pool.fetch(leaf)?;
+        let v = NodeView::new(self.pool.page(f));
+        let keys = (0..v.slot_count()).map(|i| v.key(i).to_vec()).collect();
+        self.pool.unpin(f);
+        Ok(keys)
+    }
+
+    /// Drains `leaf` to zero entries under `txn` (WAL-logged), preserving its right-sibling link so it
+    /// stays in the leaf chain — the "empty leaf ready to reclaim" state (`rmp` #225 crash-campaign
+    /// scenario setup). Lets the campaign reach the empty-leaf state without the auto-reclaim that a
+    /// real [`Self::delete`] would trigger, so it can then drive [`Self::reclaim_leaf_crash_inject`]
+    /// with a chosen ordering and stop point.
+    ///
+    /// # Errors
+    /// Propagates a buffer-pool or WAL failure.
+    #[cfg(feature = "dst")]
+    pub fn debug_empty_leaf(&mut self, txn: TxnId, leaf: PageId) -> Result<()> {
+        let f = self.pool.fetch(leaf)?;
+        let right = NodeView::new(self.pool.page(f)).right_sibling();
+        let mut scratch = self.payload_copy(f);
+        {
+            let mut n = NodeMut::new(&mut scratch);
+            n.init(0);
+            n.set_right_sibling(right);
+        }
+        self.log_and_apply_payload(txn, leaf, f, &scratch)?;
+        self.pool.unpin(f);
         Ok(())
     }
 
@@ -1071,6 +1782,29 @@ fn read_u64(p: &[u8], off: usize) -> u64 {
 }
 fn read_u32(p: &[u8], off: usize) -> u32 {
     u32::from_le_bytes(p[off..off + 4].try_into().expect("4-byte slice"))
+}
+
+/// The [`ChildRef`] an internal node routes `probe` through — the reclamation-navigation twin of
+/// [`NodeView::child_for`], returning *which* pointer was followed (leftmost vs a slot's child)
+/// rather than the child id. Uses the identical separator semantics: the first slot whose key is
+/// `> probe` bounds the descent, so `probe < key[0]` follows the leftmost child, else the child of
+/// the greatest key `<= probe`.
+fn child_ref_for(v: &NodeView, probe: &[u8]) -> ChildRef {
+    let mut lo = 0usize;
+    let mut hi = v.slot_count();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if v.key(mid) <= probe {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if lo == 0 {
+        ChildRef::Leftmost
+    } else {
+        ChildRef::Slot(lo - 1)
+    }
 }
 
 /// Documents that the meta page lives at the tree's relative page 0 (used by multi-tree layouts).

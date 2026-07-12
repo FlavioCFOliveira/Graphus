@@ -8,6 +8,13 @@ repository.workspace = true
 authors.workspace = true
 description = "B+-tree, token-lookup, composite and relationship-property indexes and constraints."
 
+[features]
+# Exposes the deterministic crash-injection seams the B+-tree page-reclamation campaign drives
+# (`rmp` #225): the stepped, mis-orderable empty-leaf unlink (`BTree::reclaim_leaf_crash_inject`) and
+# the physical free-list/reachability inspectors it asserts against. OFF by default so the production
+# build never carries the test hooks; the `reclaim_crash_dst` integration campaign enables it.
+dst = []
+
 [dependencies]
 graphus-core = { path = "../graphus-core" }
 graphus-io = { path = "../graphus-io" }

@@ -78,6 +78,15 @@ const OFF_SLOT_COUNT: usize = HEADER_SIZE + 2; // u16
 /// Offset where the slot directory begins.
 pub const SLOT_DIR_START: usize = HEADER_SIZE + 4;
 
+/// Byte offset of a **free page's** next-free pointer (`u64` device page id; `0` = end of the
+/// chain), the on-disk link of the persistent free list (`rmp` #225). A freed page is written as a
+/// canonical *empty leaf* (`level = 0` @ [`OFF_LEVEL`], `slot_count = 0` @ [`OFF_SLOT_COUNT`]) with
+/// its successor stashed here at [`SLOT_DIR_START`] — where the (empty) slot directory would begin,
+/// so the value is never mistaken for a live slot. Free pages are identified **solely** by walking
+/// the chain from the meta page's free-list head, never by these bytes in isolation: a page that is
+/// not on the chain is not free regardless of what sits here. See [`crate::btree`].
+pub const FREE_NEXT_OFF: usize = SLOT_DIR_START; // u64 next-free page id (free pages only)
+
 /// One slot directory entry is 8 bytes.
 pub const SLOT_SIZE: usize = 8;
 
