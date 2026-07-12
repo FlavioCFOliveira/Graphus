@@ -405,7 +405,10 @@ fn reclaim_leftmost_parent_emptying_and_root_collapse() {
         let end = (deleted + batch).min(n);
         in_txn(&mut tree, batch_id, |tree, txn| {
             for k in deleted..end {
-                assert!(tree.delete(txn, &key(k)).expect("delete"), "key {k} present");
+                assert!(
+                    tree.delete(txn, &key(k)).expect("delete"),
+                    "key {k} present"
+                );
             }
         });
         tree.check_invariants()
