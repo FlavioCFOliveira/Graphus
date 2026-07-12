@@ -2390,9 +2390,15 @@ fn build_operator(
             ordered,
             ..
         } => {
+            // The seek value is normally a literal or `$param`, but a correlated seek (`rmp` task
+            // #708 — the right branch of a nested-loop join, e.g. `UNWIND rows AS t MATCH (b:L {p:
+            // t.k})`) keys it off the LEFT row's bindings, which the join supplies as the correlation
+            // row `arg`. Evaluating against `arg` (the empty row at the top level) resolves that
+            // per-row key; a row-independent literal/param yields the same value against either.
+            let empty = Row::empty();
             let seek = eval_value(
                 value,
-                &Row::empty(),
+                arg.unwrap_or(&empty),
                 ctx.params,
                 ctx.graph,
                 ctx.functions,
@@ -2453,9 +2459,12 @@ fn build_operator(
             // route to the `scan_filter_eq` seam, which reads every node but builds an SSI dependency on
             // only the matching rows (+ the precise `Equality` predicate marker) — the scan-path twin of
             // `NodeIndexSeek`'s footprint, without the bare label scan's blanket "mark every node".
+            // Evaluated against the correlation row (like `NodeIndexSeek`, `rmp` task #708) so a
+            // correlated equality resolves its per-row key; a literal/param value is row-independent.
+            let empty = Row::empty();
             let seek = eval_value(
                 value,
-                &Row::empty(),
+                arg.unwrap_or(&empty),
                 ctx.params,
                 ctx.graph,
                 ctx.functions,
@@ -2474,9 +2483,13 @@ fn build_operator(
             ordered,
             ..
         } => {
+            // As with `NodeIndexSeek`, evaluate the bound against the correlation row so a
+            // per-left-row correlated range seek (`rmp` task #708) resolves its key; a literal/param
+            // bound is row-independent and yields the same value against the empty top-level row.
+            let empty = Row::empty();
             let bound_val = eval_value(
                 value,
-                &Row::empty(),
+                arg.unwrap_or(&empty),
                 ctx.params,
                 ctx.graph,
                 ctx.functions,
@@ -8401,11 +8414,43 @@ mod tests {
     }
 
     fn run_with_catalog(src: &str, graph: &mut MemGraph, catalog: &IndexCatalog) -> Vec<Row> {
+        run_with_catalog_and_params(src, graph, catalog, &crate::binding::Parameters::new())
+    }
+
+    fn run_with_catalog_and_params(
+        src: &str,
+        graph: &mut MemGraph,
+        catalog: &IndexCatalog,
+        params: &crate::binding::Parameters,
+    ) -> Vec<Row> {
         let toks = tokenize(src).expect("lex");
         let ast = parse_tokens(&toks, src).expect("parse");
         let plan = plan_physical(&lower(&analyze(&ast).expect("analyze")), catalog);
-        let params = crate::binding::bind_parameters(&plan, &crate::binding::Parameters::new())
-            .expect("bind");
+        let params = crate::binding::bind_parameters(&plan, params).expect("bind");
+        execute(&plan, &params, graph)
+            .expect("open")
+            .collect_all()
+            .expect("rows")
+    }
+
+    /// Like [`run_with_catalog_and_params`] but plans **cost-based** with the graph's own statistics,
+    /// so a test exercises the optimiser (join reordering, access-path reversion) rather than only the
+    /// rule-based tree.
+    fn run_with_catalog_params_stats(
+        src: &str,
+        graph: &mut MemGraph,
+        catalog: &IndexCatalog,
+        params: &crate::binding::Parameters,
+    ) -> Vec<Row> {
+        let toks = tokenize(src).expect("lex");
+        let ast = parse_tokens(&toks, src).expect("parse");
+        let logical = lower(&analyze(&ast).expect("analyze"));
+        // Scope the immutable statistics borrow so `graph` is free for the mutable execute below.
+        let plan = {
+            let stats = graph.statistics();
+            crate::physical::plan_physical_with_stats(&logical, catalog, stats)
+        };
+        let params = crate::binding::bind_parameters(&plan, params).expect("bind");
         execute(&plan, &params, graph)
             .expect("open")
             .collect_all()
@@ -9125,6 +9170,107 @@ mod tests {
         let after = run("MATCH (n:P) RETURN n.doomed AS d", &mut g);
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].value("d"), Value::Null, "the property was removed");
+    }
+
+    #[test]
+    fn correlated_row_valued_index_seek_returns_exactly_the_scan_result() {
+        // `rmp` task #708: a row-valued (correlated) equality anchor —
+        // `UNWIND $rows AS t MATCH (b:Person {uid: t.uid})` — now lowers to a per-left-row
+        // `NodeIndexSeek` keyed off the correlation row instead of a full label scan and filter. The
+        // seek must NEVER change results: for every driving row the indexed seek path and the plain
+        // scan+filter path must return the IDENTICAL node set (same rows, same multiplicity). This
+        // pins that the executor evaluates the seek value against the correlation row (a regression
+        // that evaluated it against the empty row would return zero rows and fail here).
+        use crate::binding::Parameters;
+
+        fn ids(
+            src: &str,
+            graph: &mut MemGraph,
+            catalog: &IndexCatalog,
+            params: &Parameters,
+        ) -> Vec<u64> {
+            let mut out: Vec<u64> = run_with_catalog_and_params(src, graph, catalog, params)
+                .iter()
+                .filter_map(|r| r.get("b").and_then(RowValue::as_node))
+                .map(|id| id.0)
+                .collect();
+            out.sort_unstable();
+            out
+        }
+
+        // Two identically-seeded graphs. The catalog is what routes the planner: `with_index` emits
+        // the correlated `NodeIndexSeek`, `no_index` the plain label scan + filter (the `MemGraph`
+        // seam serves both through `scan_filter_eq`, so this isolates the PLAN difference). Includes a
+        // DUPLICATE uid (multigraph: two nodes share uid 3) so multiplicity is exercised, and the
+        // driving rows include a uid with no match (99) so a non-match yields zero rows on both paths.
+        let seed = |g: &mut MemGraph| {
+            g.add_node(["Person"], [("uid", Value::Integer(1))]);
+            g.add_node(["Person"], [("uid", Value::Integer(2))]);
+            g.add_node(["Person"], [("uid", Value::Integer(3))]);
+            g.add_node(["Person"], [("uid", Value::Integer(3))]); // duplicate uid (multigraph)
+            g.add_node(["Person"], [("uid", Value::Integer(4))]);
+        };
+        let mut indexed = MemGraph::new();
+        seed(&mut indexed);
+        let mut plain = MemGraph::new();
+        seed(&mut plain);
+
+        let with_index = IndexCatalog::builder()
+            .with_label_property("Person", "uid")
+            .build();
+        let no_index = IndexCatalog::empty();
+
+        let rows = Value::List(vec![
+            Value::Map(vec![("uid".to_owned(), Value::Integer(1))]),
+            Value::Map(vec![("uid".to_owned(), Value::Integer(3))]), // matches BOTH duplicates
+            Value::Map(vec![("uid".to_owned(), Value::Integer(99))]), // no match
+            Value::Map(vec![("uid".to_owned(), Value::Integer(2))]),
+        ]);
+        let params = Parameters::new().with("rows", rows);
+
+        // Every correlated formulation the planner sees (inline map, WHERE, WITH-projected key) must
+        // agree with the plain scan and use the seek.
+        for src in [
+            "UNWIND $rows AS t MATCH (b:Person {uid: t.uid}) RETURN b",
+            "UNWIND $rows AS t MATCH (b:Person) WHERE b.uid = t.uid RETURN b",
+            "UNWIND $rows AS t WITH t.uid AS u MATCH (b:Person {uid: u}) RETURN b",
+        ] {
+            let seek = ids(src, &mut indexed, &with_index, &params);
+            let scan = ids(src, &mut plain, &no_index, &params);
+            assert_eq!(seek, scan, "index must not change results: {src}");
+            // uid 1 (1 node) + uid 3 (2 nodes) + uid 99 (0) + uid 2 (1 node) = 4 rows.
+            assert_eq!(seek.len(), 4, "expected 4 matched rows: {src}");
+
+            // Also validate the COST-BASED plan (the optimiser must not break the correlated seek by
+            // reordering it to the outer side or reverting it to a scan, `rmp` task #708).
+            let mut cost_based: Vec<u64> =
+                run_with_catalog_params_stats(src, &mut indexed, &with_index, &params)
+                    .iter()
+                    .filter_map(|r| r.get("b").and_then(RowValue::as_node))
+                    .map(|id| id.0)
+                    .collect();
+            cost_based.sort_unstable();
+            assert_eq!(
+                cost_based, scan,
+                "cost-based plan must not change results: {src}"
+            );
+
+            // The indexed plan must route through the correlated seek (else this proves nothing).
+            let plan = {
+                let toks = tokenize(src).expect("lex");
+                let ast = parse_tokens(&toks, src).expect("parse");
+                plan_physical(&lower(&analyze(&ast).expect("analyze")), &with_index)
+            };
+            let rendered = plan.to_string();
+            assert!(
+                rendered.contains("NodeIndexSeek"),
+                "the correlated anchor must use the index seek:\n{rendered}"
+            );
+            assert!(
+                !rendered.contains("NodeByLabelScan"),
+                "the correlated anchor must NOT fall back to a label scan:\n{rendered}"
+            );
+        }
     }
 
     #[test]
