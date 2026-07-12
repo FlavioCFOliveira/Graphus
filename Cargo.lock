@@ -1101,6 +1101,7 @@ dependencies = [
  "graphus-io",
  "graphus-sim",
  "graphus-storage",
+ "graphus-sysres",
  "graphus-wal",
  "itoa",
  "proptest",

@@ -24,6 +24,11 @@ graphus-columnar = { path = "../graphus-columnar" }
 # name their public types (devices, log sinks, the WAL manager, recovery).
 graphus-io = { path = "../graphus-io" }
 graphus-wal = { path = "../graphus-wal" }
+# Best-effort host RAM probe (`rmp` #617/#718): the offline loader sizes its buffer pool to the
+# store it will build, bounded by a fraction of available RAM, so a large graph load does not thrash
+# a fixed 2 MiB pool (quadratic) and a tiny load does not over-allocate. A leaf crate; the edge is
+# acyclic and adds no `unsafe` on Linux (the crate is `forbid(unsafe_code)` off macOS).
+graphus-sysres = { path = "../graphus-sysres" }
 # Streaming CSV read (importer) and write (dumper), honoring headers and delimiters. The reader is
 # `std::io::Read`-based so a large file streams record-by-record, never slurped. Kept out of the
 # storage core deliberately (the storage crate must not depend on `csv`).

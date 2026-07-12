@@ -57,6 +57,7 @@ pub mod columnar;
 pub mod dump;
 pub mod header;
 pub mod import;
+pub mod pool_sizing;
 pub mod row_parse;
 pub mod value_parse;
 
@@ -66,6 +67,11 @@ pub use header::{ColumnRole, HeaderError, NodeHeader, PropertyType, RelHeader, S
 pub use import::{
     BulkImporter, DEFAULT_BATCH_SIZE, DuplicatePolicy, ImportStats, ingest_node_row,
     ingest_rel_row, intern_property_key_tokens,
+};
+// Adaptive buffer-pool sizing (`rmp` #718): the offline loader sizes its pool to the store it is
+// about to build (import) or open (dump), so the random-access relationship phase never thrashes.
+pub use pool_sizing::{
+    InputFormatHint, auto_pool_pages_for_input, auto_pool_pages_for_store, ram_ceiling_pages,
 };
 // `row_parse` (`rmp` #520): the store-independent CSV row-parsing helpers network bulk-import Mode B
 // drives directly (never `ingest_node_row`/`ingest_rel_row`, which write through a raw `RecordStore`).
