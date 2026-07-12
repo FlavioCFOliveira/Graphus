@@ -425,6 +425,13 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// log, instead of replaying the whole history. Defaults to
     /// [`DEFAULT_CHECKPOINT_INTERVAL_BYTES`].
     checkpoint_interval_bytes: u64,
+    /// Whether the store sizes the WAL's segment seal threshold proportionally to its live data image
+    /// (`rmp` #706). When `true` (the default) [`apply_adaptive_wal_segment_target`](Self::apply_adaptive_wal_segment_target)
+    /// seals WAL segments at [`graphus_wal::segment_target_for_store`] of the store size at open and on
+    /// every checkpoint, so a small database's WAL is reclaimed in small chunks instead of only in fixed
+    /// 64 MiB units. When `false` the WAL keeps whatever fixed segment size its sink was constructed with
+    /// (reproducing the pre-#706 behaviour). Toggled via [`set_wal_segment_sizing_adaptive`](Self::set_wal_segment_sizing_adaptive).
+    wal_segment_sizing_adaptive: bool,
     /// The WAL `durable_len` captured at the last checkpoint (or at open); the automatic cadence
     /// fires when `durable_len - this >= checkpoint_interval_bytes`.
     wal_len_at_last_checkpoint: u64,
@@ -538,6 +545,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             reuse_barrier: None,
             statistics: Statistics::new(),
             checkpoint_interval_bytes: DEFAULT_CHECKPOINT_INTERVAL_BYTES,
+            wal_segment_sizing_adaptive: true,
             wal_len_at_last_checkpoint: 0,
             unfrozen_commit_lsn: BTreeMap::new(),
             // A fresh store has no prior transactions in its (just-created) WAL.
@@ -554,6 +562,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         store.checkpoint_meta(SYSTEM_TXN, true)?;
         store.flush()?;
         store.wal_len_at_last_checkpoint = store.wal.with(|w| w.durable_len());
+        // Size the WAL segment seal threshold to the (tiny) fresh store, so segments start small and
+        // the very first maintenance checkpoint can free WAL disk (`rmp` #706).
+        store.apply_adaptive_wal_segment_target();
         Ok(store)
     }
 
@@ -612,7 +623,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // uncommitted records (the atomicity violation this fixes). See
         // [`WalManager::max_recovered_txn_id`].
         let recovered_txn_hw = shared.with(|w| w.max_recovered_txn_id())?;
-        Ok(Self {
+        let mut store = Self {
             pool,
             wal: shared,
             element_ids: ElementIdAllocator::new(meta.element_id_next.max(1)),
@@ -639,6 +650,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             reuse_barrier: None,
             statistics: meta.statistics,
             checkpoint_interval_bytes: DEFAULT_CHECKPOINT_INTERVAL_BYTES,
+            wal_segment_sizing_adaptive: true,
             wal_len_at_last_checkpoint: shared_len,
             unfrozen_commit_lsn,
             recovered_txn_hw,
@@ -651,7 +663,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             drain_progress: None,
             // No exclusive store-open lock until the server installs one ([`hold_open_guard`], #563).
             open_guard: None,
-        })
+        };
+        // Size the WAL segment seal threshold to the RECOVERED store, so a reopened database immediately
+        // uses a segment size matched to its data image rather than the sink's default 64 MiB (`rmp` #706).
+        store.apply_adaptive_wal_segment_target();
+        Ok(store)
     }
 
     /// The largest real transaction id present in the durable WAL when this store was opened (`0` for a
@@ -1769,7 +1785,42 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.wal
             .with(|w| -> Result<()> { w.reclaim(Lsn(reclaim_floor)) })?;
         self.wal_len_at_last_checkpoint = self.wal.with(|w| w.durable_len());
+        // Re-size the WAL segment seal threshold to the current store (`rmp` #706), so as the data image
+        // grows or shrinks the reclaim granularity tracks it — a segment always seals well within one
+        // maintenance interval, so the NEXT checkpoint has sealed segments below the floor to free.
+        self.apply_adaptive_wal_segment_target();
         Ok(())
+    }
+
+    /// Sizes the WAL's segment seal threshold proportionally to the live store (`rmp` #706), so a small
+    /// database's WAL is reclaimed in small chunks (via [`graphus_wal::segment_target_for_store`])
+    /// instead of only in fixed 64 MiB units. A no-op when adaptive sizing is disabled
+    /// ([`set_wal_segment_sizing_adaptive`](Self::set_wal_segment_sizing_adaptive)) or on a non-segmented
+    /// WAL sink (e.g. the in-memory DST sink, which frees exact byte ranges).
+    ///
+    /// Called at [`create`](Self::create) / [`open`](Self::open) (so a store immediately uses a segment
+    /// size matched to its data image) and on every [`checkpoint`](Self::checkpoint) (so the size tracks
+    /// the store as it grows/shrinks). The reclaim granularity thus stays proportional to the data image,
+    /// matching the store-proportional maintenance CADENCE `rmp` #556 already established. It only affects
+    /// FUTURE segment rolls, never any already-written segment, so it is durability-neutral.
+    fn apply_adaptive_wal_segment_target(&mut self) {
+        if !self.wal_segment_sizing_adaptive {
+            return;
+        }
+        let store_bytes = self.store_page_count().saturating_mul(PAGE_SIZE as u64);
+        let target = graphus_wal::segment_target_for_store(store_bytes);
+        self.wal.with(|w| w.set_segment_target(target));
+    }
+
+    /// Enables (default) or disables the store-proportional WAL segment sizing of `rmp` #706, then
+    /// applies it immediately. When enabled the store seals WAL segments at
+    /// [`graphus_wal::segment_target_for_store`] of its live data image; when disabled the WAL keeps
+    /// whatever fixed segment size its sink was constructed with, reproducing the pre-#706
+    /// fixed-64-MiB behaviour. The regression guard for #706 uses this to drive the reverted defect on a
+    /// real file-backed WAL.
+    pub fn set_wal_segment_sizing_adaptive(&mut self, adaptive: bool) {
+        self.wal_segment_sizing_adaptive = adaptive;
+        self.apply_adaptive_wal_segment_target();
     }
 
     /// Fires an automatic [`checkpoint`](Self::checkpoint) when `checkpoint_interval_bytes` of WAL

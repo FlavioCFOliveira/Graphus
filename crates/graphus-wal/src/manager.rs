@@ -157,6 +157,15 @@ impl<S: LogSink> WalManager<S> {
         &self.sink
     }
 
+    /// Sets the size at which the backing **segmented** sink seals a segment and rolls, forwarding to
+    /// [`LogSink::set_segment_target`] (`rmp` #706). A no-op for a non-segmented sink. The
+    /// [`RecordStore`](../../graphus_storage) calls this at open and on every checkpoint to keep the WAL
+    /// reclaim granularity proportional to its live data image, so a small database's WAL is reclaimed
+    /// in small chunks instead of only in fixed 64 MiB units.
+    pub fn set_segment_target(&mut self, target_bytes: u64) {
+        self.sink.set_segment_target(target_bytes);
+    }
+
     /// Scans the durable log and returns every committed transaction with the MVCC `commit_ts` its
     /// commit record carries (`rmp` task #49).
     ///

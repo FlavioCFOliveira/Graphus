@@ -271,6 +271,19 @@ pub trait LogSink {
         0
     }
 
+    /// Sets the size at which a **segmented** sink seals its active segment and rolls to a fresh one —
+    /// the granularity at which [`reclaim`](LogSink::reclaim) can return WAL disk (`rmp` #706). The
+    /// store calls this (via [`crate::WalManager::set_segment_target`]) at open and on every checkpoint
+    /// to keep the reclaim granularity proportional to its live data image
+    /// ([`segment_target_for_store`]).
+    ///
+    /// The **default is a no-op**: a sink with no segments (e.g. [`MemLogSink`], which frees exact byte
+    /// ranges) has no roll size. The production [`FileLogSink`] overrides it; the encrypted sink
+    /// forwards to its backing file sink. Setting the target only affects **future** rolls — the next
+    /// write that finds the active segment at or over the new size — and never rewrites, splits or
+    /// truncates any already-written segment, so it is durability-neutral.
+    fn set_segment_target(&mut self, _target_bytes: u64) {}
+
     /// Whether a [`WalManager`](crate::WalManager) over this sink must retain the **in-memory undo
     /// back-chain** of its active transactions (`rmp` #724).
     ///
@@ -737,10 +750,53 @@ const SEGMENT_PREFIX: &str = "seg.";
 /// Width of the zero-padded base-offset suffix in a segment filename (`u64::MAX` is 20 digits), so
 /// lexicographic directory order equals numeric byte-offset order.
 const SEGMENT_BASE_WIDTH: usize = 20;
-/// Default size at which the active segment rolls to a fresh one. 64 MiB bounds per-file size while
-/// keeping the segment count (hence directory entries and the reclaim granularity) small for a large
-/// log. Reclamation frees disk in whole-segment units, so this also sets the reclaim granularity.
+/// Default (and **maximum**) size at which the active segment rolls to a fresh one. 64 MiB bounds
+/// per-file size while keeping the segment count (hence directory entries and the reclaim granularity)
+/// small for a large log. Reclamation frees disk in whole-segment units, so this also sets the reclaim
+/// granularity. Since `rmp` #706 it is the **cap** of the store-proportional segment target (see
+/// [`segment_target_for_store`]): a database whose data image is at least this large keeps 64 MiB
+/// segments, exactly as before; a smaller one seals proportionally smaller segments so its WAL disk is
+/// actually reclaimable.
 pub const DEFAULT_SEGMENT_TARGET_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Floor of the store-proportional WAL segment target (`rmp` #706): the smallest size at which the
+/// active segment seals and rolls. Below this the per-segment bookkeeping (a directory entry plus a
+/// dir-`fsync` on create and another on reclaim) stops being worth it, and a tiny database would
+/// otherwise accumulate an unbounded number of microscopic segment files. At 1 MiB the retained-WAL
+/// trough of even a sub-megabyte store is a handful of small files, while still being small enough
+/// (versus the fixed 64 MiB) that the reclaiming maintenance checkpoint has sealed segments below the
+/// floor to free.
+pub const WAL_SEGMENT_MIN_TARGET_BYTES: u64 = 1024 * 1024;
+
+/// The store-proportional WAL segment target (`rmp` #706): the size at which the active segment seals
+/// and rolls, so a database's WAL disk is reclaimed in chunks proportional to its live **data image**
+/// rather than in fixed 64 MiB units. Clamped to
+/// `[WAL_SEGMENT_MIN_TARGET_BYTES, DEFAULT_SEGMENT_TARGET_BYTES]` = `[1 MiB, 64 MiB]`.
+///
+/// # The finding this fixes
+///
+/// WAL disk is freed only in whole SEGMENT units, and the active (last) segment is never reclaimed, so
+/// nothing below the recovery/reclaim floor can be freed until a segment **seals**. With a fixed 64 MiB
+/// seal threshold a small database's WAL climbs all the way to 64 MiB before a single byte is freed —
+/// hundreds of times the size of the graph it protects. Sealing at `min(store_bytes, 64 MiB)` (floored
+/// at 1 MiB) makes a small database seal small segments, so the reclaiming maintenance checkpoint —
+/// whose *cadence* `rmp` #556 already made store-proportional — actually has sealed segments below the
+/// floor to delete. The cap keeps a LARGE log at 64 MiB segments (bounded file count / directory size),
+/// unchanged from before #706.
+///
+/// # Durability-neutral
+///
+/// Segmentation is transparent to the logical byte stream: `LSN == byte offset`, and
+/// [`read_durable`](LogSink::read_durable) / [`read_bounded`](LogSink::read_bounded) reassemble the
+/// segments into one offset-preserving image (a reclaimed prefix reads back as zeros). So torn-tail
+/// detection, per-record checksums and the redo/undo boundaries are all independent of segment size —
+/// only the granularity at which already-superseded WAL disk is returned changes. A commit batch is
+/// never split across segments (the roll happens *before* the batch write), so a smaller target cannot
+/// tear a record.
+#[must_use]
+pub fn segment_target_for_store(store_bytes: u64) -> u64 {
+    store_bytes.clamp(WAL_SEGMENT_MIN_TARGET_BYTES, DEFAULT_SEGMENT_TARGET_BYTES)
+}
 
 /// One present record segment: its physical byte range `[base, base + len)` and the open file.
 #[derive(Debug)]
@@ -881,6 +937,14 @@ impl FileLogSink {
             pending: Vec::new(),
             segment_target: segment_target.max(1),
         })
+    }
+
+    /// The current size at which the active segment seals and rolls (`rmp` #706 / #116). Set at open
+    /// (via [`open_with_segment_target`](Self::open_with_segment_target)) and adjusted store-proportionally
+    /// through [`LogSink::set_segment_target`]. Test/inspection helper.
+    #[must_use]
+    pub fn segment_target(&self) -> u64 {
+        self.segment_target
     }
 
     /// The path of the segment file whose physical base is `base`.
@@ -1234,6 +1298,13 @@ impl LogSink for FileLogSink {
         // leading-zero-prefix assumption).
         self.sync_dir()?;
         Ok(())
+    }
+
+    fn set_segment_target(&mut self, target_bytes: u64) {
+        // Clamp to >= 1 (a degenerate 0 would wedge rolling), mirroring `open_with_segment_target`.
+        // Only affects the NEXT roll: if the active segment is already at/over the new (smaller) target,
+        // the next `write_pending` seals it and starts a fresh one — no existing segment is touched.
+        self.segment_target = target_bytes.max(1);
     }
 
     /// `0` if no segment has been reclaimed away yet (the earliest segment, if any, still starts right
@@ -1721,6 +1792,121 @@ mod tests {
         let mut buf = Vec::new();
         s.read_durable(0, &mut buf).unwrap();
         assert_eq!(buf, b"HEADaaaa");
+    }
+
+    // -------------------------------------------- store-proportional segment target (`rmp` #706)
+
+    #[test]
+    fn segment_target_for_store_clamps_to_the_proportional_band() {
+        // Below the floor: a tiny store still gets 1 MiB segments (not microscopic ones).
+        assert_eq!(segment_target_for_store(0), WAL_SEGMENT_MIN_TARGET_BYTES);
+        assert_eq!(
+            segment_target_for_store(229_376),
+            WAL_SEGMENT_MIN_TARGET_BYTES
+        );
+        assert_eq!(
+            segment_target_for_store(WAL_SEGMENT_MIN_TARGET_BYTES - 1),
+            WAL_SEGMENT_MIN_TARGET_BYTES
+        );
+        // In the band: proportional to the data image.
+        assert_eq!(segment_target_for_store(8 * 1024 * 1024), 8 * 1024 * 1024);
+        assert_eq!(
+            segment_target_for_store(WAL_SEGMENT_MIN_TARGET_BYTES),
+            WAL_SEGMENT_MIN_TARGET_BYTES
+        );
+        assert_eq!(
+            segment_target_for_store(DEFAULT_SEGMENT_TARGET_BYTES),
+            DEFAULT_SEGMENT_TARGET_BYTES
+        );
+        // Above the cap: a large log keeps the historical 64 MiB segments (bounded file count).
+        assert_eq!(
+            segment_target_for_store(DEFAULT_SEGMENT_TARGET_BYTES + 1),
+            DEFAULT_SEGMENT_TARGET_BYTES
+        );
+        assert_eq!(
+            segment_target_for_store(1024 * 1024 * 1024),
+            DEFAULT_SEGMENT_TARGET_BYTES
+        );
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "real filesystem I/O is outside miri's isolation/UB scope"
+    )]
+    #[test]
+    fn set_segment_target_seals_a_smaller_segment_on_the_next_roll() {
+        let dir = TempWal::new("resize-target");
+        // Open with a LARGE target: everything after the anchor stays in one growing segment.
+        let mut s = FileLogSink::open_with_segment_target(&dir.path, 1_000_000).unwrap();
+        assert_eq!(s.segment_target(), 1_000_000);
+        s.append(b"HEAD"); // anchor [0, 4)
+        s.sync().unwrap();
+        for _ in 0..4 {
+            s.append(&[b'x'; 8]);
+            s.sync().unwrap();
+        }
+        // One active segment at base 4 (32 bytes < 1_000_000), nothing rolled.
+        let seg_count = |p: &std::path::Path| {
+            std::fs::read_dir(p)
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .filter(|e| e.file_name().to_str().unwrap().starts_with("seg."))
+                .count()
+        };
+        assert_eq!(
+            seg_count(&dir.path),
+            1,
+            "one growing segment under a large target"
+        );
+
+        // Shrink the target BELOW the active segment's size. The active segment (32 B) is now over the
+        // target, so the NEXT write seals it and rolls a fresh one — no existing segment is touched.
+        s.set_segment_target(8);
+        assert_eq!(s.segment_target(), 8);
+        s.append(&[b'y'; 8]);
+        s.sync().unwrap();
+        assert!(
+            seg_count(&dir.path) >= 2,
+            "the oversize active segment must seal and a new one roll after shrinking the target"
+        );
+
+        // The assembled byte stream is unchanged (segmentation is transparent) and survives a reopen.
+        let mut buf = Vec::new();
+        s.read_durable(0, &mut buf).unwrap();
+        assert_eq!(buf.len(), 4 + 4 * 8 + 8);
+        assert_eq!(&buf[0..4], b"HEAD");
+        drop(s);
+        let s2 = FileLogSink::open(&dir.path).unwrap();
+        let mut buf2 = Vec::new();
+        s2.read_durable(0, &mut buf2).unwrap();
+        assert_eq!(
+            buf2, buf,
+            "resized-segment log reassembles byte-identically after reopen"
+        );
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "real filesystem I/O is outside miri's isolation/UB scope"
+    )]
+    #[test]
+    fn a_zero_segment_target_is_clamped_and_does_not_wedge_rolling() {
+        let dir = TempWal::new("zero-target");
+        let mut s = FileLogSink::open(&dir.path).unwrap();
+        s.set_segment_target(0);
+        assert_eq!(
+            s.segment_target(),
+            1,
+            "a degenerate 0 target is clamped to 1"
+        );
+        s.append(b"HEAD");
+        s.sync().unwrap();
+        // With a 1-byte target every post-anchor sync rolls a fresh segment; nothing wedges.
+        for _ in 0..3 {
+            s.append(b"z");
+            s.sync().unwrap();
+        }
+        assert_eq!(s.durable_len(), 4 + 3);
     }
 
     // ----------------------------------------------------- DiscardingLogSink (`rmp` task #321)

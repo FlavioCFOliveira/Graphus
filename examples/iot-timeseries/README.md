@@ -11,9 +11,12 @@ real segmented WAL on disk. It reports two things, and the second one is the int
 
 > **1. The on-disk STORE plateaus while `graphus_maintenance_versions_reclaimed_total` climbs.**
 >
-> **2. The DATABASE on disk does NOT plateau — because the WAL does not.** At its worst this database
-> occupied **79.6 MB of disk to hold a 229 KB graph — 347×** — and wrote **799 physical bytes for every
-> logical byte** ingested.
+> **2. And since `rmp` #706, the DATABASE on disk very nearly plateaus too.** At its worst this database
+> now occupies **14.5 MB of disk to hold a 229 KB graph — 63×** (it was **347×** while #706 was open),
+> because WAL segments are now sized to the store, so the WAL sawtooths in a tight, bounded band instead
+> of climbing to 64 MiB. It still writes **~753 physical bytes for every logical byte** ingested — that
+> figure is the WAL *format* (dual redo/undo), not the reclaim granularity, and #706 deliberately did not
+> change it.
 
 Both halves are load-bearing, and the first without the second is a lie of omission. A flat store is a
 true statement about a *component*; published on its own, in an example whose headline is "reclamation
@@ -22,50 +25,48 @@ both, **gates** both, and states the finding plainly.
 
 ---
 
-## The finding: the store plateaus, the WAL sawtooths (`rmp` #706)
+## The finding: the store plateaus, and since `rmp` #706 the WAL sawtooths in a *tight* band
 
 Measured on the default `reclaim` profile — 140 ticks, 7 000 readings, 35× the retention window:
 
 ```
 store data image   229376 B  ────────────────────────────────────────────  FLAT. Every post-warmup tick.
 
-on-disk WAL        70 MB ┤      ╱│        ╱│        ╱          plateau ratio 1.000 (store)
-                         │    ╱  │      ╱  │      ╱            plateau ratio 7.12  (DATABASE)
-                    2 MB ┤  ╱    └────╱    └────╱              peak 347× the graph it protects
-                         └──────────────────────────────
-                          tick 15        68       128
-                                          ↑         ↑
-                                   segment sealed → ~63 MiB freed, twice
+on-disk WAL       5.4 MB ┤ ╱│╱│╱│╱│╱│╱│╱│╱│╱│╱│╱│╱│╱│╱│╱│      plateau ratio 1.000 (store)
+                         │╱ ╵ ╵ ╵ ╵ ╵ ╵ ╵ ╵ ╵ ╵ ╵ ╵ ╵ ╵ ╵     plateau ratio 1.55  (DATABASE)
+                   1.6 MB┤                                     peak 63× the graph (was 347×)
+                         └──────────────────────────────       36 reclaims, ~96 MB of WAL disk returned
+                          a small sealed segment freed on nearly every checkpoint
 ```
 
-**Root cause** (traced, not guessed). WAL disk is reclaimed in whole **segment** units, and the active
-segment is only sealed at `DEFAULT_SEGMENT_TARGET_BYTES = 64 MiB`
-([`graphus-wal/src/sink.rs:702`](../../crates/graphus-wal/src/sink.rs); the roll test is
-`active.len >= segment_target` at `:898`). The background maintenance cadence, meanwhile, *is* adaptive —
-it fires every `clamp(4 × store_bytes, 8 MiB, 256 MiB)`, i.e. every 8 MiB for a store this size
-(`rmp #556`). So the reclaim **floor advances promptly and correctly**, and `versions_reclaimed` climbs —
-but until 64 MiB has accumulated there is **no sealed segment below the floor to delete**, and not one
-byte of WAL disk is freed. When the segment finally rolls, the whole ~63 MiB is released at once. The
-*cadence* was made store-proportional; the reclaim **granularity** was not.
+**What `rmp` #706 fixed.** WAL disk is reclaimed in whole **segment** units, and the active segment is
+never reclaimed — so nothing below the reclaim floor can be freed until a segment **seals**. The seal size
+is now **store-proportional**, `clamp(store_bytes, 1 MiB, 64 MiB)`
+([`graphus_wal::segment_target_for_store`](../../crates/graphus-wal/src/sink.rs)), applied by the store at
+open and on every checkpoint. For a store this size that is the **1 MiB floor**, so the reclaiming
+maintenance checkpoint — whose cadence `rmp #556` already made store-proportional — has small sealed
+segments below the floor to delete on nearly every pass. Before #706 the seal size was a fixed **64 MiB**,
+so a small database's WAL climbed all the way to 64 MiB (hundreds of times its store) before one byte came
+back; a large log still keeps 64 MiB segments (the cap), unchanged.
 
-**Why the reclamation counters do not contradict this.** `graphus_maintenance_versions_reclaimed_total`
-counts MVCC versions freed inside the **store**. It is what keeps the store flat, and the store's plateau
-is real. It says nothing whatsoever about WAL segment files. A climbing counter beside a
-monotonically-growing WAL is not a paradox — **it is the defect**.
+**Write amplification is a separate, largely-unchanged number.** The ~760× cumulative-WAL / logical-bytes
+figure is the record **format** — physiological redo + logical undo, dual imaging (`rmp #556`) — not the
+reclaim granularity. #706 shrinks the *retained* footprint on disk, not how many bytes each commit writes;
+reducing that would be a WAL-format change, out of scope here. So this figure barely moved (it was ~799×),
+and that is expected.
 
-**Impact.** A database holding a few hundred rows still carries up to ~64 MiB of WAL on disk,
-indefinitely, *per database*. This is **not** a durability defect — nothing is lost, recovery is
-unaffected, and every WAL byte is fsynced before its commit is acknowledged — it is a
-**resource-efficiency** defect, and it bites hardest exactly where it hurts most: a Raspberry Pi 5 hosting
-several small databases.
+**Why the reclamation counters agree.** `graphus_maintenance_versions_reclaimed_total` counts MVCC versions
+freed inside the **store** (what keeps the store flat); the on-disk WAL physically **shrinking** is the
+separate, direct proof that WAL disk came back. Both climb here — this run reclaimed WAL disk **37 times**,
+returning ~96 MB.
 
-**Suggested direction** (`rmp` #706). Make the segment target adaptive in the same spirit as the cadence —
-e.g. `clamp(k × store_bytes, 1 MiB, 64 MiB)` — so reclaim granularity tracks the store it protects.
-
-> **A note for whoever fixes it.** The existing regression test
+> **Guarded on the real device.** The regression guard in
 > [`crates/graphus-cypher/tests/wal_amplification.rs`](../../crates/graphus-cypher/tests/wal_amplification.rs)
-> runs against a **`MemLogSink`**, which frees bytes exactly and has no segments at all. It therefore
-> passes today and **structurally cannot observe this**. The file-backed guard is *this example*.
+> now drives a **real segmented `FileLogSink`** and **fails** on a reverted (fixed-64-MiB) segment on a
+> small store (`rmp #719`) — the `MemLogSink` guard it replaced had no segments and was structurally blind
+> to this. The gate in this example ([`wire_samples.rs`](../../crates/graphus-iot-gen/src/wire_samples.rs))
+> holds the peak footprint to **120× the graph**, so a regression back to fixed 64 MiB segments is caught
+> here too.
 
 ---
 
@@ -84,11 +85,12 @@ retention example described a *simulator*.
 | `baseline.json` gated the simulator | `baseline.json` gates the **real server**; `baseline-mirror.json` gates the control |
 | WAL amplification: a number in a note | **A first-class, gated signal.** The run FAILS if it regresses |
 | `wal_bytes: 0` published for months, gate green | **Impossible now** — a zeroed or under-counted WAL fails the run |
-| Default wire run: 3 000 readings ≈ 59 MB WAL — *just below* the 64 MiB seal threshold, so **reclamation could never even be observed** | Default `reclaim` profile: 7 000 readings ≈ 150 MB WAL — seals and frees **two** segments |
+| Default wire run: 3 000 readings — too short to certify reclamation with the then-fixed 64 MiB seal | Default `reclaim` profile: 7 000 readings ≈ 143 MB WAL — seals and frees **dozens** of small store-proportional segments |
 
-The last row was the quiet one. The old default was sized so that the very reclamation the example claims
-**never ran**: its WAL climbed monotonically to 59 MB and *not one byte* was ever freed. An example whose
-headline is "reclamation holds the footprint flat" must not be sized so that reclamation never happens.
+The last row was the quiet one: the old default was sized so that — with the then-fixed 64 MiB seal —
+the very reclamation the example claims never ran. `rmp #706` later made the seal size store-proportional,
+so segments are now small and even short runs reclaim; the `reclaim` profile remains the default because it
+sustains the churn long enough to reach a clear, stable steady state.
 
 ---
 
@@ -149,15 +151,15 @@ RUN_WIRE=0             examples/iot-timeseries/run.sh # CONTROL mirror only — 
 Every figure in this README comes from the **`reclaim`** profile unless the table says otherwise. The
 profiles are not interchangeable, and the difference is not cosmetic:
 
-| Wire profile | Readings | Cumulative WAL | Seals a 64 MiB segment? | What it can prove |
+| Wire profile | Readings | Cumulative WAL | Reaches a stable steady state? | What it can prove |
 | --- | --- | --- | --- | --- |
-| **`reclaim`** (default) | 7 000 | ~150 MB | **yes — twice** (ticks 68, 128) | the full cycle: WAL grows, a segment seals, ~63 MiB comes back |
-| `fast` | 3 000 | ~59 MB | **no** — stops *just below* the threshold | that a small database's WAL climbs monotonically and **nothing is ever reclaimed** |
+| **`reclaim`** (default) | 7 000 | ~143 MB | **yes** — dozens of reclaims, a tight WAL sawtooth | the full cycle at steady state: the store plateaus, the WAL sawtooths and comes back |
+| `fast` | 3 000 | ~59 MB | shorter — reclaims (store-proportional segments) but ends further from steady state | a quick smoke of the same churn (post-#706 it still reclaims) |
 | `soak` | 9 000 | ~180 MB | yes | the plateau held over hundreds of consecutive post-warmup ticks |
 
-`fast` is a legitimate measurement — it is the purest statement of the #706 defect — but it **cannot
-certify reclamation**, and the run says so out loud rather than inheriting the green tick the store's
-plateau earned. The default is `reclaim` precisely so the CI gate (`rmp` #704) exercises the branch that
+`fast` is a legitimate measurement but it ends further from steady state than `reclaim`, so the run says
+which of the two it measured rather than inheriting the green tick the store's plateau earned. The default
+is `reclaim` precisely so the CI gate (`rmp` #704) exercises the branch that
 demands WAL disk actually come back. Its churn loop takes **~9.5 s**.
 
 ### Against an already-running instance (attach mode)
@@ -238,16 +240,16 @@ artefact of a workload that simply wrote nothing.
 | --- | --- | --- |
 | Store data image (`graphus.store`) | **229 376 B** | the graph itself — **0.3 %** of the footprint |
 | Doublewrite buffer (`graphus.dwb`) | **8 871 936 B** | a **fixed preallocation** per database — not graph data, and deliberately not counted as store |
-| WAL, **cumulative** bytes written (= `bytes_fsynced`) | **150 743 014 B** | every WAL byte is fsynced before its commit is acknowledged |
-| WAL, on-disk **peak** | **70 467 060 B** | the honest worst case — the residual alone depends on where in the sawtooth the run stopped |
-| WAL, residual at exit | **16 505 196 B** | never quote this without the peak beside it |
-| **WAL segments reclaimed** | **2 events, 131 837 460 B returned** | the on-disk WAL physically *shrank* twice — reclamation of WAL disk **does** work; it is simply far too coarse |
-| **Total durable footprint** (store + WAL) | peak **79 568 372 B**, min **11 171 141 B** | **plateau ratio 7.12** — the DATABASE does **not** plateau |
-| **Peak footprint per byte of graph** | **347×** | the disk a deployment must actually provision |
-| Kernel `write_bytes` (`/proc/<server-pid>/io`) | **188 534 784 B** | an independent cross-check from *outside* the engine |
+| WAL, **cumulative** bytes written (= `bytes_fsynced`) | **142 040 524 B** | every WAL byte is fsynced before its commit is acknowledged |
+| WAL, on-disk **peak** | **5 426 043 B** | the honest worst case — ~13× smaller than the ~70 MB peak while #706 was open |
+| WAL, residual at exit | **1 634 347 B** | never quote this without the peak beside it |
+| **WAL segments reclaimed** | **36 events, 96 551 056 B returned** | the on-disk WAL physically *shrank* 36 times — small store-proportional segments come back on nearly every checkpoint (`rmp #706`) |
+| **Total durable footprint** (store + WAL) | peak **14 527 355 B**, min **9 369 259 B** | **plateau ratio 1.55** — a tight sawtooth (was 7.12 while #706 was open) |
+| **Peak footprint per byte of graph** | **63×** | the disk a deployment must provision — down from 347× |
+| Kernel `write_bytes` (`/proc/<server-pid>/io`) | **189 947 904 B** | an independent cross-check from *outside* the engine |
 | Logical payload ingested | **189 000 B** | 7 000 readings × 27 B (`sensor` + `seq` + `ts` + `value`) |
-| **Write amplification** | **798.8×** | (cumulative WAL + data image) / logical bytes ingested |
-| **Space amplification** | **4 741.9×** | total on-disk / logical bytes retained at steady state |
+| **Write amplification** | **752.8×** | (cumulative WAL + data image) / logical bytes ingested — the WAL *format* (dual redo/undo), which #706 did not change |
+| **Space amplification** | **~1 988×** | total on-disk / logical bytes retained at steady state (was ~4 742×); it is now dominated by the fixed 8.9 MB doublewrite preallocation, not the WAL |
 | WAL bytes **per commit** | **~21 KB** | for a 27-byte reading. This is the number `rmp` #706 has to move. |
 
 The amplification figures are staggering, and they are **correct**. They are dominated by the WAL (89 % of

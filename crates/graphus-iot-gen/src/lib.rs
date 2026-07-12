@@ -198,23 +198,27 @@ impl GenConfig {
     /// The **reclaim** profile — the DEFAULT for the file-backed wire run, and the only profile sized
     /// so the WAL's reclamation cycle is actually *observable* (`rmp` #713).
     ///
-    /// # Why the fast profile cannot certify reclamation
+    /// # Why the reclaim profile is the default
     ///
-    /// WAL disk is freed in whole **segment** units, and a segment is only sealed once it reaches
-    /// `DEFAULT_SEGMENT_TARGET_BYTES` = 64 MiB (`graphus-wal/src/sink.rs`). Measured on this workload,
-    /// one reading costs ~21.5 KB of WAL, so the `fast` profile's 3,000 readings produce ~59 MB — it
-    /// stops just *below* the seal threshold. Its WAL therefore climbs monotonically and **not one byte
-    /// is ever reclaimed**: a run that never seals a segment can neither observe reclamation nor prove
-    /// its absence is benign. An example whose headline is "reclamation holds the footprint flat" must
-    /// not be sized so that the reclamation it claims never runs.
+    /// WAL disk is freed in whole **segment** units, and a segment seals at a store-proportional size
+    /// (`clamp(store_bytes, 1 MiB, 64 MiB)`, `graphus_wal::segment_target_for_store`, `rmp` #706) — for a
+    /// store this size, the 1 MiB floor. Measured on this workload, one reading costs ~20 KB of WAL, so a
+    /// sustained run seals and frees many small segments as it goes. The `reclaim` profile is sized to run
+    /// the churn long enough to reach a clear steady state — the store plateau AND a WAL that sawtooths in
+    /// a tight, store-proportional band with dozens of observed reclamations — and to end at a stable
+    /// point rather than a coin-flip on which side of the sawtooth the run stopped.
+    ///
+    /// (Before #706 the seal size was a fixed 64 MiB, so a short run such as the old `fast` profile — ~59
+    /// MB of WAL — never crossed one seal and reclaimed nothing; the reclaim profile existed to cross that
+    /// 64 MiB threshold. #706 removed that cliff: segments are now small and even short runs reclaim.)
     ///
     /// # Sizing (measured, not guessed)
     ///
-    /// 140 ticks × 50 readings = 7,000 readings ≈ 150 MB of cumulative WAL — enough to seal and free
-    /// **two** segments (observed at ticks 68 and 128, each returning ~63 MiB), while ending at a
-    /// ~16.5 MB residual, far from the next seal boundary so the end state is stable rather than a
-    /// coin-flip on which side of the sawtooth the run stopped. The churn loop runs in ~9.5 s, so it
-    /// stays inside a CI budget (`rmp` #704), and it is byte-for-byte reproducible across runs.
+    /// 140 ticks × 50 readings = 7,000 readings ≈ 143 MB of cumulative WAL — sealing and freeing dozens of
+    /// store-proportional segments along the way (this run: 37 observed reclamations returning ~96 MB of
+    /// WAL disk), and ending at a small ~1.7 MB residual near the bottom of the sawtooth. The churn loop
+    /// runs in ~9.5 s, so it stays inside a CI budget (`rmp` #704), and it is byte-for-byte reproducible
+    /// across runs.
     #[must_use]
     pub fn reclaim() -> Self {
         Self {
