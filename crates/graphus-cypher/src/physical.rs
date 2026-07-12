@@ -1565,6 +1565,22 @@ impl Planner<'_> {
             return seek;
         }
 
+        // Correlated (row-valued) index seek (`rmp` task #708). A `Filter` sitting over an
+        // [`Apply`](LogicalOp::Apply) whose RIGHT branch is a bare label scan, carrying an
+        // equality/range conjunct on the right's node keyed by a value that references only the
+        // LEFT (correlated) branch — the shape `UNWIND rows AS t MATCH (b:L {p: t.k})` lowers to —
+        // seeks the `(label, prop)` index **per left row** instead of scanning every `:L` node and
+        // filtering. Without this the correlation lives in the `Filter` **above** a cartesian
+        // nested-loop join, so each of the N left rows drives a full O(store) label scan (the
+        // O(N)-per-row cost measured on `social-network-uds` #697; the root of the #312 family's
+        // O(E·N) bulk-over-Cypher). Runs before the bare-label-scan path below (whose `input` is a
+        // scan, not an `Apply`), so the two are disjoint.
+        if let LogicalOp::Apply { left, right } = input
+            && let Some(seek) = self.try_correlated_index_seek(left, right, predicate, deps)
+        {
+            return seek;
+        }
+
         // Index selection only fires directly over a label scan (the logical anchor of a labelled
         // node). Anything else: lower the input normally and keep the predicate as a residual filter.
         let LogicalOp::NodeByLabelScan { variable, label } = input else {
@@ -1789,6 +1805,88 @@ impl Planner<'_> {
             input: Box::new(scan),
             predicate: predicate.clone(),
         }
+    }
+
+    /// Attempts to lower a `Filter` over an [`Apply`](LogicalOp::Apply) whose RIGHT branch is a bare
+    /// [`NodeByLabelScan`](LogicalOp::NodeByLabelScan) into a **per-left-row index seek** on that
+    /// node, when a conjunct is an index-usable equality/range on the right node keyed by a value that
+    /// references only the LEFT (correlated) branch (`rmp` task #708). Returns [`None`] (the caller
+    /// keeps its normal paths) unless that exact shape and an `(label, property)` index both hold.
+    ///
+    /// This is the fix for the O(N)-per-row cost of `UNWIND rows AS t MATCH (b:L {p: t.k})` (and the
+    /// two-anchor `MATCH (a:L {p: r.x}), (b:L {p: r.y}) CREATE …` of the #312 family): the logical
+    /// planner leaves the correlation in a `Filter` **above** a cartesian nested-loop join, so each of
+    /// the N left rows drives a full label scan of every `:L` node. Because the right branch binds
+    /// **only** `variable` (a bare label scan), `analyze_property_predicate` already guarantees the seek
+    /// value does not reference it, so the value's free variables are a subset of the left branch's
+    /// bindings — available as the nested-loop **correlation row** (`arg`) when the right branch is
+    /// rebuilt per left row. The executor's seek operators therefore evaluate the value against that
+    /// correlation row (not the empty row), yielding an index seek per left row instead of a scan.
+    ///
+    /// **Soundness.** The seek returns the identical node set the label-scan-and-filter did: the seam
+    /// re-checks each candidate's visibility, current label and current property value, and the seek is
+    /// keyed by the same value the `Filter` compared against. A [`NestedLoopJoin`](PhysicalOp::NestedLoopJoin)
+    /// is emitted unconditionally (never a hash join): the right branch now reads the left row's
+    /// bindings, so only the per-left-row realisation is correct. Remaining conjuncts re-attach as a
+    /// residual [`Filter`](PhysicalOp::Filter) **above** the join, where the merged left+right row makes
+    /// every variable they reference visible.
+    fn try_correlated_index_seek(
+        &self,
+        left: &LogicalOp,
+        right: &LogicalOp,
+        predicate: &Expr,
+        deps: &mut BTreeSet<IndexId>,
+    ) -> Option<PhysicalOp> {
+        // The right branch must be a **bare** label scan: it then binds exactly `variable`, so any
+        // conjunct value that does not reference `variable` references only the left (correlated)
+        // branch — the invariant the per-left-row seek relies on. A richer right branch (an expand
+        // chain, a nested apply) could bind other variables the value might close over, so it declines
+        // here and keeps its normal lowering.
+        let LogicalOp::NodeByLabelScan { variable, label } = right else {
+            return None;
+        };
+
+        let conjuncts = split_conjuncts(predicate);
+        // Find the first conjunct that is an index-usable equality/range on the right node whose value
+        // is independent of that node (hence of the whole right branch). This mirrors the bare-label-scan
+        // index-selection loop, but the anchor is the correlated right branch of the join.
+        for (i, conj) in conjuncts.iter().enumerate() {
+            let Some(pp) = analyze_property_predicate(conj, &variable.name) else {
+                continue;
+            };
+            let Some(idx) = self.match_index(label, &pp) else {
+                continue;
+            };
+            deps.insert(idx.id);
+            let seek = build_seek(variable, label, &pp, idx.id);
+
+            // Lower the left branch and preserve the `Apply` lowering's eager barrier: if the left
+            // performs a write and the right reads the graph, the left must settle into an `Eager`
+            // buffer before the per-left-row seek runs, so a later `MATCH` never observes the left's
+            // own in-flight writes (the openCypher eagerness rule; see the `LogicalOp::Apply` arm).
+            let phys_left = self.lower(left, deps);
+            let phys_left = if contains_write(&phys_left) && contains_read(&seek) {
+                PhysicalOp::Eager {
+                    input: Box::new(phys_left),
+                }
+            } else {
+                phys_left
+            };
+            let join = PhysicalOp::NestedLoopJoin {
+                left: Box::new(phys_left),
+                right: Box::new(seek),
+            };
+            // Re-attach the remaining conjuncts (all but the consumed one) as a residual filter above
+            // the join, preserving their order.
+            let residual: Vec<&Expr> = conjuncts
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, e)| *e)
+                .collect();
+            return Some(attach_residual(join, &residual));
+        }
+        None
     }
 
     /// Attempts to lower a `Filter` carrying an **equality on a relationship variable**, sitting over a
@@ -2603,6 +2701,16 @@ fn scan_alternative_for_seek(op: &PhysicalOp, catalog: &IndexCatalog) -> Option<
         PhysicalOp::Filter { input, predicate } => (Some(predicate.clone()), input.as_ref()),
         other => (None, other),
     };
+
+    // A **correlated** seek (its value references an outer variable, `rmp` task #708 — the right branch
+    // of a nested-loop join, keyed per driving row) must NEVER be reverted to a scan. The range revert
+    // rebuilds the consumed predicate as a `Filter` in the correlated branch, where the outer variable
+    // is out of scope (that branch's row carries only the seek's own node), yielding a wrong result;
+    // and the equality revert is pointless — the per-row seek is already the tight, correct access path
+    // (it also keeps the narrow SSI footprint of `rmp` #325). Keep the seek.
+    if contains_correlated_seek(seek) {
+        return None;
+    }
 
     // Equality seek: the scan alternative is the **precise** `NodeLabelScanEq` access path (`rmp` task
     // #325), NOT a bare `NodeByLabelScan`/`TokenLookupScan` + equality `Filter`. The precise op consumes
@@ -3538,13 +3646,92 @@ fn is_reorderable_join(op: &PhysicalOp) -> bool {
     }
 }
 
-/// Whether both join sides are safe to reorder: independent of a correlation argument and free of any
-/// write operator (a write's side effects must run in the planned order, never be reordered).
+/// Whether both join sides are safe to reorder: independent of a correlation argument (an
+/// [`Argument`](PhysicalOp::Argument) leaf **or** a correlated seek keyed off an outer row, `rmp` task
+/// #708) and free of any write operator (a write's side effects must run in the planned order, never
+/// be reordered).
 fn sides_reorderable(left: &PhysicalOp, right: &PhysicalOp) -> bool {
     !contains_argument(left)
         && !contains_argument(right)
+        && !contains_correlated_seek(left)
+        && !contains_correlated_seek(right)
         && !contains_write(left)
         && !contains_write(right)
+}
+
+/// Whether a physical (sub)plan contains a **correlated index seek** — a node property seek whose
+/// value expression references a variable, so its key is only known per driving row and is fed
+/// through the enclosing nested-loop join's correlation (`rmp` task #708, the
+/// `UNWIND rows AS t MATCH (b:L {p: t.k})` shape). Unlike an [`Argument`](PhysicalOp::Argument) leaf,
+/// this correlation is carried in the seek's *value*, not a distinct leaf — so [`contains_argument`]
+/// misses it. The cost-based reorderer must treat such a subplan as immovable (never hoist it to the
+/// outer side of a join, where the correlated key would be unbound), exactly as it does an argument.
+fn contains_correlated_seek(op: &PhysicalOp) -> bool {
+    // Only the node property seeks that carry an unevaluated value expression can be correlated (the
+    // planner keys them off a value that may reference an outer variable). Every other leaf has no
+    // value expression to correlate on.
+    let seek_value_correlated = match op {
+        PhysicalOp::NodeIndexSeek { value, .. }
+        | PhysicalOp::NodeIndexRangeSeek { value, .. }
+        | PhysicalOp::NodeLabelScanEq { value, .. } => expr_contains_variable(value),
+        PhysicalOp::NodeCompositeIndexSeek { values, .. } => {
+            values.iter().any(expr_contains_variable)
+        }
+        PhysicalOp::NodeIndexStartsWithSeek { prefix, .. } => expr_contains_variable(prefix),
+        _ => false,
+    };
+    if seek_value_correlated {
+        return true;
+    }
+    match op {
+        PhysicalOp::AllNodesScan { .. }
+        | PhysicalOp::NodeByLabelScan { .. }
+        | PhysicalOp::TokenLookupScan { .. }
+        | PhysicalOp::NodeIndexSeek { .. }
+        | PhysicalOp::NodeCompositeIndexSeek { .. }
+        | PhysicalOp::NodeLabelScanEq { .. }
+        | PhysicalOp::NodeIndexRangeSeek { .. }
+        | PhysicalOp::NodeIndexScan { .. }
+        | PhysicalOp::NodeIndexStartsWithSeek { .. }
+        | PhysicalOp::SpatialIndexSeek { .. }
+        | PhysicalOp::NodeTextIndexSeek { .. }
+        | PhysicalOp::AllRelationshipsScan { .. }
+        | PhysicalOp::RelIndexSeek { .. }
+        | PhysicalOp::RelCompositeIndexSeek { .. }
+        | PhysicalOp::RelSpatialIndexSeek { .. }
+        | PhysicalOp::Argument { .. }
+        | PhysicalOp::Empty => false,
+        PhysicalOp::Filter { input, .. }
+        | PhysicalOp::Projection { input, .. }
+        | PhysicalOp::Aggregation { input, .. }
+        | PhysicalOp::Sort { input, .. }
+        | PhysicalOp::TopN { input, .. }
+        | PhysicalOp::Skip { input, .. }
+        | PhysicalOp::Limit { input, .. }
+        | PhysicalOp::Eager { input }
+        | PhysicalOp::Unwind { input, .. }
+        | PhysicalOp::LoadCsv { input, .. }
+        | PhysicalOp::ExpandAll { input, .. }
+        | PhysicalOp::ExpandInto { input, .. }
+        | PhysicalOp::ShortestPath { input, .. }
+        | PhysicalOp::QuantifiedPath { input, .. }
+        | PhysicalOp::NamedPath { input, .. }
+        | PhysicalOp::Optional { input, .. }
+        | PhysicalOp::Create { input, .. }
+        | PhysicalOp::Merge { input, .. }
+        | PhysicalOp::SetClause { input, .. }
+        | PhysicalOp::Delete { input, .. }
+        | PhysicalOp::Remove { input, .. }
+        | PhysicalOp::Foreach { input, .. } => contains_correlated_seek(input),
+        PhysicalOp::NestedLoopJoin { left, right }
+        | PhysicalOp::HashJoin { left, right, .. }
+        | PhysicalOp::Union { left, right, .. } => {
+            contains_correlated_seek(left) || contains_correlated_seek(right)
+        }
+        PhysicalOp::ProcedureCall { input, .. } => {
+            input.as_deref().is_some_and(contains_correlated_seek)
+        }
+    }
 }
 
 /// Whether a physical (sub)plan contains an [`Argument`](PhysicalOp::Argument) anywhere — the
@@ -4279,6 +4466,59 @@ fn expr_references_var(expr: &Expr, variable: &str) -> bool {
         // Comprehensions, quantifiers, reduce, map projections and existential subqueries establish
         // their own scope (or read the graph); conservatively treat them as referencing the variable
         // so a seek is never built on a value that might shadow/close over it.
+        ExprKind::ListComprehension(_)
+        | ExprKind::PatternComprehension(_)
+        | ExprKind::Quantifier(_)
+        | ExprKind::Reduce(_)
+        | ExprKind::MapProjection(_)
+        | ExprKind::ExistsSubquery(_)
+        | ExprKind::CountSubquery(_)
+        | ExprKind::CollectSubquery(_) => true,
+    }
+}
+
+/// Whether `expr` references **any** variable (`n`, `n.p`, `f(n)`, …). A seek whose value expression
+/// satisfies this is a **correlated seek** (`rmp` task #708): its key is only known per driving row,
+/// fed through the enclosing nested-loop join's correlation, so the reorderer must never move it (see
+/// [`contains_correlated_seek`]). A literal-/parameter-only value references no variable and is safe
+/// to reorder. Conservative for scope-establishing forms (comprehensions, subqueries): treated as
+/// referencing a variable, so a seek built on one is pinned rather than risk being reordered.
+fn expr_contains_variable(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Variable(_) => true,
+        ExprKind::Literal(_) | ExprKind::Parameter(_) | ExprKind::CountStar => false,
+        ExprKind::Binary { lhs, rhs, .. } => {
+            expr_contains_variable(lhs) || expr_contains_variable(rhs)
+        }
+        ExprKind::Unary { operand, .. }
+        | ExprKind::HasLabels { operand, .. }
+        | ExprKind::TypePredicate { operand, .. }
+        | ExprKind::NormalizedPredicate { operand, .. } => expr_contains_variable(operand),
+        ExprKind::Predicate { operand, rhs, .. } => {
+            expr_contains_variable(operand) || rhs.as_deref().is_some_and(expr_contains_variable)
+        }
+        ExprKind::Property { base, .. } => expr_contains_variable(base),
+        ExprKind::Index { base, index } => {
+            expr_contains_variable(base) || expr_contains_variable(index)
+        }
+        ExprKind::Slice { base, low, high } => {
+            expr_contains_variable(base)
+                || low.as_deref().is_some_and(expr_contains_variable)
+                || high.as_deref().is_some_and(expr_contains_variable)
+        }
+        ExprKind::FunctionCall { args, .. } => args.iter().any(expr_contains_variable),
+        ExprKind::List(items) => items.iter().any(expr_contains_variable),
+        ExprKind::Map(entries) => entries.iter().any(|(_, v)| expr_contains_variable(v)),
+        ExprKind::Case(case) => {
+            case.subject.as_deref().is_some_and(expr_contains_variable)
+                || case.alternatives.iter().any(|alt| {
+                    expr_contains_variable(&alt.when) || expr_contains_variable(&alt.then)
+                })
+                || case
+                    .else_expr
+                    .as_deref()
+                    .is_some_and(expr_contains_variable)
+        }
         ExprKind::ListComprehension(_)
         | ExprKind::PatternComprehension(_)
         | ExprKind::Quantifier(_)
@@ -5607,6 +5847,136 @@ mod tests {
         let plan = physical("MATCH (n:Person) WHERE n.age = 30 RETURN n", &catalog);
         assert!(plan.to_string().contains("NodeIndexSeek"), "{plan}");
         assert_eq!(plan.index_dependencies().count(), 1);
+    }
+
+    #[test]
+    fn row_valued_correlated_equality_anchor_becomes_index_seek() {
+        // `rmp` task #708 regression PIN. A row-valued (correlated) equality anchor —
+        // `UNWIND rows AS t MATCH (b:Person {uid: t.uid})` — MUST lower to a per-left-row
+        // `NodeIndexSeek` keyed off the correlation value, NOT fall back to an O(N)-per-row label
+        // scan. This is the seek PATH (not the syntax), so every formulation the planner emits must
+        // hold: inline pattern property, explicit `WHERE`, and a `WITH`-projected key. A future
+        // change that silently drops the correlated anchor back to a `NodeByLabelScan` fails here.
+        let catalog = IndexCatalog::builder()
+            .with_label_property("Person", "uid")
+            .build();
+
+        for src in [
+            "UNWIND $rows AS t MATCH (b:Person {uid: t.uid}) RETURN b",
+            "UNWIND $rows AS t MATCH (b:Person) WHERE b.uid = t.uid RETURN b",
+            "UNWIND $rows AS t WITH t.uid AS u MATCH (b:Person {uid: u}) RETURN b",
+            "UNWIND [{uid: 1}, {uid: 2}] AS t MATCH (b:Person {uid: t.uid}) RETURN b",
+        ] {
+            let plan = physical(src, &catalog);
+            let rendered = plan.to_string();
+            assert!(
+                rendered.contains("NodeIndexSeek"),
+                "the correlated anchor must lower to an index seek: {src}\n{rendered}"
+            );
+            assert!(
+                !rendered.contains("NodeByLabelScan"),
+                "the correlated anchor must NOT fall back to a label scan: {src}\n{rendered}"
+            );
+            assert!(
+                rendered.contains("NestedLoopJoin"),
+                "the correlated seek is driven per-left-row by a nested-loop join: {src}\n{rendered}"
+            );
+            assert_eq!(
+                plan.index_dependencies().count(),
+                1,
+                "the correlated seek records its IndexId dependency: {src}"
+            );
+        }
+    }
+
+    #[test]
+    fn cost_based_optimizer_never_moves_or_reverts_the_correlated_seek() {
+        // `rmp` task #708: the correlated seek's key is fed per driving row through the nested-loop
+        // join, so the cost-based optimiser must treat it as immovable — never hoist it to the OUTER
+        // (left) side of the join (where the key would be unbound), and never revert it to a scan (the
+        // range revert would rebuild a `Filter` in the correlated branch where the outer variable is
+        // out of scope). With a large `:Person` count the cost model would be tempted to reorder/revert
+        // a normal join; here the cost-based tree must be byte-identical to the rule-based one.
+        use crate::graph_access::{GraphAccess, MemGraph};
+        use graphus_core::Value;
+
+        let catalog = IndexCatalog::builder()
+            .with_label_property("Person", "uid")
+            .build();
+        let mut g = MemGraph::new();
+        for i in 0..2000 {
+            g.add_node(["Person"], [("uid", Value::Integer(i))]);
+        }
+
+        for src in [
+            "UNWIND $rows AS t MATCH (b:Person {uid: t.uid}) RETURN b",
+            "UNWIND $rows AS t MATCH (b:Person) WHERE b.uid > t.uid RETURN b",
+            "UNWIND $rows AS r MATCH (a:Person {uid: r.src}), (b:Person {uid: r.dst}) \
+             CREATE (a)-[:KNOWS]->(b)",
+        ] {
+            let logical = logical_of(src);
+            let rule_based = plan_physical(&logical, &catalog);
+            let cost_based = plan_physical_with_stats(&logical, &catalog, g.statistics());
+            assert_eq!(
+                rule_based.root, cost_based.root,
+                "the cost-based optimiser must not disturb the correlated seek: {src}\n\
+                 rule-based:\n{rule_based}\ncost-based:\n{cost_based}"
+            );
+            // And the seek is genuinely there (an equality anchor keeps its `NodeIndexSeek`; the
+            // range anchor a `NodeIndexRangeSeek`) — neither reverted to a bare label scan.
+            let rendered = cost_based.to_string();
+            assert!(
+                rendered.contains("IndexSeek") || rendered.contains("IndexRangeSeek"),
+                "the correlated anchor stays a seek under cost-based planning: {src}\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_anchor_correlated_create_seeks_both_anchors() {
+        // `rmp` task #708 / the #312 family: the two-anchor bulk-edge shape
+        // `UNWIND rows AS r MATCH (a:Person {uid: r.src}), (b:Person {uid: r.dst}) CREATE (a)-[…]->(b)`
+        // nests two correlated `Filter`-over-`Apply`s; BOTH anchors must become index seeks (turning
+        // O(E·N) bulk-over-Cypher into O(E)). Exactly two seeks, zero label scans.
+        let catalog = IndexCatalog::builder()
+            .with_label_property("Person", "uid")
+            .build();
+        let plan = physical(
+            "UNWIND $rows AS r MATCH (a:Person {uid: r.src}), (b:Person {uid: r.dst}) \
+             CREATE (a)-[:KNOWS]->(b)",
+            &catalog,
+        );
+        let rendered = plan.to_string();
+        assert_eq!(
+            rendered.matches("NodeIndexSeek").count(),
+            2,
+            "both anchors must seek the index:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("NodeByLabelScan"),
+            "neither anchor may fall back to a label scan:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn correlated_equality_on_unindexed_property_stays_a_scan() {
+        // The lowering fires only when a `(label, property)` index exists; with NO index the
+        // correlated anchor must remain a label scan (no phantom seek). Guards that the new path is
+        // gated on `match_index`, never firing speculatively.
+        let catalog = IndexCatalog::empty();
+        let plan = physical(
+            "UNWIND $rows AS t MATCH (b:Person {uid: t.uid}) RETURN b",
+            &catalog,
+        );
+        let rendered = plan.to_string();
+        assert!(
+            !rendered.contains("NodeIndexSeek"),
+            "no index ⇒ no seek:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("NodeByLabelScan") || rendered.contains("NodeLabelScanEq"),
+            "the anchor stays a scan when unindexed:\n{rendered}"
+        );
     }
 
     #[test]

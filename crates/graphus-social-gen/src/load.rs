@@ -15,17 +15,19 @@
 //! The example's purpose is to evaluate Graphus on a **large** graph, so the ingest path must scale.
 //! Two ingest strategies were considered, and the choice is justified by evidence:
 //!
-//! - **Per-edge Cypher `CREATE` is `O(E · N)` and does not reach large scale.** Creating an edge by id
-//!   with `MATCH (a:USER {id: …}), (b:USER {id: …}) CREATE (a)-[:FRIEND]->(b)` costs one lookup per
-//!   endpoint. The planner plan was dumped for *every* two-anchor shape tried — `MATCH (a {id}), (b
-//!   {id})`, two separate `MATCH` clauses, `MATCH … WITH … MATCH`, and `MATCH (a),(b) WHERE a.id=… AND
-//!   b.id=…` — and in all of them the rule-based planner index-seeks at most **one** anchor:
-//!   `NodeIndexSeek(a) ⋈ {Filter over a TokenLookupScan/LabelScan of b}`. The *second* anchor's
-//!   predicate sits above the join, where the index-selection rewrite (which only fires on a `Filter`
-//!   directly over a `NodeByLabelScan`) cannot reach it. So even with the `:USER(id)` index present,
-//!   per-edge ingest is `O(E · N)`, not `O(E · log N)`. **This is a `graphus-cypher` planner
-//!   limitation (single-anchor index selection across a join); it is filed as an improvement** — and
-//!   it is the reason this loader does *not* ingest via Cypher.
+//! - **Per-edge Cypher `CREATE` is `O(E · log N)` — bounded, but still slower than the bulk path.**
+//!   Creating an edge by id with `MATCH (a:USER {id: …}), (b:USER {id: …}) CREATE (a)-[:FRIEND]->(b)`
+//!   costs one anchor lookup per endpoint. Historically the rule-based planner index-seeked at most
+//!   **one** anchor — the second anchor's equality was a *row-valued* (correlated) predicate sitting
+//!   above the join, which the index-selection rewrite (it fires on a `Filter` directly over a
+//!   `NodeByLabelScan`) could not reach — so it fell back to a full `O(N)` label scan per driving row,
+//!   making per-edge ingest `O(E · N)`. That is fixed (`rmp` task #708): a correlated equality anchor
+//!   now lowers to a per-left-row `NodeIndexSeek` keyed off the correlation row, so **both** anchors
+//!   seek and per-edge Cypher ingest is `O(E · log N)` (measured on the social-network-uds sweep:
+//!   per-row cost went from linear in `N` — ~0.6 ms/row at N=1k to ~10 ms/row at N=16k — to flat,
+//!   ~0.003 ms/row). This loader still ingests via the bulk path below, because that is `O(E)` (no
+//!   per-statement compile/commit) and is the production initial-load fast path — but per-edge Cypher
+//!   `CREATE` is no longer the quadratic cliff it was.
 //!
 //! - **The production bulk path (`graphus-bulk`'s [`BulkImporter`]) is `O(E)` and scales.** The
 //!   importer writes directly through the low-level store API and resolves each relationship endpoint
