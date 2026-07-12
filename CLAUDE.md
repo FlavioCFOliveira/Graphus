@@ -143,7 +143,9 @@ Task execution is the natural continuation (the next step) of planning. You MUST
 
 Whenever possible, you MUST adapt the model and the model's effort level to the requirements of each task's individual operations.
 
-Task and sprint execution should preferably be carried out sequentially. Sprints MUST only be executed sequentially; tasks may run in parallel if there is justification for it.
+**Task and sprint execution MUST be carried out sequentially.** Sprints MUST be executed sequentially, and tasks MUST be executed sequentially. Tasks MUST NEVER be run in parallel, regardless of any perceived justification: exactly one task may be in progress at any given moment, and it MUST be closed before the next one is started.
+
+This rule governs the execution of **tasks** (the units of work tracked in `rmp`). It does not restrict the internal execution of the single task that is currently in progress: within that one task you may still engage several subagents at the same time (see "Subagent team"), because subagents are not roadmap tasks.
 
 ## Knowledge Graph
 
