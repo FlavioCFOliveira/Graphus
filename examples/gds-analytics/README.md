@@ -140,14 +140,67 @@ The live workload (`data/analyze.js`) additionally captures the live `SHOW CONST
 INDEXES` catalog as evidence and proves the property-type constraint **rejects** a non-string
 `field_name` write (failing loudly if the engine were to accept it).
 
-### Two profiles
+### Three profiles
 
 | Profile | Authors | Fields | Citations (approx.) | Purpose |
 |---------|---------|--------|---------------------|---------|
-| `fast`  | 160 (4 × 40)    | 4 | ~1.1 k | CI + the official-driver E2E assertion |
-| `large` | 600 (6 × 100)   | 6 | ~4 k   | evidence-scale footprint |
+| `fast`     | 160 (4 × 40)      | 4 | ~1.1 k | correctness only — too small for a meaningful CPU measurement |
+| `moderate` | **2 400 (6 × 400)** | 6 | **~24 k** | **the DEFAULT** — the smallest graph at which per-algorithm SERVER CPU is real |
+| `large`    | 6 000 (6 × 1000)  | 6 | ~60 k  | footprint at volume |
 
-Both inject the **same** reference subgraph, so the reference assertions are profile-independent.
+All three inject the **same** reference subgraph, so the reference assertions are profile-independent.
+
+**Why the default is `moderate` (`rmp` #717).** The example exists to answer *"does GDS actually use
+the cores?"*, and at the old `fast` default (166 nodes) it could not: a `gds.betweenness.stream` call
+returns in well under a millisecond, so bracketing it against the OS's 10 ms CPU clock tick measures
+nothing — which is exactly how the project came to carry the unmeasured folklore that *"GDS uses 2 of
+9 cores"*. At `moderate` the algorithm calls are tens to hundreds of milliseconds, the per-algorithm
+CPU battery below resolves each to ~1 %, and the whole example still finishes in ~20 s — because the
+graph goes in through the **network bulk-import endpoint** (`data/bulk_load.py`, Mode A) in ~0.2 s
+rather than ~8 s of edge-by-edge Cypher. `GDS_PROFILE=fast` remains available for a quick
+correctness-only pass.
+
+### The 2-of-9-cores folklore, settled with real numbers
+
+Measured on an idle 16-core x86-64 host at the `moderate` default, per algorithm, by bracketing the
+**server** pid's cumulative CPU counters (`proc_watch --snapshot`) around each algorithm called
+enough times to span ~1 s of wall (so the 10 ms tick is noise):
+
+| Algorithm | ms/call | Server CPU | **Mean cores busy** |
+|-----------|--------:|-----------:|--------------------:|
+| `gds.closeness.stream` (weighted) | 1067 | 50.7 s | **15.8** |
+| `gds.betweenness.stream`          | 57   | 14.6 s | **14.2** |
+| `gds.closeness.stream`            | 12   | 12.6 s | **13.1** |
+| `gds.pageRank.stream` (weighted)  | 4.6  | 9.0 s  | **9.3** |
+| `gds.labelPropagation.stream`     | 3.5  | 9.3 s  | **7.2** |
+| `gds.pageRank.stream`             | 4.6  | 8.5 s  | **8.7** |
+| `gds.triangleCount.stream`        | 2.5  | 3.3 s  | **4.0** |
+| `gds.dijkstra.stream` (1 source)  | 5.4  | 0.6 s  | 0.8 |
+| `gds.wcc` / `gds.scc` / `gds.degree` / `gds.bellmanFord` | ~2.5 | ~0.4 s | ~0.5 |
+
+**The folklore is REFUTED.** The heavy centrality kernels are strongly multi-core — weighted
+closeness saturates **15.8 of 16 logical cores**, betweenness **14.2** — because `graphus-gds` fans
+each parallelisable algorithm across `rayon` workers (one source per task). The five algorithms that
+sit near one core are the ones that are *inherently* sequential or trivially cheap: single-source
+Dijkstra/Bellman-Ford (one source = one task), Tarjan SCC (a sequential DFS), and WCC / degree, which
+finish in ~2.5 ms — below the wall time at which a parallel split would pay for itself. This is not
+"GDS uses 2 of 9 cores"; it is "the algorithms that *can* parallelise do, to the machine's edge."
+
+The report (`report.md`) carries these as one **CPU-carrying phase per algorithm** (schema v4), so the
+per-algorithm core count is a first-class, versioned figure — not a sentence in a note. In **attach
+mode** the vector is **absent** (a remote target exposes no `/proc`), with a note saying so; it is
+never zero-filled.
+
+### The server memory an index costs (`rmp` #724)
+
+Bracketing the schema DDL against the server pid surfaced a hard fragility the example now reports:
+**a secondary index costs ~7.8 KB of resident server memory per indexed element, and never gives it
+back.** At `moderate`, declaring the schema (three constraints + a node RANGE index + a relationship
+RANGE index) adds ~217 MB of server RSS; isolated, the `:CITES(weight)` relationship index over 23 962
+relationships alone is ~160 MB, and at `large`'s 60 k relationships it is ~445 MB — linear. The GDS
+calls themselves do **not** leak (their memory is a one-time parallel working set: four consecutive
+passes of 18 `betweenness` calls measured +67.8 MB, then +0.8/+1.9/+1.0 MB — flat). Filed as `rmp`
+#724.
 
 ## The reference subgraph (analytically-known ground truth)
 
@@ -218,15 +271,21 @@ the workload exercises on the weighted projection (feature-detected — see the 
 From the repository root:
 
 ```bash
-examples/gds-analytics/run.sh                      # LOCAL: fast profile; official driver if node/npm present
-GDS_PROFILE=large examples/gds-analytics/run.sh    # LOCAL: evidence-scale dataset
+examples/gds-analytics/run.sh                      # LOCAL: moderate profile (default) + per-algorithm server CPU
+GDS_PROFILE=fast  examples/gds-analytics/run.sh     # LOCAL: quick correctness-only pass
+GDS_PROFILE=large examples/gds-analytics/run.sh     # LOCAL: footprint at volume
 RUN_DRIVER=0      examples/gds-analytics/run.sh     # LOCAL: skip the official-driver step (hermetic only)
+GDS_CPU_TARGET_SECS=2 examples/gds-analytics/run.sh # LOCAL: longer CPU brackets (tighter core numbers)
 GDS_SWEEP_SIZES=40,120,360 examples/gds-analytics/run.sh   # LOCAL: custom sweep field sizes
 ```
 
-> The committed baseline gate (below) is a **fast-profile** reference recorded with the **default**
-> sweep sizes (`40,120,360,1080`). Run with a custom `GDS_SWEEP_SIZES` or `GDS_PROFILE=large` and the
-> structural graph-size check is skipped/relaxed accordingly — keep the defaults for the gated run.
+> The committed baseline gate (below) is a **`moderate`-profile** reference (the default) recorded
+> with the **default** sweep sizes (`40,120,360,1080`). Its gated metrics are the *deterministic* CSR
+> sweep footprint, which is profile-independent, so the gate holds regardless of the loaded profile;
+> run with a custom `GDS_SWEEP_SIZES` and the structural check relaxes accordingly. The per-algorithm
+> SERVER CPU is machine-variant and is **not** gated — it is reported, not asserted to a number (the
+> assertion that *does* fire is "at least one algorithm keeps >1 core busy", which settles the folklore
+> without pinning a host-specific figure).
 
 Reuse pre-built binaries:
 

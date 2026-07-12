@@ -4,10 +4,10 @@
 
 use graphus_gds_gen::{GenConfig, Profile, generate};
 
-/// Both profiles emit byte-identical Cypher + reference JSON across independent generations.
+/// Every profile emits byte-identical Cypher + CSV + reference JSON across independent generations.
 #[test]
 fn profiles_are_byte_identical_across_runs() {
-    for profile in [Profile::Fast, Profile::Large] {
+    for profile in [Profile::Fast, Profile::Moderate, Profile::Large] {
         let cfg = profile.config();
         let a = generate(cfg, profile.name());
         let b = generate(cfg, profile.name());
@@ -16,6 +16,18 @@ fn profiles_are_byte_identical_across_runs() {
             a.to_cypher(),
             b.to_cypher(),
             "{} profile: graph.cypher diverged between runs",
+            profile.name()
+        );
+        assert_eq!(
+            a.authors_csv(),
+            b.authors_csv(),
+            "{} profile: nodes.csv diverged between runs",
+            profile.name()
+        );
+        assert_eq!(
+            a.relationships_csv(),
+            b.relationships_csv(),
+            "{} profile: relationships.csv diverged between runs",
             profile.name()
         );
         assert_eq!(

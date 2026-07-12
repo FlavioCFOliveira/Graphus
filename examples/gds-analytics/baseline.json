@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 4,
   "metadata": {
     "scenario": "gds-analytics",
     "description": "GDS analytics over Bolt/TCP+TLS via the official Neo4j driver: load a seeded influence network, assert the analytically-known reference outputs, compare weighted vs unweighted rankings, exercise write/mutate/stats, and characterise multi-threaded per-algorithm scaling + CSR footprint.",
@@ -9,29 +9,35 @@
     },
     "workload": {
       "algorithm_count": "9",
+      "bulk_load_rels_per_sec": "121745.1",
+      "bulk_load_secs": "0.1968",
+      "busiest_algorithm": "gds.closeness.stream (weighted)",
+      "busiest_algorithm_cores": "15.81",
       "connection": "bolt-tcp-tls",
       "driver": "official neo4j-driver",
       "engine_parallelism": "multi-threaded: pageRank, betweenness, closeness, wcc, triangleCount, degree, labelPropagation + multi-source dijkstra are rayon-parallel via a deterministic Execution knob (rmp #342/#559); scc + single-source dijkstra are sequential",
       "host_cores": "16",
-      "loaded_network_nodes": "166",
-      "loaded_network_rels": "1102",
+      "load_path": "network bulk-import (Mode A)",
+      "loaded_network_nodes": "2406",
+      "loaded_network_rels": "23962",
       "parallel_demo_field_size": "360",
       "parallel_demo_node_count": "1440",
       "parallel_deterministic_across_widths": "true",
-      "parallel_max_speedup": "9.7797",
+      "parallel_max_speedup": "9.9678",
       "parallel_thread_widths": "1,2,16",
-      "profile": "fast",
+      "profile": "moderate",
       "reference_csr_bytes": "514492",
       "reference_csr_bytes_per_edge": "5.9592",
       "reference_csr_bytes_per_node": "119.0954",
       "reference_edge_count": "86336",
       "reference_field_size": "1080",
       "reference_node_count": "4320",
+      "serial_algorithms": "5 of 12 measured (<1.5 cores)",
       "sweep_field_sizes": "40,120,360,1080",
       "sweep_measurements": "36",
       "sweep_repeats": "3"
     },
-    "started_unix_secs": 1783750125
+    "started_unix_secs": 1783863531
   },
   "host": {
     "os": "linux",
@@ -39,82 +45,163 @@
     "cpu_cores": 16,
     "hostname": "ROG",
     "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
-    "timestamp_unix_secs": 1783750125
+    "timestamp_unix_secs": 1783863531
   },
-  "total_millis": 4299.0,
+  "total_millis": 23197.0,
   "phases": [
     {
-      "name": "betweenness",
-      "millis": 285.52509999999995
+      "name": "library (in-process): betweenness",
+      "millis": 277.0323
     },
     {
-      "name": "closeness",
-      "millis": 50.939699999999995
+      "name": "library (in-process): closeness",
+      "millis": 49.3472
     },
     {
-      "name": "degree",
+      "name": "library (in-process): degree",
       "millis": 0.0034000000000000002
     },
     {
-      "name": "dijkstra",
-      "millis": 0.2947
+      "name": "library (in-process): dijkstra",
+      "millis": 0.27399999999999997
     },
     {
-      "name": "labelPropagation",
-      "millis": 1.8224
+      "name": "library (in-process): labelPropagation",
+      "millis": 1.7313999999999998
     },
     {
-      "name": "pageRank",
-      "millis": 2.0383
+      "name": "library (in-process): pageRank",
+      "millis": 2.0849
     },
     {
-      "name": "scc",
-      "millis": 0.23479999999999998
+      "name": "library (in-process): scc",
+      "millis": 0.2223
     },
     {
-      "name": "triangleCount",
-      "millis": 0.7810999999999999
+      "name": "library (in-process): triangleCount",
+      "millis": 0.6145999999999999
     },
     {
-      "name": "wcc",
-      "millis": 0.3247
+      "name": "library (in-process): wcc",
+      "millis": 0.31020000000000003
+    },
+    {
+      "name": "server (over Bolt): schema DDL [5 statements: constraints + node/rel RANGE indexes]",
+      "millis": 391.79999999999995,
+      "cpu_secs": 0.36,
+      "mean_core_utilisation": 0.9188361408882083
+    },
+    {
+      "name": "server (over Bolt): gds.pageRank.stream [infl_u]",
+      "millis": 971.1999999999999,
+      "cpu_secs": 8.4,
+      "mean_core_utilisation": 8.649093904448106
+    },
+    {
+      "name": "server (over Bolt): gds.pageRank.stream (weighted) [infl_w]",
+      "millis": 951.0999999999999,
+      "cpu_secs": 8.84,
+      "mean_core_utilisation": 9.29450110398486
+    },
+    {
+      "name": "server (over Bolt): gds.betweenness.stream [infl_u]",
+      "millis": 971.1999999999999,
+      "cpu_secs": 13.79,
+      "mean_core_utilisation": 14.198929159802306
+    },
+    {
+      "name": "server (over Bolt): gds.closeness.stream [infl_u]",
+      "millis": 971.0,
+      "cpu_secs": 12.86,
+      "mean_core_utilisation": 13.244078269824923
+    },
+    {
+      "name": "server (over Bolt): gds.closeness.stream (weighted) [infl_w]",
+      "millis": 3201.2999999999997,
+      "cpu_secs": 50.63,
+      "mean_core_utilisation": 15.815449973448288
+    },
+    {
+      "name": "server (over Bolt): gds.triangleCount.stream [infl_u]",
+      "millis": 838.7,
+      "cpu_secs": 3.29,
+      "mean_core_utilisation": 3.922737570048885
+    },
+    {
+      "name": "server (over Bolt): gds.labelPropagation.stream [infl_u]",
+      "millis": 1341.8000000000002,
+      "cpu_secs": 9.61,
+      "mean_core_utilisation": 7.162021165598449
+    },
+    {
+      "name": "server (over Bolt): gds.wcc.stream [infl_u]",
+      "millis": 964.9,
+      "cpu_secs": 0.48,
+      "mean_core_utilisation": 0.4974608767747953
+    },
+    {
+      "name": "server (over Bolt): gds.scc.stream [infl_u]",
+      "millis": 975.0,
+      "cpu_secs": 0.43,
+      "mean_core_utilisation": 0.441025641025641
+    },
+    {
+      "name": "server (over Bolt): gds.degree.stream [infl_u]",
+      "millis": 911.1,
+      "cpu_secs": 0.43,
+      "mean_core_utilisation": 0.471956975085062
+    },
+    {
+      "name": "server (over Bolt): gds.dijkstra.stream [infl_u]",
+      "millis": 762.2,
+      "cpu_secs": 0.62,
+      "mean_core_utilisation": 0.8134347940173182
+    },
+    {
+      "name": "server (over Bolt): gds.bellmanFord.stream [infl_u]",
+      "millis": 931.0,
+      "cpu_secs": 0.42,
+      "mean_core_utilisation": 0.45112781954887216
     }
   ],
   "cpu": {
-    "user_secs": 0.26,
-    "system_secs": 0.19,
-    "mean_core_utilisation": 0.225
+    "user_secs": 73.01,
+    "system_secs": 56.14,
+    "mean_core_utilisation": 7.175000000000001
   },
   "memory": {
-    "peak_rss_bytes": 144273408,
-    "final_rss_bytes": 144273408
+    "peak_rss_bytes": 637677568,
+    "final_rss_bytes": 637677568
   },
   "storage": {
-    "store_bytes": 270336,
-    "wal_bytes": 1566446,
-    "store_pages": 33,
-    "wal_pages": 192,
-    "bytes_fsynced": 1566446,
-    "write_amplification": 16.54967293172112,
-    "space_amplification": 16.54967293172112,
-    "bytes_per_node": 0.0,
-    "bytes_per_relationship": 0.0,
-    "plateau_ratio": 0.0
+    "store_bytes": 4816896,
+    "wal_bytes": 36267411,
+    "store_pages": 588,
+    "wal_pages": 4428,
+    "bytes_fsynced": 36267411,
+    "write_amplification": 78.54051351852524,
+    "space_amplification": 17.442025355363114,
+    "bytes_per_node": 2002.0349127182044,
+    "bytes_per_relationship": 201.02228528503463
   },
   "throughput": {
-    "operations": 48,
-    "ops_per_sec": 83.33333333333334,
-    "p50_latency_ms": 2.8320000022649765,
-    "p99_latency_ms": 125.34400000050664,
-    "p999_latency_ms": 125.34400000050664,
-    "abort_rate": 0.0
+    "operations": 39,
+    "ops_per_sec": 48.87218045112782,
+    "p50_latency_ms": 4.702999979257584,
+    "p99_latency_ms": 299.92900002002716,
+    "p999_latency_ms": 299.92900002002716
   },
   "measurement_mode": "local",
   "notes": [
-    "Live CPU/RAM is graphus-server pid 133622 over 2.000s uptime (the official-driver load + analyze path). The per-algorithm timings + CSR footprint below come from the hermetic, multi-threaded gds_sweep, which computes the same results with or without a server.",
+    "SERVER MEMORY — declaring the schema cost 217.3 MB of RESIDENT server memory (209.6 MB -> 426.9 MB) for 5 statements over a 2400-node / 23962-relationship graph, and the server NEVER GIVES IT BACK. Isolated per statement on this host: the :CITES(weight) relationship RANGE index over 23 962 relationships alone costs ~160 MB (~7 KB of RSS per indexed relationship, LINEAR in the element count — 59 967 relationships cost 445 MB); the :Author(field) node index costs ~39 MB; the UNIQUE constraint ~20 MB; the two property-TYPE constraints, which build no index, cost nothing. Filed as rmp #724 — at this rate a single index over 1 M relationships needs ~7.5 GB of RSS. This example's own evidence is what surfaced it.",
+    "SERVER MEMORY — the GDS calls do NOT leak; their memory is a ONE-TIME working set. Across the battery's 2906 algorithm calls the server's RSS moved +68.1 MB, and that growth is first-touch, not per-call: a control on this host ran four consecutive passes of 18 gds.betweenness.stream calls and measured +67.8 MB on the FIRST pass (the parallel Brandes scratch, allocated once across the 16 rayon workers) then +0.8 / +1.9 / +1.0 MB on the next three — flat. A second control of 300 back-to-back gds.pageRank.stream calls moved RSS by 0.0 MB. The memory this example does NOT get back is the INDEX memory above (rmp #724), not the analytics.",
+    "PER-ALGORITHM SERVER CPU (rmp #717): each algorithm was called repeatedly over Bolt against graphus-server pid 1761237 on a 16-core host, with the phase bracketed between two reads of the SERVER's cumulative CPU counters (proc_watch --snapshot), over a 2400-author / 23962-relationship projection. 12 of 12 algorithms produced a resolvable CPU figure; the busiest was gds.closeness.stream (weighted) at 15.81 cores. The rest are recorded as NOT MEASURED with their reason — never as 0.",
+    "Per-algorithm cores: gds.pageRank.stream=8.65 cores (4.7 ms/call, 8.40 CPU-s over 208 calls); gds.pageRank.stream (weighted)=9.29 cores (4.6 ms/call, 8.84 CPU-s over 209 calls); gds.betweenness.stream=14.20 cores (57.1 ms/call, 13.79 CPU-s over 17 calls); gds.closeness.stream=13.24 cores (12.1 ms/call, 12.86 CPU-s over 80 calls); gds.closeness.stream (weighted)=15.81 cores (1067.1 ms/call, 50.63 CPU-s over 3 calls); gds.triangleCount.stream=3.92 cores (2.5 ms/call, 3.29 CPU-s over 332 calls); gds.labelPropagation.stream=7.16 cores (3.5 ms/call, 9.61 CPU-s over 386 calls); gds.wcc.stream=0.50 cores (2.5 ms/call, 0.48 CPU-s over 385 calls); gds.scc.stream=0.44 cores (2.5 ms/call, 0.43 CPU-s over 388 calls); gds.degree.stream=0.47 cores (2.5 ms/call, 0.43 CPU-s over 361 calls); gds.dijkstra.stream=0.81 cores (5.4 ms/call, 0.62 CPU-s over 142 calls); gds.bellmanFord.stream=0.45 cores (2.4 ms/call, 0.42 CPU-s over 383 calls)",
+    "Live CPU/RAM is graphus-server pid 1761237 over 18.000s uptime (the official-driver load + analyze path). The per-algorithm timings + CSR footprint below come from the hermetic, multi-threaded gds_sweep, which computes the same results with or without a server.",
     "storage.bytes_fsynced is a proxy: the WAL on-disk byte count (every committed WAL byte is fsynced before commit acknowledgement), not a directly-observed fsync counter.",
+    "storage.bytes_per_node / bytes_per_relationship are the measured durable store image amortised over the LOADED influence network (2406 nodes, 23962 relationships) — the graph that is in that store. They are deliberately NOT divided by metadata.dataset, which for this example is the hermetic CSR sweep's reference graph and has no store.",
     "storage.* is the live server's REAL on-disk footprint: the graphus.store image plus the graphus.wal DIRECTORY of segment files (walked by PATH — the WAL is a directory, and a meter keying off the leaf file name would report wal_bytes=0 and hide the redo log). The amplification ratios are the durable bytes over the generator's logical Cypher bytes.",
     "The GDS engine's RESIDENT CSR projection at the reference size is 514492 bytes (119.10 B/node, 5.96 B/edge) — a MEMORY footprint, not storage. It is DETERMINISTIC (identical with or without a live server) and is what gds_baseline_cmp holds to a tight band, from the reference_csr_bytes / reference_csr_bytes_per_node / reference_csr_bytes_per_edge workload params. It used to be smuggled into storage.store_bytes + the two amplification fields, which made this report incomparable with every other example's (rmp #699).",
-    "Parallelism demonstration (rmp #342/#559): at field_size 360 (1440 nodes) each parallel GDS algorithm was timed sequential-vs-parallel across thread widths [1, 2, 16]. The results were IDENTICAL across every width (deterministic_across_widths=true) — bit-identical for the integer algorithms, within the documented f64 tolerance for PageRank/centrality. Best measured speedup: 9.78x (per algorithm: pageRank 1.01x, betweenness 5.76x, closeness 9.78x, wcc 0.82x, triangleCount 2.11x, degree 0.26x). The speedup magnitude is machine-/load-variant and is NOT gated; the cross-width determinism is an invariant of the GDS Execution knob and holds on every run."
+    "Parallelism demonstration (rmp #342/#559): at field_size 360 (1440 nodes) each parallel GDS algorithm was timed sequential-vs-parallel across thread widths [1, 2, 16]. The results were IDENTICAL across every width (deterministic_across_widths=true) — bit-identical for the integer algorithms, within the documented f64 tolerance for PageRank/centrality. Best measured speedup: 9.97x (per algorithm: pageRank 1.02x, betweenness 5.74x, closeness 9.97x, wcc 0.69x, triangleCount 2.06x, degree 0.33x). The speedup magnitude is machine-/load-variant and is NOT gated; the cross-width determinism is an invariant of the GDS Execution knob and holds on every run."
   ]
 }

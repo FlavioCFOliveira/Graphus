@@ -86,10 +86,47 @@ directly against them.
 The `emit_evidence` binary in that crate is a copy-from template that drives the collector end to
 end, writes an evidence directory, and (given a baseline path) diffs against it.
 
+<a name="proc-watch"></a>
+### `proc_watch` — sampling the SERVER from a driver that is not the server (`rmp #717`)
+
+The house rule "**sample the SERVER, not the driver**" is easy to state and was, until recently,
+impossible to honour from an example whose driver is a **Node or Python** client: those examples could
+reach the server only over the wire, so their CPU evidence was either absent or — worse — the
+*driver's*. `proc_watch` is the shared seam that closes that gap. It exposes the harness's tested
+`resource` metering (Linux `/proc`, macOS `ps`) as a tiny CLI any driver can shell out to:
+
+```bash
+proc_watch --pid <PID> --snapshot
+# {"pid":31337,"rss_bytes":43008000,"user_secs":12.340000,"system_secs":1.230000}
+
+proc_watch --pid <PID> --watch --out watch.json [--interval-ms 20] [--stop-file P] [--max-secs S]
+# {"wall_secs":…, "monitored_pid_exited":false,
+#  "cpu":{"user_secs":…,"system_secs":…,"total_secs":…,"mean_core_utilisation":…},
+#  "memory":{"baseline_rss_bytes":…,"peak_rss_bytes":…,"final_rss_bytes":…,"peak_delta_bytes":…},
+#  "samples":[{"elapsed_secs":…,"rss_bytes":…}, …]}
+```
+
+Two properties are the whole point:
+
+- **`--snapshot` brackets a phase EXACTLY.** `utime`/`stime` are *cumulative counters*, not samples, so
+  two snapshots around a phase yield the precise CPU the server burned during it (to the OS's 10 ms
+  tick). That is what turns "does GDS use the cores?" into a **per-algorithm** number instead of a
+  whole-run average that the load phase has already diluted into meaninglessness.
+- **`--watch` reports `peak_delta_bytes`** — the peak RSS *minus the baseline the process already
+  held*. A response the server materialises in full before flushing a byte is visible there and
+  essentially nowhere else: it is freed by the time the request returns, so a before/after snapshot
+  misses it entirely.
+
+It **never fabricates a zero**: an unreadable pid makes it exit non-zero and write nothing, and a
+monitored process that exits mid-window still reports its true CPU (both are pinned by regression
+tests in `crates/graphus-examples-harness/tests/proc_watch.rs` — the first cut of this binary got
+*both* wrong and cheerfully published `mean_core_utilisation: 0.0` for a process that had just
+saturated a core).
+
 <a name="evidence-schema"></a>
 ## Evidence schema (`report.json`)
 
-Every example emits `report.json` against this **stable, versioned schema** (`SCHEMA_VERSION = 3`).
+Every example emits `report.json` against this **stable, versioned schema** (`SCHEMA_VERSION = 4`).
 Field names are fixed snake_case so external tooling and the baseline-diff helper can rely on them.
 Reports deserialize leniently (each field added after v1 carries `#[serde(default)]`), so an
 older-but-compatible report still loads — a v1 `report.json` deserializes against the v3 schema, with
@@ -102,6 +139,14 @@ Schema history:
   optional `server_metrics` section scraped from the server's Prometheus `/metrics` endpoint.
 - **v3** (`rmp #711`) — **every metric is optional: a metric an example did not measure is ABSENT
   from the JSON, never a `0` / `0.0` placeholder.** See below.
+- **v4** (`rmp #717`) — a **phase may carry the server CPU it burned** and the **mean cores it kept
+  busy** (`phases[].cpu_secs` / `phases[].mean_core_utilisation`). Both are additive `Option`s, so a
+  v3 report still deserializes and a phase nobody bracketed against the server's pid simply omits them.
+  This is what lets a report answer *"does this algorithm use the cores?"* per algorithm — a question
+  the run-wide `cpu.mean_core_utilisation` average cannot answer, because a 60 ms phase on sixteen
+  cores vanishes into an 8 s phase on one. A phase too short for the OS's 10 ms clock tick to resolve
+  (under five ticks of CPU) omits the figure rather than publishing a `0.0` — the same measure-it-or-
+  omit-it rule the metrics obey.
 
 ### Measured, or absent — never a zero placeholder (v3)
 
@@ -425,9 +470,9 @@ so they cannot target a shared/remote instance.
 | [`social-network-uds`](social-network-uds/) | **The MVP, over Bolt/UDS** (local-only by construction — it owns the server's lifecycle). Many simultaneous UDS clients build a social graph under real SSI contention (all of them appending to one celebrity supernode), search and mutate it, and it survives a graceful restart **and a SIGKILL taken MID-WRITE**: the last acked commit lives, a large un-acked write leaves no trace, and the ARIES replay is *asserted* to have run (`records_scanned`/`redo_applied` > 0) — a no-op recovery fails the run. |
 | [`durability-crash-recovery`](durability-crash-recovery/) | DST-driven durability & crash recovery under load: a concurrent OLTP workload under faults + a seeded mid-workload crash, ARIES recovery, and the four ACID-durability properties asserted on the recovered engine (every acked commit survives, no in-flight effect does), with a one-command replay reproducer. |
 | [`fraud-oltp`](fraud-oltp/) | Real-time financial-transaction fraud detection as an OLTP workload over Bolt/TCP. |
-| [`gds-analytics`](gds-analytics/) | Graph Data Science analytics over a large network (influence, communities, paths). |
+| [`gds-analytics`](gds-analytics/) | **Does GDS use the cores?** A seeded influence/citation network (default 2 400 authors / ~24 000 citations, bulk-imported in ~0.2 s) is analysed through the full `gds.*` procedure surface over the official Neo4j driver, and each algorithm is called repeatedly with the **server pid's** cumulative CPU bracketed around it (`proc_watch --snapshot`) to give a **per-algorithm core-utilisation** figure. Settles the "GDS uses 2 of 9 cores" folklore with numbers: weighted closeness saturates **15.8 of 16 cores**, betweenness **14.2**, while the inherently-sequential kernels (SCC, single-source Dijkstra) sit near one — a refutation. The schema-DDL phase surfaces `rmp` #724 (an index costs ~7.8 KB of server RSS per element, never returned). |
 | [`bulk-etl`](bulk-etl/) | Offline high-throughput bulk ingest + export round-trip via `graphus-bulk` (no server, no driver). |
-| [`knowledge-graph-rest`](knowledge-graph-rest/) | A semantic knowledge graph served and queried over the Web REST API. |
+| [`knowledge-graph-rest`](knowledge-graph-rest/) | **What does the REST response path cost under VOLUME?** A semantic knowledge graph (default 1 500 documents) served over the Web REST API, with a real 150 000-row co-mention export driven through all three response shapes while the **server pid's** RSS is sampled through each (`proc_watch --watch`). The headline: the **buffered** path (a single-statement JSON that stops streaming the moment the client adds the API's own `Idempotency-Key` retry header) costs **~30× the server RSS per row** of the streaming path — the `serde_json` intermediate tree (`rmp` #383) — and the 16 MiB buffered cap (`rmp` #553) is exercised to a real HTTP 400. The concurrency phase runs across client **processes** and publishes both server and client cores, so a ceiling can never be misattributed. |
 | [`security-multitenant`](security-multitenant/) | Encryption-at-rest + fine-grained RBAC over a multi-tenant deployment (REST + Bolt). |
 | [`iot-timeseries`](iot-timeseries/) | **What does durability actually cost?** Sustained IoT ingest + sliding-window retention churn, driven over Bolt against a real server with a real segmented WAL. The durable **store** plateaus flat while the reclamation counters climb — and the same run proves the **database on disk does not**, because WAL disk is freed only in whole 64 MiB segments: **79.6 MB of disk for a 229 KB graph (347×)**, at **799× write amplification** (`rmp` #706). Write amplification is a **gated** signal here: the run fails if the WAL footprint comes back zero, under-counted, or worse than its ceiling. |
 | [`social-network-large`](social-network-large/) | **Do reads scale across cores?** A large social graph (up to ~1,000,000 USERs on an undirected multigraph FRIEND, plus ARTICLEs and USER→LIKE→ARTICLE edges, with an optional **power-law degree law that grows real supernodes**) is network-bulk-loaded into a running server, then an 8-family Cypher read battery is driven **over the Bolt wire by a concurrency ladder of simultaneous clients** while the **server process** is sampled per-thread from `/proc`. Evidence: the core-scaling curve vs C, real per-family p50/p99, and a **decomposed** on-disk footprint (data image / doublewrite / redo log). |

@@ -1,8 +1,13 @@
 //! `gds_gen` — the deterministic influence-network generator binary for `examples/gds-analytics`.
 //!
-//! Writes two artifacts into `--out-dir` for the chosen `--profile`:
+//! Writes these artifacts into `--out-dir` for the chosen `--profile`:
 //! - `graph.cypher` — the schema DDL + `:Author`/`:Ref` node and `:CITES`/`:LINKS` edge CREATE
-//!   statements (one per line, `;`-terminated),
+//!   statements (one per line, `;`-terminated). This is the **slow** load path; the attach mode uses
+//!   it against a server with no bulk-import endpoint.
+//! - `schema.cypher` — the schema DDL block on its own, for the bulk-import path (which ingests raw
+//!   CSV and applies the schema afterwards).
+//! - `nodes.csv` / `relationships.csv` — the network **bulk-import (Mode A)** CSV artifacts
+//!   (`specification/08-network-bulk-import.md`); the **fast** load path the default profile uses.
 //! - `reference.json` — the analytically-known reference subgraph + its known algorithm outputs the
 //!   workload asserts against.
 //!
@@ -11,14 +16,15 @@
 //!
 //! Usage:
 //! ```text
-//! cargo run -p graphus-gds-gen --bin gds_gen -- --profile fast  --out-dir <dir>
-//! cargo run -p graphus-gds-gen --bin gds_gen -- --profile large --out-dir <dir>
+//! cargo run -p graphus-gds-gen --bin gds_gen -- --profile fast     --out-dir <dir>
+//! cargo run -p graphus-gds-gen --bin gds_gen -- --profile moderate --out-dir <dir>
+//! cargo run -p graphus-gds-gen --bin gds_gen -- --profile large    --out-dir <dir>
 //! ```
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use graphus_gds_gen::{Profile, generate};
+use graphus_gds_gen::{Profile, generate, schema_cypher};
 
 fn main() -> ExitCode {
     let mut profile = Profile::Fast;
@@ -30,7 +36,7 @@ fn main() -> ExitCode {
             "--profile" => {
                 let v = match args.next() {
                     Some(v) => v,
-                    None => return fail("--profile requires a value (fast|large)"),
+                    None => return fail("--profile requires a value (fast|moderate|large)"),
                 };
                 profile = match Profile::parse(&v) {
                     Ok(p) => p,
@@ -45,8 +51,9 @@ fn main() -> ExitCode {
             }
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: gds_gen --profile <fast|large> --out-dir <dir>\n\
-                     writes graph.cypher + reference.json"
+                    "usage: gds_gen --profile <fast|moderate|large> --out-dir <dir>\n\
+                     writes graph.cypher + schema.cypher + nodes.csv + relationships.csv + \
+                     reference.json"
                 );
                 return ExitCode::SUCCESS;
             }
@@ -62,6 +69,9 @@ fn main() -> ExitCode {
     }
 
     let cypher_path = out_dir.join("graph.cypher");
+    let schema_path = out_dir.join("schema.cypher");
+    let nodes_path = out_dir.join("nodes.csv");
+    let rels_path = out_dir.join("relationships.csv");
     let ref_path = out_dir.join("reference.json");
 
     let ref_json = match dataset.reference_json() {
@@ -69,11 +79,18 @@ fn main() -> ExitCode {
         Err(e) => return fail(&format!("reference serialization failed: {e}")),
     };
 
-    if let Err(e) = std::fs::write(&cypher_path, dataset.to_cypher()) {
-        return fail(&format!("cannot write {}: {e}", cypher_path.display()));
-    }
-    if let Err(e) = std::fs::write(&ref_path, ref_json) {
-        return fail(&format!("cannot write {}: {e}", ref_path.display()));
+    // Each artifact is written independently so a write failure names the exact file that failed.
+    let files: [(&PathBuf, String); 5] = [
+        (&cypher_path, dataset.to_cypher()),
+        (&schema_path, schema_cypher()),
+        (&nodes_path, dataset.authors_csv()),
+        (&rels_path, dataset.relationships_csv()),
+        (&ref_path, ref_json),
+    ];
+    for (path, contents) in &files {
+        if let Err(e) = std::fs::write(path, contents) {
+            return fail(&format!("cannot write {}: {e}", path.display()));
+        }
     }
 
     // The summary line is parsed by run.sh (the `kv` helper) for the evidence dataset sizing.
@@ -93,8 +110,9 @@ fn main() -> ExitCode {
         node_count,
         rel_count,
     );
-    println!("wrote {}", cypher_path.display());
-    println!("wrote {}", ref_path.display());
+    for (path, _) in &files {
+        println!("wrote {}", path.display());
+    }
 
     ExitCode::SUCCESS
 }

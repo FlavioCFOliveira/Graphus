@@ -127,12 +127,20 @@ runs, hosts, and platforms. `cargo test -p graphus-kg-gen` proves this. Two prof
 
 | Profile | Topics | Concepts | Authors | Documents | Use |
 | --- | --- | --- | --- | --- | --- |
-| `fast` (default) | 6 | 80 | 120 | 400 | CI + the REST E2E assertions |
-| `large` | 10 | 300 | 400 | 1500 | evidence-scale (bigger NDJSON stream) |
+| `fast` | 6 | 80 | 120 | 400 | quick correctness pass |
+| `large` (**default**) | 10 | 300 | 400 | 1500 | the default — loads in ~1.8 s, yet a co-mention export over it reaches 150 000+ rows |
 
 ```bash
-cargo run -p graphus-kg-gen --bin kg_gen -- --profile fast --out-dir /tmp/kg
+cargo run -p graphus-kg-gen --bin kg_gen -- --profile large --out-dir /tmp/kg
 ```
+
+**Why the default is `large` (`rmp` #717).** The example exists to expose **REST-path resource
+behaviour**, and at the old default (400 documents, a discovery workload of 320 tiny operations) it
+could not: the REST response path's memory cost only appears at result-set **volume**, and a
+16-thread single-process python client saturates on its own GIL long before the server does — so its
+throughput reads as a *server* ceiling when it is a *client* artifact. `large` loads in ~1.8 s, a
+co-occurrence export over it reaches 150 000+ rows, and the concurrency phase now runs across real
+client **processes**.
 
 ## How the REST API is used
 
@@ -197,15 +205,36 @@ Request `parameters` may be **sparse** plain JSON (`{"id":"ref-c-0"}`). Response
 NDJSON is selected only when the client explicitly accepts `application/x-ndjson` **and** the request
 carries exactly one statement.
 
-> **Honest note on NDJSON memory.** The NDJSON **wire format** is one JSON object per line, and the
-> python client parses it **incrementally** (it iterates the HTTP response line-by-line, never
-> materializing the whole result before processing rows). The server-side row pump is *pull-based*
-> (`ResultStream::next_row`), which is the seam a future async cursor would flush through per line;
-> **today**, however, the router assembles the NDJSON body fully before responding
-> (`stream_single_statement_ndjson` in `crates/graphus-rest/src/router.rs`), so current server-side
-> memory for an NDJSON response is proportional to the result size. This example demonstrates the
-> incremental **wire format + client-side streaming**, not yet bounded server-side memory; the README
-> states this rather than overclaiming.
+## Result-set VOLUME — the REST response path, measured (`rmp` #717)
+
+This is the vector the example exists to expose. It drives a real **co-mention export** (which
+documents discuss the same concept — the canonical knowledge-graph co-occurrence query) at 150 000
+rows through **all three** REST response shapes, and samples the **server** pid's RSS through each
+with `proc_watch --watch`. The shapes do **not** cost the server the same:
+
+| Shape | How you get it | Server RSS **per row** | What it is |
+| --- | --- | ---: | --- |
+| NDJSON | `Accept: application/x-ndjson` | **~90 B** | streams — engine row materialisation only |
+| JSON, streamed | `Accept: application/json`, single statement, **no** `Idempotency-Key` | **~76 B** | streams |
+| JSON, buffered | the **same** query + an `Idempotency-Key` header (or any multi-statement batch) | **~2 300 B** | **buffers the whole result server-side** |
+
+**The headline: the buffered path costs ~30× the RSS per row of the streaming path** — at 150 000
+rows, **+330 MB of server RSS** versus **+7 MB**. That is the `serde_json` intermediate tree the whole
+result is materialised into before a byte is flushed (`rmp` #383). And the trigger is not exotic: a
+single-statement JSON read **stops streaming the instant the client adds an `Idempotency-Key`
+header** — the API's own retry-safety mechanism, which a production client is *encouraged* to send —
+because a response that may be replayed has to be cached (`stream_framing` returns `None` when the
+header is present, `crates/graphus-rest/src/router.rs`). A safety-conscious client silently pays the
+30×. This is the fragility the example now surfaces, and it is invisible at 320 tiny operations.
+
+**The buffered path is bounded, and the gate fires.** A whole-node export (`RETURN d, c, o`) whose
+serialized size crosses `MAX_BUFFERED_RESULT_BYTES` (16 MiB, `rmp` #553/#475) is **rejected with HTTP
+400 before commit** — never OOM, never silently truncated. The example drives past the cap on every
+run, so that assertion is a real gate, not a green tick over an unreachable branch.
+
+In **attach mode** the per-row *server* RSS is **absent** from the report (a remote target exposes no
+`/proc`); the shapes, their bytes, their latency, and the cap all still run and are reported, and the
+report says the server-memory vector was not measured rather than printing a zero.
 
 ### Loading the graph
 
@@ -238,10 +267,25 @@ GRAPHUS_BIN_DIR=target/release \
 | Env var | Default | Meaning |
 | --- | --- | --- |
 | `GRAPHUS_BIN_DIR` | `target/release` | where to find `graphus-server` / `kg_gen` (built if missing) |
-| `KG_PROFILE` | `fast` | dataset scale (`fast` / `large`) |
-| `KG_CLIENTS` | `16` | concurrent HTTP clients in the concurrency phase |
-| `KG_OPS` | `20` | discovery queries per client |
+| `KG_PROFILE` | `large` | dataset scale (`fast` / `large`) |
+| `KG_CLIENTS` | `64` | concurrent HTTP clients in the concurrency phase |
+| `KG_CLIENT_PROCS` | `8` | OS **processes** the clients are spread across (defeats the python GIL) |
+| `KG_OPS` | `50` | discovery queries per client |
+| `KG_VOLUME_ROWS` | `150000` | rows the co-mention export requests, per response shape |
+| `KG_CAP_PROBE_ROWS` | `400000` | whole-node rows requested to prove the 16 MiB buffered cap fires |
 | `KG_BATCH` | `200` | statements per load batch |
+
+### The concurrency phase runs across client PROCESSES, not just threads
+
+The concurrency phase spreads its clients across `KG_CLIENT_PROCS` OS **processes** (`multiprocessing`,
+`spawn`), because python's GIL makes a single-process driver saturate on its own interpreter long
+before the server does — and the resulting throughput reads as a **server** ceiling when it is a
+**client** artifact. (This suite has been bitten by exactly that: `social-network-large` once reported
+a "~1 core" server that was purely a harness artifact.) The report publishes both the **server's**
+cores and the **client's** cores over the window, so a reader can check which was the limiter rather
+than take it on faith. On a 16-core host the measured numbers are ~7 server cores against ~6 client
+cores at ~5 300 ops/s — the server out-works the client, so the throughput is *not* client-bound, and
+the report says so.
 
 **Requirements:** a Unix host (Linux/macOS), `bash`, and `python3` (3.8+, **stdlib only** — no pip
 packages). A **local** run also needs `openssl` (self-signed cert); an **external** run also needs

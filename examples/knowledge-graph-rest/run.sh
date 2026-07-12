@@ -105,10 +105,26 @@ BIN_DIR="${GRAPHUS_BIN_DIR:-$REPO_ROOT/target/release}"
 SERVER="$BIN_DIR/graphus-server"
 GEN="$BIN_DIR/kg_gen"
 
-PROFILE="${KG_PROFILE:-fast}"
-CLIENTS="${KG_CLIENTS:-16}"
-OPS_PER_CLIENT="${KG_OPS:-20}"
+# The DEFAULTS are sized so the vector this example exists to expose is OBSERVABLE (rmp #717).
+#
+# It used to move 320 operations of a handful of rows each, in 0.8 s. At that size the REST path's
+# resource behaviour — the reason this example is REST and not Bolt — is invisible: the known REST
+# issues (#304 buffered NDJSON, #383 the serde intermediate tree, #475/#553 the OOM caps) only appear
+# at VOLUME, and a 16-thread single-process python client saturates on its own GIL long before the
+# server does, so its throughput reads as a server ceiling when it is a client artifact.
+#
+# So: the `large` graph (1 500 documents — it loads in ~1.8 s), a real 150 000-row analytical export
+# driven through all THREE REST response shapes with the SERVER's RSS sampled through each, and a
+# concurrency phase spread across real client PROCESSES.
+PROFILE="${KG_PROFILE:-large}"
+CLIENTS="${KG_CLIENTS:-64}"
+OPS_PER_CLIENT="${KG_OPS:-50}"
+CLIENT_PROCS="${KG_CLIENT_PROCS:-8}"
 BATCH_SIZE="${KG_BATCH:-200}"
+# The result-set VOLUME phase: rows per response shape, and the (deliberately larger) row count that
+# must cross the buffered path's 16 MiB cap and come back as a 400 rather than an OOM.
+VOLUME_ROWS="${KG_VOLUME_ROWS:-150000}"
+CAP_PROBE_ROWS="${KG_CAP_PROBE_ROWS:-400000}"
 
 # local | external — external iff any of GRAPHUS_TARGET_{BOLT,REST,UDS} is set.
 MODE="$(harness_target_mode)"
@@ -117,6 +133,14 @@ MODE="$(harness_target_mode)"
 harness_build "the deterministic knowledge-graph generator (release)" \
   --release -p graphus-kg-gen --bin kg_gen
 [ -x "$GEN" ] || { echo "${RED}fatal: kg_gen binary not found at $GEN${RESET}" >&2; exit 2; }
+
+# The SERVER-pid sampler: how a python driver measures the SERVER's memory instead of its own. Only
+# usable in LOCAL mode (an attach target exposes no /proc), where it is what makes the volume phase's
+# "what did this response cost the server" a measurement rather than a guess.
+PROC_WATCH="$BIN_DIR/proc_watch"
+harness_build "the proc_watch server-pid CPU/RSS sampler (release)" \
+  --release -p graphus-examples-harness --bin proc_watch
+[ -x "$PROC_WATCH" ] || { echo "${RED}fatal: proc_watch binary not found at $PROC_WATCH${RESET}" >&2; exit 2; }
 
 # The server binary is needed ONLY in local mode (external attaches to a running instance).
 if [ "$MODE" = "local" ]; then
@@ -149,6 +173,9 @@ WAL_DIR="$WORKDIR/data/graphus.wal"
 # LOCAL run against (skipped in external mode — a foreign host has no comparable baseline).
 EVIDENCE_DIR="$SCRIPT_DIR/evidence"
 BASELINE="$SCRIPT_DIR/baseline.json"
+# The profile the committed baseline.json was captured from (the default). A run at any other profile
+# is a different graph, so its deterministic figures are not comparable and the gate is skipped.
+BASELINE_PROFILE="large"
 METRICS_BEFORE="$WORKDIR/metrics_before.prom"   # /metrics scrape immediately before the workload
 METRICS_AFTER="$WORKDIR/metrics_after.prom"     # /metrics scrape immediately after the workload
 PEAK_RSS_BYTES=0          # high-watermark of the server's RSS, sampled during the workload (local)
@@ -303,9 +330,15 @@ if [ "$RUN_REST" = "1" ] && [ "$MODE" = "external" ]; then
   section "Step 3 — knowledge-graph discovery over REST (python3 stdlib client, attach mode)"
   D_USER="${GRAPHUS_TARGET_USER:-graphus}"
   D_PASS="${GRAPHUS_TARGET_PASSWORD:-graphus-local}"
+  # No --server-pid in attach mode: the target is reached over the wire, so its /proc is not ours to
+  # read. The volume phase still runs (the response shapes, their bytes, their latency and the 16 MiB
+  # cap are all client-observable) — only the SERVER's RSS/CPU is ABSENT from the evidence, and the
+  # report says so rather than printing a zero.
   PY_ARGS=(--base-url "$REST_BASE" --user "$D_USER" --password "$D_PASS"
            --database "$TARGET_DB" --cypher "$GRAPH_CYPHER" --reference "$REFERENCE"
-           --batch-size "$BATCH_SIZE" --clients "$CLIENTS" --ops-per-client "$OPS_PER_CLIENT")
+           --batch-size "$BATCH_SIZE" --clients "$CLIENTS" --ops-per-client "$OPS_PER_CLIENT"
+           --client-processes "$CLIENT_PROCS"
+           --volume-rows "$VOLUME_ROWS" --cap-probe-rows "$CAP_PROBE_ROWS")
   if _harness_target_insecure; then PY_ARGS+=(--insecure); fi
 
   WORKLOAD_START_MS="$(_harness_now_ms)"
@@ -397,7 +430,12 @@ EOF
     --reference "$REFERENCE" \
     --batch-size "$BATCH_SIZE" \
     --clients "$CLIENTS" \
-    --ops-per-client "$OPS_PER_CLIENT" 2>&1)" || true
+    --ops-per-client "$OPS_PER_CLIENT" \
+    --client-processes "$CLIENT_PROCS" \
+    --volume-rows "$VOLUME_ROWS" \
+    --cap-probe-rows "$CAP_PROBE_ROWS" \
+    --server-pid "$SERVER_PID" \
+    --proc-watch "$PROC_WATCH" 2>&1)" || true
   WORKLOAD_MS=$(( $(_harness_now_ms) - WORKLOAD_START_MS ))
   printf '%s\n' "$REST_OUT" | sed 's/^/  /'
   assert "REST workload passed every assertion" "yes" \
@@ -444,6 +482,41 @@ W_NDJSON_BPS="$(json_field "$STATS" ndjson_bytes_per_sec)"
 W_OPS_PER_SEC="$(json_field "$STATS" ops_per_sec)"
 W_INDEXES="$(json_field "$STATS" indexes_total)"
 W_CONSTRAINTS="$(json_field "$STATS" constraints_total)"
+W_CLIENT_CORES="$(json_field "$STATS" concurrency_client_cores)"
+W_SERVER_CORES="$(json_field "$STATS" concurrency_server_cores)"
+W_CLIENT_PROCS="$(json_field "$STATS" concurrency_processes)"
+W_CAP_STATUS="$(json_field "$STATS" volume_cap_probe_status)"
+
+# The result-set VOLUME phase (rmp #717): the per-shape server-RSS-per-row + the headline note. Parsed
+# in python because the shapes are a nested JSON array — a sed one-liner cannot reach into it honestly.
+VOLUME_SUMMARY=""
+VOLUME_NDJSON_BPR=""; VOLUME_STREAMED_BPR=""; VOLUME_BUFFERED_BPR=""
+VOLUME_BUFFERED_PEAK_MB=""; VOLUME_AMP=""
+if [ -n "$STATS" ]; then
+  read -r VOLUME_NDJSON_BPR VOLUME_STREAMED_BPR VOLUME_BUFFERED_BPR VOLUME_BUFFERED_PEAK_MB VOLUME_AMP VOLUME_SUMMARY <<EOF2
+$(printf '%s' "$STATS" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    shapes = {s["shape"]: s for s in d.get("volume_shapes", [])}
+    def bpr(name):
+        v = shapes.get(name, {}).get("server_rss_bytes_per_row")
+        return f"{v:.0f}" if v is not None else "na"
+    nd, strm, buf = bpr("ndjson"), bpr("json-streamed"), bpr("json-buffered")
+    peak = shapes.get("json-buffered", {}).get("server_peak_rss_delta_bytes")
+    peak_mb = f"{peak/1048576:.0f}" if peak is not None else "na"
+    b = shapes.get("json-buffered", {}).get("server_rss_bytes_per_row")
+    s = shapes.get("json-streamed", {}).get("server_rss_bytes_per_row")
+    amp = f"{b/s:.0f}" if (b and s) else "na"
+    rows = d.get("volume_rows", 0)
+    summary = (f"buffered={buf}B/row(+{peak_mb}MB) streamed={strm}B/row ndjson={nd}B/row "
+               f"amp={amp}x@{rows}rows")
+    print(nd, strm, buf, peak_mb, amp, summary)
+except Exception as e:
+    print("na na na na na volume-parse-failed")
+')
+EOF2
+fi
 
 # --------------------------------------------------------------------------------------------------
 # Step 4 — collect the standardized performance evidence.
@@ -495,7 +568,12 @@ if [ "$RUN_REST" = "1" ] && [ "$MODE" = "external" ]; then
       --param "concurrency_secs=${W_CONC_SECS:-0}" \
       --param "indexes_total=${W_INDEXES:-0}" \
       --param "constraints_total=${W_CONSTRAINTS:-0}" \
+      --param "client_processes=${W_CLIENT_PROCS:-1}" \
+      --param "concurrency_client_cores=${W_CLIENT_CORES:-0}" \
+      --param "volume_rows=${VOLUME_ROWS}" \
+      --param "volume_cap_probe_status=${W_CAP_STATUS:-na}" \
       --note "Attach mode (measurement_mode=external): the workload ran against an already-running instance ($REST_BASE) isolated in database '$TARGET_DB', which is DROPPED on exit. Reads carry access_mode=READ so they engage the server's off-thread reader pool. The server_metrics section is the /metrics before→after delta attributed to '$TARGET_DB'; throughput/latency are client-measured; the CBOR/JSON/NDJSON payload bytes are deterministic per seed+profile." \
+      --note "RESULT-SET VOLUME (rmp #717): the ${VOLUME_ROWS}-row export ran through all three REST response shapes and the 16 MiB buffered cap was exercised (returned HTTP ${W_CAP_STATUS}). The per-shape SERVER RSS-per-row (the headline: streaming vs the buffered serde_json tree) is measured ONLY in a local run — an attach target exposes no /proc — so in this external report that vector is ABSENT, not zero. The concurrency phase ran across ${W_CLIENT_PROCS:-?} client processes; the client burned ${W_CLIENT_CORES:-?} cores, which bounds how much of any throughput ceiling could be the client's." \
       --assert \
       --max-abort-rate 0.5 \
       && info "evidence written to $EVIDENCE_DIR (external)" \
@@ -562,7 +640,18 @@ elif [ "$RUN_REST" = "1" ] && [ "$MODE" = "local" ]; then
       --param "http_ops_per_sec=${W_OPS_PER_SEC:-0}" \
       --param "indexes_total=${W_INDEXES:-0}" \
       --param "constraints_total=${W_CONSTRAINTS:-0}" \
-      --note "Throughput is the concurrency driver's HTTP requests over the window those requests were ACTUALLY ISSUED IN (concurrency_secs, measured by the python client) — it used to be divided by the whole server UPTIME, which silently understated req/s (rmp #699). The per-request latency percentiles + the payload sizes per encoding (json_bytes/cbor_bytes/cbor_ratio) + the NDJSON streaming throughput are likewise measured by the python client (GRAPHUS_STATS). Reads carry access_mode=READ so they engage the off-thread reader pool." \
+      --param "client_processes=${W_CLIENT_PROCS:-1}" \
+      --param "concurrency_client_cores=${W_CLIENT_CORES:-0}" \
+      --param "concurrency_server_cores=${W_SERVER_CORES:-0}" \
+      --param "volume_rows=${VOLUME_ROWS}" \
+      --param "volume_ndjson_server_rss_bytes_per_row=${VOLUME_NDJSON_BPR:-na}" \
+      --param "volume_json_streamed_server_rss_bytes_per_row=${VOLUME_STREAMED_BPR:-na}" \
+      --param "volume_json_buffered_server_rss_bytes_per_row=${VOLUME_BUFFERED_BPR:-na}" \
+      --param "volume_buffered_amplification_x=${VOLUME_AMP:-na}" \
+      --param "volume_cap_probe_status=${W_CAP_STATUS:-na}" \
+      --note "RESULT-SET VOLUME (rmp #717) — the REST response path, which this example exists to exercise, costs radically different amounts of SERVER memory by RESPONSE SHAPE at ${VOLUME_ROWS} rows. STREAMING (NDJSON, or single-statement JSON with no Idempotency-Key) holds ~${VOLUME_STREAMED_BPR} B of server RSS PER ROW (engine row materialisation only). The SAME query BUFFERED — a single-statement JSON the client made non-streamable simply by sending the API's own retry-safety Idempotency-Key header, or any multi-statement batch — holds ~${VOLUME_BUFFERED_BPR} B/row (+${VOLUME_BUFFERED_PEAK_MB} MB peak), a ${VOLUME_AMP}x amplification: the serde_json intermediate tree the whole result is materialised into before a byte is flushed (rmp #383). The server's RSS per row was measured with proc_watch --watch over the server pid through each request. A production client that sends Idempotency-Key for safety silently loses streaming and pays that ${VOLUME_AMP}x — the fragility this example now surfaces." \
+      --note "RESULT-SET VOLUME cap — the buffered path is BOUNDED (MAX_BUFFERED_RESULT_BYTES = 16 MiB serialized, rmp #553/#475): a whole-node export (RETURN d, c, o) whose serialized size crosses the cap is REJECTED with HTTP ${W_CAP_STATUS} before commit, never OOM and never silently truncated. The cap gate FIRES in this run, so it is a real gate, not a green tick over an unreachable branch." \
+      --note "Throughput is the concurrency driver's HTTP requests over the window those requests were ACTUALLY ISSUED IN (concurrency_secs, measured by the python client) — it used to be divided by the whole server UPTIME, which silently understated req/s (rmp #699). The concurrency phase runs across ${W_CLIENT_PROCS:-?} CLIENT PROCESSES (not just threads) because python's GIL makes a single-process driver saturate on itself and report a CLIENT ceiling as if it were the SERVER's — the exact scar tissue of social-network-large. Here the SERVER burned ${W_SERVER_CORES:-?} cores while the CLIENT burned ${W_CLIENT_CORES:-?}: the server out-worked the client, so this throughput is NOT client-bound. The per-request latency percentiles + payload sizes per encoding + NDJSON throughput are client-measured (GRAPHUS_STATS). Reads carry access_mode=READ so they engage the off-thread reader pool." \
       --note "storage.* is the REAL on-disk footprint: the graphus.store image plus the graphus.wal DIRECTORY of segment files. The amplification ratios are those durable bytes over the generator's logical graph.cypher bytes — previously the denominator was an invented nodes*256 + rels*128 formula and write_amplification was left at a 0.0 placeholder (rmp #699)." \
       --note "Payload sizes per encoding (json_bytes, cbor_bytes, cbor_ratio) and the dataset size are DETERMINISTIC for a fixed seed+profile and are gated tightly; req/s, latency, CPU and RSS are machine-variant and are NOT gated (see kg_baseline_cmp)." \
       && info "evidence written to $EVIDENCE_DIR" \
@@ -592,7 +681,10 @@ print('yes' if ok else 'no')" 2>/dev/null || echo no)"
     # CBOR/JSON ratio, NDJSON rows) against tight thresholds; the machine-variant families
     # (req/s, latency, CPU, RSS) stay ungated.
     # --------------------------------------------------------------------------------------------
-    if [ "$PROFILE" = "fast" ] && [ -f "$BASELINE" ] && [ -f "$EVIDENCE_DIR/report.json" ]; then
+    # The committed baseline is captured from the DEFAULT profile, and the gate runs on the default
+    # run. Pinning it to `fast` once the default moved to `large` would be a gate that never fires —
+    # the same lie as a zero placeholder, wearing a green tick (rmp #711/#717).
+    if [ "$PROFILE" = "$BASELINE_PROFILE" ] && [ -f "$BASELINE" ] && [ -f "$EVIDENCE_DIR/report.json" ]; then
       section "Step 4b — regression gate vs committed baseline"
       CMP_BIN="$BIN_DIR/kg_baseline_cmp"
       harness_build "the kg_baseline_cmp gate (debug)" --release -p graphus-kg-gen --bin kg_baseline_cmp

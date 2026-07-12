@@ -95,8 +95,22 @@ SERVER="$BIN_DIR/graphus-server"
 GEN="$BIN_DIR/gds_gen"
 SWEEP="$BIN_DIR/gds_sweep"
 
-PROFILE="${GDS_PROFILE:-fast}"
+# The DEFAULT profile is `moderate` (rmp #717): 2 400 authors / ~24 000 citations.
+#
+# It is sized by MEASUREMENT, not by taste. At the old `fast` default (166 nodes) a
+# `gds.betweenness.stream` call returns in well under a millisecond, so bracketing it against the OS's
+# 10 ms CPU clock tick measures NOTHING — which is exactly how this project came to carry the
+# unmeasured folklore that "GDS uses 2 of 9 cores". At `moderate` the algorithm calls are tens to
+# hundreds of milliseconds, the per-algorithm CPU battery below resolves each one to ~1%, and the whole
+# example still finishes in well under a minute (the graph goes in through the network bulk-import
+# endpoint in ~0.2 s instead of ~8 s of edge-by-edge Cypher).
+#
+# `GDS_PROFILE=fast` remains available for a quick correctness-only pass.
+PROFILE="${GDS_PROFILE:-moderate}"
 SWEEP_SIZES="${GDS_SWEEP_SIZES:-40,120,360,1080}"
+# Each algorithm in the per-algorithm CPU battery is repeated until its bracket spans at least this
+# many seconds, so the OS's 10 ms accounting tick is noise rather than the signal.
+CPU_TARGET_SECS="${GDS_CPU_TARGET_SECS:-1.0}"
 
 MODE="$(harness_target_mode)"
 
@@ -269,6 +283,8 @@ if [ "$MODE" = external ]; then
     --param "driver=official neo4j-driver"
     --param "gds_write_modes=$ANALYZE_MODES"
     --note "Workload: reference-subgraph ground-truth + weighted-vs-unweighted PageRank/Dijkstra + write/mutate/stats (feature-detected). nodes_written(pagerank)=$ANALYZE_WRITTEN."
+    --note "PER-ALGORITHM SERVER CPU: NOT MEASURED in attach mode. The figure requires bracketing the SERVER process's cumulative CPU counters (proc_watch --snapshot on a co-located pid); a target reached over the wire exposes no /proc, so the vector is ABSENT rather than zero-filled. Run the example locally (examples/gds-analytics/run.sh with no GRAPHUS_TARGET_*) for the per-algorithm core-utilisation evidence."
+    --note "Load path in attach mode is the Cypher replay of graph.cypher (one MATCH…MATCH…CREATE per edge), NOT the network bulk-import endpoint: a target instance may expose no bulk-import endpoint, or grant no admin rights on it. The local run measures both paths and the README quotes the difference."
     --total-millis "$WORKLOAD_MS"
     --assert
   )
@@ -317,10 +333,18 @@ KEY="$WORKDIR/key.pem"
 ADMIN_USER="neo4j"
 ADMIN_PW="gds-analytics-demo-pw-32bytes-minimum!"
 JWT_SECRET="gds-analytics-demo-jwt-secret-32bytes-ok!"
+# The store + WAL the evidence meters. A database created at run time (the bulk-import target) does NOT
+# live at the store root: it lives under `<store_path>/databases/<db>/`. Metering the root would meter
+# the EMPTY default database and report the influence network as costing a few kilobytes — a lie of
+# exactly the kind rule 5 exists to prevent. These are therefore rebound to the run's database as soon
+# as its name is known (see Step 3b).
 STORE_FILE="$WORKDIR/data/graphus.store"
 WAL_DIR="$WORKDIR/data/graphus.wal"
 SWEEP_JSON="$EVIDENCE_DIR/sweep.json"
 BASELINE="$SCRIPT_DIR/baseline.json"
+# The profile the committed baseline was captured from (the default). A run at any other profile is a
+# different graph, so its figures are not comparable and the gate is skipped — and says so.
+BASELINE_PROFILE="moderate"
 PEAK_RSS_BYTES=0
 SERVER_START_EPOCH=0
 SERVER_UPTIME_SECS=0
@@ -330,6 +354,11 @@ harness_build "graphus-server (release)" --release -p graphus-server
 harness_build "the hermetic GDS scalability sweep (release)" \
   --release -p graphus-gds-gen --bin gds_sweep
 [ -x "$SWEEP" ] || { echo "${RED}fatal: gds_sweep binary not found at $SWEEP${RESET}" >&2; exit 2; }
+# The server-pid CPU sampler: the seam that lets a Node driver measure the SERVER rather than itself.
+PROC_WATCH="$BIN_DIR/proc_watch"
+harness_build "the proc_watch server-pid CPU sampler (release)" \
+  --release -p graphus-examples-harness --bin proc_watch
+[ -x "$PROC_WATCH" ] || { echo "${RED}fatal: proc_watch binary not found at $PROC_WATCH${RESET}" >&2; exit 2; }
 
 # The logical size of the loaded dataset: the bytes the generator actually emitted. The REAL
 # denominator for the amplification ratios (rmp #699) — previously they were computed against an
@@ -417,6 +446,21 @@ emit_evidence() {
     args+=( --pid "$pid" --uptime-secs "$uptime" --store "$store" --wal "$wal" --peak-rss-bytes "$peak" )
     args+=( --nodes "$NODE_COUNT" --rels "$REL_COUNT" --param "driver=official neo4j-driver" )
     args+=( --logical-graph-bytes "$LOGICAL_GRAPH_BYTES" )
+    # write_amplification must divide by what the client actually WROTE. The local run uploads CSV to
+    # the bulk-import endpoint and never sends graph.cypher at all, so the Cypher size is the wrong
+    # denominator for it (it remains the right one for space_amplification, which asks how big the
+    # GRAPH is, not how it happened to be shipped).
+    [ -n "${LOGICAL_WRITTEN_BYTES:-}" ] && args+=( --logical-written-bytes "$LOGICAL_WRITTEN_BYTES" )
+    args+=( --param "load_path=network bulk-import (Mode A)" )
+    [ -n "${BULK_SECS:-}" ] && args+=( --param "bulk_load_secs=$BULK_SECS" )
+    [ -n "${BULK_RELS_PER_SEC:-}" ] && args+=( --param "bulk_load_rels_per_sec=$BULK_RELS_PER_SEC" )
+    # The per-algorithm SERVER CPU battery — the vector this example exists to expose (rmp #717).
+    if [ -s "${ALGO_CPU_JSON:-}" ]; then
+      args+=( --algo-cpu "$ALGO_CPU_JSON" )
+      [ -n "${TOP_ALGO:-}" ] && args+=( --param "busiest_algorithm=$TOP_ALGO" )
+      [ -n "${TOP_CORES:-}" ] && args+=( --param "busiest_algorithm_cores=$TOP_CORES" )
+      [ -n "${SERIAL_ALGOS:-}" ] && args+=( --param "serial_algorithms=$SERIAL_ALGOS of $MEASURED_ALGOS measured (<1.5 cores)" )
+    fi
     [ -n "${ANALYZE_OPS:-}" ]  && args+=( --workload-ops "$ANALYZE_OPS" )
     [ -n "${ANALYZE_SECS:-}" ] && args+=( --workload-secs "$ANALYZE_SECS" )
     [ -n "${ANALYZE_P50:-}" ]  && args+=( --p50-ms "$ANALYZE_P50" )
@@ -450,7 +494,10 @@ except Exception:
 print('yes' if t >= 1.0 else 'no')
 " 2>/dev/null || echo no)"
 
-  if [ "$PROFILE" = "fast" ] && [ -f "$BASELINE" ] && [ -f "$EVIDENCE_DIR/report.json" ]; then
+  # The committed baseline is captured from the DEFAULT profile, so the gate runs on the default run.
+  # (It used to be pinned to `fast` — which, once the default moved, would have been a gate that never
+  # fires: the same failure mode as a zero placeholder, wearing a green tick.)
+  if [ "$PROFILE" = "$BASELINE_PROFILE" ] && [ -f "$BASELINE" ] && [ -f "$EVIDENCE_DIR/report.json" ]; then
     section "regression gate vs committed baseline"
     harness_build "the gds_baseline_cmp gate (debug)" --release -p graphus-gds-gen --bin gds_baseline_cmp
     CMP_BIN="$BIN_DIR/gds_baseline_cmp"
@@ -470,12 +517,16 @@ if [ "$RUN_DRIVER" = "1" ]; then
     -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" >/dev/null 2>&1
 
   BOLT_PORT="$(( (RANDOM % 20000) + 40000 ))"
+  REST_PORT="$(( BOLT_PORT + 1 ))"
+  # REST is enabled for ONE reason: the network bulk-import (Mode A) endpoint the default profile's
+  # graph goes in through (`data/bulk_load.py`). It runs over the SAME self-signed TLS as Bolt — no
+  # plaintext listener is opened. The analytics themselves are driven over Bolt, as before.
   cat > "$CONFIG" <<EOF
 # Generated by examples/gds-analytics/run.sh — a Bolt-TCP+TLS demo configuration.
 store_path = "$WORKDIR/data"
 buffer_pool_pages = 8192
 bolt_tcp_addr = "127.0.0.1:$BOLT_PORT"
-rest_addr = ""
+rest_addr = "127.0.0.1:$REST_PORT"
 uds_path = ""
 jwt_secret = "$JWT_SECRET"
 
@@ -509,10 +560,55 @@ EOF
 
   install_driver "$WORKDIR/node" || exit 1
 
-  section "Step 3b — load + analyze the influence network over Bolt (OFFICIAL neo4j-driver)"
+  # ------------------------------------------------------------------------------------------------
+  # Step 3b — get the graph IN, through the network bulk-import endpoint (Mode A).
+  #
+  # The default profile is 2 400 authors / ~24 000 citations, and how it is loaded is the difference
+  # between an example that can afford to measure per-algorithm CPU and one that cannot: replaying
+  # graph.cypher edge by edge takes ~8 s (the planner index-seeks only the FIRST anchor of a two-anchor
+  # CREATE), where the ratified bulk-import path (specification/08-network-bulk-import.md) ingests the
+  # identical graph in ~0.2 s. The ATTACH path below keeps the Cypher loader, because a target instance
+  # may expose no bulk-import endpoint (or no admin rights on it).
+  # ------------------------------------------------------------------------------------------------
+  section "Step 3b — load the influence network (network bulk-import, Mode A)"
+  BULK_DB="gds_$(date +%s)_$$"
+  BULK_OUT="$(python3 "$SCRIPT_DIR/data/bulk_load.py" \
+      --base-url "https://127.0.0.1:$REST_PORT" \
+      --user "$ADMIN_USER" --password "$ADMIN_PW" \
+      --db "$BULK_DB" --data-dir "$DATA_DIR" --insecure \
+      --expect-nodes "$NODE_COUNT" --expect-rels "$REL_COUNT" 2>&1)" || true
+  printf '%s\n' "$BULK_OUT" | sed 's/^/  /'
+  assert "network bulk-import (Mode A) ingested the graph" "yes" \
+    "$(printf '%s' "$BULK_OUT" | grep -q 'GRAPHUS_BULK_OK' && echo yes || echo no)"
+  BULK_BLOB="$(printf '%s' "$BULK_OUT" | sed -n 's/^GRAPHUS_BULK_OK //p' | head -n1)"
+  BULK_SECS="$(json_field "$BULK_BLOB" load_secs)"
+  BULK_RELS_PER_SEC="$(json_field "$BULK_BLOB" rels_per_sec)"
+  if [ -z "$BULK_BLOB" ]; then
+    echo "${RED}fatal: the bulk import did not complete — there is no graph to analyse${RESET}" >&2
+    exit 1
+  fi
+  info "bulk-imported ${NODE_COUNT} nodes + ${REL_COUNT} relationships in ${BULK_SECS}s (${BULK_RELS_PER_SEC} rels/s) into database '$BULK_DB'"
+  # What the client actually WROTE to the server on this path: the two CSV files it uploaded.
+  LOGICAL_WRITTEN_BYTES=$(( $(wc -c < "$DATA_DIR/nodes.csv") + $(wc -c < "$DATA_DIR/relationships.csv") ))
+  info "logical bytes uploaded (nodes.csv + relationships.csv): ${LOGICAL_WRITTEN_BYTES} B"
+  # Meter the store/WAL of the database that actually HOLDS the graph (see the note at their defaults).
+  STORE_FILE="$WORKDIR/data/databases/$BULK_DB/graphus.store"
+  WAL_DIR="$WORKDIR/data/databases/$BULK_DB/graphus.wal"
+  assert "the run's database has a store image on disk" "yes" \
+    "$([ -s "$STORE_FILE" ] && echo yes || echo no)"
+  assert "the run's database has a WAL directory on disk" "yes" \
+    "$([ -d "$WAL_DIR" ] && echo yes || echo no)"
+  sample_peak_rss
+
+  section "Step 3c — analyze over Bolt (OFFICIAL neo4j-driver) + per-algorithm SERVER CPU"
+  ALGO_CPU_JSON="$EVIDENCE_DIR/algo_cpu.json"
+  rm -f "$ALGO_CPU_JSON"
   ANALYZE_OUT="$(cd "$WORKDIR/node" && node analyze.js \
       --uri "bolt+ssc://127.0.0.1:$BOLT_PORT" \
       --user "$ADMIN_USER" --password "$ADMIN_PW" \
+      --database "$BULK_DB" --skip-load \
+      --server-pid "$SERVER_PID" --proc-watch "$PROC_WATCH" \
+      --algo-cpu-out "$ALGO_CPU_JSON" --cpu-target-secs "$CPU_TARGET_SECS" \
       --graph "$GRAPH_CYPHER" --reference "$REFERENCE" 2>&1)" || true
   printf '%s\n' "$ANALYZE_OUT" | sed 's/^/  /'
   assert "GDS analytics matched the reference ground truth" "yes" \
@@ -520,6 +616,41 @@ EOF
   sample_peak_rss
   parse_stats "$ANALYZE_OUT"
   sample_peak_rss
+
+  # ------------------------------------------------------------------------------------------------
+  # The per-algorithm CPU gate. It exists to make the "GDS uses 2 of 9 cores" folklore FALSIFIABLE, so
+  # it must be a gate that can genuinely fail: it fires if the battery measured nothing, and it fires
+  # if NO algorithm exceeded one core (i.e. the server really did run the whole GDS surface serially).
+  # ------------------------------------------------------------------------------------------------
+  assert "per-algorithm SERVER CPU battery produced evidence" "yes" \
+    "$([ -s "$ALGO_CPU_JSON" ] && echo yes || echo no)"
+  BATTERY_VERDICT="$(python3 - "$ALGO_CPU_JSON" <<'PY' 2>/dev/null || echo "error"
+import json, sys
+try:
+    b = json.load(open(sys.argv[1]))
+except Exception as e:  # noqa: BLE001
+    print("error"); sys.exit()
+algos = [a for a in b["algorithms"] if a.get("mean_core_utilisation") is not None]
+if not algos:
+    print("none-measured"); sys.exit()
+top = max(algos, key=lambda a: a["mean_core_utilisation"])
+serial = [a for a in algos if a["mean_core_utilisation"] < 1.5]
+print(f'{top["algorithm"]}|{top["mean_core_utilisation"]:.2f}|{len(algos)}|{len(serial)}|{b["host_cores"]}')
+PY
+)"
+  TOP_ALGO="$(printf '%s' "$BATTERY_VERDICT" | cut -d'|' -f1)"
+  TOP_CORES="$(printf '%s' "$BATTERY_VERDICT" | cut -d'|' -f2)"
+  MEASURED_ALGOS="$(printf '%s' "$BATTERY_VERDICT" | cut -d'|' -f3)"
+  SERIAL_ALGOS="$(printf '%s' "$BATTERY_VERDICT" | cut -d'|' -f4)"
+  HOST_CORES_BATTERY="$(printf '%s' "$BATTERY_VERDICT" | cut -d'|' -f5)"
+  assert "the battery resolved at least one algorithm's server CPU" "yes" \
+    "$([ "$MEASURED_ALGOS" -ge 1 ] 2>/dev/null && echo yes || echo no)"
+  # THE gate: at this scale at least one GDS algorithm must keep MORE THAN ONE core busy on the
+  # server. If every algorithm came back under 1.5 cores, GDS is running serially and this run says so
+  # (loudly) instead of passing quietly.
+  assert "at least one GDS algorithm keeps >1 core busy on the SERVER" "yes" \
+    "$(python3 -c "import sys; print('yes' if float('${TOP_CORES:-0}') > 1.5 else 'no')" 2>/dev/null || echo no)"
+  info "busiest algorithm: ${TOP_ALGO:-?} at ${TOP_CORES:-?} of ${HOST_CORES_BATTERY:-?} cores; ${SERIAL_ALGOS:-?}/${MEASURED_ALGOS:-?} measured algorithms are effectively serial (<1.5 cores)"
 
   section "Step 4 — collect performance evidence (per-algorithm + CPU / RAM / storage)"
   SERVER_UPTIME_SECS=$(( $(date +%s) - SERVER_START_EPOCH ))

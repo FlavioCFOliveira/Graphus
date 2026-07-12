@@ -67,9 +67,17 @@
 //!   [--nodes <u64> --rels <u64>] \
 //!   [--total-millis <f64>] \
 //!   [--p50-ms <f64> --p99-ms <f64> --p999-ms <f64> --workload-ops <u64> --workload-secs <f64>] \
-//!   [--logical-graph-bytes <u64>] \
+//!   [--logical-graph-bytes <u64>] [--logical-written-bytes <u64>] \
+//!   [--algo-cpu <algo_cpu.json>] \
 //!   [--param key=value]... [--note <text>]...
 //! ```
+//!
+//! `--algo-cpu` is the per-algorithm **SERVER** CPU battery `analyze.js` measured (`rmp #717`): each
+//! algorithm called repeatedly over Bolt with the phase bracketed between two reads of the server
+//! pid's cumulative CPU counters. It lands as one CPU-carrying [`PhaseTiming`] per algorithm, so
+//! `report.md` shows, per algorithm, the cores the SERVER kept busy — the question the run-wide
+//! average cannot answer. Absent on an attach run (no co-located pid), and then the vector is absent
+//! from the report, with a note saying why.
 //!
 //! The live-server flags are all optional: when `run.sh` skipped the driver path (`RUN_DRIVER=0` or
 //! no node/npm), the CPU/RAM/storage/throughput sections honestly stay zero and the report still
@@ -148,8 +156,165 @@ struct Args {
     /// Logical size of the loaded dataset (the generator's emitted Cypher bytes), for the REAL
     /// amplification ratios. `None` ⇒ the ratios stay at "not measured" rather than being invented.
     logical_graph_bytes: Option<u64>,
+    /// The logical bytes the client actually WROTE to the server on the load path (the uploaded CSV
+    /// for the bulk-import path; the Cypher script for the attach path). The `write_amplification`
+    /// denominator. `None` ⇒ falls back to `logical_graph_bytes`.
+    logical_written_bytes: Option<u64>,
+    /// The per-algorithm SERVER-CPU battery `analyze.js` wrote (`--algo-cpu-out`), when the run could
+    /// measure it (a co-located server pid). `None` on an attach run — and then the per-algorithm
+    /// core-utilisation vector is simply ABSENT from the report.
+    algo_cpu: Option<String>,
     params: Vec<(String, String)>,
     notes: Vec<String>,
+}
+
+/// One algorithm's entry in the per-algorithm SERVER-CPU battery (`rmp #717`).
+///
+/// `cpu_secs` / `mean_core_utilisation` are `Option` for the one reason that matters: an algorithm
+/// whose whole bracket burned less CPU than the OS's clock tick can resolve **has no measurement**,
+/// and the driver omits the fields rather than writing a `0.0` that reads as "the server did no work".
+struct AlgoCpu {
+    algorithm: String,
+    projection: String,
+    calls: u64,
+    wall_secs: f64,
+    ms_per_call: f64,
+    cpu_secs: Option<f64>,
+    mean_core_utilisation: Option<f64>,
+    /// Set when the algorithm ran but its CPU could not be resolved (with the reason), or when the
+    /// server does not register the procedure at all.
+    unmeasured: Option<String>,
+}
+
+/// The battery as a whole: the server it measured, the machine it ran on, and the per-algorithm rows.
+struct AlgoCpuBattery {
+    server_pid: u64,
+    host_cores: u64,
+    authors: u64,
+    algorithms: Vec<AlgoCpu>,
+    /// What DECLARING THE SCHEMA cost the server: wall, CPU, and — the figure that matters — the
+    /// resident memory the index build took and never gave back (`rmp` #724).
+    schema_ddl: Option<SchemaDdlCost>,
+    /// The server's RSS when the battery opened and after its last call: the check that the algorithm
+    /// calls themselves do not leak (they do not — measured).
+    rss_growth_bytes: Option<i64>,
+    battery_calls: u64,
+}
+
+/// The measured cost of applying the example's schema DDL to the loaded graph.
+struct SchemaDdlCost {
+    statements_applied: u64,
+    wall_secs: f64,
+    cpu_secs: f64,
+    rss_before_bytes: u64,
+    rss_after_bytes: u64,
+    rss_delta_bytes: i64,
+}
+
+/// Parses `analyze.js`'s `algo_cpu.json`.
+fn load_algo_cpu(path: &str) -> Result<AlgoCpuBattery, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("cannot parse {path}: {e}"))?;
+    let arr = v
+        .get("algorithms")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("{path}: no `algorithms` array"))?;
+
+    let mut algorithms = Vec::with_capacity(arr.len());
+    for a in arr {
+        let algorithm = a
+            .get("algorithm")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("{path}: an entry has no `algorithm`"))?
+            .to_owned();
+        // A procedure the server does not register was not measured — and says so.
+        if let Some(skipped) = a.get("skipped").and_then(serde_json::Value::as_str) {
+            algorithms.push(AlgoCpu {
+                algorithm,
+                projection: a
+                    .get("projection")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                calls: 0,
+                wall_secs: 0.0,
+                ms_per_call: 0.0,
+                cpu_secs: None,
+                mean_core_utilisation: None,
+                unmeasured: Some(skipped.to_owned()),
+            });
+            continue;
+        }
+        algorithms.push(AlgoCpu {
+            algorithm,
+            projection: a
+                .get("projection")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            calls: a
+                .get("calls")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            wall_secs: a
+                .get("wall_secs")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0),
+            ms_per_call: a
+                .get("ms_per_call")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0),
+            cpu_secs: a.get("cpu_secs").and_then(serde_json::Value::as_f64),
+            mean_core_utilisation: a
+                .get("mean_core_utilisation")
+                .and_then(serde_json::Value::as_f64),
+            unmeasured: a
+                .get("cpu_not_measured")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+        });
+    }
+
+    let schema_ddl = v.get("schema_ddl").and_then(|d| {
+        let rss_before = d.get("server_rss_before_bytes")?.as_u64()?;
+        let rss_after = d.get("server_rss_after_bytes")?.as_u64()?;
+        Some(SchemaDdlCost {
+            statements_applied: d.get("statements_applied")?.as_u64()?,
+            wall_secs: d.get("wall_secs")?.as_f64()?,
+            cpu_secs: d.get("cpu_secs")?.as_f64()?,
+            rss_before_bytes: rss_before,
+            rss_after_bytes: rss_after,
+            rss_delta_bytes: d
+                .get("server_rss_delta_bytes")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(rss_after as i64 - rss_before as i64),
+        })
+    });
+
+    Ok(AlgoCpuBattery {
+        server_pid: v
+            .get("server_pid")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        host_cores: v
+            .get("host_cores")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        authors: v
+            .get("authors")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        algorithms,
+        schema_ddl,
+        rss_growth_bytes: v
+            .get("server_rss_growth_bytes")
+            .and_then(serde_json::Value::as_i64),
+        battery_calls: v
+            .get("battery_calls")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+    })
 }
 
 fn main() -> ExitCode {
@@ -269,8 +434,150 @@ fn main() -> ExitCode {
     collector.record_total_duration_from(args.total_millis, args.workload_secs);
 
     // --- Per-algorithm timings: one PHASE per algorithm at the reference (largest swept) size.
+    // These are the HERMETIC, in-process library timings (no server, no wire) — named so, because the
+    // report now also carries the same algorithms measured through the SERVER, and a reader must never
+    // have to guess which is which.
     for (name, ms) in &reference.timings_ms {
-        collector.phase(name.clone(), Duration::from_secs_f64(ms / 1_000.0));
+        collector.phase(
+            format!("library (in-process): {name}"),
+            Duration::from_secs_f64(ms / 1_000.0),
+        );
+    }
+
+    // --- Per-algorithm SERVER CPU (rmp #717): one CPU-carrying PHASE per algorithm, measured over
+    // Bolt against the real server by bracketing its pid's cumulative CPU counters.
+    //
+    // This is the vector the example exists to expose and could not, because the run-level average
+    // buried it: a 57 ms `betweenness` call that keeps 14 cores busy is invisible next to a load phase
+    // that used one core for seconds. Each phase's `millis` is the bracket's wall time and its
+    // `cpu_secs` the CPU the SERVER burned inside it, so `mean_core_utilisation` is that algorithm's
+    // real core count — and an algorithm whose CPU fell below the OS clock tick carries NO cpu figure
+    // at all (the phase keeps its wall time; the report renders the CPU as `not measured`).
+    let mut battery_summary: Vec<String> = Vec::new();
+    if let Some(path) = args.algo_cpu.as_deref() {
+        let battery = match load_algo_cpu(path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("gds_evidence: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        // The schema DDL comes FIRST in the phase list, because it happens first and because it is
+        // where this server spends memory it never returns (`rmp` #724).
+        if let Some(ddl) = &battery.schema_ddl {
+            collector.phase_with_cpu(
+                format!(
+                    "server (over Bolt): schema DDL [{} statements: constraints + node/rel RANGE indexes]",
+                    ddl.statements_applied
+                ),
+                Duration::from_secs_f64(ddl.wall_secs),
+                ddl.cpu_secs,
+            );
+            let mb = |b: i64| b as f64 / (1024.0 * 1024.0);
+            collector.note(format!(
+                "SERVER MEMORY — declaring the schema cost {:.1} MB of RESIDENT server memory ({:.1} \
+                 MB -> {:.1} MB) for {} statements over a {}-node / {}-relationship graph, and the \
+                 server NEVER GIVES IT BACK. Isolated per statement on this host: the :CITES(weight) \
+                 relationship RANGE index over 23 962 relationships alone costs ~160 MB (~7 KB of RSS \
+                 per indexed relationship, LINEAR in the element count — 59 967 relationships cost \
+                 445 MB); the :Author(field) node index costs ~39 MB; the UNIQUE constraint ~20 MB; \
+                 the two property-TYPE constraints, which build no index, cost nothing. Filed as rmp \
+                 #724 — at this rate a single index over 1 M relationships needs ~7.5 GB of RSS. This \
+                 example's own evidence is what surfaced it.",
+                mb(ddl.rss_delta_bytes),
+                mb(ddl.rss_before_bytes as i64),
+                mb(ddl.rss_after_bytes as i64),
+                ddl.statements_applied,
+                battery.authors,
+                args.rels.unwrap_or(0),
+            ));
+        }
+        if let Some(growth) = battery.rss_growth_bytes {
+            let mb = growth as f64 / (1024.0 * 1024.0);
+            collector.note(format!(
+                "SERVER MEMORY — the GDS calls do NOT leak; their memory is a ONE-TIME working set. \
+                 Across the battery's {} algorithm calls the server's RSS moved {mb:+.1} MB, and that \
+                 growth is first-touch, not per-call: a control on this host ran four consecutive \
+                 passes of 18 gds.betweenness.stream calls and measured +67.8 MB on the FIRST pass \
+                 (the parallel Brandes scratch, allocated once across the 16 rayon workers) then \
+                 +0.8 / +1.9 / +1.0 MB on the next three — flat. A second control of 300 back-to-back \
+                 gds.pageRank.stream calls moved RSS by 0.0 MB. The memory this example does NOT get \
+                 back is the INDEX memory above (rmp #724), not the analytics.",
+                battery.battery_calls,
+            ));
+        }
+
+        let mut measured = 0_usize;
+        let mut busiest: Option<(&str, f64)> = None;
+        for a in &battery.algorithms {
+            if let Some(reason) = &a.unmeasured {
+                if a.calls == 0 {
+                    // The server does not register the procedure: no phase, an explicit note.
+                    collector.note(format!(
+                        "server CPU for {}: NOT MEASURED — {reason}.",
+                        a.algorithm
+                    ));
+                    continue;
+                }
+            }
+            let name = format!("server (over Bolt): {} [{}]", a.algorithm, a.projection);
+            match a.cpu_secs {
+                Some(cpu) => {
+                    collector.phase_with_cpu(name, Duration::from_secs_f64(a.wall_secs), cpu);
+                    measured += 1;
+                    let cores = a.mean_core_utilisation.unwrap_or(0.0);
+                    if busiest.is_none_or(|(_, best)| cores > best) {
+                        busiest = Some((a.algorithm.as_str(), cores));
+                    }
+                }
+                None => {
+                    // Wall time is real; CPU is not measurable. Record both facts, invent neither.
+                    collector.phase(name, Duration::from_secs_f64(a.wall_secs));
+                    collector.note(format!(
+                        "server CPU for {} ({} calls, {:.2} ms/call): NOT MEASURED — {}.",
+                        a.algorithm,
+                        a.calls,
+                        a.ms_per_call,
+                        a.unmeasured.as_deref().unwrap_or("below the OS clock tick")
+                    ));
+                }
+            }
+        }
+        for a in &battery.algorithms {
+            if let (Some(cores), Some(cpu)) = (a.mean_core_utilisation, a.cpu_secs) {
+                battery_summary.push(format!(
+                    "{}={cores:.2} cores ({:.1} ms/call, {cpu:.2} CPU-s over {} calls)",
+                    a.algorithm, a.ms_per_call, a.calls
+                ));
+            }
+        }
+        let (top_name, top_cores) = busiest.unwrap_or(("<none>", 0.0));
+        collector.note(format!(
+            "PER-ALGORITHM SERVER CPU (rmp #717): each algorithm was called repeatedly over Bolt \
+             against graphus-server pid {} on a {}-core host, with the phase bracketed between two \
+             reads of the SERVER's cumulative CPU counters (proc_watch --snapshot), over a \
+             {}-author / {}-relationship projection. {measured} of {} algorithms produced a \
+             resolvable CPU figure; the busiest was {top_name} at {top_cores:.2} cores. The rest are \
+             recorded as NOT MEASURED with their reason — never as 0.",
+            battery.server_pid,
+            battery.host_cores,
+            battery.authors,
+            args.rels.unwrap_or(0),
+            battery.algorithms.len(),
+        ));
+        if !battery_summary.is_empty() {
+            collector.note(format!(
+                "Per-algorithm cores: {}",
+                battery_summary.join("; ")
+            ));
+        }
+    } else {
+        collector.note(
+            "PER-ALGORITHM SERVER CPU: NOT MEASURED in this run. It requires a co-located server pid \
+             whose /proc CPU counters the driver can bracket; an attach run reaches its target over \
+             the wire only. The phases below are the hermetic in-process library timings."
+                .to_owned(),
+        );
     }
 
     // --- CPU + memory: the live server's, when the driver path supplied a PID; else honest zeros.
@@ -318,10 +625,23 @@ fn main() -> ExitCode {
             eprintln!("gds_evidence: failed to measure the on-disk store/WAL: {e}");
             return ExitCode::FAILURE;
         }
-        // Amplification: REAL ratios — the durable bytes the load actually produced over the logical
-        // dataset the generator emitted. Absent a logical figure they are simply omitted.
-        if let Some(logical) = args.logical_graph_bytes.filter(|b| *b > 0) {
-            collector.record_amplification(logical, logical);
+        // Amplification: REAL ratios, and the two of them are genuinely different quantities.
+        //
+        // * write_amplification = durable bytes / the logical bytes the client actually WROTE. Since
+        //   the default (local) run loads through the network bulk-import endpoint, what it wrote is
+        //   the CSV it uploaded — not `graph.cypher`, which that path never sends. Feeding the Cypher
+        //   size in here would divide by a payload the server never saw.
+        // * space_amplification = durable bytes / the logical size of the GRAPH, for which
+        //   `graph.cypher` (the generator's canonical serialization of exactly this graph) is the
+        //   stable denominator in both run modes.
+        //
+        // Absent a logical figure, a ratio is simply omitted rather than invented.
+        if let Some(graph_bytes) = args.logical_graph_bytes.filter(|b| *b > 0) {
+            let written = args
+                .logical_written_bytes
+                .filter(|b| *b > 0)
+                .unwrap_or(graph_bytes);
+            collector.record_amplification(written, graph_bytes);
         }
         // Per-element durable costs (`rmp #711`): divided by the LOADED INFLUENCE NETWORK's counts —
         // the graph that is actually in the store just measured — and NOT by `metadata.dataset`, which
@@ -488,6 +808,14 @@ fn parse_args() -> Result<Args, String> {
                         .map_err(|e| format!("--logical-graph-bytes: {e}"))?,
                 );
             }
+            "--logical-written-bytes" => {
+                args.logical_written_bytes = Some(
+                    value()?
+                        .parse()
+                        .map_err(|e| format!("--logical-written-bytes: {e}"))?,
+                );
+            }
+            "--algo-cpu" => args.algo_cpu = Some(value()?),
             "--p50-ms" => {
                 args.p50_ms = Some(value()?.parse().map_err(|e| format!("--p50-ms: {e}"))?)
             }
