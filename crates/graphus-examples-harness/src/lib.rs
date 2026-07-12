@@ -129,7 +129,12 @@ pub use scrape::{Bucket, Histogram, MetricsSnapshot};
 ///   **ABSENT** from the JSON instead of being written as a `0` / `0.0` placeholder that a reader
 ///   cannot tell apart from a real zero. See [`EvidenceReport::load`] for how a v1/v2 report's zero
 ///   placeholders are normalised on the way in.
-pub const SCHEMA_VERSION: u32 = 3;
+/// - `4` — a [`PhaseTiming`] may carry the **server CPU the phase burned** and the **mean cores it
+///   kept busy** (`rmp #717`). Both are `Option` and additive, so a v3 report still deserializes and
+///   an example that does not bracket its phases against the server's pid simply omits them. This is
+///   what lets a report answer "does *this algorithm* use the cores?" — a question the run-wide
+///   average cannot answer, because a 60 ms phase on sixteen cores vanishes into an 8 s phase on one.
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// The schema version from which a metric an example did not measure is **absent** rather than zero.
 const OPTIONAL_METRICS_SINCE: u32 = 3;
@@ -667,16 +672,85 @@ fn measured_ratio(v: f64) -> Option<f64> {
     (v.is_finite() && v > 0.0).then_some(v)
 }
 
-/// A single named phase of the scenario together with its measured wall-clock duration.
+/// A single named phase of the scenario together with its measured wall-clock duration — and,
+/// **when the example bracketed the phase against the server's own CPU counters**, the CPU that
+/// phase burned and the mean number of cores it kept busy.
 ///
-/// Phase timing is the one metric the scaffold records itself today (via
-/// [`EvidenceCollector::phase`]); the richer per-phase resource attribution is `rmp #246`/`#247`.
+/// # Why a phase carries CPU (`rmp #717`)
+///
+/// A run-wide `cpu.mean_core_utilisation` is an average over everything the run did, so a phase that
+/// saturates sixteen cores for 60 ms disappears into a load phase that used one core for 8 seconds.
+/// The question "**does this algorithm actually use the cores?**" is therefore unanswerable from the
+/// run-level figure — which is exactly how this project came to carry the unmeasured folklore that
+/// "GDS uses 2 of 9 cores". Attributing CPU to the phase makes it answerable, per algorithm, with a
+/// number.
+///
+/// The two CPU fields are `Option` for the same reason every metric is (schema `3`): **an example
+/// that did not measure them omits them**. They are measurable only when the driver can read the
+/// *server's* cumulative CPU counters — i.e. a local, co-located server pid (the `proc_watch
+/// --snapshot` seam) — so an attach run against a remote instance leaves them absent, and the report
+/// says `not measured` rather than `0.000`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PhaseTiming {
     /// Human label for the phase, e.g. `"insert social graph"`.
     pub name: String,
     /// Wall-clock duration of the phase, in milliseconds.
     pub millis: f64,
+    /// CPU seconds the **server process** burned during this phase (user + system), measured by
+    /// bracketing the phase between two reads of the pid's *cumulative* CPU counters.
+    ///
+    /// Absent when not measured. Never `0.0` as a placeholder: the OS reports CPU in 10 ms clock
+    /// ticks, so a phase shorter than a few ticks cannot be measured at all — such a phase must omit
+    /// the figure (see [`PhaseTiming::with_cpu`]), not publish a zero that reads like "the server did
+    /// no work".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_secs: Option<f64>,
+    /// Mean cores the server kept busy during this phase (`cpu_secs / (millis / 1000)`).
+    ///
+    /// `1.0` = exactly one core saturated; `13.9` = the phase kept ~14 cores busy. Absent whenever
+    /// [`cpu_secs`](Self::cpu_secs) is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean_core_utilisation: Option<f64>,
+}
+
+/// The smallest phase CPU this crate will publish, in seconds.
+///
+/// The OS accounts process CPU in `USER_HZ` clock ticks — **10 ms** on Linux. A phase whose measured
+/// CPU delta is a couple of ticks is therefore dominated by quantisation error (±10 ms on ±20 ms is
+/// ±50%), and a delta of exactly zero says only "shorter than one tick", never "burned no CPU". Five
+/// ticks caps the quantisation error at ±20% before it is ever written down; below that the figure is
+/// **omitted**, because a wrong number that looks like a measurement is worse than an absent one.
+const MIN_MEASURABLE_PHASE_CPU_SECS: f64 = 0.05;
+
+impl PhaseTiming {
+    /// A phase whose wall-clock duration was measured, but whose CPU was not.
+    #[must_use]
+    pub fn new(name: impl Into<String>, millis: f64) -> Self {
+        Self {
+            name: name.into(),
+            millis,
+            cpu_secs: None,
+            mean_core_utilisation: None,
+        }
+    }
+
+    /// A phase bracketed against the **server's** cumulative CPU counters.
+    ///
+    /// `cpu_secs` is the (user + system) CPU the server burned across the phase. The CPU figures are
+    /// attached **only if they are genuinely measurable**: a `cpu_secs` below
+    /// [`MIN_MEASURABLE_PHASE_CPU_SECS`] (five 10 ms clock ticks), a non-finite one, or a phase with
+    /// no positive wall-clock window to divide by, leaves both fields ABSENT — the phase still
+    /// reports its wall time, and the report renders its CPU as `not measured`.
+    #[must_use]
+    pub fn with_cpu(name: impl Into<String>, millis: f64, cpu_secs: f64) -> Self {
+        let mut p = Self::new(name, millis);
+        let secs = millis / 1_000.0;
+        if cpu_secs.is_finite() && cpu_secs >= MIN_MEASURABLE_PHASE_CPU_SECS && secs > 0.0 {
+            p.cpu_secs = Some(cpu_secs);
+            p.mean_core_utilisation = Some(cpu_secs / secs);
+        }
+        p
+    }
 }
 
 /// The complete, serializable evidence produced by one example run — the **stable, versioned
@@ -906,19 +980,44 @@ impl EvidenceReport {
             let _ = writeln!(s);
         }
 
-        let _ = writeln!(s, "## Phase timings");
-        let _ = writeln!(s);
-        let _ = writeln!(s, "| Phase | Duration (ms) |");
-        let _ = writeln!(s, "|-------|---------------|");
-        for p in &self.phases {
-            let _ = writeln!(s, "| {} | {:.3} |", p.name, p.millis);
-        }
-        let _ = writeln!(s);
-
         // An unmeasured metric renders as an explicit "not measured", never as a `0.000` a reader
         // would take for a result (`rmp #711` — the same rule the JSON enforces by omitting it).
         let f = |v: Option<f64>| v.map_or_else(|| NOT_MEASURED.to_string(), |x| format!("{x:.3}"));
         let u = |v: Option<u64>| v.map_or_else(|| NOT_MEASURED.to_string(), |x| x.to_string());
+
+        let _ = writeln!(s, "## Phase timings");
+        let _ = writeln!(s);
+        // The SERVER-CPU columns appear only when at least one phase was bracketed against the
+        // server's own counters (`rmp #717`); a run that measured no phase CPU keeps the plain
+        // two-column table rather than printing a column of `not measured`.
+        let any_phase_cpu = self.phases.iter().any(|p| p.cpu_secs.is_some());
+        if any_phase_cpu {
+            let _ = writeln!(
+                s,
+                "| Phase | Duration (ms) | Server CPU (s) | Mean cores busy |"
+            );
+            let _ = writeln!(
+                s,
+                "|-------|---------------|----------------|-----------------|"
+            );
+            for p in &self.phases {
+                let _ = writeln!(
+                    s,
+                    "| {} | {:.3} | {} | {} |",
+                    p.name,
+                    p.millis,
+                    f(p.cpu_secs),
+                    f(p.mean_core_utilisation)
+                );
+            }
+        } else {
+            let _ = writeln!(s, "| Phase | Duration (ms) |");
+            let _ = writeln!(s, "|-------|---------------|");
+            for p in &self.phases {
+                let _ = writeln!(s, "| {} | {:.3} |", p.name, p.millis);
+            }
+        }
+        let _ = writeln!(s);
 
         let _ = writeln!(s, "## CPU");
         let _ = writeln!(s);
@@ -1138,10 +1237,24 @@ impl EvidenceCollector {
     /// A convenience over computing `Instant::elapsed()` at the call site; example code typically
     /// snapshots an `Instant` before a phase and passes the elapsed `Duration` here.
     pub fn phase(&mut self, name: impl Into<String>, duration: Duration) {
-        self.report.phases.push(PhaseTiming {
-            name: name.into(),
-            millis: duration.as_secs_f64() * 1_000.0,
-        });
+        self.report
+            .phases
+            .push(PhaseTiming::new(name, duration.as_secs_f64() * 1_000.0));
+    }
+
+    /// Records a completed phase together with the **server CPU** it burned (`rmp #717`).
+    ///
+    /// `cpu_secs` must come from bracketing the phase between two reads of the *server process's*
+    /// cumulative CPU counters (the `proc_watch --snapshot` seam) — never from the driver's own
+    /// `getrusage`, which measures the client. The CPU figures are dropped (leaving the phase's wall
+    /// time alone) when the phase is too short for the OS's 10 ms clock tick to resolve; see
+    /// [`PhaseTiming::with_cpu`].
+    pub fn phase_with_cpu(&mut self, name: impl Into<String>, duration: Duration, cpu_secs: f64) {
+        self.report.phases.push(PhaseTiming::with_cpu(
+            name,
+            duration.as_secs_f64() * 1_000.0,
+            cpu_secs,
+        ));
     }
 
     /// Mutable access to the CPU section, for `rmp #246` to populate.
@@ -1570,8 +1683,68 @@ mod tests {
         assert_eq!(report.phases.len(), 2);
         assert_eq!(report.phases[0].name, "warmup");
         assert!((report.phases[1].millis - 10.0).abs() < 1e-6);
+        // A phase nobody bracketed against the server's counters carries NO cpu figure at all.
+        assert!(report.phases[0].cpu_secs.is_none());
+        assert!(report.phases[0].mean_core_utilisation.is_none());
         // total is wall-clock between start/finish; non-negative and at least registers as elapsed.
         assert!(report.total_millis >= 0.0);
+    }
+
+    /// A phase bracketed against the SERVER's cumulative CPU counters reports the cores it kept busy
+    /// (`rmp #717`) — the figure that answers "does this algorithm use the machine?".
+    #[test]
+    fn phase_with_cpu_reports_mean_cores() {
+        let mut c = EvidenceCollector::new(sample_metadata());
+        c.start();
+        // 100 ms of wall during which the server burned 1.39 CPU-seconds => ~13.9 cores busy.
+        c.phase_with_cpu("gds.betweenness.stream", Duration::from_millis(100), 1.39);
+        let report = c.finish();
+
+        let p = &report.phases[0];
+        assert_eq!(p.cpu_secs, Some(1.39));
+        let cores = p.mean_core_utilisation.expect("cores measured");
+        assert!((cores - 13.9).abs() < 1e-9, "cores = {cores}");
+
+        // …and it survives the JSON round-trip (the fields are additive, schema 4).
+        let json = serde_json::to_string(&report).unwrap();
+        let back: EvidenceReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.phases[0].cpu_secs, Some(1.39));
+        assert!(back.phases[0].mean_core_utilisation.is_some());
+        // The human rendering shows the per-phase CPU columns.
+        let md = report.to_markdown();
+        assert!(md.contains("Mean cores busy"), "{md}");
+        assert!(md.contains("13.900"), "{md}");
+    }
+
+    /// A phase TOO SHORT for the OS's 10 ms clock tick to resolve must report **no CPU at all**,
+    /// never a `0.0` that reads as "the server did no work" (`rmp #717`, evidence-honesty rule 1).
+    ///
+    /// This is the exact shape the first cut of the GDS per-algorithm battery produced: a
+    /// `gds.bellmanFord.stream` call that returned in 2.6 ms measured a CPU delta of 0 ticks and would
+    /// have published `mean_core_utilisation: 0.0` — a fabricated zero for an algorithm that in fact
+    /// burned CPU, just less than one tick of it.
+    #[test]
+    fn phase_cpu_below_the_clock_tick_is_absent_not_zero() {
+        for (millis, cpu) in [(2.6_f64, 0.0_f64), (13.0, 0.01), (50.0, 0.04)] {
+            let p = PhaseTiming::with_cpu("gds.bellmanFord.stream", millis, cpu);
+            assert_eq!(
+                p.cpu_secs, None,
+                "cpu={cpu}s over {millis}ms must be ABSENT"
+            );
+            assert_eq!(p.mean_core_utilisation, None);
+            assert!(
+                (p.millis - millis).abs() < 1e-9,
+                "the wall time is still real"
+            );
+            // …and the JSON genuinely omits them (a `null` would still be a claim).
+            let json = serde_json::to_string(&p).unwrap();
+            assert!(!json.contains("cpu_secs"), "{json}");
+            assert!(!json.contains("mean_core_utilisation"), "{json}");
+        }
+        // Five ticks or more IS measurable (±20% quantisation, stated and bounded).
+        let p = PhaseTiming::with_cpu("gds.wcc.stream", 100.0, 0.05);
+        assert_eq!(p.cpu_secs, Some(0.05));
+        assert_eq!(p.mean_core_utilisation, Some(0.5));
     }
 
     /// Regression (`rmp #699`): an emitter that builds its report AFTER the workload must report the
@@ -1700,7 +1873,7 @@ mod tests {
         assert_eq!(parsed.storage.plateau_ratio, Some(1.02));
         // The v2 additions (`rmp #684`) survive the round-trip.
         assert_eq!(parsed.version, SCHEMA_VERSION);
-        assert_eq!(parsed.version, 3);
+        assert_eq!(parsed.version, 4);
         assert_eq!(parsed.measurement_mode, MeasurementMode::External);
         assert_eq!(parsed.server_metrics, report.server_metrics);
         let sm = parsed

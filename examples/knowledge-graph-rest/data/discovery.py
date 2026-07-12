@@ -42,8 +42,13 @@ Usage::
 import argparse
 import http.client
 import json
+import multiprocessing as mp
+import os
+import resource
 import ssl
 import struct
+import subprocess
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -234,6 +239,34 @@ class RestClient:
         if params is not None:
             stmt["parameters"] = params
         return self.auto_commit([stmt], accept=accept, access_mode="READ")
+
+    def raw_post(self, body, accept="application/json", extra_headers=None, stream=False):
+        """POSTs a hand-built transactional body with arbitrary extra headers.
+
+        The volume phase needs this because the response SHAPE is chosen by the request's headers, and
+        one of the shapes it must exercise is the one an `Idempotency-Key` forces: with that header the
+        server cannot stream (it has to cache the response for replay), so it materialises the whole
+        result first. That is a real production request — the header is the API's own retry-safety
+        mechanism — and there is no other way to ask for it."""
+        data = json.dumps(body).encode()
+        headers = {"Accept": accept, "Content-Type": "application/json"}
+        if self.token:
+            headers["Authorization"] = "Bearer " + self.token
+        headers.update(extra_headers or {})
+        last_exc = None
+        for attempt in (0, 1):
+            conn = self._connection()
+            try:
+                conn.request("POST", f"/db/{self.db}/tx/commit", body=data, headers=headers)
+                resp = conn.getresponse()
+                hdrs = {k: v for k, v in resp.getheaders()}
+                if stream:
+                    return resp.status, resp, hdrs
+                return resp.status, resp.read(), hdrs
+            except (http.client.HTTPException, ConnectionError, OSError) as exc:
+                last_exc = exc
+                self._close()
+        raise last_exc
 
     def stream(self, statement, params=None):
         """Runs a single query requesting NDJSON; returns ``(status, response_obj, headers)`` so the
@@ -566,19 +599,247 @@ def content_negotiation(client):
     return len(jbody), len(cbody)
 
 
-def concurrency(client_factory, clients, ops_per_client):
-    """Drives ``clients`` concurrent threads, each issuing ``ops_per_client`` discovery queries.
-    Asserts zero errors; returns ``(total_ops, errors, elapsed, p50_ms, p99_ms, throughput)``."""
-    errors = [0]
+# --------------------------------------------------------------------------------------------------
+# The SERVER-pid seam (rmp #717) — `proc_watch`, the shared sampler from the examples harness.
+#
+# The house rule is "sample the SERVER, not the driver". A python client can only reach the server over
+# HTTP, so on its own it can measure precisely nothing about the server's memory. `proc_watch` closes
+# that gap: `--snapshot` reads the server pid's CUMULATIVE cpu counters (bracket a phase with two to
+# get the exact CPU it burned), and `--watch` samples the pid's RSS on a cadence and reports the PEAK
+# DELTA over the baseline it held when the watch opened.
+#
+# `--watch` is the only way to see a response the server materialises in full before flushing a byte:
+# that memory is freed by the time the request returns, so a before/after snapshot misses it entirely.
+# --------------------------------------------------------------------------------------------------
+class ServerWatch:
+    """A running `proc_watch --watch` over the server pid; `stop()` returns its parsed JSON report."""
+
+    def __init__(self, proc_watch, pid, interval_ms=10):
+        self.dir = tempfile.mkdtemp(prefix="kg-watch-")
+        self.out = os.path.join(self.dir, "watch.json")
+        self.stop_file = os.path.join(self.dir, "stop")
+        self.proc = subprocess.Popen(
+            [proc_watch, "--pid", str(pid), "--watch", "--out", self.out,
+             "--interval-ms", str(interval_ms), "--stop-file", self.stop_file,
+             "--max-secs", "600"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+        # The watcher must be sampling BEFORE the workload starts, or the peak it is there to catch
+        # can happen before its first sample. One interval is enough (it samples the baseline eagerly).
+        time.sleep(max(0.05, interval_ms / 1000.0 * 3))
+
+    def stop(self):
+        with open(self.stop_file, "w") as fh:
+            fh.write("stop")
+        try:
+            _, err = self.proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            raise SystemExit("proc_watch did not exit after the stop-file was created")
+        if self.proc.returncode != 0:
+            raise SystemExit(f"proc_watch failed ({self.proc.returncode}): {err.decode()[:300]}")
+        with open(self.out) as fh:
+            return json.load(fh)
+
+
+def server_snapshot(proc_watch, pid):
+    """One cumulative CPU + current RSS reading of the SERVER process."""
+    out = subprocess.run([proc_watch, "--pid", str(pid), "--snapshot"],
+                         capture_output=True, text=True, check=True).stdout
+    return json.loads(out)
+
+
+# --------------------------------------------------------------------------------------------------
+# The VOLUME phase (rmp #717) — REST-path resource behaviour under result-set VOLUME.
+#
+# This is the vector the example exists to expose and, at 320 tiny operations, could not. The REST
+# response path has three shapes, and they do NOT cost the same:
+#
+#   1. NDJSON                      (`Accept: application/x-ndjson`)                → STREAMS
+#   2. JSON, single statement      (`Accept: application/json`, no Idempotency-Key) → STREAMS
+#   3. JSON, buffered              (the SAME query + an `Idempotency-Key` header)   → BUFFERS the whole
+#      result server-side before a byte is flushed, because the response has to be cached for replay
+#      (`stream_framing` in crates/graphus-rest/src/router.rs returns `None` when the header is
+#      present). A multi-statement batch buffers for the same reason.
+#
+# Shape 3 is not a synthetic hack: `Idempotency-Key` is the retry-safety header the API *documents and
+# encourages*, and a production client that sends it silently loses streaming. That is exactly the kind
+# of fragility an example is for — and it is invisible at 320 operations of a handful of rows.
+#
+# The buffered path is bounded (`MAX_BUFFERED_RESULT_BYTES` = 16 MiB serialized, rmp #553): over the
+# cap the statement is aborted with a 400 rather than OOMing the server. This phase drives all three
+# shapes at the same row count, samples the SERVER's RSS through each, and then deliberately crosses
+# the cap to prove it fires.
+# --------------------------------------------------------------------------------------------------
+# A REAL analytical query, not a row generator: co-mentioned document pairs (which documents discuss
+# the same concept). It is the canonical knowledge-graph "co-occurrence export", and it produces a
+# large result from a modest graph — which is the honest way to reach volume without pretending the
+# graph is bigger than it is.
+VOLUME_QUERY = (
+    "MATCH (d:Document)-[:MENTIONS]->(c:Concept)<-[:MENTIONS]-(o:Document) "
+    "WHERE d.id <> o.id "
+    "RETURN d.id AS doc, c.name AS concept, o.id AS other "
+    "LIMIT {rows}"
+)
+
+# The CAP probe needs a response whose SERIALIZED size crosses MAX_BUFFERED_RESULT_BYTES (16 MiB). The
+# narrow export above cannot get there — the graph's co-mention join saturates at ~180 000 rows of
+# ~50 B, i.e. ~9 MB — so the probe asks for the same join with the WHOLE NODES instead of three
+# scalars. That is not a trick to inflate a response: "give me the objects, not just their ids" is the
+# single most ordinary thing a client asks a knowledge graph for, and it is precisely the request that
+# turns a comfortable export into an unbounded server-side buffer.
+VOLUME_CAP_QUERY = (
+    "MATCH (d:Document)-[:MENTIONS]->(c:Concept)<-[:MENTIONS]-(o:Document) "
+    "WHERE d.id <> o.id "
+    "RETURN d, c, o "
+    "LIMIT {rows}"
+)
+
+
+def volume_shape(client, shape, rows, proc_watch=None, server_pid=None, query=VOLUME_QUERY):
+    """Issues the co-mention export in one response ``shape`` and measures what it cost the SERVER.
+
+    Returns a dict with the client-side facts (rows, bytes, secs) and — only when a co-located server
+    pid was given — the SERVER's peak RSS delta and CPU across the request. Without a pid the server
+    fields are simply ABSENT (an attach run cannot read /proc), never zero."""
+    watch = ServerWatch(proc_watch, server_pid) if (proc_watch and server_pid) else None
+    body = {"statements": [{"statement": query.format(rows=rows)}], "access_mode": "READ"}
+    headers = {}
+    if shape == "ndjson":
+        accept = "application/x-ndjson"
+    else:
+        accept = "application/json"
+    if shape == "json-buffered":
+        # The retry-safety header a production client is encouraged to send. It costs it streaming.
+        headers["Idempotency-Key"] = f"kg-volume-{rows}-{os.getpid()}-{int(time.time() * 1000)}"
+
+    t0 = time.perf_counter()
+    st, resp, hdrs = client.raw_post(body, accept=accept, extra_headers=headers, stream=True)
+    n_bytes = 0
+    n_rows = 0
+    if st == 200:
+        # Drain incrementally — the client must never be the thing that materialises the result, or it
+        # would be measuring itself.
+        if shape == "ndjson":
+            for raw in resp:
+                n_bytes += len(raw)
+                line = raw.strip()
+                if line and b'"row"' in line:
+                    n_rows += 1
+        else:
+            # Count rows by their `],[` separators as the body streams past, WITHOUT materialising it
+            # (materialising it here would measure this client, not the server). The separator can
+            # straddle a chunk boundary, so carry the last 2 bytes of each chunk into the next — a
+            # first cut that did not lost 4 rows in 150 000 and quietly failed its own row assertion.
+            carry = b""
+            while True:
+                chunk = resp.read(1 << 16)
+                if not chunk:
+                    break
+                n_bytes += len(chunk)
+                n_rows += (carry + chunk).count(b"],[")
+                carry = chunk[-2:]
+            if n_bytes:
+                n_rows += 1  # the last row has no trailing separator
+    else:
+        n_bytes = len(resp.read())
+    secs = time.perf_counter() - t0
+
+    out = {
+        "shape": shape,
+        "requested_rows": rows,
+        "status": st,
+        "rows": n_rows,
+        "response_bytes": n_bytes,
+        "wall_secs": round(secs, 4),
+        "rows_per_sec": round(n_rows / secs, 1) if secs > 0 and n_rows else None,
+        "mb_per_sec": round(n_bytes / secs / 1e6, 2) if secs > 0 and n_bytes else None,
+    }
+    if watch is not None:
+        w = watch.stop()
+        peak_delta = w["memory"]["peak_delta_bytes"]
+        cpu = w["cpu"]["total_secs"]
+        out["server_peak_rss_delta_bytes"] = peak_delta
+        out["server_rss_bytes_per_row"] = round(peak_delta / n_rows, 1) if n_rows else None
+        out["server_cpu_secs"] = round(cpu, 4)
+        out["server_mean_cores"] = w["cpu"]["mean_core_utilisation"]
+        out["server_baseline_rss_bytes"] = w["memory"]["baseline_rss_bytes"]
+        out["server_final_rss_bytes"] = w["memory"]["final_rss_bytes"]
+    return out
+
+
+def volume_phase(client, rows, cap_rows, proc_watch=None, server_pid=None):
+    """Drives the three response shapes at ``rows`` rows, then crosses the 16 MiB buffered cap.
+
+    Returns ``(shapes, cap_probe)``. Asserts what MUST hold: every shape returns the rows it was asked
+    for, the streaming shapes do not balloon the server's memory, and the buffered path is CAPPED (400)
+    rather than unbounded."""
+    shapes = []
+    for shape in ("ndjson", "json-streamed", "json-buffered"):
+        r = volume_shape(client, shape, rows, proc_watch, server_pid)
+        shapes.append(r)
+        rss = ""
+        if r.get("server_peak_rss_delta_bytes") is not None:
+            rss = (f"  server peak RSS +{r['server_peak_rss_delta_bytes'] / 1048576:7.1f} MB "
+                   f"({r['server_rss_bytes_per_row']:.0f} B/row)  cpu {r['server_cpu_secs']:.2f}s "
+                   f"({r['server_mean_cores']:.2f} cores)")
+        print(f"  {r['shape']:<14} HTTP {r['status']}  {r['rows']:>7} rows  "
+              f"{r['response_bytes'] / 1e6:6.1f} MB  {r['wall_secs'] * 1000:8.1f} ms{rss}")
+        check(f"volume {shape}: HTTP 200", r["status"], 200)
+        check(f"volume {shape}: returned the requested rows", r["rows"], rows)
+
+    # The streaming shapes must NOT accumulate the result server-side. This gate genuinely fires: if a
+    # future change makes the JSON single-statement path buffer again, its per-row RSS jumps by an
+    # order of magnitude and this fails.
+    for r in shapes:
+        if r["shape"] == "json-buffered" or r.get("server_rss_bytes_per_row") is None:
+            continue
+        check(f"volume {r['shape']}: streams (server RSS per row < {STREAM_RSS_CEILING_B} B)",
+              r["server_rss_bytes_per_row"] < STREAM_RSS_CEILING_B, True)
+
+    # The buffered path must be CAPPED, not unbounded: a result whose serialized size crosses
+    # MAX_BUFFERED_RESULT_BYTES (16 MiB) is aborted with a 400 — never OOM, never a silent truncation.
+    cap = volume_shape(client, "json-buffered", cap_rows, proc_watch, server_pid,
+                       query=VOLUME_CAP_QUERY)
+    cap["query"] = "whole-node export (RETURN d, c, o)"
+    rss = ""
+    if cap.get("server_peak_rss_delta_bytes") is not None:
+        rss = f"  server peak RSS +{cap['server_peak_rss_delta_bytes'] / 1048576:.1f} MB"
+    print(f"  cap probe      HTTP {cap['status']}  {cap_rows} buffered WHOLE-NODE rows requested "
+          f"(serialized > the 16 MiB cap){rss}")
+    check("buffered result over the 16 MiB cap is REJECTED (400), not OOM/truncated",
+          cap["status"], 400)
+    return shapes, cap
+
+
+# The per-row server-RSS ceiling a STREAMING response must stay under. The measured streaming cost on a
+# 16-core Linux host is ~80 B/row (the engine's own row materialisation); the BUFFERED path costs
+# ~2 400 B/row (the serde_json intermediate tree, rmp #383). 500 B/row sits an order of magnitude below
+# the buffered cost and ~6x above the streaming cost: comfortably clear of noise, and it FIRES the
+# moment a streaming path starts accumulating the result.
+STREAM_RSS_CEILING_B = 500
+
+
+def _conc_worker_proc(base_url, token, database, insecure, threads, ops_per_thread, out_q):
+    """One CLIENT PROCESS of the concurrency phase: runs `threads` threads, each issuing
+    `ops_per_thread` discovery queries. Returns its latencies + errors + its OWN cpu through `out_q`.
+
+    Why a process and not just more threads: python's GIL serialises the client, so a single-process
+    driver saturates at its own interpreter long before the server saturates — and the result reads as
+    a SERVER ceiling. This suite has been bitten by exactly that (social-network-large's "~1 core"
+    server was a harness artifact). Spreading the clients across PROCESSES removes the GIL from the
+    measurement, and the report publishes the client's own CPU so a reader can check the claim rather
+    than take it on faith."""
+    lat = []
+    errors = 0
     lock = threading.Lock()
-    latencies = []
-    lat_lock = threading.Lock()
 
     def worker():
-        c = client_factory()
+        nonlocal errors
+        c = RestClient(base_url, token=token, database=database, insecure=insecure)
         local = []
-        for _ in range(ops_per_client):
-            t0 = time.time()
+        for _ in range(ops_per_thread):
+            t0 = time.perf_counter()
             try:
                 st, _, _ = c.query(
                     "MATCH (seed:Document {id:'ref-d-0'})-[:MENTIONS]->(c:Concept)"
@@ -586,38 +847,84 @@ def concurrency(client_factory, clients, ops_per_client):
                     "RETURN other.id AS doc, count(DISTINCT c) AS shared ORDER BY shared DESC, doc ASC")
                 if st != 200:
                     with lock:
-                        errors[0] += 1
-            except Exception:
+                        errors += 1
+            except Exception:  # noqa: BLE001 — a transport failure is an error, not a crash
                 with lock:
-                    errors[0] += 1
-            local.append(time.time() - t0)
+                    errors += 1
+            local.append(time.perf_counter() - t0)
         c._close()
-        with lat_lock:
-            latencies.extend(local)
+        with lock:
+            lat.extend(local)
 
-    threads = [threading.Thread(target=worker) for _ in range(clients)]
-    t0 = time.time()
-    for t in threads:
+    ts = [threading.Thread(target=worker) for _ in range(threads)]
+    for t in ts:
         t.start()
-    for t in threads:
+    for t in ts:
         t.join()
-    elapsed = time.time() - t0
+    r = resource.getrusage(resource.RUSAGE_SELF)
+    out_q.put({"lat": lat, "errors": errors, "cpu_secs": r.ru_utime + r.ru_stime})
 
-    total = clients * ops_per_client
-    latencies.sort()
 
-    def pct(q):
+def concurrency(base_url, token, database, insecure, clients, ops_per_client, procs,
+                proc_watch=None, server_pid=None):
+    """Drives `clients` concurrent REST clients spread across `procs` OS PROCESSES.
+
+    Asserts zero errors. Returns a stats dict including the SERVER's cores (when a pid is available)
+    and the CLIENT's own cores — the two numbers a reader needs to tell a server ceiling from a client
+    artifact."""
+    procs = max(1, min(procs, clients))
+    per_proc = max(1, clients // procs)
+    threads_total = per_proc * procs
+
+    ctx = mp.get_context("spawn")  # never fork a process holding TLS sockets
+    q = ctx.Queue()
+    children = [
+        ctx.Process(target=_conc_worker_proc,
+                    args=(base_url, token, database, insecure, per_proc, ops_per_client, q))
+        for _ in range(procs)
+    ]
+
+    before = server_snapshot(proc_watch, server_pid) if (proc_watch and server_pid) else None
+    t0 = time.perf_counter()
+    for p in children:
+        p.start()
+    results = [q.get() for _ in children]
+    for p in children:
+        p.join()
+    elapsed = time.perf_counter() - t0
+    after = server_snapshot(proc_watch, server_pid) if (proc_watch and server_pid) else None
+
+    latencies = sorted(x for r in results for x in r["lat"])
+    errors = sum(r["errors"] for r in results)
+    client_cpu = sum(r["cpu_secs"] for r in results)
+    total = len(latencies)
+
+    def pct(q_):
         if not latencies:
-            return 0.0
-        idx = min(len(latencies) - 1, int(len(latencies) * q))
+            return None
+        idx = min(len(latencies) - 1, int(len(latencies) * q_))
         return latencies[idx] * 1000
 
-    p50 = latencies[len(latencies) // 2] * 1000 if latencies else 0.0
-    p99 = pct(0.99)
-    p999 = pct(0.999)
-    throughput = total / elapsed if elapsed > 0 else 0.0
-    check("concurrency: zero errors", errors[0], 0)
-    return total, errors[0], elapsed, p50, p99, p999, throughput
+    stats = {
+        "clients": threads_total,
+        "client_processes": procs,
+        "ops": total,
+        "errors": errors,
+        "secs": round(elapsed, 4),
+        "ops_per_sec": round(total / elapsed, 1) if elapsed > 0 else None,
+        "p50_ms": round(pct(0.50), 3) if latencies else None,
+        "p99_ms": round(pct(0.99), 3) if latencies else None,
+        "p999_ms": round(pct(0.999), 3) if latencies else None,
+        "client_cpu_secs": round(client_cpu, 3),
+        "client_mean_cores": round(client_cpu / elapsed, 3) if elapsed > 0 else None,
+    }
+    if before and after:
+        cpu = (after["user_secs"] - before["user_secs"]) + (after["system_secs"] - before["system_secs"])
+        stats["server_cpu_secs"] = round(cpu, 3)
+        stats["server_mean_cores"] = round(cpu / elapsed, 3) if elapsed > 0 else None
+    check("concurrency: zero errors", errors, 0)
+    check("concurrency: every client op completed", total, threads_total * ops_per_client)
+    return stats
 
 
 def main():
@@ -633,9 +940,23 @@ def main():
     ap.add_argument("--cypher", required=True)
     ap.add_argument("--reference", required=True)
     ap.add_argument("--batch-size", type=int, default=200)
-    ap.add_argument("--clients", type=int, default=16)
-    ap.add_argument("--ops-per-client", type=int, default=20)
+    ap.add_argument("--clients", type=int, default=64)
+    ap.add_argument("--ops-per-client", type=int, default=50)
+    # Spread the concurrent clients across OS PROCESSES: python's GIL makes a single-process driver
+    # saturate on itself and report the ceiling as if it were the SERVER's (see `_conc_worker_proc`).
+    ap.add_argument("--client-processes", type=int, default=8)
+    # The VOLUME phase (rmp #717): the row count each response shape is asked for, and the (larger)
+    # count used to prove the buffered path's 16 MiB cap fires rather than OOMing.
+    ap.add_argument("--volume-rows", type=int, default=150000)
+    ap.add_argument("--cap-probe-rows", type=int, default=400000)
+    # The SERVER-pid seam. Both must be given (a LOCAL run); without them the server-side vectors of
+    # the volume + concurrency phases are ABSENT from the evidence rather than zero-filled.
+    ap.add_argument("--server-pid", type=int)
+    ap.add_argument("--proc-watch", help="path to the harness `proc_watch` binary")
     args = ap.parse_args()
+
+    if bool(args.server_pid) != bool(args.proc_watch):
+        raise SystemExit("--server-pid and --proc-watch must be given together")
 
     base_url = args.base_url
     if not base_url:
@@ -692,12 +1013,32 @@ def main():
     ratio = cbor_bytes / json_bytes if json_bytes else 0.0
     print(f"  JSON={json_bytes} B  CBOR={cbor_bytes} B  (CBOR is {ratio * 100:.1f}% of JSON)")
 
-    print("== concurrency (access_mode READ → off-thread reader pool)")
-    total_ops, errors, conc_secs, p50, p99, p999, throughput = concurrency(
-        lambda: RestClient(base_url, token=token, database=args.database, insecure=args.insecure),
-        args.clients, args.ops_per_client)
-    print(f"  clients={args.clients} ops={total_ops} errors={errors} "
-          f"throughput={throughput:.0f} ops/s p50={p50:.1f}ms p99={p99:.1f}ms p999={p999:.1f}ms")
+    # ---- The VOLUME phase: what a LARGE RESULT SET costs the SERVER, in each response shape --------
+    print(f"== result-set VOLUME ({args.volume_rows} rows, three response shapes) "
+          f"[server RSS: {'sampled' if args.server_pid else 'NOT MEASURED — no co-located pid'}]")
+    volume_shapes, cap_probe = volume_phase(
+        client, args.volume_rows, args.cap_probe_rows,
+        proc_watch=args.proc_watch, server_pid=args.server_pid)
+
+    print(f"== concurrency ({args.clients} clients across {args.client_processes} client PROCESSES, "
+          f"access_mode READ → off-thread reader pool)")
+    conc = concurrency(base_url, token, args.database, args.insecure,
+                       args.clients, args.ops_per_client, args.client_processes,
+                       proc_watch=args.proc_watch, server_pid=args.server_pid)
+    srv = ""
+    if conc.get("server_mean_cores") is not None:
+        srv = f" server={conc['server_mean_cores']:.2f} cores"
+    print(f"  clients={conc['clients']} procs={conc['client_processes']} ops={conc['ops']} "
+          f"errors={conc['errors']} throughput={conc['ops_per_sec']:.0f} ops/s "
+          f"p50={conc['p50_ms']:.1f}ms p99={conc['p99_ms']:.1f}ms p999={conc['p999_ms']:.1f}ms"
+          f"{srv} client={conc['client_mean_cores']:.2f} cores")
+    # Is the CLIENT the limiter? Say so out loud rather than letting a reader assume the ceiling is the
+    # server's. (social-network-large once reported a "~1 core" server that was purely a harness
+    # artifact; this suite does not get to make that mistake twice.)
+    if conc.get("server_mean_cores") is not None and conc["client_mean_cores"] is not None:
+        if conc["client_mean_cores"] > conc["server_mean_cores"]:
+            print("  ⚠ the CLIENT burned more CPU than the server: this measurement is CLIENT-BOUND, "
+                  "and the throughput above is the driver's ceiling, not the server's")
 
     if FAILURES == 0:
         print("GRAPHUS_KG_REST_OK")
@@ -718,14 +1059,25 @@ def main():
             "json_bytes": json_bytes,
             "cbor_bytes": cbor_bytes,
             "cbor_ratio": round(ratio, 4),
-            "concurrency_clients": args.clients,
-            "concurrency_ops": total_ops,
-            "concurrency_errors": errors,
-            "concurrency_secs": round(conc_secs, 3),
-            "ops_per_sec": round(throughput, 1),
-            "p50_ms": round(p50, 3),
-            "p99_ms": round(p99, 3),
-            "p999_ms": round(p999, 3),
+            "concurrency_clients": conc["clients"],
+            "concurrency_processes": conc["client_processes"],
+            "concurrency_ops": conc["ops"],
+            "concurrency_errors": conc["errors"],
+            "concurrency_secs": conc["secs"],
+            "ops_per_sec": conc["ops_per_sec"],
+            "p50_ms": conc["p50_ms"],
+            "p99_ms": conc["p99_ms"],
+            "p999_ms": conc["p999_ms"],
+            "concurrency_client_cores": conc["client_mean_cores"],
+            "concurrency_client_cpu_secs": conc["client_cpu_secs"],
+            # Absent (not zero) when there was no co-located server pid to sample.
+            **({"concurrency_server_cores": conc["server_mean_cores"],
+                "concurrency_server_cpu_secs": conc["server_cpu_secs"]}
+               if conc.get("server_mean_cores") is not None else {}),
+            "volume_rows": args.volume_rows,
+            "volume_shapes": volume_shapes,
+            "volume_cap_probe_rows": args.cap_probe_rows,
+            "volume_cap_probe_status": cap_probe["status"],
         }
         print("GRAPHUS_STATS " + json.dumps(stats, separators=(",", ":")))
         return 0

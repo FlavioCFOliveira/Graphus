@@ -34,10 +34,17 @@
 //!
 //! - `reader_a` — `READ ON GRAPH tenant_a` (read-only, tenant_a only).
 //! - `writer_a` — `WRITE ON GRAPH tenant_a` (write ⊇ read, tenant_a only).
+//! - `reader_b` — `READ ON GRAPH tenant_b` (the symmetric tenant_b reader).
+//! - `writer_b` — `WRITE ON GRAPH tenant_b` (the symmetric tenant_b writer).
 //! - `analyst`  — `READ ON DATABASE` (server-wide read across **all** tenants).
 //!
-//! Users: `alice → reader_a`, `wendy → writer_a`, `ana → analyst`. The bootstrap admin `neo4j`
-//! holds the global Admin privilege (it provisions everything and may read/write any tenant).
+//! Users: `alice → reader_a`, `wendy → writer_a`, `bob → reader_b`, `bianca → writer_b`,
+//! `ana → analyst`. The bootstrap admin `neo4j` holds the global Admin privilege (it provisions
+//! everything and may read/write any tenant).
+//!
+//! Both tenants carry principals **on purpose**: tenant isolation only fails under *concurrency*, so
+//! the workload must be able to hammer BOTH tenants at once from principals scoped to each — while
+//! every cross-tenant probe is denied on every iteration (see [`ConcurrentWorkerClass`]).
 //!
 //! The manifest's [`MatrixCell`] list enumerates, for every `(user, tenant, access_mode)` triple,
 //! the expected outcome (`Allow` ⇒ HTTP 200 / no Bolt error; `Deny` ⇒ HTTP 403 / Bolt
@@ -45,6 +52,14 @@
 //! REST and Bolt workloads both drive from this list and assert each cell, so the example proves the
 //! full read/write/admin × {tenant_a, tenant_b} × {allow, deny} authorization matrix over **both**
 //! wire protocols from one deterministic description.
+//!
+//! # The concurrency model (the isolation surface under load)
+//!
+//! [`Manifest::concurrency_workers`] describes the worker **classes** the REST client instantiates for
+//! its concurrent phase — each class carries the principal, its own tenant, the tenant it must never
+//! reach, and the probes it issues every iteration. The classes are weighted, so the client can scale
+//! to any worker count `N` (≥ the class count) by cycling the weighted roster; the roster itself is a
+//! deterministic function of the seed, exactly like the rest of the manifest.
 
 #![forbid(unsafe_code)]
 
@@ -288,6 +303,52 @@ pub struct CrossTenantProbe {
     pub why: String,
 }
 
+/// One **class of concurrent worker** in the example's concurrency phase — the roster the REST client
+/// instantiates `N` workers from (cycling the weighted list), each with its own persistent keep-alive
+/// HTTPS connection, all hammering **both** tenants at once.
+///
+/// A serial matrix proves the RBAC decisions hold when nothing else is happening. Tenant isolation,
+/// however, only *fails* under concurrency: an interleaving that leaks a snapshot, a privilege cache
+/// that resolves against the wrong principal, a plan reused across sessions. So every worker runs an
+/// overlapping mix in which the cross-tenant probe, the DENY-scoped read, the RBAC denial and the
+/// auth failure are asserted on **every single iteration** — never sampled. The isolation invariant is
+/// exact: **zero** violations across all iterations; a single leaked cell fails the run.
+///
+/// The `kind` selects the oracle the client applies:
+///
+/// - `reader` — an own-tenant read that MUST succeed *and return the rows it should* (its tenant's
+///   canary, never the other tenant's), an own-tenant write that MUST be denied (the role has no
+///   WRITE), a cross-tenant read that MUST be denied, and a DENY-scoped property read whose sensitive
+///   value MUST come back NULL.
+/// - `writer` — an own-tenant read and a real own-tenant **write** (so isolation is tested while the
+///   stores are actually being mutated), plus a cross-tenant **write** attempt that MUST be denied
+///   (no mutation may ever cross a tenant boundary) and a cross-tenant read that MUST be denied.
+/// - `analyst` — a principal legitimately authorized on **both** tenants: each read must return
+///   exactly its target tenant's data and never the other's (isolation must hold even for a principal
+///   that may read both), and its writes must be denied (`READ ON DATABASE` grants no WRITE).
+/// - `rejected` — a worker whose whole job is to be rejected: a garbage Bearer on the data plane, a
+///   bad password on `POST /auth/login`, and a garbage Bearer on the `/metrics` gate. It must NEVER
+///   receive a 200 and must never obtain a token.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConcurrentWorkerClass {
+    /// The oracle selector: `reader` | `writer` | `analyst` | `rejected`.
+    pub kind: String,
+    /// The acting principal (a provisioned user), or `""` for the `rejected` class (which holds no
+    /// valid credential at all).
+    pub user: String,
+    /// The tenant database this worker is authorized in (`""` for `rejected`).
+    pub tenant: String,
+    /// The tenant database this worker must NEVER be able to read or write (`""` for `rejected`; for
+    /// `analyst` this is the *other* tenant it reads legitimately, and the oracle checks that each
+    /// read returns only the tenant it targeted).
+    pub other_tenant: String,
+    /// How many of the `N` workers this class gets, proportionally (the client expands the roster by
+    /// weight and cycles it, so the mix is stable at any `N` ≥ the class count).
+    pub weight: u32,
+    /// A short human-readable rationale (printed in the concurrency roster table).
+    pub why: String,
+}
+
 /// The whole deterministic security scenario: the tenants (with their sensitive data), the RBAC
 /// roles/users, and the expected authorization matrix. Serialized to `manifest.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -327,6 +388,22 @@ pub struct Manifest {
     /// namespace was applied). Empty when there are no DENY grants.
     #[serde(default)]
     pub deny_tenant: String,
+    /// The stable data value of the multi-label `(:Secret:Confidential)` node the `#645` guard keys
+    /// on. The concurrency oracle needs it by value: a `reader` worker's own-tenant canary read must
+    /// return its tenant's canary and must NOT return this one (the DENY label hides it from the
+    /// denied principal, under load, on every iteration).
+    #[serde(default)]
+    pub deny_label_canary: String,
+    /// The weighted roster of [`ConcurrentWorkerClass`]es the concurrency phase instantiates its `N`
+    /// workers from. Empty on a manifest that predates the concurrency phase.
+    #[serde(default)]
+    pub concurrency_workers: Vec<ConcurrentWorkerClass>,
+    /// The parameterized own-tenant **write** the `writer` workers issue under load: a real
+    /// read-then-write (`MATCH` a patient, then `CREATE` an audit event hanging off it), so the
+    /// concurrent write traffic contends on the same rows the concurrent readers scan — and so SSI has
+    /// something to actually abort. `$pid` / `$actor` / `$seq` are bound as REST query parameters.
+    #[serde(default)]
+    pub concurrency_write: String,
 }
 
 /// A fully-materialized dataset: the per-tenant sensitive data + the manifest. Produced by
@@ -450,11 +527,17 @@ pub fn generate_namespaced(config: GenConfig, profile: &str, namespace: &str) ->
     let reader_a = ns_name(namespace, "reader_a");
     let writer_a = ns_name(namespace, "writer_a");
     let analyst = ns_name(namespace, "analyst");
+    let reader_b = ns_name(namespace, "reader_b");
+    let writer_b = ns_name(namespace, "writer_b");
     let alice = ns_name(namespace, "alice");
     let wendy = ns_name(namespace, "wendy");
     let ana = ns_name(namespace, "ana");
+    let bob = ns_name(namespace, "bob");
+    let bianca = ns_name(namespace, "bianca");
 
     // --- RBAC roles / users (fixed; the matrix below references them by name). ---
+    // ORDER IS LOAD-BEARING: `roles[0]` is the tenant_a reader and `users[0]` is alice — both
+    // workloads resolve "the tenant_a reader" that way. New roles/users are APPENDED.
     let roles = vec![
         Role {
             name: reader_a.clone(),
@@ -470,6 +553,19 @@ pub fn generate_namespaced(config: GenConfig, profile: &str, namespace: &str) ->
             name: analyst.clone(),
             action: "READ".to_owned(),
             scope: "DATABASE".to_owned(),
+        },
+        // The symmetric tenant_b principals: without them the concurrency phase could only drive one
+        // tenant's principals, and a cross-tenant probe that is never *contended* by real traffic in
+        // the tenant it reaches for proves much less.
+        Role {
+            name: reader_b.clone(),
+            action: "READ".to_owned(),
+            scope: format!("GRAPH {db_b}"),
+        },
+        Role {
+            name: writer_b.clone(),
+            action: "WRITE".to_owned(),
+            scope: format!("GRAPH {db_b}"),
         },
     ];
     let users = vec![
@@ -488,10 +584,29 @@ pub fn generate_namespaced(config: GenConfig, profile: &str, namespace: &str) ->
             password: "ana-analyst-pw".to_owned(),
             role: analyst.clone(),
         },
+        User {
+            name: bob.clone(),
+            password: "bob-secret-pw".to_owned(),
+            role: reader_b.clone(),
+        },
+        User {
+            name: bianca.clone(),
+            password: "bianca-secret-pw".to_owned(),
+            role: writer_b.clone(),
+        },
     ];
 
     let admin_user = "neo4j".to_owned();
-    let matrix = build_matrix(&admin_user, &alice, &wendy, &ana, &db_a, &db_b);
+    let matrix = build_matrix(
+        &admin_user,
+        &alice,
+        &wendy,
+        &ana,
+        &bob,
+        &bianca,
+        &db_a,
+        &db_b,
+    );
 
     // --- Fine-grained DENY (negative privilege layered over reader_a's GRANT) + the #645 guard. ---
     // The confidential canary is a stable, greppable data value (never namespaced) planted inside the
@@ -500,6 +615,10 @@ pub fn generate_namespaced(config: GenConfig, profile: &str, namespace: &str) ->
     let deny_grants = vec![
         format!("DENY READ ON PROPERTY {db_a}.Patient.ssn TO {reader_a}"),
         format!("DENY TRAVERSE ON LABEL {db_a}.Confidential TO {reader_a}"),
+        // The symmetric property DENY on the OTHER tenant's secret: the concurrency phase then drives
+        // a DENY-scoped read of the sensitive surface (ssn on A, secret_token on B) from BOTH tenants
+        // at once, so deny-precedence is asserted under contention rather than in a quiet moment.
+        format!("DENY READ ON PROPERTY {db_b}.Record.secret_token TO {reader_b}"),
     ];
     let deny_seed = vec![format!(
         "CREATE (:Secret:Confidential {{name: '{confidential}'}})"
@@ -529,6 +648,15 @@ pub fn generate_namespaced(config: GenConfig, profile: &str, namespace: &str) ->
                   :Secret label"
                 .to_owned(),
         },
+        DenyCheck {
+            user: bob.clone(),
+            tenant: db_b.clone(),
+            kind: "property_null".to_owned(),
+            query: "MATCH (r:Record) RETURN r.secret_token AS v".to_owned(),
+            why: "DENY READ ON PROPERTY Record.secret_token => the token reads back NULL for the \
+                  tenant_b reader"
+                .to_owned(),
+        },
     ];
 
     // --- Broadened cross-tenant no-leak probes (run as alice against tenant_b). ---
@@ -555,6 +683,77 @@ pub fn generate_namespaced(config: GenConfig, profile: &str, namespace: &str) ->
         },
     ];
 
+    // --- The concurrency roster: who hammers what, and what must NEVER hold. ---------------------
+    // Both tenants are driven at once, by principals scoped to each, while every cross-tenant probe,
+    // DENY-scoped read, RBAC denial and auth failure is asserted on EVERY iteration.
+    let concurrency_workers = vec![
+        ConcurrentWorkerClass {
+            kind: "reader".to_owned(),
+            user: alice.clone(),
+            tenant: db_a.clone(),
+            other_tenant: db_b.clone(),
+            weight: 4,
+            why: "reader_a: reads tenant_a (canary must come back), is denied WRITE, is denied \
+                  tenant_b, and its DENY-scoped ssn must read NULL"
+                .to_owned(),
+        },
+        ConcurrentWorkerClass {
+            kind: "writer".to_owned(),
+            user: wendy.clone(),
+            tenant: db_a.clone(),
+            other_tenant: db_b.clone(),
+            weight: 3,
+            why: "writer_a: real concurrent WRITES into tenant_a (the stores are mutated while \
+                  isolation is probed), denied any access to tenant_b"
+                .to_owned(),
+        },
+        ConcurrentWorkerClass {
+            kind: "reader".to_owned(),
+            user: bob.clone(),
+            tenant: db_b.clone(),
+            other_tenant: db_a.clone(),
+            weight: 4,
+            why: "reader_b: the symmetric tenant_b reader — denied tenant_a, and its DENY-scoped \
+                  secret_token must read NULL"
+                .to_owned(),
+        },
+        ConcurrentWorkerClass {
+            kind: "writer".to_owned(),
+            user: bianca.clone(),
+            tenant: db_b.clone(),
+            other_tenant: db_a.clone(),
+            weight: 3,
+            why: "writer_b: real concurrent WRITES into tenant_b, denied any access to tenant_a"
+                .to_owned(),
+        },
+        ConcurrentWorkerClass {
+            kind: "analyst".to_owned(),
+            user: ana.clone(),
+            tenant: db_a.clone(),
+            other_tenant: db_b.clone(),
+            weight: 1,
+            why: "analyst: legitimately reads BOTH tenants — each read must return exactly the \
+                  tenant it targeted and never the other's data; every WRITE denied"
+                .to_owned(),
+        },
+        ConcurrentWorkerClass {
+            kind: "rejected".to_owned(),
+            user: String::new(),
+            tenant: db_a.clone(),
+            other_tenant: db_b.clone(),
+            weight: 1,
+            why: "holds no valid credential: bad Bearer on the data plane (401), bad password on \
+                  /auth/login (401, then 429 once the per-account throttle engages), bad Bearer on \
+                  the /metrics gate (401 — the path that DOES bump graphus_auth_failures_total)"
+                .to_owned(),
+        },
+    ];
+    // A real read-then-write: it contends with the concurrent readers on the very rows they scan, so
+    // the write traffic is not a trivially-conflict-free append and SSI has something to abort.
+    let concurrency_write =
+        "MATCH (p:Patient {id: $pid}) CREATE (p)-[:AUDIT_EVENT]->(:AuditEvent {actor: $actor, seq: $seq})"
+            .to_owned();
+
     let manifest = Manifest {
         profile: profile.to_owned(),
         seed: config.seed,
@@ -568,6 +767,9 @@ pub fn generate_namespaced(config: GenConfig, profile: &str, namespace: &str) ->
         deny_checks,
         cross_tenant_probes,
         deny_tenant: db_a,
+        deny_label_canary: confidential,
+        concurrency_workers,
+        concurrency_write,
     };
 
     Dataset { config, manifest }
@@ -576,11 +778,14 @@ pub fn generate_namespaced(config: GenConfig, profile: &str, namespace: &str) ->
 /// Builds the deterministic allow/deny/unauthenticated matrix. Covers read/write/admin ×
 /// {tenant_a, tenant_b} × {allow, deny} per user, plus the unauthenticated probe. The user and tenant
 /// names are already namespace-resolved by the caller.
+#[allow(clippy::too_many_arguments)] // The matrix legitimately references every principal by name.
 fn build_matrix(
     admin_user: &str,
     alice: &str,
     wendy: &str,
     ana: &str,
+    bob: &str,
+    bianca: &str,
     db_a: &str,
     db_b: &str,
 ) -> Vec<MatrixCell> {
@@ -679,6 +884,64 @@ fn build_matrix(
             "WRITE",
             Outcome::Deny,
             "analyst has READ only",
+        ),
+        // bob — reader_b (READ ON GRAPH tenant_b): the mirror image of alice.
+        cell(
+            Some(bob),
+            db_b,
+            "READ",
+            Outcome::Allow,
+            "reader_b: READ ON GRAPH tenant_b",
+        ),
+        cell(
+            Some(bob),
+            db_b,
+            "WRITE",
+            Outcome::Deny,
+            "reader_b has no WRITE",
+        ),
+        cell(
+            Some(bob),
+            db_a,
+            "READ",
+            Outcome::Deny,
+            "reader_b grant is scoped to tenant_b",
+        ),
+        cell(
+            Some(bob),
+            db_a,
+            "WRITE",
+            Outcome::Deny,
+            "reader_b grant is scoped to tenant_b",
+        ),
+        // bianca — writer_b (WRITE ON GRAPH tenant_b): the mirror image of wendy.
+        cell(
+            Some(bianca),
+            db_b,
+            "WRITE",
+            Outcome::Allow,
+            "writer_b: WRITE ON GRAPH tenant_b",
+        ),
+        cell(
+            Some(bianca),
+            db_b,
+            "READ",
+            Outcome::Allow,
+            "write ⊇ read (graded actions)",
+        ),
+        cell(
+            Some(bianca),
+            db_a,
+            "WRITE",
+            Outcome::Deny,
+            "writer_b grant is scoped to tenant_b",
+        ),
+        cell(
+            Some(bianca),
+            db_a,
+            "READ",
+            Outcome::Deny,
+            "writer_b grant is scoped to tenant_b",
         ),
         // admin — global Admin: read/write any tenant.
         cell(
@@ -929,6 +1192,59 @@ mod tests {
         assert!(p.contains("GRANT READ ON DATABASE TO analyst;"));
         assert!(p.contains("CREATE USER alice SET PASSWORD 'alice-secret-pw' IF NOT EXISTS;"));
         assert!(p.contains("GRANT ROLE reader_a TO alice;"));
+        // The symmetric tenant_b principals the concurrency phase drives the other half of the load
+        // from (without them, only one tenant would ever be hammered).
+        assert!(p.contains("GRANT READ ON GRAPH tenant_b TO reader_b;"));
+        assert!(p.contains("GRANT WRITE ON GRAPH tenant_b TO writer_b;"));
+        assert!(p.contains("CREATE USER bob SET PASSWORD 'bob-secret-pw' IF NOT EXISTS;"));
+        assert!(p.contains("GRANT ROLE writer_b TO bianca;"));
+    }
+
+    #[test]
+    fn concurrency_roster_drives_both_tenants_and_always_has_a_rejected_worker() {
+        let d = generate(Profile::Fast.config(), "fast");
+        let roster = &d.manifest.concurrency_workers;
+        assert!(
+            !roster.is_empty(),
+            "the concurrency roster must be populated"
+        );
+
+        // Every oracle kind is present.
+        for kind in ["reader", "writer", "analyst", "rejected"] {
+            assert!(
+                roster.iter().any(|w| w.kind == kind),
+                "roster is missing a {kind} class"
+            );
+        }
+        // BOTH tenants carry a reader AND a writer — the load overlaps on both databases at once.
+        for db in ["tenant_a", "tenant_b"] {
+            assert!(
+                roster
+                    .iter()
+                    .any(|w| w.kind == "reader" && w.tenant == db && w.other_tenant != db)
+            );
+            assert!(roster.iter().any(|w| w.kind == "writer" && w.tenant == db));
+        }
+        // Every authorized class names a DIFFERENT tenant as the one it must never reach.
+        for w in roster.iter().filter(|w| w.kind != "rejected") {
+            assert!(!w.user.is_empty(), "an authorized worker needs a principal");
+            assert_ne!(
+                w.tenant, w.other_tenant,
+                "the cross-tenant target must differ"
+            );
+            assert!(
+                w.weight >= 1,
+                "a class with weight 0 would never be scheduled"
+            );
+        }
+        // The rejected worker holds NO credential at all.
+        let rejected = roster.iter().find(|w| w.kind == "rejected").unwrap();
+        assert!(rejected.user.is_empty());
+
+        // The concurrent write is a real read-then-write (it contends with the readers' scans).
+        let w = &d.manifest.concurrency_write;
+        assert!(w.starts_with("MATCH (p:Patient {id: $pid})"), "{w}");
+        assert!(w.contains("CREATE (p)-[:AUDIT_EVENT]->"), "{w}");
     }
 
     #[test]
@@ -1026,20 +1342,28 @@ mod tests {
         // A property-level DENY (ssn reads back NULL) and a label-level DENY (node invisible).
         assert!(deny.contains("DENY READ ON PROPERTY tenant_a.Patient.ssn TO reader_a;"));
         assert!(deny.contains("DENY TRAVERSE ON LABEL tenant_a.Confidential TO reader_a;"));
+        // …and the symmetric property DENY on the OTHER tenant's sensitive surface, so the DENY
+        // oracle is driven from BOTH tenants at once during the concurrency phase.
+        assert!(deny.contains("DENY READ ON PROPERTY tenant_b.Record.secret_token TO reader_b;"));
         // The multi-label seed the #645 precedence guard keys on.
         assert!(
             d.deny_seed_cypher()
                 .contains("CREATE (:Secret:Confidential {name: 'A_CONFIDENTIAL'});")
         );
-        // The manifest carries the checks (property_null + two node_invisible, incl. the #645 guard).
+        // The manifest carries the checks (two property_null + two node_invisible, incl. #645).
         let checks = &d.manifest.deny_checks;
-        assert!(checks.iter().any(|c| c.kind == "property_null"));
+        assert_eq!(
+            checks.iter().filter(|c| c.kind == "property_null").count(),
+            2
+        );
         assert_eq!(
             checks.iter().filter(|c| c.kind == "node_invisible").count(),
             2
         );
-        assert!(checks.iter().all(|c| c.user == "alice"));
+        assert!(checks.iter().all(|c| c.user == "alice" || c.user == "bob"));
         assert_eq!(d.manifest.deny_tenant, "tenant_a");
+        // The concurrency oracle needs the hidden node's value by name.
+        assert_eq!(d.manifest.deny_label_canary, "A_CONFIDENTIAL");
     }
 
     #[test]
@@ -1104,8 +1428,15 @@ mod tests {
             d.manifest
                 .deny_checks
                 .iter()
-                .all(|c| c.user == "ex_secmt_1_2_alice")
+                .all(|c| { c.user == "ex_secmt_1_2_alice" || c.user == "ex_secmt_1_2_bob" })
         );
+        // …and so is the concurrency roster: every principal and every tenant it names is namespaced,
+        // or the concurrent phase would hammer a SHARED target's real `tenant_a`.
+        assert!(d.manifest.concurrency_workers.iter().all(|w| {
+            (w.user.is_empty() || w.user.starts_with("ex_secmt_1_2_"))
+                && w.tenant.starts_with("ex_secmt_1_2_tenant_")
+                && w.other_tenant.starts_with("ex_secmt_1_2_tenant_")
+        }));
     }
 
     #[test]

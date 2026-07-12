@@ -42,16 +42,25 @@
 //   * The .write/.stats/.mutate execution modes and gds.graph.nodeProperty.stream are a newer surface
 //     (rmp #643); an older instance may not register them, so we feature-detect and skip cleanly.
 //
+//   9. PER-ALGORITHM SERVER CPU (rmp #717) — the battery that answers "does GDS actually use the
+//      cores?". See the block comment above `cpuBattery` below.
+//
 // Usage:
 //   node analyze.js --uri <bolt-uri> --user <u> --password <p> [--database <db>] \
-//                   --graph <graph.cypher> --reference <reference.json>
+//                   --graph <graph.cypher> --reference <reference.json> [--skip-load] \
+//                   [--server-pid <pid> --proc-watch <path> --algo-cpu-out <file>]
 
 const fs = require('fs');
+const { execFileSync } = require('child_process');
+const os = require('os');
 const neo4j = require('neo4j-driver');
 
 // ---- CLI ---------------------------------------------------------------------------------------
 function parseArgs(argv) {
-  const out = { uri: '', user: '', password: '', database: '', graph: '', reference: '' };
+  const out = {
+    uri: '', user: '', password: '', database: '', graph: '', reference: '',
+    skipLoad: false, serverPid: '', procWatch: '', algoCpuOut: '', cpuTargetSecs: 1.0,
+  };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     const next = () => argv[(i += 1)];
@@ -62,6 +71,15 @@ function parseArgs(argv) {
       case '--database': out.database = next(); break;
       case '--graph': out.graph = next(); break;
       case '--reference': out.reference = next(); break;
+      // The graph is already in the database (the LOCAL run bulk-imports it over the network
+      // bulk-import Mode A endpoint, which is ~35x faster than replaying graph.cypher edge by edge).
+      case '--skip-load': out.skipLoad = true; break;
+      // The per-algorithm SERVER CPU battery. All three must be present, and the pid must be a server
+      // on THIS host: they are what makes the CPU figure the server's rather than this driver's.
+      case '--server-pid': out.serverPid = next(); break;
+      case '--proc-watch': out.procWatch = next(); break;
+      case '--algo-cpu-out': out.algoCpuOut = next(); break;
+      case '--cpu-target-secs': out.cpuTargetSecs = Number(next()); break;
       default:
         console.error(`analyze.js: unknown argument '${a}'`);
         process.exit(2);
@@ -74,7 +92,17 @@ const args = parseArgs(process.argv.slice(2));
 if (!args.uri || !args.user || !args.password || !args.graph || !args.reference) {
   console.error(
     'usage: node analyze.js --uri <bolt-uri> --user <u> --password <p> [--database <db>] ' +
-      '--graph <graph.cypher> --reference <reference.json>'
+      '--graph <graph.cypher> --reference <reference.json> [--skip-load] ' +
+      '[--server-pid <pid> --proc-watch <path> --algo-cpu-out <file>]'
+  );
+  process.exit(2);
+}
+// The battery is all-or-nothing: a half-configured battery would silently produce no evidence.
+const BATTERY = Boolean(args.serverPid && args.procWatch && args.algoCpuOut);
+if (!BATTERY && (args.serverPid || args.procWatch || args.algoCpuOut)) {
+  console.error(
+    'analyze.js: --server-pid, --proc-watch and --algo-cpu-out must be given together (the ' +
+      'per-algorithm CPU battery needs a co-located server pid, the sampler, and somewhere to write)'
   );
   process.exit(2);
 }
@@ -107,6 +135,48 @@ function fail(msg) {
   console.error('GDS ANALYTICS FAILURE: ' + msg);
   process.exit(1);
 }
+
+// ---- The per-algorithm SERVER-CPU battery (rmp #717) --------------------------------------------
+//
+// The question this example exists to answer is "**does GDS actually use the cores?**", and until now
+// nothing here could answer it. The run-level `cpu.mean_core_utilisation` is an average over the whole
+// run — a 60 ms algorithm call that saturates fourteen cores vanishes into an 8-second load phase that
+// used one — which is precisely how the project came to carry the unmeasured folklore that "GDS uses
+// 2 of 9 cores".
+//
+// So we measure each algorithm SEPARATELY, and we measure the SERVER, not this driver:
+//
+//   before = proc_watch --pid <server> --snapshot     # the pid's CUMULATIVE cpu counters
+//   t0 = now;  <call the algorithm R times over Bolt>;  t1 = now
+//   after  = proc_watch --pid <server> --snapshot
+//   cores  = (after.cpu - before.cpu) / (t1 - t0)
+//
+// Three properties make the number trustworthy:
+//
+//   * `utime`/`stime` are cumulative COUNTERS, so the bracket yields the exact CPU the server burned
+//     between the two reads — no sampling, nothing missed.
+//   * The server is otherwise idle across the bracket (this driver is serial), so all of that CPU is
+//     this algorithm's.
+//   * R is chosen ADAPTIVELY so the window is ≥ CPU_TARGET_SECS: the OS accounts CPU in 10 ms ticks,
+//     so a single 2.6 ms `gds.wcc.stream` call measures a CPU delta of *zero ticks* and would publish
+//     `0.0 cores` — a fabricated zero for an algorithm that did work. Repeating it until the window is
+//     ~1 s puts the quantisation error under 1%.
+//
+// An algorithm whose CPU delta is STILL under five ticks reports NO cpu figure at all (absent, with a
+// reason) rather than a zero: measure it or omit it (`examples/README.md`, evidence-honesty rule 1).
+const CPU_MIN_MEASURABLE_SECS = 0.05; // five 10 ms clock ticks — must match PhaseTiming::with_cpu
+const CPU_MIN_REPEATS = 3;
+const CPU_MAX_REPEATS = 400;
+
+// One cumulative CPU + RSS reading of the SERVER process, via the shared `proc_watch` seam.
+function serverSnapshot() {
+  const out = execFileSync(args.procWatch, ['--pid', args.serverPid, '--snapshot'], {
+    encoding: 'utf8',
+  });
+  return JSON.parse(out);
+}
+
+const secs = () => Number(process.hrtime.bigint()) / 1e9;
 
 // Order-independent set equality on number arrays.
 function sameSet(a, b) {
@@ -188,6 +258,26 @@ function isSchemaDdl(stmt) {
     }
   }
 
+  // Like `runOptional`, but the call is NOT added to the workload's latency sample.
+  //
+  // The CPU battery repeats one algorithm hundreds of times — including a 1-second weighted closeness
+  // — purely to open a CPU-measurement window. Folding those calls into the workload's percentiles
+  // would report the INSTRUMENT's latency as the workload's: the first cut of this battery pushed the
+  // run's p999 to 1 066 ms, which is the weighted-closeness *probe*, not anything a user of this
+  // workload would ever wait for. The battery's own per-call cost is reported separately (and
+  // honestly) as `ms_per_call` in algo_cpu.json.
+  async function runRaw(query, params) {
+    const s = sess();
+    try {
+      const r = await s.run(query, params || {});
+      return { ok: true, records: r.records };
+    } catch (e) {
+      return { ok: false, err: e };
+    } finally {
+      await s.close();
+    }
+  }
+
   // Drop a GDS projection if it exists (never fatal).
   async function dropGraph(name) {
     await runOptional(`CALL gds.graph.drop('${name}') YIELD graphName RETURN graphName`);
@@ -216,16 +306,31 @@ function isSchemaDdl(stmt) {
     // =============================================================================================
     // 0. TEARDOWN-FIRST — idempotent, safe-on-shared. A second consecutive run starts from a clean
     //    slate whether the target is a fresh isolated DB or an operator-owned shared DB.
+    //
+    //    Skipped under --skip-load: the caller has just bulk-imported the graph into a database it
+    //    created for this run, so a DETACH DELETE here would delete exactly the graph we came to
+    //    analyse.
     // =============================================================================================
-    await dropAllProjections();
-    await deleteExampleData();
+    if (!args.skipLoad) {
+      await dropAllProjections();
+      await deleteExampleData();
+    }
 
     // =============================================================================================
     // 1. LOAD — schema (idempotent + version-tolerant) then data (batched write transactions).
+    //
+    //    The SCHEMA is applied in both modes (it is idempotent and it is what the constraint-
+    //    enforcement demo below keys on). The DATA statements are replayed only when the graph was
+    //    not already loaded: under --skip-load the LOCAL run has ingested it through the network
+    //    bulk-import endpoint (Mode A) instead — measured on a 16-core host at the default
+    //    `moderate` profile, that path ingests 2 406 nodes + 23 962 relationships in **0.20 s**,
+    //    where replaying the same graph as one `MATCH … MATCH … CREATE` per edge takes **~8 s**
+    //    (~35x). The Cypher path stays exactly as it was for the ATTACH run, whose target may expose
+    //    no bulk-import endpoint (or no admin rights on it).
     // =============================================================================================
     const stmts = statements(script);
     const schema = stmts.filter(isSchemaDdl);
-    const data = stmts.filter((s) => !isSchemaDdl(s));
+    const data = args.skipLoad ? [] : stmts.filter((s) => !isSchemaDdl(s));
 
     // Schema DDL runs auto-commit (admin DDL is rejected inside an explicit txn). Each application is
     // version-tolerant. On a current build every form (named + relationship indexes, `IF NOT EXISTS`)
@@ -253,13 +358,45 @@ function isSchemaDdl(stmt) {
       console.log(`  · schema skipped (server capability gap): ${stmt.slice(0, 68)}…`);
       return 'skipped';
     }
+    // The schema DDL is bracketed against the SERVER's own counters, because building an index is
+    // where this server spends memory it never gives back: a RANGE index over the default profile's
+    // 23 962 :CITES relationships costs ~160 MB of RESIDENT server memory, and it scales linearly with
+    // the indexed element count (~7.8 KB per indexed element — see `rmp` #724, which this example's
+    // own evidence is what surfaced). An example that declares a realistic schema and never looks at
+    // what it cost would hide exactly the fragility it exists to expose.
     let schemaApplied = 0;
     let schemaSkipped = 0;
+    let schemaDdl = null;
+    const ddlBefore = BATTERY ? serverSnapshot() : null;
+    const ddlT0 = secs();
     for (const stmt of schema) {
       if ((await applySchema(stmt)) === 'applied') schemaApplied += 1;
       else schemaSkipped += 1;
     }
+    const ddlWall = secs() - ddlT0;
+    if (BATTERY) {
+      const ddlAfter = serverSnapshot();
+      schemaDdl = {
+        statements_applied: schemaApplied,
+        statements_skipped: schemaSkipped,
+        wall_secs: Number(ddlWall.toFixed(4)),
+        cpu_secs: Number(
+          (ddlAfter.user_secs - ddlBefore.user_secs + (ddlAfter.system_secs - ddlBefore.system_secs))
+            .toFixed(4)
+        ),
+        server_rss_before_bytes: ddlBefore.rss_bytes,
+        server_rss_after_bytes: ddlAfter.rss_bytes,
+        server_rss_delta_bytes: ddlAfter.rss_bytes - ddlBefore.rss_bytes,
+      };
+    }
     console.log(`schema: ${schemaApplied} applied, ${schemaSkipped} skipped (older-server DDL gaps)`);
+    if (schemaDdl) {
+      console.log(
+        `  schema DDL cost the SERVER ${(schemaDdl.server_rss_delta_bytes / 1048576).toFixed(1)} MB of ` +
+          `RESIDENT memory (${(schemaDdl.server_rss_before_bytes / 1048576).toFixed(1)} -> ` +
+          `${(schemaDdl.server_rss_after_bytes / 1048576).toFixed(1)} MB) and ${schemaDdl.cpu_secs.toFixed(2)} s of CPU`
+      );
+    }
 
     // Data CREATEs load in batched write transactions (far fewer round-trips than one-at-a-time —
     // important over a network link). Each batch is one commit.
@@ -281,7 +418,12 @@ function isSchemaDdl(stmt) {
         await s.close();
       }
     }
-    console.log(`loaded ${loaded} data statements (influence network + reference subgraph)`);
+    if (args.skipLoad) {
+      console.log('data load SKIPPED (--skip-load): the graph was bulk-imported over the network ' +
+        'bulk-import endpoint before this driver started');
+    } else {
+      console.log(`loaded ${loaded} data statements (influence network + reference subgraph)`);
+    }
 
     const authorCount = toNum(
       (await runQuery('MATCH (a:Author) RETURN count(a) AS c'))[0].get('c')
@@ -498,8 +640,6 @@ function isSchemaDdl(stmt) {
     if (!dijkstraDiffers) fail('weighted and unweighted Dijkstra produced identical distances');
     console.log(`  dijkstra from author 0: weighted reached ${dW.size} nodes, unweighted ${dU.size}; distance vectors differ (weights applied)`);
 
-    await dropGraph('infl_u');
-
     // =============================================================================================
     // 4. WRITE / MUTATE / STATS execution modes (feature-detected — a newer surface, rmp #643).
     //    Re-uses the weighted projection 'infl_w'. Probe with .stats (read-only); if the modes are
@@ -592,6 +732,153 @@ function isSchemaDdl(stmt) {
       console.log(`  mutate: nodePropertiesWritten=${mutated}; gds.graph.nodeProperty.stream read back ${streamed.length} values, all == the written pagerank`);
     }
 
+    // =============================================================================================
+    // 4b. PER-ALGORITHM SERVER CPU — "does GDS use the cores?", answered per algorithm (rmp #717).
+    //     Runs only when the caller handed us a co-located server pid + the proc_watch sampler (a
+    //     LOCAL run). Against a REMOTE target there is no /proc to read, so the vector is simply
+    //     ABSENT from the evidence — never zero-filled.
+    // =============================================================================================
+    let batteryCalls = 0;
+    let algoCpu = null;
+    if (BATTERY) {
+      console.log('\n-- per-algorithm SERVER core utilisation (proc_watch brackets the server pid) --');
+      // Every algorithm the engine registers, over BOTH projections where weighting changes the work:
+      // `weighted` closeness runs Dijkstra per source where the unweighted one runs BFS, and that
+      // difference is one of the largest cost signals in the whole surface.
+      const suite = [
+        ['gds.pageRank.stream',         'infl_u', "CALL gds.pageRank.stream('infl_u',{}) YIELD nodeId, score RETURN count(*) AS c"],
+        ['gds.pageRank.stream (weighted)', 'infl_w', "CALL gds.pageRank.stream('infl_w',{}) YIELD nodeId, score RETURN count(*) AS c"],
+        ['gds.betweenness.stream',      'infl_u', "CALL gds.betweenness.stream('infl_u',{}) YIELD nodeId, score RETURN count(*) AS c"],
+        ['gds.closeness.stream',        'infl_u', "CALL gds.closeness.stream('infl_u',{}) YIELD nodeId, score RETURN count(*) AS c"],
+        ['gds.closeness.stream (weighted)', 'infl_w', "CALL gds.closeness.stream('infl_w',{}) YIELD nodeId, score RETURN count(*) AS c"],
+        ['gds.triangleCount.stream',    'infl_u', "CALL gds.triangleCount.stream('infl_u',{}) YIELD nodeId, triangleCount RETURN count(*) AS c"],
+        ['gds.labelPropagation.stream', 'infl_u', "CALL gds.labelPropagation.stream('infl_u',{}) YIELD nodeId, communityId RETURN count(*) AS c"],
+        ['gds.wcc.stream',              'infl_u', "CALL gds.wcc.stream('infl_u',{}) YIELD nodeId, componentId RETURN count(*) AS c"],
+        ['gds.scc.stream',              'infl_u', "CALL gds.scc.stream('infl_u',{}) YIELD nodeId, componentId RETURN count(*) AS c"],
+        ['gds.degree.stream',           'infl_u', "CALL gds.degree.stream('infl_u',{}) YIELD nodeId, score RETURN count(*) AS c"],
+        ['gds.dijkstra.stream',         'infl_u', 'CALL gds.dijkstra.stream($g,{sourceNode:$s}) YIELD nodeId, distance RETURN count(*) AS c'],
+        ['gds.bellmanFord.stream',      'infl_u', 'CALL gds.bellmanFord.stream($g,{sourceNode:$s}) YIELD nodeId, distance RETURN count(*) AS c'],
+      ];
+
+      const measured = [];
+      for (const [name, graph, query] of suite) {
+        const params = { g: graph, s: src };
+        // Warm-up call: proves the server registers the procedure (an older one may not), and sizes
+        // the repeat count. It is OUTSIDE the bracket, so it inflates neither numerator nor
+        // denominator.
+        const warm0 = secs();
+        const probe = await runRaw(query, params);
+        const warmSecs = secs() - warm0;
+        batteryCalls += 1;
+        if (!probe.ok) {
+          if (isCapabilityGap(probe.err)) {
+            console.log(`  · ${name}: SKIPPED — this server does not register the procedure`);
+            measured.push({ algorithm: name, projection: graph, skipped: 'procedure not registered' });
+            continue;
+          }
+          fail(`${name} failed unexpectedly: ${probe.err.message}`);
+        }
+
+        // Repeat until the bracket is ≥ the CPU target, so the 10 ms tick is noise (not the signal).
+        const reps = Math.min(
+          CPU_MAX_REPEATS,
+          Math.max(CPU_MIN_REPEATS, Math.ceil(args.cpuTargetSecs / Math.max(warmSecs, 1e-4)))
+        );
+        const before = serverSnapshot();
+        const t0 = secs();
+        for (let i = 0; i < reps; i += 1) await runRaw(query, params);
+        const wall = secs() - t0;
+        const after = serverSnapshot();
+        batteryCalls += reps;
+
+        const cpu =
+          after.user_secs - before.user_secs + (after.system_secs - before.system_secs);
+        const entry = {
+          algorithm: name,
+          projection: graph,
+          calls: reps,
+          wall_secs: Number(wall.toFixed(4)),
+          ms_per_call: Number(((wall * 1000) / reps).toFixed(3)),
+          // The SERVER's resident memory across the bracket. Hundreds of repeats of one algorithm is
+          // exactly the shape that exposes a per-call allocation the server never gives back, so the
+          // RSS the phase *left behind* is worth recording next to the CPU it burned. (`proc_watch
+          // --snapshot` already reads RSS; this costs nothing extra.)
+          server_rss_before_bytes: before.rss_bytes,
+          server_rss_after_bytes: after.rss_bytes,
+          server_rss_delta_bytes: after.rss_bytes - before.rss_bytes,
+        };
+        const rssMb = (entry.server_rss_delta_bytes / (1024 * 1024)).toFixed(1);
+        if (cpu >= CPU_MIN_MEASURABLE_SECS && wall > 0) {
+          entry.cpu_secs = Number(cpu.toFixed(4));
+          entry.mean_core_utilisation = Number((cpu / wall).toFixed(3));
+          console.log(
+            `  ${name.padEnd(34)} ${String(reps).padStart(3)} calls  ` +
+              `${entry.ms_per_call.toFixed(2).padStart(8)} ms/call  ` +
+              `server CPU ${entry.cpu_secs.toFixed(2).padStart(6)} s  ` +
+              `=> ${entry.mean_core_utilisation.toFixed(2).padStart(5)} cores busy  ` +
+              `(server RSS ${rssMb >= 0 ? '+' : ''}${rssMb} MB)`
+          );
+        } else {
+          // Under five clock ticks of CPU across the whole bracket: the OS cannot resolve it, so the
+          // figure is NOT MEASURED. Reporting the 0.0 would tell a reader the server burned no CPU.
+          entry.cpu_not_measured =
+            `server CPU across ${reps} calls (${cpu.toFixed(3)} s) is below the ` +
+            `${CPU_MIN_MEASURABLE_SECS} s the OS clock tick can resolve`;
+          console.log(
+            `  ${name.padEnd(34)} ${String(reps).padStart(3)} calls  ` +
+              `${entry.ms_per_call.toFixed(2).padStart(8)} ms/call  ` +
+              `server CPU NOT MEASURABLE (< ${CPU_MIN_MEASURABLE_SECS}s over the bracket)`
+          );
+        }
+        measured.push(entry);
+      }
+
+      // The battery's own memory story: the server's RSS when the battery opened, and after ~2 900
+      // algorithm calls. A server that gives its per-call memory back ends where it started.
+      const rssRows = measured.filter((m) => m.server_rss_before_bytes !== undefined);
+      const rssStart = rssRows.length ? rssRows[0].server_rss_before_bytes : null;
+      const rssEnd = rssRows.length ? rssRows[rssRows.length - 1].server_rss_after_bytes : null;
+      algoCpu = {
+        server_pid: Number(args.serverPid),
+        host_cores: os.cpus().length,
+        cpu_target_secs: args.cpuTargetSecs,
+        min_measurable_cpu_secs: CPU_MIN_MEASURABLE_SECS,
+        authors: authorCount,
+        // What declaring the schema cost the server (rmp #724 — an index is ~7.8 KB of RSS per
+        // indexed element, and it is never released).
+        schema_ddl: schemaDdl,
+        battery_calls: batteryCalls,
+        server_rss_at_battery_start_bytes: rssStart,
+        server_rss_at_battery_end_bytes: rssEnd,
+        server_rss_growth_bytes: rssStart !== null && rssEnd !== null ? rssEnd - rssStart : null,
+        algorithms: measured,
+      };
+      if (rssStart !== null && rssEnd !== null) {
+        const mb = (b) => (b / (1024 * 1024)).toFixed(1);
+        console.log(
+          `  server RSS across the battery: ${mb(rssStart)} MB -> ${mb(rssEnd)} MB ` +
+            `(${rssEnd - rssStart >= 0 ? '+' : ''}${mb(rssEnd - rssStart)} MB over ${batteryCalls} calls)`
+        );
+      }
+      fs.writeFileSync(args.algoCpuOut, JSON.stringify(algoCpu, null, 2));
+      const busiest = measured
+        .filter((m) => m.mean_core_utilisation !== undefined)
+        .sort((a, b) => b.mean_core_utilisation - a.mean_core_utilisation)[0];
+      if (!busiest) {
+        fail('the CPU battery measured no algorithm at all — the server pid was unreadable, or every '
+          + 'bracket fell below the clock tick (raise --cpu-target-secs)');
+      }
+      console.log(
+        `  => busiest: ${busiest.algorithm} at ${busiest.mean_core_utilisation} cores of ` +
+          `${os.cpus().length} logical (${batteryCalls} battery calls; wrote ${args.algoCpuOut})`
+      );
+    } else {
+      console.log('\n-- per-algorithm SERVER core utilisation: NOT MEASURED --');
+      console.log('   (no co-located server pid: an attach run reaches the target over the wire only,');
+      console.log('    so /proc is not readable and the vector is ABSENT from the evidence — never 0)');
+    }
+
+    await dropGraph('infl_u');
     await dropGraph('infl_w');
 
     // =============================================================================================
@@ -613,9 +900,15 @@ function isSchemaDdl(stmt) {
       schema_applied: schemaApplied,
       schema_skipped: schemaSkipped,
       load_statements: loaded,
+      bulk_imported: args.skipLoad,
       authors_loaded: authorCount,
       modes_supported: modesSupported,
       nodes_written: nodesWritten,
+      // The battery's calls are counted SEPARATELY and are deliberately NOT in the latency sample:
+      // they are a CPU instrument (hundreds of repeats of one algorithm, including a 1-second
+      // weighted closeness), and folding them into the workload's percentiles would report the
+      // instrument's latency as the workload's.
+      battery_calls: batteryCalls,
       operations: latenciesMs.length,
       workload_secs: Number(totalSecs.toFixed(3)),
       p50_ms: percentileMs(0.5),

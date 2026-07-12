@@ -41,3 +41,13 @@ path = "src/bin/emit_evidence.rs"
 [[bin]]
 name = "measure_server"
 path = "src/bin/measure_server.rs"
+
+# Samples a LIVE server process (CPU + RSS) from outside it, so a Node/Python/bash driver can produce
+# SERVER evidence rather than its own (`rmp #717`). `--snapshot` reads the pid's cumulative CPU
+# counters once (bracket a phase with two to get that phase's EXACT server CPU — this is what makes a
+# per-algorithm core-utilisation figure real); `--watch` samples RSS on a cadence and reports the peak
+# DELTA over the baseline, which is how a server-side response buffering bug becomes visible.
+# Usage: `cargo run -p graphus-examples-harness --bin proc_watch -- --pid <PID> --snapshot`.
+[[bin]]
+name = "proc_watch"
+path = "src/bin/proc_watch.rs"

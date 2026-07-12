@@ -91,28 +91,44 @@ impl SplitMix64 {
     }
 }
 
-/// The two generation profiles: a small `Fast` graph for CI/E2E assertions, and a larger `Large`
-/// graph for evidence collection. Both inject the *same* reference subgraph, only the benign
-/// influence-network background scales, so the reference assertions are identical at both scales.
+/// The generation profiles. All three inject the *same* reference subgraph — only the benign
+/// influence-network background scales — so the analytically-known ground-truth assertions are
+/// identical at every scale.
+///
+/// # Which one to use, and why the default moved (`rmp` #717)
+///
+/// [`Profile::Moderate`] is the example's **default**: the smallest graph at which the *server's*
+/// per-algorithm core utilisation is a real measurement rather than noise. At [`Profile::Fast`]'s
+/// 166 nodes a `betweenness` call returns in well under a millisecond, so bracketing it against the
+/// OS's 10 ms CPU clock tick measures nothing — which is exactly how the project came to carry the
+/// unmeasured folklore that "GDS uses 2 of 9 cores". Measured on a 16-core host at
+/// [`Profile::Moderate`], `gds.betweenness.stream` burns **13.3 cores** and `gds.closeness.stream`
+/// **10.4** (see the example's `README.md`). [`Profile::Fast`] remains available for a quick
+/// correctness-only pass (`GDS_PROFILE=fast`) and for the attach path against a server with no
+/// bulk-import endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Profile {
-    /// Small, fast graph for CI and the official-driver E2E assertion.
+    /// Small, quick graph: correctness only. Too small for a meaningful CPU measurement.
     Fast,
-    /// Larger graph for evidence collection (storage/CPU/RAM footprint at volume).
+    /// **The default.** Production-shaped and big enough that the parallel algorithm kernels are
+    /// visibly multi-core, while the whole example still runs in well under a minute.
+    Moderate,
+    /// Larger still, for a deeper look at footprint at volume.
     Large,
 }
 
 impl Profile {
-    /// Parses a profile name (`fast` / `large`), case-insensitively.
+    /// Parses a profile name (`fast` / `moderate` / `large`), case-insensitively.
     ///
     /// # Errors
-    /// Returns `Err` with the offending name if it is neither `fast` nor `large`.
+    /// Returns `Err` with the offending name if it is none of the three.
     pub fn parse(name: &str) -> Result<Self, String> {
         match name.to_ascii_lowercase().as_str() {
             "fast" => Ok(Self::Fast),
+            "moderate" => Ok(Self::Moderate),
             "large" => Ok(Self::Large),
             other => Err(format!(
-                "unknown profile '{other}' (expected 'fast' or 'large')"
+                "unknown profile '{other}' (expected 'fast', 'moderate' or 'large')"
             )),
         }
     }
@@ -122,6 +138,7 @@ impl Profile {
     pub fn name(self) -> &'static str {
         match self {
             Self::Fast => "fast",
+            Self::Moderate => "moderate",
             Self::Large => "large",
         }
     }
@@ -132,8 +149,8 @@ impl Profile {
     pub fn config(self) -> GenConfig {
         match self {
             // Small but non-trivial: a few hundred authors across a handful of fields — enough to
-            // make the planted community structure visible, yet fast enough for the official-driver
-            // E2E (load + the full algorithm suite) to run in a few seconds.
+            // make the planted community structure visible, and to assert every reference output.
+            // Deliberately too small to say anything about CPU: see the type-level note above.
             Self::Fast => GenConfig {
                 seed: 0x06D5_A11C_5000_D001,
                 community_count: 4,
@@ -141,18 +158,33 @@ impl Profile {
                 intra_citations_per_author: 6,
                 inter_citations_per_author: 1,
             },
-            // Several times larger, for evidence: ~600 authors, ~5 k citation edges. Deliberately
-            // bounded so the example completes promptly. The Cypher loader issues one `MATCH ... MATCH
-            // ... CREATE` per edge, and the engine resolves `MATCH (a:Author {id:x})` by a *label
-            // scan* (the unique constraint is not used as an index seek for this pattern — measured at
-            // ~345 edges/s over a 1 600-node graph), so load time grows with nodes×edges. The
-            // in-process `gds_sweep` separately exercises the GDS algorithms at 4 320-node /
-            // 86 k-edge scale, where the projection + algorithms (not the loader) are what is measured.
+            // The DEFAULT (rmp #717): 2 400 authors / ~24 000 citations. Sized by measurement, not by
+            // taste — at this size a single `gds.betweenness.stream` call takes ~60 ms of wall time on
+            // a 16-core host and burns ~0.8 s of server CPU, so ten repeats inside one bracket give a
+            // 10 ms-tick error under 2% and the parallel kernels are unambiguously super-1-core. It is
+            // simultaneously small enough that the whole example (load + ground truth + weighted/
+            // unweighted + write/mutate/stats + the per-algorithm CPU battery) fits in ~20 s.
+            //
+            // The LOAD PATH is what makes this size reachable at all, and it is the network
+            // bulk-import (Mode A, `specification/08-network-bulk-import.md`), NOT Cypher: measured on
+            // this host, Mode A ingests 2 400 nodes + 24 000 relationships in **0.23 s**, where the
+            // per-edge Cypher loader below manages ~3 200 edges/s (≈7.5 s) — and the *idiomatic*
+            // `UNWIND $rows AS r MATCH (a:Author {id:r.from})…` batch loader is far worse still,
+            // because a row-dependent anchor does not index-seek (see `Dataset::to_cypher`).
+            Self::Moderate => GenConfig {
+                seed: 0x06D5_A11C_5000_D001,
+                community_count: 6,
+                field_size: 400,
+                intra_citations_per_author: 9,
+                inter_citations_per_author: 1,
+            },
+            // Larger still: 6 000 authors / ~60 000 citations, for a look at footprint and at how the
+            // parallel kernels hold up as the graph grows. Bulk-import loads it in well under a second.
             Self::Large => GenConfig {
                 seed: 0x06D5_A11C_5000_D001,
                 community_count: 6,
-                field_size: 100,
-                intra_citations_per_author: 7,
+                field_size: 1000,
+                intra_citations_per_author: 9,
                 inter_citations_per_author: 1,
             },
         }
@@ -453,6 +485,50 @@ pub fn generate(config: GenConfig, profile: &str) -> Dataset {
     }
 }
 
+/// The schema DDL block the workload declares, as a `;`-terminated Cypher script.
+///
+/// It is emitted **both** at the head of [`Dataset::to_cypher`] (so a plain Cypher load is
+/// schema-first and self-contained) and as a standalone `schema.cypher` artifact, because the
+/// bulk-import load path (`specification/08-network-bulk-import.md`) ingests raw CSV and therefore
+/// needs the schema applied *afterwards*, from a file of its own. One definition, two consumers.
+///
+/// Every form is verified against the `graphus-server` admin matcher (see
+/// `crates/graphus-server/tests/gds_analytics_schema.rs`, which parses this exact block off
+/// `parse_admin_statement` and drives it through the real engine). The generated authors conform to
+/// every constraint, so applying it before **or** after the data both succeed.
+///
+/// IDEMPOTENCY (`rmp` #690): every statement carries `IF NOT EXISTS`, so re-declaring the schema
+/// against an instance that already has it is a no-op success rather than a duplicate-object error.
+///
+/// NOTE on the property names: the influence-network model stores the planted community as an INTEGER
+/// `field` id (`0..community_count`) and its human-readable label as a STRING `field_name` (e.g.
+/// `'graph-theory'`). The property-type constraints therefore sit on the *actual* string / integer
+/// properties — `field_name` (STRING) and `h_index` (INTEGER) — not on the integer `field`.
+#[must_use]
+pub fn schema_cypher() -> String {
+    let mut s = String::new();
+    s.push_str("// schema\n");
+    // Uniqueness: every author has a distinct id (owns a backing RANGE index).
+    s.push_str(
+        "CREATE CONSTRAINT author_id_unique IF NOT EXISTS FOR (a:Author) REQUIRE a.id IS UNIQUE;\n",
+    );
+    // Node property-type constraints: the field label is a STRING and the h-index an INTEGER.
+    s.push_str(
+        "CREATE CONSTRAINT author_field_name_string IF NOT EXISTS FOR (a:Author) REQUIRE a.field_name IS :: STRING;\n",
+    );
+    s.push_str(
+        "CREATE CONSTRAINT author_h_index_integer IF NOT EXISTS FOR (a:Author) REQUIRE a.h_index IS :: INTEGER;\n",
+    );
+    // Node RANGE index on the planted field id (the community filter / grouping access path).
+    s.push_str("CREATE INDEX author_field_range IF NOT EXISTS FOR (a:Author) ON (a.field);\n");
+    // Relationship RANGE index on the citation weight — the "high-weight citations" access path
+    // (Graphus serves an equality seek from it; a `>=` range stays a scan + filter — rmp #680).
+    s.push_str(
+        "CREATE INDEX cites_weight_range IF NOT EXISTS FOR ()-[c:CITES]-() ON (c.weight);\n",
+    );
+    s
+}
+
 impl Dataset {
     /// The display name of a field id (cycles through [`FIELD_NAMES`] for large field counts).
     fn field_name(field: i64) -> &'static str {
@@ -466,50 +542,35 @@ impl Dataset {
     /// `;` and run each as its own auto-commit statement (the schema DDL **must** run in auto-commit,
     /// never inside an explicit transaction — Graphus rejects admin DDL inside an open txn).
     ///
-    /// Order: schema DDL → authors → `:Ref` nodes → CITES edges → reference `:LINKS` edges. Every
-    /// value is a literal (no parameters) so the file is self-contained and replayable by any Bolt
-    /// client.
+    /// Order: schema DDL ([`schema_cypher`]) → authors → `:Ref` nodes → CITES edges → reference
+    /// `:LINKS` edges. Every value is a **literal** (no parameters) so the file is self-contained and
+    /// replayable by any Bolt client.
+    ///
+    /// # This is the SLOW load path, and the reason is a measured planner limitation
+    ///
+    /// Each edge statement anchors on two id lookups. Graphus index-seeks a node anchor only when the
+    /// property value is a **plan-time constant** — a literal, as here, or a query parameter. Measured
+    /// on a 16-core host over Bolt (`rmp` #717), that literal form sustains **~3 200 edges/s
+    /// independently of graph size** (the seek works), and the parameterised scalar form
+    /// `MATCH (a:Author {id:$f})` is faster still at **~4 000 edges/s**.
+    ///
+    /// What does **not** work is the idiomatic batch form
+    /// `UNWIND $rows AS r MATCH (a:Author {id:r.from}), (b:Author {id:r.to}) CREATE …`: the anchor
+    /// value is then an expression over a variable bound by an earlier operator, which the planner
+    /// does not seek — it degrades to a **full label scan per row**, making the batch loader
+    /// `O(E · N)`. Measured: 1 103 edges/s at 400 nodes, 297 edges/s at 1 600 nodes (4× the nodes,
+    /// ~3.7× slower — linear in N), i.e. an order of magnitude *slower* than issuing the same edges as
+    /// individual statements. `WHERE id(a) = r.from` over an `UNWIND` row is no better (673 → 233
+    /// edges/s over the same range): there is no by-id seek either.
+    ///
+    /// So this script is fine at [`Profile::Fast`] and is what the attach path uses against a server
+    /// with no bulk-import endpoint — but the example's default [`Profile::Moderate`] load goes
+    /// through the **network bulk-import** CSV artifacts below ([`Dataset::authors_csv`] &c.), which
+    /// resolve endpoints through an internal hash map in `O(E)` and ingest the same graph in 0.23 s.
     #[must_use]
     pub fn to_cypher(&self) -> String {
         let mut s = String::with_capacity(self.authors.len() * 96 + self.citations.len() * 96);
-
-        // --- Schema (admin DDL — runs as auto-commit statements). Every form is verified against the
-        // graphus-server admin matcher (see `crates/graphus-server/tests/gds_analytics_schema.rs`,
-        // which parses this exact block off `parse_admin_statement` and drives it through the real
-        // engine). The generated authors conform to every constraint, so a schema-first load succeeds.
-        //
-        // IDEMPOTENCY (`rmp` #690): every schema statement carries `IF NOT EXISTS`, so re-running the
-        // load against an instance that already declared the schema (e.g. a shared/operator-owned
-        // database, or a second consecutive run) is a no-op success rather than a duplicate-object
-        // error. `IF NOT EXISTS` is parsed by `parse_admin_statement` for both CONSTRAINT and INDEX and
-        // the engine turns the already-exists case into a success (see `graphus-server/src/admin.rs`),
-        // and the `is_schema_ddl` prefix filter the server tests use (`starts_with("CREATE CONSTRAINT")`
-        // / `starts_with("CREATE") && contains(" INDEX ")`) is unaffected by the extra clause.
-        //
-        // NOTE on the property names: the influence-network model stores the planted community as an
-        // INTEGER `field` id (0..community_count) and its human-readable label as a STRING `field_name`
-        // (e.g. 'graph-theory'). The property-type constraints therefore sit on the *actual* string /
-        // integer properties — `field_name` (STRING) and `h_index` (INTEGER) — not on the integer
-        // `field`, so the load succeeds by construction. ---
-        s.push_str("// schema\n");
-        // Uniqueness: every author has a distinct id (owns a backing RANGE index).
-        s.push_str(
-            "CREATE CONSTRAINT author_id_unique IF NOT EXISTS FOR (a:Author) REQUIRE a.id IS UNIQUE;\n",
-        );
-        // Node property-type constraints: the field label is a STRING and the h-index an INTEGER.
-        s.push_str(
-            "CREATE CONSTRAINT author_field_name_string IF NOT EXISTS FOR (a:Author) REQUIRE a.field_name IS :: STRING;\n",
-        );
-        s.push_str(
-            "CREATE CONSTRAINT author_h_index_integer IF NOT EXISTS FOR (a:Author) REQUIRE a.h_index IS :: INTEGER;\n",
-        );
-        // Node RANGE index on the planted field id (the community filter / grouping access path).
-        s.push_str("CREATE INDEX author_field_range IF NOT EXISTS FOR (a:Author) ON (a.field);\n");
-        // Relationship RANGE index on the citation weight — the "high-weight citations" access path
-        // (Graphus serves an equality seek from it; a `>=` range stays a scan + filter — rmp #680).
-        s.push_str(
-            "CREATE INDEX cites_weight_range IF NOT EXISTS FOR ()-[c:CITES]-() ON (c.weight);\n",
-        );
+        s.push_str(&schema_cypher());
 
         // --- Authors ---
         s.push_str("// authors\n");
@@ -564,6 +625,65 @@ impl Dataset {
     /// Returns a `serde_json` error only if serialization fails (it cannot for this plain data).
     pub fn reference_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(&self.reference)
+    }
+
+    /// The `:Author` + `:Ref` **node** CSV for the network bulk-import (Mode A) upload
+    /// (`specification/08-network-bulk-import.md`, `?phase=nodes`).
+    ///
+    /// Header: `:ID,:LABEL,id:long,name:string,field:long,field_name:string,h_index:long`. The `:ID`
+    /// column is the importer's external **join key** (consumed to resolve `:START_ID`/`:END_ID`, not
+    /// stored as a property), so the author `id` is written **twice**: once as the `:ID` key and once
+    /// as the stored `id` property the workload's `MATCH (a:Author {id:…})` and reference-subgraph
+    /// translation read back. The six `:Ref` nodes share the same node namespace and are keyed
+    /// `r<ref_id>` so their join keys never collide with the numeric author keys.
+    ///
+    /// Byte-identical for a fixed config (the same ordered author/ref vectors, no floats, no map
+    /// iteration), asserted by the crate's tests.
+    #[must_use]
+    pub fn authors_csv(&self) -> String {
+        let mut s = String::with_capacity(self.authors.len() * 48 + 128);
+        s.push_str(":ID,:LABEL,id:long,name:string,field:long,field_name:string,h_index:long\n");
+        for a in &self.authors {
+            // No field contains a comma or quote (name is `author-<id>`, field_name is from a fixed
+            // comma-free table), so no CSV escaping is required — asserted by `node_csv_is_clean`.
+            let _ = writeln!(
+                s,
+                "{id},Author,{id},{name},{field},{field_name},{h_index}",
+                id = a.id,
+                name = a.name,
+                field = a.field,
+                field_name = Self::field_name(a.field),
+                h_index = a.h_index,
+            );
+        }
+        for &rid in &self.reference.ref_ids {
+            // `:Ref` nodes carry only their `id` property; the other columns are empty. An empty
+            // cell decodes to a null property, which the workload never reads on a `:Ref` node.
+            let _ = writeln!(s, "r{rid},Ref,{rid},,,,");
+        }
+        s
+    }
+
+    /// The `:CITES` / `:CROSS` + `:LINKS` **relationship** CSV for the bulk-import upload
+    /// (`?phase=relationships`).
+    ///
+    /// Header: `:START_ID,:END_ID,:TYPE,weight:long`. Endpoints reference the node CSV's `:ID` join
+    /// keys (numeric for authors, `r<id>` for the reference nodes). Intra-field citations are `:CITES`
+    /// and inter-field ones `:CROSS`, mirroring [`Dataset::to_cypher`]; the reference links are
+    /// `:LINKS` with a unit weight (the reference algorithms are unweighted, so the value is
+    /// immaterial — present only because the column is declared).
+    #[must_use]
+    pub fn relationships_csv(&self) -> String {
+        let mut s = String::with_capacity(self.citations.len() * 24 + 128);
+        s.push_str(":START_ID,:END_ID,:TYPE,weight:long\n");
+        for c in &self.citations {
+            let rel_type = if c.intra { "CITES" } else { "CROSS" };
+            let _ = writeln!(s, "{},{},{rel_type},{}", c.from, c.to, c.weight);
+        }
+        for &(x, y) in &self.reference.links {
+            let _ = writeln!(s, "r{x},r{y},LINKS,1");
+        }
+        s
     }
 }
 
@@ -687,9 +807,110 @@ mod tests {
     #[test]
     fn different_profiles_differ() {
         let fast = generate(Profile::Fast.config(), "fast");
+        let moderate = generate(Profile::Moderate.config(), "moderate");
         let large = generate(Profile::Large.config(), "large");
-        assert_ne!(fast.to_cypher(), large.to_cypher());
-        assert!(large.authors.len() > fast.authors.len());
+        assert_ne!(fast.to_cypher(), moderate.to_cypher());
+        assert_ne!(moderate.to_cypher(), large.to_cypher());
+        // The default (Moderate) is strictly bigger than Fast and strictly smaller than Large.
+        assert!(moderate.authors.len() > fast.authors.len());
+        assert!(large.authors.len() > moderate.authors.len());
+    }
+
+    #[test]
+    fn profile_names_round_trip() {
+        for p in [Profile::Fast, Profile::Moderate, Profile::Large] {
+            assert_eq!(Profile::parse(p.name()).unwrap(), p);
+        }
+        assert!(Profile::parse("nope").is_err());
+    }
+
+    #[test]
+    fn csv_is_byte_identical_per_config() {
+        let cfg = Profile::Moderate.config();
+        let a = generate(cfg, "moderate");
+        let b = generate(cfg, "moderate");
+        assert_eq!(a.authors_csv(), b.authors_csv());
+        assert_eq!(a.relationships_csv(), b.relationships_csv());
+    }
+
+    #[test]
+    fn node_csv_is_clean_and_complete() {
+        let cfg = Profile::Fast.config();
+        let d = generate(cfg, "fast");
+        let csv = d.authors_csv();
+        let mut lines = csv.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            ":ID,:LABEL,id:long,name:string,field:long,field_name:string,h_index:long"
+        );
+        let rows: Vec<&str> = lines.collect();
+        // One row per author + one per reference node; no CSV-hostile characters anywhere.
+        assert_eq!(
+            rows.len(),
+            d.authors.len() + d.reference.ref_ids.len(),
+            "one CSV row per node"
+        );
+        assert!(
+            !csv.contains('"') && !csv.contains('\r'),
+            "no quoting/escaping should be needed for this generator's fields"
+        );
+        // Every data row has exactly seven columns (six commas), the fixed header arity.
+        for r in &rows {
+            assert_eq!(r.matches(',').count(), 6, "row has wrong column count: {r}");
+        }
+        // The author rows repeat the id as :ID join key AND stored id property.
+        let first_author = rows[0];
+        let cols: Vec<&str> = first_author.split(',').collect();
+        assert_eq!(cols[0], cols[2], ":ID join key == stored id property");
+        assert_eq!(cols[1], "Author");
+        // The reference nodes are keyed `r<id>` so they never collide with numeric author keys.
+        assert!(
+            rows.iter()
+                .any(|r| r.starts_with("r") && r.contains(",Ref,")),
+            "reference nodes present, keyed r<id>"
+        );
+    }
+
+    #[test]
+    fn rel_csv_endpoints_and_types_match_the_graph() {
+        let cfg = Profile::Fast.config();
+        let d = generate(cfg, "fast");
+        let csv = d.relationships_csv();
+        let mut lines = csv.lines();
+        assert_eq!(lines.next().unwrap(), ":START_ID,:END_ID,:TYPE,weight:long");
+        let rows: Vec<&str> = lines.collect();
+        assert_eq!(
+            rows.len(),
+            d.citations.len() + d.reference.links.len(),
+            "one CSV row per relationship"
+        );
+        // Type split mirrors the intra/inter flag; every author endpoint is a valid node key.
+        let mut cites = 0u64;
+        let mut cross = 0u64;
+        let mut links = 0u64;
+        for r in &rows {
+            let c: Vec<&str> = r.split(',').collect();
+            assert_eq!(c.len(), 4);
+            match c[2] {
+                "CITES" => cites += 1,
+                "CROSS" => cross += 1,
+                "LINKS" => links += 1,
+                other => panic!("unexpected rel type {other}"),
+            }
+        }
+        let intra = d.citations.iter().filter(|c| c.intra).count() as u64;
+        let inter = d.citations.iter().filter(|c| !c.intra).count() as u64;
+        assert_eq!(cites, intra);
+        assert_eq!(cross, inter);
+        assert_eq!(links, d.reference.links.len() as u64);
+    }
+
+    #[test]
+    fn schema_cypher_is_the_head_of_the_load_script() {
+        // The standalone schema (used by the bulk-import path) is byte-identical to the schema block
+        // the plain Cypher load emits: one definition, two consumers.
+        let d = generate(Profile::Fast.config(), "fast");
+        assert!(d.to_cypher().starts_with(&schema_cypher()));
     }
 
     #[test]

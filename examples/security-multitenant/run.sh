@@ -95,18 +95,38 @@ VERIFY="$BIN_DIR/security_verify"
 PROFILE="${SEC_PROFILE:-fast}"
 MODE="$(harness_target_mode)"   # local | external
 
+# Concurrency phase (the point of the example): drive N overlapping workers against BOTH tenants for a
+# bounded window and assert ISOLATION HOLDS UNDER GENUINELY CONCURRENT CROSS-TENANT LOAD (a serial
+# matrix cannot). The defaults were chosen by MEASURING (rmp #717): 24 workers cycle the full weighted
+# roster ~1.5x, so all six worker classes (reader/writer per tenant + analyst + rejected) run
+# concurrently against both tenants; a 6 s window yields a stable rate (~30k operations, ~11k
+# cross-tenant probes) with tight latency percentiles; a per-writer write budget of 200 bounds the
+# durable footprint so the committed-store baseline stays reproducible. The whole example still
+# finishes in well under a minute. Override via SEC_WORKERS / SEC_CONC_SECS / SEC_WRITE_BUDGET.
+SEC_WORKERS="${SEC_WORKERS:-24}"
+SEC_CONC_SECS="${SEC_CONC_SECS:-6}"
+SEC_WRITE_BUDGET="${SEC_WRITE_BUDGET:-200}"
+
 # The deterministic generator is needed in BOTH modes.
 harness_build "the deterministic security generator (release)" \
   --release -p graphus-security-gen --bin security_gen
 [ -x "$GEN" ] || { echo "${RED}fatal: security_gen binary not found at $GEN${RESET}" >&2; exit 2; }
 
-# The server + hermetic crypto verifier are needed ONLY in local mode.
+# proc_watch samples the SERVER's pid (CPU + RSS) across the concurrency window — the house rule is
+# "sample the SERVER, not the driver", and this python driver cannot read the server's /proc itself.
+# LOCAL only: attach mode has no co-located pid, so the server-side vector is ABSENT there (not zero).
+PROC_WATCH="$BIN_DIR/proc_watch"
+
+# The server + hermetic crypto verifier + proc_watch are needed ONLY in local mode.
 if [ "$MODE" = "local" ]; then
   harness_build "graphus-server (release)" --release -p graphus-server
   [ -x "$SERVER" ] || { echo "${RED}fatal: server binary not found at $SERVER${RESET}" >&2; exit 2; }
   harness_build "the hermetic crypto verifier (release)" \
     --release -p graphus-security-gen --features dst-repro --bin security_verify
   [ -x "$VERIFY" ] || { echo "${RED}fatal: security_verify binary not found at $VERIFY${RESET}" >&2; exit 2; }
+  harness_build "the server-pid sampler (proc_watch, release)" \
+    --release -p graphus-examples-harness --bin proc_watch
+  [ -x "$PROC_WATCH" ] || { echo "${RED}fatal: proc_watch binary not found at $PROC_WATCH${RESET}" >&2; exit 2; }
 fi
 
 # --------------------------------------------------------------------------------------------------
@@ -369,7 +389,8 @@ if [ "$RUN_REST" = "1" ] && [ "$MODE" = "external" ]; then
     info "metrics-before scrape unavailable (non-fatal)"
   fi
 
-  section "Step 4 — RBAC + DENY + cross-tenant matrix over REST (python3 stdlib, attach mode)"
+  section "Step 4 — RBAC + DENY + cross-tenant matrix + CONCURRENT isolation over REST (python3 stdlib, attach mode)"
+  info "concurrency phase: $SEC_WORKERS workers x ${SEC_CONC_SECS}s against both tenants (server-pid sampling is LOCAL-only; absent here)"
   WORKLOAD_START="$(date +%s)"; WORKLOAD_START_MS="$(_harness_now_ms)"
   REST_OUT="$(python3 "$SCRIPT_DIR/data/matrix.py" \
     --base-url "$REST_BASE" \
@@ -377,6 +398,7 @@ if [ "$RUN_REST" = "1" ] && [ "$MODE" = "external" ]; then
     --admin-password "${GRAPHUS_TARGET_PASSWORD:-graphus-local}" \
     --data-dir "$DATA_DIR" \
     --system-db "$(_harness_target_system_db)" \
+    --workers "$SEC_WORKERS" --secs "$SEC_CONC_SECS" --write-budget "$SEC_WRITE_BUDGET" \
     "${INSECURE_FLAG[@]}" 2>&1)" || true
   printf '%s\n' "$REST_OUT" | sed 's/^/  /'
   assert "REST RBAC/DENY/cross-tenant matrix: every cell held" "yes" \
@@ -474,12 +496,15 @@ EOF
     info "scraped /metrics (before) -> auth_failures=$AUTH_FAIL_BEFORE"
   fi
 
-  section "Step 4 — provision + RBAC + DENY + cross-tenant matrix over REST (python3 stdlib)"
+  section "Step 4 — provision + RBAC + DENY + cross-tenant matrix + CONCURRENT isolation over REST (python3 stdlib)"
+  info "concurrency phase: $SEC_WORKERS workers x ${SEC_CONC_SECS}s against both tenants; server pid $SERVER_PID sampled via proc_watch"
   WORKLOAD_START="$(date +%s)"; WORKLOAD_START_MS="$(_harness_now_ms)"
   REST_OUT="$(python3 "$SCRIPT_DIR/data/matrix.py" \
     --base-url "https://127.0.0.1:$REST_PORT" \
     --admin-user "$ADMIN_USER" --admin-password "$ADMIN_PW" \
-    --data-dir "$DATA_DIR" --system-db "graphus" --insecure 2>&1)" || true
+    --data-dir "$DATA_DIR" --system-db "graphus" --insecure \
+    --workers "$SEC_WORKERS" --secs "$SEC_CONC_SECS" --write-budget "$SEC_WRITE_BUDGET" \
+    --server-pid "$SERVER_PID" --proc-watch "$PROC_WATCH" 2>&1)" || true
   printf '%s\n' "$REST_OUT" | sed 's/^/  /'
   assert "REST RBAC/DENY/cross-tenant matrix: every cell held" "yes" \
     "$(printf '%s' "$REST_OUT" | grep -q 'GRAPHUS_RBAC_OK' && echo yes || echo no)"
@@ -631,6 +656,74 @@ R_P50="$(json_field "$REST_STATS" p50_ms)"
 R_P99="$(json_field "$REST_STATS" p99_ms)"
 R_P999="$(json_field "$REST_STATS" p999_ms)"
 
+# The CONCURRENCY-phase evidence (rmp #717) — the headline throughput/latency of this example is now
+# the CONCURRENT cross-tenant isolation workload, not the ~65-request serial matrix. Every figure is
+# measured by matrix.py; the server-side cpu/cores/RSS (C_SRV_*) are proc_watch's bracket of the
+# SERVER's pid and are present ONLY in LOCAL mode (absent in attach — no co-located pid).
+C_WORKERS="$(json_field "$REST_STATS" conc_workers)"
+C_OPS="$(json_field "$REST_STATS" conc_ops)"
+C_OPS_SEC="$(json_field "$REST_STATS" conc_ops_per_sec)"
+C_SECS="$(json_field "$REST_STATS" conc_secs)"
+C_P50="$(json_field "$REST_STATS" conc_p50_ms)"
+C_P99="$(json_field "$REST_STATS" conc_p99_ms)"
+C_P999="$(json_field "$REST_STATS" conc_p999_ms)"
+C_XT_PROBES="$(json_field "$REST_STATS" conc_xt_probes)"
+C_XT_DENIED="$(json_field "$REST_STATS" conc_xt_denied)"
+C_XT_EMPTY="$(json_field "$REST_STATS" conc_xt_empty)"
+C_RBAC_DENIED="$(json_field "$REST_STATS" conc_rbac_denied)"
+C_DENY_READS="$(json_field "$REST_STATS" conc_deny_reads)"
+C_DENY_NULL_OK="$(json_field "$REST_STATS" conc_deny_null_ok)"
+C_HIDDEN_CHECKS="$(json_field "$REST_STATS" conc_hidden_canary_checks)"
+C_HIDDEN_OK="$(json_field "$REST_STATS" conc_hidden_canary_ok)"
+C_UNAUTH="$(json_field "$REST_STATS" conc_unauth_cells)"
+C_METRICS_GATE="$(json_field "$REST_STATS" conc_metrics_gate_rejections)"
+C_WCOMMIT="$(json_field "$REST_STATS" conc_write_committed)"
+C_WABORT="$(json_field "$REST_STATS" conc_write_aborted)"
+C_ABORT_RATE="$(json_field "$REST_STATS" conc_abort_rate)"
+C_WLOGICAL="$(json_field "$REST_STATS" conc_write_logical_bytes)"
+C_VIOL="$(json_field "$REST_STATS" conc_isolation_violations)"
+C_TRANSPORT_ERR="$(json_field "$REST_STATS" conc_transport_errors)"
+C_CLIENT_CPU="$(json_field "$REST_STATS" conc_client_cpu_secs)"
+C_CLIENT_CORES="$(json_field "$REST_STATS" conc_client_cores)"
+C_CLIENT_LIMITER="$(json_field "$REST_STATS" conc_client_is_limiter)"
+C_SRV_CPU="$(json_field "$REST_STATS" conc_server_cpu_secs)"
+C_SRV_CORES="$(json_field "$REST_STATS" conc_server_cores)"
+C_SRV_RSS_PEAK="$(json_field "$REST_STATS" conc_server_rss_peak_bytes)"
+C_SRV_RSS_DELTA="$(json_field "$REST_STATS" conc_server_rss_peak_delta_bytes)"
+
+# Run-level gates on the harvested concurrency evidence. These are IN ADDITION to matrix.py's own
+# per-iteration assertions (a violation there already withholds GRAPHUS_RBAC_OK), and they exist so the
+# isolation invariant is visible and enforced at the run.sh level too. A gate that cannot fire is worse
+# than no gate — each of these CAN fire (a leaked cell, a phase that drove nothing, a partial-leak).
+if [ "$RUN_REST" = "1" ] && [ -n "$C_OPS" ]; then
+  section "Concurrency-phase isolation gates (rmp #717)"
+  info "workers=$C_WORKERS ops=$C_OPS ops/sec=$C_OPS_SEC  p50/p99/p999=${C_P50}/${C_P99}/${C_P999} ms"
+  info "cross-tenant probes=$C_XT_PROBES denied=$C_XT_DENIED empty=$C_XT_EMPTY | RBAC denials=$C_RBAC_DENIED | auth rejections=$C_UNAUTH"
+  info "writes committed=$C_WCOMMIT SSI-aborted(retried)=$C_WABORT abort_rate=$C_ABORT_RATE | #645 hidden-label checks=$C_HIDDEN_CHECKS (ok=$C_HIDDEN_OK)"
+  if [ -n "$C_SRV_CORES" ]; then
+    info "SERVER (pid $SERVER_PID) during the window: ${C_SRV_CPU}s cpu => ${C_SRV_CORES} cores; peak RSS=${C_SRV_RSS_PEAK} B (+${C_SRV_RSS_DELTA} B)"
+  else
+    info "SERVER-side cpu/RSS: absent (attach mode has no co-located pid — measured only in LOCAL)"
+  fi
+  info "CLIENT (python driver): ${C_CLIENT_CPU}s cpu => ${C_CLIENT_CORES} cores busy; is_limiter=${C_CLIENT_LIMITER:-n/a}"
+  assert "concurrency: ZERO isolation violations across ~${C_XT_PROBES} concurrent cross-tenant probes" "yes" \
+    "$([ "${C_VIOL:-1}" = "0" ] && echo yes || echo no)"
+  assert "concurrency: the phase actually drove operations (>0)" "yes" \
+    "$([ "${C_OPS:-0}" -gt 0 ] 2>/dev/null && echo yes || echo no)"
+  assert "concurrency: every cross-tenant probe was denied or returned empty (no partial leak)" "yes" \
+    "$([ -n "$C_XT_PROBES" ] && [ "${C_XT_PROBES:-0}" -gt 0 ] && [ "$(( ${C_XT_DENIED:-0} + ${C_XT_EMPTY:-0} ))" = "${C_XT_PROBES}" ] && echo yes || echo no)"
+  if [ "$DENY_SUPPORTED" = "true" ]; then
+    assert "concurrency: the DENY-scoped value read back NULL on every iteration" "yes" \
+      "$([ -n "$C_DENY_READS" ] && [ "${C_DENY_READS:-0}" -gt 0 ] && [ "${C_DENY_NULL_OK:-0}" = "${C_DENY_READS}" ] && echo yes || echo no)"
+    assert "concurrency: the #645 DENY-TRAVERSE'd multi-label node stayed hidden on every scan" "yes" \
+      "$([ -n "$C_HIDDEN_CHECKS" ] && [ "${C_HIDDEN_CHECKS:-0}" -gt 0 ] && [ "${C_HIDDEN_OK:-0}" = "${C_HIDDEN_CHECKS}" ] && echo yes || echo no)"
+  fi
+  # Roll the true concurrency-window peak RSS (proc_watch) into the report's peak (LOCAL only).
+  if [ -n "$C_SRV_RSS_PEAK" ] && [ "${C_SRV_RSS_PEAK:-0}" -gt "${PEAK_RSS_BYTES:-0}" ] 2>/dev/null; then
+    PEAK_RSS_BYTES="$C_SRV_RSS_PEAK"
+  fi
+fi
+
 # --------------------------------------------------------------------------------------------------
 # Step 7 — evidence. LOCAL: measure_server (CPU/RSS/tenant-store) + baseline gate + /metrics companion.
 #          EXTERNAL: measure_target (/metrics delta, measurement_mode=external, invariant gate).
@@ -652,18 +745,18 @@ if [ "$RUN_REST" = "1" ] && [ "$MODE" = "external" ]; then
     "$MEASURE_TGT" \
       --evidence-dir "$EVIDENCE_DIR" \
       --scenario "security-multitenant" \
-      --description "Fine-grained multi-tenant RBAC (GRANT + DENY property/label scope) + cross-tenant isolation over REST and Bolt, attached to an ALREADY-RUNNING instance and provisioned into a namespaced, torn-down set of tenant databases." \
+      --description "Fine-grained multi-tenant RBAC (GRANT + DENY property/label scope) + a CONCURRENT cross-tenant isolation workload ($SEC_WORKERS overlapping workers x ${SEC_CONC_SECS}s against both tenants, isolation asserted every iteration) over REST and Bolt, attached to an ALREADY-RUNNING instance and provisioned into a namespaced, torn-down set of tenant databases." \
       --database "$DB_A" \
       --metrics-before "$METRICS_BEFORE" \
       --metrics-after "$METRICS_AFTER" \
       --nodes "$NODE_COUNT" --rels "$REL_COUNT" \
       --total-millis "${WORKLOAD_MS:-0}" \
-      --workload-ops "${R_REQS:-0}" --workload-secs "${R_REQ_SECS:-0}" \
-      --p50-ms "${R_P50:-0}" --p99-ms "${R_P99:-0}" --p999-ms "${R_P999:-0}" \
-      --abort-rate 0.0 \
+      --workload-ops "${C_OPS:-0}" --workload-secs "${C_SECS:-0}" \
+      --p50-ms "${C_P50:-0}" --p99-ms "${C_P99:-0}" --p999-ms "${C_P999:-0}" \
+      --abort-rate "${C_ABORT_RATE:-0}" \
       --note "storage.bytes_per_node / bytes_per_relationship are deliberately ABSENT (rmp #711): the storage vector meters ONE tenant's database (tenant_a) while --nodes/--rels count BOTH tenants' seeded graphs, so a per-element cost derived from them would divide one store by two stores' elements. Absent is the honest state; --per-element-costs is therefore not passed. The cross-tenant footprint totals ride in as workload params." \
       --param "seeded_statements=${R_SEEDED:-0}" \
-      --note "throughput.* is the REST RBAC matrix workload: ${R_REQS:-0} authorization-enforced /db/{db}/tx/commit requests over the window they were issued in, with their REAL latency percentiles (measured by matrix.py). Before rmp #699 the latency percentiles were hardcoded 0.000 placeholders and ops_per_sec was seeded_statements divided by the server UPTIME." \
+      --note "THROUGHPUT is the CONCURRENCY phase (rmp #717): ${C_OPS:-0} operations over ${C_SECS:-0}s driven by ${C_WORKERS:-0} overlapping keep-alive workers against BOTH tenants, with their real latency percentiles — the honest headline for a tenant-isolation example, which is a CONCURRENCY property. The ~${R_REQS:-0}-request serial matrix rides in as rest_* params. The SERVER-side cpu/RSS vector is ABSENT here by design: an external target has no co-located pid to proc_watch (schema v3: absent != zero); server-side signal is via /metrics only." \
       --param "profile=$PROFILE" \
       --param "mode=external-attach" \
       --param "namespace=$RUN_NS" \
@@ -678,12 +771,40 @@ if [ "$RUN_REST" = "1" ] && [ "$MODE" = "external" ]; then
       --param "cross_tenant_probes=${R_XT_PROBES:-0}" \
       --param "cross_tenant_denied=${R_XT_DENIED:-0}" \
       --param "cross_tenant_empty=${R_XT_EMPTY:-0}" \
+      --param "rest_requests=${R_REQS:-0}" \
+      --param "rest_workload_secs=${R_REQ_SECS:-0}" \
+      --param "rest_p50_ms=${R_P50:-0}" \
+      --param "rest_p99_ms=${R_P99:-0}" \
+      --param "rest_p999_ms=${R_P999:-0}" \
+      --param "conc_workers=${C_WORKERS:-0}" \
+      --param "conc_ops=${C_OPS:-0}" \
+      --param "conc_ops_per_sec=${C_OPS_SEC:-0}" \
+      --param "conc_window_secs=${C_SECS:-0}" \
+      --param "conc_cross_tenant_probes=${C_XT_PROBES:-0}" \
+      --param "conc_cross_tenant_denied=${C_XT_DENIED:-0}" \
+      --param "conc_cross_tenant_empty=${C_XT_EMPTY:-0}" \
+      --param "conc_rbac_denials=${C_RBAC_DENIED:-0}" \
+      --param "conc_deny_scoped_reads=${C_DENY_READS:-0}" \
+      --param "conc_deny_null_ok=${C_DENY_NULL_OK:-0}" \
+      --param "conc_hidden_label_checks=${C_HIDDEN_CHECKS:-0}" \
+      --param "conc_hidden_label_ok=${C_HIDDEN_OK:-0}" \
+      --param "conc_auth_rejections=${C_UNAUTH:-0}" \
+      --param "conc_metrics_gate_rejections=${C_METRICS_GATE:-0}" \
+      --param "conc_write_committed=${C_WCOMMIT:-0}" \
+      --param "conc_write_aborted=${C_WABORT:-0}" \
+      --param "conc_abort_rate=${C_ABORT_RATE:-0}" \
+      --param "conc_isolation_violations=${C_VIOL:-0}" \
+      --param "conc_transport_errors=${C_TRANSPORT_ERR:-0}" \
+      --param "conc_client_cpu_secs=${C_CLIENT_CPU:-0}" \
+      --param "conc_client_cores=${C_CLIENT_CORES:-0}" \
+      --param "conc_client_is_limiter=${C_CLIENT_LIMITER:-unknown}" \
       --param "auth_failures_before=${AUTH_FAIL_BEFORE}" \
       --param "auth_failures_after=${AUTH_FAIL_AFTER}" \
       --param "auth_failures_delta=${AUTH_FAIL_DELTA}" \
       --note "$AUTH_FAIL_NOTE" \
+      --note "CLIENT (the python driver) burned ${C_CLIENT_CPU:-n/a}s => ${C_CLIENT_CORES:-n/a} cores over the window (is_limiter=${C_CLIENT_LIMITER:-n/a}). The GIL caps this stdlib client near ~1 core, so when it is the limiter the achieved ops/sec is a CLIENT ceiling, not the server's. The isolation invariant is rate-independent — asserted on every iteration." \
       --note "DENY (property/label scope) support on this target: ${DENY_SUPPORTED}. When false the grammar predates DENY and only GRANT-scoped RBAC + cross-tenant isolation are exercised here; the full modern DENY coverage (#645 guard) is validated against a current server (LOCAL mode)." \
-      --note "Cross-tenant negatives (ssn / secret_token / all-nodes / count) asserted as a tenant_a user against tenant_b over REST (403 coarse gate) and Bolt (value-level filter => zero rows). No sensitive datum crosses the boundary." \
+      --note "Cross-tenant negatives asserted UNDER CONCURRENCY: ZERO of ~${C_XT_PROBES:-0} concurrent cross-tenant probes leaked (denied 403 or value-filtered to zero rows), and no sensitive datum crossed a tenant boundary on any of ${C_OPS:-0} operations." \
       --assert --max-abort-rate 0.5 \
       && info "evidence written to $EVIDENCE_DIR (external)" \
       || info "measure_target reported a violation or failure (see output above)"
@@ -705,12 +826,18 @@ elif [ "$RUN_REST" = "1" ] && [ "$MODE" = "local" ]; then
   harness_build "the dev-only measure_server harness binary (debug)" --release -p graphus-examples-harness --bin measure_server
   MEASURE_BIN="$BIN_DIR/measure_server"
 
+  # The logical graph the metered store now holds = the deterministic tenant SEED plus the concurrency
+  # phase's COMMITTED writes (evidence rule 3: a ratio's two inputs must describe the same graph, and
+  # the concurrency writes ARE in the store the amplification meters). C_WLOGICAL is 0 when the phase
+  # did not run, leaving the figure exactly as before.
+  LOGICAL_TOTAL=$(( LOGICAL_GRAPH_BYTES + ${C_WLOGICAL:-0} ))
+
   if [ -x "$MEASURE_BIN" ] && [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
     rm -rf "$EVIDENCE_DIR"
     "$MEASURE_BIN" \
       --evidence-dir "$EVIDENCE_DIR" \
       --scenario "security-multitenant" \
-      --description "Fine-grained RBAC (GRANT + DENY property/label scope) over an ENCRYPTED multi-tenant server (AES-256-GCM at rest): provision isolated tenant databases + roles/users/grants + DENY and assert the allow/deny/cross-tenant/DENY matrix over REST and Bolt, with ciphertext-on-disk, offline key rotation and encrypted-backup proofs." \
+      --description "Fine-grained RBAC (GRANT + DENY property/label scope) over an ENCRYPTED multi-tenant server (AES-256-GCM at rest): provision isolated tenant databases + roles/users/grants + DENY, then drive a CONCURRENT cross-tenant isolation workload ($SEC_WORKERS overlapping workers x ${SEC_CONC_SECS}s against both tenants, isolation asserted on every iteration) with real writes mutating the tenant stores under load, over REST and Bolt, with ciphertext-on-disk, offline key rotation and encrypted-backup proofs." \
       --pid "$SERVER_PID" \
       --uptime-secs "$SERVER_UPTIME_SECS" \
       --store "$TENANT_STORE" \
@@ -718,11 +845,16 @@ elif [ "$RUN_REST" = "1" ] && [ "$MODE" = "local" ]; then
       --nodes "$NODE_COUNT" --rels "$REL_COUNT" \
       --peak-rss-bytes "$PEAK_RSS_BYTES" \
       --total-millis "${WORKLOAD_MS:-0}" \
-      --workload-ops "${R_REQS:-0}" --workload-secs "${R_REQ_SECS:-0}" \
-      --p50-ms "${R_P50:-0}" --p99-ms "${R_P99:-0}" --p999-ms "${R_P999:-0}" \
-      --logical-bytes-written "$LOGICAL_GRAPH_BYTES" \
-      --logical-graph-bytes "$LOGICAL_GRAPH_BYTES" \
+      --workload-ops "${C_OPS:-0}" --workload-secs "${C_SECS:-0}" \
+      --p50-ms "${C_P50:-0}" --p99-ms "${C_P99:-0}" --p999-ms "${C_P999:-0}" \
+      --abort-rate "${C_ABORT_RATE:-0}" \
+      --logical-bytes-written "$LOGICAL_TOTAL" \
+      --logical-graph-bytes "$LOGICAL_TOTAL" \
+      --note "THROUGHPUT is the CONCURRENCY phase (rmp #717): ${C_OPS:-0} operations over a ${C_SECS:-0}s window driven by ${C_WORKERS:-0} overlapping keep-alive workers against BOTH tenants, with their real latency percentiles. This — not the ~${R_REQS:-0}-request serial matrix (kept as rest_* params) — is the honest headline, because tenant isolation is a CONCURRENCY property. abort_rate is the MEASURED SSI abort rate under the concurrent writes (a legitimately-zero value when the writes did not conflict; retried, not dropped)." \
+      --note "SERVER-side cost of the concurrent cross-tenant load (proc_watch bracket of pid $SERVER_PID over the window): ${C_SRV_CPU:-n/a}s cpu => ${C_SRV_CORES:-n/a} cores busy; peak RSS ${C_SRV_RSS_PEAK:-n/a} B (+${C_SRV_RSS_DELTA:-n/a} B over the pre-window baseline). The report's cpu.* section is the WHOLE server uptime (provision+seed+matrix+overhead-twin+concurrency); conc_server_* isolates just the concurrency window." \
+      --note "CLIENT (the python driver) burned ${C_CLIENT_CPU:-n/a}s => ${C_CLIENT_CORES:-n/a} cores over the window (is_limiter=${C_CLIENT_LIMITER:-n/a}). The GIL caps this stdlib client near ~1 core of bytecode, so when it is the limiter the achieved ops/sec is a CLIENT ceiling, not the server's — reported so a reader is never misled (this suite has scar tissue where a 'server ceiling' was a driver artifact). The isolation invariant is rate-independent: asserted on every iteration regardless." \
       --note "storage.bytes_per_node / bytes_per_relationship are deliberately ABSENT (rmp #711): the storage vector meters ONE tenant's database (tenant_a) while --nodes/--rels count BOTH tenants' seeded graphs, so a per-element cost derived from them would divide one store by two stores' elements. Absent is the honest state; --per-element-costs is therefore not passed. The cross-tenant footprint totals ride in as workload params." \
+      --note "AMPLIFICATION denominator = the tenant SEED (${LOGICAL_GRAPH_BYTES} B, both tenants' .cypher) PLUS the concurrency phase's committed writes (${C_WLOGICAL:-0} B logical, Cypher+params), because the metered store holds both. It remains a COARSE ratio: the numerator is tenant_a's store only while the denominator spans both tenants (the same one-store-vs-two-graphs caveat that omits the per-element costs above)." \
       --param "seeded_statements=${R_SEEDED:-0}" \
       --param "profile=$PROFILE" \
       --param "connection=rest-https-jwt+bolt-tcp-tls" \
@@ -736,6 +868,37 @@ elif [ "$RUN_REST" = "1" ] && [ "$MODE" = "local" ]; then
       --param "deny_checks=${R_DENY_CHECKS:-0}" \
       --param "cross_tenant_probes=${R_XT_PROBES:-0}" \
       --param "cross_tenant_empty=${R_XT_EMPTY:-0}" \
+      --param "rest_requests=${R_REQS:-0}" \
+      --param "rest_workload_secs=${R_REQ_SECS:-0}" \
+      --param "rest_p50_ms=${R_P50:-0}" \
+      --param "rest_p99_ms=${R_P99:-0}" \
+      --param "rest_p999_ms=${R_P999:-0}" \
+      --param "conc_workers=${C_WORKERS:-0}" \
+      --param "conc_ops=${C_OPS:-0}" \
+      --param "conc_ops_per_sec=${C_OPS_SEC:-0}" \
+      --param "conc_window_secs=${C_SECS:-0}" \
+      --param "conc_cross_tenant_probes=${C_XT_PROBES:-0}" \
+      --param "conc_cross_tenant_denied=${C_XT_DENIED:-0}" \
+      --param "conc_cross_tenant_empty=${C_XT_EMPTY:-0}" \
+      --param "conc_rbac_denials=${C_RBAC_DENIED:-0}" \
+      --param "conc_deny_scoped_reads=${C_DENY_READS:-0}" \
+      --param "conc_deny_null_ok=${C_DENY_NULL_OK:-0}" \
+      --param "conc_hidden_label_checks=${C_HIDDEN_CHECKS:-0}" \
+      --param "conc_hidden_label_ok=${C_HIDDEN_OK:-0}" \
+      --param "conc_auth_rejections=${C_UNAUTH:-0}" \
+      --param "conc_metrics_gate_rejections=${C_METRICS_GATE:-0}" \
+      --param "conc_write_committed=${C_WCOMMIT:-0}" \
+      --param "conc_write_aborted=${C_WABORT:-0}" \
+      --param "conc_abort_rate=${C_ABORT_RATE:-0}" \
+      --param "conc_isolation_violations=${C_VIOL:-0}" \
+      --param "conc_transport_errors=${C_TRANSPORT_ERR:-0}" \
+      --param "conc_client_cpu_secs=${C_CLIENT_CPU:-0}" \
+      --param "conc_client_cores=${C_CLIENT_CORES:-0}" \
+      --param "conc_client_is_limiter=${C_CLIENT_LIMITER:-unknown}" \
+      --param "conc_server_cpu_secs=${C_SRV_CPU:-n/a}" \
+      --param "conc_server_cores=${C_SRV_CORES:-n/a}" \
+      --param "conc_server_rss_peak_bytes=${C_SRV_RSS_PEAK:-n/a}" \
+      --param "conc_server_rss_peak_delta_bytes=${C_SRV_RSS_DELTA:-n/a}" \
       --param "tenant_store_bytes=${TENANT_STORE_TOTAL:-0}" \
       --param "tenant_wal_bytes=${TENANT_WAL_TOTAL:-0}" \
       --param "enc_seed_ms=${ENC_SEED_MS:-0}" \
@@ -748,9 +911,9 @@ elif [ "$RUN_REST" = "1" ] && [ "$MODE" = "local" ]; then
       --param "backup_ms=${V_BACKUP_MS:-0}" \
       --param "restore_ms=${V_RESTORE_MS:-0}" \
       --param "auth_failures_delta=${AUTH_FAIL_DELTA}" \
-      --note "STORAGE FIX (rmp #696): the primary storage section meters a REAL tenant database store ($DB_A/graphus.store), not the empty default 'graphus' db; the all-tenants store/WAL SUM rides in as tenant_store_bytes/tenant_wal_bytes params." \
+      --note "STORAGE FIX (rmp #696): the primary storage section meters a REAL tenant database store ($DB_A/graphus.store), not the empty default 'graphus' db; the all-tenants store/WAL SUM rides in as tenant_store_bytes/tenant_wal_bytes params. The store now ALSO holds the concurrency phase's committed writes (writer_a's AuditEvents), so it grows vs a matrix-only run." \
       --note "OVERHEAD FIX (rmp #696): enc_store_bytes vs clear_store_bytes now measure two ISOLATED databases (overhead_enc / overhead_clear) each seeded with the IDENTICAL tenant_a dataset, so the delta is purely per-page GCM overhead (apples-to-apples); the timing is a coarse single-run figure." \
-      --note "RBAC allow/deny/cross-tenant/DENY matrix asserted over BOTH REST and Bolt from one deterministic manifest; the hermetic security_verify proved ciphertext-on-disk, offline key rotation and the encrypted backup roundtrip." \
+      --note "RBAC allow/deny/cross-tenant/DENY matrix asserted over BOTH REST and Bolt from one deterministic manifest; the hermetic security_verify proved ciphertext-on-disk, offline key rotation and the encrypted backup roundtrip. Under the concurrency phase, ZERO of ~${C_XT_PROBES:-0} concurrent cross-tenant probes leaked and the DENY-scoped values read back NULL on every one of ${C_DENY_READS:-0} reads." \
       --note "$AUTH_FAIL_NOTE" \
       && info "evidence written to $EVIDENCE_DIR" \
       || info "evidence collection failed (non-fatal); see output above"
