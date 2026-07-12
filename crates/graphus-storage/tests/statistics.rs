@@ -1151,6 +1151,90 @@ fn rolled_back_index_declaration_is_discarded() {
     );
 }
 
+// =================================================================================================
+// `rmp` #534: superset-preserve the schema-catalog half of `Statistics` on rollback (defense-in-depth
+// for the `rmp` #529 read-only-commit fast path).
+//
+// A catalog DDL left PENDING in a concurrent open transaction must survive an UNRELATED transaction's
+// rollback. On the previous wholesale-overwrite code the rollback's `reload_catalog` reverted the
+// whole `Statistics` to the durable committed image — wiping the pending index from memory — AND
+// cleared the store-global `catalog_dirty` flag, so the owning transaction's later commit took the
+// #529 read-only fast path and SILENTLY DROPPED its committed DDL (no data record backs a catalog-only
+// change, so `catalog_dirty` is its only durability signal).
+//
+// This interleaving models a FUTURE yielding-DDL path via the direct store API: today catalog DDL runs
+// only as a yield-free auto-commit transaction (the coordinator's `begin` -> `set_*` -> `commit` with
+// no engine yield between the mutation and the commit), so it is not engine-reachable — but the
+// store's rollback contract must be robust to it. `rolled_back_index_declaration_is_discarded` above
+// pins the complementary property this fix must NOT break: a transaction's OWN pending DDL, with no
+// concurrent transaction to own it, IS still discarded on rollback (rollback atomicity).
+// =================================================================================================
+
+#[test]
+fn concurrent_pending_index_survives_an_unrelated_rollback() {
+    let mut s = fresh(64);
+
+    // Durable baseline: intern the schema tokens and commit, so the tokens the pending index will
+    // reference are already durable. This isolates the test to the index catalog ENTRY, not token
+    // durability (which rides its own #220/#172 superset restore).
+    let t0 = TxnId(1);
+    s.begin(t0);
+    let product = s.intern_token(Namespace::Label, "Product").unwrap();
+    let sku = s.intern_token(Namespace::PropKey, "sku").unwrap();
+    s.commit(t0).unwrap();
+    s.flush().unwrap();
+    assert_eq!(
+        s.node_property_index_state(product, sku),
+        None,
+        "no index is declared in the durable baseline"
+    );
+
+    // Transaction A declares a node-property index and its name — and stays OPEN (pending catalog DDL).
+    let a = TxnId(2);
+    s.begin(a);
+    s.set_node_property_index(product, sku, IndexState::Online);
+    s.set_node_property_index_name("product_sku".to_owned(), product, sku);
+
+    // Concurrent transaction B does unrelated data work, then ROLLS BACK while A is still open.
+    let b = TxnId(3);
+    s.begin(b);
+    let _ = s.create_node(b).unwrap();
+    s.rollback(b).unwrap();
+
+    // THE FIX: B's rollback must NOT have wiped A's pending index from memory (on the wholesale-
+    // overwrite code the reload reverts `Statistics` to the durable image, dropping it).
+    assert_eq!(
+        s.node_property_index_state(product, sku),
+        Some(IndexState::Online),
+        "a concurrent open transaction's pending index must survive an unrelated transaction's rollback"
+    );
+    assert_eq!(
+        s.node_property_index_name("product_sku"),
+        Some((product, sku)),
+        "the pending index NAME must survive the unrelated rollback too"
+    );
+
+    // A commits. Because B's rollback KEPT `catalog_dirty` set (the preserved DDL is not yet durable),
+    // A's commit takes the durable path and checkpoints the catalog — making the index durable. On the
+    // wholesale-overwrite code B's rollback cleared `catalog_dirty`, so this commit would take the #529
+    // read-only fast path and never persist the (already-wiped) index.
+    s.commit(a).unwrap();
+
+    // The committed index is durable across a clean reopen — the property the silent-drop bug breaks.
+    let (device, wal) = into_parts(s);
+    let reopened = RecordStore::open(device, wal, 64).expect("reopen");
+    assert_eq!(
+        reopened.node_property_index_state(product, sku),
+        Some(IndexState::Online),
+        "A's committed index must be durable after reopen (it must not have been silently dropped)"
+    );
+    assert_eq!(
+        reopened.node_property_index_name("product_sku"),
+        Some((product, sku)),
+        "A's committed index NAME must be durable after reopen"
+    );
+}
+
 #[test]
 fn removed_node_property_index_stays_removed_across_reopen() {
     let mut s = fresh(64);

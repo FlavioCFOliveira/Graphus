@@ -1108,6 +1108,106 @@ impl Statistics {
         Self::default()
     }
 
+    /// Returns `true` iff the **schema-catalog** half of `self` equals `other`'s — the twelve
+    /// `catalog_dirty`-guarded DDL maps (declared node/relationship property, composite, full-text,
+    /// text, spatial, vector indexes; their names; constraints; and the opaque property histograms)
+    /// — **ignoring** the four live-record cardinality counters
+    /// ([`total_nodes`](Self#structfield.total_nodes) /
+    /// [`total_relationships`](Self#structfield.total_relationships) /
+    /// [`nodes_per_label`](Self#structfield.nodes_per_label) /
+    /// [`rels_per_type`](Self#structfield.rels_per_type)).
+    ///
+    /// `rmp` #534: the rollback path uses this to detect whether a **concurrent** open transaction left
+    /// a pending catalog DDL change that a wholesale count-revert would otherwise silently drop. It is
+    /// the exact complement of [`adopt_schema_from`](Self::adopt_schema_from): the fields this compares
+    /// are precisely the fields that method moves — the exhaustive destructure below keeps the two in
+    /// lock-step (a newly-added `Statistics` field forces a compile decision in *both* places).
+    #[must_use]
+    pub fn schema_eq(&self, other: &Self) -> bool {
+        // Exhaustive destructure so adding a field to `Statistics` cannot silently escape this
+        // comparison: categorise the new field as a live-record COUNTER (bound to `_`, ignored) or a
+        // schema-catalog DDL map (bound and compared — an unused binding is a `-D warnings` error).
+        let Self {
+            // Live-record cardinality counters: NOT part of the schema — deliberately ignored.
+            total_nodes: _,
+            total_relationships: _,
+            nodes_per_label: _,
+            rels_per_type: _,
+            // Schema-catalog DDL (the `catalog_dirty`-guarded half): compared.
+            node_prop_histograms,
+            node_property_indexes,
+            fulltext_indexes,
+            spatial_indexes,
+            constraints,
+            node_property_index_names,
+            rel_property_indexes,
+            rel_property_index_names,
+            composite_indexes,
+            rel_composite_indexes,
+            text_indexes,
+            vector_indexes,
+        } = self;
+        *node_prop_histograms == other.node_prop_histograms
+            && *node_property_indexes == other.node_property_indexes
+            && *fulltext_indexes == other.fulltext_indexes
+            && *spatial_indexes == other.spatial_indexes
+            && *constraints == other.constraints
+            && *node_property_index_names == other.node_property_index_names
+            && *rel_property_indexes == other.rel_property_indexes
+            && *rel_property_index_names == other.rel_property_index_names
+            && *composite_indexes == other.composite_indexes
+            && *rel_composite_indexes == other.rel_composite_indexes
+            && *text_indexes == other.text_indexes
+            && *vector_indexes == other.vector_indexes
+    }
+
+    /// Moves the **schema-catalog** half of `src` into `self`, leaving `self`'s four live-record
+    /// cardinality counters untouched. The twelve fields moved are exactly those compared by
+    /// [`schema_eq`](Self::schema_eq) and guarded by the store's `catalog_dirty` flag.
+    ///
+    /// `rmp` #534: on a rollback that must **superset-preserve** a concurrent open transaction's pending
+    /// catalog DDL, the store first reverts the whole `Statistics` to the durable committed image
+    /// (correctly discarding the aborting transaction's count increments/decrements, `rmp` task #79)
+    /// and then calls this to restore the richer in-memory schema — the `Statistics` twin of the tokens
+    /// / free-list superset restore. Consuming `src` avoids re-cloning the (potentially large) DDL maps.
+    pub fn adopt_schema_from(&mut self, src: Self) {
+        // Exhaustive destructure: a newly-added `Statistics` field forces a compile decision here
+        // (a COUNTER is dropped so `self` keeps its durable-reverted value; a DDL map is moved into
+        // `self`). Missing a field is a `pattern does not mention field …` compile error.
+        let Self {
+            // Live-record cardinality counters: dropped — `self` keeps its durable-reverted values.
+            total_nodes: _,
+            total_relationships: _,
+            nodes_per_label: _,
+            rels_per_type: _,
+            // Schema-catalog DDL (the `catalog_dirty`-guarded half): moved into `self`.
+            node_prop_histograms,
+            node_property_indexes,
+            fulltext_indexes,
+            spatial_indexes,
+            constraints,
+            node_property_index_names,
+            rel_property_indexes,
+            rel_property_index_names,
+            composite_indexes,
+            rel_composite_indexes,
+            text_indexes,
+            vector_indexes,
+        } = src;
+        self.node_prop_histograms = node_prop_histograms;
+        self.node_property_indexes = node_property_indexes;
+        self.fulltext_indexes = fulltext_indexes;
+        self.spatial_indexes = spatial_indexes;
+        self.constraints = constraints;
+        self.node_property_index_names = node_property_index_names;
+        self.rel_property_indexes = rel_property_indexes;
+        self.rel_property_index_names = rel_property_index_names;
+        self.composite_indexes = composite_indexes;
+        self.rel_composite_indexes = rel_composite_indexes;
+        self.text_indexes = text_indexes;
+        self.vector_indexes = vector_indexes;
+    }
+
     /// The number of currently-live nodes carrying the label `token_id` (`0` if none).
     #[must_use]
     pub fn node_count_for_label(&self, token_id: u32) -> u64 {
