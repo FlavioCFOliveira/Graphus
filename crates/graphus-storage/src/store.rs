@@ -34,6 +34,7 @@ use graphus_bufpool::page::{self, HEADER_SIZE};
 use graphus_core::error::{GraphusError, Result};
 use graphus_core::{ElementId, Lsn, MAX_TIMESTAMP, PageId, Timestamp, TxnId, VersionStamp};
 use graphus_io::{BlockDevice, PAGE_SIZE};
+use graphus_pagemap::PageMapWriter;
 use graphus_txn::{CommitRegistry, TxnOutcome};
 use graphus_wal::{LogSink, WalManager};
 
@@ -122,20 +123,48 @@ impl StoreKind {
 
 /// In-memory handle to one fixed-record store: its kind, id allocator, free list, and the
 /// store-relative-page → device-`PageId` map.
+///
+/// `device_pages` is a [`PageMapWriter`] — the append side of a **live**, append-only, lock-free map
+/// whose read side ([`Arc<PageMap>`]) is shared with every off-thread reader (`rmp` #721). It is
+/// deliberately NOT a `Vec` owned solely by the writer: the reader's location oracle must be live,
+/// because the record *content* it navigates is live. The writer token is not `Clone` and appending
+/// takes `&mut`, so the borrow checker still enforces the single-writer contract exactly as it did for
+/// the old `Vec<PageId>`. See [`crate::pagemap`] for the monotonicity invariant, the publication
+/// ordering, and why the single-writer contract is load-bearing for durability.
 struct FixedStore {
     kind: StoreKind,
     alloc: PhysicalAllocator,
     free: FreeList,
-    device_pages: Vec<PageId>,
+    device_pages: PageMapWriter,
 }
 
 impl FixedStore {
-    fn from_meta(kind: StoreKind, m: &StoreMeta) -> Self {
-        Self {
+    /// Builds a store handle from a durable catalog entry, including a **fresh** page map. Used on
+    /// `open` / `create` / `restore` — the paths that build a `RecordStore` from scratch, where no
+    /// reader can hold a handle to the old map yet.
+    ///
+    /// A rollback's catalog reload must NOT use this: it would hand the store a brand-new map and
+    /// strand every in-flight reader on the old one. See
+    /// [`RecordStore::reload_catalog`](RecordStore::reload_catalog).
+    ///
+    /// # Errors
+    /// Returns a storage error if the catalog's page list exceeds the page map's addressable ceiling.
+    fn from_meta(kind: StoreKind, m: &StoreMeta) -> Result<Self> {
+        Ok(Self {
             kind,
             alloc: PhysicalAllocator::restore(m.high_water.max(1)),
             free: m.free_list.clone(),
-            device_pages: m.device_pages.iter().copied().map(PageId).collect(),
+            device_pages: PageMapWriter::from_pages(m.device_pages.iter().copied().map(PageId))?,
+        })
+    }
+
+    /// A brand-new, empty store handle (the `create` path): an empty page map, a fresh allocator.
+    fn empty(kind: StoreKind) -> Self {
+        Self {
+            kind,
+            alloc: PhysicalAllocator::restore(1),
+            free: FreeList::default(),
+            device_pages: PageMapWriter::new(),
         }
     }
 
@@ -155,10 +184,9 @@ impl FixedStore {
 /// the off-thread view.
 impl StorePages for [FixedStore; STORE_COUNT] {
     fn device_page(&self, kind: StoreKind, rel_page: u64) -> Result<PageId> {
-        self[kind as usize]
-            .device_pages
-            .get(rel_page as usize)
-            .copied()
+        usize::try_from(rel_page)
+            .ok()
+            .and_then(|p| self[kind as usize].device_pages.get(p))
             .ok_or_else(|| {
                 GraphusError::Storage(format!("{kind:?} store page {rel_page} not allocated"))
             })
@@ -166,6 +194,10 @@ impl StorePages for [FixedStore; STORE_COUNT] {
 
     fn high_water(&self, kind: StoreKind) -> u64 {
         self[kind as usize].alloc.high_water()
+    }
+
+    fn mapped_page_count(&self, kind: StoreKind) -> u64 {
+        self[kind as usize].device_pages.len() as u64
     }
 }
 
@@ -484,12 +516,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             wal: shared,
             element_ids: ElementIdAllocator::new(element_id_seed.max(1)),
             tokens: TokenStore::new(),
-            stores: [
-                FixedStore::from_meta(StoreKind::Node, &StoreMeta::default()),
-                FixedStore::from_meta(StoreKind::Rel, &StoreMeta::default()),
-                FixedStore::from_meta(StoreKind::Prop, &StoreMeta::default()),
-                FixedStore::from_meta(StoreKind::Strings, &StoreMeta::default()),
-            ],
+            stores: ALL_STORE_KINDS.map(FixedStore::empty),
             commit_ts_hw: 0,
             active: HashMap::new(),
             catalog_dirty: false,
@@ -556,10 +583,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             unfrozen_commit_lsn.insert(committed_txn, lsn);
         }
         let mut stores = [
-            FixedStore::from_meta(StoreKind::Node, &meta.stores[0]),
-            FixedStore::from_meta(StoreKind::Rel, &meta.stores[1]),
-            FixedStore::from_meta(StoreKind::Prop, &meta.stores[2]),
-            FixedStore::from_meta(StoreKind::Strings, &meta.stores[3]),
+            FixedStore::from_meta(StoreKind::Node, &meta.stores[0])?,
+            FixedStore::from_meta(StoreKind::Rel, &meta.stores[1])?,
+            FixedStore::from_meta(StoreKind::Prop, &meta.stores[2])?,
+            FixedStore::from_meta(StoreKind::Strings, &meta.stores[3])?,
         ];
         // Re-attribute every record page the device holds back to its owning store (`rmp` #239). The
         // durable catalog persists a store's `device_pages`/`high_water` only at a *commit*; a page
@@ -844,7 +871,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // Pages already mapped by some store's committed catalog must not be re-appended.
         let mut mapped: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for s in stores.iter() {
-            for p in &s.device_pages {
+            for p in s.device_pages.iter() {
                 mapped.insert(p.0);
             }
         }
@@ -922,7 +949,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 continue;
             }
             let kind = stores[i].kind;
-            stores[i].device_pages.extend_from_slice(&store_orphans);
+            // `open` is single-threaded and no reader holds a handle yet, so appending here needs no
+            // extra ordering — `push` publishes each entry regardless (`rmp` #721).
+            for p in &store_orphans {
+                stores[i].device_pages.push(*p)?;
+            }
             // Floor the high-water so every record slot on the now-mapped pages is addressable and the
             // allocator never re-hands-out a corpse slot. `observe(n - 1)` lifts the high-water to `n`
             // without inventing a fresh id (`observe` records the largest id seen).
@@ -997,7 +1028,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 // Stop at the first slot whose page is not mapped to this store: the dense corpse run
                 // cannot cross onto an unmapped page (a spill onto a new page is already floored by
                 // `reconstruct_orphan_store_pages`).
-                let Some(pid) = store.device_pages.get(rel_page as usize).copied() else {
+                let Some(pid) = usize::try_from(rel_page)
+                    .ok()
+                    .and_then(|p| store.device_pages.get(p))
+                else {
                     break;
                 };
                 // An unreadable page (corruption) is left to `verify_on_open`; do not fail `open`.
@@ -1103,7 +1137,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // page carries no logged change yet — `flush_unlogged` (page_lsn 0, `rmp` #337).
             self.pool.flush_unlogged(f)?;
             self.pool.unpin(f);
-            self.store_mut(kind).device_pages.push(dev_page);
+            // PUBLISH the page to every reader (`rmp` #721). This is a `Release` store of the map's
+            // length, and it happens HERE — strictly before the caller writes the record content that
+            // will point into `dev_page`, and strictly before that content is published to readers by
+            // the buffer pool's per-frame latch. So a reader that can see a pointer into this page can
+            // always LOCATE it; the reverse order would resurrect the "store page N not allocated"
+            // defect this fix closes. The page is fully initialised (header seeded, `flush_unlogged`d,
+            // unpinned) before it is published, so a reader can never observe a half-built page.
+            self.store_mut(kind).device_pages.push(dev_page)?;
             // WAL-log the record page's type+subtype header word with **undo == redo** (`rmp` #239).
             //
             // The per-store device-page map (`device_pages`) is persisted only in the durable catalog at
@@ -1123,7 +1164,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             hdr[1] = kind as u8;
             self.write_region_keep(dev_page, page::OFF_PAGE_TYPE, &hdr, txn)?;
         }
-        Ok(self.store(kind).device_pages[rel_page])
+        self.store(kind).device_pages.get(rel_page).ok_or_else(|| {
+            GraphusError::Storage(format!("{kind:?} store page {rel_page} not allocated"))
+        })
     }
 
     /// Writes `bytes` at `offset` within device `page` as one WAL-logged update under `txn` with
@@ -1204,10 +1247,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     }
 
     fn device_page(&self, kind: StoreKind, rel_page: u64) -> Result<PageId> {
-        self.store(kind)
-            .device_pages
-            .get(rel_page as usize)
-            .copied()
+        usize::try_from(rel_page)
+            .ok()
+            .and_then(|p| self.store(kind).device_pages.get(p))
             .ok_or_else(|| {
                 GraphusError::Storage(format!("{kind:?} store page {rel_page} not allocated"))
             })
@@ -1381,26 +1423,40 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Timestamp(self.commit_ts_hw)
     }
 
-    /// Captures this store's per-[`StoreKind`] location metadata into an owned, `Send + Sync`
-    /// [`MetaSnapshot`] (`rmp` task #336, Slice 3a): each store's `high_water` bound + its
-    /// `device_pages` index, shared cheaply (the page lists are copied **once** here into
-    /// [`Arc<[PageId]>`]s; thereafter cloning the snapshot is a refcount bump). Call this on the engine
-    /// thread (where the store is exclusively held); the resulting snapshot drives the off-thread read
-    /// path through a [`StoreReadView`] (Slice 3b) with **no** live access to the store's mutable
-    /// fields.
+    /// Captures this store's per-[`StoreKind`] read metadata into an owned, `Send + Sync`
+    /// [`MetaSnapshot`] (`rmp` task #336, Slice 3a; corrected by `rmp` #721): each store's
+    /// **snapshotted** `high_water` bound + a **live**, shared handle on its page map. Call this on the
+    /// engine thread (where the store is exclusively held); the result drives the off-thread read path
+    /// through a [`StoreReadView`] (Slice 3b) with no `&mut` access to the store.
     ///
-    /// MVCC-superset-safe: the writer only **appends** to `device_pages` and **advances**
-    /// `high_water`, so a reader scanning `1..high_water` over this snapshot only ever indexes
-    /// already-existing, never-mutated entries; any id allocated later belongs to a writer that commits
-    /// after the reader's snapshot timestamp and is invisible anyway (visibility is decided above by
-    /// `graphus_txn::is_visible`).
+    /// # Why the page map is LIVE and the high-water is SNAPSHOTTED (`rmp` #721)
+    ///
+    /// These two are not the same kind of thing, and freezing both was the defect.
+    ///
+    /// - `high_water` is a **bound**: it delimits the id range a scan visits (`1..high_water`). It must
+    ///   be snapshotted, so a scan is not chased by a concurrent writer and so it remains an
+    ///   MVCC-superset of what the reader may legally see.
+    /// - The page map is a **location oracle**: it answers "which device page holds record id X". It
+    ///   must be LIVE, because the record *content* the reader navigates is live (the page cache is
+    ///   `Arc`-shared) and a chain walk FOLLOWS POINTERS out of that live content. A concurrently
+    ///   committed writer prepends to a chain head, so the reader can legitimately reach a record on a
+    ///   page allocated after its snapshot. Freezing the map made that read fail with
+    ///   `"{kind} store page N not allocated"` — an internal error on a legitimate read — because
+    ///   **visibility is decided ABOVE this layer**: a record the reader cannot LOCATE is never
+    ///   filtered; the walk dies first.
+    ///
+    /// Resolving against the live map is sound precisely because the map is **monotone**: pages are
+    /// only ever appended, never remapped or removed, and page growth is never undone by a rollback
+    /// (`rmp` #239). Locating a post-snapshot record is harmless — `graphus_txn::is_visible` still
+    /// filters it out above. The capture is now also strictly cheaper: one `Arc` refcount bump per
+    /// store instead of a full copy of every store's page list on every read dispatch.
     #[must_use]
     pub fn capture_read_meta(&self) -> MetaSnapshot {
         let snap = |kind: StoreKind| {
             let s = self.store(kind);
             StoreMetaSnapshot {
                 high_water: s.alloc.high_water(),
-                device_pages: Arc::from(s.device_pages.as_slice()),
+                device_pages: s.device_pages.reader(),
             }
         };
         MetaSnapshot::new([
@@ -2720,41 +2776,26 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             self.pool.unpin(f);
             r?;
         }
-        // Move out the pre-rollback page maps (no clone) ONLY now — every fallible step above
-        // (`wal.rollback`, the compensation replay) ran with `device_pages` still INTACT, so a failure
-        // there can never strand them. `reload_catalog` (the immediate next, and now the ONLY,
-        // operation that overwrites these maps) reassigns each `self.stores[i]` wholesale from the
-        // durable catalog; we re-extend the reloaded (shrunk) maps with the tail entries it dropped.
+        // The device-page maps are NOT touched here (`rmp` #721). They used to be `std::mem::take`-n
+        // out of every store, handed to `reload_catalog` (which rebuilt each store wholesale from the
+        // durable catalog, shrinking the map back to the last committed prefix), and then re-extended
+        // with the dropped tail — a dance whose successful path reconstructed *exactly* what it took,
+        // and whose failure path had to hand-restore the maps or silently destroy committed data (the
+        // seed-5043221 durability breach, `rmp` #479).
         //
-        // EXCEPTION SAFETY (`rmp` #479): if `reload_catalog` itself fails — e.g. a disk-faulted or an
-        // inconsistent durable catalog (`Meta::decode` rejecting `high_water > capacity`) — we MUST
-        // restore the taken maps before propagating. Leaving `device_pages` empty would make the next
-        // allocation map a FRESH BLANK device page over a store whose committed records live on the
-        // now-orphaned original pages, silently destroying committed data (the seed-5043221 durability
-        // breach). The pre-rollback maps are a safe superset, so restoring them keeps every committed
-        // record addressable.
-        let device_pages: [Vec<PageId>; STORE_COUNT] =
-            std::array::from_fn(|i| std::mem::take(&mut self.stores[i].device_pages));
-        if let Err(e) = self.reload_catalog() {
-            for (i, pages) in device_pages.into_iter().enumerate() {
-                self.stores[i].device_pages = pages;
-            }
-            return Err(e);
-        }
+        // Since #721 the map is an `Arc<PageMap>` shared LIVE with every off-thread reader, and that
+        // dance is not merely unnecessary but unsound: a taken map is an EMPTY map, and a reader
+        // indexing it mid-window would be told a committed record's page "is not allocated" — a worse
+        // failure than the one #721 fixes. So the hazard is removed **structurally**, not patched: the
+        // map is never taken, never emptied, never rebuilt. `reload_catalog` now PRESERVES each store's
+        // live map (page growth is never undone, and the durable catalog's map is always a prefix of
+        // it — an invariant `reload_catalog` asserts and fails closed on), so there is no window in
+        // which a reader can observe anything but the true, monotone map. Exception safety is likewise
+        // structural: a failing `reload_catalog` cannot strand a map it never moved.
+        self.reload_catalog()?;
         self.tokens = pre_tokens;
         if pre_element_next > self.element_ids.peek() {
             self.element_ids = ElementIdAllocator::new(pre_element_next);
-        }
-        // Page growth is not undone; restore the in-memory page maps that the catalog reload (from
-        // the pre-growth metadata) shrank, so already-allocated device pages stay addressable. Only
-        // the tail entries `[reloaded_len..]` were lost, so re-extend with just those.
-        for (i, pages) in device_pages.into_iter().enumerate() {
-            let reloaded_len = self.stores[i].device_pages.len();
-            if pages.len() > reloaded_len {
-                self.stores[i]
-                    .device_pages
-                    .extend_from_slice(&pages[reloaded_len..]);
-            }
         }
         // Floor each allocator at its pre-rollback high-water so a concurrent open txn's freshly
         // allocated (and possibly soon-committed) ids stay within the scanned range and are never
@@ -2969,9 +3010,62 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // point — every durable commit persisted its own timestamp — so this `max` is a no-op for the
         // pre-#529 behaviour and strictly preserves monotonicity now.)
         self.commit_ts_hw = self.commit_ts_hw.max(meta.commit_ts_hw);
+        // THE LIVE PAGE MAP IS PRESERVED — by never being touched (`rmp` #721).
+        //
+        // Every other per-store field is restored from the durable committed catalog. The page map is
+        // NOT, because:
+        //
+        // 1. **Page growth is never undone.** A device page allocated by a transaction that then aborts
+        //    stays allocated and stays attributed to its store (its type/subtype header word is
+        //    WAL-logged with `undo == redo` for exactly this reason, `rmp` #239). So the durable
+        //    catalog's map is always a PREFIX of the live map, never a correction of it: rebuilding from
+        //    it would only throw away the tail, which the caller then had to laboriously re-append.
+        // 2. **Readers hold it.** The map is shared live with every in-flight off-thread reader
+        //    (`Arc<PageMap>`). Swapping in a fresh map would strand them on one that stops growing —
+        //    resurrecting the very defect #721 fixes — and any window in which the field held an EMPTY
+        //    map (as the old `std::mem::take` + reload + re-extend dance briefly did) would tell a
+        //    reader that a committed record's page "is not allocated".
+        //
+        // Validate FIRST, mutate second, so a rejected catalog leaves every store untouched (exception
+        // safety: `rmp` #479's seed-5043221 durability breach was a rollback that failed *after* it had
+        // already dismantled the page maps).
         for (i, sm) in meta.stores.iter().enumerate() {
             let kind = self.stores[i].kind;
-            self.stores[i] = FixedStore::from_meta(kind, sm);
+            let live = &self.stores[i].device_pages;
+            // The durable-prefix invariant is load-bearing, so it is CHECKED, not assumed — and checked
+            // in RELEASE, not behind a `debug_assert`. A durable map that is longer than, or diverges
+            // from, the live map's prefix means the in-memory map lost or remapped pages a checkpoint
+            // had already persisted: memory/catalog divergence. There is no safe way to serve a store
+            // whose location oracle we cannot trust, so fail closed (`04 §4.6`). This is O(durable
+            // pages) once per rollback, against a `reload_catalog` that already decodes the whole
+            // catalog — asymptotically free.
+            if sm.device_pages.len() > live.len() {
+                return Err(GraphusError::Storage(format!(
+                    "{kind:?} store catalog maps {} device pages but the live page map has only {} — \
+                     the durable map must always be a prefix of the live one (page growth is never \
+                     undone); refusing to serve",
+                    sm.device_pages.len(),
+                    live.len()
+                )));
+            }
+            if let Some((p, dev)) = sm
+                .device_pages
+                .iter()
+                .enumerate()
+                .find(|&(p, &dev)| live.get(p) != Some(PageId(dev)))
+            {
+                return Err(GraphusError::Storage(format!(
+                    "{kind:?} store catalog maps store-relative page {p} to device page {dev}, but the \
+                     live page map has {:?} — the durable map diverged from the live map's prefix \
+                     (a device page was remapped, which must never happen); refusing to serve",
+                    live.get(p)
+                )));
+            }
+        }
+        for (i, sm) in meta.stores.iter().enumerate() {
+            // Restore ONLY the allocator and the free list. `device_pages` is left exactly as it is.
+            self.stores[i].alloc = PhysicalAllocator::restore(sm.high_water.max(1));
+            self.stores[i].free = sm.free_list.clone();
         }
         self.tokens = meta.tokens;
         // Restore the live-record cardinalities from the durable catalog (`rmp` task #79): on
@@ -4882,7 +4976,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // The catalog's continuation pages are part of the durable image too (`rmp` task #51).
         pages.extend_from_slice(&self.meta_chain);
         for s in &self.stores {
-            pages.extend_from_slice(&s.device_pages);
+            pages.extend(s.device_pages.iter());
         }
         pages
     }

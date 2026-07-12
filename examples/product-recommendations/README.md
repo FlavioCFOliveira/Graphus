@@ -152,9 +152,14 @@ GRAPHUS_TARGET_TLS_INSECURE=1 \
 `bolt+ssc://` accepts a self-signed certificate (the traffic stays encrypted; the peer is not
 authenticated) — the mode for a demo / staging box with a self-signed cert; use `bolt+s://` against a server whose cert
 chains to a public root. External-mode knobs (all optional): `RECO_EXTERNAL_LADDER` (default
-`1,2,4,8,16`), `RECO_EXTERNAL_OPS` (default `2000`), `RECO_WRITERS` (default `0`),
-`RECO_WRITE_EVERY_MS` (default `0`), `RECO_TARGET_RPS` (default `0` = closed-loop),
+`1,2,4,8,16`), `RECO_EXTERNAL_OPS` (default `2000`), `RECO_WRITERS` (default `2`),
+`RECO_WRITE_EVERY_MS` (default `20`), `RECO_TARGET_RPS` (default `0` = closed-loop),
 `RECO_MIN_OPS_PER_CLIENT` (default `150`), `RECO_AUTO_EXTEND` (default `1`).
+
+The read/write **mix is ON by default in attach mode too** (`RECO_WRITERS=2`, `run.sh`) — exactly as in
+local mode, so invariant **I6** (no read fails with an internal `Neo.DatabaseError.*` while writers
+commit underneath it) is genuinely exercised against the attached instance, not just locally. Set
+`RECO_WRITERS=0` for the pure read-only ladder.
 
 ### Profiles
 

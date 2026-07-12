@@ -86,6 +86,10 @@ pub use dwb::{DWB_EVICT_RING_SLOTS, DWB_MAX_BATCH, Dwb, DwbPageStager, dwb_devic
 /// (the server's recovery/repair tests, offline tools) can inspect on-disk page headers without a
 /// direct dependency on the buffer-pool crate.
 pub use graphus_bufpool::page;
+/// The live, append-only, lock-free device-page map behind every store's location oracle
+/// (`rmp` #721), re-exported from the leaf `graphus-pagemap` crate so callers above this crate reach it
+/// without a direct dependency.
+pub use graphus_pagemap::{PageMap, PageMapWriter};
 pub use heap::{BLOCK_PAYLOAD, HeapBlock, STRINGS_RECORD_SIZE};
 pub use idalloc::{ElementIdAllocator, FreeList, NULL_ID, PhysicalAllocator};
 pub use incremental::{

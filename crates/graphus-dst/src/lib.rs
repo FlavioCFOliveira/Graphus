@@ -47,6 +47,7 @@ pub mod misbehave;
 pub mod mix;
 pub mod mode_b_batch_size_measurement;
 pub mod model;
+pub mod reader_store_growth;
 pub mod rng;
 pub mod scenarios;
 pub mod selfloop_churn;

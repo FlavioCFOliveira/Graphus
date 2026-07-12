@@ -104,6 +104,7 @@ pub fn catalogue() -> Vec<(&'static str, Scenario)> {
         ("contended_writes", contended_writes),
         ("concurrent_supernode", concurrent_supernode),
         ("snapshot_isolation", snapshot_isolation),
+        ("reader_vs_store_growth", reader_vs_store_growth),
         // Property / secondary index (rmp #461)
         ("property_index_oracle", property_index_oracle),
         // Atomicity / churn
@@ -670,6 +671,36 @@ pub struct DegreeOutcome {
     pub committed: i64,
     /// The hub's persisted out-edge count after all commits (must equal `committed`, never 0).
     pub fanout: Option<i64>,
+}
+
+/// **A reader must never fail a legitimate read because a writer grew the store under it**
+/// (`rmp` #721) — the off-thread reader pool's location-oracle race.
+///
+/// The reader captures its view (the `read_task_inputs` dispatch instant), the writer then commits a
+/// paced `CREATE (u)-[:PURCHASED]->(p)` + `SET p.hot = …` mix that grows every store and re-points the
+/// hub's rel/prop chain heads at records on **newly allocated pages**, and the reader — still on its
+/// pre-growth view — runs a traversal battery through it.
+///
+/// Asserts both halves of the contract, because fixing one by breaking the other would be worse than
+/// the bug:
+///
+/// 1. **Location** — no read fails (`"{kind} store page N not allocated"` is the defect; it surfaced
+///    to clients as `Neo.DatabaseError.General.UnknownError`).
+/// 2. **Isolation** — the records the reader can now LOCATE past its snapshot stay INVISIBLE to it:
+///    filtered by `is_visible` against its own snapshot + `CommitRegistry`, it sees exactly the
+///    pre-snapshot committed state, and its `scan_*` bound stays snapshotted.
+///
+/// Non-vacuous by construction: the run fails if the writer did not actually add store pages after the
+/// reader's snapshot (there would be nothing to index past).
+///
+/// See [`crate::reader_store_growth`] for the full root-cause analysis.
+fn reader_vs_store_growth(seed: u64) -> ScenarioOutcome {
+    let r = crate::reader_store_growth::run_reader_vs_store_growth(seed);
+    if r.ok() {
+        ScenarioOutcome::pass("reader_vs_store_growth", r.detail())
+    } else {
+        ScenarioOutcome::fail("reader_vs_store_growth", r.detail())
+    }
 }
 
 /// **Reusable `#220` supernode degree sweep (rmp #462, F-DST-5).** Promotes the previously-hardcoded
