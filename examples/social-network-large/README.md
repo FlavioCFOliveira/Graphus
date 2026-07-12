@@ -112,9 +112,80 @@ latency from queueing, or `1,2,4,8,16,32` to chase the knee), `SOCIAL_WRITERS` /
 | 3 | **A production search schema** | RANGE (`USER.id`, `ARTICLE.id`), **TEXT** + **FULLTEXT** over `ARTICLE.name`, a **relationship RANGE** on `LIKE.date`, a **composite** node index, the always-on **LOOKUP** token indexes, and an **existence constraint** on `ARTICLE.name` — declared over the wire and asserted `ONLINE`. |
 | 4 | **A concurrent read battery** | Eight families — direct friends, **friend-of-friend**, **mutual friends**, **top-liked** (aggregation + `ORDER BY` + `LIMIT`), degree, **TEXT `CONTAINS`**, **`LIKE.date` range**, and **FULLTEXT** `queryNodes` — driven by C simultaneous Bolt clients. |
 | 5 | **Read scaling across cores** | The **server process** is sampled per-thread from `/proc` at each rung, so the report shows core utilisation and busy-thread count **vs C**. |
-| 6 | **Readers under live writers** | With `SOCIAL_WRITERS`, low-rate writer threads commit while readers run, so the read path is measured under MVCC/SSI contention rather than on a frozen graph. |
+| 6 | **A production-shaped read/write MIX, ON BY DEFAULT** | Every rung runs **twice** — writers off (control), then writers on (treatment) — so the **cost of the mix** is measured and six concurrency **invariants** are asserted. See [The read/write mix](#the-readwrite-mix). `SOCIAL_WRITERS=0` restores the read-only ladder. |
 | 7 | **Supernode traversal** | The `zipf` mode grows a heavy-tailed hub structure and runs the same battery over it. |
 | 8 | **Explicit evidence** | A schema-versioned `report.json` + `report.md`: the per-rung scaling curve, real p50/p99/p99.9 per family, server CPU/RSS, and the **decomposed** on-disk footprint. |
+
+## The read/write mix
+
+**The default run is a MIX** (`rmp` #714). Before this, the default drove a read-only ladder against a
+**frozen** graph — which cannot exercise one single thing Graphus's concurrency design exists for: MVCC
+snapshot-isolation reads that neither abort writers nor are aborted by them, the off-thread reader pool,
+SSI for writers, or the GC pin a long reader holds. It measured the one workload nobody runs.
+
+Every rung is now driven **twice, back to back, against the same graph**: arm `readonly` (the CONTROL,
+writers off) and then arm `mixed` (the TREATMENT, writers on — the default, and the source of every
+headline figure). The control runs **first**, warming the buffer pool for the treatment, so the measured
+cost of the mix is a conservative **lower bound**.
+
+The writers are a **trickle, not a storm**: 2 writers, one business unit every 20 ms, each driven
+through **managed retry** (bounded exponential backoff + jitter — what `session.execute_write` does in
+every official driver). 25% of the units read-modify-write one of 4 *trending* articles
+(`SET a.hot = coalesce(a.hot,0)+1`); the rest touch a random user's `registered` timestamp. Both shapes
+are property `SET`s on existing nodes, so the mix changes property **values** but never the element
+**population** — which is why this example can still honestly report `storage.bytes_per_node` (the
+dataset counts still describe the graph the store image holds).
+
+### Two layers of truth, never conflated
+
+The read and write vectors are **never** spliced into one number (the defect fixed in `rmp` #715):
+
+- `throughput.*` is **the READ vector** — one coherent population, the reads of the mixed arm's best
+  rung. `throughput.abort_rate` is therefore the **read** abort rate: a genuinely *measured* `0.0`,
+  because an auto-commit read runs at **Snapshot Isolation** and *cannot* abort (invariant I1).
+- The **WRITE vector** lives in `metadata.workload`, split into the **ENGINE** layer
+  (`engine_txn_attempts` / `engine_txn_aborts` / `engine_abort_rate`) and the **APPLICATION** layer
+  (`write_units` / `write_committed` / `write_commit_rate`). A high engine abort rate *with* a full
+  application commit rate is a **healthy** system under contention: the cost is **latency**
+  (`write_p99_ms`, retry-inclusive), never lost work.
+
+### The cost of the mix (measured, 16-core idle host, `fast` profile)
+
+| clients | control (writers off) | mixed (writers on) | cost of the mix | writes committed |
+|---:|---:|---:|---:|---:|
+| 1 | 275.9 ops/s | 289.5 ops/s | +4.9% | 474 |
+| 2 | 509.0 ops/s | 529.1 ops/s | +3.9% | 258 |
+| 4 | 973.0 ops/s | 975.5 ops/s | +0.3% | 140 |
+| 8 | 1647.2 ops/s | 1643.6 ops/s | −0.2% | 82 |
+
+Serving a production-shaped write stream underneath this read ladder is **essentially free** — the
+deltas sit inside run-to-run noise — while the writers commit **100%** of their business units
+(`write_commit_rate = 1.0`, 0 retry-budget exhaustions). A read-only ladder can produce **none** of this.
+
+### The invariants it asserts
+
+A violation **fails the run**. None is a performance threshold; they are statements that must be **true**.
+
+| | invariant |
+|---|---|
+| **I1** | **Reads never abort** (auto-commit reads run at Snapshot Isolation). |
+| **I2** | **Writers make progress** — commit rate `1.0`, zero retry-budget exhaustions (no livelock). |
+| **I3** | **Readers are not starved by writers** — every mixed rung drains its full read budget and stays above a liveness floor vs its own control. |
+| **I4** | **A serialization abort stays retryable** — the `rmp` #612 detector. |
+| **I5** | **A slow reader does not stall the writers** — the GC pin (`rmp` #551). |
+| **I6** | **No read ever fails with an internal server error** (`Neo.DatabaseError.*`). |
+
+Two honesty notes, because a gate that cannot fire is worse than no gate:
+
+- **I4 is currently armed but idle.** At the production-shaped default the writers rarely collide, so
+  the measured engine abort rate is **~0** (0 aborts in 1238 attempts). With no abort to classify it
+  **verifies nothing** on a default run — and it says exactly that in its own output instead of printing
+  a reassuring pass. Raise `--writers` / lower `--write-every-ms` / lower `--hot-keys` to exercise it.
+- **I6 fails intermittently, and it is meant to.** Turning the mix on exposed a real server bug, filed as
+  **`rmp` #721**: an off-thread reader intermittently cannot locate a record (`Prop/Rel store page N not
+  allocated`) while a writer **grows** the store, because its location oracle is a *snapshot* while the
+  record content it navigates is *live*. The writers-off control arm of the same ladder is **clean at
+  every rung** — which is exactly why a read-only ladder could never have found it.
 
 ## The evidence it collects
 

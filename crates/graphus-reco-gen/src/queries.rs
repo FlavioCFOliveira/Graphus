@@ -122,6 +122,25 @@ pub const READ_BATTERY: &[QuerySpec] = &[
 pub const WRITE_PURCHASE: &str = "MATCH (u:User {id: $uid}), (p:Product {id: $pid}) \
                                   CREATE (u)-[:PURCHASED {ts: $ts, qty: 1}]->(p)";
 
+/// The scenario's **hot** write shape (`rmp` #714): a **read-modify-write** of a *trending* product's
+/// view counter — `hot = coalesce(hot, 0) + 1` — over a deliberately **small** set of products.
+///
+/// This is the shape that lets SSI (and therefore the driver's retry path) fire at all.
+/// [`WRITE_PURCHASE`] always lands on a random `(user, product)` pair, so concurrent writers
+/// essentially never touch the same key. Two concurrent read-modify-writes of the *same* node, by
+/// contrast, are exactly the rw-antidependency cycle SSI exists to break.
+///
+/// **Measured, do not over-claim:** at the production-shaped default (2 writers, one unit every 20 ms)
+/// the writers still rarely overlap on the same trending product, and the engine abort rate comes out
+/// at a measured **~0**. The retry path is therefore *armed but idle* on a default run — see
+/// [`crate::mix::WriteKind`] and invariant I4, which report that plainly instead of implying SSI was
+/// stressed. Raise `--writers` / lower `--write-every-ms` / lower `--hot-keys` to exercise it.
+///
+/// Parameter: `$id` (a `:Product(id)`, an index seek — so the conflict is on the *node version*, not
+/// on a scan).
+pub const WRITE_PRODUCT_HOT: &str =
+    "MATCH (p:Product {id: $id}) SET p.hot = coalesce(p.hot, 0) + 1";
+
 /// The total selection weight of the read battery (sum of every family's `weight`).
 #[must_use]
 pub fn total_weight() -> u32 {
@@ -199,5 +218,15 @@ mod tests {
     fn write_shape_is_a_single_purchase_create() {
         assert!(WRITE_PURCHASE.contains("CREATE (u)-[:PURCHASED"));
         assert!(WRITE_PURCHASE.contains("$uid") && WRITE_PURCHASE.contains("$pid"));
+    }
+
+    /// The hot write must be a genuine READ-MODIFY-WRITE of a single indexed node: that is the only
+    /// shape that produces the rw-antidependency SSI aborts on (rmp #714). A blind `SET p.hot = 1`
+    /// would not read the old value and would not conflict.
+    #[test]
+    fn hot_write_is_an_indexed_read_modify_write() {
+        assert!(WRITE_PRODUCT_HOT.contains("(p:Product {id: $id})"));
+        assert!(WRITE_PRODUCT_HOT.contains("coalesce(p.hot, 0) + 1"));
+        assert!(WRITE_PRODUCT_HOT.contains("SET p.hot"));
     }
 }

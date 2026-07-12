@@ -15,26 +15,47 @@
 //! read-decode methods depend on **only three things**:
 //!
 //! 1. `pool` — already an [`Arc<ConcurrentBufferPool>`], accessed through `&self` (Slice 1);
-//! 2. `device_page(kind, rel_page)` — a **pure index** into a store's `device_pages: Vec<PageId>`
-//!    (`store.rs::device_page`: `.get(rel_page).copied()`, **no** fault-in, **no** mutation);
-//! 3. `alloc.high_water()` — the scan / cycle-guard upper bound.
+//! 2. `device_page(kind, rel_page)` — a **pure lookup** in a store's page map ([`graphus_pagemap`]:
+//!    **no** fault-in, **no** mutation);
+//! 3. `alloc.high_water()` — the scan upper bound.
 //!
-//! The single writer only ever **appends** to `device_pages` and **advances** `high_water`. So a
-//! reader that captures `(high_water, device_pages snapshot)` at dispatch and scans `1..high_water`
-//! only ever indexes **already-existing, never-mutated** entries. This is MVCC-superset-safe: any id
-//! allocated after the snapshot belongs to a writer that commits *after* the reader's snapshot
-//! timestamp, so it is invisible anyway — visibility is still decided **above** this layer by
-//! `graphus_txn::is_visible` against the reader's own cloned `CommitRegistry`, exactly as before.
+//! # What a read view snapshots, and what it does NOT (`rmp` #721)
+//!
+//! An owned read view freezes the **scan bound** and shares the **location oracle** live. That
+//! asymmetry is the whole correctness argument, and getting it wrong was a production defect:
+//!
+//! - **`high_water` is SNAPSHOTTED.** It bounds the id range a scan visits (`1..high_water`), so it
+//!   must not be chased by a concurrent writer. This is MVCC-superset-safe: any id allocated after the
+//!   capture belongs to a writer that commits *after* the reader's snapshot timestamp, so it is
+//!   invisible anyway — visibility is decided **above** this layer by `graphus_txn::is_visible`
+//!   against the reader's own cloned `CommitRegistry`.
+//!
+//! - **The page map is LIVE.** The original design froze it too, on the argument that "the writer only
+//!   appends, so a reader scanning `1..high_water` only ever indexes already-existing entries; any id
+//!   allocated later is invisible anyway". That argument is true for **scans** and false for **chain
+//!   walks** — and the reader does both. A chain walk FOLLOWS POINTERS (`node.first_rel`,
+//!   `node.first_prop`, `prop.next_prop`, `HeapBlock::next_block`) read out of the **live**,
+//!   in-place-updated record content this view shares through the page cache. A concurrently committed
+//!   writer prepends its new record to a chain head, so the reader legitimately reaches a record on a
+//!   page allocated after its capture. The "invisible anyway" clause cannot save it, because
+//!   **visibility is decided ABOVE the location oracle**: a record the reader cannot LOCATE is never
+//!   filtered — the walk dies first, with `"{kind} store page N not allocated"` surfacing to the client
+//!   as an internal server error (`Neo.DatabaseError.*`).
+//!
+//! Resolving against the live map is sound because the map is **monotone** (append-only; never
+//! remapped, never shrunk, never undone by a rollback), and it costs nothing: capture is now four
+//! `Arc` refcount bumps instead of a deep copy of every store's page list *per read dispatch*. See
+//! [`graphus_pagemap`] for the structure and its publication ordering.
 //!
 //! # One decode impl, no duplication
 //!
 //! The decode bodies live here once, as free functions taking borrows
 //! `(pool, pages: &impl StorePages, …)`. Both the existing [`RecordStore`](crate::store::RecordStore)
 //! `&self` read methods **and** [`StoreReadView`] delegate to them. The [`StorePages`] trait abstracts
-//! "give me this store's `device_page` and `high_water`": `RecordStore` implements it by borrowing
-//! `&self.stores` **directly** (so the hot read path allocates / clones **nothing** per call — the
-//! Slice-1 single-thread tax is not increased), while [`MetaSnapshot`] implements it over its owned,
-//! `Arc`-shared page lists.
+//! "give me this store's `device_page`, `high_water` and live page count": `RecordStore` implements it
+//! by borrowing `&self.stores` **directly** (so the hot read path allocates / clones **nothing** per
+//! call), while [`MetaSnapshot`] implements it over its snapshotted bounds and `Arc`-shared live page
+//! maps.
 
 use std::sync::Arc;
 
@@ -42,6 +63,7 @@ use graphus_bufpool::ConcurrentBufferPool;
 use graphus_core::error::{GraphusError, Result};
 use graphus_core::{PageId, Value};
 use graphus_io::BlockDevice;
+use graphus_pagemap::PageMap;
 use graphus_wal::LogSink;
 
 use crate::heap::{HeapBlock, STRINGS_RECORD_SIZE};
@@ -58,20 +80,30 @@ use crate::{labels, valenc};
 /// The page cache type the read path goes through, shared behind an [`Arc`] (Slice 1).
 type Pool<D, S> = ConcurrentBufferPool<D, SharedWal<S>>;
 
-/// A read-only projection of one fixed-record store's location metadata: everything the decode path
-/// needs to map a record id to a device page and to bound a scan (`rmp` #336, Slice 3a).
+/// A read-only projection of one fixed-record store's read metadata: everything the decode path needs
+/// to map a record id to a device page and to bound a scan (`rmp` #336, Slice 3a; corrected by
+/// `rmp` #721).
 ///
-/// `device_pages` is held as an [`Arc<[PageId]>`] so cloning a whole [`MetaSnapshot`] is a refcount
-/// bump per store (four bumps), never a `Vec` copy. The list is the writer's `device_pages` captured
-/// at one instant; because the writer only ever **appends** to it, every index this snapshot can name
-/// stays valid for the snapshot's lifetime.
+/// The two fields are deliberately of **different kinds**, and conflating them was the #721 defect:
+///
+/// - `high_water` is **snapshotted** — it is a *bound* on a scan's id range, and must not be chased by
+///   a concurrent writer while the scan runs.
+/// - `device_pages` is **live** — it is the *location oracle*, and the record content it locates is
+///   itself live (the page cache is `Arc`-shared). A chain walk follows pointers out of live,
+///   in-place-updated content and can therefore legitimately reach a record on a page allocated after
+///   this capture. A frozen map answered "not allocated" for such a page, failing a legitimate read
+///   with an internal error; visibility is decided ABOVE this layer, so a record that cannot be
+///   LOCATED is never filtered — the walk dies first. See [`graphus_pagemap`].
+///
+/// Both fields are cheap: cloning a whole [`MetaSnapshot`] is four `Arc` refcount bumps and four `u64`
+/// copies — no page-list copy at all (before #721, capture deep-copied every store's page list on
+/// *every read dispatch*).
 #[derive(Debug, Clone)]
 pub struct StoreMetaSnapshot {
-    /// The store's id high-water mark at capture: the scan upper bound (`1..high_water`) and the
-    /// chain-walk cycle guard (`high_water + 1`).
+    /// The store's id high-water mark **at capture**: the scan upper bound (`1..high_water`).
     pub high_water: u64,
-    /// The store-relative-page → device-`PageId` map at capture, shared cheaply across clones.
-    pub device_pages: Arc<[PageId]>,
+    /// A shared handle on the store's **live**, append-only page map (`rmp` #721).
+    pub device_pages: Arc<PageMap>,
 }
 
 /// An owned, `Send + Sync + Clone` snapshot of a store's per-[`StoreKind`] location metadata
@@ -90,8 +122,8 @@ pub struct MetaSnapshot {
 
 // `rmp` #336, Slice 3a: the metadata snapshot must be `Send + Sync` so Slice 3b can move it to a
 // reader thread. A compile-time assertion (no runtime body) — it fails to build the moment a
-// non-`Sync` field is introduced. `Arc<[PageId]>` is `Send + Sync` (`PageId` is `Copy` POD) and
-// `u64` is, so the auto derivation holds with no `unsafe impl`.
+// non-`Sync` field is introduced. `Arc<PageMap>` is `Send + Sync` (the map is built from atomics and
+// `OnceLock`, `rmp` #721) and `u64` is, so the auto derivation holds with no `unsafe impl`.
 const _: () = {
     fn assert_send_sync<T: Send + Sync>() {}
     fn assert_meta_snapshot() {
@@ -125,18 +157,42 @@ pub trait StorePages {
     /// The device page backing store-relative page `rel_page` of `kind`, or a storage error if that
     /// page is not allocated (the same error `RecordStore::device_page` returns). A **pure** lookup:
     /// no fault-in, no mutation.
+    ///
+    /// **Live** (`rmp` #721): resolves against the store's current, monotone page map, so a chain walk
+    /// that legitimately reaches a record on a page allocated after the reader's snapshot can still
+    /// LOCATE it. Whether that record is *visible* is decided above this layer.
     fn device_page(&self, kind: StoreKind, rel_page: u64) -> Result<PageId>;
 
-    /// `kind`'s id high-water mark: the scan upper bound and the chain-walk cycle guard.
+    /// `kind`'s id high-water mark: the **scan** upper bound (`1..high_water`). Snapshotted for an
+    /// owned read view, so a scan is not chased by a concurrent writer.
     fn high_water(&self, kind: StoreKind) -> u64;
+
+    /// The number of device pages `kind`'s store currently maps — **live** and monotone.
+    ///
+    /// This is the chain-walk cycle guard's bound (`rmp` #721). It must be live, not the snapshotted
+    /// `high_water`: a chain walk reads LIVE content, so a concurrent writer prepending to a chain head
+    /// can legitimately make the walk take more steps than the reader's snapshot high-water allows —
+    /// which a `high_water`-derived guard would misreport as a malformed chain (a *cycle*). The number
+    /// of allocated record slots (`mapped_page_count * records_per_page`) is the true upper bound on the
+    /// length of any acyclic chain, it is always `>= high_water` (the catalog's
+    /// `high_water <= addressable capacity` invariant, `rmp` #479), and it grows with the writer — so it
+    /// can never false-positive on a legitimate walk while still terminating any genuine cycle.
+    fn mapped_page_count(&self, kind: StoreKind) -> u64;
+}
+
+/// The upper bound on the number of records `kind`'s store can currently address: the live number of
+/// mapped device pages times the records each page holds. Bounds any acyclic chain walk (`rmp` #721).
+fn slot_capacity<P: StorePages>(pages: &P, kind: StoreKind) -> u64 {
+    pages
+        .mapped_page_count(kind)
+        .saturating_mul(paging::records_per_page(kind.record_size()) as u64)
 }
 
 impl StorePages for MetaSnapshot {
     fn device_page(&self, kind: StoreKind, rel_page: u64) -> Result<PageId> {
-        self.store(kind)
-            .device_pages
-            .get(rel_page as usize)
-            .copied()
+        usize::try_from(rel_page)
+            .ok()
+            .and_then(|p| self.store(kind).device_pages.get(p))
             .ok_or_else(|| {
                 GraphusError::Storage(format!("{kind:?} store page {rel_page} not allocated"))
             })
@@ -144,6 +200,10 @@ impl StorePages for MetaSnapshot {
 
     fn high_water(&self, kind: StoreKind) -> u64 {
         self.store(kind).high_water
+    }
+
+    fn mapped_page_count(&self, kind: StoreKind) -> u64 {
+        self.store(kind).device_pages.len() as u64
     }
 }
 
@@ -240,7 +300,10 @@ pub fn read_chain<D: BlockDevice, S: LogSink, P: StorePages>(
 ) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut cur = head;
-    let guard = pages.high_water(StoreKind::Strings) + 1;
+    // LIVE bound (`rmp` #721): a concurrent writer can grow the strings heap under this walk, so the
+    // guard must be the live slot capacity, not the reader's snapshotted high-water (which a legitimate
+    // live walk can now exceed). See `StorePages::mapped_page_count`.
+    let guard = slot_capacity(pages, StoreKind::Strings) + 1;
     let mut steps = 0u64;
     while cur != NULL_ID {
         steps += 1;
@@ -541,7 +604,8 @@ fn collect_prop_chain<D: BlockDevice, S: LogSink, P: StorePages>(
 ) -> Result<Vec<(u64, PropRecord)>> {
     let mut out = Vec::new();
     let mut cur = first_prop;
-    let guard = pages.high_water(StoreKind::Prop) + 1;
+    // LIVE bound (`rmp` #721) — see `StorePages::mapped_page_count`.
+    let guard = slot_capacity(pages, StoreKind::Prop) + 1;
     let mut steps = 0u64;
     while cur != NULL_ID {
         steps += 1;
@@ -595,7 +659,9 @@ pub fn incident_rels<D: BlockDevice, S: LogSink, P: StorePages>(
     let node = read_node(pool, pages, node_id)?;
     let mut out = Vec::new();
     let mut cur = node.first_rel;
-    let guard = 2 * pages.high_water(StoreKind::Rel) + 2;
+    // LIVE bound (`rmp` #721) — see `StorePages::mapped_page_count`. The `2 *` accounts for a self-loop
+    // being threaded into the chain twice.
+    let guard = 2 * slot_capacity(pages, StoreKind::Rel) + 2;
     let mut steps = 0u64;
     let mut prev_link = NULL_ID;
     while cur != NULL_ID {
@@ -656,7 +722,9 @@ pub fn incident_rels_typed<D: BlockDevice, S: LogSink, P: StorePages>(
     let node = read_node(pool, pages, node_id)?;
     let mut out: Vec<(u64, RelRecord)> = Vec::new();
     let mut cur = node.first_rel;
-    let guard = 2 * pages.high_water(StoreKind::Rel) + 2;
+    // LIVE bound (`rmp` #721) — see `StorePages::mapped_page_count`. The `2 *` accounts for a self-loop
+    // being threaded into the chain twice.
+    let guard = 2 * slot_capacity(pages, StoreKind::Rel) + 2;
     let mut steps = 0u64;
     let mut prev_link = NULL_ID;
     while cur != NULL_ID {

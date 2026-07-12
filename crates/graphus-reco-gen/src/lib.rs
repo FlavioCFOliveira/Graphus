@@ -99,6 +99,13 @@ pub mod client;
 /// read-battery family-index lookup — all unit-testable without a running server.
 pub mod bench;
 
+/// The **read/write mix** seam shared by the over-the-wire example drivers (`rmp` #714): abort
+/// classification (including the `rmp` #612 regression detector), managed retry with bounded
+/// exponential backoff, the two-layer [`mix::WriteVector`] (engine contention vs application outcome),
+/// the [`mix::ReadInvariant`] (an auto-commit read runs at SI and can never abort), and the paired
+/// control/treatment [`mix::Arm`]s that measure what the mix COSTS.
+pub mod mix;
+
 /// The production-realistic **read-path schema** the example declares after the bulk load — a NODE KEY
 /// + UNIQUE identity pair, a `price` property-type constraint, a `TEXT` name index, and a `VECTOR`
 /// (HNSW) embedding index — as a single shared DDL block so `reco_load` and the hermetic server mirror

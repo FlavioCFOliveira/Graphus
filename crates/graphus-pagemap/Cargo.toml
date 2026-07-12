@@ -1,0 +1,34 @@
+[package]
+name = "graphus-pagemap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Live, append-only, lock-free store-relative-page to device-page map for the Graphus record stores."
+
+[dependencies]
+graphus-core = { path = "../graphus-core" }
+
+# `loom` model-checks the page map's publication ordering (`rmp` #721). It is needed by the *library*
+# (via `src/sync.rs`) only when compiled with `--cfg loom`, so it is gated on that cfg and never enters
+# a production build.
+#
+# This is a LEAF crate — it depends on `graphus-core` alone, deliberately. `--cfg loom` is a global
+# RUSTFLAG, so it also flips `graphus-bufpool`'s own loom seam; a page map living inside
+# `graphus-storage` (which depends on bufpool) therefore could not be model-checked at all, because
+# storage's `std::sync::Arc` would no longer match bufpool's `loom::sync::Arc` signatures. Keeping the
+# structure in a crate with no bufpool edge is what makes the model check possible:
+#
+#   RUSTFLAGS="--cfg loom" cargo test -p graphus-pagemap --test loom_pagemap --release
+[target.'cfg(loom)'.dependencies]
+loom = "0.7.2"
+
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7.2"
+
+# `loom` is a known custom cfg the crate sets via RUSTFLAGS; register it so `unexpected_cfgs` does not
+# warn on the `#[cfg(loom)]` arms in `src/sync.rs`.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
