@@ -283,6 +283,36 @@ pub trait LogSink {
     /// write that finds the active segment at or over the new size — and never rewrites, splits or
     /// truncates any already-written segment, so it is durability-neutral.
     fn set_segment_target(&mut self, _target_bytes: u64) {}
+
+    /// Whether a [`WalManager`](crate::WalManager) over this sink must retain the **in-memory undo
+    /// back-chain** of its active transactions (`rmp` #724).
+    ///
+    /// The manager keeps, per active transaction, one owned undo image (the pre-image patch) for every
+    /// [`log_update`](crate::WalManager::log_update) — the buffer a **live rollback** replays and a
+    /// **crash-recovery** loser-undo relies on (steal/no-force, `§4`). For a real, recoverable log this
+    /// retention is load-bearing and this method returns `true` (the default): **every durable sink
+    /// keeps it, so the durable/crash-safe path is byte-for-byte unchanged.**
+    ///
+    /// A sink whose log is **never recovered and never rolled back** — the [`DiscardingLogSink`] that
+    /// backs the derived, ephemeral secondary-index trees (rebuilt from the record store on open; an
+    /// abort reverts only the durable store, never these in-memory structures) — has no use for that
+    /// chain: it is pure, unbounded overhead. Such a sink returns `false`, and the manager then does
+    /// **not** retain the per-update undo image. This is exactly what closes `rmp` #724: an index build
+    /// logs one full-page (~8 KiB) undo patch per inserted entry into a transaction that is never
+    /// committed, so the chain grew ~8 KiB per element and was held for the life of the process (a
+    /// 60k-relationship index cost ~445 MB of RSS). Dropping the retention for the discarding sink makes
+    /// the resident cost proportional to the packed B+-tree pages (a few MB), not to the entry count.
+    ///
+    /// # Safety of returning `false`
+    ///
+    /// Sound **only** when the log is provably never used for undo: (1) no live
+    /// [`rollback`](crate::WalManager::rollback) ever walks the chain, and (2) the log is never fed to
+    /// [`crate::recover`]. Both hold for the discarding index WAL by construction. Returning `false`
+    /// from a recoverable sink would lose the ability to undo losers on crash — an ACID violation —
+    /// which is why the default is `true` and only [`DiscardingLogSink`] overrides it.
+    fn retains_undo(&self) -> bool {
+        true
+    }
 }
 
 /// In-memory [`LogSink`] for Deterministic Simulation Testing. Un-synced appends live in
@@ -699,6 +729,17 @@ impl LogSink for DiscardingLogSink {
             into[..len].copy_from_slice(&self.head[from as usize..]);
         }
         Ok(())
+    }
+
+    /// This log is **never recovered and never rolled back** (the derived, ephemeral index trees rebuild
+    /// from the record store on open; an abort reverts only the durable store). Retaining the manager's
+    /// in-memory undo back-chain would therefore accumulate one full-page (~8 KiB) undo image per index
+    /// insert, held for the life of the process, for a chain nothing ever reads — the root cause of the
+    /// per-element index memory bomb (`rmp` #724). Opting out keeps the derived-index resident cost
+    /// proportional to its packed B+-tree pages instead of to its entry count. Sound because both undo
+    /// consumers are absent here (see [`LogSink::retains_undo`]).
+    fn retains_undo(&self) -> bool {
+        false
     }
 }
 

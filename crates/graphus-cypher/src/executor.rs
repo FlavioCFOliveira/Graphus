@@ -1288,6 +1288,97 @@ fn expand_into_pending(
     Ok(())
 }
 
+/// Bounds the total heap a **single base row's** variable-length / quantified-path expansion may
+/// accumulate into `pending`, extending the shared per-value byte budget
+/// ([`crate::value_size::max_value_bytes`], `rmp` #489 / #491 / `SEC-191`) to the trail-path queue
+/// (`rmp` #656, the combinatorial vector — mirrors the `rmp` #550 breadth budget for decoded
+/// collections).
+///
+/// A variable-length `*`/`+` or quantified-path walk over a **dense** (near-complete) graph
+/// enumerates a super-polynomial number of trail (relationship-unique) paths, each materialised as a
+/// full [`Row`] pushed into the operator's `pending` [`VecDeque`]. Left uncapped that is a
+/// memory-exhaustion DoS: one crafted query grows `pending` until it OOMs the per-database engine
+/// thread — every database that thread hosts dies with it. This budget charges each emitted row's
+/// estimated footprint against the same configurable ceiling the value builders use, so the expansion
+/// is rejected with a clean, typed [`EvalError::ResourceLimit`] the instant it would cross the budget
+/// — never allocating the over-budget queue. Semantics are unchanged for any expansion that fits: the
+/// openCypher trail paths a legitimate query returns are far below the 256 MiB default, and the
+/// regression suite lowers the ceiling (via `BudgetOverride`) to measure the boundary cheaply.
+struct PendingBudget {
+    /// Estimated bytes charged so far across this base row's expansion.
+    charged: usize,
+    /// The effective ceiling, snapshot once at construction (a single `Relaxed` load; the override is
+    /// a per-scope test/config knob, never changed mid-expansion).
+    cap: usize,
+}
+
+impl PendingBudget {
+    fn new() -> Self {
+        Self {
+            charged: 0,
+            cap: crate::value_size::max_value_bytes(),
+        }
+    }
+
+    /// Charges `row`'s estimated in-memory footprint against the budget, returning a typed
+    /// [`EvalError::ResourceLimit`] once the running total for this expansion would exceed the ceiling.
+    /// The estimate short-circuits per value at the ceiling, so a pathological row is detected in
+    /// `O(budget)` work; the running total is checked *before* the row is enqueued, so the over-budget
+    /// row is never retained.
+    fn charge(&mut self, row: &Row) -> Result<(), ExecError> {
+        let bytes = row.values().iter().fold(0usize, |acc, v| {
+            acc.saturating_add(crate::value_size::estimate_rowvalue_bytes(v))
+        });
+        self.charged = self.charged.saturating_add(bytes);
+        if self.charged > self.cap {
+            return Err(ExecError::Eval(EvalError::ResourceLimit {
+                detail: format!(
+                    "variable-length / quantified-path expansion exceeds the per-query materialisation budget of {} bytes",
+                    self.cap
+                ),
+            }));
+        }
+        Ok(())
+    }
+}
+
+/// One frame of the iterative variable-length trail walk (`rmp` #656): a node to visit at a given
+/// depth, its resolved incident relationships, and the cursor / self-loop-dedup state the walk pops
+/// and repushes as it descends and backtracks. Replacing the former recursion with a heap-allocated
+/// stack of these frames moves the walk's depth off the (finite) native thread stack, so an
+/// arbitrarily long chain uses `O(1)` native stack and can never overflow it.
+struct VarExpandFrame {
+    /// Hop count from the anchor to this node (the trail length so far).
+    depth: u64,
+    /// The node this frame is visiting.
+    current: NodeId,
+    /// `None` until the frame is first visited (emit + resolve incidents); `Some` once its incident
+    /// relationships have been fetched.
+    incidents: Option<Vec<crate::graph_access::Incident>>,
+    /// Cursor into `incidents` for the next candidate relationship.
+    idx: usize,
+    /// Self-loop dedup: a relationship reported once per side is considered at most once here (the
+    /// per-node set the recursion allocated fresh per call).
+    seen_rel: rustc_hash::FxHashSet<RelId>,
+    /// Whether this frame currently holds a `trail` entry pushed for an in-progress child descent (to
+    /// be popped when the frame resurfaces after that child's subtree completes).
+    pushed: bool,
+}
+
+impl VarExpandFrame {
+    /// A fresh frame entering `current` at `depth` (not yet visited: `incidents` unresolved).
+    fn enter(depth: u64, current: NodeId) -> Self {
+        Self {
+            depth,
+            current,
+            incidents: None,
+            idx: 0,
+            seen_rel: rustc_hash::FxHashSet::default(),
+            pushed: false,
+        }
+    }
+}
+
 /// Expands one base row's **variable-length** pattern (`-[r:T*m..n]->`) into `pending`: a
 /// depth-first enumeration of the trails (relationship-unique walks, openCypher uniqueness) from
 /// the anchor whose hop count lies in `[min, max]`. Each produced row binds the relationship
@@ -1296,7 +1387,10 @@ fn expand_into_pending(
 /// `min` of 0 admits the zero-length trail (the anchor itself, an empty relationship list).
 ///
 /// Trail semantics bound the search depth by the relationship count, so an unbounded `*`
-/// terminates on any graph (cycles included).
+/// terminates on any graph (cycles included). The walk is **iterative** (an explicit heap stack of
+/// [`VarExpandFrame`]s, `rmp` #656): a long chain recurses `O(path length)` deep, which overflowed the
+/// finite worker-thread stack and aborted the whole process — the heap stack removes that failure mode
+/// entirely, and a [`PendingBudget`] bounds the trail-path materialisation.
 #[allow(clippy::too_many_arguments)]
 fn var_expand_into_pending(
     base: &Row,
@@ -1328,53 +1422,72 @@ fn var_expand_into_pending(
     let forbidden = used_relationships(base, prior_rels);
     let dir = ExpandDirection::from_pattern(direction);
     let min = range.min.unwrap_or(1);
+    let max = range.max;
 
-    // The DFS worker: `trail` is the relationship stack (ids, traversal order).
-    #[allow(clippy::too_many_arguments)]
-    fn dfs(
-        depth: u64,
-        current: NodeId,
-        trail: &mut Vec<crate::graph_access::RelId>,
-        min: u64,
-        max: Option<u64>,
-        target: Option<NodeId>,
-        dir: ExpandDirection,
-        type_names: &[String],
-        forbidden: &rustc_hash::FxHashSet<RelId>,
-        rel_props: Option<&Expr>,
-        base: &Row,
-        relationship: &Var,
-        to: &Var,
-        into: bool,
-        ctx: &mut Ctx<'_>,
-        pending: &mut VecDeque<Row>,
-    ) -> Result<(), ExecError> {
+    // Iterative depth-first trail walk with an explicit heap stack (`rmp` #656): the former recursion
+    // descended ~O(path length) deep, overflowing the finite worker-thread stack on a long chain — an
+    // uncatchable process abort (SIGABRT) that took every tenant with it. The explicit stack keeps the
+    // walk's depth on the heap, so an arbitrarily long chain uses O(1) native stack and can never
+    // overflow. `trail` (the relationship stack, traversal order) is popped/pushed in lockstep with the
+    // frame stack, and the `PendingBudget` bounds the trail-path materialisation.
+    let mut budget = PendingBudget::new();
+    let mut trail: Vec<RelId> = Vec::new();
+    let mut stack: Vec<VarExpandFrame> = vec![VarExpandFrame::enter(0, anchor)];
+
+    while let Some(mut frame) = stack.pop() {
         ctx.check_cancelled()?;
-        if depth >= min && (!into || Some(current) == target) {
-            let mut row = base.clone();
-            row.set(
-                relationship.name.clone(),
-                RowValue::list(
-                    trail
-                        .iter()
-                        .map(|&id| RowValue::Rel(RelRef { id }))
-                        .collect(),
-                ),
-            );
-            if !into {
-                row.set(to.name.clone(), RowValue::Node(NodeRef { id: current }));
+
+        // First visit of this node: emit the trail reaching it (if within `[min, max]` and, for
+        // expand-into, ending at the bound target), then resolve its incident relationships.
+        if frame.incidents.is_none() {
+            if frame.depth >= min && (!into || Some(frame.current) == target) {
+                let mut row = base.clone();
+                row.set(
+                    relationship.name.clone(),
+                    RowValue::list(
+                        trail
+                            .iter()
+                            .map(|&id| RowValue::Rel(RelRef { id }))
+                            .collect(),
+                    ),
+                );
+                if !into {
+                    row.set(
+                        to.name.clone(),
+                        RowValue::Node(NodeRef { id: frame.current }),
+                    );
+                }
+                budget.charge(&row)?;
+                pending.push_back(row);
             }
-            pending.push_back(row);
+            if max.is_some_and(|m| frame.depth >= m) {
+                // Maximum length reached: this node is a leaf, no further expansion. Its parent's
+                // trail entry (if any) is undone when the parent frame resurfaces (see `pushed`).
+                continue;
+            }
+            // Deduplicate self-loops reported once per side (`04 §2.4`); the trail check enforces
+            // relationship uniqueness across the whole walk.
+            frame.incidents = Some(ctx.graph.expand(frame.current, dir, type_names));
         }
-        if max.is_some_and(|m| depth >= m) {
-            return Ok(());
+
+        // Undo the trail push made when this frame last descended into a child.
+        if frame.pushed {
+            trail.pop();
+            frame.pushed = false;
         }
-        // Deduplicate self-loops reported once per side (`04 §2.4`); the trail check enforces
-        // relationship uniqueness across the whole walk.
-        let mut seen_rel = rustc_hash::FxHashSet::default();
-        let incidents = ctx.graph.expand(current, dir, type_names);
-        for inc in incidents {
-            if !seen_rel.insert(inc.rel) || trail.contains(&inc.rel) || forbidden.contains(&inc.rel)
+
+        // Advance to the next admissible incident (relationship-unique across the whole pattern).
+        let inc_len = frame.incidents.as_ref().map_or(0, Vec::len);
+        let mut chosen = None;
+        while frame.idx < inc_len {
+            let inc = frame
+                .incidents
+                .as_ref()
+                .expect("INVARIANT: incidents resolved above")[frame.idx];
+            frame.idx += 1;
+            if !frame.seen_rel.insert(inc.rel)
+                || trail.contains(&inc.rel)
+                || forbidden.contains(&inc.rel)
             {
                 continue;
             }
@@ -1385,48 +1498,25 @@ fn var_expand_into_pending(
                     continue;
                 }
             }
-            trail.push(inc.rel);
-            dfs(
-                depth + 1,
-                inc.neighbour,
-                trail,
-                min,
-                max,
-                target,
-                dir,
-                type_names,
-                forbidden,
-                rel_props,
-                base,
-                relationship,
-                to,
-                into,
-                ctx,
-                pending,
-            )?;
-            trail.pop();
+            chosen = Some(inc);
+            break;
         }
-        Ok(())
+        match chosen {
+            Some(inc) => {
+                trail.push(inc.rel);
+                frame.pushed = true;
+                let child = VarExpandFrame::enter(frame.depth + 1, inc.neighbour);
+                // Repush this frame (cursor advanced, trail entry outstanding), then the child on top so
+                // the walk descends depth-first — the identical pre-order enumeration the recursion made.
+                stack.push(frame);
+                stack.push(child);
+            }
+            None => {
+                // Exhausted: drop the frame (its trail entry, if any, was already undone above).
+            }
+        }
     }
-
-    dfs(
-        0,
-        anchor,
-        &mut Vec::new(),
-        min,
-        range.max,
-        target,
-        dir,
-        type_names,
-        &forbidden,
-        rel_props,
-        base,
-        relationship,
-        to,
-        into,
-        ctx,
-        pending,
-    )
+    Ok(())
 }
 
 /// A resolved interior hop of a **multi-relationship** quantified path pattern, ready for the trail
@@ -1539,12 +1629,45 @@ fn quantified_path_into_pending(
         // The flat trail across all hops of all iterations (for O(1)-ish uniqueness checks).
         trail: Vec::new(),
     };
-    st.walk(0, anchor, ctx, pending)
+    st.run(anchor, ctx, pending)
 }
 
-/// Mutable state of a quantified-path trail walk, threaded through the iteration recursion so the
-/// argument list stays manageable. Borrows the immutable operator parameters and owns the
-/// per-iteration accumulators the walk pushes/pops.
+/// One frame of the iterative quantified-path trail walk (`rmp` #656). The walk alternates between
+/// *iteration* boundaries (`Walk`) and *hop* traversals (`Step`) — the former recursion nested those
+/// two functions ~O(path length · hops) deep, overflowing the finite worker-thread stack on a long
+/// chain (an uncatchable SIGABRT). Driving the same depth-first enumeration through a heap-allocated
+/// stack of these frames keeps the walk's depth on the heap, so an arbitrarily long walk uses O(1)
+/// native stack and can never overflow. Frames are popped, mutated, and repushed (with the child on
+/// top) so the traversal order is byte-identical to the recursion's pre-order.
+enum QppFrame {
+    /// Iteration boundary: `k` iterations completed, arriving at `current`. On first processing
+    /// (`entered == false`) it emits the walk (if admissible) and, unless the maximum is reached,
+    /// begins iteration `k` (pushes the start node, descends into hop 0). On re-entry
+    /// (`entered == true`, the iteration's whole subtree finished) it pops that start node.
+    Walk {
+        k: u64,
+        current: NodeId,
+        entered: bool,
+    },
+    /// Hop traversal: traversing hop `hop_idx` of iteration `k` from `node`. `hop_idx == hops.len()`
+    /// is the iteration-complete boundary (predicate check, then descend into iteration `k + 1`),
+    /// latched one-shot by `idx`. For an interior hop (`hop_idx < hops.len()`), `idx` cursors the
+    /// candidate incidents, `seen_rel` dedups self-loops, and `pushed` records an outstanding
+    /// accumulator descent to undo when the frame resurfaces.
+    Step {
+        hop_idx: usize,
+        node: NodeId,
+        k: u64,
+        incidents: Vec<crate::graph_access::Incident>,
+        idx: usize,
+        seen_rel: rustc_hash::FxHashSet<RelId>,
+        pushed: bool,
+    },
+}
+
+/// Mutable state of a quantified-path trail walk, threaded through the iteration so the argument list
+/// stays manageable. Borrows the immutable operator parameters and owns the per-iteration accumulators
+/// the walk pushes/pops.
 struct QppWalk<'a> {
     base: &'a Row,
     group_start: &'a Var,
@@ -1568,80 +1691,190 @@ struct QppWalk<'a> {
 }
 
 impl QppWalk<'_> {
-    /// After `k` completed iterations arriving at `current`, emit the walk (if it meets the length
-    /// bound and, for `into`, ends at the target) and then, unless the maximum is reached, attempt one
-    /// more iteration by traversing the whole interior from `current`.
-    fn walk(
+    /// Drives the quantified-path trail walk from `anchor` **iteratively** (`rmp` #656): an explicit
+    /// heap stack of [`QppFrame`]s reproduces, in the identical pre-order, the enumeration the former
+    /// mutually-recursive `walk`/`step` performed — but with the walk's depth on the heap, so an
+    /// arbitrarily long chain uses O(1) native stack and can never overflow it. Each emitted row is
+    /// charged against a [`PendingBudget`], so an adversarial dense graph is rejected with a clean,
+    /// typed [`EvalError::ResourceLimit`] instead of exhausting memory.
+    fn run(
         &mut self,
-        k: u64,
-        current: NodeId,
+        anchor: NodeId,
         ctx: &mut Ctx<'_>,
         pending: &mut VecDeque<Row>,
     ) -> Result<(), ExecError> {
-        ctx.check_cancelled()?;
-        if k >= self.min && (!self.into || Some(current) == self.target) {
-            self.emit(current, pending);
-        }
-        if self.max.is_some_and(|m| k >= m) {
-            return Ok(());
-        }
-        // Begin iteration `k`: its start node is `current`.
-        self.iter_starts.push(current);
-        let r = self.step(0, current, k, ctx, pending);
-        self.iter_starts.pop();
-        r
-    }
+        let mut budget = PendingBudget::new();
+        let mut stack: Vec<QppFrame> = vec![QppFrame::Walk {
+            k: 0,
+            current: anchor,
+            entered: false,
+        }];
 
-    /// Traverses hop `hop_idx` of the current iteration from `node`. When all hops are done the
-    /// iteration is complete: check the per-iteration predicate, then recurse into the next iteration.
-    fn step(
-        &mut self,
-        hop_idx: usize,
-        node: NodeId,
-        k: u64,
-        ctx: &mut Ctx<'_>,
-        pending: &mut VecDeque<Row>,
-    ) -> Result<(), ExecError> {
-        // Cancellation is polled per visited node (as in the single-hop walk), so an adversarial
-        // high-fan-out interior hop stays responsive.
-        ctx.check_cancelled()?;
-        if hop_idx == self.hops.len() {
-            // One full interior traversed: prune the whole iteration by the interior predicate (which
-            // may reference every interior variable), then advance to the next iteration.
-            if let Some(pred) = self.interior_predicate {
-                if !self.iteration_predicate_holds(pred, ctx)? {
-                    return Ok(());
+        while let Some(frame) = stack.pop() {
+            // Cancellation is polled per frame (at least once per visited node), so an adversarial
+            // high-fan-out interior hop stays responsive.
+            ctx.check_cancelled()?;
+            match frame {
+                QppFrame::Walk {
+                    k,
+                    current,
+                    entered,
+                } => {
+                    if entered {
+                        // The whole subtree of iteration `k` finished: undo this iteration's start-node
+                        // push (the accumulator pop the recursion did after `step` returned).
+                        self.iter_starts.pop();
+                        continue;
+                    }
+                    // First arrival with `k` completed iterations: emit the walk if it meets the length
+                    // bound and, for `into`, ends at the target.
+                    if k >= self.min && (!self.into || Some(current) == self.target) {
+                        self.emit(current, &mut budget, pending)?;
+                    }
+                    if self.max.is_some_and(|m| k >= m) {
+                        // Maximum iterations reached: no further iteration. This is a leaf `Walk` (no
+                        // start node was pushed), so nothing to undo — just drop it.
+                        continue;
+                    }
+                    // Begin iteration `k`: record its start node, then traverse the interior from
+                    // `current`. Repush this `Walk` (entered) beneath the hop-0 frame so it resurfaces to
+                    // pop the start node once the iteration's subtree completes.
+                    self.iter_starts.push(current);
+                    let incidents =
+                        ctx.graph
+                            .expand(current, self.hops[0].dir, self.hops[0].type_names);
+                    stack.push(QppFrame::Walk {
+                        k,
+                        current,
+                        entered: true,
+                    });
+                    stack.push(QppFrame::Step {
+                        hop_idx: 0,
+                        node: current,
+                        k,
+                        incidents,
+                        idx: 0,
+                        seen_rel: rustc_hash::FxHashSet::default(),
+                        pushed: false,
+                    });
+                }
+                QppFrame::Step {
+                    hop_idx,
+                    node,
+                    k,
+                    incidents,
+                    mut idx,
+                    mut seen_rel,
+                    pushed,
+                } => {
+                    if hop_idx == self.hops.len() {
+                        // One full interior traversed. `idx` latches this boundary one-shot: 0 = first
+                        // arrival — prune the whole iteration by the interior predicate (which may
+                        // reference every interior variable), then descend into iteration `k + 1`;
+                        // 1 = that child iteration finished, so this boundary frame is done. The
+                        // accumulators for the final hop are owned by the parent `Step` (hop
+                        // `hops.len() - 1`), which undoes them when it resurfaces, so this frame pushes /
+                        // pops nothing itself.
+                        if idx == 0 {
+                            if let Some(pred) = self.interior_predicate {
+                                if !self.iteration_predicate_holds(pred, ctx)? {
+                                    continue; // iteration rejected
+                                }
+                            }
+                            stack.push(QppFrame::Step {
+                                hop_idx,
+                                node,
+                                k,
+                                incidents,
+                                idx: 1,
+                                seen_rel,
+                                pushed,
+                            });
+                            stack.push(QppFrame::Walk {
+                                k: k + 1,
+                                current: node,
+                                entered: false,
+                            });
+                        }
+                        continue;
+                    }
+
+                    // An interior hop. Undo the accumulator push from this frame's previous descent, if
+                    // any, before advancing to the next incident.
+                    if pushed {
+                        self.trail.pop();
+                        self.step_nodes[hop_idx].pop();
+                        self.step_rels[hop_idx].pop();
+                    }
+                    // Advance to the next admissible incident (relationship-unique across the whole walk;
+                    // self-loops deduped once per side).
+                    let mut chosen = None;
+                    while idx < incidents.len() {
+                        let inc = incidents[idx];
+                        idx += 1;
+                        if !seen_rel.insert(inc.rel)
+                            || self.trail.contains(&inc.rel)
+                            || self.forbidden.contains(&inc.rel)
+                        {
+                            continue;
+                        }
+                        chosen = Some(inc);
+                        break;
+                    }
+                    let Some(inc) = chosen else {
+                        // Exhausted: drop the frame (its accumulators were already undone above).
+                        continue;
+                    };
+                    self.step_rels[hop_idx].push(inc.rel);
+                    self.step_nodes[hop_idx].push(inc.neighbour);
+                    self.trail.push(inc.rel);
+                    let child_hop = hop_idx + 1;
+                    let child_incidents = if child_hop < self.hops.len() {
+                        ctx.graph.expand(
+                            inc.neighbour,
+                            self.hops[child_hop].dir,
+                            self.hops[child_hop].type_names,
+                        )
+                    } else {
+                        // The iteration-complete boundary traverses no relationships.
+                        Vec::new()
+                    };
+                    // Repush this frame (cursor advanced, one accumulator descent outstanding), then the
+                    // child on top so the walk descends depth-first.
+                    stack.push(QppFrame::Step {
+                        hop_idx,
+                        node,
+                        k,
+                        incidents,
+                        idx,
+                        seen_rel,
+                        pushed: true,
+                    });
+                    stack.push(QppFrame::Step {
+                        hop_idx: child_hop,
+                        node: inc.neighbour,
+                        k,
+                        incidents: child_incidents,
+                        idx: 0,
+                        seen_rel: rustc_hash::FxHashSet::default(),
+                        pushed: false,
+                    });
                 }
             }
-            return self.walk(k + 1, node, ctx, pending);
-        }
-        let hop = &self.hops[hop_idx];
-        // Deduplicate self-loops reported once per side; the trail check enforces relationship
-        // uniqueness across the whole walk.
-        let mut seen_rel = rustc_hash::FxHashSet::default();
-        let incidents = ctx.graph.expand(node, hop.dir, hop.type_names);
-        for inc in incidents {
-            if !seen_rel.insert(inc.rel)
-                || self.trail.contains(&inc.rel)
-                || self.forbidden.contains(&inc.rel)
-            {
-                continue;
-            }
-            self.step_rels[hop_idx].push(inc.rel);
-            self.step_nodes[hop_idx].push(inc.neighbour);
-            self.trail.push(inc.rel);
-            self.step(hop_idx + 1, inc.neighbour, k, ctx, pending)?;
-            self.trail.pop();
-            self.step_nodes[hop_idx].pop();
-            self.step_rels[hop_idx].pop();
         }
         Ok(())
     }
 
     /// Emits one row for a completed `k`-iteration walk ending at `current`, binding each interior
     /// group variable to its ordered per-iteration list and (unless `into`) the boundary `to` to the
-    /// final node.
-    fn emit(&self, current: NodeId, pending: &mut VecDeque<Row>) {
+    /// final node. The row is charged against `budget` before it is enqueued, so an adversarial dense
+    /// graph is rejected before the over-budget queue is materialised (`rmp` #656).
+    fn emit(
+        &self,
+        current: NodeId,
+        budget: &mut PendingBudget,
+        pending: &mut VecDeque<Row>,
+    ) -> Result<(), ExecError> {
         let mut row = self.base.clone();
         row.set(
             self.group_start.name.clone(),
@@ -1680,7 +1913,9 @@ impl QppWalk<'_> {
                 RowValue::Node(NodeRef { id: current }),
             );
         }
+        budget.charge(&row)?;
         pending.push_back(row);
+        Ok(())
     }
 
     /// Evaluates the per-iteration interior predicate with the **current** iteration's scalar
