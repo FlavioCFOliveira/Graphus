@@ -9274,6 +9274,56 @@ mod tests {
     }
 
     #[test]
+    fn two_variable_join_index_seek_returns_exactly_the_cartesian_filter_result() {
+        // `rmp` task #732 (from the #708 merge): a two-variable JOIN predicate — `MATCH (a:Person),
+        // (b:Person) WHERE a.uid = b.uid` — where one side is indexed now lowers to an index
+        // nested-loop join (scan a, per-a seek b on b.uid = a.uid) instead of a cartesian product +
+        // residual Filter. That is a SOUND, standard optimisation (the inner side sees the bound outer
+        // variable), but it must NEVER change results. This pins the two edge cases the correlated
+        // #708 test did not exercise for this shape: a DUPLICATE key (multiplicity) and a NULL key
+        // (a NULL probe must yield zero matches, exactly as `a.uid = b.uid` is NULL/false for a NULL
+        // operand — the one place a seek could silently diverge from a filter).
+        fn pairs(src: &str, graph: &mut MemGraph, catalog: &IndexCatalog) -> Vec<(u64, u64)> {
+            let mut out: Vec<(u64, u64)> = run_with_catalog(src, graph, catalog)
+                .iter()
+                .filter_map(|r| {
+                    let a = r.get("a").and_then(RowValue::as_node)?;
+                    let b = r.get("b").and_then(RowValue::as_node)?;
+                    Some((a.0, b.0))
+                })
+                .collect();
+            out.sort_unstable();
+            out
+        }
+
+        let seed = |g: &mut MemGraph| {
+            g.add_node(["Person"], [("uid", Value::Integer(1))]);
+            g.add_node(["Person"], [("uid", Value::Integer(2))]);
+            g.add_node(["Person"], [("uid", Value::Integer(2))]); // duplicate uid (multigraph)
+            g.add_node(["Person"], [("uid", Value::Null)]); // NULL key: must never join
+        };
+        let mut indexed = MemGraph::new();
+        seed(&mut indexed);
+        let mut plain = MemGraph::new();
+        seed(&mut plain);
+
+        let with_index = IndexCatalog::builder()
+            .with_label_property("Person", "uid")
+            .build();
+        let no_index = IndexCatalog::empty();
+
+        let src = "MATCH (a:Person), (b:Person) WHERE a.uid = b.uid RETURN a, b";
+        let seek = pairs(src, &mut indexed, &with_index);
+        let scan = pairs(src, &mut plain, &no_index);
+        assert_eq!(
+            seek, scan,
+            "the index nested-loop join must return exactly the cartesian+filter result"
+        );
+        // uid 1 -> (1 a) x (1 b) = 1 pair; uid 2 -> (2 a) x (2 b) = 4 pairs; NULL -> 0. Total 5.
+        assert_eq!(seek.len(), 5, "expected 5 joined pairs (NULL never joins)");
+    }
+
+    #[test]
     fn returning_write_still_yields_its_row() {
         // A write *followed by* `RETURN` has a projection root, not a write root, so it returns rows.
         let mut g = MemGraph::new();

@@ -797,10 +797,15 @@ fn two_anchor_trailing_where_both_anchors_seek() {
 }
 
 #[test]
-fn two_variable_join_predicate_stays_a_join_filter() {
-    // A predicate spanning TWO pattern variables (`a.id = b.id`) is a genuine join condition: it must
-    // NOT be pushed onto either anchor's scan (that would be unsound — the scan cannot see the other
-    // variable). It stays a `Filter` above the cartesian join, and neither anchor seeks.
+fn two_variable_join_predicate_drives_an_index_nested_loop_seek() {
+    // `rmp` #732 (behaviour set by the #708 merge): a predicate spanning TWO pattern variables
+    // (`a.id = b.id`) where one side is indexed lowers to an INDEX NESTED-LOOP JOIN — scan the outer
+    // anchor `a`, then per-`a` seek `b` on `b.id = a.id` — instead of a cartesian product + residual
+    // `Filter`. This is a SOUND, standard optimisation: the inner side is probed with the outer
+    // variable already bound (a nested-loop join, not a scan that "cannot see the other variable"),
+    // so it returns exactly the same rows in O(N log N) rather than O(N^2). The result-equivalence —
+    // including the NULL-key and duplicate-key edges — is pinned by the executor differential test
+    // `two_variable_join_index_seek_returns_exactly_the_cartesian_filter_result`.
     let catalog = IndexCatalog::builder()
         .with_label_property("User", "id")
         .build();
@@ -808,22 +813,33 @@ fn two_variable_join_predicate_stays_a_join_filter() {
         "MATCH (a:User), (b:User) WHERE a.id = b.id RETURN a, b",
         &catalog,
     );
+    // Exactly one anchor (`b`) is the indexed inner side of the nested-loop join.
     assert_eq!(
         count_seeks(&plan),
-        0,
-        "a two-variable predicate must not drive any anchor seek:\n{plan}"
+        1,
+        "the indexed inner anchor must seek per outer row:\n{plan}"
+    );
+    assert_eq!(
+        seek_vars(&plan.root),
+        vec!["b".to_string()],
+        "`b` is the inner seek, keyed off the bound outer `a`:\n{plan}"
     );
     assert!(
         find(&plan.root, &|op| matches!(
             op,
-            PhysicalOp::NestedLoopJoin { .. } | PhysicalOp::HashJoin { .. }
+            PhysicalOp::NestedLoopJoin { .. }
         ))
         .is_some(),
-        "the two independent anchors join:\n{plan}"
+        "the correlated seek is driven by a nested-loop join:\n{plan}"
     );
+    // The outer anchor `a` is still a plain label scan (nothing to seek on).
     assert!(
-        find(&plan.root, &|op| matches!(op, PhysicalOp::Filter { .. })).is_some(),
-        "the join predicate remains a residual Filter above the join:\n{plan}"
+        find(&plan.root, &|op| matches!(
+            op,
+            PhysicalOp::NodeByLabelScan { .. }
+        ))
+        .is_some(),
+        "the outer anchor `a` remains a label scan:\n{plan}"
     );
 }
 
