@@ -236,15 +236,16 @@ worth attacking.
 | **RAM** | server peak RSS **430 MiB** at C=8 (317 MiB at C=1 — it grows with connection count) |
 | **Storage — data image** | `graphus.store` **4.4 MiB** = **2.46× the 1.8 MiB logical graph**. This is the ratio that scales with the graph, and it is healthy. |
 | **Storage — doublewrite** | `graphus.dwb` **16.9 MiB** — a **fixed preallocation, one per database**, independent of graph size. It dominates a small graph's footprint and amortises to nothing on a large one. |
-| **Storage — redo log** | `graphus.wal` **41.2 MiB = 9.3× the data image it protects**, and **not truncated over the run**. This is a genuine resource-efficiency defect, filed as `rmp` **#702**. |
+| **Storage — redo log** | `graphus.wal` **retains ~19 MiB on disk = ~4.3× the data image** after WRITING **~48 MiB of cumulative redo** over the run — so **~60% was RECYCLED, not accumulated** (the highest `seg.<lsn>` frontier proves it from the evidence itself). The Mode A bulk-load's redo is reclaimed at load end (`rmp` **#579**) and the WAL segment target is sized to the store (`rmp` **#706**), so sealed segments below the checkpoint floor are freed rather than retained; what remains is the recent redo tail. A pure bulk-load (`SOCIAL_WRITERS=0`, no post-load writes) reclaims to **~0.5× the data image**. This **resolves `rmp` #702** — before those fixes the same workload held **~9.3×** and grew monotonically. |
 
 > **On reading the storage numbers.** A single lumped "durable bytes ÷ logical bytes" ratio would
-> read as **34×** here — and it would be *misleading*, because it blends the graph's data image with a
-> constant-cost doublewrite buffer and an un-checkpointed redo log. The report therefore
-> **decomposes** the footprint and states which bytes scale with the graph and which do not. (The
-> WAL is a *directory* of `seg.<lsn>` files; a classifier that tests only the leaf file name counts
-> every WAL byte as store and reports `wal = 0`, hiding the redo log entirely — that bug is now
-> pinned by a regression test.)
+> read as **~23×** here — and it would be *misleading*, because it blends the graph's data image with a
+> constant-cost doublewrite buffer and a redo log that is **continuously recycled** (its retained bytes
+> are far below the redo it has written). The report therefore **decomposes** the footprint, states
+> which bytes scale with the graph and which do not, and reports the redo log's **cumulative-written vs.
+> retained** bytes so recycling is provable from the evidence itself. (The WAL is a *directory* of
+> `seg.<lsn>` files; a classifier that tests only the leaf file name counts every WAL byte as store and
+> reports `wal = 0`, hiding the redo log entirely — that bug is now pinned by a regression test.)
 
 ### The baseline regression gate
 
