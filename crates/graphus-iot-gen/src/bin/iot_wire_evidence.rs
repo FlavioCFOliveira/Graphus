@@ -198,7 +198,7 @@ fn run() -> Result<bool, String> {
                 match s.wal_plateaued(1.5) {
                     Some(true) => "yes".to_owned(),
                     Some(false) => {
-                        "NO — the WAL sawtooths (64 MiB segment-roll reclaim granularity); see notes"
+                        "NO — the WAL sawtooths in a TIGHT store-proportional band (rmp #706); see notes"
                             .to_owned()
                     }
                     None => "not measured".to_owned(),
@@ -207,10 +207,10 @@ fn run() -> Result<bool, String> {
             // ------------------------------------------------------------------------------------
             // THE TOTAL DURABLE FOOTPRINT — what the DATABASE costs on disk, not what one component
             // of it costs. `storage.plateau_ratio` reports the STORE's plateau (that is what the
-            // schema defines it as), and the store's plateau is a genuine 1.000. But a reader who
-            // stops there has been told a true thing about a component in place of a false thing
-            // about the whole: the database on disk does NOT plateau, because the WAL does not.
-            // Both numbers, side by side, under names that say which is which (`rmp` #713).
+            // schema defines it as), and the store's plateau is a genuine 1.000. Since `rmp` #706 the
+            // WAL is store-proportional, so the TOTAL footprint sawtooths within a tight band too (this
+            // run: ~1.56x, was ~7.1x while #706 was open) — close to, but not a perfect, plateau. Both
+            // numbers, side by side, under names that say which is which (`rmp` #713 / #706).
             // ------------------------------------------------------------------------------------
             w.insert(
                 "durable_footprint_peak_bytes".into(),
@@ -232,7 +232,7 @@ fn run() -> Result<bool, String> {
                         if r <= 1.10 {
                             " (FLAT)"
                         } else {
-                            " — the DATABASE does NOT plateau, though its store does; see notes"
+                            " — the DATABASE sawtooths in a tight store-proportional band (rmp #706); see notes"
                         }
                     ),
                 );
@@ -686,64 +686,60 @@ fn add_notes(collector: &mut EvidenceCollector, s: &WireSamples, m: Option<&Main
         // impression, which is precisely the failure mode the evidence-honesty rules exist to stop.
         // ------------------------------------------------------------------------------------------
         collector.note(format!(
-            "FINDING — THE STORE PLATEAUS; THE DATABASE ON DISK DOES NOT. Read this next to the green \
-             `plateau_ratio: {:.3}` above, which describes the STORE ALONE.\n\
+            "FINDING — THE STORE PLATEAUS, AND SINCE rmp #706 THE DATABASE ON DISK VERY NEARLY DOES TOO. \
+             Read this next to the green `plateau_ratio: {:.3}` above, which describes the STORE ALONE.\n\
              Measured on this run: the data image held FLAT at {} B across the whole post-warmup window, \
-             while the TOTAL durable footprint (store + WAL) ranged over [{}, {}] B — a plateau ratio of \
-             {}, and a peak of {} for a {} B graph. At its worst this database occupied {} of disk per \
-             byte of graph it holds. The WAL, not the store, is the entire footprint.\n\
-             ROOT CAUSE (traced, not guessed — rmp #706): WAL disk is reclaimed in whole SEGMENT units, \
-             and the active segment is only sealed at DEFAULT_SEGMENT_TARGET_BYTES = 64 MiB \
-             (graphus-wal/src/sink.rs:702; the roll test is `active.len >= segment_target` at :898). The \
-             background maintenance cadence is adaptive — it fires every clamp(4 x store_bytes, 8 MiB, \
-             256 MiB), i.e. every 8 MiB for a store this size (rmp #556). So the reclaim FLOOR advances \
-             promptly and correctly, and versions_reclaimed climbs — but until 64 MiB has accumulated \
-             there is no SEALED segment below the floor to delete, and not one byte of WAL disk is freed. \
-             When the segment finally rolls, the whole ~63 MiB is released at once. Hence the sawtooth: \
-             the cadence was made store-proportional (#556); the reclaim GRANULARITY was not.\n\
-             WHY THE RECLAMATION COUNTERS DO NOT CONTRADICT THIS: \
-             graphus_maintenance_versions_reclaimed_total counts MVCC versions freed inside the STORE. It \
-             is what keeps the store flat, and it is why the store's plateau is real. It says nothing \
-             whatsoever about WAL segment files. A climbing counter beside a monotonically-growing WAL is \
-             not a paradox — it IS the defect.\n\
+             and the TOTAL durable footprint (store + WAL) now sawtooths within a TIGHT band [{}, {}] B — \
+             a plateau ratio of {} (down from ~7.1 while #706 was open), peaking at {} per byte of graph \
+             (down from ~347x). The WAL is still most of the footprint, but it is now a small, bounded, \
+             sawtoothing multiple of the store rather than an unbounded climb to 64 MiB.\n\
+             WHAT rmp #706 FIXED: WAL disk is reclaimed in whole SEGMENT units, and the active segment is \
+             never reclaimed — so nothing below the reclaim floor can be freed until a segment SEALS. The \
+             seal size is now STORE-PROPORTIONAL, clamp(store_bytes, 1 MiB, 64 MiB) \
+             (graphus_wal::segment_target_for_store), applied by the store at open and on every \
+             checkpoint. For a store this size that is the 1 MiB floor, so the reclaiming maintenance \
+             checkpoint — whose cadence #556 already made store-proportional — has small sealed segments \
+             below the floor to delete on nearly every pass. Before #706 the seal size was a fixed 64 MiB, \
+             so a small database's WAL climbed all the way to 64 MiB (hundreds of times its store) before \
+             one byte came back; a large log still keeps 64 MiB segments (the cap), unchanged.\n\
+             WRITE AMPLIFICATION IS A SEPARATE, LARGELY-UNCHANGED NUMBER: the ~{}x cumulative-WAL / \
+             logical-bytes figure is the record FORMAT (physiological redo + logical undo, dual imaging — \
+             rmp #556), NOT the reclaim granularity. #706 shrinks the RETAINED footprint on disk, not how \
+             many bytes each commit writes; reducing that would be a WAL-format change, out of scope here. \
+             So this figure barely moved (it was ~799x), and that is expected.\n\
+             WHY THE RECLAMATION COUNTERS AGREE: graphus_maintenance_versions_reclaimed_total counts MVCC \
+             versions freed inside the STORE (what keeps the store flat); the on-disk WAL physically \
+             shrinking is the separate, direct proof that WAL disk came back. Both climb here.\n\
              OBSERVED THIS RUN: {}\n\
-             IMPACT: a database holding a few hundred rows still carries up to ~64 MiB of WAL on disk, \
-             indefinitely, PER DATABASE. That is NOT a durability defect — nothing is lost, recovery is \
-             unaffected, and every byte is fsynced before its commit is acknowledged — it is a \
-             resource-efficiency defect, and an acute one on a small target such as a Raspberry Pi 5 \
-             hosting several small databases.\n\
-             SUGGESTED DIRECTION (rmp #706): make the segment target adaptive in the same spirit as the \
-             cadence — e.g. clamp(k x store_bytes, 1 MiB, 64 MiB) — so reclaim granularity tracks the \
-             store it protects. NOTE for whoever fixes it: the existing regression test \
-             (crates/graphus-cypher/tests/wal_amplification.rs) runs against a MemLogSink, which frees \
-             bytes exactly and has no segments at all — so it passes today and CANNOT observe this. The \
-             file-backed guard is this example.",
+             GUARDED: the file-backed regression guard in crates/graphus-cypher/tests/wal_amplification.rs \
+             now drives a REAL segmented FileLogSink and FAILS on a reverted (fixed-64-MiB) segment on a \
+             small store (rmp #719) — the MemLogSink guard it replaced had no segments and was \
+             structurally blind to this.",
             s.plateau_ratio().unwrap_or(f64::NAN),
             st.data_bytes,
             st.footprint_min_bytes,
             st.footprint_peak_bytes,
             s.durable_footprint_plateau_ratio()
-                .map_or("not measured".to_owned(), |r| format!("{r:.1}")),
-            st.footprint_peak_bytes,
-            st.data_bytes,
+                .map_or("not measured".to_owned(), |r| format!("{r:.2}")),
             s.footprint_peak_over_store()
-                .map_or("not measured".to_owned(), |r| format!("{r:.0} bytes")),
+                .map_or("not measured".to_owned(), |r| format!("{r:.0}x")),
+            s.write_amplification()
+                .map_or("not measured".to_owned(), |w| format!("{w:.0}")),
             match s.sealed_a_segment() {
                 Some(true) => format!(
-                    "the run wrote {} B of WAL, crossing the {} B seal threshold, and the on-disk WAL \
-                     was seen to SHRINK {} time(s), returning {} B of disk. So reclamation of WAL disk \
-                     DOES work — it is simply far too coarse to keep a small database small.",
+                    "the run wrote {} B of WAL, past the {} B max-segment threshold, so it certainly \
+                     sealed many (store-proportional) segments, and the on-disk WAL was seen to SHRINK {} \
+                     time(s), returning {} B of disk — the WAL sawtooths in a tight band and comes back on \
+                     nearly every checkpoint.",
                     st.wal_written_bytes,
                     graphus_iot_gen::wire_samples::WAL_SEGMENT_TARGET_BYTES,
                     st.wal_reclaim_events,
                     st.wal_reclaimed_bytes,
                 ),
                 Some(false) => format!(
-                    "this run wrote only {} B of WAL — BELOW the {} B segment seal threshold — so it \
-                     never sealed a segment and NOT ONE BYTE of WAL disk was reclaimable, however many \
-                     checkpoints ran. Its WAL climbed monotonically and nothing came back. That is the \
-                     defect in its purest form: a small database never even reaches the granularity at \
-                     which the engine is able to free anything.",
+                    "this run wrote only {} B of WAL — below the {} B max-segment threshold — so we cannot \
+                     CERTIFY from that conservative bound alone that a segment sealed; a longer run crosses \
+                     it and shows the full store-proportional seal-and-free sawtooth.",
                     st.wal_written_bytes,
                     graphus_iot_gen::wire_samples::WAL_SEGMENT_TARGET_BYTES,
                 ),

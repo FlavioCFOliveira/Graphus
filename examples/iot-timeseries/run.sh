@@ -11,11 +11,13 @@
 #      are load-bearing: a flat store alone also describes a workload that wrote nothing, and a climbing
 #      counter alone does not rule out unbounded growth.
 #
-#   2. THE DATABASE ON DISK DOES NOT.  The same run measures the TOTAL durable footprint (store + WAL)
-#      and finds it does NOT plateau: the WAL sawtooths between ~2 MB and ~70 MB to protect a 229 KB
-#      graph, because WAL disk is freed only in whole 64 MiB SEGMENT units (rmp #706). The store's flat
-#      plateau is a true statement about a COMPONENT; published on its own it would create a false
-#      impression about the DATABASE. So this example reports both, gates both, and says so out loud.
+#   2. AND SINCE rmp #706, THE DATABASE ON DISK VERY NEARLY DOES TOO.  The same run measures the TOTAL
+#      durable footprint (store + WAL) and finds it now sawtooths within a TIGHT band (~1.6x, peak ~64x
+#      the graph — was ~7.1x / ~347x while #706 was open): WAL segments are now store-proportional
+#      (clamp(store, 1 MiB, 64 MiB)), so a small database seals ~1 MiB segments and its WAL disk comes
+#      back on nearly every checkpoint instead of climbing to 64 MiB. The store's flat plateau is a true
+#      statement about a COMPONENT; this example reports and gates the TOTAL footprint too, so the whole
+#      database is judged, not one part of it.
 #
 # The write amplification is a FIRST-CLASS, GATED signal here — not a number buried in a report nobody
 # opens. `iot_wire_evidence --assert` FAILS the run if the WAL footprint comes back zero while writes
@@ -102,13 +104,14 @@ MODE="$(harness_target_mode)"   # external iff GRAPHUS_TARGET_{BOLT,REST,UDS} is
 # --------------------------------------------------------------------------------------------------
 # Profiles + knobs
 #
-# The WIRE run defaults to the `reclaim` profile, and that default is load-bearing (rmp #713). One
-# reading costs ~21.5 KB of WAL, so the older `fast` profile's 3,000 readings produced ~59 MB of WAL —
-# stopping just BELOW the 64 MiB segment seal threshold. Its WAL therefore climbed monotonically and not
-# one byte was ever reclaimed: it could neither observe reclamation nor prove its absence benign. An
-# example whose headline is "reclamation holds the footprint flat" must not be sized so that the
-# reclamation it claims never runs. `reclaim` (140 ticks, 7,000 readings, ~150 MB of WAL, ~9.5 s) seals
-# and frees TWO segments, and still fits a CI budget (rmp #704).
+# The WIRE run defaults to the `reclaim` profile: sized to run the churn long enough to reach a clear
+# steady state — the store plateau AND a WAL that sawtooths in a tight, store-proportional band with
+# dozens of observed reclamations — and to end at a stable, byte-reproducible point. `reclaim` (140 ticks,
+# 7,000 readings, ~143 MB of cumulative WAL, ~9.5 s) seals and frees dozens of small segments and still
+# fits a CI budget (rmp #704). (Before rmp #706 the seal size was a fixed 64 MiB, so the shorter `fast`
+# profile's ~59 MB of WAL never crossed one seal and reclaimed nothing; #706 made segments store-
+# proportional, so even short runs reclaim now — but `reclaim` remains the default for a stable steady
+# state.)
 # --------------------------------------------------------------------------------------------------
 PROFILE="${IOT_PROFILE:-fast}"                     # the in-memory CONTROL mirror's profile
 WIRE_PROFILE="${IOT_WIRE_PROFILE:-reclaim}"        # the FILE-BACKED wire run's profile (the PRIMARY)
@@ -117,12 +120,13 @@ IOT_TICKS="${IOT_TICKS:-}"                         # override the mirror's tick 
 WIRE_CLIENTS="${IOT_WIRE_CLIENTS:-2}"              # concurrent ingest connections (sensor-sharded)
 WIRE_CHECKPOINT_EVERY="${IOT_CHECKPOINT_EVERY:-5}" # 0 => rely on the background cadence alone
 
-# Ceilings the wire gate holds the (known-bad) durability cost under. They are UPPER BOUNDS just above
-# today's measured values, not targets: a bound cannot be satisfied by regressing, and it does not have
-# to be relaxed to accept a fix. Measured on the `reclaim` profile: write amplification ~799x, peak
-# durable footprint ~347x the data image.
+# Ceilings the wire gate holds the durability cost under. UPPER BOUNDS, not targets: a bound cannot be
+# satisfied by regressing, and it does not have to be relaxed to accept a fix. Write amplification is the
+# WAL FORMAT (dual redo/undo) and #706 barely moved it (~799x -> ~760x), so its ceiling stays 1000x. The
+# footprint ceiling was 450x while #706 was open (peak ~347x); now that #706 holds the peak to ~64x it is
+# tightened to 120x, so a regression BACK to fixed 64 MiB segments is caught here too.
 MAX_WRITE_AMP="${IOT_MAX_WRITE_AMP:-1000}"
-MAX_FOOTPRINT_RATIO="${IOT_MAX_FOOTPRINT_RATIO:-450}"
+MAX_FOOTPRINT_RATIO="${IOT_MAX_FOOTPRINT_RATIO:-120}"
 
 # --------------------------------------------------------------------------------------------------
 # Locate (or BUILD) the binaries.
@@ -324,10 +328,10 @@ fi
 if [ "$WIRE_OK" = 1 ]; then
   section "Step 2a — file-backed ingest + retention churn over the wire into '$WIRE_DB' ($WIRE_PROFILE profile)"
   if [ "$WIRE_PROFILE" = "fast" ]; then
-    warn "the 'fast' wire profile writes ~59 MB of WAL — just BELOW the 64 MiB segment seal threshold —"
-    warn "so it can never observe WAL reclamation. Its WAL climbs monotonically and nothing comes back."
-    warn "That is a real (and reportable) observation, but only the default 'reclaim' profile shows the"
-    warn "full seal-and-free cycle. The gate will say which of the two this run measured."
+    warn "the 'fast' wire profile is a SHORT run (~59 MB of WAL). Since rmp #706 made WAL segments store-"
+    warn "proportional it still reclaims, but the default 'reclaim' profile sustains the churn long enough"
+    warn "to reach a stable steady state (a tight WAL sawtooth with dozens of reclamations). The gate"
+    warn "reports which of the two this run measured."
   fi
 
   # 1. Scrape /metrics BEFORE the workload. The reclamation counters' delta over this window is the
@@ -522,8 +526,9 @@ if [ "$FAILURES" -eq 0 ]; then
     printf 'WAL: the on-disk STORE PLATEAUED while the server’s own reclamation counters CLIMBED —\n'
     printf 'reclaimed space is demonstrably reused, not leaked. And the durability that cost is now\n'
     printf 'MEASURED and BOUNDED rather than omitted: see "WHAT DURABILITY COST" above, and the\n'
-    printf 'FINDING note in the report — the store plateaus, but the DATABASE ON DISK DOES NOT,\n'
-    printf 'because WAL disk is freed only in whole 64 MiB segments (rmp #706).\n'
+    printf 'FINDING note in the report — the store plateaus, and since rmp #706 the DATABASE ON DISK\n'
+    printf 'very nearly does too: the WAL sawtooths in a tight store-proportional band (~64x the graph,\n'
+    printf 'was ~347x) because WAL segments are now sized to the store, not a fixed 64 MiB.\n'
   elif [ "$WIRE_OK" = 1 ]; then
     printf 'Driven over the wire against an ATTACHED instance: the store and /proc live on the target,\n'
     printf 'so the storage vectors are absent by construction; the server-side evidence is /metrics.\n'

@@ -312,6 +312,17 @@ impl LogSink for WalSink {
             Self::Encrypted(s) => s.reclaimed_floor(),
         }
     }
+
+    fn set_segment_target(&mut self, target_bytes: u64) {
+        // Forward to the concrete sink so the store-proportional segment sizing of `rmp` #706 actually
+        // reaches production: without this, `WalSink` — the type `graphus-server` opens every database
+        // with — would inherit the trait's NO-OP, the segmented `FileLogSink` would keep its fixed
+        // 64 MiB seal threshold, and a small database's WAL would climb hundreds of times its store.
+        match self {
+            Self::Plain(s) => s.set_segment_target(target_bytes),
+            Self::Encrypted(s) => s.set_segment_target(target_bytes),
+        }
+    }
 }
 
 #[cfg(test)]

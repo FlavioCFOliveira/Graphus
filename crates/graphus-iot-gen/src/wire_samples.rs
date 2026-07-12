@@ -40,16 +40,21 @@ impl WireTransport {
     }
 }
 
-/// The size at which the WAL seals its active segment and rolls to a new one
+/// The **maximum** size at which the WAL seals its active segment and rolls to a new one
 /// (`graphus_wal::sink::DEFAULT_SEGMENT_TARGET_BYTES`, `crates/graphus-wal/src/sink.rs`).
 ///
 /// Replicated here as a plain constant rather than imported, so the wire driver and its gate keep
-/// building with `--no-default-features --features wire` (client-only: no engine, no WAL crate). It is
-/// load-bearing evidence, not a decoration: **WAL disk is reclaimed in whole segment units**, so until
-/// a run has written this much WAL there is no sealed segment below the reclaim floor to delete, and
-/// no WAL disk can be freed *however often* a checkpoint runs. A run shorter than this can therefore
-/// neither observe reclamation nor claim it works — which is exactly why the wire run is sized to
-/// cross it (`GenConfig::reclaim`, `rmp` #713 / #706).
+/// building with `--no-default-features --features wire` (client-only: no engine, no WAL crate).
+///
+/// Since `rmp` #706 the seal size is **store-proportional** — `clamp(store_bytes, 1 MiB, 64 MiB)`
+/// ([`graphus_wal::segment_target_for_store`]) — so a small database seals *small* segments and its WAL
+/// disk actually comes back. This 64 MiB value is the CAP of that range. It is still load-bearing
+/// evidence here as a **conservative** lower bound: **WAL disk is reclaimed in whole segment units**, so
+/// a run that has written at least this much WAL has certainly sealed at least one segment (even at the
+/// 64 MiB cap, and many more at the proportional size), so reclamation was *observable* — which is why
+/// the wire run is sized to cross it ([`GenConfig::reclaim`], `rmp` #713 / #706). A run shorter than this
+/// cannot be *certain* it sealed a segment, so the gate asks nothing of its reclamation (see
+/// [`WireSamples::sealed_a_segment`]).
 pub const WAL_SEGMENT_TARGET_BYTES: u64 = 64 * 1024 * 1024;
 
 /// One per-tick sample of the live workload and (locally) the REAL on-disk footprint.
@@ -597,17 +602,22 @@ pub struct StorageGate {
 }
 
 impl Default for StorageGate {
-    /// The bounds the example ships with. The ceilings sit just above the values measured on the
-    /// `reclaim` profile (write amplification ~799x, peak footprint ~347x) — close enough to catch a
-    /// regression, clear enough not to flap. The floor sits two orders of magnitude below the measured
-    /// ~21 KB of WAL per commit, so it can only ever fire on a broken measurement, never on a real
-    /// engine — however much #706 improves it.
+    /// The bounds the example ships with. The write-amplification ceiling sits just above the value
+    /// measured on the `reclaim` profile (~799x, and still ~760x after `rmp` #706 — the dual redo/undo
+    /// WAL volume is the record FORMAT, not the reclaim granularity, so #706 barely moved it). The
+    /// footprint ceiling was `450x` while #706 was open (peak ~347x the graph); now that #706 has landed
+    /// the store-proportional segment sizing holds the peak durable footprint to ~64x the graph, so the
+    /// ceiling is tightened to `120x` — comfortably above the fixed value, well below the ~347x defect —
+    /// so a regression BACK to fixed 64 MiB segments (a small store's WAL climbing to 64 MiB) is caught
+    /// here too, not only by the file-backed guard in `crates/graphus-cypher/tests/wal_amplification.rs`.
+    /// The per-commit floor sits two orders of magnitude below the measured ~20 KB of WAL per commit, so
+    /// it can only ever fire on a broken measurement, never on a real engine.
     fn default() -> Self {
         Self {
             plateau_factor: 1.10,
             max_write_amplification: 1_000.0,
             min_wal_bytes_per_commit: 64,
-            max_footprint_ratio: 450.0,
+            max_footprint_ratio: 120.0,
         }
     }
 }
@@ -616,9 +626,10 @@ impl Default for StorageGate {
 mod tests {
     use super::*;
 
-    /// A run shaped like the REAL `reclaim`-profile measurement (`rmp` #713): 7,000 readings ingested
-    /// over 140 ticks into a flat 229,376 B data image, protected by 150,743,014 B of cumulative WAL
-    /// that sealed and freed two 64 MiB segments on the way.
+    /// A run shaped like the REAL `reclaim`-profile measurement, AFTER `rmp` #706 landed: 7,000 readings
+    /// ingested over 140 ticks into a flat 229,376 B data image, protected by 143,548,295 B of cumulative
+    /// WAL that — with store-proportional 1 MiB segments — sawtooths in a tight band (peak ~5.5 MiB) and
+    /// is reclaimed 37 times on the way, holding the total durable footprint to ~64x the graph.
     ///
     /// Every test below starts from this healthy run and breaks exactly ONE thing, so a failing gate
     /// names the rule it caught rather than "something is wrong somewhere".
@@ -631,12 +642,9 @@ mod tests {
                 checkpointed: (tick + 1) % 5 == 0,
                 store_data_bytes: Some(229_376),
                 store_bytes: Some(229_376 + 8_871_936 + 69_829),
-                // A sawtooth: climbs, then drops back on the two segment reclaims.
-                wal_bytes: Some(match tick {
-                    0..=67 => 2_069_829 + tick * 1_000_000,
-                    68..=127 => 2_069_829 + (tick - 68) * 1_100_000,
-                    _ => 4_633_027 + (tick - 128) * 1_000_000,
-                }),
+                // A TIGHT sawtooth: climbs ~1 MiB/tick, then drops back on each checkpoint's reclaim of
+                // the sealed 1 MiB segments below the floor — the #706-fixed behaviour, peak ~5.5 MiB.
+                wal_bytes: Some(1_664_813 + (tick % 5) * 950_000),
             })
             .collect();
         WireSamples {
@@ -665,19 +673,21 @@ mod tests {
             storage: Some(WireStorage {
                 data_bytes: 229_376,
                 dwb_bytes: 8_871_936,
-                wal_bytes: 16_505_196,
-                wal_peak_bytes: 70_467_060,
+                // After `rmp` #706: store-proportional 1 MiB segments, so the on-disk WAL sawtooths in a
+                // tight band (peak ~5.5 MiB, not ~70 MiB) and 37 reclaims free ~96 MiB of disk.
+                wal_bytes: 1_664_813,
+                wal_peak_bytes: 5_478_755,
                 other_bytes: 69_829,
-                wal_written_bytes: 150_743_014,
+                wal_written_bytes: 143_548_295,
                 plateau_min_data_bytes: 229_376,
                 plateau_max_data_bytes: 229_376,
                 plateau_max_data_pages: 28,
-                footprint_min_bytes: 11_171_141,
-                footprint_peak_bytes: 79_568_372,
-                footprint_final_bytes: 25_676_337,
-                wal_reclaim_events: 2,
-                wal_reclaimed_bytes: 131_837_460,
-                server_io_write_bytes: Some(188_534_784),
+                footprint_min_bytes: 9_369_259,
+                footprint_peak_bytes: 14_580_067, // ~64x the graph (was ~347x while #706 was open)
+                footprint_final_bytes: 10_766_125,
+                wal_reclaim_events: 37,
+                wal_reclaimed_bytes: 95_772_410,
+                server_io_write_bytes: Some(191_340_544),
             }),
             insert_latency: None,
             delete_latency: None,
@@ -817,7 +827,7 @@ mod tests {
     fn a_ballooning_total_footprint_fails_the_gate_even_when_the_store_plateaus() {
         let mut s = healthy();
         let st = s.storage.as_mut().expect("storage");
-        st.footprint_peak_bytes = 229_376 * 600; // 600x the data image, past the 450x ceiling
+        st.footprint_peak_bytes = 229_376 * 600; // 600x the data image, past the 120x ceiling
 
         let failures = s.storage_gate(&StorageGate::default());
         assert_eq!(
@@ -845,7 +855,7 @@ mod tests {
         assert_eq!(
             s.sealed_a_segment(),
             Some(true),
-            "150 MB of WAL is well past the 64 MiB seal threshold"
+            "143 MB of WAL is well past the 64 MiB max-segment threshold, so segments WERE sealed"
         );
         let failures = s.storage_gate(&StorageGate::default());
         assert!(

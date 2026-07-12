@@ -749,6 +749,15 @@ impl<S: LogSink> LogSink for EncryptedLogSink<S> {
             _ => 0,
         }
     }
+
+    fn set_segment_target(&mut self, target_bytes: u64) {
+        // Forward to the backing file sink, which owns segmentation (`rmp` #706). The target sizes the
+        // BACKING (physical) segment; encryption framing adds a small per-frame overhead on top, so the
+        // physical WAL is bounded slightly above the requested target — still store-proportional. The
+        // sink header + frame 0 stay in the backing's never-reclaimed anchor regardless of segment size
+        // (`rmp` #533), so a smaller target cannot move or tear them.
+        self.backing.set_segment_target(target_bytes);
+    }
 }
 
 impl<S: LogSink> EncryptedLogSink<S> {

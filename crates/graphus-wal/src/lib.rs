@@ -37,4 +37,7 @@ pub use checkpoint::CheckpointSnapshot;
 pub use manager::{HEADER_LEN, WAL_MAGIC, WAL_VERSION, WalManager};
 pub use record::{DecodeError, LogRecord, LogRecordRef, RecordType};
 pub use recovery::{ApplyTarget, RecoveryReport, recover, recover_from};
-pub use sink::{DiscardingLogSink, FileLogSink, FsyncJob, LogSink, MemLogSink};
+pub use sink::{
+    DEFAULT_SEGMENT_TARGET_BYTES, DiscardingLogSink, FileLogSink, FsyncJob, LogSink, MemLogSink,
+    WAL_SEGMENT_MIN_TARGET_BYTES, segment_target_for_store,
+};
