@@ -183,6 +183,38 @@ pub mod battery {
         LIKE_RECENT,
         FULLTEXT,
     ];
+
+    // --- The WRITE shapes the concurrent read/write mix commits underneath the readers (rmp #714) ---
+    //
+    // A production graph workload is a MIX: reads are served WHILE writes commit. These two shapes are
+    // the write stream `social_bench` drives, and they are deliberately different in their contention
+    // profile, because a realistic write stream is not uniform.
+
+    /// The **common** write (the bulk of the stream): touch a *random* user's `registered` timestamp.
+    ///
+    /// A single-anchor, index-seeked `SET`: a real durable write that participates in MVCC/SSI against
+    /// the concurrent readers, but that (landing on a random key out of hundreds of thousands) almost
+    /// never conflicts with another writer. Parameters: `$id`, `$ts`.
+    pub const WRITE_USER_TOUCH: &str = "MATCH (u:USER {id: $id}) SET u.registered = $ts";
+
+    /// The **hot** write (the minority): a **read-modify-write** of a *trending* article's counter —
+    /// `hot = coalesce(hot, 0) + 1` — over a deliberately **small** set of articles.
+    ///
+    /// This is the shape that lets SSI (and therefore the driver's retry path) fire at all.
+    /// [`WRITE_USER_TOUCH`] lands on a random user, so concurrent writers essentially never collide.
+    /// Two concurrent read-modify-writes of the *same* node, by contrast, are exactly the
+    /// rw-antidependency cycle SSI exists to break.
+    ///
+    /// **Measured, do not over-claim:** at the production-shaped default (2 writers, one unit every
+    /// 20 ms) the writers still rarely overlap on the same trending article, and the engine abort rate
+    /// comes out at a measured **~0**. The retry path is therefore *armed but idle* on a default run —
+    /// invariant I4 reports that plainly rather than implying SSI was stressed and found robust. Raise
+    /// `--writers` / lower `--write-every-ms` / lower `--hot-keys` to exercise it.
+    ///
+    /// Parameter: `$id` (an `:ARTICLE(id)` index seek — the conflict is on the *node version*, not on a
+    /// scan).
+    pub const WRITE_ARTICLE_HOT: &str =
+        "MATCH (a:ARTICLE {id: $id}) SET a.hot = coalesce(a.hot, 0) + 1";
 }
 
 /// A tiny, fast, fully-deterministic PRNG (SplitMix64 — Steele, Lea & Flood 2014). Chosen because it

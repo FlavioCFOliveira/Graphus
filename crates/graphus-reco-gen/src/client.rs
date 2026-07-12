@@ -521,7 +521,21 @@ impl BoltClient {
     /// # Errors
     /// [`ClientError::Failure`] on a server-reported failure; [`ClientError::Protocol`] on an
     /// out-of-place message; [`ClientError::Io`] on a transport fault.
+    ///
+    /// On a `FAILURE` the connection is [`reset`](Self::reset) back to `READY` before the error is
+    /// returned, so a single failed statement does not poison every statement after it — see
+    /// [`reset`](Self::reset) for why that is load-bearing rather than tidy.
     pub fn run(
+        &mut self,
+        query: &str,
+        parameters: Vec<(String, Value)>,
+        db: &str,
+    ) -> ClientResult<QueryResult> {
+        self.recovering(|c| c.run_inner(query, parameters, db))
+    }
+
+    /// The body of [`run`](Self::run), without the connection recovery.
+    fn run_inner(
         &mut self,
         query: &str,
         parameters: Vec<(String, Value)>,
@@ -662,6 +676,59 @@ impl BoltClient {
             Response::Success { .. } => Ok(()),
             Response::Failure(f) => Err(ClientError::Failure(f)),
             other => Err(unexpected("ROLLBACK", &other)),
+        }
+    }
+
+    /// Sends `RESET` and drains until the server acknowledges it, returning the connection from the
+    /// Bolt **`FAILED`** state to **`READY`**.
+    ///
+    /// This is not optional book-keeping — it is the Bolt state machine. When the server answers a
+    /// request with `FAILURE` the connection moves to `FAILED`, and in `FAILED` **every** subsequent
+    /// request is answered `IGNORED` until a `RESET` arrives. A client that reports the failure to its
+    /// caller and then simply sends the next `RUN` has a **poisoned connection**: every later statement
+    /// on it comes back `IGNORED`, for the rest of the connection's life.
+    ///
+    /// That is exactly what happened when the read/write mix was first switched on (`rmp` #714): ONE
+    /// genuine server error on a reader connection turned into ~1430 cascading `IGNORED` responses, a
+    /// 95% "reader error rate" that was really a single fault plus a client that would not recover from
+    /// it. The real defect was buried under the noise its own client had manufactured.
+    ///
+    /// Every official Neo4j driver does this (it resets, or discards the connection, after a failure).
+    /// The drain loop tolerates whatever is still queued from the failed exchange — `IGNORED` replies
+    /// to requests already in flight, or stray `RECORD`s — and stops at the `SUCCESS` that acknowledges
+    /// the `RESET`.
+    ///
+    /// # Errors
+    /// [`ClientError::Io`] on a transport fault (the connection is then genuinely dead, and the caller
+    /// will see honest I/O errors rather than a silent stream of `IGNORED`).
+    pub fn reset(&mut self) -> ClientResult<()> {
+        self.send(&Request::Reset)?;
+        loop {
+            match self.recv()? {
+                // The acknowledgement: the connection is READY again.
+                Response::Success { .. } => return Ok(()),
+                // Left over from the exchange that failed — discard and keep draining.
+                Response::Ignored | Response::Record { .. } | Response::Failure(_) => {}
+            }
+        }
+    }
+
+    /// Runs `f`, and if it reports a server-side `FAILURE`, [`reset`](Self::reset)s the connection back
+    /// to `READY` before handing the error on.
+    ///
+    /// The failure is still returned to the caller unchanged — recovering the *connection* must never
+    /// hide the *error*. Only a `FAILURE` triggers a reset: an `Io`/`Protocol` fault means the
+    /// transport itself is untrustworthy, so a `RESET` down the same socket would be meaningless.
+    fn recovering<T>(&mut self, f: impl FnOnce(&mut Self) -> ClientResult<T>) -> ClientResult<T> {
+        match f(self) {
+            Ok(v) => Ok(v),
+            Err(ClientError::Failure(fail)) => {
+                // A transport error while resetting leaves the connection dead; the original failure is
+                // still the more informative one, so report that and let the next call surface the I/O.
+                let _ = self.reset();
+                Err(ClientError::Failure(fail))
+            }
+            Err(e) => Err(e),
         }
     }
 

@@ -35,10 +35,11 @@ evidence across the performance vectors it can observe (throughput, latency, and
    local mode the server's own CPU / RSS / IO is sampled per rung so the **saturation knee** and the
    cores-busy-at-saturation are visible; in attach mode the same signal comes from the client-side
    throughput-vs-concurrency curve plus the `/metrics` before/after delta.
-5. **A read-heavy / write-light mix**: a small, rate-limited stream of new purchases runs
-   concurrently with the reads (MVCC readers never block on the writer), so the scenario is a
-   realistic "mostly reads" service rather than a pure read benchmark. The `--writers N` knob scales
-   the concurrent-writer count for MVCC/SSI contention.
+5. **A production-shaped read/write MIX, ON BY DEFAULT** (`rmp` #714) — see
+   [The read/write mix](#the-readwrite-mix) below. Reads are served **while writes commit
+   underneath**, every rung is run twice (writers off, then writers on) so the **cost of the mix** is
+   measured, and six concurrency **invariants** are asserted. `RECO_WRITERS=0` restores the read-only
+   ladder.
 6. **Two load-generation regimes**: the default **closed-loop** zero-think-time saturation probe, and
    an **open-loop** fixed-arrival-rate mode (`--target-rps`) that measures latency from each op's
    *scheduled* time, so a slow server surfaces as growing latency rather than a throttled arrival rate
@@ -176,9 +177,98 @@ current server for the full-size graph.
 - `--min-ops-per-client` — a per-client op floor (`clients × N`) that keeps per-family sample counts
   from collapsing as the ladder widens (the effective per-rung budget is `max(ops_per_rung, clients ×
   N)`).
-- `--writers N` — the number of concurrent low-rate writers (MVCC/SSI contention against the readers).
+- `--writers N` / `RECO_WRITERS` — concurrent writers running underneath the readers. **Default 2**
+  (the mix is the default); `0` is the documented off switch that restores the read-only ladder.
+- `--write-every-ms` / `RECO_WRITE_EVERY_MS` — writer pacing, one business unit every N ms (default
+  `20`): a production-shaped trickle, not a storm.
+- `--hot-write-fraction` / `RECO_HOT_WRITE_FRACTION` (default `0.25`) and `--hot-keys` /
+  `RECO_HOT_KEYS` (default `4`) — the share of writes that **read-modify-write** one of a small set of
+  *trending* products (`SET p.hot = coalesce(p.hot,0)+1`). This is the shape that lets SSI fire at all;
+  see the honesty note in [The read/write mix](#the-readwrite-mix).
+- `--mix-baseline 0|1` / `RECO_MIX_BASELINE` (default `1`) — run the writers-off **control** arm beside
+  the mixed arm. Without it there is no baseline to compare the mix against, and no cost-of-the-mix
+  figure is produced (it is reported as *not measured*, never as zero).
+- `--retry-budget-ms` / `RECO_RETRY_BUDGET_MS` (default `15000`) — the managed-retry budget per unit.
+- `--probe-secs` / `RECO_PROBE_SECS` (default `3`) — the slow-reader / GC-pin probe window.
 - `--target-rps R` — open-loop mode: a fixed total arrival rate; latency is measured from each op's
   scheduled time (coordinated-omission-free). `0` = closed-loop saturation.
+
+## The read/write mix
+
+**The default run is a MIX** (`rmp` #714). Before this, the default drove a read-only ladder against a
+**frozen** graph — and a frozen graph cannot exercise one single thing Graphus's concurrency design
+exists for: MVCC snapshot-isolation reads that neither abort writers nor are aborted by them, the
+off-thread reader pool, SSI for writers, or the GC pin a long reader holds. It measured the one
+workload nobody runs in production.
+
+Now every rung of the ladder is driven **twice, back to back, against the same graph**:
+
+| arm | writers | role |
+|---|---|---|
+| `readonly` | off | the **CONTROL**. Runs **first**, so it warms the buffer pool for the treatment — which makes the measured cost of the mix a conservative **lower bound**. |
+| `mixed` | on | the **TREATMENT**, and the default. Every headline figure is drawn from this arm. |
+
+The writers are a production-shaped **trickle, not a storm**: 2 writers, one business unit every 20 ms,
+each unit driven through **managed retry** (bounded exponential backoff + jitter — what
+`session.execute_write` does in every official driver). 25% of the units read-modify-write one of 4
+*trending* products; the rest `CREATE` a `PURCHASED` edge on a random `(user, product)` pair.
+
+### Two layers of truth, never conflated
+
+The read vector and the write vector are **never** spliced into one number (that was the defect fixed
+in `rmp` #715). They live in separate places and describe different transactions:
+
+- `throughput.*` in the report is **the READ vector**, and one coherent population: the reads of the
+  mixed arm's best rung. So `throughput.abort_rate` is the **read** abort rate — a genuinely *measured*
+  `0.0`, because an auto-commit read runs at **Snapshot Isolation** and *cannot* abort (invariant I1),
+  not a placeholder.
+- The **WRITE vector** lives in `metadata.workload`, split into the **ENGINE** layer
+  (`engine_txn_attempts` / `engine_txn_aborts` / `engine_abort_rate` — the contention the engine saw)
+  and the **APPLICATION** layer (`write_units` / `write_committed` / `write_commit_rate` — the outcome
+  the user sees). A high engine abort rate *with* a full application commit rate is a **healthy** system
+  under contention: the cost is paid in **latency** (`write_p99_ms`, which is retry-inclusive), never in
+  lost work.
+
+### The cost of the mix (measured, 16-core idle host, `fast` profile)
+
+| clients | control (writers off) | mixed (writers on) | cost of the mix | writes committed |
+|---:|---:|---:|---:|---:|
+| 1 | 194.3 ops/s | 189.8 ops/s | −2.4% | 704 |
+| 2 | 384.3 ops/s | 376.1 ops/s | −2.1% | 356 |
+| 4 | 575.1 ops/s | 547.4 ops/s | −4.8% | 237 |
+| 8 | 793.0 ops/s | 728.0 ops/s | **−8.2%** | 174 |
+
+Serving a production-shaped write stream underneath the read ladder costs **single-digit percent** of
+read throughput, and the writers commit **100%** of their business units (`write_commit_rate = 1.0`,
+0 retry-budget exhaustions). A read-only ladder can produce **none** of this.
+
+### The invariants it asserts
+
+A violation **fails the run** — none of these is a performance threshold; they are statements that must
+simply be **true**.
+
+| | invariant |
+|---|---|
+| **I1** | **Reads never abort.** An auto-commit read runs at Snapshot Isolation, so it can neither abort a writer nor be aborted by one. |
+| **I2** | **Writers make progress.** Application commit rate `1.0`, zero retry-budget exhaustions (no livelock). |
+| **I3** | **Readers are not starved by writers.** Every mixed rung drains its full read budget and stays above a liveness floor vs its own control. |
+| **I4** | **A serialization abort stays retryable** — the `rmp` #612 detector (an SSI abort dressed in a title the official drivers refuse to retry silently breaks `execute_write` for every driver application). |
+| **I5** | **A slow reader does not stall the writers** — the GC pin (`rmp` #551). A deliberately heavy reader is held open while the writers commit underneath it. |
+| **I6** | **No read ever fails with an internal server error** (`Neo.DatabaseError.*`). |
+
+Two honesty notes, because a gate that cannot fire is worse than no gate:
+
+- **I4 is currently armed but idle.** At the production-shaped default the writers rarely collide, so
+  the measured engine abort rate is **~0** (0 aborts in 1752 attempts). The detector would fail the run
+  on a poisoned abort — but with no abort to classify, it **verifies nothing** on a default run, and it
+  says so in its own output rather than printing a reassuring pass. Raise `--writers`, lower
+  `--write-every-ms`, or lower `--hot-keys` to actually exercise it.
+- **I6 currently FAILS, and it is meant to.** Turning the mix on immediately exposed a real server bug,
+  filed as **`rmp` #721**: an off-thread reader intermittently cannot locate a record
+  (`Prop/Rel store page N not allocated`) while a writer **grows** the store, because its location
+  oracle is a *snapshot* while the record content it navigates is *live*. The writers-off control arm of
+  the very same ladder is **clean at every rung** — which is exactly why a read-only ladder could never
+  have found it, and exactly why this example now runs the mix by default.
 
 ## The pieces
 

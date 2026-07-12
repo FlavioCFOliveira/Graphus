@@ -31,17 +31,49 @@
 #                       deltas + client throughput/latency; process CPU/RSS + storage are N/A remotely
 #                       and no baseline is gated), and DROPS the isolated database on exit.
 #
+# THE DEFAULT RUN IS A READ/WRITE MIX (rmp #714). A production graph workload is never a read-only
+# ladder against a FROZEN graph: reads are served WHILE writes commit underneath them, and Graphus's
+# entire concurrency story — MVCC snapshot-isolation auto-commit reads that neither abort writers nor
+# are aborted by them, the off-thread reader pool (#336/#543), SSI for writers (#171), the GC pin a
+# long reader holds (#551) — exists precisely to make that mix work. So every rung of the ladder is
+# driven TWICE, back to back, against the same graph:
+#
+#   arm `readonly` (CONTROL)   — writers OFF. Runs FIRST, warming the buffer pool for the treatment,
+#                                which makes the measured cost of the mix a conservative LOWER bound.
+#   arm `mixed`    (TREATMENT) — writers ON. THIS is the default and the headline.
+#
+# The delta between the two arms is THE COST OF THE MIX, and the run ASSERTS the concurrency
+# invariants: I1 reads never abort (an auto-commit read runs at Snapshot Isolation); I2 writers commit
+# (managed retry, no livelock); I3 readers are not starved; I4 an SSI abort stays retryable (the #612
+# detector); I5 a slow reader does not stall the writers (the GC pin, #551); I6 no read ever fails with
+# an INTERNAL server error (Neo.DatabaseError.*). RECO_WRITERS=0 restores the pure read-only ladder,
+# which stays a legitimate isolation experiment.
+#
+# I6 CURRENTLY FAILS, and it is meant to: switching the mix on immediately exposed a real server bug,
+# filed as rmp #721 — an off-thread reader intermittently cannot locate a record ("Prop/Rel store page
+# N not allocated") while a writer GROWS the store, because its location oracle is a snapshot while the
+# record content it navigates is live. The writers-off control arm of the very same ladder is clean at
+# every rung, which is exactly why a read-only ladder could never have found it.
+#
 # Usage:
-#   examples/product-recommendations/run.sh                         # local self-boot, fast profile
+#   examples/product-recommendations/run.sh                         # local self-boot, fast profile, MIX ON
+#   RECO_WRITERS=0                  examples/product-recommendations/run.sh   # read-only baseline (the off switch)
 #   RECO_PROFILE=large              examples/product-recommendations/run.sh   # evidence-scale local run
 #   RECO_READER_THREADS=4           examples/product-recommendations/run.sh   # pin the reader pool (local)
 #   GRAPHUS_TARGET_BOLT=bolt+ssc://host:7687 GRAPHUS_TARGET_REST=https://host:7474 \
 #     GRAPHUS_TARGET_USER=graphus GRAPHUS_TARGET_PASSWORD=graphus-local \
 #     GRAPHUS_TARGET_TLS_INSECURE=1  examples/product-recommendations/run.sh  # attach to a running instance
 #
-# External-mode knobs (all optional): RECO_EXTERNAL_LADDER (default 1,2,4,8,16), RECO_EXTERNAL_OPS
-# (default 2000), RECO_WRITERS (default 0), RECO_WRITE_EVERY_MS (default 0), RECO_TARGET_RPS (default 0
-# = closed-loop), RECO_MIN_OPS_PER_CLIENT (default 150), RECO_AUTO_EXTEND (default 1).
+# Mix knobs (both modes, all optional): RECO_WRITERS (default 2), RECO_WRITE_EVERY_MS (default 20),
+# RECO_HOT_WRITE_FRACTION (default 0.25 — the share of writes that read-modify-write a TRENDING
+# product; this is the shape that lets SSI fire, but MEASURED at the default rate the engine abort rate
+# is ~0, so the retry path is armed-but-idle — raise the writers / lower the pacing to exercise it), RECO_HOT_KEYS (default 4),
+# RECO_MIX_BASELINE (default 1 — run the readonly CONTROL arm so the cost of the mix is measurable),
+# RECO_RETRY_BUDGET_MS (default 15000), RECO_PROBE_SECS (default 3 — the slow-reader/GC-pin probe).
+#
+# Other knobs (all optional): RECO_EXTERNAL_LADDER (default 1,2,4,8,16), RECO_EXTERNAL_OPS
+# (default 2000), RECO_TARGET_RPS (default 0 = closed-loop), RECO_MIN_OPS_PER_CLIENT (default 150),
+# RECO_AUTO_EXTEND (default 1).
 #
 # Requirements: a Unix host, bash, curl. LOCAL mode's /proc server sampling is Linux-specific (the run
 # still works on macOS but the CPU/RSS/IO server evidence is skipped there). No node / openssl needed.
@@ -106,8 +138,8 @@ PROFILE="${RECO_PROFILE:-fast}"
 
 # Ladder + op-budget per profile (LOCAL). `fast` is small and CI-quick; `large` is an evidence sweep.
 case "$PROFILE" in
-  fast)  LADDER="1,2,4,8";           OPS_PER_RUNG=1500;  WRITE_EVERY_MS=0;  POOL_PAGES=8192 ;;
-  large) LADDER="1,2,4,8,16,32,64";  OPS_PER_RUNG=20000; WRITE_EVERY_MS=50; POOL_PAGES=49152 ;;
+  fast)  LADDER="1,2,4,8";           OPS_PER_RUNG=1500;  POOL_PAGES=8192 ;;
+  large) LADDER="1,2,4,8,16,32,64";  OPS_PER_RUNG=20000; POOL_PAGES=49152 ;;
   *) echo "${RED}fatal: unknown RECO_PROFILE '$PROFILE' (use fast|large)${RESET}" >&2; exit 2 ;;
 esac
 
@@ -115,11 +147,37 @@ esac
 # auto-extends past the tested top rung until throughput plateaus).
 EXT_LADDER="${RECO_EXTERNAL_LADDER:-1,2,4,8,16}"
 EXT_OPS="${RECO_EXTERNAL_OPS:-2000}"
-EXT_WRITERS="${RECO_WRITERS:-0}"
-EXT_WRITE_EVERY_MS="${RECO_WRITE_EVERY_MS:-0}"
 EXT_TARGET_RPS="${RECO_TARGET_RPS:-0}"
 MIN_OPS_PER_CLIENT="${RECO_MIN_OPS_PER_CLIENT:-150}"
 AUTO_EXTEND="${RECO_AUTO_EXTEND:-1}"
+
+# --- The read/write MIX — ON BY DEFAULT, in BOTH modes (rmp #714) ---------------------------------
+# A modest, production-shaped write rate running underneath the read ladder — a trickle, not a storm.
+# RECO_WRITERS=0 is the documented OFF switch that restores the pure read-only ladder.
+WRITERS="${RECO_WRITERS:-2}"
+WRITE_EVERY_MS="${RECO_WRITE_EVERY_MS:-20}"
+HOT_WRITE_FRACTION="${RECO_HOT_WRITE_FRACTION:-0.25}"
+HOT_KEYS="${RECO_HOT_KEYS:-4}"
+MIX_BASELINE="${RECO_MIX_BASELINE:-1}"
+RETRY_BUDGET_MS="${RECO_RETRY_BUDGET_MS:-15000}"
+PROBE_SECS="${RECO_PROBE_SECS:-3}"
+# The mix flags are IDENTICAL in both modes: the same driver, the same workload shape, whether the
+# target is self-booted or attached.
+MIX_FLAGS=(
+  --writers "$WRITERS"
+  --write-every-ms "$WRITE_EVERY_MS"
+  --hot-write-fraction "$HOT_WRITE_FRACTION"
+  --hot-keys "$HOT_KEYS"
+  --mix-baseline "$MIX_BASELINE"
+  --retry-budget-ms "$RETRY_BUDGET_MS"
+  --probe-secs "$PROBE_SECS"
+)
+if [ "$WRITERS" -gt 0 ]; then
+  info_mix="read/write MIX ON — ${WRITERS} writer(s), one business unit every ${WRITE_EVERY_MS}ms, \
+${HOT_WRITE_FRACTION} of them a read-modify-write of ${HOT_KEYS} trending product(s)"
+else
+  info_mix="read/write mix OFF (RECO_WRITERS=0) — a pure read ladder against a FROZEN graph"
+fi
 
 # The generator profile: LOCAL uses the ladder profile ($PROFILE); EXTERNAL defaults to the small
 # `tiny` graph so the whole graph loads quickly over Bolt UNWIND writes even against a small/remote or
@@ -335,7 +393,8 @@ fi
 # Step 4 — the read-heavy CONCURRENCY LADDER + evidence
 # ==================================================================================================
 if [ "$MODE" = external ]; then
-  section "Step 4 — concurrent read ladder over Bolt-TCP+TLS (attach) + /metrics evidence"
+  section "Step 4 — concurrent read/write MIX ladder over Bolt-TCP+TLS (attach) + /metrics evidence"
+  info "$info_mix"
   rm -f "$EVIDENCE_DIR/report.json" "$EVIDENCE_DIR/report.md"
 
   # Scrape /metrics BEFORE the ladder (after the load, so only the ladder's work is in the window).
@@ -355,15 +414,19 @@ if [ "$MODE" = external ]; then
     --bolt "$BOLT_URI" --user "$DRIVER_USER" --password "$DRIVER_PW" --db "$TARGET_DB" \
     --ladder "$EXT_LADDER" --ops-per-rung "$EXT_OPS" \
     --min-ops-per-client "$MIN_OPS_PER_CLIENT" \
-    --write-every-ms "$EXT_WRITE_EVERY_MS" --writers "$EXT_WRITERS" \
+    "${MIX_FLAGS[@]}" \
     --target-rps "$EXT_TARGET_RPS" "${AUTO_FLAG[@]}" \
     --users "$GEN_USERS" --products "$GEN_PRODUCTS" \
     --friends "$GEN_FRIENDS" --purchased "$GEN_PURCHASED" \
     --scenario "product-recommendations" 2>&1 \
     | tee "$BENCH_LOG" | sed 's/^/  /'
+  BENCH_STATUS="${PIPESTATUS[0]}"
   set -e
   LADDER_MS=$(( $(_harness_now_ms) - LADDER_START_MS ))
   BENCH_OUT="$(cat "$BENCH_LOG")"
+  # The driver exits non-zero when a concurrency INVARIANT was violated (I1..I5) or the reader error
+  # rate breached its threshold. That is the whole point of asserting them, so it must fail the run.
+  assert "every concurrency invariant held (I1..I6)" "0" "$BENCH_STATUS"
 
   # Scrape /metrics AFTER the ladder.
   harness_scrape_metrics "$METRICS_AFTER" || info "metrics-after scrape failed (non-fatal)"
@@ -379,15 +442,76 @@ if [ "$MODE" = external ]; then
   P50_MS="$(kv "$BENCH_STATS" p50_ms)"
   P99_MS="$(kv "$BENCH_STATS" p99_ms)"
   P999_MS="$(kv "$BENCH_STATS" p999_ms)"
+  # The READ vector's abort rate — a MEASURED 0.0 (an auto-commit read runs at Snapshot Isolation and
+  # cannot abort: invariant I1). It is NOT the writers' rate, and the two are never merged (rmp #714).
   ABORT_RATE="$(kv "$BENCH_STATS" abort_rate)"
+  HEADLINE_ARM="$(kv "$BENCH_STATS" arm)"
+  INVARIANTS_OK="$(kv "$BENCH_STATS" invariants_ok)"
 
-  # Forward the full per-rung scaling curve + the client-side scaling verdict as report notes.
+  # --- The WRITE vector, kept STRUCTURALLY APART from the read vector above (rmp #714/#715) --------
+  # ENGINE layer (what contention the engine actually saw) and APPLICATION layer (what the business
+  # units achieved). `na` means NOT MEASURED — the driver never renders an unmeasured figure as 0.
+  W_ATTEMPTS="$(kv "$BENCH_STATS" write_attempts)"
+  W_ABORTS="$(kv "$BENCH_STATS" write_aborts)"
+  W_ENGINE_ABORT_RATE="$(kv "$BENCH_STATS" engine_abort_rate)"
+  W_UNITS="$(kv "$BENCH_STATS" write_units)"
+  W_COMMITTED="$(kv "$BENCH_STATS" write_committed)"
+  W_COMMIT_RATE="$(kv "$BENCH_STATS" write_commit_rate)"
+  W_RETRIES_PER_COMMIT="$(kv "$BENCH_STATS" write_retries_per_commit)"
+  W_MAX_RETRIES="$(kv "$BENCH_STATS" write_max_retries)"
+  W_EXHAUSTED="$(kv "$BENCH_STATS" write_exhausted)"
+  W_OTHER_ERRORS="$(kv "$BENCH_STATS" write_other_errors)"
+  W_P50_MS="$(kv "$BENCH_STATS" write_p50_ms)"
+  W_P99_MS="$(kv "$BENCH_STATS" write_p99_ms)"
+  W_P999_MS="$(kv "$BENCH_STATS" write_p999_ms)"
+  W_OPS_PER_SEC="$(kv "$BENCH_STATS" write_ops_per_sec)"
+  # THE COST OF THE MIX: the mixed arm's best rung against its own writers-off control rung.
+  CONTROL_BEST_OPS="$(kv "$BENCH_STATS" control_best_ops_per_sec)"
+  MIX_COST_PCT="$(kv "$BENCH_STATS" mix_cost_read_ops_pct)"
+
+  # Only forward a write/mix param when it was actually MEASURED. `na` = absent, and an absent vector
+  # must stay ABSENT from the report rather than be zero-filled (report schema v3, rmp #711).
+  MIX_PARAMS=()
+  add_measured_param() {   # add_measured_param <key> <value>
+    [ -n "$2" ] && [ "$2" != "na" ] && MIX_PARAMS+=(--param "$1=$2")
+    return 0
+  }
+  add_measured_param "headline_arm"             "$HEADLINE_ARM"
+  add_measured_param "writer_mode"              "$([ "$WRITERS" -gt 0 ] && echo managed-retry || echo none)"
+  add_measured_param "write_every_ms"           "$WRITE_EVERY_MS"
+  add_measured_param "hot_write_fraction"       "$HOT_WRITE_FRACTION"
+  add_measured_param "hot_keys"                 "$HOT_KEYS"
+  add_measured_param "write_retry_budget_ms"    "$RETRY_BUDGET_MS"
+  add_measured_param "engine_txn_attempts"      "$W_ATTEMPTS"
+  add_measured_param "engine_txn_aborts"        "$W_ABORTS"
+  add_measured_param "engine_abort_rate"        "$W_ENGINE_ABORT_RATE"
+  add_measured_param "write_units"              "$W_UNITS"
+  add_measured_param "write_committed"          "$W_COMMITTED"
+  add_measured_param "write_commit_rate"        "$W_COMMIT_RATE"
+  add_measured_param "write_retries_per_commit" "$W_RETRIES_PER_COMMIT"
+  add_measured_param "write_max_retries"        "$W_MAX_RETRIES"
+  add_measured_param "write_retry_budget_exhausted" "$W_EXHAUSTED"
+  add_measured_param "write_other_errors"       "$W_OTHER_ERRORS"
+  add_measured_param "write_p50_ms"             "$W_P50_MS"
+  add_measured_param "write_p99_ms"             "$W_P99_MS"
+  add_measured_param "write_p999_ms"            "$W_P999_MS"
+  add_measured_param "write_ops_per_sec"        "$W_OPS_PER_SEC"
+  add_measured_param "control_best_ops_per_sec" "$CONTROL_BEST_OPS"
+  add_measured_param "mixed_best_ops_per_sec"   "$BEST_OPS_PER_SEC"
+  add_measured_param "mix_cost_read_ops_pct"    "$MIX_COST_PCT"
+  add_measured_param "concurrency_invariants_ok" "$INVARIANTS_OK"
+
+  # Forward the full per-rung PAIRED scaling curve (both arms), the client-side scaling verdict, and
+  # every invariant's PASS/FAIL verdict as report notes.
   RUNG_NOTES=()
   while IFS= read -r line; do
     [ -n "$line" ] && RUNG_NOTES+=(--note "$line")
   done < <(printf '%s\n' "$BENCH_OUT" | grep '^GRAPHUS_RECO_BENCH_RUNG ' || true)
   VERDICT_LINE="$(printf '%s\n' "$BENCH_OUT" | grep 'CLIENT-SIDE VERDICT' | head -n1 || true)"
   [ -n "$VERDICT_LINE" ] && RUNG_NOTES+=(--note "$VERDICT_LINE")
+  while IFS= read -r line; do
+    [ -n "$line" ] && RUNG_NOTES+=(--note "INVARIANT $line")
+  done < <(printf '%s\n' "$BENCH_OUT" | grep -E '^(PASS|FAIL) I[0-9]' || true)
 
   # Emit the EXTERNAL-mode evidence report via measure_target (server-side /metrics delta + the
   # client-measured throughput/latency; process CPU/RSS + storage are N/A remotely).
@@ -398,7 +522,7 @@ if [ "$MODE" = external ]; then
     "$MEASURE_BIN" \
       --evidence-dir "$EVIDENCE_DIR" \
       --scenario "product-recommendations" \
-      --description "read-heavy product recommendations: concurrent read scaling over Bolt-TCP+TLS (attach mode)" \
+      --description "read-heavy product recommendations: concurrent read scaling under a production-shaped read/write MIX over Bolt-TCP+TLS (attach mode)" \
       --database "$TARGET_DB" \
       --metrics-before "$METRICS_BEFORE" --metrics-after "$METRICS_AFTER" \
       --nodes "$NODE_COUNT" --rels "$REL_COUNT" \
@@ -412,18 +536,30 @@ if [ "$MODE" = external ]; then
       --param "ladder=$EXT_LADDER" \
       --param "ops_per_rung=$EXT_OPS" \
       --param "min_ops_per_client=$MIN_OPS_PER_CLIENT" \
-      --param "writers=$EXT_WRITERS" \
+      --param "writers=$WRITERS" \
       --param "target_rps=$EXT_TARGET_RPS" \
       --param "best_clients=${BEST_CLIENTS:-?}" \
       --param "best_ops_per_sec=${BEST_OPS_PER_SEC:-?}" \
       --param "user_count=$GEN_USERS" --param "product_count=$GEN_PRODUCTS" \
       --param "friend_count=$GEN_FRIENDS" --param "purchased_count=$GEN_PURCHASED" \
       --param "node_count=$NODE_COUNT" --param "relationship_count=$REL_COUNT" \
+      "${MIX_PARAMS[@]}" \
       "${RUNG_NOTES[@]}" \
       --note "Client throughput/latency are measured by reco_bench over Bolt-TCP+TLS; the server-side channel is the /metrics before/after delta (no /proc — remote/attached instance)." \
+      --note "TWO LAYERS OF TRUTH, never conflated (rmp #714/#715). READ: throughput.* is ONE coherent set — the reads of the best '${HEADLINE_ARM:-?}' rung (C=${BEST_CLIENTS:-?}) at ${BEST_OPS_PER_SEC:-?} ops/s, and throughput.abort_rate=${ABORT_RATE:-?} is the READ abort rate. It is a MEASURED zero, not a placeholder: a standalone auto-commit read runs at SNAPSHOT ISOLATION (rmp #543/#545), so it can neither abort a writer nor be aborted by one (invariant I1). WRITE: the writers' evidence lives in metadata.workload, split into the ENGINE layer (engine_txn_attempts/engine_txn_aborts/engine_abort_rate) and the APPLICATION layer (write_units/write_committed/write_commit_rate). A high engine abort rate WITH a full application commit rate is a HEALTHY system under contention: the cost is LATENCY (write_p99_ms, which is retry-inclusive), not lost work." \
+      --note "THE COST OF THE MIX: the mixed arm's best rung ran at ${BEST_OPS_PER_SEC:-?} ops/s against its writers-off CONTROL rung's ${CONTROL_BEST_OPS:-na} ops/s (delta ${MIX_COST_PCT:-na}%). The control arm runs FIRST at every rung, warming the buffer pool for the treatment, so this cost is a conservative LOWER bound. A read-only ladder against a frozen graph structurally cannot produce this figure." \
       --assert \
       && info "external evidence written to $EVIDENCE_DIR" \
       || { info "measure_target reported an invariant violation or error"; FAILURES=$((FAILURES + 1)); }
+    if [ "$WRITERS" -gt 0 ]; then
+      assert "the attach run drove readers AND writers against the same graph" "yes" \
+        "$([ -n "$W_COMMITTED" ] && [ "$W_COMMITTED" != "na" ] && [ "${W_COMMITTED:-0}" -gt 0 ] && echo yes || echo no)"
+      assert "the report separates the READ and WRITE vectors" "yes" \
+        "$([ -f "$EVIDENCE_DIR/report.json" ] && grep -q '"engine_abort_rate"' "$EVIDENCE_DIR/report.json" \
+           && grep -q '"write_commit_rate"' "$EVIDENCE_DIR/report.json" && echo yes || echo no)"
+      assert "the report carries the COST OF THE MIX vs the read-only baseline" "yes" \
+        "$([ -f "$EVIDENCE_DIR/report.json" ] && grep -q '"mix_cost_read_ops_pct"' "$EVIDENCE_DIR/report.json" && echo yes || echo no)"
+    fi
     assert "external report.json produced (measurement_mode=external)" "yes" \
       "$([ -f "$EVIDENCE_DIR/report.json" ] && grep -q '"measurement_mode": *"external"' "$EVIDENCE_DIR/report.json" && echo yes || echo no)"
     assert "report.json carries server_metrics deltas" "yes" \
@@ -433,7 +569,8 @@ if [ "$MODE" = external ]; then
     FAILURES=$((FAILURES + 1))
   fi
 else
-  section "Step 4 — concurrent read ladder (many simultaneous UDS-Bolt connections)"
+  section "Step 4 — concurrent read/write MIX ladder (many simultaneous UDS-Bolt connections)"
+  info "$info_mix"
   rm -f "$EVIDENCE_DIR/report.json" "$EVIDENCE_DIR/report.md"
   # The recommendation database's REAL on-disk footprint (rmp #699): the store image and the WAL,
   # which is a DIRECTORY of `seg.<lsn>` segment files. `recodb` is an additional database, so it lives
@@ -448,6 +585,7 @@ else
   done
   info "store: $RECO_STORE"
   info "WAL dir: $RECO_WAL ; logical CSV: ${LOGICAL_BYTES} B"
+  set +e
   BENCH_OUT="$("$BENCH" \
     --socket "$SOCKET" --user "$ADMIN_USER" --password "$ADMIN_PW" --db "$TARGET_DB" \
     --server-pid "$SERVER_PID" --ladder "$LADDER" --ops-per-rung "$OPS_PER_RUNG" \
@@ -456,12 +594,36 @@ else
     --friends "$GEN_FRIENDS" --purchased "$GEN_PURCHASED" \
     --store "$RECO_STORE" --wal "$RECO_WAL" --logical-bytes "$LOGICAL_BYTES" \
     --scenario "product-recommendations" --evidence-dir "$EVIDENCE_DIR" \
-    --write-every-ms "$WRITE_EVERY_MS" 2>&1)" || true
+    "${MIX_FLAGS[@]}" 2>&1)"
+  BENCH_STATUS=$?
+  set -e
   printf '%s\n' "$BENCH_OUT" | sed 's/^/  /'
+  # The driver exits non-zero when a concurrency INVARIANT was violated (I1..I5) or the reader error
+  # rate breached its threshold. Swallowing that status (as this did) makes the assertions decorative.
+  assert "every concurrency invariant held (I1..I6)" "0" "$BENCH_STATUS"
   assert "evidence report.json was produced" "yes" \
     "$([ -f "$EVIDENCE_DIR/report.json" ] && echo yes || echo no)"
   assert "evidence report.md was produced" "yes" \
     "$([ -f "$EVIDENCE_DIR/report.md" ] && echo yes || echo no)"
+
+  # --- The MIX is the point of the default run (rmp #714) ------------------------------------------
+  if [ "$WRITERS" -gt 0 ]; then
+    BENCH_STATS="$(printf '%s' "$BENCH_OUT" | sed -n 's/^GRAPHUS_RECO_BENCH_STATS //p' | head -n1)"
+    W_COMMITTED="$(kv "$BENCH_STATS" write_committed)"
+    W_COMMIT_RATE="$(kv "$BENCH_STATS" write_commit_rate)"
+    W_ENGINE_ABORT_RATE="$(kv "$BENCH_STATS" engine_abort_rate)"
+    MIX_COST_PCT="$(kv "$BENCH_STATS" mix_cost_read_ops_pct)"
+    assert "the default run drove readers AND writers against the same graph" "yes" \
+      "$([ -n "$W_COMMITTED" ] && [ "$W_COMMITTED" != "na" ] && [ "${W_COMMITTED:-0}" -gt 0 ] && echo yes || echo no)"
+    assert "every business unit COMMITTED (managed retry; no livelock)" "1.000000" "${W_COMMIT_RATE:-na}"
+    assert "the report separates the READ and WRITE vectors" "yes" \
+      "$([ -f "$EVIDENCE_DIR/report.json" ] && grep -q '"engine_abort_rate"' "$EVIDENCE_DIR/report.json" \
+         && grep -q '"write_commit_rate"' "$EVIDENCE_DIR/report.json" && echo yes || echo no)"
+    assert "the report carries the COST OF THE MIX vs the read-only baseline" "yes" \
+      "$([ -f "$EVIDENCE_DIR/report.json" ] && grep -q '"mix_cost_read_ops_pct"' "$EVIDENCE_DIR/report.json" && echo yes || echo no)"
+    info "cost of the mix at the best rung: ${MIX_COST_PCT:-na}% read throughput vs the writers-off control"
+    info "engine abort rate ${W_ENGINE_ABORT_RATE:-na} (SSI contention) with an application commit rate of ${W_COMMIT_RATE:-na}"
+  fi
   # Evidence honesty (rmp #699): total_millis must be the LADDER's wall-time, and the storage section
   # must carry the real store + WAL bytes — both were zero/near-zero before.
   assert "report total_millis is the ladder wall-time (not the emitter's)" "yes" \
@@ -489,7 +651,15 @@ fi
 # ==================================================================================================
 # Step 5 — regression gate vs the committed baseline (LOCAL fast profile only; structural metrics)
 # ==================================================================================================
-if [ "$MODE" = local ] && [ "$PROFILE" = "fast" ] && [ -f "$BASELINE" ] && [ -f "$EVIDENCE_DIR/report.json" ]; then
+if [ "$MODE" = local ] && [ "$PROFILE" = "fast" ] && [ "$WRITERS" -eq 0 ]; then
+  # The committed baseline was captured from the DEFAULT run, which is the MIX. RECO_WRITERS=0 is a
+  # different workload (a read-only ladder against a frozen graph), so diffing it against the mixed
+  # baseline would be a red gate that means nothing — the same family of lie as a green gate that
+  # cannot fire. Skip it, and say why.
+  section "regression gate vs committed baseline (structural metrics)"
+  info "SKIPPED: RECO_WRITERS=0 is the read-only ISOLATION experiment, not the default workload the"
+  info "baseline was captured from (the mix). Comparing them would gate one workload against another."
+elif [ "$MODE" = local ] && [ "$PROFILE" = "fast" ] && [ -f "$BASELINE" ] && [ -f "$EVIDENCE_DIR/report.json" ]; then
   section "regression gate vs committed baseline (structural metrics)"
   CMP_OUT="$("$CMP_BIN" "$BASELINE" "$EVIDENCE_DIR/report.json" 2>&1)" || true
   printf '%s\n' "$CMP_OUT" | sed 's/^/  /'
