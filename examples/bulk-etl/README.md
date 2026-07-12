@@ -573,6 +573,15 @@ The `fast` column is included only to show what a smoke-scale run *cannot* tell 
 Round-trip losslessness is proven by content hash at every scale (`default =
 ef61b4b3a9ebb44de27ff88c2c14433e`).
 
+> **`rmp #718` note.** The **ingest-throughput** figures in this envelope (notably `large` at
+> 30,877 elem/s ⚠️, and the `Reopen ÷ import` cell that read low *only because the import had degraded*)
+> are the **pre-fix** measurements that first exposed the quadratic importer. `#718` is now **fixed** —
+> the importer auto-sizes its buffer pool and scales approximately linearly (see
+> [§1 below](#1-the-offline-importer-was-quadratic--rmp-718-found-here-now-fixed)). The **structural
+> footprint** columns (store bytes, per-element bytes, amplifications, WAL residual) are **unaffected**
+> by the fix — the durable store is byte-identical — so the committed baseline gate is unchanged. This
+> canonical envelope will be re-captured on the reference host as a follow-up.
+
 ### The committed baseline + regression gate
 
 `baseline.json` (committed, non-git-ignored) is a **`default`-profile reference run**, captured by
@@ -615,30 +624,41 @@ The point of rescaling this example was to make it capable of exposing what it c
 It did so immediately. **These are server findings, reproduced and quantified by the example — they are
 a success of the example, not a failure of it.**
 
-### 1. The offline importer is QUADRATIC — `rmp #718` (NEW, filed by this work)
+### 1. The offline importer WAS QUADRATIC — `rmp #718` (found here, now FIXED)
 
-Look at the throughput row above: **133,066 elem/s at `default` collapses to 30,877 elem/s at
-`large`** — 4× the data for **16.8× the time**, i.e. **O(N²·⁰)**. Measured standalone, outside the
-harness, and reproducible:
+When this example was rescaled, its throughput row exposed a collapse: **133,066 elem/s at `default`
+fell to 30,877 elem/s at `large`** — 4× the data for **16.8× the time**, i.e. **O(N²·⁰)**. The tool
+whose entire purpose is loading large graphs was the one that could not.
 
-| Profile | Elements | Import | Throughput |
-|---------|---------:|-------:|-----------:|
-| `fast` | 4,829 | 0.05 s | 96,636 elem/s |
-| `default` | 164,389 | 1.27 s | 129,403 elem/s |
-| `large` | 657,589 | **21.30 s** | **30,877 elem/s** |
+**Root cause (confirmed, not inferred):** `graphus-bulk` hard-coded `const POOL_PAGES: usize = 256` — a
+**2 MiB** buffer pool — on the premise (stated in its own comment) that "a bulk load is
+sequential-write heavy". That premise is **false for the relationship phase**: `create_rel` prepends
+each edge into the incident-relationship chain of **both** endpoint nodes and relinks the previous
+chain head, and those pages are scattered across the whole store. The relationship phase is
+**random-access over the entire store**. Once the store outgrew the 2 MiB pool the miss rate approached
+100% and every edge insert evicted and re-read pages — superlinear cost. (Measured: the `default` store
+is 3,760 pages ≈ 15× the old pool; the `large` store is 15,033 pages ≈ 59× it.)
 
-**Root cause (confirmed, not inferred):** `crates/graphus-bulk/src/bin/graphus_bulk.rs:59` hard-codes
-`const POOL_PAGES: usize = 256` — a **2 MiB** buffer pool — on the premise (stated in its own comment)
-that "a bulk load is sequential-write heavy". That premise is **false for the relationship phase**:
-`create_rel` prepends each edge into the incident-relationship chain of **both** endpoint nodes, and the
-endpoints are scattered across the whole node store. The relationship phase is **random-access over the
-entire store**. Once the store outgrows the 2 MiB pool the miss rate approaches 100% and every edge
-insert evicts and re-reads pages.
+**The fix (`rmp #718`):** the importer now **auto-sizes** its buffer pool to the store the load will
+build, reusing the same `graphus-sysres` hardware probe the server uses (`rmp #617`): it estimates the
+store from its own input size (a fixed-record property-graph store measures ~6× its CSV; it provisions
+8×), bounded above by a fraction of host RAM (capped at 2 GiB) and floored at the historical 256 pages
+so a tiny load is never over-provisioned. An operator can pin it with `--buffer-pool-pages <n>` (or
+`GRAPHUS_BULK_BUFFER_POOL_PAGES`; `0` = auto). The pool is a pure RAM parameter — the durable store it
+writes is **byte-identical** regardless of pool size (verified by SHA-256), so durability and the
+recovery contract are unchanged.
 
-**Proof:** rebuilding the identical binary with only `POOL_PAGES = 32768` (a 256 MiB pool) cuts the
-`large` import from **21.30 s → 8.96 s — 2.38× faster**. The server already has adaptive,
-hardware-aware pool sizing (`graphus-sysres`, `rmp #617`); the `graphus-bulk` CLI simply bypasses it.
-Filed as **`rmp #718`**.
+**Result (before → after, same 16-core x86_64 host, standalone `graphus-bulk import`):**
+
+| Profile | Elements | Before (256-page pool) | After (auto-sized) | Speed-up |
+|---------|---------:|-----------------------:|-------------------:|---------:|
+| `default` | 164,389 | 140,264 elem/s | **190,706 elem/s** | 1.36× |
+| `large` | 657,589 | 51,475 elem/s | **163,295 elem/s** | 3.17× |
+
+The `default`→`large` throughput degradation drops from **2.72× to 1.17×** — the load now scales
+approximately linearly, and the small load did **not** regress (it got faster: a right-sized pool
+eliminates the relationship-phase thrashing without the allocation cost of an over-large one). The
+`large` import auto-sizes to a 20,291-page (158.5 MiB) pool that holds its 15,033-page store entirely.
 
 *A 47-millisecond example could never have seen this.* That is the entire argument for the rescale.
 
