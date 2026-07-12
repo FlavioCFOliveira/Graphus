@@ -384,3 +384,112 @@ fn dump_import_round_trips_to_an_identical_graph() {
         "relationship set must round-trip identically"
     );
 }
+
+// ------------------------------------------------------------------------------------------------
+// Opt-in persist-id (`rmp` #681): the external `:ID` is also stored as a queryable string property.
+// ------------------------------------------------------------------------------------------------
+
+/// Returns a node's string property `key`, if present, resolving tokens and taking the newest value.
+fn node_string_prop(store: &mut Store, id: u64, key: &str) -> Option<String> {
+    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for (_pid, key_token, value) in store.node_property_values(id).expect("props") {
+        if seen.insert(key_token) {
+            let name = store
+                .token_name(Namespace::PropKey, key_token)
+                .unwrap()
+                .to_owned();
+            if name == key {
+                return match value {
+                    Value::String(s) => Some(s),
+                    other => panic!("expected a String id property, got {other:?}"),
+                };
+            }
+        }
+    }
+    None
+}
+
+/// `--persist-id` with a NAMED `:ID` column stores each node's external id as a string property named
+/// after the id column, so the store can be queried by original id. It is a real property write (one
+/// extra `properties` stat per node with a non-empty id), and the relationship join still resolves
+/// against the same external ids.
+#[test]
+fn persist_id_stores_the_external_id_as_a_named_string_property() {
+    let nodes = "personId:ID,:LABEL,name:string\np1,Person,Alice\np2,Person,Bob\n";
+    let rels = ":START_ID,:END_ID,:TYPE\np1,p2,KNOWS\n";
+
+    let mut imp = BulkImporter::new(fresh_store(), DEFAULT_BATCH_SIZE, b',').with_persist_id(true);
+    imp.import_nodes(nodes.as_bytes()).expect("import nodes");
+    imp.import_relationships(rels.as_bytes())
+        .expect("import rels");
+    let (mut store, stats) = imp.finish();
+    verify_on_open(&mut store, &[]).expect("consistent");
+
+    // Two nodes, each carrying `name` + the persisted `personId` → 4 property writes total.
+    assert_eq!(stats.nodes, 2);
+    assert_eq!(stats.relationships, 1);
+    assert_eq!(stats.properties, 4, "name + persisted personId per node");
+
+    // Every node is queryable by its original id; the values are exactly the CSV `:ID` cells.
+    let ids: std::collections::BTreeSet<String> = store
+        .scan_node_ids()
+        .expect("scan")
+        .into_iter()
+        .map(|id| node_string_prop(&mut store, id, "personId").expect("persisted id property"))
+        .collect();
+    assert_eq!(
+        ids,
+        ["p1".to_owned(), "p2".to_owned()].into_iter().collect()
+    );
+}
+
+/// Without `--persist-id` (the default), a NAMED `:ID` column is a physical join key only — no id
+/// property is stored, so the durable graph is byte-identical to the pre-#681 importer.
+#[test]
+fn without_persist_id_the_named_id_is_not_stored_as_a_property() {
+    let nodes = "personId:ID,:LABEL,name:string\np1,Person,Alice\n";
+    let mut imp = BulkImporter::new(fresh_store(), DEFAULT_BATCH_SIZE, b',');
+    imp.import_nodes(nodes.as_bytes()).expect("import nodes");
+    let (mut store, stats) = imp.finish();
+
+    assert_eq!(
+        stats.properties, 1,
+        "only `name` — the id is a join key, not a property"
+    );
+    let id = store.scan_node_ids().expect("scan")[0];
+    assert_eq!(node_string_prop(&mut store, id, "personId"), None);
+}
+
+/// `--persist-id` requires the `:ID` column to be named (there is no property key otherwise): a bare
+/// `:ID` fails closed with an actionable error rather than silently importing without the queryable id.
+#[test]
+fn persist_id_requires_a_named_id_column() {
+    let nodes = ":ID,:LABEL\nx,L\n";
+    let mut imp = BulkImporter::new(fresh_store(), DEFAULT_BATCH_SIZE, b',').with_persist_id(true);
+    let err = imp.import_nodes(nodes.as_bytes()).unwrap_err().to_string();
+    assert!(
+        err.contains("persist-id") && err.contains(":ID"),
+        "clear, actionable error naming the unnamed :ID column: {err}"
+    );
+}
+
+/// An empty external `:ID` cell under `--persist-id` records no id property (there is no id to store),
+/// while a non-empty sibling row does — the property is present exactly where an id exists.
+#[test]
+fn persist_id_skips_empty_external_ids() {
+    let nodes = "personId:ID,:LABEL,name:string\n,Person,Anon\np9,Person,Named\n";
+    let mut imp = BulkImporter::new(fresh_store(), DEFAULT_BATCH_SIZE, b',').with_persist_id(true);
+    imp.import_nodes(nodes.as_bytes()).expect("import nodes");
+    let (mut store, stats) = imp.finish();
+
+    // Two nodes, two `name`s, but only ONE persisted id (the empty-:ID row stores none).
+    assert_eq!(stats.nodes, 2);
+    assert_eq!(stats.properties, 3, "2 names + 1 persisted id");
+    let persisted: Vec<String> = store
+        .scan_node_ids()
+        .expect("scan")
+        .into_iter()
+        .filter_map(|id| node_string_prop(&mut store, id, "personId"))
+        .collect();
+    assert_eq!(persisted, vec!["p9".to_owned()]);
+}

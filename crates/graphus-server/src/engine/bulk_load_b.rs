@@ -235,6 +235,7 @@ mod tests {
                 },
             ],
             id_index: 0,
+            id_name: None,
         })
     }
 
@@ -401,6 +402,7 @@ mod tests {
                 },
             ],
             id_index: 0,
+            id_name: None,
         });
         let err = ingest_mode_b_chunk(
             &coord,

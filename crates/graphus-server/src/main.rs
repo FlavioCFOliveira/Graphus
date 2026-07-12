@@ -21,6 +21,24 @@ use std::process::ExitCode;
 use graphus_server::{Server, ServerConfig};
 
 fn main() -> ExitCode {
+    // The `adopt` subcommand (`rmp` #681) is an OFFLINE, synchronous operation that never starts the
+    // server runtime: intercept it before the config-then-runtime `try_main` path. It is recognised
+    // only as the FIRST argument, so a config file literally named `adopt` is still usable as
+    // `graphus-server ./adopt` (it just cannot be the bare first token — an acceptable, documented
+    // edge given the subcommand's utility).
+    let mut args = std::env::args().skip(1);
+    if let Some(first) = args.next() {
+        if first == "adopt" {
+            return match graphus_server::adopt::run(args.collect()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("graphus-server: adopt: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+    }
+
     match try_main() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

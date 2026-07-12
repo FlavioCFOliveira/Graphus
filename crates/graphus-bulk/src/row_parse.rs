@@ -212,6 +212,7 @@ mod tests {
                 },
             ],
             id_index: 0,
+            id_name: None,
         }
     }
 

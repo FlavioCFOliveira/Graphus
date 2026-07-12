@@ -221,6 +221,9 @@ impl LoadingSession {
                     txn,
                     header,
                     &prop_key_tokens,
+                    // The network Mode A path never persists `:ID` as a property (`rmp` #681 is an
+                    // offline-import→adopt convenience); the online path already serves a live store.
+                    None,
                     &mut self.label_memo,
                     record,
                     &self.id_map,
@@ -678,6 +681,7 @@ mod tests {
                 },
             ],
             id_index: 0,
+            id_name: None,
         })
     }
 

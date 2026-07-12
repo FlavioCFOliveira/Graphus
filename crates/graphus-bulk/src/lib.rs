@@ -53,6 +53,19 @@
 //! ```
 #![forbid(unsafe_code)]
 
+/// The record-store device file an offline `graphus-bulk import` writes inside its `--db` directory.
+///
+/// The offline layout deliberately differs from the server's (`graphus.store`/`graphus.wal`): a
+/// `graphus-bulk` `--db` directory is a standalone import artifact, not a server data root. The
+/// server's `adopt` path (`rmp` #681) reads these two names to relocate an imported store into a
+/// server-servable database directory, so they are exported here as the single source of truth for
+/// the offline on-disk names (the `graphus-bulk` CLI's own `--db` layout uses them too).
+pub const IMPORT_STORE_FILE_NAME: &str = "graph.store";
+
+/// The WAL directory an offline `graphus-bulk import` writes inside its `--db` directory (a segmented
+/// directory of an `anchor` + `seg.<base>` files — `rmp` #116). See [`IMPORT_STORE_FILE_NAME`].
+pub const IMPORT_WAL_DIR_NAME: &str = "graph.wal";
+
 pub mod columnar;
 pub mod dump;
 pub mod header;
