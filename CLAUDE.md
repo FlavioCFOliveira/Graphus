@@ -68,6 +68,16 @@ Whenever you author, exercise, or validate test scenarios — especially those i
 3. **Documentation MUST be accurate and faithful to the code.**
 4. **The workflow MUST always follow these steps:** Specify → Implement → Test → Document.
 
+## Decision framework
+
+To decide what the project expects as a result — whether during evaluations and audits, or during development (code implementation) — you MUST follow these guidelines, and you MUST apply them in this exact order (**correct → safe → fast**):
+
+1. **Is it correct?** — Ask whether the result (of an evaluation or of a task) meets the stated goal, complies with the project's specification, and conforms to the applicable specifications, RFCs, or other authoritative sources.
+2. **Is it safe?** — Ask whether the decision to be made, or the task to be developed, contains no characteristic or behavior that could compromise the safe use of the deliverable in question.
+3. **Is it fast?** — Ask whether the decision to be made, or the task to be developed, is the fastest that can be achieved without compromising the correctness (exactness / precision / assertiveness) or the safety of the requirements; and ask what can be done so that the deliverable reaches the highest possible performance.
+
+If there are conflicts between these steps, or difficulty in following them, you MUST immediately ask the user how to proceed, presenting the possible options.
+
 ## Self-contained development policy
 
 Every development cycle MUST be self-contained. You must NEVER do only part of a task; each development cycle must produce a tangible result.
