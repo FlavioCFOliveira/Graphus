@@ -25,6 +25,7 @@
 #![forbid(unsafe_code)]
 
 pub mod admin;
+pub mod adopt;
 pub mod audit;
 pub mod bulk_import_mode_b;
 pub mod config;

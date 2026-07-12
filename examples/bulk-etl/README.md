@@ -111,6 +111,11 @@ Verified empirically against `graphus-bulk` (`crates/graphus-bulk/src/header.rs`
   :START_ID,:END_ID,:TYPE,since:int
   p0,p1,KNOWS,2014
   ```
+- **The `:ID` is a physical join key by default** (used only to resolve `:START_ID`/`:END_ID`), *not* a
+  queryable property. To keep it queryable after the store is served (`rmp #681`, below), name the id
+  column (e.g. `personId:ID`) and import with `graphus-bulk import … --persist-id`: each node then also
+  gets the string property named after the id column (`personId`), so `MATCH (p:Person {personId:'p0'})`
+  resolves. Off by default, so the durable graph — and a dump→import round-trip — stays byte-identical.
 
 ### The profile ladder (`BULK_PROFILE`)
 
@@ -320,17 +325,41 @@ The wire step was validated against a live, **older** Graphus build over REST + 
   and the hermetic mirror. Relationship property-type DDL was also not accepted by that older build
   (`2/3` version-tolerant statements applied there); this is recorded, not failed.
 
-### `rmp #681` — the offline store is not directly server-openable (surfaced, not sidestepped)
+### `rmp #681` — offline import → **adopt** → serve (RESOLVED)
 
-**STILL OPEN, and the example says so on every run.** `run.sh` **Step 7** probes the *real* store the
-metered import produced (no extra import) and checks its layout: the offline importer writes a **flat**
-`graph.store` + `graph.wal` pair, whereas a `graphus-server` resolves its store as
-`<store_path>/databases/<name>/graphus.store` (plus a database catalog). So an offline-produced store is
-**not** directly openable by a server — the probe prints `server-openable directly: no`.
+`run.sh` **Step 7** probes the *real* store the metered import produced (no extra import) and checks its
+layout: the offline importer writes a **flat** `graph.store` + `graph.wal` pair, whereas a
+`graphus-server` resolves its store as `<store_path>/databases/<name>/graphus.store` (plus a database
+catalog). So the *raw* offline store is not what a server opens — the probe still prints
+`server-openable directly: no`, which is true of the raw layout **by design** (a `graphus-bulk --db`
+directory is a standalone import artifact, not a server data root).
 
-This is why the online demo reaches the same data through the **network bulk-import path** (Step 6)
-rather than by pointing a server at the offline store. The example does not paper over the gap; it
-prints it as a standing finding every time it runs.
+**`rmp #681` closes that gap with an explicit conversion step: `graphus-server adopt`.** It relocates an
+offline-imported store into the exact server-servable layout (and, for a named database, registers it in
+the durable `databases.toml` catalog), opening it through the server's own recover→`verify_on_open` path
+first — so an adopted store is a first-class, crash-safe, ACID database, indistinguishable from a
+normally-created one. The offline→serve story now works end-to-end:
+
+```bash
+# 1. Import offline (the fast path). Name the :ID column and pass --persist-id so each node keeps its
+#    original CSV :ID as a queryable string property (here `personId`).
+graphus-bulk import --db /tmp/import \
+  --nodes people.csv --relationships knows.csv --persist-id
+#    people.csv header: personId:ID,:LABEL,name:string,…
+
+# 2. Adopt the imported store into a server data root as a named (or the default) database.
+graphus-server adopt --from /tmp/import --database socialnet --config server.toml
+#    → databases/socialnet/graphus.store + a databases.toml entry (registered ONLINE).
+
+# 3. Start the server and query — including by the ORIGINAL CSV id.
+graphus-server server.toml
+#    MATCH (p:Person {personId: '42'}) RETURN p.name
+```
+
+The **network bulk-import path** (Step 6) remains the way to load data into an *already-running* server
+without a restart; `adopt` is the offline complement — stand a large dataset up fast, then serve the
+same store. (`graphus-server adopt --help` documents the flags; a plaintext import cannot be adopted
+into an *encrypted* server, which the tool rejects up front.)
 
 ## How it is built — the dev-only generator crate
 
@@ -679,8 +708,11 @@ magnitude below the ~25 GB that `#579` recorded. The windowed/streaming recovery
 (`rmp #599`) **holds** at this scale. The example now measures this every run, so a regression would be
 caught rather than rediscovered.
 
-### 4. `rmp #681` is still open
+### 4. `rmp #681` is RESOLVED — offline import → adopt → serve
 
-The offline-produced store is still **not** directly openable by a `graphus-server` (flat
-`graph.store` + `graph.wal` vs the server's `databases/<name>/graphus.store` layout). Step 7 probes the
-real store and prints the finding on every run.
+The offline-produced store is a **standalone import artifact** (flat `graph.store` + `graph.wal`), not a
+server data root — Step 7 still prints that raw layout on every run. `rmp #681` bridges it with the
+explicit `graphus-server adopt` conversion (see "`rmp #681` — offline import → adopt → serve" above),
+which lays the store into the server's `databases/<name>/graphus.store` layout, registers it in the
+durable catalog, and verifies it opens/recovers before serving — so a bulk-imported store can now be
+served directly (and queried by original CSV `:ID` when imported with `--persist-id`).

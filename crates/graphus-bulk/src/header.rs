@@ -197,6 +197,13 @@ pub struct NodeHeader {
     pub columns: Vec<ColumnRole>,
     /// The index of the `:ID` column.
     pub id_index: usize,
+    /// The `<name>` prefix of the `:ID` column, if it is named (`personId:ID` → `Some("personId")`,
+    /// bare `:ID` → `None`). This mirrors the `neo4j-admin import` convention that a **named** id
+    /// column can also be **persisted as a node property** under that name. The importer only does
+    /// so when the caller opts in (see [`crate::BulkImporter::with_persist_id`]); by default the
+    /// external `:ID` remains a physical join key and is never stored as a queryable property, so a
+    /// dump → import round-trip stays byte-identical whether or not the id column was named.
+    pub id_name: Option<String>,
 }
 
 impl NodeHeader {
@@ -207,9 +214,12 @@ impl NodeHeader {
     /// [`HeaderError::MissingId`] if no `:ID` column is present, [`HeaderError::DuplicateId`] if more
     /// than one is, or [`HeaderError::UnknownType`] for an unrecognised property type.
     pub fn parse<'a>(cells: impl IntoIterator<Item = &'a str>) -> Result<Self, HeaderError> {
-        let columns = cells
-            .into_iter()
-            .map(parse_header_cell)
+        // Keep the raw cells so the `:ID` column's `<name>` prefix (discarded by `parse_header_cell`,
+        // which folds every id spelling to `ColumnRole::Id`) can be recovered for `id_name`.
+        let raw: Vec<String> = cells.into_iter().map(str::to_owned).collect();
+        let columns = raw
+            .iter()
+            .map(|c| parse_header_cell(c))
             .collect::<Result<Vec<_>, _>>()?;
         let mut id_index = None;
         for (i, role) in columns.iter().enumerate() {
@@ -221,7 +231,29 @@ impl NodeHeader {
             }
         }
         let id_index = id_index.ok_or(HeaderError::MissingId)?;
-        Ok(Self { columns, id_index })
+        let id_name = id_column_name(&raw[id_index]);
+        Ok(Self {
+            columns,
+            id_index,
+            id_name,
+        })
+    }
+}
+
+/// Extracts the `<name>` prefix of an `:ID` header cell — `personId:ID` → `Some("personId")`, a bare
+/// `:ID` (or `:id`, any case) → `None`. Used to name the node property that persists the external id
+/// when the caller opts into [`crate::BulkImporter::with_persist_id`]. The id column always contains a
+/// `:` (it decoded to [`ColumnRole::Id`]), so the split is on the last colon exactly as
+/// [`parse_header_cell`] does.
+fn id_column_name(cell: &str) -> Option<String> {
+    let name = match cell.trim().rsplit_once(':') {
+        Some((name, _role)) => name.trim(),
+        None => return None,
+    };
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_owned())
     }
 }
 
@@ -322,9 +354,22 @@ mod tests {
     }
 
     #[test]
+    fn node_header_captures_id_column_name() {
+        // A named id column exposes its name (for opt-in persist-id); a bare `:ID` has none.
+        let named = NodeHeader::parse(["personId:ID", ":LABEL", "name:string"]).unwrap();
+        assert_eq!(named.id_name.as_deref(), Some("personId"));
+        let bare = NodeHeader::parse([":ID", ":LABEL"]).unwrap();
+        assert_eq!(bare.id_name, None);
+        // The name is trimmed and case-preserved; the role match on `:ID` stays case-insensitive.
+        let spaced = NodeHeader::parse([" Account_Id :id "]).unwrap();
+        assert_eq!(spaced.id_name.as_deref(), Some("Account_Id"));
+    }
+
+    #[test]
     fn node_header_requires_exactly_one_id() {
         let ok = NodeHeader::parse(["id:ID", ":LABEL", "name:string"]).unwrap();
         assert_eq!(ok.id_index, 0);
+        assert_eq!(ok.id_name.as_deref(), Some("id"));
         assert!(matches!(
             NodeHeader::parse(["name:string"]).unwrap_err(),
             HeaderError::MissingId

@@ -26,7 +26,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 
-use graphus_core::{Result, TxnId};
+use graphus_core::{Result, TxnId, Value};
 use graphus_io::BlockDevice;
 use graphus_storage::{Namespace, RecordStore};
 use graphus_wal::LogSink;
@@ -136,6 +136,13 @@ pub struct BulkImporter<D: BlockDevice, S: LogSink> {
     delimiter: u8,
     /// How a duplicate non-empty external `:ID` is handled (SEC-196). Default: [`DuplicatePolicy::Strict`].
     duplicate_policy: DuplicatePolicy,
+    /// Whether each node's external `:ID` is also persisted as a queryable **string node property**
+    /// named after the `:ID` column (`rmp` #681). `false` by default: the external id stays a physical
+    /// join key only, so the durable graph — and a dump → import round-trip — is byte-identical to the
+    /// pre-#681 importer. Enabled via [`with_persist_id`](Self::with_persist_id) (the offline
+    /// `graphus-bulk import --persist-id` flag), which additionally requires the `:ID` column to be
+    /// named (the property key). See [`ingest_node_row`].
+    persist_id: bool,
     stats: ImportStats,
 }
 
@@ -156,6 +163,7 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
             batch_size: batch_size.max(1),
             delimiter,
             duplicate_policy: DuplicatePolicy::default(),
+            persist_id: false,
             stats: ImportStats::default(),
         }
     }
@@ -165,6 +173,20 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
     #[must_use]
     pub fn with_duplicate_policy(mut self, policy: DuplicatePolicy) -> Self {
         self.duplicate_policy = policy;
+        self
+    }
+
+    /// Opts into persisting every node's external `:ID` as a queryable **string node property**
+    /// (`rmp` #681) so a bulk-imported, then server-adopted, store can be queried by original id
+    /// (e.g. `MATCH (n:Person {personId: '42'})`). The property key is the `:ID` column's name — the
+    /// `neo4j-admin import` convention that a **named** id column keeps its id as a property — so
+    /// [`import_nodes`](Self::import_nodes) **requires the `:ID` column to be named** when this is set
+    /// (a bare `:ID` errors, telling the operator to name it). `false` by default (the external id is
+    /// a physical join key only), which keeps the durable graph byte-identical to the pre-#681
+    /// importer. Returns `self` for builder-style chaining.
+    #[must_use]
+    pub fn with_persist_id(mut self, persist_id: bool) -> Self {
+        self.persist_id = persist_id;
         self
     }
 
@@ -224,6 +246,23 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
         // Intern every property column's key token ONCE (idempotent → same id as the per-cell path).
         // `prop_key_tokens[i]` is `Some(token)` iff column `i` is a `Property` column.
         let prop_key_tokens = self.resolve_property_key_tokens(&header.columns)?;
+        // Opt-in persist-id (`rmp` #681): when enabled, resolve the PropKey token for the `:ID`
+        // column's name ONCE (idempotent, same as any property key) and pass it down so every node
+        // also gets a string property `<id-name> = <external id>`. A bare `:ID` cannot be persisted
+        // (there is no property key), so require the column to be named — fail closed with a clear,
+        // actionable message rather than silently importing without the queryable id.
+        let id_prop_token = if self.persist_id {
+            let name = header.id_name.as_deref().ok_or_else(|| {
+                graphus_core::GraphusError::Storage(
+                    "persist-id was requested but the :ID column is unnamed; name it (e.g. \
+                     `personId:ID`) so the external id can be stored as the node property `personId`"
+                        .to_owned(),
+                )
+            })?;
+            Some(self.store.intern_token(Namespace::PropKey, name)?)
+        } else {
+            None
+        };
         // Per-pass label-name → token memo (label cells vary per row; this dedups re-interns).
         let mut label_tokens: HashMap<String, u32> = HashMap::new();
 
@@ -241,9 +280,14 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
             if !more {
                 break;
             }
-            if let Err(e) =
-                self.ingest_node_record(txn, &header, &prop_key_tokens, &mut label_tokens, &record)
-            {
+            if let Err(e) = self.ingest_node_record(
+                txn,
+                &header,
+                &prop_key_tokens,
+                id_prop_token,
+                &mut label_tokens,
+                &record,
+            ) {
                 self.rollback(txn);
                 return Err(e);
             }
@@ -276,6 +320,7 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
         txn: TxnId,
         header: &NodeHeader,
         prop_key_tokens: &[Option<u32>],
+        id_prop_token: Option<u32>,
         label_memo: &mut HashMap<String, u32>,
         record: &csv::StringRecord,
     ) -> Result<()> {
@@ -284,6 +329,7 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
             txn,
             header,
             prop_key_tokens,
+            id_prop_token,
             label_memo,
             record,
             &self.id_map,
@@ -518,6 +564,13 @@ pub fn intern_property_key_tokens<D: BlockDevice, S: LogSink>(
 /// [`DuplicatePolicy::SkipDuplicate`] — silently overwriting the binding would re-point every
 /// relationship referencing it onto the wrong node.
 ///
+/// `id_prop_token` (`rmp` #681): when `Some(token)`, the node's non-empty external `:ID` is also
+/// stored as the **string property** `token` (the `:ID` column's name interned once by the caller),
+/// so a bulk-imported store can be queried by original id after the server adopts it. `None` (the
+/// default, and always the network Mode A path) keeps the external id a physical join key only, so the
+/// durable graph is byte-identical to the pre-#681 importer. An empty `:ID` cell stores no property
+/// (there is no id to record).
+///
 /// # Errors
 /// A header/value-parse/storage error, or [`DuplicatePolicy::Strict`]'s duplicate-`:ID` rejection.
 /// The caller is responsible for rolling back `txn` on `Err` (this function never does, since it
@@ -528,6 +581,7 @@ pub fn ingest_node_row<D: BlockDevice, S: LogSink>(
     txn: TxnId,
     header: &NodeHeader,
     prop_key_tokens: &[Option<u32>],
+    id_prop_token: Option<u32>,
     label_memo: &mut HashMap<String, u32>,
     record: &csv::StringRecord,
     id_map: &HashMap<String, u64>,
@@ -539,6 +593,22 @@ pub fn ingest_node_row<D: BlockDevice, S: LogSink>(
 
     // External id (the join key for relationships).
     let external_id = record.get(header.id_index).unwrap_or("").to_owned();
+
+    // Opt-in persist-id (`rmp` #681): also store the external id as a queryable string property. Done
+    // before the labels/properties writes purely for locality; it is one more property write under the
+    // same batch transaction, so it is committed/rolled-back atomically with the rest of the node. An
+    // empty `:ID` records nothing (the node simply has no id property).
+    if let Some(token) = id_prop_token {
+        if !external_id.is_empty() {
+            store.set_node_property_value(
+                txn,
+                node_id,
+                token,
+                &Value::String(external_id.clone()),
+            )?;
+            stats.properties += 1;
+        }
+    }
 
     // Collect labels first (a single `set_node_labels` write), then properties.
     // PERF (C18): dedup via a `HashSet` (O(1) membership) instead of `Vec::contains` (O(n) per

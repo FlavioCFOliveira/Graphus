@@ -26,8 +26,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use graphus_bulk::{
-    BulkImporter, DEFAULT_BATCH_SIZE, InputFormatHint, auto_pool_pages_for_input,
-    auto_pool_pages_for_store, csv_to_gcol, dump_nodes, dump_relationships, gcol_to_csv,
+    BulkImporter, DEFAULT_BATCH_SIZE, IMPORT_STORE_FILE_NAME, IMPORT_WAL_DIR_NAME, InputFormatHint,
+    auto_pool_pages_for_input, auto_pool_pages_for_store, csv_to_gcol, dump_nodes,
+    dump_relationships, gcol_to_csv,
 };
 use graphus_core::GraphusError;
 use graphus_io::{FileBlockDevice, PAGE_SIZE};
@@ -168,10 +169,14 @@ fn usage() -> String {
     "graphus-bulk — offline bulk import / whole-graph dump (CSV or columnar `.gcol`)\n\n\
      USAGE:\n  \
        graphus-bulk import --db <dir> [--nodes <file>]... [--relationships <file>]... \
-     [--delimiter <c>] [--batch <n>] [--format csv|gcol] [--buffer-pool-pages <n>]\n  \
+     [--delimiter <c>] [--batch <n>] [--format csv|gcol] [--buffer-pool-pages <n>] [--persist-id]\n  \
        graphus-bulk dump   --db <dir> --nodes-out <file> --relationships-out <file> \
      [--format csv|gcol] [--buffer-pool-pages <n>]\n\n\
      --format selects the file format (default csv); `gcol` is the lossless columnar format.\n\n\
+     --persist-id also stores each node's external :ID as a queryable STRING property named after the\n  \
+       :ID column (which must be named, e.g. `personId:ID`), so a store imported offline can be queried\n  \
+       by its original id once `graphus-server adopt` makes it a servable database (rmp #681). Off by\n  \
+       default: the :ID stays a physical join key only and the durable graph is byte-identical.\n\n\
      --buffer-pool-pages <n> pins the in-RAM buffer pool to n 8-KiB pages; 0 (the default) auto-\n  \
        sizes it to the store the load builds, bounded by host RAM (rmp #718 — a fixed small pool made\n  \
        large imports quadratic). Env override: GRAPHUS_BULK_BUFFER_POOL_PAGES (0 = auto).\n\n\
@@ -204,6 +209,7 @@ fn cmd_import(args: Vec<String>) -> Result<(), String> {
     let mut batch = DEFAULT_BATCH_SIZE;
     let mut format = Format::Csv;
     let mut buffer_pool_flag: Option<usize> = None;
+    let mut persist_id = false;
 
     let mut it = args.into_iter();
     while let Some(flag) = it.next() {
@@ -213,6 +219,10 @@ fn cmd_import(args: Vec<String>) -> Result<(), String> {
             "--relationships" => rels.push(PathBuf::from(next_value(&mut it, "--relationships")?)),
             "--delimiter" => delimiter = parse_delimiter(&next_value(&mut it, "--delimiter")?)?,
             "--format" => format = Format::parse(&next_value(&mut it, "--format")?)?,
+            // Opt-in (`rmp` #681): also persist each node's external `:ID` as a queryable string
+            // property named after the (required-to-be-named) `:ID` column, so an imported store can
+            // be queried by original id once the server adopts it. Off by default (byte-identical).
+            "--persist-id" => persist_id = true,
             "--batch" => {
                 batch = next_value(&mut it, "--batch")?
                     .parse()
@@ -266,7 +276,7 @@ fn cmd_import(args: Vec<String>) -> Result<(), String> {
     );
 
     let store = create_fresh_store(&db, pool_pages).map_err(|e| e.to_string())?;
-    let mut importer = BulkImporter::new(store, batch, delimiter);
+    let mut importer = BulkImporter::new(store, batch, delimiter).with_persist_id(persist_id);
 
     // Load all files. Any failure here may have left a PARTIAL (some batches committed) load on disk
     // — import is non-atomic by ratified contract (`rmp` #403) — so the operator-facing error spells
@@ -437,9 +447,13 @@ fn write_dump(path: &Path, csv: &[u8], format: Format) -> Result<(), String> {
     .map_err(|e| format!("writing {}: {e}", path.display()))
 }
 
-/// The on-disk file pair inside a `--db` directory.
+/// The on-disk file pair inside a `--db` directory (the offline names shared with the server's
+/// `adopt` path via [`IMPORT_STORE_FILE_NAME`] / [`IMPORT_WAL_DIR_NAME`]).
 fn db_files(db: &Path) -> (PathBuf, PathBuf) {
-    (db.join("graph.store"), db.join("graph.wal"))
+    (
+        db.join(IMPORT_STORE_FILE_NAME),
+        db.join(IMPORT_WAL_DIR_NAME),
+    )
 }
 
 /// Creates a **fresh** store in `db` (the directory is created if missing); errors if a store already

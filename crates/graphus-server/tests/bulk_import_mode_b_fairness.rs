@@ -96,6 +96,7 @@ fn node_header() -> Arc<NodeHeader> {
             },
         ],
         id_index: 0,
+        id_name: None,
     })
 }
 

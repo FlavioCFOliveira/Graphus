@@ -109,7 +109,7 @@ use graphus_crypto::{EncryptedFileDevice, EncryptedFileLogSink, Keyring};
 use graphus_cypher::TxnCoordinator;
 use graphus_io::FileBlockDevice;
 use graphus_storage::check::verify_on_open;
-use graphus_storage::recovery::recover_device_with_dwb;
+use graphus_storage::recovery::{recover_device, recover_device_with_dwb};
 use graphus_storage::{Dwb, RecordStore};
 use graphus_wal::{FileLogSink, WalManager};
 use serde::{Deserialize, Serialize};
@@ -2425,6 +2425,406 @@ where
 }
 
 // ------------------------------------------------------------------------------------------------
+// Offline store adoption (rmp #681): make a `graphus-bulk` offline-imported store server-servable
+// ------------------------------------------------------------------------------------------------
+
+/// The result of a successful [`adopt_offline_store`], for the operator-facing report.
+#[derive(Debug, Clone)]
+pub struct AdoptOutcome {
+    /// The (normalized, lowercase) database name the store was adopted as.
+    pub database: String,
+    /// `true` when the store was adopted as the **default** database (laid directly into the data
+    /// root, no catalog entry — the default database is implicit); `false` for a named database
+    /// (laid under `databases/<name>/` and registered in `databases.toml`).
+    pub is_default: bool,
+    /// The directory the servable store now lives in.
+    pub target_dir: PathBuf,
+    /// The desired lifecycle state persisted for a **named** database (`None` for the default, which
+    /// is always online while the server runs).
+    pub desired_state: Option<DbState>,
+    /// Node count verified in the adopted store.
+    pub nodes: u64,
+    /// Relationship count verified in the adopted store.
+    pub relationships: u64,
+}
+
+/// Adopts a `graphus-bulk` **offline-imported** store (an `<import_dir>` holding `graph.store` +
+/// `graph.wal/`) as a server-servable database of `config` (`rmp` #681). This is the offline bridge
+/// that makes "bulk-import offline, then serve the same store" work: it lays the imported store into
+/// the exact directory layout the server opens (`graphus.store`/`graphus.wal` under the data root for
+/// the default database, or under `databases/<name>/` for a named one) and, for a named database,
+/// registers it in the durable catalog — so a subsequent `graphus-server` boot serves it like any
+/// normally-created database.
+///
+/// # Durability & ACID (an adopted store is indistinguishable from a normally-created one)
+///
+/// The imported store is **copied** (never moved — the source stays intact for re-adoption), each
+/// copied file's content is `fsync`ed, and the target directory entries are hardened before the store
+/// is opened. The store is then opened through the **same** recover→open→[`verify_on_open`] path the
+/// server uses at boot (WAL recovery replays committed batches; the integrity gate refuses a corrupt
+/// store) — so adoption reports success only for a store that is actually servable. For a **named**
+/// database the catalog entry (the thing that makes the database "exist") is persisted **last**, only
+/// after the store bytes are durable and verified, with the atomic-replace catalog protocol; a crash
+/// before that leaves an inert orphan directory (cleared by a future `create`/adopt of the same name),
+/// never a registered database with a missing/torn store. For the **default** database there is no
+/// catalog (it is implicit); adoption into the data root is a one-shot bootstrap that requires the
+/// root to hold no store yet, and — like the `graphus-bulk` importer itself — is non-atomic across the
+/// two-file copy (a crash mid-copy is recovered by deleting the data root and re-adopting).
+///
+/// # Errors
+/// [`CatalogError::InvalidName`] for a bad name; [`CatalogError::AlreadyExists`] if the target already
+/// holds a store / catalog entry; [`CatalogError::Io`] for a missing/invalid import artifact, an
+/// encrypted-server mismatch (a plaintext import cannot be adopted into an encrypted server), or a
+/// filesystem failure; [`CatalogError::Engine`] if the copied store fails to open, recover, or verify.
+pub fn adopt_offline_store(
+    config: &ServerConfig,
+    import_dir: &Path,
+    database: &str,
+    online: bool,
+) -> Result<AdoptOutcome, CatalogError> {
+    let root = config.store_path.clone();
+    let default_name = normalize_db_name(&config.default_database)?;
+    let name = normalize_db_name(database)?;
+
+    // Encryption guard: a `graphus-bulk` store is PLAINTEXT (a plaintext device header + plaintext
+    // WAL). An encrypted server opens each store as an `EncryptedFileDevice`, which fails closed on a
+    // plaintext header — so a plaintext store adopted into an encrypted server would brick that
+    // database at boot. Reject up front with an actionable message rather than produce a store the
+    // server cannot open. (Transcoding plaintext → encrypted on adopt is a possible future path.)
+    if config.encryption.key_path.is_some() {
+        return Err(CatalogError::Io {
+            path: import_dir.to_path_buf(),
+            source: "cannot adopt a plaintext graphus-bulk store into an ENCRYPTED server \
+                     (encryption.key_path is set): the server would fail to open it. Adopt into a \
+                     plaintext server, or load the data over the network bulk-import path instead"
+                .to_owned(),
+        });
+    }
+
+    // Validate the import artifact: a non-empty **regular** `graph.store` file beside a **real**
+    // `graph.wal/` directory. Use `symlink_metadata` (which does NOT follow symlinks) so a crafted
+    // `--from` bundle cannot make either artifact a symlink that the subsequent copy would dereference
+    // — an operator-privileged read of an out-of-bundle file (CWE-59, security audit F1). `copy_file_
+    // durable`/`copy_dir_durable` reject symlinks *inside* the bundle for the same reason.
+    let import_store = import_dir.join(graphus_bulk::IMPORT_STORE_FILE_NAME);
+    let import_wal = import_dir.join(graphus_bulk::IMPORT_WAL_DIR_NAME);
+    let store_ok = import_store
+        .symlink_metadata()
+        .map(|m| m.file_type().is_file() && m.len() > 0)
+        .unwrap_or(false);
+    if !store_ok {
+        return Err(CatalogError::Io {
+            path: import_store,
+            source: format!(
+                "not a non-empty regular graphus-bulk store file (expected `{}` in --from; a symlink \
+                 is rejected)",
+                graphus_bulk::IMPORT_STORE_FILE_NAME
+            ),
+        });
+    }
+    let wal_ok = import_wal
+        .symlink_metadata()
+        .map(|m| m.file_type().is_dir())
+        .unwrap_or(false);
+    if !wal_ok {
+        return Err(CatalogError::Io {
+            path: import_wal,
+            source: format!(
+                "not a graphus-bulk WAL directory (expected `{}/` in --from; a symlink is rejected)",
+                graphus_bulk::IMPORT_WAL_DIR_NAME
+            ),
+        });
+    }
+
+    let is_default = name == default_name;
+    if is_default {
+        adopt_as_default(&root, &import_store, &import_wal, name)
+    } else {
+        adopt_as_named(config, &root, &import_store, &import_wal, name, online)
+    }
+}
+
+/// Adopts the imported store as the **default** database: lay `graphus.store`/`graphus.wal` directly
+/// into the data root (where the server opens the implicit default database). Requires the root to
+/// hold no store yet (never clobbers an existing default database).
+fn adopt_as_default(
+    root: &Path,
+    import_store: &Path,
+    import_wal: &Path,
+    name: String,
+) -> Result<AdoptOutcome, CatalogError> {
+    std::fs::create_dir_all(root).map_err(|e| io_error(root, "creating data root", &e))?;
+    // Acquire the exclusive store-open lock BEFORE the emptiness check and the copy (security audit
+    // F2): a server booting on this same (empty) data root takes this lock and then creates its store,
+    // so holding it across the whole check→copy→verify closes the TOCTOU window in which the adopt
+    // could clobber a concurrently-booting server's freshly-created default store. `acquire` fails
+    // fast if a live server already holds the root.
+    let _open_lock = graphus_io::StoreOpenLock::acquire(root).map_err(CatalogError::Engine)?;
+
+    let dst_store = root.join(STORE_FILE_NAME);
+    if dst_store.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+        return Err(CatalogError::AlreadyExists(format!(
+            "{name} (the data root {} already contains a store; adopt into an empty data root)",
+            root.display()
+        )));
+    }
+    // Copy + verify under the held lock. On failure, remove the just-copied artifacts (security audit
+    // F3): the default database lives directly in the data root, so leftover partial/garbage
+    // `graphus.store`/`graphus.wal` would brick the next server boot AND block re-adopt (the emptiness
+    // check would then see a non-empty store). Mirror the named branch's cleanup-on-failure.
+    let verified = (|| -> Result<(u64, u64), CatalogError> {
+        copy_store_into_dir(root, import_store, import_wal)?;
+        verify_adopted_store(root)
+    })();
+    let (nodes, relationships) = match verified {
+        Ok(counts) => counts,
+        Err(e) => {
+            remove_adopted_store_files(root);
+            return Err(e);
+        }
+    };
+    Ok(AdoptOutcome {
+        database: name,
+        is_default: true,
+        target_dir: root.to_path_buf(),
+        desired_state: None,
+        nodes,
+        relationships,
+    })
+}
+
+/// Best-effort removal of the copied `graphus.store` file and `graphus.wal/` directory from `dir`
+/// after a failed **default**-database adopt (security audit F3), so a partial/garbage default store
+/// can neither brick the next boot nor block a re-adopt. Failures are logged, not propagated (the
+/// primary adopt error is what the operator must act on). The named branch instead removes its whole
+/// provisioned directory via [`remove_dir`].
+fn remove_adopted_store_files(dir: &Path) {
+    for name in [STORE_FILE_NAME, WAL_FILE_NAME] {
+        let path = dir.join(name);
+        let res = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match res {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "could not remove a failed default adopt's copied store artifact",
+            ),
+        }
+    }
+    // Harden the removals so a crash cannot resurrect the partial store under the operator's feet.
+    if let Err(e) = fsync_dir(dir) {
+        tracing::warn!(dir = %dir.display(), error = %e, "could not fsync data root after cleanup");
+    }
+}
+
+/// Adopts the imported store as a **named** database under `databases/<name>/` and registers it in
+/// the durable catalog. Catalog-entry-persist-last ordering makes it crash-safe (module docs on
+/// [`adopt_offline_store`]).
+fn adopt_as_named(
+    config: &ServerConfig,
+    root: &Path,
+    import_store: &Path,
+    import_wal: &Path,
+    name: String,
+    online: bool,
+) -> Result<AdoptOutcome, CatalogError> {
+    // The catalog must not already know this name (a running-or-registered database is never
+    // silently overwritten by an adopt).
+    let mut entries = load_entries(root, &normalize_db_name(&config.default_database)?)?;
+    if entries.contains_key(&name) {
+        return Err(CatalogError::AlreadyExists(name));
+    }
+
+    // 1) Provision a fresh directory (clears an inert orphan, with the create-side fsync barrier).
+    let dir = root.join(DATABASES_DIR_NAME).join(&name);
+    provision_fresh_dir(&dir)?;
+
+    // 2) Copy the store in, harden it, and verify it opens/recovers/verifies BEFORE it is registered.
+    //    The exclusive store-open lock is acquired FIRST and held across copy+verify (security audit
+    //    F2), so a concurrent open of this directory cannot race the copy. On any failure, remove the
+    //    just-provisioned directory so a failed adopt leaves no trace (there is no catalog entry yet).
+    let verified = (|| -> Result<(u64, u64), CatalogError> {
+        let _open_lock = graphus_io::StoreOpenLock::acquire(&dir).map_err(CatalogError::Engine)?;
+        copy_store_into_dir(&dir, import_store, import_wal)?;
+        verify_adopted_store(&dir)
+    })();
+    let (nodes, relationships) = match verified {
+        Ok(counts) => counts,
+        Err(e) => {
+            if let Err(rm) = remove_dir(&dir) {
+                tracing::warn!(db = %name, error = %rm, "could not remove a failed adopt's directory");
+            }
+            return Err(e);
+        }
+    };
+
+    // 3) Persist the catalog entry LAST — only now does the database "exist". The atomic-replace
+    //    protocol fsyncs the data root, hardening `databases.toml` and its rename.
+    let desired = if online {
+        DbState::Online
+    } else {
+        DbState::Offline
+    };
+    entries.insert(name.clone(), desired);
+    if let Err(e) = persist_entries(root, &entries) {
+        // The catalog was not published; the provisioned directory is now an inert orphan (a future
+        // create/adopt of the same name clears it). Surface the persist failure.
+        if let Err(rm) = remove_dir(&dir) {
+            tracing::warn!(db = %name, error = %rm, "could not remove an unregistered adopt's directory");
+        }
+        return Err(e);
+    }
+
+    Ok(AdoptOutcome {
+        database: name,
+        is_default: false,
+        target_dir: dir,
+        desired_state: Some(desired),
+        nodes,
+        relationships,
+    })
+}
+
+/// Copies an imported `graph.store` file and `graph.wal/` directory into `target_dir` under the
+/// server's names (`graphus.store`/`graphus.wal`), `fsync`ing each copied file's content and the
+/// target directory entries. Copy (not move) keeps the source import intact for re-adoption and
+/// sidesteps cross-filesystem `rename` (`EXDEV`).
+fn copy_store_into_dir(
+    target_dir: &Path,
+    import_store: &Path,
+    import_wal: &Path,
+) -> Result<(), CatalogError> {
+    copy_file_durable(import_store, &target_dir.join(STORE_FILE_NAME))?;
+    copy_dir_durable(import_wal, &target_dir.join(WAL_FILE_NAME), 0)?;
+    // Harden the target directory's entries (the just-created store file + WAL sub-directory) so a
+    // crash cannot leave the store unfindable even though its bytes reached disk.
+    fsync_dir(target_dir)
+}
+
+/// Copies `src` to `dst` and `fsync`s the destination's **content** (not yet its directory entry —
+/// the caller `fsync`s the directory).
+fn copy_file_durable(src: &Path, dst: &Path) -> Result<(), CatalogError> {
+    std::fs::copy(src, dst).map_err(|e| io_error(dst, "copying imported store file", &e))?;
+    let f =
+        std::fs::File::open(dst).map_err(|e| io_error(dst, "opening copied file to fsync", &e))?;
+    f.sync_all()
+        .map_err(|e| io_error(dst, "syncing copied file", &e))
+}
+
+/// The maximum directory-nesting depth [`copy_dir_durable`] will recurse into a `--from` WAL bundle
+/// (security audit F4). The `graphus-bulk` WAL is a **flat** directory (`anchor` + `seg.<base>` — one
+/// level), so this generous cap never fires on a legitimate bundle; it exists only so a maliciously
+/// deep `--from` tree cannot overflow the stack (an uncatchable process abort).
+const MAX_WAL_COPY_DEPTH: usize = 8;
+
+/// Recursively copies the contents of directory `src` into `dst` (creating `dst`), `fsync`ing every
+/// copied file and the `dst` directory. The `graphus-bulk` WAL is a flat directory of segment files
+/// (`anchor` + `seg.<base>`), but this recurses defensively so any future nesting copies correctly.
+///
+/// # Security (untrusted `--from` bundle)
+/// - **Symlinks are rejected** (CWE-59, security audit F1): `entry.file_type()` does not follow
+///   symlinks, so a symlink entry reports neither file nor dir; such an entry errors out rather than
+///   being handed to `std::fs::copy` (which *would* follow it and copy an out-of-bundle file's
+///   contents into the served directory with the operator's privileges). The top-level `graph.store`/
+///   `graph.wal` are symlink-checked by the caller.
+/// - **Recursion is depth-capped** at [`MAX_WAL_COPY_DEPTH`] (security audit F4) so a maliciously deep
+///   `--from` tree cannot overflow the stack. (There is no symlink *loop* risk: symlinks are rejected
+///   above, so only genuine nesting recurses.)
+fn copy_dir_durable(src: &Path, dst: &Path, depth: usize) -> Result<(), CatalogError> {
+    if depth > MAX_WAL_COPY_DEPTH {
+        return Err(CatalogError::Io {
+            path: src.to_path_buf(),
+            source: format!(
+                "WAL bundle nests deeper than the allowed {MAX_WAL_COPY_DEPTH} levels (refusing a \
+                 pathologically deep --from directory)"
+            ),
+        });
+    }
+    std::fs::create_dir_all(dst).map_err(|e| io_error(dst, "creating WAL directory", &e))?;
+    for entry in std::fs::read_dir(src).map_err(|e| io_error(src, "listing WAL directory", &e))? {
+        let entry = entry.map_err(|e| io_error(src, "reading WAL directory entry", &e))?;
+        let src_child = entry.path();
+        let dst_child = dst.join(entry.file_name());
+        // `file_type()` from a `read_dir` entry does NOT follow symlinks: a symlink reports
+        // `is_symlink()` (with is_dir/is_file both false). Reject anything that is not a real file or
+        // directory, so a symlinked WAL entry can never be dereferenced by `copy_file_durable`'s
+        // `std::fs::copy` (which follows source symlinks).
+        let ft = entry
+            .file_type()
+            .map_err(|e| io_error(&src_child, "statting WAL entry", &e))?;
+        if ft.is_symlink() || !(ft.is_dir() || ft.is_file()) {
+            return Err(CatalogError::Io {
+                path: src_child,
+                source: "WAL bundle contains a symlink or special file (only regular files and \
+                         directories may be adopted; refusing to dereference it)"
+                    .to_owned(),
+            });
+        }
+        if ft.is_dir() {
+            copy_dir_durable(&src_child, &dst_child, depth + 1)?;
+        } else {
+            copy_file_durable(&src_child, &dst_child)?;
+        }
+    }
+    fsync_dir(dst)
+}
+
+/// Opens the adopted store in `dir` through the **same** plaintext recover→open→[`verify_on_open`]
+/// path a plaintext server uses at boot, proving the store is servable (and returning its node /
+/// relationship counts).
+///
+/// The caller ([`adopt_as_default`] / [`adopt_as_named`]) **already holds** the exclusive
+/// [`graphus_io::StoreOpenLock`] for `dir` across the whole copy→verify (security audit F2), so this
+/// function must NOT re-acquire it — a second `flock` on the same directory from the same process
+/// would fail against the guard the caller still holds.
+///
+/// # Errors
+/// [`CatalogError::Engine`] if the store cannot be opened, recovered, or verified.
+fn verify_adopted_store(dir: &Path) -> Result<(u64, u64), CatalogError> {
+    let device_file = dir.join(STORE_FILE_NAME);
+    let wal_file = dir.join(WAL_FILE_NAME);
+
+    // Size the read/recovery pool to the store, exactly as the offline dumper does.
+    let store_bytes = std::fs::metadata(&device_file)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let pool_pages = graphus_bulk::auto_pool_pages_for_store(store_bytes, graphus_sysres::memory());
+
+    let open_wal = || -> Result<WalManager<FileLogSink>, CatalogError> {
+        let sink = FileLogSink::open(&wal_file).map_err(|e| {
+            CatalogError::Engine(GraphusError::Storage(format!("opening adopted WAL: {e}")))
+        })?;
+        WalManager::open(sink).map_err(|e| {
+            CatalogError::Engine(GraphusError::Storage(format!(
+                "opening adopted WAL manager: {e}"
+            )))
+        })
+    };
+
+    let mut device = FileBlockDevice::open(&device_file).map_err(CatalogError::Engine)?;
+    let mut wal = open_wal()?;
+    // Replay the durable WAL onto the device (ARIES redo+undo) — identical to the server's boot
+    // recovery for a plaintext store with no doublewrite buffer (a fresh DWB would find nothing to
+    // repair). Idempotent: the server re-recovers on its first boot with the same result.
+    recover_device(&mut wal, &mut device).map_err(CatalogError::Engine)?;
+    // Reopen the WAL fresh for serving (recovery consumed the recovery view), then open + verify.
+    let wal = open_wal()?;
+    let mut store = RecordStore::open(device, wal, pool_pages).map_err(CatalogError::Engine)?;
+    // The inviolable integrity gate: refuse to certify a corrupt store (`&[]`: secondary indexes are
+    // rebuilt on open, never separately durable — same rationale as `open_or_create_coordinator`).
+    verify_on_open(&mut store, &[]).map_err(CatalogError::Engine)?;
+
+    let nodes = store.scan_node_ids().map_err(CatalogError::Engine)?.len() as u64;
+    let relationships = store.scan_rel_ids().map_err(CatalogError::Engine)?.len() as u64;
+    Ok((nodes, relationships))
+}
+
+// ------------------------------------------------------------------------------------------------
 // Tests
 // ------------------------------------------------------------------------------------------------
 
@@ -3735,5 +4135,95 @@ mod tests {
         assert!(catalog.loading_handle("gamma").is_none());
 
         catalog.shutdown_all().await;
+    }
+
+    // ---- offline store adoption (rmp #681) ------------------------------------------------------
+
+    /// A `ServerConfig` for adopt guard-rail tests: plaintext, data root at `root`, default database
+    /// `graphus`. Only the fields `adopt_offline_store` reads matter here.
+    fn adopt_config(root: &TempRoot) -> ServerConfig {
+        ServerConfig {
+            store_path: root.path.join("data"),
+            default_database: DEFAULT_DATABASE_NAME.to_owned(),
+            ..ServerConfig::default()
+        }
+    }
+
+    /// A plaintext store adopted into an ENCRYPTED server is rejected **before** any file is touched
+    /// (fail-closed): the server would not be able to open a plaintext store, so producing one would
+    /// silently brick the database at boot. The guard fires ahead of import-artifact validation, so a
+    /// non-existent import dir still surfaces the encryption error (not a missing-artifact error).
+    #[test]
+    fn adopt_rejects_a_plaintext_store_into_an_encrypted_server() {
+        let root = TempRoot::new("adopt-enc");
+        let mut config = adopt_config(&root);
+        config.encryption = crate::config::EncryptionConfig {
+            key_path: Some(root.path.join("master.key")),
+        };
+        let err = adopt_offline_store(&config, &root.path.join("import"), "graphus", true)
+            .expect_err("must reject a plaintext adopt into an encrypted server");
+        match err {
+            CatalogError::Io { source, .. } => assert!(
+                source.contains("ENCRYPTED"),
+                "actionable encrypted-server error: {source}"
+            ),
+            other => panic!("expected an Io(encryption) error, got {other:?}"),
+        }
+    }
+
+    /// An invalid target database name is rejected up front (before any filesystem work).
+    #[test]
+    fn adopt_rejects_an_invalid_database_name() {
+        let root = TempRoot::new("adopt-name");
+        let config = adopt_config(&root);
+        let err = adopt_offline_store(&config, &root.path.join("import"), "1-not-valid", true)
+            .expect_err("must reject an invalid database name");
+        assert!(matches!(err, CatalogError::InvalidName(_)), "got {err:?}");
+    }
+
+    /// A missing/empty import artifact is rejected with an error that names the expected store file.
+    #[test]
+    fn adopt_rejects_a_missing_import_artifact() {
+        let root = TempRoot::new("adopt-missing");
+        let config = adopt_config(&root);
+        let import = root.path.join("import");
+        std::fs::create_dir_all(&import).expect("mkdir import");
+        let err = adopt_offline_store(&config, &import, "graphus", true)
+            .expect_err("must reject an import dir with no graph.store");
+        match err {
+            CatalogError::Io { source, .. } => assert!(
+                source.contains(graphus_bulk::IMPORT_STORE_FILE_NAME),
+                "error names the expected store file: {source}"
+            ),
+            other => panic!("expected an Io(missing-artifact) error, got {other:?}"),
+        }
+    }
+
+    /// Security audit F1 (CWE-59): a `graph.store` that is a **symlink** (a crafted `--from` bundle
+    /// pointing at an out-of-bundle file the operator/server can read) is rejected up front — the
+    /// `symlink_metadata` check never follows it, so `adopt` never dereferences it into the data dir.
+    #[cfg(unix)]
+    #[test]
+    fn adopt_rejects_a_symlinked_store_artifact() {
+        let root = TempRoot::new("adopt-symlink");
+        let config = adopt_config(&root);
+        let import = root.path.join("import");
+        std::fs::create_dir_all(&import).expect("mkdir import");
+        // A real (non-empty) file elsewhere, and `graph.store` as a symlink to it.
+        let secret = root.path.join("outside-secret");
+        std::fs::write(&secret, b"sensitive bytes").expect("write secret");
+        std::os::unix::fs::symlink(&secret, import.join(graphus_bulk::IMPORT_STORE_FILE_NAME))
+            .expect("symlink store");
+        std::fs::create_dir_all(import.join(graphus_bulk::IMPORT_WAL_DIR_NAME)).expect("mkdir wal");
+
+        let err = adopt_offline_store(&config, &import, "graphus", true)
+            .expect_err("must reject a symlinked store artifact");
+        match err {
+            CatalogError::Io { source, .. } => assert!(
+                source.contains("symlink"),
+                "error calls out the rejected symlink: {source}"
+            ),
+            other => panic!("expected an Io(symlink) rejection, got {other:?}"),
+        }
     }
 }
