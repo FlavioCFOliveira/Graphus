@@ -318,18 +318,28 @@ impl<S: LogSink> WalManager<S> {
         self.buf.clear();
         r.encode_header_to(lsn, redo, &undo, &mut self.buf);
         self.sink.append(&self.buf);
+        // Whether the in-memory undo back-chain must be retained. `true` for every durable/recoverable
+        // sink (the default) — the durable path is byte-for-byte unchanged. `false` only for the
+        // never-recovered, never-rolled-back derived-index WAL (`DiscardingLogSink`), where retaining a
+        // full-page undo image per insert into an uncommitted transaction was the per-element index
+        // memory bomb of `rmp` #724. Read before the mutable `active` borrow below. Monomorphized, so
+        // for a durable sink this folds to a compile-time `true` and the branch is elided.
+        let retain_undo = self.sink.retains_undo();
         let st = self.active.entry(txn).or_insert(TxnState {
             first_lsn: lsn,
             last_lsn: lsn,
             undo: Vec::new(),
         });
         st.last_lsn = lsn;
-        st.undo.push(UndoEntry {
-            lsn,
-            page_id,
-            undo,
-            prev_lsn: prev,
-        });
+        if retain_undo {
+            st.undo.push(UndoEntry {
+                lsn,
+                page_id,
+                undo,
+                prev_lsn: prev,
+            });
+        }
+        // else: `undo` is dropped here (freed), not accumulated — the `rmp` #724 fix.
         lsn
     }
 
@@ -447,6 +457,18 @@ impl<S: LogSink> WalManager<S> {
         let Some(st) = self.active.remove(&txn) else {
             return Ok(());
         };
+        // Invariant guard (`rmp` #724, storage-audit hardening): a sink that opts out of undo retention
+        // (`retains_undo() == false`, i.e. the never-rolled-back ephemeral index `DiscardingLogSink`)
+        // must have an EMPTY undo chain here — nothing was ever pushed. A non-empty chain under a
+        // non-retaining sink would mean the "never rolled back" invariant was violated (a real rollback
+        // reached a manager whose chain the fix deliberately dropped). This makes that invariant loud in
+        // debug builds; it never fires for any durable sink (which always retains and rolls back
+        // normally).
+        debug_assert!(
+            self.sink.retains_undo() || st.undo.is_empty(),
+            "rollback of a non-retaining (DiscardingLogSink) WAL with a non-empty undo chain \
+             violates the rmp #724 invariant"
+        );
         for entry in st.undo.iter().rev() {
             let clr_lsn =
                 self.write_clr(txn, entry.page_id, entry.lsn, &entry.undo, entry.prev_lsn);
@@ -529,6 +551,24 @@ impl<S: LogSink> WalManager<S> {
     #[must_use]
     pub fn is_active(&self, txn: TxnId) -> bool {
         self.active.contains_key(&txn)
+    }
+
+    /// Total bytes held by the **in-memory undo back-chain** across all active transactions — the sum
+    /// of every retained undo image (`rmp` #724). This is the manager's principal in-memory footprint
+    /// under an uncommitted transaction: each [`log_update`](Self::log_update) retains its pre-image
+    /// patch until the transaction commits or rolls back (a durable/recoverable sink), or retains
+    /// nothing at all (a [`DiscardingLogSink`](crate::DiscardingLogSink), whose
+    /// [`retains_undo`](crate::LogSink::retains_undo) is `false`).
+    ///
+    /// Exposed so the derived, ephemeral index trees can be asserted to hold **zero** retained undo (the
+    /// regression pin for the per-element index memory bomb of `rmp` #724), and so a durable manager's
+    /// undo retention can be observed to be intact.
+    #[must_use]
+    pub fn retained_undo_bytes(&self) -> usize {
+        self.active
+            .values()
+            .map(|s| s.undo.iter().map(|e| e.undo.len()).sum::<usize>())
+            .sum()
     }
 
     /// The buffer-pool **WAL rule** (`§4` / `graphus_bufpool::WalRule`): before a dirty page
@@ -1070,5 +1110,94 @@ mod tests {
             1,
             "the committed txn survives the crash-safe overlap"
         );
+    }
+
+    /// Regression (`rmp` #724): a manager over a **non-retaining** [`DiscardingLogSink`] must NOT
+    /// accumulate the in-memory undo back-chain — it stays at zero no matter how many updates an
+    /// uncommitted transaction logs — while a manager over a **durable** [`MemLogSink`] retains the
+    /// full undo image per update (backing rollback / crash recovery). This is the exact mechanism of
+    /// the per-element index memory bomb and its fix: the ephemeral index WAL is a `DiscardingLogSink`
+    /// whose transaction is never committed, so retaining a ~page-sized undo image per insert leaked
+    /// ~8 KiB per indexed element.
+    #[test]
+    fn discarding_sink_retains_no_undo_but_durable_sink_does() {
+        use crate::sink::DiscardingLogSink;
+
+        let txn = TxnId(1);
+        let redo = vec![0xAB_u8; 4096];
+        let undo = vec![0xCD_u8; 4096];
+
+        // Discarding sink: no undo retained, and it does not grow with the number of updates.
+        let mut disc = WalManager::create(DiscardingLogSink::new()).unwrap();
+        for _ in 0..1000 {
+            disc.log_update(txn, PageId(1), redo.clone(), undo.clone());
+        }
+        assert_eq!(
+            disc.retained_undo_bytes(),
+            0,
+            "a DiscardingLogSink manager must retain no undo back-chain (rmp #724)"
+        );
+
+        // Durable sink: every uncommitted update retains its full undo image (rollback/recovery needs
+        // it). This proves the fix is targeted and the durable/crash-safe path is unchanged.
+        let mut durable = WalManager::create(MemLogSink::new()).unwrap();
+        for _ in 0..1000 {
+            durable.log_update(txn, PageId(1), redo.clone(), undo.clone());
+        }
+        assert_eq!(
+            durable.retained_undo_bytes(),
+            1000 * undo.len(),
+            "a durable manager must retain every update's undo image (rollback/recovery)"
+        );
+    }
+
+    /// Regression (`rmp` #724): opting the discarding sink out of undo retention must not break
+    /// rollback for a **durable** manager — the undo chain still exists and still reverts every change.
+    /// (A discarding-sink manager is never rolled back by construction, so its now-empty chain is
+    /// inert; this asserts the durable path a real transaction uses is untouched.)
+    #[test]
+    fn durable_rollback_still_undoes_every_change_after_the_fix() {
+        use crate::recovery::ApplyTarget;
+        use std::collections::HashMap;
+
+        /// A tiny in-memory apply target recording the last undo image applied per page.
+        #[derive(Default)]
+        struct Recorder {
+            applied: HashMap<u64, Vec<u8>>,
+        }
+        impl ApplyTarget for Recorder {
+            fn page_lsn(&self, _page: PageId) -> Lsn {
+                Lsn(0)
+            }
+            fn apply(&mut self, page: PageId, _clr_lsn: Lsn, image: &[u8]) -> Result<()> {
+                self.applied.insert(page.0, image.to_vec());
+                Ok(())
+            }
+        }
+
+        let txn = TxnId(7);
+        let mut wal = WalManager::create(MemLogSink::new()).unwrap();
+        wal.begin(txn);
+        wal.log_update(txn, PageId(2), vec![1, 2, 3], vec![9, 9, 9]);
+        wal.log_update(txn, PageId(3), vec![4, 5, 6], vec![8, 8, 8]);
+        assert_eq!(
+            wal.retained_undo_bytes(),
+            6,
+            "undo images are retained pre-rollback"
+        );
+
+        let mut target = Recorder::default();
+        wal.rollback(txn, &mut target).unwrap();
+
+        // Both changes were undone (newest-first) with their exact undo images.
+        assert_eq!(
+            target.applied.get(&2).map(Vec::as_slice),
+            Some([9, 9, 9].as_slice())
+        );
+        assert_eq!(
+            target.applied.get(&3).map(Vec::as_slice),
+            Some([8, 8, 8].as_slice())
+        );
+        assert!(!wal.is_active(txn), "rollback retires the transaction");
     }
 }
