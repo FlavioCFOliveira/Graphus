@@ -2756,6 +2756,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // the durable path by this aborted transaction's un-persisted mutation. (A token this txn
         // interned is kept in memory by the superset restore below, but as an unused id it needs no
         // durability — it rides the next durable commit's checkpoint if a later write actually uses it.)
+        // A CONCURRENT open transaction's still-pending catalog DDL, by contrast, IS restored below and
+        // must stay flagged: the `rmp` #534 superset-preserve block re-sets this flag when it keeps one.
         self.catalog_dirty = false;
         // If `txn` was a GC pass, discard its scheduled registry prune (`rmp` task #59): the WAL
         // undo below restores the in-flight header stamps the freeze had rewritten, and those
@@ -2804,6 +2806,23 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // harmless to keep — an unused id, idempotent on re-intern).
         let pre_tokens = self.tokens.clone();
         let pre_element_next = self.element_ids.peek();
+        // Same monotonicity hazard for the **schema-catalog** half of `Statistics` — the twelve
+        // `catalog_dirty`-guarded DDL maps (declared indexes of every kind, their names, constraints,
+        // property histograms) (`rmp` #534, defense-in-depth for the `rmp` #529 read-only-commit fast
+        // path). `reload_catalog` reverts the WHOLE `Statistics` to the durable committed image, which
+        // is correct for the live-record COUNTS (it discards this aborting txn's create/delete
+        // increments) but would wipe a CONCURRENT open txn's pending catalog DDL, which — unlike a data
+        // write — is durable ONLY via the commit-time `checkpoint_meta`, so wiping it (together with the
+        // `catalog_dirty = false` above) lets that txn's later commit take the #529 fast path and
+        // SILENTLY DROP its committed DDL.
+        //
+        // Snapshot the in-memory schema now so it can be superset-preserved after the reload — but ONLY
+        // when a concurrent transaction is still open to OWN a pending DDL change (`self.active` already
+        // excludes `txn`, removed at the top of this method). With no concurrent transaction the reload
+        // is the whole story (a lone transaction's own DDL is correctly discarded), so the common
+        // single-writer path clones NOTHING and is byte-identical to the pre-#534 behaviour. The counts
+        // this also clones are discarded — `adopt_schema_from` moves only the schema half.
+        let pre_statistics = (!self.active.is_empty()).then(|| self.statistics.clone());
         // `rmp` #337, Slice 1: drive the WAL rollback with a *recording* target that captures the
         // compensating page images WITHOUT touching the pool while the WAL lock is held, then replay
         // them into the pool AFTER the lock is released. This breaks the eviction-during-rollback
@@ -2845,6 +2864,32 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // structural: a failing `reload_catalog` cannot strand a map it never moved.
         self.reload_catalog()?;
         self.tokens = pre_tokens;
+        // `rmp` #534: superset-preserve the schema-catalog half of `Statistics` for a CONCURRENT open
+        // transaction (`pre_statistics` is `Some` exactly when one was open at capture, above).
+        // `reload_catalog` reverted the whole `Statistics` to the durable image (counts AND schema);
+        // the schema equals `pre_statistics`'s only when nothing is pending. When it DIVERGES, a
+        // concurrent transaction holds an uncommitted catalog DDL change — restore it, and keep the
+        // store flagged catalog-dirty so that transaction's later commit does NOT take the `rmp` #529
+        // read-only fast path and drop it (overriding the `catalog_dirty = false` above). The COUNTS
+        // stay at the durable image (`adopt_schema_from` moves only the schema half), correctly
+        // discarding this aborting transaction's create/delete increments.
+        //
+        // A *rolling-back* transaction's OWN pending DDL is deliberately NOT preserved: with no
+        // concurrent transaction `pre_statistics` is `None`, so the durable revert stands and the own
+        // DDL is discarded (rollback atomicity — the `rolled_back_index_declaration_is_discarded` /
+        // `rolled_back_histogram_change_is_discarded` guards). Discarding a rolling-back transaction's
+        // own DDL while preserving a concurrent one's, when BOTH could be pending, needs per-transaction
+        // catalog undo (approach (b), `rmp` #734) — not reachable today because catalog DDL runs ONLY as
+        // a yield-free auto-commit transaction (the coordinator's `begin` -> `set_*` -> `commit` with no
+        // engine yield between the mutation and the commit), so the schema NEVER diverges at an
+        // engine-reachable rollback and this whole block is a no-op there; it activates only for a future
+        // yielding-DDL path (and the direct-store-API regression test that models one).
+        if let Some(pre_statistics) = pre_statistics
+            && !self.statistics.schema_eq(&pre_statistics)
+        {
+            self.statistics.adopt_schema_from(pre_statistics);
+            self.catalog_dirty = true;
+        }
         if pre_element_next > self.element_ids.peek() {
             self.element_ids = ElementIdAllocator::new(pre_element_next);
         }
