@@ -67,7 +67,7 @@ use graphus_examples_harness::{
     CpuSection, DatasetScale, EvidenceCollector, MemorySection, RunMetadata, StorageSection,
 };
 use graphus_reco_gen::bench::{self, Pcts};
-use graphus_reco_gen::client::{BoltClient, BoltUrl, ClientResult};
+use graphus_reco_gen::client::{BoltClient, BoltUrl, ClientResult, QueryResult};
 use graphus_reco_gen::mix::{
     self, Arm, ErrorSample, READ_LIVENESS_FLOOR, ReadInvariant, RetryPolicy, WriteKind, WriteVector,
 };
@@ -76,7 +76,9 @@ use graphus_reco_gen::mix::{
 // algorithm is identical — aliasing keeps that explicit instead of letting a reader assume the
 // workload RNG below and the backoff RNG are interchangeable.
 use graphus_reco_gen::SplitMix64 as BackoffRng;
-use graphus_social_gen::{EPOCH_S, Generator, REG_SPAN_S, SplitMix64, battery};
+use graphus_social_gen::{
+    DegreeDist, EPOCH_S, GenConfig, Generator, REG_SPAN_S, SplitMix64, battery,
+};
 
 /// How often the background sampler polls `/proc/<pid>/status` for RSS, in milliseconds.
 const SAMPLE_INTERVAL_MS: u64 = 50;
@@ -93,6 +95,14 @@ const DEFAULT_MIN_OPS_PER_CLIENT: u64 = 150;
 const AUTO_EXTEND_MAX_CLIENTS: usize = 512;
 /// Hard cap on the total rung count (explicit + auto-extended).
 const MAX_TOTAL_RUNGS: usize = 24;
+
+/// The default read-result verification sampling fraction (`--verify-fraction`, `rmp` #744): a small
+/// but NON-ZERO value so invariant I7 runs by default. Roughly one read in `ceil(1/f)` per worker is
+/// checked against ground truth, so verification is a bounded fraction of the workload.
+const DEFAULT_VERIFY_FRACTION: f64 = 0.05;
+
+/// How many mismatch exemplars I7 keeps for the report (bounded so a pathological run cannot flood it).
+const MAX_VERIFY_SAMPLES: usize = 8;
 
 // --- The production-shaped MIX defaults (`rmp` #714). The run everyone executes MUST be the mix; a
 // read-only default measured a FROZEN graph and could not expose one concurrency mechanism. ---------
@@ -174,6 +184,12 @@ fn run() -> Result<bool, String> {
         );
     }
 
+    // I7 (`rmp` #744): reconstruct the FRIEND ground-truth oracle ONCE, but only when a --gen-profile
+    // resolves the SAME GenConfig the loader used AND a structural cross-check confirms it reproduced
+    // the loaded edge count. A wrongly-reconstructed oracle must never FALSE-FAIL a correct server, so
+    // any doubt leaves the oracle None and I7 reports N/A.
+    let oracle = build_read_oracle(&args);
+
     let ctx = Arc::new(BenchCtx {
         target: target.clone(),
         user: args.user.clone(),
@@ -184,6 +200,8 @@ fn run() -> Result<bool, String> {
         articles: args.articles.max(1),
         term,
         since,
+        verify_fraction: args.verify_fraction,
+        oracle,
         ops_per_rung: args.ops_per_rung,
         min_ops_per_client: args.min_ops_per_client,
         write_every_ms: args.write_every_ms,
@@ -501,9 +519,24 @@ struct BenchCtx {
     active: Vec<usize>,
     /// The weighted pick bag over `active`.
     bag: Vec<usize>,
+    /// Read-result verification sampling fraction (`--verify-fraction`); `0.0` disables I7.
+    verify_fraction: f64,
+    /// The ground-truth oracle I7 checks sampled reads against (`Some` only with a `--gen-profile`).
+    oracle: Option<SocialReadOracle>,
 }
 
 impl BenchCtx {
+    /// Verify roughly every `ceil(1/verify_fraction)`-th read op per worker, or `0` when verification
+    /// is disabled or has no oracle. A per-worker counter modulo this value picks the sampled ops, so
+    /// the sampling is deterministic and its cost is a bounded fraction of the workload.
+    fn verify_every(&self) -> u64 {
+        if self.verify_fraction > 0.0 && self.oracle.is_some() {
+            (1.0 / self.verify_fraction).ceil() as u64
+        } else {
+            0
+        }
+    }
+
     /// The effective per-rung op budget: the larger of the requested global budget and the per-client
     /// floor (`clients × min_ops_per_client`), so per-family sample counts do not collapse as the
     /// ladder widens.
@@ -601,6 +634,14 @@ struct WorkerStats {
     /// WHAT the failed reads actually failed with. An error RATE without the error is a number, not
     /// evidence — see [`ErrorSample`].
     read_errors: ErrorSample,
+    /// I7 (`rmp` #744): sampled reads whose count matched the generator's ground truth.
+    verify_ok: u64,
+    /// I7: sampled reads whose count DIVERGED from ground truth (any one FAILS the run).
+    verify_mismatch: u64,
+    /// I7: sampled reads on a non-reconstructed family / degenerate anchors (not counted either way).
+    verify_skipped: u64,
+    /// A bounded sample of mismatch descriptions for the report.
+    verify_samples: Vec<String>,
 }
 impl WorkerStats {
     fn new(families: usize) -> Self {
@@ -611,6 +652,10 @@ impl WorkerStats {
             connect_errors: 0,
             reads: ReadInvariant::default(),
             read_errors: ErrorSample::default(),
+            verify_ok: 0,
+            verify_mismatch: 0,
+            verify_skipped: 0,
+            verify_samples: Vec::new(),
         }
     }
 }
@@ -655,6 +700,14 @@ struct RungResult {
     reads: ReadInvariant,
     /// The distinct failures the rung's reads hit (empty on a clean rung).
     read_errors: ErrorSample,
+    /// I7: sampled reads verified CORRECT against the generator's ground truth (`rmp` #744).
+    verify_ok: u64,
+    /// I7: sampled reads that returned WRONG counts (any one FAILS the run).
+    verify_mismatch: u64,
+    /// I7: sampled reads on a non-reconstructed family (informational).
+    verify_skipped: u64,
+    /// A bounded sample of the rung's mismatch descriptions.
+    verify_samples: Vec<String>,
 }
 
 /// Drives a single rung of `clients` concurrent connections **in one arm** and returns its aggregated
@@ -743,6 +796,14 @@ fn drive_rung(
                 }
                 merged.reads.merge(ws.reads);
                 merged.read_errors.merge(ws.read_errors);
+                merged.verify_ok += ws.verify_ok;
+                merged.verify_mismatch += ws.verify_mismatch;
+                merged.verify_skipped += ws.verify_skipped;
+                for s in ws.verify_samples {
+                    if merged.verify_samples.len() < MAX_VERIFY_SAMPLES {
+                        merged.verify_samples.push(s);
+                    }
+                }
             }
             // A worker thread panicked (it never unwraps on I/O, so this should not happen); count it
             // as an error so the exit gate reacts rather than silently dropping it.
@@ -827,6 +888,11 @@ fn run_worker(
     let interval = ctx.arrival_interval();
     let mut rng = SplitMix64::new(seed);
     let u0_pool = ctx.users;
+    // I7 (`rmp` #744): a deterministic per-worker sampler. `read_ix` counts this worker's read ops; one
+    // in `verify_every` of them is checked against the ground-truth oracle, so verification is a bounded
+    // fraction of the load and does not materially distort throughput/latency.
+    let verify_every = ctx.verify_every();
+    let mut read_ix: u64 = 0;
     loop {
         let ticket = issued.fetch_add(1, Ordering::Relaxed);
         if ticket >= budget {
@@ -843,15 +909,33 @@ fn run_worker(
         // Weighted family pick over the ACTIVE set, with anchors spread across the keyspace.
         let fam_ix = ctx.bag[(rng.next_u64() as usize) % ctx.bag.len()];
         let fam = &battery::ALL[fam_ix];
-        let u0 = Generator::user_id(rng.next_u64() % u0_pool);
-        let u1 = Generator::user_id(rng.next_u64() % u0_pool);
+        let u0_idx = rng.next_u64() % u0_pool;
+        let u1_idx = rng.next_u64() % u0_pool;
+        let u0 = Generator::user_id(u0_idx);
+        let u1 = Generator::user_id(u1_idx);
         let params = op_params(fam.params, &u0, &u1, &ctx.term, ctx.since);
+        // Sample this op for I7 verification (before the round-trip, so the decision is deterministic).
+        let sample = verify_every != 0 && read_ix % verify_every == 0;
+        read_ix += 1;
         let op_start = scheduled.unwrap_or_else(Instant::now);
         match client.run(fam.cypher, params, &ctx.db) {
-            Ok(_) => {
+            Ok(result) => {
+                // Latency is stamped FIRST, so the (sampled-only) verification never inflates it.
                 let ns = u64::try_from(op_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 stats.lat[fam_ix].push(ns);
                 stats.ok[fam_ix] += 1;
+                if sample && let Some(oracle) = &ctx.oracle {
+                    match verify_social_read(fam.name, &result, oracle, u0_idx, u1_idx) {
+                        ReadCheck::Verified => stats.verify_ok += 1,
+                        ReadCheck::Skipped => stats.verify_skipped += 1,
+                        ReadCheck::Mismatch(detail) => {
+                            stats.verify_mismatch += 1;
+                            if stats.verify_samples.len() < MAX_VERIFY_SAMPLES {
+                                stats.verify_samples.push(detail);
+                            }
+                        }
+                    }
+                }
             }
             Err(e) => {
                 stats.err[fam_ix] += 1;
@@ -1036,6 +1120,10 @@ fn aggregate_rung(
         write,
         reads: merged.reads,
         read_errors: merged.read_errors,
+        verify_ok: merged.verify_ok,
+        verify_mismatch: merged.verify_mismatch,
+        verify_skipped: merged.verify_skipped,
+        verify_samples: std::mem::take(&mut merged.verify_samples),
     }
 }
 
@@ -1904,6 +1992,68 @@ fn check_invariants(
         },
     });
 
+    // ---- I7: READS RETURN CORRECT RESULTS (recomputed from the generator, `rmp` #744) ------------
+    // The reads are no longer pulled-and-discarded: a deterministic sample of the degree / friends /
+    // mutual families is checked against ground truth recomputed from the SAME generator that built the
+    // loaded graph (the friend graph is never mutated by the writers, which only SET scalars). A single
+    // WRONG count FAILS the run; a verifier that verified NOTHING while armed also FAILS. The oracle is
+    // present ONLY when a --gen-profile reconstruction passed its structural cross-check, so I7 is N/A
+    // (never a false fail) when the ground truth could not be reconstructed.
+    let verify_ok: u64 = rungs.iter().map(|r| r.verify_ok).sum();
+    let verify_mismatch: u64 = rungs.iter().map(|r| r.verify_mismatch).sum();
+    let verify_skipped: u64 = rungs.iter().map(|r| r.verify_skipped).sum();
+    let mut vsamples: Vec<String> = Vec::new();
+    for r in rungs {
+        for s in &r.verify_samples {
+            if vsamples.len() < MAX_VERIFY_SAMPLES {
+                vsamples.push(s.clone());
+            }
+        }
+    }
+    let (i7_ok, i7_detail) = if ctx.verify_fraction <= 0.0 || ctx.oracle.is_none() {
+        (
+            true,
+            "N/A — read-result verification is disabled (--verify-fraction 0) or the generation config \
+             could not be reconstructed (pass --gen-profile + the FRIEND-degree flags the loader used \
+             to arm I7). NOT a pass over correctness — verification simply did not run."
+                .to_string(),
+        )
+    } else if verify_mismatch > 0 {
+        (
+            false,
+            format!(
+                "{verify_mismatch} sampled read(s) returned WRONG counts (of {} checked) — the server \
+                 served incorrect rows, which a pull-and-discard driver would have passed green: {}",
+                verify_ok + verify_mismatch,
+                vsamples.join(" | ")
+            ),
+        )
+    } else if verify_ok == 0 {
+        (
+            false,
+            "--verify-fraction > 0 and the oracle reconstructed, but NOT ONE sampled read landed on a \
+             reconstructed family (degree / friends / mutual) — the verifier is VACUOUS (measure it or \
+             omit it). Expected the read battery to sample those families."
+                .to_string(),
+        )
+    } else {
+        (
+            true,
+            format!(
+                "{verify_ok} sampled read(s) returned CORRECT results (degree / friends / mutual \
+                 recomputed from the generator; {verify_skipped} sampled read(s) fell on \
+                 non-reconstructed families / degenerate anchors and were skipped). The FoF / \
+                 top-liked / text / fulltext families are not reconstructed here."
+            ),
+        )
+    };
+    out.push(Invariant {
+        id: "I7",
+        title: "READS RETURN CORRECT RESULTS (recomputed from the generator, rmp #744)",
+        ok: i7_ok,
+        detail: i7_detail,
+    });
+
     out
 }
 
@@ -2723,6 +2873,188 @@ fn mix_cost_note(rungs: &[RungResult], best: &RungResult, primary: Arm) -> Strin
 }
 
 // ============================================================================================
+// I7 — reads return correct results (the read-result oracle, `rmp` #744)
+// ============================================================================================
+
+/// Ground truth recomputed from the deterministic generator, used to check that the server returns
+/// CORRECT rows for a **sampled** read — so a server that serves WRONG, MISSING, or MIS-ORDERED counts
+/// can no longer pass a green run whose reads were pulled and discarded (`rmp` #744). Built **once** at
+/// startup, only when a `--gen-profile` reconstructs the exact generation config.
+///
+/// Three families are checked, all recomputed from the `FRIEND` graph, which the example's write
+/// workload never mutates (the writers only `SET` scalar properties), so the oracle stays valid for the
+/// whole run:
+/// * `degree` (`RETURN count(f)`) — the user's multi-edge `FRIEND` incidence count.
+/// * `friends` (`RETURN count(DISTINCT f)`) — the user's distinct-neighbour count.
+/// * `mutual` (`RETURN count(DISTINCT m)`) — `|neighbours(u0) ∩ neighbours(u1)|`, skipped when
+///   `u0 == u1` (Cypher relationship-uniqueness makes that degenerate case depend on multi-edges).
+///
+/// `fof` / `top_liked` / `text_contains` / `like_recent` / `fulltext` are deliberately not
+/// reconstructed (2-hop closures, global aggregations, and substring/full-text scans).
+struct SocialReadOracle {
+    /// Number of users in the loaded graph (bounds the anchor index).
+    users: u64,
+    /// Per-user multi-edge `FRIEND` incidence count (the `degree` answer).
+    degree: Vec<u64>,
+    /// Per-user SORTED distinct neighbour set (its length is `friends`; pairwise intersection is
+    /// `mutual`).
+    neighbours: Vec<Vec<u64>>,
+}
+
+impl SocialReadOracle {
+    /// Builds the oracle from a reconstructed generation config (`--gen-profile` + overrides + the
+    /// generation `--seed`).
+    fn build(cfg: &GenConfig) -> Self {
+        let (degree, neighbours) = Generator::new(cfg.clone()).friend_adjacency();
+        Self {
+            users: cfg.users,
+            degree,
+            neighbours,
+        }
+    }
+
+    /// `|neighbours(a) ∩ neighbours(b)|` — the mutual-friends ground truth (both neighbour sets are
+    /// sorted, so this is a linear merge). `None` when either anchor is out of range.
+    fn mutual(&self, a: u64, b: u64) -> Option<u64> {
+        let na = self.neighbours.get(a as usize)?;
+        let nb = self.neighbours.get(b as usize)?;
+        Some(sorted_intersection_len(na, nb))
+    }
+}
+
+/// Reconstruct the FRIEND ground-truth oracle for I7 (`rmp` #744) — or decline to `None` (I7 N/A).
+///
+/// Requires a `--gen-profile`; without it the FRIEND-degree config cannot be reconstructed (unlike
+/// reco's `s_user`, EVERY social family the oracle checks needs the friend graph), so I7 is N/A. When a
+/// profile is given, the SAME `GenConfig` the loader resolved is rebuilt from the profile + the
+/// FRIEND-degree overrides the loader was passed, then **structurally cross-checked**: the reconstructed
+/// undirected incidence total (`Σ degree = 2 × edges`) must equal `2 × --friends` (the loaded edge
+/// count). A mismatch means the profile/band we resolved is NOT the graph on the server — so the oracle
+/// is DECLINED rather than risk false-failing a correct server with a wrong ground truth.
+fn build_read_oracle(args: &Args) -> Option<SocialReadOracle> {
+    let profile = args.gen_profile.as_ref()?;
+    let cfg = GenConfig::resolve(
+        profile,
+        Some(args.users.max(1)),
+        Some(args.articles.max(1)),
+        args.friend_min,
+        args.friend_max,
+        args.avg_likes,
+        Some(args.seed),
+        args.degree_dist,
+    )
+    .ok()?;
+    let oracle = SocialReadOracle::build(&cfg);
+    let incidences: u64 = oracle.degree.iter().sum();
+    if args.friends > 0 && incidences == 2 * args.friends {
+        Some(oracle)
+    } else {
+        eprintln!(
+            "social_bench: I7 oracle DECLINED — reconstructed FRIEND incidences {incidences} != \
+             2×{} loaded edges; the --gen-profile/band did not reproduce the loaded graph, so \
+             read-result verification is N/A (not a failure).",
+            args.friends
+        );
+        None
+    }
+}
+
+/// The number of elements common to two ascending-sorted, de-duplicated slices (a linear merge).
+fn sorted_intersection_len(a: &[u64], b: &[u64]) -> u64 {
+    let (mut i, mut j, mut count) = (0usize, 0usize, 0u64);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                count += 1;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    count
+}
+
+/// The verdict of checking one sampled read reply against the [`SocialReadOracle`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReadCheck {
+    /// Checked against ground truth and CORRECT.
+    Verified,
+    /// This family is not deterministically reconstructed (or the anchors are out of range / degenerate).
+    Skipped,
+    /// Checked and WRONG — the string describes the divergence for the report.
+    Mismatch(String),
+}
+
+/// Checks one sampled read reply against ground truth. **Pure** — no I/O, no clock — so it is
+/// unit-testable (see the `tests` module) and adds nothing to the latency measured around it. `u0`/`u1`
+/// are the anchor user indices the worker drew (`u1` matters only for `mutual`).
+fn verify_social_read(
+    family: &str,
+    result: &QueryResult,
+    oracle: &SocialReadOracle,
+    u0: u64,
+    u1: u64,
+) -> ReadCheck {
+    match family {
+        "degree" => scalar_check(
+            result,
+            &format!("degree(u{u0})"),
+            oracle.degree.get(u0 as usize).copied(),
+        ),
+        "friends" => scalar_check(
+            result,
+            &format!("friends(u{u0})"),
+            oracle
+                .neighbours
+                .get(u0 as usize)
+                .map(|n| n.len() as u64)
+                .filter(|_| u0 < oracle.users),
+        ),
+        "mutual" => {
+            // The degenerate u0 == u1 case is not soundly reconstructible (Cypher relationship
+            // uniqueness makes it depend on multi-edges), so skip it rather than risk a false mismatch.
+            if u0 == u1 {
+                return ReadCheck::Skipped;
+            }
+            scalar_check(
+                result,
+                &format!("mutual(u{u0},u{u1})"),
+                oracle.mutual(u0, u1),
+            )
+        }
+        _ => ReadCheck::Skipped,
+    }
+}
+
+/// Checks a single-scalar-row `RETURN count(...) AS x` reply against `expected` (a count). `None`
+/// expected ⇒ [`ReadCheck::Skipped`] (anchor out of range).
+fn scalar_check(result: &QueryResult, label: &str, expected: Option<u64>) -> ReadCheck {
+    let Some(expected) = expected else {
+        return ReadCheck::Skipped;
+    };
+    let got = match (
+        result.records.len(),
+        result.records.first().and_then(|r| r.first()),
+    ) {
+        (1, Some(Value::Integer(n))) => *n,
+        _ => {
+            return ReadCheck::Mismatch(format!(
+                "{label}: expected a single integer row, got fields={:?} rows={}",
+                result.fields,
+                result.records.len()
+            ));
+        }
+    };
+    if i128::from(got) == i128::from(expected) {
+        ReadCheck::Verified
+    } else {
+        ReadCheck::Mismatch(format!("{label}: expected {expected}, got {got}"))
+    }
+}
+
+// ============================================================================================
 // CLI
 // ============================================================================================
 
@@ -2763,6 +3095,18 @@ struct Args {
     target_rps: f64,
     auto_extend: bool,
     read_timeout_ms: u64,
+    /// I7 (`rmp` #744): read-result verification sampling fraction (`--verify-fraction`); `0.0`
+    /// disables it. Non-zero AND a reconstructable generation config are BOTH required to arm I7.
+    verify_fraction: f64,
+    /// I7: the generation profile (`--gen-profile fast|large|huge`) the loaded graph was built from —
+    /// needed to reconstruct the exact `FRIEND` ground truth. Absent ⇒ I7 is N/A (never a false fail).
+    gen_profile: Option<String>,
+    /// I7: `FRIEND`-degree band + distribution overrides the loader applied (`--friend-min`,
+    /// `--friend-max`, `--avg-likes`, `--degree-dist`), so the oracle resolves the SAME `GenConfig`.
+    friend_min: Option<u64>,
+    friend_max: Option<u64>,
+    avg_likes: Option<u64>,
+    degree_dist: Option<DegreeDist>,
 }
 
 impl Args {
@@ -2808,6 +3152,15 @@ impl Args {
         let mut target_rps = 0.0f64;
         let mut auto_extend = false;
         let mut read_timeout_ms = 120_000u64;
+        // I7 (`rmp` #744): verification is armed by default, but only actually runs when a --gen-profile
+        // (plus any FRIEND-degree overrides the loader used) lets the oracle reconstruct the graph.
+        let mut verify_fraction = DEFAULT_VERIFY_FRACTION;
+        let mut gen_profile: Option<String> = None;
+        let mut friend_min: Option<u64> = None;
+        let mut friend_max: Option<u64> = None;
+        let mut avg_likes: Option<u64> = None;
+        let mut degree_dist: Option<DegreeDist> = None;
+        let mut zipf_exponent: u32 = 2;
 
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
@@ -2887,6 +3240,43 @@ impl Args {
                 }
                 "--auto-extend" => auto_extend = true,
                 "--read-timeout-ms" => read_timeout_ms = parse_u64(&value()?, "--read-timeout-ms")?,
+                // I7 (`rmp` #744) — read-result verification + the generation config to reconstruct the
+                // ground truth from. The band/dist flags mirror the loader's (social_wire_load) so the
+                // oracle resolves the SAME GenConfig the graph was built with.
+                "--verify-fraction" => {
+                    let v = value()?;
+                    verify_fraction = v.parse().map_err(|_| {
+                        format!("--verify-fraction must be a number in [0,1], got {v:?}")
+                    })?;
+                    if !(0.0..=1.0).contains(&verify_fraction) {
+                        return Err("--verify-fraction must be in [0, 1]".into());
+                    }
+                }
+                "--gen-profile" => gen_profile = Some(value()?),
+                "--friend-min" => friend_min = Some(parse_u64(&value()?, "--friend-min")?),
+                "--friend-max" => friend_max = Some(parse_u64(&value()?, "--friend-max")?),
+                "--avg-likes" => avg_likes = Some(parse_u64(&value()?, "--avg-likes")?),
+                "--degree-dist" => {
+                    degree_dist = Some(match value()?.as_str() {
+                        "uniform" => DegreeDist::Uniform,
+                        "zipf" | "powerlaw" | "power-law" => DegreeDist::PowerLaw {
+                            exponent: zipf_exponent,
+                        },
+                        other => {
+                            return Err(format!("unknown --degree-dist {other:?} (uniform|zipf)"));
+                        }
+                    });
+                }
+                "--zipf-exponent" => {
+                    zipf_exponent = u32::try_from(parse_u64(&value()?, "--zipf-exponent")?)
+                        .map_err(|_| "--zipf-exponent too large".to_string())?;
+                    // If --degree-dist zipf was already parsed, refresh its exponent.
+                    if let Some(DegreeDist::PowerLaw { .. }) = degree_dist {
+                        degree_dist = Some(DegreeDist::PowerLaw {
+                            exponent: zipf_exponent,
+                        });
+                    }
+                }
                 "-h" | "--help" => {
                     print_usage();
                     std::process::exit(0);
@@ -2923,6 +3313,12 @@ impl Args {
             probe_secs,
             target_rps,
             auto_extend,
+            verify_fraction,
+            gen_profile,
+            friend_min,
+            friend_max,
+            avg_likes,
+            degree_dist,
             read_timeout_ms: {
                 if read_timeout_ms == 0 {
                     return Err("--read-timeout-ms must be > 0".into());
@@ -2957,9 +3353,12 @@ fn print_usage() {
 #[cfg(test)]
 mod tests {
     use super::{
-        Arm, BenchCtx, ErrorSample, Pcts, ReadInvariant, RetryPolicy, RungResult, Target,
-        WriteKind, WriteVector, diagnose_knee, du_store, primary_arm, top_rung,
+        Arm, BenchCtx, ErrorSample, Pcts, ReadCheck, ReadInvariant, RetryPolicy, RungResult,
+        SocialReadOracle, Target, WriteKind, WriteVector, diagnose_knee, du_store, primary_arm,
+        top_rung, verify_social_read,
     };
+    use graphus_core::Value;
+    use graphus_reco_gen::client::QueryResult;
     use graphus_reco_gen::mix::UnitOutcome;
     use graphus_social_gen::{SplitMix64, battery};
     use std::path::PathBuf;
@@ -2991,6 +3390,10 @@ mod tests {
             write: WriteVector::default(),
             reads: ReadInvariant::default(),
             read_errors: ErrorSample::default(),
+            verify_ok: 0,
+            verify_mismatch: 0,
+            verify_skipped: 0,
+            verify_samples: Vec::new(),
         }
     }
 
@@ -3006,6 +3409,8 @@ mod tests {
             articles: 100,
             term: "term".into(),
             since: 0,
+            verify_fraction: 0.0,
+            oracle: None,
             ops_per_rung: 1500,
             min_ops_per_client: 150,
             write_every_ms,
@@ -3018,6 +3423,49 @@ mod tests {
             active: vec![0],
             bag: vec![0],
         }
+    }
+
+    /// A single-integer-row `RETURN count(...)` reply.
+    fn qr(rows: Vec<Vec<Value>>) -> QueryResult {
+        QueryResult {
+            fields: vec!["c".to_string()],
+            records: rows,
+            elapsed: Duration::from_millis(0),
+        }
+    }
+
+    /// I7 (`rmp` #744) MUST FIRE on a wrong count and stay quiet on the right one — otherwise the
+    /// pull-and-discard read loop it replaced could pass a server that served incorrect rows.
+    #[test]
+    fn i7_social_verifies_degree_friends_mutual_and_flags_wrong_counts() {
+        // A hand-built oracle: user 0 ~ {1,2}, user 1 ~ {0}, user 2 ~ {0,1,2} (neighbours sorted+deduped).
+        let oracle = SocialReadOracle {
+            users: 3,
+            degree: vec![2, 1, 3],
+            neighbours: vec![vec![1, 2], vec![0], vec![0, 1, 2]],
+        };
+        let check = |fam: &str, n: i64, u0: u64, u1: u64| {
+            verify_social_read(fam, &qr(vec![vec![Value::Integer(n)]]), &oracle, u0, u1)
+        };
+
+        // degree(u0) — the multi-edge incidence count.
+        assert_eq!(check("degree", 2, 0, 0), ReadCheck::Verified);
+        assert!(matches!(check("degree", 9, 0, 0), ReadCheck::Mismatch(_)));
+        // friends(u0) — the DISTINCT-neighbour count.
+        assert_eq!(check("friends", 3, 2, 0), ReadCheck::Verified);
+        assert!(matches!(check("friends", 2, 2, 0), ReadCheck::Mismatch(_)));
+        // mutual(u0,u1) — |neighbours(u0) ∩ neighbours(u1)| = |{1,2} ∩ {0,1,2}| = 2.
+        assert_eq!(check("mutual", 2, 0, 2), ReadCheck::Verified);
+        assert!(matches!(check("mutual", 0, 0, 2), ReadCheck::Mismatch(_)));
+        // The degenerate u0 == u1 mutual is SKIPPED (not a false mismatch).
+        assert_eq!(check("mutual", 0, 1, 1), ReadCheck::Skipped);
+        // A family the oracle does not reconstruct is SKIPPED, never failed.
+        assert_eq!(check("fof", 5, 0, 1), ReadCheck::Skipped);
+        // A malformed reply (a dropped row) is a mismatch, not a silent pass.
+        assert!(matches!(
+            verify_social_read("degree", &qr(vec![]), &oracle, 0, 0),
+            ReadCheck::Mismatch(_)
+        ));
     }
 
     /// `--writers 0` is the DOCUMENTED off switch for the read-only baseline. Flooring it back to one

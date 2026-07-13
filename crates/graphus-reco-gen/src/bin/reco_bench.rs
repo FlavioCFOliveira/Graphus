@@ -96,7 +96,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -111,11 +111,11 @@ use graphus_examples_harness::{
     CpuSection, DatasetScale, EvidenceCollector, MemorySection, RunMetadata,
 };
 use graphus_reco_gen::bench::{self, Pcts};
-use graphus_reco_gen::client::{BoltClient, BoltUrl, ClientResult};
+use graphus_reco_gen::client::{BoltClient, BoltUrl, ClientResult, QueryResult};
 use graphus_reco_gen::mix::{
     self, Arm, ErrorSample, READ_LIVENESS_FLOOR, ReadInvariant, RetryPolicy, WriteKind, WriteVector,
 };
-use graphus_reco_gen::{EPOCH_S, Generator, SplitMix64, queries};
+use graphus_reco_gen::{EPOCH_S, GenConfig, Generator, SplitMix64, queries};
 
 /// How often the background sampler polls `/proc/<pid>/status` for RSS, in milliseconds.
 const SAMPLE_INTERVAL_MS: u64 = 50;
@@ -168,6 +168,25 @@ const DEFAULT_MIN_OPS_PER_CLIENT: u64 = 150;
 const AUTO_EXTEND_MAX_CLIENTS: usize = 512;
 /// Hard cap on the total number of rungs (explicit + auto-extended), bounding the run time.
 const MAX_TOTAL_RUNGS: usize = 24;
+
+// --- I7: reads return correct results (the read-result oracle, `rmp` #744) -----------------------
+
+/// The generation seed every `reco_gen` profile pins (`GenConfig::{tiny,fast,large,huge}`), and thus
+/// the seed the loaded graph's `User.name` / `User.country` were built from. `reco_gen` exposes no seed
+/// knob, so this is the seed of every graph the example loads; `--gen-seed` overrides it for a graph
+/// hand-loaded with a different seed.
+const RECO_GEN_SEED: u64 = 0x05EC_011E_C710_0001;
+
+/// The `LIMIT` the `s_purchases` family caps its result at (kept in step with [`queries::READ_BATTERY`]).
+const S_PURCHASES_LIMIT: usize = 50;
+
+/// The default read-result verification sampling fraction (`--verify-fraction`): a small but NON-ZERO
+/// value so invariant I7 runs by default. Roughly one read in `ceil(1/f)` per worker is checked against
+/// ground truth, so the verification cost stays a bounded fraction of the workload.
+const DEFAULT_VERIFY_FRACTION: f64 = 0.05;
+
+/// How many mismatch exemplars I7 keeps for the report (bounded so a pathological run cannot flood it).
+const MAX_VERIFY_SAMPLES: usize = 8;
 
 /// Where the driver connects: a local Unix socket, or a Bolt-over-TCP(+TLS) URL for an attached
 /// (possibly remote) instance. Each worker owns one connection built from this.
@@ -222,14 +241,31 @@ fn run() -> Result<bool, String> {
     let ladder = bench::parse_ladder(&args.ladder)?;
     let target = args.target()?;
     let external = target.is_external();
+
+    // I7 (`rmp` #744): build the ground-truth oracle ONCE. A `--gen-profile` reconstructs the exact
+    // generation config (unlocking the s_degree check, and — with writers off — the exact s_purchases
+    // set); without it, s_user (from the pinned generation seed) and the s_purchases well-formedness
+    // check still run. The graph is "static" (safe for the exact purchased-set check) iff no writer runs.
+    let gen_cfg = match &args.gen_profile {
+        Some(name) => Some(GenConfig::profile(name).ok_or_else(|| {
+            format!("unknown --gen-profile {name:?} (expected one of tiny|fast|large|huge)")
+        })?),
+        None => None,
+    };
+    let gen_seed = gen_cfg.as_ref().map_or(args.gen_seed, |c| c.seed);
+    let graph_static = args.writers == 0 || args.write_every_ms == 0;
+    let users = args.users.max(1);
+    let products = args.products.max(1);
+    let oracle = ReadOracle::build(gen_seed, users, products, gen_cfg.as_ref(), graph_static);
+
     let ctx = Arc::new(BenchCtx {
         target: target.clone(),
         user: args.user.clone(),
         password: args.password.clone(),
         db: args.db.clone(),
         read_timeout: Duration::from_millis(args.read_timeout_ms),
-        users: args.users.max(1),
-        products: args.products.max(1),
+        users,
+        products,
         ops_per_rung: args.ops_per_rung,
         min_ops_per_client: args.min_ops_per_client,
         write_every_ms: args.write_every_ms,
@@ -242,6 +278,8 @@ fn run() -> Result<bool, String> {
         },
         target_rps: args.target_rps,
         seed: args.seed,
+        verify_fraction: args.verify_fraction,
+        oracle,
     });
 
     // Server-process `/proc` sampling is only meaningful for a co-located pid (local mode). In attach
@@ -481,9 +519,24 @@ struct BenchCtx {
     /// Fixed total arrival rate for open-loop mode (`--target-rps`); `0.0` = closed-loop.
     target_rps: f64,
     seed: u64,
+    /// Read-result verification sampling fraction (`--verify-fraction`); `0.0` disables I7.
+    verify_fraction: f64,
+    /// The ground-truth oracle I7 checks sampled reads against (`rmp` #744).
+    oracle: ReadOracle,
 }
 
 impl BenchCtx {
+    /// Verify roughly every `ceil(1/verify_fraction)`-th read op per worker, or `0` when verification
+    /// is disabled (`--verify-fraction 0`). A per-worker counter modulo this value picks the sampled
+    /// ops, so the sampling is deterministic and its cost is a bounded fraction of the workload.
+    fn verify_every(&self) -> u64 {
+        if self.verify_fraction > 0.0 {
+            (1.0 / self.verify_fraction).ceil() as u64
+        } else {
+            0
+        }
+    }
+
     /// The effective per-rung op budget: the larger of the requested global budget and the per-client
     /// floor (`clients × min_ops_per_client`). This keeps per-family sample counts from collapsing as
     /// the ladder widens, without shrinking a rung below the requested global budget.
@@ -581,6 +634,14 @@ struct WorkerStats {
     /// WHAT the failed reads actually failed with. An error RATE without the error is a number, not
     /// evidence — see [`ErrorSample`].
     read_errors: ErrorSample,
+    /// I7 (`rmp` #744): sampled reads whose rows matched the generator's ground truth.
+    verify_ok: u64,
+    /// I7: sampled reads whose rows DIVERGED from ground truth (any one FAILS the run).
+    verify_mismatch: u64,
+    /// I7: sampled reads on a family the oracle does not reconstruct (not counted either way).
+    verify_skipped: u64,
+    /// A bounded sample of mismatch descriptions for the report.
+    verify_samples: Vec<String>,
 }
 
 impl WorkerStats {
@@ -592,6 +653,10 @@ impl WorkerStats {
             connect_errors: 0,
             reads: ReadInvariant::default(),
             read_errors: ErrorSample::default(),
+            verify_ok: 0,
+            verify_mismatch: 0,
+            verify_skipped: 0,
+            verify_samples: Vec::new(),
         }
     }
 }
@@ -637,6 +702,14 @@ struct RungResult {
     reads: ReadInvariant,
     /// The distinct failures the rung's reads hit (empty on a clean rung).
     read_errors: ErrorSample,
+    /// I7: sampled reads verified CORRECT against the generator's ground truth (`rmp` #744).
+    verify_ok: u64,
+    /// I7: sampled reads that returned WRONG rows (any one FAILS the run).
+    verify_mismatch: u64,
+    /// I7: sampled reads on a non-reconstructed family (informational).
+    verify_skipped: u64,
+    /// A bounded sample of the rung's mismatch descriptions.
+    verify_samples: Vec<String>,
 }
 
 /// Drives a single rung of `clients` concurrent connections **in one arm** and returns its aggregated
@@ -737,6 +810,14 @@ fn drive_rung(
                 }
                 merged.reads.merge(ws.reads);
                 merged.read_errors.merge(ws.read_errors);
+                merged.verify_ok += ws.verify_ok;
+                merged.verify_mismatch += ws.verify_mismatch;
+                merged.verify_skipped += ws.verify_skipped;
+                for s in ws.verify_samples {
+                    if merged.verify_samples.len() < MAX_VERIFY_SAMPLES {
+                        merged.verify_samples.push(s);
+                    }
+                }
             }
             Err(_) => {
                 // A worker thread panicked (should never happen — the worker never unwraps on I/O);
@@ -829,6 +910,12 @@ fn run_worker(
     let t0 = *origin.get_or_init(Instant::now);
     let interval = ctx.arrival_interval();
 
+    // I7 (`rmp` #744): a deterministic per-worker sampler. `read_ix` counts this worker's read ops; one
+    // in `verify_every` of them is checked against the ground-truth oracle, so verification is a bounded
+    // fraction of the load and does not materially distort throughput/latency.
+    let verify_every = ctx.verify_every();
+    let mut read_ix: u64 = 0;
+
     let mut rng = SplitMix64::new(seed);
     loop {
         let ticket = issued.fetch_add(1, Ordering::Relaxed);
@@ -849,14 +936,31 @@ fn run_worker(
         }
         let spec = queries::pick(rng.next_u64());
         let fam = bench::family_index(spec);
-        let id = Generator::user_id(rng.next_u64() % ctx.users);
+        let uidx = rng.next_u64() % ctx.users;
+        let id = Generator::user_id(uidx);
         let params = vec![("id".to_string(), Value::String(id))];
+        // Sample this op for I7 verification (before the round-trip, so the decision is deterministic).
+        let sample = verify_every != 0 && read_ix % verify_every == 0;
+        read_ix += 1;
         let op_start = scheduled.unwrap_or_else(Instant::now);
         match client.run(spec.cypher, params, &ctx.db) {
-            Ok(_) => {
+            Ok(result) => {
+                // Latency is stamped FIRST, so the (sampled-only) verification never inflates it.
                 let ns = u64::try_from(op_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 stats.lat[fam].push(ns);
                 stats.ok[fam] += 1;
+                if sample {
+                    match verify_reco_read(spec.name, &result, &ctx.oracle, uidx) {
+                        ReadCheck::Verified => stats.verify_ok += 1,
+                        ReadCheck::Skipped => stats.verify_skipped += 1,
+                        ReadCheck::Mismatch(detail) => {
+                            stats.verify_mismatch += 1;
+                            if stats.verify_samples.len() < MAX_VERIFY_SAMPLES {
+                                stats.verify_samples.push(detail);
+                            }
+                        }
+                    }
+                }
             }
             Err(e) => {
                 stats.err[fam] += 1;
@@ -1033,6 +1137,11 @@ fn aggregate_rung(
 
     let (peak_rss, final_rss, vm_hwm) = rss;
 
+    let verify_ok = merged.verify_ok;
+    let verify_mismatch = merged.verify_mismatch;
+    let verify_skipped = merged.verify_skipped;
+    let verify_samples = std::mem::take(&mut merged.verify_samples);
+
     RungResult {
         arm,
         clients,
@@ -1056,6 +1165,10 @@ fn aggregate_rung(
         write,
         reads: merged.reads,
         read_errors: merged.read_errors,
+        verify_ok,
+        verify_mismatch,
+        verify_skipped,
+        verify_samples,
     }
 }
 
@@ -1832,6 +1945,76 @@ fn check_invariants(
                     .join("; "),
             )
         },
+    });
+
+    // ---- I7: READS RETURN CORRECT RESULTS (recomputed from the generator, `rmp` #744) ------------
+    // The reads are no longer pulled-and-discarded: a deterministic sample of them is checked against
+    // ground truth recomputed from the same generator that built the loaded graph. A single WRONG,
+    // MISSING, or MIS-ORDERED row FAILS the run; a verifier that verified NOTHING (fraction > 0 but no
+    // sampled read landed on a reconstructed family) also FAILS — measure it or omit it.
+    let verify_ok: u64 = rungs.iter().map(|r| r.verify_ok).sum();
+    let verify_mismatch: u64 = rungs.iter().map(|r| r.verify_mismatch).sum();
+    let verify_skipped: u64 = rungs.iter().map(|r| r.verify_skipped).sum();
+    let mut samples: Vec<String> = Vec::new();
+    for r in rungs {
+        for s in &r.verify_samples {
+            if samples.len() < MAX_VERIFY_SAMPLES {
+                samples.push(s.clone());
+            }
+        }
+    }
+    let families = {
+        let mut fams = vec!["s_user(name+country)"];
+        if ctx.oracle.degree.is_some() {
+            fams.push("s_degree");
+        }
+        fams.push(if ctx.oracle.purchases.is_some() {
+            "s_purchases(exact set)"
+        } else {
+            "s_purchases(well-formed)"
+        });
+        fams.join(", ")
+    };
+    let (i7_ok, i7_detail) = if ctx.verify_fraction <= 0.0 {
+        (
+            true,
+            "N/A — read-result verification is disabled (--verify-fraction 0)".to_string(),
+        )
+    } else if verify_mismatch > 0 {
+        (
+            false,
+            format!(
+                "{verify_mismatch} sampled read(s) returned WRONG results (of {} checked) — the server \
+                 served incorrect rows, which a pull-and-discard driver would have passed green: {}",
+                verify_ok + verify_mismatch,
+                samples.join(" | ")
+            ),
+        )
+    } else if verify_ok == 0 {
+        (
+            false,
+            "--verify-fraction > 0 but NOT ONE sampled read was checked against ground truth — the \
+             verifier is VACUOUS (measure it or omit it). Expected the read battery to include a \
+             reconstructed family (s_user is always reconstructible here)."
+                .to_string(),
+        )
+    } else {
+        (
+            true,
+            format!(
+                "{verify_ok} sampled read(s) returned CORRECT results (verified families: {families}; \
+                 {verify_skipped} sampled read(s) fell on non-reconstructed families and were skipped). \
+                 The FoF / collaborative-filtering families are not reconstructed here. Pass \
+                 --gen-profile to also verify s_degree, and add --writers 0 to verify the exact \
+                 s_purchases set."
+            ),
+        )
+    };
+    out.push(Invariant {
+        id: "I7",
+        title: "READS RETURN CORRECT RESULTS (recomputed from the generator, rmp #744)",
+        ok: i7_ok,
+        detail: i7_detail,
     });
 
     out
@@ -2658,6 +2841,241 @@ fn mix_cost_note(rungs: &[RungResult], best: &RungResult, primary: Arm) -> Strin
 }
 
 // ============================================================================================
+// I7 — reads return correct results (the read-result oracle, `rmp` #744)
+// ============================================================================================
+
+/// Ground truth recomputed from the deterministic generator, used to check that the server returns
+/// CORRECT rows for a **sampled** read — so a server that serves WRONG, MISSING, or MIS-ORDERED rows can
+/// no longer pass a green run whose reads were pulled and discarded (`rmp` #744). Built **once** at
+/// startup; verification is then O(returned rows) per sampled op.
+///
+/// Which families are checked, and why not all:
+/// * `s_user` (`RETURN u.name, u.country`) — always, from [`RECO_GEN_SEED`]. Stable under the write
+///   workload (no writer touches `User.name`/`country`).
+/// * `s_degree` (`RETURN count(f)`) — only with a `--gen-profile` (needs the reconstructed friend
+///   graph). Stable under the write workload (the writers add `PURCHASED`/`hot`, never `FRIEND`).
+/// * `s_purchases` (`RETURN p.id … LIMIT 50`) — the LIMIT-respecting, real-product well-formedness check
+///   always; the exact set+cardinality check only when the graph is **static** (`--writers 0`), because
+///   `WRITE_PURCHASE` adds `PURCHASED` edges (and the multigraph permits duplicates), which would make a
+///   loaded-graph purchased oracle stale.
+/// * `r1`–`r4` (the FoF / collaborative-filtering aggregations) — deliberately not reconstructed.
+struct ReadOracle {
+    /// The generation seed the loaded `User.name`/`User.country` were built from.
+    gen_seed: u64,
+    /// Number of users in the loaded graph (bounds the anchor index).
+    users: u64,
+    /// Every valid `Product` id (24-hex → `u128`) mapped to its product index. Lets `s_purchases` reject
+    /// a returned id that is not a real product, and (when sound) test set membership. Small (`products`
+    /// entries), so it is always built.
+    product_index: HashMap<u128, u32>,
+    /// Per-user undirected `FRIEND` degree — `Some` only when a `--gen-profile` reconstructs the graph.
+    degree: Option<Vec<u64>>,
+    /// Per-user SORTED distinct purchased product indices — `Some` only when the graph is static (no
+    /// writers) AND a `--gen-profile` is given (the write workload otherwise mutates the purchased set).
+    purchases: Option<Vec<Vec<u32>>>,
+}
+
+impl ReadOracle {
+    /// Builds the oracle once. `cfg` is the reconstructed generation config (`Some` iff `--gen-profile`
+    /// was given); `graph_static` is whether the run mutates the graph (`false` ⇒ writers are active, so
+    /// the exact `s_purchases` set is not reconstructed).
+    fn build(
+        gen_seed: u64,
+        users: u64,
+        products: u64,
+        cfg: Option<&GenConfig>,
+        graph_static: bool,
+    ) -> Self {
+        // Product id → index (always; `products` is small — thousands, not millions).
+        let mut product_index = HashMap::with_capacity(products as usize);
+        for k in 0..products {
+            if let Ok(key) = u128::from_str_radix(&Generator::product_id(k), 16) {
+                product_index.insert(key, k as u32);
+            }
+        }
+        let (degree, purchases) = match cfg {
+            None => (None, None),
+            Some(cfg) => {
+                let generator = Generator::new(cfg.clone());
+                // The exact purchased-set check is SOUND only when no writer ever adds a PURCHASED edge.
+                let purchases = graph_static.then(|| {
+                    generator
+                        .purchases_by_user()
+                        .into_iter()
+                        .map(|ps| {
+                            let mut v: Vec<u32> = ps.into_iter().map(|p| p as u32).collect();
+                            v.sort_unstable();
+                            v
+                        })
+                        .collect()
+                });
+                (Some(generator.friend_degrees()), purchases)
+            }
+        };
+        Self {
+            gen_seed,
+            users,
+            product_index,
+            degree,
+            purchases,
+        }
+    }
+}
+
+/// The verdict of checking one sampled read reply against the [`ReadOracle`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReadCheck {
+    /// Checked against ground truth and CORRECT.
+    Verified,
+    /// This family is not deterministically reconstructed, or the oracle lacks the data: not counted.
+    Skipped,
+    /// Checked and WRONG — the string describes the divergence for the report.
+    Mismatch(String),
+}
+
+/// Checks one sampled read reply against ground truth. **Pure** — no I/O, no clock — so it is
+/// unit-testable (see the `tests` module) and adds nothing to the latency measured around it. `uidx`
+/// is the anchor user index the worker drew. Only the deterministic structural families are checked.
+fn verify_reco_read(
+    family: &str,
+    result: &QueryResult,
+    oracle: &ReadOracle,
+    uidx: u64,
+) -> ReadCheck {
+    match family {
+        "s_user" => verify_s_user(result, oracle, uidx),
+        "s_degree" => verify_s_degree(result, oracle, uidx),
+        "s_purchases" => verify_s_purchases(result, oracle, uidx),
+        _ => ReadCheck::Skipped,
+    }
+}
+
+/// The value of column `name` in row `row` of `result`, by field name (robust to column reordering).
+fn field_in_row<'a>(result: &'a QueryResult, name: &str, row: usize) -> Option<&'a Value> {
+    let col = result.fields.iter().position(|f| f == name)?;
+    result.records.get(row)?.get(col)
+}
+
+/// The `String` value of column `name` in the first row, if present and a string.
+fn string_field(result: &QueryResult, name: &str) -> Option<String> {
+    match field_in_row(result, name, 0) {
+        Some(Value::String(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// `s_user`: `MATCH (u:User {id: $id}) RETURN u.name AS name, u.country AS country` — exactly one row
+/// whose `name`/`country` equal the generator's ground truth.
+fn verify_s_user(result: &QueryResult, oracle: &ReadOracle, uidx: u64) -> ReadCheck {
+    if uidx >= oracle.users {
+        return ReadCheck::Skipped;
+    }
+    if result.records.len() != 1 {
+        return ReadCheck::Mismatch(format!(
+            "s_user(u{uidx}): expected exactly 1 row for a unique :User(id), got {}",
+            result.records.len()
+        ));
+    }
+    let expected_name = Generator::user_name(oracle.gen_seed, uidx);
+    let expected_country = Generator::user_country(oracle.gen_seed, uidx);
+    let got_name = string_field(result, "name");
+    let got_country = string_field(result, "country");
+    if got_name.as_deref() == Some(expected_name.as_str())
+        && got_country.as_deref() == Some(expected_country)
+    {
+        ReadCheck::Verified
+    } else {
+        ReadCheck::Mismatch(format!(
+            "s_user(u{uidx}): expected (name={expected_name:?}, country={expected_country:?}), \
+             got (name={got_name:?}, country={got_country:?})"
+        ))
+    }
+}
+
+/// `s_degree`: `RETURN count(f) AS degree` — a single scalar row equal to the user's undirected
+/// `FRIEND` degree. Skipped when no `--gen-profile` reconstructed the friend graph.
+fn verify_s_degree(result: &QueryResult, oracle: &ReadOracle, uidx: u64) -> ReadCheck {
+    let Some(degree) = &oracle.degree else {
+        return ReadCheck::Skipped;
+    };
+    let Some(&expected) = degree.get(uidx as usize) else {
+        return ReadCheck::Skipped;
+    };
+    let got = match (
+        result.records.len(),
+        result.records.first().and_then(|r| r.first()),
+    ) {
+        (1, Some(Value::Integer(n))) => *n,
+        _ => {
+            return ReadCheck::Mismatch(format!(
+                "s_degree(u{uidx}): expected a single integer row, got fields={:?} rows={}",
+                result.fields,
+                result.records.len()
+            ));
+        }
+    };
+    if i128::from(got) == i128::from(expected) {
+        ReadCheck::Verified
+    } else {
+        ReadCheck::Mismatch(format!("s_degree(u{uidx}): expected {expected}, got {got}"))
+    }
+}
+
+/// `s_purchases`: `RETURN p.id AS id, p.name AS name LIMIT 50`. Always sound: the LIMIT is respected and
+/// every returned id is a real product. Exact set + cardinality only when the graph is static (writers
+/// off) — see [`ReadOracle`].
+fn verify_s_purchases(result: &QueryResult, oracle: &ReadOracle, uidx: u64) -> ReadCheck {
+    if result.records.len() > S_PURCHASES_LIMIT {
+        return ReadCheck::Mismatch(format!(
+            "s_purchases(u{uidx}): returned {} rows, exceeding LIMIT {S_PURCHASES_LIMIT}",
+            result.records.len()
+        ));
+    }
+    let mut returned: Vec<u32> = Vec::with_capacity(result.records.len());
+    for row_ix in 0..result.records.len() {
+        let Some(Value::String(pid)) = field_in_row(result, "id", row_ix) else {
+            return ReadCheck::Mismatch(format!(
+                "s_purchases(u{uidx}): row {row_ix} has no string `id` column (fields={:?})",
+                result.fields
+            ));
+        };
+        let Ok(key) = u128::from_str_radix(pid, 16) else {
+            return ReadCheck::Mismatch(format!(
+                "s_purchases(u{uidx}): returned id {pid:?} is not a 24-hex product id"
+            ));
+        };
+        let Some(&p_ix) = oracle.product_index.get(&key) else {
+            return ReadCheck::Mismatch(format!(
+                "s_purchases(u{uidx}): returned id {pid:?} is not a known Product"
+            ));
+        };
+        returned.push(p_ix);
+    }
+    // Exact set + cardinality — sound only for a static graph (`purchases` is `Some`).
+    if let Some(purchases) = &oracle.purchases {
+        let Some(expected) = purchases.get(uidx as usize) else {
+            return ReadCheck::Skipped;
+        };
+        let expected_count = expected.len().min(S_PURCHASES_LIMIT);
+        if result.records.len() != expected_count {
+            return ReadCheck::Mismatch(format!(
+                "s_purchases(u{uidx}): returned {} rows, expected min(50, {}) = {expected_count}",
+                result.records.len(),
+                expected.len()
+            ));
+        }
+        for p_ix in &returned {
+            if expected.binary_search(p_ix).is_err() {
+                return ReadCheck::Mismatch(format!(
+                    "s_purchases(u{uidx}): returned product index {p_ix}, which the user never purchased"
+                ));
+            }
+        }
+    }
+    ReadCheck::Verified
+}
+
+// ============================================================================================
 // CLI
 // ============================================================================================
 
@@ -2706,6 +3124,17 @@ struct Args {
     auto_extend: bool,
     read_timeout_ms: u64,
     seed: u64,
+    /// I7 read-result verification sampling fraction (`--verify-fraction`, default
+    /// [`DEFAULT_VERIFY_FRACTION`]); `0` disables verification.
+    verify_fraction: f64,
+    /// The generation profile to reconstruct the ground-truth oracle from (`--gen-profile`), unlocking
+    /// the `s_degree` check (and, with `--writers 0`, the exact `s_purchases` set). `None` ⇒ only the
+    /// generation-seed-based `s_user` and `s_purchases` well-formedness checks run.
+    gen_profile: Option<String>,
+    /// The generation seed for the `s_user` name/country check (`--gen-seed`, default
+    /// [`RECO_GEN_SEED`], the seed every `reco_gen` profile pins). Ignored when `--gen-profile` is set
+    /// (the profile's own seed is used).
+    gen_seed: u64,
 }
 
 impl Args {
@@ -2754,6 +3183,9 @@ impl Args {
         let mut auto_extend = false;
         let mut read_timeout_ms = 120_000u64;
         let mut seed = 0x5EC0_11EC_710Du64;
+        let mut verify_fraction = DEFAULT_VERIFY_FRACTION;
+        let mut gen_profile = None;
+        let mut gen_seed = RECO_GEN_SEED;
 
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
@@ -2829,6 +3261,17 @@ impl Args {
                 "--auto-extend" => auto_extend = true,
                 "--read-timeout-ms" => read_timeout_ms = parse_u64(&value()?, "--read-timeout-ms")?,
                 "--seed" => seed = parse_u64(&value()?, "--seed")?,
+                "--verify-fraction" => {
+                    let v = value()?;
+                    verify_fraction = v
+                        .parse()
+                        .map_err(|_| format!("--verify-fraction must be a number, got {v:?}"))?;
+                    if !(0.0..=1.0).contains(&verify_fraction) {
+                        return Err("--verify-fraction must be in [0, 1]".to_string());
+                    }
+                }
+                "--gen-profile" => gen_profile = Some(value()?),
+                "--gen-seed" => gen_seed = parse_u64(&value()?, "--gen-seed")?,
                 "-h" | "--help" => {
                     print_usage();
                     std::process::exit(0);
@@ -2880,6 +3323,9 @@ impl Args {
             auto_extend,
             read_timeout_ms,
             seed,
+            verify_fraction,
+            gen_profile,
+            gen_seed,
         })
     }
 }
@@ -2905,6 +3351,211 @@ fn print_usage() {
          \x20   [--probe-secs <s default 3>] \\\n\
          \x20   [--store <graphus.store>] [--wal <graphus.wal dir>] [--logical-bytes <N>] \\\n\
          \x20   [--target-rps <R default 0 = closed-loop>] [--auto-extend] \\\n\
+         \x20   [--verify-fraction <f default 0.05, 0 disables I7>] \\\n\
+         \x20   [--gen-profile <tiny|fast|large|huge, unlocks s_degree/exact s_purchases>] \\\n\
+         \x20   [--gen-seed <u64 default = the reco_gen profile seed>] \\\n\
          \x20   [--read-timeout-ms <ms default 120000>] [--seed <u64>]"
     );
+}
+
+// ============================================================================================
+// I7 read-result verifier — falsifiability tests (`rmp` #744)
+// ============================================================================================
+//
+// These pin the whole point of I7: a CORRECT reply verifies, and a WRONG one (a divergent value, a
+// missing row, an over-LIMIT result, a phantom product) is reported as a MISMATCH — which is exactly
+// what a pull-and-discard reader could not tell apart. The oracle is recomputed from the same
+// generator the loaded graph is built from, so the tests never assert a hand-picked answer.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Assembles a [`QueryResult`] for a family's `(fields, rows)` shape.
+    fn qr(fields: &[&str], rows: Vec<Vec<Value>>) -> QueryResult {
+        QueryResult {
+            fields: fields.iter().map(|s| (*s).to_string()).collect(),
+            records: rows,
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    /// A small, fully-reconstructible generation config (the pinned generation seed).
+    fn small_cfg() -> GenConfig {
+        GenConfig {
+            seed: RECO_GEN_SEED,
+            users: 200,
+            products: 40,
+            friend_min: 3,
+            friend_max: 10,
+            avg_purchases_per_user: 4,
+            popularity_skew: 3,
+        }
+    }
+
+    #[test]
+    fn i7_s_user_verifies_the_truth_and_flags_a_wrong_name() {
+        let oracle = ReadOracle::build(RECO_GEN_SEED, 200, 40, None, true);
+        let uidx = 7u64;
+        let name = Generator::user_name(RECO_GEN_SEED, uidx);
+        let country = Generator::user_country(RECO_GEN_SEED, uidx).to_string();
+
+        let good = qr(
+            &["name", "country"],
+            vec![vec![
+                Value::String(name.clone()),
+                Value::String(country.clone()),
+            ]],
+        );
+        assert_eq!(
+            verify_reco_read("s_user", &good, &oracle, uidx),
+            ReadCheck::Verified
+        );
+
+        // A server that returned the WRONG name must be caught.
+        let wrong_name = qr(
+            &["name", "country"],
+            vec![vec![
+                Value::String("Impostor Silva".to_string()),
+                Value::String(country),
+            ]],
+        );
+        assert!(matches!(
+            verify_reco_read("s_user", &wrong_name, &oracle, uidx),
+            ReadCheck::Mismatch(_)
+        ));
+
+        // A MISSING row (the server dropped the user) is a mismatch too.
+        let empty = qr(&["name", "country"], vec![]);
+        assert!(matches!(
+            verify_reco_read("s_user", &empty, &oracle, uidx),
+            ReadCheck::Mismatch(_)
+        ));
+    }
+
+    #[test]
+    fn i7_s_degree_verifies_the_count_and_flags_an_off_by_one() {
+        let cfg = small_cfg();
+        let oracle = ReadOracle::build(cfg.seed, cfg.users, cfg.products, Some(&cfg), true);
+        let degrees = Generator::new(cfg).friend_degrees();
+        let uidx = 5u64;
+        let expected = i64::try_from(degrees[uidx as usize]).unwrap();
+
+        let good = qr(&["degree"], vec![vec![Value::Integer(expected)]]);
+        assert_eq!(
+            verify_reco_read("s_degree", &good, &oracle, uidx),
+            ReadCheck::Verified
+        );
+
+        let off_by_one = qr(&["degree"], vec![vec![Value::Integer(expected + 1)]]);
+        assert!(matches!(
+            verify_reco_read("s_degree", &off_by_one, &oracle, uidx),
+            ReadCheck::Mismatch(_)
+        ));
+
+        // Without a --gen-profile the friend graph is not reconstructed: SKIP, never a false mismatch.
+        let no_profile = ReadOracle::build(RECO_GEN_SEED, 200, 40, None, true);
+        assert_eq!(
+            verify_reco_read("s_degree", &good, &no_profile, uidx),
+            ReadCheck::Skipped
+        );
+    }
+
+    #[test]
+    fn i7_s_purchases_verifies_the_set_and_flags_wrong_over_limit_and_phantom() {
+        let cfg = small_cfg();
+        // A static graph (writers off) ⇒ the exact purchased-set oracle is built.
+        let oracle = ReadOracle::build(cfg.seed, cfg.users, cfg.products, Some(&cfg), true);
+        let purchases = Generator::new(cfg.clone()).purchases_by_user();
+        let uidx = (0..cfg.users)
+            .find(|&u| {
+                let n = purchases[u as usize].len();
+                n > 0 && n <= S_PURCHASES_LIMIT
+            })
+            .expect("some user bought a verifiable (non-empty, <=50) set");
+        let bought = &purchases[uidx as usize];
+
+        let good = qr(
+            &["id", "name"],
+            bought
+                .iter()
+                .map(|&p| {
+                    vec![
+                        Value::String(Generator::product_id(p)),
+                        Value::String(format!("Product {p}")),
+                    ]
+                })
+                .collect(),
+        );
+        assert_eq!(
+            verify_reco_read("s_purchases", &good, &oracle, uidx),
+            ReadCheck::Verified
+        );
+
+        // A product the user never bought (added → wrong set + wrong cardinality) is caught.
+        let not_bought = (0..cfg.products)
+            .find(|p| !bought.contains(p))
+            .expect("some product went unbought");
+        let mut wrong_rows = good.records.clone();
+        wrong_rows.push(vec![
+            Value::String(Generator::product_id(not_bought)),
+            Value::String("Phantom".to_string()),
+        ]);
+        assert!(matches!(
+            verify_reco_read(
+                "s_purchases",
+                &qr(&["id", "name"], wrong_rows),
+                &oracle,
+                uidx
+            ),
+            ReadCheck::Mismatch(_)
+        ));
+
+        // The always-sound checks (no --gen-profile, writers on): a non-product id, and a result that
+        // ignores the LIMIT, are both mismatches.
+        let well_formed = ReadOracle::build(RECO_GEN_SEED, 200, 40, None, false);
+        let phantom = qr(
+            &["id", "name"],
+            vec![vec![
+                Value::String("ffffffffffffffffffffffff".to_string()),
+                Value::String("Not A Product".to_string()),
+            ]],
+        );
+        assert!(matches!(
+            verify_reco_read("s_purchases", &phantom, &well_formed, 3),
+            ReadCheck::Mismatch(_)
+        ));
+
+        let over_limit = qr(
+            &["id", "name"],
+            (0..=(S_PURCHASES_LIMIT as u64))
+                .map(|p| {
+                    vec![
+                        Value::String(Generator::product_id(p % 40)),
+                        Value::String("x".to_string()),
+                    ]
+                })
+                .collect(),
+        );
+        assert!(matches!(
+            verify_reco_read("s_purchases", &over_limit, &well_formed, 3),
+            ReadCheck::Mismatch(_)
+        ));
+    }
+
+    #[test]
+    fn i7_unreconstructed_families_are_skipped_not_failed() {
+        let oracle = ReadOracle::build(RECO_GEN_SEED, 200, 40, None, true);
+        // r3_fof3 (and the other FoF/collaborative families) are not reconstructed: never a mismatch.
+        let fof = qr(
+            &["product", "reach"],
+            vec![vec![
+                Value::String("deadbeef".to_string()),
+                Value::Integer(9),
+            ]],
+        );
+        assert_eq!(
+            verify_reco_read("r3_fof3", &fof, &oracle, 1),
+            ReadCheck::Skipped
+        );
+    }
 }

@@ -621,7 +621,12 @@ impl Generator {
     }
 
     /// A deterministic country for `User` `i`, from the [`COUNTRIES`] pool.
-    fn country_of(seed: u64, i: u64) -> &'static str {
+    ///
+    /// Exposed (alongside [`user_name`](Self::user_name)) so a read-result verifier can recompute the
+    /// exact `(:User {id}).country` the loaded graph carries — the ground truth an over-the-wire
+    /// `MATCH (u:User {id: $id}) RETURN u.name, u.country` reply must match (`rmp` #744).
+    #[must_use]
+    pub fn user_country(seed: u64, i: u64) -> &'static str {
         let mut r = SplitMix64::new(seed ^ Self::USER_SALT ^ i.wrapping_mul(0xC2B2_AE3D_27D4_EB4F));
         COUNTRIES[r.below(COUNTRIES.len() as u64) as usize]
     }
@@ -856,6 +861,35 @@ impl Generator {
         edges
     }
 
+    /// The realised **undirected `FRIEND` degree** of every user, indexed by user index — the exact
+    /// answer a `MATCH (u:User {id: $id})-[:FRIEND]-(f) RETURN count(f)` reply must return.
+    ///
+    /// Counts every incident edge (a multi-edge between the same pair is counted once per edge, and the
+    /// undirected read matches the directed-stored edge from either endpoint), so it is byte-equivalent
+    /// to the ground truth the [`stream_friend_csv`](Self::stream_friend_csv) bytes encode — it is the
+    /// *same* [`build_friend_edges`](Self::build_friend_edges) construction, just index-keyed and
+    /// without the id round-trip. Ground truth for the read-result verifier (`rmp` #744).
+    #[must_use]
+    pub fn friend_degrees(&self) -> Vec<u64> {
+        self.build_friend_edges().1
+    }
+
+    /// The set of **distinct product indices** each user purchased, indexed by user index — the ground
+    /// truth for a `MATCH (:User {id: $id})-[:PURCHASED]->(p) RETURN p.id` reply.
+    ///
+    /// The inner lists are the distinct products of [`build_purchased_edges`](Self::build_purchased_edges)
+    /// in sample order (distinctness is already enforced by the generator); a caller that needs
+    /// membership tests should sort each list. Index-keyed and byte-equivalent to the
+    /// [`stream_purchased_csv`](Self::stream_purchased_csv) bytes (same construction, no id round-trip).
+    #[must_use]
+    pub fn purchases_by_user(&self) -> Vec<Vec<u64>> {
+        let mut out = vec![Vec::new(); self.cfg.users as usize];
+        for (u, p) in self.build_purchased_edges() {
+            out[u as usize].push(p);
+        }
+        out
+    }
+
     /// Computes the run summary (counts + realised degree statistics) WITHOUT materialising any CSV
     /// text. Still builds the edge lists (the only way to know the *realised* degrees), but emits no
     /// rows.
@@ -940,7 +974,7 @@ impl Generator {
         for i in 0..self.cfg.users {
             let id = Self::user_id(i);
             let name = escape_csv(&Self::user_name(self.cfg.seed, i));
-            let country = escape_csv(Self::country_of(self.cfg.seed, i));
+            let country = escape_csv(Self::user_country(self.cfg.seed, i));
             let signup = Self::signup_ts(self.cfg.seed, i);
             // `id` appears twice: the `:ID` join key (col 0) and the stored `id` property (col 2).
             let _ = writeln!(buf, "{id},User,{id},{name},{country},{signup}");

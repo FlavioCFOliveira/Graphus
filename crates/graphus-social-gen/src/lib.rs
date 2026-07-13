@@ -824,6 +824,32 @@ impl Generator {
         (edges, degree)
     }
 
+    /// The realised `FRIEND` adjacency, indexed by user index: `(degree, neighbours)` where
+    /// `degree[u]` is `u`'s **multi-edge incident count** (the exact answer to
+    /// `RETURN count(f)`) and `neighbours[u]` is `u`'s **sorted, de-duplicated** neighbour set (whose
+    /// length is the exact answer to `RETURN count(DISTINCT f)`, and whose pairwise intersection is the
+    /// exact `mutual`-friends answer).
+    ///
+    /// This is the *same* [`build_friend_edges`](Self::build_friend_edges) construction the
+    /// [`stream_friend_csv`](Self::stream_friend_csv) bytes are built from — index-keyed and without the
+    /// id round-trip — so it is the ground truth for the read-result verifier (`rmp` #744). The friend
+    /// graph is never mutated by the example's write workload (the writers only `SET` scalar
+    /// properties), so this oracle stays valid for the whole run.
+    #[must_use]
+    pub fn friend_adjacency(&self) -> (Vec<u64>, Vec<Vec<u64>>) {
+        let (edges, degree) = self.build_friend_edges();
+        let mut neighbours: Vec<Vec<u64>> = vec![Vec::new(); self.cfg.users as usize];
+        for (a, b) in edges {
+            neighbours[a as usize].push(b);
+            neighbours[b as usize].push(a);
+        }
+        for set in &mut neighbours {
+            set.sort_unstable();
+            set.dedup();
+        }
+        (degree, neighbours)
+    }
+
     /// Builds the realised `LIKE` edges: for each user, a per-user count drawn uniformly in
     /// `[0, 2 * avg_likes_per_user]` of **distinct** article indices. Returns `(user, article)`
     /// pairs in user-then-sample order. Pure function of the config.

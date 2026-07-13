@@ -199,6 +199,27 @@ if [ "${SOCIAL_DEGREE_DIST:-uniform}" = "zipf" ]; then
   case " ${GEN_ARGS[*]} " in *" --friend-max "*) : ;; *) GEN_ARGS+=(--friend-max 500) ;; esac
 fi
 
+# I7 (rmp #744): forward the SAME generation config to social_bench so it can reconstruct the FRIEND
+# ground truth and verify a sampled fraction of read replies (degree / friends / mutual) — a server
+# serving wrong counts would otherwise pass a run whose reads were pulled and discarded. Translate the
+# loader's --profile to the bench's --gen-profile and pass the FRIEND-degree band/dist through; the
+# realised --users/--articles the bench already receives are the resolve() overrides. If the config does
+# not reconstruct the loaded edge count, the bench declines the oracle and I7 is honestly N/A.
+BENCH_ORACLE_ARGS=(--verify-fraction "${SOCIAL_VERIFY_FRACTION:-0.05}")
+_ga_i=0
+while [ "$_ga_i" -lt "${#GEN_ARGS[@]}" ]; do
+  case "${GEN_ARGS[$_ga_i]}" in
+    --profile)
+      BENCH_ORACLE_ARGS+=(--gen-profile "${GEN_ARGS[$((_ga_i + 1))]}"); _ga_i=$((_ga_i + 2)) ;;
+    --friend-min|--friend-max|--avg-likes|--degree-dist|--zipf-exponent)
+      BENCH_ORACLE_ARGS+=("${GEN_ARGS[$_ga_i]}" "${GEN_ARGS[$((_ga_i + 1))]}"); _ga_i=$((_ga_i + 2)) ;;
+    --users|--articles)
+      _ga_i=$((_ga_i + 2)) ;;  # the bench already receives the realised counts explicitly
+    *)
+      _ga_i=$((_ga_i + 1)) ;;
+  esac
+done
+
 harness_build "the social-network wire client binaries (release, --features wire, no engine)" \
   --release -p graphus-social-gen --no-default-features --features wire \
   --bin social_gen --bin social_wire_load --bin social_bench --bin social_baseline_cmp
@@ -391,7 +412,7 @@ if [ "$MODE" = external ]; then
   set +e
   "$BENCH" --bolt "$BOLT_URI" --user "$DRIVER_USER" --password "$DRIVER_PW" --db "$TARGET_DB" \
     --ladder "$EXT_LADDER" --ops-per-rung "$EXT_OPS" --min-ops-per-client "$MIN_OPS_PER_CLIENT" \
-    "${MIX_FLAGS[@]}" "${AUTO_FLAG[@]}" \
+    "${MIX_FLAGS[@]}" "${AUTO_FLAG[@]}" "${BENCH_ORACLE_ARGS[@]}" \
     --users "$GEN_USERS" --articles "$GEN_ARTICLES" --friends "$GEN_FRIENDS" --likes "$GEN_LIKES" \
     --seed "$SEED" --scenario "social-network-large" 2>&1 | tee "$BENCH_LOG" | sed 's/^/  /'
   BENCH_STATUS="${PIPESTATUS[0]}"
@@ -399,7 +420,7 @@ if [ "$MODE" = external ]; then
   LADDER_MS=$(( $(_harness_now_ms) - LADDER_START_MS ))
   # The driver exits non-zero when a concurrency INVARIANT was violated (I1..I5) or the reader error
   # rate breached its threshold. That is the whole point of asserting them, so it must fail the run.
-  assert "every concurrency invariant held (I1..I6)" "0" "$BENCH_STATUS"
+  assert "every concurrency invariant held (I1..I7, incl. read-result correctness)" "0" "$BENCH_STATUS"
 
   harness_scrape_metrics "$METRICS_AFTER" || info "metrics-after scrape failed (non-fatal)"
   assert "/metrics scraped after the ladder" "yes" "$([ -s "$METRICS_AFTER" ] && echo yes || echo no)"
@@ -546,7 +567,7 @@ else
   BENCH_OUT="$("$BENCH" --socket "$SOCKET" --user "$ADMIN_USER" --password "$ADMIN_PW" --db "$TARGET_DB" \
     --server-pid "$SERVER_PID" --store-path "$STORE_DIR" --logical-bytes "$LOGICAL_BYTES" \
     --ladder "$LADDER" --ops-per-rung "$OPS_PER_RUNG" --min-ops-per-client "$MIN_OPS_PER_CLIENT" \
-    "${MIX_FLAGS[@]}" \
+    "${MIX_FLAGS[@]}" "${BENCH_ORACLE_ARGS[@]}" \
     --users "$GEN_USERS" --articles "$GEN_ARTICLES" --friends "$GEN_FRIENDS" --likes "$GEN_LIKES" \
     --seed "$SEED" --scenario "social-network-large" --evidence-dir "$EVIDENCE_DIR" 2>&1)"
   BENCH_STATUS=$?
@@ -554,7 +575,7 @@ else
   printf '%s\n' "$BENCH_OUT" | sed 's/^/  /'
   # The driver exits non-zero when a concurrency INVARIANT was violated (I1..I5) or the reader error
   # rate breached its threshold. Swallowing that status (as this did) makes the assertions decorative.
-  assert "every concurrency invariant held (I1..I6)" "0" "$BENCH_STATUS"
+  assert "every concurrency invariant held (I1..I7, incl. read-result correctness)" "0" "$BENCH_STATUS"
   assert "evidence report.json was produced" "yes" \
     "$([ -f "$EVIDENCE_DIR/report.json" ] && echo yes || echo no)"
   assert "evidence report.md was produced" "yes" \

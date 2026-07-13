@@ -426,7 +426,7 @@ if [ "$MODE" = external ]; then
   BENCH_OUT="$(cat "$BENCH_LOG")"
   # The driver exits non-zero when a concurrency INVARIANT was violated (I1..I5) or the reader error
   # rate breached its threshold. That is the whole point of asserting them, so it must fail the run.
-  assert "every concurrency invariant held (I1..I6)" "0" "$BENCH_STATUS"
+  assert "every concurrency invariant held (I1..I7, incl. read-result correctness)" "0" "$BENCH_STATUS"
 
   # Scrape /metrics AFTER the ladder.
   harness_scrape_metrics "$METRICS_AFTER" || info "metrics-after scrape failed (non-fatal)"
@@ -600,7 +600,7 @@ else
   printf '%s\n' "$BENCH_OUT" | sed 's/^/  /'
   # The driver exits non-zero when a concurrency INVARIANT was violated (I1..I5) or the reader error
   # rate breached its threshold. Swallowing that status (as this did) makes the assertions decorative.
-  assert "every concurrency invariant held (I1..I6)" "0" "$BENCH_STATUS"
+  assert "every concurrency invariant held (I1..I7, incl. read-result correctness)" "0" "$BENCH_STATUS"
   assert "evidence report.json was produced" "yes" \
     "$([ -f "$EVIDENCE_DIR/report.json" ] && echo yes || echo no)"
   assert "evidence report.md was produced" "yes" \
