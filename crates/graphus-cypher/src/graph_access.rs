@@ -145,6 +145,17 @@ pub enum VectorQueryResult {
     NoSuchIndex,
     /// A vector index of that name exists, but over the other entity (node vs relationship).
     WrongEntity,
+    /// The vector index is declared but **not usable for reads** (`rmp` task #733): its build has not
+    /// finished ([`IndexState::Populating`](graphus_storage::IndexState)), or a failed rebuild left it
+    /// empty and it was demoted (`IndexSet::fail_closed`).
+    ///
+    /// Unlike every other index kind, a vector (HNSW) index has **no equivalent scan fallback**: it is
+    /// an *approximate* structure, so a brute-force re-rank would return a different neighbour set, not
+    /// the same one. There is therefore no correct answer to serve — and serving the incomplete graph
+    /// would return a silently truncated (or empty) neighbour set, which the caller cannot distinguish
+    /// from "there are no near neighbours". The only safe outcome is a **clear error**, so the caller
+    /// knows the answer is unavailable rather than empty.
+    NotOnline,
     /// The query vector's dimension does not match the index's declared dimension.
     DimensionMismatch {
         /// The index's declared embedding dimension.

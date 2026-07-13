@@ -758,6 +758,12 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // invalidate the plan cache. Seeded from the current state so a freshly-opened engine with a
     // recovered pending build is handled on the tick its build finishes.
     let mut builds_were_pending = coordinator.has_pending_index_builds();
+    // How many index fail-closed events (`rmp` task #733) this engine has already logged + metered, so
+    // each new one is reported exactly once. Seeded from the coordinator so a freshly-opened engine whose
+    // open-time rebuild already failed closed reports it on its first tick.
+    let mut index_fail_closed_seen = coordinator.index_fail_closed_events();
+    // Likewise for poisoned builds (`rmp` task #733, M1): each new one is logged + metered exactly once.
+    let mut index_poison_seen = coordinator.index_build_poison_events();
     // The extension registry (user-defined functions/procedures, `rmp` task #75). Built **once** on
     // the engine thread, then `Arc`-shared so an off-thread reader resolves UDF/UDP plans against the
     // SAME registry that backed compilation (`rmp` task #336 — `ExtensionRegistry` is `Send + Sync`,
@@ -931,7 +937,17 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             .as_ref()
             .expect("INVARIANT: coordinator is Some until Shutdown breaks the loop")
             .has_pending_index_builds();
-        let timed = building || readers_inflight > 0 || !parked.is_empty();
+        // A degraded index set (`rmp` task #733) is also pending work: a storage fault wiped the derived
+        // indexes fail-closed, and the engine must tick so it can log/meter the event and RETRY the
+        // rebuild — a transient fault would otherwise leave the process scan-only until it is restarted.
+        // (It is deliberately NOT folded into `has_pending_index_builds`, whose callers spin on it and
+        // would hang forever on a permanently-faulting store; the retry itself is backed off inside the
+        // coordinator.)
+        let indexes_degraded = coordinator
+            .as_ref()
+            .expect("INVARIANT: coordinator is Some until Shutdown breaks the loop")
+            .indexes_degraded();
+        let timed = building || indexes_degraded || readers_inflight > 0 || !parked.is_empty();
 
         let cmd = if timed {
             match rx.recv_timeout(INDEX_BUILD_TICK) {
@@ -939,6 +955,19 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     // No command this tick: advance any build, then loop (which drains retirements).
                     drive_index_build(&mut coordinator);
+                    // Surface and repair a fail-closed index set (`rmp` task #733). Any repair changes
+                    // what `catalog()` exposes (indexes come back `Online`), so the plan cache must be
+                    // invalidated exactly as a completed build does — otherwise plans compiled while
+                    // degraded (scan-only) would be served from cache forever.
+                    if maintain_degraded_indexes(
+                        &mut coordinator,
+                        &metrics,
+                        &db_name,
+                        &mut index_fail_closed_seen,
+                        &mut index_poison_seen,
+                    ) {
+                        plan_cache.bump_schema();
+                    }
                     invalidate_cache_on_build_completion(
                         &coordinator,
                         &mut plan_cache,
@@ -1657,6 +1686,85 @@ fn drive_index_build<D: BlockDevice, S: LogSink>(coordinator: &mut Option<TxnCoo
     if let Some(coord) = coordinator.as_mut() {
         let _remaining = coord.advance_index_builds(INDEX_BUILD_CHUNK);
     }
+}
+
+/// Surfaces and repairs a **fail-closed** index set (`rmp` task #733), returning whether this call
+/// actually repaired one (so the caller can invalidate the plan cache).
+///
+/// A fail-closed means a storage fault made the derived indexes untrustworthy, so the engine wiped them
+/// and dropped every read path to the exact store scan. Answers stay **correct** — that is the whole
+/// point of failing closed — which is precisely why it must not pass unnoticed: without a signal, a
+/// degraded engine is indistinguishable from a healthy-but-slow one, and an operator (or an automated
+/// readiness poll) would keep attributing scan latencies to indexes that are not being used.
+///
+/// So each new event is logged at `ERROR` and metered, and the rebuild is retried. The retry is bounded
+/// and exponentially backed off inside the coordinator, so a persistently-faulting store cannot make the
+/// engine thread re-scan the whole store on every tick.
+fn maintain_degraded_indexes<D: BlockDevice, S: LogSink>(
+    coordinator: &mut Option<TxnCoordinator<D, S>>,
+    metrics: &Arc<Metrics>,
+    db_name: &str,
+    seen: &mut u64,
+    poison_seen: &mut u64,
+) -> bool {
+    let Some(coord) = coordinator.as_mut() else {
+        return false;
+    };
+    // Report any build POISONED since the last tick (`rmp` task #733, M1): a build a storage fault stopped
+    // for good. Its index stays `Populating` — queries remain correct, on the exact scan — but it is not
+    // being built, and that must not pass silently.
+    let poisons = coord.index_build_poison_events();
+    if poisons > *poison_seen {
+        let new = poisons - *poison_seen;
+        *poison_seen = poisons;
+        metrics.record_index_builds_poisoned(new);
+        tracing::error!(
+            database = %db_name,
+            events = new,
+            total = poisons,
+            parked = coord.poisoned_index_builds(),
+            "an index build was stopped by a storage fault and PARKED. Its index stays POPULATING, so \
+             queries remain CORRECT but run unaccelerated (full scans). The build will be resurrected \
+             once the store reads cleanly again; investigate the storage device."
+        );
+    }
+    // Resurrect parked builds once the store reads cleanly again. Called HERE, around the drain — never
+    // inside `advance_index_builds`, where a build that failed again would be re-enqueued within the same
+    // `while has_pending_index_builds()` loop and never let it terminate.
+    if coord.retry_poisoned_index_builds() {
+        tracing::warn!(
+            database = %db_name,
+            "a parked index build was resurrected: the store reads cleanly again (rmp #733)"
+        );
+    }
+    // Report any fail-closed that happened since the last tick (an index rebuild — hence a fail-closed —
+    // can be triggered by a DDL command, not just by this tick).
+    let events = coord.index_fail_closed_events();
+    if events > *seen {
+        let new = events - *seen;
+        *seen = events;
+        metrics.record_index_fail_closed(new);
+        tracing::error!(
+            database = %db_name,
+            events = new,
+            total = events,
+            "a storage fault made the derived indexes untrustworthy: they were wiped FAIL-CLOSED. \
+             Queries remain CORRECT but run unaccelerated (full scans), and the affected indexes now \
+             report POPULATING rather than ONLINE. The engine will keep retrying the rebuild; \
+             investigate the storage device."
+        );
+    }
+    if !coord.indexes_degraded() {
+        return false;
+    }
+    if coord.retry_degraded_index_rebuild() {
+        tracing::warn!(
+            database = %db_name,
+            "the derived indexes were rebuilt successfully: the engine is no longer degraded (rmp #733)"
+        );
+        return true;
+    }
+    false
 }
 
 /// Invalidates the plan cache if an asynchronous index build completed since the previous tick
@@ -2578,6 +2686,7 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
                 point: coordinator.list_point_indexes(),
                 point_rel: coordinator.list_point_rel_indexes(),
                 text: coordinator.list_text_indexes(),
+                node_lookup_usable: coordinator.label_lookup_usable(),
                 vector: coordinator.list_vector_index_listings(),
                 constraints: coordinator.list_constraints(),
             };

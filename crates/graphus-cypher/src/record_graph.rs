@@ -1072,6 +1072,23 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     ///
     /// On a storage fault (or an overflow-form bitmap, a #39-written node) the error is captured and
     /// an empty result returned, exactly as the full scan did — never a wrong (missing/extra) row.
+    ///
+    /// # Fail-closed on a read fault (`rmp` task #733)
+    ///
+    /// This is the per-candidate re-check shared by **every** node index seek AND by the write-path
+    /// uniqueness / node-key duplicate checks (`unique_conflict` → `index_seek_eq` →
+    /// `filter_label_candidates`, and `node_key_tuple_conflict` → `composite_seek_eq` →
+    /// `filter_label_candidates`). A candidate dropped by a swallowed read fault is a candidate the
+    /// duplicate check never sees — so if the unreadable record is the **existing holder** of a unique
+    /// value, the check reports "no conflict" and a **duplicate is committed**: silent committed-data
+    /// corruption from an I/O error, exactly the class of defect `rmp` #733 exists to eliminate (and
+    /// the symmetric hole to the REL-KEY / `rel_scan_eq` fail-closed the same task already applied).
+    ///
+    /// A [`RecordStore::node`] read only returns `Err` on a genuine fault: a reclaimed slot keeps its
+    /// page allocated and decodes to `Ok(rec)` with `in_use() == false` (dropped below by the
+    /// visibility check), so this arm is never a "stale candidate", always a real read failure. Capture
+    /// it — which aborts the enclosing statement before it can commit — and return an empty result,
+    /// exactly as the sibling `node_has_label` arm and the full-scan `scan_filter_eq` path already do.
     fn filter_label_candidates(&self, token_id: u32, ids: Vec<u64>) -> Vec<NodeId> {
         // Read-only store access (`rmp` #337 Slice 2): `node` / `node_has_label` are `&self`.
         let store = self.store.borrow();
@@ -1081,10 +1098,15 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             // testing the label, so the scan honours MVCC visibility (`04 §5.3`, `rmp` task #45).
             let visible = match store.node(id) {
                 Ok(rec) => self.visible(rec.mvcc),
-                // A candidate id whose page is unallocated (a stale index entry for a reclaimed slot)
-                // is not a live node; on the full-scan path `scan_node_ids` never yields such an id,
-                // so this only fires for stale candidates and is correctly dropped, not an error.
-                Err(_) => continue,
+                // A read fault on the record itself: FAIL CLOSED (`rmp` task #733). Dropping the
+                // candidate here would let a uniqueness / node-key check miss an unreadable existing
+                // holder and commit a duplicate. `node` only errors on a genuine fault (a reclaimed
+                // slot returns `Ok` with `in_use=false`), so capturing is never a false alarm.
+                Err(e) => {
+                    drop(store);
+                    self.capture(e);
+                    return Vec::new();
+                }
             };
             // SIREAD-mark every examined node, visible or not (the label predicate examined it).
             self.note_read(node_ssi_key(id));
@@ -1106,18 +1128,63 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         out
     }
 
+    /// The **authoritative candidate set** for a scan of `label_token`, from the coordinator's label
+    /// index when that index may be trusted, and straight from the store when it may not (`rmp` task
+    /// #733).
+    ///
+    /// Every consumer of the label index goes through here — the serial label scan
+    /// ([`scan_nodes_by_label`](GraphAccess::scan_nodes_by_label)), the columnar label pass and the
+    /// morsel-parallel label source — because they must all agree on the same candidate set, and because
+    /// the guard below is easy to forget at a call site.
+    ///
+    /// # Why the guard exists
+    ///
+    /// The label index has no [`IndexState`]: it is not declared, it simply exists, and a label scan is
+    /// what **every** other index kind's seek degrades *to*. A rebuild empties it
+    /// ([`IndexSet::clear`]) before refilling it from the store, so a rebuild whose store scan faulted
+    /// used to leave it empty and still trusted — and then `MATCH (n:Label)` returned ZERO ROWS, taking
+    /// the scan fallbacks down with it. [`IndexSet::labels_usable`] is the flag a failed rebuild clears;
+    /// when it is clear we enumerate every live node id and let the caller's
+    /// [`filter_label_candidates`](Self::filter_label_candidates) re-check the inline label bitmap per
+    /// node — exactly what the standalone (index-free) path does, and exactly the same result set.
+    ///
+    /// A storage fault enumerating the store captures the error (the statement is aborted before commit)
+    /// and yields no candidates, rather than silently reporting an empty label.
+    fn label_candidates(&self, index: &Rc<RefCell<IndexSet>>, label_token: u32) -> Vec<u64> {
+        if index.borrow().labels_usable() {
+            return index.borrow_mut().seek_label(label_token);
+        }
+        // Read-only store access (`rmp` #337 Slice 2): `scan_node_ids` takes `&self`.
+        match self.store.borrow().scan_node_ids() {
+            Ok(ids) => ids,
+            Err(e) => {
+                self.capture(e);
+                Vec::new()
+            }
+        }
+    }
+
     /// The multi-label generalisation of [`filter_label_candidates`](Self::filter_label_candidates)
     /// (`rmp` task #663): keeps `ids` that are **visible** and currently carry **any** of `token_ids`,
     /// SIREAD-marking each examined id exactly once. Used by a multi-label full-text query, where a node
     /// with any covered label matches (Neo4j semantics). An empty `token_ids` keeps nothing. On a
-    /// storage fault / overflow-form bitmap the error is captured and an empty result returned.
+    /// storage fault / overflow-form bitmap the error is captured and an empty result returned — never a
+    /// wrong (missing/extra) row (`rmp` task #733: `node` only errors on a genuine fault, so failing
+    /// closed here can never drop a legitimately-present candidate, and a silently-dropped row would
+    /// break that contract).
     fn filter_any_label_candidates(&self, token_ids: &[u32], ids: Vec<u64>) -> Vec<NodeId> {
         let store = self.store.borrow();
         let mut out = Vec::new();
         for id in ids {
             let visible = match store.node(id) {
                 Ok(rec) => self.visible(rec.mvcc),
-                Err(_) => continue,
+                // FAIL CLOSED on a genuine read fault (`rmp` task #733), matching the sibling
+                // `node_has_label` arm below and the single-label `filter_label_candidates`.
+                Err(e) => {
+                    drop(store);
+                    self.capture(e);
+                    return Vec::new();
+                }
             };
             // SIREAD-mark every examined node exactly once, visible or not.
             self.note_read(node_ssi_key(id));
@@ -1232,6 +1299,69 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         out.sort_unstable();
         out.dedup();
         out
+    }
+
+    /// The **snapshot-correct full-text score** of `node` for `search`, recomputed from the store when
+    /// the inverted index may not be trusted (`rmp` task #733) — the scoring twin of
+    /// [`fulltext_scan_fallback`](GraphAccess::fulltext_scan_fallback).
+    ///
+    /// Reads the covered STRING properties at THIS MVCC snapshot (so the document is this reader's
+    /// visible text, and each read is SIREAD-marked — subsumed by the query path's preceding
+    /// `mark_all_live_nodes`, so the conflict graph is unchanged), then applies the **shared** scoring
+    /// rule [`read_source::fulltext_score_of_document`] — the same one the inverted index's forward map
+    /// implements (`InvertedIndex::score`) and the same one the off-thread reader uses
+    /// (`read_source::fulltext_score_recompute`). One rule, three call sites, no duplication: on a
+    /// trusted index this returns exactly what the fast path returns.
+    fn fulltext_score_from_snapshot(
+        &self,
+        prop_keys: &[u32],
+        analyzer: graphus_index::fulltext::Analyzer,
+        node: NodeId,
+        search: &str,
+    ) -> u64 {
+        // Resolve the covered prop-key tokens to names once, so the store borrow does not overlap the
+        // per-property MVCC reads below. A never-interned token cannot occur on any node (no terms).
+        let prop_names: Vec<String> = {
+            let store = self.store.borrow();
+            prop_keys
+                .iter()
+                .filter_map(|pk| store.token_name(Namespace::PropKey, *pk).map(str::to_owned))
+                .collect()
+        };
+        let doc_texts = prop_names.iter().filter_map(|name| {
+            match self.node_property(node, name) {
+                Some(Value::String(text)) => Some(text),
+                // A non-string covered property contributes no terms — a full-text index covers text.
+                _ => None,
+            }
+        });
+        read_source::fulltext_score_of_document(analyzer, doc_texts, search)
+    }
+
+    /// The relationship analogue of
+    /// [`fulltext_score_from_snapshot`](Self::fulltext_score_from_snapshot) (`rmp` task #733): the
+    /// snapshot-correct score of `rel`, recomputed via the same shared scoring rule.
+    fn fulltext_rel_score_from_snapshot(
+        &self,
+        prop_keys: &[u32],
+        analyzer: graphus_index::fulltext::Analyzer,
+        rel: RelId,
+        search: &str,
+    ) -> u64 {
+        let prop_names: Vec<String> = {
+            let store = self.store.borrow();
+            prop_keys
+                .iter()
+                .filter_map(|pk| store.token_name(Namespace::PropKey, *pk).map(str::to_owned))
+                .collect()
+        };
+        let doc_texts = prop_names
+            .iter()
+            .filter_map(|name| match self.rel_property(rel, name) {
+                Some(Value::String(text)) => Some(text),
+                _ => None,
+            });
+        read_source::fulltext_score_of_document(analyzer, doc_texts, search)
     }
 
     /// Re-derives `node`'s entries in the coordinator's [`IndexSet`] from the node's **current**
@@ -2296,6 +2426,13 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
 
     /// Finds **another** relationship of type `type_name`, visible to this transaction, whose current
     /// tuple of `property_names` equals `tuple`, excluding `self_rel` (`rmp` #638). Scan-based.
+    ///
+    /// A storage fault enumerating the relationships **fails closed** (`rmp` task #733): the error is
+    /// captured — which aborts the enclosing write before it can commit — instead of being swallowed.
+    /// Swallowing it returned `None`, which this method's caller reads as *"no duplicate exists"*, so a
+    /// REL KEY constraint would have **accepted a duplicate** on any read fault: a committed violation of
+    /// a declared invariant, i.e. corrupt data, produced by an I/O error. (The single-property twin
+    /// [`rel_scan_eq`](Self::rel_scan_eq) already failed closed this way; this path did not.)
     fn rel_key_tuple_conflict(
         &self,
         type_name: &str,
@@ -2303,7 +2440,13 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         tuple: &[Value],
         self_rel: RelId,
     ) -> Option<u64> {
-        let ids = self.store.borrow().scan_rel_ids().ok()?;
+        let ids = match self.store.borrow().scan_rel_ids() {
+            Ok(ids) => ids,
+            Err(e) => {
+                self.capture(e);
+                return None; // the captured error aborts the write; never "no duplicate".
+            }
+        };
         for id in ids {
             if id == self_rel.0 {
                 continue;
@@ -2739,19 +2882,24 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         self.mark_all_live_nodes();
 
         // --- the authoritative current candidate set (same source `scan_nodes_by_label` uses) ---
-        let candidates: Vec<u64> = if let Some(index) = &self.index {
-            index.borrow_mut().seek_label(label_token)
-        } else {
-            // No index (should not happen on the coordinated path, but stay correct): full id scan.
-            // Read-only: `scan_node_ids` is `&self` (`rmp` #337 Slice 2), shared borrow.
-            match self.store.borrow().scan_node_ids() {
+        // Via the shared guarded accessor (`rmp` task #733), so this path can never read an untrustworthy
+        // (rebuild-failed, empty) label index. Without an index at all (the standalone path — impossible
+        // here, since a columnar cache implies a coordinator, but stay correct) it enumerates the store.
+        let candidates: Vec<u64> = match &self.index {
+            Some(index) => self.label_candidates(index, label_token),
+            None => match self.store.borrow().scan_node_ids() {
                 Ok(ids) => ids,
                 Err(e) => {
                     self.capture(e);
                     return Some(ColumnarPass::default());
                 }
-            }
+            },
         };
+        // A capture inside the guarded accessor means the candidate enumeration faulted: the result is
+        // untrustworthy, so surface it rather than report an empty column.
+        if self.has_error() {
+            return Some(ColumnarPass::default());
+        }
 
         // --- the cached column, accessed by a memoized O(1) node_id -> row-index map ---
         // (`rmp` task #375 (c)) The decode (`Rc<DecodedColumn>`) and the `id -> index` map are both
@@ -2793,11 +2941,16 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         let mut fallback_reads: u64 = 0;
         for id in candidates {
             // Read the node record once (visibility + label re-check + the freshness witness). A
-            // candidate whose page is unallocated (a stale index entry for a reclaimed slot) is not a
-            // live node and is dropped — exactly as `filter_label_candidates` drops it.
+            // read fault FAILS CLOSED (`rmp` task #733), exactly as the sibling `node_has_label` arm
+            // below and `filter_label_candidates` do: `node` only errors on a genuine fault (a reclaimed
+            // slot decodes to `Ok` with `in_use=false`), so a swallowed error here would silently drop a
+            // node from the aggregation — a wrong `count(*)` / `sum(...)` from an I/O error.
             let node_rec = match self.store.borrow().node(id) {
                 Ok(rec) => rec,
-                Err(_) => continue,
+                Err(e) => {
+                    self.capture(e);
+                    return Some(ColumnarPass::default());
+                }
             };
             // SIREAD-mark every examined candidate, visible or not (the predicate examined it) — the
             // identical per-candidate marker `filter_label_candidates` records.
@@ -3040,7 +3193,12 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             // #16/#39) so write-skew over a label predicate stays serializable.
             let src = LiveSource(&*self.store.borrow());
             read_source::mark_all_live_nodes(&src, self);
-            let candidates = index.borrow_mut().seek_label(token_id);
+            // The authoritative candidate set — from the label index when it is usable, else straight
+            // from the store (`rmp` task #733: a failed rebuild leaves the label index EMPTY, and a
+            // label scan is what every declined seek degrades to, so trusting it blindly would make the
+            // whole fallback chain return zero rows). It re-borrows the store *shared*, which coexists
+            // with `src`'s outstanding shared borrow.
+            let candidates = self.label_candidates(index, token_id);
             return read_source::filter_label_candidates(
                 &src,
                 &self.vis_ctx(),
@@ -3191,7 +3349,12 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         }
 
         // --- the authoritative current candidate set (the SAME source `scan_nodes_by_label` uses) ---
-        let candidates: Vec<u64> = index.borrow_mut().seek_label(label_token);
+        // Through the shared guarded accessor (`rmp` task #733): a rebuild-failed label index is empty,
+        // and handing empty candidates to the morsel workers would silently drop every row of the query.
+        let candidates: Vec<u64> = self.label_candidates(index, label_token);
+        if self.has_error() {
+            return None; // the enumeration faulted; the serial path surfaces the captured error.
+        }
 
         // --- the engine-thread-captured, owned, `Send` read surface (cheap to clone per morsel) ---
         let store = self.store.borrow();
@@ -3411,7 +3574,16 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // fall back so the executor's scan covers a property the index does not).
         let label_token = self.label_id_existing(label)?;
         let prop_key = self.store.borrow().token_id(Namespace::PropKey, property)?;
-        if !index.borrow().has_node_property(label_token, prop_key) {
+        // Only an **`Online`** index may answer (`rmp` task #733). A `Populating` (half-built) or
+        // rebuild-failed (`IndexSet::fail_closed`) index holds a SUBSET of the true entries, so a seek
+        // against it silently returns a subset of the true rows. The planner already withholds a
+        // non-`Online` index from the catalog (`catalog()` exposes only `online_node_properties`), but
+        // the read seam must be correct **by itself**, not by accident: the write path's uniqueness
+        // check (`unique_conflict`) calls this directly, bypassing the planner — and a *missed*
+        // duplicate is a constraint violation, i.e. corrupt data, not a slow query. Declining is always
+        // safe: the executor falls back to `scan_filter_eq` and `unique_conflict` to a label scan, both
+        // of which are exact. (The relationship twin `rel_index_seek_eq` already gates this way.)
+        if index.borrow().node_property_state(label_token, prop_key) != Some(IndexState::Online) {
             return None; // no usable index: scan fallback
         }
 
@@ -3501,7 +3673,11 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         let index = self.index.as_ref()?;
         let label_token = self.label_id_existing(label)?;
         let prop_key = self.store.borrow().token_id(Namespace::PropKey, property)?;
-        if !index.borrow().has_node_property(label_token, prop_key) {
+        // Only an **`Online`** index may answer — a half-built or rebuild-failed one is a subset of the
+        // truth, and a range seek has no residual that could resurrect a missing row (`rmp` task #733,
+        // the same gate `index_seek_eq` applies). Declining falls back to `scan_filter_range` /
+        // `scan_nodes_by_label` + residual, which are exact.
+        if index.borrow().node_property_state(label_token, prop_key) != Some(IndexState::Online) {
             return None; // no usable index: scan fallback
         }
 
@@ -3726,7 +3902,12 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         let index = self.index.as_ref()?;
         let label_token = self.label_id_existing(label)?;
         let prop_key = self.store.borrow().token_id(Namespace::PropKey, property)?;
-        if !index.borrow().has_spatial(label_token, prop_key) {
+        // Only an **`Online`** grid may answer (`rmp` task #733): a half-built or rebuild-failed one
+        // holds a subset of the points, and the residual `distance(...) <op> r` filter cannot resurrect
+        // a candidate the grid never returned. Declining falls back to the label scan + residual, which
+        // is exact. (Previously this trusted registration alone and was safe only because the planner
+        // withholds a `Populating` index from the catalog — the seam is now correct by itself.)
+        if index.borrow().spatial_state(label_token, prop_key) != Some(IndexState::Online) {
             return None; // no usable spatial index: scan fallback
         }
 
@@ -3783,7 +3964,9 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // type/property is indexable, so decline (the executor's typed scan covers it).
         let type_token = self.store.borrow().token_id(Namespace::RelType, rel_type)?;
         let prop_key = self.store.borrow().token_id(Namespace::PropKey, property)?;
-        if !index.borrow().has_spatial_rel(type_token, prop_key) {
+        // Only an **`Online`** grid may answer — the relationship twin of the node gate above
+        // (`rmp` task #733). Declining falls back to the typed relationship scan + residual filter.
+        if index.borrow().spatial_rel_state(type_token, prop_key) != Some(IndexState::Online) {
             return None; // no usable relationship spatial index: scan fallback
         }
 
@@ -3838,7 +4021,11 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         let index = self.index.as_ref()?;
         let label_token = self.label_id_existing(label)?;
         let prop_key = self.store.borrow().token_id(Namespace::PropKey, property)?;
-        if !index.borrow().has_text(label_token, prop_key) {
+        // Only an **`Online`** trigram index may answer (`rmp` task #733): a half-built or
+        // rebuild-failed one returns a subset of the candidates, and the residual `CONTAINS` /
+        // `STARTS WITH` / `ENDS WITH` filter can only *drop* candidates, never add a missing one.
+        // Declining falls back to the label scan + residual, which is exact.
+        if index.borrow().text_state(label_token, prop_key) != Some(IndexState::Online) {
             return None; // no usable text index: scan fallback
         }
 
@@ -3899,16 +4086,38 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // procedure raises a clear error rather than silently empty results.
         let (label_tokens, prop_keys, analyzer) = index.borrow().fulltext_target(name)?;
 
-        // Cross-snapshot freshness gate (`rmp` task #467): if this reader's MVCC snapshot PREDATES the
-        // last committed (or any in-flight / rolled-back) full-text/spatial mutation, the inverted
-        // index may have been re-keyed by a writer this snapshot cannot see, so the fast path could
-        // return a strict SUBSET of this snapshot's matches (a false negative the per-candidate re-check
-        // cannot repair). Unlike the spatial seek we CANNOT signal "fall back" with `None` — the
-        // procedure treats `None` as "no such index" — so we run a snapshot-correct full-text SCAN
-        // fallback INTERNALLY and return `Some(correct_set)`. The fallback reproduces the SAME SSI
-        // footprint (`mark_all_live_nodes` + per-candidate `filter_any_label_candidates`) as this fast
-        // path, so serializability is unchanged.
-        if self.snapshot.ts < index.borrow().effective_ft_spatial_marker() {
+        // Two ORTHOGONAL trust conditions must BOTH hold before the inverted index may answer. If
+        // either fails we run a snapshot-correct full-text SCAN fallback INTERNALLY and return
+        // `Some(correct_set)` — unlike the spatial seek we cannot signal "fall back" with `None`,
+        // because the procedure treats `None` as "no such index". The fallback reproduces the SAME SSI
+        // footprint (`mark_all_live_nodes` + per-candidate `filter_any_label_candidates`) as the fast
+        // path, so serializability is unchanged either way.
+        //
+        // 1. **Completeness** (`rmp` task #733). The index must be `Online`. A `CREATE FULLTEXT INDEX`
+        //    over a populated store registers the index `Populating` and builds it **incrementally**
+        //    (bounded chunks between engine commands, so a build never monopolises the engine thread),
+        //    which means a query arriving before the build finishes would read a partially-filled — or
+        //    entirely empty — inverted index and return a SUBSET of the true matches, silently. This is
+        //    the same contract the planner already enforces for every other index kind (`catalog()`
+        //    exposes only `Online` indexes, so a `Populating` one degrades to a scan) and the same one
+        //    PostgreSQL enforces with `indisvalid = false`; the procedure surface bypasses the planner,
+        //    so it must apply the contract itself. The state also goes non-`Online` when a rebuild
+        //    fails (`IndexSet::fail_closed`), which is exactly when the postings are empty.
+        // 2. **Freshness** (`rmp` task #467). If this reader's MVCC snapshot PREDATES the last committed
+        //    (or any in-flight / rolled-back) full-text/spatial mutation, the inverted index — which
+        //    keeps only the LATEST state — may have been re-keyed by a writer this snapshot cannot see,
+        //    so the fast path could return a strict SUBSET of this snapshot's matches (a false negative
+        //    the per-candidate re-check cannot repair: it filters false positives but cannot resurrect a
+        //    missing candidate).
+        //
+        // Neither implies the other: an `Online` index can be stale for an old reader, and a fresh
+        // reader can face an incomplete index.
+        let trusted = {
+            let idx = index.borrow();
+            idx.fulltext_state(name) == Some(IndexState::Online)
+                && self.snapshot.ts >= idx.effective_ft_spatial_marker()
+        };
+        if !trusted {
             return Some(self.fulltext_scan_fallback(&label_tokens, &prop_keys, analyzer, search));
         }
 
@@ -3983,6 +4192,23 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             (label, prop)
         };
 
+        // Completeness gate (`rmp` task #733). The HNSW graph may only answer when it is **`Online`**:
+        // a `Populating` (still-building) index — or one demoted by a failed rebuild
+        // (`IndexSet::fail_closed`, which also leaves it empty) — holds a subset of the embeddings, so
+        // a k-NN over it silently returns a truncated or empty neighbour set. Unlike every other kind
+        // there is NO equivalent scan to fall back to (a brute-force re-rank would diverge from the
+        // approximate structure), so the only correct outcome is a clear error the caller can see
+        // (`VectorQueryResult::NotOnline`) rather than an empty result it would read as "no neighbours".
+        // The in-memory state is authoritative here: the durable catalog says `Online` even when the
+        // ephemeral graph is empty (it is rebuilt on open), so this must not consult `entry.state`.
+        if index
+            .borrow()
+            .vector_state(entry.token, entry.property_token)
+            != Some(IndexState::Online)
+        {
+            return VectorQueryResult::NotOnline;
+        }
+
         // SSI predicate footprint: a vector k-NN's result depends on the covered-label embeddings, so
         // register the same blanket live-node read footprint the seek / full-text procedure paths use
         // (`04 §5.4`), keeping the query indistinguishable to SSI from a covering scan.
@@ -4047,6 +4273,16 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             (rel_type, prop)
         };
 
+        // Completeness gate (`rmp` task #733) — the relationship twin of the node gate: an incomplete
+        // HNSW has no correct scan equivalent, so an unusable index is an ERROR, never an empty result.
+        if index
+            .borrow()
+            .vector_rel_state(entry.token, entry.property_token)
+            != Some(IndexState::Online)
+        {
+            return VectorQueryResult::NotOnline;
+        }
+
         // SSI footprint: mirror the relationship seek / full-text procedure blanket marking.
         self.mark_all_live_rels();
 
@@ -4086,9 +4322,20 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         let index = self.index.as_ref()?;
         let (type_tokens, prop_keys, analyzer) = index.borrow().fulltext_rel_target(name)?;
 
-        // Cross-snapshot freshness gate (`rmp` #467): a stale reader falls back to a snapshot-correct
-        // relationship scan (the shared marker also reflects relationship full-text mutations).
-        if self.snapshot.ts < index.borrow().effective_ft_spatial_marker() {
+        // The same two-condition trust gate the node path applies (see `fulltext_query`): the index must
+        // be **complete** (`Online` — `rmp` task #733) AND **fresh** for this snapshot (`rmp` #467, the
+        // shared marker also reflects relationship full-text mutations). Otherwise fall back to the
+        // snapshot-correct relationship scan, which returns the same rows with the same SSI footprint.
+        //
+        // A relationship full-text index is built synchronously today (a create ends `Online`), so the
+        // completeness half currently only fires after a failed rebuild (`IndexSet::fail_closed`) — but
+        // the hole is real and closing it here keeps the node and relationship paths on one contract.
+        let trusted = {
+            let idx = index.borrow();
+            idx.fulltext_rel_state(name) == Some(IndexState::Online)
+                && self.snapshot.ts >= idx.effective_ft_spatial_marker()
+        };
+        if !trusted {
             return Some(self.fulltext_rel_scan_fallback(
                 &type_tokens,
                 &prop_keys,
@@ -4124,9 +4371,28 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
 
     /// The best-effort relevance score of relationship `rel` against `search` for the relationship
     /// full-text index named `name` (`rmp` task #663). [`None`] if no such index is declared.
+    ///
+    /// Gated exactly like [`fulltext_query_rel`](Self::fulltext_query_rel) (`rmp` task #733): the
+    /// inverted index's forward map may only be read when the index is **complete** and **fresh** for
+    /// this snapshot. Otherwise the score is recomputed from the relationship's snapshot-visible covered
+    /// properties — the same rule, a different source. Without this gate a degraded reader would get the
+    /// right *rows* (the query path falls back to the scan) but a `0` / obsolete *score*, silently
+    /// corrupting the relevance ordering the procedure sorts by.
     fn fulltext_score_rel(&self, name: &str, rel: RelId, search: &str) -> Option<u64> {
         let index = self.index.as_ref()?;
-        index.borrow().fulltext_rel_score(name, rel.0, search)
+        // Fast path: a complete + fresh index answers from its forward map (no store reads, no clones).
+        {
+            let idx = index.borrow();
+            // A name that is not registered yields `None` — "no such index", exactly as before.
+            if idx.fulltext_rel_state(name)? == IndexState::Online
+                && self.snapshot.ts >= idx.effective_ft_spatial_marker()
+            {
+                return idx.fulltext_rel_score(name, rel.0, search);
+            }
+        }
+        // Degraded: recompute the score from this snapshot's covered property values.
+        let (_type_tokens, prop_keys, analyzer) = index.borrow().fulltext_rel_target(name)?;
+        Some(self.fulltext_rel_score_from_snapshot(&prop_keys, analyzer, rel, search))
     }
 
     /// The **snapshot-correct full-text scan fallback** for a stale reader (`rmp` task #467).
@@ -4231,9 +4497,29 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         out
     }
 
+    /// The best-effort relevance score of `node` against `search` for the full-text index named `name`
+    /// (`rmp` task #72). [`None`] if no such index is declared.
+    ///
+    /// Gated exactly like [`fulltext_query`](Self::fulltext_query) (`rmp` task #733) — see
+    /// [`fulltext_score_rel`](Self::fulltext_score_rel) for why the *score* needs the same gate as the
+    /// *rows*: an incomplete or stale inverted index scores a document `0` (its terms were never
+    /// inserted, or were re-keyed by an invisible writer), which the procedure would then sort by,
+    /// producing a wrong relevance order over an otherwise-correct row set.
     fn fulltext_score(&self, name: &str, node: NodeId, search: &str) -> Option<u64> {
         let index = self.index.as_ref()?;
-        index.borrow().fulltext_score(name, node.0, search)
+        // Fast path: a complete + fresh index answers from its forward map (no store reads, no clones).
+        {
+            let idx = index.borrow();
+            // A name that is not registered yields `None` — "no such index", exactly as before.
+            if idx.fulltext_state(name)? == IndexState::Online
+                && self.snapshot.ts >= idx.effective_ft_spatial_marker()
+            {
+                return idx.fulltext_score(name, node.0, search);
+            }
+        }
+        // Degraded: recompute the score from this snapshot's covered property values.
+        let (_label_tokens, prop_keys, analyzer) = index.borrow().fulltext_target(name)?;
+        Some(self.fulltext_score_from_snapshot(&prop_keys, analyzer, node, search))
     }
 
     // ---- writes -------------------------------------------------------------------------------

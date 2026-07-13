@@ -449,6 +449,12 @@ pub fn mark_all_live_nodes<S: StoreReadSource, K: ReadSink>(src: &S, sink: &K) {
 /// `token_id` and are **visible**, SIREAD-marking each examined id (the body of
 /// `RecordStoreGraph::filter_label_candidates`). On a storage fault / overflow-form bitmap the error is
 /// captured and an empty result returned — never a wrong (missing/extra) row.
+///
+/// Fails closed on a node read fault (`rmp` task #733): this is the same per-candidate re-check the
+/// write-path uniqueness / node-key duplicate checks reach through the off-thread read graph, and a
+/// swallowed fault on the existing holder's record would let a duplicate commit. See the inline
+/// [`RecordStoreGraph::filter_label_candidates`](crate::record_graph) copy for the full argument — this
+/// twin must stay byte-for-byte equivalent so the inline and off-thread paths never disagree.
 pub fn filter_label_candidates<S: StoreReadSource, K: ReadSink>(
     src: &S,
     ctx: &VisCtx,
@@ -461,10 +467,14 @@ pub fn filter_label_candidates<S: StoreReadSource, K: ReadSink>(
         // Skip nodes not visible before testing the label, honouring MVCC visibility.
         let visible = match src.node(id) {
             Ok(rec) => ctx.visible(rec.mvcc),
-            // A candidate id whose page is unallocated (a stale index entry) is not a live node; the
-            // full-scan path never yields such an id, so this only fires for stale candidates and is
-            // correctly dropped, not an error.
-            Err(_) => continue,
+            // A read fault on the record itself: FAIL CLOSED (`rmp` task #733). `node` only errors on a
+            // genuine fault (a reclaimed slot decodes to `Ok` with `in_use=false`), so capturing is
+            // never a false alarm — and dropping the candidate could let a uniqueness / node-key check
+            // miss an unreadable existing holder and commit a duplicate.
+            Err(e) => {
+                sink.capture(e);
+                return Vec::new();
+            }
         };
         // SIREAD-mark every examined node, visible or not (the label predicate examined it).
         sink.note_read(node_ssi_key(id));
@@ -487,7 +497,9 @@ pub fn filter_label_candidates<S: StoreReadSource, K: ReadSink>(
 /// Filters `ids` to the nodes that **currently** carry **any** of `token_ids` and are **visible**,
 /// SIREAD-marking each examined id exactly once (`rmp` task #663) — the multi-label generalisation of
 /// [`filter_label_candidates`] for a multi-label full-text index. An empty `token_ids` keeps nothing.
-/// On a storage fault / overflow-form bitmap the error is captured and an empty result returned.
+/// On a storage fault / overflow-form bitmap the error is captured and an empty result returned — never
+/// a wrong (missing/extra) row (`rmp` task #733), the off-thread twin of the inline
+/// `filter_any_label_candidates`.
 pub fn filter_any_label_candidates<S: StoreReadSource, K: ReadSink>(
     src: &S,
     ctx: &VisCtx,
@@ -499,7 +511,11 @@ pub fn filter_any_label_candidates<S: StoreReadSource, K: ReadSink>(
     for id in ids {
         let visible = match src.node(id) {
             Ok(rec) => ctx.visible(rec.mvcc),
-            Err(_) => continue,
+            // FAIL CLOSED on a genuine read fault (`rmp` task #733), matching the `node_has_label` arm.
+            Err(e) => {
+                sink.capture(e);
+                return Vec::new();
+            }
         };
         // SIREAD-mark every examined node exactly once, visible or not.
         sink.note_read(node_ssi_key(id));
@@ -562,12 +578,16 @@ pub fn scan_label_property_morsel<S: StoreReadSource, K: ReadSink>(
     let mut label_matches = 0usize;
     let mut values: Vec<Value> = Vec::new();
     for &id in ids {
-        // Read the node record ONCE (visibility + label re-check). A candidate whose page is unallocated
-        // (a stale index entry for a reclaimed slot) is not a live node and is dropped — exactly as
-        // `filter_label_candidates` drops it (no SIREAD marker for a non-existent slot).
+        // Read the node record ONCE (visibility + label re-check). A read fault FAILS CLOSED
+        // (`rmp` task #733), exactly as the sibling `node_has_label` arm below and
+        // `filter_label_candidates` do — `node` only errors on a genuine fault, so a swallowed error
+        // would silently drop a node from the off-thread aggregation (a wrong `count(*)` / `sum(...)`).
         let rec = match src.node(id) {
             Ok(rec) => rec,
-            Err(_) => continue,
+            Err(e) => {
+                sink.capture(e);
+                return (label_matches, values);
+            }
         };
         // SIREAD-mark every examined candidate, visible or not (the predicate examined it) — the
         // identical per-candidate marker `filter_label_candidates` records.
@@ -1309,16 +1329,49 @@ pub fn fulltext_scan_fallback<S: StoreReadSource, K: ReadSink>(
     out
 }
 
+/// The **full-text scoring rule**, in one place (`rmp` task #733): the best-effort relevance of a
+/// document — the covered STRING property values `doc_texts`, in the index's declared property order —
+/// against `search`, both analyzed with the index's `analyzer`.
+///
+/// It mirrors `InvertedIndex::score` exactly: the count of **distinct** analyzed `search` terms that
+/// appear among the document's terms. Extracted so that **every** score path — the off-thread
+/// [`fulltext_score_recompute`] / [`fulltext_rel_score_recompute`] and the inline
+/// `RecordStoreGraph::fulltext_score` / `fulltext_score_rel` degraded paths — shares one
+/// implementation, instead of each re-deriving the rule (and drifting from it). The caller supplies the
+/// document's texts however it reads them (MVCC `node_property` off-thread, MVCC `node_property` inline),
+/// which is the only part that differs.
+#[must_use]
+pub fn fulltext_score_of_document(
+    analyzer: Analyzer,
+    doc_texts: impl IntoIterator<Item = String>,
+    search: &str,
+) -> u64 {
+    // The document's term set: analyze each covered STRING value with the index's analyzer.
+    let mut doc_terms: BTreeSet<String> = BTreeSet::new();
+    for text in doc_texts {
+        doc_terms.extend(analyzer.analyze(&text));
+    }
+    // Count each DISTINCT query term at most once, and only if the document has it (the
+    // `InvertedIndex::score` contract).
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut score = 0u64;
+    for term in analyzer.analyze(search) {
+        if seen.insert(term.clone()) && doc_terms.contains(&term) {
+            score += 1;
+        }
+    }
+    score
+}
+
 /// The off-thread twin of `IndexSet::fulltext_score` (`rmp` task #546): the best-effort relevance of
 /// `node` for `search` under `target`, recomputed from the node's snapshot-visible covered properties
 /// instead of the inverted index's forward map.
 ///
-/// Mirrors `InvertedIndex::score`: it is the count of **distinct** analyzed `search` terms that appear
-/// among the node's document terms (the union of its covered STRING properties analyzed in declared
-/// order with the index analyzer). On a current snapshot this equals the inline score exactly (both
-/// analyze the same covered properties with the same analyzer). The node's read is SIREAD-marked (the
-/// marker is subsumed by the preceding [`fulltext_scan_fallback`]'s `mark_all_live_nodes`, so the
-/// merged conflict graph is unchanged).
+/// Applies the shared [`fulltext_score_of_document`] rule to the node's document terms (the union of
+/// its covered STRING properties, read at this snapshot in declared order). On a current snapshot this
+/// equals the inline index score exactly (both analyze the same covered properties with the same
+/// analyzer). The node's read is SIREAD-marked (the marker is subsumed by the preceding
+/// [`fulltext_scan_fallback`]'s `mark_all_live_nodes`, so the merged conflict graph is unchanged).
 #[must_use]
 pub fn fulltext_score_recompute<S: StoreReadSource, K: ReadSink>(
     src: &S,
@@ -1328,26 +1381,14 @@ pub fn fulltext_score_recompute<S: StoreReadSource, K: ReadSink>(
     node: NodeId,
     search: &str,
 ) -> u64 {
-    // The node's document term set: analyze each covered STRING property at this snapshot.
-    let mut doc_terms: BTreeSet<String> = BTreeSet::new();
-    for pk in &target.prop_keys {
-        let Some(name) = src.token_name(Namespace::PropKey, *pk) else {
-            continue;
-        };
-        if let Some(Value::String(text)) = node_property(src, ctx, sink, node, &name) {
-            doc_terms.extend(target.analyzer.analyze(&text));
+    let doc_texts = target.prop_keys.iter().filter_map(|pk| {
+        let name = src.token_name(Namespace::PropKey, *pk)?;
+        match node_property(src, ctx, sink, node, &name) {
+            Some(Value::String(text)) => Some(text),
+            _ => None,
         }
-    }
-    // Count each DISTINCT query term at most once, and only if the document has it (the
-    // `InvertedIndex::score` contract).
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    let mut score = 0u64;
-    for term in target.analyzer.analyze(search) {
-        if seen.insert(term.clone()) && doc_terms.contains(&term) {
-            score += 1;
-        }
-    }
-    score
+    });
+    fulltext_score_of_document(target.analyzer, doc_texts, search)
 }
 
 /// The **snapshot-correct relationship full-text scan fallback**, lifted over a [`StoreReadSource`]
@@ -1427,7 +1468,8 @@ pub fn fulltext_rel_scan_fallback<S: StoreReadSource, K: ReadSink>(
 
 /// The off-thread twin of `IndexSet::fulltext_rel_score` (`rmp` task #663): the best-effort relevance
 /// of relationship `rel` for `search` under `target`, recomputed from the relationship's
-/// snapshot-visible covered properties — the relationship analogue of [`fulltext_score_recompute`].
+/// snapshot-visible covered properties — the relationship analogue of [`fulltext_score_recompute`],
+/// applying the same shared [`fulltext_score_of_document`] rule.
 #[must_use]
 pub fn fulltext_rel_score_recompute<S: StoreReadSource, K: ReadSink>(
     src: &S,
@@ -1437,23 +1479,14 @@ pub fn fulltext_rel_score_recompute<S: StoreReadSource, K: ReadSink>(
     rel: RelId,
     search: &str,
 ) -> u64 {
-    let mut doc_terms: BTreeSet<String> = BTreeSet::new();
-    for pk in &target.prop_keys {
-        let Some(name) = src.token_name(Namespace::PropKey, *pk) else {
-            continue;
-        };
-        if let Some(Value::String(text)) = rel_property(src, ctx, sink, rel, &name) {
-            doc_terms.extend(target.analyzer.analyze(&text));
+    let doc_texts = target.prop_keys.iter().filter_map(|pk| {
+        let name = src.token_name(Namespace::PropKey, *pk)?;
+        match rel_property(src, ctx, sink, rel, &name) {
+            Some(Value::String(text)) => Some(text),
+            _ => None,
         }
-    }
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    let mut score = 0u64;
-    for term in target.analyzer.analyze(search) {
-        if seen.insert(term.clone()) && doc_terms.contains(&term) {
-            score += 1;
-        }
-    }
-    score
+    });
+    fulltext_score_of_document(target.analyzer, doc_texts, search)
 }
 
 /// The body of `RecordStoreGraph::rel_property` (`GraphAccess::rel_property`).

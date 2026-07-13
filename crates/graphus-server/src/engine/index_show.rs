@@ -166,6 +166,11 @@ pub(crate) struct IndexSources {
     pub vector: Vec<VectorIndexListing>,
     /// Every declared constraint, for the `owningConstraint` attribution.
     pub constraints: Vec<ConstraintInfo>,
+    /// Whether the engine's **label (token LOOKUP) index** is still usable (`rmp` task #733). `false`
+    /// after a storage fault wiped the derived indexes fail-closed, at which point the label-scan seam
+    /// bypasses the (empty) index and enumerates the store — so the synthetic node `LOOKUP` row must
+    /// report `POPULATING`, not `ONLINE`.
+    pub node_lookup_usable: bool,
 }
 
 /// A typed, pre-`Value` row (`rmp` #660). Building typed specs first lets [`build_rows`] filter on the
@@ -474,11 +479,16 @@ fn create_lookup(name: &str, is_rel: bool) -> String {
 /// The always-on token `LOOKUP` row for one entity dimension (`rmp` #660). Neo4j always lists both;
 /// they cover no specific label/type, so `labelsOrTypes` / `properties` are empty lists and
 /// `owningConstraint` is `Null`.
-fn lookup_spec(id: i64, name: &str, is_rel: bool) -> RowSpec {
+///
+/// `state` is the **effective** state (`rmp` task #733), not a hard-coded `ONLINE`: when a storage fault
+/// wipes the derived indexes fail-closed, the label index is exactly what stops being usable (the engine
+/// falls back to enumerating the store), and a `SHOW INDEXES` that still called it `ONLINE` would be
+/// lying about the one index everything else falls back on.
+fn lookup_spec(id: i64, name: &str, is_rel: bool, state: IndexState) -> RowSpec {
     RowSpec {
         id,
         name: name.to_owned(),
-        state: IndexState::Online,
+        state,
         type_str: "LOOKUP",
         entity_type: if is_rel { "RELATIONSHIP" } else { "NODE" },
         labels_or_types: Vec::new(),
@@ -509,17 +519,31 @@ pub(crate) fn build_rows(filter: IndexTypeFilter, sources: IndexSources) -> Vec<
         text,
         vector,
         constraints,
+        node_lookup_usable,
     } = sources;
 
     let mut specs: Vec<RowSpec> = Vec::new();
 
-    // The two always-on token LOOKUP indexes Neo4j always lists (ids 1/2).
+    // The two always-on token LOOKUP indexes Neo4j always lists (ids 1/2). The NODE one reports the
+    // effective state of the engine's label index (`rmp` task #733); the RELATIONSHIP one is served by a
+    // typed store scan, which no index wipe can take away, so it stays `Online`.
+    let node_lookup_state = if node_lookup_usable {
+        IndexState::Online
+    } else {
+        IndexState::Populating
+    };
     specs.push(lookup_spec(
         LOOKUP_NODE_ID,
         "node_label_lookup_index",
         false,
+        node_lookup_state,
     ));
-    specs.push(lookup_spec(LOOKUP_REL_ID, "rel_type_lookup_index", true));
+    specs.push(lookup_spec(
+        LOOKUP_REL_ID,
+        "rel_type_lookup_index",
+        true,
+        IndexState::Online,
+    ));
 
     let mut next_id = FIRST_USER_ID;
     let mut alloc = || {
@@ -814,6 +838,7 @@ mod tests {
 
     fn empty_sources() -> IndexSources {
         IndexSources {
+            node_lookup_usable: true,
             node_property: Vec::new(),
             composite: Vec::new(),
             rel_property: Vec::new(),
@@ -921,6 +946,7 @@ mod tests {
     #[test]
     fn unified_listing_spans_every_kind() {
         let sources = IndexSources {
+            node_lookup_usable: true,
             node_property: vec![(
                 "ix_person_name".to_owned(),
                 "Person".to_owned(),

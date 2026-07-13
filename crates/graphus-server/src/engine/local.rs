@@ -207,12 +207,24 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         live
     }
 
-    /// Drives any pending non-blocking index build to completion (a no-op when none is pending).
+    /// Drives any pending non-blocking index build to completion (a no-op when none is pending), then
+    /// attempts to repair a fail-closed index set (`rmp` task #733).
+    ///
+    /// The repair is a **single bounded attempt** per operation, never a loop: a permanently-faulting
+    /// store must not hang the deterministic driver. While it stays degraded the engine is still
+    /// **correct** (every read path is on the exact store scan) — just unaccelerated — and the
+    /// `SHOW INDEXES` surfaces report the affected indexes as `POPULATING`, so a DST scenario can observe
+    /// the degradation rather than mistake it for a healthy engine.
     fn drain_index_builds(&mut self) {
         if let Some(coord) = self.coordinator.as_mut() {
+            // Resurrect any build a storage fault parked, BEFORE the drain (`rmp` task #733, M1) — never
+            // inside it: a build that failed again would be re-enqueued within the `while` below and the
+            // loop would never terminate.
+            let _resurrected = coord.retry_poisoned_index_builds();
             while coord.has_pending_index_builds() {
                 coord.advance_index_builds(LOCAL_INDEX_BUILD_BUDGET);
             }
+            let _healed = coord.retry_degraded_index_rebuild();
         }
     }
 

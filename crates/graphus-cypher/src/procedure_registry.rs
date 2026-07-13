@@ -1212,6 +1212,23 @@ fn no_such_vector_index(proc: &str, name: &str, kind: &str) -> ProcedureFailure 
     )
 }
 
+/// A clear "the index cannot answer yet" error (`rmp` task #733): the named vector index is declared
+/// but not `Online` — its build has not finished, or a failed index rebuild demoted it.
+///
+/// A vector (HNSW) index is the one kind with **no equivalent scan fallback** (it is approximate, so a
+/// brute-force re-rank would return a different neighbour set), so an unusable index cannot be served
+/// correctly. Erroring is the only safe outcome: an empty neighbour list would be indistinguishable
+/// from "no near neighbours exist", which is a silent wrong answer.
+fn vector_index_not_online(proc: &str, name: &str) -> ProcedureFailure {
+    ProcedureFailure::new(
+        proc,
+        format!(
+            "the vector index {name:?} is still populating and cannot be queried yet; \
+             retry once it is online"
+        ),
+    )
+}
+
 /// A clear query-dimension-mismatch error.
 fn vector_dim_mismatch(proc: &str, expected: usize, got: usize) -> ProcedureFailure {
     ProcedureFailure::new(
@@ -1269,6 +1286,7 @@ fn vector_query_nodes_proc(
                  use db.index.vector.queryRelationships"
             ),
         )),
+        VectorQueryResult::NotOnline => Err(vector_index_not_online(NAME, index_name)),
         VectorQueryResult::DimensionMismatch { expected, got } => {
             Err(vector_dim_mismatch(NAME, expected, got))
         }
@@ -1328,6 +1346,7 @@ fn vector_query_relationships_proc(
             NAME,
             format!("index {index_name:?} is a node vector index; use db.index.vector.queryNodes"),
         )),
+        VectorQueryResult::NotOnline => Err(vector_index_not_online(NAME, index_name)),
         VectorQueryResult::DimensionMismatch { expected, got } => {
             Err(vector_dim_mismatch(NAME, expected, got))
         }

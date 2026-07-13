@@ -365,7 +365,7 @@ fn run_rest(
 
     // 4. Declare the version-tolerant read-path schema (best-effort — an older server may reject the
     //    modern DDL; the anchor indexes matter, the rest is optimisation / extra query surface).
-    let created_fulltext = declare_schema_rest(&rest, &args.db);
+    let created_fulltext = declare_schema_rest(&rest, &args.db)?;
 
     // 5. Shape assertions (deterministic for a fixed seed + profile).
     assert_count_rest(
@@ -406,9 +406,15 @@ fn run_rest(
 }
 
 /// Declares the read-path schema over REST, best-effort. Returns whether the FULLTEXT index was
-/// created (so the caller knows whether to smoke-test that family). Every statement failure is noted,
-/// not fatal — an older server that rejects modern DDL still serves the traversals (via a scan).
-fn declare_schema_rest(rest: &Rest<'_>, db: &str) -> bool {
+/// created (so the caller knows whether to smoke-test that family). Every DDL statement failure is
+/// noted, not fatal — an older server that rejects modern DDL still serves the traversals (via a
+/// scan).
+///
+/// The wait for the builds to go `ONLINE`, in contrast, IS fatal when it times out (`rmp` task #733):
+/// the battery that follows claims to measure INDEX-backed search, so a run that queried a still-
+/// building index would report scan latencies (and, before #733 was fixed, a silently empty FULLTEXT
+/// result) as if they were index-backed evidence.
+fn declare_schema_rest(rest: &Rest<'_>, db: &str) -> Result<bool, String> {
     // Anchor indexes (UNNAMED — an older server rejects NAMED node indexes): the id seeks the whole
     // battery starts from. These SHOULD succeed even on an older server.
     for (label, prop) in [("USER", "id"), ("ARTICLE", "id")] {
@@ -443,9 +449,10 @@ fn declare_schema_rest(rest: &Rest<'_>, db: &str) -> bool {
         "CREATE CONSTRAINT article_name_exists FOR (a:ARTICLE) REQUIRE a.name IS NOT NULL",
         "existence constraint ARTICLE.name",
     );
-    // Best-effort wait for the durable index builds to go online (ignored if unsupported).
-    let _ = wait_for_indexes(rest, db);
-    ft
+    // Wait for the durable index builds to go ONLINE (a no-op against a server that does not report
+    // an index `state`; fatal if they are still POPULATING when the timeout elapses).
+    wait_for_indexes(rest, db)?;
+    Ok(ft)
 }
 
 /// Runs one best-effort DDL statement, noting (not failing) on rejection. Returns `true` if it was
@@ -993,32 +1000,70 @@ fn jolt_scalar_u64(json: &Json) -> Option<u64> {
     z.parse::<i64>().ok().and_then(|v| u64::try_from(v).ok())
 }
 
-/// Polls `SHOW INDEXES` until the durable declared indexes report `online`, or the timeout elapses.
-/// Best-effort: any failure (unsupported `SHOW INDEXES` shape on an older server) is swallowed.
+/// Polls `SHOW INDEXES` until every declared index reports a state other than `populating`, and
+/// **fails** if they are still building when the timeout elapses (`rmp` task #733).
+///
+/// The state is read from the cell under the `state` FIELD, resolved by name against the result's
+/// `fields` header — not by scanning the row for the first string cell. That earlier shortcut picked
+/// up the row's `name` column (the first string in every row), which never equals `"populating"`, so
+/// the gate passed instantly and the loader queried a still-building index: the silent-zero FULLTEXT
+/// result of `rmp` #733 was measured through exactly that hole. A verification step that cannot fail
+/// verifies nothing.
+///
+/// Version-tolerant: a server whose `SHOW INDEXES` lacks the `state` field (or rejects the statement
+/// outright) reports nothing to wait on, and the poll returns `Ok` — the caller then relies on the
+/// engine's own guarantee that a not-yet-`ONLINE` index is answered by a correct scan.
 fn wait_for_indexes(rest: &Rest<'_>, db: &str) -> Result<(), String> {
     let deadline = Instant::now() + INDEX_ONLINE_TIMEOUT;
     loop {
         let Ok(json) = rest.statement(db, "SHOW INDEXES", "SHOW INDEXES", None) else {
             return Ok(());
         };
-        let all_online = json
+        // The position of the `state` column in this server's result header. Absent ⇒ nothing to wait
+        // on (an older server), so the poll is a no-op rather than a spurious failure.
+        let fields = json.pointer("/results/0/fields").and_then(Json::as_array);
+        let Some(state_at) =
+            fields.and_then(|fields| fields.iter().position(|f| f.as_str() == Some("state")))
+        else {
+            return Ok(());
+        };
+        let name_at =
+            fields.and_then(|fields| fields.iter().position(|f| f.as_str() == Some("name")));
+        let building: Vec<String> = json
             .pointer("/results/0/data")
             .and_then(Json::as_array)
             .map(|rows| {
-                rows.iter().all(|row| {
-                    row.as_array()
-                        .and_then(|cells| {
-                            cells.iter().find_map(|c| c.get("U").and_then(Json::as_str))
-                        })
-                        .is_none_or(|s| !s.eq_ignore_ascii_case("populating"))
-                })
+                rows.iter()
+                    .filter(|row| {
+                        cell_str(row, Some(state_at))
+                            .is_some_and(|s| s.eq_ignore_ascii_case("populating"))
+                    })
+                    .map(|row| cell_str(row, name_at).unwrap_or_else(|| "?".to_owned()))
+                    .collect()
             })
-            .unwrap_or(true);
-        if all_online || Instant::now() >= deadline {
+            .unwrap_or_default();
+        if building.is_empty() {
             return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "index build did not reach ONLINE within {}s: still POPULATING: {}",
+                INDEX_ONLINE_TIMEOUT.as_secs(),
+                building.join(", ")
+            ));
         }
         std::thread::sleep(INDEX_POLL_INTERVAL);
     }
+}
+
+/// The string (Jolt `"U"`) cell of a `SHOW INDEXES` row at column `at`, resolved by the caller from
+/// the result header — never by position guessed from the row itself.
+fn cell_str(row: &Json, at: Option<usize>) -> Option<String> {
+    row.as_array()?
+        .get(at?)?
+        .get("U")
+        .and_then(Json::as_str)
+        .map(ToOwned::to_owned)
 }
 
 fn login(addr: &str, user: &str, password: &str) -> Result<String, String> {

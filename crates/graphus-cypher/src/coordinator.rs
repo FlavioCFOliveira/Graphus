@@ -185,6 +185,35 @@ struct ActiveTxn {
 /// and deletes are all handled outside this snapshot by [`RecordStoreGraph::reindex_node`] /
 /// the candidate-set re-check (see [`TxnCoordinator::advance_index_builds`] for the full
 /// consistency argument), so the snapshot only needs to cover the rows that already existed.
+/// How many consecutive failures-to-progress a non-blocking index build tolerates before it is
+/// **poisoned** (`rmp` task #733) — see [`PendingIndexBuild::stall`]. Generous enough that a transient
+/// storage fault self-heals, small enough that a permanent one terminates promptly instead of spinning
+/// the engine at 100% CPU.
+const BUILD_STALL_BUDGET: u8 = 32;
+
+/// The ceiling on the degraded-index rebuild backoff (`rmp` task #733), in attempts skipped between
+/// probes. A repair rebuild is O(store) and runs **synchronously on the engine thread**, stalling every
+/// query behind it, so a permanently-faulting store must not trigger one every couple of seconds. At the
+/// engine's 2 ms idle tick this ceiling is ≈ 8.7 minutes between attempts; on a busy engine (where the
+/// counter advances once per command) it is longer still. Counted in attempts, not wall-clock: the
+/// coordinator must remain deterministic for DST and so never reads the clock.
+const MAX_DEGRADED_RETRY_BACKOFF: u32 = 262_144;
+
+/// The drains to skip before the next poisoned-build resurrection attempt, given how many consecutive
+/// resurrections have already failed to complete (`rmp` task #733, B2). `2^(attempts-1)`, capped at
+/// [`MAX_DEGRADED_RETRY_BACKOFF`]: the first re-poison waits 1 drain, then 2, 4, 8, …, so a build that
+/// keeps hitting an unreadable page is retried ever-less-often — its resurrection *rate* decays
+/// geometrically to zero, instead of spinning the engine every tick. `attempts == 0` never reaches here
+/// (the first resurrection is immediate), but is handled defensively as no skip.
+#[must_use]
+fn poison_backoff(attempts: u32) -> u32 {
+    if attempts == 0 {
+        return 0;
+    }
+    let shift = (attempts - 1).min(31);
+    (1u32 << shift).min(MAX_DEGRADED_RETRY_BACKOFF)
+}
+
 struct PendingIndexBuild {
     /// The label token the index is declared on.
     label_token: u32,
@@ -195,6 +224,24 @@ struct PendingIndexBuild {
     snapshot: Vec<u64>,
     /// The next index into `snapshot` to process; the build is complete once `cursor >= snapshot.len()`.
     cursor: usize,
+    /// The [`IndexSet::wipe_generation`] this build is indexing into (`rmp` task #733). If a
+    /// `fail_closed` wipes the index set mid-build, the epoch changes and the build **re-takes its
+    /// snapshot from the store and restarts from cursor 0** instead of resuming over an emptied tree.
+    /// Resuming would index only the tail of the snapshot and then promote the index `Online` with a hole
+    /// in it; restarting over the *original* snapshot would still lose every row written after the
+    /// snapshot was taken, because the wipe destroyed those maintenance writes too.
+    generation: u64,
+    /// How many more times this build may fail to make final progress before it is **poisoned**
+    /// (`rmp` task #733) — dropped un-promoted, leaving its index `Populating` and therefore never
+    /// served. Decremented on a chunk that could not read a node, and on a promotion blocked by a
+    /// degraded index set; refilled by any chunk that does make progress.
+    ///
+    /// It exists because Graphus assumes storage faults are **persistent** (checksum / torn page). A
+    /// build that retries an unreadable chunk forever never advances its cursor, and
+    /// `LocalEngine::drain_index_builds` spins `while has_pending_index_builds()` — an infinite loop at
+    /// 100% CPU, re-scanning the store on every iteration. A bounded budget keeps a *transient* fault
+    /// self-healing while guaranteeing termination against a permanent one.
+    stall: u8,
 }
 
 /// One in-progress **non-blocking** full-text index build (`rmp` task #72), the analogue of
@@ -210,6 +257,24 @@ struct PendingFulltextBuild {
     snapshot: Vec<u64>,
     /// The next index into `snapshot` to process; complete once `cursor >= snapshot.len()`.
     cursor: usize,
+    /// The [`IndexSet::wipe_generation`] this build is indexing into (`rmp` task #733). If a
+    /// `fail_closed` wipes the index set mid-build, the epoch changes and the build **re-takes its
+    /// snapshot from the store and restarts from cursor 0** instead of resuming over an emptied tree.
+    /// Resuming would index only the tail of the snapshot and then promote the index `Online` with a hole
+    /// in it; restarting over the *original* snapshot would still lose every row written after the
+    /// snapshot was taken, because the wipe destroyed those maintenance writes too.
+    generation: u64,
+    /// How many more times this build may fail to make final progress before it is **poisoned**
+    /// (`rmp` task #733) — dropped un-promoted, leaving its index `Populating` and therefore never
+    /// served. Decremented on a chunk that could not read a node, and on a promotion blocked by a
+    /// degraded index set; refilled by any chunk that does make progress.
+    ///
+    /// It exists because Graphus assumes storage faults are **persistent** (checksum / torn page). A
+    /// build that retries an unreadable chunk forever never advances its cursor, and
+    /// `LocalEngine::drain_index_builds` spins `while has_pending_index_builds()` — an infinite loop at
+    /// 100% CPU, re-scanning the store on every iteration. A bounded budget keeps a *transient* fault
+    /// self-healing while guaranteeing termination against a permanent one.
+    stall: u8,
 }
 
 /// One in-progress **non-blocking** spatial (point) index build (`rmp` task #98), the analogue of
@@ -229,6 +294,24 @@ struct PendingSpatialBuild {
     snapshot: Vec<u64>,
     /// The next index into `snapshot` to process; complete once `cursor >= snapshot.len()`.
     cursor: usize,
+    /// The [`IndexSet::wipe_generation`] this build is indexing into (`rmp` task #733). If a
+    /// `fail_closed` wipes the index set mid-build, the epoch changes and the build **re-takes its
+    /// snapshot from the store and restarts from cursor 0** instead of resuming over an emptied tree.
+    /// Resuming would index only the tail of the snapshot and then promote the index `Online` with a hole
+    /// in it; restarting over the *original* snapshot would still lose every row written after the
+    /// snapshot was taken, because the wipe destroyed those maintenance writes too.
+    generation: u64,
+    /// How many more times this build may fail to make final progress before it is **poisoned**
+    /// (`rmp` task #733) — dropped un-promoted, leaving its index `Populating` and therefore never
+    /// served. Decremented on a chunk that could not read a node, and on a promotion blocked by a
+    /// degraded index set; refilled by any chunk that does make progress.
+    ///
+    /// It exists because Graphus assumes storage faults are **persistent** (checksum / torn page). A
+    /// build that retries an unreadable chunk forever never advances its cursor, and
+    /// `LocalEngine::drain_index_builds` spins `while has_pending_index_builds()` — an infinite loop at
+    /// 100% CPU, re-scanning the store on every iteration. A bounded budget keeps a *transient* fault
+    /// self-healing while guaranteeing termination against a permanent one.
+    stall: u8,
 }
 
 /// The owned, `Send` pieces an off-thread reader needs to run a read-only statement against a
@@ -333,6 +416,52 @@ pub struct TxnCoordinator<D: BlockDevice, S: LogSink> {
     /// spatial index, advanced by [`advance_index_builds`](Self::advance_index_builds) alongside the
     /// other build kinds.
     pending_spatial_builds: VecDeque<PendingSpatialBuild>,
+    /// Ticks still to skip before the next degraded-index rebuild attempt (`rmp` task #733), and the
+    /// current backoff width. A `fail_closed` is usually transient, so the engine retries the rebuild
+    /// from its tick ([`retry_degraded_index_rebuild`](TxnCoordinator::retry_degraded_index_rebuild))
+    /// rather than staying scan-only until restart — but a rebuild is O(store), so a *persistent* fault
+    /// must not re-scan every tick. The backoff doubles (1, 2, 4, … 1024) on each failed attempt and
+    /// resets on success.
+    degraded_retry_skip: u32,
+    /// The current retry backoff width, in ticks — see
+    /// [`degraded_retry_skip`](Self#structfield.degraded_retry_skip).
+    degraded_retry_backoff: u32,
+    /// Builds **poisoned** by a storage fault they could not get past (`rmp` task #733, M1): dropped from
+    /// the pending queue un-promoted, so the engine terminates instead of spinning, but NOT thrown away.
+    ///
+    /// Poisoning used to be a one-way door: the index was left `Populating` (in memory *and* durably) with
+    /// nothing in the process able to bring it back — `retry_degraded_index_rebuild` only runs while the
+    /// set is degraded (which poisoning does not set), and the recovery promotion only runs in `new()`. So
+    /// 32 unlucky chunks meant a dead index until someone restarted the server, with no log and no metric
+    /// to say so. They are parked here instead and re-enqueued by
+    /// [`retry_poisoned_index_builds`](Self::retry_poisoned_index_builds) once the store reads cleanly
+    /// again.
+    poisoned_builds: Vec<PendingIndexBuild>,
+    /// Poisoned full-text builds — see [`poisoned_builds`](Self#structfield.poisoned_builds).
+    poisoned_fulltext_builds: Vec<PendingFulltextBuild>,
+    /// Poisoned spatial builds — see [`poisoned_builds`](Self#structfield.poisoned_builds).
+    poisoned_spatial_builds: Vec<PendingSpatialBuild>,
+    /// How many builds have been poisoned over this coordinator's life (`rmp` task #733, M1) — monotonic.
+    /// The server samples it to log at `ERROR` and drive a metric: an index that quietly stopped being
+    /// built is exactly the kind of degradation that otherwise passes for "healthy but slow".
+    poison_events: u64,
+    /// Drains still to skip before the next poisoned-build resurrection probe (`rmp` task #733) — the
+    /// throttle that stops a permanently-broken store from making the engine re-scan every command. Its
+    /// width comes from [`poison_backoff`] applied to
+    /// [`poison_resurrect_attempts`](Self#structfield.poison_resurrect_attempts).
+    poison_retry_skip: u32,
+    /// How many times in a row a parked build has been **resurrected without completing** (`rmp` task
+    /// #733, B2 — the fix for a defect the M1 resurrection introduced).
+    ///
+    /// A resurrection re-snapshots with `scan_node_ids` and re-enqueues every parked build. But that
+    /// probe only reads the node *slot* pages — not the property / label pages a build actually indexes.
+    /// A build poisoned by an unreadable **property** page therefore passes the probe, is resurrected,
+    /// re-drains, hits the same page, and re-poisons — every tick, forever, at ~100% CPU (the very spin
+    /// the stall budget was meant to end, re-introduced through the resurrection door). This counts the
+    /// consecutive failed resurrections so the backoff can grow geometrically (`2^attempts`, capped),
+    /// collapsing the retry *rate* toward zero; it resets to `0` the moment the graveyard clears (a
+    /// resurrected build actually completed), so a genuinely-healed store returns to fast retries.
+    poison_resurrect_attempts: u32,
 }
 
 /// The deterministic, stable **auto-name** for a node-property index on `(label, property)`
@@ -559,6 +688,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             pending_builds: VecDeque::new(),
             pending_fulltext_builds: VecDeque::new(),
             pending_spatial_builds: VecDeque::new(),
+            degraded_retry_skip: 0,
+            degraded_retry_backoff: 1,
+            poisoned_builds: Vec::new(),
+            poisoned_fulltext_builds: Vec::new(),
+            poisoned_spatial_builds: Vec::new(),
+            poison_events: 0,
+            poison_retry_skip: 0,
+            poison_resurrect_attempts: 0,
         }
     }
 
@@ -579,6 +716,24 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         index: &Rc<RefCell<IndexSet>>,
         next_txn_id: u64,
     ) -> u64 {
+        // The whole premise of this promotion is the sentence above: *"the rebuild has already fully
+        // populated it from the recovered store, so it is complete"*. When the open-time rebuild **failed
+        // closed** that premise is false — the trees are empty or holed and every index was demoted — so
+        // promoting anything now would publish `Online`, durably and in memory, an index with no rows in
+        // it (`rmp` task #733).
+        //
+        // That is the whole `rmp` #733 defect, resurrected on the recovery path, and it is worse here:
+        // the flip is DURABLE, so it also survives the restart that would otherwise have repaired it. The
+        // planner would route a real `NodeIndexSeek` at the empty tree (committed rows invisible), and
+        // `unique_conflict` — which trusts that tree as an EXACT candidate source — would let an
+        // `IS UNIQUE` constraint accept a duplicate. It further defeated the `SHOW INDEXES` effective-
+        // state machinery, which trusts the in-memory state this would have just falsified.
+        //
+        // Abort: leave every index `Populating` (withheld from the planner, and now honestly reported),
+        // let the degraded rebuild retry repair the trees, and promote on a later open.
+        if index.borrow().is_degraded() {
+            return next_txn_id;
+        }
         let populating: Vec<(u32, u32)> = store
             .borrow()
             .node_property_indexes()
@@ -765,6 +920,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// Errors reading any single node/label/property are skipped (best-effort): a missing candidate
     /// only degrades that node to the full-scan fallback for that reader, never to a wrong row. The
     /// store and the index are borrowed in separate, non-overlapping scopes.
+    ///
+    /// A fault on a **whole scan** (nodes or relationships) is different in kind: the rebuild cannot be
+    /// completed, and since [`IndexSet::clear`] has already dropped every entry, the indexes would be
+    /// left registered, `Online` and **empty** — silently answering every seek with zero rows. Such a
+    /// fault therefore **fails closed** via [`IndexSet::fail_closed`], which makes every index unusable
+    /// (not merely empty) so all consumers degrade to the always-correct store scan (`rmp` task #733).
+    /// This matters at run time, not just on open: `rebuild_index` is also driven by index / constraint
+    /// DDL.
     fn rebuild_index(store: &Rc<RefCell<RecordStore<D, S>>>, index: &Rc<RefCell<IndexSet>>) {
         // Recover the durable index catalog (`rmp` task #90) into the in-memory set first: this is
         // what makes registration survive a crash. Done before `clear` (which keeps the registered set
@@ -992,6 +1155,11 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         }
 
         index.borrow_mut().clear();
+        // Re-register every bitmap column this session declared (`rmp` task #733, M2). A bitmap is opt-in
+        // and has NO durable catalog entry, so unlike every other kind it cannot be recovered from the
+        // store — a fail-closed retires the live index and only this brings it back. The scan below then
+        // repopulates it (it is in `registered_bitmap()` again).
+        index.borrow_mut().reregister_declared_bitmaps();
 
         // The set of registered node-property indexes (any state), captured before walking the store so
         // the index is not borrowed across a store borrow. A `Populating` index is maintained too (so
@@ -1001,9 +1169,28 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
 
         let node_ids = match store.borrow_mut().scan_node_ids() {
             Ok(ids) => ids,
-            // A store-read fault on the whole scan leaves the index empty; every reader then falls
-            // back to a full scan (correct, just unaccelerated).
-            Err(_) => return,
+            // A store-read fault on the whole scan means the rebuild CANNOT be completed. `clear()`
+            // above already dropped every index's entries, so at this point every index is registered,
+            // still `Online` — and EMPTY. That is the most dangerous state the engine can be in
+            // (`rmp` task #733): the planner keeps routing seeks to those indexes, the write path keeps
+            // consulting them for uniqueness / node-key duplicate detection, and the full-text /
+            // vector procedures keep reading their postings — all returning ZERO rows, silently. (This
+            // is not a recovery-only path: `rebuild_index` also runs at run time from five DDL
+            // call sites, so a transient I/O fault during a `CREATE INDEX` could wipe the process's
+            // in-memory indexes and serve wrong answers until restart.)
+            //
+            // So fail **closed**: make every index unusable rather than empty. `fail_closed` demotes
+            // the state-carrying kinds out of `Online` (withdrawing them from the planner's catalog and
+            // from every read seam, which since `rmp` #733 declines unless `Online`), unregisters the
+            // state-less candidate sources (composite / bitmap), and poisons the full-text/spatial
+            // freshness marker. Every consumer then degrades to the always-correct store scan — the
+            // outcome the old comment here CLAIMED but did not deliver. The durable catalog is
+            // untouched, so the schema survives and the next successful rebuild (any index/constraint
+            // DDL, or reopening the store) restores the fast paths.
+            Err(_) => {
+                index.borrow_mut().fail_closed();
+                return;
+            }
         };
 
         let has_fulltext = !index.borrow().registered_fulltext().is_empty();
@@ -1073,19 +1260,28 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // The registered relationship vector index keys `(type_token, prop_key)` (`rmp` task #669),
         // captured before the scan like the others.
         let registered_rel_vector: Vec<(u32, u32)> = index.borrow().registered_vector_rel();
-        // A store-read fault enumerating the relationships leaves the rel indexes empty-but-`Online`.
-        // This matches the certified node-property rebuild's trust-once-selected behaviour: storage
-        // faults in Graphus are persistent (checksum / torn page), and both the index seek and the scan
-        // fallback read the SAME store, so they fault identically — an empty index never diverges from a
-        // scan in practice. (A whole-scan fault here is also the same failure the very next query would
-        // hit.) Per-relationship read faults inside `index_one_rel*` skip that relationship best-effort.
-        if (!registered_rel.is_empty()
+        // A store-read fault enumerating the relationships **fails closed**, exactly like the node scan
+        // above (`rmp` task #733): the relationship indexes would otherwise be left registered,
+        // `Online` and EMPTY, silently answering every relationship seek / relationship full-text query
+        // with zero rows. `fail_closed` is deliberately **total** (it demotes the node indexes too, not
+        // just the relationship ones): a whole-scan storage fault means the store itself is faulting, so
+        // preserving the node fast paths would only buy speed in a database that is already broken —
+        // and a second, partial fail-closed mode is more surface to get wrong. Per-relationship read
+        // faults inside `index_one_rel*` still skip that relationship best-effort (a missing candidate
+        // in a *populated* index degrades that reader to a re-check, never to a wrong row).
+        let needs_rel_scan = !registered_rel.is_empty()
             || has_rel_fulltext
             || !registered_rel_spatial.is_empty()
             || !registered_rel_composite.is_empty()
-            || !registered_rel_vector.is_empty())
-            && let Ok(rel_ids) = store.borrow().scan_rel_ids()
-        {
+            || !registered_rel_vector.is_empty();
+        if needs_rel_scan {
+            let rel_ids = match store.borrow().scan_rel_ids() {
+                Ok(ids) => ids,
+                Err(_) => {
+                    index.borrow_mut().fail_closed();
+                    return;
+                }
+            };
             for id in rel_ids {
                 if !registered_rel.is_empty() {
                     Self::index_one_rel(store, index, id, &registered_rel);
@@ -1113,6 +1309,21 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             }
         }
 
+        // Did the rebuild have to SKIP an entity it could not read (`rmp` task #733)? The per-entity
+        // helpers are best-effort, but "best effort" is not good enough while an index is being built:
+        // an entity they skipped is absent from the label index (invisible to every `MATCH (n:Label)`)
+        // and from every property index (invisible to every seek), and no re-check can resurrect it —
+        // a committed row silently lost to queries for the life of the process. An index we know to be
+        // an incomplete image of the store must not be published, so fail closed exactly as a failed
+        // whole-scan does. (Empirically caught by the fault-injection sweep in
+        // `tests/index_fail_closed.rs`: a single transient read fault inside the loop above used to
+        // drop one node from the label index, and a plain `MATCH (a:Article)` then returned 299 of 300
+        // rows — silently.)
+        if index.borrow().rebuild_gap() {
+            index.borrow_mut().fail_closed();
+            return;
+        }
+
         // Reset the cross-snapshot full-text/spatial freshness marker (`rmp` task #467). The rebuild
         // above re-inserted every full-text/spatial posting via the instrumented mutation methods,
         // which raised the transient dirty flag (and, on the recovery/DDL paths, may have to clear a
@@ -1122,6 +1333,11 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // path — and discard the build's dirty flag so it does not leak into the next user statement.
         let high_water = store.borrow().snapshot_ts();
         index.borrow_mut().reset_ft_spatial_marker(high_water);
+        // The rebuild completed with no whole-scan fault and no per-entity gap: the index set is once
+        // again a faithful image of the store, so a previous `fail_closed` is repaired (`rmp` task #733).
+        // This is what lets a process self-heal from a *transient* storage fault instead of serving
+        // scan-only (and reporting itself degraded) until it is restarted.
+        index.borrow_mut().heal();
     }
 
     /// Whether `name` is already used by **any** schema catalog — a node-property index name, a
@@ -1269,6 +1485,101 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// property (or carrying a null for one) is **not** indexed for that key — matching the node-key
     /// rule that an incomplete tuple never participates in uniqueness. Store and index are borrowed in
     /// separate, non-overlapping scopes (the file's borrow discipline). Read faults skip best-effort.
+    /// Decrements the front build's stall budget, returning whether it is now **exhausted** — i.e.
+    /// whether the caller must poison (drop) the build (`rmp` task #733). A no-op returning `false` when
+    /// the queue is empty.
+    /// **Poisons** the front build: takes it off the pending queue (so the engine stops re-driving it and
+    /// `has_pending_index_builds()` can go false — the termination guarantee) and parks it in the
+    /// graveyard, counted (`rmp` task #733, M1). It is NOT discarded: once the store reads cleanly again,
+    /// [`retry_poisoned_index_builds`](Self::retry_poisoned_index_builds) re-enqueues it from a fresh
+    /// snapshot, so a transient fault costs a delay rather than a permanently dead index.
+    fn poison_front<B>(queue: &mut VecDeque<B>, graveyard: &mut Vec<B>, events: &mut u64) {
+        if let Some(build) = queue.pop_front() {
+            graveyard.push(build);
+            *events = events.saturating_add(1);
+        }
+    }
+
+    fn stall_or_poison<B>(queue: &mut VecDeque<B>, stall: impl Fn(&mut B) -> &mut u8) -> bool {
+        let Some(front) = queue.front_mut() else {
+            return false;
+        };
+        let budget = stall(front);
+        // An already-exhausted budget stays exhausted (`rmp` task #733, L2). Testing `== 0` *after* a
+        // saturating decrement would also poison a build that somehow started at `0` on its very first
+        // stall — unreachable today (every build is enqueued at `BUILD_STALL_BUDGET`), but a trap for
+        // whoever adds the next build kind. Spend a unit, then report exhaustion.
+        if *budget == 0 {
+            return true;
+        }
+        *budget -= 1;
+        *budget == 0
+    }
+
+    /// Re-establishes a wiped build's snapshot from the **current** store (`rmp` task #733).
+    ///
+    /// Restarting a build at `cursor = 0` over its ORIGINAL snapshot is **not** enough, and believing it
+    /// was is what left `rmp` #733 half-fixed. The original snapshot covered only the rows that existed
+    /// when the build started; every row written *since* then was carried by
+    /// [`RecordStoreGraph::reindex_node`](crate::record_graph) straight into the index's tree — and
+    /// [`IndexSet::clear`] (which every rebuild runs, immediately before the scan that may fault)
+    /// **destroys those maintenance writes along with everything else**. So at the moment of the wipe the
+    /// tree is empty of post-snapshot rows too, and replaying only the old snapshot loses them *forever*,
+    /// under an index that then promotes itself `Online`. A fresh scan is the only thing that covers both.
+    ///
+    /// Returns [`None`] when the store scan faults — the caller must then **poison** the build (drop it
+    /// un-promoted, leaving the index `Populating` and therefore unused), never resume it.
+    fn resnapshot_build(store: &Rc<RefCell<RecordStore<D, S>>>) -> Option<Vec<u64>> {
+        // INVARIANT (`rmp` task #733, L1): every incremental build — node-property (`rmp` #91), full-text
+        // (#72) and spatial (#98) — walks a snapshot of **node** ids, so one re-snapshot serves all three.
+        // The relationship-covering indexes (rel-property, rel-composite, rel-full-text, rel-point,
+        // rel-vector) are all built **synchronously** at create time and never enqueue an incremental
+        // build, which is why no `scan_rel_ids` variant exists here. The day a relationship build becomes
+        // incremental it MUST re-snapshot with `scan_rel_ids`: re-basing it on node ids would silently
+        // index the wrong entities.
+        store.borrow_mut().scan_node_ids().ok()
+    }
+
+    /// The **effective** state of an index, as the engine will actually treat it (`rmp` task #733) —
+    /// the value every `SHOW INDEXES` surface must report.
+    ///
+    /// The durable catalog records what the schema *declares*; the in-memory [`IndexSet`] records what
+    /// the engine can actually *use*. They diverge exactly when something went wrong: a build whose fill
+    /// faulted stays `Populating` in memory while the catalog already says `ONLINE`, and a
+    /// [`IndexSet::fail_closed`] demotes (or unregisters) every index while touching no durable byte.
+    ///
+    /// Reporting the durable state in those windows is not a cosmetic inaccuracy — it is a *false
+    /// report of readiness*. An operator (or an automated `wait_for_indexes` poll, as the example
+    /// harnesses use) that waits for `state != populating` would sail straight through a degraded
+    /// engine, then attribute scan latencies to an index that is not being used. So an index that is not
+    /// usable in memory reports `POPULATING`, whatever the catalog says: not usable, not online.
+    ///
+    /// `in_memory` is the kind's registered state, or [`None`] when the kind carries no state and its
+    /// *registration* is its gate (composite, bitmap) — an unregistered one is reported `POPULATING`.
+    fn effective_state(durable: IndexState, in_memory: Option<IndexState>) -> IndexState {
+        match in_memory {
+            // Usable in memory: the durable catalog is the truth (it may legitimately still say
+            // `Populating` while an incremental build runs).
+            Some(IndexState::Online) => durable,
+            // Not registered, or registered but not `Online`: the engine will NOT use it.
+            _ => IndexState::Populating,
+        }
+    }
+
+    /// Records that a per-entity indexing helper **could not read an entity** and had to skip it
+    /// (`rmp` task #733) — the shared reporting seam for every `index_one_*` helper.
+    ///
+    /// Skipping is safe only for an index that is *already published*: there, a missing candidate simply
+    /// degrades that entity to a re-check. It is **not** safe while an index is being *built*: a seek can
+    /// only drop candidates the index returns, never resurrect one it never returned, so an entity the
+    /// build skipped is invisible to every label scan and every seek for the life of the process — a
+    /// committed row silently lost to queries. The build that drove the helper reads this flag back and
+    /// refuses to publish an index it knows is incomplete (a full rebuild goes
+    /// [`IndexSet::fail_closed`]; an incremental build declines to promote itself `Online`).
+    fn note_rebuild_gap(index: &Rc<RefCell<IndexSet>>) {
+        index.borrow_mut().note_rebuild_gap();
+    }
+
     fn index_one_node_composite(
         store: &Rc<RefCell<RecordStore<D, S>>>,
         index: &Rc<RefCell<IndexSet>>,
@@ -1281,14 +1592,26 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             let store = store.borrow();
             let labels = match store.node_labels(id) {
                 Ok(l) => l,
-                Err(_) => return,
+                Err(_) => {
+                    // `rmp` task #733: record the gap instead of hiding it — an entity missing from
+                    // the index is a candidate a seek can never resurrect, so the build that drove
+                    // this helper must refuse to publish the index (fail closed / stay Populating).
+                    Self::note_rebuild_gap(index);
+                    return;
+                }
             };
             let props = match store.node_property_values(id) {
                 Ok(chain) => chain
                     .into_iter()
                     .map(|(_pid, key, value)| (key, value))
                     .collect(),
-                Err(_) => return,
+                Err(_) => {
+                    // `rmp` task #733: record the gap instead of hiding it — an entity missing from
+                    // the index is a candidate a seek can never resurrect, so the build that drove
+                    // this helper must refuse to publish the index (fail closed / stay Populating).
+                    Self::note_rebuild_gap(index);
+                    return;
+                }
             };
             (labels, props)
         };
@@ -1341,7 +1664,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // Read this node's current label tokens (store borrow, released before the index borrow).
         let label_tokens = match store.borrow_mut().node_labels(id) {
             Ok(tokens) => tokens,
-            Err(_) => return, // overflow-form bitmap or read fault: skip this node's entries.
+            Err(_) => {
+                // overflow-form bitmap or read fault: skip this node's entries.
+                // `rmp` task #733: record the gap instead of hiding it — an entity missing from
+                // the index is a candidate a seek can never resurrect, so the build that drove
+                // this helper must refuse to publish the index (fail closed / stay Populating).
+                Self::note_rebuild_gap(index);
+                return;
+            }
         };
 
         // Resolve the node's current property values, keyed by prop-key, so the index borrow
@@ -1352,7 +1682,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         {
             let chain = match store.borrow_mut().node_property_values(id) {
                 Ok(chain) => chain,
-                Err(_) => return, // a non-storable / read fault: skip this node's properties.
+                Err(_) => {
+                    // a non-storable / read fault: skip this node's properties.
+                    // `rmp` task #733: record the gap instead of hiding it — an entity missing from
+                    // the index is a candidate a seek can never resurrect, so the build that drove
+                    // this helper must refuse to publish the index (fail closed / stay Populating).
+                    Self::note_rebuild_gap(index);
+                    return;
+                }
             };
             for (_pid, key, value) in chain {
                 // Newest-wins: keep only the first occurrence of each key.
@@ -1397,7 +1734,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // The relationship's current type token (store borrow, released before the index borrow).
         let type_token = match store.borrow().rel(id) {
             Ok(r) => r.type_id,
-            Err(_) => return, // read fault: skip this relationship's entries.
+            Err(_) => {
+                // read fault: skip this relationship's entries.
+                // `rmp` task #733: record the gap instead of hiding it — an entity missing from
+                // the index is a candidate a seek can never resurrect, so the build that drove
+                // this helper must refuse to publish the index (fail closed / stay Populating).
+                Self::note_rebuild_gap(index);
+                return;
+            }
         };
         // Nothing registered for this type ⇒ nothing to index (avoid the property-chain decode).
         if !registered
@@ -1413,7 +1757,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         {
             let chain = match store.borrow().rel_property_values(id) {
                 Ok(chain) => chain,
-                Err(_) => return, // a non-storable / read fault: skip this relationship's properties.
+                Err(_) => {
+                    // a non-storable / read fault: skip this relationship's properties.
+                    // `rmp` task #733: record the gap instead of hiding it — an entity missing from
+                    // the index is a candidate a seek can never resurrect, so the build that drove
+                    // this helper must refuse to publish the index (fail closed / stay Populating).
+                    Self::note_rebuild_gap(index);
+                    return;
+                }
             };
             for (_pid, key, value) in chain {
                 if values.iter().any(|(k, _)| *k == key) {
@@ -1450,7 +1801,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // The relationship's current type token (store borrow released before the index borrow).
         let type_token = match store.borrow().rel(id) {
             Ok(r) => r.type_id,
-            Err(_) => return, // read fault: skip this relationship's entries.
+            Err(_) => {
+                // read fault: skip this relationship's entries.
+                // `rmp` task #733: record the gap instead of hiding it — an entity missing from
+                // the index is a candidate a seek can never resurrect, so the build that drove
+                // this helper must refuse to publish the index (fail closed / stay Populating).
+                Self::note_rebuild_gap(index);
+                return;
+            }
         };
         // Nothing registered for this type ⇒ nothing to index (avoid the property-chain decode).
         if !registered
@@ -1463,7 +1821,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let props: Vec<(u32, Value)> = {
             let chain = match store.borrow().rel_property_values(id) {
                 Ok(chain) => chain,
-                Err(_) => return, // a non-storable / read fault: skip this relationship's properties.
+                Err(_) => {
+                    // a non-storable / read fault: skip this relationship's properties.
+                    // `rmp` task #733: record the gap instead of hiding it — an entity missing from
+                    // the index is a candidate a seek can never resurrect, so the build that drove
+                    // this helper must refuse to publish the index (fail closed / stay Populating).
+                    Self::note_rebuild_gap(index);
+                    return;
+                }
             };
             let mut out: Vec<(u32, Value)> = Vec::new();
             for (_pid, key, value) in chain {
@@ -1525,14 +1890,26 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ) {
         let label_tokens = match store.borrow_mut().node_labels(id) {
             Ok(tokens) => tokens,
-            Err(_) => return,
+            Err(_) => {
+                // `rmp` task #733: record the gap instead of hiding it — an entity missing from
+                // the index is a candidate a seek can never resurrect, so the build that drove
+                // this helper must refuse to publish the index (fail closed / stay Populating).
+                Self::note_rebuild_gap(index);
+                return;
+            }
         };
         // The node's current string property values, keyed by prop-key (newest-wins per key).
         let mut string_props: Vec<(u32, String)> = Vec::new();
         {
             let chain = match store.borrow_mut().node_property_values(id) {
                 Ok(chain) => chain,
-                Err(_) => return,
+                Err(_) => {
+                    // `rmp` task #733: record the gap instead of hiding it — an entity missing from
+                    // the index is a candidate a seek can never resurrect, so the build that drove
+                    // this helper must refuse to publish the index (fail closed / stay Populating).
+                    Self::note_rebuild_gap(index);
+                    return;
+                }
             };
             for (_pid, key, value) in chain {
                 if string_props.iter().any(|(k, _)| *k == key) {
@@ -1560,14 +1937,26 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ) {
         let type_token = match store.borrow().rel(id) {
             Ok(r) => r.type_id,
-            Err(_) => return,
+            Err(_) => {
+                // `rmp` task #733: record the gap instead of hiding it — an entity missing from
+                // the index is a candidate a seek can never resurrect, so the build that drove
+                // this helper must refuse to publish the index (fail closed / stay Populating).
+                Self::note_rebuild_gap(index);
+                return;
+            }
         };
         // The relationship's current string property values, keyed by prop-key (newest-wins per key).
         let mut string_props: Vec<(u32, String)> = Vec::new();
         {
             let chain = match store.borrow().rel_property_values(id) {
                 Ok(chain) => chain,
-                Err(_) => return,
+                Err(_) => {
+                    // `rmp` task #733: record the gap instead of hiding it — an entity missing from
+                    // the index is a candidate a seek can never resurrect, so the build that drove
+                    // this helper must refuse to publish the index (fail closed / stay Populating).
+                    Self::note_rebuild_gap(index);
+                    return;
+                }
             };
             for (_pid, key, value) in chain {
                 if string_props.iter().any(|(k, _)| *k == key) {
@@ -1599,7 +1988,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ) {
         let type_token = match store.borrow().rel(id) {
             Ok(r) => r.type_id,
-            Err(_) => return,
+            Err(_) => {
+                // `rmp` task #733: record the gap instead of hiding it — an entity missing from
+                // the index is a candidate a seek can never resurrect, so the build that drove
+                // this helper must refuse to publish the index (fail closed / stay Populating).
+                Self::note_rebuild_gap(index);
+                return;
+            }
         };
         // The relationship's current property values, keyed by prop-key (newest-wins per key), keeping
         // only the point values a registered relationship spatial index covers for this relationship's
@@ -1608,7 +2003,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         {
             let chain = match store.borrow().rel_property_values(id) {
                 Ok(chain) => chain,
-                Err(_) => return,
+                Err(_) => {
+                    // `rmp` task #733: record the gap instead of hiding it — an entity missing from
+                    // the index is a candidate a seek can never resurrect, so the build that drove
+                    // this helper must refuse to publish the index (fail closed / stay Populating).
+                    Self::note_rebuild_gap(index);
+                    return;
+                }
             };
             for (_pid, key, value) in chain {
                 if values.iter().any(|(k, _)| *k == key) {
@@ -1651,7 +2052,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ) {
         let label_tokens = match store.borrow_mut().node_labels(id) {
             Ok(tokens) => tokens,
-            Err(_) => return,
+            Err(_) => {
+                // `rmp` task #733: record the gap instead of hiding it — an entity missing from
+                // the index is a candidate a seek can never resurrect, so the build that drove
+                // this helper must refuse to publish the index (fail closed / stay Populating).
+                Self::note_rebuild_gap(index);
+                return;
+            }
         };
         // The node's current property values, keyed by prop-key (newest-wins per key), keeping only
         // the point values a registered spatial index covers for one of this node's labels.
@@ -1659,7 +2066,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         {
             let chain = match store.borrow_mut().node_property_values(id) {
                 Ok(chain) => chain,
-                Err(_) => return,
+                Err(_) => {
+                    // `rmp` task #733: record the gap instead of hiding it — an entity missing from
+                    // the index is a candidate a seek can never resurrect, so the build that drove
+                    // this helper must refuse to publish the index (fail closed / stay Populating).
+                    Self::note_rebuild_gap(index);
+                    return;
+                }
             };
             for (_pid, key, value) in chain {
                 if values.iter().any(|(k, _)| *k == key) {
@@ -1702,7 +2115,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ) {
         let label_tokens = match store.borrow_mut().node_labels(id) {
             Ok(tokens) => tokens,
-            Err(_) => return,
+            Err(_) => {
+                // `rmp` task #733: record the gap instead of hiding it — an entity missing from
+                // the index is a candidate a seek can never resurrect, so the build that drove
+                // this helper must refuse to publish the index (fail closed / stay Populating).
+                Self::note_rebuild_gap(index);
+                return;
+            }
         };
         // The node's current property values, keyed by prop-key (newest-wins per key), keeping only the
         // string values a registered text index covers for one of this node's labels.
@@ -1710,7 +2129,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         {
             let chain = match store.borrow_mut().node_property_values(id) {
                 Ok(chain) => chain,
-                Err(_) => return,
+                Err(_) => {
+                    // `rmp` task #733: record the gap instead of hiding it — an entity missing from
+                    // the index is a candidate a seek can never resurrect, so the build that drove
+                    // this helper must refuse to publish the index (fail closed / stay Populating).
+                    Self::note_rebuild_gap(index);
+                    return;
+                }
             };
             for (_pid, key, value) in chain {
                 if values.iter().any(|(k, _)| *k == key) {
@@ -1752,7 +2177,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ) {
         let label_tokens = match store.borrow_mut().node_labels(id) {
             Ok(tokens) => tokens,
-            Err(_) => return,
+            Err(_) => {
+                // `rmp` task #733: record the gap instead of hiding it — an entity missing from
+                // the index is a candidate a seek can never resurrect, so the build that drove
+                // this helper must refuse to publish the index (fail closed / stay Populating).
+                Self::note_rebuild_gap(index);
+                return;
+            }
         };
         // The node's current property values, keyed by prop-key (newest-wins per key), keeping only the
         // values a registered vector index covers for one of this node's labels. The value type is NOT
@@ -1761,7 +2192,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         {
             let chain = match store.borrow_mut().node_property_values(id) {
                 Ok(chain) => chain,
-                Err(_) => return,
+                Err(_) => {
+                    // `rmp` task #733: record the gap instead of hiding it — an entity missing from
+                    // the index is a candidate a seek can never resurrect, so the build that drove
+                    // this helper must refuse to publish the index (fail closed / stay Populating).
+                    Self::note_rebuild_gap(index);
+                    return;
+                }
             };
             for (_pid, key, value) in chain {
                 if values.iter().any(|(k, _)| *k == key) {
@@ -1798,13 +2235,25 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ) {
         let type_token = match store.borrow().rel(id) {
             Ok(r) => r.type_id,
-            Err(_) => return,
+            Err(_) => {
+                // `rmp` task #733: record the gap instead of hiding it — an entity missing from
+                // the index is a candidate a seek can never resurrect, so the build that drove
+                // this helper must refuse to publish the index (fail closed / stay Populating).
+                Self::note_rebuild_gap(index);
+                return;
+            }
         };
         let mut values: Vec<(u32, Value)> = Vec::new();
         {
             let chain = match store.borrow().rel_property_values(id) {
                 Ok(chain) => chain,
-                Err(_) => return,
+                Err(_) => {
+                    // `rmp` task #733: record the gap instead of hiding it — an entity missing from
+                    // the index is a candidate a seek can never resurrect, so the build that drove
+                    // this helper must refuse to publish the index (fail closed / stay Populating).
+                    Self::note_rebuild_gap(index);
+                    return;
+                }
             };
             for (_pid, key, value) in chain {
                 if values.iter().any(|(k, _)| *k == key) {
@@ -1853,7 +2302,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         }
         let label_tokens = match store.borrow_mut().node_labels(id) {
             Ok(tokens) => tokens,
-            Err(_) => return,
+            Err(_) => {
+                // `rmp` task #733: record the gap instead of hiding it — an entity missing from
+                // the index is a candidate a seek can never resurrect, so the build that drove
+                // this helper must refuse to publish the index (fail closed / stay Populating).
+                Self::note_rebuild_gap(index);
+                return;
+            }
         };
         // The node's current property values, keyed by prop-key (newest-wins per key), keeping only
         // the keys a registered bitmap index covers for one of this node's labels.
@@ -1861,7 +2316,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         {
             let chain = match store.borrow_mut().node_property_values(id) {
                 Ok(chain) => chain,
-                Err(_) => return,
+                Err(_) => {
+                    // `rmp` task #733: record the gap instead of hiding it — an entity missing from
+                    // the index is a candidate a seek can never resurrect, so the build that drove
+                    // this helper must refuse to publish the index (fail closed / stay Populating).
+                    Self::note_rebuild_gap(index);
+                    return;
+                }
             };
             for (_pid, key, value) in chain {
                 if values.iter().any(|(k, _)| *k == key) {
@@ -2341,7 +2802,16 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 for pk in &entry.property_tokens {
                     properties.push(store.token_name(Namespace::PropKey, *pk)?.to_owned());
                 }
-                Some((name, label.to_owned(), properties, entry.state))
+                // The EFFECTIVE state (`rmp` task #733): a composite carries no in-memory state, so its
+                // *registration* is its gate — a fail-closed unregisters it, and it is then unusable.
+                let state = Self::effective_state(
+                    entry.state,
+                    self.index
+                        .borrow()
+                        .has_composite(entry.label_token, &entry.property_tokens)
+                        .then_some(IndexState::Online),
+                );
+                Some((name, label.to_owned(), properties, state))
             })
             .collect()
     }
@@ -2415,7 +2885,16 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 for pk in &entry.property_tokens {
                     properties.push(store.token_name(Namespace::PropKey, *pk)?.to_owned());
                 }
-                Some((name, rel_type.to_owned(), properties, entry.state))
+                // The EFFECTIVE state (`rmp` task #733) — registration is the gate, as for the node
+                // composite above.
+                let state = Self::effective_state(
+                    entry.state,
+                    self.index
+                        .borrow()
+                        .has_rel_composite(entry.type_token, &entry.property_tokens)
+                        .then_some(IndexState::Online),
+                );
+                Some((name, rel_type.to_owned(), properties, state))
             })
             .collect()
     }
@@ -2431,6 +2910,11 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             .rel_property_indexes()
             .into_iter()
             .filter_map(|(type_token, prop_key, state)| {
+                // The EFFECTIVE state (`rmp` task #733) — see `effective_state`.
+                let state = Self::effective_state(
+                    state,
+                    self.index.borrow().rel_property_state(type_token, prop_key),
+                );
                 let rel_type = store.token_name(Namespace::RelType, type_token)?;
                 let property = store.token_name(Namespace::PropKey, prop_key)?;
                 let name = store
@@ -2553,9 +3037,19 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             .borrow_mut()
             .register_bitmap(label_token, prop_key);
         let registered = [(label_token, prop_key)];
+        self.index.borrow_mut().clear_rebuild_gap();
         let node_ids = match self.store.borrow_mut().scan_node_ids() {
             Ok(ids) => ids,
-            Err(_) => return Ok(()), // empty graph / scan fault: an empty bitmap, rebuilt later.
+            // A scan fault used to `return Ok(())` here — reporting SUCCESS while leaving an EMPTY bitmap
+            // registered (`rmp` task #733). A bitmap is a **membership-exact candidate source**, not a
+            // hint: an empty one answers every seek with zero rows. Unregister it (it carries no
+            // `IndexState` to demote, so registration IS its gate) and surface the fault.
+            Err(e) => {
+                self.index
+                    .borrow_mut()
+                    .unregister_bitmap(label_token, prop_key);
+                return Err(e);
+            }
         };
         // Build the bitmap, enforcing the distinct-value cap as we go (`rmp` #453, F-IDX-5). Checking
         // after each node short-circuits a near-unique column before its bitmap blows up, bounding the
@@ -2578,6 +3072,20 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     graphus_index::bitmap::MAX_DISTINCT_VALUES
                 )));
             }
+        }
+        // A node the capture could not read is missing from the bitmap for good (`rmp` task #733), and a
+        // bitmap is membership-exact — a seek against it would silently drop that node's rows. Unregister
+        // and surface the fault rather than report success over a holed candidate source. (This also
+        // clears the flag, which the old code left dirty for the next build to trip over.)
+        if self.index.borrow().rebuild_gap() {
+            let mut idx = self.index.borrow_mut();
+            idx.clear_rebuild_gap();
+            idx.unregister_bitmap(label_token, prop_key);
+            drop(idx);
+            return Err(GraphusError::Storage(format!(
+                "cannot create a bitmap index on `{label}.{property}`: the store scan skipped at \
+                 least one node"
+            )));
         }
         Ok(())
     }
@@ -3094,6 +3602,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             prop_key,
             snapshot,
             cursor: 0,
+            generation: self.index.borrow().wipe_generation(),
+            stall: BUILD_STALL_BUDGET,
         });
         Ok(true) // the index was created.
     }
@@ -3241,10 +3751,42 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.index
             .borrow_mut()
             .register_composite(label_token, property_tokens.clone());
-        let node_ids = self.store.borrow_mut().scan_node_ids()?;
-        let registered = vec![(label_token, property_tokens)];
+        let node_ids = match self.store.borrow_mut().scan_node_ids() {
+            Ok(ids) => ids,
+            Err(e) => {
+                // The build could not start (`rmp` task #733). A composite index carries no
+                // [`IndexState`] in the in-memory set — its consumers gate on *registration*
+                // (`has_composite`) — so the only way to make it unusable is to **unregister** it.
+                // Leaving it registered-and-empty would be far worse than slow: the node-key duplicate
+                // check (`composite_seek_eq`) trusts it as an exact candidate source, so an empty tree
+                // would report "no duplicate" for every tuple and let a NODE KEY constraint be violated.
+                // Unregistered, both the planner's seek and the duplicate check fall back to the exact
+                // label scan; the durable catalog is untouched, so any later successful `rebuild_index`
+                // (or a reopen) re-registers and repopulates it.
+                self.index
+                    .borrow_mut()
+                    .unregister_composite(label_token, &property_tokens);
+                return Err(e);
+            }
+        };
+        let registered = vec![(label_token, property_tokens.clone())];
+        self.index.borrow_mut().clear_rebuild_gap();
         for id in node_ids {
             Self::index_one_node_composite(&self.store, &self.index, id, &registered);
+        }
+        // A node the fill could not read is missing from the composite tree for good (`rmp` task #733) —
+        // and a node-key constraint trusts that tree as an EXACT candidate source, so a hole in it would
+        // let a duplicate tuple through. Unregister (the tree has no state to demote), so the duplicate
+        // check and the planner both fall back to the exact label scan, and surface the fault.
+        if self.index.borrow().rebuild_gap() {
+            let mut idx = self.index.borrow_mut();
+            idx.clear_rebuild_gap();
+            idx.unregister_composite(label_token, &property_tokens);
+            drop(idx);
+            return Err(GraphusError::Storage(
+                "the composite index could not be built: the store scan skipped at least one node"
+                    .to_owned(),
+            ));
         }
         Ok(true) // the index was created.
     }
@@ -3435,10 +3977,34 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.index
             .borrow_mut()
             .register_rel_composite(type_token, property_tokens.clone());
-        let rel_ids = self.store.borrow().scan_rel_ids()?;
-        let registered = vec![(type_token, property_tokens)];
+        let rel_ids = match self.store.borrow().scan_rel_ids() {
+            Ok(ids) => ids,
+            Err(e) => {
+                // The build could not start: unregister so the empty tree can never answer a seek
+                // (`rmp` task #733) — the relationship twin of the node composite fail-closed above.
+                self.index
+                    .borrow_mut()
+                    .unregister_rel_composite(type_token, &property_tokens);
+                return Err(e);
+            }
+        };
+        let registered = vec![(type_token, property_tokens.clone())];
+        self.index.borrow_mut().clear_rebuild_gap();
         for id in rel_ids {
             Self::index_one_rel_composite(&self.store, &self.index, id, &registered);
+        }
+        // The relationship twin of the node composite guard (`rmp` task #733): unregister the holed tree
+        // so every consumer falls back to the exact typed scan, and surface the fault.
+        if self.index.borrow().rebuild_gap() {
+            let mut idx = self.index.borrow_mut();
+            idx.clear_rebuild_gap();
+            idx.unregister_rel_composite(type_token, &property_tokens);
+            drop(idx);
+            return Err(GraphusError::Storage(
+                "the composite relationship index could not be built: the store scan skipped at \
+                 least one relationship"
+                    .to_owned(),
+            ));
         }
         Ok(true) // the index was created.
     }
@@ -3608,6 +4174,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 name: name.to_owned(),
                 snapshot,
                 cursor: 0,
+                generation: self.index.borrow().wipe_generation(),
+                stall: BUILD_STALL_BUDGET,
             });
         Ok(true)
     }
@@ -3827,13 +4395,22 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     properties.push(store.token_name(Namespace::PropKey, *pk)?.to_owned());
                 }
                 let analyzer = Analyzer::from_byte(entry.analyzer)?;
+                // The EFFECTIVE state (`rmp` task #733): route by entity to the in-memory catalogue the
+                // query seam actually consults, so a still-building (or fail-closed) index never reports
+                // itself ONLINE — which is exactly what a `wait_for_indexes` poll keys on.
+                let in_memory = if entry.entity.is_relationship() {
+                    self.index.borrow().fulltext_rel_state(&name)
+                } else {
+                    self.index.borrow().fulltext_state(&name)
+                };
+                let state = Self::effective_state(entry.state, in_memory);
                 Some((
                     name,
                     entry.entity,
                     labels_or_types,
                     properties,
                     analyzer,
-                    entry.state,
+                    state,
                 ))
             })
             .collect()
@@ -3929,6 +4506,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             prop_key,
             snapshot,
             cursor: 0,
+            generation: self.index.borrow().wipe_generation(),
+            stall: BUILD_STALL_BUDGET,
         });
         Ok(true)
     }
@@ -4128,9 +4707,16 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             .into_iter()
             .filter(|(_n, entry)| !entry.entity.is_relationship())
             .filter_map(|(name, entry)| {
+                // The EFFECTIVE state (`rmp` task #733) — see `effective_state`.
+                let state = Self::effective_state(
+                    entry.state,
+                    self.index
+                        .borrow()
+                        .spatial_state(entry.label_token, entry.property_token),
+                );
                 let label = store.token_name(Namespace::Label, entry.label_token)?;
                 let property = store.token_name(Namespace::PropKey, entry.property_token)?;
-                Some((name, label.to_owned(), property.to_owned(), entry.state))
+                Some((name, label.to_owned(), property.to_owned(), state))
             })
             .collect()
     }
@@ -4148,9 +4734,16 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             .into_iter()
             .filter(|(_n, entry)| entry.entity.is_relationship())
             .filter_map(|(name, entry)| {
+                // The EFFECTIVE state (`rmp` task #733) — see `effective_state`.
+                let state = Self::effective_state(
+                    entry.state,
+                    self.index
+                        .borrow()
+                        .spatial_rel_state(entry.label_token, entry.property_token),
+                );
                 let rel_type = store.token_name(Namespace::RelType, entry.label_token)?;
                 let property = store.token_name(Namespace::PropKey, entry.property_token)?;
-                Some((name, rel_type.to_owned(), property.to_owned(), entry.state))
+                Some((name, rel_type.to_owned(), property.to_owned(), state))
             })
             .collect()
     }
@@ -4240,19 +4833,51 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         };
         self.store.borrow_mut().commit(txn)?;
 
-        // 4. Register the trigram index in the in-memory set so concurrent writes maintain it from now
-        //    on, then synchronously index the existing nodes. The index is ephemeral (rebuilt on open
-        //    from the durable catalog + store), so this synchronous fill is a pure in-memory build with
-        //    no durability surface — a crash before it finishes recovers the `Online` registration and
-        //    the open-time rebuild repopulates it store-consistently.
+        // 4. Register the trigram index **`Populating`** so the write path maintains it from now on
+        //    while the build runs, then synchronously index the existing nodes, and only THEN promote it
+        //    to `Online`. The order is what makes it safe (`rmp` task #733): the index becomes visible
+        //    to readers (the planner's catalog and the `index_seek_text` seam both gate on `Online`)
+        //    only once it is COMPLETE. Registering `Online` up front — as this did before — meant that a
+        //    fault in the scan below returned an error to the client but left behind an `Online`, EMPTY
+        //    trigram index, after which every `CONTAINS` / `STARTS WITH` / `ENDS WITH` on the covered
+        //    property silently returned no rows until the process restarted.
+        //
+        //    The index is ephemeral (rebuilt on open from the durable catalog + store), so this
+        //    synchronous fill is a pure in-memory build with no durability surface — a crash before it
+        //    finishes recovers the durable `Online` registration and the open-time rebuild repopulates
+        //    it store-consistently.
         self.index
             .borrow_mut()
-            .register_text(label_token, prop_key, IndexState::Online);
-        let node_ids = self.store.borrow_mut().scan_node_ids()?;
+            .register_text(label_token, prop_key, IndexState::Populating);
+        let node_ids = match self.store.borrow_mut().scan_node_ids() {
+            Ok(ids) => ids,
+            Err(e) => {
+                // The build could not start. Leave the in-memory index `Populating` (declined by every
+                // reader, which falls back to the exact label scan + residual) and surface the error.
+                // The durable entry stays `Online`, so re-opening the store — or any later successful
+                // `rebuild_index` — repopulates and promotes it. Never `Online` and empty.
+                return Err(e);
+            }
+        };
         let registered = vec![(label_token, prop_key)];
+        self.index.borrow_mut().clear_rebuild_gap();
         for id in node_ids {
             Self::index_one_node_text(&self.store, &self.index, id, &registered);
         }
+        // A node the fill could not read is missing from the trigram index for good (`rmp` task #733):
+        // the residual `CONTAINS` filter can drop a candidate but never add one back. Leave the index
+        // `Populating` (declined by every reader, which falls back to the exact label scan) and surface
+        // the fault, rather than publish an index with a hole in it.
+        if self.index.borrow().rebuild_gap() {
+            self.index.borrow_mut().clear_rebuild_gap();
+            return Err(GraphusError::Storage(format!(
+                "the text index {name:?} could not be built: the store scan skipped at least one node"
+            )));
+        }
+        // The trigram index now holds every existing node's terms: promote it so readers may use it.
+        self.index
+            .borrow_mut()
+            .set_text_state(label_token, prop_key, IndexState::Online);
 
         // 5. Stamp the cross-snapshot freshness marker (`rmp` task #467): the trigram index now reflects
         //    committed state at the store's current high-water, and the build raised the transient dirty
@@ -4333,9 +4958,16 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             .text_indexes()
             .into_iter()
             .filter_map(|(name, entry)| {
+                // The EFFECTIVE state (`rmp` task #733) — see `effective_state`.
+                let state = Self::effective_state(
+                    entry.state,
+                    self.index
+                        .borrow()
+                        .text_state(entry.label_token, entry.property_token),
+                );
                 let label = store.token_name(Namespace::Label, entry.label_token)?;
                 let property = store.token_name(Namespace::PropKey, entry.property_token)?;
-                Some((name, label.to_owned(), property.to_owned(), entry.state))
+                Some((name, label.to_owned(), property.to_owned(), state))
             })
             .collect()
     }
@@ -4473,9 +5105,16 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         };
         self.store.borrow_mut().commit(txn)?;
 
-        // 4. Register the HNSW graph `Online` in the in-memory set so concurrent writes maintain it, then
-        //    synchronously index the existing nodes / relationships into it. The graph is ephemeral
-        //    (rebuilt on open), so this synchronous fill has no durability surface.
+        // 4. Register the HNSW graph **`Populating`** in the in-memory set so concurrent writes maintain
+        //    it while the build runs, synchronously index the existing nodes / relationships into it, and
+        //    only THEN promote it to `Online` (`rmp` task #733). The order is the safety property: a
+        //    vector index is the one kind with **no scan fallback** (an approximate structure cannot be
+        //    re-derived exactly by brute force), so an `Online`-but-empty HNSW would answer every k-NN
+        //    with an empty neighbour set — indistinguishable, to the caller, from "there are no near
+        //    neighbours". Registering `Online` up front (as this did before) left exactly that state
+        //    behind whenever the scan below faulted. While `Populating`, the query seam returns a clear
+        //    "still populating" error instead. The graph is ephemeral (rebuilt on open), so this
+        //    synchronous fill has no durability surface.
         let sim = similarity_from_storage(similarity);
         if entity.is_relationship() {
             self.index.borrow_mut().register_vector_rel(
@@ -4485,13 +5124,31 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 sim,
                 m,
                 ef_construction,
-                IndexState::Online,
+                IndexState::Populating,
             );
+            // The build could not start: `?` leaves the index `Populating` (its query seam then raises a
+            // clear "still populating" error) and surfaces the fault. A reopen — or any later successful
+            // `rebuild_index` — repopulates it from the durable catalog and promotes it.
             let rel_ids = self.store.borrow().scan_rel_ids()?;
             let registered = vec![(token, prop_key)];
+            self.index.borrow_mut().clear_rebuild_gap();
             for id in rel_ids {
                 Self::index_one_rel_vector(&self.store, &self.index, id, &registered);
             }
+            // A relationship the fill could not read is missing from the HNSW for good, and a vector index
+            // has no scan fallback that could compensate (`rmp` task #733). Leave it `Populating` — its
+            // query seam then raises a clear "still populating" error — and surface the fault.
+            if self.index.borrow().rebuild_gap() {
+                self.index.borrow_mut().clear_rebuild_gap();
+                return Err(GraphusError::Storage(
+                    "the vector index could not be built: the store scan skipped at least one \
+                     relationship"
+                        .to_owned(),
+                ));
+            }
+            self.index
+                .borrow_mut()
+                .set_vector_rel_state(token, prop_key, IndexState::Online);
         } else {
             self.index.borrow_mut().register_vector(
                 token,
@@ -4500,13 +5157,26 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 sim,
                 m,
                 ef_construction,
-                IndexState::Online,
+                IndexState::Populating,
             );
+            // As above: a fault leaves the index `Populating`, never `Online` and empty.
             let node_ids = self.store.borrow_mut().scan_node_ids()?;
             let registered = vec![(token, prop_key)];
+            self.index.borrow_mut().clear_rebuild_gap();
             for id in node_ids {
                 Self::index_one_node_vector(&self.store, &self.index, id, &registered);
             }
+            // The node twin of the guard above (`rmp` task #733).
+            if self.index.borrow().rebuild_gap() {
+                self.index.borrow_mut().clear_rebuild_gap();
+                return Err(GraphusError::Storage(
+                    "the vector index could not be built: the store scan skipped at least one node"
+                        .to_owned(),
+                ));
+            }
+            self.index
+                .borrow_mut()
+                .set_vector_state(token, prop_key, IndexState::Online);
         }
 
         // 5. Stamp the cross-snapshot freshness marker (`rmp` task #467): the HNSW graph now reflects
@@ -4601,9 +5271,16 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             .into_iter()
             .filter(|(_n, entry)| !entry.entity.is_relationship())
             .filter_map(|(name, entry)| {
+                // The EFFECTIVE state (`rmp` task #733) — see `effective_state`.
+                let state = Self::effective_state(
+                    entry.state,
+                    self.index
+                        .borrow()
+                        .vector_state(entry.token, entry.property_token),
+                );
                 let label = store.token_name(Namespace::Label, entry.token)?;
                 let property = store.token_name(Namespace::PropKey, entry.property_token)?;
-                Some((name, label.to_owned(), property.to_owned(), entry.state))
+                Some((name, label.to_owned(), property.to_owned(), state))
             })
             .collect()
     }
@@ -4619,9 +5296,16 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             .into_iter()
             .filter(|(_n, entry)| entry.entity.is_relationship())
             .filter_map(|(name, entry)| {
+                // The EFFECTIVE state (`rmp` task #733) — see `effective_state`.
+                let state = Self::effective_state(
+                    entry.state,
+                    self.index
+                        .borrow()
+                        .vector_rel_state(entry.token, entry.property_token),
+                );
                 let rel_type = store.token_name(Namespace::RelType, entry.token)?;
                 let property = store.token_name(Namespace::PropKey, entry.property_token)?;
-                Some((name, rel_type.to_owned(), property.to_owned(), entry.state))
+                Some((name, rel_type.to_owned(), property.to_owned(), state))
             })
             .collect()
     }
@@ -4645,6 +5329,18 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 };
                 let label_or_type = store.token_name(namespace, entry.token)?;
                 let property = store.token_name(Namespace::PropKey, entry.property_token)?;
+                // The EFFECTIVE state (`rmp` task #733), routed by entity — a vector index that is not
+                // usable ERRORS on query, so reporting it ONLINE would be doubly misleading.
+                let in_memory = if entry.entity.is_relationship() {
+                    self.index
+                        .borrow()
+                        .vector_rel_state(entry.token, entry.property_token)
+                } else {
+                    self.index
+                        .borrow()
+                        .vector_state(entry.token, entry.property_token)
+                };
+                let state = Self::effective_state(entry.state, in_memory);
                 Some(VectorIndexListing {
                     name,
                     entity: entry.entity,
@@ -4654,7 +5350,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     similarity: entry.similarity,
                     m: entry.m,
                     ef_construction: entry.ef_construction,
-                    state: entry.state,
+                    state,
                 })
             })
             .collect()
@@ -5033,18 +5729,23 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // For composite node-key uniqueness: remember the full tuples seen.
         let mut seen_tuples: Vec<Vec<Value>> = Vec::new();
         for id in node_ids {
-            // Read this node's label tokens; skip a read-faulting node best-effort.
-            let label_tokens = match self.store.borrow_mut().node_labels(id) {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
+            // A node whose labels cannot be read **fails the DDL** (`rmp` task #733). This used to
+            // `continue`, i.e. validate the constraint against the nodes it happened to be able to read
+            // — so a `CREATE CONSTRAINT … IS UNIQUE` could be ACCEPTED over data that violates it, with
+            // the duplicate hiding in the unreadable node. From that moment the constraint is a lie: the
+            // catalog says the property is unique, queries and planners may rely on it, and the
+            // offending row is already committed. Refusing is always safe for a DDL — the operator
+            // retries once the store is readable — and it is the only answer that cannot corrupt the
+            // schema's meaning. (This is the same class of defect `rmp` #733 exists to eliminate: never
+            // publish a schema object you could not fully verify.)
+            let label_tokens = self.store.borrow_mut().node_labels(id)?;
             if !label_tokens.contains(&label_token) {
                 continue; // node does not carry the covered label
             }
             match kind {
                 ConstraintKind::Existence => {
                     // A missing or null value violates the existence (NOT NULL) constraint.
-                    let value = self.node_value_for_key(id, prop_keys[0]);
+                    let value = self.node_value_for_key(id, prop_keys[0])?;
                     if value.as_ref().is_none_or(graphus_core::Value::is_null) {
                         return Err(ConstraintViolation::Existence {
                             name: name.to_owned(),
@@ -5059,7 +5760,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     // A null/absent value never participates in uniqueness (Cypher equality treats
                     // null as never-equal), matching the index's treatment.
                     let Some(value) = self
-                        .node_value_for_key(id, prop_keys[0])
+                        .node_value_for_key(id, prop_keys[0])?
                         .filter(|v| !v.is_null())
                     else {
                         continue;
@@ -5087,7 +5788,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     let mut complete = true;
                     for &prop_key in prop_keys {
                         match self
-                            .node_value_for_key(id, prop_key)
+                            .node_value_for_key(id, prop_key)?
                             .filter(|v| !v.is_null())
                         {
                             Some(v) => tuple.push(v),
@@ -5118,7 +5819,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     let mut complete = true;
                     for &prop_key in prop_keys {
                         match self
-                            .node_value_for_key(id, prop_key)
+                            .node_value_for_key(id, prop_key)?
                             .filter(|v| !v.is_null())
                         {
                             Some(v) => tuple.push(v),
@@ -5154,7 +5855,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     // Only a present, non-null value is type-checked (a missing/null value is allowed —
                     // property-type does not imply existence).
                     let Some(value) = self
-                        .node_value_for_key(id, prop_keys[0])
+                        .node_value_for_key(id, prop_keys[0])?
                         .filter(|v| !v.is_null())
                     else {
                         continue;
@@ -5184,26 +5885,36 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         Ok(())
     }
 
-    /// The newest value node `id` holds for property-key token `prop_key`, or [`None`] if the node
-    /// has no such property (or a read fault occurs). Reads the property chain newest-first and keeps
-    /// the first occurrence — the same newest-wins discipline the index rebuild uses (`rmp` task #99).
-    fn node_value_for_key(&self, id: u64, prop_key: u32) -> Option<Value> {
-        let chain = self.store.borrow_mut().node_property_values(id).ok()?;
-        chain
+    /// The newest value node `id` holds for property-key token `prop_key`, or [`None`] if the node has
+    /// no such property. Reads the property chain newest-first and keeps the first occurrence — the same
+    /// newest-wins discipline the index rebuild uses (`rmp` task #99).
+    ///
+    /// # Errors
+    /// Propagates a store read fault. It is deliberately **fallible** (`rmp` task #733): it used to fold
+    /// a read fault into `None`, indistinguishable from "the node has no such property" — which let the
+    /// constraint-validation walk that calls it treat an unreadable node as *not* violating, and so
+    /// accept a `IS UNIQUE` constraint whose duplicate was hiding in that node.
+    fn node_value_for_key(&self, id: u64, prop_key: u32) -> Result<Option<Value>> {
+        let chain = self.store.borrow_mut().node_property_values(id)?;
+        Ok(chain
             .into_iter()
             .find(|(_pid, key, _value)| *key == prop_key)
-            .map(|(_pid, _key, value)| value)
+            .map(|(_pid, _key, value)| value))
     }
 
     /// The newest value relationship `id` holds for property-key token `prop_key` (`rmp` #638), or
-    /// [`None`] if the relationship has no such property (or a read fault occurs). The relationship
-    /// analogue of [`node_value_for_key`](Self::node_value_for_key).
-    fn rel_value_for_key(&self, id: u64, prop_key: u32) -> Option<Value> {
-        let chain = self.store.borrow().rel_property_values(id).ok()?;
-        chain
+    /// [`None`] if the relationship has no such property — the relationship analogue of
+    /// [`node_value_for_key`](Self::node_value_for_key).
+    ///
+    /// # Errors
+    /// Propagates a store read fault, for the reason documented on
+    /// [`node_value_for_key`](Self::node_value_for_key) (`rmp` task #733).
+    fn rel_value_for_key(&self, id: u64, prop_key: u32) -> Result<Option<Value>> {
+        let chain = self.store.borrow().rel_property_values(id)?;
+        Ok(chain
             .into_iter()
             .find(|(_pid, key, _value)| *key == prop_key)
-            .map(|(_pid, _key, value)| value)
+            .map(|(_pid, _key, value)| value))
     }
 
     /// Scans every currently-slot-occupied relationship of the type token `type_token` and rejects if
@@ -5234,17 +5945,17 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // Composite key uniqueness: full tuples seen so far.
         let mut seen_tuples: Vec<Vec<Value>> = Vec::new();
         for id in rel_ids {
-            // Read this relationship's type token; skip a read-faulting slot best-effort.
-            let this_type = match self.store.borrow().rel(id) {
-                Ok(r) => r.type_id,
-                Err(_) => continue,
-            };
+            // A relationship whose record cannot be read **fails the DDL** (`rmp` task #733) — the
+            // relationship twin of the node guard above. Skipping it would let a `CREATE CONSTRAINT …
+            // IS UNIQUE` be accepted over data that violates it, with the duplicate hiding in the
+            // unreadable slot.
+            let this_type = self.store.borrow().rel(id)?.type_id;
             if this_type != type_token {
                 continue; // relationship does not carry the covered type
             }
             match kind {
                 ConstraintKind::RelExistence => {
-                    let value = self.rel_value_for_key(id, prop_keys[0]);
+                    let value = self.rel_value_for_key(id, prop_keys[0])?;
                     if value.as_ref().is_none_or(graphus_core::Value::is_null) {
                         return Err(ConstraintViolation::Existence {
                             name: name.to_owned(),
@@ -5257,7 +5968,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 }
                 ConstraintKind::RelUnique if prop_keys.len() == 1 => {
                     let Some(value) = self
-                        .rel_value_for_key(id, prop_keys[0])
+                        .rel_value_for_key(id, prop_keys[0])?
                         .filter(|v| !v.is_null())
                     else {
                         continue;
@@ -5285,7 +5996,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     let mut complete = true;
                     for &prop_key in prop_keys {
                         match self
-                            .rel_value_for_key(id, prop_key)
+                            .rel_value_for_key(id, prop_key)?
                             .filter(|v| !v.is_null())
                         {
                             Some(v) => tuple.push(v),
@@ -5316,7 +6027,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     let mut complete = true;
                     for &prop_key in prop_keys {
                         match self
-                            .rel_value_for_key(id, prop_key)
+                            .rel_value_for_key(id, prop_key)?
                             .filter(|v| !v.is_null())
                         {
                             Some(v) => tuple.push(v),
@@ -5350,7 +6061,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 }
                 ConstraintKind::RelPropertyType => {
                     let Some(value) = self
-                        .rel_value_for_key(id, prop_keys[0])
+                        .rel_value_for_key(id, prop_keys[0])?
                         .filter(|v| !v.is_null())
                     else {
                         continue;
@@ -5459,11 +6170,200 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// Whether any non-blocking index build is still in progress (`rmp` task #91/#72/#98). The engine
     /// loop uses this to decide between a plain blocking receive (no builds) and a timed receive that
     /// also drives the build between commands.
+    ///
+    /// Deliberately does **not** include the degraded state (`rmp` task #733): callers such as
+    /// `LocalEngine::drain_index_builds` spin `while has_pending_index_builds() { advance… }`, so
+    /// reporting a permanently-faulting store as "pending" would hang them forever. Degradation is
+    /// surfaced by [`indexes_degraded`](Self::indexes_degraded) and repaired by
+    /// [`retry_degraded_index_rebuild`](Self::retry_degraded_index_rebuild), which is bounded and
+    /// back-off-limited.
     #[must_use]
     pub fn has_pending_index_builds(&self) -> bool {
         !self.pending_builds.is_empty()
             || !self.pending_fulltext_builds.is_empty()
             || !self.pending_spatial_builds.is_empty()
+    }
+
+    /// Whether the **label (token LOOKUP) index** may still be used (`rmp` task #733).
+    ///
+    /// It is the base of every fallback in the engine — a declined seek degrades to a label scan — and a
+    /// `fail_closed` leaves it empty, at which point the label-scan seam bypasses it and enumerates the
+    /// store instead. `SHOW INDEXES` must therefore report the synthetic `LOOKUP` row as `POPULATING`
+    /// rather than the hard-coded `ONLINE`: the index that stopped being usable is precisely the one the
+    /// engine leans on hardest, and claiming it is online is the most misleading thing the surface could
+    /// say.
+    #[must_use]
+    pub fn label_lookup_usable(&self) -> bool {
+        self.index.borrow().labels_usable()
+    }
+
+    /// Whether the derived indexes are currently **degraded** — a storage fault made them
+    /// untrustworthy and [`IndexSet::fail_closed`] dropped the engine to scans (`rmp` task #733).
+    ///
+    /// Answers are still **correct** while degraded (every read path is on the exact scan), but they are
+    /// unaccelerated, and the condition must be visible: the server logs it, meters it, and reports the
+    /// affected indexes as `POPULATING` rather than `ONLINE`.
+    #[must_use]
+    pub fn indexes_degraded(&self) -> bool {
+        self.index.borrow().is_degraded()
+    }
+
+    /// How many times the derived indexes have been wiped by [`IndexSet::fail_closed`] over this
+    /// coordinator's life (`rmp` task #733) — monotonic. The server samples it to log each new
+    /// occurrence at `ERROR` and drive a metric; a silent degradation is indistinguishable from a
+    /// healthy-but-slow engine, which is how this class of fault stays unnoticed.
+    #[must_use]
+    pub fn index_fail_closed_events(&self) -> u64 {
+        self.index.borrow().fail_closed_events()
+    }
+
+    /// How many builds have been **poisoned** over this coordinator's life (`rmp` task #733, M1) —
+    /// monotonic. A poisoned build is one a storage fault stopped for good: its index is left
+    /// `Populating` (never served, so answers stay correct via the scan) until the store reads cleanly
+    /// again. The server samples this to log the event at `ERROR` and drive a metric.
+    #[must_use]
+    pub fn index_build_poison_events(&self) -> u64 {
+        self.poison_events
+    }
+
+    /// How many poisoned builds are currently parked awaiting resurrection (`rmp` task #733, M1).
+    #[must_use]
+    pub fn poisoned_index_builds(&self) -> usize {
+        self.poisoned_builds.len()
+            + self.poisoned_fulltext_builds.len()
+            + self.poisoned_spatial_builds.len()
+    }
+
+    /// Re-enqueues every **poisoned** build once the store reads cleanly again (`rmp` task #733, M1),
+    /// returning whether any build was resurrected.
+    ///
+    /// Poisoning is what guarantees termination against a permanently-faulting store, but on its own it
+    /// is a **one-way door**: the index stays `Populating` — never served, so answers remain correct, but
+    /// never accelerated either — with nothing in the process able to bring it back before a restart. A
+    /// *transient* fault would therefore cost an index permanently. So a poisoned build is parked, not
+    /// discarded, and this probes the store (one `scan_node_ids`) and, when it succeeds, re-enqueues each
+    /// parked build with a **fresh snapshot**, a full stall budget and the current wipe epoch — exactly
+    /// the state a healthy build starts from.
+    ///
+    /// Throttled by the same backoff discipline as the degraded rebuild retry, so a broken store cannot
+    /// make the engine probe on every command. It must NOT be called from inside
+    /// [`advance_index_builds`](Self::advance_index_builds): a build that fails again would be re-enqueued
+    /// within the same drain loop, and `while has_pending_index_builds() { advance… }` would never
+    /// terminate. The engine calls it *around* the drain, never inside it.
+    ///
+    /// # Bounding the poison↔resurrect cycle (`rmp` task #733, B2)
+    ///
+    /// The probe ([`resnapshot_build`](Self::resnapshot_build)) reads only the node *slot* pages, not the
+    /// property / label pages a build indexes. A build poisoned by an unreadable **property** page thus
+    /// passes the probe, is resurrected, re-drains, hits the same page, and re-poisons. The M1 code reset
+    /// the throttle to `0` on every successful probe, so this repeated **every tick** (≈ 500 O(store)
+    /// re-scans/second on a live server — a CPU + I/O + log-flood DoS, and the exact spin the round-3
+    /// stall budget had eliminated, re-introduced through the resurrection door).
+    ///
+    /// The fix keeps the throttle **armed** across resurrections and *escalates* it whenever the parked
+    /// builds were re-poisoned since the last resurrection (detected via
+    /// [`poison_watermark`](Self#structfield.poison_watermark)). The backoff only resets when the
+    /// graveyard truly clears — i.e. a resurrected build actually **completed** — so a genuinely-healed
+    /// store returns to a fast retry while a permanently-broken one has its retry rate collapse
+    /// geometrically to one attempt per [`MAX_DEGRADED_RETRY_BACKOFF`] drains.
+    pub fn retry_poisoned_index_builds(&mut self) -> bool {
+        if self.poisoned_index_builds() == 0 {
+            // The graveyard is clear: either nothing was ever poisoned, or a resurrection's builds all
+            // COMPLETED. Reset the throttle so a store that has genuinely healed retries promptly.
+            self.poison_resurrect_attempts = 0;
+            self.poison_retry_skip = 0;
+            return false;
+        }
+        if self.poison_retry_skip > 0 {
+            self.poison_retry_skip -= 1;
+            return false;
+        }
+        // Probe: can the store even be scanned? If not, stay parked and back off (this is a *different*
+        // failure — the slot pages themselves are unreadable — and it escalates like a re-poison).
+        let Some(snapshot) = Self::resnapshot_build(&self.store) else {
+            self.poison_resurrect_attempts = self.poison_resurrect_attempts.saturating_add(1);
+            self.poison_retry_skip = poison_backoff(self.poison_resurrect_attempts);
+            return false;
+        };
+        let generation = self.index.borrow().wipe_generation();
+        for mut build in self.poisoned_builds.drain(..) {
+            build.snapshot.clone_from(&snapshot);
+            build.cursor = 0;
+            build.stall = BUILD_STALL_BUDGET;
+            build.generation = generation;
+            self.pending_builds.push_back(build);
+        }
+        for mut build in self.poisoned_fulltext_builds.drain(..) {
+            build.snapshot.clone_from(&snapshot);
+            build.cursor = 0;
+            build.stall = BUILD_STALL_BUDGET;
+            build.generation = generation;
+            self.pending_fulltext_builds.push_back(build);
+        }
+        for mut build in self.poisoned_spatial_builds.drain(..) {
+            build.snapshot.clone_from(&snapshot);
+            build.cursor = 0;
+            build.stall = BUILD_STALL_BUDGET;
+            build.generation = generation;
+            self.pending_spatial_builds.push_back(build);
+        }
+        // Count this resurrection and ARM the throttle for the NEXT one (`rmp` task #733, B2). The FIRST
+        // resurrection after a poisoning is immediate (`attempts` was 0, so this is attempt 1); if these
+        // builds re-poison — which happens later in the same drain — the graveyard refills and the next
+        // call skips `poison_backoff(attempts)` drains before probing again, doubling each time. If they
+        // instead complete, the graveyard clears and the `== 0` branch above resets `attempts` to 0. So a
+        // transient fault heals within one or two cycles while a permanent one has its retry rate decay
+        // geometrically to one attempt per [`MAX_DEGRADED_RETRY_BACKOFF`] drains.
+        self.poison_resurrect_attempts = self.poison_resurrect_attempts.saturating_add(1);
+        self.poison_retry_skip = poison_backoff(self.poison_resurrect_attempts);
+        true
+    }
+
+    /// Attempts to **repair** a degraded index set by rebuilding it from the store (`rmp` task #733),
+    /// returning whether the engine is healthy afterwards.
+    ///
+    /// A `fail_closed` is usually the result of a *transient* storage fault, and without this the
+    /// process would serve scan-only until it was restarted. So the engine calls this from its tick: a
+    /// successful rebuild restores every fast path (and re-promotes the indexes in `SHOW INDEXES`),
+    /// while a rebuild that faults again simply fails closed once more — always correct, never wrong.
+    ///
+    /// A full rebuild is **O(store)** and runs synchronously on the engine thread, stalling every query
+    /// behind it — so against a *persistently* broken store it must be rare, not merely throttled. Retries
+    /// are therefore backed off exponentially up to [`MAX_DEGRADED_RETRY_BACKOFF`] attempts-worth of
+    /// skips (≈ 8.7 minutes at the engine's 2 ms tick, and far longer under load, where the counter only
+    /// advances once per command). The backoff resets the moment a rebuild succeeds. Deliberately counted
+    /// in *attempts* rather than wall-clock: the coordinator must stay deterministic for DST, so it may
+    /// not read the clock. A no-op returning `true` when the index set is healthy, so callers can invoke
+    /// it unconditionally.
+    pub fn retry_degraded_index_rebuild(&mut self) -> bool {
+        if !self.index.borrow().is_degraded() {
+            return true;
+        }
+        if self.degraded_retry_skip > 0 {
+            self.degraded_retry_skip -= 1;
+            return false;
+        }
+        Self::rebuild_index(&self.store, &self.index);
+        if self.index.borrow().is_degraded() {
+            // Still faulting: back off so a permanently-broken store cannot make the engine thread burn
+            // a whole store scan every tick (correctness is unaffected either way — reads are on scans).
+            self.degraded_retry_backoff = self
+                .degraded_retry_backoff
+                .saturating_mul(2)
+                .min(MAX_DEGRADED_RETRY_BACKOFF);
+            self.degraded_retry_skip = self.degraded_retry_backoff;
+            false
+        } else {
+            // Repaired. The backoff is **halved**, not reset (`rmp` task #733, M3): an *intermittent*
+            // device — fail, repair, fail, repair — would otherwise re-arm a 1-attempt backoff on every
+            // success, so the very next fault triggers another O(store) synchronous rebuild on the engine
+            // thread and the engine spends its life re-scanning the store. Decaying the backoff lets a
+            // genuinely-healed store return to a fast retry within a few cycles, while a flapping one
+            // stays throttled.
+            self.degraded_retry_backoff = (self.degraded_retry_backoff / 2).max(1);
+            self.degraded_retry_skip = 0;
+            true
+        }
     }
 
     /// Advances the front non-blocking index build by up to `budget` nodes (`rmp` task #91), returning
@@ -5481,6 +6381,15 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// a positive chunk size). If the durable promotion commit fails, the build is left in place
     /// `Populating` (still correct via the scan fallback) to be retried on the next call/open.
     pub fn advance_index_builds(&mut self, budget: usize) -> bool {
+        // Repair a fail-closed index set FIRST (`rmp` task #733). This runs on the **command** path (the
+        // engine drives an index build after every command), not just on the idle tick — under sustained
+        // load an idle tick may never come, and a build cannot promote while the set is degraded, so
+        // without this the engine would stay scan-only for as long as it was busy. The attempt itself is
+        // exponentially backed off inside `retry_degraded_index_rebuild`, so a permanently-faulting store
+        // costs at most one bounded probe per backoff window.
+        if self.index.borrow().is_degraded() {
+            let _healed = self.retry_degraded_index_rebuild();
+        }
         // Drive a node-property build first if one is pending; then a full-text build; then a spatial
         // build. Processing one queue per call keeps the per-call work bounded by `budget` for any kind.
         if !self.pending_builds.is_empty() {
@@ -5496,22 +6405,108 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// Advances the front **node-property** build by up to `budget` nodes (`rmp` task #91), promoting
     /// + dequeuing it when complete.
     fn advance_node_property_build(&mut self, budget: usize) {
+        // (1) EPOCH CHECK (`rmp` task #733). Was the index set wiped by a `fail_closed` since this build
+        // last ran? The build queues live on the coordinator, out of `IndexSet`'s reach, so a wipe empties
+        // the half-built tree without telling the build. Resuming from the old cursor would index only the
+        // TAIL of the snapshot and then promote the index `Online` over the hole. And restarting at
+        // cursor 0 over the ORIGINAL snapshot is *still* not enough — the wipe also destroyed the
+        // maintenance writes for rows created after the snapshot — so the snapshot itself is re-taken.
+        // See `resnapshot_build`.
+        let generation = self.index.borrow().wipe_generation();
+        if self
+            .pending_builds
+            .front()
+            .is_some_and(|b| b.generation != generation)
+        {
+            let Some(fresh) = Self::resnapshot_build(&self.store) else {
+                // The store cannot be scanned: POISON the build (drop it un-promoted). The index stays
+                // `Populating`, so it is never served — correct, just unaccelerated — and the degraded
+                // rebuild retry will repopulate its tree. Never resume a build we cannot re-base.
+                Self::poison_front(
+                    &mut self.pending_builds,
+                    &mut self.poisoned_builds,
+                    &mut self.poison_events,
+                );
+                return;
+            };
+            if let Some(build) = self.pending_builds.front_mut() {
+                build.snapshot = fresh;
+                build.cursor = 0;
+                build.generation = generation;
+                build.stall = BUILD_STALL_BUDGET;
+            }
+        }
+
         let Some(build) = self.pending_builds.front_mut() else {
             return;
         };
 
         // Index up to `budget` nodes from the snapshot, starting at the cursor.
         let registered = [(build.label_token, build.prop_key)];
+        let start = build.cursor;
         let end = build.snapshot.len().min(build.cursor + budget);
-        for &id in &build.snapshot[build.cursor..end] {
+        let chunk: Vec<u64> = build.snapshot[start..end].to_vec();
+        let total = build.snapshot.len();
+        // A clean slate: only THIS chunk's read faults may fail THIS build (`rmp` task #733).
+        self.index.borrow_mut().clear_rebuild_gap();
+        for id in chunk {
             Self::index_one_node(&self.store, &self.index, id, &registered);
         }
-        build.cursor = end;
 
-        if build.cursor < build.snapshot.len() {
+        // (2) GAP CHECK. Could a node in this chunk not be read? Then the tree has a hole a seek could
+        // never resurrect, so the cursor does NOT advance and the index is NOT promoted — the chunk is
+        // retried. A *transient* fault heals within a few attempts; a **persistent** one (the model this
+        // project assumes: checksum / torn page) would otherwise retry forever, and
+        // `LocalEngine::drain_index_builds` spins `while has_pending_index_builds()`, so that is an
+        // infinite loop at 100% CPU re-scanning the store. Hence the bounded stall budget: when it is
+        // exhausted the build is POISONED (dropped, un-promoted, index left `Populating` and therefore
+        // never served). Terminates, never holes, never spins.
+        if self.index.borrow().rebuild_gap() {
+            self.index.borrow_mut().clear_rebuild_gap();
+            if Self::stall_or_poison(&mut self.pending_builds, |b| &mut b.stall) {
+                Self::poison_front(
+                    &mut self.pending_builds,
+                    &mut self.poisoned_builds,
+                    &mut self.poison_events,
+                );
+            }
+            return;
+        }
+
+        let Some(build) = self.pending_builds.front_mut() else {
+            return;
+        };
+        build.cursor = end;
+        // Refill the stall budget ONLY on real progress. An **empty** chunk (`start == end == total`, the
+        // state of a completed build that keeps being re-driven because the degraded gate below will not
+        // let it promote) is not progress: refilling on it resets the budget faster than the gate spends
+        // it, so the build never poisons, `has_pending_index_builds()` never goes false, and
+        // `LocalEngine::drain_index_builds` spins forever (`rmp` task #733).
+        if end > start {
+            build.stall = BUILD_STALL_BUDGET;
+        }
+        if build.cursor < total {
             return; // more of this build remains.
         }
 
+        // (3) BELT AND BRACES. Never publish into a WIPED index set: while the engine is degraded, the
+        // derived structures are known-untrustworthy and a repair rebuild is pending, so an `Online`
+        // promotion now could only be a claim we cannot back. Stall (bounded) and let the repair run
+        // first; on exhaustion the build is poisoned rather than promoted.
+        if self.index.borrow().is_degraded() {
+            if Self::stall_or_poison(&mut self.pending_builds, |b| &mut b.stall) {
+                Self::poison_front(
+                    &mut self.pending_builds,
+                    &mut self.poisoned_builds,
+                    &mut self.poison_events,
+                );
+            }
+            return;
+        }
+
+        let Some(build) = self.pending_builds.front_mut() else {
+            return;
+        };
         // The front build's snapshot is fully indexed: promote it durably to `Online`, then dequeue.
         let (label_token, prop_key) = (build.label_token, build.prop_key);
         self.next_txn_id += 1;
@@ -5537,18 +6532,67 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// [`index_one_node_fulltext`](Self::index_one_node_fulltext) helper, then on completion the named
     /// catalog entry is durably flipped to [`IndexState::Online`].
     fn advance_fulltext_build(&mut self, budget: usize) {
+        // (1) EPOCH CHECK + RE-SNAPSHOT, exactly as `advance_node_property_build` documents (`rmp` #733).
+        // The full-text index escapes the worst of a stale resume by accident (the `rmp` #467 marker
+        // poison keeps readers off a wiped inverted index), but it must not be left half-filled-and-
+        // `Online` either — and the marker is cleared by the very rebuild that repairs the set.
+        let generation = self.index.borrow().wipe_generation();
+        if self
+            .pending_fulltext_builds
+            .front()
+            .is_some_and(|b| b.generation != generation)
+        {
+            let Some(fresh) = Self::resnapshot_build(&self.store) else {
+                Self::poison_front(
+                    &mut self.pending_fulltext_builds,
+                    &mut self.poisoned_fulltext_builds,
+                    &mut self.poison_events,
+                ); // poison: never resume a build we cannot re-base.
+                return;
+            };
+            if let Some(build) = self.pending_fulltext_builds.front_mut() {
+                build.snapshot = fresh;
+                build.cursor = 0;
+                build.generation = generation;
+                build.stall = BUILD_STALL_BUDGET;
+            }
+        }
         let Some(build) = self.pending_fulltext_builds.front_mut() else {
             return;
         };
         let total = build.snapshot.len();
+        let start = build.cursor;
         let end = total.min(build.cursor + budget);
-        let chunk: Vec<u64> = build.snapshot[build.cursor..end].to_vec();
+        let chunk: Vec<u64> = build.snapshot[start..end].to_vec();
         let name = build.name.clone();
         build.cursor = end;
         let done = end >= total;
 
+        // A clean slate: only THIS chunk's read faults may fail THIS build (`rmp` task #733).
+        self.index.borrow_mut().clear_rebuild_gap();
         for id in chunk {
             Self::index_one_node_fulltext(&self.store, &self.index, id);
+        }
+        // (2) GAP CHECK. A node this chunk could not read is missing from the inverted index for good, and
+        // no per-candidate re-check can resurrect it. Rewind and retry — bounded by the stall budget, so a
+        // persistent fault poisons the build instead of spinning the engine forever (`rmp` task #733).
+        if self.index.borrow().rebuild_gap() {
+            self.index.borrow_mut().clear_rebuild_gap();
+            if Self::stall_or_poison(&mut self.pending_fulltext_builds, |b| &mut b.stall) {
+                Self::poison_front(
+                    &mut self.pending_fulltext_builds,
+                    &mut self.poisoned_fulltext_builds,
+                    &mut self.poison_events,
+                );
+            } else if let Some(build) = self.pending_fulltext_builds.front_mut() {
+                build.cursor = start;
+            }
+            return;
+        }
+        if end > start
+            && let Some(build) = self.pending_fulltext_builds.front_mut()
+        {
+            build.stall = BUILD_STALL_BUDGET; // real progress: refill the budget.
         }
         // The chunk re-indexed committed text into the inverted index; raise the cross-snapshot
         // freshness marker to the store high-water so a reader whose snapshot predates this build
@@ -5564,6 +6608,26 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
 
         if !done {
             return; // more of this build remains.
+        }
+
+        // (3) BELT AND BRACES: never publish into a WIPED index set (`rmp` task #733) — stall (bounded)
+        // until the repair rebuild has run, then poison rather than promote.
+        //
+        // The cursor is deliberately NOT rewound here. Rewinding would make the *next* call re-run a
+        // non-empty chunk, which the gap check would read as progress and use to refill the stall budget
+        // — so the budget would be replenished faster than this gate spends it and the build would never
+        // poison, spinning `LocalEngine::drain_index_builds` forever. Leaving the cursor at the end costs
+        // nothing: the chunk's entries are already in the tree, and if the set is wiped again the epoch
+        // check re-snapshots and rebuilds from scratch anyway.
+        if self.index.borrow().is_degraded() {
+            if Self::stall_or_poison(&mut self.pending_fulltext_builds, |b| &mut b.stall) {
+                Self::poison_front(
+                    &mut self.pending_fulltext_builds,
+                    &mut self.poisoned_fulltext_builds,
+                    &mut self.poison_events,
+                );
+            }
+            return;
         }
 
         // The snapshot is fully indexed: durably flip the catalog entry to `Online`, then dequeue.
@@ -5607,19 +6671,65 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// catalog entry is durably flipped to [`IndexState::Online`] (after which the planner begins
     /// routing proximity seeks to it).
     fn advance_spatial_build(&mut self, budget: usize) {
+        // (1) EPOCH CHECK + RE-SNAPSHOT — the spatial twin of `advance_node_property_build` (`rmp` #733).
+        let generation = self.index.borrow().wipe_generation();
+        if self
+            .pending_spatial_builds
+            .front()
+            .is_some_and(|b| b.generation != generation)
+        {
+            let Some(fresh) = Self::resnapshot_build(&self.store) else {
+                Self::poison_front(
+                    &mut self.pending_spatial_builds,
+                    &mut self.poisoned_spatial_builds,
+                    &mut self.poison_events,
+                ); // poison: cannot re-base this build.
+                return;
+            };
+            if let Some(build) = self.pending_spatial_builds.front_mut() {
+                build.snapshot = fresh;
+                build.cursor = 0;
+                build.generation = generation;
+                build.stall = BUILD_STALL_BUDGET;
+            }
+        }
         let Some(build) = self.pending_spatial_builds.front_mut() else {
             return;
         };
         let total = build.snapshot.len();
+        let start = build.cursor;
         let end = total.min(build.cursor + budget);
-        let chunk: Vec<u64> = build.snapshot[build.cursor..end].to_vec();
+        let chunk: Vec<u64> = build.snapshot[start..end].to_vec();
         let name = build.name.clone();
         let registered = [(build.label_token, build.prop_key)];
         build.cursor = end;
         let done = end >= total;
 
+        // A clean slate: only THIS chunk's read faults may fail THIS build (`rmp` task #733).
+        self.index.borrow_mut().clear_rebuild_gap();
         for id in chunk {
             Self::index_one_node_spatial(&self.store, &self.index, id, &registered);
+        }
+        // (2) GAP CHECK. A node this chunk could not read would be missing from the grid for good — the
+        // residual `distance(...)` filter can drop a candidate but never add one back. Rewind and retry,
+        // bounded by the stall budget so a persistent fault poisons the build (`rmp` task #733).
+        if self.index.borrow().rebuild_gap() {
+            self.index.borrow_mut().clear_rebuild_gap();
+            if Self::stall_or_poison(&mut self.pending_spatial_builds, |b| &mut b.stall) {
+                Self::poison_front(
+                    &mut self.pending_spatial_builds,
+                    &mut self.poisoned_spatial_builds,
+                    &mut self.poison_events,
+                );
+            } else if let Some(build) = self.pending_spatial_builds.front_mut() {
+                build.cursor = start;
+            }
+            return;
+        }
+        if end > start
+            && let Some(build) = self.pending_spatial_builds.front_mut()
+        {
+            build.stall = BUILD_STALL_BUDGET; // real progress: refill the budget.
         }
         // Raise the cross-snapshot freshness marker to the store high-water (read BEFORE the promotion
         // commit below so it reflects the indexed nodes' committed state, not the promotion txn's ts),
@@ -5633,6 +6743,19 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
 
         if !done {
             return; // more of this build remains.
+        }
+
+        // (3) BELT AND BRACES: never publish into a WIPED index set (`rmp` task #733). The cursor is not
+        // rewound — see `advance_fulltext_build` for why rewinding here defeats the stall budget.
+        if self.index.borrow().is_degraded() {
+            if Self::stall_or_poison(&mut self.pending_spatial_builds, |b| &mut b.stall) {
+                Self::poison_front(
+                    &mut self.pending_spatial_builds,
+                    &mut self.poisoned_spatial_builds,
+                    &mut self.poison_events,
+                );
+            }
+            return;
         }
 
         // The snapshot is fully indexed: durably flip the catalog entry to `Online`, then dequeue.
@@ -5793,6 +6916,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             .node_property_indexes()
             .into_iter()
             .filter_map(|(label_token, prop_key, state)| {
+                // The EFFECTIVE state (`rmp` task #733): a failed build / fail-closed leaves the durable
+                // catalog saying ONLINE while the engine cannot use the index.
+                let state = Self::effective_state(
+                    state,
+                    self.index
+                        .borrow()
+                        .node_property_state(label_token, prop_key),
+                );
                 let label = store.token_name(Namespace::Label, label_token)?;
                 let property = store.token_name(Namespace::PropKey, prop_key)?;
                 let name = store
@@ -5821,9 +6952,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let mut builder = IndexCatalog::builder();
         let store = self.store.borrow();
 
-        for token in self.index.borrow_mut().indexed_label_tokens() {
-            if let Some(name) = store.token_name(Namespace::Label, token) {
-                builder = builder.with_token_lookup(name);
+        // The label (token-lookup) index, but only while it may be trusted: a rebuild whose store scan
+        // faulted leaves it empty, and the seam then enumerates the store instead (`rmp` task #733), so
+        // advertising an index the engine will not use would only mislead the planner's costing.
+        if self.index.borrow().labels_usable() {
+            for token in self.index.borrow_mut().indexed_label_tokens() {
+                if let Some(name) = store.token_name(Namespace::Label, token) {
+                    builder = builder.with_token_lookup(name);
+                }
             }
         }
         for (label_token, prop_key) in self.index.borrow().online_node_properties() {
@@ -6813,7 +7949,25 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // Clear the node from every value-bitmap first (drop the rolled-back value's bit), then
         // re-insert under the reverted store value for each column it still matches.
         self.index.borrow_mut().remove_node_from_all_bitmaps(id);
+        // This is an ABORT path, not a build: it borrows `index_one_node_bitmap`, which reports an
+        // unreadable node by raising the shared `rebuild_gap` flag (`rmp` task #733). Leaving that flag
+        // set here would be a landmine — the next build to read it would poison itself over a fault that
+        // had nothing to do with it. So the gap is consumed HERE, where it means something specific: the
+        // node could not be re-derived, so the bitmap (a **membership-exact** candidate source, whose
+        // holes a seek can never resurrect) no longer faithfully describes this column. Unregister the
+        // affected columns — their consumers gate on registration — so every seek falls back to the exact
+        // scan, and the next successful rebuild re-captures them.
+        self.index.borrow_mut().clear_rebuild_gap();
         Self::index_one_node_bitmap(&self.store, &self.index, id, &registered);
+        if self.index.borrow().rebuild_gap() {
+            let mut index = self.index.borrow_mut();
+            index.clear_rebuild_gap();
+            for (label_token, prop_key) in registered {
+                // RETIRE, keeping the declaration: the column stops answering seeks now, and the next
+                // successful rebuild re-registers and repopulates it (`rmp` task #733, M2).
+                index.disable_bitmap(label_token, prop_key);
+            }
+        }
     }
 }
 
@@ -7510,5 +8664,469 @@ mod ssi_prune_tests {
         coord
             .commit(reader)
             .expect("the pinned reader commits cleanly after the prune");
+    }
+}
+
+#[cfg(test)]
+mod index_wipe_tests {
+    //! White-box regressions for the `rmp` #733 wipe/poison machinery.
+    //!
+    //! These live **inside** the crate on purpose. The end-to-end tests in
+    //! `tests/index_fail_closed.rs` drive a faulty block device, which is the honest way to prove the
+    //! engine's *behaviour* — but it cannot isolate any single guard, because the guards deliberately
+    //! overlap (a wipe is covered by the epoch re-snapshot, by the degraded-promotion gate, AND by the
+    //! command-path repair). An end-to-end test therefore stays green when one of them is deleted, which
+    //! makes it worthless as a regression guard for that one.
+    //!
+    //! So each guard is pinned here against the exact adversarial state it exists for, using the
+    //! coordinator's own internals. Every test below FAILS when its guard is reverted (proven, not
+    //! assumed).
+
+    use graphus_io::MemBlockDevice;
+    use graphus_storage::{IndexState, Namespace, RecordStore};
+    use graphus_wal::{MemLogSink, WalManager};
+
+    use crate::binding::{Parameters, bind_parameters};
+    use crate::coordinator::TxnCoordinator;
+    use crate::executor::execute;
+    use crate::lexer::tokenize;
+    use crate::lower::lower;
+    use crate::parser::parse_tokens;
+    use crate::physical::{PhysicalPlan, plan_physical};
+    use crate::semantics::analyze;
+
+    type Coord = TxnCoordinator<MemBlockDevice, MemLogSink>;
+
+    fn fresh_coord() -> Coord {
+        let device = MemBlockDevice::new(0);
+        let wal = WalManager::create(MemLogSink::new()).expect("create wal");
+        let store: RecordStore<MemBlockDevice, MemLogSink> =
+            RecordStore::create(device, wal, 256, 1).expect("create store");
+        TxnCoordinator::new(store)
+    }
+
+    fn compile(coord: &Coord, src: &str) -> PhysicalPlan {
+        let toks = tokenize(src).expect("lex");
+        let ast = parse_tokens(&toks, src).expect("parse");
+        let validated = analyze(&ast).expect("analyze");
+        plan_physical(&lower(&validated), &coord.catalog())
+    }
+
+    fn run(coord: &mut Coord, src: &str) -> Vec<crate::runtime::Row> {
+        let plan = compile(coord, src);
+        let txn = coord.begin_serializable();
+        let bound = bind_parameters(&plan, &Parameters::new()).expect("bind");
+        let rows = {
+            let mut graph = coord.statement(txn).expect("statement");
+            let rows = {
+                let mut cursor = execute(&plan, &bound, &mut graph).expect("open cursor");
+                cursor.collect_all().expect("collect")
+            };
+            assert!(!graph.has_error(), "statement captured an error");
+            rows
+        };
+        coord.commit(txn).expect("commit");
+        rows
+    }
+
+    fn seed(coord: &mut Coord, n: usize) {
+        run(
+            coord,
+            &format!("UNWIND range(1, {n}) AS i CREATE (:Article {{slug: 'a' + toString(i)}})"),
+        );
+    }
+
+    fn slug_rows(coord: &mut Coord, slug: &str) -> usize {
+        run(
+            coord,
+            &format!("MATCH (a:Article {{slug: '{slug}'}}) RETURN id(a) AS id"),
+        )
+        .len()
+    }
+
+    /// **(C1, isolated.)** A wipe mid-build must make the build re-take its snapshot — not merely restart
+    /// over the old one.
+    ///
+    /// The adversarial state is reproduced exactly: a build is half-done, a row is written **after** its
+    /// snapshot (carried into the tree by `reindex_node`), then the index set is wiped. The wipe is
+    /// applied directly, and the degraded flag is then cleared **without repopulating** — which is
+    /// precisely the window the command-path repair leaves open when its backoff skips a probe, and the
+    /// only state in which the epoch guard is the last line of defence.
+    ///
+    /// Resuming (or restarting over the ORIGINAL snapshot) loses the post-snapshot row for good and then
+    /// promotes the index `Online` over the hole: a committed row invisible to every seek, and a
+    /// uniqueness check that no longer sees the existing holder.
+    #[test]
+    fn a_wipe_mid_build_re_takes_the_snapshot_so_post_snapshot_rows_survive() {
+        let mut coord = fresh_coord();
+        seed(&mut coord, 200);
+        coord
+            .begin_online_node_property_index("Article", "slug")
+            .expect("declare the online index");
+        coord.advance_index_builds(64); // half-built: the tree holds the head of the snapshot.
+        assert!(coord.has_pending_index_builds());
+
+        // A row written AFTER the build's snapshot. `reindex_node` puts it straight into the tree.
+        run(&mut coord, "CREATE (:Article {slug: 'late-1'})");
+
+        // THE WIPE, reproduced exactly as `rebuild_index` performs it: `clear()` empties every tree
+        // FIRST — taking the post-snapshot row's maintenance write with it — and only then does the
+        // faulting scan trigger `fail_closed()`. Calling `fail_closed()` alone would leave the trees
+        // populated and the test would prove nothing (it would pass with the guard deleted).
+        coord.index.borrow_mut().clear();
+        coord.index.borrow_mut().fail_closed();
+        // ...and the set is marked healthy WITHOUT being repopulated. This is the state a skipped repair
+        // probe leaves behind, and the one in which the build's own guard is the last line of defence.
+        coord.index.borrow_mut().heal();
+
+        let mut iters = 0;
+        while coord.has_pending_index_builds() {
+            coord.advance_index_builds(64);
+            iters += 1;
+            assert!(iters < 10_000, "the build must terminate");
+        }
+
+        // The index went `Online`, so the planner routes a real seek at it...
+        assert_eq!(
+            coord.index.borrow().node_property_state(
+                coord
+                    .store
+                    .borrow()
+                    .token_id(Namespace::Label, "Article")
+                    .expect("label"),
+                coord
+                    .store
+                    .borrow()
+                    .token_id(Namespace::PropKey, "slug")
+                    .expect("prop"),
+            ),
+            Some(IndexState::Online),
+            "the build must complete and promote"
+        );
+        let probe = "MATCH (a:Article {slug: 'late-1'}) RETURN id(a) AS id";
+        assert!(
+            format!("{:?}", compile(&coord, probe)).contains("NodeIndexSeek"),
+            "the probe must be served by an index seek — otherwise it proves nothing"
+        );
+        // ...and it must find the post-snapshot row. Without the re-snapshot: 0 rows.
+        assert_eq!(
+            slug_rows(&mut coord, "late-1"),
+            1,
+            "a row written after the build's snapshot must survive the wipe: the build has to \
+             RE-TAKE its snapshot, not merely restart over the stale one"
+        );
+        assert_eq!(
+            slug_rows(&mut coord, "a1"),
+            1,
+            "and the head of the snapshot too"
+        );
+    }
+
+    /// **(B4 iii.)** A build must never promote its index while the set is degraded — and, because a
+    /// degraded set may never heal, it must eventually give up rather than be re-driven forever.
+    #[test]
+    fn a_degraded_set_blocks_promotion_and_the_build_terminates() {
+        let mut coord = fresh_coord();
+        seed(&mut coord, 100);
+        coord
+            .begin_online_node_property_index("Article", "slug")
+            .expect("declare the online index");
+
+        // Wipe the set and leave it degraded (no repair): the build may complete its chunks, but it must
+        // not publish into a wrecked index set.
+        coord.index.borrow_mut().fail_closed();
+
+        let label = coord
+            .store
+            .borrow()
+            .token_id(Namespace::Label, "Article")
+            .expect("label");
+        let prop = coord
+            .store
+            .borrow()
+            .token_id(Namespace::PropKey, "slug")
+            .expect("prop");
+
+        // The engine's own drain loop. It MUST terminate: an empty chunk is not progress, so the stall
+        // budget is spent rather than refilled, and the build is poisoned.
+        let mut iters = 0;
+        while coord.has_pending_index_builds() {
+            // Drive the build directly, so the command-path repair (which would clear `degraded` and let
+            // the promotion through) cannot mask the gate under test.
+            coord.advance_node_property_build(64);
+            iters += 1;
+            assert!(
+                iters < 1_000,
+                "the drain loop must TERMINATE against a degraded set — it spun {iters} times"
+            );
+        }
+        assert_eq!(
+            coord.index.borrow().node_property_state(label, prop),
+            Some(IndexState::Populating),
+            "a build must NEVER promote its index into a wiped index set"
+        );
+        assert_eq!(
+            coord.index_build_poison_events(),
+            1,
+            "the build must be poisoned (parked + counted), not silently dropped"
+        );
+        assert_eq!(
+            coord.poisoned_index_builds(),
+            1,
+            "and parked for resurrection"
+        );
+    }
+
+    /// **(M1.)** A poisoned build is not a one-way door: once the store reads cleanly again it is
+    /// resurrected from a fresh snapshot and completes.
+    #[test]
+    fn a_poisoned_build_is_resurrected_once_the_store_is_readable() {
+        let mut coord = fresh_coord();
+        seed(&mut coord, 100);
+        coord
+            .begin_online_node_property_index("Article", "slug")
+            .expect("declare the online index");
+        coord.index.borrow_mut().fail_closed();
+        // Bounded: a reverted liveness guard must FAIL this test, never hang the suite.
+        let mut iters = 0;
+        while coord.has_pending_index_builds() {
+            coord.advance_node_property_build(64);
+            iters += 1;
+            assert!(
+                iters < 1_000,
+                "the build must terminate — it spun {iters} times"
+            );
+        }
+        assert_eq!(coord.poisoned_index_builds(), 1, "the build was poisoned");
+
+        // The store is fine (the wipe was injected, not caused by a real fault): a repair heals the set,
+        // and the parked build is then resurrected and completes.
+        assert!(coord.retry_degraded_index_rebuild(), "the set repairs");
+        assert!(
+            coord.retry_poisoned_index_builds(),
+            "the build is resurrected"
+        );
+        assert!(coord.has_pending_index_builds(), "and back in the queue");
+        let mut iters = 0;
+        while coord.has_pending_index_builds() {
+            coord.advance_index_builds(64);
+            iters += 1;
+            assert!(iters < 10_000, "the resurrected build must terminate");
+        }
+        let label = coord
+            .store
+            .borrow()
+            .token_id(Namespace::Label, "Article")
+            .expect("label");
+        let prop = coord
+            .store
+            .borrow()
+            .token_id(Namespace::PropKey, "slug")
+            .expect("prop");
+        assert_eq!(
+            coord.index.borrow().node_property_state(label, prop),
+            Some(IndexState::Online),
+            "a resurrected build must finish and promote its index"
+        );
+        assert_eq!(coord.poisoned_index_builds(), 0);
+        assert_eq!(slug_rows(&mut coord, "a1"), 1);
+    }
+
+    /// **(M2.)** A bitmap column has no durable catalog, so a fail-closed that *dropped* its declaration
+    /// lost it for the life of the process. It must be RETIRED (so an empty membership-exact index never
+    /// answers a seek) and brought back by the next rebuild.
+    #[test]
+    fn a_bitmap_declaration_survives_a_wipe() {
+        let mut coord = fresh_coord();
+        seed(&mut coord, 50);
+        coord
+            .declare_bitmap_index("Article", "slug")
+            .expect("declare the bitmap column");
+        let label = coord
+            .store
+            .borrow()
+            .token_id(Namespace::Label, "Article")
+            .expect("label");
+        let prop = coord
+            .store
+            .borrow()
+            .token_id(Namespace::PropKey, "slug")
+            .expect("prop");
+        assert!(coord.index.borrow().has_bitmap(label, prop));
+
+        coord.index.borrow_mut().fail_closed();
+        // Retired: it must NOT answer seeks while it is empty...
+        assert!(
+            !coord.index.borrow().has_bitmap(label, prop),
+            "an emptied membership-exact bitmap must not stay registered"
+        );
+        // ...but the DECLARATION survives, so the repair rebuild restores the column.
+        assert!(coord.retry_degraded_index_rebuild(), "the set repairs");
+        assert!(
+            coord.index.borrow().has_bitmap(label, prop),
+            "a declared bitmap column must come back after the rebuild — it has no durable catalog, \
+             so nothing else can restore it and it would be gone until the process restarted"
+        );
+    }
+
+    /// **(B4 i / BLOCKER 1.)** The recovery promotion must ABORT on a degraded set.
+    ///
+    /// `TxnCoordinator::new` runs the open-time rebuild (which may fail closed) and then promotes every
+    /// durably-`Populating` index to `Online` — on the premise that the rebuild has just populated it.
+    /// When the rebuild failed closed that premise is false, and the promotion publishes an EMPTY index
+    /// `Online`, **durably**: the planner routes a real seek at a tree with no rows in it, and
+    /// `unique_conflict` — which trusts that tree as an exact candidate source — lets a `IS UNIQUE`
+    /// constraint accept a duplicate. It also falsifies the in-memory state that `SHOW INDEXES` reports.
+    #[test]
+    fn the_recovery_promotion_aborts_on_a_degraded_index_set() {
+        let mut coord = fresh_coord();
+        seed(&mut coord, 50);
+        // A durably-`Populating` index — exactly what an interrupted `CREATE INDEX` leaves behind.
+        coord
+            .begin_online_node_property_index("Article", "slug")
+            .expect("declare the online index");
+        let label = coord
+            .store
+            .borrow()
+            .token_id(Namespace::Label, "Article")
+            .expect("label");
+        let prop = coord
+            .store
+            .borrow()
+            .token_id(Namespace::PropKey, "slug")
+            .expect("prop");
+        assert!(
+            coord
+                .store
+                .borrow()
+                .node_property_indexes()
+                .iter()
+                .any(|&(l, p, state)| l == label && p == prop && state == IndexState::Populating),
+            "the durable catalog must hold a Populating index"
+        );
+
+        // The open-time rebuild failed closed: the trees are empty and every index is demoted.
+        coord.index.borrow_mut().fail_closed();
+
+        // The recovery promotion now runs — and must refuse.
+        let next = TxnCoordinator::promote_recovered_populating_indexes(
+            &coord.store,
+            &coord.index,
+            coord.next_txn_id,
+        );
+        coord.next_txn_id = next;
+
+        assert_eq!(
+            coord.index.borrow().node_property_state(label, prop),
+            Some(IndexState::Populating),
+            "the recovery promotion must NOT publish an index the failed rebuild left empty"
+        );
+        assert!(
+            coord
+                .store
+                .borrow()
+                .node_property_indexes()
+                .iter()
+                .any(|&(l, p, state)| l == label && p == prop && state == IndexState::Populating),
+            "and it must not flip the DURABLE state either — that would survive the restart that \
+             would otherwise have repaired it"
+        );
+        // The index is withheld from the planner, so the query is served by the (correct) scan.
+        assert!(
+            !format!(
+                "{:?}",
+                compile(&coord, "MATCH (a:Article {slug: 'a1'}) RETURN id(a) AS id")
+            )
+            .contains("NodeIndexSeek"),
+            "a degraded engine must not plan a seek against an empty tree"
+        );
+        assert_eq!(slug_rows(&mut coord, "a1"), 1, "and the row is still found");
+    }
+
+    /// **(B4 ii / BLOCKER 2.)** While degraded, `SHOW INDEXES` must never report `ONLINE` — not even for
+    /// an index the recovery promotion would previously have flipped.
+    #[test]
+    fn show_indexes_never_reports_online_while_degraded() {
+        let mut coord = fresh_coord();
+        seed(&mut coord, 50);
+        coord
+            .begin_online_node_property_index("Article", "slug")
+            .expect("declare the online index");
+        coord.index.borrow_mut().fail_closed();
+        let next = TxnCoordinator::promote_recovered_populating_indexes(
+            &coord.store,
+            &coord.index,
+            coord.next_txn_id,
+        );
+        coord.next_txn_id = next;
+
+        assert!(
+            coord
+                .list_node_property_indexes()
+                .iter()
+                .all(|(_, _, _, state)| *state == IndexState::Populating),
+            "a degraded engine must not report any index ONLINE: {:?}",
+            coord.list_node_property_indexes()
+        );
+        assert!(
+            !coord.label_lookup_usable(),
+            "and the LOOKUP row must report the label index as unusable too"
+        );
+    }
+
+    /// **(V2 — the `poison_backoff` shift clamp.)** `poison_backoff` computes `2^(attempts-1)` to widen
+    /// the poisoned-build resurrection backoff. `attempts` is an unbounded `u32` (it grows once per
+    /// failed resurrection over the life of a coordinator), and `1u32 << shift` is **undefined for
+    /// `shift >= 32`** — in a debug build it panics `attempt to shift left with overflow`, aborting the
+    /// engine thread on a merely-degraded (still-correct) store. The `(attempts - 1).min(31)` clamp is
+    /// what makes it total; this pins that clamp.
+    ///
+    /// Reverting the clamp (`(attempts - 1)` without `.min(31)`) makes the extreme-`attempts` calls below
+    /// panic, so this test FAILS — the non-vacuity proof for the clamp.
+    #[test]
+    fn poison_backoff_is_total_monotone_and_saturating() {
+        use super::{MAX_DEGRADED_RETRY_BACKOFF, poison_backoff};
+
+        // (a) It never panics for ANY attempts value — including every shift boundary and the extremes
+        // that would overflow `1u32 << shift` without the clamp (33 ⇒ shift 32, u32::MAX ⇒ shift huge).
+        for attempts in [0u32, 1, 2, 17, 18, 19, 31, 32, 33, 63, 64, 1_000, u32::MAX] {
+            let b = poison_backoff(attempts);
+            assert!(
+                b <= MAX_DEGRADED_RETRY_BACKOFF,
+                "poison_backoff({attempts}) = {b} exceeds the cap {MAX_DEGRADED_RETRY_BACKOFF}"
+            );
+        }
+
+        // (b) The documented early values, then monotone non-decreasing across a full sweep, saturating
+        // at the cap (never above it).
+        assert_eq!(poison_backoff(0), 0, "attempts 0 is a defensive no-skip");
+        assert_eq!(poison_backoff(1), 1, "the first re-poison waits 1 drain");
+        assert_eq!(poison_backoff(2), 2);
+        assert_eq!(poison_backoff(3), 4);
+        let mut prev = 0u32;
+        for attempts in 0..=64u32 {
+            let b = poison_backoff(attempts);
+            assert!(
+                b >= prev,
+                "poison_backoff must be monotone: {attempts} gave {b} < previous {prev}"
+            );
+            assert!(b <= MAX_DEGRADED_RETRY_BACKOFF);
+            prev = b;
+        }
+
+        // (c) Once the geometric growth reaches the cap it STAYS there for every larger `attempts` — no
+        // wrap, no UB, no dip. The cap is 2^18, so it is first reached at attempts = 19 (shift 18).
+        assert_eq!(
+            poison_backoff(19),
+            MAX_DEGRADED_RETRY_BACKOFF,
+            "cap first reached at 19"
+        );
+        for attempts in [19u32, 20, 32, 33, 64, 100, 1_000, u32::MAX] {
+            assert_eq!(
+                poison_backoff(attempts),
+                MAX_DEGRADED_RETRY_BACKOFF,
+                "poison_backoff({attempts}) must saturate at the cap, not overflow or wrap"
+            );
+        }
     }
 }

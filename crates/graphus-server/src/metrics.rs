@@ -258,6 +258,19 @@ pub struct Metrics {
     /// version slots stop being reclaimed while writes accrue, a slow-motion OOM. Engine-thread-only
     /// writer (the maintenance pass runs only on the engine thread), so unpadded.
     maintenance_failures: AtomicU64,
+    /// Cumulative times a database's derived indexes were **wiped fail-closed** because a storage fault
+    /// made them untrustworthy (`rmp` task #733). The engine stays CORRECT (every read path drops to the
+    /// exact store scan and the affected indexes stop reporting `ONLINE`), but it is running
+    /// unaccelerated and something is wrong with the disk — so this must be alertable. A rise that is
+    /// not followed by a return to a healthy engine means the rebuild retries keep faulting.
+    /// Engine-thread-only writer (a fail-closed can only happen inside an index rebuild, which runs on
+    /// the engine thread), so unpadded.
+    index_fail_closed: AtomicU64,
+    /// Cumulative index builds **poisoned** by a storage fault (`rmp` task #733, M1): the build could not
+    /// get past an unreadable entity and was parked, leaving its index `Populating` — correct (every
+    /// reader is on the exact scan) but unaccelerated — until the store reads cleanly again and the build
+    /// is resurrected. A rise means an index silently stopped being built. Engine-thread-only writer.
+    index_builds_poisoned: AtomicU64,
     // NOTE (`rmp` #435): the reclamation-degraded *gating* gauge that used to live here was a single
     // shared `AtomicU64`, so one database's `K` consecutive maintenance failures flagged the WHOLE node
     // not-ready (and any other database's checkpoint success false-cleared a still-stuck flag). It is
@@ -377,6 +390,8 @@ impl Metrics {
             maintenance_versions_reclaimed: AtomicU64::new(0),
             maintenance_stamps_frozen: AtomicU64::new(0),
             maintenance_failures: AtomicU64::new(0),
+            index_fail_closed: AtomicU64::new(0),
+            index_builds_poisoned: AtomicU64::new(0),
             statement_panics: CachePad::new(0),
             egress_stall_aborts: CachePad::new(0),
             ssi_tracked: AtomicU64::new(0),
@@ -435,6 +450,20 @@ impl Metrics {
     /// means reclamation has stalled, so the count must be observable for alerting.
     pub fn record_maintenance_failure(&self) {
         self.maintenance_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records `n` new **index fail-closed** events (`rmp` task #733): a storage fault made a database's
+    /// derived indexes untrustworthy and the engine wiped them, dropping every read path to the exact
+    /// (correct, unaccelerated) store scan. Queries stay right; the engine is degraded and the disk is
+    /// suspect, so this is an alerting signal, not a debug detail.
+    pub fn record_index_fail_closed(&self, n: u64) {
+        self.index_fail_closed.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Records `n` newly **poisoned** index builds (`rmp` task #733, M1) — a build a storage fault stopped
+    /// for good, leaving its index `Populating` until the store reads cleanly again.
+    pub fn record_index_builds_poisoned(&self, n: u64) {
+        self.index_builds_poisoned.fetch_add(n, Ordering::Relaxed);
     }
 
     /// Records a committed transaction.
@@ -865,6 +894,20 @@ impl Metrics {
             "graphus_maintenance_failures_total",
             "Background maintenance checkpoints that failed (reclamation stalled — rmp #394).",
             self.maintenance_failures.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "graphus_index_builds_poisoned_total",
+            "Index builds stopped by a storage fault and parked; their index stays POPULATING (queries \
+             correct but unaccelerated) until the store reads cleanly again (rmp #733).",
+            self.index_builds_poisoned.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "graphus_index_fail_closed_total",
+            "Times a storage fault made the derived indexes untrustworthy and they were wiped \
+             fail-closed — queries stay correct but run unaccelerated (rmp #733).",
+            self.index_fail_closed.load(Ordering::Relaxed),
         );
         // NOTE (`rmp` #435): the former `graphus_maintenance_degraded` node-wide gauge was removed —
         // reclamation degradation is now a **per-engine** gate surfaced through `/health/ready`'s

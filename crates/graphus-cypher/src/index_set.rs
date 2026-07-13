@@ -185,6 +185,21 @@ pub struct IndexSet {
     /// **candidate source** (not a read-only accelerator), it is kept membership-exact under writes by
     /// the wholesale per-node re-index in [`RecordStoreGraph::reindex_node`](crate::record_graph).
     bitmap: HashMap<(u32, u32), BitmapIndex>,
+    /// The **declared** bitmap columns (`rmp` task #733, M2), independent of whether a live
+    /// [`BitmapIndex`] is currently registered for them in [`bitmap`](Self#structfield.bitmap).
+    ///
+    /// A bitmap column is opt-in and **has no durable catalog entry**: it is declared in-session. So when
+    /// [`fail_closed`](Self::fail_closed) unregisters the live bitmaps — which it must, since a bitmap is
+    /// a *membership-exact* candidate source and an empty one answers every seek with zero rows — there
+    /// is nothing on disk for a rebuild to re-register from, and the declaration would be lost **for the
+    /// life of the process**: every bitmap column silently gone after the first storage fault, with no
+    /// way back short of a restart. Keeping the declarations here (they are two tokens, not data) lets
+    /// the next rebuild re-register and repopulate exactly the columns the session asked for.
+    ///
+    /// Only an explicit drop ([`unregister_bitmap`](Self::unregister_bitmap)) removes a declaration; the
+    /// fail-closed paths use [`disable_bitmap`](Self::disable_bitmap), which retires the live index but
+    /// keeps the declaration so a rebuild can restore it.
+    bitmap_declared: BTreeSet<(u32, u32)>,
     /// **Per-transaction set of node ids whose bitmap entry this transaction touched** (`rmp` task
     /// #453, F-IDX-3). The bitmap is maintained *eagerly* during statement execution (remove-then-
     /// reinsert on a property/label change), but a transaction **abort** rolls back only the durable
@@ -249,6 +264,74 @@ pub struct IndexSet {
     /// store-consistent rebuild) clears it. Conservative (it disables the fast path after a full-text/
     /// spatial-mutating rollback) but never returns a wrong answer.
     ft_spatial_poisoned: bool,
+    /// Whether the **label** [`TokenIndex`] ([`labels`](Self#structfield.labels)) may be trusted as the
+    /// authoritative candidate source for a label scan (`rmp` task #733).
+    ///
+    /// The label index underpins **every** fallback in the engine: `scan_nodes_by_label` is what an
+    /// index seek degrades *to*, and what `MATCH (n:Label)` compiles to. Unlike the property indexes it
+    /// carries no per-index [`IndexState`] — it is not declared, it simply exists — so nothing else could
+    /// express "this is not usable". That made it the deepest instance of the empty-but-trusted hazard:
+    /// [`clear`](Self::clear) empties it at the start of a rebuild, so a rebuild whose store scan then
+    /// faulted left it **empty and trusted**, and every label scan in the process returned ZERO ROWS —
+    /// including the very scan fallbacks that are supposed to rescue the other index kinds.
+    ///
+    /// `false` makes the label-scan seam bypass the index and enumerate the store directly
+    /// (`scan_node_ids` + the per-node inline label bitmap re-check — exactly what the standalone,
+    /// index-free path does), which is always correct, just unaccelerated. Set by
+    /// [`fail_closed`](Self::fail_closed); restored by [`clear`](Self::clear), which every rebuild calls
+    /// immediately before refilling the index.
+    labels_usable: bool,
+    /// Whether the build currently filling this index **skipped an entity it could not read**
+    /// (`rmp` task #733).
+    ///
+    /// The per-entity indexing helpers (`TxnCoordinator::index_one_node` and friends) are *best-effort*:
+    /// a read fault on one node or relationship skips it and carries on. That stance is sound for a
+    /// **populated** index — a missing candidate merely degrades that entity to a re-check — but it is
+    /// **not** sound for the entity's presence in the index at all: a seek can only *drop* candidates
+    /// the index returns, never resurrect one it never returned. A node skipped by the rebuild is
+    /// therefore missing from the label index (invisible to every `MATCH (n:Label)`) and from every
+    /// property index (invisible to every seek) for the life of the process — a committed row silently
+    /// lost to queries.
+    ///
+    /// So the helpers now *record* the gap here instead of hiding it, and the build that drove them
+    /// refuses to publish an index it knows is incomplete: a full rebuild goes
+    /// [`fail_closed`](Self::fail_closed), and an incremental build declines to promote itself `Online`.
+    /// Cleared by [`clear`](Self::clear) (a fresh rebuild starts clean) and by
+    /// [`clear_rebuild_gap`](Self::clear_rebuild_gap).
+    rebuild_gap: bool,
+    /// How many times this index set has been **wiped** by [`fail_closed`](Self::fail_closed)
+    /// (`rmp` task #733) — an epoch counter that invalidates work computed against a previous epoch.
+    ///
+    /// The incremental index builds live in the **coordinator** (`pending_builds` and friends), not
+    /// here, so `fail_closed` cannot reach them: it can empty a half-built tree, but it cannot tell the
+    /// build that its progress is gone. Without this counter an in-flight build resumed **from its old
+    /// cursor** over a now-empty tree, indexed only the TAIL of its snapshot, and promoted itself
+    /// `Online` holding a fraction of the rows — an `Online` index missing committed rows, which is
+    /// exactly the state `rmp` #733 exists to make impossible. (Worse than a wrong query: the
+    /// uniqueness / node-key duplicate checks trust that tree as an EXACT candidate source, so a hole in
+    /// it lets a `IS UNIQUE` constraint accept a duplicate.) The full-text and spatial builds escaped
+    /// only by accident, via the `rmp` #467 marker poison; the node-property B-tree has no such marker.
+    ///
+    /// Each pending build records the epoch it is indexing into; when it observes a different epoch it
+    /// restarts from cursor `0` over the same snapshot. Restarting is sound: the snapshot only ever
+    /// needed to cover the rows that existed at build start, and writes since then are maintained by
+    /// [`RecordStoreGraph::reindex_node`](crate::record_graph), which gates on *registration* (which
+    /// `fail_closed` preserves for the state-carrying kinds), not on state. Re-indexing a node that is
+    /// already in the tree is idempotent.
+    wipe_generation: u64,
+    /// How many times [`fail_closed`](Self::fail_closed) has fired over this index set's life
+    /// (`rmp` task #733) — the observability counter. A fail-closed is a **serious** event (a storage
+    /// fault made the derived indexes untrustworthy and the engine dropped to scans), so the server
+    /// polls this to log it at `ERROR` and expose it as a metric: silent degradation would otherwise
+    /// look identical to a healthy-but-slow engine.
+    fail_closed_events: u64,
+    /// Whether the index set is currently **degraded** — wiped by [`fail_closed`](Self::fail_closed)
+    /// and not yet repaired by a successful rebuild (`rmp` task #733). Read by the engine so it can
+    /// retry the rebuild (self-healing rather than staying degraded until restart), and by the schema
+    /// surfaces so `SHOW INDEXES` reports the **effective** state instead of the durable catalog's
+    /// stale `ONLINE`. Cleared by [`heal`](Self::heal), which a rebuild calls once it completes with no
+    /// gap.
+    degraded: bool,
     /// Transient "a registered full-text/spatial posting changed during the current statement" flag,
     /// set by the structural mutation methods and consumed by
     /// [`note_ft_spatial_mutator`](Self::note_ft_spatial_mutator) (the statement seam, which knows the
@@ -434,7 +517,15 @@ impl IndexSet {
             composite: HashMap::new(),
             rel_composite: HashMap::new(),
             bitmap: HashMap::new(),
+            bitmap_declared: BTreeSet::new(),
             dirty_bitmap_nodes: HashMap::new(),
+            // A fresh label index is consistent with a fresh (empty) store, so it is usable; only a
+            // failed rebuild makes it untrustworthy (`rmp` task #733).
+            labels_usable: true,
+            rebuild_gap: false,
+            wipe_generation: 0,
+            fail_closed_events: 0,
+            degraded: false,
             // A fresh, empty index reflects committed state at the genesis timestamp: there is nothing
             // indexed and no mutator in flight, so every reader may trust it (`ts >= 0` always holds).
             ft_spatial_trustworthy_from: Timestamp(0),
@@ -777,6 +868,13 @@ impl IndexSet {
     /// and a uniqueness constraint's data lives in the node-property index that `clear` resets above.
     pub fn clear(&mut self) {
         self.labels = TokenIndex::new(fresh_tree());
+        // The caller (a rebuild) is about to refill the label index from the store, so it becomes
+        // trustworthy again — unless that rebuild fails, in which case `fail_closed` marks it unusable
+        // (`rmp` task #733). Restoring it here is what lets a successful rebuild heal a prior failure.
+        self.labels_usable = true;
+        // A fresh rebuild starts with no known gap; the per-entity helpers raise it if they must skip an
+        // entity they cannot read.
+        self.rebuild_gap = false;
         for np in self.node_props.values_mut() {
             np.index = PropertyIndex::new(fresh_tree());
         }
@@ -838,6 +936,162 @@ impl IndexSet {
         // A full rebuild re-derives every bitmap from the committed store, so any pending per-txn
         // abort-repair tracking (`rmp` #453) is moot — drop it so a stale txn id can never leak.
         self.dirty_bitmap_nodes.clear();
+    }
+
+    /// **Fail-closed**: makes every derived index unusable for reads after a rebuild could not be
+    /// completed (`rmp` task #733).
+    ///
+    /// # The hazard this closes
+    ///
+    /// [`clear`](Self::clear) drops every index's *entries* but deliberately keeps its *registration
+    /// and state*, because the caller ([`TxnCoordinator::rebuild_index`](crate::coordinator)) is about
+    /// to refill it from a store scan. If that scan **fails** (a storage fault), the caller is left
+    /// holding indexes that are registered, `Online` — and **empty**. An empty `Online` index is the
+    /// worst possible state: the planner keeps routing seeks to it, the write-path uniqueness /
+    /// node-key checks keep consulting it, and the full-text procedure keeps reading its postings — all
+    /// of which then return **zero rows, silently**. Silent false negatives are an ACID-correctness
+    /// defect (a committed row that a query cannot see), not a performance regression.
+    ///
+    /// # What it does
+    ///
+    /// Every index kind is made *unusable* rather than *empty*, so every consumer degrades to the
+    /// always-correct store scan (the same fallback the `rmp` #467 stale-reader gate uses):
+    ///
+    /// - The **state-carrying** kinds (node/relationship property, node/relationship full-text,
+    ///   node/relationship spatial, text, node/relationship vector) are demoted to
+    ///   [`IndexState::Populating`]. That withholds them from the planner's catalog (`online_*`) and —
+    ///   since `rmp` #733 — from every `RecordStoreGraph` read seam, which now declines to the scan
+    ///   unless the index is `Online`.
+    /// - The **state-less** candidate sources (node/relationship composite, bitmap) are
+    ///   **unregistered**, because they have no state to demote and their consumers gate on
+    ///   registration alone (`has_composite` / `has_bitmap`). Leaving an empty composite registered
+    ///   would silently break node-key duplicate detection, which trusts it as an exact candidate
+    ///   source.
+    /// - The cross-snapshot full-text/spatial marker is **poisoned**, so even a reader that somehow
+    ///   reaches a latest-state index declines to the scan.
+    ///
+    /// The *durable* catalog is untouched: the schema still exists (`SHOW INDEXES` reads the store, so
+    /// it keeps reporting the declared indexes and their durable state), and the next successful
+    /// rebuild — triggered by any index/constraint DDL, or by re-opening the store — re-registers every
+    /// index from the durable catalog and repopulates it, restoring the fast paths. Demoting the
+    /// durable state instead would require writing to a store that has just faulted, so it is
+    /// deliberately not attempted.
+    pub fn fail_closed(&mut self) {
+        // A new epoch: every derived structure below is about to become untrustworthy, so any work
+        // computed against the previous epoch — above all an **in-flight incremental build**, which
+        // lives in the coordinator and cannot be reached from here — must revalidate itself and start
+        // over rather than resume over the wreckage (`rmp` task #733).
+        self.wipe_generation = self.wipe_generation.wrapping_add(1);
+        self.fail_closed_events = self.fail_closed_events.saturating_add(1);
+        self.degraded = true;
+        // The label index first: it is the base of EVERY fallback (a declined seek degrades to a label
+        // scan), so an empty-but-trusted label index would make even the rescue path return zero rows.
+        self.labels_usable = false;
+        for np in self.node_props.values_mut() {
+            np.state = IndexState::Populating;
+        }
+        for rp in self.rel_props.values_mut() {
+            rp.state = IndexState::Populating;
+        }
+        for ft in self.fulltext.values_mut() {
+            ft.state = IndexState::Populating;
+        }
+        for ft in self.fulltext_rel.values_mut() {
+            ft.state = IndexState::Populating;
+        }
+        for sp in self.spatial.values_mut() {
+            sp.state = IndexState::Populating;
+        }
+        for sp in self.spatial_rel.values_mut() {
+            sp.state = IndexState::Populating;
+        }
+        for tx in self.text.values_mut() {
+            tx.state = IndexState::Populating;
+        }
+        for v in self.vector.values_mut() {
+            v.state = IndexState::Populating;
+        }
+        for v in self.vector_rel.values_mut() {
+            v.state = IndexState::Populating;
+        }
+        // State-less candidate sources: unregister (their consumers gate on registration, not state).
+        self.composite.clear();
+        self.rel_composite.clear();
+        // The bitmaps are RETIRED, not dropped: their live indexes go (an empty membership-exact index
+        // would answer every seek with zero rows) but their **declarations** survive in
+        // `bitmap_declared`, because a bitmap column has no durable catalog entry for a rebuild to
+        // recover it from — dropping them here lost every declared column for the life of the process
+        // (`rmp` task #733, M2). The next successful rebuild re-registers and repopulates them.
+        self.bitmap.clear();
+        self.dirty_bitmap_nodes.clear();
+        // And force every latest-state reader onto the scan path too (`rmp` #467's poison).
+        self.poison_ft_spatial_marker();
+        // The gap (if any) has been acted upon: everything it could have made incomplete is now unusable.
+        self.rebuild_gap = false;
+    }
+
+    /// Whether the **label** index may be trusted as the authoritative candidate source for a label scan
+    /// (`rmp` task #733). `false` after a failed rebuild left it empty: the label-scan seam must then
+    /// enumerate the store directly instead (see
+    /// [`labels_usable`](Self#structfield.labels_usable)).
+    #[must_use]
+    pub fn labels_usable(&self) -> bool {
+        self.labels_usable
+    }
+
+    /// Records that the build currently filling this index **had to skip an entity it could not read**
+    /// (`rmp` task #733) — see [`rebuild_gap`](Self#structfield.rebuild_gap). Called by the per-entity
+    /// indexing helpers in place of silently swallowing the read fault.
+    pub fn note_rebuild_gap(&mut self) {
+        self.rebuild_gap = true;
+    }
+
+    /// Whether the build currently filling this index skipped an entity — i.e. whether the index is known
+    /// to be an **incomplete** image of the store, and so must not be published (`rmp` task #733).
+    #[must_use]
+    pub fn rebuild_gap(&self) -> bool {
+        self.rebuild_gap
+    }
+
+    /// Clears the gap flag, so a build can start from a known-clean slate (`rmp` task #733). Used by the
+    /// synchronous / incremental builds that do not go through [`clear`](Self::clear).
+    pub fn clear_rebuild_gap(&mut self) {
+        self.rebuild_gap = false;
+    }
+
+    /// The current **wipe epoch** (`rmp` task #733): incremented by every
+    /// [`fail_closed`](Self::fail_closed). An incremental build records the epoch it is indexing into
+    /// and restarts from scratch when it observes a different one — see
+    /// [`wipe_generation`](Self#structfield.wipe_generation) for why resuming would publish an `Online`
+    /// index missing rows.
+    #[must_use]
+    pub fn wipe_generation(&self) -> u64 {
+        self.wipe_generation
+    }
+
+    /// Whether the index set is currently **degraded**: wiped by [`fail_closed`](Self::fail_closed) and
+    /// not yet repaired by a successful rebuild (`rmp` task #733). While degraded, every read path is on
+    /// the (correct, unaccelerated) scan, `SHOW INDEXES` must report the effective state rather than the
+    /// durable catalog's `ONLINE`, and the engine should keep retrying the rebuild.
+    #[must_use]
+    pub fn is_degraded(&self) -> bool {
+        self.degraded
+    }
+
+    /// How many times [`fail_closed`](Self::fail_closed) has fired (`rmp` task #733) — monotonic. The
+    /// server samples it to log the transition at `ERROR` and drive a metric; a jump means a storage
+    /// fault just cost the engine its derived indexes.
+    #[must_use]
+    pub fn fail_closed_events(&self) -> u64 {
+        self.fail_closed_events
+    }
+
+    /// Marks the index set **repaired** (`rmp` task #733): called by a rebuild that completed with no
+    /// whole-scan fault and no per-entity gap, i.e. one whose result is a faithful image of the store.
+    /// Clears the degraded flag (the fast paths are trustworthy again); the epoch counter is *not*
+    /// touched, since a build that was invalidated must still restart.
+    pub fn heal(&mut self) {
+        self.degraded = false;
     }
 
     /// Records that node `node_id` carries label `label_token` (a candidate for label scans).
@@ -2432,6 +2686,21 @@ impl IndexSet {
         }
     }
 
+    /// Poisons the full-text/spatial freshness marker unconditionally — no transaction involved
+    /// (`rmp` task #733): [`effective_ft_spatial_marker`](Self::effective_ft_spatial_marker) is pinned
+    /// at `u64::MAX`, so **every** reader declines to the always-correct scan path until a full
+    /// [`reset_ft_spatial_marker`](Self::reset_ft_spatial_marker) rebuilds the latest-state indexes.
+    ///
+    /// Where [`rollback_ft_spatial_marker`](Self::rollback_ft_spatial_marker) poisons because a *writer*
+    /// left possibly-stale postings behind, this poisons because the *index itself* is known to be
+    /// untrustworthy: a rebuild whose store scan faulted leaves the inverted indexes / grids empty (see
+    /// [`fail_closed`](Self::fail_closed)). Both reach the same conclusion — the in-memory index is not
+    /// transactional and cannot be repaired in place, so the only provably-correct response is to stop
+    /// reading it.
+    pub fn poison_ft_spatial_marker(&mut self) {
+        self.ft_spatial_poisoned = true;
+    }
+
     /// Raises the committed full-text/spatial marker to at least `ts` after an **incremental online
     /// build** chunk, and discards the build's dirty flag (`rmp` task #467).
     ///
@@ -2481,12 +2750,43 @@ impl IndexSet {
     /// coordinator rebuild and kept membership-exact by the per-write re-index.
     pub fn register_bitmap(&mut self, label_token: u32, prop_key: u32) {
         self.bitmap.entry((label_token, prop_key)).or_default();
+        // Remember the *declaration* too, so a fail-closed (which retires the live bitmap) cannot lose
+        // the column for the life of the process — a bitmap has no durable catalog to recover it from
+        // (`rmp` task #733, M2).
+        self.bitmap_declared.insert((label_token, prop_key));
     }
 
-    /// Unregisters the bitmap index on `(label_token, prop_key)`, dropping its bitmaps. A no-op if
-    /// none is registered.
+    /// **Drops** the bitmap index on `(label_token, prop_key)`: its bitmaps *and* its declaration, so no
+    /// rebuild will bring it back. A no-op if none is registered. This is the explicit-drop path — a
+    /// fail-closed must use [`disable_bitmap`](Self::disable_bitmap) instead.
     pub fn unregister_bitmap(&mut self, label_token: u32, prop_key: u32) {
         self.bitmap.remove(&(label_token, prop_key));
+        self.bitmap_declared.remove(&(label_token, prop_key));
+    }
+
+    /// **Retires** the live bitmap on `(label_token, prop_key)` while KEEPING its declaration
+    /// (`rmp` task #733, M2): the column stops answering seeks immediately (its consumers gate on
+    /// registration, and a membership-exact index with a hole in it is worse than none), but the next
+    /// successful rebuild re-registers and repopulates it from the store. The fail-closed path for a
+    /// bitmap.
+    pub fn disable_bitmap(&mut self, label_token: u32, prop_key: u32) {
+        self.bitmap.remove(&(label_token, prop_key));
+    }
+
+    /// The bitmap columns this session **declared**, whether or not a live bitmap is registered for them
+    /// right now (`rmp` task #733, M2). A rebuild re-registers exactly these, so a column retired by a
+    /// fail-closed comes back once the store is readable again.
+    #[must_use]
+    pub fn declared_bitmaps(&self) -> Vec<(u32, u32)> {
+        self.bitmap_declared.iter().copied().collect()
+    }
+
+    /// Re-registers every **declared** bitmap column that has no live index (`rmp` task #733, M2), so the
+    /// rebuild's store scan repopulates it. Called by the rebuild right after [`clear`](Self::clear).
+    pub fn reregister_declared_bitmaps(&mut self) {
+        for key in self.bitmap_declared.clone() {
+            self.bitmap.entry(key).or_default();
+        }
     }
 
     /// Whether a bitmap index is registered for `(label_token, prop_key)`.
@@ -3499,6 +3799,103 @@ mod tests {
         set.unregister_text(1, 5);
         assert!(!set.has_text(1, 5));
         assert!(set.registered_text().is_empty());
+    }
+
+    /// `fail_closed` must make **every** index unusable — not merely empty (`rmp` task #733). An empty
+    /// index that still answers is the worst possible state: it returns zero rows, silently.
+    #[test]
+    fn fail_closed_makes_every_index_unusable() {
+        let mut set = IndexSet::new();
+        set.register_node_property_with_state(1, 5, IndexState::Online);
+        set.register_rel_property_with_state(2, 5, IndexState::Online);
+        set.register_fulltext(
+            "ft",
+            vec![1],
+            vec![5],
+            Analyzer::Standard,
+            IndexState::Online,
+        );
+        set.register_fulltext_rel(
+            "ftr",
+            vec![2],
+            vec![5],
+            Analyzer::Standard,
+            IndexState::Online,
+        );
+        set.register_spatial(1, 6, 1.0, IndexState::Online);
+        set.register_spatial_rel(2, 6, 1.0, IndexState::Online);
+        set.register_text(1, 5, IndexState::Online);
+        set.register_vector(1, 7, 3, Similarity::Cosine, 16, 100, IndexState::Online);
+        set.register_vector_rel(2, 7, 3, Similarity::Cosine, 16, 100, IndexState::Online);
+        set.register_composite(1, vec![5, 6]);
+        set.register_rel_composite(2, vec![5, 6]);
+        set.register_bitmap(1, 8);
+        set.insert_label(1, 100);
+        assert!(set.labels_usable());
+
+        set.fail_closed();
+
+        // The state-carrying kinds are demoted out of `Online`, so the planner's `online_*` surfaces —
+        // and, since `rmp` #733, the read seams themselves — decline them.
+        assert!(set.online_node_properties().is_empty());
+        assert!(set.online_rel_properties().is_empty());
+        assert_eq!(set.fulltext_state("ft"), Some(IndexState::Populating));
+        assert_eq!(set.fulltext_rel_state("ftr"), Some(IndexState::Populating));
+        assert!(set.online_spatial().is_empty());
+        assert!(set.online_spatial_rel().is_empty());
+        assert!(set.online_text().is_empty());
+        assert!(set.online_vector().is_empty());
+        assert!(set.online_vector_rel().is_empty());
+        // The state-less candidate sources are unregistered: their consumers gate on registration, and a
+        // node-key duplicate check trusts the composite tree as EXACT (an empty one would admit a
+        // duplicate).
+        assert!(!set.has_composite(1, &[5, 6]));
+        assert!(!set.has_rel_composite(2, &[5, 6]));
+        assert!(!set.has_bitmap(1, 8));
+        // The label index — the base of every scan fallback — is no longer trusted, so a label scan
+        // enumerates the store instead of reading an empty index.
+        assert!(!set.labels_usable());
+        // And every latest-state reader is forced onto the scan path.
+        assert_eq!(set.effective_ft_spatial_marker(), Timestamp(u64::MAX));
+
+        // The wipe is an EPOCH change, and the degradation is observable (`rmp` task #733): an in-flight
+        // incremental build lives on the coordinator, out of reach from here, so the only way to stop it
+        // resuming over the wreckage — and publishing an `Online` index holding just the tail of its
+        // snapshot — is for it to notice that the epoch moved.
+        assert_eq!(set.wipe_generation(), 1, "fail_closed opens a new epoch");
+        assert!(set.is_degraded(), "the degradation must be observable");
+        assert_eq!(set.fail_closed_events(), 1, "and counted, for the metric");
+
+        // A later successful rebuild heals it: `clear` restores the label index's trust, and the
+        // registrations are re-established from the durable catalog by the caller.
+        set.clear();
+        assert!(set.labels_usable());
+        assert!(!set.rebuild_gap());
+        set.heal();
+        assert!(!set.is_degraded(), "a completed rebuild repairs the engine");
+        // The epoch does NOT rewind: a build invalidated by the wipe must still restart, even though the
+        // index set is healthy again.
+        assert_eq!(set.wipe_generation(), 1);
+        // A second wipe opens a second epoch (so a build cannot mistake it for the first).
+        set.fail_closed();
+        assert_eq!(set.wipe_generation(), 2);
+        assert_eq!(set.fail_closed_events(), 2);
+    }
+
+    /// A per-entity read fault during a build must be **recorded**, not swallowed: the build reads the
+    /// flag back and refuses to publish an index it knows has a hole in it (`rmp` task #733).
+    #[test]
+    fn a_rebuild_gap_is_recorded_and_cleared() {
+        let mut set = IndexSet::new();
+        assert!(!set.rebuild_gap());
+        set.note_rebuild_gap();
+        assert!(set.rebuild_gap());
+        set.clear_rebuild_gap();
+        assert!(!set.rebuild_gap());
+        // `fail_closed` consumes the gap (it has acted on it).
+        set.note_rebuild_gap();
+        set.fail_closed();
+        assert!(!set.rebuild_gap());
     }
 
     // ---- Vector (HNSW) index (`rmp` task #669) ------------------------------------------------
