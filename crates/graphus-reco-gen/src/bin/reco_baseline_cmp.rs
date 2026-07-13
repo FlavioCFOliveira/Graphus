@@ -85,6 +85,29 @@ fn main() -> ExitCode {
             d.degradation * 100.0,
         );
     }
+    // HONESTY: the perf/resource families above are UNGATED here (threshold = ∞), because an absolute
+    // baseline is host-specific and this suite runs on wildly different hardware (Pi 5 → Apple Silicon
+    // → x86). That is a deliberate choice, NOT a validated pass — so we print each perf delta as
+    // explicitly UNGATED evidence, rather than letting `GRAPHUS_BASELINE_OK` (which gates only the
+    // deterministic structural counts below) read as "performance verified" (rmp #743). A human — or a
+    // host-pinned CI gate — can still spot a gross regression in these numbers.
+    println!(
+        "PERF DELTAS vs baseline `{}` — UNGATED (host-variant; only the structural counts below gate):",
+        cmp.baseline_scenario
+    );
+    for d in &cmp.deltas {
+        println!(
+            "  ~ {}: {:.3} -> {:.3} ({:+.1}%){}",
+            d.metric,
+            d.baseline,
+            d.candidate,
+            d.fractional_change * 100.0,
+            if d.degradation > 0.0 { "  (worse)" } else { "" },
+        );
+    }
+    for s in &cmp.skipped {
+        println!("  ~ {}: SKIPPED — {}", s.metric, s.reason.as_str());
+    }
 
     // ----- 2) Exact structural counts (deterministic for a fixed seed + profile; must match). ------
     failed |= !check_exact_u64(

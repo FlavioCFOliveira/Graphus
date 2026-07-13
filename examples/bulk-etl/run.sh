@@ -645,6 +645,17 @@ EOF
       fi
     done
     info "online schema DDL applied: $SCHEMA_OK/$SCHEMA_TOTAL statement(s) accepted"
+    # The online DDL over the bulk-loaded data must SUCCEED on a current server. Swallowing a rejection
+    # into a "version gap" was a green tick that could never go red: a real defect in CREATE INDEX /
+    # constraint enforcement over bulk-imported nodes read as "older target", not a failure (rmp #743).
+    # Version-tolerance is retained ONLY behind an explicit GRAPHUS_TARGET_LEGACY=1 opt-out for attaching
+    # to a server that genuinely predates a DDL form.
+    if [ "${GRAPHUS_TARGET_LEGACY:-0}" = 1 ]; then
+      info "GRAPHUS_TARGET_LEGACY=1 — online DDL treated as best-effort (older target); not gated"
+    else
+      assert "online DDL over the loaded data was fully accepted ($SCHEMA_OK/$SCHEMA_TOTAL)" \
+        "$SCHEMA_TOTAL" "$SCHEMA_OK"
+    fi
     harness_target_query "$WIRE_DB" "SHOW CONSTRAINTS" > "$WIRE_EVIDENCE_DIR/schema_constraints.json" 2>/dev/null || true
     harness_target_query "$WIRE_DB" "SHOW INDEXES"     > "$WIRE_EVIDENCE_DIR/schema_indexes.json"     2>/dev/null || true
     assert "schema evidence captured (SHOW CONSTRAINTS/INDEXES over the loaded data)" "yes" \

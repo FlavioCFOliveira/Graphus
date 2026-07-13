@@ -822,13 +822,70 @@ fn wire_checks(
         "SHOW CONSTRAINTS YIELD name, type, entityType RETURN name, type, entityType",
         Vec::new(),
     )?;
+    // Verify the declared schema BY NAME, and that every declared index is actually ONLINE — not
+    // merely that "at least 3" rows exist. A count-only check passed even if a #694 index were stuck
+    // Populating (it is still a row), i.e. it could never catch the exact failure this example exists
+    // to expose (rmp #743). SHOW INDEXES columns are (name, type, entityType, state); SHOW CONSTRAINTS
+    // (name, type, entityType). Graphus renders an online index state as "ONLINE" (index_show.rs).
+    let schema_gaps = declared_schema_gaps(&idx, &cons);
     checks.push(WireCheck {
-        name: "SHOW INDEXES / SHOW CONSTRAINTS expose the declared schema".to_owned(),
-        ok: idx.len() >= 3 && cons.len() >= 3,
-        detail: format!("indexes={} constraints={}", idx.len(), cons.len()),
+        name: "every declared index/constraint is present by name and every index is ONLINE"
+            .to_owned(),
+        ok: schema_gaps.is_empty(),
+        detail: if schema_gaps.is_empty() {
+            format!(
+                "{} indexes ONLINE + {} constraints present (by name)",
+                EXPECTED_INDEXES.len(),
+                EXPECTED_CONSTRAINTS.len()
+            )
+        } else {
+            format!("schema gaps: {}", schema_gaps.join("; "))
+        },
     });
 
     Ok(checks)
+}
+
+/// The index names `Generator::schema_ddl` declares (see `crates/graphus-iot-gen/src/lib.rs`). Kept
+/// beside the gate that verifies them so the two cannot silently drift.
+const EXPECTED_INDEXES: [&str; 3] = ["sensor_location_point", "reading_sensor_seq", "reading_seq"];
+/// The constraint names `Generator::schema_ddl` declares.
+const EXPECTED_CONSTRAINTS: [&str; 3] = [
+    "sensor_id_key",
+    "reading_value_exists",
+    "reading_ts_integer",
+];
+
+/// Verify the declared IoT schema against a `SHOW INDEXES` / `SHOW CONSTRAINTS` result: every declared
+/// index must be present BY NAME and `ONLINE`, and every declared constraint present by name. Returns
+/// one human-readable gap per violation (empty ⇒ the schema is fully materialised). This is the gate
+/// (`rmp #743`) that a count-only `idx.len() >= 3` check could not be: a `#694` index stuck
+/// `Populating` is still a row, so counting passed while the index was unusable — this fails.
+fn declared_schema_gaps(idx: &[Vec<Value>], cons: &[Vec<Value>]) -> Vec<String> {
+    let cell = |row: &[Value], i: usize| -> String {
+        match row.get(i) {
+            Some(Value::String(s)) => s.clone(),
+            _ => String::new(),
+        }
+    };
+    let mut gaps: Vec<String> = Vec::new();
+    for name in EXPECTED_INDEXES {
+        match idx.iter().find(|row| cell(row, 0) == name) {
+            None => gaps.push(format!("index '{name}' ABSENT")),
+            Some(row) => {
+                let state = cell(row, 3);
+                if !state.eq_ignore_ascii_case("online") {
+                    gaps.push(format!("index '{name}' state='{state}' (not ONLINE)"));
+                }
+            }
+        }
+    }
+    for name in EXPECTED_CONSTRAINTS {
+        if !cons.iter().any(|row| cell(row, 0) == name) {
+            gaps.push(format!("constraint '{name}' ABSENT"));
+        }
+    }
+    gaps
 }
 
 // ==================================================================================================
@@ -997,6 +1054,72 @@ impl Args {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a `SHOW INDEXES`-shaped row `(name, type, entityType, state)`.
+    fn idx_row(name: &str, state: &str) -> Vec<Value> {
+        vec![
+            Value::String(name.to_owned()),
+            Value::String("RANGE".to_owned()),
+            Value::String("NODE".to_owned()),
+            Value::String(state.to_owned()),
+        ]
+    }
+    /// Build a `SHOW CONSTRAINTS`-shaped row `(name, type, entityType)`.
+    fn cons_row(name: &str) -> Vec<Value> {
+        vec![
+            Value::String(name.to_owned()),
+            Value::String("NODE_KEY".to_owned()),
+            Value::String("NODE".to_owned()),
+        ]
+    }
+    fn all_online() -> (Vec<Vec<Value>>, Vec<Vec<Value>>) {
+        (
+            EXPECTED_INDEXES
+                .iter()
+                .map(|n| idx_row(n, "ONLINE"))
+                .collect(),
+            EXPECTED_CONSTRAINTS.iter().map(|n| cons_row(n)).collect(),
+        )
+    }
+
+    /// The schema gate (`rmp #743`) must FIRE — not silently pass — when the declared schema is not
+    /// fully materialised. A count-only `idx.len() >= 3` check could never catch these.
+    #[test]
+    fn declared_schema_gate_is_falsifiable() {
+        // Healthy: every declared index ONLINE + every constraint present ⇒ no gaps.
+        let (idx, cons) = all_online();
+        assert!(declared_schema_gaps(&idx, &cons).is_empty());
+
+        // A #694 index stuck Populating is STILL A ROW (count-only passed) — this must fail.
+        let mut populating = idx.clone();
+        populating[1][3] = Value::String("POPULATING".to_owned());
+        let gaps = declared_schema_gaps(&populating, &cons);
+        assert_eq!(gaps.len(), 1);
+        assert!(gaps[0].contains("POPULATING"), "{gaps:?}");
+
+        // A missing index by name must fail (even though the row count could be topped up elsewhere).
+        let missing_idx: Vec<Vec<Value>> = idx.iter().skip(1).cloned().collect();
+        assert!(
+            declared_schema_gaps(&missing_idx, &cons)
+                .iter()
+                .any(|g| g.contains("ABSENT"))
+        );
+
+        // A missing constraint by name must fail.
+        let missing_cons: Vec<Vec<Value>> = cons.iter().skip(1).cloned().collect();
+        assert!(
+            declared_schema_gaps(&idx, &missing_cons)
+                .iter()
+                .any(|g| g.contains("ABSENT"))
+        );
+
+        // Case-insensitive ONLINE is accepted (defensive against renderer casing).
+        let lower: Vec<Vec<Value>> = EXPECTED_INDEXES
+            .iter()
+            .map(|n| idx_row(n, "Online"))
+            .collect();
+        assert!(declared_schema_gaps(&lower, &cons).is_empty());
+    }
 
     /// The restated PAGE_SIZE must match the engine's. This binary is client-only (it never links
     /// `graphus-io`), so the constant is pinned here against the documented value — a divergence would

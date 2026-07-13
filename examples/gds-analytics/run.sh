@@ -401,8 +401,6 @@ info "graphus-gds is MULTI-THREADED via a deterministic Execution knob (rmp #342
 RUN_START_MS="$(_harness_now_ms)"
 "$SWEEP" --out "$SWEEP_JSON" --sizes "$SWEEP_SIZES" --repeats 3 2>&1 | sed 's/^/  /'
 assert "sweep JSON was produced" "yes" "$([ -s "$SWEEP_JSON" ] && echo yes || echo no)"
-assert "sweep honestly reports a multi-threaded engine" "yes" \
-  "$(grep -q '"engine_parallelism": "multi-threaded' "$SWEEP_JSON" && echo yes || echo no)"
 assert "sweep reports CSR bytes-per-node / bytes-per-edge" "yes" \
   "$(grep -q 'bytes_per_node' "$SWEEP_JSON" && grep -q 'bytes_per_edge' "$SWEEP_JSON" && echo yes || echo no)"
 assert "parallelism demo results are deterministic across thread widths" "yes" \
@@ -410,6 +408,18 @@ assert "parallelism demo results are deterministic across thread widths" "yes" \
 HOST_CORES="$(json_field "$(cat "$SWEEP_JSON")" host_cores)"
 MAX_SPEEDUP="$(json_field "$(cat "$SWEEP_JSON")" max_speedup)"
 info "parallelism demo: host_cores=${HOST_CORES:-?}, best measured speedup=${MAX_SPEEDUP:-?}x"
+# Gate on the MEASURED speedup, not a constant string. The old gate grepped for the literal
+# '"engine_parallelism": "multi-threaded"' that gds_sweep ALWAYS prints — a green tick that could
+# never go red (README's own anti-pattern). A real regression to a serial engine collapses max_speedup
+# to ~1.0, so on a multi-core host we require a genuine parallel speedup; a 1-core host cannot speed up,
+# so the claim is skipped there rather than asserted vacuously (rmp #743).
+PARALLEL_MIN=1.5
+if [ -n "${HOST_CORES:-}" ] && [ "${HOST_CORES%%.*}" -gt 1 ] 2>/dev/null; then
+  assert "engine is genuinely multi-threaded: measured max_speedup > ${PARALLEL_MIN}x on ${HOST_CORES} cores" "yes" \
+    "$(awk -v s="${MAX_SPEEDUP:-0}" -v m="$PARALLEL_MIN" 'BEGIN{print (s+0 > m+0) ? "yes" : "no"}')"
+else
+  info "single-core host (host_cores=${HOST_CORES:-?}) — parallel-speedup claim not asserted (cannot speed up)"
+fi
 
 # --------------------------------------------------------------------------------------------------
 # Step 3 — decide whether to run the official-driver step
