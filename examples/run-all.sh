@@ -155,6 +155,15 @@ for ex in examples:
             bad.append(f"{rel}: schema v{report.get('version')} — pre-#711 (zero placeholders)")
             continue
         for section in ("cpu", "memory", "storage", "throughput"):
+            # A present-but-EMPTY vector object is the sibling of a zero placeholder (`rmp` #740): an
+            # unmeasured vector must be ABSENT from the report, not `{}`. A `{}` reads as "measured,
+            # and it was empty" and, worse, iterates to zero keys so the zero-placeholder scan below
+            # never sees it. Fail the suite on it explicitly. (`throughput` is measured client-side even
+            # in external mode, so only cpu/memory/storage are ever legitimately absent — but the rule
+            # is uniform: if the key is present it must carry at least one measured field.)
+            if section in report and not report[section]:
+                bad.append(f"{rel}: {section} = {{}} — a present-but-empty vector object for an "
+                           f"unmeasured section (schema 3+ OMITS what it did not measure; #740)")
             contents = report.get(section) or {}
             for key, value in contents.items():
                 if (section, key) in LEGITIMATELY_ZERO:

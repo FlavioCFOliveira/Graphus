@@ -773,13 +773,20 @@ pub struct EvidenceReport {
     pub total_millis: f64,
     /// Per-phase wall-clock timings, in the order phases were recorded.
     pub phases: Vec<PhaseTiming>,
-    /// CPU evidence.
+    /// CPU evidence. **Omitted entirely when unmeasured** (e.g. an external target, whose process is
+    /// not on this host) — an absent section reads as "not measured", whereas a present-but-empty
+    /// `{}` reads as "measured, and it was empty". See the crate docs' evidence-honesty rule. The
+    /// `#[serde(default)]` keeps an older report that carries the section deserializing leniently.
+    #[serde(default, skip_serializing_if = "CpuSection::is_unmeasured")]
     pub cpu: CpuSection,
-    /// Peak / final memory (RSS) evidence.
+    /// Peak / final memory (RSS) evidence. Omitted entirely when unmeasured (see [`Self::cpu`]).
+    #[serde(default, skip_serializing_if = "MemorySection::is_unmeasured")]
     pub memory: MemorySection,
-    /// Storage footprint + amplification evidence.
+    /// Storage footprint + amplification evidence. Omitted entirely when unmeasured (see [`Self::cpu`]).
+    #[serde(default, skip_serializing_if = "StorageSection::is_unmeasured")]
     pub storage: StorageSection,
-    /// Throughput + latency-percentile evidence.
+    /// Throughput + latency-percentile evidence. Omitted entirely when unmeasured (see [`Self::cpu`]).
+    #[serde(default, skip_serializing_if = "ThroughputSection::is_unmeasured")]
     pub throughput: ThroughputSection,
     /// Where this run's server-side evidence was collected from — **local** (this host) or
     /// **external** (a remote instance via `/metrics` only). Additive field (`rmp #684`,
@@ -1820,9 +1827,11 @@ mod tests {
         assert!(report.host.cpu_cores >= 1);
     }
 
-    /// **Regression (`rmp #711`).** A collector nobody fed measures nothing, and a report of nothing
-    /// must SAY nothing — every metric absent, and NOT ONE `0` / `0.0` in the emitted JSON that a
-    /// reader could take for a measurement.
+    /// **Regression (`rmp #711`, strengthened by `#740`).** A collector nobody fed measures nothing,
+    /// and a report of nothing must SAY nothing. #711 made every metric absent (no `0`/`0.0` a reader
+    /// could take for a measurement); #740 goes one step further and omits the WHOLE vector section —
+    /// a present-but-empty `{}` still reads as "measured, and it was empty" and iterates to zero keys,
+    /// so the suite's zero-placeholder scan never sees it. The unmeasured section must be ABSENT.
     #[test]
     fn unmeasured_sections_are_absent_not_zero() {
         let report = EvidenceCollector::new(sample_metadata()).finish();
@@ -1834,11 +1843,11 @@ mod tests {
         let json = report.to_json().expect("serialize");
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid json");
         for section in ["cpu", "memory", "storage", "throughput"] {
-            let obj = v[section].as_object().expect("section object");
             assert!(
-                obj.is_empty(),
-                "an unmeasured `{section}` vector must serialize EMPTY (no zero placeholders), got \
-                 {obj:?}"
+                v.get(section).is_none(),
+                "an unmeasured `{section}` vector must be ABSENT from the JSON — not `{{}}`, not zeros \
+                 (#740); got {:?}",
+                v.get(section)
             );
         }
         // The three fields this task exists for are simply not there.
@@ -1848,6 +1857,14 @@ mod tests {
                 "an unmeasured `{dead}` must be ABSENT from the JSON, not emitted as 0.0"
             );
         }
+
+        // A report whose sections were omitted must still deserialize (the `#[serde(default)]` on each
+        // vector field): an external report loaded back gets default (unmeasured) sections, never a
+        // parse error.
+        let reparsed: EvidenceReport =
+            serde_json::from_str(&json).expect("omitted sections reload");
+        assert!(reparsed.cpu.is_unmeasured());
+        assert!(reparsed.storage.is_unmeasured());
     }
 
     #[test]

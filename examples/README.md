@@ -147,13 +147,21 @@ Schema history:
   cores vanishes into an 8 s phase on one. A phase too short for the OS's 10 ms clock tick to resolve
   (under five ticks of CPU) omits the figure rather than publishing a `0.0` — the same measure-it-or-
   omit-it rule the metrics obey.
+- **`#740`** (no schema bump) — the omission is now applied at the **section** level too: a vector
+  whose every field is unmeasured is dropped **whole**, so an external report has no `cpu` /
+  `memory` / `storage` key at all rather than a present-but-empty `cpu: {}`. An empty object read as
+  "measured, and it was empty" and, worse, iterated to zero fields so the suite's zero-placeholder
+  scan never saw it. Each vector field carries `#[serde(default)]`, so a report that omits a whole
+  section still deserializes (the section loads as unmeasured), and `run-all.sh` now fails a report
+  that emits a present-but-empty vector object.
 
-### Measured, or absent — never a zero placeholder (v3)
+### Measured, or absent — never a zero placeholder (v3, sections since `#740`)
 
 Every field in the four vector sections (`cpu`, `memory`, `storage`, `throughput`) is emitted **only
-when it was measured**. A vector the run could not measure — the CPU/RSS of a server it is merely
-*attached* to, the on-disk footprint of a store it does not own, the per-operation latency of a
-one-shot batch import — is simply **not there**.
+when it was measured**, and a section whose fields are *all* unmeasured is omitted **entirely**
+(`#740`). A vector the run could not measure — the CPU/RSS of a server it is merely *attached* to,
+the on-disk footprint of a store it does not own, the per-operation latency of a one-shot batch
+import — is simply **not there** (the key is absent, never `{}`).
 
 This is the schema half of the evidence-honesty rule below. Until v3 the schema had no way to say
 "not measured", so an unmeasured metric was written as an exact `0.0` that reads exactly like a

@@ -284,16 +284,17 @@ fn run() -> Result<bool, String> {
         if let Some(r) = s.wal_to_store_ratio() {
             w.insert("wal_to_store_ratio_residual".into(), format!("{r:.1}"));
         }
-        // Explicit, machine-readable NOT-MEASURED markers (`rmp` #699). The `storage`/`cpu`/`memory`
-        // sections have non-optional fields, so in attach mode they serialize as 0 — and a 0 that reads
-        // like a measurement is exactly the failure mode this example was audited for. These markers, plus
-        // `measurement_mode: external`, say out loud which sections carry nothing.
+        // Explicit, machine-readable NOT-MEASURED markers (`rmp` #699). In attach mode the
+        // `storage`/`cpu`/`memory` sections are unmeasured, so (since `rmp` #740) the report OMITS
+        // them entirely — an absent section, never a present-but-empty `{}` and never a `0` that reads
+        // like a measurement. These markers, plus `measurement_mode: external`, say out loud which
+        // sections are absent and why.
         w.insert(
             "storage_measured".into(),
             if s.storage.is_some() {
                 "yes".into()
             } else {
-                "no — attach mode: the store files belong to the target; the storage section is 0 = NOT MEASURED".to_owned()
+                "no — attach mode: the store files belong to the target; the storage section is ABSENT = NOT MEASURED".to_owned()
             },
         );
         w.insert(
@@ -301,7 +302,7 @@ fn run() -> Result<bool, String> {
             if s.server_cpu_secs.is_some() {
                 "yes".into()
             } else {
-                "no — attach mode: /proc/<server-pid> is not readable; the cpu section is 0 = NOT MEASURED".to_owned()
+                "no — attach mode: /proc/<server-pid> is not readable; the cpu section is ABSENT = NOT MEASURED".to_owned()
             },
         );
         w.insert(
@@ -309,7 +310,7 @@ fn run() -> Result<bool, String> {
             if s.server_peak_rss_bytes.is_some() {
                 "yes".into()
             } else {
-                "no — attach mode: /proc/<server-pid> is not readable; the memory section is 0 = NOT MEASURED".to_owned()
+                "no — attach mode: /proc/<server-pid> is not readable; the memory section is ABSENT = NOT MEASURED".to_owned()
             },
         );
         // The store + WAL time series, so the growth-then-plateau curve is inspectable.
