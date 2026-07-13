@@ -152,15 +152,14 @@ cleanup() {
     kill -TERM "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
   fi
-  # EXTERNAL: drop the isolated DB we created (no-op for an operator-owned GRAPHUS_TARGET_DB); for an
-  # operator DB, best-effort clear only OUR label footprint so nothing leaks across runs.
-  if [ "$MODE" = external ]; then
-    if [ -n "${GRAPHUS_TARGET_DB:-}" ]; then
-      harness_target_query "$GRAPHUS_TARGET_DB" "MATCH (n:Account) DETACH DELETE n" >/dev/null 2>&1 || true
-      harness_target_query "$GRAPHUS_TARGET_DB" "MATCH (n:Customer) DETACH DELETE n" >/dev/null 2>&1 || true
-    else
-      harness_target_drop_db >/dev/null 2>&1 || true
-    fi
+  # EXTERNAL: drop ONLY a database the harness created. Against an operator-pinned GRAPHUS_TARGET_DB we
+  # do NOT blanket-delete :Account/:Customer — that would destroy the operator's own data, and this
+  # trap also fires when detect.js REFUSED to run (a non-empty operator DB), i.e. on exactly the nodes
+  # we declined to touch. The operator owns that DB's lifecycle (harness contract); detect.js only ever
+  # loaded into it if it was empty of our labels, so leaving it is safe and re-runs want a fresh
+  # scratch DB anyway (rmp #742).
+  if [ "$MODE" = external ] && [ -z "${GRAPHUS_TARGET_DB:-}" ]; then
+    harness_target_drop_db >/dev/null 2>&1 || true
   fi
   rm -rf "$WORKDIR"
 }
@@ -344,7 +343,11 @@ EOF
   # ------------------------------------------------------------------------------------------------
   section "Step 3 — load + detect fraud + OLTP mix (OFFICIAL neo4j-driver)"
   DETECT_START_MS="$(_harness_now_ms)"
-  DETECT_OUT="$(cd "$NODE_PROJ" && node detect.js "$DRIVER_URI" "$DRIVER_DB" "$DRIVER_USER" "$DRIVER_PW" "$GRAPH_CYPHER" "$GROUND_TRUTH" 2>&1)" || true
+  # Signal DB ownership to detect.js: we OWN the DB (safe to blanket-teardown its label classes) unless
+  # the operator pinned their own GRAPHUS_TARGET_DB in external mode — then detect.js refuses to touch a
+  # non-empty operator DB instead of clobbering it (rmp #742).
+  if [ "$MODE" = external ] && [ -n "${GRAPHUS_TARGET_DB:-}" ]; then DB_OWNED=0; else DB_OWNED=1; fi
+  DETECT_OUT="$(cd "$NODE_PROJ" && GRAPHUS_DB_OWNED="$DB_OWNED" node detect.js "$DRIVER_URI" "$DRIVER_DB" "$DRIVER_USER" "$DRIVER_PW" "$GRAPH_CYPHER" "$GROUND_TRUTH" 2>&1)" || true
   DETECT_MS=$(( $(_harness_now_ms) - DETECT_START_MS ))
   printf '%s\n' "$DETECT_OUT" | sed 's/^/  /'
   assert "detection found EXACTLY the planted fraud (rings + mules + collusion)" "yes" \

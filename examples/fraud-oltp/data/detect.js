@@ -186,13 +186,33 @@ RETURN device, edges ORDER BY device`;
     await driver.verifyConnectivity();
     console.log(`connected to ${uri}${database ? ` database='${database}'` : ' (default database)'}`);
 
-    // ---- Idempotency: clear any prior fraud-oltp footprint so a REUSED database starts clean.
+    // ---- Idempotency vs production-safety. Clearing a label class is a BLANKET DETACH DELETE, so it
+    // is safe ONLY on a database this example owns (a local self-boot, or a harness-created isolated
+    // DB dropped on exit). Against an operator-pinned GRAPHUS_TARGET_DB it would (a) delete the
+    // operator's own :Account/:Customer nodes and (b) corrupt this run's 0-FP/0-FN detection assertions
+    // by mixing foreign data in — so instead we REFUSE to run unless the operator's scratch DB is empty
+    // of our labels. GRAPHUS_DB_OWNED is set by run.sh: '1'/absent = we own it, '0' = operator-pinned.
+    const dbOwned = process.env.GRAPHUS_DB_OWNED !== '0';
     for (const label of ['Account', 'Customer']) {
       const s = driver.session(sessionOpts());
       try {
-        await s.run(`MATCH (n:${label}) DETACH DELETE n`);
-      } catch (_) {
-        /* empty/isolated DB — nothing to clear */
+        if (dbOwned) {
+          await s.run(`MATCH (n:${label}) DETACH DELETE n`);
+        } else {
+          const r = await s.run(`MATCH (n:${label}) RETURN count(n) AS c`);
+          const c = r.records[0] && r.records[0].get('c');
+          const n = c && typeof c.toNumber === 'function' ? c.toNumber() : Number(c || 0);
+          if (n > 0) {
+            throw new Error(
+              `refusing to run against operator database '${database}': it already holds ${n} :${label} ` +
+                `node(s). fraud-oltp performs a blanket teardown and needs an EMPTY scratch database — ` +
+                `running here would delete your data AND corrupt its own detection assertions. Provide an ` +
+                `empty GRAPHUS_TARGET_DB, or unset it to let the example create its own isolated database.`,
+            );
+          }
+        }
+      } catch (e) {
+        if (!dbOwned) throw e; // a refusal must abort; an owned empty/isolated DB just has nothing to clear
       } finally {
         await s.close();
       }

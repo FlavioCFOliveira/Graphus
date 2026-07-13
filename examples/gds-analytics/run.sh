@@ -248,7 +248,11 @@ if [ "$MODE" = external ]; then
   # Bracket the workload so total_millis is the RUN's wall-time (rmp #699) — the evidence binary runs
   # after the workload and cannot time it itself.
   WORKLOAD_START_MS="$(_harness_now_ms)"
-  ANALYZE_OUT="$(cd "$WORKDIR/node" && node analyze.js \
+  # Signal DB ownership to analyze.js: we OWN the DB (safe to blanket-teardown its labels) unless the
+  # operator pinned their own GRAPHUS_TARGET_DB — then analyze.js refuses to touch a non-empty operator
+  # DB and drops only its OWN GDS projections, never the whole catalog (rmp #742).
+  if [ -n "${GRAPHUS_TARGET_DB:-}" ]; then GDS_DB_OWNED=0; else GDS_DB_OWNED=1; fi
+  ANALYZE_OUT="$(cd "$WORKDIR/node" && GRAPHUS_DB_OWNED="$GDS_DB_OWNED" node analyze.js \
       --uri "$GRAPHUS_TARGET_BOLT" \
       --user "${GRAPHUS_TARGET_USER:-graphus}" \
       --password "${GRAPHUS_TARGET_PASSWORD:-graphus-local}" \

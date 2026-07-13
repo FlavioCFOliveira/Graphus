@@ -283,19 +283,45 @@ function isSchemaDdl(stmt) {
     await runOptional(`CALL gds.graph.drop('${name}') YIELD graphName RETURN graphName`);
   }
 
-  // Drop every registered GDS projection (idempotent teardown of the in-memory catalog).
-  async function dropAllProjections() {
-    const r = await runOptional('CALL gds.graph.list() YIELD graphName RETURN graphName');
-    if (!r.ok) return; // older server without gds.graph.list — nothing we can enumerate
-    for (const rec of r.records) {
-      await dropGraph(rec.get('graphName'));
+  // Drop ONLY this example's own named projections. NEVER enumerate-and-drop the whole catalog: on a
+  // shared/operator server that would destroy GDS projections an operator (or a concurrent job) had
+  // registered, which this example neither created nor owns (rmp #742). These four are exactly the
+  // projections the analysis below creates.
+  async function dropOwnProjections() {
+    for (const name of ['ref', 'refp', 'infl_u', 'infl_w']) {
+      await dropGraph(name);
     }
   }
 
-  // DETACH DELETE the example's own nodes (clean slate). Safe on an empty database.
+  // Blanket DETACH DELETE of the example's label classes — safe ONLY on a database this example owns
+  // (a local self-boot, or a harness-created isolated DB). Against an operator-pinned GRAPHUS_TARGET_DB
+  // it would delete the operator's :Author/:Ref nodes AND corrupt this run's exact-value assertions by
+  // mixing foreign data in, so we REFUSE unless the operator's scratch DB is empty of our labels.
+  // GRAPHUS_DB_OWNED is set by run.sh: '1'/absent = we own it, '0' = operator-pinned (rmp #742).
   async function deleteExampleData() {
+    const dbOwned = process.env.GRAPHUS_DB_OWNED !== '0';
     for (const label of ['Author', 'Ref']) {
-      await runOptional(`MATCH (n:${label}) DETACH DELETE n`);
+      if (dbOwned) {
+        await runOptional(`MATCH (n:${label}) DETACH DELETE n`);
+      } else {
+        const r = await runOptional(`MATCH (n:${label}) RETURN count(n) AS c`);
+        if (!r.ok) {
+          throw new Error(
+            `refusing to run against operator database '${args.database}': cannot verify it is empty ` +
+              `of :${label} (count query failed). Provide an empty GRAPHUS_TARGET_DB, or unset it.`,
+          );
+        }
+        const c = r.records.length ? r.records[0].get('c') : 0;
+        const n = c && typeof c.toNumber === 'function' ? c.toNumber() : Number(c || 0);
+        if (n > 0) {
+          throw new Error(
+            `refusing to run against operator database '${args.database}': it already holds ${n} ` +
+              `:${label} node(s). gds-analytics performs a blanket teardown and needs an EMPTY scratch ` +
+              `database — running here would delete your data AND corrupt its exact-value assertions. ` +
+              `Provide an empty GRAPHUS_TARGET_DB, or unset it to let the example create an isolated DB.`,
+          );
+        }
+      }
     }
   }
 
@@ -312,7 +338,7 @@ function isSchemaDdl(stmt) {
     //    analyse.
     // =============================================================================================
     if (!args.skipLoad) {
-      await dropAllProjections();
+      await dropOwnProjections();
       await deleteExampleData();
     }
 
@@ -882,9 +908,9 @@ function isSchemaDdl(stmt) {
     await dropGraph('infl_w');
 
     // =============================================================================================
-    // 5. TEARDOWN-LAST — drop projections + DETACH DELETE (constraints/indexes persist harmlessly).
+    // 5. TEARDOWN-LAST — drop OUR projections + DETACH DELETE (constraints/indexes persist harmlessly).
     // =============================================================================================
-    await dropAllProjections();
+    await dropOwnProjections();
     await deleteExampleData();
     const remaining = await runOptional('CALL gds.graph.list() YIELD graphName RETURN count(*) AS c');
     if (remaining.ok) {
