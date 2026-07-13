@@ -28,6 +28,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -88,6 +89,16 @@ type runResponse struct {
 	Results []statementResult `json:"results"`
 }
 
+// problem is an RFC 9457 problem+json error body: {type,title,status,detail,code}. The
+// transactional endpoint returns this (with a >= 400 status) when a statement is rejected.
+type problem struct {
+	Type   string `json:"type"`
+	Title  string `json:"title"`
+	Status int    `json:"status"`
+	Detail string `json:"detail"`
+	Code   string `json:"code"`
+}
+
 func (c *client) run(user, password string) error {
 	fmt.Printf("→ REST WebAPI at %s\n", c.base)
 
@@ -106,7 +117,8 @@ func (c *client) run(user, password string) error {
 	}
 	fmt.Println("✓ created (:Person {name:'Grace Hopper'})")
 
-	// 3. Read it back.
+	// 3. Read it back and ASSERT the exact values written — not merely that a row exists.
+	//    A server that returned the wrong name or role must fail here, before the sentinel.
 	res, err := c.query(statement{
 		Statement:  "MATCH (p:Person {name: $name}) RETURN p.name AS name, p.role AS role",
 		Parameters: map[string]any{"name": "Grace Hopper"},
@@ -114,31 +126,58 @@ func (c *client) run(user, password string) error {
 	if err != nil {
 		return fmt.Errorf("match: %w", err)
 	}
-	if len(res.Results) == 1 {
-		r := res.Results[0]
-		fmt.Printf("✓ query returned %d row(s) %v:\n", len(r.Data), r.Fields)
-		for _, row := range r.Data {
-			fmt.Printf("    %s\n", joltRow(row))
-		}
+	if len(res.Results) != 1 {
+		return fmt.Errorf("read-back: expected 1 statement result, got %d", len(res.Results))
 	}
+	r := res.Results[0]
+	if len(r.Data) != 1 {
+		return fmt.Errorf("read-back: expected exactly 1 row in the isolated DB, got %d", len(r.Data))
+	}
+	row := r.Data[0]
+	if len(row) < 2 {
+		return fmt.Errorf("read-back: expected 2 columns (name, role), got %d", len(row))
+	}
+	if name := fmt.Sprintf("%v", jolt(row[0])); name != "Grace Hopper" {
+		return fmt.Errorf("read-back: name = %q, want %q", name, "Grace Hopper")
+	}
+	if role := fmt.Sprintf("%v", jolt(row[1])); role != "rear admiral" {
+		return fmt.Errorf("read-back: role = %q, want %q", role, "rear admiral")
+	}
+	fmt.Printf("✓ read back and verified %v: %s\n", r.Fields, joltRow(row))
 
-	// 4. Aggregate.
-	res, err = c.query(statement{Statement: "MATCH (p:Person) RETURN count(p) AS people"})
+	// 4. Aggregate and ASSERT the exact count. Scoped to this client's OWN node by name so
+	//    it is deterministic in both modes (external is isolated; local shares one database
+	//    across all three clients). After a single CREATE the count is exactly 1.
+	people, err := c.count("Grace Hopper")
 	if err != nil {
-		return fmt.Errorf("aggregate: %w", err)
+		return err
 	}
-	if len(res.Results) == 1 && len(res.Results[0].Data) == 1 {
-		fmt.Printf("✓ total Person nodes: %v\n", jolt(res.Results[0].Data[0][0]))
+	if people != 1 {
+		return fmt.Errorf("aggregate: count of (:Person {name:'Grace Hopper'}) = %d, want 1 after one CREATE", people)
 	}
+	fmt.Printf("✓ nodes named 'Grace Hopper': %d (exactly as expected)\n", people)
 
-	// 5. Clean up so the example is idempotent across runs.
+	// 5. NEGATIVE path: a deliberately invalid statement MUST be rejected with a well-formed
+	//    RFC 9457 problem+json (status >= 400 carrying a title/detail). This exercises the
+	//    error path a real client has to handle; a 2xx or an unshaped body fails here.
+	if err := c.queryExpectingProblem(statement{Statement: "THIS IS NOT VALID CYPHER"}); err != nil {
+		return fmt.Errorf("negative path: %w", err)
+	}
+	fmt.Println("✓ server rejected invalid Cypher with a well-formed problem+json error")
+
+	// 6. Clean up, then ASSERT the DB is empty again — proving the DETACH DELETE took effect.
 	if _, err := c.query(statement{
 		Statement:  "MATCH (p:Person {name: $name}) DETACH DELETE p",
 		Parameters: map[string]any{"name": "Grace Hopper"},
 	}); err != nil {
 		return fmt.Errorf("cleanup: %w", err)
 	}
-	fmt.Println("✓ cleaned up")
+	if people, err := c.count("Grace Hopper"); err != nil {
+		return err
+	} else if people != 0 {
+		return fmt.Errorf("after cleanup: count of (:Person {name:'Grace Hopper'}) = %d, want 0", people)
+	}
+	fmt.Println("✓ cleaned up (count of 'Grace Hopper' back to 0)")
 
 	fmt.Println("\nREST DEMO PASSED")
 	return nil
@@ -169,8 +208,9 @@ func (c *client) login(user, password string) error {
 	return nil
 }
 
-// query runs one statement on the auto-commit endpoint and returns the decoded response.
-func (c *client) query(s statement) (*runResponse, error) {
+// do posts one statement to the transactional endpoint and returns the HTTP status and
+// raw body without interpreting them, so the success and error paths can share it.
+func (c *client) do(s statement) (int, []byte, error) {
 	body, _ := json.Marshal(runRequest{Statements: []statement{s}})
 	url := fmt.Sprintf("%s/db/%s/tx/commit", c.base, c.db)
 	req, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
@@ -178,19 +218,92 @@ func (c *client) query(s statement) (*runResponse, error) {
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, err
+		return 0, nil, err
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
+	return resp.StatusCode, raw, nil
+}
+
+// query runs one statement on the auto-commit endpoint and requires HTTP 200.
+func (c *client) query(s statement) (*runResponse, error) {
+	status, raw, err := c.do(s)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
 		// Errors are RFC 9457 problem+json: {type,title,status,detail,code}.
-		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, raw)
+		return nil, fmt.Errorf("status %d: %s", status, raw)
 	}
 	var rr runResponse
 	if err := json.Unmarshal(raw, &rr); err != nil {
 		return nil, fmt.Errorf("decoding response: %w", err)
 	}
 	return &rr, nil
+}
+
+// count returns how many :Person nodes carry the given name. Scoping the aggregate to the
+// client's own node (rather than the whole label) keeps the assertion deterministic even
+// in local mode, where all three clients share the one default database.
+func (c *client) count(name string) (int64, error) {
+	res, err := c.query(statement{
+		Statement:  "MATCH (p:Person {name: $name}) RETURN count(p) AS n",
+		Parameters: map[string]any{"name": name},
+	})
+	if err != nil {
+		return 0, fmt.Errorf("aggregate: %w", err)
+	}
+	if len(res.Results) != 1 || len(res.Results[0].Data) != 1 || len(res.Results[0].Data[0]) != 1 {
+		return 0, fmt.Errorf("aggregate: unexpected result shape %+v", res.Results)
+	}
+	n, err := asInt(jolt(res.Results[0].Data[0][0]))
+	if err != nil {
+		return 0, fmt.Errorf("aggregate: %w", err)
+	}
+	return n, nil
+}
+
+// queryExpectingProblem runs a statement the server MUST reject and asserts the reply is a
+// well-formed RFC 9457 problem+json: a >= 400 status carrying a title or detail. A server
+// that answers 2xx (or with an unshaped body) to invalid Cypher fails here.
+func (c *client) queryExpectingProblem(s statement) error {
+	status, raw, err := c.do(s)
+	if err != nil {
+		return err
+	}
+	if status < 400 {
+		return fmt.Errorf("expected rejection (HTTP >= 400) for %q, got HTTP %d: %s", s.Statement, status, raw)
+	}
+	var p problem
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return fmt.Errorf("error body is not JSON: %w (body: %s)", err, raw)
+	}
+	if strings.TrimSpace(p.Title) == "" && strings.TrimSpace(p.Detail) == "" {
+		return fmt.Errorf("error body is not a well-formed problem+json (no title/detail): %s", raw)
+	}
+	return nil
+}
+
+// asInt coerces a decoded aggregate cell to int64. Strict Jolt encodes a 64-bit integer as
+// {"Z":"<decimal string>"} — the inner value is a decimal STRING, not a JSON number, because
+// JSON numbers cannot safely carry the full int64 range — so after jolt() unwraps it we get
+// a string and must parse it (base 10). We also accept the float64/json.Number forms JSON
+// yields for smaller numeric values, and native Go integers.
+func asInt(v any) (int64, error) {
+	switch n := v.(type) {
+	case string:
+		return strconv.ParseInt(n, 10, 64)
+	case float64:
+		return int64(n), nil
+	case json.Number:
+		return n.Int64()
+	case int64:
+		return n, nil
+	case int:
+		return int64(n), nil
+	default:
+		return 0, fmt.Errorf("value %v (%T) is not an integer", v, v)
+	}
 }
 
 // jolt unwraps a strict-Jolt typed cell to a readable value. REST encodes result cells as

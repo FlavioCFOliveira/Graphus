@@ -79,6 +79,7 @@ const (
 const (
 	opHello   = 0x01
 	opGoodbye = 0x02
+	opReset   = 0x0F
 	opRun     = 0x10
 	opPull    = 0x3F
 	opLogon   = 0x6A
@@ -550,6 +551,35 @@ func (s *Session) Run(query string, params map[string]any) (*QueryResult, error)
 			return nil, failureError(resp)
 		default:
 			return nil, fmt.Errorf("unexpected response 0x%02X during PULL", resp.tag)
+		}
+	}
+}
+
+// Reset sends RESET (Bolt 5.x signature 0x0F, no fields) and drains responses until the
+// server acknowledges with SUCCESS. After a FAILURE the connection is in the FAILED state
+// and the server answers every subsequent message with IGNORED except RESET; RESET clears
+// the failure, discards any pending results, and returns the connection to READY. Without
+// this, a connection would be unusable after any server error.
+func (s *Session) Reset() error {
+	var reset packer
+	reset.structHeader(opReset, 0)
+	if err := s.send(&reset); err != nil {
+		return err
+	}
+	for {
+		resp, err := s.recv()
+		if err != nil {
+			return err
+		}
+		switch resp.tag {
+		case opSuccess:
+			return nil
+		case opIgnored:
+			continue // drain any responses queued ahead of the RESET acknowledgement
+		case opFailure:
+			return failureError(resp)
+		default:
+			return fmt.Errorf("unexpected response 0x%02X to RESET", resp.tag)
 		}
 	}
 }

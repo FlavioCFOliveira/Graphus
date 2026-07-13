@@ -52,7 +52,19 @@ if [ "$MODE" = external ]; then
   BOLT_URI="${GRAPHUS_TARGET_BOLT:?external mode requires GRAPHUS_TARGET_BOLT (bolt+ssc://host:port)}"
   USER_NAME="${GRAPHUS_TARGET_USER:-graphus}"
   PASSWORD="${GRAPHUS_TARGET_PASSWORD:?external mode requires GRAPHUS_TARGET_PASSWORD}"
-  DATABASE="${GRAPHUS_TARGET_DATABASE:-graphus}"
+  # NEVER write into the operator's data. The clients CREATE and DETACH DELETE :Person nodes; against
+  # a live instance those must land in a run-scoped database, not the target's default `graphus` — a
+  # DETACH DELETE of a name the operator legitimately holds would silently destroy their node. Carve an
+  # isolated DB (or honour an operator-pinned GRAPHUS_TARGET_DB via the shared harness contract) and
+  # drop it on exit. The old code read the non-contract var GRAPHUS_TARGET_DATABASE and defaulted to
+  # `graphus`, so it clobbered the operator's primary DB (rmp #741).
+  export HARNESS_TARGET_TOKEN
+  harness_target_login >/dev/null 2>&1 \
+    || { echo "${RED}fatal: could not authenticate against $REST_URL${RESET}" >&2; exit 2; }
+  DATABASE="$(harness_target_ensure_db)" \
+    || { echo "${RED}fatal: could not resolve an isolated target database${RESET}" >&2; exit 2; }
+  trap 'harness_target_drop_db' EXIT INT TERM
+  info "isolated target database: $DATABASE (dropped on exit unless operator-pinned via GRAPHUS_TARGET_DB)"
   SOCKET=""   # a UDS cannot be reached across a host boundary — see the header.
 else
   command -v openssl >/dev/null 2>&1 || { echo "${RED}fatal: openssl required for the TLS cert${RESET}" >&2; exit 2; }
