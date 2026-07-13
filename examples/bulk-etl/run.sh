@@ -154,6 +154,11 @@ RUN_WIRE="${RUN_WIRE:-1}"
 # CURRENT sources — a build-only-if-absent guard silently runs a STALE binary after any source edit.
 harness_build "the offline graphus-bulk importer (release)" --release -p graphus-bulk --bin graphus-bulk
 harness_build "the dev-only bulk-etl generator + drivers (release)" --release -p graphus-bulk-gen --bins
+# The dev-only measure_target evidence binary, built UNCONDITIONALLY (a build-only-if-absent guard
+# silently ran a STALE measure_target after a source edit — the evidence then described code no longer
+# under test, rmp #577).
+harness_build "the dev-only measure_target evidence binary (release)" \
+  --release -p graphus-examples-harness --bin measure_target
 for b in "$BULK" "$GEN" "$ROUNDTRIP" "$REOPEN_BIN" "$EVIDENCE_BIN" "$CMP_BIN"; do
   [ -x "$b" ] || { echo "${RED}fatal: required binary not found at $b${RESET}" >&2; exit 2; }
 done
@@ -676,14 +681,8 @@ EOF
     WIRE_SECS="$(( WIRE_MS / 1000 )).$(printf '%03d' "$(( WIRE_MS % 1000 ))")"
     info "wire load: $WIRE_ELEMENTS elements in ${WIRE_SECS}s across $TOTAL_BATCHES batches"
 
+    # Built (fresh) by harness_build above — no build-only-if-absent guard that could run a stale binary.
     MEASURE_BIN="$BIN_DIR/measure_target"
-    if [ ! -x "$MEASURE_BIN" ]; then
-      info "building the dev-only measure_target harness binary…"
-      ( cd "$REPO_ROOT" && cargo build -q -p graphus-examples-harness --bin measure_target ) || true
-      for cand in "$REPO_ROOT/target/release/measure_target" "$REPO_ROOT/target/debug/measure_target"; do
-        [ -x "$cand" ] && MEASURE_BIN="$cand" && break
-      done
-    fi
 
     if [ -x "$MEASURE_BIN" ] && [ -s "$METRICS_BEFORE" ] && [ -s "$METRICS_AFTER" ]; then
       "$MEASURE_BIN" \

@@ -223,6 +223,11 @@ done
 harness_build "the social-network wire client binaries (release, --features wire, no engine)" \
   --release -p graphus-social-gen --no-default-features --features wire \
   --bin social_gen --bin social_wire_load --bin social_bench --bin social_baseline_cmp
+# The dev-only measure_target evidence binary, built through harness_build so it is rebuilt
+# UNCONDITIONALLY (cargo is incremental) — a build-only-if-absent guard silently ran a STALE
+# measure_target after a source edit, so the evidence described code no longer under test (rmp #577).
+harness_build "the dev-only measure_target evidence binary (release)" \
+  --release -p graphus-examples-harness --bin measure_target
 if [ "$MODE" = local ]; then
   harness_build "graphus-server (release)" --release -p graphus-server
 fi
@@ -503,12 +508,8 @@ if [ "$MODE" = external ]; then
   VERDICT_LINE="$(grep 'CLIENT-SIDE VERDICT' "$BENCH_LOG" | head -n1 || true)"
   [ -n "$VERDICT_LINE" ] && RUNG_NOTES+=(--note "$VERDICT_LINE")
 
+  # Built (fresh) by harness_build above — no build-only-if-absent guard that could run a stale binary.
   MEASURE_BIN="$BIN_DIR/measure_target"
-  if [ ! -x "$MEASURE_BIN" ]; then
-    info "building the dev-only measure_target harness binary…"
-    ( cd "$REPO_ROOT" && cargo build -q -p graphus-examples-harness --bin measure_target ) || true
-    MEASURE_BIN="$REPO_ROOT/target/debug/measure_target"
-  fi
   if [ -x "$MEASURE_BIN" ] && [ -s "$METRICS_BEFORE" ] && [ -s "$METRICS_AFTER" ] && [ -n "$BENCH_STATS" ]; then
     "$MEASURE_BIN" \
       --evidence-dir "$EVIDENCE_DIR" --scenario "social-network-large" \
