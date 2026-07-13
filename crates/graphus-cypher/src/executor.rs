@@ -2682,6 +2682,54 @@ fn build_operator(
                 rows: rel_ids_to_rows(relationship, from, to, *direction, ids, ctx),
             })
         }
+        PhysicalOp::RelIndexRangeSeek {
+            relationship,
+            from,
+            to,
+            rel_type,
+            property,
+            bound,
+            value,
+            direction,
+            ..
+        } => {
+            // Relationship-property index RANGE seek (`rmp` task #680): evaluate the bound, then ask the
+            // seam for the candidate relationship ids of `rel_type` whose current `property` satisfies it
+            // (already re-checked for visibility + current type + the bound, under the same
+            // `eval::satisfies_range` a `Filter` applies). When the seam exposes no usable rel-property
+            // index — the off-thread reader, a RESTRICTED RBAC principal (the `AuthorizedGraph` decorator
+            // declines the raw seek so per-property read grants still apply), a `Populating` index
+            // (`rmp` #733), or one dropped since planning — fall back to a typed relationship scan + the
+            // identical range filter, which yields the identical relationship set. Either way, materialise
+            // each relationship's endpoints from its own record honouring the pattern direction (an
+            // undirected pattern binds both orientations), reproducing exactly the
+            // `Filter`-over-`ExpandAll`-over-`AllNodesScan` rows this seek replaced.
+            //
+            // The bound is evaluated against the empty row (like `RelIndexSeek`): the planner only emits
+            // this operator for a value that does not reference the relationship variable, and no
+            // correlated relationship seek exists (`contains_correlated_seek` covers the node seeks only).
+            let bound_val = eval_value(
+                value,
+                &Row::empty(),
+                ctx.params,
+                ctx.graph,
+                ctx.functions,
+                &ctx.clock,
+            )?;
+            let (lower, upper) = range_bounds(*bound, &bound_val);
+            let ids = match ctx
+                .graph
+                .index_seek_rel_range(&rel_type.name, property, lower, upper)
+            {
+                Some(ids) => ids,
+                None => {
+                    rel_scan_filter_range_ids(&rel_type.name, property, *bound, &bound_val, ctx)
+                }
+            };
+            Ok(Operator::Buffered {
+                rows: rel_ids_to_rows(relationship, from, to, *direction, ids, ctx),
+            })
+        }
         PhysicalOp::RelCompositeIndexSeek {
             relationship,
             from,
@@ -3483,6 +3531,57 @@ fn rel_scan_filter_eq_ids(
     seek: &Value,
     ctx: &Ctx<'_>,
 ) -> Vec<RelId> {
+    rel_scan_ids_where(rel_type, ctx, |rel| {
+        ctx.graph
+            .rel_property(rel, property)
+            .is_some_and(|v| crate::equality::equals(&v, seek).is_true())
+    })
+}
+
+/// The scan fallback for a [`RelIndexRangeSeek`](crate::physical::PhysicalOp::RelIndexRangeSeek) when
+/// the seam exposes no usable relationship-property index — the off-thread reader, a **restricted** RBAC
+/// principal (the [`AuthorizedGraph`](crate::authorized_graph::AuthorizedGraph) decorator declines the
+/// raw seek), a `Populating` index (`rmp` #733), or one dropped since planning: the visible relationship
+/// ids of `rel_type` whose current `property` satisfies the range bound, **each id once**
+/// (`rmp` task #680).
+///
+/// The range analogue of [`rel_scan_filter_eq_ids`], sharing its enumeration ([`rel_scan_ids_where`]) so
+/// MVCC visibility and RBAC compose identically. The predicate is evaluated by
+/// [`crate::eval::satisfies_range`] — the same function the seam's per-candidate re-check applies — so
+/// the seek and this fallback are **bag-equivalent** (the operator *consumes* the range conjunct, so
+/// this fallback, not a residual `Filter`, is what restores exactness).
+fn rel_scan_filter_range_ids(
+    rel_type: &str,
+    property: &str,
+    bound: RangeBound,
+    value: &Value,
+    ctx: &Ctx<'_>,
+) -> Vec<RelId> {
+    let (lower, upper) = range_bounds(bound, value);
+    rel_scan_ids_where(rel_type, ctx, |rel| {
+        ctx.graph
+            .rel_property(rel, property)
+            .is_some_and(|v| crate::eval::satisfies_range(&v, lower, upper))
+    })
+}
+
+/// Enumerates the visible relationships of `rel_type` **once each** and keeps those satisfying `keep` —
+/// the single shared enumeration behind every relationship-seek scan fallback (`rmp` tasks #659, #664,
+/// #666, #680).
+///
+/// Walks each relationship from its start node (one outgoing incidence per relationship) through the
+/// same [`scan_nodes`](crate::graph_access::GraphAccess::scan_nodes) /
+/// [`expand`](crate::graph_access::GraphAccess::expand) seam the scan-path `ExpandAll` would, so MVCC
+/// visibility and RBAC (relationship-type traversal + per-property read grants, applied inside `keep`'s
+/// [`rel_property`](crate::graph_access::GraphAccess::rel_property) reads) are enforced identically.
+/// [`rel_ids_to_rows`] then applies the pattern direction to the returned set, yielding the same rows
+/// the scan path would. The `seen` set is what makes a relationship whose endpoints are both scanned
+/// appear exactly once (the seek's candidate set is likewise de-duplicated).
+fn rel_scan_ids_where(
+    rel_type: &str,
+    ctx: &Ctx<'_>,
+    mut keep: impl FnMut(RelId) -> bool,
+) -> Vec<RelId> {
     let types = [rel_type.to_owned()];
     let mut seen = rustc_hash::FxHashSet::default();
     let mut ids = Vec::new();
@@ -3491,11 +3590,7 @@ fn rel_scan_filter_eq_ids(
             if !seen.insert(inc.rel) {
                 continue;
             }
-            if ctx
-                .graph
-                .rel_property(inc.rel, property)
-                .is_some_and(|v| crate::equality::equals(&v, seek).is_true())
-            {
+            if keep(inc.rel) {
                 ids.push(inc.rel);
             }
         }
@@ -3522,28 +3617,16 @@ fn rel_scan_filter_composite_eq_ids(
     values: &[Value],
     ctx: &Ctx<'_>,
 ) -> Vec<RelId> {
-    let types = [rel_type.to_owned()];
-    let mut seen = rustc_hash::FxHashSet::default();
-    let mut ids = Vec::new();
-    for node in ctx.graph.scan_nodes() {
-        for inc in ctx.graph.expand(node, ExpandDirection::Outgoing, &types) {
-            if !seen.insert(inc.rel) {
-                continue;
-            }
-            let matches = properties
-                .iter()
-                .zip(values.iter())
-                .all(|(property, value)| {
-                    ctx.graph
-                        .rel_property(inc.rel, property)
-                        .is_some_and(|v| crate::equality::equals(&v, value).is_true())
-                });
-            if matches {
-                ids.push(inc.rel);
-            }
-        }
-    }
-    ids
+    rel_scan_ids_where(rel_type, ctx, |rel| {
+        properties
+            .iter()
+            .zip(values.iter())
+            .all(|(property, value)| {
+                ctx.graph
+                    .rel_property(rel, property)
+                    .is_some_and(|v| crate::equality::equals(&v, value).is_true())
+            })
+    })
 }
 
 /// The scan fallback for a [`RelSpatialIndexSeek`](crate::physical::PhysicalOp::RelSpatialIndexSeek)
@@ -3559,17 +3642,7 @@ fn rel_scan_filter_composite_eq_ids(
 /// filter above the operator does the exact trimming, so this need only return the typed candidate set.
 /// [`rel_ids_to_rows`] then applies the pattern direction, yielding the same rows the scan path would.
 fn rel_scan_typed_ids(rel_type: &str, ctx: &Ctx<'_>) -> Vec<RelId> {
-    let types = [rel_type.to_owned()];
-    let mut seen = rustc_hash::FxHashSet::default();
-    let mut ids = Vec::new();
-    for node in ctx.graph.scan_nodes() {
-        for inc in ctx.graph.expand(node, ExpandDirection::Outgoing, &types) {
-            if seen.insert(inc.rel) {
-                ids.push(inc.rel);
-            }
-        }
-    }
-    ids
+    rel_scan_ids_where(rel_type, ctx, |_| true)
 }
 
 /// Fallback composite (multi-property) equality access (`rmp` task #657): scan the label and keep
@@ -3603,6 +3676,11 @@ fn scan_filter_composite_eq(
 }
 
 /// Fallback range access: scan the label and keep nodes whose property satisfies the range bound.
+///
+/// The predicate is evaluated by [`crate::eval::satisfies_range`] — the **single source of truth** for
+/// `<`/`<=`/`>`/`>=`, shared with the index seek's per-candidate re-check — so this fallback and the
+/// [`NodeIndexRangeSeek`](crate::physical::PhysicalOp::NodeIndexRangeSeek) it stands in for return the
+/// identical node set (`rmp` task #680).
 fn scan_filter_range(
     label: &Label,
     property: &str,
@@ -3610,24 +3688,14 @@ fn scan_filter_range(
     value: &Value,
     ctx: &Ctx<'_>,
 ) -> Vec<NodeId> {
-    use std::cmp::Ordering;
+    let (lower, upper) = range_bounds(bound, value);
     ctx.graph
         .scan_nodes_by_label(&label.name)
         .into_iter()
         .filter(|id| {
-            let Some(v) = ctx.graph.node_property(*id, property) else {
-                return false;
-            };
-            if v.is_null() || value.is_null() {
-                return false;
-            }
-            let ord = cmp_values(&v, value);
-            match bound {
-                RangeBound::GreaterThan => ord == Ordering::Greater,
-                RangeBound::GreaterOrEqual => ord != Ordering::Less,
-                RangeBound::LessThan => ord == Ordering::Less,
-                RangeBound::LessOrEqual => ord != Ordering::Greater,
-            }
+            ctx.graph
+                .node_property(*id, property)
+                .is_some_and(|v| crate::eval::satisfies_range(&v, lower, upper))
         })
         .collect()
 }
@@ -8336,6 +8404,12 @@ fn result_columns(op: &PhysicalOp, procedures: &dyn ProcedureRegistry) -> Vec<St
             ..
         }
         | PhysicalOp::RelIndexSeek {
+            relationship,
+            from,
+            to,
+            ..
+        }
+        | PhysicalOp::RelIndexRangeSeek {
             relationship,
             from,
             to,

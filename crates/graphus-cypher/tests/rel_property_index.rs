@@ -56,8 +56,17 @@ fn compile_cat(src: &str, catalog: &IndexCatalog) -> PhysicalPlan {
 }
 
 /// Whether a physical plan uses a [`RelIndexSeek`] anywhere (rendered via the plan's Display).
+///
+/// Note the two operator names are **not** substrings of one another (`RelIndexSeek` vs
+/// `RelIndexRangeSeek`), so this predicate and [`is_rel_range_seek`] are mutually exclusive — an
+/// equality assertion can never be accidentally satisfied by a range seek or vice versa.
 fn is_rel_seek(plan: &PhysicalPlan) -> bool {
     plan.root.to_string().contains("RelIndexSeek")
+}
+
+/// Whether a physical plan uses a [`RelIndexRangeSeek`] anywhere (`rmp` task #680).
+fn is_rel_range_seek(plan: &PhysicalPlan) -> bool {
+    plan.root.to_string().contains("RelIndexRangeSeek")
 }
 
 /// Runs a read query in its own committed transaction, returning the raw result rows (`rmp` #659).
@@ -402,23 +411,30 @@ fn rel_equality_lowers_to_seek_only_when_the_index_is_present() {
 
 #[test]
 fn non_seekable_rel_shapes_stay_scans() {
-    // Shapes the equality-only, single-type, standalone rel seek must NOT claim (`rmp` task #659):
-    // variable-length, multiple types (no single-type index), a range predicate, `OPTIONAL MATCH`
-    // (its anchor is an `Apply`-over-`Argument`, never a bare all-nodes scan), and a label-constrained
-    // anchor (a label scan, not an all-nodes scan). Each must remain a scan + filter.
+    // Shapes the single-type, standalone rel seek must NOT claim (`rmp` tasks #659, #680):
+    // variable-length, multiple types (no single-type index), `OPTIONAL MATCH` (its anchor is an
+    // `Apply`-over-`Argument`, never a bare all-nodes scan), and a label-constrained anchor (a label
+    // scan, not an all-nodes scan). Each must remain a scan + filter — for an EQUALITY *and* for a
+    // RANGE predicate alike (the range seek shares the identical shape gate).
+    //
+    // (A bare `WHERE r.since > $x` on a seek-materialisable shape is deliberately absent: since #680 it
+    // IS served, by a `RelIndexRangeSeek` — see `rel_range_lowers_to_a_range_seek_only_with_the_index`.)
     let indexed = IndexCatalog::builder()
         .with_rel_property("KNOWS", "since")
         .build();
     for src in [
         "MATCH ()-[r:KNOWS*]-() WHERE r.since = $x RETURN r",
+        "MATCH ()-[r:KNOWS*]-() WHERE r.since >= $x RETURN r",
         "MATCH ()-[r:KNOWS|LIKES {since: $x}]-() RETURN r",
-        "MATCH ()-[r:KNOWS]-() WHERE r.since > $x RETURN r",
+        "MATCH ()-[r:KNOWS|LIKES]-() WHERE r.since >= $x RETURN r",
         "OPTIONAL MATCH ()-[r:KNOWS {since: $x}]-() RETURN r",
+        "OPTIONAL MATCH ()-[r:KNOWS]-() WHERE r.since >= $x RETURN r",
         "MATCH (a:P)-[r:KNOWS {since: $x}]->(b) RETURN r",
+        "MATCH (a:P)-[r:KNOWS]->(b) WHERE r.since >= $x RETURN r",
     ] {
         let plan = compile_cat(src, &indexed);
         assert!(
-            !is_rel_seek(&plan),
+            !is_rel_seek(&plan) && !is_rel_range_seek(&plan),
             "this shape must stay a scan, got a seek: {src}\n{}",
             plan.root
         );
@@ -574,5 +590,564 @@ fn rel_seek_hides_an_uncommitted_relationship_from_a_concurrent_reader() {
         run_read(&mut coord, &plan, &params).len(),
         1,
         "after rollback only the original committed relationship remains"
+    );
+}
+
+// =================================================================================================
+// Relationship-property index RANGE seek (`rmp` task #680)
+// =================================================================================================
+
+#[test]
+fn rel_range_lowers_to_a_range_seek_only_with_the_index() {
+    // A `<` / `<=` / `>` / `>=` predicate on a relationship property, on the same standalone single-type
+    // fixed-length pattern the equality seek requires, is served by the relationship RANGE index — the
+    // gap `rmp` #673's fraud-oltp example surfaced empirically (it used to stay a full `ExpandAll` +
+    // `Filter` scan). With no such index — or on a non-covered property / type — it stays a scan.
+    let indexed = IndexCatalog::builder()
+        .with_rel_property("KNOWS", "since")
+        .build();
+    let empty = IndexCatalog::empty();
+
+    for src in [
+        "MATCH ()-[r:KNOWS]-() WHERE r.since >= $x RETURN r",
+        "MATCH ()-[r:KNOWS]-() WHERE r.since > $x RETURN r",
+        "MATCH ()-[r:KNOWS]-() WHERE r.since <= $x RETURN r",
+        "MATCH ()-[r:KNOWS]-() WHERE r.since < $x RETURN r",
+        "MATCH (a)-[r:KNOWS]->(b) WHERE r.since >= $x RETURN r",
+        // The mirrored orientation: `$x <= r.since` is the same bound with the property on the right.
+        "MATCH ()-[r:KNOWS]-() WHERE $x <= r.since RETURN r",
+    ] {
+        let plan = compile_cat(src, &indexed);
+        assert!(
+            is_rel_range_seek(&plan),
+            "expected a RelIndexRangeSeek with the index present: {src}\n{}",
+            plan.root
+        );
+        assert_eq!(
+            plan.index_dependencies().count(),
+            1,
+            "the range plan depends on exactly the relationship index: {src}\n{}",
+            plan.root
+        );
+        let scan = compile_cat(src, &empty);
+        assert!(
+            !is_rel_range_seek(&scan),
+            "without the index the same query must stay a scan + filter: {src}"
+        );
+        assert_eq!(
+            scan.index_dependencies().count(),
+            0,
+            "the scan plan uses no index: {src}"
+        );
+    }
+
+    // The index covers only `(KNOWS, since)`: a different property or a different type stays a scan.
+    for src in [
+        "MATCH ()-[r:KNOWS]-() WHERE r.note >= $x RETURN r", // property not indexed
+        "MATCH ()-[r:LIKES]-() WHERE r.since >= $x RETURN r", // type not indexed
+    ] {
+        assert!(
+            !is_rel_range_seek(&compile_cat(src, &indexed)),
+            "a non-covered (type, property) must not range-seek: {src}"
+        );
+    }
+}
+
+#[test]
+fn a_non_range_rel_index_kind_does_not_serve_a_range_predicate() {
+    // Only a RANGE (rel-property) index — or a composite relationship index on its leading key — can
+    // answer an ordered range. A relationship SPATIAL (point) index and a relationship VECTOR (HNSW)
+    // index on the same `(type, property)` must NOT be claimed by the range lowering: neither structure
+    // is ordered by the property's Cypher value, so a range predicate over them stays a scan + filter.
+    let spatial = IndexCatalog::builder()
+        .with_rel_spatial("KNOWS", "since")
+        .build();
+    let vector = IndexCatalog::builder()
+        .with_rel_vector("KNOWS", "since")
+        .build();
+    let src = "MATCH ()-[r:KNOWS]-() WHERE r.since >= $x RETURN r";
+    for (kind, catalog) in [("rel-spatial", &spatial), ("rel-vector", &vector)] {
+        let plan = compile_cat(src, catalog);
+        assert!(
+            !is_rel_range_seek(&plan),
+            "a {kind} index must not serve a range predicate:\n{}",
+            plan.root
+        );
+        assert_eq!(
+            plan.index_dependencies().count(),
+            0,
+            "and it declares no index dependency:\n{}",
+            plan.root
+        );
+    }
+
+    // A composite relationship index whose LEADING key is the property DOES serve it (the leading-prefix
+    // contract of `IndexCatalog::rel_property`, shared with the equality seek): the plan shape is the
+    // single-key range seek, and the executor falls back to a scan when only a composite tree exists.
+    let composite = IndexCatalog::builder()
+        .with_rel_composite("KNOWS", vec!["since".to_owned(), "note".to_owned()])
+        .build();
+    assert!(
+        is_rel_range_seek(&compile_cat(src, &composite)),
+        "a composite relationship index serves a range on its leading key"
+    );
+    // ...but not on a NON-leading key (a B+-tree cannot seek a suffix key).
+    assert!(
+        !is_rel_range_seek(&compile_cat(
+            "MATCH ()-[r:KNOWS]-() WHERE r.note >= $x RETURN r",
+            &composite
+        )),
+        "a composite relationship index must not serve a range on a non-leading key"
+    );
+}
+
+#[test]
+fn an_equality_conjunct_still_wins_over_a_range_conjunct() {
+    // Priority is preserved: when a filter carries BOTH an indexable equality and an indexable range on
+    // the relationship, the (strictly more selective) EQUALITY is consumed into a `RelIndexSeek` and the
+    // range is re-attached as a residual `Filter` — exactly the pre-#680 plan. Nothing that used to
+    // lower to a `RelIndexSeek` changes shape.
+    let indexed = IndexCatalog::builder()
+        .with_rel_property("KNOWS", "since")
+        .with_rel_property("KNOWS", "weight")
+        .build();
+    // The range conjunct is written FIRST, so a naive "first indexable conjunct wins" loop would have
+    // taken it — this is the assertion that pins the ordering.
+    let plan = compile_cat(
+        "MATCH ()-[r:KNOWS]-() WHERE r.weight >= $w AND r.since = $x RETURN r",
+        &indexed,
+    );
+    let rendered = plan.root.to_string();
+    assert!(
+        is_rel_seek(&plan),
+        "the equality must be consumed into a RelIndexSeek:\n{rendered}"
+    );
+    assert!(
+        !is_rel_range_seek(&plan),
+        "and the range must NOT displace it:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("Filter"),
+        "the range stays a residual filter:\n{rendered}"
+    );
+
+    // And a full-key COMPOSITE equality still wins over both (`rmp` #666 lowering intact).
+    let composite = IndexCatalog::builder()
+        .with_rel_composite("KNOWS", vec!["since".to_owned(), "note".to_owned()])
+        .build();
+    let plan = compile_cat(
+        "MATCH ()-[r:KNOWS]-() WHERE r.since >= $w AND r.since = $x AND r.note = $n RETURN r",
+        &composite,
+    );
+    let rendered = plan.root.to_string();
+    assert!(
+        rendered.contains("RelCompositeIndexSeek"),
+        "the full-key composite equality still wins:\n{rendered}"
+    );
+    assert!(
+        !is_rel_range_seek(&plan),
+        "the range does not displace the composite:\n{rendered}"
+    );
+}
+
+/// The `(id(a), id(rr), id(b))` triples of a seek plan and of the same query planned with an empty
+/// catalog, asserted equal — the seek-vs-scan parity witness. Also asserts the seek plan really uses
+/// the range seek and the scan plan really does not (non-vacuity).
+fn assert_range_seek_parity(
+    coord: &mut Coord,
+    indexed: &IndexCatalog,
+    src: &str,
+    params: &Parameters,
+    expect_rows: bool,
+) {
+    let seek_plan = compile_cat(src, indexed);
+    let scan_plan = compile_cat(src, &IndexCatalog::empty());
+    assert!(
+        is_rel_range_seek(&seek_plan),
+        "expected a RelIndexRangeSeek for: {src}\n{}",
+        seek_plan.root
+    );
+    assert!(
+        !is_rel_range_seek(&scan_plan),
+        "the empty-catalog plan must scan: {src}\n{}",
+        scan_plan.root
+    );
+    let seek_rows = triples(&run_read(coord, &seek_plan, params));
+    let scan_rows = triples(&run_read(coord, &scan_plan, params));
+    if expect_rows {
+        assert!(!seek_rows.is_empty(), "{src} should match something");
+    }
+    assert_eq!(
+        seek_rows, scan_rows,
+        "the range seek and the scan + filter must return the identical row multiset for: {src}"
+    );
+}
+
+/// Seeds the parity graph: three `:P` nodes, four `:KNOWS` relationships with distinct `since` values
+/// (one of them a **self-loop**, which an undirected pattern must bind exactly once), and a wrong-type
+/// `:LIKES` edge that no `:KNOWS` seek may ever return. Returns the coordinator with the index Online.
+fn seeded_range_coord() -> Coord {
+    let mut coord = fresh_coord();
+    run_write(&mut coord, "CREATE (:P {n: 1}), (:P {n: 2}), (:P {n: 3})");
+    run_write(
+        &mut coord,
+        "MATCH (a:P {n: 1}), (b:P {n: 2}) CREATE (a)-[:KNOWS {since: 2019}]->(b)",
+    );
+    run_write(
+        &mut coord,
+        "MATCH (a:P {n: 2}), (b:P {n: 3}) CREATE (a)-[:KNOWS {since: 2020}]->(b)",
+    );
+    run_write(
+        &mut coord,
+        "MATCH (a:P {n: 1}), (b:P {n: 3}) CREATE (a)-[:KNOWS {since: 2021}]->(b)",
+    );
+    // A self-loop above the bound: undirected must bind it exactly once (not twice).
+    run_write(
+        &mut coord,
+        "MATCH (a:P {n: 1}) CREATE (a)-[:KNOWS {since: 2022}]->(a)",
+    );
+    // A wrong-type edge inside the range: never matched.
+    run_write(
+        &mut coord,
+        "MATCH (a:P {n: 2}), (b:P {n: 3}) CREATE (a)-[:LIKES {since: 2021}]->(b)",
+    );
+    coord
+        .create_rel_property_index_named(Some("ix_since"), "KNOWS", "since", false)
+        .expect("create rel-property index");
+    coord
+}
+
+#[test]
+fn rel_range_seek_rows_match_the_scan_filter_rows_across_directions_and_self_loops() {
+    // Execution parity: the `RelIndexRangeSeek` returns the identical row multiset as the empty-catalog
+    // typed-scan + filter plan — for a directed, a reverse-directed and an undirected pattern (the last
+    // binding both endpoint orientations, and a self-loop exactly once), with a wrong-type edge inside
+    // the range to prove the type re-check (`rmp` task #680).
+    let mut coord = seeded_range_coord();
+    let indexed = coord.catalog();
+    let params = Parameters::new().with("x", Value::Integer(2020));
+
+    for pattern in [
+        "MATCH (a)-[r:KNOWS]->(b) WHERE r.since >= $x RETURN id(a) AS a, id(r) AS rr, id(b) AS b",
+        "MATCH (a)<-[r:KNOWS]-(b) WHERE r.since >= $x RETURN id(a) AS a, id(r) AS rr, id(b) AS b",
+        "MATCH (a)-[r:KNOWS]-(b) WHERE r.since >= $x RETURN id(a) AS a, id(r) AS rr, id(b) AS b",
+    ] {
+        assert_range_seek_parity(&mut coord, &indexed, pattern, &params, true);
+    }
+}
+
+#[test]
+fn rel_range_seek_parity_for_every_bound_and_an_open_side() {
+    // Every bound operator, over the same graph: a strict / inclusive lower bound (an **open upper**
+    // side) and a strict / inclusive upper bound (an **open lower** side) must each be bag-equivalent to
+    // the scan + filter. The open-lower case is the one whose candidate set the index cannot express as
+    // a bounded range (it degrades to "every candidate for the token") — the re-check must still trim it
+    // exactly (`rmp` task #680).
+    let mut coord = seeded_range_coord();
+    let indexed = coord.catalog();
+    let params = Parameters::new().with("x", Value::Integer(2020));
+
+    for pattern in [
+        // Open upper.
+        "MATCH (a)-[r:KNOWS]->(b) WHERE r.since >= $x RETURN id(a) AS a, id(r) AS rr, id(b) AS b",
+        "MATCH (a)-[r:KNOWS]->(b) WHERE r.since > $x RETURN id(a) AS a, id(r) AS rr, id(b) AS b",
+        // Open lower.
+        "MATCH (a)-[r:KNOWS]->(b) WHERE r.since <= $x RETURN id(a) AS a, id(r) AS rr, id(b) AS b",
+        "MATCH (a)-[r:KNOWS]->(b) WHERE r.since < $x RETURN id(a) AS a, id(r) AS rr, id(b) AS b",
+        // Undirected, open lower (both orientations AND the degraded candidate set together).
+        "MATCH (a)-[r:KNOWS]-(b) WHERE r.since < $x RETURN id(a) AS a, id(r) AS rr, id(b) AS b",
+    ] {
+        assert_range_seek_parity(&mut coord, &indexed, pattern, &params, true);
+    }
+
+    // A two-sided range: the seek consumes ONE bound and the other is re-attached as a residual filter.
+    // Both must be applied — the result is the intersection.
+    let two_sided = "MATCH (a)-[r:KNOWS]->(b) WHERE r.since >= 2020 AND r.since <= 2021 \
+                     RETURN id(a) AS a, id(r) AS rr, id(b) AS b";
+    let plan = compile_cat(two_sided, &indexed);
+    assert!(is_rel_range_seek(&plan), "{}", plan.root);
+    assert!(
+        plan.root.to_string().contains("Filter"),
+        "the second bound is a residual filter:\n{}",
+        plan.root
+    );
+    assert_range_seek_parity(&mut coord, &indexed, two_sided, &Parameters::new(), true);
+    // Exactly the 2020 and 2021 relationships (not the 2019, not the 2022 self-loop).
+    assert_eq!(
+        triples(&run_read(&mut coord, &plan, &Parameters::new())).len(),
+        2,
+        "the two-sided range matches exactly the two in-range relationships"
+    );
+
+    // An empty range still agrees (and returns nothing).
+    let empty_range = "MATCH (a)-[r:KNOWS]->(b) WHERE r.since >= 9999 \
+                       RETURN id(a) AS a, id(r) AS rr, id(b) AS b";
+    assert_range_seek_parity(&mut coord, &indexed, empty_range, &Parameters::new(), false);
+    assert!(
+        triples(&run_read(
+            &mut coord,
+            &compile_cat(empty_range, &indexed),
+            &Parameters::new()
+        ))
+        .is_empty(),
+        "an out-of-range bound matches nothing"
+    );
+}
+
+#[test]
+fn rel_range_seek_falls_back_to_the_scan_when_the_index_is_gone() {
+    // The executor's fallback: a plan that CONTAINS the `RelIndexRangeSeek` (compiled while the index was
+    // Online) must still return the complete, correct rows after the index is dropped — the seam declines
+    // (`index_seek_rel_range` -> `None`) and the operator falls back to the typed relationship scan +
+    // the identical range filter. This is the same path the off-thread reader (`ReadOnlyGraph`, which
+    // keeps the trait default `None`) and a restricted RBAC principal take (`rmp` task #680).
+    let mut coord = seeded_range_coord();
+    let indexed = coord.catalog();
+    let params = Parameters::new().with("x", Value::Integer(2020));
+    let src =
+        "MATCH (a)-[r:KNOWS]->(b) WHERE r.since >= $x RETURN id(a) AS a, id(r) AS rr, id(b) AS b";
+
+    let plan = compile_cat(src, &indexed);
+    assert!(is_rel_range_seek(&plan), "{}", plan.root);
+    let with_index = triples(&run_read(&mut coord, &plan, &params));
+    assert_eq!(with_index.len(), 3, "2020, 2021 and the 2022 self-loop");
+
+    // Drop the index. The PLAN is unchanged (still a `RelIndexRangeSeek` — proving the fallback is what
+    // runs, not a re-planned scan).
+    assert!(
+        coord
+            .drop_rel_property_index("KNOWS", "since")
+            .expect("drop the rel index"),
+        "the index existed and was dropped"
+    );
+    assert!(
+        is_rel_range_seek(&plan),
+        "the compiled plan still carries the range seek:\n{}",
+        plan.root
+    );
+    let after_drop = triples(&run_read(&mut coord, &plan, &params));
+    assert_eq!(
+        after_drop, with_index,
+        "the scan fallback must return exactly the rows the seek did — a dropped index may not lose \
+         a single committed relationship"
+    );
+}
+
+#[test]
+fn rel_range_seek_declines_a_bound_that_references_an_endpoint() {
+    // REGRESSION (`rmp` task #680, fixing a pre-existing `rmp` #659 / #666 defect).
+    //
+    // A relationship seek binds ALL THREE of `r`, `a` and `b` — the endpoints are materialised from the
+    // matched relationship's own record — and the executor evaluates its seek value against the EMPTY
+    // row. A predicate whose value references an endpoint (`WHERE r.since = a.age`) is therefore
+    // unknowable when the seek runs: the old planner still lowered it to a `RelIndexSeek`, whose value
+    // evaluated to `null`, and the query silently returned ZERO rows where the scan path returned the
+    // true matches. Declaring an index made a correct query return nothing.
+    //
+    // Both the equality and the range form must now DECLINE the seek and stay a scan + filter, and both
+    // must return the same rows as the no-index plan.
+    let mut coord = fresh_coord();
+    run_write(
+        &mut coord,
+        "CREATE (:P {age: 2020})-[:KNOWS {since: 2020}]->(:P {age: 9})",
+    );
+    run_write(
+        &mut coord,
+        "CREATE (:P {age: 1})-[:KNOWS {since: 5555}]->(:P {age: 2})",
+    );
+    coord
+        .create_rel_property_index_named(Some("ix_since"), "KNOWS", "since", false)
+        .expect("create rel-property index");
+    let indexed = coord.catalog();
+    let params = Parameters::new();
+
+    for src in [
+        "MATCH (a)-[r:KNOWS]->(b) WHERE r.since = a.age RETURN id(a) AS a, id(r) AS rr, id(b) AS b",
+        "MATCH (a)-[r:KNOWS]->(b) WHERE r.since >= a.age RETURN id(a) AS a, id(r) AS rr, id(b) AS b",
+        "MATCH (a)-[r:KNOWS]->(b) WHERE r.since >= b.age RETURN id(a) AS a, id(r) AS rr, id(b) AS b",
+        // The relationship's own property as the bound is rejected by `analyze_property_predicate`
+        // itself (a seek value may not reference the row it produces) — pinned here for completeness.
+        "MATCH (a)-[r:KNOWS]->(b) WHERE r.since >= r.since RETURN id(a) AS a, id(r) AS rr, id(b) AS b",
+    ] {
+        let plan = compile_cat(src, &indexed);
+        assert!(
+            !is_rel_seek(&plan) && !is_rel_range_seek(&plan),
+            "a value referencing a variable the seek itself binds must NOT be seeked: {src}\n{}",
+            plan.root
+        );
+        assert_eq!(
+            plan.index_dependencies().count(),
+            0,
+            "the declined plan declares no index dependency: {src}"
+        );
+        let indexed_rows = triples(&run_read(&mut coord, &plan, &params));
+        let scan_rows = triples(&run_read(
+            &mut coord,
+            &compile_cat(src, &IndexCatalog::empty()),
+            &params,
+        ));
+        assert_eq!(
+            indexed_rows, scan_rows,
+            "with and without the index the rows must be identical: {src}"
+        );
+        assert!(
+            !indexed_rows.is_empty(),
+            "the query really does match something (the pre-fix seek returned ZERO): {src}"
+        );
+    }
+}
+
+#[test]
+fn a_cross_type_rel_range_bound_agrees_with_the_scan() {
+    // REGRESSION (`rmp` task #680): the seek's per-candidate re-check applies the **Cypher comparison
+    // semantics** (`eval::satisfies_range` — cross-class is incomparable, so the predicate is NULL and
+    // the row is dropped), NOT the total orderability that ranks `STRING < NUMBER`. Otherwise an
+    // INTEGER-valued `since` would satisfy `>= 'abc'` through the index while the scan + `Filter` plan
+    // (correctly) returned nothing — an index changing a query's result.
+    let mut coord = seeded_range_coord();
+    let indexed = coord.catalog();
+
+    let src = "MATCH (a)-[r:KNOWS]->(b) WHERE r.since >= 'abc' \
+               RETURN id(a) AS a, id(r) AS rr, id(b) AS b";
+    let plan = compile_cat(src, &indexed);
+    assert!(
+        is_rel_range_seek(&plan),
+        "non-vacuity: the cross-type bound really is planned as a range seek:\n{}",
+        plan.root
+    );
+    let seek_rows = triples(&run_read(&mut coord, &plan, &Parameters::new()));
+    let scan_rows = triples(&run_read(
+        &mut coord,
+        &compile_cat(src, &IndexCatalog::empty()),
+        &Parameters::new(),
+    ));
+    assert!(
+        scan_rows.is_empty(),
+        "an INTEGER property against a STRING bound is incomparable: the WHERE drops every row"
+    );
+    assert_eq!(
+        seek_rows, scan_rows,
+        "the relationship range seek must agree with the scan + filter on a cross-type bound"
+    );
+}
+
+#[test]
+fn rel_range_seek_excludes_a_deleted_and_an_uncommitted_relationship() {
+    // MVCC re-check on the range path (the analogue of the #659 equality tests): after a matching
+    // relationship is deleted, the seek's candidate re-check (`rel_data`) drops it even though a stale
+    // index entry may still name it; and a concurrent writer's UNCOMMITTED matching relationship —
+    // already present in the shared in-memory index, which is maintained at write time — is invisible to
+    // a reader whose snapshot predates it (`rmp` task #680).
+    let mut coord = seeded_range_coord();
+    let indexed = coord.catalog();
+    let params = Parameters::new().with("x", Value::Integer(2020));
+    let plan = compile_cat(
+        "MATCH (a)-[r:KNOWS]->(b) WHERE r.since >= $x RETURN id(a) AS a, id(r) AS rr, id(b) AS b",
+        &indexed,
+    );
+    assert!(is_rel_range_seek(&plan), "{}", plan.root);
+    assert_eq!(
+        triples(&run_read(&mut coord, &plan, &params)).len(),
+        3,
+        "2020, 2021 and the 2022 self-loop are in range"
+    );
+
+    // Delete the 2021 relationship: the seek must drop it.
+    run_write(&mut coord, "MATCH ()-[r:KNOWS {since: 2021}]->() DELETE r");
+    assert_eq!(
+        triples(&run_read(&mut coord, &plan, &params)).len(),
+        2,
+        "a deleted relationship must not be returned by the range seek"
+    );
+
+    // A concurrent writer adds an in-range relationship but never commits.
+    let writer = coord.begin_serializable();
+    {
+        let wplan =
+            compile("MATCH (a:P {n: 1}), (b:P {n: 2}) CREATE (a)-[:KNOWS {since: 2050}]->(b)");
+        let bound = bind_parameters(&wplan, &Parameters::new()).expect("bind");
+        let mut graph = coord.statement(writer).expect("statement");
+        let mut cursor = execute(&wplan, &bound, &mut graph).expect("open cursor");
+        let _ = cursor.collect_all().expect("collect");
+    }
+    assert_eq!(
+        triples(&run_read(&mut coord, &plan, &params)).len(),
+        2,
+        "the uncommitted relationship must be invisible to the range seek"
+    );
+    coord.rollback(writer).expect("rollback the writer");
+    assert_eq!(
+        triples(&run_read(&mut coord, &plan, &params)).len(),
+        2,
+        "after the rollback only the committed in-range relationships remain"
+    );
+}
+
+#[test]
+fn rel_range_seek_covers_the_cypher_equal_numeric_class() {
+    // REGRESSION (`rmp` #680 storage audit): a Float lower bound over Integer-valued relationship data
+    // (and the signed-zero variants) must return the same rows via the `RelIndexRangeSeek` as via the
+    // scan + filter. The shared `PropertyIndex::seek_range` used to anchor the inclusive lower bound at
+    // the bound's single key, skipping Cypher-equal siblings that encode below it (`Integer(2020)` sorts
+    // below `Float(2020.0)`; `Float(-0.0)`/`Integer(0)` below `Float(0.0)`) — a silent dropped-row. The
+    // fix anchors at the byte-minimum of the equal class; this test pins it end-to-end for relationships.
+    let mut coord = fresh_coord();
+    run_write(&mut coord, "CREATE (:P {n: 1}), (:P {n: 2}), (:P {n: 3})");
+    // KNOWS.since stored as INTEGER 2019/2020/2021.
+    run_write(
+        &mut coord,
+        "MATCH (a:P {n: 1}), (b:P {n: 2}) CREATE (a)-[:KNOWS {since: 2019}]->(b)",
+    );
+    run_write(
+        &mut coord,
+        "MATCH (a:P {n: 2}), (b:P {n: 3}) CREATE (a)-[:KNOWS {since: 2020}]->(b)",
+    );
+    run_write(
+        &mut coord,
+        "MATCH (a:P {n: 1}), (b:P {n: 3}) CREATE (a)-[:KNOWS {since: 2021}]->(b)",
+    );
+    coord
+        .create_rel_property_index_named(Some("ix_since"), "KNOWS", "since", false)
+        .expect("create rel-property index");
+    let indexed = coord.catalog();
+    let empty = IndexCatalog::empty();
+
+    // A Float bound over the Integer data — the `since = 2020` relationship is the one the old anchor
+    // dropped for a `>= 2020.0` bound.
+    for src in [
+        "MATCH (a)-[r:KNOWS]->(b) WHERE r.since >= 2020.0 RETURN id(a) AS a, id(r) AS rr, id(b) AS b",
+        "MATCH (a)-[r:KNOWS]->(b) WHERE r.since <= 2020.0 RETURN id(a) AS a, id(r) AS rr, id(b) AS b",
+    ] {
+        let seek = compile_cat(src, &indexed);
+        assert!(
+            is_rel_range_seek(&seek),
+            "non-vacuity: {src}\n{}",
+            seek.root
+        );
+        let seek_rows = triples(&run_read(&mut coord, &seek, &Parameters::new()));
+        let scan_rows = triples(&run_read(
+            &mut coord,
+            &compile_cat(src, &empty),
+            &Parameters::new(),
+        ));
+        assert_eq!(
+            seek_rows, scan_rows,
+            "the rel range seek must admit the Cypher-equal Integer sibling of a Float bound: {src}"
+        );
+    }
+    // Concretely: `>= 2020.0` returns the 2020 and 2021 relationships (2 rows), not just 2021.
+    assert_eq!(
+        triples(&run_read(
+            &mut coord,
+            &compile_cat(
+                "MATCH (a)-[r:KNOWS]->(b) WHERE r.since >= 2020.0 \
+                 RETURN id(a) AS a, id(r) AS rr, id(b) AS b",
+                &indexed
+            ),
+            &Parameters::new(),
+        ))
+        .len(),
+        2,
+        "the Integer(2020) relationship must not be dropped by a Float(2020.0) lower bound"
     );
 }

@@ -216,7 +216,7 @@ Two families cost far more than the rest. To separate a genuinely **slow query**
 | Family | p50 @ C=1 (uncontended) | p50 @ C=8 (saturated) | Why |
 |--------|------------------------:|----------------------:|-----|
 | friends, degree, mutual, friend-of-friend, `CONTAINS`, FULLTEXT | ~2.2 ms | ~2.2–2.8 ms | index-backed seeks + bounded traversal |
-| **`like_recent`** (`LIKE.date >= X`) | **10.5 ms** | 15.5 ms | the relationship RANGE index is **equality-only**, so a *range* predicate is a correct **scan + residual filter** — reported honestly, not claimed as a seek (`rmp` #680) |
+| **`like_recent`** (`LIKE.date >= X`) | **10.5 ms** | 15.5 ms | **measured before `rmp` #680**, when the relationship RANGE index was equality-only and a *range* predicate was a full **scan + residual filter**. Since #680 the same predicate lowers to a `RelIndexRangeSeek`; these numbers therefore describe the *old* plan and **must be re-measured** — no improvement is claimed here that has not been measured |
 | **`top_liked`** (aggregation + `ORDER BY` + `LIMIT`) | **12.6 ms** | 20.5 ms | a full aggregation scan over every `LIKE` edge |
 
 The cost is **intrinsic to the query, not to the contention**: even alone on an idle server these two
@@ -267,5 +267,5 @@ The search schema is additionally pinned by a **hermetic schema mirror**,
 `graphus-server/tests/social_network_large_schema.rs`, which drives the equivalent `CREATE … INDEX` /
 `CREATE CONSTRAINT` **strings** through the REAL admin-DDL + `LocalEngine` seam (the exact seam the
 Bolt/REST admin surfaces use) and asserts the full `SHOW INDEXES` / `SHOW CONSTRAINTS` column set, the
-honest relationship-RANGE planner utilisation (`RelIndexSeek` for equality, scan + filter for a
-range), the TEXT/FULLTEXT known-set search, and the existence-constraint enforcement.
+honest relationship-RANGE planner utilisation (`RelIndexSeek` for equality, `RelIndexRangeSeek` for a
+range — `rmp` #680), the TEXT/FULLTEXT known-set search, and the existence-constraint enforcement.

@@ -121,13 +121,16 @@ the relationship `RANGE` index on `TRANSFER.amount` serves:
 
 - an **equality** predicate on a relationship property (`t.amount = 9000`) **is** served from the
   index — it lowers to a `RelIndexSeek`;
-- a **range** predicate (`t.amount >= 9000`) is **not** served — a relationship index seek is
-  equality-only, so the range predicate stays a full traversal + residual `Filter`.
+- a **range** predicate (`t.amount >= 9000`) **is** served too — it lowers to a `RelIndexRangeSeek`,
+  which replaces the whole traversal subtree (both endpoints are materialised from each matched
+  relationship's own record). This was the gap this example originally surfaced empirically; it was
+  closed by `rmp` #680.
 
-So the index is genuinely built and `ONLINE` (an equality seek returns the seeded rows), but the
-detection queries — being all `>=` — scan and filter rather than seek. We assert this **honestly**:
-the example does not claim range-seek utilisation the engine does not provide. (Node RANGE indexes do
-serve range predicates; the relationship-index seek path is equality-only.)
+The seek requires a **seek-materialisable** shape: a standalone, single-type, fixed-length pattern
+whose endpoints are otherwise unconstrained. The multi-hop RING query (`(a:Account)-[r1]->(b:Account)
+-[r2]->…`) therefore still runs as a traversal — its anchor is label-constrained and its later hops
+have prior pattern relationships to exclude — which is correct, not a shortfall. We assert both facts
+**honestly** against the real planner: the example claims exactly the utilisation the engine provides.
 
 ## Detection queries + OLTP mix
 

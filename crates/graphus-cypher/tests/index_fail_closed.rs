@@ -42,7 +42,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use graphus_core::error::GraphusError;
 use graphus_core::{PageId, Value};
 use graphus_cypher::binding::{Parameters, bind_parameters};
-use graphus_cypher::catalog::{IndexKind, IndexTarget};
+use graphus_cypher::catalog::{IndexCatalog, IndexKind, IndexTarget};
 use graphus_cypher::coordinator::TxnCoordinator;
 use graphus_cypher::executor::execute;
 use graphus_cypher::lexer::tokenize;
@@ -386,6 +386,11 @@ fn declare_indexes<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     coord
         .create_text_index("article_title_text", "Article", "title", false)
         .expect("create text index");
+    // A relationship RANGE index, so the relationship range seek (`rmp` task #680) is covered by the
+    // fail-closed battery too: like every other kind it must decline to the scan when it is not `Online`.
+    coord
+        .create_rel_property_index_named(Some("cites_tag_range"), "CITES", "tag", false)
+        .expect("create rel property index");
     // Drive every incremental build to completion so the baseline is fully `Online`.
     let mut iters = 0;
     while coord.has_pending_index_builds() {
@@ -1944,4 +1949,135 @@ fn a_rel_unique_check_fails_closed_on_a_read_fault() {
              uniqueness check swallowed the holder's record/property fault and reported 'no conflict'"
         );
     }
+}
+
+// =================================================================================================
+// The relationship RANGE seek honours the index state too (`rmp` tasks #733 + #680)
+// =================================================================================================
+
+/// The `rmp` #680 relationship range seek must obey the `rmp` #733 index-state gate: a `Populating`
+/// (here: fail-closed–demoted) relationship-property index is a **subset** of the truth, and a range
+/// seek has no residual `Filter` above it that could resurrect a missing row — so the seam MUST decline
+/// it and the operator MUST fall back to the typed relationship scan, returning the complete answer.
+///
+/// # Non-vacuity
+///
+/// The degraded coordinator's own catalog withholds the demoted index, so compiling against it would
+/// yield a plain scan and the seam gate would never be reached — the test would pass on an engine with
+/// no gate at all. So the plan is compiled against a catalog that **claims** the index (exactly the
+/// state a plan cached before the fault, or an operator's stale schema view, would be in), asserted to
+/// really contain the `RelIndexRangeSeek`, and only then executed. The healthy run before the fault
+/// proves the same query is genuinely index-served when the index IS `Online`.
+#[test]
+fn a_degraded_rel_range_index_declines_the_seek_and_still_returns_every_row() {
+    // The truth, from a healthy engine — and proof the query really is index-served when Online.
+    let src = "MATCH (a)-[c:CITES]->(b) WHERE c.tag >= 'p' RETURN id(c) AS id";
+    let mut store = baseline();
+    let truth = {
+        let mut healthy: MemCoord = TxnCoordinator::new(store);
+        assert!(
+            catalog_exposes_rel(&healthy, IndexKind::RelProperty, "CITES", "tag"),
+            "the healthy engine exposes the relationship RANGE index"
+        );
+        assert!(
+            plan_contains(&healthy, src, "RelIndexRangeSeek"),
+            "the healthy engine really plans a RelIndexRangeSeek for {src}"
+        );
+        let ids = ids_of(&run(&mut healthy, src), "id");
+        assert_eq!(
+            ids.len(),
+            1,
+            "exactly the `tag: 'prova'` citation is >= 'p'"
+        );
+        store = healthy.into_store();
+        ids
+    };
+
+    // Fault the rebuild on reopen: every index is made unusable (`IndexSet::fail_closed`).
+    let (device, wal) = restart_on_faulty_device(&mut store);
+    let fault = device.handle();
+    let faulty: FaultyStore =
+        RecordStore::open(device, wal, FAULTED_POOL_PAGES).expect("open store");
+    fault.arm();
+    let mut coord: FaultyCoord = TxnCoordinator::new(faulty);
+    fault.heal();
+
+    assert!(
+        coord.indexes_degraded(),
+        "the rebuild must have failed closed"
+    );
+    assert!(
+        coord
+            .list_rel_property_indexes()
+            .iter()
+            .all(|(_, _, _, state)| *state == IndexState::Populating),
+        "a degraded relationship index must never report itself ONLINE: {:?}",
+        coord.list_rel_property_indexes()
+    );
+    assert!(
+        !catalog_exposes_rel(&coord, IndexKind::RelProperty, "CITES", "tag"),
+        "and the planner catalog must withhold it"
+    );
+
+    // Compile against a catalog that still CLAIMS the index, so the plan genuinely carries the seek and
+    // the seam gate is the thing under test.
+    let claiming = IndexCatalog::builder()
+        .with_rel_property("CITES", "tag")
+        .build();
+    let plan = compile_with(&claiming, src);
+    assert!(
+        format!("{plan:?}").contains("RelIndexRangeSeek"),
+        "non-vacuity: the executed plan must really carry the range seek:\n{plan}"
+    );
+
+    let txn = coord.begin_serializable();
+    let bound = bind_parameters(&plan, &Parameters::new()).expect("bind");
+    let rows = {
+        let mut graph = coord.statement(txn).expect("statement");
+        let rows = {
+            let mut cursor = execute(&plan, &bound, &mut graph).expect("open cursor");
+            cursor.collect_all().expect("collect")
+        };
+        assert!(
+            !graph.has_error(),
+            "the degraded read must not fault: {:?}",
+            graph.take_error()
+        );
+        rows
+    };
+    coord.commit(txn).expect("commit");
+
+    assert_eq!(
+        ids_of(&rows, "id"),
+        truth,
+        "a degraded (Populating) relationship RANGE index must decline the seek and fall back to the \
+         typed scan — never answer from a half-built index and silently drop a committed relationship"
+    );
+}
+
+/// Whether the planner's catalog exposes an index of `kind` covering `(rel_type, property)` — the
+/// relationship analogue of [`catalog_exposes`] (`rmp` task #680).
+fn catalog_exposes_rel<
+    D: BlockDevice + Send + Sync + 'static,
+    S: LogSink + Send + Sync + 'static,
+>(
+    coord: &TxnCoordinator<D, S>,
+    kind: IndexKind,
+    rel_type: &str,
+    property: &str,
+) -> bool {
+    coord.catalog().indexes().iter().any(|d| {
+        d.kind == kind
+            && d.target == IndexTarget::rel_type(rel_type)
+            && d.properties.iter().any(|p| p == property)
+    })
+}
+
+/// Compiles `src` against an explicit `catalog` (rather than the coordinator's), so a plan can carry an
+/// index seek the *degraded* coordinator would no longer plan (`rmp` task #680).
+fn compile_with(catalog: &IndexCatalog, src: &str) -> PhysicalPlan {
+    let toks = tokenize(src).expect("lex");
+    let ast = parse_tokens(&toks, src).expect("parse");
+    let validated = analyze(&ast).expect("analyze");
+    plan_physical(&lower(&validated), catalog)
 }

@@ -1084,3 +1084,282 @@ fn two_anchor_create_edge_executes_over_the_seek_path() {
     );
     assert!(reverse.is_empty(), "no reverse 4 -> 2 edge was created");
 }
+
+// =================================================================================================
+// An index is a PERFORMANCE artefact, never a SEMANTIC one (`rmp` task #680 regression)
+// =================================================================================================
+
+/// A range predicate whose bound is a **different value class** from the property (an `INTEGER` `age`
+/// against a `STRING` bound) must return the SAME rows with and without the index — namely **none**,
+/// because Cypher comparability (CIP §Comparability, the semantics of `<`/`<=`/`>`/`>=`) makes a
+/// cross-class comparison `NULL`, and a `WHERE` clause drops a `NULL` row.
+///
+/// # The bug this pins (`rmp` task #680, found while adding the relationship range seek)
+///
+/// `NodeIndexRangeSeek`'s per-candidate re-check (and its `scan_filter_range` fallback) used
+/// [`cmp_values`](graphus_cypher::cmp_values) — the total **orderability** behind `ORDER BY` / `min` /
+/// `max` / the index key codec, under which value classes are *ranked* (`STRING < NUMBER < null`).
+/// Under that order `30 >= 'abc'` is TRUE (a number out-ranks a string), so the seek returned **every**
+/// node while the scan + `Filter` plan for the identical query returned **none**:
+///
+/// ```text
+/// MATCH (n:P) WHERE n.age >= 'abc' RETURN n.age    -- with a (P, age) index: [30, 10]   WRONG
+///                                                  -- without:               []          correct
+/// ```
+///
+/// Declaring an index silently changed a query's result — a correctness defect, not a performance one.
+/// Both paths now re-check through `eval::satisfies_range`, the single source of truth for the
+/// comparison operators.
+#[test]
+fn a_cross_type_range_bound_returns_the_same_rows_with_and_without_the_index() {
+    let mut coord = fresh_coord();
+    run_write(&mut coord, "CREATE (:P {age: 30}), (:P {age: 10})");
+    coord
+        .create_node_property_index("P", "age")
+        .expect("create the (P, age) range index");
+    let indexed = coord.catalog();
+
+    let src = "MATCH (n:P) WHERE n.age >= 'abc' RETURN n.age AS a";
+    let plan = compile(src, &indexed);
+    // Non-vacuity: the indexed plan really is the seek path under test (without this assertion the
+    // test would pass on an engine that never seeks).
+    assert!(
+        has_index_range_seek(&plan),
+        "the indexed plan must really use the NodeIndexRangeSeek:\n{plan}"
+    );
+
+    let via_index = read_sorted_ints(&mut coord, &indexed, src, "a");
+    let via_scan = read_sorted_ints(&mut coord, &IndexCatalog::empty(), src, "a");
+    assert!(
+        via_scan.is_empty(),
+        "an INTEGER property vs a STRING bound is incomparable: the predicate is NULL, so no row \
+         survives the WHERE — got {via_scan:?}"
+    );
+    assert_eq!(
+        via_index, via_scan,
+        "the index seek MUST agree with the scan + filter: declaring an index may never change a \
+         query's result"
+    );
+
+    // The symmetric orientation (`'abc' <= n.age`, which the planner mirrors into `n.age >= 'abc'`).
+    let mirrored = "MATCH (n:P) WHERE 'abc' <= n.age RETURN n.age AS a";
+    assert!(
+        has_index_range_seek(&compile(mirrored, &indexed)),
+        "the mirrored orientation also seeks"
+    );
+    assert_eq!(
+        read_sorted_ints(&mut coord, &indexed, mirrored, "a"),
+        read_sorted_ints(&mut coord, &IndexCatalog::empty(), mirrored, "a"),
+        "the mirrored bound must agree too"
+    );
+}
+
+/// A `NaN`-valued property must be excluded by a range predicate on **both** paths: openCypher pins
+/// every inequality against a `NaN` operand to `FALSE` (TCK `Comparison2 [5]`), whereas the total
+/// orderability [`cmp_values`](graphus_cypher::cmp_values) ranks `NaN` as the **largest number** — so
+/// the old `cmp_values`-based re-check let `NaN >= 5` through the seek while the scan + `Filter` plan
+/// (correctly) dropped it (`rmp` task #680).
+#[test]
+fn a_nan_property_is_excluded_by_a_range_predicate_on_both_paths() {
+    let mut coord = fresh_coord();
+    run_write(
+        &mut coord,
+        "CREATE (:Q {v: 0.0/0.0}), (:Q {v: 100.0}), (:Q {v: 1.0})",
+    );
+    coord
+        .create_node_property_index("Q", "v")
+        .expect("create the (Q, v) range index");
+    let indexed = coord.catalog();
+
+    let src = "MATCH (n:Q) WHERE n.v >= 5 RETURN toInteger(n.v) AS a";
+    let plan = compile(src, &indexed);
+    assert!(
+        has_index_range_seek(&plan),
+        "the indexed plan must really use the NodeIndexRangeSeek:\n{plan}"
+    );
+
+    let via_index = read_sorted_ints(&mut coord, &indexed, src, "a");
+    let via_scan = read_sorted_ints(&mut coord, &IndexCatalog::empty(), src, "a");
+    assert_eq!(
+        via_scan,
+        vec![100],
+        "only 100.0 satisfies `>= 5` — `NaN >= 5` is FALSE and `1.0 >= 5` is false"
+    );
+    assert_eq!(
+        via_index, via_scan,
+        "the seek must not admit the NaN row the scan + filter rejects"
+    );
+}
+
+/// REGRESSION (`rmp` #680 storage audit): a **Float lower bound over Integer-valued data** (and the
+/// signed-zero variants) must return the same rows with and without the index. The order-preserving
+/// index key sorts `Integer(2020)` below `Float(2020.0)` (numtag tie-break), so a `>= 2020.0` seek
+/// anchored at the bound's own key used to SKIP the Cypher-equal `Integer(2020)` — a silent false
+/// negative where declaring an index dropped a committed row. `PropertyIndex::seek_range` now anchors at
+/// the byte-minimum of the Cypher-equal class, restoring the true-superset contract.
+#[test]
+fn a_float_lower_bound_over_integer_data_returns_the_same_rows_with_and_without_the_index() {
+    let mut coord = fresh_coord();
+    run_write(
+        &mut coord,
+        "CREATE (:P {age: 2019}), (:P {age: 2020}), (:P {age: 2021})",
+    );
+    coord
+        .create_node_property_index("P", "age")
+        .expect("create the (P, age) range index");
+    let indexed = coord.catalog();
+
+    for src in [
+        "MATCH (n:P) WHERE n.age >= 2020.0 RETURN n.age AS a", // the dropped-row case
+        "MATCH (n:P) WHERE n.age > 2019.0 RETURN n.age AS a",
+        "MATCH (n:P) WHERE n.age <= 2020.0 RETURN n.age AS a",
+        "MATCH (n:P) WHERE 2020.0 <= n.age RETURN n.age AS a", // mirrored orientation
+    ] {
+        let plan = compile(src, &indexed);
+        assert!(
+            has_index_range_seek(&plan),
+            "non-vacuity: {src} must really seek:\n{plan}"
+        );
+        let via_index = read_sorted_ints(&mut coord, &indexed, src, "a");
+        let via_scan = read_sorted_ints(&mut coord, &IndexCatalog::empty(), src, "a");
+        assert_eq!(
+            via_index, via_scan,
+            "the Float-bound range seek must agree with the scan + filter for: {src}"
+        );
+    }
+    // The specific dropped row is present: `>= 2020.0` includes 2020.
+    assert_eq!(
+        read_sorted_ints(
+            &mut coord,
+            &indexed,
+            "MATCH (n:P) WHERE n.age >= 2020.0 RETURN n.age AS a",
+            "a",
+        ),
+        vec![2020, 2021],
+        "the Integer(2020) row must not be dropped by a Float(2020.0) lower bound"
+    );
+}
+
+/// REGRESSION (`rmp` #680 storage audit): `Integer(0)`, `Float(0.0)` and `Float(-0.0)` are all
+/// Cypher-equal to zero but encode to distinct keys (`-0.0` sorts below `+0.0`, and the numtag splits
+/// int from float). A `>= 0` / `>= 0.0` / `>= -0.0` seek must admit **all three** regardless of the
+/// bound's spelling — the signed-zero half of the widening the fix restored.
+#[test]
+fn a_zero_lower_bound_admits_every_signed_zero_representation_on_both_paths() {
+    let mut coord = fresh_coord();
+    // Store the three zeros (tagged so we can identify them) plus a positive control.
+    run_write(&mut coord, "CREATE (:Z {tag: 1, v: 0})");
+    run_write(&mut coord, "CREATE (:Z {tag: 2, v: 0.0})");
+    run_write(&mut coord, "CREATE (:Z {tag: 3, v: -0.0})");
+    run_write(&mut coord, "CREATE (:Z {tag: 4, v: 5})");
+    coord
+        .create_node_property_index("Z", "v")
+        .expect("create the (Z, v) range index");
+    let indexed = coord.catalog();
+
+    for src in [
+        "MATCH (n:Z) WHERE n.v >= 0 RETURN n.tag AS a",
+        "MATCH (n:Z) WHERE n.v >= 0.0 RETURN n.tag AS a",
+        "MATCH (n:Z) WHERE n.v >= -0.0 RETURN n.tag AS a",
+    ] {
+        let plan = compile(src, &indexed);
+        assert!(
+            has_index_range_seek(&plan),
+            "non-vacuity: {src} must really seek:\n{plan}"
+        );
+        let via_index = read_sorted_ints(&mut coord, &indexed, src, "a");
+        let via_scan = read_sorted_ints(&mut coord, &IndexCatalog::empty(), src, "a");
+        assert_eq!(
+            via_index,
+            vec![1, 2, 3, 4],
+            "every zero representation (and the positive control) is >= zero: {src}"
+        );
+        assert_eq!(via_index, via_scan, "seek must agree with scan for: {src}");
+    }
+}
+
+/// REGRESSION (found while certifying `rmp` #680): a **`List`-typed bound** on an indexed property is
+/// the one value class that is COMPARABLE under Cypher (`compare_values` on two lists is `Some`) yet
+/// UNINDEXABLE under the key codec (`encode_value` errors `Unindexable("List")`). A range predicate
+/// whose bound is a list must therefore return the SAME rows with and without the index. Before the
+/// fix the seam's `seek_..._property_range` collapsed the bound's encode error to `Some(empty)` (via
+/// `unwrap_or_default`) rather than `None`, so the executor used the empty candidate set and never took
+/// the scan fallback: `n.data >= [1,2,3]` returned 0 rows through the index but 1 row through the scan
+/// — an index silently changing a query's result, the exact defect class #680 exists to eliminate. The
+/// fix makes the seam decline (`None`) whenever a bound is not index-encodable, forcing the exact scan.
+#[test]
+fn a_list_range_bound_returns_the_same_rows_with_and_without_the_index() {
+    let mut coord = fresh_coord();
+    // A node whose list property is Cypher-`>=` the list bound, plus a control that is not.
+    run_write(&mut coord, "CREATE (:T {tag: 1, data: [1, 2, 3, 4]})");
+    run_write(&mut coord, "CREATE (:T {tag: 2, data: [1, 2]})");
+    coord
+        .create_node_property_index("T", "data")
+        .expect("create the (T, data) range index");
+    let indexed = coord.catalog();
+
+    for src in [
+        "MATCH (n:T) WHERE n.data >= [1, 2, 3] RETURN n.tag AS a",
+        "MATCH (n:T) WHERE n.data < [1, 2, 3] RETURN n.tag AS a",
+        "MATCH (n:T) WHERE [1, 2, 3] <= n.data RETURN n.tag AS a", // mirrored orientation
+    ] {
+        // Non-vacuity: the indexed plan really lowers to the range seek under test (so it is genuinely
+        // exercising the seam decline + scan fallback, not a plan that never seeks).
+        let plan = compile(src, &indexed);
+        assert!(
+            has_index_range_seek(&plan),
+            "non-vacuity: {src} must really lower to a NodeIndexRangeSeek:\n{plan}"
+        );
+        let via_index = read_sorted_ints(&mut coord, &indexed, src, "a");
+        let via_scan = read_sorted_ints(&mut coord, &IndexCatalog::empty(), src, "a");
+        assert_eq!(
+            via_index, via_scan,
+            "a List-typed range bound must return the same rows with and without the index: {src}"
+        );
+    }
+    // The specific row a list bound must NOT drop: `[1,2,3,4] >= [1,2,3]` is `True`.
+    assert_eq!(
+        read_sorted_ints(
+            &mut coord,
+            &indexed,
+            "MATCH (n:T) WHERE n.data >= [1, 2, 3] RETURN n.tag AS a",
+            "a",
+        ),
+        vec![1],
+        "the `[1,2,3,4]` node (tag 1) satisfies `>= [1,2,3]` and must survive the index path"
+    );
+}
+
+/// REGRESSION (found while certifying `rmp` #680): the equality twin of
+/// [`a_list_range_bound_returns_the_same_rows_with_and_without_the_index`]. A `= [list]` equality
+/// predicate on an indexed property shares the identical root cause — `seek_node_property_eq` collapsed
+/// the bound's encode error to `Some(empty)`, so `n.data = [1,2,3]` returned 0 rows via the index but 1
+/// via the scan. The seam now declines (`None`) on a non-encodable bound, forcing the exact scan.
+#[test]
+fn a_list_equality_bound_returns_the_same_rows_with_and_without_the_index() {
+    let mut coord = fresh_coord();
+    run_write(&mut coord, "CREATE (:T {tag: 1, data: [1, 2, 3]})");
+    run_write(&mut coord, "CREATE (:T {tag: 2, data: [9]})");
+    coord
+        .create_node_property_index("T", "data")
+        .expect("create the (T, data) index");
+    let indexed = coord.catalog();
+
+    let src = "MATCH (n:T) WHERE n.data = [1, 2, 3] RETURN n.tag AS a";
+    let plan = compile(src, &indexed);
+    assert!(
+        has_index_seek(&plan),
+        "non-vacuity: the indexed plan must really lower to a NodeIndexSeek:\n{plan}"
+    );
+    let via_index = read_sorted_ints(&mut coord, &indexed, src, "a");
+    let via_scan = read_sorted_ints(&mut coord, &IndexCatalog::empty(), src, "a");
+    assert_eq!(
+        via_scan,
+        vec![1],
+        "the `[1,2,3]` node (tag 1) equals the list bound"
+    );
+    assert_eq!(
+        via_index, via_scan,
+        "a List-typed equality bound must return the same rows with and without the index"
+    );
+}

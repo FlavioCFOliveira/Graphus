@@ -637,6 +637,70 @@ fn compare(op: BinaryOp, a: &Value, b: &Value) -> Ternary {
     }
 }
 
+/// Whether `value` satisfies the range predicate `[lower, upper]` under **exactly** the Cypher
+/// semantics of `<` / `<=` / `>` / `>=` — the single source of truth every *index* range path re-checks
+/// against (`rmp` task #680).
+///
+/// Each bound is `(bound_value, inclusive)`; a `None` side is open. The result is `true` only when
+/// every present bound evaluates to [`Ternary::True`] under [`compare`] — so a `NULL` (`null` operand,
+/// or **incomparable** cross-class operands such as an `INTEGER` property against a `STRING` bound) and
+/// a `FALSE` (a `NaN` against a numeric bound) both exclude the value, exactly as a `WHERE` clause
+/// would. An open range (`None`/`None`) accepts every non-null value — the `IS NOT NULL` existence
+/// scan's contract.
+///
+/// # Why this exists (`rmp` task #680, a pre-existing correctness bug)
+///
+/// The index range paths used to re-check with [`cmp_values`](crate::ordering::cmp_values) — the total
+/// **orderability** (`ORDER BY`, `min`/`max`, the index key codec), under which classes are *ranked*
+/// (`STRING < NUMBER < null`) and `NaN` is the largest number. That is **not** the semantics of the
+/// comparison operators (CIP §Comparability, [`compare_values`]), under which a cross-class comparison
+/// is `NULL` and `NaN` vs a number is `FALSE`. The two disagreed, so *declaring an index changed query
+/// results*: `MATCH (n:P) WHERE n.age >= 'abc'` (an `INTEGER` `age`) returned **every** node through
+/// `NodeIndexRangeSeek` (integers out-rank strings) but **none** through the equivalent scan + `Filter`.
+/// An index is a performance artefact and must never be a semantic one, so every range re-check now
+/// funnels through this one function.
+///
+/// # Soundness of the index candidate set
+///
+/// This re-check is only sound if the seek's candidate set is a **true superset** of the rows this
+/// predicate accepts — the re-check can *remove* rows but never *add* a missing one. The candidate set
+/// is the order-preserving index range `[lo, hi)` widened to cover the whole Cypher-equal class at each
+/// bound (`PropertyIndex::seek_range` anchors the lower bound at the byte-minimum over
+/// `numeric_equal_probes`, so a `>= 2020.0` bound still admits a stored `Integer(2020)` whose key sorts
+/// below `Float(2020.0)`; the upper bound over-includes by construction). Without that widening the
+/// candidate set was **not** a superset and this re-check would silently drop true matches — the
+/// `rmp` #680 storage audit's CRITICAL, fixed at `graphus-index`'s `seek_range`.
+pub(crate) fn satisfies_range(
+    value: &Value,
+    lower: Option<(&Value, bool)>,
+    upper: Option<(&Value, bool)>,
+) -> bool {
+    let holds = |op: BinaryOp, bound: &Value| matches!(compare(op, value, bound), Ternary::True);
+    if let Some((bound, inclusive)) = lower {
+        let op = if inclusive {
+            BinaryOp::Gte
+        } else {
+            BinaryOp::Gt
+        };
+        if !holds(op, bound) {
+            return false;
+        }
+    }
+    if let Some((bound, inclusive)) = upper {
+        let op = if inclusive {
+            BinaryOp::Lte
+        } else {
+            BinaryOp::Lt
+        };
+        if !holds(op, bound) {
+            return false;
+        }
+    }
+    // An open range accepts anything present and non-null (`IS NOT NULL`); a null value never
+    // satisfies a range predicate (`null >= x` is `NULL`), so it is excluded on both sides.
+    !value.is_null()
+}
+
 /// Evaluates the `=~` regular-expression match `subject =~ pattern` under Cypher 3VL semantics
 /// (`rmp` task #446, `04 §7.6`), reproducing Neo4j's `java.util.regex` behaviour.
 ///

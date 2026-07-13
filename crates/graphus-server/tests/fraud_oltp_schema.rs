@@ -13,8 +13,10 @@
 //!   `RANGE` indexes, a `NODE KEY`, a node `UNIQUE`, a **`RELATIONSHIP KEY`** on `TRANSFER.tx_id`, and
 //!   the two relationship property constraints;
 //! - the **empirical planner utilisation** of the relationship `RANGE` index: Graphus serves an
-//!   *equality* predicate on a relationship property from it (a `RelIndexSeek`) but **not** a `>=`
-//!   range predicate (that stays a scan + filter) — asserted honestly on the real planner;
+//!   *equality* predicate on a relationship property from it (a `RelIndexSeek`) **and** a `>=` range
+//!   predicate (a `RelIndexRangeSeek`, `rmp` #680 — the gap this example originally surfaced), while the
+//!   multi-hop ring query correctly stays a traversal (its labelled anchor is not a seek-materialisable
+//!   shape) — all asserted honestly on the real planner;
 //! - **constraint enforcement**: a duplicate `Account.id`, a null-`amount` `TRANSFER`, a non-integer
 //!   `amount` `TRANSFER`, a **duplicate** `TRANSFER.tx_id`, and a **missing** `TRANSFER.tx_id` are each
 //!   rejected with the constraint-violation error class (the `RELATIONSHIP KEY` enforces present +
@@ -337,12 +339,15 @@ fn schema_first_load_declares_new_index_and_constraint_kinds() {
 }
 
 #[test]
-fn rel_range_index_serves_equality_but_not_range_predicates() {
-    // The honest empirical planner finding (`rmp` #673): Graphus's relationship RANGE index serves an
-    // EQUALITY predicate on a relationship property (a `RelIndexSeek`) but NOT a `>=` range predicate
-    // (which stays a full `ExpandAll` + `Filter` scan). We assert on the real public planner against a
-    // catalog that models exactly the schema's `transfer_amount_range` index, then tie it back to the
-    // engine: the index is really Online, and the `>=` detection query still returns the correct fraud.
+fn rel_range_index_serves_both_equality_and_range_predicates() {
+    // The relationship RANGE index serves an EQUALITY predicate on a relationship property (a
+    // `RelIndexSeek`, `rmp` #659) **and**, since `rmp` #680, a `>=` / `<=` / `>` / `<` RANGE predicate (a
+    // `RelIndexRangeSeek`). The range half is what this example empirically surfaced as missing in
+    // `rmp` #673 — a `>=` on `TRANSFER.amount` used to stay a full `ExpandAll` + `Filter` scan.
+    //
+    // Asserted on the real public planner against a catalog that models exactly the schema's
+    // `transfer_amount_range` index, then tied back to the engine: the index is really Online, and the
+    // detection queries return the correct fraud.
     let (mut eng, dataset) = load_schema_first();
 
     let catalog = IndexCatalog::builder()
@@ -365,32 +370,40 @@ fn rel_range_index_serves_equality_but_not_range_predicates() {
         "the equality plan depends on exactly the relationship index:\n{eq_render}"
     );
 
-    // A `>=` range predicate is NOT served — it stays a scan + filter (no index dependency).
+    // ...and a `>=` RANGE predicate is served too (`rmp` #680) — the detection predicate this example
+    // is built around. It is a `RelIndexRangeSeek` (a DISTINCT operator: `RelIndexSeek` is not a
+    // substring of `RelIndexRangeSeek`, so the equality assertion above cannot be satisfied by it).
     let ge_plan = plan(
         "MATCH ()-[t:TRANSFER]->() WHERE t.amount >= 9000 RETURN t.amount",
         &catalog,
     );
     let ge_render = ge_plan.to_string();
     assert!(
-        !ge_render.contains("RelIndexSeek"),
-        "a `>=` predicate is NOT served by the rel RANGE index (equality-only):\n{ge_render}"
+        ge_render.contains("RelIndexRangeSeek"),
+        "a `>=` predicate must lower to a RelIndexRangeSeek:\n{ge_render}"
     );
     assert!(
-        ge_render.contains("Filter") && ge_render.contains("ExpandAll"),
-        "the `>=` predicate is a scan + residual filter:\n{ge_render}"
+        !ge_render.contains("ExpandAll"),
+        "the seek REPLACES the ExpandAll scan subtree (it materialises both endpoints from the \
+         relationship's own record):\n{ge_render}"
     );
     assert_eq!(
         ge_plan.index_dependencies().count(),
-        0,
-        "the `>=` plan uses no index:\n{ge_render}"
+        1,
+        "the `>=` plan depends on exactly the relationship index:\n{ge_render}"
     );
 
-    // The actual RING detection query (all `>=`) likewise uses no relationship index.
+    // The actual RING detection query does NOT seek: its anchor is a **label-constrained** `(a:Account)`
+    // (a label scan, not the bare all-nodes scan the seek's shape gate requires) and its second/third
+    // hops have prior pattern relationships to exclude. A relationship seek materialises both endpoints
+    // from the relationship's own record, which is only sound for a standalone single-hop pattern — so
+    // the multi-hop ring stays a traversal, correctly.
     let ring_plan = plan(RING_QUERY, &catalog);
     assert_eq!(
         ring_plan.index_dependencies().count(),
         0,
-        "the ring detection query uses no relationship index (its predicates are all `>=`)"
+        "the multi-hop ring detection query is not a seek-materialisable shape (labelled anchor + \
+         prior pattern relationships), so it uses no relationship index:\n{ring_plan}"
     );
 
     // Tie back to the engine: the relationship RANGE index really is Online, and — because a schema-

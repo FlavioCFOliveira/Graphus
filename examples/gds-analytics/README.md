@@ -131,10 +131,11 @@ constraint and a **relationship RANGE** index:
 > node RANGE index on the integer `field` id — not the other way round — so a schema-first load
 > succeeds by construction.
 
-> **Relationship RANGE index — honest planner note (`rmp` #680).** Graphus serves an **equality**
-> predicate on a relationship property from the index (`WHERE c.weight = 5` lowers to a `RelIndexSeek`),
-> but a **range** predicate (`WHERE c.weight >= 5`) stays a full `ExpandAll` + `Filter` scan. This is
-> asserted honestly by `crates/graphus-server/tests/gds_analytics_schema.rs` against the real planner.
+> **Relationship RANGE index — planner utilisation (`rmp` #680).** Graphus serves an **equality**
+> predicate on a relationship property from the index (`WHERE c.weight = 5` lowers to a `RelIndexSeek`)
+> **and** a **range** predicate (`WHERE c.weight >= 5` lowers to a `RelIndexRangeSeek`, which replaces
+> the `ExpandAll` + `Filter` scan entirely). Both are asserted honestly by
+> `crates/graphus-server/tests/gds_analytics_schema.rs` against the real planner.
 
 The live workload (`data/analyze.js`) additionally captures the live `SHOW CONSTRAINTS` / `SHOW
 INDEXES` catalog as evidence and proves the property-type constraint **rejects** a non-string

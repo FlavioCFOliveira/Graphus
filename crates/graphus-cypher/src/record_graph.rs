@@ -2322,10 +2322,14 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         self.mark_all_live_rels();
         // Candidate ids for `(type, prop) == value`; the index is candidate-only, so re-check the full
         // predicate per candidate (visible + current type + current value equals `value`).
-        let candidates = index
+        let Some(candidates) = index
             .borrow_mut()
             .seek_rel_property_eq(type_token, prop_key, value)
-            .unwrap_or_default();
+        else {
+            // Seam declined (an unindexable `List` bound): take the exact scan fallback rather than a
+            // silently empty result (`rmp` #680).
+            return None;
+        };
         let mut out: Vec<u64> = candidates
             .into_iter()
             .filter(|&id| {
@@ -2334,6 +2338,70 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                     Some(data) if data.rel_type == type_name => self
                         .rel_property(r, property)
                         .is_some_and(|v| crate::equality::equals(&v, value).is_true()),
+                    _ => false,
+                }
+            })
+            .collect();
+        // De-duplicate: a stale + a live index entry can name the same id twice.
+        out.sort_unstable();
+        out.dedup();
+        Some(out)
+    }
+
+    /// Index-backed **range** seek over relationships of `type_name` (`rmp` task #680): the candidate
+    /// relationship ids whose current `property` satisfies `[lower, upper]`, re-checked against the store.
+    /// The range analogue of [`rel_index_seek_eq`](Self::rel_index_seek_eq); [`None`] when no
+    /// [`IndexState::Online`] relationship-property index covers `(type_token, prop_key)` (the executor
+    /// then falls back to a typed relationship scan + residual range filter).
+    fn rel_index_seek_range(
+        &self,
+        type_token: u32,
+        prop_key: u32,
+        type_name: &str,
+        property: &str,
+        lower: Option<(&Value, bool)>,
+        upper: Option<(&Value, bool)>,
+    ) -> Option<Vec<u64>> {
+        let index = self.index.as_ref()?;
+        // Only an ONLINE index may serve a range seek — a `Populating` (half-built) or rebuild-failed one
+        // is a SUBSET of the truth, and a range seek has no residual that could resurrect a missing row
+        // (`rmp` task #733, the same gate `index_seek_range` / `rel_index_seek_eq` apply). Declining falls
+        // back to the executor's typed relationship scan + range filter, which is exact.
+        if index.borrow().rel_property_state(type_token, prop_key) != Some(IndexState::Online) {
+            return None; // no usable index: scan fallback
+        }
+        // Preserve the scan's SSI footprint so the index path is exactly as strong: the typed
+        // relationship scan this replaces re-read (SIREAD-marked) every relationship. A range predicate
+        // has no precise `Equality` marker, so register the conservative coarse `PredicateRead::RelType`
+        // (pairs with every relationship insert's `RelType(T)` write footprint — the documented coarse
+        // over-approximation, mirroring the node range seek's `Label` marker and the rel composite seek),
+        // plus `mark_all_live_rels`. Sound; at most a few extra aborts among concurrent range-reader /
+        // type-writer pairs.
+        self.note_predicate_read(PredicateRead::RelType(type_token));
+        self.mark_all_live_rels();
+        // Candidate ids for the requested range (a superset; see `IndexSet::seek_rel_property_range`).
+        let Some(candidates) = index
+            .borrow_mut()
+            .seek_rel_property_range(type_token, prop_key, lower, upper)
+        else {
+            // Seam declined (an unindexable `List` bound): exact scan fallback (`rmp` #680).
+            return None;
+        };
+
+        // Re-check the FULL range predicate per candidate: visible + current type + the current value
+        // satisfies BOTH provided bounds under the **Cypher comparison semantics**
+        // ([`crate::eval::satisfies_range`] — the same `compare` a `WHERE r.p >= v` `Filter` applies), so
+        // the seek and the executor's typed-scan + range-filter fallback return byte-identical row sets
+        // (`rmp` task #680). Each relationship's property is read via `rel_property`, which SIREAD-marks
+        // it exactly as `rel_index_seek_eq`'s re-check does.
+        let mut out: Vec<u64> = candidates
+            .into_iter()
+            .filter(|&id| {
+                let r = RelId(id);
+                match self.rel_data(r) {
+                    Some(data) if data.rel_type == type_name => self
+                        .rel_property(r, property)
+                        .is_some_and(|v| crate::eval::satisfies_range(&v, lower, upper)),
                     _ => false,
                 }
             })
@@ -2584,10 +2652,17 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // #316, which already pairs with the writer's single-prop `Equality` write footprint.)
         self.note_predicate_read(PredicateRead::Label(rule.label_token));
         self.mark_all_live_nodes();
-        let candidates = index
-            .borrow_mut()
-            .seek_composite_eq(rule.label_token, &rule.property_tokens, tuple)
-            .unwrap_or_default();
+        let Some(candidates) =
+            index
+                .borrow_mut()
+                .seek_composite_eq(rule.label_token, &rule.property_tokens, tuple)
+        else {
+            // Seam declined because a key value is an unindexable `List`: return `None` so the caller
+            // (`node_key_tuple_conflict`) takes its full label-scan fallback. Collapsing to
+            // `Some(vec![])` here would report NO conflicting holder and let a duplicate list-valued
+            // key silently violate the uniqueness/node-key constraint (`rmp` #680).
+            return None;
+        };
         Some(self.filter_label_candidates(rule.label_token, candidates))
     }
 
@@ -3625,10 +3700,14 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // Candidate ids for `(label_token, prop_key) == seek`. The index is candidate-only, so we
         // re-check the FULL `scan_filter_eq` predicate per candidate: visible + carries the label
         // (`filter_label_candidates`) + the *current* value equals `seek` by Cypher equality.
-        let candidates = index
-            .borrow_mut()
-            .seek_node_property_eq(label_token, prop_key, seek)
-            .unwrap_or_default();
+        let Some(candidates) =
+            index
+                .borrow_mut()
+                .seek_node_property_eq(label_token, prop_key, seek)
+        else {
+            // Seam declined (an unindexable `List` bound): exact scan fallback (`rmp` #680).
+            return None;
+        };
         let labelled = self.filter_label_candidates(label_token, candidates);
 
         let mut out: Vec<NodeId> = labelled
@@ -3668,8 +3747,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         lower: Option<(&Value, bool)>,
         upper: Option<(&Value, bool)>,
     ) -> Option<Vec<NodeId>> {
-        use std::cmp::Ordering;
-
         let index = self.index.as_ref()?;
         let label_token = self.label_id_existing(label)?;
         let prop_key = self.store.borrow().token_id(Namespace::PropKey, property)?;
@@ -3697,56 +3774,26 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // assumes per-property type consistency (the common case). Mixed int/float values for one
         // property would need the scan fallback; the planner is only given a property index where
         // that holds. The re-check below guarantees no WRONG rows regardless of candidate skew.
-        let candidates = index
-            .borrow_mut()
-            .seek_node_property_range(label_token, prop_key, lower, upper)
-            .unwrap_or_default();
+        let Some(candidates) =
+            index
+                .borrow_mut()
+                .seek_node_property_range(label_token, prop_key, lower, upper)
+        else {
+            // Seam declined (an unindexable `List` bound): exact scan fallback (`rmp` #680).
+            return None;
+        };
         let labelled = self.filter_label_candidates(label_token, candidates);
 
-        // Re-check the FULL `scan_filter_range` predicate per candidate: visible + has label (done
-        // above) + the current value is non-null and satisfies BOTH provided bounds via `cmp_values`.
-        let satisfies = |v: &Value| -> bool {
-            if v.is_null() {
-                return false;
-            }
-            // Lower bound: `(value, inclusive)` -> keep `ord != Less` if inclusive else `ord == Greater`.
-            if let Some((bound_value, inclusive)) = lower {
-                if bound_value.is_null() {
-                    return false;
-                }
-                let ord = crate::ordering::cmp_values(v, bound_value);
-                let ok = if inclusive {
-                    ord != Ordering::Less
-                } else {
-                    ord == Ordering::Greater
-                };
-                if !ok {
-                    return false;
-                }
-            }
-            // Upper bound: keep `ord != Greater` if inclusive else `ord == Less`.
-            if let Some((bound_value, inclusive)) = upper {
-                if bound_value.is_null() {
-                    return false;
-                }
-                let ord = crate::ordering::cmp_values(v, bound_value);
-                let ok = if inclusive {
-                    ord != Ordering::Greater
-                } else {
-                    ord == Ordering::Less
-                };
-                if !ok {
-                    return false;
-                }
-            }
-            true
-        };
-
+        // Re-check the FULL predicate per candidate: visible + has label (done above) + the current
+        // value satisfies BOTH provided bounds under the **Cypher comparison semantics**
+        // ([`crate::eval::satisfies_range`] — the same `compare` a `WHERE n.p >= v` `Filter` applies),
+        // so the seek and the `scan_filter_range` fallback return byte-identical row sets and declaring
+        // an index can never change a query's result (`rmp` task #680).
         let mut out: Vec<NodeId> = labelled
             .into_iter()
             .filter(|id| {
                 self.node_property(*id, property)
-                    .is_some_and(|v| satisfies(&v))
+                    .is_some_and(|v| crate::eval::satisfies_range(&v, lower, upper))
             })
             .collect();
         out.sort_unstable();
@@ -3787,10 +3834,14 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // Candidate ids whose composite tuple equals `values`. The index is candidate-only, so re-check
         // the FULL predicate per candidate: visible + carries the label (`filter_label_candidates`) +
         // the *current* per-property tuple equals `values` element-wise by Cypher equality.
-        let candidates = index
-            .borrow_mut()
-            .seek_composite_eq(label_token, &property_tokens, values)
-            .unwrap_or_default();
+        let Some(candidates) =
+            index
+                .borrow_mut()
+                .seek_composite_eq(label_token, &property_tokens, values)
+        else {
+            // Seam declined (a key value is an unindexable `List`): exact scan fallback (`rmp` #680).
+            return None;
+        };
         let labelled = self.filter_label_candidates(label_token, candidates);
         let mut out: Vec<NodeId> = labelled
             .into_iter()
@@ -3824,6 +3875,31 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // type + current value equals `value`) — the same re-checked-candidates contract as the node
         // `index_seek_eq`. `None` (no usable `Online` index) declines to the executor's scan fallback.
         let ids = self.rel_index_seek_eq(type_token, prop_key, rel_type, property, value)?;
+        Some(ids.into_iter().map(RelId).collect())
+    }
+
+    fn index_seek_rel_range(
+        &self,
+        rel_type: &str,
+        property: &str,
+        lower: Option<(&Value, bool)>,
+        upper: Option<(&Value, bool)>,
+    ) -> Option<Vec<RelId>> {
+        // The range analogue of `index_seek_rel_eq` (`rmp` task #680), wired identically: only the
+        // coordinated path holds the derived `IndexSet` with the relationship-property index; otherwise
+        // the executor falls back to a typed relationship scan + residual range filter.
+        self.index.as_ref()?;
+        // Resolve the type + property tokens; a missing token means no relationship of this
+        // type/property is indexable, so decline (the executor's typed scan covers it).
+        let type_token = self.store.borrow().token_id(Namespace::RelType, rel_type)?;
+        let prop_key = self.store.borrow().token_id(Namespace::PropKey, property)?;
+        // Reuse the index-backed candidate seek that already gates on an `Online` index (`rmp` #733),
+        // preserves the scan's SSI footprint (`mark_all_live_rels` + the coarse `RelType` predicate
+        // marker), and re-checks each candidate (visible + current type + the current value satisfies
+        // both bounds under the Cypher comparison semantics). `None` (no usable `Online` index) declines
+        // to the executor's scan fallback.
+        let ids =
+            self.rel_index_seek_range(type_token, prop_key, rel_type, property, lower, upper)?;
         Some(ids.into_iter().map(RelId).collect())
     }
 
@@ -3863,10 +3939,14 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // the FULL predicate per candidate: visible + current type + the *current* per-property tuple
         // equals `values` element-wise by Cypher equality (read each property via `rel_property`, which
         // SIREAD-marks it, exactly as the single-property rel seek's re-check does).
-        let candidates = index
-            .borrow_mut()
-            .seek_rel_composite_eq(type_token, &property_tokens, values)
-            .unwrap_or_default();
+        let Some(candidates) =
+            index
+                .borrow_mut()
+                .seek_rel_composite_eq(type_token, &property_tokens, values)
+        else {
+            // Seam declined (a key value is an unindexable `List`): exact scan fallback (`rmp` #680).
+            return None;
+        };
         let mut out: Vec<u64> = candidates
             .into_iter()
             .filter(|&id| {

@@ -209,8 +209,24 @@ impl<D: BlockDevice, S: LogSink> PropertyIndex<D, S> {
     /// Range seek `[lo_value, hi_value)` (half-open) for `token`, ascending by `(value, id)`.
     /// Pass `None` for `hi_value` for an unbounded-above range (`>= lo_value`).
     ///
-    /// Returns the record ids; the covered encoded key range is `[token_value_lo(lo), bound)`,
-    /// which the txn layer uses as the SSI predicate marker (crate-root seam).
+    /// Returns the record ids; the covered encoded key range is `[lo, bound)`.
+    ///
+    /// # Candidate-superset contract (`rmp` #680)
+    ///
+    /// Like [`Self::seek_eq`], the result is a **candidate superset** the caller re-checks with the
+    /// Cypher comparison semantics — because the order-preserving key is *not* Cypher-equality-canonical
+    /// for numbers. Cypher comparability merges `1`/`1.0` and `0`/`0.0`/`-0.0`, but the index key appends
+    /// a numtag / signed-zero tie-break, so a value **Cypher-equal to `lo_value`** can encode to a key
+    /// **below** `lo_value`'s own (`Integer(2020)` sorts below `Float(2020.0)`; `Float(-0.0)` below
+    /// `Integer(0)`). An inclusive lower bound anchored at `lo_value`'s single key would then **skip**
+    /// those equal-but-lower entries — a silent false negative (`WHERE p >= 2020.0` missing a stored
+    /// `Integer(2020)`), i.e. an index changing a query's result. So the lower anchor is the **byte
+    /// minimum** over the whole Cypher-equal class ([`numeric_equal_probes`], the same widening
+    /// [`Self::seek_eq`] applies); the caller's re-check trims the widened set back to the exact result.
+    /// For a non-numeric `lo_value` the probe set is just itself, so the anchor is byte-identical to
+    /// before. The **upper** bound needs no such widening: an exclusive `< v` correctly keeps every
+    /// Cypher-equal sibling of `v` as a candidate (they encode on both sides of `v`, and the re-check
+    /// drops the equal ones), and an inclusive `<= v` is mapped to an unbounded-above scan by the caller.
     ///
     /// # Errors
     /// See [`Self::insert`].
@@ -220,8 +236,17 @@ impl<D: BlockDevice, S: LogSink> PropertyIndex<D, S> {
         lo_value: &Value,
         hi_value: Option<&Value>,
     ) -> Result<Vec<u64>> {
-        let lo_tail = encode_or_storage_err(lo_value)?;
-        let lo = token_value_lo(token, &lo_tail);
+        // The byte-minimum lower anchor over the Cypher-equal class (see the candidate-superset
+        // contract above): `numeric_equal_probes` yields `lo_value` plus any numeric sibling / signed
+        // zero that is Cypher-equal to it, so no equal-but-lower-encoding entry is skipped.
+        let mut lo: Option<Vec<u8>> = None;
+        for probe in numeric_equal_probes(lo_value) {
+            let key = token_value_lo(token, &encode_or_storage_err(&probe)?);
+            if lo.as_ref().is_none_or(|cur| key < *cur) {
+                lo = Some(key);
+            }
+        }
+        let lo = lo.expect("numeric_equal_probes always yields at least `lo_value`");
         let mut out: Vec<u64> = Vec::new();
         let push_rid = |out: &mut Vec<u64>, v: &[u8]| {
             if let Some(r) = rid_decode(v) {
@@ -580,6 +605,100 @@ mod tests {
         let shared = SharedWal::new(wal);
         let pool = BufferPool::with_wal(MemBlockDevice::new(0), shared.clone(), 64);
         BTree::create(pool, shared).unwrap()
+    }
+
+    /// REGRESSION (`rmp` #680 storage audit): the order-preserving key appends a numtag / signed-zero
+    /// tie-break, so a value **Cypher-equal** to the inclusive lower bound can encode to a key BELOW the
+    /// bound's own — `Integer(2020)` below `Float(2020.0)`, and `Float(-0.0)`/`Integer(0)` below
+    /// `Float(0.0)`. A lower anchor at the bound's single key skipped those equal-but-lower entries, so
+    /// `seek_range` was not a true superset and the caller's re-check silently dropped true matches (an
+    /// index changing a query's result). `seek_range` now anchors at the byte-minimum over the
+    /// Cypher-equal class, so every equal sibling is a candidate.
+    #[test]
+    fn seek_range_lower_bound_covers_the_cypher_equal_numeric_class() {
+        let mut idx = PropertyIndex::new(fresh_tree());
+        let txn = TxnId(1);
+        idx.tree_mut().with_wal(|w| w.begin(txn));
+        // Under token 1: an INTEGER 2020, a FLOAT 2020.0, and neighbours 2019 / 2021.
+        idx.insert(txn, 1, &Value::Integer(2019), 1).unwrap();
+        idx.insert(txn, 1, &Value::Integer(2020), 2).unwrap();
+        idx.insert(txn, 1, &Value::Float(2020.0), 3).unwrap();
+        idx.insert(txn, 1, &Value::Integer(2021), 4).unwrap();
+        // The three zeros, to exercise the signed-zero widening.
+        idx.insert(txn, 2, &Value::Integer(0), 5).unwrap();
+        idx.insert(txn, 2, &Value::Float(0.0), 6).unwrap();
+        idx.insert(txn, 2, &Value::Float(-0.0), 7).unwrap();
+        idx.tree_mut().with_wal(|w| w.commit(txn).unwrap());
+
+        let sorted = |mut v: Vec<u64>| {
+            v.sort_unstable();
+            v
+        };
+
+        // `>= Float(2020.0)` MUST include the equal `Integer(2020)` (rid 2) and `Float(2020.0)` (rid 3)
+        // and `Integer(2021)` (rid 4) — the Integer(2020) is the row the old anchor dropped.
+        assert_eq!(
+            sorted(idx.seek_range(1, &Value::Float(2020.0), None).unwrap()),
+            vec![2, 3, 4],
+            "a Float lower bound must admit the Cypher-equal Integer sibling below it"
+        );
+        // The symmetric Integer bound was already correct (siblings encode above it) — pin it too.
+        assert_eq!(
+            sorted(idx.seek_range(1, &Value::Integer(2020), None).unwrap()),
+            vec![2, 3, 4]
+        );
+        // Every spelling of "zero or above" must admit all three zeros (rids 5, 6, 7).
+        for bound in [Value::Float(0.0), Value::Integer(0), Value::Float(-0.0)] {
+            assert_eq!(
+                sorted(idx.seek_range(2, &bound, None).unwrap()),
+                vec![5, 6, 7],
+                "`>= {bound:?}` must admit Integer(0), Float(0.0) and Float(-0.0)"
+            );
+        }
+        // A **two-sided** range whose LOWER bound is a Float over Integer data: the widened low anchor
+        // must still admit the Cypher-equal `Integer(2020)`. Upper bound `< Integer(2021)` (exclusive)
+        // keeps only `Integer(2020)` (rid 2) and `Float(2020.0)` (rid 3), not `Integer(2021)`.
+        assert_eq!(
+            sorted(
+                idx.seek_range(1, &Value::Float(2020.0), Some(&Value::Integer(2021)))
+                    .unwrap()
+            ),
+            vec![2, 3],
+            "a two-sided range with a Float lower bound must admit the Integer sibling below it"
+        );
+
+        // A **large / lossy** boundary: `>= Float(2^63)` over `Integer(i64::MAX = 2^63 - 1)`. Because
+        // `i64::MAX as f64 == 2^63` (the ULP near 2^63 is 2048, so `i64::MAX` rounds up to `2^63`), the
+        // stored integer is Cypher-`>= 2^63` and MUST be a candidate — the `as f64` round-trip is exactly
+        // where a naive single-key anchor (numtag FLOAT, above the stored numtag INTEGER key) silently
+        // lost it, returning the empty set. The re-checked result agrees with a scan (both admit it).
+        #[allow(clippy::cast_precision_loss)]
+        let two_pow_63 = i64::MAX as f64 + 1.0; // exactly 2^63 in f64
+        let mut lidx = PropertyIndex::new(fresh_tree());
+        lidx.tree_mut().with_wal(|w| w.begin(txn));
+        lidx.insert(txn, 1, &Value::Integer(i64::MAX), 20).unwrap();
+        lidx.tree_mut().with_wal(|w| w.commit(txn).unwrap());
+        let large = lidx.seek_range(1, &Value::Float(two_pow_63), None).unwrap();
+        assert!(
+            large.contains(&20),
+            "`>= Float(2^63)` must admit Integer(i64::MAX) whose f64 image is 2^63 (got {large:?})"
+        );
+
+        // A non-numeric bound is unaffected (the probe set is just itself): a bounded string range.
+        let mut sidx = PropertyIndex::new(fresh_tree());
+        sidx.tree_mut().with_wal(|w| w.begin(txn));
+        sidx.insert(txn, 1, &Value::String("apple".into()), 10)
+            .unwrap();
+        sidx.insert(txn, 1, &Value::String("banana".into()), 11)
+            .unwrap();
+        sidx.tree_mut().with_wal(|w| w.commit(txn).unwrap());
+        assert_eq!(
+            sorted(
+                sidx.seek_range(1, &Value::String("apple".into()), None)
+                    .unwrap()
+            ),
+            vec![10, 11]
+        );
     }
 
     #[test]

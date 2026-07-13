@@ -384,6 +384,32 @@ pub trait GraphAccess {
         None
     }
 
+    /// An **optional relationship-property index range seek** (`rmp` task #680): the visible
+    /// relationship ids of `rel_type` whose current `property` satisfies the range `[lower, upper]`
+    /// (`<`, `<=`, `>`, `>=`) — the relationship analogue of [`index_seek_range`](Self::index_seek_range)
+    /// and the range analogue of [`index_seek_rel_eq`](Self::index_seek_rel_eq). `lower`/`upper` are
+    /// `(value, inclusive)` bounds; either may be `None` for an open side.
+    ///
+    /// Returns `None` when the implementation has no usable **`Online`** relationship-property index on
+    /// `(rel_type, property)` — the executor then falls back to a typed relationship scan + residual
+    /// range filter (always correct either way, and the path the off-thread reader always takes).
+    /// `Some(ids)` is a set the seam has **already re-checked** (visibility, current type, current value
+    /// satisfies both bounds), so a deleted / invisible / re-typed / since-changed relationship never
+    /// reaches the result, and RBAC composes through the
+    /// [`AuthorizedGraph`](crate::authorized_graph::AuthorizedGraph) decorator. The executor materialises
+    /// each returned relationship's endpoints from its own record, honouring the pattern direction (and
+    /// the undirected pattern's two-orientation semantics). The default returns `None` (no
+    /// relationship-property index available).
+    fn index_seek_rel_range(
+        &self,
+        _rel_type: &str,
+        _property: &str,
+        _lower: Option<(&Value, bool)>,
+        _upper: Option<(&Value, bool)>,
+    ) -> Option<Vec<RelId>> {
+        None
+    }
+
     /// An **optional composite (multi-property) relationship index equality seek** (`rmp` task #666):
     /// the visible relationship ids of `rel_type` whose current values of `properties` (in the given
     /// order) equal `values` element-wise by Cypher equality — the relationship analogue of

@@ -14,8 +14,8 @@
 //! - the indexes are declared and `Online` (`SHOW INDEXES`): a node `RANGE` index on `Author.field`
 //!   and — the headline addition — a **relationship** `RANGE` index on `CITES.weight`;
 //! - the **empirical planner utilisation** of the relationship `RANGE` index: Graphus serves an
-//!   *equality* predicate on the citation weight from it (a `RelIndexSeek`) but **not** a `>=` range
-//!   predicate (that stays a scan + filter) — asserted honestly on the real planner (`rmp` #680);
+//!   *equality* predicate on the citation weight from it (a `RelIndexSeek`) **and** a `>=` range
+//!   predicate (a `RelIndexRangeSeek`, `rmp` #680) — asserted honestly on the real planner;
 //! - **constraint enforcement**: an `Author` written with a non-string `field_name`, one with a
 //!   non-integer `h_index`, and a duplicate `Author.id` are each rejected with the constraint-violation
 //!   error class, and the rejected writes leave the loaded author count unchanged.
@@ -316,12 +316,13 @@ fn schema_first_load_declares_constraints_and_indexes() {
 }
 
 #[test]
-fn rel_range_index_serves_equality_but_not_range_predicates() {
-    // The honest empirical planner finding (`rmp` #680): Graphus's relationship RANGE index serves an
-    // EQUALITY predicate on a relationship property (a `RelIndexSeek`) but NOT a `>=` range predicate
-    // (which stays a full `ExpandAll` + `Filter` scan). We assert on the real public planner against a
-    // catalog that models exactly the schema's `cites_weight_range` index, then tie it back to the
-    // engine: the index is really Online, and an equality seek returns the seeded citations.
+fn rel_range_index_serves_both_equality_and_range_predicates() {
+    // The relationship RANGE index serves an EQUALITY predicate on the citation weight (a
+    // `RelIndexSeek`, `rmp` #659) **and**, since `rmp` #680, a `>=` RANGE predicate (a
+    // `RelIndexRangeSeek`) — the "influential citations" filter this example is built around, which used
+    // to stay a full `ExpandAll` + `Filter` scan. Asserted on the real public planner against a catalog
+    // that models exactly the schema's `cites_weight_range` index, then tied back to the engine: the
+    // index is really Online, and an equality seek returns the seeded citations.
     let (mut eng, dataset) = load_schema_first();
 
     let catalog = IndexCatalog::builder()
@@ -344,24 +345,25 @@ fn rel_range_index_serves_equality_but_not_range_predicates() {
         "the equality plan depends on exactly the relationship index:\n{eq_render}"
     );
 
-    // A `>=` range predicate is NOT served — it stays a scan + filter (no index dependency).
+    // ...and a `>=` RANGE predicate is served too (`rmp` #680), by the distinct `RelIndexRangeSeek`
+    // operator, which REPLACES the `ExpandAll` scan subtree entirely.
     let ge_plan = plan(
         "MATCH ()-[c:CITES]->() WHERE c.weight >= 5 RETURN c.weight",
         &catalog,
     );
     let ge_render = ge_plan.to_string();
     assert!(
-        !ge_render.contains("RelIndexSeek"),
-        "a `>=` predicate is NOT served by the rel RANGE index (equality-only):\n{ge_render}"
+        ge_render.contains("RelIndexRangeSeek"),
+        "a `>=` predicate must lower to a RelIndexRangeSeek:\n{ge_render}"
     );
     assert!(
-        ge_render.contains("Filter") && ge_render.contains("ExpandAll"),
-        "the `>=` predicate is a scan + residual filter:\n{ge_render}"
+        !ge_render.contains("ExpandAll"),
+        "the seek replaces the ExpandAll scan subtree:\n{ge_render}"
     );
     assert_eq!(
         ge_plan.index_dependencies().count(),
-        0,
-        "the `>=` plan uses no index:\n{ge_render}"
+        1,
+        "the `>=` plan depends on exactly the relationship index:\n{ge_render}"
     );
 
     // Tie back to the engine: the relationship RANGE index really is Online, and — because a schema-

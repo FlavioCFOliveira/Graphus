@@ -497,6 +497,25 @@ fn vector_seed(token: u32, prop_key: u32) -> u64 {
     (u64::from(token) << 32) | u64::from(prop_key)
 }
 
+/// Whether `v` can be encoded into an order-preserving index key — the same
+/// [`keycodec::encode_single`](graphus_index::keycodec::encode_single) fallibility the backing
+/// [`PropertyIndex`] applies at insert and seek time.
+///
+/// The one **comparable-but-unindexable** value class is [`Value::List`]: Cypher *compares* two lists
+/// (`compare_values` is defined on them), yet a list is not a legal index key, so a list-valued
+/// property is silently skipped at insert and a list *bound* cannot be encoded for a seek. (`Null` and
+/// `Map` are also unindexable but are *incomparable*, so both the index seek and the scan re-check
+/// return empty for them — harmless either way; this still declines on them for good measure.)
+///
+/// A seek whose bound is not index-encodable MUST return [`None`] so the caller takes the **exact scan
+/// fallback**: otherwise the seam collapses the un-encodable bound to an empty candidate set
+/// (`Some(vec![])`), the executor uses it verbatim (the fallback fires only on `None`), and the index
+/// silently drops rows the equivalent scan + `WHERE` keeps — an index changing a query's result, the
+/// exact defect class `rmp` #680 exists to eliminate (found while certifying it).
+fn is_index_encodable(v: &Value) -> bool {
+    graphus_index::keycodec::encode_single(v).is_ok()
+}
+
 impl IndexSet {
     /// An empty index set: a single label [`TokenIndex`] (always present, auto-maintained) and no
     /// property indexes yet.
@@ -704,6 +723,11 @@ impl IndexSet {
         let idx = self
             .composite
             .get_mut(&(label_token, property_tokens.to_vec()))?;
+        // If ANY key value is not index-encodable (a `List`), decline the whole composite seek so the
+        // caller takes the exact scan fallback (`rmp` #680; see [`is_index_encodable`]).
+        if !values.iter().all(is_index_encodable) {
+            return None;
+        }
         Some(idx.seek_eq(label_token, values).unwrap_or_default())
     }
 
@@ -800,6 +824,11 @@ impl IndexSet {
         let idx = self
             .rel_composite
             .get_mut(&(type_token, property_tokens.to_vec()))?;
+        // If ANY key value is not index-encodable (a `List`), decline to the exact scan fallback
+        // (`rmp` #680; see [`is_index_encodable`]).
+        if !values.iter().all(is_index_encodable) {
+            return None;
+        }
         Some(idx.seek_eq(type_token, values).unwrap_or_default())
     }
 
@@ -1138,6 +1167,12 @@ impl IndexSet {
         value: &Value,
     ) -> Option<Vec<u64>> {
         let np = self.node_props.get_mut(&(label_token, prop_key))?;
+        // A non-index-encodable bound (a `List`) must DECLINE so the caller takes the exact scan
+        // fallback — never collapse to `Some(vec![])`, which would silently drop matching rows
+        // (`rmp` #680; see [`is_index_encodable`]).
+        if !is_index_encodable(value) {
+            return None;
+        }
         // in-memory index: a BTree op cannot fail in practice; a seek error degrades to an empty
         // candidate list. Note this is `Some(vec![])`, not `None`: the index *is* registered, it
         // simply has no matching candidate.
@@ -1188,6 +1223,21 @@ impl IndexSet {
     ) -> Option<Vec<u64>> {
         let np = self.node_props.get_mut(&(label_token, prop_key))?;
 
+        // Decline (→ exact scan fallback) if ANY present bound is not index-encodable (a `List`): the
+        // order-preserving key cannot represent it, so an unbounded lower would return the (list-empty)
+        // whole column and a present list bound would encode-error to empty — either way the index
+        // would silently drop rows the scan keeps (`rmp` #680; see [`is_index_encodable`]).
+        if let Some((v, _)) = lower {
+            if !is_index_encodable(v) {
+                return None;
+            }
+        }
+        if let Some((v, _)) = upper {
+            if !is_index_encodable(v) {
+                return None;
+            }
+        }
+
         // Map the upper bound: exclusive maps exactly; inclusive widens to unbounded-above (a
         // superset); `None` is unbounded-above.
         let hi: Option<&Value> = match upper {
@@ -1202,7 +1252,7 @@ impl IndexSet {
             // Unbounded below cannot be expressed against the inclusive-lower backing range without
             // risking a subset (values may sort below the integer floor). Return all candidates for
             // the token — always a superset of any `< upper` request.
-            None => Self::all_candidates(&mut np.index, prop_key),
+            None => Self::all_candidates(np.index.tree_mut(), prop_key),
         };
 
         // in-memory index: a BTree op cannot fail in practice; a seek error degrades to an empty
@@ -1362,7 +1412,62 @@ impl IndexSet {
         value: &Value,
     ) -> Option<Vec<u64>> {
         let rp = self.rel_props.get_mut(&(type_token, prop_key))?;
+        // A non-index-encodable bound (a `List`) declines to the exact scan fallback (`rmp` #680).
+        if !is_index_encodable(value) {
+            return None;
+        }
         Some(rp.index.seek_eq(prop_key, value).unwrap_or_default())
+    }
+
+    /// The **candidate** relationship ids of `(type_token, prop_key)` whose current value satisfies the
+    /// range `[lower, upper]` (`rmp` task #680). The relationship analogue of
+    /// [`seek_node_property_range`](Self::seek_node_property_range): identical bound mapping (an inclusive
+    /// lower maps exactly, an exclusive lower widens to inclusive; an exclusive upper maps exactly, an
+    /// inclusive upper widens to unbounded-above; either side `None` is open), so the result is always a
+    /// **superset** the caller re-checks against the store. Returns [`None`] when no relationship-property
+    /// index is registered for `(type_token, prop_key)`.
+    pub fn seek_rel_property_range(
+        &mut self,
+        type_token: u32,
+        prop_key: u32,
+        lower: Option<(&Value, bool)>,
+        upper: Option<(&Value, bool)>,
+    ) -> Option<Vec<u64>> {
+        let rp = self.rel_props.get_mut(&(type_token, prop_key))?;
+
+        // Decline (→ exact scan fallback) if ANY present bound is not index-encodable (a `List`) —
+        // mirrors `seek_node_property_range` (`rmp` #680; see [`is_index_encodable`]).
+        if let Some((v, _)) = lower {
+            if !is_index_encodable(v) {
+                return None;
+            }
+        }
+        if let Some((v, _)) = upper {
+            if !is_index_encodable(v) {
+                return None;
+            }
+        }
+
+        // Map the upper bound: exclusive maps exactly; inclusive widens to unbounded-above (a
+        // superset); `None` is unbounded-above. Mirrors `seek_node_property_range`.
+        let hi: Option<&Value> = match upper {
+            Some((v, false)) => Some(v), // exclusive: exact
+            Some((_, true)) => None,     // inclusive: widen to unbounded above (superset)
+            None => None,                // unbounded above
+        };
+
+        let candidates = match lower {
+            // Inclusive lower maps exactly; exclusive lower widens to inclusive (superset).
+            Some((v, _)) => rp.index.seek_range(prop_key, v, hi),
+            // Unbounded below cannot be expressed against the inclusive-lower backing range without
+            // risking a subset, so return every candidate for the token (always a superset of any
+            // `< upper` request) — the same treatment the node range seek gives.
+            None => Self::all_candidates(rp.index.tree_mut(), prop_key),
+        };
+
+        // in-memory index: a BTree op cannot fail in practice; a seek error degrades to an empty
+        // candidate list (still `Some`, since the index is registered).
+        Some(candidates.unwrap_or_default())
     }
 
     /// The registered relationship-property index keys `(type_token, prop_key)` in **any** state,
@@ -2957,18 +3062,22 @@ impl IndexSet {
             .map(BitmapIndex::distinct)
     }
 
-    /// All candidate ids for `token` in `idx`, regardless of value. Used as the correct
-    /// unbounded-below superset (see [`Self::seek_node_property_range`]). Implemented by scanning the
-    /// whole keyspace and keeping the entries whose key carries this token in its leading `u32`.
+    /// All candidate ids for `token` in the backing `tree`, regardless of value. Used as the correct
+    /// unbounded-below superset for both the node ([`Self::seek_node_property_range`]) and relationship
+    /// ([`Self::seek_rel_property_range`]) range seeks — a node-property and a relationship-property
+    /// index share the same layout: the **key** is `token: u32 BE ++ encoded_value ++ rid: u64 BE` and
+    /// the **value payload** is `rid: u64 LE`, so one tree scan serves both. Implemented by scanning the
+    /// whole keyspace, keeping the entries whose key carries this token in its leading `u32`, and
+    /// decoding the rid from the value payload (little-endian).
     fn all_candidates(
-        idx: &mut PropertyIndex<Dev, Sink>,
+        tree: &mut BTree<Dev, Sink>,
         token: u32,
     ) -> graphus_core::error::Result<Vec<u64>> {
         let prefix = token.to_be_bytes();
         // Stream the whole keyspace, decoding the rid out of each matching value slice — no owned
         // `(key, value)` pair per row. The unbounded-below superset semantics are unchanged.
         let mut out: Vec<u64> = Vec::new();
-        idx.tree_mut().scan_all_for_each(|k, v| {
+        tree.scan_all_for_each(|k, v| {
             if k.get(0..4) == Some(&prefix[..]) {
                 if let Ok(bytes) = v.try_into() {
                     out.push(u64::from_le_bytes(bytes));
@@ -3061,10 +3170,13 @@ mod tests {
         set.register_node_property(1, 2);
         // Null is unindexable; the insert is a no-op and does not panic.
         set.insert_node_property(1, 2, &Value::Null, 7);
-        assert_eq!(
-            set.seek_node_property_eq(1, 2, &Value::Null),
-            Some(Vec::<u64>::new())
-        );
+        // A seek whose bound is unindexable DECLINES (`None`) so the caller takes the exact scan
+        // fallback, rather than returning `Some(vec![])` (`rmp` #680; see [`is_index_encodable`]). For a
+        // `Null` bound this is still correct AND yields the same result: `= null` is `NULL` for every
+        // stored value, so the scan fallback matches nothing either. (The change is load-bearing for a
+        // `List` bound, which — unlike `Null` — is *comparable*, so an empty candidate set would
+        // wrongly drop a genuinely matching list-valued row.)
+        assert_eq!(set.seek_node_property_eq(1, 2, &Value::Null), None);
     }
 
     /// (`rmp` #598, Finding C-F3): the bitmap is a **membership-exact candidate SOURCE**, so its

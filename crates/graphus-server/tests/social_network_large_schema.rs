@@ -15,8 +15,8 @@
 //!   `rel_type_lookup_index`), and a node **existence** constraint (`ARTICLE.name IS NOT NULL`);
 //! - the **empirical planner utilisation** of the relationship `RANGE` index (asserted honestly on the
 //!   real public planner): Graphus serves an *equality* predicate on a relationship property from it (a
-//!   `RelIndexSeek`) but **not** a `>=` range predicate (that stays a scan + filter) — so the example's
-//!   `LIKE.date` range query is a correct scan + residual filter, not an index seek;
+//!   `RelIndexSeek`) **and** a `>=` range predicate (a `RelIndexRangeSeek`, `rmp` #680) — so the
+//!   example's `LIKE.date` recent-half range query is an index seek, not a scan + residual filter;
 //! - the **headline search paths**: a `TEXT` `CONTAINS` search and a `FULLTEXT`
 //!   `db.index.fulltext.queryNodes` search over `ARTICLE.name` return **exactly** the same known
 //!   article set (the term is a single-token subject word), derived from the generator — including the
@@ -113,8 +113,8 @@ fn schema_first_load_declares_new_index_and_constraint_kinds() {
 }
 
 #[test]
-fn rel_range_index_serves_equality_but_not_range_predicates() {
-    on_big_stack(rel_range_index_serves_equality_but_not_range_predicates_impl);
+fn rel_range_index_serves_equality_and_range_predicates() {
+    on_big_stack(rel_range_index_serves_equality_and_range_predicates_impl);
 }
 
 #[test]
@@ -458,10 +458,10 @@ fn schema_first_load_declares_new_index_and_constraint_kinds_impl() {
     );
 }
 
-fn rel_range_index_serves_equality_but_not_range_predicates_impl() {
-    // The honest empirical planner finding (`rmp` #677, the social analogue of fraud-oltp's rel RANGE):
-    // Graphus's relationship RANGE index serves an EQUALITY predicate on a relationship property (a
-    // `RelIndexSeek`) but NOT a `>=` range predicate (which stays a full `ExpandAll` + `Filter` scan).
+fn rel_range_index_serves_equality_and_range_predicates_impl() {
+    // The relationship RANGE index serves an EQUALITY predicate on a relationship property (a
+    // `RelIndexSeek`, `rmp` #659) AND — since `rmp` #680 — a `>=` RANGE predicate (a
+    // `RelIndexRangeSeek`), which is what the example's `LIKE.date` recent-half query needs.
     // Asserted on the real public planner against a catalog modelling exactly `like_date_range`, then
     // tied back to the engine: the index is really Online and an equality seek returns the seeded row.
     let mut eng = load_schema_first();
@@ -486,25 +486,27 @@ fn rel_range_index_serves_equality_but_not_range_predicates_impl() {
         "the equality plan depends on exactly the relationship index:\n{eq_render}"
     );
 
-    // A `>=` range predicate is NOT served — it stays a scan + filter (no index dependency). This is
-    // why the example's `LIKE.date` recent-half range query is a correct scan + residual filter.
+    // ...and a `>=` RANGE predicate is served too (`rmp` #680), by the distinct `RelIndexRangeSeek`
+    // operator — which REPLACES the `ExpandAll` scan subtree (both endpoints come from the
+    // relationship's own record). This is what makes the example's `LIKE.date` recent-half range query
+    // an index seek rather than a full relationship scan.
     let ge_plan = plan(
         "MATCH ()-[l:LIKE]->() WHERE l.date >= 1712345678 RETURN l.date",
         &catalog,
     );
     let ge_render = ge_plan.to_string();
     assert!(
-        !ge_render.contains("RelIndexSeek"),
-        "a `>=` predicate is NOT served by the rel RANGE index (equality-only):\n{ge_render}"
+        ge_render.contains("RelIndexRangeSeek"),
+        "a `>=` predicate must lower to a RelIndexRangeSeek:\n{ge_render}"
     );
     assert!(
-        ge_render.contains("Filter") && ge_render.contains("ExpandAll"),
-        "the `>=` predicate is a scan + residual filter:\n{ge_render}"
+        !ge_render.contains("ExpandAll"),
+        "the seek replaces the ExpandAll scan subtree:\n{ge_render}"
     );
     assert_eq!(
         ge_plan.index_dependencies().count(),
-        0,
-        "the `>=` plan uses no index:\n{ge_render}"
+        1,
+        "the `>=` plan depends on exactly the relationship index:\n{ge_render}"
     );
 
     // Tie back to the engine: the relationship RANGE index really is Online, and — because a
@@ -528,8 +530,9 @@ fn rel_range_index_serves_equality_but_not_range_predicates_impl() {
         "the equality seek on a seeded like date must return at least the seeded like edge"
     );
 
-    // And the `>=` range predicate — though scanned, not indexed — is still correct: a range from the
-    // epoch floor captures every LIKE (all generated dates are >= EPOCH_S).
+    // And the `>=` range predicate — now index-served (`rmp` #680) — is still exactly correct: a range
+    // from the epoch floor captures every LIKE (all generated dates are >= EPOCH_S). This is the
+    // end-to-end witness that the range SEEK returns the same rows the scan + filter used to.
     let all_likes = scalar_int(&mut eng, "MATCH ()-[l:LIKE]->() RETURN count(l) AS c");
     let from_epoch = scalar_int(
         &mut eng,
@@ -537,7 +540,7 @@ fn rel_range_index_serves_equality_but_not_range_predicates_impl() {
     );
     assert_eq!(
         from_epoch, all_likes,
-        "the `>= EPOCH_S` range (scan + filter) returns every LIKE edge — all dates are >= EPOCH_S"
+        "the `>= EPOCH_S` range (index seek) returns every LIKE edge — all dates are >= EPOCH_S"
     );
     assert!(all_likes > 0, "the seeded graph has LIKE edges");
 }

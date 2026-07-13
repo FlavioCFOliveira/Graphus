@@ -642,6 +642,29 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         None
     }
 
+    fn index_seek_rel_range(
+        &self,
+        rel_type: &str,
+        property: &str,
+        lower: Option<(&Value, bool)>,
+        upper: Option<(&Value, bool)>,
+    ) -> Option<Vec<RelId>> {
+        // A relationship-property index range seek (`rmp` task #680) is a read path, handled exactly like
+        // the single-property relationship equality seek above: an **unrestricted** principal delegates to
+        // the inner seam's seek; a **restricted** principal declines (`None`) so the executor falls back
+        // to the typed relationship scan + residual range filter, which flows through this decorator's
+        // `expand` / `rel_data` / `rel_property` and therefore enforces relationship-type traversal AND
+        // per-property read grants. The raw seek re-checks a candidate against the *raw* store value and
+        // so cannot observe a `DENY READ` on the seeked property; declining keeps a restricted principal
+        // from ever seeing a relationship a `WHERE r.p >= v` scan would have hidden — no RBAC regression.
+        if self.oracle.is_unrestricted() {
+            return self
+                .inner
+                .index_seek_rel_range(rel_type, property, lower, upper);
+        }
+        None
+    }
+
     fn index_seek_rel_composite_eq(
         &self,
         rel_type: &str,
@@ -1350,14 +1373,43 @@ mod tests {
         assert!(authz.take_auth_error().is_none());
     }
 
-    /// A [`GraphAccess`] that delegates everything to an inner [`MemGraph`] but **overrides
-    /// `project_snapshot`** to return a non-`None` snapshot, so the [`AuthorizedGraph`] decorator's
-    /// RBAC composition of that method (`rmp` task #352) can be tested in isolation: the default
-    /// `MemGraph` impl returns `None` regardless of restriction, which would not distinguish "forwarded"
-    /// from "declined".
+    /// A [`GraphAccess`] that delegates everything to an inner [`MemGraph`] but **overrides the seam
+    /// methods whose default impl is `None`** — `project_snapshot` (`rmp` task #352) and
+    /// `index_seek_rel_range` (`rmp` task #680) — so the [`AuthorizedGraph`] decorator's RBAC
+    /// composition of each can be tested in isolation. Against a bare `MemGraph` (whose defaults return
+    /// `None` regardless of restriction) "forwarded" and "declined" would be indistinguishable, and the
+    /// test would be vacuous.
     struct SnapshotStub(MemGraph);
 
     impl GraphAccess for SnapshotStub {
+        /// A relationship range seek that "finds" **every** relationship of `rel_type` whose `key`
+        /// property satisfies the bounds — enough that a `Some` here is observable by the decorator test
+        /// (the real `RecordGraph` seek is exercised end-to-end in `tests/rel_property_index.rs`).
+        fn index_seek_rel_range(
+            &self,
+            rel_type: &str,
+            property: &str,
+            lower: Option<(&Value, bool)>,
+            upper: Option<(&Value, bool)>,
+        ) -> Option<Vec<RelId>> {
+            let mut ids: Vec<RelId> = Vec::new();
+            for node in self.0.scan_nodes() {
+                for inc in self
+                    .0
+                    .expand(node, ExpandDirection::Outgoing, &[rel_type.to_owned()])
+                {
+                    if !ids.contains(&inc.rel)
+                        && self
+                            .0
+                            .rel_property(inc.rel, property)
+                            .is_some_and(|v| crate::eval::satisfies_range(&v, lower, upper))
+                    {
+                        ids.push(inc.rel);
+                    }
+                }
+            }
+            Some(ids)
+        }
         fn project_snapshot(
             &self,
             spec: &crate::snapshot::SnapshotSpec,
@@ -1497,6 +1549,48 @@ mod tests {
         assert!(
             authz_r.project_snapshot(&spec).is_none(),
             "a restricted principal must be declined the parallel snapshot (serial fallback)"
+        );
+    }
+
+    /// `rmp` task #680: the decorator **forwards** `index_seek_rel_range` for an unrestricted principal
+    /// (the common query keeps the index acceleration) and **declines** it (`None`) for a restricted one,
+    /// so the executor falls back to the typed relationship scan + range filter — which flows back
+    /// through this decorator's `expand` / `rel_data` / `rel_property` and therefore enforces
+    /// relationship-type traversal AND per-property read grants.
+    ///
+    /// Declining is load-bearing, not conservatism for its own sake: the raw seek re-checks a candidate
+    /// against the **store's** value and so cannot observe a `DENY READ` on the seeked property. Were it
+    /// forwarded, a principal denied `WORKS_AT.role` would still learn which relationships satisfy
+    /// `r.role >= 'C'` — a value it is not allowed to read. The identical reasoning (and code shape) as
+    /// the relationship equality seek's decorator (`rmp` #659).
+    #[test]
+    fn rel_range_seek_forwards_unrestricted_declines_restricted() {
+        let (g, _ada, _acme, r) = seed();
+        let lower = s("A");
+        let bounds = (Some((&lower, true)), None);
+
+        // Unrestricted: the inner seek is forwarded verbatim ('CEO' >= 'A').
+        let mut inner_u = SnapshotStub(g.clone());
+        let authz_u = AuthorizedGraph::new(&mut inner_u, StubOracle::unrestricted());
+        assert_eq!(
+            authz_u.index_seek_rel_range("WORKS_AT", "role", bounds.0, bounds.1),
+            Some(vec![r]),
+            "an unrestricted principal gets the inner relationship range seek"
+        );
+
+        // Restricted — even holding every grant the scan path would need — is declined, so the executor
+        // takes the RBAC-enforcing scan fallback instead of the raw seek.
+        let mut inner_r = SnapshotStub(g);
+        let oracle = StubOracle::default()
+            .traverse_label("Person")
+            .traverse_rel_type("WORKS_AT")
+            .read_rel_property("WORKS_AT", "role");
+        let authz_r = AuthorizedGraph::new(&mut inner_r, oracle);
+        assert!(
+            authz_r
+                .index_seek_rel_range("WORKS_AT", "role", bounds.0, bounds.1)
+                .is_none(),
+            "a restricted principal must be declined the raw relationship range seek (scan fallback)"
         );
     }
 

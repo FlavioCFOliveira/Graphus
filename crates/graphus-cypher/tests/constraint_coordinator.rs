@@ -149,6 +149,55 @@ fn uniqueness_create_rejects_duplicate_and_allows_distinct() {
 }
 
 #[test]
+fn uniqueness_enforced_on_a_list_valued_property() {
+    // REGRESSION (found while certifying `rmp` #680): a `List` is the one value class that is
+    // COMPARABLE under Cypher (two lists can be `=`) yet UNINDEXABLE (it is never stored in an index
+    // key). The uniqueness duplicate search (`unique_conflict` → `index_seek_eq`) seeks the constraint
+    // index for a holder of the incoming value; before the fix a `List` bound made the seam encode-error
+    // to an EMPTY candidate set (`Some(vec![])`) instead of declining (`None`), so the search reported
+    // NO existing holder and a **duplicate list-valued key was admitted — a silent uniqueness-constraint
+    // violation**. The seam now declines on an unindexable bound, forcing the exact label-scan fallback,
+    // which finds the duplicate by Cypher equality.
+    let mut coord = fresh_coord();
+    run_write(&mut coord, "CREATE (:Person {email: [1, 2, 3], name: 'A'})");
+    coord
+        .create_constraint("uniq_email", "Person", "email", ConstraintKind::Unique)
+        .expect("create uniqueness constraint over a list-valued property");
+
+    // A duplicate list value MUST be rejected (this is the row the bug silently admitted).
+    let err = try_write(&mut coord, "CREATE (:Person {email: [1, 2, 3], name: 'B'})")
+        .expect_err("a duplicate list-valued key must be rejected under UNIQUE");
+    assert_constraint_violation(&err);
+    assert_eq!(
+        person_count(&mut coord),
+        1,
+        "the rejected duplicate CREATE created nothing"
+    );
+
+    // A genuinely distinct list is admitted (the scan fallback re-checks by Cypher list equality, so it
+    // is neither over- nor under-broad).
+    run_write(&mut coord, "CREATE (:Person {email: [1, 2], name: 'C'})");
+    assert_eq!(person_count(&mut coord), 2);
+
+    // And an equality query with a list bound returns exactly the matching node (the seek declines, the
+    // scan fallback answers) — the query analogue of the same fix.
+    let plan = compile("MATCH (n:Person) WHERE n.email = [1, 2, 3] RETURN count(n) AS c");
+    let txn = coord.begin_serializable();
+    let bound = bind_parameters(&plan, &Parameters::new()).expect("bind");
+    let rows = {
+        let mut graph = coord.statement(txn).expect("statement");
+        let mut cursor = execute(&plan, &bound, &mut graph).expect("cursor");
+        cursor.collect_all().expect("collect")
+    };
+    coord.commit(txn).expect("read commits");
+    assert_eq!(
+        rows[0].value("c"),
+        Value::Integer(1),
+        "WHERE email = [1,2,3] must find exactly the one holder"
+    );
+}
+
+#[test]
 fn uniqueness_and_index_seek_are_cross_type_cypher_equal() {
     // `rmp` #466 regression gate (end-to-end through the real coordinator + planner + index): Cypher
     // treats `1 = 1.0`, so a UNIQUE constraint holding an Integer must reject a Cypher-equal Float (and

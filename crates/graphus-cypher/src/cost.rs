@@ -365,6 +365,30 @@ pub fn estimate_cost(op: &PhysicalOp, stats: Option<&dyn Statistics>) -> CostEst
             CostEstimate::new(rows, COST_SEEK_SETUP + rows * COST_SEEK_PER_ROW)
         }
 
+        // A relationship-property RANGE seek (`rmp` task #680): the relationship analogue of
+        // `NodeIndexRangeSeek`. The [`Statistics`] seam exposes **no** per-relationship-property
+        // histograms (`estimate_nodes_label_property_range` is node-only), so — exactly like the
+        // relationship *equality* seek above — estimate its candidate count with the constant
+        // predicate-selectivity a `rel-scan + filter` would use over the single covered type, and pay the
+        // seek setup plus a cheap per-candidate stream. An undirected pattern surfaces each relationship
+        // twice, so double the estimate to match the scan-path `Filter`-over-`ExpandAll` cardinality it
+        // replaces. This keeps the seek cheaper than the full typed relationship scan it replaces
+        // (`COST_SEEK_SETUP + rows·COST_SEEK_PER_ROW` < `type_rows·COST_ROW_SCAN` while the predicate is
+        // selective), which is what makes the planner prefer it; the executor's re-check trims the
+        // candidate set to the exact result.
+        PhysicalOp::RelIndexRangeSeek {
+            rel_type,
+            direction,
+            ..
+        } => {
+            let type_slice = std::slice::from_ref(rel_type);
+            let mut rows = rel_scan_rows(type_slice, stats) * DEFAULT_PREDICATE_SELECTIVITY;
+            if matches!(direction, crate::ast::RelDirection::Undirected) {
+                rows *= 2.0;
+            }
+            CostEstimate::new(rows, COST_SEEK_SETUP + rows * COST_SEEK_PER_ROW)
+        }
+
         // A composite (multi-property) relationship equality seek (`rmp` task #666): the selectivity is
         // the product of the per-key constant predicate-selectivities (independence assumption), so a
         // full-key composite relationship seek is far more selective than any single-key seek + residual

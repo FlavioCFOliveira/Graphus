@@ -433,6 +433,13 @@ fn walk_physical(op: &PhysicalOp, record: &mut impl FnMut(&str, ParamType)) {
             // value — no static type expectation, recorded as Any. A leaf — no input to recurse into.
             params_in_expr(value, ParamType::Any, record);
         }
+        PhysicalOp::RelIndexRangeSeek { value, .. } => {
+            // The relationship-property RANGE seek's bound value (`rmp` task #680): commonly a `$param`
+            // after literal auto-parameterisation (`WHERE r.amount >= 9000` becomes `>= $AUTOPARAM_n`),
+            // so it MUST be walked here or the bound would never bind. Same treatment as the node range
+            // seek's bound — no static type expectation, recorded as Any. A leaf — no input to recurse.
+            params_in_expr(value, ParamType::Any, record);
+        }
         PhysicalOp::RelCompositeIndexSeek { values, .. } => {
             // The composite relationship seek values (`rmp` task #666): one per key, each treated like a
             // single seek value — no static type expectation, recorded as Any. A leaf — no input.
