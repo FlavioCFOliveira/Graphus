@@ -367,6 +367,9 @@ fn run() -> Result<bool, String> {
     let mut retried_ops = 0u64;
     let mut checkpoints_issued = 0u64;
     let mut server_peak_rss: Option<u64> = None;
+    // The last retention cutoff applied — every surviving reading must have `seq >= last_cutoff`, which
+    // is what proves the DELETE removed the OLD rows and not the wrong ones (rmp #745).
+    let mut last_cutoff: u64 = 0;
 
     let cpu_before = args.server_pid.and_then(proc_cpu_secs);
     let io_before = args.server_pid.and_then(proc_write_bytes);
@@ -413,6 +416,7 @@ fn run() -> Result<bool, String> {
             )?;
             delete_latencies_ns.push(lat.as_nanos() as u64);
             retried_ops += u64::from(tries);
+            last_cutoff = t.delete_cutoff;
         }
 
         // 3. The REAL reclamation trigger (`rmp` #305): the `CHECKPOINT DATABASE` admin statement, over
@@ -506,6 +510,7 @@ fn run() -> Result<bool, String> {
         &args.cfg,
         final_live,
         total_ingested,
+        last_cutoff,
     )?;
     let checks_failed = checks.iter().filter(|c| !c.ok).count();
 
@@ -712,6 +717,7 @@ fn wire_checks(
     cfg: &GenConfig,
     final_live: u64,
     total_ingested: u64,
+    last_cutoff: u64,
 ) -> Result<Vec<WireCheck>, String> {
     let db = session.db;
     let mut checks = Vec::new();
@@ -724,6 +730,33 @@ fn wire_checks(
         ok: final_live >= lo && final_live < hi,
         detail: format!("live={final_live}, band=[{lo}, {hi}), total_ingested={total_ingested}"),
     });
+
+    // 1b. Retention deleted the RIGHT rows. A cardinality band alone (check 1) passes even if the DELETE
+    //     removed the NEWEST readings instead of the oldest — the count is identical. The retention
+    //     predicate is `seq < cutoff`, so AFTER retention NOT ONE reading below the last cutoff may
+    //     survive: `count(seq < last_cutoff)` must be 0. A non-zero count means the DELETE removed the
+    //     wrong rows (the whole subject of this example) or removed nothing — either FAILS (rmp #745).
+    if last_cutoff > 0 {
+        let below = scalar(
+            control,
+            db,
+            &format!("MATCH (r:Reading) WHERE r.seq < {last_cutoff} RETURN count(r) AS c"),
+        )? as u64;
+        checks.push(WireCheck {
+            name: "retention removed the OLDEST readings (nothing below the last cutoff survives)"
+                .to_owned(),
+            ok: below == 0,
+            detail: format!("readings with seq < last_cutoff({last_cutoff}) still live = {below}"),
+        });
+        // …and the survivors ARE the retained tail: the minimum live seq is at or above the cutoff.
+        let min_seq = scalar(control, db, "MATCH (r:Reading) RETURN min(r.seq) AS c")?;
+        checks.push(WireCheck {
+            name: "the live seq window is the retained tail (min live seq >= last cutoff)"
+                .to_owned(),
+            ok: min_seq >= last_cutoff as i64,
+            detail: format!("min_live_seq={min_seq}, last_cutoff={last_cutoff}"),
+        });
+    }
 
     // 2. POINT index: sensors within SITE_RADIUS of site 0's centre are EXACTLY the site-0 sensors —
     //    a known ground truth (the generator clusters the fleet on a 2x2 grid far wider than the radius).
