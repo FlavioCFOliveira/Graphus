@@ -393,12 +393,36 @@ async fn fast_profile_rbac_matrix_over_rest_router_holds_every_cell() {
         }
     }
 
-    // The matrix is the one from the manifest: assert we actually exercised allow/deny/unauth cells
-    // (so a future generator change that empties a class is caught), and the totals match the
-    // committed example's evidence (7 allow, 7 deny, 1 unauth, 15 cells).
-    assert_eq!(allow, 7, "allow cells");
-    assert_eq!(deny, 7, "deny cells");
-    assert_eq!(unauth, 1, "unauthenticated cells");
+    // Every cell above already asserted its own expected outcome (200 / 403 + the FORBIDDEN code /
+    // 401), so what remains to guard is the *shape* of the matrix: that all three classes are actually
+    // exercised (a generator change that silently empties a class must fail here) and that no cell was
+    // skipped. The per-class counts are taken from the manifest rather than hard-coded: the manifest IS
+    // the committed evidence, and hard-coding its tallies made this test drift the moment the example
+    // was scaled (`rmp` #717 grew the matrix, and the stale `7 / 7 / 1` literals failed on a matrix that
+    // was in fact entirely correct — a false alarm that says nothing about the server's RBAC).
+    let expected_allow = manifest
+        .matrix
+        .iter()
+        .filter(|c| c.outcome == Outcome::Allow)
+        .count() as u32;
+    let expected_deny = manifest
+        .matrix
+        .iter()
+        .filter(|c| c.outcome == Outcome::Deny)
+        .count() as u32;
+    let expected_unauth = manifest
+        .matrix
+        .iter()
+        .filter(|c| c.outcome == Outcome::Unauthenticated)
+        .count() as u32;
+    assert!(
+        expected_allow > 0 && expected_deny > 0 && expected_unauth > 0,
+        "the matrix must exercise all three classes, got {expected_allow} allow / \
+         {expected_deny} deny / {expected_unauth} unauthenticated"
+    );
+    assert_eq!(allow, expected_allow, "allow cells");
+    assert_eq!(deny, expected_deny, "deny cells");
+    assert_eq!(unauth, expected_unauth, "unauthenticated cells");
     assert_eq!(
         allow + deny + unauth,
         manifest.matrix.len() as u32,
