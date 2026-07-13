@@ -432,6 +432,16 @@ fn declare_schema_rest(rest: &Rest<'_>, db: &str) -> Result<bool, String> {
         "CREATE TEXT INDEX article_name_text FOR (a:ARTICLE) ON (a.name)",
         "TEXT index ARTICLE.name",
     );
+    // RELATIONSHIP RANGE index on LIKE.date — the backing index for the `like_recent` range family
+    // (`WHERE l.date >= $since`). Without it that query is a full relationship SCAN; with it, it is the
+    // rel-RANGE SEEK the project built in #680, so the example actually EXERCISES that surface rather
+    // than declaring a read family the planner can only answer by scanning (rmp #746).
+    best_effort_rest(
+        rest,
+        db,
+        "CREATE RANGE INDEX FOR ()-[l:LIKE]-() ON (l.date)",
+        "RANGE index LIKE.date (rel)",
+    );
     // FULLTEXT headline index — required by the `fulltext` battery family.
     let ft = best_effort_rest(
         rest,
@@ -576,6 +586,7 @@ fn run_bolt(
     //    BEFORE the edge MATCH-by-id load. On an empty label the index is online immediately.
     load.best_effort_index("USER", "id");
     load.best_effort_index("ARTICLE", "id");
+    load.best_effort_like_date_range();
     let fulltext = load.best_effort_fulltext();
 
     // 2. Stream nodes, then relationships, in UNWIND batches (parsed from the deterministic CSV; the
@@ -762,6 +773,20 @@ impl BoltLoad {
             Ok(_) => eprintln!("social_wire_load: created anchor index {label}.{prop}"),
             Err(e) => eprintln!(
                 "social_wire_load: note: anchor index {label}.{prop} not created ({e}); seeks may scan"
+            ),
+        }
+    }
+
+    /// Best-effort RELATIONSHIP RANGE index on `LIKE.date` — the backing index for the `like_recent`
+    /// range family (`WHERE l.date >= $since`). Without it that query full-SCANS the LIKE set; with it,
+    /// it is the rel-RANGE SEEK the project built in #680 (rmp #746). Older servers that lack relationship
+    /// RANGE indexes reject it — noted, not fatal.
+    fn best_effort_like_date_range(&mut self) {
+        let cypher = "CREATE RANGE INDEX FOR ()-[l:LIKE]-() ON (l.date)";
+        match self.client.run(cypher, vec![], &self.db) {
+            Ok(_) => eprintln!("social_wire_load: created rel RANGE index LIKE.date"),
+            Err(e) => eprintln!(
+                "social_wire_load: note: rel RANGE index LIKE.date not created ({e}); like_recent scans"
             ),
         }
     }
