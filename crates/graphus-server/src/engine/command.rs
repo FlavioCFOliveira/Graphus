@@ -817,6 +817,24 @@ pub struct RunSummary {
     pub query_type: Option<String>,
     /// Side-effect counters (e.g. `nodes-created`), in order.
     pub stats: Vec<(String, Value)>,
+    /// The query plan of an `EXPLAIN` / `PROFILE` statement (`rmp` task #752), or `None` for an ordinary
+    /// statement (and for every DDL / administrative command, which the Cypher planner never sees).
+    pub plan: Option<QueryPlan>,
+}
+
+/// A query plan carried in the result summary (`rmp` task #752), neutral across the two seams.
+///
+/// Mirrors `graphus_bolt::QueryPlan` / `graphus_rest::QueryPlan`; the adapters convert at their boundary,
+/// exactly as they do for [`RunSummary`] itself. The `description` is the already-rendered plan map from
+/// `graphus_cypher::plan_description` — the engine is the only layer that knows what an operator is, and
+/// both wire layers merely serialise what it hands them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryPlan {
+    /// `true` when the statement was `PROFILE`d (delivered under the `profile` key); `false` for an
+    /// `EXPLAIN` (the `plan` key). Never both — as in Neo4j.
+    pub profiled: bool,
+    /// The rendered plan-description map.
+    pub description: Value,
 }
 
 /// Builds a **schema-mutation** result summary for DDL (`rmp` #513): query type `"s"` (SCHEMA_WRITE)
@@ -844,6 +862,8 @@ fn schema_mutation_summary(key: &str, mutated: bool) -> RunSummary {
     RunSummary {
         query_type: Some("s".to_owned()),
         stats,
+        // Schema DDL never goes through the Cypher planner, so it carries no query plan (`rmp` #752).
+        plan: None,
     }
 }
 
@@ -863,6 +883,7 @@ pub fn index_ddl_summary(command: &IndexCommand, mutated: bool) -> RunSummary {
         IndexCommand::ShowIndexes { .. } => RunSummary {
             query_type: Some("r".to_owned()),
             stats: Vec::new(),
+            plan: None,
         },
         IndexCommand::CreateNodePropertyIndex { .. }
         | IndexCommand::CreateRelPropertyIndex { .. }
@@ -900,6 +921,7 @@ pub fn constraint_ddl_summary(command: &ConstraintCommand, mutated: bool) -> Run
         ConstraintCommand::Show { .. } => RunSummary {
             query_type: Some("r".to_owned()),
             stats: Vec::new(),
+            plan: None,
         },
         ConstraintCommand::Create(_) => schema_mutation_summary("constraints-added", mutated),
         ConstraintCommand::Drop { .. } => schema_mutation_summary("constraints-removed", mutated),

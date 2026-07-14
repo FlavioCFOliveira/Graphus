@@ -391,8 +391,104 @@ pub struct QueryResult {
     /// [`nodes_created`](Self::nodes_created) against the batch size is what turns that silent drop into
     /// a failure.
     pub stats: Vec<(String, Value)>,
+    /// The **query plan**, from the `plan` (EXPLAIN) or `profile` (PROFILE) key of the trailing `PULL`
+    /// `SUCCESS` metadata (`rmp` #752). `None` for an ordinary statement — the server sends neither key.
+    ///
+    /// This is what makes a planner regression *detectable from a client*. A query that is supposed to be
+    /// served by an index but silently falls back to a full scan returns exactly the same rows: only the
+    /// plan tells them apart. An example asserts on it with [`uses_operator`](Self::uses_operator).
+    pub plan: Option<QueryPlan>,
     /// Wall-clock time from sending `RUN` to receiving the trailing `SUCCESS`.
     pub elapsed: Duration,
+}
+
+/// A query plan read back from a `EXPLAIN` / `PROFILE` statement's result summary (`rmp` #752).
+///
+/// The wire form is Neo4j's: a map with `operatorType`, `args`, `identifiers` and (for an inner operator)
+/// `children`, plus — for a `PROFILE` — the measured `rows` and `dbHits` of every operator.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryPlan {
+    /// `true` when the plan carries measured runtime counters (it came from the `profile` key, so the
+    /// statement really ran); `false` for an `EXPLAIN` (the `plan` key: the statement was only planned).
+    pub profiled: bool,
+    /// The plan-description map exactly as the server sent it.
+    pub root: Value,
+}
+
+impl QueryPlan {
+    /// Whether an operator of type `operator_type` (e.g. `"RelIndexRangeSeek"`, `"NodeByLabelScan"`)
+    /// appears **anywhere** in the plan.
+    ///
+    /// This is the assertion an example makes to prove a declared index is actually used — and, negated,
+    /// that the query did **not** regress to a scan.
+    #[must_use]
+    pub fn uses_operator(&self, operator_type: &str) -> bool {
+        fn walk(node: &Value, want: &str) -> bool {
+            let Value::Map(entries) = node else {
+                return false;
+            };
+            for (k, v) in entries {
+                match (k.as_str(), v) {
+                    ("operatorType", Value::String(t)) if t == want => return true,
+                    ("children", Value::List(children))
+                        if children.iter().any(|c| walk(c, want)) =>
+                    {
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+            false
+        }
+        walk(&self.root, operator_type)
+    }
+
+    /// The list of every `operatorType` in the plan, root first (pre-order) — for error messages that
+    /// have to say what the plan actually *was*.
+    #[must_use]
+    pub fn operators(&self) -> Vec<String> {
+        fn walk(node: &Value, out: &mut Vec<String>) {
+            let Value::Map(entries) = node else { return };
+            if let Some((_, Value::String(t))) = entries.iter().find(|(k, _)| k == "operatorType") {
+                out.push(t.clone());
+            }
+            if let Some((_, Value::List(children))) = entries.iter().find(|(k, _)| k == "children")
+            {
+                for c in children {
+                    walk(c, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.root, &mut out);
+        out
+    }
+
+    /// The **measured** `dbHits` of the whole plan (the sum over every operator), or `None` for an
+    /// `EXPLAIN` (nothing ran, so nothing was measured — never read an absent counter as zero).
+    #[must_use]
+    pub fn total_db_hits(&self) -> Option<i64> {
+        if !self.profiled {
+            return None;
+        }
+        fn walk(node: &Value, acc: &mut i64) {
+            let Value::Map(entries) = node else { return };
+            for (k, v) in entries {
+                match (k.as_str(), v) {
+                    ("dbHits", Value::Integer(n)) => *acc += *n,
+                    ("children", Value::List(children)) => {
+                        for c in children {
+                            walk(c, acc);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut acc = 0;
+        walk(&self.root, &mut acc);
+        Some(acc)
+    }
 }
 
 impl QueryResult {
@@ -435,6 +531,18 @@ impl QueryResult {
     #[must_use]
     pub fn relationships_created(&self) -> Option<i64> {
         self.stat("relationships-created")
+    }
+
+    /// Whether the statement's plan used an operator of type `operator_type` (`rmp` #752).
+    ///
+    /// `false` when the statement carried no `EXPLAIN` / `PROFILE` prefix (there is then no plan to
+    /// inspect) — so a caller that means to assert on a plan must prefix its query, and a forgotten prefix
+    /// fails the assertion instead of vacuously passing it.
+    #[must_use]
+    pub fn uses_operator(&self, operator_type: &str) -> bool {
+        self.plan
+            .as_ref()
+            .is_some_and(|p| p.uses_operator(operator_type))
     }
 }
 
@@ -603,10 +711,12 @@ impl BoltClient {
         // The trailing SUCCESS carries the server's side-effect `stats` (`rmp` #509). It used to be
         // dropped on the floor; it is the ONLY authority on what a write statement actually wrote, so it
         // is now kept (`rmp` #745 — see `QueryResult::stats`).
-        let stats = loop {
+        let (stats, plan) = loop {
             match self.recv()? {
                 Response::Record { values } => records.push(scalar_row(values)),
-                Response::Success { metadata } => break extract_stats(&metadata),
+                Response::Success { metadata } => {
+                    break (extract_stats(&metadata), extract_plan(&metadata));
+                }
                 Response::Failure(f) => return Err(ClientError::Failure(f)),
                 other => return Err(unexpected("PULL", &other)),
             }
@@ -616,6 +726,7 @@ impl BoltClient {
             fields,
             records,
             stats,
+            plan,
             elapsed: started.elapsed(),
         })
     }
@@ -680,10 +791,12 @@ impl BoltClient {
         // The trailing SUCCESS carries the server's side-effect `stats` (`rmp` #509) — the only authority
         // on what a write statement actually wrote. Kept here too, so an explicit transaction is not a
         // blind spot (`rmp` #745; see `QueryResult::stats`).
-        let stats = loop {
+        let (stats, plan) = loop {
             match self.recv()? {
                 Response::Record { values } => records.push(scalar_row(values)),
-                Response::Success { metadata } => break extract_stats(&metadata),
+                Response::Success { metadata } => {
+                    break (extract_stats(&metadata), extract_plan(&metadata));
+                }
                 Response::Failure(f) => return Err(ClientError::Failure(f)),
                 other => return Err(unexpected("PULL (in txn)", &other)),
             }
@@ -693,6 +806,7 @@ impl BoltClient {
             fields,
             records,
             stats,
+            plan,
             elapsed: started.elapsed(),
         })
     }
@@ -835,6 +949,30 @@ fn extract_stats(metadata: &[(String, Value)]) -> Vec<(String, Value)> {
             _ => None,
         })
         .unwrap_or_default()
+}
+
+/// Extracts the query plan from a trailing `PULL` `SUCCESS` metadata map (`rmp` #752).
+///
+/// The server delivers it under exactly one of two mutually-exclusive keys — `profile` (the statement ran:
+/// the plan carries measured `rows`/`dbHits`) or `plan` (an `EXPLAIN`: estimates only) — and neither key
+/// for an ordinary statement, which yields `None`.
+fn extract_plan(metadata: &[(String, Value)]) -> Option<QueryPlan> {
+    let find = |key: &str| {
+        metadata
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+    };
+    if let Some(root) = find("profile") {
+        return Some(QueryPlan {
+            profiled: true,
+            root,
+        });
+    }
+    find("plan").map(|root| QueryPlan {
+        profiled: false,
+        root,
+    })
 }
 
 /// Extracts the `fields` column-name list from a `RUN` `SUCCESS` metadata map.

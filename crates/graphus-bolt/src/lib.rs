@@ -74,7 +74,9 @@ pub mod transport;
 // A coherent top-level re-export of the surface the server (rmp #20) and tests use most, per the
 // Rust API Guidelines (a flat, discoverable crate root).
 pub use error::{BoltError, BoltResult, Failure, failure_from_error};
-pub use executor::{AccessMode, BoltExecutor, QuerySummary, Record, RecordStream, TxControl};
+pub use executor::{
+    AccessMode, BoltExecutor, QueryPlan, QuerySummary, Record, RecordStream, TxControl,
+};
 pub use framing::{Dechunker, Frame, chunk_message};
 pub use handshake::{
     MANIFEST_V1_REQUEST, ManifestChoice, Proposal, Version, detect_manifest_request,

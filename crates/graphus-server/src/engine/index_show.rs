@@ -823,6 +823,7 @@ pub(crate) fn finish<S>(
                 summary: RunSummary {
                     query_type: Some("r".to_owned()),
                     stats: Vec::new(),
+                    plan: None,
                 },
             }))
         }

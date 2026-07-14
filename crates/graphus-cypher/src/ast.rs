@@ -39,6 +39,11 @@ use crate::lexer::Span;
 #[derive(Debug, Clone, PartialEq)]
 #[must_use]
 pub struct Query {
+    /// An optional leading `EXPLAIN` / `PROFILE` **query prefix** (`rmp` #752). It binds to the whole
+    /// statement and changes only *how* it is run (plan it without executing, or execute it and record
+    /// runtime counters), never *what* it means — so every later phase ignores it and simply carries it
+    /// through to the executor.
+    pub prefix: Option<QueryPrefix>,
     /// An optional leading `USE <graph>` graph (database) selector (`rmp` #640). Parsed and exposed
     /// so the server can **route** the statement to the target database; the single-graph Cypher
     /// engine itself treats it as advisory metadata (see [`UseGraph`]).
@@ -55,6 +60,54 @@ impl Query {
     #[must_use]
     pub fn use_graph(&self) -> Option<&UseGraph> {
         self.use_graph.as_ref()
+    }
+
+    /// The leading `EXPLAIN` / `PROFILE` prefix, if any (`rmp` #752).
+    #[must_use]
+    pub fn prefix(&self) -> Option<QueryPrefix> {
+        self.prefix
+    }
+}
+
+/// The leading **query prefix** of a statement — `EXPLAIN` or `PROFILE` (`rmp` #752; Neo4j 5.x
+/// *Query prefixes*).
+///
+/// The prefix binds to the **whole** statement, must be its **first** token, and only one of the two
+/// may be present. It is *not* a clause and *not* a reserved word: `explain` and `profile` remain
+/// perfectly legal identifiers, labels, property keys and aliases (`RETURN 1 AS explain` parses as it
+/// always did). The parser recognises the prefix only in the one position where a bare identifier can
+/// never begin a valid statement — see [`crate::parser`].
+///
+/// The two prefixes differ **only** in whether the statement executes:
+///
+/// * [`Explain`](Self::Explain) — the statement is compiled and planned but **never executed**: no
+///   operator is built, no store access is made, no side effect occurs, and the result carries **zero
+///   records**. The plan (with the planner's row *estimate*) is returned as result-summary metadata.
+/// * [`Profile`](Self::Profile) — the statement executes normally and returns its records, and the plan
+///   is additionally annotated with the **measured** per-operator `rows` and `dbHits`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[must_use]
+pub enum QueryPrefix {
+    /// `EXPLAIN <query>` — plan only; the query does not run and returns no records.
+    Explain,
+    /// `PROFILE <query>` — run the query and record per-operator runtime counters.
+    Profile,
+}
+
+impl QueryPrefix {
+    /// The prefix keyword, upper-case (`"EXPLAIN"` / `"PROFILE"`).
+    #[must_use]
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::Explain => "EXPLAIN",
+            Self::Profile => "PROFILE",
+        }
+    }
+
+    /// Whether this prefix executes the statement (`PROFILE` does, `EXPLAIN` does not).
+    #[must_use]
+    pub fn executes(self) -> bool {
+        matches!(self, Self::Profile)
     }
 }
 

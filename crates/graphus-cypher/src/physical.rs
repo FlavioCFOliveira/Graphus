@@ -136,7 +136,9 @@
 //! tree.
 //! Cost ties break on a stable structural key, so plan choice is deterministic for fixed statistics.
 
-use crate::ast::{BinaryOp, Expr, ExprKind, Label, LabelExpr, PredicateOp, RelType, SortDirection};
+use crate::ast::{
+    BinaryOp, Expr, ExprKind, Label, LabelExpr, PredicateOp, QueryPrefix, RelType, SortDirection,
+};
 use crate::cardinality::estimate_rows;
 use crate::catalog::{IndexCatalog, IndexDescriptor, IndexId};
 use crate::cost::estimate_cost;
@@ -169,6 +171,17 @@ pub struct PhysicalPlan {
     /// The estimated number of rows the plan's root emits, from the cardinality estimator
     /// ([`crate::cardinality::estimate_rows`]) over the optional graph [`Statistics`].
     estimated_rows: f64,
+    /// Whether the **cost-based** optimiser ran (graph [`Statistics`] were supplied to
+    /// [`plan_physical_with_stats`]) rather than only the rule-based lowering. Reported verbatim as the
+    /// plan description's root `planner` argument (`rmp` #752) — never guessed.
+    cost_based: bool,
+    /// The statement's `EXPLAIN` / `PROFILE` prefix, if any (`rmp` #752).
+    ///
+    /// The prefix is a property of the *statement*, not of the operator tree: it changes only whether the
+    /// plan is executed and whether runtime counters are recorded, never the plan's shape or its result.
+    /// It rides on the compiled plan so that the single artefact the plan cache stores — and the executor
+    /// receives — carries everything needed to run the statement, with no second parse.
+    prefix: Option<QueryPrefix>,
 }
 
 /// The read/write classification of a compiled [`PhysicalPlan`] (`rmp` task #511).
@@ -286,6 +299,186 @@ impl PhysicalPlan {
     #[must_use]
     pub fn estimated_rows(&self) -> f64 {
         self.estimated_rows
+    }
+
+    /// Whether the **cost-based** optimiser ran for this plan (graph statistics were available), as
+    /// opposed to the purely rule-based lowering. Surfaced as the plan description's root `planner`
+    /// argument (`"COST"` / `"RULE"`, `rmp` #752).
+    #[must_use]
+    pub fn cost_based(&self) -> bool {
+        self.cost_based
+    }
+
+    /// The statement's `EXPLAIN` / `PROFILE` prefix, if any (`rmp` #752).
+    ///
+    /// `None` for an ordinary statement — the overwhelmingly common case, and the only one the TCK, the
+    /// DST simulator and library callers ever produce, so their behaviour is untouched.
+    #[must_use]
+    pub fn prefix(&self) -> Option<QueryPrefix> {
+        self.prefix
+    }
+
+    /// Attaches the statement's `EXPLAIN` / `PROFILE` prefix to a freshly-planned statement
+    /// (`rmp` #752).
+    ///
+    /// The compile pipeline calls this once, right after [`plan_physical_with_stats`], with the prefix the
+    /// parser found on the [`Query`](crate::ast::Query). It is a property of the statement text, so it is
+    /// set *outside* the planner (which only ever sees the prefix-free logical plan) and travels with the
+    /// compiled plan into the plan cache and the executor.
+    pub fn with_prefix(mut self, prefix: Option<QueryPrefix>) -> Self {
+        self.prefix = prefix;
+        self
+    }
+}
+
+impl PhysicalOp {
+    /// This operator's **sub-plans**, in the canonical order a plan description lists them
+    /// (`rmp` #752).
+    ///
+    /// This is the single, exhaustive definition of "the children of a physical operator". Both the plan
+    /// description ([`crate::plan_description`]) and the profiling operator-id numbering
+    /// ([`crate::profile`]) walk the plan through it, so the tree the client sees and the tree the
+    /// runtime counters are attributed to are numbered by *one* traversal and can never drift apart.
+    ///
+    /// Every sub-plan is included, whether or not the executor builds it eagerly: a
+    /// [`NestedLoopJoin`](Self::NestedLoopJoin)'s right branch and a [`Foreach`](Self::Foreach)'s body are
+    /// rebuilt per row from a template, and a plan description that omitted them would hide real work.
+    #[must_use]
+    pub fn children(&self) -> Vec<&PhysicalOp> {
+        match self {
+            // Leaves: no sub-plan.
+            Self::AllNodesScan { .. }
+            | Self::NodeByLabelScan { .. }
+            | Self::TokenLookupScan { .. }
+            | Self::NodeIndexSeek { .. }
+            | Self::NodeCompositeIndexSeek { .. }
+            | Self::NodeLabelScanEq { .. }
+            | Self::NodeIndexRangeSeek { .. }
+            | Self::NodeIndexScan { .. }
+            | Self::NodeIndexStartsWithSeek { .. }
+            | Self::SpatialIndexSeek { .. }
+            | Self::NodeTextIndexSeek { .. }
+            | Self::AllRelationshipsScan { .. }
+            | Self::RelIndexSeek { .. }
+            | Self::RelIndexRangeSeek { .. }
+            | Self::RelCompositeIndexSeek { .. }
+            | Self::RelSpatialIndexSeek { .. }
+            | Self::Argument { .. }
+            | Self::Empty => Vec::new(),
+
+            // One sub-plan.
+            Self::ExpandAll { input, .. }
+            | Self::ExpandInto { input, .. }
+            | Self::NamedPath { input, .. }
+            | Self::ShortestPath { input, .. }
+            | Self::QuantifiedPath { input, .. }
+            | Self::Filter { input, .. }
+            | Self::Projection { input, .. }
+            | Self::Aggregation { input, .. }
+            | Self::Sort { input, .. }
+            | Self::TopN { input, .. }
+            | Self::Skip { input, .. }
+            | Self::Limit { input, .. }
+            | Self::Eager { input }
+            | Self::Unwind { input, .. }
+            | Self::LoadCsv { input, .. }
+            | Self::Optional { input, .. }
+            | Self::Create { input, .. }
+            | Self::Merge { input, .. }
+            | Self::SetClause { input, .. }
+            | Self::Delete { input, .. }
+            | Self::Remove { input, .. } => vec![input],
+
+            // Two sub-plans.
+            Self::NestedLoopJoin { left, right }
+            | Self::HashJoin { left, right, .. }
+            | Self::Union { left, right, .. } => vec![left, right],
+            // FOREACH's per-element update body is a sub-plan, rebuilt per element by the executor.
+            Self::Foreach { input, body, .. } => vec![input, body],
+
+            // An optional sub-plan (a leading `CALL` has no upstream relation).
+            Self::ProcedureCall { input, .. } => {
+                input.iter().map(std::convert::AsRef::as_ref).collect()
+            }
+        }
+    }
+
+    /// The operator's **type name** — the `operatorType` of a plan description (`rmp` #752).
+    ///
+    /// These are Graphus's own physical-operator names (the ones this crate's planner produces and this
+    /// crate's [`Display`](fmt::Display) renders), which is exactly what an operator inspecting a plan
+    /// needs in order to assert *which access path ran* — e.g. `RelIndexRangeSeek` versus
+    /// `AllRelationshipsScan`.
+    #[must_use]
+    pub fn operator_type(&self) -> &'static str {
+        match self {
+            Self::AllNodesScan { .. } => "AllNodesScan",
+            Self::NodeByLabelScan { .. } => "NodeByLabelScan",
+            Self::TokenLookupScan { .. } => "TokenLookupScan",
+            Self::NodeIndexSeek { .. } => "NodeIndexSeek",
+            Self::NodeCompositeIndexSeek { .. } => "NodeCompositeIndexSeek",
+            Self::NodeLabelScanEq { .. } => "NodeLabelScanEq",
+            Self::NodeIndexRangeSeek { .. } => "NodeIndexRangeSeek",
+            Self::NodeIndexScan { .. } => "NodeIndexScan",
+            Self::NodeIndexStartsWithSeek { .. } => "NodeIndexStartsWithSeek",
+            Self::SpatialIndexSeek { .. } => "SpatialIndexSeek",
+            Self::NodeTextIndexSeek { .. } => "NodeTextIndexSeek",
+            Self::AllRelationshipsScan { .. } => "AllRelationshipsScan",
+            Self::RelIndexSeek { .. } => "RelIndexSeek",
+            Self::RelIndexRangeSeek { .. } => "RelIndexRangeSeek",
+            Self::RelCompositeIndexSeek { .. } => "RelCompositeIndexSeek",
+            Self::RelSpatialIndexSeek { .. } => "RelSpatialIndexSeek",
+            Self::Argument { .. } => "Argument",
+            Self::Empty => "Empty",
+            Self::ExpandAll { .. } => "ExpandAll",
+            Self::ExpandInto { .. } => "ExpandInto",
+            Self::NamedPath { .. } => "NamedPath",
+            Self::ShortestPath { .. } => "ShortestPath",
+            Self::QuantifiedPath { .. } => "QuantifiedPath",
+            Self::Filter { .. } => "Filter",
+            Self::Projection { .. } => "Projection",
+            Self::Aggregation { .. } => "Aggregation",
+            Self::Sort { .. } => "Sort",
+            Self::TopN { .. } => "TopN",
+            Self::Skip { .. } => "Skip",
+            Self::Limit { .. } => "Limit",
+            Self::Eager { .. } => "Eager",
+            Self::Unwind { .. } => "Unwind",
+            Self::LoadCsv { .. } => "LoadCsv",
+            Self::NestedLoopJoin { .. } => "NestedLoopJoin",
+            Self::HashJoin { .. } => "HashJoin",
+            Self::Union { .. } => "Union",
+            Self::Optional { .. } => "Optional",
+            Self::Create { .. } => "Create",
+            Self::Merge { .. } => "Merge",
+            Self::SetClause { .. } => "SetClause",
+            Self::Delete { .. } => "Delete",
+            Self::Remove { .. } => "Remove",
+            Self::Foreach { .. } => "Foreach",
+            Self::ProcedureCall { .. } => "ProcedureCall",
+        }
+    }
+
+    /// The variables this (sub)plan binds, in introduction order — the `identifiers` of a plan
+    /// description (`rmp` #752).
+    ///
+    /// Reuses the planner's own bound-variable analysis, so the identifiers reported to a client are
+    /// exactly the ones the operator makes available to its parent (a `Projection` / `Aggregation`
+    /// resets the visible set to its output columns, as the projection-boundary rule requires).
+    #[must_use]
+    pub fn identifiers(&self) -> Vec<String> {
+        bound_var_names(self)
+    }
+
+    /// The number of operators in this subtree, `self` included (`rmp` #752): the size of the
+    /// contiguous id range a pre-order numbering assigns to it.
+    #[must_use]
+    pub fn subtree_len(&self) -> usize {
+        1 + self
+            .children()
+            .into_iter()
+            .map(PhysicalOp::subtree_len)
+            .sum::<usize>()
     }
 }
 
@@ -1208,6 +1401,11 @@ pub fn plan_physical_with_stats(
         root,
         index_dependencies,
         estimated_rows,
+        cost_based: stats.is_some(),
+        // The prefix is a property of the statement text, not of the plan: the compile pipeline attaches
+        // it with [`PhysicalPlan::with_prefix`] (`rmp` #752). A plan built straight from a logical tree
+        // (the TCK, the DST simulator, library callers) carries none.
+        prefix: None,
     }
 }
 

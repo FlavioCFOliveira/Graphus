@@ -210,6 +210,12 @@ fn to_bolt_summary(s: RunSummary) -> QuerySummary {
     QuerySummary {
         query_type: s.query_type,
         stats: s.stats,
+        // The `EXPLAIN` / `PROFILE` plan (`rmp` #752): the engine rendered it; the Bolt layer only picks the
+        // metadata key (`plan` vs `profile`) and serialises the map.
+        plan: s.plan.map(|p| graphus_bolt::QueryPlan {
+            profiled: p.profiled,
+            description: p.description,
+        }),
     }
 }
 

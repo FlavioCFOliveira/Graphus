@@ -187,6 +187,38 @@ pub fn summary_value_to_json(value: &Value) -> Json {
     }
 }
 
+/// Encodes a **query-plan description** (`rmp` task #752) as a plain JSON tree — NOT a strict-Jolt cell.
+///
+/// The plan a client reads back from `EXPLAIN` / `PROFILE` is a diagnostic *document*
+/// (`{operatorType, args, identifiers, children, rows, dbHits}`), not a result-row value: it must be
+/// directly navigable JSON, exactly as it is a directly-navigable dictionary over Bolt (and as the Neo4j
+/// HTTP API returns it). The int53 string-encoding contract [`value_to_jolt`] applies to *property
+/// values*, whose 64-bit fidelity a driver must preserve; a plan carries only small counters, engine-chosen
+/// strings and the estimate float, so a native JSON scalar is both faithful and what a reader expects.
+///
+/// The engine builds the description out of maps, lists, strings, integers, floats and booleans only, so
+/// this covers it exhaustively; any other value class (which the renderer never produces) falls back to the
+/// typed form rather than being silently dropped.
+#[must_use]
+pub fn plan_value_to_json(value: &Value) -> Json {
+    match value {
+        Value::Null => Json::Null,
+        Value::Boolean(b) => Json::from(*b),
+        Value::Integer(n) => Json::from(*n),
+        Value::Float(f) => Json::from(*f),
+        Value::String(s) => Json::String(s.clone()),
+        Value::List(items) => Json::Array(items.iter().map(plan_value_to_json).collect()),
+        Value::Map(entries) => {
+            let mut obj = JsonMap::with_capacity(entries.len());
+            for (k, v) in entries {
+                obj.insert(k.clone(), plan_value_to_json(v));
+            }
+            Json::Object(obj)
+        }
+        other => value_to_jolt(other),
+    }
+}
+
 /// Encodes a [`graphus_core::Point`] as the self-describing `@`-sigil payload object: its CRS name,
 /// SRID and coordinate list. The coordinates are plain JSON numbers (a point coordinate is a
 /// geometric quantity, not subject to the property int53 contract that strings 64-bit integers).

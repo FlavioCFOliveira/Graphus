@@ -363,6 +363,81 @@ USE graphus MATCH (n:Person) RETURN n.name
 
 ---
 
+## Query prefixes — `EXPLAIN` and `PROFILE`
+
+Prefix any statement with `EXPLAIN` or `PROFILE` to get its **execution plan** back in the result
+summary. This is how you confirm that a query is served by the index you declared, rather than silently
+falling back to a full scan — the two return exactly the same rows, so the plan is the only way to tell
+them apart.
+
+| Prefix | Runs the query? | Records returned | Summary key | Counters |
+|--------|-----------------|------------------|-------------|----------|
+| `EXPLAIN` | **No** — planned only | none (the column names are still reported) | `plan` | estimates only |
+| `PROFILE` | **Yes** | the query's real rows | `profile` | **measured** `rows` + `dbHits` per operator |
+
+`EXPLAIN` has **no side effects**: `EXPLAIN CREATE (:Person)` creates nothing, and makes no store access
+at all. `PROFILE` executes normally — including writes — and additionally reports what each operator did.
+Only one prefix may be used, and it must be the first token of the statement. Neither is a reserved word:
+`RETURN 1 AS explain`, `MATCH (n:Profile)` and `n.explain` keep working exactly as before.
+
+### The plan shape (Neo4j 5.x, verbatim)
+
+Each plan node is a map with `operatorType`, `args`, `identifiers` and — for a non-leaf — `children`;
+a `PROFILE` adds the top-level `rows` and `dbHits` of that operator. The official Neo4j drivers parse it
+as `summary().plan` / `summary().profile`. Over REST the same document appears under the summary's
+`plan` / `profile` key.
+
+`EXPLAIN` (the index is used — `NodeIndexSeek`):
+
+```
+{
+  operatorType: "Projection",
+  args: { Details: "Projection(p.email AS email)", EstimatedRows: 30, planner: "COST", runtime: "VOLCANO" },
+  identifiers: ["email"],
+  children: [
+    { operatorType: "NodeIndexSeek",
+      args: { Details: "NodeIndexSeek(p:Person email = 'u7@x.io' via idx#1)" },
+      identifiers: ["p"] }
+  ]
+}
+```
+
+`PROFILE` of `MATCH (p:Person) WHERE p.age > 90 RETURN p.age AS age` over 100 people (real output):
+
+```
+Projection      rows=9    dbHits=9      Details: Projection(p.age AS age)
+  Filter        rows=9    dbHits=100    Details: Filter((p.age > 90))
+    TokenLookupScan rows=100 dbHits=100 Details: TokenLookupScan(p:Person via idx#0)
+```
+
+Read it bottom-up: the scan read 100 node records and emitted 100 rows; the filter read one `age`
+property per candidate (100 reads) and kept 9; the projection read `age` once per surviving row.
+
+### What `dbHits` means — and what it does not
+
+A `dbHit` is **one record obtained from the storage engine** by that operator: one node/relationship
+record, one property, one index entry. It is *measured*, never estimated — Graphus reports no counter it
+did not count. A fused scan-and-filter operator (`NodeLabelScanEq`) reports the records it **examined**,
+not just the ones it matched, so a full-scan fallback cannot masquerade as cheap.
+
+Graphus deliberately does **not** report `pageCacheHits`, `pageCacheMisses` or `time`: it does not
+measure them, and a fabricated counter is worse than an absent one. Drivers treat all three as optional.
+
+`PROFILE` runs the statement **serially** (intra-query morsel parallelism is disabled for it) so that
+every storage access is attributable to an operator; a profiled query may therefore be slower than the
+same query run normally. An unprofiled statement pays nothing at all — no instrumentation is built.
+
+### Known limitation: an auto-commit read does not use the index it plans
+
+A plain auto-commit read is dispatched to the off-thread reader pool, whose seam does not currently serve
+property-index seeks: it declines them and the executor falls back — correctly, but expensively — to a
+scan. So `PROFILE MATCH (p:Person {email: $e}) RETURN p` reports `NodeIndexSeek` (the planner *did*
+choose the index) while its `dbHits` are those of a full scan. Inside an explicit transaction the same
+seek costs 2 `dbHits` against 201 for the scan. The rows are identical either way — which is why this
+went unnoticed until `PROFILE` made it visible.
+
+---
+
 ## Administration
 
 Administrative statements run in auto-commit (they are not part of a user transaction) and require

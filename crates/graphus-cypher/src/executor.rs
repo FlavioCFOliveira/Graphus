@@ -256,7 +256,15 @@ struct Ctx<'a> {
     /// process-global [`crate::morsel::morsel_threads`] at cursor-open. `<= 1` means the morsel tier
     /// early-returns (fully serial — the RPi / determinism / library / `MemGraph` default); `>= 2`
     /// enables morsel-driven intra-query parallelism for the bare-aggregate shape.
+    ///
+    /// **Forced to `1` for a `PROFILE`d statement** (`rmp` task #752): the morsel workers read the store
+    /// through a seam the profiling decorator does not sit on, so a parallel profiled run would silently
+    /// *under-count* its `dbHits`. Running the profiled statement serially keeps every storage access
+    /// attributable — an under-counted profile is a lie, and a lie is worse than a slower diagnostic.
     morsel_threads: usize,
+    /// The `PROFILE` counter sink (`rmp` task #752), or `None` — the overwhelmingly common case — for an
+    /// ordinary statement, which then builds no profiling shim and pays nothing.
+    profile: Option<Arc<crate::profile::ProfileRecorder>>,
 }
 
 impl Ctx<'_> {
@@ -297,6 +305,21 @@ enum Operator {
     /// A pre-computed queue of rows (used for leaf scans, and for materialised results of
     /// `Sort`/`TopN`/`Aggregation`/`DISTINCT`/`HashJoin`/`Union`-distinct). Lazily *drained*.
     Buffered { rows: VecDeque<Row> },
+
+    /// **`PROFILE` instrumentation** (`rmp` task #752): a transparent shim wrapping the operator built
+    /// for plan node `id`.
+    ///
+    /// It exists **only** when the statement carries the `PROFILE` prefix — an ordinary statement builds
+    /// no `Profile` node at all, so the normal execution path keeps exactly the operator tree (and the
+    /// exactly the per-row cost) it had before. On each pull it makes `id` the recorder's *current*
+    /// operator (so every storage access the wrapped operator itself makes is attributed to it, while its
+    /// children's accesses are attributed to them by their own shims), restores the previous one, and
+    /// counts the row if one was produced.
+    Profile {
+        input: Box<Operator>,
+        id: crate::profile::OpId,
+        rec: Arc<crate::profile::ProfileRecorder>,
+    },
 
     /// The single empty row, emitted once.
     SingleRow { emitted: bool, row: Row },
@@ -448,6 +471,10 @@ enum Operator {
     NestedLoop {
         left: Box<Operator>,
         right_template: Box<PhysicalOp>,
+        /// The plan id of the right branch's root, for a `PROFILE`d statement (`rmp` #752); `None`
+        /// otherwise. The template is re-numbered from it before each per-row rebuild so every rebuild
+        /// accumulates into the plan operator's own counters.
+        right_id: Option<crate::profile::OpId>,
         current_left: Option<Row>,
         current_right: Option<Box<Operator>>,
     },
@@ -476,6 +503,9 @@ enum Operator {
         list: Expr,
         /// The correlated body sub-plan, rebuilt per `(row, element)` over its Argument leaf.
         body_template: Box<PhysicalOp>,
+        /// The plan id of the body's root, for a `PROFILE`d statement (`rmp` #752); `None` otherwise.
+        /// See [`Operator::NestedLoop::right_id`].
+        body_id: Option<crate::profile::OpId>,
     },
 
     /// `CALL proc(args) [YIELD …]` (rmp #57): for each driving row, evaluate the arguments, invoke
@@ -548,6 +578,19 @@ impl Operator {
         ctx.check_cancelled()?;
         match self {
             Operator::Buffered { rows } => Ok(rows.pop_front()),
+
+            // `PROFILE` shim (`rmp` #752): attribute this operator's own storage work to `id` while it
+            // runs (a child re-enters with its own id and restores this one), and count the row it
+            // emitted. Present only for a profiled statement.
+            Operator::Profile { input, id, rec } => {
+                let previous = rec.enter(*id);
+                let produced = input.next(ctx);
+                rec.leave(previous);
+                if matches!(produced, Ok(Some(_))) {
+                    rec.record_row(*id);
+                }
+                produced
+            }
 
             Operator::SingleRow { emitted, row } => {
                 if *emitted {
@@ -876,6 +919,7 @@ impl Operator {
             Operator::NestedLoop {
                 left,
                 right_template,
+                right_id,
                 current_left,
                 current_right,
             } => loop {
@@ -891,6 +935,12 @@ impl Operator {
                 let Some(left_row) = left.next(ctx)? else {
                     return Ok(None);
                 };
+                // `PROFILE` (`rmp` #752): re-number the template from the plan id of the branch it was
+                // cloned from, so the rebuilt operators accumulate into the plan's own counters instead
+                // of being unattributable.
+                if let (Some(rec), Some(id)) = (ctx.profile.as_ref(), *right_id) {
+                    rec.rebind_template(right_template, id);
+                }
                 // Re-instantiate the right branch seeded with the left row's bindings (correlation
                 // via the Argument leaf), then loop to drain it.
                 let right_op = build_operator_with_arg(right_template, &left_row, ctx)?;
@@ -928,6 +978,7 @@ impl Operator {
                 variable,
                 list,
                 body_template,
+                body_id,
             } => {
                 // FOREACH is a per-row side-effect; it passes each input row through UNCHANGED.
                 let Some(row) = input.next(ctx)? else {
@@ -955,6 +1006,11 @@ impl Operator {
                     // loop variable lives only on this correlation row, so it never escapes into the
                     // emitted `row`.
                     let arg_row = row.with(variable.name.clone(), elem);
+                    // `PROFILE` (`rmp` #752): re-number the body template from the plan id of the body it
+                    // was cloned from, so each element's rebuild feeds the plan's own counters.
+                    if let (Some(rec), Some(id)) = (ctx.profile.as_ref(), *body_id) {
+                        rec.rebind_template(body_template, id);
+                    }
                     let mut sub = build_operator_with_arg(body_template, &arg_row, ctx)?;
                     while sub.next(ctx)?.is_some() {}
                 }
@@ -2352,7 +2408,39 @@ fn hop_step_from(rel: RelId, from: NodeId, graph: &dyn GraphAccess) -> PathStep 
 ///
 /// `arg` is the correlation row for an [`Argument`](PhysicalOp::Argument) leaf (the left row of an
 /// enclosing nested-loop join); `None` at the top level.
+///
+/// For a **`PROFILE`d** statement (`rmp` task #752) this wraps every operator it builds in an
+/// [`Operator::Profile`] shim and, while the operator is being built, makes it the recorder's *current*
+/// operator — because a leaf scan and every materialising operator (`Sort`, `Aggregation`, `HashJoin`, …)
+/// do their storage work **here**, at build time, not on the first `next()`. Since this function is the
+/// single entry point every child build recurses through, the shim is installed uniformly with no change
+/// to any operator's own construction. An unprofiled statement takes the early return and is untouched.
 fn build_operator(
+    op: &PhysicalOp,
+    arg: Option<&Row>,
+    ctx: &mut Ctx<'_>,
+) -> Result<Operator, ExecError> {
+    let Some(rec) = ctx.profile.clone() else {
+        return build_operator_unprofiled(op, arg, ctx);
+    };
+    // An operator the recorder does not know (which the executor cannot produce — it only ever builds the
+    // plan's operators and the templates it has rebound) is built with no shim rather than have its work
+    // attributed to some *other* operator's counter: a missing number is honest, a wrong one is not.
+    let Some(id) = rec.id_of(op) else {
+        return build_operator_unprofiled(op, arg, ctx);
+    };
+    let previous = rec.enter(id);
+    let built = build_operator_unprofiled(op, arg, ctx);
+    rec.leave(previous);
+    Ok(Operator::Profile {
+        input: Box::new(built?),
+        id,
+        rec,
+    })
+}
+
+/// [`build_operator`] without the profiling shim: the operator construction itself.
+fn build_operator_unprofiled(
     op: &PhysicalOp,
     arg: Option<&Row>,
     ctx: &mut Ctx<'_>,
@@ -3193,6 +3281,11 @@ fn build_operator(
         PhysicalOp::NestedLoopJoin { left, right } => Ok(Operator::NestedLoop {
             left: Box::new(build_operator(left, arg, ctx)?),
             right_template: right.clone(),
+            // The right branch is a *clone* of the plan's subtree (it is rebuilt per left row), so its
+            // nodes are not the plan's nodes. Remember the plan id of its root: before each rebuild the
+            // template is re-numbered from it, so every rebuild accumulates into the same counters
+            // (`rmp` #752).
+            right_id: ctx.profile.as_ref().and_then(|r| r.id_of(right)),
             current_left: None,
             current_right: None,
         }),
@@ -3273,6 +3366,9 @@ fn build_operator(
             variable: variable.clone(),
             list: list.clone(),
             body_template: body.clone(),
+            // As for the nested-loop right branch: the body is rebuilt per element from a clone, so its
+            // plan id is remembered here and the template re-numbered from it before each rebuild.
+            body_id: ctx.profile.as_ref().and_then(|r| r.id_of(body)),
         }),
 
         // ---- procedure ------------------------------------------------------------------------
@@ -3458,7 +3554,11 @@ fn all_rels_rows(
 /// old fallback that ran `scan_nodes_by_label` (marking every live node) + a residual filter, whose
 /// blanket marker produced reciprocal false aborts between transactions matching disjoint keys.
 fn scan_filter_eq(label: &Label, property: &str, seek: &Value, ctx: &Ctx<'_>) -> Vec<NodeId> {
-    ctx.graph.scan_filter_eq(&label.name, property, seek)
+    // The seam also reports how many records it EXAMINED (`rmp` #752 — a `PROFILE`'s `dbHits` for this
+    // fused scan+filter); the executor itself needs only the matches.
+    ctx.graph
+        .scan_filter_eq(&label.name, property, seek)
+        .matched
 }
 
 /// Materialises a re-checked relationship-id set into rows for a
@@ -7724,9 +7824,53 @@ pub struct Cursor<'a> {
     /// `false` for a write statement with no `RETURN`: the cursor drains its operator tree to apply
     /// the side effects but presents an empty result (openCypher write cardinality).
     emits_rows: bool,
+    /// The `PROFILE` counter sink (`rmp` task #752), shared with the caller so the measured counters
+    /// outlive the cursor: the result summary is built *after* the statement finished. `None` for every
+    /// ordinary statement, which then reads the store through the bare seam exactly as before.
+    profile: Option<Arc<crate::profile::ProfileRecorder>>,
 }
 
 impl<'a> Cursor<'a> {
+    /// The `PROFILE` recorder this cursor feeds, if the statement carried the `PROFILE` prefix
+    /// (`rmp` task #752).
+    ///
+    /// The caller clones the `Arc` at open time and reads the counters once the cursor is drained — the
+    /// recorder holds the plan too, so [`PlanDescription::profile`](crate::plan_description::PlanDescription::profile)
+    /// can render the annotated plan with nothing else in hand.
+    #[must_use]
+    pub fn profile(&self) -> Option<&Arc<crate::profile::ProfileRecorder>> {
+        self.profile.as_ref()
+    }
+
+    /// Runs `f` with a [`Ctx`] over this cursor's seam, interposing the [`ProfilingGraph`] counting
+    /// decorator when — and only when — the statement is being profiled (`rmp` task #752).
+    ///
+    /// Every graph access the executor makes for this cursor goes through the `Ctx` this builds, so a
+    /// profiled statement counts *all* of its storage work (including the result-materialisation reads at
+    /// the egress boundary) and an unprofiled one pays nothing: no decorator is constructed and the seam
+    /// is passed through untouched.
+    fn with_ctx<R>(&mut self, f: impl FnOnce(&mut Operator, &mut Ctx<'_>) -> R) -> R {
+        let mut decorated;
+        let graph: &mut dyn GraphAccess = match &self.profile {
+            Some(rec) => {
+                decorated = crate::profile::ProfilingGraph::new(&mut *self.graph, Arc::clone(rec));
+                &mut decorated
+            }
+            None => &mut *self.graph,
+        };
+        let mut ctx = Ctx {
+            params: &self.params,
+            token: &self.token,
+            graph,
+            functions: self.functions,
+            procedures: self.procedures,
+            clock: self.clock,
+            morsel_threads: self.morsel_threads,
+            profile: self.profile.clone(),
+        };
+        f(&mut self.root, &mut ctx)
+    }
+
     /// The result column names, in order — the schema the rows carry (`04 §7.7`).
     #[must_use]
     pub fn columns(&self) -> &[String] {
@@ -7749,29 +7893,23 @@ impl<'a> Cursor<'a> {
         if self.finished {
             return Ok(None);
         }
-        let mut ctx = Ctx {
-            params: &self.params,
-            token: &self.token,
-            graph: self.graph,
-            functions: self.functions,
-            procedures: self.procedures,
-            clock: self.clock,
-            morsel_threads: self.morsel_threads,
-        };
         // A write statement with no `RETURN` yields zero rows (openCypher write cardinality), but
         // its side effects must still happen: drain the operator tree once so every write `next()`
         // fires (e.g. `MATCH (n) SET n.x = 1` applies all N updates), then present an empty result.
         if !self.emits_rows {
             self.finished = true;
-            loop {
-                match self.root.next(&mut ctx) {
-                    Ok(Some(_)) => {}
-                    Ok(None) => return Ok(None),
-                    Err(e) => return Err(e),
+            return self.with_ctx(|root, ctx| {
+                loop {
+                    match root.next(ctx) {
+                        Ok(Some(_)) => {}
+                        Ok(None) => return Ok(None),
+                        Err(e) => return Err(e),
+                    }
                 }
-            }
+            });
         }
-        match self.root.next(&mut ctx) {
+        let produced = self.with_ctx(|root, ctx| root.next(ctx));
+        match produced {
             Ok(Some(row)) => Ok(Some(row)),
             Ok(None) => {
                 self.finished = true;
@@ -7835,7 +7973,7 @@ impl<'a> Cursor<'a> {
         &mut self,
     ) -> Result<Option<Vec<crate::result::MaterializedValue>>, ExecError> {
         match self.next()? {
-            Some(row) => Ok(Some(crate::result::materialize_row(self.graph, &row))),
+            Some(row) => Ok(Some(self.materialize_row(&row))),
             None => Ok(None),
         }
     }
@@ -7845,9 +7983,20 @@ impl<'a> Cursor<'a> {
     /// The row-at-a-time counterpart to [`next_materialized`](Self::next_materialized) for callers
     /// that hold a [`Row`] (e.g. a `pull(n)` batch) and want its wire form. Resolution reads through
     /// the cursor's `&mut dyn GraphAccess`, so RBAC/MVCC apply exactly as for `next_materialized`.
+    ///
+    /// For a `PROFILE`d statement the reads go through the counting decorator too (`rmp` task #752), so
+    /// the storage work of resolving a returned entity is measured, not silently dropped; it is attributed
+    /// to the root operator, which is the operator that produced the row.
     #[must_use]
     pub fn materialize_row(&mut self, row: &Row) -> Vec<crate::result::MaterializedValue> {
-        crate::result::materialize_row(self.graph, row)
+        match &self.profile {
+            Some(rec) => {
+                let mut decorated =
+                    crate::profile::ProfilingGraph::new(&mut *self.graph, Arc::clone(rec));
+                crate::result::materialize_row(&mut decorated, row)
+            }
+            None => crate::result::materialize_row(self.graph, row),
+        }
     }
 
     /// Detaches this cursor's **owned execution state** from the borrowed graph seam, releasing the
@@ -7876,6 +8025,9 @@ impl<'a> Cursor<'a> {
             columns: self.columns,
             finished: self.finished,
             emits_rows: self.emits_rows,
+            // The `PROFILE` counters (`rmp` #752) survive a suspend/resume with the operator state, so a
+            // statement parked for a slow consumer still reports the counts of its *whole* run.
+            profile: self.profile,
         }
     }
 }
@@ -7896,6 +8048,8 @@ pub struct SuspendedCursor {
     columns: Vec<String>,
     finished: bool,
     emits_rows: bool,
+    /// The `PROFILE` counter sink (`rmp` task #752), carried across the suspension; `None` otherwise.
+    profile: Option<Arc<crate::profile::ProfileRecorder>>,
 }
 
 impl SuspendedCursor {
@@ -7936,6 +8090,7 @@ impl SuspendedCursor {
             columns: self.columns,
             finished: self.finished,
             emits_rows: self.emits_rows,
+            profile: self.profile,
         }
     }
 }
@@ -8052,10 +8207,59 @@ impl Executor {
         // Capture the statement clock once per open() — this is the fixed per-statement instant
         // every zero-argument temporal constructor in the statement reads (`rmp` task #140).
         let clock = StatementClock::capture();
+
+        // `EXPLAIN` (`rmp` task #752): the statement is planned but **never executed**. Return here,
+        // before `build_operator` — which is where leaf scans and every materialising operator do their
+        // storage work — with an empty operator tree. No operator exists, so no store access and no side
+        // effect is possible: `EXPLAIN CREATE (:X)` creates nothing, by construction rather than by a
+        // promise. The result columns are still the query's real ones (Neo4j reports the statement's
+        // `fields` for an EXPLAIN and simply streams no record), so the client sees the correct schema
+        // with zero rows.
+        if self.plan.prefix() == Some(crate::ast::QueryPrefix::Explain) {
+            return Ok(Cursor {
+                root: Operator::Buffered {
+                    rows: VecDeque::new(),
+                },
+                params: self.params.clone(),
+                token,
+                graph,
+                functions,
+                procedures,
+                clock,
+                morsel_threads: 1,
+                columns,
+                finished: false,
+                emits_rows: !root_is_write(&self.plan.root),
+                profile: None,
+            });
+        }
+
+        // `PROFILE` (`rmp` task #752): install the counter sink for this run. It holds the plan, so the
+        // annotated description can be rendered from it alone once the statement finishes.
+        let profile = match self.plan.prefix() {
+            Some(crate::ast::QueryPrefix::Profile) => Some(Arc::new(
+                crate::profile::ProfileRecorder::new(Arc::clone(&self.plan)),
+            )),
+            _ => None,
+        };
         // The effective morsel-thread count for this statement (`rmp` task #339), read once from the
-        // process-global knob at open and frozen for the cursor's lifetime.
-        let morsel_threads = crate::morsel::morsel_threads();
+        // process-global knob at open and frozen for the cursor's lifetime. A profiled statement runs
+        // **serially** (`rmp` #752): the morsel workers bypass the counting seam, so a parallel profiled
+        // run would under-count its `dbHits` — a wrong number, which is worse than a slow one.
+        let morsel_threads = if profile.is_some() {
+            1
+        } else {
+            crate::morsel::morsel_threads()
+        };
         let root = {
+            let mut decorated;
+            let graph: &mut dyn GraphAccess = match &profile {
+                Some(rec) => {
+                    decorated = crate::profile::ProfilingGraph::new(&mut *graph, Arc::clone(rec));
+                    &mut decorated
+                }
+                None => &mut *graph,
+            };
             let mut ctx = Ctx {
                 params: &self.params,
                 token: &token,
@@ -8064,6 +8268,7 @@ impl Executor {
                 procedures,
                 clock,
                 morsel_threads,
+                profile: profile.clone(),
             };
             build_operator(&self.plan.root, None, &mut ctx)?
         };
@@ -8079,6 +8284,7 @@ impl Executor {
             columns,
             finished: false,
             emits_rows: !root_is_write(&self.plan.root),
+            profile,
         })
     }
 
@@ -8115,6 +8321,12 @@ impl Executor {
                 procedures,
                 clock,
                 morsel_threads,
+                // A seeded cursor drives a **correlated sub-plan** (an `EXISTS { … }` body), which is
+                // never a statement of its own and so never carries a query prefix. Its storage accesses
+                // are still counted when the enclosing statement is profiled: it reads through the seam
+                // the outer cursor handed it — the counting decorator — and they are attributed to the
+                // outer operator that is evaluating the subquery, which is where the work belongs.
+                profile: None,
             };
             build_operator(&self.plan.root, Some(seed), &mut ctx)?
         };
@@ -8130,6 +8342,7 @@ impl Executor {
             columns,
             finished: false,
             emits_rows: !root_is_write(&self.plan.root),
+            profile: None,
         })
     }
 }
@@ -8723,6 +8936,7 @@ mod tests {
             procedures,
             clock: StatementClock::capture(),
             morsel_threads: crate::morsel::morsel_threads(),
+            profile: None,
         };
         try_parallel_label_property_aggregate(input, group_keys, aggregates, &mut ctx)
             .expect("no error")

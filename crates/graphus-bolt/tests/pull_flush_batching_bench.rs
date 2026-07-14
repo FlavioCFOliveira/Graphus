@@ -58,6 +58,7 @@ impl RecordStream for BigStream {
     }
     fn summary(&self) -> QuerySummary {
         QuerySummary {
+            plan: None,
             query_type: Some("r".to_owned()),
             stats: vec![],
         }

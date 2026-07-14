@@ -69,7 +69,6 @@ impl LocalBoltExecutor {
 /// borrow on the engine — the next statement can run immediately.
 pub struct LocalRecordStream {
     reply: RunReply,
-    summary: QuerySummary,
 }
 
 impl RecordStream for LocalRecordStream {
@@ -86,8 +85,40 @@ impl RecordStream for LocalRecordStream {
         }
     }
 
+    /// The engine's **real** result summary, read from the [`RunReply`]'s sink exactly as the production
+    /// Bolt seam does (`rmp` #512/#752).
+    ///
+    /// It previously returned a default (empty) summary, which silently made the simulator's Bolt wire
+    /// *less* faithful than the server's: a scenario could never observe `type`, `stats`, or a query plan.
+    /// The deterministic engine drives every statement to completion inline before `run` returns, so the
+    /// sink is already filled when this is called.
     fn summary(&self) -> QuerySummary {
-        self.summary.clone()
+        to_bolt_summary(self.reply.summary.get())
+    }
+}
+
+/// Maps the engine's neutral summary onto the Bolt crate's — the same conversion the production seam
+/// (`graphus_server::engine::seam_bolt`) performs, so the simulated wire reports identical metadata.
+fn to_bolt_summary(s: graphus_server::engine::RunSummary) -> QuerySummary {
+    QuerySummary {
+        query_type: s.query_type,
+        stats: s.stats,
+        plan: s.plan.map(|p| graphus_bolt::QueryPlan {
+            profiled: p.profiled,
+            description: p.description,
+        }),
+    }
+}
+
+/// Maps the engine's neutral summary onto the REST crate's (the `seam_rest` conversion).
+fn to_rest_summary(s: graphus_server::engine::RunSummary) -> RestRunSummary {
+    RestRunSummary {
+        query_type: s.query_type,
+        stats: s.stats,
+        plan: s.plan.map(|p| graphus_rest::QueryPlan {
+            profiled: p.profiled,
+            description: p.description,
+        }),
     }
 }
 
@@ -121,10 +152,7 @@ impl BoltExecutor for LocalBoltExecutor {
             }
         };
         let reply = eng.run(ticket, query, parameters, auto_commit, None)?;
-        Ok(LocalRecordStream {
-            reply,
-            summary: QuerySummary::default(),
-        })
+        Ok(LocalRecordStream { reply })
     }
 
     fn begin(&mut self, mode: BoltAccessMode, _db: Option<&str>) -> Result<(), GraphusError> {
@@ -568,7 +596,6 @@ impl SimRestEngine {
 /// [`graphus_rest`]'s `RestValue` via the SAME mapping the real server seam uses.
 pub struct SimRestStream {
     reply: RunReply,
-    summary: RestRunSummary,
 }
 
 impl ResultStream for SimRestStream {
@@ -583,8 +610,10 @@ impl ResultStream for SimRestStream {
         }
     }
 
+    /// The engine's **real** result summary, read from the [`RunReply`]'s sink exactly as the production
+    /// REST seam does (`rmp` #512/#752) — see [`LocalRecordStream::summary`].
     fn summary(&self) -> RestRunSummary {
-        self.summary.clone()
+        to_rest_summary(self.reply.summary.get())
     }
 }
 
@@ -620,10 +649,7 @@ impl RestEngine for SimRestEngine {
             .engine
             .borrow_mut()
             .run(TxTicket(tx.0), query, parameters, false, None)?;
-        Ok(SimRestStream {
-            reply,
-            summary: RestRunSummary::default(),
-        })
+        Ok(SimRestStream { reply })
     }
 
     fn run_autocommit(
@@ -640,10 +666,7 @@ impl RestEngine for SimRestEngine {
         let mut engine = self.engine.borrow_mut();
         let ticket = engine.begin_auto_commit(map_rest_mode(mode))?;
         let reply = engine.run(ticket, query, parameters, true, None)?;
-        Ok(SimRestStream {
-            reply,
-            summary: RestRunSummary::default(),
-        })
+        Ok(SimRestStream { reply })
     }
 
     fn commit(&self, tx: TxHandle) -> Result<RestRunSummary, GraphusError> {

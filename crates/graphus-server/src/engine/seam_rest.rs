@@ -408,6 +408,12 @@ fn to_rest_summary(s: RunSummary) -> RestRunSummary {
     RestRunSummary {
         query_type: s.query_type,
         stats: s.stats,
+        // The `EXPLAIN` / `PROFILE` plan (`rmp` #752) — the same rendered plan the Bolt seam reports, under
+        // the same key.
+        plan: s.plan.map(|p| graphus_rest::QueryPlan {
+            profiled: p.profiled,
+            description: p.description,
+        }),
     }
 }
 

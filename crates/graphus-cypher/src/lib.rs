@@ -137,7 +137,9 @@ pub mod ordering;
 pub mod parser;
 pub mod physical;
 pub mod plan_cache;
+pub mod plan_description;
 pub mod procedure_registry;
+pub mod profile;
 pub mod read_only_graph;
 pub mod read_source;
 pub mod record_graph;
@@ -158,7 +160,7 @@ pub mod value_depth;
 pub mod value_size;
 pub mod zone_map;
 
-pub use ast::{Clause, Expr, ExprKind, Query, QueryBody, SingleQuery};
+pub use ast::{Clause, Expr, ExprKind, Query, QueryBody, QueryPrefix, SingleQuery};
 pub use authorized_graph::{AuthorizedGraph, PrivilegeOracle};
 pub use binding::{
     BindError, BoundParameters, ParamType, Parameters, bind_parameters, referenced_parameters,
@@ -217,10 +219,12 @@ pub use plan_cache::{
     CacheStats, FeatureFlags, NormalizedQuery, PlanCache, PlanCacheKey, SchemaVersion,
     normalize_query,
 };
+pub use plan_description::{PLAN_KEY, PROFILE_KEY, PlanDescription, PlanNode};
 pub use procedure_registry::{
     FieldSpec, FieldType, ProcedureFailure, ProcedureListing, ProcedureRegistry, ProcedureSet,
     ProcedureSignature, ValueClass,
 };
+pub use profile::{OpId, ProfileRecorder, ProfilingGraph};
 pub use read_only_graph::ReadOnlyGraph;
 pub use read_source::{LiveSource, ReadSink, ReadViewSource, StoreReadSource, VisCtx};
 pub use record_graph::RecordStoreGraph;

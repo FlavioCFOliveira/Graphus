@@ -2063,7 +2063,8 @@ fn bind_parameters(stmt: &Statement) -> Result<Vec<(String, Value)>, ValueCodecE
 
 // =============================== encoding helpers ==============================================
 
-/// Encodes a [`RunSummary`] as a typed object (`type` + `stats`).
+/// Encodes a [`RunSummary`] as a typed object (`type` + `stats`, plus `plan`/`profile` when the statement
+/// carried a query prefix).
 fn encode_summary(summary: &RunSummary) -> Json {
     let mut stats = serde_json::Map::new();
     for (k, v) in &summary.stats {
@@ -2071,10 +2072,25 @@ fn encode_summary(summary: &RunSummary) -> Json {
         // Neo4j HTTP API / `docs/rest-api.md` contract a client reads counts from directly (`rmp` #512).
         stats.insert(k.clone(), value::summary_value_to_json(v));
     }
-    json!({
-        "type": summary.query_type,
-        "stats": Json::Object(stats),
-    })
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "type".to_owned(),
+        summary
+            .query_type
+            .as_ref()
+            .map_or(Json::Null, |t| Json::String(t.clone())),
+    );
+    obj.insert("stats".to_owned(), Json::Object(stats));
+    // The query plan of an `EXPLAIN` / `PROFILE` statement (`rmp` task #752), under exactly one of the two
+    // mutually-exclusive keys the Bolt seam uses — so both protocols report the same plan under the same
+    // name. Absent entirely for an ordinary statement.
+    if let Some(plan) = &summary.plan {
+        obj.insert(
+            plan.summary_key().to_owned(),
+            value::plan_value_to_json(&plan.description),
+        );
+    }
+    Json::Object(obj)
 }
 
 /// Serialises `body` into a [`Built`] in the wire format the `Accept` header negotiated (JSON or

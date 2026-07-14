@@ -74,15 +74,41 @@ pub type Row = Vec<RestValue>;
 /// The summary metadata for a finished result, surfaced after the rows (the REST analogue of the
 /// trailing Bolt `SUCCESS` summary — `06 §3.1`).
 ///
-/// v1 carries the query `type` (e.g. `"r"`, `"rw"`, `"w"`, `"s"`) and a `stats` map of side-effect
-/// counters; richer summary fields (plan, profile, notifications) are added as the executor exposes
-/// them.
+/// It carries the query `type` (e.g. `"r"`, `"rw"`, `"w"`, `"s"`), a `stats` map of side-effect counters,
+/// and — for a statement run with the `EXPLAIN` / `PROFILE` prefix — the query [plan](QueryPlan)
+/// (`rmp` task #752); the remaining summary fields (notifications) are added as the executor exposes them.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RunSummary {
     /// The query type code for the `type` summary key (`"r"`/`"rw"`/`"w"`/`"s"`), if known.
     pub query_type: Option<String>,
     /// Side-effect counters for the `stats` summary key (e.g. `nodes-created`), in order.
     pub stats: Vec<(String, Value)>,
+    /// The query plan for an `EXPLAIN` / `PROFILE` statement (`rmp` task #752); `None` — and then absent
+    /// from the summary object entirely — for an ordinary statement.
+    pub plan: Option<QueryPlan>,
+}
+
+/// A query plan delivered in the result summary (`rmp` task #752).
+///
+/// Exactly one of two mutually-exclusive summary keys carries it, mirroring Bolt (and Neo4j): `plan` for
+/// an `EXPLAIN` (the statement did **not** run — estimates only) and `profile` for a `PROFILE` (it ran, and
+/// every operator carries its measured `rows` / `dbHits`). The `description` is an opaque, already-rendered
+/// map — the REST layer only serialises it; the plan's shape is owned by the engine
+/// (`graphus_cypher::plan_description`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryPlan {
+    /// `true` when the statement was `PROFILE`d (key `profile`); `false` for an `EXPLAIN` (key `plan`).
+    pub profiled: bool,
+    /// The rendered plan-description map.
+    pub description: Value,
+}
+
+impl QueryPlan {
+    /// The summary key this plan is delivered under: `"profile"` when profiled, `"plan"` otherwise.
+    #[must_use]
+    pub fn summary_key(&self) -> &'static str {
+        if self.profiled { "profile" } else { "plan" }
+    }
 }
 
 /// A lazily-produced stream of result rows for one statement (`04 §7.7`).
@@ -288,6 +314,7 @@ pub(crate) mod mock {
                 fields: fields.iter().map(|s| (*s).to_owned()).collect(),
                 rows,
                 summary: RunSummary {
+                    plan: None,
                     query_type: Some("r".to_owned()),
                     stats: Vec::new(),
                 },

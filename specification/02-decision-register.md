@@ -86,6 +86,32 @@ scope and are propagated into `00-overview.md` and `01-needs-survey.md`:
 > ratified outcome changes; this is the completion of an already-ratified core requirement. Specified in
 > `04-technical-design.md` §6.8 and recorded as a `Decision` node in the KG.
 
+> **Post-ratification note (2026-07-14) — `D-query-prefixes` (`EXPLAIN` / `PROFILE`).** This note
+> records a **design decision**, not a scope change: the two Cypher query prefixes are the ratified
+> core requirement `FR-QL-13`, delivered by rmp #752. `EXPLAIN` compiles and plans a statement without
+> executing it (zero records, the statement's real `fields`, plan under the `plan` key); `PROFILE`
+> executes it and returns a plan annotated with measured per-operator counters under the `profile`
+> key. Exactly one of `plan` / `profile` is ever emitted. `D-query-prefixes` captures the specific
+> choices made in delivering it:
+> 1. **`dbHits` is Graphus's own measured quantity** — one record obtained from the `GraphAccess`
+>    storage seam by an operator — **not** an attempt to reproduce Neo4j's internal DbHit accounting.
+>    A fused scan-and-filter path reports the records it *examined*, so a full-scan fallback cannot
+>    masquerade as cheap.
+> 2. **Unmeasured counters are omitted, never fabricated.** Graphus reports no per-operator
+>    wall-clock `time` and no `pageCacheHits` / `pageCacheMisses` / `pageCacheHitRatio` (all optional
+>    on the wire; drivers default them to `0`). This **supersedes the "timing" wording of `FR-QL-13`**:
+>    PROFILE reports measured `rows` and `dbHits`, but not per-operator time.
+> 3. **A `PROFILE`d statement runs serially** (intra-query morsel parallelism disabled) so every
+>    storage access is attributable; an unprofiled statement builds no instrumentation and pays
+>    nothing.
+> 4. **The planner's cardinality estimate is reported on the root only** (`EstimatedRows`), never
+>    invented per operator.
+>
+> Each choice follows the project's "measure to decide" rule and its refusal to synthesise a number it
+> did not measure. No ratified outcome changes; this completes an already-ratified core requirement.
+> Specified in `04-technical-design.md` §7.8 and `06-bolt-and-error-shapes.md` §3.1, and recorded as a
+> `Decision` node in the KG.
+
 > **Post-ratification note (2026-06-15) — sprint-19 performance/architecture deferrals.**
 > Two performance/architecture findings were evaluated during the sprint-19
 > production-readiness closure and **deferred** (accepted-as-is for the single-node

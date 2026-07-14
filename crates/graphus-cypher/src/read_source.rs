@@ -56,7 +56,9 @@ use graphus_storage::{MvccHeader, Namespace, RecordStore, StoreReadView, TokenSn
 use graphus_txn::{CommitRegistry, PredicateRead, Snapshot, is_visible};
 use graphus_wal::LogSink;
 
-use crate::graph_access::{DeletedEntity, ExpandDirection, Incident, NodeId, RelData, RelId};
+use crate::graph_access::{
+    DeletedEntity, ExpandDirection, Incident, NodeId, RelData, RelId, ScanFilter,
+};
 
 /// The conflict key for relationship physical id `id` (tagged into the high half of the SSI key
 /// space). Mirrors `record_graph::rel_ssi_key` — node ids occupy the low keys, relationship ids the
@@ -691,7 +693,7 @@ pub fn scan_filter_eq<S: StoreReadSource, K: ReadSink>(
     label: &str,
     property: &str,
     seek: &Value,
-) -> Vec<NodeId> {
+) -> ScanFilter {
     // Resolve the label + prop-key tokens (no intern — a read never mints a token) and encode the seek
     // value canonically. If any is unavailable, the precise `Equality` marker cannot be formed, so fall
     // back to the conservative label-scan footprint + an equality filter (phantom-safe, see the doc).
@@ -700,13 +702,16 @@ pub fn scan_filter_eq<S: StoreReadSource, K: ReadSink>(
         src.token_id(Namespace::PropKey, property),
         encode_equality_canonical(seek),
     ) else {
-        return scan_nodes_by_label(src, ctx, sink, label)
+        let candidates = scan_nodes_by_label(src, ctx, sink, label);
+        let examined = candidates.len();
+        let matched = candidates
             .into_iter()
             .filter(|id| {
                 node_property(src, ctx, sink, *id, property)
                     .is_some_and(|v| crate::equality::equals(&v, seek).is_true())
             })
             .collect();
+        return ScanFilter { matched, examined };
     };
 
     // The phantom-safe predicate marker: the *precise* equality predicate, so a concurrent insert /
@@ -728,9 +733,13 @@ pub fn scan_filter_eq<S: StoreReadSource, K: ReadSink>(
         Ok(ids) => ids,
         Err(e) => {
             sink.capture(e);
-            return Vec::new();
+            return ScanFilter::default();
         }
     };
+    // Every live node record is READ to evaluate the predicate (only the matches are SIREAD-marked and
+    // returned). That read count is this operator's true storage cost, so it is reported to the caller for
+    // a `PROFILE`'s `dbHits` (`rmp` #752) — a measured number, free to obtain (it is the scan's own length).
+    let examined = ids.len();
     let mut out = Vec::new();
     for id in ids {
         // Visibility first (MVCC): a tombstoned / not-yet-committed node never matches.
@@ -739,7 +748,7 @@ pub fn scan_filter_eq<S: StoreReadSource, K: ReadSink>(
             // `scan_node_ids` only yields slot-occupied ids; a transient decode fault is a real error.
             Err(e) => {
                 sink.capture(e);
-                return Vec::new();
+                return ScanFilter::default();
             }
         };
         if !visible {
@@ -752,7 +761,7 @@ pub fn scan_filter_eq<S: StoreReadSource, K: ReadSink>(
             Err(e) => {
                 // An overflow-form bitmap (#39) surfaces as a captured error, never a wrong row.
                 sink.capture(e);
-                return Vec::new();
+                return ScanFilter::default();
             }
         }
         // Current value equals `seek`? Use the non-marking property read (`read_node_prop_one`) so that
@@ -766,7 +775,10 @@ pub fn scan_filter_eq<S: StoreReadSource, K: ReadSink>(
             out.push(NodeId(id));
         }
     }
-    out
+    ScanFilter {
+        matched: out,
+        examined,
+    }
 }
 
 /// The body of `RecordStoreGraph::expand` (`GraphAccess::expand`): register the relationship-pattern

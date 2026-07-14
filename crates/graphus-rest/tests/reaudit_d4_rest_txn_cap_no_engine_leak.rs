@@ -47,6 +47,7 @@ impl ResultStream for EmptyStream {
     }
     fn summary(&self) -> RunSummary {
         RunSummary {
+            plan: None,
             query_type: Some("r".to_owned()),
             stats: Vec::new(),
         }

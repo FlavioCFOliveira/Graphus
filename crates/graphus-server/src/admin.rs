@@ -4346,6 +4346,8 @@ fn admin_command_summary(cmd: &AdminCommand) -> RunSummary {
         | A::ShowTransactions => RunSummary {
             query_type: Some("r".to_owned()),
             stats: Vec::new(),
+            // An administrative command never goes through the Cypher planner: no plan (`rmp` #752).
+            plan: None,
         },
         // Catalog + security mutations → query type "s" + system-updates + contains-system-updates.
         A::CreateDatabase { .. }
@@ -4365,6 +4367,7 @@ fn admin_command_summary(cmd: &AdminCommand) -> RunSummary {
         | A::AlterUserStatus { .. }
         | A::RenameUser { .. }
         | A::RenameRole { .. } => RunSummary {
+            plan: None,
             query_type: Some("s".to_owned()),
             stats: vec![
                 ("system-updates".to_owned(), Value::Integer(1)),
@@ -4378,6 +4381,7 @@ fn admin_command_summary(cmd: &AdminCommand) -> RunSummary {
         | A::TerminateTransactions { .. } => RunSummary {
             query_type: Some("s".to_owned()),
             stats: Vec::new(),
+            plan: None,
         },
     }
 }

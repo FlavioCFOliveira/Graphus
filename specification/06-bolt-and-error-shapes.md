@@ -207,8 +207,9 @@ A successful query over Bolt produces this sequence of server messages (`04` §8
    the row's `Value`s in the order declared by the fields metadata. Records are produced lazily and
    pushed in response to the client's `PULL n` demand (flow control; `04` §7.7).
 3. A trailing **`SUCCESS`** carrying the **result summary** — the query `type`, the side-effect
-   `stats` (present only when non-empty), and a `has_more` indicator when the client `PULL`ed a
-   bounded batch.
+   `stats` (present only when non-empty), a `has_more` indicator when the client `PULL`ed a
+   bounded batch, and — for a statement carrying an `EXPLAIN`/`PROFILE` prefix — the execution-plan
+   metadata under `plan`/`profile` (see "Execution-plan metadata" below).
 
 `DISCARD` consumes (and discards) the remaining rows and yields the trailing `SUCCESS` summary
 without emitting `RECORD`s.
@@ -236,6 +237,40 @@ which deliberately differs from the openCypher **TCK observability** model: `CRE
 reports `nodes-created: 1, nodes-deleted: 1` here, whereas the TCK observes no net side effect. The
 two models are kept separate by design — the TCK conformance runner uses the observability model and
 is never repointed at these wire counters.
+
+**Execution-plan metadata (`plan` / `profile`).** A statement whose text carries an `EXPLAIN` or
+`PROFILE` query prefix (`04-technical-design.md` §7.8) additionally reports its execution plan in the
+result summary, under exactly one key: `plan` for an `EXPLAIN`, `profile` for a `PROFILE`. The two
+keys are **mutually exclusive** (never both), and **neither** key appears for an ordinary statement.
+`stats` follows its own rule independently: an `EXPLAIN` executes nothing, so it reports no `stats`
+(the read-only-shaped summary), whereas a `PROFILE` reports `stats` exactly as the executed statement
+would. An `EXPLAIN` also produces **zero `RECORD`s**, while the `RUN` `SUCCESS` still reports the
+statement's real **fields** (its column names), matching Neo4j's `ExplainExecutionResult`.
+
+The value under `plan` / `profile` is a **plan-node tree**. On the Bolt wire each node is a
+PackStream dictionary; over REST it is a plain-JSON object (not a strict-Jolt result cell — the plan
+is a diagnostic document, `04-technical-design.md` §8.2). Both renderings are produced from one
+protocol-neutral description built in `graphus-cypher` (`04-technical-design.md` §7.8), so the two
+interfaces can never disagree. Its shape matches Neo4j 5.x's `DefaultMetadataHandler.generateExecutionPlan`
+and what the official drivers parse. A node carries:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `operatorType` | String | The operator's name. Always present (drivers read it with no null check). |
+| `args` | Map | The wire key is `args`, never `arguments`. Contents below. |
+| `identifiers` | List of String | The variables the operator's rows bind, in introduction order. |
+| `children` | List of plan nodes | The operator's sub-plans. **Omitted entirely for a leaf operator** (a leaf sends no `children` key, not an empty list). |
+| `rows`, `dbHits` | Integer | **`PROFILE` only**, as **top-level** siblings of the fields above (not nested in `args`). An `EXPLAIN` omits them: nothing ran, and Graphus never fabricates a runtime counter. |
+
+`args` always carries `Details` (the operator's own rendered detail line). A `PROFILE` adds `Rows`
+and `DbHits` (PascalCase duplicates of the top-level counters) on **every** operator. The **root**
+node additionally carries `EstimatedRows` (the planner's cardinality estimate for the whole plan —
+Graphus has no per-operator estimate and does not invent one), `planner` (`"COST"` when statistics
+drove the cost-based optimiser, `"RULE"` otherwise) and `runtime` (`"VOLCANO"`). Graphus does **not**
+emit `pageCacheHits`, `pageCacheMisses`, `pageCacheHitRatio` or `time`: it does not measure them, and
+it never reports a counter it did not count. All four are optional on the wire and the official
+drivers default them to `0`. The measured meaning of `dbHits` is defined in `04-technical-design.md`
+§7.8.
 
 ### 3.2 Failure shape (FAILURE)
 

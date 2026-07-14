@@ -61,10 +61,10 @@ use crate::ast::{
     MatchClause, MergeAction, MergeClause, NodePattern, NormalForm, PatternChainLink,
     PatternComprehension, PatternElement, PatternPart, PatternPartKind, PatternQuantifier,
     PredefinedType, PredicateOp, ProcedureCall, ProjectionBody, ProjectionItem, QppHop, QppInfo,
-    QuantifierExpr, QuantifierKind, Query, QueryBody, ReduceExpr, RelDirection, RelType,
-    RelationshipPattern, RemoveClause, RemoveItem, ReturnClause, SetClause, SetItem, SingleQuery,
-    SortDirection, SortItem, StandaloneCall, StandaloneYield, SubqueryExpr, TypeExpr, UnaryOp,
-    UnionPart, UnwindClause, UseGraph, VarLengthRange, Variable, WithClause, YieldItem,
+    QuantifierExpr, QuantifierKind, Query, QueryBody, QueryPrefix, ReduceExpr, RelDirection,
+    RelType, RelationshipPattern, RemoveClause, RemoveItem, ReturnClause, SetClause, SetItem,
+    SingleQuery, SortDirection, SortItem, StandaloneCall, StandaloneYield, SubqueryExpr, TypeExpr,
+    UnaryOp, UnionPart, UnwindClause, UseGraph, VarLengthRange, Variable, WithClause, YieldItem,
 };
 use crate::lexer::{IntLiteral, Span, Token, TokenKind, tokenize};
 use graphus_core::GraphusError;
@@ -597,9 +597,11 @@ impl<'t, 's> Parser<'t, 's> {
 
     // --- top level -------------------------------------------------------------------------------
 
-    /// Parses `Query = [UseClause], (RegularQuery | StandaloneCall)`.
+    /// Parses `Query = [QueryPrefix], [UseClause], (RegularQuery | StandaloneCall)`.
     fn parse_query(&mut self) -> Result<Query, SyntaxError> {
         let start = self.here_span().start;
+        // An optional leading `EXPLAIN` / `PROFILE` prefix (`rmp` #752) precedes everything else.
+        let prefix = self.parse_query_prefix();
         // An optional leading `USE <graph>` selector (`rmp` #640) precedes the query body.
         let use_graph = self.parse_use_clause()?;
         // A standalone CALL is recognized by a leading `CALL` that is *not* part of a longer single
@@ -617,6 +619,7 @@ impl<'t, 's> Parser<'t, 's> {
             if let Some(call) = self.try_parse_standalone_call()? {
                 let end = call.span.end;
                 return Ok(Query {
+                    prefix,
                     use_graph,
                     body: QueryBody::StandaloneCall(call),
                     span: Span::new(start, end),
@@ -633,10 +636,57 @@ impl<'t, 's> Parser<'t, 's> {
             .last()
             .map_or(head.span.end, |u: &UnionPart| u.span.end);
         Ok(Query {
+            prefix,
             use_graph,
             body: QueryBody::Regular { head, unions },
             span: Span::new(start, end),
         })
+    }
+
+    /// Parses an optional leading `EXPLAIN` / `PROFILE` **query prefix** (`rmp` #752; Neo4j 5.x
+    /// *Query prefixes*). Returns `None` when the statement carries none, leaving the cursor untouched.
+    ///
+    /// # Why this is not a lexer keyword (the conformance-critical part)
+    ///
+    /// `EXPLAIN` and `PROFILE` are **not reserved words** in openCypher: `RETURN 1 AS explain`,
+    /// `MATCH (n:Profile)`, and `RETURN n.explain` are all legal, and the TCK relies on it. Lexing them
+    /// as keywords would therefore break conforming queries. Instead the lexer keeps producing an
+    /// ordinary [`TokenKind::Identifier`], and the prefix is recognised **only here**, in the one
+    /// position where a bare identifier can never begin a valid statement: a Cypher statement always
+    /// opens with a clause keyword (`MATCH`, `OPTIONAL`, `CREATE`, `MERGE`, `RETURN`, `WITH`, `UNWIND`,
+    /// `CALL`, `FOREACH`, `LOAD`, `USE`, …), never with an identifier. Reading a leading identifier
+    /// `explain`/`profile` as the prefix is thus unambiguous, and every other occurrence of those words
+    /// keeps its identifier meaning.
+    ///
+    /// A **backtick-quoted** leading identifier (`` `EXPLAIN` MATCH … ``) is *not* the prefix: the
+    /// escaped form always denotes a plain identifier, so the original source text is consulted (the
+    /// lexer strips the backticks from the token payload) and the statement is left to fail as the
+    /// syntax error it is.
+    ///
+    /// The prefix must be followed by an actual statement (`EXPLAIN` alone is a syntax error, raised by
+    /// the clause parser that runs next), and only one prefix may appear: after consuming one, a second
+    /// leading identifier is left in place and the clause parser reports it.
+    fn parse_query_prefix(&mut self) -> Option<QueryPrefix> {
+        let tok = self.peek()?;
+        let TokenKind::Identifier(name) = &tok.kind else {
+            return None;
+        };
+        let prefix = if name.eq_ignore_ascii_case("EXPLAIN") {
+            QueryPrefix::Explain
+        } else if name.eq_ignore_ascii_case("PROFILE") {
+            QueryPrefix::Profile
+        } else {
+            return None;
+        };
+        // A backtick-escaped identifier is never a keyword: consult the raw source text.
+        if self.source.as_bytes().get(tok.span.start) == Some(&b'`') {
+            return None;
+        }
+        // A prefix on its own is not a statement; leave it to the clause parser to report. Requiring a
+        // following token also keeps `RETURN 1` unaffected — nothing else can consume this identifier.
+        self.peek_at(1)?;
+        self.bump();
+        Some(prefix)
     }
 
     /// Parses an optional leading `USE <graph>` selector (`rmp` #640). Returns `None` when the next
@@ -1019,6 +1069,9 @@ impl<'t, 's> Parser<'t, 's> {
             .last()
             .map_or(head.span.end, |u: &UnionPart| u.span.end);
         Ok(Query {
+            // A subquery block is not a statement: only the enclosing statement carries the
+            // `EXPLAIN` / `PROFILE` prefix (`rmp` #752).
+            prefix: None,
             use_graph,
             body: QueryBody::Regular { head, unions },
             span: Span::new(start, end),
@@ -3352,6 +3405,8 @@ impl<'t, 's> Parser<'t, 's> {
         }
         let query_end = unions.last().map_or(head_end, |u| u.span.end);
         Ok(Query {
+            // An expression subquery carries no statement-level prefix (`rmp` #752).
+            prefix: None,
             // An expression subquery (`EXISTS { … }`) has no `USE` selector of its own.
             use_graph: None,
             body: QueryBody::Regular { head, unions },

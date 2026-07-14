@@ -776,6 +776,7 @@ async fn auto_commit_single_write_buffered_returns_200_with_summary() {
         fields: vec!["name".to_owned()],
         rows: vec![vec![RestValue::Value(Value::String("Ada".to_owned()))]],
         summary: RunSummary {
+            plan: None,
             query_type: Some("w".to_owned()),
             stats: vec![
                 ("nodes-created".to_owned(), Value::Integer(1)),
@@ -1626,6 +1627,7 @@ fn canned_structural(fields: &[&str], rows: Vec<Row>) -> Canned {
         fields: fields.iter().map(|s| (*s).to_owned()).collect(),
         rows,
         summary: RunSummary {
+            plan: None,
             query_type: Some("r".to_owned()),
             stats: Vec::new(),
         },

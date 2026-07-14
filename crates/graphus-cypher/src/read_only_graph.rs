@@ -50,7 +50,7 @@ use graphus_txn::{CommitRegistry, PredicateRead, Snapshot, SsiReadBuffer};
 use graphus_wal::LogSink;
 
 use crate::graph_access::{
-    DeletedEntity, ExpandDirection, GraphAccess, Incident, NodeId, RelData, RelId,
+    DeletedEntity, ExpandDirection, GraphAccess, Incident, NodeId, RelData, RelId, ScanFilter,
 };
 use crate::read_source::{self, ReadSink, ReadViewSource, VisCtx};
 
@@ -272,7 +272,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         read_source::scan_nodes_by_label(&self.source(), &self.ctx(), self, label)
     }
 
-    fn scan_filter_eq(&self, label: &str, property: &str, value: &Value) -> Vec<NodeId> {
+    fn scan_filter_eq(&self, label: &str, property: &str, value: &Value) -> ScanFilter {
         // The precise equality-filtered scan (`rmp` task #325): the same lifted body the live store runs,
         // so an off-thread morsel reader registers the identical precise `Equality` + per-match SIREAD
         // footprint (never the blanket `mark_all_live_nodes`) — serializability unchanged, abort storm

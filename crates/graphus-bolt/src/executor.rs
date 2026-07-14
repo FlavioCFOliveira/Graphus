@@ -48,8 +48,9 @@ pub type Record = Vec<BoltValue>;
 
 /// The summary metadata for a finished result, emitted in the trailing `SUCCESS` (`06 §3.1`).
 ///
-/// v1 carries the query `type` (e.g. `"r"`, `"rw"`, `"w"`, `"s"`) and a `stats` map of side-effect
-/// counters; richer summary fields (plan, profile, notifications) are added as the executor exposes
+/// It carries the query `type` (e.g. `"r"`, `"rw"`, `"w"`, `"s"`), a `stats` map of side-effect
+/// counters, and — for a statement run with the `EXPLAIN` / `PROFILE` prefix — the query [plan](QueryPlan)
+/// (`rmp` task #752); the remaining summary fields (notifications) are added as the executor exposes
 /// them. The `has_more` indicator is **not** here — the server derives it from whether the stream is
 /// exhausted after a bounded `PULL n` (`06 §3.1`).
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -58,6 +59,35 @@ pub struct QuerySummary {
     pub query_type: Option<String>,
     /// Side-effect counters for the `stats` metadata key (e.g. `nodes-created`), in order.
     pub stats: Vec<(String, Value)>,
+    /// The query plan for an `EXPLAIN` / `PROFILE` statement (`rmp` task #752), or `None` for an
+    /// ordinary statement (the overwhelming majority — no plan key is then emitted at all).
+    pub plan: Option<QueryPlan>,
+}
+
+/// A query plan delivered in the result summary (`rmp` task #752).
+///
+/// Bolt carries the plan under **one** of two mutually-exclusive metadata keys — `plan` for an `EXPLAIN`
+/// (estimates only, the statement did not run) and `profile` for a `PROFILE` (the statement ran and each
+/// operator carries its measured `rows` / `dbHits`). Neo4j never sends both, and neither does Graphus:
+/// [`profiled`](Self::profiled) selects the key.
+///
+/// The `description` is an opaque, already-rendered [`Value::Map`] — the Bolt layer only serialises it.
+/// The plan's *shape* is owned by the engine (`graphus_cypher::plan_description`), which is the only
+/// component that knows what an operator is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryPlan {
+    /// `true` when the statement was `PROFILE`d (key `profile`); `false` for an `EXPLAIN` (key `plan`).
+    pub profiled: bool,
+    /// The rendered plan-description map.
+    pub description: Value,
+}
+
+impl QueryPlan {
+    /// The metadata key this plan is delivered under: `"profile"` when profiled, `"plan"` otherwise.
+    #[must_use]
+    pub fn metadata_key(&self) -> &'static str {
+        if self.profiled { "profile" } else { "plan" }
+    }
 }
 
 /// A lazily-produced stream of result records for one `RUN` (`04 §7.7`).
@@ -242,6 +272,7 @@ pub(crate) mod mock {
                 fields: fields.iter().map(|s| (*s).to_owned()).collect(),
                 rows,
                 summary: QuerySummary {
+                    plan: None,
                     query_type: Some("r".to_owned()),
                     stats: Vec::new(),
                 },

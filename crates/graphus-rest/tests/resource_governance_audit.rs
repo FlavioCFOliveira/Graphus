@@ -109,6 +109,7 @@ impl RestEngine for GenEngine {
             fields: vec!["n".to_owned()],
             remaining: Self::parse_gen(query).unwrap_or(0),
             summary: RunSummary {
+                plan: None,
                 query_type: Some("r".to_owned()),
                 stats: Vec::new(),
             },
@@ -129,6 +130,7 @@ impl RestEngine for GenEngine {
             fields: vec!["n".to_owned()],
             remaining: Self::parse_gen(query).unwrap_or(0),
             summary: RunSummary {
+                plan: None,
                 query_type: Some("r".to_owned()),
                 stats: Vec::new(),
             },

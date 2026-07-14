@@ -73,7 +73,7 @@ use graphus_core::Value;
 use graphus_core::error::GraphusError;
 
 use crate::graph_access::{
-    DeletedEntity, ExpandDirection, GraphAccess, Incident, NodeId, RelData, RelId,
+    DeletedEntity, ExpandDirection, GraphAccess, Incident, NodeId, RelData, RelId, ScanFilter,
     VectorQueryResult,
 };
 
@@ -568,17 +568,28 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         )
     }
 
-    fn scan_filter_eq(&self, label: &str, property: &str, value: &Value) -> Vec<NodeId> {
+    fn scan_filter_eq(&self, label: &str, property: &str, value: &Value) -> ScanFilter {
         // The precise equality scan (`rmp` task #325) is a read path: delegate to the inner seam (which
         // owns the tight SIREAD footprint), then apply RBAC exactly as the label scan / index seek do, so
         // the precise-scan, index-accelerated, and bare-scan paths all return the same visible rows.
-        let ids = self.inner.scan_filter_eq(label, property, value);
+        let scan = self.inner.scan_filter_eq(label, property, value);
         if self.oracle.is_unrestricted() {
-            return ids;
+            return scan;
         }
-        ids.into_iter()
+        // The RBAC filter narrows the visible result set.
+        let matched: Vec<NodeId> = scan
+            .matched
+            .into_iter()
             .filter(|&id| self.node_visible(id))
-            .collect()
+            .collect();
+        // `examined` surfaces as a `PROFILE`'s `dbHits` (`rmp` #752). For a RESTRICTED principal the inner
+        // seam's raw examined count is the pre-RBAC cardinality of the (possibly denied) label — a small
+        // information side-channel with no Neo4j analogue (Neo4j has no fused scan+filter `examined`
+        // counter). So for a restricted principal the count is clamped to what the principal may actually
+        // see; an unrestricted principal (above) keeps the true count. The dbHits of a restricted PROFILE
+        // therefore under-report the engine's real work — a deliberate, documented isolation trade-off.
+        let examined = matched.len();
+        ScanFilter { matched, examined }
     }
 
     fn index_seek_range(
@@ -1592,6 +1603,44 @@ mod tests {
                 .is_none(),
             "a restricted principal must be declined the raw relationship range seek (scan fallback)"
         );
+    }
+
+    #[test]
+    fn restricted_scan_filter_eq_examined_count_does_not_leak_denied_cardinality() {
+        // `rmp` #752 F1: the fused scan+filter's `examined` count surfaces as a `PROFILE`'s `dbHits`. For a
+        // RESTRICTED principal it must NOT reveal the pre-RBAC cardinality of a label the principal cannot
+        // see — a side-channel with no Neo4j analogue. It is clamped to the visible-match count.
+        let mut g = MemGraph::new();
+        // Ten :Secret nodes with the same name; the principal can see none of them.
+        for _ in 0..10 {
+            g.add_node(["Secret"], [("name", s("x"))]);
+        }
+        let visible = g.add_node(["Person"], [("name", s("x"))]);
+
+        // Unrestricted: the true examined count (all 11 nodes carry `name = 'x'`) is reported.
+        let unrestricted = g.scan_filter_eq("Secret", "name", &s("x"));
+        assert_eq!(
+            unrestricted.examined, 10,
+            "the seam really examined all 10 :Secret nodes"
+        );
+
+        // Restricted to :Person only: the denied-label scan reports 0 matched AND 0 examined — the
+        // pre-RBAC cardinality of :Secret is not disclosed.
+        let oracle = StubOracle::default()
+            .traverse_label("Person")
+            .read_property("Person", "name");
+        let authz = AuthorizedGraph::new(&mut g, oracle);
+        let denied = authz.scan_filter_eq("Secret", "name", &s("x"));
+        assert!(denied.matched.is_empty(), "no :Secret node is visible");
+        assert_eq!(
+            denied.examined, 0,
+            "the examined count is clamped to the visible matches — no cardinality leak"
+        );
+
+        // A label the principal CAN see reports its real (visible) examined count.
+        let allowed = authz.scan_filter_eq("Person", "name", &s("x"));
+        assert_eq!(allowed.matched, vec![visible]);
+        assert_eq!(allowed.examined, 1);
     }
 
     #[test]

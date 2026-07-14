@@ -137,3 +137,9 @@ harness = false
 [[bench]]
 name = "compile_bind"
 harness = false
+
+# The executor's per-row hot path (`rmp` #752): the number that must not move when diagnostics
+# (EXPLAIN/PROFILE) are added — an unprofiled statement pays nothing for them.
+[[bench]]
+name = "executor_row_path"
+harness = false

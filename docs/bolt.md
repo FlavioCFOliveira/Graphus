@@ -136,6 +136,12 @@ dialing. To use UDS you therefore speak Bolt directly over the socket. Two optio
   `contains-system-updates`), present only when non-empty. The official driver surfaces these as `summary().query_type` and
   `summary().counters.*`. The counters use Neo4j's operation-count model; the full contract is
   `specification/06-bolt-and-error-shapes.md` §3.1.
+- **Query plan (`EXPLAIN` / `PROFILE`).** A statement sent with the `EXPLAIN` prefix carries its plan in
+  the trailing `SUCCESS` under `plan`; one sent with `PROFILE` carries it under `profile`, annotated with
+  each operator's measured `rows` and `dbHits`. Exactly one of the two keys is ever sent (never both), and
+  neither appears for an ordinary statement. Each plan node is a dictionary with `operatorType`, `args`,
+  `identifiers` and — for a non-leaf — `children`, which is the shape the official drivers parse
+  (`summary().plan` / `summary().profile`). See [cypher.md](cypher.md#query-prefixes--explain-and-profile).
 
 For the exact wire encoding, the authoritative reference is the `graphus-bolt` crate
 (`handshake.rs`, `framing.rs`, `message.rs`, `packstream.rs`) — and the Go UDS example,

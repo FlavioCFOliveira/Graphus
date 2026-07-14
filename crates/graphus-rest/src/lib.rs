@@ -98,7 +98,7 @@ pub use columnar::{
     DecodedResult, GCOL_RESULT_MEDIA_TYPE, GcolColumn, GcolError, GcolHeader, decode_result,
     encode_result,
 };
-pub use engine::{AccessMode, RestEngine, ResultStream, Row, RunSummary, TxHandle};
+pub use engine::{AccessMode, QueryPlan, RestEngine, ResultStream, Row, RunSummary, TxHandle};
 pub use negotiate::{Decode, Wire};
 pub use problem::{PROBLEM_JSON, Problem};
 pub use protocol::{

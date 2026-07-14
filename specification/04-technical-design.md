@@ -1026,6 +1026,76 @@ These are pure-correctness, TCK-critical modules implemented to the letter of th
   (no half-applied state — the WAL undo guarantees atomic rollback regardless of where cancellation
   lands).
 
+### 7.8 Query prefixes — `EXPLAIN` and `PROFILE` (delivered, rmp #752)
+
+`graphus-cypher` implements the two Neo4j-style **query prefixes** that return a statement's
+execution plan (`FR-QL-13`; decision `D-query-prefixes`, `02-decision-register.md`). They differ in
+exactly one respect — whether the statement runs:
+
+- **`EXPLAIN <statement>`** compiles and plans the statement but **never executes it**: the executor
+  returns before any operator is built, so no operator does storage work and no side effect is
+  possible (`EXPLAIN CREATE (:X)` creates nothing, by construction rather than by promise). The
+  statement produces **zero records**, but the `RUN` `SUCCESS` still reports the statement's real
+  `fields` (column names) — matching Neo4j's `ExplainExecutionResult`. The plan is delivered in the
+  result summary under the `plan` key (`06-bolt-and-error-shapes.md` §3.1).
+- **`PROFILE <statement>`** executes the statement normally (writes included), returns its records,
+  and delivers the plan under the `profile` key (`06-bolt-and-error-shapes.md` §3.1), annotated with
+  each operator's **measured** `rows` and `dbHits`.
+
+Exactly one of `plan` / `profile` is ever emitted, never both; neither appears for an unprefixed
+statement.
+
+**Parser recognition (conformance-critical).** `EXPLAIN` and `PROFILE` are **not reserved words** —
+openCypher does not define them as tokens (Neo4j recognises them in a pre-parser), and the TCK relies
+on their staying usable as identifiers, labels, relationship types, property keys and aliases
+(`RETURN 1 AS explain`, `MATCH (n:Profile)` and `n.explain` all remain valid). The lexer therefore
+emits an ordinary identifier, and the prefix is recognised **only** as the statement's first token,
+ahead of any `USE` clause, in the one position where a bare identifier can never begin a valid
+statement (a statement always opens with a clause keyword). At most one prefix may appear; a
+backtick-quoted leading identifier (`` `EXPLAIN` … ``) is never the prefix. The prefix binds to the
+whole statement and rides on the compiled plan (`crates/graphus-cypher/src/ast.rs`, `parser.rs`).
+
+**One renderer.** The plan is rendered from the compiled physical plan into a single
+protocol-neutral `Value` tree in `crates/graphus-cypher/src/plan_description.rs`, the crate that owns
+the operator model; the Bolt and REST seams only pick the metadata key (`plan` vs `profile`) and
+serialise the tree, so the two interfaces can never disagree. The wire shape (node keys, the leaf
+`children` omission, the `PROFILE`-only top-level `rows`/`dbHits`, the root-only
+`EstimatedRows`/`planner`/`runtime`, and the omitted `pageCache*`/`time` counters) is frozen in
+`06-bolt-and-error-shapes.md` §3.1.
+
+**`dbHits` — Graphus's own measured definition.** Neo4j documents a DbHit as an abstract unit of
+storage-engine work whose accounting is internal to that engine; Graphus does **not** claim to
+reproduce Neo4j's numbers. It reports its own precisely-defined, **measured** quantity:
+
+> A `dbHit` is **one record obtained from the `GraphAccess` storage seam** by that operator.
+
+Concretely (`crates/graphus-cypher/src/profile.rs`): a **set-returning** read counts **one per record
+it returns** (and 1 when it returns none) — so the fused scan-and-filter access path (`NodeLabelScanEq`)
+reports the records it **examined**, not merely those it matched, and a million-node label scan
+reports about 1,000,000 hits while the index seek that replaces it reports the handful it fetched; a
+**scalar** read counts **1**; a **write** counts **1**. Pure-metadata calls are deliberately **not**
+counted — the transaction's own in-memory tombstone check made before every property access, and
+catalogue/statistics lookups — because the store did no record work for them. Every number is an exact
+count of calls through the one seam all store access passes through; nothing is estimated or
+synthesised.
+
+**Cost on each path.** A `PROFILE`d statement runs **serially** — intra-query morsel parallelism is
+disabled for it (`crates/graphus-cypher/src/executor.rs`) — because the morsel workers read the store
+through a seam the profiling decorator does not sit on, so a parallel profiled run would silently
+*under*-count. Serial execution keeps every storage access attributable; a profiled query may
+therefore be slower than the same query run normally (a diagnostic-only cost, exactly as Neo4j warns
+for `PROFILE`). An **unprofiled** statement pays nothing: no instrumentation is constructed (no
+recorder, no operator shim, no extra branch on the row path — confirmed by the executor row-path
+benchmark).
+
+**Known limitation (measured).** A plain **auto-commit read** is dispatched to the off-thread reader
+pool, whose seam does not currently serve property-index seeks: it declines them and the executor
+falls back — correctly but expensively — to a scan. So a `PROFILE` of an indexed auto-commit read
+reports `NodeIndexSeek` in its plan (the planner *did* choose the index) while its `dbHits` are those
+of a full scan; inside an explicit transaction the same seek serves the index (measured: 2 `dbHits`
+for the seek versus 201 for the scan over 200 nodes). The rows are identical either way, which is why
+`PROFILE` is what makes the discrepancy visible.
+
 ---
 
 ## 8. Connectivity

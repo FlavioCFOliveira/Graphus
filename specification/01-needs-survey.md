@@ -88,7 +88,13 @@ Target: **100% Cypher TCK compliant** on a pinned openCypher snapshot (decision 
   planner) is sufficient for v1.
 - **FR-QL-12** [ADV] **Cost-based optimizer (CBO):** statistics/cardinality-driven plan selection.
 - **FR-QL-13** [CORE] **`EXPLAIN`** (plan without execution) and **`PROFILE`** (execute with
-  per-operator rows/db-hits/timing).
+  per-operator rows/db-hits/timing). **Delivered (rmp #752)** — see `04-technical-design.md` §7.8 and
+  the result-summary shape in `06-bolt-and-error-shapes.md` §3.1: `EXPLAIN` returns the statement's
+  `fields` and zero records with the plan under the `plan` key; `PROFILE` returns the rows and a
+  per-operator, **measured** `rows`/`dbHits` plan under the `profile` key. Per-operator **timing** is
+  intentionally **not** emitted — Graphus does not measure per-operator wall-clock and never
+  fabricates a counter, so the optional `time`/`pageCache*` fields are omitted rather than defaulted
+  to zero (decision `D-query-prefixes`, `02-decision-register.md`).
 - **FR-QL-14** [CORE] **Plan cache:** cache compiled plans keyed on normalized parameterized AST.
 - **FR-QL-15** [CORE] **Query timeout and cancellation:** per-query/transaction timeout; list and
   kill running queries.

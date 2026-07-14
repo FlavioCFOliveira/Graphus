@@ -162,6 +162,13 @@ read-write, `s` schema/admin) and `stats` — the side-effect counters as **plai
 (e.g. `"nodes-created": 1`, not Jolt-typed), present only when non-empty. The full counter-key list
 is the Bolt result-summary contract in `specification/06-bolt-and-error-shapes.md` §3.1.
 
+A statement sent with an `EXPLAIN` / `PROFILE` prefix additionally carries its execution plan in the
+summary, under `plan` (EXPLAIN — the query was planned, not run) or `profile` (PROFILE — it ran, and
+each operator carries its measured `rows` and `dbHits`). Exactly one of the two keys is ever present,
+and neither appears for an ordinary statement. The plan is a **plain JSON** document (not Jolt-typed —
+it is a diagnostic, not a result cell) in the Neo4j shape: `operatorType`, `args`, `identifiers`, and
+`children` for a non-leaf. See [cypher.md](cypher.md#query-prefixes--explain-and-profile).
+
 ### 4.1 Value encoding (Jolt typed JSON)
 
 Result cell values are encoded in **strict Jolt** — a typed JSON form where each scalar is a

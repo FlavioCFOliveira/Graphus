@@ -18,14 +18,14 @@ use graphus_cypher::function_registry::{Arity, FunctionFailure};
 use graphus_cypher::procedure_registry::{FieldSpec, FieldType, ProcedureFailure, ValueClass};
 use graphus_cypher::{
     AuthorizedGraph, FeatureFlags, GraphAccess, IndexCatalog, Parameters, PhysicalPlan, PlanCache,
-    PlanCacheKey, PrivilegeOracle, ProcedureSignature, SchemaVersion, Statistics, TxnCoordinator,
-    analyze_with_extensions, bind_parameters, execute_with_extensions_cancellable, lower,
-    parse_tokens, plan_physical_with_stats, tokenize,
+    PlanCacheKey, PlanDescription, PrivilegeOracle, ProcedureSignature, ProfileRecorder,
+    SchemaVersion, Statistics, TxnCoordinator, analyze_with_extensions, bind_parameters,
+    execute_with_extensions_cancellable, lower, parse_tokens, plan_physical_with_stats, tokenize,
 };
 use graphus_io::BlockDevice;
 use graphus_wal::LogSink;
 
-use super::command::{AccessMode, Reply};
+use super::command::{AccessMode, QueryPlan, Reply};
 use super::privileges::EffectivePrivileges;
 use super::read_pool::{ReadDispatch, ReadTask};
 use super::stream::{RowReceiver, RowSender, SummarySink};
@@ -567,6 +567,8 @@ pub(super) fn handle_run<
         counters: graphus_cypher::QueryCounters::default(),
         query_type: Some(query_type),
         summary_sink: SummarySink::new(),
+        plan: Arc::clone(&plan),
+        profile: None,
     };
     match start_inline(
         &mut inflight,
@@ -691,6 +693,10 @@ fn open_and_drive_first(
         }
     };
     let fields: Vec<String> = cursor.columns().to_vec();
+    // Capture the `PROFILE` counter sink (`rmp` #752) — it is shared (`Arc`) with the cursor, so the
+    // counters keep accruing as the statement streams (including across a suspend/resume) and are read at
+    // finalization, long after the cursor itself is gone. `None` for every other statement.
+    inflight.profile = cursor.profile().map(Arc::clone);
 
     // Send the reply (fields + the consumer's receiver + the result-summary sink) before the first
     // row. The sink is shared (`rmp` #512): the consumer keeps a clone and reads it after draining,
@@ -773,7 +779,31 @@ fn compile(
     )
     .map_err(|e| GraphusError::Compile(e.to_string()))?;
     let logical = lower(&validated);
-    Ok(plan_physical_with_stats(&logical, catalog, stats))
+    // The statement's `EXPLAIN` / `PROFILE` prefix (`rmp` #752) rides on the compiled plan, so the ONE
+    // parse the pipeline already performs is also the one that decides how the statement runs — no second
+    // scan of the text, and the plan cache keys the prefixed and unprefixed forms apart naturally (they
+    // are different statements).
+    Ok(plan_physical_with_stats(&logical, catalog, stats).with_prefix(ast.prefix()))
+}
+
+/// Builds the result-summary [`QueryPlan`] for a statement that carried an `EXPLAIN` / `PROFILE` prefix
+/// (`rmp` task #752); `None` for an ordinary statement, which then reports no plan key at all.
+///
+/// `recorder` is the executor's [`ProfileRecorder`](graphus_cypher::ProfileRecorder) for a profiled run —
+/// `None` when the statement never opened a cursor (it failed at compile/bind/seam), in which case a
+/// `PROFILE` reports **no** plan rather than a plan of zeroes: nothing ran, so there is nothing measured to
+/// report, and Graphus never emits a counter it did not measure.
+fn plan_summary(plan: &PhysicalPlan, recorder: Option<&Arc<ProfileRecorder>>) -> Option<QueryPlan> {
+    match plan.prefix()? {
+        graphus_cypher::QueryPrefix::Explain => Some(QueryPlan {
+            profiled: false,
+            description: PlanDescription::explain(plan).to_value(),
+        }),
+        graphus_cypher::QueryPrefix::Profile => recorder.map(|rec| QueryPlan {
+            profiled: true,
+            description: PlanDescription::profile(rec).to_value(),
+        }),
+    }
 }
 
 /// The outcome of streaming one row through the deadline-aware egress send ([`send_row_with_backpressure`]).
@@ -922,6 +952,10 @@ pub(super) fn run_cursor(
         }
     };
 
+    // The `PROFILE` counter sink for this read (`rmp` #752): shared with the cursor, read after the last
+    // row so its counters are final. `None` for every other statement.
+    let profile = cursor.profile().map(Arc::clone);
+
     // The plan compiled and the cursor opened: hand the consumer its stream now, with the result
     // column names known up front (`04 §7.7`).
     let fields: Vec<String> = cursor.columns().to_vec();
@@ -996,6 +1030,10 @@ pub(super) fn run_cursor(
     summary.set(RunSummary {
         query_type: Some("r".to_owned()),
         stats: counters_to_stats(&graph.write_counters()),
+        // An `EXPLAIN` / `PROFILE` read dispatched to the reader pool reports its plan exactly as the
+        // inline path does (`rmp` #752): same renderer, same keys — the thread a read runs on is not
+        // observable to the client. Read after the last row, so a PROFILE's counters are final.
+        plan: plan_summary(plan, profile.as_ref()),
     });
     true
 }
@@ -1071,9 +1109,16 @@ pub(super) struct InFlightInline {
     /// [`handle_run`] (`rmp` #512) and carried unchanged across resumes.
     query_type: Option<String>,
     /// The side channel the consumer reads its result summary from; filled by [`finalize_inflight`]
-    /// (query type + counters) BEFORE `row_tx` drops (`rmp` #512 — see [`SummarySink`]'s
-    /// happens-before contract).
+    /// (query type + counters +, for a prefixed statement, the plan) BEFORE `row_tx` drops (`rmp` #512 —
+    /// see [`SummarySink`]'s happens-before contract).
     summary_sink: SummarySink,
+    /// The compiled plan, kept so the result summary of an `EXPLAIN` / `PROFILE` statement can be rendered
+    /// at finalization (`rmp` #752). An `Arc::clone` — a refcount bump, no plan deep-clone.
+    plan: Arc<PhysicalPlan>,
+    /// The executor's `PROFILE` counter sink for this statement (`rmp` #752), captured when the cursor
+    /// opened and read once the statement finishes. `None` for every non-profiled statement — and for a
+    /// profiled one that never opened a cursor, which then reports no plan rather than a plan of zeroes.
+    profile: Option<Arc<ProfileRecorder>>,
 }
 
 impl InFlightInline {
@@ -1359,6 +1404,10 @@ fn finalize_inflight<D: BlockDevice, S: LogSink>(
     inflight.summary_sink.set(RunSummary {
         query_type: inflight.query_type.clone(),
         stats: counters_to_stats(&inflight.counters),
+        // The plan of an `EXPLAIN` / `PROFILE` statement (`rmp` #752). For a PROFILE this reads the
+        // executor's recorder AFTER the last row was produced, so every operator's measured counters are
+        // final; for an EXPLAIN nothing ran and the plan carries estimates only.
+        plan: plan_summary(&inflight.plan, inflight.profile.as_ref()),
     });
 
     // Latency + slow-query log, measured from statement start (`04 §9` / NFR-10). Emitted at finish so

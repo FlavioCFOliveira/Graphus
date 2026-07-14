@@ -176,6 +176,24 @@ pub enum VectorQueryResult {
     },
 }
 
+/// The result of a [`scan_filter_eq`](GraphAccess::scan_filter_eq): the nodes that matched, plus the
+/// number of node records the seam **examined** to find them (`rmp` task #752).
+///
+/// The two differ by construction: this access path is a *fused scan + filter*, so it reads every live node
+/// (or every node carrying the label) and returns only the ones whose property equals the seek value.
+/// Returning just the matches would hide the operator's real cost — a full-scan fallback over a million
+/// nodes that matches one row would look as cheap as an index seek. `examined` is the count the seam
+/// already has in hand (the length of the scan it performed), so reporting it costs nothing, and it is
+/// what a `PROFILE`'s `dbHits` reports for this operator: a *measured* number of records read.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[must_use]
+pub struct ScanFilter {
+    /// The nodes whose current `property` equals the seek value (the operator's result).
+    pub matched: Vec<NodeId>,
+    /// How many node records the seam read to evaluate the predicate (`>= matched.len()`).
+    pub examined: usize,
+}
+
 /// The result of a [`columnar_label_property_scan`](GraphAccess::columnar_label_property_scan)
 /// (`rmp` tasks #329 / #330): the matched `(node, value)` rows **plus** the total count of visible
 /// nodes carrying the label.
@@ -318,14 +336,22 @@ pub trait GraphAccess {
     /// The **default** implementation preserves the historical coarse behaviour exactly
     /// (`scan_nodes_by_label` + an equality filter), so reference/test seams and the `index_seek_eq`
     /// fallback stay correct; the live store overrides it with the precise footprint.
-    fn scan_filter_eq(&self, label: &str, property: &str, value: &Value) -> Vec<NodeId> {
-        self.scan_nodes_by_label(label)
+    /// Returns the matching nodes **and the number of node records the seam examined** to find them
+    /// (`rmp` task #752). The examined count is the operator's true storage cost — this access path reads
+    /// every live node to evaluate the predicate and returns only the matches — and reporting it is what
+    /// lets a `PROFILE` show that a query fell back to a full scan. It is a byproduct of work the seam
+    /// already does (the scan's own length), so it costs nothing to report.
+    fn scan_filter_eq(&self, label: &str, property: &str, value: &Value) -> ScanFilter {
+        let candidates = self.scan_nodes_by_label(label);
+        let examined = candidates.len();
+        let matched = candidates
             .into_iter()
             .filter(|id| {
                 self.node_property(*id, property)
                     .is_some_and(|v| crate::equality::equals(&v, value).is_true())
             })
-            .collect()
+            .collect();
+        ScanFilter { matched, examined }
     }
 
     /// An **optional** index range seek. `lower`/`upper` are `(value, inclusive)` bounds; either may

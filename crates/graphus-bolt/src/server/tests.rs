@@ -720,6 +720,7 @@ fn hello_with_empty_user_agent_is_rejected() {
 #[test]
 fn summary_carries_query_type_and_stats() {
     let summary = QuerySummary {
+        plan: None,
         query_type: Some("rw".to_owned()),
         stats: vec![("nodes-created".to_owned(), Value::Integer(1))],
     };

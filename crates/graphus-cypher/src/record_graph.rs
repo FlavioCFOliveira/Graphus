@@ -241,7 +241,7 @@ fn tuples_match(a: &[Value], b: &[Value]) -> bool {
 
 use crate::constraint::{ConstraintViolation, ViolationEntity};
 use crate::graph_access::{
-    DeletedEntity, ExpandDirection, GraphAccess, Incident, NodeId, RelData, RelId,
+    DeletedEntity, ExpandDirection, GraphAccess, Incident, NodeId, RelData, RelId, ScanFilter,
     VectorQueryResult,
 };
 use crate::index_set::{ConstraintRule, IndexSet};
@@ -3723,7 +3723,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         Some(out)
     }
 
-    fn scan_filter_eq(&self, label: &str, property: &str, value: &Value) -> Vec<NodeId> {
+    fn scan_filter_eq(&self, label: &str, property: &str, value: &Value) -> ScanFilter {
         // The precise full-scan equality path (`rmp` task #325): the scan-path twin of `index_seek_eq`'s
         // SSI footprint. The lifted body (shared with `ReadOnlyGraph`) registers the precise
         // `Equality` predicate marker and SIREAD-marks ONLY the matching nodes — never the blanket

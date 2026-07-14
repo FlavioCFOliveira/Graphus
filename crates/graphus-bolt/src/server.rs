@@ -1091,6 +1091,12 @@ fn summary_metadata(
     if !summary.stats.is_empty() {
         meta.push(("stats".to_owned(), Value::Map(summary.stats.clone())));
     }
+    // The query plan of an `EXPLAIN` / `PROFILE` statement (`rmp` task #752), under exactly one of the two
+    // mutually-exclusive keys Neo4j uses — `plan` (not executed: estimates) or `profile` (executed: measured
+    // rows + dbHits). An ordinary statement carries neither key.
+    if let Some(plan) = &summary.plan {
+        meta.push((plan.metadata_key().to_owned(), plan.description.clone()));
+    }
     meta
 }
 
