@@ -158,7 +158,7 @@ run_client() {
   printf '%s\n' "$out" | sed 's/^/  /'
   assert "$label exited cleanly" "0" "$rc"
   assert "$label printed its PASSED sentinel" "yes" \
-    "$(printf '%s' "$out" | grep -q "$sentinel" && echo yes || echo no)"
+    "$(grep -q "$sentinel" <<<"$out" && echo yes || echo no)"
 }
 
 run_client "REST WebAPI client (login → JWT → CRUD → aggregate)" "REST DEMO PASSED" \

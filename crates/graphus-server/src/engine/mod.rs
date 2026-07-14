@@ -809,6 +809,16 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         .as_ref()
         .expect("INVARIANT: coordinator is Some at startup")
         .wal_durable_len();
+    // Seed this database's WAL-volume fold baseline (`rmp` #745) from the SAME already-computed offset,
+    // BEFORE the loop accepts a single command. `graphus_wal_bytes_written_total` counts bytes *this
+    // process wrote*, so the WAL history this database already had on disk (which can be gigabytes) must
+    // be baselined out rather than folded in as if this engine had just written it — and baselining it
+    // here, ahead of any request, is also what makes the very first scrape correct: a client that scrapes
+    // before the first commit sees `0`, not a phantom jump. Re-seeding per incarnation (rather than
+    // trusting a monotone-max of the raw offset) is also what keeps the counter honest across a
+    // `STOP`/`START DATABASE` and across a `DROP` + re-`CREATE` of the same name, whose new log restarts
+    // near offset 0. See `Metrics::rebaseline_wal_bytes_for`.
+    metrics.rebaseline_wal_bytes_for(&db_name, wal_at_last_maintenance);
     // Consecutive background-maintenance-checkpoint failures (`rmp` #394). Persists across maintenance
     // ticks; once it reaches `MAINTENANCE_FAILURE_ESCALATION_THRESHOLD` the reclamation-degraded gauge
     // is set (driving `/health/ready` to 503). Reset to 0 by any successful checkpoint.
@@ -1240,6 +1250,9 @@ fn maybe_run_maintenance<D: BlockDevice, S: LogSink>(
     wal_at_last_maintenance: &mut u64,
     consecutive_failures: &mut u32,
     metrics: &Metrics,
+    // The database name labelling this engine's per-database series (`rmp` #463) — needed here so the
+    // pass can publish the WAL byte offset it re-reads below (`rmp` #745).
+    db: &str,
     maintenance_degraded: &MaintenanceDegraded,
     loading_session_active: bool,
     loading_just_ended: bool,
@@ -1273,11 +1286,20 @@ fn maybe_run_maintenance<D: BlockDevice, S: LogSink>(
     // a `STOP` may still race; this removes the specific, reproducible bulk-import trigger.
     if loading_just_ended {
         *wal_at_last_maintenance = coord.wal_durable_len();
+        metrics.publish_wal_bytes_for(db, *wal_at_last_maintenance);
         return;
     }
     // Size the reclaim interval against the live store (`rmp` #556): a cheap, non-allocating page count.
     let interval = maintenance_interval_bytes(coord.store_byte_len());
     let durable = coord.wal_durable_len();
+    // Publish the WAL byte offset the cadence check just read (`rmp` #745) — free, and it runs on every
+    // engine tick. This is the seam that keeps `graphus_wal_bytes_written_total` fresh for WAL writers
+    // that do NOT pass through `ack_prepared_commits` — notably a Mode A/B bulk-import session, whose
+    // batches harden the log directly. Nothing could be *lost* without it (each publish carries the
+    // ABSOLUTE offset, so a later one always catches up), but a long bulk load would otherwise show a
+    // flat counter until its end-of-load checkpoint, which is exactly the kind of measurement blind spot
+    // this metric exists to remove.
+    metrics.publish_wal_bytes_for(db, durable);
     if durable.saturating_sub(*wal_at_last_maintenance) < interval {
         return;
     }
@@ -1318,6 +1340,12 @@ fn maybe_run_maintenance<D: BlockDevice, S: LogSink>(
     // Re-read: a successful checkpoint reclaimed the WAL prefix, so anchor the next interval at the new
     // length. On failure the length is unchanged, so the next tick re-attempts immediately.
     *wal_at_last_maintenance = coord.wal_durable_len();
+    // The checkpoint itself appended WAL (its checkpoint record), and it RECLAIMED sealed segments —
+    // deleting files without moving the byte offset. Publishing the re-read offset here (`rmp` #745) is
+    // the seam that proves the point of the whole metric: the counter keeps climbing across exactly the
+    // event where an external, poll-the-directory reconstruction loses whole segments and silently
+    // under-counts.
+    metrics.publish_wal_bytes_for(db, *wal_at_last_maintenance);
 }
 
 /// The **maximum-transaction-age sweep** (`rmp` #477): aborts any open **explicit** transaction whose
@@ -2037,6 +2065,7 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         wal_at_last_maintenance,
         maintenance_consecutive_failures,
         metrics,
+        db,
         maintenance_degraded,
         loading_session.is_some(),
         loading_just_ended,
@@ -2223,6 +2252,15 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
                     .record_maintenance_checkpoint(summary.reclaimed as u64, summary.frozen as u64);
                 maintenance_degraded.clear();
             }
+            // `rmp` #745: an operator checkpoint both APPENDS WAL (its checkpoint record) and RECLAIMS
+            // sealed segments. Publish the resulting offset so `graphus_wal_bytes_written_total` is
+            // current the instant `CHECKPOINT DATABASE` returns — an operator who checkpoints and then
+            // scrapes must see the checkpoint's own WAL bytes, and must NOT see the counter dip because
+            // segment files vanished. Safe here: the checkpoint has returned, so nothing holds a store
+            // borrow or the WAL lock that `wal_durable_len()` re-takes.
+            if let Some(coord) = coordinator.as_ref() {
+                metrics.publish_wal_bytes_for(db, coord.wal_durable_len());
+            }
             let _ = reply.send(out);
         }
         Cmd::BulkImportBatch { batch, reply } => {
@@ -2273,7 +2311,15 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             let coordinator = coordinator
                 .take()
                 .expect("INVARIANT: coordinator is Some at Shutdown");
-            let out = harden_store(coordinator);
+            let (out, final_wal_len) = harden_store(coordinator);
+            // `rmp` #745 — the one publish site that is required for CORRECTNESS, not freshness. The
+            // final flush above appends WAL (its checkpoint record) AFTER the last commit's publish. If
+            // those bytes were never published, a subsequent `START DATABASE` would re-baseline the fold
+            // at the higher on-disk offset (`rebaseline_wal_bytes_for`) and they would be dropped from
+            // the counter FOREVER — a permanent, silent, one-sided under-count, i.e. precisely the
+            // disease this metric exists to cure. Publishing the post-flush offset closes that gap, so
+            // the counter is continuous across a `STOP`/`START DATABASE` cycle.
+            metrics.publish_wal_bytes_for(db, final_wal_len);
             // Retract this engine's whole contribution from the server-wide gauge (`rmp` #418); the
             // `ActiveTxnGauge` drop at loop exit would also do this, but publishing 0 here keeps the
             // gauge correct the instant the engine drains. The coordinator is consumed above, so its
@@ -3297,6 +3343,15 @@ fn pipelined_group_commit<
 /// durable watermark to `durable` past their `COMMIT` records — the ack-after-fsync durability rule,
 /// shared by the inline [`flush_commit_batch`] and the [`pipelined_group_commit`] paths.
 fn ack_prepared_commits(durable: u64, batch: &mut Vec<PendingCommit>, metrics: &Metrics, db: &str) {
+    // Publish the WAL's absolute durable byte offset (`rmp` #745). This is the primary seam of
+    // `graphus_wal_bytes_written_total`: EVERY durable commit — inline (`flush_commit_batch`) and
+    // pipelined (`pipelined_group_commit`) alike — funnels through here, and `durable` is the offset
+    // BOTH callers had to compute anyway (`coord.wal_durable_len()`) to enforce the ack-after-fsync gate
+    // below. So the metric costs one relaxed load + one relaxed add per hardened BATCH (not per commit),
+    // takes no lock, touches no WAL state, and is published only for bytes that are already
+    // `fdatasync`-durable — it cannot run ahead of durability. Publishing here rather than per-commit
+    // also means an empty batch is a no-op fold.
+    metrics.publish_wal_bytes_for(db, durable);
     for pending in batch.drain(..) {
         // ALWAYS-ON ack-after-fsync gate (`rmp` #596; was a `debug_assert!`). The group-commit harden
         // MUST have advanced the durable watermark past every batched commit LSN before this committer is
@@ -3560,10 +3615,22 @@ fn drain_inflight<D: BlockDevice, S: LogSink>(
 /// the WAL rule before each write-back). Runs on the dedicated engine thread, so the blocking sync is
 /// off the runtime (`04 §9.1`). This is the durable, clean checkpoint the superblock reflects on
 /// reopen — the store dropping afterwards releases the device + WAL file handles.
-fn harden_store<D: BlockDevice, S: LogSink>(coordinator: TxnCoordinator<D, S>) -> Result<()> {
+///
+/// Returns the flush outcome AND the WAL's **final absolute durable byte offset** (`rmp` #745), read
+/// after the flush and before the store drops — the last chance to observe it, since the sink is closed
+/// on the next line. The caller folds it into `graphus_wal_bytes_written_total` so the bytes this final
+/// flush appended are not lost to the next incarnation's fold baseline. The offset is read on the
+/// failure path too: whatever the flush *did* harden before erroring is genuinely on disk and must be
+/// counted (durability is unaffected either way — this is pure observability).
+fn harden_store<D: BlockDevice, S: LogSink>(
+    coordinator: TxnCoordinator<D, S>,
+) -> (Result<()>, u64) {
     // Safe: `drain_inflight` left no open transaction and no statement seam is live here.
     let mut store: RecordStore<D, S> = coordinator.into_store();
-    store.flush()
+    let out = store.flush();
+    // Safe: `flush` has returned, so nothing holds the WAL lock this re-takes (no re-entrancy).
+    let wal_len = store.with_wal(|w| w.durable_len());
+    (out, wal_len)
     // `store` drops here, closing the file-backed device and WAL sink cleanly.
 }
 
@@ -3870,6 +3937,7 @@ mod maintenance_tests {
                 &mut wal_at_last_maintenance,
                 &mut consecutive_failures,
                 &metrics,
+                "test",
                 &maintenance_degraded,
                 loading,
                 false,
@@ -3913,6 +3981,7 @@ mod maintenance_tests {
             &mut wal_at_last_maintenance,
             &mut consecutive_failures,
             &metrics,
+            "test",
             &maintenance_degraded,
             false,    // session already cleared by the `End` handler
             true,     // ...but it JUST ended: this is the edge

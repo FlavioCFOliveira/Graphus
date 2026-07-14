@@ -12,18 +12,74 @@
 #      counter alone does not rule out unbounded growth.
 #
 #   2. AND SINCE rmp #706, THE DATABASE ON DISK VERY NEARLY DOES TOO.  The same run measures the TOTAL
-#      durable footprint (store + WAL) and finds it now sawtooths within a TIGHT band (~1.6x, peak ~64x
+#      durable footprint (store + WAL) and finds it now sawtooths within a TIGHT band (~1.6x, peak ~53x
 #      the graph — was ~7.1x / ~347x while #706 was open): WAL segments are now store-proportional
 #      (clamp(store, 1 MiB, 64 MiB)), so a small database seals ~1 MiB segments and its WAL disk comes
 #      back on nearly every checkpoint instead of climbing to 64 MiB. The store's flat plateau is a true
 #      statement about a COMPONENT; this example reports and gates the TOTAL footprint too, so the whole
 #      database is judged, not one part of it.
 #
+#   3. WHAT DURABILITY COSTS, AND WHY — MEASURED, NOT ASSUMED (rmp #745).  The run ingests the same steady
+#      state TWICE: once BATCHED (25 readings per commit — what a real gateway does) and once at ONE
+#      COMMIT PER 32-BYTE READING, and it takes a WAL mark at every PHASE BOUNDARY INSIDE each tick, so
+#      the WAL written by INGEST, by the retention DELETE and by the CHECKPOINT are measured SEPARATELY.
+#
+#      That split is what makes the comparison sound. Every tick pays a FIXED cost F — the retention
+#      DELETE plus the amortised CHECKPOINT — that batching cannot touch, and F is 52% of the batched
+#      segment's entire WAL bill. Written out, the whole-segment ratio is (50·A1 + F) / (2·A25 + F): F is
+#      in BOTH numerators and drags it toward 1. So:
+#
+#        INGEST ONLY (F excluded — the sound experiment):  batch=1 871x, batched 110x => BATCHING = 7.9x
+#        WHOLE SEGMENT (retention + checkpoint included):  batch=1 974x, batched 230x => 4.2x
+#
+#      This example USED TO publish the 4.2x-shaped number as the batching saving and blame the whole
+#      residual on the WAL record format — "a commit's redo is dominated by the PAGE IMAGES of every page
+#      it dirtied (~22 kB, three 8 KiB pages)". THAT WAS FALSE AND WAS NEVER MEASURED. The engine writes
+#      BYTE-RANGE PATCHES (paging::encode_patch); RecordType::FullPageImage is emitted NOWHERE. The
+#      decoding guard in crates/graphus-cypher/tests/wal_amplification.rs now measures a one-reading
+#      commit as ~19 small Update deltas averaging ~197 B against an 8192 B page — a whole commit costs
+#      less than ONE image of any single one of the ~5.7 pages it touches. (And the WAL file grows by
+#      EXACTLY what its records encode: 940303 B of LSN space == 940303 B on disk. No padding.)
+#
+#      THE RESIDUAL IS NOT THE FORMAT. More than half of it is F. The rest is a cost nobody had looked for:
+#      every commit re-images the durable catalog IN FULL, and StoreMeta::free_list holds every record id
+#      freed but not yet reused — 8 B each, imaged in BOTH redo and undo, so every commit pays ~16 B per
+#      freed slot whether it touches it or not. This example is a RETENTION workload, so its free list is
+#      permanently populated. Measured on the identical single-reading commit, before vs after one purge:
+#      catalog image 2202 B -> 60137 B per commit; total WAL 4562 B -> 62493 B per commit (13.7x). That is
+#      also why batching is worth 7.9x here but only 1.63x on a store with no free list — the catalog image
+#      is paid ONCE PER COMMIT, so the more it costs, the more a batch amortises.
+#
+#      BOTH segments are measured in STEADY STATE (the batched one starts at the END OF WARMUP, not at
+#      tick 0), so they differ in exactly ONE variable: the batch size. During the growth ramp the store
+#      is still extending and NO retention DELETE has run yet — charging that ramp to the batched segment
+#      while the batch=1 control pays none of it would divide two different workloads into each other.
+#
+#   3b. AND THE INSTRUMENT THAT MEASURES ALL THIS IS ITSELF GATED (rmp #745/#750).  The cumulative WAL
+#      volume is RECONSTRUCTED by polling the WAL directory and keeping the max length seen per segment
+#      path — which under-counts if a segment is born, sealed and RECLAIMED between two samples. It was:
+#      sampling once per tick (at the END of the tick, after the checkpoint had deleted that tick's
+#      segments) under-counted the run by 5.5% and the batch=1 control segment by 17%, and an
+#      under-counted WAL makes write amplification FALL, so it sailed under every ceiling and read like a
+#      triumph. Now: marks at every in-tick phase boundary + a 2 ms sampler thread; the run's own on-disk
+#      series forces a lower bound the reconstruction must clear; every WAL byte must reconcile to a named
+#      phase; and — decisively — the reconstruction is CROSS-CHECKED against the engine's own exact
+#      counter (graphus_db_wal_bytes_written_total, a monotone durable byte offset reclamation never
+#      rewinds). They now agree to +0.00%, and a >3% drift FAILS the run.
+#
+#   4. AND THE EXAMPLE READS ITS OWN DATA BACK (rmp #745).  Concurrent readers query the live window
+#      DURING the churn — a composite-index window, a per-sensor aggregation, and a TEMPORAL
+#      `ts IN [t0, t1)` seek over a real DATETIME — and EVERY result is gated against the seeded
+#      generator's own stream, field by field. After the churn every surviving reading is read back in
+#      full. A corrupted payload, a lost row, or an index silently answering with an EMPTY result set
+#      (rmp #738) FAILS the run. Before, every read was a count(...) and all three passed green.
+#
 # The write amplification is a FIRST-CLASS, GATED signal here — not a number buried in a report nobody
 # opens. `iot_wire_evidence --assert` FAILS the run if the WAL footprint comes back zero while writes
 # were committed (the exact rot that made this example publish `wal_bytes: 0` for months), if write
-# amplification exceeds its ceiling, if the total footprint exceeds its ceiling, or if a run long enough
-# to seal a WAL segment never actually gets any WAL disk back.
+# amplification exceeds its ceiling, if the total footprint exceeds its ceiling, if a run long enough
+# to seal a WAL segment never actually gets any WAL disk back, if the batch=1 control segment is missing
+# (the comparison IS the finding), or if a single read disagrees with the generator's ground truth.
 #
 # TWO INSTRUMENTS, AND WHICH ONE IS THE EVIDENCE:
 #
@@ -107,11 +163,10 @@ MODE="$(harness_target_mode)"   # external iff GRAPHUS_TARGET_{BOLT,REST,UDS} is
 # The WIRE run defaults to the `reclaim` profile: sized to run the churn long enough to reach a clear
 # steady state — the store plateau AND a WAL that sawtooths in a tight, store-proportional band with
 # dozens of observed reclamations — and to end at a stable, byte-reproducible point. `reclaim` (140 ticks,
-# 7,000 readings, ~143 MB of cumulative WAL, ~9.5 s) seals and frees dozens of small segments and still
-# fits a CI budget (rmp #704). (Before rmp #706 the seal size was a fixed 64 MiB, so the shorter `fast`
-# profile's ~59 MB of WAL never crossed one seal and reclaimed nothing; #706 made segments store-
-# proportional, so even short runs reclaim now — but `reclaim` remains the default for a stable steady
-# state.)
+# 7,000 readings, ~50 MB of cumulative WAL, ~2.5 s since the ingest was batched) seals and frees dozens of
+# small segments and still fits a CI budget (rmp #704). (Before rmp #706 the seal size was a fixed 64 MiB,
+# so a short profile never crossed one seal and reclaimed nothing; #706 made segments store-proportional,
+# so even short runs reclaim now — but `reclaim` remains the default for a stable steady state.)
 # --------------------------------------------------------------------------------------------------
 PROFILE="${IOT_PROFILE:-fast}"                     # the in-memory CONTROL mirror's profile
 WIRE_PROFILE="${IOT_WIRE_PROFILE:-reclaim}"        # the FILE-BACKED wire run's profile (the PRIMARY)
@@ -120,12 +175,46 @@ IOT_TICKS="${IOT_TICKS:-}"                         # override the mirror's tick 
 WIRE_CLIENTS="${IOT_WIRE_CLIENTS:-2}"              # concurrent ingest connections (sensor-sharded)
 WIRE_CHECKPOINT_EVERY="${IOT_CHECKPOINT_EVERY:-5}" # 0 => rely on the background cadence alone
 
+# THE INGEST SHAPE (rmp #745). A real IoT gateway BATCHES: it buffers its devices' samples and flushes
+# them in one transaction. The main churn therefore ingests IOT_BATCH readings per statement and per
+# commit, and a short trailing CONTROL segment (IOT_BATCH1_TICKS) re-runs the SAME steady state at
+# batch=1 — one Bolt round-trip and one commit per 32-byte reading — so the durability cost of the two
+# shapes is a comparison of two MEASUREMENTS, never an arithmetic estimate.
+WIRE_BATCH="${IOT_BATCH:-50}"
+WIRE_BATCH1_TICKS="${IOT_BATCH1_TICKS:-10}"
+
+# THE READ MIX (rmp #745). Independent Bolt connections reading WHILE the writers churn, every result
+# GATED against the generator's own stream. Before this the example's read mix was ~0% (every read was a
+# count(...)), so a corrupted payload passed green and an index silently answering with an EMPTY result
+# (rmp #738) could not have been caught here at all.
+WIRE_READERS="${IOT_READER_CLIENTS:-2}"
+WIRE_PAYLOAD_SAMPLES="${IOT_PAYLOAD_SAMPLES:-0}"  # 0 = EVERY surviving reading is read back in full, field by field
+
 # Ceilings the wire gate holds the durability cost under. UPPER BOUNDS, not targets: a bound cannot be
-# satisfied by regressing, and it does not have to be relaxed to accept a fix. Write amplification is the
-# WAL FORMAT (dual redo/undo) and #706 barely moved it (~799x -> ~760x), so its ceiling stays 1000x. The
-# footprint ceiling was 450x while #706 was open (peak ~347x); now that #706 holds the peak to ~64x it is
-# tightened to 120x, so a regression BACK to fixed 64 MiB segments is caught here too.
-MAX_WRITE_AMP="${IOT_MAX_WRITE_AMP:-1000}"
+# satisfied by regressing, and it does not have to be relaxed to accept a fix.
+#
+# READ THIS BEFORE CHANGING ANY OF THEM (rmp #745).  The WAL instrument was UNDER-COUNTING — it polled the
+# WAL directory once per tick, at the END of the tick, after the checkpoint had already deleted the
+# segments that tick created, so segments were born, sealed and reclaimed unobserved. Fixing it makes
+# every WAL figure LARGER (the run was short by 5.5%, the batch=1 control segment by 17%, measured against
+# the engine's own exact counter). A larger number under an unchanged ceiling looks exactly like a
+# regression, so it must be said plainly: THE ENGINE DID NOT GET WORSE, THE INSTRUMENT GOT HONEST.
+#
+# And the ceilings did NOT have to move. Whole-run write amplification now measures 279x under the 350x
+# bound (it read 264x while the instrument was broken); the batched segment measures 230x under 300x. The
+# corrected figures fit the headroom that was already there — which is the outcome one WANTS, because a
+# raised ceiling and a corrected instrument are indistinguishable in a diff and only one of them is
+# honest. Every bound stays comfortably below the ~974x a genuine regression back to per-reading commits
+# produces, and that is not hypothetical: the batch=1 control segment measures exactly that regression, in
+# the same run, as its own upper witness.
+MAX_WRITE_AMP="${IOT_MAX_WRITE_AMP:-350}"
+MAX_BATCHED_WRITE_AMP="${IOT_MAX_BATCHED_WRITE_AMP:-300}"
+# A LUMPED ratio, and gated as one with its eyes open: ~60% of the peak durable footprint is the FIXED
+# 8.87 MB doublewrite preallocation, which does not scale with the graph and cannot regress. It bounds the
+# disk an operator must provision (a real question), but the quantity that actually MOVES when the engine
+# changes is the graph-scaling half — the peak WAL per byte of data image — which carries its own, sharper
+# ceiling in StorageGate (measured 20x; a revert of the store-proportional segment seal, rmp #706, puts it
+# at ~241x).
 MAX_FOOTPRINT_RATIO="${IOT_MAX_FOOTPRINT_RATIO:-120}"
 
 # --------------------------------------------------------------------------------------------------
@@ -344,6 +433,8 @@ if [ "$WIRE_OK" = 1 ]; then
   set +e
   "$WIRE_BIN" "${WIRE_TRANSPORT[@]}" --user "$WIRE_USER" --password "$WIRE_PW" --db "$WIRE_DB" \
     --profile "$WIRE_PROFILE" --ingest-clients "$WIRE_CLIENTS" \
+    --batch "$WIRE_BATCH" --batch1-ticks "$WIRE_BATCH1_TICKS" \
+    --reader-clients "$WIRE_READERS" --payload-samples "$WIRE_PAYLOAD_SAMPLES" \
     --checkpoint-every "$WIRE_CHECKPOINT_EVERY" \
     --samples "$WIRE_SAMPLES" --scenario "iot-timeseries" \
     "${WIRE_LOCAL_FLAGS[@]}" 2>&1 | tee "$WORKDIR/wire.log" | sed 's/^/  /'
@@ -383,7 +474,9 @@ if [ "$WIRE_OK" = 1 ]; then
   "$WIRE_EVIDENCE_BIN" --samples "$WIRE_SAMPLES" --evidence-dir "$EVIDENCE_DIR" \
     --metrics-before "$METRICS_BEFORE" --metrics-after "$METRICS_AFTER" \
     --plateau-factor 1.10 --min-ingest-to-window 3.0 \
-    --max-write-amplification "$MAX_WRITE_AMP" --max-footprint-ratio "$MAX_FOOTPRINT_RATIO" \
+    --max-write-amplification "$MAX_WRITE_AMP" \
+    --max-batched-write-amplification "$MAX_BATCHED_WRITE_AMP" \
+    --max-footprint-ratio "$MAX_FOOTPRINT_RATIO" \
     --assert 2>&1 | tee "$WORKDIR/wire_ev.log" | sed 's/^/  /'
   set -e
   assert "PRIMARY evidence report + invariant gate passed" "yes" \
@@ -418,12 +511,66 @@ if [ "$WIRE_OK" = 1 ]; then
     assert "bytes_fsynced is REAL and non-zero (the cumulative durable-sync volume)" "yes" \
       "$([ "${W_FSYNC:-0}" -gt 0 ] && echo yes || echo no)"
     assert "write_amplification is MEASURED (present in the report, not omitted)" "yes" \
-      "$(printf '%s' "$WIRE_JSON" | grep -q '"write_amplification"' && echo yes || echo no)"
+      "$(grep -q '"write_amplification"' <<<"$WIRE_JSON" && echo yes || echo no)"
     assert "the report states the TOTAL durable footprint, not just the store" "yes" \
-      "$(printf '%s' "$WIRE_JSON" | grep -q 'durable_footprint_peak_bytes' && echo yes || echo no)"
+      "$(grep -q 'durable_footprint_peak_bytes' <<<"$WIRE_JSON" && echo yes || echo no)"
+
+    # ------------------------------------------------------------------------------------------------
+    # THE INGEST SHAPE (rmp #745) — the comparison this example exists to publish, in the run's OWN
+    # output. Both figures are MEASURED on this server, in the same steady state: batching is a CLIENT
+    # choice, and it is the dominant term in the durability bill.
+    # ------------------------------------------------------------------------------------------------
+    # NOTE: --batch is a CAP. A tick is a barrier and its readings are sharded across the ingest clients,
+    # so a commit carries about rate/clients of them. The report states the MEASURED mean readings per
+    # commit, never the requested cap — a commit of 25 readings must not be labelled `batch=50`.
+    section "Step 2c-i — WHAT A COMMIT PER READING COSTS (batch=1 vs batched, BOTH MEASURED)"
+    sed -n 's/^ *iot_wire_evidence: BATCHING /  /p' "$WORKDIR/wire_ev.log" | tr '|' '\n' | sed 's/^ *//;s/^/  /'
+    assert "BOTH ingest shapes were measured (a batch=1 control AND a batched main segment)" "yes" \
+      "$(grep -q 'segment \[batch=1 (control)\]' <<<"$WIRE_JSON" \
+         && grep -q 'segment \[batch=[0-9]* (main)\]' <<<"$WIRE_JSON" && echo yes || echo no)"
+    assert "the report states the batching saving (batch=1 write amp / batched write amp)" "yes" \
+      "$(grep -q 'batching_write_amp_saving' <<<"$WIRE_JSON" && echo yes || echo no)"
   elif [ "$MODE" = external ]; then
     info "attach mode: the store + /proc live on the target, so those vectors are ABSENT (not zeroed);"
     info "the server-side evidence for this run is the /metrics delta in the report."
+  fi
+
+  # ------------------------------------------------------------------------------------------------
+  # 6b. THE CONCURRENT READ MIX + THE TEMPORAL ROUND-TRIP (rmp #745), in the run's OWN output.
+  #
+  # Reads work over ANY wire, so this runs in both modes. Every reader result was GATED against the
+  # generator's own stream — a corrupted payload, a lost row, or an index answering with an EMPTY set
+  # (rmp #738) FAILS the run rather than being counted and forgotten.
+  # ------------------------------------------------------------------------------------------------
+  if [ -f "$EVIDENCE_DIR/report.json" ]; then
+    section "Step 2c-ii — CONCURRENT READS, GATED AGAINST GROUND TRUTH (not counted)"
+    sed -n 's/^ *iot_wire_evidence: READERS /  readers: /p;s/^ *iot_wire_evidence:   family /  family /p' \
+      "$WORKDIR/wire_ev.log" | sed 's/^/  /'
+    WIRE_JSON_ALL="$(cat "$EVIDENCE_DIR/report.json")"
+
+    # A read mix that ran, and found nothing wrong. Both halves matter: "0 mismatches" over 0 queries is
+    # not a result, and a mismatch is a data-correctness defect.
+    assert "a concurrent read mix ran DURING the churn (>= 1 reader client)" "yes" \
+      "$([ "${WIRE_READERS:-0}" -gt 0 ] && grep -q '"reader_throughput"' <<<"$WIRE_JSON_ALL" && echo yes || echo no)"
+    assert "every reader family gated its results (0 mismatches, 0 empty-but-expected)" "yes" \
+      "$(grep -q 'FAILURES:' <<<"$WIRE_JSON_ALL" && echo no || echo yes)"
+    assert "reader throughput + latency are REPORTED (measured percentiles, never a zeroed struct)" "yes" \
+      "$(grep -q 'reader family \[temporal-window\] latency_ms' <<<"$WIRE_JSON_ALL" && echo yes || echo no)"
+
+    # The temporal round-trip: `ts` is a real DATETIME on the wire, in the store, and in the index.
+    assert "the TEMPORAL window read (ts IN [t0, t1)) returned EXACTLY the generated readings" "yes" \
+      "$(grep -q 'check: temporal window read.*PASS' <<<"$WIRE_JSON_ALL" && echo yes || echo no)"
+    assert "surviving readings' payloads match the generator EXACTLY (sensor, seq, ts, value)" "yes" \
+      "$(grep -q "check: surviving readings' payloads.*PASS" <<<"$WIRE_JSON_ALL" && echo yes || echo no)"
+    assert "no orphan :EMITTED survived retention (DETACH DELETE left no dangling edge)" "yes" \
+      "$(grep -q 'check: no orphan :EMITTED.*PASS' <<<"$WIRE_JSON_ALL" && echo yes || echo no)"
+    assert "an INTEGER ts is REJECTED (the property-type constraint now demands a temporal)" "yes" \
+      "$(grep -q 'check: an INTEGER Reading.ts is rejected.*PASS' <<<"$WIRE_JSON_ALL" && echo yes || echo no)"
+
+    printf '  %stemporal window read%s  ' "$BOLD" "$RESET"
+    sed -n 's/.*"check: temporal window read[^"]*": "\([^"]*\)".*/\1/p' "$EVIDENCE_DIR/report.json" | head -n1
+    printf '  %spayload read-back%s     ' "$BOLD" "$RESET"
+    sed -n "s/.*\"check: surviving readings' payloads[^\"]*\": \"\([^\"]*\)\".*/\1/p" "$EVIDENCE_DIR/report.json" | head -n1
   fi
 
   # 7. The committed-baseline regression gate over the PRIMARY report (local runs only — an external run
@@ -434,7 +581,7 @@ if [ "$WIRE_OK" = 1 ]; then
       CMP_OUT="$("$CMP_BIN" "$BASELINE" "$EVIDENCE_DIR/report.json" 2>&1)" || true
       printf '%s\n' "$CMP_OUT" | sed 's/^/  /'
       assert "fresh PRIMARY run is within baseline thresholds" "yes" \
-        "$(printf '%s' "$CMP_OUT" | grep -q 'GRAPHUS_BASELINE_OK' && echo yes || echo no)"
+        "$(grep -q 'GRAPHUS_BASELINE_OK' <<<"$CMP_OUT" && echo yes || echo no)"
     elif [ ! -f "$BASELINE" ]; then
       info "no committed baseline.json yet — skipping the PRIMARY regression gate."
     else
@@ -460,7 +607,7 @@ CHURN_OUT="$("$CHURN" --profile "$PROFILE" --json "$SAMPLES_JSON" 2>&1)" || true
 printf '%s\n' "$CHURN_OUT" | grep -v '^GRAPHUS_IOT_SAMPLES' | sed 's/^/  /'
 
 assert "mirror reached steady state AND its footprint plateaued" "yes" \
-  "$(printf '%s' "$CHURN_OUT" | grep -q 'GRAPHUS_IOT_CHURN_OK' && echo yes || echo no)"
+  "$(grep -q 'GRAPHUS_IOT_CHURN_OK' <<<"$CHURN_OUT" && echo yes || echo no)"
 
 SAMPLES="$(cat "$SAMPLES_JSON" 2>/dev/null || echo '{}')"
 PAGE_HW="$(jnum "$SAMPLES" page_high_water)"
@@ -496,7 +643,7 @@ if [ "$PROFILE" = "fast" ] && [ -z "$IOT_TICKS" ] && [ -f "$MIRROR_BASELINE" ] &
   CMP_OUT="$("$CMP_BIN" "$MIRROR_BASELINE" "$MIRROR_EVIDENCE_DIR/report.json" 2>&1)" || true
   printf '%s\n' "$CMP_OUT" | sed 's/^/  /'
   assert "fresh CONTROL run is within baseline thresholds" "yes" \
-    "$(printf '%s' "$CMP_OUT" | grep -q 'GRAPHUS_BASELINE_OK' && echo yes || echo no)"
+    "$(grep -q 'GRAPHUS_BASELINE_OK' <<<"$CMP_OUT" && echo yes || echo no)"
 elif [ ! -f "$MIRROR_BASELINE" ]; then
   info "no committed baseline-mirror.json yet — skipping the CONTROL regression gate."
 else
@@ -524,11 +671,17 @@ if [ "$FAILURES" -eq 0 ]; then
   if [ "$WIRE_OK" = 1 ] && [ "$MODE" = local ]; then
     printf 'Driven over a REAL WIRE against a REAL SERVER with a real store file and a real segmented\n'
     printf 'WAL: the on-disk STORE PLATEAUED while the server’s own reclamation counters CLIMBED —\n'
-    printf 'reclaimed space is demonstrably reused, not leaked. And the durability that cost is now\n'
-    printf 'MEASURED and BOUNDED rather than omitted: see "WHAT DURABILITY COST" above, and the\n'
-    printf 'FINDING note in the report — the store plateaus, and since rmp #706 the DATABASE ON DISK\n'
-    printf 'very nearly does too: the WAL sawtooths in a tight store-proportional band (~64x the graph,\n'
-    printf 'was ~347x) because WAL segments are now sized to the store, not a fixed 64 MiB.\n'
+    printf 'reclaimed space is demonstrably reused, not leaked. The durability that cost is MEASURED and\n'
+    printf 'BOUNDED (see "WHAT DURABILITY COST" above), and its terms are measured APART by taking a WAL\n'
+    printf 'mark at every phase boundary INSIDE each tick. On the INGEST alone — the sound comparison,\n'
+    printf 'with the fixed per-tick retention+checkpoint cost excluded from both sides — one commit per\n'
+    printf '32-byte reading costs 871x write amplification against 110x batched, so BATCHING IS WORTH\n'
+    printf '7.9x. Over the whole segment that fixed cost (52%% of the batched bill) dilutes it to 4.2x.\n'
+    printf 'The residual is NOT "the WAL page-image format" — the engine writes byte-range patches and no\n'
+    printf 'page images at all; that claim was never measured, and it is gone.\n'
+    printf 'The WAL instrument is itself gated: it agrees with the engine’s own exact counter to +0.00%%.\n'
+    printf 'And every read was GATED against the generator’s own stream — a corrupted payload, a lost\n'
+    printf 'row, or an index silently returning an EMPTY result set would have failed this run.\n'
   elif [ "$WIRE_OK" = 1 ]; then
     printf 'Driven over the wire against an ATTACHED instance: the store and /proc live on the target,\n'
     printf 'so the storage vectors are absent by construction; the server-side evidence is /metrics.\n'

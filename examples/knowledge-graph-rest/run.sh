@@ -348,7 +348,7 @@ if [ "$RUN_REST" = "1" ] && [ "$MODE" = "external" ]; then
   WORKLOAD_SECS=$(( WORKLOAD_MS / 1000 ))
   [ "$WORKLOAD_SECS" -lt 1 ] && WORKLOAD_SECS=1
   assert "REST workload passed every assertion" "yes" \
-    "$(printf '%s' "$REST_OUT" | grep -q 'GRAPHUS_KG_REST_OK' && echo yes || echo no)"
+    "$(grep -q 'GRAPHUS_KG_REST_OK' <<<"$REST_OUT" && echo yes || echo no)"
 
   # Scrape /metrics immediately AFTER the workload window.
   if harness_scrape_metrics "$METRICS_AFTER"; then
@@ -439,7 +439,7 @@ EOF
   WORKLOAD_MS=$(( $(_harness_now_ms) - WORKLOAD_START_MS ))
   printf '%s\n' "$REST_OUT" | sed 's/^/  /'
   assert "REST workload passed every assertion" "yes" \
-    "$(printf '%s' "$REST_OUT" | grep -q 'GRAPHUS_KG_REST_OK' && echo yes || echo no)"
+    "$(grep -q 'GRAPHUS_KG_REST_OK' <<<"$REST_OUT" && echo yes || echo no)"
   sample_peak_rss   # the load + discovery + concurrency just ran; capture the server's RSS here
 
   # Scrape /metrics immediately AFTER the workload window (best-effort, non-fatal).
@@ -692,7 +692,7 @@ print('yes' if ok else 'no')" 2>/dev/null || echo no)"
       CMP_OUT="$("$CMP_BIN" "$BASELINE" "$EVIDENCE_DIR/report.json" 2>&1)" || true
       printf '%s\n' "$CMP_OUT" | sed 's/^/  /'
       assert "fresh run is within baseline thresholds (structural metrics)" "yes" \
-        "$(printf '%s' "$CMP_OUT" | grep -q 'GRAPHUS_BASELINE_OK' && echo yes || echo no)"
+        "$(grep -q 'GRAPHUS_BASELINE_OK' <<<"$CMP_OUT" && echo yes || echo no)"
     fi
 
     # --------------------------------------------------------------------------------------------

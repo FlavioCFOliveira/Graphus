@@ -3431,6 +3431,7 @@ mod tests {
             fields: vec!["c".to_string()],
             records: rows,
             elapsed: Duration::from_millis(0),
+            ..QueryResult::default()
         }
     }
 

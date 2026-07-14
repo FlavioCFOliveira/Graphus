@@ -164,13 +164,13 @@ printf '%s\n' "$SWEEP_OUT" | sed 's/^/  /'
 
 assert "durability sweep completed with exit 0 (zero violations, deterministic)" "0" "$SWEEP_CODE"
 assert "sweep reports a DURABLE verdict" "yes" \
-  "$(printf '%s' "$SWEEP_OUT" | grep -q 'RESULT: DURABLE' && echo yes || echo no)"
+  "$(grep -q 'RESULT: DURABLE' <<<"$SWEEP_OUT" && echo yes || echo no)"
 assert "every seed was non-vacuous (acked + in-flight coexisted at a crash)" "yes" \
-  "$(printf '%s' "$SWEEP_OUT" | grep -qE "non-vacuous=$SEEDS/$SEEDS" && echo yes || echo no)"
+  "$(grep -qE "non-vacuous=$SEEDS/$SEEDS" <<<"$SWEEP_OUT" && echo yes || echo no)"
 assert "focused seed's committed-or-nothing contract HOLDS (nodes)" "yes" \
-  "$(printf '%s' "$SWEEP_OUT" | grep -q 'committed-or-nothing.*HOLDS' && echo yes || echo no)"
+  "$(grep -q 'committed-or-nothing.*HOLDS' <<<"$SWEEP_OUT" && echo yes || echo no)"
 assert "focused seed's relationship durability HOLDS (recovered edges == committed edges)" "yes" \
-  "$(printf '%s' "$SWEEP_OUT" | grep -q 'relationships:.*HOLDS' && echo yes || echo no)"
+  "$(grep -q 'relationships:.*HOLDS' <<<"$SWEEP_OUT" && echo yes || echo no)"
 # The dataset's relationship count must be REAL, not the hard-coded 0 it used to report (rmp #698).
 REPORTED_RELS="$(grep -o '"relationships": *[0-9]*' "$DST_REPORT" | grep -o '[0-9]*$' || echo 0)"
 assert "evidence reports a NON-ZERO recovered relationship count (no hard-coded 0)" "yes" \
@@ -194,10 +194,10 @@ printf '%s\n' "$FAULT_OUT" | sed 's/^/  /'
 
 assert "fault catalogue completed with exit 0" "0" "$FAULT_CODE"
 assert "every fault kind recovered SAFE" "yes" \
-  "$(printf '%s' "$FAULT_OUT" | grep -q 'RESULT: ALL FAULTS SAFE' && echo yes || echo no)"
+  "$(grep -q 'RESULT: ALL FAULTS SAFE' <<<"$FAULT_OUT" && echo yes || echo no)"
 for kind in 'crash(no-force)' 'crash(steal)' 'torn-wal-tail' 'torn-data-page' 'write-reordering' 'write-io-error(full-engine)'; do
   assert "fault '$kind' ran and is SAFE" "yes" \
-    "$(printf '%s\n' "$FAULT_OUT" | grep -F "fault=$kind" | grep -q 'verdict=SAFE' && echo yes || echo no)"
+    "$(grep -F "fault=$kind" <<<"$FAULT_OUT" | grep -q 'verdict=SAFE' && echo yes || echo no)"
 done
 # Non-vacuity: the hard faults must actually have done their hard work, or "SAFE" would be vacuous.
 STEAL_LOSERS="$(printf '%s\n' "$FAULT_OUT" | grep -F 'fault=crash(steal)' | sed -n 's/.*recovery_losers=\([0-9]*\).*/\1/p')"
@@ -207,7 +207,7 @@ TORN_TAILS="$(printf '%s\n' "$FAULT_OUT" | grep -F 'fault=torn-wal-tail' | sed -
 assert "the torn-WAL-tail fault really left recovery a truncated tail" "yes" \
   "$([ "${TORN_TAILS:-0}" -gt 0 ] && echo yes || echo no)"
 assert "the ONE deferred fault is declared with its reason (fsync-EIO), not hidden" "yes" \
-  "$(printf '%s' "$FAULT_OUT" | grep -q 'fsync-eio: controlled-PANIC' && echo yes || echo no)"
+  "$(grep -q 'fsync-eio: controlled-PANIC' <<<"$FAULT_OUT" && echo yes || echo no)"
 
 # --------------------------------------------------------------------------------------------------
 # Step 3 — cross-check through the graphus-dst VOPR safety CLI (the PR safety gate)
@@ -219,7 +219,7 @@ DST_OUT="$("$DST" vopr safety --seed 1 --seeds "$SEEDS")" || DST_CODE=$?
 printf '%s\n' "$DST_OUT" | tail -n 3 | sed 's/^/  /'
 assert "vopr safety gate exits 0" "0" "$DST_CODE"
 assert "vopr safety gate reports all SAFE + deterministic" "yes" \
-  "$(printf '%s' "$DST_OUT" | grep -qE "$SEEDS seed\(s\) checked, all SAFE" && echo yes || echo no)"
+  "$(grep -qE "$SEEDS seed\(s\) checked, all SAFE" <<<"$DST_OUT" && echo yes || echo no)"
 
 # --------------------------------------------------------------------------------------------------
 # Step 4 — the one-command replay round-trip (planted synthetic failure)
@@ -240,7 +240,7 @@ REP_OUT="$("$REPLAY" --replay "$ARTIFACT")" || REP_CODE=$?
 printf '%s\n' "$REP_OUT" | sed 's/^/  /'
 assert "replay reproduced the failure (exit 0)" "0" "$REP_CODE"
 assert "replay reports REPRODUCED (identical)" "yes" \
-  "$(printf '%s' "$REP_OUT" | grep -q 'REPRODUCED (identical)' && echo yes || echo no)"
+  "$(grep -q 'REPRODUCED (identical)' <<<"$REP_OUT" && echo yes || echo no)"
 REP_TRACE="$(printf '%s' "$REP_OUT" | sed -n 's/.*trace_hash=\([0-9a-f]*\).*/\1/p' | head -n1)"
 REP_STATE="$(printf '%s' "$REP_OUT" | sed -n 's/.*state_hash=\([0-9a-f]*\).*/\1/p' | head -n1)"
 assert "replayed trace_hash equals the captured one (byte-identical)" "$CAP_TRACE" "$REP_TRACE"
@@ -511,7 +511,7 @@ fi
 assert "it HELD that transaction across real in-transaction round-trips (>= 1 answered probe)" "yes" \
   "$([ "${PHANTOM_PROBES:-0}" -ge 1 ] && echo yes || echo no)"
 assert "it died with a dead SOCKET, i.e. it observed the SIGKILL first-hand (not a server refusal)" "yes" \
-  "$(printf '%s' "$PHANTOM_ERR" | grep -qi 'refused' && echo no || echo yes)"
+  "$(grep -qi 'refused' <<<"$PHANTOM_ERR" && echo no || echo yes)"
 assert "that transaction's writes were live INSIDE it (so their absence later is a real UNDO)" \
   "$PHANTOM_NODES" "$PHANTOM_IN_TXN"
 assert "acknowledged commits were still flowing at the kill" "yes" \
@@ -601,7 +601,7 @@ assert "no transaction was half-applied (atomicity, acked AND undetermined alike
 assert "no fabricated commit appeared (every recovered batch is in the ledger)" "0" "$(v verify.batches_outside_ledger)"
 assert "no recovered row came back with a wrong value" "0" "$(v verify.corrupt_batches)"
 assert "the verifier's overall verdict is DURABLE" "yes" \
-  "$(printf '%s' "$VERIFY_OUT" | grep -q 'VERDICT: DURABLE' && echo yes || echo no)"
+  "$(grep -q 'VERDICT: DURABLE' <<<"$VERIFY_OUT" && echo yes || echo no)"
 ACCOUNTS_AFTER="$(v verify.accounts_present)"
 TRANSFERS_AFTER="$(v verify.transfers_present)"
 info "recovered: $ACCOUNTS_AFTER accounts + $TRANSFERS_AFTER transfers (acknowledged $ACKED_NODES + $ACKED_RELS, plus $(v verify.undetermined_present) undetermined batch(es) whose ack was lost with the socket)"
@@ -764,7 +764,7 @@ if [ "$PROFILE" = "fast" ] && [ "$SEEDS" = "30" ] && [ -f "$BASELINE" ] && [ -f 
   CMP_OUT="$("$CMP" "$BASELINE" "$DST_REPORT" 2>&1)" || true
   printf '%s\n' "$CMP_OUT" | sed 's/^/  /'
   assert "fresh run matches the committed baseline (structural deterministic metrics)" "yes" \
-    "$(printf '%s' "$CMP_OUT" | grep -q 'GRAPHUS_BASELINE_OK' && echo yes || echo no)"
+    "$(grep -q 'GRAPHUS_BASELINE_OK' <<<"$CMP_OUT" && echo yes || echo no)"
 else
   info "baseline gate skipped (only runs at the baseline's fast/30-seed profile)"
 fi

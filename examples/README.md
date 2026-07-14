@@ -335,6 +335,48 @@ suite (`rmp` #699) — do not reintroduce them:
    is incremental, so it is a no-op when nothing changed). A build-only-if-the-file-is-absent guard
    silently runs the *previous* binary after any source edit, so the evidence describes code that is
    no longer the code under test.
+7. **An INSTRUMENT must be checkable against something it does not itself produce** (`rmp` #745).
+   A metric that is *reconstructed* — sampled, polled, inferred — can be **wrong in one direction** and
+   still look perfectly healthy, because every gate downstream of it is computed from it. `iot-timeseries`
+   reconstructed its cumulative WAL volume by polling the WAL directory once per tick; segments were born,
+   sealed and reclaimed *between samples*, so the figure was short by **17% in the `batch = 1` control
+   segment**. An under-counted WAL makes write amplification **fall** — so it sailed under every ceiling,
+   passed every gate, and read like a triumph. No amount of gating *derived* from a broken instrument can
+   detect the break.
+   The fix is not "sample harder", it is **an independent witness**: cross-check the reconstruction against
+   a quantity produced by something else. Prefer an **exact** figure from the system under test
+   (`graphus_db_wal_bytes_written_total` — the engine's own monotone durable byte offset — is exact, and
+   the reconstruction now agrees with it to +0.00%); failing that, derive a bound the reconstruction cannot
+   violate from a *different* observation (the run's own on-disk WAL series forces a floor under the
+   cumulative volume, because reclamation can only ever shrink the on-disk figure). And **make every byte
+   reconcile**: if the parts do not sum to the whole, the remainder is not rounding — it is where the
+   defect is. This example published segments beside a run total they did not add up to, and the 7.3%
+   remainder was exactly the missing measurement.
+8. **A number you did not measure will be explained by a story you did not check.** The same example
+   reported a residual write amplification and attributed it, in the README, in `run.sh`, and in every
+   green run's report, to "the WAL's page-image record format — a commit's redo is dominated by the page
+   images of every page it dirtied". The engine emits **byte-range patches** and writes **zero** page
+   images; the claim had never been measured, and it was covering for an unmeasured *fixed per-tick cost*
+   (retention + checkpoint) that turned out to be **52% of the bill**. If an example explains a
+   measurement, the explanation is **itself a claim**, and it must be measured or removed.
+
+9. **A gate must not be able to fail by accident.** Never pipe a large value into `grep -q` inside an
+   assertion (`printf '%s' "$JSON" | grep -q 'key'`). These runners set `-o pipefail`; `grep -q` exits
+   on its **first match**, closing the pipe, so the `printf` still holding tens of kilobytes dies of
+   **SIGPIPE (141)** — and `pipefail` promotes that 141 to the pipeline's status. The assertion is
+   **true**, and it reads as **false**. Measured on a 33 KB report: **4 spurious failures in 300 runs**
+   at idle, and *reliably* under CPU load — the earlier the match sits in the payload, the likelier the
+   loss. It cost this suite a green example that failed only on busy machines (`rmp` #745). Use a
+   herestring, which has no producer to kill:
+
+   ```bash
+   grep -q 'key' <<<"$JSON"        # correct
+   case "$JSON" in *key*) ;; esac  # correct (no process at all)
+   ```
+
+   The wider rule: a flaky gate is not a lesser gate, it is a **broken** one. It trains its readers to
+   re-run until green, which is the same as having no gate — and it is indistinguishable from the real
+   regression it exists to catch.
 
 ### Baseline-diff regression detection
 
@@ -482,7 +524,7 @@ so they cannot target a shared/remote instance.
 | [`bulk-etl`](bulk-etl/) | Offline high-throughput bulk ingest + export round-trip via `graphus-bulk` (no server, no driver). |
 | [`knowledge-graph-rest`](knowledge-graph-rest/) | **What does the REST response path cost under VOLUME?** A semantic knowledge graph (default 1 500 documents) served over the Web REST API, with a real 150 000-row co-mention export driven through all three response shapes while the **server pid's** RSS is sampled through each (`proc_watch --watch`). The headline: the **buffered** path (a single-statement JSON that stops streaming the moment the client adds the API's own `Idempotency-Key` retry header) costs **~30× the server RSS per row** of the streaming path — the `serde_json` intermediate tree (`rmp` #383) — and the 16 MiB buffered cap (`rmp` #553) is exercised to a real HTTP 400. The concurrency phase runs across client **processes** and publishes both server and client cores, so a ceiling can never be misattributed. |
 | [`security-multitenant`](security-multitenant/) | Encryption-at-rest + fine-grained RBAC over a multi-tenant deployment (REST + Bolt). |
-| [`iot-timeseries`](iot-timeseries/) | **What does durability actually cost?** Sustained IoT ingest + sliding-window retention churn, driven over Bolt against a real server with a real segmented WAL. The durable **store** plateaus flat while the reclamation counters climb — and the same run proves the **database on disk does not**, because WAL disk is freed only in whole 64 MiB segments: **79.6 MB of disk for a 229 KB graph (347×)**, at **799× write amplification** (`rmp` #706). Write amplification is a **gated** signal here: the run fails if the WAL footprint comes back zero, under-counted, or worse than its ceiling. |
+| [`iot-timeseries`](iot-timeseries/) | **What does durability actually cost — and does the database give back what it stored?** Sustained IoT ingest (batched, `DATETIME`-stamped) + sliding-window retention churn, driven over Bolt against a real server with a real segmented WAL, while **concurrent readers** query the live window. The durable **store** plateaus flat while the reclamation counters climb. The durability cost is measured by taking a WAL mark at **every phase boundary inside each tick**, which separates the ingest from the **fixed per-tick cost F** (retention `DELETE` + `CHECKPOINT`) that batching cannot touch — and F is **52% of the batched segment's WAL bill**. On the ingest alone: **871× write amplification at one commit per 32-byte reading vs 110× batched ⇒ batching is worth 7.9×** (whole-segment, F included: 974× vs 230×, 4.2×). The residual is **not** a "page-image WAL format" — the engine writes byte-range patches and emits **zero** page images; that claim was never measured and is gone (`rmp` #745). What it *actually* is, measured by decoding the log: **every commit re-images the durable catalog in full, and the catalog carries the free list** — so in a retention workload every commit pays ~16 B for every freed-but-unreused record slot. Before/after one purge, on the identical commit: **4 562 B → 62 493 B per commit (13.7×)**. That is a real, unaddressed engine cost, and it is what batching amortises. The WAL instrument is itself gated: its polled reconstruction is cross-checked against the **engine's exact counter** (`rmp` #745) and agrees to **+0.00%** — it used to under-count by **17% in the control segment**. Every read is **gated against the generator's own stream** (51 852 rows field-by-field, every surviving reading read back in full), so a corrupted payload — or an index silently returning an **empty** result (`rmp` #738) — fails the run. |
 | [`social-network-large`](social-network-large/) | **Do reads scale across cores?** A large social graph (up to ~1,000,000 USERs on an undirected multigraph FRIEND, plus ARTICLEs and USER→LIKE→ARTICLE edges, with an optional **power-law degree law that grows real supernodes**) is network-bulk-loaded into a running server, then an 8-family Cypher read battery is driven **over the Bolt wire by a concurrency ladder of simultaneous clients** while the **server process** is sampled per-thread from `/proc`. Evidence: the core-scaling curve vs C, real per-family p50/p99, and a **decomposed** on-disk footprint (data image / doublewrite / redo log). |
 | [`clients-go`](clients-go/) | **Third-party driver interoperability** — the only example that drives Graphus through an *external* implementation of its protocols: Bolt-over-TCP through the **official `neo4j-go-driver/v5`**, plus REST and a hand-rolled Bolt-over-UDS client. It is therefore the suite's real conformance check: a PackStream marker or Bolt state-machine drift breaks it. |
 | [`product-recommendations`](product-recommendations/) | **Read-heavy concurrency** evaluation: a product-recommendation service over a `(:User)-[:FRIEND]-(:User)` + `(:User)-[:PURCHASED]->(:Product)` multigraph. Network-bulk-loads the graph over the wire (Mode A), then drives a **concurrency ladder** of many simultaneous Bolt/UDS clients running recommendation queries (direct-friend, 2nd/3rd-level, and similar-consumption-profile) plus a few concurrent writes, sampling the server's per-thread CPU / RSS / IO to **expose the read-path saturation knee** (single-engine-thread vs off-thread reader pool). |

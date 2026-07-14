@@ -370,13 +370,27 @@ impl From<graphus_bolt::BoltError> for ClientError {
 /// A convenience result alias for client operations.
 pub type ClientResult<T> = Result<T, ClientError>;
 
-/// The outcome of running one query: the column names, the rows, and the wall-clock latency.
-#[derive(Debug, Clone)]
+/// The outcome of running one query: the column names, the rows, the server's side-effect summary, and
+/// the wall-clock latency.
+#[derive(Debug, Clone, Default)]
 pub struct QueryResult {
     /// The result column names, in order, from the `RUN` `SUCCESS` `fields`.
     pub fields: Vec<String>,
     /// One flattened scalar row per `RECORD`, in field order.
     pub records: Vec<Vec<Value>>,
+    /// The server's **side-effect counters**, from the `stats` map of the trailing `PULL` `SUCCESS`
+    /// metadata (`rmp` #509): `nodes-created`, `relationships-created`, `properties-set`,
+    /// `nodes-deleted`, … Empty for a read-only statement, and empty against a server that does not
+    /// send them.
+    ///
+    /// Load-bearing, not decorative (`rmp` #745). A write driver counts the rows it SENT; only the
+    /// server can say how many it actually WROTE. A batched `UNWIND $rows AS row MATCH (s:Sensor {id:
+    /// row.sensor}) CREATE …` silently **drops** any row whose `MATCH` finds nothing — the statement
+    /// succeeds, the driver counts the row as ingested, and every per-element figure derived from that
+    /// count (write amplification's denominator, most of all) is silently inflated. Comparing
+    /// [`nodes_created`](Self::nodes_created) against the batch size is what turns that silent drop into
+    /// a failure.
+    pub stats: Vec<(String, Value)>,
     /// Wall-clock time from sending `RUN` to receiving the trailing `SUCCESS`.
     pub elapsed: Duration,
 }
@@ -395,6 +409,32 @@ impl QueryResult {
             Some(Value::Integer(n)) => Some(*n),
             _ => None,
         }
+    }
+
+    /// One of the server's side-effect counters by its Bolt key (`nodes-created`,
+    /// `relationships-created`, `properties-set`, …). `None` when the server reported no such counter —
+    /// which is NOT the same as zero, and must never be read as it.
+    #[must_use]
+    pub fn stat(&self, key: &str) -> Option<i64> {
+        self.stats
+            .iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, v)| match v {
+                Value::Integer(n) => Some(*n),
+                _ => None,
+            })
+    }
+
+    /// Nodes the statement created, as reported by the SERVER. See [`stats`](Self::stats).
+    #[must_use]
+    pub fn nodes_created(&self) -> Option<i64> {
+        self.stat("nodes-created")
+    }
+
+    /// Relationships the statement created, as reported by the SERVER. See [`stats`](Self::stats).
+    #[must_use]
+    pub fn relationships_created(&self) -> Option<i64> {
+        self.stat("relationships-created")
     }
 }
 
@@ -560,18 +600,22 @@ impl BoltClient {
 
         self.send(&Request::Pull { n: ALL, qid: None })?;
         let mut records = Vec::new();
-        loop {
+        // The trailing SUCCESS carries the server's side-effect `stats` (`rmp` #509). It used to be
+        // dropped on the floor; it is the ONLY authority on what a write statement actually wrote, so it
+        // is now kept (`rmp` #745 — see `QueryResult::stats`).
+        let stats = loop {
             match self.recv()? {
                 Response::Record { values } => records.push(scalar_row(values)),
-                Response::Success { .. } => break, // trailing summary
+                Response::Success { metadata } => break extract_stats(&metadata),
                 Response::Failure(f) => return Err(ClientError::Failure(f)),
                 other => return Err(unexpected("PULL", &other)),
             }
-        }
+        };
 
         Ok(QueryResult {
             fields,
             records,
+            stats,
             elapsed: started.elapsed(),
         })
     }
@@ -633,18 +677,22 @@ impl BoltClient {
 
         self.send(&Request::Pull { n: ALL, qid: None })?;
         let mut records = Vec::new();
-        loop {
+        // The trailing SUCCESS carries the server's side-effect `stats` (`rmp` #509) — the only authority
+        // on what a write statement actually wrote. Kept here too, so an explicit transaction is not a
+        // blind spot (`rmp` #745; see `QueryResult::stats`).
+        let stats = loop {
             match self.recv()? {
                 Response::Record { values } => records.push(scalar_row(values)),
-                Response::Success { .. } => break, // trailing summary
+                Response::Success { metadata } => break extract_stats(&metadata),
                 Response::Failure(f) => return Err(ClientError::Failure(f)),
                 other => return Err(unexpected("PULL (in txn)", &other)),
             }
-        }
+        };
 
         Ok(QueryResult {
             fields,
             records,
+            stats,
             elapsed: started.elapsed(),
         })
     }
@@ -771,6 +819,22 @@ impl BoltClient {
 /// Builds a [`ClientError::Protocol`] describing an out-of-place response for `stage`.
 fn unexpected(stage: &str, got: &Response) -> ClientError {
     ClientError::Protocol(format!("unexpected response to {stage}: {got:?}"))
+}
+
+/// Extracts the `stats` side-effect map from a trailing `PULL` `SUCCESS` metadata map (`rmp` #509).
+///
+/// Absent for a read-only statement, and absent against a server that does not report them — in both
+/// cases the result is an EMPTY map, which callers must read as "the server said nothing", never as
+/// "zero nodes were created".
+fn extract_stats(metadata: &[(String, Value)]) -> Vec<(String, Value)> {
+    metadata
+        .iter()
+        .find(|(k, _)| k == "stats")
+        .and_then(|(_, v)| match v {
+            Value::Map(entries) => Some(entries.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 /// Extracts the `fields` column-name list from a `RUN` `SUCCESS` metadata map.

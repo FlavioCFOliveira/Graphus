@@ -261,7 +261,7 @@ if [ "$MODE" = external ]; then
   WORKLOAD_MS=$(( $(_harness_now_ms) - WORKLOAD_START_MS ))
   printf '%s\n' "$ANALYZE_OUT" | sed 's/^/  /'
   assert "GDS workload completed against the instance" "yes" \
-    "$(printf '%s' "$ANALYZE_OUT" | grep -q 'GRAPHUS_GDS_OK' && echo yes || echo no)"
+    "$(grep -q 'GRAPHUS_GDS_OK' <<<"$ANALYZE_OUT" && echo yes || echo no)"
   parse_stats "$ANALYZE_OUT"
 
   # Scrape /metrics AFTER the workload (window closes before the DB is dropped, so its per-database
@@ -518,7 +518,7 @@ print('yes' if t >= 1.0 else 'no')
     local cmp_out; cmp_out="$("$CMP_BIN" "$BASELINE" "$EVIDENCE_DIR/report.json" 2>&1)" || true
     printf '%s\n' "$cmp_out" | sed 's/^/  /'
     assert "fresh run is within baseline thresholds (structural metrics)" "yes" \
-      "$(printf '%s' "$cmp_out" | grep -q 'GRAPHUS_BASELINE_OK' && echo yes || echo no)"
+      "$(grep -q 'GRAPHUS_BASELINE_OK' <<<"$cmp_out" && echo yes || echo no)"
   fi
 }
 
@@ -593,7 +593,7 @@ EOF
       --expect-nodes "$NODE_COUNT" --expect-rels "$REL_COUNT" 2>&1)" || true
   printf '%s\n' "$BULK_OUT" | sed 's/^/  /'
   assert "network bulk-import (Mode A) ingested the graph" "yes" \
-    "$(printf '%s' "$BULK_OUT" | grep -q 'GRAPHUS_BULK_OK' && echo yes || echo no)"
+    "$(grep -q 'GRAPHUS_BULK_OK' <<<"$BULK_OUT" && echo yes || echo no)"
   BULK_BLOB="$(printf '%s' "$BULK_OUT" | sed -n 's/^GRAPHUS_BULK_OK //p' | head -n1)"
   BULK_SECS="$(json_field "$BULK_BLOB" load_secs)"
   BULK_RELS_PER_SEC="$(json_field "$BULK_BLOB" rels_per_sec)"
@@ -626,7 +626,7 @@ EOF
       --graph "$GRAPH_CYPHER" --reference "$REFERENCE" 2>&1)" || true
   printf '%s\n' "$ANALYZE_OUT" | sed 's/^/  /'
   assert "GDS analytics matched the reference ground truth" "yes" \
-    "$(printf '%s' "$ANALYZE_OUT" | grep -q 'GRAPHUS_GDS_OK' && echo yes || echo no)"
+    "$(grep -q 'GRAPHUS_GDS_OK' <<<"$ANALYZE_OUT" && echo yes || echo no)"
   sample_peak_rss
   parse_stats "$ANALYZE_OUT"
   sample_peak_rss

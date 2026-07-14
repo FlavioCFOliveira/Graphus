@@ -15,27 +15,39 @@
 //! | Node label | Key properties | Meaning |
 //! | --- | --- | --- |
 //! | `(:Sensor {id, kind, site, location})` | `id` (stable, `s-<n>`), `location` (Cartesian `point`) | a physical sensor / device |
-//! | `(:Reading {sensor, seq, ts, value})` | `seq` (global monotonic) | one time-stamped sample |
+//! | `(:Reading {sensor, seq, ts, value})` | `seq` (global monotonic), `ts` (a real `DATETIME`) | one time-stamped sample |
 //!
 //! ## Schema — indexes & constraints ([`Generator::schema_ddl`])
 //!
-//! The bootstrap declares a production-realistic geo/time schema over this model, exercising five of
+//! The bootstrap declares a production-realistic geo/time schema over this model, exercising six of
 //! the newer index & constraint kinds (all Neo4j-5.x-shaped):
 //!
 //! | DDL | Kind | Why the workload needs it |
 //! | --- | --- | --- |
 //! | `Sensor.id IS NODE KEY` | `NODE KEY` constraint | the fleet's primary key: present + unique |
 //! | `Reading.value IS NOT NULL` | existence constraint | every telemetry sample must carry a value |
-//! | `Reading.ts IS :: INTEGER` | property-type constraint | `ts` is an epoch-ms **integer**, never a float |
+//! | `Reading.ts IS :: ZONED DATETIME` | property-type constraint | `ts` is a real **temporal**, never a bare integer |
 //! | `Sensor.location` | `POINT` (spatial) index | Cartesian proximity ("sensors near a site") |
 //! | `Reading(sensor, seq)` | composite `RANGE` index | per-sensor windowed reads (leading eq + seq range) |
 //! | `Reading.seq` | `RANGE` index | the retention key the aged-out `DELETE` seeks on |
+//! | `Reading.ts` | `RANGE` index | the **temporal** window read (`ts ∈ [t0, t1)`) seeks on |
 //!
-//! Every churn insert satisfies the constraints by construction (a `Reading` always carries an
-//! integer `ts` and a `value`; a `Sensor` always carries a unique `id`), and the retention `DELETE`
+//! Every churn insert satisfies the constraints by construction (a `Reading` always carries a
+//! `DATETIME` `ts` and a `value`; a `Sensor` always carries a unique `id`), and the retention `DELETE`
 //! only removes whole readings, so it can never leave a constraint violated. The `Reading` indexes
 //! are therefore **maintained under churn** — a realistic production stress the reclamation proof
 //! runs the engine through.
+//!
+//! ### `ts` is a real temporal, not an epoch-ms integer (`rmp` #745)
+//!
+//! `Reading.ts` was an `INTEGER` of epoch milliseconds, and the schema *forbade* it from being anything
+//! else (`IS :: INTEGER`). A time-series example whose timestamps were integers never once exercised the
+//! Bolt/PackStream **temporal** wire path (`DateTime`, struct tag `0x49`), the temporal property
+//! encoding, or a temporal index key — the three things a time-series database is judged on. `ts` is now
+//! a `ZONED DATETIME` (`Value::ZonedDateTime`, UTC, offset 0), carried as a real PackStream temporal in
+//! both directions, stored as a temporal property, and **range-indexed** so a `ts ∈ [t0, t1)` window read
+//! is served by a real temporal index seek. The epoch-ms figure survives as the *derivation* of that
+//! instant ([`ReadingRow::ts_millis`]), which keeps the stream a pure function of `seq`.
 //!
 //! One relationship type carries the time-series edge:
 //!
@@ -278,19 +290,85 @@ impl GenConfig {
 ///
 /// The in-process driver runs the literal statements (they keep the emitted stream byte-identical and
 /// the determinism proof simple); the over-the-wire driver instead binds these fields as real **Bolt
-/// parameters** (`$sid`, `$seq`, `$ts`, `$value`), which is both the realistic client shape and the one
-/// that exercises the server's parameterized plan cache. Both consume the SAME generated values, so
-/// the two drivers ingest exactly the same telemetry.
+/// parameters** (`$sid`, `$seq`, `$ts`, `$value` — with `$ts` a real PackStream `DateTime`), which is
+/// both the realistic client shape and the one that exercises the server's parameterized plan cache.
+/// Both consume the SAME generated values, so the two drivers ingest exactly the same telemetry.
+///
+/// This struct is also the wire driver's **ground truth**: the payload read-back check (`rmp` #745)
+/// compares every stored field against the [`ReadingRow`] the generator produced for that `seq`, so a
+/// corrupted or transposed property value fails the run instead of passing a `count(*)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadingRow {
     /// The global monotonic sequence number (also the retention key).
     pub seq: u64,
     /// Index of the emitting sensor (`0..sensors`); its id is [`Generator::sensor_id`].
     pub sensor: u64,
-    /// Epoch-ms timestamp: `EPOCH_MS + seq * TICK_MS`.
-    pub ts: u64,
+    /// The reading's instant, as **epoch milliseconds**: `EPOCH_MS + seq * TICK_MS`.
+    ///
+    /// This is the *derivation* of the timestamp, not its stored type: the property `Reading.ts` is a
+    /// real `DATETIME` ([`Self::ts_datetime`]), and this integer is what makes that instant a pure,
+    /// reproducible function of `seq`. [`TICK_MS`] is a whole 1 000 ms, so every instant lands on a
+    /// whole second and carries zero sub-second nanoseconds.
+    pub ts_millis: u64,
     /// The telemetry value, in `[0, 1000)`.
     pub value: u64,
+}
+
+impl ReadingRow {
+    /// The reading's instant as a Cypher **`DATETIME`** in UTC — the exact value the ingest binds as the
+    /// `$ts` Bolt parameter, and the exact value the server must give back.
+    ///
+    /// UTC is expressed as an **offset-only** zone (`offset_seconds: 0`, empty `zone_id`), which is the
+    /// PackStream `DateTime` form (struct tag `0x49`, UTC epoch seconds + nanos + offset) rather than the
+    /// `DateTimeZoneId` form. That is deliberate: the offset form round-trips **byte-exactly** with no
+    /// IANA-zone resolution in the middle, so the read-back check compares a value the wire could not
+    /// have silently re-derived. It is also precisely what Cypher's `datetime({epochMillis: …})` produces
+    /// with no timezone component (`graphus_cypher::temporal_fns`), so the literal statements the
+    /// in-process mirror runs and the parameters the wire driver binds construct the **same** instant.
+    #[cfg(any(feature = "churn", feature = "wire"))]
+    #[must_use]
+    pub fn ts_datetime(&self) -> graphus_core::ZonedDateTime {
+        // TICK_MS is a whole second, so the millisecond remainder is always 0 — but derive it anyway
+        // rather than assume it, so a future sub-second TICK_MS cannot silently truncate.
+        graphus_core::ZonedDateTime {
+            local: graphus_core::LocalDateTime {
+                epoch_seconds: (self.ts_millis / 1_000) as i64,
+                nanos: ((self.ts_millis % 1_000) * 1_000_000) as u32,
+            },
+            offset_seconds: 0,
+            zone_id: String::new(),
+        }
+    }
+
+    /// [`Self::ts_datetime`] as a bindable [`Value`](graphus_core::Value) — the `$ts` Bolt parameter.
+    #[cfg(any(feature = "churn", feature = "wire"))]
+    #[must_use]
+    pub fn ts_value(&self) -> graphus_core::Value {
+        graphus_core::Value::zoned_date_time(self.ts_datetime())
+    }
+}
+
+/// The readings sensor `sensor` (or, with `None`, **any** sensor) emitted with `seq` in `[lo, hi)` —
+/// the **ground truth** a windowed read must return, computed from the generator's own stream.
+///
+/// `readings` must be the run's whole reading stream in `seq` order (as [`Generator::all_readings`]
+/// returns it), so `readings[i].seq == i` and the window is a slice rather than a scan. A `hi` beyond
+/// the end of the stream is clamped; an inverted or empty range yields no rows.
+#[must_use]
+pub fn expected_window(
+    readings: &[ReadingRow],
+    sensor: Option<u64>,
+    lo: u64,
+    hi: u64,
+) -> Vec<ReadingRow> {
+    let len = readings.len() as u64;
+    let lo = lo.min(len) as usize;
+    let hi = hi.clamp(lo as u64, len) as usize;
+    readings[lo..hi]
+        .iter()
+        .filter(|r| sensor.is_none_or(|s| r.sensor == s))
+        .copied()
+        .collect()
 }
 
 /// The Cypher one tick contributes to the churn: an INSERT batch (new readings) and a DELETE batch
@@ -388,8 +466,8 @@ impl Generator {
     /// The one-time **schema** bootstrap: the full index & constraint DDL block declared over the
     /// geo/time model (a `NODE KEY` on `Sensor.id`, an existence + a property-type constraint on the
     /// reading, a `POINT` index on `Sensor.location`, a composite `RANGE` index on `Reading(sensor,
-    /// seq)`, and the single-property `RANGE` retention index on `Reading.seq`). See the module docs
-    /// for the table.
+    /// seq)`, the single-property `RANGE` retention index on `Reading.seq`, and the `RANGE` index on the
+    /// temporal `Reading.ts`). See the module docs for the table.
     ///
     /// Returned separately from the sensor fleet because schema DDL is a distinct engine command path
     /// (`CREATE INDEX` / `CREATE CONSTRAINT` are routed to the index/constraint catalogs, not the row
@@ -403,12 +481,12 @@ impl Generator {
             // Sensor.id is the fleet's primary key: present + unique across the fleet.
             "CREATE CONSTRAINT sensor_id_key IF NOT EXISTS FOR (s:Sensor) REQUIRE s.id IS NODE KEY"
                 .to_owned(),
-            // Every reading must carry a `value` (existence), and its `ts` — when present — is an
-            // epoch-ms INTEGER, never a float (property-type). Together they are the telemetry
-            // integrity invariants every ingest is checked against.
+            // Every reading must carry a `value` (existence), and its `ts` — when present — is a real
+            // temporal, never a bare epoch-ms integer or a string (property-type). Together they are the
+            // telemetry integrity invariants every ingest is checked against.
             "CREATE CONSTRAINT reading_value_exists IF NOT EXISTS FOR (r:Reading) REQUIRE r.value IS NOT NULL"
                 .to_owned(),
-            "CREATE CONSTRAINT reading_ts_integer IF NOT EXISTS FOR (r:Reading) REQUIRE r.ts IS :: INTEGER"
+            "CREATE CONSTRAINT reading_ts_datetime IF NOT EXISTS FOR (r:Reading) REQUIRE r.ts IS :: ZONED DATETIME"
                 .to_owned(),
             // POINT (spatial) index on the sensor geo location — accelerates the Cartesian proximity
             // ("sensors near a site") query.
@@ -421,6 +499,11 @@ impl Generator {
             // The retention key: the aged-out DELETE seeks `Reading.seq` on this single-property RANGE
             // index (the realistic shape for a TTL sweep).
             "CREATE INDEX reading_seq IF NOT EXISTS FOR (r:Reading) ON (r.seq)".to_owned(),
+            // The TEMPORAL window key: a `ts >= $t0 AND ts < $t1` read — the query a time-series
+            // database exists to serve — seeks THIS index, over a real `DATETIME` property (`rmp` #745).
+            // The RANGE index key codec orders temporals natively (`graphus_index::keycodec`), so the
+            // index is a genuine temporal index, not a integer index wearing a temporal name.
+            "CREATE INDEX reading_ts IF NOT EXISTS FOR (r:Reading) ON (r.ts)".to_owned(),
         ]
     }
 
@@ -468,17 +551,23 @@ impl Generator {
             // A bounded integer "value" (no floats on the wire — keeps the stream byte-identical
             // and the property fixed-width): a slow ramp plus seeded jitter, in [0, 1000).
             let value = (seq + self.rng.below(50)) % 1000;
-            let ts = EPOCH_MS + seq * TICK_MS;
+            let ts_millis = EPOCH_MS + seq * TICK_MS;
+            // `ts` is a real temporal. In the literal (text) form that is `datetime({epochMillis: N})`,
+            // which — with no timezone component — yields exactly the UTC, offset-0, empty-zone-id
+            // `ZonedDateTime` the parameterized wire driver binds (`ReadingRow::ts_datetime`). The two
+            // drivers therefore store the identical instant, and the emitted text stays a pure function
+            // of `seq` (no clock, no float, byte-identical across runs).
             inserts.push(format!(
                 "MATCH (s:Sensor {{id: '{}'}}) \
-                 CREATE (s)-[:EMITTED]->(:Reading {{sensor: '{}', seq: {seq}, ts: {ts}, value: {value}}})",
+                 CREATE (s)-[:EMITTED]->(:Reading {{sensor: '{}', seq: {seq}, \
+                 ts: datetime({{epochMillis: {ts_millis}}}), value: {value}}})",
                 Self::sensor_id(sensor),
                 Self::sensor_id(sensor),
             ));
             readings.push(ReadingRow {
                 seq,
                 sensor,
-                ts,
+                ts_millis,
                 value,
             });
             self.seq += 1;
@@ -509,6 +598,33 @@ impl Generator {
             next_seq: self.seq,
             delete_cutoff,
         })
+    }
+
+    /// Materialises the run's **entire reading stream** in `seq` order, so `readings[i].seq == i`.
+    ///
+    /// This is the wire driver's **ground truth**. It is a pure function of the config, so the driver can
+    /// compute — before a single row is written — exactly what every reading's `(sensor, seq, ts, value)`
+    /// must be, and exactly which readings a windowed query must return. Without it every read in the
+    /// example was a `count(…)`, and a corrupted payload passed green (`rmp` #745).
+    ///
+    /// `rate × ticks` rows (7 000 on the default `reclaim` profile, ~32 B each), so materialising the
+    /// whole stream costs a couple of hundred kilobytes and buys an exact, falsifiable oracle.
+    #[must_use]
+    pub fn all_readings(&self) -> Vec<ReadingRow> {
+        let mut g = self.clone();
+        let mut out = Vec::with_capacity(g.cfg.total_readings() as usize);
+        while let Some(t) = g.tick() {
+            out.extend(t.readings);
+        }
+        out
+    }
+
+    /// The epoch-ms instant of reading `seq` — `EPOCH_MS + seq * TICK_MS`, the derivation the whole
+    /// stream's timestamps follow. Used to build the `[t0, t1)` bounds of a temporal window query from a
+    /// `seq` window, which is exactly equivalent because `ts` is strictly increasing in `seq`.
+    #[must_use]
+    pub fn ts_millis_of(seq: u64) -> u64 {
+        EPOCH_MS + seq * TICK_MS
     }
 
     /// Materialises the **entire** run as a single deterministic text artifact: the schema/sensor
@@ -665,8 +781,9 @@ mod tests {
     fn schema_emits_full_ddl_block_plus_one_node_per_sensor() {
         let g = Generator::new(cfg());
         let ddl = g.schema_ddl();
-        // NODE KEY + existence + property-type constraints, plus POINT + composite + retention indexes.
-        assert_eq!(ddl.len(), 6);
+        // NODE KEY + existence + property-type constraints, plus POINT + composite + retention + the
+        // temporal RANGE index.
+        assert_eq!(ddl.len(), 7);
         assert_eq!(
             ddl.iter()
                 .filter(|s| s.starts_with("CREATE CONSTRAINT"))
@@ -688,6 +805,20 @@ mod tests {
                 .any(|s| s.contains("reading_seq") && s.contains("(r.seq)")),
             "the single-property retention RANGE index on Reading.seq"
         );
+        assert!(
+            ddl.iter()
+                .any(|s| s.contains("reading_ts ") && s.contains("(r.ts)")),
+            "the RANGE index on the TEMPORAL Reading.ts (rmp #745)"
+        );
+        assert!(
+            ddl.iter()
+                .any(|s| s.contains("reading_ts_datetime") && s.contains("IS :: ZONED DATETIME")),
+            "the property-type constraint declares ts a ZONED DATETIME, not an INTEGER (rmp #745)"
+        );
+        assert!(
+            !ddl.iter().any(|s| s.contains("r.ts IS :: INTEGER")),
+            "an INTEGER ts would forbid the temporal type outright — the exact defect #745 removes"
+        );
         // Every statement is a schema-DDL form (starts CREATE CONSTRAINT, or CREATE … INDEX …).
         for stmt in &ddl {
             assert!(
@@ -706,6 +837,103 @@ mod tests {
             "sensor 0 sits at its site-0 centre: {}",
             sensors[0]
         );
+    }
+
+    /// The literal insert stream must carry a REAL temporal, not an epoch-ms integer: an `INTEGER` `ts`
+    /// is precisely what `rmp` #745 removes (it left the Bolt/PackStream temporal path unexercised).
+    #[test]
+    fn the_literal_insert_stores_ts_as_a_datetime() {
+        let mut g = Generator::new(cfg());
+        let t = g.tick().expect("a tick");
+        let first = &t.inserts[0];
+        assert!(
+            first.contains("ts: datetime({epochMillis: 1704067200000})"),
+            "seq 0 must store the epoch instant as a DATETIME, got: {first}"
+        );
+        assert!(
+            !first.contains("ts: 1704067200000"),
+            "a bare integer ts would never touch the temporal wire path: {first}"
+        );
+        // …and the structured row the wire driver binds carries the SAME instant.
+        assert_eq!(t.readings[0].ts_millis, EPOCH_MS);
+        assert_eq!(t.readings[1].ts_millis, EPOCH_MS + TICK_MS);
+    }
+
+    /// The whole reading stream is the driver's ground-truth oracle, so it must be dense and `seq`-
+    /// indexed (`readings[i].seq == i`) — `expected_window` slices it on exactly that invariant.
+    #[test]
+    fn all_readings_is_dense_and_seq_indexed() {
+        let c = cfg();
+        let readings = Generator::new(c.clone()).all_readings();
+        assert_eq!(readings.len() as u64, c.total_readings());
+        for (i, r) in readings.iter().enumerate() {
+            assert_eq!(r.seq, i as u64, "the stream is dense and seq-ordered");
+            assert_eq!(r.ts_millis, Generator::ts_millis_of(r.seq));
+            assert!(r.sensor < c.sensors);
+            assert!(r.value < 1000);
+        }
+        // Deterministic: a second generator produces the identical oracle.
+        assert_eq!(readings, Generator::new(c).all_readings());
+    }
+
+    /// The windowed-read ground truth: exactly the generated readings of one sensor inside `[lo, hi)`,
+    /// in seq order — and nothing else. This is the oracle the concurrent reader mix gates against, so
+    /// an off-by-one here would silently weaken every reader check.
+    #[test]
+    fn expected_window_selects_exactly_the_sensor_readings_in_range() {
+        let c = cfg(); // 4 sensors, rate 10, 8 ticks => 80 readings
+        let readings = Generator::new(c).all_readings();
+
+        let got = expected_window(&readings, Some(2), 10, 30);
+        assert!(!got.is_empty(), "sensor 2 must emit inside a 20-seq window");
+        for r in &got {
+            assert_eq!(r.sensor, 2);
+            assert!((10..30).contains(&r.seq));
+        }
+        // Completeness: every generated reading of sensor 2 in the range is present.
+        let brute: Vec<ReadingRow> = readings
+            .iter()
+            .filter(|r| r.sensor == 2 && (10..30).contains(&r.seq))
+            .copied()
+            .collect();
+        assert_eq!(got, brute);
+
+        // `None` selects every sensor — the temporal window read's oracle (it spans the whole fleet).
+        let all = expected_window(&readings, None, 10, 30);
+        assert_eq!(all.len(), 20, "a dense 20-seq window across all sensors");
+
+        // Degenerate ranges yield nothing, and `hi` past the end is clamped rather than panicking.
+        assert!(expected_window(&readings, None, 30, 30).is_empty());
+        assert!(expected_window(&readings, None, 30, 10).is_empty());
+        assert_eq!(expected_window(&readings, None, 70, 10_000).len(), 10);
+        assert!(expected_window(&readings, None, 10_000, 20_000).is_empty());
+    }
+
+    /// The `$ts` Bolt parameter must be the UTC instant `EPOCH_MS + seq * TICK_MS`, in the **offset-only**
+    /// PackStream `DateTime` form (empty zone id) — the form that round-trips byte-exactly and that
+    /// `datetime({epochMillis: …})` produces, so the literal mirror and the parameterized wire driver
+    /// store the same value.
+    #[cfg(any(feature = "churn", feature = "wire"))]
+    #[test]
+    fn ts_datetime_is_the_utc_instant_in_the_offset_only_form() {
+        let r = ReadingRow {
+            seq: 7,
+            sensor: 3,
+            ts_millis: EPOCH_MS + 7 * TICK_MS,
+            value: 42,
+        };
+        let dt = r.ts_datetime();
+        assert_eq!(dt.local.epoch_seconds, (EPOCH_MS / 1000) as i64 + 7);
+        assert_eq!(dt.local.nanos, 0, "a whole-second TICK_MS carries no nanos");
+        assert_eq!(dt.offset_seconds, 0, "UTC");
+        assert!(
+            dt.zone_id.is_empty(),
+            "the offset-only form (PackStream DateTime, tag 0x49) — not DateTimeZoneId"
+        );
+        assert!(matches!(
+            r.ts_value(),
+            graphus_core::Value::ZonedDateTime(_)
+        ));
     }
 
     #[test]

@@ -149,6 +149,18 @@ struct PerDbCounters {
     latency: LatencyHistogram,
     /// Queries on this database that exceeded the slow-query threshold.
     slow_queries: AtomicU64,
+    /// Cumulative WAL bytes this database has made **durable** in this process (`rmp` #745). See
+    /// [`Metrics::publish_wal_bytes_for`] for the exact contract.
+    wal_bytes_written: AtomicU64,
+    /// The database's WAL **absolute durable byte offset** as of its last publish — the baseline the
+    /// next publish folds a delta against (`rmp` #745). Re-seeded at every engine open by
+    /// [`Metrics::rebaseline_wal_bytes_for`], which is what keeps the counter honest across a
+    /// `STOP`/`START DATABASE` cycle and across a `DROP` + re-`CREATE` of the same name.
+    ///
+    /// This is NOT itself exported; it is the engine's private fold state, kept here (rather than in
+    /// the engine) purely so that publishing needs no new parameter on the engine's already
+    /// 20-argument command path — `&Metrics` and `db` are threaded to every publish site already.
+    wal_offset_last: AtomicU64,
 }
 
 impl PerDbCounters {
@@ -159,6 +171,8 @@ impl PerDbCounters {
             active_txns: AtomicU64::new(0),
             latency: LatencyHistogram::new(),
             slow_queries: AtomicU64::new(0),
+            wal_bytes_written: AtomicU64::new(0),
+            wal_offset_last: AtomicU64::new(0),
         }
     }
 
@@ -350,6 +364,23 @@ pub struct Metrics {
     /// rare event, so unpadded.
     mode_b_sessions_stranded: AtomicU64,
 
+    // ---- write-ahead-log volume (`rmp` #745) ----
+    /// Cumulative bytes this **process** has made durable in the write-ahead logs of every database,
+    /// summed across engines (see [`publish_wal_bytes_for`](Self::publish_wal_bytes_for) for the exact
+    /// contract). Published additively — each engine folds only the *growth* of its own WAL's absolute
+    /// durable byte offset into this — so it equals the SUM of the per-database series, exactly like
+    /// [`active_txns`](Self::active_txns)/[`ssi_tracked`](Self::ssi_tracked) (`rmp` #418/#463).
+    ///
+    /// This is the metric that makes WAL write-amplification **measurable** rather than reconstructable.
+    /// The previous best an external observer could do was poll the WAL directory and sum the largest
+    /// size it ever saw per segment file — which structurally UNDER-counts, because a segment can be
+    /// created, filled, sealed and reclaimed entirely between two polls and so is never observed at its
+    /// final length. The under-count is one-sided and host-speed dependent, so the figure it yields is a
+    /// floor, not a measurement. The engine, by contrast, knows the answer exactly: the WAL's byte offset
+    /// IS its LSN, it only ever advances, and reclamation (which deletes segment files) does not move it.
+    /// Engine-thread-only writer per database, so unpadded.
+    wal_bytes_written: AtomicU64,
+
     // ---- per-database dimension (`rmp` #463) ----
     /// Per-database slices of the transaction/latency/abort families, keyed by canonical database name.
     /// Each engine records into BOTH its slice here and the aggregate fields above, so the per-database
@@ -399,6 +430,7 @@ impl Metrics {
             engine_force_detached_total: AtomicU64::new(0),
             engine_force_detached_active: AtomicU64::new(0),
             mode_b_sessions_stranded: AtomicU64::new(0),
+            wal_bytes_written: AtomicU64::new(0),
             per_db: RwLock::new(BTreeMap::new()),
         }
     }
@@ -775,6 +807,88 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Re-seeds `db`'s WAL fold baseline to `wal_durable_len` **without counting anything** — called
+    /// once by each engine, at open, before it serves a single request (`rmp` #745).
+    ///
+    /// This is what makes [`publish_wal_bytes_for`](Self::publish_wal_bytes_for) a counter of *bytes
+    /// this process wrote* rather than a counter of *the WAL offset a database happened to be at*. An
+    /// engine opening a database that already has a 40 GiB WAL history on disk starts its fold from
+    /// 40 GiB, so that history is never mistaken for 40 GiB of freshly-written bytes.
+    ///
+    /// It is also the sole reason the counter survives a `DROP DATABASE` + `CREATE DATABASE` of the same
+    /// name: the re-created database's WAL restarts near offset `0`, so a monotone-max publish would
+    /// have STUCK at the dropped database's high-water mark and silently under-counted every subsequent
+    /// byte the new database wrote. Re-baselining makes the next publish fold deltas against the *new*
+    /// log. The exported counter itself never decreases.
+    pub fn rebaseline_wal_bytes_for(&self, db: &str, wal_durable_len: u64) {
+        self.per_db_entry(db)
+            .wal_offset_last
+            .store(wal_durable_len, Ordering::Relaxed);
+    }
+
+    /// Publishes `db`'s WAL **absolute durable byte offset**, folding its growth since the last publish
+    /// into both the aggregate and per-database `wal_bytes_written` counters (`rmp` #745).
+    ///
+    /// # Contract
+    ///
+    /// **What it counts.** Bytes that this server process has made **durable** (`fdatasync`-hardened) in
+    /// `db`'s write-ahead log — the growth of the log's absolute durable byte offset
+    /// (`LogSink::durable_len`, which by construction equals the highest durable LSN, since a WAL byte
+    /// offset *is* an LSN). This is the WAL's true on-the-wire **volume**, so it necessarily includes
+    /// *every* record the engine hardened: commit records, update/undo records, checkpoint records, DDL,
+    /// index-catalog blocks and bulk-import batches — not just user payload. It is the numerator of write
+    /// amplification, not a count of user bytes.
+    ///
+    /// **Over what window.** Since each engine incarnation opened. The counter starts at `0` for a
+    /// freshly-started process and accumulates across `STOP`/`START DATABASE` cycles within that
+    /// process's life (each new engine re-baselines via
+    /// [`rebaseline_wal_bytes_for`](Self::rebaseline_wal_bytes_for) and then keeps folding into the same
+    /// counter, so a restart of one database neither rewinds the counter nor double-counts its history).
+    /// Two `/metrics` scrapes therefore bracket a window whose WAL volume is exactly the DELTA between
+    /// them.
+    ///
+    /// **What resets it.** Only a **process restart** — an ordinary Prometheus counter reset, which
+    /// `rate()`/`increase()` handle natively. Specifically it is NOT reset by: WAL **segment
+    /// reclamation** (which deletes whole segment files but never moves the byte offset — the freed
+    /// prefix reads back as zeros and the offset keeps climbing), a **checkpoint**, a segment **seal /
+    /// roll**, a `STOP`/`START DATABASE`, or crash **recovery**. Reclamation-independence is the entire
+    /// point: it is precisely where an external, poll-the-directory reconstruction silently loses whole
+    /// segments.
+    ///
+    /// **Freshness / exactness caveat.** The value is published by the engine thread at each of its
+    /// natural WAL-advancing seams — engine open, every group-commit harden, every maintenance or
+    /// operator checkpoint, and engine shutdown — so between two seams it is *stale*, and bytes that are
+    /// written but not yet `fdatasync`'d are not yet counted. It is never *wrong*: because each publish
+    /// carries the **absolute** offset (and only the delta is folded), a late publish always catches up
+    /// and no byte is ever lost or counted twice. A scrape taken while a commit batch is mid-harden can
+    /// therefore trail the true offset by at most that one in-flight batch, and the next scrape absorbs
+    /// it. A window that is quiescent at both ends measures its WAL volume **exactly**.
+    ///
+    /// Monotone by construction: a `wal_durable_len` at or below the fold baseline contributes nothing,
+    /// so a duplicate or out-of-order publish can never inflate or rewind the counter.
+    pub fn publish_wal_bytes_for(&self, db: &str, wal_durable_len: u64) {
+        let c = self.per_db_entry(db);
+        // Single-writer per database (the engine thread), so a plain load/store fold is race-free and
+        // needs no CAS — exactly like the other per-database counters above. `saturating_sub` + the
+        // `> 0` guard make a stale/duplicate publish a no-op rather than an underflow.
+        let last = c.wal_offset_last.load(Ordering::Relaxed);
+        let delta = wal_durable_len.saturating_sub(last);
+        if delta == 0 {
+            return;
+        }
+        c.wal_offset_last.store(wal_durable_len, Ordering::Relaxed);
+        c.wal_bytes_written.fetch_add(delta, Ordering::Relaxed);
+        // The aggregate takes the SAME delta, so the per-database series provably sum to it (`rmp` #463).
+        self.wal_bytes_written.fetch_add(delta, Ordering::Relaxed);
+    }
+
+    /// The cumulative WAL bytes this process has made durable across every database (`rmp` #745).
+    /// Test/inspection accessor for [`publish_wal_bytes_for`](Self::publish_wal_bytes_for)'s aggregate.
+    #[must_use]
+    pub fn wal_bytes_written(&self) -> u64 {
+        self.wal_bytes_written.load(Ordering::Relaxed)
+    }
+
     /// Renders the full registry in Prometheus text-exposition format (v0.0.4).
     ///
     /// The output is a stable, self-describing snapshot: each metric carries its `# HELP` and
@@ -916,6 +1030,15 @@ impl Metrics {
         // remains the fleet-wide observability signal.
         counter(
             &mut out,
+            "graphus_wal_bytes_written_total",
+            "Bytes made durable in the write-ahead logs of all databases since process start — the true \
+             WAL volume, including commit/undo/checkpoint/DDL records, not just user payload. Not reset \
+             by WAL segment reclamation, checkpoints or a STOP/START DATABASE; only by a process restart. \
+             The delta between two scrapes is the WAL volume of that window (rmp #745).",
+            self.wal_bytes_written.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
             "graphus_statement_panics_total",
             "Statements whose execution panicked and was caught at the engine panic boundary (rmp #386).",
             self.statement_panics.load(Ordering::Relaxed),
@@ -1020,6 +1143,21 @@ impl Metrics {
                     "graphus_db_transactions_aborted_total",
                     name,
                     c.aborts.load(Ordering::Relaxed),
+                );
+            }
+            labelled_counter_header(
+                &mut out,
+                "graphus_db_wal_bytes_written_total",
+                "Bytes made durable in this database's write-ahead log since process start — the true \
+                 WAL volume, not just user payload. Not reset by segment reclamation, checkpoints or a \
+                 STOP/START DATABASE; only by a process restart (rmp #745).",
+            );
+            for (name, c) in &per_db {
+                labelled_sample(
+                    &mut out,
+                    "graphus_db_wal_bytes_written_total",
+                    name,
+                    c.wal_bytes_written.load(Ordering::Relaxed),
                 );
             }
             labelled_gauge_header(
@@ -1556,5 +1694,156 @@ mod size_probe {
             0,
             "a 64-byte-aligned struct's size is a multiple of its alignment"
         );
+    }
+}
+
+#[cfg(test)]
+mod wal_volume_tests {
+    use super::*;
+
+    // ---- `rmp` #745: WAL volume counter ----------------------------------------------------------
+
+    /// The fold is a DELTA of the WAL's absolute offset, so the counter equals the bytes written in the
+    /// window — never the raw offset — and the pre-existing on-disk WAL history a database is opened
+    /// with is baselined out rather than counted as freshly-written bytes.
+    #[test]
+    fn wal_bytes_counts_growth_not_the_raw_offset() {
+        let m = Metrics::new();
+        // The engine opens a database whose WAL is already 40 GiB long. Nothing has been written *by
+        // this process* yet, so the counter must read 0.
+        const HISTORY: u64 = 40 * 1024 * 1024 * 1024;
+        m.rebaseline_wal_bytes_for("alpha", HISTORY);
+        assert_eq!(
+            m.wal_bytes_written(),
+            0,
+            "opening a database with an existing WAL history must NOT count that history as bytes \
+             this process wrote"
+        );
+
+        // It then hardens two batches, advancing the log by 1000 then 500 bytes.
+        m.publish_wal_bytes_for("alpha", HISTORY + 1000);
+        m.publish_wal_bytes_for("alpha", HISTORY + 1500);
+        assert_eq!(m.wal_bytes_written(), 1500, "the counter is the GROWTH");
+    }
+
+    /// A duplicate, stale or out-of-order publish is a no-op: it can neither double-count nor rewind.
+    /// (`durable_len` is monotone, but the counter must not *rely* on every caller being ordered.)
+    #[test]
+    fn wal_bytes_publish_is_idempotent_and_never_rewinds() {
+        let m = Metrics::new();
+        m.rebaseline_wal_bytes_for("alpha", 100);
+        m.publish_wal_bytes_for("alpha", 1100);
+        assert_eq!(m.wal_bytes_written(), 1000);
+
+        m.publish_wal_bytes_for("alpha", 1100); // exact duplicate
+        assert_eq!(
+            m.wal_bytes_written(),
+            1000,
+            "a duplicate publish adds nothing"
+        );
+
+        m.publish_wal_bytes_for("alpha", 500); // stale / out-of-order
+        assert_eq!(
+            m.wal_bytes_written(),
+            1000,
+            "a stale publish must NOT rewind the counter (Prometheus counters never decrease) and \
+             must not underflow"
+        );
+
+        m.publish_wal_bytes_for("alpha", 1600); // resumes from the true high-water mark
+        assert_eq!(
+            m.wal_bytes_written(),
+            1500,
+            "after a stale publish the fold must resume from the high-water mark, not from the stale \
+             value (which would double-count the 500..1100 range)"
+        );
+    }
+
+    /// A `STOP`/`START DATABASE` cycle re-baselines at the offset the log was left at, so the counter
+    /// is CONTINUOUS: the restart neither rewinds it nor re-counts the bytes the previous incarnation
+    /// already reported.
+    #[test]
+    fn wal_bytes_survives_a_stop_start_cycle_without_double_counting() {
+        let m = Metrics::new();
+        m.rebaseline_wal_bytes_for("alpha", 100); // incarnation 1 opens
+        m.publish_wal_bytes_for("alpha", 5100); // ...writes 5000 bytes
+        m.publish_wal_bytes_for("alpha", 5300); // ...final flush at shutdown: +200
+        assert_eq!(m.wal_bytes_written(), 5200);
+
+        // STOP, then START. The engine re-opens the SAME log, still at offset 5300.
+        m.rebaseline_wal_bytes_for("alpha", 5300);
+        assert_eq!(
+            m.wal_bytes_written(),
+            5200,
+            "re-opening must not re-count the log's existing 5300 bytes"
+        );
+        m.publish_wal_bytes_for("alpha", 5900); // incarnation 2 writes 600 more
+        assert_eq!(
+            m.wal_bytes_written(),
+            5800,
+            "the counter continues across the restart: 5200 + 600"
+        );
+    }
+
+    /// **The reason the fold is re-baselined rather than a monotone max of the raw offset.** A
+    /// `DROP DATABASE` + `CREATE DATABASE` of the same name gives that name a BRAND-NEW log that restarts
+    /// near offset 0. A monotone-max design would stick at the dropped database's high-water mark and
+    /// silently under-count every byte the new database ever writes — the exact class of one-sided,
+    /// invisible under-count this whole metric exists to eliminate.
+    #[test]
+    fn wal_bytes_recreated_database_keeps_counting() {
+        let m = Metrics::new();
+        m.rebaseline_wal_bytes_for("alpha", 0);
+        m.publish_wal_bytes_for("alpha", 1_000_000); // a long-lived database wrote 1 MB
+        assert_eq!(m.wal_bytes_written(), 1_000_000);
+
+        // DROP + CREATE: same name, fresh log, offset back near zero (just the 8-byte header).
+        m.rebaseline_wal_bytes_for("alpha", 8);
+        m.publish_wal_bytes_for("alpha", 2008); // the new database writes 2000 bytes
+        assert_eq!(
+            m.wal_bytes_written(),
+            1_002_000,
+            "the re-created database's writes MUST still be counted (a monotone-max of the raw offset \
+             would have stuck at 1_000_000 and reported 0 for all of them)"
+        );
+    }
+
+    /// The per-database WAL series sum to the aggregate — the same invariant every other family here
+    /// upholds (`rmp` #463) — and it holds across a reclamation, which moves neither.
+    #[test]
+    fn wal_bytes_per_database_series_sum_to_the_aggregate() {
+        let m = Metrics::new();
+        m.rebaseline_wal_bytes_for("alpha", 0);
+        m.rebaseline_wal_bytes_for("beta", 0);
+        m.publish_wal_bytes_for("alpha", 700);
+        m.publish_wal_bytes_for("beta", 300);
+        // A checkpoint reclaims alpha's sealed segments. The offset does not move, so neither does the
+        // counter — and both keep climbing afterwards.
+        m.publish_wal_bytes_for("alpha", 700); // post-reclaim publish: same offset
+        m.publish_wal_bytes_for("alpha", 900); // ...then more writes
+
+        let alpha = m
+            .per_db_entry("alpha")
+            .wal_bytes_written
+            .load(Ordering::Relaxed);
+        let beta = m
+            .per_db_entry("beta")
+            .wal_bytes_written
+            .load(Ordering::Relaxed);
+        assert_eq!(alpha, 900);
+        assert_eq!(beta, 300);
+        assert_eq!(
+            m.wal_bytes_written(),
+            alpha + beta,
+            "the aggregate must equal the SUM of the per-database series"
+        );
+
+        // Both series and the aggregate are rendered.
+        let text = m.render_prometheus();
+        assert!(text.contains("graphus_wal_bytes_written_total 1200"));
+        assert!(text.contains("graphus_db_wal_bytes_written_total{database=\"alpha\"} 900"));
+        assert!(text.contains("graphus_db_wal_bytes_written_total{database=\"beta\"} 300"));
+        assert!(text.contains("# TYPE graphus_wal_bytes_written_total counter"));
+        assert!(text.contains("# TYPE graphus_db_wal_bytes_written_total counter"));
     }
 }

@@ -64,6 +64,7 @@ Whenever you author, exercise, or validate test scenarios — especially those i
 1. **You are NOT authorized to make decisions on your own.** Whenever the instructions are insufficient, unclear, non-specific, non-concrete, or whenever there are contradictions or ambiguities, you MUST ALWAYS ASK the user how to proceed. When asking the user:
    - Provide multiple options (a, b, c, ...) and clearly state which one is your recommendation.
    - When there are multiple questions (clarifications needed), ask them to the user **sequentially, one at a time**.
+   - **Boundary between acting and asking.** Obvious, low-risk corrections proceed immediately — for example, a pre-existing bug whose fix is unambiguous (see "Self-contained development policy"). Any decision that changes the scope, the expected behavior, the architecture, or the requirements MUST be put to the user before you act on it.
 2. **All project documentation (including CLAUDE.md and other operational documents) MUST be written in English** — flawless English, free of spelling, grammar, and syntax errors. Use clear, simple, unambiguous technical language intended for human readers.
 3. **Documentation MUST be accurate and faithful to the code.**
 4. **The workflow MUST always follow these steps:** Specify → Implement → Test → Document.
@@ -90,6 +91,8 @@ Whenever you find pre-existing bugs, you MUST fix them on the spot and then cont
 
 ## Production-oriented
 
+**EVERY action you take MUST be held to production-grade standards** — development, bug fixes, evaluations, analyses, audits, and anything else. There is no category of work that is exempt.
+
 Throughout the entire work cycle (analysis → planning → development → testing), the goal MUST be that the produced result is **production-grade**. Apply not only your maximum knowledge but also your maximum diligence to ensure that you only ever work toward code that is ready to be used in production.
 
 ## Subagent team
@@ -107,6 +110,8 @@ Graphus is built by a **team**, not by a lone generalist. In addition to your ow
 This complements — and does not replace — the task-execution rule that you MUST determine and delegate to the most appropriate subagent for each task (see "Task execution", step 4).
 
 ## Task planning and execution
+
+**For any operation that involves Tasks or Sprints, you MUST use the `roadmap-manager` skill.** That skill is the interface through which the roadmap is planned, queried, and updated; do not drive the roadmap by any other means.
 
 To plan and coordinate execution, you MUST use the `rmp` tool (a CLI available on the system for roadmap management). Treat this tool as the **single source of truth** for planning and executing this project's tasks; no other means must be used for this purpose.
 
@@ -147,7 +152,11 @@ Whenever possible, you MUST adapt the model and the model's effort level to the 
 
 This rule governs the execution of **tasks** (the units of work tracked in `rmp`). It does not restrict the internal execution of the single task that is currently in progress: within that one task you may still engage several subagents at the same time (see "Subagent team"), because subagents are not roadmap tasks.
 
+**Evaluations and audits may be run in parallel, but ONLY when the user has explicitly authorized it, and ONLY when they are not roadmap tasks.** This covers investigative work such as running several auditor subagents at once inside the single open task, or an ad-hoc evaluation that is not tracked in `rmp`. It NEVER authorizes running two `rmp` tasks concurrently: the "exactly one task in progress" invariant holds without exception, including for tasks whose subject is an audit or an evaluation.
+
 ## Knowledge Graph
+
+**The Knowledge Graph MUST be managed with the help of the `knowledge-authority` skill.** That skill is the empirical source of truth about this project's own contents: use it to bootstrap, query, refresh, and synchronize the graph, and to update it after every commit.
 
 You MUST use the "Graph" features of `rmp` (Groadmap) to create, maintain (update), and query a knowledge graph of the project. This graph **MUST CONTAIN EVERYTHING** that proves useful to know about the project (examples: which features it has; where they are specified; where they are implemented; which tests exist and what they test; which components exist and how they relate; the dependencies between them; in which git commit a feature was specified, implemented, and tested; the rmp tasks; the component tasks; ...) among other information worth mapping.
 

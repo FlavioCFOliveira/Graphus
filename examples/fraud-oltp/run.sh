@@ -351,7 +351,7 @@ EOF
   DETECT_MS=$(( $(_harness_now_ms) - DETECT_START_MS ))
   printf '%s\n' "$DETECT_OUT" | sed 's/^/  /'
   assert "detection found EXACTLY the planted fraud (rings + mules + collusion)" "yes" \
-    "$(printf '%s' "$DETECT_OUT" | grep -q 'GRAPHUS_FRAUD_OK' && echo yes || echo no)"
+    "$(grep -q 'GRAPHUS_FRAUD_OK' <<<"$DETECT_OUT" && echo yes || echo no)"
   sample_peak_rss
 
   DETECT_STATS="$(printf '%s' "$DETECT_OUT" | sed -n 's/^GRAPHUS_STATS //p' | head -n1)"
@@ -393,7 +393,7 @@ EOF
   CONC_MS=$(( $(_harness_now_ms) - CONC_START_MS ))
   printf '%s\n' "$CONC_OUT" | sed 's/^/  /'
   assert "OLTP: ledger reconciles, application progressed, driver retry classified (rmp #612)" "yes" \
-    "$(printf '%s' "$CONC_OUT" | grep -q 'GRAPHUS_CONCURRENCY_OK' && echo yes || echo no)"
+    "$(grep -q 'GRAPHUS_CONCURRENCY_OK' <<<"$CONC_OUT" && echo yes || echo no)"
   sample_peak_rss
 
   CONC_STATS="$(printf '%s' "$CONC_OUT" | sed -n 's/^GRAPHUS_STATS //p' | head -n1)"
@@ -582,7 +582,7 @@ print('yes' if ok else 'no')" 2>/dev/null || echo no)"
         CMP_OUT="$("$CMP_BIN" "$BASELINE" "$EVIDENCE_DIR/report.json" 2>&1)" || true
         printf '%s\n' "$CMP_OUT" | sed 's/^/  /'
         assert "fresh run is within baseline thresholds (structural metrics)" "yes" \
-          "$(printf '%s' "$CMP_OUT" | grep -q 'GRAPHUS_BASELINE_OK' && echo yes || echo no)"
+          "$(grep -q 'GRAPHUS_BASELINE_OK' <<<"$CMP_OUT" && echo yes || echo no)"
       elif [ "$PROFILE" = "fast" ] && [ "$RETRY_MODE" = "0" ]; then
         section "Step 5b — regression gate vs committed baseline: SKIPPED"
         info "FRAUD_RETRY=0 is the pure-contention ISOLATION, a different workload from the committed"
@@ -621,7 +621,7 @@ section "Step 6 — deterministic SSI-contention repro (seed=$DST_SEED)"
 DST_OUT1="$("$DST" --seed "$DST_SEED" --rounds 40 --clients 4 --hot 3 2>&1)" || true
 printf '%s\n' "$DST_OUT1" | sed 's/^/  /'
 assert "DST contention repro passed its SSI invariants" "yes" \
-  "$(printf '%s' "$DST_OUT1" | grep -q 'GRAPHUS_DST_CONTENTION_OK' && echo yes || echo no)"
+  "$(grep -q 'GRAPHUS_DST_CONTENTION_OK' <<<"$DST_OUT1" && echo yes || echo no)"
 
 DST_OUT2="$("$DST" --seed "$DST_SEED" --rounds 40 --clients 4 --hot 3 2>&1)" || true
 assert "DST repro is byte-identical for a fixed seed" "yes" \

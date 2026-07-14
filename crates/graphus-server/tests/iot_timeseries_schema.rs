@@ -10,23 +10,37 @@
 //!
 //! - the new index & constraint kinds are declared and `Online` (`SHOW INDEXES` / `SHOW CONSTRAINTS`):
 //!   a **POINT** (spatial) index on `Sensor.location`, a **composite** node `RANGE` index on
-//!   `Reading(sensor, seq)`, the single-property retention `RANGE` index on `Reading.seq`, a **NODE
-//!   KEY** on `Sensor.id`, a node **property-type** (`Reading.ts IS :: INTEGER`) and a node
-//!   **existence** (`Reading.value IS NOT NULL`) constraint;
+//!   `Reading(sensor, seq)`, the single-property retention `RANGE` index on `Reading.seq`, a `RANGE`
+//!   index on the **temporal** `Reading.ts`, a **NODE KEY** on `Sensor.id`, a node **property-type**
+//!   (`Reading.ts IS :: ZONED DATETIME`) and a node **existence** (`Reading.value IS NOT NULL`)
+//!   constraint;
 //! - the **empirical planner utilisation** (asserted honestly on the real public planner): a Cartesian
 //!   `point.distance(…) <= r` proximity predicate lowers to a **`SpatialIndexSeek`** (the POINT index
 //!   IS used); a per-sensor `sensor = … AND seq ∈ [a, b)` query lowers to a **`NodeIndexSeek` on the
 //!   composite index** (leading-key equality served by the index, the `seq` range kept as a residual);
-//!   `seq IS NOT NULL` lowers to a **`NodeIndexScan`** (the existence-scan path over the retention
-//!   index) while `value IS NOT NULL` — with no `RANGE` index on `value` — stays a correct label
-//!   scan + residual filter;
+//!   a **temporal** `ts ∈ [t0, t1)` window lowers to a **`NodeIndexRangeSeek`** on the `Reading.ts`
+//!   index; `seq IS NOT NULL` lowers to a **`NodeIndexScan`** (the existence-scan path over the
+//!   retention index) while `value IS NOT NULL` — with no `RANGE` index on `value` — stays a correct
+//!   label scan + residual filter;
 //! - the **query correctness** against the loaded engine: the spatial proximity query returns exactly
 //!   the sensors of the queried site; the composite seek returns exactly the readings the
-//!   `(:Sensor)-[:EMITTED]->(:Reading)` traversal returns (a self-validating cross-check); and the
-//!   `value IS NOT NULL` existence scan counts every reading (the constraint guarantees each has one);
+//!   `(:Sensor)-[:EMITTED]->(:Reading)` traversal returns (a self-validating cross-check); the temporal
+//!   window seek returns exactly the readings whose `seq` falls in the equivalent `seq` window (`ts` is
+//!   strictly increasing in `seq`, so the two windows describe the same set — an independent oracle);
+//!   and the `value IS NOT NULL` existence scan counts every reading (the constraint guarantees one);
 //! - **constraint enforcement**: a duplicate `Sensor.id` (NODE KEY), a `Reading` with a missing
-//!   `value` (existence), and a `Reading` with a non-integer `ts` (property-type) are each rejected
-//!   with the constraint-violation error class, and the rejected writes leave the counts unchanged.
+//!   `value` (existence), and a `Reading` whose `ts` is an **INTEGER** or a **STRING** rather than a
+//!   temporal (property-type) are each rejected with the constraint-violation error class, and the
+//!   rejected writes leave the counts unchanged.
+//!
+//! # `rmp` #745 — `ts` is a real temporal
+//!
+//! `Reading.ts` used to be an epoch-ms `INTEGER`, and the schema *forbade* it from being anything else
+//! (`IS :: INTEGER`). A time-series example whose timestamps were integers exercised neither the
+//! Bolt/PackStream temporal wire path, nor the temporal property encoding, nor a temporal index key. It
+//! is now a `ZONED DATETIME`, `RANGE`-indexed, and this test is where that claim is **empirically
+//! verified** against the real engine: the index is `ONLINE` over a `DATETIME` property, the range
+//! predicate over it lowers to a real seek, and the seek returns exactly the right rows.
 //!
 //! Determining the substrate empirically (`rmp` #675 asked): `LocalEngine::run` does **not** accept DDL
 //! strings (admin DDL is intercepted before the Cypher pipeline), but `LocalEngine` fully supports admin
@@ -98,9 +112,10 @@ fn load_schema_first() -> Eng {
     let mut generator = Generator::new(cfg());
     let ddl = generator.schema_ddl();
 
-    // NODE KEY + existence + property-type + POINT + composite + retention = six schema statements.
+    // NODE KEY + existence + property-type + POINT + composite + retention + temporal = seven
+    // schema statements.
     assert!(
-        ddl.len() >= 6,
+        ddl.len() >= 7,
         "expected the full schema DDL block, got {} statements: {ddl:?}",
         ddl.len()
     );
@@ -196,7 +211,24 @@ fn schema_catalog() -> IndexCatalog {
         .with_label_spatial("Sensor", "location")
         .with_label_composite("Reading", ["sensor".to_owned(), "seq".to_owned()])
         .with_label_property("Reading", "seq")
+        .with_label_property("Reading", "ts")
         .build()
+}
+
+/// The `seq` window used by the composite + temporal window assertions, and the `[t0, t1)` instants it
+/// is equivalent to. `ts = EPOCH_MS + seq * TICK_MS` is strictly increasing in `seq`, so a temporal
+/// window over `[ts_of(lo), ts_of(hi))` selects exactly the readings whose `seq` lies in `[lo, hi)` —
+/// an independent oracle for the temporal seek that never consults the temporal query itself.
+const WIN_LO: u64 = 20;
+const WIN_HI: u64 = 60;
+
+/// The Cypher literal for the instant of reading `seq` — a real `DATETIME`, built the same way the
+/// generator's insert stream builds it (`datetime({epochMillis: …})`, no timezone ⇒ UTC, offset 0).
+fn ts_literal(seq: u64) -> String {
+    format!(
+        "datetime({{epochMillis: {}}})",
+        Generator::ts_millis_of(seq)
+    )
 }
 
 /// Compiles `src` into a physical plan against `catalog` (the real public planner pipeline — the closest
@@ -338,6 +370,26 @@ fn schema_first_load_declares_new_index_and_constraint_kinds() {
     );
     assert_eq!(retention[state_c], Value::String("ONLINE".to_owned()));
 
+    // `rmp` #745 — the RANGE index over the TEMPORAL `Reading.ts`. This is the empirical answer to
+    // "does the engine accept a RANGE index over a DATETIME property?": the index built to completion
+    // over 100 readings whose `ts` is a `Value::ZonedDateTime`, and it is ONLINE.
+    let temporal = row_by_name(&idx, "reading_ts");
+    assert_eq!(
+        temporal[type_c],
+        Value::String("RANGE".to_owned()),
+        "the temporal index is an ordinary RANGE index — the key codec orders temporals natively"
+    );
+    assert_eq!(temporal[entity_c], Value::String("NODE".to_owned()));
+    assert_eq!(
+        temporal[props_c],
+        Value::List(vec![Value::String("ts".to_owned())])
+    );
+    assert_eq!(
+        temporal[state_c],
+        Value::String("ONLINE".to_owned()),
+        "a RANGE index over a DATETIME property must build to completion, not stall Populating"
+    );
+
     // ---- SHOW CONSTRAINTS: the NODE KEY + property-type + existence constraints. ----
     let cons = show_constraints(&mut eng);
     let (ctype_c, centity_c, cprops_c, cptype_c) = (
@@ -355,7 +407,7 @@ fn schema_first_load_declares_new_index_and_constraint_kinds() {
         Value::List(vec![Value::String("id".to_owned())])
     );
 
-    let ts_type = row_by_name(&cons, "reading_ts_integer");
+    let ts_type = row_by_name(&cons, "reading_ts_datetime");
     assert_eq!(
         ts_type[ctype_c],
         Value::String("NODE_PROPERTY_TYPE".to_owned())
@@ -367,8 +419,9 @@ fn schema_first_load_declares_new_index_and_constraint_kinds() {
     );
     assert_eq!(
         ts_type[cptype_c],
-        Value::String("INTEGER".to_owned()),
-        "the declared node property type is INTEGER (ts is an epoch-ms i64, never a FLOAT)"
+        Value::String("ZONED DATETIME".to_owned()),
+        "`rmp` #745: ts is a REAL temporal. The old `IS :: INTEGER` did not merely fail to exercise \
+         the temporal path — it FORBADE it"
     );
 
     let value_exists = row_by_name(&cons, "reading_value_exists");
@@ -427,6 +480,42 @@ fn planner_uses_point_and_composite_indexes_and_the_existence_scan() {
         composite.index_dependencies().count(),
         1,
         "the composite query depends on exactly one (the composite) index:\n{composite_render}"
+    );
+
+    // 2b. `rmp` #745 — the TEMPORAL window read. A `ts ∈ [t0, t1)` range over the real `DATETIME`
+    //     property lowers to a `NodeIndexRangeSeek` on the `Reading.ts` RANGE index. This is the query a
+    //     time-series database exists to serve, and the whole reason the index exists.
+    let temporal = plan(
+        &format!(
+            "MATCH (r:Reading) WHERE r.ts >= {} AND r.ts < {} RETURN r.seq",
+            ts_literal(WIN_LO),
+            ts_literal(WIN_HI)
+        ),
+        &cat,
+    );
+    let temporal_render = temporal.to_string();
+    assert!(
+        temporal_render.contains("NodeIndexRangeSeek"),
+        "the temporal window must SEEK the Reading.ts RANGE index:\n{temporal_render}"
+    );
+    // Teeth: with NO index on `ts` the identical statement stays a scan — so the assertion above is
+    // testing the index, not the shape of the plan renderer.
+    let unindexed = IndexCatalog::builder()
+        .with_token_lookup("Reading")
+        .with_label_property("Reading", "seq")
+        .build();
+    let temporal_scan = plan(
+        &format!(
+            "MATCH (r:Reading) WHERE r.ts >= {} AND r.ts < {} RETURN r.seq",
+            ts_literal(WIN_LO),
+            ts_literal(WIN_HI)
+        ),
+        &unindexed,
+    )
+    .to_string();
+    assert!(
+        !temporal_scan.contains("NodeIndexRangeSeek"),
+        "control: with no Reading.ts index the temporal window must NOT be index-backed:\n{temporal_scan}"
     );
 
     // 3. `seq IS NOT NULL` — over the indexed `Reading.seq` — lowers to a `NodeIndexScan` (Graphus's
@@ -548,6 +637,91 @@ fn composite_seek_matches_the_emitted_traversal() {
     );
 }
 
+/// **`rmp` #745 — the empirical proof that a temporal RANGE seek returns the RIGHT rows.**
+///
+/// A plan-shape assertion proves the index is *used*; it cannot prove the index is *right*. An index
+/// that silently returns an empty set (or a truncated one) would satisfy every plan assertion in this
+/// file and every `count(…)`-shaped check in the example — that is exactly the defect class `rmp` #738
+/// exists for. So the temporal window's result set is compared, element by element, against an
+/// independent oracle: `ts = EPOCH_MS + seq * TICK_MS` is strictly increasing in `seq`, so the readings
+/// with `ts ∈ [ts_of(lo), ts_of(hi))` are precisely those with `seq ∈ [lo, hi)`, a set the `seq` index
+/// (or a bare scan) can produce without ever consulting the temporal path.
+#[test]
+fn temporal_window_seek_returns_exactly_the_right_readings() {
+    let mut eng = load_schema_first();
+
+    // The temporal index is genuinely ONLINE over the DATETIME property.
+    {
+        let idx = show_indexes(&mut eng);
+        let state_c = col(&idx, "state");
+        assert_eq!(
+            row_by_name(&idx, "reading_ts")[state_c],
+            Value::String("ONLINE".to_owned()),
+            "a RANGE index over a DATETIME property must reach ONLINE"
+        );
+    }
+
+    let via_temporal = collect_ints(
+        &mut eng,
+        &format!(
+            "MATCH (r:Reading) WHERE r.ts >= {} AND r.ts < {} RETURN r.seq AS seq",
+            ts_literal(WIN_LO),
+            ts_literal(WIN_HI)
+        ),
+    );
+    let via_seq = collect_ints(
+        &mut eng,
+        &format!(
+            "MATCH (r:Reading) WHERE r.seq >= {WIN_LO} AND r.seq < {WIN_HI} RETURN r.seq AS seq"
+        ),
+    );
+
+    // Non-vacuity FIRST: two empty sets are trivially equal, and an index that returns nothing is the
+    // exact failure this test exists to catch. The window is 40 readings wide, and all 100 are live.
+    assert_eq!(
+        via_seq.len() as u64,
+        WIN_HI - WIN_LO,
+        "the oracle must be non-empty, or the comparison below proves nothing"
+    );
+    assert_eq!(
+        via_temporal, via_seq,
+        "the temporal window seek must return EXACTLY the readings of the equivalent seq window"
+    );
+
+    // A half-open window is half-open at BOTH ends: the reading at `WIN_HI` is excluded and the one at
+    // `WIN_LO` is included. An off-by-one in the temporal key encoding shows up precisely here.
+    assert!(via_temporal.contains(&(WIN_LO as i64)));
+    assert!(!via_temporal.contains(&(WIN_HI as i64)));
+
+    // And the stored value really is a temporal — not an integer the engine coerced on the way in.
+    let ticket = eng
+        .begin(graphus_server::engine::command::AccessMode::Read)
+        .expect("begin read");
+    let mut reply = eng
+        .run(
+            ticket,
+            "MATCH (r:Reading) WHERE r.seq = 7 RETURN r.ts AS ts",
+            Vec::new(),
+            false,
+            None,
+        )
+        .expect("query runs");
+    let row = reply.rows.next().expect("row").expect("a reading at seq 7");
+    match row.first() {
+        Some(MaterializedValue::Value(Value::ZonedDateTime(dt))) => {
+            assert_eq!(
+                dt.local.epoch_seconds,
+                (Generator::ts_millis_of(7) / 1000) as i64,
+                "the stored instant is the generated one"
+            );
+            assert_eq!(dt.offset_seconds, 0, "UTC");
+        }
+        other => panic!("Reading.ts must be stored as a ZONED DATETIME, got {other:?}"),
+    }
+    drop(reply);
+    eng.commit(ticket).expect("commit read txn");
+}
+
 #[test]
 fn existence_scan_counts_every_reading() {
     let mut eng = load_schema_first();
@@ -590,26 +764,44 @@ fn schema_enforces_constraints_with_negative_writes() {
         "a duplicate Sensor.id must be a constraint violation, got: {dup}"
     );
 
-    // Node existence: a Reading without a `value` is rejected.
+    // Node existence: a Reading without a `value` is rejected. Its `ts` is a VALID temporal, so the
+    // rejection can only be the existence constraint — a malformed `ts` here would make this test pass
+    // for the wrong reason.
     let missing = expect_rejected(
         &mut eng,
-        "MATCH (s:Sensor {id: 's-0'}) \
-         CREATE (s)-[:EMITTED]->(:Reading {sensor: 's-0', seq: 900000, ts: 1704067200000})",
+        &format!(
+            "MATCH (s:Sensor {{id: 's-0'}}) \
+             CREATE (s)-[:EMITTED]->(:Reading {{sensor: 's-0', seq: 900000, ts: {}}})",
+            ts_literal(0)
+        ),
     );
     assert!(
         missing.contains(CONSTRAINT_VIOLATION_PREFIX),
         "a missing/null Reading.value must be a constraint violation, got: {missing}"
     );
 
-    // Node property-type: a Reading with a non-integer `ts` (a string) is rejected.
-    let wrong_type = expect_rejected(
+    // Node property-type (`rmp` #745): `ts` is a ZONED DATETIME, so a bare epoch-ms INTEGER is now
+    // REJECTED — the exact inverse of the old schema, which forbade the temporal and accepted the
+    // integer. This is the negative check that keeps the temporal type meaningful.
+    let int_ts = expect_rejected(
         &mut eng,
         "MATCH (s:Sensor {id: 's-0'}) \
-         CREATE (s)-[:EMITTED]->(:Reading {sensor: 's-0', seq: 900001, ts: 'noon', value: 1})",
+         CREATE (s)-[:EMITTED]->(:Reading {sensor: 's-0', seq: 900001, ts: 1704067200000, value: 1})",
     );
     assert!(
-        wrong_type.contains(CONSTRAINT_VIOLATION_PREFIX),
-        "a non-integer Reading.ts must be a constraint violation, got: {wrong_type}"
+        int_ts.contains(CONSTRAINT_VIOLATION_PREFIX),
+        "an epoch-ms INTEGER `ts` must now be a constraint violation, got: {int_ts}"
+    );
+
+    // …and so is a string.
+    let string_ts = expect_rejected(
+        &mut eng,
+        "MATCH (s:Sensor {id: 's-0'}) \
+         CREATE (s)-[:EMITTED]->(:Reading {sensor: 's-0', seq: 900002, ts: 'noon', value: 1})",
+    );
+    assert!(
+        string_ts.contains(CONSTRAINT_VIOLATION_PREFIX),
+        "a string Reading.ts must be a constraint violation, got: {string_ts}"
     );
 
     // The rejected writes all rolled back — the sensor + reading counts are unchanged from the load.
@@ -621,6 +813,6 @@ fn schema_enforces_constraints_with_negative_writes() {
     let reading_count = scalar_int(&mut eng, "MATCH (r:Reading) RETURN count(r) AS c");
     assert_eq!(
         reading_count, READINGS as i64,
-        "the two rejected readings created nothing"
+        "the three rejected readings created nothing"
     );
 }

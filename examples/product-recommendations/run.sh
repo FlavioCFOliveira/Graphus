@@ -365,8 +365,8 @@ else
 fi
 LOAD_OUT="$(cat "$LOAD_LOG")"
 assert "graph loaded + every recommendation query well-formed" "yes" \
-  "$(printf '%s' "$LOAD_OUT" | grep -q 'GRAPHUS_RECO_LOAD_OK' && echo yes || echo no)"
-if ! printf '%s' "$LOAD_OUT" | grep -q 'GRAPHUS_RECO_LOAD_OK'; then
+  "$(grep -q 'GRAPHUS_RECO_LOAD_OK' <<<"$LOAD_OUT" && echo yes || echo no)"
+if ! grep -q 'GRAPHUS_RECO_LOAD_OK' <<<"$LOAD_OUT"; then
   echo "${RED}load failed; aborting the concurrency ladder.${RESET}" >&2
   exit 1
 fi
@@ -664,7 +664,7 @@ elif [ "$MODE" = local ] && [ "$PROFILE" = "fast" ] && [ -f "$BASELINE" ] && [ -
   CMP_OUT="$("$CMP_BIN" "$BASELINE" "$EVIDENCE_DIR/report.json" 2>&1)" || true
   printf '%s\n' "$CMP_OUT" | sed 's/^/  /'
   assert "fresh run is within baseline thresholds (structural metrics)" "yes" \
-    "$(printf '%s' "$CMP_OUT" | grep -q 'GRAPHUS_BASELINE_OK' && echo yes || echo no)"
+    "$(grep -q 'GRAPHUS_BASELINE_OK' <<<"$CMP_OUT" && echo yes || echo no)"
 elif [ "$MODE" = external ]; then
   info "regression gate skipped (external attach: the host-independent invariant gate ran in measure_target --assert)."
 elif [ ! -f "$BASELINE" ]; then

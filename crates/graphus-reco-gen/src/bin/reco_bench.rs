@@ -3376,6 +3376,7 @@ mod tests {
             fields: fields.iter().map(|s| (*s).to_string()).collect(),
             records: rows,
             elapsed: Duration::ZERO,
+            ..QueryResult::default()
         }
     }
 

@@ -334,7 +334,7 @@ if [ "$MODE" = "local" ]; then
   VERIFY_OUT="$("$VERIFY" --out-dir "$WORKDIR/verify" 2>&1)" || true
   printf '%s\n' "$VERIFY_OUT" | sed 's/^/  /'
   assert "ciphertext-on-disk + rotation + encrypted-backup proofs passed" "yes" \
-    "$(printf '%s' "$VERIFY_OUT" | grep -q 'GRAPHUS_SECURITY_VERIFY_OK' && echo yes || echo no)"
+    "$(grep -q 'GRAPHUS_SECURITY_VERIFY_OK' <<<"$VERIFY_OUT" && echo yes || echo no)"
   VERIFY_STATS="$(printf '%s' "$VERIFY_OUT" | sed -n 's/^GRAPHUS_STATS //p' | head -n1)"
   V_ROTATION_MS="$(json_field "$VERIFY_STATS" rotation_ms)"
   V_BACKUP_BYTES="$(json_field "$VERIFY_STATS" backup_artifact_bytes)"
@@ -402,7 +402,7 @@ if [ "$RUN_REST" = "1" ] && [ "$MODE" = "external" ]; then
     "${INSECURE_FLAG[@]}" 2>&1)" || true
   printf '%s\n' "$REST_OUT" | sed 's/^/  /'
   assert "REST RBAC/DENY/cross-tenant matrix: every cell held" "yes" \
-    "$(printf '%s' "$REST_OUT" | grep -q 'GRAPHUS_RBAC_OK' && echo yes || echo no)"
+    "$(grep -q 'GRAPHUS_RBAC_OK' <<<"$REST_OUT" && echo yes || echo no)"
   REST_STATS="$(printf '%s' "$REST_OUT" | sed -n 's/^[[:space:]]*GRAPHUS_STATS //p' | head -n1)"
   DENY_SUPPORTED="$(json_field "$REST_STATS" deny_supported)"; [ "$DENY_SUPPORTED" = "true" ] && DENY_FLAG=1
 
@@ -422,7 +422,7 @@ EOF
         "${GRAPHUS_TARGET_USER:-graphus}" "${GRAPHUS_TARGET_PASSWORD:-graphus-local}" "$DENY_FLAG" 2>&1)" || true
       printf '%s\n' "$BOLT_OUT" | sed 's/^/  /'
       assert "Bolt RBAC/cross-tenant matrix: identical decisions held" "yes" \
-        "$(printf '%s' "$BOLT_OUT" | grep -q 'GRAPHUS_BOLT_RBAC_OK' && echo yes || echo no)"
+        "$(grep -q 'GRAPHUS_BOLT_RBAC_OK' <<<"$BOLT_OUT" && echo yes || echo no)"
     else
       info "npm install neo4j-driver failed; skipping the Bolt leg (non-fatal). See $SERVER_LOG"
     fi
@@ -507,7 +507,7 @@ EOF
     --server-pid "$SERVER_PID" --proc-watch "$PROC_WATCH" 2>&1)" || true
   printf '%s\n' "$REST_OUT" | sed 's/^/  /'
   assert "REST RBAC/DENY/cross-tenant matrix: every cell held" "yes" \
-    "$(printf '%s' "$REST_OUT" | grep -q 'GRAPHUS_RBAC_OK' && echo yes || echo no)"
+    "$(grep -q 'GRAPHUS_RBAC_OK' <<<"$REST_OUT" && echo yes || echo no)"
   sample_peak_rss
   REST_STATS="$(printf '%s' "$REST_OUT" | sed -n 's/^[[:space:]]*GRAPHUS_STATS //p' | head -n1)"
   DENY_SUPPORTED="$(json_field "$REST_STATS" deny_supported)"; [ "$DENY_SUPPORTED" = "true" ] && DENY_FLAG=1
@@ -526,7 +526,7 @@ EOF
         "$ADMIN_USER" "$ADMIN_PW" "$DENY_FLAG" 2>&1)" || true
       printf '%s\n' "$BOLT_OUT" | sed 's/^/  /'
       assert "Bolt RBAC/cross-tenant matrix: identical decisions held" "yes" \
-        "$(printf '%s' "$BOLT_OUT" | grep -q 'GRAPHUS_BOLT_RBAC_OK' && echo yes || echo no)"
+        "$(grep -q 'GRAPHUS_BOLT_RBAC_OK' <<<"$BOLT_OUT" && echo yes || echo no)"
       sample_peak_rss
     else
       info "npm install neo4j-driver failed; skipping the Bolt leg (non-fatal). See $SERVER_LOG"
@@ -944,7 +944,7 @@ print('yes' if ok else 'no')" 2>/dev/null || echo no)"
       CMP_OUT="$("$CMP_BIN" "$BASELINE" "$EVIDENCE_DIR/report.json" 2>&1)" || true
       printf '%s\n' "$CMP_OUT" | sed 's/^/  /'
       assert "fresh run is within baseline thresholds (structural metrics)" "yes" \
-        "$(printf '%s' "$CMP_OUT" | grep -q 'GRAPHUS_BASELINE_OK' && echo yes || echo no)"
+        "$(grep -q 'GRAPHUS_BASELINE_OK' <<<"$CMP_OUT" && echo yes || echo no)"
     fi
 
     # Additive server-side /metrics delta (companion), incl. the auth-failure signal.

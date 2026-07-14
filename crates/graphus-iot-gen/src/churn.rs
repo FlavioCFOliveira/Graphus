@@ -253,6 +253,11 @@ fn apply_schema(coord: &mut Coord) {
     coord
         .begin_online_node_property_index_named(Some("reading_seq"), "Reading", "seq", true)
         .expect("create RANGE index on Reading.seq");
+    // RANGE index on the TEMPORAL Reading.ts — the `ts ∈ [t0, t1)` window read's seek key (`rmp` #745).
+    // The RANGE key codec orders `Value::ZonedDateTime` natively, so this is a real temporal index.
+    coord
+        .begin_online_node_property_index_named(Some("reading_ts"), "Reading", "ts", true)
+        .expect("create RANGE index on the temporal Reading.ts");
     // NODE KEY on Sensor.id (present + unique).
     coord
         .create_constraint_general(
@@ -273,16 +278,16 @@ fn apply_schema(coord: &mut Coord) {
             None,
         )
         .expect("create existence constraint on Reading.value");
-    // Property-type: Reading.ts is an epoch-ms INTEGER.
+    // Property-type: Reading.ts is a real temporal (`ZONED DATETIME`), never a bare epoch-ms integer.
     coord
         .create_constraint_general(
-            "reading_ts_integer",
+            "reading_ts_datetime",
             "Reading",
             &["ts"],
             ConstraintKind::PropertyType,
-            Some(ConstraintTypeDescriptor::Integer),
+            Some(ConstraintTypeDescriptor::ZonedDateTime),
         )
-        .expect("create property-type constraint on Reading.ts");
+        .expect("create property-type constraint on the temporal Reading.ts");
 
     // `rmp` #694 — DRIVE THE ONLINE INDEX BUILDS TO COMPLETION.
     //
@@ -580,6 +585,33 @@ mod tests {
         assert!(
             planned.contains("Index"),
             "the per-sensor windowed read must be index-backed; planned as:\n{planned}"
+        );
+    }
+
+    /// **`rmp` #745.** The TEMPORAL window read — `ts ∈ [t0, t1)` over a real `DATETIME` property — must
+    /// SEEK the `Reading.ts` RANGE index, not scan every reading. This is the query a time-series
+    /// database exists to serve, and until #745 the schema *forbade* `ts` from being a temporal at all
+    /// (`IS :: INTEGER`), so neither the index nor the Bolt temporal path was ever exercised.
+    #[test]
+    fn the_temporal_window_read_seeks_the_reading_ts_range_index() {
+        const WINDOW: &str = "MATCH (r:Reading) \
+             WHERE r.ts >= datetime({epochMillis: 1704067200000}) \
+               AND r.ts < datetime({epochMillis: 1704067260000}) \
+             RETURN r.seq";
+
+        let catalog = schema_catalog();
+        let planned = plan_shape(WINDOW, &catalog);
+        assert!(
+            planned.contains("NodeIndexRangeSeek"),
+            "the temporal window read must SEEK the Reading.ts RANGE index; planned as:\n{planned}"
+        );
+
+        // Teeth: with an EMPTY catalog the same statement degrades to a scan, so the assertion above is
+        // testing the index and not merely the shape of the plan renderer.
+        let unplanned = plan_shape(WINDOW, &IndexCatalog::empty());
+        assert!(
+            !unplanned.contains("NodeIndexRangeSeek"),
+            "control: with no index the temporal window read must NOT be index-backed:\n{unplanned}"
         );
     }
 

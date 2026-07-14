@@ -231,7 +231,7 @@ section "Step 2 — lossless import -> dump -> re-import round-trip (real graphu
 ROUNDTRIP_OUT="$("$ROUNDTRIP" --bulk-bin "$BULK" --data-dir "$DATA_DIR" 2>&1)" || true
 printf '%s\n' "$ROUNDTRIP_OUT" | sed 's/^/  /'
 assert "round-trip is lossless (content hash preserved)" "yes" \
-  "$(printf '%s' "$ROUNDTRIP_OUT" | grep -q 'GRAPHUS_BULK_ROUNDTRIP_OK' && echo yes || echo no)"
+  "$(grep -q 'GRAPHUS_BULK_ROUNDTRIP_OK' <<<"$ROUNDTRIP_OUT" && echo yes || echo no)"
 RT_LINE="$(printf '%s' "$ROUNDTRIP_OUT" | sed -n 's/^GRAPHUS_BULK_ROUNDTRIP_OK //p' | head -n1)"
 CONTENT_HASH="$(kv "$RT_LINE" content_hash)"
 assert "round-trip reports the original node count" "$NODE_COUNT" "$(kv "$RT_LINE" nodes)"
@@ -328,7 +328,7 @@ if [ "$PROFILE" = "default" ] && [ -f "$BASELINE" ] && [ -f "$EVIDENCE_DIR/repor
   CMP_OUT="$("$CMP_BIN" "$BASELINE" "$EVIDENCE_DIR/report.json" 2>&1)" || true
   printf '%s\n' "$CMP_OUT" | sed 's/^/  /'
   assert "fresh run is within baseline thresholds (structural metrics)" "yes" \
-    "$(printf '%s' "$CMP_OUT" | grep -q 'GRAPHUS_BASELINE_OK' && echo yes || echo no)"
+    "$(grep -q 'GRAPHUS_BASELINE_OK' <<<"$CMP_OUT" && echo yes || echo no)"
 else
   section "Step 5 — baseline gate SKIPPED (profile=$PROFILE; the committed baseline is a 'default'-profile run)"
   info "a baseline can only gate the workload it was captured from — comparing a $PROFILE run against"
@@ -618,7 +618,7 @@ EOF
     # 5. Bring the loaded database online (Mode A leaves it Offline).
     START_RESP="$(harness_target_query "$(_harness_target_system_db)" "START DATABASE $WIRE_DB" || true)"
     assert "START DATABASE brought the loaded DB online" "yes" \
-      "$(printf '%s' "$START_RESP" | grep -q '"results"' && echo yes || echo no)"
+      "$(grep -q '"results"' <<<"$START_RESP" && echo yes || echo no)"
 
     # 6. Query the online database: row counts must equal the manifest.
     CN="$(wire_jolt_int "$(harness_target_query "$WIRE_DB" "MATCH (n) RETURN count(n) AS c" || true)")"
@@ -643,7 +643,7 @@ EOF
     SCHEMA_OK=0
     for stmt in "${SCHEMA_STMTS[@]}"; do
       R="$(harness_target_query "$WIRE_DB" "$stmt" 2>/dev/null || true)"
-      if printf '%s' "$R" | grep -q '"results"'; then
+      if grep -q '"results"' <<<"$R"; then
         SCHEMA_OK=$((SCHEMA_OK + 1))
       else
         info "online DDL not accepted by this server (version-tolerant, non-fatal): $stmt"
