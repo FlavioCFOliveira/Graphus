@@ -9,43 +9,68 @@ Each decision is a `Decision` node in the Knowledge Graph (status `open`) with a
 to the domain/component it constrains. On ratification, the chosen option is recorded on the node
 and its status set to `ratified`.
 
-> **Status: all 24 decisions ratified on 2026-06-05.** The chosen option is recorded on each
-> `Decision` node (`status: ratified`, property `chosen`). The ratified outcomes are summarized in
-> the next section; the options tables below are kept for the rationale and trade-offs.
+> **Status: all 24 decisions of the original 2026-06-05 round are ratified.** The chosen option is
+> recorded on each `Decision` node (`status: ratified`, property `chosen`). Seven further decisions
+> were ratified after that round; they are recorded in the same index below, each carrying its own
+> ratification date. The register therefore holds **31 decisions** in total. The decision index in
+> the next section is the canonical enumeration; the options tables below it are kept for the
+> rationale and trade-offs, and are not a decision list.
 
 Legend: ★ = recommended option.
 
-## Ratified outcomes (2026-06-05)
+## Decision index (canonical)
 
-| ID | Ratified choice |
-| --- | --- |
-| D-cypher-line | openCypher 2024.x line, feature-flagged; certify the M-series milestone first; pin a tagged commit |
-| D-tck-harness | Rust `cucumber` crate for CI + periodic JVM `tck-api` as ground-truth oracle |
-| D-element-id | Internal compact physical IDs + a stable, never-reused public element ID (ULID/UUIDv7) |
-| D-temporal-spatial | All temporal types in v1; spatial `POINT` deferred to a later phase |
-| D-concurrency-control | MVCC + Serializable Snapshot Isolation (SSI) |
-| D-isolation-level | Serializable (SSI) default; Snapshot Isolation as an opt-in documented mode |
-| D-durability-mode | Group commit + `fdatasync` default; per-transaction synchronous available; torn-write protection + page checksums + PANIC-on-fsync-failure |
-| D-buffer-mgmt | Custom self-managed buffer pool (not pure `mmap`) |
-| **D-storage-arch** | **Custom record store with index-free adjacency from day one; transactional + recovery layer built in-house** *(override of recommended staged-hybrid; raises storage-correctness risk — reinforces DST)* |
-| D-runtime-model | Hybrid: Tokio multi-thread baseline + a sharded write/ACID path (validate on a traversal-heavy benchmark) |
-| D-io-backend | Portable epoll/kqueue baseline + optional io_uring fast path on Linux with runtime fallback |
-| D-allocator | System allocator first; adopt mimalloc/jemalloc only with per-target before/after benchmarks |
-| D-target-matrix | Linux x86_64 + aarch64 and macOS aarch64 as Tier 1 tested; 64-bit only; CI on x86 + aarch64 |
-| **D-wire-protocol** | **Adopt Neo4j Bolt directly as the UDS wire protocol (PackStream)** *(override of recommended custom protocol)* |
-| **D-bolt-compat** | **Add a Bolt TCP listener (`bolt://`) for the Neo4j driver ecosystem — a third network interface beyond the originally-stated UDS + REST** *(override; requires TLS + network security for the Bolt TCP endpoint)* |
-| D-serialization | Typed JSON (Jolt-style) for REST + CBOR via negotiation; PackStream for Bolt (UDS + TCP); fix int53 from day one |
-| D-auth-scheme | UDS `SO_PEERCRED` + socket perms; REST Bearer/JWT over TLS + RBAC; Bolt TCP native auth over TLS; shared RBAC |
-| D-v1-topology | Single-node only in v1, clustering-ready internal interfaces |
-| D-v1-index-types | Token-lookup + range/B-tree + composite (incl. relationship-property) indexes in v1 |
-| **D-graph-algos** | **Full GDS-style graph-algorithms library (centrality, community detection, similarity, embeddings, in-memory projection engine)** *(override of recommended native-only; a large dedicated workstream/phase orthogonal to the ACID/TCK core)* |
-| D-multi-db | Single database in v1; catalog abstraction (catalog→schema→graph) designed in |
-| D-vector-index | Out of scope for v1; deferred to a later phase |
-| D-security-scope | Auth + RBAC + TLS (REST + Bolt) + user/role management in v1; fine-grained access control / encryption-at-rest / auditing in Phase 2 |
-| D-dst-investment | Scaffold a deterministic simulation testing harness from the start with fault injection |
-| **D-vopr** | **External, totally-deterministic VOPR simulator: drive the REAL Bolt/PackStream + REST protocol stacks and the REAL engine over a SIMULATED transport + clock + disk (seed-reproducible), with misbehaved-client / fault / load coverage and four oracles (ref-model, Elle isolation, invariants/liveness, crash-durability)** *(extends D-dst-investment to the connectivity/protocol layer; "external" = real protocols, no backdoor, over an in-memory transport — not real OS sockets. See `07-dst-simulator.md`.)* |
-| **D-read-parallelism** | **DEFER read-query parallelism for single-node production; keep the single-writer-thread engine model.** Lock-free snapshot reads are the long-term direction, but parallelizing reads is a large, high-risk change to the inviolable ACID guarantees, gated on a prerequisite migration. *(Post-ratification, sprint 19, 2026-06-15. Accepted-as-is; tracked as rmp #146. See note below.)* |
-| **D-perf-deferrals** | **DEFER three higher-risk efficiency optimizations (per-commit catalog write, per-row slot model, streaming SHOW INDEXES/CONSTRAINTS).** Each is either a durability/identity risk, a TCK-correctness-sensitive executor rewrite, or a negligible-benefit change. *(Post-ratification, sprint 19, 2026-06-15. Accepted-as-is; tracked as rmp #159. See note below.)* |
+This section is the **single canonical enumeration of every decision in this register**. Each
+decision has exactly one row here, and every row carries the decision's key, its status, the date it
+was ratified, and the ratified choice. A tool that needs the list of decisions MUST read this table
+and only this table: keys mentioned in the prose, in the options tables, or in the notes below are
+cross-references, not entries.
+
+Parse contract, to be preserved by any future edit:
+
+- The table lies between the `decision-index` begin and end markers below.
+- Every row is one decision. The `ID` cell holds the decision key alone, in backticks.
+- `Status` is exactly one of `ratified` or `open`.
+- `Ratified on` is an ISO-8601 date (`YYYY-MM-DD`), or `—` when the status is `open`.
+- Adding, retiring, or re-ratifying a decision means editing this table.
+
+<!-- BEGIN decision-index -->
+
+| ID | Status | Ratified on | Ratified choice |
+| --- | --- | --- | --- |
+| `D-cypher-line` | ratified | 2026-06-05 | openCypher 2024.x line, feature-flagged; certify the M-series milestone first; pin a tagged commit |
+| `D-tck-harness` | ratified | 2026-06-05 | Rust `cucumber` crate for CI + periodic JVM `tck-api` as ground-truth oracle |
+| `D-element-id` | ratified | 2026-06-05 | Internal compact physical IDs + a stable, never-reused public element ID (ULID/UUIDv7) |
+| `D-temporal-spatial` | ratified | 2026-06-05 | All temporal types in v1; spatial `POINT` deferred to a later phase |
+| `D-concurrency-control` | ratified | 2026-06-05 | MVCC + Serializable Snapshot Isolation (SSI) |
+| `D-isolation-level` | ratified | 2026-06-05 | Serializable (SSI) default; Snapshot Isolation as an opt-in documented mode |
+| `D-durability-mode` | ratified | 2026-06-05 | Group commit + `fdatasync` default; per-transaction synchronous available; torn-write protection + page checksums + PANIC-on-fsync-failure |
+| `D-buffer-mgmt` | ratified | 2026-06-05 | Custom self-managed buffer pool (not pure `mmap`) |
+| `D-storage-arch` | ratified | 2026-06-05 | **Custom record store with index-free adjacency from day one; transactional + recovery layer built in-house** *(override of recommended staged-hybrid; raises storage-correctness risk — reinforces DST)* |
+| `D-runtime-model` | ratified | 2026-06-05 | Hybrid: Tokio multi-thread baseline + a sharded write/ACID path (validate on a traversal-heavy benchmark) |
+| `D-io-backend` | ratified | 2026-06-05 | Portable epoll/kqueue baseline + optional io_uring fast path on Linux with runtime fallback |
+| `D-allocator` | ratified | 2026-06-05 | System allocator first; adopt mimalloc/jemalloc only with per-target before/after benchmarks |
+| `D-target-matrix` | ratified | 2026-06-05 | Linux x86_64 + aarch64 and macOS aarch64 as Tier 1 tested; 64-bit only; CI on x86 + aarch64 |
+| `D-wire-protocol` | ratified | 2026-06-05 | **Adopt Neo4j Bolt directly as the UDS wire protocol (PackStream)** *(override of recommended custom protocol)* |
+| `D-bolt-compat` | ratified | 2026-06-05 | **Add a Bolt TCP listener (`bolt://`) for the Neo4j driver ecosystem — a third network interface beyond the originally-stated UDS + REST** *(override; requires TLS + network security for the Bolt TCP endpoint)* |
+| `D-serialization` | ratified | 2026-06-05 | Typed JSON (Jolt-style) for REST + CBOR via negotiation; PackStream for Bolt (UDS + TCP); fix int53 from day one |
+| `D-auth-scheme` | ratified | 2026-06-05 | UDS `SO_PEERCRED` + socket perms; REST Bearer/JWT over TLS + RBAC; Bolt TCP native auth over TLS; shared RBAC |
+| `D-v1-topology` | ratified | 2026-06-05 | Single-node only in v1, clustering-ready internal interfaces |
+| `D-v1-index-types` | ratified | 2026-06-05 | Token-lookup + range/B-tree + composite (incl. relationship-property) indexes in v1 |
+| `D-graph-algos` | ratified | 2026-06-05 | **Full GDS-style graph-algorithms library (centrality, community detection, similarity, embeddings, in-memory projection engine)** *(override of recommended native-only; a large dedicated workstream/phase orthogonal to the ACID/TCK core)* |
+| `D-multi-db` | ratified | 2026-06-05 | Single database in v1; catalog abstraction (catalog→schema→graph) designed in |
+| `D-vector-index` | ratified | 2026-06-05 | Out of scope for v1; deferred to a later phase |
+| `D-security-scope` | ratified | 2026-06-05 | Auth + RBAC + TLS (REST + Bolt) + user/role management in v1; fine-grained access control / encryption-at-rest / auditing in Phase 2 |
+| `D-dst-investment` | ratified | 2026-06-05 | Scaffold a deterministic simulation testing harness from the start with fault injection |
+| `D-vopr` | ratified | 2026-06-14 | **External, totally-deterministic VOPR simulator: drive the REAL Bolt/PackStream + REST protocol stacks and the REAL engine over a SIMULATED transport + clock + disk (seed-reproducible), with misbehaved-client / fault / load coverage and four oracles (ref-model, Elle isolation, invariants/liveness, crash-durability)** *(extends `D-dst-investment` to the connectivity/protocol layer; "external" = real protocols, no backdoor, over an in-memory transport — not real OS sockets. See `07-dst-simulator.md`.)* |
+| `D-read-parallelism` | ratified | 2026-06-15 | **DEFER read-query parallelism for single-node production; keep the single-writer-thread engine model.** Lock-free snapshot reads are the long-term direction, but parallelizing reads is a large, high-risk change to the inviolable ACID guarantees, gated on a prerequisite migration. *(Post-ratification, sprint 19. Accepted-as-is; tracked as rmp #146. See note below.)* |
+| `D-perf-deferrals` | ratified | 2026-06-15 | **DEFER three higher-risk efficiency optimizations (per-commit catalog write, per-row slot model, streaming SHOW INDEXES/CONSTRAINTS).** Each is either a durability/identity risk, a TCK-correctness-sensitive executor rewrite, or a negligible-benefit change. *(Post-ratification, sprint 19. Accepted-as-is; tracked as rmp #159. See note below.)* |
+| `D-bulk-import-network` | ratified | 2026-07-01 | **Network bulk import over a dedicated REST streaming-upload endpoint**, reusing the existing local CSV / `.gcol` payload formats, gated by the global `Admin` privilege, with per-batch commit plus mandatory crash-consistent session resumability. Both **Mode A** (fresh/empty database, exclusive `Loading` lifecycle state) and **Mode B** (already-live, already-serving database; every batch a first-class, SSI-participating transaction) are in scope. *(Override on the target-database-scope facet: the owner added the non-recommended option (b) on top of (a). Mode B is gated on a prerequisite `graphus-bulk` fix.)* Facet table in the "Ratified decision (2026-07-01)" section below; full design in `08-network-bulk-import.md`. |
+| `D-hw-autotune` | ratified | 2026-07-08 | **Hardware-aware startup auto-tuning:** the `0 = auto` sentinel plus a strict precedence — operator configuration > hardware-derived value > built-in floor — adopted project-wide; auto `buffer_pool_pages = clamp( floor(0.125 × available_RAM_bytes ÷ 8192), 4096, 262144 )`; all OS-specific and `unsafe` probing isolated in the `graphus-sysres` leaf crate so `graphus-server` stays `#![forbid(unsafe_code)]`. Detected storage capacity/free space and the SSD-versus-rotational hint are logged only, and drive no automatic parameter change in this cut. Facet table in the "Ratified decision (2026-07-08)" section below; design in `04-technical-design.md` §9.5. |
+| `D-named-index-autoname` | ratified | 2026-07-08 | **Anonymous and legacy `CREATE INDEX ON :Label(property)` forms take a deterministic, stable auto-name of the form `index_<label>_<property>`** — a pure function of the label and property tokens — disambiguated by a deterministic token suffix and, if needed, a counter, until the name is free in every schema catalog; the resolved name is then persisted durably. Completes the already-ratified core requirement `FR-IX-15` under `D-v1-index-types` option (a); no ratified outcome changes. See the "Post-ratification note (2026-07-08)" below; design in `04-technical-design.md` §6.8. |
+| `D-query-prefixes` | ratified | 2026-07-14 | **`EXPLAIN` plans a statement without executing it; `PROFILE` executes it and annotates the plan with measured per-operator counters; exactly one of `plan` / `profile` is ever emitted.** `dbHits` is Graphus's own measured quantity, not a reproduction of Neo4j's DbHit accounting; unmeasured counters (per-operator time, page-cache counters) are omitted rather than fabricated — this supersedes the "timing" wording of `FR-QL-13`; a `PROFILE`d statement runs serially; the planner's cardinality estimate is reported on the root only. Completes the already-ratified core requirement `FR-QL-13`; no ratified outcome changes. See the "Post-ratification note (2026-07-14)" below; design in `04-technical-design.md` §7.8 and `06-bolt-and-error-shapes.md` §3.1. |
+
+<!-- END decision-index -->
 
 **Four owner overrides of the recommendation** (recorded with a `note` on their KG nodes) reshape the
 scope and are propagated into `00-overview.md` and `01-needs-survey.md`:
@@ -257,6 +282,14 @@ phase).
 The verbatim result/failure shapes and the error-classification table were read and frozen by
 SPIKE #9 (`06-bolt-and-error-shapes.md` §2–§3; resolves open question 2 and `04-technical-design.md`
 §12 item 13).
+
+## Options and rationale (not the canonical list)
+
+This table records the options that were weighed and the recommendation made for each decision, so
+that the reasoning behind a ratified outcome stays available. It is **not** the decision list: it
+predates the later decisions and does not enumerate them. The ratified outcome of every decision is
+in the "Decision index (canonical)" section above, which is the only place a tool should read the
+decision list from.
 
 | ID | Decision | Options | Affects |
 | --- | --- | --- | --- |

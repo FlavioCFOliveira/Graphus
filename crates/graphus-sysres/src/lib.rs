@@ -1,7 +1,7 @@
 //! `graphus-sysres` — best-effort probes of the host's hardware resources.
 //!
 //! Graphus is engineered to extract the fullest possible throughput from the machine it runs on
-//! (see `specification/01-functional-requirements.md` on parallelism and resource efficiency). To
+//! (see `specification/01-needs-survey.md`, FR-AR-6 hardware adaptivity). To
 //! do that, the server must *size itself* to the real hardware — the number of worker threads, the
 //! buffer-pool budget, checkpoint cadence, and so on — rather than to fixed compile-time constants.
 //! This crate is the small, separately-auditable leaf that answers three questions about the host:
