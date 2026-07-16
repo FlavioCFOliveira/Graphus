@@ -425,23 +425,44 @@ impl VectorIndex {
     /// If `id` is already present its old vector is removed first (**last write wins**), so this is
     /// also the in-place `update` primitive — see [`VectorIndex::update`].
     ///
+    /// Returns whether the embedding actually **changed** — `id` was present before AND its new
+    /// (prepared) vector differs from the old. A brand-new `id` (a pure insert) and an *unchanged*
+    /// re-index (e.g. the wholesale [`reindex_node`](crate::record_graph) a write of an UNRELATED
+    /// property triggers, re-inserting the same embedding) both return `Ok(false)`. The shared full-text/
+    /// spatial freshness-marker machinery (`rmp` task #756) uses this to poison the marker on rollback
+    /// ONLY for a real change: a rolled-back change can drop a still-committed node from the graph (a
+    /// false negative), whereas a rolled-back pure insert or unchanged re-index leaves the committed
+    /// entry exactly as it should be.
+    ///
     /// # Errors
     ///
     /// Returns [`VectorIndexError::DimensionMismatch`] if `vector.len() != self.dim()`.
-    pub fn insert(&mut self, id: u64, vector: &[f32]) -> Result<(), VectorIndexError> {
+    pub fn insert(&mut self, id: u64, vector: &[f32]) -> Result<bool, VectorIndexError> {
         if vector.len() != self.dim {
             return Err(VectorIndexError::DimensionMismatch {
                 expected: self.dim,
                 got: vector.len(),
             });
         }
+        let prepared = self.prepare_vector(vector);
+        // Did the embedding actually change? Present before AND the prepared vector differs. An unchanged
+        // re-index reports `false` so it does not poison the shared marker on rollback (`rmp` task #756).
+        let changed = match self.id_to_slot.get(&id) {
+            Some(&old_slot) => {
+                self.slab[old_slot as usize]
+                    .as_ref()
+                    .expect("INVARIANT: id_to_slot points at a live slot")
+                    .vector
+                    != prepared
+            }
+            None => false,
+        };
         // Last-wins: drop any prior version so the graph never holds two entries for one id.
         if self.id_to_slot.contains_key(&id) {
             self.remove(id);
         }
 
         let level = self.random_level();
-        let prepared = self.prepare_vector(vector);
         let slot = self.alloc_slot(Element {
             id,
             vector: prepared,
@@ -455,7 +476,7 @@ impl VectorIndex {
                 // First element becomes the entry point.
                 self.entry = Some(slot);
                 self.max_layer = level;
-                return Ok(());
+                return Ok(changed);
             }
             Some(e) => e,
         };
@@ -502,15 +523,16 @@ impl VectorIndex {
             self.max_layer = level;
             self.entry = Some(slot);
         }
-        Ok(())
+        Ok(changed)
     }
 
     /// Updates the embedding for `id` (an alias for [`VectorIndex::insert`], which is last-wins).
+    /// Returns whether the embedding actually changed (see [`VectorIndex::insert`]).
     ///
     /// # Errors
     ///
     /// Returns [`VectorIndexError::DimensionMismatch`] if `vector.len() != self.dim()`.
-    pub fn update(&mut self, id: u64, vector: &[f32]) -> Result<(), VectorIndexError> {
+    pub fn update(&mut self, id: u64, vector: &[f32]) -> Result<bool, VectorIndexError> {
         self.insert(id, vector)
     }
 
@@ -1295,6 +1317,32 @@ mod tests {
         assert!(
             build < std::time::Duration::from_secs(60),
             "build regressed badly: {build:?}"
+        );
+    }
+
+    /// `rmp` #756: `insert` must report whether the embedding actually CHANGED — a pure insert and an
+    /// UNCHANGED re-insert both return `Ok(false)`; only a real change returns `Ok(true)`. This lets an
+    /// aborted write that re-indexes an unchanged embedding (a wholesale re-index driven by an unrelated
+    /// property write) avoid poisoning the shared full-text/spatial marker, while a rolled-back real
+    /// change (a false-negative risk) poisons.
+    #[test]
+    fn insert_reports_whether_the_embedding_actually_changed_756() {
+        let mut idx = VectorIndex::new(3, Similarity::Euclidean, 16, 200, 42).expect("dim > 0");
+        assert!(
+            !idx.insert(1, &[1.0, 0.0, 0.0]).expect("insert"),
+            "first insert of an id is a pure insert, not a change"
+        );
+        assert!(
+            !idx.insert(1, &[1.0, 0.0, 0.0]).expect("insert"),
+            "re-inserting the SAME embedding is NOT a change (rmp #756)"
+        );
+        assert!(
+            idx.insert(1, &[0.0, 1.0, 0.0]).expect("insert"),
+            "re-inserting a DIFFERENT embedding is a change"
+        );
+        assert!(
+            !idx.insert(2, &[0.0, 0.0, 1.0]).expect("insert"),
+            "a different new id is a pure insert, not a change"
         );
     }
 }

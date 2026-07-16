@@ -251,18 +251,42 @@ pub struct IndexSet {
     /// gate stays `u64::MAX` until **all** concurrent full-text/spatial mutators have retired — the
     /// property a single committed transaction's commit-ts cannot provide on its own.
     ft_spatial_inflight: BTreeSet<TxnId>,
-    /// Whether a full-text/spatial mutator **rolled back**, possibly leaving the in-memory index with
-    /// stale postings the query-time re-check cannot repair (`rmp` task #467). A rolled-back *replace*
-    /// or *delete* can drop a still-committed node from a posting it should occupy (a false negative
-    /// the re-check cannot resurrect — unlike a rolled-back *insert*, which leaves only a re-check-
-    /// filterable false positive). Because the in-memory index is **not** transactional (an abort
-    /// rolls back only the durable store, not these structures — see the `rmp` #410 note on
-    /// [`seek_bitmap_eq`](Self::seek_bitmap_eq)), the only provably-correct response is to force every
-    /// reader onto the always-correct scan path until the index is rebuilt to committed state. So this
-    /// pins [`effective_ft_spatial_marker`](Self::effective_ft_spatial_marker) at `u64::MAX` until a
-    /// full [`reset_ft_spatial_marker`](Self::reset_ft_spatial_marker) (driven by the coordinator's
+    /// The subset of [`ft_spatial_inflight`](Self#structfield.ft_spatial_inflight) transactions that
+    /// have **removed or replaced** at least one covered full-text/spatial posting — i.e. dropped an
+    /// entry a still-committed node might need (`rmp` task #756). This is the discriminator that makes
+    /// the rollback poison **conditional**: only a rolled-back *remove/replace* can drop a still-
+    /// committed node from a posting it should occupy (a false negative the query-time re-check cannot
+    /// resurrect), whereas a rolled-back pure *insert* leaves only a re-check-filterable false positive.
+    ///
+    /// A transaction is recorded here by [`note_ft_spatial_mutator`](Self::note_ft_spatial_mutator)
+    /// (the statement seam) whenever a mutation actually *dropped or changed a pre-existing posting* —
+    /// signalled by the transient
+    /// [`ft_spatial_removed_dirty`](Self#structfield.ft_spatial_removed_dirty) flag, which the structural
+    /// mutation methods raise **only** when the underlying `remove` / `remove_document` reported a real
+    /// removal, or when a last-wins `index_*` reported the value actually **changed** (a different value,
+    /// NOT an unchanged re-index — e.g. the wholesale re-index a write of an unrelated property triggers,
+    /// which leaves the covered posting identical and must not poison on rollback). It is removed
+    /// by [`commit_ft_spatial_marker`](Self::commit_ft_spatial_marker) (a committed remove/replace is
+    /// correctly reflected — no poison) and by
+    /// [`rollback_ft_spatial_marker`](Self::rollback_ft_spatial_marker) (which poisons iff the retiring
+    /// txn is present here). By construction this is a subset of `ft_spatial_inflight` (every removal is
+    /// also a posting change, so a remover is always also an in-flight mutator).
+    ft_spatial_removers: BTreeSet<TxnId>,
+    /// Whether a full-text/spatial mutator **rolled back after removing or replacing a covered posting**,
+    /// possibly leaving the in-memory index with stale postings the query-time re-check cannot repair
+    /// (`rmp` tasks #467, #756). A rolled-back *replace* or *delete* can drop a still-committed node from
+    /// a posting it should occupy (a false negative the re-check cannot resurrect — unlike a rolled-back
+    /// *insert*, which leaves only a re-check-filterable false positive, so it does **not** set this).
+    /// Because the in-memory index is **not** transactional (an abort rolls back only the durable store,
+    /// not these structures — see the `rmp` #410 note on [`seek_bitmap_eq`](Self::seek_bitmap_eq)), the
+    /// only provably-correct response is to force every reader onto the always-correct scan path until the
+    /// index is rebuilt to committed state. So this pins
+    /// [`effective_ft_spatial_marker`](Self::effective_ft_spatial_marker) at `u64::MAX` until a full
+    /// [`reset_ft_spatial_marker`](Self::reset_ft_spatial_marker) (driven by the coordinator's
     /// store-consistent rebuild) clears it. Conservative (it disables the fast path after a full-text/
-    /// spatial-mutating rollback) but never returns a wrong answer.
+    /// spatial-mutating rollback that dropped a posting) but never returns a wrong answer. It is set only
+    /// via [`rollback_ft_spatial_marker`](Self::rollback_ft_spatial_marker) (a rolled-back remover) or
+    /// [`poison_ft_spatial_marker`](Self::poison_ft_spatial_marker) (a faulted rebuild, `rmp` #733).
     ft_spatial_poisoned: bool,
     /// Whether the **label** [`TokenIndex`] ([`labels`](Self#structfield.labels)) may be trusted as the
     /// authoritative candidate source for a label scan (`rmp` task #733).
@@ -341,6 +365,21 @@ pub struct IndexSet {
     /// `TxnId`, so they cannot record set membership themselves; they flag dirtiness here and the seam
     /// converts it to a [`ft_spatial_inflight`](Self#structfield.ft_spatial_inflight) entry.
     ft_spatial_dirty: bool,
+    /// Transient companion to [`ft_spatial_dirty`](Self#structfield.ft_spatial_dirty) that additionally
+    /// records that the current statement's full-text/spatial mutation **dropped or changed a
+    /// pre-existing posting** (a remove, or a last-wins re-index to a DIFFERENT value), not merely added
+    /// a new one or re-indexed an UNCHANGED value (`rmp` task #756). Set by the structural mutation
+    /// methods **only** when the underlying structure reported a real removal (its `remove` /
+    /// `remove_document` returned `true`) or an actual value change (a last-wins `index_*` returned
+    /// `true`), and consumed by [`note_ft_spatial_mutator`](Self::note_ft_spatial_mutator) into
+    /// [`ft_spatial_removers`](Self#structfield.ft_spatial_removers) / cleared by
+    /// [`clear_ft_spatial_dirty`](Self::clear_ft_spatial_dirty) — mirroring `ft_spatial_dirty` exactly.
+    ///
+    /// **Invariant:** every site that sets this also sets `ft_spatial_dirty` (a removal is always a
+    /// posting change), so `removed ⇒ dirty`. This is what lets the poison stay off for a rolled-back
+    /// pure insert (a brand-new node's `CREATE`, which drops nothing) while still failing closed for a
+    /// rolled-back remove/replace of a still-committed node.
+    ft_spatial_removed_dirty: bool,
 }
 
 /// A declared constraint's in-memory rule (`rmp` tasks #99, #100): the covered label token, the
@@ -549,8 +588,10 @@ impl IndexSet {
             // indexed and no mutator in flight, so every reader may trust it (`ts >= 0` always holds).
             ft_spatial_trustworthy_from: Timestamp(0),
             ft_spatial_inflight: BTreeSet::new(),
+            ft_spatial_removers: BTreeSet::new(),
             ft_spatial_poisoned: false,
             ft_spatial_dirty: false,
+            ft_spatial_removed_dirty: false,
         }
     }
 
@@ -1635,10 +1676,17 @@ impl IndexSet {
     /// `terms` removes the node from the index. A no-op if no such index is registered.
     pub fn index_fulltext_document(&mut self, name: &str, node_id: u64, terms: &[String]) {
         if let Some(ft) = self.fulltext.get_mut(name) {
-            ft.index.index_document(node_id, terms);
+            let changed = ft.index.index_document(node_id, terms);
             // A registered posting changed: flag the cross-snapshot freshness marker dirty so the
             // statement seam records this writer as a full-text/spatial mutator (`rmp` task #467).
             self.ft_spatial_dirty = true;
+            // If this (re-)index actually CHANGED the document (different terms, or an update-to-empty
+            // removal), a rolled-back writer can leave a still-committed node dropped from a posting — a
+            // false negative the re-check cannot resurrect. Flag the removal so the rollback path fails
+            // closed; a pure insert or an unchanged re-index does not (`rmp` task #756).
+            if changed {
+                self.ft_spatial_removed_dirty = true;
+            }
         }
     }
 
@@ -1648,9 +1696,12 @@ impl IndexSet {
         if let Some(ft) = self.fulltext.get_mut(name) {
             // Flag the freshness marker dirty only when a posting actually changed (`remove_document`
             // returns whether the node was present), so a no-op removal does not needlessly force
-            // concurrent readers off the fast path (`rmp` task #467).
+            // concurrent readers off the fast path (`rmp` task #467). A real removal is also a
+            // remove/replace for the rollback poison discriminator (`rmp` task #756): a rolled-back
+            // delete can drop a still-committed node from a posting it should occupy.
             if ft.index.remove_document(node_id) {
                 self.ft_spatial_dirty = true;
+                self.ft_spatial_removed_dirty = true;
             }
         }
     }
@@ -1681,6 +1732,13 @@ impl IndexSet {
         // so such a writer is not a full-text mutator and must not force concurrent readers off the
         // fast path.
         let mut changed = false;
+        // Whether any covering full-text index actually DROPPED a pre-existing posting for this node —
+        // a remove (lost the covered label) or a wholesale replace (`index_document` reported it swapped
+        // out an existing document). This drives the rollback poison discriminator (`rmp` task #756):
+        // only a rolled-back remove/replace can drop a still-committed node from a posting it should
+        // occupy (a false negative), whereas a rolled-back pure insert (a brand-new node, no prior
+        // posting) leaves only a re-check-filterable false positive.
+        let mut removed = false;
         for name in names {
             let Some(ft) = self.fulltext.get(&name) else {
                 continue;
@@ -1689,7 +1747,7 @@ impl IndexSet {
             // the index's covered labels.
             if !ft.label_tokens.iter().any(|lt| label_tokens.contains(lt)) {
                 // The node does not (or no longer) carries any covered label: drop it from this index.
-                // `remove_document` reports whether it was present (a real posting change).
+                // `remove_document` reports whether it was present (a real posting change / removal).
                 if self
                     .fulltext
                     .get_mut(&name)
@@ -1698,6 +1756,7 @@ impl IndexSet {
                     .remove_document(node_id)
                 {
                     changed = true;
+                    removed = true;
                 }
                 continue;
             }
@@ -1712,19 +1771,29 @@ impl IndexSet {
             }
             // The node carries the covered label, so `index_document` re-indexes it (a wholesale term
             // replace that can both ADD and DROP postings — exactly the stale-reader false-negative
-            // this marker guards). Treat any covered re-index as a posting change. This is the simplest
-            // sound rule (the over-mark — identical terms re-indexed — only makes concurrent readers
-            // conservatively decline; it never returns a wrong answer) and needs no `graphus-index`
-            // presence-probe API.
+            // this marker guards). Treat any covered re-index as a posting change (the over-mark of the
+            // in-flight marker — identical terms re-indexed — only makes concurrent readers
+            // conservatively decline; it never returns a wrong answer). But the rollback poison
+            // discriminator (`rmp` task #756) must be PRECISE: it flags a removal ONLY when
+            // `index_document` reports the document actually CHANGED (returned `true`), so a brand-new
+            // node's first index (a pure insert) AND an unchanged re-index (e.g. driven by an unrelated
+            // property write) — both safe on rollback — do not poison.
             changed = true;
-            self.fulltext
+            if self
+                .fulltext
                 .get_mut(&name)
                 .expect("index present")
                 .index
-                .index_document(node_id, &terms);
+                .index_document(node_id, &terms)
+            {
+                removed = true;
+            }
         }
         if changed {
             self.ft_spatial_dirty = true;
+        }
+        if removed {
+            self.ft_spatial_removed_dirty = true;
         }
     }
 
@@ -1882,6 +1951,10 @@ impl IndexSet {
     ) {
         let names: Vec<String> = self.fulltext_rel.keys().cloned().collect();
         let mut changed = false;
+        // Whether any covering relationship full-text index actually DROPPED a pre-existing posting for
+        // this relationship — a remove (type no longer covered) or a wholesale replace. Drives the
+        // rollback poison discriminator (`rmp` task #756), exactly as in `reindex_fulltext_node`.
+        let mut removed = false;
         for name in names {
             let Some(ft) = self.fulltext_rel.get(&name) else {
                 continue;
@@ -1895,6 +1968,7 @@ impl IndexSet {
                     .remove_document(rel_id)
                 {
                     changed = true;
+                    removed = true;
                 }
                 continue;
             }
@@ -1907,19 +1981,28 @@ impl IndexSet {
                 }
             }
             // Any covered re-index is a posting change (the same over-mark-is-safe rule as
-            // `reindex_fulltext_node`): it only makes concurrent readers conservatively decline.
+            // `reindex_fulltext_node`): it only makes concurrent readers conservatively decline. The
+            // rollback poison discriminator (`rmp` task #756) is precise: it flags a removal ONLY when
+            // `index_document` reports the document actually CHANGED.
             changed = true;
-            self.fulltext_rel
+            if self
+                .fulltext_rel
                 .get_mut(&name)
                 .expect("index present")
                 .index
-                .index_document(rel_id, &terms);
+                .index_document(rel_id, &terms)
+            {
+                removed = true;
+            }
         }
         if changed {
             // Reuse the shared full-text/spatial freshness marker (`rmp` task #467) so a stale reader of
             // this relationship full-text index declines to the snapshot-correct scan fallback, exactly
             // as it does for a node full-text mutation.
             self.ft_spatial_dirty = true;
+        }
+        if removed {
+            self.ft_spatial_removed_dirty = true;
         }
     }
 
@@ -2036,15 +2119,26 @@ impl IndexSet {
     ) {
         if let Some(sp) = self.spatial.get_mut(&(label_token, prop_key)) {
             if let Value::Point(p) = value {
-                sp.index.index_point(node_id, *p);
+                // `index_point` is last-wins; it returns whether the point actually CHANGED (the node
+                // moved), not merely whether an entry existed.
+                let changed = sp.index.index_point(node_id, *p);
                 // A point was (re)inserted: a real grid change. Flag the freshness marker dirty so the
                 // statement seam records this writer as a full-text/spatial mutator (`rmp` task #467).
                 self.ft_spatial_dirty = true;
+                // A real move DROPPED the old cell entry, so a rolled-back writer can leave a still-
+                // committed node missing from the grid — a false negative. Flag the removal so the
+                // rollback path fails closed; a pure insert or an unchanged re-index does not
+                // (`rmp` task #756).
+                if changed {
+                    self.ft_spatial_removed_dirty = true;
+                }
             } else {
                 // The property is no longer a point (e.g. an update changed its type) — drop the
-                // stale grid entry so a re-check never sees a phantom. Only a real removal flags dirty.
+                // stale grid entry so a re-check never sees a phantom. Only a real removal flags dirty,
+                // and a real removal is a remove/replace for the rollback poison (`rmp` task #756).
                 if sp.index.remove(node_id) {
                     self.ft_spatial_dirty = true;
+                    self.ft_spatial_removed_dirty = true;
                 }
             }
         }
@@ -2057,9 +2151,11 @@ impl IndexSet {
             // Flag the freshness marker dirty only when a grid entry actually existed and was removed
             // (`remove` returns whether the node was present), so the per-write wholesale re-index's
             // unconditional `remove_spatial_point` over UNcovered nodes does not needlessly force
-            // concurrent readers off the fast path (`rmp` task #467).
+            // concurrent readers off the fast path (`rmp` task #467). A real removal is a remove/replace
+            // for the rollback poison discriminator (`rmp` task #756).
             if sp.index.remove(node_id) {
                 self.ft_spatial_dirty = true;
+                self.ft_spatial_removed_dirty = true;
             }
         }
     }
@@ -2196,10 +2292,16 @@ impl IndexSet {
     ) {
         if let Some(sp) = self.spatial_rel.get_mut(&(type_token, prop_key)) {
             if let Value::Point(p) = value {
-                sp.index.index_point(rel_id, *p);
+                // Last-wins; `index_point` returns whether the point actually CHANGED — only a real move
+                // can drop a still-committed rel from the grid on rollback (`rmp` task #756).
+                let changed = sp.index.index_point(rel_id, *p);
                 self.ft_spatial_dirty = true;
+                if changed {
+                    self.ft_spatial_removed_dirty = true;
+                }
             } else if sp.index.remove(rel_id) {
                 self.ft_spatial_dirty = true;
+                self.ft_spatial_removed_dirty = true;
             }
         }
     }
@@ -2209,8 +2311,10 @@ impl IndexSet {
     /// [`remove_spatial_point`](Self::remove_spatial_point). A no-op if no such index is registered.
     pub fn remove_spatial_rel_point(&mut self, type_token: u32, prop_key: u32, rel_id: u64) {
         if let Some(sp) = self.spatial_rel.get_mut(&(type_token, prop_key)) {
+            // A real removal is a remove/replace for the rollback poison discriminator (`rmp` #756).
             if sp.index.remove(rel_id) {
                 self.ft_spatial_dirty = true;
+                self.ft_spatial_removed_dirty = true;
             }
         }
     }
@@ -2315,15 +2419,26 @@ impl IndexSet {
     ) {
         if let Some(tx) = self.text.get_mut(&(label_token, prop_key)) {
             if let Value::String(s) = value {
-                tx.index.index_value(node_id, s);
+                // `index_value` is last-wins; it returns whether the indexed content actually CHANGED
+                // (different trigrams), not merely whether a value existed.
+                let changed = tx.index.index_value(node_id, s);
                 // A value was (re)indexed: a real trigram change. Flag the freshness marker dirty so the
                 // statement seam records this writer as a full-text/spatial mutator (`rmp` task #467) —
                 // the text index rides the same cross-snapshot marker (it too keeps only latest state).
                 self.ft_spatial_dirty = true;
+                // A real change DROPPED the old trigrams, so a rolled-back writer can leave a still-
+                // committed node missing from the index — a false negative. Flag the removal so the
+                // rollback path fails closed; a pure insert or an unchanged re-index does not
+                // (`rmp` task #756).
+                if changed {
+                    self.ft_spatial_removed_dirty = true;
+                }
             } else if tx.index.remove(node_id) {
                 // The property is no longer a string (e.g. an update changed its type) — drop the stale
-                // entry so a re-check never sees a phantom. Only a real removal flags dirty.
+                // entry so a re-check never sees a phantom. Only a real removal flags dirty, and a real
+                // removal is a remove/replace for the rollback poison discriminator (`rmp` task #756).
                 self.ft_spatial_dirty = true;
+                self.ft_spatial_removed_dirty = true;
             }
         }
     }
@@ -2335,9 +2450,11 @@ impl IndexSet {
             // Flag the freshness marker dirty only when a trigram entry actually existed and was removed
             // (`remove` returns whether the node was present), so the per-write wholesale re-index's
             // unconditional `remove_text` over UNcovered nodes does not needlessly force concurrent
-            // readers off the fast path (`rmp` task #467).
+            // readers off the fast path (`rmp` task #467). A real removal is a remove/replace for the
+            // rollback poison discriminator (`rmp` task #756).
             if tx.index.remove(node_id) {
                 self.ft_spatial_dirty = true;
+                self.ft_spatial_removed_dirty = true;
             }
         }
     }
@@ -2489,17 +2606,27 @@ impl IndexSet {
         if let Some(v) = self.vector.get_mut(&(label_token, prop_key)) {
             match extract_embedding(value, v.index.dim()) {
                 Some(embedding) => {
-                    // `insert` is last-wins, so this also serves the update case. A dimension mismatch is
+                    // `insert` is last-wins, so this also serves the update case, and returns whether the
+                    // embedding actually CHANGED (present before AND the vector differs). Only a real
+                    // change can drop a still-committed node from the graph on rollback (a false
+                    // negative); a pure insert or an unchanged re-index (e.g. a wholesale re-index driven
+                    // by an UNRELATED property write) leaves at worst a re-check-filterable false
+                    // positive, so it must NOT poison (`rmp` task #756). A dimension mismatch is
                     // impossible here (`extract_embedding` already checked length), so the result is Ok.
-                    if v.index.insert(node_id, &embedding).is_ok() {
+                    if let Ok(changed) = v.index.insert(node_id, &embedding) {
                         self.ft_spatial_dirty = true;
+                        if changed {
+                            self.ft_spatial_removed_dirty = true;
+                        }
                     }
                 }
                 None => {
                     // Absent / malformed embedding: drop any stale graph entry so a seek never sees a
-                    // phantom. Only a real removal flags the freshness marker dirty.
+                    // phantom. Only a real removal flags the freshness marker dirty, and a real removal is
+                    // a remove/replace for the rollback poison discriminator (`rmp` task #756).
                     if v.index.remove(node_id) {
                         self.ft_spatial_dirty = true;
+                        self.ft_spatial_removed_dirty = true;
                     }
                 }
             }
@@ -2510,8 +2637,10 @@ impl IndexSet {
     /// or a node that lost the covered label). A no-op if no such index is registered.
     pub fn remove_vector(&mut self, label_token: u32, prop_key: u32, node_id: u64) {
         if let Some(v) = self.vector.get_mut(&(label_token, prop_key)) {
+            // A real removal is a remove/replace for the rollback poison discriminator (`rmp` #756).
             if v.index.remove(node_id) {
                 self.ft_spatial_dirty = true;
+                self.ft_spatial_removed_dirty = true;
             }
         }
     }
@@ -2628,13 +2757,20 @@ impl IndexSet {
         if let Some(v) = self.vector_rel.get_mut(&(type_token, prop_key)) {
             match extract_embedding(value, v.index.dim()) {
                 Some(embedding) => {
-                    if v.index.insert(rel_id, &embedding).is_ok() {
+                    // Last-wins; `insert` returns whether the embedding actually CHANGED — only a real
+                    // change can drop a still-committed rel from the graph on rollback, whereas a pure
+                    // insert or an unchanged re-index does not (`rmp` task #756).
+                    if let Ok(changed) = v.index.insert(rel_id, &embedding) {
                         self.ft_spatial_dirty = true;
+                        if changed {
+                            self.ft_spatial_removed_dirty = true;
+                        }
                     }
                 }
                 None => {
                     if v.index.remove(rel_id) {
                         self.ft_spatial_dirty = true;
+                        self.ft_spatial_removed_dirty = true;
                     }
                 }
             }
@@ -2645,8 +2781,10 @@ impl IndexSet {
     /// registered.
     pub fn remove_vector_rel(&mut self, type_token: u32, prop_key: u32, rel_id: u64) {
         if let Some(v) = self.vector_rel.get_mut(&(type_token, prop_key)) {
+            // A real removal is a remove/replace for the rollback poison discriminator (`rmp` #756).
             if v.index.remove(rel_id) {
                 self.ft_spatial_dirty = true;
+                self.ft_spatial_removed_dirty = true;
             }
         }
     }
@@ -2714,8 +2852,17 @@ impl IndexSet {
     /// [`ft_spatial_inflight`](Self#structfield.ft_spatial_inflight) entry via
     /// [`note_ft_spatial_mutator`](Self::note_ft_spatial_mutator), and the rebuild path discards it via
     /// [`clear_ft_spatial_dirty`](Self::clear_ft_spatial_dirty).
+    ///
+    /// This manual seam carries **no** information about whether the mutation it stands for *dropped* a
+    /// pre-existing posting, so it is classified **conservatively as a removal** (`rmp` task #756): it
+    /// also raises [`ft_spatial_removed_dirty`](Self#structfield.ft_spatial_removed_dirty), which fails
+    /// closed (a rollback of a txn that used this seam poisons the marker). Over-poisoning is
+    /// conservative-safe — it only disables the fast path until the next rebuild — whereas
+    /// under-poisoning could miss a real removal and return a false negative. The precise per-site
+    /// mutation methods (which know their actual did-remove boolean) are preferred over this seam.
     pub fn mark_ft_spatial_mutated_inflight(&mut self) {
         self.ft_spatial_dirty = true;
+        self.ft_spatial_removed_dirty = true;
     }
 
     /// Converts a pending dirty flag into an in-flight-mutator record for `txn`, returning whether
@@ -2729,9 +2876,22 @@ impl IndexSet {
     /// becomes `u64::MAX` until `txn` retires. The flag is cleared either way, so a subsequent
     /// non-mutating statement of any transaction does not inherit it.
     pub fn note_ft_spatial_mutator(&mut self, txn: TxnId) -> bool {
+        // Consume the transient removal flag alongside the dirty flag (`rmp` task #756). By construction
+        // `removed ⇒ dirty` (every removal is also a posting change), so a removal is only ever recorded
+        // when `txn` is also recorded as an in-flight mutator — keeping `ft_spatial_removers` a subset of
+        // `ft_spatial_inflight`. Clearing it here (whether or not a posting changed) prevents a later
+        // non-mutating statement of any transaction from inheriting a stale removal signal.
+        let removed = self.ft_spatial_removed_dirty;
+        self.ft_spatial_removed_dirty = false;
         if self.ft_spatial_dirty {
             self.ft_spatial_inflight.insert(txn);
             self.ft_spatial_dirty = false;
+            if removed {
+                // This txn dropped/replaced a pre-existing posting: if it later rolls back, the in-memory
+                // index may be left with a still-committed node missing from a posting it should occupy
+                // (a false negative the re-check cannot resurrect), so the rollback must fail closed.
+                self.ft_spatial_removers.insert(txn);
+            }
             true
         } else {
             false
@@ -2745,8 +2905,14 @@ impl IndexSet {
     /// between commands, and a `Populating` index is withheld from the planner). The coordinator calls
     /// this after such a build so the flag the mutation methods raised does not leak into the next
     /// user statement.
+    ///
+    /// Discards the companion [`ft_spatial_removed_dirty`](Self#structfield.ft_spatial_removed_dirty)
+    /// flag too (`rmp` task #756): a rebuild re-indexing committed state may replace postings (raising
+    /// the removal flag), but that reflects committed state and must not be attributed to — or poison on
+    /// rollback of — any open transaction.
     pub fn clear_ft_spatial_dirty(&mut self) {
         self.ft_spatial_dirty = false;
+        self.ft_spatial_removed_dirty = false;
     }
 
     /// Whether `txn` currently has an uncommitted full-text/spatial mutation recorded (`rmp` task
@@ -2767,6 +2933,10 @@ impl IndexSet {
     /// `u64::MAX` until **every** concurrent mutator has retired — so a sibling writer's still-
     /// uncommitted mutation is never prematurely exposed by this one's commit.
     pub fn commit_ft_spatial_marker(&mut self, txn: TxnId, commit_ts: Timestamp) {
+        // A COMMITTED remove/replace is correctly reflected in both the index and the store, so it must
+        // never poison — just retire the txn from the removers set (`rmp` task #756). This is cleanup
+        // only; the poison decision lives in `rollback_ft_spatial_marker`.
+        self.ft_spatial_removers.remove(&txn);
         if self.ft_spatial_inflight.remove(&txn) && commit_ts.0 > self.ft_spatial_trustworthy_from.0
         {
             self.ft_spatial_trustworthy_from = commit_ts;
@@ -2777,16 +2947,29 @@ impl IndexSet {
     /// `txn` was not a mutator.
     ///
     /// A rollback undoes the durable store but **not** the in-memory index (it is not transactional —
-    /// see the `rmp` #410 note on [`seek_bitmap_eq`](Self::seek_bitmap_eq)). A rolled-back *replace*
-    /// or *delete* can leave a still-committed node dropped from a posting it should occupy — a false
-    /// negative the query-time re-check cannot resurrect. So this **poisons** the marker
-    /// ([`effective_ft_spatial_marker`](Self::effective_ft_spatial_marker) pinned at `u64::MAX`),
-    /// forcing every reader onto the always-correct scan path until a full
-    /// [`reset_ft_spatial_marker`](Self::reset_ft_spatial_marker) rebuilds the index to committed
-    /// state. Conservative — it disables the fast path after a full-text/spatial-mutating rollback —
-    /// but never returns a wrong answer.
+    /// see the `rmp` #410 note on [`seek_bitmap_eq`](Self::seek_bitmap_eq)). It **poisons** the marker
+    /// ([`effective_ft_spatial_marker`](Self::effective_ft_spatial_marker) pinned at `u64::MAX`, forcing
+    /// every reader onto the always-correct scan path until a full
+    /// [`reset_ft_spatial_marker`](Self::reset_ft_spatial_marker) rebuilds the index to committed state)
+    /// **only when the retiring txn actually removed or replaced a covered posting** — recorded in
+    /// [`ft_spatial_removers`](Self#structfield.ft_spatial_removers) (`rmp` task #756).
+    ///
+    /// The discrimination is the crux of `rmp` #756: a rolled-back *replace* or *delete* can leave a
+    /// still-committed node dropped from a posting it should occupy — a false negative the query-time
+    /// re-check cannot resurrect — so it MUST fail closed (poison). A rolled-back pure *insert* (e.g. an
+    /// aborted `CREATE` of a brand-new node, or an aborted insert that added a posting to a node that had
+    /// none) leaves only a re-check-filterable false **positive**, so poisoning it would needlessly
+    /// disable the fast path DB-wide for every reader of that index kind until a reopen — the regression
+    /// `rmp` #756 fixes. The txn is retired from the in-flight set either way (its window is over).
+    /// Conservative but never returns a wrong answer: it only ever poisons on a genuine remove/replace.
     pub fn rollback_ft_spatial_marker(&mut self, txn: TxnId) {
-        if self.ft_spatial_inflight.remove(&txn) {
+        // Retire the txn from the in-flight set regardless — its uncommitted window is over.
+        self.ft_spatial_inflight.remove(&txn);
+        // Poison iff this txn dropped/replaced a pre-existing posting. `ft_spatial_removers ⊆
+        // ft_spatial_inflight` by construction, so a remover was always also in-flight; keying the poison
+        // solely on the removers set is the fail-closed choice (a removal always poisons; a pure insert
+        // never does).
+        if self.ft_spatial_removers.remove(&txn) {
             self.ft_spatial_poisoned = true;
         }
     }
@@ -2830,6 +3013,9 @@ impl IndexSet {
             self.ft_spatial_trustworthy_from = ts;
         }
         self.ft_spatial_dirty = false;
+        // The build's committed re-index may have replaced postings (raising the removal flag); discard
+        // it so it is never attributed to an open transaction (`rmp` task #756), mirroring the dirty flag.
+        self.ft_spatial_removed_dirty = false;
     }
 
     /// Resets the full-text/spatial freshness marker to `ts` and clears the poison / dirty flags
@@ -2844,6 +3030,11 @@ impl IndexSet {
         self.ft_spatial_trustworthy_from = ts;
         self.ft_spatial_poisoned = false;
         self.ft_spatial_dirty = false;
+        // Clear only the TRANSIENT removal flag (`rmp` task #756), mirroring `ft_spatial_dirty`. The
+        // `ft_spatial_removers` set is deliberately NOT touched, exactly as `ft_spatial_inflight` is not:
+        // a rebuild runs between commands with no open transaction, so both are empty; clearing them
+        // would drop a still-open mutator's poison-on-rollback signal if one were somehow in flight.
+        self.ft_spatial_removed_dirty = false;
     }
 
     // ============================================================================================
@@ -4263,5 +4454,315 @@ mod tests {
                 .collect();
             assert_eq!(rechecked, exact, "re-checked index == full scan");
         }
+    }
+
+    // =============================================================================================
+    // `rmp` #756 — the rollback poison must be CONDITIONAL on an actual remove/replace
+    // =============================================================================================
+    // The in-memory full-text/spatial index is NOT transactional, so a rollback undoes only the durable
+    // store, not these structures. The false negative a rolled-back mutator can cause exists ONLY when
+    // the txn REMOVED or REPLACED a pre-existing posting (dropping a still-committed node from a posting
+    // it should occupy — a false negative the query-time re-check cannot resurrect). A rolled-back pure
+    // INSERT leaves only a re-check-filterable false POSITIVE, so poisoning it needlessly forces every
+    // reader of that index kind onto the scan path DB-wide until a reopen (the `rmp` #756 regression).
+    // These tests pin BOTH directions.
+
+    /// A text index with node 100 committed under "apple" at commit ts 5. After this the marker is the
+    /// committed `Timestamp(5)` (no in-flight mutator, not poisoned).
+    fn text_set_with_committed_apple() -> IndexSet {
+        let mut set = IndexSet::new();
+        set.register_text(1, 5, IndexState::Online);
+        let t0 = TxnId(1);
+        set.insert_text_value(1, 5, &s("apple"), 100); // node 100: a brand-new posting (pure insert).
+        assert!(set.note_ft_spatial_mutator(t0));
+        set.commit_ft_spatial_marker(t0, Timestamp(5));
+        assert_eq!(
+            set.effective_ft_spatial_marker(),
+            Timestamp(5),
+            "baseline must be committed, in-flight-free, and not poisoned"
+        );
+        set
+    }
+
+    #[test]
+    fn rmp756_rolled_back_pure_insert_to_text_index_does_not_poison() {
+        let mut set = text_set_with_committed_apple();
+        let t1 = TxnId(2);
+        // T1 inserts a BRAND-NEW node 200 (no prior posting) — a pure insert.
+        set.insert_text_value(1, 5, &s("banana"), 200);
+        assert!(set.note_ft_spatial_mutator(t1), "T1 mutated the index");
+        assert!(set.is_ft_spatial_mutator(t1));
+        assert_eq!(
+            set.effective_ft_spatial_marker(),
+            Timestamp(u64::MAX),
+            "while T1 is in flight every reader declines (may reflect uncommitted state)"
+        );
+        set.rollback_ft_spatial_marker(t1);
+        assert!(
+            !set.is_ft_spatial_mutator(t1),
+            "T1 is retired from the in-flight set on rollback"
+        );
+        assert_eq!(
+            set.effective_ft_spatial_marker(),
+            Timestamp(5),
+            "a rolled-back PURE INSERT must NOT poison — the fast path is preserved (`rmp` #756)"
+        );
+    }
+
+    #[test]
+    fn rmp756_rolled_back_replace_of_text_index_still_fails_closed() {
+        let mut set = text_set_with_committed_apple();
+        let t1 = TxnId(2);
+        // T1 REPLACES node 100's committed "apple" with "banana" — last-wins drops the "apple" posting.
+        set.insert_text_value(1, 5, &s("banana"), 100);
+        assert!(set.note_ft_spatial_mutator(t1));
+        set.rollback_ft_spatial_marker(t1);
+        assert!(
+            !set.is_ft_spatial_mutator(t1),
+            "T1 is retired from the in-flight set (so the pinned MAX below is the POISON, not residual \
+             in-flight state)"
+        );
+        assert_eq!(
+            set.effective_ft_spatial_marker(),
+            Timestamp(u64::MAX),
+            "a rolled-back REPLACE dropped the still-committed 'apple' posting: it MUST poison so no \
+             reader can get a false negative (`rmp` #756)"
+        );
+    }
+
+    #[test]
+    fn rmp756_rolled_back_remove_of_text_index_still_fails_closed() {
+        let mut set = text_set_with_committed_apple();
+        let t1 = TxnId(2);
+        // T1 DELETEs node 100 from the index — a real removal of a committed posting.
+        set.remove_text(1, 5, 100);
+        assert!(set.note_ft_spatial_mutator(t1));
+        set.rollback_ft_spatial_marker(t1);
+        assert!(!set.is_ft_spatial_mutator(t1));
+        assert_eq!(
+            set.effective_ft_spatial_marker(),
+            Timestamp(u64::MAX),
+            "a rolled-back REMOVE of a committed posting MUST poison (`rmp` #756)"
+        );
+    }
+
+    #[test]
+    fn rmp756_rolled_back_noop_remove_does_not_poison() {
+        // The per-write wholesale re-index calls `remove_*` UNCONDITIONALLY over nodes no index covers.
+        // Such a no-op removal (nothing was present) must not mark the txn a remover — this is exactly
+        // the reco CREATE-of-a-new-node case that used to poison the whole database (`rmp` #756).
+        let mut set = IndexSet::new();
+        set.register_text(1, 5, IndexState::Online);
+        let t1 = TxnId(2);
+        set.remove_text(1, 5, 999); // node 999 was never indexed — a no-op.
+        assert!(
+            !set.note_ft_spatial_mutator(t1),
+            "a no-op removal changed no posting, so T1 is not even recorded as a mutator"
+        );
+        assert!(!set.is_ft_spatial_mutator(t1));
+        set.rollback_ft_spatial_marker(t1);
+        assert_eq!(
+            set.effective_ft_spatial_marker(),
+            Timestamp(0),
+            "a rolled-back no-op removal must NOT poison"
+        );
+    }
+
+    #[test]
+    fn rmp756_committed_replace_does_not_poison_and_clears_removers() {
+        let mut set = text_set_with_committed_apple();
+        let t1 = TxnId(2);
+        set.insert_text_value(1, 5, &s("banana"), 100); // replace: drops the committed "apple" posting.
+        assert!(set.note_ft_spatial_mutator(t1));
+        // T1 COMMITS at ts 9: the replace is correctly reflected in BOTH the index and the store, so it
+        // must advance the marker and must NOT poison.
+        set.commit_ft_spatial_marker(t1, Timestamp(9));
+        assert!(!set.is_ft_spatial_mutator(t1));
+        assert_eq!(
+            set.effective_ft_spatial_marker(),
+            Timestamp(9),
+            "a COMMITTED replace advances the marker and does not poison"
+        );
+        // And the removers set really was cleared on commit: a LATER unrelated rolled-back txn that only
+        // inserts must not resurrect T1's removal and wrongly poison.
+        let t2 = TxnId(3);
+        set.insert_text_value(1, 5, &s("cherry"), 300); // new node — pure insert.
+        assert!(set.note_ft_spatial_mutator(t2));
+        set.rollback_ft_spatial_marker(t2);
+        assert_eq!(
+            set.effective_ft_spatial_marker(),
+            Timestamp(9),
+            "committing T1 cleared it from the removers set, so T2's pure-insert rollback stays clean"
+        );
+    }
+
+    #[test]
+    fn rmp756_spatial_pure_insert_rollback_no_poison_but_replace_poisons() {
+        let mut set = IndexSet::new();
+        set.register_spatial(1, 6, 1.0, IndexState::Online);
+        let t0 = TxnId(1);
+        set.insert_spatial_point(1, 6, &pt(0.5, 0.5), 100); // baseline committed point.
+        assert!(set.note_ft_spatial_mutator(t0));
+        set.commit_ft_spatial_marker(t0, Timestamp(5));
+
+        // (a) pure insert of a NEW node 200, rolled back -> no poison.
+        let t1 = TxnId(2);
+        set.insert_spatial_point(1, 6, &pt(9.0, 9.0), 200);
+        assert!(set.note_ft_spatial_mutator(t1));
+        set.rollback_ft_spatial_marker(t1);
+        assert!(!set.is_ft_spatial_mutator(t1));
+        assert_eq!(
+            set.effective_ft_spatial_marker(),
+            Timestamp(5),
+            "a rolled-back pure spatial insert must not poison"
+        );
+
+        // (b) REPLACE node 100's committed point (last-wins re-buckets it), rolled back -> poison.
+        let t2 = TxnId(3);
+        set.insert_spatial_point(1, 6, &pt(3.5, 3.5), 100);
+        assert!(set.note_ft_spatial_mutator(t2));
+        set.rollback_ft_spatial_marker(t2);
+        assert!(!set.is_ft_spatial_mutator(t2));
+        assert_eq!(
+            set.effective_ft_spatial_marker(),
+            Timestamp(u64::MAX),
+            "a rolled-back spatial replace dropped the committed grid entry: it must poison"
+        );
+    }
+
+    #[test]
+    fn rmp756_vector_pure_insert_rollback_no_poison_but_replace_poisons() {
+        let mut set = IndexSet::new();
+        set.register_vector(1, 7, 3, Similarity::Cosine, 16, 100, IndexState::Online);
+        let t0 = TxnId(1);
+        set.insert_vector_value(1, 7, &emb(1, 0, 0), 100); // baseline committed embedding.
+        assert!(set.note_ft_spatial_mutator(t0));
+        set.commit_ft_spatial_marker(t0, Timestamp(5));
+
+        // (a) pure insert of a NEW node 200, rolled back -> no poison.
+        let t1 = TxnId(2);
+        set.insert_vector_value(1, 7, &emb(0, 1, 0), 200);
+        assert!(set.note_ft_spatial_mutator(t1));
+        set.rollback_ft_spatial_marker(t1);
+        assert_eq!(
+            set.effective_ft_spatial_marker(),
+            Timestamp(5),
+            "a rolled-back pure vector insert must not poison"
+        );
+
+        // (b) REPLACE node 100's committed embedding (last-wins), rolled back -> poison.
+        let t2 = TxnId(3);
+        set.insert_vector_value(1, 7, &emb(0, 0, 1), 100);
+        assert!(set.note_ft_spatial_mutator(t2));
+        set.rollback_ft_spatial_marker(t2);
+        assert_eq!(
+            set.effective_ft_spatial_marker(),
+            Timestamp(u64::MAX),
+            "a rolled-back vector replace dropped the committed graph entry: it must poison"
+        );
+    }
+
+    #[test]
+    fn rmp756_fulltext_reindex_pure_insert_no_poison_but_replace_and_lost_label_poison() {
+        let mut set = IndexSet::new();
+        set.register_fulltext(
+            "ft",
+            vec![1],
+            vec![5],
+            Analyzer::Standard,
+            IndexState::Online,
+        );
+        let t0 = TxnId(1);
+        set.reindex_fulltext_node(100, &[1], &[(5, "cat".to_owned())]); // baseline committed document.
+        assert!(set.note_ft_spatial_mutator(t0));
+        set.commit_ft_spatial_marker(t0, Timestamp(5));
+
+        // (a) a covered NEW node 200 reindexed -> a pure insert (no prior document) -> rollback: no poison.
+        let t1 = TxnId(2);
+        set.reindex_fulltext_node(200, &[1], &[(5, "dog".to_owned())]);
+        assert!(set.note_ft_spatial_mutator(t1));
+        set.rollback_ft_spatial_marker(t1);
+        assert_eq!(
+            set.effective_ft_spatial_marker(),
+            Timestamp(5),
+            "a rolled-back full-text pure insert (new document) must not poison"
+        );
+
+        // (b) node 100's terms REPLACED cat -> bird (a wholesale term swap) -> rollback: poison.
+        let t2 = TxnId(3);
+        set.reindex_fulltext_node(100, &[1], &[(5, "bird".to_owned())]);
+        assert!(set.note_ft_spatial_mutator(t2));
+        set.rollback_ft_spatial_marker(t2);
+        assert_eq!(
+            set.effective_ft_spatial_marker(),
+            Timestamp(u64::MAX),
+            "a rolled-back full-text replace dropped the committed 'cat' posting: it must poison"
+        );
+
+        // (c) a reindex that DROPS node 100's covered label (now labelled 9, not 1) removes its document
+        // from the covering index -> a real removal -> rollback: poison. (Fresh set to isolate.)
+        let mut set2 = IndexSet::new();
+        set2.register_fulltext(
+            "ft",
+            vec![1],
+            vec![5],
+            Analyzer::Standard,
+            IndexState::Online,
+        );
+        let u0 = TxnId(1);
+        set2.reindex_fulltext_node(100, &[1], &[(5, "cat".to_owned())]);
+        assert!(set2.note_ft_spatial_mutator(u0));
+        set2.commit_ft_spatial_marker(u0, Timestamp(5));
+        let u1 = TxnId(2);
+        set2.reindex_fulltext_node(100, &[9], &[(5, "cat".to_owned())]); // lost the covered label.
+        assert!(set2.note_ft_spatial_mutator(u1));
+        set2.rollback_ft_spatial_marker(u1);
+        assert_eq!(
+            set2.effective_ft_spatial_marker(),
+            Timestamp(u64::MAX),
+            "a rolled-back reindex that dropped a committed posting (lost label) must poison"
+        );
+    }
+
+    #[test]
+    fn rmp756_manual_inflight_seam_is_conservatively_a_remover() {
+        // `mark_ft_spatial_mutated_inflight` carries no did-remove information, so it is classified
+        // conservatively as a removal: a rollback of a txn that used it fails closed (`rmp` #756).
+        // Over-poisoning is safe; under-poisoning could miss a real removal and return a false negative.
+        let mut set = IndexSet::new();
+        set.register_text(1, 5, IndexState::Online);
+        let t1 = TxnId(2);
+        set.mark_ft_spatial_mutated_inflight();
+        assert!(set.note_ft_spatial_mutator(t1));
+        set.rollback_ft_spatial_marker(t1);
+        assert_eq!(
+            set.effective_ft_spatial_marker(),
+            Timestamp(u64::MAX),
+            "the conservative manual seam fails closed on rollback"
+        );
+    }
+
+    #[test]
+    fn rmp756_same_txn_create_then_update_conservatively_poisons() {
+        // A txn that creates node 300 AND then replaces its indexed value within the SAME txn hits a real
+        // (same-txn) posting replace on the second write, so it is recorded as a remover and its rollback
+        // poisons. This is a CONSERVATIVE over-approximation: the dropped posting belonged to the same
+        // uncommitted txn, so no COMMITTED node is ever lost — both poisoning and not poisoning are safe.
+        // We pin the current (safe) behavior; the marker is deliberately coarse (a single DB-wide bit) and
+        // does not track per-posting txn provenance. A plain `CREATE` (one wholesale re-index with the
+        // full property set) is a single pure insert and does NOT hit this path — see
+        // `rmp756_rolled_back_pure_insert_to_text_index_does_not_poison`.
+        let mut set = IndexSet::new();
+        set.register_text(1, 5, IndexState::Online);
+        let t1 = TxnId(2);
+        set.insert_text_value(1, 5, &s("apple"), 300); // create: pure insert.
+        set.insert_text_value(1, 5, &s("apricot"), 300); // same-txn update: replaces the same-txn posting.
+        assert!(set.note_ft_spatial_mutator(t1));
+        set.rollback_ft_spatial_marker(t1);
+        assert_eq!(
+            set.effective_ft_spatial_marker(),
+            Timestamp(u64::MAX),
+            "conservative but safe: a same-txn replace rollback poisons"
+        );
     }
 }

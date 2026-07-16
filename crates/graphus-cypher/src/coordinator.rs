@@ -7765,6 +7765,19 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.ssi.borrow().tracked_len()
     }
 
+    /// The **effective** full-text/spatial freshness marker (`rmp` tasks #467 / #756) — the timestamp an
+    /// inline reader compares its MVCC snapshot against to decide the fast index path vs the always-correct
+    /// scan fallback (see [`RecordStoreGraph::index_seek_text`] and friends). It is
+    /// [`Timestamp(u64::MAX)`] while any full-text/spatial mutator is in flight OR the marker is
+    /// **poisoned** (a rolled-back remove/replace, or a `rmp` #733 faulted rebuild), which forces every
+    /// inline reader onto the scan path; otherwise it is the committed trustworthy-from timestamp. A
+    /// read-only diagnostic (used by the `rmp` #756 regression tests to witness that a rolled-back pure
+    /// INSERT does not poison while a rolled-back remove/replace does).
+    #[must_use]
+    pub fn effective_ft_spatial_marker(&self) -> Timestamp {
+        self.index.borrow().effective_ft_spatial_marker()
+    }
+
     /// Reclaims the underlying store once no transaction is open and no statement seam is live
     /// (tests / shutdown).
     ///
@@ -7890,14 +7903,17 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 // even if the txn was somehow torn down concurrently / twice.
                 self.ssi.borrow_mut().forget(self.txn);
                 self.locks.borrow_mut().release_all(self.txn);
-                // Cross-snapshot freshness marker (`rmp` task #467): retire `txn` as a ROLLED-BACK
-                // full-text/spatial mutator. The store undo above (or below) does NOT roll back the
-                // in-memory inverted index / grid, so a rolled-back replace/delete may leave a still-
-                // committed node dropped from a posting it should occupy — a false negative the query-
-                // time re-check cannot resurrect. `rollback_ft_spatial_marker` therefore pins the
-                // effective marker at `u64::MAX` (every reader uses the always-correct scan path) until
-                // a full store-consistent rebuild repairs the index. A no-op if `txn` was not a mutator,
-                // so the common (non-full-text/spatial) rollback leaves the fast path untouched.
+                // Cross-snapshot freshness marker (`rmp` tasks #467, #756): retire `txn` as a
+                // ROLLED-BACK full-text/spatial mutator. The store undo above (or below) does NOT roll
+                // back the in-memory inverted index / grid, so a rolled-back replace/delete may leave a
+                // still-committed node dropped from a posting it should occupy — a false negative the
+                // query-time re-check cannot resurrect. `rollback_ft_spatial_marker` therefore pins the
+                // effective marker at `u64::MAX` (every reader uses the always-correct scan path) until a
+                // full store-consistent rebuild repairs the index — but ONLY when `txn` actually removed
+                // or replaced a covered posting (`rmp` #756). A rolled-back pure insert (e.g. an aborted
+                // `CREATE` of a new node) leaves only a re-check-filterable false positive, so it does
+                // not poison and the fast path is preserved. A no-op if `txn` was not a mutator, so the
+                // common (non-full-text/spatial) rollback leaves the fast path untouched.
                 self.index.borrow_mut().rollback_ft_spatial_marker(self.txn);
                 self.active.remove(&self.txn);
             }

@@ -170,7 +170,24 @@ impl SpatialIndex {
     /// Indexes (or **re-indexes**) `node` at `point`. Idempotent on the node: it first removes any
     /// existing entry (so an update after a coordinate change re-buckets the node), then inserts the
     /// node into its new cell's id list.
-    pub fn index_point(&mut self, node: u64, point: Point) {
+    ///
+    /// Returns whether the node's point actually **changed** — it was present before AND the new point
+    /// differs from the old (the node moved). A brand-new node (a pure insert) and an *unchanged*
+    /// re-index (e.g. the wholesale [`reindex_node`](crate::record_graph) a write of an UNRELATED
+    /// property triggers, re-inserting the same point) both return `false`. The full-text/spatial
+    /// freshness-marker machinery (`rmp` task #756) uses this to poison the marker on rollback ONLY for a
+    /// real move: a rolled-back move can drop a still-committed node from the grid cell it should occupy
+    /// (a false negative), whereas a rolled-back pure insert or unchanged re-index leaves the committed
+    /// entry exactly as it should be (at worst a re-check-filterable false positive).
+    pub fn index_point(&mut self, node: u64, point: Point) -> bool {
+        // Did the point actually move? Present before AND the new point differs. `value_eq` is used
+        // rather than a derived `PartialEq` (which `Point` intentionally omits for the `NaN` footgun); a
+        // `NaN` coordinate compares unequal, so it conservatively reports `changed` (safe). The borrow
+        // ends before the mutating `remove` below (`rmp` task #756).
+        let changed = self
+            .forward
+            .get(&node)
+            .is_some_and(|(_, old_point)| !old_point.value_eq(&point));
         self.remove(node);
         let cell = self.cell_of(&point);
         let list = self.cells.entry(cell).or_default();
@@ -178,6 +195,7 @@ impl SpatialIndex {
             list.insert(pos, node);
         }
         self.forward.insert(node, (cell, point));
+        changed
     }
 
     /// Removes `node` from the index entirely (its forward entry and the one cell it lives in),
@@ -522,5 +540,30 @@ mod tests {
         assert!(idx.is_empty());
         assert_eq!(idx.cell_count(), 0);
         assert!(idx.query_within(0.0, 0.0, 10.0).is_empty());
+    }
+
+    /// `rmp` #756: `index_point` must report whether the point actually MOVED — a pure insert and an
+    /// UNCHANGED re-index both return `false`; only a real move returns `true`. This lets an aborted
+    /// write that re-indexes an unchanged point (a wholesale re-index driven by an unrelated property
+    /// write) avoid poisoning, while a rolled-back real move (a false-negative risk) poisons.
+    #[test]
+    fn index_point_reports_whether_the_point_actually_changed_756() {
+        let mut idx = SpatialIndex::new(1.0);
+        assert!(
+            !idx.index_point(1, cart(0.5, 0.5)),
+            "first index of a node is a pure insert, not a change"
+        );
+        assert!(
+            !idx.index_point(1, cart(0.5, 0.5)),
+            "re-indexing the SAME point is NOT a change (rmp #756)"
+        );
+        assert!(
+            idx.index_point(1, cart(9.5, 9.5)),
+            "moving the node to a different point is a change"
+        );
+        assert!(
+            !idx.index_point(2, cart(0.0, 0.0)),
+            "a different new node changes nothing"
+        );
     }
 }

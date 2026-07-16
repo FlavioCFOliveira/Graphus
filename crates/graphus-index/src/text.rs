@@ -152,13 +152,29 @@ impl TrigramIndex {
     /// the index entirely — exactly the update-to-empty case. Only `CONTAINS ""` / `STARTS WITH ""` /
     /// `ENDS WITH ""` would match an empty string, and those needles are too short to form a trigram so
     /// they take the "all candidates" fallback anyway (the residual re-check keeps the empty value).
-    pub fn index_value(&mut self, node: u64, value: &str) {
+    ///
+    /// Returns whether the node's indexed content actually **changed** — it was present before AND its
+    /// new trigram set differs from the old (an update to a different value, or an update-to-empty
+    /// removal). A brand-new node (a pure insert) and an *unchanged* re-index (e.g. the wholesale
+    /// [`reindex_node`](crate::record_graph) a write of an UNRELATED property triggers) both return
+    /// `false`. The full-text/spatial freshness-marker machinery (`rmp` task #756) uses this to poison
+    /// the marker on rollback ONLY for a real change: a rolled-back change can leave a still-committed
+    /// node dropped from a posting it should occupy (a false negative the re-check cannot resurrect),
+    /// whereas a rolled-back pure insert or unchanged re-index leaves the committed posting exactly as it
+    /// should be (at worst a re-check-filterable false positive) — so poisoning it would needlessly
+    /// disable the fast path.
+    pub fn index_value(&mut self, node: u64, value: &str) -> bool {
+        let distinct = padded_trigrams(value);
+        // Did the indexed content actually change? Present before AND the new trigram set differs. An
+        // unchanged re-index (same trigrams) must report `false` so it does not poison on rollback
+        // (`rmp` task #756). The borrow ends before the mutating `remove` below.
+        let changed = self.forward.get(&node).is_some_and(|old| old != &distinct);
+
         // Remove the old value first so an update fully replaces, not accumulates, its trigrams.
         self.remove(node);
 
-        let distinct = padded_trigrams(value);
         if distinct.is_empty() {
-            return;
+            return changed;
         }
         for &tri in &distinct {
             let list = self.postings.entry(tri).or_default();
@@ -169,6 +185,7 @@ impl TrigramIndex {
             }
         }
         self.forward.insert(node, distinct);
+        changed
     }
 
     /// Removes `node` from the index entirely (its forward entry and every posting list it appears in),
@@ -551,5 +568,35 @@ mod tests {
         assert_eq!(idx.query_contains("aaa"), Some(vec![10]));
         // Postings: [Start,a,a], [a,a,a], [a,a,End] → 3 distinct grams, [a,a,a] once.
         assert_eq!(idx.trigram_count(), 3);
+    }
+
+    /// `rmp` #756: `index_value` must report whether the indexed content actually CHANGED — a pure insert
+    /// and an UNCHANGED re-index both return `false`; only a real change (or an update-to-empty removal)
+    /// returns `true`. The rollback-poison discriminator relies on this so an aborted write that
+    /// re-indexes an unchanged value (a wholesale re-index driven by an unrelated property write) does
+    /// NOT poison, while a rolled-back real change (a false-negative risk) does.
+    #[test]
+    fn index_value_reports_whether_the_value_actually_changed_756() {
+        let mut idx = TrigramIndex::new();
+        assert!(
+            !idx.index_value(1, "apple"),
+            "first index of a node is a pure insert, not a change"
+        );
+        assert!(
+            !idx.index_value(1, "apple"),
+            "re-indexing the SAME value is NOT a change (rmp #756)"
+        );
+        assert!(
+            idx.index_value(1, "banana"),
+            "re-index to a DIFFERENT value is a change"
+        );
+        assert!(
+            idx.index_value(1, ""),
+            "update-to-empty on a present node drops its posting (a change)"
+        );
+        assert!(
+            !idx.index_value(2, ""),
+            "an empty value on an absent node changes nothing"
+        );
     }
 }

@@ -961,18 +961,37 @@ fn schema_evidence_and_query_asserts(rest: &Rest<'_>, db: &str) -> Result<(), St
 /// `rest.statement` returns an `Err`): a **duplicate `Product.id`** (violates the `UNIQUE` constraint)
 /// and a **non-integer `price`** (violates the `IS :: INTEGER` property-type constraint).
 ///
+/// Both negatives carry a `name`, so each rejected write also exercises `Product.name` TEXT index
+/// maintenance before aborting — the shape that regressed the whole database before `rmp` #756 (see
+/// below), and which must now cost later readers nothing.
+///
 /// # Errors
 /// If either write is *accepted* (the constraint did not enforce), or the point-read of product 0's id
 /// fails.
 fn assert_constraints_reject(rest: &Rest<'_>, db: &str) -> Result<(), String> {
     let existing_pid = Generator::product_id(0);
 
+    // BOTH rejected writes deliberately set `name`, so each one exercises `Product.name` TEXT index
+    // maintenance and *then* aborts on its constraint — the realistic shape (a real loader's rejected
+    // rows carry a name like any other) and the shape that once broke the database. Until `rmp` #756 an
+    // aborting writer that had touched a TEXT/FULLTEXT/spatial-covered label poisoned the freshness
+    // marker database-wide, so every later reader of that index kind declined to a full-store scan until
+    // reopen — these two load-time negatives alone degraded the very TEXT index the read-mix exists to
+    // exercise. #756 made that poison conditional on a genuine remove/replace: a rejected pure INSERT
+    // leaves only a false positive the visibility re-check filters, so it must cost later readers
+    // nothing. Keeping `name` here therefore makes this an end-to-end guard for #756 — if the poison
+    // ever regresses, the I9 `CONTAINS` seek in the read-mix collapses to a full scan.
+    //
+    // Each rejected name carries a `REF-NEG…` code that no generated product can ever hold (real codes
+    // are hex-derived from a product id), so the aborted rows' trigrams never collide with a real
+    // reference fragment and cannot perturb the I9 seek's candidate set.
+
     // Duplicate Product.id → UNIQUE violation.
     expect_rejected(
         rest,
         db,
         "duplicate Product.id (UNIQUE)",
-        "CREATE (:Product {id: $id, name: 'dup', category: 'x', price: 100})",
+        "CREATE (:Product {id: $id, name: 'Counterfeit Widget REF-NEGDUP', category: 'x', price: 100})",
         Some(json!({ "id": existing_pid })),
     )?;
 
@@ -982,7 +1001,8 @@ fn assert_constraints_reject(rest: &Rest<'_>, db: &str) -> Result<(), String> {
         rest,
         db,
         "non-integer Product.price (IS :: INTEGER)",
-        "CREATE (:Product {id: 'reco-neg-price-test', name: 'p', category: 'x', price: 9.99})",
+        "CREATE (:Product {id: 'reco-neg-price-test', name: 'Prototype Widget REF-NEGPRC', \
+         category: 'x', price: 9.99})",
         None,
     )?;
 

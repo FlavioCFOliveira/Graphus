@@ -326,32 +326,47 @@ impl InvertedIndex {
     ///
     /// Passing an empty `terms` removes the document entirely (a node whose indexed text became
     /// empty no longer matches anything), which is exactly the update-to-empty case.
-    pub fn index_document(&mut self, node: u64, terms: &[String]) {
+    ///
+    /// Returns whether the node's document actually **changed** — it was present before AND its new
+    /// distinct-term set differs from the old (an update to different text, or an update-to-empty
+    /// removal). A brand-new node (a pure insert) and an *unchanged* re-index (e.g. the wholesale
+    /// [`reindex_node`](crate::record_graph) a write of an UNRELATED property triggers) both return
+    /// `false`. The full-text/spatial freshness-marker machinery (`rmp` task #756) uses this to poison
+    /// the marker on rollback ONLY for a real change: a rolled-back change can leave a still-committed
+    /// node dropped from a posting it should occupy (a false negative the query-time re-check cannot
+    /// resurrect), whereas a rolled-back pure insert or unchanged re-index leaves the committed posting
+    /// exactly as it should be (at worst a re-check-filterable false positive).
+    pub fn index_document(&mut self, node: u64, terms: &[String]) -> bool {
+        // Build the new distinct-term set first (no allocation for a repeated term — the same PERF/I2
+        // no-clone-on-repeat rule as before), so we can compare it to the old document BEFORE removing.
+        let mut distinct: BTreeSet<String> = BTreeSet::new();
+        for term in terms {
+            if !distinct.contains(term) {
+                distinct.insert(term.clone());
+            }
+        }
+        // Did the document's terms actually change? Present before AND the new set differs. An unchanged
+        // re-index (same terms) reports `false` so it does not poison on rollback (`rmp` task #756).
+        let changed = self.forward.get(&node).is_some_and(|old| old != &distinct);
+
         // Remove the old document first so an update fully replaces, not accumulates, its terms.
         self.remove_document(node);
 
-        if terms.is_empty() {
-            return;
+        if distinct.is_empty() {
+            return changed;
         }
-        // PERF/I2: the previous code allocated a clone for `distinct.insert(term.clone())` on every
-        // input term — including repeated terms, where the clone was immediately dropped on the
-        // failed insert. Gate on `contains` first so a repeated term costs no allocation; a
-        // genuinely new term is still owned independently by `forward` and `postings` (two owners,
-        // two copies is the minimum). Index contents are identical.
-        let mut distinct: BTreeSet<String> = BTreeSet::new();
-        for term in terms {
-            if distinct.contains(term) {
-                continue;
-            }
-            distinct.insert(term.clone());
+        for term in &distinct {
+            // A genuinely new term is owned independently by `forward` and `postings` (two owners, two
+            // copies is the minimum).
             let list = self.postings.entry(term.clone()).or_default();
-            // Keep each posting list sorted + de-duplicated. `node` is absent (we just removed
-            // the document), so a binary-search insert keeps the invariant in O(log n).
+            // Keep each posting list sorted + de-duplicated. `node` is absent (we just removed the
+            // document), so a binary-search insert keeps the invariant in O(log n).
             if let Err(pos) = list.binary_search(&node) {
                 list.insert(pos, node);
             }
         }
         self.forward.insert(node, distinct);
+        changed
     }
 
     /// Removes `node` from the index entirely (its forward entry and every posting list it appears
@@ -843,5 +858,35 @@ mod tests {
         assert!(idx.is_empty());
         assert_eq!(idx.term_count(), 0);
         assert!(idx.query(&t(&["a"]), MatchSemantics::Or).is_empty());
+    }
+
+    /// `rmp` #756: `index_document` must report whether the document's terms actually CHANGED — a pure
+    /// insert and an UNCHANGED re-index both return `false`; only a real change (or an update-to-empty
+    /// removal) returns `true`. This lets an aborted write that re-indexes unchanged terms (a wholesale
+    /// re-index driven by an unrelated property write) avoid poisoning, while a rolled-back real change
+    /// (a false-negative risk) poisons.
+    #[test]
+    fn index_document_reports_whether_the_document_actually_changed_756() {
+        let mut idx = InvertedIndex::new();
+        assert!(
+            !idx.index_document(1, &t(&["graph"])),
+            "first index of a node is a pure insert, not a change"
+        );
+        assert!(
+            !idx.index_document(1, &t(&["graph"])),
+            "re-indexing the SAME terms is NOT a change (rmp #756)"
+        );
+        assert!(
+            idx.index_document(1, &t(&["theory"])),
+            "re-index to different terms is a change"
+        );
+        assert!(
+            idx.index_document(1, &[]),
+            "update-to-empty on a present node drops its document (a change)"
+        );
+        assert!(
+            !idx.index_document(2, &[]),
+            "empty terms on an absent node changes nothing"
+        );
     }
 }
