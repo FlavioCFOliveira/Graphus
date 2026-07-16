@@ -5678,22 +5678,38 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     // A relationship uniqueness constraint (`rmp` #638) registers + populates a backing
                     // relationship-property index on its single `(type, property)` (`rmp` task #646), so
                     // the write-time duplicate check is index-accelerated (a full rebuild repopulates it).
-                    if let [prop_key] = prop_keys.as_slice() {
-                        idx.register_rel_property_with_state(
+                    match prop_keys.as_slice() {
+                        [prop_key] => idx.register_rel_property_with_state(
                             label_token,
                             *prop_key,
                             IndexState::Online,
-                        );
+                        ),
+                        // Composite relationship uniqueness (`rmp` #651) is backed by a composite
+                        // relationship index over the whole tuple — exactly like the RELATIONSHIP KEY
+                        // below, and mirroring the node `Unique` arity>1 case above (`rmp` #683).
+                        _ => idx.register_rel_composite(label_token, prop_keys.clone()),
                     }
                     true
                 }
-                // Existence + property-type are pure per-entity predicates; RelKey / RelPropertyType
-                // stay scan-based (a relationship COMPOSITE index is deferred; RelPropertyType is a pure
-                // per-relationship predicate). None of these need an index rebuild.
+                ConstraintKind::RelKey => {
+                    // A RELATIONSHIP KEY registers + populates a backing COMPOSITE relationship index
+                    // over its whole tuple, at EVERY arity (`rmp` #683), mirroring `NodeKey` above.
+                    //
+                    // Arity is deliberately NOT special-cased down to a single-property relationship
+                    // index: `enforce_constraints_for_rel` dispatches `RelKey` on KIND, not arity, so an
+                    // arity-1 REL KEY routes to `rel_key_tuple_conflict` just like an arity-3 one. That
+                    // is precisely the #683 defect — before this, an arity-1 REL KEY on `TRANSFER.tx_id`
+                    // registered NO index at all and fell through to `scan_rel_ids()`, re-reading EVERY
+                    // live relationship in the graph (measured: p50 12ms -> 474ms from 1e3 to 1e5 live
+                    // rels, against a flat 5ms without the constraint).
+                    idx.register_rel_composite(label_token, prop_keys.clone());
+                    true
+                }
+                // Existence + property-type are pure per-entity predicates; RelPropertyType is a pure
+                // per-relationship predicate. None of these need a backing index or a rebuild.
                 ConstraintKind::Existence
                 | ConstraintKind::PropertyType
                 | ConstraintKind::RelExistence
-                | ConstraintKind::RelKey
                 | ConstraintKind::RelPropertyType => false,
             }
         };
@@ -6126,10 +6142,25 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 .borrow()
                 .composite_index_name_for(entry.label_token, &entry.property_tokens)
                 .is_some();
+        // The relationship twin (`rmp` #683): a RELATIONSHIP KEY / composite relationship-uniqueness
+        // constraint's backing composite tree may likewise be **shared** with a standalone composite
+        // relationship index over the same `(type, tuple)` (`rmp` #666), so keep it if one still needs
+        // it — dropping the constraint must not silently disable the standalone index's acceleration.
+        let rel_backed_by_composite = matches!(entry.kind, ConstraintKind::RelKey)
+            || (entry.kind == ConstraintKind::RelUnique && entry.property_tokens.len() > 1);
+        let rel_shared_with_composite_index = rel_backed_by_composite
+            && self
+                .store
+                .borrow()
+                .rel_composite_index_name_for(entry.label_token, &entry.property_tokens)
+                .is_some();
         let mut idx = self.index.borrow_mut();
         idx.unregister_constraint(name);
         if entry.kind == ConstraintKind::NodeKey && !shared_with_composite_index {
             idx.unregister_composite(entry.label_token, &entry.property_tokens);
+        }
+        if rel_backed_by_composite && !rel_shared_with_composite_index {
+            idx.unregister_rel_composite(entry.label_token, &entry.property_tokens);
         }
         Ok(true) // a constraint was removed.
     }

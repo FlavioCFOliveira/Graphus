@@ -27,7 +27,7 @@
 //! seek deliberately exploits this when a bound cannot be expressed exactly against the backing
 //! index (see [`IndexSet::seek_node_property_range`]).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use graphus_bufpool::BufferPool;
 use graphus_core::{Timestamp, TxnId, Value};
@@ -176,6 +176,37 @@ pub struct IndexSet {
     /// on open); only the *registration* is durable. A standalone composite relationship index is a pure
     /// query accelerator (no uniqueness), maintained candidate-only by the relationship write path.
     rel_composite: HashMap<(u32, Vec<u32>), CompositeIndex<Dev, Sink>>,
+    /// **Reachability gate** for [`PredicateRead::RelEquality`] markers (`rmp` #683): the
+    /// `type_token -> {prop_key}` pairs for which some reader in this process's lifetime *could* have
+    /// registered such a marker.
+    ///
+    /// # Why this exists
+    ///
+    /// Every relationship write path must announce the `RelEquality` markers its edge satisfies, or the
+    /// precise marker silently stops matching and SSI misses an anomaly. But announcing requires reading
+    /// the relationship's property chain, which is **not** free — measured at ~3x on `SET r.p` for a
+    /// store with no relationship index at all, where the announcement is provably inert because
+    /// **nobody can hold the marker**. A reader can only register `RelEquality{T, p, _}` via one of
+    /// exactly three paths, and each requires schema over `(T, p)`:
+    ///   1. `rel_index_seek_eq` — requires an `Online` relationship-property index on `(T, p)`;
+    ///   2. `rel_unique_conflict` — requires a `RelUnique` rule covering `(T, p)`;
+    ///   3. `rel_composite_seek_eq` — requires a `RelKey`/`RelUnique` rule covering `(T, tuple ∋ p)`.
+    ///
+    /// So `(T, p)` absent from this map ⇒ no marker can exist ⇒ skipping the announcement is sound.
+    ///
+    /// # MONOTONE — entries are NEVER removed (this is the load-bearing property)
+    ///
+    /// A gate that merely asked "is there an index **now**?" would make the write footprint
+    /// **schema-derived** and open a DDL/DML race: a reader seeks (holding the marker), a concurrent
+    /// `DROP INDEX`/`DROP CONSTRAINT` commits, and the writer then sees no schema, skips the
+    /// announcement, and the reader's marker is never matched — a **FALSE NEGATIVE**, the exact hazard
+    /// that made the marker design per-component rather than tuple-shaped in the first place.
+    ///
+    /// Keeping the entry forever makes the gate a sound **superset**: a drop can only ever leave us
+    /// announcing markers nobody holds (correct and slightly slow — the safe direction), never skipping
+    /// markers somebody does hold. The map is part of the derived, rebuilt-on-open `IndexSet`, so it
+    /// resets only when no transaction — and therefore no marker — can survive.
+    rel_equality_declared: HashMap<u32, HashSet<u32>>,
     /// Declared **low-cardinality Roaring-bitmap** indexes (`rmp` task #328), keyed by `(label_token,
     /// prop_key)`. Each value is an in-memory [`BitmapIndex`] (value → compressed node-id bitmap) over
     /// the covered low-cardinality column. Like every other backing structure it is **ephemeral**
@@ -574,6 +605,7 @@ impl IndexSet {
             constraints: HashMap::new(),
             composite: HashMap::new(),
             rel_composite: HashMap::new(),
+            rel_equality_declared: HashMap::new(),
             bitmap: HashMap::new(),
             bitmap_declared: BTreeSet::new(),
             dirty_bitmap_nodes: HashMap::new(),
@@ -657,6 +689,44 @@ impl IndexSet {
             .map(|np| np.state)
     }
 
+    // ---- RelEquality marker reachability gate (`rmp` #683) -------------------------------------
+
+    /// Records that a reader could, from now on, register a [`PredicateRead::RelEquality`] marker over
+    /// `(type_token, prop_key)` (`rmp` #683). Monotone: never undone. See
+    /// [`rel_equality_declared`](Self::rel_equality_declared).
+    fn note_rel_equality_declared(&mut self, type_token: u32, prop_key: u32) {
+        self.rel_equality_declared
+            .entry(type_token)
+            .or_default()
+            .insert(prop_key);
+    }
+
+    /// Whether **any** relationship `(type, property)` in this store could have a `RelEquality` marker
+    /// held against it (`rmp` #683). The O(1) outermost gate: a store with no relationship-property
+    /// index and no relationship uniqueness/key constraint pays **nothing** on its relationship writes —
+    /// not even the record read needed to learn the relationship's type.
+    #[must_use]
+    pub fn rel_equality_any_declared(&self) -> bool {
+        !self.rel_equality_declared.is_empty()
+    }
+
+    /// Whether a reader could hold a `RelEquality` marker over `(type_token, prop_key)` (`rmp` #683).
+    /// `false` ⇒ the writer's announcement for that property is provably inert and may be skipped.
+    #[must_use]
+    pub fn rel_equality_marker_possible(&self, type_token: u32, prop_key: u32) -> bool {
+        self.rel_equality_declared
+            .get(&type_token)
+            .is_some_and(|props| props.contains(&prop_key))
+    }
+
+    /// Whether a reader could hold a `RelEquality` marker over **any** property of `type_token`
+    /// (`rmp` #683). Gates the wholesale pre-image announcements (`delete_rel`,
+    /// `replace_rel_properties`), which would otherwise decode the whole property chain.
+    #[must_use]
+    pub fn rel_equality_possible_for_type(&self, type_token: u32) -> bool {
+        self.rel_equality_declared.contains_key(&type_token)
+    }
+
     // ---- Constraints (`rmp` task #99) ---------------------------------------------------------
 
     /// Registers (or replaces) the constraint named `name` over `(label_token, property_tokens)` of
@@ -673,6 +743,17 @@ impl IndexSet {
         kind: ConstraintKind,
         type_descriptor: Option<ConstraintTypeDescriptor>,
     ) {
+        // Feed the `RelEquality` reachability gate (`rmp` #683): a relationship uniqueness / KEY rule
+        // makes the write-path enforcement reader (`rel_unique_conflict` / `rel_composite_seek_eq`)
+        // register a marker over every covered `(type, property)`, so writers must announce for those
+        // pairs from now on. Only these two kinds have such a reader — `RelExistence` /
+        // `RelPropertyType` are pure per-relationship predicates that read no equality predicate — and
+        // the node kinds do not touch this gate at all.
+        if matches!(kind, ConstraintKind::RelUnique | ConstraintKind::RelKey) {
+            for &prop_key in &property_tokens {
+                self.note_rel_equality_declared(label_token, prop_key);
+            }
+        }
         self.constraints.insert(
             name.to_owned(),
             ConstraintRule {
@@ -790,6 +871,11 @@ impl IndexSet {
             !property_tokens.is_empty(),
             "composite relationship index needs at least one property"
         );
+        // Feed the `RelEquality` reachability gate (`rmp` #683): `rel_composite_seek_eq` registers one
+        // per-component marker for every covered property, so writers must announce for each.
+        for &prop_key in &property_tokens {
+            self.note_rel_equality_declared(type_token, prop_key);
+        }
         let arity = property_tokens.len();
         self.rel_composite
             .entry((type_token, property_tokens))
@@ -1376,6 +1462,11 @@ impl IndexSet {
         prop_key: u32,
         state: IndexState,
     ) {
+        // Feed the `RelEquality` reachability gate (`rmp` #683): once this index exists, `index_seek_eq`
+        // can serve a seek over `(type_token, prop_key)` and register a marker, so every writer of that
+        // property must announce from now on. Recorded for ANY state, not just `Online`: a `Populating`
+        // index becomes `Online` without passing through here again.
+        self.note_rel_equality_declared(type_token, prop_key);
         self.rel_props
             .entry((type_token, prop_key))
             .and_modify(|rp| rp.state = state)
@@ -1435,9 +1526,16 @@ impl IndexSet {
         rel_id: u64,
     ) {
         if let Some(rp) = self.rel_props.get_mut(&(type_token, prop_key)) {
-            // in-memory index: a BTree op cannot fail in practice; an insert failure leaves the entry
-            // simply absent (the caller re-checks, so a missing candidate degrades to a full scan,
-            // never to a wrong answer).
+            // The `let _ =` is tolerated because this is a purely in-memory BTree insert with no I/O:
+            // it cannot fail in practice.
+            //
+            // It is NOT tolerated because a failure would be harmless — it would not be. A dropped
+            // entry means a MISSING CANDIDATE, and a candidate seek returns candidates, not a scan:
+            // the caller's re-check can only ever *remove* ids, never resurrect one the seek never
+            // yielded. So a lost entry is a lost row, a lost SIREAD marker, and (via
+            // `rel_unique_conflict`) a uniqueness check that reports "no duplicate" — the `rmp`
+            // #738 class. There is no "degrades to a full scan" fallback on this path; do not
+            // reintroduce that claim.
             let _ = rp.index.insert(EPHEMERAL_TXN, prop_key, value, rel_id);
         }
     }

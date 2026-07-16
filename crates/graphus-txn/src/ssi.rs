@@ -75,13 +75,21 @@ use crate::store::Key;
 /// ## Granularity (a sound over-approximation is acceptable)
 ///
 /// - [`PredicateRead::Equality`] — the precise `MATCH (n:Label {prop: value})` access path. The value
-///   is an **order-preserving encoded** key (the same encoding the secondary index uses), so two
-///   values that are Cypher-equal compare equal here and a writer's inserted value matches byte-for-byte.
+///   is a **Cypher-equality-canonical** encoded key (`graphus_index::encode_equality_canonical`),
+///   **not** the order-preserving secondary-index key, so two values that are Cypher-equal —
+///   including the cross-type `1` / `1.0` — register byte-identical markers and the writer's insert
+///   matches the reader's marker (`rmp` #171 blocker C1).
 /// - [`PredicateRead::Label`] — a bare label scan `MATCH (n:Label)`, *and* the conservative
 ///   over-approximation used for a **range / property-existence** scan over a label: any insert of
 ///   that label matches. Coarser than equality (it may abort a few extra genuinely-concurrent
 ///   transactions) but never unsound.
 /// - [`PredicateRead::AllNodes`] — an all-nodes scan `MATCH (n)`: any node insert matches.
+/// - [`PredicateRead::RelEquality`] — the relationship twin of [`PredicateRead::Equality`]: the precise
+///   `(rel type, property, value)` access path used by the relationship index seek and the write path's
+///   relationship uniqueness / RELATIONSHIP KEY check (`rmp` #683).
+/// - [`PredicateRead::RelType`] — a typed relationship traversal `MATCH ()-[r:T]-()`, *and* the
+///   conservative over-approximation for a relationship **range** read: any `:T` insert/delete matches.
+/// - [`PredicateRead::AnyRel`] — an untyped relationship read: any relationship insert/delete matches.
 ///
 /// Coarser granularity only ever causes *more* aborts among **concurrently-overlapping** transactions;
 /// it never produces a false abort for non-overlapping (serial) transactions, because every edge is
@@ -104,14 +112,22 @@ pub enum PredicateRead {
     /// property-existence scan over the label registers. Any insert carrying this label matches.
     Label(u32),
     /// An exact label + property-equality predicate (`MATCH (n:Label {prop: value})`), keyed by the
-    /// label token, the property-key token, and the order-preserving encoded `value`.
+    /// label token, the property-key token, and the Cypher-equality-canonical encoded `value`.
     Equality {
         /// The covered label token.
         label: u32,
         /// The covered property-key token.
         property: u32,
-        /// The order-preserving encoded predicate value (the secondary-index key encoding), so a
-        /// writer's inserted value matches a reader's marker iff they are Cypher-equal.
+        /// The **Cypher-equality-canonical** encoded predicate value
+        /// (`graphus_index::encode_equality_canonical`), so a writer's inserted value matches a
+        /// reader's marker iff they are Cypher-equal.
+        ///
+        /// **Not** the order-preserving secondary-index key (`encode_single`). That encoding tags
+        /// `Integer(1)` and `Float(1.0)` apart, so a reader of `{p: 1}` and a writer of `{p: 1.0}`
+        /// would register *different* markers and the cross-type numeric phantom rw-edge would never
+        /// close (`rmp` #171 blocker C1). Both the reader (`index_seek_eq`, the scan fallback) and the
+        /// writer (`note_predicate_write`) must use the canonical encoder, or the pair silently stops
+        /// matching — a false negative no same-type test can catch.
         value: Vec<u8>,
     },
     /// A relationship-pattern read over **any** relationship type — a `MATCH ()-[r]-()` /
@@ -123,6 +139,40 @@ pub enum PredicateRead {
     /// `create_rel`/`delete_rel` of that type matches (a relationship phantom: read "no `:T` edges",
     /// then a concurrent `CREATE` of a `:T` edge). The relationship analogue of [`Label`](Self::Label).
     RelType(u32),
+    /// An exact relationship-type + property-equality predicate (`MATCH ()-[r:T {p: v}]-()`, and the
+    /// write path's relationship uniqueness / RELATIONSHIP KEY check), keyed by the relationship-type
+    /// token, the property-key token, and the Cypher-equality-canonical encoded `value`. The
+    /// relationship analogue of [`Equality`](Self::Equality) (`rmp` #683).
+    ///
+    /// # Why this variant exists
+    ///
+    /// Its coarser sibling [`RelType`](Self::RelType) matches **every** relationship of the type, so it
+    /// pairs with `create_rel`'s `[AnyRel, RelType(T)]` write footprint for *every* concurrent creator —
+    /// even two creating **distinct** values. That manufactured an rw-edge between every pair of
+    /// concurrent `:T` writers (measured: a 0.75 SSI abort rate against a 0.00 no-constraint control,
+    /// with every value distinct — i.e. ~100% of those aborts were false). This precise marker matches
+    /// only a writer whose relationship actually holds `(T, p, v)`.
+    ///
+    /// # Per-component, never a tuple
+    ///
+    /// A composite (multi-property) reader registers **one marker per component**, and a writer
+    /// announces one per property its relationship holds. A tuple-shaped marker would make the writer's
+    /// footprint *schema-derived* (it would have to enumerate the declared rules to know which tuples to
+    /// announce), opening a DDL/DML race in which a rule the enumeration missed is a **false negative**.
+    /// Per-component is schema-independent and a sound superset: a reader of `(v1..vN)` registers N
+    /// markers and a matching relationship announces all N, so the edge always forms; a relationship
+    /// sharing only `v1` forms one spurious edge — an extra abort, never a missed one.
+    RelEquality {
+        /// The covered relationship-type token.
+        rel_type: u32,
+        /// The covered property-key token.
+        property: u32,
+        /// The **Cypher-equality-canonical** encoded predicate value
+        /// (`graphus_index::encode_equality_canonical`) — identical in contract to
+        /// [`Equality::value`](Self::Equality), including the `Integer(1)` / `Float(1.0)` cross-type
+        /// requirement. **Not** the order-preserving secondary-index key (`encode_single`).
+        value: Vec<u8>,
+    },
 }
 
 /// Per-transaction SSI bookkeeping (its node in the conflict graph).

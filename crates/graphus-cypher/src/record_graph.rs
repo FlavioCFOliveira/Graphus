@@ -630,6 +630,237 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         ]);
     }
 
+    /// Registers the **reader** side of a relationship `(type, property, value)` equality predicate
+    /// (`rmp` #683): the precise [`PredicateRead::RelEquality`] marker, which pairs with the
+    /// per-property `RelEquality` write footprint every relationship write path announces.
+    ///
+    /// # The coarse fallback is deliberate — never "no marker"
+    ///
+    /// Gated on [`encode_equality_canonical`] succeeding, **not** on the index's `is_index_encodable`
+    /// (`index_set.rs`, = `encode_single(v).is_ok()`). The two domains differ: `is_index_encodable`
+    /// **accepts** `NaN`, which `encode_equality_canonical` **rejects**, so gating on the former would
+    /// let the seek proceed while the marker was silently dropped — a false negative no same-type test
+    /// can catch.
+    ///
+    /// When the value is not canonically encodable the coarse [`PredicateRead::RelType`] marker is
+    /// registered instead. That is exactly the marker this path used before #683, so the footprint is
+    /// **never weaker than the pre-#683 baseline** for any value class; it merely stops being coarse for
+    /// the encodable values that dominate real workloads. (For `NaN` specifically the coarse marker is
+    /// strictly redundant — `NaN` equals nothing, not even itself, so no writer can ever make a
+    /// relationship match — but announcing it costs one marker on a vanishingly rare path and keeps this
+    /// helper's contract "always at least as strong as `RelType`", which is the property the
+    /// non-weakening oracle checks.)
+    fn note_rel_equality_read(&self, type_token: u32, prop_key: u32, value: &Value) {
+        if self.ssi.is_none() {
+            return; // standalone path: nothing to track.
+        }
+        match encode_equality_canonical(value) {
+            Ok(encoded) => self.note_predicate_read(PredicateRead::RelEquality {
+                rel_type: type_token,
+                property: prop_key,
+                value: encoded,
+            }),
+            // Not canonically encodable (`List`/`Map`/`Null`/`NaN`): fall back to the coarse marker
+            // rather than registering nothing. See the method doc.
+            Err(_) => self.note_predicate_read(PredicateRead::RelType(type_token)),
+        }
+    }
+
+    /// The **writer** side twin of [`note_rel_equality_read`](Self::note_rel_equality_read): the
+    /// per-property [`PredicateRead::RelEquality`] markers a relationship holding `resolved` under
+    /// `type_id` satisfies, plus the coarse `[AnyRel, RelType]` pair (`rmp` #683).
+    ///
+    /// A value that is not canonically encodable yields no `RelEquality` marker for that property, which
+    /// is sound: no reader can hold a marker for it either (the reader helper above cannot encode it
+    /// and registers the coarse `RelType(T)` instead — which this footprint always contains).
+    fn rel_predicate_footprint(
+        &self,
+        type_id: u32,
+        resolved: &[(u32, Value)],
+    ) -> Vec<PredicateRead> {
+        let mut footprint = Vec::with_capacity(resolved.len() + 2);
+        footprint.push(PredicateRead::AnyRel);
+        footprint.push(PredicateRead::RelType(type_id));
+        for (prop_key, value) in resolved {
+            if let Ok(encoded) = encode_equality_canonical(value) {
+                footprint.push(PredicateRead::RelEquality {
+                    rel_type: type_id,
+                    property: *prop_key,
+                    value: encoded,
+                });
+            }
+        }
+        footprint
+    }
+
+    /// Announces the O(1) per-property [`PredicateRead::RelEquality`] write marker for a single
+    /// `(type, property, value)` (`rmp` #683) — the `set_rel_property` form, which announces only the
+    /// key it actually changed rather than re-reading the relationship's whole property chain.
+    ///
+    /// Sound at this granularity because a relationship can only *become* (or *stop being*) a match for
+    /// a reader's tuple by **changing** at least one covered component, and this is called for both the
+    /// pre- and the post-image of exactly that component.
+    fn note_rel_property_predicate_write(&self, type_id: u32, prop_key: u32, value: &Value) {
+        if self.ssi.is_none() {
+            return; // standalone path: nothing to track.
+        }
+        // Reachability gate (`rmp` #683): no reader can hold a `RelEquality{type_id, prop_key, _}`
+        // marker unless schema over that pair exists, so the announcement is provably inert. Sound
+        // because the gate is MONOTONE — see `IndexSet::rel_equality_declared`.
+        if !self.rel_equality_marker_possible(type_id, prop_key) {
+            return;
+        }
+        if let Ok(encoded) = encode_equality_canonical(value) {
+            self.note_predicate_write_footprint(&[PredicateRead::RelEquality {
+                rel_type: type_id,
+                property: prop_key,
+                value: encoded,
+            }]);
+        }
+    }
+
+    /// The relationship's current type token, or [`None`] when it cannot be read.
+    fn rel_type_token(&self, rel: RelId) -> Option<u32> {
+        let store = self.store.borrow();
+        store.rel(rel.0).ok().map(|r| r.type_id)
+    }
+
+    /// Whether a reader could hold a [`PredicateRead::RelEquality`] marker over `(type_id, prop_key)` —
+    /// the O(1) reachability gate (`rmp` #683). Conservative when there is no derived index (the
+    /// standalone path has no `IndexSet`, but it also has no SSI tracker, so nothing is announced
+    /// anyway).
+    fn rel_equality_marker_possible(&self, type_id: u32, prop_key: u32) -> bool {
+        self.index
+            .as_ref()
+            .is_some_and(|idx| idx.borrow().rel_equality_marker_possible(type_id, prop_key))
+    }
+
+    /// Whether ANY relationship `(type, property)` could carry a `RelEquality` marker (`rmp` #683). The
+    /// outermost gate: false ⇒ the whole announcement machinery is skipped without even reading the
+    /// relationship's type record.
+    fn rel_equality_any_declared(&self) -> bool {
+        self.index
+            .as_ref()
+            .is_some_and(|idx| idx.borrow().rel_equality_any_declared())
+    }
+
+    /// Announces the **pre-image** `RelEquality` marker for the single property `prop_key` of `rel` —
+    /// the value the relationship holds for that key *right now*, before the caller overwrites or
+    /// removes it (`rmp` #683).
+    ///
+    /// A no-op when the key is currently absent (a brand-new relationship, or a key being added), which
+    /// is exactly right: there is no predicate the relationship is about to stop satisfying.
+    ///
+    /// # Why this pre-image is kept even though it is redundant today
+    ///
+    /// Given that **every** relationship write path calls `note_write(rel_ssi_key(..))`, this marker is
+    /// provably redundant: a reader that saw the relationship SIREAD-marked it (so the physical key
+    /// closes the edge), and a reader that could NOT see it is looking at an edge created by a
+    /// concurrent uncommitted transaction — which is the only transaction able to modify it, and which
+    /// already announced the value as a **post-image** on its own create/set. Duplicate protection rides
+    /// entirely on the post-image regardless: a duplicate requires two relationships *holding* a value,
+    /// and the pre-image announces the value being *left*.
+    ///
+    /// It is kept as **defence-in-depth**, for a reason that is not hypothetical: that redundancy rests
+    /// on the invariant "every relationship write path calls `note_write`", and that invariant was
+    /// **violated in two of the seven paths** until this same cycle fixed them (`remove_rel_property`
+    /// and `replace_rel_properties`, `rmp` #683 H1/H2). A future write path that forgets `note_write`
+    /// reopens exactly that hole, and this marker is what would still catch it. With the reachability
+    /// gate below the cost is zero wherever the marker is inert, so there is no trade to make: the
+    /// defence stays and the cost goes.
+    fn note_rel_property_preimage(&self, rel: RelId, prop_key: u32) {
+        if self.ssi.is_none() {
+            return; // standalone path: nothing to track.
+        }
+        // Gate BEFORE reading anything: `rel_type_and_resolved_props` decodes the whole property chain,
+        // which is the entire cost of this call (measured ~3x on `SET r.p` when unconditional). The
+        // outer `any_declared` check avoids even the type record read in the common no-schema case.
+        if !self.rel_equality_any_declared() {
+            return;
+        }
+        let Some(type_id) = self.rel_type_token(rel) else {
+            return; // unreadable: the physical `note_write` still covers the record key.
+        };
+        if !self.rel_equality_marker_possible(type_id, prop_key) {
+            return; // provably inert: no reader can hold this marker.
+        }
+        let Some((_, resolved)) = self.rel_type_and_resolved_props(rel) else {
+            return; // unreadable: the physical `note_write` still covers the record key.
+        };
+        if let Some((_, old)) = resolved.iter().find(|(k, _)| *k == prop_key) {
+            self.note_rel_property_predicate_write(type_id, prop_key, old);
+        }
+    }
+
+    /// The relationship's current type token and resolved (newest-wins) property values, or [`None`]
+    /// when it cannot be read. Shared by the full post-image / pre-image announcements below.
+    fn rel_type_and_resolved_props(&self, rel: RelId) -> Option<(u32, Vec<(u32, Value)>)> {
+        let type_id = {
+            let store = self.store.borrow();
+            store.rel(rel.0).ok()?.type_id
+        };
+        let store = self.store.borrow();
+        let chain = store.rel_property_values(rel.0).ok()?;
+        let mut resolved: Vec<(u32, Value)> = Vec::new();
+        for (_pid, key, value) in chain {
+            if resolved.iter().any(|(k, _)| *k == key) {
+                continue; // newest-wins: keep only the first (head-most) occurrence per key.
+            }
+            resolved.push((key, value));
+        }
+        Some((type_id, resolved))
+    }
+
+    /// Announces a relationship's **full current** predicate footprint (`rmp` #683): the coarse
+    /// `[AnyRel, RelType]` pair plus one [`PredicateRead::RelEquality`] per property it currently holds.
+    ///
+    /// Used as the **pre-image** announcement on the paths that make a relationship stop satisfying
+    /// predicates wholesale — `delete_rel` and `replace_rel_properties`' clear — where the O(1)
+    /// per-property form is unavailable because *every* property is vacated at once. Must run **before**
+    /// the store mutation: afterwards the vacated values are unreadable.
+    ///
+    /// # Fail-safe
+    ///
+    /// If the relationship's type or property chain cannot be read, the coarse `[AnyRel, RelType]` pair
+    /// is announced from whatever *is* readable (and nothing at all only when even the type is
+    /// unreadable, in which case the relationship is already being aborted by a captured error). Never a
+    /// wrong marker; the per-record `note_write` covers the physical key regardless. Mirrors
+    /// [`note_predicate_write_preimage`](Self::note_predicate_write_preimage)'s stance.
+    fn note_rel_predicate_write_full(&self, rel: RelId) {
+        if self.ssi.is_none() {
+            return; // standalone path: nothing to track.
+        }
+        // Reachability gate (`rmp` #683): when no property of this relationship's type can carry a
+        // `RelEquality` marker, only the coarse `[AnyRel, RelType]` pair is needed — which `rmp` #171
+        // blocker A1 requires unconditionally — and the property-chain decode is skipped entirely.
+        if let Some(type_id) = self.rel_type_token(rel) {
+            if !self.rel_equality_possible_for_type(type_id) {
+                self.note_rel_predicate_write(type_id);
+                return;
+            }
+        }
+        match self.rel_type_and_resolved_props(rel) {
+            Some((type_id, resolved)) => {
+                let footprint = self.rel_predicate_footprint(type_id, &resolved);
+                self.note_predicate_write_footprint(&footprint);
+            }
+            // Cannot enumerate the properties: fall back to the coarse pair if the type is readable.
+            None => {
+                let type_id = { self.store.borrow().rel(rel.0).ok().map(|r| r.type_id) };
+                if let Some(type_id) = type_id {
+                    self.note_rel_predicate_write(type_id);
+                }
+            }
+        }
+    }
+
+    /// Whether any property of `type_id` could carry a `RelEquality` marker (`rmp` #683).
+    fn rel_equality_possible_for_type(&self, type_id: u32) -> bool {
+        self.index
+            .as_ref()
+            .is_some_and(|idx| idx.borrow().rel_equality_possible_for_type(type_id))
+    }
+
     /// Thin wrapper announcing an explicit `footprint` of [`PredicateRead`] markers to the shared
     /// tracker (used for the relationship footprint, whose markers are not derived from node state).
     fn note_predicate_write_footprint(&self, footprint: &[PredicateRead]) {
@@ -2182,9 +2413,9 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                     }
                 }
                 ConstraintKind::RelUnique => {
-                    // Composite relationship uniqueness (`rmp` #651), scan-based (no composite rel
-                    // index yet — the same footprint as `RelKey`). No existence requirement: a null in
-                    // any covered property relaxes uniqueness, so an incomplete tuple is skipped. The
+                    // Composite relationship uniqueness (`rmp` #651), index-backed over the whole tuple
+                    // exactly like `RelKey` (`rmp` #683). No existence requirement: a null in any
+                    // covered property relaxes uniqueness, so an incomplete tuple is skipped. The
                     // complete tuple must not be held by another relationship of the type.
                     let mut tuple = Vec::with_capacity(property_names.len());
                     let mut complete = true;
@@ -2204,7 +2435,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                         continue;
                     }
                     if self
-                        .rel_key_tuple_conflict(&type_name, &property_names, &tuple, rel)
+                        .rel_key_tuple_conflict(&type_name, &property_names, &rule, &tuple, rel)
                         .is_some()
                     {
                         self.capture(
@@ -2221,9 +2452,13 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                     }
                 }
                 ConstraintKind::RelKey => {
-                    if let Some(violation) =
-                        self.rel_key_conflict(&constraint_name, &type_name, &property_names, rel)
-                    {
+                    if let Some(violation) = self.rel_key_conflict(
+                        &constraint_name,
+                        &type_name,
+                        &property_names,
+                        &rule,
+                        rel,
+                    ) {
                         self.capture(violation.into_error());
                         return;
                     }
@@ -2281,9 +2516,18 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         value: &Value,
         self_rel: RelId,
     ) -> Option<u64> {
-        // AUDIT-FIX PROBE (#646): register the rel-type predicate read so a concurrent insert of the
-        // same brand-new value forms the rw-antidependency (pairs with create_rel's RelType write).
-        self.note_predicate_read(PredicateRead::RelType(type_token));
+        // The phantom marker for the *absence* case (`rmp` #646): a concurrent insert of the same
+        // brand-new value must form the rw-antidependency, and neither writer sees the other under MVCC
+        // so no physical-key edge can form.
+        //
+        // Registered HERE as well as inside `rel_index_seek_eq` (idempotent — markers are a set) because
+        // the fallback below is `rel_scan_eq`, which registers **no** predicate marker of its own. This
+        // asymmetry with the node side is deliberate and load-bearing: the node twin's fallback
+        // (`scan_nodes_by_label`) registers `Label(L)` itself, so `unique_conflict` needs nothing; the
+        // relationship scan has no such marker, so dropping this line would leave the scan-fallback path
+        // (a non-`Online` index, or an unindexable `List` value) with no absence-phantom protection at
+        // all. `rmp` #683.
+        self.note_rel_equality_read(type_token, prop_key, value);
         let matches: Vec<u64> = self
             .rel_index_seek_eq(type_token, prop_key, type_name, property, value)
             .unwrap_or_else(|| self.rel_scan_eq(type_name, property, value));
@@ -2295,16 +2539,57 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     /// relationship-property index covers `(type_token, prop_key)` — the caller then falls back to
     /// [`rel_scan_eq`](Self::rel_scan_eq).
     ///
-    /// # Correctness — state gating and the preserved SSI footprint
+    /// # Correctness — state gating and the SSI footprint
     ///
     /// Only an **`Online`** index is used: a `Populating` (half-built) one returns a *subset* of the
     /// true matches, which would MISS a conflict — a uniqueness bypass — so it declines to the scan.
-    /// The candidate seek examines only the relationships holding `value`, not every relationship of the
-    /// type the scan re-read; to keep serializability **exactly as strong** as the scan, this preserves
-    /// the scan's blanket SIREAD footprint via [`mark_all_live_rels`](Self::mark_all_live_rels) (so a
-    /// concurrent modify of an existing relationship *into* `value` — invisible to this snapshot's seek
-    /// — still forms an rw-antidependency). Each surviving candidate is additionally re-checked with
-    /// [`rel_data`](GraphAccess::rel_data), which SIREAD-marks it.
+    ///
+    /// ## Two callers, one footprint (`rmp` #683)
+    ///
+    /// This method has **two** callers and must be correct for both by itself:
+    ///   1. [`rel_unique_conflict`](Self::rel_unique_conflict) — the write path's uniqueness check;
+    ///   2. `index_seek_rel_eq` — the executor's `RelIndexSeek` operator (`rmp` #659), which registers
+    ///      **nothing** of its own.
+    ///
+    /// So the predicate marker is registered **here**, not in a caller: hosting it in
+    /// `rel_unique_conflict` alone would leave caller (2) with no phantom protection at all. This
+    /// mirrors the node twin [`index_seek_eq`](Self::index_seek_eq) (`rmp` #316) exactly, which
+    /// likewise registers its `Equality` marker inside itself and serves both `unique_conflict` and the
+    /// executor's seek.
+    ///
+    /// ## Why there is no `mark_all_live_rels()` blanket (do NOT reintroduce it)
+    ///
+    /// This path used to SIREAD-mark **every live relationship** per seek — an O(live rels) footprint
+    /// (measured: ~1 marker per live relationship per write, 200k markers at 100k rels) that
+    /// manufactured an rw-edge with *any* concurrent relationship writer, including one touching a
+    /// relationship that neither matches `(type, property, value)` nor was ever examined. Measured
+    /// effect: a 0.75 SSI abort rate against a 0.00 no-constraint control on an identical workload in
+    /// which **every value was distinct** — i.e. ~100% of those aborts were false.
+    ///
+    /// The blanket was **not** what caught the writer-first interleavings, which is the trap that makes
+    /// this look scarier than it is. The real mechanism there is the **shared ephemeral index**:
+    /// `reindex_rel` inserts under `EPHEMERAL_TXN` regardless of commit, so a concurrent uncommitted
+    /// writer's relationship surfaces as a *candidate* whose `rel_data` re-check SIREAD-marks it before
+    /// the visibility filter drops it. Measured cell by cell, the blanket was load-bearing in exactly
+    /// **one** of four phantom cells (a concurrent modify of an existing relationship INTO `value`, with
+    /// the reader's seek running first) — and the precise `RelEquality` marker below covers that cell
+    /// via the writer's post-image announcement, plus one cell the blanket never covered at all. See
+    /// `tests/rel_seek_phantom_oracle.rs`, which pins all four cells as a permanent oracle.
+    ///
+    /// Serializability is covered by two precise markers instead:
+    ///   1. the per-candidate SIREAD in the re-check below ([`rel_data`](GraphAccess::rel_data) /
+    ///      [`rel_property`](GraphAccess::rel_property)) marks every relationship the seek examined, so
+    ///      a concurrent modify/delete of a *matching* relationship closes an rw-edge; and
+    ///   2. the precise `RelEquality` predicate marker, which pairs with the pre- and post-image
+    ///      `RelEquality` writes every relationship write path announces (`set_rel_property`,
+    ///      `create_rel`'s property loop, `remove_rel_property`, `replace_rel_properties`,
+    ///      `delete_rel`), so a concurrent INSERT — or an UPDATE of some *other* relationship INTO this
+    ///      exact `(type, property, value)` — closes an rw-edge even when the seek matches nothing.
+    ///
+    /// (The **range** twin [`rel_index_seek_range`](Self::rel_index_seek_range) KEEPS its blanket: a
+    /// range predicate has no precise equality marker, so its value-changes-into-range phantom rests on
+    /// it. Same asymmetry as the node side, where `index_seek_range` kept the blanket #316 removed from
+    /// `index_seek_eq`.)
     fn rel_index_seek_eq(
         &self,
         type_token: u32,
@@ -2318,8 +2603,10 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         if index.borrow().rel_property_state(type_token, prop_key) != Some(IndexState::Online) {
             return None; // no usable index: scan fallback
         }
-        // Preserve the scan's SSI footprint so the index path is exactly as strong (see the method doc).
-        self.mark_all_live_rels();
+        // The precise phantom-safe marker, registered HERE so BOTH callers carry it (see the method
+        // doc). Falls back to the coarse `RelType(T)` when the value is not canonically encodable —
+        // never "no marker".
+        self.note_rel_equality_read(type_token, prop_key, value);
         // Candidate ids for `(type, prop) == value`; the index is candidate-only, so re-check the full
         // predicate per candidate (visible + current type + current value equals `value`).
         let Some(candidates) = index
@@ -2419,9 +2706,24 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     ///
     /// A storage fault enumerating the relationships **fails closed**: the error is captured (aborting
     /// the enclosing write before commit) rather than swallowed, so a uniqueness check that could not
-    /// complete never silently reports "no conflict" and admits a possible duplicate. The
-    /// index-accelerated path ([`mark_all_live_rels`](Self::mark_all_live_rels)) already fails closed
-    /// the same way; this keeps the fallback's ACID stance identical.
+    /// complete never silently reports "no conflict" and admits a possible duplicate.
+    ///
+    /// # It registers no predicate marker of its own — VERIFIED not to be a hole (`rmp` #683)
+    ///
+    /// This asymmetry with the node side is real and looks alarming: the node twin
+    /// [`scan_nodes_by_label`](Self::scan_nodes_by_label) registers `PredicateRead::Label(L)` itself,
+    /// whereas this scan registers only the per-relationship physical SIREADs. It is nevertheless NOT a
+    /// phantom hole, for two independent reasons, both checked:
+    ///   * this method's **only** caller is [`rel_unique_conflict`](Self::rel_unique_conflict), which
+    ///     registers the fine `RelEquality` marker (or its coarse `RelType` fallback) *before* calling
+    ///     it — precisely so the scan fallback is covered when the index declines; and
+    ///   * the **executor's** relationship scan is a different path entirely (`rel_scan_filter_eq_ids`
+    ///     -> `read_source`), which registers its own `AnyRel` / `RelType(T)` marker
+    ///     (`read_source.rs`). Measured: with no index registered, all four phantom cells of
+    ///     `tests/rel_seek_phantom_oracle.rs` close on the scan path.
+    ///
+    /// So do not "fix" this by adding a marker here: it would be redundant with the caller's, and a
+    /// coarse `RelType(T)` added here would silently re-widen the footprint #683 narrowed.
     fn rel_scan_eq(&self, type_name: &str, property: &str, value: &Value) -> Vec<u64> {
         let ids = match self.store.borrow().scan_rel_ids() {
             Ok(ids) => ids,
@@ -2455,6 +2757,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         constraint_name: &str,
         type_name: &str,
         property_names: &[String],
+        rule: &ConstraintRule,
         rel: RelId,
     ) -> Option<ConstraintViolation> {
         // Existence half: build this relationship's own current tuple; a single absent/null covered
@@ -2478,7 +2781,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         }
         // Uniqueness half: the complete tuple must not be held by another relationship of the type.
         if self
-            .rel_key_tuple_conflict(type_name, property_names, &tuple, rel)
+            .rel_key_tuple_conflict(type_name, property_names, rule, &tuple, rel)
             .is_some()
         {
             return Some(ConstraintViolation::NodeKeyDuplicate {
@@ -2492,8 +2795,71 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         None
     }
 
+    /// Candidate relationship ids whose composite tuple for `rule`'s `(type, property tuple)` equals
+    /// `tuple` (`rmp` #683). [`None`] when no composite relationship index is registered — the caller
+    /// then takes the exact scan fallback.
+    ///
+    /// The relationship twin of [`composite_seek_eq`](Self::composite_seek_eq), with one deliberate
+    /// difference: it registers the **precise per-component `RelEquality`** markers and NO
+    /// `mark_all_live_rels()` blanket. Mirroring the node composite path's coarse `Label` + blanket
+    /// would reproduce byte-for-byte the O(live rels) footprint #683 exists to remove; the path to
+    /// mirror is the single-property [`rel_index_seek_eq`](Self::rel_index_seek_eq) (`rmp` #316's
+    /// relationship analogue).
+    ///
+    /// # Why there is no `IndexState` gate here (VERIFIED — do not "fix" this)
+    ///
+    /// [`has_rel_composite`](graphus_cypher::index_set::IndexSet::has_rel_composite) is a bare boolean
+    /// while every other index kind carries an [`IndexState`], which looks like a `rmp` #733-class hole
+    /// (a `Populating` index returns a SUBSET => a MISSED conflict => a uniqueness bypass). It is not,
+    /// because a composite index is **never observable half-built**:
+    ///   * the DDL path (`create_constraint_general`) calls `rebuild_index` **synchronously**, in the
+    ///     same call, immediately after `register_rel_composite`; the engine is single-threaded per
+    ///     database, so no other transaction can observe the interval; and
+    ///   * the standalone path (`begin_online_rel_composite_index_named`) — despite the `begin_online`
+    ///     name — is **also atomic**: it registers, populates inline, and on any scan gap the #733 guard
+    ///     **unregisters** the holed tree and returns `Err`.
+    ///
+    /// So a composite relationship index is either fully populated **or not registered at all**: the
+    /// boolean carries exactly the information an `Online` state would. Gating on `has_rel_composite`
+    /// is therefore correct, and identical to what `composite_seek_eq` does on the node side.
+    fn rel_composite_seek_eq(&self, rule: &ConstraintRule, tuple: &[Value]) -> Option<Vec<u64>> {
+        let index = self.index.as_ref()?;
+        if !index
+            .borrow()
+            .has_rel_composite(rule.label_token, &rule.property_tokens)
+        {
+            return None; // no usable composite relationship index: scan fallback
+        }
+        // SSI predicate footprint: one precise `RelEquality` marker per covered component. A writer
+        // announces one per property its relationship holds, so a relationship matching the whole tuple
+        // announces all N of these and the rw-edge always forms; one sharing only some components forms
+        // a spurious edge (an extra abort, never a missed one). Registered BEFORE the seek so a decline
+        // below still leaves the caller's scan fallback covered.
+        for (&prop_key, value) in rule.property_tokens.iter().zip(tuple.iter()) {
+            self.note_rel_equality_read(rule.label_token, prop_key, value);
+        }
+        let Some(candidates) = index.borrow_mut().seek_rel_composite_eq(
+            rule.label_token,
+            &rule.property_tokens,
+            tuple,
+        ) else {
+            // Seam declined because a key value is an unindexable `List`: return `None` so the caller
+            // takes its full scan fallback. Collapsing to `Some(vec![])` here would report NO conflicting
+            // holder and let a duplicate list-valued key silently violate the constraint (`rmp` #680/#738).
+            return None;
+        };
+        Some(candidates)
+    }
+
     /// Finds **another** relationship of type `type_name`, visible to this transaction, whose current
-    /// tuple of `property_names` equals `tuple`, excluding `self_rel` (`rmp` #638). Scan-based.
+    /// tuple of `property_names` equals `tuple`, excluding `self_rel` (`rmp` #638).
+    ///
+    /// **Index-backed** via the composite relationship index over the whole tuple when one is registered
+    /// (a RELATIONSHIP KEY at any arity, and composite relationship uniqueness, both register one —
+    /// `rmp` #683); candidate ids are re-checked against the store (visibility + current type + current
+    /// tuple). With no such index a full relationship scan + per-relationship tuple re-check is the
+    /// (correct, slower) fallback. Either way every surviving candidate is an exact match, so the first
+    /// one that is not `self_rel` is a genuine duplicate.
     ///
     /// A storage fault enumerating the relationships **fails closed** (`rmp` task #733): the error is
     /// captured — which aborts the enclosing write before it can commit — instead of being swallowed.
@@ -2505,15 +2871,21 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         &self,
         type_name: &str,
         property_names: &[String],
+        rule: &ConstraintRule,
         tuple: &[Value],
         self_rel: RelId,
     ) -> Option<u64> {
-        let ids = match self.store.borrow().scan_rel_ids() {
-            Ok(ids) => ids,
-            Err(e) => {
-                self.capture(e);
-                return None; // the captured error aborts the write; never "no duplicate".
-            }
+        // Prefer the index-backed candidate seek; fall back to the exact full scan when no composite
+        // relationship index covers the tuple (or the seam declined an unindexable value).
+        let ids: Vec<u64> = match self.rel_composite_seek_eq(rule, tuple) {
+            Some(candidates) => candidates,
+            None => match self.store.borrow().scan_rel_ids() {
+                Ok(ids) => ids,
+                Err(e) => {
+                    self.capture(e);
+                    return None; // the captured error aborts the write; never "no duplicate".
+                }
+            },
         };
         for id in ids {
             if id == self_rel.0 {
@@ -3686,9 +4058,14 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // **Cypher-equality-canonical** encoder — the same encoding the writer's
         // `note_predicate_write` uses — so Cypher-equal values (incl. cross-type `1` vs `1.0`, blocker
         // C1) register the SAME marker. NOTE this is the SSI marker ONLY; the index lookup below passes
-        // the raw `seek` `Value`, so seek/scan result semantics are entirely unchanged. A non-encodable
-        // seek value (`Null`/`List`/`Map`/`NaN`) registers no `Equality` marker (it can never equal a
-        // stored value either); the `mark_all_live_nodes` footprint still covers existing rows.
+        // the raw `seek` `Value`, so seek/scan result semantics are entirely unchanged.
+        //
+        // A non-encodable seek value registers no `Equality` marker, and that is sound WITHOUT any
+        // blanket backstop — this path has none (`rmp` #316 removed the `mark_all_live_nodes` call;
+        // do NOT reintroduce the claim that it covers here). Each non-encodable case is independently
+        // safe: `List` declines at the seam below and takes the exact scan fallback, which registers
+        // its own footprint; `Null`/`Map` are not equality-seekable; and `NaN` equals nothing, not
+        // even itself, so no writer can ever make a node match — there is no phantom to catch.
         if let Ok(encoded) = encode_equality_canonical(seek) {
             self.note_predicate_read(PredicateRead::Equality {
                 label: label_token,
@@ -4785,6 +5162,17 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             return; // error already captured
         };
         self.note_write(rel_ssi_key(rel.0));
+        // Relationship property phantom (`rmp` #683), O(1) form: announce the PRE-image of the key this
+        // write changes, BEFORE the store mutation (afterwards the vacated value is unreadable). A
+        // brand-new relationship (`create_rel`'s property loop) has no old value, so this announces
+        // nothing — exactly as it should.
+        //
+        // Announced on BOTH branches (removal and replace) because both make the relationship stop
+        // satisfying `(T, p, old)`. Arguably redundant with the physical `note_write` above — a reader
+        // that SAW this relationship marked it — but `remove_rel_property` and `replace_rel_properties`
+        // provably did NOT note_write at all before this cycle (`rmp` #683 H1/H2), so that invariant is
+        // not one to rest an ACID guarantee on. Announce it.
+        self.note_rel_property_preimage(rel, key_id);
         if value.is_null() {
             // `SET r.p = null` is a removal in Cypher: drop the key (and free any overflow chain it
             // owned) so a later read sees the property absent.
@@ -4817,6 +5205,25 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             // `rmp` #510: a non-null relationship property write counts (the `null` branch above is a
             // removal and returned early); count only on store success.
             self.bump(|c| c.properties_set += 1);
+            // Relationship property phantom (`rmp` #683), POST-image: this relationship now satisfies
+            // `(T, p, value)`, so a concurrent reader of that equality predicate — which saw nothing,
+            // because this write is invisible to its snapshot — closes an rw-edge into this writer.
+            // This is the marker that makes the seek-then-check safe WITHOUT the O(live rels) blanket:
+            // it is the *only* mechanism that catches a concurrent modify of an existing relationship
+            // INTO the sought value when the reader's seek ran first (measured — see
+            // `tests/rel_seek_phantom_oracle.rs`).
+            //
+            // Announced AFTER store success (a rejected write satisfies nothing) but regardless of
+            // `defer_constraint_check`: that flag may suppress the constraint CHECK, never a MARKER.
+            //
+            // The `rel_equality_any_declared` gate is checked FIRST so a store with no relationship
+            // index and no relationship uniqueness/key constraint does not even read the type record
+            // here (`rmp` #683 — the marker is provably inert; see `IndexSet::rel_equality_declared`).
+            if self.rel_equality_any_declared()
+                && let Some(type_id) = self.rel_type_token(rel)
+            {
+                self.note_rel_property_predicate_write(type_id, key_id, &value);
+            }
             // Enforce relationship constraints on the now-current value (`rmp` #638) unless a
             // multi-property write is deferring the single end-of-write check.
             if !self.defer_constraint_check.get() {
@@ -4945,6 +5352,17 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         let Some(key_id) = self.store.borrow().token_id(Namespace::PropKey, key) else {
             return;
         };
+        // `rmp` #683 (H1), a PRE-EXISTING serializability hole fixed here: this path never recorded the
+        // physical write at all. The node twin `remove_node_property` has always called
+        // `note_write(node_ssi_key(..))`; this one did not, so `REMOVE r.p` un-matched a relationship
+        // from `(T, p, v)` leaving **zero** SSI evidence — a read-then-unmatch write-skew that no
+        // reader could ever detect. (Not a duplicate source — un-matching only ever *relaxes*
+        // uniqueness — but a genuine serializability defect.)
+        self.note_write(rel_ssi_key(rel.0));
+        // Read-then-clear write-skew (`rmp` #683): announce the PRE-image `(T, p, old)` marker before
+        // the removal, so a concurrent reader of that equality predicate closes an rw-edge into this
+        // writer. Symmetric to `remove_node_property`'s `note_predicate_write_preimage`.
+        self.note_rel_property_preimage(rel, key_id);
         if let Err(e) = self
             .store
             .borrow_mut()
@@ -5023,6 +5441,18 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         if !self.rel_exists(rel) {
             return;
         }
+        // `rmp` #683 (H2), a PRE-EXISTING serializability hole fixed here: this path had NEITHER a
+        // `note_write` NOR a pre-image announcement. For `SET r = {}` (or an all-null map) no
+        // `set_rel_property` ever runs, so the relationship's ENTIRE property set was cleared with zero
+        // SSI evidence — invisible to every concurrent reader. The node twin
+        // `replace_node_properties` has always announced its pre-image before the clear.
+        self.note_write(rel_ssi_key(rel.0));
+        // Read-then-replace write-skew (`rmp` #683): `SET r = map` clears every existing property, so
+        // announce the relationship's FULL pre-image footprint BEFORE the clear — once the chain is
+        // cleared the per-key `set_rel_property` pre-image reads below would no longer see the vacated
+        // values. This is the wholesale form; the O(1) per-key form cannot be used because *every*
+        // property is vacated at once.
+        self.note_rel_predicate_write_full(rel);
         if let Err(e) = self
             .store
             .borrow_mut()
@@ -5081,8 +5511,8 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // or never created) is a no-op, not an error — matching the `MemGraph` contract. Visibility
         // (not raw `in_use`) is the right guard now that delete is an MVCC tombstone (the slot stays
         // in use): a second delete in the same transaction sees its own tombstone and does nothing.
-        let (mvcc, type_id) = match self.store.borrow().rel(rel.0) {
-            Ok(r) => (r.mvcc, r.type_id),
+        let mvcc = match self.store.borrow().rel(rel.0) {
+            Ok(r) => r.mvcc,
             Err(_) => return,
         };
         if !self.visible(mvcc) {
@@ -5095,8 +5525,14 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         self.note_write(rel_ssi_key(rel.0));
         // Read-then-delete relationship write-skew (`rmp` #171 blocker A1): a concurrent reader of
         // `MATCH ()-[r:T]-()` that SAW this edge must close an rw-edge into this delete. Announce the
-        // edge's rel-type predicate footprint (its pre-image type), symmetric to `create_rel`.
-        self.note_rel_predicate_write(type_id);
+        // edge's FULL pre-image predicate footprint — the coarse `[AnyRel, RelType(T)]` pair (blocker
+        // A1) PLUS one `RelEquality` per property it currently holds (`rmp` #683), because a delete
+        // makes the edge stop satisfying every one of those equality predicates too. Symmetric to
+        // `create_rel`'s post-image announcement.
+        //
+        // Runs BEFORE the store mutation: afterwards the tombstoned edge's type and property chain are
+        // no longer readable, so neither the coarse pair nor the vacated values could be enumerated.
+        self.note_rel_predicate_write_full(rel);
         if let Err(e) = self.store.borrow_mut().delete_rel(self.txn, rel.0) {
             self.capture(e);
         } else {
