@@ -1519,6 +1519,95 @@ fn rebuild_gate_declines_the_capture_for_an_older_snapshot() {
     );
 }
 
+/// `rmp` #768: the **RANGE** capture rides the SAME node-property rebuild watermark as the equality
+/// capture (`rebuilt_trees_trustworthy_from`) — exercised here, not presumed from the equality test.
+/// A reader whose snapshot predates an unrelated `CREATE INDEX` (which `clear`s + newest-wins-refills
+/// every node-property tree, destroying the stale entries it depends on) must have its range capture
+/// **decline** (→ exact `scan_filter_range`, snapshot-correct), never serve a subset. The composite
+/// capture shares the identical guard (`capture_node_property_composite`, same first two lines).
+#[test]
+fn rebuild_gate_declines_the_range_capture_for_an_older_snapshot() {
+    let mut coord = fresh_coord();
+    run_write(&mut coord, "CREATE (:Person {age: 10})");
+    coord
+        .create_node_property_index("Person", "age")
+        .expect("create the (Person, age) range index");
+
+    // The reader begins HERE: its snapshot sees `age = 10`, which satisfies `age >= 5`.
+    let reader = coord.begin_serializable();
+
+    // A writer moves the node OUT of the range (10 -> 1) and commits; the index keeps the stale
+    // (10 -> n) entry (append-only per entry), so the reader is still correctly served under its snapshot.
+    run_write(
+        &mut coord,
+        "MATCH (n:Person) WHERE n.age = 10 SET n.age = 1",
+    );
+
+    let plan = compile(
+        "MATCH (n:Person) WHERE n.age >= 5 RETURN n.age AS a",
+        &coord.catalog(),
+    );
+    let bound = bind_parameters(&plan, &Parameters::new()).expect("bind");
+    let (l_person, k_age) = {
+        let tokens = coord.read_task_inputs(reader).expect("read inputs").tokens;
+        (
+            tokens
+                .token_id(graphus_storage::Namespace::Label, "Person")
+                .expect("Person token"),
+            tokens
+                .token_id(graphus_storage::Namespace::PropKey, "age")
+                .expect("age token"),
+        )
+    };
+    let lower = Some((&Value::Integer(5), true));
+
+    // BEFORE any rebuild the memo is a superset and the reader is served the row (else the gate assertion
+    // below is vacuous).
+    assert_eq!(
+        run_plan(&coord, reader, &plan).len(),
+        1,
+        "before the rebuild the reader must see the row under its own snapshot"
+    );
+    let pre = coord.index_candidates_for(reader, &plan, &bound);
+    assert!(
+        pre.get_range(l_person, k_age, lower, None).is_some(),
+        "before the rebuild the RANGE capture must SERVE this seek (holding the stale entry) — if None \
+         the test is vacuous"
+    );
+
+    // An index on a COMPLETELY UNRELATED property rebuilds EVERY node-property tree, destroying the stale
+    // (10 -> n) entry. State stays Online, degraded heals — exactly the `rmp` #765 hazard.
+    coord
+        .create_node_property_index("Person", "unrelated")
+        .expect("create unrelated index");
+
+    // THE GATE: the reader predates the rebuild, so the range capture must DECLINE (empty), so the
+    // reader's `index_seek_range` misses and the executor falls back to the exact, snapshot-correct scan.
+    let post = coord.index_candidates_for(reader, &plan, &bound);
+    assert!(
+        post.get_range(l_person, k_age, lower, None).is_none(),
+        "GATE (rmp #765/#768): a rebuild destroyed the stale entries this reader depends on, so the \
+         RANGE capture MUST decline. Serving it would hand the reader a subset and drop a committed row."
+    );
+
+    // A reader that begins AFTER the rebuild is at-or-after the watermark: still served (the gate must
+    // not disable the fast path wholesale).
+    let fresh_reader = coord.begin_serializable();
+    let fresh = coord.index_candidates_for(fresh_reader, &plan, &bound);
+    assert!(
+        fresh.get_range(l_person, k_age, lower, None).is_some(),
+        "a post-rebuild reader must still be SERVED the range seek"
+    );
+
+    // AND THE ROW SURVIVES: the inline seek applies the SAME watermark gate (`rmp` #765, closed), so it
+    // too declines to the exact scan and the committed row visible at this reader's snapshot survives.
+    assert_eq!(
+        run_plan(&coord, reader, &plan).len(),
+        1,
+        "rmp #765: the row visible at this reader's snapshot must survive the unrelated rebuild"
+    );
+}
+
 /// **THE `rmp` #765 REGRESSION: an unrelated `CREATE INDEX` must not make a concurrent older-snapshot
 /// reader lose a committed row on the INLINE path.**
 ///

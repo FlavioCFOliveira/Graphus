@@ -3811,7 +3811,7 @@ fn scan_filter_range(
 /// incremented (`"a\u{10FFFF}"` -> `"b"`). Returns `None` when no finite successor exists (an empty
 /// prefix, or a prefix of only `U+10FFFF` scalars); the caller then seeks with an open upper bound,
 /// which is still a correct superset since the residual `STARTS WITH` filter restores exactness.
-fn string_prefix_successor(prefix: &str) -> Option<String> {
+pub(crate) fn string_prefix_successor(prefix: &str) -> Option<String> {
     let mut chars: Vec<char> = prefix.chars().collect();
     while let Some(last) = chars.pop() {
         if let Some(next) = next_scalar(last) {

@@ -1103,3 +1103,204 @@ fn off_thread_index_seek_equals_inline_seek_and_scan_across_snapshots() {
         "the stale reader must see p0 (still `a@x.io` at its snapshot) and NOT the later p_new"
     );
 }
+
+/// `rmp` task #768: a node **RANGE**, **COMPOSITE**, and **TEXT** seek is byte-identical off-thread vs
+/// inline — both the **rows** and the **canonical SIREAD buffer** — the way `rmp` #755 pinned the
+/// equality seek. Both routes run the SAME lifted re-check body (`index_seek_range_recheck` /
+/// `index_seek_composite_recheck` / `index_seek_text_recheck`); the engine thread contributes only the
+/// candidate ids (from the live index inline, from the `IndexCandidateCapture` off-thread). This measures
+/// the identity that body guarantees — the load-bearing ACID assertion that moving these seeks off-thread
+/// changes neither the answer nor the serializability footprint.
+///
+/// Non-vacuity is built in three ways: the inline seek must return `Some` (an `Online` index really
+/// serves it), the off-thread seek must return `Some` (the memo really serves it — a decline would be
+/// `None`, failing the `expect`), and the SIREAD buffers must be **non-empty** (a range/composite/text
+/// seek `mark_all_live_nodes`, so the buffers carry every live node key).
+#[test]
+fn off_thread_range_composite_text_seeks_equal_inline_rows_and_ssi_footprint() {
+    use graphus_cypher::physical::TextSeekOp;
+
+    let mut s = fresh();
+    let txn = TxnId(1);
+    s.begin(txn);
+    let l_person = s.intern_token(Namespace::Label, "Person").unwrap();
+    let l_company = s.intern_token(Namespace::Label, "Company").unwrap();
+    let k_age = s.intern_token(Namespace::PropKey, "age").unwrap();
+    let k_dept = s.intern_token(Namespace::PropKey, "dept").unwrap();
+    let k_team = s.intern_token(Namespace::PropKey, "team").unwrap();
+    let k_bio = s.intern_token(Namespace::PropKey, "bio").unwrap();
+
+    // Eight People with a unique (dept, team) pair, an int age = index, and a distinct bio.
+    let mut ids = Vec::new();
+    for i in 0..8u64 {
+        let (n, _) = s.create_node(txn).unwrap();
+        s.add_label(txn, n, l_person).unwrap();
+        s.set_node_property_value(txn, n, k_age, &Value::Integer(i as i64))
+            .unwrap();
+        s.set_node_property_value(txn, n, k_dept, &Value::String(format!("D{i}")))
+            .unwrap();
+        s.set_node_property_value(txn, n, k_team, &Value::String(format!("T{i}")))
+            .unwrap();
+        s.set_node_property_value(txn, n, k_bio, &Value::String(format!("bio{i}end")))
+            .unwrap();
+        ids.push(n);
+    }
+    // A Company that shares the same property values as a Person — it must be excluded by BOTH routes on
+    // the label re-check (so a bug that ignores the label cannot pass by matching on value alone).
+    let (company, _) = s.create_node(txn).unwrap();
+    s.add_label(txn, company, l_company).unwrap();
+    s.set_node_property_value(txn, company, k_age, &Value::Integer(7))
+        .unwrap();
+    s.set_node_property_value(txn, company, k_dept, &Value::String("D3".to_owned()))
+        .unwrap();
+    s.set_node_property_value(txn, company, k_team, &Value::String("T3".to_owned()))
+        .unwrap();
+    s.set_node_property_value(txn, company, k_bio, &Value::String("bio3end".to_owned()))
+        .unwrap();
+    s.commit(txn).unwrap();
+    let ts = s.snapshot_ts();
+
+    // Register + populate all three indexes over committed state, exactly what the coordinator's build
+    // leaves behind. The fixture drives no rebuild, so the node-property rebuild watermark and the
+    // ft/spatial marker both sit at their defaults and admit this reader (the watermark gates are pinned
+    // separately in tests/index_wiring.rs).
+    let coord = Coordinated::new(s);
+    {
+        let mut idx = coord.index.borrow_mut();
+        idx.register_node_property_with_state(l_person, k_age, IndexState::Online);
+        idx.register_composite(l_person, vec![k_dept, k_team]);
+        idx.register_text(l_person, k_bio, IndexState::Online);
+        for (i, &id) in ids.iter().enumerate() {
+            idx.insert_node_property(l_person, k_age, &Value::Integer(i as i64), id);
+            idx.insert_composite(
+                l_person,
+                &[k_dept, k_team],
+                &[
+                    Value::String(format!("D{i}")),
+                    Value::String(format!("T{i}")),
+                ],
+                id,
+            );
+            idx.insert_text_value(l_person, k_bio, &Value::String(format!("bio{i}end")), id);
+        }
+        // The populate reflects committed state, not an open transaction; clear the in-flight ft/spatial
+        // marker so the live text seam takes its fast index arm (else the comparison would be vacuous).
+        idx.clear_ft_spatial_dirty();
+    }
+
+    // A helper: run one seek on the inline seam and on an off-thread reader fed the engine-captured memo,
+    // assert the ROWS are equal (and hold `expected`), then assert the canonical SIREAD buffers are
+    // byte-identical and non-empty. `run` performs the seek on a `&dyn GraphAccess`-shaped closure.
+    let compare = |what: &str,
+                   capture: graphus_cypher::read_source::IndexCandidateCapture,
+                   inline_seek: &dyn Fn(&Live) -> Option<Vec<NodeId>>,
+                   reader_seek: &dyn Fn(&ReadOnly) -> Option<Vec<NodeId>>,
+                   expected_subset: &[NodeId]| {
+        let live = coord.live_at(TxnId(100), ts);
+        let inline = inline_seek(&live).unwrap_or_else(|| {
+            panic!("{what}: the inline seam has an Online index — it must seek")
+        });
+
+        let ro = coord
+            .reader_at(TxnId(100), ts)
+            .with_index_candidates(capture);
+        let off_thread = reader_seek(&ro)
+            .unwrap_or_else(|| panic!("{what}: the reader has a captured memo — it must seek"));
+
+        assert_eq!(
+            off_thread, inline,
+            "{what}: the off-thread seek rows disagree with the inline seek"
+        );
+        for id in expected_subset {
+            assert!(
+                off_thread.contains(id),
+                "{what}: the seek must contain {id:?} (rows={off_thread:?})"
+            );
+        }
+        assert!(
+            !off_thread.contains(&NodeId(company)),
+            "{what}: the Company node must be excluded by the label re-check (rows={off_thread:?})"
+        );
+
+        // The load-bearing ACID assertion: byte-identical SIREAD footprint. Take the live buffer BEFORE
+        // it drops (unmerged), and the reader's owned buffer, then compare canonical sorted+deduped forms.
+        let live_buf = live
+            .take_read_buffer()
+            .expect("coordinated live seam holds a SIREAD buffer");
+        let ro_buf = ro.take_buffer();
+        let (lr, lk, lp) = canonical(live_buf);
+        let (rr, rk, rp) = canonical(ro_buf);
+        assert_eq!(lr, rr, "{what}: SIREAD reader id differs");
+        assert_eq!(
+            lk, rk,
+            "{what}: per-record SIREAD key markers differ (sorted+deduped)"
+        );
+        assert_eq!(
+            lp, rp,
+            "{what}: predicate SIREAD markers differ (sorted+deduped)"
+        );
+        assert!(
+            !lk.is_empty(),
+            "{what}: expected non-empty SIREAD key markers (mark_all_live_nodes) — assertion vacuous otherwise"
+        );
+        assert!(!ro.has_error(), "{what}: reader captured an error");
+    };
+
+    // Each capture is hoisted into a `let` so the engine index's `borrow_mut()` guard is released before
+    // `compare` runs — inside `compare` the inline seam borrows the same `Rc<RefCell<IndexSet>>`.
+
+    // RANGE: `age >= 4` → the top four People (ids 4..=7), never the Company.
+    let range_cap = coord.index.borrow_mut().capture_node_property_range(
+        ts,
+        &[(l_person, k_age, Some((Value::Integer(4), true)), None)],
+    );
+    compare(
+        "range age>=4",
+        range_cap,
+        &|live: &Live| {
+            live.index_seek_range("Person", "age", Some((&Value::Integer(4), true)), None)
+        },
+        &|ro: &ReadOnly| {
+            ro.index_seek_range("Person", "age", Some((&Value::Integer(4), true)), None)
+        },
+        &[
+            NodeId(ids[4]),
+            NodeId(ids[5]),
+            NodeId(ids[6]),
+            NodeId(ids[7]),
+        ],
+    );
+
+    // COMPOSITE: `{dept:'D3', team:'T3'}` → exactly Person 3, never the same-valued Company.
+    let comp_props = ["dept".to_owned(), "team".to_owned()];
+    let comp_vals = [
+        Value::String("D3".to_owned()),
+        Value::String("T3".to_owned()),
+    ];
+    let composite_cap = coord.index.borrow_mut().capture_node_property_composite(
+        ts,
+        &[(l_person, vec![k_dept, k_team], comp_vals.to_vec())],
+    );
+    compare(
+        "composite (D3,T3)",
+        composite_cap,
+        &|live: &Live| live.index_seek_composite_eq("Person", &comp_props, &comp_vals),
+        &|ro: &ReadOnly| ro.index_seek_composite_eq("Person", &comp_props, &comp_vals),
+        &[NodeId(ids[3])],
+    );
+
+    // TEXT: `CONTAINS 'o3e'` → the trigram candidate superset (Person 3's `bio3end` matches); the residual
+    // filter above the operator restores exactness in the executor, so here we only require the true match
+    // is present and the two routes agree exactly.
+    let text_cap = coord.index.borrow_mut().capture_node_property_text(
+        ts,
+        &[(l_person, k_bio, TextSeekOp::Contains, "o3e".to_owned())],
+    );
+    compare(
+        "text CONTAINS o3e",
+        text_cap,
+        &|live: &Live| live.index_seek_text("Person", "bio", TextSeekOp::Contains, "o3e"),
+        &|ro: &ReadOnly| ro.index_seek_text("Person", "bio", TextSeekOp::Contains, "o3e"),
+        &[NodeId(ids[3])],
+    );
+}

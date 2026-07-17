@@ -45,6 +45,18 @@ use graphus_io::MemBlockDevice;
 use graphus_storage::{ConstraintKind, ConstraintTypeDescriptor, IndexState};
 use graphus_wal::{DiscardingLogSink, WalManager};
 
+/// One node-property RANGE seek to pre-run for an off-thread reader (`rmp` task #768):
+/// `(label_token, prop_key, lower, upper)`, each bound owned as `(value, inclusive)` or `None` (open).
+/// Consumed by [`IndexSet::capture_node_property_range`].
+pub type RangeCaptureRequest = (u32, u32, Option<(Value, bool)>, Option<(Value, bool)>);
+/// One node COMPOSITE equality seek to pre-run for an off-thread reader (`rmp` task #768):
+/// `(label_token, property_tokens, values)` — the full ordered key and the per-key seek values.
+/// Consumed by [`IndexSet::capture_node_property_composite`].
+pub type CompositeCaptureRequest = (u32, Vec<u32>, Vec<Value>);
+/// One node TEXT (trigram) seek to pre-run for an off-thread reader (`rmp` task #768):
+/// `(label_token, prop_key, op, needle)`. Consumed by [`IndexSet::capture_node_property_text`].
+pub type TextCaptureRequest = (u32, u32, crate::physical::TextSeekOp, String);
+
 /// The in-memory block device the derived indexes are built on.
 type Dev = MemBlockDevice;
 /// The log sink the derived indexes' ephemeral WAL is built on (`rmp` task #321).
@@ -1960,6 +1972,132 @@ impl IndexSet {
             // — and nothing else. It declines (`None`) an unindexable value, which we simply skip.
             if let Some(ids) = self.seek_node_property_eq(*label_token, *prop_key, value) {
                 capture.insert(*label_token, *prop_key, value, ids);
+            }
+        }
+        capture
+    }
+
+    /// Runs the node-property **RANGE seeks** in `requests` on this (engine-thread) index and memoises
+    /// their candidate ids for an off-thread reader (`rmp` task #768) — the range twin of
+    /// [`capture_node_property_eq`](Self::capture_node_property_eq).
+    ///
+    /// Each request is `(label_token, prop_key, lower, upper)` where each bound is an owned
+    /// `(value, inclusive)` or `None` (an open side), resolved by the caller from a plan's
+    /// `NodeIndexRangeSeek` / `NodeIndexScan` / `NodeIndexStartsWithSeek` operators whose bound values are
+    /// statically knowable (a literal or bound parameter — never a correlated per-row key, `rmp` #764).
+    ///
+    /// # Gates — identical in kind to [`capture_node_property_eq`](Self::capture_node_property_eq)
+    ///
+    /// RANGE is the same append-only node-property tree class as equality, so it rides the same
+    /// wholesale-rebuild watermark (`rmp` #765): capture nothing when [`degraded`](Self#structfield.degraded),
+    /// nothing when the reader predates the last rebuild (`reader_ts < rebuilt_trees_trustworthy_from`),
+    /// and per request only when the index is `Online`. A gate failure — or a `List` bound the index
+    /// cannot key — simply is not captured, so the reader misses and takes its exact scan fallback.
+    #[must_use]
+    pub fn capture_node_property_range(
+        &mut self,
+        reader_ts: Timestamp,
+        requests: &[RangeCaptureRequest],
+    ) -> crate::read_source::IndexCandidateCapture {
+        let mut capture = crate::read_source::IndexCandidateCapture::default();
+        // GATE 1 (degraded) + GATE 3 (rebuild watermark): identical to the equality capture — a wiped or
+        // pre-rebuild tree is a subset for this reader, so capture nothing (it declines to the scan).
+        if self.degraded || reader_ts < self.rebuilt_trees_trustworthy_from {
+            return capture;
+        }
+        for (label_token, prop_key, lower, upper) in requests {
+            // GATE 2: only an `Online` index may answer.
+            if self.node_property_state(*label_token, *prop_key) != Some(IndexState::Online) {
+                continue;
+            }
+            let lo = lower.as_ref().map(|(v, inc)| (v, *inc));
+            let up = upper.as_ref().map(|(v, inc)| (v, *inc));
+            // Structural: `seek_node_property_range` reads `node_props` (the append-only class) and
+            // declines (`None`) an unindexable `List` bound, which we skip.
+            if let Some(ids) = self.seek_node_property_range(*label_token, *prop_key, lo, up) {
+                capture.insert_range(*label_token, *prop_key, lo, up, ids);
+            }
+        }
+        capture
+    }
+
+    /// Runs the node **COMPOSITE (multi-property) equality seeks** in `requests` on this (engine-thread)
+    /// index and memoises their candidate ids for an off-thread reader (`rmp` task #768) — the composite
+    /// twin of [`capture_node_property_eq`](Self::capture_node_property_eq).
+    ///
+    /// Each request is `(label_token, property_tokens, values)`, the composite index's full ordered key
+    /// and the per-key seek values (both statically knowable). Composite indexes are the same append-only
+    /// node-property tree class as equality (`clear`-and-refill rebuild, no per-entry removal), so they
+    /// ride the same rebuild watermark (`rmp` #765). Per request the index must be registered
+    /// ([`has_composite`](Self::has_composite)); a `List` element the index cannot key is skipped.
+    #[must_use]
+    pub fn capture_node_property_composite(
+        &mut self,
+        reader_ts: Timestamp,
+        requests: &[CompositeCaptureRequest],
+    ) -> crate::read_source::IndexCandidateCapture {
+        let mut capture = crate::read_source::IndexCandidateCapture::default();
+        if self.degraded || reader_ts < self.rebuilt_trees_trustworthy_from {
+            return capture;
+        }
+        for (label_token, property_tokens, values) in requests {
+            if !self.has_composite(*label_token, property_tokens) {
+                continue;
+            }
+            if let Some(ids) = self.seek_composite_eq(*label_token, property_tokens, values) {
+                capture.insert_composite(*label_token, property_tokens, values, ids);
+            }
+        }
+        capture
+    }
+
+    /// Runs the node **TEXT (trigram) seeks** in `requests` on this (engine-thread) index and memoises
+    /// their candidate ids for an off-thread reader (`rmp` task #768).
+    ///
+    /// Each request is `(label_token, prop_key, op, needle)` from a plan's `NodeTextIndexSeek` operator
+    /// whose needle is a statically-knowable string.
+    ///
+    /// # Gates — the TEXT/trigram class, NOT the node-property tree class
+    ///
+    /// The trigram index is **not** an append-only node-property tree: like full-text and spatial it keeps
+    /// only the latest state (a write re-keys a node's trigrams wholesale), so it rides the
+    /// [`effective_ft_spatial_marker`](Self::effective_ft_spatial_marker) freshness gate (`rmp` #467),
+    /// **not** `rebuilt_trees_trustworthy_from`. Capture nothing when the reader's snapshot predates that
+    /// marker (an in-flight or rolled-back ft/spatial mutation forces it to `u64::MAX`, so every reader
+    /// declines); per request only when the trigram index is `Online`. This mirrors the inline
+    /// `RecordStoreGraph::index_seek_text` gates exactly — using the node-property watermark here instead
+    /// would be a soundness bug (a reader newer than the last node-property rebuild but older than the last
+    /// trigram re-key would be served a subset).
+    #[must_use]
+    pub fn capture_node_property_text(
+        &mut self,
+        reader_ts: Timestamp,
+        requests: &[TextCaptureRequest],
+    ) -> crate::read_source::IndexCandidateCapture {
+        use crate::physical::TextSeekOp;
+        let mut capture = crate::read_source::IndexCandidateCapture::default();
+        // The TEXT class freshness gate (`rmp` #467): an older reader may face a wholesale-re-keyed index,
+        // so it declines to the snapshot-correct scan. Folds in the in-flight / poisoned sentinels.
+        if reader_ts < self.effective_ft_spatial_marker() {
+            return capture;
+        }
+        for (label_token, prop_key, op, needle) in requests {
+            // Only an `Online` trigram index may answer (`rmp` #733); a half-built or rebuild-failed one
+            // is a subset.
+            if self.text_state(*label_token, *prop_key) != Some(IndexState::Online) {
+                continue;
+            }
+            let ids = match op {
+                TextSeekOp::Contains => self.seek_text_contains(*label_token, *prop_key, needle),
+                TextSeekOp::EndsWith => self.seek_text_ends_with(*label_token, *prop_key, needle),
+                TextSeekOp::StartsWith => {
+                    self.seek_text_starts_with(*label_token, *prop_key, needle)
+                }
+            };
+            // `None` = the needle is too short to form a trigram: the index cannot narrow, so skip it and
+            // let the reader decline to the scan (exactly as the inline seek does).
+            if let Some(ids) = ids {
+                capture.insert_text(*label_token, *prop_key, *op, needle, ids);
             }
         }
         capture
@@ -4845,6 +4983,44 @@ mod tests {
             "baseline must be committed, in-flight-free, and not poisoned"
         );
         set
+    }
+
+    /// `rmp` #768: the TEXT capture rides the **trigram/ft-spatial** freshness marker
+    /// (`effective_ft_spatial_marker`), NOT the node-property rebuild watermark the range/composite
+    /// captures use — the trigram index keeps only the latest state, so a reader older than the last
+    /// re-key could be handed a subset. This pins that the capture declines below the marker and serves
+    /// at/above it. Using the wrong watermark here would be silent row loss (a stale text reader served a
+    /// subset), which is exactly the "no path safe by analogy" trap.
+    #[test]
+    fn rmp768_text_capture_declines_for_a_reader_older_than_the_trigram_marker() {
+        use crate::physical::TextSeekOp;
+        // Node 100 = "apple" committed at ts 5, so the effective marker is Timestamp(5).
+        let mut set = text_set_with_committed_apple();
+        let req = [(1u32, 5u32, TextSeekOp::Contains, "ppl".to_owned())];
+
+        // A reader AT/AFTER the marker is served the trigram candidate ("apple" holds the "ppl" trigram).
+        let served = set.capture_node_property_text(Timestamp(5), &req);
+        assert_eq!(
+            served
+                .get_text(1, 5, TextSeekOp::Contains, "ppl")
+                .as_deref(),
+            Some(&[100u64][..]),
+            "a reader at/after the trigram marker must be SERVED the candidate — else the decline below \
+             is vacuous"
+        );
+
+        // A reader OLDER than the marker must DECLINE (→ exact scan), never be handed a subset.
+        let declined = set.capture_node_property_text(Timestamp(4), &req);
+        assert!(
+            declined
+                .get_text(1, 5, TextSeekOp::Contains, "ppl")
+                .is_none(),
+            "a reader older than the trigram freshness marker MUST decline; serving it would risk a subset"
+        );
+        assert!(
+            declined.is_empty(),
+            "the whole text capture must be empty for a pre-marker reader"
+        );
     }
 
     #[test]

@@ -316,6 +316,55 @@ impl PhysicalPlan {
         out
     }
 
+    /// Every node-property **RANGE seek** this plan will ask
+    /// [`index_seek_range`](crate::graph_access::GraphAccess::index_seek_range) for, resolved to the exact
+    /// `(label, property, lower, upper)` the executor will pass — whenever the bound is statically knowable
+    /// (`rmp` task #768). Covers all three range-index operators: [`NodeIndexRangeSeek`](PhysicalOp::NodeIndexRangeSeek)
+    /// (a `<`/`<=`/`>`/`>=` bound), [`NodeIndexScan`](PhysicalOp::NodeIndexScan) (`IS NOT NULL` → the open
+    /// `(None, None)` range), and [`NodeIndexStartsWithSeek`](PhysicalOp::NodeIndexStartsWithSeek)
+    /// (`STARTS WITH` → `[prefix, successor(prefix))`). The bound derivation mirrors the executor's byte
+    /// for byte, so the reader keys the memo identically; a value it fails to anticipate costs the
+    /// acceleration, never rows (the reader misses and takes the exact scan).
+    #[must_use]
+    pub fn static_node_index_range_seeks(
+        &self,
+        params: &crate::binding::BoundParameters,
+    ) -> Vec<StaticRangeSeek> {
+        let mut out = Vec::new();
+        collect_static_node_range_seeks(&self.root, params, &mut out);
+        out
+    }
+
+    /// Every node **COMPOSITE (multi-property) equality seek** this plan will ask
+    /// [`index_seek_composite_eq`](crate::graph_access::GraphAccess::index_seek_composite_eq) for, resolved
+    /// to `(label, properties, values)` — but only when **every** per-key seek value is statically knowable
+    /// (`rmp` task #768). A single correlated key disqualifies the whole tuple (the reader would then miss
+    /// and take the exact scan).
+    #[must_use]
+    pub fn static_node_composite_seeks(
+        &self,
+        params: &crate::binding::BoundParameters,
+    ) -> Vec<StaticCompositeSeek> {
+        let mut out = Vec::new();
+        collect_static_node_composite_seeks(&self.root, params, &mut out);
+        out
+    }
+
+    /// Every node **TEXT (trigram) seek** this plan will ask
+    /// [`index_seek_text`](crate::graph_access::GraphAccess::index_seek_text) for, resolved to
+    /// `(label, property, op, needle)` — but only when the needle is a statically-knowable **string**
+    /// (`rmp` task #768). A non-string needle matches nothing and falls to a scan in the executor, so it is
+    /// not captured.
+    #[must_use]
+    pub fn static_node_text_seeks(
+        &self,
+        params: &crate::binding::BoundParameters,
+    ) -> Vec<StaticTextSeek> {
+        let mut out = Vec::new();
+        collect_static_node_text_seeks(&self.root, params, &mut out);
+        out
+    }
+
     /// Whether this plan depends on `id`.
     #[must_use]
     pub fn depends_on(&self, id: IndexId) -> bool {
@@ -5872,6 +5921,141 @@ impl PhysicalOp {
                 Ok(())
             }
         }
+    }
+}
+
+/// One side of an owned range bound (`rmp` task #768): `(value, inclusive)`, or `None` for an open side.
+pub type OwnedRangeSide = Option<(graphus_core::Value, bool)>;
+/// One statically-knowable node-property RANGE seek, in name form (`rmp` task #768):
+/// `(label, property, lower, upper)`, each bound an [`OwnedRangeSide`]. The coordinator resolves the
+/// names to tokens for [`IndexSet::capture_node_property_range`].
+pub type StaticRangeSeek = (String, String, OwnedRangeSide, OwnedRangeSide);
+/// One statically-knowable node COMPOSITE equality seek, in name form (`rmp` task #768):
+/// `(label, properties, values)`.
+pub type StaticCompositeSeek = (String, Vec<String>, Vec<graphus_core::Value>);
+/// One statically-knowable node TEXT (trigram) seek, in name form (`rmp` task #768):
+/// `(label, property, op, needle)`.
+pub type StaticTextSeek = (String, String, TextSeekOp, String);
+
+/// The owned `(lower, upper)` bounds a [`RangeBound`] + seek value implies (`rmp` task #768) — the
+/// owned twin of the executor's `range_bounds`, kept in lockstep so the capture and the executor form
+/// byte-identical memo keys. A drift here only misses the acceleration (the reader declines to the exact
+/// scan), never a row.
+fn owned_range_bounds(
+    bound: RangeBound,
+    value: graphus_core::Value,
+) -> (OwnedRangeSide, OwnedRangeSide) {
+    match bound {
+        RangeBound::GreaterThan => (Some((value, false)), None),
+        RangeBound::GreaterOrEqual => (Some((value, true)), None),
+        RangeBound::LessThan => (None, Some((value, false))),
+        RangeBound::LessOrEqual => (None, Some((value, true))),
+    }
+}
+
+/// Collects this operator's statically-knowable node-property RANGE seeks — over all three
+/// range-index operators — then recurses into its sub-plans (`rmp` task #768). See
+/// [`PhysicalPlan::static_node_index_range_seeks`]. Walks [`PhysicalOp::children`] so a nested seek is
+/// never missed (a miss only costs the acceleration; the reader declines and scans).
+fn collect_static_node_range_seeks(
+    op: &PhysicalOp,
+    params: &crate::binding::BoundParameters,
+    out: &mut Vec<StaticRangeSeek>,
+) {
+    match op {
+        PhysicalOp::NodeIndexRangeSeek {
+            label,
+            property,
+            bound,
+            value,
+            ..
+        } => {
+            if let Some(v) = static_seek_value(value, params) {
+                let (lower, upper) = owned_range_bounds(*bound, v);
+                out.push((label.name.clone(), property.clone(), lower, upper));
+            }
+        }
+        PhysicalOp::NodeIndexScan {
+            label, property, ..
+        } => {
+            // `IS NOT NULL` lowers to the open `(None, None)` range: every index entry is a present,
+            // non-null value, and the residual `IS NOT NULL` filter above restores exactness. No operand,
+            // so it is always statically knowable — the executor unconditionally calls
+            // `index_seek_range(None, None)` for this operator.
+            out.push((label.name.clone(), property.clone(), None, None));
+        }
+        PhysicalOp::NodeIndexStartsWithSeek {
+            label,
+            property,
+            prefix,
+            ..
+        } => {
+            // `STARTS WITH <prefix>` lowers to `[prefix, successor(prefix))`, computed from the evaluated
+            // string exactly as the executor does (a non-string prefix matches nothing and scans, so it is
+            // not captured). Reuses the executor's `string_prefix_successor` so the upper bound cannot
+            // drift from the one the executor forms.
+            if let Some(graphus_core::Value::String(s)) = static_seek_value(prefix, params) {
+                let lower = Some((graphus_core::Value::String(s.clone()), true));
+                let upper = crate::executor::string_prefix_successor(&s)
+                    .map(|succ| (graphus_core::Value::String(succ), false));
+                out.push((label.name.clone(), property.clone(), lower, upper));
+            }
+        }
+        _ => {}
+    }
+    for child in op.children() {
+        collect_static_node_range_seeks(child, params, out);
+    }
+}
+
+/// Collects this operator's statically-knowable node COMPOSITE equality seeks, then recurses
+/// (`rmp` task #768). A tuple is emitted only when **every** per-key value is statically knowable. See
+/// [`PhysicalPlan::static_node_composite_seeks`].
+fn collect_static_node_composite_seeks(
+    op: &PhysicalOp,
+    params: &crate::binding::BoundParameters,
+    out: &mut Vec<StaticCompositeSeek>,
+) {
+    if let PhysicalOp::NodeCompositeIndexSeek {
+        label,
+        properties,
+        values,
+        ..
+    } = op
+    {
+        let resolved: Option<Vec<graphus_core::Value>> = values
+            .iter()
+            .map(|v| static_seek_value(v, params))
+            .collect();
+        if let Some(vals) = resolved {
+            out.push((label.name.clone(), properties.clone(), vals));
+        }
+    }
+    for child in op.children() {
+        collect_static_node_composite_seeks(child, params, out);
+    }
+}
+
+/// Collects this operator's statically-knowable node TEXT (trigram) seeks, then recurses
+/// (`rmp` task #768). Emitted only for a string needle. See [`PhysicalPlan::static_node_text_seeks`].
+fn collect_static_node_text_seeks(
+    op: &PhysicalOp,
+    params: &crate::binding::BoundParameters,
+    out: &mut Vec<StaticTextSeek>,
+) {
+    if let PhysicalOp::NodeTextIndexSeek {
+        label,
+        property,
+        op: text_op,
+        needle,
+        ..
+    } = op
+        && let Some(graphus_core::Value::String(s)) = static_seek_value(needle, params)
+    {
+        out.push((label.name.clone(), property.clone(), *text_op, s));
+    }
+    for child in op.children() {
+        collect_static_node_text_seeks(child, params, out);
     }
 }
 

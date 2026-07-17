@@ -350,6 +350,22 @@ impl<D: BlockDevice, S: LogSink> StoreReadSource for ReadViewSource<'_, D, S> {
 ///
 /// [`Self::get`] returning `None` means "not captured" and MUST be treated by the caller as
 /// **decline → exact scan fallback**, never as "no rows" (`rmp` #680/#738).
+///
+/// # Beyond equality (`rmp` task #768)
+///
+/// `rmp` #755 captured only node-property **equality** seeks; every other node-property seek — RANGE,
+/// COMPOSITE, TEXT — fell to the reader's `GraphAccess` default (`None`) and full-scanned the label
+/// while the plan still named the index. This memo now carries all three, each keyed by the exact
+/// `GraphAccess` call the reader makes so the reader looks it up by the same arguments the capture
+/// resolved. The MVCC-superset argument and the "miss ⇒ decline, never `Some(empty)`" contract are
+/// unchanged and apply per kind; the per-kind capture gates (which rebuild watermark, which index
+/// state) live in [`IndexSet`](crate::index_set::IndexSet) — RANGE/COMPOSITE ride the node-property
+/// `rebuilt_trees_trustworthy_from` watermark (`rmp` #765), TEXT rides the trigram index's
+/// `effective_ft_spatial_marker` (`rmp` #467), exactly as their inline seeks do.
+/// The memo key for a captured COMPOSITE seek (`rmp` #768): `(label_token, property_tokens,
+/// encode_values(values))`. Factored to a named type so the map declaration stays legible.
+type CompositeCaptureKey = (u32, Vec<u32>, Vec<u8>);
+
 #[derive(Debug, Clone, Default)]
 pub struct IndexCandidateCapture {
     /// `(label_token, prop_key, encode_single(seek))` → the candidate ids that seek returned.
@@ -361,12 +377,25 @@ pub struct IndexCandidateCapture {
     /// same literal/parameter the capture used, the two encodings always agree; and a key that does not
     /// agree simply misses, which degrades to the exact scan.
     entries: HashMap<(u32, u32, Vec<u8>), Arc<[u64]>>,
+    /// `(label_token, prop_key, encode_range_bounds(lower, upper))` → the range candidate ids
+    /// (`rmp` #768). The bound encoding is byte-canonical and unambiguous (a tag byte per side, and a
+    /// length-prefixed [`encode_single`] of each present bound value), so the reader — which forms the
+    /// same `(lower, upper)` from the same literal/parameter the capture used — keys identically.
+    range: HashMap<(u32, u32, Vec<u8>), Arc<[u64]>>,
+    /// `(label_token, property_tokens, encode_values(values))` → the composite candidate ids
+    /// (`rmp` #768). The property tokens are the composite index's full ordered key; the value encoding
+    /// is a length-prefixed [`encode_single`] of each element, matching the reader's own resolution.
+    composite: HashMap<CompositeCaptureKey, Arc<[u64]>>,
+    /// `(label_token, prop_key, op, needle)` → the trigram text candidate ids (`rmp` #768). The needle
+    /// is the raw string (the trigram index keys on characters, not the order-preserving codec), so it
+    /// is stored verbatim; the reader looks it up with the same `(op, needle)` it evaluated.
+    text: HashMap<(u32, u32, crate::physical::TextSeekOp, String), Arc<[u64]>>,
 }
 
-// `rmp` #755, Slice S2: the capture rides a `ReadTask` to a reader thread, so it must be `Send + Sync`.
-// A compile-time assertion (no runtime body), mirroring `TokenSnapshot`'s — it fails to build the
-// instant a non-`Sync` field is introduced. `HashMap<(u32, u32, Vec<u8>), Arc<[u64]>>` is `Send + Sync`
-// by auto-derivation, with no `unsafe impl`.
+// `rmp` #755/#768, Slice S2: the capture rides a `ReadTask` to a reader thread, so it must be
+// `Send + Sync`. A compile-time assertion (no runtime body), mirroring `TokenSnapshot`'s — it fails to
+// build the instant a non-`Sync` field is introduced. Every field is a `HashMap` of `Send + Sync`
+// keys/values (`TextSeekOp` is a plain `Copy` enum), so this holds by auto-derivation, no `unsafe impl`.
 const _: () = {
     fn assert_send_sync<T: Send + Sync>() {}
     fn assert_index_candidate_capture() {
@@ -374,6 +403,44 @@ const _: () = {
     }
     let _ = assert_index_candidate_capture;
 };
+
+/// The canonical, unambiguous byte key for a `(lower, upper)` range request (`rmp` #768). Each side is
+/// a tag byte — `0` = open, `1` = inclusive, `2` = exclusive — followed, when present, by the
+/// length-prefixed [`encode_single`] of the bound value. Returns `None` when a present bound value is
+/// not index-encodable (a `List`): the capture then does not key it and the reader misses → declines to
+/// the exact scan, exactly as the inline seek declines a `List` bound (`rmp` #680).
+fn encode_range_bounds_key(
+    lower: Option<(&Value, bool)>,
+    upper: Option<(&Value, bool)>,
+) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    for side in [lower, upper] {
+        match side {
+            None => out.push(0u8),
+            Some((v, inclusive)) => {
+                let enc = encode_single(v).ok()?;
+                out.push(if inclusive { 1u8 } else { 2u8 });
+                out.extend_from_slice(&(enc.len() as u32).to_le_bytes());
+                out.extend_from_slice(&enc);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// The canonical, unambiguous byte key for a composite tuple's `values` (`rmp` #768): the
+/// length-prefixed [`encode_single`] of each element, concatenated in key order. Returns `None` when
+/// **any** element is not index-encodable (a `List`), matching the inline composite seek's whole-tuple
+/// decline (`rmp` #680).
+fn encode_values_key(values: &[Value]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    for v in values {
+        let enc = encode_single(v).ok()?;
+        out.extend_from_slice(&(enc.len() as u32).to_le_bytes());
+        out.extend_from_slice(&enc);
+    }
+    Some(out)
+}
 
 impl IndexCandidateCapture {
     /// Memoises `ids` as the candidate list for `(label_token, prop_key) == seek`.
@@ -398,10 +465,115 @@ impl IndexCandidateCapture {
         self.entries.get(&(label_token, prop_key, key)).cloned()
     }
 
-    /// Whether nothing was captured (the common case: a read with no indexed equality seek).
+    /// Memoises `ids` as the RANGE candidate list for `(label_token, prop_key)` under `(lower, upper)`
+    /// (`rmp` #768). A `List` bound value cannot be keyed and is silently not captured — the reader then
+    /// misses and takes the exact scan, exactly as the inline seek declines it (`rmp` #680).
+    pub fn insert_range(
+        &mut self,
+        label_token: u32,
+        prop_key: u32,
+        lower: Option<(&Value, bool)>,
+        upper: Option<(&Value, bool)>,
+        ids: Vec<u64>,
+    ) {
+        if let Some(key) = encode_range_bounds_key(lower, upper) {
+            self.range.insert((label_token, prop_key, key), ids.into());
+        }
+    }
+
+    /// The memoised RANGE candidate ids for `(label_token, prop_key)` under `(lower, upper)`, or `None`
+    /// if this range was not captured — which the caller MUST turn into a declined seek (exact scan
+    /// fallback), never an empty result (`rmp` #680/#738).
+    #[must_use]
+    pub fn get_range(
+        &self,
+        label_token: u32,
+        prop_key: u32,
+        lower: Option<(&Value, bool)>,
+        upper: Option<(&Value, bool)>,
+    ) -> Option<Arc<[u64]>> {
+        let key = encode_range_bounds_key(lower, upper)?;
+        self.range.get(&(label_token, prop_key, key)).cloned()
+    }
+
+    /// Memoises `ids` as the COMPOSITE candidate list for `(label_token, property_tokens)` under
+    /// `values` (`rmp` #768). A `List` element cannot be keyed and is silently not captured.
+    pub fn insert_composite(
+        &mut self,
+        label_token: u32,
+        property_tokens: &[u32],
+        values: &[Value],
+        ids: Vec<u64>,
+    ) {
+        if let Some(key) = encode_values_key(values) {
+            self.composite
+                .insert((label_token, property_tokens.to_vec(), key), ids.into());
+        }
+    }
+
+    /// The memoised COMPOSITE candidate ids for `(label_token, property_tokens)` under `values`, or
+    /// `None` if this tuple was not captured — the caller MUST decline (exact scan fallback), never an
+    /// empty result (`rmp` #680/#738).
+    #[must_use]
+    pub fn get_composite(
+        &self,
+        label_token: u32,
+        property_tokens: &[u32],
+        values: &[Value],
+    ) -> Option<Arc<[u64]>> {
+        let key = encode_values_key(values)?;
+        self.composite
+            .get(&(label_token, property_tokens.to_vec(), key))
+            .cloned()
+    }
+
+    /// Memoises `ids` as the TEXT candidate list for `(label_token, prop_key)` under `(op, needle)`
+    /// (`rmp` #768).
+    pub fn insert_text(
+        &mut self,
+        label_token: u32,
+        prop_key: u32,
+        op: crate::physical::TextSeekOp,
+        needle: &str,
+        ids: Vec<u64>,
+    ) {
+        self.text
+            .insert((label_token, prop_key, op, needle.to_owned()), ids.into());
+    }
+
+    /// The memoised TEXT candidate ids for `(label_token, prop_key)` under `(op, needle)`, or `None` if
+    /// not captured — the caller MUST decline (exact scan fallback), never an empty result
+    /// (`rmp` #680/#738).
+    #[must_use]
+    pub fn get_text(
+        &self,
+        label_token: u32,
+        prop_key: u32,
+        op: crate::physical::TextSeekOp,
+        needle: &str,
+    ) -> Option<Arc<[u64]>> {
+        self.text
+            .get(&(label_token, prop_key, op, needle.to_owned()))
+            .cloned()
+    }
+
+    /// Folds `other`'s memoised seeks into `self` (`rmp` task #768), used by the dispatch site to merge
+    /// the per-kind captures (equality, range, composite, text) into one memo for the reader. The four
+    /// maps are disjoint by kind, so this is a straight per-map extend.
+    pub fn absorb(&mut self, other: IndexCandidateCapture) {
+        self.entries.extend(other.entries);
+        self.range.extend(other.range);
+        self.composite.extend(other.composite);
+        self.text.extend(other.text);
+    }
+
+    /// Whether nothing was captured (the common case: a read with no indexed seek).
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+            && self.range.is_empty()
+            && self.composite.is_empty()
+            && self.text.is_empty()
     }
 }
 
@@ -954,6 +1126,168 @@ pub fn index_seek_eq_recheck<S: StoreReadSource, K: ReadSink>(
         })
         .collect();
     // De-duplicate: a stale + a live index entry can name the same id twice.
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The **re-check half** of an indexed node-property RANGE seek (`rmp` task #768): given a candidate id
+/// list from *some* index source, register the seek's SSI footprint and reduce the candidates to exactly
+/// the rows `scan_filter_range` would return for the same `(label, property, lower, upper)`.
+///
+/// Lifted for the same anti-drift reason as [`index_seek_eq_recheck`]: `RecordStoreGraph::index_seek_range`
+/// (candidates from its live `IndexSet`) and the off-thread `ReadOnlyGraph` (candidates from the
+/// [`IndexCandidateCapture`] memo) both call this one body, so their rows and their SSI footprint are
+/// identical **by construction**, not by review.
+///
+/// # SSI footprint (byte-identical to the inline range seek and to `scan_filter_range`, `rmp` #171/§5.4)
+///
+/// A range predicate has no precise per-value `Equality` marker, so — exactly as the inline seek and the
+/// scan fallback it stands in for both do — it registers the conservative pair: the coarse
+/// [`PredicateRead::Label`] marker (any concurrent INSERT of this label is a possible phantom) plus the
+/// blanket [`mark_all_live_nodes`] read (a range scan reads every node to evaluate the predicate). The
+/// per-candidate SIREAD in [`filter_label_candidates`] is subsumed by that blanket. This is the same
+/// footprint whether the index serves the seek or the scan replaces it, so serving it off-thread changes
+/// nothing (`rmp` #755's "do not change the footprint" rule).
+///
+/// # The contract on `candidates`
+///
+/// `candidates` MUST be a **superset** of the ids whose *current, snapshot-visible* value satisfies
+/// `(lower, upper)` under `(label_token, prop_key)`. A superset is safe (this body filters extras out via
+/// [`crate::eval::satisfies_range`], the single comparison source of truth); a **subset is silent row
+/// loss** this body cannot detect. A caller that cannot guarantee the superset MUST decline (`None` →
+/// exact scan fallback), never `Some(vec![])` (`rmp` #680/#738).
+#[allow(clippy::too_many_arguments)] // a lifted read body; the source/ctx/sink seams are positional
+pub fn index_seek_range_recheck<S: StoreReadSource, K: ReadSink>(
+    src: &S,
+    ctx: &VisCtx,
+    sink: &K,
+    label_token: u32,
+    property: &str,
+    lower: Option<(&Value, bool)>,
+    upper: Option<(&Value, bool)>,
+    candidates: Vec<u64>,
+) -> Vec<NodeId> {
+    // Preserve the exact `scan_filter_range` read footprint (`scan_nodes_by_label` → `Label` +
+    // `mark_all_live_nodes`) so the index path and the scan fallback are indistinguishable to SSI.
+    sink.note_predicate_read(PredicateRead::Label(label_token));
+    mark_all_live_nodes(src, sink);
+
+    // Re-check the FULL predicate per candidate: visible + carries the label (`filter_label_candidates`,
+    // which SIREAD-marks each examined id — subsumed by the blanket above — and fails closed on a read
+    // fault), then the *current* value satisfies BOTH bounds under Cypher comparison semantics.
+    let labelled = filter_label_candidates(src, ctx, sink, label_token, candidates);
+    let mut out: Vec<NodeId> = labelled
+        .into_iter()
+        .filter(|id| {
+            node_property(src, ctx, sink, *id, property)
+                .is_some_and(|v| crate::eval::satisfies_range(&v, lower, upper))
+        })
+        .collect();
+    // De-duplicate: a stale + a live index entry can name the same id twice.
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The **re-check half** of an indexed node COMPOSITE (multi-property) equality seek (`rmp` task #768):
+/// given a candidate id list from *some* index source, register the seek's SSI footprint and reduce the
+/// candidates to exactly the rows `scan_filter_composite_eq` would return for the same
+/// `(label, properties, values)`.
+///
+/// Lifted for the same anti-drift reason as [`index_seek_eq_recheck`]: the inline
+/// `RecordStoreGraph::index_seek_composite_eq` and the off-thread reader both call this one body.
+///
+/// # SSI footprint (byte-identical to the inline composite seek and to `scan_filter_composite_eq`)
+///
+/// The composite index has no precise multi-property `Equality` marker, so — exactly as the inline seek
+/// and the scan fallback both do — it registers the coarse [`PredicateRead::Label`] marker (pairing with
+/// every node insert's `Label(L)` write footprint, closing the composite-absence phantom the physical
+/// per-key SIREADs alone would miss) plus the blanket [`mark_all_live_nodes`]. Conservative but never
+/// wrong; unchanged whether the index serves the seek or the scan replaces it (`rmp` #401/#755).
+///
+/// # The contract on `candidates`
+///
+/// `candidates` MUST be a **superset** of the ids whose *current, snapshot-visible* tuple over
+/// `properties` equals `values` element-wise by Cypher equality. A superset is safe (this body filters
+/// extras out); a subset is silent row loss. A caller that cannot guarantee the superset MUST decline
+/// (`None` → exact scan fallback), never `Some(vec![])` (`rmp` #680/#738).
+#[allow(clippy::too_many_arguments)] // a lifted read body; the source/ctx/sink seams are positional
+pub fn index_seek_composite_recheck<S: StoreReadSource, K: ReadSink>(
+    src: &S,
+    ctx: &VisCtx,
+    sink: &K,
+    label_token: u32,
+    properties: &[String],
+    values: &[Value],
+    candidates: Vec<u64>,
+) -> Vec<NodeId> {
+    // Preserve the exact `scan_filter_composite_eq` read footprint (the coarse `Label` marker + the
+    // blanket `mark_all_live_nodes`) so the index path and the scan fallback are indistinguishable.
+    sink.note_predicate_read(PredicateRead::Label(label_token));
+    mark_all_live_nodes(src, sink);
+
+    // Re-check the FULL predicate per candidate: visible + carries the label
+    // (`filter_label_candidates`), then the *current* per-property tuple equals `values` element-wise by
+    // Cypher equality — the same test `scan_filter_composite_eq` applies, so both paths return the
+    // identical set.
+    let labelled = filter_label_candidates(src, ctx, sink, label_token, candidates);
+    let mut out: Vec<NodeId> = labelled
+        .into_iter()
+        .filter(|id| {
+            properties
+                .iter()
+                .zip(values.iter())
+                .all(|(property, value)| {
+                    node_property(src, ctx, sink, *id, property)
+                        .is_some_and(|v| crate::equality::equals(&v, value).is_true())
+                })
+        })
+        .collect();
+    // De-duplicate: a stale + a live index entry can name the same id twice.
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The **re-check half** of an indexed node TEXT (trigram) seek (`rmp` task #768): given a candidate id
+/// list from *some* index source, register the seek's SSI footprint and reduce the candidates to the
+/// visible, currently-labelled nodes — the exact set the inline `RecordStoreGraph::index_seek_text`
+/// returns for the same `label_token`.
+///
+/// Lifted for the same anti-drift reason as [`index_seek_eq_recheck`]: the inline
+/// `RecordStoreGraph::index_seek_text` and the off-thread reader both call this one body, so their rows
+/// and their SSI footprint are identical **by construction**.
+///
+/// # No predicate residual here — the executor keeps it (verified, `rmp` #662/#768)
+///
+/// Unlike RANGE/COMPOSITE, the text operator does **not** consume its predicate: the planner leaves the
+/// exact `CONTAINS`/`ENDS WITH`/`STARTS WITH` as a residual [`Filter`](crate::physical::PhysicalOp::Filter)
+/// **above** [`NodeTextIndexSeek`](crate::physical::PhysicalOp::NodeTextIndexSeek) (executor.rs, the
+/// `NodeTextIndexSeek` arm). So this body — like the inline seek — only narrows the trigram candidate
+/// superset to visible, labelled nodes; that residual filter restores exactness. It therefore applies **no**
+/// string predicate itself, and the result is identical whether the trigram index serves the seek or a
+/// label scan replaces it.
+///
+/// # SSI footprint (byte-identical to the inline text seek, `rmp` #467/#768)
+///
+/// The blanket [`mark_all_live_nodes`] read (the trigram seek stands in for a label scan that reads every
+/// node) plus the per-candidate [`filter_label_candidates`] SIREAD it subsumes. This matches the **inline
+/// text seek** exactly (the acceptance bar); note the inline text seek — and its spatial sibling — register
+/// **no** coarse `Label` phantom marker, so this reproduces the inline seek's footprint, not the scan's
+/// (which does register `Label`). That established seek/scan asymmetry is pre-existing (`rmp` #662/#73),
+/// out of scope for this task, and reproduced here rather than altered.
+pub fn index_seek_text_recheck<S: StoreReadSource, K: ReadSink>(
+    src: &S,
+    ctx: &VisCtx,
+    sink: &K,
+    label_token: u32,
+    candidates: Vec<u64>,
+) -> Vec<NodeId> {
+    // Preserve the inline text seek's read footprint: the blanket `mark_all_live_nodes` (a text seek
+    // stands in for a label scan) + the per-candidate SIREAD in `filter_label_candidates` it subsumes.
+    mark_all_live_nodes(src, sink);
+    let mut out = filter_label_candidates(src, ctx, sink, label_token, candidates);
     out.sort_unstable();
     out.dedup();
     out

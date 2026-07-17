@@ -495,3 +495,170 @@ async fn the_off_thread_reader_serves_the_index_seek_and_profile_measures_it() {
 
     let _ = server.shutdown().await;
 }
+
+/// **`rmp` #768 — the off-thread reader now serves a node RANGE seek, MEASURED.**
+///
+/// `rmp` #755 taught the reader pool only node-property **equality** seeks. Every other node-property
+/// seek — RANGE (`<`/`<=`/`>`/`>=`), COMPOSITE, TEXT — still fell to the reader's `GraphAccess` default
+/// (`None`) and full-scanned the label while the plan named the index. This pins the RANGE fix the way
+/// the equality one is pinned: a `PROFILE`d auto-commit read over the wire (so it runs on the reader
+/// pool) whose **measured `dbHits`** must be a small fraction of the same query's full scan. Asserting
+/// the operator NAME is deliberately NOT enough — a `NodeIndexRangeSeek` in the plan is exactly what
+/// shipped over a full scan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_off_thread_reader_serves_a_range_seek_and_profile_measures_it() {
+    let temp = TempStore::new("readerpool-range");
+    let server = boot(&temp).await;
+
+    let (seek_ops, seek_hits, scan_hits) = tokio::task::spawn_blocking(move || {
+        let mut c = connect(&temp);
+        // 300 items 0..=299; the seek `n >= 295` matches only the top 5.
+        c.run("UNWIND range(0, 299) AS i CREATE (:Item {n: i})")
+            .expect("seed");
+        c.run("CREATE INDEX item_n FOR (x:Item) ON (x.n)")
+            .expect("index");
+
+        let query = "PROFILE MATCH (x:Item) WHERE x.n >= 295 RETURN x.n AS n";
+        let seek = c.run(query).expect("indexed range read");
+        let seek_plan = wire_plan(&seek.summary).expect("plan");
+        assert_eq!(seek.records.len(), 5, "295..=299 match");
+
+        c.run("DROP INDEX item_n").expect("drop");
+        let scan = c.run(query).expect("unindexed range read");
+        let scan_plan = wire_plan(&scan.summary).expect("plan");
+        assert_eq!(scan.records.len(), 5, "the rows are identical either way");
+
+        (
+            operators(&seek_plan.root),
+            total_db_hits(&seek_plan.root),
+            total_db_hits(&scan_plan.root),
+        )
+    })
+    .await
+    .expect("client thread");
+
+    assert!(
+        seek_ops.iter().any(|o| o == "NodeIndexRangeSeek"),
+        "the planner DID pick the range index: {seek_ops:?}"
+    );
+    assert!(
+        seek_hits * 4 < scan_hits,
+        "MEASURED FIX (rmp #768): the reader pool now SERVES the range seek from the candidates \
+         captured at dispatch, so the indexed range must read a small fraction of the full scan \
+         (seek={seek_hits}, scan={scan_hits}). Before #768 the off-thread reader declined every range \
+         seek and read the whole label while the plan still said NodeIndexRangeSeek."
+    );
+
+    let _ = server.shutdown().await;
+}
+
+/// **`rmp` #768 — the off-thread reader now serves a node COMPOSITE (multi-property) seek, MEASURED.**
+///
+/// Same shape as the range test, for a two-property composite equality seek
+/// (`{dept: …, team: …}`) backed by a composite `RANGE` index.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_off_thread_reader_serves_a_composite_seek_and_profile_measures_it() {
+    let temp = TempStore::new("readerpool-composite");
+    let server = boot(&temp).await;
+
+    let (seek_ops, seek_hits, scan_hits) = tokio::task::spawn_blocking(move || {
+        let mut c = connect(&temp);
+        // Each employee has a UNIQUE (dept, team) pair, so the composite seek matches exactly one.
+        c.run(
+            "UNWIND range(0, 299) AS i \
+             CREATE (:Emp {dept: 'D' + toString(i), team: 'T' + toString(i)})",
+        )
+        .expect("seed");
+        c.run("CREATE INDEX emp_dept_team FOR (e:Emp) ON (e.dept, e.team)")
+            .expect("composite index");
+
+        let query = "PROFILE MATCH (e:Emp {dept: 'D7', team: 'T7'}) RETURN e.dept AS d";
+        let seek = c.run(query).expect("indexed composite read");
+        let seek_plan = wire_plan(&seek.summary).expect("plan");
+        assert_eq!(seek.records.len(), 1, "one employee matches (D7, T7)");
+
+        c.run("DROP INDEX emp_dept_team").expect("drop");
+        let scan = c.run(query).expect("unindexed composite read");
+        let scan_plan = wire_plan(&scan.summary).expect("plan");
+        assert_eq!(
+            scan.records, seek.records,
+            "the rows are identical either way"
+        );
+
+        (
+            operators(&seek_plan.root),
+            total_db_hits(&seek_plan.root),
+            total_db_hits(&scan_plan.root),
+        )
+    })
+    .await
+    .expect("client thread");
+
+    assert!(
+        seek_ops.iter().any(|o| o == "NodeCompositeIndexSeek"),
+        "the planner DID pick the composite index: {seek_ops:?}"
+    );
+    assert!(
+        seek_hits * 4 < scan_hits,
+        "MEASURED FIX (rmp #768): the reader pool now SERVES the composite seek from the candidates \
+         captured at dispatch (seek={seek_hits}, scan={scan_hits}). Before #768 the off-thread reader \
+         declined it and read the whole label while the plan still said NodeCompositeIndexSeek."
+    );
+
+    let _ = server.shutdown().await;
+}
+
+/// **`rmp` #768 — the off-thread reader now serves a node TEXT (trigram) seek, MEASURED.**
+///
+/// This is the exact residual the `rmp` #746 index-seek gate reproduced on a live server:
+/// `NodeTextIndexSeek` in the plan, a full-scan `dbHits` at runtime. A `CONTAINS` auto-commit read over
+/// the wire must now measure a small fraction of its full scan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_off_thread_reader_serves_a_text_seek_and_profile_measures_it() {
+    let temp = TempStore::new("readerpool-text");
+    let server = boot(&temp).await;
+
+    let (seek_ops, seek_hits, scan_hits) = tokio::task::spawn_blocking(move || {
+        let mut c = connect(&temp);
+        // Bodies `doc0xyz`..`doc299xyz`; the 3-char needle `c7x` forms a trigram and matches only `doc7xyz`.
+        c.run("UNWIND range(0, 299) AS i CREATE (:Doc {body: 'doc' + toString(i) + 'xyz'})")
+            .expect("seed");
+        c.run("CREATE TEXT INDEX doc_body FOR (d:Doc) ON (d.body)")
+            .expect("text index");
+
+        let query = "PROFILE MATCH (d:Doc) WHERE d.body CONTAINS 'c7x' RETURN d.body AS b";
+        let seek = c.run(query).expect("indexed text read");
+        let seek_plan = wire_plan(&seek.summary).expect("plan");
+        assert_eq!(seek.records.len(), 1, "only doc7xyz contains 'c7x'");
+
+        c.run("DROP INDEX doc_body").expect("drop");
+        let scan = c.run(query).expect("unindexed text read");
+        let scan_plan = wire_plan(&scan.summary).expect("plan");
+        assert_eq!(
+            scan.records, seek.records,
+            "the rows are identical either way"
+        );
+
+        (
+            operators(&seek_plan.root),
+            total_db_hits(&seek_plan.root),
+            total_db_hits(&scan_plan.root),
+        )
+    })
+    .await
+    .expect("client thread");
+
+    assert!(
+        seek_ops.iter().any(|o| o == "NodeTextIndexSeek"),
+        "the planner DID pick the text index: {seek_ops:?}"
+    );
+    assert!(
+        seek_hits * 4 < scan_hits,
+        "MEASURED FIX (rmp #768, the #746 I9 residual): the reader pool now SERVES the trigram text \
+         seek from the candidates captured at dispatch (seek={seek_hits}, scan={scan_hits}). Before \
+         #768 the off-thread reader declined it and read the whole label while the plan still said \
+         NodeTextIndexSeek — measured on the live server as text_seek_hits=801 == text_scan_hits=801."
+    );
+
+    let _ = server.shutdown().await;
+}

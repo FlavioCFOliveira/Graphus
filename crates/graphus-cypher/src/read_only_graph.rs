@@ -331,6 +331,103 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         ))
     }
 
+    fn index_seek_range(
+        &self,
+        label: &str,
+        property: &str,
+        lower: Option<(&Value, bool)>,
+        upper: Option<(&Value, bool)>,
+    ) -> Option<Vec<NodeId>> {
+        // `rmp` task #768 — the range twin of `index_seek_eq` above. The reader holds no `IndexSet`, so
+        // the range candidates come from the memo the engine thread captured at dispatch, keyed by the
+        // same `(lower, upper)` the executor formed. A MISS (not captured, a `List` bound, a gate
+        // refused it) MUST decline so the executor takes the exact `scan_filter_range` fallback — never
+        // `Some(vec![])`, which would silently drop rows (`rmp` #680/#738).
+        let label_token = self.tokens.token_id(Namespace::Label, label)?;
+        let prop_key = self.tokens.token_id(Namespace::PropKey, property)?;
+        let candidates = self
+            .index_candidates
+            .get_range(label_token, prop_key, lower, upper)?;
+
+        // The SAME lifted body the inline seam runs (`rmp` #768): the `Label` predicate marker + the
+        // blanket `mark_all_live_nodes` + the per-candidate visibility/label re-check + the
+        // `satisfies_range` residual + the dedup — so rows and SSI footprint match the inline seek by
+        // construction.
+        Some(read_source::index_seek_range_recheck(
+            &self.source(),
+            &self.ctx(),
+            self,
+            label_token,
+            property,
+            lower,
+            upper,
+            candidates.to_vec(),
+        ))
+    }
+
+    fn index_seek_composite_eq(
+        &self,
+        label: &str,
+        properties: &[String],
+        values: &[Value],
+    ) -> Option<Vec<NodeId>> {
+        // `rmp` task #768 — the composite twin. Resolve the label + every property key to a token (a
+        // missing token cannot match any composite index, so decline), then consult the memo keyed by
+        // the full ordered property-token tuple. A MISS MUST decline to the exact
+        // `scan_filter_composite_eq` fallback (`rmp` #680/#738).
+        let label_token = self.tokens.token_id(Namespace::Label, label)?;
+        let property_tokens: Option<Vec<u32>> = properties
+            .iter()
+            .map(|p| self.tokens.token_id(Namespace::PropKey, p))
+            .collect();
+        let property_tokens = property_tokens?;
+        let candidates =
+            self.index_candidates
+                .get_composite(label_token, &property_tokens, values)?;
+
+        // The SAME lifted body the inline seam runs: the `Label` marker + `mark_all_live_nodes` + the
+        // per-candidate label re-check + the element-wise tuple equality residual + the dedup.
+        Some(read_source::index_seek_composite_recheck(
+            &self.source(),
+            &self.ctx(),
+            self,
+            label_token,
+            properties,
+            values,
+            candidates.to_vec(),
+        ))
+    }
+
+    fn index_seek_text(
+        &self,
+        label: &str,
+        property: &str,
+        op: crate::physical::TextSeekOp,
+        needle: &str,
+    ) -> Option<Vec<NodeId>> {
+        // `rmp` task #768 — the trigram-text twin. The candidates come from the memo keyed by
+        // `(label, property, op, needle)`; a MISS (not captured, needle too short, a gate refused it)
+        // MUST decline so the executor takes the exact label-scan fallback and the residual
+        // `CONTAINS`/`ENDS WITH`/`STARTS WITH` filter above restores exactness (`rmp` #680/#738).
+        let label_token = self.tokens.token_id(Namespace::Label, label)?;
+        let prop_key = self.tokens.token_id(Namespace::PropKey, property)?;
+        let candidates = self
+            .index_candidates
+            .get_text(label_token, prop_key, op, needle)?;
+
+        // The SAME lifted body the inline seam runs: the blanket `mark_all_live_nodes` + the
+        // per-candidate visibility/label re-check + the dedup (no predicate residual — the executor keeps
+        // the exact string filter above this operator). Rows and SSI footprint match the inline text seek
+        // by construction.
+        Some(read_source::index_seek_text_recheck(
+            &self.source(),
+            &self.ctx(),
+            self,
+            label_token,
+            candidates.to_vec(),
+        ))
+    }
+
     fn expand(&self, node: NodeId, direction: ExpandDirection, types: &[String]) -> Vec<Incident> {
         read_source::expand(&self.source(), &self.ctx(), self, node, direction, types)
     }

@@ -4249,23 +4249,12 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             return None; // no usable index: scan fallback
         }
 
-        // SSI predicate footprint: an indexed range predicate replaces the `scan_filter_range`
-        // fallback (which read every node via `scan_nodes_by_label`). Preserve that read footprint so
-        // the index path and the scan fallback are indistinguishable to SSI (`04 §5.4`).
-        self.mark_all_live_nodes();
-        // Plus the phantom-safe predicate marker (`rmp` #171): a range / property scan registers the
-        // conservative `Label` marker (any insert of this label matches), the documented coarse
-        // over-approximation for a non-equality predicate — sound, at most a few extra aborts among
-        // concurrent range-reader / label-writer pairs. This is the same coarse marker the
-        // scan-fallback range filter (`scan_filter_range` over `scan_nodes_by_label`) registers.
-        self.note_predicate_read(PredicateRead::Label(label_token));
-
-        // **AND** the tree must be trustworthy *for this reader* (`rmp` task #765): a rebuild wiped it
-        // and refilled NEWEST-WINS, destroying the stale entries an older snapshot still depends on, so
-        // the tree is a SUBSET for such a reader even though it is Online and not degraded. Decline to
-        // the exact scan. Placed HERE — after the SSI markers above, immediately before the seek — so a
-        // decline registers exactly the footprint this site's established `List` decline below does.
-        // See `rebuilt_trees_serve_reader`.
+        // The tree must be trustworthy *for this reader* (`rmp` task #765): a rebuild wiped it and
+        // refilled NEWEST-WINS, destroying the stale entries an older snapshot still depends on, so the
+        // tree is a SUBSET for such a reader even though it is Online and not degraded. Decline to the
+        // exact scan. Placed BEFORE any marker (like the `Online` gate above): every decline path — this
+        // gate, the `List` decline below, the `Online` gate — returns before marking, so the executor's
+        // `scan_filter_range` fallback owns the SSI footprint exactly once. See `rebuilt_trees_serve_reader`.
         if !self.rebuilt_trees_serve_reader(index) {
             return None; // reader predates the rebuild: exact scan fallback (snapshot-correct)
         }
@@ -4274,7 +4263,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // NOTE (v1-index limitation): the index keys by exact encoded value, so the value-match path
         // assumes per-property type consistency (the common case). Mixed int/float values for one
         // property would need the scan fallback; the planner is only given a property index where
-        // that holds. The re-check below guarantees no WRONG rows regardless of candidate skew.
+        // that holds. The lifted re-check below guarantees no WRONG rows regardless of candidate skew.
         let Some(candidates) =
             index
                 .borrow_mut()
@@ -4283,23 +4272,24 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             // Seam declined (an unindexable `List` bound): exact scan fallback (`rmp` #680).
             return None;
         };
-        let labelled = self.filter_label_candidates(label_token, candidates);
 
-        // Re-check the FULL predicate per candidate: visible + has label (done above) + the current
-        // value satisfies BOTH provided bounds under the **Cypher comparison semantics**
-        // ([`crate::eval::satisfies_range`] — the same `compare` a `WHERE n.p >= v` `Filter` applies),
-        // so the seek and the `scan_filter_range` fallback return byte-identical row sets and declaring
-        // an index can never change a query's result (`rmp` task #680).
-        let mut out: Vec<NodeId> = labelled
-            .into_iter()
-            .filter(|id| {
-                self.node_property(*id, property)
-                    .is_some_and(|v| crate::eval::satisfies_range(&v, lower, upper))
-            })
-            .collect();
-        out.sort_unstable();
-        out.dedup();
-        Some(out)
+        // Everything past the candidate list is the SAME lifted body the off-thread `ReadOnlyGraph` runs
+        // (`rmp` #768, Slice S1 generalised): the coarse `Label` predicate marker + the blanket
+        // `mark_all_live_nodes` (preserving the `scan_filter_range` footprint, `rmp` #171/§5.4) + the
+        // per-candidate visibility/label re-check + the `satisfies_range` residual (`crate::eval`, the
+        // single comparison source of truth) + the dedup. Both seams call it, so rows and SSI footprint
+        // are identical by construction, not by review. Read-only: `LiveSource` over the store's `&self`
+        // reads (`rmp` #337 Slice 2).
+        Some(read_source::index_seek_range_recheck(
+            &LiveSource(&*self.store.borrow()),
+            &self.vis_ctx(),
+            self,
+            label_token,
+            property,
+            lower,
+            upper,
+            candidates,
+        ))
     }
 
     fn index_seek_composite_eq(
@@ -4322,25 +4312,12 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             return None; // no usable composite index: scan fallback
         }
 
-        // SSI predicate footprint: mirror the node-key composite seek (`node_key_tuple_conflict` /
-        // `composite_seek_eq`, `rmp` #401). The composite index has no precise multi-property `Equality`
-        // marker, so we register the coarse `PredicateRead::Label` (which pairs with every node insert's
-        // `Label(L)` write footprint, closing the composite-absence phantom the physical-key SIREADs
-        // alone miss) plus `mark_all_live_nodes` — exactly the footprint the label-scan fallback this
-        // seek replaces would register. Conservative but never wrong; it only adds an rw-edge between
-        // concurrent same-label writers, as the scan fallback already did.
-        self.note_predicate_read(PredicateRead::Label(label_token));
-        self.mark_all_live_nodes();
-
-        // Candidate ids whose composite tuple equals `values`. The index is candidate-only, so re-check
-        // the FULL predicate per candidate: visible + carries the label (`filter_label_candidates`) +
-        // the *current* per-property tuple equals `values` element-wise by Cypher equality.
-        // **AND** the tree must be trustworthy *for this reader* (`rmp` task #765): a rebuild wiped it
-        // and refilled NEWEST-WINS, destroying the stale entries an older snapshot still depends on, so
-        // the tree is a SUBSET for such a reader even though it is Online and not degraded. Decline to
-        // the exact scan. Placed HERE — after the SSI markers above, immediately before the seek — so a
-        // decline registers exactly the footprint this site's established `List` decline below does.
-        // See `rebuilt_trees_serve_reader`.
+        // The tree must be trustworthy *for this reader* (`rmp` task #765): a rebuild wiped it and
+        // refilled NEWEST-WINS, destroying the stale entries an older snapshot still depends on, so the
+        // tree is a SUBSET for such a reader even though it is Online and not degraded. Decline to the
+        // exact scan. Placed BEFORE any marker (like the `has_composite` gate above): every decline path
+        // returns before marking, so the executor's `scan_filter_composite_eq` fallback owns the SSI
+        // footprint exactly once. See `rebuilt_trees_serve_reader`.
         if !self.rebuilt_trees_serve_reader(index) {
             return None; // reader predates the rebuild: exact scan fallback (snapshot-correct)
         }
@@ -4353,18 +4330,22 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             // Seam declined (a key value is an unindexable `List`): exact scan fallback (`rmp` #680).
             return None;
         };
-        let labelled = self.filter_label_candidates(label_token, candidates);
-        let mut out: Vec<NodeId> = labelled
-            .into_iter()
-            .filter(|id| {
-                self.node_tuple(*id, &property_tokens)
-                    .is_some_and(|tuple| tuples_match(&tuple, values))
-            })
-            .collect();
-        // De-duplicate: a stale + a live index entry can name the same id twice.
-        out.sort_unstable();
-        out.dedup();
-        Some(out)
+
+        // Everything past the candidate list is the SAME lifted body the off-thread `ReadOnlyGraph` runs
+        // (`rmp` #768): the coarse `Label` predicate marker + the blanket `mark_all_live_nodes` (mirroring
+        // the node-key composite seek's footprint, `rmp` #401) + the per-candidate visibility/label
+        // re-check + the element-wise tuple-equality residual + the dedup. Both seams call it, so rows and
+        // SSI footprint are identical by construction. Read-only: `LiveSource` over the store's `&self`
+        // reads (`rmp` #337 Slice 2).
+        Some(read_source::index_seek_composite_recheck(
+            &LiveSource(&*self.store.borrow()),
+            &self.vis_ctx(),
+            self,
+            label_token,
+            properties,
+            values,
+            candidates,
+        ))
     }
 
     fn index_seek_rel_eq(
@@ -4667,15 +4648,21 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             }
         }?;
 
-        // SSI predicate footprint: an indexed text predicate replaces the label-scan + filter fallback
-        // (which read every node via `scan_nodes_by_label`). Preserve that exact read footprint so the
-        // index path and the scan fallback are indistinguishable to SSI (`04 §5.4`).
-        self.mark_all_live_nodes();
-
-        let mut out = self.filter_label_candidates(label_token, candidates);
-        out.sort_unstable();
-        out.dedup();
-        Some(out)
+        // Everything past the candidate list is the SAME lifted body the off-thread `ReadOnlyGraph` runs
+        // (`rmp` #768): the blanket `mark_all_live_nodes` (a text seek stands in for a label scan,
+        // `rmp` #467/§5.4) + the per-candidate visibility/label re-check + the dedup. There is deliberately
+        // NO string-predicate residual and NO coarse `Label` phantom marker here — the executor keeps the
+        // exact `CONTAINS`/`ENDS WITH`/`STARTS WITH` filter above this operator, and the text/spatial seek
+        // family has never registered the `Label` marker its scan does (a pre-existing seek/scan asymmetry,
+        // `rmp` #662/#73). Both seams call this one body, so rows and footprint match by construction.
+        // Read-only: `LiveSource` over the store's `&self` reads (`rmp` #337 Slice 2).
+        Some(read_source::index_seek_text_recheck(
+            &LiveSource(&*self.store.borrow()),
+            &self.vis_ctx(),
+            self,
+            label_token,
+            candidates,
+        ))
     }
 
     fn fulltext_query(&self, name: &str, search: &str) -> Option<Vec<NodeId>> {

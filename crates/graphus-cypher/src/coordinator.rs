@@ -8020,12 +8020,22 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         plan: &crate::physical::PhysicalPlan,
         params: &crate::binding::BoundParameters,
     ) -> crate::read_source::IndexCandidateCapture {
-        let seeks = plan.static_node_index_eq_seeks(params);
-        if seeks.is_empty() {
+        // Every node-property seek kind the reader can be served off-thread (`rmp` #755 equality + `rmp`
+        // #768 range / composite / text). Correlated per-row seeks are excluded by construction (only a
+        // literal or bound parameter is statically knowable — `rmp` #764).
+        let eq_seeks = plan.static_node_index_eq_seeks(params);
+        let range_seeks = plan.static_node_index_range_seeks(params);
+        let composite_seeks = plan.static_node_composite_seeks(params);
+        let text_seeks = plan.static_node_text_seeks(params);
+        if eq_seeks.is_empty()
+            && range_seeks.is_empty()
+            && composite_seeks.is_empty()
+            && text_seeks.is_empty()
+        {
             return crate::read_source::IndexCandidateCapture::default();
         }
         // The reader's own snapshot decides whether a captured seek may be trusted at all (the rebuild
-        // gate — `rmp` #755 Slice S2, containing `rmp` #765). An unknown txn captures nothing.
+        // gate — `rmp` #755/#768, containing / closing `rmp` #765). An unknown txn captures nothing.
         let Some(reader_ts) = self.active.get(&txn).map(|a| a.snapshot.ts) else {
             return crate::read_source::IndexCandidateCapture::default();
         };
@@ -8033,7 +8043,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // property key that was never interned cannot match any node, so it simply yields no request
         // (the reader misses and declines to its scan, which returns the same empty result).
         let store = self.store.borrow();
-        let requests: Vec<(u32, u32, Value)> = seeks
+        let eq_requests: Vec<(u32, u32, Value)> = eq_seeks
             .into_iter()
             .filter_map(|(label, property, value)| {
                 let label_token = store.token_id(Namespace::Label, &label)?;
@@ -8041,10 +8051,42 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 Some((label_token, prop_key, value))
             })
             .collect();
+        let range_requests: Vec<crate::index_set::RangeCaptureRequest> = range_seeks
+            .into_iter()
+            .filter_map(|(label, property, lower, upper)| {
+                let label_token = store.token_id(Namespace::Label, &label)?;
+                let prop_key = store.token_id(Namespace::PropKey, &property)?;
+                Some((label_token, prop_key, lower, upper))
+            })
+            .collect();
+        let composite_requests: Vec<crate::index_set::CompositeCaptureRequest> = composite_seeks
+            .into_iter()
+            .filter_map(|(label, properties, values)| {
+                let label_token = store.token_id(Namespace::Label, &label)?;
+                let property_tokens: Option<Vec<u32>> = properties
+                    .iter()
+                    .map(|p| store.token_id(Namespace::PropKey, p))
+                    .collect();
+                Some((label_token, property_tokens?, values))
+            })
+            .collect();
+        let text_requests: Vec<crate::index_set::TextCaptureRequest> = text_seeks
+            .into_iter()
+            .filter_map(|(label, property, op, needle)| {
+                let label_token = store.token_id(Namespace::Label, &label)?;
+                let prop_key = store.token_id(Namespace::PropKey, &property)?;
+                Some((label_token, prop_key, op, needle))
+            })
+            .collect();
         drop(store);
-        self.index
-            .borrow_mut()
-            .capture_node_property_eq(reader_ts, &requests)
+        // One `borrow_mut`, four per-kind captures merged into one memo. Each kind applies its own gates
+        // (RANGE/COMPOSITE ride the node-property rebuild watermark; TEXT rides the ft/spatial marker).
+        let mut index = self.index.borrow_mut();
+        let mut capture = index.capture_node_property_eq(reader_ts, &eq_requests);
+        capture.absorb(index.capture_node_property_range(reader_ts, &range_requests));
+        capture.absorb(index.capture_node_property_composite(reader_ts, &composite_requests));
+        capture.absorb(index.capture_node_property_text(reader_ts, &text_requests));
+        capture
     }
 
     /// Merges an off-thread reader's accumulated [`SsiReadBuffer`] into the shared
