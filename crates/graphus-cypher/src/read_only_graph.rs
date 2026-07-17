@@ -45,7 +45,7 @@ use std::cell::RefCell;
 use graphus_core::error::GraphusError;
 use graphus_core::{TxnId, Value};
 use graphus_io::BlockDevice;
-use graphus_storage::{StoreReadView, TokenSnapshot};
+use graphus_storage::{Namespace, StoreReadView, TokenSnapshot};
 use graphus_txn::{CommitRegistry, PredicateRead, Snapshot, SsiReadBuffer};
 use graphus_wal::LogSink;
 
@@ -91,6 +91,12 @@ pub struct ReadOnlyGraph<D: BlockDevice, S: LogSink> {
     /// full-text-capable read supplies it via [`with_fulltext`](Self::with_fulltext) — the morsel
     /// readers (`rmp` #339) never call procedures, so they keep the free empty catalogue.
     fulltext: read_source::FulltextReadSnapshot,
+    /// The engine-thread-captured memo of node-property equality seek results (`rmp` task #755, Slice
+    /// S2), letting this reader serve `index_seek_eq` as a real seek instead of declining to a full
+    /// scan. Empty (the [`new`](Self::new) default) unless supplied via
+    /// [`with_index_candidates`](Self::with_index_candidates); an empty capture simply declines, which
+    /// is the pre-#755 behaviour (correct, just unaccelerated).
+    index_candidates: read_source::IndexCandidateCapture,
 }
 
 impl<D: BlockDevice, S: LogSink> ReadOnlyGraph<D, S> {
@@ -128,6 +134,7 @@ impl<D: BlockDevice, S: LogSink> ReadOnlyGraph<D, S> {
             buffer: RefCell::new(Some(buffer)),
             error: RefCell::new(None),
             fulltext: read_source::FulltextReadSnapshot::default(),
+            index_candidates: read_source::IndexCandidateCapture::default(),
         }
     }
 
@@ -137,6 +144,16 @@ impl<D: BlockDevice, S: LogSink> ReadOnlyGraph<D, S> {
     /// empty catalogue. Consumes and returns `self` for chaining at the dispatch site.
     pub fn with_fulltext(mut self, fulltext: read_source::FulltextReadSnapshot) -> Self {
         self.fulltext = fulltext;
+        self
+    }
+
+    /// Attaches the captured node-property equality seek results (`rmp` task #755, Slice S2), enabling
+    /// this reader to serve [`index_seek_eq`](crate::graph_access::GraphAccess::index_seek_eq) as a real
+    /// seek. A builder for the same reasons as [`with_fulltext`](Self::with_fulltext): [`new`](Self::new)
+    /// keeps its signature, and the morsel readers (`rmp` #339), which never seek an index, keep the free
+    /// empty capture. Consumes and returns `self` for chaining at the dispatch site.
+    pub fn with_index_candidates(mut self, candidates: read_source::IndexCandidateCapture) -> Self {
+        self.index_candidates = candidates;
         self
     }
 
@@ -276,8 +293,42 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // The precise equality-filtered scan (`rmp` task #325): the same lifted body the live store runs,
         // so an off-thread morsel reader registers the identical precise `Equality` + per-match SIREAD
         // footprint (never the blanket `mark_all_live_nodes`) — serializability unchanged, abort storm
-        // gone. The reader holds no derived index, so the lifted body is the only path.
+        // gone. This stays the exact fallback whenever the seek below declines.
         read_source::scan_filter_eq(&self.source(), &self.ctx(), self, label, property, value)
+    }
+
+    fn index_seek_eq(&self, label: &str, property: &str, seek: &Value) -> Option<Vec<NodeId>> {
+        // `rmp` task #755, Slice S2 — the fix for "the planner picks the index, the plan REPORTS
+        // `NodeIndexSeek`, and the runtime reads the whole store". This reader holds no `IndexSet` (its
+        // `BTree`s are `&mut self` throughout, so even a `Send + Sync` one would be unusable behind
+        // `&self`), so the *candidates* come from the memo the engine thread captured at dispatch.
+        //
+        // Resolve the tokens through this reader's own captured dictionary — the same dictionary the
+        // capture's tokens were resolved from, so they agree by construction.
+        let label_token = self.tokens.token_id(Namespace::Label, label)?;
+        let prop_key = self.tokens.token_id(Namespace::PropKey, property)?;
+
+        // A MISS — not captured, wrong value, a gate refused it (non-`Online` / degraded / unindexable)
+        // — MUST decline so the executor takes the exact `scan_filter_eq` fallback. Returning
+        // `Some(vec![])` here would read as "no rows" and silently drop them (`rmp` #680/#738). Declining
+        // is always safe: it is precisely the pre-#755 behaviour.
+        let candidates = self.index_candidates.get(label_token, prop_key, seek)?;
+
+        // Everything past the candidate list is the SAME lifted body the live inline seam runs
+        // (`rmp` #755, Slice S1): the precise `Equality` predicate marker, the per-candidate SIREAD +
+        // fail-closed visibility/label re-check, the current-value residual, the dedup. The engine
+        // contributed raw ids and no semantics whatsoever, so this seek's rows and SSI footprint are
+        // identical to the inline seek's — not by review, but because it is the same code.
+        Some(read_source::index_seek_eq_recheck(
+            &self.source(),
+            &self.ctx(),
+            self,
+            label_token,
+            prop_key,
+            property,
+            seek,
+            candidates.to_vec(),
+        ))
     }
 
     fn expand(&self, node: NodeId, direction: ExpandDirection, types: &[String]) -> Vec<Incident> {

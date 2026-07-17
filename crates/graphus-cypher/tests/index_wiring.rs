@@ -18,6 +18,7 @@ use graphus_cypher::binding::{Parameters, bind_parameters};
 use graphus_cypher::catalog::IndexCatalog;
 use graphus_cypher::coordinator::TxnCoordinator;
 use graphus_cypher::executor::execute;
+use graphus_cypher::graph_access::GraphAccess;
 use graphus_cypher::lexer::tokenize;
 use graphus_cypher::lower::lower;
 use graphus_cypher::parser::parse_tokens;
@@ -1361,5 +1362,156 @@ fn a_list_equality_bound_returns_the_same_rows_with_and_without_the_index() {
     assert_eq!(
         via_index, via_scan,
         "a List-typed equality bound must return the same rows with and without the index"
+    );
+}
+
+/// **The rebuild gate: a captured off-thread seek must never serve a reader older than the last index
+/// rebuild** (`rmp` task #755, Slice S2 — containment of `rmp` #765).
+///
+/// # The hazard this pins
+///
+/// The captured-candidate design (Slice S2) rests on `node_props` being append-only, so that the *stale*
+/// index entry a reader with an older snapshot still depends on survives to be captured. That holds for
+/// the per-entry surface (`insert_node_property` is the only per-entry mutation; there is no
+/// `remove_node_property`) — but **not for the tree**: `TxnCoordinator::rebuild_index` calls
+/// `IndexSet::clear()`, which wipes every node-property tree, and refills **newest-wins**. The stale
+/// entries are annihilated, while the indexes stay `Online` and `heal()` clears `degraded` — so the
+/// `Online` and not-degraded gates both pass over a tree that is a genuine SUBSET for an older snapshot.
+///
+/// Any index/constraint DDL triggers it, including one on a **completely unrelated** label/property, and
+/// so does the degraded-rebuild retry — no user DDL required.
+///
+/// # What this test asserts
+///
+/// With a reader's snapshot fixed BEFORE a value change, and a rebuild driven AFTER it, the capture the
+/// reader would be handed must be **empty** (a decline → the executor's exact `scan_filter_eq`, which is
+/// snapshot-correct). If the gate were removed, the capture would instead HIT with an empty candidate
+/// list — `Some(vec![])`, the precise "reads as no rows" hazard of `rmp` #680/#738 — and the reader would
+/// silently drop a committed row it can still see (measured: 1 row → 0 rows).
+///
+/// # This is CONTAINMENT, not a fix
+///
+/// The underlying defect is **pre-existing and lives in the rebuild**: the INLINE seek
+/// (`RecordStoreGraph::index_seek_eq`) reads the same wiped tree with no gate and loses the row **today**
+/// — asserted below, so the open hazard is pinned rather than forgotten. This gate only guarantees the
+/// captured off-thread seek is never worse than the pre-#755 behaviour (which declined every seek and
+/// full-scanned, and so was accidentally immune). It sidesteps `rmp` #765; it does not close it.
+#[test]
+fn rebuild_gate_declines_the_capture_for_an_older_snapshot() {
+    let mut coord = fresh_coord();
+    run_write(&mut coord, "CREATE (:Person {email: 'a@x.io'})");
+    coord
+        .create_node_property_index("Person", "email")
+        .expect("create index");
+
+    // The reader begins HERE: its snapshot sees `email = 'a@x.io'`.
+    let reader = coord.begin_serializable();
+
+    // A writer moves the node OFF the sought value and commits. The index keeps the stale
+    // ('a@x.io' -> n) entry (append-only per entry), so the reader is still correctly served.
+    run_write(
+        &mut coord,
+        "MATCH (n:Person) WHERE n.email = 'a@x.io' SET n.email = 'zz@x.io'",
+    );
+
+    let plan = compile(
+        "MATCH (n:Person) WHERE n.email = 'a@x.io' RETURN n.email AS a",
+        &coord.catalog(),
+    );
+    let bound = bind_parameters(&plan, &Parameters::new()).expect("bind");
+    let seek = Value::String("a@x.io".to_owned());
+    let (l_person, k_email) = {
+        // The tokens exactly as the reader resolves them: through the dispatch-captured dictionary.
+        let tokens = coord.read_task_inputs(reader).expect("read inputs").tokens;
+        (
+            tokens
+                .token_id(graphus_storage::Namespace::Label, "Person")
+                .expect("Person token"),
+            tokens
+                .token_id(graphus_storage::Namespace::PropKey, "email")
+                .expect("email token"),
+        )
+    };
+
+    // BEFORE any rebuild the memo is a superset and the reader is served the row.
+    assert_eq!(
+        run_plan(&coord, reader, &plan).len(),
+        1,
+        "before the rebuild the reader must see the row under its own snapshot"
+    );
+    let pre = coord.index_candidates_for(reader, &plan, &bound);
+    assert_eq!(
+        pre.get(l_person, k_email, &seek).as_deref(),
+        Some(&[1u64][..]),
+        "before the rebuild the capture must SERVE this seek, holding the stale entry. If this is \
+         None the test is vacuous — it would then prove nothing about the gate below."
+    );
+
+    // An index on a COMPLETELY UNRELATED property rebuilds EVERY node-property tree: clear() + a
+    // newest-wins refill destroys the stale ('a@x.io' -> n) entry. State stays Online, degraded heals.
+    coord
+        .create_node_property_index("Person", "unrelated")
+        .expect("create unrelated index");
+
+    // THE GATE: the reader's snapshot predates the rebuild, so the capture must DECLINE — empty, so the
+    // reader's `index_seek_eq` misses and falls back to the exact, snapshot-correct scan.
+    let post = coord.index_candidates_for(reader, &plan, &bound);
+    assert!(
+        post.get(l_person, k_email, &seek).is_none(),
+        "GATE 3 (rmp #755): a rebuild destroyed the stale entries this reader depends on, so the \
+         capture MUST decline (→ exact scan). Serving it would hand the reader `Some(vec![])` and \
+         silently drop a committed row it can still see. Without the gate this returns Some([])."
+    );
+    assert!(
+        post.is_empty(),
+        "the whole capture must be empty for a pre-rebuild reader"
+    );
+
+    // A reader that begins AFTER the rebuild is at-or-after the stamped high-water: still served, so the
+    // gate contains the hazard without disabling the acceleration for the normal case.
+    let fresh_reader = coord.begin_serializable();
+    let fresh = coord.index_candidates_for(fresh_reader, &plan, &bound);
+    assert!(
+        fresh.get(l_person, k_email, &seek).is_some(),
+        "a post-rebuild reader must still be SERVED — the gate must not disable the fast path wholesale"
+    );
+
+    // AND THE ROWS COME BACK. The declined capture is the whole point: the off-thread reader's
+    // `index_seek_eq` misses, returns `None`, and the executor falls back to the exact `scan_filter_eq`,
+    // which is snapshot-correct. This is what "strictly <= pre-#755" means — the pre-#755 reader declined
+    // every seek and scanned, and here we reproduce exactly that, for exactly this reader.
+    {
+        let inputs = coord.read_task_inputs(reader).expect("read inputs");
+        let ro: graphus_cypher::ReadOnlyGraph<MemBlockDevice, MemLogSink> =
+            graphus_cypher::ReadOnlyGraph::new(
+                inputs.view,
+                inputs.tokens,
+                inputs.snapshot,
+                inputs.registry,
+                reader,
+                graphus_txn::SsiReadBuffer::new(reader),
+            )
+            .with_index_candidates(post);
+        assert!(
+            ro.index_seek_eq("Person", "email", &seek).is_none(),
+            "the reader must DECLINE the seek (never Some(vec![])), so the executor scans"
+        );
+        assert_eq!(
+            ro.scan_filter_eq("Person", "email", &seek).matched.len(),
+            1,
+            "and the exact scan the decline falls back to RESTORES the row the rebuild's wipe hid"
+        );
+        assert!(!ro.has_error());
+    }
+
+    // THE OPEN HAZARD, pinned (`rmp` #765): the INLINE seek has no such gate. It reads the live wiped
+    // tree and LOSES the row for this same reader — today, before and independently of #755. When #765
+    // is fixed this assertion flips to `1` and must be updated together with the gate above.
+    assert_eq!(
+        run_plan(&coord, reader, &plan).len(),
+        0,
+        "rmp #765 (OPEN, pre-existing): the inline seek reads the rebuilt (wiped, newest-wins) tree and \
+         loses a committed row visible at this reader's snapshot. If this now returns 1, #765 has been \
+         fixed — revisit the containment gate in IndexSet::capture_node_property_eq."
     );
 }

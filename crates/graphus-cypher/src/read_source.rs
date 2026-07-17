@@ -42,6 +42,7 @@
 //! `LiveSource(&*self.store.borrow())` + its own [`VisCtx`] + its own sink, so its observable behaviour
 //! stays **byte-identical** (the openCypher TCK and the Slice 3b-i equivalence test are the guards).
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use std::collections::{BTreeSet, HashMap};
@@ -49,7 +50,7 @@ use std::collections::{BTreeSet, HashMap};
 use graphus_core::error::GraphusError;
 use graphus_core::{TxnId, Value, VersionStamp};
 use graphus_index::fulltext::Analyzer;
-use graphus_index::keycodec::encode_equality_canonical;
+use graphus_index::keycodec::{encode_equality_canonical, encode_single};
 use graphus_io::BlockDevice;
 use graphus_storage::record::{NodeRecord, PropRecord, RelRecord};
 use graphus_storage::{MvccHeader, Namespace, RecordStore, StoreReadView, TokenSnapshot};
@@ -301,6 +302,106 @@ impl<D: BlockDevice, S: LogSink> StoreReadSource for ReadViewSource<'_, D, S> {
     }
     fn token_name(&self, ns: Namespace, id: u32) -> Option<String> {
         self.tokens.token_name(ns, id).map(ToOwned::to_owned)
+    }
+}
+
+// =================================================================================================
+// IndexCandidateCapture — the engine thread's index seek RESULTS, moved to a reader
+// =================================================================================================
+
+/// An owned, `Send + Sync` memo of node-property **equality seek results**, computed on the engine
+/// thread at read dispatch so an off-thread reader can serve `index_seek_eq` without touching the live
+/// index (`rmp` task #755, Slice S2).
+///
+/// # Why a memo of results and not a snapshot of the index
+///
+/// The obvious move — share the [`IndexSet`](crate::index_set::IndexSet) with the reader — does not
+/// work, and not because of `Rc<RefCell<…>>`: **every read method of the backing `BTree` takes
+/// `&mut self`** (`lookup`, `range`, `scan_all`, and hence `PropertyIndex::seek_eq`), because the
+/// single-threaded `BufferPool` mutates frames and pin counts on fetch. A `Send + Sync` index shared
+/// behind `&self` would therefore still be unusable, and making the pool concurrent is the `rmp` #721
+/// hazard class. So instead of moving the *index*, we move the *answers*: the engine thread runs the
+/// seeks it can prove the reader will ask for and hands over the resulting id lists. The engine
+/// contributes only raw candidate ids — a pure accelerator with **zero semantics**; the reader still
+/// does all of it (visibility, label re-check, value residual, SIREAD markers) through the one lifted
+/// [`index_seek_eq_recheck`] body that the live path uses.
+///
+/// # Why the memo is a superset (the MVCC soundness argument)
+///
+/// The reader's snapshot `T` is taken at `begin`, which precedes the capture instant `W`. Let node `n`
+/// be visible at `T` with value `v`. Its writer `A` has `commit_ts(A) <= T <= W`, and `reindex_node`
+/// inserts `(v, n)` **during** `A`'s statement — before `A` commits, hence before `W`. So `(v, n)` is
+/// present at `W`: the capture cannot miss a row the reader must return. Entries from uncommitted
+/// transactions (`EPHEMERAL_TXN`) are merely *extra*, and the per-candidate re-check can only ever
+/// REMOVE. The argument needs the node-property index to be **append-only per entry**, which it is:
+/// `insert_node_property` is its only per-entry mutation and there is no `remove_node_property`
+/// (a value change leaves the stale entry behind — which is exactly why the seek re-checks and dedups).
+///
+/// The capture is also **atomic** with respect to index mutation: it and every index write run on the
+/// same serial engine thread, so it can never observe a half-applied `reindex_node`.
+///
+/// # What must NEVER be captured (each is silent row loss)
+///
+/// * a **non-`Online`** index — `Populating` is a genuine SUBSET of the truth (`rmp` #733);
+/// * a **degraded / fail-closed** index — its trees have been wiped, so it is a subset (`rmp` #733);
+/// * the **destructive** index classes (full-text / spatial / text / vector / bitmap) — they
+///   re-index wholesale via `remove_*` + re-insert, so a reader whose snapshot predates the rewrite
+///   sees a subset (`rmp` #467). Only the append-only node-property class is captured here.
+///
+/// [`Self::get`] returning `None` means "not captured" and MUST be treated by the caller as
+/// **decline → exact scan fallback**, never as "no rows" (`rmp` #680/#738).
+#[derive(Debug, Clone, Default)]
+pub struct IndexCandidateCapture {
+    /// `(label_token, prop_key, encode_single(seek))` → the candidate ids that seek returned.
+    ///
+    /// The key uses [`encode_single`] — the **index lookup** encoding, i.e. the identity of the value
+    /// that was sought — deliberately NOT `encode_equality_canonical` (which is the SSI *marker*
+    /// encoding, and which merges Cypher-equal `1`/`1.0`). They are different jobs: a lookup that
+    /// merged `1` with `1.0` would hand back the wrong memo. Because the reader re-evaluates the very
+    /// same literal/parameter the capture used, the two encodings always agree; and a key that does not
+    /// agree simply misses, which degrades to the exact scan.
+    entries: HashMap<(u32, u32, Vec<u8>), Arc<[u64]>>,
+}
+
+// `rmp` #755, Slice S2: the capture rides a `ReadTask` to a reader thread, so it must be `Send + Sync`.
+// A compile-time assertion (no runtime body), mirroring `TokenSnapshot`'s — it fails to build the
+// instant a non-`Sync` field is introduced. `HashMap<(u32, u32, Vec<u8>), Arc<[u64]>>` is `Send + Sync`
+// by auto-derivation, with no `unsafe impl`.
+const _: () = {
+    fn assert_send_sync<T: Send + Sync>() {}
+    fn assert_index_candidate_capture() {
+        assert_send_sync::<IndexCandidateCapture>();
+    }
+    let _ = assert_index_candidate_capture;
+};
+
+impl IndexCandidateCapture {
+    /// Memoises `ids` as the candidate list for `(label_token, prop_key) == seek`.
+    ///
+    /// The caller is responsible for the gates above: only an `Online`, non-degraded, append-only
+    /// node-property index may be captured, and `ids` must be the seek's own (superset) output. A
+    /// non-index-encodable `seek` (`Null`/`List`/`Map`) cannot be keyed and is silently not captured —
+    /// the reader then misses and takes the exact scan, exactly as the live path declines it.
+    pub fn insert(&mut self, label_token: u32, prop_key: u32, seek: &Value, ids: Vec<u64>) {
+        if let Ok(key) = encode_single(seek) {
+            self.entries
+                .insert((label_token, prop_key, key), ids.into());
+        }
+    }
+
+    /// The memoised candidate ids for `(label_token, prop_key) == seek`, or `None` if this seek was not
+    /// captured — which the caller MUST turn into a declined seek (exact scan fallback), never an empty
+    /// result. Cheap: one hash lookup + one `Arc` refcount bump.
+    #[must_use]
+    pub fn get(&self, label_token: u32, prop_key: u32, seek: &Value) -> Option<Arc<[u64]>> {
+        let key = encode_single(seek).ok()?;
+        self.entries.get(&(label_token, prop_key, key)).cloned()
+    }
+
+    /// Whether nothing was captured (the common case: a read with no indexed equality seek).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
@@ -779,6 +880,83 @@ pub fn scan_filter_eq<S: StoreReadSource, K: ReadSink>(
         matched: out,
         examined,
     }
+}
+
+/// The **re-check half** of an indexed node-property equality seek (`rmp` task #755, Slice S1): given a
+/// candidate id list produced by *some* index source, register the seek's SSI footprint and reduce the
+/// candidates to exactly the rows `scan_filter_eq` would return for the same `(label, property, seek)`.
+///
+/// # Why this is lifted (the anti-drift move)
+///
+/// A node index is **candidate-only**: it yields a SUPERSET of the matching ids (stale entries, entries
+/// written by transactions this snapshot cannot see, cross-type encodings). Everything that turns that
+/// superset into the answer — MVCC visibility, the label re-check, the current-value equality residual,
+/// the SIREAD markers, the dedup — is *semantics*, and it must be identical no matter where the
+/// candidates came from. Lifting it here (the Fork-1 factorisation of `rmp` #336 applied to seeks) makes
+/// "identical" a property of the **code**, not of code review: `RecordStoreGraph::index_seek_eq` calls
+/// this with candidates from its live `IndexSet`, and any future off-thread candidate source calls the
+/// same body with the same guarantees.
+///
+/// # The contract on `candidates`
+///
+/// `candidates` MUST be a **superset** of the ids whose *current, snapshot-visible* value equals `seek`
+/// under `(label_token, prop_key)`. A superset is safe (this body filters extras out); a **subset is
+/// silent row loss** and this body cannot detect it. A caller that cannot guarantee the superset property
+/// MUST decline (return `None` to the executor, taking the exact `scan_filter_eq` fallback) rather than
+/// pass a partial list — never `Some(vec![])`, which reads as "no match" (`rmp` #680/#738).
+///
+/// # SSI footprint (byte-identical to the inline path it replaces, `rmp` #316/#325)
+///
+/// Two precise markers, and deliberately **no** `mark_all_live_nodes` blanket:
+///   1. the per-candidate SIREAD in [`filter_label_candidates`] — a concurrent modify/delete of a node
+///      this seek *examined* closes an rw-edge; and
+///   2. the precise [`PredicateRead::Equality`] marker — it pairs with the writer's
+///      `note_predicate_write` (same `encode_equality_canonical` encoder), so a concurrent INSERT or an
+///      UPDATE of some *other* node **into** this exact `(label, property, value)` closes an rw-edge even
+///      when the seek currently matches nothing.
+///
+/// `rmp` #316 removed the blanket marker (it manufactured an rw-edge with any concurrent node writer:
+/// measured fraud-oltp `abort_rate ≈ 0.97`); **do NOT reintroduce it here**. A non-encodable `seek`
+/// registers no `Equality` marker, and that is sound with no backstop: `List` declines upstream and takes
+/// the exact scan fallback; `Null`/`Map` are not equality-seekable; and `NaN` equals nothing (not even
+/// itself), so no writer can make a node match — there is no phantom to catch.
+#[allow(clippy::too_many_arguments)] // a lifted read body; the source/ctx/sink seams are positional
+pub fn index_seek_eq_recheck<S: StoreReadSource, K: ReadSink>(
+    src: &S,
+    ctx: &VisCtx,
+    sink: &K,
+    label_token: u32,
+    prop_key: u32,
+    property: &str,
+    seek: &Value,
+    candidates: Vec<u64>,
+) -> Vec<NodeId> {
+    // (2) The precise equality predicate marker. NOTE this is the SSI marker ONLY: the candidate lookup
+    // upstream keys off the raw `Value`, so seek/scan *result* semantics are entirely unchanged.
+    if let Ok(encoded) = encode_equality_canonical(seek) {
+        sink.note_predicate_read(PredicateRead::Equality {
+            label: label_token,
+            property: prop_key,
+            value: encoded,
+        });
+    }
+
+    // (1) Re-check the FULL `scan_filter_eq` predicate per candidate: visible + carries the label
+    // (`filter_label_candidates`, which SIREAD-marks each examined id and fails closed on a read fault),
+    // then the *current* value equals `seek` by Cypher equality.
+    let labelled = filter_label_candidates(src, ctx, sink, label_token, candidates);
+
+    let mut out: Vec<NodeId> = labelled
+        .into_iter()
+        .filter(|id| {
+            node_property(src, ctx, sink, *id, property)
+                .is_some_and(|v| crate::equality::equals(&v, seek).is_true())
+        })
+        .collect();
+    // De-duplicate: a stale + a live index entry can name the same id twice.
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// The body of `RecordStoreGraph::expand` (`GraphAccess::expand`): register the relationship-pattern

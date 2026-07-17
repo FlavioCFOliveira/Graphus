@@ -915,3 +915,191 @@ fn fulltext_query_rel_off_thread_is_byte_identical_to_inline() {
         "\"graph\" must match exactly the two KNOWS relationships that contain it"
     );
 }
+
+/// The off-thread **index seek** is byte-identical to the inline seek — and to the exact scan — for a
+/// reader whose snapshot is STALE relative to the capture (`rmp` task #755, Slice S2).
+///
+/// # What this pins
+///
+/// Slice S2 lets an off-thread reader serve `index_seek_eq` from a memo of candidate ids captured on the
+/// engine thread at dispatch. That memo is taken at instant `W`, but the reader runs at its own snapshot
+/// `T <= W` — so the memo describes a **later** world than the one the reader must report. The claim that
+/// makes this sound is that the memo is a **superset** of the reader's true matches, never a subset,
+/// because the node-property index is append-only per entry (`insert_node_property` is its only
+/// per-entry mutation; there is no `remove_node_property`).
+///
+/// This fixture attacks that claim from **both** sides at once. Between the reader's snapshot `ts_stale`
+/// and the capture, a committed writer:
+///
+/// * **moves** `p0` off the sought value (`a@x.io` → `zz@x.io`) — leaving a **stale** index entry
+///   `(a@x.io → p0)` behind. The stale reader MUST still return `p0` (it is genuinely `a@x.io` at
+///   `ts_stale`). Were the index to remove entries on update, the memo would be a SUBSET here and `p0`
+///   would silently vanish — the exact row-loss this design turns on; and
+/// * **creates** `p_new` holding the sought value `a@x.io` — a **fresh** entry the memo contains but the
+///   stale reader must NOT return (invisible at `ts_stale`). This proves the extras are filtered.
+///
+/// So the memo for `a@x.io` at capture time is `{p0, p_new}`, while the truth at `ts_stale` is `{p0}` —
+/// a strict superset in one direction and a strict subset of the memo in the other. Only a correct
+/// per-candidate MVCC re-check turns one into the other.
+///
+/// Three-way equality is asserted at both snapshots: **off-thread seek == off-thread scan == inline
+/// seek**. The scan arm is the independent oracle (it never consults an index), so agreement cannot be
+/// an artifact of the seek paths sharing a bug.
+#[test]
+fn off_thread_index_seek_equals_inline_seek_and_scan_across_snapshots() {
+    let mut s = fresh();
+
+    // --- t1: four Person nodes; `p0` holds the value we will seek. -------------------------------
+    let txn1 = TxnId(1);
+    s.begin(txn1);
+    let l_person = s.intern_token(Namespace::Label, "Person").unwrap();
+    let k_email = s.intern_token(Namespace::PropKey, "email").unwrap();
+    let emails = ["a@x.io", "b@x.io", "c@x.io", "d@x.io"];
+    let mut ids = Vec::new();
+    for email in emails {
+        let (n, _) = s.create_node(txn1).unwrap();
+        s.add_label(txn1, n, l_person).unwrap();
+        s.set_node_property_value(txn1, n, k_email, &Value::String((*email).to_owned()))
+            .unwrap();
+        ids.push(n);
+    }
+    s.commit(txn1).unwrap();
+    let ts_stale = s.snapshot_ts();
+
+    let coord = Coordinated::new(s);
+    {
+        // An `Online` node-property index over `(Person, email)`, populated from committed state —
+        // exactly what the coordinator's build leaves behind.
+        let mut idx = coord.index.borrow_mut();
+        idx.register_node_property_with_state(l_person, k_email, IndexState::Online);
+        for (i, email) in emails.iter().enumerate() {
+            idx.insert_node_property(
+                l_person,
+                k_email,
+                &Value::String((*email).to_owned()),
+                ids[i],
+            );
+        }
+    }
+
+    // --- t2: the concurrent writer commits AFTER the stale snapshot. -----------------------------
+    let p_new = {
+        let mut store = coord.store.borrow_mut();
+        let txn2 = TxnId(2);
+        store.begin(txn2);
+        // (a) move `p0` OFF the sought value: the `(a@x.io → p0)` index entry becomes stale but REMAINS.
+        store
+            .set_node_property_value(txn2, ids[0], k_email, &Value::String("zz@x.io".to_owned()))
+            .unwrap();
+        // (b) a NEW node that takes the sought value.
+        let (n, _) = store.create_node(txn2).unwrap();
+        store.add_label(txn2, n, l_person).unwrap();
+        store
+            .set_node_property_value(txn2, n, k_email, &Value::String("a@x.io".to_owned()))
+            .unwrap();
+        store.commit(txn2).unwrap();
+        n
+    };
+    {
+        // The writer's index maintenance: append the two new entries (`reindex_node` never removes).
+        let mut idx = coord.index.borrow_mut();
+        idx.insert_node_property(
+            l_person,
+            k_email,
+            &Value::String("zz@x.io".to_owned()),
+            ids[0],
+        );
+        idx.insert_node_property(
+            l_person,
+            k_email,
+            &Value::String("a@x.io".to_owned()),
+            p_new,
+        );
+    }
+    let ts_fresh = coord.store.borrow().snapshot_ts();
+
+    // The memo the engine thread would hand a reader at snapshot `ts` — captured at `W`, strictly after
+    // the writer committed, for BOTH snapshots below. This fixture drives no rebuild, so the rebuild gate
+    // (`node_props_trustworthy_from`) sits at its `0` default and admits every reader — which is what
+    // keeps this test about the MVCC re-check. The gate is pinned separately by
+    // `rebuild_gate_declines_the_capture_for_an_older_snapshot` (tests/index_wiring.rs).
+    let capture = |ts: graphus_core::Timestamp, v: &str| {
+        coord
+            .index
+            .borrow_mut()
+            .capture_node_property_eq(ts, &[(l_person, k_email, Value::String(v.to_owned()))])
+    };
+
+    // Pin the premise this design rests on: the memo really is a superset containing BOTH the stale and
+    // the fresh id. If this ever fails, the index stopped being append-only and S2 is unsound.
+    {
+        let memo = capture(ts_fresh, "a@x.io");
+        let cands = memo
+            .get(l_person, k_email, &Value::String("a@x.io".to_owned()))
+            .expect("the seek must be captured");
+        let mut got: Vec<u64> = cands.to_vec();
+        got.sort_unstable();
+        got.dedup();
+        assert!(
+            got.contains(&ids[0]) && got.contains(&p_new),
+            "the capture must be a SUPERSET holding both the stale entry (p0={}) and the fresh one \
+             (p_new={p_new}): {got:?}. A missing p0 means the index removed an entry on update, which \
+             would make an off-thread seek lose rows for a stale reader.",
+            ids[0]
+        );
+    }
+
+    // --- the three-way equality, at the stale and the fresh snapshot. ----------------------------
+    for (what, ts, txn) in [
+        ("stale snapshot", ts_stale, TxnId(100)),
+        ("fresh snapshot", ts_fresh, TxnId(101)),
+    ] {
+        for probe in ["a@x.io", "zz@x.io", "b@x.io", "nobody@x.io"] {
+            let seek = Value::String(probe.to_owned());
+
+            let live = coord.live_at(txn, ts);
+            let inline = live
+                .index_seek_eq("Person", "email", &seek)
+                .expect("the inline seam has an Online index: it must serve the seek");
+
+            let ro = coord
+                .reader_at(txn, ts)
+                .with_index_candidates(capture(ts, probe));
+            let off_thread = ro
+                .index_seek_eq("Person", "email", &seek)
+                .expect("the reader has a captured memo: it must serve the seek");
+
+            // The independent oracle: a full scan, which consults no index at all.
+            let scan = coord
+                .reader_at(txn, ts)
+                .scan_filter_eq("Person", "email", &seek)
+                .matched;
+            let mut scan_sorted = scan;
+            scan_sorted.sort_unstable();
+
+            assert_eq!(
+                off_thread, inline,
+                "{what}, {probe:?}: the off-thread seek disagrees with the inline seek"
+            );
+            assert_eq!(
+                off_thread, scan_sorted,
+                "{what}, {probe:?}: the off-thread seek disagrees with the exact scan (the oracle)"
+            );
+            assert!(
+                !ro.has_error(),
+                "{what}, {probe:?}: reader captured an error"
+            );
+        }
+    }
+
+    // The headline case, stated explicitly so a regression names itself: at the stale snapshot the
+    // sought value must resolve to the node that has since moved off it — and to nothing else.
+    let ro = coord
+        .reader_at(TxnId(200), ts_stale)
+        .with_index_candidates(capture(ts_stale, "a@x.io"));
+    assert_eq!(
+        ro.index_seek_eq("Person", "email", &Value::String("a@x.io".to_owned())),
+        Some(vec![NodeId(ids[0])]),
+        "the stale reader must see p0 (still `a@x.io` at its snapshot) and NOT the later p_new"
+    );
+}

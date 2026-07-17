@@ -4087,70 +4087,46 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             return None; // no usable index: scan fallback
         }
 
-        // SSI predicate footprint for an indexed equality predicate (`rmp` #316). We do NOT
-        // SIREAD-mark every live node here. The earlier `scan_filter_eq` fallback read every node,
-        // so it conservatively marked all of them; that blanket marker manufactured an rw-edge with
-        // *any* concurrent node writer — even one touching a node that does not match `(label,
-        // property, value)` and that we never examined — which under contention produced a storm of
-        // false aborts (measured: fraud-oltp abort_rate ≈ 0.97). It is also unnecessary for
-        // serializability, which is fully covered by two precise markers:
-        //   1. the per-candidate SIREAD in `filter_label_candidates` (below) marks every node the
-        //      seek actually examined, so a concurrent modify/delete of a *matching* node closes an
-        //      rw-edge; and
-        //   2. the precise `Equality` predicate marker (below) pairs with the writer's pre- and
-        //      post-image predicate writes (`note_predicate_write_preimage` + `reindex_node` in
-        //      `set_node_property`, and `create_node`'s insert footprint), so a concurrent INSERT or
-        //      an UPDATE of some other node *into* this exact `(label, property, value)` closes an
-        //      rw-edge even when the seek currently matches nothing.
-        // Together these cover every phantom the blanket marker did, without conflicting on nodes
-        // that neither match nor were examined. (The range path keeps its conservative marker — a
-        // value-change-into-range phantom is not as precisely covered; see `index_seek_range`.)
-        // The phantom-safe predicate marker (`rmp` #171): the *precise* equality predicate, so a
-        // concurrent insert of a node with this exact `(label, property, value)` closes an rw-edge
-        // even when the seek currently matches nothing. The value is encoded with the
-        // **Cypher-equality-canonical** encoder — the same encoding the writer's
-        // `note_predicate_write` uses — so Cypher-equal values (incl. cross-type `1` vs `1.0`, blocker
-        // C1) register the SAME marker. NOTE this is the SSI marker ONLY; the index lookup below passes
-        // the raw `seek` `Value`, so seek/scan result semantics are entirely unchanged.
-        //
-        // A non-encodable seek value registers no `Equality` marker, and that is sound WITHOUT any
-        // blanket backstop — this path has none (`rmp` #316 removed the `mark_all_live_nodes` call;
-        // do NOT reintroduce the claim that it covers here). Each non-encodable case is independently
-        // safe: `List` declines at the seam below and takes the exact scan fallback, which registers
-        // its own footprint; `Null`/`Map` are not equality-seekable; and `NaN` equals nothing, not
-        // even itself, so no writer can ever make a node match — there is no phantom to catch.
-        if let Ok(encoded) = encode_equality_canonical(seek) {
-            self.note_predicate_read(PredicateRead::Equality {
-                label: label_token,
-                property: prop_key,
-                value: encoded,
-            });
-        }
-
-        // Candidate ids for `(label_token, prop_key) == seek`. The index is candidate-only, so we
-        // re-check the FULL `scan_filter_eq` predicate per candidate: visible + carries the label
-        // (`filter_label_candidates`) + the *current* value equals `seek` by Cypher equality.
+        // Candidate ids for `(label_token, prop_key) == seek`, from this transaction's LIVE index.
         let Some(candidates) =
             index
                 .borrow_mut()
                 .seek_node_property_eq(label_token, prop_key, seek)
         else {
             // Seam declined (an unindexable `List` bound): exact scan fallback (`rmp` #680).
+            //
+            // FOOTPRINT-NEUTRALITY OF THE DECLINE ORDER (`rmp` #755, Slice S1). The lifted body
+            // registers the `Equality` marker, so declining HERE returns before any marker is
+            // registered — whereas the pre-lift code registered the marker *before* the seek could
+            // decline. That is not a change in footprint, because the two encoders' failure sets nest:
+            // the seam declines iff `encode_single` errs (`is_index_encodable`), which is exactly
+            // `{Null, List, Map}`, and `encode_equality_canonical` errs on `{Null, List, Map, NaN}` —
+            // a strict SUPERSET. So on every declining value the old code's `encode_equality_canonical`
+            // had already failed and registered nothing. (`NaN` is the one value in the difference: it
+            // is index-encodable, so it does NOT decline, reaches the body, and registers no marker
+            // there — again identical. And it needs none: `NaN` equals nothing, not even itself, so no
+            // writer can make a node match it.)
             return None;
         };
-        let labelled = self.filter_label_candidates(label_token, candidates);
 
-        let mut out: Vec<NodeId> = labelled
-            .into_iter()
-            .filter(|id| {
-                self.node_property(*id, property)
-                    .is_some_and(|v| crate::equality::equals(&v, seek).is_true())
-            })
-            .collect();
-        // De-duplicate: a stale + a live index entry can name the same id twice.
-        out.sort_unstable();
-        out.dedup();
-        Some(out)
+        // The index is candidate-only, so the FULL `scan_filter_eq` predicate is re-checked per
+        // candidate — visibility, the label, the current value, the dedup — together with this seek's
+        // SSI footprint (the precise `Equality` predicate marker + the per-candidate SIREADs, and
+        // deliberately NO `mark_all_live_nodes` blanket; `rmp` #316). All of that is *semantics of the
+        // seek*, independent of where the candidates came from, so it lives in ONE lifted body
+        // (`rmp` #755, Slice S1) that this live path and any future off-thread candidate source both
+        // call — the two can no longer drift, because they are the same code. Read-only: `LiveSource`
+        // over the live store's `&self` reads (`rmp` #337 Slice 2), so a shared borrow suffices.
+        Some(read_source::index_seek_eq_recheck(
+            &LiveSource(&*self.store.borrow()),
+            &self.vis_ctx(),
+            self,
+            label_token,
+            prop_key,
+            property,
+            seek,
+            candidates,
+        ))
     }
 
     fn scan_filter_eq(&self, label: &str, property: &str, value: &Value) -> ScanFilter {

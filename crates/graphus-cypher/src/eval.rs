@@ -395,7 +395,7 @@ pub(crate) fn to_value(rv: RowValue) -> Value {
 
 /// Decodes an AST [`Literal`] into a property [`Value`], range-checking integers into `i64`
 /// (`04 §7.3` defers the range check to here, the runtime phase).
-fn literal_value(lit: &Literal) -> Result<Value, EvalError> {
+pub(crate) fn literal_value(lit: &Literal) -> Result<Value, EvalError> {
     match lit {
         // The parser already range-checked the literal into `i64` at compile time (`04 §7.3`,
         // openCypher `IntegerOverflow`), so decoding here is total.

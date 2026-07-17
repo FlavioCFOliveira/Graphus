@@ -167,6 +167,7 @@ pub fn run_read_task<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send +
         registry,
         buffer,
         fulltext,
+        index_candidates,
     } = inputs;
 
     // Build the off-thread read-only seam over the captured view. It accumulates this reader's SIREAD
@@ -174,8 +175,13 @@ pub fn run_read_task<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send +
     // error into its own cell (surfaced as the outcome). The captured full-text catalogue (`rmp` #546)
     // lets an off-thread `CALL db.index.fulltext.queryNodes` resolve the index by name and recompute
     // its matches from this reader's snapshot.
-    let mut graph =
-        ReadOnlyGraph::new(view, tokens, snapshot, registry, txn, buffer).with_fulltext(fulltext);
+    // The captured index-candidate memo (`rmp` #755) lets an off-thread indexed `MATCH` serve a REAL
+    // `index_seek_eq` — the engine thread pre-ran the seek and handed over the raw candidate ids, and the
+    // reader re-checks them through the same lifted body the inline seam uses. An empty capture (any
+    // non-indexed read, or a gate refusal) simply declines to the exact scan, as before.
+    let mut graph = ReadOnlyGraph::new(view, tokens, snapshot, registry, txn, buffer)
+        .with_fulltext(fulltext)
+        .with_index_candidates(index_candidates);
 
     // RBAC (rmp #93) composes exactly as the inline path: a restricted principal wraps the seam in an
     // `AuthorizedGraph` so reads are filtered uniformly; `None`/admin runs the bare seam (zero cost).

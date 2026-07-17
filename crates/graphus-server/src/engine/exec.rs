@@ -477,7 +477,13 @@ pub(super) fn handle_run<
         && dispatch.is_threaded()
     {
         match coordinator.read_task_inputs(txn) {
-            Ok(inputs) => {
+            Ok(mut inputs) => {
+                // `rmp` #755, Slice S2: pre-run this plan's statically-knowable node-property equality
+                // seeks HERE, on the engine thread that owns the index, and send the results with the
+                // task. Filled at this site (rather than inside `read_task_inputs`) because it is the
+                // plan + bound parameters that decide which seeks to run, and only this site has them.
+                // Without it the reader declines every seek and full-scans a planned index.
+                inputs.index_candidates = coordinator.index_candidates_for(txn, &plan, &bound);
                 let task = ReadTask {
                     txn,
                     ticket,

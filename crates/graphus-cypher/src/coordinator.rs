@@ -388,6 +388,12 @@ pub struct ReadTaskInputs<D: BlockDevice, S: LogSink> {
     /// recomputes its matches from this reader's MVCC snapshot — without the coordinator's `!Send`
     /// [`IndexSet`](crate::index_set::IndexSet). Usually empty (no full-text index declared).
     pub fulltext: crate::read_source::FulltextReadSnapshot,
+    /// A `Send + Sync` memo of the node-property **equality seek results** this plan will ask for
+    /// (`rmp` task #755, Slice S2), pre-run on the engine thread against the live index so the reader
+    /// serves a real seek instead of declining to a full scan. Empty (the default) unless the dispatch
+    /// site fills it via [`TxnCoordinator::index_candidates_for`] — a miss simply declines, so an
+    /// unfilled capture is always safe.
+    pub index_candidates: crate::read_source::IndexCandidateCapture,
 }
 
 // `rmp` #336 Slice 3b-ii: `ReadTaskInputs` is captured on the engine thread and MOVED into the
@@ -1503,6 +1509,18 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // path — and discard the build's dirty flag so it does not leak into the next user statement.
         let high_water = store.borrow().snapshot_ts();
         index.borrow_mut().reset_ft_spatial_marker(high_water);
+        // The node-property twin of the marker above (`rmp` task #755, Slice S2 — containment of the
+        // pre-existing `rmp` #765). `clear()` above wiped every node-property tree and the refill is
+        // NEWEST-WINS, so the stale entries an older snapshot still depends on were destroyed, while the
+        // indexes stay `Online` and `heal()` clears `degraded`. Stamp the same high-water so a captured
+        // seek serves only a reader at-or-after it; an older reader declines to the exact scan.
+        //
+        // Every early return above is preceded by `fail_closed()` (degraded + all states `Populating`),
+        // which the capture's gates 1/2 already refuse — so a failed rebuild needs no stamp.
+        //
+        // NOTE this stamp does NOT protect the INLINE seek, which reads the live wiped tree and still
+        // loses the row: that is `rmp` #765, open.
+        index.borrow_mut().note_node_props_rebuilt(high_water);
         // The rebuild completed with no whole-scan fault and no per-entity gap: the index set is once
         // again a faithful image of the store, so a previous `fail_closed` is repaired (`rmp` task #733).
         // This is what lets a process self-heal from a *transient* storage fault instead of serving
@@ -7711,7 +7729,67 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             // (one entry per declared index) and usually empty, so a per-read `Arc`-free clone is
             // negligible.
             fulltext: self.index.borrow().fulltext_snapshot(),
+            // Filled by the dispatch site via `index_candidates_for` (it needs the plan + bound
+            // parameters, which this method does not take). Defaulting to empty here keeps every other
+            // caller — the DST harness, the tests — on the pre-#755 behaviour: a miss declines to the
+            // exact scan.
+            index_candidates: crate::read_source::IndexCandidateCapture::default(),
         })
+    }
+
+    /// Pre-runs, on the engine thread, every node-property equality seek `plan` will ask for whose seek
+    /// value is statically knowable from `params`, and returns the `Send + Sync` memo of their results
+    /// for an off-thread reader (`rmp` task #755, Slice S2).
+    ///
+    /// This is the whole of the engine thread's contribution to an off-thread index seek: **raw
+    /// candidate ids and nothing else**. Every scrap of semantics — MVCC visibility, the label
+    /// re-check, the current-value residual, the SIREAD markers, the dedup — stays with the reader, which
+    /// runs it through the same lifted [`read_source::index_seek_eq_recheck`] body the live inline path
+    /// uses. So serving a seek off-thread cannot drift from serving it inline: past the candidate list,
+    /// it is literally the same code.
+    ///
+    /// Correctness rests on the memo being a **superset** of the reader's true matches, argued in full
+    /// on [`IndexCandidateCapture`](crate::read_source::IndexCandidateCapture) (the reader's snapshot
+    /// precedes this capture; the node-property index is append-only per entry; the capture is atomic
+    /// against index mutation because both run on this one serial thread). The gates that keep it a
+    /// superset live in [`IndexSet::capture_node_property_eq`](crate::index_set::IndexSet::capture_node_property_eq).
+    ///
+    /// Cheap and self-limiting: it runs at most one seek per `NodeIndexSeek` operator in the plan
+    /// (almost always exactly one, usually zero — most reads seek no index), each the very seek the
+    /// statement was going to run anyway. It is not extra work; it is the *same* work, moved to the
+    /// thread that owns the index.
+    #[must_use]
+    pub fn index_candidates_for(
+        &self,
+        txn: TxnId,
+        plan: &crate::physical::PhysicalPlan,
+        params: &crate::binding::BoundParameters,
+    ) -> crate::read_source::IndexCandidateCapture {
+        let seeks = plan.static_node_index_eq_seeks(params);
+        if seeks.is_empty() {
+            return crate::read_source::IndexCandidateCapture::default();
+        }
+        // The reader's own snapshot decides whether a captured seek may be trusted at all (the rebuild
+        // gate — `rmp` #755 Slice S2, containing `rmp` #765). An unknown txn captures nothing.
+        let Some(reader_ts) = self.active.get(&txn).map(|a| a.snapshot.ts) else {
+            return crate::read_source::IndexCandidateCapture::default();
+        };
+        // Resolve names → tokens through the live store, exactly as the inline seek does. A label or
+        // property key that was never interned cannot match any node, so it simply yields no request
+        // (the reader misses and declines to its scan, which returns the same empty result).
+        let store = self.store.borrow();
+        let requests: Vec<(u32, u32, Value)> = seeks
+            .into_iter()
+            .filter_map(|(label, property, value)| {
+                let label_token = store.token_id(Namespace::Label, &label)?;
+                let prop_key = store.token_id(Namespace::PropKey, &property)?;
+                Some((label_token, prop_key, value))
+            })
+            .collect();
+        drop(store);
+        self.index
+            .borrow_mut()
+            .capture_node_property_eq(reader_ts, &requests)
     }
 
     /// Merges an off-thread reader's accumulated [`SsiReadBuffer`] into the shared

@@ -430,31 +430,30 @@ async fn profile_over_the_wire_returns_rows_and_measured_counters() {
     let _ = server.shutdown().await;
 }
 
-/// **A finding this feature immediately exposed, pinned as a test** (`rmp` #752).
+/// **The finding `PROFILE` exposed (`rmp` #752), now pinned as its FIX (`rmp` #755).**
 ///
-/// An auto-commit read is dispatched to the off-thread **reader pool** (`rmp` #336/#543), whose seam
-/// (`ReadOnlyGraph`) implements **no** `index_seek_*` method: it declines every property-index seek and
-/// the executor falls back — correctly, but expensively — to a full scan. So an indexed query sent over
-/// the wire as a plain auto-commit read reports `NodeIndexSeek` in its plan (the planner *did* choose the
-/// index) while its measured `dbHits` are those of a full scan. Concretely, on the same 300-node data:
+/// An auto-commit read is dispatched to the off-thread **reader pool** (`rmp` #336/#543). Its seam
+/// (`ReadOnlyGraph`) used to implement **no** `index_seek_*` method: it declined every property-index
+/// seek and the executor fell back — correctly, but expensively — to a full scan. So an indexed query
+/// sent over the wire as a plain auto-commit read reported `NodeIndexSeek` in its plan (the planner
+/// *did* choose the index) while its measured `dbHits` were those of a full scan. Measured, on the same
+/// 300-node data:
 ///
-/// | seam | operator | measured `dbHits` |
-/// |------|----------|-------------------|
-/// | inline store seam (`RecordStoreGraph`, `graphus-cypher`'s `profile_db_hits_prove_…` test, 200 nodes) | `NodeIndexSeek` | **2** |
-/// | inline store seam, index dropped | `NodeLabelScanEq` | 201 |
-/// | **off-thread reader** (this test, over Bolt, 300 nodes) | `NodeIndexSeek` | **301** — the whole store |
+/// | seam | operator | `dbHits` before #755 | after |
+/// |------|----------|----------------------|-------|
+/// | inline store seam (`RecordStoreGraph`) | `NodeIndexSeek` | **2** | 2 |
+/// | inline store seam, index dropped | `NodeLabelScanEq` | 201 | 201 |
+/// | **off-thread reader** (this test, over Bolt, 300 nodes) | `NodeIndexSeek` | **301** — the whole store | **a real seek** |
 ///
-/// The plan is right; the *execution* does not use the index. That is a real performance defect in the
-/// read path (it is not introduced by `PROFILE` — `PROFILE` is what made it visible), and it is precisely
-/// the class of silent regression this task exists to surface. It is **not** a correctness bug: the rows
-/// are identical either way, which is exactly why it went unnoticed.
+/// The plan was right; the *execution* did not use the index. It was never a correctness bug — the rows
+/// are identical either way, which is exactly why it went unnoticed until `PROFILE` measured it.
 ///
-/// This test pins the CURRENT measured behaviour so the finding cannot be quietly lost. When the reader
-/// pool learns to serve index seeks (a follow-up task: the reader needs a `Send` snapshot of the index),
-/// this assertion will fail — and must then be tightened to `seek_hits * 4 < scan_hits`, matching what the
-/// inline seam already achieves.
+/// `rmp` #755 (Slice S2) closes it: the engine thread pre-runs the plan's statically-knowable equality
+/// seeks at dispatch and hands the reader the candidate ids, which the reader re-checks through the same
+/// lifted body the inline seam uses. This test now pins the FIX with the threshold the finding itself
+/// named — `seek_hits * 4 < scan_hits`, matching what the inline seam already achieved.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_off_thread_reader_declines_the_index_and_profile_measures_it() {
+async fn the_off_thread_reader_serves_the_index_seek_and_profile_measures_it() {
     let temp = TempStore::new("readerpool");
     let server = boot(&temp).await;
 
@@ -486,16 +485,12 @@ async fn the_off_thread_reader_declines_the_index_and_profile_measures_it() {
         seek_ops.iter().any(|o| o == "NodeIndexSeek"),
         "the planner DID pick the index: {seek_ops:?}"
     );
-    assert_eq!(
-        seek_hits, scan_hits,
-        "MEASURED FINDING (rmp #752): an auto-commit read runs on the reader pool, whose seam declines \
-         the index seek, so the indexed query reads exactly as much of the store as the unindexed one \
-         (seek={seek_hits}, scan={scan_hits}). The inline seam serves the same seek in 2 dbHits. When the \
-         reader pool learns index seeks, tighten this to `seek_hits * 4 < scan_hits`."
-    );
     assert!(
-        seek_hits >= 300,
-        "…and what it read is the whole 300-node store: {seek_hits}"
+        seek_hits * 4 < scan_hits,
+        "MEASURED FIX (rmp #755): an auto-commit read runs on the reader pool, which now SERVES the \
+         index seek from the candidates captured at dispatch — so the indexed query must read a small \
+         fraction of what the unindexed one reads (seek={seek_hits}, scan={scan_hits}). Before #755 \
+         these were EQUAL (301 vs 301: the whole 300-node store) while the plan still said NodeIndexSeek."
     );
 
     let _ = server.shutdown().await;

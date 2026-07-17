@@ -281,6 +281,41 @@ impl PhysicalPlan {
         all_procedure_calls_reader_safe(&self.root, registry)
     }
 
+    /// Every `(label, property, seek_value)` this plan will ask
+    /// [`index_seek_eq`](crate::graph_access::GraphAccess::index_seek_eq) for and whose seek value is
+    /// **statically knowable** at dispatch — i.e. resolvable *now*, on the engine thread, to exactly the
+    /// value the executor will later compute (`rmp` task #755, Slice S2).
+    ///
+    /// The engine uses this to pre-run those seeks against the live index and hand the results to an
+    /// off-thread reader as an [`IndexCandidateCapture`](crate::read_source::IndexCandidateCapture).
+    ///
+    /// # What "statically knowable" means, and why the test is the expression itself
+    ///
+    /// A seek value qualifies iff it is an [`ExprKind::Literal`] or an [`ExprKind::Parameter`] (the
+    /// latter is the overwhelmingly common shape: auto-parameterisation turns `{email: 'u7@x.io'}` into
+    /// a `$param`). No plan-position analysis is needed, because those two forms **cannot** reference a
+    /// row: they are row-independent *by construction*. That single test excludes, in one stroke:
+    ///
+    /// * **correlated** seeks (`rmp` #708/#764 — `UNWIND rows AS t MATCH (b:L {p: t.k})`), whose value
+    ///   is a `Property`/`Variable` expression keyed off the left row; and
+    /// * every **non-deterministic or graph-dependent** expression (`date()`, `rand()`, a function of
+    ///   another node), which could evaluate differently at dispatch than in the executor.
+    ///
+    /// Anything else yields no entry, the reader's lookup misses, and it declines to its exact scan
+    /// fallback — so a value this method fails to anticipate costs performance, never rows.
+    ///
+    /// A missing parameter resolves to no entry here; the executor evaluates it to `Null`, which is
+    /// unindexable and declines anyway — the two agree.
+    #[must_use]
+    pub fn static_node_index_eq_seeks(
+        &self,
+        params: &crate::binding::BoundParameters,
+    ) -> Vec<(String, String, graphus_core::Value)> {
+        let mut out = Vec::new();
+        collect_static_node_index_eq_seeks(&self.root, params, &mut out);
+        out
+    }
+
     /// Whether this plan depends on `id`.
     #[must_use]
     pub fn depends_on(&self, id: IndexId) -> bool {
@@ -5837,6 +5872,48 @@ impl PhysicalOp {
                 Ok(())
             }
         }
+    }
+}
+
+/// Collects this operator's statically-knowable `NodeIndexSeek` keys, then recurses into its sub-plans
+/// (`rmp` task #755, Slice S2). See [`PhysicalPlan::static_node_index_eq_seeks`].
+///
+/// The recursion walks [`PhysicalOp::children`] — the single, exhaustive definition of "the children of
+/// a physical operator" — so a newly-added child-bearing operator is traversed here automatically and a
+/// nested seek can never escape the capture by being missed. (Escaping only costs the acceleration: the
+/// reader would decline and scan. The walk is shared so it stays right anyway.)
+fn collect_static_node_index_eq_seeks(
+    op: &PhysicalOp,
+    params: &crate::binding::BoundParameters,
+    out: &mut Vec<(String, String, graphus_core::Value)>,
+) {
+    if let PhysicalOp::NodeIndexSeek {
+        label,
+        property,
+        value,
+        ..
+    } = op
+        && let Some(seek) = static_seek_value(value, params)
+    {
+        out.push((label.name.clone(), property.clone(), seek));
+    }
+    for child in op.children() {
+        collect_static_node_index_eq_seeks(child, params, out);
+    }
+}
+
+/// The value of `expr` if — and only if — it is knowable at dispatch and guaranteed to equal what the
+/// executor will evaluate: a literal, or a bound parameter. Everything else (a correlated `t.k`, a
+/// function call, an arithmetic expression) yields [`None`], because it may depend on the row, the
+/// clock, or the graph. See [`PhysicalPlan::static_node_index_eq_seeks`] for why this is the whole test.
+fn static_seek_value(
+    expr: &Expr,
+    params: &crate::binding::BoundParameters,
+) -> Option<graphus_core::Value> {
+    match &expr.kind {
+        ExprKind::Literal(lit) => crate::eval::literal_value(lit).ok(),
+        ExprKind::Parameter(name) => params.get(name).cloned(),
+        _ => None,
     }
 }
 
