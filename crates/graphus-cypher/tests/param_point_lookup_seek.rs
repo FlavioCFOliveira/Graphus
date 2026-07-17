@@ -124,15 +124,25 @@ fn assert_point_lookup_seeks(coord: &Coord, ctx: &str) {
         );
     }
 
-    // Cross-check the cost floor directly: an equality seek is estimated strictly cheaper than the
-    // NodeLabelScanEq alternative over the same label — even with the parameter's constant-selectivity
-    // fallback (no histogram), which is exactly the production situation (no ANALYZE runs there).
+    // Cross-check the statistics the two shapes actually plan on.
+    //
+    // This assertion used to read `.is_none()`, on the premise that "production has no histogram …
+    // (no ANALYZE runs there)". That premise was true when `rmp` #569 wrote it and is **false** since
+    // `rmp` #572: `CREATE INDEX` now seeds the index's histogram, so a declared index is born with
+    // real statistics. Inverted here rather than deleted, because the seeding is exactly what a
+    // regression would silently undo.
     assert!(
         stats
             .estimate_nodes_label_property_eq("Account", "id", &graphus_core::Value::Integer(42))
-            .is_none(),
-        "[{ctx}] precondition: production has no histogram for Account.id (the fallback path)"
+            .is_some(),
+        "[{ctx}] since `rmp` #572 a declared index is born with a histogram (CREATE INDEX seeds it)"
     );
+
+    // The property that matters is unchanged and is asserted above for BOTH shapes: the point lookup
+    // is a `NodeIndexSeek` cost-based AND rule-based. The rule-based case (`None` stats) is the one
+    // that proves the seek does not *depend* on the histogram — which is what keeps a `$param` lookup
+    // a seek, since a parameter's value is unknown at plan time and can never be placed in a
+    // histogram bucket. `param_equality_seek_cost_beats_label_scan_eq` pins that cost ordering.
 }
 
 #[test]

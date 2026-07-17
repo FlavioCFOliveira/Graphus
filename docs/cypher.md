@@ -724,7 +724,8 @@ Call procedures with `CALL … [YIELD …]`.
 | `dbms.components()` | product name, version list, and edition (`Graphus`, `["0.0.x"]`, `community`) |
 | `db.awaitIndexes(timeOutSeconds = 300)` | block until every index is `online` or the timeout elapses — the timeout is **optional** (defaults to 300) |
 | `db.awaitIndex(indexName, timeOutSeconds = 300)` | await one named index; a no-op for a real index, an **error** if no index of that name exists |
-| `db.resampleIndex(indexName)`, `db.resampleOutdatedIndexes()` | schedule a re-sampling of index statistics (no-op; statistics are maintained automatically) |
+| `db.resampleIndex(indexName)` | request a recompute of the named index's selectivity histogram — an **error** if no index of that name exists; a no-op for an index kind that keeps no histogram. Not part of the calling transaction (as in Neo4j); see [indexes.md](indexes.md#index-statistics-and-the-planner) |
+| `db.resampleOutdatedIndexes()` | request a recompute of **every** declared node-property index's selectivity histogram |
 | `db.index.fulltext.queryNodes(indexName, queryString [, options])` | full-text node search; optional `options` map honours `skip` / `limit` |
 | `db.index.fulltext.queryRelationships(indexName, queryString [, options])` | full-text relationship search; same optional `options` map |
 | `db.index.fulltext.listAvailableAnalyzers()` | list the supported full-text analyzers (`standard`, `keyword`) with their stop-words |
@@ -738,7 +739,9 @@ CALL dbms.components() YIELD name, versions, edition RETURN name, versions, edit
 CALL db.awaitIndexes()             -- block up to the default 300 s for pending builds
 CALL db.awaitIndexes(60)           -- ... or an explicit timeout
 CALL db.awaitIndex('ix_age')       -- await a single named index (errors if it does not exist)
-CALL db.resampleIndex('ix_age')
+
+CALL db.resampleIndex('ix_age')    -- refresh one index's selectivity histogram
+CALL db.resampleOutdatedIndexes()  -- ... or every declared node-property index
 
 CALL db.index.fulltext.listAvailableAnalyzers() YIELD analyzer, description, stopwords
 

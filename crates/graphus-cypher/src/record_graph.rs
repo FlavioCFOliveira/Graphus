@@ -3929,6 +3929,59 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         )
     }
 
+    fn resamplable_node_property_indexes(&self) -> Option<Vec<(String, String, String)>> {
+        // The declared single-property node indexes, from the **durable** catalog (`rmp` task #572) —
+        // a pure metadata read of the schema, like `index_exists_by_name`: no MVCC snapshot, no entity
+        // visibility, no SIREAD marker (an index declaration is not row data).
+        //
+        // Every declared index is listed, in **any** build state, not only `Online`. A `Populating`
+        // index's histogram is just as computable (the histogram is derived from the *nodes*, never
+        // from the index's backing tree), and refusing to resample it would make the procedure's effect
+        // depend on a race with a background build.
+        //
+        // The name resolution mirrors `TxnCoordinator::list_node_property_indexes` — the source
+        // `SHOW INDEXES` renders — so a name a user can *see* is a name they can resample: the durable
+        // name, falling back to the deterministic `auto_index_name` for a legacy anonymous index whose
+        // best-effort backfill has not (yet) committed.
+        let store = self.store.borrow();
+        Some(
+            store
+                .node_property_indexes()
+                .into_iter()
+                .filter_map(|(label_token, prop_key, _state)| {
+                    let label = store.token_name(Namespace::Label, label_token)?;
+                    let property = store.token_name(Namespace::PropKey, prop_key)?;
+                    let name = store
+                        .node_property_index_name_for(label_token, prop_key)
+                        .unwrap_or_else(|| crate::coordinator::auto_index_name(label, property));
+                    Some((name, label.to_owned(), property.to_owned()))
+                })
+                .collect(),
+        )
+    }
+
+    fn request_index_resample(&mut self, label: &str, property: &str) -> bool {
+        // QUEUE the request for the coordinator's drain; do NOT recompute here (`rmp` task #572).
+        //
+        // This seam is bound to the CALLER's transaction, and the recompute must not run in it — a
+        // catalog mutation staged in a transaction the engine can yield across is precisely the shape
+        // `RecordStore::rollback` cannot undo per-transaction (`rmp` #734), and Neo4j's own
+        // `db.resampleIndex` does not resample inside the caller's transaction either (it schedules a
+        // job). Only the coordinator can mint the separate, yield-free transaction the recompute needs,
+        // so the request is handed to it through the shared `IndexSet` — the same channel the seam
+        // already uses to signal a rebuild gap.
+        //
+        // `false` on the standalone path (no coordinator ⇒ nobody will ever drain the queue): the caller
+        // then keeps its lenient no-op contract rather than promising a resample that cannot happen.
+        match &self.index {
+            Some(index) => {
+                index.borrow_mut().request_resample(label, property);
+                true
+            }
+            None => false,
+        }
+    }
+
     fn node_labels(&self, node: NodeId) -> Option<Vec<String>> {
         // The shared lifted body (`rmp` task #336): existence check, then the node's label names
         // mapped + name-sorted; an overflow-form bitmap is captured and reported as `Some(vec![])`

@@ -393,6 +393,65 @@ index is its own kind — it never backs a constraint (`owningConstraint` is alw
 
 ---
 
+## Index statistics and the planner
+
+The cost-based planner estimates how many rows a predicate will match. Graphus keeps **two kinds** of
+statistic, and they are maintained differently — the distinction matters when you tune:
+
+| Statistic | Scope | Maintenance |
+| --------- | ----- | ----------- |
+| Per-label / per-relationship-type **counts** | the whole graph | **Live.** Every write keeps them current, so they never go stale and never need a resample. |
+| Per-`(label, property)` **selectivity histogram** (equi-depth, 64 buckets) | each declared single-property **node** index | **Sampled.** A point-in-time image, recomputed by a full scan on demand. It drifts as the data changes. |
+
+An equi-depth histogram cannot be maintained incrementally without resampling, so it is deliberately
+recompute-only — this is the same trade-off `ANALYZE` / `UPDATE STATISTICS` makes in a relational
+engine. Graphus recomputes it in two places:
+
+- **at `CREATE INDEX`**, so a declared index is *born* with real statistics and no operator action is
+  needed for a freshly-built index;
+- **on demand**, via `db.resampleIndex(indexName)` / `db.resampleOutdatedIndexes()` — Graphus's
+  `ANALYZE`. (Neo4j has no `ANALYZE` keyword; these procedures *are* it.)
+
+```cypher
+CALL db.resampleIndex('index_Person_age')  -- refresh one index after a bulk load
+CALL db.resampleOutdatedIndexes()          -- refresh every declared node-property index
+```
+
+**A resample is not part of your transaction, and `ROLLBACK` does not undo it.** The procedure
+*requests* the recompute and returns; the engine runs it immediately afterwards in its own
+transaction. This matches Neo4j, where `db.resampleIndex` schedules a background re-sampling job that
+ignores the calling transaction entirely — resampling is not a transactional graph mutation. So the
+call returns "accepted and will run", not "already done", and the outcome is the **same** whether you
+call it auto-commit or inside `BEGIN … ROLLBACK`, with or without other transactions in flight.
+
+Statistics are metadata, not data: this costs you nothing in correctness. A histogram that is stale,
+absent, or refreshed when you expected it not to be can only make a plan less well informed — it can
+never change a query's rows.
+
+**When to resample.** After a bulk load, or after a change large enough to shift the distribution the
+histogram describes — the classic case being data that arrives sorted or clustered, so the shape after
+the load looks nothing like the shape at `CREATE INDEX`. A stale histogram is never *wrong*, only
+imprecise: it can only cost you a less well-informed plan, never a wrong answer.
+
+**Cost.** A resample is a full scan of the label, per `(label, property)`. That is why it is explicit
+rather than automatic, and why `db.resampleOutdatedIndexes()` on a large graph with many indexed
+properties is not free. Measured on the reference host, seeding a histogram adds **~5%** to the
+`CREATE INDEX` DDL (which already scans the store to populate the index itself) — 569 ms vs 541 ms at
+50 000 nodes.
+
+**Scope.** Only single-property **node** indexes carry a histogram — it is what the estimator is keyed
+by. Resampling a relationship, composite, full-text, point, text, or vector index by name is an
+accepted no-op: those index kinds keep no sampled statistic. Naming an index that does not exist at
+all is an error.
+
+> Unlike Neo4j — which samples in the background and selects only indexes whose update count exceeds a
+> threshold — `db.resampleOutdatedIndexes()` recomputes **every** declared node-property index
+> synchronously. Graphus tracks no per-index update counter, so it cannot single out the genuinely
+> drifted ones; recomputing all of them is a superset of that selection (never wrong, but more
+> expensive), and it is complete by the time the call returns.
+
+---
+
 ## Try it — REST
 
 Log in for a Bearer token, then send the DDL to the auto-commit endpoint (see

@@ -697,15 +697,37 @@ impl ProcedureSet {
             ),
             Box::new(|_args, _graph| Ok(list_available_analyzers_rows())),
         );
-        // `db.resampleIndex(indexName)` and `db.resampleOutdatedIndexes()` — schedule a re-sampling of
-        // index statistics (`rmp` task #639). Both are **VOID** no-ops in Graphus: the planner's
-        // statistics are maintained **automatically** — live per-label/per-type counts and equi-depth
-        // property histograms rebuilt from the store on open (see [`crate::statistics`] /
-        // `graphus-index::histogram`) — so there is no separately-sampled index statistic that could go
-        // stale and need an explicit resample. They are registered for driver/tooling compatibility and
-        // complete successfully with no effect. `indexName` is not validated against the catalog (the
-        // `GraphAccess` seam exposes no index-catalog listing), matching the lenient no-op contract.
-        set.register_reader_safe(
+        // `db.resampleIndex(indexName)` and `db.resampleOutdatedIndexes()` — re-sample index
+        // statistics (`rmp` tasks #639, #572). Both are **VOID**, and both really do the work: they are
+        // Graphus's `ANALYZE` (Neo4j has no `ANALYZE` keyword — these procedures *are* it).
+        //
+        // Graphus keeps two kinds of planner statistic, and they are maintained differently:
+        //
+        // - the per-label / per-type **counts** (`rmp` tasks #79 / #82) are live — every write keeps
+        //   them current incrementally, so they never go stale and never need a resample;
+        // - the per-`(label, property)` equi-depth **histograms** (`rmp` task #81) are *sampled*: an
+        //   equi-depth histogram cannot be maintained incrementally without resampling (see
+        //   `RecordStoreGraph::recompute_property_histogram`), so it is a point-in-time image that
+        //   drifts as the data changes. It is recomputed by a full scan on demand — requested here and
+        //   executed by the engine's drain, and directly when an index is created (so a declared index
+        //   is born with real statistics).
+        //
+        // So there IS a separately-sampled statistic that goes stale, and this is what refreshes it.
+        // A histogram that is stale or absent is never *wrong*, only imprecise: the estimator falls
+        // back to `cardinality::DEFAULT_PREDICATE_SELECTIVITY` and the plan is merely less well
+        // informed.
+        //
+        // The resample is NOT part of the caller's transaction, and a ROLLBACK does not undo it — that
+        // is the Neo4j model (it schedules a background job), and it is what makes the outcome
+        // deterministic. See `db_resample_index` for the full rationale; do not "fix" it back to
+        // transactional.
+        //
+        // NOT reader-safe (`rmp` task #546): both record their request into the shared `IndexSet` for
+        // the engine's drain. That is a mutation of engine-thread state, and the off-thread reader pool
+        // works from an owned, snapshot-captured view whose `IndexSet` the engine never reads back — so
+        // a dispatched resample request would be dropped on the floor and the procedure would report
+        // success having queued nothing.
+        set.register(
             ProcedureSignature::new(
                 "db.resampleIndex",
                 vec![FieldSpec::new(
@@ -714,11 +736,11 @@ impl ProcedureSet {
                 )],
                 Vec::new(),
             ),
-            Box::new(|_args, _graph| Ok(Vec::new())),
+            Box::new(db_resample_index),
         );
-        set.register_reader_safe(
+        set.register(
             ProcedureSignature::new("db.resampleOutdatedIndexes", Vec::new(), Vec::new()),
-            Box::new(|_args, _graph| Ok(Vec::new())),
+            Box::new(db_resample_outdated_indexes),
         );
         set
     }
@@ -1007,6 +1029,111 @@ fn db_await_index(
             NAME,
             format!("there is no index named {index_name:?}"),
         ));
+    }
+    Ok(Vec::new())
+}
+
+/// The `db.resampleIndex(indexName)` body (`rmp` task #572) — Graphus's `ANALYZE`.
+///
+/// Resolves `indexName` to the `(label, property)` it covers and **requests** that its equi-depth
+/// selectivity histogram be recomputed from the current data, so the planner estimates ranges and joins
+/// from the real distribution instead of its constant fallback. The engine performs the recompute
+/// shortly afterwards, in its **own** transaction.
+///
+/// # This is deliberately NOT part of the caller's transaction — do not "fix" it
+///
+/// A `ROLLBACK` does not undo a resample, and that is **correct**, not a compromise:
+///
+/// * **It is what Neo4j does.** `db.resampleIndex` there *schedules* a background re-sampling job that
+///   ignores the caller's transaction entirely. Resampling is not a transactional graph mutation in the
+///   Neo4j model, and Graphus is bound to that model. Making it transactional would be the deviation.
+/// * **It is what keeps the outcome deterministic.** A resample staged in the caller's transaction is
+///   undone by a rollback only when no *other* transaction happens to be open: `RecordStore::rollback`
+///   restores the catalog's schema half wholesale when the active set is non-empty, resurrecting the
+///   very change it was undoing. So the transactional reading gave "discarded, or not, depending on
+///   unrelated concurrency" — which is indefensible in either direction. Out of the caller's
+///   transaction, the answer is the same every time.
+/// * **It sidesteps `rmp` #734 rather than closing it.** That per-transaction catalog-undo gap is
+///   pre-existing and still open for any future DDL that mutates the catalog inside a yielding
+///   transaction; this procedure simply no longer triggers it. Nothing here fixes #734.
+///
+/// The consequence to keep in mind: a `true` return means "accepted and will run", not "already done"
+/// — exactly as Neo4j's scheduled job does.
+///
+/// # Name resolution
+///
+/// Searches the declared **node-property** indexes — the only kind an equi-depth histogram is keyed by
+/// — using the same names `SHOW INDEXES` displays. Three cases, in order:
+///
+/// - the name is a node-property index → request its recompute;
+/// - the name is an index of **another kind** (full-text, vector, composite, …) → a genuine **no-op
+///   success**: that index exists, it simply keeps no sampled statistic to refresh;
+/// - the name is in **no** catalog → an error, matching Neo4j (and `db.awaitIndex`, which shares this
+///   name namespace and this spelling).
+///
+/// # Errors
+/// Returns a [`ProcedureFailure`] if the first argument is not a string, or if the seam reports
+/// authoritatively that no index of that name exists. A scan fault during the later recompute cannot be
+/// reported here (the work has not run yet); it fails closed, leaving the histogram absent rather than
+/// partial (`rmp` task #733), and the planner falls back to its constant.
+fn db_resample_index(
+    args: &[Value],
+    graph: &mut dyn GraphAccess,
+) -> Result<Vec<Vec<Value>>, ProcedureFailure> {
+    const NAME: &str = "db.resampleIndex";
+    let index_name = match args.first() {
+        Some(Value::String(s)) => s.as_str(),
+        _ => {
+            return Err(ProcedureFailure::new(
+                NAME,
+                "the first argument (indexName) must be a string",
+            ));
+        }
+    };
+    // `None` = the seam has no index-catalog visibility → keep the lenient no-op contract, exactly as
+    // `db.awaitIndex` does for a seam that cannot resolve names.
+    let Some(declared) = graph.resamplable_node_property_indexes() else {
+        return Ok(Vec::new());
+    };
+    let Some((_, label, property)) = declared.into_iter().find(|(n, _, _)| n == index_name) else {
+        // Not a node-property index. Distinguish "exists, but keeps no histogram" (no-op success) from
+        // "no such index at all" (error) — only the seam's cross-kind catalog can tell them apart.
+        if graph.index_exists_by_name(index_name) == Some(false) {
+            return Err(ProcedureFailure::new(
+                NAME,
+                format!("there is no index named {index_name:?}"),
+            ));
+        }
+        return Ok(Vec::new());
+    };
+    graph.request_index_resample(&label, &property);
+    Ok(Vec::new())
+}
+
+/// The `db.resampleOutdatedIndexes()` body (`rmp` task #572) — `ANALYZE` over every declared index.
+///
+/// Requests a recompute of the equi-depth selectivity histogram of **every** declared node-property
+/// index. As with [`db_resample_index`], the recomputes run in the engine's own transactions and are
+/// **not** part of the caller's — see that function for why that is the conformant behaviour and must
+/// not be "corrected" to transactional.
+///
+/// # "Outdated"
+///
+/// Graphus tracks no per-index update counter, so it cannot single out the indexes whose statistics have
+/// actually drifted (Neo4j gates on `updates > round(0.05 * indexSize)`); it recomputes **all** of them.
+/// That is a deliberate **superset** of the Neo4j selection and is therefore never wrong — resampling an
+/// already-current histogram recomputes the same values — but it does cost a full scan per declared
+/// `(label, property)`. Gating on real drift needs an update counter, which is a separate, measured task.
+fn db_resample_outdated_indexes(
+    _args: &[Value],
+    graph: &mut dyn GraphAccess,
+) -> Result<Vec<Vec<Value>>, ProcedureFailure> {
+    // `None` = no index-catalog visibility → lenient no-op (the `db.awaitIndex` convention).
+    let Some(declared) = graph.resamplable_node_property_indexes() else {
+        return Ok(Vec::new());
+    };
+    for (_, label, property) in declared {
+        graph.request_index_resample(&label, &property);
     }
     Ok(Vec::new())
 }
@@ -1860,10 +1987,13 @@ mod tests {
     }
 
     #[test]
-    fn db_resample_index_and_outdated_are_void_noops() {
-        // `rmp` task #639: both VOID no-ops (planner statistics are maintained automatically, so there
-        // is nothing to resample). `db.resampleIndex` takes a STRING index name; the outdated form is
-        // nullary.
+    fn db_resample_index_and_outdated_are_void_and_lenient_without_a_catalog() {
+        // `rmp` tasks #639, #572: both are VOID. Against a seam with no index-catalog visibility
+        // (`MemGraph` returns `None` from `resamplable_node_property_indexes`), both keep the lenient
+        // no-op contract rather than erroring — the same convention `db.awaitIndex` follows. The real
+        // resampling behaviour, over the store-backed seam, is proven in
+        // `tests/index_statistics.rs`. `db.resampleIndex` takes a STRING index name; the outdated
+        // form is nullary.
         let set = ProcedureSet::with_builtins();
 
         let sig = set.signature("db.resampleIndex").expect("registered");
@@ -2006,8 +2136,6 @@ mod tests {
         for name in [
             "dbms.components",
             "db.awaitIndexes",
-            "db.resampleIndex",
-            "db.resampleOutdatedIndexes",
             "db.index.fulltext.queryRelationships",
             "db.index.fulltext.awaitEventuallyConsistentIndexRefresh",
             "db.index.fulltext.listAvailableAnalyzers",
@@ -2020,6 +2148,23 @@ mod tests {
             !set.is_reader_safe("db.awaitIndex"),
             "db.awaitIndex must run inline (authoritative catalog)"
         );
+    }
+
+    #[test]
+    fn resample_procedures_are_not_reader_safe() {
+        // `rmp` task #572. These two were reader-safe while they were no-ops — trivially true of a body
+        // that does nothing. Now that they really resample, they record their request into the shared
+        // engine-thread `IndexSet` for the drain to execute, so they must run inline. Were they still
+        // dispatched to the off-thread reader pool (`rmp` #546), they would record into an owned
+        // snapshot view the engine never reads back, and the resample the caller explicitly asked for
+        // would be silently dropped — the procedure would report success having queued nothing.
+        let set = ProcedureSet::with_builtins();
+        for name in ["db.resampleIndex", "db.resampleOutdatedIndexes"] {
+            assert!(
+                !set.is_reader_safe(name),
+                "`{name}` writes a histogram: it must run inline, never on the reader pool"
+            );
+        }
     }
 
     #[test]

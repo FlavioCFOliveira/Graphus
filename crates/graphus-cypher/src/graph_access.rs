@@ -624,6 +624,45 @@ pub trait GraphAccess {
         None
     }
 
+    /// The declared **node-property** indexes whose selectivity histogram a resample can recompute,
+    /// as `(name, label, property)` (`rmp` task #572) — the catalogue behind `db.resampleIndex` /
+    /// `db.resampleOutdatedIndexes`.
+    ///
+    /// Only single-property **node** indexes appear: an equi-depth [`PropertyHistogram`] is keyed by
+    /// `(label_token, property_token)`, so it is the only index kind that backs a
+    /// [`Statistics`](crate::statistics::Statistics) estimate. Every other kind (relationship,
+    /// composite, full-text, spatial, text, vector) keeps no histogram and is therefore correctly
+    /// absent — resampling one is a no-op, not an error.
+    ///
+    /// Returns `None` by default: this seam has no index-catalog visibility, so the caller keeps the
+    /// lenient no-op contract (the same convention as
+    /// [`index_exists_by_name`](Self::index_exists_by_name)). `Some(vec)` is authoritative — an empty
+    /// vector genuinely means "no node-property index is declared", which is **not** the same as
+    /// `None`.
+    ///
+    /// The store-backed [`RecordStoreGraph`](crate::record_graph) answers from the durable index
+    /// catalog, resolving each index's name exactly as `SHOW INDEXES` does (including the auto-name
+    /// fallback for a legacy index whose durable name backfill has not run).
+    fn resamplable_node_property_indexes(&self) -> Option<Vec<(String, String, String)>> {
+        None
+    }
+
+    /// **Requests** that the `(label, property)` selectivity histogram be recomputed, returning whether
+    /// this seam accepted the request (`rmp` task #572).
+    ///
+    /// This is the `ANALYZE` trigger. It deliberately does **not** do the work, and the resample is
+    /// deliberately **not** part of the calling transaction — see
+    /// [`resamplable_node_property_indexes`](Self::resamplable_node_property_indexes) for which indexes
+    /// carry a histogram at all, and `db.resampleIndex` for the full rationale. The engine executes the
+    /// request shortly afterwards, in its own transaction; `true` means "accepted and will run", not
+    /// "already done".
+    ///
+    /// The **default** returns `false`: a backend that keeps no sampled statistics has nothing to
+    /// recompute, so the caller keeps its lenient no-op contract.
+    fn request_index_resample(&mut self, _label: &str, _property: &str) -> bool {
+        false
+    }
+
     /// The **snapshot-correct full-text scan fallback** for a stale reader (`rmp` task #467): an
     /// internal seam helper. The default is a no-op (`Vec::new()`); the store-backed
     /// [`RecordStoreGraph`](crate::record_graph) overrides it to compute the matching node set directly

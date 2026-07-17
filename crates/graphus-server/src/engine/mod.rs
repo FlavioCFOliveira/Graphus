@@ -1710,7 +1710,9 @@ fn intercept_simulate_maintenance(
 /// Advances the front non-blocking index build by one [`INDEX_BUILD_CHUNK`] (`rmp` task #91). A
 /// no-op when no build is pending. Kept tiny and inline-friendly so the loop's two call sites read
 /// clearly.
-fn drive_index_build<D: BlockDevice, S: LogSink>(coordinator: &mut Option<TxnCoordinator<D, S>>) {
+fn drive_index_build<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>(
+    coordinator: &mut Option<TxnCoordinator<D, S>>,
+) {
     if let Some(coord) = coordinator.as_mut() {
         let _remaining = coord.advance_index_builds(INDEX_BUILD_CHUNK);
     }

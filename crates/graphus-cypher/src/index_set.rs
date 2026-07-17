@@ -27,7 +27,7 @@
 //! seek deliberately exploits this when a bound cannot be expressed exactly against the backing
 //! index (see [`IndexSet::seek_node_property_range`]).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use graphus_bufpool::BufferPool;
 use graphus_core::{Timestamp, TxnId, Value};
@@ -354,6 +354,21 @@ pub struct IndexSet {
     /// Cleared by [`clear`](Self::clear) (a fresh rebuild starts clean) and by
     /// [`clear_rebuild_gap`](Self::clear_rebuild_gap).
     rebuild_gap: bool,
+    /// `(label, property)` pairs whose selectivity histogram a `db.resampleIndex` /
+    /// `db.resampleOutdatedIndexes` has **asked** to have recomputed (`rmp` task #572), oldest first.
+    ///
+    /// The same seam→coordinator signalling channel as [`rebuild_gap`](Self#structfield.rebuild_gap):
+    /// the per-statement seam records here, and the coordinator's
+    /// `advance_index_builds` drain reads it — because only the coordinator can mint the transaction
+    /// the recompute must run in. The procedure cannot do the work itself: it holds the **caller's**
+    /// transaction, and a catalog mutation staged there is exactly what must not happen (see
+    /// `TxnCoordinator::seed_index_histogram`).
+    ///
+    /// Deliberately **not** cleared by [`clear`](Self::clear) / [`fail_closed`](Self::fail_closed),
+    /// unlike `rebuild_gap`: a request is a user's instruction, not state derived from the trees, and a
+    /// rebuild has no business silently dropping it. The recompute reads the **store**, so it is
+    /// unaffected by a wiped index set.
+    pending_resamples: VecDeque<(String, String)>,
     /// How many times this index set has been **wiped** by [`fail_closed`](Self::fail_closed)
     /// (`rmp` task #733) — an epoch counter that invalidates work computed against a previous epoch.
     ///
@@ -613,6 +628,7 @@ impl IndexSet {
             // failed rebuild makes it untrustworthy (`rmp` task #733).
             labels_usable: true,
             rebuild_gap: false,
+            pending_resamples: VecDeque::new(),
             wipe_generation: 0,
             fail_closed_events: 0,
             degraded: false,
@@ -1211,6 +1227,35 @@ impl IndexSet {
 
     /// Clears the gap flag, so a build can start from a known-clean slate (`rmp` task #733). Used by the
     /// synchronous / incremental builds that do not go through [`clear`](Self::clear).
+    /// Records a request to recompute the `(label, property)` selectivity histogram (`rmp` task #572),
+    /// for the coordinator's drain to execute. Idempotent: a pair already queued is not queued twice, so
+    /// N calls before one drain cost one recompute — a histogram is a point-in-time image, so the second
+    /// of two back-to-back recomputes would only redo the first.
+    pub fn request_resample(&mut self, label: &str, property: &str) {
+        if self
+            .pending_resamples
+            .iter()
+            .any(|(l, p)| l == label && p == property)
+        {
+            return;
+        }
+        self.pending_resamples
+            .push_back((label.to_owned(), property.to_owned()));
+    }
+
+    /// Whether any resample request is still waiting for the coordinator's drain (`rmp` task #572).
+    #[must_use]
+    pub fn has_pending_resamples(&self) -> bool {
+        !self.pending_resamples.is_empty()
+    }
+
+    /// Takes the oldest pending resample request, or [`None`] when the queue is empty (`rmp` task
+    /// #572). The caller **owns** the request once taken: it is not re-queued on failure, which is what
+    /// makes the drain loop terminate (`while has_pending_index_builds() { advance… }`).
+    pub fn pop_pending_resample(&mut self) -> Option<(String, String)> {
+        self.pending_resamples.pop_front()
+    }
+
     pub fn clear_rebuild_gap(&mut self) {
         self.rebuild_gap = false;
     }

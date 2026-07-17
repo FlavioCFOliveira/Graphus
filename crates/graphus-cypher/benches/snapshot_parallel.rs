@@ -225,22 +225,42 @@ fn bench_snapshot_aggregation(c: &mut Criterion) {
         assert_eq!(nodes.len(), n);
 
         // Cross-check serial == parallel once before timing (also surfaces a regression cheaply).
-        let serial_ref: i64 = nodes.iter().map(|&node| kernel(&snap, node)).sum();
-        let parallel_ref: i64 = nodes.par_iter().map(|&node| kernel(&snap, node)).sum();
+        //
+        // WRAPPING accumulation, deliberately. `kernel` is a hash-like mixer that already uses
+        // `wrapping_*` internally and returns values spread over the whole `i64` range, so summing
+        // thousands of them overflows `i64` by construction. Plain `sum()` is a *checked* add: it wraps
+        // silently in release but PANICS in debug, so `cargo test --all-targets` (which builds benches
+        // in debug) aborted this bench before it ran a single measurement. Wrapping is what release was
+        // doing all along, and `i64` wrapping addition stays associative + commutative, so the
+        // serial-vs-parallel equality this cross-check exists for is unaffected by the reduction order.
+        let serial_ref: i64 = nodes
+            .iter()
+            .map(|&node| kernel(&snap, node))
+            .fold(0i64, i64::wrapping_add);
+        let parallel_ref: i64 = nodes
+            .par_iter()
+            .map(|&node| kernel(&snap, node))
+            .reduce(|| 0i64, i64::wrapping_add);
         assert_eq!(serial_ref, parallel_ref);
 
         group.throughput(Throughput::Elements(n as u64));
 
         group.bench_with_input(BenchmarkId::new("serial", n), &nodes, |b, nodes| {
             b.iter(|| {
-                let sum: i64 = nodes.iter().map(|&node| kernel(&snap, node)).sum();
+                let sum: i64 = nodes
+                    .iter()
+                    .map(|&node| kernel(&snap, node))
+                    .fold(0i64, i64::wrapping_add);
                 black_box(sum)
             });
         });
 
         group.bench_with_input(BenchmarkId::new("parallel", n), &nodes, |b, nodes| {
             b.iter(|| {
-                let sum: i64 = nodes.par_iter().map(|&node| kernel(&snap, node)).sum();
+                let sum: i64 = nodes
+                    .par_iter()
+                    .map(|&node| kernel(&snap, node))
+                    .reduce(|| 0i64, i64::wrapping_add);
                 black_box(sum)
             });
         });

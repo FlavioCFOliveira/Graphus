@@ -699,6 +699,126 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         }
     }
 
+    /// Recomputes the equi-depth selectivity histogram of the node-property index on
+    /// `(label_token, prop_key)`, in its own committed transaction — so an index that has just come
+    /// [`IndexState::Online`] is **born with real statistics** and the planner estimates ranges and
+    /// joins over it from the actual data distribution instead of the
+    /// [`DEFAULT_PREDICATE_SELECTIVITY`](crate::cardinality::DEFAULT_PREDICATE_SELECTIVITY) constant
+    /// (`rmp` task #572). No operator action (`db.resampleIndex`) is needed for a fresh index.
+    ///
+    /// # Why this is a second pass, not a fold into the build scan
+    ///
+    /// The index build's scan ([`index_one_node`](Self::index_one_node)) reads through
+    /// `RecordStore::node_labels` / `node_property_values` — **raw** store reads with no MVCC
+    /// visibility filtering. That is sound for the *tree*, which is a **candidate** source: a seek
+    /// re-checks every candidate against the reader's snapshot, so an extra invisible version costs a
+    /// rejected candidate, never a wrong answer. A histogram has no such re-check — it is consumed
+    /// **directly** as an estimate — so folding it into that scan would describe a graph that never
+    /// existed at any snapshot (counting superseded and uncommitted property versions). The histogram
+    /// must therefore be built over the visibility-filtered seam, which is a separate read.
+    ///
+    /// # Why the coordinator, and not the procedure
+    ///
+    /// This is the ONLY place a histogram recompute is executed. `db.resampleIndex` cannot do the work
+    /// itself: it runs inside the **caller's** transaction, and a catalog mutation staged in a
+    /// transaction the engine yields across is exactly the shape `RecordStore::rollback` cannot undo
+    /// per-transaction — it restores the catalog's schema half wholesale when any other transaction is
+    /// open, resurrecting the change it was undoing (the pre-existing `rmp` #734 gap, whose store.rs
+    /// note records that catalog DDL is safe today only because it "runs ONLY as a yield-free
+    /// auto-commit transaction"). So the procedure only *queues* a request, and this method — a
+    /// yield-free auto-commit transaction, honouring that precondition — executes it.
+    ///
+    /// To be precise about what that buys: it **avoids triggering** #734; it does not close it. The gap
+    /// is still there for any future DDL that mutates the catalog inside a yielding transaction.
+    ///
+    /// # Cost and failure policy
+    ///
+    /// One label scan per created index, on a DDL that already scans the store to populate the tree.
+    /// It is **best-effort**: a failure leaves the index fully created and usable with *no* histogram,
+    /// which is exactly the pre-`rmp`-#572 behaviour (the estimator falls back to its constant). A
+    /// missing statistic makes a plan less well informed, never wrong — so it must never fail a valid
+    /// DDL, and a faulted scan publishes nothing at all (`rmp` task #733 fail-closed, enforced inside
+    /// [`RecordStoreGraph::recompute_property_histogram`]).
+    ///
+    /// The scan runs at **snapshot isolation** and so registers no SIREAD markers: seeding a statistic
+    /// must never abort a concurrent user transaction (see the demotion note in the body).
+    ///
+    /// `D`/`S` carry `Send + Sync + 'static` for the same reason [`statement`](Self::statement) does —
+    /// the statement seam this drives is bounded that way; every real store instantiation already
+    /// meets these bounds.
+    fn seed_index_histogram(&mut self, label_token: u32, prop_key: u32)
+    where
+        D: Send + Sync + 'static,
+        S: Send + Sync + 'static,
+    {
+        // Resolve the token names the recompute takes. A token with no resolvable name is a
+        // defensively-skipped impossibility for a live, just-created index.
+        let Some((label, property)) = ({
+            let store = self.store.borrow();
+            match (
+                store.token_name(Namespace::Label, label_token),
+                store.token_name(Namespace::PropKey, prop_key),
+            ) {
+                (Some(l), Some(p)) => Some((l.to_owned(), p.to_owned())),
+                _ => None,
+            }
+        }) else {
+            return;
+        };
+
+        let txn = self.begin_serializable();
+        // SNAPSHOT ISOLATION, deliberately (`rmp` #545's rule applied to an internal read). The scan
+        // below would otherwise merge SIREAD markers for the whole label into the shared tracker,
+        // handing every in-flight writer of that label an in-conflict it would not otherwise have — so
+        // a `CREATE INDEX` could ABORT a concurrent user transaction that was going to commit, purely
+        // to compute an estimate. That is the trade `rmp` #545 already rejected for ordinary reads
+        // ("a read carries no serializability overhead and can never cause a writer to abort"), and it
+        // applies with more force here: this read is internal and its only output is a *discardable*
+        // statistic. Snapshot isolation reads the same consistent point-in-time graph — only the
+        // conflict tracking is dropped — so the histogram is unchanged while concurrent writers are
+        // left alone. The histogram write is not SSI-tracked either (it goes straight to the catalog,
+        // never through `record_write`), so this transaction genuinely is a reader to SSI.
+        self.demote_read_to_snapshot(txn);
+        let recomputed = {
+            let graph = match self.statement(txn) {
+                Ok(g) => g,
+                Err(_) => {
+                    // Could not open a statement seam; leave the index without statistics.
+                    let _ = self.rollback(txn);
+                    return;
+                }
+            };
+            // The INHERENT recompute, deliberately — not the `GraphAccess::request_index_resample`
+            // seam, which only *queues* a request for this very drain and would loop back here forever.
+            // This is the one place the work actually happens.
+            graph
+                .recompute_property_histogram(&label, &property)
+                .is_ok()
+        };
+        if recomputed {
+            {
+                if self.commit(txn).is_err() {
+                    // The histogram could not be made durable. The index itself is already committed
+                    // and `Online`; the planner simply falls back until a `db.resampleIndex`.
+                    //
+                    // ROLL BACK EXPLICITLY. `commit` propagates the store error with `?` *before* it
+                    // reaches `self.active.remove(&txn)`, so a swallowed failure would leave this
+                    // transaction in `active` forever — and `oldest_active_snapshot` is a `min` over
+                    // `active`, so it would permanently pin the MVCC GC watermark, the SSI prune
+                    // (`rmp` #552) and the WAL reclaim floor. It is also unreapable: the `rmp` #477 age
+                    // sweep only sees transactions opened via `begin_at`. `rollback` frees
+                    // `active`/`ssi`/`locks` through `abort`'s cleanup guard even if the undo fails.
+                    let _ = self.rollback(txn);
+                }
+            }
+        } else {
+            // The scan faulted, so nothing was published (`rmp` task #733 fail-closed). Discard the
+            // transaction and leave the index statistic-free rather than failing a DDL that otherwise
+            // succeeded, or publishing a histogram built over a partial scan.
+            let _ = self.rollback(txn);
+        }
+    }
+
     /// Promotes every durable-[`IndexState::Populating`] node-property index to
     /// [`IndexState::Online`] (catalog + in-memory set), in one committed transaction minted from
     /// `next_txn_id`. Returns the advanced `next_txn_id` (so [`new`](Self::new) keeps its monotonic
@@ -2418,7 +2538,11 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// # Errors
     /// Returns a storage error if interning either token, recording the catalog entry, or the
     /// committing transaction fails.
-    pub fn create_node_property_index(&mut self, label: &str, property: &str) -> Result<()> {
+    pub fn create_node_property_index(&mut self, label: &str, property: &str) -> Result<()>
+    where
+        D: Send + Sync + 'static,
+        S: Send + Sync + 'static,
+    {
         // Intern the label + prop-key tokens and record the durable catalog entry in one dedicated
         // transaction so the schema change (tokens + registration) survives a crash atomically, even
         // if no node yet uses them.
@@ -2466,6 +2590,9 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             IndexState::Online,
         );
         Self::rebuild_index(&self.store, &self.index);
+        // The index is Online and populated: seed its selectivity histogram so it is born with real
+        // statistics (`rmp` task #572). Best-effort — never fails an otherwise-successful DDL.
+        self.seed_index_histogram(label_token, prop_key);
         Ok(())
     }
 
@@ -6213,6 +6340,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         !self.pending_builds.is_empty()
             || !self.pending_fulltext_builds.is_empty()
             || !self.pending_spatial_builds.is_empty()
+            // A queued `db.resampleIndex` (`rmp` task #572) is pending index work too. Reporting it
+            // here is what makes the drain UNMISSABLE: every existing driver — the server's
+            // `drive_index_build` after each command, the DST `LocalEngine::drain_index_builds` spin —
+            // already loops on this predicate, so none of them needs to know resamples exist. Were it
+            // omitted, a resample would silently never run and the procedure would have lied.
+            || self.index.borrow().has_pending_resamples()
     }
 
     /// Whether the **label (token LOOKUP) index** may still be used (`rmp` task #733).
@@ -6411,7 +6544,11 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// A `budget` of `0` performs no indexing but still returns the pending state (callers should pass
     /// a positive chunk size). If the durable promotion commit fails, the build is left in place
     /// `Populating` (still correct via the scan fallback) to be retried on the next call/open.
-    pub fn advance_index_builds(&mut self, budget: usize) -> bool {
+    pub fn advance_index_builds(&mut self, budget: usize) -> bool
+    where
+        D: Send + Sync + 'static,
+        S: Send + Sync + 'static,
+    {
         // Repair a fail-closed index set FIRST (`rmp` task #733). This runs on the **command** path (the
         // engine drives an index build after every command), not just on the idle tick — under sustained
         // load an idle tick may never come, and a build cannot promote while the set is degraded, so
@@ -6430,12 +6567,52 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         } else {
             self.advance_spatial_build(budget);
         }
+        // Then one queued resample (`rmp` task #572) — after the builds, because a build makes an index
+        // usable while a resample only sharpens an estimate. ONE per call keeps this tick bounded: each
+        // is a full label scan, and `db.resampleOutdatedIndexes` can queue one per declared index.
+        //
+        // TERMINATION: the request is POPPED before the work and is never re-queued, even on failure, so
+        // the queue strictly shrinks and `while has_pending_index_builds() { advance… }` always ends.
+        // (`rmp` #733 learned this the hard way: work that stays queued after a failed attempt spins the
+        // drain loop at 100% CPU forever.)
+        self.drain_one_pending_resample();
         self.has_pending_index_builds()
+    }
+
+    /// Executes one queued `db.resampleIndex` request (`rmp` task #572), if any.
+    ///
+    /// The request is popped first and never re-queued (see the termination note in
+    /// [`advance_index_builds`](Self::advance_index_builds)); the recompute itself is the best-effort
+    /// [`seed_index_histogram`](Self::seed_index_histogram), which runs it in its own yield-free
+    /// auto-commit transaction.
+    fn drain_one_pending_resample(&mut self)
+    where
+        D: Send + Sync + 'static,
+        S: Send + Sync + 'static,
+    {
+        let Some((label, property)) = self.index.borrow_mut().pop_pending_resample() else {
+            return;
+        };
+        // Resolve to tokens; a request naming a label/property whose token vanished is dropped (it can
+        // carry no histogram anyway).
+        let tokens = {
+            let store = self.store.borrow();
+            store
+                .token_id(Namespace::Label, &label)
+                .zip(store.token_id(Namespace::PropKey, &property))
+        };
+        if let Some((label_token, prop_key)) = tokens {
+            self.seed_index_histogram(label_token, prop_key);
+        }
     }
 
     /// Advances the front **node-property** build by up to `budget` nodes (`rmp` task #91), promoting
     /// + dequeuing it when complete.
-    fn advance_node_property_build(&mut self, budget: usize) {
+    fn advance_node_property_build(&mut self, budget: usize)
+    where
+        D: Send + Sync + 'static,
+        S: Send + Sync + 'static,
+    {
         // (1) EPOCH CHECK (`rmp` task #733). Was the index set wiped by a `fail_closed` since this build
         // last ran? The build queues live on the coordinator, out of `IndexSet`'s reach, so a wipe empties
         // the half-built tree without telling the build. Resuming from the old cursor would index only the
@@ -6554,6 +6731,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             .borrow_mut()
             .set_node_property_state(label_token, prop_key, IndexState::Online);
         self.pending_builds.pop_front();
+        // The build is complete and the index is durably Online: seed its selectivity histogram
+        // (`rmp` task #572). This is the production `CREATE INDEX` completion point — the server drives
+        // `begin_online_node_composite_index_named`, whose arity-1 case is this non-blocking build — so
+        // this is what makes a declared index born with real statistics. Done *after* `pop_front` so no
+        // build borrow is outstanding across the statement seam, and only on the promotion tick (once
+        // per created index), never per chunk.
+        self.seed_index_histogram(label_token, prop_key);
     }
 
     /// Advances the front **full-text** build by up to `budget` nodes (`rmp` task #72), promoting +
