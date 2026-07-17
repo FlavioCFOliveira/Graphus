@@ -13,7 +13,9 @@ admin rights (see [security.md](security.md)).
 
 Building an index is **non-blocking**: `CREATE INDEX` returns promptly and the build runs in
 the background, so it never stalls concurrent queries. Over an already-populated store the
-index may briefly report `POPULATING` in `SHOW INDEXES` before it becomes `ONLINE`.
+index reports `POPULATING` in `SHOW INDEXES`, with its real progress in `populationPercent`,
+before it becomes `ONLINE` — see [The `POPULATING` window](#the-populating-window) for how long
+that takes, what it costs, and how to tell a normal build from a stalled one.
 
 ---
 
@@ -152,7 +154,7 @@ A bare listing returns the **12 default columns**, in Neo4j order:
 | `id`                | integer         | a stable-within-a-listing id (the two token LOOKUPs are `1` / `2`) |
 | `name`              | string          | the index name (explicit or auto-generated) |
 | `state`             | string          | `ONLINE` (ready) or `POPULATING` (build in progress) |
-| `populationPercent` | float           | `100.0` when online, else `0.0` |
+| `populationPercent` | float           | `100.0` when online; a build's real progress (`0.0`–`100.0`) while `POPULATING` — see [The `POPULATING` window](#the-populating-window) |
 | `type`              | string          | `RANGE`, `TEXT`, `FULLTEXT`, `POINT` or `LOOKUP` |
 | `entityType`        | string          | `NODE` or `RELATIONSHIP` |
 | `labelsOrTypes`     | list of string  | the covered label(s)/type, e.g. `["Person"]` (empty for `LOOKUP`) |
@@ -199,6 +201,72 @@ config lives here), `failureMessage` (empty), and `createStatement` (a round-tri
 SHOW INDEXES YIELD name, type, state WHERE type = 'RANGE' RETURN name, state
 SHOW INDEXES YIELD *
 ```
+
+### The `POPULATING` window
+
+`CREATE INDEX` returns as soon as the index is declared; the build then runs in the background,
+indexing a snapshot of the covered entities in bounded chunks so it never stalls concurrent queries.
+Until it finishes, the index reports `POPULATING` and is **withheld from the planner** — queries keep
+running, on a full scan, and keep returning exactly the right answers.
+
+`populationPercent` reports that build's real progress. It is the fraction of the build's snapshot
+indexed so far, on Neo4j's own rule (`completed / total * 100`, or `0.0` when there is nothing to
+index), so a build halfway through a million nodes reports ≈`50.0`:
+
+```cypher
+SHOW INDEXES YIELD name, state, populationPercent WHERE state = 'POPULATING'
+```
+
+A `POPULATING` index with `populationPercent` at `0.0` and **no** build running is a different
+condition: it is an index the engine has demoted because a storage fault made the derived indexes
+untrustworthy (a *fail-closed* wipe). Queries stay correct — every read path drops to the exact store
+scan — and the index is reported `POPULATING` deliberately, rather than claiming a readiness it does
+not have. The `graphus_index_fail_closed_total` counter below records each occurrence.
+
+**How long the window lasts.** Measured on a node-property `RANGE` build: **~70–74k nodes/s**, linear
+in the number of covered nodes.
+
+| Nodes covered | Build window (measured) |
+| ------------- | ----------------------- |
+| 10⁴           | 79–135 ms               |
+| 10⁵           | 1.29–1.40 s             |
+| 10⁶           | 13.8–14.7 s             |
+| 10⁷           | ~2.3 min (extrapolated) |
+
+**What the window costs today: nothing.** It would be reasonable to expect a latency cliff here — the
+index is withheld while `POPULATING`, so point lookups fall back to a label scan until it is promoted.
+Measurement says otherwise. Across promotion the latency is **flat**:
+
+| Index state             | Operator          | dbHits   | Latency   |
+| ----------------------- | ----------------- | -------- | --------- |
+| no index (control)      | `NodeLabelScanEq` | 100001   | 23.6 ms   |
+| `POPULATING`            | `NodeLabelScanEq` | 100001   | 23–32 ms  |
+| `ONLINE`                | `NodeIndexSeek`   | 100001   | 23–24 ms  |
+
+The promoted index really is planned (`PROFILE` shows `NodeIndexSeek`), but it reads the whole label
+anyway, so promotion currently buys nothing and the window costs nothing to wait through. The cliff is
+therefore **latent, not present**: it will appear only once the promoted index stops scanning the full
+label, and until then `populationPercent` is an operability signal rather than a latency warning.
+
+**Telling a window from a stall.** A build stopped for good by a storage fault is *parked*: its index
+stays `POPULATING` indefinitely — still correct, still unaccelerated — until the store reads cleanly
+again, at which point the build is resurrected automatically. `SHOW INDEXES` cannot distinguish that
+from a healthy build at the same percentage in a single snapshot, and it deliberately does not try:
+`POPULATING` is the conformant state for an interrupted build that will be repopulated, and a
+`FAILED` state would be a lie (it is terminal in Neo4j, and drivers' `awaitIndexes()` throws on it).
+The distinction is published in the metrics instead:
+
+| Metric                                   | Type    | Meaning |
+| ---------------------------------------- | ------- | ------- |
+| `graphus_index_builds_pending`            | gauge   | builds in flight now — rises and returns to zero over a normal window |
+| `graphus_index_build_entities_remaining`  | gauge   | entities still to index; falls as a healthy build progresses |
+| `graphus_index_builds_parked`             | gauge   | **builds stalled right now** — alert on this |
+| `graphus_index_builds_poisoned_total`     | counter | cumulative builds ever poisoned |
+| `graphus_index_fail_closed_total`         | counter | cumulative fail-closed index wipes |
+
+`pending > 0` with `entities_remaining` falling is a normal window. `parked > 0` is a stall that will
+not clear on its own until the underlying storage fault does — the counters cannot tell you this,
+because they only ever say that something happened once. Each parked build is also logged at `ERROR`.
 
 ---
 

@@ -2081,3 +2081,379 @@ fn compile_with(catalog: &IndexCatalog, src: &str) -> PhysicalPlan {
     let validated = analyze(&ast).expect("analyze");
     plan_physical(&lower(&validated), catalog)
 }
+
+// =================================================================================================
+// A POISONED build must be DISTINGUISHABLE from a healthy one (`rmp` task #573)
+// =================================================================================================
+
+/// **`rmp` task #573 — THE GATE.** A build a storage fault poisoned must be **distinguishable** from a
+/// healthy build in progress.
+///
+/// This is the operability hole the #573 investigation surfaced. A poisoned build (`rmp` #733) is parked
+/// un-promoted and its index stays `Populating` **forever** — never served, so answers remain correct via
+/// the scan, but never accelerated either. Before this task the only observable signals were the index's
+/// state (`POPULATING`, identical to a healthy build) and `populationPercent` (a constant `0.0`, also
+/// identical). An operator looking at a `Populating` index therefore could not tell a normal build window
+/// from indefinite degradation, and the cumulative `graphus_index_builds_poisoned_total` counter cannot
+/// answer it either: it says something happened once, never whether it is happening *now*.
+///
+/// So the distinction is made where Neo4j itself makes this class of distinction — out of band, in the
+/// coordinator's observable state (which drives the `graphus_index_builds_parked` gauge and the `ERROR`
+/// log), NOT by bending the Neo4j-facing `SHOW INDEXES` columns. `POPULATING` **is** Neo4j's own state
+/// for a build that was interrupted and will be repopulated, and `FAILED` is terminal — reporting it for
+/// a build Graphus auto-resurrects would break every driver's `awaitIndexes()`.
+///
+/// # Non-vacuity
+///
+/// The healthy build in the first half is the control: it must be reported as pending and NOT poisoned,
+/// with the exact same API returning the exact opposite verdict for the poisoned build in the second half.
+/// The sweep asserts at least one page actually poisons a build, or the test would prove nothing.
+#[test]
+fn a_poisoned_build_is_distinguishable_from_a_healthy_build_in_progress() {
+    let make_store = || {
+        let device = MemBlockDevice::new(0);
+        let wal = WalManager::create(MemLogSink::new()).expect("create wal");
+        let store: MemStore = RecordStore::create(device, wal, 64, 1).expect("create store");
+        let mut coord: MemCoord = TxnCoordinator::new(store);
+        run(
+            &mut coord,
+            "UNWIND range(1, 120) AS i \
+             CREATE (:Article {slug: 'slug-' + toString(i), title: 'title text ' + toString(i)})",
+        );
+        coord.into_store()
+    };
+
+    // ---- The CONTROL: a healthy build in progress, on an unfaulted device. ----
+    {
+        let mut store = make_store();
+        let (device, wal) = restart_on_faulty_device(&mut store);
+        let faulty: FaultyStore =
+            RecordStore::open(device, wal, FAULTED_POOL_PAGES).expect("open store");
+        let mut coord: FaultyCoord = TxnCoordinator::new(faulty);
+        coord
+            .begin_online_node_property_index("Article", "slug")
+            .expect("declare the build");
+        coord.advance_index_builds(5);
+
+        let progress = coord.index_build_progress();
+        assert_eq!(progress.len(), 1, "one build in flight: {progress:?}");
+        assert!(
+            !progress[0].poisoned,
+            "a HEALTHY build must NOT be reported poisoned — the control that makes the poisoned \
+             verdict below meaningful"
+        );
+        assert!(
+            progress[0].done > 0 && progress[0].done < progress[0].total,
+            "the control must be genuinely mid-build: {progress:?}"
+        );
+        let totals = coord.index_build_totals();
+        assert_eq!(totals.pending, 1, "a healthy build is PENDING");
+        assert_eq!(totals.parked, 0, "a healthy build is NOT parked");
+        assert!(
+            totals.entities_remaining > 0,
+            "a healthy build has work left"
+        );
+    }
+
+    // ---- The SUBJECT: a build poisoned by a permanently dead page. ----
+    let page_span = {
+        let mut store = make_store();
+        let (device, _wal) = restart_on_faulty_device(&mut store);
+        device.page_count()
+    };
+    let mut saw_a_poisoned_build = false;
+    for dead in 1..page_span {
+        let mut store = make_store();
+        let (device, wal) = restart_on_faulty_device(&mut store);
+        let fault = device.handle();
+        let faulty: FaultyStore =
+            RecordStore::open(device, wal, FAULTED_POOL_PAGES).expect("open store");
+        let mut coord: FaultyCoord = TxnCoordinator::new(faulty);
+
+        // Kill a page for good, then declare the build. A node-slot page fails the declare's own
+        // snapshot scan (no build enqueued — not the scenario); a property page lets the build enqueue
+        // and then fault while indexing, which is what poisons it.
+        fault.kill_page(dead as usize);
+        if coord
+            .begin_online_node_property_index("Article", "slug")
+            .is_err()
+        {
+            continue;
+        }
+        while coord.has_pending_index_builds() {
+            coord.advance_index_builds(usize::MAX);
+        }
+        if coord.poisoned_index_builds() == 0 {
+            continue; // this page did not poison the build
+        }
+        saw_a_poisoned_build = true;
+
+        // THE ASSERTION: the parked build is reported, and reported as POISONED.
+        let progress = coord.index_build_progress();
+        assert_eq!(
+            progress.len(),
+            1,
+            "the parked build must still be observable: {progress:?}"
+        );
+        assert!(
+            progress[0].poisoned,
+            "a PARKED build must be reported poisoned — otherwise it is indistinguishable from a \
+             healthy build at {}%, which is exactly the hole rmp #573 closes: {progress:?}",
+            progress[0].done * 100 / progress[0].total.max(1)
+        );
+
+        // And in the aggregate the two states are opposites: a poisoned build is NOT pending work.
+        let totals = coord.index_build_totals();
+        assert_eq!(
+            totals.pending, 0,
+            "a poisoned build is not in flight: nothing is advancing it"
+        );
+        assert_eq!(totals.parked, 1, "it is PARKED — the alertable gauge");
+        assert_eq!(
+            totals.entities_remaining, 0,
+            "a parked build's remainder is frozen, not work in progress"
+        );
+
+        // The index it covers is still POPULATING (correct, unaccelerated) — the very state that makes
+        // it indistinguishable without the flag above.
+        assert_eq!(
+            coord.list_node_property_indexes()[0].3,
+            IndexState::Populating,
+            "a poisoned build leaves its index Populating"
+        );
+
+        // And it self-heals: once the store reads cleanly the build is resurrected and stops being
+        // reported as poisoned, so the signal is not sticky.
+        fault.heal();
+        let mut iters = 0;
+        while coord.has_pending_index_builds() || coord.poisoned_index_builds() > 0 {
+            coord.retry_poisoned_index_builds();
+            while coord.has_pending_index_builds() {
+                coord.advance_index_builds(usize::MAX);
+            }
+            iters += 1;
+            assert!(iters < 100, "the healed build must finish");
+        }
+        assert_eq!(
+            coord.index_build_totals(),
+            Default::default(),
+            "a resurrected, completed build leaves the gauges at zero"
+        );
+        assert!(
+            coord.index_build_progress().is_empty(),
+            "a completed build is no longer reported"
+        );
+    }
+    assert!(
+        saw_a_poisoned_build,
+        "no page poisoned a build — the test would be vacuous"
+    );
+}
+
+// =================================================================================================
+// The DST drain loop must not overflow on a build parked at the degraded gate (`rmp` task #573)
+// =================================================================================================
+
+/// **A pre-existing engine-thread panic, reached through the REAL DST drain loop** (`rmp` task #573).
+///
+/// `advance_index_builds` computed its chunk end as `cursor + budget`. `LocalEngine::drain_index_builds`
+/// — the DST driver, this project's mandated E2E harness — spins
+/// `while has_pending_index_builds() { advance_index_builds(usize::MAX) }`
+/// (`LOCAL_INDEX_BUILD_BUDGET`), so any iteration starting from a **non-zero** cursor overflows: a panic
+/// in debug, and in release a wrap to `end < start` that panics on the slice range instead.
+///
+/// # Why a non-zero cursor is reachable
+///
+/// The chunk bounds are computed **before** the gap check and before the degraded gate, so once any call
+/// leaves a build pending with `cursor == total`, the *next* call overflows unconditionally — whether or
+/// not the store has healed by then. Only a wipe (`fail_closed`, which bumps the epoch) resets a cursor,
+/// and healing does not bump it.
+///
+/// The degraded gate is exactly such a call. `retry_degraded_index_rebuild` is **attempt-counted** backed
+/// off, so after one failed probe the repair at the top of `advance_index_builds` is *skipped* — not
+/// merely failed — for the next few calls **regardless of how cleanly the store now reads**. A build whose
+/// chunk then completes over healthy reads reaches the gate ("never publish into a WIPED index set"),
+/// declines to promote, and stays pending with its cursor at the end. The next drain iteration panics.
+///
+/// Every step below is in-tree: `LocalEngine::drain_index_builds` itself calls
+/// `retry_degraded_index_rebuild` after every dispatch, which is what arms the backoff.
+#[test]
+fn the_dst_drain_loop_does_not_overflow_on_a_build_parked_at_the_degraded_gate() {
+    let mut store = baseline();
+    let (device, wal) = restart_on_faulty_device(&mut store);
+    let fault = device.handle();
+    let faulty: FaultyStore =
+        RecordStore::open(device, wal, FAULTED_POOL_PAGES).expect("open store");
+
+    // Fault every read across the open-time `rebuild_index`: it fails closed, leaving the engine DEGRADED.
+    fault.arm();
+    let mut coord: FaultyCoord = TxnCoordinator::new(faulty);
+    assert!(
+        coord.indexes_degraded(),
+        "the open-time rebuild must have failed closed"
+    );
+
+    // ARM THE BACKOFF while the store is still faulting — exactly what `LocalEngine::drain_index_builds`
+    // does after every dispatch. This probe fails, so the retry is now SKIPPED for the next few calls.
+    let healed = coord.retry_degraded_index_rebuild();
+    assert!(!healed, "the probe must fail while the device is armed");
+
+    // Now heal. The store reads perfectly from here on — but the engine is still marked degraded, and the
+    // repair that would clear it is backed off.
+    fault.heal();
+    assert!(
+        coord.indexes_degraded(),
+        "the engine stays degraded: the repair is backed off, not merely failed — this is what makes \
+         the degraded gate reachable over CLEAN reads"
+    );
+
+    // Declare a build. Its snapshot scan reads cleanly and it records the CURRENT epoch, so the epoch
+    // check will not re-snapshot it (which would reset the cursor and hide the defect).
+    coord
+        .begin_online_node_property_index("Person", "age")
+        .expect("declare the build");
+
+    // `LocalEngine::drain_index_builds`, verbatim — every budget `usize::MAX`.
+    let mut iters = 0;
+    let _resurrected = coord.retry_poisoned_index_builds();
+    while coord.has_pending_index_builds() {
+        coord.advance_index_builds(usize::MAX); // iteration 2 panicked here before the fix
+        iters += 1;
+        assert!(
+            iters < 10_000,
+            "the drain must terminate (got {iters} spins)"
+        );
+    }
+    let _healed = coord.retry_degraded_index_rebuild();
+
+    // NON-VACUITY: the drain must have re-driven the build at least twice. The FIRST iteration leaves
+    // `cursor == total` at the degraded gate; the SECOND is the one that overflowed. A single iteration
+    // would mean the build promoted immediately and the defect was never in reach.
+    assert!(
+        iters > 1,
+        "the build must be re-driven at least twice — the second iteration is the one that overflowed; \
+         got {iters}, so the degraded gate was never reached and this test proves nothing"
+    );
+    // The build terminated the only two ways it legitimately may: poisoned (parked, index left
+    // Populating) or completed. What must NOT happen is a panic.
+    assert!(
+        !coord.has_pending_index_builds(),
+        "the drain left the build pending — it must poison or complete"
+    );
+}
+
+// =================================================================================================
+// A DROPPED index must stay dropped, even if a POISONED build for it is parked (`rmp` task #573/#733)
+// =================================================================================================
+
+/// **A CRITICAL pre-existing schema-durability defect** (found auditing `rmp` task #573).
+///
+/// Every `DROP INDEX` path cancels the index's **pending** build, but none of them purges the **poison
+/// graveyards** (`poisoned_builds` / `poisoned_fulltext_builds` / `poisoned_spatial_builds`). So a build
+/// that a storage fault parked outlives the drop of its own index. When the store later reads cleanly,
+/// `retry_poisoned_index_builds` resurrects it with a fresh snapshot and a reset cursor, the drain runs it
+/// to the end, and the promotion writes `set_node_property_index(label, prop, Online)` — **re-creating the
+/// dropped index in the durable catalog**, nameless.
+///
+/// That is a committed write, so it survives a restart: a reopen's `rebuild_index` re-registers the index
+/// `Online` from the catalog. `DROP INDEX` is therefore silently undone — a durability/consistency break
+/// (the schema does not reflect the last committed DDL), and the resurrected entry has no name, so
+/// `DROP INDEX <name>` cannot even remove it again.
+///
+/// It also defeats `rmp` #573's own operability contract: the `graphus_index_builds_parked` gauge is an
+/// alerting signal, and a graveyard entry for a dropped index keeps it above zero forever.
+#[test]
+fn dropping_an_index_with_a_poisoned_build_does_not_resurrect_it() {
+    let make_store = || {
+        let device = MemBlockDevice::new(0);
+        let wal = WalManager::create(MemLogSink::new()).expect("create wal");
+        let store: MemStore = RecordStore::create(device, wal, 64, 1).expect("create store");
+        let mut coord: MemCoord = TxnCoordinator::new(store);
+        run(
+            &mut coord,
+            "UNWIND range(1, 120) AS i \
+             CREATE (:Article {slug: 'slug-' + toString(i), title: 'title text ' + toString(i)})",
+        );
+        coord.into_store()
+    };
+
+    let page_span = {
+        let mut store = make_store();
+        let (device, _wal) = restart_on_faulty_device(&mut store);
+        device.page_count()
+    };
+
+    let mut exercised = false;
+    for dead in 1..page_span {
+        let mut store = make_store();
+        let (device, wal) = restart_on_faulty_device(&mut store);
+        let fault = device.handle();
+        let faulty: FaultyStore =
+            RecordStore::open(device, wal, FAULTED_POOL_PAGES).expect("open store");
+        let mut coord: FaultyCoord = TxnCoordinator::new(faulty);
+
+        // Poison a build by killing a property page for good.
+        fault.kill_page(dead as usize);
+        if coord
+            .begin_online_node_property_index_named(Some("ix_slug"), "Article", "slug", false)
+            .is_err()
+        {
+            continue; // a node-slot page: the declare's own snapshot scan failed, not the scenario.
+        }
+        while coord.has_pending_index_builds() {
+            coord.advance_index_builds(usize::MAX);
+        }
+        if coord.poisoned_index_builds() == 0 {
+            continue; // this page did not poison the build.
+        }
+        exercised = true;
+
+        // DROP the index while its build is parked.
+        assert!(
+            coord
+                .drop_node_property_index("Article", "slug")
+                .expect("drop succeeds"),
+            "the index must be dropped"
+        );
+        assert!(
+            coord.list_node_property_indexes().is_empty(),
+            "the drop must remove the index from the catalog"
+        );
+
+        // THE ASSERTION: the drop must take the parked build with it. A graveyard entry for a dropped
+        // index is a live resurrection, and it also pins the alerting `parked` gauge above zero forever.
+        assert_eq!(
+            coord.poisoned_index_builds(),
+            0,
+            "DROP INDEX left a POISONED build parked for the index it just dropped (dead page {dead}): \
+             resurrecting it re-creates the index in the durable catalog"
+        );
+
+        // And the whole self-heal cycle must not bring it back.
+        fault.heal();
+        let mut iters = 0;
+        while coord.has_pending_index_builds() || coord.poisoned_index_builds() > 0 {
+            coord.retry_poisoned_index_builds();
+            while coord.has_pending_index_builds() {
+                coord.advance_index_builds(usize::MAX);
+            }
+            iters += 1;
+            assert!(iters < 100, "the cycle must terminate");
+        }
+        assert!(
+            coord.list_node_property_indexes().is_empty(),
+            "a DROPPED index came BACK — a resurrected poisoned build durably re-created it (dead page \
+             {dead}): {:?}",
+            coord.list_node_property_indexes()
+        );
+        assert_eq!(
+            coord.index_build_totals(),
+            Default::default(),
+            "no build may remain for a dropped index"
+        );
+    }
+    assert!(
+        exercised,
+        "no page poisoned a build — the test would be vacuous"
+    );
+}

@@ -24,6 +24,7 @@ use graphus_cypher::parser::parse_tokens;
 use graphus_cypher::physical::{PhysicalOp, PhysicalPlan, plan_physical};
 use graphus_cypher::runtime::Row;
 use graphus_cypher::semantics::analyze;
+use graphus_index::fulltext::Analyzer;
 use graphus_io::MemBlockDevice;
 use graphus_storage::recovery::recover_device;
 use graphus_storage::{IndexState, RecordStore};
@@ -507,5 +508,151 @@ fn two_builds_queue_and_complete_in_order() {
             ),
         ],
         "both queued builds complete Online, each with its deterministic auto-name"
+    );
+}
+
+// =================================================================================================
+// Build progress (`rmp` task #573)
+// =================================================================================================
+
+/// `rmp` task #573: `index_build_progress` must report the build's REAL cursor against its snapshot —
+/// the numerator and denominator `SHOW INDEXES`' `populationPercent` is computed from.
+///
+/// Non-vacuity: the progress is sampled at three points that must differ from one another (fresh, part
+/// way, complete). An implementation that reported a constant — which is exactly what `populationPercent`
+/// did before this task — cannot satisfy all three.
+#[test]
+fn index_build_progress_reports_the_real_cursor() {
+    let mut coord = fresh_coord();
+    seed_people(&mut coord);
+
+    coord
+        .begin_online_node_property_index("Person", "age")
+        .expect("declare the build");
+
+    // Fresh: the cursor is at zero and the snapshot covers every live node.
+    let fresh = coord.index_build_progress();
+    assert_eq!(fresh.len(), 1, "one build in flight: {fresh:?}");
+    assert_eq!(fresh[0].done, 0, "a fresh build has indexed nothing");
+    let total = fresh[0].total;
+    assert!(
+        total > 4,
+        "the snapshot must span several nodes (got {total})"
+    );
+    assert!(!fresh[0].poisoned, "a healthy build is not poisoned");
+    assert_eq!(
+        fresh[0].name,
+        graphus_cypher::auto_index_name("Person", "age"),
+        "the build is reported under the name SHOW INDEXES lists it by"
+    );
+
+    // Part way: the cursor advanced by exactly the budget, and the totals agree.
+    coord.advance_index_builds(3);
+    let mid = coord.index_build_progress();
+    assert_eq!(mid.len(), 1, "still one build: {mid:?}");
+    assert_eq!(mid[0].done, 3, "the cursor advanced by the budget");
+    assert_eq!(
+        mid[0].total, total,
+        "the denominator is stable within a build"
+    );
+    let totals = coord.index_build_totals();
+    assert_eq!(totals.pending, 1);
+    assert_eq!(totals.parked, 0);
+    assert_eq!(
+        totals.entities_remaining,
+        total - 3,
+        "the aggregate remainder tracks the same cursor"
+    );
+
+    // Complete: the build is dequeued, so it reports no progress at all — and the index is Online, which
+    // is what makes `populationPercent` 100.0.
+    while coord.advance_index_builds(4) {}
+    assert!(
+        coord.index_build_progress().is_empty(),
+        "a completed build is dequeued"
+    );
+    assert_eq!(coord.index_build_totals(), Default::default());
+    assert_eq!(
+        coord.list_node_property_indexes()[0].3,
+        IndexState::Online,
+        "the drained build is promoted"
+    );
+}
+
+/// **A pre-existing overflow this task's first mid-build test surfaced** (`rmp` task #573).
+///
+/// `advance_index_builds(usize::MAX)` — the documented "finish this build" budget, and the one
+/// `LocalEngine::drain_index_builds` (`LOCAL_INDEX_BUILD_BUDGET`) passes — computed its chunk end as
+/// `cursor + budget`. From cursor `0` that is fine; from any **non-zero** cursor it overflows: a panic in
+/// debug, and in release a wrap to `end < start` that panics on the slice range immediately below. Either
+/// way a public API panics the engine thread on a documented argument.
+///
+/// # Scope
+///
+/// This is a **live** engine-thread panic in the DST driver, not a theoretical one:
+/// `index_fail_closed.rs::the_dst_drain_loop_does_not_overflow_on_a_build_parked_at_the_degraded_gate`
+/// reaches it through `LocalEngine::drain_index_builds` verbatim, using only in-tree calls. The
+/// production server is NOT exposed — it passes the finite `INDEX_BUILD_CHUNK` (512) — but the DST driver,
+/// `graphus-social-gen` and `graphus-iot-gen` all pass `usize::MAX`.
+///
+/// This test covers the **arithmetic** directly, for all three incremental build kinds — node-property
+/// (`rmp` #91), full-text (#72) and spatial (#98) — because all three had it. Each is advanced by a small
+/// budget FIRST (so the cursor is non-zero), then asked to finish with `usize::MAX`. The companion test
+/// above covers the reachable *path*.
+#[test]
+fn advancing_a_started_build_to_completion_does_not_overflow() {
+    // Node-property.
+    let mut coord = fresh_coord();
+    seed_people(&mut coord);
+    coord
+        .begin_online_node_property_index("Person", "age")
+        .expect("declare the build");
+    coord.advance_index_builds(2);
+    assert_eq!(
+        coord.index_build_progress()[0].done,
+        2,
+        "the cursor must be NON-ZERO for this regression to bite"
+    );
+    while coord.advance_index_builds(usize::MAX) {} // panicked here before the fix
+    assert_eq!(
+        coord.list_node_property_indexes()[0].3,
+        IndexState::Online,
+        "the build completes"
+    );
+
+    // Full-text.
+    let mut coord = fresh_coord();
+    seed_people(&mut coord);
+    coord
+        .create_fulltext_index(
+            "ft",
+            &["Person".to_owned()],
+            &["name".to_owned()],
+            Analyzer::from_name("standard").expect("known analyzer"),
+            false,
+        )
+        .expect("declare the full-text build");
+    coord.advance_index_builds(2);
+    while coord.advance_index_builds(usize::MAX) {}
+    assert!(
+        coord.index_build_progress().is_empty(),
+        "the full-text build completes"
+    );
+
+    // Spatial.
+    let mut coord = fresh_coord();
+    seed_people(&mut coord);
+    run_write(
+        &mut coord,
+        "CREATE (:City {loc: point({x: 1.0, y: 2.0})}), (:City {loc: point({x: 3.0, y: 4.0})})",
+    );
+    coord
+        .create_point_index("pt", "City", "loc", false)
+        .expect("declare the spatial build");
+    coord.advance_index_builds(1);
+    while coord.advance_index_builds(usize::MAX) {}
+    assert!(
+        coord.index_build_progress().is_empty(),
+        "the spatial build completes"
     );
 }

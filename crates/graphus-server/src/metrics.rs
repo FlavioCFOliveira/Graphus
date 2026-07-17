@@ -285,6 +285,31 @@ pub struct Metrics {
     /// reader is on the exact scan) but unaccelerated — until the store reads cleanly again and the build
     /// is resurrected. A rise means an index silently stopped being built. Engine-thread-only writer.
     index_builds_poisoned: AtomicU64,
+    /// Index builds currently **in flight**, summed across every database engine (a gauge, `rmp` task
+    /// #573). Published **additively** by each engine (never `store`d), so under multi-database operation
+    /// the gauge equals the SUM across engines rather than whichever engine wrote last — the `rmp` #418
+    /// lesson, the same discipline [`active_txns`](Self#structfield.active_txns) follows.
+    ///
+    /// This is the *window* half of the window-vs-stall discrimination: a healthy build makes this rise
+    /// and then fall back to zero within the build window, whose measured rate is ~70–74k nodes/s.
+    index_builds_pending: AtomicU64,
+    /// Index builds currently **parked poisoned**, summed across every database engine (a gauge, `rmp`
+    /// task #573). Published additively, exactly like
+    /// [`index_builds_pending`](Self#structfield.index_builds_pending).
+    ///
+    /// This is the *stall* half: [`index_builds_poisoned`](Self#structfield.index_builds_poisoned) is a
+    /// cumulative counter, so it ticks once and says nothing about *now* — a build poisoned an hour ago
+    /// and one poisoned and long since resurrected are indistinguishable in it. A gauge that stays above
+    /// zero is the signal that an index is stalled **at this moment** and will never finish on its own.
+    index_builds_parked: AtomicU64,
+    /// Entities still to index across every **in-flight** build, summed across every database engine (a
+    /// gauge, `rmp` task #573) — `Σ (snapshot.len() - cursor)`. Published additively.
+    ///
+    /// The actual *progress* signal: paired with
+    /// [`index_builds_pending`](Self#structfield.index_builds_pending) it separates a build that is moving
+    /// (this falls) from one that is wedged (this holds steady while pending stays 1), and it sizes the
+    /// remaining window rather than merely asserting one exists.
+    index_build_entities_remaining: AtomicU64,
     // NOTE (`rmp` #435): the reclamation-degraded *gating* gauge that used to live here was a single
     // shared `AtomicU64`, so one database's `K` consecutive maintenance failures flagged the WHOLE node
     // not-ready (and any other database's checkpoint success false-cleared a still-stuck flag). It is
@@ -423,6 +448,9 @@ impl Metrics {
             maintenance_failures: AtomicU64::new(0),
             index_fail_closed: AtomicU64::new(0),
             index_builds_poisoned: AtomicU64::new(0),
+            index_builds_pending: AtomicU64::new(0),
+            index_builds_parked: AtomicU64::new(0),
+            index_build_entities_remaining: AtomicU64::new(0),
             statement_panics: CachePad::new(0),
             egress_stall_aborts: CachePad::new(0),
             ssi_tracked: AtomicU64::new(0),
@@ -663,25 +691,7 @@ impl Metrics {
     /// `fetch_add`, a negative one a saturating `fetch_sub`; zero is a no-op. The per-engine "previous"
     /// bookkeeping lives in [`crate::engine`]'s `ActiveTxnGauge`.
     pub fn add_ssi_tracked_delta(&self, delta: i64) {
-        if delta > 0 {
-            self.ssi_tracked
-                .fetch_add(delta.unsigned_abs(), Ordering::Relaxed);
-        } else if delta < 0 {
-            let dec = delta.unsigned_abs();
-            let mut cur = self.ssi_tracked.load(Ordering::Relaxed);
-            loop {
-                let next = cur.saturating_sub(dec);
-                match self.ssi_tracked.compare_exchange_weak(
-                    cur,
-                    next,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => break,
-                    Err(observed) => cur = observed,
-                }
-            }
-        }
+        add_delta(&self.ssi_tracked, delta);
     }
 
     /// The current server-wide retained-SSI-conflict-record gauge (`rmp` #591, D-#1) — the direct
@@ -689,6 +699,38 @@ impl Metrics {
     #[must_use]
     pub fn ssi_tracked(&self) -> u64 {
         self.ssi_tracked.load(Ordering::Relaxed)
+    }
+
+    /// Publishes the per-engine deltas of the three **index-build** gauges additively (`rmp` task #573),
+    /// following the same discipline as [`add_ssi_tracked_delta`](Self::add_ssi_tracked_delta): each
+    /// engine reports the signed change since its own last publish, so each gauge equals the SUM across
+    /// every database engine rather than whichever engine wrote last (the `rmp` #418 lesson). The
+    /// per-engine "previously published" bookkeeping lives in [`crate::engine`]'s `IndexBuildGauge`.
+    pub fn add_index_build_deltas(&self, pending: i64, parked: i64, remaining: i64) {
+        add_delta(&self.index_builds_pending, pending);
+        add_delta(&self.index_builds_parked, parked);
+        add_delta(&self.index_build_entities_remaining, remaining);
+    }
+
+    /// The current server-wide **in-flight index build** gauge (`rmp` task #573) — observability / tests.
+    #[must_use]
+    pub fn index_builds_pending(&self) -> u64 {
+        self.index_builds_pending.load(Ordering::Relaxed)
+    }
+
+    /// The current server-wide **parked (poisoned) index build** gauge (`rmp` task #573): above zero means
+    /// an index build is stalled *right now* and will not finish without a resurrection — the signal the
+    /// cumulative `graphus_index_builds_poisoned_total` counter cannot give. Observability / tests.
+    #[must_use]
+    pub fn index_builds_parked(&self) -> u64 {
+        self.index_builds_parked.load(Ordering::Relaxed)
+    }
+
+    /// The current server-wide **entities remaining across in-flight index builds** gauge (`rmp` task
+    /// #573) — observability / tests.
+    #[must_use]
+    pub fn index_build_entities_remaining(&self) -> u64 {
+        self.index_build_entities_remaining.load(Ordering::Relaxed)
     }
 
     /// Records one statement-recovery **double-panic** caught at the engine's recovery boundary
@@ -1023,6 +1065,35 @@ impl Metrics {
              fail-closed — queries stay correct but run unaccelerated (rmp #733).",
             self.index_fail_closed.load(Ordering::Relaxed),
         );
+        // The window-vs-stall gauges (`rmp` task #573). The two counters above are cumulative event
+        // tallies: they say something happened, never whether it is happening NOW. An index left
+        // POPULATING is normal during a build window (~70-74k nodes/s) and pathological when a poisoned
+        // build parked it there for good, and no counter can tell those apart. These three can:
+        // pending>0 with remaining falling is a window; parked>0 is a stall.
+        gauge(
+            &mut out,
+            "graphus_index_builds_pending",
+            "Index builds currently in flight across all databases. Rises and returns to zero over a \
+             normal build window; see graphus_index_build_entities_remaining for its size (rmp #573).",
+            self.index_builds_pending.load(Ordering::Relaxed),
+        );
+        gauge(
+            &mut out,
+            "graphus_index_builds_parked",
+            "Index builds currently PARKED after a storage fault poisoned them (rmp #733). Above zero \
+             means an index is stalled POPULATING right now and will not finish until the store reads \
+             cleanly again — queries stay correct but unaccelerated. Alert on this, not on the \
+             cumulative graphus_index_builds_poisoned_total (rmp #573).",
+            self.index_builds_parked.load(Ordering::Relaxed),
+        );
+        gauge(
+            &mut out,
+            "graphus_index_build_entities_remaining",
+            "Entities still to index across all in-flight index builds. Falls to zero as a healthy \
+             build progresses; holding steady while graphus_index_builds_pending stays above zero means \
+             the build is wedged (rmp #573).",
+            self.index_build_entities_remaining.load(Ordering::Relaxed),
+        );
         // NOTE (`rmp` #435): the former `graphus_maintenance_degraded` node-wide gauge was removed —
         // reclamation degradation is now a **per-engine** gate surfaced through `/health/ready`'s
         // per-database aggregation (the shared gauge made one tenant's stall blanket-503 the node and
@@ -1223,6 +1294,30 @@ fn counter(out: &mut String, name: &str, help: &str, value: u64) {
     out.push_str(&format!(
         "# HELP {name} {help}\n# TYPE {name} counter\n{name} {value}\n"
     ));
+}
+
+/// Applies a signed `delta` to an **additively-published** gauge, saturating at zero on a (logic-error)
+/// over-decrement so the gauge can never wrap below zero.
+///
+/// Additive publishing is what lets `N` database engines share one server-wide gauge: each folds in only
+/// the change since its own last publish, so the gauge equals the SUM across engines rather than whichever
+/// engine stored last (`rmp` #418). A positive delta is a `fetch_add`; a negative one a compare-exchange
+/// loop that saturates rather than wraps; zero is a no-op. Shared by every additive gauge (`rmp` #591's
+/// `ssi_tracked`, `rmp` #573's index-build gauges) so the saturating-decrement discipline is written once.
+fn add_delta(target: &AtomicU64, delta: i64) {
+    if delta > 0 {
+        target.fetch_add(delta.unsigned_abs(), Ordering::Relaxed);
+    } else if delta < 0 {
+        let dec = delta.unsigned_abs();
+        let mut cur = target.load(Ordering::Relaxed);
+        loop {
+            let next = cur.saturating_sub(dec);
+            match target.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
+        }
+    }
 }
 
 /// Appends a Prometheus gauge (`# HELP`/`# TYPE gauge` + value).

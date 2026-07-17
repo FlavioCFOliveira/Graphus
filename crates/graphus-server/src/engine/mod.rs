@@ -44,7 +44,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use graphus_core::error::{GraphusError, Result};
-use graphus_cypher::TxnCoordinator;
+use graphus_cypher::{IndexBuildTotals, TxnCoordinator};
 use graphus_io::BlockDevice;
 use graphus_storage::RecordStore;
 use graphus_txn::IsolationLevel;
@@ -558,21 +558,32 @@ impl ActiveTxnGauge {
     fn publish(&mut self, active: usize, ssi_tracked: usize) {
         let active = active as u64;
         if active != self.last {
-            // `i128` headroom so the subtraction never overflows `i64` for any realistic count (a small
-            // `usize`); clamp into `i64` for the (impossible-in-practice) saturating case.
-            let delta = (i128::from(active) - i128::from(self.last))
-                .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
-            self.metrics.add_active_txns_delta_for(&self.db_name, delta);
+            self.metrics
+                .add_active_txns_delta_for(&self.db_name, signed_delta(active, self.last));
             self.last = active;
         }
         let ssi_tracked = ssi_tracked as u64;
         if ssi_tracked != self.last_ssi {
-            let delta = (i128::from(ssi_tracked) - i128::from(self.last_ssi))
-                .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
-            self.metrics.add_ssi_tracked_delta(delta);
+            self.metrics
+                .add_ssi_tracked_delta(signed_delta(ssi_tracked, self.last_ssi));
             self.last_ssi = ssi_tracked;
         }
     }
+}
+
+/// The signed change from `before` to `now`, for an **additively-published** gauge (`rmp` #418).
+///
+/// `i128` headroom so the subtraction cannot overflow `i64` for any realistic count (both operands are
+/// small `u64`s derived from a `usize`); the clamp handles the impossible-in-practice saturating case, and
+/// makes the `as i64` provably lossless. Shared by [`ActiveTxnGauge`] and [`IndexBuildGauge`] so the
+/// delta arithmetic is written once — the caller-side twin of [`crate::metrics`]'s `add_delta`.
+///
+/// NOTE: were the clamp ever to saturate, the caller's `last = now` would record the full value while only
+/// `i64::MAX` was folded in, permanently skewing the gauge. That needs `> 9.2e18` concurrent items, so it
+/// is unreachable — but it is the classic saturation-desync, and it is left recorded here rather than
+/// silently assumed away.
+fn signed_delta(now: u64, before: u64) -> i64 {
+    (i128::from(now) - i128::from(before)).clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
 impl Drop for ActiveTxnGauge {
@@ -592,6 +603,64 @@ impl Drop for ActiveTxnGauge {
                 .add_ssi_tracked_delta(-(i64::try_from(self.last_ssi).unwrap_or(i64::MAX)));
             self.last_ssi = 0;
         }
+    }
+}
+
+/// This engine's contribution to the server-wide **index-build** gauges (`rmp` task #573) — the sibling
+/// of [`ActiveTxnGauge`], following the same additive discipline for the same reason (`rmp` #418): with
+/// `N` database engines sharing one gauge, a last-writer-wins `store` would report whichever engine wrote
+/// last instead of the fleet total, so each engine folds in only the delta since its own last publish.
+struct IndexBuildGauge {
+    metrics: Arc<Metrics>,
+    /// The counts this engine last contributed to each shared gauge (pending, parked, remaining).
+    last: IndexBuildTotals,
+}
+
+impl IndexBuildGauge {
+    fn new(metrics: Arc<Metrics>) -> Self {
+        Self {
+            metrics,
+            last: IndexBuildTotals::default(),
+        }
+    }
+
+    /// Publishes `totals`, folding only the change since the last publish into the shared gauges. A no-op
+    /// when nothing changed — which is the overwhelmingly common case (no build running), so this costs an
+    /// integer compare per engine-loop iteration.
+    ///
+    /// Both sides are **destructured** deliberately: a field added to [`IndexBuildTotals`] must not be
+    /// able to slip through un-published (and, via [`Drop`], un-retracted) while the derived `PartialEq`
+    /// above quietly keeps comparing it. Destructuring turns that omission into a compile error.
+    fn publish(&mut self, totals: IndexBuildTotals) {
+        if totals == self.last {
+            return;
+        }
+        let IndexBuildTotals {
+            pending,
+            parked,
+            entities_remaining,
+        } = totals;
+        let IndexBuildTotals {
+            pending: was_pending,
+            parked: was_parked,
+            entities_remaining: was_remaining,
+        } = self.last;
+        self.metrics.add_index_build_deltas(
+            signed_delta(pending as u64, was_pending as u64),
+            signed_delta(parked as u64, was_parked as u64),
+            signed_delta(entities_remaining as u64, was_remaining as u64),
+        );
+        self.last = totals;
+    }
+}
+
+impl Drop for IndexBuildGauge {
+    fn drop(&mut self) {
+        // Retract this engine's whole remaining contribution, so a stopped or torn-down engine never
+        // leaves a phantom build in the server-wide gauges (`rmp` #418). This matters most for `parked`:
+        // it is an alerting signal, and a leaked one would page an operator about an index build on a
+        // database that no longer exists.
+        self.publish(IndexBuildTotals::default());
     }
 }
 
@@ -744,6 +813,9 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // database's per-database gauge (`rmp` #463). Dropped (retracting its contribution from both) when the
     // loop exits. `db_name` labels the per-database series for every metric family below.
     let mut active_txns = ActiveTxnGauge::new(Arc::clone(&metrics), Arc::clone(&db_name));
+    // This engine's contribution to the server-wide index-build gauges (`rmp` task #573), republished
+    // every loop iteration so a build's start, progress, completion and parking are all visible.
+    let mut index_builds = IndexBuildGauge::new(Arc::clone(&metrics));
     let mut open: HashMap<u64, OpenTx> = HashMap::new();
     let mut next_ticket: u64 = 0;
     // The engine's compiled-plan cache (`rmp` task #322): reuses a compiled `PhysicalPlan` for an
@@ -957,6 +1029,19 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             .as_ref()
             .expect("INVARIANT: coordinator is Some until Shutdown breaks the loop")
             .indexes_degraded();
+        // Publish the index-build gauges (`rmp` task #573). Here, because this point is reached on EVERY
+        // iteration — after each command (so a `CREATE INDEX`'s new build shows up at once) and after each
+        // build tick (so progress falls and completion returns the gauges to zero) — and because it is the
+        // last thing evaluated before the loop may block on `recv`, so the published values are the ones
+        // that stay true while the engine is idle. `index_build_totals` allocates nothing and reads no
+        // store: with no build running it is three `len()`s on empty collections, so it adds no per-tick
+        // cost to the build loop.
+        index_builds.publish(
+            coordinator
+                .as_ref()
+                .expect("INVARIANT: coordinator is Some until Shutdown breaks the loop")
+                .index_build_totals(),
+        );
         let timed = building || indexes_degraded || readers_inflight > 0 || !parked.is_empty();
 
         let cmd = if timed {
@@ -2737,6 +2822,9 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
                 node_lookup_usable: coordinator.label_lookup_usable(),
                 vector: coordinator.list_vector_index_listings(),
                 constraints: coordinator.list_constraints(),
+                // The in-flight / parked builds, so a `Populating` index reports its REAL
+                // `populationPercent` rather than a constant 0.0 (`rmp` task #573).
+                builds: coordinator.index_build_progress(),
             };
             let rows = index_show::build_rows(*filter, sources);
             Ok(IndexDdlReply {
@@ -4238,6 +4326,130 @@ mod max_transaction_age_tests {
             open.len(),
             1,
             "the open map is untouched when the cap is disabled"
+        );
+    }
+}
+
+#[cfg(test)]
+mod index_build_gauge_tests {
+    //! The server-wide **index-build gauges** (`rmp` task #573).
+    //!
+    //! The two pre-existing signals (`graphus_index_builds_poisoned_total` /
+    //! `graphus_index_fail_closed_total`) are cumulative event counters: they record that something
+    //! happened, never whether it is happening *now*. These gauges are what separate a normal build
+    //! window from a permanent stall, so their arithmetic must hold under the two conditions the `rmp`
+    //! #418 lesson taught: multiple engines share one gauge (hence additive publishing), and an engine
+    //! can be torn down at any time (hence the `Drop` retraction — a leaked `parked` would page an
+    //! operator about a database that no longer exists).
+
+    use super::*;
+
+    fn totals(pending: usize, parked: usize, remaining: usize) -> IndexBuildTotals {
+        IndexBuildTotals {
+            pending,
+            parked,
+            entities_remaining: remaining,
+        }
+    }
+
+    /// A single engine's publishes move each gauge to the published value, in both directions.
+    #[test]
+    fn publishing_tracks_the_totals_in_both_directions() {
+        let metrics = Arc::new(Metrics::new());
+        let mut gauge = IndexBuildGauge::new(Arc::clone(&metrics));
+        assert_eq!(metrics.index_builds_pending(), 0, "starts empty");
+
+        // A build starts.
+        gauge.publish(totals(1, 0, 500));
+        assert_eq!(metrics.index_builds_pending(), 1);
+        assert_eq!(metrics.index_builds_parked(), 0);
+        assert_eq!(metrics.index_build_entities_remaining(), 500);
+
+        // It progresses: the remainder FALLS (a rising gauge would be a sign inversion).
+        gauge.publish(totals(1, 0, 200));
+        assert_eq!(metrics.index_build_entities_remaining(), 200);
+
+        // It gets poisoned: pending drops, parked rises — the window/stall transition.
+        gauge.publish(totals(0, 1, 0));
+        assert_eq!(metrics.index_builds_pending(), 0);
+        assert_eq!(metrics.index_builds_parked(), 1);
+        assert_eq!(metrics.index_build_entities_remaining(), 0);
+
+        // It is resurrected and completes.
+        gauge.publish(totals(0, 0, 0));
+        assert_eq!(metrics.index_builds_parked(), 0);
+    }
+
+    /// **The `rmp` #418 invariant.** With several engines sharing the gauges, each publishing only its own
+    /// delta, every gauge equals the SUM across engines — never whichever engine wrote last.
+    #[test]
+    fn gauges_sum_across_engines_rather_than_last_writer_wins() {
+        let metrics = Arc::new(Metrics::new());
+        let mut a = IndexBuildGauge::new(Arc::clone(&metrics));
+        let mut b = IndexBuildGauge::new(Arc::clone(&metrics));
+
+        a.publish(totals(1, 0, 100));
+        b.publish(totals(2, 1, 300));
+        assert_eq!(metrics.index_builds_pending(), 3, "1 + 2, not 2");
+        assert_eq!(metrics.index_builds_parked(), 1);
+        assert_eq!(metrics.index_build_entities_remaining(), 400, "100 + 300");
+
+        // One engine going idle must not zero the other's contribution.
+        a.publish(totals(0, 0, 0));
+        assert_eq!(
+            metrics.index_builds_pending(),
+            2,
+            "engine B's builds survive engine A going idle"
+        );
+        assert_eq!(metrics.index_build_entities_remaining(), 300);
+    }
+
+    /// A torn-down engine retracts its whole contribution, so no phantom build is left behind. This
+    /// matters most for `parked`, which is an alerting signal.
+    #[test]
+    fn dropping_an_engines_gauge_retracts_its_contribution() {
+        let metrics = Arc::new(Metrics::new());
+        let mut survivor = IndexBuildGauge::new(Arc::clone(&metrics));
+        survivor.publish(totals(1, 0, 50));
+        {
+            let mut dying = IndexBuildGauge::new(Arc::clone(&metrics));
+            dying.publish(totals(3, 2, 900));
+            assert_eq!(metrics.index_builds_parked(), 2);
+        } // `dying` is dropped here.
+        assert_eq!(
+            metrics.index_builds_parked(),
+            0,
+            "a torn-down engine must not leave a phantom PARKED build alerting forever"
+        );
+        assert_eq!(
+            metrics.index_builds_pending(),
+            1,
+            "only the dead engine's contribution is retracted"
+        );
+        assert_eq!(metrics.index_build_entities_remaining(), 50);
+    }
+
+    /// The gauges render as Prometheus **gauges** (not counters) with their metric names.
+    #[test]
+    fn gauges_render_in_the_prometheus_exposition() {
+        let metrics = Arc::new(Metrics::new());
+        let mut gauge = IndexBuildGauge::new(Arc::clone(&metrics));
+        gauge.publish(totals(1, 2, 42));
+        let out = metrics.render_prometheus();
+        for name in [
+            "graphus_index_builds_pending",
+            "graphus_index_builds_parked",
+            "graphus_index_build_entities_remaining",
+        ] {
+            assert!(
+                out.contains(&format!("# TYPE {name} gauge")),
+                "{name} must be exposed as a gauge:\n{out}"
+            );
+        }
+        assert!(out.contains("\ngraphus_index_builds_parked 2\n"), "{out}");
+        assert!(
+            out.contains("\ngraphus_index_build_entities_remaining 42\n"),
+            "{out}"
         );
     }
 }

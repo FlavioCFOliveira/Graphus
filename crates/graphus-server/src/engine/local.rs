@@ -59,6 +59,12 @@ const LOCAL_RESULT_BUFFER: usize = super::stream::UNBOUNDED;
 
 /// How many index entries an inline index build advances per step while draining a non-blocking
 /// build to completion. Large enough that any realistic simulation index finishes in one step.
+///
+/// NOTE for tests (`rmp` task #573): because this is unbounded, [`LocalEngine::dispatch`]'s post-command
+/// drain finishes the **entire** build — so *any* command completes it, whatever the store's size. A test
+/// that wants to observe a build mid-flight must therefore not observe it through a dispatched command:
+/// the observation would consume what it measures, and seeding more nodes cannot buy a longer window.
+/// Use the coordinator directly (see the test module's `show_index_row_no_drain`).
 const LOCAL_INDEX_BUILD_BUDGET: usize = usize::MAX;
 
 /// An inline, single-threaded driver of the real Graphus engine for Deterministic Simulation Testing.
@@ -517,6 +523,243 @@ mod tests {
             out.push(row.iter().map(|c| format!("{c:?}")).collect());
         }
         out
+    }
+
+    /// Seeds `n` `(:Person {a: i})` nodes through the engine's normal auto-commit write path.
+    fn seed_people(eng: &mut LocalEngine<MemBlockDevice, MemLogSink>, n: usize) {
+        let tx = eng.begin_auto_commit(AccessMode::Write).expect("begin");
+        let mut reply = eng
+            .run(
+                tx,
+                format!("UNWIND range(1, {n}) AS i CREATE (:Person {{a: i}})"),
+                vec![],
+                true,
+                None,
+            )
+            .expect("seed runs");
+        let _ = drain(&mut reply);
+    }
+
+    /// A `SHOW INDEXES` command covering every index kind.
+    fn show_indexes_cmd() -> IndexCommand {
+        IndexCommand::ShowIndexes {
+            filter: crate::engine::IndexTypeFilter::All,
+            tail: None,
+        }
+    }
+
+    /// Reads `(state, populationPercent)` for the index named `name` out of a rendered `SHOW INDEXES`
+    /// reply, by column name (never by position).
+    fn read_index_row(reply: &IndexDdlReply, name: &str) -> (String, f64) {
+        use graphus_core::Value;
+
+        let col = |c: &str| {
+            reply
+                .fields
+                .iter()
+                .position(|f| f == c)
+                .unwrap_or_else(|| panic!("a {c} column"))
+        };
+        let (name_c, state_c, pct_c) = (col("name"), col("state"), col("populationPercent"));
+        let row = reply
+            .rows
+            .iter()
+            .find(|r| r[name_c] == Value::String(name.to_owned()))
+            .unwrap_or_else(|| panic!("index {name} must be listed"));
+        let state = match &row[state_c] {
+            Value::String(s) => s.clone(),
+            other => panic!("state must be a string: {other:?}"),
+        };
+        let pct = match row[pct_c] {
+            Value::Float(f) => f,
+            ref other => panic!("populationPercent must be a Float: {other:?}"),
+        };
+        (state, pct)
+    }
+
+    /// Reads a `SHOW INDEXES` row through the engine's **full dispatch** — which drains any pending
+    /// build *after* the command it dispatched, so the reply reflects the pre-drain state but the build
+    /// is complete on return. Fine for a single observation; see [`show_index_row_no_drain`] for
+    /// repeated ones.
+    fn show_index_row(
+        eng: &mut LocalEngine<MemBlockDevice, MemLogSink>,
+        name: &str,
+    ) -> (String, f64) {
+        let reply = eng.index_ddl(show_indexes_cmd()).expect("show indexes");
+        read_index_row(&reply, name)
+    }
+
+    /// Reads a `SHOW INDEXES` row **without advancing the build** — the observation must not perturb what
+    /// it observes.
+    ///
+    /// `LocalEngine::dispatch` drains pending builds after every command with `LOCAL_INDEX_BUILD_BUDGET`
+    /// (`usize::MAX`), so *any* command completes the whole build in one step. A test that samples a build
+    /// repeatedly through [`show_index_row`] therefore gets exactly ONE sample, whatever the store's size
+    /// — the instrument consumes the thing being measured. Seeding more nodes cannot help: an unbounded
+    /// budget always finishes the build on the first drain.
+    ///
+    /// So this calls the engine's index-DDL handler directly, bypassing only the `dispatch` wrapper (and
+    /// hence its drain). It is still the REAL render: `handle_index_ddl` is where the `SHOW INDEXES` arm
+    /// builds its `IndexSources` — including `builds: coordinator.index_build_progress()` — and calls
+    /// `index_show::build_rows`. Nothing about the rendering is reimplemented or stubbed here.
+    fn show_index_row_no_drain(
+        coord: &mut TxnCoordinator<MemBlockDevice, MemLogSink>,
+        name: &str,
+    ) -> (String, f64) {
+        let reply =
+            crate::engine::handle_index_ddl(coord, &show_indexes_cmd()).expect("show indexes");
+        read_index_row(&reply, name)
+    }
+
+    /// **`rmp` task #573 — THE GATE.** A `Populating` index must report its build's REAL progress in
+    /// `SHOW INDEXES`' `populationPercent`, not the constant `0.0` it reported before.
+    ///
+    /// This drives the whole chain the server actually uses: the build's `cursor`/`snapshot` →
+    /// `TxnCoordinator::index_build_progress` → `IndexSources::builds` → `index_show::build_rows` →
+    /// the rendered `populationPercent` column, through the real `ShowIndexes` engine command.
+    ///
+    /// The build is advanced by a **bounded budget** rather than drained, which is what makes a mid-build
+    /// observation deterministic: `LocalEngine::dispatch` drains only *after* the command it dispatched,
+    /// so the `SHOW INDEXES` below renders the partial state, and the drain that follows completes it.
+    ///
+    /// # The non-vacuity controls
+    ///
+    /// A test that only asserted "some percentage" would pass against the old constant. So:
+    /// * the mid-build value must be **strictly** between 0 and 100 — the old constant `0.0` fails this,
+    ///   and so does any implementation that reports a state-derived value;
+    /// * an `Online` index must still report **exactly** `100.0` (`ONLINE ⇒ 100.0`, as in Neo4j);
+    /// * the percentage must match the cursor **exactly**, so the number is the real one and not a
+    ///   plausible-looking fabrication.
+    #[test]
+    fn show_indexes_reports_real_population_percent_mid_build() {
+        const N: usize = 200;
+        // A budget that leaves the build genuinely unfinished: small enough that several advances still
+        // do not reach N, so the observed cursor is strictly inside (0, N).
+        const BUDGET: usize = 20;
+
+        let mut eng = engine(sim_clock(0));
+        seed_people(&mut eng, N);
+
+        // Enqueue the build directly on the coordinator (the DDL command would be drained to completion
+        // by `dispatch`), then advance it by a bounded budget to land mid-build.
+        let coord = eng.coordinator.as_mut().expect("coordinator");
+        coord
+            .begin_online_node_property_index_named(Some("ix_a"), "Person", "a", false)
+            .expect("declare the build");
+        coord.advance_index_builds(BUDGET);
+
+        // The coordinator's own view of the build: strictly partial, and not poisoned.
+        let progress = coord.index_build_progress();
+        assert_eq!(
+            progress.len(),
+            1,
+            "exactly one build in flight: {progress:?}"
+        );
+        let (done, total) = (progress[0].done, progress[0].total);
+        assert_eq!(progress[0].name, "ix_a");
+        assert!(!progress[0].poisoned, "a healthy build is not poisoned");
+        assert_eq!(total, N, "the snapshot covers every seeded node");
+        assert!(
+            done > 0 && done < total,
+            "the build must be STRICTLY mid-flight for this test to mean anything, got {done}/{total}"
+        );
+
+        // THE ASSERTION: the rendered column carries the real progress.
+        let (state, pct) = show_index_row(&mut eng, "ix_a");
+        assert_eq!(state, "POPULATING", "the build has not finished");
+        assert!(
+            pct > 0.0 && pct < 100.0,
+            "populationPercent must report REAL progress strictly inside (0, 100) mid-build — the \
+             pre-#573 constant reported 0.0; got {pct}"
+        );
+        // An INDEPENDENT oracle, not a re-derivation: `BUDGET` of `N` is 20 of 200, which is exactly
+        // 10.0 — a literal this test can state without reusing the implementation's own arithmetic.
+        // (Re-deriving `done * 100 / total` here would compare the implementation against a copy of
+        // itself and could not fail.)
+        assert_eq!(done, 20, "the cursor advanced by exactly BUDGET");
+        assert_eq!(total, 200, "the snapshot is exactly N");
+        assert!(
+            (pct - 10.0).abs() < 1e-9,
+            "20 of 200 nodes indexed must render as exactly 10.0, got {pct}"
+        );
+
+        // The control: once built, exactly 100.0 / ONLINE. `ONLINE ⇒ 100.0` is Neo4j's invariant, and it
+        // is what proves the mid-build value above is a real measurement rather than a broken constant.
+        eng.coordinator
+            .as_mut()
+            .expect("coordinator")
+            .advance_index_builds(usize::MAX);
+        let (state, pct) = show_index_row(&mut eng, "ix_a");
+        assert_eq!(state, "ONLINE", "the drained build is promoted");
+        assert!(
+            (pct - 100.0).abs() < f64::EPSILON,
+            "an Online index reports exactly 100.0, got {pct}"
+        );
+    }
+
+    /// `rmp` task #573: the **rendered** `populationPercent` must never exceed 100 and must not go
+    /// backwards **within one build** — the Neo4j-facing contract of the column.
+    ///
+    /// Sampled off a real `SHOW INDEXES` render at every step of a build advanced **one entity at a
+    /// time** — the finest granularity the build loop has — so any transient overshoot or regression
+    /// inside a single generation is caught.
+    ///
+    /// Two properties of the harness are load-bearing:
+    ///
+    /// * It reads the **rendered column** rather than re-computing `done * 100 / total` from the cursor.
+    ///   Re-deriving the formula would compare the implementation against a copy of itself and could not
+    ///   fail for any change to `population_percent`.
+    /// * It observes via [`show_index_row_no_drain`], because the ordinary `LocalEngine` dispatch drains
+    ///   the whole build after every command (`LOCAL_INDEX_BUILD_BUDGET` is `usize::MAX`) — the act of
+    ///   observing would otherwise consume what is being observed, and the loop below would get exactly
+    ///   one sample and prove nothing.
+    #[test]
+    fn population_percent_is_monotonic_and_bounded_within_one_build() {
+        const N: usize = 40;
+
+        let mut eng = engine(sim_clock(0));
+        seed_people(&mut eng, N);
+        let coord = eng.coordinator.as_mut().expect("coordinator");
+        coord
+            .begin_online_node_property_index_named(Some("ix_a"), "Person", "a", false)
+            .expect("declare the build");
+
+        let mut last = 0.0_f64;
+        let mut samples = 0;
+        let mut saw_populating = false;
+        while coord.has_pending_index_builds() {
+            let (state, pct) = show_index_row_no_drain(coord, "ix_a");
+            assert!(
+                (0.0..=100.0).contains(&pct),
+                "populationPercent left [0, 100]: {pct}"
+            );
+            assert!(
+                pct >= last,
+                "populationPercent went BACKWARDS within one build: {last} -> {pct}"
+            );
+            if state == "POPULATING" {
+                saw_populating = true;
+            }
+            last = pct;
+            samples += 1;
+            // One entity per step — the finest granularity the build loop offers.
+            coord.advance_index_builds(1);
+        }
+        // NON-VACUITY. The loop must have sampled a RISING percentage many times over. With one sample
+        // "monotonic" is a statement about nothing, so this guard is what gives the assertions above their
+        // teeth: it is the reason the observation had to stop draining the build.
+        assert!(
+            samples > 2,
+            "the build must have been sampled repeatedly (got {samples} samples)"
+        );
+        assert!(
+            saw_populating,
+            "the build must have been observed while POPULATING"
+        );
+        assert!(
+            last > 0.0,
+            "the sampled percentage must have risen above 0 (got {last})"
+        );
     }
 
     #[test]

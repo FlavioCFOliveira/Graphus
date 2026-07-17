@@ -314,6 +314,56 @@ struct PendingSpatialBuild {
     stall: u8,
 }
 
+/// The observable progress of one index build — in flight or **parked poisoned** (`rmp` task #573).
+///
+/// Every non-blocking build ([`PendingIndexBuild`], [`PendingFulltextBuild`], [`PendingSpatialBuild`])
+/// already carries the two numbers that describe its progress exactly: a `cursor` into a `snapshot`
+/// captured at build start. This is that pair, named and lifted to the public surface so the server can
+/// render it (`SHOW INDEXES`' `populationPercent`) and meter it, without the listing having to know how a
+/// build is represented.
+///
+/// # Why `poisoned` belongs here
+///
+/// A poisoned build (`rmp` task #733) is one a storage fault stopped for good: it is parked, un-promoted,
+/// and its index stays `Populating` **forever** — never served, so answers remain correct via the scan,
+/// but never accelerated either — until the store reads cleanly again and it is resurrected. Without this
+/// flag a permanently-parked build is indistinguishable from a healthy build at 1%, which is precisely
+/// the operability hole `rmp` #573 closes: an operator staring at a `Populating` index cannot tell a
+/// normal ~14 s window from indefinite degradation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexBuildProgress {
+    /// The name of the index this build populates — the same name `SHOW INDEXES` lists it under, so a
+    /// listing row can be matched to its build.
+    pub name: String,
+    /// Entities indexed so far (the build cursor). Never exceeds [`total`](Self::total).
+    pub done: usize,
+    /// The length of the snapshot captured at build start — the denominator. Zero when the build had
+    /// nothing to index (an empty store), in which case it promotes on its next tick.
+    pub total: usize,
+    /// Whether this build is **parked poisoned** (`rmp` task #733) rather than in flight: a storage fault
+    /// stopped it, [`done`](Self::done) is frozen, and it makes no further progress until
+    /// [`retry_poisoned_index_builds`](TxnCoordinator::retry_poisoned_index_builds) resurrects it.
+    pub poisoned: bool,
+}
+
+/// The aggregate index-build numbers, with **no** per-build detail (`rmp` task #573) — the cheap
+/// counterpart of [`IndexBuildProgress`], for the server's per-loop-iteration metrics publish.
+///
+/// [`TxnCoordinator::index_build_progress`] resolves a name per build, which allocates; the engine loop
+/// evaluates its gauges on *every* iteration, so it must not pay that. This carries only what a gauge
+/// needs, and computing it allocates nothing and touches no store (see
+/// [`TxnCoordinator::index_build_totals`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IndexBuildTotals {
+    /// Builds currently in flight.
+    pub pending: usize,
+    /// Builds currently parked poisoned (`rmp` task #733).
+    pub parked: usize,
+    /// `Σ (snapshot.len() - cursor)` over the **in-flight** builds — entities still to index. Parked
+    /// builds are excluded: their remainder is frozen and would otherwise read as work in progress.
+    pub entities_remaining: usize,
+}
+
 /// The owned, `Send` pieces an off-thread reader needs to run a read-only statement against a
 /// [`ReadOnlyGraph`](crate::read_only_graph::ReadOnlyGraph), captured on the engine thread by
 /// [`TxnCoordinator::read_task_inputs`] (`rmp` task #336, Slice 3b-ii).
@@ -4293,8 +4343,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             IndexState::Populating,
         );
 
-        // Cancel any prior pending build of the same name (a re-declare), then enqueue this one.
-        self.pending_fulltext_builds.retain(|b| b.name != name);
+        // Cancel any prior build of the same name — pending OR parked poisoned (`rmp` task #573) — then
+        // enqueue this one. A parked build left behind would be resurrected later and race this one.
+        Self::cancel_named_builds(
+            &mut self.pending_fulltext_builds,
+            &mut self.poisoned_fulltext_builds,
+            name,
+            |b| &b.name,
+        );
         let snapshot = self.store.borrow_mut().scan_node_ids()?;
         self.pending_fulltext_builds
             .push_back(PendingFulltextBuild {
@@ -4475,7 +4531,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             if !if_exists {
                 return Err(index_drop_not_found(name));
             }
-            self.pending_fulltext_builds.retain(|b| b.name != name);
+            Self::cancel_named_builds(
+                &mut self.pending_fulltext_builds,
+                &mut self.poisoned_fulltext_builds,
+                name,
+                |b| &b.name,
+            );
             // The name is unique across catalogs, so at most one of these unregisters anything
             // (`rmp` task #663): one is a no-op.
             self.index.borrow_mut().unregister_fulltext(name);
@@ -4488,7 +4549,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.store.borrow_mut().remove_fulltext_index(name);
         self.store.borrow_mut().commit(txn)?;
 
-        self.pending_fulltext_builds.retain(|b| b.name != name);
+        Self::cancel_named_builds(
+            &mut self.pending_fulltext_builds,
+            &mut self.poisoned_fulltext_builds,
+            name,
+            |b| &b.name,
+        );
         // Unregister from whichever in-memory map holds it (node or relationship, `rmp` #663).
         self.index.borrow_mut().unregister_fulltext(name);
         self.index.borrow_mut().unregister_fulltext_rel(name);
@@ -4624,8 +4690,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             IndexState::Populating,
         );
 
-        // Cancel any prior pending build of the same name (a re-declare), then enqueue this one.
-        self.pending_spatial_builds.retain(|b| b.name != name);
+        // Cancel any prior build of the same name — pending OR parked poisoned (`rmp` task #573) — then
+        // enqueue this one. A parked build left behind would be resurrected later and race this one.
+        Self::cancel_named_builds(
+            &mut self.pending_spatial_builds,
+            &mut self.poisoned_spatial_builds,
+            name,
+            |b| &b.name,
+        );
         let snapshot = self.store.borrow_mut().scan_node_ids()?;
         self.pending_spatial_builds.push_back(PendingSpatialBuild {
             name: name.to_owned(),
@@ -4796,7 +4868,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             if !if_exists {
                 return Err(index_drop_not_found(name));
             }
-            self.pending_spatial_builds.retain(|b| b.name != name);
+            Self::cancel_named_builds(
+                &mut self.pending_spatial_builds,
+                &mut self.poisoned_spatial_builds,
+                name,
+                |b| &b.name,
+            );
             return Ok(false); // nothing removed.
         };
 
@@ -4806,7 +4883,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.store.borrow_mut().remove_spatial_index(name);
         self.store.borrow_mut().commit(txn)?;
 
-        self.pending_spatial_builds.retain(|b| b.name != name);
+        Self::cancel_named_builds(
+            &mut self.pending_spatial_builds,
+            &mut self.poisoned_spatial_builds,
+            name,
+            |b| &b.name,
+        );
         // Route the unregister by entity (`rmp` task #664): a relationship point index lives in the
         // rel-keyed grid map, a node one in the node-keyed map (both keyed by `(token, prop_key)`).
         if entry.entity.is_relationship() {
@@ -6398,6 +6480,159 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             + self.poisoned_spatial_builds.len()
     }
 
+    /// Cancels every build — in flight **or parked poisoned** — covering the node-property index
+    /// `(label_token, prop_key)`, for a `DROP INDEX`.
+    ///
+    /// Both queues, always. A poisoned build left behind by a drop is not inert: it is resurrected by
+    /// [`retry_poisoned_index_builds`](Self::retry_poisoned_index_builds) the moment the store reads
+    /// cleanly again, and its promotion re-creates the dropped index in the **durable** catalog (`rmp`
+    /// task #573, auditing `rmp` #733). It also pins the alerting `graphus_index_builds_parked` gauge above
+    /// zero for an index that no longer exists.
+    fn cancel_node_property_builds(
+        pending: &mut VecDeque<PendingIndexBuild>,
+        poisoned: &mut Vec<PendingIndexBuild>,
+        label_token: u32,
+        prop_key: u32,
+    ) {
+        let covers = |b: &PendingIndexBuild| b.label_token == label_token && b.prop_key == prop_key;
+        pending.retain(|b| !covers(b));
+        poisoned.retain(|b| !covers(b));
+    }
+
+    /// Cancels every **name-keyed** build — in flight *or* parked poisoned — called `name`, for a
+    /// `DROP INDEX` or a re-declare of the same name. The full-text / spatial twin of
+    /// [`cancel_node_property_builds`](Self::cancel_node_property_builds), and it purges the poison
+    /// graveyard for the same load-bearing reason: a parked build that outlives its index is resurrected
+    /// later and durably re-creates it.
+    fn cancel_named_builds<T>(
+        pending: &mut VecDeque<T>,
+        poisoned: &mut Vec<T>,
+        name: &str,
+        name_of: impl Fn(&T) -> &str,
+    ) {
+        pending.retain(|b| name_of(b) != name);
+        poisoned.retain(|b| name_of(b) != name);
+    }
+
+    /// The aggregate index-build numbers (`rmp` task #573) — in-flight and parked build counts, and the
+    /// entities still to index across the in-flight ones.
+    ///
+    /// Deliberately allocation-free and store-free: the engine loop publishes its gauges from this on
+    /// **every** iteration, so it must cost nothing when no build is running (the overwhelmingly common
+    /// case — three empty-collection `len()`s and a sum over an empty deque). The per-build names live in
+    /// [`index_build_progress`](Self::index_build_progress), which allocates and is called only when a
+    /// `SHOW INDEXES` actually asks.
+    ///
+    /// NOTE: `pending` counts **builds**, so it is deliberately narrower than
+    /// [`has_pending_index_builds`](Self::has_pending_index_builds), which also reports a queued
+    /// `db.resampleIndex` (`rmp` task #572). The engine can therefore be ticking with `pending == 0`: a
+    /// resample only sharpens a statistic, it does not populate an index, and reporting it as an
+    /// in-flight build would misread as a stalled build to anyone watching the gauge.
+    #[must_use]
+    pub fn index_build_totals(&self) -> IndexBuildTotals {
+        // `saturating_sub` on every remainder: a cursor cannot legitimately outrun its snapshot, but a
+        // gauge must never underflow into a nonsense value if one ever did.
+        let remaining = |cursor: usize, len: usize| len.saturating_sub(cursor);
+        IndexBuildTotals {
+            pending: self.pending_builds.len()
+                + self.pending_fulltext_builds.len()
+                + self.pending_spatial_builds.len(),
+            parked: self.poisoned_index_builds(),
+            entities_remaining: self
+                .pending_builds
+                .iter()
+                .map(|b| remaining(b.cursor, b.snapshot.len()))
+                .chain(
+                    self.pending_fulltext_builds
+                        .iter()
+                        .map(|b| remaining(b.cursor, b.snapshot.len())),
+                )
+                .chain(
+                    self.pending_spatial_builds
+                        .iter()
+                        .map(|b| remaining(b.cursor, b.snapshot.len())),
+                )
+                .sum(),
+        }
+    }
+
+    /// The progress of every index build this coordinator is carrying — in flight *and* parked poisoned
+    /// (`rmp` task #573), named so a `SHOW INDEXES` row can be matched to its build.
+    ///
+    /// This reads the `cursor`/`snapshot.len()` pair each build already maintains; it adds **no** per-tick
+    /// cost to the build loop itself (both reads are O(1); only resolving a node-property build's name
+    /// costs a token/catalog lookup, and only when a caller actually asks). Callers are the `SHOW INDEXES`
+    /// render and the server's metrics publish, neither of which is on the build's hot path.
+    ///
+    /// Order is: node-property, full-text, spatial — pending first within each kind, then parked. Callers
+    /// match by name rather than position.
+    ///
+    /// A node-property build whose tokens no longer resolve to names is **omitted** (it has no listing row
+    /// to match, so there is nothing to report it against). That is the one case where this disagrees with
+    /// [`index_build_totals`](Self::index_build_totals), whose counts are name-independent: the returned
+    /// length may be smaller than `pending + parked`. Callers must not treat the two as interchangeable.
+    #[must_use]
+    pub fn index_build_progress(&self) -> Vec<IndexBuildProgress> {
+        let store = self.store.borrow();
+
+        // A node-property build is keyed by its `(label_token, prop_key)` tokens, not by a name, so the
+        // name is resolved exactly as `list_node_property_indexes` resolves it — same catalog lookup, same
+        // `auto_index_name` fallback — or the listing and the progress would disagree on the key.
+        let node_name = |b: &PendingIndexBuild| -> Option<String> {
+            let label = store.token_name(Namespace::Label, b.label_token)?;
+            let property = store.token_name(Namespace::PropKey, b.prop_key)?;
+            Some(
+                store
+                    .node_property_index_name_for(b.label_token, b.prop_key)
+                    .unwrap_or_else(|| auto_index_name(label, property)),
+            )
+        };
+
+        let mut out = Vec::with_capacity(
+            self.pending_builds.len()
+                + self.pending_fulltext_builds.len()
+                + self.pending_spatial_builds.len()
+                + self.poisoned_index_builds(),
+        );
+        let mut push = |name: String, done: usize, total: usize, poisoned: bool| {
+            out.push(IndexBuildProgress {
+                name,
+                // A cursor can never legitimately exceed its snapshot, but clamping keeps the public
+                // contract (`done <= total`) true by construction rather than by trust — the value feeds a
+                // Neo4j-facing percentage that must never exceed 100.
+                done: done.min(total),
+                total,
+                poisoned,
+            });
+        };
+
+        // Pending first, then parked — the `poisoned` flag comes from WHICH collection the build sits in,
+        // so each collection is walked separately with the flag it implies.
+        for b in &self.pending_builds {
+            if let Some(name) = node_name(b) {
+                push(name, b.cursor, b.snapshot.len(), false);
+            }
+        }
+        for b in &self.poisoned_builds {
+            if let Some(name) = node_name(b) {
+                push(name, b.cursor, b.snapshot.len(), true);
+            }
+        }
+        for b in &self.pending_fulltext_builds {
+            push(b.name.clone(), b.cursor, b.snapshot.len(), false);
+        }
+        for b in &self.poisoned_fulltext_builds {
+            push(b.name.clone(), b.cursor, b.snapshot.len(), true);
+        }
+        for b in &self.pending_spatial_builds {
+            push(b.name.clone(), b.cursor, b.snapshot.len(), false);
+        }
+        for b in &self.poisoned_spatial_builds {
+            push(b.name.clone(), b.cursor, b.snapshot.len(), true);
+        }
+        out
+    }
+
     /// Re-enqueues every **poisoned** build once the store reads cleanly again (`rmp` task #733, M1),
     /// returning whether any build was resurrected.
     ///
@@ -6542,8 +6777,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// thread (the responsiveness guarantee).
     ///
     /// A `budget` of `0` performs no indexing but still returns the pending state (callers should pass
-    /// a positive chunk size). If the durable promotion commit fails, the build is left in place
-    /// `Populating` (still correct via the scan fallback) to be retried on the next call/open.
+    /// a positive chunk size). A `budget` of [`usize::MAX`] means "advance this build to completion" and
+    /// is legal from **any** cursor position — the chunk bounds saturate rather than overflow (`rmp` task
+    /// #573). If the durable promotion commit fails, the build is left in place `Populating` (still
+    /// correct via the scan fallback) to be retried on the next call/open.
     pub fn advance_index_builds(&mut self, budget: usize) -> bool
     where
         D: Send + Sync + 'static,
@@ -6650,9 +6887,24 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         };
 
         // Index up to `budget` nodes from the snapshot, starting at the cursor.
+        //
+        // `saturating_add`, not `+`: `budget` is caller-supplied and `usize::MAX` is the documented way to
+        // ask for "the whole build" — `LocalEngine::drain_index_builds` (the DST driver) passes exactly
+        // that, in a loop. Once the cursor is non-zero, `cursor + usize::MAX` overflows: a debug panic, and
+        // in release a wrap to `end < start` that panics on the slice range below.
+        //
+        // A non-zero cursor here is REACHABLE, not hypothetical (`rmp` task #573). These bounds are
+        // computed BEFORE the gap check and the degraded gate, so once any call leaves a build pending
+        // with `cursor == total` — which the degraded gate below does, and which a failed promotion commit
+        // does — the NEXT call overflows regardless of whether the store has since healed. Only a wipe
+        // resets a cursor (via the epoch check above); healing does not. Pinned by
+        // `index_fail_closed.rs::the_dst_drain_loop_does_not_overflow_on_a_build_parked_at_the_degraded_gate`.
         let registered = [(build.label_token, build.prop_key)];
         let start = build.cursor;
-        let end = build.snapshot.len().min(build.cursor + budget);
+        let end = build
+            .snapshot
+            .len()
+            .min(build.cursor.saturating_add(budget));
         let chunk: Vec<u64> = build.snapshot[start..end].to_vec();
         let total = build.snapshot.len();
         // A clean slate: only THIS chunk's read faults may fail THIS build (`rmp` task #733).
@@ -6777,7 +7029,9 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         };
         let total = build.snapshot.len();
         let start = build.cursor;
-        let end = total.min(build.cursor + budget);
+        // `saturating_add` — see the node-property build's chunk bounds (`rmp` task #573): a `usize::MAX`
+        // budget past a non-zero cursor would otherwise overflow and panic the engine thread.
+        let end = total.min(build.cursor.saturating_add(budget));
         let chunk: Vec<u64> = build.snapshot[start..end].to_vec();
         let name = build.name.clone();
         build.cursor = end;
@@ -6913,7 +7167,9 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         };
         let total = build.snapshot.len();
         let start = build.cursor;
-        let end = total.min(build.cursor + budget);
+        // `saturating_add` — see the node-property build's chunk bounds (`rmp` task #573): a `usize::MAX`
+        // budget past a non-zero cursor would otherwise overflow and panic the engine thread.
+        let end = total.min(build.cursor.saturating_add(budget));
         let chunk: Vec<u64> = build.snapshot[start..end].to_vec();
         let name = build.name.clone();
         let registered = [(build.label_token, build.prop_key)];
@@ -7060,8 +7316,18 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.store.borrow_mut().commit(txn)?;
 
         // Cancel any in-progress build for this index and unregister it from the in-memory set.
-        self.pending_builds
-            .retain(|b| !(b.label_token == label_token && b.prop_key == prop_key));
+        //
+        // The POISON GRAVEYARD is purged alongside the pending queue, and that is load-bearing, not
+        // tidiness: a parked build outliving the drop of its own index is resurrected by
+        // `retry_poisoned_index_builds` once the store reads cleanly, drains to the end, and its promotion
+        // durably RE-CREATES the index this call just dropped — nameless, and surviving a restart, because
+        // a reopen rebuilds the in-memory set from the catalog. `DROP INDEX` would be silently undone.
+        Self::cancel_node_property_builds(
+            &mut self.pending_builds,
+            &mut self.poisoned_builds,
+            label_token,
+            prop_key,
+        );
         self.index
             .borrow_mut()
             .unregister_node_property(label_token, prop_key);
@@ -7110,8 +7376,18 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.store.borrow_mut().commit(txn)?;
 
         // Cancel any in-progress build for this index and unregister it from the in-memory set.
-        self.pending_builds
-            .retain(|b| !(b.label_token == label_token && b.prop_key == prop_key));
+        //
+        // The POISON GRAVEYARD is purged alongside the pending queue, and that is load-bearing, not
+        // tidiness: a parked build outliving the drop of its own index is resurrected by
+        // `retry_poisoned_index_builds` once the store reads cleanly, drains to the end, and its promotion
+        // durably RE-CREATES the index this call just dropped — nameless, and surviving a restart, because
+        // a reopen rebuilds the in-memory set from the catalog. `DROP INDEX` would be silently undone.
+        Self::cancel_node_property_builds(
+            &mut self.pending_builds,
+            &mut self.poisoned_builds,
+            label_token,
+            prop_key,
+        );
         self.index
             .borrow_mut()
             .unregister_node_property(label_token, prop_key);

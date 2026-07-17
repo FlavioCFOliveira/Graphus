@@ -35,8 +35,9 @@
 //!   next id from `3`. Ids are assigned over the *unfiltered* order, so a given index keeps its id
 //!   regardless of the [`IndexTypeFilter`]. Real drivers do not depend on the exact value.
 //! * `state` — the **UPPER-CASE** Neo4j string `ONLINE` / `POPULATING`.
-//! * `populationPercent` — `100.0` when `Online`, else `0.0` (Graphus does not surface a fractional
-//!   build progress from the listing APIs; a `Populating` index reports `0.0`).
+//! * `populationPercent` — `100.0` when `Online`; for a `Populating` index, its covering build's **real**
+//!   progress (`done / total * 100`, `rmp` task #573), or `0.0` when no build covers it (a fail-closed
+//!   demotion) — the same rule Neo4j applies. See [`population_percent`].
 //! * `type` — one of `RANGE` / `TEXT` / `FULLTEXT` / `POINT` / `VECTOR` / `LOOKUP` (`TEXT` is a distinct
 //!   native string index for `CONTAINS` / `ENDS WITH` / `STARTS WITH`, `rmp` task #662; `VECTOR` is the
 //!   HNSW approximate-nearest-neighbour index, `rmp` tasks #668–#671).
@@ -59,8 +60,8 @@
 
 use graphus_core::{GraphusError, Value};
 use graphus_cypher::{
-    Analyzer, ConstraintInfo, FulltextEntity, FulltextIndexListing, VectorIndexListing,
-    VectorSimilarity,
+    Analyzer, ConstraintInfo, FulltextEntity, FulltextIndexListing, IndexBuildProgress,
+    VectorIndexListing, VectorSimilarity,
 };
 use graphus_storage::{ConstraintKind, IndexState};
 
@@ -171,6 +172,11 @@ pub(crate) struct IndexSources {
     /// bypasses the (empty) index and enumerates the store — so the synthetic node `LOOKUP` row must
     /// report `POPULATING`, not `ONLINE`.
     pub node_lookup_usable: bool,
+    /// Every index build currently in flight or parked poisoned (`rmp` task #573), matched to its listing
+    /// row **by name** to render a `Populating` index's real `populationPercent`. Only the incrementally
+    /// built kinds ever appear here (node-property `rmp` #91, full-text #72, spatial #98); every other
+    /// kind builds synchronously at create time.
+    pub builds: Vec<IndexBuildProgress>,
 }
 
 /// A typed, pre-`Value` row (`rmp` #660). Building typed specs first lets [`build_rows`] filter on the
@@ -191,13 +197,15 @@ struct RowSpec {
 }
 
 impl RowSpec {
-    /// Renders the spec into a [`COLUMNS_FULL`]-ordered `Value` row.
-    fn into_values(self) -> Vec<Value> {
+    /// Renders the spec into a [`COLUMNS_FULL`]-ordered `Value` row, taking `populationPercent` from the
+    /// covering build's real progress when one is in flight (`rmp` task #573).
+    fn into_values(self, builds: &[IndexBuildProgress]) -> Vec<Value> {
+        let percent = population_percent(self.state, find_build(builds, &self.name));
         vec![
             Value::Integer(self.id),
             Value::String(self.name),
             Value::String(state_string(self.state).to_owned()),
-            Value::Float(population_percent(self.state)),
+            Value::Float(percent),
             Value::String(self.type_str.to_owned()),
             Value::String(self.entity_type.to_owned()),
             Value::List(
@@ -228,12 +236,79 @@ const fn state_string(state: IndexState) -> &'static str {
     }
 }
 
-/// The `populationPercent` for an [`IndexState`]: `100.0` when built, else `0.0` (`rmp` #660).
-const fn population_percent(state: IndexState) -> f64 {
+/// The `populationPercent` of an index (`rmp` #660, real progress added by `rmp` task #573): `100.0` once
+/// `Online`, else the covering build's **real** progress — `done / total * 100`.
+///
+/// This mirrors Neo4j 5.x's **rule** exactly. There, one expression computes the column for every state,
+/// *without consulting the state at all* (`TransactionBoundQueryContext.getIndexStatus`), over
+/// `IndexPopulationProgress.getCompletedPercentage`:
+///
+/// ```java
+/// return totalCount > 0 ? ((float) (completedCount * 100) / totalCount) : 0.0f;
+/// ```
+///
+/// Graphus deviates in one respect, deliberately: it computes in `f64` where Neo4j uses a 32-bit `float`
+/// widened to the wire's 64-bit `Float`. Exactly-representable fractions agree bit-for-bit (`70/100` is
+/// `70.0` in both), but a non-representable one differs in the last ~7 digits (`1/3` → Neo4j
+/// `33.33333206176758`, Graphus `33.33333333333334`). This is not a conformance risk: PackStream's `Float`
+/// is an IEEE-754 double either way, no driver byte-asserts a progress estimate, and Neo4j's own figure is
+/// not a `cursor/len` ratio at all — its `toIndexPopulationProgress` fabricates counts against a
+/// `fakeTotal = 1_000`, so it carries only ~0.1% granularity. Matching its rounding would mean reproducing
+/// an artefact, not a contract; `f64` is simply the more accurate answer to the same question.
+///
+/// The per-state values fall out of that: an `ONLINE` index's proxy reports `PopulationProgress.DONE`
+/// (`1/1` → exactly `100.0`), and a `POPULATING` index's reports its live population job — a genuine
+/// fractional value (Neo4j's own `ShowIndexesCommandTest` fixture asserts a `POPULATING` index at `70.0`).
+/// So `ONLINE ⇒ 100.0`, but **not** the converse: a build that has finished its scan but not yet flipped
+/// `Online` legitimately reports ~`100.0` while still `POPULATING`.
+///
+/// `builds` carries only the kinds that build **incrementally** (node-property `rmp` #91, full-text #72,
+/// spatial #98); every other kind is built synchronously at create time and is `Online` — hence `100.0` —
+/// by the time it can be listed. A `Populating` row with no covering build reports `0.0`: that is an index
+/// a [`fail_closed`](graphus_cypher::TxnCoordinator::indexes_degraded) demoted, for which no build is
+/// running and there is genuinely no progress to report. `total == 0` also reports `0.0`, exactly as the
+/// Java above does.
+///
+/// # Why a parked (poisoned) build is not distinguished *here*
+///
+/// A poisoned build (`rmp` task #733) reports its frozen progress like any other `Populating` index, and
+/// is surfaced out-of-band instead — the `graphus_index_builds_parked` gauge and an `ERROR` log. That is
+/// the Neo4j-faithful choice, not a shortcut: `POPULATING` **is** Neo4j's own state for a build that was
+/// interrupted and will be repopulated (`IndexingService` drops and rebuilds any index found `POPULATING`
+/// at startup), whereas `FAILED` is *terminal* — never auto-rebuilt, and `Schema.awaitIndexesOnline`
+/// **throws** on it. Reporting `FAILED` for a build Graphus auto-resurrects would permanently break every
+/// driver's `awaitIndexes()`. A non-empty `failureMessage` on a `POPULATING` row is likewise a tuple
+/// Neo4j's code cannot produce (its `failureMessage` is `if (state == FAILED) … else ""`), so tooling that
+/// reads a message as "this index failed" would misread Graphus. Neo4j routes this class of diagnostic to
+/// the logs by its own design; so does Graphus.
+fn population_percent(state: IndexState, build: Option<&IndexBuildProgress>) -> f64 {
     match state {
         IndexState::Online => 100.0,
-        IndexState::Populating => 0.0,
+        IndexState::Populating => match build {
+            Some(b) if b.total > 0 => {
+                // `.min(b.total)` makes `<= 100.0` true BY CONSTRUCTION. `index_build_progress` already
+                // clamps, but it lives in another crate behind a `pub` type with `pub` fields, so nothing
+                // in the type system carries that invariant to here — and this value goes on the wire.
+                //
+                // Multiply BEFORE dividing, and keep it that way: `100 * d` is `25d * 4`, and the `* 4` is
+                // a free exponent shift, so the product is exact for any `d < 2^53/25` (≈ 3.6e14 — a
+                // snapshot that large would need petabytes of RAM). That exactness is what makes a
+                // finished-but-unpromoted build report exactly `100.0`. The "simplification"
+                // `done / total * 100.0` rounds twice and loses it.
+                (b.done.min(b.total) as f64) * 100.0 / (b.total as f64)
+            }
+            // No covering build, or nothing to index: no progress to report (Neo4j's `totalCount > 0 ? …
+            // : 0.0f`).
+            _ => 0.0,
+        },
     }
+}
+
+/// The build covering the index named `name`, if one is in flight or parked (`rmp` task #573). Linear over
+/// `builds`, which holds one entry per *in-progress* build — normally zero, a handful at most — so it is
+/// not worth a map.
+fn find_build<'a>(builds: &'a [IndexBuildProgress], name: &str) -> Option<&'a IndexBuildProgress> {
+    builds.iter().find(|b| b.name == name)
 }
 
 /// The `owningConstraint` for a **single-property** `RANGE` index (`rmp` #653/#660): the name of the
@@ -520,6 +595,7 @@ pub(crate) fn build_rows(filter: IndexTypeFilter, sources: IndexSources) -> Vec<
         vector,
         constraints,
         node_lookup_usable,
+        builds,
     } = sources;
 
     let mut specs: Vec<RowSpec> = Vec::new();
@@ -734,7 +810,7 @@ pub(crate) fn build_rows(filter: IndexTypeFilter, sources: IndexSources) -> Vec<
     specs
         .into_iter()
         .filter(|s| filter.matches(s.type_str))
-        .map(RowSpec::into_values)
+        .map(|s| s.into_values(&builds))
         .collect()
 }
 
@@ -850,6 +926,7 @@ mod tests {
             text: Vec::new(),
             vector: Vec::new(),
             constraints: Vec::new(),
+            builds: Vec::new(),
         }
     }
 
@@ -1009,6 +1086,7 @@ mod tests {
                 IndexState::Online,
             )],
             constraints: Vec::new(),
+            builds: Vec::new(),
         };
         let rows = build_rows(IndexTypeFilter::All, sources);
         // 2 lookups + 9 declared indexes (`rmp` #666 added the composite relationship index; `rmp` #671
@@ -1040,7 +1118,12 @@ mod tests {
             "composite properties render as a multi-element list"
         );
         assert_eq!(composite[2], Value::String("POPULATING".to_owned()));
-        assert_eq!(composite[3], Value::Float(0.0), "Populating → 0.0");
+        assert_eq!(
+            composite[3],
+            Value::Float(0.0),
+            "a Populating index with no covering build reports 0.0 (`rmp` task #573): a composite builds \
+             synchronously, so it never has one"
+        );
 
         // The relationship index carries entityType RELATIONSHIP.
         let rel = rows
@@ -1229,6 +1312,7 @@ mod tests {
             ],
             ..empty_sources()
         };
+        // NOTE: `empty_sources` supplies no builds, so the `Populating` vector index below reports 0.0.
         let rows = build_rows(IndexTypeFilter::Vector, sources);
         assert_eq!(
             rows.len(),
@@ -1508,6 +1592,149 @@ mod tests {
             AdminParse::Index(cmd) => cmd,
             other => panic!("createStatement {stmt:?} must re-parse to index DDL, got {other:?}"),
         }
+    }
+
+    /// Builds an [`IndexBuildProgress`] fixture (`rmp` task #573).
+    fn build(name: &str, done: usize, total: usize, poisoned: bool) -> IndexBuildProgress {
+        IndexBuildProgress {
+            name: name.to_owned(),
+            done,
+            total,
+            poisoned,
+        }
+    }
+
+    /// Renders one node-property index at `state` against `builds`, returning its `populationPercent`.
+    fn percent_of(state: IndexState, builds: Vec<IndexBuildProgress>) -> f64 {
+        let sources = IndexSources {
+            node_property: vec![(
+                "ix".to_owned(),
+                "Person".to_owned(),
+                "name".to_owned(),
+                state,
+            )],
+            builds,
+            ..empty_sources()
+        };
+        let rows = build_rows(IndexTypeFilter::Range, sources);
+        match rows[0][3] {
+            Value::Float(f) => f,
+            ref other => panic!("populationPercent must be a Float: {other:?}"),
+        }
+    }
+
+    /// `rmp` task #573: a `Populating` index reports its build's REAL fractional progress, exactly as
+    /// Neo4j does (`totalCount > 0 ? (completed * 100) / totalCount : 0.0f`, computed independently of
+    /// the state). The pre-#573 constant `0.0` fails every case here but the last two.
+    #[test]
+    fn population_percent_reports_real_build_progress() {
+        assert!(
+            (percent_of(IndexState::Populating, vec![build("ix", 25, 100, false)]) - 25.0).abs()
+                < 1e-9,
+            "a quarter-done build reports 25.0"
+        );
+        assert!(
+            (percent_of(IndexState::Populating, vec![build("ix", 1, 3, false)]) - 100.0 / 3.0)
+                .abs()
+                < 1e-9,
+            "the value is fractional, not rounded to a state-derived constant"
+        );
+        // A build that finished its scan but has not yet flipped Online legitimately reports 100.0 while
+        // still POPULATING. `ONLINE => 100.0` holds in Neo4j; the converse does not.
+        assert!(
+            (percent_of(IndexState::Populating, vec![build("ix", 100, 100, false)]) - 100.0).abs()
+                < f64::EPSILON,
+            "a scan-complete but un-promoted build reports 100.0"
+        );
+        // A poisoned build reports its FROZEN progress like any other Populating index: the poison is
+        // surfaced out-of-band (the parked gauge + an ERROR log), never by bending this column.
+        assert!(
+            (percent_of(IndexState::Populating, vec![build("ix", 40, 100, true)]) - 40.0).abs()
+                < 1e-9,
+            "a parked build reports the progress it froze at"
+        );
+        // An Online index is always exactly 100.0, whatever `builds` says.
+        assert!(
+            (percent_of(IndexState::Online, vec![build("ix", 10, 100, false)]) - 100.0).abs()
+                < f64::EPSILON,
+            "ONLINE => exactly 100.0"
+        );
+    }
+
+    /// `rmp` task #573: the Neo4j-facing contract of the column. It must never leave `[0, 100]`, and the
+    /// two "no progress to report" cases must both yield `0.0` — matching Neo4j's `totalCount > 0 ? … :
+    /// 0.0f`, and in particular never producing a `NaN` from a `0/0`.
+    #[test]
+    fn population_percent_never_leaves_zero_to_one_hundred() {
+        // An empty snapshot: nothing to index. Neo4j's `IndexPopulationProgress` returns 0.0 when
+        // `totalCount == 0`; a naive `done / total` would produce NaN here and poison the wire.
+        let empty = percent_of(IndexState::Populating, vec![build("ix", 0, 0, false)]);
+        assert!(
+            empty.abs() < f64::EPSILON,
+            "an empty snapshot reports 0.0, not NaN: got {empty}"
+        );
+        assert!(!empty.is_nan(), "populationPercent must never be NaN");
+
+        // A Populating index with NO covering build: a fail-closed demotion, or a kind that builds
+        // synchronously. No build, no progress.
+        assert!(
+            percent_of(IndexState::Populating, Vec::new()).abs() < f64::EPSILON,
+            "no covering build reports 0.0"
+        );
+        // A build whose name does not match this index must not be borrowed by it.
+        assert!(
+            percent_of(IndexState::Populating, vec![build("other", 90, 100, false)]).abs()
+                < f64::EPSILON,
+            "progress is matched by name; another index's build is not this one's"
+        );
+
+        // The bound holds across the whole domain.
+        for done in 0..=100_usize {
+            let pct = percent_of(IndexState::Populating, vec![build("ix", done, 100, false)]);
+            assert!(
+                (0.0..=100.0).contains(&pct),
+                "populationPercent left [0, 100] at done={done}: {pct}"
+            );
+        }
+    }
+
+    /// `rmp` task #573 — CONFORMANCE. A `Populating` index, poisoned or not, must keep the Neo4j-faithful
+    /// tuple: `state = POPULATING` and an **empty** `failureMessage`.
+    ///
+    /// Neo4j computes `failureMessage` as `if (state == FAILED) indexGetFailure(index) else ""`, so a
+    /// `POPULATING` row carrying a message is a tuple its code cannot produce, and tooling that reads a
+    /// non-empty message as "this index failed" would misread Graphus. Reporting `FAILED` outright would
+    /// be worse: `Schema.awaitIndexesOnline` **throws** on `FAILED`, which would permanently break every
+    /// driver's `awaitIndexes()` for a build Graphus resurrects on its own.
+    #[test]
+    fn a_poisoned_build_keeps_the_neo4j_conformant_populating_tuple() {
+        let sources = IndexSources {
+            node_property: vec![(
+                "ix".to_owned(),
+                "Person".to_owned(),
+                "name".to_owned(),
+                IndexState::Populating,
+            )],
+            builds: vec![build("ix", 40, 100, true)],
+            ..empty_sources()
+        };
+        let rows = build_rows(IndexTypeFilter::Range, sources);
+        assert_eq!(
+            rows[0][2],
+            Value::String("POPULATING".to_owned()),
+            "a poisoned build stays POPULATING — Neo4j's own state for an interrupted build that will \
+             be repopulated; FAILED is terminal and would break awaitIndexesOnline"
+        );
+        assert_eq!(
+            rows[0][11],
+            Value::String(String::new()),
+            "failureMessage stays empty: Neo4j couples it exclusively to the FAILED state"
+        );
+        assert_eq!(
+            rows[0][3],
+            Value::Float(40.0),
+            "the frozen progress is still reported"
+        );
     }
 
     #[test]
