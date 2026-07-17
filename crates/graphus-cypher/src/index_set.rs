@@ -429,12 +429,17 @@ pub struct IndexSet {
     /// * **`vector`** — destructive per entry (`VectorIndex` is id-keyed: an insert for an existing id
     ///   REPLACES it, and `remove` drops it), so the refill reproduces the live graph exactly. NOTE it is
     ///   gated only by `IndexState::Online` (`rmp` #733), NOT by the #467 marker — do not assume it is.
-    /// * **`labels`** — the one that is stale-RETAINING yet still safe, and the reason is subtle: label
-    ///   membership is **not** MVCC snapshot-isolated. The re-check (`store.node_has_label`) reads the
-    ///   node record's CURRENT inline bitmap (labels live in the record, not in a version chain), so any
-    ///   entry the refill drops is one the re-check would have rejected anyway. The rebuild changes no
-    ///   answer. **This safety is conditional on that (defective) semantics**: if label membership ever
-    ///   becomes versioned, `labels` joins the list above and needs this watermark.
+    /// * **`labels`** — stale-RETAINING, and `clear` does **not** empty it at all (`rmp` task #771), so
+    ///   there is nothing for a watermark to gate: the refill only ever ADDS. It needs that exemption
+    ///   rather than a watermark because labels are mutated IN PLACE with no version chain, so the
+    ///   refill's only source is the CURRENT bitmap and it cannot reproduce a committed label an
+    ///   uncommitted writer has removed — see [`clear`](Self::clear) for the full argument.
+    ///
+    ///   This entry used to claim the opposite — that emptying `labels` was safe because "any entry the
+    ///   refill drops is one the re-check would have rejected anyway", so "the rebuild changes no
+    ///   answer". That was FALSE, and it was the #771 defect: it holds only at the refill INSTANT, and
+    ///   the record's bitmap changes BACK when the writer rolls back, at which point the re-check would
+    ///   have accepted the entry the refill had already destroyed.
     /// * **`bitmap`** — membership-EXACT (maintained by remove-then-reinsert, `rmp` #453), so the refill
     ///   reproduces exactly what the live bitmap already held. It also has no *planner* consumer (only
     ///   `TxnCoordinator::bitmap_seek_eq` / `bitmap_conjunction`, a documented test/diagnostic surface),
@@ -1089,8 +1094,40 @@ impl IndexSet {
     ///
     /// The constraint registry (`rmp` task #99) is left untouched: it holds *declarations*, not data,
     /// and a uniqueness constraint's data lives in the node-property index that `clear` resets above.
+    ///
+    /// # The `labels` tree is deliberately NOT reset (`rmp` task #771)
+    ///
+    /// Every other tree here is rebuilt from a source that can reproduce it. The label tree is not:
+    /// **labels are mutated IN PLACE, with no version chain** (they live in the node record's inline
+    /// bitmap), so the refill's only source is
+    /// [`node_labels`](graphus_storage::RecordStore::node_labels) — the *current* bitmap, including
+    /// every UNCOMMITTED change. The committed label set exists nowhere the refill can read it; it
+    /// survives only in the WAL undo image. So a clear-then-refill run while a writer holds an
+    /// uncommitted `REMOVE n:Label` writes a **subset**: the entry is destroyed, not re-inserted, and
+    /// when that writer ROLLS BACK the record bit comes back but nothing brings the index entry back.
+    /// `MATCH (n:Label)` then returned ZERO rows for a label the node demonstrably still carries —
+    /// permanently, for the life of the process (`tests/index_rebuild_label.rs`).
+    ///
+    /// Retaining the tree is what makes the refill purely ADDITIVE, and additive is the only image this
+    /// tree may hold, by the false-negative asymmetry the whole index set rests on: the re-check
+    /// (`node_has_label` on the CURRENT bitmap, via `read_source::filter_label_candidates`) can REMOVE
+    /// a candidate but can never RESURRECT one. A retained stale entry is a false POSITIVE the re-check
+    /// drops; a destroyed entry is a committed row silently lost.
+    ///
+    /// This corrects a claim this file used to make — that dropping label entries "changes no answer"
+    /// because "any entry the refill drops is one the re-check would have rejected anyway". That holds
+    /// only at the refill INSTANT. The record's bitmap can change BACK afterwards (a rollback restores
+    /// it), and the re-check would then have ACCEPTED the very entry the refill dropped.
+    ///
+    /// The cost of retaining: nothing prunes a label entry whose node was since deleted or relabelled.
+    /// That is not a new leak — this tree has **never** removed an entry (there is no `remove_label` on
+    /// `IndexSet`; it is stale-retaining by design, see
+    /// [`rebuilt_trees_trustworthy_from`](Self#structfield.rebuilt_trees_trustworthy_from)), and
+    /// `clear` was only ever an incidental reclaim, one that was never sound. Entries are still
+    /// reclaimed wholesale when the process
+    /// re-opens the store (a fresh `IndexSet`). A correctness-preserving prune would have to know that
+    /// no in-flight transaction could roll a label back, which nothing here can establish.
     pub fn clear(&mut self) {
-        self.labels = TokenIndex::new(fresh_tree());
         // The caller (a rebuild) is about to refill the label index from the store, so it becomes
         // trustworthy again — unless that rebuild fails, in which case `fail_closed` marks it unusable
         // (`rmp` task #733). Restoring it here is what lets a successful rebuild heal a prior failure.
@@ -3827,7 +3864,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_empties_then_reinsert_works() {
+    fn clear_empties_the_property_indexes_but_retains_the_label_tree() {
         let mut set = IndexSet::new();
         set.register_node_property(1, 2);
         set.insert_label(7, 100);
@@ -3839,18 +3876,29 @@ mod tests {
         );
 
         set.clear();
-        // Entries gone, but the registered set is preserved.
-        assert_eq!(set.seek_label(7), Vec::<u64>::new());
+        // The property index's ENTRIES are gone, but its registration is preserved: it is refilled from
+        // a source (the MVCC version chain) that can reproduce every version a reader may be owed.
         assert_eq!(
             set.seek_node_property_eq(1, 2, &Value::Integer(10)),
             Some(Vec::<u64>::new())
         );
         assert!(set.has_node_property(1, 2));
 
-        // Re-insert after clear works.
+        // The LABEL tree is RETAINED across `clear` (`rmp` task #771). Emptying it wrote a subset: labels
+        // are mutated in place with no version chain, so the refill reads the CURRENT bitmap and cannot
+        // reproduce a committed label an uncommitted writer has removed — and when that writer rolls back,
+        // the record bit returns but the destroyed entry does not. Retaining the tree makes the refill
+        // purely additive, which the query-time re-check (`node_has_label`) then narrows to the exact set.
+        assert_eq!(
+            set.seek_label(7),
+            vec![100],
+            "clear must NOT drop label entries (#771): a destroyed label entry is unrecoverable",
+        );
+
+        // Re-insert after clear works, and a retained label entry does not block a new one.
         set.insert_label(7, 200);
         set.insert_node_property(1, 2, &Value::Integer(10), 99);
-        assert_eq!(set.seek_label(7), vec![200]);
+        assert_eq!(set.seek_label(7), vec![100, 200]);
         assert_eq!(
             set.seek_node_property_eq(1, 2, &Value::Integer(10)),
             Some(vec![99])
