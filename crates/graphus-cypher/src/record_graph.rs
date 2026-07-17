@@ -1381,6 +1381,39 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     ///
     /// A storage fault enumerating the store captures the error (the statement is aborted before commit)
     /// and yields no candidates, rather than silently reporting an empty label.
+    /// Whether the **stale-retaining candidate trees** (`node_props`, `rel_props`, `composite`,
+    /// `rel_composite`) may serve *this* reader's seek, or whether it must decline to the exact scan
+    /// (`rmp` task #765).
+    ///
+    /// # The hazard
+    ///
+    /// `TxnCoordinator::rebuild_index` — fired by ANY index/constraint DDL, even on a completely
+    /// unrelated label/property, and by the degraded-rebuild retry — calls [`IndexSet::clear`], which
+    /// wipes every one of these trees, and refills them **newest-wins** from the store. Their soundness
+    /// rests on being stale-RETAINING (insert-only per entry: an overwritten value's OLD entry survives,
+    /// which is what an older snapshot needs, since values are MVCC-versioned newest-**visible**-wins,
+    /// `rmp` #50). The rebuild destroys exactly those stale entries while every other gate keeps passing:
+    /// the indexes stay `IndexState::Online` and `IndexSet::heal` clears `degraded`. The tree is then a
+    /// genuine SUBSET for any snapshot older than the rebuild, and a per-candidate re-check can only
+    /// REMOVE candidates — never resurrect a missing one. Measured before this gate existed: a reader
+    /// begins, a writer moves a node off the sought value, an *unrelated* `CREATE INDEX` rebuilds, and
+    /// the reader's seek silently drops a COMMITTED row it can still see (1 row → 0 rows).
+    ///
+    /// # Why a watermark, and why declining is always safe
+    ///
+    /// This is the append-only class's analogue of the full-text/spatial marker (`rmp` #467), which
+    /// guards the identical wholesale-destruction hazard reached by a different verb. It needs no
+    /// poison/in-flight machinery, because these trees are not destructive per entry — only the
+    /// wholesale rebuild can lose an entry, and that is precisely what the rebuild's stamp records.
+    ///
+    /// Declining returns `None` from the seek, which every caller routes to its **exact** fallback (the
+    /// executor's scan + residual; the write path's `unwrap_or_else(scan)` uniqueness check). It must
+    /// NEVER be turned into `Some(vec![])`: a silently empty result is row loss plus a uniqueness bypass
+    /// (`rmp` #680/#738) — the very defect this closes.
+    fn rebuilt_trees_serve_reader(&self, index: &Rc<RefCell<IndexSet>>) -> bool {
+        self.snapshot.ts >= index.borrow().rebuilt_trees_trustworthy_from()
+    }
+
     fn label_candidates(&self, index: &Rc<RefCell<IndexSet>>, label_token: u32) -> Vec<u64> {
         if index.borrow().labels_usable() {
             return index.borrow_mut().seek_label(label_token);
@@ -2607,6 +2640,16 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // doc). Falls back to the coarse `RelType(T)` when the value is not canonically encodable —
         // never "no marker".
         self.note_rel_equality_read(type_token, prop_key, value);
+        // **AND** the tree must be trustworthy *for this reader* (`rmp` task #765): a rebuild wiped it
+        // and refilled NEWEST-WINS, destroying the stale entries an older snapshot still depends on, so
+        // the tree is a SUBSET for such a reader even though it is Online and not degraded. Decline to
+        // the exact scan. Placed HERE — after the SSI markers above, immediately before the seek — so a
+        // decline registers exactly the footprint this site's established `List` decline below does.
+        // See `rebuilt_trees_serve_reader`.
+        if !self.rebuilt_trees_serve_reader(index) {
+            return None; // reader predates the rebuild: exact scan fallback (snapshot-correct)
+        }
+
         // Candidate ids for `(type, prop) == value`; the index is candidate-only, so re-check the full
         // predicate per candidate (visible + current type + current value equals `value`).
         let Some(candidates) = index
@@ -2666,6 +2709,16 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // type-writer pairs.
         self.note_predicate_read(PredicateRead::RelType(type_token));
         self.mark_all_live_rels();
+        // **AND** the tree must be trustworthy *for this reader* (`rmp` task #765): a rebuild wiped it
+        // and refilled NEWEST-WINS, destroying the stale entries an older snapshot still depends on, so
+        // the tree is a SUBSET for such a reader even though it is Online and not degraded. Decline to
+        // the exact scan. Placed HERE — after the SSI markers above, immediately before the seek — so a
+        // decline registers exactly the footprint this site's established `List` decline below does.
+        // See `rebuilt_trees_serve_reader`.
+        if !self.rebuilt_trees_serve_reader(index) {
+            return None; // reader predates the rebuild: exact scan fallback (snapshot-correct)
+        }
+
         // Candidate ids for the requested range (a superset; see `IndexSet::seek_rel_property_range`).
         let Some(candidates) = index
             .borrow_mut()
@@ -2838,6 +2891,16 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         for (&prop_key, value) in rule.property_tokens.iter().zip(tuple.iter()) {
             self.note_rel_equality_read(rule.label_token, prop_key, value);
         }
+        // **AND** the tree must be trustworthy *for this reader* (`rmp` task #765): a rebuild wiped it
+        // and refilled NEWEST-WINS, destroying the stale entries an older snapshot still depends on, so
+        // the tree is a SUBSET for such a reader even though it is Online and not degraded. Decline to
+        // the exact scan. Placed HERE — after the SSI markers above, immediately before the seek — so a
+        // decline registers exactly the footprint this site's established `List` decline below does.
+        // See `rebuilt_trees_serve_reader`.
+        if !self.rebuilt_trees_serve_reader(index) {
+            return None; // reader predates the rebuild: exact scan fallback (snapshot-correct)
+        }
+
         let Some(candidates) = index.borrow_mut().seek_rel_composite_eq(
             rule.label_token,
             &rule.property_tokens,
@@ -3024,6 +3087,16 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // #316, which already pairs with the writer's single-prop `Equality` write footprint.)
         self.note_predicate_read(PredicateRead::Label(rule.label_token));
         self.mark_all_live_nodes();
+        // **AND** the tree must be trustworthy *for this reader* (`rmp` task #765): a rebuild wiped it
+        // and refilled NEWEST-WINS, destroying the stale entries an older snapshot still depends on, so
+        // the tree is a SUBSET for such a reader even though it is Online and not degraded. Decline to
+        // the exact scan. Placed HERE — after the SSI markers above, immediately before the seek — so a
+        // decline registers exactly the footprint this site's established `List` decline below does.
+        // See `rebuilt_trees_serve_reader`.
+        if !self.rebuilt_trees_serve_reader(index) {
+            return None; // reader predates the rebuild: exact scan fallback (snapshot-correct)
+        }
+
         let Some(candidates) =
             index
                 .borrow_mut()
@@ -4086,6 +4159,18 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         if index.borrow().node_property_state(label_token, prop_key) != Some(IndexState::Online) {
             return None; // no usable index: scan fallback
         }
+        // **AND** the tree must be trustworthy *for this reader* (`rmp` task #765). The two gates above
+        // are not enough: a rebuild wipes every node-property tree (`IndexSet::clear`) and refills it
+        // NEWEST-WINS, destroying the STALE entries a reader whose snapshot predates the rebuild still
+        // depends on (its visible value is an OLDER version — `rmp` #50 newest-VISIBLE-wins). The index
+        // stays `Online` and `heal()` clears `degraded`, so both gates pass over a tree that is a genuine
+        // SUBSET for that reader, and the per-candidate re-check below can only REMOVE candidates, never
+        // resurrect a missing one — silent loss of a committed row. Decline instead, exactly as the
+        // ft/spatial marker gate (`rmp` #467) does in `index_seek_spatial` / `index_seek_text` for the
+        // identical wholesale-destruction hazard, reached there by a different verb.
+        if !self.rebuilt_trees_serve_reader(index) {
+            return None; // reader predates the rebuild: exact scan fallback (snapshot-correct)
+        }
 
         // Candidate ids for `(label_token, prop_key) == seek`, from this transaction's LIVE index.
         let Some(candidates) =
@@ -4175,6 +4260,16 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // scan-fallback range filter (`scan_filter_range` over `scan_nodes_by_label`) registers.
         self.note_predicate_read(PredicateRead::Label(label_token));
 
+        // **AND** the tree must be trustworthy *for this reader* (`rmp` task #765): a rebuild wiped it
+        // and refilled NEWEST-WINS, destroying the stale entries an older snapshot still depends on, so
+        // the tree is a SUBSET for such a reader even though it is Online and not degraded. Decline to
+        // the exact scan. Placed HERE — after the SSI markers above, immediately before the seek — so a
+        // decline registers exactly the footprint this site's established `List` decline below does.
+        // See `rebuilt_trees_serve_reader`.
+        if !self.rebuilt_trees_serve_reader(index) {
+            return None; // reader predates the rebuild: exact scan fallback (snapshot-correct)
+        }
+
         // Candidate ids for the requested range (a superset; see `IndexSet::seek_node_property_range`).
         // NOTE (v1-index limitation): the index keys by exact encoded value, so the value-match path
         // assumes per-property type consistency (the common case). Mixed int/float values for one
@@ -4240,6 +4335,16 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // Candidate ids whose composite tuple equals `values`. The index is candidate-only, so re-check
         // the FULL predicate per candidate: visible + carries the label (`filter_label_candidates`) +
         // the *current* per-property tuple equals `values` element-wise by Cypher equality.
+        // **AND** the tree must be trustworthy *for this reader* (`rmp` task #765): a rebuild wiped it
+        // and refilled NEWEST-WINS, destroying the stale entries an older snapshot still depends on, so
+        // the tree is a SUBSET for such a reader even though it is Online and not degraded. Decline to
+        // the exact scan. Placed HERE — after the SSI markers above, immediately before the seek — so a
+        // decline registers exactly the footprint this site's established `List` decline below does.
+        // See `rebuilt_trees_serve_reader`.
+        if !self.rebuilt_trees_serve_reader(index) {
+            return None; // reader predates the rebuild: exact scan fallback (snapshot-correct)
+        }
+
         let Some(candidates) =
             index
                 .borrow_mut()
@@ -4340,6 +4445,16 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // wrong; it only adds an rw-edge between concurrent same-type writers, as the scan already did.
         self.note_predicate_read(PredicateRead::RelType(type_token));
         self.mark_all_live_rels();
+
+        // **AND** the tree must be trustworthy *for this reader* (`rmp` task #765): a rebuild wiped it
+        // and refilled NEWEST-WINS, destroying the stale entries an older snapshot still depends on, so
+        // the tree is a SUBSET for such a reader even though it is Online and not degraded. Decline to
+        // the exact scan. Placed HERE — after the SSI markers above, immediately before the seek — so a
+        // decline registers exactly the footprint this site's established `List` decline below does.
+        // See `rebuilt_trees_serve_reader`.
+        if !self.rebuilt_trees_serve_reader(index) {
+            return None; // reader predates the rebuild: exact scan fallback (snapshot-correct)
+        }
 
         // Candidate ids whose composite tuple equals `values`. The index is candidate-only, so re-check
         // the FULL predicate per candidate: visible + current type + the *current* per-property tuple

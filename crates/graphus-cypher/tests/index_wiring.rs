@@ -1389,13 +1389,15 @@ fn a_list_equality_bound_returns_the_same_rows_with_and_without_the_index() {
 /// list — `Some(vec![])`, the precise "reads as no rows" hazard of `rmp` #680/#738 — and the reader would
 /// silently drop a committed row it can still see (measured: 1 row → 0 rows).
 ///
-/// # This is CONTAINMENT, not a fix
+/// # One invariant, two seams (`rmp` #765, closed)
 ///
-/// The underlying defect is **pre-existing and lives in the rebuild**: the INLINE seek
-/// (`RecordStoreGraph::index_seek_eq`) reads the same wiped tree with no gate and loses the row **today**
-/// — asserted below, so the open hazard is pinned rather than forgotten. This gate only guarantees the
-/// captured off-thread seek is never worse than the pre-#755 behaviour (which declined every seek and
-/// full-scanned, and so was accidentally immune). It sidesteps `rmp` #765; it does not close it.
+/// This gate began as *containment* for the then-open `rmp` #765, which lived on the INLINE seek. #765 is
+/// now closed by applying the same reader-vs-rebuild gate there too, and the assertion at the foot of
+/// this test — which pinned the row loss at `0` while the defect was open — now pins the row's SURVIVAL
+/// at `1`. The two gates are not redundant: they guard different sources (this one the **capture** handed
+/// to the off-thread reader, the inline one the **live tree**), and removing either re-opens #765 on that
+/// seam. Both express one invariant: a reader older than the last rebuild is never served from
+/// `node_props`.
 #[test]
 fn rebuild_gate_declines_the_capture_for_an_older_snapshot() {
     let mut coord = fresh_coord();
@@ -1504,14 +1506,408 @@ fn rebuild_gate_declines_the_capture_for_an_older_snapshot() {
         assert!(!ro.has_error());
     }
 
-    // THE OPEN HAZARD, pinned (`rmp` #765): the INLINE seek has no such gate. It reads the live wiped
-    // tree and LOSES the row for this same reader — today, before and independently of #755. When #765
-    // is fixed this assertion flips to `1` and must be updated together with the gate above.
+    // THE HAZARD, NOW CLOSED (`rmp` #765 — this assertion was `0` while the defect was open). The inline
+    // seek now applies the SAME reader-vs-rebuild gate (`RecordStoreGraph::index_seek_eq` declines when
+    // `snapshot.ts < rebuilt_trees_trustworthy_from`), so it too falls back to the exact scan and the
+    // committed row survives. Inline and off-thread now agree — via the same decline, at two seams.
     assert_eq!(
         run_plan(&coord, reader, &plan).len(),
-        0,
-        "rmp #765 (OPEN, pre-existing): the inline seek reads the rebuilt (wiped, newest-wins) tree and \
-         loses a committed row visible at this reader's snapshot. If this now returns 1, #765 has been \
-         fixed — revisit the containment gate in IndexSet::capture_node_property_eq."
+        1,
+        "rmp #765: the inline seek must DECLINE for a reader older than the rebuild and fall back to \
+         the exact scan, so the committed row visible at this reader's snapshot survives. A `0` here \
+         is the row loss #765 fixed."
+    );
+}
+
+/// **THE `rmp` #765 REGRESSION: an unrelated `CREATE INDEX` must not make a concurrent older-snapshot
+/// reader lose a committed row on the INLINE path.**
+///
+/// # The defect
+///
+/// `TxnCoordinator::rebuild_index` calls `IndexSet::clear()`, which swaps every node-property tree for
+/// an empty one while **keeping each index's state** (an `Online` index stays `Online` over an empty
+/// tree), then refills **newest-wins** — destroying every STALE entry. A reader whose snapshot predates
+/// the rebuild still legitimately resolves the node under its OLD value (node properties are
+/// MVCC-versioned per value, `rmp` #50: newest-VISIBLE-wins), so it needs exactly those destroyed
+/// entries. Both gates that guard a seek (`IndexState::Online` and `!degraded`) therefore pass over a
+/// tree that is a genuine SUBSET, and the per-candidate re-check can only REMOVE candidates — never
+/// resurrect a missing one. Result: 1 row → 0 rows, from a `CREATE INDEX` on an unrelated property.
+///
+/// # What this asserts
+///
+/// The reader's answer must be INVARIANT across the unrelated rebuild, and the inline path must agree
+/// with the off-thread reader (which reaches the same answer by declining to `scan_filter_eq`).
+/// Pre-fix this fails with `after = 0`.
+#[test]
+fn an_unrelated_rebuild_must_not_lose_a_committed_row_for_an_older_snapshot() {
+    let mut coord = fresh_coord();
+    run_write(&mut coord, "CREATE (:Person {email: 'a@x.io'})");
+    coord
+        .create_node_property_index("Person", "email")
+        .expect("create the (Person, email) index");
+
+    // The reader begins HERE: its snapshot sees `email = 'a@x.io'`.
+    let reader = coord.begin_serializable();
+
+    // A writer moves the node OFF the sought value and commits, leaving a STALE index entry behind.
+    // The reader's snapshot still resolves the node under the OLD value.
+    run_write(
+        &mut coord,
+        "MATCH (n:Person) WHERE n.email = 'a@x.io' SET n.email = 'zz@x.io'",
+    );
+
+    let plan = compile(
+        "MATCH (n:Person) WHERE n.email = 'a@x.io' RETURN n.email AS a",
+        &coord.catalog(),
+    );
+    // NON-VACUITY: this must really lower to a seek. Were it a scan, the test could never observe the
+    // defect (the scan is snapshot-correct) and would prove nothing.
+    assert!(
+        has_index_seek(&plan),
+        "non-vacuity: the reader's plan must lower to a NodeIndexSeek, else this test cannot \
+         observe the rebuild hazard at all:\n{plan}"
+    );
+
+    let before = run_plan(&coord, reader, &plan).len();
+    assert_eq!(
+        before, 1,
+        "baseline: before any rebuild the reader must see the row under its own snapshot (the \
+         stale index entry is still there). If this is 0 the test is vacuous."
+    );
+
+    // An index on a COMPLETELY UNRELATED property rebuilds EVERY node-property tree: clear() + a
+    // newest-wins refill destroys the stale ('a@x.io' -> n) entry, while the index stays Online and
+    // heal() clears `degraded`.
+    coord
+        .create_node_property_index("Person", "unrelated")
+        .expect("create the unrelated (Person, unrelated) index");
+
+    let after = run_plan(&coord, reader, &plan).len();
+    assert_eq!(
+        before, after,
+        "rmp #765 ROW LOSS: an unrelated CREATE INDEX rebuilt (wiped + newest-wins refilled) the \
+         node-property trees and destroyed the stale entry this reader's snapshot depends on, so \
+         the inline seek returned a SUBSET and silently dropped a COMMITTED row (before={before}, \
+         after={after}). The seek must DECLINE for a reader older than the rebuild and fall back \
+         to the exact scan."
+    );
+}
+
+/// `rmp` #765, the **relationship-property** tree: `rel_props` is stale-retaining
+/// (`insert_rel_property` is its only per-entry mutator) over MVCC-versioned relationship property
+/// values (they share `tombstone_props_for_key` + the prepend-and-filter chain with node properties),
+/// so a rebuild's newest-wins refill destroys the entry an older snapshot depends on, exactly as for
+/// `node_props`. Pre-fix this loses the row.
+#[test]
+fn an_unrelated_rebuild_must_not_lose_a_committed_rel_row_for_an_older_snapshot() {
+    let mut coord = fresh_coord();
+    run_write(
+        &mut coord,
+        "CREATE (:P {i: 1})-[:KNOWS {since: 1990}]->(:P {i: 2})",
+    );
+    coord
+        .create_rel_property_index_named(None, "KNOWS", "since", false)
+        .expect("create the (KNOWS, since) index");
+
+    let reader = coord.begin_serializable();
+
+    run_write(
+        &mut coord,
+        "MATCH ()-[r:KNOWS]->() WHERE r.since = 1990 SET r.since = 2020",
+    );
+
+    let src = "MATCH ()-[r:KNOWS]->() WHERE r.since = 1990 RETURN r.since AS a";
+    let plan = compile(src, &coord.catalog());
+    assert!(
+        plan.to_string().contains("RelIndexSeek"),
+        "non-vacuity: the reader's plan must lower to a RelIndexSeek, else this test cannot observe \
+         the rebuild hazard:\n{plan}"
+    );
+
+    let before = run_plan(&coord, reader, &plan).len();
+    assert_eq!(
+        before, 1,
+        "baseline: before the rebuild the reader sees the relationship under its own snapshot"
+    );
+
+    coord
+        .create_node_property_index("P", "unrelated")
+        .expect("create an unrelated index (rebuilds every tree)");
+
+    let after = run_plan(&coord, reader, &plan).len();
+    assert_eq!(
+        before, after,
+        "rmp #765 ROW LOSS (rel_props): an unrelated CREATE INDEX wiped + newest-wins refilled the \
+         relationship-property tree, destroying the stale entry this reader's snapshot depends on \
+         (before={before}, after={after})."
+    );
+}
+
+/// `rmp` #765, the **node composite** tree. Strictly worse than the single-property case: overwriting
+/// ANY ONE covered property destroys the entry for the whole old TUPLE, so a reader seeking
+/// `(a_old, b_old)` misses even though only `b` changed.
+#[test]
+fn an_unrelated_rebuild_must_not_lose_a_committed_composite_row_for_an_older_snapshot() {
+    let mut coord = fresh_coord();
+    run_write(&mut coord, "CREATE (:Person {a: 1, b: 2})");
+    coord
+        .begin_online_node_composite_index_named(
+            None,
+            "Person",
+            &["a".to_owned(), "b".to_owned()],
+            false,
+        )
+        .expect("create the (Person, [a, b]) composite index");
+
+    let reader = coord.begin_serializable();
+
+    // Change ONE covered property: the whole (1, 2) tuple entry becomes stale.
+    run_write(&mut coord, "MATCH (n:Person) WHERE n.a = 1 SET n.b = 99");
+
+    let src = "MATCH (n:Person) WHERE n.a = 1 AND n.b = 2 RETURN n.a AS a";
+    let plan = compile(src, &coord.catalog());
+    assert!(
+        plan.to_string().contains("NodeCompositeIndexSeek"),
+        "non-vacuity: the reader's plan must lower to a NodeCompositeIndexSeek:\n{plan}"
+    );
+
+    let before = run_plan(&coord, reader, &plan).len();
+    assert_eq!(
+        before, 1,
+        "baseline: before the rebuild the reader sees the (1, 2) tuple at its own snapshot"
+    );
+
+    coord
+        .create_node_property_index("Person", "unrelated")
+        .expect("create an unrelated index (rebuilds every tree)");
+
+    let after = run_plan(&coord, reader, &plan).len();
+    assert_eq!(
+        before, after,
+        "rmp #765 ROW LOSS (composite): an unrelated CREATE INDEX destroyed the stale tuple entry \
+         this reader's snapshot depends on (before={before}, after={after})."
+    );
+}
+
+/// `rmp` #765, the **relationship composite** tree — the rel twin of the composite case above.
+#[test]
+fn an_unrelated_rebuild_must_not_lose_a_committed_rel_composite_row_for_an_older_snapshot() {
+    let mut coord = fresh_coord();
+    run_write(
+        &mut coord,
+        "CREATE (:P {i: 1})-[:RATED {x: 1, y: 2}]->(:P {i: 2})",
+    );
+    coord
+        .begin_online_rel_composite_index_named(
+            None,
+            "RATED",
+            &["x".to_owned(), "y".to_owned()],
+            false,
+        )
+        .expect("create the (RATED, [x, y]) composite index");
+
+    let reader = coord.begin_serializable();
+
+    run_write(
+        &mut coord,
+        "MATCH ()-[r:RATED]->() WHERE r.x = 1 SET r.y = 99",
+    );
+
+    let src = "MATCH ()-[r:RATED]->() WHERE r.x = 1 AND r.y = 2 RETURN r.x AS a";
+    let plan = compile(src, &coord.catalog());
+    assert!(
+        plan.to_string().contains("RelCompositeIndexSeek"),
+        "non-vacuity: the reader's plan must lower to a RelCompositeIndexSeek:\n{plan}"
+    );
+
+    let before = run_plan(&coord, reader, &plan).len();
+    assert_eq!(
+        before, 1,
+        "baseline: before the rebuild the reader sees the (1, 2) rel tuple at its own snapshot"
+    );
+
+    coord
+        .create_node_property_index("P", "unrelated")
+        .expect("create an unrelated index (rebuilds every tree)");
+
+    let after = run_plan(&coord, reader, &plan).len();
+    assert_eq!(
+        before, after,
+        "rmp #765 ROW LOSS (rel_composite): an unrelated CREATE INDEX destroyed the stale rel tuple \
+         entry this reader's snapshot depends on (before={before}, after={after})."
+    );
+}
+
+/// `rmp` #765, the **node range** seek (`index_seek_range`). A range seek has no residual that could
+/// resurrect a missing row, so the destroyed stale entry is lost outright.
+#[test]
+fn an_unrelated_rebuild_must_not_lose_a_committed_range_row_for_an_older_snapshot() {
+    let mut coord = fresh_coord();
+    run_write(&mut coord, "CREATE (:Person {age: 30})");
+    coord
+        .create_node_property_index("Person", "age")
+        .expect("create the (Person, age) index");
+
+    let reader = coord.begin_serializable();
+
+    // Move the node BELOW the range's lower bound. The direction matters: `seek_node_property_range`
+    // widens an INCLUSIVE upper bound to unbounded-above, so a value moved UP would still be a candidate
+    // and the re-check would restore the row — the test would then pass at HEAD and prove nothing
+    // (verified: it did). Moving it DOWN puts it outside the widened range, so the rebuilt tree really
+    // cannot yield it and the seek must decline.
+    run_write(
+        &mut coord,
+        "MATCH (n:Person) WHERE n.age = 30 SET n.age = 5",
+    );
+
+    let src = "MATCH (n:Person) WHERE n.age > 25 AND n.age < 40 RETURN n.age AS a";
+    let plan = compile(src, &coord.catalog());
+    assert!(
+        has_index_range_seek(&plan),
+        "non-vacuity: the reader's plan must lower to a NodeIndexRangeSeek:\n{plan}"
+    );
+
+    let before = run_plan(&coord, reader, &plan).len();
+    assert_eq!(
+        before, 1,
+        "baseline: before the rebuild the reader sees age=30 at its own snapshot"
+    );
+
+    coord
+        .create_node_property_index("Person", "unrelated")
+        .expect("create an unrelated index (rebuilds every tree)");
+
+    let after = run_plan(&coord, reader, &plan).len();
+    assert_eq!(
+        before, after,
+        "rmp #765 ROW LOSS (node range): an unrelated CREATE INDEX destroyed the stale entry this \
+         reader's snapshot depends on (before={before}, after={after})."
+    );
+}
+
+/// `rmp` #765, the **relationship range** seek (`rel_index_seek_range`).
+#[test]
+fn an_unrelated_rebuild_must_not_lose_a_committed_rel_range_row_for_an_older_snapshot() {
+    let mut coord = fresh_coord();
+    run_write(
+        &mut coord,
+        "CREATE (:P {i: 1})-[:KNOWS {since: 1990}]->(:P {i: 2})",
+    );
+    coord
+        .create_rel_property_index_named(None, "KNOWS", "since", false)
+        .expect("create the (KNOWS, since) index");
+
+    let reader = coord.begin_serializable();
+
+    // BELOW the lower bound — see the node-range twin above for why the direction is load-bearing.
+    run_write(
+        &mut coord,
+        "MATCH ()-[r:KNOWS]->() WHERE r.since = 1990 SET r.since = 1900",
+    );
+
+    let src = "MATCH ()-[r:KNOWS]->() WHERE r.since > 1980 AND r.since < 2000 RETURN r.since AS a";
+    let plan = compile(src, &coord.catalog());
+    assert!(
+        plan.to_string().contains("RelIndexRangeSeek"),
+        "non-vacuity: the reader's plan must lower to a RelIndexRangeSeek:\n{plan}"
+    );
+
+    let before = run_plan(&coord, reader, &plan).len();
+    assert_eq!(
+        before, 1,
+        "baseline: before the rebuild the reader sees since=1990 at its own snapshot"
+    );
+
+    coord
+        .create_node_property_index("P", "unrelated")
+        .expect("create an unrelated index (rebuilds every tree)");
+
+    let after = run_plan(&coord, reader, &plan).len();
+    assert_eq!(
+        before, after,
+        "rmp #765 ROW LOSS (rel range): an unrelated CREATE INDEX destroyed the stale entry this \
+         reader's snapshot depends on (before={before}, after={after})."
+    );
+}
+
+/// `rmp` #765 on the **WRITE path**: an unrelated rebuild must not change a NODE KEY constraint's
+/// verdict for a writer whose snapshot predates it.
+///
+/// # Why this seam is the dangerous one
+///
+/// `composite_seek_eq` is reached from `node_key_tuple_conflict`, the duplicate-detector behind NODE
+/// KEY / composite uniqueness. If a rebuild leaves that seek a SUBSET, the detector finds no holder and
+/// the duplicate is **admitted** — committed corrupt data, not a slow query. The gate makes the seek
+/// decline for a pre-rebuild writer, which routes it to the exact label scan (`unwrap_or_else`).
+///
+/// # What is asserted (and what is deliberately NOT)
+///
+/// PARITY, not an absolute verdict: the same scenario is run twice — once with an unrelated
+/// `CREATE INDEX` interposed, once without — and the two verdicts must AGREE. This pins the invariant
+/// "a rebuild changes no answer" without this test having to decide what uniqueness-under-snapshot
+/// *should* rule, which is a semantics question in its own right. Pre-fix the two disagree.
+#[test]
+fn an_unrelated_rebuild_must_not_change_a_node_key_verdict_for_an_older_writer() {
+    // `run` performs the scenario, optionally interposing an unrelated rebuild, and reports whether the
+    // duplicate CREATE was REJECTED.
+    let run = |with_rebuild: bool| -> bool {
+        let mut coord = fresh_coord();
+        run_write(
+            &mut coord,
+            "CREATE (:Person {first: 'Ada', last: 'Lovelace'})",
+        );
+        coord
+            .create_constraint_general(
+                "person_key",
+                "Person",
+                &["first", "last"],
+                graphus_cypher::ConstraintKind::NodeKey,
+                None,
+            )
+            .expect("create node key over conforming data");
+
+        // The writer begins HERE: its snapshot sees the holder as ('Ada', 'Lovelace').
+        let writer = coord.begin_serializable();
+
+        // A committed change moves the holder OFF that tuple, leaving the ('Ada','Lovelace') entry
+        // stale — still the tuple the writer's snapshot sees.
+        run_write(
+            &mut coord,
+            "MATCH (n:Person) WHERE n.first = 'Ada' SET n.last = 'Byron'",
+        );
+
+        if with_rebuild {
+            coord
+                .create_node_property_index("Person", "unrelated")
+                .expect("create an unrelated index (rebuilds every tree)");
+        }
+
+        // The writer now tries to CREATE the very tuple its snapshot still sees held.
+        let plan = compile(
+            "CREATE (:Person {first: 'Ada', last: 'Lovelace'})",
+            &IndexCatalog::empty(),
+        );
+        let bound = bind_parameters(&plan, &Parameters::new()).expect("bind");
+        let captured = {
+            let mut graph = coord.statement(writer).expect("statement");
+            let mut cursor = execute(&plan, &bound, &mut graph).expect("open cursor");
+            let _ = cursor.collect_all().expect("collect");
+            drop(cursor);
+            graph.take_error()
+        };
+        let _ = coord.rollback(writer);
+        captured.is_some()
+    };
+
+    let without_rebuild = run(false);
+    let with_rebuild = run(true);
+
+    assert_eq!(
+        without_rebuild, with_rebuild,
+        "rmp #765 (write path): an unrelated CREATE INDEX changed the NODE KEY verdict for a writer \
+         whose snapshot predates it (rejected without rebuild = {without_rebuild}, with rebuild = \
+         {with_rebuild}). The rebuild wiped the composite tree and refilled it newest-wins, so the \
+         duplicate detector's seek became a SUBSET and stopped seeing the holder — admitting a \
+         duplicate. The seek must decline for a pre-rebuild writer and fall back to the exact scan."
     );
 }

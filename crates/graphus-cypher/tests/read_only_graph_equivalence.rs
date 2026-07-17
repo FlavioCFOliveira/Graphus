@@ -1020,7 +1020,7 @@ fn off_thread_index_seek_equals_inline_seek_and_scan_across_snapshots() {
 
     // The memo the engine thread would hand a reader at snapshot `ts` — captured at `W`, strictly after
     // the writer committed, for BOTH snapshots below. This fixture drives no rebuild, so the rebuild gate
-    // (`node_props_trustworthy_from`) sits at its `0` default and admits every reader — which is what
+    // (`rebuilt_trees_trustworthy_from`) sits at its `0` default and admits every reader — which is what
     // keeps this test about the MVCC re-check. The gate is pinned separately by
     // `rebuild_gate_declines_the_capture_for_an_older_snapshot` (tests/index_wiring.rs).
     let capture = |ts: graphus_core::Timestamp, v: &str| {

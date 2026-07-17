@@ -1090,12 +1090,44 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// This is the store-side analogue of [`RecordStoreGraph::reindex_node`], but it reads directly
     /// off the store (no MVCC snapshot) because the index is a **candidate** set: an entry for a
     /// version that is invisible to some future reader is harmless — every seek re-checks visibility,
-    /// the current label, and the current value. Inserting every in-use node's current state
-    /// therefore guarantees **no false negatives**.
+    /// the current label, and the current value, so a false POSITIVE is filtered out.
     ///
-    /// Errors reading any single node/label/property are skipped (best-effort): a missing candidate
-    /// only degrades that node to the full-scan fallback for that reader, never to a wrong row. The
-    /// store and the index are borrowed in separate, non-overlapping scopes.
+    /// # This guarantees no false negatives only for readers AT OR AFTER the rebuild (`rmp` #765)
+    ///
+    /// Inserting every in-use entity's **current** state is a genuine SUBSET for any snapshot OLDER than
+    /// the rebuild's high-water. The refill is newest-wins, so it does not reproduce the STALE entries
+    /// that [`IndexSet::clear`] just destroyed, and an older reader legitimately resolves an entity under
+    /// its OLD value (properties are MVCC-versioned newest-**visible**-wins, `rmp` #50). For such a
+    /// reader this rebuild MANUFACTURES false negatives, and the re-check cannot repair them: it only
+    /// ever REMOVES candidates, never resurrects a missing one.
+    ///
+    /// That is why the rebuild stamps [`IndexSet::note_trees_rebuilt`] with its high-water below: every
+    /// seek against the stale-retaining trees (`node_props`, `rel_props`, `composite`, `rel_composite`)
+    /// declines for a reader older than that stamp and falls back to the exact scan. Do NOT read the
+    /// "candidate set + re-check" argument as making this refill safe for all readers — it does not, and
+    /// believing it did is exactly how `rmp` #765 (committed-row loss) was introduced.
+    ///
+    /// # KNOWN OPEN DEFECT: this refill indexes UNCOMMITTED versions (reproduced, not yet fixed)
+    ///
+    /// "Current state" here means the newest **physical** version, NOT the newest committed one:
+    /// [`RecordStore::node_property_values`] / `rel_property_values` decode the raw chain with **no
+    /// visibility filter**, and the newest-wins loop below keeps the head. If a transaction is open with
+    /// an uncommitted write to a covered property when a rebuild runs, the refill indexes that
+    /// **dirty** value and, being newest-wins, drops the committed one — so a reader at or after the
+    /// stamped high-water (which the `rmp` #765 watermark deliberately SERVES) loses a committed row,
+    /// and it stays lost even if that writer later rolls back. Reproduced at the `TxnCoordinator` seam:
+    /// an open uncommitted `SET`, an unrelated `CREATE INDEX`, then a brand-new reader — the seek
+    /// returns 0 rows where the snapshot-correct scan returns 1.
+    ///
+    /// The `rmp` #765 watermark canNOT close this: its victims are precisely the readers the watermark
+    /// declares safe. Closing it is a change to how the refill CONSTRUCTS its image (index the newest
+    /// committed version, or index every live version in the chain), which is a design decision and is
+    /// tracked separately. Nothing below should be read as claiming this refill is a committed-state
+    /// image; it is not while any mutator is open.
+    ///
+    /// Errors reading any single node/label/property are skipped (best-effort) and recorded as a rebuild
+    /// gap, which fails the index closed (`rmp` #733) rather than leaving a hole a seek would read as
+    /// "no such row". The store and the index are borrowed in separate, non-overlapping scopes.
     ///
     /// A fault on a **whole scan** (nodes or relationships) is different in kind: the rebuild cannot be
     /// completed, and since [`IndexSet::clear`] has already dropped every entry, the indexes would be
@@ -1509,18 +1541,18 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // path — and discard the build's dirty flag so it does not leak into the next user statement.
         let high_water = store.borrow().snapshot_ts();
         index.borrow_mut().reset_ft_spatial_marker(high_water);
-        // The node-property twin of the marker above (`rmp` task #755, Slice S2 — containment of the
-        // pre-existing `rmp` #765). `clear()` above wiped every node-property tree and the refill is
-        // NEWEST-WINS, so the stale entries an older snapshot still depends on were destroyed, while the
-        // indexes stay `Online` and `heal()` clears `degraded`. Stamp the same high-water so a captured
-        // seek serves only a reader at-or-after it; an older reader declines to the exact scan.
+        // The append-only class's twin of the marker above (`rmp` tasks #755 / #765). `clear()` above
+        // wiped all four stale-retaining trees (`node_props`, `rel_props`, `composite`, `rel_composite`)
+        // and the refill is NEWEST-WINS, so the stale entries an older snapshot still depends on were
+        // destroyed, while the indexes stay `Online` and `heal()` clears `degraded`. Stamp the same
+        // high-water so a seek serves only a reader at-or-after it; an older reader declines to the exact
+        // scan. BOTH seams honour it: the captured off-thread seek
+        // ([`IndexSet::capture_node_property_eq`]) and every inline seek
+        // (`RecordStoreGraph::rebuilt_trees_serve_reader`).
         //
         // Every early return above is preceded by `fail_closed()` (degraded + all states `Populating`),
         // which the capture's gates 1/2 already refuse — so a failed rebuild needs no stamp.
-        //
-        // NOTE this stamp does NOT protect the INLINE seek, which reads the live wiped tree and still
-        // loses the row: that is `rmp` #765, open.
-        index.borrow_mut().note_node_props_rebuilt(high_water);
+        index.borrow_mut().note_trees_rebuilt(high_water);
         // The rebuild completed with no whole-scan fault and no per-entity gap: the index set is once
         // again a faithful image of the store, so a previous `fail_closed` is repaired (`rmp` task #733).
         // This is what lets a process self-heal from a *transient* storage fault instead of serving
@@ -1864,8 +1896,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
 
         // Resolve the node's current property values, keyed by prop-key, so the index borrow
         // below never overlaps a store borrow. `node_property_values` decodes the whole chain
-        // newest-first (`rmp` task #50); the first occurrence per key is the newest value. No MVCC
-        // snapshot is needed — the index is a candidate set and every seek re-checks visibility.
+        // newest-first (`rmp` task #50); the first occurrence per key is the newest value.
+        //
+        // NEWEST-WINS, and therefore a SUBSET for an older snapshot (`rmp` #765). Only the newest value
+        // is indexed, so the stale entries `clear()` destroyed are NOT restored. That is sound only
+        // because the caller stamps `note_trees_rebuilt`, which makes every seek decline for a reader
+        // older than this rebuild. (The old rationale here — "no MVCC snapshot is needed, the index is a
+        // candidate set and every seek re-checks visibility" — is a false-POSITIVE argument being applied
+        // to a false-NEGATIVE hazard: a re-check cannot resurrect a candidate that is not there.)
         let mut values: Vec<(u32, graphus_core::Value)> = Vec::new();
         {
             let chain = match store.borrow_mut().node_property_values(id) {
@@ -1977,7 +2015,11 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// index whose covered type it carries (`rmp` task #666) — the relationship analogue of
     /// [`index_one_node_composite`](Self::index_one_node_composite). Candidate-only: only the current
     /// tuple is inserted (a seek re-checks visibility, current type and current tuple), so no stale-entry
-    /// removal is needed. Store and index are borrowed in separate, non-overlapping scopes; a read fault
+    /// removal is needed — stale entries are false POSITIVES the re-check drops. The converse does NOT
+    /// follow: because only the current tuple is inserted, this refill cannot restore the stale entries
+    /// [`IndexSet::clear`] destroyed, which an OLDER snapshot needs (`rmp` #765) — hence the
+    /// [`IndexSet::note_trees_rebuilt`] stamp that makes such a reader decline to the exact scan.
+    /// Store and index are borrowed in separate, non-overlapping scopes; a read fault
     /// skips this relationship best-effort. A relationship missing a covered property (an incomplete
     /// tuple) is left unindexed for that key.
     fn index_one_rel_composite(

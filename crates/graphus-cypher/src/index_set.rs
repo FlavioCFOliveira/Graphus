@@ -402,24 +402,55 @@ pub struct IndexSet {
     /// stale `ONLINE`. Cleared by [`heal`](Self::heal), which a rebuild calls once it completes with no
     /// gap.
     degraded: bool,
-    /// The store snapshot timestamp from which the **node-property** trees are a faithful image of
-    /// committed state — i.e. the high-water stamped by the last [`clear`](Self::clear)-and-refill
-    /// rebuild (`rmp` task #755, Slice S2). A reader with `snapshot.ts >= node_props_trustworthy_from`
-    /// may be served from a captured seek; an **older** reader must decline to the exact scan.
+    /// The store snapshot timestamp from which the **stale-retaining candidate trees** are a faithful
+    /// image of committed state — i.e. the high-water stamped by the last [`clear`](Self::clear)-and-
+    /// refill rebuild (`rmp` tasks #755 / #765). A reader with
+    /// `snapshot.ts >= rebuilt_trees_trustworthy_from` may be served a seek; an **older** reader must
+    /// decline to the exact scan.
     ///
-    /// This is the node-property twin of [`ft_spatial_trustworthy_from`](Self#structfield.ft_spatial_trustworthy_from)
-    /// (`rmp` #467) and exists for the identical reason: a rebuild is **wholesale destructive** — it
-    /// wipes every tree and refills *newest-wins*, so the stale entries an older snapshot still depends
-    /// on are destroyed. `0` (the default) means "never rebuilt", where the trees are purely append-only
-    /// and every reader may be served.
+    /// # Which trees this covers, and why exactly these (`rmp` #765)
     ///
-    /// # CONTAINMENT, NOT A FIX (see `rmp` #765)
+    /// The four trees that are **stale-retaining** (insert-only per entry, so an overwritten value's OLD
+    /// entry survives) over **MVCC-versioned** values (`rmp` #50: newest-**visible**-wins, so an older
+    /// reader's visible value can BE that old one): `node_props`, `rel_props`, `composite`,
+    /// `rel_composite`. For these, and only these, a wholesale wipe + newest-wins refill destroys an
+    /// entry an older reader is genuinely entitled to, and the per-candidate re-check can only REMOVE
+    /// candidates, never resurrect a missing one. One watermark serves all four because
+    /// [`clear`](Self::clear) wipes them together and the rebuild stamps one high-water.
     ///
-    /// This gate stops the destroyed-stale-entry hazard from reaching the **captured off-thread seek**.
-    /// It does **not** close the hazard: the inline `RecordStoreGraph::index_seek_eq` seeks the live
-    /// (wiped) tree with no such gate and still loses the row — reproduced, and tracked as `rmp` #765.
-    /// This field sidesteps #765; it does not close it.
-    node_props_trustworthy_from: Timestamp,
+    /// The other trees `clear` empties need no gate, each for a positive reason. The common thread: they
+    /// are **destructive per entry** (a rewrite/remove drops the old entry as the write happens), so the
+    /// live tree already holds only current state and the newest-wins refill REPRODUCES it — the rebuild
+    /// destroys nothing a reader could still be owed.
+    /// * **full-text / spatial / text** — destructive per entry, and additionally gated by the
+    ///   poisonable [`ft_spatial_trustworthy_from`](Self#structfield.ft_spatial_trustworthy_from) marker
+    ///   (`rmp` #467/#756), which a plain watermark could not replace: a rolled-back remove/replace can
+    ///   strip a still-committed entity from a posting, so they need poisoning, not just an ordering.
+    /// * **`vector`** — destructive per entry (`VectorIndex` is id-keyed: an insert for an existing id
+    ///   REPLACES it, and `remove` drops it), so the refill reproduces the live graph exactly. NOTE it is
+    ///   gated only by `IndexState::Online` (`rmp` #733), NOT by the #467 marker — do not assume it is.
+    /// * **`labels`** — the one that is stale-RETAINING yet still safe, and the reason is subtle: label
+    ///   membership is **not** MVCC snapshot-isolated. The re-check (`store.node_has_label`) reads the
+    ///   node record's CURRENT inline bitmap (labels live in the record, not in a version chain), so any
+    ///   entry the refill drops is one the re-check would have rejected anyway. The rebuild changes no
+    ///   answer. **This safety is conditional on that (defective) semantics**: if label membership ever
+    ///   becomes versioned, `labels` joins the list above and needs this watermark.
+    /// * **`bitmap`** — membership-EXACT (maintained by remove-then-reinsert, `rmp` #453), so the refill
+    ///   reproduces exactly what the live bitmap already held. It also has no *planner* consumer (only
+    ///   `TxnCoordinator::bitmap_seek_eq` / `bitmap_conjunction`, a documented test/diagnostic surface),
+    ///   so no query path reaches it.
+    ///
+    /// `0` (the default) means "never rebuilt": the trees are then purely append-only and every reader
+    /// may be served.
+    ///
+    /// # Read by BOTH seams
+    ///
+    /// Every reader of these trees consults this watermark, at whichever seam it reads from:
+    /// [`capture_node_property_eq`](Self::capture_node_property_eq) declines to build a capture for the
+    /// off-thread `ReadOnlyGraph`, and `RecordStoreGraph`'s inline seeks decline against the live trees.
+    /// Both fall back to the exact scan. A seam that reads one of these trees without consulting this
+    /// field re-opens `rmp` #765 (committed-row loss) on that seam.
+    rebuilt_trees_trustworthy_from: Timestamp,
     /// Transient "a registered full-text/spatial posting changed during the current statement" flag,
     /// set by the structural mutation methods and consumed by
     /// [`note_ft_spatial_mutator`](Self::note_ft_spatial_mutator) (the statement seam, which knows the
@@ -651,7 +682,7 @@ impl IndexSet {
             fail_closed_events: 0,
             degraded: false,
             // Never rebuilt: the trees are purely append-only, so every reader may be served.
-            node_props_trustworthy_from: Timestamp::default(),
+            rebuilt_trees_trustworthy_from: Timestamp::default(),
             // A fresh, empty index reflects committed state at the genesis timestamp: there is nothing
             // indexed and no mutator in flight, so every reader may trust it (`ts >= 0` always holds).
             ft_spatial_trustworthy_from: Timestamp(0),
@@ -1852,12 +1883,21 @@ impl IndexSet {
     /// So gate 3 is the exact analogue of the #467 marker: serve only a reader at-or-after the rebuild's
     /// high-water; an older one declines to the scan, which is snapshot-correct.
     ///
-    /// **This gate is CONTAINMENT, not a fix — it sidesteps `rmp` #765; it does not close it.** The
-    /// underlying defect is in the rebuild itself and is **pre-existing**: the inline
-    /// `RecordStoreGraph::index_seek_eq` seeks the live wiped tree with no such gate and loses the row
-    /// today. This gate only guarantees that the off-thread captured seek is **never worse** than the
-    /// pre-#755 behaviour (which declined every seek and full-scanned, and so was accidentally immune).
-    /// Do not read it as evidence that the rebuild hazard is handled: it is open, and it is `rmp` #765.
+    /// # One invariant, two seams — this gate is load-bearing (`rmp` #765, closed)
+    ///
+    /// This gate began life as *containment*: it kept the then-open #765 off the captured off-thread
+    /// path while the inline path still lost the row. #765 is now **closed**, by applying the same gate
+    /// to the inline seek (`RecordStoreGraph::index_seek_eq` / `index_seek_range` decline when
+    /// `snapshot.ts < rebuilt_trees_trustworthy_from`). That does **not** make this gate redundant, and it
+    /// must not be removed: the two seams read **different sources**. The inline gate guards
+    /// `RecordStoreGraph` reading the **live tree**; this gate guards the off-thread `ReadOnlyGraph`,
+    /// which never touches the live tree and can only read the **capture** handed to it at dispatch. A
+    /// capture built for a pre-rebuild reader would be a subset no downstream gate could repair — the
+    /// off-thread reader's `index_seek_eq` would HIT with `Some(subset)` and silently drop the row.
+    ///
+    /// So both are enforcement points of a single invariant: **a reader older than the last rebuild is
+    /// never served from `node_props`** — it declines to the exact scan, which is snapshot-correct.
+    /// Removing either one re-opens #765 on that seam.
     #[must_use]
     pub fn capture_node_property_eq(
         &mut self,
@@ -1871,7 +1911,7 @@ impl IndexSet {
         }
         // GATE 3: a rebuild wiped the stale entries this reader may still depend on. Capture nothing;
         // the reader declines to the snapshot-correct scan. (`rmp` #755 containment of `rmp` #765.)
-        if reader_ts < self.node_props_trustworthy_from {
+        if reader_ts < self.rebuilt_trees_trustworthy_from {
             return capture;
         }
         for (label_token, prop_key, value) in requests {
@@ -3271,20 +3311,21 @@ impl IndexSet {
     /// older reader declines (conservative, correct). The in-flight set is **not** touched: a rebuild
     /// runs between commands with no open transaction, so it is empty; clearing it would be wrong if a
     /// mutator were somehow open.
-    /// Stamps the snapshot timestamp from which the node-property trees are a faithful image of
-    /// committed state, after a [`clear`](Self::clear)-and-refill rebuild (`rmp` task #755, Slice S2).
-    /// The node-property twin of [`reset_ft_spatial_marker`](Self::reset_ft_spatial_marker) (`rmp` #467),
-    /// called from the same place in `TxnCoordinator::rebuild_index` with the same high-water.
-    pub fn note_node_props_rebuilt(&mut self, ts: Timestamp) {
-        self.node_props_trustworthy_from = ts;
+    /// Stamps the snapshot timestamp from which the stale-retaining candidate trees (`node_props`,
+    /// `rel_props`, `composite`, `rel_composite`) are a faithful image of committed state, after a
+    /// [`clear`](Self::clear)-and-refill rebuild (`rmp` tasks #755 / #765). The append-only-class twin of
+    /// [`reset_ft_spatial_marker`](Self::reset_ft_spatial_marker) (`rmp` #467), called from the same
+    /// place in `TxnCoordinator::rebuild_index` with the same high-water.
+    pub fn note_trees_rebuilt(&mut self, ts: Timestamp) {
+        self.rebuilt_trees_trustworthy_from = ts;
     }
 
-    /// The snapshot timestamp from which a captured node-property seek may be trusted; a reader older
-    /// than this must decline to the exact scan (`rmp` task #755, Slice S2). See
-    /// [`node_props_trustworthy_from`](Self#structfield.node_props_trustworthy_from).
+    /// The snapshot timestamp from which a seek against the stale-retaining candidate trees may be
+    /// trusted; a reader older than this must decline to the exact scan (`rmp` tasks #755 / #765). See
+    /// [`rebuilt_trees_trustworthy_from`](Self#structfield.rebuilt_trees_trustworthy_from).
     #[must_use]
-    pub fn node_props_trustworthy_from(&self) -> Timestamp {
-        self.node_props_trustworthy_from
+    pub fn rebuilt_trees_trustworthy_from(&self) -> Timestamp {
+        self.rebuilt_trees_trustworthy_from
     }
 
     pub fn reset_ft_spatial_marker(&mut self, ts: Timestamp) {
