@@ -43,7 +43,160 @@ use std::rc::Rc;
 
 use graphus_core::Value;
 use graphus_core::error::{GraphusError, Result};
-use graphus_core::{Lsn, Timestamp, TxnId};
+use graphus_core::{Lsn, Timestamp, TxnId, VersionStamp};
+
+/// One version of one property, as the index build sees it: the MVCC stamps plus the decoded value
+/// (`rmp` task #766). `RecordStore::node_property_values` / `rel_property_values` discard the stamps,
+/// so the composite builds read `node_properties` / `rel_properties` and keep them.
+struct PropVersion {
+    /// The creating transaction's stamp (`MvccHeader::created_ts`), raw.
+    xmin: u64,
+    /// The expiring transaction's stamp (`MvccHeader::expired_ts`), raw; `0` = live.
+    xmax: u64,
+    value: Value,
+}
+
+/// Whether `v` is visible from the *view* `(writer, t)`: a reader at snapshot `t` which — when `writer`
+/// is `Some(w)` — is `w` itself and so also sees `w`'s own uncommitted writes.
+///
+/// This is exactly [`graphus_txn::is_visible`] against a synthetic snapshot, and it MUST be: stamps are
+/// settled LAZILY, so a long-committed version can still carry `InFlight(w)` and only the registry knows
+/// it committed. Deciding visibility from the raw stamp alone (treating every `InFlight` as visible only
+/// to its own writer) partitions a node's versions into disjoint per-writer views, and a tuple mixing
+/// one writer's committed value with another's is then emitted by NO view — a missing candidate, i.e.
+/// exactly the false negative this construction exists to prevent. `TxnId(0)` is never minted
+/// (`begin_inner` pre-increments), so it is a safe "no own writes" owner for the committed view.
+fn version_visible_from(
+    v: &PropVersion,
+    writer: Option<TxnId>,
+    t: Timestamp,
+    registry: &CommitRegistry,
+) -> bool {
+    graphus_txn::is_visible(
+        Snapshot {
+            owner: writer.unwrap_or(TxnId(0)),
+            ts: t,
+        },
+        v.xmin,
+        v.xmax,
+        registry,
+    )
+}
+
+/// Every composite tuple any reader can observe for one entity, given `per_key[i]` = the chain of
+/// versions of the i-th covered property, newest first (`rmp` task #766).
+///
+/// # Why this shape, and why it is a complete superset
+///
+/// A reader never mixes versions freely: at snapshot `T` it resolves the newest version of EACH key
+/// visible at that ONE `T`. So the only observable tuples are the *per-instant* tuples, and the tuple
+/// can only change where some version becomes visible or expires — i.e. at a stamp in the chain. The
+/// instants below are therefore the distinct committed stamps (plus `0`, the before-anything instant).
+///
+/// An in-flight writer is the exception, and the reason this is not simply "one tuple per timestamp":
+/// it sees its OWN uncommitted writes, which carry no commit timestamp. Its tuple is (its own newest
+/// version where it wrote, else newest committed at ITS snapshot `S`) — a tuple no committed instant
+/// emits. Each in-flight writer therefore gets its own view. Its `S` is unknown here, so the view is
+/// evaluated at EVERY committed instant: for `T` = the largest instant `<= S`, "newest committed `<= T`"
+/// is exactly "newest committed `<= S`", so the writer's real tuple is always among those emitted. That
+/// over-approximation is sound precisely because a superset is safe — extra tuples are false positives
+/// the seek's re-check drops, whereas a MISSING tuple is unfixable: a re-check can remove a candidate
+/// but never resurrect one, and for the NODE KEY / REL KEY trees a missing candidate means the write
+/// path's duplicate check finds nothing and ADMITS A COMMITTED DUPLICATE (`rmp` #683 / #765).
+///
+/// # Complexity — two different bounds, do not conflate them (measured, `rmp` task #766)
+///
+/// - **Emitted tuples** (what bounds INDEX SIZE): `O((1 + W) * V)`, where `V` is the number of distinct
+///   instants and `W` the in-flight writers. Linear.
+/// - **Construction cost** (what bounds DDL TIME): `O((1 + W) * k * V^2)`. The `V^2` is real: the loop
+///   below is `views x instants x keys x find`, and the `find` is a LINEAR scan of that key's chain.
+///   `out.contains` adds a second quadratic term in the emitted count.
+///
+/// Measured on one node under a 3-key NODE KEY (debug build), rebuild wall time vs the newest-wins
+/// baseline — the quadratic is invisible below V~64 because fixed cost dominates, and unmistakable above:
+///
+/// | V    | newest-wins | this construction |
+/// |------|-------------|-------------------|
+/// | 8    | 1.02 ms     | 1.35 ms           |
+/// | 64   | 1.38 ms     | 4.25 ms           |
+/// | 256  | 2.36 ms     | 27.03 ms          |
+/// | 1024 | 5.52 ms     | 249.02 ms  (45x)  |
+///
+/// This is an accepted, RECORDED residual (`rmp` #774), not a bound anyone should rely on: chains are
+/// NOT pruned in practice — `RecordStore::gc` has no production trigger (`rmp` #305 owns scheduling) —
+/// so `V` on a hot node is limited by nothing and every index/constraint DDL pays this per node. The
+/// linear-time shape is a merge-style sweep over the per-key chains in stamp order (the instants are
+/// monotone, so each key's cursor only ever advances), giving `O(k * V)`; it is deferred only because it
+/// must not risk the correctness property this function exists to hold.
+///
+/// It is nonetheless the affordable choice available: the cartesian product across the per-key version
+/// lists is `O((V+1)^k)` — 269.9 ms at V=16 where this takes 1.41 ms — and emits combinations no reader
+/// can ever observe (a value of `k1` from one instant with a value of `k2` from another).
+fn composite_candidate_tuples(
+    per_key: &[Vec<&PropVersion>],
+    registry: &CommitRegistry,
+) -> Vec<Vec<Value>> {
+    let mut instants: Vec<Timestamp> = vec![Timestamp(0)];
+    let mut writers: Vec<TxnId> = Vec::new();
+    for versions in per_key {
+        for v in versions {
+            for raw in [v.xmin, v.xmax] {
+                // Resolve through the registry, never from the raw word: a lazily-stamped version still
+                // reads `InFlight(w)` long after `w` committed, and its real commit instant is only
+                // knowable here. `resolve_commit_ts` returns `Some(ts)` for a settled OR lazily-stamped
+                // committed writer, and `None` for one that is genuinely still in flight (or aborted).
+                match registry.resolve_commit_ts(raw) {
+                    Some(ts) => {
+                        if !instants.contains(&ts) {
+                            instants.push(ts);
+                        }
+                    }
+                    None => {
+                        if let VersionStamp::InFlight(w) = VersionStamp::from_raw(raw)
+                            && !writers.contains(&w)
+                        {
+                            writers.push(w);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // The committed timeline, then one view per in-flight writer.
+    let mut views: Vec<Option<TxnId>> = Vec::with_capacity(1 + writers.len());
+    views.push(None);
+    views.extend(writers.into_iter().map(Some));
+
+    let mut out: Vec<Vec<Value>> = Vec::new();
+    for writer in views {
+        for &t in &instants {
+            let mut tuple = Vec::with_capacity(per_key.len());
+            let mut complete = true;
+            for versions in per_key {
+                // Newest-visible-wins within this one view — exactly what a reader at this view does.
+                // A covered property that is absent or NULL from this view makes the tuple incomplete,
+                // so the entity is not a uniqueness candidate at that view (matching Cypher's treatment
+                // of NULL in an index key) and contributes nothing.
+                match versions
+                    .iter()
+                    .find(|v| version_visible_from(v, writer, t, registry))
+                    .map(|v| &v.value)
+                    .filter(|v| !v.is_null())
+                {
+                    Some(value) => tuple.push(value.clone()),
+                    None => {
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+            if complete && !out.contains(&tuple) {
+                out.push(tuple);
+            }
+        }
+    }
+    out
+}
 use graphus_index::fulltext::Analyzer;
 use graphus_index::histogram::PropertyHistogram;
 use graphus_index::{Similarity, VectorIndexError};
@@ -1088,42 +1241,46 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// *adds* the durable set, and [`IndexSet::register_node_property_with_state`] is idempotent.
     ///
     /// This is the store-side analogue of [`RecordStoreGraph::reindex_node`], but it reads directly
-    /// off the store (no MVCC snapshot) because the index is a **candidate** set: an entry for a
-    /// version that is invisible to some future reader is harmless — every seek re-checks visibility,
-    /// the current label, and the current value, so a false POSITIVE is filtered out.
+    /// off the store (no MVCC snapshot). That is sound only because the trees it fills are **candidate**
+    /// sets whose consumers re-check every hit against their own snapshot: an entry for a version some
+    /// reader cannot see is a false POSITIVE the re-check filters out.
     ///
-    /// # This guarantees no false negatives only for readers AT OR AFTER the rebuild (`rmp` #765)
+    /// # The governing asymmetry: a superset is safe, a subset is not
     ///
-    /// Inserting every in-use entity's **current** state is a genuine SUBSET for any snapshot OLDER than
-    /// the rebuild's high-water. The refill is newest-wins, so it does not reproduce the STALE entries
-    /// that [`IndexSet::clear`] just destroyed, and an older reader legitimately resolves an entity under
-    /// its OLD value (properties are MVCC-versioned newest-**visible**-wins, `rmp` #50). For such a
-    /// reader this rebuild MANUFACTURES false negatives, and the re-check cannot repair them: it only
-    /// ever REMOVES candidates, never resurrects a missing one.
+    /// A re-check can REMOVE a candidate; it can never RESURRECT one. So this refill must produce a
+    /// candidate **SUPERSET** of what every reader could resolve. Anything less is unfixable downstream:
+    /// a missing entry is a committed row silently lost to every seek, and for the trees backing NODE KEY
+    /// / REL KEY it also makes the write path's duplicate check find nothing and ADMIT A COMMITTED
+    /// DUPLICATE (`rmp` #683 / #765).
     ///
-    /// That is why the rebuild stamps [`IndexSet::note_trees_rebuilt`] with its high-water below: every
-    /// seek against the stale-retaining trees (`node_props`, `rel_props`, `composite`, `rel_composite`)
-    /// declines for a reader older than that stamp and falls back to the exact scan. Do NOT read the
-    /// "candidate set + re-check" argument as making this refill safe for all readers — it does not, and
-    /// believing it did is exactly how `rmp` #765 (committed-row loss) was introduced.
+    /// The refill therefore indexes **every version in each chain**, not the newest one (`rmp` task
+    /// #766). Newest-wins produced a subset and lost committed rows two ways, both reproduced and pinned
+    /// by `tests/index_rebuild_uncommitted.rs`:
     ///
-    /// # KNOWN OPEN DEFECT: this refill indexes UNCOMMITTED versions (reproduced, not yet fixed)
+    /// - the newest version may be **UNCOMMITTED**, so the committed value was indexed nowhere and a
+    ///   FRESH reader — the reader the `rmp` #765 watermark deliberately SERVES — sought it and got
+    ///   nothing, permanently, even after that writer rolled back;
+    /// - the versions an OLDER snapshot resolves were dropped, which is the `rmp` #765 defect.
     ///
-    /// "Current state" here means the newest **physical** version, NOT the newest committed one:
-    /// [`RecordStore::node_property_values`] / `rel_property_values` decode the raw chain with **no
-    /// visibility filter**, and the newest-wins loop below keeps the head. If a transaction is open with
-    /// an uncommitted write to a covered property when a rebuild runs, the refill indexes that
-    /// **dirty** value and, being newest-wins, drops the committed one — so a reader at or after the
-    /// stamped high-water (which the `rmp` #765 watermark deliberately SERVES) loses a committed row,
-    /// and it stays lost even if that writer later rolls back. Reproduced at the `TxnCoordinator` seam:
-    /// an open uncommitted `SET`, an unrelated `CREATE INDEX`, then a brand-new reader — the seek
-    /// returns 0 rows where the snapshot-correct scan returns 1.
+    /// Reading the newest **committed** version instead was implemented and measured, and only moves the
+    /// victim: the in-flight writer's own value would be missing, and `commit` does not re-insert index
+    /// entries (they are made eagerly at write time and [`IndexSet::clear`] destroyed them), so that row
+    /// stays lost once the writer commits. Only the every-version image serves both readers.
     ///
-    /// The `rmp` #765 watermark canNOT close this: its victims are precisely the readers the watermark
-    /// declares safe. Closing it is a change to how the refill CONSTRUCTS its image (index the newest
-    /// committed version, or index every live version in the chain), which is a design decision and is
-    /// tracked separately. Nothing below should be read as claiming this refill is a committed-state
-    /// image; it is not while any mutator is open.
+    /// The composite trees cannot simply index every version independently — a tuple must be internally
+    /// consistent — so they index one tuple per observable **view**; see [`composite_candidate_tuples`].
+    ///
+    /// # Where the superset argument does NOT apply
+    ///
+    /// It holds only where the consumer re-checks the predicate. It does **not** hold for the full-text
+    /// trees: [`RecordStoreGraph::fulltext_query`] re-checks a candidate's visibility and current label
+    /// and nothing else, so a stale version's terms would be returned as a WRONG ROW rather than filtered.
+    /// Those helpers stay newest-wins deliberately; their residual window is `rmp` #773. The
+    /// single-value-per-entity trees (spatial's `node -> (cell, point)`, vector's one embedding per
+    /// entity) cannot represent a superset at all.
+    ///
+    /// The rebuild still stamps [`IndexSet::note_trees_rebuilt`] with its high-water below, as a
+    /// conservative `rmp` #765 safety net.
     ///
     /// Errors reading any single node/label/property are skipped (best-effort) and recorded as a rebuild
     /// gap, which fails the index closed (`rmp` #733) rather than leaving a hole a seek would read as
@@ -1806,9 +1963,11 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         id: u64,
         registered: &[(u32, Vec<u32>)],
     ) {
-        // The node's current label tokens + its property values, read in one store-borrow scope.
-        // Read-only: `node_labels` / `node_property_values` are `&self` (`rmp` #337 Slice 2).
-        let (label_tokens, props): (Vec<u32>, Vec<(u32, Value)>) = {
+        // The node's label tokens + EVERY version of its properties (with MVCC stamps), read in one
+        // store-borrow scope. Read-only: `node_labels` / `node_properties` are `&self` (`rmp` #337
+        // Slice 2). `node_properties` is used rather than `node_property_values` because the latter
+        // strips the stamps, and the per-view tuple construction below needs them (`rmp` task #766).
+        let (label_tokens, props, registry): (Vec<u32>, Vec<(u32, PropVersion)>, CommitRegistry) = {
             let store = store.borrow();
             let labels = match store.node_labels(id) {
                 Ok(l) => l,
@@ -1820,11 +1979,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     return;
                 }
             };
-            let props = match store.node_property_values(id) {
-                Ok(chain) => chain
-                    .into_iter()
-                    .map(|(_pid, key, value)| (key, value))
-                    .collect(),
+            let chain = match store.node_properties(id) {
+                Ok(chain) => chain,
                 Err(_) => {
                     // `rmp` task #733: record the gap instead of hiding it — an entity missing from
                     // the index is a candidate a seek can never resurrect, so the build that drove
@@ -1833,7 +1989,26 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     return;
                 }
             };
-            (labels, props)
+            let mut props: Vec<(u32, PropVersion)> = Vec::with_capacity(chain.len());
+            for (_pid, prop) in chain {
+                match store.decode_property_value(prop.type_tag, prop.value_inline) {
+                    Ok(value) => props.push((
+                        prop.key,
+                        PropVersion {
+                            xmin: prop.mvcc.created_ts,
+                            xmax: prop.mvcc.expired_ts,
+                            value,
+                        },
+                    )),
+                    Err(_) => {
+                        // `rmp` task #733: an undecodable version is a gap, not something to skip.
+                        Self::note_rebuild_gap(index);
+                        return;
+                    }
+                }
+            }
+            // The registry resolves lazily-stamped commits (see `version_visible_from`).
+            (labels, props, store.commit_registry().clone())
         };
 
         let mut idx = index.borrow_mut();
@@ -1841,26 +2016,32 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             if !label_tokens.contains(label_token) {
                 continue; // node does not carry this composite index's label
             }
-            // Build the tuple newest-wins; bail on the first absent/null covered property (the tuple is
-            // incomplete, so the node is not a uniqueness candidate and is left unindexed for this key).
-            let mut tuple = Vec::with_capacity(property_tokens.len());
-            let mut complete = true;
+            // Every version chain of each covered property, newest first. A covered property with no
+            // version at all can never form a tuple from any view, so the node is left unindexed here.
+            let mut per_key: Vec<Vec<&PropVersion>> = Vec::with_capacity(property_tokens.len());
+            let mut any_version = true;
             for prop_key in property_tokens {
-                match props
+                let versions: Vec<&PropVersion> = props
                     .iter()
-                    .find(|(k, _)| k == prop_key)
+                    .filter(|(k, _)| k == prop_key)
                     .map(|(_, v)| v)
-                    .filter(|v| !v.is_null())
-                {
-                    Some(v) => tuple.push(v.clone()),
-                    None => {
-                        complete = false;
-                        break;
-                    }
+                    .collect();
+                if versions.is_empty() {
+                    any_version = false;
+                    break;
                 }
+                per_key.push(versions);
             }
-            if complete {
-                idx.insert_composite(*label_token, property_tokens, &tuple, id);
+            if any_version {
+                // One tuple per observable VIEW (`rmp` task #766) — see `composite_candidate_tuples`
+                // for why that is a complete superset, and why the in-flight writers need their own
+                // views. Collapsing to the single newest version of each key indexed ONE tuple, a false
+                // negative for every reader resolving a different one; because this tree backs NODE KEY,
+                // that missing candidate makes the write path's duplicate check ADMIT A COMMITTED
+                // DUPLICATE (`rmp` #765 / #683).
+                for tuple in composite_candidate_tuples(&per_key, &registry) {
+                    idx.insert_composite(*label_token, property_tokens, &tuple, id);
+                }
             }
         }
     }
@@ -1894,16 +2075,29 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             }
         };
 
-        // Resolve the node's current property values, keyed by prop-key, so the index borrow
-        // below never overlaps a store borrow. `node_property_values` decodes the whole chain
-        // newest-first (`rmp` task #50); the first occurrence per key is the newest value.
+        // Resolve the node's property values, keyed by prop-key, so the index borrow below never
+        // overlaps a store borrow. `node_property_values` decodes the whole chain newest-first
+        // (`rmp` task #50): it holds EVERY not-yet-GC'd version of every key — the live one, the
+        // versions an older snapshot still reads, and any still-uncommitted write.
         //
-        // NEWEST-WINS, and therefore a SUBSET for an older snapshot (`rmp` #765). Only the newest value
-        // is indexed, so the stale entries `clear()` destroyed are NOT restored. That is sound only
-        // because the caller stamps `note_trees_rebuilt`, which makes every seek decline for a reader
-        // older than this rebuild. (The old rationale here — "no MVCC snapshot is needed, the index is a
-        // candidate set and every seek re-checks visibility" — is a false-POSITIVE argument being applied
-        // to a false-NEGATIVE hazard: a re-check cannot resurrect a candidate that is not there.)
+        // # Index EVERY version, never just the newest (`rmp` task #766)
+        //
+        // This loop indexes **one entry per version**, with no newest-wins collapse and no visibility
+        // filter. That is what makes the refill a candidate **SUPERSET**, which is the only image this
+        // index may hold, because of the asymmetry stated above: a seek's re-check can REMOVE a
+        // candidate, never RESURRECT one. An extra entry (an uncommitted, stale, or aborted version) is
+        // a false POSITIVE the re-check drops; a missing entry is a committed row silently lost.
+        //
+        // Newest-wins produced a SUBSET, and lost committed rows two ways (both reproduced, and pinned
+        // by `tests/index_rebuild_uncommitted.rs`):
+        //   - the newest version may be UNCOMMITTED, so the committed value was never indexed at all
+        //     and a FRESH reader — precisely the reader the `rmp` #765 watermark declares safe — sought
+        //     it and got nothing;
+        //   - the versions an OLDER snapshot resolves were dropped, which is the `rmp` #765 defect.
+        // Reading the newest *committed* version instead only moves the victim: the in-flight writer's
+        // own value would then be missing, and `commit` does not re-insert index entries (they are made
+        // eagerly at write time), so that row stays lost once the writer commits. Indexing every version
+        // is the only image that serves both readers.
         let mut values: Vec<(u32, graphus_core::Value)> = Vec::new();
         {
             let chain = match store.borrow_mut().node_property_values(id) {
@@ -1918,11 +2112,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 }
             };
             for (_pid, key, value) in chain {
-                // Newest-wins: keep only the first occurrence of each key.
-                if values.iter().any(|(k, _)| *k == key) {
-                    continue;
-                }
-                // Only keep keys that a registered index over one of this node's labels uses.
+                // Only keep keys that a registered index over one of this node's labels uses. NOTE: no
+                // dedup by key — every version of a used key is indexed (`rmp` task #766).
                 let used = registered.iter().any(|&(reg_label, prop_key)| {
                     prop_key == key && label_tokens.contains(&reg_label)
                 });
@@ -1977,8 +2168,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             return;
         }
 
-        // Resolve the relationship's current property values (newest-wins per key), keeping only the
-        // keys a registered index over this relationship's type uses.
+        // Resolve the relationship's property values, keeping only the keys a registered index over this
+        // relationship's type uses. Like the node path, this indexes **every version** in the chain with
+        // no newest-wins collapse (`rmp` task #766): the tree must be a candidate SUPERSET, because a
+        // seek's re-check can remove a candidate but never resurrect one. Collapsing to the newest
+        // version dropped the committed value whenever the head was an uncommitted write — and this tree
+        // backs relationship uniqueness / REL KEY enforcement, where a missing candidate is not merely a
+        // lost row but an ADMITTED COMMITTED DUPLICATE (the `rmp` #683 / #765 failure mode).
         let mut values: Vec<(u32, graphus_core::Value)> = Vec::new();
         {
             let chain = match store.borrow().rel_property_values(id) {
@@ -1993,9 +2189,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 }
             };
             for (_pid, key, value) in chain {
-                if values.iter().any(|(k, _)| *k == key) {
-                    continue; // newest-wins: keep only the first (head-most) occurrence per key.
-                }
+                // No dedup by key: every version of a used key is indexed (`rmp` task #766).
                 let used = registered
                     .iter()
                     .any(|&(reg_type, prop_key)| reg_type == type_token && prop_key == key);
@@ -2047,9 +2241,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         {
             return;
         }
-        // Resolve the relationship's current property values (newest-wins per key).
-        let props: Vec<(u32, Value)> = {
-            let chain = match store.borrow().rel_property_values(id) {
+        // EVERY version of the relationship's properties, with MVCC stamps (`rmp` task #766):
+        // `rel_properties` rather than `rel_property_values`, which strips the stamps the per-view
+        // tuple construction needs.
+        let (props, registry): (Vec<(u32, PropVersion)>, CommitRegistry) = {
+            let store = store.borrow();
+            let chain = match store.rel_properties(id) {
                 Ok(chain) => chain,
                 Err(_) => {
                     // a non-storable / read fault: skip this relationship's properties.
@@ -2060,14 +2257,26 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     return;
                 }
             };
-            let mut out: Vec<(u32, Value)> = Vec::new();
-            for (_pid, key, value) in chain {
-                if out.iter().any(|(k, _)| *k == key) {
-                    continue; // newest-wins: keep only the first (head-most) occurrence per key.
+            let mut out: Vec<(u32, PropVersion)> = Vec::with_capacity(chain.len());
+            for (_pid, prop) in chain {
+                match store.decode_property_value(prop.type_tag, prop.value_inline) {
+                    Ok(value) => out.push((
+                        prop.key,
+                        PropVersion {
+                            xmin: prop.mvcc.created_ts,
+                            xmax: prop.mvcc.expired_ts,
+                            value,
+                        },
+                    )),
+                    Err(_) => {
+                        // `rmp` task #733: an undecodable version is a gap, not something to skip.
+                        Self::note_rebuild_gap(index);
+                        return;
+                    }
                 }
-                out.push((key, value));
             }
-            out
+            // The registry resolves lazily-stamped commits (see `version_visible_from`).
+            (out, store.commit_registry().clone())
         };
 
         let mut idx = index.borrow_mut();
@@ -2075,26 +2284,28 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             if *reg_type != type_token {
                 continue; // relationship does not carry this composite index's type
             }
-            // Build the tuple newest-wins; bail on the first absent/null covered property (the tuple is
-            // incomplete, so the relationship is left unindexed for this key).
-            let mut tuple = Vec::with_capacity(property_tokens.len());
-            let mut complete = true;
+            // Every version chain of each covered property, newest first; a covered property with no
+            // version at all can form no tuple from any view.
+            let mut per_key: Vec<Vec<&PropVersion>> = Vec::with_capacity(property_tokens.len());
+            let mut any_version = true;
             for prop_key in property_tokens {
-                match props
+                let versions: Vec<&PropVersion> = props
                     .iter()
-                    .find(|(k, _)| k == prop_key)
+                    .filter(|(k, _)| k == prop_key)
                     .map(|(_, v)| v)
-                    .filter(|v| !v.is_null())
-                {
-                    Some(v) => tuple.push(v.clone()),
-                    None => {
-                        complete = false;
-                        break;
-                    }
+                    .collect();
+                if versions.is_empty() {
+                    any_version = false;
+                    break;
                 }
+                per_key.push(versions);
             }
-            if complete {
-                idx.insert_rel_composite(type_token, property_tokens, &tuple, id);
+            if any_version {
+                // One tuple per observable view — the construction of `composite_candidate_tuples`,
+                // applied to the relationship tree (`rmp` task #766).
+                for tuple in composite_candidate_tuples(&per_key, &registry) {
+                    idx.insert_rel_composite(type_token, property_tokens, &tuple, id);
+                }
             }
         }
     }
@@ -2540,8 +2751,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 return;
             }
         };
-        // The node's current property values, keyed by prop-key (newest-wins per key), keeping only
-        // the keys a registered bitmap index covers for one of this node's labels.
+        // The node's property values, keeping only the keys a registered bitmap index covers for one of
+        // this node's labels. Every version in the chain is indexed, with no newest-wins collapse
+        // (`rmp` task #766): a value-bitmap is a candidate set re-checked against the store, so an extra
+        // membership is a false positive the re-check drops, while a collapsed-away committed value is a
+        // silently lost row. A node legitimately appears in several value-bitmaps of the same key while
+        // more than one of its versions is live.
         let mut values: Vec<(u32, Value)> = Vec::new();
         {
             let chain = match store.borrow_mut().node_property_values(id) {
@@ -2555,9 +2770,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 }
             };
             for (_pid, key, value) in chain {
-                if values.iter().any(|(k, _)| *k == key) {
-                    continue; // newest-wins: keep only the first occurrence of each key.
-                }
+                // No dedup by key: every version of a used key is indexed (`rmp` task #766).
                 let used = registered.iter().any(|&(reg_label, prop_key)| {
                     prop_key == key && label_tokens.contains(&reg_label)
                 });

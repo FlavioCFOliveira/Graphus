@@ -2046,6 +2046,16 @@ impl IndexSet {
                 continue;
             }
             // Gather the covered text in the index's declared property order, then analyze it.
+            //
+            // EXACTLY ONE value per covered key contributes — the caller's newest. This must NOT become
+            // a union over several values of the same key (`rmp` task #766 tried it, `rmp` task #773
+            // tracks the residue): unlike the property trees, the full-text consumer canNOT re-check the
+            // predicate. `RecordStoreGraph::fulltext_query` re-checks a candidate's VISIBILITY and
+            // CURRENT LABEL (`filter_any_label_candidates`) and nothing else, so every term in a node's
+            // document is taken as the node's current text. Indexing a stale or uncommitted version's
+            // terms therefore does not add a re-checkable false positive — it returns a WRONG ROW
+            // (measured: `queryNodes('quantum')` matching a node whose title is now 'classical
+            // mechanics'). The candidate-superset argument is only sound where the consumer re-checks.
             let analyzer = ft.analyzer;
             let prop_keys = ft.prop_keys.clone();
             let mut terms: Vec<String> = Vec::new();
@@ -2257,6 +2267,9 @@ impl IndexSet {
                 }
                 continue;
             }
+            // Exactly one value per covered key — the no-union rule of `reindex_fulltext_node`, for the
+            // same reason: the relationship full-text consumer re-checks visibility and current type,
+            // never the terms (`rmp` tasks #766 / #773).
             let analyzer = ft.analyzer;
             let prop_keys = ft.prop_keys.clone();
             let mut terms: Vec<String> = Vec::new();
