@@ -374,17 +374,18 @@ fn fulltext_online_does_not_match_a_superseded_version() {
     );
 }
 
-/// The composite refill must not regress to the CARTESIAN PRODUCT (`rmp` task #766).
+/// The composite refill must not regress to the CARTESIAN PRODUCT (`rmp` tasks #766 / #774).
 ///
 /// What this gate does and does not catch, stated plainly so nobody mistakes it for more than it is:
 ///
 /// - It CATCHES a regression to the cartesian product across per-key version lists, `O((V+1)^k)`. That
 ///   construction is correct but unaffordable: measured at 269.9 ms for V=16 on this exact scenario,
-///   where the shipped per-view construction takes 1.41 ms.
-/// - It does NOT catch the shipped construction's own `O(k*V^2)` term (a recorded residual, `rmp` #774
-///   — see `composite_candidate_tuples`). At V=16 a quadratic is ~1.4 ms and sails through any bound
-///   that the product fails, so this size cannot separate quadratic from linear. V=64 is used instead:
-///   the product is already hopeless there, while the quadratic measures ~4.3 ms.
+///   where the linear sweep now rebuilds the whole node in ~3 ms at V=64.
+/// - It does NOT catch a regression from the linear sweep back to the pre-#774 `O(k*V^2)` construction:
+///   an absolute wall-time bound at a single V cannot separate quadratic from linear when the quadratic
+///   is still only a small fraction of the rebuild's linear store/insert floor (at V=64 both are a few
+///   ms). That shape is guarded, load-invariantly, by the `construction_scales_sub_quadratically` unit
+///   test in `graphus-cypher`'s coordinator, which times the construction alone at 256 vs 1024 versions.
 ///
 /// Chains are NOT pruned in practice (`RecordStore::gc` has no production trigger, `rmp` #305), so V is
 /// bounded by nothing and this path is worth a gate even though it only guards the outer bound.
@@ -415,13 +416,16 @@ fn composite_rebuild_does_not_regress_to_cartesian_product() {
         started.elapsed().as_micros()
     }
 
-    // At V=64 the shipped construction measures ~4.3 ms; a 3-key cartesian product over ~65 versions per
-    // key would emit ~275_000 tuples and is orders of magnitude beyond this. The bound is generous
-    // enough not to flap on a loaded machine, and still ~14x below where a product regression lands.
+    // At V=64 the linear sweep rebuilds the whole node in ~3 ms; a 3-key cartesian product over ~65
+    // versions per key would emit ~275_000 tuples and is orders of magnitude beyond this. The bound is
+    // tightened to 20 ms (from 60 ms, now the construction no longer carries a quadratic term): ~6x over
+    // the measured ~3 ms so it does not flap on a loaded machine, yet ~13x below where a product
+    // regression lands (269_900us at only V=16, far worse at V=64).
     let at64 = rebuild_micros(64);
     assert!(
-        at64 < 60_000,
-        "composite rebuild cost regressed toward the cartesian product: V=64 took {at64}us          (shipped construction measures ~4_300us; the product cost 269_900us at only V=16)",
+        at64 < 20_000,
+        "composite rebuild cost regressed toward the cartesian product: V=64 took {at64}us \
+         (linear sweep measures ~3_000us; the product cost 269_900us at only V=16)",
     );
 }
 

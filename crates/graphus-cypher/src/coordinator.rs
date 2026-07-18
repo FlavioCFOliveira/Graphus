@@ -38,7 +38,7 @@
 //! coordinator's shared trackers.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::rc::Rc;
 
 use graphus_core::Value;
@@ -56,31 +56,111 @@ struct PropVersion {
     value: Value,
 }
 
-/// Whether `v` is visible from the *view* `(writer, t)`: a reader at snapshot `t` which — when `writer`
-/// is `Some(w)` — is `w` itself and so also sees `w`'s own uncommitted writes.
+/// The instant-index half-open range `[lo, hi)` over the sorted `instants` on which version `v` is
+/// visible from the view owned by `owner` (`TxnId(0)` for the committed view), or [`None`] if it is
+/// visible at no instant.
 ///
-/// This is exactly [`graphus_txn::is_visible`] against a synthetic snapshot, and it MUST be: stamps are
-/// settled LAZILY, so a long-committed version can still carry `InFlight(w)` and only the registry knows
-/// it committed. Deciding visibility from the raw stamp alone (treating every `InFlight` as visible only
-/// to its own writer) partitions a node's versions into disjoint per-writer views, and a tuple mixing
-/// one writer's committed value with another's is then emitted by NO view — a missing candidate, i.e.
-/// exactly the false negative this construction exists to prevent. `TxnId(0)` is never minted
-/// (`begin_inner` pre-increments), so it is a safe "no own writes" owner for the committed view.
-fn version_visible_from(
+/// This is [`graphus_txn::is_visible`] turned inside-out: rather than testing one snapshot, it returns
+/// the whole *contiguous* span of snapshots that see `v`. Visibility is monotone in the snapshot time —
+/// the creator becomes visible at one stamp (clause 1) and the expirer hides it at a later one
+/// (clause 2), `04 §5.3` — so the visible snapshots are exactly one interval, and each stamp that bounds
+/// it is itself an instant (it was collected from some version's `xmin` / `xmax`).
+///
+/// Stamps resolve through the `registry`, NEVER from the raw word: a commit settles LAZILY, so a
+/// long-committed version still reads `InFlight(w)` and only the registry knows its real commit instant.
+/// Deciding visibility from the raw stamp alone would split a node's versions into disjoint per-writer
+/// views and drop the tuple that mixes one writer's committed value with another's — the missing
+/// candidate this whole construction exists to prevent. That premise fell during `rmp` #766.
+///
+/// The one exception the resolver cannot express is the owner's OWN uncommitted write: it has no commit
+/// timestamp yet is visible to `owner` from `t = 0` (an own uncommitted deletion, symmetrically, hides
+/// the version from `owner` at every instant). Those two cases are handled explicitly before the
+/// resolver; everything else — committed, foreign in-flight, aborted, or the `0`/live sentinel — is what
+/// [`CommitRegistry::resolve_commit_ts`] already classifies.
+fn visible_instant_range(
     v: &PropVersion,
-    writer: Option<TxnId>,
-    t: Timestamp,
+    owner: TxnId,
     registry: &CommitRegistry,
-) -> bool {
-    graphus_txn::is_visible(
-        Snapshot {
-            owner: writer.unwrap_or(TxnId(0)),
-            ts: t,
+    instants: &[Timestamp],
+    instant_index: &HashMap<Timestamp, usize>,
+) -> Option<(usize, usize)> {
+    let n = instants.len();
+    // First instant index at or after `ts`. Every resolved commit stamp is an instant, so the map hits;
+    // the `partition_point` fallback keeps a (never-taken) miss sound rather than panicking inside a DDL.
+    let idx_of = |ts: Timestamp| -> usize {
+        instant_index
+            .get(&ts)
+            .copied()
+            .unwrap_or_else(|| instants.partition_point(|&x| x < ts))
+    };
+    // `lo` = first instant whose snapshot sees the creator (clause 1). An own uncommitted creator is
+    // seen from `t = 0`; otherwise the resolver decides — `None` means visible at no instant.
+    let lo = match VersionStamp::from_raw(v.xmin) {
+        VersionStamp::InFlight(w) if w == owner => 0,
+        _ => match registry.resolve_commit_ts(v.xmin) {
+            Some(ts) => idx_of(ts),
+            None => return None,
         },
-        v.xmin,
-        v.xmax,
-        registry,
-    )
+    };
+    // `hi` = first instant whose snapshot has the expirer hide it (clause 2); `n` when nothing hides it.
+    // An own uncommitted deletion hides from `t = 0` (an empty span); otherwise the resolver decides —
+    // `None` (the `0`/live sentinel, a foreign in-flight, or an aborted expirer) never hides it.
+    let hi = match VersionStamp::from_raw(v.xmax) {
+        VersionStamp::InFlight(w) if w == owner => 0,
+        _ => match registry.resolve_commit_ts(v.xmax) {
+            Some(ts) => idx_of(ts),
+            None => n,
+        },
+    };
+    (lo < hi).then_some((lo, hi))
+}
+
+/// Path-halving "next still-empty slot" lookup for the newest-priority interval fill in
+/// [`composite_candidate_tuples`]. `next[i] == i` marks slot `i` empty; filling `i` sets `next[i] = i+1`
+/// so later lookups skip it. Returns the smallest `j >= i` still empty. `next` has length `n + 1`, so
+/// the sentinel `next[n] == n` bounds the walk and the returned index never exceeds `n`.
+fn uf_next_empty(next: &mut [usize], mut i: usize) -> usize {
+    while next[i] != i {
+        next[i] = next[next[i]]; // path halving keeps the amortised cost ~O(1)
+        i = next[i];
+    }
+    i
+}
+
+/// A hash of `tuple` consistent with `Vec<Value>`'s structural [`PartialEq`], for the dedup fast-path in
+/// [`composite_candidate_tuples`]. Structurally-equal tuples always hash equal, so they always land in
+/// the same bucket where the exact `==` confirm decides membership; the coarse fallback for non-scalar
+/// variants (bucket by discriminant only) is therefore always SOUND — it can only cost extra confirms,
+/// never a wrong dedup. Scalars — the near-universal composite key shapes — are hashed precisely, with
+/// floats canonicalised so `+0.0`/`-0.0` agree (they are `==`) and every `NaN` shares one bucket (it is
+/// never `==`, so the confirm keeps both, exactly as the old `Vec::contains` did).
+fn composite_tuple_hash(tuple: &[Value]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    tuple.len().hash(&mut h);
+    for v in tuple {
+        std::mem::discriminant(v).hash(&mut h);
+        match v {
+            Value::Boolean(b) => b.hash(&mut h),
+            Value::Integer(i) => i.hash(&mut h),
+            Value::Float(f) => {
+                let bits = if *f == 0.0 {
+                    0
+                } else if f.is_nan() {
+                    u64::MAX
+                } else {
+                    f.to_bits()
+                };
+                bits.hash(&mut h);
+            }
+            Value::String(s) => s.hash(&mut h),
+            Value::Bytes(b) => b.hash(&mut h),
+            // Non-scalar variants (Null, List, Map, temporal, Point) bucket by discriminant only: sound
+            // (equal values share a discriminant) and immaterial in practice (rare as composite keys).
+            _ => {}
+        }
+    }
+    h.finish()
 }
 
 /// Every composite tuple any reader can observe for one entity, given `per_key[i]` = the chain of
@@ -104,52 +184,62 @@ fn version_visible_from(
 /// but never resurrect one, and for the NODE KEY / REL KEY trees a missing candidate means the write
 /// path's duplicate check finds nothing and ADMITS A COMMITTED DUPLICATE (`rmp` #683 / #765).
 ///
-/// # Complexity — two different bounds, do not conflate them (measured, `rmp` task #766)
+/// # Complexity — two different bounds, do not conflate them (`rmp` task #774)
 ///
-/// - **Emitted tuples** (what bounds INDEX SIZE): `O((1 + W) * V)`, where `V` is the number of distinct
-///   instants and `W` the in-flight writers. Linear.
-/// - **Construction cost** (what bounds DDL TIME): `O((1 + W) * k * V^2)`. The `V^2` is real: the loop
-///   below is `views x instants x keys x find`, and the `find` is a LINEAR scan of that key's chain.
-///   `out.contains` adds a second quadratic term in the emitted count.
+/// With `V` = the number of distinct instants, `k` = the covered-property count, `W` = the in-flight
+/// writers:
 ///
-/// Measured on one node under a 3-key NODE KEY (debug build), rebuild wall time vs the newest-wins
-/// baseline — the quadratic is invisible below V~64 because fixed cost dominates, and unmistakable above:
+/// - **Emitted tuples** (what bounds INDEX SIZE): `O((1 + W) * V)`. Linear — one tuple per (view,
+///   instant) before dedup.
+/// - **Construction cost** (what bounds DDL TIME): `O((1 + W) * k * V)` (amortised), plus `O(V log V)`
+///   to sort the instants once and `O((1 + W) * V)` expected for the hashed dedup. Linear in `V`.
 ///
-/// | V    | newest-wins | this construction |
-/// |------|-------------|-------------------|
-/// | 8    | 1.02 ms     | 1.35 ms           |
-/// | 64   | 1.38 ms     | 4.25 ms           |
-/// | 256  | 2.36 ms     | 27.03 ms          |
-/// | 1024 | 5.52 ms     | 249.02 ms  (45x)  |
+/// The construction is a MERGE-STYLE SWEEP: for each view and each key, every version is visible over a
+/// contiguous instant range (see [`visible_instant_range`]), so the per-key chain is swept newest-first,
+/// painting only the still-empty instants of each range through a union-find "next empty" cursor
+/// ([`uf_next_empty`]) — each instant is written exactly once, giving `O(V)` per (view, key) instead of
+/// the `find`-per-instant scan that made this `O(k * V^2)` before `rmp` #774. The dedup is a hashed set
+/// ([`composite_tuple_hash`] + an exact `==` confirm), replacing the old `O(emitted^2)` `Vec::contains`.
 ///
-/// This is an accepted, RECORDED residual (`rmp` #774), not a bound anyone should rely on: chains are
-/// NOT pruned in practice — `RecordStore::gc` has no production trigger (`rmp` #305 owns scheduling) —
-/// so `V` on a hot node is limited by nothing and every index/constraint DDL pays this per node. The
-/// linear-time shape is a merge-style sweep over the per-key chains in stamp order (the instants are
-/// monotone, so each key's cursor only ever advances), giving `O(k * V)`; it is deferred only because it
-/// must not risk the correctness property this function exists to hold.
+/// Both matter because chains are NOT pruned in practice — `RecordStore::gc` has no production trigger
+/// (`rmp` #305 owns scheduling) — so `V` on a hot node is bounded by nothing and every index/constraint
+/// DDL pays this per node.
 ///
-/// It is nonetheless the affordable choice available: the cartesian product across the per-key version
-/// lists is `O((V+1)^k)` — 269.9 ms at V=16 where this takes 1.41 ms — and emits combinations no reader
-/// can ever observe (a value of `k1` from one instant with a value of `k2` from another).
+/// Measured on one node under a 3-key NODE KEY (debug build), the CONSTRUCTION alone (isolated from the
+/// rebuild's store reads / tree inserts, so the term this bound describes is what is timed), the pre-#774
+/// `find`-per-instant construction vs this sweep, on the dev host in one run:
+///
+/// | V    | pre-#774 `O(k*V^2)` | this sweep |
+/// |------|---------------------|------------|
+/// | 8    | 0.009 ms            | 0.036 ms   |
+/// | 16   | 0.023 ms            | 0.068 ms   |
+/// | 64   | 0.197 ms            | 0.250 ms   |
+/// | 256  | 2.83 ms             | 0.96 ms    |
+/// | 1024 | 44.08 ms            | 4.02 ms  (11x) |
+///
+/// Exponent per 4x step: pre-#774 `1.35 → 1.55 → 1.92 → 1.98` (heading to 2); this sweep
+/// `0.92 → 0.94 → 0.97 → 1.04` (flat at 1). The sweep's larger fixed cost makes it slower below `V ≈ 100`
+/// (its `BTreeSet` / `HashMap` / union-find scratch), and decisively faster as `V` grows — the right
+/// trade for an UNBOUNDED chain. At the full-rebuild level the same 3-key scenario went `227 ms → 63 ms`
+/// at `V = 1024` (the recorded `rmp` #766 residual measured `249 ms`), the remainder being the rebuild's
+/// own linear store/insert floor. `construction_scales_sub_quadratically` guards the shape.
 fn composite_candidate_tuples(
     per_key: &[Vec<&PropVersion>],
     registry: &CommitRegistry,
 ) -> Vec<Vec<Value>> {
-    let mut instants: Vec<Timestamp> = vec![Timestamp(0)];
+    // The instant grid + the in-flight writer views. `instants` = distinct committed stamps (resolved
+    // through the registry, never the raw word — see `visible_instant_range`) UNION `{0}`; a `BTreeSet`
+    // yields them SORTED and deduped in `O(V log V)` — the old `Vec::contains` de-dup here was itself
+    // `O(V^2)`. `writers` = the distinct in-flight writers (few in practice; a linear `contains` is fine).
+    let mut instant_set: BTreeSet<Timestamp> = BTreeSet::new();
+    instant_set.insert(Timestamp(0));
     let mut writers: Vec<TxnId> = Vec::new();
     for versions in per_key {
         for v in versions {
             for raw in [v.xmin, v.xmax] {
-                // Resolve through the registry, never from the raw word: a lazily-stamped version still
-                // reads `InFlight(w)` long after `w` committed, and its real commit instant is only
-                // knowable here. `resolve_commit_ts` returns `Some(ts)` for a settled OR lazily-stamped
-                // committed writer, and `None` for one that is genuinely still in flight (or aborted).
                 match registry.resolve_commit_ts(raw) {
                     Some(ts) => {
-                        if !instants.contains(&ts) {
-                            instants.push(ts);
-                        }
+                        instant_set.insert(ts);
                     }
                     None => {
                         if let VersionStamp::InFlight(w) = VersionStamp::from_raw(raw)
@@ -162,40 +252,386 @@ fn composite_candidate_tuples(
             }
         }
     }
+    let instants: Vec<Timestamp> = instant_set.into_iter().collect();
+    let n = instants.len();
+    // `O(1)` stamp -> instant-index lookup for the interval bounds (see `visible_instant_range`).
+    let instant_index: HashMap<Timestamp, usize> =
+        instants.iter().enumerate().map(|(i, &t)| (t, i)).collect();
+
     // The committed timeline, then one view per in-flight writer.
     let mut views: Vec<Option<TxnId>> = Vec::with_capacity(1 + writers.len());
     views.push(None);
-    views.extend(writers.into_iter().map(Some));
+    views.extend(writers.iter().copied().map(Some));
 
+    let k = per_key.len();
     let mut out: Vec<Vec<Value>> = Vec::new();
-    for writer in views {
-        for &t in &instants {
-            let mut tuple = Vec::with_capacity(per_key.len());
+    // Hashed dedup: bucket -> positions in `out`. Membership is decided by the exact `==` confirm, so a
+    // coarse hash only ever costs extra comparisons; the output is the same distinct set as before.
+    let mut seen: HashMap<u64, Vec<usize>> = HashMap::new();
+    // Reused union-find scratch for the newest-priority interval fill (length `n + 1`).
+    let mut next: Vec<usize> = Vec::with_capacity(n + 1);
+
+    for &writer in &views {
+        let owner = writer.unwrap_or(TxnId(0)); // `TxnId(0)` is never a writer: a "no own writes" owner.
+        // For each key, the value the reader at THIS view resolves at each instant (newest-visible
+        // wins). `found[key][i]` = the newest version covering instant `i` (its value may be NULL — an
+        // absent key at assembly), or `None` if no version covers `i`.
+        let mut found: Vec<Vec<Option<&Value>>> = Vec::with_capacity(k);
+        for versions in per_key {
+            let mut col: Vec<Option<&Value>> = vec![None; n];
+            // Reset the "next empty" cursor: every slot starts empty (`next[i] == i`).
+            next.clear();
+            next.extend(0..=n);
+            // Newest-first so a newer version claims a shared instant; older versions fill only the gaps.
+            for &v in versions {
+                let Some((lo, hi)) =
+                    visible_instant_range(v, owner, registry, &instants, &instant_index)
+                else {
+                    continue; // visible at no instant from this view
+                };
+                let mut i = uf_next_empty(&mut next, lo);
+                while i < hi {
+                    col[i] = Some(&v.value);
+                    next[i] = i + 1; // mark filled -> skip on the next lookup
+                    i = uf_next_empty(&mut next, i + 1);
+                }
+            }
+            found.push(col);
+        }
+
+        // Assemble one tuple per instant: the newest-visible value of every key, all present and
+        // non-null. A key whose newest-visible version is absent or NULL makes the tuple incomplete
+        // (Cypher's treatment of NULL in an index key), so the entity contributes nothing at that view.
+        for i in 0..n {
+            let mut tuple = Vec::with_capacity(k);
             let mut complete = true;
-            for versions in per_key {
-                // Newest-visible-wins within this one view — exactly what a reader at this view does.
-                // A covered property that is absent or NULL from this view makes the tuple incomplete,
-                // so the entity is not a uniqueness candidate at that view (matching Cypher's treatment
-                // of NULL in an index key) and contributes nothing.
-                match versions
-                    .iter()
-                    .find(|v| version_visible_from(v, writer, t, registry))
-                    .map(|v| &v.value)
-                    .filter(|v| !v.is_null())
-                {
-                    Some(value) => tuple.push(value.clone()),
-                    None => {
+            for col in &found {
+                match col[i] {
+                    Some(value) if !value.is_null() => tuple.push(value.clone()),
+                    _ => {
                         complete = false;
                         break;
                     }
                 }
             }
-            if complete && !out.contains(&tuple) {
-                out.push(tuple);
+            if complete {
+                let bucket = seen.entry(composite_tuple_hash(&tuple)).or_default();
+                if !bucket.iter().any(|&j| out[j] == tuple) {
+                    bucket.push(out.len());
+                    out.push(tuple);
+                }
             }
         }
     }
     out
+}
+
+/// Equivalence guard for the `rmp` #774 merge-sweep: `composite_candidate_tuples` must produce the SAME
+/// candidate SET as the pre-#774 `find`-per-instant construction, for ANY chain — a wrong tuple here is a
+/// dropped candidate, i.e. an admitted committed duplicate on a NODE KEY / REL KEY (`rmp` #683 / #765).
+/// The oracle below is that former construction, verbatim in shape (per-instant `graphus_txn::is_visible`
+/// + `Vec::contains` dedup), so the two agreeing pins the sweep to the exact semantics it replaced.
+#[cfg(test)]
+mod composite_sweep_equivalence {
+    use super::*;
+
+    /// The pre-#774 construction: one tuple per (view, instant) via a linear `find`, deduped by
+    /// structural `PartialEq`. This is the reference the sweep must match, so it is intentionally the
+    /// slow, obviously-correct shape.
+    fn oracle(per_key: &[Vec<&PropVersion>], registry: &CommitRegistry) -> Vec<Vec<Value>> {
+        let mut instants: Vec<Timestamp> = vec![Timestamp(0)];
+        let mut writers: Vec<TxnId> = Vec::new();
+        for versions in per_key {
+            for v in versions {
+                for raw in [v.xmin, v.xmax] {
+                    match registry.resolve_commit_ts(raw) {
+                        Some(ts) => {
+                            if !instants.contains(&ts) {
+                                instants.push(ts);
+                            }
+                        }
+                        None => {
+                            if let VersionStamp::InFlight(w) = VersionStamp::from_raw(raw)
+                                && !writers.contains(&w)
+                            {
+                                writers.push(w);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut views: Vec<Option<TxnId>> = vec![None];
+        views.extend(writers.into_iter().map(Some));
+
+        let mut out: Vec<Vec<Value>> = Vec::new();
+        for writer in views {
+            let owner = writer.unwrap_or(TxnId(0));
+            for &t in &instants {
+                let mut tuple = Vec::with_capacity(per_key.len());
+                let mut complete = true;
+                for versions in per_key {
+                    match versions
+                        .iter()
+                        .find(|v| {
+                            graphus_txn::is_visible(
+                                Snapshot { owner, ts: t },
+                                v.xmin,
+                                v.xmax,
+                                registry,
+                            )
+                        })
+                        .map(|v| &v.value)
+                        .filter(|v| !v.is_null())
+                    {
+                        Some(value) => tuple.push(value.clone()),
+                        None => {
+                            complete = false;
+                            break;
+                        }
+                    }
+                }
+                if complete && !out.contains(&tuple) {
+                    out.push(tuple);
+                }
+            }
+        }
+        out
+    }
+
+    /// Asserts the sweep and the oracle emit the same SET of tuples (order-independent, both deduped).
+    fn assert_same_set(per_key: &[Vec<&PropVersion>], registry: &CommitRegistry) {
+        let got = composite_candidate_tuples(per_key, registry);
+        let want = oracle(per_key, registry);
+        let subset =
+            |a: &[Vec<Value>], b: &[Vec<Value>]| a.iter().all(|x| b.iter().any(|y| x == y));
+        assert!(
+            got.len() == want.len() && subset(&got, &want) && subset(&want, &got),
+            "sweep != oracle\n sweep = {got:?}\noracle = {want:?}",
+        );
+    }
+
+    fn pv(xmin: u64, xmax: u64, value: i64) -> PropVersion {
+        PropVersion {
+            xmin,
+            xmax,
+            value: Value::Integer(value),
+        }
+    }
+
+    /// A committed-only chain (the dominant real case): three settled versions, no writer.
+    #[test]
+    fn committed_only_chain() {
+        let reg = CommitRegistry::new();
+        let cm = VersionStamp::committed;
+        // newest-first: v3 live [30,inf), v2 [20,30), v1 [10,20)
+        let v3 = pv(cm(Timestamp(30)), 0, 3);
+        let v2 = pv(cm(Timestamp(20)), cm(Timestamp(30)), 2);
+        let v1 = pv(cm(Timestamp(10)), cm(Timestamp(20)), 1);
+        assert_same_set(&[vec![&v3, &v2, &v1]], &reg);
+    }
+
+    /// A committed-then-deleted property: the newest version expires, so late snapshots see NOTHING and
+    /// the tuple is incomplete (found -> none, not resurrect-older).
+    #[test]
+    fn committed_then_deleted() {
+        let reg = CommitRegistry::new();
+        let cm = VersionStamp::committed;
+        let v2 = pv(cm(Timestamp(20)), cm(Timestamp(40)), 2); // created 20, deleted 40
+        let v1 = pv(cm(Timestamp(10)), cm(Timestamp(20)), 1);
+        assert_same_set(&[vec![&v2, &v1]], &reg);
+    }
+
+    /// THE in-flight-writer overlap the naive monotone cursor gets wrong (`rmp` #774): writer `w`'s own
+    /// live write is visible at EVERY instant, overlapping the older committed versions it superseded, so
+    /// `w`'s view resolves `w`'s value at every instant while the committed view walks the older chain.
+    #[test]
+    fn in_flight_writer_overlaps_committed_chain() {
+        let mut reg = CommitRegistry::new();
+        reg.register_begin(TxnId(9)); // w = 9, in flight
+        let cm = VersionStamp::committed;
+        let inflight = VersionStamp::in_flight;
+        // newest-first: v0 = w's own live write; v1 committed then superseded by w; v2 older committed.
+        let v0 = pv(inflight(TxnId(9)), 0, 100);
+        let v1 = pv(cm(Timestamp(20)), inflight(TxnId(9)), 2);
+        let v2 = pv(cm(Timestamp(10)), cm(Timestamp(20)), 1);
+        assert_same_set(&[vec![&v0, &v1, &v2]], &reg);
+    }
+
+    /// A version whose creator LAZILY committed (header still reads `InFlight`, registry says committed):
+    /// its real commit instant must come from the registry, not the raw word.
+    #[test]
+    fn lazily_stamped_commit_resolves_via_registry() {
+        let mut reg = CommitRegistry::new();
+        reg.record_commit(TxnId(5), Timestamp(25)); // committed but header still InFlight(5)
+        let inflight = VersionStamp::in_flight;
+        let cm = VersionStamp::committed;
+        let v2 = pv(inflight(TxnId(5)), 0, 2); // lazily-stamped, live
+        let v1 = pv(cm(Timestamp(10)), inflight(TxnId(5)), 1); // superseded by the lazily-stamped txn
+        assert_same_set(&[vec![&v2, &v1]], &reg);
+    }
+
+    /// Two keys with independent chains + a NULL that makes a tuple incomplete at some instants.
+    #[test]
+    fn two_keys_with_null_hole() {
+        let reg = CommitRegistry::new();
+        let cm = VersionStamp::committed;
+        let ka2 = pv(cm(Timestamp(30)), 0, 5);
+        let ka1 = pv(cm(Timestamp(10)), cm(Timestamp(30)), 4);
+        let kb2 = pv(cm(Timestamp(20)), 0, 7);
+        // A NULL newest version on key b before 20 -> incomplete there.
+        let kb1 = PropVersion {
+            xmin: cm(Timestamp(5)),
+            xmax: cm(Timestamp(20)),
+            value: Value::Null,
+        };
+        assert_same_set(&[vec![&ka2, &ka1], vec![&kb2, &kb1]], &reg);
+    }
+
+    /// The construction must scale SUB-QUADRATICALLY in the version-chain length `V` (`rmp` task #774).
+    /// This is the sharp, load-invariant guard for the merge-sweep: it times the construction ALONE (no
+    /// store reads / tree inserts to dilute it) at 4x apart sizes and asserts the time ratio is far below
+    /// a quadratic's. A ratio gate cancels any uniform machine slowdown, so it does not flap on load —
+    /// what changes under a regression is the *shape*, not the constant. Measured: the linear sweep is
+    /// ~4.2x per 4x step (exponent ~1.0); the pre-#774 `find`-per-instant construction was ~15.6x
+    /// (exponent ~2.0). The `< 9.0` ceiling passes the former with ~2x margin and fails the latter.
+    #[test]
+    fn construction_scales_sub_quadratically() {
+        // A clean 3-key committed chain of `v` versions (one node updated `v` times), newest-first.
+        fn chains(v: usize) -> Vec<Vec<PropVersion>> {
+            let cm = VersionStamp::committed;
+            (0..3)
+                .map(|_| {
+                    (0..v)
+                        .map(|j| PropVersion {
+                            // j=0 is newest+live at V*10; j>=1 created (V-j)*10, expired (V-j+1)*10.
+                            xmin: cm(Timestamp(((v - j) as u64) * 10)),
+                            xmax: if j == 0 {
+                                0
+                            } else {
+                                cm(Timestamp(((v - j + 1) as u64) * 10))
+                            },
+                            value: Value::Integer((v - j) as i64),
+                        })
+                        .collect()
+                })
+                .collect()
+        }
+        // Min of a few runs: least-noisy estimator of the intrinsic cost.
+        fn min_nanos(store: &[Vec<PropVersion>], reg: &CommitRegistry) -> u128 {
+            let per_key: Vec<Vec<&PropVersion>> =
+                store.iter().map(|c| c.iter().collect()).collect();
+            (0..5)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    std::hint::black_box(composite_candidate_tuples(&per_key, reg));
+                    t.elapsed().as_nanos()
+                })
+                .min()
+                .unwrap()
+        }
+        let reg = CommitRegistry::new();
+        let small = chains(256);
+        let large = chains(1024); // 4x
+        // Warm up so the ratio reflects steady state, not first-touch allocation.
+        let _ = min_nanos(&small, &reg);
+        let t_small = min_nanos(&small, &reg);
+        let t_large = min_nanos(&large, &reg);
+        let ratio = t_large as f64 / t_small.max(1) as f64;
+        assert!(
+            ratio < 9.0,
+            "composite construction regressed toward quadratic: 4x more versions took {ratio:.1}x \
+             longer (linear sweep is ~4x; the pre-#774 quadratic was ~16x). \
+             t(256)={t_small}ns t(1024)={t_large}ns",
+        );
+    }
+
+    /// Deterministic randomized battery over arbitrary chains, registries and views. Both functions
+    /// derive from the same visibility rules, so they must agree on ANY input — this exercises far more
+    /// shapes (aborted, foreign in-flight, lazy commits, multi-writer overlaps) than the hand cases.
+    #[test]
+    fn randomized_battery_agrees() {
+        // xorshift64* — dependency-free deterministic PRNG.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rng = || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+
+        for _ in 0..4000 {
+            let mut reg = CommitRegistry::new();
+            // A pool of up to 6 transactions, each committed / aborted / left in flight.
+            let n_txn = 1 + rng() % 6;
+            let mut committed: Vec<(TxnId, Timestamp)> = Vec::new();
+            let mut inflight_ids: Vec<TxnId> = Vec::new();
+            for id in 1..=n_txn {
+                let txn = TxnId(id);
+                match rng() % 3 {
+                    0 => {
+                        let ts = Timestamp(1 + rng() % 40);
+                        reg.record_commit(txn, ts);
+                        committed.push((txn, ts));
+                    }
+                    1 => {
+                        reg.register_begin(txn);
+                        inflight_ids.push(txn);
+                    }
+                    _ => reg.record_abort(txn),
+                }
+            }
+            // A raw stamp word: 0 (none/live), a settled commit, a lazy commit or in-flight (header
+            // InFlight), or a foreign committed timestamp not in the pool.
+            let raw_word = |rng: &mut dyn FnMut() -> u64| -> u64 {
+                match rng() % 4 {
+                    0 => 0,
+                    1 => VersionStamp::committed(Timestamp(1 + rng() % 40)),
+                    2 if !committed.is_empty() => {
+                        // Header reads InFlight but the registry has it committed (lazy) — or settled.
+                        let (txn, ts) = committed[(rng() % committed.len() as u64) as usize];
+                        if rng() % 2 == 0 {
+                            VersionStamp::in_flight(txn)
+                        } else {
+                            VersionStamp::committed(ts)
+                        }
+                    }
+                    _ if !inflight_ids.is_empty() => VersionStamp::in_flight(
+                        inflight_ids[(rng() % inflight_ids.len() as u64) as usize],
+                    ),
+                    _ => VersionStamp::committed(Timestamp(1 + rng() % 40)),
+                }
+            };
+
+            let n_keys = 1 + (rng() % 3) as usize;
+            let mut chains: Vec<Vec<PropVersion>> = Vec::with_capacity(n_keys);
+            for _ in 0..n_keys {
+                let chain_len = (rng() % 5) as usize; // 0..=4 (0 exercises the empty-key skip too)
+                let mut chain = Vec::with_capacity(chain_len);
+                for _ in 0..chain_len {
+                    let xmin = raw_word(&mut rng);
+                    let xmax = raw_word(&mut rng);
+                    // A small value domain forces genuine collisions so the dedup is exercised; an
+                    // occasional NULL exercises the incomplete-tuple path.
+                    let value = match rng() % 5 {
+                        0 => Value::Null,
+                        v => Value::Integer((v % 3) as i64),
+                    };
+                    chain.push(PropVersion { xmin, xmax, value });
+                }
+                chains.push(chain);
+            }
+            // Skip inputs with an empty key chain: the callers filter those out before calling, and both
+            // functions treat an empty `per_key[i]` identically (no version -> all tuples incomplete),
+            // but the contract is "every key has >= 1 version".
+            if chains.iter().any(Vec::is_empty) {
+                continue;
+            }
+            let per_key: Vec<Vec<&PropVersion>> =
+                chains.iter().map(|c| c.iter().collect()).collect();
+            assert_same_set(&per_key, &reg);
+        }
+    }
 }
 use graphus_index::fulltext::Analyzer;
 use graphus_index::histogram::PropertyHistogram;
@@ -2007,7 +2443,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     }
                 }
             }
-            // The registry resolves lazily-stamped commits (see `version_visible_from`).
+            // The registry resolves lazily-stamped commits (see `visible_instant_range`).
             (labels, props, store.commit_registry().clone())
         };
 
@@ -2275,7 +2711,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     }
                 }
             }
-            // The registry resolves lazily-stamped commits (see `version_visible_from`).
+            // The registry resolves lazily-stamped commits (see `visible_instant_range`).
             (out, store.commit_registry().clone())
         };
 
