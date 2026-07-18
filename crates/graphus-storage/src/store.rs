@@ -50,9 +50,9 @@ use crate::paging;
 use crate::read_view::{self, MetaSnapshot, StoreMetaSnapshot, StorePages, StoreReadView};
 use crate::record::{
     CHAIN_FLAG_END_FIRST, CHAIN_FLAG_START_FIRST, ChainSide, MVCC_HEADER_SIZE, MVCC_OFF_CREATED_TS,
-    MVCC_OFF_EXPIRED_TS, MvccHeader, NODE_OFF_FIRST_PROP, NODE_OFF_FIRST_REL, NODE_RECORD_SIZE,
-    NodeRecord, PROP_RECORD_SIZE, PropRecord, REL_OFF_CHAIN_FLAGS, REL_OFF_END_PREV,
-    REL_OFF_FIRST_PROP, REL_OFF_START_PREV, REL_RECORD_SIZE, RelRecord,
+    MVCC_OFF_EXPIRED_TS, MvccHeader, NODE_OFF_FIRST_PROP, NODE_OFF_FIRST_REL, NODE_OFF_LABELS,
+    NODE_RECORD_SIZE, NodeRecord, PROP_RECORD_SIZE, PropRecord, REL_OFF_CHAIN_FLAGS,
+    REL_OFF_END_PREV, REL_OFF_FIRST_PROP, REL_OFF_START_PREV, REL_RECORD_SIZE, RelRecord,
 };
 use crate::tokens::{Namespace, TokenSnapshot, TokenStore};
 use crate::valenc;
@@ -1977,6 +1977,56 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Ok(())
     }
 
+    /// Writes node `id`'s 8-byte `labels` bitmap word to `new_labels`, logging a **compare-and-set
+    /// logical undo** (`rmp` #772): redo installs `new_labels`; undo resets the word to `old_labels`
+    /// *only if it still equals `new_labels`* (this txn's own write is still the one on the page).
+    ///
+    /// # Why a whole-record undo here is unsound (the `rmp` #772 breach)
+    ///
+    /// [`add_label`](Self::add_label) / [`remove_label`](Self::remove_label) change ONLY the `labels`
+    /// word, but used to persist the change with [`write_node`](Self::write_node) — a plain
+    /// **whole-record** pre-image undo (`write_region`). The node record's OTHER words are
+    /// concurrently shared: a different transaction's [`add_node_property`](Self::add_node_property) /
+    /// [`create_rel`](Self::create_rel) pushes onto `first_prop` / `first_rel` via
+    /// [`write_chain_head`](Self::write_chain_head), and its delete/tombstone re-stamps the MVCC
+    /// header via [`patch_header_word_cas`](Self::patch_header_word_cas). Under statement-granularity
+    /// interleaving that writer can COMMIT between the label change and its abort, so the aborting
+    /// label change's whole-record pre-image no longer describes those words. Replaying it on abort
+    /// reverted `first_prop` to its pre-commit value, orphaning the committed property version (whose
+    /// predecessor the committing writer had MVCC-tombstoned on a byte region the whole-record undo
+    /// does not restore) — the committed value read back as `Null`: an atomicity + durability breach.
+    ///
+    /// Scoping the write and its undo to the `labels` word alone — with the same CAS discipline the
+    /// three chain-participating writes above already use — reverts ONLY this transaction's own label
+    /// change and never a concurrently-committed writer's `first_prop` / `first_rel` / MVCC word. The
+    /// CAS (rather than a plain pre-image of just the word) also protects the `labels` word itself: a
+    /// later committed writer that legitimately owns it by abort time is preserved (the CAS no-ops),
+    /// exactly as [`patch_header_word_cas`](Self::patch_header_word_cas) reasons for the header word.
+    /// Replays identically in live rollback (`PoolTarget`) and crash recovery (`DeviceTarget`) via
+    /// [`paging::apply_patch`].
+    fn write_node_labels(
+        &mut self,
+        id: u64,
+        new_labels: u64,
+        old_labels: u64,
+        txn: TxnId,
+    ) -> Result<()> {
+        let (rel_page, off) = paging::record_location(id, StoreKind::Node.record_size());
+        let dev = self.device_page(StoreKind::Node, rel_page)?;
+        let abs = off + NODE_OFF_LABELS;
+        let redo = paging::encode_patch(abs, &new_labels.to_le_bytes());
+        let undo = paging::encode_cas_patch(abs, new_labels, old_labels).into_vec();
+        let f = self.pool.fetch(dev)?;
+        let lsn = self
+            .wal
+            .with(|w| w.log_update_borrowed(txn, dev, &redo, undo));
+        self.pool.with_page_mut_lsn(f, lsn, |p| {
+            p[abs..abs + 8].copy_from_slice(&new_labels.to_le_bytes());
+        });
+        self.pool.unpin(f);
+        Ok(())
+    }
+
     /// Writes the full body of record `id` in `kind`'s store, logging a **header-only undo**: the
     /// redo is the whole-record post-image; the undo restores ONLY the 25-byte MVCC header captured
     /// live from the page before the overwrite. On abort/recovery this reverts the slot to not-in-use
@@ -3418,7 +3468,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// - [`GraphusError::Runtime`] (from [`LabelError`](crate::labels::LabelError)) if
     ///   `label_token_id` is `>= 63`, or the node's bitmap is already in overflow form (#39).
     pub fn add_label(&mut self, txn: TxnId, id: u64, label_token_id: u32) -> Result<()> {
-        let mut node = self.read_node(id)?;
+        let node = self.read_node(id)?;
         if !Self::is_live_version(node.mvcc) {
             return Err(GraphusError::Storage(format!("node {id} not in use")));
         }
@@ -3427,8 +3477,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             return Ok(()); // already present: no write, no WAL churn, no count change
         }
         let old_labels = node.labels;
-        node.labels = next;
-        self.write_node(id, &node, txn)?;
+        // Scope the write and its undo to the `labels` word alone, with CAS logical undo, so a
+        // rolled-back label change never clobbers a concurrently-committed writer's `first_prop` /
+        // `first_rel` / MVCC word on the same node record (`rmp` #772). `write_node` (whole-record
+        // pre-image undo) was the breach.
+        self.write_node_labels(id, next, old_labels, txn)?;
         // Exactly one bit was newly set: increment its per-label count (`rmp` task #79).
         self.apply_label_count_delta(old_labels, next);
         Ok(())
@@ -3442,7 +3495,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// - [`GraphusError::Runtime`] (from [`LabelError`](crate::labels::LabelError)) if
     ///   `label_token_id` is `>= 63`, or the node's bitmap is already in overflow form (#39).
     pub fn remove_label(&mut self, txn: TxnId, id: u64, label_token_id: u32) -> Result<()> {
-        let mut node = self.read_node(id)?;
+        let node = self.read_node(id)?;
         if !Self::is_live_version(node.mvcc) {
             return Err(GraphusError::Storage(format!("node {id} not in use")));
         }
@@ -3452,8 +3505,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             return Ok(()); // already absent: no write, no count change
         }
         let old_labels = node.labels;
-        node.labels = next;
-        self.write_node(id, &node, txn)?;
+        // Scope the write and its undo to the `labels` word alone, with CAS logical undo, so a
+        // rolled-back label change never clobbers a concurrently-committed writer's `first_prop` /
+        // `first_rel` / MVCC word on the same node record (`rmp` #772). `write_node` (whole-record
+        // pre-image undo) was the breach.
+        self.write_node_labels(id, next, old_labels, txn)?;
         // Exactly one bit was newly cleared: decrement its per-label count (`rmp` task #79).
         self.apply_label_count_delta(old_labels, next);
         Ok(())

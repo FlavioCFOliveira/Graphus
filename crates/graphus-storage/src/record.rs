@@ -117,7 +117,11 @@ pub(crate) const NODE_OFF_FIRST_REL: usize = 41; // u64
 /// Byte offset of the `first_prop` chain-head pointer within a node record (used by the store's
 /// compare-and-set chain-head logical undo).
 pub(crate) const NODE_OFF_FIRST_PROP: usize = 49; // u64
-const NODE_OFF_LABELS: usize = 57; // u64
+/// Byte offset of the `labels` bitmap word within a node record. Like the chain-head pointers
+/// above, this field is written by a **compare-and-set logical undo** (`rmp` #772): a plain
+/// whole-record pre-image undo of a label change would, on abort, revert the `first_prop` /
+/// `first_rel` / MVCC-header words that a concurrently-committed writer legitimately owns.
+pub(crate) const NODE_OFF_LABELS: usize = 57; // u64
 
 /// A node record (`04 §2.3`): the head of this node's relationship incidence chain
 /// (`first_rel`) and property chain (`first_prop`), plus a packed `labels` reference.
