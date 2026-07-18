@@ -390,6 +390,16 @@ pub struct IndexCandidateCapture {
     /// is the raw string (the trigram index keys on characters, not the order-preserving codec), so it
     /// is stored verbatim; the reader looks it up with the same `(op, needle)` it evaluated.
     text: HashMap<(u32, u32, crate::physical::TextSeekOp, String), Arc<[u64]>>,
+    /// `(type_token, prop_key, encode_single(seek))` → the RELATIONSHIP equality candidate ids
+    /// (`rmp` #769). The relationship twin of [`entries`](Self#structfield.entries), keyed on the rel-type
+    /// token. Values are rel ids.
+    rel_eq: HashMap<(u32, u32, Vec<u8>), Arc<[u64]>>,
+    /// `(type_token, prop_key, encode_range_bounds(lower, upper))` → the RELATIONSHIP range candidate ids
+    /// (`rmp` #769) — the twin of [`range`](Self#structfield.range) over the #680 `RelIndexRangeSeek`.
+    rel_range: HashMap<(u32, u32, Vec<u8>), Arc<[u64]>>,
+    /// `(type_token, property_tokens, encode_values(values))` → the RELATIONSHIP composite candidate ids
+    /// (`rmp` #769) — the twin of [`composite`](Self#structfield.composite).
+    rel_composite: HashMap<CompositeCaptureKey, Arc<[u64]>>,
 }
 
 // `rmp` #755/#768, Slice S2: the capture rides a `ReadTask` to a reader thread, so it must be
@@ -557,14 +567,94 @@ impl IndexCandidateCapture {
             .cloned()
     }
 
-    /// Folds `other`'s memoised seeks into `self` (`rmp` task #768), used by the dispatch site to merge
-    /// the per-kind captures (equality, range, composite, text) into one memo for the reader. The four
-    /// maps are disjoint by kind, so this is a straight per-map extend.
+    /// Memoises `ids` as the RELATIONSHIP equality candidate list for `(type_token, prop_key) == seek`
+    /// (`rmp` #769). A `List` value cannot be keyed and is silently not captured (the reader then misses
+    /// and takes the exact typed-scan fallback, `rmp` #680).
+    pub fn insert_rel_eq(&mut self, type_token: u32, prop_key: u32, seek: &Value, ids: Vec<u64>) {
+        if let Ok(key) = encode_single(seek) {
+            self.rel_eq.insert((type_token, prop_key, key), ids.into());
+        }
+    }
+
+    /// The memoised RELATIONSHIP equality candidate ids, or `None` if not captured — the caller MUST
+    /// decline (exact typed scan), never an empty result (`rmp` #680/#738).
+    #[must_use]
+    pub fn get_rel_eq(&self, type_token: u32, prop_key: u32, seek: &Value) -> Option<Arc<[u64]>> {
+        let key = encode_single(seek).ok()?;
+        self.rel_eq.get(&(type_token, prop_key, key)).cloned()
+    }
+
+    /// Memoises `ids` as the RELATIONSHIP range candidate list for `(type_token, prop_key)` under
+    /// `(lower, upper)` (`rmp` #769). A `List` bound is silently not captured.
+    pub fn insert_rel_range(
+        &mut self,
+        type_token: u32,
+        prop_key: u32,
+        lower: Option<(&Value, bool)>,
+        upper: Option<(&Value, bool)>,
+        ids: Vec<u64>,
+    ) {
+        if let Some(key) = encode_range_bounds_key(lower, upper) {
+            self.rel_range
+                .insert((type_token, prop_key, key), ids.into());
+        }
+    }
+
+    /// The memoised RELATIONSHIP range candidate ids, or `None` if not captured — the caller MUST decline
+    /// (exact typed scan), never an empty result (`rmp` #680/#738).
+    #[must_use]
+    pub fn get_rel_range(
+        &self,
+        type_token: u32,
+        prop_key: u32,
+        lower: Option<(&Value, bool)>,
+        upper: Option<(&Value, bool)>,
+    ) -> Option<Arc<[u64]>> {
+        let key = encode_range_bounds_key(lower, upper)?;
+        self.rel_range.get(&(type_token, prop_key, key)).cloned()
+    }
+
+    /// Memoises `ids` as the RELATIONSHIP composite candidate list for `(type_token, property_tokens)`
+    /// under `values` (`rmp` #769). A `List` element is silently not captured.
+    pub fn insert_rel_composite(
+        &mut self,
+        type_token: u32,
+        property_tokens: &[u32],
+        values: &[Value],
+        ids: Vec<u64>,
+    ) {
+        if let Some(key) = encode_values_key(values) {
+            self.rel_composite
+                .insert((type_token, property_tokens.to_vec(), key), ids.into());
+        }
+    }
+
+    /// The memoised RELATIONSHIP composite candidate ids, or `None` if not captured — the caller MUST
+    /// decline (exact typed scan), never an empty result (`rmp` #680/#738).
+    #[must_use]
+    pub fn get_rel_composite(
+        &self,
+        type_token: u32,
+        property_tokens: &[u32],
+        values: &[Value],
+    ) -> Option<Arc<[u64]>> {
+        let key = encode_values_key(values)?;
+        self.rel_composite
+            .get(&(type_token, property_tokens.to_vec(), key))
+            .cloned()
+    }
+
+    /// Folds `other`'s memoised seeks into `self` (`rmp` tasks #768/#769), used by the dispatch site to
+    /// merge the per-kind captures (node + relationship equality, range, composite, text) into one memo
+    /// for the reader. The maps are disjoint by kind, so this is a straight per-map extend.
     pub fn absorb(&mut self, other: IndexCandidateCapture) {
         self.entries.extend(other.entries);
         self.range.extend(other.range);
         self.composite.extend(other.composite);
         self.text.extend(other.text);
+        self.rel_eq.extend(other.rel_eq);
+        self.rel_range.extend(other.rel_range);
+        self.rel_composite.extend(other.rel_composite);
     }
 
     /// Whether nothing was captured (the common case: a read with no indexed seek).
@@ -574,6 +664,9 @@ impl IndexCandidateCapture {
             && self.range.is_empty()
             && self.composite.is_empty()
             && self.text.is_empty()
+            && self.rel_eq.is_empty()
+            && self.rel_range.is_empty()
+            && self.rel_composite.is_empty()
     }
 }
 
@@ -1291,6 +1384,169 @@ pub fn index_seek_text_recheck<S: StoreReadSource, K: ReadSink>(
     out.sort_unstable();
     out.dedup();
     out
+}
+
+// =================================================================================================
+// Relationship index seeks (`rmp` task #769) — the off-thread twin of the node seeks above
+// =================================================================================================
+
+/// Registers the **precise relationship-equality** SIREAD predicate marker for a rel-eq seek
+/// (`rmp` #683/#769): [`PredicateRead::RelEquality`] when `value` is canonically encodable, else the
+/// coarse [`PredicateRead::RelType`] fallback (never "no marker"). The reader twin of
+/// `RecordStoreGraph::note_rel_equality_read`, sharing the same [`encode_equality_canonical`] encoder so
+/// a reader's marker pairs byte-for-byte with the writer's post-image announcement.
+pub fn note_rel_equality_read<K: ReadSink>(
+    sink: &K,
+    type_token: u32,
+    prop_key: u32,
+    value: &Value,
+) {
+    match encode_equality_canonical(value) {
+        Ok(encoded) => sink.note_predicate_read(PredicateRead::RelEquality {
+            rel_type: type_token,
+            property: prop_key,
+            value: encoded,
+        }),
+        Err(_) => sink.note_predicate_read(PredicateRead::RelType(type_token)),
+    }
+}
+
+/// SIREAD-marks **every live relationship** as this transaction's predicate-read footprint (the body of
+/// `RecordStoreGraph::mark_all_live_rels`), the conservative phantom-safe approximation a
+/// relationship-type / range / composite predicate read requires. Read errors are captured exactly as
+/// the inline path would.
+pub fn mark_all_live_rels<S: StoreReadSource, K: ReadSink>(src: &S, sink: &K) {
+    let ids = match src.scan_rel_ids() {
+        Ok(ids) => ids,
+        Err(e) => {
+            sink.capture(e);
+            return;
+        }
+    };
+    for id in ids {
+        sink.note_read(rel_ssi_key(id));
+    }
+}
+
+/// The **re-check half** of an indexed relationship-property EQUALITY seek (`rmp` #769/#683): given a
+/// candidate rel-id list from *some* index source, reduce it to exactly the relationships the inline
+/// `rel_index_seek_eq` would return for the same `(type, property, value)`.
+///
+/// # Why the marker is NOT here (the relationship/node asymmetry, `rmp` #683)
+///
+/// Unlike the node [`index_seek_eq_recheck`], this body registers **no** predicate marker. The precise
+/// [`PredicateRead::RelEquality`] marker is registered by the *caller* (both the inline seam and the
+/// reader call [`note_rel_equality_read`] just before this body) and NOT moved in here, because the
+/// relationship scan fallback registers no `RelEquality` marker of its own — so the inline seam must
+/// register it *before* its rebuild/`List` decline (to keep the decline's footprint), which this body,
+/// reached only on a serve, cannot do. What is shared here is the ACID-critical part: the per-candidate
+/// re-check that determines the rows **and** the per-candidate SIREAD (via [`rel_data`] / [`rel_property`],
+/// which mark every relationship the seek examined). That is what backs the `rmp` #683 uniqueness path,
+/// so it must be identical at both seams — and it is, because it is this one body.
+///
+/// # The contract on `candidates`
+///
+/// `candidates` MUST be a **superset** of the visible relationships of `type_name` whose current
+/// `property` equals `value`. A superset is safe (this body filters extras out); a **subset is silent
+/// row loss** — and, on the uniqueness path, an admitted committed duplicate (`rmp` #683). A caller that
+/// cannot guarantee the superset MUST decline (`None` → exact typed scan), never `Some(vec![])`
+/// (`rmp` #680/#738).
+#[allow(clippy::too_many_arguments)] // a lifted read body; the source/ctx/sink seams are positional
+pub fn rel_index_seek_eq_recheck<S: StoreReadSource, K: ReadSink>(
+    src: &S,
+    ctx: &VisCtx,
+    sink: &K,
+    type_name: &str,
+    property: &str,
+    value: &Value,
+    candidates: Vec<u64>,
+) -> Vec<RelId> {
+    let mut out: Vec<u64> = candidates
+        .into_iter()
+        .filter(|&id| {
+            let r = RelId(id);
+            match rel_data(src, ctx, sink, r) {
+                Some(data) if data.rel_type == type_name => {
+                    rel_property(src, ctx, sink, r, property)
+                        .is_some_and(|v| crate::equality::equals(&v, value).is_true())
+                }
+                _ => false,
+            }
+        })
+        .collect();
+    // De-duplicate: a stale + a live index entry can name the same id twice.
+    out.sort_unstable();
+    out.dedup();
+    out.into_iter().map(RelId).collect()
+}
+
+/// The **re-check half** of an indexed relationship-property RANGE seek (`rmp` #769/#680): the range
+/// twin of [`rel_index_seek_eq_recheck`]. Re-checks visible + current type + the current value satisfies
+/// both bounds under [`crate::eval::satisfies_range`] (the single comparison source of truth). As with
+/// the eq twin, the SSI markers (the coarse [`PredicateRead::RelType`] + the blanket [`mark_all_live_rels`])
+/// are registered by the caller, not here (`rmp` #683 asymmetry); this body owns the rows + the
+/// per-candidate SIREAD.
+#[allow(clippy::too_many_arguments)] // a lifted read body; the source/ctx/sink seams are positional
+pub fn rel_index_seek_range_recheck<S: StoreReadSource, K: ReadSink>(
+    src: &S,
+    ctx: &VisCtx,
+    sink: &K,
+    type_name: &str,
+    property: &str,
+    lower: Option<(&Value, bool)>,
+    upper: Option<(&Value, bool)>,
+    candidates: Vec<u64>,
+) -> Vec<RelId> {
+    let mut out: Vec<u64> = candidates
+        .into_iter()
+        .filter(|&id| {
+            let r = RelId(id);
+            match rel_data(src, ctx, sink, r) {
+                Some(data) if data.rel_type == type_name => {
+                    rel_property(src, ctx, sink, r, property)
+                        .is_some_and(|v| crate::eval::satisfies_range(&v, lower, upper))
+                }
+                _ => false,
+            }
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out.into_iter().map(RelId).collect()
+}
+
+/// The **re-check half** of an indexed relationship COMPOSITE (multi-property) equality seek
+/// (`rmp` #769/#666): re-checks visible + current type + the current per-property tuple equals `values`
+/// element-wise by Cypher equality. SSI markers registered by the caller (`rmp` #683 asymmetry).
+#[allow(clippy::too_many_arguments)] // a lifted read body; the source/ctx/sink seams are positional
+pub fn rel_index_seek_composite_recheck<S: StoreReadSource, K: ReadSink>(
+    src: &S,
+    ctx: &VisCtx,
+    sink: &K,
+    type_name: &str,
+    properties: &[String],
+    values: &[Value],
+    candidates: Vec<u64>,
+) -> Vec<RelId> {
+    let mut out: Vec<u64> = candidates
+        .into_iter()
+        .filter(|&id| {
+            let r = RelId(id);
+            match rel_data(src, ctx, sink, r) {
+                Some(data) if data.rel_type == type_name => properties
+                    .iter()
+                    .zip(values.iter())
+                    .all(|(property, value)| {
+                        rel_property(src, ctx, sink, r, property)
+                            .is_some_and(|v| crate::equality::equals(&v, value).is_true())
+                    }),
+                _ => false,
+            }
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out.into_iter().map(RelId).collect()
 }
 
 /// The body of `RecordStoreGraph::expand` (`GraphAccess::expand`): register the relationship-pattern

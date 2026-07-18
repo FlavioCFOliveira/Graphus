@@ -2650,8 +2650,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             return None; // reader predates the rebuild: exact scan fallback (snapshot-correct)
         }
 
-        // Candidate ids for `(type, prop) == value`; the index is candidate-only, so re-check the full
-        // predicate per candidate (visible + current type + current value equals `value`).
+        // Candidate ids for `(type, prop) == value`; the index is candidate-only.
         let Some(candidates) = index
             .borrow_mut()
             .seek_rel_property_eq(type_token, prop_key, value)
@@ -2660,22 +2659,22 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             // silently empty result (`rmp` #680).
             return None;
         };
-        let mut out: Vec<u64> = candidates
-            .into_iter()
-            .filter(|&id| {
-                let r = RelId(id);
-                match self.rel_data(r) {
-                    Some(data) if data.rel_type == type_name => self
-                        .rel_property(r, property)
-                        .is_some_and(|v| crate::equality::equals(&v, value).is_true()),
-                    _ => false,
-                }
-            })
-            .collect();
-        // De-duplicate: a stale + a live index entry can name the same id twice.
-        out.sort_unstable();
-        out.dedup();
-        Some(out)
+        // The per-candidate re-check (visible + current type + current value equals `value`) + dedup is
+        // the SAME lifted body the off-thread `ReadOnlyGraph` runs (`rmp` #769) — so the rows and the
+        // per-candidate SIREAD footprint that backs the `rmp` #683 uniqueness path are identical at both
+        // seams by construction. The precise `RelEquality` marker is registered ABOVE (before the gate),
+        // NOT in the body, because the rel scan fallback registers no such marker, so it must stay in each
+        // seam (`rmp` #683). Read-only: `LiveSource` over the store's `&self` reads (`rmp` #337 Slice 2).
+        let matches = read_source::rel_index_seek_eq_recheck(
+            &LiveSource(&*self.store.borrow()),
+            &self.vis_ctx(),
+            self,
+            type_name,
+            property,
+            value,
+            candidates,
+        );
+        Some(matches.into_iter().map(|r| r.0).collect())
     }
 
     /// Index-backed **range** seek over relationships of `type_name` (`rmp` task #680): the candidate
@@ -2728,28 +2727,22 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             return None;
         };
 
-        // Re-check the FULL range predicate per candidate: visible + current type + the current value
-        // satisfies BOTH provided bounds under the **Cypher comparison semantics**
-        // ([`crate::eval::satisfies_range`] — the same `compare` a `WHERE r.p >= v` `Filter` applies), so
-        // the seek and the executor's typed-scan + range-filter fallback return byte-identical row sets
-        // (`rmp` task #680). Each relationship's property is read via `rel_property`, which SIREAD-marks
-        // it exactly as `rel_index_seek_eq`'s re-check does.
-        let mut out: Vec<u64> = candidates
-            .into_iter()
-            .filter(|&id| {
-                let r = RelId(id);
-                match self.rel_data(r) {
-                    Some(data) if data.rel_type == type_name => self
-                        .rel_property(r, property)
-                        .is_some_and(|v| crate::eval::satisfies_range(&v, lower, upper)),
-                    _ => false,
-                }
-            })
-            .collect();
-        // De-duplicate: a stale + a live index entry can name the same id twice.
-        out.sort_unstable();
-        out.dedup();
-        Some(out)
+        // The per-candidate re-check (visible + current type + the current value satisfies BOTH bounds
+        // under `crate::eval::satisfies_range`, the single comparison source of truth) + dedup is the SAME
+        // lifted body the off-thread reader runs (`rmp` #769/#680) — rows and per-candidate SIREAD identical
+        // by construction. The coarse `RelType` marker + the blanket `mark_all_live_rels` are registered
+        // ABOVE, NOT in the body (`rmp` #683 asymmetry). Read-only: `LiveSource` over the store's `&self`.
+        let matches = read_source::rel_index_seek_range_recheck(
+            &LiveSource(&*self.store.borrow()),
+            &self.vis_ctx(),
+            self,
+            type_name,
+            property,
+            lower,
+            upper,
+            candidates,
+        );
+        Some(matches.into_iter().map(|r| r.0).collect())
     }
 
     /// Full relationship scan: every relationship of type `type_name`, visible to this transaction,
@@ -4449,26 +4442,19 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             // Seam declined (a key value is an unindexable `List`): exact scan fallback (`rmp` #680).
             return None;
         };
-        let mut out: Vec<u64> = candidates
-            .into_iter()
-            .filter(|&id| {
-                let r = RelId(id);
-                match self.rel_data(r) {
-                    Some(data) if data.rel_type == rel_type => properties
-                        .iter()
-                        .zip(values.iter())
-                        .all(|(property, value)| {
-                            self.rel_property(r, property)
-                                .is_some_and(|v| crate::equality::equals(&v, value).is_true())
-                        }),
-                    _ => false,
-                }
-            })
-            .collect();
-        // De-duplicate: a stale + a live index entry can name the same id twice.
-        out.sort_unstable();
-        out.dedup();
-        Some(out.into_iter().map(RelId).collect())
+        // The per-candidate re-check (visible + current type + the current per-property tuple equals
+        // `values`) + dedup is the SAME lifted body the off-thread reader runs (`rmp` #769/#666) — rows and
+        // per-candidate SIREAD identical by construction. The coarse `RelType` marker + `mark_all_live_rels`
+        // are registered ABOVE, NOT in the body (`rmp` #683 asymmetry). Read-only: `LiveSource` over `&self`.
+        Some(read_source::rel_index_seek_composite_recheck(
+            &LiveSource(&*self.store.borrow()),
+            &self.vis_ctx(),
+            self,
+            rel_type,
+            properties,
+            values,
+            candidates,
+        ))
     }
 
     fn index_seek_spatial(

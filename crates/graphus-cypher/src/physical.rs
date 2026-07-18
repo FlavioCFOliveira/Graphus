@@ -365,6 +365,49 @@ impl PhysicalPlan {
         out
     }
 
+    /// Every RELATIONSHIP-property **equality seek** this plan will ask
+    /// [`index_seek_rel_eq`](crate::graph_access::GraphAccess::index_seek_rel_eq) for, resolved to
+    /// `(rel_type, property, value)` when the value is statically knowable (`rmp` task #769). The
+    /// relationship twin of [`static_node_index_eq_seeks`](Self::static_node_index_eq_seeks).
+    #[must_use]
+    pub fn static_rel_index_eq_seeks(
+        &self,
+        params: &crate::binding::BoundParameters,
+    ) -> Vec<(String, String, graphus_core::Value)> {
+        let mut out = Vec::new();
+        collect_static_rel_eq_seeks(&self.root, params, &mut out);
+        out
+    }
+
+    /// Every RELATIONSHIP-property **RANGE seek** this plan will ask
+    /// [`index_seek_rel_range`](crate::graph_access::GraphAccess::index_seek_rel_range) for, resolved to
+    /// `(rel_type, property, lower, upper)` (`rmp` task #769/#680). Relationships have a single range
+    /// operator ([`RelIndexRangeSeek`](PhysicalOp::RelIndexRangeSeek)) — there is no rel existence-scan or
+    /// rel starts-with operator — so this covers the whole rel-range surface.
+    #[must_use]
+    pub fn static_rel_index_range_seeks(
+        &self,
+        params: &crate::binding::BoundParameters,
+    ) -> Vec<StaticRangeSeek> {
+        let mut out = Vec::new();
+        collect_static_rel_range_seeks(&self.root, params, &mut out);
+        out
+    }
+
+    /// Every RELATIONSHIP **COMPOSITE equality seek** this plan will ask
+    /// [`index_seek_rel_composite_eq`](crate::graph_access::GraphAccess::index_seek_rel_composite_eq) for,
+    /// resolved to `(rel_type, properties, values)` when every per-key value is statically knowable
+    /// (`rmp` task #769/#666).
+    #[must_use]
+    pub fn static_rel_composite_seeks(
+        &self,
+        params: &crate::binding::BoundParameters,
+    ) -> Vec<StaticCompositeSeek> {
+        let mut out = Vec::new();
+        collect_static_rel_composite_seeks(&self.root, params, &mut out);
+        out
+    }
+
     /// Whether this plan depends on `id`.
     #[must_use]
     pub fn depends_on(&self, id: IndexId) -> bool {
@@ -6056,6 +6099,80 @@ fn collect_static_node_text_seeks(
     }
     for child in op.children() {
         collect_static_node_text_seeks(child, params, out);
+    }
+}
+
+/// Collects this operator's statically-knowable relationship EQUALITY seeks, then recurses
+/// (`rmp` task #769). See [`PhysicalPlan::static_rel_index_eq_seeks`].
+fn collect_static_rel_eq_seeks(
+    op: &PhysicalOp,
+    params: &crate::binding::BoundParameters,
+    out: &mut Vec<(String, String, graphus_core::Value)>,
+) {
+    if let PhysicalOp::RelIndexSeek {
+        rel_type,
+        property,
+        value,
+        ..
+    } = op
+        && let Some(seek) = static_seek_value(value, params)
+    {
+        out.push((rel_type.name.clone(), property.clone(), seek));
+    }
+    for child in op.children() {
+        collect_static_rel_eq_seeks(child, params, out);
+    }
+}
+
+/// Collects this operator's statically-knowable relationship RANGE seeks, then recurses
+/// (`rmp` task #769/#680). See [`PhysicalPlan::static_rel_index_range_seeks`].
+fn collect_static_rel_range_seeks(
+    op: &PhysicalOp,
+    params: &crate::binding::BoundParameters,
+    out: &mut Vec<StaticRangeSeek>,
+) {
+    if let PhysicalOp::RelIndexRangeSeek {
+        rel_type,
+        property,
+        bound,
+        value,
+        ..
+    } = op
+        && let Some(v) = static_seek_value(value, params)
+    {
+        let (lower, upper) = owned_range_bounds(*bound, v);
+        out.push((rel_type.name.clone(), property.clone(), lower, upper));
+    }
+    for child in op.children() {
+        collect_static_rel_range_seeks(child, params, out);
+    }
+}
+
+/// Collects this operator's statically-knowable relationship COMPOSITE seeks, then recurses
+/// (`rmp` task #769/#666). Emitted only when every per-key value is statically knowable. See
+/// [`PhysicalPlan::static_rel_composite_seeks`].
+fn collect_static_rel_composite_seeks(
+    op: &PhysicalOp,
+    params: &crate::binding::BoundParameters,
+    out: &mut Vec<StaticCompositeSeek>,
+) {
+    if let PhysicalOp::RelCompositeIndexSeek {
+        rel_type,
+        properties,
+        values,
+        ..
+    } = op
+    {
+        let resolved: Option<Vec<graphus_core::Value>> = values
+            .iter()
+            .map(|v| static_seek_value(v, params))
+            .collect();
+        if let Some(vals) = resolved {
+            out.push((rel_type.name.clone(), properties.clone(), vals));
+        }
+    }
+    for child in op.children() {
+        collect_static_rel_composite_seeks(child, params, out);
     }
 }
 

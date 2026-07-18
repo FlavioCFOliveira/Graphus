@@ -662,3 +662,163 @@ async fn the_off_thread_reader_serves_a_text_seek_and_profile_measures_it() {
 
     let _ = server.shutdown().await;
 }
+
+// =================================================================================================
+// `rmp` #769 — the RELATIONSHIP twin of #768: the off-thread reader must serve rel index seeks
+// =================================================================================================
+
+/// **`rmp` #769 — the off-thread reader now serves a RELATIONSHIP equality seek, MEASURED.**
+///
+/// The off-thread `ReadOnlyGraph` implemented no `index_seek_rel_eq`, so an auto-commit
+/// `MATCH ()-[r:T {p: v}]-()` read full-scanned the type (ExpandAll over AllNodesScan) while the plan
+/// named a `RelIndexSeek`. This pins the fix the #768 way: measured `dbHits`, off-thread, seek ≪ scan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_off_thread_reader_serves_a_rel_eq_seek_and_profile_measures_it() {
+    let temp = TempStore::new("readerpool-rel-eq");
+    let server = boot(&temp).await;
+
+    let (seek_ops, seek_hits, scan_hits) = tokio::task::spawn_blocking(move || {
+        let mut c = connect(&temp);
+        // Two hubs and 300 RATED relationships with a unique `mid`; the seek matches exactly one.
+        c.run("CREATE (a:Hub {n: 0}), (b:Hub {n: 1})").expect("hubs");
+        c.run("MATCH (a:Hub {n: 0}), (b:Hub {n: 1}) UNWIND range(0, 299) AS i CREATE (a)-[:RATED {mid: i}]->(b)")
+            .expect("seed rels");
+        c.run("CREATE INDEX rated_mid FOR ()-[r:RATED]-() ON (r.mid)")
+            .expect("rel index");
+
+        let query = "PROFILE MATCH ()-[r:RATED {mid: 7}]->() RETURN r.mid AS m";
+        let seek = c.run(query).expect("indexed rel read");
+        let seek_plan = wire_plan(&seek.summary).expect("plan");
+        assert_eq!(seek.records.len(), 1, "one relationship matches mid=7");
+
+        c.run("DROP INDEX rated_mid").expect("drop");
+        let scan = c.run(query).expect("unindexed rel read");
+        let scan_plan = wire_plan(&scan.summary).expect("plan");
+        assert_eq!(scan.records, seek.records, "the rows are identical either way");
+
+        (
+            operators(&seek_plan.root),
+            total_db_hits(&seek_plan.root),
+            total_db_hits(&scan_plan.root),
+        )
+    })
+    .await
+    .expect("client thread");
+
+    assert!(
+        seek_ops.iter().any(|o| o == "RelIndexSeek"),
+        "the planner DID pick the rel index: {seek_ops:?}"
+    );
+    assert!(
+        seek_hits * 4 < scan_hits,
+        "MEASURED FIX (rmp #769): the reader pool now SERVES the rel eq seek from the candidates \
+         captured at dispatch (seek={seek_hits}, scan={scan_hits}). Before #769 the off-thread reader \
+         declined it and typed-scanned the whole relationship type while the plan still said RelIndexSeek."
+    );
+
+    let _ = server.shutdown().await;
+}
+
+/// **`rmp` #769 — the off-thread reader now serves a RELATIONSHIP RANGE seek, MEASURED.**
+///
+/// The #680 `RelIndexRangeSeek` (`<`/`<=`/`>`/`>=`) had NO production read path: an auto-commit range
+/// query dispatched off-thread declined and typed-scanned the type. This gives it one, measured.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_off_thread_reader_serves_a_rel_range_seek_and_profile_measures_it() {
+    let temp = TempStore::new("readerpool-rel-range");
+    let server = boot(&temp).await;
+
+    let (seek_ops, seek_hits, scan_hits) = tokio::task::spawn_blocking(move || {
+        let mut c = connect(&temp);
+        c.run("CREATE (a:Hub {n: 0}), (b:Hub {n: 1})").expect("hubs");
+        c.run("MATCH (a:Hub {n: 0}), (b:Hub {n: 1}) UNWIND range(0, 299) AS i CREATE (a)-[:LIKE {date: i}]->(b)")
+            .expect("seed rels");
+        c.run("CREATE INDEX like_date FOR ()-[r:LIKE]-() ON (r.date)")
+            .expect("rel range index");
+
+        let query = "PROFILE MATCH ()-[r:LIKE]->() WHERE r.date >= 295 RETURN r.date AS d";
+        let seek = c.run(query).expect("indexed rel range read");
+        let seek_plan = wire_plan(&seek.summary).expect("plan");
+        assert_eq!(seek.records.len(), 5, "dates 295..=299 match");
+
+        c.run("DROP INDEX like_date").expect("drop");
+        let scan = c.run(query).expect("unindexed rel range read");
+        let scan_plan = wire_plan(&scan.summary).expect("plan");
+        assert_eq!(scan.records.len(), 5, "the rows are identical either way");
+
+        (
+            operators(&seek_plan.root),
+            total_db_hits(&seek_plan.root),
+            total_db_hits(&scan_plan.root),
+        )
+    })
+    .await
+    .expect("client thread");
+
+    assert!(
+        seek_ops.iter().any(|o| o == "RelIndexRangeSeek"),
+        "the planner DID pick the rel RANGE index (#680): {seek_ops:?}"
+    );
+    assert!(
+        seek_hits * 4 < scan_hits,
+        "MEASURED FIX (rmp #769): the #680 RelIndexRangeSeek now has a production read path — the \
+         reader pool SERVES it from the captured candidates (seek={seek_hits}, scan={scan_hits}). \
+         Before #769 an auto-commit rel range read declined and typed-scanned the whole type."
+    );
+
+    let _ = server.shutdown().await;
+}
+
+/// **`rmp` #769 — the off-thread reader now serves a RELATIONSHIP COMPOSITE seek, MEASURED.**
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_off_thread_reader_serves_a_rel_composite_seek_and_profile_measures_it() {
+    let temp = TempStore::new("readerpool-rel-composite");
+    let server = boot(&temp).await;
+
+    let (seek_ops, seek_hits, scan_hits) = tokio::task::spawn_blocking(move || {
+        let mut c = connect(&temp);
+        c.run("CREATE (a:Hub {n: 0}), (b:Hub {n: 1})")
+            .expect("hubs");
+        c.run(
+            "MATCH (a:Hub {n: 0}), (b:Hub {n: 1}) UNWIND range(0, 299) AS i \
+             CREATE (a)-[:PAID {acct: 'A' + toString(i), cur: 'C' + toString(i)}]->(b)",
+        )
+        .expect("seed rels");
+        c.run("CREATE INDEX paid_ac FOR ()-[r:PAID]-() ON (r.acct, r.cur)")
+            .expect("rel composite index");
+
+        let query = "PROFILE MATCH ()-[r:PAID {acct: 'A7', cur: 'C7'}]->() RETURN r.acct AS a";
+        let seek = c.run(query).expect("indexed rel composite read");
+        let seek_plan = wire_plan(&seek.summary).expect("plan");
+        assert_eq!(seek.records.len(), 1, "one relationship matches (A7, C7)");
+
+        c.run("DROP INDEX paid_ac").expect("drop");
+        let scan = c.run(query).expect("unindexed rel composite read");
+        let scan_plan = wire_plan(&scan.summary).expect("plan");
+        assert_eq!(
+            scan.records, seek.records,
+            "the rows are identical either way"
+        );
+
+        (
+            operators(&seek_plan.root),
+            total_db_hits(&seek_plan.root),
+            total_db_hits(&scan_plan.root),
+        )
+    })
+    .await
+    .expect("client thread");
+
+    assert!(
+        seek_ops.iter().any(|o| o == "RelCompositeIndexSeek"),
+        "the planner DID pick the rel composite index (#666): {seek_ops:?}"
+    );
+    assert!(
+        seek_hits * 4 < scan_hits,
+        "MEASURED FIX (rmp #769): the reader pool now SERVES the rel composite seek from the captured \
+         candidates (seek={seek_hits}, scan={scan_hits}). Before #769 the off-thread reader declined it \
+         and typed-scanned the whole relationship type while the plan still said RelCompositeIndexSeek."
+    );
+
+    let _ = server.shutdown().await;
+}

@@ -1304,3 +1304,177 @@ fn off_thread_range_composite_text_seeks_equal_inline_rows_and_ssi_footprint() {
         &[NodeId(ids[3])],
     );
 }
+
+/// `rmp` task #769: a RELATIONSHIP **eq**, **range**, and **composite** seek is byte-identical off-thread
+/// vs inline — both the **rows** and the **canonical SIREAD buffer** — the relationship twin of
+/// `off_thread_range_composite_text_seeks_equal_inline_rows_and_ssi_footprint`. Both routes run the SAME
+/// lifted per-candidate re-check body (`rel_index_seek_eq_recheck` / `_range_recheck` / `_composite_recheck`),
+/// which is what backs the `rmp` #683 uniqueness path, so this pins the load-bearing ACID guarantee that
+/// moving these seeks off-thread changes neither the answer nor the serializability footprint.
+///
+/// Non-vacuity: the inline seek must return `Some`, the off-thread seek must return `Some` (a decline
+/// would be `None`), and — for eq — the SIREAD buffer carries the precise `RelEquality` predicate marker
+/// (for range/composite the blanket `mark_all_live_rels` fills the key set).
+#[test]
+fn off_thread_rel_seeks_equal_inline_rows_and_ssi_footprint() {
+    let mut s = fresh();
+    let txn = TxnId(1);
+    s.begin(txn);
+    let t_likes = s.intern_token(Namespace::RelType, "LIKES").unwrap();
+    let t_knows = s.intern_token(Namespace::RelType, "KNOWS").unwrap();
+    let k_n = s.intern_token(Namespace::PropKey, "n").unwrap();
+    let k_acct = s.intern_token(Namespace::PropKey, "acct").unwrap();
+    let k_cur = s.intern_token(Namespace::PropKey, "cur").unwrap();
+
+    // A node scaffold, then 8 LIKES rels with a unique n / (acct, cur), plus one KNOWS rel sharing the
+    // same values — it must be excluded by BOTH routes on the type re-check (a bug that ignores the type
+    // cannot pass by matching on value alone).
+    let mut nodes = Vec::new();
+    for _ in 0..9 {
+        let (n, _) = s.create_node(txn).unwrap();
+        nodes.push(n);
+    }
+    let mut ids = Vec::new();
+    for i in 0..8u64 {
+        let (r, _) = s
+            .create_rel(txn, t_likes, nodes[i as usize], nodes[i as usize + 1])
+            .unwrap();
+        s.set_rel_property_value(txn, r, k_n, &Value::Integer(i as i64))
+            .unwrap();
+        s.set_rel_property_value(txn, r, k_acct, &Value::String(format!("A{i}")))
+            .unwrap();
+        s.set_rel_property_value(txn, r, k_cur, &Value::String(format!("C{i}")))
+            .unwrap();
+        ids.push(r);
+    }
+    let (knows, _) = s.create_rel(txn, t_knows, nodes[0], nodes[1]).unwrap();
+    s.set_rel_property_value(txn, knows, k_n, &Value::Integer(3))
+        .unwrap();
+    s.set_rel_property_value(txn, knows, k_acct, &Value::String("A3".to_owned()))
+        .unwrap();
+    s.set_rel_property_value(txn, knows, k_cur, &Value::String("C3".to_owned()))
+        .unwrap();
+    s.commit(txn).unwrap();
+    let ts = s.snapshot_ts();
+
+    // Register + populate the rel-property (n) and rel-composite (acct, cur) indexes over committed state.
+    let coord = Coordinated::new(s);
+    {
+        let mut idx = coord.index.borrow_mut();
+        idx.register_rel_property_with_state(t_likes, k_n, IndexState::Online);
+        idx.register_rel_composite(t_likes, vec![k_acct, k_cur]);
+        for (i, &r) in ids.iter().enumerate() {
+            idx.insert_rel_property(t_likes, k_n, &Value::Integer(i as i64), r);
+            idx.insert_rel_composite(
+                t_likes,
+                &[k_acct, k_cur],
+                &[
+                    Value::String(format!("A{i}")),
+                    Value::String(format!("C{i}")),
+                ],
+                r,
+            );
+        }
+    }
+
+    // Compare one rel seek on the inline seam and an off-thread reader fed the engine-captured memo:
+    // rows equal (and hold `expected`, exclude the KNOWS rel), then canonical SIREAD buffers byte-equal.
+    let compare = |what: &str,
+                   capture: graphus_cypher::read_source::IndexCandidateCapture,
+                   inline_seek: &dyn Fn(&Live) -> Option<Vec<RelId>>,
+                   reader_seek: &dyn Fn(&ReadOnly) -> Option<Vec<RelId>>,
+                   expected: &[RelId]| {
+        let live = coord.live_at(TxnId(100), ts);
+        let inline = inline_seek(&live).unwrap_or_else(|| {
+            panic!("{what}: the inline seam has an Online index — it must seek")
+        });
+
+        let ro = coord
+            .reader_at(TxnId(100), ts)
+            .with_index_candidates(capture);
+        let off_thread = reader_seek(&ro)
+            .unwrap_or_else(|| panic!("{what}: the reader has a captured memo — it must seek"));
+
+        assert_eq!(
+            off_thread, inline,
+            "{what}: off-thread rel seek rows disagree with inline"
+        );
+        assert_eq!(
+            off_thread, expected,
+            "{what}: rel seek rows are not the expected set"
+        );
+        assert!(
+            !off_thread.contains(&RelId(knows)),
+            "{what}: the KNOWS rel must be excluded by the type re-check (rows={off_thread:?})"
+        );
+
+        let live_buf = live
+            .take_read_buffer()
+            .expect("coordinated live seam holds a SIREAD buffer");
+        let ro_buf = ro.take_buffer();
+        let (lr, lk, lp) = canonical(live_buf);
+        let (rr, rk, rp) = canonical(ro_buf);
+        assert_eq!(lr, rr, "{what}: SIREAD reader id differs");
+        assert_eq!(
+            lk, rk,
+            "{what}: per-record SIREAD key markers differ (sorted+deduped)"
+        );
+        assert_eq!(
+            lp, rp,
+            "{what}: predicate SIREAD markers differ (sorted+deduped)"
+        );
+        assert!(
+            !lk.is_empty(),
+            "{what}: expected non-empty SIREAD key markers — assertion vacuous otherwise"
+        );
+        assert!(!ro.has_error(), "{what}: reader captured an error");
+    };
+
+    // REL EQ: `n == 3` → exactly LIKES rel 3, never the KNOWS rel.
+    let eq_cap = coord
+        .index
+        .borrow_mut()
+        .capture_rel_property_eq(ts, &[(t_likes, k_n, Value::Integer(3))]);
+    compare(
+        "rel eq n=3",
+        eq_cap,
+        &|live: &Live| live.index_seek_rel_eq("LIKES", "n", &Value::Integer(3)),
+        &|ro: &ReadOnly| ro.index_seek_rel_eq("LIKES", "n", &Value::Integer(3)),
+        &[RelId(ids[3])],
+    );
+
+    // REL RANGE (#680): `n >= 5` → LIKES rels 5,6,7.
+    let range_cap = coord
+        .index
+        .borrow_mut()
+        .capture_rel_property_range(ts, &[(t_likes, k_n, Some((Value::Integer(5), true)), None)]);
+    compare(
+        "rel range n>=5",
+        range_cap,
+        &|live: &Live| {
+            live.index_seek_rel_range("LIKES", "n", Some((&Value::Integer(5), true)), None)
+        },
+        &|ro: &ReadOnly| {
+            ro.index_seek_rel_range("LIKES", "n", Some((&Value::Integer(5), true)), None)
+        },
+        &[RelId(ids[5]), RelId(ids[6]), RelId(ids[7])],
+    );
+
+    // REL COMPOSITE (#666): `{acct:'A3', cur:'C3'}` → exactly LIKES rel 3, never the same-valued KNOWS rel.
+    let comp_props = ["acct".to_owned(), "cur".to_owned()];
+    let comp_vals = [
+        Value::String("A3".to_owned()),
+        Value::String("C3".to_owned()),
+    ];
+    let comp_cap = coord
+        .index
+        .borrow_mut()
+        .capture_rel_composite(ts, &[(t_likes, vec![k_acct, k_cur], comp_vals.to_vec())]);
+    compare(
+        "rel composite (A3,C3)",
+        comp_cap,
+        &|live: &Live| live.index_seek_rel_composite_eq("LIKES", &comp_props, &comp_vals),
+        &|ro: &ReadOnly| ro.index_seek_rel_composite_eq("LIKES", &comp_props, &comp_vals),
+        &[RelId(ids[3])],
+    );
+}

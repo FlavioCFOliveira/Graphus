@@ -8020,17 +8020,24 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         plan: &crate::physical::PhysicalPlan,
         params: &crate::binding::BoundParameters,
     ) -> crate::read_source::IndexCandidateCapture {
-        // Every node-property seek kind the reader can be served off-thread (`rmp` #755 equality + `rmp`
-        // #768 range / composite / text). Correlated per-row seeks are excluded by construction (only a
-        // literal or bound parameter is statically knowable — `rmp` #764).
+        // Every node- and relationship-property seek kind the reader can be served off-thread (`rmp` #755
+        // node equality + `rmp` #768 node range/composite/text + `rmp` #769 rel equality/range/composite).
+        // Correlated per-row seeks are excluded by construction (only a literal or bound parameter is
+        // statically knowable — `rmp` #764).
         let eq_seeks = plan.static_node_index_eq_seeks(params);
         let range_seeks = plan.static_node_index_range_seeks(params);
         let composite_seeks = plan.static_node_composite_seeks(params);
         let text_seeks = plan.static_node_text_seeks(params);
+        let rel_eq_seeks = plan.static_rel_index_eq_seeks(params);
+        let rel_range_seeks = plan.static_rel_index_range_seeks(params);
+        let rel_composite_seeks = plan.static_rel_composite_seeks(params);
         if eq_seeks.is_empty()
             && range_seeks.is_empty()
             && composite_seeks.is_empty()
             && text_seeks.is_empty()
+            && rel_eq_seeks.is_empty()
+            && rel_range_seeks.is_empty()
+            && rel_composite_seeks.is_empty()
         {
             return crate::read_source::IndexCandidateCapture::default();
         }
@@ -8078,14 +8085,47 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 Some((label_token, prop_key, op, needle))
             })
             .collect();
+        // Relationship seeks resolve the type through the `RelType` namespace (`rmp` #769); the property
+        // namespace is shared with nodes.
+        let rel_eq_requests: Vec<(u32, u32, Value)> = rel_eq_seeks
+            .into_iter()
+            .filter_map(|(rel_type, property, value)| {
+                let type_token = store.token_id(Namespace::RelType, &rel_type)?;
+                let prop_key = store.token_id(Namespace::PropKey, &property)?;
+                Some((type_token, prop_key, value))
+            })
+            .collect();
+        let rel_range_requests: Vec<crate::index_set::RangeCaptureRequest> = rel_range_seeks
+            .into_iter()
+            .filter_map(|(rel_type, property, lower, upper)| {
+                let type_token = store.token_id(Namespace::RelType, &rel_type)?;
+                let prop_key = store.token_id(Namespace::PropKey, &property)?;
+                Some((type_token, prop_key, lower, upper))
+            })
+            .collect();
+        let rel_composite_requests: Vec<crate::index_set::CompositeCaptureRequest> =
+            rel_composite_seeks
+                .into_iter()
+                .filter_map(|(rel_type, properties, values)| {
+                    let type_token = store.token_id(Namespace::RelType, &rel_type)?;
+                    let property_tokens: Option<Vec<u32>> = properties
+                        .iter()
+                        .map(|p| store.token_id(Namespace::PropKey, p))
+                        .collect();
+                    Some((type_token, property_tokens?, values))
+                })
+                .collect();
         drop(store);
-        // One `borrow_mut`, four per-kind captures merged into one memo. Each kind applies its own gates
-        // (RANGE/COMPOSITE ride the node-property rebuild watermark; TEXT rides the ft/spatial marker).
+        // One `borrow_mut`, seven per-kind captures merged into one memo. RANGE/COMPOSITE (node and rel)
+        // and equality ride the shared rebuild watermark; TEXT rides the ft/spatial marker.
         let mut index = self.index.borrow_mut();
         let mut capture = index.capture_node_property_eq(reader_ts, &eq_requests);
         capture.absorb(index.capture_node_property_range(reader_ts, &range_requests));
         capture.absorb(index.capture_node_property_composite(reader_ts, &composite_requests));
         capture.absorb(index.capture_node_property_text(reader_ts, &text_requests));
+        capture.absorb(index.capture_rel_property_eq(reader_ts, &rel_eq_requests));
+        capture.absorb(index.capture_rel_property_range(reader_ts, &rel_range_requests));
+        capture.absorb(index.capture_rel_composite(reader_ts, &rel_composite_requests));
         capture
     }
 

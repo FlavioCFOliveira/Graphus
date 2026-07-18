@@ -428,6 +428,103 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         ))
     }
 
+    fn index_seek_rel_eq(
+        &self,
+        rel_type: &str,
+        property: &str,
+        value: &Value,
+    ) -> Option<Vec<RelId>> {
+        // `rmp` task #769 — the relationship twin of `index_seek_eq`. The candidates come from the memo
+        // keyed by `(type, property, value)`; a MISS MUST decline so the executor takes the exact typed
+        // relationship scan — never `Some(vec![])`, which on the rel-property trees is not only silent
+        // row loss but a UNIQUE bypass (`rmp` #680/#738/#683).
+        let type_token = self.tokens.token_id(Namespace::RelType, rel_type)?;
+        let prop_key = self.tokens.token_id(Namespace::PropKey, property)?;
+        let candidates = self
+            .index_candidates
+            .get_rel_eq(type_token, prop_key, value)?;
+
+        // On a HIT, register the SAME footprint the inline seek does — the precise `RelEquality` predicate
+        // marker (registered by the seam, NOT inside the lifted body: the rel scan fallback registers no
+        // such marker, so it must stay in each seam, `rmp` #683) — then run the SAME lifted per-candidate
+        // re-check both seams share (rows + per-candidate SIREAD identical by construction).
+        read_source::note_rel_equality_read(self, type_token, prop_key, value);
+        Some(read_source::rel_index_seek_eq_recheck(
+            &self.source(),
+            &self.ctx(),
+            self,
+            rel_type,
+            property,
+            value,
+            candidates.to_vec(),
+        ))
+    }
+
+    fn index_seek_rel_range(
+        &self,
+        rel_type: &str,
+        property: &str,
+        lower: Option<(&Value, bool)>,
+        upper: Option<(&Value, bool)>,
+    ) -> Option<Vec<RelId>> {
+        // `rmp` task #769/#680 — gives the `RelIndexRangeSeek` a production read path. A MISS declines to
+        // the exact typed-scan + range filter (`rmp` #680/#738).
+        let type_token = self.tokens.token_id(Namespace::RelType, rel_type)?;
+        let prop_key = self.tokens.token_id(Namespace::PropKey, property)?;
+        let candidates = self
+            .index_candidates
+            .get_rel_range(type_token, prop_key, lower, upper)?;
+
+        // On a HIT, register the SAME footprint the inline range seek does — the coarse `RelType` marker +
+        // the blanket `mark_all_live_rels` (a range predicate has no precise equality marker) — then run
+        // the SAME lifted per-candidate re-check.
+        self.note_predicate_read(PredicateRead::RelType(type_token));
+        read_source::mark_all_live_rels(&self.source(), self);
+        Some(read_source::rel_index_seek_range_recheck(
+            &self.source(),
+            &self.ctx(),
+            self,
+            rel_type,
+            property,
+            lower,
+            upper,
+            candidates.to_vec(),
+        ))
+    }
+
+    fn index_seek_rel_composite_eq(
+        &self,
+        rel_type: &str,
+        properties: &[String],
+        values: &[Value],
+    ) -> Option<Vec<RelId>> {
+        // `rmp` task #769/#666 — the relationship composite twin. A MISS declines to the exact typed scan
+        // + per-key equality (`rmp` #680/#738).
+        let type_token = self.tokens.token_id(Namespace::RelType, rel_type)?;
+        let property_tokens: Option<Vec<u32>> = properties
+            .iter()
+            .map(|p| self.tokens.token_id(Namespace::PropKey, p))
+            .collect();
+        let property_tokens = property_tokens?;
+        let candidates =
+            self.index_candidates
+                .get_rel_composite(type_token, &property_tokens, values)?;
+
+        // On a HIT, register the SAME footprint the inline composite seek does (`RelType` + blanket
+        // `mark_all_live_rels`), then run the SAME lifted per-candidate tuple re-check.
+        self.note_predicate_read(PredicateRead::RelType(type_token));
+        read_source::mark_all_live_rels(&self.source(), self);
+        Some(read_source::rel_index_seek_composite_recheck(
+            &self.source(),
+            &self.ctx(),
+            self,
+            rel_type,
+            properties,
+            values,
+            candidates.to_vec(),
+        ))
+    }
+
     fn expand(&self, node: NodeId, direction: ExpandDirection, types: &[String]) -> Vec<Incident> {
         read_source::expand(&self.source(), &self.ctx(), self, node, direction, types)
     }

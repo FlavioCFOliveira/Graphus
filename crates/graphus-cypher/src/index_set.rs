@@ -2103,6 +2103,88 @@ impl IndexSet {
         capture
     }
 
+    /// Runs the RELATIONSHIP-property **equality seeks** in `requests` on this (engine-thread) index and
+    /// memoises their candidate rel ids for an off-thread reader (`rmp` task #769) — the relationship
+    /// twin of [`capture_node_property_eq`](Self::capture_node_property_eq).
+    ///
+    /// Each request is `(type_token, prop_key, value)`. Relationship-property trees are the same
+    /// append-only, `clear`-and-refill-rebuilt class as node-property trees, so they ride the identical
+    /// gates: capture nothing when [`degraded`](Self#structfield.degraded) or when the reader predates
+    /// the last rebuild (`reader_ts < rebuilt_trees_trustworthy_from`, `rmp` #765), and per request only
+    /// when the index is `Online`. A `List` value the index cannot key is skipped (the reader then
+    /// declines to the exact typed scan, `rmp` #680).
+    #[must_use]
+    pub fn capture_rel_property_eq(
+        &mut self,
+        reader_ts: Timestamp,
+        requests: &[(u32, u32, Value)],
+    ) -> crate::read_source::IndexCandidateCapture {
+        let mut capture = crate::read_source::IndexCandidateCapture::default();
+        if self.degraded || reader_ts < self.rebuilt_trees_trustworthy_from {
+            return capture;
+        }
+        for (type_token, prop_key, value) in requests {
+            if self.rel_property_state(*type_token, *prop_key) != Some(IndexState::Online) {
+                continue;
+            }
+            if let Some(ids) = self.seek_rel_property_eq(*type_token, *prop_key, value) {
+                capture.insert_rel_eq(*type_token, *prop_key, value, ids);
+            }
+        }
+        capture
+    }
+
+    /// Runs the RELATIONSHIP-property **RANGE seeks** in `requests` (`rmp` task #769/#680) — the twin of
+    /// [`capture_node_property_range`](Self::capture_node_property_range). Same append-only rebuild-watermark
+    /// gates as the rel-eq capture; per request the index must be `Online`.
+    #[must_use]
+    pub fn capture_rel_property_range(
+        &mut self,
+        reader_ts: Timestamp,
+        requests: &[RangeCaptureRequest],
+    ) -> crate::read_source::IndexCandidateCapture {
+        let mut capture = crate::read_source::IndexCandidateCapture::default();
+        if self.degraded || reader_ts < self.rebuilt_trees_trustworthy_from {
+            return capture;
+        }
+        for (type_token, prop_key, lower, upper) in requests {
+            if self.rel_property_state(*type_token, *prop_key) != Some(IndexState::Online) {
+                continue;
+            }
+            let lo = lower.as_ref().map(|(v, inc)| (v, *inc));
+            let up = upper.as_ref().map(|(v, inc)| (v, *inc));
+            if let Some(ids) = self.seek_rel_property_range(*type_token, *prop_key, lo, up) {
+                capture.insert_rel_range(*type_token, *prop_key, lo, up, ids);
+            }
+        }
+        capture
+    }
+
+    /// Runs the RELATIONSHIP **COMPOSITE equality seeks** in `requests` (`rmp` task #769/#666) — the twin
+    /// of [`capture_node_property_composite`](Self::capture_node_property_composite). Composite relationship
+    /// indexes are the same append-only rebuild class; per request the index must be registered
+    /// ([`has_rel_composite`](Self::has_rel_composite)).
+    #[must_use]
+    pub fn capture_rel_composite(
+        &mut self,
+        reader_ts: Timestamp,
+        requests: &[CompositeCaptureRequest],
+    ) -> crate::read_source::IndexCandidateCapture {
+        let mut capture = crate::read_source::IndexCandidateCapture::default();
+        if self.degraded || reader_ts < self.rebuilt_trees_trustworthy_from {
+            return capture;
+        }
+        for (type_token, property_tokens, values) in requests {
+            if !self.has_rel_composite(*type_token, property_tokens) {
+                continue;
+            }
+            if let Some(ids) = self.seek_rel_composite_eq(*type_token, property_tokens, values) {
+                capture.insert_rel_composite(*type_token, property_tokens, values, ids);
+            }
+        }
+        capture
+    }
+
     /// The registered full-text index names (in any state), ascending. Used by the coordinator's
     /// rebuild to know which indexes to repopulate and by `SHOW FULLTEXT INDEXES`.
     #[must_use]
@@ -5020,6 +5102,41 @@ mod tests {
         assert!(
             declined.is_empty(),
             "the whole text capture must be empty for a pre-marker reader"
+        );
+    }
+
+    /// `rmp` #769: the RELATIONSHIP-property capture rides the SAME node-property rebuild watermark
+    /// (`rebuilt_trees_trustworthy_from`) as the node capture — rel-property trees are the same
+    /// append-only, `clear`-and-refill-rebuilt class (`rmp` #765). Exercised here, not presumed from the
+    /// node test: a reader older than the last rebuild must have its rel capture DECLINE (→ exact typed
+    /// scan), never be served a subset (which on the rel trees would be a `rmp` #683 uniqueness hazard).
+    /// The rel-range and rel-composite captures share the identical guard (same first two lines).
+    #[test]
+    fn rmp769_rel_capture_declines_for_a_reader_older_than_the_rebuild() {
+        let mut set = IndexSet::new();
+        set.register_rel_property_with_state(1, 5, IndexState::Online);
+        set.insert_rel_property(1, 5, &Value::Integer(7), 100);
+        // A rebuild wiped + newest-wins-refilled every tree; stamp its high-water at ts 10.
+        set.note_trees_rebuilt(Timestamp(10));
+
+        // A reader AT/AFTER the watermark is served the candidate rel id.
+        let served = set.capture_rel_property_eq(Timestamp(10), &[(1, 5, Value::Integer(7))]);
+        assert_eq!(
+            served.get_rel_eq(1, 5, &Value::Integer(7)).as_deref(),
+            Some(&[100u64][..]),
+            "a reader at/after the rebuild watermark must be SERVED — else the decline below is vacuous"
+        );
+
+        // A reader OLDER than the watermark must DECLINE (the stale entries it depends on were annihilated).
+        let declined = set.capture_rel_property_eq(Timestamp(9), &[(1, 5, Value::Integer(7))]);
+        assert!(
+            declined.get_rel_eq(1, 5, &Value::Integer(7)).is_none(),
+            "a reader older than the rebuild watermark MUST decline; serving it would risk a subset — and \
+             on the rel trees a missing candidate admits a committed duplicate (`rmp` #683)"
+        );
+        assert!(
+            declined.is_empty(),
+            "the whole rel capture must be empty for a pre-rebuild reader"
         );
     }
 
