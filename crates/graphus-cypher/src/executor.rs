@@ -2510,16 +2510,25 @@ fn build_operator_unprofiled(
             ..
         } => {
             // Composite (multi-property) equality seek (`rmp` task #657): evaluate each key's seek value
-            // at run time (a literal or a `$param`), then route to the composite index seam. The seam
-            // returns a candidate SUPERSET which it has already re-checked for the current per-key tuple;
-            // when no composite index is available it returns `None` and we fall back to a label scan
-            // filtered by every key (the operator consumed the equality conjuncts, so the fallback must
-            // re-apply them). Both paths yield the identical node set.
+            // at run time, then route to the composite index seam. The seam returns a candidate SUPERSET
+            // which it has already re-checked for the current per-key tuple; when no composite index is
+            // available it returns `None` and we fall back to a label scan filtered by every key (the
+            // operator consumed the equality conjuncts, so the fallback must re-apply them). Both paths
+            // yield the identical node set.
+            //
+            // Each key value is normally a literal or `$param`, but a CORRELATED composite seek (`rmp`
+            // task #729 — the right branch of a nested-loop join, e.g.
+            // `UNWIND rows AS t MATCH (b:L {a: t.x, b: t.y})` with a composite `(a, b)` index) keys them
+            // off the LEFT row's bindings, which the join supplies as the correlation row `arg`.
+            // Evaluating against `arg` (the empty row at the top level) resolves each per-row key exactly
+            // as the single-property `NodeIndexSeek` arm does for #708; a row-independent literal/param
+            // yields the same value against either row.
+            let empty = Row::empty();
             let mut seek_values = Vec::with_capacity(values.len());
             for value in values {
                 seek_values.push(eval_value(
                     value,
-                    &Row::empty(),
+                    arg.unwrap_or(&empty),
                     ctx.params,
                     ctx.graph,
                     ctx.functions,
@@ -9553,6 +9562,453 @@ mod tests {
             assert!(
                 rendered.contains("NodeIndexSeek"),
                 "the correlated anchor must use the index seek:\n{rendered}"
+            );
+            assert!(
+                !rendered.contains("NodeByLabelScan"),
+                "the correlated anchor must NOT fall back to a label scan:\n{rendered}"
+            );
+        }
+    }
+
+    /// A `GraphAccess` seam over a [`MemGraph`] with a **real** in-process composite index on
+    /// `(Account.tenant, Account.extid)` (a hash map from the canonical key tuple to node ids), plus a
+    /// [`Cell`](std::cell::Cell) counting the **node records examined** by whichever access path runs:
+    ///
+    /// * [`index_seek_composite_eq`](GraphAccess::index_seek_composite_eq) does an O(1) hash lookup and
+    ///   charges only the candidates it returns — the composite **seek** path (`rmp` task #729, post-fix).
+    /// * [`scan_nodes_by_label`](GraphAccess::scan_nodes_by_label) charges every node of the label — the
+    ///   label **scan** path a pre-#729 correlated composite anchor degrades to (its leading-prefix
+    ///   `NodeIndexSeek` finds no single-key tree in a composite-only store and falls back to a full scan
+    ///   per driving row).
+    ///
+    /// This lets a sweep over the node count `N` measure the per-driving-row cost of each path directly
+    /// and deterministically (an examined-record count, not a wall-clock time), proving the seek stays
+    /// flat in `N` while the scan grows linearly.
+    struct CountingCompositeGraph {
+        inner: MemGraph,
+        composite: std::collections::HashMap<String, Vec<NodeId>>,
+        examined: std::cell::Cell<usize>,
+    }
+
+    impl CountingCompositeGraph {
+        /// Canonical string key for a composite tuple (deterministic for the `Integer` keys the sweep
+        /// uses); both the build below and the seek lookup format values the same way.
+        fn key_of(values: &[Value]) -> String {
+            values
+                .iter()
+                .map(|v| format!("{v:?}"))
+                .collect::<Vec<_>>()
+                .join("|")
+        }
+
+        fn new(inner: MemGraph) -> Self {
+            let mut composite: std::collections::HashMap<String, Vec<NodeId>> =
+                std::collections::HashMap::new();
+            for id in inner.scan_nodes_by_label("Account") {
+                let tenant = inner.node_property(id, "tenant");
+                let extid = inner.node_property(id, "extid");
+                if let (Some(t), Some(e)) = (tenant, extid) {
+                    composite.entry(Self::key_of(&[t, e])).or_default().push(id);
+                }
+            }
+            Self {
+                inner,
+                composite,
+                examined: std::cell::Cell::new(0),
+            }
+        }
+
+        fn reset(&self) {
+            self.examined.set(0);
+        }
+        fn examined(&self) -> usize {
+            self.examined.get()
+        }
+    }
+
+    impl crate::statistics::Statistics for CountingCompositeGraph {
+        fn total_nodes(&self) -> u64 {
+            self.inner.node_count() as u64
+        }
+        fn nodes_with_label(&self, label: &str) -> Option<u64> {
+            Some(self.inner.scan_nodes_by_label(label).len() as u64)
+        }
+        fn total_relationships(&self) -> u64 {
+            0
+        }
+        fn relationships_with_type(&self, _rel_type: &str) -> Option<u64> {
+            Some(0)
+        }
+    }
+
+    impl GraphAccess for CountingCompositeGraph {
+        fn index_seek_composite_eq(
+            &self,
+            _label: &str,
+            _properties: &[String],
+            values: &[Value],
+        ) -> Option<Vec<NodeId>> {
+            // O(1) hash lookup; charge only the candidates returned (the seek's true storage cost).
+            let ids = self
+                .composite
+                .get(&Self::key_of(values))
+                .cloned()
+                .unwrap_or_default();
+            self.examined.set(self.examined.get() + ids.len());
+            Some(ids)
+        }
+        fn scan_nodes_by_label(&self, label: &str) -> Vec<NodeId> {
+            // Charge every node record the scan touches (the label-scan path's true storage cost).
+            let ids = self.inner.scan_nodes_by_label(label);
+            self.examined.set(self.examined.get() + ids.len());
+            ids
+        }
+        fn statistics(&self) -> Option<&dyn crate::statistics::Statistics> {
+            Some(self)
+        }
+        fn scan_nodes(&self) -> Vec<NodeId> {
+            self.inner.scan_nodes()
+        }
+        fn expand(
+            &self,
+            node: NodeId,
+            direction: ExpandDirection,
+            types: &[String],
+        ) -> Vec<crate::graph_access::Incident> {
+            self.inner.expand(node, direction, types)
+        }
+        fn node_exists(&self, node: NodeId) -> bool {
+            self.inner.node_exists(node)
+        }
+        fn rel_exists(&self, rel: RelId) -> bool {
+            self.inner.rel_exists(rel)
+        }
+        fn node_labels(&self, node: NodeId) -> Option<Vec<String>> {
+            self.inner.node_labels(node)
+        }
+        fn rel_data(&self, rel: RelId) -> Option<crate::graph_access::RelData> {
+            self.inner.rel_data(rel)
+        }
+        fn node_property(&self, node: NodeId, key: &str) -> Option<Value> {
+            self.inner.node_property(node, key)
+        }
+        fn rel_property(&self, rel: RelId, key: &str) -> Option<Value> {
+            self.inner.rel_property(rel, key)
+        }
+        fn node_properties(&self, node: NodeId) -> Option<Vec<(String, Value)>> {
+            self.inner.node_properties(node)
+        }
+        fn rel_properties(&self, rel: RelId) -> Option<Vec<(String, Value)>> {
+            self.inner.rel_properties(rel)
+        }
+        fn create_node(&mut self, labels: &[String], properties: &[(String, Value)]) -> NodeId {
+            self.inner.create_node(labels, properties)
+        }
+        fn create_rel(
+            &mut self,
+            rel_type: &str,
+            start: NodeId,
+            end: NodeId,
+            properties: &[(String, Value)],
+        ) -> RelId {
+            self.inner.create_rel(rel_type, start, end, properties)
+        }
+        fn set_node_property(&mut self, node: NodeId, key: &str, value: Value) {
+            self.inner.set_node_property(node, key, value);
+        }
+        fn set_rel_property(&mut self, rel: RelId, key: &str, value: Value) {
+            self.inner.set_rel_property(rel, key, value);
+        }
+        fn add_labels(&mut self, node: NodeId, labels: &[String]) {
+            self.inner.add_labels(node, labels);
+        }
+        fn remove_labels(&mut self, node: NodeId, labels: &[String]) {
+            self.inner.remove_labels(node, labels);
+        }
+        fn remove_node_property(&mut self, node: NodeId, key: &str) {
+            self.inner.remove_node_property(node, key);
+        }
+        fn remove_rel_property(&mut self, rel: RelId, key: &str) {
+            self.inner.remove_rel_property(rel, key);
+        }
+        fn replace_node_properties(&mut self, node: NodeId, properties: &[(String, Value)]) {
+            self.inner.replace_node_properties(node, properties);
+        }
+        fn merge_node_properties(&mut self, node: NodeId, properties: &[(String, Value)]) {
+            self.inner.merge_node_properties(node, properties);
+        }
+        fn replace_rel_properties(&mut self, rel: RelId, properties: &[(String, Value)]) {
+            self.inner.replace_rel_properties(rel, properties);
+        }
+        fn merge_rel_properties(&mut self, rel: RelId, properties: &[(String, Value)]) {
+            self.inner.merge_rel_properties(rel, properties);
+        }
+        fn incident_rels(&self, node: NodeId) -> Vec<RelId> {
+            self.inner.incident_rels(node)
+        }
+        fn delete_rel(&mut self, rel: RelId) {
+            self.inner.delete_rel(rel);
+        }
+        fn delete_node(&mut self, node: NodeId) {
+            self.inner.delete_node(node);
+        }
+    }
+
+    #[test]
+    fn correlated_composite_seek_per_row_cost_is_flat_in_n() {
+        // `rmp` task #729 — the WHOLE POINT of the fix, measured. A batched load keyed on a composite
+        // business key drives a FIXED number of rows against a store of `N` `:Account` nodes. Pre-fix
+        // the correlated composite anchor degrades to a per-row LABEL SCAN (O(N) per row → O(D·N)
+        // total); post-fix it is a per-row composite SEEK (O(1) per row → O(D) total, flat in N).
+        //
+        // Measured deterministically as node records EXAMINED (not wall-clock): the `CountingCompositeGraph`
+        // seam charges the seek only its candidates and the scan every node it touches. The scan path
+        // (`no_index` catalog) is the growing-slope proxy for the pre-fix cost; the seek path
+        // (`with_index` composite catalog) is the flat line. Both are run on the SAME seam and asserted
+        // to return the IDENTICAL rows, so the flatness is proven against a real, growing baseline.
+        use crate::binding::Parameters;
+
+        // A fixed batch of driving rows; each composite key `(tenant=i%7, extid=i)` hits exactly one node
+        // (extid is unique). Independent of N.
+        const D: i64 = 8;
+        let rows = Value::List(
+            (0..D)
+                .map(|i| {
+                    Value::Map(vec![
+                        ("tn".to_owned(), Value::Integer(i % 7)),
+                        ("ex".to_owned(), Value::Integer(i)),
+                    ])
+                })
+                .collect(),
+        );
+        let params = Parameters::new().with("rows", rows);
+
+        let with_index = IndexCatalog::builder()
+            .with_label_composite("Account", ["tenant", "extid"])
+            .build();
+        let no_index = IndexCatalog::empty();
+
+        // Runs `src` against `seam` with `catalog` (cost-based, so the optimiser is exercised too),
+        // returning (sorted matched node ids, node records examined).
+        fn run_measured(
+            src: &str,
+            seam: &mut CountingCompositeGraph,
+            catalog: &IndexCatalog,
+            params: &Parameters,
+        ) -> (Vec<u64>, usize) {
+            let toks = tokenize(src).expect("lex");
+            let ast = parse_tokens(&toks, src).expect("parse");
+            let logical = lower(&analyze(&ast).expect("analyze"));
+            let plan = {
+                let stats = seam.statistics();
+                crate::physical::plan_physical_with_stats(&logical, catalog, stats)
+            };
+            let bound = crate::binding::bind_parameters(&plan, params).expect("bind");
+            seam.reset();
+            let mut ids: Vec<u64> = execute(&plan, &bound, seam)
+                .expect("open")
+                .collect_all()
+                .expect("rows")
+                .iter()
+                .filter_map(|r| r.get("b").and_then(RowValue::as_node))
+                .map(|id| id.0)
+                .collect();
+            ids.sort_unstable();
+            (ids, seam.examined())
+        }
+
+        let src = "UNWIND $rows AS t MATCH (b:Account {tenant: t.tn, extid: t.ex}) RETURN b";
+
+        let sweep = [250usize, 500, 1000, 2000, 4000];
+        let mut seek_curve: Vec<(usize, usize)> = Vec::new();
+        let mut scan_curve: Vec<(usize, usize)> = Vec::new();
+        for &n in &sweep {
+            let mut mem = MemGraph::new();
+            for i in 0..n as i64 {
+                mem.add_node(
+                    ["Account"],
+                    [
+                        ("tenant", Value::Integer(i % 7)),
+                        ("extid", Value::Integer(i)),
+                    ],
+                );
+            }
+            let mut seam = CountingCompositeGraph::new(mem);
+
+            let (seek_ids, seek_examined) = run_measured(src, &mut seam, &with_index, &params);
+            let (scan_ids, scan_examined) = run_measured(src, &mut seam, &no_index, &params);
+
+            // Correctness during the measurement: seek and scan agree, and D rows match (extid unique).
+            assert_eq!(seek_ids, scan_ids, "seek and scan disagree at N={n}");
+            assert_eq!(seek_ids.len(), D as usize, "expected {D} matches at N={n}");
+
+            seek_curve.push((n, seek_examined));
+            scan_curve.push((n, scan_examined));
+        }
+
+        eprintln!("[#729 flat-cost] D={D} driving rows; examined node records vs N:");
+        for ((n, seek), (_, scan)) in seek_curve.iter().zip(scan_curve.iter()) {
+            eprintln!(
+                "  N={n:>5}  seek={seek:>7}  scan={scan:>9}  scan/seek={:.1}x",
+                *scan as f64 / (*seek).max(1) as f64
+            );
+        }
+
+        // SEEK is FLAT: examined is constant across the whole sweep (D candidates, one per driving row,
+        // independent of N).
+        let seek_baseline = seek_curve[0].1;
+        for &(n, examined) in &seek_curve {
+            assert_eq!(
+                examined, seek_baseline,
+                "the composite SEEK must be flat in N: examined {examined} at N={n} != {seek_baseline}"
+            );
+        }
+        assert_eq!(
+            seek_baseline, D as usize,
+            "the seek examines exactly one candidate per driving row"
+        );
+
+        // SCAN GROWS linearly: examined == D * N at each point (a full label scan per driving row).
+        for &(n, examined) in &scan_curve {
+            assert_eq!(
+                examined,
+                D as usize * n,
+                "the label SCAN cost must be D*N: examined {examined} at N={n}"
+            );
+        }
+        // And the growth is real: doubling N doubles the scan cost while the seek cost is unchanged —
+        // the flat line is proven against a genuine slope, not asserted in a vacuum.
+        assert!(
+            scan_curve.last().unwrap().1 > 10 * scan_curve.first().unwrap().1,
+            "the scan slope must grow with N across the sweep: {scan_curve:?}"
+        );
+    }
+
+    #[test]
+    fn correlated_composite_index_seek_returns_exactly_the_scan_result() {
+        // `rmp` task #729: a row-valued (correlated) FULL-composite anchor —
+        // `UNWIND $rows AS t MATCH (b:Account {tenant: t.tn, extid: t.ex})` over a composite
+        // `(tenant, extid)` index — now lowers to a per-left-row `NodeCompositeIndexSeek` keyed off the
+        // correlation row instead of a leading-prefix scan + residual filter. The seek must NEVER change
+        // results: for every driving row the composite seek path and the plain scan+filter path must
+        // return the IDENTICAL node set (same rows, same multiplicity). This pins that the executor
+        // evaluates EACH key value against the correlation row — a regression that evaluated them against
+        // the empty row would resolve every key to `null` and return zero rows, failing here.
+        use crate::binding::Parameters;
+
+        fn ids(
+            src: &str,
+            graph: &mut MemGraph,
+            catalog: &IndexCatalog,
+            params: &Parameters,
+        ) -> Vec<u64> {
+            let mut out: Vec<u64> = run_with_catalog_and_params(src, graph, catalog, params)
+                .iter()
+                .filter_map(|r| r.get("b").and_then(RowValue::as_node))
+                .map(|id| id.0)
+                .collect();
+            out.sort_unstable();
+            out
+        }
+
+        // Two identically-seeded graphs. `with_index` routes the planner to the correlated
+        // `NodeCompositeIndexSeek`; `no_index` to the plain label scan + residual filters (the `MemGraph`
+        // seam serves both through `scan_filter_composite_eq`, so this isolates the PLAN difference).
+        // Includes a DUPLICATE composite key (two nodes share `(1, 3)`) so multiplicity is exercised,
+        // and a decoy that matches only the LEADING key (`(1, 999)`: same tenant, different extid) so a
+        // leading-prefix-only seek would over-match and be caught.
+        let seed = |g: &mut MemGraph| {
+            g.add_node(
+                ["Account"],
+                [("tenant", Value::Integer(1)), ("extid", Value::Integer(3))],
+            );
+            g.add_node(
+                ["Account"],
+                [("tenant", Value::Integer(1)), ("extid", Value::Integer(3))],
+            ); // duplicate composite key
+            g.add_node(
+                ["Account"],
+                [
+                    ("tenant", Value::Integer(1)),
+                    ("extid", Value::Integer(999)),
+                ],
+            ); // same tenant, other extid (leading-prefix decoy)
+            g.add_node(
+                ["Account"],
+                [("tenant", Value::Integer(2)), ("extid", Value::Integer(3))],
+            ); // same extid, other tenant
+            g.add_node(
+                ["Account"],
+                [("tenant", Value::Integer(2)), ("extid", Value::Integer(7))],
+            );
+        };
+        let mut indexed = MemGraph::new();
+        seed(&mut indexed);
+        let mut plain = MemGraph::new();
+        seed(&mut plain);
+
+        let with_index = IndexCatalog::builder()
+            .with_label_composite("Account", ["tenant", "extid"])
+            .build();
+        let no_index = IndexCatalog::empty();
+
+        let rows = Value::List(vec![
+            Value::Map(vec![
+                ("tn".to_owned(), Value::Integer(1)),
+                ("ex".to_owned(), Value::Integer(3)),
+            ]), // matches BOTH duplicates
+            Value::Map(vec![
+                ("tn".to_owned(), Value::Integer(2)),
+                ("ex".to_owned(), Value::Integer(7)),
+            ]), // matches exactly one
+            Value::Map(vec![
+                ("tn".to_owned(), Value::Integer(1)),
+                ("ex".to_owned(), Value::Integer(5)),
+            ]), // MISSING: tenant 1 exists but no extid 5 -> zero rows
+            Value::Map(vec![
+                ("tn".to_owned(), Value::Integer(9)),
+                ("ex".to_owned(), Value::Integer(9)),
+            ]), // MISSING: neither key present -> zero rows
+        ]);
+        let params = Parameters::new().with("rows", rows);
+
+        for src in [
+            "UNWIND $rows AS t MATCH (b:Account {tenant: t.tn, extid: t.ex}) RETURN b",
+            "UNWIND $rows AS t MATCH (b:Account) WHERE b.tenant = t.tn AND b.extid = t.ex RETURN b",
+            "UNWIND $rows AS t WITH t.tn AS tn, t.ex AS ex \
+             MATCH (b:Account {tenant: tn, extid: ex}) RETURN b",
+        ] {
+            let seek = ids(src, &mut indexed, &with_index, &params);
+            let scan = ids(src, &mut plain, &no_index, &params);
+            assert_eq!(seek, scan, "composite index must not change results: {src}");
+            // (1,3) matches 2 duplicates + (2,7) matches 1 + two missing keys = 3 rows total. The
+            // leading-prefix decoy (1,999) must NOT appear (it would if only `tenant` were sought).
+            assert_eq!(seek.len(), 3, "expected 3 matched rows: {src}");
+
+            // Also validate the COST-BASED plan (the optimiser must not break the correlated composite
+            // seek by reordering it to the outer side or reverting it to a scan, `rmp` task #729).
+            let mut cost_based: Vec<u64> =
+                run_with_catalog_params_stats(src, &mut indexed, &with_index, &params)
+                    .iter()
+                    .filter_map(|r| r.get("b").and_then(RowValue::as_node))
+                    .map(|id| id.0)
+                    .collect();
+            cost_based.sort_unstable();
+            assert_eq!(
+                cost_based, scan,
+                "cost-based plan must not change results: {src}"
+            );
+
+            // The indexed plan must route through the correlated composite seek (else this proves nothing).
+            let plan = {
+                let toks = tokenize(src).expect("lex");
+                let ast = parse_tokens(&toks, src).expect("parse");
+                plan_physical(&lower(&analyze(&ast).expect("analyze")), &with_index)
+            };
+            let rendered = plan.to_string();
+            assert!(
+                rendered.contains("NodeCompositeIndexSeek"),
+                "the correlated anchor must use the composite index seek:\n{rendered}"
             );
             assert!(
                 !rendered.contains("NodeByLabelScan"),

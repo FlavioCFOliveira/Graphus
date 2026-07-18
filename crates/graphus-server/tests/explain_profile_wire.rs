@@ -608,6 +608,125 @@ async fn the_off_thread_reader_serves_a_composite_seek_and_profile_measures_it()
     let _ = server.shutdown().await;
 }
 
+/// **`rmp` #729 — a CORRELATED composite anchor works correctly off-thread (the reader pool).**
+///
+/// The composite follow-up to #708, verified end-to-end over the real Bolt wire through the off-thread
+/// reader pool (a structurally read-only auto-commit statement is dispatched there, as the sibling
+/// tests above establish). A row-valued (correlated) full-composite anchor —
+/// `UNWIND rows AS t MATCH (b:Account {tenant: t.tn, extid: t.ex})` over a composite `(tenant, extid)`
+/// index — must (a) lower to a `NodeCompositeIndexSeek` and (b) return the EXACT rows, including a
+/// DUPLICATE composite key (matched twice), MISSING keys (matched zero times), and a leading-prefix
+/// DECOY (same `tenant`, different `extid`) that a leading-key-only seek would wrongly admit.
+///
+/// A correlated per-row seek's key is NOT statically knowable, so it is excluded from the dispatch-time
+/// index-candidate memo (`rmp` #764) — the off-thread reader therefore MISSES the memo and DECLINES to
+/// the exact `scan_filter_composite_eq` fallback (never `Some(vec![])`, the #680/#738 row-loss guard),
+/// which `ReadOnlyGraph` serves correctly from its captured store view. The measured `dbHits` reflect
+/// that honest scan (≥ the whole label), which is the signature of the decline-to-scan path running
+/// off-thread — while the plan still faithfully reports the `NodeCompositeIndexSeek` the planner chose.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_correlated_composite_anchor_is_correct_off_thread() {
+    let temp = TempStore::new("readerpool-correlated-composite");
+    let server = boot(&temp).await;
+
+    let (ops, hits, rows, account_count) = tokio::task::spawn_blocking(move || {
+        let mut c = connect(&temp);
+
+        // 200 distinct filler accounts (none match any driving row), plus the correctness fixtures:
+        //   (1,3) TWICE  -> a duplicate composite key (must match twice)
+        //   (1,999)      -> a leading-prefix DECOY (same tenant, other extid: must NOT match)
+        //   (2,3)        -> same extid, other tenant (must NOT match (1,3))
+        //   (2,7)        -> matches exactly one driving row
+        c.run(
+            "UNWIND range(0, 199) AS i \
+             CREATE (:Account {tenant: 1000 + i, extid: 2000 + i})",
+        )
+        .expect("seed fillers");
+        c.run(
+            "CREATE (:Account {tenant: 1, extid: 3}) \
+             CREATE (:Account {tenant: 1, extid: 3}) \
+             CREATE (:Account {tenant: 1, extid: 999}) \
+             CREATE (:Account {tenant: 2, extid: 3}) \
+             CREATE (:Account {tenant: 2, extid: 7})",
+        )
+        .expect("seed fixtures");
+        c.run("CREATE INDEX account_key FOR (a:Account) ON (a.tenant, a.extid)")
+            .expect("composite index");
+
+        let account_count = match c
+            .run("MATCH (a:Account) RETURN count(a) AS n")
+            .expect("count")
+            .records[0][0]
+        {
+            Value::Integer(n) => n,
+            ref other => panic!("count returned {other:?}"),
+        };
+
+        // The correlated composite read, PROFILEd, over an inline row list (so no `$param` plumbing).
+        // The driving keys: (1,3) matches BOTH duplicates, (2,7) matches one, (1,5) and (9,9) are
+        // MISSING and must yield nothing.
+        let query = "PROFILE UNWIND [{tn: 1, ex: 3}, {tn: 2, ex: 7}, {tn: 1, ex: 5}, {tn: 9, ex: 9}] \
+                     AS t MATCH (b:Account {tenant: t.tn, extid: t.ex}) \
+                     RETURN b.tenant AS t, b.extid AS e";
+        let reply = c.run(query).expect("correlated composite read");
+        let plan = wire_plan(&reply.summary).expect("a PROFILE reports a plan");
+
+        // Collect (tenant, extid) pairs the read returned.
+        let mut pairs: Vec<(i64, i64)> = reply
+            .records
+            .iter()
+            .map(|r| {
+                let t = match r[0] {
+                    Value::Integer(n) => n,
+                    ref o => panic!("tenant {o:?}"),
+                };
+                let e = match r[1] {
+                    Value::Integer(n) => n,
+                    ref o => panic!("extid {o:?}"),
+                };
+                (t, e)
+            })
+            .collect();
+        pairs.sort_unstable();
+
+        (
+            operators(&plan.root),
+            total_db_hits(&plan.root),
+            pairs,
+            account_count,
+        )
+    })
+    .await
+    .expect("client thread");
+
+    // (a) EXACT rows: (1,3) twice + (2,7) once; the (1,999) decoy and the (2,3) off-tenant node are
+    // excluded; the two missing keys contribute nothing.
+    assert_eq!(
+        rows,
+        vec![(1, 3), (1, 3), (2, 7)],
+        "the correlated composite read must return exactly the matching rows off-thread"
+    );
+
+    // (b) the planner lowered the correlated composite anchor to a composite seek, over the real wire.
+    assert!(
+        ops.iter().any(|o| o == "NodeCompositeIndexSeek"),
+        "the correlated composite anchor must lower to a NodeCompositeIndexSeek: {ops:?}"
+    );
+
+    // (c) it ran through the off-thread reader's DECLINE-to-scan path: a correlated per-row key is not
+    // captured in the dispatch memo (`rmp` #764), so the reader honestly scans (≥ the whole label) and
+    // measures it — not the tiny accelerated count a static composite seek gets (#768). This is the
+    // measured signature that the off-thread reader served the correlated seek correctly via the scan
+    // fallback, with the plan still reporting the seek the planner picked.
+    assert!(
+        hits >= account_count,
+        "the off-thread reader declined the correlated seek to a full scan and measured it: \
+         dbHits={hits}, accounts={account_count}"
+    );
+
+    let _ = server.shutdown().await;
+}
+
 /// **`rmp` #768 — the off-thread reader now serves a node TEXT (trigram) seek, MEASURED.**
 ///
 /// This is the exact residual the `rmp` #746 index-seek gate reproduced on a live server:

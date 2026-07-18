@@ -1965,18 +1965,24 @@ impl Planner<'_> {
             return seek;
         }
 
-        // Correlated (row-valued) index seek (`rmp` task #708). A `Filter` sitting over an
-        // [`Apply`](LogicalOp::Apply) whose RIGHT branch is a bare label scan, carrying an
-        // equality/range conjunct on the right's node keyed by a value that references only the
-        // LEFT (correlated) branch — the shape `UNWIND rows AS t MATCH (b:L {p: t.k})` lowers to —
-        // seeks the `(label, prop)` index **per left row** instead of scanning every `:L` node and
-        // filtering. Without this the correlation lives in the `Filter` **above** a cartesian
-        // nested-loop join, so each of the N left rows drives a full O(store) label scan (the
-        // O(N)-per-row cost measured on `social-network-uds` #697; the root of the #312 family's
-        // O(E·N) bulk-over-Cypher). Runs before the bare-label-scan path below (whose `input` is a
-        // scan, not an `Apply`), so the two are disjoint.
-        if let LogicalOp::Apply { left, right } = input
-            && let Some(seek) = self.try_correlated_index_seek(left, right, predicate, deps)
+        // Correlated (row-valued) index seek (`rmp` tasks #708 single-property, #729 composite). A
+        // `Filter` sitting over an [`Apply`](LogicalOp::Apply) whose RIGHT branch is a bare label scan,
+        // carrying equality/range conjuncts on the right's node keyed by values that reference only the
+        // LEFT (correlated) branch — the shape `UNWIND rows AS t MATCH (b:L {p: t.k})` (single key) or
+        // `MATCH (b:L {a: t.x, b: t.y})` (composite key) lowers to — seeks the index **per left row**
+        // instead of scanning every `:L` node and filtering. Without this the correlation lives in the
+        // `Filter` **above** a cartesian nested-loop join, so each of the N left rows drives a full
+        // O(store) label scan (the O(N)-per-row cost measured on `social-network-uds` #697; the root of
+        // the #312 family's O(E·N) bulk-over-Cypher).
+        //
+        // The predicate may be a **stacked chain** of `Filter`s (an inline `{a: …, b: …}` map lowers to
+        // one `Filter` per key) bottoming out at the `Apply`, so fold the whole chain into one
+        // conjunction first — otherwise each level would see only its own key and a full composite tuple
+        // could never be recognised together (mirrors `fold_label_scan_filter_chain` on the
+        // non-correlated path). Runs before the bare-label-scan path below (whose `input` is a scan, not
+        // an `Apply`), so the two are disjoint.
+        if let Some((left, right, folded)) = fold_apply_filter_chain(input, predicate)
+            && let Some(seek) = self.try_correlated_index_seek(left, right, &folded, deps)
         {
             return seek;
         }
@@ -2247,6 +2253,97 @@ impl Planner<'_> {
         };
 
         let conjuncts = split_conjuncts(predicate);
+
+        // Wrap a built per-left-row `seek` (whose value(s) reference only the LEFT branch) into the
+        // correlated nested-loop join, re-attaching every conjunct the seek did NOT consume as a
+        // residual filter above the join (preserving conjunct order). Shared by the composite pass and
+        // the single-property pass below — `this`/`deps` are threaded as parameters so the closure
+        // borrows neither `self` nor `deps`, leaving `self.lower`/`deps.insert` free to run inside it.
+        let finish =
+            |this: &Self, seek: PhysicalOp, consumed: &[usize], deps: &mut BTreeSet<IndexId>| {
+                // Lower the left branch and preserve the `Apply` lowering's eager barrier: if the left
+                // performs a write and the right reads the graph, the left must settle into an `Eager`
+                // buffer before the per-left-row seek runs, so a later `MATCH` never observes the left's
+                // own in-flight writes (the openCypher eagerness rule; see the `LogicalOp::Apply` arm).
+                let phys_left = this.lower(left, deps);
+                let phys_left = if contains_write(&phys_left) && contains_read(&seek) {
+                    PhysicalOp::Eager {
+                        input: Box::new(phys_left),
+                    }
+                } else {
+                    phys_left
+                };
+                let join = PhysicalOp::NestedLoopJoin {
+                    left: Box::new(phys_left),
+                    right: Box::new(seek),
+                };
+                let residual: Vec<&Expr> = conjuncts
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| !consumed.contains(j))
+                    .map(|(_, e)| *e)
+                    .collect();
+                attach_residual(join, &residual)
+            };
+
+        // Composite (multi-property) correlated seek (`rmp` task #729, the composite follow-up to the
+        // single-property #708). Collect the equality conjuncts on the right node whose value references
+        // only the LEFT branch — `analyze_property_predicate` already rejects a value referencing
+        // `variable`, and the bare-scan right branch binds nothing but `variable`, so a value it accepts
+        // closes over the left (correlated) row alone. If a composite index's FULL ordered key tuple is
+        // entirely covered by them, lower to ONE per-left-row `NodeCompositeIndexSeek` (whose executor
+        // arm evaluates every key value against the correlation row). Runs BEFORE the single-conjunct
+        // loop so a full-key composite match takes priority over consuming just the leading key — mirror
+        // of the non-correlated composite pass in `lower_filter`. A PARTIAL match (`label_composite_full_eq`
+        // returns `None`) falls through to the single-property loop, which serves the leading key as a
+        // leading-prefix `NodeIndexSeek` exactly as #708 does today.
+        let eq_conjuncts: Vec<(usize, String, &Expr)> = conjuncts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, conj)| {
+                let pp = analyze_property_predicate(conj, &variable.name)?;
+                match pp.kind {
+                    // Defer cloning the value to the consumed keys only: keep the conjunct by reference.
+                    PropertyPredicateKind::Equality { value: _ } => Some((i, pp.property, *conj)),
+                    _ => None,
+                }
+            })
+            .collect();
+        if eq_conjuncts.len() >= 2 {
+            let available: Vec<&str> = eq_conjuncts.iter().map(|(_, p, _)| p.as_str()).collect();
+            if let Some(idx) = self.catalog.label_composite_full_eq(label, &available) {
+                deps.insert(idx.id);
+                // Build the per-key value list in the composite's declared key order, recording which
+                // conjuncts are consumed (the first matching conjunct per key, so a repeated key leaves
+                // its later conjuncts as residual filters — the residual restores exactness).
+                let mut values: Vec<Expr> = Vec::with_capacity(idx.properties.len());
+                let mut consumed: Vec<usize> = Vec::with_capacity(idx.properties.len());
+                for key in &idx.properties {
+                    let (ci, _, conj) = eq_conjuncts
+                        .iter()
+                        .find(|(ci, p, _)| p == key && !consumed.contains(ci))
+                        .or_else(|| eq_conjuncts.iter().find(|(_, p, _)| p == key))
+                        .expect("label_composite_full_eq guarantees every key is available");
+                    let value = analyze_property_predicate(conj, &variable.name)
+                        .and_then(|pp| match pp.kind {
+                            PropertyPredicateKind::Equality { value } => Some(value),
+                            _ => None,
+                        })
+                        .expect("eq_conjuncts holds only equality predicates");
+                    values.push(value);
+                    consumed.push(*ci);
+                }
+                let seek = PhysicalOp::NodeCompositeIndexSeek {
+                    variable: variable.clone(),
+                    label: label.clone(),
+                    properties: idx.properties.clone(),
+                    values,
+                    index: idx.id,
+                };
+                return Some(finish(self, seek, &consumed, deps));
+            }
+        }
+
         // Find the first conjunct that is an index-usable equality/range on the right node whose value
         // is independent of that node (hence of the whole right branch). This mirrors the bare-label-scan
         // index-selection loop, but the anchor is the correlated right branch of the join.
@@ -2259,32 +2356,7 @@ impl Planner<'_> {
             };
             deps.insert(idx.id);
             let seek = build_seek(variable, label, &pp, idx.id);
-
-            // Lower the left branch and preserve the `Apply` lowering's eager barrier: if the left
-            // performs a write and the right reads the graph, the left must settle into an `Eager`
-            // buffer before the per-left-row seek runs, so a later `MATCH` never observes the left's
-            // own in-flight writes (the openCypher eagerness rule; see the `LogicalOp::Apply` arm).
-            let phys_left = self.lower(left, deps);
-            let phys_left = if contains_write(&phys_left) && contains_read(&seek) {
-                PhysicalOp::Eager {
-                    input: Box::new(phys_left),
-                }
-            } else {
-                phys_left
-            };
-            let join = PhysicalOp::NestedLoopJoin {
-                left: Box::new(phys_left),
-                right: Box::new(seek),
-            };
-            // Re-attach the remaining conjuncts (all but the consumed one) as a residual filter above
-            // the join, preserving their order.
-            let residual: Vec<&Expr> = conjuncts
-                .iter()
-                .enumerate()
-                .filter(|(j, _)| *j != i)
-                .map(|(_, e)| *e)
-                .collect();
-            return Some(attach_residual(join, &residual));
+            return Some(finish(self, seek, &[i], deps));
         }
         None
     }
@@ -3334,6 +3406,44 @@ fn and_exprs(lhs: Expr, rhs: Expr) -> Expr {
         },
         span,
     )
+}
+
+/// If `input` is a (possibly nested) chain of [`Filter`](LogicalOp::Filter)s bottoming out at an
+/// [`Apply`](LogicalOp::Apply), returns that apply's `(left, right)` branches plus the **conjunction**
+/// of `top` and every predicate in the chain (top-down order), so [`Planner::lower_filter`] can drive
+/// the correlated index seek over all conjuncts at once (`rmp` tasks #708 / #729). Returns [`None`]
+/// when `input` is not such a chain (e.g. a filter over a label scan or expand), so the caller keeps
+/// its normal residual-filter path.
+///
+/// A single `Filter` directly over the `Apply` (the `WHERE a AND b` / single-key inline-map shape)
+/// yields exactly `top`; a stacked chain (the multi-key inline-map shape, one `Filter` per key) folds
+/// every level together — exactly what a full composite key needs to be recognised as one tuple.
+fn fold_apply_filter_chain<'a>(
+    input: &'a LogicalOp,
+    top: &Expr,
+) -> Option<(&'a LogicalOp, &'a LogicalOp, Expr)> {
+    let mut predicates: Vec<Expr> = vec![top.clone()];
+    let mut cur = input;
+    loop {
+        match cur {
+            LogicalOp::Apply { left, right } => {
+                let mut it = predicates.into_iter();
+                let mut acc = it.next()?; // always Some: `top` is pushed first.
+                for p in it {
+                    acc = and_exprs(acc, p);
+                }
+                return Some((left.as_ref(), right.as_ref(), acc));
+            }
+            LogicalOp::Filter {
+                input: inner,
+                predicate,
+            } => {
+                predicates.push(predicate.clone());
+                cur = inner;
+            }
+            _ => return None,
+        }
+    }
 }
 
 /// If `input` is a (possibly nested) chain of [`Filter`](LogicalOp::Filter)s bottoming out at an
@@ -6897,6 +7007,174 @@ mod tests {
         assert!(!rendered.contains("NodeIndexSeek"), "{rendered}");
         // A single non-leading equality still narrows the SSI footprint via the precise scan path.
         assert!(rendered.contains("NodeLabelScanEq"), "{rendered}");
+    }
+
+    #[test]
+    fn correlated_composite_anchor_becomes_one_composite_seek() {
+        // `rmp` task #729 (composite follow-up to #708): a row-valued (correlated) FULL-composite anchor
+        // — `UNWIND rows AS t MATCH (b:L {a: t.x, b: t.y})` over a composite `(a, b)` index — must lower
+        // to ONE per-left-row `NodeCompositeIndexSeek` driven by a nested-loop join, consuming BOTH keys
+        // (no residual Filter on a covered key), NOT to a leading-prefix `NodeIndexSeek` on `a` + a
+        // residual `Filter` on `b` (the #708 shape, which degrades to an O(N)-per-row scan because a
+        // composite-only store has no single-key tree). Every formulation the planner emits must hold.
+        let catalog = IndexCatalog::builder()
+            .with_label_composite("Account", ["tenant", "extid"])
+            .build();
+
+        for src in [
+            "UNWIND $rows AS t MATCH (b:Account {tenant: t.tn, extid: t.ex}) RETURN b",
+            "UNWIND $rows AS t MATCH (b:Account) WHERE b.tenant = t.tn AND b.extid = t.ex RETURN b",
+            "UNWIND $rows AS t MATCH (b:Account) WHERE b.extid = t.ex AND b.tenant = t.tn RETURN b",
+            "UNWIND $rows AS t WITH t.tn AS tn, t.ex AS ex \
+             MATCH (b:Account {tenant: tn, extid: ex}) RETURN b",
+        ] {
+            let plan = physical(src, &catalog);
+            let rendered = plan.to_string();
+            assert!(
+                rendered.contains("NodeCompositeIndexSeek"),
+                "the correlated composite anchor must lower to a composite seek: {src}\n{rendered}"
+            );
+            assert!(
+                !rendered.contains("NodeIndexSeek"),
+                "it must NOT fall back to a leading-prefix single-key seek: {src}\n{rendered}"
+            );
+            assert!(
+                !rendered.contains("NodeByLabelScan"),
+                "it must NOT fall back to a label scan: {src}\n{rendered}"
+            );
+            assert!(
+                !rendered.contains("Filter"),
+                "both keys are consumed by the composite seek — no residual filter: {src}\n{rendered}"
+            );
+            assert!(
+                rendered.contains("NestedLoopJoin"),
+                "the composite seek is driven per-left-row by a nested-loop join: {src}\n{rendered}"
+            );
+            assert_eq!(
+                plan.index_dependencies().count(),
+                1,
+                "the correlated composite seek records exactly its one IndexId dependency: {src}"
+            );
+        }
+    }
+
+    #[test]
+    fn correlated_partial_composite_anchor_stays_a_leading_prefix_seek() {
+        // `rmp` task #729: a PARTIAL correlated composite match (only the leading key `tenant` bound) must
+        // NOT lower to a composite seek — `label_composite_full_eq` declines, and the single-property
+        // #708 path serves `tenant` as a leading-prefix `NodeIndexSeek`, exactly as today. A correlated
+        // equality on ONLY a non-leading key (`extid`) cannot use the composite at all (leading key
+        // unbound) and stays the precise scan path. This pins the "full key required" boundary.
+        let catalog = IndexCatalog::builder()
+            .with_label_composite("Account", ["tenant", "extid"])
+            .build();
+
+        // Leading key only -> leading-prefix single-key seek, never a composite seek.
+        let plan = physical(
+            "UNWIND $rows AS t MATCH (b:Account {tenant: t.tn}) RETURN b",
+            &catalog,
+        );
+        let rendered = plan.to_string();
+        assert!(
+            !rendered.contains("NodeCompositeIndexSeek"),
+            "a partial (leading-only) match must NOT use the composite seek:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("NodeIndexSeek"),
+            "the leading key falls back to a leading-prefix single-key seek:\n{rendered}"
+        );
+
+        // Non-leading key only -> no seek (leading key unbound); stays a scan.
+        let plan = physical(
+            "UNWIND $rows AS t MATCH (b:Account {extid: t.ex}) RETURN b",
+            &catalog,
+        );
+        let rendered = plan.to_string();
+        assert!(
+            !rendered.contains("CompositeIndexSeek"),
+            "a non-leading-only correlated match must NOT use the composite seek:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("NodeIndexSeek"),
+            "a non-leading-only correlated match has no leading key to seek:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn cost_based_optimizer_never_moves_or_reverts_the_correlated_composite_seek() {
+        // `rmp` task #729: the correlated composite seek's per-key values are fed per driving row through
+        // the nested-loop join, so the cost-based optimiser must treat it as immovable (never hoist it to
+        // the OUTER side, where the keys would be unbound; never revert it to a scan). `contains_correlated_seek`
+        // already covers `NodeCompositeIndexSeek.values`, so the cost-based tree must be byte-identical to
+        // the rule-based one even with a large `:Account` count that would tempt a reorder.
+        use crate::graph_access::{GraphAccess, MemGraph};
+        use graphus_core::Value;
+
+        let catalog = IndexCatalog::builder()
+            .with_label_composite("Account", ["tenant", "extid"])
+            .build();
+        let mut g = MemGraph::new();
+        for i in 0..2000 {
+            g.add_node(
+                ["Account"],
+                [
+                    ("tenant", Value::Integer(i % 4)),
+                    ("extid", Value::Integer(i)),
+                ],
+            );
+        }
+
+        for src in [
+            "UNWIND $rows AS t MATCH (b:Account {tenant: t.tn, extid: t.ex}) RETURN b",
+            "UNWIND $rows AS r MATCH (a:Account {tenant: r.t1, extid: r.e1}), \
+             (b:Account {tenant: r.t2, extid: r.e2}) CREATE (a)-[:LINKS]->(b)",
+        ] {
+            let logical = logical_of(src);
+            let rule_based = plan_physical(&logical, &catalog);
+            let cost_based = plan_physical_with_stats(&logical, &catalog, g.statistics());
+            assert_eq!(
+                rule_based.root, cost_based.root,
+                "the cost-based optimiser must not disturb the correlated composite seek: {src}\n\
+                 rule-based:\n{rule_based}\ncost-based:\n{cost_based}"
+            );
+            let rendered = cost_based.to_string();
+            assert!(
+                rendered.contains("NodeCompositeIndexSeek"),
+                "the correlated composite anchor stays a composite seek under cost-based planning: \
+                 {src}\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_anchor_correlated_composite_create_seeks_both_anchors() {
+        // `rmp` task #729 / the #312 family: the two-anchor bulk-edge shape keyed on a COMPOSITE business
+        // key — `UNWIND rows AS r MATCH (a:Account {tenant: r.t1, extid: r.e1}),
+        // (b:Account {tenant: r.t2, extid: r.e2}) CREATE (a)-[…]->(b)` — nests two correlated
+        // `Filter`-over-`Apply`s; BOTH anchors must become composite seeks (turning O(E·N) bulk-over-Cypher
+        // into O(E)). Exactly two composite seeks, zero label scans, zero single-key seeks.
+        let catalog = IndexCatalog::builder()
+            .with_label_composite("Account", ["tenant", "extid"])
+            .build();
+        let plan = physical(
+            "UNWIND $rows AS r MATCH (a:Account {tenant: r.t1, extid: r.e1}), \
+             (b:Account {tenant: r.t2, extid: r.e2}) CREATE (a)-[:LINKS]->(b)",
+            &catalog,
+        );
+        let rendered = plan.to_string();
+        assert_eq!(
+            rendered.matches("NodeCompositeIndexSeek").count(),
+            2,
+            "both anchors must seek the composite index:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("NodeByLabelScan"),
+            "neither anchor may fall back to a label scan:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("NodeIndexSeek"),
+            "neither anchor may fall back to a leading-prefix single-key seek:\n{rendered}"
+        );
     }
 
     #[test]
