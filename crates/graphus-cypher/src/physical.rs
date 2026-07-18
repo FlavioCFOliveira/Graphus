@@ -1987,6 +1987,21 @@ impl Planner<'_> {
             return seek;
         }
 
+        // Correlated seek pushed THROUGH a traversal (`rmp` task #730, the expand follow-up to #708).
+        // A correlated equality on a per-row anchor that then EXPANDS — `UNWIND rows AS t MATCH
+        // (b:L)-[:R]->(c) WHERE b.uid = t.uid` — lowers to `Filter(b.uid = t.uid, Expand(Apply(Unwind,
+        // NodeByLabelScan b)))`: the anchor's `Apply` is buried BENEATH the `Expand`, so the
+        // `fold_apply_filter_chain` path above (whose input must fold straight to an `Apply`) does not
+        // reach it and the anchor stays an O(N)-per-row label scan. Push the anchor equality down onto
+        // that scan so the anchor seeks the index per driving row while the expand runs from each seeked
+        // anchor. The inline-anchor-map form (`(b:L {uid: t.uid})-[:R]->(c)`) already seeks — the logical
+        // planner places its `Filter` directly over the `Apply`, below the `Expand` — so this only rescues
+        // the `WHERE`-after-pattern shape. Runs after the bare-`Apply` path (disjoint: that input folds to
+        // an `Apply`, this one is an `Expand`) and before the label-scan fallback.
+        if let Some(seek) = self.try_correlated_seek_through_expand(input, predicate, deps) {
+            return seek;
+        }
+
         // Index selection only fires directly over a label scan (the logical anchor of a labelled
         // node). Anything else: lower the input normally and keep the predicate as a residual filter.
         let LogicalOp::NodeByLabelScan { variable, label } = input else {
@@ -2359,6 +2374,120 @@ impl Planner<'_> {
             return Some(finish(self, seek, &[i], deps));
         }
         None
+    }
+
+    /// Attempts the correlated push-down **through a traversal** (`rmp` task #730): a `Filter` over an
+    /// [`Expand`](LogicalOp::Expand) chain that bottoms out at an [`Apply`](LogicalOp::Apply) whose right
+    /// branch is a bare [`NodeByLabelScan`](LogicalOp::NodeByLabelScan) anchor. Pushes the anchor's
+    /// correlated equality conjuncts down onto that scan (so the anchor seeks the index per driving row,
+    /// with the expand running from each seeked anchor), leaving every other conjunct as a residual
+    /// [`Filter`](PhysicalOp::Filter) above the traversal. Returns [`None`] (the caller keeps its normal
+    /// residual-filter lowering) when the shape does not qualify or no pushed conjunct is index-usable.
+    ///
+    /// **Soundness of the push-down.** A predicate on the expand's *source* (`b` in
+    /// `(b)-[:R]->(c)`) selects exactly the same `(b, r, c)` rows whether applied before or after the
+    /// traversal — `b` is bound below the expand and the expand does not change it — so moving it below
+    /// the `Expand` is result-preserving (standard filter-pushdown onto a traversal's anchor).
+    ///
+    /// **The critical correctness bar.** A conjunct is pushed **only** when its value's free variables
+    /// are disjoint from *every* variable the intervening subtree binds — the anchor itself **and** every
+    /// relationship/target the `Expand` chain introduces (`r`, `c`, …). Pushing a value that references a
+    /// variable bound *inside* the traversal (e.g. `b.uid = c.uid`, where `c` is the expand's target)
+    /// would evaluate it against an unbound variable at the anchor and change the result — so such a
+    /// conjunct stays a residual filter above the expand, keeping the anchor a scan. `analyze_property_predicate`
+    /// already rejects a value referencing the anchor; this adds the expand-bound-variable check.
+    ///
+    /// **Mechanism.** The qualifying conjuncts are pushed as a `Filter` directly over the `Apply` (below
+    /// the `Expand` chain), reproducing the exact shape [`try_correlated_index_seek`] already lowers — so
+    /// the seek, the composite fusion (`rmp` #729), and the reorderer/scan-revert guards all come for
+    /// free by re-lowering the rewritten tree. It fires only when at least one pushed conjunct is served
+    /// by an index ([`match_index`](Self::match_index)), so a no-index anchor is never moved for nothing.
+    fn try_correlated_seek_through_expand(
+        &self,
+        input: &LogicalOp,
+        predicate: &Expr,
+        deps: &mut BTreeSet<IndexId>,
+    ) -> Option<PhysicalOp> {
+        // The filter's input must be an `Expand` (a traversal) — the shape the bare-`Apply` path above
+        // cannot reach. Walk the `Expand` chain down to the anchor's `Apply`, collecting every variable
+        // the chain binds (each hop's relationship + target); a non-`Expand`, non-`Apply` node on the
+        // way (another `Filter`, a nested apply, a scan) declines.
+        let LogicalOp::Expand { .. } = input else {
+            return None;
+        };
+        let mut expand_bound: Vec<&str> = Vec::new();
+        let mut cur = input;
+        let (anchor, label) = loop {
+            match cur {
+                LogicalOp::Expand {
+                    input: inner,
+                    relationship,
+                    to,
+                    ..
+                } => {
+                    // Every variable a hop introduces is off-limits to a pushed value (it is unbound at
+                    // the anchor, below the expand).
+                    expand_bound.push(relationship.name.as_str());
+                    expand_bound.push(to.name.as_str());
+                    cur = inner;
+                }
+                LogicalOp::Apply { right, .. } => {
+                    let LogicalOp::NodeByLabelScan { variable, label } = right.as_ref() else {
+                        return None; // a richer / non-bare right branch is not a materialisable anchor
+                    };
+                    break (variable, label);
+                }
+                _ => return None,
+            }
+        };
+
+        // A conjunct is PUSHABLE when it constrains `anchor.<prop>` (equality or range) against a value
+        // whose free variables are disjoint from every expand-bound variable. `analyze_property_predicate`
+        // already guarantees the value does not reference the anchor; the added check rejects a value
+        // referencing anything the traversal binds (the critical correctness bar).
+        let conjuncts = split_conjuncts(predicate);
+        let is_pushable = |conj: &Expr| -> bool {
+            let Some(pp) = analyze_property_predicate(conj, &anchor.name) else {
+                return false;
+            };
+            let value = match &pp.kind {
+                PropertyPredicateKind::Equality { value } => value,
+                PropertyPredicateKind::Range { value, .. } => value,
+            };
+            !expand_bound
+                .iter()
+                .any(|bound| expr_references_var(value, bound))
+        };
+        let (push_down, keep_above): (Vec<&Expr>, Vec<&Expr>) =
+            conjuncts.iter().partition(|conj| is_pushable(conj));
+
+        // Fire only when the push produces a real seek: at least one pushed conjunct must be served by an
+        // index (a single-property index, or a composite's leading key). Otherwise the anchor would be
+        // moved below the expand for no acceleration — decline and keep the scan + residual filter.
+        let any_indexable = push_down.iter().any(|conj| {
+            analyze_property_predicate(conj, &anchor.name)
+                .is_some_and(|pp| self.match_index(label, &pp).is_some())
+        });
+        if !any_indexable {
+            return None;
+        }
+
+        // Rewrite: push the qualifying conjuncts as a `Filter` directly over the `Apply` (below the
+        // expand chain), and re-lower. The re-lowering hits `try_correlated_index_seek` on that pushed
+        // filter (single-property #708 or composite #729), while any non-pushable conjunct stays a
+        // residual `Filter` above the rebuilt traversal. Re-entry is safe: the residual carries no
+        // pushable anchor conjunct (they were all consumed into `push_down`), so this method declines the
+        // second time and the residual becomes an ordinary filter.
+        let pushed_predicate = conjunction_of(&push_down)?;
+        let pushed_tree = push_filter_below_expands(input, pushed_predicate)?;
+        let rewritten = match conjunction_of(&keep_above) {
+            Some(residual) => LogicalOp::Filter {
+                input: Box::new(pushed_tree),
+                predicate: residual,
+            },
+            None => pushed_tree,
+        };
+        Some(self.lower(&rewritten, deps))
     }
 
     /// Attempts to lower a `Filter` carrying an **equality or a range predicate on a relationship
@@ -3470,6 +3599,55 @@ fn fold_expand_filter_chain<'a>(
             }
             _ => return None,
         }
+    }
+}
+
+/// AND-combines a slice of conjunct references into one owned predicate (left-to-right), or [`None`]
+/// when the slice is empty. Used by [`Planner::try_correlated_seek_through_expand`] (`rmp` task #730) to
+/// rebuild the pushed-down and the residual predicates from their partitioned conjuncts.
+fn conjunction_of(conjuncts: &[&Expr]) -> Option<Expr> {
+    let mut it = conjuncts.iter().copied();
+    let mut acc = it.next()?.clone();
+    for c in it {
+        acc = and_exprs(acc, c.clone());
+    }
+    Some(acc)
+}
+
+/// Rebuilds an [`Expand`](LogicalOp::Expand) chain, wrapping the [`Apply`](LogicalOp::Apply) it bottoms
+/// out at in `Filter(pushed, Apply)` (`rmp` task #730). The chain is cloned link-by-link with the pushed
+/// filter spliced directly over the `Apply`, so re-lowering the result drives the anchor seek beneath
+/// the traversal. Returns [`None`] if `input` is not an `Expand`(s)-over-`Apply` chain (the caller then
+/// declines) — the same structure [`Planner::try_correlated_seek_through_expand`] validated before
+/// calling, so `None` here is a defensive belt, never expected.
+fn push_filter_below_expands(input: &LogicalOp, pushed: Expr) -> Option<LogicalOp> {
+    match input {
+        LogicalOp::Apply { .. } => Some(LogicalOp::Filter {
+            input: Box::new(input.clone()),
+            predicate: pushed,
+        }),
+        LogicalOp::Expand {
+            input: inner,
+            from,
+            relationship,
+            to,
+            direction,
+            types,
+            range,
+            prior_rels,
+            rel_props,
+        } => Some(LogicalOp::Expand {
+            input: Box::new(push_filter_below_expands(inner, pushed)?),
+            from: from.clone(),
+            relationship: relationship.clone(),
+            to: to.clone(),
+            direction: *direction,
+            types: types.clone(),
+            range: *range,
+            prior_rels: prior_rels.clone(),
+            rel_props: rel_props.clone(),
+        }),
+        _ => None,
     }
 }
 
@@ -7174,6 +7352,172 @@ mod tests {
         assert!(
             !rendered.contains("NodeIndexSeek"),
             "neither anchor may fall back to a leading-prefix single-key seek:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn correlated_anchor_over_expand_seeks_through_the_traversal() {
+        // `rmp` task #730 (the expand follow-up to #708). A correlated equality on a per-row anchor that
+        // then EXPANDS — spelled as a `WHERE` *after* the pattern, so the anchor's `Apply` is buried
+        // beneath the `Expand` — must push the anchor equality down onto the scan and lower it to a
+        // per-row `NodeIndexSeek`, NOT a per-row label scan. Every driving row then seeks its anchor and
+        // expands from it, turning O(N)-per-row into O(1)-per-row. Single hop, two hops, and a residual
+        // predicate on the expand's target all hold.
+        let catalog = IndexCatalog::builder()
+            .with_label_property("Person", "uid")
+            .build();
+
+        for src in [
+            "UNWIND $rows AS t MATCH (b:Person)-[:R]->(c) WHERE b.uid = t.uid RETURN c",
+            "UNWIND $rows AS t MATCH (b:Person)<-[:R]-(c) WHERE b.uid = t.uid RETURN c",
+            "UNWIND $rows AS t MATCH (b:Person)-[:R]->(c)-[:S]->(d) WHERE b.uid = t.uid RETURN d",
+            "UNWIND $rows AS t MATCH (b:Person)-[:R]->(c) WHERE b.uid = t.uid AND c.k = 5 RETURN c",
+        ] {
+            let plan = physical(src, &catalog);
+            let rendered = plan.to_string();
+            assert!(
+                rendered.contains("NodeIndexSeek(b:Person uid = t.uid"),
+                "the anchor beneath the expand must seek per row: {src}\n{rendered}"
+            );
+            assert!(
+                !rendered.contains("NodeByLabelScan"),
+                "the anchor must NOT stay a label scan: {src}\n{rendered}"
+            );
+            assert!(
+                rendered.contains("ExpandAll"),
+                "the traversal still runs from each seeked anchor: {src}\n{rendered}"
+            );
+            assert_eq!(
+                plan.index_dependencies().count(),
+                1,
+                "the pushed seek records its IndexId dependency: {src}"
+            );
+        }
+
+        // The residual predicate on the expand's target survives as a Filter ABOVE the traversal.
+        let plan = physical(
+            "UNWIND $rows AS t MATCH (b:Person)-[:R]->(c) WHERE b.uid = t.uid AND c.k = 5 RETURN c",
+            &catalog,
+        );
+        assert!(plan.to_string().contains("Filter"), "{plan}");
+    }
+
+    #[test]
+    fn correlated_inline_anchor_over_expand_still_seeks() {
+        // `rmp` task #730 regression LOCK for the FR's own example. The inline-anchor-map form —
+        // `MATCH (b:L {uid: t.uid})-[:R]->(c)` — ALREADY seeks (the logical planner places its `Filter`
+        // directly over the `Apply`, below the `Expand`, so #708 fires). #730 must not disturb that
+        // already-working path: this pins it so a future change to the push-down cannot regress it.
+        let catalog = IndexCatalog::builder()
+            .with_label_property("Person", "uid")
+            .build();
+        for src in [
+            "UNWIND $rows AS t MATCH (b:Person {uid: t.uid})-[:R]->(c) RETURN c",
+            "UNWIND $rows AS t MATCH (b:Person {uid: t.uid})-[:R]->(c)-[:S]->(d) RETURN d",
+            "UNWIND $rows AS t MATCH (b:Person {uid: t.uid}) MATCH (b)-[:R]->(c) RETURN c",
+        ] {
+            let plan = physical(src, &catalog);
+            let rendered = plan.to_string();
+            assert!(
+                rendered.contains("NodeIndexSeek(b:Person uid = t.uid"),
+                "the inline-anchor form must still seek: {src}\n{rendered}"
+            );
+            assert!(
+                !rendered.contains("NodeByLabelScan"),
+                "the inline-anchor form must not regress to a scan: {src}\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn correlated_anchor_over_expand_value_bound_by_expand_stays_a_scan() {
+        // `rmp` task #730 — THE critical correctness bar (the disjointness guard has teeth). A predicate
+        // whose value references a variable bound INSIDE the traversal (`c`, the expand's target, or `r`,
+        // the relationship) must NOT be pushed to the anchor — at the anchor that variable is unbound, so
+        // pushing it would change the result. It stays a scan + residual Filter above the expand.
+        let catalog = IndexCatalog::builder()
+            .with_label_property("Person", "uid")
+            .build();
+
+        for src in [
+            // value references the expand's TARGET `c`
+            "UNWIND $rows AS t MATCH (b:Person)-[:R]->(c) WHERE b.uid = c.uid RETURN c",
+            // value references the RELATIONSHIP `r`
+            "UNWIND $rows AS t MATCH (b:Person)-[r:R]->(c) WHERE b.uid = r.w RETURN c",
+        ] {
+            let plan = physical(src, &catalog);
+            let rendered = plan.to_string();
+            assert!(
+                !rendered.contains("NodeIndexSeek"),
+                "a value bound by the traversal must NOT be pushed to a seek: {src}\n{rendered}"
+            );
+            assert!(
+                rendered.contains("NodeByLabelScan(b:Person)"),
+                "the anchor stays a scan when the predicate is not pushable: {src}\n{rendered}"
+            );
+            assert!(
+                rendered.contains("Filter"),
+                "the un-pushable predicate stays a residual filter: {src}\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn correlated_composite_anchor_over_expand_seeks_the_composite() {
+        // `rmp` task #730 + #729 (the two orthogonal axes composed): a correlated COMPOSITE anchor that
+        // then EXPANDS, spelled as a `WHERE`, must push BOTH keys down and lower to a
+        // `NodeCompositeIndexSeek` beneath the traversal — the composite fusion falls out of the
+        // re-lowering for free (the push produces the exact `Filter(a AND b, Apply)` shape #729 lowers).
+        let catalog = IndexCatalog::builder()
+            .with_label_composite("Account", ["tenant", "extid"])
+            .build();
+        let plan = physical(
+            "UNWIND $rows AS t MATCH (b:Account)-[:R]->(c) \
+             WHERE b.tenant = t.tn AND b.extid = t.ex RETURN c",
+            &catalog,
+        );
+        let rendered = plan.to_string();
+        assert!(
+            rendered.contains("NodeCompositeIndexSeek"),
+            "the correlated composite anchor beneath an expand must seek the composite:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("NodeByLabelScan"),
+            "the anchor must not stay a label scan:\n{rendered}"
+        );
+        assert!(rendered.contains("ExpandAll"), "{rendered}");
+    }
+
+    #[test]
+    fn cost_based_optimizer_keeps_the_pushed_through_expand_seek() {
+        // `rmp` task #730: the pushed correlated seek is fed per driving row through the nested-loop
+        // join, so the cost-based optimiser must treat it as immovable exactly as for #708/#729 — the
+        // rule-based and cost-based trees must be byte-identical even with a large `:Person` count.
+        use crate::graph_access::{GraphAccess, MemGraph};
+        use graphus_core::Value;
+
+        let catalog = IndexCatalog::builder()
+            .with_label_property("Person", "uid")
+            .build();
+        let mut g = MemGraph::new();
+        for i in 0..2000 {
+            g.add_node(["Person"], [("uid", Value::Integer(i))]);
+        }
+
+        let src = "UNWIND $rows AS t MATCH (b:Person)-[:R]->(c) WHERE b.uid = t.uid RETURN c";
+        let logical = logical_of(src);
+        let rule_based = plan_physical(&logical, &catalog);
+        let cost_based = plan_physical_with_stats(&logical, &catalog, g.statistics());
+        assert_eq!(
+            rule_based.root, cost_based.root,
+            "the cost-based optimiser must not disturb the pushed-through-expand seek:\n\
+             rule-based:\n{rule_based}\ncost-based:\n{cost_based}"
+        );
+        assert!(
+            cost_based
+                .to_string()
+                .contains("NodeIndexSeek(b:Person uid = t.uid"),
+            "the anchor stays a seek under cost-based planning:\n{cost_based}"
         );
     }
 

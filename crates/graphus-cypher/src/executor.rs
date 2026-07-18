@@ -10017,6 +10017,492 @@ mod tests {
         }
     }
 
+    /// A `GraphAccess` seam over a [`MemGraph`] with a **real** in-process single-property index on
+    /// `(Person.uid)` (a hash map from the value to node ids) plus a [`Cell`](std::cell::Cell) counting
+    /// the **anchor node records examined** (`rmp` task #730):
+    ///
+    /// * [`index_seek_eq`](GraphAccess::index_seek_eq) does an O(1) hash lookup and charges only the
+    ///   candidates it returns — the pushed-through-expand **seek** (post-#730).
+    /// * [`scan_nodes_by_label`](GraphAccess::scan_nodes_by_label) charges every `:Person` node — the
+    ///   label **scan** a pre-#730 anchor takes per driving row (the anchor stays a `NodeByLabelScan`
+    ///   beneath the expand, so each row reads the whole label).
+    ///
+    /// The traversal itself (`expand`, `node_property`, …) delegates to the inner graph and is identical
+    /// on both paths, so the counter isolates the anchor access cost: a sweep over `N` proves the seek
+    /// stays flat while the scan grows linearly.
+    struct CountingAnchorGraph {
+        inner: MemGraph,
+        uid_index: std::collections::HashMap<String, Vec<NodeId>>,
+        examined: std::cell::Cell<usize>,
+    }
+
+    impl CountingAnchorGraph {
+        fn key_of(value: &Value) -> String {
+            format!("{value:?}")
+        }
+        fn new(inner: MemGraph) -> Self {
+            let mut uid_index: std::collections::HashMap<String, Vec<NodeId>> =
+                std::collections::HashMap::new();
+            for id in inner.scan_nodes_by_label("Person") {
+                if let Some(uid) = inner.node_property(id, "uid") {
+                    uid_index.entry(Self::key_of(&uid)).or_default().push(id);
+                }
+            }
+            Self {
+                inner,
+                uid_index,
+                examined: std::cell::Cell::new(0),
+            }
+        }
+        fn reset(&self) {
+            self.examined.set(0);
+        }
+        fn examined(&self) -> usize {
+            self.examined.get()
+        }
+    }
+
+    impl crate::statistics::Statistics for CountingAnchorGraph {
+        fn total_nodes(&self) -> u64 {
+            self.inner.node_count() as u64
+        }
+        fn nodes_with_label(&self, label: &str) -> Option<u64> {
+            Some(self.inner.scan_nodes_by_label(label).len() as u64)
+        }
+        fn total_relationships(&self) -> u64 {
+            self.inner.rel_count() as u64
+        }
+        fn relationships_with_type(&self, _rel_type: &str) -> Option<u64> {
+            Some(self.inner.rel_count() as u64)
+        }
+    }
+
+    impl GraphAccess for CountingAnchorGraph {
+        fn index_seek_eq(&self, label: &str, property: &str, value: &Value) -> Option<Vec<NodeId>> {
+            if label != "Person" || property != "uid" {
+                return None;
+            }
+            let ids = self
+                .uid_index
+                .get(&Self::key_of(value))
+                .cloned()
+                .unwrap_or_default();
+            self.examined.set(self.examined.get() + ids.len());
+            Some(ids)
+        }
+        fn scan_nodes_by_label(&self, label: &str) -> Vec<NodeId> {
+            let ids = self.inner.scan_nodes_by_label(label);
+            if label == "Person" {
+                self.examined.set(self.examined.get() + ids.len());
+            }
+            ids
+        }
+        fn statistics(&self) -> Option<&dyn crate::statistics::Statistics> {
+            Some(self)
+        }
+        fn scan_nodes(&self) -> Vec<NodeId> {
+            self.inner.scan_nodes()
+        }
+        fn expand(
+            &self,
+            node: NodeId,
+            direction: ExpandDirection,
+            types: &[String],
+        ) -> Vec<crate::graph_access::Incident> {
+            self.inner.expand(node, direction, types)
+        }
+        fn node_exists(&self, node: NodeId) -> bool {
+            self.inner.node_exists(node)
+        }
+        fn rel_exists(&self, rel: RelId) -> bool {
+            self.inner.rel_exists(rel)
+        }
+        fn node_labels(&self, node: NodeId) -> Option<Vec<String>> {
+            self.inner.node_labels(node)
+        }
+        fn rel_data(&self, rel: RelId) -> Option<crate::graph_access::RelData> {
+            self.inner.rel_data(rel)
+        }
+        fn node_property(&self, node: NodeId, key: &str) -> Option<Value> {
+            self.inner.node_property(node, key)
+        }
+        fn rel_property(&self, rel: RelId, key: &str) -> Option<Value> {
+            self.inner.rel_property(rel, key)
+        }
+        fn node_properties(&self, node: NodeId) -> Option<Vec<(String, Value)>> {
+            self.inner.node_properties(node)
+        }
+        fn rel_properties(&self, rel: RelId) -> Option<Vec<(String, Value)>> {
+            self.inner.rel_properties(rel)
+        }
+        fn create_node(&mut self, labels: &[String], properties: &[(String, Value)]) -> NodeId {
+            self.inner.create_node(labels, properties)
+        }
+        fn create_rel(
+            &mut self,
+            rel_type: &str,
+            start: NodeId,
+            end: NodeId,
+            properties: &[(String, Value)],
+        ) -> RelId {
+            self.inner.create_rel(rel_type, start, end, properties)
+        }
+        fn set_node_property(&mut self, node: NodeId, key: &str, value: Value) {
+            self.inner.set_node_property(node, key, value);
+        }
+        fn set_rel_property(&mut self, rel: RelId, key: &str, value: Value) {
+            self.inner.set_rel_property(rel, key, value);
+        }
+        fn add_labels(&mut self, node: NodeId, labels: &[String]) {
+            self.inner.add_labels(node, labels);
+        }
+        fn remove_labels(&mut self, node: NodeId, labels: &[String]) {
+            self.inner.remove_labels(node, labels);
+        }
+        fn remove_node_property(&mut self, node: NodeId, key: &str) {
+            self.inner.remove_node_property(node, key);
+        }
+        fn remove_rel_property(&mut self, rel: RelId, key: &str) {
+            self.inner.remove_rel_property(rel, key);
+        }
+        fn replace_node_properties(&mut self, node: NodeId, properties: &[(String, Value)]) {
+            self.inner.replace_node_properties(node, properties);
+        }
+        fn merge_node_properties(&mut self, node: NodeId, properties: &[(String, Value)]) {
+            self.inner.merge_node_properties(node, properties);
+        }
+        fn replace_rel_properties(&mut self, rel: RelId, properties: &[(String, Value)]) {
+            self.inner.replace_rel_properties(rel, properties);
+        }
+        fn merge_rel_properties(&mut self, rel: RelId, properties: &[(String, Value)]) {
+            self.inner.merge_rel_properties(rel, properties);
+        }
+        fn incident_rels(&self, node: NodeId) -> Vec<RelId> {
+            self.inner.incident_rels(node)
+        }
+        fn delete_rel(&mut self, rel: RelId) {
+            self.inner.delete_rel(rel);
+        }
+        fn delete_node(&mut self, node: NodeId) {
+            self.inner.delete_node(node);
+        }
+    }
+
+    #[test]
+    fn correlated_anchor_over_expand_per_row_cost_is_flat_in_n() {
+        // `rmp` task #730 — the WHOLE POINT, measured. A batched read drives a FIXED number of rows,
+        // each anchoring on a per-row key then expanding, against a store of `N` `:Person` anchors.
+        // Pre-#730 the anchor beneath the expand is a per-row LABEL SCAN (O(N) per row → O(D·N) total);
+        // post-#730 it is a per-row SEEK pushed through the traversal (O(1) per row → O(D) total).
+        //
+        // Measured deterministically as ANCHOR node records examined (not wall-clock): the
+        // `CountingAnchorGraph` charges the seek only its candidates and the scan every `:Person`. The
+        // scan path (`no_index`) is the growing-slope proxy for the pre-fix cost; the seek path
+        // (`with_index`) is the flat line. Both run on the SAME seam and return the IDENTICAL rows, so
+        // the flatness is proven against a real, growing baseline.
+        use crate::binding::Parameters;
+
+        const D: i64 = 8;
+        let rows = Value::List(
+            (0..D)
+                .map(|i| Value::Map(vec![("uid".to_owned(), Value::Integer(i))]))
+                .collect(),
+        );
+        let params = Parameters::new().with("rows", rows);
+
+        let with_index = IndexCatalog::builder()
+            .with_label_property("Person", "uid")
+            .build();
+        let no_index = IndexCatalog::empty();
+
+        fn run_measured(
+            src: &str,
+            seam: &mut CountingAnchorGraph,
+            catalog: &IndexCatalog,
+            params: &Parameters,
+        ) -> (usize, usize) {
+            let toks = tokenize(src).expect("lex");
+            let ast = parse_tokens(&toks, src).expect("parse");
+            let logical = lower(&analyze(&ast).expect("analyze"));
+            let plan = {
+                let stats = seam.statistics();
+                crate::physical::plan_physical_with_stats(&logical, catalog, stats)
+            };
+            let bound = crate::binding::bind_parameters(&plan, params).expect("bind");
+            seam.reset();
+            let rows = execute(&plan, &bound, seam)
+                .expect("open")
+                .collect_all()
+                .expect("rows")
+                .len();
+            (rows, seam.examined())
+        }
+
+        let src = "UNWIND $rows AS t MATCH (b:Person)-[:R]->(c) WHERE b.uid = t.uid RETURN c.name AS name";
+
+        // The no-index path expands from every anchor per driving row and `MemGraph::expand` is O(rels),
+        // so the scan path is ~O(N²) — keep the sweep modest; the exact `scan == D*N` assertions below
+        // prove linear growth rigorously without a huge N.
+        let sweep = [200usize, 400, 800, 1600];
+        let mut seek_curve: Vec<(usize, usize)> = Vec::new();
+        let mut scan_curve: Vec<(usize, usize)> = Vec::new();
+        for &n in &sweep {
+            // Each :Person(uid=i) has one :R edge to a distinct :Thing (so every driving row yields 1
+            // row); uid is unique so each seek returns 1 candidate.
+            let mut mem = MemGraph::new();
+            for i in 0..n as i64 {
+                let p = mem.add_node(["Person"], [("uid", Value::Integer(i))]);
+                let thing = mem.add_node(["Thing"], [("name", Value::String(format!("t{i}")))]);
+                mem.add_rel("R", p, thing, NO_PROPS);
+            }
+            let mut seam = CountingAnchorGraph::new(mem);
+
+            let (seek_rows, seek_examined) = run_measured(src, &mut seam, &with_index, &params);
+            let (scan_rows, scan_examined) = run_measured(src, &mut seam, &no_index, &params);
+
+            assert_eq!(
+                seek_rows, scan_rows,
+                "seek and scan row counts disagree at N={n}"
+            );
+            assert_eq!(seek_rows, D as usize, "expected {D} rows at N={n}");
+
+            seek_curve.push((n, seek_examined));
+            scan_curve.push((n, scan_examined));
+        }
+
+        eprintln!("[#730 flat-cost] D={D} driving rows; anchor records examined vs N:");
+        for ((n, seek), (_, scan)) in seek_curve.iter().zip(scan_curve.iter()) {
+            eprintln!(
+                "  N={n:>5}  seek={seek:>7}  scan={scan:>9}  scan/seek={:.1}x",
+                *scan as f64 / (*seek).max(1) as f64
+            );
+        }
+
+        // SEEK is FLAT: examined is constant across the sweep (D candidates, one per driving row).
+        let seek_baseline = seek_curve[0].1;
+        for &(n, examined) in &seek_curve {
+            assert_eq!(
+                examined, seek_baseline,
+                "the pushed SEEK must be flat in N: examined {examined} at N={n} != {seek_baseline}"
+            );
+        }
+        assert_eq!(
+            seek_baseline, D as usize,
+            "the seek examines exactly one anchor candidate per driving row"
+        );
+
+        // SCAN GROWS linearly: examined == D * N (a full label scan of the anchor per driving row).
+        for &(n, examined) in &scan_curve {
+            assert_eq!(
+                examined,
+                D as usize * n,
+                "the anchor SCAN cost must be D*N: examined {examined} at N={n}"
+            );
+        }
+        assert!(
+            scan_curve.last().unwrap().1 > 6 * scan_curve.first().unwrap().1,
+            "the scan slope must grow with N across the sweep: {scan_curve:?}"
+        );
+    }
+
+    #[test]
+    fn correlated_anchor_over_expand_returns_exactly_the_scan_result() {
+        // `rmp` task #730: a correlated anchor that expands, keyed by a `WHERE` after the pattern —
+        // `UNWIND $rows AS t MATCH (b:Person)-[:R]->(c) WHERE b.uid = t.uid RETURN c` — now pushes the
+        // anchor equality down onto the scan (a per-row `NodeIndexSeek`) with the expand running from
+        // each seeked anchor. The push-down must NEVER change results: for every driving row the seek
+        // path and the plain scan+filter path must return the IDENTICAL rows in the IDENTICAL ORDER and
+        // multiplicity. Exercised with a DUPLICATE anchor uid (two `:Person` share uid 1 — multiplicity),
+        // a DUPLICATE driving key (uid 1 twice — the batch fans out twice), and a MISSING key (uid 99 —
+        // zero rows). A regression that pushed a wrong value or dropped/duplicated rows fails here.
+        use crate::binding::Parameters;
+
+        // Ordered `c.name` values the read returns (NOT sorted — order is part of the contract).
+        fn names(
+            src: &str,
+            graph: &mut MemGraph,
+            catalog: &IndexCatalog,
+            params: &Parameters,
+        ) -> Vec<String> {
+            run_with_catalog_and_params(src, graph, catalog, params)
+                .iter()
+                .filter_map(|r| match r.value("name") {
+                    Value::String(s) => Some(s),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        // uid 1 -> p1 (→ tA, tB) and p2 (→ tC): a duplicate anchor uid. uid 2 -> p3 (→ tD). uid 3 -> p4
+        // (→ tE, unreachable from the driving rows). Two identically-seeded graphs isolate the PLAN
+        // difference (`MemGraph` serves both index and scan through `scan_filter_eq`).
+        let seed = |g: &mut MemGraph| {
+            let p1 = g.add_node(["Person"], [("uid", Value::Integer(1))]);
+            let p2 = g.add_node(["Person"], [("uid", Value::Integer(1))]); // duplicate anchor uid
+            let p3 = g.add_node(["Person"], [("uid", Value::Integer(2))]);
+            let p4 = g.add_node(["Person"], [("uid", Value::Integer(3))]);
+            let ta = g.add_node(["Thing"], [("name", Value::String("tA".into()))]);
+            let tb = g.add_node(["Thing"], [("name", Value::String("tB".into()))]);
+            let tc = g.add_node(["Thing"], [("name", Value::String("tC".into()))]);
+            let td = g.add_node(["Thing"], [("name", Value::String("tD".into()))]);
+            let te = g.add_node(["Thing"], [("name", Value::String("tE".into()))]);
+            g.add_rel("R", p1, ta, NO_PROPS);
+            g.add_rel("R", p1, tb, NO_PROPS);
+            g.add_rel("R", p2, tc, NO_PROPS);
+            g.add_rel("R", p3, td, NO_PROPS);
+            g.add_rel("R", p4, te, NO_PROPS);
+        };
+        let mut indexed = MemGraph::new();
+        seed(&mut indexed);
+        let mut plain = MemGraph::new();
+        seed(&mut plain);
+
+        let with_index = IndexCatalog::builder()
+            .with_label_property("Person", "uid")
+            .build();
+        let no_index = IndexCatalog::empty();
+
+        let rows = Value::List(vec![
+            Value::Map(vec![("uid".to_owned(), Value::Integer(1))]),
+            Value::Map(vec![("uid".to_owned(), Value::Integer(1))]), // duplicate driving key
+            Value::Map(vec![("uid".to_owned(), Value::Integer(2))]),
+            Value::Map(vec![("uid".to_owned(), Value::Integer(99))]), // missing key
+        ]);
+        let params = Parameters::new().with("rows", rows);
+
+        let src = "UNWIND $rows AS t MATCH (b:Person)-[:R]->(c) WHERE b.uid = t.uid RETURN c.name AS name";
+
+        let seek = names(src, &mut indexed, &with_index, &params);
+        let scan = names(src, &mut plain, &no_index, &params);
+        assert_eq!(
+            seek, scan,
+            "the pushed-through-expand seek must match the scan exactly (order + multiplicity)"
+        );
+        // uid 1 (×2 driving) → {tA, tB, tC} each time = 6 rows; uid 2 → {tD} = 1; uid 99 → none.
+        assert_eq!(seek.len(), 7, "expected 7 rows: {seek:?}");
+        {
+            let mut sorted = seek.clone();
+            sorted.sort();
+            assert_eq!(
+                sorted,
+                vec!["tA", "tA", "tB", "tB", "tC", "tC", "tD"],
+                "the exact multiset (duplicate anchor + duplicate driving key + missing key): {seek:?}"
+            );
+        }
+
+        // Cost-based plan must agree too (the pushed seek is immovable, `rmp` #730).
+        let cost_based: Vec<String> =
+            run_with_catalog_params_stats(src, &mut indexed, &with_index, &params)
+                .iter()
+                .filter_map(|r| match r.value("name") {
+                    Value::String(s) => Some(s),
+                    _ => None,
+                })
+                .collect();
+        assert_eq!(cost_based, scan, "cost-based plan must not change results");
+
+        // The indexed plan must route through the pushed-down seek (else this proves nothing).
+        let plan = {
+            let toks = tokenize(src).expect("lex");
+            let ast = parse_tokens(&toks, src).expect("parse");
+            plan_physical(&lower(&analyze(&ast).expect("analyze")), &with_index)
+        };
+        let rendered = plan.to_string();
+        assert!(
+            rendered.contains("NodeIndexSeek(b:Person uid = t.uid"),
+            "the anchor must seek beneath the expand:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("NodeByLabelScan"),
+            "the anchor must NOT stay a label scan:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn correlated_anchor_over_expand_value_bound_by_expand_matches_the_scan() {
+        // `rmp` task #730 — the free-var safety guard, checked at the EXECUTOR level: a predicate whose
+        // value references a variable bound by the traversal (`b.uid = c.uid`, `c` the expand's target)
+        // must NOT be pushed. The planner keeps it a scan+filter; here we prove the RESULT is right (a
+        // wrong push to the anchor would evaluate `c.uid` against an unbound variable and drop rows). The
+        // indexed catalog and the empty catalog must agree.
+        use crate::binding::Parameters;
+
+        fn names(
+            src: &str,
+            graph: &mut MemGraph,
+            catalog: &IndexCatalog,
+            params: &Parameters,
+        ) -> Vec<String> {
+            let mut out: Vec<String> = run_with_catalog_and_params(src, graph, catalog, params)
+                .iter()
+                .filter_map(|r| match r.value("name") {
+                    Value::String(s) => Some(s),
+                    _ => None,
+                })
+                .collect();
+            out.sort();
+            out
+        }
+
+        // p1(uid=10)->tX(uid=10) [b.uid == c.uid ✓], p1->tY(uid=99) [✗]; p2(uid=20)->tZ(uid=20) [✓].
+        let seed = |g: &mut MemGraph| {
+            let p1 = g.add_node(["Person"], [("uid", Value::Integer(10))]);
+            let p2 = g.add_node(["Person"], [("uid", Value::Integer(20))]);
+            let tx = g.add_node(
+                ["Thing"],
+                [
+                    ("uid", Value::Integer(10)),
+                    ("name", Value::String("tX".into())),
+                ],
+            );
+            let ty = g.add_node(
+                ["Thing"],
+                [
+                    ("uid", Value::Integer(99)),
+                    ("name", Value::String("tY".into())),
+                ],
+            );
+            let tz = g.add_node(
+                ["Thing"],
+                [
+                    ("uid", Value::Integer(20)),
+                    ("name", Value::String("tZ".into())),
+                ],
+            );
+            g.add_rel("R", p1, tx, NO_PROPS);
+            g.add_rel("R", p1, ty, NO_PROPS);
+            g.add_rel("R", p2, tz, NO_PROPS);
+        };
+        let mut indexed = MemGraph::new();
+        seed(&mut indexed);
+        let mut plain = MemGraph::new();
+        seed(&mut plain);
+
+        let with_index = IndexCatalog::builder()
+            .with_label_property("Person", "uid")
+            .build();
+        let no_index = IndexCatalog::empty();
+
+        // A driving row is present but the predicate is anchor-vs-target, independent of `t`.
+        let params = Parameters::new().with(
+            "rows",
+            Value::List(vec![Value::Map(vec![("x".to_owned(), Value::Integer(0))])]),
+        );
+
+        let src = "UNWIND $rows AS t MATCH (b:Person)-[:R]->(c) WHERE b.uid = c.uid RETURN c.name AS name";
+        let with = names(src, &mut indexed, &with_index, &params);
+        let without = names(src, &mut plain, &no_index, &params);
+        assert_eq!(
+            with, without,
+            "the un-pushable predicate must give identical results"
+        );
+        assert_eq!(
+            with,
+            vec!["tX", "tZ"],
+            "only the b.uid == c.uid edges survive: {with:?}"
+        );
+    }
+
     #[test]
     fn two_variable_join_index_seek_returns_exactly_the_cartesian_filter_result() {
         // `rmp` task #732 (from the #708 merge): a two-variable JOIN predicate — `MATCH (a:Person),
