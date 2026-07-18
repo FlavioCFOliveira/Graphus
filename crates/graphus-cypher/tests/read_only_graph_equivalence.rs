@@ -1478,3 +1478,172 @@ fn off_thread_rel_seeks_equal_inline_rows_and_ssi_footprint() {
         &[RelId(ids[3])],
     );
 }
+
+/// `rmp` task #770: a NODE and a RELATIONSHIP **spatial (point)** seek is byte-identical off-thread vs
+/// inline — both the **rows** and the **canonical SIREAD buffer** — the spatial twin of
+/// `off_thread_range_composite_text_seeks_equal_inline_rows_and_ssi_footprint`. Both routes run the SAME
+/// lifted body (`index_seek_spatial_recheck` / `rel_index_seek_spatial_recheck`), so this proves the
+/// off-thread reader serves the grid seek from the dispatch-time memo with an identical footprint. A
+/// same-position **wrong-label / wrong-type** entry is forced into each grid so the per-candidate
+/// label/type re-check is genuinely exercised (a bug that ignored it would return the extra id).
+#[test]
+fn off_thread_spatial_seeks_equal_inline_rows_and_ssi_footprint() {
+    let cart = |x: f64, y: f64| Value::Point(Point::new_2d(Crs::Cartesian, x, y));
+
+    let mut s = fresh();
+    let txn = TxnId(1);
+    s.begin(txn);
+    let l_city = s.intern_token(Namespace::Label, "City").unwrap();
+    let l_town = s.intern_token(Namespace::Label, "Town").unwrap();
+    let t_visited = s.intern_token(Namespace::RelType, "VISITED").unwrap();
+    let t_knows = s.intern_token(Namespace::RelType, "KNOWS").unwrap();
+    let k_loc = s.intern_token(Namespace::PropKey, "loc").unwrap();
+    let k_at = s.intern_token(Namespace::PropKey, "at").unwrap();
+
+    // Six City nodes along the x-axis at (i, 0). A Town at the ORIGIN shares the query cell but must be
+    // excluded on the label re-check. Also seed a node scaffold for the relationships.
+    let mut city_ids = Vec::new();
+    for i in 0..6u64 {
+        let (n, _) = s.create_node(txn).unwrap();
+        s.add_label(txn, n, l_city).unwrap();
+        s.set_node_property_value(txn, n, k_loc, &cart(i as f64, 0.0))
+            .unwrap();
+        city_ids.push(n);
+    }
+    let (town, _) = s.create_node(txn).unwrap();
+    s.add_label(txn, town, l_town).unwrap();
+    s.set_node_property_value(txn, town, k_loc, &cart(0.0, 0.0))
+        .unwrap();
+
+    // Six VISITED rels whose point `at` is (i, 0), plus a KNOWS rel at the origin sharing the query cell —
+    // excluded on the type re-check.
+    let mut rel_ids = Vec::new();
+    for i in 0..6u64 {
+        let (r, _) = s.create_rel(txn, t_visited, city_ids[0], town).unwrap();
+        s.set_rel_property_value(txn, r, k_at, &cart(i as f64, 0.0))
+            .unwrap();
+        rel_ids.push(r);
+    }
+    let (knows, _) = s.create_rel(txn, t_knows, city_ids[0], town).unwrap();
+    s.set_rel_property_value(txn, knows, k_at, &cart(0.0, 0.0))
+        .unwrap();
+    s.commit(txn).unwrap();
+    let ts = s.snapshot_ts();
+
+    // Register + populate the node and relationship spatial grids over committed state. The Town id is
+    // forced into the CITY grid, and the KNOWS id into the VISITED grid, both at the origin — so each
+    // grid returns it as a geometric candidate and only the label/type re-check can drop it.
+    let coord = Coordinated::new(s);
+    {
+        let mut idx = coord.index.borrow_mut();
+        idx.register_spatial(l_city, k_loc, 1.0, IndexState::Online);
+        idx.register_spatial_rel(t_visited, k_at, 1.0, IndexState::Online);
+        for (i, &id) in city_ids.iter().enumerate() {
+            idx.insert_spatial_point(l_city, k_loc, &cart(i as f64, 0.0), id);
+        }
+        idx.insert_spatial_point(l_city, k_loc, &cart(0.0, 0.0), town);
+        for (i, &r) in rel_ids.iter().enumerate() {
+            idx.insert_spatial_rel_point(t_visited, k_at, &cart(i as f64, 0.0), r);
+        }
+        idx.insert_spatial_rel_point(t_visited, k_at, &cart(0.0, 0.0), knows);
+        // The populate reflects committed state; clear the in-flight ft/spatial marker so the live seam
+        // takes its fast grid arm and the capture is admitted (else the comparison is vacuous).
+        idx.clear_ft_spatial_dirty();
+    }
+
+    // --- NODE spatial: within radius 2 of the origin → Cities at x=0,1,2; never the Town. ---
+    let node_cap = coord
+        .index
+        .borrow_mut()
+        .capture_node_spatial(ts, &[(l_city, k_loc, 0.0, 0.0, 2.0)]);
+    {
+        let live = coord.live_at(TxnId(100), ts);
+        let inline = live
+            .index_seek_spatial("City", "loc", 0.0, 0.0, 2.0)
+            .expect("inline City grid is Online — it must seek");
+        let ro = coord
+            .reader_at(TxnId(100), ts)
+            .with_index_candidates(node_cap);
+        let off_thread = ro
+            .index_seek_spatial("City", "loc", 0.0, 0.0, 2.0)
+            .expect("the reader has a captured memo — it must seek");
+
+        assert_eq!(
+            off_thread, inline,
+            "node spatial: off-thread rows disagree with inline"
+        );
+        for id in [city_ids[0], city_ids[1], city_ids[2]] {
+            assert!(
+                off_thread.contains(&NodeId(id)),
+                "node spatial: the seek must contain {id} (rows={off_thread:?})"
+            );
+        }
+        assert!(
+            !off_thread.contains(&NodeId(town)),
+            "node spatial: the Town must be excluded by the label re-check (rows={off_thread:?})"
+        );
+
+        let live_buf = live
+            .take_read_buffer()
+            .expect("coordinated live seam holds a SIREAD buffer");
+        let ro_buf = ro.take_buffer();
+        let (lr, lk, lp) = canonical(live_buf);
+        let (rr, rk, rp) = canonical(ro_buf);
+        assert_eq!(lr, rr, "node spatial: SIREAD reader id differs");
+        assert_eq!(lk, rk, "node spatial: per-record SIREAD markers differ");
+        assert_eq!(lp, rp, "node spatial: predicate SIREAD markers differ");
+        assert!(
+            !lk.is_empty(),
+            "node spatial: expected non-empty SIREAD markers (mark_all_live_nodes) — else vacuous"
+        );
+        assert!(!ro.has_error(), "node spatial: reader captured an error");
+    }
+
+    // --- REL spatial: within radius 2 of the origin → VISITED rels at x=0,1,2; never the KNOWS rel. ---
+    let rel_cap = coord
+        .index
+        .borrow_mut()
+        .capture_rel_spatial(ts, &[(t_visited, k_at, 0.0, 0.0, 2.0)]);
+    {
+        let live = coord.live_at(TxnId(101), ts);
+        let inline = live
+            .index_seek_spatial_rel("VISITED", "at", 0.0, 0.0, 2.0)
+            .expect("inline VISITED grid is Online — it must seek");
+        let ro = coord
+            .reader_at(TxnId(101), ts)
+            .with_index_candidates(rel_cap);
+        let off_thread = ro
+            .index_seek_spatial_rel("VISITED", "at", 0.0, 0.0, 2.0)
+            .expect("the reader has a captured memo — it must seek");
+
+        assert_eq!(
+            off_thread, inline,
+            "rel spatial: off-thread rows disagree with inline"
+        );
+        for id in [rel_ids[0], rel_ids[1], rel_ids[2]] {
+            assert!(
+                off_thread.contains(&RelId(id)),
+                "rel spatial: the seek must contain {id} (rows={off_thread:?})"
+            );
+        }
+        assert!(
+            !off_thread.contains(&RelId(knows)),
+            "rel spatial: the KNOWS rel must be excluded by the type re-check (rows={off_thread:?})"
+        );
+
+        let live_buf = live
+            .take_read_buffer()
+            .expect("coordinated live seam holds a SIREAD buffer");
+        let ro_buf = ro.take_buffer();
+        let (lr, lk, lp) = canonical(live_buf);
+        let (rr, rk, rp) = canonical(ro_buf);
+        assert_eq!(lr, rr, "rel spatial: SIREAD reader id differs");
+        assert_eq!(lk, rk, "rel spatial: per-record SIREAD markers differ");
+        assert_eq!(lp, rp, "rel spatial: predicate SIREAD markers differ");
+        assert!(
+            !lk.is_empty(),
+            "rel spatial: expected non-empty SIREAD markers (mark_all_live_rels) — else vacuous"
+        );
+        assert!(!ro.has_error(), "rel spatial: reader captured an error");
+    }
+}

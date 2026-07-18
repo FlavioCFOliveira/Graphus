@@ -56,6 +56,11 @@ pub type CompositeCaptureRequest = (u32, Vec<u32>, Vec<Value>);
 /// One node TEXT (trigram) seek to pre-run for an off-thread reader (`rmp` task #768):
 /// `(label_token, prop_key, op, needle)`. Consumed by [`IndexSet::capture_node_property_text`].
 pub type TextCaptureRequest = (u32, u32, crate::physical::TextSeekOp, String);
+/// One SPATIAL (point) proximity seek to pre-run for an off-thread reader (`rmp` task #770), shared by
+/// nodes and relationships: `(token, prop_key, center_x, center_y, radius)`. The centre/radius are the
+/// plan-time-folded `f64` constants. Consumed by [`IndexSet::capture_node_spatial`] /
+/// [`IndexSet::capture_rel_spatial`].
+pub type SpatialCaptureRequest = (u32, u32, f64, f64, f64);
 
 /// The in-memory block device the derived indexes are built on.
 type Dev = MemBlockDevice;
@@ -2180,6 +2185,69 @@ impl IndexSet {
             }
             if let Some(ids) = self.seek_rel_composite_eq(*type_token, property_tokens, values) {
                 capture.insert_rel_composite(*type_token, property_tokens, values, ids);
+            }
+        }
+        capture
+    }
+
+    /// Runs the node SPATIAL (point) proximity seeks in `requests` on this (engine-thread) grid index and
+    /// memoises their candidate node ids for an off-thread reader (`rmp` task #770).
+    ///
+    /// Each request is `(label_token, prop_key, center_x, center_y, radius)` from a plan's
+    /// [`SpatialIndexSeek`](crate::physical::PhysicalOp::SpatialIndexSeek), whose centre + radius are
+    /// plan-time-folded constants.
+    ///
+    /// # Gates — the ft/spatial (grid) class, exactly as [`capture_node_property_text`](Self::capture_node_property_text)
+    ///
+    /// The grid, like the trigram and full-text indexes, keeps only the LATEST state (a write re-keys a
+    /// node's cell wholesale), so it rides the [`effective_ft_spatial_marker`](Self::effective_ft_spatial_marker)
+    /// freshness gate (`rmp` #467) — **not** the node-property `rebuilt_trees_trustworthy_from` watermark:
+    /// using the latter would serve a reader newer than the last node-property rebuild but older than the
+    /// last grid re-key a subset (silent row loss). Capture nothing when the reader predates the marker
+    /// (an in-flight / rolled-back ft/spatial mutation forces it to `u64::MAX`, so every reader declines);
+    /// per request only when the grid is `Online` (`rmp` #733). The memo captures the RAW grid superset
+    /// (before label filtering) — the reader's re-check runs [`filter_label_candidates`](crate::read_source)
+    /// on it, exactly as the inline seam does, so the per-candidate SIREAD footprint is identical.
+    #[must_use]
+    pub fn capture_node_spatial(
+        &mut self,
+        reader_ts: Timestamp,
+        requests: &[SpatialCaptureRequest],
+    ) -> crate::read_source::IndexCandidateCapture {
+        let mut capture = crate::read_source::IndexCandidateCapture::default();
+        if reader_ts < self.effective_ft_spatial_marker() {
+            return capture;
+        }
+        for (label_token, prop_key, cx, cy, r) in requests {
+            if self.spatial_state(*label_token, *prop_key) != Some(IndexState::Online) {
+                continue;
+            }
+            if let Some(ids) = self.seek_spatial_within(*label_token, *prop_key, *cx, *cy, *r) {
+                capture.insert_spatial(*label_token, *prop_key, *cx, *cy, *r, ids);
+            }
+        }
+        capture
+    }
+
+    /// Runs the RELATIONSHIP SPATIAL (point) proximity seeks in `requests` (`rmp` task #770/#664) — the
+    /// relationship twin of [`capture_node_spatial`](Self::capture_node_spatial). Same ft/spatial freshness
+    /// gate; per request only when the relationship grid is `Online`.
+    #[must_use]
+    pub fn capture_rel_spatial(
+        &mut self,
+        reader_ts: Timestamp,
+        requests: &[SpatialCaptureRequest],
+    ) -> crate::read_source::IndexCandidateCapture {
+        let mut capture = crate::read_source::IndexCandidateCapture::default();
+        if reader_ts < self.effective_ft_spatial_marker() {
+            return capture;
+        }
+        for (type_token, prop_key, cx, cy, r) in requests {
+            if self.spatial_rel_state(*type_token, *prop_key) != Some(IndexState::Online) {
+                continue;
+            }
+            if let Some(ids) = self.seek_spatial_rel_within(*type_token, *prop_key, *cx, *cy, *r) {
+                capture.insert_rel_spatial(*type_token, *prop_key, *cx, *cy, *r, ids);
             }
         }
         capture

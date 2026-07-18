@@ -822,3 +822,117 @@ async fn the_off_thread_reader_serves_a_rel_composite_seek_and_profile_measures_
 
     let _ = server.shutdown().await;
 }
+
+// =================================================================================================
+// `rmp` #770 — the off-thread reader must serve SPATIAL (point) proximity seeks (node + rel)
+// =================================================================================================
+
+/// **`rmp` #770 — the off-thread reader now serves a NODE spatial (point) proximity seek, MEASURED.**
+///
+/// The off-thread `ReadOnlyGraph` implemented no `index_seek_spatial`, so an auto-commit
+/// `MATCH (c:City) WHERE distance(c.loc, point(...)) <= r` read full-scanned the label (`SpatialIndexSeek`
+/// declines `None` → `scan_nodes_by_label`) while the plan named a `SpatialIndexSeek`. Unlike VECTOR
+/// (whose ANN probe is a runtime vector), a spatial seek's centre + radius are plan-time-folded `f64`
+/// constants, so the candidate superset can be pre-captured at dispatch — the #768/#769 memo extended.
+/// Pinned the #768 way: measured `dbHits`, off-thread, seek ≪ scan (asserting the operator NAME is not
+/// enough — a `SpatialIndexSeek` over a full scan is exactly what shipped).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_off_thread_reader_serves_a_spatial_seek_and_profile_measures_it() {
+    let temp = TempStore::new("readerpool-spatial-node");
+    let server = boot(&temp).await;
+
+    let (seek_ops, seek_hits, scan_hits) = tokio::task::spawn_blocking(move || {
+        let mut c = connect(&temp);
+        // 300 cities strung along the x-axis at (i, 0); only i ∈ {0,1,2} lie within radius 2 of origin.
+        c.run("UNWIND range(0, 299) AS i CREATE (:City {loc: point({x: i, y: 0}), name: 'c' + toString(i)})")
+            .expect("seed");
+        c.run("CREATE POINT INDEX city_loc FOR (c:City) ON (c.loc)")
+            .expect("point index");
+
+        let query =
+            "PROFILE MATCH (c:City) WHERE distance(c.loc, point({x: 0, y: 0})) <= 2 RETURN c.name AS n";
+        let seek = c.run(query).expect("indexed spatial read");
+        let seek_plan = wire_plan(&seek.summary).expect("plan");
+        assert_eq!(seek.records.len(), 3, "cities at x=0,1,2 are within radius 2");
+
+        c.run("DROP INDEX city_loc").expect("drop");
+        let scan = c.run(query).expect("unindexed spatial read");
+        let scan_plan = wire_plan(&scan.summary).expect("plan");
+        assert_eq!(scan.records.len(), 3, "the rows are identical either way");
+
+        (
+            operators(&seek_plan.root),
+            total_db_hits(&seek_plan.root),
+            total_db_hits(&scan_plan.root),
+        )
+    })
+    .await
+    .expect("client thread");
+
+    assert!(
+        seek_ops.iter().any(|o| o == "SpatialIndexSeek"),
+        "the planner DID pick the spatial index: {seek_ops:?}"
+    );
+    assert!(
+        seek_hits * 4 < scan_hits,
+        "MEASURED FIX (rmp #770): the reader pool now SERVES the node spatial seek from the candidates \
+         captured at dispatch (seek={seek_hits}, scan={scan_hits}). Before #770 the off-thread reader \
+         declined every spatial seek and read the whole label while the plan still said SpatialIndexSeek."
+    );
+
+    let _ = server.shutdown().await;
+}
+
+/// **`rmp` #770 — the off-thread reader now serves a RELATIONSHIP spatial (point) seek, MEASURED.**
+///
+/// The relationship twin (`RelSpatialIndexSeek`, `rmp` #664). Same shape, over a relationship point index.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_off_thread_reader_serves_a_rel_spatial_seek_and_profile_measures_it() {
+    let temp = TempStore::new("readerpool-spatial-rel");
+    let server = boot(&temp).await;
+
+    let (seek_ops, seek_hits, scan_hits) = tokio::task::spawn_blocking(move || {
+        let mut c = connect(&temp);
+        // Two hubs and 300 VISITED relationships whose point `at` is (i, 0); only i ∈ {0,1,2} within r=2.
+        c.run("CREATE (a:Hub {n: 0}), (b:Hub {n: 1})").expect("hubs");
+        c.run(
+            "MATCH (a:Hub {n: 0}), (b:Hub {n: 1}) UNWIND range(0, 299) AS i \
+             CREATE (a)-[:VISITED {at: point({x: i, y: 0}), tag: 't' + toString(i)}]->(b)",
+        )
+        .expect("seed rels");
+        c.run("CREATE POINT INDEX visited_at FOR ()-[r:VISITED]-() ON (r.at)")
+            .expect("rel point index");
+
+        let query =
+            "PROFILE MATCH ()-[r:VISITED]->() WHERE distance(r.at, point({x: 0, y: 0})) <= 2 RETURN r.tag AS t";
+        let seek = c.run(query).expect("indexed rel spatial read");
+        let seek_plan = wire_plan(&seek.summary).expect("plan");
+        assert_eq!(seek.records.len(), 3, "rels at x=0,1,2 are within radius 2");
+
+        c.run("DROP INDEX visited_at").expect("drop");
+        let scan = c.run(query).expect("unindexed rel spatial read");
+        let scan_plan = wire_plan(&scan.summary).expect("plan");
+        assert_eq!(scan.records.len(), 3, "the rows are identical either way");
+
+        (
+            operators(&seek_plan.root),
+            total_db_hits(&seek_plan.root),
+            total_db_hits(&scan_plan.root),
+        )
+    })
+    .await
+    .expect("client thread");
+
+    assert!(
+        seek_ops.iter().any(|o| o == "RelSpatialIndexSeek"),
+        "the planner DID pick the rel spatial index (#664): {seek_ops:?}"
+    );
+    assert!(
+        seek_hits * 4 < scan_hits,
+        "MEASURED FIX (rmp #770): the reader pool now SERVES the rel spatial seek from the captured \
+         candidates (seek={seek_hits}, scan={scan_hits}). Before #770 the off-thread reader declined it \
+         and typed-scanned the whole relationship type while the plan still said RelSpatialIndexSeek."
+    );
+
+    let _ = server.shutdown().await;
+}

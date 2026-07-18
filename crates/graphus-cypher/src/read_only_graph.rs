@@ -525,6 +525,71 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         ))
     }
 
+    fn index_seek_spatial(
+        &self,
+        label: &str,
+        property: &str,
+        center_x: f64,
+        center_y: f64,
+        radius: f64,
+    ) -> Option<Vec<NodeId>> {
+        // `rmp` task #770 — the SPATIAL (point) twin of the seeks above. Unlike VECTOR (whose ANN probe is
+        // a run-time vector the reader cannot pre-capture, so `db.index.vector.*` stays inline by dispatch
+        // rule), the centre + radius are plan-time-folded `f64` constants, so the grid candidate superset
+        // was memoised at dispatch, keyed on the same constants the executor passes. A MISS (not captured,
+        // a since-dropped/`Populating` grid, a stale reader past the ft/spatial marker) MUST decline so the
+        // executor takes the exact `scan_nodes_by_label` + residual `distance(...) <op> r` filter — never
+        // `Some(vec![])`, which would silently drop rows (`rmp` #680/#738).
+        let label_token = self.tokens.token_id(Namespace::Label, label)?;
+        let prop_key = self.tokens.token_id(Namespace::PropKey, property)?;
+        let candidates =
+            self.index_candidates
+                .get_spatial(label_token, prop_key, center_x, center_y, radius)?;
+
+        // The SAME lifted body the inline seam runs (`rmp` #770): the blanket `mark_all_live_nodes` + the
+        // per-candidate visibility/label re-check + the dedup, with NO predicate residual (the executor
+        // keeps the exact `distance` filter above). Spatial shares the text-family narrowing, so this rides
+        // `index_seek_text_recheck` — rows + SSI footprint identical to the inline spatial seek by
+        // construction.
+        Some(read_source::index_seek_spatial_recheck(
+            &self.source(),
+            &self.ctx(),
+            self,
+            label_token,
+            candidates.to_vec(),
+        ))
+    }
+
+    fn index_seek_spatial_rel(
+        &self,
+        rel_type: &str,
+        property: &str,
+        center_x: f64,
+        center_y: f64,
+        radius: f64,
+    ) -> Option<Vec<RelId>> {
+        // `rmp` task #770/#664 — the relationship spatial twin. A MISS declines to the exact typed
+        // relationship scan + residual `distance` filter (`rmp` #680/#738).
+        let type_token = self.tokens.token_id(Namespace::RelType, rel_type)?;
+        let prop_key = self.tokens.token_id(Namespace::PropKey, property)?;
+        let candidates = self
+            .index_candidates
+            .get_rel_spatial(type_token, prop_key, center_x, center_y, radius)?;
+
+        // The SAME lifted body the inline seam runs: the blanket `mark_all_live_rels` (INSIDE the body,
+        // since a spatial seek has no `List`/rebuild pre-decline marker to preserve — unlike the rel
+        // eq/range/composite seams, `rmp` #683) + the per-candidate visibility/type re-check + the dedup,
+        // with NO `distance` residual (the executor keeps it above). Rows + SSI footprint identical to the
+        // inline rel spatial seek by construction.
+        Some(read_source::rel_index_seek_spatial_recheck(
+            &self.source(),
+            &self.ctx(),
+            self,
+            rel_type,
+            candidates.to_vec(),
+        ))
+    }
+
     fn expand(&self, node: NodeId, direction: ExpandDirection, types: &[String]) -> Vec<Incident> {
         read_source::expand(&self.source(), &self.ctx(), self, node, direction, types)
     }
@@ -577,14 +642,18 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         read_source::incident_rels(&self.source(), &self.ctx(), self, node)
     }
 
-    // The optional property-index / spatial / columnar / statistics seams DECLINE on the reader
-    // (first-cut scan-fallback): the derived accelerators live in the coordinator, not in this owned
-    // read view. The executor then uses the ordinary Volcano scan / label-scan fallback, which the
-    // reads above answer correctly and which registers the identical SSI footprint — so a
-    // `SpatialIndexSeek` off-thread returns `None` here and the executor's label-scan + residual
-    // `distance(...)` filter serves it correctly. Each falls back to the `GraphAccess` default
-    // (`None`), so they are deliberately not overridden. `statistics()` likewise defaults to `None`
-    // (cost-based planning happens on the engine thread before dispatch).
+    // The property-index and spatial seeks above are SERVED off-thread from the dispatch-time memo
+    // (`rmp` #755/#768/#769 property seeks + #770 spatial) — a MISS declines to the exact scan, never
+    // `Some(empty)`. The remaining accelerators DECLINE on the reader (their derived structures live in
+    // the coordinator, not in this owned read view): `columnar_label_property_scan` / `morsel_label_scan`
+    // fall to the `GraphAccess` default (`None`), so the executor uses the ordinary Volcano scan / row
+    // read — always correct, and its "candidate set" is the whole column, so pre-capturing it at dispatch
+    // would move the bulk read back onto the engine thread, defeating off-thread dispatch (`rmp` #770
+    // verdict; #352 measured a full-column projection ~1.8x SLOWER than serial). VECTOR seeks are never
+    // reached here: `db.index.vector.*` is registered NOT reader-safe, so an ANN read stays inline by
+    // dispatch rule (its query vector is a run-time value, not a plan constant, `rmp` #770). `statistics()`
+    // likewise defaults to `None` (cost-based planning happens on the engine thread before dispatch, which
+    // also keeps the morsel/parallel tiers — gated on `statistics()` — from being attempted off-thread).
 
     // Full-text is the exception (`rmp` task #546): unlike a declined *index seek* (which the executor
     // turns into a correct scan), a declined `fulltext_query` surfaces as a hard "no such index"

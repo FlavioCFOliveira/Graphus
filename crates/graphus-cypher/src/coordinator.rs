@@ -8045,6 +8045,11 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let rel_eq_seeks = plan.static_rel_index_eq_seeks(params);
         let rel_range_seeks = plan.static_rel_index_range_seeks(params);
         let rel_composite_seeks = plan.static_rel_composite_seeks(params);
+        // Spatial (point) seeks take no `params`: their centre + radius are plan-time-folded constants
+        // (`rmp` #770). VECTOR is deliberately NOT captured — `db.index.vector.*` runs inline (not
+        // reader-safe), so an ANN read never dispatches off-thread.
+        let spatial_seeks = plan.static_node_spatial_seeks();
+        let rel_spatial_seeks = plan.static_rel_spatial_seeks();
         if eq_seeks.is_empty()
             && range_seeks.is_empty()
             && composite_seeks.is_empty()
@@ -8052,6 +8057,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             && rel_eq_seeks.is_empty()
             && rel_range_seeks.is_empty()
             && rel_composite_seeks.is_empty()
+            && spatial_seeks.is_empty()
+            && rel_spatial_seeks.is_empty()
         {
             return crate::read_source::IndexCandidateCapture::default();
         }
@@ -8129,9 +8136,27 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     Some((type_token, property_tokens?, values))
                 })
                 .collect();
+        // Spatial (point) seeks (`rmp` #770): node keyed through the `Label` namespace, rel through
+        // `RelType`; the property namespace is shared. The centre/radius stay `f64` — no encoding here.
+        let spatial_requests: Vec<crate::index_set::SpatialCaptureRequest> = spatial_seeks
+            .into_iter()
+            .filter_map(|(label, property, cx, cy, r)| {
+                let label_token = store.token_id(Namespace::Label, &label)?;
+                let prop_key = store.token_id(Namespace::PropKey, &property)?;
+                Some((label_token, prop_key, cx, cy, r))
+            })
+            .collect();
+        let rel_spatial_requests: Vec<crate::index_set::SpatialCaptureRequest> = rel_spatial_seeks
+            .into_iter()
+            .filter_map(|(rel_type, property, cx, cy, r)| {
+                let type_token = store.token_id(Namespace::RelType, &rel_type)?;
+                let prop_key = store.token_id(Namespace::PropKey, &property)?;
+                Some((type_token, prop_key, cx, cy, r))
+            })
+            .collect();
         drop(store);
-        // One `borrow_mut`, seven per-kind captures merged into one memo. RANGE/COMPOSITE (node and rel)
-        // and equality ride the shared rebuild watermark; TEXT rides the ft/spatial marker.
+        // One `borrow_mut`, nine per-kind captures merged into one memo. RANGE/COMPOSITE (node and rel)
+        // and equality ride the shared rebuild watermark; TEXT and SPATIAL ride the ft/spatial marker.
         let mut index = self.index.borrow_mut();
         let mut capture = index.capture_node_property_eq(reader_ts, &eq_requests);
         capture.absorb(index.capture_node_property_range(reader_ts, &range_requests));
@@ -8140,6 +8165,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         capture.absorb(index.capture_rel_property_eq(reader_ts, &rel_eq_requests));
         capture.absorb(index.capture_rel_property_range(reader_ts, &rel_range_requests));
         capture.absorb(index.capture_rel_composite(reader_ts, &rel_composite_requests));
+        capture.absorb(index.capture_node_spatial(reader_ts, &spatial_requests));
+        capture.absorb(index.capture_rel_spatial(reader_ts, &rel_spatial_requests));
         capture
     }
 

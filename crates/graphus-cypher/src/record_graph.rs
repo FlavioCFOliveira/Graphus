@@ -4495,25 +4495,30 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             return None;
         }
 
-        // SSI predicate footprint: an indexed proximity predicate replaces the label-scan + filter
-        // fallback (which read every node via `scan_nodes_by_label`). Preserve that exact read
-        // footprint so the index path and the scan fallback are indistinguishable to SSI (`04 §5.4`).
-        self.mark_all_live_nodes();
-
         // Candidate ids whose point lies within the radius of the centre's 2D projection — a geometric
-        // superset (the grid buckets by `(x, y)`). The caller's residual `distance(...) <op> r` filter
-        // re-checks the exact predicate, CRS, current value, visibility, and current label per
-        // candidate, so this need only narrow to nodes that currently carry the label.
+        // superset (the grid buckets by `(x, y)`). The residual `distance(...) <op> r` filter above this
+        // operator re-checks the exact predicate, CRS, current value, visibility, and current label per
+        // candidate, so this need only narrow to nodes that currently carry the label. The grid read
+        // registers no SIREAD (it reads the derived grid, not the store), so the SSI footprint is stamped
+        // entirely by the lifted body below — order relative to the seek is irrelevant.
         let candidates = index
             .borrow()
             .seek_spatial_within(label_token, prop_key, center_x, center_y, radius)
             .unwrap_or_default();
-        let labelled = self.filter_label_candidates(label_token, candidates);
 
-        let mut out = labelled;
-        out.sort_unstable();
-        out.dedup();
-        Some(out)
+        // The SAME lifted body the off-thread `ReadOnlyGraph` runs (`rmp` #770): the blanket
+        // `mark_all_live_nodes` (an indexed proximity predicate stands in for a label scan, `04 §5.4`) +
+        // the per-candidate visibility/label re-check + the dedup. Spatial and text share this one node
+        // narrowing (`rmp` #662/#73) — no coarse `Label` phantom marker and no predicate residual (the
+        // executor keeps the exact `distance` filter above). Both seams call this one body, so rows +
+        // footprint match by construction. Read-only: `LiveSource` over the store's `&self` reads.
+        Some(read_source::index_seek_spatial_recheck(
+            &LiveSource(&*self.store.borrow()),
+            &self.vis_ctx(),
+            self,
+            label_token,
+            candidates,
+        ))
     }
 
     fn index_seek_spatial_rel(
@@ -4550,30 +4555,28 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             return None;
         }
 
-        // SSI predicate footprint: an indexed proximity seek replaces the typed-relationship scan +
-        // filter fallback (which read every relationship of the type). Preserve that exact read footprint
-        // so the index path and the scan fallback are indistinguishable to SSI (`04 §5.4`), exactly as
-        // `rel_index_seek_eq` does.
-        self.mark_all_live_rels();
-
         // Candidate relationship ids whose point lies within the radius of the centre's 2D projection — a
         // geometric superset (the grid buckets by `(x, y)`). The residual `distance(...) <= r` filter
-        // re-checks the exact predicate, CRS, current value, and visibility per candidate, so this need
-        // only narrow to relationships that currently carry the covered type (each candidate re-read via
-        // `rel_data`, which also SIREAD-marks it and drops a no-longer-visible relationship).
+        // above this operator re-checks the exact predicate, CRS, current value, and visibility per
+        // candidate, so this need only narrow to relationships that currently carry the covered type. The
+        // grid read registers no SIREAD, so the SSI footprint is stamped entirely by the lifted body below.
         let candidates = index
             .borrow()
             .seek_spatial_rel_within(type_token, prop_key, center_x, center_y, radius)
             .unwrap_or_default();
-        let mut out: Vec<u64> = candidates
-            .into_iter()
-            .filter(
-                |&id| matches!(self.rel_data(RelId(id)), Some(data) if data.rel_type == rel_type),
-            )
-            .collect();
-        out.sort_unstable();
-        out.dedup();
-        Some(out.into_iter().map(RelId).collect())
+
+        // The SAME lifted body the off-thread `ReadOnlyGraph` runs (`rmp` #770): the blanket
+        // `mark_all_live_rels` (INSIDE the body, since a spatial seek has no `List`/rebuild pre-decline
+        // marker to preserve, unlike the rel eq/range/composite seams, `rmp` #683) + the per-candidate
+        // `rel_data` visibility/type re-check + the dedup, with no `distance` residual (the executor keeps
+        // it above). Both seams call this one body, so rows + footprint match by construction.
+        Some(read_source::rel_index_seek_spatial_recheck(
+            &LiveSource(&*self.store.borrow()),
+            &self.vis_ctx(),
+            self,
+            rel_type,
+            candidates,
+        ))
     }
 
     fn index_seek_text(

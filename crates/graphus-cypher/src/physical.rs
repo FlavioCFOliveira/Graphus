@@ -408,6 +408,38 @@ impl PhysicalPlan {
         out
     }
 
+    /// Every node **SPATIAL (point) proximity seek** this plan will ask
+    /// [`index_seek_spatial`](crate::graph_access::GraphAccess::index_seek_spatial) for, resolved to
+    /// `(label, property, center_x, center_y, radius)` (`rmp` task #770).
+    ///
+    /// # Why this needs no `params` (the VECTOR contrast)
+    ///
+    /// Unlike an ANN probe (whose query vector is a run-time value the off-thread reader cannot
+    /// pre-capture — `rmp` #770 keeps `db.index.vector.*` inline), a [`SpatialIndexSeek`](PhysicalOp::SpatialIndexSeek)'s
+    /// centre and radius are **plan-time-folded `f64` constants** (a proximity predicate whose operands are
+    /// not compile-time constants never reaches this operator — the planner falls back to scan + filter,
+    /// see [`binding::params_in_physical`](crate::binding)). So the candidate superset is fully
+    /// determined at dispatch and can be memoised for the reader exactly like the #768/#769 seeks — no
+    /// parameter resolution is involved.
+    #[must_use]
+    pub fn static_node_spatial_seeks(&self) -> Vec<StaticSpatialSeek> {
+        let mut out = Vec::new();
+        collect_static_node_spatial_seeks(&self.root, &mut out);
+        out
+    }
+
+    /// Every RELATIONSHIP **SPATIAL (point) proximity seek** this plan will ask
+    /// [`index_seek_spatial_rel`](crate::graph_access::GraphAccess::index_seek_spatial_rel) for, resolved
+    /// to `(rel_type, property, center_x, center_y, radius)` (`rmp` task #770/#664) — the relationship
+    /// twin of [`static_node_spatial_seeks`](Self::static_node_spatial_seeks). Same constant-centre
+    /// argument: [`RelSpatialIndexSeek`](PhysicalOp::RelSpatialIndexSeek) carries plan-time-folded `f64`s.
+    #[must_use]
+    pub fn static_rel_spatial_seeks(&self) -> Vec<StaticSpatialSeek> {
+        let mut out = Vec::new();
+        collect_static_rel_spatial_seeks(&self.root, &mut out);
+        out
+    }
+
     /// Whether this plan depends on `id`.
     #[must_use]
     pub fn depends_on(&self, id: IndexId) -> bool {
@@ -5979,6 +6011,14 @@ pub type StaticCompositeSeek = (String, Vec<String>, Vec<graphus_core::Value>);
 /// One statically-knowable node TEXT (trigram) seek, in name form (`rmp` task #768):
 /// `(label, property, op, needle)`.
 pub type StaticTextSeek = (String, String, TextSeekOp, String);
+/// One statically-knowable SPATIAL (point) proximity seek, in name form (`rmp` task #770), shared by
+/// nodes and relationships: `(label_or_rel_type, property, center_x, center_y, radius)`. The centre and
+/// radius are the plan-time-folded `f64` constants the [`SpatialIndexSeek`](PhysicalOp::SpatialIndexSeek)
+/// / [`RelSpatialIndexSeek`](PhysicalOp::RelSpatialIndexSeek) operator carries (never a `$param`), so no
+/// parameter resolution is involved. The coordinator resolves the name to a token for
+/// [`IndexSet::capture_node_spatial`](crate::index_set::IndexSet::capture_node_spatial) /
+/// [`capture_rel_spatial`](crate::index_set::IndexSet::capture_rel_spatial).
+pub type StaticSpatialSeek = (String, String, f64, f64, f64);
 
 /// The owned `(lower, upper)` bounds a [`RangeBound`] + seek value implies (`rmp` task #768) — the
 /// owned twin of the executor's `range_bounds`, kept in lockstep so the capture and the executor form
@@ -6173,6 +6213,58 @@ fn collect_static_rel_composite_seeks(
     }
     for child in op.children() {
         collect_static_rel_composite_seeks(child, params, out);
+    }
+}
+
+/// Collects this operator's node SPATIAL (point) seeks, then recurses (`rmp` task #770). No `params`:
+/// the centre + radius are the plan-time-folded `f64` constants the operator carries (never a `$param`).
+/// See [`PhysicalPlan::static_node_spatial_seeks`].
+fn collect_static_node_spatial_seeks(op: &PhysicalOp, out: &mut Vec<StaticSpatialSeek>) {
+    if let PhysicalOp::SpatialIndexSeek {
+        label,
+        property,
+        center_x,
+        center_y,
+        radius,
+        ..
+    } = op
+    {
+        out.push((
+            label.name.clone(),
+            property.clone(),
+            *center_x,
+            *center_y,
+            *radius,
+        ));
+    }
+    for child in op.children() {
+        collect_static_node_spatial_seeks(child, out);
+    }
+}
+
+/// Collects this operator's relationship SPATIAL (point) seeks, then recurses (`rmp` task #770/#664) —
+/// the relationship twin of [`collect_static_node_spatial_seeks`]. See
+/// [`PhysicalPlan::static_rel_spatial_seeks`].
+fn collect_static_rel_spatial_seeks(op: &PhysicalOp, out: &mut Vec<StaticSpatialSeek>) {
+    if let PhysicalOp::RelSpatialIndexSeek {
+        rel_type,
+        property,
+        center_x,
+        center_y,
+        radius,
+        ..
+    } = op
+    {
+        out.push((
+            rel_type.name.clone(),
+            property.clone(),
+            *center_x,
+            *center_y,
+            *radius,
+        ));
+    }
+    for child in op.children() {
+        collect_static_rel_spatial_seeks(child, out);
     }
 }
 

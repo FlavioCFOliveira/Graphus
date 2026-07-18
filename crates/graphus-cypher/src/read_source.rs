@@ -365,6 +365,12 @@ impl<D: BlockDevice, S: LogSink> StoreReadSource for ReadViewSource<'_, D, S> {
 /// The memo key for a captured COMPOSITE seek (`rmp` #768): `(label_token, property_tokens,
 /// encode_values(values))`. Factored to a named type so the map declaration stays legible.
 type CompositeCaptureKey = (u32, Vec<u32>, Vec<u8>);
+/// The memo key for a captured SPATIAL (point) seek (`rmp` #770): `(token, prop_key, cx_bits, cy_bits,
+/// r_bits)`, where the three coordinates are `f64::to_bits()` of the plan-time-folded centre/radius.
+/// Bit-exact keying is correct here — the reader forms the identical `f64` constants from the same
+/// [`SpatialIndexSeek`](crate::physical::PhysicalOp::SpatialIndexSeek) operator the capture read, so the
+/// bits always agree; a key that failed to agree would simply miss and decline to the exact scan.
+type SpatialCaptureKey = (u32, u32, u64, u64, u64);
 
 #[derive(Debug, Clone, Default)]
 pub struct IndexCandidateCapture {
@@ -400,6 +406,13 @@ pub struct IndexCandidateCapture {
     /// `(type_token, property_tokens, encode_values(values))` → the RELATIONSHIP composite candidate ids
     /// (`rmp` #769) — the twin of [`composite`](Self#structfield.composite).
     rel_composite: HashMap<CompositeCaptureKey, Arc<[u64]>>,
+    /// `(label_token, prop_key, cx_bits, cy_bits, r_bits)` → the SPATIAL (point) candidate node ids
+    /// (`rmp` #770). The grid seek is a geometric superset; the reader narrows it to visible + currently
+    /// labelled nodes and the executor's residual `distance(...) <op> r` filter restores exactness.
+    spatial: HashMap<SpatialCaptureKey, Arc<[u64]>>,
+    /// `(type_token, prop_key, cx_bits, cy_bits, r_bits)` → the SPATIAL (point) candidate rel ids
+    /// (`rmp` #770/#664) — the relationship twin of [`spatial`](Self#structfield.spatial). Values are rel ids.
+    rel_spatial: HashMap<SpatialCaptureKey, Arc<[u64]>>,
 }
 
 // `rmp` #755/#768, Slice S2: the capture rides a `ReadTask` to a reader thread, so it must be
@@ -644,9 +657,101 @@ impl IndexCandidateCapture {
             .cloned()
     }
 
-    /// Folds `other`'s memoised seeks into `self` (`rmp` tasks #768/#769), used by the dispatch site to
-    /// merge the per-kind captures (node + relationship equality, range, composite, text) into one memo
-    /// for the reader. The maps are disjoint by kind, so this is a straight per-map extend.
+    /// Memoises `ids` as the SPATIAL (point) candidate node list for `(label_token, prop_key)` under the
+    /// centre `(center_x, center_y)` + `radius` (`rmp` #770). The centre/radius are keyed bit-exactly via
+    /// [`f64::to_bits`] — the reader forms the identical constants from the same operator, so they agree.
+    pub fn insert_spatial(
+        &mut self,
+        label_token: u32,
+        prop_key: u32,
+        center_x: f64,
+        center_y: f64,
+        radius: f64,
+        ids: Vec<u64>,
+    ) {
+        self.spatial.insert(
+            (
+                label_token,
+                prop_key,
+                center_x.to_bits(),
+                center_y.to_bits(),
+                radius.to_bits(),
+            ),
+            ids.into(),
+        );
+    }
+
+    /// The memoised SPATIAL candidate node ids for `(label_token, prop_key)` + `(center_x, center_y,
+    /// radius)`, or `None` if not captured — the caller MUST decline (exact label scan + residual
+    /// `distance` filter), never an empty result (`rmp` #680/#738).
+    #[must_use]
+    pub fn get_spatial(
+        &self,
+        label_token: u32,
+        prop_key: u32,
+        center_x: f64,
+        center_y: f64,
+        radius: f64,
+    ) -> Option<Arc<[u64]>> {
+        self.spatial
+            .get(&(
+                label_token,
+                prop_key,
+                center_x.to_bits(),
+                center_y.to_bits(),
+                radius.to_bits(),
+            ))
+            .cloned()
+    }
+
+    /// Memoises `ids` as the SPATIAL (point) candidate RELATIONSHIP list for `(type_token, prop_key)`
+    /// under the centre + radius (`rmp` #770/#664) — the relationship twin of [`insert_spatial`](Self::insert_spatial).
+    pub fn insert_rel_spatial(
+        &mut self,
+        type_token: u32,
+        prop_key: u32,
+        center_x: f64,
+        center_y: f64,
+        radius: f64,
+        ids: Vec<u64>,
+    ) {
+        self.rel_spatial.insert(
+            (
+                type_token,
+                prop_key,
+                center_x.to_bits(),
+                center_y.to_bits(),
+                radius.to_bits(),
+            ),
+            ids.into(),
+        );
+    }
+
+    /// The memoised SPATIAL candidate RELATIONSHIP ids, or `None` if not captured — the caller MUST
+    /// decline (exact typed scan + residual `distance` filter), never an empty result (`rmp` #680/#738).
+    #[must_use]
+    pub fn get_rel_spatial(
+        &self,
+        type_token: u32,
+        prop_key: u32,
+        center_x: f64,
+        center_y: f64,
+        radius: f64,
+    ) -> Option<Arc<[u64]>> {
+        self.rel_spatial
+            .get(&(
+                type_token,
+                prop_key,
+                center_x.to_bits(),
+                center_y.to_bits(),
+                radius.to_bits(),
+            ))
+            .cloned()
+    }
+
+    /// Folds `other`'s memoised seeks into `self` (`rmp` tasks #768/#769/#770), used by the dispatch site
+    /// to merge the per-kind captures (node + relationship equality, range, composite, text, spatial) into
+    /// one memo for the reader. The maps are disjoint by kind, so this is a straight per-map extend.
     pub fn absorb(&mut self, other: IndexCandidateCapture) {
         self.entries.extend(other.entries);
         self.range.extend(other.range);
@@ -655,6 +760,8 @@ impl IndexCandidateCapture {
         self.rel_eq.extend(other.rel_eq);
         self.rel_range.extend(other.rel_range);
         self.rel_composite.extend(other.rel_composite);
+        self.spatial.extend(other.spatial);
+        self.rel_spatial.extend(other.rel_spatial);
     }
 
     /// Whether nothing was captured (the common case: a read with no indexed seek).
@@ -667,6 +774,8 @@ impl IndexCandidateCapture {
             && self.rel_eq.is_empty()
             && self.rel_range.is_empty()
             && self.rel_composite.is_empty()
+            && self.spatial.is_empty()
+            && self.rel_spatial.is_empty()
     }
 }
 
@@ -1386,6 +1495,29 @@ pub fn index_seek_text_recheck<S: StoreReadSource, K: ReadSink>(
     out
 }
 
+/// The **re-check half** of an indexed node SPATIAL (point) proximity seek (`rmp` task #770): narrow the
+/// grid candidate superset to exactly the nodes the inline `index_seek_spatial` would return.
+///
+/// The spatial and text node seeks are the **same** narrowing (`rmp` #662/#73): the grid returns a
+/// geometric superset just as the trigram index returns a candidate superset; both register the blanket
+/// [`mark_all_live_nodes`] (the seek stands in for a label scan) + the per-candidate
+/// [`filter_label_candidates`] SIREAD, and neither applies a predicate residual — the executor keeps the
+/// exact `distance(...) <op> r` filter above [`SpatialIndexSeek`](crate::physical::PhysicalOp::SpatialIndexSeek)
+/// (executor.rs, the `SpatialIndexSeek` arm), exactly as it keeps the `CONTAINS`/`ENDS WITH`/`STARTS WITH`
+/// residual above the text seek. So this delegates to the one shared body ([`index_seek_text_recheck`]) —
+/// no fork, no drift — and the inline seam calls it too, so rows + SSI footprint are identical by
+/// construction. `candidates` MUST be a superset; a subset is silent row loss (a caller that cannot
+/// guarantee it MUST decline `None`, never `Some(vec![])`, `rmp` #680/#738).
+pub fn index_seek_spatial_recheck<S: StoreReadSource, K: ReadSink>(
+    src: &S,
+    ctx: &VisCtx,
+    sink: &K,
+    label_token: u32,
+    candidates: Vec<u64>,
+) -> Vec<NodeId> {
+    index_seek_text_recheck(src, ctx, sink, label_token, candidates)
+}
+
 // =================================================================================================
 // Relationship index seeks (`rmp` task #769) — the off-thread twin of the node seeks above
 // =================================================================================================
@@ -1542,6 +1674,49 @@ pub fn rel_index_seek_composite_recheck<S: StoreReadSource, K: ReadSink>(
                     }),
                 _ => false,
             }
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out.into_iter().map(RelId).collect()
+}
+
+/// The **re-check half** of an indexed relationship SPATIAL (point) proximity seek (`rmp` task #770/#664):
+/// narrow the grid candidate superset to exactly the relationships the inline `index_seek_spatial_rel`
+/// would return for the same `(type, centre, radius)`.
+///
+/// # The marker IS here (unlike the rel eq/range/composite bodies, `rmp` #769/#683)
+///
+/// The rel eq/range/composite bodies leave their marker to the caller because the rel scan fallback
+/// registers no matching precise marker, and the inline seam must register it *before* its `List`/rebuild
+/// decline. A spatial seek has **no such asymmetry**: its centre/radius are constants (never a `List`), so
+/// there is no pre-decline marker to preserve — the inline seam simply calls `self.mark_all_live_rels()`
+/// right before this narrowing, on a serve. So the blanket [`mark_all_live_rels`] lives *inside* this body
+/// (exactly as [`mark_all_live_nodes`] lives inside the node [`index_seek_text_recheck`] this delegates
+/// the node spatial seek to), and there is **no** `distance` residual here — the executor keeps the exact
+/// `distance(...) <op> r` filter above [`RelSpatialIndexSeek`](crate::physical::PhysicalOp::RelSpatialIndexSeek).
+/// Both the inline seam and the reader call this one body, so rows + SSI footprint match by construction.
+///
+/// `candidates` MUST be a superset of the visible relationships of `type_name` within the radius; a subset
+/// is silent row loss (a caller that cannot guarantee it MUST decline `None`, never `Some(vec![])`,
+/// `rmp` #680/#738).
+pub fn rel_index_seek_spatial_recheck<S: StoreReadSource, K: ReadSink>(
+    src: &S,
+    ctx: &VisCtx,
+    sink: &K,
+    type_name: &str,
+    candidates: Vec<u64>,
+) -> Vec<RelId> {
+    // The inline rel spatial seam marks every live relationship (the seek stands in for a typed scan) —
+    // reproduce it here so the served footprint is identical.
+    mark_all_live_rels(src, sink);
+    let mut out: Vec<u64> = candidates
+        .into_iter()
+        .filter(|&id| {
+            // `rel_data` SIREAD-marks + visibility-filters each candidate, mirroring the inline seam's
+            // per-candidate `self.rel_data(...)` type re-check; the residual `distance` filter above
+            // restores exactness.
+            matches!(rel_data(src, ctx, sink, RelId(id)), Some(data) if data.rel_type == type_name)
         })
         .collect();
     out.sort_unstable();
