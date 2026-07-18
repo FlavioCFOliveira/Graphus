@@ -2538,16 +2538,32 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         }
     }
 
-    /// (Re)indexes node `id`'s current string value into each `registered` `(label_token, prop_key)`
-    /// text (trigram) index it matches (`rmp` task #662). The text analogue of
+    /// Indexes node `id`'s **every** string version into each `registered` `(label_token, prop_key)`
+    /// text (trigram) index it matches (`rmp` tasks #662 / #773). The text analogue of
     /// [`index_one_node_spatial`](Self::index_one_node_spatial): the same single per-node code path the
     /// full rebuild ([`rebuild_index`](Self::rebuild_index)) and the synchronous create build both drive,
     /// so a recovered store rebuilds the trigram indexes store-consistently. Only the **string**-valued
-    /// properties a registered index covers are read; a node not carrying the covered label, or whose
-    /// covered property is absent / non-string, contributes nothing (the trigram index is a candidate
-    /// set, so a missing candidate degrades to the scan fallback for that reader — never a wrong row).
-    /// The store and index are borrowed in **separate, non-overlapping** scopes (this file's borrow
-    /// discipline).
+    /// versions a registered index covers are read; a node not carrying the covered label, or whose
+    /// covered property is absent / non-string, contributes nothing.
+    ///
+    /// # Index EVERY version, never just the newest (`rmp` task #773)
+    ///
+    /// The chain is decoded newest-first and each string version is **unioned** into the trigram tree
+    /// via [`merge_text_value`](IndexSet::merge_text_value), so the tree becomes a candidate **SUPERSET**
+    /// across all versions. This is the only image the tree may hold, because of the false-negative
+    /// asymmetry the whole index layer turns on: a seek's residual re-check can REMOVE a candidate, never
+    /// RESURRECT one. Collapsing to the newest version produced a SUBSET, and when that newest version
+    /// belonged to a still-open transaction (an index built while a writer holds an uncommitted
+    /// overwrite) the committed value was indexed nowhere and a fresh reader sought it and got nothing —
+    /// the #766 loss, which reproduced on this tree until this fix (pinned by
+    /// `tests/index_rebuild_uncommitted.rs`). The extra trigrams a superset carries are false positives
+    /// the executor's residual `CONTAINS`/`STARTS WITH`/`ENDS WITH` filter drops, re-reading each
+    /// candidate's snapshot-visible value.
+    ///
+    /// This is the **build** path only; the per-write seam ([`reindex_node`](crate::record_graph) →
+    /// [`insert_text_value`](IndexSet::insert_text_value)) stays last-wins, feeding one current value per
+    /// key, so the union engages solely here. The store and index are borrowed in **separate,
+    /// non-overlapping** scopes (this file's borrow discipline).
     fn index_one_node_text(
         store: &Rc<RefCell<RecordStore<D, S>>>,
         index: &Rc<RefCell<IndexSet>>,
@@ -2564,8 +2580,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 return;
             }
         };
-        // The node's current property values, keyed by prop-key (newest-wins per key), keeping only the
-        // string values a registered text index covers for one of this node's labels.
+        // EVERY string version of a covered key for one of this node's labels — no newest-wins collapse
+        // (`rmp` task #773), keeping only string values (a text index covers strings only).
         let mut values: Vec<(u32, Value)> = Vec::new();
         {
             let chain = match store.borrow_mut().node_property_values(id) {
@@ -2579,9 +2595,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 }
             };
             for (_pid, key, value) in chain {
-                if values.iter().any(|(k, _)| *k == key) {
-                    continue; // newest-wins: keep only the first occurrence of each key.
-                }
+                // No dedup by key — every string version is unioned into the tree (`rmp` task #773).
                 let used = registered.iter().any(|&(reg_label, prop_key)| {
                     prop_key == key && label_tokens.contains(&reg_label)
                 });
@@ -2595,7 +2609,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         for (prop_key, value) in &values {
             for &lt in &label_tokens {
                 if index.has_text(lt, *prop_key) {
-                    index.insert_text_value(lt, *prop_key, value, id);
+                    index.merge_text_value(lt, *prop_key, value, id);
                 }
             }
         }

@@ -188,6 +188,41 @@ impl TrigramIndex {
         changed
     }
 
+    /// **Unions** `value`'s trigrams into `node`'s existing trigram set, keeping every trigram the node
+    /// already had (`rmp` task #773). Unlike [`index_value`](Self::index_value) — which is last-wins and
+    /// first `remove`s the node — this only ADDS: `node` is inserted into the posting list of each
+    /// distinct trigram of the sentinel-padded `value` it does not already occupy, and none is ever
+    /// dropped.
+    ///
+    /// It is the **build-path** primitive (`index_one_node_text`): an index build reads a property's
+    /// whole version chain and must make the tree a candidate **SUPERSET** across all versions, because
+    /// a seek's residual re-check can REMOVE a candidate but never RESURRECT one — so indexing only the
+    /// newest (possibly uncommitted) version silently loses a committed row (`rmp` task #766). Calling
+    /// this once per version accumulates the union; the residual `CONTAINS`/`STARTS WITH`/`ENDS WITH`
+    /// filter then drops every version's trigrams that do not match the reader's snapshot-visible value.
+    ///
+    /// The **per-write** seam stays last-wins ([`index_value`](Self::index_value)); this is never called
+    /// from the write path, so a live update still fully replaces a node's trigrams.
+    ///
+    /// An empty `value` (no 3-window) contributes nothing — the node keeps exactly the trigrams it had.
+    pub fn merge_value(&mut self, node: u64, value: &str) {
+        let distinct = padded_trigrams(value);
+        if distinct.is_empty() {
+            return;
+        }
+        let entry = self.forward.entry(node).or_default();
+        for &tri in &distinct {
+            // Only touch the posting list for a trigram the node does not already occupy — `insert`
+            // reports whether the trigram was newly added to the node's forward set.
+            if entry.insert(tri) {
+                let list = self.postings.entry(tri).or_default();
+                if let Err(pos) = list.binary_search(&node) {
+                    list.insert(pos, node);
+                }
+            }
+        }
+    }
+
     /// Removes `node` from the index entirely (its forward entry and every posting list it appears in),
     /// returning whether it was present. Idempotent: removing an absent node is a no-op.
     pub fn remove(&mut self, node: u64) -> bool {
@@ -598,5 +633,44 @@ mod tests {
             !idx.index_value(2, ""),
             "an empty value on an absent node changes nothing"
         );
+    }
+
+    #[test]
+    fn merge_value_accumulates_the_union_across_versions_773() {
+        // The build path unions every version's trigrams (`rmp` task #773). After merging two distinct
+        // values, node 1 is a candidate for a substring of EITHER — the superset a query re-checks.
+        let mut idx = TrigramIndex::new();
+        idx.merge_value(1, "classical mechanics");
+        idx.merge_value(1, "quantum physics");
+        assert_eq!(
+            idx.len(),
+            1,
+            "still one node, with the UNION of both trigram sets"
+        );
+        assert_eq!(
+            idx.query_contains("classical"),
+            Some(vec![1]),
+            "the older version's substring is still a candidate",
+        );
+        assert_eq!(
+            idx.query_contains("quantum"),
+            Some(vec![1]),
+            "the newer version's substring is a candidate too (the union)",
+        );
+
+        // Contrast: last-wins `index_value` would keep ONLY the latest, dropping the older substring.
+        let mut lw = TrigramIndex::new();
+        lw.index_value(1, "classical mechanics");
+        lw.index_value(1, "quantum physics");
+        assert_eq!(
+            lw.query_contains("classical"),
+            Some(vec![]),
+            "last-wins drops the older version — exactly the #766/#773 subset that loses a row",
+        );
+
+        // A merge never removes: an empty value leaves the accumulated union intact.
+        idx.merge_value(1, "");
+        assert_eq!(idx.query_contains("classical"), Some(vec![1]));
+        assert_eq!(idx.query_contains("quantum"), Some(vec![1]));
     }
 }

@@ -2998,6 +2998,38 @@ impl IndexSet {
         }
     }
 
+    /// **Unions** node `node_id`'s string `value` into the `(label_token, prop_key)` text index without
+    /// dropping any trigram it already contributes (`rmp` task #773) — the build-path analogue of
+    /// [`insert_text_value`](Self::insert_text_value), which is last-wins. A no-op when no such index is
+    /// registered or `value` is not a string (a text index covers strings only; unlike the last-wins
+    /// path there is nothing to remove, because a build only ever adds).
+    ///
+    /// An index build reads a property's whole version chain and calls this once per string version, so
+    /// the trigram tree becomes the candidate **SUPERSET** across all versions — the only image safe for
+    /// a tree whose seek re-check can drop a candidate but never resurrect one (`rmp` task #766). The
+    /// residual `CONTAINS`/`STARTS WITH`/`ENDS WITH` filter above the seek drops every version's trigrams
+    /// that do not match the reader's snapshot-visible value.
+    ///
+    /// Raises only the transient `ft_spatial_dirty` flag (a posting changed), never
+    /// `ft_spatial_removed_dirty`: a union is a pure insert, so it can never leave a still-committed node
+    /// dropped from a posting (`rmp` task #756). The build path clears the flag via
+    /// [`bump_ft_spatial_marker_after_build`](Self::bump_ft_spatial_marker_after_build) either way, so
+    /// this is never attributed to an open transaction.
+    pub fn merge_text_value(
+        &mut self,
+        label_token: u32,
+        prop_key: u32,
+        value: &Value,
+        node_id: u64,
+    ) {
+        if let Some(tx) = self.text.get_mut(&(label_token, prop_key)) {
+            if let Value::String(s) = value {
+                tx.index.merge_value(node_id, s);
+                self.ft_spatial_dirty = true;
+            }
+        }
+    }
+
     /// Removes `node_id` from the `(label_token, prop_key)` text index (a delete, a type change, or a
     /// node that lost the covered label). A no-op if no such index is registered.
     pub fn remove_text(&mut self, label_token: u32, prop_key: u32, node_id: u64) {

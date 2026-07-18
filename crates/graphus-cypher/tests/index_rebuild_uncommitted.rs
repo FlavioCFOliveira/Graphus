@@ -424,3 +424,147 @@ fn composite_rebuild_does_not_regress_to_cartesian_product() {
         "composite rebuild cost regressed toward the cartesian product: V=64 took {at64}us          (shipped construction measures ~4_300us; the product cost 269_900us at only V=16)",
     );
 }
+
+/// A text (trigram) index built while a writer holds an uncommitted overwrite must not lose the
+/// committed row (`rmp` tasks #766 / #773). The trigram tree keeps ONE trigram set per node, so the
+/// build used to collapse the property chain newest-wins; when the newest version belonged to a
+/// still-open transaction, the tree held only the uncommitted value's trigrams and a fresh reader
+/// sought the committed value and got nothing — the #766 loss, which reproduced on this tree.
+///
+/// The fix unions every version's trigrams (build-path `merge_text_value`), making the tree a candidate
+/// SUPERSET; the executor's residual `CONTAINS` filter drops the extras. This is exactly the
+/// node-property fix, and it is SOUND here (unlike full-text) because the text consumer DOES re-check
+/// the string predicate (the residual above `NodeTextIndexSeek`).
+///
+/// The build MUST be driven so the text index is `Online`: `create_text_index` fills synchronously and
+/// promotes to `Online`, and the reader's snapshot post-dates the build's freshness marker, so the seek
+/// is genuinely routed to the trigram index. The `seek == 0` before the fix (vs `scan == 1`) proves the
+/// index was consulted and lost the row — a declining index would have scanned and returned 1.
+#[test]
+fn text_online_build_while_writer_open_keeps_committed_row_findable() {
+    let mut coord = fresh_coord();
+    run_write(&mut coord, "CREATE (:Doc {title: 'classical mechanics'})");
+
+    // An OPEN, UNCOMMITTED writer moves the node off its committed value. The property is NOT yet
+    // text-indexed, so this writer is invisible to the #467 freshness marker (the marker only tracks
+    // writers that mutate an already-registered index) — which is why the build below can bake its
+    // uncommitted value and a later reader still trusts the index.
+    let _writer = coord.begin_serializable();
+    let _ = run_plan(
+        &coord,
+        _writer,
+        &compile(
+            "MATCH (n:Doc) SET n.title = 'quantum physics'",
+            &IndexCatalog::empty(),
+        ),
+    );
+
+    coord
+        .create_text_index("t", "Doc", "title", false)
+        .expect("create text index");
+    while coord.advance_index_builds(usize::MAX) {}
+
+    // NON-VACUITY: the compiled query must actually route to the trigram index, or the seek below is a
+    // disguised scan that cannot exhibit the loss.
+    let reader = coord.begin_serializable();
+    let seek_plan = compile(
+        "MATCH (n:Doc) WHERE n.title CONTAINS 'classical' RETURN n",
+        &coord.catalog(),
+    );
+    assert!(
+        format!("{seek_plan:?}").contains("NodeTextIndexSeek"),
+        "vacuous: the plan does not route to the text index, so the seek is a disguised scan",
+    );
+
+    let (seek, scan) = seek_vs_scan(
+        &coord,
+        reader,
+        "MATCH (n:Doc) WHERE n.title CONTAINS 'classical' RETURN n",
+    );
+    assert_eq!(
+        scan, 1,
+        "ground truth broken: the committed row must be visible to the full scan",
+    );
+    assert_eq!(
+        seek, scan,
+        "the text build indexed only the UNCOMMITTED value and lost the committed row: \
+         index seek returned {seek}, the snapshot-correct scan returned {scan}",
+    );
+}
+
+/// The text union must not surface a value the reader's snapshot does not hold (`rmp` task #773) — the
+/// property that makes the SUPERSET sound and distinguishes text (reason 1) from full-text (reason 2).
+///
+/// A node with committed history `'quantum physics'` → `'classical mechanics'` is built into a trigram
+/// index that (post-#773) holds BOTH versions' trigrams. A `CONTAINS 'quantum'` seek returns the node
+/// as a candidate, but the executor's residual re-reads the snapshot-visible value (`'classical
+/// mechanics'`) and drops it — so the union never returns a wrong row, exactly where the same union over
+/// full-text returned one (full-text has no term re-check). The `CONTAINS 'classical'` control confirms
+/// the index is `Online` and consulted (not a vacuous scan).
+#[test]
+fn text_union_does_not_surface_a_superseded_committed_version() {
+    let mut coord = fresh_coord();
+    run_write(&mut coord, "CREATE (:Doc {title: 'quantum physics'})");
+    run_write(
+        &mut coord,
+        "MATCH (n:Doc) SET n.title = 'classical mechanics'",
+    );
+
+    coord
+        .create_text_index("t", "Doc", "title", false)
+        .expect("create text index");
+    while coord.advance_index_builds(usize::MAX) {}
+
+    let reader = coord.begin_serializable();
+
+    // TEETH: the trigram tree really did UNION the stale version — the raw index seek (which re-checks
+    // visibility + label but NOT the string predicate) returns the node as a candidate for 'quantum'.
+    // Only the residual can be what removes it below, so this test genuinely guards the residual and
+    // would fail if either the union stopped unioning (candidate absent) or the residual regressed
+    // (wrong row surfaced).
+    {
+        let graph = coord.statement(reader).expect("statement");
+        let raw = graph.index_seek_text(
+            "Doc",
+            "title",
+            graphus_cypher::physical::TextSeekOp::Contains,
+            "quantum",
+        );
+        assert_eq!(
+            raw.as_ref().map(Vec::len),
+            Some(1),
+            "the union did not carry the superseded version's trigrams (raw candidate = {raw:?})",
+        );
+    }
+
+    // NON-VACUITY control: the CURRENT term is served by the index (proves Online + consulted).
+    let (seek_c, scan_c) = seek_vs_scan(
+        &coord,
+        reader,
+        "MATCH (n:Doc) WHERE n.title CONTAINS 'classical' RETURN n",
+    );
+    assert_eq!(
+        scan_c, 1,
+        "ground truth: current value contains 'classical'"
+    );
+    assert_eq!(
+        seek_c, scan_c,
+        "the text index did not serve the current term"
+    );
+
+    // The stale committed term must NOT match: the residual drops the union's false positive.
+    let (seek_q, scan_q) = seek_vs_scan(
+        &coord,
+        reader,
+        "MATCH (n:Doc) WHERE n.title CONTAINS 'quantum' RETURN n",
+    );
+    assert_eq!(
+        scan_q, 0,
+        "ground truth: the current committed value is 'classical mechanics'",
+    );
+    assert_eq!(
+        seek_q, scan_q,
+        "the text union returned a WRONG ROW: a superseded version's term 'quantum' matched a node \
+         whose current title is 'classical mechanics' (seek {seek_q}, scan {scan_q})",
+    );
+}
