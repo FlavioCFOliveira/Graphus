@@ -10,10 +10,15 @@
 //! label the node demonstrably still carried.
 //!
 //! The fix makes the refill purely ADDITIVE: `clear` no longer empties the label tree. That is the only
-//! image it may hold, by the false-negative asymmetry — the re-check (`node_has_label` on the CURRENT
-//! bitmap, in `read_source::filter_label_candidates`) can REMOVE a candidate but never RESURRECT one,
-//! so a retained stale entry is a false POSITIVE the re-check drops, while a destroyed entry is a
+//! image it may hold, by the false-negative asymmetry — the re-check (in
+//! `read_source::filter_label_candidates`) can REMOVE a candidate but never RESURRECT one, so a
+//! retained stale entry is a false POSITIVE the re-check drops, while a destroyed entry is a
 //! committed row lost for good.
+//!
+//! Since `rmp` #767 that re-check resolves label membership against the READER'S SNAPSHOT rather than
+//! the current bitmap, so it no longer independently rejects a stale entry — additive retention is now
+//! the only thing standing between this tree and `rmp` #765. See `tests/label_tree_765_reaudit_767.rs`,
+//! which re-runs #765's per-tree audit for the label tree under the new re-check.
 //!
 //! Every test compares the label-index-routed `MATCH (n:Person)` against an ALL-NODES scan reading
 //! `labels(n)` — the ground truth, which never consults the label index — so a test can only pass by

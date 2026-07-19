@@ -60,6 +60,26 @@ serializable either):
 | **Standalone write** (autocommit) | **Serializable** | Full Serializable Snapshot Isolation (SSI): the write commits atomically and durably, and conflicting concurrent writers are resolved so the outcome is equivalent to some serial order. |
 | **Explicit transaction** (`BEGIN … COMMIT`) | **Serializable** | Every statement in the transaction — reads *and* writes — runs under full SSI. Use this when a read-modify-write must be serializable. |
 
+### What a snapshot covers
+
+A snapshot covers **every** observable part of a node or relationship, not just its properties:
+
+| State | Snapshot-isolated |
+| ----- | ----------------- |
+| Node / relationship existence (create, delete) | yes |
+| Property values (`SET n.p = ...`, `REMOVE n.p`) | yes |
+| **Node labels** (`SET n:L`, `REMOVE n:L`) | **yes** |
+| Relationship type | yes (a relationship's type is fixed at creation) |
+
+This matters because labels are stored differently from properties — a property is a separately
+versioned record, whereas a label set is a bitmap written in place inside the node record. Until
+recently that difference leaked into the observable semantics: a label read returned the
+*current* bitmap, so a committed `REMOVE n:Person` became visible to a reader whose snapshot
+predated it (a non-repeatable read), and an *uncommitted* one was visible to any concurrent reader
+(a dirty read). Both are anomalies that Snapshot Isolation excludes, so this was an isolation
+defect, not a documented trade-off. Older label versions are now retained and every label read is
+resolved against the reader's own snapshot, exactly as a property read already was.
+
 ### What Snapshot Isolation for standalone reads implies
 
 Because a standalone read does not participate in serializability validation, it can observe the

@@ -45,6 +45,7 @@ pub mod freelist_reuse;
 pub mod harness;
 pub mod isolation;
 pub mod label_rollback_clobber;
+pub mod label_snapshot_visibility;
 pub mod misbehave;
 pub mod mix;
 pub mod mode_b_batch_size_measurement;

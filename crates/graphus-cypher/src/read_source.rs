@@ -53,7 +53,7 @@ use graphus_index::fulltext::Analyzer;
 use graphus_index::keycodec::{encode_equality_canonical, encode_single};
 use graphus_io::BlockDevice;
 use graphus_storage::record::{NodeRecord, PropRecord, RelRecord};
-use graphus_storage::{MvccHeader, Namespace, RecordStore, StoreReadView, TokenSnapshot};
+use graphus_storage::{MvccHeader, Namespace, RecordStore, StoreReadView, TokenSnapshot, labels};
 use graphus_txn::{CommitRegistry, PredicateRead, Snapshot, is_visible};
 use graphus_wal::LogSink;
 
@@ -152,7 +152,29 @@ pub trait StoreReadSource {
     fn node_labels(&self, id: u64) -> Result<Vec<u32>, GraphusError>;
 
     /// Whether node `id` carries the label with `label_token_id`.
+    ///
+    /// **Reads the CURRENT word.** For a visibility-correct membership test use
+    /// [`label_bitmap_at`](Self::label_bitmap_at) (`rmp` #767).
     fn node_has_label(&self, id: u64, label_token_id: u32) -> Result<bool, GraphusError>;
+
+    /// The label bitmap node `id` presents to `snapshot`, given the `live` word already decoded from
+    /// its record (`rmp` task #767).
+    ///
+    /// The label word is mutated IN PLACE with no version chain, so reading it directly returns
+    /// whatever it holds at that instant — including an uncommitted writer's change (a dirty read) or
+    /// one committed after the reader's snapshot began (a non-repeatable read). This resolves it
+    /// through the store's live label version history instead, the label analogue of the
+    /// newest-visible-wins fold the property chain already gets.
+    ///
+    /// Takes `live` rather than re-reading the record: every hot-path caller has just decoded it for
+    /// the MVCC visibility check one line earlier.
+    fn label_bitmap_at(
+        &self,
+        id: u64,
+        live: u64,
+        snapshot: Snapshot,
+        registry: &CommitRegistry,
+    ) -> u64;
 
     /// Every live `(physical_id, record)` in `node_id`'s property chain, head to tail (newest first).
     fn node_properties(&self, node_id: u64) -> Result<Vec<(u64, PropRecord)>, GraphusError>;
@@ -214,6 +236,15 @@ impl<D: BlockDevice, S: LogSink> StoreReadSource for LiveSource<'_, D, S> {
     fn node_has_label(&self, id: u64, label_token_id: u32) -> Result<bool, GraphusError> {
         self.0.node_has_label(id, label_token_id)
     }
+    fn label_bitmap_at(
+        &self,
+        id: u64,
+        live: u64,
+        snapshot: Snapshot,
+        registry: &CommitRegistry,
+    ) -> u64 {
+        self.0.label_bitmap_at(id, live, snapshot, registry)
+    }
     fn node_properties(&self, node_id: u64) -> Result<Vec<(u64, PropRecord)>, GraphusError> {
         self.0.node_properties(node_id)
     }
@@ -273,6 +304,15 @@ impl<D: BlockDevice, S: LogSink> StoreReadSource for ReadViewSource<'_, D, S> {
     }
     fn node_has_label(&self, id: u64, label_token_id: u32) -> Result<bool, GraphusError> {
         self.view.node_has_label(id, label_token_id)
+    }
+    fn label_bitmap_at(
+        &self,
+        id: u64,
+        live: u64,
+        snapshot: Snapshot,
+        registry: &CommitRegistry,
+    ) -> u64 {
+        self.view.label_bitmap_at(id, live, snapshot, registry)
     }
     fn node_properties(&self, node_id: u64) -> Result<Vec<(u64, PropRecord)>, GraphusError> {
         self.view.node_properties(node_id)
@@ -848,6 +888,17 @@ impl VisCtx<'_> {
         )
     }
 
+    /// The label bitmap `id` presents to this query's snapshot (`rmp` task #767), given the `live`
+    /// word already decoded from `id`'s record.
+    ///
+    /// The label counterpart of [`visible`](Self::visible): where `visible` filters a *record*
+    /// version, this resolves the *label word*, which is mutated in place and so has its versions in
+    /// the store's side history rather than in the record.
+    #[inline]
+    pub fn labels_at<S: StoreReadSource>(&self, src: &S, id: u64, live: u64) -> u64 {
+        src.label_bitmap_at(id, live, self.snapshot, self.registry)
+    }
+
     /// Whether the version carrying `mvcc` was **deleted by this very transaction** — its creator is
     /// visible (it existed before our `DELETE`) and its expirer is *our own* in-flight stamp
     /// (`04 §5.3`). The discriminator openCypher needs for a same-query `DELETE` (the entity keeps its
@@ -942,8 +993,8 @@ pub fn filter_label_candidates<S: StoreReadSource, K: ReadSink>(
     let mut out = Vec::new();
     for id in ids {
         // Skip nodes not visible before testing the label, honouring MVCC visibility.
-        let visible = match src.node(id) {
-            Ok(rec) => ctx.visible(rec.mvcc),
+        let rec = match src.node(id) {
+            Ok(rec) => rec,
             // A read fault on the record itself: FAIL CLOSED (`rmp` task #733). `node` only errors on a
             // genuine fault (a reclaimed slot decodes to `Ok` with `in_use=false`), so capturing is
             // never a false alarm — and dropping the candidate could let a uniqueness / node-key check
@@ -953,17 +1004,22 @@ pub fn filter_label_candidates<S: StoreReadSource, K: ReadSink>(
                 return Vec::new();
             }
         };
+        let visible = ctx.visible(rec.mvcc);
         // SIREAD-mark every examined node, visible or not (the label predicate examined it).
         sink.note_read(node_ssi_key(id));
         if !visible {
             continue;
         }
-        match src.node_has_label(id, token_id) {
+        // Resolve the label word AS OF THIS SNAPSHOT (`rmp` #767) rather than reading whatever it
+        // holds now. `rec` is already in hand, so this also drops the second `read_node` the old
+        // `node_has_label(id, ..)` call performed per candidate.
+        let bitmap = ctx.labels_at(src, id, rec.labels);
+        match labels::has_label(bitmap, token_id) {
             Ok(true) => out.push(NodeId(id)),
             Ok(false) => {}
             Err(e) => {
                 // An overflow-form bitmap surfaces as a captured error, never a wrong row.
-                sink.capture(e);
+                sink.capture(GraphusError::from(e));
                 return Vec::new();
             }
         }
@@ -986,29 +1042,32 @@ pub fn filter_any_label_candidates<S: StoreReadSource, K: ReadSink>(
 ) -> Vec<NodeId> {
     let mut out = Vec::new();
     for id in ids {
-        let visible = match src.node(id) {
-            Ok(rec) => ctx.visible(rec.mvcc),
+        let rec = match src.node(id) {
+            Ok(rec) => rec,
             // FAIL CLOSED on a genuine read fault (`rmp` task #733), matching the `node_has_label` arm.
             Err(e) => {
                 sink.capture(e);
                 return Vec::new();
             }
         };
+        let visible = ctx.visible(rec.mvcc);
         // SIREAD-mark every examined node exactly once, visible or not.
         sink.note_read(node_ssi_key(id));
         if !visible {
             continue;
         }
+        // One snapshot-correct resolution (`rmp` #767) for the whole token loop below.
+        let bitmap = ctx.labels_at(src, id, rec.labels);
         let mut carries = false;
         for &token_id in token_ids {
-            match src.node_has_label(id, token_id) {
+            match labels::has_label(bitmap, token_id) {
                 Ok(true) => {
                     carries = true;
                     break;
                 }
                 Ok(false) => {}
                 Err(e) => {
-                    sink.capture(e);
+                    sink.capture(GraphusError::from(e));
                     return Vec::new();
                 }
             }
@@ -1072,12 +1131,13 @@ pub fn scan_label_property_morsel<S: StoreReadSource, K: ReadSink>(
         if !ctx.visible(rec.mvcc) {
             continue;
         }
-        match src.node_has_label(id, token_id) {
+        // Snapshot-correct label membership (`rmp` #767), resolved from the record read above.
+        match labels::has_label(ctx.labels_at(src, id, rec.labels), token_id) {
             Ok(true) => {}
             Ok(false) => continue,
             Err(e) => {
                 // An overflow-form bitmap surfaces as a captured error, never a wrong row.
-                sink.capture(e);
+                sink.capture(GraphusError::from(e));
                 return (label_matches, values);
             }
         }
@@ -1218,24 +1278,24 @@ pub fn scan_filter_eq<S: StoreReadSource, K: ReadSink>(
     let mut out = Vec::new();
     for id in ids {
         // Visibility first (MVCC): a tombstoned / not-yet-committed node never matches.
-        let visible = match src.node(id) {
-            Ok(rec) => ctx.visible(rec.mvcc),
+        let rec = match src.node(id) {
+            Ok(rec) => rec,
             // `scan_node_ids` only yields slot-occupied ids; a transient decode fault is a real error.
             Err(e) => {
                 sink.capture(e);
                 return ScanFilter::default();
             }
         };
-        if !visible {
+        if !ctx.visible(rec.mvcc) {
             continue;
         }
-        // Carries the label?
-        match src.node_has_label(id, label_token) {
+        // Carries the label AS OF THIS SNAPSHOT (`rmp` #767)?
+        match labels::has_label(ctx.labels_at(src, id, rec.labels), label_token) {
             Ok(true) => {}
             Ok(false) => continue,
             Err(e) => {
                 // An overflow-form bitmap (#39) surfaces as a captured error, never a wrong row.
-                sink.capture(e);
+                sink.capture(GraphusError::from(e));
                 return ScanFilter::default();
             }
         }
@@ -1946,10 +2006,18 @@ pub fn node_labels<S: StoreReadSource, K: ReadSink>(
     if !node_exists(src, ctx, sink, node) {
         return None;
     }
-    let ids = match src.node_labels(node.0) {
-        Ok(ids) => ids,
+    // Resolve the label word AS OF THIS SNAPSHOT (`rmp` #767), not whatever it holds now.
+    let live = match src.node(node.0) {
+        Ok(rec) => rec.labels,
         Err(e) => {
             sink.capture(e);
+            return Some(Vec::new());
+        }
+    };
+    let ids = match labels::token_ids(ctx.labels_at(src, node.0, live)) {
+        Ok(ids) => ids,
+        Err(e) => {
+            sink.capture(GraphusError::from(e));
             return Some(Vec::new());
         }
     };

@@ -35,11 +35,12 @@ use graphus_core::error::{GraphusError, Result};
 use graphus_core::{ElementId, Lsn, MAX_TIMESTAMP, PageId, Timestamp, TxnId, VersionStamp};
 use graphus_io::{BlockDevice, PAGE_SIZE};
 use graphus_pagemap::PageMapWriter;
-use graphus_txn::{CommitRegistry, TxnOutcome};
+use graphus_txn::{CommitRegistry, Snapshot, TxnOutcome};
 use graphus_wal::{LogSink, WalManager};
 
 use crate::heap::{self, BLOCK_PAYLOAD, HeapBlock, STRINGS_RECORD_SIZE};
 use crate::idalloc::{ElementIdAllocator, FreeList, NULL_ID, PhysicalAllocator};
+use crate::label_history::LabelHistory;
 use crate::labels;
 use crate::meta::{
     CompositeIndexEntry, ConstraintEntry, FulltextIndexEntry, IndexState, Meta,
@@ -225,6 +226,14 @@ struct ActiveTxn {
     /// list would hand out a still-live slot (the free-list twin of the #220/#172 monotonic
     /// high-water floor). A normal write transaction pushes nothing here (it only *pops* ids via
     /// [`alloc_id`](RecordStore::alloc_id)), so this stays empty for it.
+    /// Physical node ids whose label bitmap this transaction changed and for which a version was
+    /// retained in [`LabelHistory`] (`rmp` #767). Consumed by [`commit_prepare`](RecordStore::
+    /// commit_prepare) to **settle** exactly those entries to `Committed(ts)`.
+    ///
+    /// This list exists so the commit path is `O(nodes this txn relabelled)` rather than
+    /// `O(tracked_nodes)`: the history is keyed by node id, so settling by scanning the whole map
+    /// would put an unbounded walk on the commit hot path.
+    labelled_nodes: Vec<u64>,
     freed_ids: Vec<(StoreKind, u64)>,
     /// Physical ids this transaction **popped** (reused) from a store's free list via
     /// [`alloc_id`](RecordStore::alloc_id) (`rmp` #581). On a **live** rollback each such reused id was
@@ -396,6 +405,20 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// stamp of a committed writer to its `Committed(ts)` form and, once that freeze is durable
     /// (the GC transaction commits), forgets the now-unreferenced writers from this table.
     commit_registry: CommitRegistry,
+    /// MVCC version history for the node **label bitmap** (`rmp` task #767).
+    ///
+    /// The label word is mutated IN PLACE inside the node record, so — unlike a property, which is a
+    /// separate MVCC-versioned `PropRecord` — it has no version for `graphus_txn::is_visible` to
+    /// filter. Without this, a label read returned whatever the word held at that instant: an
+    /// uncommitted writer's change was visible to a concurrent reader (a **dirty read**) and a
+    /// committed one was visible to a reader whose snapshot predated it (a **non-repeatable read**).
+    /// This supplies the "older versions as logical undo deltas" half of `04 §5.1`'s ratified scheme
+    /// that the in-place label write never had.
+    ///
+    /// `Arc`-shared with every [`StoreReadView`] so an off-thread reader resolves against the SAME
+    /// live history (the page cache it decodes from is itself live, `rmp` #721, so a change committed
+    /// after dispatch is already in the word it reads and only a live history can undo it).
+    label_history: Arc<LabelHistory>,
     /// The registry prune the last completed [`gc`](Self::gc) freeze sweep scheduled, applied at
     /// the GC transaction's [`commit`](Self::commit) and discarded at its
     /// [`rollback`](Self::rollback) (`rmp` task #59). `None` while no GC pass is pending.
@@ -595,6 +618,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             schema_last_seq: HashMap::default(),
             meta_chain: Vec::new(),
             commit_registry: CommitRegistry::new(),
+            label_history: Arc::new(LabelHistory::new()),
             pending_gc_prune: None,
             // `rmp` #522 incremental-GC state (pure in-memory; rebuilt from scratch every open). The
             // freeze frontier starts at `1` so the first pass fully settles every pre-existing on-disk
@@ -702,6 +726,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             schema_last_seq: HashMap::default(),
             meta_chain,
             commit_registry,
+            label_history: Arc::new(LabelHistory::new()),
             pending_gc_prune: None,
             // `rmp` #522 incremental-GC state (pure in-memory; rebuilt from scratch every open). The
             // freeze frontier starts at `1` so the first pass fully settles every pre-existing on-disk
@@ -1380,6 +1405,31 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // violation). Held ids are stashed and re-listed so they stay free for later reuse once released;
         // if only held ids remain we grow a fresh id rather than reuse one. On the common path
         // (`held_slots` empty) `contains_key` is a cheap miss and this is the pre-#588 single pop.
+        // `rmp` #767: a node id must never be handed out while `LabelHistory` still holds versions for
+        // it — the new node would resolve its labels through the DEAD node's history (and, because a
+        // freshly created node retains no version of its own, would never override it).
+        //
+        // `RecordStore::reclaim_node` purges the entry before pushing the id, which makes this hold.
+        // But that argument is "every path that returns a node id to the free list remembers to purge",
+        // and this project has twice been burned by an invariant maintained elsewhere silently ceasing
+        // to hold (`rmp` #734, #778). Rather than key the history by an epoch, assert the property at
+        // the single choke point where a reused id is handed out: any future free-list producer that
+        // forgets to purge fails HERE, loudly, instead of silently poisoning a reused node's labels.
+        #[cfg(debug_assertions)]
+        if kind == StoreKind::Node {
+            let poisoned: Vec<u64> = self.stores[kind as usize]
+                .free
+                .ids()
+                .iter()
+                .copied()
+                .filter(|id| self.label_history.tracks_node(*id))
+                .collect();
+            assert!(
+                poisoned.is_empty(),
+                "rmp #767: node ids {poisoned:?} are on the free list but still carry retained label \
+                 history — some path returned them without calling LabelHistory::forget_node"
+            );
+        }
         let reused = if self.held_slots[kind as usize].is_empty() {
             self.store_mut(kind).free.pop()
         } else {
@@ -1484,6 +1534,16 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         &self.commit_registry
     }
 
+    /// The node label-bitmap MVCC version history (`rmp` task #767).
+    ///
+    /// The read layer resolves a node's label set through this against its own snapshot, exactly as it
+    /// resolves a property version through [`commit_registry`](Self::commit_registry). Shared by
+    /// [`Arc`] so an off-thread [`StoreReadView`] reader resolves against the same live history.
+    #[must_use]
+    pub fn label_history(&self) -> &Arc<LabelHistory> {
+        &self.label_history
+    }
+
     /// Whether `txn` is a **live, unresolved** transaction of this store: it has
     /// [`begin`](Self::begin)-ed and has neither committed nor rolled back.
     ///
@@ -1583,7 +1643,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// threads.
     #[must_use]
     pub fn read_view(&self) -> StoreReadView<D, S> {
-        StoreReadView::new(Arc::clone(&self.pool), self.capture_read_meta())
+        StoreReadView::new(
+            Arc::clone(&self.pool),
+            self.capture_read_meta(),
+            Arc::clone(&self.label_history),
+        )
     }
 
     /// Commits `txn`: persists the catalog under `txn`, then group-commits the WAL so all of
@@ -1673,9 +1737,37 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         //     catalog change (the `statistics` reopen tests are the regression guard).
         let wrote_durable = self.wal.with(|w| w.is_active(txn));
         let commit_ts = self.next_commit_ts();
+        // Settle this transaction's retained label versions from its in-flight stamp to
+        // `Committed(commit_ts)` (`rmp` #767). Unlike the record headers above — settled lazily at GC
+        // time because doing it eagerly was O(records) WAL-logged page writes — this history is small
+        // and purely in-memory, so settling now is free and logs nothing.
+        //
+        // It is REQUIRED, not an optimisation: a raw in-flight stamp is only resolvable while the
+        // `commit_registry` still holds `txn`, and a GC pass FORGETS committed writers from that
+        // registry once their headers are frozen (`pending_gc_prune`, applied below). After that the
+        // registry maps the unknown id to `Aborted`, so the version would read as never-committed and
+        // every reader would fall back to the PRE-CHANGE bitmap — a committed label change silently
+        // reverting in memory, healed only by a restart.
         // Drop the per-txn created/expired bookkeeping (it fed the old eager settle loop; the table
-        // entry below is all the durable/visible state a committed version now needs).
-        self.active.remove(&txn);
+        // entry below is all the durable/visible state a committed version now needs). The label ids
+        // are taken out of it here and consumed immediately below.
+        let labelled_nodes = self
+            .active
+            .remove(&txn)
+            .map(|a| a.labelled_nodes)
+            .unwrap_or_default();
+        // Settle BEFORE the `rmp` #529 read-only fast path returns, not after. A label writer always
+        // logs a WAL data record, so it never takes that path — but placing the settle after the check
+        // would make correctness depend on that invariant holding forever, and a stranded in-flight
+        // stamp is precisely the silent, restart-healed defect this settle exists to prevent. Running
+        // it first is unconditionally correct and costs nothing when the list is empty. The invariant
+        // is asserted rather than assumed.
+        debug_assert!(
+            labelled_nodes.is_empty() || self.wal.with(|w| w.is_active(txn)),
+            "a label writer must have logged a WAL record; if it can take the read-only fast path, \
+             the settle below must move with it"
+        );
+        self.label_history.settle(txn, commit_ts, &labelled_nodes);
         // `rmp` #522: this GC pass is committing — its freeze frontier advance is now permanent, so the
         // rollback savepoint is no longer needed (a GC pass never takes the read-only fast path below,
         // since it schedules a prune, so clearing it here always runs for a committing GC pass).
@@ -2106,7 +2198,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         new_labels: u64,
         old_labels: u64,
         txn: TxnId,
+        creator: u64,
     ) -> Result<()> {
+        // Retain the pre-change bitmap as an MVCC version BEFORE overwriting the word (`rmp` #767):
+        // the word is mutated in place, so without this the old value survives only in the WAL undo
+        // image, which no reader can reach. A reader whose snapshot predates this change — or any
+        // reader at all while this writer is still in flight — resolves through the history instead.
+        self.track_label_history(id, txn, old_labels, new_labels, creator);
         let (rel_page, off) = paging::record_location(id, StoreKind::Node.record_size());
         let dev = self.device_page(StoreKind::Node, rel_page)?;
         let abs = off + NODE_OFF_LABELS;
@@ -2121,6 +2219,70 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         });
         self.pool.unpin(f);
         Ok(())
+    }
+
+    /// Retains `id`'s pre-change label bitmap as an MVCC version, UNLESS `txn` is also the node's
+    /// still-in-flight creator (`rmp` task #767).
+    ///
+    /// # Why the creator case is skipped, and why it matters
+    ///
+    /// A node whose `xmin` is `txn`'s own in-flight stamp is invisible to **every** other snapshot —
+    /// no reader can ask what its labels were before, because no reader can see the node at all — and
+    /// `txn` itself always reads its own latest write. Once `txn` commits, every snapshot that can see
+    /// the node is at or after that commit and the live word is already the right answer. So the
+    /// history would be pure overhead.
+    ///
+    /// It is not a small overhead: `CREATE (:L)` sets labels through `add_label`, so without this gate
+    /// a bulk load of N labelled nodes retains N useless versions, which both leaks memory until the
+    /// next GC and — because a non-empty history arms the hot-path gate — puts a lock + map lookup on
+    /// every label re-check in the store. MEASURED on a pure label scan of 100_000 labelled nodes:
+    /// without this gate ~636 ns/node against a ~218 ns/node pre-#767 baseline (a ~2.9x regression);
+    /// with it, ~202 ns/node — indistinguishable from that baseline across repeated runs.
+    fn track_label_history(
+        &mut self,
+        id: u64,
+        txn: TxnId,
+        old_labels: u64,
+        new_labels: u64,
+        creator: u64,
+    ) {
+        // The `SYSTEM_TXN` guard the sibling bookkeeping helpers use (`note_created`, `free_push`).
+        // Here it is also a PANIC guard: `SYSTEM_TXN` is `TxnId(u64::MAX)`, whose bit 63 collides with
+        // the `VersionStamp` in-flight discriminant, so `VersionStamp::in_flight` asserts on it. The
+        // system transaction only ever runs `checkpoint_meta` and never touches a label, so there is no
+        // version to retain — but were that to change, this must become a real versioned write rather
+        // than a silent skip.
+        if txn == SYSTEM_TXN {
+            debug_assert!(
+                false,
+                "SYSTEM_TXN changed node {id}'s labels; label history cannot version it"
+            );
+            return;
+        }
+        // This comparison depends on `TxnId`s never REPEATING across a reopen (`rmp` #767, Finding 7).
+        //
+        // `creator` is the node's on-disk `xmin`, which under lazy GC-time freezing (`rmp` #49) can
+        // still be the raw `InFlight(T)` form of a transaction that committed in an EARLIER process
+        // run. If a later run ever re-minted that same `T` for a live writer, this gate would match on
+        // a pre-existing committed node and wrongly skip retention — reopening both #767 anomalies for
+        // it. It cannot happen because the coordinator seeds `next_txn_id` from the RECOVERED id
+        // high-water on open (`graphus_cypher::TxnCoordinator::new`, "minted from the recovered id
+        // high-water so even the promotion transaction never reuses a pre-crash id"), so ids are
+        // monotone across restarts and a stale on-disk stamp can never equal a live writer's id.
+        //
+        // That invariant is maintained in a DIFFERENT crate, which is exactly the shape that silently
+        // ceased to hold in `rmp` #734 and #778. If id allocation ever restarts from a fixed origin,
+        // this gate must be revisited — a stale `InFlight` creator would then be indistinguishable
+        // from the current writer's own fresh node.
+        if VersionStamp::from_raw(creator) == VersionStamp::InFlight(txn) {
+            return;
+        }
+        if old_labels == new_labels {
+            return; // no version retained, so nothing to settle later
+        }
+        self.label_history.record(id, txn, old_labels, new_labels);
+        // Remember the touched node so `commit_prepare` can settle in O(this txn's own writes).
+        self.active.entry(txn).or_default().labelled_nodes.push(id);
     }
 
     /// Writes the full body of record `id` in `kind`'s store, logging a **header-only undo**: the
@@ -2434,6 +2596,28 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // `rmp` #563: heartbeat the drain-progress beacon across every phase of this GC pass so a
         // `STOP DATABASE` that races it sees a *progressing* engine and waits rather than force-detaching.
         self.bump_drain_progress();
+
+        // ---- Label-bitmap version history (`rmp` #767) ----
+        // `watermark` is at or below the oldest active reader's snapshot (this function's documented
+        // contract), so a label version committed at or before it is visible to EVERY current and
+        // future snapshot: it collapses into the node's base and everything older is dropped. This is
+        // the label twin of the tombstone reclamation below, and it is what keeps the history bounded
+        // rather than growing for the life of the process. Safe in a freeze-only pass too — it frees
+        // memory and reads no pages.
+        //
+        // ORDERING IS LOAD-BEARING, for physical-id reuse. Node ids are reused after reclamation
+        // (`04 §2.7`), and this history is keyed by physical id — so a stale entry surviving past its
+        // node's slot being handed to a NEW node would make that new node resolve its labels through a
+        // dead node's versions. It cannot happen, and this placement is why: a node is only reclaimed
+        // in Phases A-D below once its tombstone committed at or before THIS SAME `watermark`, which
+        // means every label version it carries also committed at or before it — so this prune, running
+        // FIRST with the same watermark, has already collapsed them and dropped the entry. Moving this
+        // call after the reclamation sweeps, or passing it a different watermark, breaks that argument.
+        //
+        // The other two ways a version could outlive its node are closed elsewhere: an ABORTED writer's
+        // versions are removed by `rollback` -> `LabelHistory::forget`, and a crash starts a fresh
+        // (empty) history, since it is in-memory only.
+        self.label_history.prune(watermark, &self.commit_registry);
 
         // ---- Phases A–D: reclamation sweeps. SKIPPED in a freeze-only pass (`rmp` #590). ----
         // A freeze-only pass exists solely to advance the WAL reclaim floor (Phase E) cheaply during a
@@ -3120,6 +3304,18 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 _ => {}
             }
         }
+        // Drop this transaction's retained label versions — LAST, strictly AFTER the WAL undo above
+        // has restored the label word (`rmp` #767).
+        //
+        // ORDER IS LOAD-BEARING. This used to run at the TOP of `rollback`, described as "not required
+        // for correctness". That was wrong. When the aborting transaction is a node's only versioner,
+        // `forget` drops the entry entirely — and `LabelHistory::resolve` then falls back to the LIVE
+        // word, which until the undo replays still holds the ABORTED value. Between those two points
+        // any concurrent reader (the off-thread pool reads through the same `Arc`) sees the aborted
+        // label change UNMASKED: exactly the dirty read #767 exists to close, reintroduced by the
+        // cleanup. Running it here closes the window — the word is already restored, so the fallback
+        // the drop exposes is the correct committed value.
+        self.label_history.forget(txn);
         Ok(())
     }
 
@@ -3532,6 +3728,15 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         dead.first_prop = NULL_ID;
         dead.mvcc = MvccHeader::default(); // clears in_use
         self.write_node(id, &dead, txn)?;
+        // Drop this node's retained label versions BEFORE its id goes on the free list (`rmp` #767).
+        // Physical ids are reused (`04 §2.7`) and the history is keyed by physical id, so an entry
+        // surviving here would be inherited by whatever NEW node is handed this slot — which then
+        // reports the DEAD node's labels, permanently, because `LabelHistory::resolve` ignores the live
+        // word whenever an entry exists and the new node records no version of its own (its creator is
+        // its own in-flight writer, which `track_label_history` skips). The GC-time `prune` is NOT
+        // sufficient on its own: a version whose writer the registry has since forgotten resolves to
+        // "not committed" and is therefore never prunable, so it would strand here forever.
+        self.label_history.forget_node(id);
         self.free_push(StoreKind::Node, id, txn);
         Ok(())
     }
@@ -3566,6 +3771,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         let new_labels = labels::encode_set(label_token_ids).map_err(GraphusError::from)?;
         let old_labels = node.labels;
         node.labels = new_labels;
+        // Retain the pre-change bitmap as an MVCC version (`rmp` #767) — the same reason as
+        // `write_node_labels`. This path replaces the whole set rather than one bit, but the label
+        // word is overwritten in place just the same, so an older snapshot needs the prior value.
+        self.track_label_history(id, txn, old_labels, new_labels, node.mvcc.created_ts);
         self.write_node(id, &node, txn)?;
         // Adjust the per-label counts by the membership delta of this live node (`rmp` task #79).
         self.apply_label_count_delta(old_labels, new_labels);
@@ -3615,7 +3824,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // rolled-back label change never clobbers a concurrently-committed writer's `first_prop` /
         // `first_rel` / MVCC word on the same node record (`rmp` #772). `write_node` (whole-record
         // pre-image undo) was the breach.
-        self.write_node_labels(id, next, old_labels, txn)?;
+        self.write_node_labels(id, next, old_labels, txn, node.mvcc.created_ts)?;
         // Exactly one bit was newly set: increment its per-label count (`rmp` task #79).
         self.apply_label_count_delta(old_labels, next);
         Ok(())
@@ -3643,7 +3852,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // rolled-back label change never clobbers a concurrently-committed writer's `first_prop` /
         // `first_rel` / MVCC word on the same node record (`rmp` #772). `write_node` (whole-record
         // pre-image undo) was the breach.
-        self.write_node_labels(id, next, old_labels, txn)?;
+        self.write_node_labels(id, next, old_labels, txn, node.mvcc.created_ts)?;
         // Exactly one bit was newly cleared: decrement its per-label count (`rmp` task #79).
         self.apply_label_count_delta(old_labels, next);
         Ok(())
@@ -3669,6 +3878,27 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     ///   `label_token_id` is `>= 63`, or the node's bitmap is in overflow form (#39).
     pub fn node_has_label(&self, id: u64, label_token_id: u32) -> Result<bool> {
         read_view::node_has_label(&self.pool, &self.stores, id, label_token_id)
+    }
+
+    /// The label bitmap node `id` presents to `snapshot` (`rmp` task #767), given the `live` word
+    /// already decoded from its record.
+    ///
+    /// The inline twin of [`StoreReadView::label_bitmap_at`]. Takes `live` rather than re-reading the
+    /// record because every caller on the hot path has just decoded it for the MVCC visibility check.
+    ///
+    /// [`node_labels`](Self::node_labels) / [`node_has_label`](Self::node_has_label) deliberately do
+    /// NOT apply this: the index-build and constraint-enforcement paths want the CURRENT word (they
+    /// build a candidate superset that a snapshot-correct re-check then narrows — see
+    /// `graphus_cypher::read_source::filter_label_candidates`).
+    #[must_use]
+    pub fn label_bitmap_at(
+        &self,
+        id: u64,
+        live: u64,
+        snapshot: Snapshot,
+        registry: &CommitRegistry,
+    ) -> u64 {
+        self.label_history.resolve(id, live, snapshot, registry)
     }
 
     // --------------------------- relationship CRUD --------------------------

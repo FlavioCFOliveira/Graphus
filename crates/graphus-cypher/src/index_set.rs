@@ -481,9 +481,11 @@ pub struct IndexSet {
     ///   gated only by `IndexState::Online` (`rmp` #733), NOT by the #467 marker — do not assume it is.
     /// * **`labels`** — stale-RETAINING, and `clear` does **not** empty it at all (`rmp` task #771), so
     ///   there is nothing for a watermark to gate: the refill only ever ADDS. It needs that exemption
-    ///   rather than a watermark because labels are mutated IN PLACE with no version chain, so the
-    ///   refill's only source is the CURRENT bitmap and it cannot reproduce a committed label an
-    ///   uncommitted writer has removed — see [`clear`](Self::clear) for the full argument.
+    ///   rather than a watermark because labels are mutated IN PLACE, so the refill's only source is
+    ///   the CURRENT bitmap and it cannot reproduce a committed label an uncommitted writer has
+    ///   removed — see [`clear`](Self::clear) for the full argument. Since `rmp` #767 that retention
+    ///   is also the ONLY defence left: the per-candidate re-check is now snapshot-isolated, so it no
+    ///   longer independently rejects a stale entry an older reader may genuinely need.
     ///
     ///   This entry used to claim the opposite — that emptying `labels` was safe because "any entry the
     ///   refill drops is one the re-check would have rejected anyway", so "the rebuild changes no
@@ -1162,9 +1164,20 @@ impl IndexSet {
     ///
     /// Retaining the tree is what makes the refill purely ADDITIVE, and additive is the only image this
     /// tree may hold, by the false-negative asymmetry the whole index set rests on: the re-check
-    /// (`node_has_label` on the CURRENT bitmap, via `read_source::filter_label_candidates`) can REMOVE
-    /// a candidate but can never RESURRECT one. A retained stale entry is a false POSITIVE the re-check
-    /// drops; a destroyed entry is a committed row silently lost.
+    /// (via `read_source::filter_label_candidates`) can REMOVE a candidate but can never RESURRECT
+    /// one. A retained stale entry is a false POSITIVE the re-check drops; a destroyed entry is a
+    /// committed row silently lost.
+    ///
+    /// # Since `rmp` #767 this retention is the ONLY thing keeping the tree safe from #765
+    ///
+    /// That re-check used to test the CURRENT label bitmap, which made a dropped entry harmless *by
+    /// itself*: the re-check would have rejected it anyway. #767 made label membership
+    /// snapshot-isolated, so the re-check now tests the bitmap AS OF THE READER'S SNAPSHOT and an
+    /// older reader can legitimately need a candidate the current bitmap no longer shows. The
+    /// second, independent line of defence is therefore GONE, and additive retention is load-bearing
+    /// on its own. Pruning this tree — the "cost of retaining" noted below is exactly the temptation —
+    /// or re-enabling the wipe now costs a REAL lost row. Pinned by
+    /// `tests/label_tree_765_reaudit_767.rs`.
     ///
     /// This corrects a claim this file used to make — that dropping label entries "changes no answer"
     /// because "any entry the refill drops is one the re-check would have rejected anyway". That holds
@@ -1554,6 +1567,29 @@ impl IndexSet {
     }
 
     /// Records that node `node_id` carries label `label_token` (a candidate for label scans).
+    ///
+    /// # This tree is INSERT-ONLY, and that is load-bearing for correctness (`rmp` #771 / #767)
+    ///
+    /// There is deliberately **no** `remove_label` counterpart, and [`clear`](Self::clear) does not
+    /// reset this tree. Do not add one without reading both arguments below — the absence of a removal
+    /// path is not an oversight or a missing optimisation, it is what makes two separate defects
+    /// impossible.
+    ///
+    /// * **`rmp` #771** — the refill's only source is the node's CURRENT bitmap, which includes an
+    ///   uncommitted writer's change. Destroying entries makes the rebuild write a SUBSET, and when
+    ///   that writer rolls back the record's bit returns while nothing restores the index entry.
+    /// * **`rmp` #767** — the per-candidate re-check is now snapshot-isolated, so an older reader can
+    ///   legitimately need a candidate the current bitmap no longer shows. Before #767 a dropped
+    ///   entry was harmless *by itself* because the re-check tested the current bitmap and would have
+    ///   rejected it anyway; that second, independent line of defence is GONE.
+    ///
+    /// So the tree must stay a monotone SUPERSET: a retained stale entry is a false positive the
+    /// re-check drops, while a destroyed entry is a committed row silently lost. The tempting reason
+    /// to add a removal — nothing prunes an entry whose node was deleted or relabelled — is
+    /// acknowledged in [`clear`](Self::clear); entries are reclaimed wholesale when the store reopens.
+    ///
+    /// `tests/label_tree_765_reaudit_767.rs` fires on entry destruction (verified by mutation), and
+    /// `tests/index_rebuild_label.rs` covers the #771 direction.
     pub fn insert_label(&mut self, label_token: u32, node_id: u64) {
         // in-memory index: a BTree op cannot fail in practice; an insert failure leaves the entry
         // simply absent (the caller re-checks, so a missing candidate degrades to a full scan, never

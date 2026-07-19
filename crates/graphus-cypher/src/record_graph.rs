@@ -29,6 +29,7 @@
 //! | **`String` / `List` node property values** | **supported** (#43) via the `strings.store` overflow heap (`04 §2.1`/§2.3) | a `Map`/`Bytes`/temporal value, or a heterogeneous/nested `List`, captures a runtime error (outside the stored-property subtype, `05 §7.2`) |
 //! | **Node property removal / overwrite** (`SET n.p = null`, `REMOVE n.p`, `SET n = map`) | **supported** (#43) — removes the record and frees any overflow chain (no leak) | — |
 //! | Node **labels** (`CREATE (:L)`, `SET`/`REMOVE` label, `n:L` predicates, `labels(n)`, label scan) | **supported** (#42) via the inline label bitmap, `05 §9` | a label needing token id `≥ 63` (a 64th+ distinct label) captures the documented overflow error (the token-list block is #39) |
+//! | **Label-membership MVCC** (snapshot-consistent label reads, no dirty read) | **supported** (#767) — the label word is mutated IN PLACE, so its older versions are retained as logical undo deltas in the store's in-memory [`LabelHistory`](graphus_storage::LabelHistory) and every label read resolves through it against the reader's snapshot ([`label_bitmap_at`](Self::label_bitmap_at)). Before #767 labels were read LIVE: a committed `REMOVE n:L` was visible to an older snapshot (non-repeatable read) and an *uncommitted* one to any concurrent reader (dirty read) | — |
 //! | **Relationship properties** — read (`r.k`, `properties(r)`), create (`CREATE ()-[:T {..}]->()`), `SET`/`REMOVE`, inline **and** `String`/`List` overflow | **supported** (#44) over [`RelRecord.first_prop`] (`04 §2.3`/§2.1, `05 §9`); `delete_rel` frees the chain (no leak) | a `Map`/`Bytes`/temporal value, or a heterogeneous/nested `List`, captures the same runtime error as a node property |
 //! | **Index-accelerated** label / property scans | **supported** (#48) — when driven by a [`TxnCoordinator`](crate::coordinator::TxnCoordinator) the seam holds a derived [`IndexSet`](crate::index_set::IndexSet): a label scan seeks the label index then re-checks, and `index_seek_eq`/`index_seek_range` seek the property index then re-check exactly the scan+filter residual, returning the same visible rows. Standalone (no coordinator) falls back to scan+filter | — |
 //! | **MVCC snapshot visibility** (consistent reads, own-writes, tombstone visibility, crash-safe) | **supported** (#45) — reads filtered by `graphus_txn::is_visible` on each record's `xmin`/`xmax`; delete is an MVCC tombstone reclaimed by GC | — |
@@ -959,6 +960,17 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         )
     }
 
+    /// The label bitmap node `id` presents to this query's snapshot (`rmp` task #767), given the
+    /// `live` word already decoded from its record.
+    ///
+    /// The label counterpart of [`visible`](Self::visible). The label word is mutated IN PLACE with no
+    /// version chain, so its older versions live in the store's side history rather than in the
+    /// record; reading the word directly would surface an uncommitted writer's change (a dirty read)
+    /// or one committed after this snapshot began (a non-repeatable read).
+    fn label_bitmap_at(&self, store: &RecordStore<D, S>, id: u64, live: u64) -> u64 {
+        store.label_bitmap_at(id, live, self.snapshot, &self.registry)
+    }
+
     /// This statement's visibility context (snapshot + registry + txn) for the shared lifted read body
     /// (`rmp` task #336, Slice 3b-i). The read methods pass this and a [`LiveSource`] over the live
     /// store to [`crate::read_source`], so they run the **same** code the off-thread
@@ -1327,8 +1339,8 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         for id in ids {
             // Skip nodes not visible to this snapshot (tombstoned or not-yet-committed) before
             // testing the label, so the scan honours MVCC visibility (`04 §5.3`, `rmp` task #45).
-            let visible = match store.node(id) {
-                Ok(rec) => self.visible(rec.mvcc),
+            let rec = match store.node(id) {
+                Ok(rec) => rec,
                 // A read fault on the record itself: FAIL CLOSED (`rmp` task #733). Dropping the
                 // candidate here would let a uniqueness / node-key check miss an unreadable existing
                 // holder and commit a duplicate. `node` only errors on a genuine fault (a reclaimed
@@ -1339,19 +1351,24 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                     return Vec::new();
                 }
             };
+            let visible = self.visible(rec.mvcc);
             // SIREAD-mark every examined node, visible or not (the label predicate examined it).
             self.note_read(node_ssi_key(id));
             if !visible {
                 continue;
             }
-            match store.node_has_label(id, token_id) {
+            // Resolve the label word AS OF THIS SNAPSHOT (`rmp` #767) instead of reading whatever it
+            // holds now — the inline twin of `read_source::filter_label_candidates`. `rec` is already
+            // in hand, so this also drops the second `read_node` `node_has_label` performed.
+            let bitmap = self.label_bitmap_at(&store, id, rec.labels);
+            match graphus_storage::labels::has_label(bitmap, token_id) {
                 Ok(true) => out.push(NodeId(id)),
                 Ok(false) => {}
                 Err(e) => {
                     // An overflow-form bitmap (a #39-written node) surfaces as a captured error
                     // rather than a wrong (missing/extra) row.
                     drop(store);
-                    self.capture(e);
+                    self.capture(GraphusError::from(e));
                     return Vec::new();
                 }
             }
@@ -1440,8 +1457,8 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         let store = self.store.borrow();
         let mut out = Vec::new();
         for id in ids {
-            let visible = match store.node(id) {
-                Ok(rec) => self.visible(rec.mvcc),
+            let rec = match store.node(id) {
+                Ok(rec) => rec,
                 // FAIL CLOSED on a genuine read fault (`rmp` task #733), matching the sibling
                 // `node_has_label` arm below and the single-label `filter_label_candidates`.
                 Err(e) => {
@@ -1450,14 +1467,17 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                     return Vec::new();
                 }
             };
+            let visible = self.visible(rec.mvcc);
             // SIREAD-mark every examined node exactly once, visible or not.
             self.note_read(node_ssi_key(id));
             if !visible {
                 continue;
             }
+            // One snapshot-correct resolution (`rmp` #767) for the whole token loop below.
+            let bitmap = self.label_bitmap_at(&store, id, rec.labels);
             let mut carries = false;
             for &token_id in token_ids {
-                match store.node_has_label(id, token_id) {
+                match graphus_storage::labels::has_label(bitmap, token_id) {
                     Ok(true) => {
                         carries = true;
                         break;
@@ -1465,7 +1485,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                     Ok(false) => {}
                     Err(e) => {
                         drop(store);
-                        self.capture(e);
+                        self.capture(GraphusError::from(e));
                         return Vec::new();
                     }
                 }
@@ -3474,13 +3494,15 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             if !self.visible(node_rec.mvcc) {
                 continue;
             }
-            // The node must currently carry the label (the row label scan's membership test).
-            match self.store.borrow().node_has_label(id, label_token) {
+            // The node must carry the label AS OF THIS SNAPSHOT (`rmp` #767), the row label scan's
+            // membership test — resolved from the record already decoded above, not re-read live.
+            let bitmap = self.label_bitmap_at(&self.store.borrow(), id, node_rec.labels);
+            match graphus_storage::labels::has_label(bitmap, label_token) {
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(e) => {
                     // An overflow-form bitmap (#39) surfaces as a captured error, never a wrong row.
-                    self.capture(e);
+                    self.capture(GraphusError::from(e));
                     return Some(ColumnarPass::default());
                 }
             }

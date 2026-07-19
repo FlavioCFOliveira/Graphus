@@ -64,10 +64,12 @@ use graphus_core::error::{GraphusError, Result};
 use graphus_core::{PageId, Value};
 use graphus_io::BlockDevice;
 use graphus_pagemap::PageMap;
+use graphus_txn::{CommitRegistry, Snapshot};
 use graphus_wal::LogSink;
 
 use crate::heap::{HeapBlock, STRINGS_RECORD_SIZE};
 use crate::idalloc::NULL_ID;
+use crate::label_history::LabelHistory;
 use crate::paging;
 use crate::record::{
     MVCC_HEADER_SIZE, MvccHeader, NODE_RECORD_SIZE, NodeRecord, PROP_RECORD_SIZE, PropRecord,
@@ -795,6 +797,13 @@ pub fn incident_rels_typed<D: BlockDevice, S: LogSink, P: StorePages>(
 pub struct StoreReadView<D: BlockDevice, S: LogSink> {
     pool: Arc<Pool<D, S>>,
     meta: MetaSnapshot,
+    /// The store's **live** node label-bitmap version history (`rmp` task #767), shared by [`Arc`].
+    ///
+    /// Live, not captured: the page cache above is itself live (`rmp` #721), so a label change
+    /// committed after this view was dispatched is already present in the word a reader decodes, and
+    /// only a live history carries the older version needed to resolve it away. See
+    /// [`LabelHistory`](crate::label_history::LabelHistory).
+    label_history: Arc<LabelHistory>,
 }
 
 impl<D: BlockDevice, S: LogSink> Clone for StoreReadView<D, S> {
@@ -802,6 +811,7 @@ impl<D: BlockDevice, S: LogSink> Clone for StoreReadView<D, S> {
         Self {
             pool: Arc::clone(&self.pool),
             meta: self.meta.clone(),
+            label_history: Arc::clone(&self.label_history),
         }
     }
 }
@@ -818,8 +828,23 @@ impl<D: BlockDevice, S: LogSink> StoreReadView<D, S> {
     /// Builds a read view from an [`Arc`]-shared page cache and a captured [`MetaSnapshot`]. Used by
     /// [`RecordStore::read_view`](crate::store::RecordStore::read_view).
     #[must_use]
-    pub fn new(pool: Arc<Pool<D, S>>, meta: MetaSnapshot) -> Self {
-        Self { pool, meta }
+    pub fn new(
+        pool: Arc<Pool<D, S>>,
+        meta: MetaSnapshot,
+        label_history: Arc<LabelHistory>,
+    ) -> Self {
+        Self {
+            pool,
+            meta,
+            label_history,
+        }
+    }
+
+    /// The shared node label-bitmap version history (`rmp` task #767) this view resolves labels
+    /// through.
+    #[must_use]
+    pub fn label_history(&self) -> &Arc<LabelHistory> {
+        &self.label_history
     }
 
     /// The location metadata snapshot this view reads through.
@@ -891,6 +916,24 @@ impl<D: BlockDevice, S: LogSink> StoreReadView<D, S> {
     /// As [`StoreReadView::node`], plus a runtime error for an overflow-form label bitmap.
     pub fn node_labels(&self, id: u64) -> Result<Vec<u32>> {
         node_labels(&self.pool, &self.meta, id)
+    }
+
+    /// The label bitmap node `id` presents to `snapshot` (`rmp` task #767), given the `live` word
+    /// already decoded from its record.
+    ///
+    /// Takes `live` rather than re-reading the record because every caller on the hot path has just
+    /// decoded it for the MVCC visibility check. Resolves through the store's live
+    /// [`LabelHistory`](crate::label_history::LabelHistory), so an uncommitted or
+    /// after-the-snapshot label change is undone instead of leaking into the read.
+    #[must_use]
+    pub fn label_bitmap_at(
+        &self,
+        id: u64,
+        live: u64,
+        snapshot: Snapshot,
+        registry: &CommitRegistry,
+    ) -> u64 {
+        self.label_history.resolve(id, live, snapshot, registry)
     }
 
     /// Whether node `id` carries the label with `label_token_id`. See [`node_has_label`].

@@ -296,6 +296,15 @@ fn csr_eliminates_nonmatching_chain_reads() {
         ) -> Result<bool, graphus_core::error::GraphusError> {
             self.inner.node_has_label(id, l)
         }
+        fn label_bitmap_at(
+            &self,
+            id: u64,
+            live: u64,
+            snapshot: graphus_txn::Snapshot,
+            registry: &graphus_txn::CommitRegistry,
+        ) -> u64 {
+            self.inner.label_bitmap_at(id, live, snapshot, registry)
+        }
         fn node_properties(
             &self,
             id: u64,

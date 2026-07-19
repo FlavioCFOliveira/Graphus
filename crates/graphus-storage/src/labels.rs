@@ -7,6 +7,17 @@
 //! (`rmp` task #39, alongside index-accelerated label scans, the string/list property overflow
 //! heap, and MVCC concurrency).
 //!
+//! # MVCC (`rmp` task #767)
+//!
+//! Of those follow-ups, **MVCC concurrency for labels was the one that stayed open longest**, and its
+//! absence was an isolation defect rather than a missing feature: because the word below is mutated in
+//! place with no version, a label read returned whatever it held at that instant — an uncommitted
+//! writer's change (a dirty read) or one committed after the reader's snapshot (a non-repeatable
+//! read). This module still encodes only the *current* set; the retained older versions live in
+//! [`crate::label_history`], and the read layer resolves through it. Nothing here is snapshot-aware:
+//! callers of [`has_label`] / [`token_ids`] must pass a bitmap that is already correct for their
+//! snapshot.
+//!
 //! # The bitmap scheme
 //!
 //! A node's label set is encoded as a [`Label`](crate::tokens::Namespace::Label)-namespace
