@@ -1101,6 +1101,87 @@ pub struct Statistics {
     pub vector_indexes: BTreeMap<String, VectorIndexEntry>,
 }
 
+/// Declares the per-entry access table for the twelve schema-catalog maps of [`Statistics`] — the
+/// `catalog_dirty`-guarded half that [`Statistics::schema_eq`] compares and
+/// [`Statistics::adopt_schema_from`] moves (`rmp` #734).
+///
+/// One line per map generates, in lock-step: a [`SchemaKey`] variant, a [`SchemaValue`] variant, and
+/// the matching [`Statistics::schema_get`] / [`Statistics::schema_put`] arms. Generating all four
+/// from one table is what makes it impossible for the read and write halves to disagree about a
+/// map's key or value type — the pairing is established once, here.
+///
+/// # Adding a schema-catalog map
+///
+/// A new map must be listed **here as well as** in `schema_eq` and `adopt_schema_from` (both of which
+/// stop compiling until it is). Only those two are compile-enforced; this table is not. The backstop
+/// is the debug-only faithful-inverse assertion in `RecordStore::with_schema_undo`, which fires the
+/// first time a catalog mutator touching an unlisted map is exercised — so an omission surfaces as a
+/// failing test, never as a silently un-undoable DDL.
+macro_rules! schema_catalog_table {
+    ( $( $map:ident : $key_variant:ident ( $key_ty:ty ) => $value_variant:ident ( $value_ty:ty ) ),+ $(,)? ) => {
+        /// Identifies **one entry** of one schema-catalog map of [`Statistics`] (`rmp` #734): which
+        /// map, and which key within it. The unit of per-transaction catalog undo — a rolling-back
+        /// transaction restores exactly the entries it touched, leaving every other entry (including
+        /// a concurrent transaction's pending DDL in the *same* map) untouched.
+        #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+        pub(crate) enum SchemaKey {
+            $( $key_variant($key_ty), )+
+        }
+
+        /// The value stored at a [`SchemaKey`] (`rmp` #734). One variant per map, so a value is
+        /// always bound to the map it came from and can never be written back into another.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub(crate) enum SchemaValue {
+            $( $value_variant($value_ty), )+
+        }
+
+        fn schema_catalog_get(stats: &Statistics, key: &SchemaKey) -> Option<SchemaValue> {
+            match key {
+                $(
+                    SchemaKey::$key_variant(k) => {
+                        stats.$map.get(k).cloned().map(SchemaValue::$value_variant)
+                    }
+                )+
+            }
+        }
+
+        fn schema_catalog_put(stats: &mut Statistics, key: &SchemaKey, value: Option<SchemaValue>) {
+            match (key, value) {
+                $(
+                    (SchemaKey::$key_variant(k), None) => {
+                        stats.$map.remove(k);
+                    }
+                    (SchemaKey::$key_variant(k), Some(SchemaValue::$value_variant(v))) => {
+                        stats.$map.insert(k.clone(), v);
+                    }
+                )+
+                // Unreachable by construction: every `SchemaValue` in this crate is produced by a
+                // `schema_get` on the very `SchemaKey` it is later written back with, so the two
+                // variants always agree. Assert loudly in debug; in release, decline the write rather
+                // than corrupt an unrelated catalog map.
+                (_, Some(_)) => {
+                    debug_assert!(false, "schema_put: value kind does not match key {key:?}");
+                }
+            }
+        }
+    };
+}
+
+schema_catalog_table! {
+    node_prop_histograms:      NodePropHistogram((u32, u32))  => Histogram(Vec<u8>),
+    node_property_indexes:     NodePropertyIndex((u32, u32))  => NodePropertyIndexState(IndexState),
+    node_property_index_names: NodePropertyIndexName(String)  => NodePropertyIndexTarget((u32, u32)),
+    rel_property_indexes:      RelPropertyIndex((u32, u32))   => RelPropertyIndexState(IndexState),
+    rel_property_index_names:  RelPropertyIndexName(String)   => RelPropertyIndexTarget((u32, u32)),
+    fulltext_indexes:          FulltextIndex(String)          => Fulltext(FulltextIndexEntry),
+    spatial_indexes:           SpatialIndex(String)           => Spatial(SpatialIndexEntry),
+    composite_indexes:         CompositeIndex(String)         => Composite(CompositeIndexEntry),
+    rel_composite_indexes:     RelCompositeIndex(String)      => RelComposite(RelCompositeIndexEntry),
+    text_indexes:              TextIndex(String)              => Text(TextIndexEntry),
+    vector_indexes:            VectorIndex(String)            => Vector(VectorIndexEntry),
+    constraints:               Constraint(String)             => Constraint(ConstraintEntry),
+}
+
 impl Statistics {
     /// An empty statistics catalog (every count `0`).
     #[must_use]
@@ -1206,6 +1287,25 @@ impl Statistics {
         self.rel_composite_indexes = rel_composite_indexes;
         self.text_indexes = text_indexes;
         self.vector_indexes = vector_indexes;
+    }
+
+    /// Reads one schema-catalog entry by [`SchemaKey`], cloned out — [`None`] when the key is absent.
+    ///
+    /// The single-entry read half of the per-transaction catalog undo (`rmp` #734). Paired with
+    /// [`schema_put`](Self::schema_put), which is its exact inverse: `schema_put(k, schema_get(k))` is
+    /// a no-op for every key.
+    pub(crate) fn schema_get(&self, key: &SchemaKey) -> Option<SchemaValue> {
+        schema_catalog_get(self, key)
+    }
+
+    /// Writes one schema-catalog entry by [`SchemaKey`]: `Some(v)` inserts/replaces, [`None`] removes.
+    ///
+    /// The single-entry write half of the per-transaction catalog undo (`rmp` #734). It deliberately
+    /// bypasses the invariant-enforcing mutators (e.g. `set_node_property_index_name`'s
+    /// one-name-per-target clear): this replays a **previously observed** state, so re-running those
+    /// invariants would be wrong — the state being restored already satisfied them when it was captured.
+    pub(crate) fn schema_put(&mut self, key: &SchemaKey, value: Option<SchemaValue>) {
+        schema_catalog_put(self, key, value);
     }
 
     /// The number of currently-live nodes carrying the label `token_id` (`0` if none).

@@ -1506,17 +1506,19 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ///
     /// # Why the coordinator, and not the procedure
     ///
-    /// This is the ONLY place a histogram recompute is executed. `db.resampleIndex` cannot do the work
-    /// itself: it runs inside the **caller's** transaction, and a catalog mutation staged in a
-    /// transaction the engine yields across is exactly the shape `RecordStore::rollback` cannot undo
-    /// per-transaction — it restores the catalog's schema half wholesale when any other transaction is
-    /// open, resurrecting the change it was undoing (the pre-existing `rmp` #734 gap, whose store.rs
-    /// note records that catalog DDL is safe today only because it "runs ONLY as a yield-free
-    /// auto-commit transaction"). So the procedure only *queues* a request, and this method — a
-    /// yield-free auto-commit transaction, honouring that precondition — executes it.
+    /// This is the ONLY place a histogram recompute is executed. `db.resampleIndex` does not do the
+    /// work itself: it runs inside the **caller's** transaction, and Neo4j's `db.resampleIndex`
+    /// schedules a background job that ignores the caller's transaction entirely — so executing the
+    /// resample outside it is the conformant behaviour, not a workaround. The procedure therefore only
+    /// *queues* a request, and this method — a yield-free auto-commit transaction — executes it.
     ///
-    /// To be precise about what that buys: it **avoids triggering** #734; it does not close it. The gap
-    /// is still there for any future DDL that mutates the catalog inside a yielding transaction.
+    /// Historical note: this split was originally introduced to *avoid triggering* `rmp` #734, under
+    /// which a catalog mutation staged in a transaction the engine yields across survived its own
+    /// rollback (the rollback restored the catalog's schema half wholesale whenever any other
+    /// transaction was open). That gap is now **closed** — `RecordStore` tracks catalog DDL
+    /// per-transaction and undoes exactly the rolling-back transaction's own — so the split here stands
+    /// on its Neo4j-conformance merit alone, and no longer on a precondition another author must
+    /// preserve.
     ///
     /// # Cost and failure policy
     ///
@@ -1676,10 +1678,11 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         {
             let mut store = store.borrow_mut();
             for &(label_token, prop_key) in &populating {
-                store.set_node_property_index(label_token, prop_key, IndexState::Online);
+                store.set_node_property_index(txn, label_token, prop_key, IndexState::Online);
             }
             for (name, entry) in &populating_fulltext {
                 store.set_fulltext_index(
+                    txn,
                     name.clone(),
                     FulltextIndexEntry {
                         state: IndexState::Online,
@@ -1689,6 +1692,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             }
             for (name, entry) in &populating_spatial {
                 store.set_spatial_index(
+                    txn,
                     name.clone(),
                     SpatialIndexEntry {
                         state: IndexState::Online,
@@ -1781,7 +1785,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 // same pass) so colliding bases are disambiguated deterministically.
                 let name =
                     Self::unique_auto_index_name(&store, &label, &property, label_token, prop_key);
-                store.set_node_property_index_name(name, label_token, prop_key);
+                store.set_node_property_index_name(txn, name, label_token, prop_key);
             }
         }
         // The txn advanced an id whether or not the commit lands (mirrors the promote path). A failed
@@ -3602,13 +3606,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             // successful create ends `Online`). This becomes durable at the commit below, alongside the
             // tokens; a crash mid-create recovers to the last committed catalog (no entry), and the
             // failed create leaves no orphan registration.
-            store.set_node_property_index(label_token, prop_key, IndexState::Online);
+            store.set_node_property_index(txn, label_token, prop_key, IndexState::Online);
             // Record a deterministic auto-name (`rmp` task #624) so this index is named end-to-end (it
             // shows up in `SHOW INDEXES` with a name and is droppable by name). Idempotent: recomputing
             // the auto-name of an index that already carries it is not a collision, so re-declaring the
             // same `(label, property)` keeps the same name.
             let name = Self::unique_auto_index_name(&store, label, property, label_token, prop_key);
-            store.set_node_property_index_name(name, label_token, prop_key);
+            store.set_node_property_index_name(txn, name, label_token, prop_key);
             (label_token, prop_key)
         };
         self.store.borrow_mut().commit(txn)?;
@@ -3712,8 +3716,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     &store, rel_type, property, type_token, prop_key,
                 ),
             };
-            store.set_rel_property_index(type_token, prop_key, IndexState::Online);
-            store.set_rel_property_index_name(effective_name, type_token, prop_key);
+            store.set_rel_property_index(txn, type_token, prop_key, IndexState::Online);
+            store.set_rel_property_index_name(txn, effective_name, type_token, prop_key);
             (type_token, prop_key)
         };
         self.store.borrow_mut().commit(txn)?;
@@ -3764,8 +3768,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.store.borrow_mut().begin(txn);
         {
             let mut store = self.store.borrow_mut();
-            store.remove_rel_property_index(type_token, prop_key);
-            store.remove_rel_property_index_name_for(type_token, prop_key);
+            store.remove_rel_property_index(txn, type_token, prop_key);
+            store.remove_rel_property_index_name_for(txn, type_token, prop_key);
         }
         self.store.borrow_mut().commit(txn)?;
 
@@ -3802,8 +3806,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.store.borrow_mut().begin(txn);
         {
             let mut store = self.store.borrow_mut();
-            store.remove_rel_property_index(type_token, prop_key);
-            store.remove_rel_property_index_name(name);
+            store.remove_rel_property_index(txn, type_token, prop_key);
+            store.remove_rel_property_index_name(txn, name);
         }
         self.store.borrow_mut().commit(txn)?;
 
@@ -3924,7 +3928,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.next_txn_id += 1;
         let txn = TxnId(self.next_txn_id);
         self.store.borrow_mut().begin(txn);
-        self.store.borrow_mut().remove_composite_index(name);
+        self.store.borrow_mut().remove_composite_index(txn, name);
         self.store.borrow_mut().commit(txn)?;
 
         // Keep the backing tree iff a node-key constraint over the same tuple still shares it.
@@ -4019,7 +4023,9 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.next_txn_id += 1;
         let txn = TxnId(self.next_txn_id);
         self.store.borrow_mut().begin(txn);
-        self.store.borrow_mut().remove_rel_composite_index(name);
+        self.store
+            .borrow_mut()
+            .remove_rel_composite_index(txn, name);
         self.store.borrow_mut().commit(txn)?;
         self.index
             .borrow_mut()
@@ -4738,8 +4744,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     Self::unique_auto_index_name(&store, label, property, label_token, prop_key)
                 }
             };
-            store.set_node_property_index(label_token, prop_key, IndexState::Populating);
-            store.set_node_property_index_name(effective_name, label_token, prop_key);
+            store.set_node_property_index(txn, label_token, prop_key, IndexState::Populating);
+            store.set_node_property_index_name(txn, effective_name, label_token, prop_key);
             (label_token, prop_key)
         };
         self.store.borrow_mut().commit(txn)?;
@@ -4889,6 +4895,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 ),
             };
             store.set_composite_index(
+                txn,
                 effective_name.clone(),
                 CompositeIndexEntry {
                     label_token,
@@ -5116,6 +5123,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 ),
             };
             store.set_rel_composite_index(
+                txn,
                 effective_name.clone(),
                 RelCompositeIndexEntry {
                     type_token,
@@ -5310,7 +5318,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 analyzer: analyzer.as_byte(),
                 state: IndexState::Populating,
             };
-            store.set_fulltext_index(name.to_owned(), entry.clone());
+            store.set_fulltext_index(txn, name.to_owned(), entry.clone());
             entry
         };
         self.store.borrow_mut().commit(txn)?;
@@ -5425,7 +5433,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 analyzer: analyzer.as_byte(),
                 state: IndexState::Online,
             };
-            store.set_fulltext_index(name.to_owned(), entry.clone());
+            store.set_fulltext_index(txn, name.to_owned(), entry.clone());
             entry
         };
         self.store.borrow_mut().commit(txn)?;
@@ -5518,7 +5526,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.next_txn_id += 1;
         let txn = TxnId(self.next_txn_id);
         self.store.borrow_mut().begin(txn);
-        self.store.borrow_mut().remove_fulltext_index(name);
+        self.store.borrow_mut().remove_fulltext_index(txn, name);
         self.store.borrow_mut().commit(txn)?;
 
         self.cancel_fulltext_builds(name);
@@ -5637,6 +5645,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 }
             };
             store.set_spatial_index(
+                txn,
                 name.to_owned(),
                 SpatialIndexEntry {
                     entity: SpatialEntity::Node,
@@ -5735,6 +5744,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 }
             };
             store.set_spatial_index(
+                txn,
                 name.to_owned(),
                 SpatialIndexEntry {
                     entity: SpatialEntity::Relationship,
@@ -5847,7 +5857,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.next_txn_id += 1;
         let txn = TxnId(self.next_txn_id);
         self.store.borrow_mut().begin(txn);
-        self.store.borrow_mut().remove_spatial_index(name);
+        self.store.borrow_mut().remove_spatial_index(txn, name);
         self.store.borrow_mut().commit(txn)?;
 
         Self::cancel_named_builds(
@@ -5998,6 +6008,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 }
             };
             store.set_text_index(
+                txn,
                 name.to_owned(),
                 TextIndexEntry {
                     label_token,
@@ -6114,7 +6125,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.next_txn_id += 1;
         let txn = TxnId(self.next_txn_id);
         self.store.borrow_mut().begin(txn);
-        self.store.borrow_mut().remove_text_index(name);
+        self.store.borrow_mut().remove_text_index(txn, name);
         self.store.borrow_mut().commit(txn)?;
 
         self.index
@@ -6265,6 +6276,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 None => Self::unique_auto_vector_index_name(&store, entity, covering, property),
             };
             store.set_vector_index(
+                txn,
                 effective_name,
                 VectorIndexEntry {
                     entity,
@@ -6420,7 +6432,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.next_txn_id += 1;
         let txn = TxnId(self.next_txn_id);
         self.store.borrow_mut().begin(txn);
-        self.store.borrow_mut().remove_vector_index(name);
+        self.store.borrow_mut().remove_vector_index(txn, name);
         self.store.borrow_mut().commit(txn)?;
 
         if entry.entity.is_relationship() {
@@ -6813,6 +6825,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
 
         // Conforming: record the durable catalog entry and commit (tokens + entry atomically).
         self.store.borrow_mut().set_constraint(
+            txn,
             name.to_owned(),
             ConstraintEntry {
                 label_token,
@@ -7307,7 +7320,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.next_txn_id += 1;
         let txn = TxnId(self.next_txn_id);
         self.store.borrow_mut().begin(txn);
-        self.store.borrow_mut().remove_constraint(name);
+        self.store.borrow_mut().remove_constraint(txn, name);
         self.store.borrow_mut().commit(txn)?;
         // A node key's backing composite tree may be **shared** with a standalone composite index over
         // the same `(label, tuple)` (`rmp` task #657): keep it if such an index still needs it, so
@@ -8075,9 +8088,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.next_txn_id += 1;
         let txn = TxnId(self.next_txn_id);
         self.store.borrow_mut().begin(txn);
-        self.store
-            .borrow_mut()
-            .set_node_property_index(label_token, prop_key, IndexState::Online);
+        self.store.borrow_mut().set_node_property_index(
+            txn,
+            label_token,
+            prop_key,
+            IndexState::Online,
+        );
         if self.store.borrow_mut().commit(txn).is_err() {
             // The durable flip failed; leave the build pending `Populating` and retry next call.
             return;
@@ -8281,6 +8297,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.store.borrow_mut().begin(txn);
         let promoted = if let Some(entry) = entry {
             self.store.borrow_mut().set_fulltext_index(
+                txn,
                 name.clone(),
                 FulltextIndexEntry {
                     state: IndexState::Online,
@@ -8411,6 +8428,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.store.borrow_mut().begin(txn);
         let promoted = if let Some(entry) = entry {
             self.store.borrow_mut().set_spatial_index(
+                txn,
                 name.clone(),
                 SpatialIndexEntry {
                     state: IndexState::Online,
@@ -8484,8 +8502,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.store.borrow_mut().begin(txn);
         {
             let mut store = self.store.borrow_mut();
-            store.remove_node_property_index(label_token, prop_key);
-            store.remove_node_property_index_name_for(label_token, prop_key);
+            store.remove_node_property_index(txn, label_token, prop_key);
+            store.remove_node_property_index_name_for(txn, label_token, prop_key);
         }
         self.store.borrow_mut().commit(txn)?;
 
@@ -8544,8 +8562,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.store.borrow_mut().begin(txn);
         {
             let mut store = self.store.borrow_mut();
-            store.remove_node_property_index(label_token, prop_key);
-            store.remove_node_property_index_name(name);
+            store.remove_node_property_index(txn, label_token, prop_key);
+            store.remove_node_property_index_name(txn, name);
         }
         self.store.borrow_mut().commit(txn)?;
 

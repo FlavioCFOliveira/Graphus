@@ -3242,7 +3242,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             };
             self.store
                 .borrow_mut()
-                .remove_property_histogram(label_token, prop_token);
+                .remove_property_histogram(self.txn, label_token, prop_token);
             return Ok(());
         }
 
@@ -3262,9 +3262,12 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 GraphusError::Storage("property-key token interning failed".to_owned())
             })
         })?;
-        self.store
-            .borrow_mut()
-            .set_property_histogram(label_token, prop_token, hist.encode());
+        self.store.borrow_mut().set_property_histogram(
+            self.txn,
+            label_token,
+            prop_token,
+            hist.encode(),
+        );
         Ok(())
     }
 

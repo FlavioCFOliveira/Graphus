@@ -264,7 +264,7 @@ fn store_with_legacy_anonymous_index() -> Store {
     let pk = store
         .intern_token(Namespace::PropKey, "age")
         .expect("intern prop");
-    store.set_node_property_index(lt, pk, IndexState::Online);
+    store.set_node_property_index(txn, lt, pk, IndexState::Online);
     // Deliberately NO set_node_property_index_name — this is the legacy anonymous shape.
     store.commit(txn).expect("commit legacy index");
     store

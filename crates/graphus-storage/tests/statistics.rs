@@ -812,8 +812,8 @@ fn property_histogram_persists_across_reopen() {
     let name = s.intern_token(Namespace::PropKey, "name").unwrap();
     let age_hist = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
     let name_hist = vec![0xABu8; 130];
-    s.set_property_histogram(person, age, age_hist.clone());
-    s.set_property_histogram(person, name, name_hist.clone());
+    s.set_property_histogram(txn, person, age, age_hist.clone());
+    s.set_property_histogram(txn, person, name, name_hist.clone());
     s.commit(txn).unwrap();
     s.flush().unwrap();
 
@@ -839,14 +839,14 @@ fn property_histogram_recovers_after_a_no_force_crash() {
     let person = s.intern_token(Namespace::Label, "Person").unwrap();
     let age = s.intern_token(Namespace::PropKey, "age").unwrap();
     let hist = vec![9u8, 8, 7, 6, 5, 4, 3, 2, 1];
-    s.set_property_histogram(person, age, hist.clone());
+    s.set_property_histogram(txn, person, age, hist.clone());
     s.commit(txn).unwrap();
 
     // Replace it in a second committed txn so the recovered value is the *latest* committed blob.
     let t2 = TxnId(2);
     s.begin(t2);
     let newer = vec![42u8; 64];
-    s.set_property_histogram(person, age, newer.clone());
+    s.set_property_histogram(t2, person, age, newer.clone());
     s.commit(t2).unwrap();
 
     let rec = recover_no_force(&s);
@@ -861,7 +861,7 @@ fn property_histogram_recovers_after_a_steal_crash() {
     let person = s.intern_token(Namespace::Label, "Person").unwrap();
     let age = s.intern_token(Namespace::PropKey, "age").unwrap();
     let hist = vec![0x11u8, 0x22, 0x33, 0x44];
-    s.set_property_histogram(person, age, hist.clone());
+    s.set_property_histogram(txn, person, age, hist.clone());
     s.commit(txn).unwrap();
 
     let rec = recover_steal(&mut s);
@@ -877,13 +877,13 @@ fn an_uncommitted_histogram_does_not_survive_recovery() {
     let person = s.intern_token(Namespace::Label, "Person").unwrap();
     let age = s.intern_token(Namespace::PropKey, "age").unwrap();
     let committed = vec![1u8, 1, 1, 1];
-    s.set_property_histogram(person, age, committed.clone());
+    s.set_property_histogram(t1, person, age, committed.clone());
     s.commit(t1).unwrap();
 
     // T2 sets a different histogram but never commits (a loser); harden the WAL tail so undo runs.
     let t2 = TxnId(2);
     s.begin(t2);
-    s.set_property_histogram(person, age, vec![2u8; 200]);
+    s.set_property_histogram(t2, person, age, vec![2u8; 200]);
     s.with_wal(graphus_wal::WalManager::flush);
 
     // Only T1's committed blob survives — the catalog is checkpointed only at commit.
@@ -902,15 +902,15 @@ fn rolled_back_histogram_change_is_discarded() {
     let person = s.intern_token(Namespace::Label, "Person").unwrap();
     let age = s.intern_token(Namespace::PropKey, "age").unwrap();
     let baseline = vec![7u8, 7, 7];
-    s.set_property_histogram(person, age, baseline.clone());
+    s.set_property_histogram(t1, person, age, baseline.clone());
     s.commit(t1).unwrap();
 
     // T2: replace the committed blob and add a new one, then ROLL BACK. Both changes must vanish.
     let t2 = TxnId(2);
     s.begin(t2);
     let name = s.intern_token(Namespace::PropKey, "name").unwrap();
-    s.set_property_histogram(person, age, vec![0u8; 50]); // would replace the committed blob
-    s.set_property_histogram(person, name, vec![1u8, 2, 3]); // would add a new entry
+    s.set_property_histogram(t2, person, age, vec![0u8; 50]); // would replace the committed blob
+    s.set_property_histogram(t2, person, name, vec![1u8, 2, 3]); // would add a new entry
     s.rollback(t2).unwrap();
 
     assert_eq!(
@@ -928,7 +928,7 @@ fn rolled_back_histogram_change_is_discarded() {
     // state, not merely left it stale).
     let t3 = TxnId(3);
     s.begin(t3);
-    s.remove_property_histogram(person, age); // would delete the committed blob
+    s.remove_property_histogram(t3, person, age); // would delete the committed blob
     s.rollback(t3).unwrap();
     assert_eq!(s.property_histogram(person, age), Some(baseline.as_slice()));
 }
@@ -941,14 +941,14 @@ fn removed_property_histogram_stays_removed_across_reopen() {
     let person = s.intern_token(Namespace::Label, "Person").unwrap();
     let age = s.intern_token(Namespace::PropKey, "age").unwrap();
     let name = s.intern_token(Namespace::PropKey, "name").unwrap();
-    s.set_property_histogram(person, age, vec![1u8, 2, 3]);
-    s.set_property_histogram(person, name, vec![4u8, 5, 6]);
+    s.set_property_histogram(t1, person, age, vec![1u8, 2, 3]);
+    s.set_property_histogram(t1, person, name, vec![4u8, 5, 6]);
     s.commit(t1).unwrap();
 
     // Remove one entry in a committed txn.
     let t2 = TxnId(2);
     s.begin(t2);
-    s.remove_property_histogram(person, age);
+    s.remove_property_histogram(t2, person, age);
     s.commit(t2).unwrap();
     s.flush().unwrap();
     assert_eq!(s.property_histogram(person, age), None);
@@ -971,14 +971,14 @@ fn an_empty_blob_is_treated_as_a_removal() {
     s.begin(t1);
     let person = s.intern_token(Namespace::Label, "Person").unwrap();
     let age = s.intern_token(Namespace::PropKey, "age").unwrap();
-    s.set_property_histogram(person, age, vec![1u8, 2, 3]);
+    s.set_property_histogram(t1, person, age, vec![1u8, 2, 3]);
     s.commit(t1).unwrap();
     assert_eq!(s.property_histogram(person, age), Some(&[1u8, 2, 3][..]));
 
     // Setting an empty blob removes the entry (a histogram is never zero-length).
     let t2 = TxnId(2);
     s.begin(t2);
-    s.set_property_histogram(person, age, Vec::new());
+    s.set_property_histogram(t2, person, age, Vec::new());
     s.commit(t2).unwrap();
     s.flush().unwrap();
     assert_eq!(s.property_histogram(person, age), None);
@@ -1011,8 +1011,8 @@ fn node_property_index_persists_across_reopen() {
     let age = s.intern_token(Namespace::PropKey, "age").unwrap();
     let name = s.intern_token(Namespace::PropKey, "name").unwrap();
     // Mixed state: one Online, one Populating (the latter is what `rmp` task #91 will resume).
-    s.set_node_property_index(person, age, IndexState::Online);
-    s.set_node_property_index(person, name, IndexState::Populating);
+    s.set_node_property_index(txn, person, age, IndexState::Online);
+    s.set_node_property_index(txn, person, name, IndexState::Populating);
     s.commit(txn).unwrap();
     s.flush().unwrap();
 
@@ -1044,13 +1044,13 @@ fn node_property_index_recovers_after_a_no_force_crash() {
     s.begin(txn);
     let person = s.intern_token(Namespace::Label, "Person").unwrap();
     let age = s.intern_token(Namespace::PropKey, "age").unwrap();
-    s.set_node_property_index(person, age, IndexState::Populating);
+    s.set_node_property_index(txn, person, age, IndexState::Populating);
     s.commit(txn).unwrap();
 
     // Promote it to Online in a second committed txn so the recovered state is the *latest* committed.
     let t2 = TxnId(2);
     s.begin(t2);
-    s.set_node_property_index(person, age, IndexState::Online);
+    s.set_node_property_index(t2, person, age, IndexState::Online);
     s.commit(t2).unwrap();
 
     let rec = recover_no_force(&s);
@@ -1067,7 +1067,7 @@ fn node_property_index_recovers_after_a_steal_crash() {
     s.begin(txn);
     let person = s.intern_token(Namespace::Label, "Person").unwrap();
     let age = s.intern_token(Namespace::PropKey, "age").unwrap();
-    s.set_node_property_index(person, age, IndexState::Online);
+    s.set_node_property_index(txn, person, age, IndexState::Online);
     s.commit(txn).unwrap();
 
     let rec = recover_steal(&mut s);
@@ -1085,14 +1085,14 @@ fn an_uncommitted_index_declaration_does_not_survive_recovery() {
     s.begin(t1);
     let person = s.intern_token(Namespace::Label, "Person").unwrap();
     let age = s.intern_token(Namespace::PropKey, "age").unwrap();
-    s.set_node_property_index(person, age, IndexState::Online);
+    s.set_node_property_index(t1, person, age, IndexState::Online);
     s.commit(t1).unwrap();
 
     // T2 declares a second index but never commits (a loser); harden the WAL tail so undo runs.
     let t2 = TxnId(2);
     s.begin(t2);
     let name = s.intern_token(Namespace::PropKey, "name").unwrap();
-    s.set_node_property_index(person, name, IndexState::Populating);
+    s.set_node_property_index(t2, person, name, IndexState::Populating);
     s.with_wal(graphus_wal::WalManager::flush);
 
     // Only T1's committed declaration survives — the catalog is checkpointed only at commit. The
@@ -1117,15 +1117,15 @@ fn rolled_back_index_declaration_is_discarded() {
     s.begin(t1);
     let person = s.intern_token(Namespace::Label, "Person").unwrap();
     let age = s.intern_token(Namespace::PropKey, "age").unwrap();
-    s.set_node_property_index(person, age, IndexState::Online);
+    s.set_node_property_index(t1, person, age, IndexState::Online);
     s.commit(t1).unwrap();
 
     // T2: flip the committed entry's state and add a new one, then ROLL BACK. Both must vanish.
     let t2 = TxnId(2);
     s.begin(t2);
     let name = s.intern_token(Namespace::PropKey, "name").unwrap();
-    s.set_node_property_index(person, age, IndexState::Populating); // would flip the committed state
-    s.set_node_property_index(person, name, IndexState::Online); // would add a new entry
+    s.set_node_property_index(t2, person, age, IndexState::Populating); // would flip the committed state
+    s.set_node_property_index(t2, person, name, IndexState::Online); // would add a new entry
     s.rollback(t2).unwrap();
 
     assert_eq!(
@@ -1143,7 +1143,7 @@ fn rolled_back_index_declaration_is_discarded() {
     // state, not merely left it stale).
     let t3 = TxnId(3);
     s.begin(t3);
-    s.remove_node_property_index(person, age);
+    s.remove_node_property_index(t3, person, age);
     s.rollback(t3).unwrap();
     assert_eq!(
         s.node_property_index_state(person, age),
@@ -1162,12 +1162,18 @@ fn rolled_back_index_declaration_is_discarded() {
 // #529 read-only fast path and SILENTLY DROPPED its committed DDL (no data record backs a catalog-only
 // change, so `catalog_dirty` is its only durability signal).
 //
-// This interleaving models a FUTURE yielding-DDL path via the direct store API: today catalog DDL runs
-// only as a yield-free auto-commit transaction (the coordinator's `begin` -> `set_*` -> `commit` with
-// no engine yield between the mutation and the commit), so it is not engine-reachable — but the
-// store's rollback contract must be robust to it. `rolled_back_index_declaration_is_discarded` above
-// pins the complementary property this fix must NOT break: a transaction's OWN pending DDL, with no
-// concurrent transaction to own it, IS still discarded on rollback (rollback atomicity).
+// This interleaving is driven through the direct store API. It was once described here as modelling a
+// merely HYPOTHETICAL yielding-DDL path, on the grounds that catalog DDL runs only as a yield-free
+// auto-commit transaction and so could never be interleaved. That reasoning no longer holds and should
+// not be repeated: `rmp` #572's `db.resampleIndex` was the first procedure to mutate the catalog from
+// inside a caller's explicit transaction, and it reproduced the interleaving for real. #572 moved its
+// own resample into a private auto-commit transaction, which removed that one caller from the path
+// without closing it. `rmp` #734 closed it, for every catalog mutator.
+//
+// `rolled_back_index_declaration_is_discarded` above pins the complementary property this fix must NOT
+// break: a transaction's OWN pending DDL, with no concurrent transaction to own it, IS still discarded
+// on rollback (rollback atomicity). Since #734 that holds with a concurrent transaction open too —
+// see `tests/catalog_txn_undo_734.rs`, which pins BOTH halves at once.
 // =================================================================================================
 
 #[test]
@@ -1192,8 +1198,8 @@ fn concurrent_pending_index_survives_an_unrelated_rollback() {
     // Transaction A declares a node-property index and its name — and stays OPEN (pending catalog DDL).
     let a = TxnId(2);
     s.begin(a);
-    s.set_node_property_index(product, sku, IndexState::Online);
-    s.set_node_property_index_name("product_sku".to_owned(), product, sku);
+    s.set_node_property_index(a, product, sku, IndexState::Online);
+    s.set_node_property_index_name(a, "product_sku".to_owned(), product, sku);
 
     // Concurrent transaction B does unrelated data work, then ROLLS BACK while A is still open.
     let b = TxnId(3);
@@ -1243,14 +1249,14 @@ fn removed_node_property_index_stays_removed_across_reopen() {
     let person = s.intern_token(Namespace::Label, "Person").unwrap();
     let age = s.intern_token(Namespace::PropKey, "age").unwrap();
     let name = s.intern_token(Namespace::PropKey, "name").unwrap();
-    s.set_node_property_index(person, age, IndexState::Online);
-    s.set_node_property_index(person, name, IndexState::Online);
+    s.set_node_property_index(t1, person, age, IndexState::Online);
+    s.set_node_property_index(t1, person, name, IndexState::Online);
     s.commit(t1).unwrap();
 
     // Drop one index in a committed txn.
     let t2 = TxnId(2);
     s.begin(t2);
-    s.remove_node_property_index(person, age);
+    s.remove_node_property_index(t2, person, age);
     s.commit(t2).unwrap();
     s.flush().unwrap();
     assert_eq!(s.node_property_index_state(person, age), None);

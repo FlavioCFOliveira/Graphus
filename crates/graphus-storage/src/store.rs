@@ -43,8 +43,8 @@ use crate::idalloc::{ElementIdAllocator, FreeList, NULL_ID, PhysicalAllocator};
 use crate::labels;
 use crate::meta::{
     CompositeIndexEntry, ConstraintEntry, FulltextIndexEntry, IndexState, Meta,
-    RelCompositeIndexEntry, SpatialIndexEntry, Statistics, StoreMeta, TextIndexEntry, VectorEntity,
-    VectorIndexEntry,
+    RelCompositeIndexEntry, SchemaKey, SchemaValue, SpatialIndexEntry, Statistics, StoreMeta,
+    TextIndexEntry, VectorEntity, VectorIndexEntry,
 };
 use crate::paging;
 use crate::read_view::{self, MetaSnapshot, StoreMetaSnapshot, StorePages, StoreReadView};
@@ -244,6 +244,54 @@ struct ActiveTxn {
     /// `popped_ids`, so bounded by the free list size at begin). A popped prop with no recorded owner
     /// is conservatively **not** re-pushed (a safe leak, never a double-free).
     popped_prop_owners: Vec<(u64, StoreKind, u64)>,
+    /// This transaction's own pending **schema-catalog DDL**, as a per-entry undo log (`rmp` #734) —
+    /// the `Statistics` twin of [`freed_ids`](Self#structfield.freed_ids) / [`popped_ids`](Self#structfield.popped_ids).
+    ///
+    /// Unlike a record write, catalog DDL is not WAL-logged: it mutates one shared in-memory
+    /// [`Statistics`] and becomes durable only via the commit-time `checkpoint_meta`. So a rollback
+    /// cannot undo it by replaying the log — it has to know, per entry, what this transaction changed
+    /// and what the entry held before. Each [`SchemaUndo`] records exactly that, appended in mutation
+    /// order by [`with_schema_undo`](RecordStore::with_schema_undo) and replayed newest-first by
+    /// [`apply_schema_undo`](RecordStore::apply_schema_undo) on rollback.
+    ///
+    /// Empty for the overwhelming majority of transactions: only a DDL statement writes here.
+    schema_undo: Vec<SchemaUndo>,
+}
+
+/// One entry of a transaction's catalog-DDL undo log (`rmp` #734): the schema-catalog entry a
+/// mutation touched, and the value it held **before** that mutation.
+///
+/// A restore is conditioned on this transaction still being the entry's **last writer**, so a
+/// rollback never clobbers DDL that has since been written by somebody else. The witness for that is
+/// deliberately the generation stamp [`seq`](Self#structfield.seq) and **not** the value the mutation
+/// left behind: comparing values cannot distinguish "nobody has written since" from "somebody wrote
+/// the identical value since" (a plain ABA). Two concurrent `ANALYZE` passes computing the same
+/// histogram bytes, or two racing `CREATE INDEX … IF NOT EXISTS` both writing `IndexState::Online`,
+/// hit that case — and a value-witnessed undo would silently revert the other transaction's still-
+/// pending write, which is the very lost-update #734 exists to prevent, mirrored.
+#[derive(Debug, Clone)]
+struct SchemaUndo {
+    /// Store-global mutation generation, unique and strictly increasing across **all** transactions
+    /// (`RecordStore::schema_seq`). Serves two purposes.
+    ///
+    /// As an **owner witness**: the restore fires only while `schema_last_seq[key] == seq`, i.e. only
+    /// while this exact mutation is still the entry's most recent one — regardless of what value any
+    /// later writer happened to store.
+    ///
+    /// As a **global order**: undoing one transaction's log needs only its own order, but building the
+    /// committed catalog image ([`RecordStore::committed_statistics`]) undoes several open
+    /// transactions' logs together, and those must be replayed in reverse *global* order. Undoing
+    /// X-then-Y when Y wrote the same entry last would strand the entry at Y's `prev` (which is X's
+    /// value) instead of walking it back to the committed value.
+    seq: u64,
+    /// The generation that owned this entry immediately **before** this mutation (`0` = no recorded
+    /// writer). Restoring rolls `schema_last_seq[key]` back to this, so a chain of mutations by the
+    /// same transaction unwinds one link at a time instead of stalling after the newest.
+    prev_seq: u64,
+    /// The schema-catalog entry this undo restores.
+    key: SchemaKey,
+    /// What the entry held before this transaction's mutation ([`None`] = the entry was absent).
+    prev: Option<SchemaValue>,
 }
 
 /// What one [`RecordStore::gc`] pass did (observability, NFR-10; `rmp` task #59).
@@ -310,10 +358,26 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// transaction both logged no WAL data record (`WalManager::is_active` is false) **and** dirtied no
     /// catalog here, because such a mutation is durable **only** via the commit-time
     /// [`checkpoint_meta`](Self::checkpoint_meta) the fast path would otherwise skip. Cleared after any
-    /// durable commit persists the catalog and on [`rollback`](Self::rollback) (which reloads it). The
-    /// count mutators (`inc_node`/`inc_rel`/…) are *not* tracked here: they only ever run inside a
+    /// durable commit persists the catalog and on [`rollback`](Self::rollback) (which reloads it) —
+    /// in both cases **only if no still-open transaction holds pending schema DDL**, which a checkpoint
+    /// deliberately does not persist (`rmp` #734, [`committed_statistics`](Self::committed_statistics)).
+    /// The count mutators (`inc_node`/`inc_rel`/…) are *not* tracked here: they only ever run inside a
     /// record-writing operation, so `WalManager::is_active` already covers them.
     catalog_dirty: bool,
+    /// Monotonic stamp handed to each [`SchemaUndo`] so catalog mutations carry a **store-global**
+    /// order (`rmp` #734). Purely in-memory: undo logs never outlive the transactions that own them,
+    /// so this needs no durability and is not part of [`Meta`].
+    schema_seq: u64,
+    /// The generation ([`SchemaUndo::seq`]) of the most recent mutation of each schema-catalog entry
+    /// (`rmp` #734) — the **owner witness** an undo is conditioned on.
+    ///
+    /// Answers "am I still the last writer of this entry?" without comparing values, so an undo can
+    /// tell "nobody wrote since" apart from "somebody wrote the identical value since". Bounded by the
+    /// number of distinct catalog entries ever mutated in this process (tens, in practice: one per
+    /// declared index, name, constraint or histogram), and purely in-memory — a stamp left behind by a
+    /// long-resolved transaction is inert, because generations are unique and never reissued, so no
+    /// live undo entry can ever match it by accident.
+    schema_last_seq: HashMap<SchemaKey, u64>,
     /// The metadata **continuation** pages (device ids of the catalog chain after [`META_PAGE`]),
     /// in chain order (`rmp` task #51). Rebuilt from disk on open/recovery by walking the chain, and
     /// grown on demand at [`checkpoint_meta`](Self::checkpoint_meta) when the encoded catalog needs
@@ -527,6 +591,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             commit_ts_hw: 0,
             active: HashMap::new(),
             catalog_dirty: false,
+            schema_seq: 0,
+            schema_last_seq: HashMap::default(),
             meta_chain: Vec::new(),
             commit_registry: CommitRegistry::new(),
             pending_gc_prune: None,
@@ -632,6 +698,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             commit_ts_hw: meta.commit_ts_hw,
             active: HashMap::new(),
             catalog_dirty: false,
+            schema_seq: 0,
+            schema_last_seq: HashMap::default(),
             meta_chain,
             commit_registry,
             pending_gc_prune: None,
@@ -707,8 +775,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             tokens: self.tokens.clone(),
             // Clones the whole `Statistics` (counts *and* the `rmp` task #81 property-histogram map):
             // the histogram blobs ride the same checkpoint-at-commit path as the counts with no
-            // special-casing — `Statistics` is cloned structurally.
-            statistics: self.statistics.clone(),
+            // special-casing — `Statistics` is cloned structurally. The SCHEMA half is taken from the
+            // COMMITTED image, not the live one (`rmp` #734): the live `Statistics` also carries any
+            // still-open transaction's uncommitted DDL, and checkpointing that would publish an
+            // in-flight schema change as committed. See `committed_statistics`.
+            statistics: self.committed_statistics(),
         }
     }
 
@@ -1645,7 +1716,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // once this commit record's `fdatasync` (the deferred `harden_wal`) completes, so the next
         // read-only commit may safely take its fast path (`rmp` #529). Cleared here (before the deferred
         // harden) is sound: the only harden failure is a PANIC (fsyncgate), after which this flag is moot.
-        self.catalog_dirty = false;
+        //
+        // ...UNLESS another open transaction still holds pending schema DDL (`rmp` #734). The checkpoint
+        // above deliberately did NOT persist that DDL (`committed_statistics`), so the catalog still has
+        // un-persisted schema state and the flag must stay set — otherwise that transaction's own commit
+        // would take the #529 fast path and silently drop its committed DDL, which is precisely the
+        // silent-drop `rmp` #534 was written to prevent, arriving through the commit path instead of the
+        // rollback path.
+        self.catalog_dirty = self.open_txn_holds_pending_ddl();
         // Remember this commit record's LSN until a GC freeze settles `txn`'s versions: WAL
         // reclamation must keep it readable so a crash can still resolve an unfrozen in-flight stamp
         // (`rmp` #114 / the lazy freeze of #49/#59). This only ever LOWERS the reclaim floor, and reclaim
@@ -2805,6 +2883,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             freed_ids: aborted_freed_ids,
             popped_ids: aborted_popped_ids,
             popped_prop_owners: aborted_prop_owners,
+            schema_undo: aborted_schema_undo,
             ..
         } = self.active.remove(&txn).unwrap_or_default();
         // Snapshot the in-memory free lists BEFORE the catalog reload (`rmp` #578). The free list has
@@ -2890,7 +2969,16 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // is the whole story (a lone transaction's own DDL is correctly discarded), so the common
         // single-writer path clones NOTHING and is byte-identical to the pre-#534 behaviour. The counts
         // this also clones are discarded — `adopt_schema_from` moves only the schema half.
-        let pre_statistics = (!self.active.is_empty()).then(|| self.statistics.clone());
+        // Also snapshot when THIS transaction holds catalog DDL of its own, even with no concurrent
+        // transaction open (`rmp` #734). The tempting shortcut — "alone ⇒ the reload discards exactly
+        // my DDL" — is FALSE: a concurrent transaction that committed and has since resolved may have
+        // checkpointed this transaction's still-pending DDL into the durable image on its way out, in
+        // which case `reload_catalog` restores that DDL rather than discarding it, and the undo below
+        // is the only thing that removes it. (`committed_statistics` stops new checkpoints from
+        // capturing pending DDL; this keeps the rollback correct regardless.) A transaction with no
+        // catalog DDL and no concurrent transaction still clones nothing — the common path is unchanged.
+        let pre_statistics = (!self.active.is_empty() || !aborted_schema_undo.is_empty())
+            .then(|| self.statistics.clone());
         // `rmp` #337, Slice 1: drive the WAL rollback with a *recording* target that captures the
         // compensating page images WITHOUT touching the pool while the WAL lock is held, then replay
         // them into the pool AFTER the lock is released. This breaks the eviction-during-rollback
@@ -2942,21 +3030,49 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // stay at the durable image (`adopt_schema_from` moves only the schema half), correctly
         // discarding this aborting transaction's create/delete increments.
         //
-        // A *rolling-back* transaction's OWN pending DDL is deliberately NOT preserved: with no
-        // concurrent transaction `pre_statistics` is `None`, so the durable revert stands and the own
-        // DDL is discarded (rollback atomicity — the `rolled_back_index_declaration_is_discarded` /
-        // `rolled_back_histogram_change_is_discarded` guards). Discarding a rolling-back transaction's
-        // own DDL while preserving a concurrent one's, when BOTH could be pending, needs per-transaction
-        // catalog undo (approach (b), `rmp` #734) — not reachable today because catalog DDL runs ONLY as
-        // a yield-free auto-commit transaction (the coordinator's `begin` -> `set_*` -> `commit` with no
-        // engine yield between the mutation and the commit), so the schema NEVER diverges at an
-        // engine-reachable rollback and this whole block is a no-op there; it activates only for a future
-        // yielding-DDL path (and the direct-store-API regression test that models one).
-        if let Some(pre_statistics) = pre_statistics
-            && !self.statistics.schema_eq(&pre_statistics)
-        {
-            self.statistics.adopt_schema_from(pre_statistics);
-            self.catalog_dirty = true;
+        // A *rolling-back* transaction's OWN pending DDL is removed from that restored image first
+        // (`rmp` #734): `apply_schema_undo` walks this transaction's per-entry undo log newest-first,
+        // reverting each entry it still owns to the value that entry held before it touched it. What
+        // survives into `adopt_schema_from` is therefore the in-memory schema MINUS this transaction's
+        // own DDL — every other open transaction's pending DDL, and nothing else.
+        //
+        // Before #734 the two halves could not be separated: the whole in-memory schema was preserved
+        // whenever any unrelated transaction was open, so a rolling-back transaction's own DDL survived
+        // its rollback (in memory and, via the next commit's `checkpoint_meta`, durably). The face of it
+        // was worse than "rollback does not undo": it was NON-DETERMINISTIC, because whether the DDL was
+        // discarded depended only on whether some unrelated transaction happened to be open. The comment
+        // that used to stand here argued the case was unreachable, on the grounds that catalog DDL runs
+        // ONLY as a yield-free auto-commit transaction. THAT PRECONDITION IS FALSE: `rmp` #572's
+        // `db.resampleIndex` was the first procedure to mutate the catalog from inside a caller's
+        // explicit transaction, and it reproduced exactly this. #572 then moved its own resample into a
+        // private auto-commit transaction (independently correct — Neo4j schedules a background job that
+        // ignores the caller's transaction), which stopped that one procedure from standing on the hole
+        // without closing it. It is closed here, for every catalog mutator, reachable or not.
+        //
+        // With no concurrent transaction `pre_statistics` is `None` and the durable revert alone is the
+        // whole story: the in-memory schema is the durable image plus this transaction's own pending DDL,
+        // so reloading discards precisely that (the `rolled_back_index_declaration_is_discarded` /
+        // `rolled_back_histogram_change_is_discarded` guards) and the undo log has nothing to add.
+        if let Some(mut pre_statistics) = pre_statistics {
+            // Borrowed in place, never moved out: a `mem::take` here would leave the witness map
+            // empty if anything between the take and the restore ever unwound. `active` is borrowed
+            // alongside it so a declined mutation can be spliced out of the chains the transactions
+            // still open are holding — see `apply_schema_undo`.
+            let Self {
+                active,
+                schema_last_seq,
+                ..
+            } = self;
+            Self::apply_schema_undo(
+                &mut pre_statistics,
+                schema_last_seq,
+                active,
+                &aborted_schema_undo,
+            );
+            if !self.statistics.schema_eq(&pre_statistics) {
+                self.statistics.adopt_schema_from(pre_statistics);
+                self.catalog_dirty = true;
+            }
         }
         if pre_element_next > self.element_ids.peek() {
             self.element_ids = ElementIdAllocator::new(pre_element_next);
@@ -5227,30 +5343,288 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.statistics.property_histogram(label_token, prop_token)
     }
 
+    // ---- Schema-catalog DDL: the per-transaction undo seam (`rmp` #734) --------------------------
+    //
+    // EVERY catalog mutator below routes its mutation through `with_schema_undo` and takes the
+    // owning `txn` — the same shape as every other mutating store API (`set_node_labels`,
+    // `set_node_property_value`, ...). Passing the transaction is not bookkeeping ceremony: catalog
+    // DDL is the one class of mutation the WAL does not log, so the undo log recorded here is the
+    // ONLY thing that can roll it back. A mutator that skipped this seam would be silently
+    // un-rollbackable.
+
+    /// Applies one schema-catalog mutation on behalf of `txn`, recording the per-entry undo that lets
+    /// a later rollback discard **exactly this transaction's** change (`rmp` #734).
+    ///
+    /// `keys` must list every schema-catalog entry `apply` can touch, without repeats. Most mutators
+    /// touch one; the index-name setters touch two (they clear any prior name for the same target to
+    /// preserve the one-name-per-target invariant). Over-listing a key is harmless — an untouched entry
+    /// records `prev` equal to what it already holds, so its undo restores the same value.
+    ///
+    /// # Panics
+    ///
+    /// In debug builds, panics if the recorded undo is not a faithful inverse of `apply` — i.e. if
+    /// `apply` changed a schema-catalog entry that `keys` did not list, or one whose map is missing
+    /// from the `schema_catalog_table!` in [`meta`](crate::meta). This is the backstop that keeps the
+    /// undo log complete as new catalog mutators are added; it is the reason an omission surfaces as a
+    /// failing test rather than as a silently un-undoable DDL.
+    fn with_schema_undo<F>(&mut self, txn: TxnId, keys: &[SchemaKey], apply: F)
+    where
+        F: FnOnce(&mut Statistics),
+    {
+        // The undo is only ever consulted for a transaction that is still open — `rollback` reads it
+        // out of the active-set entry. A mutator called with a transaction that never began (or has
+        // already resolved) would therefore record an undo nobody can replay, leaving its DDL
+        // un-rollbackable: exactly the #734 defect, reintroduced one call site at a time. Catch a
+        // mis-threaded `txn` at the source. (`is_txn_active` is the live-writer predicate — active-set
+        // membership; the commit registry only gains an entry once a transaction *resolves*.)
+        debug_assert!(
+            self.is_txn_active(txn),
+            "catalog DDL for {txn:?}, which is not an open transaction: its undo could never be replayed"
+        );
+        debug_assert!(
+            keys.iter().enumerate().all(|(i, k)| !keys[..i].contains(k)),
+            "with_schema_undo: duplicate key in {keys:?} — each entry must be listed once so its \
+             generation chain unwinds exactly one link per replay step"
+        );
+
+        #[cfg(debug_assertions)]
+        let before = self.statistics.clone();
+        #[cfg(debug_assertions)]
+        let before_seq = self.schema_last_seq.clone();
+
+        let prevs: Vec<(Option<SchemaValue>, u64)> = keys
+            .iter()
+            .map(|k| {
+                (
+                    self.statistics.schema_get(k),
+                    self.schema_last_seq.get(k).copied().unwrap_or(0),
+                )
+            })
+            .collect();
+        apply(&mut self.statistics);
+        let entries: Vec<SchemaUndo> = keys
+            .iter()
+            .zip(prevs)
+            .map(|(key, (prev, prev_seq))| {
+                self.schema_seq += 1;
+                self.schema_last_seq.insert(key.clone(), self.schema_seq);
+                SchemaUndo {
+                    seq: self.schema_seq,
+                    prev_seq,
+                    key: key.clone(),
+                    prev,
+                }
+            })
+            .collect();
+
+        // Faithful-inverse check: replaying the undo we just recorded, against the state the mutation
+        // just produced, must reproduce the pre-mutation schema AND the pre-mutation generations
+        // exactly. Checking the generations too is what catches a mutator that touches an entry `keys`
+        // did not list: such an entry keeps its stale generation, and the comparison fails.
+        #[cfg(debug_assertions)]
+        {
+            let mut probe = self.statistics.clone();
+            let mut probe_seq = self.schema_last_seq.clone();
+            // Every entry just recorded IS its own entry's last writer, so all of them fire and the
+            // splice target is never touched — a scratch map keeps the real logs out of the probe.
+            let mut probe_live = HashMap::new();
+            Self::apply_schema_undo(&mut probe, &mut probe_seq, &mut probe_live, &entries);
+            debug_assert!(
+                probe.schema_eq(&before) && probe_seq == before_seq,
+                "catalog undo over {keys:?} is not a faithful inverse of the mutation"
+            );
+        }
+
+        // Deliberately NOT `self.active.entry(txn).or_default()`: inserting an entry here would make
+        // an unbegun transaction look *open* to `is_txn_active` and to the active-set emptiness checks,
+        // and — since nothing will ever commit or roll it back — its phantom entry would suppress the
+        // catalog checkpoint forever (`committed_statistics`). Recording nothing is the lesser failure,
+        // and the debug assertion above turns any such call site into a failing test.
+        if let Some(active) = self.active.get_mut(&txn) {
+            active.schema_undo.extend(entries);
+        }
+        self.catalog_dirty = true;
+    }
+
+    /// Rolls back a transaction's catalog undo log into `stats` (and its generations into `last_seq`),
+    /// newest-first, splicing any declined mutation out of the predecessor chains still held by the
+    /// transactions in `live` (`rmp` #734).
+    ///
+    /// Newest-first is what makes repeated writes to one entry collapse correctly: each step restores
+    /// the value the step before it observed, walking the entry back to what it held before this
+    /// transaction touched it at all.
+    ///
+    /// # Why the splice is not optional
+    ///
+    /// The undo log is a **chain**: every entry names the generation it superseded, and restoring
+    /// means "put back what my predecessor left". Aborts do not have to arrive newest-first. When an
+    /// older writer aborts while a newer one is still open, its entry correctly declines — it is no
+    /// longer the last writer — but the newer writer's entry still names it as its predecessor. Undo
+    /// that link later and the newer writer restores a value written **only** by the transaction that
+    /// already aborted: both transactions rolled back, yet a value neither of them committed is live,
+    /// and the next checkpoint publishes it. Splicing on the declined branch keeps every live chain
+    /// rooted in a value that was actually committed. (Same idiom as the `rmp` #220/#172 chain-head
+    /// logical undo, and the same defect family as the `rmp` #239 non-LIFO prepender abort.)
+    ///
+    /// The splice only ever runs on the declined branch: an entry that FIRES was the entry's last
+    /// writer, so by definition no live successor names it.
+    fn apply_schema_undo(
+        stats: &mut Statistics,
+        last_seq: &mut HashMap<SchemaKey, u64>,
+        live: &mut HashMap<TxnId, ActiveTxn>,
+        undo: &[SchemaUndo],
+    ) {
+        // One transaction's log is appended in ascending `seq`, so reverse iteration IS descending
+        // global order — no sort needed here (`committed_statistics` merges several logs and does).
+        // Descending order is also what makes the splice cascade: a chain of this transaction's own
+        // writes is unwound link by link, each decline re-pointing the live successors one step older.
+        for entry in undo.iter().rev() {
+            if !Self::undo_schema_entry(stats, last_seq, entry) {
+                Self::splice_schema_predecessor(live, entry);
+            }
+        }
+    }
+
+    /// Removes `dead` from the predecessor chain of every still-live undo entry, so no future rollback
+    /// can restore the value `dead`'s transaction wrote (`rmp` #734).
+    ///
+    /// A successor inherits `dead`'s own predecessor link, which is by construction a state `dead`
+    /// itself observed — so the chain stays rooted wherever it was rooted before `dead` joined it.
+    fn splice_schema_predecessor(live: &mut HashMap<TxnId, ActiveTxn>, dead: &SchemaUndo) {
+        for active in live.values_mut() {
+            for successor in &mut active.schema_undo {
+                if successor.prev_seq == dead.seq {
+                    // Generations are globally unique and each belongs to exactly one entry, so
+                    // naming `dead`'s generation already implies naming `dead`'s key.
+                    debug_assert_eq!(
+                        successor.key, dead.key,
+                        "generation {} is claimed as predecessor by a different catalog entry",
+                        dead.seq
+                    );
+                    successor.prev.clone_from(&dead.prev);
+                    successor.prev_seq = dead.prev_seq;
+                }
+            }
+        }
+    }
+
+    /// Restores one [`SchemaUndo`] entry, **iff** its transaction is still the entry's last writer
+    /// (`rmp` #734). Returns whether it fired. The single guarded step both undo paths are built from.
+    ///
+    /// The guard compares **generations**, not values. An entry some other transaction has written
+    /// since is left alone — this transaction's write is already gone, and restoring over the newer
+    /// value would discard DDL belonging to someone else. Comparing the stored value instead would miss
+    /// exactly the case where that other transaction happened to write the *same* value, silently
+    /// reverting its still-pending write.
+    fn undo_schema_entry(
+        stats: &mut Statistics,
+        last_seq: &mut HashMap<SchemaKey, u64>,
+        entry: &SchemaUndo,
+    ) -> bool {
+        if last_seq.get(&entry.key).copied().unwrap_or(0) != entry.seq {
+            return false;
+        }
+        stats.schema_put(&entry.key, entry.prev.clone());
+        if entry.prev_seq == 0 {
+            last_seq.remove(&entry.key);
+        } else {
+            last_seq.insert(entry.key.clone(), entry.prev_seq);
+        }
+        true
+    }
+
+    /// The **committed** catalog image: the live [`Statistics`] with every still-open transaction's
+    /// pending schema DDL undone (`rmp` #734).
+    ///
+    /// This is what a checkpoint must persist. The live `Statistics` is shared by every transaction,
+    /// so it also holds the *uncommitted* DDL of whatever transactions happen to be open — and
+    /// persisting that would publish an in-flight schema change as though it had committed. The
+    /// failure is not hypothetical: a crash while such a transaction is open recovers a schema object
+    /// nobody committed, and a crash **after** that transaction rolled back resurrects the very DDL the
+    /// rollback discarded (the in-memory undo is correct, but the durable image predates it). Both are
+    /// atomicity breaches for catalog DDL, and both are the reason a checkpoint may not simply clone
+    /// the live image.
+    ///
+    /// Only the *schema* half is stripped. Tokens and the live-record counts are deliberately left as
+    /// they are: tokens are append-only and monotonic, so persisting an as-yet-unused one is the
+    /// documented `rmp` #220/#172 superset stance, and the counts ride the existing
+    /// checkpoint-at-commit contract unchanged.
+    ///
+    /// Costs nothing in the ordinary case: with no open transaction holding DDL — which is every
+    /// workload that is not interleaving schema changes — this is exactly the clone it always was.
+    fn committed_statistics(&self) -> Statistics {
+        if self.active.values().all(|a| a.schema_undo.is_empty()) {
+            return self.statistics.clone();
+        }
+        // Merge every open transaction's undo log and replay it in reverse GLOBAL order. Sorting by
+        // the store-global `seq` is also what makes the result deterministic: `active` is a HashMap,
+        // so its iteration order is not stable, but `seq` is unique and totally ordered.
+        let mut pending: Vec<&SchemaUndo> = self
+            .active
+            .values()
+            .flat_map(|a| a.schema_undo.iter())
+            .collect();
+        pending.sort_unstable_by_key(|e| std::cmp::Reverse(e.seq));
+        let mut committed = self.statistics.clone();
+        // A scratch copy of the generations: this is a read-only view of the catalog, so the store's
+        // own witness map must survive it untouched.
+        let mut last_seq = self.schema_last_seq.clone();
+        for entry in pending {
+            // No splice here, and none is needed. A decline means some transaction wrote this entry
+            // after `entry` and is not in `pending` — i.e. it COMMITTED, and its log was dropped with
+            // its active-set slot. Its value is therefore the committed one, which is exactly what
+            // declining leaves in place. Every link that is still live is present in `pending` (a
+            // rollback splices out the ones that are not), so live chains unwind here without gaps.
+            Self::undo_schema_entry(&mut committed, &mut last_seq, entry);
+        }
+        committed
+    }
+
+    /// Whether any currently-open transaction still holds pending schema DDL (`rmp` #734) — i.e.
+    /// whether the catalog has in-memory schema state a checkpoint has deliberately NOT persisted.
+    ///
+    /// [`commit`](Self::commit) uses this to decide whether `catalog_dirty` may be cleared: clearing
+    /// it while another transaction's DDL is still unpersisted would let that transaction's own commit
+    /// take the `rmp` #529 read-only fast path and silently drop its committed DDL.
+    fn open_txn_holds_pending_ddl(&self) -> bool {
+        self.active.values().any(|a| !a.schema_undo.is_empty())
+    }
+
     /// Records (or replaces) the opaque value histogram for the node-label property
     /// `(label_token, prop_token)` with `bytes`, stored verbatim (`rmp` task #81).
     ///
     /// The mutation is purely in-memory here. Like the `rmp` task #79 count mutators, it becomes
-    /// **durable when the enclosing transaction commits** (the catalog is checkpointed at commit) and
-    /// is **discarded on rollback** (the catalog is reloaded from the last committed metadata page).
+    /// **durable when `txn` commits** (the catalog is checkpointed at commit) and is **discarded when
+    /// `txn` rolls back** — precisely, leaving any concurrent transaction's pending DDL intact
+    /// (`rmp` #734).
     ///
     /// An empty `bytes` removes any existing entry: a histogram is never zero-length, so an empty
     /// value is meaningless and would not survive the codec round-trip.
-    pub fn set_property_histogram(&mut self, label_token: u32, prop_token: u32, bytes: Vec<u8>) {
-        self.statistics
-            .set_property_histogram(label_token, prop_token, bytes);
-        self.catalog_dirty = true;
+    pub fn set_property_histogram(
+        &mut self,
+        txn: TxnId,
+        label_token: u32,
+        prop_token: u32,
+        bytes: Vec<u8>,
+    ) {
+        self.with_schema_undo(
+            txn,
+            &[SchemaKey::NodePropHistogram((label_token, prop_token))],
+            |s| s.set_property_histogram(label_token, prop_token, bytes),
+        );
     }
 
     /// Removes the durable value histogram for the node-label property `(label_token, prop_token)`,
     /// if present (`rmp` task #81). Removing an absent entry is a harmless no-op.
     ///
     /// Like [`set_property_histogram`](Self::set_property_histogram), the removal is in-memory and
-    /// becomes durable at the enclosing transaction's commit, and is discarded on rollback.
-    pub fn remove_property_histogram(&mut self, label_token: u32, prop_token: u32) {
-        self.statistics
-            .remove_property_histogram(label_token, prop_token);
-        self.catalog_dirty = true;
+    /// becomes durable at `txn`'s commit, and is discarded on `txn`'s rollback.
+    pub fn remove_property_histogram(&mut self, txn: TxnId, label_token: u32, prop_token: u32) {
+        self.with_schema_undo(
+            txn,
+            &[SchemaKey::NodePropHistogram((label_token, prop_token))],
+            |s| s.remove_property_histogram(label_token, prop_token),
+        );
     }
 
     /// Lists every declared node-property index as `(label_token, prop_token, state)` from the durable
@@ -5281,29 +5655,34 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// durable catalog (`rmp` task #90).
     ///
     /// The mutation is purely in-memory here. Like the `rmp` task #79 count mutators and the
-    /// `rmp` task #81 histogram mutators, it becomes **durable when the enclosing transaction commits**
-    /// (the catalog is checkpointed at commit) and is **discarded on rollback** (the catalog is
-    /// reloaded from the last committed metadata page). Re-recording an existing key flips its state.
+    /// `rmp` task #81 histogram mutators, it becomes **durable when `txn` commits** (the catalog is
+    /// checkpointed at commit) and is **discarded when `txn` rolls back** (`rmp` #734). Re-recording an
+    /// existing key flips its state.
     pub fn set_node_property_index(
         &mut self,
+        txn: TxnId,
         label_token: u32,
         prop_token: u32,
         state: IndexState,
     ) {
-        self.statistics
-            .set_node_property_index(label_token, prop_token, state);
-        self.catalog_dirty = true;
+        self.with_schema_undo(
+            txn,
+            &[SchemaKey::NodePropertyIndex((label_token, prop_token))],
+            |s| s.set_node_property_index(label_token, prop_token, state),
+        );
     }
 
     /// Removes the node-property index on `(label_token, prop_token)` from the durable catalog, if
     /// declared (`rmp` task #90). Removing an absent entry is a harmless no-op.
     ///
     /// Like [`set_node_property_index`](Self::set_node_property_index), the removal is in-memory and
-    /// becomes durable at the enclosing transaction's commit, and is discarded on rollback.
-    pub fn remove_node_property_index(&mut self, label_token: u32, prop_token: u32) {
-        self.statistics
-            .remove_node_property_index(label_token, prop_token);
-        self.catalog_dirty = true;
+    /// becomes durable at `txn`'s commit, and is discarded on `txn`'s rollback.
+    pub fn remove_node_property_index(&mut self, txn: TxnId, label_token: u32, prop_token: u32) {
+        self.with_schema_undo(
+            txn,
+            &[SchemaKey::NodePropertyIndex((label_token, prop_token))],
+            |s| s.remove_node_property_index(label_token, prop_token),
+        );
     }
 
     /// The `(label_token, prop_token)` a named node-property index covers, or [`None`] if no index of
@@ -5329,34 +5708,68 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     }
 
     /// Records (or replaces) the name of the node-property index on `(label_token, prop_token)` in the
-    /// durable catalog (`rmp` task #623). In-memory here; durable at the enclosing transaction's
-    /// commit, discarded on rollback (like [`set_node_property_index`](Self::set_node_property_index)).
+    /// durable catalog (`rmp` task #623). In-memory here; durable at `txn`'s commit, discarded on
+    /// `txn`'s rollback (like [`set_node_property_index`](Self::set_node_property_index)).
     /// Global name uniqueness is the Cypher layer's responsibility, enforced before this is called.
     pub fn set_node_property_index_name(
         &mut self,
+        txn: TxnId,
         name: String,
         label_token: u32,
         prop_token: u32,
     ) {
-        self.statistics
-            .set_node_property_index_name(name, label_token, prop_token);
-        self.catalog_dirty = true;
+        // TWO entries: the name being recorded, and any name already mapping to this target — which
+        // the one-name-per-target invariant makes this setter clear. Both must be undoable, or a
+        // rollback would leave the displaced name lost.
+        let mut keys = vec![SchemaKey::NodePropertyIndexName(name.clone())];
+        // Skip when the target already carries exactly this name: the setter then removes and
+        // reinserts the same entry, and listing the key twice would make the generation chain need two
+        // replay steps where the undo does one.
+        if let Some(displaced) = self
+            .statistics
+            .node_property_index_name_for(label_token, prop_token)
+            .filter(|d| *d != name)
+        {
+            keys.push(SchemaKey::NodePropertyIndexName(displaced.to_owned()));
+        }
+        self.with_schema_undo(txn, &keys, |s| {
+            s.set_node_property_index_name(name, label_token, prop_token);
+        });
     }
 
     /// Removes the name entry `name` from the durable catalog, if present (`rmp` task #623) — the
-    /// durable half of `DROP INDEX <name>`. In-memory here; durable at commit, discarded on rollback.
-    pub fn remove_node_property_index_name(&mut self, name: &str) {
-        self.statistics.remove_node_property_index_name(name);
-        self.catalog_dirty = true;
+    /// durable half of `DROP INDEX <name>`. In-memory here; durable at `txn`'s commit, discarded on
+    /// `txn`'s rollback.
+    pub fn remove_node_property_index_name(&mut self, txn: TxnId, name: &str) {
+        self.with_schema_undo(
+            txn,
+            &[SchemaKey::NodePropertyIndexName(name.to_owned())],
+            |s| s.remove_node_property_index_name(name),
+        );
     }
 
     /// Removes whatever name maps to `(label_token, prop_token)`, if any (`rmp` task #623) — used by the
     /// by-target `DROP INDEX FOR (n:L) ON (n.p)` shape so the name is cleared alongside the index. A
-    /// no-op for a nameless (legacy) index. In-memory here; durable at commit, discarded on rollback.
-    pub fn remove_node_property_index_name_for(&mut self, label_token: u32, prop_token: u32) {
-        self.statistics
-            .remove_node_property_index_name_for(label_token, prop_token);
-        self.catalog_dirty = true;
+    /// no-op for a nameless (legacy) index. In-memory here; durable at `txn`'s commit, discarded on
+    /// `txn`'s rollback.
+    pub fn remove_node_property_index_name_for(
+        &mut self,
+        txn: TxnId,
+        label_token: u32,
+        prop_token: u32,
+    ) {
+        // Resolve the target's name first: the undo log is keyed by name, and after the removal there
+        // is nothing left to resolve. Nameless target -> nothing to remove and nothing to undo.
+        let Some(name) = self
+            .statistics
+            .node_property_index_name_for(label_token, prop_token)
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        self.with_schema_undo(txn, &[SchemaKey::NodePropertyIndexName(name)], |s| {
+            s.remove_node_property_index_name_for(label_token, prop_token);
+        });
     }
 
     /// Lists every named node-property index as `(name, label_token, prop_token)` from the durable
@@ -5388,20 +5801,31 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     }
 
     /// Declares (or updates the state of) the relationship-property index on `(type_token, prop_token)`
-    /// in the durable catalog (`rmp` task #646). In-memory here; durable at commit, discarded on
-    /// rollback.
-    pub fn set_rel_property_index(&mut self, type_token: u32, prop_token: u32, state: IndexState) {
-        self.statistics
-            .set_rel_property_index(type_token, prop_token, state);
-        self.catalog_dirty = true;
+    /// in the durable catalog (`rmp` task #646). In-memory here; durable at `txn`'s commit, discarded
+    /// on `txn`'s rollback.
+    pub fn set_rel_property_index(
+        &mut self,
+        txn: TxnId,
+        type_token: u32,
+        prop_token: u32,
+        state: IndexState,
+    ) {
+        self.with_schema_undo(
+            txn,
+            &[SchemaKey::RelPropertyIndex((type_token, prop_token))],
+            |s| s.set_rel_property_index(type_token, prop_token, state),
+        );
     }
 
     /// Removes the relationship-property index on `(type_token, prop_token)` from the durable catalog,
-    /// if declared (`rmp` task #646). In-memory here; durable at commit, discarded on rollback.
-    pub fn remove_rel_property_index(&mut self, type_token: u32, prop_token: u32) {
-        self.statistics
-            .remove_rel_property_index(type_token, prop_token);
-        self.catalog_dirty = true;
+    /// if declared (`rmp` task #646). In-memory here; durable at `txn`'s commit, discarded on `txn`'s
+    /// rollback.
+    pub fn remove_rel_property_index(&mut self, txn: TxnId, type_token: u32, prop_token: u32) {
+        self.with_schema_undo(
+            txn,
+            &[SchemaKey::RelPropertyIndex((type_token, prop_token))],
+            |s| s.remove_rel_property_index(type_token, prop_token),
+        );
     }
 
     /// The `(type_token, prop_token)` a named relationship-property index covers, or [`None`] if no
@@ -5423,28 +5847,64 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     }
 
     /// Records (or replaces) the name of the relationship-property index on `(type_token, prop_token)`
-    /// in the durable catalog (`rmp` task #646). In-memory here; durable at commit, discarded on
-    /// rollback. Global name uniqueness is the Cypher layer's responsibility, enforced before this call.
-    pub fn set_rel_property_index_name(&mut self, name: String, type_token: u32, prop_token: u32) {
-        self.statistics
-            .set_rel_property_index_name(name, type_token, prop_token);
-        self.catalog_dirty = true;
+    /// in the durable catalog (`rmp` task #646). In-memory here; durable at `txn`'s commit, discarded
+    /// on `txn`'s rollback. Global name uniqueness is the Cypher layer's responsibility, enforced
+    /// before this call.
+    pub fn set_rel_property_index_name(
+        &mut self,
+        txn: TxnId,
+        name: String,
+        type_token: u32,
+        prop_token: u32,
+    ) {
+        // Two entries, exactly as in the node twin: the new name plus any name this setter displaces
+        // to keep one name per target.
+        let mut keys = vec![SchemaKey::RelPropertyIndexName(name.clone())];
+        // Skip when the target already carries exactly this name: the setter then removes and
+        // reinserts the same entry, and listing the key twice would make the generation chain need two
+        // replay steps where the undo does one.
+        if let Some(displaced) = self
+            .statistics
+            .rel_property_index_name_for(type_token, prop_token)
+            .filter(|d| *d != name)
+        {
+            keys.push(SchemaKey::RelPropertyIndexName(displaced.to_owned()));
+        }
+        self.with_schema_undo(txn, &keys, |s| {
+            s.set_rel_property_index_name(name, type_token, prop_token);
+        });
     }
 
     /// Removes the name entry `name` from the durable catalog, if present (`rmp` task #646) — the
-    /// durable half of `DROP INDEX <name>`. In-memory here; durable at commit, discarded on rollback.
-    pub fn remove_rel_property_index_name(&mut self, name: &str) {
-        self.statistics.remove_rel_property_index_name(name);
-        self.catalog_dirty = true;
+    /// durable half of `DROP INDEX <name>`. In-memory here; durable at `txn`'s commit, discarded on
+    /// `txn`'s rollback.
+    pub fn remove_rel_property_index_name(&mut self, txn: TxnId, name: &str) {
+        self.with_schema_undo(
+            txn,
+            &[SchemaKey::RelPropertyIndexName(name.to_owned())],
+            |s| s.remove_rel_property_index_name(name),
+        );
     }
 
     /// Removes whatever name maps to `(type_token, prop_token)`, if any (`rmp` task #646) — used by the
     /// by-target `DROP INDEX FOR ()-[r:T]-() ON (r.p)` shape so the name is cleared alongside the index.
-    /// In-memory here; durable at commit, discarded on rollback.
-    pub fn remove_rel_property_index_name_for(&mut self, type_token: u32, prop_token: u32) {
-        self.statistics
-            .remove_rel_property_index_name_for(type_token, prop_token);
-        self.catalog_dirty = true;
+    /// In-memory here; durable at `txn`'s commit, discarded on `txn`'s rollback.
+    pub fn remove_rel_property_index_name_for(
+        &mut self,
+        txn: TxnId,
+        type_token: u32,
+        prop_token: u32,
+    ) {
+        let Some(name) = self
+            .statistics
+            .rel_property_index_name_for(type_token, prop_token)
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        self.with_schema_undo(txn, &[SchemaKey::RelPropertyIndexName(name)], |s| {
+            s.remove_rel_property_index_name_for(type_token, prop_token);
+        });
     }
 
     /// Lists every named relationship-property index as `(name, type_token, prop_token)` from the
@@ -5479,17 +5939,19 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// **durable when the enclosing transaction commits** (the catalog is checkpointed at commit) and
     /// is **discarded on rollback** (the catalog is reloaded from the last committed metadata page).
     /// Re-recording an existing name overwrites the entry (e.g. to flip its state).
-    pub fn set_fulltext_index(&mut self, name: String, entry: FulltextIndexEntry) {
-        self.statistics.set_fulltext_index(name, entry);
-        self.catalog_dirty = true;
+    pub fn set_fulltext_index(&mut self, txn: TxnId, name: String, entry: FulltextIndexEntry) {
+        self.with_schema_undo(txn, &[SchemaKey::FulltextIndex(name.clone())], |s| {
+            s.set_fulltext_index(name, entry);
+        });
     }
 
     /// Removes the full-text index named `name` from the durable catalog, if declared (`rmp` task
     /// #72). Removing an absent entry is a harmless no-op. Durable at the enclosing transaction's
     /// commit, discarded on rollback.
-    pub fn remove_fulltext_index(&mut self, name: &str) {
-        self.statistics.remove_fulltext_index(name);
-        self.catalog_dirty = true;
+    pub fn remove_fulltext_index(&mut self, txn: TxnId, name: &str) {
+        self.with_schema_undo(txn, &[SchemaKey::FulltextIndex(name.to_owned())], |s| {
+            s.remove_fulltext_index(name);
+        });
     }
 
     /// The durable spatial (point) index entry named `name`, or [`None`] if no such index is declared
@@ -5515,17 +5977,19 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// **durable when the enclosing transaction commits** (the catalog is checkpointed at commit) and
     /// is **discarded on rollback** (the catalog is reloaded from the last committed metadata page).
     /// Re-recording an existing name overwrites the entry (e.g. to flip its state).
-    pub fn set_spatial_index(&mut self, name: String, entry: SpatialIndexEntry) {
-        self.statistics.set_spatial_index(name, entry);
-        self.catalog_dirty = true;
+    pub fn set_spatial_index(&mut self, txn: TxnId, name: String, entry: SpatialIndexEntry) {
+        self.with_schema_undo(txn, &[SchemaKey::SpatialIndex(name.clone())], |s| {
+            s.set_spatial_index(name, entry);
+        });
     }
 
     /// Removes the spatial index named `name` from the durable catalog, if declared (`rmp` task #98).
     /// Removing an absent entry is a harmless no-op. Durable at the enclosing transaction's commit,
     /// discarded on rollback.
-    pub fn remove_spatial_index(&mut self, name: &str) {
-        self.statistics.remove_spatial_index(name);
-        self.catalog_dirty = true;
+    pub fn remove_spatial_index(&mut self, txn: TxnId, name: &str) {
+        self.with_schema_undo(txn, &[SchemaKey::SpatialIndex(name.to_owned())], |s| {
+            s.remove_spatial_index(name);
+        });
     }
 
     /// The durable composite (multi-property) node index entry named `name`, or [`None`] if no such
@@ -5566,17 +6030,19 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// the enclosing transaction commits** (the catalog is checkpointed at commit) and is **discarded
     /// on rollback** (the catalog is reloaded from the last committed metadata page). Re-recording an
     /// existing name overwrites the entry (e.g. to flip its state).
-    pub fn set_composite_index(&mut self, name: String, entry: CompositeIndexEntry) {
-        self.statistics.set_composite_index(name, entry);
-        self.catalog_dirty = true;
+    pub fn set_composite_index(&mut self, txn: TxnId, name: String, entry: CompositeIndexEntry) {
+        self.with_schema_undo(txn, &[SchemaKey::CompositeIndex(name.clone())], |s| {
+            s.set_composite_index(name, entry);
+        });
     }
 
     /// Removes the composite index named `name` from the durable catalog, if declared (`rmp` task
     /// #657). Removing an absent entry is a harmless no-op. Durable at the enclosing transaction's
     /// commit, discarded on rollback.
-    pub fn remove_composite_index(&mut self, name: &str) {
-        self.statistics.remove_composite_index(name);
-        self.catalog_dirty = true;
+    pub fn remove_composite_index(&mut self, txn: TxnId, name: &str) {
+        self.with_schema_undo(txn, &[SchemaKey::CompositeIndex(name.to_owned())], |s| {
+            s.remove_composite_index(name);
+        });
     }
 
     /// The durable composite (multi-property) **relationship** index entry named `name`, or [`None`] if
@@ -5613,17 +6079,24 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Declares (or replaces) the composite relationship index named `name` in the durable catalog
     /// (`rmp` task #666). Purely in-memory here; becomes **durable when the enclosing transaction
     /// commits** and is **discarded on rollback**, exactly like [`set_composite_index`](Self::set_composite_index).
-    pub fn set_rel_composite_index(&mut self, name: String, entry: RelCompositeIndexEntry) {
-        self.statistics.set_rel_composite_index(name, entry);
-        self.catalog_dirty = true;
+    pub fn set_rel_composite_index(
+        &mut self,
+        txn: TxnId,
+        name: String,
+        entry: RelCompositeIndexEntry,
+    ) {
+        self.with_schema_undo(txn, &[SchemaKey::RelCompositeIndex(name.clone())], |s| {
+            s.set_rel_composite_index(name, entry);
+        });
     }
 
     /// Removes the composite relationship index named `name` from the durable catalog, if declared
     /// (`rmp` task #666). Removing an absent entry is a harmless no-op. Durable at the enclosing
     /// transaction's commit, discarded on rollback.
-    pub fn remove_rel_composite_index(&mut self, name: &str) {
-        self.statistics.remove_rel_composite_index(name);
-        self.catalog_dirty = true;
+    pub fn remove_rel_composite_index(&mut self, txn: TxnId, name: &str) {
+        self.with_schema_undo(txn, &[SchemaKey::RelCompositeIndex(name.to_owned())], |s| {
+            s.remove_rel_composite_index(name);
+        });
     }
 
     /// The durable text (trigram) node index entry named `name`, or [`None`] if no such index is
@@ -5658,17 +6131,19 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// the enclosing transaction commits** (the catalog is checkpointed at commit) and is **discarded
     /// on rollback** (the catalog is reloaded from the last committed metadata page). Re-recording an
     /// existing name overwrites the entry (e.g. to flip its state).
-    pub fn set_text_index(&mut self, name: String, entry: TextIndexEntry) {
-        self.statistics.set_text_index(name, entry);
-        self.catalog_dirty = true;
+    pub fn set_text_index(&mut self, txn: TxnId, name: String, entry: TextIndexEntry) {
+        self.with_schema_undo(txn, &[SchemaKey::TextIndex(name.clone())], |s| {
+            s.set_text_index(name, entry);
+        });
     }
 
     /// Removes the text index named `name` from the durable catalog, if declared (`rmp` task #662).
     /// Removing an absent entry is a harmless no-op. Durable at the enclosing transaction's commit,
     /// discarded on rollback.
-    pub fn remove_text_index(&mut self, name: &str) {
-        self.statistics.remove_text_index(name);
-        self.catalog_dirty = true;
+    pub fn remove_text_index(&mut self, txn: TxnId, name: &str) {
+        self.with_schema_undo(txn, &[SchemaKey::TextIndex(name.to_owned())], |s| {
+            s.remove_text_index(name);
+        });
     }
 
     /// The durable vector (HNSW) index entry named `name`, or [`None`] if no such index is declared
@@ -5707,17 +6182,19 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Declares (or replaces) the vector index named `name` in the durable catalog (`rmp` task #669).
     /// Purely in-memory here; becomes **durable when the enclosing transaction commits** and is
     /// **discarded on rollback**, exactly like [`set_text_index`](Self::set_text_index).
-    pub fn set_vector_index(&mut self, name: String, entry: VectorIndexEntry) {
-        self.statistics.set_vector_index(name, entry);
-        self.catalog_dirty = true;
+    pub fn set_vector_index(&mut self, txn: TxnId, name: String, entry: VectorIndexEntry) {
+        self.with_schema_undo(txn, &[SchemaKey::VectorIndex(name.clone())], |s| {
+            s.set_vector_index(name, entry);
+        });
     }
 
     /// Removes the vector index named `name` from the durable catalog, if declared (`rmp` task #669).
     /// Removing an absent entry is a harmless no-op. Durable at the enclosing transaction's commit,
     /// discarded on rollback.
-    pub fn remove_vector_index(&mut self, name: &str) {
-        self.statistics.remove_vector_index(name);
-        self.catalog_dirty = true;
+    pub fn remove_vector_index(&mut self, txn: TxnId, name: &str) {
+        self.with_schema_undo(txn, &[SchemaKey::VectorIndex(name.to_owned())], |s| {
+            s.remove_vector_index(name);
+        });
     }
 
     /// The durable constraint entry named `name`, or [`None`] if no such constraint is declared
@@ -5744,17 +6221,19 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// enclosing transaction commits** (the catalog is checkpointed at commit) and is **discarded on
     /// rollback** (the catalog is reloaded from the last committed metadata page). Re-recording an
     /// existing name overwrites the entry.
-    pub fn set_constraint(&mut self, name: String, entry: ConstraintEntry) {
-        self.statistics.set_constraint(name, entry);
-        self.catalog_dirty = true;
+    pub fn set_constraint(&mut self, txn: TxnId, name: String, entry: ConstraintEntry) {
+        self.with_schema_undo(txn, &[SchemaKey::Constraint(name.clone())], |s| {
+            s.set_constraint(name, entry);
+        });
     }
 
     /// Removes the constraint named `name` from the durable catalog, if declared (`rmp` task #99).
     /// Removing an absent entry is a harmless no-op. Durable at the enclosing transaction's commit,
     /// discarded on rollback.
-    pub fn remove_constraint(&mut self, name: &str) {
-        self.statistics.remove_constraint(name);
-        self.catalog_dirty = true;
+    pub fn remove_constraint(&mut self, txn: TxnId, name: &str) {
+        self.with_schema_undo(txn, &[SchemaKey::Constraint(name.to_owned())], |s| {
+            s.remove_constraint(name);
+        });
     }
 
     /// Reads device page `page` through the pool (verifying its checksum), returning its bytes.

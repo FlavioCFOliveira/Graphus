@@ -36,6 +36,7 @@
 //! are deferred (with reasons) — the project forbids claiming coverage it does not have.
 #![forbid(unsafe_code)]
 
+pub mod catalog_rollback_undo;
 pub mod checker;
 pub mod cli;
 pub mod fault;
@@ -61,6 +62,10 @@ pub mod vopr_repro;
 pub mod wire;
 pub mod workload;
 
+pub use catalog_rollback_undo::{
+    AOutcome, BEnding, CatalogRollbackReport, Crash, run_catalog_rollback_undo,
+    run_checkpoint_excludes_pending_ddl, run_multi_holder_out_of_order_abort,
+};
 pub use checker::{CheckFailure, CheckResult, verify};
 pub use cli::{CliConfig, run, summarize};
 pub use fault::{DeferredFault, FaultKind};
