@@ -326,6 +326,89 @@ fn composite_candidate_tuples(
     out
 }
 
+/// The **in-flight** (unresolved) transaction holding the NEWEST version of some `covered` property
+/// key of this entity, if any, given its property `chain` newest-first (from
+/// [`RecordStore::node_properties`](graphus_storage::RecordStore::node_properties) /
+/// [`rel_properties`](graphus_storage::RecordStore::rel_properties)) and the commit `registry`
+/// (`rmp` task #778; reusable for the spatial #779 / vector #780 trees, which share this build shape).
+///
+/// # Why the single-value-per-entity trees need this (option (b), poison-on-build)
+///
+/// Full-text, spatial and vector indexes build **newest-wins**: one term-set / point / embedding per
+/// entity. If such an index is (re)built while the newest version of a covered property is an active
+/// writer's *uncommitted* overwrite, that dirty value is baked and the committed value is indexed
+/// **nowhere** — the #766 loss — and the consumer cannot repair it: `fulltext_query` re-checks a
+/// candidate's visibility + current label but NOT its terms (#773 measured that a version-union there
+/// returns WRONG ROWS). So when this predicate holds the build must **not** promote the index to
+/// `Online`; it stays `Populating`, and every reader declines to the snapshot-correct scan fallback until
+/// the writer commits or aborts. Once it resolves the newest version is either the writer's now-committed
+/// value or (on abort) the restored committed version, and the build rebuilds and promotes cleanly.
+///
+/// # Why not option (a), and what was actually measured
+///
+/// Option (a) — teach `fulltext_query` to re-analyze each candidate's snapshot-visible covered text and
+/// confirm the search terms match — would make a version-union sound, because the extra terms would then
+/// be false positives the consumer drops (exactly how the #773 TEXT/trigram fix works). It is **not**
+/// ruled out on cost: measured on a 4 000-node corpus (`rmp` #778 AC 2), seek + per-candidate re-check
+/// costs 0.04x the scan fallback at 1% candidate selectivity, 0.13x at 10%, 0.52x at 50% and 1.02x in the
+/// degenerate case where every node is a candidate — i.e. it is never materially worse than the scan it
+/// would replace, because the scan already re-analyzes *every* entity while the re-check touches only
+/// candidates. Any earlier claim that option (a) is "prohibitively costly" was never measured and is
+/// contradicted by those numbers.
+///
+/// Option (b) is chosen here on **scope**, not cost: a union would also pollute the forward map that
+/// `fulltext_score` / `fulltext_score_rel` read for relevance, so option (a) is a three-part change
+/// (build union + consumer term re-check + score recomputation) that must additionally be mirrored on the
+/// off-thread reader seam to keep `read_only_graph`'s answers byte-identical to the inline path. Option
+/// (b) is contained entirely in the build drivers and costs only DDL liveness — an index covering a
+/// property under uncommitted mutation serves the (correct) scan until that writer resolves.
+///
+/// # Correctness of the stamp resolution
+///
+/// A raw `InFlight(w)` stamp does NOT mean `w` is running: commit stamps settle **lazily**, so a
+/// long-committed version still reads `InFlight(w)` until a GC pass freezes it. The liveness question is
+/// therefore asked of the store's Active Transaction Table via
+/// [`RecordStore::is_txn_active`](graphus_storage::RecordStore::is_txn_active) — deliberately NOT
+/// `CommitRegistry::outcome(w) == TxnOutcome::InFlight`, which is **dead, always false** (the registry
+/// gains an entry only when a transaction *resolves*, and an unknown id maps to `Aborted`). That exact
+/// confusion is `rmp` #522, and re-making it here would have made this whole gate a no-op.
+///
+/// An **aborted** writer's version is orphaned from the chain head on rollback (the `write_chain_head`
+/// CAS undo in `graphus-storage`), so it is never the newest a chain walk returns — the newest is
+/// therefore always either committed or held by a still-active writer, and this predicate is exact for
+/// the #766 overwrite window. (A concurrent *delete* of the newest version — `xmax` in-flight — is a
+/// distinct, narrower window not covered here.)
+fn active_writer_holds_newest_covered(
+    chain: &[(u64, PropRecord)],
+    covered: &[u32],
+    is_active: impl Fn(TxnId) -> bool,
+) -> Option<TxnId> {
+    let held_by_active = |word: u64| match VersionStamp::from_raw(word) {
+        VersionStamp::InFlight(w) if is_active(w) => Some(w),
+        VersionStamp::InFlight(_) | VersionStamp::Committed(_) | VersionStamp::None => None,
+    };
+    covered.iter().find_map(|&key| {
+        // Newest-first: the FIRST occurrence of `key` in the chain is its newest version.
+        chain
+            .iter()
+            .find(|(_, prop)| prop.key == key)
+            .and_then(|(_, prop)| {
+                // BOTH MVCC stamps, because both halves of an uncommitted change hide behind a different
+                // one. `created_ts` catches `SET n.p = …`: the writer PREPENDS a new version, so its
+                // dirty value is the chain head. `expired_ts` catches `REMOVE n.p`: the writer
+                // TOMBSTONES in place WITHOUT prepending (`remove_node_property_value`), so the head is
+                // still the committed record and only its expiry stamp names the writer.
+                //
+                // Checking `created_ts` alone left the removal half of this window open — MEASURED: the
+                // build baked the doomed value, and once the removal committed the index kept matching a
+                // term the entity no longer has. Same unrepairable wrong row, since the consumer
+                // re-checks visibility + label but never terms.
+                held_by_active(prop.mvcc.created_ts)
+                    .or_else(|| held_by_active(prop.mvcc.expired_ts))
+            })
+    })
+}
+
 /// Equivalence guard for the `rmp` #774 merge-sweep: `composite_candidate_tuples` must produce the SAME
 /// candidate SET as the pre-#774 `find`-per-instant construction, for ANY chain — a wrong tuple here is a
 /// dropped candidate, i.e. an admitted committed duplicate on a NODE KEY / REL KEY (`rmp` #683 / #765).
@@ -639,9 +722,9 @@ use graphus_index::{Similarity, VectorIndexError};
 use graphus_io::BlockDevice;
 use graphus_storage::{
     CompositeIndexEntry, ConstraintEntry, ConstraintKind, ConstraintTypeDescriptor, FulltextEntity,
-    FulltextIndexEntry, GcPassReport, IndexState, Namespace, RecordStore, RelCompositeIndexEntry,
-    SpatialEntity, SpatialIndexEntry, StoreReadView, TextIndexEntry, TokenSnapshot, VectorEntity,
-    VectorIndexEntry, VectorSimilarity,
+    FulltextIndexEntry, GcPassReport, IndexState, Namespace, PropRecord, RecordStore,
+    RelCompositeIndexEntry, SpatialEntity, SpatialIndexEntry, StoreReadView, TextIndexEntry,
+    TokenSnapshot, VectorEntity, VectorIndexEntry, VectorSimilarity,
 };
 use graphus_txn::{CommitRegistry, IsolationLevel, LockTable, Snapshot, SsiReadBuffer, SsiTracker};
 use graphus_wal::LogSink;
@@ -864,6 +947,18 @@ struct PendingFulltextBuild {
     /// 100% CPU, re-scanning the store on every iteration. A bounded budget keeps a *transient* fault
     /// self-healing while guaranteeing termination against a permanent one.
     stall: u8,
+    /// The in-flight writers that made this build SKIP a node, accumulated across every chunk (`rmp`
+    /// task #778). Non-empty at completion means the snapshot was not fully indexed, so the build parks
+    /// instead of promoting — see the conflict gate in
+    /// [`advance_fulltext_build`](TxnCoordinator::advance_fulltext_build).
+    ///
+    /// This is drained from [`IndexSet::ft_build_conflict_writers`] after each chunk and accumulated
+    /// **here, on the build**, rather than being read off the shared index set at completion. The shared
+    /// record does not survive an [`IndexSet::clear`], and `clear` is called by every `rebuild_index` —
+    /// which an unrelated `CREATE INDEX` / `CREATE CONSTRAINT` can run at any point between this build's
+    /// chunks. Reading it at completion would therefore let a build that skipped a node in an early chunk
+    /// promote `Online` over that hole, because an interleaved DDL had wiped the evidence.
+    conflict_writers: Vec<TxnId>,
 }
 
 /// One in-progress **non-blocking** spatial (point) index build (`rmp` task #98), the analogue of
@@ -946,7 +1041,17 @@ pub struct IndexBuildProgress {
 pub struct IndexBuildTotals {
     /// Builds currently in flight.
     pub pending: usize,
-    /// Builds currently parked poisoned (`rmp` task #733).
+    /// Builds that exist but are not progressing: parked **poisoned** by a storage fault (`rmp` task
+    /// #733) *or* paused on an in-flight writer's uncommitted value (`rmp` task #778).
+    ///
+    /// Both are counted here because the gauge answers one operator question — "is an index declared but
+    /// not being built?" — and leaving the #778 pause out made an index stuck `Populating` look like an
+    /// idle, healthy engine (`pending == 0`, `parked == 0`). They differ in urgency: a poisoned build
+    /// needs the store fixed, a paused one clears itself when the blocking transaction ends. A paused
+    /// build is deliberately NOT counted by
+    /// [`poisoned_index_builds`](TxnCoordinator::poisoned_index_builds), which drives the poison backoff
+    /// and the `ERROR`-level operator log — a transient write conflict is not a fault and must not
+    /// escalate like one.
     pub parked: usize,
     /// `Σ (snapshot.len() - cursor)` over the **in-flight** builds — entities still to index. Parked
     /// builds are excluded: their remainder is frozen and would otherwise read as work in progress.
@@ -1084,6 +1189,40 @@ pub struct TxnCoordinator<D: BlockDevice, S: LogSink> {
     poisoned_builds: Vec<PendingIndexBuild>,
     /// Poisoned full-text builds — see [`poisoned_builds`](Self#structfield.poisoned_builds).
     poisoned_fulltext_builds: Vec<PendingFulltextBuild>,
+    /// Full-text builds parked because an in-flight writer held the newest version of a covered property
+    /// on a node they had to skip (`rmp` task #778) — each carrying, in its
+    /// [`conflict_writers`](PendingFulltextBuild#structfield.conflict_writers), the transactions whose
+    /// resolution unblocks it. Their index stays `Populating`, so every reader is on the
+    /// snapshot-correct scan until then.
+    ///
+    /// Deliberately NOT [`poisoned_fulltext_builds`](Self#structfield.poisoned_fulltext_builds), for two
+    /// reasons. It is not a *fault*: no storage read failed, nothing is broken, and it must not count
+    /// toward [`poison_events`](Self#structfield.poison_events) (an operator alert for an index that
+    /// silently stopped being built) or burn the poison backoff. And the graveyard's resurrection,
+    /// `retry_poisoned_index_builds`, is driven on the threaded engine only by the idle tick — whose gate
+    /// does not count parked builds (`rmp` #763) — so a build parked there while the engine is otherwise
+    /// idle is never resurrected. This queue is drained by
+    /// [`retry_conflicted_fulltext_builds`](Self::retry_conflicted_fulltext_builds), which
+    /// [`advance_index_builds`](Self::advance_index_builds) — and therefore every command — drives.
+    ///
+    /// Excluded from [`has_pending_index_builds`](Self::has_pending_index_builds), exactly like the
+    /// graveyard: `LocalEngine::drain_index_builds` spins `while has_pending_index_builds()`, so a build
+    /// waiting on a writer that stays open would otherwise spin the engine forever.
+    conflicted_fulltext_builds: Vec<PendingFulltextBuild>,
+    /// Drains still to skip before the next `rmp` #778 conflict-repair attempt, and its current width —
+    /// the exact throttle discipline [`retry_degraded_index_rebuild`](Self::retry_degraded_index_rebuild)
+    /// applies, for a sharper version of the same reason.
+    ///
+    /// The repair is an O(store) `rebuild_index` on the engine thread, driven from the **command** path.
+    /// A #778 conflict is inherently *flapping*: with overlapping write transactions touching a covered
+    /// property, W1 resolves → full rebuild → the rebuild immediately conflicts with the already-open
+    /// W2 → W2 resolves → full rebuild → … Unthrottled that is one whole-store scan per writer
+    /// generation, sustained, on a database whose mandate is extreme write concurrency — and it thrashes
+    /// every full-text index between `Online` and `Populating` while doing it. Backing off costs only
+    /// latency on an index that is correct-but-unaccelerated meanwhile.
+    conflict_retry_skip: u32,
+    /// The current backoff width for [`conflict_retry_skip`](Self#structfield.conflict_retry_skip).
+    conflict_retry_backoff: u32,
     /// Poisoned spatial builds — see [`poisoned_builds`](Self#structfield.poisoned_builds).
     poisoned_spatial_builds: Vec<PendingSpatialBuild>,
     /// How many builds have been poisoned over this coordinator's life (`rmp` task #733, M1) — monotonic.
@@ -1337,6 +1476,9 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             degraded_retry_backoff: 1,
             poisoned_builds: Vec::new(),
             poisoned_fulltext_builds: Vec::new(),
+            conflicted_fulltext_builds: Vec::new(),
+            conflict_retry_skip: 0,
+            conflict_retry_backoff: 1,
             poisoned_spatial_builds: Vec::new(),
             poison_events: 0,
             poison_retry_skip: 0,
@@ -2125,6 +2267,23 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             return;
         }
 
+        // Did the rebuild have to SKIP a full-text entity because an in-flight writer holds the newest
+        // version of a covered property (`rmp` task #778)? Unlike the read fault above this is not a
+        // fault and must not `fail_closed` the whole set — it is a transient write conflict, and every
+        // OTHER index kind refilled above is unaffected (they hold every version, so a re-check drops the
+        // extras). Only the single-value-per-entity full-text trees are holed, and only they are demoted:
+        // `Populating` routes `fulltext_query` / `fulltext_query_rel` to the snapshot-correct scan, which
+        // returns the committed row and not the writer's dirty term.
+        //
+        // The demotion is IN MEMORY only, so the durable catalog still says what it said. That is what
+        // makes the repair automatic: the resurrection re-runs THIS function, whose re-registration pass
+        // restores each index's state from that catalog and then refills it — so an index can only return
+        // to `Online` by being rebuilt with no conflict. The conflict record itself is deliberately NOT
+        // cleared here; `advance_index_builds` reads it to know which writers to wait on.
+        if index.borrow().ft_build_conflict() {
+            index.borrow_mut().demote_fulltext_for_conflict();
+        }
+
         // Reset the cross-snapshot full-text/spatial freshness marker (`rmp` task #467). The rebuild
         // above re-inserted every full-text/spatial posting via the instrumented mutation methods,
         // which raised the transient dirty flag (and, on the recovery/DDL paths, may have to clear a
@@ -2765,21 +2924,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         index: &Rc<RefCell<IndexSet>>,
         id: u64,
     ) {
-        let label_tokens = match store.borrow_mut().node_labels(id) {
-            Ok(tokens) => tokens,
-            Err(_) => {
-                // `rmp` task #733: record the gap instead of hiding it — an entity missing from
-                // the index is a candidate a seek can never resurrect, so the build that drove
-                // this helper must refuse to publish the index (fail closed / stay Populating).
-                Self::note_rebuild_gap(index);
-                return;
-            }
-        };
-        // The node's current string property values, keyed by prop-key (newest-wins per key).
-        let mut string_props: Vec<(u32, String)> = Vec::new();
-        {
-            let chain = match store.borrow_mut().node_property_values(id) {
-                Ok(chain) => chain,
+        // Read the node's labels, the covered full-text keys, its STAMPED property chain (newest-first)
+        // and the commit registry in one shared borrow scope (`node_labels` / `node_properties` are
+        // `&self`, `rmp` #337 Slice 2). The chain carries MVCC stamps (`node_properties`, not
+        // `node_property_values`) because the #778 gate below must resolve the newest version's writer.
+        let (label_tokens, covered, chain) = {
+            let store = store.borrow();
+            let label_tokens = match store.node_labels(id) {
+                Ok(tokens) => tokens,
                 Err(_) => {
                     // `rmp` task #733: record the gap instead of hiding it — an entity missing from
                     // the index is a candidate a seek can never resurrect, so the build that drove
@@ -2788,12 +2940,69 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     return;
                 }
             };
-            for (_pid, key, value) in chain {
-                if string_props.iter().any(|(k, _)| *k == key) {
-                    continue; // newest-wins: keep only the first occurrence of each key.
+            let covered = index
+                .borrow()
+                .fulltext_covered_keys_for_labels(&label_tokens);
+            let chain = match store.node_properties(id) {
+                Ok(chain) => chain,
+                Err(_) => {
+                    Self::note_rebuild_gap(index);
+                    return;
                 }
-                if let graphus_core::Value::String(s) = value {
-                    string_props.push((key, s));
+            };
+            (label_tokens, covered, chain)
+        };
+
+        // Option (b), `rmp` task #778 (poison-on-build). If an in-flight transaction holds the NEWEST
+        // version of a covered property, baking newest-wins would index its uncommitted value and lose
+        // the committed one — the #766 loss the full-text consumer cannot repair (it re-checks
+        // visibility + label but NOT terms). Record the conflict and do NOT bake this node, so the build
+        // stays `Populating` (readers decline to the snapshot-correct scan) until the writer resolves.
+        if let Some(writer) = active_writer_holds_newest_covered(&chain, &covered, |w| {
+            store.borrow().is_txn_active(w)
+        }) {
+            index.borrow_mut().note_ft_build_conflict(writer);
+            return;
+        }
+
+        // The node's current string property values, keyed by prop-key (newest-wins per key).
+        let mut string_props: Vec<(u32, String)> = Vec::new();
+        {
+            let store = store.borrow();
+            // `seen` is tracked SEPARATELY from `string_props`, and both skips below happen BEFORE the
+            // decode. Three distinct correctness points, each measured (`rmp` task #778 audit):
+            //
+            // 1. NEWEST-WINS ACROSS TYPES. Keying "already handled" off `string_props` made the guard
+            //    trip only once a *String* had been pushed, so when the newest version of a key was a
+            //    non-string the loop walked on and indexed an OLDER string version of that same key:
+            //    `SET n.title = 42` over a committed `'alpha'` left the index still matching `'alpha'`.
+            //    A key is settled by its newest version whatever that version's type.
+            // 2. A COMMITTED REMOVAL IS NOT PART OF THE STATE. `node_properties` returns every `in_use`
+            //    record, and a tombstone keeps its slot until GC reclaims it — which has no automatic
+            //    trigger (`rmp` #305) — so a removed property's value stayed indexable indefinitely:
+            //    `REMOVE n.title` committed, then any rebuild re-baked `'alpha'`. A non-zero `expired_ts`
+            //    means this version was removed; the still-in-flight case is already parked by the
+            //    conflict gate above, so reaching here with one set means the remover committed.
+            // 3. FAIL-CLOSED NARROWING. Skipping before the decode means a corrupt SHADOWED or REMOVED
+            //    version no longer raises a `rebuild_gap` (`rmp` task #733). Deliberate: only the newest
+            //    live version reaches the index, so neither can make the index an inexact image of the
+            //    committed store — which is the condition `rebuild_gap` exists to detect.
+            let mut seen: Vec<u32> = Vec::new();
+            for (_pid, prop) in &chain {
+                if seen.contains(&prop.key) {
+                    continue;
+                }
+                seen.push(prop.key);
+                if prop.mvcc.expired_ts != 0 {
+                    continue;
+                }
+                match store.decode_property_value(prop.type_tag, prop.value_inline) {
+                    Ok(graphus_core::Value::String(s)) => string_props.push((prop.key, s)),
+                    Ok(_) => {} // a full-text index covers string text only
+                    Err(_) => {
+                        Self::note_rebuild_gap(index);
+                        return;
+                    }
                 }
             }
         }
@@ -2812,21 +3021,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         index: &Rc<RefCell<IndexSet>>,
         id: u64,
     ) {
-        let type_token = match store.borrow().rel(id) {
-            Ok(r) => r.type_id,
-            Err(_) => {
-                // `rmp` task #733: record the gap instead of hiding it — an entity missing from
-                // the index is a candidate a seek can never resurrect, so the build that drove
-                // this helper must refuse to publish the index (fail closed / stay Populating).
-                Self::note_rebuild_gap(index);
-                return;
-            }
-        };
-        // The relationship's current string property values, keyed by prop-key (newest-wins per key).
-        let mut string_props: Vec<(u32, String)> = Vec::new();
-        {
-            let chain = match store.borrow().rel_property_values(id) {
-                Ok(chain) => chain,
+        // The relationship's type, covered full-text keys, STAMPED property chain and the commit
+        // registry in one shared borrow scope — the relationship twin of `index_one_node_fulltext`
+        // (`rmp` task #778). `rel_properties` (not `rel_property_values`) so the #778 gate can resolve
+        // the newest version's writer.
+        let (type_token, covered, chain) = {
+            let store = store.borrow();
+            let type_token = match store.rel(id) {
+                Ok(r) => r.type_id,
                 Err(_) => {
                     // `rmp` task #733: record the gap instead of hiding it — an entity missing from
                     // the index is a candidate a seek can never resurrect, so the build that drove
@@ -2835,12 +3037,68 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     return;
                 }
             };
-            for (_pid, key, value) in chain {
-                if string_props.iter().any(|(k, _)| *k == key) {
-                    continue; // newest-wins: keep only the first occurrence of each key.
+            let covered = index
+                .borrow()
+                .fulltext_rel_covered_keys_for_type(type_token);
+            let chain = match store.rel_properties(id) {
+                Ok(chain) => chain,
+                Err(_) => {
+                    Self::note_rebuild_gap(index);
+                    return;
                 }
-                if let graphus_core::Value::String(s) = value {
-                    string_props.push((key, s));
+            };
+            (type_token, covered, chain)
+        };
+
+        // Option (b), `rmp` task #778 (poison-on-build) — the relationship twin of the node gate. An
+        // in-flight writer holding the newest version of a covered property means a newest-wins bake
+        // would lose the committed value, so record the conflict and do NOT bake (the build stays
+        // `Populating`, readers decline to the scan) until the writer resolves.
+        if let Some(writer) = active_writer_holds_newest_covered(&chain, &covered, |w| {
+            store.borrow().is_txn_active(w)
+        }) {
+            index.borrow_mut().note_ft_build_conflict(writer);
+            return;
+        }
+
+        // The relationship's current string property values, keyed by prop-key (newest-wins per key).
+        let mut string_props: Vec<(u32, String)> = Vec::new();
+        {
+            let store = store.borrow();
+            // `seen` is tracked SEPARATELY from `string_props`, and both skips below happen BEFORE the
+            // decode. Three distinct correctness points, each measured (`rmp` task #778 audit):
+            //
+            // 1. NEWEST-WINS ACROSS TYPES. Keying "already handled" off `string_props` made the guard
+            //    trip only once a *String* had been pushed, so when the newest version of a key was a
+            //    non-string the loop walked on and indexed an OLDER string version of that same key:
+            //    `SET n.title = 42` over a committed `'alpha'` left the index still matching `'alpha'`.
+            //    A key is settled by its newest version whatever that version's type.
+            // 2. A COMMITTED REMOVAL IS NOT PART OF THE STATE. `node_properties` returns every `in_use`
+            //    record, and a tombstone keeps its slot until GC reclaims it — which has no automatic
+            //    trigger (`rmp` #305) — so a removed property's value stayed indexable indefinitely:
+            //    `REMOVE n.title` committed, then any rebuild re-baked `'alpha'`. A non-zero `expired_ts`
+            //    means this version was removed; the still-in-flight case is already parked by the
+            //    conflict gate above, so reaching here with one set means the remover committed.
+            // 3. FAIL-CLOSED NARROWING. Skipping before the decode means a corrupt SHADOWED or REMOVED
+            //    version no longer raises a `rebuild_gap` (`rmp` task #733). Deliberate: only the newest
+            //    live version reaches the index, so neither can make the index an inexact image of the
+            //    committed store — which is the condition `rebuild_gap` exists to detect.
+            let mut seen: Vec<u32> = Vec::new();
+            for (_pid, prop) in &chain {
+                if seen.contains(&prop.key) {
+                    continue;
+                }
+                seen.push(prop.key);
+                if prop.mvcc.expired_ts != 0 {
+                    continue;
+                }
+                match store.decode_property_value(prop.type_tag, prop.value_inline) {
+                    Ok(graphus_core::Value::String(s)) => string_props.push((prop.key, s)),
+                    Ok(_) => {} // a full-text index covers string text only
+                    Err(_) => {
+                        Self::note_rebuild_gap(index);
+                        return;
+                    }
                 }
             }
         }
@@ -5068,12 +5326,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
 
         // Cancel any prior build of the same name — pending OR parked poisoned (`rmp` task #573) — then
         // enqueue this one. A parked build left behind would be resurrected later and race this one.
-        Self::cancel_named_builds(
-            &mut self.pending_fulltext_builds,
-            &mut self.poisoned_fulltext_builds,
-            name,
-            |b| &b.name,
-        );
+        self.cancel_fulltext_builds(name);
         let snapshot = self.store.borrow_mut().scan_node_ids()?;
         self.pending_fulltext_builds
             .push_back(PendingFulltextBuild {
@@ -5082,6 +5335,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 cursor: 0,
                 generation: self.index.borrow().wipe_generation(),
                 stall: BUILD_STALL_BUDGET,
+                conflict_writers: Vec::new(),
             });
         Ok(true)
     }
@@ -5254,12 +5508,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             if !if_exists {
                 return Err(index_drop_not_found(name));
             }
-            Self::cancel_named_builds(
-                &mut self.pending_fulltext_builds,
-                &mut self.poisoned_fulltext_builds,
-                name,
-                |b| &b.name,
-            );
+            self.cancel_fulltext_builds(name);
             // The name is unique across catalogs, so at most one of these unregisters anything
             // (`rmp` task #663): one is a no-op.
             self.index.borrow_mut().unregister_fulltext(name);
@@ -5272,12 +5521,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.store.borrow_mut().remove_fulltext_index(name);
         self.store.borrow_mut().commit(txn)?;
 
-        Self::cancel_named_builds(
-            &mut self.pending_fulltext_builds,
-            &mut self.poisoned_fulltext_builds,
-            name,
-            |b| &b.name,
-        );
+        self.cancel_fulltext_builds(name);
         // Unregister from whichever in-memory map holds it (node or relationship, `rmp` #663).
         self.index.borrow_mut().unregister_fulltext(name);
         self.index.borrow_mut().unregister_fulltext_rel(name);
@@ -7237,6 +7481,23 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         poisoned.retain(|b| name_of(b) != name);
     }
 
+    /// Cancels every full-text build called `name` — in flight, parked poisoned, **or** parked on a
+    /// write conflict (`rmp` task #778). The full-text-specific wrapper over
+    /// [`cancel_named_builds`](Self::cancel_named_builds), which knows only the two generic queues.
+    ///
+    /// The conflict queue must be purged for exactly the reason the poison graveyard is: a parked build
+    /// that outlives its index is resurrected later — here as soon as its blocking writer commits — and
+    /// durably re-creates an index the user dropped, or races the fresh build of a re-declared one.
+    fn cancel_fulltext_builds(&mut self, name: &str) {
+        Self::cancel_named_builds(
+            &mut self.pending_fulltext_builds,
+            &mut self.poisoned_fulltext_builds,
+            name,
+            |b| &b.name,
+        );
+        self.conflicted_fulltext_builds.retain(|b| b.name != name);
+    }
+
     /// The aggregate index-build numbers (`rmp` task #573) — in-flight and parked build counts, and the
     /// entities still to index across the in-flight ones.
     ///
@@ -7260,7 +7521,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             pending: self.pending_builds.len()
                 + self.pending_fulltext_builds.len()
                 + self.pending_spatial_builds.len(),
-            parked: self.poisoned_index_builds(),
+            parked: self.poisoned_index_builds() + self.conflicted_fulltext_builds.len(),
             entities_remaining: self
                 .pending_builds
                 .iter()
@@ -7420,6 +7681,9 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             build.cursor = 0;
             build.stall = BUILD_STALL_BUDGET;
             build.generation = generation;
+            // Fresh snapshot from cursor 0: drop any stale `rmp` #778 conflict record for the same reason
+            // the epoch re-snapshot does.
+            build.conflict_writers.clear();
             self.pending_fulltext_builds.push_back(build);
         }
         for mut build in self.poisoned_spatial_builds.drain(..) {
@@ -7488,6 +7752,116 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         }
     }
 
+    /// Re-drives every full-text build that `rmp` task #778 parked, once the in-flight writers that
+    /// blocked it have resolved. Returns whether anything was re-driven.
+    ///
+    /// This is the **resurrection path** for the option (b) conflict gate, and the reason a conflict is a
+    /// pause rather than a poison. Two shapes are parked and both are drained here:
+    ///
+    /// - a **node** build, parked in [`conflicted_fulltext_builds`](Self#structfield.conflicted_fulltext_builds)
+    ///   by [`advance_fulltext_build`](Self::advance_fulltext_build): re-enqueued from a fresh snapshot,
+    ///   so it re-visits the node it skipped and this time bakes the settled value;
+    /// - a **relationship** (or already-`Online` node) index, demoted in memory by
+    ///   [`rebuild_index`](Self::rebuild_index), whose repair is a fresh `rebuild_index` — its
+    ///   re-registration pass restores each index's state from the durable catalog and then refills, so an
+    ///   index returns to `Online` only by being rebuilt with no conflict remaining.
+    ///
+    /// # Why it is gated on the writers, and why that is cheap
+    ///
+    /// Both repairs are O(store) scans, and this runs on the command path — so re-attempting while the
+    /// blocking writer is still open would re-scan the store on every command for as long as one
+    /// transaction stayed open. Waiting for the recorded writers costs one
+    /// [`RecordStore::is_txn_active`](graphus_storage::RecordStore::is_txn_active) lookup each and fires
+    /// only when the repair can actually succeed. A writer that commits and one that aborts both resolve
+    /// it: after either, the newest version of the covered property is a settled one. (Note the predicate
+    /// — the Active Transaction Table, NOT `CommitRegistry::outcome`, which is always-false for a running
+    /// transaction and is the root of `rmp` #522 and #778 alike.)
+    ///
+    /// It is additionally **throttled**, for the reason
+    /// [`retry_degraded_index_rebuild`](Self::retry_degraded_index_rebuild) documents: this conflict is
+    /// inherently flapping — overlapping write transactions resolve one after another — so an unthrottled
+    /// repair would run one O(store) rebuild per writer generation, on the engine thread, forever.
+    fn retry_conflicted_fulltext_builds(&mut self) -> bool {
+        let rebuild_blocked = !self.index.borrow().ft_demoted_blockers().is_empty();
+        if self.conflicted_fulltext_builds.is_empty() && !rebuild_blocked {
+            return false;
+        }
+        // The same liveness signal the gate used — the Active Transaction Table, never
+        // `CommitRegistry::outcome` (see `active_writer_holds_newest_covered`). Here the naive predicate
+        // would have been dead in the OPPOSITE direction: reporting every writer resolved would make the
+        // repair fire immediately and re-park in a loop, re-scanning the store on every command.
+        let resolved = |writers: &[TxnId], store: &Rc<RefCell<RecordStore<D, S>>>| {
+            let store = store.borrow();
+            writers.iter().all(|&w| !store.is_txn_active(w))
+        };
+
+        // (1) The synchronous / relationship shape: a `rebuild_index` demoted the full-text indexes.
+        let mut acted = false;
+        if rebuild_blocked {
+            let writers: Vec<TxnId> = self.index.borrow().ft_demoted_blockers().to_vec();
+            if !resolved(&writers, &self.store) {
+                // Still blocked — not an attempt, so it neither spends nor arms the throttle.
+            } else if self.conflict_retry_skip > 0 {
+                self.conflict_retry_skip -= 1;
+            } else {
+                // `rebuild_index` clears the record via `IndexSet::clear` and re-raises it if the conflict
+                // persists (a writer that opened since), so this cannot livelock: it re-runs only when the
+                // recorded writers have settled.
+                Self::rebuild_index(&self.store, &self.index);
+                if self.index.borrow().ft_demoted_blockers().is_empty() {
+                    // Repaired. HALVE rather than reset, exactly as `retry_degraded_index_rebuild`
+                    // documents: a flapping conflict — repair, re-conflict, repair — would otherwise
+                    // re-arm a 1-drain backoff on every success, so the next overlapping writer buys
+                    // another full store scan and the engine spends its life re-scanning.
+                    self.conflict_retry_backoff = (self.conflict_retry_backoff / 2).max(1);
+                    self.conflict_retry_skip = 0;
+                } else {
+                    // Re-conflicted with a writer that opened in the meantime: widen the window.
+                    self.conflict_retry_backoff = self
+                        .conflict_retry_backoff
+                        .saturating_mul(2)
+                        .min(MAX_DEGRADED_RETRY_BACKOFF);
+                    self.conflict_retry_skip = self.conflict_retry_backoff;
+                }
+                acted = true;
+            }
+        }
+
+        // (2) The chunked node-build shape.
+        if !self.conflicted_fulltext_builds.is_empty() {
+            let ready: Vec<usize> = self
+                .conflicted_fulltext_builds
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| resolved(&b.conflict_writers, &self.store))
+                .map(|(i, _)| i)
+                .collect();
+            // The probe below is a store scan, so it is spent from the SAME throttle as the rebuild
+            // repair: a faulting store returns `None`, removes nothing, and would otherwise be re-probed
+            // on every command forever (the guard `retry_poisoned_index_builds` applies to its identical
+            // probe via `poison_retry_skip`).
+            if !ready.is_empty() && self.conflict_retry_skip > 0 {
+                self.conflict_retry_skip -= 1;
+            } else if !ready.is_empty()
+                && let Some(snapshot) = Self::resnapshot_build(&self.store)
+            {
+                let generation = self.index.borrow().wipe_generation();
+                // Descending, so each removal leaves the lower indices valid.
+                for i in ready.into_iter().rev() {
+                    let mut build = self.conflicted_fulltext_builds.swap_remove(i);
+                    build.snapshot.clone_from(&snapshot);
+                    build.cursor = 0;
+                    build.stall = BUILD_STALL_BUDGET;
+                    build.generation = generation;
+                    build.conflict_writers.clear();
+                    self.pending_fulltext_builds.push_back(build);
+                    acted = true;
+                }
+            }
+        }
+        acted
+    }
+
     /// Advances the front non-blocking index build by up to `budget` nodes (`rmp` task #91), returning
     /// whether **any** build remains pending afterwards.
     ///
@@ -7518,6 +7892,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         if self.index.borrow().is_degraded() {
             let _healed = self.retry_degraded_index_rebuild();
         }
+        // Re-drive any full-text build paused by an in-flight writer whose conflict has since resolved
+        // (`rmp` task #778). Sited HERE, on the command path, for the reason the degraded repair above
+        // documents — and additionally because the poison graveyard's own resurrection runs on the
+        // threaded engine only from the idle tick, whose gate does not count parked builds (`rmp` #763).
+        // A paused index is `Populating`, so it is correct-but-unaccelerated until this fires.
+        let _resumed = self.retry_conflicted_fulltext_builds();
         // Drive a node-property build first if one is pending; then a full-text build; then a spatial
         // build. Processing one queue per call keeps the per-call work bounded by `budget` for any kind.
         if !self.pending_builds.is_empty() {
@@ -7745,6 +8125,11 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 build.cursor = 0;
                 build.generation = generation;
                 build.stall = BUILD_STALL_BUDGET;
+                // A restart from cursor 0 re-visits every entity, so any conflict this build recorded on
+                // its previous pass is about to be re-detected if it still holds (`rmp` task #778).
+                // Carrying it forward would park the fresh, clean pass on a transaction that is no longer
+                // relevant — the same mis-attribution the per-chunk clear exists to prevent.
+                build.conflict_writers.clear();
             }
         }
         let Some(build) = self.pending_fulltext_builds.front_mut() else {
@@ -7760,10 +8145,25 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         build.cursor = end;
         let done = end >= total;
 
-        // A clean slate: only THIS chunk's read faults may fail THIS build (`rmp` task #733).
+        // A clean slate: only THIS chunk's read faults may fail THIS build (`rmp` task #733), and only
+        // THIS chunk's write conflicts are attributed to it (`rmp` task #778).
         self.index.borrow_mut().clear_rebuild_gap();
+        self.index.borrow_mut().clear_ft_build_conflict();
         for id in chunk {
             Self::index_one_node_fulltext(&self.store, &self.index, id);
+        }
+        // Drain this chunk's conflict record onto the BUILD before anything else can clear it — see
+        // `PendingFulltextBuild::conflict_writers` for why it cannot be read off the index set later.
+        let chunk_blockers: Vec<TxnId> = self.index.borrow().ft_build_conflict_writers().to_vec();
+        if !chunk_blockers.is_empty() {
+            self.index.borrow_mut().clear_ft_build_conflict();
+            if let Some(build) = self.pending_fulltext_builds.front_mut() {
+                for w in chunk_blockers {
+                    if !build.conflict_writers.contains(&w) {
+                        build.conflict_writers.push(w);
+                    }
+                }
+            }
         }
         // (2) GAP CHECK. A node this chunk could not read is missing from the inverted index for good, and
         // no per-candidate re-check can resurrect it. Rewind and retry — bounded by the stall budget, so a
@@ -7818,6 +8218,57 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     &mut self.poisoned_fulltext_builds,
                     &mut self.poison_events,
                 );
+            }
+            return;
+        }
+
+        // (4) CONFLICT GATE (`rmp` task #778). Some chunk of this build skipped a node because an
+        // in-flight writer held the newest version of a covered property. The snapshot is therefore NOT
+        // fully indexed — promoting now would publish an index that is missing that node's committed text
+        // and, worse, one whose terms no reader re-checks. Park the build with the writers that blocked
+        // it and leave the index `Populating`, so every reader takes the snapshot-correct scan.
+        //
+        // The build is moved OFF the pending queue rather than rewound, for the termination reason the
+        // degraded gate above documents: `LocalEngine::drain_index_builds` spins
+        // `while has_pending_index_builds()`, so a build left pending while its blocking writer stays
+        // open would spin the engine forever. `conflicted_fulltext_builds` is excluded from
+        // `has_pending_index_builds`, exactly like the poison graveyard.
+        //
+        // It is deliberately NOT the poison graveyard: that is resurrected only by
+        // `retry_poisoned_index_builds`, which on the threaded engine runs on the IDLE TICK and never on
+        // the command path — and the tick's own gate does not count parked builds (`rmp` #763), so a
+        // build parked there on an otherwise-idle engine is never resurrected at all. This queue is
+        // drained from `advance_index_builds`, which every command drives.
+        // BOTH conflict records are consulted, for the same reason gate (3) above re-checks `is_degraded`
+        // rather than trusting this build's own history:
+        //
+        // - THIS build's `conflict_writers` — a node it personally skipped;
+        // - the shared `ft_demoted_blockers` — a node the WHOLE-SET `rebuild_index` skipped.
+        //
+        // The second is not redundant. `rebuild_index` (run by any unrelated `CREATE INDEX` /
+        // `CREATE CONSTRAINT` between this build's chunks) calls `IndexSet::clear`, which empties this
+        // index's tree and refills it from the store — minus the entity it had to skip. `clear` does NOT
+        // bump `wipe_generation` (only `fail_closed` does), so there is no epoch change and this build
+        // does not re-snapshot: it simply resumes at its cursor. If the skipped entity sits BEFORE that
+        // cursor the build never revisits it, finishes its remaining chunks cleanly, and — on its own
+        // record alone — would promote `Online` over the hole, with the #467 marker already raised so
+        // readers trust it. That is the #766 loss re-entering through the promotion door.
+        let blocked_by_rebuild: Vec<TxnId> = self.index.borrow().ft_demoted_blockers().to_vec();
+        if self
+            .pending_fulltext_builds
+            .front()
+            .is_some_and(|b| !b.conflict_writers.is_empty())
+            || !blocked_by_rebuild.is_empty()
+        {
+            if let Some(mut build) = self.pending_fulltext_builds.pop_front() {
+                // Adopt the rebuild's blockers too, so this build is re-driven once EVERY writer that
+                // holed it — its own and the rebuild's — has resolved.
+                for w in blocked_by_rebuild {
+                    if !build.conflict_writers.contains(&w) {
+                        build.conflict_writers.push(w);
+                    }
+                }
+                self.conflicted_fulltext_builds.push(build);
             }
             return;
         }

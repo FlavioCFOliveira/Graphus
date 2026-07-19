@@ -371,6 +371,39 @@ pub struct IndexSet {
     /// Cleared by [`clear`](Self::clear) (a fresh rebuild starts clean) and by
     /// [`clear_rebuild_gap`](Self::clear_rebuild_gap).
     rebuild_gap: bool,
+    /// Whether the build currently filling a **single-value-per-entity** index (full-text — and, by
+    /// #779/#780, spatial/vector) observed that an **in-flight** transaction holds the NEWEST version of
+    /// a covered property on some entity it visited (`rmp` task #778). Unlike [`rebuild_gap`], which
+    /// reports a read *fault*, this reports a live *conflict*: a newest-wins build would bake that
+    /// uncommitted value and index the committed one nowhere (the #766 loss), and — because the
+    /// full-text consumer re-checks visibility + label but NOT the term — the reader cannot repair it.
+    ///
+    /// The signal is the same seam→coordinator channel as [`rebuild_gap`]: the per-entity build helper
+    /// records it here, and the build driver reacts by NOT promoting the index to `Online` — it stays
+    /// `Populating`, so every reader declines to the snapshot-correct scan fallback until the writer
+    /// commits or aborts (option (b), poison-on-build). Distinct from `rebuild_gap` because a *fault*
+    /// must fail the whole rebuild closed, whereas a *conflict* is transient and clears when the writer
+    /// resolves. Cleared by [`clear`](Self::clear) and [`clear_ft_build_conflict`](Self::clear_ft_build_conflict).
+    ///
+    /// This holds the **blocking writers** rather than a bare flag, and non-emptiness IS the flag
+    /// ([`ft_build_conflict`](Self::ft_build_conflict)) so the two can never disagree. The ids are what
+    /// makes the resurrection *cheap*: the driver re-drives the build when — and only when — every writer
+    /// recorded here has resolved, instead of re-scanning the store on every command for as long as any
+    /// transaction happens to be open.
+    ft_build_conflict_writers: Vec<TxnId>,
+    /// The writers whose resolution must re-drive a **whole-set rebuild**, because that rebuild demoted
+    /// the full-text indexes via [`demote_fulltext_for_conflict`](Self::demote_fulltext_for_conflict)
+    /// (`rmp` task #778). Set and cleared only by
+    /// [`rebuild_index`](crate::coordinator::TxnCoordinator), and read only by its resurrection.
+    ///
+    /// Deliberately a SECOND slot rather than a re-read of
+    /// [`ft_build_conflict_writers`](Self#structfield.ft_build_conflict_writers), which is a *transient
+    /// per-pass channel* from the per-entity helpers to whichever driver is currently running — and the
+    /// chunked node build clears it on every chunk. Sharing one slot between the two drivers let a node
+    /// build's chunk wipe the rebuild's record, after which nothing would ever re-drive the rebuild and
+    /// the demoted indexes stayed `Populating` for the life of the process: answers still correct, but
+    /// permanently unaccelerated, with no way back.
+    ft_demoted_blockers: Vec<TxnId>,
     /// `(label, property)` pairs whose selectivity histogram a `db.resampleIndex` /
     /// `db.resampleOutdatedIndexes` has **asked** to have recomputed (`rmp` task #572), oldest first.
     ///
@@ -699,6 +732,8 @@ impl IndexSet {
             // failed rebuild makes it untrustworthy (`rmp` task #733).
             labels_usable: true,
             rebuild_gap: false,
+            ft_build_conflict_writers: Vec::new(),
+            ft_demoted_blockers: Vec::new(),
             pending_resamples: VecDeque::new(),
             wipe_generation: 0,
             fail_closed_events: 0,
@@ -1152,6 +1187,14 @@ impl IndexSet {
         // A fresh rebuild starts with no known gap; the per-entity helpers raise it if they must skip an
         // entity they cannot read.
         self.rebuild_gap = false;
+        // Likewise a fresh rebuild starts with no known active-writer conflict (`rmp` task #778); the
+        // full-text helpers raise it if the newest version of a covered property is held by an in-flight
+        // transaction.
+        self.ft_build_conflict_writers.clear();
+        // Likewise the demotion record: `rebuild_index` calls `clear` at its start and re-establishes
+        // this from its own fresh pass, so carrying a previous pass's blockers forward would strand the
+        // repair behind transactions that are no longer relevant.
+        self.ft_demoted_blockers.clear();
         for np in self.node_props.values_mut() {
             np.index = PropertyIndex::new(fresh_tree());
         }
@@ -1363,6 +1406,116 @@ impl IndexSet {
 
     pub fn clear_rebuild_gap(&mut self) {
         self.rebuild_gap = false;
+    }
+
+    /// Records that a single-value-per-entity index build saw the **in-flight** transaction `writer`
+    /// holding the NEWEST version of a covered property (`rmp` task #778) — see
+    /// [`ft_build_conflict_writers`](Self#structfield.ft_build_conflict_writers). Called by the full-text
+    /// build helpers in place of baking that uncommitted value newest-wins.
+    ///
+    /// De-duplicated: one writer typically blocks many entities of the same build, and the driver only
+    /// ever asks whether they have all resolved.
+    pub fn note_ft_build_conflict(&mut self, writer: TxnId) {
+        if !self.ft_build_conflict_writers.contains(&writer) {
+            self.ft_build_conflict_writers.push(writer);
+        }
+    }
+
+    /// Whether the build currently filling a single-value-per-entity index observed an active-writer
+    /// conflict — i.e. whether promoting it `Online` now would bake an uncommitted value over a committed
+    /// one (`rmp` task #778).
+    #[must_use]
+    pub fn ft_build_conflict(&self) -> bool {
+        !self.ft_build_conflict_writers.is_empty()
+    }
+
+    /// The in-flight writers that blocked the current build (`rmp` task #778) — the set whose resolution
+    /// the driver waits on before re-driving. Empty when the build saw no conflict.
+    #[must_use]
+    pub fn ft_build_conflict_writers(&self) -> &[TxnId] {
+        &self.ft_build_conflict_writers
+    }
+
+    /// Clears the active-writer conflict record so a build can start from a known-clean slate (`rmp` task
+    /// #778). Used by the incremental / synchronous builds that do not go through [`clear`](Self::clear).
+    pub fn clear_ft_build_conflict(&mut self) {
+        self.ft_build_conflict_writers.clear();
+    }
+
+    /// Demotes every registered full-text index — node AND relationship — to
+    /// [`IndexState::Populating`] **in memory only**, because the build that was filling them skipped an
+    /// entity whose newest covered version an in-flight writer holds (`rmp` task #778).
+    ///
+    /// # Why in-memory only, and why *every* full-text index
+    ///
+    /// In-memory only follows the [`fail_closed`](Self::fail_closed) precedent: the durable catalog keeps
+    /// whatever state it had, so the single route back to `Online` is
+    /// [`rebuild_index`](crate::coordinator::TxnCoordinator)'s re-registration from that catalog — which
+    /// re-runs the refill first, so an index can only come back `Online` by being rebuilt cleanly. Writing
+    /// `Populating` durably instead would make a *transient* write conflict survive a restart, and would
+    /// route through the recovery promotion path, which does not re-check anything.
+    ///
+    /// Every index, because the conflict signal is per-build, not per-index: a build visits entities, and
+    /// one skipped entity may be covered by any subset of the declared full-text indexes. Demoting the
+    /// superset is the conservative choice — it costs a scan fallback on indexes that were not actually
+    /// holed (correct, just unaccelerated), where demoting too few would leave a holed index `Online` and
+    /// silently losing rows.
+    /// The writers whose resolution must re-drive the whole-set rebuild that demoted the full-text
+    /// indexes (`rmp` task #778). Empty when no rebuild is awaiting repair — see
+    /// [`ft_demoted_blockers`](Self#structfield.ft_demoted_blockers).
+    #[must_use]
+    pub fn ft_demoted_blockers(&self) -> &[TxnId] {
+        &self.ft_demoted_blockers
+    }
+
+    pub fn demote_fulltext_for_conflict(&mut self) {
+        // Record the blockers in the SAME step as the demotion: an index demoted without a recorded
+        // blocker has no resurrection trigger and would stay `Populating` forever.
+        self.ft_demoted_blockers
+            .clone_from(&self.ft_build_conflict_writers);
+        for ft in self.fulltext.values_mut() {
+            ft.state = IndexState::Populating;
+        }
+        for ft in self.fulltext_rel.values_mut() {
+            ft.state = IndexState::Populating;
+        }
+    }
+
+    /// The union of covered property-key tokens of every registered **node** full-text index whose
+    /// covered label set intersects `label_tokens` (`rmp` task #778) — the keys whose newest version the
+    /// build must check for an in-flight writer before it may bake this node newest-wins. Empty when the
+    /// node carries no covered label of any full-text index.
+    #[must_use]
+    pub fn fulltext_covered_keys_for_labels(&self, label_tokens: &[u32]) -> Vec<u32> {
+        let mut keys: Vec<u32> = Vec::new();
+        for ft in self.fulltext.values() {
+            if ft.label_tokens.iter().any(|lt| label_tokens.contains(lt)) {
+                for &pk in &ft.prop_keys {
+                    if !keys.contains(&pk) {
+                        keys.push(pk);
+                    }
+                }
+            }
+        }
+        keys
+    }
+
+    /// The union of covered property-key tokens of every registered **relationship** full-text index
+    /// covering `type_token` (`rmp` task #778) — the relationship analogue of
+    /// [`fulltext_covered_keys_for_labels`](Self::fulltext_covered_keys_for_labels).
+    #[must_use]
+    pub fn fulltext_rel_covered_keys_for_type(&self, type_token: u32) -> Vec<u32> {
+        let mut keys: Vec<u32> = Vec::new();
+        for ft in self.fulltext_rel.values() {
+            if ft.type_tokens.contains(&type_token) {
+                for &pk in &ft.prop_keys {
+                    if !keys.contains(&pk) {
+                        keys.push(pk);
+                    }
+                }
+            }
+        }
+        keys
     }
 
     /// The current **wipe epoch** (`rmp` task #733): incremented by every

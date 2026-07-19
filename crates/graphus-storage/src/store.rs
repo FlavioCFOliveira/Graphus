@@ -1413,6 +1413,24 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         &self.commit_registry
     }
 
+    /// Whether `txn` is a **live, unresolved** transaction of this store: it has
+    /// [`begin`](Self::begin)-ed and has neither committed nor rolled back.
+    ///
+    /// # Use this, not `commit_registry().outcome(txn) == TxnOutcome::InFlight`
+    ///
+    /// That predicate is **dead — always `false`** — and mistaking it for this one has now caused two
+    /// separate silent-data-loss defects (`rmp` #522, `rmp` #778). The registry records an outcome only
+    /// when a transaction *resolves*: [`commit`](Self::commit) inserts `Committed(ts)` and
+    /// [`rollback`](Self::rollback) inserts `Aborted`. A still-running transaction therefore has **no
+    /// registry entry at all**, and [`CommitRegistry::outcome`](graphus_txn::CommitRegistry::outcome)
+    /// maps an unknown id to `Aborted`, never `InFlight` — so the naive predicate silently reports every
+    /// genuinely open writer as resolved. Live membership in the Active Transaction Table is the correct
+    /// "this writer might still commit, so treat its versions as uncommitted" signal.
+    #[must_use]
+    pub fn is_txn_active(&self, txn: TxnId) -> bool {
+        self.active.contains_key(&txn)
+    }
+
     /// Opens transaction `txn`'s MVCC version-stamp bookkeeping. The WAL `BEGIN` is **lazy** (`rmp`
     /// #529): it is *not* emitted here — the WAL Active-Transaction-Table entry is created on demand by
     /// the first data record ([`WalManager::log_update`]'s `or_insert`). A read-only transaction
@@ -2655,7 +2673,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// signal.
     fn is_inflight_of_inflight_writer(&self, word: u64) -> bool {
         matches!(VersionStamp::from_raw(word), VersionStamp::InFlight(w)
-            if self.active.contains_key(&w))
+            if self.is_txn_active(w))
     }
 
     /// Reclaims the reclaimable MVCC tombstones of `kind` (`Rel` or `Node`) under `txn` (`rmp` #522).

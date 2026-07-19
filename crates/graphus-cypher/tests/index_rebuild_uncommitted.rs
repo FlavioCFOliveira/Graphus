@@ -572,3 +572,549 @@ fn text_union_does_not_surface_a_superseded_committed_version() {
          whose current title is 'classical mechanics' (seek {seek_q}, scan {scan_q})",
     );
 }
+
+/// The `IndexState` of the full-text index named `name`, from the coordinator's listing surface.
+fn ft_state(coord: &Coord, name: &str) -> Option<graphus_storage::IndexState> {
+    coord
+        .list_fulltext_indexes()
+        .into_iter()
+        .find(|(n, ..)| n == name)
+        .map(|(_, _, _, _, _, state)| state)
+}
+
+/// NODE FULL-TEXT, the #766 window (`rmp` task #778). A full-text index built while a writer holds an
+/// uncommitted overwrite of a covered property used to bake that DIRTY value newest-wins: the committed
+/// value was then indexed NOWHERE (loss) and the uncommitted term was returned (wrong row).
+///
+/// Full-text cannot be repaired the way `rmp` #773 repaired the trigram tree. A version UNION is sound
+/// for text because the executor's residual `CONTAINS` re-checks the string predicate and drops the
+/// extras; `fulltext_query` re-checks a candidate's visibility and current LABEL and nothing else — it
+/// never re-checks the TERMS — so a union's extra terms are not false positives a consumer drops, they
+/// are wrong answers. The fix is therefore option (b): a build that observes an in-flight writer holding
+/// the newest covered version must NOT promote the index `Online`; it stays `Populating` and every
+/// reader declines to the snapshot-correct scan, which returns exactly these two answers.
+#[test]
+fn fulltext_online_build_while_writer_open_keeps_committed_row_findable() {
+    let mut coord = fresh_coord();
+    run_write(&mut coord, "CREATE (:Doc {title: 'classical mechanics'})");
+
+    // An OPEN, UNCOMMITTED writer moves the node off its committed value. The property is not yet
+    // full-text-indexed, so this writer is invisible to the #467 freshness marker (`note_ft_spatial_
+    // mutator` only records writers that mutated an ALREADY-REGISTERED index) — which is why the build
+    // below can bake its uncommitted value and a later reader still trusts the index.
+    let writer = coord.begin_serializable();
+    let _ = run_plan(
+        &coord,
+        writer,
+        &compile(
+            "MATCH (n:Doc) SET n.title = 'quantum physics'",
+            &IndexCatalog::empty(),
+        ),
+    );
+
+    // THE PRODUCTION ROUTE: declare the index, then let the engine drain the build exactly as it does
+    // between commands (`LocalEngine::drain_index_builds`).
+    coord
+        .create_fulltext_index(
+            "docs",
+            &["Doc".to_owned()],
+            &["title".to_owned()],
+            Analyzer::Standard,
+            false,
+        )
+        .expect("declare fulltext index");
+    while coord.advance_index_builds(usize::MAX) {}
+
+    {
+        let reader = coord.begin_serializable();
+        let graph = coord.statement(reader).expect("statement");
+
+        // Both halves of the defect are observed BEFORE either is asserted, so one failure reports the
+        // whole picture: (a) the committed value is LOST, and (b) the uncommitted term is a WRONG ROW.
+        let committed = graph.fulltext_query("docs", "classical");
+        let uncommitted = graph.fulltext_query("docs", "quantum");
+        assert_eq!(
+            (
+                committed.as_ref().map(Vec::len),
+                uncommitted.as_ref().map(Vec::len)
+            ),
+            (Some(1), Some(0)),
+            "the full-text build baked the in-flight writer's UNCOMMITTED value:\n  \
+             (a) LOSS      queryNodes('classical') = {committed:?} — the node's committed title is \
+             'classical mechanics', so this must find it\n  \
+             (b) WRONG ROW queryNodes('quantum')   = {uncommitted:?} — 'quantum physics' is an \
+             UNCOMMITTED writer's value that no reader may see, and `fulltext_query` has no term \
+             re-check to drop it",
+        );
+    }
+
+    // THE MECHANISM (option (b), poison-on-build): while the conflict is live the index must not be
+    // `Online`, because an `Online` full-text index is consulted directly and cannot be repaired by a
+    // re-check. Staying `Populating` is what routes the two probes above to the exact scan.
+    assert_eq!(
+        ft_state(&coord, "docs"),
+        Some(graphus_storage::IndexState::Populating),
+        "a full-text index built over an in-flight writer's uncommitted value must not be promoted \
+         Online — an Online index is trusted and its terms are never re-checked",
+    );
+
+    // THE RESURRECTION PATH: once the writer resolves, the conflict is gone and the index must promote
+    // and serve. Without this the fix would be a permanent poison — strictly worse than the defect.
+    coord.rollback(writer).expect("writer rolls back");
+    let _ = coord.retry_poisoned_index_builds();
+    while coord.advance_index_builds(usize::MAX) {}
+    assert_eq!(
+        ft_state(&coord, "docs"),
+        Some(graphus_storage::IndexState::Online),
+        "the conflicted build was never resurrected after the writer resolved: the index is stuck \
+         Populating for the life of the process",
+    );
+
+    let reader = coord.begin_serializable();
+    let graph = coord.statement(reader).expect("statement");
+    let committed = graph.fulltext_query("docs", "classical");
+    assert_eq!(
+        committed.as_ref().map(Vec::len),
+        Some(1),
+        "after resurrection the Online index must serve the committed value. got {committed:?}",
+    );
+    let rolled_back = graph.fulltext_query("docs", "quantum");
+    assert_eq!(
+        rolled_back.as_ref().map(Vec::len),
+        Some(0),
+        "after resurrection the rolled-back writer's term must not be indexed. got {rolled_back:?}",
+    );
+}
+
+/// RELATIONSHIP FULL-TEXT, the same window (`rmp` task #778) — the twin of
+/// [`fulltext_online_build_while_writer_open_keeps_committed_row_findable`]. `fulltext_query_rel`
+/// re-checks a candidate's visibility and current TYPE and nothing else, so it has exactly the node
+/// path's blind spot on terms.
+///
+/// The relationship index is built SYNCHRONOUSLY (`create_fulltext_rel_index` registers `Online` and
+/// calls `rebuild_index`), so the conflict must be detected inside that synchronous build and demote the
+/// index — a different driver from the node path's chunked `advance_fulltext_build`, which is why both
+/// twins are pinned.
+#[test]
+fn fulltext_rel_online_build_while_writer_open_keeps_committed_row_findable() {
+    let mut coord = fresh_coord();
+    run_write(
+        &mut coord,
+        "CREATE (:P {n: 1})-[:KNOWS {note: 'classical mechanics'}]->(:P {n: 2})",
+    );
+
+    // An OPEN, UNCOMMITTED writer moves the relationship off its committed value.
+    let writer = coord.begin_serializable();
+    let _ = run_plan(
+        &coord,
+        writer,
+        &compile(
+            "MATCH ()-[r:KNOWS]->() SET r.note = 'quantum physics'",
+            &IndexCatalog::empty(),
+        ),
+    );
+
+    coord
+        .create_fulltext_rel_index(
+            "rels",
+            &["KNOWS".to_owned()],
+            &["note".to_owned()],
+            Analyzer::Standard,
+            false,
+        )
+        .expect("declare relationship fulltext index");
+    while coord.advance_index_builds(usize::MAX) {}
+
+    {
+        let reader = coord.begin_serializable();
+        let graph = coord.statement(reader).expect("statement");
+
+        // Both halves observed before either is asserted — see the node twin.
+        let committed = graph.fulltext_query_rel("rels", "classical");
+        let uncommitted = graph.fulltext_query_rel("rels", "quantum");
+        assert_eq!(
+            (
+                committed.as_ref().map(Vec::len),
+                uncommitted.as_ref().map(Vec::len)
+            ),
+            (Some(1), Some(0)),
+            "the relationship full-text build baked the in-flight writer's UNCOMMITTED value:\n  \
+             (a) LOSS      queryRelationships('classical') = {committed:?} — the relationship's \
+             committed note is 'classical mechanics', so this must find it\n  \
+             (b) WRONG ROW queryRelationships('quantum')   = {uncommitted:?} — 'quantum physics' is \
+             an UNCOMMITTED writer's value that no reader may see, and `fulltext_query_rel` has no \
+             term re-check to drop it",
+        );
+    }
+
+    // THE MECHANISM.
+    assert_eq!(
+        ft_state(&coord, "rels"),
+        Some(graphus_storage::IndexState::Populating),
+        "a relationship full-text index built over an in-flight writer's uncommitted value must not \
+         be left Online — an Online index is trusted and its terms are never re-checked",
+    );
+
+    // THE RESURRECTION PATH.
+    coord.rollback(writer).expect("writer rolls back");
+    let _ = coord.retry_poisoned_index_builds();
+    while coord.advance_index_builds(usize::MAX) {}
+    assert_eq!(
+        ft_state(&coord, "rels"),
+        Some(graphus_storage::IndexState::Online),
+        "the conflicted relationship build was never resurrected after the writer resolved: the \
+         index is stuck Populating for the life of the process",
+    );
+
+    let reader = coord.begin_serializable();
+    let graph = coord.statement(reader).expect("statement");
+    let committed = graph.fulltext_query_rel("rels", "classical");
+    assert_eq!(
+        committed.as_ref().map(Vec::len),
+        Some(1),
+        "after resurrection the Online index must serve the committed value. got {committed:?}",
+    );
+    let rolled_back = graph.fulltext_query_rel("rels", "quantum");
+    assert_eq!(
+        rolled_back.as_ref().map(Vec::len),
+        Some(0),
+        "after resurrection the rolled-back writer's term must not be indexed. got {rolled_back:?}",
+    );
+}
+
+/// TWO conflict records, TWO owners — the cross-talk regression (`rmp` task #778).
+///
+/// The #778 conflict signal has two independent producers: the whole-set `rebuild_index`, which demotes
+/// the full-text indexes it holed, and the chunked node build, which parks itself. Both originally read
+/// and cleared ONE slot on the shared `IndexSet`, and the chunked build clears that slot on **every
+/// chunk**. So a node build running after a rebuild had demoted an index wiped the rebuild's record of
+/// which writers to wait for — and with the trigger gone, nothing ever re-drove that rebuild. The
+/// demoted index stayed `Populating` for the life of the process: answers still correct (every reader is
+/// on the exact scan) but permanently unaccelerated, with no path back to `Online`.
+///
+/// This drives exactly that interleaving: an `Online` index is demoted by a rebuild, a SECOND index's
+/// build then runs its chunks, and after the blocking writer resolves BOTH must reach `Online`.
+#[test]
+fn a_second_fulltext_build_does_not_strand_an_index_demoted_by_a_rebuild() {
+    let mut coord = fresh_coord();
+    run_write(&mut coord, "CREATE (:Doc {title: 'classical mechanics'})");
+
+    // Index A, built cleanly to Online with no writer in flight.
+    coord
+        .create_fulltext_index(
+            "a",
+            &["Doc".to_owned()],
+            &["title".to_owned()],
+            Analyzer::Standard,
+            false,
+        )
+        .expect("declare fulltext index a");
+    while coord.advance_index_builds(usize::MAX) {}
+    assert_eq!(
+        ft_state(&coord, "a"),
+        Some(graphus_storage::IndexState::Online),
+        "setup: index a must start Online, or the demotion below proves nothing",
+    );
+
+    // A writer takes the covered property uncommitted...
+    let writer = coord.begin_serializable();
+    let _ = run_plan(
+        &coord,
+        writer,
+        &compile(
+            "MATCH (n:Doc) SET n.title = 'quantum physics'",
+            &IndexCatalog::empty(),
+        ),
+    );
+    // ...and an UNRELATED DDL drives a whole-set `rebuild_index`, which holes index a and demotes it.
+    coord
+        .create_node_property_index("Doc", "probe")
+        .expect("unrelated DDL drives the rebuild");
+    assert_eq!(
+        ft_state(&coord, "a"),
+        Some(graphus_storage::IndexState::Populating),
+        "setup: the rebuild must have demoted index a for this to test the stranding",
+    );
+
+    // THE CROSS-TALK: a second index's chunked build now runs and clears the shared per-chunk conflict
+    // channel. With one shared slot this erased index a's resurrection trigger.
+    coord
+        .create_fulltext_index(
+            "b",
+            &["Doc".to_owned()],
+            &["title".to_owned()],
+            Analyzer::Standard,
+            false,
+        )
+        .expect("declare fulltext index b");
+    while coord.advance_index_builds(usize::MAX) {}
+
+    // The writer resolves: every conflict is now settled, so BOTH indexes must come back.
+    coord.rollback(writer).expect("writer rolls back");
+    while coord.advance_index_builds(usize::MAX) {}
+
+    assert_eq!(
+        ft_state(&coord, "a"),
+        Some(graphus_storage::IndexState::Online),
+        "index a was STRANDED Populating: the second build's chunk cleared the rebuild's record of \
+         the blocking writer, so the repair was never re-driven",
+    );
+    assert_eq!(
+        ft_state(&coord, "b"),
+        Some(graphus_storage::IndexState::Online),
+        "index b never completed after its blocking writer resolved",
+    );
+
+    // Both must serve the committed value, and neither the rolled-back term.
+    let reader = coord.begin_serializable();
+    let graph = coord.statement(reader).expect("statement");
+    for name in ["a", "b"] {
+        assert_eq!(
+            graph
+                .fulltext_query(name, "classical")
+                .as_ref()
+                .map(Vec::len),
+            Some(1),
+            "index {name} does not serve the committed value after resurrection",
+        );
+        assert_eq!(
+            graph.fulltext_query(name, "quantum").as_ref().map(Vec::len),
+            Some(0),
+            "index {name} returned the rolled-back writer's term after resurrection",
+        );
+    }
+}
+
+/// A chunked build must not promote `Online` over a hole the WHOLE-SET rebuild left (`rmp` task #778).
+///
+/// The conflict gate originally consulted only the build's OWN record of entities it skipped. But an
+/// unrelated `CREATE INDEX` / `CREATE CONSTRAINT` between two chunks runs `rebuild_index`, which calls
+/// `IndexSet::clear` — emptying this index's tree and refilling it from the store, MINUS any entity an
+/// in-flight writer holds. `clear` does not bump `wipe_generation` (only `fail_closed` does), so the
+/// build sees no epoch change, does not re-snapshot, and simply resumes at its cursor. An entity skipped
+/// BEFORE that cursor is therefore never revisited: the remaining chunks are clean, the build's own
+/// record stays empty, and it promotes the index `Online` with the committed row missing — while
+/// `bump_ft_spatial_marker_after_build` has already raised the #467 freshness marker so readers trust it.
+///
+/// That is the #766 loss re-entering through the promotion door, which is why the gate must consult the
+/// shared demotion record too. Driven with a chunk budget of 1 so the DDL lands mid-build, after the
+/// conflicted node has been passed.
+#[test]
+fn a_chunked_build_does_not_promote_over_a_hole_left_by_a_rebuild() {
+    let mut coord = fresh_coord();
+    // Several docs so the build takes several chunks; only the FIRST is put under uncommitted mutation,
+    // so the rebuild's hole lands strictly before the cursor once the build has moved past it.
+    run_write(&mut coord, "CREATE (:Doc {title: 'classical mechanics'})");
+    for i in 0..6 {
+        run_write(
+            &mut coord,
+            &format!("CREATE (:Doc {{title: 'filler {i}'}})"),
+        );
+    }
+
+    coord
+        .create_fulltext_index(
+            "docs",
+            &["Doc".to_owned()],
+            &["title".to_owned()],
+            Analyzer::Standard,
+            false,
+        )
+        .expect("declare fulltext index");
+
+    // Advance ONE node: the build passes the first Doc and its cursor moves beyond it.
+    coord.advance_index_builds(1);
+
+    // NOW a writer takes the first Doc's covered property uncommitted, and an unrelated DDL runs the
+    // whole-set rebuild — which wipes and refills the tree, skipping that node.
+    let writer = coord.begin_serializable();
+    let _ = run_plan(
+        &coord,
+        writer,
+        &compile(
+            "MATCH (n:Doc) WHERE n.title = 'classical mechanics' SET n.title = 'quantum physics'",
+            &IndexCatalog::empty(),
+        ),
+    );
+    coord
+        .create_node_property_index("Doc", "probe")
+        .expect("unrelated DDL drives the rebuild");
+
+    // Finish the build. Its remaining chunks are clean, so only the SHARED demotion record can stop it.
+    while coord.advance_index_builds(usize::MAX) {}
+
+    assert_eq!(
+        ft_state(&coord, "docs"),
+        Some(graphus_storage::IndexState::Populating),
+        "the build promoted the index Online while the whole-set rebuild's hole was still outstanding",
+    );
+
+    // The committed row must still be findable, and the uncommitted term must not be.
+    {
+        let reader = coord.begin_serializable();
+        let graph = coord.statement(reader).expect("statement");
+        let committed = graph.fulltext_query("docs", "classical");
+        let uncommitted = graph.fulltext_query("docs", "quantum");
+        assert_eq!(
+            (
+                committed.as_ref().map(Vec::len),
+                uncommitted.as_ref().map(Vec::len)
+            ),
+            (Some(1), Some(0)),
+            "the index was published over a hole: committed 'classical' = {committed:?} (must be 1), \
+             uncommitted 'quantum' = {uncommitted:?} (must be 0)",
+        );
+    }
+
+    // And it must still resurrect once the writer resolves.
+    coord.rollback(writer).expect("writer rolls back");
+    while coord.advance_index_builds(usize::MAX) {}
+    assert_eq!(
+        ft_state(&coord, "docs"),
+        Some(graphus_storage::IndexState::Online),
+        "the build never resurrected after the writer resolved",
+    );
+    let reader = coord.begin_serializable();
+    let graph = coord.statement(reader).expect("statement");
+    assert_eq!(
+        graph
+            .fulltext_query("docs", "classical")
+            .as_ref()
+            .map(Vec::len),
+        Some(1),
+        "after resurrection the committed row must be findable through the Online index",
+    );
+}
+
+/// The REMOVAL half of the uncommitted-version window (`rmp` task #778).
+///
+/// `SET n.p = …` and `REMOVE n.p` reach the store differently: a SET PREPENDS a new version, so the
+/// writer's dirty value is the chain head and its `created_ts` names the writer; a REMOVE tombstones
+/// **in place without prepending**, so the head is still the committed record and only its `expired_ts`
+/// names the writer. A conflict gate that inspects `created_ts` alone therefore sees a perfectly ordinary
+/// committed version and bakes it.
+///
+/// During the window that is harmless — the removal is invisible, so the baked value is the right answer.
+/// The damage lands at COMMIT: the index still carries a term the entity no longer has, and full-text
+/// re-checks visibility and label but never terms, so no reader can drop it.
+#[test]
+fn fulltext_build_parks_on_an_uncommitted_property_removal() {
+    let mut coord = fresh_coord();
+    run_write(&mut coord, "CREATE (:Doc {title: 'alpha beta'})");
+
+    let writer = coord.begin_serializable();
+    let _ = run_plan(
+        &coord,
+        writer,
+        &compile("MATCH (n:Doc) REMOVE n.title", &IndexCatalog::empty()),
+    );
+
+    coord
+        .create_fulltext_index(
+            "docs",
+            &["Doc".to_owned()],
+            &["title".to_owned()],
+            Analyzer::Standard,
+            false,
+        )
+        .expect("declare fulltext index");
+    while coord.advance_index_builds(usize::MAX) {}
+
+    // The removal is UNCOMMITTED, so a reader must still match the term.
+    {
+        let reader = coord.begin_serializable();
+        let graph = coord.statement(reader).expect("statement");
+        assert_eq!(
+            graph.fulltext_query("docs", "alpha").as_ref().map(Vec::len),
+            Some(1),
+            "an uncommitted removal must not hide the committed value",
+        );
+    }
+    assert_eq!(
+        ft_state(&coord, "docs"),
+        Some(graphus_storage::IndexState::Populating),
+        "the build must park on an in-flight REMOVE exactly as it parks on an in-flight SET — the \
+         `expired_ts` stamp is the only thing that names the writer",
+    );
+
+    // On COMMIT the term must disappear. This is the assertion that fails when only `created_ts` is
+    // inspected: the doomed value was baked, and nothing re-checks terms.
+    coord.commit(writer).expect("removal commits");
+    while coord.advance_index_builds(usize::MAX) {}
+    let reader = coord.begin_serializable();
+    let graph = coord.statement(reader).expect("statement");
+    let stale = graph.fulltext_query("docs", "alpha");
+    assert_eq!(
+        stale.as_ref().map(Vec::len),
+        Some(0),
+        "the index still matches 'alpha' after the property was REMOVED and committed. got {stale:?}",
+    );
+}
+
+/// A COMMITTED removal must not stay indexed (`rmp` task #778 audit). Independent of concurrency.
+///
+/// `node_properties` returns every `in_use` record, and an MVCC tombstone keeps its slot until GC
+/// reclaims it — which has no automatic trigger (`rmp` #305). The build collapsed the chain newest-wins
+/// without consulting `expired_ts`, so a removed property's value stayed indexable for as long as the
+/// tombstone survived: `REMOVE n.title`, commit, then ANY rebuild re-baked the removed term.
+#[test]
+fn fulltext_build_does_not_index_a_committed_removal() {
+    let mut coord = fresh_coord();
+    run_write(&mut coord, "CREATE (:Doc {title: 'alpha beta'})");
+    run_write(&mut coord, "MATCH (n:Doc) REMOVE n.title");
+
+    coord
+        .create_fulltext_index(
+            "docs",
+            &["Doc".to_owned()],
+            &["title".to_owned()],
+            Analyzer::Standard,
+            false,
+        )
+        .expect("declare fulltext index");
+    while coord.advance_index_builds(usize::MAX) {}
+
+    let reader = coord.begin_serializable();
+    let graph = coord.statement(reader).expect("statement");
+    let stale = graph.fulltext_query("docs", "alpha");
+    assert_eq!(
+        stale.as_ref().map(Vec::len),
+        Some(0),
+        "the build indexed a COMMITTED-REMOVED property: 'alpha' still matches a node with no title \
+         at all. got {stale:?}",
+    );
+}
+
+/// Newest-wins must settle a key whatever the newest version's TYPE (`rmp` task #778 audit).
+///
+/// The dedup guard keyed off the accumulated STRING list, so it only tripped once a string had been
+/// pushed for that key. When the newest version was a non-string it contributed nothing, the guard never
+/// tripped, and the loop walked on to index an OLDER string version of the same key — resurrecting a
+/// superseded term. Independent of concurrency.
+#[test]
+fn fulltext_build_does_not_index_a_string_shadowed_by_a_non_string() {
+    let mut coord = fresh_coord();
+    run_write(&mut coord, "CREATE (:Doc {title: 'alpha beta'})");
+    run_write(&mut coord, "MATCH (n:Doc) SET n.title = 42");
+
+    coord
+        .create_fulltext_index(
+            "docs",
+            &["Doc".to_owned()],
+            &["title".to_owned()],
+            Analyzer::Standard,
+            false,
+        )
+        .expect("declare fulltext index");
+    while coord.advance_index_builds(usize::MAX) {}
+
+    let reader = coord.begin_serializable();
+    let graph = coord.statement(reader).expect("statement");
+    let stale = graph.fulltext_query("docs", "alpha");
+    assert_eq!(
+        stale.as_ref().map(Vec::len),
+        Some(0),
+        "a superseded STRING version was indexed because the newest version is an integer: \
+         'alpha' still matches a node whose title is 42. got {stale:?}",
+    );
+}
