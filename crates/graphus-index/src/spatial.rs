@@ -78,18 +78,35 @@ fn cell_rect_area(cx0: i64, cx1: i64, cy0: i64, cy1: i64) -> Option<usize> {
 }
 
 /// A uniform **grid index** over 2D-projected points: `cell -> sorted node ids`, plus a forward map
-/// (`node -> its (cell, point)`) so an update/delete is O(1) in the number of cells (`rmp` task #73).
+/// (`node -> its (cell, point)` entries) so an update/delete is O(k) in that node's own entry count
+/// rather than O(cells) (`rmp` tasks #73 / #779).
 ///
 /// # Representation
 ///
 /// - `cells: cell -> sorted, de-duplicated node ids in that cell`. Sorted so [`query_bbox`] /
 ///   [`query_within`] return candidates ascending (a deterministic order, like every other index
 ///   kind).
-/// - `forward: node -> (cell, point)`. Without it, removing a node would require scanning every cell;
-///   with it, a delete/update is O(1) in the cell count.
+/// - `forward: node -> its indexed `(cell, point)` entries`. Without it, removing a node would require
+///   scanning every cell; with it, a delete/update is O(k) in that node's own entry count.
 ///
 /// Both are [`BTreeMap`]/[`BTreeSet`]-backed so iteration is deterministic (reproducible tests and
 /// the candidate-ordering contract).
+///
+/// # Why a node may hold SEVERAL points (`rmp` task #779)
+///
+/// The per-write seam is **last-wins**: a live node has exactly one current point, so `forward` holds
+/// one entry for it. The **build** seam ([`merge_point`](Self::merge_point)) instead unions **every
+/// version** of the node's point property, so a node under an index build can hold several entries.
+///
+/// That union is not an optimisation — it is the only image the grid may hold, because of the
+/// false-negative asymmetry the whole index layer turns on: a seek's residual re-check can REMOVE a
+/// candidate, never RESURRECT one. Collapsing a build to the newest version produced a SUBSET, and when
+/// that newest version belonged to a still-open transaction (an index built while a writer holds an
+/// uncommitted move) the committed point was indexed nowhere: a fresh reader sought it and got nothing,
+/// while the snapshot-correct scan returned it — the `rmp` #766 loss, which reproduced on this grid
+/// until this fix. The extra cells a union occupies are false positives the executor's residual
+/// `distance(...) <op> r` filter drops, re-reading each candidate's snapshot-visible point (verified
+/// empirically, not assumed: the grid offers the stale candidate and the query returns no row).
 ///
 /// [`query_bbox`]: SpatialIndex::query_bbox
 /// [`query_within`]: SpatialIndex::query_within
@@ -99,8 +116,11 @@ pub struct SpatialIndex {
     cell_size: f64,
     /// cell → sorted, de-duplicated node ids whose indexed point falls in that cell.
     cells: BTreeMap<Cell, Vec<u64>>,
-    /// node → its current `(cell, indexed point)` (the forward index, for deletes/updates).
-    forward: BTreeMap<u64, (Cell, Point)>,
+    /// node → its indexed `(cell, point)` entries (the forward index, for deletes/updates). Exactly one
+    /// entry for a node maintained by the last-wins write seam; possibly several for a node a build
+    /// unioned across versions (`rmp` task #779). Never empty for a present node, and never holding two
+    /// entries with the same `(cell, point)`.
+    forward: BTreeMap<u64, Vec<(Cell, Point)>>,
 }
 
 impl SpatialIndex {
@@ -144,6 +164,16 @@ impl SpatialIndex {
         self.cells.len()
     }
 
+    /// The total number of `(cell, point)` entries across all indexed nodes (`rmp` task #779).
+    ///
+    /// Equals [`len`](Self::len) whenever every node was indexed by the last-wins write seam, and
+    /// exceeds it by the number of extra DISTINCT point versions a build unioned. The memory-cost
+    /// observable the multi-value grid is measured by.
+    #[must_use]
+    pub fn entry_count(&self) -> usize {
+        self.forward.values().map(Vec::len).sum()
+    }
+
     /// The grid cell a point's `(x, y)` projection falls into. A non-finite coordinate maps to cell
     /// `0` on that axis (the caller's exact predicate still rejects it; the bucket is just arbitrary).
     fn cell_of(&self, point: &Point) -> Cell {
@@ -167,49 +197,163 @@ impl SpatialIndex {
         }
     }
 
-    /// Indexes (or **re-indexes**) `node` at `point`. Idempotent on the node: it first removes any
-    /// existing entry (so an update after a coordinate change re-buckets the node), then inserts the
-    /// node into its new cell's id list.
+    /// Indexes (or **re-indexes**) `node` at `point`, **last-wins**: it first removes ALL of the node's
+    /// existing entries (so an update after a coordinate change re-buckets it, and a node a build
+    /// unioned across versions collapses to its one current point), then inserts it into the new cell's
+    /// id list. This is the **write** seam; the build seam is [`merge_point`](Self::merge_point).
     ///
-    /// Returns whether the node's point actually **changed** — it was present before AND the new point
-    /// differs from the old (the node moved). A brand-new node (a pure insert) and an *unchanged*
-    /// re-index (e.g. the wholesale [`reindex_node`](crate::record_graph) a write of an UNRELATED
-    /// property triggers, re-inserting the same point) both return `false`. The full-text/spatial
-    /// freshness-marker machinery (`rmp` task #756) uses this to poison the marker on rollback ONLY for a
-    /// real move: a rolled-back move can drop a still-committed node from the grid cell it should occupy
-    /// (a false negative), whereas a rolled-back pure insert or unchanged re-index leaves the committed
-    /// entry exactly as it should be (at worst a re-check-filterable false positive).
+    /// Returns whether this call actually **dropped** anything the grid was holding — the node was
+    /// present before AND its entries were not already exactly this one point. A brand-new node (a pure
+    /// insert) and an *unchanged* re-index (e.g. the wholesale [`reindex_node`](crate::record_graph) a
+    /// write of an UNRELATED property triggers, re-inserting the same point) both return `false`;
+    /// a real move returns `true`, and so does collapsing a multi-entry node, because the entries it
+    /// discards are versions an older snapshot may still need.
+    ///
+    /// The full-text/spatial freshness-marker machinery (`rmp` task #756) uses this to poison the marker
+    /// on rollback ONLY for a real drop: a rolled-back drop can leave a still-committed node missing from
+    /// the grid cell it should occupy (a false negative), whereas a rolled-back pure insert or unchanged
+    /// re-index leaves the committed entry exactly as it should be (at worst a re-check-filterable false
+    /// positive).
+    ///
+    /// The equality here is [`Point::value_eq`], deliberately NOT the `total_cmp` that
+    /// [`merge_point`](Self::merge_point) dedups with. The two want opposite answers on `NaN`: this seam
+    /// is a **poison** decision, where treating `NaN` as unequal reports `changed` and over-poisons
+    /// (fail-closed, safe); that seam is a **dedup** decision, where treating `NaN` as unequal would
+    /// silently stop deduplicating. Do not unify them.
+    ///
+    /// # Known over-firing on a unioned node (`rmp` task #779) — stated, not implied
+    ///
+    /// This result is **conservative, and measurably wider than it was before #779**. The FIRST write to
+    /// a node a build unioned reports `changed` even when the point did not move at all (e.g. the
+    /// wholesale re-index an unrelated property write triggers), because `len() != 1` fires on the
+    /// multi-entry state. If that write then rolls back, the `rmp` #756 machinery poisons the ft/spatial
+    /// freshness marker, and the poison stands until a full rebuild — so one rolled-back, unrelated write
+    /// takes the whole spatial fast path offline for the process. Reproduced: a node with two committed
+    /// point versions, indexed, then `SET n.name = 'x'` + rollback, declines the seek, while the
+    /// single-version control is still served.
+    ///
+    /// It is nonetheless the **correct** answer available at this layer, and narrowing it to "the new
+    /// point is not among the existing entries" is UNSOUND: a writer that sets the point BACK to an older
+    /// unioned value would then report no drop, yet the collapse discards the newest committed point, so
+    /// a rollback leaves that committed point in no cell at all — the exact false negative the poison
+    /// exists to prevent. Distinguishing a stale version from a live one needs commit visibility, which
+    /// the grid does not have; only a caller that knows which entry is committed could tighten this.
+    ///
+    /// The cost is bounded and self-clearing per node — the first write collapses that node to one entry,
+    /// after which it behaves exactly as it did pre-#779 — but the poison it may raise is not.
     pub fn index_point(&mut self, node: u64, point: Point) -> bool {
-        // Did the point actually move? Present before AND the new point differs. `value_eq` is used
-        // rather than a derived `PartialEq` (which `Point` intentionally omits for the `NaN` footgun); a
-        // `NaN` coordinate compares unequal, so it conservatively reports `changed` (safe). The borrow
-        // ends before the mutating `remove` below (`rmp` task #756).
+        // Did this write actually DROP something the grid was holding? Present before AND its entries
+        // are not already exactly this one point. See the method docs for why the comparison is
+        // `value_eq` here and `total_cmp` in `merge_point`. The borrow ends before the mutating
+        // `remove` below.
         let changed = self
             .forward
             .get(&node)
-            .is_some_and(|(_, old_point)| !old_point.value_eq(&point));
+            .is_some_and(|entries| entries.len() != 1 || !entries[0].1.value_eq(&point));
         self.remove(node);
+        self.add_entry(node, point);
+        changed
+    }
+
+    /// **Unions** `point` into `node`'s indexed entries without dropping any it already holds — the
+    /// build-path analogue of [`index_point`](Self::index_point), which is last-wins (`rmp` task #779).
+    ///
+    /// An index build reads a node's whole point version chain and calls this once per point version, so
+    /// the grid becomes the candidate **SUPERSET** across all versions — the only image safe for a
+    /// structure whose seek re-check can drop a candidate but never resurrect one (`rmp` task #766). The
+    /// residual `distance(...) <op> r` filter above the seek drops every version's cell that does not
+    /// match the reader's snapshot-visible point.
+    ///
+    /// Idempotent on an identical `(cell, point)`: re-merging a point the node already carries adds
+    /// nothing, so a chain of `V` versions all at the same coordinate costs one entry, not `V`. Unlike
+    /// [`index_point`](Self::index_point) this never removes, so it has no `changed` result to report —
+    /// a pure insert can never leave a still-committed node missing from the grid (`rmp` task #756).
+    pub fn merge_point(&mut self, node: u64, point: Point) {
+        let cell = self.cell_of(&point);
+        // Already carried? Dedup on the exact `(cell, point)` so repeated identical versions do not
+        // grow the entry list. Linear in this node's own entry count, which is the number of DISTINCT
+        // points its chain holds (typically 1).
+        //
+        // The comparison is `total_cmp`, NOT `value_eq`. `value_eq` is IEEE value equality, under which
+        // `NaN != NaN` — so a chain repeatedly written with a `NaN` coordinate would defeat the dedup
+        // and add one entry per version. `total_cmp` is the total Cypher orderability in which `NaN`
+        // equals itself, which is exactly the identity this dedup wants. Collapsing two `total_cmp`-equal
+        // points can never lose a candidate: they carry the same CRS and bit-identical coordinates, so
+        // they bucket to the same cell and the residual re-check treats them identically. (`-0.0` and
+        // `+0.0` are `total_cmp`-distinct and would each be kept — harmless, since both bucket to the
+        // same cell and the extra entry is a false positive the residual drops.)
+        // The entry list is kept SORTED by `(cell, point)` so this is a binary search, not a linear
+        // scan. A linear scan makes the union O(V^2) in comparisons for an entity whose chain holds V
+        // DISTINCT points, and `rmp` #305 leaves chains unpruned, so V has no bound. Measured on one
+        // node, release, best of 3 (V distinct points):
+        //
+        //   V:            256     512    1024    2048    4096
+        //   linear scan:   32us   125us   317us   932us  3389us
+        //   binary search: 19us    49us    96us   245us   501us
+        //
+        // The `Vec::insert` still memmoves, but moving 48-byte elements is far cheaper than the CRS +
+        // 3-coordinate comparisons it replaces.
+        let entries = self
+            .forward
+            .entry(node)
+            .or_insert_with(|| Vec::with_capacity(1));
+        match entries.binary_search_by(|(c, p)| c.cmp(&cell).then_with(|| p.total_cmp(&point))) {
+            Ok(_) => {} // already carried: an identical `(cell, point)` adds nothing.
+            Err(pos) => {
+                entries.insert(pos, (cell, point));
+                let list = self.cells.entry(cell).or_default();
+                if let Err(at) = list.binary_search(&node) {
+                    list.insert(at, node);
+                }
+            }
+        }
+    }
+
+    /// Adds one `(cell, point)` entry for `node`: appends to its forward list and inserts it into that
+    /// cell's sorted id list (a no-op there when another of the node's entries already occupies the
+    /// cell, since the list is de-duplicated).
+    ///
+    /// Used by [`index_point`](Self::index_point) only, which always [`remove`](Self::remove)s first, so
+    /// the list it appends to is empty and the single resulting entry is trivially sorted — the ordering
+    /// [`merge_point`](Self::merge_point)'s binary search depends on is preserved.
+    fn add_entry(&mut self, node: u64, point: Point) {
         let cell = self.cell_of(&point);
         let list = self.cells.entry(cell).or_default();
         if let Err(pos) = list.binary_search(&node) {
             list.insert(pos, node);
         }
-        self.forward.insert(node, (cell, point));
-        changed
+        // `with_capacity(1)`, not `or_default().push(..)`. An entry is 48 bytes, and `Vec`'s growth
+        // policy gives a first allocation of FOUR slots for any element of 1..=1024 bytes — so the
+        // default would reserve 192 bytes for the single entry that is all the overwhelmingly common
+        // (one live version, written by the last-wins seam) node ever holds.
+        //
+        // Measured with an allocation-counting global allocator, 100k single-version entities, release:
+        // the old inline `(Cell, Point)` representation cost 134.41 bytes/entity; `or_default()` cost
+        // 282.41 (2.10x); this exact-fit reservation costs 138.41 (1.03x). Growth beyond one entry then
+        // follows `Vec`'s normal doubling (`rmp` task #779).
+        self.forward
+            .entry(node)
+            .or_insert_with(|| Vec::with_capacity(1))
+            .push((cell, point));
     }
 
-    /// Removes `node` from the index entirely (its forward entry and the one cell it lives in),
+    /// Removes `node` from the index entirely (its forward entries and every cell they live in),
     /// returning whether it was present. Idempotent: removing an absent node is a no-op.
     pub fn remove(&mut self, node: u64) -> bool {
-        let Some((cell, _)) = self.forward.remove(&node) else {
+        let Some(entries) = self.forward.remove(&node) else {
             return false;
         };
-        if let Some(list) = self.cells.get_mut(&cell) {
-            if let Ok(pos) = list.binary_search(&node) {
-                list.remove(pos);
-            }
-            if list.is_empty() {
-                self.cells.remove(&cell);
+        // A node the build unioned may occupy several cells, and two of its entries may share one cell
+        // — the second removal from that cell is then a no-op (`binary_search` fails), which is exactly
+        // right: the cell list holds each node id at most once.
+        for (cell, _) in entries {
+            if let Some(list) = self.cells.get_mut(&cell) {
+                if let Ok(pos) = list.binary_search(&node) {
+                    list.remove(pos);
+                }
+                if list.is_empty() {
+                    self.cells.remove(&cell);
+                }
             }
         }
         true
@@ -540,6 +684,126 @@ mod tests {
         assert!(idx.is_empty());
         assert_eq!(idx.cell_count(), 0);
         assert!(idx.query_within(0.0, 0.0, 10.0).is_empty());
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // Multi-valued grid: the build unions every version (`rmp` task #779)
+    // ----------------------------------------------------------------------------------------
+
+    /// The headline #779 property: a node the build unioned across two point versions is a candidate at
+    /// BOTH, so a committed point stays findable even when an uncommitted version was also indexed.
+    #[test]
+    fn merge_point_unions_versions_so_both_are_candidates_779() {
+        let mut idx = SpatialIndex::new(1.0);
+        idx.merge_point(10, cart(0.5, 0.5)); // the committed point
+        idx.merge_point(10, cart(100.5, 100.5)); // an uncommitted writer's point
+
+        assert_eq!(idx.len(), 1, "still ONE node");
+        assert_eq!(idx.entry_count(), 2, "carrying TWO point entries");
+        assert_eq!(
+            idx.query_within(0.0, 0.0, 1.0),
+            vec![10],
+            "the committed point must still be a candidate (the #766 loss)"
+        );
+        assert_eq!(
+            idx.query_within(100.0, 100.0, 1.0),
+            vec![10],
+            "the other version is a candidate too (a false positive the residual drops)"
+        );
+    }
+
+    /// A union must be idempotent on an identical point: a chain of `V` versions all at one coordinate
+    /// costs ONE entry, not `V`. Without this a long unpruned chain (`rmp` #305) grows the grid linearly
+    /// in versions for no candidate benefit.
+    #[test]
+    fn merge_point_dedups_an_identical_repeated_version_779() {
+        let mut idx = SpatialIndex::new(1.0);
+        for _ in 0..64 {
+            idx.merge_point(10, cart(0.5, 0.5));
+        }
+        assert_eq!(idx.entry_count(), 1, "64 identical versions → ONE entry");
+        assert_eq!(idx.cell_count(), 1);
+        assert_eq!(idx.query_within(0.0, 0.0, 1.0), vec![10]);
+    }
+
+    /// The dedup must hold for a `NaN` coordinate too. `Point::value_eq` is IEEE value equality, under
+    /// which `NaN != NaN`, so deduping with it would add one entry per version for a chain repeatedly
+    /// written with a `NaN` — the dedup silently not working in exactly the case nobody tests. The
+    /// comparison is `total_cmp` (the total Cypher orderability, in which `NaN` equals itself).
+    #[test]
+    fn merge_point_dedups_a_repeated_nan_coordinate_779() {
+        let mut idx = SpatialIndex::new(1.0);
+        for _ in 0..64 {
+            idx.merge_point(10, cart(f64::NAN, 0.5));
+        }
+        assert_eq!(
+            idx.entry_count(),
+            1,
+            "64 identical NaN versions must collapse to ONE entry, not 64"
+        );
+    }
+
+    /// Removing a multi-entry node must clear it from EVERY cell it occupies. A partial removal would
+    /// leave a phantom candidate id in a cell whose forward entry is gone — an id the re-check would
+    /// have to resolve against a node that may no longer exist.
+    #[test]
+    fn remove_clears_a_node_from_every_cell_it_occupies_779() {
+        let mut idx = SpatialIndex::new(1.0);
+        idx.merge_point(10, cart(0.5, 0.5));
+        idx.merge_point(10, cart(50.5, 50.5));
+        idx.merge_point(10, cart(99.5, 99.5));
+        idx.merge_point(20, cart(0.7, 0.7)); // shares cell (0,0) with 10
+        assert_eq!(idx.cell_count(), 3);
+
+        assert!(idx.remove(10));
+        assert!(idx.query_within(50.0, 50.0, 1.0).is_empty());
+        assert!(idx.query_within(99.0, 99.0, 1.0).is_empty());
+        // Node 20 still occupies the shared cell — removing 10 must not have taken it out.
+        assert_eq!(idx.query_within(0.0, 0.0, 1.0), vec![20]);
+        assert_eq!(idx.cell_count(), 1, "the two vacated cells are dropped");
+        assert_eq!(idx.entry_count(), 1);
+    }
+
+    /// Two versions in the SAME cell must leave that cell's id list de-duplicated (a cell holds each id
+    /// at most once), and one `remove` must still fully clear the node.
+    #[test]
+    fn two_versions_in_one_cell_keep_the_id_list_deduplicated_779() {
+        let mut idx = SpatialIndex::new(10.0); // one big cell
+        idx.merge_point(10, cart(1.0, 1.0));
+        idx.merge_point(10, cart(2.0, 2.0)); // same cell (0,0), different point
+        assert_eq!(idx.entry_count(), 2);
+        assert_eq!(
+            idx.query_within(1.5, 1.5, 5.0),
+            vec![10],
+            "the id appears ONCE, not twice"
+        );
+        assert!(idx.remove(10));
+        assert!(idx.is_empty());
+        assert_eq!(idx.cell_count(), 0);
+    }
+
+    /// The per-write seam stays LAST-WINS on top of a unioned node: it collapses the node to the one
+    /// current point, and (because it dropped entries an older snapshot may need) reports `changed` so
+    /// the `rmp` #756 rollback poison still engages.
+    #[test]
+    fn index_point_collapses_a_unioned_node_and_reports_changed_779() {
+        let mut idx = SpatialIndex::new(1.0);
+        idx.merge_point(10, cart(0.5, 0.5));
+        idx.merge_point(10, cart(100.5, 100.5));
+        assert_eq!(idx.entry_count(), 2);
+
+        // Last-wins, and the surviving point is one the node already had: still `changed`, because the
+        // OTHER entry was dropped.
+        assert!(
+            idx.index_point(10, cart(0.5, 0.5)),
+            "collapsing a unioned node DROPS entries — that must report changed (rmp #756)"
+        );
+        assert_eq!(idx.entry_count(), 1, "collapsed to the one current point");
+        assert!(
+            idx.query_within(100.0, 100.0, 1.0).is_empty(),
+            "the other version's cell is gone"
+        );
+        assert_eq!(idx.query_within(0.0, 0.0, 1.0), vec![10]);
     }
 
     /// `rmp` #756: `index_point` must report whether the point actually MOVED — a pure insert and an

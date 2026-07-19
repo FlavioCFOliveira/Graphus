@@ -1118,3 +1118,318 @@ fn fulltext_build_does_not_index_a_string_shadowed_by_a_non_string() {
          'alpha' still matches a node whose title is 42. got {stale:?}",
     );
 }
+
+// =================================================================================================
+// SPATIAL (point) grids — `rmp` task #779
+// =================================================================================================
+
+/// A node proximity query near the origin; the committed point is at the origin.
+const NEAR_ORIGIN: &str =
+    "MATCH (n:City) WHERE distance(n.loc, point({x: 0, y: 0})) <= 1 RETURN id(n) AS id";
+
+#[test]
+fn spatial_online_build_while_writer_open_keeps_committed_point_findable() {
+    let mut coord = fresh_coord();
+    run_write(
+        &mut coord,
+        "CREATE (:City {name: 'a', loc: point({x: 0, y: 0})})",
+    );
+
+    // An OPEN, UNCOMMITTED writer moves the point far away.
+    let writer = coord.begin_serializable();
+    let _ = run_plan(
+        &coord,
+        writer,
+        &compile(
+            "MATCH (n:City) SET n.loc = point({x: 100, y: 100})",
+            &IndexCatalog::empty(),
+        ),
+    );
+
+    // THE PRODUCTION ROUTE, driven ONLINE.
+    coord
+        .create_point_index("by_loc", "City", "loc", false)
+        .expect("declare point index");
+    while coord.advance_index_builds(usize::MAX) {}
+
+    assert!(
+        !coord.catalog().indexes().is_empty(),
+        "vacuous: no index in the planner's catalog",
+    );
+
+    let reader = coord.begin_serializable();
+    let (seek, scan) = seek_vs_scan(&coord, reader, NEAR_ORIGIN);
+    assert_eq!(scan, 1, "ground truth broken: committed point must be seen");
+    assert_eq!(
+        seek, scan,
+        "the spatial build indexed the UNCOMMITTED point and lost the committed one: \
+         index seek returned {seek}, the snapshot-correct scan returned {scan}",
+    );
+}
+
+/// A relationship proximity query near the origin.
+const REL_NEAR_ORIGIN: &str = "MATCH (a)-[r:VISITED]->(b) \
+     WHERE distance(r.at, point({x: 0, y: 0})) <= 1 RETURN id(r) AS id";
+
+/// A node proximity query near (100, 100) — where an in-flight writer's point lands.
+const NEAR_FAR_100: &str =
+    "MATCH (n:City) WHERE distance(n.loc, point({x: 100, y: 100})) <= 1 RETURN id(n) AS id";
+
+#[test]
+fn spatial_rel_build_while_writer_open_keeps_committed_point_findable() {
+    let mut coord = fresh_coord();
+    run_write(&mut coord, "CREATE (:P {name: 'p1'}), (:P {name: 'p2'})");
+    run_write(
+        &mut coord,
+        "MATCH (a:P {name: 'p1'}), (b:P {name: 'p2'}) \
+         CREATE (a)-[:VISITED {at: point({x: 0, y: 0})}]->(b)",
+    );
+
+    let writer = coord.begin_serializable();
+    let _ = run_plan(
+        &coord,
+        writer,
+        &compile(
+            "MATCH ()-[r:VISITED]->() SET r.at = point({x: 100, y: 100})",
+            &IndexCatalog::empty(),
+        ),
+    );
+
+    coord
+        .create_point_rel_index("rel_at", "VISITED", "at", false)
+        .expect("declare rel point index");
+    while coord.advance_index_builds(usize::MAX) {}
+
+    assert!(
+        !coord.catalog().indexes().is_empty(),
+        "vacuous: no index in the planner's catalog",
+    );
+
+    let reader = coord.begin_serializable();
+    let (seek, scan) = seek_vs_scan(&coord, reader, REL_NEAR_ORIGIN);
+    assert_eq!(scan, 1, "ground truth broken: committed point must be seen");
+    assert_eq!(
+        seek, scan,
+        "the rel spatial build indexed the UNCOMMITTED point and lost the committed one: \
+         index seek returned {seek}, the snapshot-correct scan returned {scan}",
+    );
+}
+
+/// THE LOAD-BEARING INVARIANT (`rmp` task #779). The multi-valued grid is only safe because the
+/// executor keeps a residual `distance(...)` filter above the spatial seek that re-reads each
+/// candidate's SNAPSHOT-VISIBLE point. If that residual is ever dropped — an "optimisation" that would
+/// look free, since the grid seems to answer the predicate already — the union stops being a superset
+/// the caller trims and starts being WRONG ROWS.
+///
+/// So this pins the invariant instead of trusting it (`rmp` #734's lesson: a correctness argument that
+/// rests on an invariant maintained elsewhere must fail loudly when that invariant breaks). It asserts
+/// BOTH halves, which is what makes it non-vacuous:
+///
+/// 1. the raw grid really does offer the far candidate (so the residual has something to drop); and
+/// 2. the full query returns no row (so the residual dropped it).
+///
+/// Assertion 1 alone would pass on a grid that lost the entry; assertion 2 alone would pass on a plan
+/// that never consulted the index.
+#[test]
+fn spatial_residual_filter_rechecks_the_snapshot_visible_point_779() {
+    let mut coord = fresh_coord();
+    // Committed at the origin; a LATER COMMITTED version moves it far away. The build unions both, so
+    // the grid offers this node as a candidate near the origin — where it no longer is.
+    run_write(
+        &mut coord,
+        "CREATE (:City {name: 'a', loc: point({x: 0, y: 0})})",
+    );
+    run_write(
+        &mut coord,
+        "MATCH (n:City) SET n.loc = point({x: 100, y: 100})",
+    );
+    coord
+        .create_point_index("by_loc", "City", "loc", false)
+        .expect("declare point index");
+    while coord.advance_index_builds(usize::MAX) {}
+
+    let reader = coord.begin_serializable();
+    // (1) The grid DOES offer the stale candidate near the origin.
+    let candidates = {
+        let graph = coord.statement(reader).expect("statement");
+        graph.index_seek_spatial("City", "loc", 0.0, 0.0, 1.0)
+    };
+    assert_eq!(
+        candidates.as_ref().map(Vec::len),
+        Some(1),
+        "vacuous: the grid did not offer the superseded version as a candidate, so the residual \
+         re-check below is not being exercised. got {candidates:?}",
+    );
+    // (2) …and the query returns NO row, because the residual re-read the visible point (100, 100).
+    let (seek, scan) = seek_vs_scan(&coord, reader, NEAR_ORIGIN);
+    assert_eq!(scan, 0, "ground truth: the node is no longer at the origin");
+    assert_eq!(
+        seek, 0,
+        "the residual distance filter did NOT re-check: the spatial seek returned a WRONG ROW for a \
+         node whose visible point is (100, 100). The multi-valued grid (rmp #779) is unsound without \
+         this re-check.",
+    );
+}
+
+/// The relationship twin of the invariant above (`rmp` task #779).
+#[test]
+fn spatial_rel_residual_filter_rechecks_the_snapshot_visible_point_779() {
+    let mut coord = fresh_coord();
+    run_write(&mut coord, "CREATE (:P {name: 'p1'}), (:P {name: 'p2'})");
+    run_write(
+        &mut coord,
+        "MATCH (a:P {name: 'p1'}), (b:P {name: 'p2'}) \
+         CREATE (a)-[:VISITED {at: point({x: 0, y: 0})}]->(b)",
+    );
+    run_write(
+        &mut coord,
+        "MATCH ()-[r:VISITED]->() SET r.at = point({x: 100, y: 100})",
+    );
+    coord
+        .create_point_rel_index("rel_at", "VISITED", "at", false)
+        .expect("declare rel point index");
+    while coord.advance_index_builds(usize::MAX) {}
+
+    let reader = coord.begin_serializable();
+    let candidates = {
+        let graph = coord.statement(reader).expect("statement");
+        graph.index_seek_spatial_rel("VISITED", "at", 0.0, 0.0, 1.0)
+    };
+    assert_eq!(
+        candidates.as_ref().map(Vec::len),
+        Some(1),
+        "vacuous: the rel grid did not offer the superseded version as a candidate. got {candidates:?}",
+    );
+    let (seek, scan) = seek_vs_scan(&coord, reader, REL_NEAR_ORIGIN);
+    assert_eq!(scan, 0, "ground truth: the rel is no longer at the origin");
+    assert_eq!(
+        seek, 0,
+        "the residual distance filter did NOT re-check: the rel spatial seek returned a WRONG ROW.",
+    );
+}
+
+/// The synchronous rebuild route (an UNRELATED index DDL wipes every tree via `IndexSet::clear` and
+/// refills while the writer is still open) must also keep the committed point findable (`rmp` #779).
+///
+/// HONEST SCOPE: this test **passed before the fix** — it is not a #779 regression test. Here the
+/// spatial index exists BEFORE the writer opens, so `note_ft_spatial_mutator` (which iterates
+/// `registered_spatial()`) does record the writer, the #467 freshness marker is poisoned, and the reader
+/// declines to the snapshot-correct scan. That is precisely the case #779 is NOT about: the defect is
+/// the writer that PREDATES the index, whom the marker never sees. It is kept as the complementary
+/// guard — it fails if the marker path itself ever regresses, which the multi-value union must not be
+/// allowed to mask.
+#[test]
+fn spatial_unrelated_rebuild_while_writer_open_keeps_committed_point_findable() {
+    let mut coord = fresh_coord();
+    run_write(
+        &mut coord,
+        "CREATE (:City {name: 'a', loc: point({x: 0, y: 0})})",
+    );
+    coord
+        .create_point_index("by_loc", "City", "loc", false)
+        .expect("create point index");
+    while coord.advance_index_builds(usize::MAX) {}
+
+    let writer = coord.begin_serializable();
+    let _ = run_plan(
+        &coord,
+        writer,
+        &compile(
+            "MATCH (n:City) SET n.loc = point({x: 100, y: 100})",
+            &IndexCatalog::empty(),
+        ),
+    );
+
+    // An unrelated index DDL rebuilds every tree while the writer is still open.
+    coord
+        .create_node_property_index("City", "name")
+        .expect("unrelated create index");
+
+    let reader = coord.begin_serializable();
+    let (seek, scan) = seek_vs_scan(&coord, reader, NEAR_ORIGIN);
+    assert_eq!(scan, 1, "ground truth broken: committed point must be seen");
+    assert_eq!(
+        seek, scan,
+        "the rebuild indexed the UNCOMMITTED point and lost the committed one: \
+         index seek returned {seek}, the snapshot-correct scan returned {scan}",
+    );
+}
+
+/// The OTHER reader, and the reason indexing only the newest COMMITTED version is not a fix: once the
+/// in-flight writer commits, ITS point must be findable too. `commit` does not re-insert grid entries
+/// — they are made eagerly at write time and the rebuild destroyed them — so a committed-only image
+/// would lose this row instead. Unioning every version serves both readers (`rmp` #779).
+///
+/// HONEST SCOPE: this test **passed before the fix** — the pre-fix newest-wins build happened to bake
+/// exactly this reader's point in (that WAS the defect, seen from the other side). It is not a
+/// regression test for #779; it is the counterexample that rejects the WRONG fix. "Index only the
+/// newest COMMITTED version" repairs the two tests above and breaks this one, so it must stay green
+/// alongside them, and only the union keeps all three.
+#[test]
+fn spatial_rebuild_then_writer_commits_keeps_the_new_point_findable() {
+    let mut coord = fresh_coord();
+    run_write(
+        &mut coord,
+        "CREATE (:City {name: 'a', loc: point({x: 0, y: 0})})",
+    );
+    let writer = coord.begin_serializable();
+    let _ = run_plan(
+        &coord,
+        writer,
+        &compile(
+            "MATCH (n:City) SET n.loc = point({x: 100, y: 100})",
+            &IndexCatalog::empty(),
+        ),
+    );
+    coord
+        .create_point_index("by_loc", "City", "loc", false)
+        .expect("declare point index");
+    while coord.advance_index_builds(usize::MAX) {}
+    coord.commit(writer).expect("writer commits");
+
+    let reader = coord.begin_serializable();
+    let (seek, scan) = seek_vs_scan(&coord, reader, NEAR_FAR_100);
+    assert_eq!(
+        scan, 1,
+        "ground truth: the committed point is now (100,100)"
+    );
+    assert_eq!(
+        seek, scan,
+        "after the writer committed, its point is findable nowhere: \
+         index seek returned {seek}, the snapshot-correct scan returned {scan}",
+    );
+}
+
+/// A rolled-back writer must leave the committed point findable: the refill must not have baked the
+/// dirty point in as the node's only grid entry (`rmp` #779).
+#[test]
+fn spatial_rebuild_then_writer_rolls_back_keeps_committed_point_findable() {
+    let mut coord = fresh_coord();
+    run_write(
+        &mut coord,
+        "CREATE (:City {name: 'a', loc: point({x: 0, y: 0})})",
+    );
+    let writer = coord.begin_serializable();
+    let _ = run_plan(
+        &coord,
+        writer,
+        &compile(
+            "MATCH (n:City) SET n.loc = point({x: 100, y: 100})",
+            &IndexCatalog::empty(),
+        ),
+    );
+    coord
+        .create_point_index("by_loc", "City", "loc", false)
+        .expect("declare point index");
+    while coord.advance_index_builds(usize::MAX) {}
+    coord.rollback(writer).expect("writer rolls back");
+
+    let reader = coord.begin_serializable();
+    let (seek, scan) = seek_vs_scan(&coord, reader, NEAR_ORIGIN);
+    assert_eq!(scan, 1, "ground truth broken: committed point must be seen");
+    assert_eq!(
+        seek, scan,
+        "after the writer rolled back, the committed point is findable nowhere: \
+         index seek returned {seek}, the snapshot-correct scan returned {scan}",
+    );
+}

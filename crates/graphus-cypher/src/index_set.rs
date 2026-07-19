@@ -2956,6 +2956,38 @@ impl IndexSet {
         }
     }
 
+    /// **Unions** node `node_id`'s point `value` into the `(label_token, prop_key)` spatial grid without
+    /// dropping any cell it already occupies (`rmp` task #779) — the build-path analogue of
+    /// [`insert_spatial_point`](Self::insert_spatial_point), which is last-wins. A no-op when no such
+    /// index is registered or `value` is not a point (a spatial index covers points only; unlike the
+    /// last-wins path there is nothing to remove, because a build only ever adds).
+    ///
+    /// An index build reads a property's whole version chain and calls this once per point version, so
+    /// the grid becomes the candidate **SUPERSET** across all versions — the only image safe for a
+    /// structure whose seek re-check can drop a candidate but never resurrect one (`rmp` task #766). The
+    /// residual `distance(...) <op> r` filter above the seek drops every version's cell that does not
+    /// match the reader's snapshot-visible point.
+    ///
+    /// Raises only the transient `ft_spatial_dirty` flag (a grid entry changed), never
+    /// `ft_spatial_removed_dirty`: a union is a pure insert, so it can never leave a still-committed
+    /// node dropped from a cell (`rmp` task #756). The build path clears the flag via
+    /// [`bump_ft_spatial_marker_after_build`](Self::bump_ft_spatial_marker_after_build) either way, so
+    /// this is never attributed to an open transaction.
+    pub fn merge_spatial_point(
+        &mut self,
+        label_token: u32,
+        prop_key: u32,
+        value: &Value,
+        node_id: u64,
+    ) {
+        if let Some(sp) = self.spatial.get_mut(&(label_token, prop_key)) {
+            if let Value::Point(p) = value {
+                sp.index.merge_point(node_id, *p);
+                self.ft_spatial_dirty = true;
+            }
+        }
+    }
+
     /// Removes `node_id` from the `(label_token, prop_key)` spatial index (a delete, a type change, or
     /// a node that lost the covered label). A no-op if no such index is registered.
     pub fn remove_spatial_point(&mut self, label_token: u32, prop_key: u32, node_id: u64) {
@@ -2992,6 +3024,30 @@ impl IndexSet {
     /// Candidate node ids whose `(label_token, prop_key)` point lies within the bounding box
     /// `[min_x, max_x] × [min_y, max_y]`, ascending. `None` if no such index is registered; otherwise
     /// a **geometric superset** (`rmp` task #73). The caller re-checks the exact predicate.
+    ///
+    /// # The exact re-check is MANDATORY, not an optimisation (`rmp` task #779)
+    ///
+    /// This method has **no production caller today** — the planner lowers only the proximity shape
+    /// (`distance(...) <op> r`) to a `SpatialIndexSeek`, never a bounding box — so the warning below is
+    /// for whoever wires it up.
+    ///
+    /// The returned ids are a superset along TWO independent axes, and a consumer that skips the
+    /// re-check returns WRONG ROWS on either:
+    ///
+    /// 1. **Geometric** — the grid buckets whole cells, so a cell clipped by the box contributes points
+    ///    outside it (the original `rmp` #73 contract); and
+    /// 2. **Temporal** — a node may be indexed at SEVERAL points at once, because an index build unions
+    ///    every version of its point property (`rmp` #779). A node whose visible point is far away is
+    ///    deliberately still a candidate here, since that union is what stops a committed point being
+    ///    indexed nowhere while an uncommitted writer holds the newest version (`rmp` #766).
+    ///
+    /// Axis 2 is the newer and the easier to overlook: before #779 a node had exactly one indexed point,
+    /// so a bbox consumer that skipped the re-check would merely have returned cell-edge false positives
+    /// — visibly wrong, but only at the margins. It now returns nodes that are nowhere near the box.
+    /// The proximity path stays correct because the planner ALWAYS re-attaches the exact
+    /// `distance(...)` predicate as a residual `Filter` above the seek (`Planner::lower_filter` →
+    /// `attach_residual`, called with every conjunct), and that residual re-reads each candidate's
+    /// snapshot-visible point. A bbox lowering MUST do the same with its coordinate predicate.
     #[must_use]
     pub fn seek_spatial_bbox(
         &self,
@@ -3114,6 +3170,26 @@ impl IndexSet {
             } else if sp.index.remove(rel_id) {
                 self.ft_spatial_dirty = true;
                 self.ft_spatial_removed_dirty = true;
+            }
+        }
+    }
+
+    /// **Unions** relationship `rel_id`'s point `value` into the `(type_token, prop_key)` relationship
+    /// spatial grid without dropping any cell it already occupies (`rmp` task #779) — the relationship
+    /// analogue of [`merge_spatial_point`](Self::merge_spatial_point), and the build-path counterpart of
+    /// the last-wins [`insert_spatial_rel_point`](Self::insert_spatial_rel_point). See
+    /// [`merge_spatial_point`](Self::merge_spatial_point) for why a build MUST union every version.
+    pub fn merge_spatial_rel_point(
+        &mut self,
+        type_token: u32,
+        prop_key: u32,
+        value: &Value,
+        rel_id: u64,
+    ) {
+        if let Some(sp) = self.spatial_rel.get_mut(&(type_token, prop_key)) {
+            if let Value::Point(p) = value {
+                sp.index.merge_point(rel_id, *p);
+                self.ft_spatial_dirty = true;
             }
         }
     }

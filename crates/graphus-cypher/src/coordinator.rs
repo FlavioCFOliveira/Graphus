@@ -3111,14 +3111,19 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             .reindex_fulltext_rel(id, type_token, &string_props);
     }
 
-    /// Inserts relationship `id`'s current point value into each `registered` `(type_token, prop_key)`
-    /// relationship spatial index it matches (`rmp` task #664). The relationship analogue of
-    /// [`index_one_node_spatial`](Self::index_one_node_spatial): the same single per-relationship code
-    /// path the full rebuild ([`rebuild_index`](Self::rebuild_index)) and the synchronous create build
-    /// both drive, so a recovered store rebuilds the relationship grids store-consistently. Only the
-    /// **point**-valued properties a registered index covers are read; a relationship of a different
-    /// type, or whose covered property is absent / non-point, contributes nothing (the grid is a
-    /// candidate set). The store and index are borrowed in **separate, non-overlapping** scopes.
+    /// Indexes relationship `id`'s **every** point version into each `registered`
+    /// `(type_token, prop_key)` relationship spatial index it matches (`rmp` tasks #664 / #779). The
+    /// relationship analogue of [`index_one_node_spatial`](Self::index_one_node_spatial): the same
+    /// single per-relationship code path the full rebuild ([`rebuild_index`](Self::rebuild_index)) and
+    /// the synchronous create build both drive, so a recovered store rebuilds the relationship grids
+    /// store-consistently. Only the **point**-valued properties a registered index covers are read; a
+    /// relationship of a different type, or whose covered property is absent / non-point, contributes
+    /// nothing (the grid is a candidate set). The store and index are borrowed in **separate,
+    /// non-overlapping** scopes.
+    ///
+    /// Like the node twin it **unions every version** rather than collapsing newest-wins — see
+    /// [`index_one_node_spatial`](Self::index_one_node_spatial) for why that is the only safe image
+    /// (`rmp` #766/#779).
     fn index_one_rel_spatial(
         store: &Rc<RefCell<RecordStore<D, S>>>,
         index: &Rc<RefCell<IndexSet>>,
@@ -3135,9 +3140,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 return;
             }
         };
-        // The relationship's current property values, keyed by prop-key (newest-wins per key), keeping
-        // only the point values a registered relationship spatial index covers for this relationship's
-        // type.
+        // EVERY point version a registered relationship spatial index covers for this relationship's
+        // type, in chain order (newest first) — NOT collapsed newest-wins (`rmp` task #779).
         let mut values: Vec<(u32, Value)> = Vec::new();
         {
             let chain = match store.borrow().rel_property_values(id) {
@@ -3151,9 +3155,9 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 }
             };
             for (_pid, key, value) in chain {
-                if values.iter().any(|(k, _)| *k == key) {
-                    continue; // newest-wins: keep only the first occurrence of each key.
-                }
+                // EVERY point version, not just the newest (`rmp` task #779) — see the node twin
+                // `index_one_node_spatial`'s docs. No newest-wins dedup here: the union below is what
+                // makes the grid a candidate SUPERSET across versions.
                 let used = registered
                     .iter()
                     .any(|&(reg_type, prop_key)| prop_key == key && reg_type == type_token);
@@ -3166,14 +3170,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let mut index = index.borrow_mut();
         for (prop_key, value) in &values {
             if index.has_spatial_rel(type_token, *prop_key) {
-                index.insert_spatial_rel_point(type_token, *prop_key, value, id);
+                index.merge_spatial_rel_point(type_token, *prop_key, value, id);
             }
         }
     }
 
-    /// Inserts node `id`'s current point value into each `registered` `(label_token, prop_key)`
-    /// spatial index it matches (`rmp` task #98). The spatial analogue of
-    /// [`index_one_node`](Self::index_one_node) / [`index_one_node_fulltext`](Self::index_one_node_fulltext):
+    /// Indexes node `id`'s **every** point version into each `registered` `(label_token, prop_key)`
+    /// spatial index it matches (`rmp` tasks #98 / #779). The spatial analogue of
+    /// [`index_one_node`](Self::index_one_node) / [`index_one_node_text`](Self::index_one_node_text):
     /// the same single per-node code path the full rebuild ([`rebuild_index`](Self::rebuild_index)) and
     /// the non-blocking spatial build ([`advance_spatial_build`](Self::advance_spatial_build)) both
     /// drive, so their per-node logic can never diverge.
@@ -3183,6 +3187,23 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// (the grid is a candidate set, so a missing candidate degrades to the scan fallback for that
     /// reader — never a wrong row). The store and the index are borrowed in **separate,
     /// non-overlapping** scopes (the load-bearing borrow discipline of this file).
+    ///
+    /// # Index EVERY version, never just the newest (`rmp` task #779)
+    ///
+    /// The chain is decoded newest-first and each point version is **unioned** into the grid via
+    /// [`merge_spatial_point`](IndexSet::merge_spatial_point), so the grid becomes a candidate
+    /// **SUPERSET** across all versions — for the same reason as the text index (`rmp` #773) and with
+    /// the same false-negative asymmetry behind it: a seek's residual re-check can REMOVE a candidate,
+    /// never RESURRECT one. Collapsing to the newest version produced a SUBSET, and when that newest
+    /// version belonged to a still-open transaction the committed point was indexed nowhere and a fresh
+    /// reader sought it and got nothing — the #766 loss, which reproduced on this grid until this fix
+    /// (pinned by `tests/index_rebuild_uncommitted.rs`). The extra cells a union occupies are false
+    /// positives the executor's residual `distance(...) <op> r` filter drops, re-reading each
+    /// candidate's snapshot-visible point.
+    ///
+    /// This is the **build** path only; the per-write seam ([`reindex_node`](crate::record_graph) →
+    /// [`insert_spatial_point`](IndexSet::insert_spatial_point)) stays last-wins, feeding one current
+    /// point per key, so the union engages solely here.
     fn index_one_node_spatial(
         store: &Rc<RefCell<RecordStore<D, S>>>,
         index: &Rc<RefCell<IndexSet>>,
@@ -3199,8 +3220,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 return;
             }
         };
-        // The node's current property values, keyed by prop-key (newest-wins per key), keeping only
-        // the point values a registered spatial index covers for one of this node's labels.
+        // EVERY point version a registered spatial index covers for one of this node's labels, in
+        // chain order (newest first) — NOT collapsed newest-wins (`rmp` task #779).
         let mut values: Vec<(u32, Value)> = Vec::new();
         {
             let chain = match store.borrow_mut().node_property_values(id) {
@@ -3214,9 +3235,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 }
             };
             for (_pid, key, value) in chain {
-                if values.iter().any(|(k, _)| *k == key) {
-                    continue; // newest-wins: keep only the first occurrence of each key.
-                }
+                // EVERY point version, not just the newest (`rmp` task #779). No newest-wins dedup: the
+                // union below is what makes the grid a candidate SUPERSET across versions.
                 let used = registered.iter().any(|&(reg_label, prop_key)| {
                     prop_key == key && label_tokens.contains(&reg_label)
                 });
@@ -3230,7 +3250,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         for (prop_key, value) in &values {
             for &lt in &label_tokens {
                 if index.has_spatial(lt, *prop_key) {
-                    index.insert_spatial_point(lt, *prop_key, value, id);
+                    index.merge_spatial_point(lt, *prop_key, value, id);
                 }
             }
         }
