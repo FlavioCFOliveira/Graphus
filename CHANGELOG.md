@@ -63,6 +63,10 @@ explicitly so an operator can judge their own exposure.
   restart.
 - **`EXPLAIN` / `PROFILE` query prefixes (rmp #752)** with the Neo4j-5.x plan shape (estimated rows /
   measured rows + dbHits), surfaced through the Bolt and REST result summary.
+- **Bolt transaction bookmarks (rmp #807).** The `SUCCESS` response to `COMMIT` and the terminal
+  auto-commit `PULL` now carry an opaque, monotonic-per-database `bookmark::String`, as the Bolt spec's
+  field list names — the official Neo4j driver accepts and chains it (`session.last_bookmarks()`).
+  Emitted only on a durable-write commit; reads, no-ops, DDL and `ROLLBACK` carry none.
 - **Offline bulk import → adopt → serve (rmp #681).** An offline import can be adopted and then served,
   queryable by the original `:ID`.
 - **Crash-safe B-tree whole-page reclamation via a persistent free list (rmp #225).**
