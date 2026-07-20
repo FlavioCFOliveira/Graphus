@@ -93,6 +93,14 @@ explicitly so an operator can judge their own exposure.
 
 ### Fixed
 
+- **A GC-freed dead-link relationship corpse zeroed its body, severing an in-flight off-thread
+  reader mid-traversal (rmp #811, ACID Isolation).** The maintenance GC runs while off-thread readers
+  are in flight over the shared page cache; `gc_splice_corpses` zeroed a reclaimed corpse's forward
+  chain pointer, so a reader poised on that corpse read a zeroed pointer, ended its walk, and silently
+  dropped every live relationship threaded below it — a wrong (short) traversal result. The freed
+  corpse now preserves its body exactly as the tombstone path does. Found by the release-readiness
+  audit; a schedule the single-threaded simulator structurally cannot reach, reproduced with real
+  threads.
 - **CRITICAL — a clean, fully-committed WAL refused to recover when the first retained record's
   `total_len` was a multiple of 256 (rmp #806).** `total_len` is a little-endian `u32`, so any
   multiple of 256 begins with a `0x00` byte; recovery skipped it as reclaimed padding, decoded garbage
