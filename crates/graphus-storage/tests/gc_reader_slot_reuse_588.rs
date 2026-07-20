@@ -165,3 +165,111 @@ fn gc_freed_slot_is_not_reused_while_an_inflight_reader_may_walk_through_it() {
     );
     let _ = (l1, l2, l3, READER_TICKET);
 }
+
+/// Regression: `rmp` #811 — the SIBLING hole `#588`'s reuse barrier does not close.
+///
+/// `#588` (above) proved a GC-freed slot is not REUSED under an in-flight reader. But `held_slots`
+/// only defers re-allocation; it never guarded the phase-3 ZEROING of a **dead-link corpse** (a rel
+/// slot left by an ABORTED create, reclaimed via `gc_splice_corpses`, NOT the tombstone path through
+/// the already-body-preserving `reclaim_rel`). The old phase 3 wrote `RelRecord::new(id, 0, 0, 0, 0)`,
+/// so an off-thread reader that entered hub's incidence walk holding `cur == corpse` BEFORE phase 2
+/// bridged it out, and read the corpse AFTER phase 3, saw a zeroed forward pointer, terminated its
+/// walk, and SILENTLY DROPPED every live rel threaded below the corpse — a wrong (short) traversal, an
+/// ACID Isolation defect a two-thread reproduction confirmed. The fix makes phase 3 preserve the body
+/// exactly as `reclaim_rel` does.
+///
+/// FAILS on the pre-fix zeroing phase 3: the reader's `out` loses the live rel below the corpse.
+#[test]
+fn a_gc_freed_dead_link_corpse_still_threads_an_inflight_reader_to_the_live_rel_below_811() {
+    let mut s = fresh(256);
+    let t = {
+        let txn = graphus_core::TxnId(1);
+        s.begin(txn);
+        let tk = s.intern_token(Namespace::RelType, "LINK").unwrap();
+        s.commit(txn).unwrap();
+        tk
+    };
+
+    // Committed hub H + three leaves.
+    let txn = graphus_core::TxnId(2);
+    s.begin(txn);
+    let (h, _) = s.create_node(txn).unwrap();
+    let (l1, _) = s.create_node(txn).unwrap();
+    let (l2, _) = s.create_node(txn).unwrap();
+    let (l3, _) = s.create_node(txn).unwrap();
+    s.commit(txn).unwrap();
+
+    // Three interleaved prepends onto H. The MIDDLE (r2) is rolled back LIVE while r1/r3 commit, so it
+    // becomes a dead-link corpse (aborted create -> gc_splice_corpses, not a tombstone). create_rel
+    // prepends, so the physical chain is H -> r3 -> r2(corpse) -> r1.
+    let (t1, t2, t3) = (
+        graphus_core::TxnId(3),
+        graphus_core::TxnId(4),
+        graphus_core::TxnId(5),
+    );
+    s.begin(t1);
+    s.begin(t2);
+    s.begin(t3);
+    let r1 = s.create_rel(t1, t, h, l1).unwrap().0;
+    let r2 = s.create_rel(t2, t, h, l2).unwrap().0;
+    let r3 = s.create_rel(t3, t, h, l3).unwrap().0;
+    s.commit(t1).unwrap();
+    s.rollback(t2).unwrap(); // the middle writer aborts: r2 is a dead-link corpse
+    s.commit(t3).unwrap();
+
+    assert!(
+        !s.rel(r2).unwrap().mvcc.in_use(),
+        "r2 must be a not-in-use corpse before GC"
+    );
+
+    // An OFF-THREAD READER (the shared Arc<pool> view) walks H's incidence chain hop-by-hop. When it
+    // reaches the corpse r2 — poised on it, exactly as it would be if it had cached `r3.next = r2`
+    // across an unlatched hop — the engine runs a maintenance GC (phase 2 bridges r3 -> r1, phase 3
+    // frees r2). The reader then reads r2 through the SAME shared view.
+    let view = s.read_view();
+    let mut out: Vec<u64> = Vec::new();
+    let mut cur = view.node(h).unwrap().first_rel;
+    let mut injected = false;
+    let mut steps = 0u64;
+    while cur != NULL_ID {
+        steps += 1;
+        assert!(
+            steps <= 64,
+            "walk did not terminate (malformed chain / cycle)"
+        );
+        if cur == r2 && !injected {
+            injected = true;
+            let watermark = s.snapshot_ts();
+            s.begin(graphus_core::TxnId(6));
+            s.gc(graphus_core::TxnId(6), watermark).unwrap();
+            s.commit(graphus_core::TxnId(6)).unwrap();
+            assert!(
+                !s.rel(r2).unwrap().mvcc.in_use(),
+                "the corpse must be freed by the GC (in-use bit clear)"
+            );
+        }
+        let r = view.rel(cur).unwrap();
+        if r.mvcc.in_use() && (r.start_node == h || r.end_node == h) {
+            out.push(cur);
+        }
+        cur = if r.start_node == h {
+            r.start_next_rel
+        } else {
+            r.end_next_rel
+        };
+    }
+
+    // The in-flight reader must still reach the live edge r1 threaded BELOW the corpse. The pre-fix
+    // zeroing severed r2's forward pointer, so the walk terminated at r2 and lost r1.
+    assert!(
+        out.contains(&r1),
+        "#811: an in-flight reader poised on a dead-link corpse before GC must still thread through \
+         the freed corpse to the live rel {r1} below it; a zeroed corpse body severs the walk \
+         (out={out:?})"
+    );
+    // r3 (the still-live head) is of course also reached.
+    assert!(
+        out.contains(&r3),
+        "the live head r3 is reached (out={out:?})"
+    );
+}

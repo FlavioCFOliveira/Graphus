@@ -4239,12 +4239,20 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             self.bridge_corpse_run(run, txn)?;
         }
 
-        // Phase 3 — free the now-unreferenced corpse slots. Clear the slot (the in-use bit is already
-        // off; zero the stale body so a re-allocated slot starts clean) and return the id to the free
-        // list, exactly as `reclaim_rel` does for a tombstoned rel.
+        // Phase 3 — free the now-unreferenced corpse slots. PRESERVE the corpse body (its start/end
+        // nodes and the four incidence-chain pointers), exactly as `reclaim_rel` does for a tombstoned
+        // rel: a still-in-flight off-thread reader (`rmp` #336) that entered a node's incidence walk
+        // holding `cur == corpse_id` BEFORE phase 2 bridged it out still threads correctly THROUGH the
+        // freed corpse to the live record below it. The old code wrote `RelRecord::new(element_id, 0, 0,
+        // 0, 0)`, zeroing the forward pointer, which severed such a reader's walk mid-flight and dropped
+        // every live rel threaded below the corpse — a silent short (wrong) traversal result confirmed
+        // by a two-thread reproduction (`rmp` #811). Only the now-dangling prop head is dropped and the
+        // in-use bit stays clear; the slot is reuse-deferred by `held_slots` (#588) until every
+        // predating reader retires, after which a fresh allocation overwrites the body wholesale — so
+        // the "zero it so a reused slot starts clean" rationale is moot (both hazards close together).
         for &corpse_id in &corpses {
-            let element_id = self.read_rel(corpse_id)?.element_id;
-            let mut dead = RelRecord::new(element_id, 0, 0, 0, 0);
+            let mut dead = self.read_rel(corpse_id)?;
+            dead.first_prop = NULL_ID; // the chain is freed; drop the now-dangling head pointer
             dead.mvcc = MvccHeader::default(); // in_use stays clear
             self.write_rel(corpse_id, &dead, txn)?;
             self.free_push(StoreKind::Rel, corpse_id, txn);
