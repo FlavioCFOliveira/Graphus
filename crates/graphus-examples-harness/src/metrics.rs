@@ -446,25 +446,41 @@ impl ThroughputCounter {
 // ---------------------------------------------------------------------------------------------
 
 impl StorageSection {
-    /// Builds a [`StorageSection`] from the measured store/WAL footprints and a `bytes_fsynced`
-    /// figure, each of which may be **absent** (= that path was not measured for this run).
+    /// Builds a [`StorageSection`] from the measured store footprint, the **WAL bytes written**, the
+    /// **retained** WAL directory footprint, and a `bytes_fsynced` figure — each of which may be
+    /// **absent** (= not measured for this run) (`rmp #805`).
     ///
-    /// `bytes_fsynced` is what the example honestly observed to have been forced to durable media. If
-    /// the example cannot instrument fsync directly, the WAL byte count is the most faithful proxy
-    /// (every committed WAL byte is fsynced before acknowledgement) — see
-    /// [`EvidenceCollector::record_storage`](crate::EvidenceCollector::record_storage), which defaults
-    /// it to exactly that when there IS a WAL to measure.
+    /// The two WAL quantities are deliberately distinct and answer different questions:
+    ///
+    /// * `wal_written_bytes` → [`wal_bytes`](StorageSection::wal_bytes): the durable write **volume**
+    ///   (`graphus_wal_bytes_written_total`), monotonic and reclamation-independent, hence **stable**
+    ///   across identical runs and the gated regression signal.
+    /// * `wal_retained` → [`wal_retained_bytes`](StorageSection::wal_retained_bytes): the on-disk size
+    ///   of the WAL directory at teardown, kept for diagnostic interest but **bimodal** by
+    ///   construction (it depends on where teardown lands relative to the last checkpoint), hence not
+    ///   gated.
+    ///
+    /// `bytes_fsynced` is what the example honestly observed forced to durable media. If the example
+    /// cannot instrument fsync directly, the WAL bytes **written** are the most faithful proxy (every
+    /// committed WAL byte is fsynced before acknowledgement) — see
+    /// [`EvidenceCollector::record_storage_at`](crate::EvidenceCollector::record_storage_at), which
+    /// defaults it to exactly that when a written figure is available. The retained directory size is
+    /// **not** a valid fsync proxy: it is a post-reclamation snapshot, not a count of bytes forced.
     #[must_use]
     pub fn from_footprints(
         store: Option<DiskFootprint>,
-        wal: Option<DiskFootprint>,
+        wal_written_bytes: Option<u64>,
+        wal_retained: Option<DiskFootprint>,
         bytes_fsynced: Option<u64>,
     ) -> Self {
+        let wal_written = wal_written_bytes.map(DiskFootprint::from_bytes);
         Self {
             store_bytes: store.map(|s| s.bytes),
-            wal_bytes: wal.map(|w| w.bytes),
             store_pages: store.map(|s| s.pages),
-            wal_pages: wal.map(|w| w.pages),
+            wal_bytes: wal_written.map(|w| w.bytes),
+            wal_pages: wal_written.map(|w| w.pages),
+            wal_retained_bytes: wal_retained.map(|w| w.bytes),
+            wal_retained_pages: wal_retained.map(|w| w.pages),
             bytes_fsynced,
             // Amplification ratios are only known once the caller supplies the logical figures, and the
             // per-element costs / plateau ratio only once the caller attests the dataset scale. All stay
@@ -759,11 +775,26 @@ mod tests {
     #[test]
     fn storage_section_from_footprints() {
         let store = DiskFootprint::from_bytes(20_000);
-        let wal = DiskFootprint::from_bytes(5_000);
-        let section = StorageSection::from_footprints(Some(store), Some(wal), Some(wal.bytes));
+        // The WAL bytes WRITTEN (9_000) and the RETAINED directory footprint (5_000) are DISTINCT
+        // quantities (`rmp #805`): the written volume is what a durability regression moves; the
+        // retained size is a bimodal teardown snapshot.
+        let wal_retained = DiskFootprint::from_bytes(5_000);
+        let section = StorageSection::from_footprints(
+            Some(store),
+            Some(9_000),
+            Some(wal_retained),
+            Some(9_000),
+        );
         assert_eq!(section.store_bytes, Some(20_000));
-        assert_eq!(section.wal_bytes, Some(5_000));
-        assert_eq!(section.bytes_fsynced, Some(5_000));
+        assert_eq!(section.wal_bytes, Some(9_000), "wal_bytes is bytes WRITTEN");
+        assert_eq!(section.wal_pages, Some(2)); // ceil(9_000 / 8_192)
+        assert_eq!(
+            section.wal_retained_bytes,
+            Some(5_000),
+            "the on-disk directory size is the SEPARATE retained field"
+        );
+        assert_eq!(section.wal_retained_pages, Some(1)); // ceil(5_000 / 8_192)
+        assert_eq!(section.bytes_fsynced, Some(9_000));
         // The derived figures are NOT invented here: they stay absent until a caller supplies the
         // logical bytes / the dataset scale that make them derivable.
         assert_eq!(section.write_amplification, None);
@@ -771,13 +802,39 @@ mod tests {
         assert_eq!(section.plateau_ratio, None);
     }
 
-    /// A footprint nobody could measure (no store path, no WAL) yields an EMPTY section — every field
+    /// The written volume and the retained footprint are independently present-or-absent: an example
+    /// can measure the on-disk directory (a walk) yet have no `/metrics` written-volume figure, and
+    /// vice versa. Neither is a substitute for the other (`rmp #805`).
+    #[test]
+    fn storage_section_written_and_retained_are_independent() {
+        // Retained walk only (no written figure): wal_bytes absent, wal_retained present.
+        let s = StorageSection::from_footprints(
+            None,
+            None,
+            Some(DiskFootprint::from_bytes(31_457_384)),
+            None,
+        );
+        assert_eq!(s.wal_bytes, None, "no written volume was measured");
+        assert_eq!(s.wal_retained_bytes, Some(31_457_384));
+        assert_eq!(
+            s.bytes_fsynced, None,
+            "the retained walk is NOT an fsync proxy"
+        );
+
+        // Written figure only (an in-memory mirror leaves no directory to walk).
+        let s = StorageSection::from_footprints(None, Some(7_360_747), None, None);
+        assert_eq!(s.wal_bytes, Some(7_360_747));
+        assert_eq!(s.wal_retained_bytes, None);
+    }
+
+    /// A footprint nobody could measure (no store, no WAL) yields an EMPTY section — every field
     /// absent — not a section full of zeros claiming the graph occupies nothing.
     #[test]
     fn storage_section_from_absent_footprints_is_unmeasured() {
-        let section = StorageSection::from_footprints(None, None, None);
+        let section = StorageSection::from_footprints(None, None, None, None);
         assert!(section.is_unmeasured());
         assert_eq!(section.store_bytes, None);
         assert_eq!(section.wal_bytes, None);
+        assert_eq!(section.wal_retained_bytes, None);
     }
 }

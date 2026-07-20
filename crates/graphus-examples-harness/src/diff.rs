@@ -14,10 +14,19 @@
 //! | `throughput.ops_per_sec`     | **lower** (less work per second) |
 //! | `throughput.p50/p99/p999`    | **higher** (slower) |
 //! | `memory.peak_rss_bytes`      | **higher** (more RAM) |
-//! | `storage.store_bytes` / `wal_bytes` | **higher** (more disk) |
+//! | `storage.store_bytes`        | **higher** (more disk) |
+//! | `storage.wal_bytes` (WAL bytes **written**) | **higher** (more durable write volume) |
 //! | `storage.write_amplification` / `space_amplification` | **higher** (more overhead) |
 //! | `cpu.user_secs + system_secs`| **higher** (more CPU) |
 //! | `throughput.abort_rate`      | **higher** (more transactions lost to conflict) |
+//!
+//! `storage.wal_bytes` is the WAL bytes **written** (`graphus_wal_bytes_written_total`, `rmp #745`) —
+//! a monotonic, reclamation-independent volume that is stable across identical runs, so it is a sound
+//! gate signal. Its sibling [`StorageSection::wal_retained_bytes`](crate::StorageSection::wal_retained_bytes)
+//! — the on-disk WAL directory size at teardown — is **deliberately NOT gated** (`rmp #805`): it is
+//! bimodal by construction (it depends on where teardown lands relative to the last checkpoint; a 17×
+//! spread was observed across identical runs), so any fixed threshold either flakes or is meaningless.
+//! It is carried for diagnostic interest only.
 //!
 //! A metric regresses when its **fractional degradation** exceeds the threshold, e.g. with the
 //! default 10%: ops/sec dropping from 1000 to 850 (−15%) regresses; dropping to 950 (−5%) does not.
@@ -329,6 +338,9 @@ pub fn compare(
         HigherIsWorse,
         thresholds.storage_rise,
     );
+    // The GATED WAL metric is the bytes WRITTEN (a stable, monotonic volume), not the on-disk
+    // directory size. `storage.wal_retained_bytes` is deliberately NOT gated here: it is bimodal by
+    // construction and would flake any fixed threshold (`rmp #805` — see the module docs).
     gate(
         "storage.wal_bytes",
         baseline.storage.wal_bytes.map(|b| b as f64),
@@ -479,6 +491,10 @@ mod tests {
             wal_bytes: Some(200_000),
             store_pages: Some(123),
             wal_pages: Some(25),
+            // A DIFFERENT figure from wal_bytes: the retained directory size is a bimodal teardown
+            // snapshot, deliberately unrelated to the stable written volume (`rmp #805`).
+            wal_retained_bytes: Some(3_500_000),
+            wal_retained_pages: Some(428),
             bytes_fsynced: Some(200_000),
             write_amplification: Some(1.5),
             space_amplification: Some(2.0),
@@ -697,5 +713,102 @@ mod tests {
                 "{metric} must not be compared"
             );
         }
+    }
+
+    // -- The gate now has TEETH on WAL write volume (`rmp #805`) ---------------------------------
+
+    /// **The defect this task exists for (AC#4).** `storage.wal_bytes` now carries the WAL bytes
+    /// WRITTEN — a stable, monotonic volume — so a genuine write-volume regression MOVES it and the
+    /// gate MUST catch it. Before `#805` `wal_bytes` was the bimodal on-disk directory size, whose 17×
+    /// run-to-run spread meant a fixed 10% gate was either flaky or vacuous; a real regression could
+    /// hide inside the noise and a green tick would be printed. Here the written volume climbs 50% and
+    /// the gate fires.
+    #[test]
+    fn an_injected_wal_write_volume_regression_is_caught() {
+        let base = baseline(); // wal_bytes = 200_000 written
+        let mut regressed = base.clone();
+        regressed.metadata.scenario = "fraud-oltp".to_string();
+        // A durability-path regression that writes 50% more WAL for the same logical work.
+        regressed.storage.wal_bytes = Some(300_000);
+
+        let cmp = compare(&base, &regressed, &RegressionThresholds::default());
+        let d = cmp
+            .deltas
+            .iter()
+            .find(|d| d.metric == "storage.wal_bytes")
+            .expect("wal_bytes is measured on both sides, so it MUST be gated");
+        assert!(
+            d.regressed,
+            "a +50% WAL write volume is a regression the gate must catch: {d:?}"
+        );
+        assert!(cmp.regressed, "{}", cmp.summary());
+        assert!(
+            (d.degradation - 0.5).abs() < 1e-9,
+            "the degradation is the fractional write-volume rise: {}",
+            d.degradation
+        );
+    }
+
+    /// The RETENTION metric is deliberately NOT gated (`rmp #805`): it is bimodal by construction, so
+    /// gating it would reintroduce the very flakiness this task removes. Even a 17×-style swing in
+    /// `wal_retained_bytes` must neither regress the run nor appear as a compared delta or a skipped
+    /// gate — it is simply not a gated metric.
+    #[test]
+    fn the_retained_wal_footprint_is_not_a_gated_metric() {
+        let base = baseline(); // wal_retained_bytes = 3_500_000
+        let mut cand = baseline();
+        // The bimodal spread the whole task was triggered by: 1.87 MB vs 31.46 MB across identical
+        // runs. If this were gated, an identical configuration would false-positive a "regression".
+        cand.storage.wal_retained_bytes = Some(31_457_384);
+        cand.storage.wal_retained_pages = Some(31_457_384u64.div_ceil(crate::PAGE_SIZE));
+
+        let cmp = compare(&base, &cand, &RegressionThresholds::default());
+        assert!(
+            !cmp.regressed,
+            "a swing in the bimodal retained footprint must NOT be a regression: {}",
+            cmp.summary()
+        );
+        assert!(
+            !cmp.deltas.iter().any(|d| d.metric.contains("wal_retained")),
+            "the retained footprint must not be a compared metric"
+        );
+        assert!(
+            !cmp.skipped
+                .iter()
+                .any(|s| s.metric.contains("wal_retained")),
+            "nor a skipped one — it is simply not gated"
+        );
+    }
+
+    /// A **pre-`#805` baseline** (schema `< 5`, whose `wal_bytes` was the directory walk) must not be
+    /// gated against a new candidate's WRITTEN volume — those are different quantities. The load-time
+    /// migration relabels the old figure to `wal_retained_bytes` and clears it as a written volume, so
+    /// the gate SKIPS `wal_bytes` rather than comparing a walk against a write volume.
+    #[test]
+    fn a_pre_805_baseline_skips_the_wal_volume_gate_instead_of_mis_comparing() {
+        // The committed pre-#805 baseline: `wal_bytes` was the bimodal directory snapshot.
+        let mut legacy = baseline();
+        legacy.version = 4;
+        legacy.storage.wal_bytes = Some(31_457_384); // a large teardown snapshot
+        legacy.storage.wal_retained_bytes = None; // pre-#805 had no separate retained field
+        legacy.migrate_pre_wal_written_semantics();
+
+        // The candidate is a real #805 run that measured a modest written volume.
+        let mut cand = baseline();
+        cand.storage.wal_bytes = Some(210_000);
+
+        let cmp = compare(&legacy, &cand, &RegressionThresholds::default());
+        assert!(
+            cmp.skipped.iter().any(|s| s.metric == "storage.wal_bytes"),
+            "the WAL-volume gate must be SKIPPED (baseline never measured a written volume), not a \
+             31 MB→210 KB apples-to-oranges compare: {}",
+            cmp.summary()
+        );
+        assert!(
+            !cmp.deltas.iter().any(|d| d.metric == "storage.wal_bytes"),
+            "and it must not appear as a compared delta"
+        );
+        // The old directory figure survived under its true name.
+        assert_eq!(legacy.storage.wal_retained_bytes, Some(31_457_384));
     }
 }

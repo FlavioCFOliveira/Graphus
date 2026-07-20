@@ -126,8 +126,11 @@ saturated a core).
 <a name="evidence-schema"></a>
 ## Evidence schema (`report.json`)
 
-Every example emits `report.json` against this **stable, versioned schema** (`SCHEMA_VERSION = 4`).
+Every example emits `report.json` against this **stable, versioned schema** (`SCHEMA_VERSION = 5`).
 Field names are fixed snake_case so external tooling and the baseline-diff helper can rely on them.
+Schema `5` redefined `storage.wal_bytes` to the WAL bytes **written** (a stable, monotonic volume) and
+added the separately-named `storage.wal_retained_bytes` for the on-disk WAL directory walk (`rmp
+#805`); a pre-`5` baseline is migrated on load.
 Reports deserialize leniently (each field added after v1 carries `#[serde(default)]`), so an
 older-but-compatible report still loads — a v1 `report.json` deserializes against the v3 schema, with
 `measurement_mode` defaulting to `"local"` and `server_metrics` absent.
@@ -184,7 +187,7 @@ Consequences you can rely on:
 
 ```jsonc
 {
-  "version": 3,                       // schema version (integer, bump-aware)
+  "version": 5,                       // schema version (integer, bump-aware)
   "metadata": {
     "scenario": "fraud-oltp",         // STABLE scenario key (the baseline-diff join key)
     "description": "…",
@@ -225,13 +228,26 @@ Consequences you can rely on:
   },
   "storage": {                        // storage footprint + amplification + per-element costs
     "store_bytes": 81920,             // everything durable that is NOT the redo log
-    "wal_bytes": 16384,               // the redo log — see the WAL-is-a-directory note below;
-                                      //   absent for an in-memory mirror, which has no WAL at all
+    "wal_bytes": 16384,               // WAL bytes WRITTEN (rmp #805): the durable write VOLUME,
+                                      //   graphus_wal_bytes_written_total — a MONOTONIC,
+                                      //   reclamation-independent counter that is STABLE across
+                                      //   identical runs, so it can gate a durability regression.
+                                      //   Absent when the example did not scrape /metrics for it
+                                      //   (never substituted by the directory walk below).
     "store_pages": 10,                // ceil(store_bytes / PAGE_SIZE)
-    "wal_pages": 2,
-    "bytes_fsynced": 16384,
-    "write_amplification": 1.20,      // physical bytes written / logical bytes written
-    "space_amplification": 1.45,      // on-disk bytes / logical graph bytes
+    "wal_pages": 2,                   // ceil(wal_bytes / PAGE_SIZE) — pages of WAL WRITTEN
+    "wal_retained_bytes": 24576,      // on-disk WAL DIRECTORY size at teardown (rmp #805): the du -sb
+                                      //   walk. BIMODAL by construction (it depends on where teardown
+                                      //   lands relative to the last checkpoint — a 17x spread was
+                                      //   observed on repeat), kept for diagnostic interest, NOT gated.
+    "wal_retained_pages": 3,          // ceil(wal_retained_bytes / PAGE_SIZE)
+    "bytes_fsynced": 16384,           // bytes forced to durable media (proxied by wal_bytes WRITTEN
+                                      //   when no direct fsync counter — never the retained walk)
+    "write_amplification": 1.20,      // (store_bytes + wal_bytes WRITTEN) / logical bytes written —
+                                      //   stable, because the WAL term is the written volume, not the
+                                      //   bimodal retained walk (rmp #805)
+    "space_amplification": 1.45,      // (store_bytes + wal_bytes WRITTEN) / logical graph bytes; the
+                                      //   transient retained WAL is excluded (as bytes_per_node is)
                                       //   (both absent when no logical figure was supplied)
     "bytes_per_node": 102.4,          // per-element COST, not a ratio: the measured durable STORE
                                       //   IMAGE amortised over the stored node count. Present only
@@ -327,10 +343,19 @@ suite (`rmp` #699) — do not reintroduce them:
    that is how social-network-large came to report a "~1 core" ceiling that was purely a harness
    artifact, while the server actually scales to 6+ cores.
 5. **The WAL is a DIRECTORY** (`databases/<db>/graphus.wal/seg.<lsn>`). Classifying store-vs-WAL bytes
-   by the leaf *file name* counts every WAL byte as store and reports `wal_bytes: 0` — silently hiding
-   the entire redo log. Classify by **path**. And decompose the footprint: a lumped total blends the
-   data image (which scales with the graph) with a fixed-size doublewrite preallocation (which does
-   not), producing ratios that look alarming and mean nothing.
+   by the leaf *file name* counts every WAL byte as store — silently hiding the entire redo log.
+   Classify by **path**. And decompose the footprint: a lumped total blends the data image (which
+   scales with the graph) with a fixed-size doublewrite preallocation (which does not), producing
+   ratios that look alarming and mean nothing.
+   But note the deeper trap the *directory walk itself* is (`rmp #805`): a `du -sb` of the WAL
+   directory measures only what is **retained** on disk at that instant, and the WAL grows
+   monotonically and is reclaimed only at teardown — so the snapshot is **bimodal**, depending entirely
+   on where teardown lands relative to the last checkpoint (the same configuration produced 1,871,597
+   and 31,457,384 B on repeat, a 17× spread). That walk is `storage.wal_retained_bytes` — diagnostic,
+   NOT gated. The gated `storage.wal_bytes` is the WAL bytes **written**
+   (`graphus_wal_bytes_written_total`, rule 7), a monotonic counter that is stable across identical
+   runs — the quantity a durability regression actually moves. Scrape it from `/metrics`; never
+   substitute the directory walk for it.
 6. **Never run a stale binary.** Build through `harness_build`, which rebuilds unconditionally (cargo
    is incremental, so it is a no-op when nothing changed). A build-only-if-the-file-is-absent guard
    silently runs the *previous* binary after any source edit, so the evidence describes code that is
@@ -390,11 +415,16 @@ baseline `report.json` and flags a **regression** when any key metric degrades b
 | `throughput.p50/p99/p999_latency_ms` | **higher** |
 | `throughput.abort_rate` | **higher** |
 | `memory.peak_rss_bytes` | **higher** |
-| `storage.store_bytes` / `wal_bytes` | **higher** |
+| `storage.store_bytes` | **higher** |
+| `storage.wal_bytes` (WAL bytes **written**) | **higher** |
 | `storage.write_amplification` / `space_amplification` | **higher** |
 | `storage.bytes_per_node` / `bytes_per_relationship` | **higher** |
 | `storage.plateau_ratio` | **higher** |
 | `cpu.total_secs` (user + system) | **higher** |
+
+`storage.wal_retained_bytes` (the on-disk WAL directory walk) is **deliberately NOT gated** (`rmp
+#805`): it is bimodal by construction, so any fixed threshold flakes or is meaningless. It is carried
+for diagnostic interest only; the gated WAL signal is `storage.wal_bytes`, the bytes **written**.
 
 The returned `ComparisonReport` lists every metric's `baseline → candidate` delta, its `degradation`,
 and a `regressed` flag, plus a `regressed: bool` for the run overall and a `summary()` string. A CI

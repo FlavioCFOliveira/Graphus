@@ -17,9 +17,16 @@
 //! (`User`/`Product`/`FRIEND`/`PURCHASED`) the driver was told the graph contains — and gives every
 //! volatile metric family an effectively-infinite tolerance.
 //!
-//! Unlike `social_baseline_cmp`, there is **no** durable-store byte gate here: `reco_bench` is a
-//! **client-only** driver (it never links the engine, so it measures no on-disk store image). The
-//! structural counts are the only deterministic signal, and they must match the baseline **exactly**.
+//! `reco_bench` DOES now record a storage vector — the co-located store image (walked by path) and
+//! the WAL bytes **written** (scraped from the server's `graphus_wal_bytes_written_total`, `rmp #805`,
+//! reported as `storage.wal_bytes`; the on-disk WAL directory walk is the separate, bimodal
+//! `storage.wal_retained_bytes`). Those figures are still given **infinite tolerance** here, on
+//! purpose: the store image is small and the WAL write volume has a host-variant component — this
+//! example's mix writers are *time-paced* (one unit every 20 ms over the ladder's wall-time), so a
+//! faster host commits more units and writes more WAL. Gating either across the Pi 5 → Apple Silicon →
+//! x86 hardware range would therefore flake. The general, host-pinned harness gate
+//! (`EvidenceReport::compare_to_baseline`) does gate `storage.wal_bytes` with teeth; this example
+//! deliberately holds only the deterministic **structural** counts, which must match **exactly**.
 //!
 //! Hermetic: this binary needs only the harness + serde, so it is always buildable —
 //! `cargo build -p graphus-reco-gen --bin reco_baseline_cmp` builds it with no engine dependency.

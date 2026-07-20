@@ -94,6 +94,11 @@ pub mod queries;
 /// by the `reco_bench` concurrent read driver. Reuses the [`graphus_bolt`] symmetric wire codec.
 pub mod client;
 
+/// A minimal, dependency-free HTTP/1.1 **GET** client used by `reco_bench` to scrape the co-located
+/// server's Prometheus `/metrics` over the plaintext-loopback REST listener — the only place the
+/// stable WAL bytes-**written** volume (`graphus_wal_bytes_written_total`) is exposed (`rmp #805`).
+pub mod http;
+
 /// Pure, hermetic helpers for the `reco_bench` concurrent read driver: latency-percentile
 /// summarisation, the `/proc/<pid>` field parsers, the concurrency-ladder CSV parser, and the
 /// read-battery family-index lookup — all unit-testable without a running server.

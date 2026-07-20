@@ -237,6 +237,10 @@ ADMIN_USER="reco"
 ADMIN_PW="reco-admin-pw-1"
 DEFAULT_DB="graphus"
 LOCAL_TARGET_DB="recodb"
+# A fixed scrape token for the LOCAL server's /metrics, so reco_bench can read the STABLE WAL
+# bytes-written volume (graphus_wal_bytes_written_total) without a full login (rmp #805). Dev-only,
+# on a plaintext loopback listener the example itself boots.
+METRICS_TOKEN="reco-metrics-scrape-token-1"
 
 # ==================================================================================================
 # Step 1 — deterministic generator (byte-identical per seed) — both modes
@@ -300,6 +304,9 @@ buffer_pool_pages = $POOL_PAGES
 uds_path = "$SOCKET"
 rest_addr = "$REST_ADDR"
 jwt_secret = "graphus-product-recommendations-example-uds-rest-secret-32+"
+# A /metrics scrape token so reco_bench can read the STABLE WAL bytes-written volume
+# (graphus_wal_bytes_written_total) over the loopback REST without a full login (rmp #805).
+metrics_scrape_token = "$METRICS_TOKEN"
 # Plaintext loopback REST (dev/test only) so the network bulk-import upload needs no TLS/cert.
 allow_insecure_network = true
 
@@ -605,6 +612,7 @@ else
     --users "$GEN_USERS" --products "$GEN_PRODUCTS" \
     --friends "$GEN_FRIENDS" --purchased "$GEN_PURCHASED" \
     --store "$RECO_STORE" --wal "$RECO_WAL" --logical-bytes "$LOGICAL_BYTES" \
+    --metrics-url "$REST_ADDR" --metrics-token "$METRICS_TOKEN" \
     --scenario "product-recommendations" --evidence-dir "$EVIDENCE_DIR" \
     "${MIX_FLAGS[@]}" 2>&1)"
   BENCH_STATUS=$?
@@ -662,12 +670,22 @@ import json,sys
 try: t = json.load(open('$EVIDENCE_DIR/report.json'))['total_millis']
 except Exception: print('no'); sys.exit()
 print('yes' if t >= 1000.0 else 'no')" 2>/dev/null || echo no)"
-  assert "report carries the real store + WAL footprint" "yes" \
+  # rmp #805: storage.wal_bytes is now the STABLE WAL bytes-WRITTEN volume
+  # (graphus_wal_bytes_written_total, scraped from /metrics); the on-disk WAL directory walk is the
+  # SEPARATE storage.wal_retained_bytes. Assert both the store image and the written volume are real
+  # and positive — that end-to-end proves the /metrics scrape wired the stable metric in.
+  assert "report carries the real store image + STABLE WAL bytes-written volume (rmp #805)" "yes" \
     "$(python3 -c "
 import json,sys
 try: s = json.load(open('$EVIDENCE_DIR/report.json'))['storage']
 except Exception: print('no'); sys.exit()
-print('yes' if s['store_bytes'] > 0 and s['wal_bytes'] > 0 else 'no')" 2>/dev/null || echo no)"
+print('yes' if s.get('store_bytes',0) > 0 and s.get('wal_bytes',0) > 0 else 'no')" 2>/dev/null || echo no)"
+  assert "report carries the SEPARATE retained on-disk WAL footprint (rmp #805)" "yes" \
+    "$(python3 -c "
+import json,sys
+try: s = json.load(open('$EVIDENCE_DIR/report.json'))['storage']
+except Exception: print('no'); sys.exit()
+print('yes' if s.get('wal_retained_bytes',0) > 0 else 'no')" 2>/dev/null || echo no)"
 
   # Persist the modern schema evidence into the evidence dir alongside the concurrency report.
   if [ -s "${SCHEMA_EVIDENCE_FILE:-/nonexistent}" ]; then

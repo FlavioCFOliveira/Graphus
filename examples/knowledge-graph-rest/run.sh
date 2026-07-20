@@ -671,7 +671,7 @@ t, tp, st = d['total_millis'], d['throughput'], d['storage']
 ok = (t >= 1.0
       and tp['ops_per_sec'] > 0.0
       and tp['p50_latency_ms'] > 0.0 and tp['p99_latency_ms'] > 0.0 and tp['p999_latency_ms'] > 0.0
-      and st['store_bytes'] > 0 and st['wal_bytes'] > 0
+      and st['store_bytes'] > 0 and (st.get('wal_bytes',0) > 0 or st.get('wal_retained_bytes',0) > 0)
       and st['write_amplification'] > 0.0 and st['space_amplification'] > 0.0)
 print('yes' if ok else 'no')" 2>/dev/null || echo no)"
 

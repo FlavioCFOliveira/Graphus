@@ -27,7 +27,7 @@
 //! | [`HostInfo`]        | os, arch, cpu cores, hostname, rustc version, timestamp |
 //! | [`CpuSection`]      | user / system CPU seconds, mean core utilisation |
 //! | [`MemorySection`]   | peak / final RSS bytes |
-//! | [`StorageSection`]  | store / WAL bytes + pages, bytes fsynced, write-amp, space-amp |
+//! | [`StorageSection`]  | store bytes + pages, WAL bytes **written** + pages, WAL **retained** on-disk bytes + pages, bytes fsynced, write-amp, space-amp |
 //! | [`ThroughputSection`] | operations, ops/sec, p50 / p99 / p999 latency (ms) |
 //! | [`ServerMetricsSection`] | server-side `/metrics` deltas: committed/aborted txns, abort rate, slow queries, panic/force-detach counters, SSI gauge, query-duration histogram |
 //!
@@ -134,10 +134,23 @@ pub use scrape::{Bucket, Histogram, MetricsSnapshot};
 ///   an example that does not bracket its phases against the server's pid simply omits them. This is
 ///   what lets a report answer "does *this algorithm* use the cores?" — a question the run-wide
 ///   average cannot answer, because a 60 ms phase on sixteen cores vanishes into an 8 s phase on one.
-pub const SCHEMA_VERSION: u32 = 4;
+/// - `5` — `storage.wal_bytes` now means the WAL bytes **written** (the durable write volume,
+///   `graphus_wal_bytes_written_total`), a monotonic, reclamation-independent quantity that is stable
+///   across identical runs; the on-disk WAL **directory** size at teardown moves to the new, distinctly
+///   named [`StorageSection::wal_retained_bytes`] / [`StorageSection::wal_retained_pages`] (`rmp #805`).
+///   The old `wal_bytes` was a bimodal teardown snapshot that could not gate a WAL regression. A pre-v5
+///   report is migrated on load by [`EvidenceReport::migrate_pre_wal_written_semantics`], which relabels
+///   its directory-walk figure to `wal_retained_bytes` and drops the now-incomparable amplification
+///   ratios. Additive `#[serde(default)]` fields, so a v4 report still deserializes.
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// The schema version from which a metric an example did not measure is **absent** rather than zero.
 const OPTIONAL_METRICS_SINCE: u32 = 3;
+
+/// The schema version from which `storage.wal_bytes` is the WAL bytes **written** (a stable, monotonic
+/// volume) rather than the bimodal on-disk WAL **directory** size (`rmp #805`). A pre-`5` baseline is
+/// migrated on load (see [`EvidenceReport::migrate_pre_wal_written_semantics`]).
+const WAL_WRITTEN_SEMANTICS_SINCE: u32 = 5;
 
 /// How an absent (= not measured) metric renders in the human-readable `report.md`. Deliberately a
 /// phrase and not a number: a reader must never be shown a `0.000` for something nobody measured.
@@ -305,16 +318,49 @@ pub struct StorageSection {
     /// Total on-disk size of the data store after the run, in bytes. Absent = not measured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_bytes: Option<u64>,
-    /// Total on-disk size of the write-ahead log after the run, in bytes. Absent = not measured (the
-    /// WAL is a *directory* of `seg.<lsn>` files; an in-memory mirror has none at all).
+    /// **WAL bytes WRITTEN over the run** — the durable write volume, not a footprint (`rmp #805`).
+    ///
+    /// This is the quantity `graphus_wal_bytes_written_total` (per-DB
+    /// `graphus_db_wal_bytes_written_total`, `rmp #745`) reports: the exact number of bytes the engine
+    /// made durable in its write-ahead log — commit/undo/checkpoint/DDL records included — over the
+    /// measured window. It is **monotonic and reclamation-independent**, so repeated runs of an
+    /// identical configuration produce the same figure, which is precisely what makes it a sound
+    /// regression signal: a durability-path regression moves *bytes written*, and this field moves with
+    /// it.
+    ///
+    /// It is deliberately **not** the on-disk size of the WAL directory. That directory grows
+    /// monotonically and is reclaimed only at teardown, so a snapshot of its size is bimodal by
+    /// construction (`rmp #805` observed a 17× spread across identical runs) and cannot gate anything.
+    /// The on-disk footprint lives in [`wal_retained_bytes`](Self::wal_retained_bytes), separately.
+    ///
+    /// Absent = not measured (an in-memory mirror writes no WAL; an example that does not scrape the
+    /// server's `/metrics` cannot observe the written volume and reports it absent rather than
+    /// substituting the bimodal directory walk).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wal_bytes: Option<u64>,
     /// Equivalent whole-page count of the data store (`ceil(store_bytes / PAGE_SIZE)`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_pages: Option<u64>,
-    /// Equivalent whole-page count of the WAL (`ceil(wal_bytes / PAGE_SIZE)`).
+    /// Whole pages of WAL **written** over the run (`ceil(wal_bytes / PAGE_SIZE)`) — the page-equivalent
+    /// of [`wal_bytes`](Self::wal_bytes), which is a written volume. For the on-disk page footprint of
+    /// the retained WAL directory see [`wal_retained_pages`](Self::wal_retained_pages).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wal_pages: Option<u64>,
+    /// **On-disk size of the WAL directory at teardown**, in bytes — the retained footprint (`rmp #805`).
+    ///
+    /// This is the classic `du -sb` of the `seg.<lsn>` segment files still on disk when the run tore
+    /// down: the redo log the engine had not yet reclaimed. It is kept for diagnostic interest (how
+    /// much log a checkpoint had left to reclaim) but is **bimodal by construction** — it depends
+    /// entirely on where teardown lands relative to the last checkpoint — so it is *not* a gated
+    /// regression signal. The bytes the workload actually wrote are in [`wal_bytes`](Self::wal_bytes).
+    /// Absent = not measured (no WAL directory to walk, or a store this run cannot read).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wal_retained_bytes: Option<u64>,
+    /// Equivalent whole-page count of the retained WAL directory (`ceil(wal_retained_bytes /
+    /// PAGE_SIZE)`) — the on-disk page footprint of the log left unreclaimed at teardown. Bimodal, like
+    /// [`wal_retained_bytes`](Self::wal_retained_bytes); not gated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wal_retained_pages: Option<u64>,
     /// Bytes physically `fsync`ed to durable media during the run. Absent = not measured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes_fsynced: Option<u64>,
@@ -322,16 +368,29 @@ pub struct StorageSection {
     /// measured (no logical figure supplied). `1.0` is ideal; `> 1.0` quantifies durability I/O
     /// overhead.
     ///
+    /// Its physical numerator is `store_bytes + `[`wal_bytes`](Self::wal_bytes) — the store image plus
+    /// the WAL bytes **written** (`rmp #805`). Because the WAL term is now the true written volume and
+    /// not the bimodal retained-directory snapshot, this ratio is stable across identical runs and
+    /// therefore a sound gate signal. The transient retained WAL
+    /// ([`wal_retained_bytes`](Self::wal_retained_bytes)) is deliberately excluded: folding a
+    /// checkpoint-reclaimed residual into an amplification ratio would make it depend on teardown
+    /// timing.
+    ///
     /// This field carries an amplification RATIO and nothing else. An example that wants to report a
     /// per-element cost or a plateau ratio must use the dedicated fields below — smuggling a
     /// different quantity in here makes the reports incomparable and silently misleads any reader
     /// (or gate) that trusts the field name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_amplification: Option<f64>,
-    /// **Space amplification**: total on-disk bytes / logical graph size. Absent when not measured.
-    /// `1.0` means the on-disk form equals the logical data size; `> 1.0` captures padding/slack.
+    /// **Space amplification**: durable bytes produced / logical graph size. Absent when not measured.
+    /// `1.0` means the durable form equals the logical data size; `> 1.0` captures padding/slack.
     ///
-    /// A ratio, like [`write_amplification`](Self::write_amplification) — see the note there.
+    /// Like [`write_amplification`](Self::write_amplification) its numerator is `store_bytes + `
+    /// [`wal_bytes`](Self::wal_bytes) (the store image plus the WAL bytes **written**), so it is stable
+    /// across identical runs. It excludes the transient, checkpoint-reclaimed retained WAL for the same
+    /// reason [`bytes_per_node`](Self::bytes_per_node) does — a footprint that depends on how recently
+    /// the server checkpointed is not a property of the workload. For the raw occupied WAL footprint
+    /// see [`wal_retained_bytes`](Self::wal_retained_bytes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub space_amplification: Option<f64>,
     /// **Durable bytes per stored node**: the measured durable **store image** divided by the number
@@ -849,6 +908,15 @@ impl EvidenceReport {
     /// measurement — and gate a real candidate figure against it (a `0.0 → 1239.04` "+100% regression"
     /// against a number nobody ever measured).
     ///
+    /// A **pre-v5** report (schema `< 5`) is additionally migrated by
+    /// [`migrate_pre_wal_written_semantics`](Self::migrate_pre_wal_written_semantics): before `rmp #805`
+    /// `storage.wal_bytes` held the on-disk WAL **directory** size (a bimodal teardown snapshot), not
+    /// the durable write **volume** it names today. Loading it verbatim would silently gate a stable
+    /// candidate written-volume against an old baseline's directory walk — comparing two different
+    /// quantities. The migration relabels that value to its true home
+    /// ([`wal_retained_bytes`](StorageSection::wal_retained_bytes)) and drops the now-incomparable
+    /// amplification ratios, so the gate skips them until the baseline is regenerated.
+    ///
     /// # Errors
     ///
     /// Returns any I/O error from reading the file, and a `serde_json` parse error (surfaced as
@@ -860,7 +928,53 @@ impl EvidenceReport {
         if report.version < OPTIONAL_METRICS_SINCE {
             report.normalize_legacy_zero_placeholders();
         }
+        if report.version < WAL_WRITTEN_SEMANTICS_SINCE {
+            report.migrate_pre_wal_written_semantics();
+        }
         Ok(report)
+    }
+
+    /// Relabels a **pre-`rmp #805`** report's WAL storage figures to the written-vs-retained schema.
+    ///
+    /// Before schema `5` (`rmp #805`) `storage.wal_bytes` was the on-disk size of the WAL **directory**
+    /// walked at teardown — a footprint that is bimodal by construction (it depends on where teardown
+    /// lands relative to the last checkpoint; `rmp #805` observed a 17× spread across identical runs).
+    /// Today `storage.wal_bytes` names the durable write **volume**
+    /// (`graphus_wal_bytes_written_total`), a monotonic, reclamation-independent quantity. The two are
+    /// not interchangeable, so an old baseline's `wal_bytes` must not be gated against a new candidate's.
+    ///
+    /// This migration is a faithful relabel, never a fabrication:
+    ///
+    /// * the old `wal_bytes` / `wal_pages` (which WAS the directory walk) move to
+    ///   [`wal_retained_bytes`](StorageSection::wal_retained_bytes) /
+    ///   [`wal_retained_pages`](StorageSection::wal_retained_pages), unless the report already carries
+    ///   retained figures (a partially-migrated report is left as-is);
+    /// * `wal_bytes` / `wal_pages` (the write volume) are cleared to **absent** — that quantity was
+    ///   never measured before `rmp #805`;
+    /// * the amplification ratios are cleared: their physical numerator changed from `store + retained`
+    ///   to `store + written`, so an old ratio is not comparable to a new one, and a silent
+    ///   apples-to-oranges gate is exactly the "subtly wrong evidence" this schema exists to prevent;
+    /// * `bytes_fsynced`, which pre-`#805` proxied the directory walk, is cleared — a post-reclamation
+    ///   snapshot is not a count of bytes forced to durable media.
+    ///
+    /// After the migration the gate skips the WAL-volume and amplification metrics for that baseline
+    /// (both sides can no longer be compared) until it is regenerated against the corrected metric.
+    pub fn migrate_pre_wal_written_semantics(&mut self) {
+        let st = &mut self.storage;
+        // Relabel the old directory-walk figures to their true home, unless already migrated.
+        if st.wal_retained_bytes.is_none() {
+            st.wal_retained_bytes = st.wal_bytes.take();
+            st.wal_retained_pages = st.wal_pages.take();
+        }
+        // The write VOLUME was not measured before `#805`.
+        st.wal_bytes = None;
+        st.wal_pages = None;
+        // The amplification numerator changed (store + retained → store + written): old ratios are not
+        // comparable to new ones, so drop them rather than gate across the redefinition.
+        st.write_amplification = None;
+        st.space_amplification = None;
+        // The old fsync proxy was the directory walk, not a forced-byte count.
+        st.bytes_fsynced = None;
     }
 
     /// Rewrites the **zero placeholders** of a pre-v3 report (see [`SCHEMA_VERSION`]) as what they
@@ -906,6 +1020,8 @@ impl EvidenceReport {
         drop_zero_u64(&mut st.wal_bytes);
         drop_zero_u64(&mut st.store_pages);
         drop_zero_u64(&mut st.wal_pages);
+        drop_zero_u64(&mut st.wal_retained_bytes);
+        drop_zero_u64(&mut st.wal_retained_pages);
         drop_zero_u64(&mut st.bytes_fsynced);
         drop_zero_f64(&mut st.write_amplification);
         drop_zero_f64(&mut st.space_amplification);
@@ -1061,8 +1177,18 @@ impl EvidenceReport {
         let _ = writeln!(s, "|--------|-------|");
         let _ = writeln!(s, "| store (bytes) | {} |", u(self.storage.store_bytes));
         let _ = writeln!(s, "| store (pages) | {} |", u(self.storage.store_pages));
-        let _ = writeln!(s, "| WAL (bytes) | {} |", u(self.storage.wal_bytes));
-        let _ = writeln!(s, "| WAL (pages) | {} |", u(self.storage.wal_pages));
+        let _ = writeln!(s, "| WAL written (bytes) | {} |", u(self.storage.wal_bytes));
+        let _ = writeln!(s, "| WAL written (pages) | {} |", u(self.storage.wal_pages));
+        let _ = writeln!(
+            s,
+            "| WAL retained on disk (bytes) | {} |",
+            u(self.storage.wal_retained_bytes)
+        );
+        let _ = writeln!(
+            s,
+            "| WAL retained on disk (pages) | {} |",
+            u(self.storage.wal_retained_pages)
+        );
         let _ = writeln!(s, "| fsynced (bytes) | {} |", u(self.storage.bytes_fsynced));
         let _ = writeln!(
             s,
@@ -1286,10 +1412,18 @@ impl EvidenceCollector {
 
     /// Records the on-disk storage evidence by measuring the example's store and WAL paths.
     ///
-    /// `bytes_fsynced` honestly reports what the caller observed forced to durable media. When an
-    /// example cannot instrument fsync directly, pass `None`: the measured WAL byte count is used as
-    /// the faithful proxy (every committed WAL byte is fsynced before a commit is acknowledged), and
-    /// a note records that this is a proxy rather than a directly-observed counter.
+    /// This walks the store image (→ `store_bytes`) and the WAL **directory** (→
+    /// [`wal_retained_bytes`](StorageSection::wal_retained_bytes), the on-disk footprint at teardown).
+    /// It does **not** populate the gated [`wal_bytes`](StorageSection::wal_bytes) — the durable write
+    /// **volume** cannot be obtained by walking the directory (that walk is what makes the old metric
+    /// bimodal). An example that wants the stable, gated write volume scrapes the server's
+    /// `graphus_wal_bytes_written_total` and passes it through
+    /// [`record_storage_at`](Self::record_storage_at) (`rmp #805`).
+    ///
+    /// `bytes_fsynced` honestly reports what the caller observed forced to durable media. With no
+    /// directly-observed fsync counter **and** no written-volume figure, it stays absent — the retained
+    /// directory size is deliberately not used as a proxy (it is a post-reclamation snapshot, not a
+    /// count of bytes forced).
     ///
     /// A path that **does not exist** is not a zero footprint — it is a footprint that was **not
     /// measured**. Its figures are therefore left absent (and a note says so), rather than reporting
@@ -1308,24 +1442,30 @@ impl EvidenceCollector {
         self.record_storage_at(store_path, wal_path, None, bytes_fsynced)
     }
 
-    /// [`record_storage`](Self::record_storage), but with the WAL byte count supplied by the example
-    /// instead of walked at emission time (`rmp` #712).
+    /// [`record_storage`](Self::record_storage), but with the **WAL bytes written** supplied by the
+    /// example instead of leaving the gated volume unmeasured (`rmp` #712, redefined by `rmp #805`).
     ///
-    /// # Why an override exists at all
+    /// # The two WAL quantities, kept apart (`rmp #805`)
+    ///
+    /// This method always walks `wal_path` to record the on-disk directory size at teardown into
+    /// [`wal_retained_bytes`](StorageSection::wal_retained_bytes) — a *bimodal* footprint kept for
+    /// diagnostic interest. The **gated** [`wal_bytes`](StorageSection::wal_bytes) is the durable write
+    /// **volume**, `graphus_wal_bytes_written_total` (`rmp #745`), which is monotonic and
+    /// reclamation-independent and therefore stable across identical runs. That figure cannot be
+    /// obtained by walking the directory (the directory is what makes the old metric bimodal); it comes
+    /// from the server's `/metrics`, so the example scrapes it and passes it here as `wal_written_bytes`.
+    ///
+    /// # The crash-recovery case
     ///
     /// A **crash-recovery** example's load-bearing WAL figure is the redo log that existed **at the
-    /// crash** — the bytes that carried the acknowledged commits and that recovery then replayed. By
-    /// the time the report is emitted, the server has restarted, replayed, and begun checkpointing:
-    /// walking the WAL directory *then* measures the post-recovery **residual**, which is a different
-    /// quantity and a much smaller one. Reporting the residual under `wal_bytes` would tell the reader
-    /// that a crash-recovery run's redo log cost a fraction of what it actually cost.
+    /// crash** — the bytes that carried the acknowledged commits and that recovery then replayed. That
+    /// is a *written volume* too, so it is passed here as `wal_written_bytes`; the emission-time walk
+    /// (the post-recovery residual) is then correctly recorded, separately, as the retained footprint
+    /// rather than overwriting the load-bearing figure.
     ///
-    /// So the example — which owns the store and measured the WAL *by path*, at the instant that
-    /// matters, with the same walker — passes that measurement in. It is still a MEASUREMENT, taken at
-    /// the only instant at which the quantity exists; it is not a fabrication, and the caller is
-    /// obliged to state in a note which instant its figure describes.
-    ///
-    /// `wal_bytes = None` restores the emission-time walk (what every other example wants).
+    /// `wal_written_bytes = None` leaves [`wal_bytes`](StorageSection::wal_bytes) absent (not measured)
+    /// while still recording the retained directory walk — the honest state for an example that does
+    /// not scrape `/metrics`.
     ///
     /// # Errors
     ///
@@ -1335,20 +1475,15 @@ impl EvidenceCollector {
         &mut self,
         store_path: impl AsRef<Path>,
         wal_path: impl AsRef<Path>,
-        wal_bytes: Option<u64>,
+        wal_written_bytes: Option<u64>,
         bytes_fsynced: Option<u64>,
     ) -> io::Result<()> {
         let store_path = store_path.as_ref();
         let wal_path = wal_path.as_ref();
         let store = StorageMeter::try_measure_path(store_path)?;
-        // An example-supplied WAL byte count replaces the emission-time walk; the path is still
-        // consulted, so a WAL that does not exist at all is still reported as "not measured".
-        let walked = StorageMeter::try_measure_path(wal_path)?;
-        let wal = match (wal_bytes, walked) {
-            (Some(bytes), Some(_)) => Some(DiskFootprint::from_bytes(bytes)),
-            (Some(_), None) | (None, None) => None,
-            (None, Some(w)) => Some(w),
-        };
+        // The on-disk WAL directory walk is ALWAYS the retained footprint (bimodal); the written
+        // volume, when known, is a separate, stable quantity supplied by the caller (`rmp #805`).
+        let wal_retained = StorageMeter::try_measure_path(wal_path)?;
 
         if store.is_none() {
             self.report.notes.push(format!(
@@ -1357,43 +1492,66 @@ impl EvidenceCollector {
                 store_path.display()
             ));
         }
-        if wal.is_none() {
+        if wal_retained.is_none() {
             self.report.notes.push(format!(
-                "storage.wal_bytes / wal_pages are NOT MEASURED (absent, not zero): the WAL path {} \
-                 does not exist for this run.",
+                "storage.wal_retained_bytes / wal_retained_pages are NOT MEASURED (absent, not zero): \
+                 the WAL directory {} does not exist for this run.",
                 wal_path.display()
             ));
         }
+        // The written-volume gap note fires only when there IS a WAL directory on disk but no written
+        // figure was supplied — i.e. a local example that walked the log yet did not scrape the
+        // server's write-volume counter. A fully-external run (no WAL directory at all) is already
+        // covered by the retained note above; repeating it would be noise.
+        if wal_written_bytes.is_none() && wal_retained.is_some() {
+            self.report.notes.push(
+                "storage.wal_bytes (WAL bytes WRITTEN) is NOT MEASURED (absent, not zero): this run \
+                 walked the WAL directory but did not scrape the server's \
+                 graphus_wal_bytes_written_total, so the durable write volume is unknown. The retained \
+                 WAL directory size is reported separately as storage.wal_retained_bytes, but it is a \
+                 bimodal teardown snapshot and is NOT a substitute for the written volume (rmp #805)."
+                    .to_string(),
+            );
+        }
 
-        let fsynced = match (bytes_fsynced, wal) {
+        let fsynced = match (bytes_fsynced, wal_written_bytes) {
             (Some(b), _) => Some(b),
-            (None, Some(wal)) => {
+            (None, Some(written)) => {
                 self.report.notes.push(
-                    "storage.bytes_fsynced is a proxy: the WAL on-disk byte count (every committed \
-                     WAL byte is fsynced before commit acknowledgement), not a directly-observed \
-                     fsync counter."
+                    "storage.bytes_fsynced is a proxy: the WAL bytes WRITTEN (every committed WAL \
+                     byte is fsynced before commit acknowledgement), not a directly-observed fsync \
+                     counter."
                         .to_string(),
                 );
-                Some(wal.bytes)
+                Some(written)
             }
-            // No fsync counter AND no WAL to proxy it with: the figure was not measured.
+            // No fsync counter AND no written volume to proxy it with: the figure was not measured.
+            // The retained directory size is deliberately NOT used — a post-reclamation snapshot is
+            // not a count of bytes forced to durable media (rmp #805).
             (None, None) => None,
         };
-        self.report.storage = StorageSection::from_footprints(store, wal, fsynced);
+        self.report.storage =
+            StorageSection::from_footprints(store, wal_written_bytes, wal_retained, fsynced);
         Ok(())
     }
 
     /// Records the storage amplification ratios from the logical figures the example tracked.
     ///
-    /// Call **after** [`record_storage`](Self::record_storage): write amplification is derived from
-    /// the measured physical store+WAL bytes against `logical_bytes_written`, and space amplification
-    /// from the on-disk store+WAL total against `logical_graph_bytes`. Passing `0` for a logical
-    /// figure (or calling this without a measured footprint) leaves the corresponding ratio **absent**
-    /// — an unmeasurable ratio is omitted, never emitted as a `0.0` that reads like a measurement.
+    /// Call **after** [`record_storage`](Self::record_storage): both ratios use the physical numerator
+    /// `store_bytes + `[`wal_bytes`](StorageSection::wal_bytes) — the store image plus the WAL bytes
+    /// **written** (`rmp #805`). Because the WAL term is the true written volume rather than the
+    /// bimodal retained-directory snapshot, the ratios are **stable** across identical runs. The
+    /// transient retained WAL ([`wal_retained_bytes`](StorageSection::wal_retained_bytes)) is
+    /// deliberately excluded — a checkpoint-reclaimed residual folded into an amplification ratio would
+    /// make the ratio depend on teardown timing.
+    ///
+    /// Passing `0` for a logical figure (or calling this without a measured footprint) leaves the
+    /// corresponding ratio **absent** — an unmeasurable ratio is omitted, never emitted as a `0.0`
+    /// that reads like a measurement.
     pub fn record_amplification(&mut self, logical_bytes_written: u64, logical_graph_bytes: u64) {
         let s = &self.report.storage;
-        // The physical figure needs at least one measured footprint; store or WAL alone is still an
-        // honest lower bound, but with neither there is nothing to divide.
+        // The physical figure needs at least one measured footprint; store or WAL-written alone is
+        // still an honest lower bound, but with neither there is nothing to divide.
         let physical = match (s.store_bytes, s.wal_bytes) {
             (None, None) => return,
             (store, wal) => store.unwrap_or(0).saturating_add(wal.unwrap_or(0)),
@@ -1641,6 +1799,8 @@ mod tests {
             wal_bytes: Some(16_384),
             store_pages: Some(10),
             wal_pages: Some(2),
+            wal_retained_bytes: Some(24_576),
+            wal_retained_pages: Some(3),
             bytes_fsynced: Some(16_384),
             write_amplification: Some(1.2),
             space_amplification: Some(1.5),
@@ -1888,9 +2048,13 @@ mod tests {
         assert_eq!(parsed.storage.bytes_per_node, Some(8_192.0));
         assert_eq!(parsed.storage.bytes_per_relationship, Some(4_096.0));
         assert_eq!(parsed.storage.plateau_ratio, Some(1.02));
+        // The WAL written volume and the separate retained footprint both round-trip (`rmp #805`).
+        assert_eq!(parsed.storage.wal_bytes, Some(16_384));
+        assert_eq!(parsed.storage.wal_retained_bytes, Some(24_576));
+        assert_eq!(parsed.storage.wal_retained_pages, Some(3));
         // The v2 additions (`rmp #684`) survive the round-trip.
         assert_eq!(parsed.version, SCHEMA_VERSION);
-        assert_eq!(parsed.version, 4);
+        assert_eq!(parsed.version, 5);
         assert_eq!(parsed.measurement_mode, MeasurementMode::External);
         assert_eq!(parsed.server_metrics, report.server_metrics);
         let sm = parsed
@@ -1987,13 +2151,27 @@ mod tests {
         let baseline =
             EvidenceReport::load(&path).expect("a committed v2 baseline must still parse");
 
-        // The dead placeholders are gone — they were never measurements.
+        // The dead placeholders are gone — they were never measurements (`rmp #711`).
         assert_eq!(baseline.storage.bytes_per_node, None);
         assert_eq!(baseline.storage.bytes_per_relationship, None);
         assert_eq!(baseline.storage.plateau_ratio, None);
-        // …while every figure that WAS measured survives untouched.
+        // The pre-`#805` WAL figure was the on-disk DIRECTORY size (a bimodal snapshot), so the
+        // migration relabels it to its true home and clears the write VOLUME (never measured then).
+        assert_eq!(
+            baseline.storage.wal_bytes, None,
+            "written volume: not measured pre-#805"
+        );
+        assert_eq!(
+            baseline.storage.wal_retained_bytes,
+            Some(3_982_455),
+            "relabelled"
+        );
+        // …and the amplification ratios are dropped: their numerator changed (store + retained →
+        // store + written), so an old ratio is not comparable to a new one (`rmp #805`).
+        assert_eq!(baseline.storage.write_amplification, None);
+        assert_eq!(baseline.storage.space_amplification, None);
+        // …while every figure that WAS measured and is still comparable survives untouched.
         assert_eq!(baseline.storage.store_bytes, Some(442_368));
-        assert_eq!(baseline.storage.write_amplification, Some(39.35));
         assert_eq!(baseline.cpu.user_secs, Some(1.91));
         assert_eq!(baseline.throughput.operations, Some(914));
         // …including a legitimately-measured non-zero abort rate.
@@ -2050,11 +2228,12 @@ mod tests {
     /// a crashed store's redo log cost almost nothing, which is exactly the class of subtly-wrong
     /// evidence the honesty rules exist to prevent.
     ///
-    /// [`EvidenceCollector::record_storage_at`] lets the example supply the figure it measured at the
-    /// instant the quantity existed; the page count is derived from THAT, and `bytes_fsynced` follows
-    /// it rather than the residual.
+    /// [`EvidenceCollector::record_storage_at`] lets the example supply the written volume it measured
+    /// at the instant the quantity existed; the page count is derived from THAT, `bytes_fsynced`
+    /// follows it, and the post-recovery residual on disk is recorded separately as the RETAINED
+    /// footprint — the two are no longer conflated (`rmp #805`).
     #[test]
-    fn a_supplied_wal_byte_count_overrides_the_emission_time_walk() {
+    fn a_supplied_wal_byte_count_is_the_written_volume_not_the_walked_residual() {
         let dir = temp_store_with_bytes("crash-wal", 8_192);
         // The WAL as it looks AFTER recovery: a small residual (one reclaimed segment).
         std::fs::write(
@@ -2068,7 +2247,7 @@ mod tests {
         c.record_storage_at(
             dir.join("graphus.store"),
             dir.join("graphus.wal"),
-            Some(1_254_181), // what the example measured, by path, AT THE CRASH
+            Some(1_254_181), // the written volume the example measured, AT THE CRASH
             Some(1_254_181),
         )
         .expect("measure");
@@ -2078,13 +2257,19 @@ mod tests {
         assert_eq!(
             report.storage.wal_bytes,
             Some(1_254_181),
-            "the redo log the crash left behind is the WAL this run wrote — NOT the 4 KiB residual \
-             that happens to be on disk once recovery has replayed and checkpointed it away"
+            "wal_bytes is the WRITTEN volume — the redo log the crash left behind — NOT the 4 KiB \
+             residual on disk once recovery has replayed and checkpointed it away"
         );
         assert_eq!(
             report.storage.wal_pages,
             Some(1_254_181u64.div_ceil(PAGE_SIZE)),
-            "the page count must follow the supplied byte count, not the walked residual"
+            "the written-page count must follow the supplied byte count, not the walked residual"
+        );
+        assert_eq!(
+            report.storage.wal_retained_bytes,
+            Some(4_096),
+            "the post-recovery residual on disk is the SEPARATE retained footprint, no longer \
+             conflated with the written volume (rmp #805)"
         );
         assert_eq!(report.storage.bytes_fsynced, Some(1_254_181));
         assert_eq!(
@@ -2094,15 +2279,16 @@ mod tests {
         );
     }
 
-    /// The override never *invents* a WAL: if the WAL path does not exist at all, the vector stays
-    /// NOT MEASURED (absent), exactly as it does without the override. A figure supplied for a WAL
-    /// this run never had would be a fabrication, and schema v3 exists to make that impossible.
+    /// The written volume comes from the server's `graphus_wal_bytes_written_total` counter, which is
+    /// independent of whether the WAL **directory** still exists on disk at emission time (a checkpoint
+    /// may have reclaimed it). So a supplied written volume is honest even with no directory to walk —
+    /// while the RETAINED footprint, which IS a directory walk, is then correctly absent (`rmp #805`).
     #[test]
-    fn a_supplied_wal_byte_count_cannot_conjure_a_wal_that_does_not_exist() {
+    fn the_written_volume_stands_even_when_the_retained_directory_is_gone() {
         let dir = temp_store_with_bytes("no-wal", 8_192);
         let _ = std::fs::remove_dir_all(dir.join("graphus.wal"));
 
-        let mut c = EvidenceCollector::new(RunMetadata::new("unit", "absent WAL"));
+        let mut c = EvidenceCollector::new(RunMetadata::new("unit", "reclaimed WAL directory"));
         c.start();
         c.record_storage_at(
             dir.join("graphus.store"),
@@ -2112,26 +2298,33 @@ mod tests {
         )
         .expect("measure");
         let report = c.finish();
-        let storage_json = serde_json::to_string(&report.storage).expect("serialize");
         let _ = std::fs::remove_dir_all(&dir);
 
-        assert_eq!(report.storage.wal_bytes, None);
-        assert_eq!(report.storage.wal_pages, None);
         assert_eq!(
-            report.storage.bytes_fsynced, None,
-            "with no WAL there is nothing to proxy the fsynced bytes with either"
+            report.storage.wal_bytes,
+            Some(999_999),
+            "the written volume is a server counter, not a directory walk — it stands even after the \
+             directory was reclaimed"
         );
-        assert!(
-            !storage_json.contains("wal_bytes"),
-            "a WAL that does not exist is NOT MEASURED — absent from the storage section, never a \
-             supplied number: {storage_json}"
+        assert_eq!(
+            report.storage.wal_pages,
+            Some(999_999u64.div_ceil(PAGE_SIZE))
+        );
+        assert_eq!(
+            report.storage.wal_retained_bytes, None,
+            "the RETAINED footprint IS a directory walk, so with no directory it is NOT MEASURED"
+        );
+        assert_eq!(
+            report.storage.bytes_fsynced,
+            Some(999_999),
+            "bytes_fsynced proxies the WRITTEN volume, which was supplied"
         );
         assert!(
             report
                 .notes
                 .iter()
-                .any(|n| n.contains("NOT MEASURED") && n.contains("wal_bytes")),
-            "and the report must SAY why the vector is absent"
+                .any(|n| n.contains("NOT MEASURED") && n.contains("wal_retained_bytes")),
+            "and the report must SAY the retained footprint is absent"
         );
     }
 

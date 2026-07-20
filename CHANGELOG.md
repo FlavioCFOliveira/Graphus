@@ -94,6 +94,17 @@ explicitly so an operator can judge their own exposure.
   bomb (rmp #724).
 - **Composite index refill tuple construction is now O(k·V), not O(k·V²) (rmp #774).**
 - **The bulk-import buffer pool auto-sizes so large loads are not quadratic (rmp #718).**
+- **The examples' `storage.wal_bytes` gate now has teeth: it measures WAL bytes *written*, not a
+  `du -sb` snapshot (rmp #805).** The old metric sampled the WAL *directory* at teardown, where the
+  monotonic-growth-then-reclaim curve makes it bimodal by construction — the same configuration was
+  observed to swing 17× (1.87 MB vs 31.46 MB), which both caused a false-positive regression diagnosis
+  and would mask a genuine multi-fold regression. `storage.wal_bytes` is now sourced from the stable
+  `graphus_wal_bytes_written_total` counter (0.23 % spread across three identical runs), and the
+  on-disk footprint moved to a distinctly-named, deliberately un-gated `storage.wal_retained_bytes`.
+  The evidence report is schema v5; pre-#805 baselines are migrated at load time (their old figure is
+  relabelled *retained* and the WAL-volume gate is skipped rather than mis-compared), and the
+  product-recommendations baseline is regenerated against the corrected metric with recorded
+  provenance.
 
 ### Fixed
 

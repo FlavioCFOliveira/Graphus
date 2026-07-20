@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 5,
   "metadata": {
     "scenario": "product-recommendations",
     "description": "read-heavy product recommendations: concurrent read scaling under a production-shaped read/write MIX (paired control vs mixed arms)",
@@ -8,26 +8,26 @@
       "relationships": 30877
     },
     "workload": {
-      "best_busiest_core_frac": "0.752",
+      "best_busiest_core_frac": "0.724",
       "best_busy_threads": "33",
       "best_clients": "8",
-      "best_ops_per_sec": "717.3",
-      "best_p50_ms": "4.4061",
-      "best_p999_ms": "86.4297",
-      "best_p99_ms": "75.5767",
-      "best_server_cores": "12.095",
+      "best_ops_per_sec": "770.4",
+      "best_p50_ms": "4.5341",
+      "best_p999_ms": "120.0098",
+      "best_p99_ms": "79.9770",
+      "best_server_cores": "11.941",
       "connection": "uds-bolt (client, per-connection thread)",
-      "control_best_ops_per_sec": "779.9",
+      "control_best_ops_per_sec": "810.3",
       "engine_abort_rate": "0.000000",
       "engine_txn_aborts": "0",
-      "engine_txn_attempts": "1752",
+      "engine_txn_attempts": "1450",
       "friend_count": "14994",
       "headline_arm": "mixed",
       "hot_keys": "4",
       "hot_write_fraction": "0.2500",
       "ladder": "1,2,4,8",
-      "mix_cost_read_ops_pct": "-8.03",
-      "mixed_best_ops_per_sec": "717.3",
+      "mix_cost_read_ops_pct": "-4.93",
+      "mixed_best_ops_per_sec": "770.4",
       "node_count": "2400",
       "ops_per_rung": "1500",
       "proc_sampling": "true",
@@ -37,25 +37,25 @@
       "rungs": "8",
       "scenario_db": "recodb",
       "seed": "104179027439885",
-      "total_read_errors": "8",
-      "total_read_ops": "11992",
+      "total_read_errors": "0",
+      "total_read_ops": "12000",
       "user_count": "2000",
       "write_commit_rate": "1.000000",
-      "write_committed": "1752",
+      "write_committed": "1450",
       "write_every_ms": "20",
       "write_max_retries": "0",
-      "write_ops_per_sec": "88.0484",
-      "write_p50_ms": "2.3686",
-      "write_p999_ms": "23.8286",
-      "write_p99_ms": "6.1863",
+      "write_ops_per_sec": "79.4933",
+      "write_p50_ms": "4.9602",
+      "write_p999_ms": "26.8584",
+      "write_p99_ms": "10.0317",
       "write_retries_per_commit": "0.0000",
       "write_retry_budget_exhausted": "0",
       "write_retry_budget_ms": "15000",
-      "write_units": "1752",
+      "write_units": "1450",
       "writer_mode": "managed-retry",
       "writers": "2"
     },
-    "started_unix_secs": 1783843007
+    "started_unix_secs": 1784582217
   },
   "host": {
     "os": "linux",
@@ -63,102 +63,106 @@
     "cpu_cores": 16,
     "hostname": "ROG",
     "rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
-    "timestamp_unix_secs": 1783843007
+    "timestamp_unix_secs": 1784582217
   },
-  "total_millis": 35962.139359,
+  "total_millis": 31818.536387,
   "phases": [
     {
       "name": "rung C=1 (readonly)",
-      "millis": 7633.620524
+      "millis": 6051.989568999999
     },
     {
       "name": "rung C=1 (mixed)",
-      "millis": 8011.504103
+      "millis": 6889.609099
     },
     {
       "name": "rung C=2 (readonly)",
-      "millis": 3903.9034699999997
+      "millis": 3531.5377909999997
     },
     {
       "name": "rung C=2 (mixed)",
-      "millis": 4069.7555530000004
+      "millis": 3963.444498
     },
     {
       "name": "rung C=4 (readonly)",
-      "millis": 2603.17286
+      "millis": 2143.284806
     },
     {
       "name": "rung C=4 (mixed)",
-      "millis": 2719.0083600000003
+      "millis": 2422.776141
     },
     {
       "name": "rung C=8 (readonly)",
-      "millis": 1923.2952349999998
+      "millis": 1851.192086
     },
     {
       "name": "rung C=8 (mixed)",
-      "millis": 2088.416
+      "millis": 1947.1024009999999
     },
     {
       "name": "slow-reader probe",
-      "millis": 3009.463254
+      "millis": 3017.599996
     }
   ],
   "cpu": {
-    "user_secs": 22.65,
-    "system_secs": 2.61,
-    "mean_core_utilisation": 12.095291359575869
+    "user_secs": 21.36,
+    "system_secs": 1.89,
+    "mean_core_utilisation": 11.940820363664068
   },
   "memory": {
-    "peak_rss_bytes": 612012032,
-    "final_rss_bytes": 612012032
+    "peak_rss_bytes": 719892480,
+    "final_rss_bytes": 719892480
   },
   "storage": {
-    "store_bytes": 6922240,
-    "wal_bytes": 7360747,
-    "store_pages": 845,
-    "wal_pages": 899,
-    "bytes_fsynced": 7360747,
-    "write_amplification": 5.87020397158725,
-    "space_amplification": 5.87020397158725
+    "store_bytes": 6873088,
+    "wal_bytes": 69180880,
+    "store_pages": 839,
+    "wal_pages": 8445,
+    "wal_retained_bytes": 27341937,
+    "wal_retained_pages": 3338,
+    "bytes_fsynced": 69180880,
+    "write_amplification": 31.201205481115537,
+    "space_amplification": 31.201205481115537
   },
   "throughput": {
-    "operations": 1498,
-    "ops_per_sec": 717.2900418307463,
-    "p50_latency_ms": 4.40611,
-    "p99_latency_ms": 75.576725,
-    "p999_latency_ms": 86.429722,
+    "operations": 1500,
+    "ops_per_sec": 770.3755073331657,
+    "p50_latency_ms": 4.534132,
+    "p99_latency_ms": 79.977008,
+    "p999_latency_ms": 120.00979,
     "abort_rate": 0.0
   },
   "measurement_mode": "local",
   "notes": [
-    "CONCURRENCY LADDER (read-heavy MIX, 8 rungs × 2 arm(s) over 1,2,4,8 against 'recodb'): the headline evidence is where throughput SATURATES while latency explodes and only a subset of cores stay busy — the single-engine-thread vs off-thread-reader-pool signature — measured under a PRODUCTION-SHAPED MIX (reads served while writes commit underneath), not against a frozen graph.",
-    "TWO LAYERS OF TRUTH, never conflated (rmp #714, #715). READ: throughput.* is ONE coherent set — the 1498 reads of the best 'mixed' rung (C=8), at 717.3 ops/s, and throughput.abort_rate = 0.000000 is the READ abort rate. It is a MEASURED zero, not a placeholder: a standalone auto-commit read runs at SNAPSHOT ISOLATION (rmp #543/#545), so it can neither abort a writer nor be aborted by one — that is invariant I1, and the run FAILS if a read ever aborts. WRITE: the writers' evidence lives in the workload map and is split in two. ENGINE: 0 of 1752 transaction attempts were aborted by SSI (engine_abort_rate 0.000000). APPLICATION: 1752 of 1752 business units COMMITTED (write_commit_rate 1.000000), at 0.0000 retries per commit, 0 exhausting their retry budget. A high engine abort rate WITH a full application commit rate is a HEALTHY system under contention: the application-visible cost of contention is LATENCY (see write_p99_ms, which is RETRY-INCLUSIVE), not lost work.",
-    "THE COST OF THE MIX (rmp #714). Every rung was run TWICE, back to back, same concurrency, same op budget, same graph: once with the writers OFF (the control) and once with them ON (the treatment — the production-shaped default this report headlines). What the mix costs the READ path: -8.0% at the best rung (C=8). Rung by rung: C=1: 196.5 → 186.9 ops/s (-4.9%), p99 31.2 → 31.5 ms | C=2: 384.2 → 368.1 ops/s (-4.2%), p99 32.1 → 32.5 ms | C=4: 576.2 → 551.3 ops/s (-4.3%), p99 45.3 → 44.6 ms | C=8: 779.9 → 717.3 ops/s (-8.0%), p99 75.8 → 75.6 ms. The control arm runs FIRST at every rung, so it warms the buffer pool for the mixed arm — the cost reported here is therefore a conservative LOWER BOUND. This is the number a capacity planner needs and that a read-only ladder against a frozen graph can never produce.",
-    "THE WRITE STREAM is production-shaped, not a storm: 2 writer(s) paced at one business unit every 20ms, each driven through MANAGED RETRY (bounded exponential backoff + jitter — what session.execute_write does in every official driver). 25% of the units are a read-modify-write of one of 4 TRENDING products (`SET p.hot = coalesce(p.hot,0)+1`); the rest CREATE a PURCHASED edge on a random (user, product) pair. The hot component is what makes SSI — and therefore the retry path — LOAD-BEARING: a purely random write stream conflicts with nobody, aborts nothing, and leaves the retry path as dead code and the bounded-retries invariant vacuous.",
-    "SLOW-READER PROBE (invariant I5, the GC pin — rmp #551): while 107 heavy 'r3_fof3' traversals (p50 22.8ms, max 57.1ms) held their MVCC snapshots open for 3.0s, the writers committed 263 of 263 business units underneath them (0 engine aborts). A long reader pins the GC watermark; if that pin could stall the write path, this window would show ZERO commits — and the ladder, whose reads are all short, would never have noticed.",
-    "rung clients=1 arm=readonly: 196.5 ops/s over 7.634s (1500 ok, 0 err, 0 read aborts); p50=2.205ms p90=10.527ms p99=31.203ms p99.9=37.481ms max=37.510ms; server 2.05 cores across 8 busy thread(s), busiest 0.35 core; peak RSS 328.6MiB (VmHWM 328.6MiB); disk read IO 0.0MiB",
-    "rung clients=1 arm=mixed: 186.9 ops/s over 8.012s (1497 ok, 3 err, 0 read aborts); p50=2.204ms p90=10.820ms p99=31.539ms p99.9=39.278ms max=41.895ms; server 2.12 cores across 9 busy thread(s), busiest 0.35 core; peak RSS 376.0MiB (VmHWM 376.0MiB); disk read IO 0.0MiB; READ FAILURES 3×Neo.DatabaseError.General.UnknownError (Prop store page 321 not allocated); WRITES 716/716 units committed, 0 of 716 engine attempts aborted (rate 0.0000), 0 retries, 0 exhausted; COST OF THE MIX -4.9% vs its control's 196.5 ops/s",
-    "rung clients=2 arm=readonly: 384.2 ops/s over 3.904s (1500 ok, 0 err, 0 read aborts); p50=2.204ms p90=12.579ms p99=32.082ms p99.9=38.151ms max=46.597ms; server 3.59 cores across 14 busy thread(s), busiest 0.49 core; peak RSS 385.9MiB (VmHWM 385.9MiB); disk read IO 0.0MiB",
-    "rung clients=2 arm=mixed: 368.1 ops/s over 4.070s (1498 ok, 2 err, 0 read aborts); p50=2.211ms p90=11.937ms p99=32.505ms p99.9=44.384ms max=47.720ms; server 3.63 cores across 17 busy thread(s), busiest 0.50 core; peak RSS 415.5MiB (VmHWM 415.5MiB); disk read IO 0.0MiB; READ FAILURES 2×Neo.DatabaseError.General.UnknownError (Rel store page 393 not allocated); WRITES 361/361 units committed, 0 of 361 engine attempts aborted (rate 0.0000), 0 retries, 0 exhausted; COST OF THE MIX -4.2% vs its control's 384.2 ops/s",
-    "rung clients=4 arm=readonly: 576.2 ops/s over 2.603s (1500 ok, 0 err, 0 read aborts); p50=2.249ms p90=17.536ms p99=45.325ms p99.9=66.687ms max=67.383ms; server 7.77 cores across 32 busy thread(s), busiest 0.65 core; peak RSS 429.9MiB (VmHWM 429.9MiB); disk read IO 0.0MiB",
-    "rung clients=4 arm=mixed: 551.3 ops/s over 2.719s (1499 ok, 1 err, 0 read aborts); p50=2.582ms p90=17.541ms p99=44.628ms p99.9=75.980ms max=77.675ms; server 7.40 cores across 33 busy thread(s), busiest 0.64 core; peak RSS 480.1MiB (VmHWM 480.1MiB); disk read IO 0.0MiB; READ FAILURES 1×Neo.DatabaseError.General.UnknownError (Rel store page 396 not allocated); WRITES 236/236 units committed, 0 of 236 engine attempts aborted (rate 0.0000), 0 retries, 0 exhausted; COST OF THE MIX -4.3% vs its control's 576.2 ops/s",
-    "rung clients=8 arm=readonly: 779.9 ops/s over 1.923s (1500 ok, 0 err, 0 read aborts); p50=4.330ms p90=25.835ms p99=75.769ms p99.9=110.487ms max=112.990ms; server 12.13 cores across 33 busy thread(s), busiest 0.76 core; peak RSS 532.0MiB (VmHWM 532.0MiB); disk read IO 0.0MiB",
-    "rung clients=8 arm=mixed: 717.3 ops/s over 2.088s (1498 ok, 2 err, 0 read aborts); p50=4.406ms p90=27.544ms p99=75.577ms p99.9=86.430ms max=93.672ms; server 12.10 cores across 33 busy thread(s), busiest 0.75 core; peak RSS 583.7MiB (VmHWM 583.7MiB); disk read IO 0.0MiB; READ FAILURES 2×Neo.DatabaseError.General.UnknownError (Prop store page 334 not allocated); WRITES 176/176 units committed, 0 of 176 engine attempts aborted (rate 0.0000), 0 retries, 0 exhausted; COST OF THE MIX -8.0% vs its control's 779.9 ops/s",
-    "family s_user (point read) @ clients=8: 299 ok / 0 err; p50=2.373ms p99=6.953ms max=7.966ms",
-    "family s_purchases (point read) @ clients=8: 219 ok / 0 err; p50=2.317ms p99=6.483ms max=7.577ms",
-    "family s_degree (point read) @ clients=8: 140 ok / 0 err; p50=2.396ms p99=6.784ms max=7.971ms",
-    "family r1_friends (advanced traversal) @ clients=8: 300 ok / 0 err; p50=4.344ms p99=26.385ms max=36.182ms",
-    "family r2_fof (advanced traversal) @ clients=8: 188 ok / 0 err; p50=19.908ms p99=56.247ms max=57.100ms",
-    "family r3_fof3 (advanced traversal) @ clients=8: 126 ok / 2 err; p50=52.676ms p99=86.430ms max=93.672ms",
-    "family r4_similar (advanced traversal) @ clients=8: 226 ok / 0 err; p50=9.054ms p99=20.059ms max=25.330ms",
-    "storage.bytes_fsynced is a proxy: the WAL on-disk byte count (every committed WAL byte is fsynced before commit acknowledgement), not a directly-observed fsync counter.",
-    "storage.bytes_per_node / bytes_per_relationship are deliberately ABSENT (rmp #711/#714): the dataset counts are the GENERATOR's seed graph, while the mixed arm COMMITTED 1752 business unit(s) into this same store — most of them a CREATE of a new PURCHASED edge. The store therefore no longer holds the graph those counts describe, and a per-element cost computed from them would be real arithmetic over the wrong graph.",
-    "storage.* is the REAL on-disk footprint of the 'recodb' database after the ladder: a 6922240 B store image plus a 7360747 B WAL DIRECTORY of segment files (walked by PATH). The amplification ratios are those durable bytes over the generator's 2433133 B logical CSV — and they now include the durable cost of the writes the mix committed, so they are an UPPER bound on the load's own amplification.",
-    "KNEE: Peak throughput 717.3 ops/s at clients=8 (p50=4.406ms p99=75.577ms p99.9=86.430ms).",
+    "METRIC PROVENANCE (rmp #805): storage.wal_bytes is the WAL bytes WRITTEN \u2014 graphus_wal_bytes_written_total (rmp #745), scraped from the co-located server /metrics \u2014 a MONOTONIC, reclamation-independent volume that is STABLE across identical runs (3-run spread 69,050,344..69,212,357 B = 0.23%), which is why it can gate a durability regression. It REPLACES the pre-#805 storage.wal_bytes, which was the on-disk WAL DIRECTORY size at teardown \u2014 a bimodal snapshot (the same configuration produced 1,871,597 and 31,457,384 B on repeat, a 17x spread) that gated nothing and masked regressions. The on-disk directory walk is now reported SEPARATELY as storage.wal_retained_bytes (still bimodal, kept for diagnostic interest, NOT gated). write_amplification/space_amplification use store + WAL-written and are therefore stable too. The pre-#805 committed baseline had wal_bytes=7,360,747 (a directory snapshot) and write_amplification=5.87 (computed from that snapshot); neither is comparable to these.",
+    "CONCURRENCY LADDER (read-heavy MIX, 8 rungs \u00d7 2 arm(s) over 1,2,4,8 against 'recodb'): the headline evidence is where throughput SATURATES while latency explodes and only a subset of cores stay busy \u2014 the single-engine-thread vs off-thread-reader-pool signature \u2014 measured under a PRODUCTION-SHAPED MIX (reads served while writes commit underneath), not against a frozen graph.",
+    "TWO LAYERS OF TRUTH, never conflated (rmp #714, #715). READ: throughput.* is ONE coherent set \u2014 the 1500 reads of the best 'mixed' rung (C=8), at 770.4 ops/s, and throughput.abort_rate = 0.000000 is the READ abort rate. It is a MEASURED zero, not a placeholder: a standalone auto-commit read runs at SNAPSHOT ISOLATION (rmp #543/#545), so it can neither abort a writer nor be aborted by one \u2014 that is invariant I1, and the run FAILS if a read ever aborts. WRITE: the writers' evidence lives in the workload map and is split in two. ENGINE: 0 of 1450 transaction attempts were aborted by SSI (engine_abort_rate 0.000000). APPLICATION: 1450 of 1450 business units COMMITTED (write_commit_rate 1.000000), at 0.0000 retries per commit, 0 exhausting their retry budget. A high engine abort rate WITH a full application commit rate is a HEALTHY system under contention: the application-visible cost of contention is LATENCY (see write_p99_ms, which is RETRY-INCLUSIVE), not lost work.",
+    "THE COST OF THE MIX (rmp #714). Every rung was run TWICE, back to back, same concurrency, same op budget, same graph: once with the writers OFF (the control) and once with them ON (the treatment \u2014 the production-shaped default this report headlines). What the mix costs the READ path: -4.9% at the best rung (C=8). Rung by rung: C=1: 247.9 \u2192 217.7 ops/s (-12.2%), p99 27.0 \u2192 26.4 ms | C=2: 424.7 \u2192 378.5 ops/s (-10.9%), p99 34.0 \u2192 33.4 ms | C=4: 699.9 \u2192 619.1 ops/s (-11.5%), p99 40.5 \u2192 45.7 ms | C=8: 810.3 \u2192 770.4 ops/s (-4.9%), p99 81.8 \u2192 80.0 ms. The control arm runs FIRST at every rung, so it warms the buffer pool for the mixed arm \u2014 the cost reported here is therefore a conservative LOWER BOUND. This is the number a capacity planner needs and that a read-only ladder against a frozen graph can never produce.",
+    "THE WRITE STREAM is production-shaped, not a storm: 2 writer(s) paced at one business unit every 20ms, each driven through MANAGED RETRY (bounded exponential backoff + jitter \u2014 what session.execute_write does in every official driver). 25% of the units are a read-modify-write of one of 4 TRENDING products (`SET p.hot = coalesce(p.hot,0)+1`); the rest CREATE a PURCHASED edge on a random (user, product) pair. The hot component is what makes SSI \u2014 and therefore the retry path \u2014 LOAD-BEARING: a purely random write stream conflicts with nobody, aborts nothing, and leaves the retry path as dead code and the bounded-retries invariant vacuous.",
+    "SLOW-READER PROBE (invariant I5, the GC pin \u2014 rmp #551): while 124 heavy 'r3_fof3' traversals (p50 23.6ms, max 40.6ms) held their MVCC snapshots open for 3.0s, the writers committed 240 of 240 business units underneath them (0 engine aborts). A long reader pins the GC watermark; if that pin could stall the write path, this window would show ZERO commits \u2014 and the ladder, whose reads are all short, would never have noticed.",
+    "rung clients=1 arm=readonly: 247.9 ops/s over 6.052s (1500 ok, 0 err, 0 read aborts); p50=2.197ms p90=8.466ms p99=27.046ms p99.9=37.436ms max=37.441ms; server 1.79 cores across 7 busy thread(s), busiest 0.32 core; peak RSS 316.7MiB (VmHWM 316.7MiB); disk read IO 0.0MiB",
+    "rung clients=1 arm=mixed: 217.7 ops/s over 6.890s (1500 ok, 0 err, 0 read aborts); p50=2.229ms p90=10.021ms p99=26.357ms p99.9=36.341ms max=36.635ms; server 1.70 cores across 9 busy thread(s), busiest 0.29 core; peak RSS 352.4MiB (VmHWM 352.4MiB); disk read IO 0.0MiB; WRITES 557/557 units committed, 0 of 557 engine attempts aborted (rate 0.0000), 0 retries, 0 exhausted; COST OF THE MIX -12.2% vs its control's 247.9 ops/s",
+    "rung clients=2 arm=readonly: 424.7 ops/s over 3.532s (1500 ok, 0 err, 0 read aborts); p50=2.190ms p90=10.717ms p99=33.991ms p99.9=56.420ms max=72.716ms; server 3.99 cores across 15 busy thread(s), busiest 0.48 core; peak RSS 389.4MiB (VmHWM 389.4MiB); disk read IO 0.0MiB",
+    "rung clients=2 arm=mixed: 378.5 ops/s over 3.963s (1500 ok, 0 err, 0 read aborts); p50=2.213ms p90=11.522ms p99=33.431ms p99.9=65.673ms max=65.732ms; server 3.72 cores across 15 busy thread(s), busiest 0.48 core; peak RSS 448.5MiB (VmHWM 448.5MiB); disk read IO 0.0MiB; WRITES 317/317 units committed, 0 of 317 engine attempts aborted (rate 0.0000), 0 retries, 0 exhausted; COST OF THE MIX -10.9% vs its control's 424.7 ops/s",
+    "rung clients=4 arm=readonly: 699.9 ops/s over 2.143s (1500 ok, 0 err, 0 read aborts); p50=2.225ms p90=15.080ms p99=40.506ms p99.9=49.917ms max=64.787ms; server 7.90 cores across 33 busy thread(s), busiest 0.68 core; peak RSS 469.6MiB (VmHWM 469.6MiB); disk read IO 0.0MiB",
+    "rung clients=4 arm=mixed: 619.1 ops/s over 2.423s (1500 ok, 0 err, 0 read aborts); p50=2.572ms p90=15.763ms p99=45.694ms p99.9=60.596ms max=65.837ms; server 7.05 cores across 33 busy thread(s), busiest 0.63 core; peak RSS 521.7MiB (VmHWM 521.7MiB); disk read IO 0.0MiB; WRITES 192/192 units committed, 0 of 192 engine attempts aborted (rate 0.0000), 0 retries, 0 exhausted; COST OF THE MIX -11.5% vs its control's 699.9 ops/s",
+    "rung clients=8 arm=readonly: 810.3 ops/s over 1.851s (1500 ok, 0 err, 0 read aborts); p50=3.138ms p90=26.382ms p99=81.761ms p99.9=106.431ms max=120.377ms; server 12.59 cores across 33 busy thread(s), busiest 0.74 core; peak RSS 632.2MiB (VmHWM 632.2MiB); disk read IO 0.0MiB",
+    "rung clients=8 arm=mixed: 770.4 ops/s over 1.947s (1500 ok, 0 err, 0 read aborts); p50=4.534ms p90=25.425ms p99=79.977ms p99.9=120.010ms max=127.860ms; server 11.94 cores across 33 busy thread(s), busiest 0.72 core; peak RSS 686.5MiB (VmHWM 686.5MiB); disk read IO 0.0MiB; WRITES 144/144 units committed, 0 of 144 engine attempts aborted (rate 0.0000), 0 retries, 0 exhausted; COST OF THE MIX -4.9% vs its control's 810.3 ops/s",
+    "family s_user (point read) @ clients=8: 238 ok / 0 err; p50=2.943ms p99=11.412ms max=17.125ms",
+    "family s_purchases (point read) @ clients=8: 192 ok / 0 err; p50=3.010ms p99=11.789ms max=16.971ms",
+    "family s_degree (point read) @ clients=8: 121 ok / 0 err; p50=2.861ms p99=11.187ms max=15.280ms",
+    "family r1_friends (advanced traversal) @ clients=8: 247 ok / 0 err; p50=5.219ms p99=27.719ms max=35.723ms",
+    "family r2_fof (advanced traversal) @ clients=8: 137 ok / 0 err; p50=18.287ms p99=44.619ms max=48.760ms",
+    "family r3_fof3 (advanced traversal) @ clients=8: 117 ok / 0 err; p50=54.082ms p99=120.010ms max=127.860ms",
+    "family r4_similar (advanced traversal) @ clients=8: 166 ok / 0 err; p50=10.975ms p99=22.361ms max=23.818ms",
+    "family p_ann (advanced traversal) @ clients=8: 178 ok / 0 err; p50=1.260ms p99=7.084ms max=7.237ms",
+    "family p_search (point read) @ clients=8: 104 ok / 0 err; p50=1.764ms p99=8.179ms max=8.184ms",
+    "storage.bytes_per_node / bytes_per_relationship are deliberately ABSENT (rmp #711/#714): the dataset counts are the GENERATOR's seed graph, while the mixed arm COMMITTED 1450 business unit(s) into this same store \u2014 most of them a CREATE of a new PURCHASED edge. The store therefore no longer holds the graph those counts describe, and a per-element cost computed from them would be real arithmetic over the wrong graph.",
+    "storage.* is the REAL footprint of the 'recodb' database after the ladder: a 6873088 B store image, plus 69180880 B written to the WAL (storage.wal_bytes = graphus_wal_bytes_written_total, the STABLE write volume) with 27341937 B still retained on disk in the WAL DIRECTORY at teardown (storage.wal_retained_bytes, a bimodal snapshot, NOT gated). The amplification ratios are store + WAL-written over the generator's 2437533 B logical CSV \u2014 and they now include the durable cost of the writes the mix committed, so they are an UPPER bound on the load's own amplification.",
+    "KNEE: Peak throughput 770.4 ops/s at clients=8 (p50=4.534ms p99=79.977ms p99.9=120.010ms).",
     "KNEE: The ladder's top rung is also its best; extend --ladder to observe the plateau.",
-    "KNEE: At saturation (clients=8) the server used 12.10 cores across 33 busy thread(s); the busiest single thread ran at 0.75 of a core.",
-    "KNEE: VERDICT: reads SCALED ACROSS CORES — 33 threads were busy and total core usage reached 12.10, well above any single thread's 0.75. The read path spread work across cores (the off-thread reader pool #336/#527 is engaged).",
+    "KNEE: At saturation (clients=8) the server used 11.94 cores across 33 busy thread(s); the busiest single thread ran at 0.72 of a core.",
+    "KNEE: VERDICT: reads SCALED ACROSS CORES \u2014 33 threads were busy and total core usage reached 11.94, well above any single thread's 0.72. The read path spread work across cores (the off-thread reader pool #336/#527 is engaged).",
     "KNEE: Server disk read IO at the top rung: 0.0 MiB over the rung (reads are largely served from the buffer pool when this stays low)."
   ]
 }

@@ -108,7 +108,7 @@ use std::time::{Duration, Instant};
 
 use graphus_core::Value;
 use graphus_examples_harness::{
-    CpuSection, DatasetScale, EvidenceCollector, MemorySection, RunMetadata,
+    CpuSection, DatasetScale, EvidenceCollector, MemorySection, RunMetadata, scrape,
 };
 use graphus_reco_gen::bench::{self, Pcts};
 use graphus_reco_gen::client::{BoltClient, BoltUrl, ClientError, ClientResult, QueryResult};
@@ -3092,12 +3092,26 @@ fn write_evidence(
     // the store and report `wal_bytes: 0`, hiding the redo log completely.
     match (&args.store, &args.wal) {
         (Some(store), Some(wal)) => {
+            // The STABLE WAL metric is the bytes WRITTEN (`graphus_wal_bytes_written_total`), scraped
+            // from the co-located server's /metrics (`rmp #805`). It replaces the old on-disk WAL
+            // DIRECTORY walk, which was bimodal by construction (it depended on where teardown landed
+            // relative to the last checkpoint — a 17× run-to-run spread) and so could gate nothing. The
+            // directory walk is still recorded, separately, as storage.wal_retained_bytes. A failed /
+            // absent scrape yields None, and the report then reports wal_bytes as NOT MEASURED rather
+            // than substituting the bimodal walk.
+            let wal_written = args.metrics_url.as_deref().and_then(|url| {
+                scrape_wal_bytes_written(url, args.metrics_token.as_deref(), &args.db)
+            });
+            // `bytes_fsynced` proxies the written volume when we have it (every committed WAL byte is
+            // fsynced before acknowledgement); with no written figure it stays absent (the retained
+            // walk is a post-reclamation snapshot, not a forced-byte count).
             collector
-                .record_storage(store, wal, None)
+                .record_storage_at(store, wal, wal_written, wal_written)
                 .map_err(|e| format!("cannot measure the store/WAL footprint: {e}"))?;
             // Amplification against the REAL logical dataset (the generator's CSV bytes). Absent that
             // figure the ratios are simply OMITTED rather than computed against an invented
-            // per-element size.
+            // per-element size. The physical numerator is store + WAL bytes WRITTEN (stable), never the
+            // bimodal retained directory (`rmp #805`).
             if args.logical_bytes > 0 {
                 collector.record_amplification(args.logical_bytes, args.logical_bytes);
             }
@@ -3123,17 +3137,33 @@ fn write_evidence(
                 collector.record_per_element_costs();
             }
             let s = collector.storage_mut();
-            let (store_bytes, wal_bytes) = (
-                s.store_bytes.unwrap_or_default(),
-                s.wal_bytes.unwrap_or_default(),
-            );
+            let store_bytes = s.store_bytes.unwrap_or_default();
+            let wal_written = s.wal_bytes;
+            let wal_retained = s.wal_retained_bytes.unwrap_or_default();
+            // PROVENANCE (rmp #805): storage.wal_bytes is the WAL bytes WRITTEN, scraped from the
+            // server's graphus_wal_bytes_written_total — a monotonic, reclamation-independent volume
+            // that is STABLE across identical runs, which is why it can gate a durability regression.
+            // The on-disk WAL directory size is reported SEPARATELY as storage.wal_retained_bytes; it
+            // is a bimodal teardown snapshot (it depends on where teardown lands relative to the last
+            // checkpoint) and is NOT gated.
+            let wal_clause = match wal_written {
+                Some(w) => format!(
+                    "{w} B written to the WAL (storage.wal_bytes = graphus_wal_bytes_written_total, \
+                     the STABLE write volume) with {wal_retained} B still retained on disk in the WAL \
+                     DIRECTORY at teardown (storage.wal_retained_bytes, a bimodal snapshot, NOT gated)"
+                ),
+                None => format!(
+                    "the WAL write volume was NOT MEASURED (no /metrics scrape); {wal_retained} B was \
+                     retained on disk in the WAL DIRECTORY at teardown (storage.wal_retained_bytes)"
+                ),
+            };
             collector.note(format!(
-                "storage.* is the REAL on-disk footprint of the '{}' database after the ladder: a {} \
-                 B store image plus a {} B WAL DIRECTORY of segment files (walked by PATH). The \
-                 amplification ratios are those durable bytes over the generator's {} B logical CSV{}.",
+                "storage.* is the REAL footprint of the '{}' database after the ladder: a {} B store \
+                 image, plus {}. The amplification ratios are store + WAL-written over the generator's \
+                 {} B logical CSV{}.",
                 args.db,
                 store_bytes,
-                wal_bytes,
+                wal_clause,
                 args.logical_bytes,
                 if mixed_wrote {
                     " — and they now include the durable cost of the writes the mix committed, so they \
@@ -3179,6 +3209,62 @@ fn write_evidence(
 /// Bytes → mebibytes as an `f64`, for human display.
 fn mib(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
+}
+
+/// The Prometheus counter names for the WAL bytes **written** (per-database and server-wide aggregate).
+const DB_WAL_BYTES_WRITTEN: &str = "graphus_db_wal_bytes_written_total";
+const WAL_BYTES_WRITTEN: &str = "graphus_wal_bytes_written_total";
+
+/// Scrapes the co-located server's Prometheus `/metrics` and returns the **WAL bytes written** for
+/// `db` — the stable, reclamation-independent write volume `graphus_wal_bytes_written_total` reports
+/// (`rmp #745`), which `rmp #805` uses for `storage.wal_bytes` in place of the bimodal on-disk WAL
+/// directory walk.
+///
+/// The server is freshly booted for the example and the counter is monotonic since process start, so
+/// its **absolute** value after the run is exactly the bytes this run's workload wrote — no before /
+/// after delta is needed. The per-database series is preferred (it isolates the example's database);
+/// the server-wide aggregate is the fallback when no per-database series is exposed.
+///
+/// Returns `None` — never a fabricated figure — on any failure (endpoint unreachable, non-200, the
+/// counter absent). The caller then reports `storage.wal_bytes` as NOT MEASURED (absent) rather than
+/// substituting the bimodal directory walk. `base_url` is `host:port` (plaintext loopback REST).
+fn scrape_wal_bytes_written(base_url: &str, token: Option<&str>, db: &str) -> Option<u64> {
+    // Accept an optional scheme/trailing slash so callers may pass `http://host:port` or `host:port`.
+    let authority = base_url
+        .trim()
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    let resp = match graphus_reco_gen::http::http_get(authority, "/metrics", token) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("reco_bench: /metrics scrape of {authority} failed (non-fatal): {e}");
+            return None;
+        }
+    };
+    if resp.status != 200 {
+        eprintln!(
+            "reco_bench: /metrics scrape of {authority} returned HTTP {} (non-fatal); is \
+             metrics_scrape_token set?",
+            resp.status
+        );
+        return None;
+    }
+    let text = resp.text().ok()?;
+    let snapshot = scrape::parse(&text);
+    // Prefer the per-database counter (isolates this example's database); fall back to the aggregate.
+    let written = snapshot
+        .db_scalar(db, DB_WAL_BYTES_WRITTEN)
+        .or_else(|| snapshot.scalar(WAL_BYTES_WRITTEN));
+    match written {
+        Some(v) if v.is_finite() && v >= 0.0 => Some(v as u64),
+        _ => {
+            eprintln!(
+                "reco_bench: /metrics carried no {DB_WAL_BYTES_WRITTEN}{{database={db:?}}} nor \
+                 {WAL_BYTES_WRITTEN} (non-fatal); storage.wal_bytes will be NOT MEASURED"
+            );
+            None
+        }
+    }
 }
 
 /// The **COST OF THE MIX** note, written for a human reader: what serving reads *while writes commit*
@@ -3876,8 +3962,16 @@ struct Args {
     /// on-disk storage evidence. `None` (attach mode) ⇒ the storage section stays honestly zero.
     store: Option<String>,
     /// The co-located database's WAL **directory** (`.../databases/<db>/graphus.wal`, which holds the
-    /// `seg.<lsn>` segment files). Measured by PATH, not by leaf file name.
+    /// `seg.<lsn>` segment files). Walked by PATH into `storage.wal_retained_bytes` — the on-disk
+    /// footprint at teardown, a bimodal snapshot (`rmp #805`).
     wal: Option<String>,
+    /// The co-located server's plaintext-loopback REST authority (`host:port`), for scraping the
+    /// STABLE WAL bytes-written volume from `/metrics` into `storage.wal_bytes` (`rmp #805`). `None`
+    /// ⇒ that volume is NOT MEASURED and reported absent (never the bimodal directory walk).
+    metrics_url: Option<String>,
+    /// The `metrics_scrape_token` configured on the co-located server, sent as `Authorization: Bearer`
+    /// so the `/metrics` scrape passes the server's fail-closed gate without a full login.
+    metrics_token: Option<String>,
     /// Logical size of the loaded graph (the generator's CSV bytes), for the amplification ratios.
     /// `0` = not supplied, and the ratios stay at "not measured" rather than being invented.
     logical_bytes: u64,
@@ -3942,6 +4036,8 @@ impl Args {
         let mut evidence_dir = None;
         let mut store = None;
         let mut wal = None;
+        let mut metrics_url = None;
+        let mut metrics_token = None;
         let mut logical_bytes = 0u64;
         // The production-shaped MIX is the DEFAULT (rmp #714): the run everyone executes must be the
         // mix, not a read-only ladder against a frozen graph.
@@ -4030,6 +4126,8 @@ impl Args {
                 }
                 "--store" => store = Some(value()?),
                 "--wal" => wal = Some(value()?),
+                "--metrics-url" => metrics_url = Some(value()?),
+                "--metrics-token" => metrics_token = Some(value()?),
                 "--logical-bytes" => logical_bytes = parse_u64(&value()?, "--logical-bytes")?,
                 "--auto-extend" => auto_extend = true,
                 "--read-timeout-ms" => read_timeout_ms = parse_u64(&value()?, "--read-timeout-ms")?,
@@ -4075,6 +4173,8 @@ impl Args {
             server_pid,
             store,
             wal,
+            metrics_url,
+            metrics_token,
             logical_bytes,
             ladder,
             ops_per_rung,

@@ -2880,9 +2880,14 @@ fn write_evidence(
     if args.store_path.is_some() {
         *collector.storage_mut() = StorageSection::from_footprints(
             Some(DiskFootprint::from_bytes(store_bytes)),
+            // No WAL-written volume: social_bench walks the co-located store but does not scrape the
+            // server's graphus_wal_bytes_written_total, so the gated write VOLUME is NOT MEASURED
+            // (absent, never the bimodal directory walk) — the walk is the RETAINED footprint below
+            // (`rmp #805`).
+            None,
             Some(DiskFootprint::from_bytes(wal_bytes)),
-            // fsync proxy: every committed WAL byte is fsynced before the commit is acknowledged.
-            Some(wal_bytes),
+            // No directly-observed fsync counter and no written volume to proxy it with: absent.
+            None,
         );
         // Space amplification of the durable image over the logical graph. `0` logical bytes omits the
         // ratio rather than inventing one.

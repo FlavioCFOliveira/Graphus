@@ -152,15 +152,26 @@ evidence_capture_rss() {
   evidence_metric "memory.peak_rss_bytes" "0  # TODO(rmp #246)"
 }
 
-# evidence_capture_storage <store-dir> <wal-dir> — STUB (TODO rmp #247). Records on-disk sizes if the
-# paths exist; otherwise zeros. Full attribution (bytes fsynced, etc.) is the metering task's job.
+# evidence_capture_storage <store-dir> <wal-dir> — records on-disk sizes if the paths exist.
+#
+# A `du -sb` of the WAL directory is the on-disk RETAINED footprint at this instant, NOT the durable
+# write VOLUME — and it is bimodal by construction (it depends on where this snapshot lands relative to
+# the last checkpoint; rmp #805 observed a 17x spread). So it is emitted under storage.wal_retained_bytes,
+# never storage.wal_bytes. The gated storage.wal_bytes is the WAL bytes WRITTEN
+# (graphus_wal_bytes_written_total), a monotonic counter this shell stub cannot read — an example that
+# needs it scrapes /metrics (see examples/product-recommendations). Full attribution (bytes fsynced,
+# etc.) is the metering task's job.
 evidence_capture_storage() {
   local store="$1" wal="$2"
-  local store_bytes=0 wal_bytes=0
-  [ -e "$store" ] && store_bytes="$(du -sb "$store" 2>/dev/null | awk '{print $1}' || echo 0)"
-  [ -e "$wal" ]   && wal_bytes="$(du -sb "$wal" 2>/dev/null | awk '{print $1}' || echo 0)"
-  evidence_metric "storage.store_bytes" "${store_bytes:-0}"
-  evidence_metric "storage.wal_bytes" "${wal_bytes:-0}"
+  local store_bytes wal_retained_bytes
+  if [ -e "$store" ]; then
+    store_bytes="$(du -sb "$store" 2>/dev/null | awk '{print $1}' || echo 0)"
+    evidence_metric "storage.store_bytes" "${store_bytes:-0}"
+  fi
+  if [ -e "$wal" ]; then
+    wal_retained_bytes="$(du -sb "$wal" 2>/dev/null | awk '{print $1}' || echo 0)"
+    evidence_metric "storage.wal_retained_bytes" "${wal_retained_bytes:-0}"
+  fi
 }
 
 # --------------------------------------------------------------------------------------------------
