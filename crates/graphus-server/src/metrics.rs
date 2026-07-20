@@ -285,6 +285,11 @@ pub struct Metrics {
     /// brute-force scan while the index still reports `ONLINE`. Correct, but a silent throughput
     /// cliff, so it is an alerting signal exactly like `index_fail_closed`.
     vector_index_conflicts: AtomicU64,
+    /// How many times the cross-snapshot full-text/spatial freshness marker was poisoned (`rmp` #803),
+    /// sending every TEXT / FULLTEXT / SPATIAL seek in a database to an exact full scan while the
+    /// indexes still report `ONLINE`. Correct but strictly slower than having no index — an alerting
+    /// signal, not a debug detail.
+    ft_spatial_poison: AtomicU64,
     /// Cumulative index builds **poisoned** by a storage fault (`rmp` task #733, M1): the build could not
     /// get past an unreadable entity and was parked, leaving its index `Populating` — correct (every
     /// reader is on the exact scan) but unaccelerated — until the store reads cleanly again and the build
@@ -453,6 +458,7 @@ impl Metrics {
             maintenance_failures: AtomicU64::new(0),
             index_fail_closed: AtomicU64::new(0),
             vector_index_conflicts: AtomicU64::new(0),
+            ft_spatial_poison: AtomicU64::new(0),
             index_builds_poisoned: AtomicU64::new(0),
             index_builds_pending: AtomicU64::new(0),
             index_builds_parked: AtomicU64::new(0),
@@ -532,6 +538,13 @@ impl Metrics {
     /// is `O(entities x dim)` and the index still reports `ONLINE`, so this must be observable.
     pub fn record_vector_index_conflicts(&self, n: u64) {
         self.vector_index_conflicts.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Records `n` new poisonings of the cross-snapshot full-text/spatial marker (`rmp` #803): a
+    /// transaction that removed or replaced an indexed posting rolled back, so every TEXT / FULLTEXT /
+    /// SPATIAL seek falls back to an exact full scan until a rebuild clears it.
+    pub fn record_ft_spatial_poison(&self, n: u64) {
+        self.ft_spatial_poison.fetch_add(n, Ordering::Relaxed);
     }
 
     /// Records `n` newly **poisoned** index builds (`rmp` task #733, M1) — a build a storage fault stopped
@@ -1086,6 +1099,14 @@ impl Metrics {
              uncommitted writer, so every k-NN falls back to an exact O(entities x dim) brute-force \
              scan while the index still reports ONLINE. Correct, but a silent cliff (rmp #780).",
             self.vector_index_conflicts.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "graphus_ft_spatial_poison_total",
+            "Times the cross-snapshot full-text/spatial freshness marker was poisoned, sending every \
+             TEXT, FULLTEXT and SPATIAL seek to an exact full scan while the indexes still report \
+             ONLINE. Answers stay correct but the index costs more than none (rmp #803).",
+            self.ft_spatial_poison.load(Ordering::Relaxed),
         );
         // The window-vs-stall gauges (`rmp` task #573). The two counters above are cumulative event
         // tallies: they say something happened, never whether it is happening NOW. An index left

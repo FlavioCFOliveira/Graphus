@@ -336,6 +336,10 @@ pub struct IndexSet {
     /// via [`rollback_ft_spatial_marker`](Self::rollback_ft_spatial_marker) (a rolled-back remover) or
     /// [`poison_ft_spatial_marker`](Self::poison_ft_spatial_marker) (a faulted rebuild, `rmp` #733).
     ft_spatial_poisoned: bool,
+    /// How many times [`ft_spatial_poisoned`](Self#structfield.ft_spatial_poisoned) has gone
+    /// clean→poisoned over this set's life (`rmp` task #803) — monotonic. See
+    /// [`ft_spatial_poison_events`](Self::ft_spatial_poison_events).
+    ft_spatial_poison_events: u64,
     /// Whether the **label** [`TokenIndex`] ([`labels`](Self#structfield.labels)) may be trusted as the
     /// authoritative candidate source for a label scan (`rmp` task #733).
     ///
@@ -774,6 +778,7 @@ impl IndexSet {
             ft_spatial_inflight: BTreeSet::new(),
             ft_spatial_removers: BTreeSet::new(),
             ft_spatial_poisoned: false,
+            ft_spatial_poison_events: 0,
             ft_spatial_dirty: false,
             ft_spatial_removed_dirty: false,
         }
@@ -1226,6 +1231,11 @@ impl IndexSet {
         // A fresh rebuild starts with no known gap; the per-entity helpers raise it if they must skip an
         // entity they cannot read.
         self.rebuild_gap = false;
+        // Likewise the transient full-text/spatial attribution flags (`rmp` task #803): the caller is
+        // about to re-derive every posting from the committed store, so any bit left over from an
+        // earlier path describes work that is being discarded. Mirrors `rebuild_gap` exactly.
+        self.ft_spatial_dirty = false;
+        self.ft_spatial_removed_dirty = false;
         // Likewise a fresh rebuild starts with no known active-writer conflict (`rmp` task #778); the
         // full-text helpers raise it if the newest version of a covered property is held by an in-flight
         // transaction.
@@ -1395,6 +1405,14 @@ impl IndexSet {
         self.dirty_bitmap_nodes.clear();
         // And force every latest-state reader onto the scan path too (`rmp` #467's poison).
         self.poison_ft_spatial_marker();
+        // Discard the TRANSIENT attribution flags too (`rmp` task #803). A fail-closed is the
+        // "everything derived is untrustworthy" path: it wipes every structure and poisons the marker,
+        // so a half-raised dirty bit describing work that has just been thrown away has no meaning left.
+        // Leaving it standing let a faulted rebuild's residue be charged to the next unrelated write
+        // statement, which then poisoned the marker a SECOND time on abort — by a transaction that
+        // touched nothing indexed. (`rebuild_index` reaches `fail_closed` on both of its bail paths
+        // AFTER its refill loops have raised the flag.)
+        self.clear_ft_spatial_dirty();
         // The gap (if any) has been acted upon: everything it could have made incomplete is now unusable.
         self.rebuild_gap = false;
     }
@@ -4063,7 +4081,7 @@ impl IndexSet {
         // solely on the removers set is the fail-closed choice (a removal always poisons; a pure insert
         // never does).
         if self.ft_spatial_removers.remove(&txn) {
-            self.ft_spatial_poisoned = true;
+            self.poison_ft_spatial_marker();
         }
     }
 
@@ -4079,7 +4097,38 @@ impl IndexSet {
     /// transactional and cannot be repaired in place, so the only provably-correct response is to stop
     /// reading it.
     pub fn poison_ft_spatial_marker(&mut self) {
+        // Count the clean→poisoned EDGE (`rmp` task #803): one observable degradation per entry, not
+        // one per poisoning write.
+        if !self.ft_spatial_poisoned {
+            self.ft_spatial_poison_events += 1;
+        }
         self.ft_spatial_poisoned = true;
+    }
+
+    /// Whether the cross-snapshot full-text/spatial marker is currently **poisoned** (`rmp` task #803).
+    ///
+    /// While poisoned, [`effective_ft_spatial_marker`](Self::effective_ft_spatial_marker) is
+    /// `u64::MAX`, so EVERY reader declines EVERY node and relationship TEXT / FULLTEXT / SPATIAL seek
+    /// to the exact scan — including the off-thread reader pool. Answers stay correct; the "index" now
+    /// costs strictly more than having none (measured in the product-recommendations example: 801
+    /// dbHits for the seek against 800 for the equivalent full scan), while `SHOW INDEXES` still
+    /// reports `ONLINE`.
+    ///
+    /// Read by the coordinator to (a) drive the repair — only a full `rebuild_index` can clear a
+    /// poison, since the poison means the in-memory index may be MISSING a committed posting that no
+    /// re-check can resurrect — and (b) publish the state, because a permanent silent DB-wide
+    /// degradation is precisely the fault class `rmp` #733 exists to make impossible.
+    #[must_use]
+    pub fn ft_spatial_poisoned(&self) -> bool {
+        self.ft_spatial_poisoned
+    }
+
+    /// How many times the marker has been poisoned over this set's life (`rmp` task #803) — monotonic,
+    /// counted on the clean→poisoned edge so a repeatedly-poisoning workload reports each transition
+    /// once. The server samples it to log the entry at `WARN` and drive a counter.
+    #[must_use]
+    pub fn ft_spatial_poison_events(&self) -> u64 {
+        self.ft_spatial_poison_events
     }
 
     /// Raises the committed full-text/spatial marker to at least `ts` after an **incremental online

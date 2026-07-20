@@ -1235,6 +1235,21 @@ pub struct TxnCoordinator<D: BlockDevice, S: LogSink> {
     conflict_retry_skip: u32,
     /// The current backoff width for [`conflict_retry_skip`](Self#structfield.conflict_retry_skip).
     conflict_retry_backoff: u32,
+    /// Drains still to skip before the next POISON-only full-text/spatial repair (`rmp` task #803) —
+    /// see [`retry_degraded_index_rebuild`](Self::retry_degraded_index_rebuild). Kept separate from
+    /// [`degraded_retry_skip`](Self#structfield.degraded_retry_skip) because the two throttle opposite
+    /// failure modes: a degraded set is a storage fault whose repair keeps FAILING, while a poison
+    /// repair always succeeds and the hazard is it being re-triggered.
+    ft_poison_repair_skip: u32,
+    /// The current backoff width for
+    /// [`ft_poison_repair_skip`](Self#structfield.ft_poison_repair_skip). Doubles on each successful
+    /// poison-only repair and halves on every call that finds the engine healthy.
+    ft_poison_repair_backoff: u32,
+    /// How many POISON-driven full-store rebuilds this coordinator has actually run (`rmp` task #803)
+    /// — monotonic. The repair is an O(store) rebuild of every index, so its RATE is the thing that
+    /// must stay proportionate to the fault rather than to the traffic; a counter is the only way to
+    /// hold that in a regression test.
+    ft_poison_repairs: u64,
     /// Drains still to skip before the next VECTOR conflict re-fill attempt (`rmp` task #780) — the
     /// vector twin of [`conflict_retry_skip`](Self#structfield.conflict_retry_skip), kept SEPARATE so a
     /// flapping full-text conflict cannot starve a vector re-fill (or the reverse): while an index is
@@ -1500,6 +1515,9 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             conflicted_fulltext_builds: Vec::new(),
             conflict_retry_skip: 0,
             conflict_retry_backoff: 1,
+            ft_poison_repair_skip: 0,
+            ft_poison_repair_backoff: 1,
+            ft_poison_repairs: 0,
             vector_conflict_retry_skip: 0,
             vector_conflict_retry_backoff: 1,
             poisoned_spatial_builds: Vec::new(),
@@ -6199,6 +6217,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // the fault, rather than publish an index with a hole in it.
         if self.index.borrow().rebuild_gap() {
             self.index.borrow_mut().clear_rebuild_gap();
+            // `rmp` #803: see the vector twin — discard the fill loop's transient dirty flag.
+            self.index.borrow_mut().clear_ft_spatial_dirty();
             return Err(GraphusError::Storage(format!(
                 "the text index {name:?} could not be built: the store scan skipped at least one node"
             )));
@@ -6470,6 +6490,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             // query seam then raises a clear "still populating" error — and surface the fault.
             if self.index.borrow().rebuild_gap() {
                 self.index.borrow_mut().clear_rebuild_gap();
+                // `rmp` #803: this bail is AFTER the fill loop, which raised the transient dirty flag.
+                // Discard it — the build's insertions reflect committed state and must never be
+                // attributed to (or poison on the abort of) the next unrelated write statement.
+                self.index.borrow_mut().clear_ft_spatial_dirty();
                 return Err(GraphusError::Storage(
                     "the vector index could not be built: the store scan skipped at least one \
                      relationship"
@@ -6499,6 +6523,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             // The node twin of the guard above (`rmp` task #733).
             if self.index.borrow().rebuild_gap() {
                 self.index.borrow_mut().clear_rebuild_gap();
+                // `rmp` #803: this bail is AFTER the fill loop, which raised the transient dirty flag.
+                // Discard it — the build's insertions reflect committed state and must never be
+                // attributed to (or poison on the abort of) the next unrelated write statement.
+                self.index.borrow_mut().clear_ft_spatial_dirty();
                 return Err(GraphusError::Storage(
                     "the vector index could not be built: the store scan skipped at least one node"
                         .to_owned(),
@@ -7603,6 +7631,36 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.index.borrow().blocked_vector_indexes()
     }
 
+    /// Whether the cross-snapshot full-text/spatial marker is **poisoned** (`rmp` task #803) — i.e.
+    /// whether every TEXT / FULLTEXT / SPATIAL seek in this database, node and relationship, inline and
+    /// off-thread, is currently declining to the exact scan while `SHOW INDEXES` reports `ONLINE`.
+    ///
+    /// Answers stay correct and the state is self-repairing (see
+    /// [`retry_degraded_index_rebuild`](Self::retry_degraded_index_rebuild)), but it must be visible:
+    /// this is the fault class that reached production-example scale precisely because nothing reported
+    /// it.
+    #[must_use]
+    pub fn ft_spatial_poisoned(&self) -> bool {
+        self.index.borrow().ft_spatial_poisoned()
+    }
+
+    /// How many times the full-text/spatial marker has been poisoned over this coordinator's life
+    /// (`rmp` task #803) — monotonic, one per clean→poisoned edge. Sampled by the server to log and
+    /// meter each new occurrence.
+    #[must_use]
+    pub fn ft_spatial_poison_events(&self) -> u64 {
+        self.index.borrow().ft_spatial_poison_events()
+    }
+
+    /// How many POISON-driven full-store index rebuilds this coordinator has run (`rmp` task #803) —
+    /// monotonic. Distinct from
+    /// [`ft_spatial_poison_events`](Self::ft_spatial_poison_events), which counts how many times the
+    /// marker was POISONED: the gap between the two is exactly what the repair throttle is buying.
+    #[must_use]
+    pub fn ft_poison_repairs(&self) -> u64 {
+        self.ft_poison_repairs
+    }
+
     /// How many times a VECTOR index has entered that blocked state over this coordinator's life
     /// (`rmp` task #780) — monotonic, one per index per entry. The server samples it to log each new
     /// occurrence and drive a metric.
@@ -7912,15 +7970,71 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// not read the clock. A no-op returning `true` when the index set is healthy, so callers can invoke
     /// it unconditionally.
     pub fn retry_degraded_index_rebuild(&mut self) -> bool {
-        if !self.index.borrow().is_degraded() {
+        // `rmp` task #803 — the trigger covers a POISONED marker as well as a degraded set.
+        //
+        // A poisoned cross-snapshot full-text/spatial marker pins `effective_ft_spatial_marker` at
+        // `u64::MAX`, so every TEXT / FULLTEXT / SPATIAL seek — node and relationship, inline and
+        // off-thread — declines to the exact scan, permanently. It was previously UNREACHABLE for
+        // repair: `bump_ft_spatial_marker_after_build` (what `CREATE TEXT INDEX` ends with) only raises
+        // the watermark and deliberately does not clear a poison, and the only clearing call
+        // (`reset_ft_spatial_marker`) lives inside `rebuild_index`, which this driver only ever reached
+        // when `is_degraded()`. A poisoned-but-not-degraded set is not degraded, so nothing repaired
+        // it: MEASURED, the poison survived `DROP INDEX` + `CREATE TEXT INDEX` and only a process
+        // restart cleared it.
+        //
+        // A full rebuild is the CORRECT repair, not merely the available one: the poison means a
+        // rolled-back writer may have removed a posting the index never re-inserted (index maintenance
+        // is eager at write time and rollback does not undo it), so the in-memory index can be MISSING
+        // a committed posting — a false negative no re-check can resurrect. Only re-deriving from the
+        // committed store can prove otherwise.
+        //
+        // SPIN SAFETY: unlike `has_pending_index_builds` — which callers SPIN on, and which is why
+        // `rmp` #780 refused to widen it — this function is never called inside a loop. Its three
+        // production call sites (`advance_index_builds`, `LocalEngine::drain_index_builds`,
+        // `maintain_degraded_indexes`) each call it at most once per command/tick, and the attempt is
+        // additionally throttled by the shared exponential backoff below. A workload that re-poisons on
+        // every attempt therefore costs one bounded O(store) rebuild per backoff window, never a hot
+        // loop.
+        //
+        // THROTTLE, and why the pre-existing one was NOT enough. `degraded_retry_backoff` arms only when
+        // a repair FAILS, which is the right shape for a faulting device but the wrong one here: a
+        // poison repair SUCCEEDS every time (the rebuild clears it) and then the very next rolled-back
+        // remover poisons again. With only that backoff, an abort-heavy workload on an indexed property
+        // — SSI aborts under contention are ordinary in this engine — would pay a full O(store) rebuild
+        // of EVERY index on EVERY command. That is a worse regression than the defect, which at least
+        // left queries running. So a poison-ONLY repair carries its own backoff, armed on SUCCESS and
+        // decayed whenever the engine is found healthy. Throttling is always safe here: while the
+        // repair waits, the marker stays poisoned and reads stay on the exact scan — correct, and
+        // exactly the pre-fix behaviour, so a throttled repair is never worse than not having one.
+        let (degraded, poisoned) = {
+            let idx = self.index.borrow();
+            (idx.is_degraded(), idx.ft_spatial_poisoned())
+        };
+        if !degraded && !poisoned {
+            // Nothing to repair. Decay the poison backoff so a burst of aborts throttles the repair but
+            // a subsequent quiet period restores an immediate response to the next isolated poisoning.
+            self.ft_poison_repair_backoff = (self.ft_poison_repair_backoff / 2).max(1);
             return true;
+        }
+        // A poison-only repair waits its own turn. A DEGRADED set deliberately does not: that is a
+        // storage fault that cost the engine its indexes, and its cadence stays exactly as `rmp` #733
+        // set it.
+        if !degraded && self.ft_poison_repair_skip > 0 {
+            self.ft_poison_repair_skip -= 1;
+            return false;
         }
         if self.degraded_retry_skip > 0 {
             self.degraded_retry_skip -= 1;
             return false;
         }
+        if !degraded {
+            self.ft_poison_repairs += 1;
+        }
         Self::rebuild_index(&self.store, &self.index);
-        if self.index.borrow().is_degraded() {
+        // Repaired only if BOTH conditions cleared. `rebuild_index` ends in `reset_ft_spatial_marker`,
+        // which clears the poison — but it bails to `fail_closed` (which re-poisons) on a read fault, so
+        // the two conditions genuinely have to be tested together.
+        if self.index.borrow().is_degraded() || self.index.borrow().ft_spatial_poisoned() {
             // Still faulting: back off so a permanently-broken store cannot make the engine thread burn
             // a whole store scan every tick (correctness is unaffected either way — reads are on scans).
             self.degraded_retry_backoff = self
@@ -7938,6 +8052,16 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             // stays throttled.
             self.degraded_retry_backoff = (self.degraded_retry_backoff / 2).max(1);
             self.degraded_retry_skip = 0;
+            if !degraded {
+                // A poison-only repair succeeded: arm and GROW its own backoff, so a workload that
+                // keeps re-poisoning cannot buy a whole-store rebuild per command. An isolated
+                // poisoning pays one skip and the decay above erases it within a few healthy commands.
+                self.ft_poison_repair_skip = self.ft_poison_repair_backoff;
+                self.ft_poison_repair_backoff = self
+                    .ft_poison_repair_backoff
+                    .saturating_mul(2)
+                    .min(MAX_DEGRADED_RETRY_BACKOFF);
+            }
             true
         }
     }
@@ -8089,6 +8213,16 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 );
             }
         }
+
+        // `rmp` #803: the re-fill above drove `insert_vector_value` / `insert_vector_rel_value`, which
+        // raise the shared transient dirty flag. Discard it on EVERY exit from here (this driver had no
+        // disposal at all, so it leaked on its success path too, not merely on a bail): the re-fill
+        // reflects committed state, so it must never be attributed to the next write statement's
+        // transaction. `clear_ft_spatial_dirty` rather than `bump_ft_spatial_marker_after_build`
+        // deliberately — this re-fill re-keys only the VECTOR graph, and vector does not consult the
+        // full-text/spatial watermark, so raising that watermark would needlessly send unrelated TEXT /
+        // FULLTEXT / SPATIAL readers to the exact scan.
+        self.index.borrow_mut().clear_ft_spatial_dirty();
 
         // Did every attempted index come back clean?
         let repaired = ready_nodes
@@ -8247,7 +8381,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // without this the engine would stay scan-only for as long as it was busy. The attempt itself is
         // exponentially backed off inside `retry_degraded_index_rebuild`, so a permanently-faulting store
         // costs at most one bounded probe per backoff window.
-        if self.index.borrow().is_degraded() {
+        // `rmp` #803: a poisoned marker is repairable work too, and its repair lives behind the same
+        // driver — so this gate must admit it or the whole widening above is unreachable from here.
+        let needs_repair = {
+            let idx = self.index.borrow();
+            idx.is_degraded() || idx.ft_spatial_poisoned()
+        };
+        if needs_repair {
             let _healed = self.retry_degraded_index_rebuild();
         }
         // Re-drive any full-text build paused by an in-flight writer whose conflict has since resolved
@@ -8545,6 +8685,9 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             } else if let Some(build) = self.pending_fulltext_builds.front_mut() {
                 build.cursor = start;
             }
+            // `rmp` #803: this rewind is AFTER the chunk loop, which raised the transient dirty flag.
+            // Discard it rather than let the next unrelated write statement be charged with it.
+            self.index.borrow_mut().clear_ft_spatial_dirty();
             return;
         }
         if end > start
@@ -8736,6 +8879,9 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             } else if let Some(build) = self.pending_spatial_builds.front_mut() {
                 build.cursor = start;
             }
+            // `rmp` #803: this rewind is AFTER the chunk loop, which raised the transient dirty flag.
+            // Discard it rather than let the next unrelated write statement be charged with it.
+            self.index.borrow_mut().clear_ft_spatial_dirty();
             return;
         }
         if end > start
@@ -11346,5 +11492,189 @@ mod index_wipe_tests {
                 "poison_backoff({attempts}) must saturate at the cap, not overflow or wrap"
             );
         }
+    }
+}
+
+/// `rmp` task #803 — the STRUCTURAL half of the dirty-flag fix, pinned on its own.
+///
+/// The end-to-end test in `graphus-cypher/tests/text_index.rs` proves the defect is gone, but it
+/// cannot pin THIS layer: the fix has two redundant layers by design (each leaking build driver now
+/// clears at source, AND the statement seam clears before it does any work), so the end-to-end test
+/// passes with either one present. Mutation-proven: reverting only the seam scoping leaves it green.
+///
+/// This test removes that redundancy. It plants residue directly — the exact state a leaking build
+/// leaves behind, including the `removed` bit that makes an abort POISON rather than merely
+/// mis-attribute — and asserts a statement that touched no indexed property cannot inherit it. It is
+/// therefore the guard for every FUTURE build driver that forgets to clear, which is the whole reason
+/// the seam-level fix exists rather than trusting six one-line fixes to stay correct.
+#[cfg(test)]
+mod ft_spatial_statement_scope_803 {
+    use graphus_io::MemBlockDevice;
+    use graphus_storage::RecordStore;
+    use graphus_wal::{MemLogSink, WalManager};
+
+    use crate::binding::{Parameters, bind_parameters};
+    use crate::catalog::IndexCatalog;
+    use crate::coordinator::TxnCoordinator;
+    use crate::executor::execute;
+    use crate::lexer::tokenize;
+    use crate::lower::lower;
+    use crate::parser::parse_tokens;
+    use crate::physical::{PhysicalPlan, plan_physical};
+    use crate::semantics::analyze;
+
+    type Coord = TxnCoordinator<MemBlockDevice, MemLogSink>;
+
+    fn fresh_coord() -> Coord {
+        let device = MemBlockDevice::new(0);
+        let wal = WalManager::create(MemLogSink::new()).expect("create wal");
+        let store: RecordStore<MemBlockDevice, MemLogSink> =
+            RecordStore::create(device, wal, 256, 1).expect("create store");
+        TxnCoordinator::new(store)
+    }
+
+    fn compile(src: &str) -> PhysicalPlan {
+        let toks = tokenize(src).expect("lex");
+        let ast = parse_tokens(&toks, src).expect("parse");
+        let validated = analyze(&ast).expect("analyze");
+        plan_physical(&lower(&validated), &IndexCatalog::empty())
+    }
+
+    fn run_stmt(coord: &Coord, txn: graphus_core::TxnId, src: &str) {
+        let plan = compile(src);
+        let bound = bind_parameters(&plan, &Parameters::new()).expect("bind");
+        let mut graph = coord.statement(txn).expect("statement");
+        {
+            let mut cursor = execute(&plan, &bound, &mut graph).expect("open cursor");
+            cursor.collect_all().expect("collect");
+        }
+        assert!(graph.take_error().is_none(), "captured error in: {src}");
+    }
+
+    /// Poisons the marker the supported way: a transaction REPLACES an indexed value, then aborts.
+    fn poison(coord: &mut Coord) {
+        let w = coord.begin_serializable();
+        run_stmt(
+            coord,
+            w,
+            "MATCH (n:Product {id: 1}) SET n.name = 'Renamed Widget'",
+        );
+        coord.rollback(w).expect("the replacing writer aborts");
+        assert!(
+            coord.ft_spatial_poisoned(),
+            "precondition: a rolled-back replace of an indexed value must poison the marker"
+        );
+    }
+
+    /// One drain — exactly what the engine runs after a command. `advance_index_builds` returns whether
+    /// builds remain pending, and none are here, so this is a single call.
+    fn drain(coord: &mut Coord) {
+        while coord.advance_index_builds(usize::MAX) {}
+    }
+
+    /// `rmp` #803 — THE REPAIR MUST BE THROTTLED, and must still be LIVE.
+    ///
+    /// The repair is a full O(store) rebuild of every index in the database. It always SUCCEEDS, so the
+    /// pre-existing `degraded_retry_backoff` — which arms only when a repair fails — never engages for
+    /// it. Without a throttle of its own, a workload that keeps poisoning (an abort-heavy one on an
+    /// indexed property; SSI aborts under contention are ordinary here) would buy a whole-store rebuild
+    /// on EVERY command: a worse regression than the defect being fixed, which at least left queries
+    /// running.
+    ///
+    /// Throttling is safe because the fallback is correct: while the repair waits, reads stay on the
+    /// exact scan, which is exactly the pre-fix behaviour. So this test pins BOTH halves — that a
+    /// repeat poisoning is throttled, and that it is nonetheless repaired soon after.
+    #[test]
+    fn a_repeatedly_poisoning_workload_does_not_rebuild_on_every_command() {
+        let mut coord = fresh_coord();
+        let seed = coord.begin_serializable();
+        run_stmt(&coord, seed, "CREATE (:Product {id: 1, name: 'Widget 1'})");
+        coord.commit(seed).expect("seed commits");
+        coord
+            .create_text_index("tx_name", "Product", "name", false)
+            .expect("create text index");
+
+        // The FIRST poisoning after a quiet period is repaired immediately — the responsiveness half.
+        poison(&mut coord);
+        drain(&mut coord);
+        assert!(
+            !coord.ft_spatial_poisoned(),
+            "the first poisoning must be repaired by the very next command"
+        );
+
+        // The SECOND, back-to-back, must NOT buy another whole-store rebuild on the next command.
+        poison(&mut coord);
+        drain(&mut coord);
+        assert!(
+            coord.ft_spatial_poisoned(),
+            "rmp #803: a back-to-back re-poisoning must be THROTTLED, not repaired again immediately \
+             — otherwise an abort-heavy workload on an indexed property pays a full O(store) rebuild \
+             of every index on every command"
+        );
+
+        // LIVENESS: it must still be repaired shortly after. A throttle that never fires again is just
+        // the original defect wearing a different name.
+        let mut drains = 0;
+        while coord.ft_spatial_poisoned() && drains < 64 {
+            drain(&mut coord);
+            drains += 1;
+        }
+        assert!(
+            !coord.ft_spatial_poisoned(),
+            "the throttled repair must still fire: still poisoned after {drains} further commands"
+        );
+
+        // THE QUANTITATIVE PIN. The repair is a full O(store) rebuild of every index, so its RATE must
+        // track the FAULT, never the traffic. Drive a workload that re-poisons on EVERY command — the
+        // worst case — and require the rebuild count to stay a small fraction of it.
+        const ROUNDS: u64 = 300;
+        let before = coord.ft_poison_repairs();
+        for _ in 0..ROUNDS {
+            poison(&mut coord);
+            drain(&mut coord);
+        }
+        let repairs = coord.ft_poison_repairs() - before;
+        assert!(
+            repairs * 4 < ROUNDS,
+            "rmp #803: {repairs} full-store rebuilds over {ROUNDS} re-poisoning commands. The repair \
+             rate must be proportionate to the FAULT, not to the traffic — one rebuild per command \
+             drags the whole store through the buffer pool on every write and is a worse regression \
+             than the degradation it repairs"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_aborting_statement_cannot_inherit_leaked_dirty_flags() {
+        let mut coord = fresh_coord();
+        let seed = coord.begin_serializable();
+        run_stmt(&coord, seed, "CREATE (:Product {id: 1, name: 'Widget 1'})");
+        coord.commit(seed).expect("seed commits");
+        coord
+            .create_text_index("tx_name", "Product", "name", false)
+            .expect("create text index");
+        assert!(
+            !coord.ft_spatial_poisoned(),
+            "precondition: a fresh engine with a freshly built index is not poisoned"
+        );
+
+        // PLANT THE RESIDUE, exactly as a build that bailed after mutating would leave it: both the
+        // dirty bit and the `removed` companion. `mark_ft_spatial_mutated_inflight` is the public
+        // method that produces precisely that pair, so this is the real state, not an approximation of
+        // it. (Six drivers could reach it; the `removed` half needs a read fault, which is why this
+        // test plants it rather than staging a fault-injection scenario to produce one bit.)
+        coord.index.borrow_mut().mark_ft_spatial_mutated_inflight();
+
+        // A transaction that touches a label with NO index of any kind — and then aborts.
+        let unrelated = coord.begin_serializable();
+        run_stmt(&coord, unrelated, "CREATE (:Unrelated {x: 1})");
+        coord.rollback(unrelated).expect("the unrelated txn aborts");
+
+        assert!(
+            !coord.ft_spatial_poisoned(),
+            "rmp #803: a transaction that touched NO indexed property inherited a build's leaked \
+             dirty flags, was recorded as a full-text/spatial REMOVER, and its abort then poisoned the \
+             DB-wide freshness marker — permanently degrading every TEXT, FULLTEXT and SPATIAL index \
+             in the database. The statement seam must discard residue before doing any work."
+        );
     }
 }

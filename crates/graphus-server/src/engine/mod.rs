@@ -833,13 +833,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // How many index fail-closed events (`rmp` task #733) this engine has already logged + metered, so
     // each new one is reported exactly once. Seeded from the coordinator so a freshly-opened engine whose
     // open-time rebuild already failed closed reports it on its first tick.
-    let mut index_fail_closed_seen = coordinator.index_fail_closed_events();
-    // Likewise for poisoned builds (`rmp` task #733, M1): each new one is logged + metered exactly once.
-    let mut index_poison_seen = coordinator.index_build_poison_events();
-    // Likewise for VECTOR build conflicts (`rmp` task #780): each index that enters the blocked
-    // exact-scan state is logged + metered exactly once, and its return to the fast path is logged too.
-    let mut vector_conflict_seen = coordinator.vector_index_conflict_events();
-    let mut vector_blocked_seen = coordinator.blocked_vector_indexes();
+    let mut index_health_seen = IndexHealthSeen::seed(&coordinator);
     // The extension registry (user-defined functions/procedures, `rmp` task #75). Built **once** on
     // the engine thread, then `Arc`-shared so an off-thread reader resolves UDF/UDP plans against the
     // SAME registry that backed compilation (`rmp` task #336 — `ExtensionRegistry` is `Send + Sync`,
@@ -1050,6 +1044,15 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             .expect("INVARIANT: coordinator is Some until Shutdown breaks the loop")
             .blocked_vector_indexes()
             > 0;
+        // A poisoned full-text/spatial marker (`rmp` task #803) is pending work for the same reason:
+        // every TEXT / FULLTEXT / SPATIAL seek is on the exact scan until a rebuild clears it, and that
+        // rebuild only runs when the engine ticks. Without this, an engine that went idle right after
+        // the poison would park on a plain `recv` and stay degraded until the next command — which is
+        // exactly how this defect reached example scale.
+        let ft_spatial_poisoned = coordinator
+            .as_ref()
+            .expect("INVARIANT: coordinator is Some until Shutdown breaks the loop")
+            .ft_spatial_poisoned();
         // Publish the index-build gauges (`rmp` task #573). Here, because this point is reached on EVERY
         // iteration — after each command (so a `CREATE INDEX`'s new build shows up at once) and after each
         // build tick (so progress falls and completion returns the gauges to zero) — and because it is the
@@ -1066,6 +1069,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         let timed = building
             || indexes_degraded
             || vector_blocked
+            || ft_spatial_poisoned
             || readers_inflight > 0
             || !parked.is_empty();
 
@@ -1083,10 +1087,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                         &mut coordinator,
                         &metrics,
                         &db_name,
-                        &mut index_fail_closed_seen,
-                        &mut index_poison_seen,
-                        &mut vector_conflict_seen,
-                        &mut vector_blocked_seen,
+                        &mut index_health_seen,
                     ) {
                         plan_cache.bump_schema();
                     }
@@ -1842,14 +1843,50 @@ fn drive_index_build<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send +
 /// So each new event is logged at `ERROR` and metered, and the rebuild is retried. The retry is bounded
 /// and exponentially backed off inside the coordinator, so a persistently-faulting store cannot make the
 /// engine thread re-scan the whole store on every tick.
+/// The engine-loop-local edge detectors for [`maintain_degraded_indexes`].
+///
+/// Every index-health signal the engine reports is a *delta* against what it has already reported, so
+/// each needs a "last seen" companion. Bundled into one struct rather than passed as loose `&mut`
+/// arguments: the set grows every time a new degradation mode is made observable (`rmp` #733 → #780 →
+/// #803), and a nine-argument function is both a clippy failure and genuinely easy to mis-order at the
+/// call site, since several of them are `&mut u64`.
+#[derive(Debug)]
+struct IndexHealthSeen {
+    /// Fail-closed events already reported (`rmp` #733).
+    fail_closed: u64,
+    /// Poisoned index builds already reported (`rmp` #733, M1).
+    poisoned_builds: u64,
+    /// VECTOR build-conflict entries already reported (`rmp` #780).
+    vector_conflicts: u64,
+    /// How many VECTOR indexes were blocked at the previous tick, for the recovery edge (`rmp` #780).
+    vector_blocked: usize,
+    /// Full-text/spatial marker poisonings already reported (`rmp` #803).
+    ft_poison: u64,
+    /// Whether the marker was poisoned at the previous tick, for the recovery edge (`rmp` #803).
+    ft_poisoned: bool,
+}
+
+impl IndexHealthSeen {
+    /// Seeds every detector from the coordinator's CURRENT state, so a freshly-opened engine whose
+    /// open-time rebuild already failed closed (or already poisoned the marker) reports it on its first
+    /// tick rather than treating the pre-existing condition as old news.
+    fn seed<D: BlockDevice, S: LogSink>(coordinator: &TxnCoordinator<D, S>) -> Self {
+        Self {
+            fail_closed: coordinator.index_fail_closed_events(),
+            poisoned_builds: coordinator.index_build_poison_events(),
+            vector_conflicts: coordinator.vector_index_conflict_events(),
+            vector_blocked: coordinator.blocked_vector_indexes(),
+            ft_poison: coordinator.ft_spatial_poison_events(),
+            ft_poisoned: coordinator.ft_spatial_poisoned(),
+        }
+    }
+}
+
 fn maintain_degraded_indexes<D: BlockDevice, S: LogSink>(
     coordinator: &mut Option<TxnCoordinator<D, S>>,
     metrics: &Arc<Metrics>,
     db_name: &str,
-    seen: &mut u64,
-    poison_seen: &mut u64,
-    vector_conflict_seen: &mut u64,
-    vector_blocked_seen: &mut usize,
+    seen: &mut IndexHealthSeen,
 ) -> bool {
     let Some(coord) = coordinator.as_mut() else {
         return false;
@@ -1861,9 +1898,9 @@ fn maintain_degraded_indexes<D: BlockDevice, S: LogSink>(
     // reveal it. Same reasoning as the fail-closed report below (`rmp` #733): a silent degradation is
     // indistinguishable from a healthy-but-slow engine.
     let conflicts = coord.vector_index_conflict_events();
-    if conflicts > *vector_conflict_seen {
-        let new = conflicts - *vector_conflict_seen;
-        *vector_conflict_seen = conflicts;
+    if conflicts > seen.vector_conflicts {
+        let new = conflicts - seen.vector_conflicts;
+        seen.vector_conflicts = conflicts;
         metrics.record_vector_index_conflicts(new);
         tracing::warn!(
             database = %db_name,
@@ -1879,7 +1916,7 @@ fn maintain_degraded_indexes<D: BlockDevice, S: LogSink>(
     }
     // And the recovery edge, so the WARN above is never left dangling with no resolution.
     let blocked = coord.blocked_vector_indexes();
-    if blocked < *vector_blocked_seen {
+    if blocked < seen.vector_blocked {
         tracing::info!(
             database = %db_name,
             blocked,
@@ -1887,14 +1924,46 @@ fn maintain_degraded_indexes<D: BlockDevice, S: LogSink>(
              (rmp #780)"
         );
     }
-    *vector_blocked_seen = blocked;
+    seen.vector_blocked = blocked;
+    // Report a newly POISONED full-text/spatial marker (`rmp` task #803). While poisoned, every node
+    // and relationship TEXT / FULLTEXT / SPATIAL seek in this database declines to the exact scan —
+    // including the off-thread reader pool, so `executeRead` is not a workaround — while SHOW INDEXES
+    // still reports ONLINE. Answers stay CORRECT; the index costs strictly more than not having one.
+    // This went unnoticed to production-example scale (411 consecutive declines) precisely because
+    // nothing reported it.
+    let marker_poisons = coord.ft_spatial_poison_events();
+    if marker_poisons > seen.ft_poison {
+        let new = marker_poisons - seen.ft_poison;
+        seen.ft_poison = marker_poisons;
+        metrics.record_ft_spatial_poison(new);
+        tracing::warn!(
+            database = %db_name,
+            events = new,
+            total = marker_poisons,
+            "the cross-snapshot full-text/spatial freshness marker was POISONED: a transaction that \
+             removed or replaced an indexed posting rolled back, so the in-memory index may be missing \
+             a committed entry. Every TEXT, FULLTEXT and SPATIAL seek now falls back to an exact full \
+             scan (answers stay CORRECT but slower than having no index), while SHOW INDEXES still \
+             reports ONLINE. The engine will rebuild the derived indexes to clear it (rmp #803)."
+        );
+    }
+    // And the recovery edge, so the WARN above always resolves.
+    let poisoned_now = coord.ft_spatial_poisoned();
+    if seen.ft_poisoned && !poisoned_now {
+        tracing::info!(
+            database = %db_name,
+            "the full-text/spatial freshness marker was cleared by a rebuild: TEXT, FULLTEXT and \
+             SPATIAL seeks are back on the index fast path (rmp #803)"
+        );
+    }
+    seen.ft_poisoned = poisoned_now;
     // Report any build POISONED since the last tick (`rmp` task #733, M1): a build a storage fault stopped
     // for good. Its index stays `Populating` — queries remain correct, on the exact scan — but it is not
     // being built, and that must not pass silently.
     let poisons = coord.index_build_poison_events();
-    if poisons > *poison_seen {
-        let new = poisons - *poison_seen;
-        *poison_seen = poisons;
+    if poisons > seen.poisoned_builds {
+        let new = poisons - seen.poisoned_builds;
+        seen.poisoned_builds = poisons;
         metrics.record_index_builds_poisoned(new);
         tracing::error!(
             database = %db_name,
@@ -1918,9 +1987,9 @@ fn maintain_degraded_indexes<D: BlockDevice, S: LogSink>(
     // Report any fail-closed that happened since the last tick (an index rebuild — hence a fail-closed —
     // can be triggered by a DDL command, not just by this tick).
     let events = coord.index_fail_closed_events();
-    if events > *seen {
-        let new = events - *seen;
-        *seen = events;
+    if events > seen.fail_closed {
+        let new = events - seen.fail_closed;
+        seen.fail_closed = events;
         metrics.record_index_fail_closed(new);
         tracing::error!(
             database = %db_name,
@@ -1932,7 +2001,10 @@ fn maintain_degraded_indexes<D: BlockDevice, S: LogSink>(
              investigate the storage device."
         );
     }
-    if !coord.indexes_degraded() {
+    // `rmp` #803: a poisoned marker is repairable through the SAME driver, so this gate must admit it
+    // — otherwise the widened trigger is unreachable from the threaded engine and only the inline one
+    // repairs, which is the exact divergence `rmp` #780 found.
+    if !coord.indexes_degraded() && !coord.ft_spatial_poisoned() {
         return false;
     }
     if coord.retry_degraded_index_rebuild() {

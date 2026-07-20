@@ -373,6 +373,53 @@ fn plan(src: &str, catalog: &IndexCatalog) -> PhysicalPlan {
     plan_physical(&logical, catalog)
 }
 
+/// Executes a `PROFILE`d query against the real engine and returns the summed MEASURED `dbHits` of
+/// every operator (`rmp` #803).
+///
+/// This is the only honest way to assert an index is USED. A rendered plan cannot do it: a seek that
+/// declines to a full scan at run time — which every TEXT / FULLTEXT / SPATIAL seek does whenever the
+/// cross-snapshot freshness marker is poisoned — still renders as `NodeTextIndexSeek`. The plan is
+/// byte-identical in the healthy and the degraded engine; only the work differs.
+fn profile_db_hits(eng: &mut Eng, query: &str) -> i64 {
+    fn walk(node: &Value) -> i64 {
+        let mine = match node {
+            Value::Map(entries) => entries
+                .iter()
+                .find(|(k, _)| k == "dbHits")
+                .and_then(|(_, v)| match v {
+                    Value::Integer(n) => Some(*n),
+                    _ => None,
+                })
+                .unwrap_or(0),
+            _ => 0,
+        };
+        let kids = match node {
+            Value::Map(entries) => entries
+                .iter()
+                .find(|(k, _)| k == "children")
+                .map(|(_, v)| match v {
+                    Value::List(cs) => cs.iter().map(walk).sum(),
+                    _ => 0,
+                })
+                .unwrap_or(0),
+            _ => 0,
+        };
+        mine + kids
+    }
+    let ticket = eng.begin(AccessMode::Read).expect("begin read txn");
+    let mut reply = eng
+        .run(ticket, query, Vec::new(), false, None)
+        .expect("profiled query runs");
+    while let Ok(Some(_)) = reply.rows.next() {}
+    let summary = reply.summary.get();
+    eng.commit(ticket).expect("read commits");
+    let plan = summary
+        .plan
+        .unwrap_or_else(|| panic!("a PROFILEd statement must report a plan: {query}"));
+    assert!(plan.profiled, "PROFILE must report MEASURED counters");
+    walk(&plan.description)
+}
+
 /// Runs an auto-commit write that MUST be rejected by a constraint, returning the violation message.
 fn expect_rejected(eng: &mut Eng, stmt: &str) -> String {
     let ticket = eng
@@ -704,18 +751,55 @@ fn index_query_paths_return_correct_results_and_are_utilised_impl() {
         "TEXT CONTAINS '{substr}' must return exactly the generator's matching post set"
     );
 
-    // The TEXT index is utilised by the real planner (a `NodeTextIndexSeek`, not a scan + filter).
-    let text_catalog = IndexCatalog::builder()
-        .with_label_text("Post", "content")
-        .build();
-    let text_plan = plan(
-        "MATCH (p:Post) WHERE p.content CONTAINS 'content-1' RETURN p.id",
-        &text_catalog,
+    // The TEXT index is actually USED — proven by MEASURED dbHits, not by a plan string (`rmp` #803).
+    //
+    // What stood here asserted `NodeTextIndexSeek` appeared in a plan rendered from a SYNTHETIC
+    // `IndexCatalog::builder()` catalog, and never executed it. That could not fail: the catalog was
+    // hand-built rather than read from the engine, so it asserted the planner's reaction to a catalog
+    // the test itself wrote, and the surrounding result assertion is vacuous by construction because
+    // the scan fallback returns identical rows. It was blind to exactly the defect that shipped —
+    // `rmp` #803, where a poisoned freshness marker still PLANS `NodeTextIndexSeek` and then declines
+    // to a full scan at RUN time, so the rendered plan is byte-identical while the work explodes.
+    //
+    // The replacement executes the query against the real engine and compares the work the seek did
+    // with the work the same query costs with no index. Only dbHits separates those two.
+    // A SELECTIVE needle, derived from the dataset rather than assumed: `substr` above deliberately
+    // matches many posts (it exercises a set search), which makes it useless for measuring
+    // selectivity. `post-content-31` is the last generated post, so `content-31` is a substring of
+    // exactly one.
+    let selective = "content-31";
+    let selective_matches = all_posts
+        .iter()
+        .filter(|(_, content, _)| content.contains(selective))
+        .count();
+    assert_eq!(
+        selective_matches, 1,
+        "the selectivity probe needs a needle matching exactly ONE post; '{selective}' matched \
+         {selective_matches}"
     );
-    let text_render = text_plan.to_string();
+    let profiled = profile_db_hits(
+        &mut eng,
+        &format!("PROFILE MATCH (p:Post) WHERE p.content CONTAINS '{selective}' RETURN p.id AS id"),
+    );
+    // The full-scan control, over the SAME node population: an UNINDEXED string property with a needle
+    // that matches nothing, so the engine must examine every `:Post` and return no rows. This is the
+    // cost the seek must beat, and it is the cost a declined seek regresses to.
+    let scan_baseline = profile_db_hits(
+        &mut eng,
+        "PROFILE MATCH (p:Post) WHERE p.language CONTAINS 'zzz-no-such-language' RETURN p.id AS id",
+    );
     assert!(
-        text_render.contains("NodeTextIndexSeek"),
-        "a CONTAINS predicate must lower to a NodeTextIndexSeek:\n{text_render}"
+        scan_baseline >= all_posts.len() as i64,
+        "the control must really scan every post ({scan_baseline} dbHits over {} posts), else the \
+         comparison below is vacuous",
+        all_posts.len()
+    );
+    assert!(
+        profiled * 4 < scan_baseline,
+        "the TEXT index must make the CONTAINS seek SELECTIVE: it measured {profiled} dbHits against \
+         {scan_baseline} for a full scan of the same nodes. A ratio this close means the seek declined \
+         to a full scan at run time — which the rendered plan cannot show, because a declined seek \
+         still renders as NodeTextIndexSeek (rmp #803)."
     );
 
     // ---- FULLTEXT queryNodes: the shared `content` token returns the whole post population. ----

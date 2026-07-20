@@ -1719,6 +1719,24 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
 
         // --- (re)insert the node's current entries into the index (index borrow only) ---
         let mut index = index.borrow_mut();
+        // `rmp` task #803 — SCOPE THE DIRTY FLAGS TO THIS STATEMENT.
+        //
+        // `ft_spatial_dirty` / `ft_spatial_removed_dirty` are GLOBAL on the `IndexSet`, and
+        // `note_ft_spatial_mutator(self.txn)` at the end of this function converts whatever they hold
+        // into "THIS transaction mutated a full-text/spatial posting". A build that raised them and then
+        // bailed early (six such drivers existed, `rmp` #803) leaves residue that this statement would
+        // then be charged with — and if this transaction aborts, `rollback_ft_spatial_marker` poisons
+        // the marker permanently, silently degrading every TEXT / FULLTEXT / SPATIAL index DB-wide, for
+        // a transaction that never touched an indexed property.
+        //
+        // Discarding is the semantically correct disposal, not merely the safe one: build residue
+        // reflects COMMITTED state, which is exactly what `clear_ft_spatial_dirty` /
+        // `bump_ft_spatial_marker_after_build` do with it on the paths that remember to.
+        //
+        // This makes the invariant structural rather than a discipline every future build must
+        // remember: a statement can only ever be charged with dirt IT raised. The leaking drivers are
+        // fixed at source too, but that fix is now defence in depth rather than the only guard.
+        index.clear_ft_spatial_dirty();
         for &lt in &label_tokens {
             index.insert_label(lt, node.0);
         }
@@ -1964,6 +1982,10 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             })
             .collect();
         let mut index = index.borrow_mut();
+        // `rmp` task #803 — scope the dirty flags to this statement; see `reindex_node` for the full
+        // rationale. Unconditional here even though the raises below are guarded, because the point is
+        // to DISCARD another path's residue before this transaction can be charged with it.
+        index.clear_ft_spatial_dirty();
         if has_rel_prop {
             for (prop_key, value) in &resolved {
                 if index.has_rel_property(type_token, *prop_key) {
@@ -2057,13 +2079,18 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 }
             }
         }
-        if has_rel_ft || has_rel_spatial || has_rel_vector {
-            // Record THIS transaction as a full-text/spatial mutator if a posting changed (`rmp` #467,
-            // shared marker) — exactly as `reindex_node` does — so a concurrent stale reader of this
-            // relationship full-text / spatial / vector index declines to the correct scan path until the
-            // txn retires.
-            let _ = index.note_ft_spatial_mutator(self.txn);
-        }
+        // Record THIS transaction as a full-text/spatial mutator if a posting changed (`rmp` #467,
+        // shared marker) — exactly as `reindex_node` does — so a concurrent stale reader of this
+        // relationship full-text / spatial / vector index declines to the correct scan path until the
+        // txn retires.
+        //
+        // UNCONDITIONAL since `rmp` #803. It used to be guarded by
+        // `has_rel_ft || has_rel_spatial || has_rel_vector`, which is exactly the disjunction that gates
+        // every raise above — so the guard never suppressed a real attribution. What it DID suppress was
+        // the drain: with only relationship-property / composite indexes declared, this seam left any
+        // residue standing for the next statement to inherit. Calling it unconditionally is free (a
+        // no-op returning `false` when nothing is dirty) and removes a second-order leak path.
+        let _ = index.note_ft_spatial_mutator(self.txn);
     }
 
     /// Maintains **only** the bitmap (low-cardinality) indexes (`rmp` task #328) for `node` from its

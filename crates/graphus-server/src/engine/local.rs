@@ -729,6 +729,85 @@ mod tests {
         );
     }
 
+    /// `rmp` #803: the poisoned-marker repair must be reachable from the INLINE driver too.
+    ///
+    /// This is the `rmp` #780 lesson applied before the fact rather than after it. There, a repair
+    /// sited inside `advance_index_builds` was reachable from the threaded engine and unreachable here,
+    /// so the simulator every DST / VOPR scenario runs diverged silently from production. The #803
+    /// repair rides `retry_degraded_index_rebuild`, which `drain_index_builds` already calls
+    /// unconditionally after its drain — so it SHOULD be reachable. "Should" is not evidence; this is.
+    ///
+    /// FAILS with the widened trigger reverted to `is_degraded()` (verified).
+    #[test]
+    fn the_inline_driver_repairs_a_poisoned_ft_spatial_marker() {
+        let mut eng = engine(sim_clock(0));
+        let tx = eng.begin_auto_commit(AccessMode::Write).expect("begin");
+        let mut reply = eng
+            .run(
+                tx,
+                "CREATE (:Product {id: 1, name: 'Widget 1'}), (:Product {id: 2, name: 'Widget 2'})",
+                vec![],
+                true,
+                None,
+            )
+            .expect("seed");
+        let _ = drain(&mut reply);
+        eng.index_ddl(IndexCommand::CreateTextIndex {
+            name: "tx_name".to_owned(),
+            label: "Product".to_owned(),
+            property: "name".to_owned(),
+            if_not_exists: false,
+        })
+        .expect("create text index");
+
+        // Poison it the supported way: an explicit transaction REPLACES an indexed value, then aborts.
+        let w = eng.begin(AccessMode::Write).expect("begin explicit");
+        let mut reply = eng
+            .run(
+                w,
+                "MATCH (n:Product {id: 1}) SET n.name = 'Renamed Widget'",
+                vec![],
+                false,
+                None,
+            )
+            .expect("replace");
+        let _ = drain(&mut reply);
+        eng.rollback(w).expect("the replacing writer aborts");
+
+        // NON-VACUITY, via the monotonic event counter rather than the live flag. The live flag cannot
+        // witness this: `drain_index_builds` runs after EVERY command including the rollback itself, so
+        // on a fixed engine the poison is raised and cleared inside that one command and is never
+        // observable from outside. The counter records the clean→poisoned EDGE, so it proves the poison
+        // genuinely happened no matter how fast the repair was — which is precisely why the observability
+        // this task adds is an edge counter and not just a flag.
+        let events = eng
+            .coordinator
+            .as_ref()
+            .expect("coordinator")
+            .ft_spatial_poison_events();
+        assert!(
+            events > 0,
+            "vacuous: the rolled-back replace never poisoned the marker, so there is nothing to repair",
+        );
+
+        // One more ordinary command, so the assertion below cannot depend on repair-within-rollback.
+        let tx = eng.begin_auto_commit(AccessMode::Write).expect("begin");
+        let mut reply = eng
+            .run(tx, "CREATE (:Other {i: 1})", vec![], true, None)
+            .expect("ordinary command");
+        let _ = drain(&mut reply);
+
+        assert!(
+            !eng.coordinator
+                .as_ref()
+                .expect("coordinator")
+                .ft_spatial_poisoned(),
+            "rmp #803: the inline driver must reach the poisoned-marker repair. Still poisoned means \
+             every TEXT / FULLTEXT / SPATIAL seek in this driver full-scans forever, while the threaded \
+             engine repairs — the exact simulator/production divergence rmp #780 found",
+        );
+    }
+
     /// A `Clock` whose ticks the test controls; wrapping a `SimClock` in an `Arc` lets the engine
     /// read it while the test holds the same value (the engine only reads `now_nanos`).
     fn sim_clock(start: u64) -> Arc<dyn Clock + Send + Sync> {

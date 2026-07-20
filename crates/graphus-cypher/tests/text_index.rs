@@ -742,3 +742,190 @@ fn rmp756_constraint_rejected_insert_keeps_the_text_seek_selective() {
         "the rejected 'Counterfeit Widget' is not a committed match"
     );
 }
+
+// =================================================================================================
+// `rmp` #803 — the poison LATCH, and the GLOBAL dirty-flag leak that arms it from nowhere.
+//
+// #756 (above) narrowed WHEN the marker is poisoned. It left two things unfixed, and this campaign
+// measured both in a live example run: 411 consecutive TEXT declines, every one reading
+// `poisoned=true inflight=0 trustworthy_from=Timestamp(19)` — the watermark satisfied and the
+// in-flight set empty, so the LATCH alone was declining every seek.
+//
+// Both tests below measure dbHits, never a plan string. That distinction is load-bearing here: a
+// poisoned marker still PLANS `NodeTextIndexSeek` and only declines at run time, so the rendered plan
+// is byte-identical in the healthy and the broken engine. Only the measured work separates them.
+// =================================================================================================
+
+/// DEFECT 1 — THE LATCH HAD NO REPAIR PATH.
+///
+/// `bump_ft_spatial_marker_after_build` (what `CREATE TEXT INDEX` ends with) only raises the
+/// watermark and explicitly does not clear a poison; the only clearing call, `reset_ft_spatial_marker`,
+/// lives inside `rebuild_index`, which the auto-retry driver reached only when `is_degraded()` — and a
+/// poisoned-but-not-degraded set is not degraded. So nothing in the process cleared it: measured, the
+/// poison survived `DROP INDEX` + `CREATE TEXT INDEX` and only a restart repaired it.
+///
+/// FAILS without the fix: the final seek still reads the whole store.
+#[test]
+fn rmp803_a_poisoned_marker_recovers_without_a_process_restart() {
+    let mut coord = fresh_coord();
+    seed_products(&mut coord);
+    declare_product_schema(&mut coord);
+
+    // Calibration on this exact store: what a full scan costs.
+    let (scan_rows, scan) = profile_query(&mut coord, PROFILE_CONTAINS_137, &IndexCatalog::empty());
+    let scan_hits = total_db_hits(&scan);
+    assert_eq!(scan_rows, 1, "exactly one product is named 'Widget 137'");
+
+    // The healthy baseline: a selective seek.
+    let catalog = coord.catalog();
+    let (_, seek) = profile_query(&mut coord, PROFILE_CONTAINS_137, &catalog);
+    let baseline_hits = total_db_hits(&seek);
+    assert!(
+        baseline_hits * 4 < scan_hits,
+        "baseline: the seek reads a fraction of the store (seek={baseline_hits} scan={scan_hits})"
+    );
+
+    // POISON IT, through the ordinary supported route: a transaction REPLACES an indexed value and
+    // then rolls back. The trigram index dropped the old posting eagerly at write time and rollback
+    // does not put it back, so the index really may be missing a committed entry — the poison is
+    // CORRECT here. What was wrong is that it was forever.
+    run_write_then_rollback(
+        &mut coord,
+        "MATCH (n:Product {id: 137}) SET n.name = 'Renamed Widget'",
+    );
+    assert!(
+        coord.ft_spatial_poisoned(),
+        "non-vacuous precondition: the rolled-back replace must have poisoned the marker, otherwise \
+         this test never exercises the repair"
+    );
+
+    // The degradation is real and MEASURED, not inferred from the flag: every seek now reads the
+    // whole store. This is the 801-vs-800 dbHits the example reported.
+    let (_, poisoned) = profile_query(&mut coord, PROFILE_CONTAINS_137, &catalog);
+    let poisoned_hits = total_db_hits(&poisoned);
+    assert!(
+        poisoned_hits >= scan_hits,
+        "while poisoned the 'seek' must cost at least a full scan (poisoned={poisoned_hits} \
+         scan={scan_hits}) — if it does not, the poison is not actually degrading anything and the \
+         recovery assertion below would be vacuous"
+    );
+
+    // THE FIX: the command path repairs it. No restart, no DDL, no reopen.
+    while coord.advance_index_builds(usize::MAX) {}
+
+    assert!(
+        !coord.ft_spatial_poisoned(),
+        "rmp #803: a rebuild must clear the poison; it was previously unreachable for repair and \
+         survived DROP INDEX + CREATE TEXT INDEX"
+    );
+    let (rows_after, after) = profile_query(&mut coord, PROFILE_CONTAINS_137, &catalog);
+    let after_hits = total_db_hits(&after);
+    assert_eq!(
+        rows_after, 1,
+        "the repaired seek must still return the one matching product"
+    );
+    assert!(
+        after_hits * 4 < scan_hits,
+        "rmp #803: after the repair the seek must be SELECTIVE again (after={after_hits} \
+         scan={scan_hits}); still scan-sized means the latch never cleared"
+    );
+}
+
+/// DEFECT 2 — THE GLOBAL DIRTY FLAGS LEAKED ACROSS TRANSACTIONS.
+///
+/// `ft_spatial_dirty` / `ft_spatial_removed_dirty` live on the `IndexSet`, not on a transaction. Six
+/// build drivers raised one and returned without clearing it (`retry_conflicted_vector_builds` leaked
+/// on EVERY path, including success). The next unrelated write statement's
+/// `note_ft_spatial_mutator(txn)` then charged the residue to ITS transaction — so a transaction that
+/// touched no indexed property at all became a registered full-text/spatial mutator, and every TEXT /
+/// FULLTEXT / SPATIAL seek in the database declined to a full scan for as long as it stayed open.
+///
+/// The residue here is produced by a REAL build, not simulated: the `rmp` #780 vector re-fill, driven
+/// through its ordinary success path with no fault injected.
+///
+/// FAILS without the fix: the seek taken while the unrelated transaction is open reads the whole store.
+#[test]
+fn rmp803_an_unrelated_transaction_cannot_inherit_a_builds_dirty_flag() {
+    let mut coord = fresh_coord();
+    seed_products(&mut coord);
+    declare_product_schema(&mut coord);
+    let catalog = coord.catalog();
+
+    let (_, scan) = profile_query(&mut coord, PROFILE_CONTAINS_137, &IndexCatalog::empty());
+    let scan_hits = total_db_hits(&scan);
+    let (_, seek) = profile_query(&mut coord, PROFILE_CONTAINS_137, &catalog);
+    let baseline_hits = total_db_hits(&seek);
+    assert!(
+        baseline_hits * 4 < scan_hits,
+        "baseline: the seek is selective (seek={baseline_hits} scan={scan_hits})"
+    );
+
+    // A VECTOR index on a DIFFERENT label, built while a writer holds the newest embedding — the
+    // `rmp` #780 conflict. Nothing here touches `:Product` or its TEXT index.
+    run_write(
+        &mut coord,
+        "CREATE (:Doc {name: 'x', embedding: [1.0, 0.0, 0.0]})",
+    );
+    run_write(
+        &mut coord,
+        "CREATE (:Doc {name: 'y', embedding: [0.0, 1.0, 0.0]})",
+    );
+    let writer = coord.begin_serializable();
+    {
+        let plan = compile_with(
+            "MATCH (n:Doc {name: 'x'}) SET n.embedding = [0.0, 0.0, 1.0]",
+            &IndexCatalog::empty(),
+        );
+        let bound = bind_parameters(&plan, &Parameters::new()).expect("bind");
+        let mut graph = coord.statement(writer).expect("statement");
+        let mut cursor = execute(&plan, &bound, &mut graph).expect("open cursor");
+        let _: Vec<Row> = cursor.collect_all().expect("collect");
+    }
+    coord
+        .begin_online_vector_index_named(
+            Some("doc_vec"),
+            graphus_storage::VectorEntity::Node,
+            "Doc",
+            "embedding",
+            3,
+            graphus_storage::VectorSimilarity::Cosine,
+            16,
+            200,
+            false,
+        )
+        .expect("create vector index");
+    coord.rollback(writer).expect("writer rolls back");
+    // Drives `retry_conflicted_vector_builds`, whose re-fill raises the shared dirty flag.
+    while coord.advance_index_builds(usize::MAX) {}
+
+    // NOW the unrelated transaction: it writes a label with NO index of any kind, and stays open.
+    let unrelated = coord.begin_serializable();
+    {
+        let plan = compile_with("CREATE (:Unrelated {x: 1})", &IndexCatalog::empty());
+        let bound = bind_parameters(&plan, &Parameters::new()).expect("bind");
+        let mut graph = coord.statement(unrelated).expect("statement");
+        let mut cursor = execute(&plan, &bound, &mut graph).expect("open cursor");
+        let _: Vec<Row> = cursor.collect_all().expect("collect");
+    }
+
+    // THE ASSERTION, measured while that transaction is still OPEN. If it inherited the build's dirty
+    // flag it is now a registered ft/spatial mutator, `effective_ft_spatial_marker` is `u64::MAX`, and
+    // every TEXT seek in the database — on a label this transaction never touched — full-scans.
+    let (rows_during, during) = profile_query(&mut coord, PROFILE_CONTAINS_137, &catalog);
+    let during_hits = total_db_hits(&during);
+    assert_eq!(rows_during, 1, "the seek still returns the one product");
+    assert!(
+        during_hits * 4 < scan_hits,
+        "rmp #803: a transaction that touched NO indexed property must not be charged with an index \
+         build's dirty flag; with it, every TEXT seek DB-wide declines to a full scan while that \
+         transaction is open (during={during_hits} scan={scan_hits} baseline={baseline_hits})"
+    );
+
+    coord.rollback(unrelated).expect("the unrelated txn aborts");
+    // And its abort must not have latched the degradation permanently.
+    assert!(
+        !coord.ft_spatial_poisoned(),
+        "rmp #803: aborting a transaction that touched no indexed property must never poison the \
+         DB-wide freshness marker"
+    );
+}
