@@ -170,6 +170,19 @@ explicitly so an operator can judge their own exposure.
 - **A single QPP / variable-length query can no longer abort the server (rmp #656).**
 - **`stdev` / `stdevp` returned a wrong aggregate value (rmp #628).**
 
+### Security
+
+- **Closed a username-enumeration timing oracle in password authentication (rmp #812, CWE-208 /
+  CWE-203).** `Authenticator::verify_password` ran the full Argon2id KDF for a known user but returned
+  immediately for an unknown or password-less user, so response *latency* distinguished valid usernames
+  even though the wire response was a uniform failure — reachable from both Bolt `LOGON` and REST
+  `POST /auth/login`. Measured on an idle host the differential was **9193×** (12.84 ms vs 0.001 ms).
+  The unknown-user and suspended-user branches now perform an equal-cost Argon2id verification against
+  a fixed dummy hash (derived once through the crate's own `hash_password`, so its parameters can never
+  drift) and discard the result; the delta collapses to within measurement noise (1.0×). The adjacent
+  suspended-account latency oracle was closed in the same change, and both branches are pinned by
+  non-vacuous KDF-invocation regression tests.
+
 ## [0.0.9] - 2026-07-08
 
 ### Added

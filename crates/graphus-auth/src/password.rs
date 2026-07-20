@@ -11,6 +11,8 @@
 //! the [`Catalog`](crate::Catalog) ties a hash to a user and exposes `set_password` /
 //! `verify_user_password` on top of these (see [`crate::auth`]).
 
+use std::sync::OnceLock;
+
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::{Argon2, password_hash::Error as PhcError};
@@ -69,6 +71,13 @@ pub fn verify_password(plaintext: &str, hash: &str) -> Result<bool> {
     let parsed = PasswordHash::new(hash).map_err(|e| AuthError::PasswordHash {
         detail: format!("stored hash unparsable: {e}"),
     })?;
+    // Deterministic test seam (rmp #812): count the Argon2 KDF verifications that ACTUALLY run
+    // (i.e. after a successful PHC parse), so the constant-work regression tests can prove — without
+    // a flaky wall-clock assertion — that the unknown-user / password-less / suspended branches each
+    // invoke exactly one KDF. Thread-local, so parallel tests never perturb one another's count (the
+    // KDF runs synchronously on the calling thread). Compiled out entirely in release/prod.
+    #[cfg(test)]
+    KDF_VERIFY_COUNT.with(|c| c.set(c.get() + 1));
     match Argon2::default().verify_password(plaintext.as_bytes(), &parsed) {
         Ok(()) => Ok(true),
         // A wrong password is the expected negative — surface it as `false`, not an error.
@@ -77,6 +86,55 @@ pub fn verify_password(plaintext: &str, hash: &str) -> Result<bool> {
             detail: e.to_string(),
         }),
     }
+}
+
+// Per-thread count of Argon2 KDF verifications actually executed by `verify_password` (rmp #812
+// regression seam). See the increment site in `verify_password`. Test-only.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static KDF_VERIFY_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A fixed plaintext used only to derive the process-wide dummy verification hash
+/// ([`dummy_verify_hash`]). Its exact value is irrelevant — it is never a real credential and is never
+/// compared for equality — it only has to satisfy [`MIN_PASSWORD_LEN`] so [`hash_password`] accepts it.
+const DUMMY_VERIFY_PLAINTEXT: &str = "graphus-constant-work-dummy-credential";
+
+/// The process-wide dummy Argon2id PHC hash backing the constant-work mitigation (rmp #812).
+///
+/// Derived **once**, lazily, through this crate's own [`hash_password`], so it carries **exactly** the
+/// same Argon2 parameters as a real stored hash: if [`Argon2::default`] ever changes, the dummy moves
+/// with it and the verification cost stays indistinguishable. (A hardcoded PHC-string constant would
+/// silently diverge from the real hashes the moment the defaults changed — the whole point of
+/// deriving it live.) The salt value is whatever the one-time hash drew and is fixed thereafter, which
+/// is correct: Argon2 verification cost depends on the parameters (memory/time/parallelism), not on
+/// the salt value.
+///
+/// The lazy first init runs one extra `hash_password` (an Argon2 *hash*), so the very first no-hash
+/// authentication after process start pays a one-time extra KDF — that makes the first such request
+/// *slower*, never faster, than a real verification, so it grants an attacker no enumeration signal;
+/// every subsequent call reuses the cached hash and is indistinguishable.
+fn dummy_verify_hash() -> &'static str {
+    static DUMMY: OnceLock<String> = OnceLock::new();
+    DUMMY.get_or_init(|| {
+        hash_password(DUMMY_VERIFY_PLAINTEXT)
+            .expect("dummy plaintext satisfies the strength policy")
+    })
+}
+
+/// Performs one full Argon2id verification against the fixed dummy hash and discards the result, so a
+/// caller with **no** real hash to check (unknown user, password-less user, suspended account) still
+/// pays the **same** KDF cost as a genuine verification.
+///
+/// This is the constant-work mitigation for the user-enumeration **timing** oracle (rmp #812,
+/// CWE-208 / CWE-203): without it the no-hash path returns in microseconds while a real verification
+/// takes tens of milliseconds, letting an unauthenticated attacker enumerate valid usernames purely by
+/// response latency even though the wire response (401 / Bolt `FAILURE`) is uniform. It routes through
+/// the same [`verify_password`] primitive the real path uses, so both perform an identical, observable
+/// KDF. The result is always `false` by construction (the dummy plaintext never matches); callers
+/// ignore it.
+pub(crate) fn verify_password_dummy(plaintext: &str) {
+    let _ = verify_password(plaintext, dummy_verify_hash());
 }
 
 #[cfg(test)]
@@ -140,5 +198,23 @@ mod tests {
     fn malformed_stored_hash_is_an_error_not_a_false() {
         let err = verify_password("whatever", "not-a-phc-string").unwrap_err();
         assert!(matches!(err, AuthError::PasswordHash { .. }));
+    }
+
+    #[test]
+    fn dummy_verification_runs_one_real_kdf() {
+        // Regression (rmp #812, CWE-208): the constant-work primitive must perform exactly one real
+        // Argon2 KDF verification — the same work a genuine `verify_password` does — so a no-hash
+        // authentication branch is indistinguishable by timing. Proven deterministically via the
+        // per-thread KDF counter rather than a flaky wall-clock assertion. Warm the lazy dummy hash
+        // first (its one-time init runs a `hash_password`, not a counted `verify_password`), so the
+        // measured window counts only the verification.
+        verify_password_dummy("warm-up");
+        KDF_VERIFY_COUNT.with(|c| c.set(0));
+        verify_password_dummy("any-plaintext-at-all");
+        assert_eq!(
+            KDF_VERIFY_COUNT.with(std::cell::Cell::get),
+            1,
+            "the dummy path must invoke exactly one Argon2 KDF verification"
+        );
     }
 }

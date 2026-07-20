@@ -207,12 +207,21 @@ impl Authenticator {
         Ok(())
     }
 
-    /// Verifies `plaintext` against `user`'s stored hash in constant time.
+    /// Verifies `plaintext` against `user`'s stored hash in **constant work**.
     ///
     /// Returns `Ok(true)` on a correct password, `Ok(false)` for an unknown user, a user with no
     /// password configured, or a wrong password — the negative cases are deliberately
     /// indistinguishable to the caller to avoid user-enumeration. Errors only on a corrupt stored
     /// hash.
+    ///
+    /// **Timing (rmp #812, CWE-208 / CWE-203).** Both branches perform exactly one Argon2id
+    /// verification: the *no-hash* branch (unknown user, or a user with no password) verifies the
+    /// supplied `plaintext` against a fixed dummy hash via [`password::verify_password_dummy`] and
+    /// discards the result. Without this, the no-hash branch would return in microseconds while a
+    /// real verification takes tens of milliseconds, letting an unauthenticated attacker enumerate
+    /// valid usernames purely by response latency even though the wire response is uniform. The dummy
+    /// hash is derived through this crate's own `hash_password`, so its KDF cost is identical to a
+    /// real hash's by construction.
     ///
     /// # Errors
     /// [`AuthError::PasswordHash`] if the stored hash cannot be parsed.
@@ -223,7 +232,14 @@ impl Authenticator {
             .and_then(|u| u.password_hash.as_deref())
         {
             Some(hash) => password::verify_password(plaintext, hash),
-            None => Ok(false),
+            // Constant-work: run the SAME Argon2 KDF against a dummy hash so an unknown / password-less
+            // user is indistinguishable by timing from a real verification. Must never short-circuit to
+            // a bare `Ok(false)` — that reopens the CWE-208 enumeration oracle (pinned by the
+            // `unknown_user_still_runs_the_kdf` regression test).
+            None => {
+                password::verify_password_dummy(plaintext);
+                Ok(false)
+            }
         }
     }
 
@@ -237,6 +253,12 @@ impl Authenticator {
     pub fn authenticate_password(&self, user: &str, plaintext: &str) -> Result<String> {
         // A suspended account is rejected regardless of an otherwise-valid password (rmp #641).
         if self.catalog.is_user_suspended(user) {
+            // Constant-work (rmp #812, CWE-208): pay the same Argon2 KDF cost as a live verification
+            // before rejecting, so a suspended account is not distinguishable by response latency from
+            // an active or unknown one. This early-out branch skips `verify_password`, so it must run
+            // the dummy KDF itself; the result is discarded — suspension is a hard reject. Pinned by
+            // the `suspended_user_still_runs_the_kdf` regression test.
+            password::verify_password_dummy(plaintext);
             return Err(AuthError::Unauthenticated);
         }
         if self.verify_password(user, plaintext)? {
@@ -475,6 +497,68 @@ mod tests {
         assert_eq!(
             a.authenticate_password("ghost", "alice-pw"),
             Err(AuthError::Unauthenticated)
+        );
+    }
+
+    #[test]
+    fn unknown_user_still_runs_the_kdf() {
+        // Regression (rmp #812, CWE-208 / CWE-203): the unknown-user (and password-less) branch of
+        // `verify_password` MUST perform the SAME Argon2 KDF work as a real verification, so response
+        // latency cannot enumerate valid usernames. Proven deterministically via the per-thread KDF
+        // counter — this test FAILS if someone restores the early `None => Ok(false)`. Warm the lazy
+        // dummy hash first so the measured window counts only the verification, not the one-time init
+        // `hash_password`.
+        let a = fixture();
+        crate::password::verify_password_dummy("warm-up");
+
+        // Unknown user: exactly one KDF verification, result `false`.
+        crate::password::KDF_VERIFY_COUNT.with(|c| c.set(0));
+        assert!(!a.verify_password("ghost", "any-password").unwrap());
+        assert_eq!(
+            crate::password::KDF_VERIFY_COUNT.with(std::cell::Cell::get),
+            1,
+            "the unknown-user branch must invoke the Argon2 KDF (constant work)"
+        );
+
+        // A known user with a wrong password does the SAME one KDF — equal work, no timing oracle.
+        crate::password::KDF_VERIFY_COUNT.with(|c| c.set(0));
+        assert!(!a.verify_password("alice", "wrong-password").unwrap());
+        assert_eq!(
+            crate::password::KDF_VERIFY_COUNT.with(std::cell::Cell::get),
+            1,
+            "the known-user wrong-password branch invokes exactly one KDF"
+        );
+
+        // A password-less (cleared) user is also a no-hash branch → must still run the KDF.
+        let mut b = fixture();
+        b.clear_password("alice").unwrap();
+        crate::password::KDF_VERIFY_COUNT.with(|c| c.set(0));
+        assert!(!b.verify_password("alice", "any-password").unwrap());
+        assert_eq!(
+            crate::password::KDF_VERIFY_COUNT.with(std::cell::Cell::get),
+            1,
+            "the password-less-user branch must invoke the Argon2 KDF (constant work)"
+        );
+    }
+
+    #[test]
+    fn suspended_user_still_runs_the_kdf() {
+        // Regression (rmp #812, CWE-208): the suspended-account early-out in `authenticate_password`
+        // MUST still pay the Argon2 KDF cost, so a suspended (known) account is not distinguishable by
+        // latency from an active one. This FAILS if the dummy KDF is removed from the suspended branch.
+        let mut a = fixture();
+        crate::password::verify_password_dummy("warm-up");
+        a.catalog_mut().set_user_suspended("alice", true).unwrap();
+
+        crate::password::KDF_VERIFY_COUNT.with(|c| c.set(0));
+        assert_eq!(
+            a.authenticate_password("alice", "alice-pw"),
+            Err(AuthError::Unauthenticated)
+        );
+        assert_eq!(
+            crate::password::KDF_VERIFY_COUNT.with(std::cell::Cell::get),
+            1,
+            "the suspended-user branch must invoke the Argon2 KDF (constant work)"
         );
     }
 
