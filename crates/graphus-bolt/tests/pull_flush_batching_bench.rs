@@ -61,6 +61,7 @@ impl RecordStream for BigStream {
             plan: None,
             query_type: Some("r".to_owned()),
             stats: vec![],
+            bookmark: None,
         }
     }
 }

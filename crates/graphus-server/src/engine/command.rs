@@ -820,6 +820,14 @@ pub struct RunSummary {
     /// The query plan of an `EXPLAIN` / `PROFILE` statement (`rmp` task #752), or `None` for an ordinary
     /// statement (and for every DDL / administrative command, which the Cypher planner never sees).
     pub plan: Option<QueryPlan>,
+    /// The transaction **bookmark** (`rmp` task #807), set **only when a transaction committed a
+    /// durable write**: the engine mints an opaque, monotonic-per-database token (`"<db>:<commit_ts>"`,
+    /// from the per-database commit-timestamp oracle) on the `COMMIT` of a write transaction and on the
+    /// finalisation of an auto-commit write, and leaves it `None` for a read-only / no-op commit and for
+    /// every non-terminal statement result. The Bolt seam surfaces it in the `SUCCESS` metadata of
+    /// `COMMIT` / the terminal auto-commit `PULL` (`graphus_bolt::QuerySummary::bookmark`); the REST
+    /// seam ignores it (HTTP is stateless — no causal chaining). Drivers treat it as opaque.
+    pub bookmark: Option<String>,
 }
 
 /// A query plan carried in the result summary (`rmp` task #752), neutral across the two seams.
@@ -864,6 +872,8 @@ fn schema_mutation_summary(key: &str, mutated: bool) -> RunSummary {
         stats,
         // Schema DDL never goes through the Cypher planner, so it carries no query plan (`rmp` #752).
         plan: None,
+        // Schema DDL is not a data-write transaction, so it mints no causal bookmark (`rmp` #807).
+        bookmark: None,
     }
 }
 
@@ -884,6 +894,7 @@ pub fn index_ddl_summary(command: &IndexCommand, mutated: bool) -> RunSummary {
             query_type: Some("r".to_owned()),
             stats: Vec::new(),
             plan: None,
+            bookmark: None,
         },
         IndexCommand::CreateNodePropertyIndex { .. }
         | IndexCommand::CreateRelPropertyIndex { .. }
@@ -922,6 +933,7 @@ pub fn constraint_ddl_summary(command: &ConstraintCommand, mutated: bool) -> Run
             query_type: Some("r".to_owned()),
             stats: Vec::new(),
             plan: None,
+            bookmark: None,
         },
         ConstraintCommand::Create(_) => schema_mutation_summary("constraints-added", mutated),
         ConstraintCommand::Drop { .. } => schema_mutation_summary("constraints-removed", mutated),

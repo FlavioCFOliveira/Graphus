@@ -380,6 +380,7 @@ pub(crate) fn finish<S>(
                     query_type: Some("r".to_owned()),
                     stats: Vec::new(),
                     plan: None,
+                    bookmark: None,
                 },
             }))
         }

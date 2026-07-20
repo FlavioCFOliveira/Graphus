@@ -400,3 +400,76 @@ fn autocommit_coalescing_scales_and_does_not_collapse_at_w16() {
     drop(handle2);
     graceful_shutdown(reopened);
 }
+
+/// `rmp` #807 — a durable **auto-commit write**'s result summary carries an opaque, monotonic
+/// **bookmark** (`"<db>:<commit_ts>"`), minted by the REAL engine from its per-database
+/// commit-timestamp oracle, while a **read** mints none. This guards the engine plumbing the Bolt seam
+/// surfaces in the terminal `PULL` `SUCCESS` (`finish_autocommit` -> `bookmark_token` -> `SummarySink`),
+/// which the mock-driven `graphus-bolt` regression cannot exercise. Two successive writes MUST yield
+/// strictly increasing bookmarks (the property causal chaining / `session.last_bookmarks()` relies on).
+#[test]
+fn autocommit_write_summary_carries_a_monotonic_bookmark_and_a_read_carries_none() {
+    let dir = TempDir::new("bookmark807");
+    let hardens = Arc::new(AtomicU64::new(0));
+    let engine = create_engine(&dir.path, Arc::clone(&hardens));
+    let handle = engine.handle.clone();
+
+    // The bookmark on one drained auto-commit write's summary (read AFTER end-of-stream — the
+    // ack-after-fsync close is the happens-before edge that publishes the summary, `rmp` #512/#807).
+    let write_bookmark = |id: i64| -> Option<String> {
+        let ticket = handle
+            .begin_auto_commit_blocking(AccessMode::Write)
+            .expect("begin write");
+        let mut reply = handle
+            .run_blocking(
+                ticket,
+                "CREATE (:Acct {id: $id})".to_owned(),
+                vec![("id".to_owned(), Value::Integer(id))],
+                true,
+                None,
+            )
+            .expect("write runs");
+        while let Ok(Some(_)) = reply.rows.next() {}
+        reply.summary.get().bookmark
+    };
+    let b1 = write_bookmark(1).expect("a durable auto-commit write mints a bookmark");
+    let b2 = write_bookmark(2).expect("the second write mints a bookmark");
+
+    // A read commits nothing durable, so it mints no bookmark (the driver keeps its prior one).
+    let read_ticket = handle
+        .begin_auto_commit_blocking(AccessMode::Read)
+        .expect("begin read");
+    let mut read_reply = handle
+        .run_blocking(
+            read_ticket,
+            "MATCH (n:Acct) RETURN count(n)".to_owned(),
+            vec![],
+            true,
+            None,
+        )
+        .expect("read runs");
+    while let Ok(Some(_)) = read_reply.rows.next() {}
+    let read_bookmark = read_reply.summary.get().bookmark;
+
+    graceful_shutdown(engine);
+
+    // The token is the opaque `"<db>:<commit_ts>"` shape; parse the monotonic numeric suffix.
+    let seq = |bm: &str| -> u64 {
+        bm.rsplit(':')
+            .next()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("bookmark must be a `<db>:<ts>` token, got {bm:?}"))
+    };
+    assert!(
+        b1.contains(':') && b2.contains(':'),
+        "bookmarks are `<db>:<ts>` tokens: {b1:?}, {b2:?}"
+    );
+    assert!(
+        seq(&b2) > seq(&b1),
+        "the engine's per-database bookmark must advance monotonically: {b1} -> {b2}"
+    );
+    assert_eq!(
+        read_bookmark, None,
+        "a read-only auto-commit mints no bookmark (`rmp` #807)"
+    );
+}

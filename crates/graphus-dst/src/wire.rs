@@ -107,6 +107,9 @@ fn to_bolt_summary(s: graphus_server::engine::RunSummary) -> QuerySummary {
             profiled: p.profiled,
             description: p.description,
         }),
+        // The transaction bookmark (`rmp` #807): pass it through exactly as the production seam does,
+        // so the simulated Bolt wire reports identical `SUCCESS` metadata for a committed write.
+        bookmark: s.bookmark,
     }
 }
 

@@ -1040,6 +1040,8 @@ pub(super) fn run_cursor(
         // inline path does (`rmp` #752): same renderer, same keys — the thread a read runs on is not
         // observable to the client. Read after the last row, so a PROFILE's counters are final.
         plan: plan_summary(plan, profile.as_ref()),
+        // A reader-pool read commits nothing durable, so it mints no causal bookmark (`rmp` #807).
+        bookmark: None,
     });
     true
 }
@@ -1386,7 +1388,14 @@ fn finalize_inflight<D: BlockDevice, S: LogSink>(
     // Auto-commit: commit on success, roll back on a runtime/deferral error — while `row_tx` is still
     // open so a commit failure (e.g. an SSI serialization abort) reaches the consumer as a terminal
     // error, never swallowed into a false success (`04 §1.3` step 6; the rmp #238 atomicity divergence).
-    if inflight.auto_commit {
+    //
+    // A durable auto-commit **write** yields the transaction's bookmark (`rmp` #807): the monotonic
+    // per-database `"<db>:<commit_ts>"` token the client receives in the terminal `PULL` `SUCCESS`. A
+    // read / no-op auto-commit, and every explicit-transaction `RUN` (which does not auto-commit —
+    // `inflight.auto_commit == false`, so `finish_autocommit` is not called and this stays `None`),
+    // mints none; the bookmark for an explicit transaction is minted by its `COMMIT` instead. This is
+    // the structural gate that keeps the bookmark off a `RUN` `SUCCESS` and off an explicit-tx `PULL`.
+    let bookmark = if inflight.auto_commit {
         finish_autocommit(
             coordinator,
             open,
@@ -1396,8 +1405,10 @@ fn finalize_inflight<D: BlockDevice, S: LogSink>(
             metrics,
             db,
             commit_batch,
-        );
-    }
+        )
+    } else {
+        None
+    };
 
     // Publish the finished statement's result summary (`rmp` task #512) into the side sink BEFORE
     // `row_tx` drops. THIS ORDERING IS CRITICAL: the channel-close that follows — when `inflight`
@@ -1414,6 +1425,11 @@ fn finalize_inflight<D: BlockDevice, S: LogSink>(
         // executor's recorder AFTER the last row was produced, so every operator's measured counters are
         // final; for an EXPLAIN nothing ran and the plan carries estimates only.
         plan: plan_summary(&inflight.plan, inflight.profile.as_ref()),
+        // The auto-commit write bookmark computed just above (`rmp` #807); `None` for a read / no-op or
+        // an explicit-transaction statement. The consumer reads this summary only AFTER the egress
+        // channel closes — which for a deferred (group-commit) durable write is the post-`fdatasync`
+        // batch ack — so a bookmark the client observes always names an already-durable commit.
+        bookmark,
     });
 
     // Latency + slow-query log, measured from statement start (`04 §9` / NFR-10). Emitted at finish so
@@ -1495,6 +1511,11 @@ fn to_parameters(params: Vec<(String, graphus_core::Value)>) -> Parameters {
 ///
 /// In BOTH shapes the SSI validation runs at commit time in channel order, so serializability and the
 /// abort victim are byte-identical to the pre-#566 inline commit — only the `fdatasync` is coalesced.
+/// Returns the auto-commit **write** bookmark (`rmp` #807) — `Some("<db>:<commit_ts>")` when this
+/// transaction committed a durable write, `None` for a read / no-op commit or an abort. The token is
+/// opaque and monotonic per database (the commit-timestamp oracle issues strictly increasing values),
+/// and the caller publishes it into the statement's summary sink so the client receives it in the
+/// terminal `PULL` `SUCCESS`.
 #[allow(clippy::too_many_arguments)] // commit bookkeeping + the #566 group-commit batch, all positional
 fn finish_autocommit<D: BlockDevice, S: LogSink>(
     coordinator: &mut TxnCoordinator<D, S>,
@@ -1505,15 +1526,13 @@ fn finish_autocommit<D: BlockDevice, S: LogSink>(
     metrics: &Metrics,
     db: &str,
     commit_batch: Option<&mut Vec<super::PendingCommit>>,
-) {
-    let Some(tx) = open.remove(&ticket.0) else {
-        return;
-    };
+) -> Option<String> {
+    let tx = open.remove(&ticket.0)?;
     if !produced_ok {
         // A runtime/deferral error terminated the stream: roll back (no commit, nothing durable).
         let _ = coordinator.rollback(tx.txn);
         metrics.record_abort_for(db);
-        return;
+        return None;
     }
     match commit_batch {
         // Group-commit batch available (`rmp` #566): PREPARE the write and DEFER its durability ack.
@@ -1523,33 +1542,58 @@ fn finish_autocommit<D: BlockDevice, S: LogSink>(
             // (channel close) only then — the ack-after-fsync rule, coalesced across the batch. The
             // statement's own `row_tx` drops when its `handle_run` returns, leaving this clone the last
             // sender, so the close happens precisely at the batch ack. `record_commit` is deferred there.
-            Ok((_commit_ts, Some(commit_lsn))) => {
+            // The commit timestamp (strictly monotonic per database) is this write's bookmark (`rmp` #807).
+            Ok((commit_ts, Some(commit_lsn))) => {
                 batch.push(super::PendingCommit::Autocommit {
                     row_tx: row_tx.clone(),
                     commit_lsn,
                 });
+                Some(bookmark_token(db, commit_ts))
             }
             // Wrote nothing durable (`rmp` #529): nothing to harden, so no deferral — ack now. The
-            // statement's `row_tx` drop (at `handle_run` scope end) closes the channel with no sync.
-            Ok((_commit_ts, None)) => metrics.record_commit_for(db),
+            // statement's `row_tx` drop (at `handle_run` scope end) closes the channel with no sync. A
+            // no-op/read commit mints no bookmark (`rmp` #807).
+            Ok((_commit_ts, None)) => {
+                metrics.record_commit_for(db);
+                None
+            }
             // SSI serialization abort (or inactive txn): already rolled back — surface the retriable
             // failure as a terminal stream error, never a silent success over rolled-back writes
-            // (`04 §1.3` step 6; the rmp #238 seed-4 atomicity divergence).
+            // (`04 §1.3` step 6; the rmp #238 seed-4 atomicity divergence). A rolled-back txn mints no
+            // bookmark, and the consumer sees the terminal error and never reads the summary anyway.
             Err(e) => {
                 let _ = row_tx.send(Err(e));
                 metrics.record_abort_for(db);
+                None
             }
         },
         // No batch (the parked-statement resume path): commit INLINE with its own `fdatasync`, exactly
-        // as before #566.
+        // as before #566. This path is reached only by a suspended (slow-consumer) auto-commit **write**
+        // — auto-commit reads run off the reader pool and never park here — so a successful inline
+        // commit yields the write's bookmark from its commit timestamp (`rmp` #807).
         None => match coordinator.commit(tx.txn) {
-            Ok(_) => metrics.record_commit_for(db),
+            Ok(commit_ts) => {
+                metrics.record_commit_for(db);
+                Some(bookmark_token(db, commit_ts))
+            }
             Err(e) => {
                 let _ = row_tx.send(Err(e));
                 metrics.record_abort_for(db);
+                None
             }
         },
     }
+}
+
+/// Formats a Bolt transaction **bookmark** (`rmp` #807): the opaque, monotonic-per-database token
+/// `"<db>:<commit_ts>"`, from the database name and the transaction's commit timestamp. The
+/// commit-timestamp oracle issues strictly increasing values per database (see
+/// `graphus_txn::TimestampOracle::commit`), so successive commits on a database yield strictly
+/// increasing tokens — the monotonicity a driver's causal chaining (`session.last_bookmarks()`) and
+/// the `rmp` #807 regression rely on. Drivers treat the whole string as opaque; the format is an
+/// internal convention, not wire-fixed.
+pub(super) fn bookmark_token(db: &str, commit_ts: graphus_core::Timestamp) -> String {
+    format!("{db}:{}", commit_ts.0)
 }
 
 /// Rolls back an auto-commit transaction that failed to compile/bind (so it never leaks). A no-op

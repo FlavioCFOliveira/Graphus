@@ -216,6 +216,10 @@ fn to_bolt_summary(s: RunSummary) -> QuerySummary {
             profiled: p.profiled,
             description: p.description,
         }),
+        // The transaction bookmark (`rmp` #807): the engine minted an opaque monotonic-per-database
+        // token on a write commit (auto-commit finalisation or explicit `COMMIT`); the Bolt server
+        // surfaces it in the `SUCCESS` metadata of the terminal auto-commit `PULL` / the `COMMIT`.
+        bookmark: s.bookmark,
     }
 }
 

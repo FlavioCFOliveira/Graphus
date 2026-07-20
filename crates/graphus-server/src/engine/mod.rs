@@ -726,6 +726,10 @@ enum PendingCommit {
         /// The LSN of this transaction's `COMMIT` record; the batch harden must advance the durable
         /// watermark past it before this reply is sent (asserted in [`ack_prepared_commits`]).
         commit_lsn: graphus_core::Lsn,
+        /// This write transaction's causal **bookmark** (`rmp` #807): `"<db>:<commit_ts>"`, minted at
+        /// prepare time and returned in the `COMMIT` `SUCCESS` metadata once the commit is durable
+        /// (`ack`), so a driver can chain it. Always `Some` for this durable-write variant.
+        bookmark: Option<String>,
     },
     /// An **auto-commit** single write statement (`rmp` #566): its client is acknowledged by the
     /// **close of the result-egress channel**, not a one-shot reply. `row_tx` is a *clone* of the
@@ -760,8 +764,16 @@ impl PendingCommit {
     /// held-open egress sender, closing the channel — the consumer's end-of-stream.
     fn ack(self) {
         match self {
-            PendingCommit::Explicit { reply, .. } => {
-                let _ = reply.send(Ok(RunSummary::default()));
+            PendingCommit::Explicit {
+                reply, bookmark, ..
+            } => {
+                // The durable-write `COMMIT` `SUCCESS` carries this transaction's causal bookmark
+                // (`rmp` #807); it is sent only here, AFTER the batch `fdatasync` made the commit
+                // durable — so the bookmark a driver receives always names an already-durable commit.
+                let _ = reply.send(Ok(RunSummary {
+                    bookmark,
+                    ..RunSummary::default()
+                }));
             }
             // Dropping the last egress sender closes the channel — the auto-commit statement's
             // ack-after-fsync end-of-stream (the summary was already published into the shared sink).
@@ -3327,11 +3339,17 @@ fn commit_prepare_tx<D: BlockDevice, S: LogSink>(
         return;
     };
     match coordinator.commit_prepare(tx.txn) {
-        // A durable write commit: defer the ack until the batch `fdatasync` covers `commit_lsn`.
-        Ok((_commit_ts, Some(commit_lsn))) => {
-            commit_batch.push(PendingCommit::Explicit { reply, commit_lsn })
-        }
-        // A read-only commit (`rmp` #529): nothing was appended, so no sync is needed — ack now.
+        // A durable write commit: defer the ack until the batch `fdatasync` covers `commit_lsn`. Mint
+        // the causal bookmark now from the commit timestamp (`rmp` #807) — monotonic per database — and
+        // carry it in the deferred reply so the `COMMIT` `SUCCESS` returns it once durable.
+        Ok((commit_ts, Some(commit_lsn))) => commit_batch.push(PendingCommit::Explicit {
+            reply,
+            commit_lsn,
+            bookmark: Some(exec::bookmark_token(db, commit_ts)),
+        }),
+        // A read-only commit (`rmp` #529): nothing was appended, so no sync is needed — ack now. A
+        // read-only transaction commits no durable write, so it mints no bookmark (`rmp` #807): the
+        // driver keeps its prior bookmark, exactly as for a read that observes nothing new.
         Ok((_commit_ts, None)) => {
             metrics.record_commit_for(db);
             let _ = reply.send(Ok(RunSummary::default()));

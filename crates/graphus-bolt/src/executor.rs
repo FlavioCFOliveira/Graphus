@@ -62,6 +62,21 @@ pub struct QuerySummary {
     /// The query plan for an `EXPLAIN` / `PROFILE` statement (`rmp` task #752), or `None` for an
     /// ordinary statement (the overwhelming majority — no plan key is then emitted at all).
     pub plan: Option<QueryPlan>,
+    /// The transaction **bookmark** for the `bookmark` metadata key (`rmp` task #807).
+    ///
+    /// The Bolt spec lists `bookmark::String` in the `SUCCESS` response to `COMMIT` and in the final
+    /// (`has_more == false`) `SUCCESS` of an **auto-commit** `PULL` ("the bookmark after committing
+    /// this transaction"; auto-commit only), for causal-consistency chaining
+    /// (`session.last_bookmarks()` / `execute_write`). It is an **opaque, monotonic-per-database**
+    /// token the driver stores and echoes back on a later `BEGIN`.
+    ///
+    /// This is `Some` **only when a transaction actually committed a durable write** — the executor
+    /// sets it on `COMMIT` of a write transaction and on the finalisation of an auto-commit write, and
+    /// leaves it `None` for a read-only / no-op commit, and for every non-terminal statement result.
+    /// So the gating is structural: an explicit-transaction `RUN`/`PULL` (which does not commit) and a
+    /// `ROLLBACK` carry no bookmark, and it is emitted on exactly the two messages the spec names. The
+    /// server ([`crate::server`]) serialises it verbatim; it never inspects the token's shape.
+    pub bookmark: Option<String>,
 }
 
 /// A query plan delivered in the result summary (`rmp` task #752).
@@ -275,8 +290,17 @@ pub(crate) mod mock {
                     plan: None,
                     query_type: Some("r".to_owned()),
                     stats: Vec::new(),
+                    bookmark: None,
                 },
             }
+        }
+
+        /// Attaches an auto-commit **bookmark** to this result's summary (`rmp` task #807), so a test
+        /// can assert the final auto-commit `PULL` `SUCCESS` carries it. A real auto-commit write's
+        /// summary carries the bookmark the engine minted when the stream's transaction committed.
+        pub fn with_bookmark(mut self, bookmark: &str) -> Self {
+            self.summary.bookmark = Some(bookmark.to_owned());
+            self
         }
     }
 
@@ -291,6 +315,9 @@ pub(crate) mod mock {
         pub tx_open: bool,
         pub log: Vec<String>,
         pub commit_fails_with: Option<GraphusError>,
+        /// The bookmark a successful `commit()` returns in its [`QuerySummary`] (`rmp` task #807).
+        /// `None` (the default) models a read-only / no-op commit that mints no bookmark.
+        pub commit_bookmark: Option<String>,
         /// The principal last announced via [`BoltExecutor::set_principal`] (None until LOGON).
         pub principal: Option<String>,
     }
@@ -315,6 +342,13 @@ pub(crate) mod mock {
         /// A fallback result for any unscripted query.
         pub fn with_default(mut self, result: CannedResult) -> Self {
             self.default_result = Some(result);
+            self
+        }
+
+        /// The bookmark a successful `commit()` will mint (`rmp` task #807). Models the engine minting
+        /// a monotonic per-database bookmark on the `COMMIT` of a write transaction.
+        pub fn with_commit_bookmark(mut self, bookmark: &str) -> Self {
+            self.commit_bookmark = Some(bookmark.to_owned());
             self
         }
     }
@@ -388,7 +422,12 @@ pub(crate) mod mock {
                 return Err(clone_error(err));
             }
             self.tx_open = false;
-            Ok(QuerySummary::default())
+            // A committed write transaction carries a bookmark (`rmp` task #807); a read-only commit
+            // (the default `None`) carries none.
+            Ok(QuerySummary {
+                bookmark: self.commit_bookmark.clone(),
+                ..QuerySummary::default()
+            })
         }
 
         fn rollback(&mut self) -> Result<(), GraphusError> {

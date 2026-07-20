@@ -723,6 +723,7 @@ fn summary_carries_query_type_and_stats() {
         plan: None,
         query_type: Some("rw".to_owned()),
         stats: vec![("nodes-created".to_owned(), Value::Integer(1))],
+        bookmark: None,
     };
     let exec = MockExecutor::new().on_query(
         "CREATE (n)",
@@ -763,6 +764,149 @@ fn summary_carries_query_type_and_stats() {
         }
         other => panic!("expected trailing SUCCESS, got {other:?}"),
     }
+}
+
+#[test]
+fn bookmark_on_commit_and_autocommit_pull_only_and_monotonic() {
+    // rmp #807: the Bolt spec lists `bookmark::String` in the SUCCESS response to COMMIT and in the
+    // terminal (`has_more == false`) SUCCESS of an AUTO-COMMIT PULL ("the bookmark after committing
+    // this transaction"; auto-commit only). Graphus emits an opaque, monotonic-per-database token
+    // there — and ONLY there. This test pins every positive and negative case:
+    //   * auto-commit final PULL    -> carries a bookmark (two writes, strictly advancing);
+    //   * explicit COMMIT           -> carries a bookmark;
+    //   * RUN SUCCESS               -> NO bookmark (it commits nothing);
+    //   * explicit-transaction PULL -> NO bookmark (the tx has not committed; its COMMIT carries it);
+    //   * ROLLBACK                  -> NO bookmark (it committed nothing).
+    // Mutation guard: deleting the emission in `summary_metadata` (or the COMMIT arm) fails this test.
+    let exec = MockExecutor::new()
+        // Two auto-commit writes with strictly increasing bookmarks. The engine mints "<db>:<ts>" from
+        // the monotonic commit-timestamp oracle; the mock stands in with fixed advancing tokens so the
+        // wire plumbing (engine summary -> QuerySummary -> SUCCESS metadata) is exercised end to end.
+        .on_query(
+            "CREATE (:A)",
+            CannedResult::rows(&[], vec![]).with_bookmark("graphus:100"),
+        )
+        .on_query(
+            "CREATE (:B)",
+            CannedResult::rows(&[], vec![]).with_bookmark("graphus:101"),
+        )
+        // An in-transaction read: its PULL summary carries NO bookmark (the tx has not committed).
+        .on_query(
+            "MATCH (n) RETURN n",
+            CannedResult::rows(&["n"], vec![vec![Value::Integer(1)]]),
+        )
+        // The explicit COMMIT of the write transaction mints its own bookmark.
+        .with_commit_bookmark("graphus:200");
+
+    let input = session_input(&[
+        hello(),
+        logon_alice(),
+        // (A) auto-commit write #1 — RUN SUCCESS then terminal PULL SUCCESS(bookmark 100).
+        Request::Run {
+            query: "CREATE (:A)".to_owned(),
+            parameters: vec![],
+            extra: vec![],
+        },
+        Request::Pull { n: ALL, qid: None },
+        // (B) auto-commit write #2 — terminal PULL SUCCESS(bookmark 101), strictly greater.
+        Request::Run {
+            query: "CREATE (:B)".to_owned(),
+            parameters: vec![],
+            extra: vec![],
+        },
+        Request::Pull { n: ALL, qid: None },
+        // (C) explicit tx: BEGIN, RUN(read), PULL(no bookmark), COMMIT(bookmark 200).
+        Request::Begin { extra: vec![] },
+        Request::Run {
+            query: "MATCH (n) RETURN n".to_owned(),
+            parameters: vec![],
+            extra: vec![],
+        },
+        Request::Pull { n: ALL, qid: None },
+        Request::Commit,
+        // (D) explicit tx that ROLLBACKs (no bookmark on the ROLLBACK).
+        Request::Begin { extra: vec![] },
+        Request::Run {
+            query: "MATCH (n) RETURN n".to_owned(),
+            parameters: vec![],
+            extra: vec![],
+        },
+        Request::Pull { n: ALL, qid: None },
+        Request::Rollback,
+        Request::Goodbye,
+    ]);
+
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, exec, &auth);
+        session.run().expect("session runs");
+    }
+    let (_, stream) = split_handshake(transport.written());
+    let r = decode_responses(stream);
+
+    // The `bookmark` string in a SUCCESS response, or `None` (panics if the response is not SUCCESS,
+    // so the caller must index a known-SUCCESS response).
+    let bookmark_of = |resp: &Response| -> Option<String> {
+        match resp {
+            Response::Success { metadata } => {
+                metadata.iter().find_map(|(k, v)| match (k.as_str(), v) {
+                    ("bookmark", Value::String(s)) => Some(s.clone()),
+                    _ => None,
+                })
+            }
+            other => panic!("expected SUCCESS, got {other:?}"),
+        }
+    };
+
+    // Response index map (a CREATE returns 0 rows, a MATCH one RECORD):
+    //  [0]HELLO [1]LOGON
+    //  [2]RUN(A)SUCCESS [3]PULL SUCCESS(bookmark 100)
+    //  [4]RUN(B)SUCCESS [5]PULL SUCCESS(bookmark 101)
+    //  [6]BEGIN [7]RUN(read)SUCCESS [8]RECORD [9]PULL SUCCESS(in-tx,none) [10]COMMIT(bookmark 200)
+    //  [11]BEGIN [12]RUN(read)SUCCESS [13]RECORD [14]PULL SUCCESS(in-tx,none) [15]ROLLBACK(none)
+    assert_eq!(
+        bookmark_of(&r[2]),
+        None,
+        "RUN SUCCESS must not carry a bookmark"
+    );
+    let bm1 = bookmark_of(&r[3]).expect("auto-commit final PULL carries a bookmark");
+    assert_eq!(bm1, "graphus:100");
+    let bm2 = bookmark_of(&r[5]).expect("second auto-commit final PULL carries a bookmark");
+    assert_eq!(bm2, "graphus:101");
+    assert_eq!(
+        bookmark_of(&r[7]),
+        None,
+        "in-tx RUN SUCCESS must not carry a bookmark"
+    );
+    assert_eq!(
+        bookmark_of(&r[9]),
+        None,
+        "explicit-transaction PULL must not carry a bookmark (its COMMIT does)"
+    );
+    assert_eq!(
+        bookmark_of(&r[10]).as_deref(),
+        Some("graphus:200"),
+        "COMMIT SUCCESS carries the transaction bookmark"
+    );
+    assert_eq!(
+        bookmark_of(&r[14]),
+        None,
+        "explicit-transaction PULL must not carry a bookmark"
+    );
+    assert_eq!(
+        bookmark_of(&r[15]),
+        None,
+        "ROLLBACK must not carry a bookmark"
+    );
+
+    // Strict monotonic advance across the two successive auto-commit writes (the property causal
+    // chaining relies on): parse the numeric suffix of each opaque `"<db>:<n>"` token.
+    let seq = |bm: &str| -> u64 { bm.rsplit(':').next().unwrap().parse().unwrap() };
+    assert!(
+        seq(&bm2) > seq(&bm1),
+        "bookmark must advance monotonically: {bm1} -> {bm2}"
+    );
 }
 
 #[test]

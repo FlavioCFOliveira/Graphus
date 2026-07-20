@@ -1097,6 +1097,17 @@ fn summary_metadata(
     if let Some(plan) = &summary.plan {
         meta.push((plan.metadata_key().to_owned(), plan.description.clone()));
     }
+    // The transaction bookmark (`rmp` task #807). The Bolt spec lists `bookmark::String` in the
+    // `SUCCESS` response to `COMMIT` and in the terminal (`has_more == false`) `SUCCESS` of an
+    // **auto-commit** `PULL` — "the bookmark after committing this transaction". The executor sets it
+    // in the [`QuerySummary`](crate::executor::QuerySummary) only when a transaction actually committed
+    // a durable write, so it is present here on exactly those two messages (this builder is called for
+    // the trailing `COMMIT`/`PULL` `SUCCESS` only — a `has_more:true` page and a `RUN` `SUCCESS` build
+    // their metadata elsewhere and never carry it, and a `ROLLBACK` mints no bookmark). The token is
+    // opaque and monotonic-per-database; the server serialises it verbatim.
+    if let Some(bookmark) = &summary.bookmark {
+        meta.push(("bookmark".to_owned(), Value::String(bookmark.clone())));
+    }
     meta
 }
 

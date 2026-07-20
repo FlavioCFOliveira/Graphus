@@ -4348,6 +4348,8 @@ fn admin_command_summary(cmd: &AdminCommand) -> RunSummary {
             stats: Vec::new(),
             // An administrative command never goes through the Cypher planner: no plan (`rmp` #752).
             plan: None,
+            // An administrative command is not a data-write transaction: no causal bookmark (`rmp` #807).
+            bookmark: None,
         },
         // Catalog + security mutations → query type "s" + system-updates + contains-system-updates.
         A::CreateDatabase { .. }
@@ -4373,6 +4375,9 @@ fn admin_command_summary(cmd: &AdminCommand) -> RunSummary {
                 ("system-updates".to_owned(), Value::Integer(1)),
                 ("contains-system-updates".to_owned(), Value::Boolean(true)),
             ],
+            // A system-catalog update is not a graph data-write transaction: no causal bookmark
+            // (`rmp` #807; bookmarks are per-database data-commit tokens, not system-database updates).
+            bookmark: None,
         },
         // Operator commands: administrative operations, not countable system-catalog updates.
         A::BackupDatabase { .. }
@@ -4382,6 +4387,8 @@ fn admin_command_summary(cmd: &AdminCommand) -> RunSummary {
             query_type: Some("s".to_owned()),
             stats: Vec::new(),
             plan: None,
+            // An operator command is not a data-write transaction: no causal bookmark (`rmp` #807).
+            bookmark: None,
         },
     }
 }
