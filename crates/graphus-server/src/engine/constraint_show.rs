@@ -372,6 +372,10 @@ pub(crate) fn finish<S>(
         }
         None => {
             let fields = COLUMNS_DEFAULT.iter().map(|c| (*c).to_owned()).collect();
+            // `rmp` #813: a bare `SHOW CONSTRAINTS` listing is a read — carry the DB's durable-write
+            // bookmark, matching the YIELD/WHERE path (which re-runs as a read and already gets one) and a
+            // real Neo4j server (which emits a bookmark for read transactions too).
+            let bookmark = reply.bookmark;
             let rows = project_default(reply.rows);
             Ok(as_admin(AdminResult {
                 fields,
@@ -380,7 +384,7 @@ pub(crate) fn finish<S>(
                     query_type: Some("r".to_owned()),
                     stats: Vec::new(),
                     plan: None,
-                    bookmark: None,
+                    bookmark,
                 },
             }))
         }

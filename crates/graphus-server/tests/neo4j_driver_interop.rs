@@ -50,8 +50,15 @@ impl TempDir {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        // A process-wide atomic counter guarantees a distinct directory even when two tests construct a
+        // `TempDir` in the SAME nanosecond under parallel execution (`cargo test`'s default multi-thread
+        // runner). Without it, two tests could collide on the same `{nanos}-{pid}` path and one's `Drop`
+        // would delete the other's freshly generated `cert.pem` / `security.toml`, spuriously failing the
+        // victim at "server should boot". Discovered while extending this harness for rmp #813.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         path.push(format!(
-            "graphus-neo4j-interop-{nanos}-{}",
+            "graphus-neo4j-interop-{nanos}-{}-{seq}",
             std::process::id()
         ));
         std::fs::create_dir_all(&path).unwrap();
@@ -215,6 +222,70 @@ function fail(msg) {
         await tx.commit();
       } finally {
         await session.close();
+      }
+    }
+
+    // 6. rmp #813: a READ transaction advances the session bookmark too, exactly like a real Neo4j
+    //    server (which emits a `bookmark` in the SUCCESS of a read transaction's COMMIT / terminal
+    //    auto-commit PULL). Before #813 Graphus emitted none for reads and lastBookmarks() stayed empty
+    //    after a read. Assert: (a) an auto-commit read advances lastBookmarks(); (b) two reads with no
+    //    write between them yield the SAME bookmark (the durable-write high-water is not a per-read
+    //    phantom tick); (c) chaining a further read on the read bookmark (executeRead) still resolves —
+    //    read-your-writes / causal chaining do not regress.
+    {
+      const session = driver.session();
+      try {
+        // (a) A pure auto-commit read must advance the session's last bookmarks.
+        await session.run('MATCH (p:Person) RETURN count(p) AS c');
+        const afterRead1 = session.lastBookmarks();
+        if (!afterRead1 || afterRead1.length === 0) {
+          fail('a read did not advance lastBookmarks() (rmp #813 regression)');
+        }
+        // (b) A second read with no write between must not move the bookmark backwards, and (single
+        //     instance) yields the same durable-write high-water token.
+        await session.run('MATCH (p:Person) RETURN count(p) AS c');
+        const afterRead2 = session.lastBookmarks();
+        if (JSON.stringify(afterRead1) !== JSON.stringify(afterRead2)) {
+          fail(`two reads with no write between yielded different bookmarks: ` +
+            `${JSON.stringify(afterRead1)} vs ${JSON.stringify(afterRead2)} (rmp #813)`);
+        }
+      } finally {
+        await session.close();
+      }
+    }
+
+    // 7. rmp #813 read-your-writes + causal chaining: a write's bookmark chained into a NEW read
+    //    session must observe the write (executeRead over the chained bookmarks), and the read session's
+    //    lastBookmarks() must be non-empty afterwards.
+    {
+      const writeSession = driver.session();
+      let writeBookmarks;
+      try {
+        await writeSession.executeWrite((tx) =>
+          tx.run('CREATE (:Marker813 {tag: $tag})', { tag: marker })
+        );
+        writeBookmarks = writeSession.lastBookmarks();
+        if (!writeBookmarks || writeBookmarks.length === 0) {
+          fail('a write did not advance lastBookmarks() (baseline for chaining)');
+        }
+      } finally {
+        await writeSession.close();
+      }
+      const readSession = driver.session({ bookmarks: writeBookmarks });
+      try {
+        const chained = await readSession.executeRead((tx) =>
+          tx.run('MATCH (m:Marker813 {tag: $tag}) RETURN count(m) AS c', { tag: marker })
+        );
+        const c = neo4j.isInt(chained.records[0].get('c'))
+          ? chained.records[0].get('c').toNumber()
+          : chained.records[0].get('c');
+        if (c !== 1) fail(`read chained on a write bookmark saw count ${c}, expected 1 (read-your-writes)`);
+        const readBookmarks = readSession.lastBookmarks();
+        if (!readBookmarks || readBookmarks.length === 0) {
+          fail('a read chained on a write bookmark did not itself advance lastBookmarks() (rmp #813)');
+        }
+      } finally {
+        await readSession.close();
       }
     }
 

@@ -75,6 +75,12 @@ pub struct ReadTask<D: BlockDevice, S: LogSink> {
     /// The owned, engine-thread-captured store read view + token snapshot + read snapshot + commit
     /// registry clone + fresh SIREAD buffer.
     pub inputs: ReadTaskInputs<D, S>,
+    /// This auto-commit read's Bolt causal **bookmark** (`rmp` task #813), minted on the engine thread at
+    /// dispatch from the DB's durable-write high-water (`"<db>:<durable_write_commit_ts>"`). Carried on
+    /// the `Send` task so the reader thread places it in the terminal `PULL` `SUCCESS` — matching a real
+    /// Neo4j server, which emits a bookmark for read transactions too. Always `Some` on the dispatch path
+    /// (an empty DB mints `"<db>:0"`).
+    pub read_bookmark: Option<String>,
     /// The shared extension registry (functions + procedures), `Arc`-shared from the engine.
     pub extensions: Arc<ExtensionRegistry>,
     /// The principal's resolved RBAC for this statement (`None`/unrestricted = no filtering).
@@ -150,6 +156,7 @@ pub fn run_read_task<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send +
         plan,
         bound,
         inputs,
+        read_bookmark,
         extensions,
         privileges,
         deadline,
@@ -204,6 +211,8 @@ pub fn run_read_task<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send +
                 // A fresh read-only summary sink; `run_cursor` fills it with the `r` query type
                 // before the caller drops `row_tx` (`rmp` #512).
                 SummarySink::new(),
+                // The auto-commit read's causal bookmark (`rmp` #813), minted at dispatch.
+                read_bookmark,
                 reply,
             );
             auth_error = authz.take_auth_error();
@@ -222,6 +231,8 @@ pub fn run_read_task<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send +
             // A fresh read-only summary sink; `run_cursor` fills it with the `r` query type before
             // the caller drops `row_tx` (`rmp` #512).
             SummarySink::new(),
+            // The auto-commit read's causal bookmark (`rmp` #813), minted at dispatch.
+            read_bookmark,
             reply,
         ),
     };

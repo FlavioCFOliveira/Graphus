@@ -401,15 +401,22 @@ fn autocommit_coalescing_scales_and_does_not_collapse_at_w16() {
     graceful_shutdown(reopened);
 }
 
-/// `rmp` #807 — a durable **auto-commit write**'s result summary carries an opaque, monotonic
-/// **bookmark** (`"<db>:<commit_ts>"`), minted by the REAL engine from its per-database
-/// commit-timestamp oracle, while a **read** mints none. This guards the engine plumbing the Bolt seam
-/// surfaces in the terminal `PULL` `SUCCESS` (`finish_autocommit` -> `bookmark_token` -> `SummarySink`),
-/// which the mock-driven `graphus-bolt` regression cannot exercise. Two successive writes MUST yield
-/// strictly increasing bookmarks (the property causal chaining / `session.last_bookmarks()` relies on).
+/// `rmp` #813 (was `rmp` #807 "a read carries none") — EVERY auto-commit result summary now carries an
+/// opaque, monotonic **bookmark** (`"<db>:<ts>"`), minted by the REAL engine, matching a real Neo4j
+/// server (which emits a bookmark for read transactions too). A durable WRITE mints its own commit
+/// timestamp; a READ mints the DB's **durable-write high-water** — the latest already-durable write it
+/// observed. This guards the engine plumbing the Bolt seam surfaces in the terminal `PULL` `SUCCESS`
+/// (`finish_autocommit`/reader-pool `run_cursor` -> `bookmark_token`/`durable_write_commit_ts` ->
+/// `SummarySink`), which the mock-driven `graphus-bolt` regression cannot exercise. It asserts:
+///   * two writes yield strictly increasing bookmarks (causal chaining / `session.last_bookmarks()`);
+///   * a read after them yields `>=` the last write's bookmark (**read-your-writes**);
+///   * two reads with no write between them yield the **SAME** bookmark — proving the read source is the
+///     durable-write watermark and NOT a per-read phantom tick (the `rmp` #529 `snapshot_ts` contamination
+///     this task had to avoid; sourcing from `snapshot_ts` would make the two reads differ, so this is the
+///     regression that fails RED under the wrong source).
 #[test]
-fn autocommit_write_summary_carries_a_monotonic_bookmark_and_a_read_carries_none() {
-    let dir = TempDir::new("bookmark807");
+fn autocommit_write_summary_carries_a_monotonic_bookmark_and_a_read_carries_a_monotonic_bookmark() {
+    let dir = TempDir::new("bookmark813");
     let hardens = Arc::new(AtomicU64::new(0));
     let engine = create_engine(&dir.path, Arc::clone(&hardens));
     let handle = engine.handle.clone();
@@ -435,25 +442,31 @@ fn autocommit_write_summary_carries_a_monotonic_bookmark_and_a_read_carries_none
     let b1 = write_bookmark(1).expect("a durable auto-commit write mints a bookmark");
     let b2 = write_bookmark(2).expect("the second write mints a bookmark");
 
-    // A read commits nothing durable, so it mints no bookmark (the driver keeps its prior one).
-    let read_ticket = handle
-        .begin_auto_commit_blocking(AccessMode::Read)
-        .expect("begin read");
-    let mut read_reply = handle
-        .run_blocking(
-            read_ticket,
-            "MATCH (n:Acct) RETURN count(n)".to_owned(),
-            vec![],
-            true,
-            None,
-        )
-        .expect("read runs");
-    while let Ok(Some(_)) = read_reply.rows.next() {}
-    let read_bookmark = read_reply.summary.get().bookmark;
+    // A read now carries a bookmark too (`rmp` #813): the DB's durable-write high-water, which after the
+    // two writes is exactly the last durable one — read-your-writes. Run it TWICE with no write between,
+    // to assert both reads return the SAME token (the watermark is not a per-read phantom tick).
+    let read_once = || -> Option<String> {
+        let read_ticket = handle
+            .begin_auto_commit_blocking(AccessMode::Read)
+            .expect("begin read");
+        let mut read_reply = handle
+            .run_blocking(
+                read_ticket,
+                "MATCH (n:Acct) RETURN count(n)".to_owned(),
+                vec![],
+                true,
+                None,
+            )
+            .expect("read runs");
+        while let Ok(Some(_)) = read_reply.rows.next() {}
+        read_reply.summary.get().bookmark
+    };
+    let read1 = read_once().expect("a read auto-commit mints a bookmark (`rmp` #813)");
+    let read2 = read_once().expect("a second read also mints a bookmark");
 
     graceful_shutdown(engine);
 
-    // The token is the opaque `"<db>:<commit_ts>"` shape; parse the monotonic numeric suffix.
+    // The token is the opaque `"<db>:<ts>"` shape; parse the monotonic numeric suffix.
     let seq = |bm: &str| -> u64 {
         bm.rsplit(':')
             .next()
@@ -461,15 +474,21 @@ fn autocommit_write_summary_carries_a_monotonic_bookmark_and_a_read_carries_none
             .unwrap_or_else(|| panic!("bookmark must be a `<db>:<ts>` token, got {bm:?}"))
     };
     assert!(
-        b1.contains(':') && b2.contains(':'),
-        "bookmarks are `<db>:<ts>` tokens: {b1:?}, {b2:?}"
+        b1.contains(':') && b2.contains(':') && read1.contains(':'),
+        "bookmarks are `<db>:<ts>` tokens: {b1:?}, {b2:?}, {read1:?}"
     );
     assert!(
         seq(&b2) > seq(&b1),
-        "the engine's per-database bookmark must advance monotonically: {b1} -> {b2}"
+        "the engine's per-database write bookmark must advance monotonically: {b1} -> {b2}"
+    );
+    assert!(
+        seq(&read1) >= seq(&b2),
+        "a read's bookmark names at least the last durable write it observed (read-your-writes): \
+         {b2} -> {read1}"
     );
     assert_eq!(
-        read_bookmark, None,
-        "a read-only auto-commit mints no bookmark (`rmp` #807)"
+        read1, read2,
+        "two reads with no write between them must return the SAME bookmark — the durable-write \
+         high-water is not a per-read phantom tick (`rmp` #813/#529)"
     );
 }

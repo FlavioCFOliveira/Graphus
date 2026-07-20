@@ -768,16 +768,19 @@ fn summary_carries_query_type_and_stats() {
 
 #[test]
 fn bookmark_on_commit_and_autocommit_pull_only_and_monotonic() {
-    // rmp #807: the Bolt spec lists `bookmark::String` in the SUCCESS response to COMMIT and in the
+    // rmp #807/#813: the Bolt spec lists `bookmark::String` in the SUCCESS response to COMMIT and in the
     // terminal (`has_more == false`) SUCCESS of an AUTO-COMMIT PULL ("the bookmark after committing
     // this transaction"; auto-commit only). Graphus emits an opaque, monotonic-per-database token
-    // there — and ONLY there. This test pins every positive and negative case:
-    //   * auto-commit final PULL    -> carries a bookmark (two writes, strictly advancing);
-    //   * explicit COMMIT           -> carries a bookmark;
-    //   * RUN SUCCESS               -> NO bookmark (it commits nothing);
-    //   * explicit-transaction PULL -> NO bookmark (the tx has not committed; its COMMIT carries it);
-    //   * ROLLBACK                  -> NO bookmark (it committed nothing).
-    // Mutation guard: deleting the emission in `summary_metadata` (or the COMMIT arm) fails this test.
+    // there — and ONLY there. Since rmp #813 a READ carries a bookmark too (matching a real Neo4j
+    // server), on exactly the same terminal messages. This test pins every positive and negative case:
+    //   * auto-commit final PULL (write) -> carries a bookmark (two writes, strictly advancing);
+    //   * auto-commit final PULL (READ)  -> carries a bookmark (rmp #813) — on the terminal PULL only;
+    //   * explicit COMMIT                -> carries a bookmark;
+    //   * RUN SUCCESS (write OR read)    -> NO bookmark (it commits nothing);
+    //   * explicit-transaction PULL      -> NO bookmark (the tx has not committed; its COMMIT carries it);
+    //   * ROLLBACK                       -> NO bookmark (it committed nothing).
+    // Mutation guard: deleting the emission in `summary_metadata` (or the COMMIT arm) fails this test, and
+    // leaking it onto a RUN / mid-stream / in-tx PULL fails the negative assertions below.
     let exec = MockExecutor::new()
         // Two auto-commit writes with strictly increasing bookmarks. The engine mints "<db>:<ts>" from
         // the monotonic commit-timestamp oracle; the mock stands in with fixed advancing tokens so the
@@ -794,6 +797,12 @@ fn bookmark_on_commit_and_autocommit_pull_only_and_monotonic() {
         .on_query(
             "MATCH (n) RETURN n",
             CannedResult::rows(&["n"], vec![vec![Value::Integer(1)]]),
+        )
+        // An AUTO-COMMIT read: its terminal PULL summary DOES carry a bookmark (rmp #813) — the DB's
+        // durable-write high-water. The mock stands in with a fixed token past the prior writes/commit.
+        .on_query(
+            "MATCH (x) RETURN x",
+            CannedResult::rows(&["x"], vec![vec![Value::Integer(1)]]).with_bookmark("graphus:250"),
         )
         // The explicit COMMIT of the write transaction mints its own bookmark.
         .with_commit_bookmark("graphus:200");
@@ -833,6 +842,15 @@ fn bookmark_on_commit_and_autocommit_pull_only_and_monotonic() {
         },
         Request::Pull { n: ALL, qid: None },
         Request::Rollback,
+        // (E) auto-commit READ — RUN SUCCESS (no bookmark) then a RECORD then a terminal PULL SUCCESS
+        // that DOES carry a bookmark (rmp #813: a read carries a bookmark on the terminal auto-commit
+        // PULL, exactly like a write, and NOT on its RUN).
+        Request::Run {
+            query: "MATCH (x) RETURN x".to_owned(),
+            parameters: vec![],
+            extra: vec![],
+        },
+        Request::Pull { n: ALL, qid: None },
         Request::Goodbye,
     ]);
 
@@ -865,6 +883,7 @@ fn bookmark_on_commit_and_autocommit_pull_only_and_monotonic() {
     //  [4]RUN(B)SUCCESS [5]PULL SUCCESS(bookmark 101)
     //  [6]BEGIN [7]RUN(read)SUCCESS [8]RECORD [9]PULL SUCCESS(in-tx,none) [10]COMMIT(bookmark 200)
     //  [11]BEGIN [12]RUN(read)SUCCESS [13]RECORD [14]PULL SUCCESS(in-tx,none) [15]ROLLBACK(none)
+    //  [16]RUN(read E)SUCCESS [17]RECORD [18]PULL SUCCESS(auto-commit read, bookmark 250)
     assert_eq!(
         bookmark_of(&r[2]),
         None,
@@ -899,6 +918,15 @@ fn bookmark_on_commit_and_autocommit_pull_only_and_monotonic() {
         None,
         "ROLLBACK must not carry a bookmark"
     );
+    // (E) an AUTO-COMMIT READ: its RUN carries NO bookmark, but its terminal PULL DOES (rmp #813).
+    assert_eq!(
+        bookmark_of(&r[16]),
+        None,
+        "auto-commit READ RUN SUCCESS must not carry a bookmark"
+    );
+    let bmr =
+        bookmark_of(&r[18]).expect("auto-commit READ terminal PULL carries a bookmark (rmp #813)");
+    assert_eq!(bmr, "graphus:250");
 
     // Strict monotonic advance across the two successive auto-commit writes (the property causal
     // chaining relies on): parse the numeric suffix of each opaque `"<db>:<n>"` token.
@@ -906,6 +934,12 @@ fn bookmark_on_commit_and_autocommit_pull_only_and_monotonic() {
     assert!(
         seq(&bm2) > seq(&bm1),
         "bookmark must advance monotonically: {bm1} -> {bm2}"
+    );
+    // The read's bookmark is monotonic past the prior write bookmarks too (rmp #813): a real read reflects
+    // the DB's durable-write high-water, which is >= any write the session has done.
+    assert!(
+        seq(&bmr) > seq(&bm2),
+        "a read's bookmark advances monotonically past prior writes: {bm2} -> {bmr}"
     );
 }
 

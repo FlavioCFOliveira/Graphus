@@ -484,12 +484,19 @@ pub(super) fn handle_run<
                 // plan + bound parameters that decide which seeks to run, and only this site has them.
                 // Without it the reader declines every seek and full-scans a planned index.
                 inputs.index_candidates = coordinator.index_candidates_for(txn, &plan, &bound);
+                // `rmp` #813: mint this auto-commit read's Bolt causal bookmark HERE, on the engine thread,
+                // from the DB's durable-write high-water — the latest already-durable write this read
+                // observes (it is dispatched only from a `RUN`, i.e. after any pending commit batch was
+                // flushed, so the high-water is already hardened). Captured into the `Send` task so the
+                // reader thread places it in the terminal `PULL` `SUCCESS` without touching the live store.
+                let read_bookmark = Some(bookmark_token(db, coordinator.durable_write_commit_ts()));
                 let task = ReadTask {
                     txn,
                     ticket,
                     plan,
                     bound,
                     inputs,
+                    read_bookmark,
                     extensions: Arc::clone(extensions),
                     privileges,
                     // The per-statement deadline (`rmp` #476) rides the `Send` task to the reader thread,
@@ -932,6 +939,10 @@ pub(super) fn run_cursor(
     row_tx: &RowSender,
     row_rx: std::sync::mpsc::Receiver<super::stream::RowItem>,
     summary: SummarySink,
+    // The auto-commit read's Bolt causal bookmark (`rmp` #813), minted on the engine thread at dispatch
+    // from the DB's durable-write high-water and carried here so it reaches the terminal `PULL` `SUCCESS`.
+    // `None` on the (non-reader-pool) callers that do not carry one.
+    read_bookmark: Option<String>,
     reply: Reply<Result<RunReply, GraphusError>>,
 ) -> bool {
     // The **same** registry that backed `compile` must back execution (`rmp` task #75), or the
@@ -1040,8 +1051,13 @@ pub(super) fn run_cursor(
         // inline path does (`rmp` #752): same renderer, same keys — the thread a read runs on is not
         // observable to the client. Read after the last row, so a PROFILE's counters are final.
         plan: plan_summary(plan, profile.as_ref()),
-        // A reader-pool read commits nothing durable, so it mints no causal bookmark (`rmp` #807).
-        bookmark: None,
+        // The auto-commit read's causal bookmark (`rmp` #813): the DB's monotonic durable-write
+        // high-water, minted on the engine thread at dispatch and carried in with the task. It names an
+        // already-durable commit and is identical for two reads with no write between them — matching a
+        // real Neo4j server, which emits a bookmark for read transactions too. A reader-pool read is
+        // always an auto-commit statement whose terminal (`has_more == false`) `PULL` `SUCCESS` this
+        // summary backs, so this is exactly the spec-named message that carries the bookmark.
+        bookmark: read_bookmark,
     });
     true
 }
@@ -1552,10 +1568,14 @@ fn finish_autocommit<D: BlockDevice, S: LogSink>(
             }
             // Wrote nothing durable (`rmp` #529): nothing to harden, so no deferral — ack now. The
             // statement's `row_tx` drop (at `handle_run` scope end) closes the channel with no sync. A
-            // no-op/read commit mints no bookmark (`rmp` #807).
+            // read / no-op auto-commit mints the DB's **durable-write** bookmark (`rmp` #813): the
+            // monotonic `"<db>:<durable_write_commit_ts>"` high-water — the latest already-durable write
+            // this commit could have observed. It is deliberately NOT this transaction's own
+            // (phantom-ticked, `rmp` #529) `commit_ts`, so it always names a durable commit and two reads
+            // with no write between them return the SAME token (Neo4j read-bookmark semantics).
             Ok((_commit_ts, None)) => {
                 metrics.record_commit_for(db);
-                None
+                Some(bookmark_token(db, coordinator.durable_write_commit_ts()))
             }
             // SSI serialization abort (or inactive txn): already rolled back — surface the retriable
             // failure as a terminal stream error, never a silent success over rolled-back writes

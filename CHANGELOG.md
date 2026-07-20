@@ -117,6 +117,17 @@ explicitly so an operator can judge their own exposure.
   (a false negative would be a dirty read) was adversarially audited SOUND with explicit happens-before
   on every surface including aarch64, and the load-bearing insert-before-word-write ordering is frozen
   by safety-critical comments.
+- **Read transactions (and schema DDL) now emit a Bolt causal bookmark, matching the reference Neo4j
+  server (rmp #813, follow-up to #807).** #807 minted a bookmark only for durable-write commits; a
+  read-only / no-op auto-commit minted none. The reference server emits one on every commit, so — for
+  strict wire-conformance — every `COMMIT` / terminal auto-commit `PULL` SUCCESS (read, write and DDL)
+  now carries the monotonic `"<db>:<commit_ts>"` token, while the structural gate (no bookmark on `RUN`,
+  a mid-stream `PULL`, or an explicit-transaction `PULL`) is preserved. A read's bookmark is sourced
+  from a new **durable-write commit-timestamp high-water** in the storage engine (advanced only at the
+  `fdatasync` durability point, never by a read-only commit's timestamp tick), so it always names an
+  already-durable commit, never decreases, and is identical for two reads with no write between them.
+  Verified against the official `neo4j-driver` 6.x: a read auto-commit advances `last_bookmarks()` and
+  read-your-writes / `execute_read`/`execute_write` chaining is unaffected.
 
 ### Fixed
 

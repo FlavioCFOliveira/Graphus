@@ -597,6 +597,12 @@ pub struct IndexDdlReply {
     /// Neo4j's idempotent-DDL summary. A real mutation is `true`. Irrelevant for a `SHOW` (always
     /// `false`; the read summary ignores it).
     pub mutated: bool,
+    /// The transaction **bookmark** (`rmp` task #813) for this DDL, set by the engine after it commits:
+    /// the DB's monotonic durable-write high-water token (`"<db>:<durable_write_commit_ts>"`). A schema
+    /// change is a committing transaction, so — like a real Neo4j server — the Bolt seam surfaces this on
+    /// the DDL result summary (the terminal `PULL` `SUCCESS`). `None` until the engine stamps it (and on
+    /// the REST seam, which is stateless — no causal chaining).
+    pub bookmark: Option<String>,
 }
 
 impl IndexDdlReply {
@@ -609,6 +615,8 @@ impl IndexDdlReply {
             fields: Vec::new(),
             rows: Vec::new(),
             mutated,
+            // Stamped by the engine after the DDL commits (`rmp` #813); `None` until then.
+            bookmark: None,
         }
     }
 }

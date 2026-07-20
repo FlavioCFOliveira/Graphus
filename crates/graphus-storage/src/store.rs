@@ -25,7 +25,7 @@
 //! and traversal dedupes it by relationship id (`04 §2.4`). [`RecordStore::incident_rels`] walks
 //! a node's chain in O(degree) with no index probe.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use std::sync::Arc;
 
@@ -356,6 +356,25 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// resumes monotonically after reopen. The next commit timestamp is `commit_ts_hw + 1`, and a
     /// fresh reader's snapshot timestamp is `commit_ts_hw` (it sees exactly what has committed).
     commit_ts_hw: u64,
+    /// Durable-write commit timestamps that have been PREPAREd (a `COMMIT` record appended) but whose
+    /// group-commit `fdatasync` may not yet have hardened, as `(commit_lsn, commit_ts)` pairs in
+    /// ascending `commit_lsn` order (`commit_prepare` runs serially on the engine thread, so pushes are
+    /// naturally ordered). Drained into `durable_write_commit_ts_hw` by
+    /// [`advance_durable_write_watermark`](Self::advance_durable_write_watermark) once the WAL
+    /// `durable_len` covers each `commit_lsn`. A read-only commit appends nothing (`rmp` #529 fast
+    /// path), so it never enters this queue — the whole point of the `rmp` #813 read-bookmark source
+    /// being this queue rather than the phantom-tick-contaminated `commit_ts_hw`.
+    pending_write_commits: VecDeque<(Lsn, Timestamp)>,
+    /// The **durable-write commit-timestamp high-water** (`rmp` task #813): the largest commit timestamp
+    /// of a write commit whose `COMMIT` record is `fdatasync`-durable. It is the source of a read
+    /// transaction's Bolt causal **bookmark** (`"<db>:<durable_write_commit_ts_hw>"`): it always names an
+    /// already-durable commit, is non-decreasing, and is IDENTICAL for two reads with no write between
+    /// them (Neo4j read-bookmark semantics). Unlike [`snapshot_ts`](Self::snapshot_ts) / `commit_ts_hw`
+    /// it is NOT advanced by a read-only commit's `rmp` #529 phantom tick, so it is a faithful
+    /// durable-write high-water rather than the issued-timestamp high-water. Seeded on open from the
+    /// recovered `commit_ts_hw` (which, post-recovery, reflects the last durable write — phantom ticks do
+    /// not survive a crash), so it never steps backwards across a restart.
+    durable_write_commit_ts_hw: u64,
     /// Per-open-transaction version-stamp bookkeeping, consumed at [`commit`](Self::commit) to
     /// settle in-flight headers to the commit timestamp (`04 §5.2`).
     active: HashMap<TxnId, ActiveTxn>,
@@ -612,6 +631,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             tokens: TokenStore::new(),
             stores: ALL_STORE_KINDS.map(FixedStore::empty),
             commit_ts_hw: 0,
+            // A fresh store has made no durable write, so both the queue and the bookmark high-water start
+            // empty/zero (`rmp` #813): a read before the first write mints `"<db>:0"`.
+            pending_write_commits: VecDeque::new(),
+            durable_write_commit_ts_hw: 0,
             active: HashMap::new(),
             catalog_dirty: false,
             schema_seq: 0,
@@ -720,6 +743,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             tokens: meta.tokens,
             stores,
             commit_ts_hw: meta.commit_ts_hw,
+            // Nothing is un-hardened at open (recovery truncated the un-synced WAL tail). Seed the
+            // durable-write bookmark high-water from the recovered `commit_ts_hw` (`rmp` #813): after a
+            // crash only durable commit records survive, so this reflects the last durable write and can
+            // never step backwards across a restart. (In the rare case a checkpoint had persisted a
+            // read-only phantom tick into `meta.commit_ts_hw`, this is at most a harmless slight
+            // over-estimate — still durable, still monotonic.)
+            pending_write_commits: VecDeque::new(),
+            durable_write_commit_ts_hw: meta.commit_ts_hw,
             active: HashMap::new(),
             catalog_dirty: false,
             schema_seq: 0,
@@ -1588,6 +1619,37 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Timestamp(self.commit_ts_hw)
     }
 
+    /// The **durable-write commit-timestamp high-water** (`rmp` task #813): the largest commit timestamp
+    /// of a write commit whose `COMMIT` record is `fdatasync`-durable. This is the source of a read
+    /// transaction's Bolt causal bookmark — it always names an already-durable commit, never decreases,
+    /// and (unlike [`snapshot_ts`](Self::snapshot_ts)) is unaffected by a read-only commit's `rmp` #529
+    /// phantom tick, so two reads with no write between them observe the SAME value (Neo4j semantics).
+    ///
+    /// First drains any PREPAREd write whose `commit_lsn` the WAL has since hardened, so a read that runs
+    /// between two batch hardens still reflects exactly what is durable at that instant (and never a
+    /// prepared-but-un-hardened write).
+    pub fn durable_write_commit_ts(&mut self) -> Timestamp {
+        self.advance_durable_write_watermark();
+        Timestamp(self.durable_write_commit_ts_hw)
+    }
+
+    /// Promotes every PREPAREd durable-write commit (`rmp` task #813) whose `commit_lsn` the WAL has now
+    /// hardened (`durable_len`) into `durable_write_commit_ts_hw`. The queue is in ascending `commit_lsn`
+    /// order and `commit_ts` is monotonic with it, so this pops a hardened prefix and takes the max.
+    /// Called after every harden (bounding the queue to at most one un-hardened batch) and on each read
+    /// of the watermark.
+    fn advance_durable_write_watermark(&mut self) {
+        let durable = self.wal.with(|w| w.durable_len());
+        while let Some(&(lsn, ts)) = self.pending_write_commits.front() {
+            if lsn.0 <= durable {
+                self.durable_write_commit_ts_hw = self.durable_write_commit_ts_hw.max(ts.0);
+                self.pending_write_commits.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
     /// Captures this store's per-[`StoreKind`] read metadata into an owned, `Send + Sync`
     /// [`MetaSnapshot`] (`rmp` task #336, Slice 3a; corrected by `rmp` #721): each store's
     /// **snapshotted** `high_water` bound + a **live**, shared handle on its page map. Call this on the
@@ -1804,6 +1866,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // PREPARE: append the `COMMIT` record with NO `fdatasync` (the group-commit deferral, `rmp`
         // #528). The caller hardens the whole batch with a single `harden_wal`.
         let commit_lsn = self.wal.with(|w| w.commit_at_no_sync(txn, commit_ts))?;
+        // `rmp` #813: record this durable write's `(commit_lsn, commit_ts)` so a read transaction's causal
+        // bookmark can advance to it — but ONLY once the deferred harden makes `commit_lsn` durable. The
+        // pair is drained into `durable_write_commit_ts_hw` at the next harden (or lazily on a read of the
+        // watermark), so a read never surfaces a not-yet-`fdatasync`'d write's timestamp. A read-only
+        // commit returned early above (the `rmp` #529 fast path) and so never reaches this push.
+        self.pending_write_commits
+            .push_back((commit_lsn, commit_ts));
         // The catalog (any pending token intern / index / histogram / constraint change) will be durable
         // once this commit record's `fdatasync` (the deferred `harden_wal`) completes, so the next
         // read-only commit may safely take its fast path (`rmp` #529). Cleared here (before the deferred
@@ -1854,6 +1923,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Panics (controlled abort) if the durability `fdatasync` fails (`04 §4.9`, fsyncgate).
     pub fn harden_wal(&mut self) {
         self.wal.with(|w| w.flush());
+        // `rmp` #813: the flush hardened every PREPAREd `COMMIT` record, so promote their write commit
+        // timestamps into the durable-write bookmark high-water (a no-op for a read-only batch, whose
+        // queue is empty).
+        self.advance_durable_write_watermark();
     }
 
     /// Group-commit **HARDEN — PREPARE half** of a *pipelined* commit (`rmp` #532): writes every
@@ -1890,6 +1963,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// acknowledging any committer whose record the job covered (ack-after-fsync).
     pub fn complete_harden_wal(&mut self, target_len: u64) {
         self.wal.with(|w| w.complete_harden(target_len));
+        // `rmp` #813: advance the durable-write bookmark high-water for every PREPAREd write this job just
+        // hardened (its `commit_lsn <= target_len`, now that `durable_len` reached it).
+        self.advance_durable_write_watermark();
     }
 
     /// Runs the redo-bounding auto-checkpoint if enough WAL has accumulated since the last one (`rmp`

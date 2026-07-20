@@ -9755,6 +9755,19 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.store.borrow_mut().complete_harden_wal(target_len);
     }
 
+    /// The store's **durable-write commit-timestamp high-water** (`rmp` task #813): the largest commit
+    /// timestamp of a write commit whose `COMMIT` record is `fdatasync`-durable. This is the engine's
+    /// source for a **read** transaction's (and a schema DDL's) Bolt causal bookmark
+    /// (`"<db>:<ts>"`): it always names an already-durable commit, never decreases, and is IDENTICAL for
+    /// two reads with no write between them — unlike [`RecordStore::snapshot_ts`], which a read-only
+    /// commit's `rmp` #529 phantom tick would advance. Drains any newly-hardened prepared write first, so
+    /// the value is exact even between two group-commit hardens (interior mutability via the store's
+    /// `RefCell`, hence `&self`).
+    #[must_use]
+    pub fn durable_write_commit_ts(&self) -> Timestamp {
+        self.store.borrow_mut().durable_write_commit_ts()
+    }
+
     /// Runs the redo-bounding auto-checkpoint if enough WAL has accumulated (`rmp` storage audit F3),
     /// a no-op otherwise. The engine's group-commit path calls this **once per drained batch**, after
     /// its committers are acknowledged (their commits are already durable via

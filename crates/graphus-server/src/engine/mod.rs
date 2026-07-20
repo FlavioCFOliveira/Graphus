@@ -2432,7 +2432,7 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
         }
         Cmd::IndexDdl { command, reply } => {
             let mutating = !matches!(command, IndexCommand::ShowIndexes { .. });
-            let out = handle_index_ddl(coord, &command);
+            let mut out = handle_index_ddl(coord, &command);
             // Invalidate the plan cache on a successful *mutating* index DDL (`rmp` task #322): a DROP
             // (and a fulltext/spatial CREATE, which is synchronous) changes the planner-visible catalog
             // immediately. A node-property CREATE only starts a `Populating` build whose later
@@ -2442,16 +2442,31 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             if mutating && out.is_ok() {
                 plan_cache.bump_schema();
             }
+            // `rmp` #813: a schema DDL is a committing transaction, so — like a real Neo4j server — it
+            // carries the DB's durable-write bookmark on its terminal `PULL` `SUCCESS`. A CREATE/DROP is
+            // itself a durable catalog write (its commit advanced the high-water); a SHOW is a read that
+            // observes it. The Bolt seam copies this onto the DDL result summary.
+            if let Ok(reply_ref) = out.as_mut() {
+                reply_ref.bookmark =
+                    Some(exec::bookmark_token(db, coord.durable_write_commit_ts()));
+            }
             let _ = reply.send(out);
         }
         Cmd::ConstraintDdl { command, reply } => {
             let mutating = !matches!(command, ConstraintCommand::Show { .. });
-            let out = handle_constraint_ddl(coord, &command);
+            let mut out = handle_constraint_ddl(coord, &command);
             // A successful mutating constraint DDL changes the schema (a new/dropped unique/existence/
             // node-key/property-type rule) — invalidate so no plan compiled under the old schema is
             // reused (`rmp` task #322).
             if mutating && out.is_ok() {
                 plan_cache.bump_schema();
+            }
+            // `rmp` #813: a constraint DDL is a committing transaction — carry the DB's durable-write
+            // bookmark on its terminal `PULL` `SUCCESS`, exactly as Neo4j does (the seam copies it onto
+            // the summary). A CREATE/DROP constraint advanced the high-water; a SHOW observes it.
+            if let Ok(reply_ref) = out.as_mut() {
+                reply_ref.bookmark =
+                    Some(exec::bookmark_token(db, coord.durable_write_commit_ts()));
             }
             let _ = reply.send(out);
         }
@@ -2981,6 +2996,7 @@ fn handle_index_ddl<D: BlockDevice, S: LogSink>(
                     .collect(),
                 rows,
                 mutated: false, // a SHOW is a read; the mutated flag is unused.
+                bookmark: None, // stamped by the dispatch_command handler (`rmp` #813).
             })
         }
         IndexCommand::CreateRelPropertyIndex {
@@ -3277,6 +3293,7 @@ fn handle_constraint_ddl<D: BlockDevice, S: LogSink>(
                 fields,
                 rows,
                 mutated: false, // a SHOW is a read; the mutated flag is unused.
+                bookmark: None, // stamped by the dispatch_command handler (`rmp` #813).
             })
         }
     }
@@ -3347,12 +3364,22 @@ fn commit_prepare_tx<D: BlockDevice, S: LogSink>(
             commit_lsn,
             bookmark: Some(exec::bookmark_token(db, commit_ts)),
         }),
-        // A read-only commit (`rmp` #529): nothing was appended, so no sync is needed — ack now. A
-        // read-only transaction commits no durable write, so it mints no bookmark (`rmp` #807): the
-        // driver keeps its prior bookmark, exactly as for a read that observes nothing new.
+        // A read-only commit (`rmp` #529): nothing was appended, so no sync is needed — ack now. It
+        // still returns the DB's **durable-write** bookmark on its `COMMIT` `SUCCESS` (`rmp` #813) —
+        // matching a real Neo4j server, which emits a bookmark for read transactions too. The token is
+        // the monotonic `"<db>:<durable_write_commit_ts>"` high-water: it names an already-durable commit
+        // and equals what a subsequent read returns absent a write, NOT this transaction's own
+        // (phantom-ticked, `rmp` #529) `commit_ts` — so two read-only commits with no write between them
+        // return the SAME bookmark.
         Ok((_commit_ts, None)) => {
             metrics.record_commit_for(db);
-            let _ = reply.send(Ok(RunSummary::default()));
+            let _ = reply.send(Ok(RunSummary {
+                bookmark: Some(exec::bookmark_token(
+                    db,
+                    coordinator.durable_write_commit_ts(),
+                )),
+                ..RunSummary::default()
+            }));
         }
         // An SSI serialization abort (or an inactive txn): the coordinator already rolled it back.
         Err(e) => {

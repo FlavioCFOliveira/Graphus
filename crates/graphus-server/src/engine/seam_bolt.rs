@@ -403,7 +403,10 @@ impl BoltExecutor for BoltEngineExecutor {
                 // The result summary (`rmp` #513 / #626 follow-up): query type `s` +
                 // `indexes-added`/`indexes-removed` for a real CREATE/DROP, or the `0` counter shape for
                 // an idempotent no-op (`reply.mutated == false`).
-                let summary = index_ddl_summary(&summary_cmd, reply.mutated);
+                let mut summary = index_ddl_summary(&summary_cmd, reply.mutated);
+                // `rmp` #813: a schema DDL is a committing transaction — surface the DB's durable-write
+                // bookmark on its result summary, exactly as a real Neo4j server does.
+                summary.bookmark = reply.bookmark.clone();
                 return Ok(BoltEngineStream::admin(AdminResult {
                     fields: reply.fields,
                     rows: reply.rows,
@@ -488,7 +491,10 @@ impl BoltExecutor for BoltEngineExecutor {
                 // The result summary (`rmp` #513 / #626 follow-up): query type `s` +
                 // `constraints-added`/`constraints-removed` for a real CREATE/DROP, or the `0` counter
                 // shape for a no-op drop (`reply.mutated == false`).
-                let summary = constraint_ddl_summary(&summary_cmd, reply.mutated);
+                let mut summary = constraint_ddl_summary(&summary_cmd, reply.mutated);
+                // `rmp` #813: a constraint DDL is a committing transaction — surface the DB's durable-write
+                // bookmark on its result summary, exactly as a real Neo4j server does.
+                summary.bookmark = reply.bookmark.clone();
                 return Ok(BoltEngineStream::admin(AdminResult {
                     fields: reply.fields,
                     rows: reply.rows,
