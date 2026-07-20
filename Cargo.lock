@@ -1482,6 +1482,7 @@ dependencies = [
  "graphus-sim",
  "graphus-txn",
  "graphus-wal",
+ "loom",
  "proptest",
  "smallvec",
 ]

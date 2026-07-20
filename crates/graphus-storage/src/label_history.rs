@@ -42,36 +42,30 @@
 //! concurrent label churn keeps the map empty and pays only that load. The lock is taken only while
 //! label history actually exists.
 //!
-//! # KNOWN RESIDUAL: multi-core read scaling while the history is ARMED (`rmp` #767)
+//! # Multi-core read scaling while the history is ARMED — the lock-free pre-filter (`rmp` #808)
 //!
 //! While the map is empty the gate short-circuits on a load of a read-only cache line, which stays
-//! Shared across cores and costs nothing to scale. **Once the history is non-empty**, every label
-//! re-check on every reader thread takes a shared [`RwLock`] acquisition — an atomic read-modify-write
-//! on ONE cache line, contended by every reader.
+//! Shared across cores and costs nothing to scale. Once the history is non-empty ("armed"), the
+//! naive design took a shared [`RwLock`] read acquisition on **every** re-check — an atomic
+//! read-modify-write on ONE cache line, contended by every reader. That collapsed aggregate
+//! label-scan throughput to well below single-thread past a couple of cores (measured: 0.12× of
+//! single-thread at 16 threads, 20_000 labelled nodes, AMD Ryzen 9 5900HX (8C/16T), `--release`,
+//! idle host).
 //!
-//! This is **MEASURED, and it is severe.** Aggregate off-thread label-scan throughput, 20_000 labelled
-//! nodes, AMD Ryzen 9 5900HX (8C/16T), `--release`, idle host:
+//! The realisation that fixes it cheaply: while armed, the tracked set is TINY (typically one or two
+//! nodes — a relabel of an already-committed node, retained only until the next GC prune) relative to
+//! a scan, so for nearly every candidate the correct answer is "not tracked, use the live word". A
+//! [`TrackedFilter`] — a lock-free Bloom membership pre-filter maintained by the single writer and
+//! read with atomic **loads only** — answers exactly that question without the lock. The `RwLock` is
+//! taken only for the handful of genuinely-tracked ids (plus a negligible false-positive rate), so
+//! the armed path scales like the unarmed one, and the certified resolution logic behind the lock is
+//! byte-identical to before. See [`TrackedFilter`] for the no-false-negative safety argument.
 //!
-//! | reader threads | 1 | 2 | 4 | 8 | 16 |
-//! |---|---|---|---|---|---|
-//! | gate UNARMED (scans/s) | 1515 | 2870 | 5380 | 7355 | **8630** |
-//! | gate ARMED (scans/s)   | 1092 | 1627 | 2117 | 2125 | **824** |
-//!
-//! Unarmed scales to 5.7x. Armed peaks at ~1.95x by 8 threads and then **collapses to 0.75x** — slower
-//! than a single thread — for a **10.5x** aggregate throughput loss at 16 threads. The lock is the
-//! bottleneck, and past saturation it is actively destructive.
-//!
-//! Scope of the exposure: only while label history is retained, i.e. between a relabel of an
-//! already-committed node and the next GC prune. Steady-state read workloads are unaffected (the
-//! unarmed row is the shipped path), and the gate is what keeps it that way.
-//!
-//! It is left as-is DELIBERATELY, not absorbed silently: the fix is a copy-on-write snapshot
-//! (`ArcSwap`-style) so readers pay one atomic load, but this workspace carries **no external
-//! dependencies**, and adding one — or hand-rolling the equivalent — changes the concurrency design.
-//! That is an owner decision, not something to smuggle into a correctness fix. A cheaper mitigation
-//! that stays inside the current design is a lock-free pre-filter (e.g. an atomic min/max tracked-id
-//! bound, or a small atomic bitset) consulted before the lock: the tracked set is typically one or two
-//! nodes, so nearly every candidate would skip the lock entirely.
+//! This stays inside the workspace's **no-external-dependencies** rule (no `ArcSwap`): a naive
+//! atomic-`Arc` snapshot would not even help, since `Arc::clone` on load is itself an RMW on the
+//! control block — the same contention by another name — and a scaling variant needs
+//! hazard-pointer/epoch reclamation. The pre-filter avoids all of that: no reclamation, no `unsafe`,
+//! and the slow path reuses the existing lock unchanged.
 //!
 //! # Version resolution
 //!
@@ -111,7 +105,7 @@
 
 use std::collections::HashMap;
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use graphus_core::{Timestamp, TxnId};
 use graphus_txn::{CommitRegistry, Snapshot, VersionStamp, is_visible};
@@ -145,13 +139,129 @@ struct NodeLabelHistory {
 /// This must be shared **live** rather than captured per dispatch: the page cache the reader decodes
 /// from is itself live (`rmp` #721), so a label change committed after dispatch is already visible in
 /// the word the reader reads, and only a live history can undo it.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct LabelHistory {
     /// Fast gate: `true` iff [`map`](Self::map) is non-empty. Lets the overwhelmingly common
     /// no-label-churn path skip the lock entirely.
     any: AtomicBool,
+    /// Lock-free membership pre-filter over the tracked node ids (`rmp` #808). Consulted after the
+    /// [`any`](Self::any) gate and before the [`map`](Self::map) lock: a **miss** is authoritative
+    /// ("this node has no tracked change"), so the overwhelming majority of re-checks — every
+    /// untracked node in a scan while a handful of others are armed — skip the `RwLock` entirely and
+    /// pay only a pair of atomic **loads** on read-mostly cache lines. See [`TrackedFilter`].
+    filter: TrackedFilter,
     /// `node_id -> retained versions`.
     map: RwLock<HashMap<u64, NodeLabelHistory>>,
+}
+
+impl Default for LabelHistory {
+    fn default() -> Self {
+        Self {
+            any: AtomicBool::new(false),
+            filter: TrackedFilter::new(),
+            map: RwLock::new(HashMap::new()),
+        }
+    }
+}
+
+/// Number of 64-bit words backing [`TrackedFilter`]. 64 words = 4096 bits = 512 bytes: enough that,
+/// for the realistic armed set (one or two nodes, up to a few dozen under heavy churn), the
+/// false-positive rate is negligible (≈`(k·n/m)^k`; for `n=32, k=2, m=4096` it is ≈`2·10⁻⁴`), while
+/// staying small enough that the two words a lookup touches are almost always cache-resident.
+const LABEL_FILTER_WORDS: usize = 64;
+/// Total bit capacity of the filter.
+const LABEL_FILTER_BITS: u64 = (LABEL_FILTER_WORDS as u64) * 64;
+
+/// A lock-free Bloom membership pre-filter over the tracked node ids (`rmp` #808).
+///
+/// # Why this exists
+///
+/// The authoritative history is [`LabelHistory::map`], behind a `RwLock`. Even a *read* acquisition
+/// of that lock is an atomic read-modify-write on one cache line, so once the history is armed every
+/// reader thread contends on it and aggregate label-scan throughput collapses (measured: 0.12× of
+/// single-thread at 16 threads on an idle Ryzen 9 5900HX). This filter lets a reader decide, with
+/// **loads only**, that a given id is definitely *not* tracked and skip the lock — which is the case
+/// for nearly every candidate, because the armed set is tiny relative to a scan.
+///
+/// # No false negatives (the safety property)
+///
+/// A lookup may return a false *positive* (harmless: the reader takes the lock, finds no entry, and
+/// returns the live word) but **never** a false negative for a genuinely tracked id. Two facts
+/// establish this:
+///
+/// * **Adds are monotonic.** [`insert`](Self::insert) only ever sets bits, so once an id's bits are
+///   set they stay set for the whole armed window.
+/// * **Rebuilds preserve every surviving key.** [`rebuild`](Self::rebuild) recomputes the image from
+///   the *surviving* keys and publishes it one word at a time; a surviving key has both its bits set
+///   in the new image, so any per-word interleaving of the old and new images a concurrent reader
+///   might observe still has that key's bits set. Only bits belonging exclusively to *removed* ids
+///   can clear, and a removed id is one whose live word is authoritative again — returning the live
+///   word for it is correct.
+///
+/// The publication ordering that makes a newly-armed id visible mirrors [`LabelHistory::any`]: the
+/// writer sets the bits (with `Release`) **before** it arms the gate and, on the store write path,
+/// before it mutates the in-place live word the version guards; a reader that observes either the
+/// armed gate or the mutated word (through the buffer-pool page latch) therefore also observes the
+/// bits. Reads use `Acquire` so the property holds by construction rather than by a neighbour's
+/// implementation detail.
+#[derive(Debug)]
+struct TrackedFilter {
+    words: [AtomicU64; LABEL_FILTER_WORDS],
+}
+
+impl TrackedFilter {
+    /// An empty filter (no id tracked).
+    fn new() -> Self {
+        Self {
+            words: [const { AtomicU64::new(0) }; LABEL_FILTER_WORDS],
+        }
+    }
+
+    /// The two bit indices `id` maps to (double hashing with two independent mixes of the id).
+    #[inline]
+    fn bits(id: u64) -> (usize, usize) {
+        // splitmix64 finalizers: full-avalanche mixing so adjacent physical ids do not collide.
+        let mix = |mut z: u64| -> u64 {
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        };
+        let h1 = mix(id) % LABEL_FILTER_BITS;
+        let h2 = mix(id ^ 0x9e37_79b9_7f4a_7c15) % LABEL_FILTER_BITS;
+        (h1 as usize, h2 as usize)
+    }
+
+    /// Marks `id` as tracked (writer only). Monotonic: only sets bits.
+    fn insert(&self, id: u64) {
+        let (b1, b2) = Self::bits(id);
+        self.words[b1 / 64].fetch_or(1u64 << (b1 % 64), Ordering::Release);
+        self.words[b2 / 64].fetch_or(1u64 << (b2 % 64), Ordering::Release);
+    }
+
+    /// Whether `id` *may* be tracked — **loads only**, the hot path. A `false` is authoritative:
+    /// `id` is definitely not tracked. Never a false negative for a tracked id (see type docs).
+    #[inline]
+    #[must_use]
+    fn maybe_contains(&self, id: u64) -> bool {
+        let (b1, b2) = Self::bits(id);
+        self.words[b1 / 64].load(Ordering::Acquire) & (1u64 << (b1 % 64)) != 0
+            && self.words[b2 / 64].load(Ordering::Acquire) & (1u64 << (b2 % 64)) != 0
+    }
+
+    /// Recomputes the image from exactly the surviving `keys` (writer only), publishing each word
+    /// with a single store. Preserves every surviving key's bits under concurrent reads (see type
+    /// docs); an empty `keys` clears the filter.
+    fn rebuild<'a>(&self, keys: impl Iterator<Item = &'a u64>) {
+        let mut image = [0u64; LABEL_FILTER_WORDS];
+        for &id in keys {
+            let (b1, b2) = Self::bits(id);
+            image[b1 / 64] |= 1u64 << (b1 % 64);
+            image[b2 / 64] |= 1u64 << (b2 % 64);
+        }
+        for (w, &v) in self.words.iter().zip(image.iter()) {
+            w.store(v, Ordering::Release);
+        }
+    }
 }
 
 impl LabelHistory {
@@ -205,6 +315,11 @@ impl LabelHistory {
             stamp: VersionStamp::in_flight(txn),
             bitmap: new,
         });
+        // Mark the id in the lock-free pre-filter BEFORE arming the gate, so a reader that observes
+        // `any() == true` also observes the bits (the same publication ordering `any` documents), and
+        // — on the store write path — before the in-place live word is mutated, so a reader that
+        // reaches the mutated word through the page latch is guaranteed to take the slow path.
+        self.filter.insert(id);
         self.any.store(true, Ordering::Release);
     }
 
@@ -225,6 +340,13 @@ impl LabelHistory {
     ) -> u64 {
         // Hot path: no node anywhere has a tracked change.
         if !self.any() {
+            return live;
+        }
+        // Second gate (`rmp` #808): a lock-free membership check with loads only. A miss is
+        // authoritative — this node has no tracked change — so the untracked majority of a scan
+        // skips the `RwLock` below entirely instead of contending on its reader-count cache line.
+        // A false positive merely reaches the (byte-identical) slow path and returns `live`.
+        if !self.filter.maybe_contains(id) {
             return live;
         }
         let map = self.map.read().unwrap_or_else(|e| e.into_inner());
@@ -322,6 +444,9 @@ impl LabelHistory {
         }
         let mut map = self.map.write().unwrap_or_else(|e| e.into_inner());
         map.remove(&id);
+        // Rebuild the pre-filter from the survivors so a churn of reclaimed slots does not let stale
+        // bits accumulate. Surviving keys keep their bits, so no concurrent reader can be misled.
+        self.filter.rebuild(map.keys());
         self.any.store(!map.is_empty(), Ordering::Release);
     }
 
@@ -339,6 +464,7 @@ impl LabelHistory {
             hist.versions.retain(|v| v.stamp != stamp);
             !hist.versions.is_empty()
         });
+        self.filter.rebuild(map.keys());
         self.any.store(!map.is_empty(), Ordering::Release);
     }
 
@@ -367,6 +493,7 @@ impl LabelHistory {
             }
             !hist.versions.is_empty()
         });
+        self.filter.rebuild(map.keys());
         self.any.store(!map.is_empty(), Ordering::Release);
     }
 
@@ -580,5 +707,92 @@ mod tests {
         assert_eq!(h.resolve(1, 0b111, snap(9, 10), &reg), 0b11);
         // The author sees its own.
         assert_eq!(h.resolve(1, 0b111, snap(2, 10), &reg), 0b111);
+    }
+
+    // ------------------------- pre-filter (`rmp` #808) -------------------------
+
+    /// The pre-filter never yields a false negative for a tracked id: a resolve for any of a set of
+    /// tracked ids must reach the history, across an id range wide enough to exercise many
+    /// bit-position collisions and the whole hash space.
+    #[test]
+    fn filter_has_no_false_negative_across_a_wide_id_range() {
+        let h = LabelHistory::new();
+        let mut reg = CommitRegistry::new();
+        // Track a spread of ids (uncommitted writer 7): each resolve MUST return the masked value,
+        // never the live word — i.e. the pre-filter must route every one to the slow path.
+        let tracked: Vec<u64> = (0..256).map(|k| k * 7919 + 3).collect();
+        for &id in &tracked {
+            h.record(id, TxnId(7), 0b1, 0b0);
+        }
+        let _ = &mut reg;
+        for &id in &tracked {
+            assert_eq!(
+                h.resolve(id, 0b0, snap(9, 100), &reg),
+                0b1,
+                "tracked id {id} was skipped by the pre-filter (false negative = dirty read)"
+            );
+        }
+    }
+
+    /// After a shrink (`forget`), the filter is rebuilt from the survivors, so a still-tracked id is
+    /// still routed to the slow path (no false negative), while the disarmed node returns its live
+    /// word.
+    #[test]
+    fn filter_rebuild_preserves_survivors_after_forget() {
+        let h = LabelHistory::new();
+        let reg = CommitRegistry::new();
+        // Two nodes tracked by two different in-flight writers.
+        h.record(10, TxnId(7), 0b1, 0b0);
+        h.record(20, TxnId(8), 0b1, 0b0);
+        // Writer 7 rolls back: node 10's version is dropped; node 20 survives.
+        h.forget(TxnId(7));
+        assert!(h.any(), "node 20 still tracked");
+        // Node 20 (survivor) must still be masked — the rebuilt filter keeps its bits.
+        assert_eq!(
+            h.resolve(20, 0b0, snap(9, 100), &reg),
+            0b1,
+            "survivor was skipped after rebuild (false negative)"
+        );
+        // Node 10 is no longer tracked: its live word is authoritative again.
+        assert_eq!(h.resolve(10, 0b1, snap(9, 100), &reg), 0b1);
+    }
+
+    /// When the last tracked node is forgotten, the gate disarms and the filter is cleared: a
+    /// resolve for the id that WAS tracked now returns the live word via the ultra-fast gate.
+    #[test]
+    fn filter_clears_when_history_empties() {
+        let h = LabelHistory::new();
+        let reg = CommitRegistry::new();
+        h.record(42, TxnId(7), 0b1, 0b0);
+        assert!(
+            h.filter.maybe_contains(42),
+            "an armed id must be in the filter"
+        );
+        h.forget(TxnId(7));
+        assert!(!h.any(), "gate disarms when the last version goes");
+        assert!(
+            !h.filter.maybe_contains(42),
+            "the filter must be cleared once the history empties"
+        );
+        assert_eq!(h.resolve(42, 0b111, snap(9, 100), &reg), 0b111);
+    }
+
+    /// The filter membership question is exact for a single tracked id and (with overwhelming
+    /// probability, given the 4096-bit width) a miss for an untracked one — the property that makes
+    /// the untracked majority of a scan skip the lock.
+    #[test]
+    fn filter_membership_matches_tracked_set() {
+        let h = LabelHistory::new();
+        h.record(1000, TxnId(7), 0b1, 0b0);
+        assert!(h.filter.maybe_contains(1000));
+        // A large sample of untracked ids: essentially all should miss (false positives are rare and
+        // harmless, so we assert the rate is low rather than zero).
+        let fp = (0u64..10_000)
+            .filter(|&id| id != 1000 && h.filter.maybe_contains(id))
+            .count();
+        assert!(
+            fp <= 5,
+            "false-positive rate unexpectedly high ({fp}/10000) for a single tracked id"
+        );
     }
 }

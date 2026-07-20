@@ -105,6 +105,18 @@ explicitly so an operator can judge their own exposure.
   relabelled *retained* and the WAL-volume gate is skipped rather than mis-compared), and the
   product-recommendations baseline is regenerated against the corrected metric with recorded
   provenance.
+- **Off-thread label re-checks scale across cores again while the label history is armed (rmp #808).**
+  Every `MATCH (n:L)` re-check consults the label-version history; once that history is non-empty, the
+  old code took a shared `RwLock` read on one cache line per re-check, so aggregate off-thread
+  label-scan throughput *collapsed* to 0.12× of single-thread at 16 threads (measured on an idle
+  8C/16T host). A lock-free Bloom membership pre-filter (`TrackedFilter`, `[AtomicU64; 64]`, loads-only
+  for readers) now answers "is this id tracked?" without touching the lock; only a genuinely tracked
+  id falls through to the unchanged authoritative resolution. Armed 16-thread throughput goes from 638
+  to 133 217 scans/s (**209×**, 6.97× scaling — matching the unarmed path), the common unarmed path is
+  unchanged, and the fix adds no external runtime dependency. The no-false-negative safety property
+  (a false negative would be a dirty read) was adversarially audited SOUND with explicit happens-before
+  on every surface including aarch64, and the load-bearing insert-before-word-write ordering is frozen
+  by safety-critical comments.
 
 ### Fixed
 

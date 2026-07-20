@@ -2204,6 +2204,16 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // the word is mutated in place, so without this the old value survives only in the WAL undo
         // image, which no reader can reach. A reader whose snapshot predates this change — or any
         // reader at all while this writer is still in flight — resolves through the history instead.
+        //
+        // SAFETY-CRITICAL ORDERING (`rmp` #808) — do NOT move this below the in-place page write.
+        // `track_label_history` also arms the `TrackedFilter` membership bit for `id` (Release), and
+        // the filter's no-false-negative guarantee is published to off-thread readers through the
+        // buffer-pool page latch acquired for the `with_page_mut_lsn` write below — NOT through the
+        // `any` gate (which is already set in the common already-armed case and so carries no fresh
+        // happens-before for THIS insert). Because the filter bit is set before the perturbed live
+        // word is written under the latch, a reader that decodes this word under the page READ latch
+        // is guaranteed to also observe the filter bit, so it can never skip the authoritative
+        // history and trust an uncommitted word. Reorder these two and you open a dirty read.
         self.track_label_history(id, txn, old_labels, new_labels, creator);
         let (rel_page, off) = paging::record_location(id, StoreKind::Node.record_size());
         let dev = self.device_page(StoreKind::Node, rel_page)?;
@@ -3774,6 +3784,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // Retain the pre-change bitmap as an MVCC version (`rmp` #767) — the same reason as
         // `write_node_labels`. This path replaces the whole set rather than one bit, but the label
         // word is overwritten in place just the same, so an older snapshot needs the prior value.
+        //
+        // SAFETY-CRITICAL ORDERING (`rmp` #808) — this `track_label_history` (which arms the
+        // `TrackedFilter` bit for `id`, Release) MUST stay ordered BEFORE the `write_node` page
+        // write below. The filter's no-false-negative guarantee is published to off-thread readers
+        // via the buffer-pool page latch, not the `any` gate; arming the bit before the perturbed
+        // word reaches the page is what lets a reader decoding that word never miss the membership
+        // bit. Reorder these and an off-thread reader can trust an uncommitted word (a dirty read).
         self.track_label_history(id, txn, old_labels, new_labels, node.mvcc.created_ts);
         self.write_node(id, &node, txn)?;
         // Adjust the per-label counts by the membership delta of this live node (`rmp` task #79).
