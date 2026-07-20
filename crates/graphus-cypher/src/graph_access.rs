@@ -171,7 +171,19 @@ pub enum VectorQueryResult {
         property: String,
         /// The declared embedding dimension (used to re-validate each candidate's current embedding).
         dimensions: usize,
+        /// The index's declared similarity metric (`rmp` task #780). The caller needs it to **re-score**
+        /// each surviving candidate against its own snapshot-visible embedding: the `score` below is
+        /// computed from whatever vector the HNSW holds, which is not necessarily the vector this
+        /// reader's snapshot sees.
+        similarity: graphus_index::Similarity,
         /// Candidate `(entity_id, score)` pairs, ordered by descending score.
+        ///
+        /// **Candidate** is literal, in two directions (`rmp` task #780). The set may contain entities
+        /// this snapshot cannot see (the caller drops them), and each `score` is *provisional*: it is
+        /// the similarity of the query to the vector currently in the ANN graph, which for a reader on
+        /// an older snapshot — or one racing a concurrent write — is a vector that reader may not
+        /// observe. Reporting it verbatim leaks a value across the snapshot boundary, so the caller
+        /// MUST re-score every survivor from its own visible embedding and re-sort on the result.
         hits: Vec<(u64, f32)>,
     },
 }

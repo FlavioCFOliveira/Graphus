@@ -871,6 +871,18 @@ const BUILD_STALL_BUDGET: u8 = 32;
 /// coordinator must remain deterministic for DST and so never reads the clock.
 const MAX_DEGRADED_RETRY_BACKOFF: u32 = 262_144;
 
+/// The synthetic blocker a FAULTED vector re-fill records (`rmp` task #780).
+///
+/// A re-fill wipes the graph before repopulating it, so a fault mid-way leaves an index that is empty
+/// or holed — precisely the state that must never be served. Recording this id keeps the index declining
+/// to the exact scan (which is correct, just slower) instead of publishing the hole.
+///
+/// It is deliberately an id no real transaction can hold, so `RecordStore::is_txn_active` reports it
+/// resolved and the very next drain re-attempts the repair. That is the intent: the fault may be
+/// transient, and a permanently-faulting store then costs one bounded probe per backoff window rather
+/// than pinning the index on the slow path forever.
+const REFILL_FAULT_BLOCKER: TxnId = TxnId(u64::MAX);
+
 /// The drains to skip before the next poisoned-build resurrection attempt, given how many consecutive
 /// resurrections have already failed to complete (`rmp` task #733, B2). `2^(attempts-1)`, capped at
 /// [`MAX_DEGRADED_RETRY_BACKOFF`]: the first re-poison waits 1 drain, then 2, 4, 8, …, so a build that
@@ -1223,6 +1235,15 @@ pub struct TxnCoordinator<D: BlockDevice, S: LogSink> {
     conflict_retry_skip: u32,
     /// The current backoff width for [`conflict_retry_skip`](Self#structfield.conflict_retry_skip).
     conflict_retry_backoff: u32,
+    /// Drains still to skip before the next VECTOR conflict re-fill attempt (`rmp` task #780) — the
+    /// vector twin of [`conflict_retry_skip`](Self#structfield.conflict_retry_skip), kept SEPARATE so a
+    /// flapping full-text conflict cannot starve a vector re-fill (or the reverse): while an index is
+    /// blocked its every read pays an O(entities x dim) exact scan, so its repair must not queue behind
+    /// an unrelated kind's backoff.
+    vector_conflict_retry_skip: u32,
+    /// The current backoff width for
+    /// [`vector_conflict_retry_skip`](Self#structfield.vector_conflict_retry_skip).
+    vector_conflict_retry_backoff: u32,
     /// Poisoned spatial builds — see [`poisoned_builds`](Self#structfield.poisoned_builds).
     poisoned_spatial_builds: Vec<PendingSpatialBuild>,
     /// How many builds have been poisoned over this coordinator's life (`rmp` task #733, M1) — monotonic.
@@ -1392,7 +1413,7 @@ pub fn auto_vector_rel_index_name(rel_type: &str, property: &str) -> String {
 /// (`rmp` task #669). Storage does not depend on `graphus-index`, so the metric is stored as its own
 /// byte enum and translated here when the query layer (re)builds the HNSW graph.
 #[must_use]
-fn similarity_from_storage(similarity: VectorSimilarity) -> Similarity {
+pub(crate) fn similarity_from_storage(similarity: VectorSimilarity) -> Similarity {
     match similarity {
         VectorSimilarity::Cosine => Similarity::Cosine,
         VectorSimilarity::Euclidean => Similarity::Euclidean,
@@ -1479,6 +1500,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             conflicted_fulltext_builds: Vec::new(),
             conflict_retry_skip: 0,
             conflict_retry_backoff: 1,
+            vector_conflict_retry_skip: 0,
+            vector_conflict_retry_backoff: 1,
             poisoned_spatial_builds: Vec::new(),
             poison_events: 0,
             poison_retry_skip: 0,
@@ -3358,6 +3381,56 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 return;
             }
         };
+
+        // `rmp` task #780 — the #766 uncommitted-version gate, per covered index.
+        //
+        // The loop below collapses the property chain NEWEST-WINS. If the newest version of a covered
+        // embedding belongs to a still-ACTIVE writer, baking it indexes an UNCOMMITTED embedding and
+        // leaves the committed one indexed nowhere — MEASURED to make a fresh reader's k=1 return the
+        // wrong node, with a `score` computed from a vector that reader's snapshot cannot see (a dirty
+        // read, not a recall artifact), and to SURVIVE that writer's rollback for the life of the
+        // process. Unlike full-text (`rmp` #778) the consumer cannot repair it: the per-candidate
+        // re-check validates the embedding's SHAPE, never its geometry.
+        //
+        // So: skip the entity AND record the writer against each index that covers it. A non-empty
+        // blocker list makes every reader of that index decline to the exact brute-force scan until a
+        // conflict-free re-fill succeeds. Attribution is per `(token, prop_key)` rather than global so
+        // one conflicted index never makes an unrelated one decline.
+        //
+        // The liveness predicate is the store's Active Transaction Table
+        // (`RecordStore::is_txn_active`), deliberately NOT `CommitRegistry::outcome(w) ==
+        // TxnOutcome::InFlight`, which is DEAD — always false, since the registry gains an entry only
+        // when a transaction *resolves*. That exact confusion is `rmp` #522 and it silently no-opped the
+        // pre-#778 full-text gate; re-making it here would no-op this one.
+        let conflicted_keys: Vec<u32> = {
+            let chain = match store.borrow().node_properties(id) {
+                Ok(chain) => chain,
+                Err(_) => {
+                    Self::note_rebuild_gap(index);
+                    return;
+                }
+            };
+            let covering: Vec<(u32, u32)> = registered
+                .iter()
+                .copied()
+                .filter(|(reg_label, _)| label_tokens.contains(reg_label))
+                .collect();
+            let mut keys = Vec::new();
+            for (reg_label, prop_key) in covering {
+                if let Some(writer) = active_writer_holds_newest_covered(&chain, &[prop_key], |w| {
+                    store.borrow().is_txn_active(w)
+                }) {
+                    index
+                        .borrow_mut()
+                        .note_vector_build_conflict(reg_label, prop_key, writer);
+                    if !keys.contains(&prop_key) {
+                        keys.push(prop_key);
+                    }
+                }
+            }
+            keys
+        };
+
         // The node's current property values, keyed by prop-key (newest-wins per key), keeping only the
         // values a registered vector index covers for one of this node's labels. The value type is NOT
         // pre-filtered here (unlike text/spatial): `insert_vector_value` validates the embedding shape.
@@ -3377,6 +3450,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 if values.iter().any(|(k, _)| *k == key) {
                     continue; // newest-wins: keep only the first occurrence of each key.
                 }
+                // `rmp` #780: an active writer holds this key's newest version. Indexing ANY version
+                // here would be wrong — the newest is uncommitted, and an older one is not what a
+                // newest-wins graph means — so leave the entity out entirely. The blocker recorded
+                // above makes readers decline this index to the exact scan, which sees the committed
+                // value, so the omission is never observable as a missing row.
+                if conflicted_keys.contains(&key) {
+                    continue;
+                }
                 let used = registered.iter().any(|&(reg_label, prop_key)| {
                     prop_key == key && label_tokens.contains(&reg_label)
                 });
@@ -3389,7 +3470,15 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let mut index = index.borrow_mut();
         for (prop_key, value) in &values {
             for &lt in &label_tokens {
-                if index.has_vector(lt, *prop_key) {
+                // Scope the fan-out to the `registered` set the CALLER asked for, not to "any vector
+                // index that happens to cover this (label, key)" (`rmp` task #780 audit).
+                //
+                // `has_vector` alone was wrong for the partial re-fill driven by
+                // `retry_conflicted_vector_builds`, which passes only the indexes it just WIPED: a node
+                // carrying two covered labels would have had its embedding inserted into a sibling index
+                // that was NOT wiped, silently duplicating maintenance into a graph the caller is not
+                // rebuilding. The whole-set rebuild passes every registered key, so it is unaffected.
+                if registered.contains(&(lt, *prop_key)) && index.has_vector(lt, *prop_key) {
                     index.insert_vector_value(lt, *prop_key, value, id);
                 }
             }
@@ -3416,6 +3505,35 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 return;
             }
         };
+        // `rmp` task #780 — the relationship twin of the node gate in
+        // [`index_one_node_vector`](Self::index_one_node_vector); see there for the full rationale.
+        let conflicted_keys: Vec<u32> = {
+            let chain = match store.borrow().rel_properties(id) {
+                Ok(chain) => chain,
+                Err(_) => {
+                    Self::note_rebuild_gap(index);
+                    return;
+                }
+            };
+            let mut keys = Vec::new();
+            for (reg_type, prop_key) in registered.iter().copied() {
+                if reg_type != type_token {
+                    continue;
+                }
+                if let Some(writer) = active_writer_holds_newest_covered(&chain, &[prop_key], |w| {
+                    store.borrow().is_txn_active(w)
+                }) {
+                    index
+                        .borrow_mut()
+                        .note_vector_rel_build_conflict(reg_type, prop_key, writer);
+                    if !keys.contains(&prop_key) {
+                        keys.push(prop_key);
+                    }
+                }
+            }
+            keys
+        };
+
         let mut values: Vec<(u32, Value)> = Vec::new();
         {
             let chain = match store.borrow().rel_property_values(id) {
@@ -3431,6 +3549,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             for (_pid, key, value) in chain {
                 if values.iter().any(|(k, _)| *k == key) {
                     continue; // newest-wins: keep only the first occurrence of each key.
+                }
+                // `rmp` #780: see the node twin — leave a conflicted entity out entirely.
+                if conflicted_keys.contains(&key) {
+                    continue;
                 }
                 let used = registered
                     .iter()
@@ -6572,6 +6694,21 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// The returned ids are **candidates**: the query planner layers MVCC visibility + current-label +
     /// current-value re-checks (and the cross-snapshot freshness gate) on top. `ef_search` defaults are
     /// the caller's; [`graphus_index::DEFAULT_EF_SEARCH`] is a sensible starting point.
+    ///
+    /// # This is the RAW seam and is NOT safe for production reads (`rmp` #797)
+    ///
+    /// It reads the ANN graph directly and applies **none** of the guarantees the query surface applies.
+    /// Specifically it does not check [`IndexState`] (`rmp` #733), so a still-`Populating` or
+    /// fail-closed index answers with a silently truncated or empty neighbour set; it does not consult
+    /// the `rmp` #780 build-conflict gate, so an index whose build was blocked by an uncommitted writer
+    /// answers from an incomplete graph instead of declining to the exact scan; and the scores it
+    /// returns are **provisional**, computed from whatever vector the graph holds rather than from the
+    /// caller's snapshot-visible embedding.
+    ///
+    /// Production reads MUST go through `db.index.vector.queryNodes`, i.e.
+    /// [`GraphAccess::vector_query_nodes`](crate::graph_access::GraphAccess::vector_query_nodes), which
+    /// applies all three. This entry point exists for tests and for low-level index inspection; it has
+    /// no production caller today and must not acquire one without first gaining those gates.
     #[must_use]
     pub fn vector_query_nodes(
         &self,
@@ -7454,6 +7591,26 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.index.borrow().is_degraded()
     }
 
+    /// How many VECTOR indexes are **currently** blocked by a `rmp` #780 build conflict, node and
+    /// relationship together — i.e. how many k-NN surfaces are serving the exact brute-force scan.
+    ///
+    /// Answers stay **correct** while blocked (the scan is exact where the ANN is approximate), but
+    /// they cost `O(covered entities x dim)` instead of a graph descent, and the index keeps reporting
+    /// `ONLINE`. Exactly like [`indexes_degraded`](Self::indexes_degraded), the condition must be
+    /// visible or it is indistinguishable from a healthy-but-slow engine.
+    #[must_use]
+    pub fn blocked_vector_indexes(&self) -> usize {
+        self.index.borrow().blocked_vector_indexes()
+    }
+
+    /// How many times a VECTOR index has entered that blocked state over this coordinator's life
+    /// (`rmp` task #780) — monotonic, one per index per entry. The server samples it to log each new
+    /// occurrence and drive a metric.
+    #[must_use]
+    pub fn vector_index_conflict_events(&self) -> u64 {
+        self.index.borrow().vector_conflict_events()
+    }
+
     /// How many times the derived indexes have been wiped by [`IndexSet::fail_closed`] over this
     /// coordinator's life (`rmp` task #733) — monotonic. The server samples it to log each new
     /// occurrence at `ERROR` and drive a metric; a silent degradation is indistinguishable from a
@@ -7785,6 +7942,174 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         }
     }
 
+    /// Re-fills every VECTOR index whose build was blocked by an uncommitted writer, once ALL of that
+    /// index's recorded writers have resolved (`rmp` task #780). Returns whether any re-fill ran.
+    ///
+    /// # Why resolution alone is not the repair
+    ///
+    /// A blocked build SKIPPED the conflicted entity rather than baking its uncommitted embedding, so
+    /// the graph is missing that entity. A k-NN can drop a candidate but never resurrect one, and
+    /// nothing re-inserts it when the writer resolves — MEASURED: before this, the wrong answer survived
+    /// the writer's ROLLBACK for the life of the process, healed only by a reopen (the graph is
+    /// ephemeral). The repair therefore has to be an actual re-fill: wipe the graph, re-scan, re-insert.
+    ///
+    /// # Why it is gated on the writers, and why that is cheap
+    ///
+    /// The re-fill is an O(store) scan on the command path, so attempting it while a blocking writer is
+    /// still open would re-scan on every command for as long as that transaction stayed open. Waiting
+    /// costs one [`RecordStore::is_txn_active`](graphus_storage::RecordStore::is_txn_active) lookup per
+    /// recorded writer and fires only when the re-fill can actually succeed. A writer that COMMITS and
+    /// one that ABORTS both resolve it: after either, the newest version of the covered property is a
+    /// settled one. (The predicate is the Active Transaction Table, NOT `CommitRegistry::outcome`, which
+    /// is always-false for a running transaction — `rmp` #522 / #778.)
+    ///
+    /// It is throttled for the reason [`retry_degraded_index_rebuild`](Self::retry_degraded_index_rebuild)
+    /// documents: overlapping writers resolve one after another, so an unthrottled repair would run one
+    /// O(store) re-fill per writer generation, forever. A repair HALVES the backoff rather than resetting
+    /// it (a flapping conflict would otherwise buy a full re-scan on every success); a re-conflict
+    /// doubles it up to [`MAX_DEGRADED_RETRY_BACKOFF`].
+    fn retry_conflicted_vector_builds(&mut self) -> bool {
+        let node_keys = self.index.borrow().conflicted_vector();
+        let rel_keys = self.index.borrow().conflicted_vector_rel();
+        if node_keys.is_empty() && rel_keys.is_empty() {
+            return false;
+        }
+        let resolved = |writers: &[TxnId], store: &Rc<RefCell<RecordStore<D, S>>>| {
+            let store = store.borrow();
+            writers.iter().all(|&w| !store.is_txn_active(w))
+        };
+
+        // Partition first: only indexes whose writers have ALL settled are repairable now.
+        let ready_nodes: Vec<(u32, u32)> = node_keys
+            .into_iter()
+            .filter(|&(t, p)| {
+                let writers = self.index.borrow().vector_blockers(t, p).to_vec();
+                resolved(&writers, &self.store)
+            })
+            .collect();
+        let ready_rels: Vec<(u32, u32)> = rel_keys
+            .into_iter()
+            .filter(|&(t, p)| {
+                let writers = self.index.borrow().vector_rel_blockers(t, p).to_vec();
+                resolved(&writers, &self.store)
+            })
+            .collect();
+        if ready_nodes.is_empty() && ready_rels.is_empty() {
+            // Still blocked — not an attempt, so it neither spends nor arms the throttle.
+            return false;
+        }
+        if self.vector_conflict_retry_skip > 0 {
+            self.vector_conflict_retry_skip -= 1;
+            return false;
+        }
+
+        for (token, prop_key) in &ready_nodes {
+            self.index
+                .borrow_mut()
+                .reset_vector_for_refill(*token, *prop_key);
+        }
+        for (token, prop_key) in &ready_rels {
+            self.index
+                .borrow_mut()
+                .reset_vector_rel_for_refill(*token, *prop_key);
+        }
+        // Arm the per-entity fault signal (`rmp` task #733) BEFORE the re-fill, exactly as every sibling
+        // build driver does. `index_one_*_vector` raises this when it cannot read an entity's labels or
+        // property chain, and an entity missing from the graph is a candidate a k-NN can never
+        // resurrect. Without this bracket the driver published a silently INCOMPLETE index as fully
+        // repaired — the same wrong-answer-with-no-signal the whole task exists to remove, re-entering
+        // through the repair door.
+        self.index.borrow_mut().clear_rebuild_gap();
+
+        // Re-fill from a fresh scan. `index_one_*_vector` re-runs the same conflict gate, so a writer
+        // that opened in the meantime simply re-records itself and the index stays on the exact scan.
+        if !ready_nodes.is_empty() {
+            // Bind the scan result BEFORE matching: a `self.store.borrow_mut()` temporary inside the
+            // match scrutinee stays alive for the whole match, and `index_one_node_vector` borrows the
+            // same cell — which panicked "RefCell already borrowed" the first time this ran.
+            let scanned = self.store.borrow_mut().scan_node_ids();
+            match scanned {
+                Ok(ids) => {
+                    for id in ids {
+                        Self::index_one_node_vector(&self.store, &self.index, id, &ready_nodes);
+                    }
+                }
+                Err(_) => {
+                    // The scan faulted: the graph is now WIPED and only partially re-filled, which is
+                    // exactly the state that must never be served. Re-record every writer we cleared so
+                    // the index keeps declining to the exact scan until a later attempt succeeds.
+                    for (token, prop_key) in &ready_nodes {
+                        self.index.borrow_mut().note_vector_build_conflict(
+                            *token,
+                            *prop_key,
+                            REFILL_FAULT_BLOCKER,
+                        );
+                    }
+                }
+            }
+        }
+        if !ready_rels.is_empty() {
+            // Same borrow discipline as the node arm above.
+            let scanned = self.store.borrow().scan_rel_ids();
+            match scanned {
+                Ok(ids) => {
+                    for id in ids {
+                        Self::index_one_rel_vector(&self.store, &self.index, id, &ready_rels);
+                    }
+                }
+                Err(_) => {
+                    for (token, prop_key) in &ready_rels {
+                        self.index.borrow_mut().note_vector_rel_build_conflict(
+                            *token,
+                            *prop_key,
+                            REFILL_FAULT_BLOCKER,
+                        );
+                    }
+                }
+            }
+        }
+
+        // A per-entity read fault during the re-fill is treated EXACTLY as a whole-scan fault: the graph
+        // is now wiped and only partially re-filled, so re-record a synthetic blocker on every index we
+        // touched and keep serving the exact scan until a later attempt succeeds.
+        if self.index.borrow().rebuild_gap() {
+            self.index.borrow_mut().clear_rebuild_gap();
+            for (token, prop_key) in &ready_nodes {
+                self.index.borrow_mut().note_vector_build_conflict(
+                    *token,
+                    *prop_key,
+                    REFILL_FAULT_BLOCKER,
+                );
+            }
+            for (token, prop_key) in &ready_rels {
+                self.index.borrow_mut().note_vector_rel_build_conflict(
+                    *token,
+                    *prop_key,
+                    REFILL_FAULT_BLOCKER,
+                );
+            }
+        }
+
+        // Did every attempted index come back clean?
+        let repaired = ready_nodes
+            .iter()
+            .all(|&(t, p)| self.index.borrow().vector_blockers(t, p).is_empty())
+            && ready_rels
+                .iter()
+                .all(|&(t, p)| self.index.borrow().vector_rel_blockers(t, p).is_empty());
+        if repaired {
+            self.vector_conflict_retry_backoff = (self.vector_conflict_retry_backoff / 2).max(1);
+            self.vector_conflict_retry_skip = 0;
+        } else {
+            self.vector_conflict_retry_backoff = self
+                .vector_conflict_retry_backoff
+                .saturating_mul(2)
+                .min(MAX_DEGRADED_RETRY_BACKOFF);
+            self.vector_conflict_retry_skip = self.vector_conflict_retry_backoff;
+        }
+        true
+    }
+
     /// Re-drives every full-text build that `rmp` task #778 parked, once the in-flight writers that
     /// blocked it have resolved. Returns whether anything was re-driven.
     ///
@@ -7931,6 +8256,11 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // threaded engine only from the idle tick, whose gate does not count parked builds (`rmp` #763).
         // A paused index is `Populating`, so it is correct-but-unaccelerated until this fires.
         let _resumed = self.retry_conflicted_fulltext_builds();
+        // Re-fill any VECTOR index whose build skipped an entity under an uncommitted writer, once every
+        // recorded writer has resolved (`rmp` task #780). Sited here for the same reason: while blocked,
+        // the index serves a correct but O(entities x dim) exact scan, so the repair must not wait for an
+        // idle tick that a loaded engine may never reach.
+        let _refilled = self.retry_conflicted_vector_builds();
         // Drive a node-property build first if one is pending; then a full-text build; then a spatial
         // build. Processing one queue per call keeps the per-call work bounded by `budget` for any kind.
         if !self.pending_builds.is_empty() {

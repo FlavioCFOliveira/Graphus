@@ -79,6 +79,7 @@ use graphus_core::{Timestamp, TxnId, Value};
 use graphus_index::histogram::PropertyHistogram;
 use graphus_index::keycodec::{encode_equality_canonical, encode_single};
 use graphus_index::kinds::DEFAULT_HISTOGRAM_BUCKETS;
+use graphus_index::similarity_score;
 use graphus_io::BlockDevice;
 use graphus_storage::{ConstraintKind, IndexState, MvccHeader, Namespace, RecordStore};
 use graphus_txn::{
@@ -3582,6 +3583,122 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         };
         prop.key == prop_key && self.visible(prop.mvcc)
     }
+
+    /// `rmp` task #780 — OVER-FETCH. `k` hits from the graph become FEWER than `k` rows once the
+    /// caller drops the candidates this snapshot cannot see, which silently under-filled `k`
+    /// (`rmp` #795). Ask for more so the filter has slack.
+    ///
+    /// The factor is 2, measured rather than picked: over-fetch saturates, with k'=4k buying nothing
+    /// over k'=2k on a 20 000-entity corpus, because past a point the binding constraint is
+    /// `ef_search`, not k'. And it is FREE up to `DEFAULT_EF_SEARCH`: `query_knn` searches the base
+    /// layer with `ef_search.max(k')`, so any k' <= 100 traverses exactly the same graph and simply
+    /// keeps more of what the search already materialised.
+    ///
+    /// HONEST RESIDUAL, stated here rather than implied away: this does NOT guarantee `k` rows. If
+    /// more than `k` of the 2k candidates are filtered, the result is still short. A guarantee needs
+    /// a resumable scan with a budget cap — the shape pgvector adopted in 0.8.0 (iterative index
+    /// scans + `hnsw.max_scan_tuples`) precisely because no fixed multiplier is sound. Deliberately
+    /// not built here: it is a query-surface change, and this task's mandate is the correctness hole.
+    #[must_use]
+    fn vector_over_fetch(k: usize) -> usize {
+        k.saturating_mul(2).max(k)
+    }
+
+    /// The **exact** brute-force k-NN over every snapshot-visible embedding of `label_token`
+    /// (`rmp` task #780) — the fallback a blocked vector index declines to.
+    ///
+    /// This is the "decline to the scan" contract every other index kind already has, and the argument
+    /// that vector could not have one does not survive inspection. It rested on "an HNSW is approximate,
+    /// so a brute-force re-rank would return a *different* neighbour set" — true, but the difference is
+    /// that the scan is **exact**. Returning the true top-k where the index would have returned an
+    /// approximation is not a divergence to be avoided; and `vector.similarity.cosine` already computes
+    /// scores with the very same [`graphus_index::similarity_score`] the HNSW uses, so the two paths are
+    /// identical in scale and directly comparable.
+    ///
+    /// Cost is `O(covered entities x dim)`, which is real: measured single-threaded at 9.5 ms for 10 000
+    /// entities at dim 384 and 959 ms at 1 000 000. It is paid only while a conflicting writer is
+    /// unresolved, and it buys a correct answer where the alternative was a wrong one.
+    fn vector_scan_fallback(
+        &self,
+        label_token: u32,
+        property: &str,
+        similarity: graphus_index::Similarity,
+        dim: usize,
+        query: &[f32],
+        k: usize,
+    ) -> Vec<(u64, f32)> {
+        let all_ids = match self.store.borrow().scan_node_ids() {
+            Ok(ids) => ids,
+            Err(e) => {
+                self.capture(e);
+                return Vec::new();
+            }
+        };
+        // Same shared per-candidate label + visibility re-check the index path's caller applies, so the
+        // two paths agree on membership and register identical SIREAD markers.
+        let labelled = self.filter_label_candidates(label_token, all_ids);
+        let mut scored: Vec<(u64, f32)> = Vec::new();
+        for node in labelled {
+            let Some(value) = self.node_property(node, property) else {
+                continue;
+            };
+            // The SAME shape validation the write path applies, so the scan's membership matches the
+            // index's exactly: a malformed / wrong-dimension / non-finite embedding is not a member.
+            let Some(embedding) = crate::index_set::extract_embedding(&value, dim) else {
+                continue;
+            };
+            scored.push((node.0, similarity_score(similarity, &embedding, query)));
+        }
+        // Descending score, ascending id tie-break — the same total order the procedure imposes, so a
+        // tie resolves identically whichever path served it.
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        scored.truncate(k);
+        scored
+    }
+
+    /// The **relationship** twin of [`vector_scan_fallback`](Self::vector_scan_fallback)
+    /// (`rmp` task #780): the exact brute-force k-NN over every snapshot-visible embedding of
+    /// relationships of `type_token`.
+    fn vector_rel_scan_fallback(
+        &self,
+        rel_type: &str,
+        property: &str,
+        similarity: graphus_index::Similarity,
+        dim: usize,
+        query: &[f32],
+        k: usize,
+    ) -> Vec<(u64, f32)> {
+        let all_ids = match self.store.borrow().scan_rel_ids() {
+            Ok(ids) => ids,
+            Err(e) => {
+                self.capture(e);
+                return Vec::new();
+            }
+        };
+        let mut scored: Vec<(u64, f32)> = Vec::new();
+        for id in all_ids {
+            let rel = RelId(id);
+            // Visible + of the covered type? `rel_data` returns `None` for a relationship this snapshot
+            // cannot see, and SIREAD-marks the one it examined — the same per-candidate re-check the
+            // full-text relationship fallback uses, so membership and markers match the index path.
+            let Some(data) = self.rel_data(rel) else {
+                continue;
+            };
+            if data.rel_type != rel_type {
+                continue;
+            }
+            let Some(value) = self.rel_property(rel, property) else {
+                continue;
+            };
+            let Some(embedding) = crate::index_set::extract_embedding(&value, dim) else {
+                continue;
+            };
+            scored.push((rel.0, similarity_score(similarity, &embedding, query)));
+        }
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        scored.truncate(k);
+        scored
+    }
 }
 
 /// The live seam routes the shared lifted read body's markers / errors to its **existing** channels
@@ -4748,13 +4865,57 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     /// derived [`IndexSet`], and returns candidate `(id, score)` hits the procedure re-checks against
     /// this reader's MVCC snapshot + RBAC.
     ///
-    /// The HNSW reflects the **latest committed** graph state (it is maintained on every write, like
-    /// the full-text inverted index), so a returned candidate is re-checked by the procedure for
-    /// snapshot visibility, current covered label and current valid embedding — dropping any false
-    /// positive. Unlike the full-text query there is no exact scan fallback for a snapshot that
-    /// predates a concurrent vector mutation (an HNSW is an *approximate* structure — a brute-force
-    /// re-rank would diverge from it), so a stale reader may miss a since-mutated near neighbour; for
-    /// an auto-commit read (snapshot == latest committed) this cannot arise.
+    /// # The actual contract (corrected by `rmp` task #780; the previous text was false)
+    ///
+    /// This comment used to claim the HNSW "reflects the latest committed graph state" and that a wrong
+    /// answer "cannot arise" for an auto-commit read. Both were **measured false**, node and
+    /// relationship, on the production `CREATE VECTOR INDEX` route driven online and reachable over the
+    /// wire from a single sequential client:
+    ///
+    /// * The **create-after-write route** the old text did not cover. The build collapses the property
+    ///   chain newest-wins with no MVCC filter, so a build running while an active writer holds the
+    ///   newest covered embedding baked that UNCOMMITTED vector and indexed the committed one nowhere
+    ///   (the `rmp` #766 loss). A *fresh* auto-commit reader's k=1 then returned the wrong node, and the
+    ///   wrong answer SURVIVED the writer's rollback for the life of the process (the graph is
+    ///   ephemeral, so only a reopen healed it).
+    /// * The **score channel**, which is a dirty read rather than a recall artifact: `score` came from
+    ///   the vector in the graph, which need not be the vector this snapshot sees. That is observable
+    ///   with no #766 conflict at all — a reader on an older snapshot already gets scores from a newer
+    ///   *committed* vector.
+    ///
+    /// Both are now closed. The build records the blocking writers per index
+    /// ([`IndexSet::note_vector_build_conflict`](crate::index_set::IndexSet::note_vector_build_conflict))
+    /// and this seam declines a blocked index to an **exact brute-force k-NN** over snapshot-visible
+    /// embeddings ([`vector_scan_fallback`](Self::vector_scan_fallback)). That fallback is not a
+    /// degraded approximation: it shares `graphus_index::similarity_score` with both the HNSW and the
+    /// Cypher `vector.similarity.*` functions, so it is *exact* where the index is approximate. The
+    /// caller additionally re-scores every survivor from its own visible embedding, so no score crosses
+    /// the snapshot boundary.
+    ///
+    /// What remains true: the hits are a **candidate set**. The procedure re-checks each for snapshot
+    /// visibility, current covered label and a currently-valid embedding, dropping false positives.
+    ///
+    /// # KNOWN UNCOVERED WINDOW — write-after-index (`rmp` #794), stated rather than implied away
+    ///
+    /// The gate above covers the **create-after-write** route: a BUILD running while a writer is open.
+    /// It does NOT cover the converse, where the index already exists and a writer then mutates a
+    /// covered embedding. That write goes through `reindex_node` -> `IndexSet::insert_vector_value`,
+    /// which maintains the live graph eagerly, so an ACTIVE writer's uncommitted embedding is baked
+    /// directly and no blocker is recorded (blockers are a build-time signal).
+    ///
+    /// MEASURED, on this code, with 200 decoy embeddings between the query and the dirty vector: a
+    /// fresh reader's `k = 1` returned `d0` at 0.978 where the committed truth is `x` at 1.0. The
+    /// re-score keeps the SCORE honest and the over-fetch narrows the window, but neither can help once
+    /// the dirty vector pushes the entity outside the candidate set entirely — a k-NN can drop a
+    /// candidate, never resurrect one.
+    ///
+    /// This is **pre-existing**, not introduced here, and it is precisely the window the `rmp` #467
+    /// freshness marker exists to close for full-text/spatial. Vector already RAISES that marker on
+    /// every write (`insert_vector_value` sets `ft_spatial_dirty`) but never READS it — so the marker
+    /// would already decline this exact case if consulted. Consulting it is a one-line change with a
+    /// large behavioural consequence (any in-flight write to a covered property would send every vector
+    /// read to the exact scan, measured 17-31x the index path), so it is a **design call for the owner**
+    /// under `rmp` #794 rather than something to take unilaterally here.
     fn vector_query_nodes(&self, name: &str, query: &[f32], k: usize) -> VectorQueryResult {
         // Only the coordinated path carries the derived `IndexSet` that holds the HNSW graph.
         let Some(index) = self.index.as_ref() else {
@@ -4813,14 +4974,45 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
 
         // SSI predicate footprint: a vector k-NN's result depends on the covered-label embeddings, so
         // register the same blanket live-node read footprint the seek / full-text procedure paths use
-        // (`04 §5.4`), keeping the query indistinguishable to SSI from a covering scan.
+        // (`04 §5.4`), keeping the query indistinguishable to SSI from a covering scan. Marked once,
+        // before the trust branch, so the index path and the scan fallback are indistinguishable to SSI
+        // (the fallback's own `scan_node_ids` adds no marker the fast path lacks).
         self.mark_all_live_nodes();
+
+        let similarity = crate::coordinator::similarity_from_storage(entry.similarity);
+        let over_fetch = Self::vector_over_fetch(k);
+
+        // `rmp` task #780 — the trust gate. A non-empty blocker list means this graph's build skipped at
+        // least one entity whose newest covered embedding belonged to a still-active writer, so the
+        // graph is INCOMPLETE in a way a k-NN can never repair (it can drop a candidate, never
+        // resurrect one). Decline to the exact scan, which reads this snapshot's own visible values.
+        if !index
+            .borrow()
+            .vector_blockers(entry.token, entry.property_token)
+            .is_empty()
+        {
+            let hits = self.vector_scan_fallback(
+                entry.token,
+                &property,
+                similarity,
+                entry.dimensions as usize,
+                query,
+                over_fetch,
+            );
+            return VectorQueryResult::Hits {
+                label_or_type,
+                property,
+                dimensions: entry.dimensions as usize,
+                similarity,
+                hits,
+            };
+        }
 
         match index.borrow().seek_vector_knn(
             entry.token,
             entry.property_token,
             query,
-            k,
+            over_fetch,
             graphus_index::DEFAULT_EF_SEARCH,
         ) {
             // Declared durably but absent from the derived index — treat as no such index.
@@ -4829,6 +5021,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 label_or_type,
                 property,
                 dimensions: entry.dimensions as usize,
+                similarity,
                 hits,
             },
             // Defensive: we already dimension-checked, so this is unreachable in practice.
@@ -4885,14 +5078,42 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             return VectorQueryResult::NotOnline;
         }
 
-        // SSI footprint: mirror the relationship seek / full-text procedure blanket marking.
+        // SSI footprint: mirror the relationship seek / full-text procedure blanket marking. Marked
+        // before the trust branch so the index path and the scan fallback are SSI-indistinguishable.
         self.mark_all_live_rels();
+
+        let similarity = crate::coordinator::similarity_from_storage(entry.similarity);
+        let over_fetch = Self::vector_over_fetch(k);
+
+        // `rmp` task #780 — the relationship twin of the node trust gate; see
+        // [`vector_query_nodes`](Self::vector_query_nodes) for the full rationale.
+        if !index
+            .borrow()
+            .vector_rel_blockers(entry.token, entry.property_token)
+            .is_empty()
+        {
+            let hits = self.vector_rel_scan_fallback(
+                &label_or_type,
+                &property,
+                similarity,
+                entry.dimensions as usize,
+                query,
+                over_fetch,
+            );
+            return VectorQueryResult::Hits {
+                label_or_type,
+                property,
+                dimensions: entry.dimensions as usize,
+                similarity,
+                hits,
+            };
+        }
 
         match index.borrow().seek_vector_rel_knn(
             entry.token,
             entry.property_token,
             query,
-            k,
+            over_fetch,
             graphus_index::DEFAULT_EF_SEARCH,
         ) {
             None => VectorQueryResult::NoSuchIndex,
@@ -4900,6 +5121,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 label_or_type,
                 property,
                 dimensions: entry.dimensions as usize,
+                similarity,
                 hits,
             },
             Some(Err(graphus_index::VectorIndexError::DimensionMismatch { expected, got })) => {

@@ -16,6 +16,17 @@
 //! **verbatim** — [`super::dispatch_command`] → [`super::exec::handle_run`] → the coordinator — so the
 //! simulator exercises the *same* code paths the server does, not a parallel re-implementation.
 //!
+//! ## The "verbatim" claim covers DISPATCH, not the post-command maintenance
+//!
+//! Command dispatch is shared code and so cannot drift. The **maintenance** each driver runs after a
+//! command is not: the threaded loop calls [`super::drive_index_build`], this one calls
+//! [`LocalEngine::drain_index_builds`], and the two are separate functions that must be kept in step
+//! by hand. They have drifted before — `rmp` #780 found this driver reaching only the build *queues*
+//! and never the index-set **conflict repairs**, so a vector index blocked by an uncommitted writer
+//! was repaired in production and stayed degraded forever in simulation. When adding maintenance to
+//! either driver, add it to both, and prefer routing it through
+//! [`TxnCoordinator::advance_index_builds`], which both already call.
+//!
 //! ## How it stays single-threaded
 //!
 //! `handle_run` streams result rows into a **bounded** egress channel and relies on a *concurrent*
@@ -227,8 +238,29 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             // inside it: a build that failed again would be re-enqueued within the `while` below and the
             // loop would never terminate.
             let _resurrected = coord.retry_poisoned_index_builds();
-            while coord.has_pending_index_builds() {
+            // Drive at least ONE pass, even with nothing queued (`rmp` task #780).
+            //
+            // `advance_index_builds` is not only a build pump: its prologue also runs the repair
+            // drivers for the conflict gates — `retry_conflicted_fulltext_builds` (`rmp` #778) and
+            // `retry_conflicted_vector_builds` (`rmp` #780). Those repairs are NOT counted by
+            // `has_pending_index_builds`, so the previous `while`-only shape never reached them when no
+            // build happened to be queued: a vector index blocked by an uncommitted writer stayed on
+            // the exact brute-force scan **forever** on this driver, where the threaded engine (whose
+            // `drive_index_build` runs unconditionally after every command) repairs it. MEASURED before
+            // this change: gate fires, writer rolls back, 400 further commands — still blocked.
+            //
+            // TERMINATION (the reason this is a do-while and NOT a widened `has_pending_index_builds`):
+            // the loop's exit condition is untouched, so it still depends *only* on the build queues,
+            // which strictly shrink. Folding the conflict gates into that predicate instead would spin
+            // this loop — and the threaded engine's — at 100% CPU for as long as a blocking writer
+            // stayed open, since no amount of pumping can resolve another transaction. That is the same
+            // trap `indexes_degraded` is deliberately kept out of the predicate for, and it is why the
+            // repair is reached by an extra bounded PASS rather than by a wider condition.
+            loop {
                 coord.advance_index_builds(LOCAL_INDEX_BUILD_BUDGET);
+                if !coord.has_pending_index_builds() {
+                    break;
+                }
             }
             let _healed = coord.retry_degraded_index_rebuild();
         }
@@ -504,6 +536,198 @@ fn gone() -> GraphusError {
 mod tests {
     use super::*;
     use graphus_sim::SimClock;
+
+    /// `rmp` #780 / #778: the inline driver must reach the index-set CONFLICT REPAIRS, not only the
+    /// build queues.
+    ///
+    /// `advance_index_builds`'s prologue runs `retry_conflicted_vector_builds` and
+    /// `retry_conflicted_fulltext_builds`, and neither is counted by `has_pending_index_builds`. The
+    /// previous `while has_pending_index_builds()`-only shape therefore never reached them when no
+    /// build happened to be queued, so a vector index blocked by an uncommitted writer stayed on the
+    /// exact O(entities x dim) brute-force scan **for the life of the process** here — while the
+    /// threaded engine, whose `drive_index_build` runs unconditionally after every command, repaired
+    /// it. That divergence matters: this driver is what every DST / VOPR scenario runs, and this
+    /// module's header claims it reuses the production dispatch path verbatim.
+    ///
+    /// FAILS when `drain_index_builds` is reverted to the `while`-only shape (verified).
+    #[test]
+    fn the_inline_driver_repairs_a_vector_index_blocked_by_an_uncommitted_writer() {
+        let mut eng = engine(sim_clock(0));
+        for stmt in [
+            "CREATE (:Doc {name: 'x', embedding: [1.0, 0.0, 0.0]})",
+            "CREATE (:Doc {name: 'y', embedding: [0.0, 1.0, 0.0]})",
+        ] {
+            let tx = eng.begin_auto_commit(AccessMode::Write).expect("begin");
+            let mut reply = eng.run(tx, stmt, vec![], true, None).expect("seed");
+            let _ = drain(&mut reply);
+        }
+
+        // An explicit transaction writes the covered embedding and STAYS OPEN — a detached REST/Bolt
+        // transaction is enough, no concurrency required.
+        let w = eng.begin(AccessMode::Write).expect("begin explicit");
+        let mut reply = eng
+            .run(
+                w,
+                "MATCH (n:Doc {name: 'x'}) SET n.embedding = [0.0, 0.0, 1.0]",
+                vec![],
+                false,
+                None,
+            )
+            .expect("dirty write");
+        let _ = drain(&mut reply);
+
+        // The production build route, driven while that writer is open.
+        eng.index_ddl(IndexCommand::CreateVectorIndex {
+            name: Some("doc_vec".to_owned()),
+            entity: graphus_storage::VectorEntity::Node,
+            label_or_type: "Doc".to_owned(),
+            property: "embedding".to_owned(),
+            dimensions: 3,
+            similarity: graphus_storage::VectorSimilarity::Cosine,
+            m: 16,
+            ef_construction: 200,
+            if_not_exists: false,
+        })
+        .expect("create vector index");
+
+        // Non-vacuity: the gate really fired, so there is a degradation for the repair to undo.
+        assert_eq!(
+            eng.coordinator
+                .as_ref()
+                .expect("coordinator")
+                .blocked_vector_indexes(),
+            1,
+            "vacuous: the #780 build gate did not block the index inline, so this test proves \
+             nothing about the repair reaching this driver",
+        );
+
+        eng.rollback(w).expect("writer rolls back");
+
+        // One ordinary command afterwards — nothing is queued, which is exactly the case the
+        // `while`-only drain could not reach.
+        let tx = eng.begin_auto_commit(AccessMode::Write).expect("begin");
+        let mut reply = eng
+            .run(tx, "CREATE (:Other {i: 1})", vec![], true, None)
+            .expect("ordinary command");
+        let _ = drain(&mut reply);
+
+        assert_eq!(
+            eng.coordinator
+                .as_ref()
+                .expect("coordinator")
+                .blocked_vector_indexes(),
+            0,
+            "the inline driver must reach the #780 re-fill: after the blocking writer resolved and a \
+             further command ran, the index must be back on the ANN fast path. Still blocked means \
+             this driver — the one every DST / VOPR scenario runs — diverges from the threaded \
+             engine, which repairs it",
+        );
+    }
+
+    /// The other half of the `rmp` #780 drain change: it must TERMINATE while the blocking writer is
+    /// still open.
+    ///
+    /// This is the test for the fix that was NOT made. Reaching the repair by folding the conflict
+    /// gates into `has_pending_index_builds` would have been the obvious change and a far worse bug:
+    /// `drain_index_builds` SPINS on that predicate with an unbounded budget, and no amount of pumping
+    /// can resolve somebody else's transaction — so a single long-running open writer would have hung
+    /// this driver (and the threaded engine's equivalent loop) at 100% CPU. The repair is therefore
+    /// reached by an extra bounded PASS, leaving the loop's exit condition untouched.
+    ///
+    /// If the predicate is ever widened, this test hangs rather than failing — which is the honest
+    /// signal, since a hang is exactly the regression it guards.
+    #[test]
+    fn the_inline_drain_terminates_while_a_blocking_writer_is_still_open() {
+        let mut eng = engine(sim_clock(0));
+        let tx = eng.begin_auto_commit(AccessMode::Write).expect("begin");
+        let mut reply = eng
+            .run(
+                tx,
+                "CREATE (:Doc {name: 'x', embedding: [1.0, 0.0, 0.0]})",
+                vec![],
+                true,
+                None,
+            )
+            .expect("seed");
+        let _ = drain(&mut reply);
+
+        // The writer opens and STAYS open for the rest of the test.
+        let w = eng.begin(AccessMode::Write).expect("begin explicit");
+        let mut reply = eng
+            .run(
+                w,
+                "MATCH (n:Doc {name: 'x'}) SET n.embedding = [0.0, 0.0, 1.0]",
+                vec![],
+                false,
+                None,
+            )
+            .expect("dirty write");
+        let _ = drain(&mut reply);
+
+        eng.index_ddl(IndexCommand::CreateVectorIndex {
+            name: Some("doc_vec".to_owned()),
+            entity: graphus_storage::VectorEntity::Node,
+            label_or_type: "Doc".to_owned(),
+            property: "embedding".to_owned(),
+            dimensions: 3,
+            similarity: graphus_storage::VectorSimilarity::Cosine,
+            m: 16,
+            ef_construction: 200,
+            if_not_exists: false,
+        })
+        .expect("create vector index");
+        assert_eq!(
+            eng.coordinator
+                .as_ref()
+                .expect("coordinator")
+                .blocked_vector_indexes(),
+            1,
+            "vacuous: nothing is blocked, so there is no unresolvable condition to spin on",
+        );
+
+        // Every one of these drives `drain_index_builds` with the blocker UNRESOLVABLE. Each must
+        // return.
+        for i in 0..25 {
+            let tx = eng.begin_auto_commit(AccessMode::Write).expect("begin");
+            let mut reply = eng
+                .run(
+                    tx,
+                    format!("CREATE (:Other {{i: {i}}})"),
+                    vec![],
+                    true,
+                    None,
+                )
+                .expect("ordinary command");
+            let _ = drain(&mut reply);
+        }
+
+        // Still blocked — correctly so: the writer may yet commit, so its embedding is not settled.
+        // Correct-but-slow is the intended state here; the point is that the engine kept running.
+        assert_eq!(
+            eng.coordinator
+                .as_ref()
+                .expect("coordinator")
+                .blocked_vector_indexes(),
+            1,
+            "an unresolved writer must keep the index on the exact scan (never bake a dirty vector)",
+        );
+        // And it repairs the moment the writer resolves, proving the drain was idle-waiting rather
+        // than wedged.
+        eng.rollback(w).expect("writer rolls back");
+        let tx = eng.begin_auto_commit(AccessMode::Write).expect("begin");
+        let mut reply = eng
+            .run(tx, "CREATE (:Other {i: 99})", vec![], true, None)
+            .expect("ordinary command");
+        let _ = drain(&mut reply);
+        assert_eq!(
+            eng.coordinator
+                .as_ref()
+                .expect("coordinator")
+                .blocked_vector_indexes(),
+            0,
+            "once the writer resolved, the very next command must repair the index",
+        );
+    }
 
     /// A `Clock` whose ticks the test controls; wrapping a `SimClock` in an `Arc` lets the engine
     /// read it while the test holds the same value (the engine only reads `now_nanos`).

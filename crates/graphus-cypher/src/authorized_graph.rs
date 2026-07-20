@@ -817,17 +817,20 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         // A vector k-NN is a read path (`rmp` task #671): filter the candidate hits exactly like a
         // scan, so an RBAC-invisible node never reaches the result. The procedure body additionally
         // re-checks each surviving candidate's current label + embedding through this same decorator,
-        // so the filters compose (visibility + label + value + RBAC). Scores are preserved verbatim.
+        // so the filters compose (visibility + label + value + RBAC). Scores pass through untouched here and
+        // are re-scored by the procedure against each survivor's snapshot-visible embedding (`rmp` #780).
         match result {
             VectorQueryResult::Hits {
                 label_or_type,
                 property,
                 dimensions,
+                similarity,
                 hits,
             } => VectorQueryResult::Hits {
                 label_or_type,
                 property,
                 dimensions,
+                similarity,
                 hits: hits
                     .into_iter()
                     .filter(|&(id, _)| self.node_visible(NodeId(id)))
@@ -850,11 +853,13 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
                 label_or_type,
                 property,
                 dimensions,
+                similarity,
                 hits,
             } => VectorQueryResult::Hits {
                 label_or_type,
                 property,
                 dimensions,
+                similarity,
                 hits: hits
                     .into_iter()
                     .filter(|&(id, _)| self.rel_visible(RelId(id)))

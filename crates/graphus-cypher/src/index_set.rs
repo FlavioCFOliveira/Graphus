@@ -371,6 +371,16 @@ pub struct IndexSet {
     /// Cleared by [`clear`](Self::clear) (a fresh rebuild starts clean) and by
     /// [`clear_rebuild_gap`](Self::clear_rebuild_gap).
     rebuild_gap: bool,
+    /// How many times a VECTOR index has **entered** the blocked (exact-brute-force-scan) state over
+    /// this set's life (`rmp` task #780) — monotonic, counted on the empty→non-empty blocker-list edge
+    /// so one build blocked by five writers is one event, not five.
+    ///
+    /// This exists for the same reason [`fail_closed_events`](Self#structfield.fail_closed_events)
+    /// does, and the #733 comment there states it best: a silent degradation is indistinguishable from
+    /// a healthy-but-slow engine. A blocked vector index keeps reporting `ONLINE` while every k-NN it
+    /// serves costs `O(covered entities x dim)` instead of an ANN descent, so the transition has to be
+    /// observable. The server samples this to log the entry at `WARN` and drive a counter.
+    vector_conflict_events: u64,
     /// Whether the build currently filling a **single-value-per-entity** index (full-text — and, by
     /// #779/#780, spatial/vector) observed that an **in-flight** transaction holds the NEWEST version of
     /// a covered property on some entity it visited (`rmp` task #778). Unlike [`rebuild_gap`], which
@@ -643,6 +653,21 @@ struct VectorEntry {
     state: IndexState,
     /// The backing in-memory HNSW approximate-nearest-neighbour graph over the covered embedding.
     index: VectorIndex,
+    /// The still-unresolved transactions whose **uncommitted** embedding this graph's build had to
+    /// skip (`rmp` task #780). Non-empty means the graph is **not trustworthy** for reads: the build
+    /// collapsed the property chain newest-wins, and for these entities the newest version belonged to
+    /// an active writer, so baking it would have indexed an uncommitted embedding and left the
+    /// committed one indexed nowhere (the `rmp` #766 loss). While non-empty, every k-NN declines to the
+    /// **exact brute-force scan** over snapshot-visible embeddings — vector is the one kind with no
+    /// approximate fallback, and the exact scan is strictly MORE correct than the index path it
+    /// replaces (it shares `graphus_index::similarity_score` with both the HNSW and the Cypher
+    /// `vector.similarity.*` functions, so the scores are identical in scale).
+    ///
+    /// Cleared only by a successful conflict-free re-fill
+    /// (`TxnCoordinator::retry_conflicted_vector_builds`), never by the writers merely resolving: the
+    /// skipped entity is *missing* from the graph, and a k-NN can drop a candidate but never resurrect
+    /// one, so resolution alone does not repair it.
+    conflict_blockers: Vec<TxnId>,
 }
 
 /// Extracts a dense `f32` embedding of exactly `dim` elements from `value` (`rmp` task #669).
@@ -654,7 +679,7 @@ struct VectorEntry {
 /// path. Rejecting non-finite values matches Neo4j (a vector with `NaN`/`Inf` is not a valid embedding)
 /// and keeps the HNSW distance order well-defined (a `NaN` distance would otherwise rank first under the
 /// `total_cmp` result ordering; `rmp` #669 storage-audit follow-up).
-fn extract_embedding(value: &Value, dim: usize) -> Option<Vec<f32>> {
+pub(crate) fn extract_embedding(value: &Value, dim: usize) -> Option<Vec<f32>> {
     let Value::List(items) = value else {
         return None;
     };
@@ -734,6 +759,7 @@ impl IndexSet {
             // failed rebuild makes it untrustworthy (`rmp` task #733).
             labels_usable: true,
             rebuild_gap: false,
+            vector_conflict_events: 0,
             ft_build_conflict_writers: Vec::new(),
             ft_demoted_blockers: Vec::new(),
             pending_resamples: VecDeque::new(),
@@ -1244,11 +1270,21 @@ impl IndexSet {
         // Vector (HNSW) indexes: clear the ANN graph entries but keep the registration + state + build
         // parameters (`rmp` task #669), exactly like the spatial / text index. `VectorIndex::clear`
         // preserves the configured dimension / similarity / m / ef_construction.
+        //
+        // The per-index build blockers go WITH the entries (`rmp` task #780), for exactly the reason
+        // `ft_demoted_blockers` above states: the caller is about to re-derive this graph from a fresh
+        // store scan, and that scan re-records whatever conflicts are *currently* real. A blocker
+        // carried across it names a transaction that pass never saw, so it strands the index on the
+        // exact brute-force scan — and costs a redundant O(store) wipe + re-fill on the next drain to
+        // undo. Missing this was a #780 audit finding: `register_vector`'s `and_modify` preserves the
+        // blockers too, so `clear` is the only place that can drop them.
         for v in self.vector.values_mut() {
             v.index.clear();
+            v.conflict_blockers.clear();
         }
         for v in self.vector_rel.values_mut() {
             v.index.clear();
+            v.conflict_blockers.clear();
         }
         // Composite indexes (`rmp` task #100): recreate each backing tree to drop its entries while
         // keeping the registered `(label_token, property_tokens)` set, exactly like the property indexes.
@@ -3458,6 +3494,7 @@ impl IndexSet {
                 state,
                 index: VectorIndex::new(dim, similarity, m, ef_construction, seed)
                     .expect("INVARIANT: vector dimension validated > 0 at create + decode"),
+                conflict_blockers: Vec::new(),
             });
     }
 
@@ -3486,6 +3523,141 @@ impl IndexSet {
     #[must_use]
     pub fn vector_state(&self, label_token: u32, prop_key: u32) -> Option<IndexState> {
         self.vector.get(&(label_token, prop_key)).map(|v| v.state)
+    }
+
+    // ---- Build-conflict tracking (`rmp` task #780) ------------------------------------------------
+    //
+    // These eight methods are the whole mechanism. They are deliberately NOT the `rmp` #778 full-text
+    // machinery (`ft_build_conflict_writers` / `ft_demoted_blockers` / `conflicted_fulltext_builds`):
+    // that machinery parks a CHUNKED build driven by `advance_fulltext_build` and resumes it from a
+    // fresh snapshot, whereas a vector build is a SYNCHRONOUS single pass inside the `CREATE` call
+    // (`TxnCoordinator::begin_online_vector_index_named`). There is no chunk to park and no pending
+    // build to re-enqueue, so bending #778's shape onto it would have carried its whole two-slot
+    // drain/park protocol for a build that never yields. The state here is per-index instead of shared,
+    // which also keeps one conflicted index from making an unrelated one decline.
+
+    /// Records that the build of the `(label_token, prop_key)` node vector index had to skip an entity
+    /// because the still-active transaction `writer` held the newest version of its covered embedding
+    /// (`rmp` task #780). Idempotent per writer. A no-op if no such index is registered.
+    pub fn note_vector_build_conflict(&mut self, label_token: u32, prop_key: u32, writer: TxnId) {
+        if let Some(v) = self.vector.get_mut(&(label_token, prop_key))
+            && !v.conflict_blockers.contains(&writer)
+        {
+            // The empty→non-empty EDGE is the observable event (`rmp` task #780): this index just left
+            // the ANN fast path for the exact scan. Counted here rather than per writer so one build
+            // blocked by five transactions reports one degradation, not five.
+            let entering = v.conflict_blockers.is_empty();
+            v.conflict_blockers.push(writer);
+            if entering {
+                self.vector_conflict_events += 1;
+            }
+        }
+    }
+
+    /// The unresolved writers blocking the `(label_token, prop_key)` node vector index (`rmp` #780).
+    /// A non-empty slice means a reader MUST decline this index and take the exact scan instead.
+    #[must_use]
+    pub fn vector_blockers(&self, label_token: u32, prop_key: u32) -> &[TxnId] {
+        self.vector
+            .get(&(label_token, prop_key))
+            .map_or(&[], |v| v.conflict_blockers.as_slice())
+    }
+
+    /// Clears the node vector index's recorded blockers and **wipes its HNSW graph** so a caller can
+    /// re-fill it from scratch (`rmp` task #780). Both happen together on purpose: clearing the
+    /// blockers without wiping would re-publish a graph that is still missing every skipped entity.
+    pub fn reset_vector_for_refill(&mut self, label_token: u32, prop_key: u32) {
+        if let Some(v) = self.vector.get_mut(&(label_token, prop_key)) {
+            v.conflict_blockers.clear();
+            v.index.clear();
+        }
+    }
+
+    /// Every node vector index key that currently has unresolved build blockers, ascending
+    /// (`rmp` task #780) — the work list for the coordinator's re-fill driver.
+    #[must_use]
+    pub fn conflicted_vector(&self) -> Vec<(u32, u32)> {
+        let mut keys: Vec<(u32, u32)> = self
+            .vector
+            .iter()
+            .filter(|(_, v)| !v.conflict_blockers.is_empty())
+            .map(|(&key, _)| key)
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// Relationship twin of [`note_vector_build_conflict`](Self::note_vector_build_conflict).
+    pub fn note_vector_rel_build_conflict(
+        &mut self,
+        type_token: u32,
+        prop_key: u32,
+        writer: TxnId,
+    ) {
+        if let Some(v) = self.vector_rel.get_mut(&(type_token, prop_key))
+            && !v.conflict_blockers.contains(&writer)
+        {
+            // The empty→non-empty edge; see the node twin.
+            let entering = v.conflict_blockers.is_empty();
+            v.conflict_blockers.push(writer);
+            if entering {
+                self.vector_conflict_events += 1;
+            }
+        }
+    }
+
+    /// Relationship twin of [`vector_blockers`](Self::vector_blockers).
+    #[must_use]
+    pub fn vector_rel_blockers(&self, type_token: u32, prop_key: u32) -> &[TxnId] {
+        self.vector_rel
+            .get(&(type_token, prop_key))
+            .map_or(&[], |v| v.conflict_blockers.as_slice())
+    }
+
+    /// Relationship twin of [`reset_vector_for_refill`](Self::reset_vector_for_refill).
+    pub fn reset_vector_rel_for_refill(&mut self, type_token: u32, prop_key: u32) {
+        if let Some(v) = self.vector_rel.get_mut(&(type_token, prop_key)) {
+            v.conflict_blockers.clear();
+            v.index.clear();
+        }
+    }
+
+    /// How many VECTOR indexes are **currently** blocked — node and relationship together
+    /// (`rmp` task #780). Non-zero means that many k-NN surfaces are serving the exact brute-force
+    /// scan while still reporting `ONLINE`. The server publishes this and uses the non-zero→zero edge
+    /// to log the recovery.
+    #[must_use]
+    pub fn blocked_vector_indexes(&self) -> usize {
+        self.vector
+            .values()
+            .filter(|v| !v.conflict_blockers.is_empty())
+            .count()
+            + self
+                .vector_rel
+                .values()
+                .filter(|v| !v.conflict_blockers.is_empty())
+                .count()
+    }
+
+    /// How many times a VECTOR index has entered the blocked state over this set's life
+    /// (`rmp` task #780) — monotonic; see
+    /// [`vector_conflict_events`](Self#structfield.vector_conflict_events).
+    #[must_use]
+    pub fn vector_conflict_events(&self) -> u64 {
+        self.vector_conflict_events
+    }
+
+    /// Relationship twin of [`conflicted_vector`](Self::conflicted_vector).
+    #[must_use]
+    pub fn conflicted_vector_rel(&self) -> Vec<(u32, u32)> {
+        let mut keys: Vec<(u32, u32)> = self
+            .vector_rel
+            .iter()
+            .filter(|(_, v)| !v.conflict_blockers.is_empty())
+            .map(|(&key, _)| key)
+            .collect();
+        keys.sort_unstable();
+        keys
     }
 
     /// The registered node vector index keys `(label_token, prop_key)` in any state, ascending. Used by
@@ -3604,6 +3776,7 @@ impl IndexSet {
                 state,
                 index: VectorIndex::new(dim, similarity, m, ef_construction, seed)
                     .expect("INVARIANT: vector dimension validated > 0 at create + decode"),
+                conflict_blockers: Vec::new(),
             });
     }
 

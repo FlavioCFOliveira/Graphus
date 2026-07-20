@@ -280,6 +280,11 @@ pub struct Metrics {
     /// Engine-thread-only writer (a fail-closed can only happen inside an index rebuild, which runs on
     /// the engine thread), so unpadded.
     index_fail_closed: AtomicU64,
+    /// How many times a VECTOR index entered the `rmp` #780 blocked state — its build was cut short by
+    /// an uncommitted writer, so every k-NN it serves falls back to an exact `O(entities x dim)`
+    /// brute-force scan while the index still reports `ONLINE`. Correct, but a silent throughput
+    /// cliff, so it is an alerting signal exactly like `index_fail_closed`.
+    vector_index_conflicts: AtomicU64,
     /// Cumulative index builds **poisoned** by a storage fault (`rmp` task #733, M1): the build could not
     /// get past an unreadable entity and was parked, leaving its index `Populating` — correct (every
     /// reader is on the exact scan) but unaccelerated — until the store reads cleanly again and the build
@@ -447,6 +452,7 @@ impl Metrics {
             maintenance_stamps_frozen: AtomicU64::new(0),
             maintenance_failures: AtomicU64::new(0),
             index_fail_closed: AtomicU64::new(0),
+            vector_index_conflicts: AtomicU64::new(0),
             index_builds_poisoned: AtomicU64::new(0),
             index_builds_pending: AtomicU64::new(0),
             index_builds_parked: AtomicU64::new(0),
@@ -518,6 +524,14 @@ impl Metrics {
     /// suspect, so this is an alerting signal, not a debug detail.
     pub fn record_index_fail_closed(&self, n: u64) {
         self.index_fail_closed.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Records `n` VECTOR indexes newly **blocked** by a `rmp` #780 build conflict: an uncommitted
+    /// writer held the newest covered embedding when the index was built, so it declines every k-NN to
+    /// an exact brute-force scan until a conflict-free re-fill succeeds. Answers stay right; the k-NN
+    /// is `O(entities x dim)` and the index still reports `ONLINE`, so this must be observable.
+    pub fn record_vector_index_conflicts(&self, n: u64) {
+        self.vector_index_conflicts.fetch_add(n, Ordering::Relaxed);
     }
 
     /// Records `n` newly **poisoned** index builds (`rmp` task #733, M1) — a build a storage fault stopped
@@ -1064,6 +1078,14 @@ impl Metrics {
             "Times a storage fault made the derived indexes untrustworthy and they were wiped \
              fail-closed — queries stay correct but run unaccelerated (rmp #733).",
             self.index_fail_closed.load(Ordering::Relaxed),
+        );
+        counter(
+            &mut out,
+            "graphus_vector_index_conflicts_total",
+            "Times a VECTOR index entered the blocked state: its build was cut short by an \
+             uncommitted writer, so every k-NN falls back to an exact O(entities x dim) brute-force \
+             scan while the index still reports ONLINE. Correct, but a silent cliff (rmp #780).",
+            self.vector_index_conflicts.load(Ordering::Relaxed),
         );
         // The window-vs-stall gauges (`rmp` task #573). The two counters above are cumulative event
         // tallies: they say something happened, never whether it is happening NOW. An index left

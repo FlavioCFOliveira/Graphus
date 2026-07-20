@@ -1421,33 +1421,122 @@ fn vector_query_nodes_proc(
             label_or_type,
             property,
             dimensions,
+            similarity,
             hits,
         } => {
             // Re-check each candidate against the caller's snapshot (MVCC + RBAC compose through the
-            // seam). Collect `(score, id)` so we can order relevance-first after filtering.
-            let mut kept: Vec<(f32, u64)> = hits
-                .into_iter()
-                .filter(|&(id, _)| {
+            // seam), and RE-SCORE every survivor from its own snapshot-visible embedding.
+            let mut kept =
+                rescore_candidates(hits, similarity, dimensions, query_ref(&query), |id| {
                     let nid = NodeId(id);
-                    graph.node_exists(nid)
-                        && graph
-                            .node_labels(nid)
-                            .is_some_and(|labels| labels.iter().any(|l| l == &label_or_type))
-                        && embedding_present(
-                            graph.node_property(nid, &property).as_ref(),
-                            dimensions,
-                        )
-                })
-                .map(|(id, score)| (score, id))
-                .collect();
-            // Descending score, ascending id tie-break — deterministic after filtering.
-            kept.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+                    if !graph.node_exists(nid) {
+                        return None;
+                    }
+                    if !graph
+                        .node_labels(nid)
+                        .is_some_and(|labels| labels.iter().any(|l| l == &label_or_type))
+                    {
+                        return None;
+                    }
+                    graph.node_property(nid, &property)
+                });
+            kept.truncate(k);
             Ok(kept
                 .into_iter()
                 .map(|(score, id)| vec![Value::Integer(id as i64), Value::Float(f64::from(score))])
                 .collect())
         }
     }
+}
+
+/// Borrows a query vector as a slice (a tiny helper so the two procedure bodies read identically).
+fn query_ref(q: &[f32]) -> &[f32] {
+    q
+}
+
+/// The shared candidate post-processing for both vector procedures (`rmp` task #780):
+/// **re-score → dedup → order**, over the candidate `(id, score)` pairs the seam returned.
+///
+/// `visible_value` returns the candidate's snapshot-visible covered property value, or [`None`] if the
+/// candidate is not a member at this snapshot (invisible, wrong label/type, or RBAC-filtered).
+///
+/// # Why re-scoring is mandatory, not cosmetic
+///
+/// The seam's `score` is computed from whatever vector the ANN graph holds, which is **not necessarily
+/// the vector this reader's snapshot sees** — a reader on an older snapshot already gets scores derived
+/// from a newer *committed* vector, with no `rmp` #766 build conflict involved at all. Passing that
+/// through returns a value computed from data the transaction may not observe (a dirty read on the
+/// score channel), and makes the score **non-deterministic** with respect to an unrelated writer's
+/// transaction state — which the project's DST determinism mandate forbids outright. Measured on a
+/// 20 000-entity corpus, a realistic re-embed produced score errors up to 0.2333 on a (0,1] scale.
+///
+/// Re-scoring is close to free: the membership re-check above already fetched the property, so the page
+/// read is paid; this adds one distance computation per surviving candidate.
+///
+/// # Dedup
+///
+/// One entity may appear only once. The ANN graph is keyed one-slot-per-entity today, so this is a
+/// no-op — it is here because it is the invariant the ROW CONTRACT owes the caller regardless of how
+/// the graph is keyed, and a future multi-version graph (`rmp` #798) must not be able to violate it by
+/// construction. Best score per entity wins.
+fn rescore_candidates(
+    hits: Vec<(u64, f32)>,
+    similarity: graphus_index::Similarity,
+    dimensions: usize,
+    query: &[f32],
+    mut visible_value: impl FnMut(u64) -> Option<Value>,
+) -> Vec<(f32, u64)> {
+    let mut kept: Vec<(f32, u64)> = Vec::with_capacity(hits.len());
+    for (id, _provisional) in hits {
+        let value = visible_value(id);
+        if !embedding_present(value.as_ref(), dimensions) {
+            continue;
+        }
+        // `embedding_present` just proved the shape, so this cannot fail.
+        let Some(embedding) = value.as_ref().and_then(|v| to_embedding(v, dimensions)) else {
+            continue;
+        };
+        let score = graphus_index::similarity_score(similarity, &embedding, query);
+        kept.push((score, id));
+    }
+    // Descending score, ascending id tie-break — deterministic after filtering.
+    kept.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    // Dedup AFTER the sort: O(n) on an ordered list, where deduping during the push loop needed a linear
+    // scan per candidate (O(n^2)) for the same result.
+    //
+    // `dedup_by_key` only collapses ADJACENT equals, so this is correct only because two occurrences of
+    // one entity are necessarily adjacent here — and they are, load-bearingly, BECAUSE of the re-score
+    // above: every occurrence of an entity is scored from that entity's ONE snapshot-visible embedding,
+    // so duplicates carry an identical score, and the `(score desc, id asc)` order therefore places them
+    // side by side. If a future change ever lets two rows of the same entity carry DIFFERENT scores
+    // (`rmp` #798's multi-version graph would, if it re-scored per version rather than per entity), this
+    // silently stops deduping and must become a sort by `(id, score)` + dedup + re-sort.
+    kept.dedup_by_key(|(_, id)| *id);
+    kept
+}
+
+/// The `f32` embedding behind a snapshot-visible property value, or [`None`] if it is not a valid
+/// embedding of `dim` finite numbers. Mirrors `embedding_present`'s acceptance exactly.
+fn to_embedding(value: &Value, dim: usize) -> Option<Vec<f32>> {
+    let Value::List(items) = value else {
+        return None;
+    };
+    if items.len() != dim {
+        return None;
+    }
+    let mut out = Vec::with_capacity(dim);
+    for item in items {
+        let x = match item {
+            Value::Integer(i) => *i as f32,
+            Value::Float(f) => *f as f32,
+            _ => return None,
+        };
+        if !x.is_finite() {
+            return None;
+        }
+        out.push(x);
+    }
+    Some(out)
 }
 
 /// The `db.index.vector.queryRelationships(indexName, numberOfNearestNeighbours, query)` body (`rmp`
@@ -1481,24 +1570,25 @@ fn vector_query_relationships_proc(
             label_or_type,
             property,
             dimensions,
+            similarity,
             hits,
         } => {
-            let mut kept: Vec<(f32, u64)> = hits
-                .into_iter()
-                .filter(|&(id, _)| {
+            // Re-score + dedup + order, exactly as the node twin (`rmp` task #780).
+            let mut kept =
+                rescore_candidates(hits, similarity, dimensions, query_ref(&query), |id| {
                     let rid = RelId(id);
-                    graph.rel_exists(rid)
-                        && graph
-                            .rel_data(rid)
-                            .is_some_and(|data| data.rel_type == label_or_type)
-                        && embedding_present(
-                            graph.rel_property(rid, &property).as_ref(),
-                            dimensions,
-                        )
-                })
-                .map(|(id, score)| (score, id))
-                .collect();
-            kept.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+                    if !graph.rel_exists(rid) {
+                        return None;
+                    }
+                    if graph
+                        .rel_data(rid)
+                        .is_none_or(|data| data.rel_type != label_or_type)
+                    {
+                        return None;
+                    }
+                    graph.rel_property(rid, &property)
+                });
+            kept.truncate(k);
             Ok(kept
                 .into_iter()
                 .map(|(score, id)| vec![Value::Integer(id as i64), Value::Float(f64::from(score))])

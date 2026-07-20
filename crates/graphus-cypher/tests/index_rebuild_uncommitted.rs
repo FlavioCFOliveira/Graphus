@@ -16,6 +16,8 @@
 //! Each test compares the index-routed query against the SAME query at the SAME snapshot with an empty
 //! catalog (a forced full scan) — the ground truth — so a test can only pass by the two agreeing.
 
+use std::collections::HashMap;
+
 use graphus_cypher::binding::{Parameters, bind_parameters};
 use graphus_cypher::catalog::IndexCatalog;
 use graphus_cypher::coordinator::TxnCoordinator;
@@ -1431,5 +1433,524 @@ fn spatial_rebuild_then_writer_rolls_back_keeps_committed_point_findable() {
         seek, scan,
         "after the writer rolled back, the committed point is findable nowhere: \
          index seek returned {seek}, the snapshot-correct scan returned {scan}",
+    );
+}
+
+// =================================================================================================
+// VECTOR (HNSW) graphs — `rmp` task #780
+//
+// Vector is the one index kind with no approximate fallback, so the #766 window here is not a missing
+// row but a WRONG ONE: the build bakes an active writer's uncommitted embedding, the committed one is
+// indexed nowhere, and a FRESH auto-commit reader's k=1 returns the wrong entity — with a `score`
+// computed from a vector that reader's snapshot cannot see.
+//
+// Every assertion below is ABSOLUTE (the exact expected name and score), never seek-vs-scan agreement:
+// in `rmp` #767 an equivalence test survived mutation because both seams were wrong identically.
+// =================================================================================================
+
+use graphus_core::Value as CoreValue;
+use graphus_storage::{VectorEntity, VectorSimilarity};
+
+/// `x` is the exact query direction (cosine 1.0 -> score 1.0); `y` is a runner-up at cosine 0.9
+/// (score 0.95). Both are unit vectors, so the scores are exact, not approximate.
+const V_QUERY: [f32; 3] = [1.0, 0.0, 0.0];
+
+fn vec_lit(v: &[f32]) -> String {
+    let elems: Vec<String> = v.iter().map(|x| format!("{x:?}")).collect();
+    format!("[{}]", elems.join(", "))
+}
+
+fn pid_map(coord: &Coord, txn: graphus_core::TxnId, pattern: &str) -> HashMap<u64, String> {
+    run_plan(coord, txn, &compile(pattern, &IndexCatalog::empty()))
+        .iter()
+        .map(|r| {
+            let pid = match r.value("pid") {
+                CoreValue::Integer(i) => i as u64,
+                other => panic!("pid must be an integer, got {other:?}"),
+            };
+            let name = match r.value("name") {
+                CoreValue::String(s) => s,
+                other => panic!("name must be a string, got {other:?}"),
+            };
+            (pid, name)
+        })
+        .collect()
+}
+
+/// `(name, score)` rows from `db.index.vector.queryNodes`, in the procedure's own order.
+fn knn_nodes(coord: &Coord, txn: graphus_core::TxnId, k: usize) -> Vec<(String, f64)> {
+    let map = pid_map(
+        coord,
+        txn,
+        "MATCH (n:Doc) RETURN id(n) AS pid, n.name AS name",
+    );
+    let src = format!(
+        "CALL db.index.vector.queryNodes('doc_vec', {k}, {}) YIELD node, score \
+         RETURN id(node) AS pid, score",
+        vec_lit(&V_QUERY)
+    );
+    knn_rows(coord, txn, &src, &map)
+}
+
+/// `(name, score)` rows from `db.index.vector.queryRelationships`.
+fn knn_rels(coord: &Coord, txn: graphus_core::TxnId, k: usize) -> Vec<(String, f64)> {
+    let map = pid_map(
+        coord,
+        txn,
+        "MATCH ()-[r:SIMILAR]->() RETURN id(r) AS pid, r.name AS name",
+    );
+    let src = format!(
+        "CALL db.index.vector.queryRelationships('rel_vec', {k}, {}) YIELD relationship, score \
+         RETURN id(relationship) AS pid, score",
+        vec_lit(&V_QUERY)
+    );
+    knn_rows(coord, txn, &src, &map)
+}
+
+fn knn_rows(
+    coord: &Coord,
+    txn: graphus_core::TxnId,
+    src: &str,
+    map: &HashMap<u64, String>,
+) -> Vec<(String, f64)> {
+    run_plan(coord, txn, &compile(src, &IndexCatalog::empty()))
+        .iter()
+        .map(|r| {
+            let pid = match r.value("pid") {
+                CoreValue::Integer(i) => i as u64,
+                other => panic!("pid must be an integer, got {other:?}"),
+            };
+            let score = match r.value("score") {
+                CoreValue::Float(f) => f,
+                other => panic!("score must be a float, got {other:?}"),
+            };
+            (
+                map.get(&pid).cloned().unwrap_or_else(|| format!("<{pid}>")),
+                score,
+            )
+        })
+        .collect()
+}
+
+/// The number of decoy embeddings seeded around the query direction.
+///
+/// THE LOAD-BEARING TEST PARAMETER (`rmp` #780 vacuity audit). With a corpus of 2 and `k = 1`, the
+/// over-fetch of `2k` returns EVERY entity, so the k-NN never makes a selection and `rescore_candidates`
+/// alone determines the answer — which made an earlier version of these tests pass with the entire build
+/// gate deleted. Mutation-tested: with the gate removed, the corpus below fails them.
+///
+/// Each decoy sits at angle `0.30 + i*0.001` rad from the query, i.e. cosine ~0.955 — strictly NEARER
+/// the query than `x`'s dirty `[0,0,1]` (cosine 0) and strictly FARTHER than `x`'s committed `[1,0,0]`
+/// (cosine 1.0). So `x` must win, but only if the graph OFFERS it, which is exactly what the build gate
+/// decides.
+const DISTRACTORS: usize = 200;
+
+fn seed_distractors(coord: &mut Coord) {
+    for i in 0..DISTRACTORS {
+        let t = 0.30 + (i as f32) * 0.001;
+        run_write(
+            coord,
+            &format!(
+                "CREATE (:Doc {{name: 'd{i}', embedding: [{:?}, {:?}, 0.0]}})",
+                t.cos(),
+                t.sin()
+            ),
+        );
+    }
+}
+
+fn seed_rel_distractors(coord: &mut Coord) {
+    for i in 0..DISTRACTORS {
+        let t = 0.30 + (i as f32) * 0.001;
+        run_write(
+            coord,
+            &format!(
+                "MATCH (a:P {{n: 'p1'}}), (b:P {{n: 'p3'}}) \
+                 CREATE (a)-[:SIMILAR {{name: 'd{i}', vec: [{:?}, {:?}, 0.0]}}]->(b)",
+                t.cos(),
+                t.sin()
+            ),
+        );
+    }
+}
+
+fn declare_node_vector(coord: &mut Coord) {
+    coord
+        .begin_online_vector_index_named(
+            Some("doc_vec"),
+            VectorEntity::Node,
+            "Doc",
+            "embedding",
+            3,
+            VectorSimilarity::Cosine,
+            16,
+            200,
+            false,
+        )
+        .expect("create node vector index");
+}
+
+fn seed_docs(coord: &mut Coord) {
+    run_write(
+        coord,
+        "CREATE (:Doc {name: 'x', embedding: [1.0, 0.0, 0.0]})",
+    );
+    run_write(
+        coord,
+        "CREATE (:Doc {name: 'y', embedding: [0.9, 0.4358899, 0.0]})",
+    );
+}
+
+/// Seeds, opens an uncommitted writer that moves `x` orthogonal to the query, then runs THE PRODUCTION
+/// BUILD ROUTE (`begin_online_vector_index_named` — what the server's `CREATE VECTOR INDEX` calls).
+fn seed_and_build_under_open_writer(coord: &mut Coord) -> graphus_core::TxnId {
+    seed_docs(coord);
+    seed_distractors(coord);
+    let writer = coord.begin_serializable();
+    let _ = run_plan(
+        coord,
+        writer,
+        &compile(
+            "MATCH (n:Doc {name: 'x'}) SET n.embedding = [0.0, 0.0, 1.0]",
+            &IndexCatalog::empty(),
+        ),
+    );
+    declare_node_vector(coord);
+    writer
+}
+
+#[test]
+fn vector_build_while_writer_open_returns_the_committed_nearest_neighbour() {
+    let mut coord = fresh_coord();
+    let _writer = seed_and_build_under_open_writer(&mut coord);
+
+    // Non-vacuity: the index really is declared and really is Online. A NotOnline index ERRORS rather
+    // than mis-ranking, so a green test could otherwise be the #733 gate firing instead of this fix.
+    let listings = coord.list_vector_index_listings();
+    assert_eq!(listings.len(), 1, "vacuous: no vector index declared");
+    assert_eq!(
+        format!("{:?}", listings[0].state),
+        "Online",
+        "vacuous: the index is not Online, so this exercises the #733 gate, not #780",
+    );
+
+    let reader = coord.begin_serializable();
+    let got = knn_nodes(&coord, reader, 1);
+    assert_eq!(
+        got,
+        vec![("x".to_owned(), 1.0)],
+        "k=1 must return the COMMITTED nearest neighbour x at its snapshot-visible score 1.0; \
+         the uncommitted [0,0,1] must not rank y first",
+    );
+}
+
+#[test]
+fn vector_rel_build_while_writer_open_returns_the_committed_nearest_neighbour() {
+    let mut coord = fresh_coord();
+    run_write(
+        &mut coord,
+        "CREATE (:P {n: 'p1'}), (:P {n: 'p2'}), (:P {n: 'p3'})",
+    );
+    run_write(
+        &mut coord,
+        "MATCH (a:P {n: 'p1'}), (b:P {n: 'p2'}) \
+         CREATE (a)-[:SIMILAR {name: 'x', vec: [1.0, 0.0, 0.0]}]->(b)",
+    );
+    run_write(
+        &mut coord,
+        "MATCH (a:P {n: 'p2'}), (b:P {n: 'p3'}) \
+         CREATE (a)-[:SIMILAR {name: 'y', vec: [0.9, 0.4358899, 0.0]}]->(b)",
+    );
+    seed_rel_distractors(&mut coord);
+    let _writer = {
+        let w = coord.begin_serializable();
+        let _ = run_plan(
+            &coord,
+            w,
+            &compile(
+                "MATCH ()-[r:SIMILAR {name: 'x'}]->() SET r.vec = [0.0, 0.0, 1.0]",
+                &IndexCatalog::empty(),
+            ),
+        );
+        w
+    };
+    coord
+        .begin_online_vector_index_named(
+            Some("rel_vec"),
+            VectorEntity::Relationship,
+            "SIMILAR",
+            "vec",
+            3,
+            VectorSimilarity::Cosine,
+            16,
+            200,
+            false,
+        )
+        .expect("create rel vector index");
+
+    let listings = coord.list_vector_index_listings();
+    assert_eq!(listings.len(), 1, "vacuous: no vector index declared");
+    assert_eq!(
+        format!("{:?}", listings[0].state),
+        "Online",
+        "vacuous: the index is not Online",
+    );
+
+    let reader = coord.begin_serializable();
+    let got = knn_rels(&coord, reader, 1);
+    assert_eq!(
+        got,
+        vec![("x".to_owned(), 1.0)],
+        "rel k=1 must return the COMMITTED nearest relationship x at score 1.0",
+    );
+}
+
+/// The wrong answer used to SURVIVE the writer's rollback for the life of the process (only a reopen
+/// healed it, the graph being ephemeral). The re-fill driver must repair it once the writer resolves.
+#[test]
+fn vector_index_is_refilled_after_the_blocking_writer_rolls_back() {
+    let mut coord = fresh_coord();
+    let writer = seed_and_build_under_open_writer(&mut coord);
+    coord.rollback(writer).expect("writer rolls back");
+    // The repair runs on the command path, exactly where a real engine would drive it.
+    while coord.advance_index_builds(usize::MAX) {}
+
+    let reader = coord.begin_serializable();
+    assert_eq!(
+        knn_nodes(&coord, reader, 1),
+        vec![("x".to_owned(), 1.0)],
+        "after the blocking writer rolled back, the graph must be re-filled from committed state",
+    );
+}
+
+/// Same, for a writer that COMMITS: the newly committed embedding must be the one indexed.
+///
+/// NOT a regression test, and it says so rather than being claimed as one: this test **passes before
+/// the fix too**, because a committed writer's value IS the committed truth, so the graph that baked it
+/// early was accidentally right. It is kept as the counterexample that rejects the tempting "just index
+/// the newest COMMITTED version" repair — that would leave the writer's own value unindexed once it
+/// committed, since `commit` re-inserts no index entries (they are made eagerly at write time).
+#[test]
+fn vector_index_is_refilled_after_the_blocking_writer_commits() {
+    let mut coord = fresh_coord();
+    let writer = seed_and_build_under_open_writer(&mut coord);
+    coord.commit(writer).expect("writer commits");
+    while coord.advance_index_builds(usize::MAX) {}
+
+    let reader = coord.begin_serializable();
+    // x is now committed at [0,0,1] (cosine 0 -> score 0.5), so the nearest DISTRACTOR wins: d0 sits at
+    // cosine ~0.955 (score ~0.9777), ahead of y at 0.95.
+    assert_eq!(
+        knn_nodes(&coord, reader, 1),
+        vec![("d0".to_owned(), 0.977_668_285_369_873)],
+        "after the writer committed, its embedding IS the committed truth and d0 is nearest",
+    );
+}
+
+/// THE DIRTY-READ SCORE CHANNEL (`rmp` task #780). Independent of #766 and reproducible with no build
+/// conflict at all: an older reader must be scored against the embedding ITS snapshot sees, never the
+/// newer committed one the graph holds.
+#[test]
+fn vector_score_is_recomputed_from_the_snapshot_visible_embedding() {
+    let mut coord = fresh_coord();
+    seed_docs(&mut coord);
+    seed_distractors(&mut coord);
+    declare_node_vector(&mut coord);
+
+    // An older reader pins the snapshot where x = [1,0,0] (score 1.0).
+    let reader = coord.begin_serializable();
+    // A LATER, COMMITTED write moves x to cosine 0.98 (score 0.99). Deliberately a SMALL move: x stays
+    // comfortably ahead of the distractors (~0.9777), so it is still OFFERED by the graph and this test
+    // isolates the SCORE channel. The separate window where a large move pushes an entity OUT of the
+    // candidate set is `rmp` #794, documented at `record_graph.rs::vector_query_nodes`.
+    run_write(
+        &mut coord,
+        "MATCH (n:Doc {name: 'x'}) SET n.embedding = [0.98, 0.19899, 0.0]",
+    );
+
+    let got = knn_nodes(&coord, reader, 2);
+    let x_score = got
+        .iter()
+        .find(|(n, _)| n == "x")
+        .map(|(_, s)| *s)
+        .expect("x must still be visible to this older reader");
+    assert!(
+        (x_score - 1.0).abs() < 1e-6,
+        "x must be scored 1.0 from the embedding THIS snapshot sees ([1,0,0]); \
+         got {x_score}, which is derived from the newer committed [0.98, 0.19899, 0] (score 0.99) \
+         that this reader cannot observe",
+    );
+}
+
+/// The relationship twin of the dirty-read score channel.
+#[test]
+fn vector_rel_score_is_recomputed_from_the_snapshot_visible_embedding() {
+    let mut coord = fresh_coord();
+    run_write(&mut coord, "CREATE (:P {n: 'p1'}), (:P {n: 'p2'})");
+    run_write(
+        &mut coord,
+        "MATCH (a:P {n: 'p1'}), (b:P {n: 'p2'}) \
+         CREATE (a)-[:SIMILAR {name: 'x', vec: [1.0, 0.0, 0.0]}]->(b)",
+    );
+    run_write(&mut coord, "CREATE (:P {n: 'p3'})");
+    seed_rel_distractors(&mut coord);
+    coord
+        .begin_online_vector_index_named(
+            Some("rel_vec"),
+            VectorEntity::Relationship,
+            "SIMILAR",
+            "vec",
+            3,
+            VectorSimilarity::Cosine,
+            16,
+            200,
+            false,
+        )
+        .expect("create rel vector index");
+
+    let reader = coord.begin_serializable();
+    // A SMALL later move (cosine 0.98), for the reason the node twin documents.
+    run_write(
+        &mut coord,
+        "MATCH ()-[r:SIMILAR {name: 'x'}]->() SET r.vec = [0.98, 0.19899, 0.0]",
+    );
+
+    let got = knn_rels(&coord, reader, 2);
+    let x_score = got
+        .iter()
+        .find(|(n, _)| n == "x")
+        .map(|(_, s)| *s)
+        .expect("x must still be visible to this older reader");
+    assert!(
+        (x_score - 1.0).abs() < 1e-6,
+        "rel x must be scored 1.0 from the embedding THIS snapshot sees; got {x_score}",
+    );
+}
+
+/// SILENT k-UNDERFILL (`rmp` #795). `k` went straight to the HNSW and the per-candidate re-check then
+/// filtered the hits with no back-fill, so `queryNodes(k)` returned fewer than `k` rows even when `k`
+/// valid neighbours existed.
+#[test]
+fn vector_knn_does_not_underfill_k_when_candidates_are_filtered() {
+    let mut coord = fresh_coord();
+    for (n, e) in [
+        ("a", "[0.9, 0.4358899, 0.0]"),
+        ("b", "[0.0, 1.0, 0.0]"),
+        ("c", "[0.0, 0.0, 1.0]"),
+    ] {
+        run_write(
+            &mut coord,
+            &format!("CREATE (:Doc {{name: '{n}', embedding: {e}}})"),
+        );
+    }
+    declare_node_vector(&mut coord);
+
+    // An OLDER reader opens before a nearer node exists.
+    let reader = coord.begin_serializable();
+    run_write(
+        &mut coord,
+        "CREATE (:Doc {name: 'e', embedding: [1.0, 0.0, 0.0]})",
+    );
+
+    // The reader has exactly three visible neighbours: a, b, c.
+    let got = knn_nodes(&coord, reader, 3);
+    let names: Vec<String> = got.iter().map(|(n, _)| n.clone()).collect();
+    assert_eq!(
+        names,
+        vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
+        "k=3 must return all three visible neighbours; the invisible nearer node must not consume a slot",
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// `rmp` #780 REPAIR — engine-STATE tests.
+//
+// These exist because every other #780 test asserts the query ANSWER, and the exact brute-force scan
+// a blocked index declines to returns the SAME answer a repaired index does. That made the whole
+// repair driver invisible: with `retry_conflicted_vector_builds` stubbed to `return false`, all of
+// them stayed green (mutation-proven during the #780 audit). A test for a repair whose remedy is
+// "degrade to a correct slower path" MUST therefore assert the engine's STATE — that the fast path is
+// re-armed — never the rows.
+// -------------------------------------------------------------------------------------------------
+
+/// The re-fill driver must actually return the index to the ANN fast path.
+///
+/// FAILS with `retry_conflicted_vector_builds` disabled (verified by stubbing it to `return false`),
+/// which is precisely what `vector_index_is_refilled_after_the_blocking_writer_rolls_back` above
+/// cannot detect.
+#[test]
+fn vector_index_returns_to_the_fast_path_after_the_blocking_writer_resolves() {
+    let mut coord = fresh_coord();
+    let writer = seed_and_build_under_open_writer(&mut coord);
+
+    // Non-vacuity: the gate really fired, so there is a degradation for the repair to undo.
+    assert_eq!(
+        coord.blocked_vector_indexes(),
+        1,
+        "vacuous: the build gate did not block the index, so this test proves nothing about repair",
+    );
+    assert_eq!(
+        coord.vector_index_conflict_events(),
+        1,
+        "the blocked-state entry must be counted exactly once, for the operator-facing metric",
+    );
+
+    coord.rollback(writer).expect("writer rolls back");
+    // Resolution ALONE is not the repair: the skipped entity is still missing from the graph, and a
+    // k-NN can drop a candidate but never resurrect one.
+    assert_eq!(
+        coord.blocked_vector_indexes(),
+        1,
+        "the writer merely resolving must NOT re-arm the fast path — the graph is still holed",
+    );
+
+    // The command path, where a real engine drives the repair.
+    while coord.advance_index_builds(usize::MAX) {}
+
+    assert_eq!(
+        coord.blocked_vector_indexes(),
+        0,
+        "after every blocking writer resolved, the re-fill must rebuild the graph and put the index \
+         back on the ANN fast path; still blocked means every k-NN keeps paying an O(entities x dim) \
+         exact scan forever, silently, while SHOW INDEXES reports ONLINE",
+    );
+    // The counter is monotonic: a repair does not un-count the degradation that happened.
+    assert_eq!(
+        coord.vector_index_conflict_events(),
+        1,
+        "the entry counter is cumulative and must not be reset by the repair",
+    );
+}
+
+/// A whole-set rebuild re-derives every graph from a fresh store scan, so it must not carry a blocker
+/// across — `IndexSet::clear` drops the #778 full-text blockers for exactly this reason.
+///
+/// FAILS without the `clear()` fix: the stale blocker survives, and the freshly and CORRECTLY rebuilt
+/// graph is left declining to the exact scan (plus a redundant O(store) wipe + re-fill on the next
+/// drain to undo it).
+#[test]
+fn a_whole_set_rebuild_does_not_strand_a_resolved_vector_blocker() {
+    let mut coord = fresh_coord();
+    let writer = seed_and_build_under_open_writer(&mut coord);
+    assert_eq!(
+        coord.blocked_vector_indexes(),
+        1,
+        "vacuous: the build gate did not block the index",
+    );
+    // The blocking writer resolves FIRST, so the rebuild's own pass cannot see any conflict at all —
+    // any blocker still standing afterwards is therefore pure residue from the previous pass.
+    coord.rollback(writer).expect("writer rolls back");
+
+    // An unrelated index DDL, which drives `rebuild_index` (clear + re-register + re-fill from the
+    // committed store) synchronously — the ordinary way a rebuild happens in a running engine.
+    coord
+        .create_node_property_index("Doc", "name")
+        .expect("declare an unrelated index");
+
+    assert_eq!(
+        coord.blocked_vector_indexes(),
+        0,
+        "a whole-set rebuild from a conflict-free store must leave NO vector blocker behind; a \
+         surviving one strands a correctly-rebuilt graph on the exact brute-force scan",
     );
 }

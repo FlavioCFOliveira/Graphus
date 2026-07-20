@@ -836,6 +836,10 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     let mut index_fail_closed_seen = coordinator.index_fail_closed_events();
     // Likewise for poisoned builds (`rmp` task #733, M1): each new one is logged + metered exactly once.
     let mut index_poison_seen = coordinator.index_build_poison_events();
+    // Likewise for VECTOR build conflicts (`rmp` task #780): each index that enters the blocked
+    // exact-scan state is logged + metered exactly once, and its return to the fast path is logged too.
+    let mut vector_conflict_seen = coordinator.vector_index_conflict_events();
+    let mut vector_blocked_seen = coordinator.blocked_vector_indexes();
     // The extension registry (user-defined functions/procedures, `rmp` task #75). Built **once** on
     // the engine thread, then `Arc`-shared so an off-thread reader resolves UDF/UDP plans against the
     // SAME registry that backed compilation (`rmp` task #336 — `ExtensionRegistry` is `Send + Sync`,
@@ -1029,6 +1033,23 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             .as_ref()
             .expect("INVARIANT: coordinator is Some until Shutdown breaks the loop")
             .indexes_degraded();
+        // A VECTOR index blocked by a `rmp` #780 build conflict is pending work too, for the same
+        // reason a degraded index set is: while blocked, its every k-NN runs an exact O(entities x dim)
+        // scan, and the repair (`retry_conflicted_vector_builds`, inside `advance_index_builds`) only
+        // runs when the engine ticks. Without this, an engine that went idle right after the conflict
+        // would park on a plain `recv` and stay on the slow path until the next command arrived — and
+        // the degradation would never be logged.
+        //
+        // Like `indexes_degraded`, this is deliberately NOT folded into `has_pending_index_builds`,
+        // whose callers SPIN on it: no amount of pumping can resolve another transaction, so a blocking
+        // writer that stayed open would turn that loop into a 100%-CPU hang. Making the engine *tick*
+        // is bounded (one `is_txn_active` lookup per recorded writer, then an early return); making it
+        // *spin* is not.
+        let vector_blocked = coordinator
+            .as_ref()
+            .expect("INVARIANT: coordinator is Some until Shutdown breaks the loop")
+            .blocked_vector_indexes()
+            > 0;
         // Publish the index-build gauges (`rmp` task #573). Here, because this point is reached on EVERY
         // iteration — after each command (so a `CREATE INDEX`'s new build shows up at once) and after each
         // build tick (so progress falls and completion returns the gauges to zero) — and because it is the
@@ -1042,7 +1063,11 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                 .expect("INVARIANT: coordinator is Some until Shutdown breaks the loop")
                 .index_build_totals(),
         );
-        let timed = building || indexes_degraded || readers_inflight > 0 || !parked.is_empty();
+        let timed = building
+            || indexes_degraded
+            || vector_blocked
+            || readers_inflight > 0
+            || !parked.is_empty();
 
         let cmd = if timed {
             match rx.recv_timeout(INDEX_BUILD_TICK) {
@@ -1060,6 +1085,8 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                         &db_name,
                         &mut index_fail_closed_seen,
                         &mut index_poison_seen,
+                        &mut vector_conflict_seen,
+                        &mut vector_blocked_seen,
                     ) {
                         plan_cache.bump_schema();
                     }
@@ -1821,10 +1848,46 @@ fn maintain_degraded_indexes<D: BlockDevice, S: LogSink>(
     db_name: &str,
     seen: &mut u64,
     poison_seen: &mut u64,
+    vector_conflict_seen: &mut u64,
+    vector_blocked_seen: &mut usize,
 ) -> bool {
     let Some(coord) = coordinator.as_mut() else {
         return false;
     };
+    // Report any VECTOR index that entered the `rmp` #780 blocked state since the last tick: its build
+    // was cut short by an uncommitted writer, so it declines every k-NN to an exact brute-force scan.
+    // Queries stay CORRECT — the scan is exact where the ANN is approximate — but they now cost
+    // `O(covered entities x dim)`, and the index still reports `ONLINE`, so nothing else would ever
+    // reveal it. Same reasoning as the fail-closed report below (`rmp` #733): a silent degradation is
+    // indistinguishable from a healthy-but-slow engine.
+    let conflicts = coord.vector_index_conflict_events();
+    if conflicts > *vector_conflict_seen {
+        let new = conflicts - *vector_conflict_seen;
+        *vector_conflict_seen = conflicts;
+        metrics.record_vector_index_conflicts(new);
+        tracing::warn!(
+            database = %db_name,
+            events = new,
+            total = conflicts,
+            blocked = coord.blocked_vector_indexes(),
+            "a VECTOR index build was cut short by an UNCOMMITTED writer holding the newest covered \
+             embedding. Its k-NN answers stay CORRECT but now run as an exact O(entities x dim) \
+             brute-force scan instead of an ANN descent, while SHOW INDEXES still reports ONLINE. It \
+             repairs itself once every blocking transaction commits or rolls back — if this persists, \
+             look for a long-running open transaction writing that property (rmp #780)."
+        );
+    }
+    // And the recovery edge, so the WARN above is never left dangling with no resolution.
+    let blocked = coord.blocked_vector_indexes();
+    if blocked < *vector_blocked_seen {
+        tracing::info!(
+            database = %db_name,
+            blocked,
+            "a VECTOR index was re-filled from committed state and is back on the ANN fast path \
+             (rmp #780)"
+        );
+    }
+    *vector_blocked_seen = blocked;
     // Report any build POISONED since the last tick (`rmp` task #733, M1): a build a storage fault stopped
     // for good. Its index stays `Populating` — queries remain correct, on the exact scan — but it is not
     // being built, and that must not pass silently.

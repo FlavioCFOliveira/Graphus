@@ -55,6 +55,7 @@ pub mod rng;
 pub mod scenarios;
 pub mod selfloop_churn;
 pub mod spatial_build_uncommitted;
+pub mod vector_build_uncommitted;
 pub mod vopr;
 pub mod vopr_fault;
 pub mod vopr_fuzz;
@@ -81,6 +82,13 @@ pub use rng::DetRng;
 pub use selfloop_churn::{SelfLoopChurnReport, run_selfloop_churn_crash};
 pub use spatial_build_uncommitted::{
     SpatialBuildReport, WriterEnding, run_spatial_build_uncommitted,
+};
+// `WriterEnding` is re-exported under a qualified name: the vector scenario declares its own enum,
+// structurally identical to the spatial one above but a DISTINCT type. Re-exporting it bare would let
+// the crate-root `WriterEnding` (spatial's) be passed to `run_vector_build_uncommitted`, which does not
+// accept it — a confusing type error at the call site rather than at the definition.
+pub use vector_build_uncommitted::{
+    VectorBuildReport, WriterEnding as VectorWriterEnding, run_vector_build_uncommitted,
 };
 // The wire-level VOPR core (rmp #162). Its `run`/`summarize` are kept module-qualified (`vopr::run`)
 // so they do not clash with the storage harness's crate-root `run`/`summarize`.
