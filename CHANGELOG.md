@@ -7,92 +7,133 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+This cycle brings Graphus to **full Neo4j-5.x index and constraint parity**, closes a large tranche
+of the Cypher surface beyond the openCypher TCK core, hardens the whole examples suite into a
+falsifiable gate, and — most importantly for operators — fixes a family of **ACID correctness**
+defects in the index-build / MVCC / WAL-recovery paths. Several of the fixes are committed-data-loss
+or silent-degradation bugs that a green test suite did not catch; the *Fixed* section calls them out
+explicitly so an operator can judge their own exposure.
+
 ### Added
 
-- **Neo4j-conformant named node-property indexes (rmp #623-#627).** `CREATE INDEX <name> FOR (n:L)
-  ON (n.p)` with an optional index name, `DROP INDEX <name>`, and `IF NOT EXISTS` / `IF EXISTS`
-  guards. A durable named-index catalogue (with legacy auto-name migration) enforces global name
-  uniqueness, and `SHOW INDEXES` reports the Neo4j-conformant columns including `name`. Parsed in the
-  server admin DDL layer.
-- **Cypher completeness — Neo4j 5.x surface beyond the openCypher TCK core (rmp #629-#643).** Math
-  function family (trigonometry, `exp`/`log`, `pi`/`e`, `degrees`/`radians`, `isNaN`); scalar/id/list
-  functions (`elementId`, `timestamp`, `randomUUID`, `isEmpty`, `valueType`, `nullIf`,
+- **Full Neo4j-5.x index parity (rmp #655-#671, #676-#680).** Every Neo4j index kind is now served,
+  for nodes *and* relationships:
+  - **TEXT (trigram) index** serving `CONTAINS` / `ENDS WITH` / `STARTS WITH` (#662), and a bounded
+    RANGE prefix seek for `STARTS WITH` (#658).
+  - **FULLTEXT index**, node, multi-label and relationship, with a working
+    `db.index.fulltext.queryRelationships` (#663).
+  - **POINT (spatial) index** for nodes and relationships, with a real spatial seek (#664).
+  - **Composite (multi-property) RANGE index**, node (#657) and relationship (#666), with multi-key
+    seek.
+  - **Relationship-property index** end-to-end (#646, #659), and a **relationship RANGE index** that
+    serves range predicates (`<`, `<=`, `>`, `>=`) (#680).
+  - **Existence (`IS NOT NULL`) index scan** with `ORDER BY` served by the index (Sort elision) (#665).
+  - **VECTOR (HNSW) index** in four parts: the HNSW ANN structure (#668), a durable catalog +
+    coordinator wiring (#669), `CREATE`/`DROP VECTOR INDEX` DDL with `OPTIONS`/`indexConfig` and
+    `SHOW … type=VECTOR` (#670), and the `db.index.vector.query*` procedures plus
+    `vector.similarity.*` functions (#671).
+  - **Unified, Neo4j-conformant `SHOW INDEXES`** across every kind, with the full column set, filters
+    and `YIELD`/`WHERE` (#660), plus index DDL `OPTIONS` and `IF (NOT) EXISTS` completeness with a
+    unified `DROP` (#661), the complete index-procedure surface (#667), and **named node-property
+    indexes** with an optional name, `DROP INDEX <name>` and a durable named-index catalogue
+    enforcing global name uniqueness (#623-#627).
+- **Full Neo4j-5.x constraint parity (rmp #650-#654).** Composite property-uniqueness constraints for
+  nodes and relationships (#651); the complete property-type set for `IS :: <TYPE>` including the
+  temporal scalars, `POINT`, `LIST<X NOT NULL>` element types and closed unions (#652); optional
+  constraint names with a deterministic generated name and an `OPTIONS` clause (#654); and a
+  Neo4j-complete `SHOW CONSTRAINTS` with the full column set, type filters and `YIELD`/`WHERE`/`RETURN`
+  (#653).
+- **Cypher completeness — the Neo4j-5.x surface beyond the openCypher TCK core (rmp #628-#643).** The
+  math function family (trigonometry, `exp`/`log`, `pi`/`e`, `degrees`/`radians`, `isNaN`);
+  scalar/id/list functions (`elementId`, `timestamp`, `randomUUID`, `isEmpty`, `valueType`, `nullIf`,
   `char_length`, the `toXxxOrNull` / `toXxxList` families); `reduce()` list fold; map projection
   `n{ .name, .*, key: expr }`; `CALL { }` subqueries (importing `WITH`, inner `UNION`,
   `IN TRANSACTIONS`); `COUNT { }` and `COLLECT { }` expression subqueries; label/type expressions
   `:A&B`, `:A|B`, `:!A`, `:%`; type predicates `IS :: TYPE`, `IS NOT :: TYPE`, `IS NORMALIZED`;
   administrative `SHOW FUNCTIONS/PROCEDURES/TRANSACTIONS/SETTINGS` and `TERMINATE TRANSACTIONS`;
   constraint & typed/relationship index DDL; `dbms.*` procedures (`dbms.components`),
-  `db.awaitIndexes`, `db.index.fulltext.queryRelationships`; the `USE <db>` graph selector; and GDS
-  write/mutate/stats execution modes plus vector similarity / `VECTOR` index.
+  `db.awaitIndexes`; the `USE <db>` graph selector; and GDS write/mutate/stats execution modes.
 - **Quantified Path Patterns (GPM, rmp #642/#648).** `((x)-[r1:R]->(m)-[r2:S]->(y))+` and `{n,m}`
-  quantifiers through the full parser → semantics → planner → executor pipeline, including a
-  multi-relationship interior (tested to 3 hops) with per-iteration group variables, a global trail
-  (no relationship reused across any hop of any iteration), and a folded per-iteration predicate for
-  cross-relationship `WHERE`. Nested QPP `( ( )+ )+` is deferred with a clear parse error.
+  quantifiers through the full parser → semantics → planner → executor pipeline, with a
+  multi-relationship interior, per-iteration group variables, a global trail (no relationship reused
+  across any hop of any iteration), and a folded per-iteration `WHERE`.
 - **Negative privileges — `DENY` (rmp #641/#645).** `DENY <priv> ON <resource> TO <role>` with
-  deny-precedence (a `DENY` beats an implying `GRANT`), reversed action grading (`DENY READ` blocks
-  Read+Write but not Traverse; `DENY TRAVERSE` blocks all three; `DENY WRITE` blocks only Write),
-  `REVOKE GRANT` / `REVOKE DENY` / plain `REVOKE`, and a `SHOW PRIVILEGES` `access` column
-  (`GRANTED`/`DENIED`). The global root-admin can never be locked out. Durable across restart; the
-  per-query effective-privileges snapshot reads grants and denies under a single guard.
-- **Relationship property index (rmp #646).** `CREATE INDEX [name] FOR ()-[r:T]-() ON (r.p)`
-  end-to-end, mirroring the node-property index: durable catalogue on the atomic meta-checkpoint,
-  synchronous online build with rebuild-on-recovery, per-write maintenance at the `set_rel_property`
-  chokepoint, and index-backed relationship-uniqueness enforcement (replacing the prior
-  O(rels-of-type) scan while preserving its serializability footprint). `SHOW INDEXES` lists node and
-  relationship rows with `entityType` = `NODE` / `RELATIONSHIP`.
-
-### Added
-
-- **Neo4j-complete `SHOW CONSTRAINTS` (rmp #653).** The listing now returns the full Neo4j-5.x column
-  set — `id, name, type, entityType, labelsOrTypes, properties, ownedIndex, propertyType` by default,
-  plus `options, createStatement` via `YIELD *` — with the correct `type` strings
-  (`NODE_PROPERTY_UNIQUENESS`, `RELATIONSHIP_PROPERTY_UNIQUENESS`, `NODE_PROPERTY_EXISTENCE`,
-  `RELATIONSHIP_PROPERTY_EXISTENCE`, `NODE_KEY`, `RELATIONSHIP_KEY`, `NODE_PROPERTY_TYPE`,
-  `RELATIONSHIP_PROPERTY_TYPE`), `labelsOrTypes`/`properties` as lists, an `ownedIndex`, a separate
-  `propertyType`, and a re-runnable `createStatement`. Type filters (`SHOW UNIQUE|NODE KEY|RELATIONSHIP
-  PROPERTY EXISTENCE|PROPERTY TYPE|… CONSTRAINTS`) and a full `YIELD … [WHERE] [RETURN] [ORDER BY]
-  [SKIP] [LIMIT]` / terse `WHERE …` sub-clause are supported (the tail is evaluated by re-running a
-  translated `UNWIND`-based Cypher read query, so `YIELD`/`WHERE`/`RETURN` have full expression
-  fidelity). `SHOW INDEXES` gains an `owningConstraint` column.
-- **Optional constraint names + `OPTIONS` clause (rmp #654).** `CREATE CONSTRAINT` no longer requires
-  a name: when omitted (`CREATE CONSTRAINT FOR (n:L) REQUIRE …`) a deterministic Neo4j-style name
-  (`constraint_<hex>`, derived from the entity + property tuple + kind via a stable hash) is
-  generated, so a repeated unnamed `CREATE … IF NOT EXISTS` remains idempotent and `SHOW CONSTRAINTS`
-  reports a stable name. A trailing `OPTIONS { … }` map (Neo4j's backing-index provider/config,
-  including nested maps) is accepted for DDL compatibility and ignored (Graphus has a single built-in
-  index provider).
-- **Composite property uniqueness constraints (rmp #651).** `REQUIRE (a, b, …) IS UNIQUE` over a
-  property tuple is now supported for both nodes (`FOR (n:L)`) and relationships (`FOR ()-[r:T]-()`),
-  matching Neo4j. Enforced on `CREATE`/`SET`/`MERGE` and at creation time, null-relaxed (an entity
-  with a null in any covered property is never checked, mirroring single-property uniqueness), and
-  serializable-safe: two concurrent inserts of the same brand-new tuple abort exactly one (the node
-  path reuses the composite backing index + SSI predicate footprint of node-key). Durable across
+  deny-precedence, reversed action grading, `REVOKE GRANT`/`REVOKE DENY`/plain `REVOKE`, and a
+  `SHOW PRIVILEGES` `access` column. The global root-admin can never be locked out; durable across
   restart.
-- **Full property-type set for `IS :: <TYPE>` constraints (rmp #652).** Property type constraints now
-  accept the complete Neo4j-5.x closed set: the temporal scalars (`DATE`, `LOCAL TIME`, `ZONED TIME`,
-  `LOCAL DATETIME`, `ZONED DATETIME`, `DURATION`) and `POINT` in addition to `BOOLEAN`/`STRING`/
-  `INTEGER`/`FLOAT`; `LIST<X NOT NULL>` element types; and closed unions (`INTEGER | STRING`,
-  `STRING | LIST<STRING NOT NULL>`). The `IS TYPED <TYPE>` / `:: <TYPE>` synonyms and the openCypher
-  type-name synonyms (`BOOL`, `VARCHAR`, `INT`, `SIGNED INTEGER`) are accepted; the non-property types
-  (`NODE`/`RELATIONSHIP`/`PATH`/`MAP`/`ANY`/`NOTHING`/`NULL`) are rejected with a clear error. The
-  durable constraint-type descriptor was extended with a backward-compatible, depth- and
-  count-bounded wire encoding, and `SHOW CONSTRAINTS` renders the canonical type spelling (e.g.
-  `LIST<STRING NOT NULL>`).
+- **`EXPLAIN` / `PROFILE` query prefixes (rmp #752)** with the Neo4j-5.x plan shape (estimated rows /
+  measured rows + dbHits), surfaced through the Bolt and REST result summary.
+- **Offline bulk import → adopt → serve (rmp #681).** An offline import can be adopted and then served,
+  queryable by the original `:ID`.
+- **Crash-safe B-tree whole-page reclamation via a persistent free list (rmp #225).**
+- **CLI Bolt-over-TCP(+TLS) transport (`--bolt`) for remote targeting (rmp #688).**
+- **Planner cost model on real distributions, not a `0.3` constant (rmp #572)**, plus correlated-anchor
+  index seeks: an equality in a `WHERE` above an `Expand` now seeks through the traversal (#730), a
+  correlated composite anchor seeks the composite index per row (#729), a two-variable join predicate
+  drives an index nested-loop seek (#732), a row-valued equality anchor seeks per row (#708), and both
+  anchors of a two-pattern edge `CREATE` are index-seeked (#312/#303).
+- **The examples suite is now a falsifiable GATE in both of its modes (rmp #704, #714, #744, #745).**
+  Fifteen example domains were instrumented with attach-mode, a Prometheus `/metrics` scrape, an
+  external-target seam, schema v3 (an unmeasured vector is *absent*, never a zero), read-result
+  correctness invariants, and a default read/write MIX that separates the vectors and asserts the
+  invariants (rmp #673-#717, #739-#746, #749). Each example now exercises real index and constraint
+  kinds against the running server rather than asserting a plan string.
+
+### Changed
+
+- **The off-thread reader pool now serves every seek kind, not just node equality (rmp #755, #768,
+  #769, #770).** An auto-commit indexed read is a real off-thread seek (301 → 2 dbHits, #755); the
+  pool serves node RANGE/COMPOSITE/TEXT seeks (#768), relationship index seeks — the first production
+  read path for the #680 rel-RANGE (#769) — and SPATIAL seeks (#770).
+- **WAL disk is reclaimed proportionally to the store, so a small database stops sawtoothing to 396×
+  (rmp #706/#719)**, and the ephemeral index WAL drops its undo retention to stop a per-element memory
+  bomb (rmp #724).
+- **Composite index refill tuple construction is now O(k·V), not O(k·V²) (rmp #774).**
+- **The bulk-import buffer pool auto-sizes so large loads are not quadratic (rmp #718).**
 
 ### Fixed
 
-- **`REMOVE n.p` / `REMOVE r.p` bypassed existence & key constraints (rmp #650, CWE-617/schema
-  integrity).** Unlike `SET … = null`, the `REMOVE` clause dropped a property without enforcing the
-  declared constraints, so `MATCH (n:Person) REMOVE n.name` could silently leave a record violating a
-  `NOT NULL` / `NODE KEY` / `RELATIONSHIP KEY` constraint. `REMOVE` now enforces after the removal
-  (mirroring `SET … = null`) and is rejected + rolled back with
-  `Neo.ClientError.Schema.ConstraintValidationFailed`. Regression tests added (node/relationship,
-  existence + key).
-- **`stdev` / `stdevp` returned a wrong aggregate value (rmp #628).** The sample/population standard
-  deviation aggregates silently computed an incorrect result; corrected and covered by regression
-  tests.
+- **CRITICAL — a clean, fully-committed WAL refused to recover when the first retained record's
+  `total_len` was a multiple of 256 (rmp #806).** `total_len` is a little-endian `u32`, so any
+  multiple of 256 begins with a `0x00` byte; recovery skipped it as reclaimed padding, decoded garbage
+  one byte in, and misdiagnosed a clean log as interior corruption — refusing to open and making
+  committed data unrecoverable. A second manifestation made the recovered transaction-id high-water
+  mark read as 0, inviting id reuse. Fixed by disambiguating a leading zero run with a CRC-checked
+  decode probe. Violated the ACID guarantee; found by the release-readiness audit.
+- **CRITICAL — the index-build / rollback / MVCC "uncommitted" defect family (rmp #765, #766, #771,
+  #772, #773, #778, #779, #780, #803, #734, #534, #767).** A cluster of related ACID bugs in which a
+  concurrent open or rolled-back writer could corrupt an index or the catalog:
+  - A `CREATE INDEX` could make a concurrent reader lose committed rows, or admit a duplicate NODE KEY
+    (#765); an index build could let an uncommitted write hide a committed row (#766).
+  - A synchronous rebuild could lose a label a rolled-back writer removed (#771); a rolled-back label
+    change could clobber a concurrently-committed property write (#772); a rolled-back txn now discards
+    only its own pending catalog DDL (#734) and the schema catalog is superset-preserved on rollback
+    for a concurrent open txn (#534).
+  - The TEXT (#773), FULLTEXT (#778), SPATIAL (#779) and VECTOR (#780) index builds no longer bake an
+    uncommitted value over the committed one; the SPATIAL grid is treated as multi-valued so a build no
+    longer loses the committed point (#779).
+  - **A poisoned ft/spatial marker now REPAIRS instead of degrading every TEXT/FULLTEXT/SPATIAL index
+    DB-wide, permanently and silently, until a process restart (rmp #803)** — the residue of #756,
+    whose fix narrowed *when* the marker is poisoned but left the latch unclearable.
+  - Label membership is now snapshot-isolated (#767).
+- **CRITICAL — a declared RELATIONSHIP KEY admitted a committed duplicate (rmp #683).** Physical SIREAD
+  is asymmetric, so two writers produced only one rw-edge and no SSI pivot; the constraint now carries
+  a proper predicate marker.
+- **A rejected write poisoned the TEXT/FULLTEXT/spatial fast path DB-wide (rmp #756).** Poison is now
+  raised only on a genuine remove/replace rollback, not on every constraint/SSI abort. (See #803 for
+  the follow-up that made the latch clearable.)
+- **FULLTEXT/VECTOR procedures now honour index state and fail closed on a read fault (rmp #733)** —
+  a `Populating` index scans, and a read fault returns an error rather than silently declining.
+- **A reader's page map must be LIVE, not a snapshot (rmp #721)** — a stale page map could hide a
+  concurrently-committed write from a reader.
+- **`REMOVE n.p` / `REMOVE r.p` bypassed existence & key constraints (rmp #650, schema integrity).**
+  Now enforced after the removal, mirroring `SET … = null`.
+- **`DENY` now takes precedence across labels on a multi-label node (rmp #645, CWE-863).**
+- **Undecodable constraint type descriptors are rejected at the write path (rmp #652, ACID-D).**
+- **`SHOW INDEXES` reports real build progress, and `DROP INDEX` stops resurrecting the index it
+  dropped (rmp #573).**
+- **A single QPP / variable-length query can no longer abort the server (rmp #656).**
+- **`stdev` / `stdevp` returned a wrong aggregate value (rmp #628).**
 
 ## [0.0.9] - 2026-07-08
 
