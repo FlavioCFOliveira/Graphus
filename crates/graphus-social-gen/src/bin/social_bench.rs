@@ -67,7 +67,7 @@ use graphus_examples_harness::{
     CpuSection, DatasetScale, EvidenceCollector, MemorySection, RunMetadata, StorageSection,
 };
 use graphus_reco_gen::bench::{self, Pcts};
-use graphus_reco_gen::client::{BoltClient, BoltUrl, ClientResult, QueryResult};
+use graphus_reco_gen::client::{BoltClient, BoltUrl, ClientError, ClientResult, QueryResult};
 use graphus_reco_gen::mix::{
     self, Arm, ErrorSample, READ_LIVENESS_FLOOR, ReadInvariant, RetryPolicy, WriteKind, WriteVector,
 };
@@ -77,7 +77,8 @@ use graphus_reco_gen::mix::{
 // workload RNG below and the backoff RNG are interchangeable.
 use graphus_reco_gen::SplitMix64 as BackoffRng;
 use graphus_social_gen::{
-    DegreeDist, EPOCH_S, GenConfig, Generator, REG_SPAN_S, SplitMix64, battery,
+    DegreeDist, EPOCH_S, GenConfig, Generator, SplitMix64, ZipfRanks, battery, hub_degree_floor,
+    is_hub_degree,
 };
 
 /// How often the background sampler polls `/proc/<pid>/status` for RSS, in milliseconds.
@@ -103,6 +104,12 @@ const DEFAULT_VERIFY_FRACTION: f64 = 0.05;
 
 /// How many mismatch exemplars I7 keeps for the report (bounded so a pathological run cannot flood it).
 const MAX_VERIFY_SAMPLES: usize = 8;
+
+/// The generous floor for the anchor-skew HUB threshold (I9, `rmp` #746): an anchor counts as landing on
+/// a hub when its realised FRIEND degree reaches `max(degree_max / 2, HUB_GENEROUS_FLOOR)`. `32` mirrors
+/// the example `run.sh`'s own "power-law grew a supernode (max degree >= 32)" hub detection, so a graph
+/// the harness calls a hub graph is one this gate can assert a read landed on.
+const HUB_GENEROUS_FLOOR: u64 = 32;
 
 // --- The production-shaped MIX defaults (`rmp` #714). The run everyone executes MUST be the mix; a
 // read-only default measured a FROZEN graph and could not expose one concurrency mechanism. ---------
@@ -173,7 +180,9 @@ fn run() -> Result<bool, String> {
     let external = target.is_external();
 
     let (term, _hits) = Generator::dominant_headline_term_for(args.seed, args.articles.max(1));
-    let since = (EPOCH_S + REG_SPAN_S / 2) as i64;
+    // The `like_recent` recent-window cutoff (`rmp` #746): the last ~10% of the timeline, narrow enough
+    // that the `LIKE.date` rel-RANGE index SEEK is genuinely selective (proven by I8 below).
+    let since = battery::LIKE_RECENT_SINCE;
 
     // Capability preflight: connect once, warm each family, keep only the families the target serves.
     let active = preflight_active_families(&target, &args, &term, since)?;
@@ -189,6 +198,16 @@ fn run() -> Result<bool, String> {
     // the loaded edge count. A wrongly-reconstructed oracle must never FALSE-FAIL a correct server, so
     // any doubt leaves the oracle None and I7 reports N/A.
     let oracle = build_read_oracle(&args);
+
+    // --anchor-skew (`rmp` #746): bias read anchors toward the generated SUPERNODE tail. A power-law
+    // graph's high-degree users are SCATTERED across the index space (the stub-count draw is per-user
+    // independent — NOT correlated with the user index), so a naive low-index bias would miss them. The
+    // oracle's per-user FRIEND degree is the only signal that finds them: build a degree-rank permutation
+    // (user indices sorted by degree DESCENDING, rank 0 = the top hub) and draw a rank from a Zipf(skew)
+    // distribution over ranks, so the hubs are drawn far more often. Engaged only when the skew is on AND
+    // the oracle reconstructed; otherwise anchors stay uniform (with a printed note if it was requested).
+    let anchor_ranks = build_anchor_ranks(args.anchor_skew, oracle.as_ref());
+    let graph_power_law = matches!(args.degree_dist, Some(DegreeDist::PowerLaw { .. }));
 
     let ctx = Arc::new(BenchCtx {
         target: target.clone(),
@@ -216,6 +235,9 @@ fn run() -> Result<bool, String> {
         seed: args.seed,
         active: active.clone(),
         bag: weighted_bag(&active),
+        anchor_skew: args.anchor_skew,
+        anchor_ranks,
+        graph_power_law,
     });
 
     let server_pid = args.server_pid.unwrap_or(-1);
@@ -357,7 +379,14 @@ fn run() -> Result<bool, String> {
     };
 
     print_report(&ctx, &rungs, proc_available, external);
-    let invariants = check_invariants(&rungs, probe.as_ref(), &ctx);
+    let mut invariants = check_invariants(&rungs, probe.as_ref(), &ctx);
+    // I8 (`rmp` #746): PROVE the `like_recent` family genuinely SEEKS the LIKE.date rel-RANGE index at
+    // runtime — over the wire, under load, with PROFILE-measured dbHits — so a plan naming the index it
+    // then scans (`rmp` #755) FAILS the run instead of passing behind a green tick. It also prints the
+    // GRAPHUS_SOCIAL_INDEX_PROOF sentinel run.sh asserts on.
+    invariants.push(prove_like_recent(&ctx));
+    // I9 (`rmp` #746): assert `--anchor-skew` actually landed a read on a supernode (N/A off/uniform).
+    invariants.push(check_anchor_hub(&rungs, &ctx));
     let invariants_ok = print_invariants(&invariants);
     print_client_stats_sentinels(&rungs, probe.as_ref(), external, invariants_ok);
 
@@ -433,7 +462,15 @@ fn preflight_active_families(
     let mut active = Vec::new();
     for (i, fam) in battery::ALL.iter().enumerate() {
         let params = op_params(fam.params, &u0, &u1, term, since);
-        match client.run(fam.cypher, params, &args.db) {
+        // `like_recent` (Params::Recent) is warmed in an EXPLICIT read transaction — the same dispatch
+        // path the measured ladder uses for it, so the warm-up exercises the same dispatch. Every other
+        // family warms auto-commit.
+        let outcome = if fam.params == battery::Params::Recent {
+            read_in_read_txn(&mut client, fam.cypher, params, &args.db)
+        } else {
+            client.run(fam.cypher, params, &args.db)
+        };
+        match outcome {
             Ok(_) => active.push(i),
             Err(e) => eprintln!(
                 "social_bench: preflight: dropping family '{}' — target rejected it ({e})",
@@ -464,6 +501,39 @@ fn weighted_bag(active: &[usize]) -> Vec<usize> {
     bag
 }
 
+/// Builds the degree-rank anchor sampler for `--anchor-skew` (`rmp` #746): `(permutation, zipf)` where
+/// `permutation[rank]` is the user index of the `rank`-th highest-degree user (rank 0 = the top hub) and
+/// `zipf` draws a rank biased toward rank 0 with slope `skew`.
+///
+/// Returns `None` — anchors stay UNIFORM — when the skew is off (`skew == 0`) or the oracle could not be
+/// reconstructed (so per-user degree is unknown). In the latter case it prints a note, because a
+/// requested skew that silently fell back to uniform would be a green gate that cannot fire.
+fn build_anchor_ranks(
+    skew: u32,
+    oracle: Option<&SocialReadOracle>,
+) -> Option<(Vec<u64>, ZipfRanks)> {
+    if skew == 0 {
+        return None;
+    }
+    let Some(oracle) = oracle else {
+        eprintln!(
+            "social_bench: --anchor-skew {skew} requested but no oracle reconstructed (pass \
+             --gen-profile so per-user degree is known) — anchors fall back to UNIFORM, and I9 is N/A."
+        );
+        return None;
+    };
+    // User indices sorted by FRIEND degree DESCENDING; ties broken by index ASCENDING so the permutation
+    // is deterministic. rank 0 is the highest-degree user (the top supernode).
+    let mut perm: Vec<u64> = (0..oracle.degree.len() as u64).collect();
+    perm.sort_by(|&a, &b| {
+        oracle.degree[b as usize]
+            .cmp(&oracle.degree[a as usize])
+            .then(a.cmp(&b))
+    });
+    let zipf = ZipfRanks::new(perm.len(), skew);
+    Some((perm, zipf))
+}
+
 /// Builds the per-op `Value` params for a family (anchors vary per op; `term`/`since` are fixed).
 fn op_params(
     kind: battery::Params,
@@ -484,6 +554,39 @@ fn op_params(
         battery::Params::Term => vec![("term".into(), Value::String(term.into()))],
         battery::Params::FulltextTerm => vec![("term".into(), Value::String(term.to_lowercase()))],
         battery::Params::Recent => vec![("since".into(), Value::Integer(since))],
+    }
+}
+
+/// Runs `cypher` inside an **explicit read transaction** (`BEGIN` → `RUN` → `COMMIT`) — the path that
+/// makes an index-backed read really SEEK its index (`rmp` #746/#755). An auto-commit read is dispatched
+/// to the off-thread reader pool. NOTE: the pool no longer declines index seeks for the kinds these
+/// examples exercise (`rmp` #768 node TEXT, #769 relationship), so this is the realistic production
+/// shape rather than a correctness requirement — MEASURED as identical dbHits either way. This is also the production `session.executeRead` shape.
+/// On any server `FAILURE` the connection is `RESET` back to `READY`, so one failed read cannot poison it.
+///
+/// Copied verbatim from `reco_bench` — it is transport-agnostic and depends only on the shared
+/// `graphus_reco_gen::client` seam (`begin` / `run_in_txn` / `commit` / `reset`).
+fn read_in_read_txn(
+    client: &mut BoltClient,
+    cypher: &str,
+    params: Vec<(String, Value)>,
+    db: &str,
+) -> ClientResult<QueryResult> {
+    let reset_on_failure = |client: &mut BoltClient, e: ClientError| -> ClientError {
+        if matches!(e, ClientError::Failure(_)) {
+            let _ = client.reset();
+        }
+        e
+    };
+    if let Err(e) = client.begin(db) {
+        return Err(reset_on_failure(client, e));
+    }
+    match client.run_in_txn(cypher, params) {
+        Ok(qr) => match client.commit() {
+            Ok(()) => Ok(qr),
+            Err(e) => Err(reset_on_failure(client, e)),
+        },
+        Err(e) => Err(reset_on_failure(client, e)),
     }
 }
 
@@ -523,9 +626,36 @@ struct BenchCtx {
     verify_fraction: f64,
     /// The ground-truth oracle I7 checks sampled reads against (`Some` only with a `--gen-profile`).
     oracle: Option<SocialReadOracle>,
+    /// Anchor-skew exponent (`--anchor-skew`); `0` = UNIFORM anchors (the default). `rmp` #746.
+    anchor_skew: u32,
+    /// The degree-rank anchor sampler, present iff anchor-skew is ENGAGED (`anchor_skew > 0` AND the
+    /// oracle reconstructed): `(permutation, zipf)` where `permutation[rank]` is the user index of the
+    /// `rank`-th highest-degree user (rank 0 = the top hub) and `zipf` draws a rank biased toward 0.
+    anchor_ranks: Option<(Vec<u64>, ZipfRanks)>,
+    /// Whether the loaded graph is a power law (grows hubs) — from `--degree-dist zipf`. Only then does
+    /// I9 assert a read landed on a hub; a uniform graph has no hubs, so that assertion is N/A.
+    graph_power_law: bool,
 }
 
 impl BenchCtx {
+    /// Draws one anchor user index for a read op.
+    ///
+    /// When anchor-skew is ENGAGED (`--anchor-skew > 0` AND the oracle reconstructed the per-user
+    /// degree, so `anchor_ranks` is `Some`), it draws a Zipf-distributed RANK biased toward rank 0 (the
+    /// top hub) and maps it to that rank's user index — biasing reads toward the generated supernodes.
+    /// Otherwise it is the historical UNIFORM draw over users. Consumes exactly ONE `next_u64()` either
+    /// way, so both ladder arms replay the identical anchor stream (the cost of the mix stays the only
+    /// delta between them). `rmp` #746.
+    fn draw_anchor(&self, rng: &mut SplitMix64) -> u64 {
+        match &self.anchor_ranks {
+            Some((perm, zipf)) if !perm.is_empty() => {
+                let rank = zipf.sample(rng.next_u64());
+                perm[rank.min(perm.len() - 1)]
+            }
+            _ => rng.next_u64() % self.users,
+        }
+    }
+
     /// Verify roughly every `ceil(1/verify_fraction)`-th read op per worker, or `0` when verification
     /// is disabled or has no oracle. A per-worker counter modulo this value picks the sampled ops, so
     /// the sampling is deterministic and its cost is a bounded fraction of the workload.
@@ -642,6 +772,9 @@ struct WorkerStats {
     verify_skipped: u64,
     /// A bounded sample of mismatch descriptions for the report.
     verify_samples: Vec<String>,
+    /// I9 (`rmp` #746): the max realised FRIEND degree of any anchor this worker queried (oracle-derived;
+    /// `0` when no oracle). Merged by MAX across workers; the anchor-skew hub assertion reads it.
+    max_anchor_degree: u64,
 }
 impl WorkerStats {
     fn new(families: usize) -> Self {
@@ -656,6 +789,7 @@ impl WorkerStats {
             verify_mismatch: 0,
             verify_skipped: 0,
             verify_samples: Vec::new(),
+            max_anchor_degree: 0,
         }
     }
 }
@@ -708,6 +842,8 @@ struct RungResult {
     verify_skipped: u64,
     /// A bounded sample of the rung's mismatch descriptions.
     verify_samples: Vec<String>,
+    /// I9 (`rmp` #746): the max realised FRIEND degree any anchor in this rung queried (`0` if no oracle).
+    max_anchor_degree: u64,
 }
 
 /// Drives a single rung of `clients` concurrent connections **in one arm** and returns its aggregated
@@ -799,6 +935,7 @@ fn drive_rung(
                 merged.verify_ok += ws.verify_ok;
                 merged.verify_mismatch += ws.verify_mismatch;
                 merged.verify_skipped += ws.verify_skipped;
+                merged.max_anchor_degree = merged.max_anchor_degree.max(ws.max_anchor_degree);
                 for s in ws.verify_samples {
                     if merged.verify_samples.len() < MAX_VERIFY_SAMPLES {
                         merged.verify_samples.push(s);
@@ -887,7 +1024,6 @@ fn run_worker(
     let t0 = *origin.get_or_init(Instant::now);
     let interval = ctx.arrival_interval();
     let mut rng = SplitMix64::new(seed);
-    let u0_pool = ctx.users;
     // I7 (`rmp` #744): a deterministic per-worker sampler. `read_ix` counts this worker's read ops; one
     // in `verify_every` of them is checked against the ground-truth oracle, so verification is a bounded
     // fraction of the load and does not materially distort throughput/latency.
@@ -906,11 +1042,19 @@ fn run_worker(
                 thread::sleep(due - now);
             }
         }
-        // Weighted family pick over the ACTIVE set, with anchors spread across the keyspace.
+        // Weighted family pick over the ACTIVE set. Anchors are drawn via `draw_anchor`: UNIFORM by
+        // default, or Zipf-skewed toward the supernode tail when `--anchor-skew > 0` (`rmp` #746).
         let fam_ix = ctx.bag[(rng.next_u64() as usize) % ctx.bag.len()];
         let fam = &battery::ALL[fam_ix];
-        let u0_idx = rng.next_u64() % u0_pool;
-        let u1_idx = rng.next_u64() % u0_pool;
+        let u0_idx = ctx.draw_anchor(&mut rng);
+        let u1_idx = ctx.draw_anchor(&mut rng);
+        // I9: track the max realised FRIEND degree of any anchor this worker actually queried (from the
+        // oracle; 0 when no oracle). With anchor-skew engaged on a power-law graph, this must reach a hub.
+        if let Some(oracle) = &ctx.oracle {
+            let d0 = oracle.degree.get(u0_idx as usize).copied().unwrap_or(0);
+            let d1 = oracle.degree.get(u1_idx as usize).copied().unwrap_or(0);
+            stats.max_anchor_degree = stats.max_anchor_degree.max(d0).max(d1);
+        }
         let u0 = Generator::user_id(u0_idx);
         let u1 = Generator::user_id(u1_idx);
         let params = op_params(fam.params, &u0, &u1, &ctx.term, ctx.since);
@@ -918,7 +1062,17 @@ fn run_worker(
         let sample = verify_every != 0 && read_ix % verify_every == 0;
         read_ix += 1;
         let op_start = scheduled.unwrap_or_else(Instant::now);
-        match client.run(fam.cypher, params, &ctx.db) {
+        // `like_recent` (Params::Recent) runs in an explicit read transaction — the realistic
+        // `session.executeRead` shape, and the one I8 profiles. NOTE: this is no longer *required* for
+        // the seek; `rmp` #769 gave the off-thread reader pool relationship-index seek parity, so the
+        // auto-commit path seeks identically (MEASURED: 2907 dbHits either way). It costs 3 round-trips
+        // per op. Every other family hits its path auto-commit (SI, cannot abort — I1).
+        let outcome = if fam.params == battery::Params::Recent {
+            read_in_read_txn(&mut client, fam.cypher, params, &ctx.db)
+        } else {
+            client.run(fam.cypher, params, &ctx.db)
+        };
+        match outcome {
             Ok(result) => {
                 // Latency is stamped FIRST, so the (sampled-only) verification never inflates it.
                 let ns = u64::try_from(op_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -1124,6 +1278,7 @@ fn aggregate_rung(
         verify_mismatch: merged.verify_mismatch,
         verify_skipped: merged.verify_skipped,
         verify_samples: std::mem::take(&mut merged.verify_samples),
+        max_anchor_degree: merged.max_anchor_degree,
     }
 }
 
@@ -2072,6 +2227,283 @@ fn print_invariants(invariants: &[Invariant]) -> bool {
         ok &= i.ok;
     }
     ok
+}
+
+// ============================================================================================
+// I8 — the like_recent index-seek PROOF (the LIKE.date rel-RANGE index is USED at runtime, rmp #746)
+// ============================================================================================
+
+/// A profiled read: the plan's operators and its **measured** total `dbHits` (`rmp` #752).
+struct ProfiledRead {
+    ops: Vec<String>,
+    db_hits: i64,
+}
+
+/// Reads back a `PROFILE`d reply's measured plan (whatever dispatch path produced it).
+///
+/// # Errors
+/// When the transport/statement failed, the reply carried no plan (a missing `PROFILE` prefix), or the
+/// plan reported no measured `dbHits`.
+fn profiled(result: ClientResult<QueryResult>) -> Result<ProfiledRead, String> {
+    let result = result.map_err(|e| e.to_string())?;
+    let plan = result.plan.as_ref().ok_or_else(|| {
+        "the reply carried no PROFILE plan (did the query keep its PROFILE prefix?)".to_string()
+    })?;
+    let ops = plan.operators();
+    let db_hits = plan
+        .total_db_hits()
+        .ok_or_else(|| "the PROFILE plan reported no measured dbHits".to_string())?;
+    Ok(ProfiledRead { ops, db_hits })
+}
+
+/// An index proof that could not even run (connect/login/statement fault): a hard FAIL.
+fn proof_error(id: &'static str, title: &'static str, msg: &str) -> Invariant {
+    Invariant {
+        id,
+        title,
+        ok: false,
+        detail: msg.to_string(),
+    }
+}
+
+/// An index proof skipped because the family is not served (attach/older server): informational PASS.
+fn proof_skipped(id: &'static str, title: &'static str, why: &str) -> Invariant {
+    Invariant {
+        id,
+        title,
+        ok: true,
+        detail: format!("SKIPPED — {why}"),
+    }
+}
+
+/// The `GRAPHUS_SOCIAL_INDEX_PROOF` sentinel `run.sh` asserts on (the placeholder form for the
+/// error/skip paths, where there are no measured dbHits to report).
+fn print_index_proof_sentinel_na(state: &str) {
+    println!(
+        "GRAPHUS_SOCIAL_INDEX_PROOF rel_range_op={state} rel_range_seek_hits=na rel_range_scan_hits=na"
+    );
+}
+
+/// PROVES, over the wire and UNDER LOAD, that the `like_recent` family genuinely SEEKS the `LIKE.date`
+/// relationship RANGE index at runtime — not merely that the planner named it (`rmp` #746/#755).
+///
+/// Two things are PROFILEd while the same paced writers commit underneath: (1) the recent-window range
+/// query, which must lower to `RelIndexRangeSeek`; (2) an unrestricted full `LIKE` type scan, which no
+/// index serves — the STORE-SCALE reference. The gate ([`bench::index_seek_verdict`]) asserts the
+/// operator is present AND the seek's dbHits are a small fraction (`× 4 <`) of that scan's.
+///
+/// The reference is deliberately a real index-free scan rather than "the same query auto-committed".
+/// The latter was written against `rmp` #755 (the reader pool declining a seek to a scan), but #769 gave
+/// the pool relationship-index seek parity — both paths now seek, measured as seek == scan == 2907 — so
+/// that gate would report FAIL on the very improvement that fixed it. A gate must not depend on a known
+/// defect persisting.
+///
+/// A relationship RANGE index is a B-tree / MVCC-exact index — it does NOT ride the `rmp` #467
+/// latest-state freshness marker a TEXT/trigram index does — so this SEEKS correctly EVEN with writers
+/// active. Prints the `GRAPHUS_SOCIAL_INDEX_PROOF` sentinel (in EVERY path) and returns the I8 invariant.
+/// If the target does not serve `like_recent` (dropped in the capability preflight — an older server
+/// without the rel-RANGE index), the proof is SKIPPED (informational PASS), as reco does for its
+/// index-backed families.
+fn prove_like_recent(ctx: &Arc<BenchCtx>) -> Invariant {
+    const T8: &str =
+        "like_recent genuinely SEEKS the LIKE.date rel-RANGE index, not the rmp #755 scan (I8)";
+
+    let served = battery::ALL
+        .iter()
+        .position(|f| f.name == "like_recent")
+        .is_some_and(|ix| ctx.active.contains(&ix));
+    if !served {
+        print_index_proof_sentinel_na("skipped");
+        return proof_skipped(
+            "I8",
+            T8,
+            "the like_recent family is not served by this target",
+        );
+    }
+    let mut client = match ctx.target.connect(ctx.read_timeout) {
+        Ok(c) => c,
+        Err(e) => {
+            print_index_proof_sentinel_na("error");
+            return proof_error("I8", T8, &format!("index-proof connect failed: {e}"));
+        }
+    };
+    if client.login(&ctx.user, &ctx.password).is_err() {
+        print_index_proof_sentinel_na("error");
+        return proof_error("I8", T8, "index-proof login failed");
+    }
+
+    // Under LOAD: the same paced writers the mix uses commit underneath the profiled reads, so the seek
+    // is certified WHILE writes are landing (not on a frozen graph). `usize::MAX - 1` keeps this window's
+    // write stream from replaying any ladder rung's.
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut writer_handles: Vec<JoinHandle<WriteVector>> = Vec::new();
+    for wi in 0..ctx.effective_writers() {
+        writer_handles.push(spawn_writer(
+            Arc::clone(ctx),
+            Arc::clone(&stop),
+            usize::MAX - 1,
+            wi,
+        ));
+    }
+
+    let params = vec![("since".to_string(), Value::Integer(ctx.since))];
+    let profiled_q = format!("PROFILE {}", battery::LIKE_RECENT.cypher);
+    // (1) Explicit read transaction — seeks RelIndexRangeSeek inline on the engine thread.
+    let seek = profiled(read_in_read_txn(
+        &mut client,
+        &profiled_q,
+        params.clone(),
+        &ctx.db,
+    ));
+    // (2) The STORE-SCALE reference: an unrestricted full `LIKE` type scan, which no index serves.
+    //
+    // This is deliberately NOT "the same query auto-committed". That contrast was written against
+    // `rmp` #755 (the off-thread reader pool declining an index seek to a full scan), but #769 gave the
+    // reader pool relationship-index seek parity, so the auto-commit path now SEEKS too — measured here
+    // as seek == scan == 2907 dbHits, both of them genuine seeks. A gate whose PASS condition depends on
+    // a known defect still being present INVERTS as soon as the defect is fixed: it reports FAIL on an
+    // improvement. Comparing against a real index-free scan instead measures the property actually
+    // claimed — the seek reads a small fraction of the type — and stays valid however the read is
+    // dispatched.
+    let scan = profiled(client.run(
+        "PROFILE MATCH ()-[l:LIKE]->(:ARTICLE) RETURN count(l) AS hits",
+        vec![],
+        &ctx.db,
+    ));
+
+    stop.store(true, Ordering::Relaxed);
+    for h in writer_handles {
+        let _ = h.join();
+    }
+    let _ = client.goodbye();
+
+    let (seek, scan) = match (seek, scan) {
+        (Ok(s), Ok(c)) => (s, c),
+        (Err(e), _) => {
+            print_index_proof_sentinel_na("error");
+            return proof_error("I8", T8, &format!("like_recent seek PROFILE failed: {e}"));
+        }
+        (_, Err(e)) => {
+            print_index_proof_sentinel_na("error");
+            return proof_error(
+                "I8",
+                T8,
+                &format!("like_recent scan-contrast PROFILE failed: {e}"),
+            );
+        }
+    };
+
+    let op_present = seek.ops.iter().any(|o| o == "RelIndexRangeSeek");
+    println!(
+        "GRAPHUS_SOCIAL_INDEX_PROOF rel_range_op={} rel_range_seek_hits={} rel_range_scan_hits={}",
+        if op_present {
+            "RelIndexRangeSeek"
+        } else {
+            "MISSING"
+        },
+        seek.db_hits,
+        scan.db_hits,
+    );
+    match bench::index_seek_verdict(op_present, seek.db_hits, scan.db_hits, 4) {
+        Ok(()) => Invariant {
+            id: "I8",
+            title: T8,
+            ok: true,
+            detail: format!(
+                "RelIndexRangeSeek: recent-window seek dbHits={} vs a {}-dbHit unrestricted full LIKE \
+                 type scan — a genuine rel-RANGE seek reading a small fraction of the type, not a plan \
+                 that names an index it then scans. A rel-RANGE index is B-tree / MVCC-exact, so it \
+                 seeks even while the writers commit underneath.",
+                seek.db_hits, scan.db_hits
+            ),
+        },
+        Err(m) => Invariant {
+            id: "I8",
+            title: T8,
+            ok: false,
+            detail: m,
+        },
+    }
+}
+
+// ============================================================================================
+// I9 — anchor-skew landed a read on a HUB (the supernode bias is real, rmp #746)
+// ============================================================================================
+
+/// I9 (`rmp` #746): when `--anchor-skew > 0` on a power-law graph (with the oracle reconstructed), assert
+/// that some read actually landed on a **HUB** — the max realised FRIEND degree any anchor queried
+/// reached [`hub_degree_floor`]`(degree_max, HUB_GENEROUS_FLOOR)`.
+///
+/// It is **N/A** (an informational PASS, clearly labelled — never a false RED) when the skew is off, no
+/// oracle reconstructed (so the draw fell back to uniform and per-anchor degree is unknown), or the graph
+/// is UNIFORM (it has no hub tail to land on). This makes the gate falsifiable without failing by
+/// accident: it can only FAIL when anchor-skew was genuinely engaged on a hub graph yet no read reached a
+/// hub — exactly the regression (a mis-wired anchor draw) it exists to catch.
+fn check_anchor_hub(rungs: &[RungResult], ctx: &BenchCtx) -> Invariant {
+    const T9: &str = "ANCHOR-SKEW LANDS A READ ON A HUB (rmp #746)";
+    let max_anchor_degree = rungs.iter().map(|r| r.max_anchor_degree).max().unwrap_or(0);
+
+    let (ok, detail) = if ctx.anchor_skew == 0 {
+        (
+            true,
+            "N/A — anchor-skew is off (--anchor-skew 0): anchors are UNIFORM, so there is no hub-bias to \
+             assert."
+                .to_string(),
+        )
+    } else if ctx.oracle.is_none() || ctx.anchor_ranks.is_none() {
+        (
+            true,
+            "N/A — anchor-skew was requested but no oracle reconstructed, so the draw fell back to \
+             UNIFORM and the per-anchor degree is unknown (pass --gen-profile to arm it)."
+                .to_string(),
+        )
+    } else if !ctx.graph_power_law {
+        (
+            true,
+            "N/A — a UNIFORM graph has no hubs to land on; anchor-skew only asserts a hub-hit on a \
+             power-law graph (--degree-dist zipf)."
+                .to_string(),
+        )
+    } else {
+        let degree_max = ctx
+            .oracle
+            .as_ref()
+            .map_or(0, |o| o.degree.iter().copied().max().unwrap_or(0));
+        let floor = hub_degree_floor(degree_max, HUB_GENEROUS_FLOOR);
+        if is_hub_degree(max_anchor_degree, degree_max, HUB_GENEROUS_FLOOR) {
+            (
+                true,
+                format!(
+                    "anchor-skew (Zipf exponent {}) landed a read on a HUB: the max queried anchor \
+                     FRIEND degree {} >= the hub floor {} (max(degree_max/2={}, {})); the loaded \
+                     power-law graph's realised max degree is {}.",
+                    ctx.anchor_skew,
+                    max_anchor_degree,
+                    floor,
+                    degree_max / 2,
+                    HUB_GENEROUS_FLOOR,
+                    degree_max,
+                ),
+            )
+        } else {
+            (
+                false,
+                format!(
+                    "anchor-skew (Zipf exponent {}) was requested on a power-law graph but NO read \
+                     landed on a hub: the max queried anchor FRIEND degree {} < the hub floor {} \
+                     (degree_max {}). The Zipf-over-ranks anchor draw is not biasing reads toward the \
+                     supernode tail.",
+                    ctx.anchor_skew, max_anchor_degree, floor, degree_max,
+                ),
+            )
+        }
+    };
+    Invariant {
+        id: "I9",
+        title: T9,
+        ok,
+        detail,
+    }
 }
 
 /// Renders an optional `f64` sentinel value: the measurement, or the literal `na`.
@@ -3107,6 +3539,11 @@ struct Args {
     friend_max: Option<u64>,
     avg_likes: Option<u64>,
     degree_dist: Option<DegreeDist>,
+    /// I9 (`rmp` #746): anchor-skew exponent (`--anchor-skew`). `0` = UNIFORM anchors (the default);
+    /// `> 0` biases read anchors toward the generated supernode tail with a Zipf(exponent) draw over the
+    /// degree ranks. Engaged only when the oracle reconstructs (needs `--gen-profile`) AND the graph is a
+    /// power law; otherwise it falls back to uniform.
+    anchor_skew: u32,
 }
 
 impl Args {
@@ -3161,6 +3598,7 @@ impl Args {
         let mut avg_likes: Option<u64> = None;
         let mut degree_dist: Option<DegreeDist> = None;
         let mut zipf_exponent: u32 = 2;
+        let mut anchor_skew: u32 = 0;
 
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
@@ -3277,6 +3715,11 @@ impl Args {
                         });
                     }
                 }
+                // I9 (`rmp` #746): bias read anchors toward the supernode tail. `0` = uniform (default).
+                "--anchor-skew" => {
+                    anchor_skew = u32::try_from(parse_u64(&value()?, "--anchor-skew")?)
+                        .map_err(|_| "--anchor-skew too large".to_string())?;
+                }
                 "-h" | "--help" => {
                     print_usage();
                     std::process::exit(0);
@@ -3319,6 +3762,7 @@ impl Args {
             friend_max,
             avg_likes,
             degree_dist,
+            anchor_skew,
             read_timeout_ms: {
                 if read_timeout_ms == 0 {
                     return Err("--read-timeout-ms must be > 0".into());
@@ -3346,6 +3790,8 @@ fn print_usage() {
          \x20   [--hot-write-fraction <f default 0.25>] [--hot-keys <N default 4>] \\\n\
          \x20   [--mix-baseline <0|1 default 1>] [--retry-budget-ms <ms default 15000>] \\\n\
          \x20   [--probe-secs <s default 3>] \\\n\
+         \x20   [--anchor-skew <exp default 0 = uniform; > 0 Zipf-biases anchors to supernodes>] \\\n\
+         \x20   [--gen-profile <fast|large|huge>] [--verify-fraction <f default 0.05>] \\\n\
          \x20   [--target-rps <R default 0 = closed-loop>] [--auto-extend] [--read-timeout-ms <ms default 120000>]"
     );
 }
@@ -3354,8 +3800,8 @@ fn print_usage() {
 mod tests {
     use super::{
         Arm, BenchCtx, ErrorSample, Pcts, ReadCheck, ReadInvariant, RetryPolicy, RungResult,
-        SocialReadOracle, Target, WriteKind, WriteVector, diagnose_knee, du_store, primary_arm,
-        top_rung, verify_social_read,
+        SocialReadOracle, Target, WriteKind, WriteVector, build_anchor_ranks, check_anchor_hub,
+        diagnose_knee, du_store, primary_arm, top_rung, verify_social_read,
     };
     use graphus_core::Value;
     use graphus_reco_gen::client::QueryResult;
@@ -3363,6 +3809,24 @@ mod tests {
     use graphus_social_gen::{SplitMix64, battery};
     use std::path::PathBuf;
     use std::time::Duration;
+
+    /// An oracle fixture with an explicit per-user FRIEND degree vector (`neighbours` unused by the
+    /// anchor-skew path, so kept empty). Used to exercise the anchor draw and the I9 hub verdict.
+    fn oracle_with_degrees(degree: Vec<u64>) -> SocialReadOracle {
+        let n = degree.len();
+        SocialReadOracle {
+            users: n as u64,
+            degree,
+            neighbours: vec![Vec::new(); n],
+        }
+    }
+
+    /// A rung whose only relevant field is the max FRIEND degree its reads queried (for I9).
+    fn rung_anchor(max_anchor_degree: u64) -> RungResult {
+        let mut r = rung(Arm::Mixed, 4, 100.0);
+        r.max_anchor_degree = max_anchor_degree;
+        r
+    }
 
     /// A rung fixture: everything not named is the neutral, "not measured" value.
     fn rung(arm: Arm, clients: usize, ops_per_sec: f64) -> RungResult {
@@ -3394,6 +3858,7 @@ mod tests {
             verify_mismatch: 0,
             verify_skipped: 0,
             verify_samples: Vec::new(),
+            max_anchor_degree: 0,
         }
     }
 
@@ -3422,6 +3887,9 @@ mod tests {
             seed: 7,
             active: vec![0],
             bag: vec![0],
+            anchor_skew: 0,
+            anchor_ranks: None,
+            graph_power_law: false,
         }
     }
 
@@ -3629,6 +4097,116 @@ mod tests {
             fp.wal_cumulative_bytes,
             8 + 8192,
             "wal_cumulative_bytes = the highest seg.<lsn> frontier (base_lsn + size)"
+        );
+    }
+
+    /// `--anchor-skew` (`rmp` #746): with the sampler engaged, the draw lands on the top hub (rank 0)
+    /// the large majority of the time; with it OFF the draw is uniform over the users. This is the
+    /// passing (biased) AND the failing (unbiased) case for "does the anchor draw concentrate on hubs?".
+    #[test]
+    fn anchor_draw_concentrates_on_the_hub_only_when_skew_is_engaged() {
+        // User 0 is a supernode (degree 400); users 1..=3 are ordinary (degree 5). The degree-rank
+        // permutation therefore puts user 0 at rank 0, and Zipf(2) draws rank 0 most of the time.
+        let mut skewed = ctx(2, 20, 0.25);
+        skewed.users = 4;
+        skewed.oracle = Some(oracle_with_degrees(vec![400, 5, 5, 5]));
+        skewed.anchor_skew = 2;
+        skewed.anchor_ranks = build_anchor_ranks(2, skewed.oracle.as_ref());
+        assert!(skewed.anchor_ranks.is_some(), "skew engaged ⇒ ranks built");
+        let mut rng = SplitMix64::new(0xA11C_E5EE_D000_0001);
+        let mut hub_hits = 0u32;
+        for _ in 0..2000 {
+            if skewed.draw_anchor(&mut rng) == 0 {
+                hub_hits += 1;
+            }
+        }
+        assert!(
+            hub_hits > 1000,
+            "the skewed draw must land on the top hub the majority of the time, got {hub_hits}/2000"
+        );
+
+        // With the skew OFF (no ranks), the draw is uniform over 4 users — the hub is drawn ~a quarter
+        // of the time, NOT concentrated. Same seed, so the comparison is apples-to-apples.
+        let mut uniform = ctx(2, 20, 0.25);
+        uniform.users = 4;
+        assert!(uniform.anchor_ranks.is_none(), "skew off ⇒ no ranks");
+        let mut rng = SplitMix64::new(0xA11C_E5EE_D000_0001);
+        let mut hub_hits = 0u32;
+        for _ in 0..2000 {
+            if uniform.draw_anchor(&mut rng) == 0 {
+                hub_hits += 1;
+            }
+        }
+        assert!(
+            hub_hits < 900,
+            "a uniform draw over 4 users must NOT concentrate on the hub, got {hub_hits}/2000"
+        );
+    }
+
+    /// A skew requested WITHOUT an oracle falls back to uniform ranks-less draw (and prints a note),
+    /// never silently pretending to be biased.
+    #[test]
+    fn anchor_skew_without_oracle_falls_back_to_uniform() {
+        assert!(
+            build_anchor_ranks(2, None).is_none(),
+            "no oracle ⇒ no anchor-rank sampler (fall back to uniform)"
+        );
+        assert!(
+            build_anchor_ranks(0, Some(&oracle_with_degrees(vec![1, 2, 3]))).is_none(),
+            "skew 0 ⇒ no anchor-rank sampler even with an oracle"
+        );
+    }
+
+    /// I9 (`rmp` #746) must FIRE (FAIL) when anchor-skew was engaged on a power-law graph yet no read
+    /// reached a hub, PASS when a hub was hit, and stay N/A (informational pass) for the off / uniform /
+    /// no-oracle cases — so it can fail on a real regression without ever false-failing.
+    #[test]
+    fn i9_hub_assert_fires_on_a_miss_and_stays_na_off() {
+        // A power-law graph with a top hub of degree 400; the hub floor is max(200, 32) = 200.
+        let mut c = ctx(2, 20, 0.25);
+        c.users = 4;
+        c.oracle = Some(oracle_with_degrees(vec![400, 5, 5, 5]));
+        c.anchor_skew = 2;
+        c.graph_power_law = true;
+        c.anchor_ranks = build_anchor_ranks(2, c.oracle.as_ref());
+
+        // A read landed on the hub (max anchor degree 400 ≥ 200) ⇒ PASS.
+        let pass = check_anchor_hub(&[rung_anchor(400)], &c);
+        assert_eq!(pass.id, "I9");
+        assert!(pass.ok, "a hub hit must PASS: {}", pass.detail);
+        assert!(pass.detail.contains("landed a read on a HUB"));
+
+        // NO read reached a hub (max anchor degree 5 < 200) while skew was engaged on a hub graph ⇒ FAIL.
+        let fail = check_anchor_hub(&[rung_anchor(5)], &c);
+        assert!(
+            !fail.ok,
+            "no hub hit under engaged skew must FAIL: {}",
+            fail.detail
+        );
+        assert!(fail.detail.contains("NO read"));
+
+        // Skew OFF ⇒ N/A (never a false RED), even with a low max anchor degree.
+        c.anchor_skew = 0;
+        assert!(
+            check_anchor_hub(&[rung_anchor(5)], &c).ok,
+            "skew off ⇒ N/A pass"
+        );
+
+        // Skew on but a UNIFORM graph (no hubs) ⇒ N/A.
+        c.anchor_skew = 2;
+        c.graph_power_law = false;
+        assert!(
+            check_anchor_hub(&[rung_anchor(5)], &c).ok,
+            "uniform graph has no hubs ⇒ N/A pass"
+        );
+
+        // Skew on, power-law, but no oracle ⇒ N/A (the draw fell back to uniform).
+        c.graph_power_law = true;
+        c.oracle = None;
+        c.anchor_ranks = None;
+        assert!(
+            check_anchor_hub(&[rung_anchor(5)], &c).ok,
+            "no oracle ⇒ N/A pass (fell back to uniform)"
         );
     }
 

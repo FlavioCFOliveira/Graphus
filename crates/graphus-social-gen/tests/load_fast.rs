@@ -177,8 +177,8 @@ fn fast_profile_declares_search_schema_and_searches_headlines() {
         out.search_expected
     );
 
-    // --- The LIKE.date range predicate (a scan + residual filter — the rel RANGE index is
-    //     equality-only) returns a non-trivial recent slice: 0 < recent < |LIKE|. -----------------
+    // --- The LIKE.date recent-window range predicate (a `RelIndexRangeSeek` on the like_date_range
+    //     rel RANGE index since `rmp` #680) returns a non-trivial recent slice: 0 < recent < |LIKE|. --
     let recent = out.query("like_recent").expect("like_recent probe");
     let recent_n = recent.scalar.unwrap_or(-1);
     assert!(

@@ -46,12 +46,26 @@ stubs are deterministically shuffled and paired, self-loops avoided, multi-edges
 
 | Mode | Degree law | Realised (fast profile) | What it exercises |
 |------|-----------|--------------------------|-------------------|
-| `uniform` *(default)* | uniform in `[friend_min, friend_max]` | 15,047 edges, degree ∈ [6, 24] | an evenly-connected graph — no hubs |
-| `zipf` | power law `P(k) ∝ k^-s` | 3,688 edges, degree ∈ **[1, 367]**, log2 histogram `1:1242 2:447 4:180 8:68 16:35 32:10 64:13 128:4 256:1` | a **heavy tail of SUPERNODES** — the realistic social shape, and the adversarial case for traversal |
+| `zipf` *(default)* | power law `P(k) ∝ k^-s` | 3,688 edges, degree ∈ **[1, 367]**, log2 histogram `1:1242 2:447 4:180 8:68 16:35 32:10 64:13 128:4 256:1` | a **heavy tail of SUPERNODES** — the realistic social shape, and the adversarial case for traversal |
+| `uniform` | uniform in `[friend_min, friend_max]` | 15,047 edges, degree ∈ [6, 24] | an evenly-connected graph — no hubs |
 
-The power-law run asserts a supernode actually grew (max degree ≥ 32) and prints the degree
-histogram. It is **not** baseline-comparable to the uniform graph, so the structural gate is skipped
-for it (by design, and stated in the run output).
+The default is **power-law**, because a real large social graph is scale-free and only that shape lets
+the example demonstrate what it is named for — reads that traverse SUPERNODES. The power-law run asserts
+a supernode actually grew (max degree ≥ 32), prints the degree histogram, and is gated against the
+committed power-law baseline. The `uniform` mode is the simpler contrast; it has no hubs, so its
+supernode-anchor proof (I9) is a clearly-labelled N/A and its structural gate is skipped (it is not
+baseline-comparable to the power-law baseline).
+
+**Read anchors follow the supernodes (`rmp` #746).** A power-law graph's high-degree users are
+**scattered** across the index space — the per-user stub-count draw is independent of the user index —
+so a naive "low-index" bias would miss them entirely. In `zipf` mode the driver instead uses the
+reconstructed per-user degree to bias its read anchors toward the hub tail: it sorts users by degree
+(rank 0 = the top hub) and draws a rank from a **Zipf(`SOCIAL_ANCHOR_SKEW`, default 2)** distribution,
+so the supernodes are queried far more often (`SOCIAL_ANCHOR_SKEW=0` restores uniform anchors). The run
+then **asserts (invariant I9)** that a read genuinely landed on a hub — the max queried anchor degree
+reaches `max(degree_max/2, 32)` — so a mis-wired skew fails the run instead of quietly querying only the
+long tail. It is engaged only on a power-law graph with the generator config reconstructed
+(`--gen-profile`); on a uniform graph (no hubs) I9 is a clearly-labelled N/A.
 
 ## Scale profiles
 
@@ -84,7 +98,7 @@ the server-side channel is the `/metrics` delta and the host-independent invaria
 
 ```bash
 examples/social-network-large/run.sh                                   # local self-boot
-SOCIAL_DEGREE_DIST=zipf  examples/social-network-large/run.sh          # power-law supernodes
+SOCIAL_DEGREE_DIST=uniform  examples/social-network-large/run.sh       # simpler uniform graph (default is power-law)
 SOCIAL_WRITERS=2 SOCIAL_WRITE_EVERY_MS=20 examples/…/run.sh            # readers contend with live writers
 SOCIAL_PROFILE=large     examples/social-network-large/run.sh          # evidence-scale
 
@@ -93,7 +107,7 @@ GRAPHUS_TARGET_USER=graphus GRAPHUS_TARGET_PASSWORD=… \
   examples/social-network-large/run.sh                                 # attach to a running instance
 ```
 
-Knobs: `SOCIAL_PROFILE`, `SOCIAL_DEGREE_DIST` (+ `SOCIAL_ZIPF_EXPONENT`), `SOCIAL_LADDER` +
+Knobs: `SOCIAL_PROFILE`, `SOCIAL_DEGREE_DIST` (+ `SOCIAL_ZIPF_EXPONENT`, `SOCIAL_ANCHOR_SKEW`), `SOCIAL_LADDER` +
 `SOCIAL_OPS_PER_RUNG` (override the profile's ladder — e.g. `SOCIAL_LADDER=1` to isolate per-family
 latency from queueing, or `1,2,4,8,16,32` to chase the knee), `SOCIAL_WRITERS` /
 `SOCIAL_WRITE_EVERY_MS`, `SOCIAL_READER_THREADS`, `GRAPHUS_BIN_DIR`.
@@ -110,10 +124,10 @@ latency from queueing, or `1,2,4,8,16,32` to chase the knee), `SOCIAL_WRITERS` /
 | 1 | **Deterministic large-graph generation** | `social_gen` emits the graph twice and the bytes are diffed identical. |
 | 2 | **Network bulk import** | The graph is uploaded to a **running server** over REST (`bulk-import`, Mode A) and every structural count is round-tripped back over Bolt. |
 | 3 | **A production search schema** | RANGE (`USER.id`, `ARTICLE.id`), **TEXT** + **FULLTEXT** over `ARTICLE.name`, a **relationship RANGE** on `LIKE.date`, a **composite** node index, the always-on **LOOKUP** token indexes, and an **existence constraint** on `ARTICLE.name` — declared over the wire and asserted `ONLINE`. |
-| 4 | **A concurrent read battery** | Eight families — direct friends, **friend-of-friend**, **mutual friends**, **top-liked** (aggregation + `ORDER BY` + `LIMIT`), degree, **TEXT `CONTAINS`**, **`LIKE.date` range**, and **FULLTEXT** `queryNodes` — driven by C simultaneous Bolt clients. |
+| 4 | **A concurrent read battery** | Eight families — direct friends, **friend-of-friend**, **mutual friends**, **top-liked** (aggregation + `ORDER BY` + `LIMIT`), degree, **TEXT `CONTAINS`**, **`LIKE.date` recent-window range** (a `RelIndexRangeSeek` run in an explicit read transaction — PROFILE-asserted at runtime, see [I8](#the-invariants-it-asserts)), and **FULLTEXT** `queryNodes` — driven by C simultaneous Bolt clients. |
 | 5 | **Read scaling across cores** | The **server process** is sampled per-thread from `/proc` at each rung, so the report shows core utilisation and busy-thread count **vs C**. |
-| 6 | **A production-shaped read/write MIX, ON BY DEFAULT** | Every rung runs **twice** — writers off (control), then writers on (treatment) — so the **cost of the mix** is measured and six concurrency **invariants** are asserted. See [The read/write mix](#the-readwrite-mix). `SOCIAL_WRITERS=0` restores the read-only ladder. |
-| 7 | **Supernode traversal** | The `zipf` mode grows a heavy-tailed hub structure and runs the same battery over it. |
+| 6 | **A production-shaped read/write MIX, ON BY DEFAULT** | Every rung runs **twice** — writers off (control), then writers on (treatment) — so the **cost of the mix** is measured and nine concurrency **invariants** (I1–I9) are asserted. See [The read/write mix](#the-readwrite-mix). `SOCIAL_WRITERS=0` restores the read-only ladder. |
+| 7 | **Supernode traversal** | The `zipf` mode grows a heavy-tailed hub structure, **Zipf-skews the read anchors toward those hubs** (`SOCIAL_ANCHOR_SKEW`), and asserts a read landed on one (I9). |
 | 8 | **Explicit evidence** | A schema-versioned `report.json` + `report.md`: the per-rung scaling curve, real p50/p99/p99.9 per family, server CPU/RSS, and the **decomposed** on-disk footprint. |
 
 ## The read/write mix
@@ -174,8 +188,11 @@ A violation **fails the run**. None is a performance threshold; they are stateme
 | **I4** | **A serialization abort stays retryable** — the `rmp` #612 detector. |
 | **I5** | **A slow reader does not stall the writers** — the GC pin (`rmp` #551). |
 | **I6** | **No read ever fails with an internal server error** (`Neo.DatabaseError.*`). |
+| **I7** | **Reads return correct results** — a sampled fraction of `degree` / `friends` / `mutual` replies is checked against ground truth recomputed from the generator (`rmp` #744). |
+| **I8** | **`like_recent` genuinely SEEKS the `LIKE.date` rel-RANGE index** — PROFILEd over the wire under load: the recent-window seek reads a **small fraction** of the dbHits an unrestricted full `LIKE` type scan reads. A plan naming the index it then scans **fails** here instead of passing behind a green tick (`rmp` #746). |
+| **I9** | **Anchor-skew landed a read on a hub** — on a power-law graph with `--anchor-skew > 0`, the max queried anchor degree reaches a hub floor; N/A (never a false red) when the skew is off, the graph is uniform, or the config could not be reconstructed (`rmp` #746). |
 
-Two honesty notes, because a gate that cannot fire is worse than no gate:
+Three honesty notes, because a gate that cannot fire is worse than no gate:
 
 - **I4 is currently armed but idle.** At the production-shaped default the writers rarely collide, so
   the measured engine abort rate is **~0** (0 aborts in 1238 attempts). With no abort to classify it
@@ -186,6 +203,18 @@ Two honesty notes, because a gate that cannot fire is worse than no gate:
   allocated`) while a writer **grows** the store, because its location oracle is a *snapshot* while the
   record content it navigates is *live*. The writers-off control arm of the same ladder is **clean at
   every rung** — which is exactly why a read-only ladder could never have found it.
+- **I8 measures the seek, it does not trust the plan.** The planner can name a `RelIndexRangeSeek` in the
+  plan while the engine actually runs a full scan (`rmp` #755) — a green tick over a lie. So I8 PROFILEs
+  the recent-window query *under load* and compares its **measured** dbHits (~2.9k) against an
+  unrestricted full `LIKE` type scan, which no index serves. Only the number, not the operator name,
+  tells a genuine seek from a scan.
+
+  The reference is deliberately a real index-free scan and **not** "the same query auto-committed".
+  That earlier contrast was written against `rmp` #755, when the off-thread reader pool declined an
+  index seek to a scan — but `rmp` #769 gave the pool relationship-index seek parity, so both paths now
+  seek (measured: `seek == scan == 2907` dbHits, both genuine). A gate whose PASS condition depends on a
+  known defect still being present reports **FAIL on the improvement that fixes it**, which is how this
+  one was caught.
 
 ## The evidence it collects
 
@@ -216,7 +245,7 @@ Two families cost far more than the rest. To separate a genuinely **slow query**
 | Family | p50 @ C=1 (uncontended) | p50 @ C=8 (saturated) | Why |
 |--------|------------------------:|----------------------:|-----|
 | friends, degree, mutual, friend-of-friend, `CONTAINS`, FULLTEXT | ~2.2 ms | ~2.2–2.8 ms | index-backed seeks + bounded traversal |
-| **`like_recent`** (`LIKE.date >= X`) | **10.5 ms** | 15.5 ms | **measured before `rmp` #680**, when the relationship RANGE index was equality-only and a *range* predicate was a full **scan + residual filter**. Since #680 the same predicate lowers to a `RelIndexRangeSeek`; these numbers therefore describe the *old* plan and **must be re-measured** — no improvement is claimed here that has not been measured |
+| **`like_recent`** (`LIKE.date >= X`, the recent ~10% window) | **6.3 ms** | 11.6 ms | a `RelIndexRangeSeek` on the `LIKE.date` rel-RANGE index (`rmp` #680), run in an **explicit read transaction** (`BEGIN`/`RUN`/`COMMIT` = 3 round-trips). PROFILE-measured (I8): **2907 dbHits over the narrow recent window vs 22595 for an unrestricted full `LIKE` type scan**, a **7.8× reduction in reads-touched**. Wall latency is dominated by the round-trips at this small scale, not the dbHits, so it stays a few ms above the point reads — the win is in reads-touched, provable at any size |
 | **`top_liked`** (aggregation + `ORDER BY` + `LIMIT`) | **12.6 ms** | 20.5 ms | a full aggregation scan over every `LIKE` edge |
 
 The cost is **intrinsic to the query, not to the contention**: even alone on an idle server these two

@@ -111,11 +111,32 @@ use graphus_examples_harness::{
     CpuSection, DatasetScale, EvidenceCollector, MemorySection, RunMetadata,
 };
 use graphus_reco_gen::bench::{self, Pcts};
-use graphus_reco_gen::client::{BoltClient, BoltUrl, ClientResult, QueryResult};
+use graphus_reco_gen::client::{BoltClient, BoltUrl, ClientError, ClientResult, QueryResult};
 use graphus_reco_gen::mix::{
     self, Arm, ErrorSample, READ_LIVENESS_FLOOR, ReadInvariant, RetryPolicy, WriteKind, WriteVector,
 };
-use graphus_reco_gen::{EPOCH_S, GenConfig, Generator, SplitMix64, queries};
+use graphus_reco_gen::queries::FamilyKind;
+use graphus_reco_gen::{EMBED_DIM, EPOCH_S, GenConfig, Generator, SplitMix64, queries, schema};
+
+/// The number of nearest neighbours the ANN "similar products" family requests (`db.index.vector.
+/// queryNodes`'s `$k`). Small — a real "you might also like" strip shows a handful.
+const ANN_K: usize = 5;
+
+/// The absolute dbHits envelope the index proof holds the VECTOR ANN read to.
+///
+/// An HNSW seek reads `O(ef_search)`, **NOT** `O(k)`: `query_knn` searches the base layer with
+/// `ef_search.max(k)`, so every `k` below the default `ef_search` traverses exactly the same graph and
+/// simply keeps more of what the search already materialised (`graphus_index::DEFAULT_EF_SEARCH` = 100;
+/// see the same reasoning spelled out at `graphus-cypher`'s `seek_vector_knn` call site: "past a point
+/// the binding constraint is `ef_search`, not k'"). A `k`-scaled bound is therefore wrong *by
+/// construction* — MEASURED: `k = 5` reads 50 dbHits, which a `k × 8 = 40` bound rejected as a
+/// "brute-force scan" even though the same read is 16× cheaper than the 800-dbHit full catalogue scan.
+///
+/// `2 × DEFAULT_EF_SEARCH` leaves margin for the over-fetch (`k' = 2k`) and the per-candidate MVCC/RBAC
+/// re-checks while staying flat as the catalogue grows — which is the property that actually
+/// distinguishes an HNSW seek from a brute-force scan. The ratio test against the measured full scan
+/// remains the primary gate; this is the shape check beside it.
+const ANN_EF_ENVELOPE: i64 = 200;
 
 /// How often the background sampler polls `/proc/<pid>/status` for RSS, in milliseconds.
 const SAMPLE_INTERVAL_MS: u64 = 50;
@@ -258,6 +279,21 @@ fn run() -> Result<bool, String> {
     let products = args.products.max(1);
     let oracle = ReadOracle::build(gen_seed, users, products, gen_cfg.as_ref(), graph_static);
 
+    // Capability preflight for the two index-backed families (`rmp` #746): the LOCAL (REST bulk-import)
+    // path declares the full VECTOR + TEXT schema, so both are served; the ATTACH path declares only a
+    // version-tolerant minimal schema (an older server may lack the VECTOR/TEXT DDL), so a family whose
+    // warm-up errors is DROPPED from the mix and its index proof reported SKIPPED — never a false
+    // failure against a server that legitimately does not have the index.
+    let (ann_active, text_active) = preflight_index_families(
+        &target,
+        &args.user,
+        &args.password,
+        &args.db,
+        &oracle,
+        Duration::from_millis(args.read_timeout_ms),
+    );
+    let active_bag = build_active_bag(ann_active, text_active);
+
     let ctx = Arc::new(BenchCtx {
         target: target.clone(),
         user: args.user.clone(),
@@ -280,6 +316,9 @@ fn run() -> Result<bool, String> {
         seed: args.seed,
         verify_fraction: args.verify_fraction,
         oracle,
+        active_bag,
+        ann_active,
+        text_active,
     });
 
     // Server-process `/proc` sampling is only meaningful for a co-located pid (local mode). In attach
@@ -431,8 +470,12 @@ fn run() -> Result<bool, String> {
 
     print_report(&rungs, proc_available, external);
 
-    // The invariants (I1–I5). Each prints its own PASS/FAIL line; any violation fails the process.
-    let invariants = check_invariants(&rungs, probe.as_ref(), &ctx);
+    // The invariants (I1–I7). Each prints its own PASS/FAIL line; any violation fails the process.
+    let mut invariants = check_invariants(&rungs, probe.as_ref(), &ctx);
+    // I8/I9 (`rmp` #746): PROVE the declared VECTOR + TEXT indexes are genuinely USED at runtime — over
+    // the wire, under load, with PROFILE-measured dbHits — so the plan naming an index it then scans
+    // (`rmp` #755) FAILS the run instead of passing behind a green tick.
+    invariants.extend(prove_index_seeks(&ctx));
     let invariants_ok = print_invariants(&invariants);
 
     // Machine-readable client-side stats sentinels for run.sh to forward to measure_target (the ONLY
@@ -523,6 +566,15 @@ struct BenchCtx {
     verify_fraction: f64,
     /// The ground-truth oracle I7 checks sampled reads against (`rmp` #744).
     oracle: ReadOracle,
+    /// The weighted pick bag (`rmp` #746): each ACTIVE read-battery family's index repeated by its
+    /// weight. The two index-backed families are present only when the target serves them (see the
+    /// capability preflight); a uniform draw over this bag therefore reproduces the relative family
+    /// weights among the families that are actually available.
+    active_bag: Vec<usize>,
+    /// Whether the VECTOR ANN family (`p_ann`) is served by the target (preflight result).
+    ann_active: bool,
+    /// Whether the TEXT `CONTAINS` family (`p_search`) is served by the target (preflight result).
+    text_active: bool,
 }
 
 impl BenchCtx {
@@ -934,23 +986,39 @@ fn run_worker(
                 thread::sleep(due - now);
             }
         }
-        let spec = queries::pick(rng.next_u64());
-        let fam = bench::family_index(spec);
-        let uidx = rng.next_u64() % ctx.users;
-        let id = Generator::user_id(uidx);
-        let params = vec![("id".to_string(), Value::String(id))];
-        // Sample this op for I7 verification (before the round-trip, so the decision is deterministic).
-        let sample = verify_every != 0 && read_ix % verify_every == 0;
+        // Draw a family from the ACTIVE bag (`rmp` #746): the index-backed families are present only
+        // when the target serves them, so an attach run against an older server without the VECTOR/TEXT
+        // schema never picks a family it cannot serve.
+        let fam = ctx.active_bag[(rng.next_u64() as usize) % ctx.active_bag.len()];
+        let spec = &queries::READ_BATTERY[fam];
+        // Build this op's parameters + verification anchor, and choose the dispatch path that actually
+        // hits its declared index at runtime (`rmp` #746/#755) — auto-commit for the traversal and the
+        // (inline-HNSW) ANN families, an explicit read transaction for the TEXT `CONTAINS` seek.
+        let op = build_read_op(spec, &mut rng, &ctx.oracle, ctx.users);
+        // I7 verification: sample the UserAnchored families (5% by default); ALWAYS verify the two
+        // index-backed families (their correctness IS the exercise, and the check is O(rows) cheap).
+        let sample = matches!(spec.kind, FamilyKind::VectorAnn | FamilyKind::TextContains)
+            || (verify_every != 0 && read_ix % verify_every == 0);
         read_ix += 1;
         let op_start = scheduled.unwrap_or_else(Instant::now);
-        match client.run(spec.cypher, params, &ctx.db) {
+        let outcome = match spec.kind {
+            // The TEXT search MUST run inside an explicit read transaction to seek NodeTextIndexSeek;
+            // — the realistic `session.executeRead` shape (see `read_in_read_txn` on why this is no
+            // longer what makes the seek happen).
+            FamilyKind::TextContains => {
+                read_in_read_txn(&mut client, spec.cypher, op.params.clone(), &ctx.db)
+            }
+            // UserAnchored + the (not-reader-safe, inline) ANN procedure hit their path auto-commit.
+            _ => client.run(spec.cypher, op.params.clone(), &ctx.db),
+        };
+        match outcome {
             Ok(result) => {
-                // Latency is stamped FIRST, so the (sampled-only) verification never inflates it.
+                // Latency is stamped FIRST, so the verification never inflates it.
                 let ns = u64::try_from(op_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 stats.lat[fam].push(ns);
                 stats.ok[fam] += 1;
                 if sample {
-                    match verify_reco_read(spec.name, &result, &ctx.oracle, uidx) {
+                    match verify_read_op(spec, &result, &ctx.oracle, &op) {
                         ReadCheck::Verified => stats.verify_ok += 1,
                         ReadCheck::Skipped => stats.verify_skipped += 1,
                         ReadCheck::Mismatch(detail) => {
@@ -964,9 +1032,10 @@ fn run_worker(
             }
             Err(e) => {
                 stats.err[fam] += 1;
-                // I1: an auto-commit read runs at Snapshot Isolation. If it came back with a
-                // serialization abort, the SI guarantee is broken — that is an INVARIANT VIOLATION,
-                // not a statistic to be averaged into an error rate.
+                // I1: a read runs read-only (auto-commit at Snapshot Isolation, or a read-only explicit
+                // transaction whose SIREAD-only footprint can never make it an SSI pivot — proven 0
+                // aborts under a hot-write storm, `rmp` #746). A serialization abort here is therefore an
+                // INVARIANT VIOLATION, not a statistic to be averaged into an error rate.
                 stats.reads.record(&e);
                 // …and whatever it was, RECORD WHAT IT WAS. A bare error rate cannot be acted on.
                 stats.read_errors.record(&e);
@@ -1650,6 +1719,331 @@ struct Invariant {
     title: &'static str,
     ok: bool,
     detail: String,
+}
+
+// ============================================================================================
+// I8 / I9 — the index-seek PROOF (the declared VECTOR + TEXT indexes are USED at runtime, rmp #746)
+// ============================================================================================
+
+/// A profiled read: the plan's operators and its **measured** total `dbHits` (`rmp` #752), plus the rows
+/// (for a ground-truth check).
+struct ProfiledRead {
+    ops: Vec<String>,
+    db_hits: i64,
+    result: QueryResult,
+}
+
+/// Reads back a `PROFILE`d reply's measured plan (whatever dispatch path produced it).
+///
+/// # Errors
+/// When the transport/statement failed, the reply carried no plan (a missing `PROFILE` prefix), or the
+/// plan reported no measured `dbHits`.
+fn profiled(result: ClientResult<QueryResult>) -> Result<ProfiledRead, String> {
+    let result = result.map_err(|e| e.to_string())?;
+    let plan = result.plan.as_ref().ok_or_else(|| {
+        "the reply carried no PROFILE plan (did the query keep its PROFILE prefix?)".to_string()
+    })?;
+    let ops = plan.operators();
+    let db_hits = plan
+        .total_db_hits()
+        .ok_or_else(|| "the PROFILE plan reported no measured dbHits".to_string())?;
+    Ok(ProfiledRead {
+        ops,
+        db_hits,
+        result,
+    })
+}
+
+/// An index proof that could not even run (connect/login/statement fault): a hard FAIL.
+fn proof_error(id: &'static str, title: &'static str, msg: &str) -> Invariant {
+    Invariant {
+        id,
+        title,
+        ok: false,
+        detail: msg.to_string(),
+    }
+}
+
+/// An index proof skipped because the family is not served (attach/older server): an informational PASS.
+fn proof_skipped(id: &'static str, title: &'static str, why: &str) -> Invariant {
+    Invariant {
+        id,
+        title,
+        ok: true,
+        detail: format!("SKIPPED — {why}"),
+    }
+}
+
+/// PROVES, over the wire and UNDER LOAD, that the two declared index-backed families genuinely USE their
+/// index at runtime — not merely that the planner named it (`rmp` #746/#755). Each query is PROFILEd on
+/// the dispatch path the mix uses, its real `dbHits` measured, and compared against a full scan while the
+/// same paced writers commit underneath. Returns the two invariants (I8, I9) and prints a
+/// `GRAPHUS_RECO_INDEX_PROOF` sentinel carrying the measured numbers.
+fn prove_index_seeks(ctx: &Arc<BenchCtx>) -> Vec<Invariant> {
+    const T8: &str = "VECTOR ANN retrieval genuinely uses the HNSW index at runtime (I8)";
+    const T9: &str = "TEXT CONTAINS genuinely SEEKS the trigram index, not the rmp #755 scan (I9)";
+
+    let mut client = match ctx.target.connect(ctx.read_timeout) {
+        Ok(c) => c,
+        Err(e) => {
+            let m = format!("index-proof connect failed: {e}");
+            return vec![proof_error("I8", T8, &m), proof_error("I9", T9, &m)];
+        }
+    };
+    if client.login(&ctx.user, &ctx.password).is_err() {
+        return vec![
+            proof_error("I8", T8, "index-proof login failed"),
+            proof_error("I9", T9, "index-proof login failed"),
+        ];
+    }
+
+    // Run the proof UNDER LOAD: the same paced writers the mix uses commit underneath the profiled
+    // reads, so the seeks are certified WHILE writes are landing (not on a frozen graph). `usize::MAX-1`
+    // keeps this window's write stream from replaying any ladder rung's.
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut writer_handles: Vec<JoinHandle<WriteVector>> = Vec::new();
+    for wi in 0..ctx.effective_writers() {
+        writer_handles.push(spawn_writer(
+            Arc::clone(ctx),
+            Arc::clone(&stop),
+            usize::MAX - 1,
+            wi,
+        ));
+    }
+
+    let (i8, v_sentinel) = prove_vector(&mut client, ctx, T8);
+    let (i9, t_sentinel) = prove_text(&mut client, ctx, T9);
+
+    stop.store(true, Ordering::Relaxed);
+    for h in writer_handles {
+        let _ = h.join();
+    }
+    let _ = client.goodbye();
+
+    println!("GRAPHUS_RECO_INDEX_PROOF {v_sentinel} {t_sentinel}");
+    vec![i8, i9]
+}
+
+/// The I8 proof: the VECTOR ANN family runs inline (`ProcedureCall`), reads O(k) not O(store), and
+/// returns the queried category's products. Returns `(invariant, sentinel_fragment)`.
+fn prove_vector(
+    client: &mut BoltClient,
+    ctx: &BenchCtx,
+    title: &'static str,
+) -> (Invariant, String) {
+    if !ctx.ann_active {
+        return (
+            proof_skipped(
+                "I8",
+                title,
+                "the VECTOR ANN family is not served by this target",
+            ),
+            "vector=skipped".to_string(),
+        );
+    }
+    let category = ctx.oracle.ann_categories.first().copied().unwrap_or(0);
+    let ann_spec = queries::READ_BATTERY
+        .iter()
+        .find(|q| q.kind == FamilyKind::VectorAnn)
+        .expect("INVARIANT: the battery has one VECTOR ANN family");
+    let query_vector: Vec<Value> = Generator::category_centroid(category)
+        .iter()
+        .map(|x| Value::Float(f64::from(*x)))
+        .collect();
+    let ann_params = vec![
+        (
+            "indexName".to_string(),
+            Value::String(schema::PRODUCT_EMBEDDING_VECTOR.to_string()),
+        ),
+        ("k".to_string(), Value::Integer(ANN_K as i64)),
+        ("queryVector".to_string(), Value::List(query_vector)),
+    ];
+    let ann =
+        match profiled(client.run(&format!("PROFILE {}", ann_spec.cypher), ann_params, &ctx.db)) {
+            Ok(p) => p,
+            Err(e) => {
+                return (
+                    proof_error("I8", title, &format!("ANN PROFILE failed: {e}")),
+                    "vector=error".to_string(),
+                );
+            }
+        };
+    // A forced full Product scan: no index serves `p.category <> ''`, so it reads every product.
+    let scan = match profiled(client.run(
+        "PROFILE MATCH (p:Product) WHERE p.category <> $x RETURN count(p) AS n",
+        vec![("x".to_string(), Value::String(String::new()))],
+        &ctx.db,
+    )) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                proof_error("I8", title, &format!("scan-reference PROFILE failed: {e}")),
+                "vector=error".to_string(),
+            );
+        }
+    };
+
+    let op_present = ann.ops.iter().any(|o| o == "ProcedureCall");
+    let ground_truth = verify_ann(&ann.result, &ctx.oracle, category);
+    let sentinel = format!(
+        "vector_op={} vector_hits={} scan_hits={} vector_k={ANN_K}",
+        if op_present {
+            "ProcedureCall"
+        } else {
+            "MISSING"
+        },
+        ann.db_hits,
+        scan.db_hits
+    );
+    // Genuine HNSW seek: the ProcedureCall is present, the neighbours are correct, and the dbHits are
+    // k-scale AND a fraction of a full scan (a brute-force scan-then-top-k would read the whole store).
+    let fail: Option<String> = if !op_present {
+        Some(format!(
+            "the ANN plan has no ProcedureCall calling the vector index: {:?}",
+            ann.ops
+        ))
+    } else if let ReadCheck::Mismatch(m) = &ground_truth {
+        Some(format!("ANN ground truth failed: {m}"))
+    } else if ann.db_hits >= scan.db_hits {
+        Some(format!(
+            "the ANN read as much of the store as a full scan: ann={} scan={}",
+            ann.db_hits, scan.db_hits
+        ))
+    } else if ann.db_hits > ANN_EF_ENVELOPE {
+        Some(format!(
+            "the ANN dbHits {} exceed the HNSW candidate-list envelope ({ANN_EF_ENVELOPE}) — the read \
+             is growing with the store, i.e. a brute-force scan rather than an HNSW seek",
+            ann.db_hits
+        ))
+    } else {
+        None
+    };
+    let inv = match fail {
+        None => Invariant {
+            id: "I8",
+            title,
+            ok: true,
+            detail: format!(
+                "ProcedureCall + HNSW seek: ann dbHits={} (k={ANN_K}, envelope {ANN_EF_ENVELOPE}) vs a \
+                 {}-dbHit full Product scan; \
+                 every neighbour is category '{}' with a strong score",
+                ann.db_hits,
+                scan.db_hits,
+                Generator::category_name(category)
+            ),
+        },
+        Some(m) => Invariant {
+            id: "I8",
+            title,
+            ok: false,
+            detail: m,
+        },
+    };
+    (inv, sentinel)
+}
+
+/// The I9 proof: the TEXT `CONTAINS` search SEEKS `NodeTextIndexSeek` in an explicit transaction and
+/// reads a small fraction of a forced index-free full `Product` label scan.
+/// Returns `(invariant, sentinel_fragment)`.
+fn prove_text(client: &mut BoltClient, ctx: &BenchCtx, title: &'static str) -> (Invariant, String) {
+    if !ctx.text_active {
+        return (
+            proof_skipped(
+                "I9",
+                title,
+                "the TEXT CONTAINS family is not served by this target",
+            ),
+            "text=skipped".to_string(),
+        );
+    }
+    let text_spec = queries::READ_BATTERY
+        .iter()
+        .find(|q| q.kind == FamilyKind::TextContains)
+        .expect("INVARIANT: the battery has one TEXT search family");
+    let product_ix = 0u64;
+    let params = vec![(
+        "fragment".to_string(),
+        Value::String(product_search_fragment(ctx.oracle.gen_seed, product_ix)),
+    )];
+    let profiled_q = format!("PROFILE {}", text_spec.cypher);
+    // Explicit read transaction: seeks NodeTextIndexSeek (inline on the engine thread).
+    let seek = match profiled(read_in_read_txn(client, &profiled_q, params, &ctx.db)) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                proof_error("I9", title, &format!("TEXT seek PROFILE failed: {e}")),
+                "text=error".to_string(),
+            );
+        }
+    };
+    // The STORE-SCALE reference: a forced full `Product` label scan that no index serves.
+    //
+    // Deliberately NOT "the same query auto-committed". That contrast was written against `rmp` #755
+    // (the off-thread reader pool declining an index seek to a full scan), but #768 gave the pool node
+    // TEXT-seek parity, so the auto-commit path now seeks exactly as an explicit transaction does —
+    // measured on an isolated server as 23 dbHits either way. A gate whose PASS condition requires a
+    // known defect to still be present INVERTS the moment the defect is fixed: it reports FAIL on an
+    // improvement. Comparing against a real index-free scan measures the property actually claimed —
+    // the seek reads a handful of products, not the catalogue — and holds however the read is
+    // dispatched.
+    let scan = match profiled(client.run(
+        "PROFILE MATCH (p:Product) WHERE p.category <> $x RETURN count(p) AS n",
+        vec![("x".to_string(), Value::String(String::new()))],
+        &ctx.db,
+    )) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                proof_error(
+                    "I9",
+                    title,
+                    &format!("TEXT scan-contrast PROFILE failed: {e}"),
+                ),
+                "text=error".to_string(),
+            );
+        }
+    };
+
+    let op_present = seek.ops.iter().any(|o| o == "NodeTextIndexSeek");
+    let ground_truth = verify_text(&seek.result, &ctx.oracle, product_ix);
+    let sentinel = format!(
+        "text_op={} text_seek_hits={} text_scan_hits={}",
+        if op_present {
+            "NodeTextIndexSeek"
+        } else {
+            "MISSING"
+        },
+        seek.db_hits,
+        scan.db_hits
+    );
+    let fail: Option<String> =
+        if let Err(m) = bench::index_seek_verdict(op_present, seek.db_hits, scan.db_hits, 4) {
+            Some(m)
+        } else if let ReadCheck::Mismatch(m) = &ground_truth {
+            Some(format!("TEXT ground truth failed: {m}"))
+        } else {
+            None
+        };
+    let inv = match fail {
+        None => Invariant {
+            id: "I9",
+            title,
+            ok: true,
+            detail: format!(
+                "NodeTextIndexSeek: trigram seek dbHits={} vs a {}-dbHit forced full Product scan — a \
+                 genuine seek reading a handful of products, not a plan that names an index it then \
+                 scans",
+                seek.db_hits, scan.db_hits
+            ),
+        },
+        Some(m) => Invariant {
+            id: "I9",
+            title,
+            ok: false,
+            detail: m,
+        },
+    };
+    (inv, sentinel)
 }
 
 /// Evaluates every invariant the mix makes checkable. A violation FAILS the run (non-zero exit): none
@@ -2873,6 +3267,15 @@ struct ReadOracle {
     /// Per-user SORTED distinct purchased product indices — `Some` only when the graph is static (no
     /// writers) AND a `--gen-profile` is given (the write workload otherwise mutates the purchased set).
     purchases: Option<Vec<Vec<u32>>>,
+    /// The category index (`0..EMBED_DIM`) of every product, by product index — a pure function of the
+    /// generation seed (`Generator::product_category_index`). The ANN ground-truth: a returned node id
+    /// maps to a product whose category must equal the queried centroid's category.
+    product_category: Vec<usize>,
+    /// The category indices that have **at least [`ANN_K`] products**, so a k-NN query at their centroid
+    /// returns a full k of that category (all same-category ⇒ the ground-truth check is exact). The ANN
+    /// family draws its query category only from here. Falls back to all categories if none qualifies
+    /// (a degenerate tiny catalogue), keeping the family runnable.
+    ann_categories: Vec<usize>,
 }
 
 impl ReadOracle {
@@ -2892,6 +3295,25 @@ impl ReadOracle {
             if let Ok(key) = u128::from_str_radix(&Generator::product_id(k), 16) {
                 product_index.insert(key, k as u32);
             }
+        }
+        // Per-product category + which categories have >= ANN_K products (the ANN query categories).
+        // Category is a pure function of (gen_seed, product index), independent of the write workload.
+        let product_category: Vec<usize> = (0..products)
+            .map(|i| Generator::product_category_index(gen_seed, i))
+            .collect();
+        let mut per_category = [0usize; EMBED_DIM];
+        for &c in &product_category {
+            if c < EMBED_DIM {
+                per_category[c] += 1;
+            }
+        }
+        let mut ann_categories: Vec<usize> = (0..EMBED_DIM)
+            .filter(|&c| per_category[c] >= ANN_K)
+            .collect();
+        if ann_categories.is_empty() {
+            // Degenerate tiny catalogue: no category has k products. Query every category anyway (the
+            // ground-truth check tolerates fewer than k rows), so the family still runs.
+            ann_categories = (0..EMBED_DIM).collect();
         }
         let (degree, purchases) = match cfg {
             None => (None, None),
@@ -2918,7 +3340,242 @@ impl ReadOracle {
             product_index,
             degree,
             purchases,
+            product_category,
+            ann_categories,
         }
+    }
+
+    /// Picks a query **category** for one ANN op from the well-populated set, by a uniform draw. The
+    /// draw is the caller's RNG value reduced modulo the eligible-category count, so distinct ops spread
+    /// across categories deterministically.
+    fn ann_category(&self, draw: u64) -> usize {
+        let n = self.ann_categories.len().max(1) as u64;
+        self.ann_categories[(draw % n) as usize]
+    }
+
+    /// The generated category of the product whose 24-hex id is `id`, or `None` if `id` is not a real
+    /// product (the ANN must never return a phantom node). Used by the ANN ground-truth check.
+    fn category_of_product_id(&self, id: &str) -> Option<usize> {
+        let key = u128::from_str_radix(id, 16).ok()?;
+        let ix = *self.product_index.get(&key)? as usize;
+        self.product_category.get(ix).copied()
+    }
+
+    /// The number of products in the loaded catalogue (bounds the TEXT search's anchor product index).
+    fn products(&self) -> u64 {
+        self.product_category.len() as u64
+    }
+}
+
+/// One read op's parameters + the ground-truth ANCHOR the verifier checks the reply against. Built on
+/// the worker thread from the family's [`FamilyKind`], so a family's parameter shape, dispatch path, and
+/// verification all stay in one place (`rmp` #746).
+struct ReadOp {
+    /// The `$`-parameters for this op, already the shape the family's Cypher binds.
+    params: Vec<(String, Value)>,
+    /// What the verifier checks the reply against.
+    anchor: OpAnchor,
+}
+
+/// The family-specific verification anchor for one read op.
+enum OpAnchor {
+    /// A `(:User {id})` anchor: the user index the op drew.
+    User(u64),
+    /// A VECTOR ANN query at `category`'s centroid: every returned node must be that category.
+    Ann { category: usize },
+    /// A TEXT `CONTAINS` search whose fragment is product `product_ix`'s unique reference code
+    /// (`REF-…`, carried inside its name): that product's id must appear in the reply.
+    Text { product_ix: u64 },
+}
+
+/// Builds one read op — its parameters and its verification anchor — for `spec`, drawing anchors from
+/// `rng`. Each [`FamilyKind`] binds exactly the parameters its Cypher expects (`rmp` #746): the ANN's
+/// `$queryVector` is a real `LIST<FLOAT>` category centroid, never a string-formatted literal.
+fn build_read_op(
+    spec: &queries::QuerySpec,
+    rng: &mut SplitMix64,
+    oracle: &ReadOracle,
+    users: u64,
+) -> ReadOp {
+    match spec.kind {
+        FamilyKind::UserAnchored => {
+            let uidx = rng.next_u64() % users.max(1);
+            ReadOp {
+                params: vec![("id".to_string(), Value::String(Generator::user_id(uidx)))],
+                anchor: OpAnchor::User(uidx),
+            }
+        }
+        FamilyKind::VectorAnn => {
+            let category = oracle.ann_category(rng.next_u64());
+            // The query vector is the category CENTROID, passed as a real LIST<FLOAT> Bolt parameter.
+            let query_vector: Vec<Value> = Generator::category_centroid(category)
+                .iter()
+                .map(|x| Value::Float(f64::from(*x)))
+                .collect();
+            ReadOp {
+                params: vec![
+                    (
+                        "indexName".to_string(),
+                        Value::String(schema::PRODUCT_EMBEDDING_VECTOR.to_string()),
+                    ),
+                    ("k".to_string(), Value::Integer(ANN_K as i64)),
+                    ("queryVector".to_string(), Value::List(query_vector)),
+                ],
+                anchor: OpAnchor::Ann { category },
+            }
+        }
+        FamilyKind::TextContains => {
+            let product_ix = rng.next_u64() % oracle.products().max(1);
+            ReadOp {
+                params: vec![(
+                    "fragment".to_string(),
+                    Value::String(product_search_fragment(oracle.gen_seed, product_ix)),
+                )],
+                anchor: OpAnchor::Text { product_ix },
+            }
+        }
+    }
+}
+
+/// A **selective** `CONTAINS` search fragment for product `i` — its unique **reference code**
+/// (`REF-…`, [`Generator::product_model_code`]), a real "find this product by its model/SKU" search.
+///
+/// The reference code rather than a bare noun is used deliberately: the generator assembles names from
+/// small shared pools (25 nouns, 15 adjectives, 10 brands), so every *trigram* of a natural-language
+/// fragment appears across a large fraction of the catalogue and a `CONTAINS '<noun>'` seek is NOT
+/// selective — its trigram candidate set is nearly the whole store, so it reads as much as a full scan
+/// (measured 801 ≈ 801 dbHits) and the index-proof gate cannot tell a genuine seek from the `rmp` #755
+/// decline. The reference code's trigrams are rare (they derive from the product's unique id), so its
+/// seek reads a handful of products — a genuine, index-serviceable search. It is comma-free and, by
+/// construction, present in product `i`'s own `name`, so the ground-truth check is exact. It does not
+/// depend on the generation seed (the id is a pure function of the index), but the parameter is kept for
+/// call-site symmetry with the other fragment builders.
+fn product_search_fragment(_gen_seed: u64, i: u64) -> String {
+    Generator::product_model_code(i)
+}
+
+/// Warms the two index-backed families once to learn whether the target actually serves them (`rmp`
+/// #746). Returns `(ann_active, text_active)`.
+///
+/// The LOCAL (REST bulk-import) path declares the full VECTOR + TEXT schema, so both warm-ups succeed;
+/// the ATTACH path declares only a version-tolerant minimal schema (an older server may lack the
+/// VECTOR/TEXT DDL), so a family whose warm-up ERRORS is dropped from the mix and its index proof
+/// reported SKIPPED — a server that legitimately has no such index must not fail the run. `UserAnchored`
+/// families are always active. A connect/login failure drops both (the ladder's own connect gate then
+/// surfaces the real fault).
+fn preflight_index_families(
+    target: &Target,
+    user: &str,
+    password: &str,
+    db: &str,
+    oracle: &ReadOracle,
+    read_timeout: Duration,
+) -> (bool, bool) {
+    let mut client = match target.connect(read_timeout) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "reco_bench: index-family preflight: connect failed ({e}); dropping ANN + TEXT families"
+            );
+            return (false, false);
+        }
+    };
+    if client.login(user, password).is_err() {
+        eprintln!("reco_bench: index-family preflight: login failed; dropping ANN + TEXT families");
+        return (false, false);
+    }
+    let mut rng = SplitMix64::new(0x0A22_15EE_C0DE_0746 ^ oracle.gen_seed);
+    let ann_spec = queries::READ_BATTERY
+        .iter()
+        .find(|q| q.kind == FamilyKind::VectorAnn)
+        .expect("INVARIANT: the read battery has one VECTOR ANN family");
+    let ann_op = build_read_op(ann_spec, &mut rng, oracle, oracle.users);
+    let ann_active = client.run(ann_spec.cypher, ann_op.params, db).is_ok();
+    let text_spec = queries::READ_BATTERY
+        .iter()
+        .find(|q| q.kind == FamilyKind::TextContains)
+        .expect("INVARIANT: the read battery has one TEXT search family");
+    let text_op = build_read_op(text_spec, &mut rng, oracle, oracle.users);
+    let text_active = read_in_read_txn(&mut client, text_spec.cypher, text_op.params, db).is_ok();
+    if !ann_active {
+        eprintln!(
+            "reco_bench: index-family preflight: the VECTOR ANN family (db.index.vector.queryNodes) is \
+             not served — dropping p_ann and skipping its index proof (I8)."
+        );
+    }
+    if !text_active {
+        eprintln!(
+            "reco_bench: index-family preflight: the TEXT CONTAINS family is not served — dropping \
+             p_search and skipping its index proof (I9)."
+        );
+    }
+    let _ = client.goodbye();
+    (ann_active, text_active)
+}
+
+/// Builds the weighted pick bag over the ACTIVE families (`rmp` #746): each family's index repeated by
+/// its weight, dropping the two index-backed families when the preflight found the target does not serve
+/// them. `UserAnchored` families are always included, so the bag is never empty.
+fn build_active_bag(ann_active: bool, text_active: bool) -> Vec<usize> {
+    let mut bag = Vec::new();
+    for (i, spec) in queries::READ_BATTERY.iter().enumerate() {
+        let active = match spec.kind {
+            FamilyKind::UserAnchored => true,
+            FamilyKind::VectorAnn => ann_active,
+            FamilyKind::TextContains => text_active,
+        };
+        if active {
+            for _ in 0..spec.weight {
+                bag.push(i);
+            }
+        }
+    }
+    bag
+}
+
+/// Runs `cypher` inside an **explicit read transaction** (`BEGIN` → `RUN` → `COMMIT`) — the path that
+/// makes an index-backed read really SEEK its index (`rmp` #746/#755). An auto-commit read is dispatched
+/// to the off-thread reader pool. NOTE: the pool no longer declines index seeks for the kinds these
+/// examples exercise (`rmp` #768 node TEXT, #769 relationship), so this is the realistic production
+/// shape rather than a correctness requirement — MEASURED as identical dbHits either way. This is also the production `session.executeRead` shape.
+/// On any server `FAILURE` the connection is `RESET` back to `READY`, so one failed read cannot poison it.
+fn read_in_read_txn(
+    client: &mut BoltClient,
+    cypher: &str,
+    params: Vec<(String, Value)>,
+    db: &str,
+) -> ClientResult<QueryResult> {
+    let reset_on_failure = |client: &mut BoltClient, e: ClientError| -> ClientError {
+        if matches!(e, ClientError::Failure(_)) {
+            let _ = client.reset();
+        }
+        e
+    };
+    if let Err(e) = client.begin(db) {
+        return Err(reset_on_failure(client, e));
+    }
+    match client.run_in_txn(cypher, params) {
+        Ok(qr) => match client.commit() {
+            Ok(()) => Ok(qr),
+            Err(e) => Err(reset_on_failure(client, e)),
+        },
+        Err(e) => Err(reset_on_failure(client, e)),
+    }
+}
+
+/// Routes one sampled reply to the verifier for its family kind (`rmp` #746). The `UserAnchored`
+/// families keep their existing per-name verifier (`s_user` / `s_degree` / `s_purchases`); the two
+/// index-backed families get their own ground-truth checks.
+fn verify_read_op(
+    spec: &queries::QuerySpec,
+    result: &QueryResult,
+    oracle: &ReadOracle,
+    op: &ReadOp,
+) -> ReadCheck {
+    match op.anchor {
+        OpAnchor::User(uidx) => verify_reco_read(spec.name, result, oracle, uidx),
+        OpAnchor::Ann { category } => verify_ann(result, oracle, category),
+        OpAnchor::Text { product_ix } => verify_text(result, oracle, product_ix),
     }
 }
 
@@ -2947,6 +3604,122 @@ fn verify_reco_read(
         "s_degree" => verify_s_degree(result, oracle, uidx),
         "s_purchases" => verify_s_purchases(result, oracle, uidx),
         _ => ReadCheck::Skipped,
+    }
+}
+
+/// `p_ann`: the VECTOR (HNSW) k-NN ground truth (`rmp` #746). A query at category `category`'s CENTROID
+/// must return only that category's products (the generator clusters each embedding one-hot on its
+/// category axis), in DESCENDING normalized similarity, and the nearest must be a strong cosine match
+/// (`>= 0.9`). Every returned node id must map to a **real** product whose GENERATED category is
+/// `category` — so a server cannot pass by echoing the right category string on the wrong (or a phantom)
+/// node. This is what makes the ANN falsifiable: a query at the WRONG centroid returns the wrong
+/// category and FAILS here.
+fn verify_ann(result: &QueryResult, oracle: &ReadOracle, category: usize) -> ReadCheck {
+    if result.records.is_empty() {
+        return ReadCheck::Mismatch(format!(
+            "p_ann(cat {category}): the VECTOR index returned no products (built empty / declined?)"
+        ));
+    }
+    if result.records.len() > ANN_K {
+        return ReadCheck::Mismatch(format!(
+            "p_ann(cat {category}): returned {} rows, more than k={ANN_K}",
+            result.records.len()
+        ));
+    }
+    let expected_name = Generator::category_name(category);
+    let mut prev_score = f64::INFINITY;
+    let mut top_score: Option<f64> = None;
+    for row in 0..result.records.len() {
+        let got_cat = match field_in_row(result, "category", row) {
+            Some(Value::String(s)) => s.as_str(),
+            other => {
+                return ReadCheck::Mismatch(format!(
+                    "p_ann(cat {category}): row {row} category cell is {other:?}, expected a string"
+                ));
+            }
+        };
+        if got_cat != expected_name {
+            return ReadCheck::Mismatch(format!(
+                "p_ann at category {category}'s centroid returned a '{got_cat}' product, expected all \
+                 '{expected_name}' (clusters not separated / query vector wrong)"
+            ));
+        }
+        let id = match field_in_row(result, "id", row) {
+            Some(Value::String(s)) => s.clone(),
+            other => {
+                return ReadCheck::Mismatch(format!("p_ann: row {row} id cell is {other:?}"));
+            }
+        };
+        match oracle.category_of_product_id(&id) {
+            Some(c) if c == category => {}
+            Some(c) => {
+                return ReadCheck::Mismatch(format!(
+                    "p_ann(cat {category}): node {id} is generated category {c}, not {category}"
+                ));
+            }
+            None => {
+                return ReadCheck::Mismatch(format!(
+                    "p_ann: node {id} is not a real product (a phantom result)"
+                ));
+            }
+        }
+        let score = match field_in_row(result, "score", row) {
+            Some(Value::Float(f)) => *f,
+            Some(Value::Integer(n)) => *n as f64,
+            other => {
+                return ReadCheck::Mismatch(format!("p_ann: row {row} score cell is {other:?}"));
+            }
+        };
+        // Scores must be non-increasing (nearest first); a tiny epsilon absorbs float noise.
+        if score > prev_score + 1e-9 {
+            return ReadCheck::Mismatch(format!(
+                "p_ann: scores must be descending (nearest first), saw {score} after {prev_score}"
+            ));
+        }
+        prev_score = score;
+        top_score.get_or_insert(score);
+    }
+    if let Some(top) = top_score
+        && top < 0.9
+    {
+        return ReadCheck::Mismatch(format!(
+            "p_ann(cat {category}): top score {top} too low for a centroid query (index not used?)"
+        ));
+    }
+    ReadCheck::Verified
+}
+
+/// `p_search`: the TEXT (trigram) `CONTAINS` ground truth (`rmp` #746). Searching a product's OWN unique
+/// reference code (`REF-…`, [`product_search_fragment`]) must return that product's id among the matches
+/// — a trigram index that silently dropped it (or returned an empty result, `rmp` #738) FAILS here.
+/// Every returned id must be a real product.
+fn verify_text(result: &QueryResult, oracle: &ReadOracle, product_ix: u64) -> ReadCheck {
+    let expected_id = Generator::product_id(product_ix);
+    let mut found = false;
+    for row in 0..result.records.len() {
+        let id = match field_in_row(result, "id", row) {
+            Some(Value::String(s)) => s.clone(),
+            other => {
+                return ReadCheck::Mismatch(format!("p_search: row {row} id cell is {other:?}"));
+            }
+        };
+        if oracle.category_of_product_id(&id).is_none() {
+            return ReadCheck::Mismatch(format!(
+                "p_search: returned id {id} is not a real product"
+            ));
+        }
+        if id == expected_id {
+            found = true;
+        }
+    }
+    if found {
+        ReadCheck::Verified
+    } else {
+        ReadCheck::Mismatch(format!(
+            "p_search(product {product_ix}): a search for its own reference code did not return its id \
+             {expected_id} ({} match rows)",
+            result.records.len()
+        ))
     }
 }
 
@@ -3558,5 +4331,173 @@ mod tests {
             verify_reco_read("r3_fof3", &fof, &oracle, 1),
             ReadCheck::Skipped
         );
+    }
+
+    // --- The index-backed families (`rmp` #746): parameter shape + falsifiable ground truth ---------
+
+    /// The two new families bind exactly their kind's parameters, and the ANN query vector is a REAL
+    /// `LIST<FLOAT>` Bolt parameter of the embedding dimension — never a string-formatted literal (the
+    /// acceptance criterion).
+    #[test]
+    fn build_read_op_binds_kind_params_and_a_real_vector() {
+        let cfg = small_cfg();
+        let oracle = ReadOracle::build(cfg.seed, cfg.users, cfg.products, Some(&cfg), true);
+        let mut rng = SplitMix64::new(1);
+        for spec in queries::READ_BATTERY {
+            let op = build_read_op(spec, &mut rng, &oracle, cfg.users);
+            let keys: Vec<&str> = op.params.iter().map(|(k, _)| k.as_str()).collect();
+            match spec.kind {
+                FamilyKind::UserAnchored => assert_eq!(keys, ["id"], "{}", spec.name),
+                FamilyKind::VectorAnn => {
+                    assert_eq!(keys, ["indexName", "k", "queryVector"], "{}", spec.name);
+                    let (_, qv) = op
+                        .params
+                        .iter()
+                        .find(|(k, _)| k == "queryVector")
+                        .expect("queryVector param");
+                    match qv {
+                        Value::List(v) => {
+                            assert_eq!(v.len(), EMBED_DIM, "the query vector is EMBED_DIM long");
+                            assert!(
+                                v.iter().all(|x| matches!(x, Value::Float(_))),
+                                "the query vector is a real LIST<FLOAT>, not a string literal"
+                            );
+                        }
+                        other => panic!("queryVector must be a List<Float>, got {other:?}"),
+                    }
+                }
+                FamilyKind::TextContains => assert_eq!(keys, ["fragment"], "{}", spec.name),
+            }
+        }
+    }
+
+    /// `verify_ann` accepts a genuine category cluster and FLAGS a wrong-centroid / low-score / phantom
+    /// reply — so a query at the wrong centroid, or a scan-then-topk regression, fails the run.
+    #[test]
+    fn ann_verifies_a_cluster_and_flags_a_wrong_centroid() {
+        let cfg = small_cfg();
+        let oracle = ReadOracle::build(cfg.seed, cfg.users, cfg.products, Some(&cfg), true);
+        let c = *oracle.ann_categories.first().expect("a populated category");
+        let cat = Generator::category_name(c);
+        let members: Vec<u64> = (0..cfg.products)
+            .filter(|&i| Generator::product_category_index(cfg.seed, i) == c)
+            .take(ANN_K.min(3))
+            .collect();
+        assert!(!members.is_empty());
+        let good = qr(
+            &["id", "category", "score"],
+            members
+                .iter()
+                .enumerate()
+                .map(|(k, &i)| {
+                    vec![
+                        Value::String(Generator::product_id(i)),
+                        Value::String(cat.to_string()),
+                        Value::Float(0.99 - 0.01 * k as f64),
+                    ]
+                })
+                .collect(),
+        );
+        assert_eq!(verify_ann(&good, &oracle, c), ReadCheck::Verified);
+
+        // Wrong centroid: a product of a DIFFERENT category is returned for category `c`.
+        let other_c = (c + 1) % EMBED_DIM;
+        let other = (0..cfg.products)
+            .find(|&i| Generator::product_category_index(cfg.seed, i) == other_c)
+            .expect("another category has a product");
+        let wrong = qr(
+            &["id", "category", "score"],
+            vec![vec![
+                Value::String(Generator::product_id(other)),
+                Value::String(Generator::category_name(other_c).to_string()),
+                Value::Float(0.99),
+            ]],
+        );
+        assert!(matches!(
+            verify_ann(&wrong, &oracle, c),
+            ReadCheck::Mismatch(_)
+        ));
+
+        // A weak top score (the centroid's nearest neighbour must be a strong match).
+        let weak = qr(
+            &["id", "category", "score"],
+            vec![vec![
+                Value::String(Generator::product_id(members[0])),
+                Value::String(cat.to_string()),
+                Value::Float(0.5),
+            ]],
+        );
+        assert!(matches!(
+            verify_ann(&weak, &oracle, c),
+            ReadCheck::Mismatch(_)
+        ));
+
+        // A phantom node (id echoing the right category but not a real product).
+        let phantom = qr(
+            &["id", "category", "score"],
+            vec![vec![
+                Value::String("f".repeat(24)),
+                Value::String(cat.to_string()),
+                Value::Float(0.99),
+            ]],
+        );
+        assert!(matches!(
+            verify_ann(&phantom, &oracle, c),
+            ReadCheck::Mismatch(_)
+        ));
+
+        // Empty result (index built empty / declined).
+        let empty = qr(&["id", "category", "score"], vec![]);
+        assert!(matches!(
+            verify_ann(&empty, &oracle, c),
+            ReadCheck::Mismatch(_)
+        ));
+    }
+
+    /// `verify_text` requires the searched product's own id to be returned, and FLAGS a silent drop
+    /// (`rmp` #738) or a phantom id.
+    #[test]
+    fn text_verifies_the_product_is_found_and_flags_a_miss() {
+        let cfg = small_cfg();
+        let oracle = ReadOracle::build(cfg.seed, cfg.users, cfg.products, Some(&cfg), true);
+        let pix = 3u64;
+        let pid = Generator::product_id(pix);
+        let good = qr(
+            &["id"],
+            vec![
+                vec![Value::String(Generator::product_id(1))],
+                vec![Value::String(pid.clone())],
+            ],
+        );
+        assert_eq!(verify_text(&good, &oracle, pix), ReadCheck::Verified);
+
+        // The index silently dropped the product (its own search term did not return it).
+        let missing = qr(&["id"], vec![vec![Value::String(Generator::product_id(1))]]);
+        assert!(matches!(
+            verify_text(&missing, &oracle, pix),
+            ReadCheck::Mismatch(_)
+        ));
+
+        // A phantom (non-product) id in the result.
+        let phantom = qr(&["id"], vec![vec![Value::String("f".repeat(24))]]);
+        assert!(matches!(
+            verify_text(&phantom, &oracle, pix),
+            ReadCheck::Mismatch(_)
+        ));
+    }
+
+    /// The ANN query categories are only ever drawn from well-populated categories (≥ [`ANN_K`]
+    /// products), so an all-`k`-match ground-truth check is exact.
+    #[test]
+    fn ann_categories_are_well_populated() {
+        let cfg = small_cfg();
+        let oracle = ReadOracle::build(cfg.seed, cfg.users, cfg.products, Some(&cfg), true);
+        for &c in &oracle.ann_categories {
+            let count = (0..cfg.products)
+                .filter(|&i| Generator::product_category_index(cfg.seed, i) == c)
+                .count();
+            // Either a genuinely well-populated category, or the whole-set fallback for a tiny catalogue.
+            assert!(count >= ANN_K || oracle.ann_categories.len() == EMBED_DIM);
+        }
     }
 }

@@ -79,7 +79,7 @@ use std::time::{Duration, Instant};
 use graphus_core::Value;
 use graphus_reco_gen::Generator;
 use graphus_reco_gen::client::{BoltClient, BoltUrl};
-use graphus_reco_gen::queries::READ_BATTERY;
+use graphus_reco_gen::queries::{FamilyKind, READ_BATTERY};
 use graphus_reco_gen::schema;
 use serde_json::{Value as Json, json};
 
@@ -413,10 +413,15 @@ fn run(args: &Args) -> Result<(), String> {
         args.expect_purchased,
     )?;
 
-    // 8. Recommendation smoke: every family must return a well-formed, non-erroring result on a real
-    //    sample user id. Surfaces any unsupported Cypher in the battery early.
+    // 8. Recommendation smoke: every USER-ANCHORED family must return a well-formed, non-erroring result
+    //    on a real sample user id. The two index-backed families (VECTOR ANN + TEXT CONTAINS) bind their
+    //    OWN parameters ($indexName / $queryVector / a name fragment) and are validated by step 9's
+    //    dedicated index-backed asserts, so they are not driven with a `$id` here (`rmp` #746).
     let sample_id = Generator::user_id(0);
-    for spec in READ_BATTERY {
+    for spec in READ_BATTERY
+        .iter()
+        .filter(|s| s.kind == FamilyKind::UserAnchored)
+    {
         let params = json!({ "id": sample_id });
         let what = format!("recommendation query family '{}'", spec.name);
         rest.statement(&args.db, &what, spec.cypher, Some(params))
@@ -588,10 +593,16 @@ fn run_bolt(args: &Args) -> Result<(), String> {
         args.expect_friends,
     )?;
 
-    // 4. Recommendation smoke: every family must return a well-formed, non-erroring result on a real
-    //    sample user id (surfaces any unsupported Cypher in the battery against this server version).
+    // 4. Recommendation smoke: every USER-ANCHORED family must return a well-formed, non-erroring result
+    //    on a real sample user id (surfaces any unsupported Cypher against this server version). The
+    //    index-backed families (VECTOR ANN + TEXT CONTAINS) bind their own parameters, so they are not
+    //    driven with a `$id` here (`rmp` #746).
     let sample_id = Generator::user_id(0);
-    for spec in READ_BATTERY {
+    let user_anchored: Vec<_> = READ_BATTERY
+        .iter()
+        .filter(|s| s.kind == FamilyKind::UserAnchored)
+        .collect();
+    for spec in &user_anchored {
         load.write(
             &format!("recommendation family '{}'", spec.name),
             spec.cypher,
@@ -599,8 +610,8 @@ fn run_bolt(args: &Args) -> Result<(), String> {
         )?;
     }
     eprintln!(
-        "reco_load: every recommendation family returned a well-formed result ({} families)",
-        READ_BATTERY.len()
+        "reco_load: every recommendation family returned a well-formed result ({} user-anchored families)",
+        user_anchored.len()
     );
 
     load.goodbye();

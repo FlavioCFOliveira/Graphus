@@ -426,7 +426,16 @@ if [ "$MODE" = external ]; then
   BENCH_OUT="$(cat "$BENCH_LOG")"
   # The driver exits non-zero when a concurrency INVARIANT was violated (I1..I5) or the reader error
   # rate breached its threshold. That is the whole point of asserting them, so it must fail the run.
-  assert "every concurrency invariant held (I1..I7, incl. read-result correctness)" "0" "$BENCH_STATUS"
+  assert "every concurrency invariant held (I1..I9, incl. read-result correctness + index-seek proofs)" "0" "$BENCH_STATUS"
+
+  # The VECTOR + TEXT index-seek proofs (rmp #746) — surfaced from the sentinel (BENCH_STATUS already
+  # gates I8/I9). Herestring, so no producer to SIGPIPE under pipefail (rmp #745 rule 9).
+  RECO_INDEX_PROOF="$(sed -n 's/^GRAPHUS_RECO_INDEX_PROOF //p' <<<"$BENCH_OUT" | head -n1)"
+  assert "the VECTOR + TEXT index-seek proof ran (I8/I9)" "yes" \
+    "$([ -n "$RECO_INDEX_PROOF" ] && echo yes || echo no)"
+  if [ -n "$RECO_INDEX_PROOF" ]; then
+    info "index-seek proof (PROFILE dbHits): $RECO_INDEX_PROOF"
+  fi
 
   # Scrape /metrics AFTER the ladder.
   harness_scrape_metrics "$METRICS_AFTER" || info "metrics-after scrape failed (non-fatal)"
@@ -512,6 +521,9 @@ if [ "$MODE" = external ]; then
   while IFS= read -r line; do
     [ -n "$line" ] && RUNG_NOTES+=(--note "INVARIANT $line")
   done < <(printf '%s\n' "$BENCH_OUT" | grep -E '^(PASS|FAIL) I[0-9]' || true)
+  if [ -n "$RECO_INDEX_PROOF" ]; then
+    RUNG_NOTES+=(--note "INDEX-SEEK PROOF (rmp #746, PROFILE dbHits): $RECO_INDEX_PROOF")
+  fi
 
   # Emit the EXTERNAL-mode evidence report via measure_target (server-side /metrics delta + the
   # client-measured throughput/latency; process CPU/RSS + storage are N/A remotely).
@@ -600,11 +612,29 @@ else
   printf '%s\n' "$BENCH_OUT" | sed 's/^/  /'
   # The driver exits non-zero when a concurrency INVARIANT was violated (I1..I5) or the reader error
   # rate breached its threshold. Swallowing that status (as this did) makes the assertions decorative.
-  assert "every concurrency invariant held (I1..I7, incl. read-result correctness)" "0" "$BENCH_STATUS"
+  assert "every concurrency invariant held (I1..I9, incl. read-result correctness + index-seek proofs)" "0" "$BENCH_STATUS"
   assert "evidence report.json was produced" "yes" \
     "$([ -f "$EVIDENCE_DIR/report.json" ] && echo yes || echo no)"
   assert "evidence report.md was produced" "yes" \
     "$([ -f "$EVIDENCE_DIR/report.md" ] && echo yes || echo no)"
+
+  # The declared VECTOR (HNSW) + TEXT (trigram) indexes are genuinely USED at runtime, PROFILE-asserted
+  # under load (rmp #746): the BENCH_STATUS gate above already FAILS the run on a declined seek reported
+  # as an index operator (I8/I9 — the rmp #755 trap), so this only surfaces the measured dbHits. The
+  # herestring has no producer to kill, so it cannot SIGPIPE under pipefail (rmp #745 rule 9).
+  RECO_INDEX_PROOF="$(sed -n 's/^GRAPHUS_RECO_INDEX_PROOF //p' <<<"$BENCH_OUT" | head -n1)"
+  assert "the VECTOR + TEXT index-seek proof ran (I8/I9)" "yes" \
+    "$([ -n "$RECO_INDEX_PROOF" ] && echo yes || echo no)"
+  # LOCAL mode declares the FULL VECTOR + TEXT schema, so both proofs MUST have really MEASURED a seek.
+  # The emptiness check above cannot tell a real proof from `vector=skipped` / `text=error`, both of
+  # which emit the sentinel and would pass a vacuous green. Only ATTACH may legitimately skip.
+  assert "the VECTOR proof MEASURED an HNSW seek (not skipped/errored)" "yes" \
+    "$(grep -q 'vector_op=ProcedureCall' <<<"$RECO_INDEX_PROOF" && echo yes || echo no)"
+  assert "the TEXT proof MEASURED a trigram seek (not skipped/errored)" "yes" \
+    "$(grep -q 'text_op=NodeTextIndexSeek' <<<"$RECO_INDEX_PROOF" && echo yes || echo no)"
+  if [ -n "$RECO_INDEX_PROOF" ]; then
+    info "index-seek proof (PROFILE dbHits): $RECO_INDEX_PROOF"
+  fi
 
   # --- The MIX is the point of the default run (rmp #714) ------------------------------------------
   if [ "$WRITERS" -gt 0 ]; then

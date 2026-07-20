@@ -45,7 +45,7 @@ use std::time::{Duration, Instant};
 
 use graphus_core::Value;
 use graphus_reco_gen::client::{BoltClient, BoltUrl};
-use graphus_social_gen::{DegreeDist, EPOCH_S, GenConfig, Generator, REG_SPAN_S, battery};
+use graphus_social_gen::{DegreeDist, GenConfig, Generator, battery};
 use serde_json::{Value as Json, json};
 
 /// Bounds a hung connect without failing a healthy loopback.
@@ -493,7 +493,9 @@ fn smoke_battery_rest(
     let u0 = Generator::user_id(0);
     let u1 = Generator::user_id(1);
     let (term, expected_hits) = Generator::dominant_headline_term_for(cfg.seed, cfg.articles);
-    let since = EPOCH_S + REG_SPAN_S / 2;
+    // The `like_recent` recent-window cutoff — the SAME constant the concurrent driver and the
+    // in-process load-time validation use, so all three probe the identical slice (`rmp` #746).
+    let since = battery::LIKE_RECENT_SINCE;
 
     for fam in battery::ALL {
         if fam.name == "fulltext" && !fulltext {
@@ -502,7 +504,7 @@ fn smoke_battery_rest(
             );
             continue;
         }
-        let params = rest_params(fam.params, &u0, &u1, &term, since as i64);
+        let params = rest_params(fam.params, &u0, &u1, &term, since);
         let json = rest
             .statement(
                 db,
@@ -662,7 +664,7 @@ fn run_bolt(
     let u0 = Generator::user_id(0);
     let u1 = Generator::user_id(1);
     let (term, _hits) = Generator::dominant_headline_term_for(cfg.seed, cfg.articles);
-    let since = (EPOCH_S + REG_SPAN_S / 2) as i64;
+    let since = battery::LIKE_RECENT_SINCE;
     for fam in battery::ALL {
         if fam.name == "fulltext" && !fulltext {
             continue;

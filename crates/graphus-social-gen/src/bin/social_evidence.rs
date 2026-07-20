@@ -328,9 +328,9 @@ fn run() -> Result<(), String> {
              `article_catalog_composite` on ARTICLE(registered, id)) plus the ARTICLE.name existence \
              constraint. Headline search: TEXT `CONTAINS '{}'` returned {} articles and FULLTEXT \
              `queryNodes('{}')` returned {} — both matching the generator's ground truth of {} (the \
-             standard analyzer lowercases and tokenizes but does not stem). The LIKE.date recent-half \
-             range predicate — a correct scan + residual filter, since Graphus's relationship RANGE \
-             index is equality-only — returned {} of {} LIKE edges.",
+             standard analyzer lowercases and tokenizes but does not stem). The LIKE.date recent-window \
+             range predicate — a `RelIndexRangeSeek` on the like_date_range relationship RANGE index \
+             (which serves range predicates since `rmp` #680) — returned {} of {} LIKE edges.",
             outcome.indexes.len(),
             outcome.search_term,
             hits("text_contains"),

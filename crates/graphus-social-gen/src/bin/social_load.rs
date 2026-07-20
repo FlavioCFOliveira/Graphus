@@ -189,7 +189,7 @@ fn main() -> ExitCode {
             ft.map_or_else(|| "-".to_owned(), |n| n.to_string()),
         );
         println!(
-            "  LIKE.date recent-half range (scan + filter, rel RANGE is equality-only)={}",
+            "  LIKE.date recent-window range (RelIndexRangeSeek on like_date_range, rmp #680)={}",
             recent.map_or_else(|| "-".to_owned(), |n| n.to_string()),
         );
     }
@@ -365,8 +365,8 @@ fn main() -> ExitCode {
             ),
         );
 
-        // The LIKE.date range predicate (a scan + residual filter — the rel RANGE index is
-        // equality-only) returns a non-trivial recent slice: 0 < recent < |LIKE|.
+        // The LIKE.date recent-window range predicate (a `RelIndexRangeSeek` on the like_date_range
+        // rel RANGE index since `rmp` #680) returns a non-trivial recent slice: 0 < recent < |LIKE|.
         let recent = out
             .query("like_recent")
             .and_then(|q| q.scalar)

@@ -593,8 +593,19 @@ impl Generator {
     }
 
     /// A deterministic product name for `Product` `i`, valid UTF-8 (diacritics included) and at most
-    /// [`MAX_NAME_BYTES`] bytes. Assembled as `<noun> <adjective>` with, roughly half the time, a
-    /// brand-ish suffix. Never contains a comma, quote, or newline.
+    /// [`MAX_NAME_BYTES`] bytes. Assembled as `<noun> <adjective> [brand] <reference>`, where the trailing
+    /// **reference code** ([`product_model_code`](Self::product_model_code)) is a high-entropy token,
+    /// distinct per product at every generated catalogue size. Never contains a comma, quote, or newline.
+    ///
+    /// The reference code is what makes a `TEXT` `CONTAINS` search over the name **selective** (`rmp`
+    /// #746): the `<noun> <adjective> [brand]` vocabulary is drawn from small shared pools, so every
+    /// *trigram* of a bare-word fragment appears across a large fraction of the catalogue — a
+    /// `CONTAINS '<noun>'` seek is then no more selective than a full scan (its candidate set is nearly
+    /// the whole store, measured 801 ≈ 801 dbHits). The reference code's trigrams are rare (they derive
+    /// from the product's unique id), so a `CONTAINS '<reference>'` seek reads a handful of products —
+    /// a genuine, index-serviceable search, the way a real catalogue is queried by model/SKU. The base
+    /// name is truncated first to reserve the code's bytes, so the code is ALWAYS present and the total
+    /// stays within [`MAX_NAME_BYTES`].
     #[must_use]
     pub fn product_name(seed: u64, i: u64) -> String {
         let mut r =
@@ -602,22 +613,53 @@ impl Generator {
         let noun = PRODUCT_NOUN[r.below(PRODUCT_NOUN.len() as u64) as usize];
         let adj = PRODUCT_ADJ[r.below(PRODUCT_ADJ.len() as u64) as usize];
 
+        // Reserve room for the trailing " <reference>" so the selective code is never truncated away.
+        let code = Self::product_model_code(i);
+        let budget = MAX_NAME_BYTES.saturating_sub(code.len() + 1);
+
         let mut name = String::with_capacity(MAX_NAME_BYTES);
         name.push_str(noun);
         name.push(' ');
         name.push_str(adj);
 
-        // ~half the time, append a brand-ish suffix.
+        // ~half the time, append a brand-ish suffix (only if it still fits within the reserved budget).
         if r.below(2) == 1 {
             let brand = PRODUCT_BRAND[r.below(PRODUCT_BRAND.len() as u64) as usize];
-            let extra = 1 + brand.len();
-            if name.len() + extra <= MAX_NAME_BYTES {
+            if name.len() + 1 + brand.len() <= budget {
                 name.push(' ');
                 name.push_str(brand);
             }
         }
 
-        truncate_on_char_boundary(name, MAX_NAME_BYTES)
+        let mut name = truncate_on_char_boundary(name, budget);
+        name.push(' ');
+        name.push_str(&code);
+        name
+    }
+
+    /// A high-entropy product **reference code** — `REF-` followed by the first six hex chars of the
+    /// product's id, upper-cased (e.g. `REF-3F8A2B`) — carried inside
+    /// [`product_name`](Self::product_name).
+    ///
+    /// Real catalogues have model / SKU numbers; here the code exists so a `TEXT` `CONTAINS` search over
+    /// the product name is genuinely **selective** (`rmp` #746). Its trigrams derive from the product's
+    /// id, so they are rare across the catalogue — unlike the shared `<noun>`/`<adjective>`/`[brand]`
+    /// vocabulary, whose every trigram is common. That selectivity is what lets the `TEXT` index serve
+    /// the search with a genuine seek (reading a handful of products) instead of a full scan. A pure
+    /// function of the product index ⇒ byte-deterministic across platforms.
+    ///
+    /// The code is six hex chars — a 24-bit space — so it is **distinct for every product at the
+    /// generated catalogue sizes** (measured: 0 collisions at 50 / 400 / 8 000 products, i.e. every
+    /// profile this generator ships), but it is a hash prefix, NOT a guaranteed-unique key: at 40 000
+    /// products 45 codes are shared by two products each. A shared code is harmless here — it widens a
+    /// search from one matching product to two, which is still selective by three orders of magnitude,
+    /// and both matches are real products — so the ground-truth check (the searched product's own id
+    /// must appear among the matches) stays exact either way.
+    #[must_use]
+    pub fn product_model_code(i: u64) -> String {
+        let id = Self::product_id(i);
+        // `product_id` yields 24 lowercase hex chars, so the first six are always present and ASCII.
+        format!("REF-{}", id[..6].to_uppercase())
     }
 
     /// A deterministic country for `User` `i`, from the [`COUNTRIES`] pool.

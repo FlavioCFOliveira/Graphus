@@ -5,8 +5,9 @@
 # The model (a multigraph LPG): a social network of (:USER {id, name, registered}) befriended by an
 # UNDIRECTED multigraph (:USER)-[:FRIEND {since}]-(:USER), a corpus of (:ARTICLE {id, name,
 # registered}) carrying realistic Portuguese headlines, and directed (:USER)-[:LIKE {date}]->(:ARTICLE)
-# edges. The FRIEND degree is a configuration model — uniform by default, or a power law (Zipf) that
-# produces SUPERNODES via SOCIAL_DEGREE_DIST=zipf.
+# edges. The FRIEND degree is a configuration model — a power law (Zipf) that produces SUPERNODES by
+# DEFAULT (a real large social graph is scale-free), or the simpler uniform band via
+# SOCIAL_DEGREE_DIST=uniform.
 #
 # THE HEADLINE (rmp #691): the 8-query read battery (direct friends, friend-of-friend, mutual friends,
 # top-liked articles, degree, headline TEXT search, recent-LIKE range, FULLTEXT headline search) is
@@ -62,7 +63,10 @@
 #   examples/social-network-large/run.sh                          # local self-boot, fast profile, MIX ON
 #   SOCIAL_WRITERS=0                examples/social-network-large/run.sh   # read-only baseline (the off switch)
 #   SOCIAL_PROFILE=large            examples/social-network-large/run.sh   # evidence-scale local run
-#   SOCIAL_DEGREE_DIST=zipf         examples/social-network-large/run.sh   # power-law (supernode) FRIEND graph
+#   SOCIAL_DEGREE_DIST=uniform      examples/social-network-large/run.sh   # simpler uniform-band FRIEND graph
+#                                                                         #   (the DEFAULT is power-law/Zipf,
+#                                                                         #    which also skews read anchors to
+#                                                                         #    the supernodes; SOCIAL_ANCHOR_SKEW)
 #   SOCIAL_READER_THREADS=4         examples/social-network-large/run.sh   # pin the reader pool (local)
 #   GRAPHUS_TARGET_BOLT=bolt+ssc://host:7687 GRAPHUS_TARGET_REST=https://host:7474 \
 #     GRAPHUS_TARGET_USER=graphus GRAPHUS_TARGET_PASSWORD=graphus-local \
@@ -75,6 +79,12 @@
 # 4), SOCIAL_MIX_BASELINE (default 1 — run the readonly CONTROL arm so the cost of the mix is
 # measurable), SOCIAL_RETRY_BUDGET_MS (default 15000), SOCIAL_PROBE_SECS (default 3 — the
 # slow-reader/GC-pin probe).
+#
+# SOCIAL_ANCHOR_SKEW (rmp #746): the Zipf exponent used to bias read anchors toward the generated
+# SUPERNODE tail (default 2 in zipf mode, 0 = uniform anchors otherwise). It only engages on a power-law
+# graph with the oracle reconstructed; the driver asserts (I9) that a read actually landed on a hub.
+# The `like_recent` family SEEKS the LIKE.date rel-RANGE index in an explicit read transaction, and the
+# driver PROFILE-proves that seek at runtime (I8), emitting a GRAPHUS_SOCIAL_INDEX_PROOF sentinel.
 #
 # Requirements: a Unix host, bash, curl. LOCAL mode's /proc server sampling is Linux-specific (the run
 # still works on macOS but the CPU/RSS server evidence is skipped there). No node / openssl needed.
@@ -191,8 +201,13 @@ if [ "$MODE" = external ]; then
     --avg-likes "${SOCIAL_EXTERNAL_AVG_LIKES:-3}"
   )
 fi
-# Optional power-law (Zipf) FRIEND-degree mode (supernodes). Applies to both modes.
-if [ "${SOCIAL_DEGREE_DIST:-uniform}" = "zipf" ]; then
+# FRIEND-degree distribution. The DEFAULT is a power law (Zipf) that grows SUPERNODES, because a real
+# large social graph is scale-free — a handful of hubs with enormous degree and a long thin tail — and
+# this example only earns its name ("…-large") by exercising that shape: the anchor-skew read proof (I9,
+# `rmp` #746) asserts a read actually LANDS on one of those hubs, which a uniform graph (no hubs) cannot
+# demonstrate. `SOCIAL_DEGREE_DIST=uniform` selects the simpler uniform band for contrast.
+SOCIAL_DEGREE_DIST="${SOCIAL_DEGREE_DIST:-zipf}"
+if [ "$SOCIAL_DEGREE_DIST" = "zipf" ]; then
   GEN_ARGS+=(--degree-dist zipf --zipf-exponent "${SOCIAL_ZIPF_EXPONENT:-2}")
   # A power law wants a low floor + a high ceiling to grow a hub tail (unless already overridden).
   case " ${GEN_ARGS[*]} " in *" --friend-min "*) : ;; *) GEN_ARGS+=(--friend-min 1) ;; esac
@@ -219,6 +234,17 @@ while [ "$_ga_i" -lt "${#GEN_ARGS[@]}" ]; do
       _ga_i=$((_ga_i + 1)) ;;
   esac
 done
+
+# Anchor-skew (rmp #746): bias read anchors toward the generated SUPERNODE tail. It is only meaningful on
+# a power-law graph (a uniform graph has no hubs) AND when the oracle reconstructs (so per-user degree is
+# known — the same --gen-profile forwarded above arms it); the driver reports I9 as N/A otherwise, never
+# a false failure. Default a Zipf exponent of 2 in zipf mode, 0 (uniform anchors) otherwise.
+if [ "$SOCIAL_DEGREE_DIST" = "zipf" ]; then
+  ANCHOR_SKEW="${SOCIAL_ANCHOR_SKEW:-2}"
+else
+  ANCHOR_SKEW="${SOCIAL_ANCHOR_SKEW:-0}"
+fi
+BENCH_ORACLE_ARGS+=(--anchor-skew "$ANCHOR_SKEW")
 
 harness_build "the social-network wire client binaries (release, --features wire, no engine)" \
   --release -p graphus-social-gen --no-default-features --features wire \
@@ -423,9 +449,13 @@ if [ "$MODE" = external ]; then
   BENCH_STATUS="${PIPESTATUS[0]}"
   set -e
   LADDER_MS=$(( $(_harness_now_ms) - LADDER_START_MS ))
-  # The driver exits non-zero when a concurrency INVARIANT was violated (I1..I5) or the reader error
+  # The driver exits non-zero when a concurrency INVARIANT was violated (I1..I9) or the reader error
   # rate breached its threshold. That is the whole point of asserting them, so it must fail the run.
-  assert "every concurrency invariant held (I1..I7, incl. read-result correctness)" "0" "$BENCH_STATUS"
+  assert "every concurrency invariant held (I1..I9, incl. read-result correctness, the like_recent index-seek proof, and the anchor-skew hub hit)" "0" "$BENCH_STATUS"
+  # I8 (rmp #746): the like_recent rel-RANGE index-seek proof must have RUN — its sentinel is emitted in
+  # every path. Herestring (never `printf | grep -q` under pipefail — a broken pipe would mask a miss).
+  assert "the LIKE.date rel-RANGE index-seek proof ran (I8 sentinel emitted)" "yes" \
+    "$(grep -q 'GRAPHUS_SOCIAL_INDEX_PROOF' "$BENCH_LOG" && echo yes || echo no)"
 
   harness_scrape_metrics "$METRICS_AFTER" || info "metrics-after scrape failed (non-fatal)"
   assert "/metrics scraped after the ladder" "yes" "$([ -s "$METRICS_AFTER" ] && echo yes || echo no)"
@@ -574,9 +604,18 @@ else
   BENCH_STATUS=$?
   set -e
   printf '%s\n' "$BENCH_OUT" | sed 's/^/  /'
-  # The driver exits non-zero when a concurrency INVARIANT was violated (I1..I5) or the reader error
+  # The driver exits non-zero when a concurrency INVARIANT was violated (I1..I9) or the reader error
   # rate breached its threshold. Swallowing that status (as this did) makes the assertions decorative.
-  assert "every concurrency invariant held (I1..I7, incl. read-result correctness)" "0" "$BENCH_STATUS"
+  assert "every concurrency invariant held (I1..I9, incl. read-result correctness, the like_recent index-seek proof, and the anchor-skew hub hit)" "0" "$BENCH_STATUS"
+  # I8 (rmp #746): the like_recent rel-RANGE index-seek proof must have RUN — its sentinel is emitted in
+  # every path. Herestring (never `printf | grep -q` under pipefail — a broken pipe would mask a miss).
+  assert "the LIKE.date rel-RANGE index-seek proof ran (I8 sentinel emitted)" "yes" \
+    "$(grep -q 'GRAPHUS_SOCIAL_INDEX_PROOF' <<<"$BENCH_OUT" && echo yes || echo no)"
+  # LOCAL mode declares the full schema, so the proof MUST have really MEASURED a seek. The emptiness
+  # check above cannot tell a real proof from `rel_range_op=skipped` / `=error`, both of which emit the
+  # sentinel and would pass a vacuous green. Only the ATTACH path may legitimately skip.
+  assert "the rel-RANGE proof MEASURED a seek (not skipped/errored)" "yes" \
+    "$(grep -q 'rel_range_op=RelIndexRangeSeek' <<<"$BENCH_OUT" && echo yes || echo no)"
   assert "evidence report.json was produced" "yes" \
     "$([ -f "$EVIDENCE_DIR/report.json" ] && echo yes || echo no)"
   assert "evidence report.md was produced" "yes" \
@@ -613,7 +652,7 @@ if [ "$MODE" = local ] && [ "$PROFILE" = "fast" ] && [ "$WRITERS" -eq 0 ]; then
   section "regression gate vs committed baseline (structural counts)"
   info "SKIPPED: SOCIAL_WRITERS=0 is the read-only ISOLATION experiment, not the default workload the"
   info "baseline was captured from (the mix). Comparing them would gate one workload against another."
-elif [ "$MODE" = local ] && [ "$PROFILE" = "fast" ] && [ "${SOCIAL_DEGREE_DIST:-uniform}" = "uniform" ] \
+elif [ "$MODE" = local ] && [ "$PROFILE" = "fast" ] && [ "$SOCIAL_DEGREE_DIST" = "zipf" ] \
    && [ -f "$BASELINE" ] && [ -f "$EVIDENCE_DIR/report.json" ]; then
   section "regression gate vs committed baseline (structural counts)"
   CMP_OUT="$("$CMP_BIN" "$BASELINE" "$EVIDENCE_DIR/report.json" 2>&1)" || true
@@ -622,8 +661,8 @@ elif [ "$MODE" = local ] && [ "$PROFILE" = "fast" ] && [ "${SOCIAL_DEGREE_DIST:-
     "$(grep -q 'GRAPHUS_BASELINE_OK' <<<"$CMP_OUT" && echo yes || echo no)"
 elif [ "$MODE" = external ]; then
   info "regression gate skipped (external attach: the host-independent invariant gate ran in measure_target --assert)."
-elif [ "${SOCIAL_DEGREE_DIST:-uniform}" != "uniform" ]; then
-  info "regression gate skipped (power-law graph: not baseline-comparable to the committed uniform baseline)."
+elif [ "$SOCIAL_DEGREE_DIST" != "zipf" ]; then
+  info "regression gate skipped (uniform graph: not baseline-comparable to the committed power-law baseline)."
 elif [ ! -f "$BASELINE" ]; then
   info "no committed baseline.json yet — skipping the regression gate."
 else

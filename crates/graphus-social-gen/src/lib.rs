@@ -76,6 +76,19 @@ pub mod battery {
     /// `fulltext` family queries. Kept in sync with the in-process loader's `IDX_ARTICLE_HEADLINE_FT`.
     pub const FULLTEXT_INDEX: &str = "article_headline_fulltext";
 
+    /// The `$since` cutoff the [`LIKE_RECENT`] family and the load-time `like_recent` probe use: the
+    /// start of the **last 10% of the modelled timeline** (~36 days).
+    ///
+    /// Every generated `LIKE.date` lies uniformly in `[EPOCH_S, EPOCH_S + REG_SPAN_S)`, so `date >=
+    /// LIKE_RECENT_SINCE` selects roughly the most-recent tenth of the like edges. The window is
+    /// deliberately **narrow** so the `LIKE.date` relationship-RANGE index SEEK (`RelIndexRangeSeek`,
+    /// which Graphus serves for range predicates since `rmp` #680) is genuinely SELECTIVE — it reads a
+    /// small fraction of the type, not the ~half a midpoint window would, so a real seek is
+    /// unambiguously cheaper than the whole-type scan the off-thread reader pool declines it to (`rmp`
+    /// #755). Every consumer (the concurrent driver, the over-the-wire loader, and the in-process
+    /// load-time validation) references this ONE constant so they all probe the identical slice.
+    pub const LIKE_RECENT_SINCE: i64 = (super::EPOCH_S + super::REG_SPAN_S * 9 / 10) as i64;
+
     /// The per-op parameter shape a [`Family`] needs, so a driver can build the right `$`-map.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Params {
@@ -1522,6 +1535,107 @@ fn degree_histogram_of(degree: &[u64]) -> Vec<(u64, u64)> {
     buckets.into_iter().collect()
 }
 
+/// A precomputed **Zipf-over-ranks** sampler: draws a rank in `[0, n)` with `P(rank r) ∝ 1/(r+1)^s`,
+/// so rank `0` is by far the most likely and the probability decays with the slope `s` (`exponent`).
+///
+/// This is a **driver-side** sampling knob used by `social_bench` to bias read anchors toward the
+/// highest-degree users (the generated **supernodes**): rank `0` is mapped to the top hub, rank `1` to
+/// the next, and so on, so a larger `exponent` concentrates reads on the hub tail. `exponent == 0`
+/// degenerates to a **uniform** draw over the ranks (every weight `1`).
+///
+/// `f64` is used deliberately and safely here: this sampler never touches the emitted CSV byte-stream
+/// (which is pure-integer and byte-identical across platforms — see [`power_law_cdf`]); it only decides
+/// which *already-loaded* user a read anchors on, so it carries no cross-platform-determinism
+/// constraint. The cumulative weights are precomputed **once** (`O(n)`), and each draw is an `O(log n)`
+/// binary search.
+#[derive(Debug, Clone)]
+pub struct ZipfRanks {
+    /// Ascending cumulative weights: `cdf[r] = Σ_{k=0..=r} 1/(k+1)^exponent`. `cdf.last()` is the total.
+    cdf: Vec<f64>,
+}
+
+impl ZipfRanks {
+    /// Precomputes the sampler for `n` ranks with slope `exponent`. `n == 0` yields an empty sampler
+    /// (whose [`sample`](Self::sample) always returns `0`). A larger `exponent` steepens the decay,
+    /// concentrating draws on the low ranks; `exponent == 0` is a uniform draw over the ranks.
+    #[must_use]
+    pub fn new(n: usize, exponent: u32) -> Self {
+        let mut cdf = Vec::with_capacity(n);
+        let mut acc = 0.0f64;
+        for r in 0..n {
+            // 1/(r+1)^exponent, evaluated as a positive f64 (exponent 0 ⇒ every weight 1.0 ⇒ uniform).
+            let w = 1.0 / ((r as f64) + 1.0).powi(exponent as i32);
+            acc += w;
+            cdf.push(acc);
+        }
+        Self { cdf }
+    }
+
+    /// The number of ranks this sampler covers.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.cdf.len()
+    }
+
+    /// Whether the sampler covers no ranks (its [`sample`](Self::sample) always returns `0`).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.cdf.is_empty()
+    }
+
+    /// Draws a rank in `[0, len)` from a raw `u64` entropy draw, mapped through the cumulative weights.
+    ///
+    /// Returns `0` for an empty sampler. The top 53 bits of `entropy` are scaled into `[0, 1)` and
+    /// multiplied by the total weight to get a uniform target, then the first rank whose cumulative
+    /// weight strictly exceeds the target is returned — so every rank with non-zero weight is reachable
+    /// and the distribution is exactly `P(rank r) ∝ 1/(r+1)^exponent`.
+    #[must_use]
+    pub fn sample(&self, entropy: u64) -> usize {
+        let n = self.cdf.len();
+        if n == 0 {
+            return 0;
+        }
+        let total = self.cdf[n - 1];
+        if total <= 0.0 {
+            return 0;
+        }
+        // The high 53 bits of the entropy → a uniform f64 in [0, 1) (the full mantissa, no bias).
+        let unit = ((entropy >> 11) as f64) / ((1u64 << 53) as f64);
+        let target = unit * total;
+        // First rank whose cumulative weight strictly exceeds `target`.
+        match self.cdf.binary_search_by(|&c| {
+            if c <= target {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            }
+        }) {
+            Ok(i) | Err(i) => i.min(n - 1),
+        }
+    }
+}
+
+/// The minimum realised `FRIEND` degree an anchor must reach to count as landing on a **HUB**, given
+/// the loaded graph's realised maximum degree `degree_max`.
+///
+/// The floor is `max(degree_max / 2, generous_floor)`: half the realised maximum scales the bar with
+/// the actual hub tail (in a power law only a handful of supernodes reach it), while `generous_floor`
+/// keeps a small graph from setting an unreachably-low bar. A pure function of its inputs, so it is
+/// unit-testable and shared by the driver's hub assertion (`rmp` #746).
+#[must_use]
+pub fn hub_degree_floor(degree_max: u64, generous_floor: u64) -> u64 {
+    (degree_max / 2).max(generous_floor)
+}
+
+/// Whether an anchor of realised `FRIEND` degree `degree` counts as a **HUB** in a graph whose realised
+/// maximum degree is `degree_max`, using [`hub_degree_floor`] with `generous_floor`.
+///
+/// A pure function: `degree >= hub_degree_floor(degree_max, generous_floor)`.
+#[must_use]
+pub fn is_hub_degree(degree: u64, degree_max: u64, generous_floor: u64) -> bool {
+    degree >= hub_degree_floor(degree_max, generous_floor)
+}
+
 /// Truncates a `String` to at most `max_bytes`, never splitting a UTF-8 char. Cheap when already
 /// within budget (the common path).
 fn truncate_on_char_boundary(mut s: String, max_bytes: usize) -> String {
@@ -1759,5 +1873,116 @@ mod tests {
             assert!(!t.contains('\''), "title must not contain a quote: {t}");
             assert!(!t.is_empty());
         }
+    }
+
+    /// The `like_recent` window (`rmp` #746) must be the LAST tenth of the timeline — narrow enough that
+    /// the `LIKE.date` rel-RANGE seek is genuinely selective, not the ~half a midpoint window would read.
+    #[test]
+    fn like_recent_since_is_the_last_tenth_of_the_timeline() {
+        let span = REG_SPAN_S as i64;
+        let offset = battery::LIKE_RECENT_SINCE - EPOCH_S as i64;
+        assert_eq!(offset, span * 9 / 10, "cutoff is at 90% of the span");
+        // It sits strictly inside the timeline, so `0 < recent < |LIKE|` always holds.
+        assert!(offset > 0 && offset < span, "cutoff is strictly interior");
+        // A midpoint window would read ~half; this reads ~a tenth — materially more selective.
+        assert!(
+            offset > span / 2,
+            "the window is narrower than a midpoint window"
+        );
+    }
+
+    /// `ZipfRanks` with `exponent == 0` is (near-)uniform: over many draws every rank is hit and the
+    /// most-frequent rank is not wildly more frequent than the least. This is the PASSING case for
+    /// "uniform"; the failing case ("does it concentrate?") is asserted below with a higher exponent.
+    #[test]
+    fn zipf_ranks_exponent_zero_is_uniform() {
+        let z = ZipfRanks::new(64, 0);
+        assert_eq!(z.len(), 64);
+        assert!(!z.is_empty());
+        let mut counts = vec![0u64; 64];
+        let mut rng = SplitMix64::new(0xB16B_00B5_0000_0001);
+        for _ in 0..64_000 {
+            counts[z.sample(rng.next_u64())] += 1;
+        }
+        // Every rank reachable.
+        assert!(
+            counts.iter().all(|&c| c > 0),
+            "every rank must be reachable"
+        );
+        // Uniform: max/min bucket ratio is modest (expected ~1000 each; a 3× spread is generous slack).
+        let max = *counts.iter().max().unwrap();
+        let min = *counts.iter().min().unwrap();
+        assert!(
+            max < min * 3,
+            "exponent 0 must NOT concentrate: max {max} vs min {min}"
+        );
+        // In particular rank 0 is NOT dominant under exponent 0.
+        assert!(
+            counts[0] < min * 2,
+            "rank 0 must not dominate a uniform draw"
+        );
+    }
+
+    /// `ZipfRanks` with a higher exponent CONCENTRATES draws on the low ranks (the hubs): rank 0 is by
+    /// far the most likely, and the last rank is drawn far less often. This is the FAILING case for the
+    /// "is it uniform?" question — the property the anchor-skew relies on to bias reads to supernodes.
+    #[test]
+    fn zipf_ranks_higher_exponent_concentrates_on_low_ranks() {
+        let n = 256;
+        let z = ZipfRanks::new(n, 2);
+        let mut counts = vec![0u64; n];
+        let mut rng = SplitMix64::new(0xD1CE_D1CE_0000_0002);
+        let draws = 200_000u64;
+        for _ in 0..draws {
+            counts[z.sample(rng.next_u64())] += 1;
+        }
+        // rank 0 dominates: for exponent 2 its share is 1/Z with Z = Σ 1/(r+1)^2 < π²/6 ≈ 1.645, so
+        // P(rank 0) > 0.6. A conservative floor of 40% survives sampling noise.
+        assert!(
+            counts[0] as f64 / draws as f64 > 0.40,
+            "rank 0 must dominate under exponent 2, got {}",
+            counts[0]
+        );
+        // The tail is starved: rank 0 is drawn orders of magnitude more than the last rank.
+        assert!(
+            counts[0] > counts[n - 1].saturating_mul(1000).max(1000),
+            "rank 0 ({}) must vastly exceed the last rank ({})",
+            counts[0],
+            counts[n - 1],
+        );
+        // Bounds always hold, even for a degenerate empty sampler.
+        assert_eq!(ZipfRanks::new(0, 2).sample(12345), 0, "empty sampler ⇒ 0");
+        for _ in 0..1000 {
+            assert!(z.sample(rng.next_u64()) < n, "sample stays in range");
+        }
+    }
+
+    /// The hub-membership check (`rmp` #746) fires on a genuine hub and stays quiet below the floor —
+    /// covering BOTH the passing (a supernode) and the failing (a median user) input.
+    #[test]
+    fn hub_degree_check_flags_hubs_and_spares_the_median() {
+        // A power-law graph with a realised max degree of 400. The floor is max(200, generous_floor).
+        assert_eq!(hub_degree_floor(400, 32), 200);
+        assert!(is_hub_degree(400, 400, 32), "the top hub is a hub");
+        assert!(is_hub_degree(200, 400, 32), "exactly at the floor is a hub");
+        assert!(
+            !is_hub_degree(199, 400, 32),
+            "just below the floor is NOT a hub"
+        );
+        assert!(!is_hub_degree(20, 400, 32), "a median user is NOT a hub");
+        // A tiny graph: the generous floor keeps the bar sane instead of trivially low.
+        assert_eq!(
+            hub_degree_floor(10, 32),
+            32,
+            "generous floor dominates a tiny max"
+        );
+        assert!(
+            !is_hub_degree(10, 10, 32),
+            "no user reaches the generous floor here"
+        );
+        assert!(
+            is_hub_degree(40, 10, 32),
+            "a degree above the generous floor is a hub"
+        );
     }
 }

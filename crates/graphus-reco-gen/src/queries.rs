@@ -25,18 +25,50 @@
 //! kept separate so the read mix stays purely read-only and the writer's rate is controlled
 //! independently.
 
+/// What per-op parameters a family binds, how it must be **dispatched** so it genuinely hits its
+/// declared index at runtime (`rmp` #746/#755), and how its result is verified.
+///
+/// The dispatch distinction is the crux of this task. An auto-commit read is sent to the **off-thread
+/// reader pool**, whose seam declines every index seek and falls back to a full scan (`rmp` #755): the
+/// *plan* still reports the seek operator, but the *execution* reads the whole store. A read inside an
+/// **explicit transaction** runs inline on the engine thread and really seeks the index. So each family
+/// declares the path that actually indexes it — verified empirically with `PROFILE` (`rmp` #752).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FamilyKind {
+    /// Anchored on `(:User {id: $id})` — the traversal + point-read families. Runs **auto-commit**
+    /// (their cost is the traversal, not the anchor seek; the anchor-seek decline is `rmp` #755's own
+    /// fix, out of scope here). Binds `$id`.
+    UserAnchored,
+    /// The VECTOR (HNSW) k-NN **"similar products"** ANN retrieval — the primary retrieval path of a
+    /// real recommendation service: `CALL db.index.vector.queryNodes($indexName, $k, $queryVector)`.
+    /// `db.index.vector.queryNodes` is registered **not** reader-safe, so it runs **inline** on the
+    /// engine thread even as an auto-commit read and hits the live HNSW regardless of dispatch (`rmp`
+    /// #746, measured 25 dbHits vs a 700-node scan). Binds `$indexName`, `$k`, and `$queryVector` — a
+    /// real `LIST<FLOAT>` Bolt parameter, **never** a string-formatted literal.
+    VectorAnn,
+    /// The TEXT (trigram) catalogue search `MATCH (p:Product) WHERE p.name CONTAINS $fragment`. A plain
+    /// read with no procedure ⇒ auto-commit dispatches off-thread, where the reader pool **declines**
+    /// the `NodeTextIndexSeek` and full-scans (`rmp` #755, measured 601 dbHits). It MUST run in an
+    /// **explicit read transaction** to seek the index (measured 3 dbHits) — which is also the realistic
+    /// production shape (`session.executeRead`). Binds `$fragment`.
+    TextContains,
+}
+
 /// One query family in the read battery.
 #[derive(Debug, Clone, Copy)]
 pub struct QuerySpec {
     /// Stable family id, e.g. `"s_user"` / `"r1_friends"` (a metrics/report key).
     pub name: &'static str,
-    /// The parameterised Cypher. Every family binds `$id` (a 24-hex `:User(id)`); no other parameter.
+    /// The parameterised Cypher. A [`FamilyKind::UserAnchored`] family binds `$id`; the index-backed
+    /// families bind their own parameters (see [`FamilyKind`]).
     pub cypher: &'static str,
     /// Relative selection weight in the read mix (larger = more frequent).
     pub weight: u32,
     /// Whether this is an **advanced** traversal (`true`) or a simple **point read** (`false`) — used
     /// only to group the per-family latencies in the report.
     pub advanced: bool,
+    /// The parameter shape + dispatch + verification contract for this family (`rmp` #746).
+    pub kind: FamilyKind,
 }
 
 /// The read battery, in a fixed order. Weights model a read-heavy service: ~45% cheap point reads,
@@ -47,21 +79,24 @@ pub const READ_BATTERY: &[QuerySpec] = &[
     QuerySpec {
         name: "s_user",
         cypher: "MATCH (u:User {id: $id}) RETURN u.name AS name, u.country AS country",
-        weight: 20,
+        weight: 18,
         advanced: false,
+        kind: FamilyKind::UserAnchored,
     },
     QuerySpec {
         name: "s_purchases",
         cypher: "MATCH (:User {id: $id})-[:PURCHASED]->(p:Product) \
                  RETURN p.id AS id, p.name AS name LIMIT 50",
-        weight: 15,
+        weight: 14,
         advanced: false,
+        kind: FamilyKind::UserAnchored,
     },
     QuerySpec {
         name: "s_degree",
         cypher: "MATCH (u:User {id: $id})-[:FRIEND]-(f:User) RETURN count(f) AS degree",
-        weight: 10,
+        weight: 9,
         advanced: false,
+        kind: FamilyKind::UserAnchored,
     },
     // --- Recommendation traversals (advanced) -----------------------------------------------------
     // Direct friends' purchases the customer has not bought, ranked by how many friends bought them.
@@ -71,8 +106,9 @@ pub const READ_BATTERY: &[QuerySpec] = &[
                  WHERE NOT (me)-[:PURCHASED]->(p) \
                  RETURN p.id AS product, count(DISTINCT f) AS friends \
                  ORDER BY friends DESC, product ASC LIMIT 10",
-        weight: 20,
+        weight: 18,
         advanced: true,
+        kind: FamilyKind::UserAnchored,
     },
     // Friend-of-friend (2nd level) reach: purchases of 2-hop friends (excluding self + direct friends).
     QuerySpec {
@@ -83,8 +119,9 @@ pub const READ_BATTERY: &[QuerySpec] = &[
                  WHERE NOT (me)-[:PURCHASED]->(p) \
                  RETURN p.id AS product, count(DISTINCT fof) AS reach \
                  ORDER BY reach DESC, product ASC LIMIT 10",
-        weight: 12,
+        weight: 10,
         advanced: true,
+        kind: FamilyKind::UserAnchored,
     },
     // Third-level reach: purchases of 3-hop friends (the heaviest social traversal).
     QuerySpec {
@@ -97,6 +134,7 @@ pub const READ_BATTERY: &[QuerySpec] = &[
                  ORDER BY reach DESC, product ASC LIMIT 10",
         weight: 8,
         advanced: true,
+        kind: FamilyKind::UserAnchored,
     },
     // Similar consumption profile (collaborative filtering / co-purchase): users who bought many of
     // the same products, then what *they* bought that the seed customer has not.
@@ -110,8 +148,32 @@ pub const READ_BATTERY: &[QuerySpec] = &[
                  WHERE NOT (me)-[:PURCHASED]->(rec) \
                  RETURN rec.id AS product, count(DISTINCT other) AS supporters, sum(shared) AS affinity \
                  ORDER BY supporters DESC, affinity DESC, product ASC LIMIT 10",
+        weight: 13,
+        advanced: true,
+        kind: FamilyKind::UserAnchored,
+    },
+    // --- Index-backed retrieval (the declared VECTOR + TEXT indexes, exercised UNDER LOAD, rmp #746) ---
+    // The VECTOR (HNSW) "similar products" ANN retrieval — the primary retrieval path of a real
+    // recommendation service. The query vector is a category CENTROID passed as a real LIST<FLOAT>
+    // parameter ($queryVector), so the k nearest neighbours are that category's products (ground truth).
+    // db.index.vector.queryNodes is not reader-safe ⇒ runs inline ⇒ hits the live HNSW even auto-commit.
+    QuerySpec {
+        name: "p_ann",
+        cypher: "CALL db.index.vector.queryNodes($indexName, $k, $queryVector) YIELD node, score \
+                 RETURN node.id AS id, node.category AS category, score",
         weight: 15,
         advanced: true,
+        kind: FamilyKind::VectorAnn,
+    },
+    // The TEXT (trigram) catalogue search — "find a product by a fragment of its name". A plain read, so
+    // it MUST run in an explicit read transaction to seek the NodeTextIndexSeek (auto-commit is declined
+    // to a full scan by the off-thread reader pool — rmp #755). Binds $fragment.
+    QuerySpec {
+        name: "p_search",
+        cypher: "MATCH (p:Product) WHERE p.name CONTAINS $fragment RETURN p.id AS id",
+        weight: 8,
+        advanced: false,
+        kind: FamilyKind::TextContains,
     },
 ];
 
@@ -182,10 +244,9 @@ mod tests {
     }
 
     #[test]
-    fn every_read_query_binds_id_and_no_write_verb() {
+    fn every_read_query_is_read_only_and_binds_its_kind_params() {
         for q in READ_BATTERY {
-            assert!(q.cypher.contains("$id"), "{} must bind $id", q.name);
-            // The read battery must be strictly read-only.
+            // The whole read battery must be strictly read-only.
             for verb in ["CREATE", "MERGE", "DELETE", "SET ", "REMOVE"] {
                 assert!(
                     !q.cypher.contains(verb),
@@ -193,7 +254,48 @@ mod tests {
                     q.name
                 );
             }
+            // Each family binds exactly the parameters its kind promises.
+            match q.kind {
+                FamilyKind::UserAnchored => {
+                    assert!(q.cypher.contains("$id"), "{} must bind $id", q.name);
+                }
+                FamilyKind::VectorAnn => {
+                    assert!(
+                        q.cypher.contains("$indexName")
+                            && q.cypher.contains("$k")
+                            && q.cypher.contains("$queryVector"),
+                        "{} must bind the ANN params",
+                        q.name
+                    );
+                    assert!(
+                        q.cypher.contains("db.index.vector.queryNodes"),
+                        "{} must call the vector index procedure",
+                        q.name
+                    );
+                }
+                FamilyKind::TextContains => {
+                    assert!(
+                        q.cypher.contains("$fragment") && q.cypher.contains("CONTAINS"),
+                        "{} must be a CONTAINS search binding $fragment",
+                        q.name
+                    );
+                }
+            }
         }
+    }
+
+    #[test]
+    fn exactly_one_ann_and_one_text_family_exist() {
+        let ann = READ_BATTERY
+            .iter()
+            .filter(|q| q.kind == FamilyKind::VectorAnn)
+            .count();
+        let text = READ_BATTERY
+            .iter()
+            .filter(|q| q.kind == FamilyKind::TextContains)
+            .count();
+        assert_eq!(ann, 1, "exactly one VECTOR ANN family");
+        assert_eq!(text, 1, "exactly one TEXT search family");
     }
 
     #[test]

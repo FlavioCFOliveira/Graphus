@@ -173,6 +173,60 @@ pub fn parse_proc_io_bytes(io: &str, key: &str) -> Option<u64> {
     None
 }
 
+/// The verdict of an index-seek PROFILE gate (`rmp` #746/#755): a query genuinely uses its declared
+/// index **at runtime** iff (a) the expected index operator is present in the plan AND (b) the measured
+/// `dbHits` are a **small fraction** of the whole-store scan's.
+///
+/// Both halves are load-bearing, and (b) is why the operator alone is not enough. The off-thread reader
+/// pool declines every index seek and falls back to a full scan (`rmp` #755), yet the *planner* still
+/// picked the index — so the plan reports `NodeTextIndexSeek` / `RelIndexRangeSeek` while the execution
+/// reads the whole store. Only the measured `dbHits` tell a genuine seek from a mislabelled scan. This
+/// is the exact defect this task exists to prevent an example from hiding behind a green tick.
+///
+/// `seek_hits` is the measured `dbHits` of the (allegedly) index-backed run; `scan_hits` is the measured
+/// `dbHits` of the same shape executed as a full scan (either the identical query declined to the reader
+/// pool, or a forced label/type scan). `factor` is the margin the seek must beat: the seek must read
+/// **strictly less than `scan_hits / factor`** (e.g. `factor = 4` ⇒ the seek reads under a quarter of the
+/// scan). A larger `factor` is a stricter gate.
+///
+/// Returns `Ok(())` when the index is genuinely used, or `Err(reason)` describing why the gate FAILS —
+/// the operator was absent (the planner did not pick the index at all), or the seek read as much of the
+/// store as the scan (the `rmp` #755 decline: a seek in name only).
+///
+/// # Errors
+/// A human-readable reason when the gate fails: a missing operator or a non-selective `dbHits`.
+pub fn index_seek_verdict(
+    op_present: bool,
+    seek_hits: i64,
+    scan_hits: i64,
+    factor: i64,
+) -> Result<(), String> {
+    if !op_present {
+        return Err(
+            "the expected index operator is absent from the plan — the planner did not pick the \
+             index (a scan, or a different plan)"
+                .to_owned(),
+        );
+    }
+    if scan_hits <= 0 {
+        return Err(format!(
+            "the scan reference measured no dbHits ({scan_hits}); cannot prove the seek is a fraction \
+             of it (is the scan query really a full scan?)"
+        ));
+    }
+    // Strictly less than scan_hits / factor, computed WITHOUT division so a small scan reference cannot
+    // round the threshold to zero: `seek_hits * factor < scan_hits`.
+    if seek_hits.saturating_mul(factor.max(1)) < scan_hits {
+        Ok(())
+    } else {
+        Err(format!(
+            "the operator is present but the measured dbHits are NOT a small fraction of the scan's: \
+             seek={seek_hits}, scan={scan_hits} (need seek × {factor} < scan). This is the rmp #755 \
+             decline — a seek reported in the plan but a full scan at runtime."
+        ))
+    }
+}
+
 /// The index of a read-battery [`QuerySpec`] within [`READ_BATTERY`], used to bucket per-family
 /// latencies. `spec` is one of the entries [`crate::queries::pick`] returns; the lookup is by the
 /// family's unique `name` (the report key), which is stable regardless of const-promotion (a pointer
@@ -308,5 +362,44 @@ mod tests {
         for (i, spec) in READ_BATTERY.iter().enumerate() {
             assert_eq!(family_index(spec), i, "family {} index", spec.name);
         }
+    }
+
+    #[test]
+    fn index_seek_verdict_passes_a_genuine_seek() {
+        // MEASURED shapes, all against a real index-free scan reference.
+        // TEXT trigram seek on an isolated server: 23 dbHits vs an 801-dbHit index-free scan.
+        assert!(index_seek_verdict(true, 23, 801, 4).is_ok());
+        // rel RANGE over the 10% recent window: 2907 dbHits vs a full LIKE type scan.
+        assert!(index_seek_verdict(true, 2907, 24500, 4).is_ok());
+        // VECTOR ANN inline: 50 dbHits vs an 800-dbHit forced Product scan.
+        assert!(index_seek_verdict(true, 50, 800, 4).is_ok());
+    }
+
+    #[test]
+    fn index_seek_verdict_fails_the_rmp755_decline() {
+        // The exact defect the gate exists to catch: the operator is present (the planner picked the
+        // index) but the runtime dbHits are a full scan's — MEASURED in the product-recommendations
+        // example, where a bulk-imported database reports the TEXT index `ONLINE` yet every `CONTAINS`
+        // reads the whole label (801 dbHits == the index-free scan).
+        let v = index_seek_verdict(true, 601, 601, 4);
+        assert!(v.is_err(), "a seek that read the whole store must FAIL");
+        assert!(v.unwrap_err().contains("#755"));
+        // Even a modest over-read fails the 4× margin (seek read half the store).
+        assert!(index_seek_verdict(true, 300, 601, 4).is_err());
+    }
+
+    #[test]
+    fn index_seek_verdict_fails_a_missing_operator() {
+        // The planner did not pick the index at all (a scan, or an unrelated plan): FAIL.
+        let v = index_seek_verdict(false, 3, 601, 4);
+        assert!(v.is_err());
+        assert!(v.unwrap_err().contains("absent"));
+    }
+
+    #[test]
+    fn index_seek_verdict_rejects_a_degenerate_scan_reference() {
+        // If the "scan" reference read nothing, we cannot prove selectivity — fail closed rather than
+        // pass a gate on a meaningless comparison.
+        assert!(index_seek_verdict(true, 0, 0, 4).is_err());
     }
 }

@@ -76,9 +76,6 @@ use graphus_storage::{IndexState, RecordStore};
 use graphus_txn::IsolationLevel;
 use graphus_wal::{FileLogSink, WalManager};
 
-use crate::EPOCH_S;
-use crate::REG_SPAN_S;
-
 use crate::{GenConfig, Generator};
 
 /// The on-disk store type this loader drives.
@@ -113,8 +110,9 @@ const IDX_ARTICLE_NAME_TEXT: &str = "article_name_text";
 /// `FULLTEXT` (analyzer-tokenized) index on `ARTICLE.name` — the headline word search queried by
 /// `db.index.fulltext.queryNodes`.
 const IDX_ARTICLE_HEADLINE_FT: &str = "article_headline_fulltext";
-/// Relationship `RANGE` index on `LIKE.date` — an equality-seekable like-timestamp index (Graphus's
-/// relationship RANGE index is equality-only; a `date` *range* predicate stays a scan + filter).
+/// Relationship `RANGE` index on `LIKE.date` — the like-timestamp index. Since `rmp` #680 the
+/// relationship RANGE index serves a `date` *range* predicate as a `RelIndexRangeSeek` (not just
+/// equality), so the `like_recent` recent-window query SEEKS it rather than scanning the type.
 const IDX_LIKE_DATE: &str = "like_date_range";
 /// Composite node `RANGE` index on `ARTICLE(registered, id)` — time-ordered catalogue reads (leading
 /// `registered` equality seek + trailing `id` residual).
@@ -572,8 +570,8 @@ pub fn run_load(cfg: &GenConfig, dir: &Path, opts: LoadOpts) -> LoadOutcome {
         //     - a TEXT (trigram) index for headline substring search (`CONTAINS` / `STARTS WITH`);
         //     - a FULLTEXT (analyzer-tokenized) index for headline WORD search via
         //       `db.index.fulltext.queryNodes`;
-        //     - a relationship RANGE index on LIKE.date (equality-seekable; Graphus's relationship RANGE
-        //       index is equality-only, so a `date` *range* predicate stays a scan + residual filter);
+        //     - a relationship RANGE index on LIKE.date (since `rmp` #680 it serves a `date` *range*
+        //       predicate as a `RelIndexRangeSeek`, so the `like_recent` window query SEEKS it);
         //     - a composite node RANGE index on ARTICLE(registered, id) for time-ordered catalogue reads.
         coord
             .create_text_index(IDX_ARTICLE_NAME_TEXT, "ARTICLE", "name", true)
@@ -814,10 +812,10 @@ fn run_query_battery(
 ///    index (`<term>` lower-cased to the analyzer token). By construction this returns the SAME article
 ///    set as `text_contains` (`<term>` is a single-token subject word appearing nowhere else), so the
 ///    caller cross-checks both against the generator's ground truth.
-/// 3. `like_recent`   — a `LIKE.date` **range** predicate (`WHERE l.date >= <midpoint>`). Graphus's
-///    relationship RANGE index is *equality-only*, so this range predicate is served by a correct
-///    scan-plus-residual-filter (NOT the `like_date_range` index); the probe still returns a
-///    well-defined, non-trivial slice of the like timeline (the recent half).
+/// 3. `like_recent`   — a `LIKE.date` **range** predicate (`WHERE l.date >= LIKE_RECENT_SINCE`, the last
+///    ~10% of the timeline). Since `rmp` #680 the `like_date_range` relationship RANGE index serves a
+///    range predicate as a `RelIndexRangeSeek`, so this probe SEEKS the index; the narrow recent window
+///    keeps that seek genuinely selective and returns a well-defined, non-trivial recent slice.
 fn run_search_battery(coord: &mut Coord, catalog: &IndexCatalog, term: &str) -> Vec<QuerySample> {
     let mut out = Vec::with_capacity(3);
 
@@ -847,13 +845,16 @@ fn run_search_battery(coord: &mut Coord, catalog: &IndexCatalog, term: &str) -> 
         scalar: first_scalar(&rows),
     });
 
-    // 3) LIKE.date range (the recent half). Every generated LIKE date lies in
-    //    `[EPOCH_S, EPOCH_S + REG_SPAN_S)`, so `date >= EPOCH_S + REG_SPAN_S/2` is the upper (recent)
-    //    half of the timeline — a well-defined, non-trivial slice. The relationship RANGE index is
-    //    equality-only, so this predicate is a correct scan + residual filter, not an index seek.
-    let midpoint = EPOCH_S + REG_SPAN_S / 2;
+    // 3) LIKE.date recent-window range. Every generated LIKE date lies in `[EPOCH_S, EPOCH_S +
+    //    REG_SPAN_S)`, so `date >= LIKE_RECENT_SINCE` (the last ~10% of the timeline) selects a small,
+    //    well-defined recent slice. Since `rmp` #680 the relationship RANGE index on LIKE.date serves a
+    //    RANGE predicate, so this lowers to a `RelIndexRangeSeek` (not a scan + residual filter); the
+    //    narrow window keeps that seek genuinely selective. This shared cutoff is the SAME one the
+    //    concurrent driver's `like_recent` family uses, so the load-time validation and the ladder probe
+    //    the identical slice.
+    let since = crate::battery::LIKE_RECENT_SINCE;
     let q =
-        format!("MATCH ()-[l:LIKE]->(:ARTICLE) WHERE l.date >= {midpoint} RETURN count(l) AS hits");
+        format!("MATCH ()-[l:LIKE]->(:ARTICLE) WHERE l.date >= {since} RETURN count(l) AS hits");
     let (rows, latency_us) = timed_read(coord, catalog, &q);
     out.push(QuerySample {
         name: "like_recent".to_owned(),
