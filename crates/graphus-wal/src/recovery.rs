@@ -343,11 +343,20 @@ pub(crate) enum ScanOutcome {
 
 /// Finds the absolute offset of the first surviving record at/after `base`, skipping a leading run
 /// of zero bytes — a **reclaimed WAL prefix** (`rmp` #114): freed segments / a drained tail read
-/// back as zeros, and a real record never begins with a zero byte (its leading `total_len` is
-/// `>= MIN_RECORD_LEN`). The skip is confined to the *leading* prefix; a reclaim only ever frees a
+/// back as zeros. The skip is confined to the *leading* prefix; a reclaim only ever frees a
 /// contiguous front prefix, so interior zero/garbage between real records is still caught by the
 /// [`scan_forward`] corruption check. Windowed, so even a large reclaimed gap costs O(window) memory.
 /// Returns `None` if `[base, durable_len)` is empty or entirely zero.
+///
+/// **Why the naive "first non-zero byte" is wrong (`rmp` release audit, WAL CRITICAL).** A record's
+/// `total_len` is a little-endian `u32`, so a real record whose `total_len` is a multiple of 256
+/// (256, 512, …) *begins* with a `0x00` byte — `total_len >= MIN_RECORD_LEN` bounds the value away
+/// from zero but says nothing about its low byte. Returning the first non-zero offset then points one
+/// or more bytes INTO such a record, the forward scan decodes garbage there, and a clean,
+/// fully-committed log is misdiagnosed as interior corruption and refuses to open. A leading zero run
+/// is therefore AMBIGUOUS: it is either reclaimed padding, or the low `total_len` bytes of a genuine
+/// record at `abs`. It is disambiguated by [`record_decodes_at`] — a real record decodes (CRC-checked)
+/// at `abs`; reclaimed zeros do not.
 pub(crate) fn find_first_record_offset<S: LogSink>(
     wal: &WalManager<S>,
     base: u64,
@@ -359,12 +368,58 @@ pub(crate) fn find_first_record_offset<S: LogSink>(
     while abs < durable_len {
         let win_end = (abs + window).min(durable_len);
         wal.read_bounded(Lsn(abs), Lsn(win_end), &mut buf)?;
-        if let Some(pos) = buf.iter().position(|&b| b != 0) {
-            return Ok(Some(abs + pos as u64));
+        match buf.iter().position(|&b| b != 0) {
+            // The whole window was zeros; keep skipping.
+            None => abs = win_end,
+            // A record begins right at `abs` (its first byte is non-zero).
+            Some(0) => return Ok(Some(abs)),
+            // `pos` leading zero bytes precede non-zero data: reclaimed padding, OR a real record at
+            // `abs` whose `total_len` has zero low bytes. Decode at `abs` to tell them apart.
+            Some(pos) => {
+                if record_decodes_at(wal, abs, durable_len, window)? {
+                    return Ok(Some(abs));
+                }
+                return Ok(Some(abs + pos as u64));
+            }
         }
-        abs = win_end; // the whole window was zeros; keep skipping
     }
     Ok(None)
+}
+
+/// Whether a single well-formed record decodes starting exactly at `at` (CRC-checked). Used only to
+/// disambiguate a real record whose little-endian `total_len` has zero low bytes from a run of
+/// reclaimed zero padding — a CRC-valid record decodes here, reclaimed zeros (or a misaligned read one
+/// byte into a real record) do not. Grows the read window on a straddle, exactly like [`scan_forward`],
+/// so an oversized first record is probed correctly rather than mistaken for padding.
+fn record_decodes_at<S: LogSink>(
+    wal: &WalManager<S>,
+    at: u64,
+    durable_len: u64,
+    window: u64,
+) -> Result<bool> {
+    let mut win = window;
+    let mut buf = Vec::new();
+    loop {
+        let win_end = (at + win).min(durable_len);
+        wal.read_bounded(Lsn(at), Lsn(win_end), &mut buf)?;
+        match LogRecordRef::decode(&buf) {
+            Ok(_) => return Ok(true),
+            // Not enough bytes yet: grow the window unless we are already at end-of-log (where too few
+            // bytes means there is no complete record here — it is padding or a torn tail).
+            Err(DecodeError::Incomplete) => {
+                if win_end == durable_len {
+                    return Ok(false);
+                }
+                win = win.checked_mul(2).ok_or_else(|| {
+                    GraphusError::Storage(
+                        "WAL recovery window overflow while probing the first record".to_owned(),
+                    )
+                })?;
+            }
+            // A wrong length or a failed CRC: this offset does not begin a real record.
+            Err(DecodeError::BadCrc | DecodeError::Corrupt) => return Ok(false),
+        }
+    }
 }
 
 /// Streams the durable record range `[first_offset, durable_len)` window-by-window, invoking

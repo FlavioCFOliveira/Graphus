@@ -413,6 +413,123 @@ fn committed_transactions_fails_loud_on_interior_corruption() {
 }
 
 #[test]
+fn committed_transactions_recovers_a_first_record_whose_total_len_is_a_multiple_of_256() {
+    // Regression (release-readiness audit, WAL finding 1 / CRITICAL): `find_first_record_offset`
+    // skipped a leading run of zero bytes as "reclaimed WAL prefix" on the false premise that "a real
+    // record never begins with a zero byte". A record's `total_len` is a little-endian u32, so any
+    // record whose `total_len` is a multiple of 256 (256, 512, ...) begins with a 0x00 byte. When such
+    // a record is the FIRST one above the recovery base, the skip returned an offset one byte into it,
+    // the forward scan then decoded garbage, and a perfectly clean, fully-committed log was
+    // misdiagnosed as "interior log corruption" and refused to open — committed data made unrecoverable.
+    //
+    // The reproduction sizes a committed transaction's update record to total_len == 256 and reclaims
+    // the WAL up to it, so recovery's `base` lands exactly on a record beginning with 0x00.
+    let mut wal = WalManager::create(MemLogSink::new()).unwrap();
+
+    // Txn 1: an ordinary small transaction. It will be reclaimed away, moving the recovery base past it.
+    wal.begin(TxnId(1));
+    wal.log_update(TxnId(1), PageId(0), d(-1), d(1));
+    wal.commit(TxnId(1)).unwrap();
+
+    // The offset where txn 2's records begin — the reclaim floor we will move `base` to.
+    wal.flush();
+    let reclaim_to = wal.durable_len();
+
+    // Txn 2: its update record is padded so that total_len == 256 exactly, i.e. its leading byte is
+    // 0x00. total_len = REC_FIXED_PREFIX(45) + 4 + redo.len() + 4 + undo.len() + 4 = 57 + redo + undo,
+    // so redo + undo must be 199. (The begin record precedes it, so we reclaim past begin as well.)
+    wal.begin(TxnId(2));
+    wal.log_update(TxnId(2), PageId(1), vec![7u8; 150], vec![9u8; 49]);
+    wal.commit(TxnId(2)).unwrap();
+    wal.flush();
+
+    // Confirm — non-vacuously — that a real record beginning with 0x00 actually exists in the log, and
+    // that it sits at or after the reclaim floor (so the skip logic will see it as the first record).
+    let full = wal.sink().durable_bytes().to_vec();
+    let mut cursor = HEADER_LEN as usize;
+    let mut found_zero_leading_at = None;
+    while cursor < full.len() {
+        let (_, n) = LogRecord::decode(&full[cursor..]).expect("intact record");
+        if full[cursor] == 0x00 {
+            found_zero_leading_at = Some(cursor as u64);
+        }
+        cursor += n;
+    }
+    let zero_at = found_zero_leading_at
+        .expect("the padded update record must begin with a 0x00 total_len byte");
+    assert!(
+        zero_at >= reclaim_to,
+        "the zero-leading record ({zero_at}) must be at/after the reclaim floor ({reclaim_to})"
+    );
+
+    // Reclaim up to the 0x00-leading record itself, so recovery's `base` lands EXACTLY on it and the
+    // leading-zero skip is applied to a real record's first byte (reclaiming only up to `reclaim_to`
+    // would leave txn 2's begin record — which does not start with 0x00 — first, and the skip is
+    // confined to the leading prefix, so it would never see the zero-leading record at all).
+    wal.reclaim(Lsn(zero_at)).expect("reclaim");
+    assert_eq!(
+        wal.sink().reclaimed_floor(),
+        zero_at,
+        "the reclaim must have moved the floor exactly onto the zero-leading record"
+    );
+
+    // The committed transaction table must still contain txn 2. Before the fix this returned an
+    // "interior log corruption" error instead — the clean log refused to recover.
+    let committed = wal
+        .committed_transactions()
+        .expect("a clean, fully-committed log must recover, not be misread as corruption");
+    assert!(
+        committed.iter().any(|(t, _, _)| *t == TxnId(2)),
+        "committed txn 2 must survive recovery when its record's total_len is a multiple of 256; \
+         got {committed:?}"
+    );
+}
+
+#[test]
+fn max_recovered_txn_id_survives_a_first_record_whose_total_len_is_a_multiple_of_256() {
+    // The second manifestation of the same WAL CRITICAL: `max_recovered_txn_id` shares
+    // `find_first_record_offset`, but scans with the interior-corruption probe OFF, so the misaligned
+    // decode was treated as an immediate torn tail and it returned max_id = 0. A too-low high-water
+    // mark causes transaction-id REUSE across recovery — the atomicity violation that function exists
+    // to prevent. This pins that it now returns the real high-water mark.
+    let mut wal = WalManager::create(MemLogSink::new()).unwrap();
+    wal.begin(TxnId(1));
+    wal.log_update(TxnId(1), PageId(0), d(-1), d(1));
+    wal.commit(TxnId(1)).unwrap();
+    wal.flush();
+
+    // Txn 2's update record padded to total_len == 256 (leading 0x00), as above.
+    wal.begin(TxnId(2));
+    wal.log_update(TxnId(2), PageId(1), vec![7u8; 150], vec![9u8; 49]);
+    wal.commit(TxnId(2)).unwrap();
+    wal.flush();
+
+    // Find the zero-leading record and reclaim exactly onto it.
+    let full = wal.sink().durable_bytes().to_vec();
+    let mut cursor = HEADER_LEN as usize;
+    let mut zero_at = None;
+    while cursor < full.len() {
+        let (_, n) = LogRecord::decode(&full[cursor..]).expect("intact record");
+        if full[cursor] == 0x00 {
+            zero_at = Some(cursor as u64);
+        }
+        cursor += n;
+    }
+    let zero_at = zero_at.expect("a 0x00-leading record must exist");
+    wal.reclaim(Lsn(zero_at)).expect("reclaim");
+
+    // The high-water mark must be at least txn 2. Before the fix this returned 0 — inviting id reuse.
+    let max_id = wal
+        .max_recovered_txn_id()
+        .expect("scan the id high-water mark");
+    assert!(
+        max_id >= 2,
+        "the recovered id high-water mark must include txn 2 (got {max_id}); a lower value would \
+         let recovery reuse a committed transaction id"
+    );
+}
+
+#[test]
 fn committed_transactions_tolerates_a_genuine_torn_tail() {
     // Complement of the above: a genuine torn tail (no valid record after the torn point) must NOT
     // trip the fail-loud guard — `committed_transactions` returns the committed prefix cleanly.
