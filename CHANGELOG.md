@@ -152,6 +152,16 @@ explicitly so an operator can judge their own exposure.
   increments `graphus_freeze_frontier_violations_total`, and logs the offending store/id/stamps. Cost
   is **~43 µs, 0.35 % of a maintenance pass** (and avoids the O(store) spike a periodic full scan
   would cause), with the debug/`check-cold-assert` full per-prune scan retained as the strongest tier.
+- **A repaired VECTOR index returns to the ANN fast path immediately at full quiescence, instead of
+  carrying a backoff residue that outlived its cause (rmp #802).** The degraded-index re-fill throttle
+  (`vector_conflict_retry_backoff`) is coordinator-global across every vector index and only *halved*
+  on a successful repair, so one index's overlapping-writer storm inflated it and the inflated throttle
+  was then spent on an unrelated index's next conflict — an index with a single transient conflict paid
+  **513 commands** on the (correct but slower) exact scan before returning to ANN. It now **drains to 1
+  the moment the whole vector-index blocker set is empty** (full quiescence), while still *halving* in
+  the intermittent case, so a genuinely re-conflicting workload does not regress into a hot re-fill loop
+  (the storm trajectory is measured byte-identical). Result: the single-conflict recovery bound drops
+  **513 → 3 commands**. Correctness was never at risk (the fallback is exact, not approximate).
 
 ### Fixed
 

@@ -1954,3 +1954,173 @@ fn a_whole_set_rebuild_does_not_strand_a_resolved_vector_blocker() {
          surviving one strands a correctly-rebuilt graph on the exact brute-force scan",
     );
 }
+
+// -------------------------------------------------------------------------------------------------
+// `rmp` #802 — the re-fill throttle must DRAIN at full quiescence, not merely halve.
+//
+// The vector-conflict re-fill backoff is a coordinator-GLOBAL throttle shared by every vector index:
+// one index's overlapping-writer storm inflates it, and it is spent as `skip` on the FIRST re-conflict
+// of the NEXT index to block. Halving on a repair decays it over ~log2(backoff) later repairs, so the
+// inflated throttle OUTLIVES the storm that armed it and makes a fresh, singly-conflicted index decline
+// to the exact brute-force scan for `backoff` further commands — silently, while `SHOW INDEXES` reports
+// ONLINE. The fix drains the backoff to its floor the moment the WHOLE vector blocker set is empty.
+// -------------------------------------------------------------------------------------------------
+
+/// Declare an ONLINE node vector index named `name` over `Doc.prop` (the production `CREATE VECTOR
+/// INDEX` route).
+fn declare_doc_vector(coord: &mut Coord, name: &str, prop: &str) {
+    coord
+        .begin_online_vector_index_named(
+            Some(name),
+            VectorEntity::Node,
+            "Doc",
+            prop,
+            3,
+            VectorSimilarity::Cosine,
+            16,
+            200,
+            false,
+        )
+        .expect("create node vector index");
+}
+
+/// Open (and leave open) a writer that moves `Doc {name: node}`'s `prop` off its committed value.
+fn open_vec_blocker(coord: &mut Coord, node: &str, prop: &str) -> graphus_core::TxnId {
+    let w = coord.begin_serializable();
+    let _ = run_plan(
+        coord,
+        w,
+        &compile(
+            &format!("MATCH (n:Doc {{name: '{node}'}}) SET n.{prop} = [0.0, 0.0, 1.0]"),
+            &IndexCatalog::empty(),
+        ),
+    );
+    w
+}
+
+/// Drive ONE re-conflict of the already-blocked vector index on `prop`, which takes the `else`
+/// (doubling) branch of the re-fill throttle: resolve the current blocker `w`, open the next blocker on
+/// the OTHER node (distinct node ⇒ no write-write abort), then drain command passes until the re-fill
+/// re-conflicts (one `vector_index_conflict_events` increment). Returns the new OPEN blocker.
+fn overlap_double_vec(
+    coord: &mut Coord,
+    w: graphus_core::TxnId,
+    prop: &str,
+    next_node: &str,
+) -> graphus_core::TxnId {
+    let w_next = open_vec_blocker(coord, next_node, prop);
+    coord.rollback(w).expect("resolve current blocker");
+    let base = coord.vector_index_conflict_events();
+    let mut guard = 0u64;
+    loop {
+        coord.advance_index_builds(usize::MAX);
+        guard += 1;
+        if coord.vector_index_conflict_events() > base {
+            break;
+        }
+        assert!(
+            guard <= 5_000_000,
+            "{prop}: the re-fill never re-conflicted"
+        );
+    }
+    w_next
+}
+
+/// Full quiescence: resolve `w`, then count command passes until the fast path is re-armed (the index
+/// is no longer declining to the exact scan). This IS the "commands still served by the exact scan"
+/// recovery bound.
+fn quiesce_vec_and_count(coord: &mut Coord, w: graphus_core::TxnId) -> u64 {
+    coord.rollback(w).expect("resolve last blocker");
+    let mut passes = 0u64;
+    while coord.blocked_vector_indexes() > 0 {
+        coord.advance_index_builds(usize::MAX);
+        passes += 1;
+        assert!(
+            passes <= 5_000_000,
+            "the index never returned to the fast path"
+        );
+    }
+    passes
+}
+
+/// The recovery bound: after a storm on one index has fully quiesced, an UNRELATED index that blocks
+/// later with a single transient conflict must return to the ANN fast path PROMPTLY — it must not
+/// inherit the storm's inflated throttle.
+///
+/// FAILS (RED) with the `rmp` #802 drain reverted (the `repaired` branch halving unconditionally): the
+/// shared backoff peaks during storm A, A quiesces to backoff/2, and index B — built long after, with
+/// ONE re-conflict — then inherits it and stays on the exact scan for hundreds of commands. MEASURED:
+/// B pays 513 commands without the drain versus 3 with it (storm A peaked the shared backoff at 512).
+///
+/// The assertion is a STATE bound (`blocked_vector_indexes` passes), never a query answer: the exact
+/// scan a blocked index declines to returns the SAME rows a repaired index does, so a rows-based test
+/// cannot see the residue at all (`rmp` #780 audit, above).
+#[test]
+fn vector_conflict_backoff_drains_at_full_quiescence() {
+    let mut coord = fresh_coord();
+    // Two covered properties on the same label, each with its OWN vector index. The throttle they share
+    // is coordinator-global, which is the whole point.
+    run_write(
+        &mut coord,
+        "CREATE (:Doc {name: 'x', embedding: [1.0, 0.0, 0.0], emb2: [1.0, 0.0, 0.0]})",
+    );
+    run_write(
+        &mut coord,
+        "CREATE (:Doc {name: 'y', embedding: [0.9, 0.4358899, 0.0], emb2: [0.9, 0.4358899, 0.0]})",
+    );
+
+    // ---- STORM on index A: build under an open writer, then 20 overlapping re-conflicts that inflate
+    // the shared backoff geometrically (1 → 2 → 4 → … → 512). An EVEN round count ends the storm on a
+    // drained-skip round, so A quiesces through the pure vector-conflict re-fill (the path #802 fixes)
+    // rather than the #803 poison-rebuild path (which clears the blocker WITHOUT touching this throttle,
+    // and would leave B's inheritance ambiguous).
+    let mut w = open_vec_blocker(&mut coord, "x", "embedding");
+    declare_doc_vector(&mut coord, "vec_a", "embedding");
+    for round in 0..20u32 {
+        let next = if round % 2 == 0 { "y" } else { "x" };
+        w = overlap_double_vec(&mut coord, w, "embedding", next);
+    }
+    // NON-VACUITY: the storm genuinely churned. Each re-conflict is one `vector_conflict_events` edge,
+    // and (under a drained skip) one doubling of the shared backoff — so a high count is direct evidence
+    // the throttle was driven far above its floor and there is a real inflation for B to inherit.
+    let storm_events = coord.vector_index_conflict_events();
+    assert!(
+        storm_events >= 15,
+        "vacuous: the storm produced only {storm_events} re-conflicts, so it did not inflate the \
+         shared backoff and B below has nothing to inherit",
+    );
+
+    // A quiesces. Its OWN recovery still pays the inherent throttle cost it armed — the fix neither does
+    // nor must shorten the storm's own tail; #802 is only about the backoff OUTLIVING the storm.
+    let residue_a = quiesce_vec_and_count(&mut coord, w);
+    assert_eq!(
+        coord.blocked_vector_indexes(),
+        0,
+        "vacuous: storm A never blocked, so there was no inflated throttle to drain",
+    );
+
+    // ---- Index B: a DIFFERENT index, built long after the storm ended, with a SINGLE transient
+    // re-conflict. It must NOT inherit storm A's throttle: B's own one re-conflict justifies at most a
+    // ~3-command window, nothing more.
+    let mut wb = open_vec_blocker(&mut coord, "x", "emb2");
+    declare_doc_vector(&mut coord, "vec_b", "emb2");
+    assert_eq!(
+        coord.blocked_vector_indexes(),
+        1,
+        "vacuous: index B's build did not block, so its recovery exercises nothing",
+    );
+    wb = overlap_double_vec(&mut coord, wb, "emb2", "y");
+    let residue_b = quiesce_vec_and_count(&mut coord, wb);
+
+    // THE BOUND. With the drain (fix) B recovers in 3 command passes; without it B inherits the storm's
+    // half-decayed backoff (256 after a 512 peak) and pays 513 — the residue outliving its cause.
+    assert!(
+        residue_b <= 5,
+        "index B — unrelated to storm A, with a single transient conflict — took {residue_b} \
+         commands to return to the ANN fast path (its own re-conflict justifies at most ~3). It \
+         inherited storm A's inflated backoff (A itself needed {residue_a} and churned \
+         {storm_events} re-conflicts); the re-fill throttle did not drain at full quiescence, so a \
+         fresh index declines to the O(entities x dim) exact scan long after the storm that armed the \
+         throttle is gone (`rmp` #802).",
+    );
+}

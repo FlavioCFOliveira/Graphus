@@ -8089,9 +8089,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ///
     /// It is throttled for the reason [`retry_degraded_index_rebuild`](Self::retry_degraded_index_rebuild)
     /// documents: overlapping writers resolve one after another, so an unthrottled repair would run one
-    /// O(store) re-fill per writer generation, forever. A repair HALVES the backoff rather than resetting
-    /// it (a flapping conflict would otherwise buy a full re-scan on every success); a re-conflict
-    /// doubles it up to [`MAX_DEGRADED_RETRY_BACKOFF`].
+    /// O(store) re-fill per writer generation, forever. A re-conflict doubles the backoff up to
+    /// [`MAX_DEGRADED_RETRY_BACKOFF`]. A repair that leaves the storm still running — some vector index
+    /// still blocked — HALVES it (a flapping conflict would otherwise buy a full re-scan on every
+    /// success); a repair that reaches FULL quiescence (no vector index, node or rel, still blocked)
+    /// DRAINS it to the floor (`rmp` task #802), so the coordinator-global backoff cannot outlive the
+    /// storm that armed it and spend itself as a wide skip on the next unrelated index to block.
     fn retry_conflicted_vector_builds(&mut self) -> bool {
         let node_keys = self.index.borrow().conflicted_vector();
         let rel_keys = self.index.borrow().conflicted_vector_rel();
@@ -8232,7 +8235,29 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 .iter()
                 .all(|&(t, p)| self.index.borrow().vector_rel_blockers(t, p).is_empty());
         if repaired {
-            self.vector_conflict_retry_backoff = (self.vector_conflict_retry_backoff / 2).max(1);
+            // `rmp` task #802 — DRAIN on full quiescence, HALVE otherwise.
+            //
+            // The backoff is a coordinator-GLOBAL throttle shared by every vector index (node and rel):
+            // one index's overlapping-writer storm inflates it, and it is spent as `skip` on the FIRST
+            // re-conflict of the NEXT index to block — so a wide backoff left standing after its cause is
+            // gone makes a fresh, singly-conflicted index decline to the exact brute-force scan for
+            // `backoff` further commands, silently, while `SHOW INDEXES` reports ONLINE. Halving alone
+            // decays it over ~log2(backoff) later repairs, so the residue outlives the storm that armed
+            // it (measured: 513 commands on an unrelated index after a burst that peaked at 512).
+            //
+            // When the WHOLE vector blocker set is now empty — no index, this one or any other, is still
+            // declining — the storm is genuinely over, so reset the throttle to its floor. Draining is
+            // sound precisely BECAUSE the set is empty: a re-conflicting workload keeps a non-empty set
+            // (a still-open writer re-records itself during this very re-fill, taking the `else` branch
+            // below instead) or leaves a sibling index blocked, and either way never reaches this reset —
+            // so the anti-hot-loop guard (`rmp` #733 / #780) that the backoff exists for is preserved: a
+            // storm still climbs 1→2→4→…→cap and is never re-armed to a 1-drain window mid-storm.
+            if self.index.borrow().blocked_vector_indexes() == 0 {
+                self.vector_conflict_retry_backoff = 1;
+            } else {
+                self.vector_conflict_retry_backoff =
+                    (self.vector_conflict_retry_backoff / 2).max(1);
+            }
             self.vector_conflict_retry_skip = 0;
         } else {
             self.vector_conflict_retry_backoff = self
