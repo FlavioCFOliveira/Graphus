@@ -214,6 +214,17 @@ explicitly so an operator can judge their own exposure.
   dropped (rmp #573).**
 - **A single QPP / variable-length query can no longer abort the server (rmp #656).**
 - **`stdev` / `stdevp` returned a wrong aggregate value (rmp #628).**
+- **GC no longer severs an in-flight off-thread reader by zeroing a reclaimed property's forward
+  pointer (rmp #821, ACID-Isolation).** `gc_property_chain` zeroed a reclaimed tombstone's `next_prop`
+  on a **live** owner's chain, so a concurrent auto-commit reader walking the chain lost every
+  committed, snapshot-visible property below the tombstone — a silent snapshot-isolation violation (a
+  threaded stress reproduced ~7.4% lost reads on the unfixed code). The reclaim now **preserves** the
+  forward pointer so a reader threads through to the live successor, mirroring the #811 relationship fix.
+- **The MVP UDS crash-recovery E2E tests are deterministic under a full-workspace run (rmp #819).** A
+  test-harness robustness gap (not a server defect — recovery is correct in isolation) let a spawned
+  server child be killed at startup under ~300-binary parallelism; the child is now single-threaded and
+  low-footprint, its spawn is bounded-retried to absorb a transient reaper/OOM kill, and a guard test
+  proves the retry never masks a genuine startup crash.
 
 ### Security
 
@@ -227,6 +238,34 @@ explicitly so an operator can judge their own exposure.
   drift) and discard the result; the delta collapses to within measurement noise (1.0×). The adjacent
   suspended-account latency oracle was closed in the same change, and both branches are pinned by
   non-vacuous KDF-invocation regression tests.
+- **Closed a Bolt pre-authentication RESET authentication bypass (rmp #820, CWE-306).** A failure
+  *before* authentication (a malformed/absent HELLO, a failed LOGON, or an out-of-order message)
+  entered the RESET-recoverable `FAILED` state instead of the spec-mandated terminal `DEFUNCT`, so an
+  unauthenticated client could send junk → `RESET` → `RESET` → `RUN` and reach `READY` with a `None`
+  principal — which the engine seam treats as **unrestricted** — running arbitrary read+write queries
+  over Bolt (TCP and UDS) with no credentials. Every pre-auth failure is now terminal, with a
+  defense-in-depth guard in `RESET`; the correct post-auth `FAILED`→`RESET`→`READY` recovery (#613) is
+  preserved. Proven by a non-vacuous test in which the exploit's `RUN` reaches the executor on the
+  unfixed code.
+- **Node index-seek / precise-scan and the named full-text/vector index procedures now honour
+  `DENY READ` property masking for a restricted principal (rmp #822 / #826, CWE-863).** The fused node
+  read paths (`index_seek` eq/range/composite/spatial/text and `scan_filter_eq`), and
+  `db.index.fulltext.query*`, filtered candidates only on node visibility — so `WHERE n.p = v` (or a
+  full-text match) on a `DENY READ` property returned rows a masked read hides, disclosing *which* nodes
+  carry a value while `RETURN n.p` shows `null`. They now gate on read access to **every** covered
+  property, exactly matching the `node_property` masking (the relationship seeks already declined). The
+  vector k-NN procedure was already safe at the whole-query level (the re-score masks the embedding) and
+  was hardened defensively.
+- **Bolt `LOGON` is now subject to the per-account brute-force lockout (rmp #823, CWE-307).** The
+  `AuthThrottle` (per-account failed-login lockout) was consulted only by REST `/auth/login`, so online
+  password guessing against a known account never locked out over Bolt. One shared throttle instance now
+  backs both password interfaces, keyed per account; the previously-inaccurate doc was corrected.
+- **Bounded concurrent password-verification work to stop a username-rotation Argon2 amplification DoS
+  (rmp #824, CWE-770).** Because the per-account throttle admits the first attempt for every distinct
+  username and #812 made every unknown-user LOGON pay a full memory-hard Argon2id, a flood of logins
+  with rotating usernames could exhaust the shared blocking pool pre-auth. A new global bound on
+  concurrent verifications sheds (REST 503 / a transient Bolt `FAILURE`) **before** the KDF,
+  username-independently — preserving the #812 constant-work property — sized from the host's CPU count.
 
 ## [0.0.9] - 2026-07-08
 
