@@ -311,6 +311,54 @@ impl<'g, O: PrivilegeOracle> AuthorizedGraph<'g, O> {
         }
     }
 
+    /// The relationship twin of [`may_read_node_property`](Self::may_read_node_property) for a single
+    /// property (`rmp` task #826): the relationship must be visible (type traversable + both endpoints
+    /// visible) AND grant a read on `property` on its type. Used to gate a vector k-NN hit on the
+    /// covered embedding property's read grant.
+    fn may_read_rel_property(&self, id: RelId, property: &str) -> bool {
+        match self.inner.rel_data(id) {
+            Some(data) => {
+                self.rel_visible(id) && self.oracle.can_read_rel_property(&data.rel_type, property)
+            }
+            None => false,
+        }
+    }
+
+    /// Whether a **restricted** principal may see node `id` as a full-text match over an index covering
+    /// `covered` (`rmp` task #826): the node must be traversable AND **every** covered property must be
+    /// readable under its labels. A full-text match returns the node because ANY covered property
+    /// matched the search, and the procedure never re-reads it, so a `DENY READ` on **any** covered
+    /// property must hide the node — otherwise the principal learns it matched while `RETURN
+    /// n.<covered>` shows `null`. Fetches the labels once (the multi-property twin of
+    /// [`may_read_node_property`](Self::may_read_node_property)); an empty `covered` still requires
+    /// visibility. Only consulted on the restricted path.
+    fn may_read_all_covered_node(&self, id: NodeId, covered: &[String]) -> bool {
+        match self.inner.node_labels(id) {
+            Some(labels) => {
+                self.labels_traversable(&labels)
+                    && covered.iter().all(|p| self.property_readable(&labels, p))
+            }
+            None => false,
+        }
+    }
+
+    /// The relationship twin of [`may_read_all_covered_node`](Self::may_read_all_covered_node) (`rmp`
+    /// task #826): the relationship must be visible (type traversable + both endpoints visible) AND
+    /// **every** covered property readable on its type. A relationship carries exactly one type, so
+    /// readability folds grant/deny in [`PrivilegeOracle::can_read_rel_property`] with no separate deny
+    /// predicate (mirroring [`rel_property`](GraphAccess::rel_property)'s masking gate).
+    fn may_read_all_covered_rel(&self, id: RelId, covered: &[String]) -> bool {
+        match self.inner.rel_data(id) {
+            Some(data) => {
+                self.rel_visible(id)
+                    && covered
+                        .iter()
+                        .all(|p| self.oracle.can_read_rel_property(&data.rel_type, p))
+            }
+            None => false,
+        }
+    }
+
     /// Whether `rel` is traversable: it exists, its type is traversable, **and** both endpoints are
     /// visible. The relationship-visibility gate for every read/traverse path.
     fn rel_visible(&self, rel: RelId) -> bool {
@@ -826,13 +874,20 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         if self.oracle.is_unrestricted() {
             return Some(ids);
         }
-        // A full-text query is a read path (`rmp` task #72): filter the candidate ids exactly like a
-        // scan, so an RBAC-invisible node never reaches the result. The procedure body additionally
-        // re-checks each candidate's current label through this same decorator, so the two filters
-        // compose (visibility + label + RBAC).
+        // A full-text match returns a node BECAUSE one of the index's covered TEXT properties matched
+        // the search; the procedure re-checks only `node_exists` + `fulltext_score`, never re-reading a
+        // covered property, so filtering on visibility alone leaks WHICH nodes match while `RETURN
+        // n.<covered>` shows null under a `DENY READ` (`rmp` task #826, the named-index-procedure twin of
+        // the #822 seek leak). Keep a candidate only when it is visible AND every covered property is
+        // readable under its labels — a match could be on any of them, so a `DENY READ` on ANY covered
+        // property hides the node. Unlike the seek family there is no scan fallback, so this MUST filter.
+        // If the covered set is unavailable (never, for a seam that returned candidates) FAIL CLOSED.
+        let Some(covered) = self.inner.fulltext_covered_properties(name) else {
+            return Some(Vec::new());
+        };
         Some(
             ids.into_iter()
-                .filter(|&id| self.node_visible(id))
+                .filter(|&id| self.may_read_all_covered_node(id, &covered))
                 .collect(),
         )
     }
@@ -848,11 +903,19 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         if self.oracle.is_unrestricted() {
             return Some(ids);
         }
-        // A relationship full-text query is a read path (`rmp` task #663): filter the candidate ids
-        // exactly like a scan, so an RBAC-invisible relationship (traverse denied, or an endpoint not
-        // visible) never reaches the result. The procedure body additionally re-checks each candidate's
-        // current type through this same decorator, so the filters compose (visibility + type + RBAC).
-        Some(ids.into_iter().filter(|&id| self.rel_visible(id)).collect())
+        // The relationship twin of the `rmp` #826 gate above: a relationship full-text match returns the
+        // relationship BECAUSE a covered TEXT property matched, and the procedure never re-reads it, so
+        // a visibility-only filter leaks which relationships match while `RETURN r.<covered>` shows null
+        // under a `DENY READ`. Keep a candidate only when it is visible AND every covered property is
+        // readable on its type. FAIL CLOSED if the covered set is unavailable.
+        let Some(covered) = self.inner.fulltext_rel_covered_properties(name) else {
+            return Some(Vec::new());
+        };
+        Some(
+            ids.into_iter()
+                .filter(|&id| self.may_read_all_covered_rel(id, &covered))
+                .collect(),
+        )
     }
 
     fn fulltext_score_rel(&self, name: &str, rel: RelId, search: &str) -> Option<u64> {
@@ -865,11 +928,15 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         if self.oracle.is_unrestricted() {
             return result;
         }
-        // A vector k-NN is a read path (`rmp` task #671): filter the candidate hits exactly like a
-        // scan, so an RBAC-invisible node never reaches the result. The procedure body additionally
-        // re-checks each surviving candidate's current label + embedding through this same decorator,
-        // so the filters compose (visibility + label + value + RBAC). Scores pass through untouched here and
-        // are re-scored by the procedure against each survivor's snapshot-visible embedding (`rmp` #780).
+        // A vector k-NN hit is returned BECAUSE the node's covered embedding is near the query vector,
+        // so gate on read access to that embedding property — whose name the result carries in
+        // `property` — exactly as `node_property` masking would: a `DENY READ` on the embedding hides
+        // the hit (`rmp` task #826). Defense in depth AND consistency with the full-text gate: the
+        // procedure's mandatory `rmp` #780 re-score independently re-reads the embedding through this
+        // SAME masking `node_property` (a denied embedding masks to null → `embedding_present(None)` is
+        // false → the candidate is dropped, so the whole-query surface never leaked), but gating here
+        // makes the seam self-correct so a future change to the re-score cannot reopen the leak.
+        // Compute the filtered hits into a local BEFORE moving `property` into the returned struct.
         match result {
             VectorQueryResult::Hits {
                 label_or_type,
@@ -877,16 +944,19 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
                 dimensions,
                 similarity,
                 hits,
-            } => VectorQueryResult::Hits {
-                label_or_type,
-                property,
-                dimensions,
-                similarity,
-                hits: hits
+            } => {
+                let hits: Vec<(u64, f32)> = hits
                     .into_iter()
-                    .filter(|&(id, _)| self.node_visible(NodeId(id)))
-                    .collect(),
-            },
+                    .filter(|&(id, _)| self.may_read_node_property(NodeId(id), &property))
+                    .collect();
+                VectorQueryResult::Hits {
+                    label_or_type,
+                    property,
+                    dimensions,
+                    similarity,
+                    hits,
+                }
+            }
             other => other,
         }
     }
@@ -896,9 +966,11 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         if self.oracle.is_unrestricted() {
             return result;
         }
-        // The relationship analogue: drop hits on an RBAC-invisible relationship (traverse denied, or
-        // an endpoint not visible); the procedure body re-checks each survivor's current type +
-        // embedding through this decorator, so the filters compose.
+        // The relationship analogue of the `rmp` #826 node gate above: gate each hit on read access to
+        // the covered embedding property on its type (a `DENY READ` / un-granted read hides it), the
+        // relationship twin of `rel_property` masking. Defense in depth over the procedure's #780
+        // re-score, which re-reads the embedding through this same masking `rel_property`. Filter into a
+        // local BEFORE moving `property` into the returned struct.
         match result {
             VectorQueryResult::Hits {
                 label_or_type,
@@ -906,16 +978,19 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
                 dimensions,
                 similarity,
                 hits,
-            } => VectorQueryResult::Hits {
-                label_or_type,
-                property,
-                dimensions,
-                similarity,
-                hits: hits
+            } => {
+                let hits: Vec<(u64, f32)> = hits
                     .into_iter()
-                    .filter(|&(id, _)| self.rel_visible(RelId(id)))
-                    .collect(),
-            },
+                    .filter(|&(id, _)| self.may_read_rel_property(RelId(id), &property))
+                    .collect();
+                VectorQueryResult::Hits {
+                    label_or_type,
+                    property,
+                    dimensions,
+                    similarity,
+                    hits,
+                }
+            }
             other => other,
         }
     }
@@ -1569,6 +1644,64 @@ mod tests {
             Some(crate::snapshot::GraphSnapshot::from_label_column(
                 label, property, members, rows,
             ))
+        }
+        // Full-text seams (`rmp` task #826). The default `MemGraph` returns `None`, so the decorator's
+        // covered-property gate would be untestable. Here every node/relationship is a "match" (the RBAC
+        // gate, not the search, is under test), and the covered property SET is encoded in the index
+        // `name` as a comma-separated list, so a test picks it per call.
+        fn fulltext_query(&self, _name: &str, _search: &str) -> Option<Vec<NodeId>> {
+            Some(self.0.scan_nodes())
+        }
+        fn fulltext_covered_properties(&self, name: &str) -> Option<Vec<String>> {
+            Some(name.split(',').map(str::to_owned).collect())
+        }
+        fn fulltext_query_rel(&self, _name: &str, _search: &str) -> Option<Vec<RelId>> {
+            let mut rels: Vec<RelId> = Vec::new();
+            for n in self.0.scan_nodes() {
+                for inc in self.0.expand(n, ExpandDirection::Outgoing, &[]) {
+                    if !rels.contains(&inc.rel) {
+                        rels.push(inc.rel);
+                    }
+                }
+            }
+            Some(rels)
+        }
+        fn fulltext_rel_covered_properties(&self, name: &str) -> Option<Vec<String>> {
+            Some(name.split(',').map(str::to_owned).collect())
+        }
+        // Vector k-NN seams (`rmp` task #826). Every entity is a "hit"; the covered embedding property
+        // name is the index `name` (so a test picks which property the RBAC gate checks). `label_or_type`
+        // is unused by the decorator's covered-property gate.
+        fn vector_query_nodes(&self, name: &str, _query: &[f32], _k: usize) -> VectorQueryResult {
+            VectorQueryResult::Hits {
+                label_or_type: String::new(),
+                property: name.to_owned(),
+                dimensions: 3,
+                similarity: graphus_index::Similarity::Cosine,
+                hits: self
+                    .0
+                    .scan_nodes()
+                    .into_iter()
+                    .map(|n| (n.0, 1.0))
+                    .collect(),
+            }
+        }
+        fn vector_query_rels(&self, name: &str, _query: &[f32], _k: usize) -> VectorQueryResult {
+            let mut hits: Vec<(u64, f32)> = Vec::new();
+            for n in self.0.scan_nodes() {
+                for inc in self.0.expand(n, ExpandDirection::Outgoing, &[]) {
+                    if !hits.iter().any(|&(id, _)| id == inc.rel.0) {
+                        hits.push((inc.rel.0, 1.0));
+                    }
+                }
+            }
+            VectorQueryResult::Hits {
+                label_or_type: String::new(),
+                property: name.to_owned(),
+                dimensions: 3,
+                similarity: graphus_index::Similarity::Cosine,
+                hits,
+            }
         }
         // Everything else delegates to the inner MemGraph.
         fn scan_nodes(&self) -> Vec<NodeId> {
@@ -2252,6 +2385,173 @@ mod tests {
             authz.node_property(n, "contents"),
             None,
             "the denied property reads as null, so IS NULL keeps the node (masking parity)",
+        );
+    }
+
+    // ---- `rmp` #826: named-index PROCEDURE surface must honour `DENY READ` on covered properties -----
+    //
+    // The leak these guard: a full-text match returns a node/rel BECAUSE one of the index's covered TEXT
+    // properties matched the search; the procedure re-checks only visibility, never re-reading a covered
+    // property, so a restricted principal DENIED read on a covered property learned WHICH nodes/rels
+    // match (while `RETURN n.<covered>` shows null). The fix gates each result on read access to EVERY
+    // covered property (a match could be on any of them). The SnapshotStub encodes the covered set in
+    // the index name. (VECTOR does NOT leak — its #780 re-score reads the covered embedding through the
+    // masking `node_property`/`rel_property` and drops a denied candidate — so it is not gated here.)
+
+    #[test]
+    fn restricted_fulltext_query_honours_deny_read_on_a_covered_property_826() {
+        let (g, n) = multilabel();
+        let mut stub = SnapshotStub(g);
+        let authz = AuthorizedGraph::new(&mut stub, deny_contents_oracle());
+
+        // Covered = {contents} (DENIED): the node must NOT come back, though its text matched.
+        assert_eq!(
+            authz.fulltext_query("contents", "secret"),
+            Some(vec![]),
+            "a full-text match on a DENY-READ covered property must not leak the node",
+        );
+        // Covered = {title, contents}: a DENY READ on ANY covered property hides the node (the match
+        // could have been on `contents`).
+        assert_eq!(
+            authz.fulltext_query("title,contents", "secret"),
+            Some(vec![]),
+            "a DENY READ on ANY covered property hides the full-text result",
+        );
+        // Covered = {title} (READABLE): the node is still returned — the fix narrows only the leak.
+        assert_eq!(
+            authz.fulltext_query("title", "Q3"),
+            Some(vec![n]),
+            "an all-readable covered set still returns the match",
+        );
+    }
+
+    #[test]
+    fn unrestricted_fulltext_query_keeps_all_826() {
+        let (g, n) = multilabel();
+        let mut stub = SnapshotStub(g);
+        let authz = AuthorizedGraph::new(&mut stub, StubOracle::unrestricted());
+        assert_eq!(
+            authz.fulltext_query("contents", "secret"),
+            Some(vec![n]),
+            "an unrestricted principal keeps the full-text result over any covered property",
+        );
+    }
+
+    #[test]
+    fn restricted_fulltext_query_rel_honours_deny_read_on_a_covered_property_826() {
+        // seed(): Ada(:Person)-[:WORKS_AT {role}]->Acme(:Company). A relationship is visible only when
+        // its type is traversable AND both endpoints are visible; a rel property is readable iff granted
+        // (relationships have no separate DENY predicate).
+        let base = || {
+            StubOracle::default()
+                .traverse_label("Person")
+                .traverse_label("Company")
+                .traverse_rel_type("WORKS_AT")
+        };
+        let (g, _ada, _acme, r) = seed();
+
+        // No read grant on `role` (covered) → the relationship full-text match must be hidden.
+        let mut stub_denied = SnapshotStub(g.clone());
+        let authz_denied = AuthorizedGraph::new(&mut stub_denied, base());
+        assert_eq!(
+            authz_denied.fulltext_query_rel("role", "CEO"),
+            Some(vec![]),
+            "a rel full-text match on an unreadable covered property must not leak the relationship",
+        );
+
+        // With read on `role` granted → the relationship comes back.
+        let mut stub_ok = SnapshotStub(g.clone());
+        let authz_ok =
+            AuthorizedGraph::new(&mut stub_ok, base().read_rel_property("WORKS_AT", "role"));
+        assert_eq!(
+            authz_ok.fulltext_query_rel("role", "CEO"),
+            Some(vec![r]),
+            "a readable covered property still returns the relationship match",
+        );
+
+        // Unrestricted keeps it regardless.
+        let mut stub_u = SnapshotStub(g);
+        let authz_u = AuthorizedGraph::new(&mut stub_u, StubOracle::unrestricted());
+        assert_eq!(authz_u.fulltext_query_rel("role", "CEO"), Some(vec![r]));
+    }
+
+    /// The surviving hit ids of a [`VectorQueryResult`], or a panic if it is not `Hits`.
+    fn vhits(r: VectorQueryResult) -> Vec<u64> {
+        match r {
+            VectorQueryResult::Hits { hits, .. } => hits.into_iter().map(|(id, _)| id).collect(),
+            _ => panic!("expected VectorQueryResult::Hits"),
+        }
+    }
+
+    #[test]
+    fn restricted_vector_query_nodes_honours_deny_read_on_the_embedding_property_826() {
+        // A k-NN hit is returned because the node's covered embedding is near the query, so a `DENY
+        // READ` on that embedding property must hide the hit (defense in depth over the procedure's #780
+        // re-score, which independently masks). The stub encodes the covered property in the index name.
+        let (g, n) = multilabel();
+        let mut stub = SnapshotStub(g);
+        let authz = AuthorizedGraph::new(&mut stub, deny_contents_oracle());
+
+        // Covered embedding = `contents` (DENIED) → the hit is dropped.
+        assert_eq!(
+            vhits(authz.vector_query_nodes("contents", &[0.0, 0.0, 0.0], 1)),
+            Vec::<u64>::new(),
+            "a vector hit whose covered embedding property is DENY READ must not leak",
+        );
+        // Covered embedding = `title` (READABLE) → the hit survives.
+        assert_eq!(
+            vhits(authz.vector_query_nodes("title", &[0.0, 0.0, 0.0], 1)),
+            vec![n.0],
+            "a readable covered embedding still returns the hit",
+        );
+    }
+
+    #[test]
+    fn unrestricted_vector_query_nodes_keeps_all_826() {
+        let (g, n) = multilabel();
+        let mut stub = SnapshotStub(g);
+        let authz = AuthorizedGraph::new(&mut stub, StubOracle::unrestricted());
+        assert_eq!(
+            vhits(authz.vector_query_nodes("contents", &[0.0, 0.0, 0.0], 1)),
+            vec![n.0],
+            "an unrestricted principal keeps the vector hit over any covered property",
+        );
+    }
+
+    #[test]
+    fn restricted_vector_query_rels_honours_deny_read_on_the_embedding_property_826() {
+        let base = || {
+            StubOracle::default()
+                .traverse_label("Person")
+                .traverse_label("Company")
+                .traverse_rel_type("WORKS_AT")
+        };
+        let (g, _ada, _acme, r) = seed();
+
+        // No read grant on the covered embedding `vec` → the relationship hit is hidden.
+        let mut stub_denied = SnapshotStub(g.clone());
+        let authz_denied = AuthorizedGraph::new(&mut stub_denied, base());
+        assert_eq!(
+            vhits(authz_denied.vector_query_rels("vec", &[0.0, 0.0, 0.0], 1)),
+            Vec::<u64>::new(),
+            "a rel vector hit whose covered embedding is unreadable must not leak",
+        );
+
+        // With read on `vec` granted → the relationship hit survives.
+        let mut stub_ok = SnapshotStub(g.clone());
+        let authz_ok =
+            AuthorizedGraph::new(&mut stub_ok, base().read_rel_property("WORKS_AT", "vec"));
+        assert_eq!(
+            vhits(authz_ok.vector_query_rels("vec", &[0.0, 0.0, 0.0], 1)),
+            vec![r.0],
+        );
+
+        // Unrestricted keeps it regardless.
+        let mut stub_u = SnapshotStub(g);
+        let authz_u = AuthorizedGraph::new(&mut stub_u, StubOracle::unrestricted());
+        assert_eq!(
+            vhits(authz_u.vector_query_rels("vec", &[0.0, 0.0, 0.0], 1)),
+            vec![r.0],
         );
     }
 

@@ -4887,6 +4887,37 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         Some(out)
     }
 
+    /// The covered property names of the node full-text index `name` (`rmp` task #826), for the
+    /// `AuthorizedGraph` decorator's property-read gate. `None` when no such index is declared, matching
+    /// [`fulltext_query`](GraphAccess::fulltext_query)'s own "no such index" signal. Resolves the
+    /// covered prop-key tokens to names via the store dictionary (the index + store borrows are taken in
+    /// separate, non-overlapping scopes, per this file's borrow discipline).
+    fn fulltext_covered_properties(&self, name: &str) -> Option<Vec<String>> {
+        let index = self.index.as_ref()?;
+        let (_labels, prop_keys, _analyzer) = index.borrow().fulltext_target(name)?;
+        let store = self.store.borrow();
+        Some(
+            prop_keys
+                .iter()
+                .filter_map(|pk| store.token_name(Namespace::PropKey, *pk).map(str::to_owned))
+                .collect(),
+        )
+    }
+
+    /// The covered property names of the relationship full-text index `name` (`rmp` task #826) — the
+    /// relationship analogue of [`fulltext_covered_properties`](Self::fulltext_covered_properties).
+    fn fulltext_rel_covered_properties(&self, name: &str) -> Option<Vec<String>> {
+        let index = self.index.as_ref()?;
+        let (_types, prop_keys, _analyzer) = index.borrow().fulltext_rel_target(name)?;
+        let store = self.store.borrow();
+        Some(
+            prop_keys
+                .iter()
+                .filter_map(|pk| store.token_name(Namespace::PropKey, *pk).map(str::to_owned))
+                .collect(),
+        )
+    }
+
     /// The **node** vector (HNSW) index k-NN seam behind `db.index.vector.queryNodes` (`rmp` task
     /// #671). Resolves the index by name against the durable catalog, runs the ANN query over the
     /// derived [`IndexSet`], and returns candidate `(id, score)` hits the procedure re-checks against

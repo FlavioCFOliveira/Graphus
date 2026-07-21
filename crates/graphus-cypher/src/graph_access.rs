@@ -560,6 +560,27 @@ pub trait GraphAccess {
         None
     }
 
+    /// The property names the **node** full-text index named `name` covers, or `None` if no such index
+    /// is declared in this seam (`rmp` task #826).
+    ///
+    /// A full-text match returns a node **because one of the covered TEXT properties matched** the
+    /// search — but the procedure never re-reads that property, so a candidate-visibility filter alone
+    /// leaks *which* nodes match while `RETURN n.<covered>` shows `null` under a `DENY READ`. The
+    /// [`AuthorizedGraph`](crate::authorized_graph::AuthorizedGraph) decorator consumes this to gate a
+    /// restricted principal's result on read access to **every** covered property (a match could be on
+    /// any of them). Names, not tokens, because the RBAC oracle is name-scoped. The default returns
+    /// `None` (only the coordinated seams — inline and off-thread — hold the descriptor).
+    fn fulltext_covered_properties(&self, _name: &str) -> Option<Vec<String>> {
+        None
+    }
+
+    /// The property names the **relationship** full-text index named `name` covers, or `None` if no
+    /// such index is declared (`rmp` task #826) — the relationship analogue of
+    /// [`fulltext_covered_properties`](Self::fulltext_covered_properties).
+    fn fulltext_rel_covered_properties(&self, _name: &str) -> Option<Vec<String>> {
+        None
+    }
+
     /// The **best-effort relevance score** of `node` against `search` for the full-text index named
     /// `name` (`rmp` task #72): the count of distinct analyzed query terms the node contains. Returns
     /// `None` when no such index is declared, or when the node is not in the index. Documented as a

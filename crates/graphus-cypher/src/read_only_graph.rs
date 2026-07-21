@@ -715,6 +715,43 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         ))
     }
 
+    /// The covered property names of the node full-text index `name` (`rmp` task #826), resolved from
+    /// the captured catalogue + token snapshot — the off-thread twin of `RecordStoreGraph`'s impl, so
+    /// the `AuthorizedGraph` decorator's property-read gate composes identically whether a restricted
+    /// principal's full-text query runs inline or on the reader pool. `None` for an unknown index,
+    /// exactly as `fulltext_query` signals it.
+    fn fulltext_covered_properties(&self, name: &str) -> Option<Vec<String>> {
+        let target = self.fulltext.target(name)?;
+        Some(
+            target
+                .prop_keys
+                .iter()
+                .filter_map(|&pk| {
+                    self.tokens
+                        .token_name(Namespace::PropKey, pk)
+                        .map(str::to_owned)
+                })
+                .collect(),
+        )
+    }
+
+    /// The relationship analogue of
+    /// [`fulltext_covered_properties`](Self::fulltext_covered_properties) (`rmp` task #826).
+    fn fulltext_rel_covered_properties(&self, name: &str) -> Option<Vec<String>> {
+        let target = self.fulltext.rel_target(name)?;
+        Some(
+            target
+                .prop_keys
+                .iter()
+                .filter_map(|&pk| {
+                    self.tokens
+                        .token_name(Namespace::PropKey, pk)
+                        .map(str::to_owned)
+                })
+                .collect(),
+        )
+    }
+
     // ---- morsel intra-query parallelism (off-thread, `rmp` task #575-g.1) ---------------------------
 
     fn frontier_morsel_source(&self) -> Option<crate::morsel::MorselFrontierSource> {

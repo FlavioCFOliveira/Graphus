@@ -1018,3 +1018,139 @@ async fn deny_read_property_is_enforced_on_index_seek_and_precise_scan_822() {
     bob.goodbye().await;
     server.shutdown().await.expect("clean shutdown");
 }
+
+/// `rmp` #826 (regression, whole-query end-to-end): the named-index PROCEDURE surface must honour a
+/// `DENY READ` on the property an index covers. A full-text match returns a node BECAUSE a covered TEXT
+/// property matched the search, so a restricted principal denied read on that covered property must NOT
+/// learn which nodes match (while `RETURN n.<covered>` shows null) — the procedure never re-reads the
+/// covered property, so the `AuthorizedGraph` decorator must filter on read access to every covered
+/// property. Proven over `db.index.fulltext.queryNodes`.
+///
+/// It ALSO pins the VECTOR determination as a positive control: `db.index.vector.queryNodes` does NOT
+/// leak (unchanged by this fix), because its mandatory `rmp` #780 re-score reads the covered embedding
+/// through the masking `node_property` and drops a candidate whose embedding is unreadable.
+#[tokio::test]
+async fn deny_read_property_is_enforced_on_named_index_procedures_826() {
+    let temp = TempStore::new("enforce826");
+    let server = boot(base_config(&temp)).await;
+    let uds = server.uds_path.clone().expect("UDS enabled");
+
+    // ---- Admin seeds Docs with a text `body` + an `embedding`, and a full-text + vector index. ----
+    let mut alice = BoltClient::connect(&uds).await;
+    alice.handshake_and_logon("alice", "admin-pw8").await;
+    alice
+        .run_ok("CREATE (:Doc {name: 'Alpha', body: 'graph databases are fast', embedding: [1.0, 0.0, 0.0]})")
+        .await;
+    alice
+        .run_ok("CREATE (:Doc {name: 'Beta', body: 'entirely unrelated prose', embedding: [0.0, 1.0, 0.0]})")
+        .await;
+    alice
+        .run_ok("CREATE FULLTEXT INDEX doc_ft FOR (d:Doc) ON EACH [d.body]")
+        .await;
+    alice
+        .run_ok(
+            "CREATE VECTOR INDEX doc_vec FOR (d:Doc) ON (d.embedding) \
+             OPTIONS { indexConfig: { `vector.dimensions`: 3, `vector.similarity_function`: 'cosine' } }",
+        )
+        .await;
+    // Admin sanity (also drives the incremental full-text build to Online): both indexes find Alpha.
+    let a_ft = alice
+        .run_ok("CALL db.index.fulltext.queryNodes('doc_ft', 'graph') YIELD node RETURN node.name")
+        .await;
+    assert_eq!(
+        opt_strings(&a_ft, 0),
+        vec![Some("Alpha".to_owned())],
+        "admin full-text finds the matching doc"
+    );
+    let a_vec = alice
+        .run_ok("CALL db.index.vector.queryNodes('doc_vec', 1, [1.0, 0.0, 0.0]) YIELD node RETURN node.name")
+        .await;
+    assert_eq!(
+        opt_strings(&a_vec, 0),
+        vec![Some("Alpha".to_owned())],
+        "admin vector k-NN finds the nearest doc"
+    );
+    alice.goodbye().await;
+
+    // ---- Narrow bob: TRAVERSE :Doc + READ :Doc.name, but DENY READ the covered `body` + `embedding`.
+    let mut admin = BoltClient::connect(&uds).await;
+    admin.handshake_and_logon("alice", "admin-pw8").await;
+    admin.run_ok("REVOKE ROLE readwrite FROM bob").await;
+    admin.run_ok("CREATE ROLE doc_reader").await;
+    admin
+        .run_ok("GRANT TRAVERSE ON LABEL graphus.Doc TO doc_reader")
+        .await;
+    admin
+        .run_ok("GRANT READ ON PROPERTY graphus.Doc.name TO doc_reader")
+        .await;
+    // Broad read grants that WOULD reach the covered properties...
+    admin
+        .run_ok("GRANT READ ON PROPERTY graphus.Doc.body TO doc_reader")
+        .await;
+    admin
+        .run_ok("GRANT READ ON PROPERTY graphus.Doc.embedding TO doc_reader")
+        .await;
+    // ...carved by explicit DENYs (DENY-across precedence; the leak vector for the covered properties).
+    admin
+        .run_ok("DENY READ ON PROPERTY graphus.Doc.body TO doc_reader")
+        .await;
+    admin
+        .run_ok("DENY READ ON PROPERTY graphus.Doc.embedding TO doc_reader")
+        .await;
+    admin.run_ok("GRANT ROLE doc_reader TO bob").await;
+    admin.goodbye().await;
+
+    let mut bob = BoltClient::connect(&uds).await;
+    bob.handshake_and_logon("bob", "user2-pw8").await;
+
+    // 1) FULLTEXT (the fix): the covered `body` is DENY READ, so the match must NOT come back — bob must
+    //    not learn Alpha's body contains 'graph' while `RETURN d.body` would show null.
+    let ft = bob
+        .run_ok("CALL db.index.fulltext.queryNodes('doc_ft', 'graph') YIELD node RETURN node.name")
+        .await;
+    assert!(
+        ft.is_empty(),
+        "a full-text match on a DENY-READ covered property must not leak the node: {ft:?}"
+    );
+
+    // 2) VECTOR (positive control, unchanged): the covered `embedding` is DENY READ; the #780 re-score
+    //    reads it through the masking node_property → null → the candidate is dropped. So vector already
+    //    does not leak.
+    let vec_hit = bob
+        .run_ok("CALL db.index.vector.queryNodes('doc_vec', 1, [1.0, 0.0, 0.0]) YIELD node RETURN node.name")
+        .await;
+    assert!(
+        vec_hit.is_empty(),
+        "vector k-NN must not leak a node whose covered embedding is DENY READ: {vec_hit:?}"
+    );
+
+    // 3) The node stays visible to a bare scan (DENY READ hides the property value, not the node).
+    let all = bob.run_ok("MATCH (d:Doc) RETURN d.name").await;
+    let mut names = opt_strings(&all, 0);
+    names.sort();
+    assert_eq!(
+        names,
+        vec![Some("Alpha".to_owned()), Some("Beta".to_owned())],
+        "DENY READ leaves the Doc nodes visible to a bare scan: {names:?}"
+    );
+    bob.reset().await;
+
+    // ---- CONTROL: once `body` is readable again, bob's full-text query returns the match. ----
+    let mut admin2 = BoltClient::connect(&uds).await;
+    admin2.handshake_and_logon("alice", "admin-pw8").await;
+    admin2
+        .run_ok("REVOKE DENY READ ON PROPERTY graphus.Doc.body FROM doc_reader")
+        .await;
+    admin2.goodbye().await;
+
+    let ft2 = bob
+        .run_ok("CALL db.index.fulltext.queryNodes('doc_ft', 'graph') YIELD node RETURN node.name")
+        .await;
+    assert_eq!(
+        opt_strings(&ft2, 0),
+        vec![Some("Alpha".to_owned())],
+        "with the covered property readable again, the full-text match returns on bob's next statement"
+    );
+    bob.goodbye().await;
+    server.shutdown().await.expect("clean shutdown");
+}
