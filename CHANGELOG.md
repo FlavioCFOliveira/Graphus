@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10] - 2026-07-21
+
 This cycle brings Graphus to **full Neo4j-5.x index and constraint parity**, closes a large tranche
 of the Cypher surface beyond the openCypher TCK core, hardens the whole examples suite into a
 falsifiable gate, and — most importantly for operators — fixes a family of **ACID correctness**
