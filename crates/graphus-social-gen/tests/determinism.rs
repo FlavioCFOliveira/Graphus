@@ -4,7 +4,8 @@
 //! produce a **byte-identical** Cypher graph on every run, host, and platform, so the example's
 //! CPU / RAM / storage performance claims are pinned to a fixed input. These tests assert the
 //! byte-identity, the configuration-model degree band, count consistency, and the node-property
-//! contracts (bounded UTF-8 names, 24-lowercase-hex ids). Kept on the `fast` profile so it is quick.
+//! contracts (bounded UTF-8 names, unique non-negative `u64` ids). Kept on the `fast` profile so it is
+//! quick.
 
 use std::collections::HashMap;
 
@@ -130,7 +131,7 @@ fn realised_friend_degree_is_within_band_for_every_user() {
     let text = g.emit_all();
 
     // Map every user id back to its index so we can attribute degrees.
-    let mut id_to_user: HashMap<String, u64> = HashMap::new();
+    let mut id_to_user: HashMap<u64, u64> = HashMap::new();
     for u in 0..cfg.users {
         id_to_user.insert(Generator::user_id(u), u);
     }
@@ -140,8 +141,8 @@ fn realised_friend_degree_is_within_band_for_every_user() {
         if !line.contains("[:FRIEND") {
             continue;
         }
-        // Each FRIEND line is: MATCH (a:USER {id: 'X'}), (b:USER {id: 'Y'}) CREATE (a)-[:FRIEND ...
-        let ids = extract_quoted(line);
+        // Each FRIEND line is: MATCH (a:USER {id: X}), (b:USER {id: Y}) CREATE (a)-[:FRIEND ...
+        let ids = extract_ids(line);
         assert_eq!(
             ids.len(),
             2,
@@ -210,39 +211,49 @@ fn every_user_name_is_bounded_valid_utf8() {
 }
 
 #[test]
-fn every_id_is_24_lowercase_hex_chars() {
+fn every_id_is_a_unique_nonnegative_integer() {
+    use std::collections::HashSet;
     let cfg = GenConfig::fast();
-    let is_lc_hex = |id: &str| {
-        id.len() == 24
-            && id
-                .chars()
-                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
-    };
+
+    // Every USER / ARTICLE id is a distinct, non-negative `i64` (bit 63 clear), and the two label id
+    // spaces are disjoint — the invariants the `REQUIRE n.id IS UNIQUE` constraints enforce at load.
+    let mut users = HashSet::new();
     for u in 0..cfg.users {
         let id = Generator::user_id(u);
-        assert!(is_lc_hex(&id), "USER {u} id not 24 lowercase hex: {id}");
+        assert!(
+            id < (1u64 << 63),
+            "USER {u} id must fit a non-negative i64: {id}"
+        );
+        assert!(users.insert(id), "USER {u} id {id} is a duplicate");
     }
+    let mut articles = HashSet::new();
     for a in 0..cfg.articles {
         let id = Generator::article_id(a);
-        assert!(is_lc_hex(&id), "ARTICLE {a} id not 24 lowercase hex: {id}");
+        assert!(
+            id < (1u64 << 63),
+            "ARTICLE {a} id must fit a non-negative i64: {id}"
+        );
+        assert!(articles.insert(id), "ARTICLE {a} id {id} is a duplicate");
     }
+    assert!(
+        users.is_disjoint(&articles),
+        "no USER id may equal an ARTICLE id"
+    );
 }
 
-/// Extracts the contents of every `'…'` single-quoted literal on a line, in order.
-fn extract_quoted(line: &str) -> Vec<String> {
+/// Extracts every `id: <integer>` value on a line, in order (the two `USER` endpoint ids of a FRIEND
+/// statement, now unquoted `u64` integers). Matches the `id: ` key exactly, so the `since:` property is
+/// not mistaken for an id.
+fn extract_ids(line: &str) -> Vec<u64> {
     let mut out = Vec::new();
-    let mut chars = line.char_indices().peekable();
-    while let Some((_, c)) = chars.next() {
-        if c == '\'' {
-            let mut s = String::new();
-            for (_, c2) in chars.by_ref() {
-                if c2 == '\'' {
-                    break;
-                }
-                s.push(c2);
-            }
-            out.push(s);
+    let mut rest = line;
+    while let Some(pos) = rest.find("id: ") {
+        let after = &rest[pos + "id: ".len()..];
+        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+        if let Ok(v) = digits.parse::<u64>() {
+            out.push(v);
         }
+        rest = &after[digits.len()..];
     }
     out
 }

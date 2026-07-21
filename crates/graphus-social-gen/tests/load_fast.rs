@@ -136,14 +136,18 @@ fn fast_profile_declares_search_schema_and_searches_headlines() {
     // The two always-on token LOOKUP indexes are surfaced.
     online("node_label_lookup_index", "LOOKUP", "NODE");
     online("rel_type_lookup_index", "LOOKUP", "RELATIONSHIP");
-    // The id read-path RANGE indexes are retained.
-    online("user_id_range", "RANGE", "NODE");
-    online("article_id_range", "RANGE", "NODE");
     // The new index kinds: TEXT + FULLTEXT (node), relationship RANGE, composite (node) RANGE.
     online("article_name_text", "TEXT", "NODE");
     online("article_headline_fulltext", "FULLTEXT", "NODE");
     online("like_date_range", "RANGE", "RELATIONSHIP");
     online("article_catalog_composite", "RANGE", "NODE");
+    // The id read-path is now backed by UNIQUENESS constraints (below), not standalone RANGE indexes:
+    // a constraint's backing index is NOT listed by SHOW INDEXES, so neither id index appears here.
+    assert!(
+        out.index("user_id_range").is_none() && out.index("article_id_range").is_none(),
+        "the id RANGE indexes were replaced by uniqueness constraints (backings are not listed): {:?}",
+        out.indexes
+    );
 
     // The existence constraint on ARTICLE.name is declared.
     let cons = out
@@ -151,6 +155,26 @@ fn fast_profile_declares_search_schema_and_searches_headlines() {
         .expect("existence constraint present");
     assert_eq!(cons.kind, "NODE_PROPERTY_EXISTENCE");
     assert_eq!(cons.properties, vec!["name".to_owned()]);
+
+    // The id UNIQUENESS constraints are declared (enforce the unique key AND back the `(:USER {id})` /
+    // `(:ARTICLE {id})` point-seeks).
+    for (name, label) in [("user_id_unique", "USER"), ("article_id_unique", "ARTICLE")] {
+        let c = out.constraint(name).unwrap_or_else(|| {
+            panic!(
+                "uniqueness constraint {name} present: {:?}",
+                out.constraints
+            )
+        });
+        assert_eq!(
+            c.kind, "NODE_PROPERTY_UNIQUENESS",
+            "{label}.id constraint kind"
+        );
+        assert_eq!(
+            c.properties,
+            vec!["id".to_owned()],
+            "{label}.id constraint property"
+        );
+    }
 
     // --- The headline search: TEXT CONTAINS and FULLTEXT queryNodes return the SAME, generator-
     //     derived article set (the term is a single-token subject word). ---------------------------

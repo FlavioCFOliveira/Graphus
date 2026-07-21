@@ -21,9 +21,10 @@
 //!
 //! # The graph CSV shape (`social_gen --format csv`)
 //!
-//! `neo4j-admin import`-flavoured: node files are `:ID,:LABEL,id:string,name:string,registered:long`
-//! (the 24-hex id appears **twice** — the reserved `:ID` join key AND a stored `id` property the
-//! traversals anchor on); relationship files are `:START_ID,:END_ID,:TYPE,<prop>:long`. The generator
+//! `neo4j-admin import`-flavoured: node files are `:ID,:LABEL,id:long,name:string,registered:long`
+//! (the `u64` id appears **twice** — the reserved `:ID` join key, a decimal string, AND a stored
+//! `id:long` property the traversals anchor on as an integer); relationship files are
+//! `:START_ID,:END_ID,:TYPE,<prop>:long`. The generator
 //! never emits a comma / quote / newline inside a field, so a plain `split(',')` is exact for the Bolt
 //! path's row parse.
 //!
@@ -415,14 +416,19 @@ fn run_rest(
 /// building index would report scan latencies (and, before #733 was fixed, a silently empty FULLTEXT
 /// result) as if they were index-backed evidence.
 fn declare_schema_rest(rest: &Rest<'_>, db: &str) -> Result<bool, String> {
-    // Anchor indexes (UNNAMED — an older server rejects NAMED node indexes): the id seeks the whole
-    // battery starts from. These SHOULD succeed even on an older server.
-    for (label, prop) in [("USER", "id"), ("ARTICLE", "id")] {
+    // Anchor id UNIQUENESS constraints: the globally-unique key each traversal point-seeks on. The
+    // backing index makes `(:USER {id})` / `(:ARTICLE {id})` a SEEK; the constraint additionally enforces
+    // the unique-key invariant. Version-tolerant: an older attach target that lacks node-uniqueness
+    // rejects this — noted, not fatal (the seek then falls back to a scan, still correct).
+    for (label, var) in [("USER", "u"), ("ARTICLE", "a")] {
         best_effort_rest(
             rest,
             db,
-            &format!("CREATE INDEX FOR (n:{label}) ON (n.{prop})"),
-            &format!("anchor index {label}.{prop}"),
+            &format!(
+                "CREATE CONSTRAINT {}_id_unique FOR ({var}:{label}) REQUIRE {var}.id IS UNIQUE",
+                label.to_lowercase()
+            ),
+            &format!("uniqueness constraint {label}.id"),
         );
     }
     // TEXT index on ARTICLE.name (the CONTAINS search is served by a scan without it — optimisation).
@@ -504,7 +510,7 @@ fn smoke_battery_rest(
             );
             continue;
         }
-        let params = rest_params(fam.params, &u0, &u1, &term, since);
+        let params = rest_params(fam.params, u0, u1, &term, since);
         let json = rest
             .statement(
                 db,
@@ -548,9 +554,9 @@ fn smoke_battery_rest(
     Ok(())
 }
 
-/// Builds the REST (JSON) parameters for a battery family. `term` is lower-cased for the FULLTEXT
-/// analyzer token (matching the in-process loader).
-fn rest_params(kind: battery::Params, u0: &str, u1: &str, term: &str, since: i64) -> Option<Json> {
+/// Builds the REST (JSON) parameters for a battery family. `u0`/`u1` are `u64` id anchors (serialized as
+/// JSON integers); `term` is lower-cased for the FULLTEXT analyzer token (matching the in-process loader).
+fn rest_params(kind: battery::Params, u0: u64, u1: u64, term: &str, since: i64) -> Option<Json> {
     match kind {
         battery::Params::None => None,
         battery::Params::User => Some(json!({ "u0": u0 })),
@@ -584,10 +590,11 @@ fn run_bolt(
         args.db
     );
 
-    // 1. Best-effort anchor indexes so `(:USER {id})` / `(:ARTICLE {id})` seeks are index-backed
-    //    BEFORE the edge MATCH-by-id load. On an empty label the index is online immediately.
-    load.best_effort_index("USER", "id");
-    load.best_effort_index("ARTICLE", "id");
+    // 1. Best-effort id UNIQUENESS constraints so `(:USER {id})` / `(:ARTICLE {id})` seeks are
+    //    index-backed (and the unique key is enforced) BEFORE the edge MATCH-by-id load. On an empty
+    //    label the backing index is online immediately.
+    load.best_effort_unique("USER");
+    load.best_effort_unique("ARTICLE");
     load.best_effort_like_date_range();
     let fulltext = load.best_effort_fulltext();
 
@@ -669,7 +676,7 @@ fn run_bolt(
         if fam.name == "fulltext" && !fulltext {
             continue;
         }
-        let params = bolt_params(fam.params, &u0, &u1, &term, since);
+        let params = bolt_params(fam.params, u0, u1, &term, since);
         load.write(
             &format!("battery family '{}'", fam.name),
             fam.cypher,
@@ -685,18 +692,19 @@ fn run_bolt(
 /// Builds the Bolt (`Value`) parameters for a battery family.
 fn bolt_params(
     kind: battery::Params,
-    u0: &str,
-    u1: &str,
+    u0: u64,
+    u1: u64,
     term: &str,
     since: i64,
 ) -> Vec<(String, Value)> {
+    // The id anchors are `u64` values in `[0, 2^63)` (see `Generator::entity_id`), so `as i64` is exact.
     match kind {
         battery::Params::None => vec![],
-        battery::Params::User => vec![("u0".into(), Value::String(u0.into()))],
+        battery::Params::User => vec![("u0".into(), Value::Integer(u0 as i64))],
         battery::Params::UserPair => {
             vec![
-                ("u0".into(), Value::String(u0.into())),
-                ("u1".into(), Value::String(u1.into())),
+                ("u0".into(), Value::Integer(u0 as i64)),
+                ("u1".into(), Value::Integer(u1 as i64)),
             ]
         }
         battery::Params::Term => vec![("term".into(), Value::String(term.into()))],
@@ -705,18 +713,19 @@ fn bolt_params(
     }
 }
 
-/// A parsed node row: `(id, name, registered)`.
-type NodeRow = (String, String, i64);
-/// A parsed edge row: `(start_id, end_id, prop_value)`.
-type EdgeRow = (String, String, i64);
+/// A parsed node row: `(id, name, registered)` — the id is a `u64` (carried as `i64` on the wire).
+type NodeRow = (i64, String, i64);
+/// A parsed edge row: `(start_id, end_id, prop_value)` — both endpoint ids are `u64` (carried as `i64`).
+type EdgeRow = (i64, i64, i64);
 
-/// Builds `UNWIND` `Value::Map` rows for a node chunk (`{id, name, registered}`).
+/// Builds `UNWIND` `Value::Map` rows for a node chunk (`{id, name, registered}`). `id` is an integer so
+/// `CREATE (:USER {id: row.id})` stores it as the queryable `u64` value.
 fn node_rows(chunk: &[NodeRow]) -> Vec<Value> {
     chunk
         .iter()
         .map(|(id, name, reg)| {
             Value::Map(vec![
-                ("id".into(), Value::String(id.clone())),
+                ("id".into(), Value::Integer(*id)),
                 ("name".into(), Value::String(name.clone())),
                 ("registered".into(), Value::Integer(*reg)),
             ])
@@ -724,14 +733,15 @@ fn node_rows(chunk: &[NodeRow]) -> Vec<Value> {
         .collect()
 }
 
-/// Builds `UNWIND` `Value::Map` rows for an edge chunk (`{a, b, prop}`).
+/// Builds `UNWIND` `Value::Map` rows for an edge chunk (`{a, b, prop}`). The endpoint ids are integers so
+/// `MATCH (:USER {id: row.a})` point-seeks the id-uniqueness index.
 fn edge_rows(chunk: &[EdgeRow], _prop_name: &str) -> Vec<Value> {
     chunk
         .iter()
         .map(|(a, b, prop)| {
             Value::Map(vec![
-                ("a".into(), Value::String(a.clone())),
-                ("b".into(), Value::String(b.clone())),
+                ("a".into(), Value::Integer(*a)),
+                ("b".into(), Value::Integer(*b)),
                 ("prop".into(), Value::Integer(*prop)),
             ])
         })
@@ -769,12 +779,18 @@ impl BoltLoad {
             .map_err(|e| format!("{what} failed: {e}"))
     }
 
-    fn best_effort_index(&mut self, label: &str, prop: &str) {
-        let cypher = format!("CREATE INDEX FOR (n:{label}) ON (n.{prop})");
+    /// Best-effort id UNIQUENESS constraint on `label`: enforces the globally-unique id AND, via its
+    /// backing index, makes `(:label {id})` a point-SEEK. Version-tolerant — an older server that lacks
+    /// node-uniqueness rejects it (noted, not fatal; the seek then falls back to a scan).
+    fn best_effort_unique(&mut self, label: &str) {
+        let cypher = format!(
+            "CREATE CONSTRAINT {}_id_unique FOR (n:{label}) REQUIRE n.id IS UNIQUE",
+            label.to_lowercase()
+        );
         match self.client.run(&cypher, vec![], &self.db) {
-            Ok(_) => eprintln!("social_wire_load: created anchor index {label}.{prop}"),
+            Ok(_) => eprintln!("social_wire_load: created id uniqueness constraint on {label}"),
             Err(e) => eprintln!(
-                "social_wire_load: note: anchor index {label}.{prop} not created ({e}); seeks may scan"
+                "social_wire_load: note: id uniqueness constraint on {label} not created ({e}); seeks may scan"
             ),
         }
     }
@@ -870,13 +886,13 @@ fn read_data_rows(dir: &Path, name: &str) -> Result<Vec<Vec<String>>, String> {
         .collect())
 }
 
-/// `users.csv` / `articles.csv` → `(id, name, registered)` (node columns 2 [stored id], 3, 4).
+/// `users.csv` / `articles.csv` → `(id, name, registered)` (node columns 2 [stored `id:long`], 3, 4).
 fn parse_nodes(dir: &Path, name: &str) -> Result<Vec<NodeRow>, String> {
     read_data_rows(dir, name)?
         .into_iter()
         .map(|c| {
             Ok((
-                row_str(&c, 2, name)?,
+                row_int(&c, 2, name)?,
                 row_str(&c, 3, name)?,
                 row_int(&c, 4, name)?,
             ))
@@ -884,14 +900,15 @@ fn parse_nodes(dir: &Path, name: &str) -> Result<Vec<NodeRow>, String> {
         .collect()
 }
 
-/// `friends.csv` / `likes.csv` → `(start_id, end_id, prop)` (rel columns 0, 1, 3).
+/// `friends.csv` / `likes.csv` → `(start_id, end_id, prop)` (rel columns 0, 1, 3). The `:START_ID` /
+/// `:END_ID` join keys are the `u64` ids as decimal strings, parsed back to integers here.
 fn parse_edges(dir: &Path, name: &str) -> Result<Vec<EdgeRow>, String> {
     read_data_rows(dir, name)?
         .into_iter()
         .map(|c| {
             Ok((
-                row_str(&c, 0, name)?,
-                row_str(&c, 1, name)?,
+                row_int(&c, 0, name)?,
+                row_int(&c, 1, name)?,
                 row_int(&c, 3, name)?,
             ))
         })

@@ -5,8 +5,11 @@
 # The model (a multigraph LPG): a social network of (:USER {id, name, registered}) befriended by an
 # UNDIRECTED multigraph (:USER)-[:FRIEND {since}]-(:USER), a corpus of (:ARTICLE {id, name,
 # registered}) carrying realistic Portuguese headlines, and directed (:USER)-[:LIKE {date}]->(:ARTICLE)
-# edges. The FRIEND degree is a configuration model — a power law (Zipf) that produces SUPERNODES by
-# DEFAULT (a real large social graph is scale-free), or the simpler uniform band via
+# edges. Every `id` is a globally-unique u64 (a label-tagged bijective scramble, so USER and ARTICLE id
+# spaces never collide) enforced by a `REQUIRE n.id IS UNIQUE` constraint whose backing index also serves
+# the `MATCH (:USER {id: <int>})` point-seek; every timestamp (registered / since / date) is an i64 Unix
+# second count. The FRIEND degree is a configuration model — a power law (Zipf) that produces SUPERNODES
+# by DEFAULT (a real large social graph is scale-free), or the simpler uniform band via
 # SOCIAL_DEGREE_DIST=uniform.
 #
 # THE HEADLINE (rmp #691): the 8-query read battery (direct friends, friend-of-friend, mutual friends,

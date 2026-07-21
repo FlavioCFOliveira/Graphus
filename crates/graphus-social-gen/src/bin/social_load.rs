@@ -334,6 +334,16 @@ fn main() -> ExitCode {
                 .is_some_and(|c| c.kind == "NODE_PROPERTY_EXISTENCE"),
             "existence constraint on ARTICLE.name is declared (article_name_exists)".to_owned(),
         );
+        // The id UNIQUENESS constraints (the most-appropriate schema for the unique-key `id` column):
+        // each enforces the globally-unique id AND backs the `(:USER {id})` / `(:ARTICLE {id})`
+        // point-seek. Constraint backings surface under SHOW CONSTRAINTS, not SHOW INDEXES.
+        for (name, label) in [("user_id_unique", "USER"), ("article_id_unique", "ARTICLE")] {
+            check(
+                out.constraint(name)
+                    .is_some_and(|c| c.kind == "NODE_PROPERTY_UNIQUENESS"),
+                format!("uniqueness constraint on {label}.id is declared ({name})"),
+            );
+        }
 
         // The headline search cross-check: the term is a single-token subject word, so TEXT CONTAINS
         // and FULLTEXT queryNodes must BOTH return exactly the generator's ground-truth article set.

@@ -24,10 +24,17 @@ expected result and `run.sh` exits non-zero if any assertion fails.
 
 | Element | Shape | Meaning |
 |---------|-------|---------|
-| `(:USER {id, name, registered})` | `id` = 24 hex chars, `name` ≤ 64 chars (realistic Portuguese full names, with diacritics), `registered` = unix ts | a person |
-| `(:ARTICLE {id, name, registered})` | `id` = 24 hex chars, `name` = a realistic news-style headline, `registered` = unix ts | a published article |
-| `(:USER)-[:FRIEND {since}]-(:USER)` | **undirected multigraph** | a friendship |
-| `(:USER)-[:LIKE {date}]->(:ARTICLE)` | directed | a like |
+| `(:USER {id, name, registered})` | `id` = **globally-unique `u64`**, `name` ≤ 64 chars (realistic Portuguese full names, with diacritics), `registered` = **`i64`** unix ts | a person |
+| `(:ARTICLE {id, name, registered})` | `id` = **globally-unique `u64`**, `name` = a realistic news-style headline, `registered` = **`i64`** unix ts | a published article |
+| `(:USER)-[:FRIEND {since}]-(:USER)` | **undirected multigraph**, `since` = **`i64`** unix ts | a friendship |
+| `(:USER)-[:LIKE {date}]->(:ARTICLE)` | directed, `date` = **`i64`** unix ts | a like |
+
+> The `id` is a label-tagged **bijective scramble** of the entity index — distinct entities always get
+> distinct ids and no `USER` id can equal an `ARTICLE` id, so a `REQUIRE n.id IS UNIQUE` constraint can
+> never spuriously reject the load. Every id stays in `[0, 2^63)`, so it round-trips losslessly as a
+> signed 64-bit integer (`Value::Integer(i64)`, a PackStream `Integer`, and the bulk-import CSV `:long`
+> column). A `MATCH (:USER {id: <int>})` point-seek is served by the uniqueness constraint's backing
+> index (PROFILE-verified: `NodeIndexSeek`, dbHits 1), not a label scan.
 
 ### Realistic, deterministic data
 
@@ -123,7 +130,7 @@ latency from queueing, or `1,2,4,8,16,32` to chase the knee), `SOCIAL_WRITERS` /
 |---|------------|-----------------|
 | 1 | **Deterministic large-graph generation** | `social_gen` emits the graph twice and the bytes are diffed identical. |
 | 2 | **Network bulk import** | The graph is uploaded to a **running server** over REST (`bulk-import`, Mode A) and every structural count is round-tripped back over Bolt. |
-| 3 | **A production search schema** | RANGE (`USER.id`, `ARTICLE.id`), **TEXT** + **FULLTEXT** over `ARTICLE.name`, a **relationship RANGE** on `LIKE.date`, a **composite** node index, the always-on **LOOKUP** token indexes, and an **existence constraint** on `ARTICLE.name` — declared over the wire and asserted `ONLINE`. |
+| 3 | **A production search schema** | **UNIQUENESS constraints** on `USER.id` / `ARTICLE.id` (which enforce the unique key AND back the id point-seek), **TEXT** + **FULLTEXT** over `ARTICLE.name`, a **relationship RANGE** on `LIKE.date`, a **composite** node index, the always-on **LOOKUP** token indexes, and an **existence constraint** on `ARTICLE.name` — declared over the wire and asserted `ONLINE`. |
 | 4 | **A concurrent read battery** | Eight families — direct friends, **friend-of-friend**, **mutual friends**, **top-liked** (aggregation + `ORDER BY` + `LIMIT`), degree, **TEXT `CONTAINS`**, **`LIKE.date` recent-window range** (a `RelIndexRangeSeek` run in an explicit read transaction — PROFILE-asserted at runtime, see [I8](#the-invariants-it-asserts)), and **FULLTEXT** `queryNodes` — driven by C simultaneous Bolt clients. |
 | 5 | **Read scaling across cores** | The **server process** is sampled per-thread from `/proc` at each rung, so the report shows core utilisation and busy-thread count **vs C**. |
 | 6 | **A production-shaped read/write MIX, ON BY DEFAULT** | Every rung runs **twice** — writers off (control), then writers on (treatment) — so the **cost of the mix** is measured and nine concurrency **invariants** (I1–I9) are asserted. See [The read/write mix](#the-readwrite-mix). `SOCIAL_WRITERS=0` restores the read-only ladder. |

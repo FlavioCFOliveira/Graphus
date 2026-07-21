@@ -461,7 +461,7 @@ fn preflight_active_families(
     let u1 = Generator::user_id(1 % args.users.max(1));
     let mut active = Vec::new();
     for (i, fam) in battery::ALL.iter().enumerate() {
-        let params = op_params(fam.params, &u0, &u1, term, since);
+        let params = op_params(fam.params, u0, u1, term, since);
         // `like_recent` (Params::Recent) is warmed in an EXPLICIT read transaction — the same dispatch
         // path the measured ladder uses for it, so the warm-up exercises the same dispatch. Every other
         // family warms auto-commit.
@@ -534,21 +534,22 @@ fn build_anchor_ranks(
     Some((perm, zipf))
 }
 
-/// Builds the per-op `Value` params for a family (anchors vary per op; `term`/`since` are fixed).
+/// Builds the per-op `Value` params for a family (anchors vary per op; `term`/`since` are fixed). The
+/// `u0`/`u1` id anchors are `u64` values in `[0, 2^63)` (see `Generator::entity_id`), so `as i64` is exact.
 fn op_params(
     kind: battery::Params,
-    u0: &str,
-    u1: &str,
+    u0: u64,
+    u1: u64,
     term: &str,
     since: i64,
 ) -> Vec<(String, Value)> {
     match kind {
         battery::Params::None => vec![],
-        battery::Params::User => vec![("u0".into(), Value::String(u0.into()))],
+        battery::Params::User => vec![("u0".into(), Value::Integer(u0 as i64))],
         battery::Params::UserPair => {
             vec![
-                ("u0".into(), Value::String(u0.into())),
-                ("u1".into(), Value::String(u1.into())),
+                ("u0".into(), Value::Integer(u0 as i64)),
+                ("u1".into(), Value::Integer(u1 as i64)),
             ]
         }
         battery::Params::Term => vec![("term".into(), Value::String(term.into()))],
@@ -729,11 +730,12 @@ impl BenchCtx {
     ) -> (WriteKind, &'static str, Vec<(String, Value)>) {
         match mix::pick_write_kind(rng.next_u64(), self.hot_write_fraction) {
             WriteKind::Hot => {
+                // The id is a `u64` in `[0, 2^63)` (see `Generator::entity_id`), so `as i64` is exact.
                 let aid = Generator::article_id(rng.next_u64() % self.hot_keys.min(self.articles));
                 (
                     WriteKind::Hot,
                     battery::WRITE_ARTICLE_HOT,
-                    vec![("id".to_string(), Value::String(aid))],
+                    vec![("id".to_string(), Value::Integer(aid as i64))],
                 )
             }
             WriteKind::Common => {
@@ -742,7 +744,7 @@ impl BenchCtx {
                     WriteKind::Common,
                     battery::WRITE_USER_TOUCH,
                     vec![
-                        ("id".to_string(), Value::String(uid)),
+                        ("id".to_string(), Value::Integer(uid as i64)),
                         ("ts".to_string(), Value::Integer(ts)),
                     ],
                 )
@@ -1057,7 +1059,7 @@ fn run_worker(
         }
         let u0 = Generator::user_id(u0_idx);
         let u1 = Generator::user_id(u1_idx);
-        let params = op_params(fam.params, &u0, &u1, &ctx.term, ctx.since);
+        let params = op_params(fam.params, u0, u1, &ctx.term, ctx.since);
         // Sample this op for I7 verification (before the round-trip, so the decision is deterministic).
         let sample = verify_every != 0 && read_ix % verify_every == 0;
         read_ix += 1;
@@ -1357,7 +1359,7 @@ fn run_slow_reader_probe(ctx: &Arc<BenchCtx>, probe_secs: f64) -> ProbeResult {
                 loop {
                     let u0 = Generator::user_id(rng.next_u64() % ctx.users);
                     let u1 = Generator::user_id(rng.next_u64() % ctx.users);
-                    let params = op_params(family.params, &u0, &u1, &ctx.term, ctx.since);
+                    let params = op_params(family.params, u0, u1, &ctx.term, ctx.since);
                     let op = Instant::now();
                     match client.run(family.cypher, params, &ctx.db) {
                         Ok(_) => {

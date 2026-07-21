@@ -10,9 +10,10 @@
 //!
 //! - the new index & constraint kinds are declared and `Online` (`SHOW INDEXES` / `SHOW CONSTRAINTS`):
 //!   a **TEXT** index and a **FULLTEXT** index over `ARTICLE.name`, a relationship **RANGE** index on
-//!   `LIKE.date`, a **composite** node `RANGE` index on `ARTICLE(registered, id)`, the two node id
-//!   `RANGE` indexes, the two always-on **LOOKUP** token indexes (`node_label_lookup_index` /
-//!   `rel_type_lookup_index`), and a node **existence** constraint (`ARTICLE.name IS NOT NULL`);
+//!   `LIKE.date`, a **composite** node `RANGE` index on `ARTICLE(registered, id)`, the two always-on
+//!   **LOOKUP** token indexes (`node_label_lookup_index` / `rel_type_lookup_index`), the two node id
+//!   **UNIQUENESS** constraints (`USER.id` / `ARTICLE.id` — which back the id point-seek), and a node
+//!   **existence** constraint (`ARTICLE.name IS NOT NULL`);
 //! - the **empirical planner utilisation** of the relationship `RANGE` index (asserted honestly on the
 //!   real public planner): Graphus serves an *equality* predicate on a relationship property from it (a
 //!   `RelIndexSeek`) **and** a `>=` range predicate (a `RelIndexRangeSeek`, `rmp` #680) — so the
@@ -74,9 +75,11 @@ fn cfg() -> GenConfig {
 /// Bolt/REST admin surface parses. `IF NOT EXISTS` is omitted so each is a plain create over the empty
 /// store.
 const SCHEMA_DDL: &[&str] = &[
-    // The id read-path RANGE indexes (the friendship / like point-lookup anchors).
-    "CREATE INDEX user_id_range FOR (u:USER) ON (u.id)",
-    "CREATE INDEX article_id_range FOR (a:ARTICLE) ON (a.id)",
+    // The id UNIQUENESS constraints (the most-appropriate schema for the unique-key `id` column): each
+    // enforces the globally-unique identity AND, via its backing index, serves the friendship / like
+    // point-lookup anchor seek.
+    "CREATE CONSTRAINT user_id_unique FOR (u:USER) REQUIRE u.id IS UNIQUE",
+    "CREATE CONSTRAINT article_id_unique FOR (a:ARTICLE) REQUIRE a.id IS UNIQUE",
     // The search schema over ARTICLE headlines + the LIKE timeline.
     "CREATE TEXT INDEX article_name_text FOR (a:ARTICLE) ON (a.name)",
     "CREATE FULLTEXT INDEX article_headline_fulltext FOR (a:ARTICLE) ON EACH [a.name]",
@@ -244,21 +247,21 @@ fn expect_rejected(eng: &mut Eng, stmt: &str) -> String {
     }
 }
 
-/// Collects the single string column of a read query into a sorted, de-duplicated set (e.g. the
-/// `ARTICLE` ids the TEXT / FULLTEXT search returns).
-fn collect_strings(eng: &mut Eng, query: &str) -> Vec<String> {
+/// Collects the single integer column of a read query into a sorted, de-duplicated set (e.g. the
+/// `ARTICLE` `id`s the TEXT / FULLTEXT search returns — now `u64` values on the wire as `i64`).
+fn collect_ints(eng: &mut Eng, query: &str) -> Vec<i64> {
     let ticket = eng.begin(AccessMode::Read).expect("begin read txn");
     let mut reply = eng
         .run(ticket, query, Vec::new(), false, None)
         .expect("query runs");
     let mut out = Vec::new();
     while let Ok(Some(row)) = reply.rows.next() {
-        if let Some(MaterializedValue::Value(Value::String(s))) = row.first() {
-            out.push(s.clone());
+        if let Some(MaterializedValue::Value(Value::Integer(v))) = row.first() {
+            out.push(*v);
         }
     }
     eng.commit(ticket).expect("commit read txn");
-    out.sort();
+    out.sort_unstable();
     out.dedup();
     out
 }
@@ -297,20 +300,21 @@ const ASCII_SUBJECTS: &[&str] = &[
 
 /// Picks the most frequent [`ASCII_SUBJECTS`] headline term for [`cfg`] and returns `(term, sorted set
 /// of ARTICLE ids whose headline contains it)` — the ground truth read straight from the deterministic
-/// generator (the set the engine's TEXT / FULLTEXT searches must both return).
-fn dominant_headline_term() -> (String, Vec<String>) {
+/// generator (the set the engine's TEXT / FULLTEXT searches must both return). The ids are the `u64`
+/// [`Generator::article_id`] values as `i64` (all in `[0, 2^63)`), the form they come back on the wire.
+fn dominant_headline_term() -> (String, Vec<i64>) {
     let c = cfg();
-    let mut best: (String, Vec<String>) = (ASCII_SUBJECTS[0].to_owned(), Vec::new());
+    let mut best: (String, Vec<i64>) = (ASCII_SUBJECTS[0].to_owned(), Vec::new());
     for &word in ASCII_SUBJECTS {
-        let ids: Vec<String> = (0..c.articles)
+        let ids: Vec<i64> = (0..c.articles)
             .filter(|&i| Generator::article_name(c.seed, i).contains(word))
-            .map(Generator::article_id)
+            .map(|i| Generator::article_id(i) as i64)
             .collect();
         if ids.len() > best.1.len() {
             best = (word.to_owned(), ids);
         }
     }
-    best.1.sort();
+    best.1.sort_unstable();
     best
 }
 
@@ -334,8 +338,9 @@ fn sample_like_date() -> i64 {
 fn schema_first_load_declares_new_index_and_constraint_kinds_impl() {
     let mut eng = load_schema_first();
 
-    // ---- SHOW INDEXES: the TEXT + FULLTEXT + relationship-RANGE + composite + id RANGE indexes and
-    //      the two always-on LOOKUP token indexes, all Online. ----
+    // ---- SHOW INDEXES: the TEXT + FULLTEXT + relationship-RANGE + composite indexes and the two
+    //      always-on LOOKUP token indexes, all Online (the id anchors are uniqueness constraints, whose
+    //      backing indexes are not listed here — see SHOW CONSTRAINTS below). ----
     let idx = show_indexes(&mut eng);
     let (type_c, entity_c, labels_c, props_c, state_c) = (
         col(&idx, "type"),
@@ -431,21 +436,43 @@ fn schema_first_load_declares_new_index_and_constraint_kinds_impl() {
     );
     assert_eq!(composite[state_c], Value::String("ONLINE".to_owned()));
 
-    // The two node id RANGE indexes are present and Online.
-    for name in ["user_id_range", "article_id_range"] {
-        let r = row_by_name(&idx, name);
-        assert_eq!(r[type_c], Value::String("RANGE".to_owned()), "{name}");
-        assert_eq!(r[entity_c], Value::String("NODE".to_owned()), "{name}");
-        assert_eq!(r[state_c], Value::String("ONLINE".to_owned()), "{name}");
+    // The two node id read-path anchors are now UNIQUENESS constraints, not standalone RANGE indexes.
+    // A constraint's backing index is NOT listed by `SHOW INDEXES` (it surfaces under `SHOW
+    // CONSTRAINTS`), so neither `user_id_range` nor `article_id_range` appears here.
+    for absent in ["user_id_range", "article_id_range"] {
+        assert!(
+            !idx.rows
+                .iter()
+                .any(|r| matches!(&r[col(&idx, "name")], Value::String(n) if n == absent)),
+            "{absent} must NOT be listed — the id anchors are uniqueness-constraint backings now"
+        );
     }
 
-    // ---- SHOW CONSTRAINTS: the node existence constraint on ARTICLE.name. ----
+    // ---- SHOW CONSTRAINTS: the two id UNIQUENESS constraints + the node existence constraint on
+    //      ARTICLE.name. ----
     let cons = show_constraints(&mut eng);
     let (ctype_c, centity_c, cprops_c) = (
         col(&cons, "type"),
         col(&cons, "entityType"),
         col(&cons, "properties"),
     );
+
+    // USER.id / ARTICLE.id uniqueness — the unique-key enforcement that also backs the id point-seek.
+    for (name, label) in [("user_id_unique", "USER"), ("article_id_unique", "ARTICLE")] {
+        let uniq = row_by_name(&cons, name);
+        assert_eq!(
+            uniq[ctype_c],
+            Value::String("NODE_PROPERTY_UNIQUENESS".to_owned()),
+            "{label}.id is a node uniqueness constraint"
+        );
+        assert_eq!(uniq[centity_c], Value::String("NODE".to_owned()), "{name}");
+        assert_eq!(
+            uniq[cprops_c],
+            Value::List(vec![Value::String("id".to_owned())]),
+            "{name} covers exactly the id property"
+        );
+    }
+
     let exists = row_by_name(&cons, "article_name_exists");
     assert_eq!(
         exists[ctype_c],
@@ -558,7 +585,7 @@ fn text_and_fulltext_return_the_same_headline_article_set_impl() {
     );
 
     // TEXT `CONTAINS` over the TEXT-indexed ARTICLE.name returns exactly the expected articles.
-    let via_text = collect_strings(
+    let via_text = collect_ints(
         &mut eng,
         &format!("MATCH (a:ARTICLE) WHERE a.name CONTAINS '{term}' RETURN a.id AS id"),
     );
@@ -572,7 +599,7 @@ fn text_and_fulltext_return_the_same_headline_article_set_impl() {
     // so the whole-word subject token (lower-cased) matches exactly the articles whose headline uses
     // that subject — identical to the CONTAINS set.
     let term_lc = term.to_lowercase();
-    let via_fulltext = collect_strings(
+    let via_fulltext = collect_ints(
         &mut eng,
         &format!(
             "CALL db.index.fulltext.queryNodes('article_headline_fulltext', '{term_lc}') \
@@ -587,7 +614,7 @@ fn text_and_fulltext_return_the_same_headline_article_set_impl() {
 
     // A stop-word-only / absent term matches nothing (the analyzer drops English stop-words; a term no
     // headline contains simply has no matches).
-    let none = collect_strings(
+    let none = collect_ints(
         &mut eng,
         "CALL db.index.fulltext.queryNodes('article_headline_fulltext', 'zzzznotaword') \
          YIELD node RETURN node.id AS id",
@@ -602,10 +629,12 @@ fn schema_enforces_existence_constraint_with_negative_writes_impl() {
     let mut eng = load_schema_first();
     let article_count = cfg().articles as i64;
 
-    // Node existence: an ARTICLE without a `name` is rejected.
+    // Node existence: an ARTICLE without a `name` is rejected. (The id `1` is a fresh, non-colliding
+    // integer — every seeded ARTICLE id is `>= 2^62` — so uniqueness passes and existence is the
+    // violation under test.)
     let missing = expect_rejected(
         &mut eng,
-        "CREATE (:ARTICLE {id: 'no-name-article', registered: 1712345678})",
+        "CREATE (:ARTICLE {id: 1, registered: 1712345678})",
     );
     assert!(
         missing.contains(CONSTRAINT_VIOLATION_PREFIX),
@@ -615,7 +644,7 @@ fn schema_enforces_existence_constraint_with_negative_writes_impl() {
     // An explicit null `name` is likewise rejected.
     let explicit_null = expect_rejected(
         &mut eng,
-        "CREATE (:ARTICLE {id: 'null-name-article', name: null, registered: 1712345678})",
+        "CREATE (:ARTICLE {id: 2, name: null, registered: 1712345678})",
     );
     assert!(
         explicit_null.contains(CONSTRAINT_VIOLATION_PREFIX),

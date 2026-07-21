@@ -81,11 +81,11 @@ fn csv_format_writes_four_files_with_correct_headers_and_counts() {
 
     assert_eq!(
         read_header(&out.join("users.csv")),
-        ":ID,:LABEL,id:string,name:string,registered:long"
+        ":ID,:LABEL,id:long,name:string,registered:long"
     );
     assert_eq!(
         read_header(&out.join("articles.csv")),
-        ":ID,:LABEL,id:string,name:string,registered:long"
+        ":ID,:LABEL,id:long,name:string,registered:long"
     );
     assert_eq!(
         read_header(&out.join("friends.csv")),

@@ -14,15 +14,22 @@
 //!
 //! | Node label | Key properties | Meaning |
 //! | --- | --- | --- |
-//! | `(:USER {id, name, registered})` | `id` (24 lowercase hex chars, unique) | a member |
-//! | `(:ARTICLE {id, name, registered})` | `id` (24 lowercase hex chars, unique) | a news item |
+//! | `(:USER {id, name, registered})` | `id` (`u64`, globally unique), `registered` (`i64` Unix seconds) | a member |
+//! | `(:ARTICLE {id, name, registered})` | `id` (`u64`, globally unique), `registered` (`i64` Unix seconds) | a news item |
+//!
+//! The `id` is a **`u64`** produced by a label-tagged bijective scramble (see [`Generator::entity_id`]),
+//! so distinct entities always get distinct ids and no `USER` id ever equals an `ARTICLE` id — the
+//! guarantee a `REQUIRE n.id IS UNIQUE` constraint needs. Every id stays in `[0, 2^63)`, so it
+//! round-trips losslessly as a signed 64-bit integer (the engine's `Value::Integer(i64)`, a PackStream
+//! `Integer`, and the bulk-import CSV `:long` column). Every timestamp property is an **`i64`** Unix
+//! second count.
 //!
 //! Two relationship types:
 //!
 //! | Relationship | Direction | Meaning |
 //! | --- | --- | --- |
-//! | `:FRIEND {since}` | `(:USER)-(:USER)` (undirected) | a friendship; **multi-edges allowed** |
-//! | `:LIKE {date}` | `(:USER)->(:ARTICLE)` | the user liked the article |
+//! | `:FRIEND {since}` | `(:USER)-(:USER)` (undirected) | a friendship (`since`: `i64` Unix seconds); **multi-edges allowed** |
+//! | `:LIKE {date}` | `(:USER)->(:ARTICLE)` | the user liked the article (`date`: `i64` Unix seconds) |
 //!
 //! ## The FRIEND multigraph: the configuration model
 //!
@@ -664,34 +671,55 @@ impl Generator {
         &self.cfg
     }
 
-    /// The deterministic 24-lowercase-hex-char id for entity `i` within a label-specific `salt`
-    /// namespace (so `USER 0` and `ARTICLE 0` get distinct ids). Built from two SplitMix64 draws
-    /// keyed by `(salt, i)` and rendered as 24 hex nibbles (96 bits). Collisions across our scales
-    /// are negligible, and the id is purely a function of `(salt, i)`.
+    /// Odd multiplier for the id scramble. Multiplying by an **odd** constant is a bijection on the
+    /// integers modulo any power of two (an odd number is a unit in that ring), so `i ↦ i·ODD` maps
+    /// distinct indices to distinct scrambled values with **zero collisions** — precisely the property a
+    /// `REQUIRE n.id IS UNIQUE` constraint needs. (A collision-prone *hash* could not offer this: two
+    /// indices could map to the same id and the uniqueness constraint would spuriously reject the load.)
+    /// The constant is the SplitMix64 golden-ratio increment, reused here only for its good bit-mix.
+    const ID_SCRAMBLE_ODD: u64 = 0x9E37_79B9_7F4A_7C15;
+
+    /// The bit that tags an id's label namespace so `USER` and `ARTICLE` id spaces never overlap. Bit
+    /// **62** — the top bit of the *non-negative* `i64` range, deliberately NOT bit 63 — so every id
+    /// stays in `[0, 2^63)` and round-trips losslessly as a signed 64-bit integer everywhere it travels:
+    /// the engine's `Value::Integer(i64)`, a PackStream `Integer`, and the bulk-import CSV `:long` typed
+    /// column. A bit-63 tag would push `ARTICLE` ids past `i64::MAX` and break that round-trip.
+    const ID_LABEL_BIT: u32 = 62;
+    /// The label tag reserved for `USER` ids (bit [`ID_LABEL_BIT`](Self::ID_LABEL_BIT) clear).
+    const USER_TAG: u64 = 0;
+    /// The label tag reserved for `ARTICLE` ids (bit [`ID_LABEL_BIT`](Self::ID_LABEL_BIT) set).
+    const ARTICLE_TAG: u64 = 1;
+
+    /// The deterministic, globally-unique **`u64`** id for entity `i` in label namespace `label_tag`
+    /// ([`USER_TAG`](Self::USER_TAG) / [`ARTICLE_TAG`](Self::ARTICLE_TAG)).
+    ///
+    /// The low [`ID_LABEL_BIT`](Self::ID_LABEL_BIT) bits are `i·ODD mod 2^62`, a **bijection** (see
+    /// [`ID_SCRAMBLE_ODD`](Self::ID_SCRAMBLE_ODD)) — so distinct `i` within a label always yield distinct
+    /// ids — and bit [`ID_LABEL_BIT`](Self::ID_LABEL_BIT) carries the label tag, so a `USER` id can never
+    /// equal an `ARTICLE` id. Every id is therefore a non-negative `i64`, and the whole function is pure
+    /// in `(label_tag, i)`, so the generator stays byte-identical per seed.
     #[must_use]
-    pub fn entity_id(salt: u64, i: u64) -> String {
-        // Two independent 48-bit halves → 96 bits → 24 hex chars.
-        let mut r = SplitMix64::new(salt ^ i.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-        let hi = r.next_u64() & 0x0000_FFFF_FFFF_FFFF; // 48 bits
-        let lo = r.next_u64() & 0x0000_FFFF_FFFF_FFFF; // 48 bits
-        format!("{hi:012x}{lo:012x}")
+    pub fn entity_id(label_tag: u64, i: u64) -> u64 {
+        let scramble_mask = (1u64 << Self::ID_LABEL_BIT) - 1; // the low 62 bits
+        let scrambled = i.wrapping_mul(Self::ID_SCRAMBLE_ODD) & scramble_mask;
+        (label_tag << Self::ID_LABEL_BIT) | scrambled
     }
 
-    /// Salt namespace for `USER` ids.
+    /// Salt namespace for `USER` name / timestamp PRNG streams (independent of the id bijection).
     const USER_SALT: u64 = 0x1111_1111_0000_0001;
-    /// Salt namespace for `ARTICLE` ids.
+    /// Salt namespace for `ARTICLE` name / timestamp PRNG streams (independent of the id bijection).
     const ARTICLE_SALT: u64 = 0x2222_2222_0000_0002;
 
-    /// The stable id of `USER` `i`.
+    /// The stable, unique **`u64`** id of `USER` `i`.
     #[must_use]
-    pub fn user_id(i: u64) -> String {
-        Self::entity_id(Self::USER_SALT, i)
+    pub fn user_id(i: u64) -> u64 {
+        Self::entity_id(Self::USER_TAG, i)
     }
 
-    /// The stable id of `ARTICLE` `i`.
+    /// The stable, unique **`u64`** id of `ARTICLE` `i`.
     #[must_use]
-    pub fn article_id(i: u64) -> String {
-        Self::entity_id(Self::ARTICLE_SALT, i)
+    pub fn article_id(i: u64) -> u64 {
+        Self::entity_id(Self::ARTICLE_TAG, i)
     }
 
     /// A deterministic, realistic Portuguese full name for `USER` `i`, valid UTF-8 (diacritics
@@ -738,11 +766,35 @@ impl Generator {
         format!("{subject} {verb} {object} {tail}")
     }
 
-    /// A deterministic registration timestamp (Unix seconds) for entity `i` in `salt`'s namespace,
-    /// spread across the registration span.
-    fn registered_ts(seed: u64, salt: u64, i: u64) -> u64 {
+    /// A deterministic registration timestamp (**`i64`** Unix seconds) for entity `i` in `salt`'s
+    /// namespace, spread across the registration span. The value lies in `[EPOCH_S, EPOCH_S +
+    /// REG_SPAN_S)`, well within the positive `i64` range, so the `as i64` is exact.
+    fn registered_ts(seed: u64, salt: u64, i: u64) -> i64 {
         let mut r = SplitMix64::new(seed ^ salt ^ i.wrapping_mul(0x2545_F491_4F6C_DD1D));
-        EPOCH_S + r.below(REG_SPAN_S)
+        (EPOCH_S + r.below(REG_SPAN_S)) as i64
+    }
+
+    /// A deterministic `FRIEND` `since` timestamp (**`i64`** Unix seconds) for the ordered endpoint pair
+    /// `(a, b)`. Pure in `(seed, a, b)`, so it is byte-identical per seed. Shared by every `FRIEND`
+    /// emitter (the `emit_all` artifact, the streaming Cypher loader, and the CSV streamer) so all three
+    /// produce the identical timestamp for a given edge.
+    fn friend_since_ts(seed: u64, a: u64, b: u64) -> i64 {
+        let mut r = SplitMix64::new(
+            seed ^ 0xF111_0000_0000_0004
+                ^ a.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                ^ b.rotate_left(17),
+        );
+        (EPOCH_S + r.below(REG_SPAN_S)) as i64
+    }
+
+    /// A deterministic `LIKE` `date` timestamp (**`i64`** Unix seconds) for the `(user, article)` pair.
+    /// Pure in `(seed, u, art)`, and shared by every `LIKE` emitter (see
+    /// [`friend_since_ts`](Self::friend_since_ts)).
+    fn like_date_ts(seed: u64, u: u64, art: u64) -> i64 {
+        let mut r = SplitMix64::new(
+            seed ^ 0x11CE_0000_0000_0005 ^ u.wrapping_mul(0xA0761D6478BD642F) ^ art.rotate_left(23),
+        );
+        (EPOCH_S + r.below(REG_SPAN_S)) as i64
     }
 
     /// Builds the realised `FRIEND` multigraph via the configuration model, returning the list of
@@ -1012,7 +1064,7 @@ impl Generator {
             let reg = Self::registered_ts(self.cfg.seed, Self::USER_SALT, i);
             let _ = write!(
                 out,
-                "CREATE (:USER {{id: '{id}', name: '{name}', registered: {reg}}})"
+                "CREATE (:USER {{id: {id}, name: '{name}', registered: {reg}}})"
             );
             batch += 1;
             if batch == BATCH || i + 1 == self.cfg.users {
@@ -1032,7 +1084,7 @@ impl Generator {
             let reg = Self::registered_ts(self.cfg.seed, Self::ARTICLE_SALT, i);
             let _ = write!(
                 out,
-                "CREATE (:ARTICLE {{id: '{id}', name: '{name}', registered: {reg}}})"
+                "CREATE (:ARTICLE {{id: {id}, name: '{name}', registered: {reg}}})"
             );
             batch += 1;
             if batch == BATCH || i + 1 == self.cfg.articles {
@@ -1048,23 +1100,17 @@ impl Generator {
         for &(a, b) in edges {
             let ida = Self::user_id(a);
             let idb = Self::user_id(b);
-            // Deterministic `since` timestamp keyed on the (ordered) endpoint pair + position.
-            let mut r = SplitMix64::new(
-                self.cfg.seed
-                    ^ 0xF111_0000_0000_0004
-                    ^ a.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                    ^ b.rotate_left(17),
-            );
-            let since = EPOCH_S + r.below(REG_SPAN_S);
+            // Deterministic `since` timestamp keyed on the (ordered) endpoint pair.
+            let since = Self::friend_since_ts(self.cfg.seed, a, b);
             // ONE statement per edge (NOT many per statement): packing N `MATCH … CREATE` clauses
             // into one statement would either rebind the shared `a`/`b` variables (one edge per
             // batch) or form an N-way cartesian product. Stored DIRECTED `(a)->(b)` once per
             // friendship (Cypher `CREATE` requires a direction — the TCK's
             // `RequiresDirectedRelationship` rule); read back undirected (`-[:FRIEND]-`) so the
-            // symmetric semantics hold.
+            // symmetric semantics hold. The `id` anchors are unquoted `u64` integers.
             let _ = writeln!(
                 out,
-                "MATCH (a:USER {{id: '{ida}'}}), (b:USER {{id: '{idb}'}}) CREATE (a)-[:FRIEND {{since: {since}}}]->(b);"
+                "MATCH (a:USER {{id: {ida}}}), (b:USER {{id: {idb}}}) CREATE (a)-[:FRIEND {{since: {since}}}]->(b);"
             );
         }
     }
@@ -1073,17 +1119,11 @@ impl Generator {
         for &(u, art) in edges {
             let idu = Self::user_id(u);
             let ida = Self::article_id(art);
-            let mut r = SplitMix64::new(
-                self.cfg.seed
-                    ^ 0x11CE_0000_0000_0005
-                    ^ u.wrapping_mul(0xA0761D6478BD642F)
-                    ^ art.rotate_left(23),
-            );
-            let date = EPOCH_S + r.below(REG_SPAN_S);
+            let date = Self::like_date_ts(self.cfg.seed, u, art);
             // ONE statement per edge (see `emit_friend_edges`).
             let _ = writeln!(
                 out,
-                "MATCH (u:USER {{id: '{idu}'}}), (a:ARTICLE {{id: '{ida}'}}) CREATE (u)-[:LIKE {{date: {date}}}]->(a);"
+                "MATCH (u:USER {{id: {idu}}}), (a:ARTICLE {{id: {ida}}}) CREATE (u)-[:LIKE {{date: {date}}}]->(a);"
             );
         }
     }
@@ -1120,7 +1160,7 @@ impl Generator {
             }
             let _ = write!(
                 buf,
-                "CREATE (:USER {{id: '{id}', name: '{name}', registered: {reg}}})"
+                "CREATE (:USER {{id: {id}, name: '{name}', registered: {reg}}})"
             );
             batch += 1;
             if batch == BATCH || i + 1 == self.cfg.users {
@@ -1144,7 +1184,7 @@ impl Generator {
             }
             let _ = write!(
                 buf,
-                "CREATE (:ARTICLE {{id: '{id}', name: '{name}', registered: {reg}}})"
+                "CREATE (:ARTICLE {{id: {id}, name: '{name}', registered: {reg}}})"
             );
             batch += 1;
             if batch == BATCH || i + 1 == self.cfg.articles {
@@ -1171,19 +1211,13 @@ impl Generator {
         for &(a, b) in &edges {
             let ida = Self::user_id(a);
             let idb = Self::user_id(b);
-            let mut r = SplitMix64::new(
-                self.cfg.seed
-                    ^ 0xF111_0000_0000_0004
-                    ^ a.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                    ^ b.rotate_left(17),
-            );
-            let since = EPOCH_S + r.below(REG_SPAN_S);
+            let since = Self::friend_since_ts(self.cfg.seed, a, b);
             buf.clear();
             // Stored DIRECTED `(a)->(b)` once per friendship (Cypher `CREATE` requires a direction);
             // read back undirected (`-[:FRIEND]-`) to preserve the friendship's symmetric semantics.
             let _ = write!(
                 buf,
-                "MATCH (a:USER {{id: '{ida}'}}), (b:USER {{id: '{idb}'}}) CREATE (a)-[:FRIEND {{since: {since}}}]->(b)"
+                "MATCH (a:USER {{id: {ida}}}), (b:USER {{id: {idb}}}) CREATE (a)-[:FRIEND {{since: {since}}}]->(b)"
             );
             sink(buf.clone());
         }
@@ -1201,17 +1235,11 @@ impl Generator {
         for &(u, art) in &edges {
             let idu = Self::user_id(u);
             let ida = Self::article_id(art);
-            let mut r = SplitMix64::new(
-                self.cfg.seed
-                    ^ 0x11CE_0000_0000_0005
-                    ^ u.wrapping_mul(0xA0761D6478BD642F)
-                    ^ art.rotate_left(23),
-            );
-            let date = EPOCH_S + r.below(REG_SPAN_S);
+            let date = Self::like_date_ts(self.cfg.seed, u, art);
             buf.clear();
             let _ = write!(
                 buf,
-                "MATCH (u:USER {{id: '{idu}'}}), (a:ARTICLE {{id: '{ida}'}}) CREATE (u)-[:LIKE {{date: {date}}}]->(a)"
+                "MATCH (u:USER {{id: {idu}}}), (a:ARTICLE {{id: {ida}}}) CREATE (u)-[:LIKE {{date: {date}}}]->(a)"
             );
             sink(buf.clone());
         }
@@ -1237,16 +1265,16 @@ impl Generator {
     // IMPORTANT: the importer's `:ID` column is the external **join key** and is NOT stored as a node
     // property (it is consumed to resolve `:START_ID`/`:END_ID`). The read battery, however, anchors
     // its traversals on `(:USER {id: …})`, which needs a real `id` *property*. So each node row carries
-    // the 24-hex id **twice**: once in the reserved `:ID` join-key column and once in a stored
-    // `id:string` property column — the standard neo4j-admin-import recipe for "join key that is also a
-    // queryable property".
+    // the `u64` id **twice**: once in the reserved `:ID` join-key column (a decimal string — the join
+    // key is always textual, matched by `:START_ID`/`:END_ID`) and once in a stored, typed `id:long`
+    // property column (the queryable `u64` value) — the standard neo4j-admin-import recipe for "join key
+    // that is also a queryable property".
 
-    /// The header row of the USER node CSV: `:ID` join key + `:LABEL` + a stored `id` property +
+    /// The header row of the USER node CSV: `:ID` join key + `:LABEL` + a stored `id:long` property +
     /// `name` + `registered`.
-    pub const USER_CSV_HEADER: &'static str = ":ID,:LABEL,id:string,name:string,registered:long\n";
+    pub const USER_CSV_HEADER: &'static str = ":ID,:LABEL,id:long,name:string,registered:long\n";
     /// The header row of the ARTICLE node CSV (same shape as users).
-    pub const ARTICLE_CSV_HEADER: &'static str =
-        ":ID,:LABEL,id:string,name:string,registered:long\n";
+    pub const ARTICLE_CSV_HEADER: &'static str = ":ID,:LABEL,id:long,name:string,registered:long\n";
     /// The header row of the FRIEND relationship CSV.
     pub const FRIEND_CSV_HEADER: &'static str = ":START_ID,:END_ID,:TYPE,since:long\n";
     /// The header row of the LIKE relationship CSV.
@@ -1259,6 +1287,7 @@ impl Generator {
         sink(Self::USER_CSV_HEADER.as_bytes().to_vec());
         self.stream_node_csv_rows(
             self.cfg.users,
+            Self::USER_TAG,
             Self::USER_SALT,
             "USER",
             &Self::user_name,
@@ -1271,6 +1300,7 @@ impl Generator {
         sink(Self::ARTICLE_CSV_HEADER.as_bytes().to_vec());
         self.stream_node_csv_rows(
             self.cfg.articles,
+            Self::ARTICLE_TAG,
             Self::ARTICLE_SALT,
             "ARTICLE",
             &Self::article_name,
@@ -1278,11 +1308,13 @@ impl Generator {
         );
     }
 
-    /// Shared node-CSV row streamer: emits `count` rows of `<id>,<label>,<name>,<registered>` in
-    /// [`BATCH`]-row chunks, deterministic in index order. `name_fn` produces the per-index name.
+    /// Shared node-CSV row streamer: emits `count` rows of `<id>,<label>,<id>,<name>,<registered>` in
+    /// [`BATCH`]-row chunks, deterministic in index order. `label_tag` keys the id bijection and `salt`
+    /// keys the name/timestamp PRNG streams; `name_fn` produces the per-index name.
     fn stream_node_csv_rows<F: FnMut(Vec<u8>)>(
         &self,
         count: u64,
+        label_tag: u64,
         salt: u64,
         label: &str,
         name_fn: &dyn Fn(u64, u64) -> String,
@@ -1291,10 +1323,10 @@ impl Generator {
         let mut buf = String::new();
         let mut in_chunk = 0usize;
         for i in 0..count {
-            let id = Self::entity_id(salt, i);
+            let id = Self::entity_id(label_tag, i);
             let name = escape_csv(&name_fn(self.cfg.seed, i));
             let reg = Self::registered_ts(self.cfg.seed, salt, i);
-            // `id` appears twice: the `:ID` join key (col 0) and the stored `id` property (col 2).
+            // `id` appears twice: the `:ID` join key (col 0) and the stored `id:long` property (col 2).
             let _ = writeln!(buf, "{id},{label},{id},{name},{reg}");
             in_chunk += 1;
             if in_chunk == BATCH || i + 1 == count {
@@ -1319,13 +1351,7 @@ impl Generator {
         for (k, &(a, b)) in edges.iter().enumerate() {
             let ida = Self::user_id(a);
             let idb = Self::user_id(b);
-            let mut r = SplitMix64::new(
-                self.cfg.seed
-                    ^ 0xF111_0000_0000_0004
-                    ^ a.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                    ^ b.rotate_left(17),
-            );
-            let since = EPOCH_S + r.below(REG_SPAN_S);
+            let since = Self::friend_since_ts(self.cfg.seed, a, b);
             let _ = writeln!(buf, "{ida},{idb},FRIEND,{since}");
             in_chunk += 1;
             if in_chunk == BATCH || k + 1 == n {
@@ -1349,13 +1375,7 @@ impl Generator {
         for (k, &(u, art)) in edges.iter().enumerate() {
             let idu = Self::user_id(u);
             let ida = Self::article_id(art);
-            let mut r = SplitMix64::new(
-                self.cfg.seed
-                    ^ 0x11CE_0000_0000_0005
-                    ^ u.wrapping_mul(0xA0761D6478BD642F)
-                    ^ art.rotate_left(23),
-            );
-            let date = EPOCH_S + r.below(REG_SPAN_S);
+            let date = Self::like_date_ts(self.cfg.seed, u, art);
             let _ = writeln!(buf, "{idu},{ida},LIKE,{date}");
             in_chunk += 1;
             if in_chunk == BATCH || k + 1 == n {
@@ -1366,10 +1386,10 @@ impl Generator {
         total
     }
 
-    /// A sample `USER` id by index, for the loader's read-query probes. Convenience over
+    /// A sample `USER` `u64` id by index, for the loader's read-query probes. Convenience over
     /// [`user_id`](Self::user_id).
     #[must_use]
-    pub fn sample_user_id(&self, i: u64) -> String {
+    pub fn sample_user_id(&self, i: u64) -> u64 {
         Self::user_id(i % self.cfg.users.max(1))
     }
 
@@ -1738,18 +1758,41 @@ mod tests {
         }
     }
 
+    /// The id is a `u64` from a label-tagged bijection, so across the whole entity range: every id is
+    /// unique within its label, every id is a non-negative `i64` (so it round-trips as a signed 64-bit
+    /// integer), and no `USER` id ever collides with an `ARTICLE` id — the invariants a
+    /// `REQUIRE n.id IS UNIQUE` constraint enforces at load time.
     #[test]
-    fn ids_are_24_lowercase_hex() {
-        for i in 0..50 {
-            for id in [Generator::user_id(i), Generator::article_id(i)] {
-                assert_eq!(id.len(), 24, "id must be 24 chars: {id}");
-                assert!(
-                    id.chars()
-                        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
-                    "id must be lowercase hex: {id}"
-                );
-            }
+    fn ids_are_unique_u64() {
+        use std::collections::HashSet;
+        const N: u64 = 5_000;
+        let users: Vec<u64> = (0..N).map(Generator::user_id).collect();
+        let articles: Vec<u64> = (0..N).map(Generator::article_id).collect();
+
+        // Every id is a non-negative i64 (bit 63 is clear).
+        for &id in users.iter().chain(&articles) {
+            assert!(id < (1u64 << 63), "id must fit a non-negative i64: {id}");
         }
+
+        // Distinct indices within a label ⇒ distinct ids (the bijection).
+        let user_set: HashSet<u64> = users.iter().copied().collect();
+        let article_set: HashSet<u64> = articles.iter().copied().collect();
+        assert_eq!(user_set.len(), N as usize, "USER ids must all be distinct");
+        assert_eq!(
+            article_set.len(),
+            N as usize,
+            "ARTICLE ids must all be distinct"
+        );
+
+        // The two label id spaces are disjoint (the top-of-i64 label tag).
+        assert!(
+            user_set.is_disjoint(&article_set),
+            "no USER id may equal an ARTICLE id"
+        );
+
+        // Determinism: the id is a pure function of (label, index).
+        assert_eq!(Generator::user_id(1234), Generator::user_id(1234));
+        assert_eq!(Generator::article_id(1234), Generator::article_id(1234));
     }
 
     #[test]
@@ -1851,7 +1894,7 @@ mod tests {
         assert_eq!(like_total, s.like_edges, "LIKE stream return");
 
         // The headers are exactly the importer-flavoured schema.
-        assert!(users_csv.starts_with(":ID,:LABEL,id:string,name:string,registered:long\n"));
+        assert!(users_csv.starts_with(":ID,:LABEL,id:long,name:string,registered:long\n"));
         assert!(friend_csv.starts_with(":START_ID,:END_ID,:TYPE,since:long\n"));
         // Every USER data row carries the USER label in the :LABEL column, and the :ID join key (col 0)
         // equals the stored `id` property (col 2) — the join-key-as-property recipe.

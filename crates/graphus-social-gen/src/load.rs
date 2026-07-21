@@ -100,10 +100,12 @@ const ELEMENT_ID_SEED: u128 = 1;
 // `LocalEngine::{index_ddl, constraint_ddl}`, so a drift between the typed seam this loader uses and
 // the string admin grammar would fail that test.
 
-/// Node `RANGE` index on `USER.id` — the friendship-traversal anchor lookup.
-const IDX_USER_ID: &str = "user_id_range";
-/// Node `RANGE` index on `ARTICLE.id` — the like-traversal anchor lookup.
-const IDX_ARTICLE_ID: &str = "article_id_range";
+/// Node **uniqueness** constraint on `USER.id` — enforces the globally-unique member identity AND, via
+/// its backing node-property index, serves the friendship-traversal `(:USER {id})` anchor point-seek.
+const CONS_USER_ID_UNIQUE: &str = "user_id_unique";
+/// Node **uniqueness** constraint on `ARTICLE.id` — enforces the globally-unique article identity AND
+/// backs the like-traversal `(:ARTICLE {id})` anchor point-seek.
+const CONS_ARTICLE_ID_UNIQUE: &str = "article_id_unique";
 /// `TEXT` (trigram) index on `ARTICLE.name` — accelerates `CONTAINS` / `STARTS WITH` / `ENDS WITH`
 /// headline substring search.
 const IDX_ARTICLE_NAME_TEXT: &str = "article_name_text";
@@ -237,7 +239,8 @@ pub struct LoadOutcome {
     /// The uncompressed logical size, in bytes, of the loader-ready CSV the importer consumed (the
     /// honest denominator for the amplification figures).
     pub logical_csv_bytes: u64,
-    /// Wall-clock duration of the two `CREATE INDEX` builds, in milliseconds (`0` when not indexed).
+    /// Wall-clock duration of the whole schema build (id uniqueness constraints + the search indexes),
+    /// in milliseconds (`0` when not indexed).
     pub index_build_millis: u64,
     /// Durable on-disk size of the page device file after the load (bytes).
     pub device_bytes: u64,
@@ -557,14 +560,31 @@ pub fn run_load(cfg: &GenConfig, dir: &Path, opts: LoadOpts) -> LoadOutcome {
     if opts.index_ids {
         let t = Instant::now();
 
-        // (1) The id read-path RANGE indexes — the friendship / like point-lookup anchors, so every
-        //     `MATCH (:USER {id: …})` in the read battery is an index SEEK, not a label scan.
+        // (1) The id UNIQUENESS constraints — the most-appropriate schema for a unique-key column. Each
+        //     enforces the globally-unique `id` invariant (validated against the just-loaded data — the
+        //     bijective `u64` ids never collide, so the constraint is accepted) AND registers a backing
+        //     node-property index over `id`, so every `MATCH (:USER {id: …})` in the read battery is an
+        //     index SEEK, not a label scan — the same point-seek a bare RANGE index gave, plus the
+        //     uniqueness guarantee. (The constraint backing is not listed by `SHOW INDEXES`; it surfaces
+        //     under `SHOW CONSTRAINTS`.)
         coord
-            .begin_online_node_property_index_named(Some(IDX_USER_ID), "USER", "id", true)
-            .expect("create :USER(id) RANGE index");
+            .create_constraint_general(
+                CONS_USER_ID_UNIQUE,
+                "USER",
+                &["id"],
+                ConstraintKind::Unique,
+                None,
+            )
+            .expect("create :USER(id) uniqueness constraint");
         coord
-            .begin_online_node_property_index_named(Some(IDX_ARTICLE_ID), "ARTICLE", "id", true)
-            .expect("create :ARTICLE(id) RANGE index");
+            .create_constraint_general(
+                CONS_ARTICLE_ID_UNIQUE,
+                "ARTICLE",
+                &["id"],
+                ConstraintKind::Unique,
+                None,
+            )
+            .expect("create :ARTICLE(id) uniqueness constraint");
 
         // (2) The production-realistic SEARCH schema over the ARTICLE headlines + the LIKE timeline:
         //     - a TEXT (trigram) index for headline substring search (`CONTAINS` / `STARTS WITH`);
@@ -610,10 +630,10 @@ pub fn run_load(cfg: &GenConfig, dir: &Path, opts: LoadOpts) -> LoadOutcome {
             )
             .expect("create existence constraint on ARTICLE.name");
 
-        // Drive every non-blocking build (the single-property id RANGE indexes and the FULLTEXT index)
-        // to completion so they are Online before the read battery — the same `advance_index_builds`
-        // pump the server's engine loop runs between commands, here run to quiescence in one shot (the
-        // TEXT, composite and relationship RANGE indexes build synchronously and are already Online).
+        // Drive every non-blocking build (the FULLTEXT index) to completion so it is Online before the
+        // read battery — the same `advance_index_builds` pump the server's engine loop runs between
+        // commands, here run to quiescence in one shot. (The id-uniqueness constraint backings, the TEXT,
+        // composite, and relationship RANGE indexes build synchronously and are already Online.)
         while coord.advance_index_builds(usize::MAX) {}
 
         index_build_millis = t.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
@@ -726,7 +746,7 @@ fn run_query_battery(
 
     // 1) Direct friends.
     let q = format!(
-        "MATCH (u:USER {{id: '{u0}'}})-[:FRIEND]-(f:USER) RETURN count(DISTINCT f) AS friends"
+        "MATCH (u:USER {{id: {u0}}})-[:FRIEND]-(f:USER) RETURN count(DISTINCT f) AS friends"
     );
     let (rows, latency_us) = timed_read(coord, catalog, &q);
     out.push(QuerySample {
@@ -741,8 +761,8 @@ fn run_query_battery(
     //    a 2-hop neighbour; we count the distinct set so direct friends reachable on a second path
     //    are not double-counted).
     let q = format!(
-        "MATCH (u:USER {{id: '{u0}'}})-[:FRIEND]-(:USER)-[:FRIEND]-(fof:USER) \
-         WHERE fof.id <> '{u0}' \
+        "MATCH (u:USER {{id: {u0}}})-[:FRIEND]-(:USER)-[:FRIEND]-(fof:USER) \
+         WHERE fof.id <> {u0} \
          RETURN count(DISTINCT fof) AS fof"
     );
     let (rows, latency_us) = timed_read(coord, catalog, &q);
@@ -756,7 +776,7 @@ fn run_query_battery(
 
     // 3) Mutual friends between two sample users.
     let q = format!(
-        "MATCH (a:USER {{id: '{u0}'}})-[:FRIEND]-(m:USER)-[:FRIEND]-(b:USER {{id: '{u1}'}}) \
+        "MATCH (a:USER {{id: {u0}}})-[:FRIEND]-(m:USER)-[:FRIEND]-(b:USER {{id: {u1}}}) \
          RETURN count(DISTINCT m) AS mutual"
     );
     let (rows, latency_us) = timed_read(coord, catalog, &q);
@@ -790,7 +810,7 @@ fn run_query_battery(
     });
 
     // 5) Degree (a sample user's friend count).
-    let q = format!("MATCH (u:USER {{id: '{u0}'}})-[:FRIEND]-(f:USER) RETURN count(f) AS degree");
+    let q = format!("MATCH (u:USER {{id: {u0}}})-[:FRIEND]-(f:USER) RETURN count(f) AS degree");
     let (rows, latency_us) = timed_read(coord, catalog, &q);
     out.push(QuerySample {
         name: "degree".to_owned(),
