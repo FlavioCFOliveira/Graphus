@@ -17,19 +17,32 @@
 //! ## States (`04 §8.1`)
 //!
 //! ```text
-//! CONNECTED --(HELLO)--> AUTHENTICATION --(LOGON ok)--> READY
+//! CONNECTED --(HELLO ok)--> AUTHENTICATION --(LOGON ok)--> READY
 //!    READY  --(RUN)--> STREAMING --(stream drained)--> READY
 //!    READY  --(BEGIN)--> TX_READY --(RUN)--> TX_STREAMING --(drained)--> TX_READY
 //!  TX_READY --(COMMIT/ROLLBACK)--> READY
-//!    <any>  --(error)--> FAILED --(RESET)--> READY
+//!  post-auth --(error)--> FAILED --(RESET)--> READY
+//!  pre-auth  --(HELLO/LOGON fail or out-of-order msg)--> DEFUNCT
 //!    <any>  --(GOODBYE / fatal)--> DEFUNCT
 //! ```
 //!
 //! ## The fail-then-ignore-until-RESET rule (`04 §8.1`, `06 §3.2`)
 //!
-//! After any `FAILURE`, the connection enters [`State::Failed`] and **every** subsequent request is
-//! answered `IGNORED` until the client sends `RESET`, which clears the failure and returns to
-//! [`State::Ready`]. This is modelled as an explicit guard at the top of the dispatch.
+//! After any `FAILURE` **in an authenticated state**, the connection enters [`State::Failed`] and
+//! **every** subsequent request is answered `IGNORED` until the client sends `RESET`, which clears
+//! the failure and returns to [`State::Ready`]. This is modelled as an explicit guard at the top of
+//! the dispatch.
+//!
+//! ## Pre-authentication failures are terminal (`04 §8.1`; rmp #820)
+//!
+//! A failure **before** authentication completes — a malformed/absent `HELLO`, a failed `LOGON`, a
+//! malformed frame, or any out-of-order message in `CONNECTED`/`AUTHENTICATION` — is **not**
+//! recoverable. The Bolt server-state spec transitions `NEGOTIATION` and `AUTHENTICATION` to
+//! `DEFUNCT` on such a failure (never to `FAILED`), and `RESET` is not a valid message before
+//! authentication. Entering the recoverable `FAILED` state here was an authentication bypass: a
+//! subsequent `RESET` returned the connection to `READY` with a `None` principal, which the engine
+//! seam treats as unrestricted. Every pre-auth failure therefore goes straight to [`State::Defunct`]
+//! and closes the connection (see [`BoltSession::fail_terminal`]).
 //!
 //! ## Streaming honours the fetch size (`04 §7.7`, `06 §3.1`)
 //!
@@ -332,11 +345,21 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
             let request = match Request::decode(&payload) {
                 Ok(r) => r,
                 Err(e) => {
-                    // A malformed message is a protocol fault: FAILURE then fail-state.
-                    self.send_failure(Failure::new(
-                        "Neo.ClientError.Request.Invalid",
-                        e.to_string(),
-                    ))?;
+                    let failure = Failure::new("Neo.ClientError.Request.Invalid", e.to_string());
+                    // Before authentication a malformed message is TERMINAL: the Bolt server-state
+                    // spec transitions NEGOTIATION / AUTHENTICATION to DEFUNCT on failure, and RESET
+                    // is not valid pre-auth — so a recoverable FAILED here would let a later RESET
+                    // resurrect an unauthenticated connection to READY (which then runs with a `None`,
+                    // i.e. unrestricted, principal at the engine seam — rmp #820). Send the FAILURE,
+                    // flush, then close. After authentication a malformed message stays recoverable
+                    // (fail-then-ignore-until-RESET).
+                    if matches!(self.state, State::Connected | State::Authentication) {
+                        self.send_failure(failure)?;
+                        self.state = State::Defunct;
+                        self.transport.flush()?;
+                        return Ok(());
+                    }
+                    self.send_failure(failure)?;
                     self.state = State::Failed;
                     continue;
                 }
@@ -469,10 +492,11 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
         // Fail-then-ignore-until-RESET: in FAILED, only RESET is processed; all else is IGNORED.
         if self.state == State::Failed {
             if matches!(request, Request::Reset) {
-                self.handle_reset()?;
-            } else {
-                self.send(&Response::Ignored)?;
+                // `handle_reset` decides the flow: it recovers an authenticated connection to READY
+                // (Continue), but makes an *unauthenticated* one terminal (Stop) — rmp #820.
+                return self.handle_reset();
             }
+            self.send(&Response::Ignored)?;
             return Ok(Flow::Continue);
         }
 
@@ -497,15 +521,18 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
                 // versions (`04 §8.1`); a HELLO that omits it (or carries a non-string / empty
                 // value) is malformed and is rejected with FAILURE rather than silently accepted —
                 // this also closes a trivial DoS where a client drives the handshake with truncated
-                // metadata. The connection enters FAILED and the listener closes it.
+                // metadata. Being a pre-authentication failure it is terminal: the connection goes
+                // straight to DEFUNCT and closes (rmp #820), never the recoverable FAILED state.
                 let user_agent_ok = map_str(&extra, "user_agent").is_some_and(|s| !s.is_empty());
                 if !user_agent_ok {
-                    self.send_failure(Failure::new(
+                    // A malformed HELLO is a PRE-authentication failure and is therefore TERMINAL:
+                    // the Bolt server-state spec transitions NEGOTIATION to DEFUNCT on an
+                    // unsuccessful HELLO, and RESET is not valid before authentication — so this must
+                    // not enter the RESET-recoverable FAILED state (rmp #820).
+                    return self.fail_terminal(Failure::new(
                         "Neo.ClientError.Request.Invalid",
                         "HELLO is missing the required `user_agent` field",
-                    ))?;
-                    self.state = State::Failed;
-                    return Ok(Flow::Continue);
+                    ));
                 }
                 // HELLO no longer carries credentials in 5.1+ (LOGON does). Acknowledge with server
                 // metadata and move to AUTHENTICATION. The `server` agent and the per-connection
@@ -555,19 +582,22 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
                         // so a legitimate long-lived authenticated session is not reaped (rmp #469,
                         // F-NET-1). A no-op on transports without a deadline.
                         self.transport.on_authenticated();
+                        Ok(Flow::Continue)
                     }
                     Err(failure) => {
                         // Record the failed attempt for audit (rmp #70) before the FAILURE goes out.
                         self.executor
                             .on_auth_failure(attempted.as_deref(), "authentication failed");
-                        // A failed auth is delivered as FAILURE; the connection enters FAILED and
-                        // the listener closes it (`04 §8.4`: failed auth → FAILURE + close). We stay
-                        // in the fail-state so a stray follow-up is IGNORED until the socket drops.
-                        self.send_failure(failure)?;
-                        self.state = State::Failed;
+                        // A failed LOGON is a PRE-authentication failure and is TERMINAL: the Bolt
+                        // server-state spec transitions AUTHENTICATION to DEFUNCT on an unsuccessful
+                        // LOGON (never a recoverable FAILED), and RESET is not valid before
+                        // authentication (`04 §8.4`: failed auth → FAILURE + close). Closing here
+                        // prevents a later RESET from resurrecting the unauthenticated connection to
+                        // READY with a `None` (unrestricted) principal (rmp #820). The FAILURE keeps
+                        // its `Neo.ClientError.Security.Unauthorized` code (set by `authenticate`).
+                        self.fail_terminal(failure)
                     }
                 }
-                Ok(Flow::Continue)
             }
             other => self.unexpected(&other),
         }
@@ -704,10 +734,7 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
                 self.fail_protocol("LOGOFF is only valid in the READY state")?;
                 Ok(Flow::Continue)
             }
-            (_, Request::Reset) => {
-                self.handle_reset()?;
-                Ok(Flow::Continue)
-            }
+            (_, Request::Reset) => self.handle_reset(),
             (_, other) => self.unexpected(&other),
         }
     }
@@ -717,10 +744,7 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
         match request {
             Request::Pull { n, qid } => self.handle_pull(n, qid, true),
             Request::Discard { n, qid } => self.handle_pull(n, qid, false),
-            Request::Reset => {
-                self.handle_reset()?;
-                Ok(Flow::Continue)
-            }
+            Request::Reset => self.handle_reset(),
             other => self.unexpected(&other),
         }
     }
@@ -913,8 +937,29 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
     // ---- RESET / failure -------------------------------------------------------------------------
 
     /// Handles `RESET`: clears any failure and open stream, rolls back an open transaction, and
-    /// returns to `READY` (`04 §8.1`).
-    fn handle_reset(&mut self) -> BoltResult<()> {
+    /// returns to `READY` (`04 §8.1`) — for an **authenticated** connection. Returns [`Flow::Stop`]
+    /// (terminal) when the connection has never authenticated (defense in depth for rmp #820).
+    fn handle_reset(&mut self) -> BoltResult<Flow> {
+        // Defense in depth (rmp #820): RESET must never resurrect an UNAUTHENTICATED connection to
+        // READY. A legitimate client only ever RESETs an authenticated session (the principal is
+        // `Some`); a `None` principal here means the connection reached a RESET-handling path without
+        // a successful LOGON, and READY with a `None` principal runs unrestricted at the engine seam.
+        // Make it terminal instead. (The primary fix already turns every pre-auth failure into
+        // DEFUNCT outright, so this is a backstop against any residual/future path, not the main
+        // guard.) A legitimate flow is never affected — a post-auth RESET always has `principal`
+        // `Some` and takes the normal recovery path below.
+        if self.principal.is_none() {
+            self.executor.rollback_open_tx();
+            self.open_stream = None;
+            self.open_qid = None;
+            self.next_qid = 0;
+            self.send_failure(Failure::new(
+                "Neo.ClientError.Request.Invalid",
+                "RESET is not valid before authentication",
+            ))?;
+            self.state = State::Defunct;
+            return Ok(Flow::Stop);
+        }
         // RESET forces the connection back to a clean READY "as if HELLO/LOGON had just completed"
         // (`04 §8.1`, Bolt RESET spec), so any in-flight transaction MUST be aborted. Roll back
         // whatever transaction the executor actually holds, UNCONDITIONALLY — do NOT gate on the
@@ -932,7 +977,7 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
         self.next_qid = 0;
         self.send(&Response::Success { metadata: vec![] })?;
         self.state = State::Ready;
-        Ok(())
+        Ok(Flow::Continue)
     }
 
     /// Sends a `FAILURE` for a `GraphusError` and enters [`State::Failed`], dropping any open
@@ -954,14 +999,40 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
         Ok(())
     }
 
-    /// An unexpected request for the current state: `FAILURE` + fail-state (`04 §8.1` rejects an
-    /// out-of-order message).
+    /// Sends a `FAILURE` for a **pre-authentication** fault and makes the connection TERMINAL
+    /// ([`State::Defunct`] + [`Flow::Stop`]), so the message loop flushes the failure and closes the
+    /// socket instead of returning to a recoverable state.
+    ///
+    /// The Bolt server-state spec transitions NEGOTIATION and AUTHENTICATION to DEFUNCT on a failed
+    /// HELLO / LOGON (never to the RESET-recoverable FAILED state), and RESET is not a valid message
+    /// before authentication (neo4j.com/docs/bolt/current/bolt/server-state/). Using FAILED here was
+    /// an authentication bypass: a later RESET reset the connection to READY with a `None` principal,
+    /// which the engine seam treats as unrestricted (rmp #820). No transaction can be open before
+    /// authentication, so there is nothing to roll back.
+    fn fail_terminal(&mut self, failure: Failure) -> BoltResult<Flow> {
+        self.open_stream = None;
+        self.open_qid = None;
+        self.send_failure(failure)?;
+        self.state = State::Defunct;
+        Ok(Flow::Stop)
+    }
+
+    /// An unexpected request for the current state: an out-of-order message (`04 §8.1`). Before
+    /// authentication this is TERMINAL (DEFUNCT); after authentication it is the recoverable FAILED
+    /// state (fail-then-ignore-until-RESET).
     fn unexpected(&mut self, request: &Request) -> BoltResult<Flow> {
         let msg = format!(
             "request {} is not valid in state {:?}",
             request_name(request),
             self.state
         );
+        // A pre-authentication out-of-order message must not enter the RESET-recoverable FAILED state
+        // (which a later RESET could turn into an unauthenticated, `None`-principal, unrestricted
+        // READY — rmp #820): NEGOTIATION / AUTHENTICATION transition to DEFUNCT on failure and RESET
+        // is not valid pre-auth. After authentication an out-of-order message stays recoverable.
+        if matches!(self.state, State::Connected | State::Authentication) {
+            return self.fail_terminal(Failure::new("Neo.ClientError.Request.Invalid", msg));
+        }
         self.fail_protocol(&msg)?;
         Ok(Flow::Continue)
     }

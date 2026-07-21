@@ -374,7 +374,10 @@ async fn runtime_created_user_authenticates_then_drop_refuses_live() {
         code.contains("Security.Unauthorized") || code.contains("Unauthorized"),
         "unknown-user LOGON fails as Unauthorized: {code}"
     );
-    dave_pre.goodbye().await;
+    // A failed LOGON is terminal: the server sends the FAILURE and closes the connection (Bolt
+    // server-state spec — AUTHENTICATION → DEFUNCT on an unsuccessful LOGON; rmp #820). The client
+    // must not send GOODBYE on the now-closed socket — a real driver simply drops the connection.
+    drop(dave_pre);
     assert_eq!(
         rest_auth_status(rest, "dave").await,
         401,
@@ -422,7 +425,8 @@ async fn runtime_created_user_authenticates_then_drop_refuses_live() {
         code.contains("Security.Unauthorized") || code.contains("Unauthorized"),
         "dropped-user LOGON fails as Unauthorized: {code}"
     );
-    dave_after.goodbye().await;
+    // Failed LOGON is terminal — the server already closed the connection (rmp #820); just drop it.
+    drop(dave_after);
     assert_eq!(
         rest_auth_status(rest, "dave").await,
         401,
@@ -486,7 +490,8 @@ async fn runtime_password_change_takes_effect_live() {
         code.contains("Security.Unauthorized") || code.contains("Unauthorized"),
         "old-password LOGON fails as Unauthorized: {code}"
     );
-    erin_old.goodbye().await;
+    // Failed LOGON is terminal — the server already closed the connection (rmp #820); just drop it.
+    drop(erin_old);
 
     // The NEW password is accepted on a fresh authentication (no reboot).
     let mut erin_new = BoltClient::connect(&uds).await;

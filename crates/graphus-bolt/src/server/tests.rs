@@ -399,7 +399,12 @@ fn discard_drops_rows_and_yields_summary_only() {
 }
 
 #[test]
-fn bad_credentials_fail_and_then_ignore() {
+fn bad_credentials_fail_and_close() {
+    // A failed LOGON is a PRE-authentication failure: the Bolt server-state spec transitions
+    // AUTHENTICATION to DEFUNCT on an unsuccessful LOGON (never a RESET-recoverable FAILED), and
+    // RESET is not valid before authentication. So the FAILURE (`Unauthorized`) is TERMINAL — the
+    // connection closes and the following RUN is never processed. Letting it stay recoverable was an
+    // authentication bypass (a later RESET reached an unauthenticated READY — rmp #820).
     let exec = MockExecutor::new();
     let input = session_input(&[
         hello(),
@@ -410,7 +415,7 @@ fn bad_credentials_fail_and_then_ignore() {
                 ("credentials".to_owned(), Value::String("WRONG".to_owned())),
             ],
         },
-        // After a failed auth the connection is FAILED; this RUN is IGNORED.
+        // The connection is DEFUNCT after the failed LOGON; this RUN is never even read.
         Request::Run {
             query: "RETURN 1".to_owned(),
             parameters: vec![],
@@ -424,6 +429,11 @@ fn bad_credentials_fail_and_then_ignore() {
         let mut session = BoltSession::new(&mut transport, exec, &auth);
         session.run().unwrap();
         assert_eq!(session.principal(), None);
+        assert_eq!(
+            session.state(),
+            State::Defunct,
+            "a failed LOGON must close the connection, not leave it recoverable (rmp #820)"
+        );
     }
     let (_, stream) = split_handshake(transport.written());
     let r = decode_responses(stream);
@@ -432,7 +442,12 @@ fn bad_credentials_fail_and_then_ignore() {
         Response::Failure(f) => assert_eq!(f.code, CODE_UNAUTHORIZED),
         other => panic!("expected auth FAILURE, got {other:?}"),
     }
-    assert!(matches!(r[2], Response::Ignored));
+    // The connection closed after the FAILURE: no further response (the RUN was never processed).
+    assert!(
+        r.get(2).is_none(),
+        "a failed LOGON is terminal; no response may follow the FAILURE: {r:?}"
+    );
+    assert_eq!(r.len(), 2);
 }
 
 #[test]
@@ -585,6 +600,163 @@ fn reset_after_error_inside_explicit_tx_clears_tx_so_next_begin_succeeds() {
 }
 
 #[test]
+fn pre_auth_reset_cannot_bypass_authentication_rmp_820() {
+    // rmp #820 (CRITICAL auth bypass): a PRE-authentication failure must be TERMINAL. The Bolt
+    // server-state spec transitions NEGOTIATION/AUTHENTICATION to DEFUNCT on failure (never to a
+    // RESET-recoverable FAILED), and RESET is not a valid message before authentication
+    // (neo4j.com/docs/bolt/current/bolt/server-state/). Before the fix, a junk message in CONNECTED
+    // entered the recoverable FAILED state and a following RESET reset the connection to READY with a
+    // `None` principal — which the server engine seam treats as UNRESTRICTED — so an unauthenticated
+    // client could run arbitrary queries. This drives exactly that exploit (no HELLO, no LOGON) and
+    // proves the query never reaches the executor.
+    let exec = MockExecutor::new().on_query(
+        "RETURN 1",
+        CannedResult::rows(&["x"], vec![vec![Value::Integer(1)]]),
+    );
+    let input = session_input(&[
+        Request::Reset, // junk in CONNECTED → must be terminal
+        Request::Reset, // the "recovery" RESET the exploit relied on
+        Request::Run {
+            query: "RETURN 1".to_owned(),
+            parameters: vec![],
+            extra: vec![],
+        },
+        Request::Pull { n: ALL, qid: None },
+    ]);
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&input);
+    let mut session = BoltSession::new(&mut transport, exec, &auth);
+    session.run().expect("session runs to a clean terminal");
+
+    // PRIMARY discriminator: the query NEVER reached the executor. `run(` is the mock's per-RUN log
+    // marker; its absence proves the RUN bytes were never dispatched. (RED on the unfixed code, where
+    // the second RESET resurrected the connection to READY and the RUN executed unrestricted.)
+    assert!(
+        !session.executor().log.iter().any(|e| e.starts_with("run(")),
+        "an unauthenticated RUN must never execute (auth bypass, rmp #820): {:?}",
+        session.executor().log
+    );
+    // On the wire the client sees only a FAILURE — never a SUCCESS (which would open a stream / signal
+    // a resurrected READY) and never a RECORD.
+    drop(session);
+    let (_, stream) = split_handshake(transport.written());
+    let r = decode_responses(stream);
+    assert!(
+        matches!(r.first(), Some(Response::Failure(_))),
+        "pre-auth junk must be answered with FAILURE: {r:?}"
+    );
+    assert!(
+        !r.iter().any(|resp| matches!(resp, Response::Record { .. })),
+        "no RECORD may ever be produced for an unauthenticated session: {r:?}"
+    );
+    assert!(
+        !r.iter()
+            .any(|resp| matches!(resp, Response::Success { .. })),
+        "no SUCCESS may follow pre-auth junk — a SUCCESS means the connection was resurrected: {r:?}"
+    );
+}
+
+#[test]
+fn post_logoff_reset_cannot_reach_ready_unauthenticated_rmp_820() {
+    // rmp #820 variant: even a genuinely-authenticated connection must not be able to reach an
+    // unrestricted READY. After LOGOFF the connection is back in AUTHENTICATION with a cleared
+    // principal; a RESET there must be TERMINAL (not a jump to READY), so the post-LOGOFF path cannot
+    // run queries with a `None` (unrestricted) principal. The discriminating property is that the
+    // RUN never executes (the EOF at the end of the script drives BOTH the fixed and unfixed builds
+    // to DEFUNCT, so the final state alone does not distinguish them).
+    let exec = MockExecutor::new().on_query(
+        "RETURN 1",
+        CannedResult::rows(&["x"], vec![vec![Value::Integer(1)]]),
+    );
+    let input = session_input(&[
+        hello(),
+        logon_alice(),
+        Request::Logoff, // → AUTHENTICATION, principal cleared
+        Request::Reset,  // junk in AUTHENTICATION → must be terminal
+        Request::Reset,  // the "recovery" RESET the exploit relied on
+        Request::Run {
+            query: "RETURN 1".to_owned(),
+            parameters: vec![],
+            extra: vec![],
+        },
+        Request::Pull { n: ALL, qid: None },
+    ]);
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&input);
+    let mut session = BoltSession::new(&mut transport, exec, &auth);
+    session.run().expect("session runs to a clean terminal");
+    assert!(
+        !session.executor().log.iter().any(|e| e.starts_with("run(")),
+        "a RUN after a post-LOGOFF RESET must never execute (auth bypass, rmp #820): {:?}",
+        session.executor().log
+    );
+    drop(session);
+    let (_, stream) = split_handshake(transport.written());
+    let r = decode_responses(stream);
+    assert!(
+        !r.iter().any(|resp| matches!(resp, Response::Record { .. })),
+        "no RECORD may be produced after a post-LOGOFF RESET: {r:?}"
+    );
+}
+
+#[test]
+fn post_auth_statement_failure_still_recovers_via_reset_rmp_820_guard() {
+    // rmp #820 must NOT regress the correct POST-authentication recovery (the rmp #613 semantics): an
+    // AUTHENTICATED session that hits a statement FAILURE stays in the recoverable FAILED state, and a
+    // RESET returns it to READY so the next statement runs. Only PRE-auth failures are terminal. This
+    // guards that the `handle_reset` change (principal-present path) keeps recovering.
+    let exec = MockExecutor::new()
+        .on_query_error("BAD", GraphusError::Compile("nope".to_owned()))
+        .on_query(
+            "RETURN 1",
+            CannedResult::rows(&["x"], vec![vec![Value::Integer(1)]]),
+        );
+    let input = session_input(&[
+        hello(),
+        logon_alice(),
+        Request::Run {
+            query: "BAD".to_owned(),
+            parameters: vec![],
+            extra: vec![],
+        },
+        Request::Reset,
+        Request::Run {
+            query: "RETURN 1".to_owned(),
+            parameters: vec![],
+            extra: vec![],
+        },
+        Request::Pull { n: ALL, qid: None },
+        Request::Goodbye,
+    ]);
+    let auth = auth_fixture();
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, exec, &auth);
+        session.run().unwrap();
+    }
+    let (_, stream) = split_handshake(transport.written());
+    let r = decode_responses(stream);
+    // HELLO, LOGON, FAILURE (BAD), RESET SUCCESS, RUN SUCCESS{fields}, RECORD, trailing SUCCESS.
+    assert!(matches!(r[0], Response::Success { .. }), "HELLO");
+    assert!(matches!(r[1], Response::Success { .. }), "LOGON");
+    assert!(matches!(r[2], Response::Failure(_)), "BAD → FAILURE");
+    assert!(
+        matches!(r[3], Response::Success { .. }),
+        "RESET → SUCCESS (recovered to READY)"
+    );
+    assert!(
+        matches!(r[4], Response::Success { .. }),
+        "RUN after RESET → SUCCESS"
+    );
+    assert!(
+        matches!(r[5], Response::Record { .. }),
+        "the recovered RUN streams its record"
+    );
+    assert!(matches!(r[6], Response::Success { .. }), "trailing summary");
+    assert_eq!(r.len(), 7);
+}
+
+#[test]
 fn noop_keepalive_between_messages_is_ignored() {
     // Insert a bare NOOP (00 00) between LOGON and RUN; the session must skip it.
     let mut input = handshake_54();
@@ -660,8 +832,9 @@ fn eof_before_goodbye_ends_cleanly() {
 #[test]
 fn hello_without_user_agent_is_rejected_with_failure() {
     // Regression: `user_agent` is REQUIRED in HELLO (`04 §8.1`). A HELLO that omits it must be
-    // answered with FAILURE (not SUCCESS), and the connection must enter FAILED — it must never
-    // advance to AUTHENTICATION. A subsequent LOGON is then IGNORED.
+    // answered with FAILURE (not SUCCESS). A malformed HELLO is a PRE-authentication failure and is
+    // therefore TERMINAL (DEFUNCT) — never a recoverable FAILED, and never AUTHENTICATION (rmp #820).
+    // The connection closes, so the following LOGON is never even processed.
     let input = session_input(&[
         Request::Hello { extra: vec![] }, // no `user_agent`
         logon_alice(),
@@ -677,6 +850,11 @@ fn hello_without_user_agent_is_rejected_with_failure() {
             Some("alice"),
             "a rejected HELLO must not authenticate"
         );
+        assert_eq!(
+            session.state(),
+            State::Defunct,
+            "a malformed HELLO is terminal (DEFUNCT), not a recoverable FAILED (rmp #820)"
+        );
     }
     let (_, stream) = split_handshake(transport.written());
     let r = decode_responses(stream);
@@ -687,10 +865,11 @@ fn hello_without_user_agent_is_rejected_with_failure() {
         }
         other => panic!("expected HELLO FAILURE, got {other:?}"),
     }
-    // The LOGON that followed must have been IGNORED (no second SUCCESS/FAILURE for it).
+    // The connection is terminal after the FAILURE: the LOGON that followed was never processed, so
+    // there is no second response at all (before rmp #820 it was IGNORED on a still-open connection).
     assert!(
-        !matches!(r.get(1), Some(Response::Success { .. })),
-        "LOGON after a failed HELLO must not succeed: {r:?}"
+        r.get(1).is_none(),
+        "a malformed HELLO closes the connection; no further response may follow: {r:?}"
     );
 }
 
@@ -708,6 +887,11 @@ fn hello_with_empty_user_agent_is_rejected() {
     {
         let mut session = BoltSession::new(&mut transport, MockExecutor::new(), &auth);
         session.run().expect("session runs");
+        assert_eq!(
+            session.state(),
+            State::Defunct,
+            "an empty user_agent is a terminal pre-auth failure (rmp #820)"
+        );
     }
     let (_, stream) = split_handshake(transport.written());
     let r = decode_responses(stream);
@@ -1514,9 +1698,10 @@ fn telemetry_with_valid_api_is_acknowledged_with_success() {
 #[test]
 fn telemetry_in_authentication_is_rejected_as_wrong_state() {
     // TELEMETRY is legal ONLY in READY (Bolt 5.4+ state machine). Sent out of order in
-    // AUTHENTICATION (after HELLO, before LOGON) it is a wrong-state request: FAILURE → FAILED, and
-    // the following LOGON is then IGNORED until a RESET (`04 §8.1`). This supersedes the earlier
-    // rmp #95 leniency in favour of the inviolable 100%-Bolt-compliance mandate.
+    // AUTHENTICATION (after HELLO, before LOGON) it is a wrong-state request. Since this is BEFORE
+    // authentication, the failure is TERMINAL (DEFUNCT), not a RESET-recoverable FAILED: NEGOTIATION
+    // / AUTHENTICATION transition to DEFUNCT on failure and RESET is not valid pre-auth (rmp #820).
+    // So the FAILURE closes the connection and the following LOGON is never processed.
     let input = session_input(&[
         hello(),
         Request::Telemetry { api: 1 },
@@ -1532,17 +1717,17 @@ fn telemetry_in_authentication_is_rejected_as_wrong_state() {
     }
     let (_, stream) = split_handshake(transport.written());
     let r = decode_responses(stream);
-    // HELLO SUCCESS, TELEMETRY FAILURE (wrong state), LOGON IGNORED (FAILED until RESET).
+    // HELLO SUCCESS, TELEMETRY FAILURE (wrong state) — then the connection is closed (terminal).
     assert!(matches!(r[0], Response::Success { .. }), "HELLO → SUCCESS");
     match &r[1] {
         Response::Failure(f) => assert_eq!(f.code, "Neo.ClientError.Request.Invalid"),
         other => panic!("expected wrong-state FAILURE, got {other:?}"),
     }
     assert!(
-        matches!(r[2], Response::Ignored),
-        "LOGON after the TELEMETRY FAILURE → IGNORED"
+        r.get(2).is_none(),
+        "a pre-auth wrong-state FAILURE is terminal; the LOGON must never be processed: {r:?}"
     );
-    assert_eq!(r.len(), 3);
+    assert_eq!(r.len(), 2);
 }
 
 // ---- rmp #443: absent-`n` PULL/DISCARD + invalid-`api` TELEMETRY rejection ---------------------
@@ -1762,8 +1947,10 @@ fn reset_after_run_pull_clears_state_serial_equivalence() {
 
 #[test]
 fn telemetry_before_hello_is_rejected_as_wrong_state() {
-    // TELEMETRY sent in CONNECTED (before HELLO) is a wrong-state request: FAILURE → FAILED. The
-    // subsequent HELLO is then IGNORED until a RESET arrives.
+    // TELEMETRY sent in CONNECTED (before HELLO) is a wrong-state request. Since this is BEFORE
+    // authentication, the failure is TERMINAL (DEFUNCT), not a RESET-recoverable FAILED: NEGOTIATION
+    // transitions to DEFUNCT on failure and RESET is not valid pre-auth (rmp #820). The FAILURE
+    // closes the connection, so the following HELLO is never processed.
     let input = session_input(&[Request::Telemetry { api: 3 }, hello(), Request::Goodbye]);
     let auth = auth_fixture();
     let mut transport = MemoryTransport::with_input(&input);
@@ -1774,16 +1961,16 @@ fn telemetry_before_hello_is_rejected_as_wrong_state() {
     }
     let (_, stream) = split_handshake(transport.written());
     let r = decode_responses(stream);
-    // TELEMETRY FAILURE (pre-HELLO), HELLO IGNORED (FAILED until RESET).
+    // TELEMETRY FAILURE (pre-HELLO) — then the connection is closed (terminal).
     match &r[0] {
         Response::Failure(f) => assert_eq!(f.code, "Neo.ClientError.Request.Invalid"),
         other => panic!("expected wrong-state FAILURE, got {other:?}"),
     }
     assert!(
-        matches!(r[1], Response::Ignored),
-        "HELLO after the pre-HELLO TELEMETRY FAILURE → IGNORED"
+        r.get(1).is_none(),
+        "a pre-auth wrong-state FAILURE is terminal; the HELLO must never be processed: {r:?}"
     );
-    assert_eq!(r.len(), 2);
+    assert_eq!(r.len(), 1);
 }
 
 #[test]

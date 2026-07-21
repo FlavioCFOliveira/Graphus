@@ -192,6 +192,13 @@ fn hello_without_user_agent_is_rejected() {
     let bad_hello = Request::Hello { extra: vec![] };
     let state = run_session(&[bad_hello]);
     assert_ne!(state, State::Ready);
+    // A malformed HELLO is a PRE-authentication failure: it must be terminal (DEFUNCT), not the
+    // RESET-recoverable FAILED state that let a later RESET reach an unauthenticated READY (rmp #820).
+    assert_eq!(
+        state,
+        State::Defunct,
+        "a malformed HELLO must close the connection, never leave it recoverable"
+    );
 }
 
 #[test]
