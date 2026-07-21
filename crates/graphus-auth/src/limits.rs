@@ -120,9 +120,14 @@ impl RateLimiter {
     }
 }
 
-/// A per-key **failed-authentication throttle** (rmp #458): a token bucket of "allowed failures" per
-/// source/account key, consulted **before** the expensive Argon2 verification on every Bolt `LOGON`
-/// and REST Bearer/admin check.
+/// A per-key **failed-authentication throttle** (rmp #458/#823): a token bucket of "allowed failures"
+/// per account key, consulted **before** the expensive Argon2 verification on **both** password-
+/// authentication paths — the REST `POST /auth/login` endpoint (rmp #499) and the Bolt native `LOGON`
+/// (rmp #823) — so an attacker cannot pick one interface to sidestep the per-account lockout the other
+/// enforces (CWE-307). The two paths share **one** `AuthThrottle` instance, so a spent budget for an
+/// account is enforced jointly across REST and Bolt (and, for Bolt, across reconnects — a failed
+/// pre-auth `LOGON` is terminal, so each connection is one attempt). The Bearer/JWT and admin checks
+/// verify an HMAC signature, not a memory-hard hash, so they are deliberately **not** throttled here.
 ///
 /// ## Why this exists
 ///

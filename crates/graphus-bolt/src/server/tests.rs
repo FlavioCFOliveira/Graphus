@@ -2144,3 +2144,206 @@ fn neo4j_compat_agent_matches_negotiated_bolt_window() {
     );
     assert_eq!(crate::server::NEO4J_COMPAT_SERVER_AGENT, "Neo4j/5.13.0");
 }
+
+// ---- Bolt LOGON per-account throttle (rmp #458/#823) ------------------------------------------
+
+use graphus_auth::AuthProvider;
+use graphus_auth::AuthThrottle;
+use graphus_core::capability::Clock;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+/// An [`AuthProvider`] that delegates to a real [`Authenticator`] but **counts** every call to
+/// `authenticate_password` — i.e. every time the memory-hard Argon2 KDF is invoked (the KDF lives
+/// strictly inside that call). The Bolt `LOGON` throttle (rmp #823) must reject a spent-budget account
+/// *before* this call, so a flat count across the throttled attempt is a direct, non-vacuous proof
+/// that "the KDF did not run" — the same property graphus-auth's own `#[cfg(test)] KDF_VERIFY_COUNT`
+/// seam proves, but reachable here (that thread-local is invisible cross-crate).
+struct CountingAuth {
+    inner: Authenticator,
+    kdf_calls: AtomicUsize,
+}
+
+impl CountingAuth {
+    fn new(inner: Authenticator) -> Self {
+        Self {
+            inner,
+            kdf_calls: AtomicUsize::new(0),
+        }
+    }
+    fn kdf_calls(&self) -> usize {
+        self.kdf_calls.load(Ordering::SeqCst)
+    }
+}
+
+impl AuthProvider for CountingAuth {
+    fn authenticate_password(&self, user: &str, plaintext: &str) -> graphus_auth::Result<String> {
+        self.kdf_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.authenticate_password(user, plaintext)
+    }
+    fn authenticate_bearer(
+        &self,
+        token: &str,
+        now_unix_secs: u64,
+    ) -> graphus_auth::Result<graphus_auth::Claims> {
+        self.inner.authenticate_bearer(token, now_unix_secs)
+    }
+    fn require(&self, user: &str, wanted: &Privilege) -> graphus_auth::Result<()> {
+        self.inner.require(user, wanted)
+    }
+    fn issue_token(
+        &self,
+        user: &str,
+        now_unix_secs: u64,
+        ttl_secs: u64,
+    ) -> graphus_auth::Result<String> {
+        self.inner.issue_token(user, now_unix_secs, ttl_secs)
+    }
+}
+
+/// A deterministic, manually-advanced [`Clock`] for the throttle window — no wall time (the project
+/// rule: throttle behaviour is a pure function of injected clock readings).
+struct TestClock {
+    nanos: AtomicU64,
+}
+
+impl TestClock {
+    fn new() -> Self {
+        Self {
+            nanos: AtomicU64::new(0),
+        }
+    }
+    fn advance_secs(&self, secs: u64) {
+        self.nanos
+            .fetch_add(secs.saturating_mul(1_000_000_000), Ordering::SeqCst);
+    }
+}
+
+impl Clock for TestClock {
+    fn now_nanos(&self) -> u64 {
+        self.nanos.load(Ordering::SeqCst)
+    }
+}
+
+/// Drives ONE bad `LOGON` for `principal` on a fresh session sharing `auth` + `throttle`, returning
+/// the decoded responses. A failed pre-auth `LOGON` is terminal (rmp #820), so each attempt is a fresh
+/// connection — exactly how the throttle accrues across reconnects in production.
+fn drive_bad_logon(
+    auth: &CountingAuth,
+    throttle: &LoginThrottle,
+    principal: &str,
+) -> Vec<Response> {
+    let input = session_input(&[
+        hello(),
+        Request::Logon {
+            auth: vec![
+                ("scheme".to_owned(), Value::String("basic".to_owned())),
+                ("principal".to_owned(), Value::String(principal.to_owned())),
+                (
+                    "credentials".to_owned(),
+                    Value::String("WRONG-pw".to_owned()),
+                ),
+            ],
+        },
+    ]);
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, MockExecutor::new(), auth)
+            .with_login_throttle(throttle.clone());
+        session.run().unwrap();
+        assert_eq!(session.principal(), None);
+        assert_eq!(
+            session.state(),
+            State::Defunct,
+            "a failed LOGON is terminal (rmp #820) — one attempt per connection"
+        );
+    }
+    let (_, stream) = split_handshake(transport.written());
+    decode_responses(stream)
+}
+
+#[test]
+fn bolt_logon_consults_the_shared_per_account_throttle_before_the_kdf() {
+    // rmp #823 (security audit Finding 2): the Bolt `LOGON` path MUST consult the SAME per-account
+    // failed-login throttle as REST `/auth/login`, so an attacker cannot pick the Bolt interface to
+    // sidestep the per-account lockout (CWE-307). Proven via `CountingAuth` (the KDF lives strictly
+    // inside `authenticate_password`), so a flat call-count across the throttled attempt proves the
+    // KDF did not run — the assertion that is RED without the `authenticate` throttle check.
+    const MAX: u32 = 3; // a small budget keeps the test cheap; the mechanism is identical at 5.
+    let auth = CountingAuth::new(auth_fixture());
+    let clock = Arc::new(TestClock::new());
+    let throttle = LoginThrottle::new(
+        Arc::new(AuthThrottle::new(MAX, 1).expect("non-zero limits")),
+        clock.clone(),
+    );
+
+    // The first MAX bad LOGONs for `alice` each run the KDF and each FAIL; the shared throttle accrues
+    // those failures across the reconnects.
+    for i in 0..MAX {
+        let before = auth.kdf_calls();
+        let r = drive_bad_logon(&auth, &throttle, "alice");
+        assert!(
+            matches!(r[1], Response::Failure(_)),
+            "attempt {i}: a wrong password must FAIL"
+        );
+        assert_eq!(
+            auth.kdf_calls(),
+            before + 1,
+            "attempt {i}: the KDF must run while the account still has failure budget"
+        );
+    }
+
+    // The (MAX+1)th LOGON for `alice`: the bucket is empty, so the throttle rejects it BEFORE the KDF.
+    let before = auth.kdf_calls();
+    let r = drive_bad_logon(&auth, &throttle, "alice");
+    match &r[1] {
+        Response::Failure(f) => assert_eq!(
+            f.code, CODE_UNAUTHORIZED,
+            "a throttled LOGON returns the SAME Unauthorized as a wrong password (no oracle)"
+        ),
+        other => panic!("expected an Unauthorized FAILURE, got {other:?}"),
+    }
+    assert_eq!(
+        auth.kdf_calls(),
+        before,
+        "the throttled LOGON MUST be rejected BEFORE the Argon2 KDF runs (rmp #823)"
+    );
+
+    // Key derivation matches REST — PER-ACCOUNT: a DIFFERENT principal is unaffected by alice's spent
+    // budget, so its first attempt still runs the KDF (the throttle is not a global gate).
+    let before = auth.kdf_calls();
+    let _ = drive_bad_logon(&auth, &throttle, "bob");
+    assert_eq!(
+        auth.kdf_calls(),
+        before + 1,
+        "a different account is keyed independently, not globally throttled"
+    );
+
+    // A CORRECT credential still authenticates once the account's bucket refills (success is never
+    // throttled): advance the injected clock past the refill window so alice's bucket recovers.
+    clock.advance_secs(u64::from(MAX) + 1);
+    let input = session_input(&[hello(), logon_alice()]);
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, MockExecutor::new(), &auth)
+            .with_login_throttle(throttle.clone());
+        session.run().unwrap();
+        // The session ends `Defunct` on EOF (no further messages), so the proof of a successful LOGON
+        // is the resolved principal (retained past the EOF) plus the `SUCCESS` on the wire below.
+        assert_eq!(
+            session.principal(),
+            Some("alice"),
+            "a correct credential still authenticates after the throttle window refills"
+        );
+    }
+    let (_, stream) = split_handshake(transport.written());
+    let r = decode_responses(stream);
+    assert!(
+        matches!(r[0], Response::Success { .. }),
+        "HELLO must succeed"
+    );
+    assert!(
+        matches!(r[1], Response::Success { .. }),
+        "the LOGON must SUCCEED after the throttle refills (success is never throttled): {r:?}"
+    );
+}

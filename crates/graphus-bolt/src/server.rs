@@ -52,8 +52,11 @@
 //! the trailing `SUCCESS` carries `has_more = true` and the connection stays in `STREAMING`
 //! (`06 §3.1`). `DISCARD` drops the remaining rows and emits only the trailing `SUCCESS`.
 
-use graphus_auth::AuthProvider;
+use std::sync::Arc;
+
+use graphus_auth::{AuthProvider, AuthThrottle};
 use graphus_core::Value;
+use graphus_core::capability::Clock;
 
 use crate::error::{BoltError, BoltResult, CODE_UNAUTHORIZED, Failure, failure_from_error};
 use crate::executor::{AccessMode, BoltExecutor, Record, RecordStream, TxControl};
@@ -173,6 +176,40 @@ impl Default for SessionConfig {
 /// The default `ROUTE` routing-table TTL in seconds (300 = 5 minutes, Neo4j's driver default).
 pub const DEFAULT_ROUTING_TTL_SECS: i64 = 300;
 
+/// The per-account failed-authentication throttle a listener wires into a [`BoltSession`] so the
+/// Bolt native `LOGON` path shares the **same** lockout policy as the REST `POST /auth/login`
+/// endpoint (rmp #458/#823): the shared [`AuthThrottle`] plus the [`Clock`] its token buckets read.
+///
+/// [`BoltSession::authenticate`] consults it **before** the Argon2 verify, keyed by the attempted
+/// **principal** — exactly as the REST endpoint keys by the submitted username — so an account whose
+/// failure budget is spent is rejected up front without paying the memory-hard KDF, closing the
+/// interface-shopping gap where an attacker used Bolt to sidestep the per-account lockout REST
+/// enforces (CWE-307). The budget accrues **across reconnects**: a failed pre-auth `LOGON` is terminal
+/// (rmp #820), so each connection is one attempt, and the shared throttle remembers the account's
+/// spent budget from one connection to the next. A session with no throttle attached (the default)
+/// authenticates exactly as before.
+#[derive(Clone)]
+pub struct LoginThrottle {
+    throttle: Arc<AuthThrottle>,
+    clock: Arc<dyn Clock + Send + Sync>,
+}
+
+impl LoginThrottle {
+    /// Wraps the shared [`AuthThrottle`] + [`Clock`] a listener already owns so it can be attached to a
+    /// session with [`BoltSession::with_login_throttle`].
+    #[must_use]
+    pub fn new(throttle: Arc<AuthThrottle>, clock: Arc<dyn Clock + Send + Sync>) -> Self {
+        Self { throttle, clock }
+    }
+}
+
+impl std::fmt::Debug for LoginThrottle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never expose the throttle's internal per-key bucket state or the clock.
+        f.debug_struct("LoginThrottle").finish_non_exhaustive()
+    }
+}
+
 /// A Bolt connection session: the state machine plus its in-flight result stream.
 ///
 /// Generic over the [`Transport`] (byte pipe) and the [`BoltExecutor`] (query seam) so it is
@@ -209,6 +246,11 @@ pub struct BoltSession<'a, T: Transport, E: BoltExecutor> {
     packer: Packer,
     /// PERF (C4/C5): retained framing buffer (chunked wire bytes), reused across responses.
     framed: Vec<u8>,
+    /// Optional per-account failed-`LOGON` throttle (rmp #458/#823). `None` (the default) leaves the
+    /// auth path unchanged; the server attaches the process-wide shared throttle via
+    /// [`with_login_throttle`](Self::with_login_throttle) so Bolt enforces the SAME per-account lockout
+    /// as REST `/auth/login`.
+    login_throttle: Option<LoginThrottle>,
 }
 
 /// An open `RUN` result plus a **one-record lookahead** buffer.
@@ -293,7 +335,18 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
             read_buf: vec![0u8; 8 * 1024],
             packer: Packer::new(),
             framed: Vec::new(),
+            login_throttle: None,
         }
+    }
+
+    /// Attaches the shared per-account failed-`LOGON` throttle (rmp #458/#823) so the Bolt auth path
+    /// enforces the **same** per-account lockout as REST `/auth/login`. Consulted in
+    /// [`authenticate`](Self::authenticate) **before** the Argon2 verify (keyed by the attempted
+    /// principal); without it — the default — the auth path is unthrottled, exactly as before.
+    #[must_use]
+    pub fn with_login_throttle(mut self, throttle: LoginThrottle) -> Self {
+        self.login_throttle = Some(throttle);
+        self
     }
 
     /// The current connection state (for tests/observability).
@@ -1053,9 +1106,36 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
         }
         let principal = map_str(auth, "principal").unwrap_or("");
         let credentials = map_str(auth, "credentials").unwrap_or("");
+
+        // Per-account failed-`LOGON` throttle (rmp #458/#823), keyed by the attempted `principal`
+        // EXACTLY as the REST `/auth/login` throttle keys by the submitted username — so both
+        // password-authentication interfaces share ONE per-account lockout and an attacker cannot pick
+        // Bolt to sidestep the lockout REST enforces (CWE-307). Consulted BEFORE the Argon2 verify: an
+        // account whose failure budget is spent is rejected up front WITHOUT paying the memory-hard KDF
+        // (this also blunts the per-account Argon2 CPU-exhaustion vector). A denied attempt returns the
+        // SAME `Unauthorized` FAILURE as a wrong password, so — like every pre-auth failure — it is
+        // terminal (rmp #820) and reveals nothing about why it was refused.
+        if let Some(t) = &self.login_throttle
+            && !t.throttle.permit_attempt(principal, t.clock.as_ref())
+        {
+            return Err(Failure::new(
+                CODE_UNAUTHORIZED,
+                "too many failed authentication attempts for this account; retry later",
+            ));
+        }
+
         match self.auth.authenticate_password(principal, credentials) {
             Ok(user) => Ok(user),
-            Err(_) => Err(Failure::new(CODE_UNAUTHORIZED, "authentication failed")),
+            Err(_) => {
+                // Debit this account's failure bucket (rmp #458/#823): the Nth failure within the
+                // window empties it, so `permit_attempt` rejects the next attempt for this principal —
+                // across reconnects — before the KDF. A *correct* credential never reaches here, so a
+                // successful auth never debits (mirrors the REST endpoint: success is never throttled).
+                if let Some(t) = &self.login_throttle {
+                    t.throttle.note_failure(principal, t.clock.as_ref());
+                }
+                Err(Failure::new(CODE_UNAUTHORIZED, "authentication failed"))
+            }
         }
     }
 

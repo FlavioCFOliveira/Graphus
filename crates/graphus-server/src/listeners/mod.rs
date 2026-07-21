@@ -206,6 +206,17 @@ pub async fn start_all(
         Arc::clone(&transactions),
     );
 
+    // The per-account failed-authentication throttle (rmp #458/#823), built ONCE and shared by every
+    // password-authentication path: the REST `POST /auth/login` endpoint AND both Bolt `LOGON` loops
+    // (UDS + TCP). Sharing a single instance is load-bearing — a spent failure budget for an account
+    // is enforced jointly across REST and Bolt, so an attacker cannot pick the Bolt interface to
+    // sidestep the per-account lockout REST enforces (CWE-307). The limits are compile-time non-zero,
+    // so construction cannot fail.
+    let auth_throttle = Arc::new(
+        graphus_auth::AuthThrottle::new(LOGIN_THROTTLE_MAX_FAILURES, LOGIN_THROTTLE_REFILL_PER_SEC)
+            .expect("INVARIANT: login throttle limits are compile-time non-zero"),
+    );
+
     // ---- UDS-Bolt (peer-cred, no TLS) ----
     let uds_path = if let Some(path) = &config.uds_path {
         let acceptor =
@@ -215,6 +226,8 @@ pub async fn start_all(
             acceptor,
             context.clone(),
             Arc::clone(&auth),
+            Arc::clone(&auth_throttle),
+            Arc::clone(&clock),
             advertised_bolt.clone(),
             bolt_server_agent.clone(),
             Arc::clone(&metrics),
@@ -248,6 +261,8 @@ pub async fn start_all(
             tls_acceptor,
             context.clone(),
             Arc::clone(&auth),
+            Arc::clone(&auth_throttle),
+            Arc::clone(&clock),
             advertised_bolt.clone(),
             bolt_server_agent.clone(),
             Arc::clone(&metrics),
@@ -276,6 +291,7 @@ pub async fn start_all(
             context.clone(),
             Arc::clone(&catalog),
             Arc::clone(&auth),
+            Arc::clone(&auth_throttle),
             Arc::clone(&security),
             Arc::clone(&audit),
             Arc::clone(&clock),
@@ -320,17 +336,19 @@ pub async fn start_all(
 ///
 /// Authentication is LIVE everywhere (rmp #94): the transactional API holds the `AuthProvider`
 /// (`auth`, a `LiveAuth` over the catalog), and the server's own `/admin/*` routes hold the
-/// The per-account failed-login **burst** tolerated before the REST `/auth/login` throttle (rmp #458)
-/// engages: a legitimate user fat-fingering a password gets this many tries; an attacker gets no more
-/// per account before being slowed. A modest value — the protection is the *refill*, not the burst.
+/// The per-account failed-login **burst** tolerated before the shared failed-authentication throttle
+/// (rmp #458/#823) engages on the REST `/auth/login` **and** Bolt `LOGON` paths: a legitimate user
+/// fat-fingering a password gets this many tries; an attacker gets no more per account (on either
+/// interface) before being slowed. A modest value — the protection is the *refill*, not the burst.
 const LOGIN_THROTTLE_MAX_FAILURES: u32 = 5;
 
-/// The per-account failed-login **refill** rate for the REST `/auth/login` throttle (rmp #458): one
-/// failed-attempt slot per second — the finest the token bucket exposes (its constructor requires an
-/// integer rate ≥ 1/s). After the burst is spent, this bounds *sustained* failed logins for one
-/// account — and so its Argon2 CPU cost — to ~1/s, layered under the per-source-IP connection cap
-/// (rmp #478) and the global connection cap. A *correct* credential never debits, so a legitimate
-/// client is never throttled by its own success.
+/// The per-account failed-login **refill** rate for the shared failed-authentication throttle (rmp
+/// #458/#823), applied on both the REST `/auth/login` and Bolt `LOGON` paths: one failed-attempt slot
+/// per second — the finest the token bucket exposes (its constructor requires an integer rate ≥ 1/s).
+/// After the burst is spent, this bounds *sustained* failed logins for one account — and so its Argon2
+/// CPU cost — to ~1/s, layered under the per-source-IP connection cap (rmp #478) and the global
+/// connection cap. A *correct* credential never debits, so a legitimate client is never throttled by
+/// its own success.
 const LOGIN_THROTTLE_REFILL_PER_SEC: u32 = 1;
 
 /// `SecurityCatalog` directly (`security`) and resolve each Bearer check through it.
@@ -340,6 +358,7 @@ fn build_rest_router(
     context: AdminContext,
     catalog: Arc<DatabaseCatalog>,
     auth: Arc<dyn AuthProvider>,
+    auth_throttle: Arc<graphus_auth::AuthThrottle>,
     security: Arc<SecurityCatalog>,
     audit: Arc<AuditLog>,
     clock: Arc<dyn Clock + Send + Sync>,
@@ -381,12 +400,9 @@ fn build_rest_router(
         Arc::new(crate::engine::RestAuthObserver::new(Arc::clone(&audit)));
     // Enable the per-account failed-login throttle (rmp #458) on the `POST /auth/login` endpoint
     // (rmp #499): the bucket is consulted before the expensive Argon2 verification, blunting targeted
-    // online password-guessing and the per-account Argon2 CPU-exhaustion vector. The limits are
-    // compile-time non-zero, so construction cannot fail.
-    let auth_throttle = Arc::new(
-        graphus_auth::AuthThrottle::new(LOGIN_THROTTLE_MAX_FAILURES, LOGIN_THROTTLE_REFILL_PER_SEC)
-            .expect("INVARIANT: login throttle limits are compile-time non-zero"),
-    );
+    // online password-guessing and the per-account Argon2 CPU-exhaustion vector. This is the SAME
+    // `AuthThrottle` instance the Bolt `LOGON` loops consult (rmp #823, threaded in from `start_all`),
+    // so a spent failure budget for an account is enforced jointly across REST and Bolt.
     let api = router(
         AppState::new(rest_engine, auth, registry, Arc::clone(&clock))
             .with_auth_observer(observer)
