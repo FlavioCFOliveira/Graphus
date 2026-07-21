@@ -10,26 +10,27 @@
 //!
 //! # The social-network graph model
 //!
-//! A Label Property Graph modelling a population and its relationships:
+//! A near-**pure-topology** Label Property Graph modelling a population and its relationships: every
+//! node carries only its `id`, and the relationships carry no properties at all — the graph *is* its
+//! structure.
 //!
 //! | Node label | Key properties | Meaning |
 //! | --- | --- | --- |
-//! | `(:USER {id, name, registered})` | `id` (`u64`, globally unique), `registered` (`i64` Unix seconds) | a member |
-//! | `(:ARTICLE {id, name, registered})` | `id` (`u64`, globally unique), `registered` (`i64` Unix seconds) | a news item |
+//! | `(:USER {id})` | `id` (`u64`, globally unique) | a member |
+//! | `(:ARTICLE {id})` | `id` (`u64`, globally unique) | a news item |
 //!
 //! The `id` is a **`u64`** produced by a label-tagged bijective scramble (see [`Generator::entity_id`]),
 //! so distinct entities always get distinct ids and no `USER` id ever equals an `ARTICLE` id — the
 //! guarantee a `REQUIRE n.id IS UNIQUE` constraint needs. Every id stays in `[0, 2^63)`, so it
 //! round-trips losslessly as a signed 64-bit integer (the engine's `Value::Integer(i64)`, a PackStream
-//! `Integer`, and the bulk-import CSV `:long` column). Every timestamp property is an **`i64`** Unix
-//! second count.
+//! `Integer`, and the bulk-import CSV `:long` column).
 //!
-//! Two relationship types:
+//! Two relationship types, both property-less:
 //!
 //! | Relationship | Direction | Meaning |
 //! | --- | --- | --- |
-//! | `:FRIEND {since}` | `(:USER)-(:USER)` (undirected) | a friendship (`since`: `i64` Unix seconds); **multi-edges allowed** |
-//! | `:LIKE {date}` | `(:USER)->(:ARTICLE)` | the user liked the article (`date`: `i64` Unix seconds) |
+//! | `:FRIEND` | `(:USER)-(:USER)` (undirected) | a friendship; **multi-edges allowed** |
+//! | `:LIKE` | `(:USER)->(:ARTICLE)` | the user liked the article |
 //!
 //! ## The FRIEND multigraph: the configuration model
 //!
@@ -75,27 +76,11 @@ pub mod load;
 
 /// The read-query **battery** as parameterised Cypher, shared by the over-the-wire loader (smoke) and
 /// the concurrent ladder driver (`social_bench`). Pure text + metadata — no engine, no client deps —
-/// so it is available in every build. The same eight families the in-process `load` battery runs, but
-/// **parameterised** (`$u0`, `$u1`, `$term`, `$since`) so a driver reuses one plan-cache entry per
-/// family with the anchor varying per op.
+/// so it is available in every build. The five pure-**topology** families the in-process `load` battery
+/// runs, **parameterised** (`$u0`, `$u1`) so a driver reuses one plan-cache entry per family with the
+/// anchor varying per op. Every family reads only graph structure — there are no stored `name` / date
+/// properties to search in the minimal (near-pure-topology) model.
 pub mod battery {
-    /// The FULLTEXT headline index name the over-the-wire loader declares (best-effort) and the
-    /// `fulltext` family queries. Kept in sync with the in-process loader's `IDX_ARTICLE_HEADLINE_FT`.
-    pub const FULLTEXT_INDEX: &str = "article_headline_fulltext";
-
-    /// The `$since` cutoff the [`LIKE_RECENT`] family and the load-time `like_recent` probe use: the
-    /// start of the **last 10% of the modelled timeline** (~36 days).
-    ///
-    /// Every generated `LIKE.date` lies uniformly in `[EPOCH_S, EPOCH_S + REG_SPAN_S)`, so `date >=
-    /// LIKE_RECENT_SINCE` selects roughly the most-recent tenth of the like edges. The window is
-    /// deliberately **narrow** so the `LIKE.date` relationship-RANGE index SEEK (`RelIndexRangeSeek`,
-    /// which Graphus serves for range predicates since `rmp` #680) is genuinely SELECTIVE — it reads a
-    /// small fraction of the type, not the ~half a midpoint window would, so a real seek is
-    /// unambiguously cheaper than the whole-type scan the off-thread reader pool declines it to (`rmp`
-    /// #755). Every consumer (the concurrent driver, the over-the-wire loader, and the in-process
-    /// load-time validation) references this ONE constant so they all probe the identical slice.
-    pub const LIKE_RECENT_SINCE: i64 = (super::EPOCH_S + super::REG_SPAN_S * 9 / 10) as i64;
-
     /// The per-op parameter shape a [`Family`] needs, so a driver can build the right `$`-map.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Params {
@@ -105,13 +90,6 @@ pub mod battery {
         User,
         /// Two `USER` anchors `$u0`, `$u1` (mutual friends).
         UserPair,
-        /// A headline search `$term` (a stored-property `CONTAINS` scan).
-        Term,
-        /// A headline search `$term` fed to the FULLTEXT procedure (the driver lower-cases it to the
-        /// analyzer token).
-        FulltextTerm,
-        /// A `$since` timestamp for the recent-`LIKE` range scan.
-        Recent,
     }
 
     /// One read-battery family: a stable report name, its parameterised Cypher, whether it is an
@@ -151,11 +129,13 @@ pub mod battery {
         advanced: true,
         params: Params::UserPair,
     };
-    /// The top-5 most-liked articles (aggregation + `ORDER BY` + `LIMIT`) — a whole-`LIKE`-set scan.
+    /// The top-5 most-liked articles by `id` (aggregation + `ORDER BY` + `LIMIT`) — a whole-`LIKE`-set
+    /// scan. Returns `a.id` (there is no stored `name` in the minimal model); the `id` tie-break keeps
+    /// the ordering deterministic.
     pub const TOP_LIKED: Family = Family {
         name: "top_liked",
         cypher: "MATCH (:USER)-[:LIKE]->(a:ARTICLE) \
-                 RETURN a.name AS article, count(*) AS likes \
+                 RETURN a.id AS article, count(*) AS likes \
                  ORDER BY likes DESC, article ASC LIMIT 5",
         advanced: true,
         params: Params::None,
@@ -167,74 +147,28 @@ pub mod battery {
         advanced: false,
         params: Params::User,
     };
-    /// Headline substring search over `ARTICLE.name` (`CONTAINS`) — a TEXT-indexed / scan search.
-    pub const TEXT_CONTAINS: Family = Family {
-        name: "text_contains",
-        cypher: "MATCH (a:ARTICLE) WHERE a.name CONTAINS $term RETURN count(a) AS hits",
-        advanced: false,
-        params: Params::Term,
-    };
-    /// Recent-`LIKE` range scan (`WHERE l.date >= $since`) — the upper half of the like timeline.
-    pub const LIKE_RECENT: Family = Family {
-        name: "like_recent",
-        cypher: "MATCH ()-[l:LIKE]->(:ARTICLE) WHERE l.date >= $since RETURN count(l) AS hits",
-        advanced: false,
-        params: Params::Recent,
-    };
-    /// FULLTEXT headline word search via `db.index.fulltext.queryNodes` — version-fragile (needs the
-    /// FULLTEXT index; an older server that cannot declare it drops this family in the driver's
-    /// capability preflight).
-    pub const FULLTEXT: Family = Family {
-        name: "fulltext",
-        cypher: "CALL db.index.fulltext.queryNodes('article_headline_fulltext', $term) \
-                 YIELD node RETURN count(node) AS hits",
-        advanced: false,
-        params: Params::FulltextTerm,
-    };
 
-    /// The whole read battery, in report order: five traversal families then three search families.
-    pub const ALL: &[Family] = &[
-        FRIENDS,
-        FOF,
-        MUTUAL,
-        TOP_LIKED,
-        DEGREE,
-        TEXT_CONTAINS,
-        LIKE_RECENT,
-        FULLTEXT,
-    ];
+    /// The whole read battery, in report order: the five pure-topology families (no name/date search
+    /// families — the minimal model stores no such properties).
+    pub const ALL: &[Family] = &[FRIENDS, FOF, MUTUAL, TOP_LIKED, DEGREE];
 
-    // --- The WRITE shapes the concurrent read/write mix commits underneath the readers (rmp #714) ---
+    // --- The WRITE shape the concurrent read/write mix commits underneath the readers (rmp #714) -----
     //
-    // A production graph workload is a MIX: reads are served WHILE writes commit. These two shapes are
-    // the write stream `social_bench` drives, and they are deliberately different in their contention
-    // profile, because a realistic write stream is not uniform.
+    // A production graph workload is a MIX: reads are served WHILE writes commit. In the minimal
+    // (near-pure-topology) model there are no scalar properties to `SET`, so the write is a TOPOLOGICAL
+    // one — it appends a `:LIKE` edge, growing the graph. `social_bench` draws the common (random
+    // article) and hot (a small trending set) variants of it; the difference is only WHICH article the
+    // edge lands on, so both use this one statement.
 
-    /// The **common** write (the bulk of the stream): touch a *random* user's `registered` timestamp.
+    /// Append one `:LIKE` edge from user `$u` to article `$a` (both index-seeked by their unique `id`).
     ///
-    /// A single-anchor, index-seeked `SET`: a real durable write that participates in MVCC/SSI against
-    /// the concurrent readers, but that (landing on a random key out of hundreds of thousands) almost
-    /// never conflicts with another writer. Parameters: `$id`, `$ts`.
-    pub const WRITE_USER_TOUCH: &str = "MATCH (u:USER {id: $id}) SET u.registered = $ts";
-
-    /// The **hot** write (the minority): a **read-modify-write** of a *trending* article's counter —
-    /// `hot = coalesce(hot, 0) + 1` — over a deliberately **small** set of articles.
-    ///
-    /// This is the shape that lets SSI (and therefore the driver's retry path) fire at all.
-    /// [`WRITE_USER_TOUCH`] lands on a random user, so concurrent writers essentially never collide.
-    /// Two concurrent read-modify-writes of the *same* node, by contrast, are exactly the
-    /// rw-antidependency cycle SSI exists to break.
-    ///
-    /// **Measured, do not over-claim:** at the production-shaped default (2 writers, one unit every
-    /// 20 ms) the writers still rarely overlap on the same trending article, and the engine abort rate
-    /// comes out at a measured **~0**. The retry path is therefore *armed but idle* on a default run —
-    /// invariant I4 reports that plainly rather than implying SSI was stressed and found robust. Raise
-    /// `--writers` / lower `--write-every-ms` / lower `--hot-keys` to exercise it.
-    ///
-    /// Parameter: `$id` (an `:ARTICLE(id)` index seek — the conflict is on the *node version*, not on a
-    /// scan).
-    pub const WRITE_ARTICLE_HOT: &str =
-        "MATCH (a:ARTICLE {id: $id}) SET a.hot = coalesce(a.hot, 0) + 1";
+    /// A real durable write that participates in MVCC/SSI against the concurrent readers. On a **random**
+    /// `$a` it almost never collides with another writer; on a **hot** `$a` drawn from a deliberately
+    /// small trending set, two concurrent writers append a `:LIKE` to the SAME article — contending on
+    /// that article's relationship incidence chain, which is what can make SSI (and the driver's retry
+    /// path) fire. Parameters: `$u` (a `USER` id), `$a` (an `ARTICLE` id).
+    pub const WRITE_LIKE_CREATE: &str =
+        "MATCH (u:USER {id: $u}), (a:ARTICLE {id: $a}) CREATE (u)-[:LIKE]->(a)";
 }
 
 /// A tiny, fast, fully-deterministic PRNG (SplitMix64 — Steele, Lea & Flood 2014). Chosen because it
@@ -276,174 +210,11 @@ impl SplitMix64 {
     }
 }
 
-/// Epoch (seconds) the modelled timeline starts at — a fixed constant so timestamps are reproducible.
-/// `2024-01-01T00:00:00Z` in Unix seconds.
-pub const EPOCH_S: u64 = 1_704_067_200;
-
-/// One year in seconds — registration timestamps are spread across `[EPOCH_S, EPOCH_S + REG_SPAN_S)`.
-pub const REG_SPAN_S: u64 = 365 * 24 * 60 * 60;
-
 /// How many `CREATE`/`MATCH` clauses are packed into a single emitted statement. Batching keeps the
 /// per-statement parse/plan overhead amortised when the loader replays the stream, while staying
 /// small enough that any one statement is human-inspectable. A pure constant so the output is a pure
 /// function of the config.
 pub const BATCH: usize = 100;
-
-// --- Deterministic Portuguese-name fragment pools -----------------------------------------------
-//
-// Realistic European-Portuguese given names, middle/connective particles, and surnames, all valid
-// UTF-8 *including diacritics*. None contains a single-quote, so the assembled `name` can never break
-// a Cypher string literal; we still escape defensively at emit time. Names are assembled
-// deterministically from these pools so they "tend to contain real information" while remaining a
-// pure function of the seed.
-
-/// First (given) names.
-const FIRST_NAMES: &[&str] = &[
-    "José",
-    "António",
-    "Maria",
-    "Joana",
-    "Manuel",
-    "Ana",
-    "João",
-    "Francisco",
-    "Margarida",
-    "Rita",
-    "Tomás",
-    "Beatriz",
-    "Miguel",
-    "Inês",
-    "Rui",
-    "Sofia",
-    "Pedro",
-    "Catarina",
-    "Carlos",
-    "Mariana",
-    "Luís",
-    "Matilde",
-    "André",
-    "Leonor",
-    "Gonçalo",
-    "Carolina",
-    "Ricardo",
-    "Patrícia",
-    "Tiago",
-    "Helena",
-    "Fernando",
-    "Cristina",
-];
-
-/// Surnames (and surname components). Multiple may be chained with connective particles.
-const SURNAMES: &[&str] = &[
-    "Silva",
-    "Santos",
-    "Ferreira",
-    "Pereira",
-    "Oliveira",
-    "Costa",
-    "Rodrigues",
-    "Martins",
-    "Jesus",
-    "Sousa",
-    "Fernandes",
-    "Gonçalves",
-    "Gomes",
-    "Lopes",
-    "Marques",
-    "Almeida",
-    "Carvalho",
-    "Ribeiro",
-    "Pinto",
-    "Teixeira",
-    "Moreira",
-    "Correia",
-    "Mendes",
-    "Nunes",
-    "Soares",
-    "Vieira",
-    "Monteiro",
-    "Cardoso",
-    "Rocha",
-    "Antunes",
-    "Coelho",
-    "Cunha",
-];
-
-/// Connective particles used between surnames ("José da Silva e Carvalho").
-const PARTICLES: &[&str] = &["da", "de", "do", "dos", "das", "e"];
-
-// --- Deterministic news-headline fragment pools -------------------------------------------------
-//
-// Headline-style fragments assembled into article titles so they "tend to contain real information".
-// None contains a single-quote; we still escape defensively at emit time.
-
-/// Headline subjects.
-const HEAD_SUBJECT: &[&str] = &[
-    "Governo",
-    "Câmara Municipal",
-    "Universidade",
-    "Selecção Nacional",
-    "Banco Central",
-    "Ministério da Saúde",
-    "Comissão Europeia",
-    "Empresa tecnológica",
-    "Investigadores",
-    "Autarquia",
-    "Mercado imobiliário",
-    "Sector automóvel",
-    "Comunidade científica",
-    "Federação",
-    "Associação de moradores",
-];
-
-/// Headline verbs / actions.
-const HEAD_VERB: &[&str] = &[
-    "anuncia",
-    "aprova",
-    "investe em",
-    "lança",
-    "estuda",
-    "reforça",
-    "apresenta",
-    "regula",
-    "moderniza",
-    "expande",
-    "reduz",
-    "duplica",
-];
-
-/// Headline objects / topics.
-const HEAD_OBJECT: &[&str] = &[
-    "nova linha de metro",
-    "rede de energia renovável",
-    "programa de habitação acessível",
-    "plano de digitalização",
-    "centro de investigação",
-    "medidas de mobilidade urbana",
-    "apoio às pequenas empresas",
-    "infraestrutura de dados",
-    "estratégia para a saúde",
-    "rede de transportes públicos",
-    "projecto de reflorestação",
-    "incentivos à inovação",
-];
-
-/// Headline qualifiers / closers.
-const HEAD_TAIL: &[&str] = &[
-    "até 2030",
-    "na região norte",
-    "em todo o país",
-    "com fundos europeus",
-    "para o próximo ano",
-    "em parceria com privados",
-    "após meses de negociação",
-    "com impacto nacional",
-];
-
-/// The maximum number of bytes a `USER` name may occupy. The model contract guarantees names are
-/// valid UTF-8 (diacritics included) and at most this many bytes; the assembler truncates on a char
-/// boundary if a chained name would overshoot.
-pub const MAX_NAME_BYTES: usize = 64;
 
 /// How each user's target `FRIEND` degree (stub count) is drawn — the shape of the friendship graph.
 ///
@@ -705,11 +476,6 @@ impl Generator {
         (label_tag << Self::ID_LABEL_BIT) | scrambled
     }
 
-    /// Salt namespace for `USER` name / timestamp PRNG streams (independent of the id bijection).
-    const USER_SALT: u64 = 0x1111_1111_0000_0001;
-    /// Salt namespace for `ARTICLE` name / timestamp PRNG streams (independent of the id bijection).
-    const ARTICLE_SALT: u64 = 0x2222_2222_0000_0002;
-
     /// The stable, unique **`u64`** id of `USER` `i`.
     #[must_use]
     pub fn user_id(i: u64) -> u64 {
@@ -720,81 +486,6 @@ impl Generator {
     #[must_use]
     pub fn article_id(i: u64) -> u64 {
         Self::entity_id(Self::ARTICLE_TAG, i)
-    }
-
-    /// A deterministic, realistic Portuguese full name for `USER` `i`, valid UTF-8 (diacritics
-    /// included) and at most [`MAX_NAME_BYTES`] bytes. Assembled as a given name, one or two
-    /// surnames, optionally joined by a connective particle. Never contains a single-quote.
-    #[must_use]
-    pub fn user_name(seed: u64, i: u64) -> String {
-        let mut r = SplitMix64::new(seed ^ Self::USER_SALT ^ i.wrapping_mul(0xD1B5_4A32_D192_ED03));
-        let first = FIRST_NAMES[r.below(FIRST_NAMES.len() as u64) as usize];
-        let s1 = SURNAMES[r.below(SURNAMES.len() as u64) as usize];
-
-        let mut name = String::with_capacity(MAX_NAME_BYTES);
-        name.push_str(first);
-        name.push(' ');
-        name.push_str(s1);
-
-        // ~half the time, append a particle + a second surname ("da Silva e Carvalho").
-        if r.below(2) == 1 {
-            let particle = PARTICLES[r.below(PARTICLES.len() as u64) as usize];
-            let s2 = SURNAMES[r.below(SURNAMES.len() as u64) as usize];
-            // Only append if it stays within the byte budget.
-            let extra = 1 + particle.len() + 1 + s2.len();
-            if name.len() + extra <= MAX_NAME_BYTES {
-                name.push(' ');
-                name.push_str(particle);
-                name.push(' ');
-                name.push_str(s2);
-            }
-        }
-
-        truncate_on_char_boundary(name, MAX_NAME_BYTES)
-    }
-
-    /// A deterministic, headline-style article title for `ARTICLE` `i`. Assembled from the headline
-    /// fragment pools so it "tends to contain real information". Never contains a single-quote;
-    /// bounded in length by construction.
-    #[must_use]
-    pub fn article_name(seed: u64, i: u64) -> String {
-        let mut r = SplitMix64::new(seed ^ Self::ARTICLE_SALT ^ i.wrapping_mul(0xA0761D6478BD642F));
-        let subject = HEAD_SUBJECT[r.below(HEAD_SUBJECT.len() as u64) as usize];
-        let verb = HEAD_VERB[r.below(HEAD_VERB.len() as u64) as usize];
-        let object = HEAD_OBJECT[r.below(HEAD_OBJECT.len() as u64) as usize];
-        let tail = HEAD_TAIL[r.below(HEAD_TAIL.len() as u64) as usize];
-        format!("{subject} {verb} {object} {tail}")
-    }
-
-    /// A deterministic registration timestamp (**`i64`** Unix seconds) for entity `i` in `salt`'s
-    /// namespace, spread across the registration span. The value lies in `[EPOCH_S, EPOCH_S +
-    /// REG_SPAN_S)`, well within the positive `i64` range, so the `as i64` is exact.
-    fn registered_ts(seed: u64, salt: u64, i: u64) -> i64 {
-        let mut r = SplitMix64::new(seed ^ salt ^ i.wrapping_mul(0x2545_F491_4F6C_DD1D));
-        (EPOCH_S + r.below(REG_SPAN_S)) as i64
-    }
-
-    /// A deterministic `FRIEND` `since` timestamp (**`i64`** Unix seconds) for the ordered endpoint pair
-    /// `(a, b)`. Pure in `(seed, a, b)`, so it is byte-identical per seed. Shared by every `FRIEND`
-    /// emitter (the `emit_all` artifact, the streaming Cypher loader, and the CSV streamer) so all three
-    /// produce the identical timestamp for a given edge.
-    fn friend_since_ts(seed: u64, a: u64, b: u64) -> i64 {
-        let mut r = SplitMix64::new(
-            seed ^ 0xF111_0000_0000_0004
-                ^ a.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                ^ b.rotate_left(17),
-        );
-        (EPOCH_S + r.below(REG_SPAN_S)) as i64
-    }
-
-    /// A deterministic `LIKE` `date` timestamp (**`i64`** Unix seconds) for the `(user, article)` pair.
-    /// Pure in `(seed, u, art)`, and shared by every `LIKE` emitter (see
-    /// [`friend_since_ts`](Self::friend_since_ts)).
-    fn like_date_ts(seed: u64, u: u64, art: u64) -> i64 {
-        let mut r = SplitMix64::new(
-            seed ^ 0x11CE_0000_0000_0005 ^ u.wrapping_mul(0xA0761D6478BD642F) ^ art.rotate_left(23),
-        );
-        (EPOCH_S + r.below(REG_SPAN_S)) as i64
     }
 
     /// Builds the realised `FRIEND` multigraph via the configuration model, returning the list of
@@ -897,9 +588,9 @@ impl Generator {
     ///
     /// This is the *same* [`build_friend_edges`](Self::build_friend_edges) construction the
     /// [`stream_friend_csv`](Self::stream_friend_csv) bytes are built from — index-keyed and without the
-    /// id round-trip — so it is the ground truth for the read-result verifier (`rmp` #744). The friend
-    /// graph is never mutated by the example's write workload (the writers only `SET` scalar
-    /// properties), so this oracle stays valid for the whole run.
+    /// id round-trip — so it is the ground truth for the read-result verifier (`rmp` #744). The FRIEND
+    /// graph is never mutated by the example's write workload (the writers only append `:LIKE` edges,
+    /// never `:FRIEND` ones), so this friends/degree/mutual oracle stays valid for the whole run.
     #[must_use]
     pub fn friend_adjacency(&self) -> (Vec<u64>, Vec<Vec<u64>>) {
         let (edges, degree) = self.build_friend_edges();
@@ -1060,12 +751,7 @@ impl Generator {
         let mut batch = 0usize;
         for i in 0..self.cfg.users {
             let id = Self::user_id(i);
-            let name = escape_cypher(&Self::user_name(self.cfg.seed, i));
-            let reg = Self::registered_ts(self.cfg.seed, Self::USER_SALT, i);
-            let _ = write!(
-                out,
-                "CREATE (:USER {{id: {id}, name: '{name}', registered: {reg}}})"
-            );
+            let _ = write!(out, "CREATE (:USER {{id: {id}}})");
             batch += 1;
             if batch == BATCH || i + 1 == self.cfg.users {
                 out.push_str(";\n");
@@ -1080,12 +766,7 @@ impl Generator {
         let mut batch = 0usize;
         for i in 0..self.cfg.articles {
             let id = Self::article_id(i);
-            let name = escape_cypher(&Self::article_name(self.cfg.seed, i));
-            let reg = Self::registered_ts(self.cfg.seed, Self::ARTICLE_SALT, i);
-            let _ = write!(
-                out,
-                "CREATE (:ARTICLE {{id: {id}, name: '{name}', registered: {reg}}})"
-            );
+            let _ = write!(out, "CREATE (:ARTICLE {{id: {id}}})");
             batch += 1;
             if batch == BATCH || i + 1 == self.cfg.articles {
                 out.push_str(";\n");
@@ -1100,17 +781,16 @@ impl Generator {
         for &(a, b) in edges {
             let ida = Self::user_id(a);
             let idb = Self::user_id(b);
-            // Deterministic `since` timestamp keyed on the (ordered) endpoint pair.
-            let since = Self::friend_since_ts(self.cfg.seed, a, b);
             // ONE statement per edge (NOT many per statement): packing N `MATCH … CREATE` clauses
             // into one statement would either rebind the shared `a`/`b` variables (one edge per
             // batch) or form an N-way cartesian product. Stored DIRECTED `(a)->(b)` once per
             // friendship (Cypher `CREATE` requires a direction — the TCK's
             // `RequiresDirectedRelationship` rule); read back undirected (`-[:FRIEND]-`) so the
-            // symmetric semantics hold. The `id` anchors are unquoted `u64` integers.
+            // symmetric semantics hold. The `id` anchors are unquoted `u64` integers; the edge carries
+            // no properties (the near-pure-topology model).
             let _ = writeln!(
                 out,
-                "MATCH (a:USER {{id: {ida}}}), (b:USER {{id: {idb}}}) CREATE (a)-[:FRIEND {{since: {since}}}]->(b);"
+                "MATCH (a:USER {{id: {ida}}}), (b:USER {{id: {idb}}}) CREATE (a)-[:FRIEND]->(b);"
             );
         }
     }
@@ -1119,11 +799,10 @@ impl Generator {
         for &(u, art) in edges {
             let idu = Self::user_id(u);
             let ida = Self::article_id(art);
-            let date = Self::like_date_ts(self.cfg.seed, u, art);
-            // ONE statement per edge (see `emit_friend_edges`).
+            // ONE statement per edge (see `emit_friend_edges`); no edge properties.
             let _ = writeln!(
                 out,
-                "MATCH (u:USER {{id: {idu}}}), (a:ARTICLE {{id: {ida}}}) CREATE (u)-[:LIKE {{date: {date}}}]->(a);"
+                "MATCH (u:USER {{id: {idu}}}), (a:ARTICLE {{id: {ida}}}) CREATE (u)-[:LIKE]->(a);"
             );
         }
     }
@@ -1153,15 +832,10 @@ impl Generator {
         let mut batch = 0usize;
         for i in 0..self.cfg.users {
             let id = Self::user_id(i);
-            let name = escape_cypher(&Self::user_name(self.cfg.seed, i));
-            let reg = Self::registered_ts(self.cfg.seed, Self::USER_SALT, i);
             if batch > 0 {
                 buf.push('\n');
             }
-            let _ = write!(
-                buf,
-                "CREATE (:USER {{id: {id}, name: '{name}', registered: {reg}}})"
-            );
+            let _ = write!(buf, "CREATE (:USER {{id: {id}}})");
             batch += 1;
             if batch == BATCH || i + 1 == self.cfg.users {
                 sink(std::mem::take(&mut buf));
@@ -1177,15 +851,10 @@ impl Generator {
         let mut batch = 0usize;
         for i in 0..self.cfg.articles {
             let id = Self::article_id(i);
-            let name = escape_cypher(&Self::article_name(self.cfg.seed, i));
-            let reg = Self::registered_ts(self.cfg.seed, Self::ARTICLE_SALT, i);
             if batch > 0 {
                 buf.push('\n');
             }
-            let _ = write!(
-                buf,
-                "CREATE (:ARTICLE {{id: {id}, name: '{name}', registered: {reg}}})"
-            );
+            let _ = write!(buf, "CREATE (:ARTICLE {{id: {id}}})");
             batch += 1;
             if batch == BATCH || i + 1 == self.cfg.articles {
                 sink(std::mem::take(&mut buf));
@@ -1211,13 +880,13 @@ impl Generator {
         for &(a, b) in &edges {
             let ida = Self::user_id(a);
             let idb = Self::user_id(b);
-            let since = Self::friend_since_ts(self.cfg.seed, a, b);
             buf.clear();
             // Stored DIRECTED `(a)->(b)` once per friendship (Cypher `CREATE` requires a direction);
             // read back undirected (`-[:FRIEND]-`) to preserve the friendship's symmetric semantics.
+            // No edge properties (the near-pure-topology model).
             let _ = write!(
                 buf,
-                "MATCH (a:USER {{id: {ida}}}), (b:USER {{id: {idb}}}) CREATE (a)-[:FRIEND {{since: {since}}}]->(b)"
+                "MATCH (a:USER {{id: {ida}}}), (b:USER {{id: {idb}}}) CREATE (a)-[:FRIEND]->(b)"
             );
             sink(buf.clone());
         }
@@ -1235,11 +904,10 @@ impl Generator {
         for &(u, art) in &edges {
             let idu = Self::user_id(u);
             let ida = Self::article_id(art);
-            let date = Self::like_date_ts(self.cfg.seed, u, art);
             buf.clear();
             let _ = write!(
                 buf,
-                "MATCH (u:USER {{id: {idu}}}), (a:ARTICLE {{id: {ida}}}) CREATE (u)-[:LIKE {{date: {date}}}]->(a)"
+                "MATCH (u:USER {{id: {idu}}}), (a:ARTICLE {{id: {ida}}}) CREATE (u)-[:LIKE]->(a)"
             );
             sink(buf.clone());
         }
@@ -1268,66 +936,47 @@ impl Generator {
     // the `u64` id **twice**: once in the reserved `:ID` join-key column (a decimal string — the join
     // key is always textual, matched by `:START_ID`/`:END_ID`) and once in a stored, typed `id:long`
     // property column (the queryable `u64` value) — the standard neo4j-admin-import recipe for "join key
-    // that is also a queryable property".
+    // that is also a queryable property". In the minimal model `id` is the ONLY node property, and the
+    // relationships carry no properties at all.
 
-    /// The header row of the USER node CSV: `:ID` join key + `:LABEL` + a stored `id:long` property +
-    /// `name` + `registered`.
-    pub const USER_CSV_HEADER: &'static str = ":ID,:LABEL,id:long,name:string,registered:long\n";
+    /// The header row of the USER node CSV: `:ID` join key + `:LABEL` + a stored `id:long` property.
+    pub const USER_CSV_HEADER: &'static str = ":ID,:LABEL,id:long\n";
     /// The header row of the ARTICLE node CSV (same shape as users).
-    pub const ARTICLE_CSV_HEADER: &'static str = ":ID,:LABEL,id:long,name:string,registered:long\n";
-    /// The header row of the FRIEND relationship CSV.
-    pub const FRIEND_CSV_HEADER: &'static str = ":START_ID,:END_ID,:TYPE,since:long\n";
-    /// The header row of the LIKE relationship CSV.
-    pub const LIKE_CSV_HEADER: &'static str = ":START_ID,:END_ID,:TYPE,date:long\n";
+    pub const ARTICLE_CSV_HEADER: &'static str = ":ID,:LABEL,id:long\n";
+    /// The header row of the FRIEND relationship CSV (no properties).
+    pub const FRIEND_CSV_HEADER: &'static str = ":START_ID,:END_ID,:TYPE\n";
+    /// The header row of the LIKE relationship CSV (no properties).
+    pub const LIKE_CSV_HEADER: &'static str = ":START_ID,:END_ID,:TYPE\n";
 
     /// Streams the USER node CSV to `sink`, one chunk at a time: the header chunk first, then chunks of
-    /// up to [`BATCH`] data rows. Each row is `<id>,USER,<name>,<registered>`. No edge list is built;
-    /// peak memory is one chunk.
+    /// up to [`BATCH`] data rows. Each row is `<id>,USER,<id>`. No edge list is built; peak memory is one
+    /// chunk.
     pub fn stream_user_csv<F: FnMut(Vec<u8>)>(&self, mut sink: F) {
         sink(Self::USER_CSV_HEADER.as_bytes().to_vec());
-        self.stream_node_csv_rows(
-            self.cfg.users,
-            Self::USER_TAG,
-            Self::USER_SALT,
-            "USER",
-            &Self::user_name,
-            &mut sink,
-        );
+        self.stream_node_csv_rows(self.cfg.users, Self::USER_TAG, "USER", &mut sink);
     }
 
     /// Streams the ARTICLE node CSV to `sink` (see [`stream_user_csv`](Self::stream_user_csv)).
     pub fn stream_article_csv<F: FnMut(Vec<u8>)>(&self, mut sink: F) {
         sink(Self::ARTICLE_CSV_HEADER.as_bytes().to_vec());
-        self.stream_node_csv_rows(
-            self.cfg.articles,
-            Self::ARTICLE_TAG,
-            Self::ARTICLE_SALT,
-            "ARTICLE",
-            &Self::article_name,
-            &mut sink,
-        );
+        self.stream_node_csv_rows(self.cfg.articles, Self::ARTICLE_TAG, "ARTICLE", &mut sink);
     }
 
-    /// Shared node-CSV row streamer: emits `count` rows of `<id>,<label>,<id>,<name>,<registered>` in
-    /// [`BATCH`]-row chunks, deterministic in index order. `label_tag` keys the id bijection and `salt`
-    /// keys the name/timestamp PRNG streams; `name_fn` produces the per-index name.
+    /// Shared node-CSV row streamer: emits `count` rows of `<id>,<label>,<id>` in [`BATCH`]-row chunks,
+    /// deterministic in index order. `label_tag` keys the id bijection.
     fn stream_node_csv_rows<F: FnMut(Vec<u8>)>(
         &self,
         count: u64,
         label_tag: u64,
-        salt: u64,
         label: &str,
-        name_fn: &dyn Fn(u64, u64) -> String,
         sink: &mut F,
     ) {
         let mut buf = String::new();
         let mut in_chunk = 0usize;
         for i in 0..count {
             let id = Self::entity_id(label_tag, i);
-            let name = escape_csv(&name_fn(self.cfg.seed, i));
-            let reg = Self::registered_ts(self.cfg.seed, salt, i);
             // `id` appears twice: the `:ID` join key (col 0) and the stored `id:long` property (col 2).
-            let _ = writeln!(buf, "{id},{label},{id},{name},{reg}");
+            let _ = writeln!(buf, "{id},{label},{id}");
             in_chunk += 1;
             if in_chunk == BATCH || i + 1 == count {
                 sink(std::mem::take(&mut buf).into_bytes());
@@ -1337,8 +986,8 @@ impl Generator {
     }
 
     /// Streams the FRIEND relationship CSV to `sink`: the header chunk, then chunks of up to [`BATCH`]
-    /// rows `<start_id>,<end_id>,FRIEND,<since>`. Each unordered friendship is emitted **once** (stored
-    /// directed; read back undirected in queries). Returns the number of FRIEND edges emitted
+    /// rows `<start_id>,<end_id>,FRIEND`. Each unordered friendship is emitted **once** (stored directed;
+    /// read back undirected in queries). Returns the number of FRIEND edges emitted
     /// (== [`Summary::friend_edges`]). The (linear-size) edge list is built once; the text streams a
     /// chunk at a time.
     pub fn stream_friend_csv<F: FnMut(Vec<u8>)>(&self, mut sink: F) -> u64 {
@@ -1351,8 +1000,7 @@ impl Generator {
         for (k, &(a, b)) in edges.iter().enumerate() {
             let ida = Self::user_id(a);
             let idb = Self::user_id(b);
-            let since = Self::friend_since_ts(self.cfg.seed, a, b);
-            let _ = writeln!(buf, "{ida},{idb},FRIEND,{since}");
+            let _ = writeln!(buf, "{ida},{idb},FRIEND");
             in_chunk += 1;
             if in_chunk == BATCH || k + 1 == n {
                 sink(std::mem::take(&mut buf).into_bytes());
@@ -1363,7 +1011,7 @@ impl Generator {
     }
 
     /// Streams the LIKE relationship CSV to `sink`: the header chunk, then chunks of up to [`BATCH`]
-    /// rows `<user_id>,<article_id>,LIKE,<date>`. Returns the number of LIKE edges emitted
+    /// rows `<user_id>,<article_id>,LIKE`. Returns the number of LIKE edges emitted
     /// (== [`Summary::like_edges`]).
     pub fn stream_like_csv<F: FnMut(Vec<u8>)>(&self, mut sink: F) -> u64 {
         sink(Self::LIKE_CSV_HEADER.as_bytes().to_vec());
@@ -1375,8 +1023,7 @@ impl Generator {
         for (k, &(u, art)) in edges.iter().enumerate() {
             let idu = Self::user_id(u);
             let ida = Self::article_id(art);
-            let date = Self::like_date_ts(self.cfg.seed, u, art);
-            let _ = writeln!(buf, "{idu},{ida},LIKE,{date}");
+            let _ = writeln!(buf, "{idu},{ida},LIKE");
             in_chunk += 1;
             if in_chunk == BATCH || k + 1 == n {
                 sink(std::mem::take(&mut buf).into_bytes());
@@ -1406,48 +1053,6 @@ impl Generator {
     pub fn degree_histogram(&self) -> Vec<(u64, u64)> {
         let (_edges, degree) = self.build_friend_edges();
         degree_histogram_of(&degree)
-    }
-
-    /// The dominant single-word, ASCII, diacritic-free headline **subject** term for this config, with
-    /// the number of `ARTICLE`s whose `name` contains it — the ground truth the `text_contains` /
-    /// `fulltext` search probes assert against (a term the engine never produced). Hermetic: a pure
-    /// function of `(seed, articles)`, so both the in-process loader and the over-the-wire driver pick
-    /// the identical term. See [`Generator::dominant_headline_term_for`].
-    #[must_use]
-    pub fn dominant_headline_term(&self) -> (String, u64) {
-        Self::dominant_headline_term_for(self.cfg.seed, self.cfg.articles)
-    }
-
-    /// The dominant headline term for an explicit `(seed, articles)` — the associated-function form so
-    /// a driver that only knows the seed and article count (not a full [`Generator`]) can compute the
-    /// same term. Scans the single-word ASCII subjects and returns the most frequent one with its hit
-    /// count (ties broken by pool order). Returns `("Governo", 0)` for an empty catalogue.
-    #[must_use]
-    pub fn dominant_headline_term_for(seed: u64, articles: u64) -> (String, u64) {
-        // Single-word, ASCII-only subjects (or ASCII leading words of multi-word subjects) from the
-        // `HEAD_SUBJECT` pool — each unique to its subject and free of diacritics, so "articles whose
-        // name CONTAINS the word" and "articles the FULLTEXT index returns for its lower-cased token"
-        // are the same set.
-        const ASCII_SUBJECTS: &[&str] = &[
-            "Governo",
-            "Universidade",
-            "Banco",
-            "Empresa",
-            "Investigadores",
-            "Autarquia",
-            "Mercado",
-            "Sector",
-        ];
-        let mut best = (ASCII_SUBJECTS[0].to_owned(), 0u64);
-        for &word in ASCII_SUBJECTS {
-            let count = (0..articles)
-                .filter(|&i| Self::article_name(seed, i).contains(word))
-                .count() as u64;
-            if count > best.1 {
-                best = (word.to_owned(), count);
-            }
-        }
-        best
     }
 
     /// A machine-readable one-line summary of the run's realised shape (the `social_gen` binary
@@ -1656,59 +1261,6 @@ pub fn is_hub_degree(degree: u64, degree_max: u64, generous_floor: u64) -> bool 
     degree >= hub_degree_floor(degree_max, generous_floor)
 }
 
-/// Truncates a `String` to at most `max_bytes`, never splitting a UTF-8 char. Cheap when already
-/// within budget (the common path).
-fn truncate_on_char_boundary(mut s: String, max_bytes: usize) -> String {
-    if s.len() <= max_bytes {
-        return s;
-    }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    s.truncate(end);
-    s
-}
-
-/// Defensively escapes a string for inclusion inside a single-quoted Cypher string literal. Our name
-/// and title pools never contain single-quotes or backslashes, but we escape both to guarantee the
-/// emitted Cypher is always well-formed regardless of the pools.
-fn escape_cypher(s: &str) -> String {
-    if !s.contains('\'') && !s.contains('\\') {
-        return s.to_owned();
-    }
-    let mut out = String::with_capacity(s.len() + 4);
-    for c in s.chars() {
-        match c {
-            '\'' => out.push_str("\\'"),
-            '\\' => out.push_str("\\\\"),
-            other => out.push(other),
-        }
-    }
-    out
-}
-
-/// Defensively escapes a string for inclusion as one field of a comma-delimited CSV row (RFC 4180):
-/// a field containing a comma, a double-quote, or a newline is wrapped in double-quotes with each
-/// embedded double-quote doubled. Our name and title pools contain none of these, so the common path
-/// returns the input untouched (and the stream stays byte-identical per seed); we still escape so the
-/// emitted CSV is always well-formed regardless of the pools.
-fn escape_csv(s: &str) -> String {
-    if !s.contains(',') && !s.contains('"') && !s.contains('\n') && !s.contains('\r') {
-        return s.to_owned();
-    }
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        if c == '"' {
-            out.push('"');
-        }
-        out.push(c);
-    }
-    out.push('"');
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1796,19 +1348,6 @@ mod tests {
     }
 
     #[test]
-    fn user_names_are_bounded_utf8() {
-        for i in 0..500 {
-            let name = Generator::user_name(cfg().seed, i);
-            assert!(name.len() <= MAX_NAME_BYTES, "name too long: {name:?}");
-            assert!(!name.is_empty());
-            assert!(
-                !name.contains('\''),
-                "name must not contain a quote: {name}"
-            );
-        }
-    }
-
-    #[test]
     fn summary_counts_match_emitted() {
         let g = Generator::new(cfg());
         let s = g.summary();
@@ -1893,45 +1432,20 @@ mod tests {
         assert_eq!(friend_total, s.friend_edges, "FRIEND stream return");
         assert_eq!(like_total, s.like_edges, "LIKE stream return");
 
-        // The headers are exactly the importer-flavoured schema.
-        assert!(users_csv.starts_with(":ID,:LABEL,id:long,name:string,registered:long\n"));
-        assert!(friend_csv.starts_with(":START_ID,:END_ID,:TYPE,since:long\n"));
+        // The headers are exactly the importer-flavoured schema (id-only nodes, property-less rels).
+        assert!(users_csv.starts_with(":ID,:LABEL,id:long\n"));
+        assert!(friend_csv.starts_with(":START_ID,:END_ID,:TYPE\n"));
         // Every USER data row carries the USER label in the :LABEL column, and the :ID join key (col 0)
         // equals the stored `id` property (col 2) — the join-key-as-property recipe.
         for line in users_csv.lines().skip(1) {
             let cols: Vec<&str> = line.split(',').collect();
-            assert_eq!(cols.len(), 5, "USER row has 5 columns: {line}");
+            assert_eq!(cols.len(), 3, "USER row has 3 columns: {line}");
             assert_eq!(cols[1], "USER", "USER :LABEL column: {line}");
             assert_eq!(
                 cols[0], cols[2],
                 "ID join key == stored id property: {line}"
             );
         }
-    }
-
-    #[test]
-    fn article_titles_have_no_quotes() {
-        for i in 0..100 {
-            let t = Generator::article_name(cfg().seed, i);
-            assert!(!t.contains('\''), "title must not contain a quote: {t}");
-            assert!(!t.is_empty());
-        }
-    }
-
-    /// The `like_recent` window (`rmp` #746) must be the LAST tenth of the timeline — narrow enough that
-    /// the `LIKE.date` rel-RANGE seek is genuinely selective, not the ~half a midpoint window would read.
-    #[test]
-    fn like_recent_since_is_the_last_tenth_of_the_timeline() {
-        let span = REG_SPAN_S as i64;
-        let offset = battery::LIKE_RECENT_SINCE - EPOCH_S as i64;
-        assert_eq!(offset, span * 9 / 10, "cutoff is at 90% of the span");
-        // It sits strictly inside the timeline, so `0 < recent < |LIKE|` always holds.
-        assert!(offset > 0 && offset < span, "cutoff is strictly interior");
-        // A midpoint window would read ~half; this reads ~a tenth — materially more selective.
-        assert!(
-            offset > span / 2,
-            "the window is narrower than a midpoint window"
-        );
     }
 
     /// `ZipfRanks` with `exponent == 0` is (near-)uniform: over many draws every rank is hit and the

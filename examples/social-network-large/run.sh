@@ -2,22 +2,20 @@
 #
 # Graphus large-scale social-graph demonstration — OVER-THE-WIRE concurrent read scaling.
 #
-# The model (a multigraph LPG): a social network of (:USER {id, name, registered}) befriended by an
-# UNDIRECTED multigraph (:USER)-[:FRIEND {since}]-(:USER), a corpus of (:ARTICLE {id, name,
-# registered}) carrying realistic Portuguese headlines, and directed (:USER)-[:LIKE {date}]->(:ARTICLE)
-# edges. Every `id` is a globally-unique u64 (a label-tagged bijective scramble, so USER and ARTICLE id
-# spaces never collide) enforced by a `REQUIRE n.id IS UNIQUE` constraint whose backing index also serves
-# the `MATCH (:USER {id: <int>})` point-seek; every timestamp (registered / since / date) is an i64 Unix
-# second count. The FRIEND degree is a configuration model — a power law (Zipf) that produces SUPERNODES
-# by DEFAULT (a real large social graph is scale-free), or the simpler uniform band via
-# SOCIAL_DEGREE_DIST=uniform.
+# The model (a near-PURE-TOPOLOGY multigraph LPG): a social network of (:USER {id}) befriended by an
+# UNDIRECTED multigraph (:USER)-[:FRIEND]-(:USER), a corpus of (:ARTICLE {id}), and directed
+# (:USER)-[:LIKE]->(:ARTICLE) edges. Every node carries ONLY its `id` and the relationships carry NO
+# properties — the graph IS its structure. Every `id` is a globally-unique u64 (a label-tagged bijective
+# scramble, so USER and ARTICLE id spaces never collide) enforced by a `REQUIRE n.id IS UNIQUE` constraint
+# whose backing index also serves the `MATCH (:USER {id: <int>})` point-seek. The FRIEND degree is a
+# configuration model — a power law (Zipf) that produces SUPERNODES by DEFAULT (a real large social graph
+# is scale-free), or the simpler uniform band via SOCIAL_DEGREE_DIST=uniform.
 #
-# THE HEADLINE (rmp #691): the 8-query read battery (direct friends, friend-of-friend, mutual friends,
-# top-liked articles, degree, headline TEXT search, recent-LIKE range, FULLTEXT headline search) is
-# driven OVER THE WIRE by a concurrency ladder of C Bolt clients while the CO-LOCATED SERVER PROCESS is
-# sampled from /proc — so the report shows whether reads SCALE ACROSS CORES (the off-thread reader pool)
-# or hit a single-thread ceiling. This corrects the previous in-process battery, whose ~1-core figure
-# was a DRIVER artifact (it bypassed the server's reader pool entirely).
+# THE HEADLINE (rmp #691): the 5-query pure-topology read battery (direct friends, friend-of-friend,
+# mutual friends, top-liked articles, degree) is driven OVER THE WIRE by a concurrency ladder of C Bolt
+# clients while the CO-LOCATED SERVER PROCESS is sampled from /proc — so the report shows whether reads
+# SCALE ACROSS CORES (the off-thread reader pool) or hit a single-thread ceiling. This corrects the
+# previous in-process battery, whose ~1-core figure was a DRIVER artifact (it bypassed the reader pool).
 #
 # It runs in TWO modes (auto-detected via the shared external-target seam in `_harness/harness.sh`):
 #
@@ -31,9 +29,9 @@
 #   EXTERNAL (attach) — when ANY of GRAPHUS_TARGET_{BOLT,REST,UDS} is set, attaches to an
 #                       ALREADY-RUNNING instance (local OR remote) over Bolt-over-TCP + TLS.
 #                       It carves out a dedicated, isolated database, loads a SMALL graph over Bolt with
-#                       a version-tolerant schema (an older server may lack the modern FULLTEXT/TEXT
-#                       DDL — the driver's capability preflight drops any family the target cannot
-#                       serve), scrapes the target's `/metrics` before + after the ladder, drives the
+#                       a version-tolerant schema (an older server may lack node-uniqueness DDL — the id
+#                       seek then falls back to a scan, still correct), scrapes the target's `/metrics`
+#                       before + after the ladder, drives the
 #                       SAME read ladder over Bolt-TCP+TLS (/proc sampling OFF — the server-side channel
 #                       is /metrics), emits an EXTERNAL-mode report via `measure_target`, and DROPS the
 #                       isolated database on exit.
@@ -75,10 +73,15 @@
 #     GRAPHUS_TARGET_USER=graphus GRAPHUS_TARGET_PASSWORD=graphus-local \
 #     GRAPHUS_TARGET_TLS_INSECURE=1  examples/social-network-large/run.sh  # attach to a running instance
 #
+# The write MIX is TOPOLOGICAL: each write appends a (:USER)-[:LIKE]->(:ARTICLE) edge (the minimal model
+# has no scalar properties to SET), growing the graph during the run (bounded per run). The hot fraction
+# targets a small TRENDING article set, so concurrent hot writers append LIKEs to the SAME article and
+# contend on its incidence chain — the shape that lets SSI fire.
+#
 # Mix knobs (both modes, all optional): SOCIAL_WRITERS (default 2), SOCIAL_WRITE_EVERY_MS (default 20),
-# SOCIAL_HOT_WRITE_FRACTION (default 0.25 — the share of writes that read-modify-write a TRENDING
-# article; this is the shape that lets SSI fire, but MEASURED at the default rate the engine abort rate
-# is ~0, so the retry path is armed-but-idle — raise the writers / lower the pacing to exercise it), SOCIAL_HOT_KEYS (default
+# SOCIAL_HOT_WRITE_FRACTION (default 0.25 — the share of writes that append a LIKE to a TRENDING article;
+# this is the shape that lets SSI fire, but MEASURED at the default rate the engine abort rate is ~0, so
+# the retry path is armed-but-idle — raise the writers / lower the pacing to exercise it), SOCIAL_HOT_KEYS (default
 # 4), SOCIAL_MIX_BASELINE (default 1 — run the readonly CONTROL arm so the cost of the mix is
 # measurable), SOCIAL_RETRY_BUDGET_MS (default 15000), SOCIAL_PROBE_SECS (default 3 — the
 # slow-reader/GC-pin probe).
@@ -86,8 +89,6 @@
 # SOCIAL_ANCHOR_SKEW (rmp #746): the Zipf exponent used to bias read anchors toward the generated
 # SUPERNODE tail (default 2 in zipf mode, 0 = uniform anchors otherwise). It only engages on a power-law
 # graph with the oracle reconstructed; the driver asserts (I9) that a read actually landed on a hub.
-# The `like_recent` family SEEKS the LIKE.date rel-RANGE index in an explicit read transaction, and the
-# driver PROFILE-proves that seek at runtime (I8), emitting a GRAPHUS_SOCIAL_INDEX_PROOF sentinel.
 #
 # Requirements: a Unix host, bash, curl. LOCAL mode's /proc server sampling is Linux-specific (the run
 # still works on macOS but the CPU/RSS server evidence is skipped there). No node / openssl needed.
@@ -183,8 +184,8 @@ MIX_FLAGS=(
   --probe-secs "$PROBE_SECS"
 )
 if [ "$WRITERS" -gt 0 ]; then
-  info_mix="read/write MIX ON — ${WRITERS} writer(s), one business unit every ${WRITE_EVERY_MS}ms, \
-${HOT_WRITE_FRACTION} of them a read-modify-write of ${HOT_KEYS} trending article(s)"
+  info_mix="read/write MIX ON — ${WRITERS} writer(s), one :LIKE-append business unit every ${WRITE_EVERY_MS}ms, \
+${HOT_WRITE_FRACTION} of them onto ${HOT_KEYS} trending article(s)"
 else
   info_mix="read/write mix OFF (SOCIAL_WRITERS=0) — a pure read ladder against a FROZEN graph"
 fi
@@ -452,13 +453,9 @@ if [ "$MODE" = external ]; then
   BENCH_STATUS="${PIPESTATUS[0]}"
   set -e
   LADDER_MS=$(( $(_harness_now_ms) - LADDER_START_MS ))
-  # The driver exits non-zero when a concurrency INVARIANT was violated (I1..I9) or the reader error
+  # The driver exits non-zero when a concurrency INVARIANT was violated (I1..I7, I9) or the reader error
   # rate breached its threshold. That is the whole point of asserting them, so it must fail the run.
-  assert "every concurrency invariant held (I1..I9, incl. read-result correctness, the like_recent index-seek proof, and the anchor-skew hub hit)" "0" "$BENCH_STATUS"
-  # I8 (rmp #746): the like_recent rel-RANGE index-seek proof must have RUN — its sentinel is emitted in
-  # every path. Herestring (never `printf | grep -q` under pipefail — a broken pipe would mask a miss).
-  assert "the LIKE.date rel-RANGE index-seek proof ran (I8 sentinel emitted)" "yes" \
-    "$(grep -q 'GRAPHUS_SOCIAL_INDEX_PROOF' "$BENCH_LOG" && echo yes || echo no)"
+  assert "every concurrency invariant held (I1..I7, I9, incl. read-result correctness and the anchor-skew hub hit)" "0" "$BENCH_STATUS"
 
   harness_scrape_metrics "$METRICS_AFTER" || info "metrics-after scrape failed (non-fatal)"
   assert "/metrics scraped after the ladder" "yes" "$([ -s "$METRICS_AFTER" ] && echo yes || echo no)"
@@ -607,18 +604,9 @@ else
   BENCH_STATUS=$?
   set -e
   printf '%s\n' "$BENCH_OUT" | sed 's/^/  /'
-  # The driver exits non-zero when a concurrency INVARIANT was violated (I1..I9) or the reader error
+  # The driver exits non-zero when a concurrency INVARIANT was violated (I1..I7, I9) or the reader error
   # rate breached its threshold. Swallowing that status (as this did) makes the assertions decorative.
-  assert "every concurrency invariant held (I1..I9, incl. read-result correctness, the like_recent index-seek proof, and the anchor-skew hub hit)" "0" "$BENCH_STATUS"
-  # I8 (rmp #746): the like_recent rel-RANGE index-seek proof must have RUN — its sentinel is emitted in
-  # every path. Herestring (never `printf | grep -q` under pipefail — a broken pipe would mask a miss).
-  assert "the LIKE.date rel-RANGE index-seek proof ran (I8 sentinel emitted)" "yes" \
-    "$(grep -q 'GRAPHUS_SOCIAL_INDEX_PROOF' <<<"$BENCH_OUT" && echo yes || echo no)"
-  # LOCAL mode declares the full schema, so the proof MUST have really MEASURED a seek. The emptiness
-  # check above cannot tell a real proof from `rel_range_op=skipped` / `=error`, both of which emit the
-  # sentinel and would pass a vacuous green. Only the ATTACH path may legitimately skip.
-  assert "the rel-RANGE proof MEASURED a seek (not skipped/errored)" "yes" \
-    "$(grep -q 'rel_range_op=RelIndexRangeSeek' <<<"$BENCH_OUT" && echo yes || echo no)"
+  assert "every concurrency invariant held (I1..I7, I9, incl. read-result correctness and the anchor-skew hub hit)" "0" "$BENCH_STATUS"
   assert "evidence report.json was produced" "yes" \
     "$([ -f "$EVIDENCE_DIR/report.json" ] && echo yes || echo no)"
   assert "evidence report.md was produced" "yes" \

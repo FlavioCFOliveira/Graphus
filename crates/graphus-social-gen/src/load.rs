@@ -68,8 +68,8 @@ use graphus_bulk::{BulkImporter, DEFAULT_BATCH_SIZE};
 use graphus_core::{TxnId, Value};
 use graphus_cypher::coordinator::TxnCoordinator;
 use graphus_cypher::{
-    Analyzer, ConstraintInfo, ConstraintKind, FulltextEntity, IndexCatalog, Parameters, Row,
-    RowValue, analyze, bind_parameters, execute, lower, parse_tokens, plan_physical, tokenize,
+    ConstraintInfo, ConstraintKind, FulltextEntity, IndexCatalog, Parameters, Row, RowValue,
+    analyze, bind_parameters, execute, lower, parse_tokens, plan_physical, tokenize,
 };
 use graphus_io::FileBlockDevice;
 use graphus_storage::{IndexState, RecordStore};
@@ -92,13 +92,14 @@ const POOL_PAGES: usize = 4_096;
 /// The element-id seed handed to [`RecordStore::create`] (the production default the server uses).
 const ELEMENT_ID_SEED: u128 = 1;
 
-// --- Search-schema object names (the DDL this loader declares) -----------------------------------
+// --- Schema object names (the DDL this loader declares) ------------------------------------------
 //
-// These are the exact names a Bolt/REST operator would pass to `CREATE … INDEX <name> …` /
-// `CREATE CONSTRAINT <name> …`; the hermetic `graphus-server/tests/social_network_large_schema.rs`
+// The minimal (near-pure-topology) model declares ONLY the two id uniqueness constraints: there are no
+// stored `name` / date properties left to index. These are the exact names a Bolt/REST operator would
+// pass to `CREATE CONSTRAINT <name> …`; the hermetic `graphus-server/tests/social_network_large_schema.rs`
 // drives the *string* DDL forms carrying these same names through `parse_admin_statement` →
-// `LocalEngine::{index_ddl, constraint_ddl}`, so a drift between the typed seam this loader uses and
-// the string admin grammar would fail that test.
+// `LocalEngine::constraint_ddl`, so a drift between the typed seam this loader uses and the string admin
+// grammar would fail that test.
 
 /// Node **uniqueness** constraint on `USER.id` — enforces the globally-unique member identity AND, via
 /// its backing node-property index, serves the friendship-traversal `(:USER {id})` anchor point-seek.
@@ -106,21 +107,6 @@ const CONS_USER_ID_UNIQUE: &str = "user_id_unique";
 /// Node **uniqueness** constraint on `ARTICLE.id` — enforces the globally-unique article identity AND
 /// backs the like-traversal `(:ARTICLE {id})` anchor point-seek.
 const CONS_ARTICLE_ID_UNIQUE: &str = "article_id_unique";
-/// `TEXT` (trigram) index on `ARTICLE.name` — accelerates `CONTAINS` / `STARTS WITH` / `ENDS WITH`
-/// headline substring search.
-const IDX_ARTICLE_NAME_TEXT: &str = "article_name_text";
-/// `FULLTEXT` (analyzer-tokenized) index on `ARTICLE.name` — the headline word search queried by
-/// `db.index.fulltext.queryNodes`.
-const IDX_ARTICLE_HEADLINE_FT: &str = "article_headline_fulltext";
-/// Relationship `RANGE` index on `LIKE.date` — the like-timestamp index. Since `rmp` #680 the
-/// relationship RANGE index serves a `date` *range* predicate as a `RelIndexRangeSeek` (not just
-/// equality), so the `like_recent` recent-window query SEEKS it rather than scanning the type.
-const IDX_LIKE_DATE: &str = "like_date_range";
-/// Composite node `RANGE` index on `ARTICLE(registered, id)` — time-ordered catalogue reads (leading
-/// `registered` equality seek + trailing `id` residual).
-const IDX_ARTICLE_CATALOG: &str = "article_catalog_composite";
-/// Node existence constraint: every `ARTICLE` must carry a `name` (the searchable headline).
-const CONS_ARTICLE_NAME_EXISTS: &str = "article_name_exists";
 
 /// The two **always-on** token-lookup index names Graphus surfaces from `SHOW INDEXES` (they back
 /// every label / relationship-type scan and are never created explicitly). Named here so the loader's
@@ -265,13 +251,6 @@ pub struct LoadOutcome {
     /// The `SHOW CONSTRAINTS`-style listing captured after the schema was declared. Empty when
     /// `schema_applied` is `false`.
     pub constraints: Vec<ConstraintListing>,
-    /// The headline term the TEXT / FULLTEXT search probes searched for — the single-token subject word
-    /// that appears in the most `ARTICLE` headlines (deterministic; empty when no schema was applied).
-    pub search_term: String,
-    /// The number of `ARTICLE`s whose headline contains [`search_term`](Self::search_term), derived
-    /// **from the generator** (the ground truth the TEXT `CONTAINS` and FULLTEXT `queryNodes` probes
-    /// must both return). `0` when no schema was applied.
-    pub search_expected: u64,
     /// The read-query battery's measured samples, in run order.
     pub queries: Vec<QuerySample>,
 }
@@ -549,24 +528,23 @@ pub fn run_load(cfg: &GenConfig, dir: &Path, opts: LoadOpts) -> LoadOutcome {
     // --- Build a coordinator over the SAME store (no reopen) for the index build + read battery. --
     let mut coord = TxnCoordinator::new(store);
 
-    // --- Schema build (indexes + constraint via the typed coordinator seam, online over loaded data).
-    // These are the exact methods the server's Bolt/REST admin surface dispatches to after parsing the
-    // equivalent `CREATE … INDEX` / `CREATE CONSTRAINT` statement; the hermetic
-    // `graphus-server/tests/social_network_large_schema.rs` drives those *string* DDL forms (carrying
-    // the same object names) through `parse_admin_statement` → `LocalEngine::{index_ddl, constraint_ddl}`
-    // and asserts the identical schema, so a drift between the two seams would fail there.
+    // --- Schema build (the id uniqueness constraints via the typed coordinator seam, online over the
+    // loaded data). These are the exact methods the server's Bolt/REST admin surface dispatches to after
+    // parsing the equivalent `CREATE CONSTRAINT` statement; the hermetic
+    // `graphus-server/tests/social_network_large_schema.rs` drives those *string* DDL forms (carrying the
+    // same object names) through `parse_admin_statement` → `LocalEngine::constraint_ddl` and asserts the
+    // identical schema, so a drift between the two seams would fail there.
     let mut index_build_millis = 0u64;
     let mut schema_applied = false;
     if opts.index_ids {
         let t = Instant::now();
 
-        // (1) The id UNIQUENESS constraints — the most-appropriate schema for a unique-key column. Each
-        //     enforces the globally-unique `id` invariant (validated against the just-loaded data — the
-        //     bijective `u64` ids never collide, so the constraint is accepted) AND registers a backing
-        //     node-property index over `id`, so every `MATCH (:USER {id: …})` in the read battery is an
-        //     index SEEK, not a label scan — the same point-seek a bare RANGE index gave, plus the
-        //     uniqueness guarantee. (The constraint backing is not listed by `SHOW INDEXES`; it surfaces
-        //     under `SHOW CONSTRAINTS`.)
+        // The id UNIQUENESS constraints — the whole schema of the minimal (near-pure-topology) model.
+        // Each enforces the globally-unique `id` invariant (validated against the just-loaded data — the
+        // bijective `u64` ids never collide, so the constraint is accepted) AND registers a backing
+        // node-property index over `id`, so every `MATCH (:USER {id: …})` in the read battery is an index
+        // SEEK, not a label scan. (The constraint backing is not listed by `SHOW INDEXES`; it surfaces
+        // under `SHOW CONSTRAINTS`.) There are no `name` / date properties to index in this model.
         coord
             .create_constraint_general(
                 CONS_USER_ID_UNIQUE,
@@ -586,61 +564,16 @@ pub fn run_load(cfg: &GenConfig, dir: &Path, opts: LoadOpts) -> LoadOutcome {
             )
             .expect("create :ARTICLE(id) uniqueness constraint");
 
-        // (2) The production-realistic SEARCH schema over the ARTICLE headlines + the LIKE timeline:
-        //     - a TEXT (trigram) index for headline substring search (`CONTAINS` / `STARTS WITH`);
-        //     - a FULLTEXT (analyzer-tokenized) index for headline WORD search via
-        //       `db.index.fulltext.queryNodes`;
-        //     - a relationship RANGE index on LIKE.date (since `rmp` #680 it serves a `date` *range*
-        //       predicate as a `RelIndexRangeSeek`, so the `like_recent` window query SEEKS it);
-        //     - a composite node RANGE index on ARTICLE(registered, id) for time-ordered catalogue reads.
-        coord
-            .create_text_index(IDX_ARTICLE_NAME_TEXT, "ARTICLE", "name", true)
-            .expect("create TEXT index on ARTICLE.name");
-        coord
-            .create_fulltext_index(
-                IDX_ARTICLE_HEADLINE_FT,
-                &["ARTICLE".to_owned()],
-                &["name".to_owned()],
-                Analyzer::Standard,
-                true,
-            )
-            .expect("create FULLTEXT index on ARTICLE.name");
-        coord
-            .create_rel_property_index_named(Some(IDX_LIKE_DATE), "LIKE", "date", true)
-            .expect("create relationship RANGE index on LIKE.date");
-        coord
-            .begin_online_node_composite_index_named(
-                Some(IDX_ARTICLE_CATALOG),
-                "ARTICLE",
-                &["registered".to_owned(), "id".to_owned()],
-                true,
-            )
-            .expect("create composite RANGE index on ARTICLE(registered, id)");
-
-        // (3) The node existence constraint: every ARTICLE carries a `name` (the searchable headline).
-        //     Validated against the just-loaded data — the load only reaches here because every seeded
-        //     ARTICLE has a name, so the constraint is accepted.
-        coord
-            .create_constraint_general(
-                CONS_ARTICLE_NAME_EXISTS,
-                "ARTICLE",
-                &["name"],
-                ConstraintKind::Existence,
-                None,
-            )
-            .expect("create existence constraint on ARTICLE.name");
-
-        // Drive every non-blocking build (the FULLTEXT index) to completion so it is Online before the
+        // Drive any non-blocking build to completion so the constraint backings are Online before the
         // read battery — the same `advance_index_builds` pump the server's engine loop runs between
-        // commands, here run to quiescence in one shot. (The id-uniqueness constraint backings, the TEXT,
-        // composite, and relationship RANGE indexes build synchronously and are already Online.)
+        // commands, here run to quiescence in one shot.
         while coord.advance_index_builds(usize::MAX) {}
 
         index_build_millis = t.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         schema_applied = true;
     }
-    // The live catalog the read phases compile against: reflects the indexes just built so the planner
-    // emits `NodeIndexSeek` for every id-keyed MATCH.
+    // The live catalog the read phases compile against: reflects the constraint backings just built so the
+    // planner emits `NodeIndexSeek` for every id-keyed MATCH.
     let catalog = coord.catalog();
 
     // Capture the SHOW INDEXES / SHOW CONSTRAINTS listings as evidence (empty when not indexed).
@@ -653,14 +586,6 @@ pub fn run_load(cfg: &GenConfig, dir: &Path, opts: LoadOpts) -> LoadOutcome {
         collect_constraint_listings(&coord)
     } else {
         Vec::new()
-    };
-    // The headline term the search probes look for + its ground-truth hit count, derived from the
-    // generator (the known article set the TEXT `CONTAINS` and FULLTEXT `queryNodes` probes must both
-    // return). Empty / zero when no schema was applied.
-    let (search_term, search_expected) = if schema_applied {
-        dominant_headline_term(cfg)
-    } else {
-        (String::new(), 0)
     };
 
     // --- Flush + sync so the durable image on disk reflects every committed page, then measure. ---
@@ -692,12 +617,9 @@ pub fn run_load(cfg: &GenConfig, dir: &Path, opts: LoadOpts) -> LoadOutcome {
         "MATCH ()-[r:LIKE]->() RETURN count(r) AS c",
     );
 
-    // --- The read-query battery: the traversal probes, then (when a schema was declared) the search
-    //     probes that exercise the TEXT / FULLTEXT / relationship-RANGE index paths. --------------------
-    let mut queries = run_query_battery(&mut coord, &catalog, &generator);
-    if schema_applied {
-        queries.extend(run_search_battery(&mut coord, &catalog, &search_term));
-    }
+    // --- The read-query battery: the five pure-topology traversal probes (there are no name/date
+    //     search families in the minimal model). --------------------------------------------------------
+    let queries = run_query_battery(&mut coord, &catalog, &generator);
 
     LoadOutcome {
         cfg: cfg.clone(),
@@ -718,8 +640,6 @@ pub fn run_load(cfg: &GenConfig, dir: &Path, opts: LoadOpts) -> LoadOutcome {
         schema_applied,
         indexes,
         constraints,
-        search_term,
-        search_expected,
         queries,
     }
 }
@@ -788,9 +708,10 @@ fn run_query_battery(
         scalar: first_scalar(&rows),
     });
 
-    // 4) Top-N most-liked articles (aggregation + ORDER BY + LIMIT).
+    // 4) Top-N most-liked articles by id (aggregation + ORDER BY + LIMIT). Returns `a.id` — there is no
+    //    stored `name` in the minimal model — with an `id` tie-break for a deterministic ordering.
     let q = "MATCH (:USER)-[:LIKE]->(a:ARTICLE) \
-             RETURN a.name AS article, count(*) AS likes \
+             RETURN a.id AS article, count(*) AS likes \
              ORDER BY likes DESC, article ASC LIMIT 5"
         .to_owned();
     let (rows, latency_us) = timed_read(coord, catalog, &q);
@@ -823,92 +744,9 @@ fn run_query_battery(
     out
 }
 
-/// Runs the three **search** probes that exercise the new index kinds, returning a measured
-/// [`QuerySample`] per probe (each a `count(…)` so its `scalar` is the hit count):
-///
-/// 1. `text_contains` — headline substring search over the TEXT-indexed `ARTICLE.name`
-///    (`WHERE a.name CONTAINS '<term>'`), the "find every article whose headline mentions X" query.
-/// 2. `fulltext`      — headline WORD search via `CALL db.index.fulltext.queryNodes` over the FULLTEXT
-///    index (`<term>` lower-cased to the analyzer token). By construction this returns the SAME article
-///    set as `text_contains` (`<term>` is a single-token subject word appearing nowhere else), so the
-///    caller cross-checks both against the generator's ground truth.
-/// 3. `like_recent`   — a `LIKE.date` **range** predicate (`WHERE l.date >= LIKE_RECENT_SINCE`, the last
-///    ~10% of the timeline). Since `rmp` #680 the `like_date_range` relationship RANGE index serves a
-///    range predicate as a `RelIndexRangeSeek`, so this probe SEEKS the index; the narrow recent window
-///    keeps that seek genuinely selective and returns a well-defined, non-trivial recent slice.
-fn run_search_battery(coord: &mut Coord, catalog: &IndexCatalog, term: &str) -> Vec<QuerySample> {
-    let mut out = Vec::with_capacity(3);
-
-    // 1) TEXT-index headline substring search.
-    let q = format!("MATCH (a:ARTICLE) WHERE a.name CONTAINS '{term}' RETURN count(a) AS hits");
-    let (rows, latency_us) = timed_read(coord, catalog, &q);
-    out.push(QuerySample {
-        name: "text_contains".to_owned(),
-        query: q,
-        latency_us,
-        rows: rows.len() as u64,
-        scalar: first_scalar(&rows),
-    });
-
-    // 2) FULLTEXT headline word search (lower-case the term to the standard-analyzer token).
-    let term_lc = term.to_lowercase();
-    let q = format!(
-        "CALL db.index.fulltext.queryNodes('{IDX_ARTICLE_HEADLINE_FT}', '{term_lc}') \
-         YIELD node RETURN count(node) AS hits"
-    );
-    let (rows, latency_us) = timed_read(coord, catalog, &q);
-    out.push(QuerySample {
-        name: "fulltext".to_owned(),
-        query: q,
-        latency_us,
-        rows: rows.len() as u64,
-        scalar: first_scalar(&rows),
-    });
-
-    // 3) LIKE.date recent-window range. Every generated LIKE date lies in `[EPOCH_S, EPOCH_S +
-    //    REG_SPAN_S)`, so `date >= LIKE_RECENT_SINCE` (the last ~10% of the timeline) selects a small,
-    //    well-defined recent slice. Since `rmp` #680 the relationship RANGE index on LIKE.date serves a
-    //    RANGE predicate, so this lowers to a `RelIndexRangeSeek` (not a scan + residual filter); the
-    //    narrow window keeps that seek genuinely selective. This shared cutoff is the SAME one the
-    //    concurrent driver's `like_recent` family uses, so the load-time validation and the ladder probe
-    //    the identical slice.
-    let since = crate::battery::LIKE_RECENT_SINCE;
-    let q =
-        format!("MATCH ()-[l:LIKE]->(:ARTICLE) WHERE l.date >= {since} RETURN count(l) AS hits");
-    let (rows, latency_us) = timed_read(coord, catalog, &q);
-    out.push(QuerySample {
-        name: "like_recent".to_owned(),
-        query: q,
-        latency_us,
-        rows: rows.len() as u64,
-        scalar: first_scalar(&rows),
-    });
-
-    out
-}
-
-/// Picks the headline term the search probes assert on, and returns `(term, expected_hits)` where
-/// `expected_hits` is the number of `ARTICLE`s whose headline contains `term` — the ground truth read
-/// **straight from the deterministic generator**, so the TEXT `CONTAINS` and FULLTEXT `queryNodes`
-/// probes can be cross-checked against a value the engine never produced.
-///
-/// The candidates are the single-word, ASCII-only headline **subject** words. Each is the *leading*
-/// token of the articles whose headline uses that subject and appears **nowhere else** in the headline
-/// fragment pools (no verb / object / tail contains it), so for any of them the three sets — "articles
-/// whose `name` CONTAINS the word", "articles the FULLTEXT index returns for the lower-cased token",
-/// and "articles with that subject" — are identical. Restricting to ASCII, single-word subjects keeps
-/// the query literal quote-free and side-steps any analyzer diacritic / multi-token subtlety, so the
-/// cross-check is exact and robust. The most frequent candidate is chosen so the asserted set is
-/// non-trivial (more than one article) at every profile.
-fn dominant_headline_term(cfg: &GenConfig) -> (String, u64) {
-    // The ground-truth term picker is the hermetic library function (shared with the over-the-wire
-    // driver, so both pick the identical term); this in-process loader just forwards to it.
-    Generator::dominant_headline_term_for(cfg.seed, cfg.articles)
-}
-
 /// Reads the `SHOW INDEXES`-style listing from the coordinator's index catalogs, in a stable order:
-/// the two always-on `LOOKUP` token indexes first, then the node-property, composite, relationship-
-/// property, TEXT and FULLTEXT indexes this loader declared.
+/// the two always-on `LOOKUP` token indexes first, then any node-property index (here only the id
+/// uniqueness-constraint backings).
 fn collect_index_listings(coord: &Coord) -> Vec<IndexListing> {
     fn state_str(s: IndexState) -> String {
         match s {
@@ -1090,8 +928,6 @@ pub fn outcome_json(out: &LoadOutcome) -> String {
     let _ = write!(s, "\"friend_edges\":{},", out.friend_count);
     let _ = write!(s, "\"like_edges\":{},", out.like_count);
     let _ = write!(s, "\"schema_applied\":{},", out.schema_applied);
-    let _ = write!(s, "\"search_term\":\"{}\",", out.search_term);
-    let _ = write!(s, "\"search_expected\":{},", out.search_expected);
     s.push_str("\"indexes\":[");
     for (i, idx) in out.indexes.iter().enumerate() {
         if i > 0 {

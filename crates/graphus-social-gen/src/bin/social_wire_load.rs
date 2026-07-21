@@ -21,12 +21,11 @@
 //!
 //! # The graph CSV shape (`social_gen --format csv`)
 //!
-//! `neo4j-admin import`-flavoured: node files are `:ID,:LABEL,id:long,name:string,registered:long`
-//! (the `u64` id appears **twice** — the reserved `:ID` join key, a decimal string, AND a stored
-//! `id:long` property the traversals anchor on as an integer); relationship files are
-//! `:START_ID,:END_ID,:TYPE,<prop>:long`. The generator
-//! never emits a comma / quote / newline inside a field, so a plain `split(',')` is exact for the Bolt
-//! path's row parse.
+//! `neo4j-admin import`-flavoured: node files are `:ID,:LABEL,id:long` (the `u64` id appears **twice** —
+//! the reserved `:ID` join key, a decimal string, AND a stored `id:long` property the traversals anchor
+//! on as an integer); relationship files are `:START_ID,:END_ID,:TYPE` (no property columns — the
+//! near-pure-topology model). The generator never emits a comma / quote / newline inside a field, so a
+//! plain `split(',')` is exact for the Bolt path's row parse.
 //!
 //! # Exit contract
 //!
@@ -91,9 +90,9 @@ fn main() -> ExitCode {
     let summary = Generator::new(cfg.clone()).summary();
 
     let result = if args.bolt.is_some() {
-        run_bolt(&args, &cfg, &summary)
+        run_bolt(&args, &summary)
     } else {
-        run_rest(&args, &cfg, &summary)
+        run_rest(&args, &summary)
     };
     match result {
         Ok(()) => {
@@ -245,11 +244,7 @@ impl Args {
 
 /// Runs the REST bulk-import Mode A load + schema + asserts. Returns `Ok(())` only when every step
 /// succeeded and every assertion held.
-fn run_rest(
-    args: &Args,
-    cfg: &GenConfig,
-    summary: &graphus_social_gen::Summary,
-) -> Result<(), String> {
+fn run_rest(args: &Args, summary: &graphus_social_gen::Summary) -> Result<(), String> {
     let rest_addr = args
         .rest
         .as_deref()
@@ -365,8 +360,8 @@ fn run_rest(
     )?;
 
     // 4. Declare the version-tolerant read-path schema (best-effort — an older server may reject the
-    //    modern DDL; the anchor indexes matter, the rest is optimisation / extra query surface).
-    let created_fulltext = declare_schema_rest(&rest, &args.db)?;
+    //    node-uniqueness DDL; the id-anchor seek then falls back to a scan, still correct).
+    declare_schema_rest(&rest, &args.db)?;
 
     // 5. Shape assertions (deterministic for a fixed seed + profile).
     assert_count_rest(
@@ -399,27 +394,20 @@ fn run_rest(
         summary.like_edges,
     )?;
 
-    // 6. Battery smoke: every family must return a well-formed, non-erroring result. The FULLTEXT
-    //    family is asserted only when its index was actually created (version-tolerant).
-    smoke_battery_rest(&rest, &args.db, cfg, created_fulltext)?;
+    // 6. Battery smoke: every (topology) family must return a well-formed, non-erroring result.
+    smoke_battery_rest(&rest, &args.db)?;
 
     Ok(())
 }
 
-/// Declares the read-path schema over REST, best-effort. Returns whether the FULLTEXT index was
-/// created (so the caller knows whether to smoke-test that family). Every DDL statement failure is
-/// noted, not fatal — an older server that rejects modern DDL still serves the traversals (via a
-/// scan).
+/// Declares the read-path schema over REST, best-effort: the two id UNIQUENESS constraints — the whole
+/// schema of the minimal (near-pure-topology) model (there are no `name` / date properties to index).
+/// Each backing index makes `(:USER {id})` / `(:ARTICLE {id})` a SEEK, and the constraint enforces the
+/// unique key. Version-tolerant: an older attach target that lacks node-uniqueness rejects them (noted,
+/// not fatal — the id seek then falls back to a scan, still correct).
 ///
-/// The wait for the builds to go `ONLINE`, in contrast, IS fatal when it times out (`rmp` task #733):
-/// the battery that follows claims to measure INDEX-backed search, so a run that queried a still-
-/// building index would report scan latencies (and, before #733 was fixed, a silently empty FULLTEXT
-/// result) as if they were index-backed evidence.
-fn declare_schema_rest(rest: &Rest<'_>, db: &str) -> Result<bool, String> {
-    // Anchor id UNIQUENESS constraints: the globally-unique key each traversal point-seeks on. The
-    // backing index makes `(:USER {id})` / `(:ARTICLE {id})` a SEEK; the constraint additionally enforces
-    // the unique-key invariant. Version-tolerant: an older attach target that lacks node-uniqueness
-    // rejects this — noted, not fatal (the seek then falls back to a scan, still correct).
+/// The wait for the builds to go `ONLINE`, in contrast, IS fatal when it times out (`rmp` task #733).
+fn declare_schema_rest(rest: &Rest<'_>, db: &str) -> Result<(), String> {
     for (label, var) in [("USER", "u"), ("ARTICLE", "a")] {
         best_effort_rest(
             rest,
@@ -431,44 +419,10 @@ fn declare_schema_rest(rest: &Rest<'_>, db: &str) -> Result<bool, String> {
             &format!("uniqueness constraint {label}.id"),
         );
     }
-    // TEXT index on ARTICLE.name (the CONTAINS search is served by a scan without it — optimisation).
-    best_effort_rest(
-        rest,
-        db,
-        "CREATE TEXT INDEX article_name_text FOR (a:ARTICLE) ON (a.name)",
-        "TEXT index ARTICLE.name",
-    );
-    // RELATIONSHIP RANGE index on LIKE.date — the backing index for the `like_recent` range family
-    // (`WHERE l.date >= $since`). Without it that query is a full relationship SCAN; with it, it is the
-    // rel-RANGE SEEK the project built in #680, so the example actually EXERCISES that surface rather
-    // than declaring a read family the planner can only answer by scanning (rmp #746).
-    best_effort_rest(
-        rest,
-        db,
-        "CREATE RANGE INDEX FOR ()-[l:LIKE]-() ON (l.date)",
-        "RANGE index LIKE.date (rel)",
-    );
-    // FULLTEXT headline index — required by the `fulltext` battery family.
-    let ft = best_effort_rest(
-        rest,
-        db,
-        &format!(
-            "CREATE FULLTEXT INDEX {} FOR (a:ARTICLE) ON EACH [a.name]",
-            battery::FULLTEXT_INDEX
-        ),
-        "FULLTEXT index ARTICLE.name",
-    );
-    // Existence constraint on ARTICLE.name (extra realistic schema surface).
-    best_effort_rest(
-        rest,
-        db,
-        "CREATE CONSTRAINT article_name_exists FOR (a:ARTICLE) REQUIRE a.name IS NOT NULL",
-        "existence constraint ARTICLE.name",
-    );
     // Wait for the durable index builds to go ONLINE (a no-op against a server that does not report
     // an index `state`; fatal if they are still POPULATING when the timeout elapses).
     wait_for_indexes(rest, db)?;
-    Ok(ft)
+    Ok(())
 }
 
 /// Runs one best-effort DDL statement, noting (not failing) on rejection. Returns `true` if it was
@@ -488,82 +442,33 @@ fn best_effort_rest(rest: &Rest<'_>, db: &str, statement: &str, what: &str) -> b
     }
 }
 
-/// Smoke-tests every battery family over REST on a real sample. The traversal + scan families must
-/// return a well-formed result; the search families additionally assert the ground-truth hit count.
-fn smoke_battery_rest(
-    rest: &Rest<'_>,
-    db: &str,
-    cfg: &GenConfig,
-    fulltext: bool,
-) -> Result<(), String> {
+/// Smoke-tests every (topology) battery family over REST on a real sample: each of the five families
+/// must return a well-formed result.
+fn smoke_battery_rest(rest: &Rest<'_>, db: &str) -> Result<(), String> {
     let u0 = Generator::user_id(0);
     let u1 = Generator::user_id(1);
-    let (term, expected_hits) = Generator::dominant_headline_term_for(cfg.seed, cfg.articles);
-    // The `like_recent` recent-window cutoff — the SAME constant the concurrent driver and the
-    // in-process load-time validation use, so all three probe the identical slice (`rmp` #746).
-    let since = battery::LIKE_RECENT_SINCE;
 
     for fam in battery::ALL {
-        if fam.name == "fulltext" && !fulltext {
-            eprintln!(
-                "social_wire_load: skipping fulltext smoke (FULLTEXT index unavailable on this server)"
-            );
-            continue;
-        }
-        let params = rest_params(fam.params, u0, u1, &term, since);
-        let json = rest
-            .statement(
-                db,
-                &format!("battery family '{}'", fam.name),
-                fam.cypher,
-                params,
-            )
-            .map_err(|e| format!("{e} (family {:?} is not a well-formed result)", fam.name))?;
-        // Ground-truth hit-count assertions for the search families (evidence the engine matched the
-        // deterministic generator, not just "did not error").
-        if fam.name == "text_contains" {
-            let got = jolt_scalar_u64(&json).ok_or_else(|| {
-                format!(
-                    "text_contains returned no scalar: {}",
-                    clip_str(&json.to_string())
-                )
-            })?;
-            if got != expected_hits {
-                return Err(format!(
-                    "text_contains '{term}' hit count mismatch: server {got}, ground truth {expected_hits}"
-                ));
-            }
-        }
-        if fam.name == "fulltext" {
-            let got = jolt_scalar_u64(&json).ok_or_else(|| {
-                format!(
-                    "fulltext returned no scalar: {}",
-                    clip_str(&json.to_string())
-                )
-            })?;
-            if got != expected_hits {
-                return Err(format!(
-                    "fulltext '{term}' hit count mismatch: server {got}, ground truth {expected_hits}"
-                ));
-            }
-        }
+        let params = rest_params(fam.params, u0, u1);
+        rest.statement(
+            db,
+            &format!("battery family '{}'", fam.name),
+            fam.cypher,
+            params,
+        )
+        .map_err(|e| format!("{e} (family {:?} is not a well-formed result)", fam.name))?;
     }
-    eprintln!(
-        "social_wire_load: every battery family returned a well-formed result; text search '{term}' = {expected_hits} articles (ground-truth match)"
-    );
+    eprintln!("social_wire_load: every battery family returned a well-formed result");
     Ok(())
 }
 
 /// Builds the REST (JSON) parameters for a battery family. `u0`/`u1` are `u64` id anchors (serialized as
-/// JSON integers); `term` is lower-cased for the FULLTEXT analyzer token (matching the in-process loader).
-fn rest_params(kind: battery::Params, u0: u64, u1: u64, term: &str, since: i64) -> Option<Json> {
+/// JSON integers).
+fn rest_params(kind: battery::Params, u0: u64, u1: u64) -> Option<Json> {
     match kind {
         battery::Params::None => None,
         battery::Params::User => Some(json!({ "u0": u0 })),
         battery::Params::UserPair => Some(json!({ "u0": u0, "u1": u1 })),
-        battery::Params::Term => Some(json!({ "term": term })),
-        battery::Params::FulltextTerm => Some(json!({ "term": term.to_lowercase() })),
-        battery::Params::Recent => Some(json!({ "since": since })),
     }
 }
 
@@ -574,11 +479,7 @@ fn rest_params(kind: battery::Params, u0: u64, u1: u64, term: &str, since: i64) 
 /// Loads the social graph over Bolt-over-TCP+TLS into the harness-created isolated `--db`. Does NOT
 /// create or drop the database. Declares best-effort anchor indexes, streams the node then
 /// relationship rows in `UNWIND` batches (parsed from the CSV), and asserts the shape + battery.
-fn run_bolt(
-    args: &Args,
-    cfg: &GenConfig,
-    summary: &graphus_social_gen::Summary,
-) -> Result<(), String> {
+fn run_bolt(args: &Args, summary: &graphus_social_gen::Summary) -> Result<(), String> {
     let url_str = args
         .bolt
         .as_deref()
@@ -595,11 +496,10 @@ fn run_bolt(
     //    label the backing index is online immediately.
     load.best_effort_unique("USER");
     load.best_effort_unique("ARTICLE");
-    load.best_effort_like_date_range();
-    let fulltext = load.best_effort_fulltext();
 
     // 2. Stream nodes, then relationships, in UNWIND batches (parsed from the deterministic CSV; the
-    //    generator never emits a comma/quote/newline in a field, so split(',') is exact).
+    //    generator never emits a comma/quote/newline in a field, so split(',') is exact). Nodes carry
+    //    only `id`; relationships carry no properties (the near-pure-topology model).
     let users = parse_nodes(&args.data_dir, "users.csv")?;
     let articles = parse_nodes(&args.data_dir, "articles.csv")?;
     let friends = parse_edges(&args.data_dir, "friends.csv")?;
@@ -609,7 +509,7 @@ fn run_bolt(
         let rows = node_rows(chunk);
         load.write(
             "load USER nodes",
-            "UNWIND $rows AS row CREATE (:USER {id: row.id, name: row.name, registered: row.registered})",
+            "UNWIND $rows AS row CREATE (:USER {id: row.id})",
             vec![("rows".into(), Value::List(rows))],
         )?;
     }
@@ -618,27 +518,27 @@ fn run_bolt(
         let rows = node_rows(chunk);
         load.write(
             "load ARTICLE nodes",
-            "UNWIND $rows AS row CREATE (:ARTICLE {id: row.id, name: row.name, registered: row.registered})",
+            "UNWIND $rows AS row CREATE (:ARTICLE {id: row.id})",
             vec![("rows".into(), Value::List(rows))],
         )?;
     }
     eprintln!("social_wire_load: loaded {} ARTICLE nodes", articles.len());
     for chunk in friends.chunks(EDGE_BATCH) {
-        let rows = edge_rows(chunk, "since");
+        let rows = edge_rows(chunk);
         load.write(
             "load FRIEND edges",
             "UNWIND $rows AS row MATCH (a:USER {id: row.a}), (b:USER {id: row.b}) \
-             CREATE (a)-[:FRIEND {since: row.prop}]->(b)",
+             CREATE (a)-[:FRIEND]->(b)",
             vec![("rows".into(), Value::List(rows))],
         )?;
     }
     eprintln!("social_wire_load: loaded {} FRIEND edges", friends.len());
     for chunk in likes.chunks(EDGE_BATCH) {
-        let rows = edge_rows(chunk, "date");
+        let rows = edge_rows(chunk);
         load.write(
             "load LIKE edges",
             "UNWIND $rows AS row MATCH (u:USER {id: row.a}), (a:ARTICLE {id: row.b}) \
-             CREATE (u)-[:LIKE {date: row.prop}]->(a)",
+             CREATE (u)-[:LIKE]->(a)",
             vec![("rows".into(), Value::List(rows))],
         )?;
     }
@@ -667,16 +567,11 @@ fn run_bolt(
         summary.friend_edges,
     )?;
 
-    // 4. Battery smoke: every family must return a well-formed result (fulltext only if created).
+    // 4. Battery smoke: every (topology) family must return a well-formed result.
     let u0 = Generator::user_id(0);
     let u1 = Generator::user_id(1);
-    let (term, _hits) = Generator::dominant_headline_term_for(cfg.seed, cfg.articles);
-    let since = battery::LIKE_RECENT_SINCE;
     for fam in battery::ALL {
-        if fam.name == "fulltext" && !fulltext {
-            continue;
-        }
-        let params = bolt_params(fam.params, u0, u1, &term, since);
+        let params = bolt_params(fam.params, u0, u1);
         load.write(
             &format!("battery family '{}'", fam.name),
             fam.cypher,
@@ -690,13 +585,7 @@ fn run_bolt(
 }
 
 /// Builds the Bolt (`Value`) parameters for a battery family.
-fn bolt_params(
-    kind: battery::Params,
-    u0: u64,
-    u1: u64,
-    term: &str,
-    since: i64,
-) -> Vec<(String, Value)> {
+fn bolt_params(kind: battery::Params, u0: u64, u1: u64) -> Vec<(String, Value)> {
     // The id anchors are `u64` values in `[0, 2^63)` (see `Generator::entity_id`), so `as i64` is exact.
     match kind {
         battery::Params::None => vec![],
@@ -707,42 +596,34 @@ fn bolt_params(
                 ("u1".into(), Value::Integer(u1 as i64)),
             ]
         }
-        battery::Params::Term => vec![("term".into(), Value::String(term.into()))],
-        battery::Params::FulltextTerm => vec![("term".into(), Value::String(term.to_lowercase()))],
-        battery::Params::Recent => vec![("since".into(), Value::Integer(since))],
     }
 }
 
-/// A parsed node row: `(id, name, registered)` — the id is a `u64` (carried as `i64` on the wire).
-type NodeRow = (i64, String, i64);
-/// A parsed edge row: `(start_id, end_id, prop_value)` — both endpoint ids are `u64` (carried as `i64`).
-type EdgeRow = (i64, i64, i64);
+/// A parsed node row: the node's `id` — a `u64` (carried as `i64` on the wire; there are no other node
+/// properties in the minimal model).
+type NodeRow = i64;
+/// A parsed edge row: `(start_id, end_id)` — both endpoint ids are `u64` (carried as `i64`); the edge
+/// carries no properties.
+type EdgeRow = (i64, i64);
 
-/// Builds `UNWIND` `Value::Map` rows for a node chunk (`{id, name, registered}`). `id` is an integer so
+/// Builds `UNWIND` `Value::Map` rows for a node chunk (`{id}`). `id` is an integer so
 /// `CREATE (:USER {id: row.id})` stores it as the queryable `u64` value.
 fn node_rows(chunk: &[NodeRow]) -> Vec<Value> {
     chunk
         .iter()
-        .map(|(id, name, reg)| {
-            Value::Map(vec![
-                ("id".into(), Value::Integer(*id)),
-                ("name".into(), Value::String(name.clone())),
-                ("registered".into(), Value::Integer(*reg)),
-            ])
-        })
+        .map(|id| Value::Map(vec![("id".into(), Value::Integer(*id))]))
         .collect()
 }
 
-/// Builds `UNWIND` `Value::Map` rows for an edge chunk (`{a, b, prop}`). The endpoint ids are integers so
-/// `MATCH (:USER {id: row.a})` point-seeks the id-uniqueness index.
-fn edge_rows(chunk: &[EdgeRow], _prop_name: &str) -> Vec<Value> {
+/// Builds `UNWIND` `Value::Map` rows for an edge chunk (`{a, b}`). The endpoint ids are integers so
+/// `MATCH (:USER {id: row.a})` point-seeks the id-uniqueness index; the edge itself is property-less.
+fn edge_rows(chunk: &[EdgeRow]) -> Vec<Value> {
     chunk
         .iter()
-        .map(|(a, b, prop)| {
+        .map(|(a, b)| {
             Value::Map(vec![
                 ("a".into(), Value::Integer(*a)),
                 ("b".into(), Value::Integer(*b)),
-                ("prop".into(), Value::Integer(*prop)),
             ])
         })
         .collect()
@@ -792,40 +673,6 @@ impl BoltLoad {
             Err(e) => eprintln!(
                 "social_wire_load: note: id uniqueness constraint on {label} not created ({e}); seeks may scan"
             ),
-        }
-    }
-
-    /// Best-effort RELATIONSHIP RANGE index on `LIKE.date` — the backing index for the `like_recent`
-    /// range family (`WHERE l.date >= $since`). Without it that query full-SCANS the LIKE set; with it,
-    /// it is the rel-RANGE SEEK the project built in #680 (rmp #746). Older servers that lack relationship
-    /// RANGE indexes reject it — noted, not fatal.
-    fn best_effort_like_date_range(&mut self) {
-        let cypher = "CREATE RANGE INDEX FOR ()-[l:LIKE]-() ON (l.date)";
-        match self.client.run(cypher, vec![], &self.db) {
-            Ok(_) => eprintln!("social_wire_load: created rel RANGE index LIKE.date"),
-            Err(e) => eprintln!(
-                "social_wire_load: note: rel RANGE index LIKE.date not created ({e}); like_recent scans"
-            ),
-        }
-    }
-
-    /// Best-effort FULLTEXT headline index (an older server rejects it). Returns whether it succeeded.
-    fn best_effort_fulltext(&mut self) -> bool {
-        let cypher = format!(
-            "CREATE FULLTEXT INDEX {} FOR (a:ARTICLE) ON EACH [a.name]",
-            battery::FULLTEXT_INDEX
-        );
-        match self.client.run(&cypher, vec![], &self.db) {
-            Ok(_) => {
-                eprintln!("social_wire_load: created FULLTEXT headline index");
-                true
-            }
-            Err(e) => {
-                eprintln!(
-                    "social_wire_load: note: FULLTEXT index not created ({e}); fulltext family skipped"
-                );
-                false
-            }
         }
     }
 
@@ -886,40 +733,21 @@ fn read_data_rows(dir: &Path, name: &str) -> Result<Vec<Vec<String>>, String> {
         .collect())
 }
 
-/// `users.csv` / `articles.csv` → `(id, name, registered)` (node columns 2 [stored `id:long`], 3, 4).
+/// `users.csv` / `articles.csv` → the node `id` (column 2, the stored `id:long`).
 fn parse_nodes(dir: &Path, name: &str) -> Result<Vec<NodeRow>, String> {
     read_data_rows(dir, name)?
         .into_iter()
-        .map(|c| {
-            Ok((
-                row_int(&c, 2, name)?,
-                row_str(&c, 3, name)?,
-                row_int(&c, 4, name)?,
-            ))
-        })
+        .map(|c| row_int(&c, 2, name))
         .collect()
 }
 
-/// `friends.csv` / `likes.csv` → `(start_id, end_id, prop)` (rel columns 0, 1, 3). The `:START_ID` /
-/// `:END_ID` join keys are the `u64` ids as decimal strings, parsed back to integers here.
+/// `friends.csv` / `likes.csv` → `(start_id, end_id)` (rel columns 0, 1). The `:START_ID` / `:END_ID`
+/// join keys are the `u64` ids as decimal strings, parsed back to integers here.
 fn parse_edges(dir: &Path, name: &str) -> Result<Vec<EdgeRow>, String> {
     read_data_rows(dir, name)?
         .into_iter()
-        .map(|c| {
-            Ok((
-                row_int(&c, 0, name)?,
-                row_int(&c, 1, name)?,
-                row_int(&c, 3, name)?,
-            ))
-        })
+        .map(|c| Ok((row_int(&c, 0, name)?, row_int(&c, 1, name)?)))
         .collect()
-}
-
-fn row_str(cells: &[String], col: usize, name: &str) -> Result<String, String> {
-    cells
-        .get(col)
-        .cloned()
-        .ok_or_else(|| format!("{name}: row has no column {col}"))
 }
 
 fn row_int(cells: &[String], col: usize, name: &str) -> Result<i64, String> {

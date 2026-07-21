@@ -163,10 +163,11 @@ fn main() -> ExitCode {
     }
 
     // ---------------------------------------------------------------------------------------------
-    // Search schema: the SHOW INDEXES / SHOW CONSTRAINTS listing + the headline search cross-check.
+    // Schema: the SHOW INDEXES / SHOW CONSTRAINTS listing (the two id uniqueness constraints back the
+    // id point-seek; there is no name/date search schema in the minimal model).
     // ---------------------------------------------------------------------------------------------
     if out.schema_applied {
-        println!("  SHOW INDEXES (search schema + always-on LOOKUP):");
+        println!("  SHOW INDEXES (always-on LOOKUP token indexes):");
         println!("    name                        type      entity        state");
         for idx in &out.indexes {
             println!(
@@ -174,24 +175,10 @@ fn main() -> ExitCode {
                 idx.name, idx.kind, idx.entity, idx.state
             );
         }
-        println!("  SHOW CONSTRAINTS:");
+        println!("  SHOW CONSTRAINTS (the two id uniqueness constraints):");
         for c in &out.constraints {
             println!("    {:<26}  {}  {:?}", c.name, c.kind, c.properties);
         }
-        let text = out.query("text_contains").map(|q| q.scalar.unwrap_or(-1));
-        let ft = out.query("fulltext").map(|q| q.scalar.unwrap_or(-1));
-        let recent = out.query("like_recent").map(|q| q.scalar.unwrap_or(-1));
-        println!(
-            "  headline search: term='{}' expected={} | TEXT CONTAINS={} | FULLTEXT queryNodes={}",
-            out.search_term,
-            out.search_expected,
-            text.map_or_else(|| "-".to_owned(), |n| n.to_string()),
-            ft.map_or_else(|| "-".to_owned(), |n| n.to_string()),
-        );
-        println!(
-            "  LIKE.date recent-window range (RelIndexRangeSeek on like_date_range, rmp #680)={}",
-            recent.map_or_else(|| "-".to_owned(), |n| n.to_string()),
-        );
     }
 
     if let Some(path) = &json_path {
@@ -294,12 +281,11 @@ fn main() -> ExitCode {
         format!("degree non-empty (got {})", degree.scalar.unwrap_or(0)),
     );
 
-    // The search schema: the new index kinds must be declared + Online, the existence constraint
-    // present, and the TEXT `CONTAINS` + FULLTEXT `queryNodes` probes must both return exactly the
-    // generator's ground-truth article set (the headline term appears in `search_expected` articles).
+    // The schema: the two always-on LOOKUP token indexes are surfaced, and the two id UNIQUENESS
+    // constraints (the whole schema of the minimal model) are declared — each enforces the globally-
+    // unique id AND backs the `(:USER {id})` / `(:ARTICLE {id})` point-seek. Constraint backings surface
+    // under SHOW CONSTRAINTS, not SHOW INDEXES.
     if out.schema_applied {
-        // Every declared index kind is present, correctly typed, and Online — and the two always-on
-        // LOOKUP token indexes are surfaced.
         let index_present = |name: &str, kind: &str, entity: &str| {
             out.index(name)
                 .is_some_and(|i| i.kind == kind && i.entity == entity && i.state == "ONLINE")
@@ -312,31 +298,6 @@ fn main() -> ExitCode {
             index_present("rel_type_lookup_index", "LOOKUP", "RELATIONSHIP"),
             "always-on relationship LOOKUP index surfaced (rel_type_lookup_index)".to_owned(),
         );
-        check(
-            index_present("article_name_text", "TEXT", "NODE"),
-            "TEXT index on ARTICLE.name is Online (article_name_text)".to_owned(),
-        );
-        check(
-            index_present("article_headline_fulltext", "FULLTEXT", "NODE"),
-            "FULLTEXT index on ARTICLE.name is Online (article_headline_fulltext)".to_owned(),
-        );
-        check(
-            index_present("like_date_range", "RANGE", "RELATIONSHIP"),
-            "relationship RANGE index on LIKE.date is Online (like_date_range)".to_owned(),
-        );
-        check(
-            index_present("article_catalog_composite", "RANGE", "NODE"),
-            "composite RANGE index on ARTICLE(registered, id) is Online (article_catalog_composite)"
-                .to_owned(),
-        );
-        check(
-            out.constraint("article_name_exists")
-                .is_some_and(|c| c.kind == "NODE_PROPERTY_EXISTENCE"),
-            "existence constraint on ARTICLE.name is declared (article_name_exists)".to_owned(),
-        );
-        // The id UNIQUENESS constraints (the most-appropriate schema for the unique-key `id` column):
-        // each enforces the globally-unique id AND backs the `(:USER {id})` / `(:ARTICLE {id})`
-        // point-seek. Constraint backings surface under SHOW CONSTRAINTS, not SHOW INDEXES.
         for (name, label) in [("user_id_unique", "USER"), ("article_id_unique", "ARTICLE")] {
             check(
                 out.constraint(name)
@@ -344,50 +305,6 @@ fn main() -> ExitCode {
                 format!("uniqueness constraint on {label}.id is declared ({name})"),
             );
         }
-
-        // The headline search cross-check: the term is a single-token subject word, so TEXT CONTAINS
-        // and FULLTEXT queryNodes must BOTH return exactly the generator's ground-truth article set.
-        let text_hits = out
-            .query("text_contains")
-            .and_then(|q| q.scalar)
-            .unwrap_or(-1);
-        let ft_hits = out.query("fulltext").and_then(|q| q.scalar).unwrap_or(-1);
-        check(
-            out.search_expected > 1,
-            format!(
-                "headline term '{}' matches multiple articles (expected {})",
-                out.search_term, out.search_expected
-            ),
-        );
-        check(
-            text_hits == out.search_expected as i64,
-            format!(
-                "TEXT CONTAINS '{}' returns the generator's {} articles (got {text_hits})",
-                out.search_term, out.search_expected
-            ),
-        );
-        check(
-            ft_hits == out.search_expected as i64,
-            format!(
-                "FULLTEXT queryNodes('{}') returns the same {} articles (got {ft_hits})",
-                out.search_term.to_lowercase(),
-                out.search_expected
-            ),
-        );
-
-        // The LIKE.date recent-window range predicate (a `RelIndexRangeSeek` on the like_date_range
-        // rel RANGE index since `rmp` #680) returns a non-trivial recent slice: 0 < recent < |LIKE|.
-        let recent = out
-            .query("like_recent")
-            .and_then(|q| q.scalar)
-            .unwrap_or(-1);
-        check(
-            recent > 0 && (recent as u64) < out.like_count,
-            format!(
-                "LIKE.date recent-half range is a non-trivial slice: 0 < {recent} < {}",
-                out.like_count
-            ),
-        );
     }
 
     println!();

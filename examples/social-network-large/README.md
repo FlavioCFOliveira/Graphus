@@ -1,11 +1,11 @@
 # social-network-large — do reads scale across cores?
 
 This example evaluates Graphus's read path on a **big social graph** under **real concurrency**. It
-builds a social network of **`USER`** nodes befriended by an **undirected multigraph** `FRIEND`
-relationship, a corpus of **`ARTICLE`** nodes carrying realistic headlines, and **`LIKE`** edges from
-users to articles — loads it into a **running server over the wire**, then drives a **concurrency
-ladder of simultaneous Bolt clients** through a Cypher read battery while **sampling the server
-process itself**.
+builds a **near-pure-topology** social network — **`USER`** nodes befriended by an **undirected
+multigraph** `FRIEND` relationship, a corpus of **`ARTICLE`** nodes, and **`LIKE`** edges from users to
+articles, where every node carries only its `id` and the relationships carry no properties — loads it
+into a **running server over the wire**, then drives a **concurrency ladder of simultaneous Bolt
+clients** through a Cypher read battery while **sampling the server process itself**.
 
 The headline question is deliberately narrow: **when C clients read at once, does the server spread
 the work across CPU cores, or does it hit a single-thread ceiling?**
@@ -22,12 +22,15 @@ expected result and `run.sh` exits non-zero if any assertion fails.
 
 ## The graph model (a multigraph LPG)
 
+This is a **near-pure-topology** graph: every node carries only its `id` and the relationships carry no
+properties at all — the graph *is* its structure.
+
 | Element | Shape | Meaning |
 |---------|-------|---------|
-| `(:USER {id, name, registered})` | `id` = **globally-unique `u64`**, `name` ≤ 64 chars (realistic Portuguese full names, with diacritics), `registered` = **`i64`** unix ts | a person |
-| `(:ARTICLE {id, name, registered})` | `id` = **globally-unique `u64`**, `name` = a realistic news-style headline, `registered` = **`i64`** unix ts | a published article |
-| `(:USER)-[:FRIEND {since}]-(:USER)` | **undirected multigraph**, `since` = **`i64`** unix ts | a friendship |
-| `(:USER)-[:LIKE {date}]->(:ARTICLE)` | directed, `date` = **`i64`** unix ts | a like |
+| `(:USER {id})` | `id` = **globally-unique `u64`** | a person |
+| `(:ARTICLE {id})` | `id` = **globally-unique `u64`** | a published article |
+| `(:USER)-[:FRIEND]-(:USER)` | **undirected multigraph**, property-less | a friendship |
+| `(:USER)-[:LIKE]->(:ARTICLE)` | directed, property-less | a like |
 
 > The `id` is a label-tagged **bijective scramble** of the entity index — distinct entities always get
 > distinct ids and no `USER` id can equal an `ARTICLE` id, so a `REQUIRE n.id IS UNIQUE` constraint can
@@ -36,14 +39,13 @@ expected result and `run.sh` exits non-zero if any assertion fails.
 > column). A `MATCH (:USER {id: <int>})` point-seek is served by the uniqueness constraint's backing
 > index (PROFILE-verified: `NodeIndexSeek`, dbHits 1), not a label scan.
 
-### Realistic, deterministic data
+### Deterministic data
 
 The generator (`graphus-social-gen`, a dev-only leaf crate) is **fully deterministic**: the entire
-graph is a pure function of `(seed, profile)`, so it is **byte-identical per seed** across runs,
-hosts, and platforms (a seeded `SplitMix64` PRNG; no clock, no float in any emitted text, no hash-map
-iteration). Names are assembled from European-Portuguese given-name / surname / particle pools
-(diacritics preserved, bounded to 64 bytes on a char boundary); article titles are assembled from
-realistic headline-fragment pools so they "tend to contain real information".
+graph is a pure function of `(seed, profile)`, so it is **byte-identical per seed** across runs, hosts,
+and platforms (a seeded `SplitMix64` PRNG; no clock, no float in any emitted text, no hash-map
+iteration). The `id` is the only property; the FRIEND / LIKE topology is drawn from PRNG streams that are
+independent of the id bijection, so the graph's structure is fixed by the seed alone.
 
 ### Two degree distributions — including supernodes
 
@@ -91,17 +93,17 @@ The example auto-detects its mode through the shared external-target seam (`_har
 
 **LOCAL (default)** — self-boots a real `graphus-server` (Bolt-over-UDS for the ladder + a
 plaintext-loopback REST listener for the upload path), **network-bulk-imports** the graph via
-`POST /admin/db/{db}/bulk-import` (Mode A) into an isolated database, declares the search schema over
-the wire, drives the ladder over UDS while sampling the **server's** per-thread CPU / RSS / IO from
+`POST /admin/db/{db}/bulk-import` (Mode A) into an isolated database, declares the id-uniqueness schema
+over the wire, drives the ladder over UDS while sampling the **server's** per-thread CPU / RSS / IO from
 `/proc`, and gates the structural counts against the committed baseline.
 
 **EXTERNAL (attach)** — when any `GRAPHUS_TARGET_{BOLT,REST,UDS}` is set, it attaches to an
 **already-running instance** (local or remote) over Bolt-TCP + TLS. It carves out a dedicated,
-run-scoped database, loads a small graph over Bolt with a **version-tolerant schema** (a capability
-preflight drops any battery family the target cannot serve — e.g. FULLTEXT on an older server),
-scrapes the target's Prometheus `/metrics` before and after the ladder, drives the **same** battery,
-and **drops the isolated database on exit**. `/proc` sampling is off (there is no co-located PID), so
-the server-side channel is the `/metrics` delta and the host-independent invariant gate.
+run-scoped database, loads a small graph over Bolt with a **version-tolerant schema** (an older server
+that lacks node-uniqueness DDL still runs — the id seek falls back to a scan), scrapes the target's
+Prometheus `/metrics` before and after the ladder, drives the **same** battery, and **drops the isolated
+database on exit**. `/proc` sampling is off (there is no co-located PID), so the server-side channel is
+the `/metrics` delta and the host-independent invariant gate.
 
 ```bash
 examples/social-network-large/run.sh                                   # local self-boot
@@ -130,10 +132,10 @@ latency from queueing, or `1,2,4,8,16,32` to chase the knee), `SOCIAL_WRITERS` /
 |---|------------|-----------------|
 | 1 | **Deterministic large-graph generation** | `social_gen` emits the graph twice and the bytes are diffed identical. |
 | 2 | **Network bulk import** | The graph is uploaded to a **running server** over REST (`bulk-import`, Mode A) and every structural count is round-tripped back over Bolt. |
-| 3 | **A production search schema** | **UNIQUENESS constraints** on `USER.id` / `ARTICLE.id` (which enforce the unique key AND back the id point-seek), **TEXT** + **FULLTEXT** over `ARTICLE.name`, a **relationship RANGE** on `LIKE.date`, a **composite** node index, the always-on **LOOKUP** token indexes, and an **existence constraint** on `ARTICLE.name` — declared over the wire and asserted `ONLINE`. |
-| 4 | **A concurrent read battery** | Eight families — direct friends, **friend-of-friend**, **mutual friends**, **top-liked** (aggregation + `ORDER BY` + `LIMIT`), degree, **TEXT `CONTAINS`**, **`LIKE.date` recent-window range** (a `RelIndexRangeSeek` run in an explicit read transaction — PROFILE-asserted at runtime, see [I8](#the-invariants-it-asserts)), and **FULLTEXT** `queryNodes` — driven by C simultaneous Bolt clients. |
+| 3 | **The most-appropriate id schema** | **UNIQUENESS constraints** on `USER.id` / `ARTICLE.id` — the whole schema of the minimal model: each enforces the unique key AND its backing index serves the id point-seek. Declared over the wire; no name/date search schema exists to declare. |
+| 4 | **A concurrent read battery** | Five pure-topology families — direct friends, **friend-of-friend**, **mutual friends**, **top-liked** (aggregation + `ORDER BY` + `LIMIT`), and degree — driven by C simultaneous Bolt clients. |
 | 5 | **Read scaling across cores** | The **server process** is sampled per-thread from `/proc` at each rung, so the report shows core utilisation and busy-thread count **vs C**. |
-| 6 | **A production-shaped read/write MIX, ON BY DEFAULT** | Every rung runs **twice** — writers off (control), then writers on (treatment) — so the **cost of the mix** is measured and nine concurrency **invariants** (I1–I9) are asserted. See [The read/write mix](#the-readwrite-mix). `SOCIAL_WRITERS=0` restores the read-only ladder. |
+| 6 | **A production-shaped read/write MIX, ON BY DEFAULT** | Every rung runs **twice** — writers off (control), then writers on (treatment) — so the **cost of the mix** is measured and the concurrency **invariants** (I1–I7, I9) are asserted. See [The read/write mix](#the-readwrite-mix). `SOCIAL_WRITERS=0` restores the read-only ladder. |
 | 7 | **Supernode traversal** | The `zipf` mode grows a heavy-tailed hub structure, **Zipf-skews the read anchors toward those hubs** (`SOCIAL_ANCHOR_SKEW`), and asserts a read landed on one (I9). |
 | 8 | **Explicit evidence** | A schema-versioned `report.json` + `report.md`: the per-rung scaling curve, real p50/p99/p99.9 per family, server CPU/RSS, and the **decomposed** on-disk footprint. |
 
@@ -151,11 +153,13 @@ cost of the mix is a conservative **lower bound**.
 
 The writers are a **trickle, not a storm**: 2 writers, one business unit every 20 ms, each driven
 through **managed retry** (bounded exponential backoff + jitter — what `session.execute_write` does in
-every official driver). 25% of the units read-modify-write one of 4 *trending* articles
-(`SET a.hot = coalesce(a.hot,0)+1`); the rest touch a random user's `registered` timestamp. Both shapes
-are property `SET`s on existing nodes, so the mix changes property **values** but never the element
-**population** — which is why this example can still honestly report `storage.bytes_per_node` (the
-dataset counts still describe the graph the store image holds).
+every official driver). Every unit is a **topological write** — it appends a `(:USER)-[:LIKE]->(:ARTICLE)`
+edge (the minimal model has no scalar properties to `SET`). 25% of the units target one of 4 *trending*
+articles, so concurrent hot writers append a `:LIKE` to the **same** article and contend on its incidence
+chain (the shape that lets SSI fire); the rest link to a random article. The mix therefore **grows** the
+graph with `:LIKE` edges (bounded per run). The durable footprint and `metadata.dataset` counts are
+measured at **load time**, before the writers commit, so they still describe exactly the graph the store
+image was sized on — the honest denominator for `storage.bytes_per_node`.
 
 ### Two layers of truth, never conflated
 
@@ -195,9 +199,11 @@ A violation **fails the run**. None is a performance threshold; they are stateme
 | **I4** | **A serialization abort stays retryable** — the `rmp` #612 detector. |
 | **I5** | **A slow reader does not stall the writers** — the GC pin (`rmp` #551). |
 | **I6** | **No read ever fails with an internal server error** (`Neo.DatabaseError.*`). |
-| **I7** | **Reads return correct results** — a sampled fraction of `degree` / `friends` / `mutual` replies is checked against ground truth recomputed from the generator (`rmp` #744). |
-| **I8** | **`like_recent` genuinely SEEKS the `LIKE.date` rel-RANGE index** — PROFILEd over the wire under load: the recent-window seek reads a **small fraction** of the dbHits an unrestricted full `LIKE` type scan reads. A plan naming the index it then scans **fails** here instead of passing behind a green tick (`rmp` #746). |
+| **I7** | **Reads return correct results** — a sampled fraction of `degree` / `friends` / `mutual` replies is checked against ground truth recomputed from the generator (`rmp` #744). The `:LIKE` writes never touch the FRIEND topology, so this oracle stays valid for the whole run. |
 | **I9** | **Anchor-skew landed a read on a hub** — on a power-law graph with `--anchor-skew > 0`, the max queried anchor degree reaches a hub floor; N/A (never a false red) when the skew is off, the graph is uniform, or the config could not be reconstructed (`rmp` #746). |
+
+(There is no I8 in the minimal model: the `like_recent` rel-RANGE-seek proof needed the removed
+`LIKE.date` property + index.)
 
 Three honesty notes, because a gate that cannot fire is worse than no gate:
 
@@ -207,21 +213,10 @@ Three honesty notes, because a gate that cannot fire is worse than no gate:
   a reassuring pass. Raise `--writers` / lower `--write-every-ms` / lower `--hot-keys` to exercise it.
 - **I6 fails intermittently, and it is meant to.** Turning the mix on exposed a real server bug, filed as
   **`rmp` #721**: an off-thread reader intermittently cannot locate a record (`Prop/Rel store page N not
-  allocated`) while a writer **grows** the store, because its location oracle is a *snapshot* while the
-  record content it navigates is *live*. The writers-off control arm of the same ladder is **clean at
-  every rung** — which is exactly why a read-only ladder could never have found it.
-- **I8 measures the seek, it does not trust the plan.** The planner can name a `RelIndexRangeSeek` in the
-  plan while the engine actually runs a full scan (`rmp` #755) — a green tick over a lie. So I8 PROFILEs
-  the recent-window query *under load* and compares its **measured** dbHits (~2.9k) against an
-  unrestricted full `LIKE` type scan, which no index serves. Only the number, not the operator name,
-  tells a genuine seek from a scan.
-
-  The reference is deliberately a real index-free scan and **not** "the same query auto-committed".
-  That earlier contrast was written against `rmp` #755, when the off-thread reader pool declined an
-  index seek to a scan — but `rmp` #769 gave the pool relationship-index seek parity, so both paths now
-  seek (measured: `seek == scan == 2907` dbHits, both genuine). A gate whose PASS condition depends on a
-  known defect still being present reports **FAIL on the improvement that fixes it**, which is how this
-  one was caught.
+  allocated`) while a writer **grows** the store — and the topological `:LIKE`-append mix grows it on
+  every write — because the reader's location oracle is a *snapshot* while the record content it navigates
+  is *live*. The writers-off control arm of the same ladder is **clean at every rung** — which is exactly
+  why a read-only ladder could never have found it.
 
 ## The evidence it collects
 
@@ -246,14 +241,13 @@ C=8; extend `SOCIAL_LADDER` to find the knee.
 
 ### Per-family latency — where the tail comes from
 
-Two families cost far more than the rest. To separate a genuinely **slow query** from a merely
+One family costs far more than the rest. To separate a genuinely **slow query** from a merely
 **contended** one, measure both uncontended (`SOCIAL_LADDER=1`, same op budget) and at saturation:
 
 | Family | p50 @ C=1 (uncontended) | p50 @ C=8 (saturated) | Why |
 |--------|------------------------:|----------------------:|-----|
-| friends, degree, mutual, friend-of-friend, `CONTAINS`, FULLTEXT | ~2.2 ms | ~2.2–2.8 ms | index-backed seeks + bounded traversal |
-| **`like_recent`** (`LIKE.date >= X`, the recent ~10% window) | **6.3 ms** | 11.6 ms | a `RelIndexRangeSeek` on the `LIKE.date` rel-RANGE index (`rmp` #680), run in an **explicit read transaction** (`BEGIN`/`RUN`/`COMMIT` = 3 round-trips). PROFILE-measured (I8): **2907 dbHits over the narrow recent window vs 22595 for an unrestricted full `LIKE` type scan**, a **7.8× reduction in reads-touched**. Wall latency is dominated by the round-trips at this small scale, not the dbHits, so it stays a few ms above the point reads — the win is in reads-touched, provable at any size |
-| **`top_liked`** (aggregation + `ORDER BY` + `LIMIT`) | **12.6 ms** | 20.5 ms | a full aggregation scan over every `LIKE` edge |
+| friends, degree, mutual, friend-of-friend | ~2.2 ms | ~2.2–2.8 ms | id-seek-anchored bounded traversal |
+| **`top_liked`** (aggregation + `ORDER BY` + `LIMIT`, returns `a.id`) | **12.6 ms** | 20.5 ms | a full aggregation scan over every `LIKE` edge |
 
 The cost is **intrinsic to the query, not to the contention**: even alone on an idle server these two
 run 5–6× every other family. That is the example doing its job — it names the two read-path costs
@@ -295,13 +289,15 @@ zero recovery panics, zero force-detaches).
 
 ## CI coverage
 
-`graphus-social-gen`'s own tests exercise the `fast`-profile load, the read-query battery, the shape
-invariants, the search schema, and the generator's byte-identical determinism + degree-band + id/name
-invariants — including the power-law degree law and the on-disk footprint decomposition.
+`graphus-social-gen`'s own tests exercise the `fast`-profile load, the pure-topology read-query battery,
+the shape invariants, the id-uniqueness schema, and the generator's byte-identical determinism +
+degree-band + unique-`u64`-id invariants — including the power-law degree law and the on-disk footprint
+decomposition.
 
-The search schema is additionally pinned by a **hermetic schema mirror**,
-`graphus-server/tests/social_network_large_schema.rs`, which drives the equivalent `CREATE … INDEX` /
-`CREATE CONSTRAINT` **strings** through the REAL admin-DDL + `LocalEngine` seam (the exact seam the
-Bolt/REST admin surfaces use) and asserts the full `SHOW INDEXES` / `SHOW CONSTRAINTS` column set, the
-honest relationship-RANGE planner utilisation (`RelIndexSeek` for equality, `RelIndexRangeSeek` for a
-range — `rmp` #680), the TEXT/FULLTEXT known-set search, and the existence-constraint enforcement.
+The id schema is additionally pinned by a **hermetic schema mirror**,
+`graphus-server/tests/social_network_large_schema.rs`, which drives the equivalent `CREATE CONSTRAINT`
+**strings** through the REAL admin-DDL + `LocalEngine` seam (the exact seam the Bolt/REST admin surfaces
+use) and asserts the `SHOW INDEXES` / `SHOW CONSTRAINTS` column set (only the two always-on LOOKUP indexes
++ the two id uniqueness constraints), the planner utilisation of the uniqueness-constraint backing index
+(a `MATCH (:USER {id: <int>})` point lookup lowers to a `NodeIndexSeek`), and the id-uniqueness
+enforcement on a duplicate write.

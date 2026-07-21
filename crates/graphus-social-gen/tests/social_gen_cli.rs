@@ -79,21 +79,15 @@ fn csv_format_writes_four_files_with_correct_headers_and_counts() {
         .expect("spawn social_gen");
     assert!(status.success(), "social_gen --format csv should succeed");
 
-    assert_eq!(
-        read_header(&out.join("users.csv")),
-        ":ID,:LABEL,id:long,name:string,registered:long"
-    );
-    assert_eq!(
-        read_header(&out.join("articles.csv")),
-        ":ID,:LABEL,id:long,name:string,registered:long"
-    );
+    assert_eq!(read_header(&out.join("users.csv")), ":ID,:LABEL,id:long");
+    assert_eq!(read_header(&out.join("articles.csv")), ":ID,:LABEL,id:long");
     assert_eq!(
         read_header(&out.join("friends.csv")),
-        ":START_ID,:END_ID,:TYPE,since:long"
+        ":START_ID,:END_ID,:TYPE"
     );
     assert_eq!(
         read_header(&out.join("likes.csv")),
-        ":START_ID,:END_ID,:TYPE,date:long"
+        ":START_ID,:END_ID,:TYPE"
     );
 
     // Node counts are exact (fixed by --users/--articles); FRIEND/LIKE counts are only bounded by

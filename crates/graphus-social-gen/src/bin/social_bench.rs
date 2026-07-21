@@ -67,7 +67,7 @@ use graphus_examples_harness::{
     CpuSection, DatasetScale, EvidenceCollector, MemorySection, RunMetadata, StorageSection,
 };
 use graphus_reco_gen::bench::{self, Pcts};
-use graphus_reco_gen::client::{BoltClient, BoltUrl, ClientError, ClientResult, QueryResult};
+use graphus_reco_gen::client::{BoltClient, BoltUrl, ClientResult, QueryResult};
 use graphus_reco_gen::mix::{
     self, Arm, ErrorSample, READ_LIVENESS_FLOOR, ReadInvariant, RetryPolicy, WriteKind, WriteVector,
 };
@@ -77,7 +77,7 @@ use graphus_reco_gen::mix::{
 // workload RNG below and the backoff RNG are interchangeable.
 use graphus_reco_gen::SplitMix64 as BackoffRng;
 use graphus_social_gen::{
-    DegreeDist, EPOCH_S, GenConfig, Generator, SplitMix64, ZipfRanks, battery, hub_degree_floor,
+    DegreeDist, GenConfig, Generator, SplitMix64, ZipfRanks, battery, hub_degree_floor,
     is_hub_degree,
 };
 
@@ -179,13 +179,8 @@ fn run() -> Result<bool, String> {
     let target = args.target()?;
     let external = target.is_external();
 
-    let (term, _hits) = Generator::dominant_headline_term_for(args.seed, args.articles.max(1));
-    // The `like_recent` recent-window cutoff (`rmp` #746): the last ~10% of the timeline, narrow enough
-    // that the `LIKE.date` rel-RANGE index SEEK is genuinely selective (proven by I8 below).
-    let since = battery::LIKE_RECENT_SINCE;
-
     // Capability preflight: connect once, warm each family, keep only the families the target serves.
-    let active = preflight_active_families(&target, &args, &term, since)?;
+    let active = preflight_active_families(&target, &args)?;
     if active.is_empty() {
         return Err(
             "no read-battery family could be served by the target (preflight failed for all)"
@@ -217,8 +212,6 @@ fn run() -> Result<bool, String> {
         read_timeout: Duration::from_millis(args.read_timeout_ms),
         users: args.users.max(1),
         articles: args.articles.max(1),
-        term,
-        since,
         verify_fraction: args.verify_fraction,
         oracle,
         ops_per_rung: args.ops_per_rung,
@@ -380,12 +373,9 @@ fn run() -> Result<bool, String> {
 
     print_report(&ctx, &rungs, proc_available, external);
     let mut invariants = check_invariants(&rungs, probe.as_ref(), &ctx);
-    // I8 (`rmp` #746): PROVE the `like_recent` family genuinely SEEKS the LIKE.date rel-RANGE index at
-    // runtime — over the wire, under load, with PROFILE-measured dbHits — so a plan naming the index it
-    // then scans (`rmp` #755) FAILS the run instead of passing behind a green tick. It also prints the
-    // GRAPHUS_SOCIAL_INDEX_PROOF sentinel run.sh asserts on.
-    invariants.push(prove_like_recent(&ctx));
     // I9 (`rmp` #746): assert `--anchor-skew` actually landed a read on a supernode (N/A off/uniform).
+    // (There is no I8 in the minimal model: the `like_recent` rel-RANGE-seek proof needed the removed
+    // `LIKE.date` property + index.)
     invariants.push(check_anchor_hub(&rungs, &ctx));
     let invariants_ok = print_invariants(&invariants);
     print_client_stats_sentinels(&rungs, probe.as_ref(), external, invariants_ok);
@@ -441,16 +431,10 @@ fn run() -> Result<bool, String> {
 // Capability preflight + weighted mix
 // ============================================================================================
 
-/// Connects once, warms every battery family with one representative call, and returns the indices
-/// (into [`battery::ALL`]) the target actually served. A family that errors (e.g. `fulltext` without a
-/// FULLTEXT index on an older server) is dropped and noted — this is the version-tolerance seam AND
-/// the required warm-up before the measured ladder.
-fn preflight_active_families(
-    target: &Target,
-    args: &Args,
-    term: &str,
-    since: i64,
-) -> Result<Vec<usize>, String> {
+/// Connects once, warms every (topology) battery family with one representative call, and returns the
+/// indices (into [`battery::ALL`]) the target actually served. A family that errors is dropped and noted
+/// — this is the version-tolerance seam AND the required warm-up before the measured ladder.
+fn preflight_active_families(target: &Target, args: &Args) -> Result<Vec<usize>, String> {
     let mut client = target
         .connect(Duration::from_millis(args.read_timeout_ms))
         .map_err(|e| format!("preflight connect failed: {e}"))?;
@@ -461,16 +445,8 @@ fn preflight_active_families(
     let u1 = Generator::user_id(1 % args.users.max(1));
     let mut active = Vec::new();
     for (i, fam) in battery::ALL.iter().enumerate() {
-        let params = op_params(fam.params, u0, u1, term, since);
-        // `like_recent` (Params::Recent) is warmed in an EXPLICIT read transaction — the same dispatch
-        // path the measured ladder uses for it, so the warm-up exercises the same dispatch. Every other
-        // family warms auto-commit.
-        let outcome = if fam.params == battery::Params::Recent {
-            read_in_read_txn(&mut client, fam.cypher, params, &args.db)
-        } else {
-            client.run(fam.cypher, params, &args.db)
-        };
-        match outcome {
+        let params = op_params(fam.params, u0, u1);
+        match client.run(fam.cypher, params, &args.db) {
             Ok(_) => active.push(i),
             Err(e) => eprintln!(
                 "social_bench: preflight: dropping family '{}' — target rejected it ({e})",
@@ -488,10 +464,9 @@ fn weighted_bag(active: &[usize]) -> Vec<usize> {
     let mut bag = Vec::new();
     for &i in active {
         let w = match battery::ALL[i].name {
-            "friends" | "degree" => 4,            // cheap point-anchored 1-hop counts
-            "fof" | "mutual" => 2,                // heavier multi-hop traversals
-            "text_contains" | "like_recent" => 2, // property/range scans
-            "top_liked" | "fulltext" => 1,        // whole-set aggregation / procedure
+            "friends" | "degree" => 4, // cheap point-anchored 1-hop counts
+            "fof" | "mutual" => 2,     // heavier multi-hop traversals
+            "top_liked" => 1,          // whole-`LIKE`-set aggregation
             _ => 1,
         };
         for _ in 0..w {
@@ -534,15 +509,9 @@ fn build_anchor_ranks(
     Some((perm, zipf))
 }
 
-/// Builds the per-op `Value` params for a family (anchors vary per op; `term`/`since` are fixed). The
-/// `u0`/`u1` id anchors are `u64` values in `[0, 2^63)` (see `Generator::entity_id`), so `as i64` is exact.
-fn op_params(
-    kind: battery::Params,
-    u0: u64,
-    u1: u64,
-    term: &str,
-    since: i64,
-) -> Vec<(String, Value)> {
+/// Builds the per-op `Value` params for a (topology) family (anchors vary per op). The `u0`/`u1` id
+/// anchors are `u64` values in `[0, 2^63)` (see `Generator::entity_id`), so `as i64` is exact.
+fn op_params(kind: battery::Params, u0: u64, u1: u64) -> Vec<(String, Value)> {
     match kind {
         battery::Params::None => vec![],
         battery::Params::User => vec![("u0".into(), Value::Integer(u0 as i64))],
@@ -552,42 +521,6 @@ fn op_params(
                 ("u1".into(), Value::Integer(u1 as i64)),
             ]
         }
-        battery::Params::Term => vec![("term".into(), Value::String(term.into()))],
-        battery::Params::FulltextTerm => vec![("term".into(), Value::String(term.to_lowercase()))],
-        battery::Params::Recent => vec![("since".into(), Value::Integer(since))],
-    }
-}
-
-/// Runs `cypher` inside an **explicit read transaction** (`BEGIN` → `RUN` → `COMMIT`) — the path that
-/// makes an index-backed read really SEEK its index (`rmp` #746/#755). An auto-commit read is dispatched
-/// to the off-thread reader pool. NOTE: the pool no longer declines index seeks for the kinds these
-/// examples exercise (`rmp` #768 node TEXT, #769 relationship), so this is the realistic production
-/// shape rather than a correctness requirement — MEASURED as identical dbHits either way. This is also the production `session.executeRead` shape.
-/// On any server `FAILURE` the connection is `RESET` back to `READY`, so one failed read cannot poison it.
-///
-/// Copied verbatim from `reco_bench` — it is transport-agnostic and depends only on the shared
-/// `graphus_reco_gen::client` seam (`begin` / `run_in_txn` / `commit` / `reset`).
-fn read_in_read_txn(
-    client: &mut BoltClient,
-    cypher: &str,
-    params: Vec<(String, Value)>,
-    db: &str,
-) -> ClientResult<QueryResult> {
-    let reset_on_failure = |client: &mut BoltClient, e: ClientError| -> ClientError {
-        if matches!(e, ClientError::Failure(_)) {
-            let _ = client.reset();
-        }
-        e
-    };
-    if let Err(e) = client.begin(db) {
-        return Err(reset_on_failure(client, e));
-    }
-    match client.run_in_txn(cypher, params) {
-        Ok(qr) => match client.commit() {
-            Ok(()) => Ok(qr),
-            Err(e) => Err(reset_on_failure(client, e)),
-        },
-        Err(e) => Err(reset_on_failure(client, e)),
     }
 }
 
@@ -604,8 +537,6 @@ struct BenchCtx {
     read_timeout: Duration,
     users: u64,
     articles: u64,
-    term: String,
-    since: i64,
     ops_per_rung: u64,
     min_ops_per_client: u64,
     write_every_ms: u64,
@@ -718,38 +649,30 @@ impl BenchCtx {
 
     /// The Cypher + parameters of one write **business unit**, drawn from this writer's own RNG.
     ///
-    /// [`WriteKind::Common`] (the bulk) touches a RANDOM user's `registered` timestamp and hardly ever
-    /// conflicts; [`WriteKind::Hot`] is a read-modify-write of one of the `hot_keys` trending articles
-    /// (`SET a.hot = coalesce(a.hot, 0) + 1`) — the component that actually exercises SSI, because two
-    /// concurrent read-modify-writes of the same node are precisely the rw-antidependency cycle SSI
-    /// exists to break. Returns `(kind, cypher, params)`.
-    fn write_unit(
-        &self,
-        rng: &mut SplitMix64,
-        ts: i64,
-    ) -> (WriteKind, &'static str, Vec<(String, Value)>) {
-        match mix::pick_write_kind(rng.next_u64(), self.hot_write_fraction) {
+    /// Both variants APPEND a `:LIKE` edge (the minimal model has no scalar properties to `SET`):
+    /// [`WriteKind::Common`] (the bulk) links a random user to a RANDOM article and hardly ever conflicts;
+    /// [`WriteKind::Hot`] links a random user to one of the `hot_keys` TRENDING articles, so two
+    /// concurrent hot writers append a `:LIKE` to the SAME article — contending on its relationship
+    /// incidence chain, the shape that can make SSI (and the driver's retry path) fire. It grows the
+    /// graph with `:LIKE` edges during the mix (bounded per run). Returns `(kind, cypher, params)`.
+    fn write_unit(&self, rng: &mut SplitMix64) -> (WriteKind, &'static str, Vec<(String, Value)>) {
+        // The ids are `u64` in `[0, 2^63)` (see `Generator::entity_id`), so `as i64` is exact.
+        let kind = mix::pick_write_kind(rng.next_u64(), self.hot_write_fraction);
+        let uid = Generator::user_id(rng.next_u64() % self.users);
+        let aid = match kind {
             WriteKind::Hot => {
-                // The id is a `u64` in `[0, 2^63)` (see `Generator::entity_id`), so `as i64` is exact.
-                let aid = Generator::article_id(rng.next_u64() % self.hot_keys.min(self.articles));
-                (
-                    WriteKind::Hot,
-                    battery::WRITE_ARTICLE_HOT,
-                    vec![("id".to_string(), Value::Integer(aid as i64))],
-                )
+                Generator::article_id(rng.next_u64() % self.hot_keys.min(self.articles))
             }
-            WriteKind::Common => {
-                let uid = Generator::user_id(rng.next_u64() % self.users);
-                (
-                    WriteKind::Common,
-                    battery::WRITE_USER_TOUCH,
-                    vec![
-                        ("id".to_string(), Value::Integer(uid as i64)),
-                        ("ts".to_string(), Value::Integer(ts)),
-                    ],
-                )
-            }
-        }
+            WriteKind::Common => Generator::article_id(rng.next_u64() % self.articles),
+        };
+        (
+            kind,
+            battery::WRITE_LIKE_CREATE,
+            vec![
+                ("u".to_string(), Value::Integer(uid as i64)),
+                ("a".to_string(), Value::Integer(aid as i64)),
+            ],
+        )
     }
 }
 
@@ -1059,21 +982,13 @@ fn run_worker(
         }
         let u0 = Generator::user_id(u0_idx);
         let u1 = Generator::user_id(u1_idx);
-        let params = op_params(fam.params, u0, u1, &ctx.term, ctx.since);
+        let params = op_params(fam.params, u0, u1);
         // Sample this op for I7 verification (before the round-trip, so the decision is deterministic).
         let sample = verify_every != 0 && read_ix % verify_every == 0;
         read_ix += 1;
         let op_start = scheduled.unwrap_or_else(Instant::now);
-        // `like_recent` (Params::Recent) runs in an explicit read transaction — the realistic
-        // `session.executeRead` shape, and the one I8 profiles. NOTE: this is no longer *required* for
-        // the seek; `rmp` #769 gave the off-thread reader pool relationship-index seek parity, so the
-        // auto-commit path seeks identically (MEASURED: 2907 dbHits either way). It costs 3 round-trips
-        // per op. Every other family hits its path auto-commit (SI, cannot abort — I1).
-        let outcome = if fam.params == battery::Params::Recent {
-            read_in_read_txn(&mut client, fam.cypher, params, &ctx.db)
-        } else {
-            client.run(fam.cypher, params, &ctx.db)
-        };
+        // Every topology family reads auto-commit (Snapshot Isolation — a read can never abort, I1).
+        let outcome = client.run(fam.cypher, params, &ctx.db);
         match outcome {
             Ok(result) => {
                 // Latency is stamped FIRST, so the (sampled-only) verification never inflates it.
@@ -1112,10 +1027,11 @@ fn run_worker(
 ///
 /// It connects, then — every `write_every_ms` until stopped — drives ONE **business unit** through
 /// [`mix::run_managed_write`]: managed retry with bounded exponential backoff and jitter, the same
-/// contract `session.execute_write` gives an application. The unit is either the low-conflict
-/// [`battery::WRITE_USER_TOUCH`] on a random user or — with probability `hot_write_fraction` — a
-/// read-modify-write of one of the `hot_keys` trending articles ([`battery::WRITE_ARTICLE_HOT`]),
-/// which is what makes SSI and the retry path load-bearing rather than dead code.
+/// contract `session.execute_write` gives an application. The unit APPENDS a
+/// [`battery::WRITE_LIKE_CREATE`] `:LIKE` edge: to a random article (the low-conflict bulk) or — with
+/// probability `hot_write_fraction` — to one of the `hot_keys` TRENDING articles, so concurrent hot
+/// writers contend on the same article's incidence chain (what makes SSI and the retry path
+/// load-bearing rather than dead code).
 ///
 /// `writer_ix` salts the seed stream so concurrent writers do not replay the same key sequence.
 /// Returns this writer's own [`WriteVector`], built from **per-unit locals** — never by differencing a
@@ -1149,14 +1065,12 @@ fn spawn_writer(
                 ^ 0x5757_5252_0000_0001,
         );
         let mut backoff_rng = BackoffRng::new(rng.next_u64());
-        let mut ts: i64 = EPOCH_S as i64;
         while !stop.load(Ordering::Relaxed) {
             thread::sleep(Duration::from_millis(ctx.write_every_ms));
             if stop.load(Ordering::Relaxed) {
                 break;
             }
-            ts = ts.wrapping_add(1);
-            let (_kind, cypher, params) = ctx.write_unit(&mut rng, ts);
+            let (_kind, cypher, params) = ctx.write_unit(&mut rng);
             // The unit's OWN local outcome — the only thing folded into the shared vector.
             let outcome = mix::run_managed_write(&ctx.retry, &mut backoff_rng, || {
                 client.run(cypher, params.clone(), &ctx.db).map(|_| ())
@@ -1359,7 +1273,7 @@ fn run_slow_reader_probe(ctx: &Arc<BenchCtx>, probe_secs: f64) -> ProbeResult {
                 loop {
                     let u0 = Generator::user_id(rng.next_u64() % ctx.users);
                     let u1 = Generator::user_id(rng.next_u64() % ctx.users);
-                    let params = op_params(family.params, u0, u1, &ctx.term, ctx.since);
+                    let params = op_params(family.params, u0, u1);
                     let op = Instant::now();
                     match client.run(family.cypher, params, &ctx.db) {
                         Ok(_) => {
@@ -2200,7 +2114,7 @@ fn check_invariants(
                 "{verify_ok} sampled read(s) returned CORRECT results (degree / friends / mutual \
                  recomputed from the generator; {verify_skipped} sampled read(s) fell on \
                  non-reconstructed families / degenerate anchors and were skipped). The FoF / \
-                 top-liked / text / fulltext families are not reconstructed here."
+                 top-liked families are not reconstructed here."
             ),
         )
     };
@@ -2229,203 +2143,6 @@ fn print_invariants(invariants: &[Invariant]) -> bool {
         ok &= i.ok;
     }
     ok
-}
-
-// ============================================================================================
-// I8 — the like_recent index-seek PROOF (the LIKE.date rel-RANGE index is USED at runtime, rmp #746)
-// ============================================================================================
-
-/// A profiled read: the plan's operators and its **measured** total `dbHits` (`rmp` #752).
-struct ProfiledRead {
-    ops: Vec<String>,
-    db_hits: i64,
-}
-
-/// Reads back a `PROFILE`d reply's measured plan (whatever dispatch path produced it).
-///
-/// # Errors
-/// When the transport/statement failed, the reply carried no plan (a missing `PROFILE` prefix), or the
-/// plan reported no measured `dbHits`.
-fn profiled(result: ClientResult<QueryResult>) -> Result<ProfiledRead, String> {
-    let result = result.map_err(|e| e.to_string())?;
-    let plan = result.plan.as_ref().ok_or_else(|| {
-        "the reply carried no PROFILE plan (did the query keep its PROFILE prefix?)".to_string()
-    })?;
-    let ops = plan.operators();
-    let db_hits = plan
-        .total_db_hits()
-        .ok_or_else(|| "the PROFILE plan reported no measured dbHits".to_string())?;
-    Ok(ProfiledRead { ops, db_hits })
-}
-
-/// An index proof that could not even run (connect/login/statement fault): a hard FAIL.
-fn proof_error(id: &'static str, title: &'static str, msg: &str) -> Invariant {
-    Invariant {
-        id,
-        title,
-        ok: false,
-        detail: msg.to_string(),
-    }
-}
-
-/// An index proof skipped because the family is not served (attach/older server): informational PASS.
-fn proof_skipped(id: &'static str, title: &'static str, why: &str) -> Invariant {
-    Invariant {
-        id,
-        title,
-        ok: true,
-        detail: format!("SKIPPED — {why}"),
-    }
-}
-
-/// The `GRAPHUS_SOCIAL_INDEX_PROOF` sentinel `run.sh` asserts on (the placeholder form for the
-/// error/skip paths, where there are no measured dbHits to report).
-fn print_index_proof_sentinel_na(state: &str) {
-    println!(
-        "GRAPHUS_SOCIAL_INDEX_PROOF rel_range_op={state} rel_range_seek_hits=na rel_range_scan_hits=na"
-    );
-}
-
-/// PROVES, over the wire and UNDER LOAD, that the `like_recent` family genuinely SEEKS the `LIKE.date`
-/// relationship RANGE index at runtime — not merely that the planner named it (`rmp` #746/#755).
-///
-/// Two things are PROFILEd while the same paced writers commit underneath: (1) the recent-window range
-/// query, which must lower to `RelIndexRangeSeek`; (2) an unrestricted full `LIKE` type scan, which no
-/// index serves — the STORE-SCALE reference. The gate ([`bench::index_seek_verdict`]) asserts the
-/// operator is present AND the seek's dbHits are a small fraction (`× 4 <`) of that scan's.
-///
-/// The reference is deliberately a real index-free scan rather than "the same query auto-committed".
-/// The latter was written against `rmp` #755 (the reader pool declining a seek to a scan), but #769 gave
-/// the pool relationship-index seek parity — both paths now seek, measured as seek == scan == 2907 — so
-/// that gate would report FAIL on the very improvement that fixed it. A gate must not depend on a known
-/// defect persisting.
-///
-/// A relationship RANGE index is a B-tree / MVCC-exact index — it does NOT ride the `rmp` #467
-/// latest-state freshness marker a TEXT/trigram index does — so this SEEKS correctly EVEN with writers
-/// active. Prints the `GRAPHUS_SOCIAL_INDEX_PROOF` sentinel (in EVERY path) and returns the I8 invariant.
-/// If the target does not serve `like_recent` (dropped in the capability preflight — an older server
-/// without the rel-RANGE index), the proof is SKIPPED (informational PASS), as reco does for its
-/// index-backed families.
-fn prove_like_recent(ctx: &Arc<BenchCtx>) -> Invariant {
-    const T8: &str =
-        "like_recent genuinely SEEKS the LIKE.date rel-RANGE index, not the rmp #755 scan (I8)";
-
-    let served = battery::ALL
-        .iter()
-        .position(|f| f.name == "like_recent")
-        .is_some_and(|ix| ctx.active.contains(&ix));
-    if !served {
-        print_index_proof_sentinel_na("skipped");
-        return proof_skipped(
-            "I8",
-            T8,
-            "the like_recent family is not served by this target",
-        );
-    }
-    let mut client = match ctx.target.connect(ctx.read_timeout) {
-        Ok(c) => c,
-        Err(e) => {
-            print_index_proof_sentinel_na("error");
-            return proof_error("I8", T8, &format!("index-proof connect failed: {e}"));
-        }
-    };
-    if client.login(&ctx.user, &ctx.password).is_err() {
-        print_index_proof_sentinel_na("error");
-        return proof_error("I8", T8, "index-proof login failed");
-    }
-
-    // Under LOAD: the same paced writers the mix uses commit underneath the profiled reads, so the seek
-    // is certified WHILE writes are landing (not on a frozen graph). `usize::MAX - 1` keeps this window's
-    // write stream from replaying any ladder rung's.
-    let stop = Arc::new(AtomicBool::new(false));
-    let mut writer_handles: Vec<JoinHandle<WriteVector>> = Vec::new();
-    for wi in 0..ctx.effective_writers() {
-        writer_handles.push(spawn_writer(
-            Arc::clone(ctx),
-            Arc::clone(&stop),
-            usize::MAX - 1,
-            wi,
-        ));
-    }
-
-    let params = vec![("since".to_string(), Value::Integer(ctx.since))];
-    let profiled_q = format!("PROFILE {}", battery::LIKE_RECENT.cypher);
-    // (1) Explicit read transaction — seeks RelIndexRangeSeek inline on the engine thread.
-    let seek = profiled(read_in_read_txn(
-        &mut client,
-        &profiled_q,
-        params.clone(),
-        &ctx.db,
-    ));
-    // (2) The STORE-SCALE reference: an unrestricted full `LIKE` type scan, which no index serves.
-    //
-    // This is deliberately NOT "the same query auto-committed". That contrast was written against
-    // `rmp` #755 (the off-thread reader pool declining an index seek to a full scan), but #769 gave the
-    // reader pool relationship-index seek parity, so the auto-commit path now SEEKS too — measured here
-    // as seek == scan == 2907 dbHits, both of them genuine seeks. A gate whose PASS condition depends on
-    // a known defect still being present INVERTS as soon as the defect is fixed: it reports FAIL on an
-    // improvement. Comparing against a real index-free scan instead measures the property actually
-    // claimed — the seek reads a small fraction of the type — and stays valid however the read is
-    // dispatched.
-    let scan = profiled(client.run(
-        "PROFILE MATCH ()-[l:LIKE]->(:ARTICLE) RETURN count(l) AS hits",
-        vec![],
-        &ctx.db,
-    ));
-
-    stop.store(true, Ordering::Relaxed);
-    for h in writer_handles {
-        let _ = h.join();
-    }
-    let _ = client.goodbye();
-
-    let (seek, scan) = match (seek, scan) {
-        (Ok(s), Ok(c)) => (s, c),
-        (Err(e), _) => {
-            print_index_proof_sentinel_na("error");
-            return proof_error("I8", T8, &format!("like_recent seek PROFILE failed: {e}"));
-        }
-        (_, Err(e)) => {
-            print_index_proof_sentinel_na("error");
-            return proof_error(
-                "I8",
-                T8,
-                &format!("like_recent scan-contrast PROFILE failed: {e}"),
-            );
-        }
-    };
-
-    let op_present = seek.ops.iter().any(|o| o == "RelIndexRangeSeek");
-    println!(
-        "GRAPHUS_SOCIAL_INDEX_PROOF rel_range_op={} rel_range_seek_hits={} rel_range_scan_hits={}",
-        if op_present {
-            "RelIndexRangeSeek"
-        } else {
-            "MISSING"
-        },
-        seek.db_hits,
-        scan.db_hits,
-    );
-    match bench::index_seek_verdict(op_present, seek.db_hits, scan.db_hits, 4) {
-        Ok(()) => Invariant {
-            id: "I8",
-            title: T8,
-            ok: true,
-            detail: format!(
-                "RelIndexRangeSeek: recent-window seek dbHits={} vs a {}-dbHit unrestricted full LIKE \
-                 type scan — a genuine rel-RANGE seek reading a small fraction of the type, not a plan \
-                 that names an index it then scans. A rel-RANGE index is B-tree / MVCC-exact, so it \
-                 seeks even while the writers commit underneath.",
-                seek.db_hits, scan.db_hits
-            ),
-        },
-        Err(m) => Invariant {
-            id: "I8",
-            title: T8,
-            ok: false,
-            detail: m,
-        },
-    }
 }
 
 // ============================================================================================
@@ -3328,8 +3045,7 @@ fn mix_cost_note(rungs: &[RungResult], best: &RungResult, primary: Arm) -> Strin
 /// * `mutual` (`RETURN count(DISTINCT m)`) — `|neighbours(u0) ∩ neighbours(u1)|`, skipped when
 ///   `u0 == u1` (Cypher relationship-uniqueness makes that degenerate case depend on multi-edges).
 ///
-/// `fof` / `top_liked` / `text_contains` / `like_recent` / `fulltext` are deliberately not
-/// reconstructed (2-hop closures, global aggregations, and substring/full-text scans).
+/// `fof` / `top_liked` are deliberately not reconstructed (2-hop closures and global aggregations).
 struct SocialReadOracle {
     /// Number of users in the loaded graph (bounds the anchor index).
     users: u64,
@@ -3879,8 +3595,6 @@ mod tests {
             read_timeout: Duration::from_millis(1000),
             users: 1000,
             articles: 100,
-            term: "term".into(),
-            since: 0,
             verify_fraction: 0.0,
             oracle: None,
             ops_per_rung: 1500,
@@ -3971,30 +3685,25 @@ mod tests {
         assert_eq!(ctx(2, 20, 0.25).arms(false), vec![Arm::Mixed]);
     }
 
-    /// Both write shapes are property SETs on an EXISTING node: the common one touches a random user,
-    /// the hot one read-modify-writes a trending article. The hot shape is the only one that makes SSI
+    /// Both write shapes APPEND a `:LIKE` edge (the minimal model has no scalar properties to `SET`):
+    /// the common one links to a random article, the hot one to the trending set (concurrent hot writers
+    /// contend on the same article). Both carry `$u` + `$a`; the hot shape is the only one that makes SSI
     /// (and therefore the retry path) load-bearing — a purely random stream conflicts with nobody.
     #[test]
     fn the_write_unit_draws_both_shapes_and_confines_the_hot_one_to_the_trending_set() {
         let c = ctx(2, 20, 0.5);
         let mut rng = SplitMix64::new(1);
         let (mut hot, mut common) = (0u32, 0u32);
-        for i in 0..500 {
-            let (kind, cypher, params) = c.write_unit(&mut rng, i);
+        for _ in 0..500 {
+            let (kind, cypher, params) = c.write_unit(&mut rng);
+            // Both shapes are the same topological `:LIKE` append, anchored by `$u` + `$a`.
+            assert_eq!(cypher, battery::WRITE_LIKE_CREATE);
+            assert_eq!(params.len(), 2, "the LIKE write carries $u and $a");
+            assert_eq!(params[0].0, "u");
+            assert_eq!(params[1].0, "a");
             match kind {
-                WriteKind::Hot => {
-                    hot += 1;
-                    assert_eq!(cypher, battery::WRITE_ARTICLE_HOT);
-                    assert_eq!(params.len(), 1, "the hot write is anchored by $id alone");
-                    assert_eq!(params[0].0, "id");
-                }
-                WriteKind::Common => {
-                    common += 1;
-                    assert_eq!(cypher, battery::WRITE_USER_TOUCH);
-                    assert_eq!(params.len(), 2, "the common write carries $id and $ts");
-                    assert_eq!(params[0].0, "id");
-                    assert_eq!(params[1].0, "ts");
-                }
+                WriteKind::Hot => hot += 1,
+                WriteKind::Common => common += 1,
             }
         }
         assert!(

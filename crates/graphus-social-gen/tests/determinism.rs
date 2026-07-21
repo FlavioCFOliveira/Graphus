@@ -3,13 +3,13 @@
 //! The generator's whole value as an example fixture is reproducibility: the same [`GenConfig`] must
 //! produce a **byte-identical** Cypher graph on every run, host, and platform, so the example's
 //! CPU / RAM / storage performance claims are pinned to a fixed input. These tests assert the
-//! byte-identity, the configuration-model degree band, count consistency, and the node-property
-//! contracts (bounded UTF-8 names, unique non-negative `u64` ids). Kept on the `fast` profile so it is
-//! quick.
+//! byte-identity, the configuration-model degree band, count consistency, and the id contract (unique
+//! non-negative `u64` ids — the only node property in the minimal model). Kept on the `fast` profile so
+//! it is quick.
 
 use std::collections::HashMap;
 
-use graphus_social_gen::{DegreeDist, GenConfig, Generator, MAX_NAME_BYTES};
+use graphus_social_gen::{DegreeDist, GenConfig, Generator};
 
 /// A `fast`-scale power-law config with a wide degree band, for the supernode / determinism tests.
 fn power_law_cfg() -> GenConfig {
@@ -188,29 +188,6 @@ fn summary_counts_match_the_generated_text() {
 }
 
 #[test]
-fn every_user_name_is_bounded_valid_utf8() {
-    let cfg = GenConfig::fast();
-    for u in 0..cfg.users {
-        let name = Generator::user_name(cfg.seed, u);
-        assert!(
-            name.len() <= MAX_NAME_BYTES,
-            "user {u} name exceeds {MAX_NAME_BYTES} bytes: {name:?}"
-        );
-        assert!(!name.is_empty(), "user {u} name is empty");
-        // A `String` is valid UTF-8 by construction; assert it round-trips through bytes.
-        assert_eq!(
-            String::from_utf8(name.clone().into_bytes()).unwrap(),
-            name,
-            "user {u} name must be valid UTF-8"
-        );
-        assert!(
-            !name.contains('\''),
-            "user {u} name must not contain a quote"
-        );
-    }
-}
-
-#[test]
 fn every_id_is_a_unique_nonnegative_integer() {
     use std::collections::HashSet;
     let cfg = GenConfig::fast();
@@ -242,8 +219,8 @@ fn every_id_is_a_unique_nonnegative_integer() {
 }
 
 /// Extracts every `id: <integer>` value on a line, in order (the two `USER` endpoint ids of a FRIEND
-/// statement, now unquoted `u64` integers). Matches the `id: ` key exactly, so the `since:` property is
-/// not mistaken for an id.
+/// statement, unquoted `u64` integers). The FRIEND statement carries no other `id: ` key in the minimal
+/// (property-less-relationship) model.
 fn extract_ids(line: &str) -> Vec<u64> {
     let mut out = Vec::new();
     let mut rest = line;

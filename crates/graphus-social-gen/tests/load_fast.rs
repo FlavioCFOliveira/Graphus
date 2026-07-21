@@ -117,14 +117,14 @@ fn fast_profile_loads_and_traverses() {
 }
 
 #[test]
-fn fast_profile_declares_search_schema_and_searches_headlines() {
+fn fast_profile_declares_minimal_id_schema() {
     let cfg = GenConfig::fast();
 
     let dir = TempDir::new("schema");
     let out = run_load_isolated(&cfg, &dir.path, LoadOpts::default());
 
-    // --- The production-realistic search schema is declared, correctly typed, and Online. ---------
-    assert!(out.schema_applied, "the search schema must be applied");
+    // --- The minimal (near-pure-topology) schema is declared, correctly typed, and Online. ---------
+    assert!(out.schema_applied, "the id schema must be applied");
     let online = |name: &str, kind: &str, entity: &str| {
         let idx = out
             .index(name)
@@ -133,31 +133,27 @@ fn fast_profile_declares_search_schema_and_searches_headlines() {
         assert_eq!(idx.entity, entity, "{name} entity");
         assert_eq!(idx.state, "ONLINE", "{name} state");
     };
-    // The two always-on token LOOKUP indexes are surfaced.
+    // Only the two always-on token LOOKUP indexes are surfaced (there is no name/date search schema; the
+    // id uniqueness-constraint backings are NOT listed by SHOW INDEXES).
     online("node_label_lookup_index", "LOOKUP", "NODE");
     online("rel_type_lookup_index", "LOOKUP", "RELATIONSHIP");
-    // The new index kinds: TEXT + FULLTEXT (node), relationship RANGE, composite (node) RANGE.
-    online("article_name_text", "TEXT", "NODE");
-    online("article_headline_fulltext", "FULLTEXT", "NODE");
-    online("like_date_range", "RANGE", "RELATIONSHIP");
-    online("article_catalog_composite", "RANGE", "NODE");
-    // The id read-path is now backed by UNIQUENESS constraints (below), not standalone RANGE indexes:
-    // a constraint's backing index is NOT listed by SHOW INDEXES, so neither id index appears here.
-    assert!(
-        out.index("user_id_range").is_none() && out.index("article_id_range").is_none(),
-        "the id RANGE indexes were replaced by uniqueness constraints (backings are not listed): {:?}",
-        out.indexes
-    );
+    for absent in [
+        "article_name_text",
+        "article_headline_fulltext",
+        "like_date_range",
+        "article_catalog_composite",
+        "user_id_range",
+        "article_id_range",
+    ] {
+        assert!(
+            out.index(absent).is_none(),
+            "the minimal model declares no `{absent}` index: {:?}",
+            out.indexes
+        );
+    }
 
-    // The existence constraint on ARTICLE.name is declared.
-    let cons = out
-        .constraint("article_name_exists")
-        .expect("existence constraint present");
-    assert_eq!(cons.kind, "NODE_PROPERTY_EXISTENCE");
-    assert_eq!(cons.properties, vec!["name".to_owned()]);
-
-    // The id UNIQUENESS constraints are declared (enforce the unique key AND back the `(:USER {id})` /
-    // `(:ARTICLE {id})` point-seeks).
+    // The whole schema: the two id UNIQUENESS constraints (enforce the unique key AND back the
+    // `(:USER {id})` / `(:ARTICLE {id})` point-seeks). No existence / name / date constraints remain.
     for (name, label) in [("user_id_unique", "USER"), ("article_id_unique", "ARTICLE")] {
         let c = out.constraint(name).unwrap_or_else(|| {
             panic!(
@@ -175,40 +171,11 @@ fn fast_profile_declares_search_schema_and_searches_headlines() {
             "{label}.id constraint property"
         );
     }
-
-    // --- The headline search: TEXT CONTAINS and FULLTEXT queryNodes return the SAME, generator-
-    //     derived article set (the term is a single-token subject word). ---------------------------
-    assert!(
-        out.search_expected > 1,
-        "the headline term must match multiple articles: {} -> {}",
-        out.search_term,
-        out.search_expected
-    );
-    let text = out.query("text_contains").expect("text_contains probe");
-    let ft = out.query("fulltext").expect("fulltext probe");
     assert_eq!(
-        text.scalar,
-        Some(out.search_expected as i64),
-        "TEXT CONTAINS '{}' returns the generator's {} articles",
-        out.search_term,
-        out.search_expected
-    );
-    assert_eq!(
-        ft.scalar,
-        Some(out.search_expected as i64),
-        "FULLTEXT queryNodes('{}') returns the same {} articles (analyzer lowercases, no stemming)",
-        out.search_term.to_lowercase(),
-        out.search_expected
-    );
-
-    // --- The LIKE.date recent-window range predicate (a `RelIndexRangeSeek` on the like_date_range
-    //     rel RANGE index since `rmp` #680) returns a non-trivial recent slice: 0 < recent < |LIKE|. --
-    let recent = out.query("like_recent").expect("like_recent probe");
-    let recent_n = recent.scalar.unwrap_or(-1);
-    assert!(
-        recent_n > 0 && (recent_n as u64) < out.like_count,
-        "LIKE.date recent-half range is a non-trivial slice: 0 < {recent_n} < {}",
-        out.like_count
+        out.constraints.len(),
+        2,
+        "exactly the two id uniqueness constraints: {:?}",
+        out.constraints
     );
 }
 
@@ -229,28 +196,14 @@ fn fast_profile_load_is_deterministic() {
     assert_eq!(a.friend_count, b.friend_count, "FRIEND count stable");
     assert_eq!(a.like_count, b.like_count, "LIKE count stable");
 
-    for name in [
-        "friends",
-        "fof",
-        "mutual",
-        "top_liked",
-        "degree",
-        "text_contains",
-        "fulltext",
-        "like_recent",
-    ] {
+    for name in ["friends", "fof", "mutual", "top_liked", "degree"] {
         let qa = a.query(name).expect("probe a");
         let qb = b.query(name).expect("probe b");
         assert_eq!(qa.rows, qb.rows, "{name} row count stable");
         assert_eq!(qa.scalar, qb.scalar, "{name} scalar stable");
     }
 
-    // The declared search schema + the headline ground truth are deterministic too.
-    assert_eq!(a.search_term, b.search_term, "search term stable");
-    assert_eq!(
-        a.search_expected, b.search_expected,
-        "search expected stable"
-    );
+    // The declared schema listings are deterministic too.
     assert_eq!(a.indexes, b.indexes, "index listing stable");
     assert_eq!(a.constraints, b.constraints, "constraint listing stable");
 
