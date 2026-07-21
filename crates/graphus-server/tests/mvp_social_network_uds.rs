@@ -44,6 +44,18 @@ use graphus_examples_harness::{
 const ADMIN_USER: &str = "alice";
 const ADMIN_PW: &str = "social-demo-pw-1";
 
+/// Serialises the two server-spawning E2E tests within this binary so at most one real
+/// `graphus-server` child from this binary is alive at a time (`rmp` #819). Combined with the
+/// single-threaded, low-buffer child config, this bounds this binary's peak footprint during a full
+/// `cargo test --workspace` run. Poison-tolerant: a panicking test must not wedge the other.
+static E2E_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn e2e_serial_guard() -> std::sync::MutexGuard<'static, ()> {
+    E2E_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// A private temp directory for one test run (store + config + socket), removed on drop.
 struct Workspace {
     root: PathBuf,
@@ -87,12 +99,31 @@ impl Workspace {
     /// our own connections). No network listener ⇒ no TLS material needed; the JWT secret is present
     /// only because the security catalog mandates a >=32-byte secret even when it is unused.
     fn write_config(&self) {
+        self.write_config_with_secret("graphus-mvp-social-demo-uds-only-secret-32+");
+    }
+
+    /// The config writer, parameterised on `jwt_secret` so the harness self-test
+    /// ([`spawn_retry_does_not_mask_a_genuine_startup_failure`]) can supply a deliberately-invalid
+    /// (too-short) secret to force a *deterministic* startup failure and prove the bounded spawn
+    /// retry does NOT mask a genuine crash.
+    ///
+    /// The reader and morsel pools are pinned to a single thread each (rather than the hardware-auto
+    /// `min(N,16)`): each of these E2E tests spawns a REAL `graphus-server` child, and under a full
+    /// `cargo test --workspace` run (~300 concurrent test binaries) an auto-sized child spun up
+    /// ~16 reader + 16 morsel threads, whose aggregate footprint made the sandbox reaper / OOM killer
+    /// kill a *starting* child — the whole-workspace flakiness of `rmp` #819. A single-threaded child
+    /// is functionally identical for these correctness/recovery tests (they assert data, not
+    /// parallelism) and keeps the footprint small; `buffer_pool_pages` is likewise already pinned low.
+    fn write_config_with_secret(&self, jwt_secret: &str) {
         let toml = format!(
             "store_path = {data:?}\n\
              buffer_pool_pages = 2048\n\
              uds_path = {sock:?}\n\
              rest_addr = \"\"\n\
-             jwt_secret = \"graphus-mvp-social-demo-uds-only-secret-32+\"\n\
+             jwt_secret = \"{jwt_secret}\"\n\
+             \n[admission]\n\
+             reader_threads = 1\n\
+             morsel_parallelism = 1\n\
              \n[auth]\n\
              admin_user = \"{user}\"\n\
              admin_password = \"{pw}\"\n\
@@ -153,24 +184,53 @@ struct ServerProcess {
 impl ServerProcess {
     /// Spawns `graphus-server <config>`, appending its stdout+stderr to the workspace log, and waits
     /// until the UDS is bound (readiness) — failing fast if the process dies during startup.
-    fn start(ws: &Workspace) -> Self {
-        let exe = env!("CARGO_BIN_EXE_graphus-server");
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(ws.log_path())
-            .unwrap();
-        let log_err = log.try_clone().unwrap();
-        let child = Command::new(exe)
-            .arg(ws.config_path())
-            .stdout(log)
-            .stderr(log_err)
-            .spawn()
-            .expect("spawn graphus-server");
+    /// Max spawn attempts (`rmp` #819). Under a full `cargo test --workspace` run the sandbox reaper /
+    /// OOM killer can kill a *starting* child on a transient resource spike; that is retried. A
+    /// *deterministic* startup failure (bad config, a genuine crash) reproduces on every attempt and
+    /// is surfaced — the retry never masks a real failure (proved by
+    /// `spawn_retry_does_not_mask_a_genuine_startup_failure`).
+    const MAX_SPAWN_ATTEMPTS: u32 = 6;
 
-        let mut proc = Self { child };
-        proc.wait_until_ready(&ws.socket_path(), &ws.log_path());
-        proc
+    fn start(ws: &Workspace) -> Self {
+        Self::try_start(ws, Self::MAX_SPAWN_ATTEMPTS).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Spawns `graphus-server <config>` with a bounded retry, returning `Err` (never panicking) so a
+    /// genuine, deterministic startup failure is observable rather than masked. On success the UDS is
+    /// bound; each failed attempt already reaped its child (`wait_until_ready`).
+    fn try_start(ws: &Workspace, max_attempts: u32) -> Result<Self, String> {
+        let exe = env!("CARGO_BIN_EXE_graphus-server");
+        let mut last = String::new();
+        for attempt in 1..=max_attempts {
+            // Clear any stale socket a prior killed attempt may have left, so `socket.exists()` below
+            // never reports a false readiness.
+            let _ = std::fs::remove_file(ws.socket_path());
+            let log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(ws.log_path())
+                .unwrap();
+            let log_err = log.try_clone().unwrap();
+            let child = Command::new(exe)
+                .arg(ws.config_path())
+                .stdout(log)
+                .stderr(log_err)
+                .spawn()
+                .map_err(|e| format!("spawn graphus-server: {e}"))?;
+            let mut proc = Self { child };
+            match proc.wait_until_ready(&ws.socket_path(), &ws.log_path()) {
+                Ok(()) => return Ok(proc),
+                Err(reason) => {
+                    last = format!("attempt {attempt}/{max_attempts}: {reason}");
+                    // Small increasing backoff: give the transient resource spike time to pass. A
+                    // deterministic failure just burns the attempts fast and falls through to `Err`.
+                    std::thread::sleep(Duration::from_millis(150 * u64::from(attempt)));
+                }
+            }
+        }
+        Err(format!(
+            "graphus-server failed to start after {max_attempts} attempts; last {last}"
+        ))
     }
 
     /// The OS process id of the running server (for evidence metering of the real process).
@@ -178,25 +238,31 @@ impl ServerProcess {
         self.child.id()
     }
 
-    fn wait_until_ready(&mut self, socket: &Path, log: &Path) {
+    /// Waits until the UDS is bound (`Ok`) or the child dies / times out during startup (`Err`,
+    /// retryable). The child is reaped on every `Err` path (a dead child via `try_wait`, a wedged one
+    /// via `kill` + `wait`) so a retry never leaks a process.
+    fn wait_until_ready(&mut self, socket: &Path, log: &Path) -> Result<(), String> {
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
             if socket.exists() {
-                return;
+                return Ok(());
             }
             if let Ok(Some(status)) = self.child.try_wait() {
-                panic!(
+                return Err(format!(
                     "graphus-server exited during startup with {status}; log:\n{}",
                     std::fs::read_to_string(log).unwrap_or_default()
-                );
+                ));
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        panic!(
+        // Timed out without binding: kill the (possibly wedged) child so the slot frees, then report.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        Err(format!(
             "graphus-server did not bind UDS {} within timeout; log:\n{}",
             socket.display(),
             std::fs::read_to_string(log).unwrap_or_default()
-        );
+        ))
     }
 
     /// Graceful shutdown: SIGTERM, then wait for a clean exit.
@@ -268,6 +334,7 @@ fn scalar_str(socket: &Path, cypher: &str) -> String {
 
 #[test]
 fn mvp_social_network_over_uds_survives_restart_and_crash() {
+    let _serial = e2e_serial_guard(); // rmp #819: one server child from this binary at a time
     let ws = Workspace::new();
     ws.write_config();
     let socket = ws.socket_path();
@@ -614,6 +681,7 @@ fn strip_ansi(s: &str) -> String {
 
 #[test]
 fn mid_flight_crash_keeps_the_acked_commit_discards_the_unacked_and_proves_the_wal_replayed() {
+    let _serial = e2e_serial_guard(); // rmp #819: one server child from this binary at a time
     let ws = Workspace::new();
     ws.write_config();
     let socket = ws.socket_path();
@@ -752,4 +820,36 @@ fn mid_flight_crash_keeps_the_acked_commit_discards_the_unacked_and_proves_the_w
     );
 
     server.stop_graceful();
+}
+
+/// `rmp` #819 guard: the bounded spawn retry must NOT mask a GENUINE startup failure. A config with a
+/// too-short `jwt_secret` fails the security catalog's `>=32`-byte requirement deterministically, so
+/// the child exits during startup on EVERY attempt. `try_start` must therefore exhaust its attempts
+/// and return `Err` (never hang, never falsely succeed) — proving the retry only absorbs a *transient*
+/// reaper/OOM kill under heavy parallelism, not a real crash. This is what keeps the whole-workspace
+/// gate both DETERMINISTIC and HONEST.
+#[test]
+fn spawn_retry_does_not_mask_a_genuine_startup_failure() {
+    let _serial = e2e_serial_guard();
+    let ws = Workspace::new();
+    // < 32 bytes ⇒ SecurityCatalog::load / config validation fails at startup, deterministically.
+    ws.write_config_with_secret("too-short");
+    let started = Instant::now();
+    let outcome = ServerProcess::try_start(&ws, 3);
+    assert!(
+        outcome.is_err(),
+        "a deterministic startup failure (too-short jwt_secret) must surface as Err, not be masked \
+         by the retry"
+    );
+    let msg = outcome.err().unwrap();
+    assert!(
+        msg.contains("failed to start after 3 attempts"),
+        "the error must report the exhausted attempts, got: {msg}"
+    );
+    // It must fail FAST (the child EXITS at startup, detected via `try_wait`), not wait out the
+    // 20s-per-attempt readiness deadline (which would be ~60s for 3 attempts).
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "the retry must fail fast on a deterministic startup crash, not hang on the readiness timeout"
+    );
 }
