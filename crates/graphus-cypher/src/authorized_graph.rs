@@ -283,6 +283,34 @@ impl<'g, O: PrivilegeOracle> AuthorizedGraph<'g, O> {
         labels.iter().any(|l| self.oracle.can_read_property(l, key))
     }
 
+    /// Whether a **restricted** principal may both traverse node `id` **and** read its `property`
+    /// under the node's current labels — the fused-seek / precise-scan analogue of the
+    /// [`node_property`](GraphAccess::node_property) null-masking gate (`rmp` task #822).
+    ///
+    /// A candidate that fails this is exactly a row the generic `node_property`-masking `Filter` path
+    /// drops. A `DENY READ` (or an absent grant) makes the property read as `null`, so a **positive**
+    /// predicate on it — `=`, `<`/`<=`/`>`/`>=`, a composite conjunct, `distance(...) <op> r`,
+    /// `CONTAINS`/`STARTS WITH`/`ENDS WITH`, `IS NOT NULL` — evaluates to `null` and the row is
+    /// excluded. The fused index seeks (and the precise `scan_filter_eq`) re-check a candidate against
+    /// the **raw store value**, so they cannot themselves observe a `DENY READ` on the seeked property;
+    /// without this gate they returned the node, leaking *which* nodes carry `p = v` while `RETURN n.p`
+    /// would have shown `null` (`rmp` #822, the node twin of the relationship `index_seek_rel_*`
+    /// declines). This mirrors [`node_property`](GraphAccess::node_property)'s gate **exactly** — the
+    /// node must be traversable AND grant a read on `property`, both with DENY-across-labels
+    /// precedence — so a gated seek returns precisely the rows the masking scan would. `IS NULL` is
+    /// unaffected: it is never served by these paths (an index holds no null entries; the planner runs
+    /// a scan + `Filter` through the masking `node_property`, so a denied property still reads as
+    /// `null` and the row is kept). Only ever consulted on the restricted path.
+    fn may_read_node_property(&self, id: NodeId, property: &str) -> bool {
+        match self.inner.node_labels(id) {
+            // Traversable (node visible) AND the seeked property is readable under its labels.
+            Some(labels) => {
+                self.labels_traversable(&labels) && self.property_readable(&labels, property)
+            }
+            None => false, // absent / MVCC-invisible in the inner seam
+        }
+    }
+
     /// Whether `rel` is traversable: it exists, its type is traversable, **and** both endpoints are
     /// visible. The relationship-visibility gate for every read/traverse path.
     fn rel_visible(&self, rel: RelId) -> bool {
@@ -559,11 +587,15 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         if self.oracle.is_unrestricted() {
             return Some(ids);
         }
-        // An index seek is a read path: the result must be filtered exactly like a scan, so the
-        // index-accelerated and scan-fallback paths return the same visible rows.
+        // An index seek is a read path: the result must be filtered exactly like the generic
+        // `node_property`-masking `Filter`, so the index-accelerated and scan-fallback paths return the
+        // same rows. `may_read_node_property` gates BOTH node visibility AND read access to the seeked
+        // property, so a `DENY READ` on `property` drops the candidate exactly as a masked `WHERE n.p =
+        // v` would (`rmp` #822) — not merely `node_visible`, which enforced traverse but leaked the
+        // denied property's value by inference.
         Some(
             ids.into_iter()
-                .filter(|&id| self.node_visible(id))
+                .filter(|&id| self.may_read_node_property(id, property))
                 .collect(),
         )
     }
@@ -576,11 +608,14 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         if self.oracle.is_unrestricted() {
             return scan;
         }
-        // The RBAC filter narrows the visible result set.
+        // The RBAC filter narrows the result set. `may_read_node_property` gates node visibility AND
+        // read access to `property` (a `DENY READ` reads the property as null, so a masked
+        // `WHERE n.p = v` drops the row) — the precise-scan (`rmp` #325) twin of the `index_seek_eq`
+        // gate above, closing the same `rmp` #822 leak on the no-index fallback path.
         let matched: Vec<NodeId> = scan
             .matched
             .into_iter()
-            .filter(|&id| self.node_visible(id))
+            .filter(|&id| self.may_read_node_property(id, property))
             .collect();
         // `examined` surfaces as a `PROFILE`'s `dbHits` (`rmp` #752). For a RESTRICTED principal the inner
         // seam's raw examined count is the pre-RBAC cardinality of the (possibly denied) label — a small
@@ -603,9 +638,13 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         if self.oracle.is_unrestricted() {
             return Some(ids);
         }
+        // Gate node visibility AND read access to `property`: a `DENY READ` makes `n.p` read as null,
+        // so a masked `WHERE n.p > v` (or the `IS NOT NULL` existence scan served by an open range)
+        // drops the row — matching the `scan_filter_range` fallback, which already masks via
+        // `node_property` (`rmp` #822).
         Some(
             ids.into_iter()
-                .filter(|&id| self.node_visible(id))
+                .filter(|&id| self.may_read_node_property(id, property))
                 .collect(),
         )
     }
@@ -625,9 +664,17 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         if self.oracle.is_unrestricted() {
             return Some(ids);
         }
+        // Gate node visibility AND read access to EVERY covered property: a `DENY READ` on ANY key
+        // makes that conjunct's `n.p = v` read null, so the whole `AND` is null and the row is dropped
+        // — matching the `scan_filter_composite_eq` fallback, which already masks each key via
+        // `node_property` (`rmp` #822).
         Some(
             ids.into_iter()
-                .filter(|&id| self.node_visible(id))
+                .filter(|&id| {
+                    properties
+                        .iter()
+                        .all(|property| self.may_read_node_property(id, property))
+                })
                 .collect(),
         )
     }
@@ -737,13 +784,15 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         if self.oracle.is_unrestricted() {
             return Some(ids);
         }
-        // A spatial proximity seek is a read path (`rmp` task #73): filter the candidate ids exactly
-        // like a scan, so an RBAC-invisible node never reaches the result. The seek's residual
-        // `distance` filter additionally re-checks each candidate's current value/label through this
-        // same decorator, so the filters compose (visibility + label + value + RBAC).
+        // A spatial proximity seek is a read path (`rmp` task #73): gate node visibility AND read
+        // access to the point `property`, so a `DENY READ` on it drops the candidate exactly as a
+        // masked `WHERE distance(n.p, c) <= r` would (`node_property` masks `n.p` to null → the
+        // distance is null → excluded), `rmp` #822. The residual `distance` filter above additionally
+        // re-checks each survivor's current value/label through this same decorator, so the filters
+        // compose (visibility + property read + label + value).
         Some(
             ids.into_iter()
-                .filter(|&id| self.node_visible(id))
+                .filter(|&id| self.may_read_node_property(id, property))
                 .collect(),
         )
     }
@@ -759,13 +808,15 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         if self.oracle.is_unrestricted() {
             return Some(ids);
         }
-        // A text (trigram) seek is a read path (`rmp` task #662): filter the candidate ids exactly like
-        // a scan, so an RBAC-invisible node never reaches the result. The seek's residual string
-        // predicate additionally re-checks each candidate's current value/label through this same
-        // decorator, so the filters compose (visibility + label + value + RBAC).
+        // A text (trigram) seek is a read path (`rmp` task #662): gate node visibility AND read access
+        // to the string `property`, so a `DENY READ` on it drops the candidate exactly as a masked
+        // `WHERE n.p CONTAINS s` would (`node_property` masks `n.p` to null → the predicate is null →
+        // excluded), `rmp` #822. The residual string predicate above additionally re-checks each
+        // survivor's current value/label through this same decorator, so the filters compose
+        // (visibility + property read + label + value).
         Some(
             ids.into_iter()
-                .filter(|&id| self.node_visible(id))
+                .filter(|&id| self.may_read_node_property(id, property))
                 .collect(),
         )
     }
@@ -1390,14 +1441,91 @@ mod tests {
     }
 
     /// A [`GraphAccess`] that delegates everything to an inner [`MemGraph`] but **overrides the seam
-    /// methods whose default impl is `None`** — `project_snapshot` (`rmp` task #352) and
-    /// `index_seek_rel_range` (`rmp` task #680) — so the [`AuthorizedGraph`] decorator's RBAC
-    /// composition of each can be tested in isolation. Against a bare `MemGraph` (whose defaults return
-    /// `None` regardless of restriction) "forwarded" and "declined" would be indistinguishable, and the
-    /// test would be vacuous.
+    /// methods whose default impl is `None`** — `project_snapshot` (`rmp` task #352),
+    /// `index_seek_rel_range` (`rmp` task #680), and the **node** fused seeks `index_seek_eq` /
+    /// `index_seek_range` / `index_seek_composite_eq` / `index_seek_spatial` / `index_seek_text`
+    /// (`rmp` task #822) — so the [`AuthorizedGraph`] decorator's RBAC composition of each can be tested
+    /// in isolation. Against a bare `MemGraph` (whose defaults return `None` regardless of restriction)
+    /// "forwarded" and "declined" would be indistinguishable, and the test would be vacuous.
+    ///
+    /// The node seeks return **raw** candidates (every label member carrying the property), mirroring
+    /// the real `RecordGraph` seam, which re-checks a candidate against the RAW store value and so
+    /// cannot itself observe a property `DENY READ` — exactly the `rmp` #822 leak the decorator must
+    /// close. `scan_filter_eq` is deliberately **not** overridden: the trait default already scans the
+    /// label raw, so the decorator's `rmp` #822 gate over it is exercised directly.
     struct SnapshotStub(MemGraph);
 
+    impl SnapshotStub {
+        /// The label members carrying a (raw) value for `property` — the raw fused-seek candidate set.
+        fn label_members_with(&self, label: &str, property: &str) -> Vec<NodeId> {
+            self.0
+                .scan_nodes_by_label(label)
+                .into_iter()
+                .filter(|&n| self.0.node_property(n, property).is_some())
+                .collect()
+        }
+    }
+
     impl GraphAccess for SnapshotStub {
+        /// Every member of `label` carrying a value for `property` — a raw candidate superset, exactly
+        /// what a `RecordGraph` fused seek returns before the RBAC decorator narrows it (`rmp` #822).
+        /// The value/predicate match is the seam's own re-check; the decorator test only needs a live
+        /// candidate to observe the property-read gate, so these ignore `value`/bounds/geometry/needle.
+        fn index_seek_eq(
+            &self,
+            label: &str,
+            property: &str,
+            _value: &Value,
+        ) -> Option<Vec<NodeId>> {
+            Some(self.label_members_with(label, property))
+        }
+        fn index_seek_range(
+            &self,
+            label: &str,
+            property: &str,
+            _lower: Option<(&Value, bool)>,
+            _upper: Option<(&Value, bool)>,
+        ) -> Option<Vec<NodeId>> {
+            Some(self.label_members_with(label, property))
+        }
+        fn index_seek_composite_eq(
+            &self,
+            label: &str,
+            properties: &[String],
+            _values: &[Value],
+        ) -> Option<Vec<NodeId>> {
+            // A composite candidate carries every covered property (matching the real seam).
+            Some(
+                self.0
+                    .scan_nodes_by_label(label)
+                    .into_iter()
+                    .filter(|&n| {
+                        properties
+                            .iter()
+                            .all(|p| self.0.node_property(n, p).is_some())
+                    })
+                    .collect(),
+            )
+        }
+        fn index_seek_spatial(
+            &self,
+            label: &str,
+            property: &str,
+            _center_x: f64,
+            _center_y: f64,
+            _radius: f64,
+        ) -> Option<Vec<NodeId>> {
+            Some(self.label_members_with(label, property))
+        }
+        fn index_seek_text(
+            &self,
+            label: &str,
+            property: &str,
+            _op: crate::physical::TextSeekOp,
+            _needle: &str,
+        ) -> Option<Vec<NodeId>> {
+            Some(self.label_members_with(label, property))
+        }
         /// A relationship range seek that "finds" **every** relationship of `rel_type` whose `key`
         /// property satisfies the bounds — enough that a `Some` here is observable by the decorator test
         /// (the real `RecordGraph` seek is exercised end-to-end in `tests/rel_property_index.rs`).
@@ -1957,6 +2085,174 @@ mod tests {
         let props = authz.node_properties(n).expect("node visible");
         assert_eq!(props.len(), 1, "only the readable prop survives: {props:?}");
         assert_eq!(props[0], ("title".to_owned(), s("Q3")));
+    }
+
+    // ---- `rmp` #822: NODE fused seeks + precise scan must honour `DENY READ` on the seeked property --
+    //
+    // The leak these guard: for a RESTRICTED principal a fused index seek (`index_seek_eq` / range /
+    // composite / spatial / text) and the precise `scan_filter_eq` re-check candidates against the RAW
+    // store value, so a `DENY READ` on the seeked property was invisible to them — the node was returned
+    // even though the generic `node_property`-masking `WHERE n.p = v` `Filter` (the no-index path) reads
+    // `n.p` as null and drops it. That both returned wrong rows AND disclosed, by inference, which nodes
+    // carry `p = v` while `RETURN n.p` shows null (CWE-863). The fix gates each path on
+    // `may_read_node_property`, exactly mirroring `node_property` masking; the relationship twins
+    // (`index_seek_rel_*`) already decline for the same reason.
+
+    /// An oracle that grants traverse on both labels and read on `title`, but **denies** read on
+    /// `contents` (via `:Classified`) — the `multilabel()` node's DENY-across-labels shape.
+    fn deny_contents_oracle() -> StubOracle {
+        StubOracle::default()
+            .traverse_label("Report")
+            .traverse_label("Classified")
+            .read_property("Report", "title")
+            .read_property("Classified", "title")
+            // A broad read grant that reaches `contents` via BOTH labels...
+            .read_property("Report", "contents")
+            .read_property("Classified", "contents")
+            // ...carved by an explicit DENY on one label (DENY-across-labels precedence wins).
+            .deny_read_property("Classified", "contents")
+    }
+
+    #[test]
+    fn restricted_node_seeks_honour_deny_read_on_the_seeked_property_822() {
+        use crate::physical::TextSeekOp;
+        let (g, _n) = multilabel();
+        let mut stub = SnapshotStub(g);
+        let authz = AuthorizedGraph::new(&mut stub, deny_contents_oracle());
+
+        // Every fused NODE access path over the DENY-READ property `contents` must return EMPTY — the
+        // masked `WHERE n.contents <pred>` reads `contents` as null, so the row is dropped. Before the
+        // fix each returned `Some(vec![n])` (the raw candidate), leaking the node. `Some(vec![])`
+        // (registered-index-but-no-visible-row), not `None`, because the index IS usable.
+        assert_eq!(
+            authz.index_seek_eq("Report", "contents", &s("top-secret")),
+            Some(vec![]),
+            "index_seek_eq must not leak a node whose seeked property is DENY READ",
+        );
+        assert_eq!(
+            authz.index_seek_range("Report", "contents", Some((&s("a"), true)), None),
+            Some(vec![]),
+            "index_seek_range must not leak a DENY-READ property",
+        );
+        assert_eq!(
+            authz.index_seek_composite_eq("Report", &["contents".to_owned()], &[s("top-secret")],),
+            Some(vec![]),
+            "composite seek must not leak a DENY-READ property",
+        );
+        assert_eq!(
+            authz.index_seek_composite_eq(
+                "Report",
+                &["title".to_owned(), "contents".to_owned()],
+                &[s("Q3"), s("top-secret")],
+            ),
+            Some(vec![]),
+            "composite seek drops the node if ANY covered property is DENY READ",
+        );
+        assert_eq!(
+            authz.index_seek_spatial("Report", "contents", 0.0, 0.0, 1.0),
+            Some(vec![]),
+            "spatial seek must not leak a DENY-READ property",
+        );
+        assert_eq!(
+            authz.index_seek_text("Report", "contents", TextSeekOp::Contains, "secret"),
+            Some(vec![]),
+            "text seek must not leak a DENY-READ property",
+        );
+        assert_eq!(
+            authz
+                .scan_filter_eq("Report", "contents", &s("top-secret"))
+                .matched,
+            Vec::<NodeId>::new(),
+            "the precise equality scan (no-index fallback) must not leak a DENY-READ property",
+        );
+    }
+
+    #[test]
+    fn restricted_node_seeks_keep_a_readable_property_822() {
+        // Control: a READABLE property (`title`) is unaffected — the node is still returned, so the fix
+        // narrows only the denied path, never a legitimate one.
+        use crate::physical::TextSeekOp;
+        let (g, n) = multilabel();
+        let mut stub = SnapshotStub(g);
+        let authz = AuthorizedGraph::new(&mut stub, deny_contents_oracle());
+
+        assert_eq!(
+            authz.index_seek_eq("Report", "title", &s("Q3")),
+            Some(vec![n]),
+            "a readable property still resolves through the accelerated seek",
+        );
+        assert_eq!(
+            authz.index_seek_range("Report", "title", Some((&s("A"), true)), None),
+            Some(vec![n]),
+        );
+        assert_eq!(
+            authz.index_seek_composite_eq("Report", &["title".to_owned()], &[s("Q3")]),
+            Some(vec![n]),
+        );
+        assert_eq!(
+            authz.index_seek_spatial("Report", "title", 0.0, 0.0, 1.0),
+            Some(vec![n]),
+        );
+        assert_eq!(
+            authz.index_seek_text("Report", "title", TextSeekOp::Contains, "Q"),
+            Some(vec![n]),
+        );
+        assert_eq!(
+            authz.scan_filter_eq("Report", "title", &s("Q3")).matched,
+            vec![n],
+        );
+    }
+
+    #[test]
+    fn unrestricted_node_seeks_keep_the_accelerated_path_822() {
+        // Control: an UNRESTRICTED principal keeps the raw accelerated seek verbatim (no filtering),
+        // even over a property another principal would be denied — the fast path is unchanged.
+        use crate::physical::TextSeekOp;
+        let (g, n) = multilabel();
+        let mut stub = SnapshotStub(g);
+        let authz = AuthorizedGraph::new(&mut stub, StubOracle::unrestricted());
+
+        assert_eq!(
+            authz.index_seek_eq("Report", "contents", &s("top-secret")),
+            Some(vec![n]),
+            "unrestricted principal keeps the accelerated seek over any property",
+        );
+        assert_eq!(
+            authz.index_seek_text("Report", "contents", TextSeekOp::Contains, "secret"),
+            Some(vec![n]),
+        );
+        assert_eq!(
+            authz
+                .scan_filter_eq("Report", "contents", &s("top-secret"))
+                .matched,
+            vec![n],
+        );
+    }
+
+    #[test]
+    fn restricted_deny_read_leaves_the_node_visible_to_a_bare_scan_822() {
+        // Masking parity the fix must NOT break: `DENY READ` hides only the property value, not the
+        // node — a bare `MATCH (n:Report)` (no property predicate) still returns it, and a
+        // `WHERE n.contents IS NULL` (served by a scan + `node_property` masking, never a fused seek)
+        // still INCLUDES it because the denied property reads as null. This mirrors what the whole-query
+        // engine test asserts; here we assert the two seam primitives those plans use.
+        let (g, n) = multilabel();
+        let mut stub = SnapshotStub(g);
+        let authz = AuthorizedGraph::new(&mut stub, deny_contents_oracle());
+
+        // A bare label scan (no property read) still surfaces the node.
+        assert_eq!(
+            authz.scan_nodes_by_label("Report"),
+            vec![n],
+            "DENY READ leaves TRAVERSE intact: the node is still visible to a bare scan",
+        );
+        // The denied property reads as null — the exact substrate of `WHERE n.contents IS NULL`, which
+        // therefore keeps the node (unlike a positive predicate, which drops it).
+        assert_eq!(
+            authz.node_property(n, "contents"),
+            None,
+            "the denied property reads as null, so IS NULL keeps the node (masking parity)",
+        );
     }
 
     #[test]

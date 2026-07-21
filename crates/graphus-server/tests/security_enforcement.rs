@@ -884,3 +884,137 @@ async fn deny_survives_restart_and_is_still_enforced() {
     bob.goodbye().await;
     server.shutdown().await.expect("clean shutdown");
 }
+
+/// `rmp` #822 (regression, whole-query end-to-end): a fused index seek / precise equality scan on a
+/// property a restricted principal is **denied** read on must return EXACTLY the rows the generic
+/// `node_property`-masking `WHERE` `Filter` returns — the denied property reads as `null`, so a
+/// positive predicate (`=`, `>`) drops the row (never leaking *who* has value `v`, which `RETURN
+/// p.salary` would only ever show as `null`), while `IS NULL` keeps it. Proven with the RANGE index
+/// present (`NodeIndexSeek`) AND after `DROP INDEX` (the precise `scan_filter_eq` scan) — the two
+/// gapped node paths this task closes. The relationship twins already declined for the same reason.
+///
+/// Pre-fix, the seek/precise-scan re-checked the RAW store value and so bypassed the property masking,
+/// returning the denied node (an authorization bypass + information disclosure, CWE-863).
+#[tokio::test]
+async fn deny_read_property_is_enforced_on_index_seek_and_precise_scan_822() {
+    let temp = TempStore::new("enforce822");
+    let server = boot(base_config(&temp)).await;
+    let uds = server.uds_path.clone().expect("UDS enabled");
+
+    // ---- Admin seeds two Person nodes and a RANGE index on (:Person).salary. --------------------
+    let mut alice = BoltClient::connect(&uds).await;
+    alice.handshake_and_logon("alice", "admin-pw8").await;
+    alice
+        .run_ok("CREATE (:Person {name: 'Ada', salary: 100000})")
+        .await;
+    alice
+        .run_ok("CREATE (:Person {name: 'Bob', salary: 40000})")
+        .await;
+    alice
+        .run_ok("CREATE INDEX FOR (n:Person) ON (n.salary)")
+        .await;
+    // Admin (unrestricted) keeps the accelerated seek — the fast path is unchanged.
+    let admin_hi = alice
+        .run_ok("MATCH (p:Person) WHERE p.salary = 100000 RETURN p.name")
+        .await;
+    assert_eq!(
+        opt_strings(&admin_hi, 0),
+        vec![Some("Ada".to_owned())],
+        "admin seeks the high earner via the index"
+    );
+    alice.goodbye().await;
+
+    // ---- Narrow bob: TRAVERSE :Person + READ :Person.name, but DENY READ :Person.salary. --------
+    let mut admin = BoltClient::connect(&uds).await;
+    admin.handshake_and_logon("alice", "admin-pw8").await;
+    admin.run_ok("REVOKE ROLE readwrite FROM bob").await;
+    admin.run_ok("CREATE ROLE salary_blind").await;
+    admin
+        .run_ok("GRANT TRAVERSE ON LABEL graphus.Person TO salary_blind")
+        .await;
+    admin
+        .run_ok("GRANT READ ON PROPERTY graphus.Person.name TO salary_blind")
+        .await;
+    // A broad read grant that WOULD reach salary...
+    admin
+        .run_ok("GRANT READ ON PROPERTY graphus.Person.salary TO salary_blind")
+        .await;
+    // ...carved by an explicit DENY (the leak vector: the seek re-checks the RAW value).
+    admin
+        .run_ok("DENY READ ON PROPERTY graphus.Person.salary TO salary_blind")
+        .await;
+    admin.run_ok("GRANT ROLE salary_blind TO bob").await;
+    admin.goodbye().await;
+
+    let mut bob = BoltClient::connect(&uds).await;
+    bob.handshake_and_logon("bob", "user2-pw8").await;
+
+    // 1) Equality on the DENIED property returns NO rows — the row would have disclosed the earner.
+    let hi = bob
+        .run_ok("MATCH (p:Person) WHERE p.salary = 100000 RETURN p.name")
+        .await;
+    assert!(
+        hi.is_empty(),
+        "bob must not learn who earns 100000 via the index seek: {hi:?}"
+    );
+
+    // 2) Even RETURNING the denied property yields no row (never a row whose salary is null-by-deny).
+    let hi2 = bob
+        .run_ok("MATCH (p:Person) WHERE p.salary = 100000 RETURN p.name, p.salary")
+        .await;
+    assert!(
+        hi2.is_empty(),
+        "no row may survive a positive predicate on a denied property: {hi2:?}"
+    );
+
+    // 3) A range predicate on the denied property is likewise dropped (index_seek_range).
+    let rich = bob
+        .run_ok("MATCH (p:Person) WHERE p.salary > 50000 RETURN p.name")
+        .await;
+    assert!(
+        rich.is_empty(),
+        "a range seek must not leak the denied property: {rich:?}"
+    );
+
+    // 4) MASKING PARITY: `IS NULL` INCLUDES both (salary reads as null under DENY READ) — served by a
+    //    scan + `node_property` masking, never a fused seek, so the fix must not touch it.
+    let blind = bob
+        .run_ok("MATCH (p:Person) WHERE p.salary IS NULL RETURN p.name")
+        .await;
+    let mut blind_names = opt_strings(&blind, 0);
+    blind_names.sort();
+    assert_eq!(
+        blind_names,
+        vec![Some("Ada".to_owned()), Some("Bob".to_owned())],
+        "IS NULL keeps both nodes (the denied salary reads as null): {blind_names:?}"
+    );
+
+    // 5) CONTROL: a predicate on a READABLE property (name) still resolves through the same paths.
+    let ada = bob
+        .run_ok("MATCH (p:Person) WHERE p.name = 'Ada' RETURN p.name")
+        .await;
+    assert_eq!(
+        opt_strings(&ada, 0),
+        vec![Some("Ada".to_owned())],
+        "a readable property is unaffected: {ada:?}"
+    );
+    bob.reset().await;
+
+    // ---- Drop the index: the SAME query now falls to the precise equality scan (scan_filter_eq). --
+    let mut admin2 = BoltClient::connect(&uds).await;
+    admin2.handshake_and_logon("alice", "admin-pw8").await;
+    admin2
+        .run_ok("DROP INDEX FOR (n:Person) ON (n.salary)")
+        .await;
+    admin2.goodbye().await;
+
+    let hi3 = bob
+        .run_ok("MATCH (p:Person) WHERE p.salary = 100000 RETURN p.name")
+        .await;
+    assert!(
+        hi3.is_empty(),
+        "the no-index precise equality scan (scan_filter_eq) must also honour the DENY: {hi3:?}"
+    );
+    bob.goodbye().await;
+    server.shutdown().await.expect("clean shutdown");
+}
