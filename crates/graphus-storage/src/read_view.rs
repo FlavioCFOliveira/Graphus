@@ -393,6 +393,29 @@ fn for_each_record_slot<D, S, P, F>(
     pages: &P,
     kind: StoreKind,
     from: u64,
+    visit: F,
+) -> Result<()>
+where
+    D: BlockDevice,
+    S: LogSink,
+    P: StorePages,
+    F: FnMut(u64, &[u8]) -> Result<()>,
+{
+    // The unbounded scan is exactly the bounded scan whose upper bound is the store's `high_water`.
+    for_each_record_slot_bounded(pool, pages, kind, from, pages.high_water(kind), visit)
+}
+
+/// Like [`for_each_record_slot`] but stops at the exclusive id bound `to` (clamped to the store's
+/// `high_water`), visiting only `from.max(1)..min(to, high_water)` (`rmp` #809). A caller that must
+/// bound the *cost* of one scan — the release-active freeze-frontier audit sweeps a fixed-size id
+/// window per GC pass — passes `to = from + window` so the work is `O(window)` regardless of store
+/// size. Passing `to = high_water` reproduces [`for_each_record_slot`] byte-for-byte.
+fn for_each_record_slot_bounded<D, S, P, F>(
+    pool: &Pool<D, S>,
+    pages: &P,
+    kind: StoreKind,
+    from: u64,
+    to: u64,
     mut visit: F,
 ) -> Result<()>
 where
@@ -402,31 +425,33 @@ where
     F: FnMut(u64, &[u8]) -> Result<()>,
 {
     let high_water = pages.high_water(kind);
-    if high_water <= 1 {
+    // Never visit an id at or beyond the high-water mark (an unallocated slot), whatever `to` requests.
+    let to = to.min(high_water);
+    if to <= 1 {
         return Ok(()); // ids start at 1 (id 0 is the reserved null pointer)
     }
     let record_size = kind.record_size();
     let rpp = paging::records_per_page(record_size) as u64;
-    // Visit the id range `from.max(1)..high_water`, ascending (`rmp` #522: a `from > 1` lets the freeze
+    // Visit the id range `from.max(1)..to`, ascending (`rmp` #522: a `from > 1` lets the freeze
     // sweep skip every already-settled record below the frontier by starting on the page that holds
-    // `from`, so the scan is O(records above the frontier), not O(store size)). The range spans
-    // store-relative pages `first_page..=last_page` (id 1 lives on page 0 since `rpp >= 1`; the highest
-    // live id is `high_water - 1`). Walk those pages inclusively.
+    // `from`; `rmp` #809: a `to < high_water` caps the window's span). The range spans store-relative
+    // pages `first_page..=last_page` (id 1 lives on page 0 since `rpp >= 1`; the highest visited id is
+    // `to - 1`). Walk those pages inclusively.
     let from = from.max(1);
-    if from >= high_water {
-        return Ok(()); // nothing at or above the frontier
+    if from >= to {
+        return Ok(()); // nothing in the requested (clamped) range
     }
     let first_page = from / rpp;
-    let last_page = (high_water - 1) / rpp;
+    let last_page = (to - 1) / rpp;
     for rel_page in first_page..=last_page {
         let dev = pages.device_page(kind, rel_page)?;
         // The first id this page holds, and the (exclusive) id one past its last in-range slot. Clamp
-        // the upper bound to `high_water` so the final page never visits an id at or beyond the
-        // high-water mark (an unallocated slot), and clamp the lower bound to `from` (>= 1) so the
-        // null-pointer slot 0 of page 0 — and every already-settled slot below the frontier — is skipped.
+        // the upper bound to `to` so the final page never visits an id at or beyond the window end, and
+        // clamp the lower bound to `from` (>= 1) so the null-pointer slot 0 of page 0 — and every
+        // already-settled slot below the frontier — is skipped.
         let page_first_id = rel_page * rpp;
         let id_lo = page_first_id.max(from);
-        let id_hi = (page_first_id + rpp).min(high_water);
+        let id_hi = (page_first_id + rpp).min(to);
         // ONE pin + read latch for the whole page (concurrent.rs:442): walk every in-range slot under
         // it. The closure does pure decode work; it never re-enters the pool with this page.
         pool.with_page_fetched(dev, |p| -> Result<()> {
@@ -534,6 +559,41 @@ pub fn scan_in_use_mvcc_from<D: BlockDevice, S: LogSink, P: StorePages>(
         Ok(())
     })?;
     Ok(out)
+}
+
+/// Like [`scan_in_use_mvcc_from`] but visits only the **bounded window** `from..min(from+max_ids,
+/// high_water)` (`rmp` #809): the release-active freeze-frontier audit sweeps one such window per GC
+/// pass so its cost is `O(max_ids)` — a constant tax on the GC path, independent of store size — while
+/// a per-kind rotating cursor gives full coverage of the id space over successive passes. Returns the
+/// in-use `(id, MvccHeader)` slots inside the window, and `next_from` = the first id NOT covered (the
+/// clamped window end): when `next_from >= high_water` the store has been fully swept from `from`, and
+/// the caller wraps its cursor back to `1`.
+///
+/// # Errors
+/// Returns a storage error if a store page in the window cannot be read.
+pub fn scan_in_use_mvcc_window<D: BlockDevice, S: LogSink, P: StorePages>(
+    pool: &Pool<D, S>,
+    pages: &P,
+    kind: StoreKind,
+    from: u64,
+    max_ids: u64,
+) -> Result<(Vec<(u64, MvccHeader)>, u64)> {
+    let high_water = pages.high_water(kind);
+    let from = from.max(1);
+    // The exclusive window end, clamped so a scan never runs past the allocated id space. `next_from`
+    // is exactly this bound: a later pass resumes here, or the caller wraps when it reaches `high_water`.
+    let to = from.saturating_add(max_ids).min(high_water);
+    let mut out = Vec::new();
+    if from < to {
+        for_each_record_slot_bounded(pool, pages, kind, from, to, |id, rec| {
+            let mvcc = MvccHeader::read(&rec[..MVCC_HEADER_SIZE]);
+            if mvcc.in_use() {
+                out.push((id, mvcc));
+            }
+            Ok(())
+        })?;
+    }
+    Ok((out, to))
 }
 
 /// The `Label`-namespace token ids of node `id`'s labels, ascending (the body of

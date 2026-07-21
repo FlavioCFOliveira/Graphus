@@ -142,6 +142,16 @@ explicitly so an operator can judge their own exposure.
   verbatim would move retryability — deferred to a product decision. Verified against the official
   `neo4j-driver` 6.x: the driver observes the exact leaf code and still treats it as a non-retryable
   `ClientError`.
+- **The #522 prune-soundness invariant is now verified in ordinary release builds, not only debug
+  (rmp #809, defense-in-depth).** The invariant "no in-use MVCC record bears an unfrozen committed
+  stamp before the GC registry prune" — the exact precondition whose violation was the #522
+  silent-committed-data-loss critical — was checked only by a debug-only full-store assertion. An
+  always-on, bounded **rotating-window** audit (8192 ids per store kind per GC pass, reusing the exact
+  `frozen_word` predicate) now runs in every build; on a violation the pass **skips the prune**
+  (fail-closed — committed writers stay resolvable, so no committed version can be forgotten),
+  increments `graphus_freeze_frontier_violations_total`, and logs the offending store/id/stamps. Cost
+  is **~43 µs, 0.35 % of a maintenance pass** (and avoids the O(store) spike a periodic full scan
+  would cause), with the debug/`check-cold-assert` full per-prune scan retained as the strongest tier.
 
 ### Fixed
 

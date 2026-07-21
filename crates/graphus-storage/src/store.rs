@@ -319,6 +319,38 @@ pub struct GcPassReport {
     /// this stays ≈ the records added since the last pass (O(Δ)) instead of the whole store (O(N)) — the
     /// direct evidence the maintenance cost is no longer quadratic.
     pub freeze_scanned: u64,
+    /// **`rmp` #809 — release-active freeze-frontier audit.** How many in-use MVCC records the bounded
+    /// rotating-window audit ([`audit_freeze_frontier_window`](RecordStore::audit_freeze_frontier_window))
+    /// found still bearing an **unfrozen committed-writer stamp** *after* the freeze sweep and *before*
+    /// the registry prune — the exact silent-committed-data-loss invariant of `rmp` #522, verified in an
+    /// ordinary release build (the [`debug_assert_freeze_complete`](RecordStore::debug_assert_freeze_complete)
+    /// full scan runs only under `debug_assertions`/`check-cold-assert`). Normally `0`. A non-zero value
+    /// means a freeze-frontier regression stranded a committed stamp: this pass **skipped the prune** as
+    /// a fail-closed protective response (the affected writers stay resolvable, so no committed version is
+    /// forgotten), and the caller must raise the operator alert.
+    pub freeze_violations: u64,
+    /// The first stranded record the `rmp` #809 audit found this pass (for the operator-facing WARN/ERROR
+    /// log), or `None` when `freeze_violations == 0`. The storage crate carries no logger, so it surfaces
+    /// the offending store/id/stamps here for the server maintenance loop to log.
+    pub first_freeze_violation: Option<FreezeFrontierViolation>,
+}
+
+/// One in-use MVCC record found by the `rmp` #809 release-active freeze-frontier audit to still bear an
+/// **unfrozen committed-writer in-flight stamp** after the freeze sweep — i.e. a stamp whose writer the
+/// registry records as `Committed` but whose on-disk word is still the in-flight `TxnId` form. Forgetting
+/// that writer at the following prune would make this version read as **invisible** (silent lost committed
+/// data; the `rmp` #522 class). Carried out of the storage layer (which has no logger) so the server can
+/// emit the structured alert naming the exact store/id/stamps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FreezeFrontierViolation {
+    /// Which MVCC store the stranded record lives in.
+    pub kind: StoreKind,
+    /// The stranded record's physical id.
+    pub id: u64,
+    /// The record's raw `xmin` (created-ts) header word at detection.
+    pub xmin: u64,
+    /// The record's raw `xmax` (expired-ts) header word at detection.
+    pub xmax: u64,
 }
 
 /// The prune a completed [`RecordStore::gc`] freeze sweep scheduled, held until its GC transaction
@@ -460,6 +492,15 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
     /// range still bearing an in-flight-writer stamp (or `high_water` if none). Initialised to `1` on
     /// open, so the first pass is a full freeze that settles every pre-existing on-disk stamp.
     freeze_low: [u64; STORE_COUNT],
+    /// **`rmp` #809 — release-active freeze-frontier audit cursor.** Per-kind resume id for the bounded
+    /// rotating-window audit ([`audit_freeze_frontier_window`](Self::audit_freeze_frontier_window)) that
+    /// runs on every GC pass in an ordinary release build. Each pass scans `[freeze_audit_from[kind],
+    /// +[`FREEZE_AUDIT_WINDOW_IDS`])` of each MVCC store and advances the cursor, wrapping to `1` at
+    /// `high_water` — so the whole id space is re-verified every `⌈high_water / FREEZE_AUDIT_WINDOW_IDS⌉`
+    /// passes at a fixed `O(window)` per-pass cost, independent of store size. Pure in-memory, rebuilt
+    /// from `1` every open (no on-disk representation, so the store format and crash recovery are
+    /// unchanged). Index `Strings` is unused (heap blocks carry no MVCC stamps).
+    freeze_audit_from: [u64; STORE_COUNT],
     /// Reclaim candidates: per-kind physical ids of MVCC tombstones (`xmax` set) awaiting reclamation
     /// (`rmp` #522). The reclaim sweep iterates ONLY these ids instead of scanning the whole store —
     /// reclaiming those whose `xmax` has committed at or below the watermark and dropping entries that
@@ -601,6 +642,19 @@ pub struct RecordStore<D: BlockDevice, S: LogSink> {
 /// tunable per store via [`RecordStore::set_checkpoint_interval_bytes`].
 pub const DEFAULT_CHECKPOINT_INTERVAL_BYTES: u64 = 64 * 1024 * 1024;
 
+/// **`rmp` #809 — release-active freeze-frontier audit window.** How many physical ids of *each* MVCC
+/// store the always-on prune-soundness audit re-verifies per GC pass (see
+/// [`RecordStore::audit_freeze_frontier_window`]). It bounds the audit's per-pass cost to a fixed
+/// `3 * O(FREEZE_AUDIT_WINDOW_IDS)` (constant, independent of store size), while the per-kind rotating
+/// cursor re-covers the whole id space every `⌈high_water / FREEZE_AUDIT_WINDOW_IDS⌉` passes. `8192`
+/// was chosen empirically (`freeze_audit_window_cost_is_negligible_809`): at this size the three windows
+/// add on the order of tens of microseconds to a GC pass — negligible next to the pass's own freeze /
+/// reclaim / checkpoint work — while a store of a few hundred thousand records is fully re-audited within
+/// a few dozen maintenance ticks (and a *systematic* freeze regression, which strands stamps densely, is
+/// caught in far fewer). One page holds 125 node / 80 rel / ~146 prop records, so a window spans ~55–100
+/// store pages — a handful of page fetches per kind.
+const FREEZE_AUDIT_WINDOW_IDS: u64 = 8192;
+
 impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// Creates a brand-new record store on an empty `device`, with `wal` an already-created WAL,
     /// `pool_capacity` buffer frames, and `element_id_seed` the first `ElementId` to allocate
@@ -648,6 +702,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // stamp; `gc_full_scan_pending` forces that first pass to also do the full corpse/property
             // sweep for anything a fresh process has no in-memory record of.
             freeze_low: [1; STORE_COUNT],
+            // `rmp` #809: the release-active freeze-frontier audit starts each store's rotating window
+            // at id 1 (pure in-memory; rebuilt every open, so the on-disk format is unchanged).
+            freeze_audit_from: [1; STORE_COUNT],
             pending_tombstones: Default::default(),
             pending_corpse_rels: std::collections::BTreeSet::new(),
             pending_prop_corpses: false,
@@ -764,6 +821,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // stamp; `gc_full_scan_pending` forces that first pass to also do the full corpse/property
             // sweep for anything a fresh process has no in-memory record of.
             freeze_low: [1; STORE_COUNT],
+            // `rmp` #809: the release-active freeze-frontier audit starts each store's rotating window
+            // at id 1 (pure in-memory; rebuilt every open, so the on-disk format is unchanged).
+            freeze_audit_from: [1; STORE_COUNT],
             pending_tombstones: Default::default(),
             pending_corpse_rels: std::collections::BTreeSet::new(),
             pending_prop_corpses: false,
@@ -2781,29 +2841,133 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // `rmp` #522 (durability-audit W1 regression guard): before scheduling the prune that will
         // forget every committed writer, assert the freeze sweep actually settled ALL of their on-disk
         // in-flight stamps — the invariant the prune's soundness rests on (a stranded committed stamp
-        // whose writer is forgotten reads as invisible: silent lost committed data). Debug-only, so it
-        // is compiled out (and costs nothing) in release. See [`debug_assert_freeze_complete`].
+        // whose writer is forgotten reads as invisible: silent lost committed data). This FULL-store
+        // scan is compiled out (costs nothing) in an ordinary release build; it stays the strongest
+        // guarantee under `debug_assertions`/`check-cold-assert`. See [`debug_assert_freeze_complete`].
         self.debug_assert_freeze_complete();
 
-        // Schedule the table prune: every writer recorded as committed at this point had ALL of its
-        // on-disk in-flight stamps rewritten by the freeze sweep (the frontier invariant guarantees no
-        // in-use record below `freeze_low` bears an unfrozen committed stamp, and the sweep froze the
-        // rest), so each becomes forgettable the moment the freeze is durable — i.e. when `txn` commits.
-        // The GC transaction itself, and any transaction that commits between here and that commit, is
-        // not in this set and is pruned by a later pass.
-        let writers = self.commit_registry.committed_writers();
-        let prune_scheduled = writers.len();
-        self.pending_gc_prune = Some(PendingGcPrune {
-            gc_txn: txn,
-            writers,
-        });
+        // `rmp` #809: the always-on, release-active counterpart of the guard above. It re-verifies the
+        // SAME invariant over a bounded rotating id window (so full-store coverage every N passes at a
+        // fixed O(window) per-pass cost), and reports any stranded committed stamp it finds — the tier
+        // that runs in production, where the full scan does not. See [`audit_freeze_frontier_window`].
+        let (freeze_violations, first_freeze_violation) = self.audit_freeze_frontier_window();
 
-        Ok(GcPassReport {
-            reclaimed,
-            frozen,
-            prune_scheduled,
-            freeze_scanned,
-        })
+        if freeze_violations == 0 {
+            // Normal path: schedule the table prune. Every writer recorded as committed at this point had
+            // ALL of its on-disk in-flight stamps rewritten by the freeze sweep (the frontier invariant
+            // guarantees no in-use record below `freeze_low` bears an unfrozen committed stamp, and the
+            // sweep froze the rest), so each becomes forgettable the moment the freeze is durable — i.e.
+            // when `txn` commits. The GC transaction itself, and any transaction that commits between
+            // here and that commit, is not in this set and is pruned by a later pass.
+            let writers = self.commit_registry.committed_writers();
+            let prune_scheduled = writers.len();
+            self.pending_gc_prune = Some(PendingGcPrune {
+                gc_txn: txn,
+                writers,
+            });
+            Ok(GcPassReport {
+                reclaimed,
+                frozen,
+                prune_scheduled,
+                freeze_scanned,
+                freeze_violations: 0,
+                first_freeze_violation: None,
+            })
+        } else {
+            // `rmp` #809 fail-closed response: a committed stamp is stranded unfrozen below the frontier,
+            // so pruning now would forget a writer that a live version still needs to resolve — the exact
+            // `rmp` #522 silent-committed-data-loss failure. **Skip the prune this pass** (leave every
+            // committed writer in the Active/Recent Transaction Table, so its version stays visible) and
+            // surface the violation to the caller for the operator alert. This is strictly safer than
+            // pruning-then-losing-data, and safer than aborting the whole database on a durability path (a
+            // false abort is itself a durability hazard); a later pass reprunes once the condition clears.
+            // Not scheduling `pending_gc_prune` mirrors exactly what a rolled-back GC pass does.
+            Ok(GcPassReport {
+                reclaimed,
+                frozen,
+                prune_scheduled: 0,
+                freeze_scanned,
+                freeze_violations,
+                first_freeze_violation,
+            })
+        }
+    }
+
+    /// **Release-active freeze-frontier audit** (`rmp` #809) — the always-on counterpart of
+    /// [`debug_assert_freeze_complete`](Self::debug_assert_freeze_complete). Called by
+    /// [`gc`](Self::gc)/[`gc_freeze_only`](Self::gc_freeze_only) after the freeze sweep and immediately
+    /// before the registry prune, in **every** build (not just debug/`check-cold-assert`).
+    ///
+    /// It re-verifies the `rmp` #522 prune-soundness invariant — *no in-use MVCC record still bears an
+    /// unfrozen committed-writer in-flight stamp* — using the exact [`frozen_word`](Self::frozen_word)
+    /// predicate the sweep clears (`frozen_word(word).is_some()` ⇔ an unfrozen committed stamp). The
+    /// difference from the debug guard is **cost, not correctness**: the debug guard scans the *whole*
+    /// store on every prune (O(store), too dear for production); this scans a fixed-size id **window**
+    /// (`FREEZE_AUDIT_WINDOW_IDS` ids of each MVCC store) and advances a per-kind rotating cursor, so the
+    /// per-pass cost is `O(window)` — constant, independent of store size — and the whole id space is
+    /// re-verified every `⌈high_water / FREEZE_AUDIT_WINDOW_IDS⌉` passes.
+    ///
+    /// **Detection latency.** A *systematic* freeze-frontier regression (the real failure mode: e.g. the
+    /// dead `outcome == InFlight` predicate that caused `rmp` #522) strands committed stamps *densely* —
+    /// essentially every record a GC pass raised the frontier past while a writer was in flight — so the
+    /// window hits one within a handful of passes (O(1) in the density). An *isolated* single stranding
+    /// is caught within one full sweep of the id space (the bound above). Either way this is eventual, not
+    /// per-prune, detection — acceptable for a defense-in-depth guard over a path already audited SOUND,
+    /// and the caller's fail-closed prune-skip means the FIRST detection prevents the data loss regardless
+    /// of how many passes it took (the writers are not forgotten until a clean pass finds zero violations).
+    ///
+    /// Returns `(violation_count, first_violation)` for this pass's windows. Read-only + best-effort: a
+    /// page-read error surfaces nothing and leaves the cursor put (the next pass retries) rather than
+    /// failing the GC pass — a transient read fault must not turn a maintenance tick into an abort.
+    fn audit_freeze_frontier_window(&mut self) -> (u64, Option<FreezeFrontierViolation>) {
+        let mut violations = 0u64;
+        let mut first: Option<FreezeFrontierViolation> = None;
+        // The three MVCC stores (heap `Strings` blocks carry no version stamps). Each advances its own
+        // window cursor every pass, so total per-pass cost is `3 * O(FREEZE_AUDIT_WINDOW_IDS)`.
+        for kind in [StoreKind::Node, StoreKind::Rel, StoreKind::Prop] {
+            let ki = kind as usize;
+            let from = self.freeze_audit_from[ki];
+            let (records, next_from) = match read_view::scan_in_use_mvcc_window(
+                &self.pool,
+                &self.stores,
+                kind,
+                from,
+                FREEZE_AUDIT_WINDOW_IDS,
+            ) {
+                Ok(v) => v,
+                // Best-effort: a read fault must never fail the maintenance pass. Leave the cursor so the
+                // next pass re-covers this window; report no violation (we simply did not observe here).
+                Err(_) => continue,
+            };
+            for (id, mvcc) in records {
+                // The SAME "unfrozen committed stamp" predicate the freeze sweep clears (`frozen_word`
+                // is `Some` only for an in-flight stamp whose writer the registry records as Committed).
+                // A genuinely-open writer's stamp maps to `None` (correctly not a violation — it is frozen
+                // once that writer commits), so this never fires on legitimately in-flight data.
+                if self.frozen_word(mvcc.created_ts).is_some()
+                    || self.frozen_word(mvcc.expired_ts).is_some()
+                {
+                    violations += 1;
+                    if first.is_none() {
+                        first = Some(FreezeFrontierViolation {
+                            kind,
+                            id,
+                            xmin: mvcc.created_ts,
+                            xmax: mvcc.expired_ts,
+                        });
+                    }
+                }
+            }
+            // Advance the rotating cursor: resume at `next_from`, or wrap to `1` once the window reached
+            // this store's high-water (a full sweep of its id space is complete).
+            let high_water = self.store(kind).alloc.high_water();
+            self.freeze_audit_from[ki] = if next_from >= high_water {
+                1
+            } else {
+                next_from
+            };
+        }
+        (violations, first)
     }
 
     /// Reads just the 25-byte MVCC header of record `id` in `kind`'s store (freeze-sweep helper —
@@ -7991,6 +8155,276 @@ mod tests {
             report.is_consistent(),
             "store consistent after #522 equivalence check: {:?}",
             report.violations
+        );
+    }
+
+    /// `rmp` #809 (healthy path — the always-on audit is a no-op on a well-formed store, in EVERY build).
+    /// A normal mixed workload driven through real `gc()` passes must report zero freeze-frontier
+    /// violations and still schedule its prunes: the release-active audit must never fire on legitimately
+    /// in-flight or correctly-frozen data (the "does NOT fire in the normal case" half of AC#3).
+    #[test]
+    fn freeze_frontier_audit_silent_on_healthy_store_809() {
+        let mut s = fresh();
+        let key = s.intern_token(Namespace::PropKey, "v").unwrap();
+        let mut next = 1u64;
+        // Several rounds of create + property + a GC pass each; every pass must stay silent.
+        for round in 0..4u64 {
+            let t = TxnId(next);
+            next += 1;
+            s.begin(t);
+            for _ in 0..30 {
+                let (n, _) = s.create_node(t).unwrap();
+                s.add_node_property(t, n, key, 1, round + 1).unwrap();
+            }
+            s.commit(t).unwrap();
+            let report = gc_pass(&mut s, next);
+            next += 1;
+            assert_eq!(
+                report.freeze_violations, 0,
+                "round {round}: the audit must not fire on a healthy store"
+            );
+            assert!(
+                report.first_freeze_violation.is_none(),
+                "round {round}: no violation detail on a clean pass"
+            );
+        }
+    }
+
+    /// `rmp` #809 (non-vacuity — the audit FIRES on an injected stranded stamp, and stays SILENT in the
+    /// normal case). This tests the release-active [`audit_freeze_frontier_window`] predicate DIRECTLY
+    /// (build-independent: it bypasses the debug-only `debug_assert_freeze_complete`, which would panic
+    /// on the same state before the audit ran). It models the exact `rmp` #522 failure: a committed
+    /// writer whose on-disk in-flight stamp the incremental freeze sweep never settled because the
+    /// frontier was raised past it.
+    #[test]
+    fn freeze_frontier_audit_fires_on_stranded_committed_stamp_809() {
+        let mut s = fresh();
+
+        // A committed node whose xmin is still the writer's in-flight TxnId (headers are frozen lazily at
+        // GC, never at commit — see `commit`). So after this the registry says W is Committed while the
+        // on-disk stamp is unfrozen: exactly the "committed but unfrozen" condition the audit hunts.
+        let w = TxnId(1);
+        s.begin(w);
+        let (nid, _) = s.create_node(w).unwrap();
+        s.commit(w).unwrap();
+
+        // Model the #522 stranding: raise the freeze frontier PAST the node, so the (frontier-bounded)
+        // incremental freeze sweep would skip it, leaving the committed stamp unfrozen forever.
+        s.freeze_low[StoreKind::Node as usize] = nid + 1;
+        // Prove the frontier-bounded sweep really does MISS it (it scans only `[freeze_low, high_water)`).
+        let (missed, _) =
+            read_view::scan_in_use_mvcc_from(&s.pool, &s.stores, StoreKind::Node, s.freeze_low[0])
+                .map(|v| (v.iter().any(|&(id, _)| id == nid), v))
+                .unwrap();
+        assert!(
+            !missed,
+            "the frontier-bounded sweep must skip the stranded node — that is what makes it invisible \
+             to the incremental freeze (the #522 hole)"
+        );
+
+        // The full-range window audit (frontier-agnostic) MUST catch it.
+        s.freeze_audit_from = [1; STORE_COUNT];
+        let (violations, first) = s.audit_freeze_frontier_window();
+        assert!(
+            violations >= 1,
+            "the release-active audit must detect the stranded committed stamp (got {violations})"
+        );
+        let v = first.expect("a firing audit reports the offending record");
+        assert_eq!(v.kind, StoreKind::Node, "the stranded record is a node");
+        assert_eq!(v.id, nid, "the audit names the exact stranded id");
+        assert_eq!(
+            v.xmin,
+            VersionStamp::in_flight(w),
+            "the reported xmin is the unfrozen in-flight stamp of the committed writer"
+        );
+
+        // Now settle the stamp properly (a real full freeze) and re-audit: it must go SILENT. Reset the
+        // frontier so the sweep actually visits the node, then freeze under a fresh GC-style txn.
+        s.freeze_low[StoreKind::Node as usize] = 1;
+        let g = TxnId(2);
+        s.begin(g);
+        let (frozen, _) = s
+            .freeze_store_headers_incremental(g, StoreKind::Node)
+            .unwrap();
+        s.commit(g).unwrap();
+        assert!(frozen >= 1, "the freeze sweep settled the committed stamp");
+
+        s.freeze_audit_from = [1; STORE_COUNT];
+        let (violations_after, first_after) = s.audit_freeze_frontier_window();
+        assert_eq!(
+            violations_after, 0,
+            "after a proper freeze the audit must be SILENT (no stranded stamp remains)"
+        );
+        assert!(first_after.is_none(), "no violation detail on a clean pass");
+    }
+
+    /// `rmp` #809 (fail-closed integration — a firing audit SKIPS the prune, a clean pass prunes normally).
+    /// Drives real `gc()` passes end to end. The full-store `debug_assert_freeze_complete` panics on a
+    /// stranded stamp *before* the release-active audit runs, so the firing half is exercised only where
+    /// that assert is compiled out — an ordinary release build. Run with `cargo test --release`.
+    #[test]
+    #[cfg_attr(
+        any(debug_assertions, feature = "check-cold-assert"),
+        ignore = "debug_assert_freeze_complete panics before the release-active audit; run under --release"
+    )]
+    fn freeze_frontier_audit_skips_prune_fail_closed_809() {
+        let mut s = fresh();
+
+        // Healthy pass first: a committed node, a normal gc() → zero violations and the prune IS scheduled.
+        let t = TxnId(1);
+        s.begin(t);
+        let (nid, _) = s.create_node(t).unwrap();
+        s.commit(t).unwrap();
+        let clean = gc_pass(&mut s, 2);
+        assert_eq!(
+            clean.freeze_violations, 0,
+            "a healthy pass reports no freeze-frontier violation"
+        );
+        assert!(
+            clean.prune_scheduled > 0,
+            "a healthy pass schedules the registry prune (a committed writer became forgettable)"
+        );
+
+        // Inject a stranding: a second committed node whose stamp we strand by raising the frontier past
+        // it, so the next gc()'s frontier-bounded freeze sweep leaves it committed-but-unfrozen.
+        let t = TxnId(3);
+        s.begin(t);
+        let (nid2, _) = s.create_node(t).unwrap();
+        s.commit(t).unwrap();
+        s.freeze_low[StoreKind::Node as usize] = nid2 + 1;
+        // Aim the audit window at the node store so this pass definitely covers the stranded id.
+        s.freeze_audit_from = [1; STORE_COUNT];
+
+        let poisoned = gc_pass(&mut s, 4);
+        assert!(
+            poisoned.freeze_violations >= 1,
+            "the release-active audit fires inside gc() on the stranded stamp"
+        );
+        assert_eq!(
+            poisoned.prune_scheduled, 0,
+            "fail-closed: a gc() pass that detects a stranded committed stamp SKIPS the prune, so no \
+             committed writer is forgotten (the #522 data-loss is prevented)"
+        );
+        let v = poisoned
+            .first_freeze_violation
+            .expect("the report carries the offending record for the operator alert");
+        assert_eq!((v.kind, v.id), (StoreKind::Node, nid2));
+        let _ = nid;
+    }
+
+    /// `rmp` #809 (AC#2 measurement, `#[ignore]`d — a reproducible benchmark, not a CI assertion). Prints
+    /// the per-GC-pass cost the release-active window audit ADDS, the full-store scan cost it AVOIDS (what
+    /// a periodic-tick design would spike to every Nth pass), and a steady-state `gc()` pass cost for
+    /// scale — so the "negligible" claim is backed by numbers on the running host. Run with:
+    /// `cargo test --release -p graphus-storage -- --ignored --nocapture freeze_audit_window_cost`.
+    #[test]
+    #[ignore = "measurement/benchmark; run explicitly with --ignored --nocapture"]
+    fn freeze_audit_window_cost_is_negligible_809() {
+        use std::time::Instant;
+
+        const N: u64 = 200_000;
+        // A representative buffer pool (production auto-sizes to hardware — a 64-frame pool would thrash a
+        // 200k-record scan through eviction, exaggerating the audit's page-fetch cost). Large enough to
+        // hold the node store's pages warm.
+        let device = MemBlockDevice::new(0);
+        let wal = WalManager::create(MemLogSink::new()).expect("create wal");
+        let mut s = RecordStore::create(device, wal, 4096, 1).expect("create store");
+
+        // Build N committed nodes in batches, then a steady-state gc() so everything is frozen and pruned
+        // (the realistic state the audit runs against on every subsequent maintenance tick).
+        let mut txn = 1u64;
+        const BATCH: u64 = 20_000;
+        let mut made = 0u64;
+        while made < N {
+            let t = TxnId(txn);
+            txn += 1;
+            s.begin(t);
+            for _ in 0..BATCH {
+                s.create_node(t).unwrap();
+            }
+            s.commit(t).unwrap();
+            made += BATCH;
+        }
+        gc_pass(&mut s, txn);
+        txn += 1;
+
+        // (a) The 3-kind window audit's per-pass added cost at the SHIPPING window size, averaged over
+        // many calls (the cursor rotates, so successive calls cover successive windows).
+        const ITERS: u32 = 500;
+        s.freeze_audit_from = [1; STORE_COUNT];
+        let t0 = Instant::now();
+        let mut sink = 0u64;
+        for _ in 0..ITERS {
+            let (v, _) = s.audit_freeze_frontier_window();
+            sink = sink.wrapping_add(v);
+        }
+        let audit_ns = t0.elapsed().as_nanos() / ITERS as u128;
+
+        // (a') The raw window scan+predicate cost for several candidate window sizes on the Node store, to
+        // justify the chosen constant (this isolates one kind's window, so multiply by ~3 for a full pass).
+        let mut per_w = Vec::new();
+        for w in [1024u64, 2048, 4096, 8192] {
+            let mut from = 1u64;
+            let mut acc = 0u128;
+            let reps = 300u32;
+            for _ in 0..reps {
+                let t = Instant::now();
+                let (recs, next) = read_view::scan_in_use_mvcc_window(
+                    &s.pool,
+                    &s.stores,
+                    StoreKind::Node,
+                    from,
+                    w,
+                )
+                .unwrap();
+                let mut bad = 0u64;
+                for (_, mvcc) in &recs {
+                    if s.frozen_word(mvcc.created_ts).is_some()
+                        || s.frozen_word(mvcc.expired_ts).is_some()
+                    {
+                        bad += 1;
+                    }
+                }
+                acc += t.elapsed().as_nanos();
+                sink = sink.wrapping_add(bad);
+                let hw = s.store(StoreKind::Node).alloc.high_water();
+                from = if next >= hw { 1 } else { next };
+            }
+            per_w.push((w, acc / reps as u128));
+        }
+
+        // (b) The full-store scan cost (all three MVCC kinds) — the periodic-tick spike the window avoids.
+        let t1 = Instant::now();
+        let mut fullsink = 0u64;
+        for kind in [StoreKind::Node, StoreKind::Rel, StoreKind::Prop] {
+            let in_use = read_view::scan_in_use_mvcc(&s.pool, &s.stores, kind).unwrap();
+            for &(_, mvcc) in &in_use {
+                if s.frozen_word(mvcc.created_ts).is_some()
+                    || s.frozen_word(mvcc.expired_ts).is_some()
+                {
+                    fullsink += 1;
+                }
+            }
+        }
+        let full_ns = t1.elapsed().as_nanos();
+
+        // (c) A realistic maintenance operation for scale: a full store checkpoint (flush dirty pages home
+        // + WAL reclaim), which is what the background cadence actually runs around each gc() pass.
+        let t2 = Instant::now();
+        gc_pass(&mut s, txn);
+        s.checkpoint().unwrap();
+        let ckpt_ns = t2.elapsed().as_nanos();
+
+        println!(
+            "rmp #809 freeze-audit cost @ N={N} nodes, pool=4096 frames:\n  \
+             3-kind window audit ADDED/pass (W={FREEZE_AUDIT_WINDOW_IDS}) : {audit_ns:>10} ns\n  \
+             full-store scan (AVOIDED periodic-tick spike)   : {full_ns:>10} ns\n  \
+             gc()+checkpoint (a real maintenance pass)       : {ckpt_ns:>10} ns\n  \
+             audit / maintenance pass                        : {:.4}%\n  \
+             per-window (Node only) 1024/2048/4096/8192 ns   : {:?}\n  \
+             (sink={sink}, full_flagged={fullsink})",
+            audit_ns as f64 / ckpt_ns as f64 * 100.0,
+            per_w
         );
     }
 

@@ -560,6 +560,20 @@ fn reclaim_after_bulk_load<D: BlockDevice, S: LogSink>(coordinator: &mut TxnCoor
                 "bulk-import Mode A session end: reclaimed the WAL before the database is stopped, so \
                  the next START DATABASE reopen does not replay it (rmp #579)"
             );
+            // `rmp` #809: this end-of-load checkpoint runs the same GC pass as the background cadence, so
+            // it too can catch a stranded committed stamp (the pass skips the prune fail-closed if it
+            // does). No `Metrics` handle here, so raise the alert log directly; the next background
+            // maintenance tick re-detects and increments `graphus_freeze_frontier_violations_total`.
+            if report.freeze_violations > 0 {
+                tracing::error!(
+                    violations = report.freeze_violations,
+                    detail = ?report.first_freeze_violation,
+                    "rmp #809 DURABILITY ALERT: the end-of-load GC freeze-frontier audit found an \
+                     unfrozen committed stamp before the prune (the rmp #522 silent-committed-data-loss \
+                     invariant). The pass SKIPPED the prune fail-closed — no committed data was lost — \
+                     but a freeze-frontier regression is live; investigate immediately."
+                );
+            }
         }
         Err(e) => {
             tracing::warn!(

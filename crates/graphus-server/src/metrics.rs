@@ -290,6 +290,15 @@ pub struct Metrics {
     /// indexes still report `ONLINE`. Correct but strictly slower than having no index — an alerting
     /// signal, not a debug detail.
     ft_spatial_poison: AtomicU64,
+    /// Cumulative **freeze-frontier violations** the release-active GC audit caught (`rmp` #809): an
+    /// in-use MVCC record still bore an *unfrozen committed-writer stamp* after the freeze sweep and
+    /// before the registry prune — the exact `rmp` #522 silent-committed-data-loss invariant. The GC
+    /// pass responded fail-closed (it **skipped the prune**, so the affected committed versions stay
+    /// resolvable and no data is lost), but a non-zero value means a freeze-frontier regression is live
+    /// and the Active/Recent Transaction Table is no longer being pruned — the highest-severity storage
+    /// alert (a durability-path bug), never a debug detail. Engine-thread-only writer (GC runs on the
+    /// engine thread), so unpadded.
+    freeze_frontier_violations: AtomicU64,
     /// Cumulative index builds **poisoned** by a storage fault (`rmp` task #733, M1): the build could not
     /// get past an unreadable entity and was parked, leaving its index `Populating` — correct (every
     /// reader is on the exact scan) but unaccelerated — until the store reads cleanly again and the build
@@ -459,6 +468,7 @@ impl Metrics {
             index_fail_closed: AtomicU64::new(0),
             vector_index_conflicts: AtomicU64::new(0),
             ft_spatial_poison: AtomicU64::new(0),
+            freeze_frontier_violations: AtomicU64::new(0),
             index_builds_poisoned: AtomicU64::new(0),
             index_builds_pending: AtomicU64::new(0),
             index_builds_parked: AtomicU64::new(0),
@@ -545,6 +555,16 @@ impl Metrics {
     /// SPATIAL seek falls back to an exact full scan until a rebuild clears it.
     pub fn record_ft_spatial_poison(&self, n: u64) {
         self.ft_spatial_poison.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Records `n` new **freeze-frontier violations** the release-active GC audit caught (`rmp` #809): a
+    /// committed MVCC stamp was stranded unfrozen below the GC freeze frontier before the registry prune
+    /// — the `rmp` #522 silent-committed-data-loss class. The GC pass already responded fail-closed
+    /// (it skipped the prune, so no committed version was forgotten); this counter makes the regression
+    /// alertable. Any non-zero value is a durability-path emergency.
+    pub fn record_freeze_frontier_violations(&self, n: u64) {
+        self.freeze_frontier_violations
+            .fetch_add(n, Ordering::Relaxed);
     }
 
     /// Records `n` newly **poisoned** index builds (`rmp` task #733, M1) — a build a storage fault stopped
@@ -1108,6 +1128,15 @@ impl Metrics {
              ONLINE. Answers stay correct but the index costs more than none (rmp #803).",
             self.ft_spatial_poison.load(Ordering::Relaxed),
         );
+        counter(
+            &mut out,
+            "graphus_freeze_frontier_violations_total",
+            "Times the release-active GC audit found a committed MVCC stamp stranded unfrozen below the \
+             freeze frontier before the registry prune — the silent-committed-data-loss invariant of rmp \
+             #522. The GC pass responded fail-closed (it skipped the prune, so no committed version was \
+             forgotten); any non-zero value is a durability-path emergency (rmp #809).",
+            self.freeze_frontier_violations.load(Ordering::Relaxed),
+        );
         // The window-vs-stall gauges (`rmp` task #573). The two counters above are cumulative event
         // tallies: they say something happened, never whether it is happening NOW. An index left
         // POPULATING is normal during a build window (~70-74k nodes/s) and pathological when a poisoned
@@ -1428,6 +1457,23 @@ mod tests {
         // Self-describing: HELP + TYPE present.
         assert!(text.contains("# TYPE graphus_transactions_committed_total counter"));
         assert!(text.contains("# TYPE graphus_active_transactions gauge"));
+    }
+
+    /// `rmp` #809: the release-active freeze-frontier violation counter is exported (zero on a healthy
+    /// node, ticking only when the GC audit catches a stranded committed stamp — a durability alert).
+    #[test]
+    fn freeze_frontier_violations_counter_renders() {
+        let m = Metrics::new();
+        assert!(
+            m.render_prometheus()
+                .contains("graphus_freeze_frontier_violations_total 0"),
+            "the counter is exported and starts at zero on a healthy node"
+        );
+        m.record_freeze_frontier_violations(2);
+        m.record_freeze_frontier_violations(1);
+        let text = m.render_prometheus();
+        assert!(text.contains("graphus_freeze_frontier_violations_total 3"));
+        assert!(text.contains("# TYPE graphus_freeze_frontier_violations_total counter"));
     }
 
     /// `rmp` #418: the open-transaction gauge is additive, so two engines each publishing their own
