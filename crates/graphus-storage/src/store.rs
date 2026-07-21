@@ -4716,9 +4716,11 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// committed at or before `watermark`, so no live or future snapshot can still see that version.
     /// Returns the number of records reclaimed.
     ///
-    /// For each reclaimable record it frees the property's overflow heap chain, clears the record
-    /// (`MvccHeader::default()` + `next_prop = NULL_ID`), returns its id to the Prop free list, and
-    /// **splices it out** of the chain: if it was the head (no kept predecessor) the owner's
+    /// For each reclaimable record it frees the property's overflow heap chain, clears the record's
+    /// in-use bit (`MvccHeader::default()`) **while PRESERVING its `next_prop` forward link** (`rmp`
+    /// #821/#811 — so a concurrent off-thread reader mid-walk threads through it to the live successor
+    /// below; see the inline note), returns its id to the Prop free list, and **splices it out** of the
+    /// chain: if it was the head (no kept predecessor) the owner's
     /// `first_prop` is repointed past it and the owner record rewritten, otherwise the last kept
     /// predecessor's `next_prop` is repointed past it. A non-reclaimable record (a live version, or a
     /// not-yet-committed / not-yet-old-enough tombstone) is kept and becomes the new predecessor.
@@ -4772,7 +4774,23 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 }
                 let mut dead = prop;
                 dead.mvcc = MvccHeader::default(); // clears in_use (no-op for a corpse, already clear)
-                dead.next_prop = NULL_ID;
+                // `rmp` #821/#811: PRESERVE `dead.next_prop` (do NOT zero it). This tombstone/corpse sits
+                // on a **live** owner's chain, so an off-thread reader (`read_view::collect_prop_chain`,
+                // behind `node_properties`/`rel_properties`) that captured a pointer to `cur` — from the
+                // owner's `first_prop` or a predecessor's `next_prop` — BEFORE the bridge below still
+                // reads this record and must thread through its `next_prop` to the live successor it
+                // points at. The reader correctly SKIPS this record (its `!in_use` bit hides the
+                // tombstone), but it walks the chain LIVE and non-atomically: zeroing `next_prop` made
+                // that reader observe `!in_use` **and** `next_prop == 0`, terminating its walk and
+                // silently dropping every committed, snapshot-visible property below the tombstone — a
+                // property-chain instance of the `rmp` #811 severance. The rel corpse/tombstone paths
+                // (`gc_splice_corpses` phase 3, `reclaim_rel`) preserve their incidence pointers for the
+                // identical reason; this brings the property chain in line. The GC watermark protects
+                // VISIBILITY (the reader skips the tombstone), not STRUCTURAL traversal (it must still
+                // thread `next_prop` to reach the live successor). The bridge below unlinks `cur` for
+                // FRESH walks that start after it; `held_slots` (#588) defers slot **reuse** while a
+                // predating reader is in flight; and a later `write_prop_create` overwrites the slot
+                // wholesale, so no stale pointer ever survives into a reused slot.
                 self.write_prop(cur, &dead, txn)?;
                 self.free_push(StoreKind::Prop, cur, txn);
                 if prev == NULL_ID {
@@ -8860,6 +8878,194 @@ mod tests {
         );
         // No record id 0 was minted: the allocator high-water is unchanged (no silent advance).
         assert_eq!(s.store(StoreKind::Node).alloc.high_water(), u64::MAX);
+    }
+
+    /// `rmp` #821 (deterministic RED→GREEN for the property-chain `rmp` #811 severance): a reclaimable
+    /// tombstone on a **live** owner's chain must keep its `next_prop` forward link after GC frees its
+    /// slot, so an off-thread reader (`read_view::collect_prop_chain`) that captured a pointer to it
+    /// still threads THROUGH it to the live property below. Pre-fix the reclaim zeroed `next_prop`, so a
+    /// reader reading the reclaimed record observed `!in_use` **and** `next_prop == 0` and dropped every
+    /// live property beneath the tombstone. This asserts the preserved link directly (no threads), so it
+    /// is a hard, timing-free regression guard (RED before the fix — `next_prop` reads back `0`).
+    #[test]
+    fn gc_property_chain_preserves_reclaimed_tombstone_next_prop_811() {
+        let mut s = fresh();
+        let ka = s.intern_token(Namespace::PropKey, "a").unwrap();
+        let kb = s.intern_token(Namespace::PropKey, "b").unwrap();
+
+        // Chain head B -> A: create A (older, stays live), then B (newer head), both COMMITTED.
+        let t0 = TxnId(1);
+        s.begin(t0);
+        let (node, _) = s.create_node(t0).unwrap();
+        let a = s.add_node_property(t0, node, ka, 1, 0xAA).unwrap();
+        let b = s.add_node_property(t0, node, kb, 1, 0xBB).unwrap();
+        s.commit(t0).unwrap();
+        assert_eq!(
+            s.property(b).unwrap().next_prop,
+            a,
+            "precondition: the chain head B links down to the older property A"
+        );
+
+        // Delete B: MVCC-tombstones it (xmax committed), leaving the chain B(tomb) -> A(live).
+        let t_del = TxnId(2);
+        s.begin(t_del);
+        assert!(s.remove_node_property_value(t_del, node, kb).unwrap());
+        s.commit(t_del).unwrap();
+
+        // GC past B's expiry reclaims the tombstone B and frees its slot.
+        let wm = s.snapshot_ts();
+        s.begin(TxnId(3));
+        s.gc(TxnId(3), wm).unwrap();
+        s.commit(TxnId(3)).unwrap();
+        assert!(
+            s.store(StoreKind::Prop).free.ids().contains(&b),
+            "the reclaimed tombstone B is returned to the Prop free list"
+        );
+
+        // THE INVARIANT: B's forward link is PRESERVED (RED before the fix: reads back 0), so a reader
+        // mid-walk on B still reaches A instead of terminating on a zeroed pointer.
+        assert_eq!(
+            s.property(b).unwrap().next_prop,
+            a,
+            "rmp #821/#811: a reclaimed tombstone prop MUST preserve next_prop so an off-thread reader \
+             threading through it reaches the live property A below (zeroing it silently drops A)"
+        );
+
+        // End-to-end proof: replay `collect_prop_chain`'s exact skip-`!in_use`-then-follow-`next` walk
+        // from the STALE captured head B (what a reader holds when GC bridges the owner out from under
+        // it) and assert it still threads through to the live property A.
+        let mut cur = b;
+        let mut steps = 0u64;
+        let mut reached_a = false;
+        while cur != NULL_ID {
+            steps += 1;
+            assert!(
+                steps <= s.store(StoreKind::Prop).alloc.high_water() + 1,
+                "the stale-head walk must terminate within the cycle guard"
+            );
+            let p = s.property(cur).unwrap();
+            let next = p.next_prop;
+            if p.mvcc.in_use() && cur == a {
+                reached_a = true;
+            }
+            cur = next;
+        }
+        assert!(
+            reached_a,
+            "a reader walking from the stale head B must still thread through to the live property A"
+        );
+
+        // No corruption and no leak: the checker stays green, and the owner's LIVE chain is bridged to
+        // exactly the live property A (B is unlinked and reclaimed).
+        let report = crate::check::check_store(&mut s, &[]).unwrap();
+        assert!(
+            report.is_consistent(),
+            "store consistent after the property-chain GC: {:?}",
+            report.violations
+        );
+        assert_eq!(
+            s.node_properties(node)
+                .unwrap()
+                .into_iter()
+                .map(|(pid, _)| pid)
+                .collect::<Vec<_>>(),
+            vec![a],
+            "the owner's live chain is bridged to exactly the live property A"
+        );
+    }
+
+    /// `rmp` #821 (threaded stress — also closes the GAP-A concurrency-coverage gap of the v0.0.9
+    /// storage re-audit): an off-thread reader hammering `node_properties` on a **live** owner whose
+    /// chain is `B(tombstone) -> A(live)` must NEVER lose the live property A while the engine
+    /// repeatedly runs a GC pass that reclaims the tombstone B above it. Pre-fix the GC zeroed B's
+    /// `next_prop`, and a reader that read the owner's (not-yet-bridged) head B and then read B after
+    /// the zero terminated its walk and dropped A. This drives REAL threads over the shared
+    /// `Arc<pool>` (the production `rmp` #336 off-thread-reader path — `read_view()` is `Send + Sync`),
+    /// so it exercises the exact non-atomic live chain walk vs. in-place GC mutation race.
+    #[test]
+    fn offthread_reader_never_loses_live_property_across_gc_811() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+        let mut s = fresh();
+        let ka = s.intern_token(Namespace::PropKey, "a").unwrap();
+        let kb = s.intern_token(Namespace::PropKey, "b").unwrap();
+
+        // Owner with the live property A, then the head property B, both committed. Capture the
+        // (`Send + Sync`) read view AFTER both exist so its snapshot high-water covers A and B; the
+        // churn below reuses B's freed slot, so no new Prop page ever appears above that snapshot.
+        let t0 = TxnId(1);
+        s.begin(t0);
+        let (node, _) = s.create_node(t0).unwrap();
+        let a = s.add_node_property(t0, node, ka, 1, 0xAA).unwrap();
+        let _b = s.add_node_property(t0, node, kb, 1, 0xBB).unwrap();
+        s.commit(t0).unwrap();
+
+        let view = s.read_view(); // owns Arc clones of the live page cache + live page map: Send + Sync
+        let stop = Arc::new(AtomicBool::new(false));
+        let losses = Arc::new(AtomicU64::new(0));
+        let reads = Arc::new(AtomicU64::new(0));
+
+        let reader = {
+            let view = view;
+            let stop = Arc::clone(&stop);
+            let losses = Arc::clone(&losses);
+            let reads = Arc::clone(&reads);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    match view.node_properties(node) {
+                        // The live property A (pid `a`) is NEVER deleted, so it must be present on every
+                        // read: only a severed walk can drop it.
+                        Ok(props) => {
+                            if !props.iter().any(|(pid, _)| *pid == a) {
+                                losses.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        // A live-chain walk must never error either (a torn pointer would surface here).
+                        Err(_) => {
+                            losses.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    reads.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        };
+
+        // Churn: each cycle re-tombstones B, GC-reclaims it (the severance window), then re-adds B
+        // (reusing the freed slot). Every cycle is a fresh `B(tomb) -> A(live)` reclaim the reader races.
+        let cycles = 20_000u64;
+        let mut txn = 10u64;
+        for _ in 0..cycles {
+            s.begin(TxnId(txn));
+            s.remove_node_property_value(TxnId(txn), node, kb).unwrap();
+            s.commit(TxnId(txn)).unwrap();
+            txn += 1;
+
+            let wm = s.snapshot_ts();
+            s.begin(TxnId(txn));
+            s.gc(TxnId(txn), wm).unwrap();
+            s.commit(TxnId(txn)).unwrap();
+            txn += 1;
+
+            s.begin(TxnId(txn));
+            s.add_node_property(TxnId(txn), node, kb, 1, 0xBB).unwrap();
+            s.commit(TxnId(txn)).unwrap();
+            txn += 1;
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        reader.join().expect("reader thread joined");
+
+        assert!(
+            reads.load(Ordering::Relaxed) > 0,
+            "the reader must have actually run concurrently with the churn"
+        );
+        assert_eq!(
+            losses.load(Ordering::Relaxed),
+            0,
+            "rmp #821/#811: an off-thread reader lost the live property A while GC reclaimed the \
+             tombstone above it (over {} reads)",
+            reads.load(Ordering::Relaxed)
+        );
     }
 
     // -------- read-only transactions perform ZERO WAL append + ZERO fdatasync (`rmp` #529) --------
