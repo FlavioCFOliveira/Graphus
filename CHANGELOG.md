@@ -128,6 +128,20 @@ explicitly so an operator can judge their own exposure.
   already-durable commit, never decreases, and is identical for two reads with no write between them.
   Verified against the official `neo4j-driver` 6.x: a read auto-commit advances `last_bookmarks()` and
   read-your-writes / `execute_read`/`execute_write` chaining is unaffected.
+- **A request that names a database which does not exist now reports the verbatim Neo4j leaf code
+  `Neo.ClientError.Database.DatabaseNotFound`, not the coarse `Neo.ClientError.Request.Invalid` (rmp
+  #814, from the #800 Bolt audit).** The classification is unchanged — still a **non-retryable
+  `ClientError`** (HTTP 400 on REST) — so retryability does not move; only the fine-grained title an
+  application may switch on (e.g. auto-create-a-database-on-not-found) becomes exact. It is emitted at
+  every driver-observable "database does not exist" site: a Bolt/REST session targeting an unknown
+  database, and an admin `DROP`/`STOP`/`START`/`ALTER DATABASE` naming a missing one. Implemented as a
+  small, reusable "verbatim wire status code" primitive (`graphus_core::WIRE_STATUS_CODE_PREFIX`),
+  the variant-agnostic generalization of the existing schema-rule sentinel. An **offline/stopped**
+  database deliberately stays `Neo.ClientError.Request.Invalid`: Neo4j's faithful code for it is
+  `Neo.TransientError.General.DatabaseUnavailable`, a **retryable** `TransientError`, so emitting it
+  verbatim would move retryability — deferred to a product decision. Verified against the official
+  `neo4j-driver` 6.x: the driver observes the exact leaf code and still treats it as a non-retryable
+  `ClientError`.
 
 ### Fixed
 

@@ -26,6 +26,7 @@ use std::fmt;
 
 use graphus_core::{
     CONSTRAINT_VIOLATION_PREFIX, GraphusError, SCHEMA_RULE_ERROR_PREFIX, SCHEMA_RULE_ERROR_SEP,
+    WIRE_STATUS_CODE_PREFIX, WIRE_STATUS_CODE_SEP,
 };
 
 /// The crate-wide result alias for protocol/codec operations.
@@ -117,12 +118,44 @@ impl Failure {
 /// (client-caused vs retriable vs server fault) is the part drivers act on (retry vs fail), and is
 /// faithfully derived from the variant; only the fine-grained third/fourth segments are the
 /// best-effort placeholders the `06 §2.4` flag will pin verbatim.
+///
+/// ## Verbatim leaf codes for common driver-observable errors (`rmp` task #814)
+///
+/// A few Neo4j leaf codes are *driver-observable* — an application switches on the exact string
+/// (e.g. auto-create-a-database on `Neo.ClientError.Database.DatabaseNotFound`). For those, the
+/// engine tags the error message with the [`graphus_core::WIRE_STATUS_CODE_PREFIX`] sentinel +
+/// `<leaf code>\u{1f}<human>`, and this renderer emits that leaf code **verbatim** (the same
+/// established pattern as the schema-rule and constraint-violation sentinels). This is a small,
+/// deliberate class: it currently pins `Neo.ClientError.Database.DatabaseNotFound` (a request that
+/// names a database which does not exist) — the classification is **unchanged** from the coarse
+/// `Neo.ClientError.Request.Invalid` it replaces (both `ClientError`, non-retryable), only the
+/// fine-grained title becomes exact. An offline/stopped database is **deliberately not** in this
+/// class: Neo4j's faithful code for it is `Neo.TransientError.General.DatabaseUnavailable`, a
+/// **retryable** `TransientError`, so emitting it verbatim would move retryability (a behavioral
+/// change deferred to a product decision) — it stays `Neo.ClientError.Request.Invalid`.
 #[must_use]
 pub fn failure_from_error(error: &GraphusError) -> Failure {
     // The human message renders verbatim, but strip the `GraphusError` layer prefix
     // ("compile error: ", …) the engine's `Display` adds — the classification already conveys the
     // layer, and Neo4j `FAILURE` messages do not carry that prefix.
     let message = strip_layer_prefix(&error.to_string());
+
+    // A verbatim wire status code (`rmp` task #814): ANY `GraphusError` variant whose
+    // (layer-stripped) message carries the `WIRE_STATUS_CODE_PREFIX` sentinel + `<leaf code>\u{1f}
+    // <human>` emits that Neo4j leaf code VERBATIM. This is the reusable "carry a driver-observable
+    // Neo4j leaf code from the engine to the wire" primitive (the variant-agnostic generalization of
+    // the schema-rule mechanism below) — e.g. `Neo.ClientError.Database.DatabaseNotFound` for a
+    // request that names a database which does not exist, whose exact title a client may switch on
+    // (auto-create-on-not-found). The leaf code is server-generated from a fixed set and any
+    // client-supplied name lands in the human segment after the separator, so a client can never
+    // inject an arbitrary status code. Only the fine-grained title changes; the coarse
+    // classification the driver acts on (retry vs. fail) is the leaf code's own `Neo.<Class>.*`
+    // segment, which the carrier variant is chosen to agree with (see `WIRE_STATUS_CODE_PREFIX`).
+    if let Some(rest) = message.strip_prefix(WIRE_STATUS_CODE_PREFIX)
+        && let Some((leaf_code, human)) = rest.split_once(WIRE_STATUS_CODE_SEP)
+    {
+        return Failure::new(leaf_code, human.to_owned());
+    }
 
     // A constraint violation (`rmp` task #99) is a `GraphusError::Runtime` whose message carries the
     // internal sentinel `graphus_cypher::CONSTRAINT_VIOLATION_PREFIX`. Detect it and emit the precise
@@ -310,5 +343,57 @@ mod tests {
             failure_from_error(&GraphusError::Protocol("bad frame".to_owned())).code,
             CODE_REQUEST_INVALID
         );
+    }
+
+    #[test]
+    fn wire_status_code_sentinel_emits_the_verbatim_leaf_and_strips_it() {
+        // The verbatim-leaf-code mechanism (`rmp` task #814): a `GraphusError` carrying the
+        // WIRE_STATUS_CODE sentinel + `<leaf code>\u{1f}<human>` must emit the leaf code as-is and
+        // surface ONLY the human message (sentinel + code stripped). This is the driver-observable
+        // `Neo.ClientError.Database.DatabaseNotFound` case: an app switches on the exact title.
+        let msg = graphus_core::wire_status_code_message(
+            "Neo.ClientError.Database.DatabaseNotFound",
+            "database \"ghost\" does not exist",
+        );
+        let f = failure_from_error(&GraphusError::Protocol(msg));
+        assert_eq!(f.code, "Neo.ClientError.Database.DatabaseNotFound");
+        assert_eq!(f.message, "database \"ghost\" does not exist");
+        // The classification is a non-retryable ClientError — the SAME class as the coarse
+        // Request.Invalid it refines (retryability does not move), only the title becomes exact.
+        assert!(f.code.contains("ClientError"), "{f:?}");
+        assert!(!f.code.contains("TransientError"), "{f:?}");
+    }
+
+    #[test]
+    fn wire_status_code_sentinel_is_variant_agnostic() {
+        // Unlike the schema-rule sentinel (Runtime-only), the WIRE_STATUS_CODE sentinel rides ANY
+        // variant. The admin-DDL "database does not exist" twin carries it on a Runtime error and
+        // must still emit the verbatim leaf code (not the Runtime fallback ArgumentError).
+        let msg = graphus_core::wire_status_code_message(
+            "Neo.ClientError.Database.DatabaseNotFound",
+            "database \"scratch\" does not exist",
+        );
+        let f = failure_from_error(&GraphusError::Runtime(msg));
+        assert_eq!(f.code, "Neo.ClientError.Database.DatabaseNotFound");
+        assert_eq!(f.message, "database \"scratch\" does not exist");
+    }
+
+    #[test]
+    fn untagged_protocol_still_maps_to_request_invalid() {
+        // Non-regression guard against over-broad remapping (`rmp` task #814): a plain
+        // `GraphusError::Protocol` WITHOUT the sentinel (genuine protocol misuse — a malformed
+        // message, a missing user_agent, a result-not-open) must still classify as the coarse
+        // `Neo.ClientError.Request.Invalid`, exactly as before. Only the sentinel opts into a
+        // verbatim leaf code.
+        for m in [
+            "expected a HELLO message",
+            "HELLO is missing the required \"user_agent\" field",
+            "the result being pulled is not open",
+            // Even a message that merely mentions a database but lacks the sentinel stays coarse.
+            "cannot switch database inside an explicit transaction",
+        ] {
+            let f = failure_from_error(&GraphusError::Protocol(m.to_owned()));
+            assert_eq!(f.code, CODE_REQUEST_INVALID, "message {m:?}");
+        }
     }
 }

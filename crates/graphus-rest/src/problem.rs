@@ -43,7 +43,10 @@
 //! matching the Bolt `TransientError` classification drivers act on.
 
 use graphus_auth::AuthError;
-use graphus_core::{GraphusError, SCHEMA_RULE_ERROR_PREFIX, SCHEMA_RULE_ERROR_SEP};
+use graphus_core::{
+    GraphusError, SCHEMA_RULE_ERROR_PREFIX, SCHEMA_RULE_ERROR_SEP, WIRE_STATUS_CODE_PREFIX,
+    WIRE_STATUS_CODE_SEP,
+};
 use http::StatusCode;
 use serde::Serialize;
 
@@ -116,6 +119,32 @@ impl Problem {
     /// matching the Bolt renderer.
     #[must_use]
     pub fn from_graphus_error(error: &GraphusError) -> Self {
+        // A verbatim wire status code (`rmp` task #814): ANY `GraphusError` variant whose
+        // (layer-stripped) message carries the `WIRE_STATUS_CODE_PREFIX` sentinel + `<leaf code>
+        // \u{1f}<human>` surfaces that Neo4j leaf code VERBATIM — the REST sibling of
+        // `graphus_bolt::failure_from_error`'s verbatim handling. The HTTP status is derived from the
+        // leaf code's own classification segment so it agrees with the code (a `Neo.ClientError.*`
+        // leaf → 400, exactly as the `Neo.ClientError.Request.Invalid` it replaces for the headline
+        // `Neo.ClientError.Database.DatabaseNotFound`), i.e. the classification is unchanged and only
+        // the fine-grained title becomes exact. A server-fault (`Neo.DatabaseError.*`) leaf uses the
+        // generic detail (rmp #187, CWE-209); a client-fault leaf keeps the (server-authored) human
+        // message, which helps the client fix its request.
+        {
+            let stripped = strip_layer_prefix(&error.to_string());
+            if let Some(rest) = stripped.strip_prefix(WIRE_STATUS_CODE_PREFIX)
+                && let Some((leaf, human)) = rest.split_once(WIRE_STATUS_CODE_SEP)
+            {
+                let (status, kind, title) = problem_shape_for_leaf_code(leaf);
+                let detail = if status.is_server_error() {
+                    eprintln!("graphus-rest: internal fault (wire status {leaf}): {error}");
+                    GENERIC_SERVER_FAULT_DETAIL.to_owned()
+                } else {
+                    human.to_owned()
+                };
+                return Problem::new(status, kind, title, detail).with_code(leaf);
+            }
+        }
+
         // A schema-rule declaration error (`rmp` task #624) is a `GraphusError::Runtime` carrying the
         // `SCHEMA_RULE_ERROR_PREFIX` sentinel + `<Neo4j leaf code>\u{1f}<message>`. Surface it as a
         // client-fault **400** with the precise `Neo.ClientError.Schema.*` code and the stripped human
@@ -365,6 +394,29 @@ const CODE_FORBIDDEN: &str = "Neo.ClientError.Security.Forbidden";
 /// rendering the rest of the surface uses (`06 §2.4`), matching Neo4j's authentication-rate-limit class.
 const CODE_AUTH_RATE_LIMIT: &str = "Neo.ClientError.Security.AuthenticationRateLimit";
 
+/// Derives the RFC 9457 HTTP status from a verbatim Neo4j leaf status code's classification segment
+/// Derives the RFC 9457 problem shape — HTTP status, `type` suffix (`kind`) and human `title` — from
+/// a verbatim Neo4j leaf status code's classification segment (`rmp` task #814), so a
+/// `WIRE_STATUS_CODE_PREFIX`-tagged error's status/kind agree with the code it carries. The
+/// classification is the second dotted segment (`Neo.<Classification>.<Category>.<Title>`):
+///
+/// - `TransientError` → **409 Conflict** (retriable — the same status the retriable
+///   `Neo.TransientError.Transaction.*` class maps to);
+/// - `DatabaseError` → **500 Internal Server Error** (server fault);
+/// - anything else (`ClientError`, or a malformed code) → **400 Bad Request** (client fault) — the
+///   conservative default that matches the `Neo.ClientError.Request.Invalid` these codes refine.
+fn problem_shape_for_leaf_code(code: &str) -> (StatusCode, &'static str, &'static str) {
+    match code.split('.').nth(1) {
+        Some("TransientError") => (StatusCode::CONFLICT, "transient", "transient error"),
+        Some("DatabaseError") => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "database",
+            "database error",
+        ),
+        _ => (StatusCode::BAD_REQUEST, "client-error", "client error"),
+    }
+}
+
 /// Removes the `GraphusError::Display` layer prefix (`"<layer> error: "`) so the problem `detail`
 /// is the bare human description — mirrors `graphus_bolt::error`'s `strip_layer_prefix`.
 fn strip_layer_prefix(s: &str) -> String {
@@ -433,6 +485,64 @@ mod tests {
         let detail = p.detail.unwrap();
         assert!(!detail.contains("/var/lib/graphus"));
         assert!(!detail.contains("0xDEADBEEF"));
+    }
+
+    #[test]
+    fn wire_status_code_sentinel_emits_verbatim_leaf_with_classification_derived_status() {
+        // The verbatim-leaf-code mechanism (`rmp` task #814), REST sibling of the Bolt renderer: a
+        // `Neo.ClientError.Database.DatabaseNotFound` carried on a `GraphusError::Protocol` (the
+        // session-targeting unknown-database case) surfaces the leaf VERBATIM at a 400 (its
+        // ClientError classification — the SAME status the coarse Request.Invalid it refines used),
+        // with the sentinel + code stripped from the detail.
+        let msg = graphus_core::wire_status_code_message(
+            "Neo.ClientError.Database.DatabaseNotFound",
+            "database \"ghost\" does not exist",
+        );
+        let p = Problem::from_graphus_error(&GraphusError::Protocol(msg));
+        assert_eq!(p.status, 400);
+        assert_eq!(
+            p.code.as_deref(),
+            Some("Neo.ClientError.Database.DatabaseNotFound")
+        );
+        assert_eq!(
+            p.detail.as_deref(),
+            Some("database \"ghost\" does not exist")
+        );
+    }
+
+    #[test]
+    fn wire_status_code_status_tracks_classification_segment() {
+        // The derived status agrees with the leaf code's own classification: ClientError → 400,
+        // TransientError → 409 (retriable), DatabaseError → 500 (server fault, generic detail).
+        assert_eq!(
+            problem_shape_for_leaf_code("Neo.ClientError.Database.DatabaseNotFound").0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            problem_shape_for_leaf_code("Neo.TransientError.General.DatabaseUnavailable").0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            problem_shape_for_leaf_code("Neo.DatabaseError.Database.Unknown").0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        // A server-fault leaf redacts its detail (rmp #187) even when carried by the sentinel.
+        let msg = graphus_core::wire_status_code_message(
+            "Neo.DatabaseError.Database.Unknown",
+            "internal path /var/lib/graphus/store leaked",
+        );
+        let p = Problem::from_graphus_error(&GraphusError::Storage(msg));
+        assert_eq!(p.status, 500);
+        assert_eq!(p.detail.as_deref(), Some(GENERIC_SERVER_FAULT_DETAIL));
+    }
+
+    #[test]
+    fn untagged_protocol_still_maps_to_400_request_invalid() {
+        // Non-regression guard (`rmp` task #814): a plain `GraphusError::Protocol` WITHOUT the
+        // sentinel stays the coarse 400 `Neo.ClientError.Request.Invalid`.
+        let p = Problem::from_graphus_error(&GraphusError::Protocol("bad frame".to_owned()));
+        assert_eq!(p.status, 400);
+        assert_eq!(p.code.as_deref(), Some(CODE_REQUEST_INVALID));
     }
 
     #[test]

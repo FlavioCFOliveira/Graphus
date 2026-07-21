@@ -113,6 +113,18 @@ use crate::engine::{
 };
 use crate::security::{SecurityCatalog, SecurityError};
 
+/// The verbatim Neo4j leaf status code for "a request named a database that does not exist"
+/// (`rmp` task #814). Emitted at every driver-observable "database does not exist" site — a session
+/// targeting an unknown database (see [`AdminContext::unavailable`]) and an admin `DROP`/`STOP`/
+/// `START`/`ALTER DATABASE` naming a missing one (see [`graphus_error_from_catalog`]) — via the
+/// [`graphus_core::wire_status_code_message`] sentinel, so the Bolt / REST renderers surface it
+/// verbatim. Classification: `ClientError`, **non-retryable** — the SAME class as the coarse
+/// `Neo.ClientError.Request.Invalid` / `Neo.ClientError.Statement.ArgumentError` it replaces, so only
+/// the fine-grained title (which a client may switch on, e.g. auto-create-on-not-found) becomes
+/// exact; retryability does not move. Verified against
+/// <https://neo4j.com/docs/status-codes/current/errors/all-errors/> (Neo4j 5.x / 2025.x).
+const CODE_DATABASE_NOT_FOUND: &str = "Neo.ClientError.Database.DatabaseNotFound";
+
 // ------------------------------------------------------------------------------------------------
 // Statement grammar
 // ------------------------------------------------------------------------------------------------
@@ -3843,6 +3855,16 @@ impl AdminContext {
     /// Builds the precise "database not servable" error for `name` (already normalized): unknown
     /// vs. stopped vs. failed-to-start. Off the hot path — it takes the catalog's admin lock via
     /// the async bridge purely to produce an accurate message.
+    ///
+    /// The **unknown** case (the database is not in the catalog) is the driver-observable
+    /// "does not exist" condition, so it carries the verbatim leaf code
+    /// [`CODE_DATABASE_NOT_FOUND`] (`rmp` task #814) — the classification is unchanged (still a
+    /// non-retryable `ClientError`; the carrier is [`GraphusError::Protocol`] whose own fallback is
+    /// `Neo.ClientError.Request.Invalid`), only the fine-grained title becomes exact. The
+    /// **offline** and **failed-to-start** cases deliberately stay a coarse
+    /// [`GraphusError::Protocol`] (`Neo.ClientError.Request.Invalid`): Neo4j's faithful code for
+    /// them is `Neo.TransientError.General.DatabaseUnavailable`, a **retryable** `TransientError`,
+    /// so emitting it verbatim would move retryability — deferred to a product decision.
     fn unavailable(&self, name: &str) -> GraphusError {
         let listing = {
             let catalog = Arc::clone(&self.catalog);
@@ -3851,18 +3873,26 @@ impl AdminContext {
                 async move { catalog.list().await.into_iter().find(|i| i.name == name) },
             )
         };
-        let message = match listing {
+        match listing {
             Ok(Some(info)) => match info.error {
-                Some(e) => format!("database {name:?} failed to start: {e}"),
-                None => format!(
+                Some(e) => {
+                    GraphusError::Protocol(format!("database {name:?} failed to start: {e}"))
+                }
+                None => GraphusError::Protocol(format!(
                     "database {name:?} is not currently online (start it with START DATABASE)"
-                ),
+                )),
             },
-            Ok(None) => format!("database {name:?} does not exist"),
+            // The database is not in the catalog — the driver-observable "does not exist" case:
+            // emit the verbatim `Neo.ClientError.Database.DatabaseNotFound` (rmp #814).
+            Ok(None) => GraphusError::Protocol(graphus_core::wire_status_code_message(
+                CODE_DATABASE_NOT_FOUND,
+                &format!("database {name:?} does not exist"),
+            )),
             // The bridge only fails at process shutdown; report the plain fact.
-            Err(_) => format!("database {name:?} is not currently available"),
-        };
-        GraphusError::Protocol(message)
+            Err(_) => {
+                GraphusError::Protocol(format!("database {name:?} is not currently available"))
+            }
+        }
     }
 
     /// Authorizes `principal` for the administrative surface: it must be authenticated and hold the
@@ -4838,9 +4868,16 @@ fn graphus_error_from_security(e: &SecurityError) -> GraphusError {
 /// HTTP 500).
 fn graphus_error_from_catalog(e: &CatalogError) -> GraphusError {
     match e {
+        // A `DROP`/`STOP`/`START`/`ALTER DATABASE` (etc.) naming a database that is not in the
+        // catalog is the admin-surface twin of a session targeting an unknown database: emit the
+        // verbatim `Neo.ClientError.Database.DatabaseNotFound` (rmp #814), carried on
+        // `GraphusError::Runtime` (whose own fallback class, `Neo.ClientError.Statement.ArgumentError`,
+        // is the SAME non-retryable `ClientError` — only the fine-grained title becomes exact).
+        CatalogError::UnknownDatabase(_) => GraphusError::Runtime(
+            graphus_core::wire_status_code_message(CODE_DATABASE_NOT_FOUND, &e.to_string()),
+        ),
         CatalogError::InvalidName(_)
         | CatalogError::AlreadyExists(_)
-        | CatalogError::UnknownDatabase(_)
         | CatalogError::NotOffline(_)
         | CatalogError::NotLoadable(_)
         | CatalogError::Backup(_)

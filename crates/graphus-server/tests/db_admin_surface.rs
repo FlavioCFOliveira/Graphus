@@ -1442,6 +1442,12 @@ async fn bolt_admin_lifecycle_create_show_stop_drop_and_if_variants() {
         .await
         .expect_err("offline database refuses sessions");
     assert!(f.message.contains("not currently online"), "{f:?}");
+    // Deferral pin (rmp #814): an OFFLINE database stays the coarse, non-retryable
+    // `Neo.ClientError.Request.Invalid` — it is deliberately NOT remapped to the verbatim
+    // `Neo.TransientError.General.DatabaseUnavailable`, because that faithful Neo4j code is a
+    // RETRYABLE TransientError and emitting it would move retryability (deferred to a product
+    // decision). Only the "does not exist" case gets a verbatim leaf code.
+    assert_eq!(f.code, "Neo.ClientError.Request.Invalid", "{f:?}");
     c.reset().await;
 
     // START brings it back online.
@@ -1458,12 +1464,15 @@ async fn bolt_admin_lifecycle_create_show_stop_drop_and_if_variants() {
         "drop removes the database directory"
     );
 
-    // DROP of a missing database fails; IF EXISTS makes it a no-op.
+    // DROP of a missing database fails; IF EXISTS makes it a no-op. The admin-DDL "does not exist"
+    // surface carries the SAME verbatim leaf code as the session-targeting one (rmp #814):
+    // `Neo.ClientError.Database.DatabaseNotFound`, a non-retryable ClientError.
     let f = c
         .run_on_db("DROP DATABASE scratch", None)
         .await
         .expect_err("drop of a missing database fails");
     assert!(f.message.contains("does not exist"), "{f:?}");
+    assert_eq!(f.code, "Neo.ClientError.Database.DatabaseNotFound", "{f:?}");
     c.reset().await;
     c.run_ok("DROP DATABASE scratch IF EXISTS", None).await;
 
@@ -1517,21 +1526,28 @@ async fn bolt_unknown_database_fails_clearly_and_session_recovers() {
     let mut c = BoltClient::connect(&uds).await;
     c.handshake_and_logon("alice", "admin-pw8").await;
 
-    // Auto-commit RUN against a missing database.
+    // Auto-commit RUN against a missing database. The FAILURE carries the verbatim Neo4j leaf code
+    // `Neo.ClientError.Database.DatabaseNotFound` (rmp #814) — the exact title a client may switch on
+    // (e.g. auto-create-on-not-found), NOT the coarse `Neo.ClientError.Request.Invalid` — while the
+    // classification stays a non-retryable ClientError and the human message is unchanged.
     let f = c
         .run_on_db("CREATE (:Lost)", Some("missing"))
         .await
         .expect_err("unknown database fails the RUN");
     assert!(f.message.contains("does not exist"), "{f:?}");
+    assert_eq!(f.code, "Neo.ClientError.Database.DatabaseNotFound", "{f:?}");
+    // Non-retryable ClientError: the classification the driver acts on did not move to TransientError.
     assert!(f.code.contains("ClientError"), "{f:?}");
+    assert!(!f.code.contains("TransientError"), "{f:?}");
     c.reset().await;
 
-    // BEGIN against a missing database.
+    // BEGIN against a missing database: same verbatim leaf code on the transaction-begin surface.
     let f = c
         .begin(Some("missing"))
         .await
         .expect_err("unknown db BEGIN");
     assert!(f.message.contains("does not exist"), "{f:?}");
+    assert_eq!(f.code, "Neo.ClientError.Database.DatabaseNotFound", "{f:?}");
     c.reset().await;
 
     // An invalid name is rejected by the name rule, with the rule in the message.
@@ -1716,11 +1732,17 @@ async fn rest_db_routing_admin_surface_and_isolation() {
     let (status, _) = rest_statement(rest, &token, "GRAPHUS", "RETURN 1").await;
     assert_eq!(status, 200, "the default name is case-insensitive");
 
-    // Unknown database: a clear client error (400 Request.Invalid), no side effects, and the
-    // server keeps serving.
+    // Unknown database: a clear client error (400) whose `code` is the verbatim Neo4j leaf
+    // `Neo.ClientError.Database.DatabaseNotFound` (rmp #814) — the same ClientError classification
+    // (still 400) as the coarse `Neo.ClientError.Request.Invalid` it refines, only the exact title
+    // (an app may switch on) becomes faithful. No side effects, and the server keeps serving.
     let (status, body) = rest_statement(rest, &token, "ghost", "CREATE (:Lost)").await;
     assert_eq!(status, 400, "unknown database is a client error: {body}");
     assert!(body.contains("does not exist"), "{body}");
+    assert!(
+        body.contains("Neo.ClientError.Database.DatabaseNotFound"),
+        "REST body must carry the verbatim DatabaseNotFound leaf code: {body}"
+    );
     let (status, _) = rest_statement(rest, &token, "graphus", "RETURN 1").await;
     assert_eq!(status, 200, "the server keeps serving after the error");
 

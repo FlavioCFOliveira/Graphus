@@ -11,7 +11,7 @@
 
 pub use error::{
     CONSTRAINT_VIOLATION_PREFIX, GraphusError, Result, SCHEMA_RULE_ERROR_PREFIX,
-    SCHEMA_RULE_ERROR_SEP,
+    SCHEMA_RULE_ERROR_SEP, WIRE_STATUS_CODE_PREFIX, WIRE_STATUS_CODE_SEP, wire_status_code_message,
 };
 pub use ids::{ElementId, Lsn, PageId, Timestamp, TxnId};
 pub use temporal_calc::{TemporalError, TemporalResult};
@@ -488,6 +488,54 @@ pub mod error {
     /// [`SCHEMA_RULE_ERROR_PREFIX`] (`rmp` task #624). The ASCII unit separator (`0x1f`), which never
     /// appears in a leaf code or a human schema message.
     pub const SCHEMA_RULE_ERROR_SEP: char = '\u{1f}';
+
+    /// The stable internal sentinel that prefixes an engine-error message carrying a **verbatim
+    /// Neo4j leaf status code** to emit on the wire (`rmp` task #814). Its remainder is
+    /// `<Neo4j leaf code>\u{1f}<human message>` (the [`WIRE_STATUS_CODE_SEP`] separates the two).
+    ///
+    /// This is the reusable, **variant-agnostic** generalization of [`SCHEMA_RULE_ERROR_PREFIX`]:
+    /// where that one carries schema-rule leaf codes on a [`GraphusError::Runtime`] only, this one
+    /// may ride ANY [`GraphusError`] variant, so it is the single primitive for "carry a
+    /// driver-observable Neo4j leaf code from the engine to the wire" for the common codes an
+    /// application switches on. The headline member is
+    /// `Neo.ClientError.Database.DatabaseNotFound` for a request that names a database which does
+    /// not exist (whose exact title a client may switch on — e.g. auto-create-on-not-found).
+    ///
+    /// The Bolt / REST error renderers detect the prefix, split off the precise `Neo.*` leaf code
+    /// and emit it **verbatim** (stripping the sentinel + code from the human message the wire
+    /// carries), exactly as they already do for [`SCHEMA_RULE_ERROR_PREFIX`]. It lives here in
+    /// `graphus-core` so the producer (`graphus-server`) and the consumers (`graphus-bolt`,
+    /// `graphus-rest`) share one definition with **no** crate dependency between them. Chosen so a
+    /// genuine user message can never start with it; the code segment is server-generated from a
+    /// fixed set of leaf codes and any client-supplied value lands in the *human* segment after the
+    /// first separator, so a client can never inject an arbitrary status code.
+    ///
+    /// The carrier variant still matters as a **fallback classification**: a producer wraps the
+    /// framed message in whichever [`GraphusError`] variant conveys the correct coarse class
+    /// (client-fault vs. server-fault), so that even if a renderer did not strip the sentinel the
+    /// classification the driver acts on (retry vs. fail) would still be right. The leaf code and
+    /// its carrier variant MUST agree on classification (e.g. a `Neo.ClientError.*` leaf on a
+    /// client-fault variant): the leaf code the wire carries changes only the fine-grained title,
+    /// never the classification.
+    pub const WIRE_STATUS_CODE_PREFIX: &str = "\u{1}wire-status-code\u{1} ";
+
+    /// The separator between the Neo4j leaf code and the human message inside a message carrying
+    /// [`WIRE_STATUS_CODE_PREFIX`] (`rmp` task #814). The ASCII unit separator (`0x1f`), which never
+    /// appears in a leaf code or a human message.
+    pub const WIRE_STATUS_CODE_SEP: char = '\u{1f}';
+
+    /// Frames a **verbatim Neo4j leaf status code** together with its human message into the wire
+    /// form the Bolt / REST error renderers decode (`rmp` task #814):
+    /// `<WIRE_STATUS_CODE_PREFIX><leaf code>\u{1f}<message>`.
+    ///
+    /// Producers wrap the returned string in whichever [`GraphusError`] variant carries the right
+    /// *fallback* classification (see [`WIRE_STATUS_CODE_PREFIX`]). `leaf_code` MUST be a
+    /// server-controlled constant; `message` may contain user data — it lands after the separator
+    /// and can never be read back as a status code.
+    #[must_use]
+    pub fn wire_status_code_message(leaf_code: &str, message: &str) -> String {
+        format!("{WIRE_STATUS_CODE_PREFIX}{leaf_code}{WIRE_STATUS_CODE_SEP}{message}")
+    }
 
     /// Top-level error type for Graphus.
     ///

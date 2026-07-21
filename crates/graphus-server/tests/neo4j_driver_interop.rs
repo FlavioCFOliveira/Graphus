@@ -485,6 +485,99 @@ function fail(msg) {
 })();
 "#;
 
+/// A Node.js script that drives Graphus with the OFFICIAL `neo4j-driver` and asserts the
+/// verbatim leaf code for a request that names a **database which does not exist** (rmp #814). It
+/// opens a session pinned to a non-existent database, runs a query, and asserts the thrown
+/// `Neo4jError`:
+///
+/// - `err.code === 'Neo.ClientError.Database.DatabaseNotFound'` (the exact title an app switches on,
+///   e.g. auto-create-on-not-found) — NOT the coarse `Neo.ClientError.Request.Invalid`;
+/// - the classification segment is `ClientError`, and the driver's own `retryable` flag / static
+///   `isRetryable` is **false** — proving the driver treats it as a NON-retryable client error, so
+///   remapping the fine-grained title did not move retryability;
+/// - the connection stays usable afterwards (a query against the real default database still works).
+///
+/// Prints `GRAPHUS_DBNOTFOUND_OK` and exits 0 only on full success; any mismatch exits 1.
+const DATABASE_NOT_FOUND_SCRIPT: &str = r#"
+'use strict';
+const neo4j = require('neo4j-driver');
+
+const [, , port, user, password] = process.argv;
+const uri = `bolt+ssc://127.0.0.1:${port}`;
+
+function fail(msg) {
+  console.error('DBNOTFOUND FAILURE: ' + msg);
+  process.exit(1);
+}
+
+// Resolve the driver's own view of retryability robustly across driver minors: the preferred
+// `err.retryable` boolean (falls back to the static isRetryable/isRetriable helpers).
+function driverRetryable(err) {
+  if (typeof err.retryable === 'boolean') return err.retryable;
+  if (typeof err.retriable === 'boolean') return err.retriable;
+  const E = neo4j.Neo4jError;
+  if (E && typeof E.isRetryable === 'function') return E.isRetryable(err);
+  if (E && typeof E.isRetriable === 'function') return E.isRetriable(err);
+  return null; // unknown to this driver version
+}
+
+(async () => {
+  const driver = neo4j.driver(uri, neo4j.auth.basic(user, password));
+  try {
+    await driver.verifyConnectivity();
+
+    // A query pinned to a database that does not exist must FAIL with the verbatim leaf code.
+    let caught = null;
+    {
+      const session = driver.session({ database: 'ghost' });
+      try {
+        await session.run('RETURN 1 AS n');
+        fail('a query against a non-existent database unexpectedly succeeded');
+      } catch (err) {
+        caught = err;
+      } finally {
+        await session.close();
+      }
+    }
+    if (!caught) fail('no error was thrown for a non-existent database');
+
+    // (a) Exact verbatim leaf code — the title an application switches on.
+    if (caught.code !== 'Neo.ClientError.Database.DatabaseNotFound') {
+      fail(`code = ${JSON.stringify(caught.code)}, expected Neo.ClientError.Database.DatabaseNotFound`);
+    }
+    // (b) Classification segment is ClientError (inherently non-retryable per the driver's class rules).
+    const classification = String(caught.code).split('.')[1];
+    if (classification !== 'ClientError') {
+      fail(`classification = ${classification}, expected ClientError (retryability must not move)`);
+    }
+    // (c) The driver's own retryability view must not be true (non-retryable), whenever it exposes one.
+    const retryable = driverRetryable(caught);
+    if (retryable === true) {
+      fail('driver reports the DatabaseNotFound error as retryable — classification moved to transient');
+    }
+
+    // (d) The connection stays usable: a query against the real default database still round-trips.
+    {
+      const session = driver.session();
+      try {
+        const res = await session.run('RETURN 1 AS n');
+        const n = neo4j.isInt(res.records[0].get('n')) ? res.records[0].get('n').toNumber() : res.records[0].get('n');
+        if (n !== 1) fail(`post-error RETURN 1 gave ${n}, expected 1`);
+      } finally {
+        await session.close();
+      }
+    }
+
+    console.log('GRAPHUS_DBNOTFOUND_OK:retryable=' + JSON.stringify(retryable));
+    process.exit(0);
+  } catch (err) {
+    fail((err && err.stack) ? err.stack : String(err));
+  } finally {
+    await driver.close();
+  }
+})();
+"#;
+
 /// `package.json` pinning the official driver (v6.x — current major) for a reproducible install.
 const PACKAGE_JSON: &str = r#"{
   "name": "graphus-neo4j-interop",
@@ -656,6 +749,56 @@ async fn official_neo4j_driver_full_crud_nodes_and_edges() {
     assert!(
         stdout.contains("GRAPHUS_CRUD_OK"),
         "driver exited 0 but the CRUD success marker was missing.\n\
+         --- node stdout ---\n{stdout}\n--- node stderr ---\n{stderr}",
+    );
+
+    server.shutdown().await.expect("clean shutdown");
+}
+
+/// The verbatim `Neo.ClientError.Database.DatabaseNotFound` leaf code, proven end-to-end against the
+/// OFFICIAL Neo4j driver (rmp #814).
+///
+/// The #800 Bolt audit found Graphus reported a missing database as the coarse
+/// `Neo.ClientError.Request.Invalid`, where Neo4j uses the fine-grained
+/// `Neo.ClientError.Database.DatabaseNotFound`. Only the reference driver can prove the fix reaches
+/// the wire as the ecosystem reads it: this boots a real Graphus server (Bolt-TCP+TLS), targets a
+/// non-existent database with the official driver, and asserts the driver observes the exact leaf
+/// code AND still treats it as a NON-retryable `ClientError` (retryability did not move) — then that
+/// the connection keeps serving. Like the other real-ecosystem interop tests it lives behind the
+/// `neo4j-interop` feature (not the DST simulator), because exercising the external driver over the
+/// TLS socket is the entire point.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn official_neo4j_driver_reports_database_not_found_leaf_code() {
+    let dir = TempDir::new();
+
+    // Self-signed cert/key for the TLS listener (`bolt+ssc://` trusts it).
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let cert_path = dir.path.join("cert.pem");
+    let key_path = dir.path.join("key.pem");
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
+
+    // Boot the real server and read back the OS-assigned ephemeral Bolt-TCP port.
+    let config = config_for(&dir, cert_path, key_path, None);
+    let server = boot(config).await;
+    let bolt: SocketAddr = server.bolt_tcp_addr.expect("Bolt-TCP listener enabled");
+
+    // Drive the DatabaseNotFound probe against the live server.
+    let (stdout, stderr, ok) = install_and_run_driver(
+        dir.path.join("node-dbnotfound"),
+        DATABASE_NOT_FOUND_SCRIPT,
+        bolt.port(),
+    )
+    .await;
+
+    assert!(
+        ok,
+        "the official Neo4j driver did NOT observe Neo.ClientError.Database.DatabaseNotFound.\n\
+         --- node stdout ---\n{stdout}\n--- node stderr ---\n{stderr}",
+    );
+    assert!(
+        stdout.contains("GRAPHUS_DBNOTFOUND_OK"),
+        "driver exited 0 but the DatabaseNotFound success marker was missing.\n\
          --- node stdout ---\n{stdout}\n--- node stderr ---\n{stderr}",
     );
 
