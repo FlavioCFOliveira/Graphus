@@ -7866,6 +7866,44 @@ mod tests {
         (h, key, p)
     }
 
+    /// Commits two nodes A, B and one `LINK` relationship between them, then deletes that relationship
+    /// and GCs, so its physical id `R` is freed and the durably-committed `Rel` free list is exactly
+    /// `[R]` (both endpoints back to an empty incidence chain). Returns `(A, B, LINK type, R)`. The
+    /// `Rel` twin of [`setup_freed_prop_slot`].
+    fn setup_freed_rel_slot(s: &mut Store) -> (u64, u64, u32, u64) {
+        let ty = s.intern_token(Namespace::RelType, "LINK").unwrap();
+        let t0 = TxnId(1);
+        s.begin(t0);
+        let (a, _) = s.create_node(t0).unwrap();
+        let (b, _) = s.create_node(t0).unwrap();
+        let (r, _) = s.create_rel(t0, ty, a, b).unwrap();
+        s.commit(t0).unwrap();
+        let t_del = TxnId(2);
+        s.begin(t_del);
+        s.delete_rel(t_del, r).unwrap();
+        s.commit(t_del).unwrap();
+        let wm = s.snapshot_ts();
+        s.begin(TxnId(3));
+        s.gc(TxnId(3), wm).unwrap();
+        s.commit(TxnId(3)).unwrap();
+        assert_eq!(
+            s.store(StoreKind::Rel).free.ids(),
+            &[r],
+            "setup: the deleted relationship's slot R is on the free list after GC"
+        );
+        assert_eq!(
+            s.read_node(a).unwrap().first_rel,
+            NULL_ID,
+            "setup: A's incidence chain is empty after the delete + GC unlinked R"
+        );
+        assert_eq!(
+            s.read_node(b).unwrap().first_rel,
+            NULL_ID,
+            "setup: B's incidence chain is empty after the delete + GC unlinked R"
+        );
+        (a, b, ty, r)
+    }
+
     /// `rmp` #581: an aborting transaction's OWN reused-id pop that ends up UNREFERENCED is returned to
     /// the free list (reclaimed), closing the reuse-then-abort bounded space leak the #578 fix
     /// documented. Deterministic RecordStore repro (the #578 DST-harness style).
@@ -7972,6 +8010,118 @@ mod tests {
         assert!(
             report.is_consistent(),
             "store consistent after GC reclaims the corpse: {:?}",
+            report.violations
+        );
+    }
+
+    /// `rmp` #581 (safety boundary, REL branch): the `Rel` mirror of
+    /// [`aborted_pop_that_became_a_live_corpse_is_not_reclaimed_581`]. An aborting transaction's own
+    /// reused-id relationship pop that a concurrently-committed writer prepended onto is a
+    /// LIVE-REFERENCED corpse (the #220/#172 pattern) and MUST NOT be re-pushed: re-freeing a slot
+    /// still threaded into a live incidence chain would hand the allocator a slot a committed edge
+    /// points at — the `rmp` #578 double-allocation in reverse, i.e. committed-data corruption. This
+    /// drives [`rel_slot_referenced`](Self::rel_slot_referenced) to return `true` so the decline at the
+    /// `Rel` arm of [`reclaim_aborted_pops`](Self::reclaim_aborted_pops) fires; the slot stays a corpse
+    /// the GC incidence-chain splice reclaims, and the consistency checker stays green throughout.
+    #[test]
+    fn aborted_rel_pop_that_became_a_live_corpse_is_not_reclaimed_581() {
+        let mut s = fresh();
+        let (a, b, ty, r) = setup_freed_rel_slot(&mut s);
+
+        // T1 pops R by creating a fresh A-[:LINK]->B relationship (reuses the freed slot), staying
+        // OPEN. R is now the head of BOTH endpoints' incidence chains (A.first_rel == B.first_rel == R),
+        // written in-place via the structural chain-head CAS so a concurrent writer observes it.
+        let t1 = TxnId(4);
+        s.begin(t1);
+        let (reused, _) = s.create_rel(t1, ty, a, b).unwrap();
+        assert_eq!(reused, r, "T1 popped the freed rel slot R");
+        assert!(
+            s.store(StoreKind::Rel).free.is_empty(),
+            "R is off the free list while T1 holds it"
+        );
+
+        // A concurrent committed writer C prepends a NEW parallel A-[:LINK]->B relationship S on TOP of
+        // R (multigraph): S becomes each chain's head and threads through R (S.start_next == R and
+        // S.end_next == R). C allocates a FRESH slot — T1's pop emptied the free list.
+        let c = TxnId(5);
+        s.begin(c);
+        let (sid, _) = s.create_rel(c, ty, a, b).unwrap();
+        assert_ne!(
+            sid, r,
+            "C allocates a fresh slot (T1 emptied the free list)"
+        );
+        s.commit(c).unwrap();
+
+        // Precondition proof of the corpse topology: R is genuinely threaded below the committed S in
+        // BOTH endpoint chains — exactly the state that makes `rel_slot_referenced(R)` return true.
+        let s_rec = s.read_rel(sid).unwrap();
+        assert_eq!(
+            s.read_node(a).unwrap().first_rel,
+            sid,
+            "S is A's chain head"
+        );
+        assert_eq!(
+            s.read_node(b).unwrap().first_rel,
+            sid,
+            "S is B's chain head"
+        );
+        assert_eq!(
+            s_rec.start_next_rel, r,
+            "S's start-side chain link threads through R (R referenced by A's live chain)"
+        );
+        assert_eq!(
+            s_rec.end_next_rel, r,
+            "S's end-side chain link threads through R (R referenced by B's live chain)"
+        );
+
+        // T1 aborts (non-LIFO relative to C): R is now a live-referenced corpse (A/B -> S -> R -> NULL).
+        s.rollback(t1).unwrap();
+        assert!(
+            s.store(StoreKind::Rel).free.is_empty(),
+            "rmp #581: a referenced-corpse rel pop must NOT be reclaimed (no double-free of a threaded \
+             slot)"
+        );
+        assert!(
+            !s.read_rel(r).unwrap().mvcc.in_use(),
+            "R is a not-in-use corpse threaded below the committed prepend"
+        );
+        // The corpse is still threaded below S in both chains (the abort's chain-head CAS no-oped
+        // because C had already pushed S on top, so `first_rel` no longer equals R).
+        assert_eq!(
+            s.read_rel(sid).unwrap().start_next_rel,
+            r,
+            "R is still threaded below S after the abort (the CAS chain-head undo no-oped)"
+        );
+        // The checker tolerates the corpse threaded in the live chain (no double-free / dangling link).
+        let report = crate::check::check_store(&mut s, &[]).unwrap();
+        assert!(
+            report.is_consistent(),
+            "corpse-threaded rel chain is consistent: {:?}",
+            report.violations
+        );
+        // A subsequent rel allocation does NOT hand out the still-referenced corpse slot R.
+        let t2 = TxnId(6);
+        s.begin(t2);
+        let (fresh_rel, _) = s.create_rel(t2, ty, a, b).unwrap();
+        assert_ne!(
+            fresh_rel, r,
+            "the corpse slot R is not handed out (still referenced)"
+        );
+        s.commit(t2).unwrap();
+
+        // GC reclaims the corpse R via the incidence-chain splice; the checker stays green.
+        let wm2 = s.snapshot_ts();
+        s.begin(TxnId(7));
+        s.gc(TxnId(7), wm2).unwrap();
+        s.commit(TxnId(7)).unwrap();
+        assert!(
+            !s.read_rel(r).unwrap().mvcc.in_use(),
+            "R is still a not-in-use slot after GC spliced it out of the chains"
+        );
+        let report = crate::check::check_store(&mut s, &[]).unwrap();
+        assert!(
+            report.is_consistent(),
+            "store consistent after GC reclaims the rel corpse: {:?}",
             report.violations
         );
     }
