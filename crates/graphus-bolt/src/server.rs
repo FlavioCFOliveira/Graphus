@@ -54,11 +54,13 @@
 
 use std::sync::Arc;
 
-use graphus_auth::{AuthProvider, AuthThrottle};
+use graphus_auth::{AuthProvider, AuthThrottle, VerifyLimiter};
 use graphus_core::Value;
 use graphus_core::capability::Clock;
 
-use crate::error::{BoltError, BoltResult, CODE_UNAUTHORIZED, Failure, failure_from_error};
+use crate::error::{
+    BoltError, BoltResult, CODE_SERVER_BUSY, CODE_UNAUTHORIZED, Failure, failure_from_error,
+};
 use crate::executor::{AccessMode, BoltExecutor, Record, RecordStream, TxControl};
 use crate::framing::{Dechunker, Frame, chunk_message_into};
 use crate::handshake::{
@@ -251,6 +253,11 @@ pub struct BoltSession<'a, T: Transport, E: BoltExecutor> {
     /// [`with_login_throttle`](Self::with_login_throttle) so Bolt enforces the SAME per-account lockout
     /// as REST `/auth/login`.
     login_throttle: Option<LoginThrottle>,
+    /// Optional GLOBAL bound on concurrent password verifications (rmp #824). `None` (the default)
+    /// leaves the auth path unbounded; the server attaches the process-wide shared limiter via
+    /// [`with_verify_limiter`](Self::with_verify_limiter) so a username-rotation flood cannot force
+    /// unbounded concurrent Argon2 work on the shared blocking pool.
+    verify_limiter: Option<Arc<VerifyLimiter>>,
 }
 
 /// An open `RUN` result plus a **one-record lookahead** buffer.
@@ -336,6 +343,7 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
             packer: Packer::new(),
             framed: Vec::new(),
             login_throttle: None,
+            verify_limiter: None,
         }
     }
 
@@ -346,6 +354,18 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
     #[must_use]
     pub fn with_login_throttle(mut self, throttle: LoginThrottle) -> Self {
         self.login_throttle = Some(throttle);
+        self
+    }
+
+    /// Attaches the shared **global** concurrent-password-verification bound (rmp #824), consulted in
+    /// [`authenticate`](Self::authenticate) **after** the per-account throttle and **before** the
+    /// Argon2 verify. When the process is already at its verification capacity, a `LOGON` is shed with a
+    /// transient [`CODE_SERVER_BUSY`] `FAILURE` **without** running the KDF, so a username-rotation flood
+    /// cannot pile unbounded concurrent Argon2 work onto the shared blocking pool. Without it — the
+    /// default — verification is unbounded, exactly as before.
+    #[must_use]
+    pub fn with_verify_limiter(mut self, limiter: Arc<VerifyLimiter>) -> Self {
+        self.verify_limiter = Some(limiter);
         self
     }
 
@@ -1123,6 +1143,26 @@ impl<'a, T: Transport, E: BoltExecutor> BoltSession<'a, T, E> {
                 "too many failed authentication attempts for this account; retry later",
             ));
         }
+
+        // GLOBAL concurrent-verification bound (rmp #824), consulted AFTER the per-account throttle and
+        // BEFORE the Argon2 verify: if the process is already at its verification capacity, shed this
+        // `LOGON` with a transient FAILURE WITHOUT running the memory-hard KDF, so a username-rotation
+        // flood cannot pile unbounded concurrent Argon2 work onto the shared blocking pool. The permit is
+        // held across the verify (RAII release on drop) so the in-flight count reflects real KDF work.
+        // The shed decision reads only the global in-flight counter — never the principal — so it is
+        // byte-identical for a valid vs an invalid username and adds no enumeration oracle (rmp #812).
+        let _verify_permit = match &self.verify_limiter {
+            Some(limiter) => match limiter.try_acquire() {
+                Some(permit) => Some(permit),
+                None => {
+                    return Err(Failure::new(
+                        CODE_SERVER_BUSY,
+                        "server is busy verifying credentials; retry shortly",
+                    ));
+                }
+            },
+            None => None,
+        };
 
         match self.auth.authenticate_password(principal, credentials) {
             Ok(user) => Ok(user),

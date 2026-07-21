@@ -84,7 +84,7 @@ pub mod token;
 
 pub use auth::{AuthProvider, Authenticator};
 pub use error::{AuthError, Result};
-pub use limits::{AuthThrottle, RateLimiter, RequestLimits};
+pub use limits::{AuthThrottle, RateLimiter, RequestLimits, VerifyLimiter, VerifyPermit};
 pub use peercred::{PeerCred, PeerCredMap, PeerCredSource};
 pub use rbac::{Action, Catalog, Privilege, Resource, ResourceRef, Role, User};
 #[cfg(feature = "tls")]

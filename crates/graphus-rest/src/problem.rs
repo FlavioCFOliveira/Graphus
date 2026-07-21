@@ -338,6 +338,28 @@ impl Problem {
         .with_code(CODE_AUTH_RATE_LIMIT)
     }
 
+    /// A **503 Service Unavailable** when the global concurrent-password-verification bound (rmp #824)
+    /// is saturated: the server is momentarily at its Argon2 verification capacity, so the login is shed
+    /// **before** the memory-hard KDF runs rather than piling unbounded concurrent hashing onto the
+    /// shared blocking pool — the pre-authentication availability collapse a *username-rotation* flood
+    /// would otherwise force, which the per-account throttle cannot bound.
+    ///
+    /// It is a **retriable** load-shed (capacity frees as in-flight verifications finish), so it carries
+    /// a *transient* Neo error code; the client should back off briefly and retry. The shed reads only
+    /// the global in-flight count — never the submitted username — so it is byte-identical for a valid
+    /// vs an invalid user and is never a user-existence oracle (preserving the rmp #812 constant-work
+    /// property).
+    #[must_use]
+    pub fn service_unavailable(detail: impl Into<String>) -> Self {
+        Problem::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service-unavailable",
+            "server busy verifying credentials",
+            detail,
+        )
+        .with_code(CODE_SERVER_BUSY)
+    }
+
     /// A **404 Not Found** for an unknown transaction id (`04 §8.2`).
     #[must_use]
     pub fn unknown_transaction(id: &str) -> Self {
@@ -393,6 +415,11 @@ const CODE_FORBIDDEN: &str = "Neo.ClientError.Security.Forbidden";
 /// The auth-rate-limit code for a throttled login (rmp #458/#499): the same best-effort `Neo.*`-shaped
 /// rendering the rest of the surface uses (`06 §2.4`), matching Neo4j's authentication-rate-limit class.
 const CODE_AUTH_RATE_LIMIT: &str = "Neo.ClientError.Security.AuthenticationRateLimit";
+/// The "server busy at authentication" transient code for a login shed by the global
+/// concurrent-verification bound (rmp #824), byte-identical to `graphus_bolt`'s `CODE_SERVER_BUSY`
+/// (`Neo.TransientError.General.DatabaseUnavailable`) for cross-wire parity: a **retryable**
+/// `TransientError` telling the client to back off and retry, not a credential failure.
+const CODE_SERVER_BUSY: &str = "Neo.TransientError.General.DatabaseUnavailable";
 
 /// Derives the RFC 9457 HTTP status from a verbatim Neo4j leaf status code's classification segment
 /// Derives the RFC 9457 problem shape — HTTP status, `type` suffix (`kind`) and human `title` — from

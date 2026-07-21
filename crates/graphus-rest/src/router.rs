@@ -86,7 +86,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::response::Response;
 use axum::routing::{get, post};
-use graphus_auth::{Action, AuthError, AuthProvider, AuthThrottle, Privilege};
+use graphus_auth::{Action, AuthError, AuthProvider, AuthThrottle, Privilege, VerifyLimiter};
 use graphus_core::capability::Clock;
 use graphus_core::{GraphusError, Value};
 use http::header::{ACCEPT, AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE};
@@ -317,6 +317,13 @@ pub struct AppState<E: RestEngine> {
     /// Shared (`Arc`) because the bucket map is process-wide state, behind an internal `std::sync::Mutex`
     /// whose critical section never spans an `.await`.
     auth_throttle: Arc<AuthThrottle>,
+    /// The process-wide **global** bound on concurrent password verifications (rmp #824) consulted by
+    /// the [`login`] handler **after** the per-account throttle and **before** the Argon2 verify.
+    /// Defaults to an **unbounded** limiter (the control disabled) — the server sizes it from detected
+    /// CPUs via [`with_verify_limiter`](Self::with_verify_limiter). Shared (`Arc`) so the SAME instance
+    /// bounds REST `/auth/login` and every Bolt `LOGON` jointly: a username-rotation flood cannot force
+    /// unbounded concurrent memory-hard hashing on the shared blocking pool through either interface.
+    verify_limiter: Arc<VerifyLimiter>,
 }
 
 // Manual `Clone` (deriving would wrongly require `E: Clone`; the fields are all `Arc`).
@@ -330,6 +337,7 @@ impl<E: RestEngine> Clone for AppState<E> {
             auth_observer: self.auth_observer.clone(),
             cors: self.cors.clone(),
             auth_throttle: Arc::clone(&self.auth_throttle),
+            verify_limiter: Arc::clone(&self.verify_limiter),
         }
     }
 }
@@ -356,6 +364,10 @@ impl<E: RestEngine + 'static> AppState<E> {
             // enables it via `with_auth_throttle`. A disabled throttle allows every attempt (the
             // tests, and any in-process embedding that does not configure one, are unaffected).
             auth_throttle: Arc::new(AuthThrottle::disabled()),
+            // Unbounded by default (rmp #824): the concurrency cap is sized from detected CPUs by the
+            // server via `with_verify_limiter`. An unbounded limiter admits every verification (the
+            // tests, and any in-process embedding that does not configure one, are unaffected).
+            verify_limiter: Arc::new(VerifyLimiter::unbounded()),
         }
     }
 
@@ -382,6 +394,18 @@ impl<E: RestEngine + 'static> AppState<E> {
     #[must_use]
     pub fn with_auth_throttle(mut self, throttle: Arc<AuthThrottle>) -> Self {
         self.auth_throttle = throttle;
+        self
+    }
+
+    /// Wires the process-wide **global** concurrent-password-verification bound (rmp #824) the [`login`]
+    /// handler consults **after** the per-account throttle and **before** the Argon2 verify. The default
+    /// is an **unbounded** limiter (the control disabled); the server passes a CPU-sized, shared
+    /// [`VerifyLimiter`] here — the SAME instance the Bolt `LOGON` path uses — so a username-rotation
+    /// flood cannot force unbounded concurrent memory-hard hashing through either interface. Returns
+    /// `self` for chaining at construction.
+    #[must_use]
+    pub fn with_verify_limiter(mut self, limiter: Arc<VerifyLimiter>) -> Self {
+        self.verify_limiter = limiter;
         self
     }
 }
@@ -519,11 +543,33 @@ async fn login<E: RestEngine + 'static>(
         .into_response();
     }
 
-    // (3) Verify the credential. Any failure is a UNIFORM 401 with no user-exists oracle.
-    match state
-        .auth
-        .authenticate_password(&req.username, &req.password)
-    {
+    // (3) GLOBAL concurrent-verification bound (rmp #824), consulted AFTER the per-account throttle and
+    // BEFORE the Argon2 verify: if the process is already at its verification capacity, shed this login
+    // with a retriable `503` WITHOUT running the memory-hard KDF, so a username-rotation flood cannot
+    // pile unbounded concurrent Argon2 work onto the shared blocking pool (the per-account throttle is
+    // structurally blind to distinct-username floods). The permit is held only across the verify (RAII
+    // release on the block's drop) so the in-flight count reflects real KDF work. The shed reads only the
+    // global in-flight count — never the username — so it is identical for a valid vs an invalid user and
+    // adds no enumeration oracle (preserving rmp #812's constant-work property).
+    let verify_outcome = {
+        let _verify_permit = match state.verify_limiter.try_acquire() {
+            Some(permit) => permit,
+            None => {
+                notify_auth_failure(&state, "login shed: verification capacity saturated");
+                return Built::from(Problem::service_unavailable(
+                    "the server is temporarily busy verifying credentials; retry shortly",
+                ))
+                .into_response();
+            }
+        };
+        state
+            .auth
+            .authenticate_password(&req.username, &req.password)
+        // `_verify_permit` drops here, releasing the slot before token issuance / serialization.
+    };
+
+    // (4) Map the verification outcome. Any failure is a UNIFORM 401 with no user-exists oracle.
+    match verify_outcome {
         Ok(user) => {
             // (4) Success: do NOT debit the throttle. Mint a token for the resolved principal.
             let now = state.now_unix_secs();

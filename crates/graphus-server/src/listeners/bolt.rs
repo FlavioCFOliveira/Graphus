@@ -18,7 +18,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use graphus_auth::{AuthProvider, AuthThrottle, PeerCred as AuthPeerCred, PeerCredSource};
+use graphus_auth::{
+    AuthProvider, AuthThrottle, PeerCred as AuthPeerCred, PeerCredSource, VerifyLimiter,
+};
 use graphus_bolt::server::{BoltSession, LoginThrottle, SessionConfig};
 use graphus_core::capability::Clock;
 use graphus_io::{TcpAcceptor, UdsAcceptor};
@@ -75,6 +77,7 @@ pub async fn run_uds_accept_loop(
     auth: Arc<dyn AuthProvider>,
     auth_throttle: Arc<AuthThrottle>,
     clock: Arc<dyn Clock + Send + Sync>,
+    verify_limiter: Arc<VerifyLimiter>,
     advertised_bolt_address: Option<String>,
     server_agent: String,
     metrics: Arc<Metrics>,
@@ -129,6 +132,7 @@ pub async fn run_uds_accept_loop(
                     Arc::clone(&auth),
                     Arc::clone(&auth_throttle),
                     Arc::clone(&clock),
+                    Arc::clone(&verify_limiter),
                     session_config(advertised_bolt_address.clone(), server_agent.clone()),
                     idle_timeout,
                     pre_auth_timeout,
@@ -182,6 +186,7 @@ pub async fn run_tcp_accept_loop(
     auth: Arc<dyn AuthProvider>,
     auth_throttle: Arc<AuthThrottle>,
     clock: Arc<dyn Clock + Send + Sync>,
+    verify_limiter: Arc<VerifyLimiter>,
     advertised_bolt_address: Option<String>,
     server_agent: String,
     metrics: Arc<Metrics>,
@@ -242,6 +247,7 @@ pub async fn run_tcp_accept_loop(
                 let auth = Arc::clone(&auth);
                 let auth_throttle = Arc::clone(&auth_throttle);
                 let clock = Arc::clone(&clock);
+                let verify_limiter = Arc::clone(&verify_limiter);
                 let shutdown = shutdown.clone();
                 let metrics = Arc::clone(&metrics);
                 let advertised = advertised_bolt_address.clone();
@@ -259,6 +265,7 @@ pub async fn run_tcp_accept_loop(
                                 auth,
                                 auth_throttle,
                                 clock,
+                                verify_limiter,
                                 session_config(advertised, agent),
                                 idle_timeout,
                                 // Reuse the handshake deadline as the Bolt pre-authentication read
@@ -365,6 +372,7 @@ fn spawn_session<S>(
     auth: Arc<dyn AuthProvider>,
     auth_throttle: Arc<AuthThrottle>,
     clock: Arc<dyn Clock + Send + Sync>,
+    verify_limiter: Arc<VerifyLimiter>,
     session_config: SessionConfig,
     idle_timeout: Option<Duration>,
     pre_auth_timeout: Option<Duration>,
@@ -389,9 +397,13 @@ fn spawn_session<S>(
         // interfaces (built in `start_all`), so a spent budget for an account is shared across REST and
         // Bolt and across reconnects.
         let login_throttle = LoginThrottle::new(auth_throttle, clock);
+        // Wire the SHARED global concurrent-password-verification bound (rmp #824) into the session so a
+        // Bolt `LOGON` consults the SAME cap as REST `/auth/login`: a username-rotation flood cannot force
+        // unbounded concurrent Argon2 work through either interface — overflow is shed BEFORE the KDF.
         let mut session =
             BoltSession::with_config(transport, executor, auth.as_ref(), session_config)
-                .with_login_throttle(login_throttle);
+                .with_login_throttle(login_throttle)
+                .with_verify_limiter(verify_limiter);
         if let Err(e) = session.run() {
             // A transport/handshake error ends the session; a Cypher/auth FAILURE is *not* an error
             // here (it is delivered in-band — see `BoltSession::run` docs).

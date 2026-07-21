@@ -217,6 +217,21 @@ pub async fn start_all(
             .expect("INVARIANT: login throttle limits are compile-time non-zero"),
     );
 
+    // The GLOBAL concurrent-password-verification bound (rmp #824), built ONCE and shared by every
+    // password-authentication path: the REST `POST /auth/login` endpoint AND both Bolt `LOGON` loops.
+    // The per-account throttle above bounds repeated failures for ONE username, but a *distinct*-username
+    // flood is never throttled (a first sighting is always admitted) and — since rmp #812's constant-work
+    // fix — each unknown-user attempt pays a full Argon2id. This cap bounds how many such verifications
+    // run CONCURRENTLY (sized from detected CPUs), shedding the overflow (`503` / a transient `FAILURE`)
+    // BEFORE the KDF, so a username-rotation flood cannot exhaust CPU + memory on the shared blocking pool.
+    // Sharing one instance enforces the cap jointly across REST and Bolt.
+    let verify_cap = config.admission.password_verification_cap();
+    let verify_limiter = Arc::new(graphus_auth::VerifyLimiter::new(verify_cap));
+    tracing::debug!(
+        max_concurrent_password_verifications = verify_cap,
+        "global concurrent-password-verification bound enabled (rmp #824)"
+    );
+
     // ---- UDS-Bolt (peer-cred, no TLS) ----
     let uds_path = if let Some(path) = &config.uds_path {
         let acceptor =
@@ -228,6 +243,7 @@ pub async fn start_all(
             Arc::clone(&auth),
             Arc::clone(&auth_throttle),
             Arc::clone(&clock),
+            Arc::clone(&verify_limiter),
             advertised_bolt.clone(),
             bolt_server_agent.clone(),
             Arc::clone(&metrics),
@@ -263,6 +279,7 @@ pub async fn start_all(
             Arc::clone(&auth),
             Arc::clone(&auth_throttle),
             Arc::clone(&clock),
+            Arc::clone(&verify_limiter),
             advertised_bolt.clone(),
             bolt_server_agent.clone(),
             Arc::clone(&metrics),
@@ -292,6 +309,7 @@ pub async fn start_all(
             Arc::clone(&catalog),
             Arc::clone(&auth),
             Arc::clone(&auth_throttle),
+            Arc::clone(&verify_limiter),
             Arc::clone(&security),
             Arc::clone(&audit),
             Arc::clone(&clock),
@@ -359,6 +377,7 @@ fn build_rest_router(
     catalog: Arc<DatabaseCatalog>,
     auth: Arc<dyn AuthProvider>,
     auth_throttle: Arc<graphus_auth::AuthThrottle>,
+    verify_limiter: Arc<graphus_auth::VerifyLimiter>,
     security: Arc<SecurityCatalog>,
     audit: Arc<AuditLog>,
     clock: Arc<dyn Clock + Send + Sync>,
@@ -406,7 +425,8 @@ fn build_rest_router(
     let api = router(
         AppState::new(rest_engine, auth, registry, Arc::clone(&clock))
             .with_auth_observer(observer)
-            .with_auth_throttle(auth_throttle),
+            .with_auth_throttle(auth_throttle)
+            .with_verify_limiter(verify_limiter),
     );
 
     let extra = extra_routes::routes(

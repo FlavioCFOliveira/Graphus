@@ -223,6 +223,16 @@ const CODE_CONSTRAINT_VALIDATION: &str = "Neo.ClientError.Schema.ConstraintValid
 /// builds this `Failure` directly; the code is the documented best-effort placeholder.
 pub const CODE_UNAUTHORIZED: &str = "Neo.ClientError.Security.Unauthorized";
 
+/// Transient "server too busy to authenticate right now" code for a `LOGON` shed by the global
+/// concurrent-verification bound (rmp #824): the server is momentarily at its Argon2 verification
+/// capacity, so the `LOGON` is refused **before** the memory-hard KDF runs rather than piling
+/// unbounded concurrent hashing onto the shared blocking pool. It is a **retryable** `TransientError`
+/// (`Neo.TransientError.General.DatabaseUnavailable` — Neo4j's documented "not available now, retrying
+/// later may succeed" code), so a driver backs off and reconnects rather than treating it as a
+/// credential failure. The shed is independent of the submitted principal, so it carries **no**
+/// user-existence signal (preserving the rmp #812 constant-work property).
+pub const CODE_SERVER_BUSY: &str = "Neo.TransientError.General.DatabaseUnavailable";
+
 /// Best-effort code for an authorization failure: the authenticated principal lacks the privilege
 /// the operation requires ([`GraphusError::Security`], `04 §8.4`).
 const CODE_FORBIDDEN: &str = "Neo.ClientError.Security.Forbidden";

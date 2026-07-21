@@ -222,6 +222,22 @@ pub struct AdmissionConfig {
     /// it never changes query results — only the read cost of typed traversals on a stable graph. Keep
     /// it off unless type-selective expand is a measured bottleneck and the per-edge RAM is acceptable.
     pub csr_adjacency: bool,
+    /// Maximum number of **concurrent password verifications** (Argon2id KDFs) in flight across every
+    /// authentication interface at once (`rmp` #824, CWE-770). The per-account login throttle (`rmp`
+    /// #458/#823) bounds repeated failures for **one** username, but an attacker who sends a fresh,
+    /// never-seen username on every request is never throttled, and since the `rmp` #812 constant-work
+    /// fix an unknown user pays a **full** Argon2id (~19 MiB, tens of ms) — so a *distinct*-username
+    /// flood forces unbounded **concurrent** memory-hard hashing on the shared blocking pool
+    /// ([`blocking_thread_budget`](Self::blocking_thread_budget)), a pre-authentication availability
+    /// collapse from ~120-byte requests. This global bound sheds a verification past the cap
+    /// (`/auth/login` → `503`, Bolt `LOGON` → a transient `FAILURE`) **before** the KDF runs.
+    ///
+    /// `0` (the default) selects an automatic size of `max(4, 2 × available_parallelism())` — a small
+    /// multiple of the detected CPU count that bounds both the CPU saturation and the transient memory
+    /// (cap × ~19 MiB) while never starving legitimate logins at low concurrency. Any value `> 0` pins
+    /// the cap exactly (`1` serialises verification — useful only for A/B tests). See
+    /// [`password_verification_cap`](Self::password_verification_cap).
+    pub max_concurrent_password_verifications: usize,
 }
 
 impl Default for AdmissionConfig {
@@ -239,6 +255,7 @@ impl Default for AdmissionConfig {
             morsel_parallelism: 0,
             max_open_transactions: graphus_rest::registry::DEFAULT_MAX_OPEN_TRANSACTIONS,
             csr_adjacency: false,
+            max_concurrent_password_verifications: 0,
         }
     }
 }
@@ -276,6 +293,30 @@ impl AdmissionConfig {
                 .map(std::num::NonZeroUsize::get)
                 .unwrap_or(1)
                 .min(16)
+        }
+    }
+
+    /// The effective **global concurrent-password-verification cap** (rmp #824): the configured
+    /// [`max_concurrent_password_verifications`](Self::max_concurrent_password_verifications), or — when
+    /// that is `0` (auto) — `max(4, 2 × N)` where `N` is the available hardware parallelism (falling
+    /// back to 1 if it cannot be queried).
+    ///
+    /// The `2 ×` multiple lets a brief legitimate login burst overlap (a memory-hard verify is
+    /// momentarily memory-bandwidth-bound, not purely CPU-bound) while keeping the concurrent Argon2
+    /// work — and hence its transient memory (cap × ~19 MiB) and its share of the shared blocking pool —
+    /// a small, bounded multiple of the CPU count rather than header-driven-unbounded. The `4` floor
+    /// keeps a 1–2 core host (a Raspberry Pi) from starving a handful of concurrent legitimate logins.
+    /// A flood beyond the cap is shed with a retriable busy response *before* the KDF, so it costs the
+    /// server almost nothing.
+    #[must_use]
+    pub fn password_verification_cap(&self) -> usize {
+        if self.max_concurrent_password_verifications > 0 {
+            self.max_concurrent_password_verifications
+        } else {
+            let cpus = std::thread::available_parallelism()
+                .map(std::num::NonZeroUsize::get)
+                .unwrap_or(1);
+            (2 * cpus).max(4)
         }
     }
 

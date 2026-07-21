@@ -91,7 +91,16 @@ fn base_config(temp: &TempStore) -> ServerConfig {
         rest_addr: Some("127.0.0.1:0".to_owned()),
         uds_path: Some(temp.uds_path()),
         tls: TlsConfig::default(),
-        admission: AdmissionConfig::default(),
+        admission: AdmissionConfig {
+            // These tests exercise **connection-level** admission (`max_connections`), not the rmp #824
+            // global concurrent-password-verification bound (which has its own dedicated unit tests in
+            // graphus-auth / -bolt / -rest). They drive hundreds of clients that all `LOGON` at once, so
+            // pin the verification cap comfortably above the largest connection cap any test here uses
+            // (`many`: 400) — otherwise the CPU-sized auto cap would shed some admitted clients' LOGONs
+            // and make these connection-admission tests fail CPU-count-dependently.
+            max_concurrent_password_verifications: 1024,
+            ..AdmissionConfig::default()
+        },
         timing: TimingConfig::default(),
         jwt_secret: "integration-test-jwt-secret-32-bytes!".to_owned(),
         auth: AuthBootstrap {

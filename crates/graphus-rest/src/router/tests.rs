@@ -16,7 +16,7 @@ use http_body_util::BodyExt;
 use serde_json::{Value as Json, json};
 use tower::ServiceExt;
 
-use graphus_auth::{AuthProvider, AuthThrottle, Authenticator, Privilege};
+use graphus_auth::{AuthProvider, AuthThrottle, Authenticator, Privilege, VerifyLimiter};
 use graphus_core::capability::Clock;
 use graphus_core::{GraphusError, Value};
 
@@ -153,6 +153,33 @@ impl Harness {
             Arc::clone(&clock) as Arc<dyn Clock + Send + Sync>,
         )
         .with_auth_throttle(throttle);
+        Self {
+            router: router(state),
+            engine,
+            registry,
+            clock,
+            auth,
+        }
+    }
+
+    /// Builds a harness whose `/auth/login` is guarded by an explicit **global** concurrent-verification
+    /// bound (rmp #824), so the verification-shed test can saturate it and assert a `503` before Argon2.
+    /// The per-account throttle is disabled (this isolates the global bound).
+    fn with_verify_limiter(engine: MockEngine, limiter: Arc<VerifyLimiter>) -> Self {
+        let engine = Arc::new(engine);
+        let auth = Arc::new(fixture_auth());
+        let registry = Arc::new(
+            TxRegistry::new(TTL)
+                .with_max_open_transactions(crate::registry::DEFAULT_MAX_OPEN_TRANSACTIONS),
+        );
+        let clock = Arc::new(TestClock::new(1_000_000_000));
+        let state = AppState::new(
+            Arc::clone(&engine),
+            Arc::clone(&auth) as Arc<dyn AuthProvider>,
+            Arc::clone(&registry),
+            Arc::clone(&clock) as Arc<dyn Clock + Send + Sync>,
+        )
+        .with_verify_limiter(limiter);
         Self {
             router: router(state),
             engine,
@@ -2367,6 +2394,55 @@ async fn login_throttle_returns_429_then_refills() {
     // A throttle keyed on `alice` must not bleed onto another account: `bob` is never throttled here.
     let bob = h.send(post_login_json("bob", BOB_PASSWORD)).await;
     assert_eq!(bob.status(), StatusCode::OK, "the throttle is per-account");
+}
+
+#[tokio::test]
+async fn login_sheds_503_when_the_global_verify_bound_is_saturated() {
+    // rmp #824 (security audit Finding 1): when the GLOBAL concurrent-verification bound is saturated,
+    // `/auth/login` sheds with a retriable `503` BEFORE Argon2 — and the shed is BYTE-IDENTICAL for a
+    // valid vs an invalid username (no user-existence oracle; preserves rmp #812's constant work). A
+    // username-rotation flood therefore cannot force unbounded concurrent memory-hard hashing on the
+    // shared blocking pool. Modelled deterministically by pre-holding all K verification slots.
+    const K: usize = 2;
+    let limiter = Arc::new(VerifyLimiter::new(K));
+    let h = Harness::with_verify_limiter(MockEngine::new(), Arc::clone(&limiter));
+
+    // Saturate: hold all K verification slots (K verifications "in flight").
+    let held: Vec<_> = (0..K)
+        .map(|_| limiter.try_acquire().expect("within cap"))
+        .collect();
+    assert_eq!(limiter.in_flight(), K);
+
+    // A VALID-username login is shed with a retriable 503 (a transient code) before the KDF.
+    let valid = h.send(post_login_json("alice", ALICE_PASSWORD)).await;
+    assert_eq!(valid.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(content_type(&valid), "application/problem+json");
+    let valid_body = body_bytes(valid).await;
+
+    // An INVALID-username login is shed BYTE-IDENTICALLY (rmp #812 constant work: no enumeration oracle).
+    let invalid = h.send(post_login_json("ghost", "any-password-here")).await;
+    assert_eq!(invalid.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let invalid_body = body_bytes(invalid).await;
+    assert_eq!(
+        valid_body, invalid_body,
+        "a valid vs invalid username must shed byte-identically (rmp #812)"
+    );
+    let problem: Json = serde_json::from_slice(&valid_body).unwrap();
+    assert_eq!(problem["status"], 503);
+    assert_eq!(
+        problem["code"],
+        "Neo.TransientError.General.DatabaseUnavailable"
+    );
+
+    // Free the slots: a correct credential authenticates again — low concurrency is never starved.
+    drop(held);
+    assert_eq!(limiter.in_flight(), 0);
+    let ok = h.send(post_login_json("alice", ALICE_PASSWORD)).await;
+    assert_eq!(
+        ok.status(),
+        StatusCode::OK,
+        "a correct login succeeds once verification capacity frees"
+    );
 }
 
 #[tokio::test]

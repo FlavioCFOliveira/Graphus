@@ -23,6 +23,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use graphus_core::capability::Clock;
@@ -361,6 +362,129 @@ impl RequestLimits {
     }
 }
 
+/// A process-wide bound on the number of **concurrent password verifications** (Argon2id KDFs) in
+/// flight across every authentication interface at once (rmp #824, CWE-770 / CWE-400).
+///
+/// ## Why the per-account throttle cannot close this gap
+///
+/// [`AuthThrottle`] is *per account*: it bounds repeated failures for **one** username. But an attacker
+/// who sends a fresh, never-seen username on every request is never throttled — a first sighting is
+/// always admitted (`permit_attempt` returns `true` without inserting), and since rmp #812's
+/// constant-work fix an unknown / password-less / suspended user pays a **full** Argon2id (~19 MiB and
+/// tens of ms). A flood of *distinct*-username logins therefore forces unbounded **concurrent**
+/// memory-hard hashing on the shared blocking pool (REST `spawn_blocking` + every Bolt session + the
+/// engine command bridge + catalog persistence), a pre-authentication availability collapse from
+/// ~120-byte requests. The per-account throttle is structurally blind to it; this global bound closes it.
+///
+/// ## Semantics
+///
+/// [`try_acquire`](Self::try_acquire) admits — returning an RAII [`VerifyPermit`] that decrements the
+/// in-flight count on drop — iff **fewer than `max`** verifications are currently in flight; otherwise
+/// it **sheds** (returns `None`) so the caller refuses the request *before* running the KDF (REST
+/// `/auth/login` → `503`, Bolt `LOGON` → a transient `FAILURE`). The decision reads only the global
+/// in-flight counter — it is **independent of the username** — so a shed is byte-identical for a valid
+/// vs an invalid user and introduces **no** user-enumeration oracle (preserving rmp #812's
+/// constant-work property). Sizing `max` to a small multiple of the CPU count bounds both the CPU
+/// saturation and the transient memory (`max` × ~19 MiB).
+///
+/// A `max` of `0` means **unbounded** (the control disabled): `try_acquire` always admits. This is the
+/// default for in-process / test call sites that never flood; production sizes it from detected CPUs.
+///
+/// Lock-free: a single [`AtomicUsize`] CAS on the admit path, so it adds negligible cost to a genuine
+/// login and no lock contention under a flood (a shed is a single relaxed load + compare).
+#[derive(Debug)]
+pub struct VerifyLimiter {
+    /// The number of password verifications currently in flight (holding a permit).
+    in_flight: AtomicUsize,
+    /// The maximum number of concurrent verifications; `0` disables the bound (always admit).
+    max: usize,
+}
+
+impl VerifyLimiter {
+    /// A limiter admitting at most `max` concurrent verifications. `max == 0` disables the bound
+    /// ([`unbounded`](Self::unbounded)).
+    #[must_use]
+    pub fn new(max: usize) -> Self {
+        Self {
+            in_flight: AtomicUsize::new(0),
+            max,
+        }
+    }
+
+    /// An **unbounded** limiter (the control disabled): every [`try_acquire`](Self::try_acquire)
+    /// admits. Used where no cap is configured (the in-process / test call sites).
+    #[must_use]
+    pub fn unbounded() -> Self {
+        Self::new(0)
+    }
+
+    /// Whether the bound is active (`max > 0`).
+    #[must_use]
+    pub fn is_bounded(&self) -> bool {
+        self.max > 0
+    }
+
+    /// The configured concurrency ceiling (`0` = unbounded).
+    #[must_use]
+    pub fn max(&self) -> usize {
+        self.max
+    }
+
+    /// The number of verifications currently in flight (for tests / observability).
+    #[must_use]
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
+    }
+
+    /// Tries to admit one password verification. Returns a [`VerifyPermit`] (release-on-drop) if fewer
+    /// than [`max`](Self::max) are in flight, or `None` to **shed** — the caller must then refuse the
+    /// request *before* running the Argon2 KDF. Never blocks (a shed is immediate), and never inspects
+    /// the username, so the shed carries no enumeration signal.
+    #[must_use]
+    pub fn try_acquire(&self) -> Option<VerifyPermit<'_>> {
+        if self.max == 0 {
+            // Unbounded: admit without touching the counter (nothing to release).
+            return Some(VerifyPermit { limiter: None });
+        }
+        let mut cur = self.in_flight.load(Ordering::Acquire);
+        loop {
+            if cur >= self.max {
+                return None; // saturated → shed before the KDF
+            }
+            match self.in_flight.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(VerifyPermit {
+                        limiter: Some(self),
+                    });
+                }
+                Err(actual) => cur = actual, // lost the race; retry with the observed value
+            }
+        }
+    }
+}
+
+/// An RAII permit for one in-flight password verification (rmp #824): dropping it releases the slot
+/// back to the [`VerifyLimiter`]. Held across the Argon2 verify at the call site so the in-flight count
+/// reflects real concurrent KDF work. A permit from an unbounded limiter holds no slot (its `limiter`
+/// is `None`) and is a no-op on drop.
+#[derive(Debug)]
+pub struct VerifyPermit<'a> {
+    limiter: Option<&'a VerifyLimiter>,
+}
+
+impl Drop for VerifyPermit<'_> {
+    fn drop(&mut self) {
+        if let Some(l) = self.limiter {
+            l.in_flight.fetch_sub(1, Ordering::Release);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,5 +586,102 @@ mod tests {
         let limits = RequestLimits::new(1024, Duration::from_secs(30)).unwrap();
         assert!(limits.permits_body(1024));
         assert!(!limits.permits_body(1025));
+    }
+
+    #[test]
+    fn verify_limiter_admits_up_to_cap_then_sheds() {
+        let lim = VerifyLimiter::new(2);
+        assert!(lim.is_bounded());
+        assert_eq!(lim.max(), 2);
+        let p1 = lim.try_acquire().expect("1st admitted");
+        let p2 = lim.try_acquire().expect("2nd admitted");
+        assert_eq!(lim.in_flight(), 2);
+        assert!(lim.try_acquire().is_none(), "the 3rd is shed at the cap");
+        drop(p1);
+        assert_eq!(lim.in_flight(), 1);
+        let p3 = lim.try_acquire().expect("a freed slot admits again");
+        drop(p2);
+        drop(p3);
+        assert_eq!(lim.in_flight(), 0);
+    }
+
+    #[test]
+    fn unbounded_limiter_always_admits() {
+        let lim = VerifyLimiter::unbounded();
+        assert!(!lim.is_bounded());
+        let mut permits = Vec::new();
+        for _ in 0..1000 {
+            permits.push(lim.try_acquire().expect("unbounded admits every attempt"));
+        }
+        // An unbounded permit holds no slot, so the counter stays at 0 (nothing to track/release).
+        assert_eq!(lim.in_flight(), 0);
+    }
+
+    #[test]
+    fn concurrent_verifications_beyond_cap_are_shed_before_the_kdf() {
+        // rmp #824 (security audit Finding 1): the GLOBAL bound must shed the (K+1)-th CONCURRENT
+        // verification BEFORE it runs the KDF, so a username-rotation flood cannot force unbounded
+        // concurrent Argon2 work. K real worker threads each acquire a permit, record a "KDF ran", then
+        // BLOCK on a latch holding the permit — so exactly K verifications are in flight. A barrier makes
+        // the state deterministic (no timing race); the (K+1)-th `try_acquire` must then shed.
+        use std::sync::{Arc, Barrier, Condvar};
+
+        const K: usize = 4;
+        let lim = Arc::new(VerifyLimiter::new(K));
+        let kdf_runs = Arc::new(AtomicUsize::new(0));
+        let all_in_flight = Arc::new(Barrier::new(K + 1)); // K workers + this thread
+        let latch = Arc::new((Mutex::new(false), Condvar::new()));
+
+        let mut handles = Vec::new();
+        for _ in 0..K {
+            let lim = Arc::clone(&lim);
+            let kdf_runs = Arc::clone(&kdf_runs);
+            let all_in_flight = Arc::clone(&all_in_flight);
+            let latch = Arc::clone(&latch);
+            handles.push(std::thread::spawn(move || {
+                let _permit = lim.try_acquire().expect("within cap: admitted");
+                kdf_runs.fetch_add(1, Ordering::SeqCst); // model "the KDF started running"
+                all_in_flight.wait(); // signal in-flight, then hold the permit until released
+                let (m, cv) = &*latch;
+                let mut released = m.lock().unwrap();
+                while !*released {
+                    released = cv.wait(released).unwrap();
+                }
+                // `_permit` drops here, releasing the slot.
+            }));
+        }
+        all_in_flight.wait(); // all K permits are now held (K verifications in flight)
+        assert_eq!(lim.in_flight(), K);
+        assert_eq!(
+            kdf_runs.load(Ordering::SeqCst),
+            K,
+            "the K admitted verifications ran the KDF"
+        );
+
+        // The (K+1)-th CONCURRENT verification is SHED — no permit, and crucially no KDF.
+        assert!(
+            lim.try_acquire().is_none(),
+            "the (K+1)-th concurrent verification must be shed at the global cap (rmp #824)"
+        );
+        assert_eq!(
+            kdf_runs.load(Ordering::SeqCst),
+            K,
+            "a shed verification must NOT run the KDF (count stays K, not K+1)"
+        );
+
+        // Release the workers; capacity frees and a fresh verification is admitted again.
+        {
+            let (m, cv) = &*latch;
+            *m.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(lim.in_flight(), 0);
+        assert!(
+            lim.try_acquire().is_some(),
+            "capacity frees once the in-flight verifications finish"
+        );
     }
 }

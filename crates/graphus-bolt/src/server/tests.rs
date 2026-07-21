@@ -2347,3 +2347,104 @@ fn bolt_logon_consults_the_shared_per_account_throttle_before_the_kdf() {
         "the LOGON must SUCCEED after the throttle refills (success is never throttled): {r:?}"
     );
 }
+
+// ---- Bolt LOGON global concurrent-verification bound (rmp #824) --------------------------------
+
+use graphus_auth::VerifyLimiter;
+
+/// Drives ONE `LOGON` (`principal`/`password`) on a fresh session wired with `verify_limiter` (no
+/// per-account throttle — this isolates the GLOBAL verification bound), over the shared counting
+/// `auth`, returning the decoded responses.
+fn drive_logon_with_limiter(
+    auth: &CountingAuth,
+    verify_limiter: Arc<VerifyLimiter>,
+    principal: &str,
+    password: &str,
+) -> Vec<Response> {
+    let input = session_input(&[
+        hello(),
+        Request::Logon {
+            auth: vec![
+                ("scheme".to_owned(), Value::String("basic".to_owned())),
+                ("principal".to_owned(), Value::String(principal.to_owned())),
+                ("credentials".to_owned(), Value::String(password.to_owned())),
+            ],
+        },
+    ]);
+    let mut transport = MemoryTransport::with_input(&input);
+    {
+        let mut session = BoltSession::new(&mut transport, MockExecutor::new(), auth)
+            .with_verify_limiter(verify_limiter);
+        session.run().unwrap();
+    }
+    let (_, stream) = split_handshake(transport.written());
+    decode_responses(stream)
+}
+
+#[test]
+fn bolt_logon_sheds_before_the_kdf_when_the_global_verify_bound_is_saturated() {
+    // rmp #824 (security audit Finding 1): when the GLOBAL concurrent-verification bound is saturated, a
+    // Bolt `LOGON` is shed with a transient FAILURE BEFORE the Argon2 KDF — and the shed is BYTE-IDENTICAL
+    // for a valid vs an invalid username (no enumeration oracle; preserves rmp #812's constant work).
+    // Proven via `CountingAuth` (the KDF lives strictly inside `authenticate_password`) and a shared
+    // `VerifyLimiter` whose K slots are pre-held to model K verifications already in flight. This is the
+    // assertion that is RED without the `authenticate` acquire (the shed would still run the KDF).
+    const K: usize = 2;
+    let auth = CountingAuth::new(auth_fixture());
+    let limiter = Arc::new(VerifyLimiter::new(K));
+
+    // Saturate the bound: hold all K permits (K verifications "in flight").
+    let held: Vec<_> = (0..K)
+        .map(|_| limiter.try_acquire().expect("within cap"))
+        .collect();
+    assert_eq!(limiter.in_flight(), K);
+
+    // A LOGON with a VALID username is shed with the transient busy code, WITHOUT running the KDF.
+    let before = auth.kdf_calls();
+    let valid = drive_logon_with_limiter(&auth, Arc::clone(&limiter), "alice", "alice-pw");
+    match &valid[1] {
+        Response::Failure(f) => assert_eq!(
+            f.code, CODE_SERVER_BUSY,
+            "a saturated-bound shed carries the transient busy code"
+        ),
+        other => panic!("expected a busy FAILURE, got {other:?}"),
+    }
+    assert_eq!(
+        auth.kdf_calls(),
+        before,
+        "a shed LOGON must NOT run the Argon2 KDF (rmp #824)"
+    );
+
+    // A LOGON with an INVALID username is shed IDENTICALLY — the rmp #812 constant-work invariant at the
+    // shed: a valid vs an invalid username are byte-indistinguishable (same code + message, no KDF).
+    let before = auth.kdf_calls();
+    let invalid = drive_logon_with_limiter(&auth, Arc::clone(&limiter), "ghost", "any-password");
+    match &invalid[1] {
+        Response::Failure(f) => assert_eq!(f.code, CODE_SERVER_BUSY),
+        other => panic!("expected a busy FAILURE, got {other:?}"),
+    }
+    assert_eq!(
+        auth.kdf_calls(),
+        before,
+        "the shed is username-independent — no KDF for an unknown user either (no oracle)"
+    );
+    assert_eq!(
+        valid[1], invalid[1],
+        "a valid vs invalid username must shed BYTE-IDENTICALLY (rmp #812 constant work)"
+    );
+
+    // Free the slots: a subsequent LOGON is admitted to the KDF again and a correct credential succeeds.
+    drop(held);
+    assert_eq!(limiter.in_flight(), 0);
+    let before = auth.kdf_calls();
+    let ok = drive_logon_with_limiter(&auth, Arc::clone(&limiter), "alice", "alice-pw");
+    assert!(
+        matches!(ok[1], Response::Success { .. }),
+        "a correct credential authenticates once verification capacity frees: {ok:?}"
+    );
+    assert_eq!(
+        auth.kdf_calls(),
+        before + 1,
+        "the admitted LOGON ran exactly one KDF"
+    );
+}
