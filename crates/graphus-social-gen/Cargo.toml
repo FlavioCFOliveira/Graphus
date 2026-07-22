@@ -60,6 +60,13 @@ engine = [
 # features. graphus-server depends on neither this crate nor reco-gen, so this stays acyclic.
 wire = ["dep:graphus-core", "dep:graphus-reco-gen"]
 
+# The `falkor` feature gates `social_falkor_bench`, which drives the SAME read battery against a
+# FalkorDB (RedisGraph successor) instance over the Redis RESP protocol (`GRAPH.QUERY`), for an
+# apples-to-apples comparison with the Bolt (Graphus/Neo4j) runs. It reuses ONLY this crate's own
+# hermetic generator/battery/anchor API + std (a tiny built-in RESP client) — no engine, no Bolt, no
+# new workspace dependency — so it builds with `--no-default-features --features falkor`.
+falkor = []
+
 [dependencies]
 # The generator emits the graph as Cypher text and its summary as key=value / JSON; serde pins match
 # the rest of the workspace.
@@ -156,3 +163,13 @@ required-features = ["wire"]
 name = "social_bench"
 path = "src/bin/social_bench.rs"
 required-features = ["wire"]
+
+# The FalkorDB (RESP / GRAPH.QUERY) read-battery bench (`falkor` feature): the same graph, families,
+# ladder, and Zipf anchor skew as `social_bench`, over the Redis protocol instead of Bolt, so
+# FalkorDB can be compared apples-to-apples with the Graphus and Neo4j Bolt runs. Client-only, std +
+# this crate's generator only. Usage: cargo run -p graphus-social-gen --no-default-features
+# --features falkor --bin social_falkor_bench -- --host <h> --port 6379 ...
+[[bin]]
+name = "social_falkor_bench"
+path = "src/bin/social_falkor_bench.rs"
+required-features = ["falkor"]
