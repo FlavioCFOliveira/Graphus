@@ -637,10 +637,23 @@ impl BoltClient {
     /// unexpected reply; [`ClientError::Io`] on a transport fault.
     pub fn login(&mut self, user: &str, password: &str) -> ClientResult<()> {
         self.send(&Request::Hello {
-            extra: vec![(
-                "user_agent".to_owned(),
-                Value::String(USER_AGENT.to_owned()),
-            )],
+            extra: vec![
+                (
+                    "user_agent".to_owned(),
+                    Value::String(USER_AGENT.to_owned()),
+                ),
+                // The Bolt 5.3+ structured bolt agent block. It MUST be a map of string→string;
+                // Neo4j 2026 rejects the HELLO outright when it is absent or not a map, while
+                // Graphus (and older Neo4j) ignore it. Mirrors the graphus-cli client so the bench
+                // tools interoperate with the real Neo4j driver-facing server.
+                (
+                    "bolt_agent".to_owned(),
+                    Value::Map(vec![(
+                        "product".to_owned(),
+                        Value::String(USER_AGENT.to_owned()),
+                    )]),
+                ),
+            ],
         })?;
         match self.recv()? {
             Response::Success { .. } => {}
