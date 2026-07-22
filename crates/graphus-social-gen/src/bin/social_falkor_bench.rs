@@ -137,12 +137,25 @@ impl FalkorConn {
         }
     }
 
-    /// Issue `GRAPH.QUERY <graph> <query>` and consume the full reply. `Err` on a RESP error.
-    fn graph_query(&mut self, graph: &str, query: &str) -> io::Result<Result<(), String>> {
-        self.send(&["GRAPH.QUERY", graph, query])?;
+    /// Issue `GRAPH.QUERY <graph> <query> TIMEOUT <ms>` and consume the full reply. `Err` on a RESP
+    /// error. FalkorDB's deprecated legacy `TIMEOUT` config defaults to 1000ms and aborts any read
+    /// exceeding it; the Graphus and Neo4j Bolt runs had no such cap and ran the heavy `top_liked`
+    /// aggregation (~4-37s) to completion, so a generous per-query ceiling removes that config
+    /// artifact and keeps the comparison about the ENGINE, not the default timeout.
+    fn graph_query(
+        &mut self,
+        graph: &str,
+        query: &str,
+        timeout_ms: &str,
+    ) -> io::Result<Result<(), String>> {
+        self.send(&["GRAPH.QUERY", graph, query, "TIMEOUT", timeout_ms])?;
         self.consume()
     }
 }
+
+/// The generous per-query ceiling (ms) passed to every `GRAPH.QUERY`, above the heaviest family's cost
+/// yet below the TCP read timeout, so a slow query completes rather than being severed by either bound.
+const QUERY_TIMEOUT_MS: &str = "120000";
 
 // ============================================================================================
 // CLI
@@ -186,7 +199,7 @@ fn parse_args() -> Result<Args, String> {
         min_ops_per_client: 150,
         anchor_skew: 2,
         load_dir: None,
-        timeout: Duration::from_secs(120),
+        timeout: Duration::from_secs(180),
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -397,7 +410,7 @@ fn load(a: &Args, dir: &str) -> Result<(), String> {
     for label in ["USER", "ARTICLE"] {
         let q = format!("CREATE INDEX FOR (n:{label}) ON (n.id)");
         match c
-            .graph_query(g, &q)
+            .graph_query(g, &q, QUERY_TIMEOUT_MS)
             .map_err(|e| format!("index {label}: {e}"))?
         {
             Ok(()) => println!("  index on :{label}(id) created"),
@@ -444,7 +457,7 @@ fn load_nodes(c: &mut FalkorConn, g: &str, label: &str, ids: &[i64]) -> Result<(
         }
         list.push(']');
         let q = format!("UNWIND {list} AS id CREATE (:{label} {{id: id}})");
-        c.graph_query(g, &q)
+        c.graph_query(g, &q, QUERY_TIMEOUT_MS)
             .map_err(|e| format!("load {label} nodes: {e}"))?
             .map_err(|e| format!("load {label} nodes: {e}"))?;
     }
@@ -477,7 +490,7 @@ fn load_edges(
         let q = format!(
             "UNWIND {list} AS p MATCH (a:{la} {{id: p[0]}}), (b:{lb} {{id: p[1]}}) CREATE (a)-[:{rel}]->(b)"
         );
-        c.graph_query(g, &q)
+        c.graph_query(g, &q, QUERY_TIMEOUT_MS)
             .map_err(|e| format!("load {rel} edges: {e}"))?
             .map_err(|e| format!("load {rel} edges: {e}"))?;
     }
@@ -542,7 +555,7 @@ fn run_worker(
         let u1 = Generator::user_id(u1_idx);
         let query = build_query(fam, u0, u1);
         let start = Instant::now();
-        match conn.graph_query(&ctx.graph, &query) {
+        match conn.graph_query(&ctx.graph, &query, QUERY_TIMEOUT_MS) {
             Ok(Ok(())) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 out.lat.push((fam_ix, ms));
@@ -635,7 +648,7 @@ fn preflight(ctx: &Ctx) -> Result<(), String> {
     for fam in battery::ALL {
         let q = build_query(fam, u0, u1);
         match c
-            .graph_query(&ctx.graph, &q)
+            .graph_query(&ctx.graph, &q, QUERY_TIMEOUT_MS)
             .map_err(|e| format!("preflight {}: {e}", fam.name))?
         {
             Ok(()) => {}
