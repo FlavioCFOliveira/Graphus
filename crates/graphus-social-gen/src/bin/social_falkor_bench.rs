@@ -516,6 +516,8 @@ struct WorkerOut {
     lat: Vec<(usize, f64)>,
     errors: u64,
     connect_error: bool,
+    /// The first query-error message this worker saw (for diagnosing load-shedding vs the engine).
+    first_error: Option<String>,
 }
 
 fn run_worker(
@@ -530,6 +532,7 @@ fn run_worker(
         lat: Vec::new(),
         errors: 0,
         connect_error: false,
+        first_error: None,
     };
     let mut conn = match FalkorConn::connect(&ctx.host, ctx.port, ctx.timeout) {
         Ok(c) => c,
@@ -560,7 +563,14 @@ fn run_worker(
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
                 out.lat.push((fam_ix, ms));
             }
-            _ => out.errors += 1,
+            Ok(Err(msg)) => {
+                out.errors += 1;
+                out.first_error.get_or_insert(msg);
+            }
+            Err(e) => {
+                out.errors += 1;
+                out.first_error.get_or_insert(e.to_string());
+            }
         }
     }
     out
@@ -574,6 +584,7 @@ struct RungResult {
     p50: f64,
     p99: f64,
     errors: u64,
+    sample_error: Option<String>,
     per_family: Vec<(usize, f64)>, // (family_index, latency_ms) — only populated at the top rung
 }
 
@@ -613,11 +624,15 @@ fn run_rung(ctx: &Ctx, clients: u64, budget: u64, collect_family: bool) -> RungR
 
     let mut all: Vec<f64> = Vec::new();
     let mut errors = 0u64;
+    let mut sample_error: Option<String> = None;
     let mut per_family: Vec<(usize, f64)> = Vec::new();
     for o in &outs {
         errors += o.errors;
         if o.connect_error {
             errors += 1;
+        }
+        if let Some(e) = &o.first_error {
+            sample_error.get_or_insert_with(|| e.clone());
         }
         for &(fx, ms) in &o.lat {
             all.push(ms);
@@ -636,6 +651,7 @@ fn run_rung(ctx: &Ctx, clients: u64, budget: u64, collect_family: bool) -> RungR
         p50: pct(&all, 50.0),
         p99: pct(&all, 99.0),
         errors,
+        sample_error,
         per_family,
     }
 }
@@ -727,6 +743,9 @@ fn main() {
             "  rung clients={:>4} : {:>8.2} ops/s | p50={:>9.3}ms p99={:>10.3}ms | ok={} err={} secs={:.1}",
             r.clients, r.ops_per_sec, r.p50, r.p99, r.ops, r.errors, r.secs
         );
+        if let Some(e) = &r.sample_error {
+            println!("      first error @ clients={}: {e}", r.clients);
+        }
         rungs.push(r);
     }
 
