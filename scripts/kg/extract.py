@@ -291,6 +291,9 @@ def extract_symbols(docdirs: dict[str, Path]) -> tuple[list[dict], list[dict], d
 
 TEST_ATTR = re.compile(r"^\s*#\[(test|tokio::test)\b")
 FN_RE = re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)")
+# A double-quoted Rust string literal, escapes included. Stripped before counting
+# brackets so a `[` inside an attribute's message cannot unbalance the scan.
+STR_LIT = re.compile(r'"(?:[^"\\]|\\.)*"')
 PROPTEST_OPEN = re.compile(r"^\s*proptest!\s*\{")
 MOD_OPEN = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{")
 
@@ -384,13 +387,30 @@ def extract_tests() -> tuple[list[dict], list[dict]]:
                 # blank lines, and COMMENTS. Comments are not hypothetical --
                 # gorilla.rs:174 has a 3-line comment between #[test] and its fn,
                 # and an attributes-and-blanks-only skip loses that test.
+                #
+                # An attribute may also span SEVERAL lines, so matching `#[` on one
+                # line is not enough: advance until its brackets balance. Skipping
+                # only the opening line stops the scan on the attribute's own
+                # continuation, `FN_RE` then fails to match it, and the test is
+                # dropped in silence -- store.rs:8433's multi-line `#[cfg_attr(...)]`
+                # is exactly that case, and it cost audit criterion C17 one test.
+                # String literals are stripped before counting so a bracket inside
+                # an `ignore = "..."` reason cannot unbalance the scan.
                 j = i + 1
-                while j < len(lines) and (
-                    re.match(r"^\s*#\[", lines[j])
-                    or re.match(r"^\s*//", lines[j])
-                    or not lines[j].strip()
-                ):
-                    j += 1
+                while j < len(lines):
+                    if not lines[j].strip() or re.match(r"^\s*//", lines[j]):
+                        j += 1
+                        continue
+                    if re.match(r"^\s*#\[", lines[j]):
+                        depth = 0
+                        while j < len(lines):
+                            bare = STR_LIT.sub("", lines[j])
+                            depth += bare.count("[") - bare.count("]")
+                            j += 1
+                            if depth <= 0:
+                                break
+                        continue
+                    break
                 if j < len(lines):
                     fm = FN_RE.match(lines[j])
                     if fm:
