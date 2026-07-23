@@ -69,6 +69,7 @@ Parse contract, to be preserved by any future edit:
 | `D-hw-autotune` | ratified | 2026-07-08 | **Hardware-aware startup auto-tuning:** the `0 = auto` sentinel plus a strict precedence — operator configuration > hardware-derived value > built-in floor — adopted project-wide; auto `buffer_pool_pages = clamp( floor(0.125 × available_RAM_bytes ÷ 8192), 4096, 262144 )`; all OS-specific and `unsafe` probing isolated in the `graphus-sysres` leaf crate so `graphus-server` stays `#![forbid(unsafe_code)]`. Detected storage capacity/free space and the SSD-versus-rotational hint are logged only, and drive no automatic parameter change in this cut. Facet table in the "Ratified decision (2026-07-08)" section below; design in `04-technical-design.md` §9.5. |
 | `D-named-index-autoname` | ratified | 2026-07-08 | **Anonymous and legacy `CREATE INDEX ON :Label(property)` forms take a deterministic, stable auto-name of the form `index_<label>_<property>`** — a pure function of the label and property tokens — disambiguated by a deterministic token suffix and, if needed, a counter, until the name is free in every schema catalog; the resolved name is then persisted durably. Completes the already-ratified core requirement `FR-IX-15` under `D-v1-index-types` option (a); no ratified outcome changes. See the "Post-ratification note (2026-07-08)" below; design in `04-technical-design.md` §6.8. |
 | `D-query-prefixes` | ratified | 2026-07-14 | **`EXPLAIN` plans a statement without executing it; `PROFILE` executes it and annotates the plan with measured per-operator counters; exactly one of `plan` / `profile` is ever emitted.** `dbHits` is Graphus's own measured quantity, not a reproduction of Neo4j's DbHit accounting; unmeasured counters (per-operator time, page-cache counters) are omitted rather than fabricated — this supersedes the "timing" wording of `FR-QL-13`; a `PROFILE`d statement runs serially; the planner's cardinality estimate is reported on the root only. Completes the already-ratified core requirement `FR-QL-13`; no ratified outcome changes. See the "Post-ratification note (2026-07-14)" below; design in `04-technical-design.md` §7.8 and `06-bolt-and-error-shapes.md` §3.1. |
+| `D-async-commit` | ratified | 2026-07-23 | **Declined — Graphus does NOT adopt a deferred (asynchronous) WAL flush, whether time- or count-triggered.** Ack-after-fsync stays unconditional for every workload, and ingest acceleration goes through the `SuspendPersistence` campaign instead. Evaluated against measured evidence on 2026-07-23 and declined by the owner; refines `D-durability-mode`, whose "per-transaction synchronous available" facet is unchanged. Evidence and rationale in the "Ratified decision (2026-07-23)" section below. |
 
 <!-- END decision-index -->
 
@@ -253,6 +254,51 @@ scope and are propagated into `00-overview.md` and `01-needs-survey.md`:
 > no automatic parameter change yet (`04` §9.5). The resolved values and their provenance
 > (operator-overridden, hardware-derived, or floor) are recorded in a single structured startup log
 > line.
+
+## Ratified decision (2026-07-23) — `D-async-commit`
+
+> **`D-async-commit` — Deferred (asynchronous) WAL flush. DECLINED.** A time- or count-triggered WAL
+> flush — the equivalent of Memgraph's `--storage-wal-file-flush-every-n-tx` (default `100000`) or
+> PostgreSQL's `synchronous_commit = off` — was evaluated on 2026-07-23 as an alternative route to the
+> ingest throughput that the `SuspendPersistence` campaign (`rmp` #829–#854) targets. **The owner
+> declined it: ack-after-fsync remains unconditional, and ingest acceleration goes through
+> `SuspendPersistence`.**
+>
+> **Status: ratified (as a declination).**
+>
+> This is recorded because the option is cheap to re-propose and the evidence behind the refusal is
+> not self-evident — on the throughput axis the alternative measured as a genuine contender, not as an
+> inferior one.
+>
+> | Measured quantity | Value |
+> | --- | --- |
+> | `fdatasync` cost on the evaluation host | **2.90 ms fixed + ~0.35 ms per MiB** accumulated (a 344 sync/s device ceiling) |
+> | Durability share, statement-at-a-time | **~84%** of a 3.45 ms statement (the measured 280–290 ops/s write ceiling) |
+> | Durability share, `UNWIND`-batched ingest | **~14%** (`social-network-uds`, after subtracting its measured 18 ms client overhead from the 39 ms p50) |
+> | Predicted gain, **either** design | **~6×** statement-at-a-time; **~1.16×** batched |
+>
+> **Why the two designs share a ceiling.** Both remove exactly the same thing from the critical path —
+> the commit `fdatasync` — and both leave the same residual (~0.55 ms/statement: parse and plan, wire
+> framing, constraint checking, per-row secondary-index maintenance, SSI bookkeeping, encoding),
+> because the ratified `SuspendPersistence` scope waives **durability only** and keeps A, C and I fully
+> enforced. A deferred flush would additionally have cost no extra RAM (the WAL still reaches disk,
+> avoiding the in-memory undo retention that suspension forces — `rmp` #313 measured an unread
+> in-memory WAL at 72% of peak RSS), required no resynchronization on resume, stayed revocable at any
+> moment, and not required the graph to fit in RAM. Per PostgreSQL's documented guarantee, the risk it
+> carries is "data loss, not data corruption", bounded by a declarable window.
+>
+> **Why it was declined regardless.** It relaxes durability *unconditionally, for every workload*,
+> whereas `SuspendPersistence` confines the waiver to an explicit, operator-opened window. Against the
+> four inviolable requirements of `CLAUDE.md`, an always-on relaxation of D is a different class of
+> change from a bounded, opt-in suspension — and that distinction, not throughput, decided it.
+>
+> **Two consequences to hold, both measured.** First, `SuspendPersistence` must **not** be positioned
+> as a read accelerator: read-only transactions already perform zero WAL appends and zero `fdatasync`
+> (`rmp` #529), so the ceiling of any read gain is the −2.4% (1 client) to −8.2% (8 clients) that
+> concurrent writers were measured to cost readers in `examples/product-recommendations`, and the
+> retained in-memory undo chain pushes the other way. Second, the batched-ingest gain of ~1.16× is why
+> the campaign's value rests on sprint 81 (per-row cost and prepare-side parallelism) rather than on
+> the suspension itself.
 
 ## TCK target (pinned — closes `D-cypher-line` open question 1)
 
