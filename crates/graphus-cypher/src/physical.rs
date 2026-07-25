@@ -1526,6 +1526,179 @@ pub fn plan_physical(logical: &LogicalOp, catalog: &IndexCatalog) -> PhysicalPla
 ///
 /// The root [`estimated_rows`](PhysicalPlan::estimated_rows) is the cardinality estimate over the
 /// logical plan, which the rewrites preserve.
+/// Pushes each `WHERE` conjunct as deep into the plan as it can legally go, so it lands on the scan
+/// that binds the variable it constrains (`rmp` task #857).
+///
+/// # The gap this closes, measured
+///
+/// A predicate written in the same clause as its pattern already reaches the scan — the existing
+/// access-path selection ([`seek_alternative_for_filter`]) folds a `Filter` over a scan into a seek
+/// there. One written after a `WITH` did not: `MATCH (v:USER)-[:LIKES]->(a) WITH v, a WHERE v.uidn = 42`
+/// planned a `NodeByLabelScan(v)` and filtered above both the projection and the expand, while the
+/// identical `MATCH (v:USER {uidn: 42})-…` planned a `NodeIndexSeek`. Two operators sat between the
+/// filter and the scan and nothing moved the conjunct past them.
+///
+/// Running before the access-path pass is what makes it pay off: the conjunct arrives directly over the
+/// scan, which is exactly the shape that pass turns into a seek. It also helps on its own — a filter
+/// evaluated below an expand discards rows before they fan out.
+///
+/// # What a conjunct may travel through, and what stops it
+///
+/// Descent is **allow-listed**, never inferred: an operator this function does not name explicitly
+/// stops the conjunct, which is what keeps an unfamiliar or newly-added operator safe by default.
+///
+/// * [`Filter`](PhysicalOp::Filter) — always. Two filters in sequence evaluate the same predicates on
+///   the same rows; they are deliberately **not** merged into one `AND`, so neither predicate's
+///   evaluation order changes.
+/// * [`Projection`](PhysicalOp::Projection) — only when every variable the conjunct reads is projected
+///   through by **identity** (`v AS v`), and it touches nothing the projection introduced or renamed.
+///   That is what makes the predicate mean the same thing on either side: the column it reads is
+///   literally the same binding. `DISTINCT` is included — filtering before or after de-duplication
+///   yields the same set, because a predicate reading only identity-projected columns cannot
+///   distinguish two rows the de-duplication would merge.
+/// * [`ExpandAll`](PhysicalOp::ExpandAll) / [`ExpandInto`](PhysicalOp::ExpandInto) — only when the
+///   conjunct reads neither the relationship variable nor the target the hop introduces. Those are
+///   unbound below the expand, so a predicate touching them cannot be evaluated there.
+/// * [`Sort`](PhysicalOp::Sort) — always. Sorting permutes rows; it neither adds nor removes any, so
+///   filtering below produces the same bag in the same order.
+///
+/// Everything else stops it, and the load-bearing cases are worth naming:
+/// [`Aggregation`](PhysicalOp::Aggregation) (filtering before a grouping would change every count),
+/// [`Limit`](PhysicalOp::Limit) / [`Skip`](PhysicalOp::Skip) / [`TopN`](PhysicalOp::TopN) (filtering
+/// past a bound selects a different bounded set), [`Optional`](PhysicalOp::Optional) (a predicate pushed
+/// inside would remove the row the outer join must preserve with nulls), `Union`, `Eager`, `Unwind`,
+/// every join, and every writing operator.
+///
+/// A conjunction is split, so `WHERE v.uidn = 1 AND size(keys(a)) > 2` pushes the part that qualifies
+/// and leaves the rest where it was. When nothing qualifies the tree is rebuilt unchanged, which keeps
+/// the rule-based/TCK plan identical wherever this does not apply.
+fn push_filters_through_projections(op: PhysicalOp) -> PhysicalOp {
+    // Bottom-up, so a `WITH … WITH … WHERE` chain is rewritten from the leaves and a conjunct can
+    // travel through several projections in one pass.
+    let op = map_children(op, &push_filters_through_projections);
+    let PhysicalOp::Filter { input, predicate } = op else {
+        return op;
+    };
+    // Each conjunct is re-inserted at the deepest point it may legally reach — which, for one that
+    // cannot move at all, is exactly where it already was. So the `Filter` is not "removed": it is
+    // rebuilt, once per conjunct, wherever each one belongs.
+    let conjuncts: Vec<Expr> = split_conjuncts(&predicate).into_iter().cloned().collect();
+    let mut below = *input;
+    for conjunct in conjuncts {
+        below = push_conjunct_into(below, &conjunct);
+    }
+    below
+}
+
+/// Wraps `conjunct` in a [`Filter`](PhysicalOp::Filter) at the deepest point inside `op` the allow-list
+/// permits — immediately around `op` itself when it may not travel at all.
+///
+/// Traversability is decided by **reference** before the operator is consumed, then the descent reuses
+/// [`map_children`], so the recursion cannot disagree with the decision and no operator's fields need
+/// re-listing here. Every traversable operator has a single input, which is what makes that safe.
+fn push_conjunct_into(op: PhysicalOp, conjunct: &Expr) -> PhysicalOp {
+    // A `Filter` whose own input refuses the conjunct absorbs it instead of gaining a nested `Filter`
+    // below. Two reasons, and the first is not cosmetic: nesting one `Filter` per conjunct adds a plan
+    // level per conjunct, and a 12-part pattern with 11 join conjuncts overflowed the stack in the
+    // recursive passes that walk the tree afterwards (`tests/planner_join_bound.rs`). Merging keeps the
+    // depth constant. And it is exactly semantics-preserving here: the conjuncts are re-joined in their
+    // original order, so `c1 AND c2` is the predicate the query already had.
+    if let PhysicalOp::Filter { input, predicate } = op {
+        if can_traverse(&input, conjunct) {
+            return PhysicalOp::Filter {
+                input: Box::new(push_conjunct_into(*input, conjunct)),
+                predicate,
+            };
+        }
+        let span = predicate.span;
+        return PhysicalOp::Filter {
+            input,
+            predicate: Expr::new(
+                ExprKind::Binary {
+                    op: BinaryOp::And,
+                    lhs: Box::new(predicate),
+                    rhs: Box::new(conjunct.clone()),
+                },
+                span,
+            ),
+        };
+    }
+    if !can_traverse(&op, conjunct) {
+        return PhysicalOp::Filter {
+            input: Box::new(op),
+            predicate: conjunct.clone(),
+        };
+    }
+    map_children(op, &|child| push_conjunct_into(child, conjunct))
+}
+
+/// Whether `conjunct` may legally be evaluated below `op` — the allow-list of the pass.
+///
+/// Decided by reference, before the operator is consumed, so [`push_conjunct_into`]'s descent cannot
+/// disagree with the decision. Every traversable operator has a single input, which is what makes
+/// descending through [`map_children`] safe.
+fn can_traverse(op: &PhysicalOp, conjunct: &Expr) -> bool {
+    match op {
+        // A filter can always host another below it; a sort permutes rows without adding or removing
+        // any. Neither is merged into the other, so no predicate's evaluation order changes.
+        PhysicalOp::Filter { .. } | PhysicalOp::Sort { .. } => true,
+        PhysicalOp::Projection { input, items, .. } => {
+            projection_passes_through(input, items, conjunct)
+        }
+        // A hop's relationship variable and its target are unbound below it, so a conjunct touching
+        // either cannot be evaluated there.
+        PhysicalOp::ExpandAll {
+            relationship, to, ..
+        } => {
+            !expr_references_var(conjunct, &relationship.name)
+                && !expr_references_var(conjunct, &to.name)
+        }
+        // Expand-into binds no new node — both endpoints are already bound — but still introduces the
+        // relationship variable.
+        PhysicalOp::ExpandInto { relationship, .. } => {
+            !expr_references_var(conjunct, &relationship.name)
+        }
+        // Everything else stops it. Explicitly a catch-all, so a newly-added operator is a barrier
+        // until someone proves it traversable.
+        _ => false,
+    }
+}
+
+/// Whether `conjunct` means the same thing below a projection as above it.
+///
+/// True only when it reads at least one column the projection passes through by **identity** (`v AS v`)
+/// — so moving it can actually help — and touches nothing the projection introduced or renamed. Identity
+/// is what makes the two sides equivalent: the column read below is literally the same binding.
+///
+/// The introduced/renamed set is tested with the exhaustive [`expr_references_var`] walk rather than by
+/// enumerating the conjunct's own variables, so a newly-added `ExprKind` cannot silently escape the
+/// check.
+///
+/// `DISTINCT` is deliberately not consulted: filtering before or after de-duplication yields the same
+/// set, because a predicate reading only identity-projected columns cannot distinguish two rows the
+/// de-duplication would merge.
+fn projection_passes_through(
+    input: &PhysicalOp,
+    items: &[ProjectionColumn],
+    conjunct: &Expr,
+) -> bool {
+    let identity: BTreeSet<&str> = items
+        .iter()
+        .filter_map(|c| match &c.expr.kind {
+            ExprKind::Variable(name) if *name == c.alias => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    let below_binds: BTreeSet<String> = bound_var_names(input).into_iter().collect();
+    let reads_identity = identity.iter().any(|v| expr_references_var(conjunct, v));
+    let blocked = items
+        .iter()
+        .map(|c| c.alias.as_str())
+        .filter(|a| !identity.contains(*a) || !below_binds.contains(*a))
+        .any(|v| expr_references_var(conjunct, v));
+    reads_identity && !blocked
+}
+
 pub fn plan_physical_with_stats(
     logical: &LogicalOp,
     catalog: &IndexCatalog,
@@ -1533,7 +1706,12 @@ pub fn plan_physical_with_stats(
 ) -> PhysicalPlan {
     let estimated_rows = estimate_rows(logical, stats);
     let mut deps = BTreeSet::new();
-    let rule_based = Planner { catalog }.lower(logical, &mut deps);
+    // Predicate pushdown across pass-through projections (`rmp` task #857) runs on the rule-based tree,
+    // BEFORE the access-path pass below: it delivers a conjunct to the scan that binds the variable it
+    // constrains, which is exactly the `Filter`-over-scan shape that pass turns into a seek. It is
+    // bag-preserving, so it applies with or without statistics.
+    let rule_based =
+        push_filters_through_projections(Planner { catalog }.lower(logical, &mut deps));
 
     // With statistics, refine the rule-based tree by the cost model; without, keep its shape (no
     // cost-based rewrites). The optimiser is bag-preserving, so only the shape changes — and the index
