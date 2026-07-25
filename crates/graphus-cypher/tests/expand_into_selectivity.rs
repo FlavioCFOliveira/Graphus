@@ -217,34 +217,45 @@ fn uniform_random_graph_estimate_is_within_an_order_of_magnitude() {
     // digraph the probability that a walked neighbour is the bound `to` really is degree/|V|, so the
     // estimate must track the measured rows closely — and it is this test, not the triangle ring
     // below, that would catch a wrong formula.
-    let mut g = uniform_digraph(100, 1, 5);
-    let p = plan(TRIANGLE_UNLABELLED, &g);
-    let est = estimate_cost(find(&p, true).expect("expand-into"), g.statistics()).rows;
-    let real = measured_rows(TRIANGLE_UNLABELLED, &mut g) as f64;
-    assert!(
-        real > 100.0,
-        "non-vacuity: the corpus must close many triangles, got {real}"
-    );
-    let ratio = if est > real { est / real } else { real / est };
-    assert!(
-        ratio <= 10.0,
-        "estimate diverged by more than an order of magnitude on a uniform corpus: \
-         est={est} measured={real} ratio={ratio}"
-    );
+    //
+    // BOTH spellings are checked. When this suite was written only the unlabelled one could pass,
+    // because the labelled one additionally paid the cost model's flat 0.3 filter constant twice
+    // (0.09, an 11x skew) for label predicates that remove nothing on this corpus. Task #864 replaced
+    // that constant with the shared predicate model, so the two spellings now agree — see
+    // `label_predicates_that_remove_nothing_no_longer_shrink_the_estimate` below, which pins it.
+    for spelling in [TRIANGLE_UNLABELLED, TRIANGLE] {
+        let mut g = uniform_digraph(100, 1, 5);
+        let p = plan(spelling, &g);
+        let est = estimate_cost(find(&p, true).expect("expand-into"), g.statistics()).rows;
+        let real = measured_rows(spelling, &mut g) as f64;
+        assert!(
+            real > 100.0,
+            "non-vacuity: the corpus must close many triangles, got {real} for `{spelling}`"
+        );
+        let ratio = if est > real { est / real } else { real / est };
+        assert!(
+            ratio <= 10.0,
+            "estimate diverged by more than an order of magnitude on a uniform corpus: \
+             est={est} measured={real} ratio={ratio} for `{spelling}`"
+        );
+    }
 }
 
 #[test]
-fn flat_filter_constant_is_what_still_skews_the_labelled_spelling() {
-    // Attribution test, so the residual error is pinned to its real cause rather than blamed on the
-    // expand-into formula. The two spellings describe the same pattern over a corpus where every node
-    // is a `Person`, so they must measure the same rows; only the labelled one pays the flat `0.3`
-    // filter constant, twice. This test fails the day task #864 replaces that constant — at which
-    // point the labelled spelling should be folded back into the accuracy test above.
+fn label_predicates_that_remove_nothing_no_longer_shrink_the_estimate() {
+    // Task #864, stated as the property that fixes it. The two spellings describe the same pattern over
+    // a corpus where every node is a `Person`, so they match the same rows — and now that a label
+    // predicate is estimated from the label's actual population rather than a flat constant, they must
+    // also be *estimated* the same. Before #864 the labelled spelling estimated 0.09 of the other.
     let mut g = uniform_digraph(100, 1, 5);
-    let labelled = measured_rows(TRIANGLE, &mut g) as f64;
-    let plain = measured_rows(TRIANGLE_UNLABELLED, &mut g) as f64;
+    let labelled_rows = measured_rows(TRIANGLE, &mut g) as f64;
+    let plain_rows = measured_rows(TRIANGLE_UNLABELLED, &mut g) as f64;
+    assert!(
+        labelled_rows > 100.0,
+        "non-vacuity: the pattern must match, got {labelled_rows}"
+    );
     assert_eq!(
-        labelled, plain,
+        labelled_rows, plain_rows,
         "premise: the two spellings must match the same rows on this corpus"
     );
     let stats = g.statistics();
@@ -255,9 +266,9 @@ fn flat_filter_constant_is_what_still_skews_the_labelled_spelling() {
     )
     .rows;
     assert!(
-        est_labelled < est_plain / 5.0,
-        "the flat filter constant should be shrinking the labelled estimate by ~0.09: \
-         labelled={est_labelled} plain={est_plain} (measured {plain})"
+        (est_labelled - est_plain).abs() < 1e-9,
+        "a label predicate that removes nothing must not change the estimate: \
+         labelled={est_labelled} plain={est_plain} (both measured {plain_rows})"
     );
 }
 

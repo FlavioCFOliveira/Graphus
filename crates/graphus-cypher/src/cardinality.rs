@@ -11,21 +11,32 @@
 //! module changes no query result and no plan shape — only the value carried alongside the plan. A
 //! later sub-task wires that estimate into a cost model.
 //!
-//! # Property-histogram filter selectivity (sub-task #81)
+//! # Filter selectivity (sub-task #81, extended by task #864)
 //!
-//! A [`Filter`](LogicalOp::Filter) whose predicate is a single property comparison on a label-scanned
-//! variable — `v.prop = lit`, or `v.prop </<=/>/>=  lit` (and the mirrored `lit <op> v.prop` forms) —
-//! is estimated from a real **equi-depth histogram** read through the [`Statistics`] property-
-//! selectivity seam ([`Statistics::estimate_nodes_label_property_eq`] /
-//! [`estimate_nodes_label_property_range`](Statistics::estimate_nodes_label_property_range)), instead
-//! of the flat [`DEFAULT_PREDICATE_SELECTIVITY`]. The detected predicate shapes mirror the physical
-//! planner's index-selection detection ([`crate::physical`]) exactly, so the estimator recognises the
-//! same predicates the planner can turn into index seeks. Every other predicate shape — a non-property
-//! comparison, a non-literal operand, a filter not over a label scan, an unindexable literal, absent
-//! statistics, or a `None` from the seam — **falls back** to the documented constant (see
-//! [`estimate`]'s `Filter` arm for the full fallback matrix). The fallback is per-`Filter`: the
-//! logical lowering splits a conjunction (`AND`) into **nested** `Filter`s, so each `Filter` here
-//! carries a single conjunct, and a compound predicate composes per-filter selectivities naturally.
+//! [`predicate_selectivity`] is the **one** predicate model in the crate, shared by this estimator and
+//! the physical [cost model](crate::cost). It answers in three tiers:
+//!
+//! 1. A single property comparison on a label-bound variable — `v.prop = lit`, or
+//!    `v.prop </<=/>/>= lit` (and the mirrored `lit <op> v.prop` forms) — is estimated from a real
+//!    **equi-depth histogram** read through the [`Statistics`] property-selectivity seam
+//!    ([`Statistics::estimate_nodes_label_property_eq`] /
+//!    [`estimate_nodes_label_property_range`](Statistics::estimate_nodes_label_property_range)). The
+//!    detected shapes mirror the physical planner's index-selection detection ([`crate::physical`])
+//!    exactly, so the estimator recognises the same predicates the planner can turn into index seeks.
+//! 2. A **label predicate** `v:Label` (and conjunctions of them, which is also how the parser desugars
+//!    `v:A:B`) is estimated from the label's real population: `1.0` when the access path binding `v`
+//!    already guarantees that label — the filter is a redundant re-check and removes nothing — and the
+//!    label's share of all nodes otherwise.
+//! 3. Everything else — a non-property comparison, a non-literal operand, a variable whose label is
+//!    unresolved, an unindexable literal, a disjunction, absent statistics, or a `None` from the seam —
+//!    **falls back** to the documented flat [`DEFAULT_PREDICATE_SELECTIVITY`].
+//!
+//! Selectivity is expressed as a *fraction of the input*, not as an absolute row count, which is what
+//! lets one model serve a filter over any input: over a bare label scan the two coincide, but over a
+//! filter fed by an expand — many rows per node — an absolute count would be meaningless. A conjunction
+//! multiplies its conjuncts' selectivities (independence assumption); `OR` and `XOR` are deliberately
+//! **not** decomposed, because a product would badly under-estimate a disjunction and the
+//! inclusion-exclusion terms are not available.
 //!
 //! # Why `f64`
 //!
@@ -53,7 +64,7 @@
 //! — they are not claimed to be accurate, and sub-task #81 supersedes the predicate one with real
 //! histograms.
 
-use crate::ast::{BinaryOp, Expr, ExprKind, Literal, VarLengthRange};
+use crate::ast::{BinaryOp, Expr, ExprKind, LabelExpr, Literal, VarLengthRange};
 use crate::logical::LogicalOp;
 use crate::statistics::Statistics;
 use graphus_core::Value;
@@ -77,12 +88,15 @@ pub const DEFAULT_LABEL_SELECTIVITY: f64 = 0.1;
 ///
 /// `0.3` is the classic textbook default for an unknown predicate with no histogram (System R used
 /// `1/3` for an inequality and similar magic constants throughout; `0.3` is the widely-cited rounded
-/// value). As of sub-task #81 the estimator prefers a property-histogram-driven estimate for a
-/// recognised single-property comparison over a label-scanned variable (see [`estimate`]'s `Filter`
-/// arm); this constant is the **fallback** for every other case — a non-property predicate, a
-/// non-literal / unindexable operand, a filter not over a label scan, absent statistics, or a `None`
-/// from the [`Statistics`] seam. It keeps such a filtered estimate strictly below its input (a filter
-/// never adds rows) while leaving a meaningful fraction.
+/// value). It is the **last** tier of [`predicate_selectivity`], reached only for a predicate neither
+/// the histogram path (sub-task #81) nor the label-population path (task #864) can read: a non-property
+/// comparison, a non-literal or unindexable operand, a variable whose label is unresolved, a
+/// disjunction or negation, absent statistics, or a `None` from the [`Statistics`] seam. It keeps such a
+/// filtered estimate strictly below its input (a filter never adds rows) while leaving a meaningful
+/// fraction.
+///
+/// It is deliberately **kept** rather than replaced: an estimator that invents a number for a shape it
+/// cannot read is worse than one that admits it is guessing with a documented constant.
 pub const DEFAULT_PREDICATE_SELECTIVITY: f64 = 0.3;
 
 /// Assumed total node count when no [`Statistics`] source is available.
@@ -198,6 +212,22 @@ pub(crate) fn total_relationships(stats: Option<&dyn Statistics>) -> f64 {
     })
 }
 
+/// The number of nodes carrying `label`: the exact per-label count when statistics know it, otherwise
+/// a documented fraction of the total ([`DEFAULT_LABEL_SELECTIVITY`]).
+///
+/// An unknown label that statistics *do* track legitimately returns `Some(0)` — that is an exact zero,
+/// not a fallback, so the `unwrap_or_else` fires only when the count is genuinely unavailable.
+///
+/// Shared with the [cost model](crate::cost) so a label scan's row count and the *denominator* of a
+/// label predicate's selectivity are the same number computed the same way (`rmp` task #864). Before
+/// they were two copies of this expression, one in each estimator.
+pub(crate) fn label_rows(label: &str, stats: Option<&dyn Statistics>) -> f64 {
+    stats
+        .and_then(|s| s.nodes_with_label(label))
+        .map(|c| c as f64)
+        .unwrap_or_else(|| total_nodes(stats) * DEFAULT_LABEL_SELECTIVITY)
+}
+
 /// The average node out-degree: `total_relationships / max(1, total_nodes)`.
 ///
 /// `max(1, _)` guards against division by zero on an empty graph; with zero nodes the degree is
@@ -269,10 +299,7 @@ fn estimate(op: &LogicalOp, stats: Option<&dyn Statistics>) -> f64 {
         // A label scan emits the exact per-label count when known; otherwise a documented fraction
         // of the total (DEFAULT_LABEL_SELECTIVITY). An unknown label that statistics *do* track
         // legitimately returns Some(0) — that is an exact zero, not a fallback.
-        LogicalOp::NodeByLabelScan { label, .. } => stats
-            .and_then(|s| s.nodes_with_label(&label.name))
-            .map(|c| c as f64)
-            .unwrap_or_else(|| total_nodes(stats) * DEFAULT_LABEL_SELECTIVITY),
+        LogicalOp::NodeByLabelScan { label, .. } => label_rows(&label.name, stats),
 
         // A relationship scan emits one row per relationship, refined by type when types are listed:
         // sum the known per-type counts; if a listed type's count is unknown, fall back to the total
@@ -491,46 +518,93 @@ fn estimate(op: &LogicalOp, stats: Option<&dyn Statistics>) -> f64 {
 }
 
 // =================================================================================================
-// Filter selectivity: histogram-driven where possible, constant fallback otherwise (sub-task #81)
+// Filter selectivity: histograms, label populations, constant fallback (sub-task #81, task #864)
 // =================================================================================================
 
-/// Estimates a [`Filter`](LogicalOp::Filter)'s output cardinality.
+/// Estimates a [`Filter`](LogicalOp::Filter)'s output cardinality as `input_rows` times the shared
+/// [`predicate_selectivity`].
 ///
-/// The model, in order:
-///
-/// 1. `input_rows = estimate(input)` — a filter never adds rows, so this is the ceiling.
-/// 2. If the `predicate` is a single property comparison on a variable `v` (equality or a range, with
-///    a bare, index-encodable literal operand), `v` is bound by a [`NodeByLabelScan`](LogicalOp::NodeByLabelScan)
-///    somewhere on `input`'s spine, and `stats` carries a histogram for that `label.property`, the
-///    estimate is the histogram's answer **clamped to `[0, input_rows]`** (clamping keeps the estimate
-///    sound under stale statistics — a filter can never exceed its input).
-/// 3. Otherwise (no property predicate, unresolved label, non-literal / unindexable operand, no
-///    statistics, or `None` from the seam) the estimate is `input_rows * DEFAULT_PREDICATE_SELECTIVITY`.
+/// The label resolver walks `input`'s spine for the access path that binds a variable, so a label
+/// predicate can be recognised as redundant. Because the selectivity is clamped to `[0, 1]`, the result
+/// can never exceed `input_rows` — a filter never adds rows, however stale the statistics are.
 ///
 /// The whole result is finite and non-negative; [`estimate_rows`] additionally clamps the tree.
 fn estimate_filter(input: &LogicalOp, predicate: &Expr, stats: Option<&dyn Statistics>) -> f64 {
     let input_rows = estimate(input, stats);
-    if let Some(count) = histogram_filter_estimate(input, predicate, stats) {
-        // A filter never adds rows; clamp to the input so a stale histogram cannot make it grow.
-        return count.clamp(0.0, input_rows);
-    }
-    input_rows * DEFAULT_PREDICATE_SELECTIVITY
+    let resolver = |variable: &str| label_for_var(input, variable);
+    input_rows * predicate_selectivity(predicate, stats, &resolver)
 }
 
-/// Attempts a histogram-backed row estimate for a filter, returning `None` to request the constant
-/// fallback. `None` is returned when **any** precondition fails: no statistics, the predicate is not a
-/// recognised single-property comparison, the variable is not bound by a label scan on `input`, the
-/// literal does not convert to an index-encodable [`Value`], or the [`Statistics`] seam returns `None`
-/// (no histogram for this `label.property`, or an unindexable value).
-fn histogram_filter_estimate(
-    input: &LogicalOp,
+/// The fraction of its input rows a filter `predicate` is estimated to keep, in `[0, 1]`.
+///
+/// This is the **single** predicate model, shared by the logical cardinality estimator and the physical
+/// [cost model](crate::cost) (`rmp` task #864). Before this existed the cost model applied a flat
+/// [`DEFAULT_PREDICATE_SELECTIVITY`] to *every* filter while this module resolved the same predicate
+/// against histograms, so the two estimators answered differently for the same expression and every
+/// residual `Filter` in a physical plan shrank its input by exactly 3.3x regardless of what it tested.
+///
+/// `label_of` maps a variable name to the label that binds it on the input, if any — the one thing the
+/// two callers must supply differently, since one walks a [`LogicalOp`] tree and the other a
+/// [`PhysicalOp`](crate::physical::PhysicalOp) tree.
+///
+/// # The model
+///
+/// A conjunction is split into its conjuncts and their selectivities multiplied, the standard
+/// independence assumption. Each conjunct is then recognised as, in order:
+///
+/// 1. **A property comparison** with a histogram behind it — selectivity is the histogram's count over
+///    the label's node count. Expressing it as a *fraction* rather than as the absolute count is what
+///    lets the same number serve a filter over any input: over a bare label scan the two are identical
+///    (`label_rows * count/label_rows == count`), but over a filter fed by an expand — where the input
+///    is many rows per node — the absolute count would be meaningless.
+/// 2. **A label predicate** (`v:Label`) — `1.0` when the input already binds `v` through that very
+///    label (the filter is redundant and keeps everything), otherwise the label's share of all nodes.
+///    A negated, disjunctive or otherwise compound label expression is not modelled and falls through.
+/// 3. **Anything else** — the documented [`DEFAULT_PREDICATE_SELECTIVITY`] fallback.
+///
+/// The result is clamped to `[0, 1]`, so a filter can never be estimated to add rows however stale the
+/// statistics are.
+pub(crate) fn predicate_selectivity(
     predicate: &Expr,
     stats: Option<&dyn Statistics>,
+    label_of: &dyn Fn(&str) -> Option<String>,
+) -> f64 {
+    // Conjuncts are independent by assumption, so their selectivities multiply. `AND` is the only
+    // connective decomposed: `OR` and `XOR` would need the inclusion-exclusion terms this model does
+    // not have, and estimating them as a product would *under*-estimate a disjunction badly.
+    if let ExprKind::Binary {
+        op: BinaryOp::And,
+        lhs,
+        rhs,
+    } = &predicate.kind
+    {
+        return (predicate_selectivity(lhs, stats, label_of)
+            * predicate_selectivity(rhs, stats, label_of))
+        .clamp(0.0, 1.0);
+    }
+    if let Some(s) = property_comparison_selectivity(predicate, stats, label_of) {
+        return s.clamp(0.0, 1.0);
+    }
+    if let Some(s) = label_predicate_selectivity(predicate, stats, label_of) {
+        return s.clamp(0.0, 1.0);
+    }
+    DEFAULT_PREDICATE_SELECTIVITY
+}
+
+/// Attempts a histogram-backed selectivity for a property comparison, returning `None` to request the
+/// next model. `None` is returned when **any** precondition fails: no statistics, the predicate is not a
+/// recognised single-property comparison, the variable is not bound by a label scan on the input, the
+/// literal does not convert to an index-encodable [`Value`], or the [`Statistics`] seam returns `None`
+/// (no histogram for this `label.property`, or an unindexable value).
+fn property_comparison_selectivity(
+    predicate: &Expr,
+    stats: Option<&dyn Statistics>,
+    label_of: &dyn Fn(&str) -> Option<String>,
 ) -> Option<f64> {
     let stats = stats?;
     let pred = analyze_property_comparison(predicate)?;
-    let label = label_for_var(input, &pred.variable)?;
-    match pred.kind {
+    let label = label_of(&pred.variable)?;
+    let matching = match pred.kind {
         ComparisonKind::Equality { value } => {
             stats.estimate_nodes_label_property_eq(&label, &pred.property, &value)
         }
@@ -545,6 +619,74 @@ fn histogram_filter_estimate(
                 hi,
                 hi_inc,
             )
+        }
+    }?;
+    // The denominator is the same label row count a label scan would estimate, so a filter directly
+    // over that scan reproduces the histogram's absolute count exactly.
+    let population = label_rows(&label, Some(stats));
+    if population <= 0.0 {
+        // No population to be selective over. Zero rows in means zero rows out either way, so the
+        // fraction is unobservable; return the neutral 1.0 rather than a division by zero.
+        return Some(1.0);
+    }
+    Some(matching / population)
+}
+
+/// Attempts a selectivity for a bare label predicate `v:Label`, returning `None` for anything else.
+///
+/// A label test on a variable the input **already** binds through that same label keeps every row: the
+/// predicate is a residual check the access path has made redundant. This is the case that produced the
+/// worst measured error before task #864 — a two-hop pattern whose every node is written with its label
+/// had its downstream cardinality under-estimated by about 11x, purely from applying the flat constant
+/// twice to predicates that in fact removed nothing (measured in
+/// `tests/expand_into_selectivity.rs`).
+///
+/// Single labels and their conjunctions are modelled (a conjunction is also how the parser desugars
+/// the legacy `v:A:B` form). A negation, a disjunction or the `%` wildcard has no population count to
+/// read, so it falls through to the constant rather than being guessed at.
+fn label_predicate_selectivity(
+    predicate: &Expr,
+    stats: Option<&dyn Statistics>,
+    label_of: &dyn Fn(&str) -> Option<String>,
+) -> Option<f64> {
+    let ExprKind::HasLabels { operand, expr } = &predicate.kind else {
+        return None;
+    };
+    let ExprKind::Variable(variable) = &operand.kind else {
+        return None;
+    };
+    label_expr_selectivity(expr, variable, stats, label_of)
+}
+
+/// The selectivity of a label expression against `variable`, or `None` for a shape with no population
+/// count behind it.
+fn label_expr_selectivity(
+    expr: &LabelExpr,
+    variable: &str,
+    stats: Option<&dyn Statistics>,
+    label_of: &dyn Fn(&str) -> Option<String>,
+) -> Option<f64> {
+    match expr {
+        LabelExpr::Leaf { name, .. } => {
+            if label_of(variable).as_deref() == Some(name.as_str()) {
+                // The access path already guarantees the label; the filter removes nothing.
+                return Some(1.0);
+            }
+            let total = total_nodes(stats);
+            if total <= 0.0 {
+                // An empty graph: zero rows in, zero out, so the fraction is unobservable.
+                return Some(1.0);
+            }
+            Some(label_rows(name, stats) / total)
+        }
+        // Independence again, and the same reason `OR` is not decomposed above applies to `|` here.
+        LabelExpr::Conjunction { lhs, rhs, .. } => {
+            let l = label_expr_selectivity(lhs, variable, stats, label_of)?;
+            let r = label_expr_selectivity(rhs, variable, stats, label_of)?;
+            Some(l * r)
+        }
+        LabelExpr::Wildcard { .. } | LabelExpr::Negation { .. } | LabelExpr::Disjunction { .. } => {
+            None
         }
     }
 }

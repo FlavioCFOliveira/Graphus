@@ -30,13 +30,14 @@
 //! same physical tree and the same statistics it returns the same estimate, so the optimiser's
 //! cost-tie-breaking is deterministic.
 
-use crate::ast::{Expr, RelType};
+use crate::ast::{Expr, Label, RelType};
 use crate::cardinality::{
     DEFAULT_CSV_RECORDS, DEFAULT_DISTINCT_GROUP_RATIO, DEFAULT_DISTINCT_PROJECTION_RATIO,
     DEFAULT_LABEL_SELECTIVITY, DEFAULT_LIST_LENGTH, DEFAULT_PREDICATE_SELECTIVITY,
     DEFAULT_PROCEDURE_YIELD, average_degree, average_path_length, clamp_estimate,
-    literal_row_count, total_nodes, total_relationships,
+    literal_row_count, predicate_selectivity, total_nodes, total_relationships,
 };
+use crate::logical::Var;
 use crate::physical::{PhysicalOp, RangeBound};
 use crate::statistics::Statistics;
 
@@ -550,9 +551,19 @@ pub fn estimate_cost(op: &PhysicalOp, stats: Option<&dyn Statistics>) -> CostEst
         // ---- relational ---------------------------------------------------------------------------
 
         // A filter keeps a fraction of its input and pays a predicate evaluation per *input* row.
-        PhysicalOp::Filter { input, .. } => {
+        // A filter keeps the fraction of its input the shared predicate model estimates, and pays one
+        // predicate evaluation per input row. Until `rmp` task #864 this arm applied the flat 0.3
+        // constant to *every* predicate, so a residual `Filter` shrank its input by exactly 3.3x
+        // whatever it tested — including a label check the access path beneath had already guaranteed,
+        // which removes nothing. Two such filters in a two-hop pattern under-estimated the downstream
+        // cardinality by ~11x (measured; `tests/expand_into_selectivity.rs`), and every cost comparison
+        // above them inherited the error.
+        PhysicalOp::Filter {
+            input, predicate, ..
+        } => {
             let inner = estimate_cost(input, stats);
-            let rows = inner.rows * DEFAULT_PREDICATE_SELECTIVITY;
+            let resolver = |variable: &str| physical_label_for_var(input, variable);
+            let rows = inner.rows * predicate_selectivity(predicate, stats, &resolver);
             CostEstimate::new(rows, inner.cost + inner.rows * COST_ROW_FILTER)
         }
 
@@ -736,11 +747,97 @@ pub fn estimate_cost(op: &PhysicalOp, stats: Option<&dyn Statistics>) -> CostEst
 // =================================================================================================
 
 /// Rows a label scan emits: the exact per-label count, or the documented selectivity fallback.
+///
+/// Delegates to [`crate::cardinality::label_rows`] so this estimator and the logical one compute a
+/// label's population identically — and so the *denominator* of a label predicate's selectivity is the
+/// same number as the label scan's row count (`rmp` task #864).
 fn label_scan_rows(label: &str, stats: Option<&dyn Statistics>) -> f64 {
-    stats
-        .and_then(|s| s.nodes_with_label(label))
-        .map(|c| c as f64)
-        .unwrap_or_else(|| total_nodes(stats) * DEFAULT_LABEL_SELECTIVITY)
+    crate::cardinality::label_rows(label, stats)
+}
+
+/// The label that binds `variable` on this physical plan, if any access path on the spine states one.
+///
+/// The physical counterpart of the logical estimator's `label_for_var`, and the one input
+/// [`crate::cardinality::predicate_selectivity`] cannot derive for itself (`rmp` task #864). Every
+/// node access path carries the label it scans or seeks, so a residual `Filter` above one can tell
+/// whether it is re-testing a label the access path already guaranteed — the case that produced the
+/// worst measured estimate error, since the flat constant charged it a 70% row removal for testing
+/// nothing.
+///
+/// Recursion follows the binding: single-input operators pass through to their child, and a binary
+/// operator may bind the variable on either side (the first side that does wins, which is sound because
+/// a variable is bound once per plan). A `Union` is deliberately **not** searched: its two branches may
+/// bind the same variable through different labels, so no single answer is correct and `None` — the
+/// constant fallback — is the honest result.
+fn physical_label_for_var(op: &PhysicalOp, variable: &str) -> Option<String> {
+    /// Matches an access path's `(variable, label)` pair against the variable being resolved.
+    fn bound(v: &Var, label: &Label, variable: &str) -> Option<String> {
+        (v.name == variable).then(|| label.name.clone())
+    }
+    match op {
+        // ---- access paths that state a label -------------------------------------------------------
+        PhysicalOp::NodeByLabelScan { variable: v, label }
+        | PhysicalOp::TokenLookupScan {
+            variable: v, label, ..
+        }
+        | PhysicalOp::NodeIndexSeek {
+            variable: v, label, ..
+        }
+        | PhysicalOp::NodeCompositeIndexSeek {
+            variable: v, label, ..
+        }
+        | PhysicalOp::NodeLabelScanEq {
+            variable: v, label, ..
+        }
+        | PhysicalOp::NodeIndexRangeSeek {
+            variable: v, label, ..
+        }
+        | PhysicalOp::NodeIndexScan {
+            variable: v, label, ..
+        }
+        | PhysicalOp::NodeIndexStartsWithSeek {
+            variable: v, label, ..
+        }
+        | PhysicalOp::SpatialIndexSeek {
+            variable: v, label, ..
+        }
+        | PhysicalOp::NodeTextIndexSeek {
+            variable: v, label, ..
+        } => bound(v, label, variable),
+
+        // ---- single-input operators: the binding is below ------------------------------------------
+        PhysicalOp::ExpandAll { input, .. }
+        | PhysicalOp::ExpandInto { input, .. }
+        | PhysicalOp::NamedPath { input, .. }
+        | PhysicalOp::ShortestPath { input, .. }
+        | PhysicalOp::QuantifiedPath { input, .. }
+        | PhysicalOp::Filter { input, .. }
+        | PhysicalOp::Projection { input, .. }
+        | PhysicalOp::Aggregation { input, .. }
+        | PhysicalOp::Sort { input, .. }
+        | PhysicalOp::TopN { input, .. }
+        | PhysicalOp::Skip { input, .. }
+        | PhysicalOp::Limit { input, .. }
+        | PhysicalOp::Eager { input, .. }
+        | PhysicalOp::Unwind { input, .. }
+        | PhysicalOp::LoadCsv { input, .. }
+        | PhysicalOp::Optional { input, .. }
+        | PhysicalOp::Create { input, .. }
+        | PhysicalOp::Merge { input, .. }
+        | PhysicalOp::SetClause { input, .. }
+        | PhysicalOp::Delete { input, .. }
+        | PhysicalOp::Remove { input, .. }
+        | PhysicalOp::Foreach { input, .. } => physical_label_for_var(input, variable),
+
+        // ---- binary operators: either side may bind it ---------------------------------------------
+        PhysicalOp::NestedLoopJoin { left, right } | PhysicalOp::HashJoin { left, right, .. } => {
+            physical_label_for_var(left, variable)
+                .or_else(|| physical_label_for_var(right, variable))
+        }
+
+        // ---- leaves and shapes with no single answer -----------------------------------------------
+        _ => None,
+    }
 }
 
 /// Rows an equality index seek for the concrete `value` emits: the histogram's equality estimate
@@ -997,6 +1094,268 @@ mod tests {
         assert!(
             seek_rows <= 5.0,
             "selective equality seek estimate {seek_rows} should be tiny"
+        );
+    }
+
+    // ---- Filter selectivity: histograms and labels, not a flat constant (`rmp` task #864) -----
+
+    /// `p.age = n` as a filter predicate.
+    fn age_eq(n: i64) -> Expr {
+        Expr::new(
+            ExprKind::Binary {
+                op: crate::ast::BinaryOp::Eq,
+                lhs: Box::new(Expr::new(
+                    ExprKind::Property {
+                        base: Box::new(Expr::new(ExprKind::Variable("p".to_owned()), span())),
+                        key: "age".to_owned(),
+                    },
+                    span(),
+                )),
+                rhs: Box::new(int_expr(n)),
+            },
+            span(),
+        )
+    }
+
+    /// `p:Name` as a filter predicate.
+    fn has_label(name: &str) -> Expr {
+        has_label_on("p", name)
+    }
+
+    /// `<variable>:Name` as a filter predicate.
+    fn has_label_on(variable: &str, name: &str) -> Expr {
+        Expr::new(
+            ExprKind::HasLabels {
+                operand: Box::new(Expr::new(ExprKind::Variable(variable.to_owned()), span())),
+                expr: crate::ast::LabelExpr::Leaf {
+                    name: name.to_owned(),
+                    span: span(),
+                },
+            },
+            span(),
+        )
+    }
+
+    fn filter_over(input: PhysicalOp, predicate: Expr) -> PhysicalOp {
+        PhysicalOp::Filter {
+            input: Box::new(input),
+            predicate,
+        }
+    }
+
+    #[test]
+    fn label_filter_the_access_path_already_guarantees_removes_nothing() {
+        // The worst case the flat 0.3 constant produced: `Filter(p:Person)` directly over a
+        // `NodeByLabelScan(p:Person)` re-tests what the scan guaranteed, so it removes NOTHING — yet it
+        // was estimated to drop 70% of the rows, and every operator costed above inherited that error.
+        let g = skewed_graph();
+        let stats = g.statistics();
+        let scan_rows = estimate_cost(&person_label_scan(), stats).rows;
+        let filtered = estimate_cost(
+            &filter_over(person_label_scan(), has_label("Person")),
+            stats,
+        );
+        assert!(scan_rows > 0.0, "premise: the scan must produce rows");
+        assert!(
+            (filtered.rows - scan_rows).abs() < 1e-9,
+            "a redundant label filter must pass everything through: {} of {scan_rows}",
+            filtered.rows
+        );
+        // It is still charged for evaluating the predicate on every row — free rows, not free work.
+        assert!(
+            filtered.cost > estimate_cost(&person_label_scan(), stats).cost,
+            "the filter must still pay its per-row evaluation"
+        );
+    }
+
+    #[test]
+    fn label_filter_for_a_different_label_uses_that_label_population() {
+        // A label the access path does NOT guarantee is estimated from its share of all nodes, not from
+        // the constant. `Company` is 5 of 1005 nodes in the corpus, so the filter is far MORE selective
+        // than the flat 0.3 claimed — the error runs in both directions.
+        let g = skewed_graph();
+        let stats = g.statistics();
+        let scan_rows = estimate_cost(&person_label_scan(), stats).rows;
+        let filtered = estimate_cost(
+            &filter_over(person_label_scan(), has_label("Company")),
+            stats,
+        );
+        let expected = scan_rows * (5.0 / 1005.0);
+        assert!(
+            (filtered.rows - expected).abs() < 1e-6,
+            "expected {expected} from Company's population share, got {}",
+            filtered.rows
+        );
+        assert!(
+            filtered.rows < scan_rows * DEFAULT_PREDICATE_SELECTIVITY,
+            "and it must be more selective than the constant it replaced"
+        );
+    }
+
+    #[test]
+    fn property_filter_uses_the_histogram_not_the_constant() {
+        // 1000 distinct ages, so an equality keeps about one row — nothing like 30%.
+        let g = skewed_graph();
+        let stats = g.statistics();
+        let scan_rows = estimate_cost(&person_label_scan(), stats).rows;
+        let filtered = estimate_cost(&filter_over(person_label_scan(), age_eq(42)), stats);
+        assert!(
+            filtered.rows <= 5.0,
+            "a selective equality must estimate a handful of rows, got {}",
+            filtered.rows
+        );
+        assert!(
+            filtered.rows < scan_rows * DEFAULT_PREDICATE_SELECTIVITY,
+            "and it must beat the flat constant it replaced"
+        );
+    }
+
+    #[test]
+    fn the_two_estimators_agree_on_the_same_predicate() {
+        // The agreement property #864 exists to establish: the physical cost model and the logical
+        // cardinality estimator now share ONE predicate model, so the same predicate over an equivalent
+        // input must produce the same row estimate. They used to disagree by construction — this module
+        // applied a flat constant while `cardinality` resolved histograms.
+        use crate::cardinality::estimate_rows;
+        use crate::logical::LogicalOp;
+
+        let g = skewed_graph();
+        let stats = g.statistics();
+        let logical_scan = LogicalOp::NodeByLabelScan {
+            variable: Var::named("p"),
+            label: label("Person"),
+        };
+        for (name, predicate) in [
+            ("property equality", age_eq(42)),
+            ("redundant label", has_label("Person")),
+            ("other label", has_label("Company")),
+            (
+                "conjunction of both",
+                Expr::new(
+                    ExprKind::Binary {
+                        op: crate::ast::BinaryOp::And,
+                        lhs: Box::new(age_eq(42)),
+                        rhs: Box::new(has_label("Person")),
+                    },
+                    span(),
+                ),
+            ),
+        ] {
+            let physical =
+                estimate_cost(&filter_over(person_label_scan(), predicate.clone()), stats).rows;
+            let logical = estimate_rows(
+                &LogicalOp::Filter {
+                    input: Box::new(logical_scan.clone()),
+                    predicate,
+                },
+                stats,
+            );
+            assert!(
+                (physical - logical).abs() < 1e-6,
+                "estimators disagree on `{name}`: physical={physical} logical={logical}"
+            );
+        }
+    }
+
+    #[test]
+    fn unrecognised_predicate_still_falls_back_to_the_documented_constant() {
+        // The constant is kept as the fallback, not deleted. A predicate neither model recognises — here
+        // a disjunction, which needs inclusion-exclusion terms this model does not have — must still be
+        // costed by it, so the estimator never returns a guessed-at number for a shape it cannot read.
+        let g = skewed_graph();
+        let stats = g.statistics();
+        let scan_rows = estimate_cost(&person_label_scan(), stats).rows;
+        let disjunction = Expr::new(
+            ExprKind::Binary {
+                op: crate::ast::BinaryOp::Or,
+                lhs: Box::new(age_eq(1)),
+                rhs: Box::new(age_eq(2)),
+            },
+            span(),
+        );
+        let filtered = estimate_cost(&filter_over(person_label_scan(), disjunction), stats);
+        assert!(
+            (filtered.rows - scan_rows * DEFAULT_PREDICATE_SELECTIVITY).abs() < 1e-6,
+            "an unrecognised predicate must use the constant: got {} want {}",
+            filtered.rows,
+            scan_rows * DEFAULT_PREDICATE_SELECTIVITY
+        );
+    }
+
+    #[test]
+    fn filter_selectivity_needs_no_statistics_and_stays_bounded() {
+        // With no statistics there is no population to read, so every shape falls back — and must stay
+        // finite, non-negative and never above its input, which is what makes the estimate safe to
+        // propagate through the operators above it.
+        let scan_rows = estimate_cost(&person_label_scan(), None).rows;
+        for predicate in [age_eq(42), has_label("Person"), has_label("Company")] {
+            let e = estimate_cost(&filter_over(person_label_scan(), predicate), None);
+            assert!(e.rows.is_finite() && e.rows >= 0.0, "rows {}", e.rows);
+            assert!(
+                e.rows <= scan_rows + 1e-9,
+                "a filter must never be estimated above its input: {} > {scan_rows}",
+                e.rows
+            );
+        }
+    }
+
+    #[test]
+    fn a_label_filter_above_an_expand_is_not_charged_a_removal_it_does_not_make() {
+        // The measured 11x case, in its real shape: the filtered variable is bound by an EXPAND, not by
+        // a label scan, so the access path guarantees nothing and the estimate falls to the label's
+        // population share. `connected_graph` is used rather than `skewed_graph` because the latter has
+        // no relationships at all — the expand would estimate zero rows and the comparison below would
+        // hold vacuously. `Person` is 1002 of its 1007 nodes, so the filter passes ~99.5% through, where
+        // the flat constant claimed 30%.
+        let g = connected_graph();
+        let stats = g.statistics();
+        let expand = PhysicalOp::ExpandAll {
+            input: Box::new(person_label_scan()),
+            from: Var::named("p"),
+            relationship: Var::named("r"),
+            to: Var::named("q"),
+            direction: crate::ast::RelDirection::LeftToRight,
+            types: Vec::new(),
+            range: None,
+            prior_rels: Vec::new(),
+            rel_props: None,
+        };
+        let expand_rows = estimate_cost(&expand, stats).rows;
+        assert!(
+            expand_rows > 1.0,
+            "non-vacuity: the expand must fan out, else the comparison proves nothing (got \
+             {expand_rows})"
+        );
+
+        // `q` is the expand's TARGET: no access path states its label, so the estimate falls to the
+        // label's share of all nodes — 1002 of 1007, so ~99.5% passes through where the flat constant
+        // claimed 30%.
+        let on_target = estimate_cost(
+            &filter_over(expand.clone(), has_label_on("q", "Person")),
+            stats,
+        )
+        .rows;
+        let share = 1002.0 / 1007.0;
+        assert!(
+            (on_target - expand_rows * share).abs() < 1e-6,
+            "expected ~{}% pass-through on the expand target, got {on_target} of {expand_rows}",
+            share * 100.0
+        );
+        assert!(
+            on_target > expand_rows * 0.9,
+            "a label covering nearly every node must pass nearly everything through: {on_target} of \
+             {expand_rows}"
+        );
+
+        // `p` is the expand's SOURCE, still bound by the label scan below it. Resolution follows the
+        // binding through the expand, so this filter is recognised as fully redundant — a stricter
+        // answer than the population share, and the one the flat constant got most wrong.
+        let on_source =
+            estimate_cost(&filter_over(expand, has_label_on("p", "Person")), stats).rows;
+        assert!(
+            (on_source - expand_rows).abs() < 1e-9,
+            "a label the scan below already guarantees must remove nothing: {on_source} of \
+             {expand_rows}"
         );
     }
 
