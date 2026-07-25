@@ -24,6 +24,12 @@
 //!   `Filter(pred) ▸ Expand(a)-[r]->(b) ▸ scan(a)`. When a `MATCH` follows existing clauses, its
 //!   leading scan is joined to the prior plan with [`Apply`](LogicalOp::Apply) over an
 //!   [`Argument`](LogicalOp::Argument) so the new pattern is correlated with the carried bindings.
+//!   **The anchor is the part's written leading node unless the plan so far already binds a *later*
+//!   node of that same part**, in which case the traversal starts there and walks out — backwards to
+//!   the leading node (mirroring each arrow) and then forwards (`rmp` task #862; see
+//!   [`choose_anchor_index`] for the soundness argument and the two cases it declines). Anchoring on
+//!   a bound node turns what would be a cartesian join plus a connection check into a plain
+//!   traversal of that node's incidence.
 //! - **`OPTIONAL MATCH`** lowers with **left-outer** semantics: the optional pattern is planned on
 //!   the right of an [`Apply`](LogicalOp::Apply), wrapped in [`Optional`](LogicalOp::Optional) so
 //!   the outer row survives even with no match (the new variables become `NULL`). See
@@ -59,8 +65,8 @@
 //!
 //! # Normalisation
 //!
-//! The planner applies exactly one conservative rewrite, **inline-predicate hoisting**, and is
-//! careful to *not* apply it where it would change semantics:
+//! The planner applies two conservative rewrites — **inline-predicate hoisting** and **bound-node
+//! anchoring** — and is careful to *not* apply either where it would change semantics:
 //!
 //! - **Inline-property-map predicates** on a `MATCH` node/relationship pattern (`MATCH (n {k: v})`)
 //!   are lowered into an explicit [`Filter`](LogicalOp::Filter) on the equality `n.k = v`, placed
@@ -74,6 +80,11 @@
 //!   `MATCH` (across the whole pattern), so it stays above the full pattern's scans/expands. This
 //!   keeps the one rewrite obviously sound; aggressive predicate pushdown and join reordering are
 //!   deferred to the Phase 2 cost-based optimiser (`00-overview`).
+//! - **Bound-node anchoring** ([`choose_anchor_index`], `rmp` task #862) is the second rewrite. It
+//!   changes only *which end* of a pattern part the traversal starts from, never which rows it
+//!   produces: the walk crosses the same links over the same relationship set, with each backward
+//!   hop's arrow mirrored, and every inline predicate still lands on the operator that binds its
+//!   entity.
 //!
 //! # Covered vs deferred (named)
 //!
@@ -100,9 +111,9 @@ use crate::ast::{
     BinaryOp, CallSubqueryClause, Clause, CreateClause, DeleteClause, Expr, ExprKind,
     ForeachClause, LabelExpr, Literal, LoadCsvClause, MatchClause, MergeAction, MergeClause,
     NodePattern, PatternChainLink, PatternElement, PatternPart, PatternPartKind, ProjectionBody,
-    ProjectionItem, QppInfo, Query, QueryBody, RelType, RelationshipPattern, RemoveClause,
-    RemoveItem, SetClause, SetItem, SingleQuery, StandaloneCall, StandaloneYield, UnionPart,
-    UnwindClause,
+    ProjectionItem, QppInfo, Query, QueryBody, RelDirection, RelType, RelationshipPattern,
+    RemoveClause, RemoveItem, SetClause, SetItem, SingleQuery, StandaloneCall, StandaloneYield,
+    UnionPart, UnwindClause,
 };
 use crate::function_registry;
 use crate::lexer::Span;
@@ -413,7 +424,7 @@ impl Planner {
 
     /// Required (non-optional) `MATCH`: lower the pattern over the prior plan, then `WHERE`.
     fn lower_required_match(&mut self, m: &MatchClause, current: Option<LogicalOp>) -> LogicalOp {
-        let mut plan = self.lower_pattern_parts(&m.pattern, current);
+        let mut plan = self.lower_pattern_parts(&m.pattern, current, m.where_clause.as_ref());
         if let Some(pred) = &m.where_clause {
             plan = push_where_onto_scans(plan, pred);
         }
@@ -440,7 +451,7 @@ impl Planner {
         };
 
         // Plan the optional pattern correlated with the carried bindings, then its WHERE.
-        let mut rhs = self.lower_pattern_parts(&m.pattern, Some(argument));
+        let mut rhs = self.lower_pattern_parts(&m.pattern, Some(argument), m.where_clause.as_ref());
         if let Some(pred) = &m.where_clause {
             rhs = LogicalOp::Filter {
                 input: Box::new(rhs),
@@ -471,6 +482,7 @@ impl Planner {
         &mut self,
         parts: &[PatternPart],
         current: Option<LogicalOp>,
+        where_clause: Option<&Expr>,
     ) -> LogicalOp {
         let mut plan = current;
         // Relationship variables bound so far by **this** MATCH pattern, threaded across the
@@ -479,7 +491,7 @@ impl Planner {
         // MATCH keeps cross-clause reuse legal).
         let mut pattern_rels: Vec<Var> = Vec::new();
         for part in parts {
-            plan = Some(self.lower_pattern_part(part, plan, &mut pattern_rels));
+            plan = Some(self.lower_pattern_part(part, plan, &mut pattern_rels, where_clause));
         }
         plan.unwrap_or(LogicalOp::Empty)
     }
@@ -495,13 +507,18 @@ impl Planner {
         part: &PatternPart,
         current: Option<LogicalOp>,
         pattern_rels: &mut Vec<Var>,
+        where_clause: Option<&Expr>,
     ) -> LogicalOp {
         if part.kind != PatternPartKind::Normal {
             return self.lower_shortest_path_part(part, current);
         }
         let element = &part.element;
+        // Where the traversal starts: the written leading node, or an already-bound *later* node of
+        // this same part (`rmp` task #862 — see [`choose_anchor_index`] for why and when).
+        let anchor_idx = choose_anchor_index(part, current.as_ref(), where_clause);
+        let anchor_node = part_node_at(element, anchor_idx);
         // The anchor node: scan it unless `current` already binds it, then filter on inline props.
-        let anchor_var = self.node_var(&element.start);
+        let anchor_var = self.node_var(anchor_node);
         // Whether the anchor is **reused** from a prior plan (already bound). A reused anchor is not
         // re-scanned, so its inline labels are *not* applied by `scan_node` and must be enforced by a
         // `HasLabels` filter below (`MATCH (a)-[r]->() WITH a MATCH (a:X)-[r]->()`, TCK `Match3` [25]).
@@ -519,7 +536,7 @@ impl Planner {
                 plan
             }
             Some(plan) => {
-                let mut scan = self.scan_node(&element.start, &anchor_var);
+                let mut scan = self.scan_node(anchor_node, &anchor_var);
                 let args = collect_bound_vars(&plan);
                 // Push this fresh component's inline property map onto its OWN scan, *below* the
                 // `Apply`, so the physical planner's index selection (which only fires on a `Filter`
@@ -533,10 +550,10 @@ impl Planner {
                 // `UNWIND $rows AS r MATCH (y:L {k: r.k})` must keep its filter above the join) nor an
                 // opaque subquery scope. Otherwise the inline filter stays above the `Apply` (applied
                 // below via `filter_inline_props`).
-                if props_pushable_onto_fresh_scan(element.start.properties.as_ref(), &args) {
+                if props_pushable_onto_fresh_scan(anchor_node.properties.as_ref(), &args) {
                     scan = self.filter_inline_props(
                         scan,
-                        element.start.properties.as_ref(),
+                        anchor_node.properties.as_ref(),
                         &anchor_var,
                     );
                     props_pushed = true;
@@ -548,25 +565,32 @@ impl Planner {
                     right: Box::new(scan),
                 }
             }
-            None => self.scan_node(&element.start, &anchor_var),
+            None => self.scan_node(anchor_node, &anchor_var),
         };
         // A reused anchor's inline labels were not applied by a scan; enforce them here so an added
         // label predicate on an already-bound node actually filters (`Match3` [25]).
         if anchor_reused {
-            plan = self.filter_inline_labels(plan, &element.start, &anchor_var);
+            plan = self.filter_inline_labels(plan, anchor_node, &anchor_var);
         }
         // Apply the anchor's inline property map above `plan` unless it was already pushed onto the
         // fresh scan above. For the leading anchor (`None`) this `Filter` sits directly over the
         // scan, so index selection still reaches it; for a reused anchor it sits above the shared
         // binding (as it must).
         if !props_pushed {
-            plan = self.filter_inline_props(plan, element.start.properties.as_ref(), &anchor_var);
+            plan = self.filter_inline_props(plan, anchor_node.properties.as_ref(), &anchor_var);
         }
 
-        // Each chain link: expand to the next node, then filter the link's inline props.
-        let mut from = anchor_var.clone();
+        // Each hop of the traversal: expand to the next node, then filter the link's inline props.
+        // The hops are the part's chain links walked out from the anchor — with `anchor_idx == 0`
+        // (the default) exactly the written left-to-right order, so this is the historical lowering.
+        let mut node_vars: Vec<Option<Var>> = vec![None; element.chain.len() + 1];
+        node_vars[anchor_idx] = Some(anchor_var.clone());
         let mut step_rels = Vec::with_capacity(element.chain.len());
-        for link in &element.chain {
+        for hop in part_traversal(element, anchor_idx) {
+            let link = &element.chain[hop.link];
+            let from = node_vars[hop.from]
+                .clone()
+                .expect("INVARIANT: a hop's source node is bound by the anchor or an earlier hop");
             // A quantified path pattern link lowers to a dedicated repetition operator that binds the
             // interior variables as group lists; it is not an ordinary single-hop expand.
             if let Some(qpp) = &link.qpp {
@@ -577,18 +601,29 @@ impl Planner {
                 // links, and stand in for the (possibly named) path's step relationships.
                 pattern_rels.push(group_rel.clone());
                 step_rels.push(group_rel);
-                from = boundary_var;
+                node_vars[hop.to] = Some(boundary_var);
                 continue;
             }
             let rel_var = self.rel_var(&link.relationship);
-            let to_var = self.node_var(&link.node);
+            // The node this hop reaches — the link's written far endpoint on a forward hop, the
+            // *previous* node on a backward one. Minted once per position and cached, so a position
+            // revisited by a later hop (a cycle in the pattern) reuses the same binding.
+            let to_node = part_node_at(element, hop.to);
+            let to_var = match node_vars[hop.to].clone() {
+                Some(v) => v,
+                None => {
+                    let v = self.node_var(to_node);
+                    node_vars[hop.to] = Some(v.clone());
+                    v
+                }
+            };
             let is_var_length = link.relationship.range.is_some();
             plan = LogicalOp::Expand {
                 input: Box::new(plan),
                 from: from.clone(),
                 relationship: rel_var.clone(),
                 to: to_var.clone(),
-                direction: link.relationship.direction,
+                direction: hop.direction,
                 types: link.relationship.types.clone(),
                 range: link.relationship.range,
                 // Every relationship already bound by this pattern must not be re-traversed.
@@ -625,14 +660,13 @@ impl Planner {
                     };
                 }
             }
-            plan = self.filter_inline_props(plan, link.node.properties.as_ref(), &to_var);
+            plan = self.filter_inline_props(plan, to_node.properties.as_ref(), &to_var);
             // The target node's inline labels (`(a)-[r]->(b:X)`) constrain `b` to entities carrying
             // all listed labels. The anchor's labels are handled by its scan (`scan_node`), but an
             // expand target is reached through the relationship, never scanned, so its labels must be
             // applied here as a `HasLabels` filter (`WithOrderBy4` [15] regression guard).
-            plan = self.filter_inline_labels(plan, &link.node, &to_var);
+            plan = self.filter_inline_labels(plan, to_node, &to_var);
             step_rels.push(rel_var);
-            from = to_var;
         }
         // A named path (`p = …`) binds the path value over the part's traversal variables.
         if let Some(v) = &part.var {
@@ -2381,6 +2415,191 @@ fn push_unique(out: &mut Vec<Var>, var: Var) {
 /// shared binding, not a re-scan).
 fn plan_binds(plan: &LogicalOp, var: &Var) -> bool {
     collect_bound_vars(plan).iter().any(|v| v.name == var.name)
+}
+
+// =================================================================================================
+// Pattern-part traversal order (`rmp` task #862)
+// =================================================================================================
+
+/// The node pattern at position `idx` of a pattern element: `0` is the element's written leading
+/// node, and `i + 1` is the node reached by chain link `i`.
+///
+/// # Panics
+///
+/// Panics if `idx > element.chain.len()` — the caller derives every index from the chain length.
+fn part_node_at(element: &PatternElement, idx: usize) -> &NodePattern {
+    if idx == 0 {
+        &element.start
+    } else {
+        &element.chain[idx - 1].node
+    }
+}
+
+/// The direction a chain link is traversed when walked **backwards** — from the node it reaches
+/// towards the node it starts at.
+///
+/// A directed link swaps its arrow; an undirected link is symmetric and keeps it. This mirrors the
+/// physical planner's expand reversal (`rmp` task #366) and rests on the same fact: a directed edge
+/// `a → b` is the *same* relationship whether it is enumerated as `a`'s outgoing incidence or `b`'s
+/// incoming one, so reversing the walk binds the identical `{from, relationship, to}` entities.
+const fn reversed_direction(direction: RelDirection) -> RelDirection {
+    match direction {
+        RelDirection::LeftToRight => RelDirection::RightToLeft,
+        RelDirection::RightToLeft => RelDirection::LeftToRight,
+        RelDirection::Undirected => RelDirection::Undirected,
+    }
+}
+
+/// Whether `predicate` contains a conjunct that constrains a **property of `variable`**
+/// (`rmp` task #862) — the signal that the variable has a selective access path worth keeping.
+///
+/// Deliberately coarse and conservative: it looks through `AND` conjunctions for any comparison,
+/// string predicate, `IN`, or `IS [NOT] NULL` whose operand is `variable.<prop>`, and answers `true`
+/// on the first hit. A false positive only declines a rewrite (keeping today's plan); a false
+/// negative would risk the regression the rewrite is gated against, so the test errs towards `true`.
+fn predicate_constrains_property_of(predicate: &Expr, variable: &str) -> bool {
+    /// Is `expr` a property access rooted at `variable`?
+    fn is_property_of(expr: &Expr, variable: &str) -> bool {
+        match &expr.kind {
+            ExprKind::Property { base, .. } => {
+                matches!(&base.kind, ExprKind::Variable(v) if v == variable)
+            }
+            _ => false,
+        }
+    }
+    match &predicate.kind {
+        ExprKind::Binary {
+            op: BinaryOp::And,
+            lhs,
+            rhs,
+        } => {
+            predicate_constrains_property_of(lhs, variable)
+                || predicate_constrains_property_of(rhs, variable)
+        }
+        ExprKind::Binary { lhs, rhs, .. } => {
+            is_property_of(lhs, variable) || is_property_of(rhs, variable)
+        }
+        ExprKind::Predicate { operand, .. } => is_property_of(operand, variable),
+        _ => false,
+    }
+}
+
+/// One hop of a pattern part's traversal, in the order the plan walks it (`rmp` task #862).
+struct PartHop {
+    /// Index into [`PatternElement::chain`] of the link this hop traverses.
+    link: usize,
+    /// Position of the node the hop starts from (already bound when the hop runs).
+    from: usize,
+    /// Position of the node the hop reaches.
+    to: usize,
+    /// The direction to traverse — the link's written direction on a forward hop, its mirror on a
+    /// backward one ([`reversed_direction`]).
+    direction: RelDirection,
+}
+
+/// The hops of `element` walked out from the node at position `anchor`: **backwards** to the leading
+/// node first, then **forwards** to the trailing node.
+///
+/// With `anchor == 0` (the default) there are no backward hops and this is exactly the written
+/// left-to-right order — the lowering the planner has always produced, hop for hop.
+fn part_traversal(element: &PatternElement, anchor: usize) -> Vec<PartHop> {
+    let mut hops = Vec::with_capacity(element.chain.len());
+    for i in (0..anchor).rev() {
+        hops.push(PartHop {
+            link: i,
+            from: i + 1,
+            to: i,
+            direction: reversed_direction(element.chain[i].relationship.direction),
+        });
+    }
+    for i in anchor..element.chain.len() {
+        hops.push(PartHop {
+            link: i,
+            from: i,
+            to: i + 1,
+            direction: element.chain[i].relationship.direction,
+        });
+    }
+    hops
+}
+
+/// Picks the position of the pattern part's **anchor** — the node its traversal starts from
+/// (`rmp` task #862).
+///
+/// The default is the written leading node (`0`). When the plan so far does **not** bind the leading
+/// node but *does* bind a later node of the same part, that node is chosen instead.
+///
+/// # Why
+///
+/// Anchoring on the written leading node when a later node is already bound plans the part as a
+/// fresh scan joined to the existing plan by a (cartesian) `Apply`, with the shared node degenerating
+/// into a connection check. Measured on a 200k `USER` / 2k `ARTICLE` / 3M `LIKES` store:
+/// `MATCH (u:USER)-[:LIKES]->(a:ARTICLE), (v:USER)-[:LIKES]->(a) WHERE u.uidn = 1` took **7.73 s**
+/// that way, against **0.025 s** for the identical query written as one chain — the same 10 055 rows.
+/// Expanding from the bound node is a traversal of that node's incidence; scanning the label and
+/// connecting afterwards is the whole label crossed with the driving rows.
+///
+/// # Soundness
+///
+/// The re-anchored walk visits the *same* chain links over the *same* relationship set, only from the
+/// other end, with each backward hop's arrow mirrored ([`reversed_direction`]). It binds the identical
+/// variables to the identical entities, and every inline predicate still lands on the operator that
+/// binds its entity, so the result bag is unchanged.
+///
+/// Only **named** nodes are considered: an anonymous node can never have been bound by an earlier
+/// clause, and probing one would mint a synthetic variable as a side effect and perturb the anonymous
+/// numbering of every plan.
+///
+/// # When it is declined
+///
+/// Re-anchoring costs the leading node its **own access path**: in the written lowering that node is
+/// scanned (and the physical planner may turn its predicate into an index seek), whereas the
+/// re-anchored walk reaches it through the relationship. That trade is a clear win when the leading
+/// node is unconstrained, and it can be a clear *loss* when the leading node carries a selective
+/// predicate — expanding a high-degree bound node backwards to find one indexed row is worse than
+/// seeking that row and checking the connection. Until the cost-based anchor search (`rmp` task #858)
+/// can decide this by estimate, the rule declines whenever the leading node is constrained at all:
+///
+/// * the leading node carries an **inline property map** (`(v {name: 'x'})-[…]->(a)`), or
+/// * the enclosing `MATCH`'s **`WHERE`** compares a **property of the leading node** — the same
+///   constraint written the other way.
+///
+/// It is also declined, unconditionally, for:
+///
+/// * a part binding a **named path** — [`NamedPath`](LogicalOp::NamedPath) records the path's start
+///   and its steps in *written* order, which a re-anchored walk no longer produces;
+/// * a part containing a **quantified path pattern** — a QPP's interior repetition is not reversible
+///   by mirroring one arrow.
+fn choose_anchor_index(
+    part: &PatternPart,
+    current: Option<&LogicalOp>,
+    where_clause: Option<&Expr>,
+) -> usize {
+    let Some(plan) = current else { return 0 };
+    if part.var.is_some() || part.element.chain.iter().any(|l| l.qpp.is_some()) {
+        return 0;
+    }
+    // The leading node keeps its scan when it is constrained (see "When it is declined").
+    if part.element.start.properties.is_some() {
+        return 0;
+    }
+    if let (Some(pred), Some(lead)) = (where_clause, part.element.start.variable.as_ref()) {
+        if predicate_constrains_property_of(pred, &lead.name) {
+            return 0;
+        }
+    }
+    let bound = collect_bound_vars(plan);
+    let is_bound = |node: &NodePattern| {
+        node.variable
+            .as_ref()
+            .is_some_and(|v| bound.iter().any(|b| b.name == v.name))
+    };
+    if is_bound(&part.element.start) {
+        return 0;
+    }
+    (1..=part.element.chain.len())
+        .find(|&i| is_bound(part_node_at(&part.element, i)))
+        .unwrap_or(0)
 }
 
 /// Collects the variables a (sub)plan binds, in a stable order (the order they are introduced,

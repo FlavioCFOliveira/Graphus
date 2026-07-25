@@ -930,3 +930,147 @@ fn display_is_deterministic_for_the_same_query() {
     let b = rendered("MATCH (n:Person) WHERE n.age > 18 RETURN n.name AS name");
     assert_eq!(a, b);
 }
+
+// =================================================================================================
+// Anchoring a pattern part on an already-bound node (`rmp` task #862)
+// =================================================================================================
+//
+// A pattern part whose *leading* node is unbound but which shares a *later* node with the plan so
+// far must expand from that bound node, not scan its leading label and connect afterwards. The
+// re-anchored walk traverses the same links over the same relationship set from the other end, with
+// each backward hop's arrow mirrored, so the result bag is unchanged — only the access path is.
+
+#[test]
+fn bound_trailing_node_anchors_the_part_instead_of_scanning_its_leading_node() {
+    // `a` is bound by the first part; the second part is written leading-node-first but must be
+    // walked from `a`, mirroring the arrow (`(v)-[:LIKES]->(a)` becomes `Expand(a)<-[…]-(v)`).
+    let r = rendered("MATCH (u)-[:LIKES]->(a), (v)-[:LIKES]->(a) RETURN v");
+    assert!(
+        r.contains("Expand(a)<-[anon_1:LIKES]-(v)"),
+        "second part must expand backwards from the bound `a`, got:\n{r}"
+    );
+    // ... and `v` is therefore never scanned, so no cartesian Apply is introduced for this part.
+    assert!(
+        !r.contains("AllNodesScan(v)"),
+        "the re-anchored part must not scan its leading node, got:\n{r}"
+    );
+    assert!(
+        !r.contains("Apply"),
+        "a part sharing a bound node is a traversal, not a correlated join, got:\n{r}"
+    );
+}
+
+#[test]
+fn bound_middle_node_anchors_the_part_and_walks_both_ways() {
+    // `b` sits in the MIDDLE of the second part: the walk goes backwards to `c` (arrow mirrored)
+    // and then forwards to `d` (arrow as written).
+    let r = rendered("MATCH (x)-[:A]->(b) MATCH (c)-[:B]->(b)-[:C]->(d) RETURN d");
+    assert!(
+        r.contains("Expand(b)<-[anon_1:B]-(c)"),
+        "backward hop must mirror the written arrow, got:\n{r}"
+    );
+    assert!(
+        r.contains("Expand(b)-[anon_2:C]->(d)"),
+        "forward hop resumes at the anchor and keeps the written arrow, got:\n{r}"
+    );
+    assert!(
+        !r.contains("AllNodesScan(c)"),
+        "the re-anchored part must not scan its leading node, got:\n{r}"
+    );
+}
+
+#[test]
+fn undirected_link_walked_backwards_stays_undirected() {
+    // An undirected link is symmetric: mirroring it is a no-op, so the rendering keeps `-[…]-`.
+    let r = rendered("MATCH (u)-[:LIKES]->(a), (v)-[:KNOWS]-(a) RETURN v");
+    assert!(
+        r.contains("Expand(a)-[anon_1:KNOWS]-(v)"),
+        "an undirected backward hop keeps its direction, got:\n{r}"
+    );
+}
+
+#[test]
+fn leading_node_already_bound_still_reuses_it_unchanged() {
+    // The historical case: when the LEADING node is the shared one, nothing changes.
+    let r = rendered("MATCH (u)-[:LIKES]->(a), (a)-[:TAGGED]->(t) RETURN t");
+    assert!(
+        r.contains("Expand(a)-[anon_1:TAGGED]->(t)"),
+        "a bound leading node keeps the written forward walk, got:\n{r}"
+    );
+    assert!(!r.contains("AllNodesScan(a)"), "no re-scan of `a`:\n{r}");
+}
+
+#[test]
+fn named_path_part_declines_reanchoring() {
+    // `NamedPath` records the path's start and steps in WRITTEN order, which a re-anchored walk no
+    // longer produces — so a part binding a path variable keeps the leading-node anchor.
+    let r = rendered("MATCH (u)-[:LIKES]->(a) MATCH p = (v)-[:LIKES]->(a) RETURN p");
+    assert!(
+        r.contains("NamedPath(p = v,"),
+        "the named path must still start at the written leading node, got:\n{r}"
+    );
+    assert!(
+        r.contains("AllNodesScan(v)"),
+        "declining re-anchoring keeps the leading-node scan, got:\n{r}"
+    );
+}
+
+#[test]
+fn quantified_path_part_declines_reanchoring() {
+    // A QPP's interior repetition is not reversible by mirroring one arrow, so a part containing one
+    // keeps the leading-node anchor.
+    let r = rendered("MATCH (u)-[:LIKES]->(a) MATCH (v) ((s)-[:R]->(e)){1,2} (a) RETURN v");
+    assert!(
+        r.contains("AllNodesScan(v)"),
+        "a QPP part keeps its written anchor, got:\n{r}"
+    );
+}
+
+#[test]
+fn disconnected_part_still_lowers_to_a_correlated_apply() {
+    // A genuinely disconnected component shares no node, so it keeps the fresh scan + Apply.
+    let r = rendered("MATCH (u:A)-[:LIKES]->(a:B), (x:C)-[:R]->(y:D) RETURN x");
+    assert!(
+        r.contains("Apply"),
+        "a disconnected part is still a correlated join, got:\n{r}"
+    );
+    assert!(
+        r.contains("NodeByLabelScan(x:C)"),
+        "a disconnected part still scans its leading node, got:\n{r}"
+    );
+}
+
+#[test]
+fn constrained_leading_node_declines_reanchoring_inline_map() {
+    // The leading node of the second part carries an inline property map, so it keeps its own scan
+    // (which the physical planner can turn into an index seek). Expanding backwards from the bound
+    // node to find one selective row would be the worse plan, and the cost-based anchor search
+    // (`rmp` #858) is what will decide this by estimate.
+    let r = rendered("MATCH (u)-[:LIKES]->(a), (v {uidn: 2})-[:LIKES]->(a) RETURN v");
+    assert!(
+        r.contains("AllNodesScan(v)"),
+        "a constrained leading node keeps its scan, got:\n{r}"
+    );
+}
+
+#[test]
+fn constrained_leading_node_declines_reanchoring_where_clause() {
+    // The same constraint written as a WHERE on the enclosing MATCH must decline identically —
+    // otherwise the rewrite would depend on which of two equivalent spellings the user chose.
+    let r = rendered("MATCH (u)-[:LIKES]->(a), (v)-[:LIKES]->(a) WHERE v.uidn = 2 RETURN v");
+    assert!(
+        r.contains("AllNodesScan(v)"),
+        "a WHERE-constrained leading node keeps its scan, got:\n{r}"
+    );
+}
+
+#[test]
+fn where_on_another_variable_does_not_block_reanchoring() {
+    // Only a constraint on the *leading node of the re-anchored part* blocks the rewrite; a WHERE
+    // about some other variable must not suppress it.
+    let r = rendered("MATCH (u)-[:LIKES]->(a), (v)-[:LIKES]->(a) WHERE u.uidn = 1 RETURN v");
+    assert!(
+        r.contains("Expand(a)<-[anon_1:LIKES]-(v)"),
+        "an unconstrained leading node still re-anchors, got:\n{r}"
+    );
+}
