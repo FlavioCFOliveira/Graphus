@@ -212,6 +212,66 @@ pub(crate) fn total_relationships(stats: Option<&dyn Statistics>) -> f64 {
     })
 }
 
+/// The average number of relationships of the given `types` a node carrying `anchor_label` traverses
+/// in `direction` — the **directional** degree (`rmp` task #886), or `None` to request the graph-wide
+/// fallback.
+///
+/// A single graph-wide degree per type makes both ends of a relationship look identical. Measured on the
+/// evaluation store: `LIKES` yields an estimated degree of 9.7 from *any* anchor, while the true
+/// out-degree is about 10 from a `USER` and about 333 from an `ARTICLE`. A cost-based planner given
+/// symmetric degrees cannot tell a selective anchor from a fan-out one, so it compares candidate plans
+/// blindly — which is why this exists and why the counters of `rmp` task #856 were built.
+///
+/// The projection read follows the direction, and this is the whole point of the pair being directional:
+/// a `LeftToRight` hop walks out of the anchor, so the anchor is the relationship's **start**
+/// (`(label, type)`); a `RightToLeft` hop walks into it, so the anchor is the **end** (`(type, label)`);
+/// an undirected hop walks both, so the two are summed.
+///
+/// Returns `None` — meaning "fall back to the graph-wide degree" — when: there are no statistics, the
+/// anchor's label is unresolved, the anchor's label population is unknown or empty, or the store carries
+/// no directional counters (a catalogue predating them, or one never backfilled). A `None` from the seam
+/// is emphatically not a zero: reading it as one would estimate a fan-out of nothing.
+///
+/// With several `types` the per-type counters are summed, which is exact — a relationship has exactly
+/// one type, so the type alternatives partition the edges walked.
+pub(crate) fn directional_degree(
+    anchor_label: Option<&str>,
+    types: &[crate::ast::RelType],
+    direction: crate::ast::RelDirection,
+    stats: Option<&dyn Statistics>,
+) -> Option<f64> {
+    use crate::ast::RelDirection;
+    let stats = stats?;
+    let label = anchor_label?;
+    // An untyped expand has no per-type counter to read; the graph-wide average degree already covers
+    // it and is what the caller falls back to.
+    if types.is_empty() {
+        return None;
+    }
+    let mut edges = 0.0;
+    for t in types {
+        let per_type = match direction {
+            RelDirection::LeftToRight => stats.rels_from_label_with_type(label, &t.name)?,
+            RelDirection::RightToLeft => stats.rels_with_type_to_label(&t.name, label)?,
+            // Both sides are walked, so both projections contribute. A self-loop is counted by each,
+            // which is correct: an undirected traversal really can leave along it either way.
+            RelDirection::Undirected => {
+                stats.rels_from_label_with_type(label, &t.name)?
+                    + stats.rels_with_type_to_label(&t.name, label)?
+            }
+        };
+        edges += per_type as f64;
+    }
+    // Per-anchor degree, so the denominator is the anchor label's population — not the graph's.
+    let population = stats.nodes_with_label(label)? as f64;
+    if population <= 0.0 {
+        // No node carries the label: there is no per-anchor degree to speak of, and dividing would be
+        // undefined. The caller's graph-wide fallback is the honest answer.
+        return None;
+    }
+    Some(edges / population)
+}
+
 /// The number of nodes carrying `label`: the exact per-label count when statistics know it, otherwise
 /// a documented fraction of the total ([`DEFAULT_LABEL_SELECTIVITY`]).
 ///
@@ -331,34 +391,44 @@ fn estimate(op: &LogicalOp, stats: Option<&dyn Statistics>) -> f64 {
 
         // ---- graph --------------------------------------------------------------------------------
 
-        // Expand multiplies the input by an average degree. When types are listed and known, the
-        // degree is refined to (sum of those types' counts) / total_nodes; otherwise the graph-wide
-        // average degree. For a variable-length range we compound by degree^(avg path length),
-        // clamping an open upper bound (see `average_path_length`) so the result stays finite.
+        // Expand multiplies the input by a degree. Preferred is the **directional** degree for this
+        // anchor's own label, type and direction (`rmp` task #886) — without it both ends of a
+        // relationship look identical and the planner cannot tell a selective anchor from a fan-out one.
+        // Failing that (no anchor label bound on the input, no directional counters in the catalogue, or
+        // an untyped hop) the graph-wide degree: refined to (sum of those types' counts) / total_nodes
+        // when types are listed and known, else the plain average. For a variable-length range we
+        // compound by degree^(avg path length), clamping an open upper bound (see `average_path_length`)
+        // so the result stays finite.
         LogicalOp::Expand {
             input,
+            from,
             types,
             range,
+            direction,
             ..
         } => {
             let input_rows = estimate(input, stats);
             let nodes = total_nodes(stats).max(1.0);
-            let degree = if types.is_empty() {
-                average_degree(stats)
-            } else {
-                let typed_rels: f64 = types
-                    .iter()
-                    .map(|t| {
-                        stats
-                            .and_then(|s| s.relationships_with_type(&t.name))
-                            .map(|c| c as f64)
-                            .unwrap_or_else(|| {
-                                total_relationships(stats) * DEFAULT_LABEL_SELECTIVITY
+            let anchor_label = label_for_var(input, &from.name);
+            let degree = directional_degree(anchor_label.as_deref(), types, *direction, stats)
+                .unwrap_or_else(|| {
+                    if types.is_empty() {
+                        average_degree(stats)
+                    } else {
+                        let typed_rels: f64 = types
+                            .iter()
+                            .map(|t| {
+                                stats
+                                    .and_then(|s| s.relationships_with_type(&t.name))
+                                    .map(|c| c as f64)
+                                    .unwrap_or_else(|| {
+                                        total_relationships(stats) * DEFAULT_LABEL_SELECTIVITY
+                                    })
                             })
-                    })
-                    .sum();
-                typed_rels / nodes
-            };
+                            .sum();
+                        typed_rels / nodes
+                    }
+                });
             match range {
                 None => input_rows * degree,
                 Some(r) => {

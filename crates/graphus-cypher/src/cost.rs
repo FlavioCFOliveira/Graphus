@@ -450,12 +450,14 @@ pub fn estimate_cost(op: &PhysicalOp, stats: Option<&dyn Statistics>) -> CostEst
         // and pays one edge-cost per emitted edge — every edge it walks is an edge it emits.
         PhysicalOp::ExpandAll {
             input,
+            from,
             types,
             range,
+            direction,
             ..
         } => {
             let inner = estimate_cost(input, stats);
-            let degree = typed_degree(types, stats);
+            let degree = anchored_degree(input, from, types, *direction, stats);
             let rows = match range {
                 None => inner.rows * degree,
                 Some(r) => inner.rows * degree.powf(average_path_length(r)),
@@ -472,23 +474,30 @@ pub fn estimate_cost(op: &PhysicalOp, stats: Option<&dyn Statistics>) -> CostEst
         // quantities here and only the rows were wrong.
         PhysicalOp::ExpandInto {
             input,
+            from,
+            to,
             types,
             range,
+            direction,
             ..
         } => {
             let inner = estimate_cost(input, stats);
-            let degree = typed_degree(types, stats);
+            let degree = anchored_degree(input, from, types, *direction, stats);
             // Edges the traversal actually visits — identical to the expand-all fan-out.
             let walked = match range {
                 None => inner.rows * degree,
                 Some(r) => inner.rows * degree.powf(average_path_length(r)),
             };
-            // Under the estimator's standing uniformity assumption, the chance that a walked
-            // neighbour is the specific node `to` is bound to is `1 / total_nodes`, so the emitted
-            // rows are that fraction of the edges walked. The denominator is graph-wide because the
-            // estimator has no directional degrees yet; `rmp` task #856 replaces it with the candidate
-            // count of `to`'s label, which is the accurate denominator.
-            let selected = walked / total_nodes(stats).max(1.0);
+            // Under the estimator's standing uniformity assumption, the chance that a walked neighbour
+            // is the specific node `to` is bound to is one in however many nodes `to` could be. That
+            // candidate count is the population of `to`'s label when the access path binding it states
+            // one (`rmp` task #886, which #863 recorded in-code as the accurate denominator), and the
+            // whole graph otherwise — a far looser bound, since a labelled `to` is a much smaller
+            // haystack than every node.
+            let candidates = physical_label_for_var(input, &to.name)
+                .map(|label| label_scan_rows(&label, stats))
+                .unwrap_or_else(|| total_nodes(stats));
+            let selected = walked / candidates.max(1.0);
             // Floor a fed selection at one row (PostgreSQL's `clamp_row_est`, `costsize.c`: "force a
             // row-count estimate to a sane value ... clamp to one row" ). Without this the fraction
             // above goes sub-unitary on any sizeable graph, and because every operator costed *above*
@@ -753,6 +762,29 @@ pub fn estimate_cost(op: &PhysicalOp, stats: Option<&dyn Statistics>) -> CostEst
 /// same number as the label scan's row count (`rmp` task #864).
 fn label_scan_rows(label: &str, stats: Option<&dyn Statistics>) -> f64 {
     crate::cardinality::label_rows(label, stats)
+}
+
+/// The average number of relationships of `types` a row of `input` traverses out of anchor `from` in
+/// `direction` (`rmp` task #886).
+///
+/// Prefers the **directional** degree for the anchor's own label — the `(label, type)` or
+/// `(type, label)` counter of task #856, divided by that label's population. Falls back to the
+/// graph-wide [`typed_degree`] when the anchor's label is not stated by any access path on the input,
+/// when the catalogue carries no directional counters, or for an untyped hop (which has no per-type
+/// counter to read).
+///
+/// The fallback is what keeps the estimate *degrading* rather than failing: a plan over a database that
+/// predates the counters, or one never backfilled, is costed exactly as it was before this task.
+fn anchored_degree(
+    input: &PhysicalOp,
+    from: &Var,
+    types: &[RelType],
+    direction: crate::ast::RelDirection,
+    stats: Option<&dyn Statistics>,
+) -> f64 {
+    let anchor_label = physical_label_for_var(input, &from.name);
+    crate::cardinality::directional_degree(anchor_label.as_deref(), types, direction, stats)
+        .unwrap_or_else(|| typed_degree(types, stats))
 }
 
 /// The label that binds `variable` on this physical plan, if any access path on the spine states one.
