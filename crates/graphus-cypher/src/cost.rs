@@ -121,8 +121,11 @@ pub const COST_NL_PAIR: f64 = 1.0;
 /// Per-expanded-edge cost of an [`ExpandAll`](PhysicalOp::ExpandAll) /
 /// [`ExpandInto`](PhysicalOp::ExpandInto) traversal.
 ///
-/// `1.0` per traversed relationship: an expand's cost scales with the number of edges it walks (its
-/// output cardinality), the standard model for a neighbourhood traversal.
+/// `1.0` per traversed relationship: an expand's cost scales with the number of edges it **walks**,
+/// the standard model for a neighbourhood traversal. For an expand-**all** the edges walked are also
+/// the rows emitted, so cost and cardinality coincide; for an expand-**into** they do not — it walks
+/// the same incidence but emits only the edges landing on the already-bound `to`, so it is charged the
+/// full traversal against a much smaller output (see the `ExpandInto` arm of [`estimate_cost`]).
 pub const COST_EXPAND_EDGE: f64 = 1.0;
 
 /// Per-input-row cost of a [`Filter`](PhysicalOp::Filter) predicate evaluation.
@@ -442,15 +445,9 @@ pub fn estimate_cost(op: &PhysicalOp, stats: Option<&dyn Statistics>) -> CostEst
 
         // ---- graph traversal ----------------------------------------------------------------------
 
-        // Expand multiplies the input by the average degree (compounded over a var-length range), and
-        // pays one edge-cost per emitted edge.
+        // Expand-all multiplies the input by the average degree (compounded over a var-length range),
+        // and pays one edge-cost per emitted edge — every edge it walks is an edge it emits.
         PhysicalOp::ExpandAll {
-            input,
-            types,
-            range,
-            ..
-        }
-        | PhysicalOp::ExpandInto {
             input,
             types,
             range,
@@ -463,6 +460,48 @@ pub fn estimate_cost(op: &PhysicalOp, stats: Option<&dyn Statistics>) -> CostEst
                 Some(r) => inner.rows * degree.powf(average_path_length(r)),
             };
             CostEstimate::new(rows, inner.cost + rows * COST_EXPAND_EDGE)
+        }
+
+        // Expand-**into** has BOTH endpoints already bound, so it is a *selection*, not a fan-out: it
+        // walks the same incidence an expand-all would — and therefore pays the same traversal cost —
+        // but emits only the edges that land on the one node `to` is already bound to (`rmp` task
+        // #863). Sharing the expand-all arm, as this used to, over-estimated its **output** by the
+        // whole degree factor, and every operator costed above it inherited that error, so any plan
+        // that closes a cycle looked far more expensive than it is. Rows and cost are different
+        // quantities here and only the rows were wrong.
+        PhysicalOp::ExpandInto {
+            input,
+            types,
+            range,
+            ..
+        } => {
+            let inner = estimate_cost(input, stats);
+            let degree = typed_degree(types, stats);
+            // Edges the traversal actually visits — identical to the expand-all fan-out.
+            let walked = match range {
+                None => inner.rows * degree,
+                Some(r) => inner.rows * degree.powf(average_path_length(r)),
+            };
+            // Under the estimator's standing uniformity assumption, the chance that a walked
+            // neighbour is the specific node `to` is bound to is `1 / total_nodes`, so the emitted
+            // rows are that fraction of the edges walked. The denominator is graph-wide because the
+            // estimator has no directional degrees yet; `rmp` task #856 replaces it with the candidate
+            // count of `to`'s label, which is the accurate denominator.
+            let selected = walked / total_nodes(stats).max(1.0);
+            // Floor a fed selection at one row (PostgreSQL's `clamp_row_est`, `costsize.c`: "force a
+            // row-count estimate to a sane value ... clamp to one row" ). Without this the fraction
+            // above goes sub-unitary on any sizeable graph, and because every operator costed *above*
+            // an expand-into multiplies through that fraction, its whole sub-tree would be costed as
+            // if it were free — the exact mirror of the over-estimate #863 removes, and just as
+            // capable of steering the search wrong. Measured on a closed-triangle ring of 64 nodes:
+            // 0.72 estimated against 64 rows produced (`tests/expand_into_selectivity.rs`). An empty
+            // input still estimates empty: a selection cannot invent rows it was never fed.
+            let rows = if inner.rows >= 1.0 {
+                selected.max(1.0)
+            } else {
+                selected
+            };
+            CostEstimate::new(rows, inner.cost + walked * COST_EXPAND_EDGE)
         }
 
         // A shortest-path BFS explores up to ~degree^avg_len edges per source row but yields a single
@@ -1065,6 +1104,166 @@ mod tests {
             (estimate_cost(&token, stats).rows - estimate_cost(&person_label_scan(), stats).rows)
                 .abs()
                 < 1e-9
+        );
+    }
+
+    // ---- Expand-into is a selection, not a fan-out (`rmp` task #863) -------------------------
+
+    /// Builds an expand over `input` between `from` and `to`; `into` selects expand-into.
+    fn expand(
+        input: PhysicalOp,
+        into: bool,
+        range: Option<crate::ast::VarLengthRange>,
+    ) -> PhysicalOp {
+        let (from, relationship, to) = (Var::named("p"), Var::named("r"), Var::named("q"));
+        let types = vec![crate::ast::RelType {
+            name: "KNOWS".to_owned(),
+            span: span(),
+        }];
+        if into {
+            PhysicalOp::ExpandInto {
+                input: Box::new(input),
+                from,
+                relationship,
+                to,
+                direction: crate::ast::RelDirection::LeftToRight,
+                types,
+                range,
+                prior_rels: Vec::new(),
+                rel_props: None,
+            }
+        } else {
+            PhysicalOp::ExpandAll {
+                input: Box::new(input),
+                from,
+                relationship,
+                to,
+                direction: crate::ast::RelDirection::LeftToRight,
+                types,
+                range,
+                prior_rels: Vec::new(),
+                rel_props: None,
+            }
+        }
+    }
+
+    /// A graph with a real relationship population, so `typed_degree` is not the zero degenerate.
+    fn connected_graph() -> MemGraph {
+        let mut g = skewed_graph();
+        let a = g.add_node(["Person"], [("age", Value::Integer(9999))]);
+        let b = g.add_node(["Person"], [("age", Value::Integer(9998))]);
+        for _ in 0..500 {
+            g.add_rel("KNOWS", a, b, [("w", Value::Integer(1))]);
+        }
+        g
+    }
+
+    #[test]
+    fn expand_into_emits_far_fewer_rows_than_expand_all() {
+        // Both endpoints are bound, so an expand-into is a connection CHECK: it emits the edges that
+        // land on one specific node, not the anchor's whole fan-out. Sharing the expand-all arm made
+        // it claim the full degree, and every operator above inherited that over-estimate.
+        let g = connected_graph();
+        let stats = g.statistics();
+        let all = estimate_cost(&expand(person_label_scan(), false, None), stats);
+        let into = estimate_cost(&expand(person_label_scan(), true, None), stats);
+        assert!(
+            into.rows < all.rows,
+            "expand-into must emit fewer rows than expand-all: into={} all={}",
+            into.rows,
+            all.rows
+        );
+        // Specifically, by the uniformity assumption: one neighbour in `total_nodes` is the bound one,
+        // floored at a single row because a fed selection may not be costed as emitting nothing.
+        let expected = (all.rows / total_nodes(stats).max(1.0)).max(1.0);
+        assert!(
+            (into.rows - expected).abs() < 1e-9,
+            "into.rows should be all.rows / total_nodes, floored at 1: got {} want {expected}",
+            into.rows
+        );
+    }
+
+    #[test]
+    fn fed_expand_into_never_estimates_below_one_row() {
+        // PostgreSQL's `clamp_row_est` rule. A sub-unitary estimate here would zero out the cost of
+        // every operator above the expand-into, since they all multiply through this row count — the
+        // mirror image of the over-estimate #863 removes.
+        let g = connected_graph();
+        let into = estimate_cost(&expand(person_label_scan(), true, None), g.statistics());
+        assert!(
+            into.rows >= 1.0,
+            "a selection fed real rows must be costed as emitting at least one: {}",
+            into.rows
+        );
+    }
+
+    #[test]
+    fn unfed_expand_into_still_estimates_empty() {
+        // The floor applies to a *fed* selection only: over an empty input the operator emits nothing,
+        // and claiming a row would over-estimate every plan built on an empty branch.
+        let g = MemGraph::new(); // no nodes at all, so the label scan beneath yields zero rows
+        let stats = g.statistics();
+        let inner = estimate_cost(&person_label_scan(), stats);
+        assert!(inner.rows < 1.0, "premise: the input must be sub-unitary");
+        let into = estimate_cost(&expand(person_label_scan(), true, None), stats);
+        assert!(
+            into.rows < 1.0,
+            "an unfed selection must not be floored up to a row: {}",
+            into.rows
+        );
+    }
+
+    #[test]
+    fn expand_into_pays_the_same_traversal_cost_as_expand_all() {
+        // It walks the same incidence — only its OUTPUT is smaller. Charging it less traversal work
+        // would be the opposite error.
+        let g = connected_graph();
+        let stats = g.statistics();
+        let all = estimate_cost(&expand(person_label_scan(), false, None), stats);
+        let into = estimate_cost(&expand(person_label_scan(), true, None), stats);
+        assert!(
+            (into.cost - all.cost).abs() < 1e-9,
+            "traversal cost must match: into={} all={}",
+            into.cost,
+            all.cost
+        );
+    }
+
+    #[test]
+    fn var_length_expand_into_is_also_a_selection() {
+        let g = connected_graph();
+        let stats = g.statistics();
+        let range = Some(crate::ast::VarLengthRange {
+            min: Some(1),
+            max: Some(3),
+            exact: false,
+        });
+        let all = estimate_cost(&expand(person_label_scan(), false, range), stats);
+        let into = estimate_cost(&expand(person_label_scan(), true, range), stats);
+        assert!(
+            into.rows < all.rows,
+            "var-length into must also select down"
+        );
+        assert!(
+            (into.cost - all.cost).abs() < 1e-9,
+            "var-length into walks the same frontier"
+        );
+        assert!(into.rows.is_finite() && into.rows >= 0.0);
+    }
+
+    #[test]
+    fn expand_into_estimate_stays_finite_without_statistics() {
+        // The no-stats path must not divide by zero or produce NaN/inf.
+        let into = estimate_cost(&expand(person_label_scan(), true, None), None);
+        assert!(
+            into.rows.is_finite() && into.rows >= 0.0,
+            "rows {}",
+            into.rows
+        );
+        assert!(
+            into.cost.is_finite() && into.cost >= 0.0,
+            "cost {}",
+            into.cost
         );
     }
 

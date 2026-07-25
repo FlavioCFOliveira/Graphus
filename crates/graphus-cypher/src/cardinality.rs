@@ -202,8 +202,11 @@ pub(crate) fn total_relationships(stats: Option<&dyn Statistics>) -> f64 {
 ///
 /// `max(1, _)` guards against division by zero on an empty graph; with zero nodes the degree is
 /// simply the relationship total (a degenerate but finite value). Shared with the
-/// [cost model](crate::cost), whose `ExpandAll`/`ExpandInto` cardinality multiplies by this same
-/// degree.
+/// [cost model](crate::cost), whose `ExpandAll` cardinality multiplies by this same degree.
+/// `ExpandInto` uses the degree only for the *edges walked*: both its endpoints are already bound, so
+/// it emits the fraction of that fan-out landing on the bound `to` (`rmp` task #863). The logical
+/// `Expand` this module estimates cannot distinguish the two — the physical plan decides which
+/// specialisation applies — so the split lives in the cost model alone.
 pub(crate) fn average_degree(stats: Option<&dyn Statistics>) -> f64 {
     let nodes = total_nodes(stats).max(1.0);
     total_relationships(stats) / nodes
