@@ -735,8 +735,76 @@ fn regex_match(subject: &Value, pattern: &Value) -> EvalResult {
     let Value::String(pattern) = pattern else {
         return Ok(RowValue::NULL);
     };
-    let re = regex_full_match(pattern)?;
+    let re = regex_memoised(pattern)?;
     Ok(ternary_value(Ternary::from_bool(re.is_match(subject))))
+}
+
+/// How many distinct `=~` patterns one evaluator thread keeps compiled.
+///
+/// Four, not "as many as asked for". A statement's regex patterns come from its *text* — a literal or
+/// a parameter — so the steady state is one or two per statement, and four covers a query with several
+/// `=~` predicates without ever growing. A per-pattern cache keyed on attacker-supplied text would
+/// retain an unbounded number of compiled automata (the `regex` crate's default program size limit is
+/// 10 MiB *each*), which would trade a CPU defect for a memory one. A fixed, tiny ring cannot.
+const REGEX_MEMO_SLOTS: usize = 4;
+
+/// The longest pattern that is worth *retaining* between rows.
+///
+/// A pattern is retained by value, so the slot costs its length. 64 KiB is far above any real pattern
+/// while keeping the worst-case retention of the whole ring at 256 KiB of pattern text. A pattern
+/// longer than this still compiles and still matches — it simply is not memoised, exactly as before
+/// this task, so behaviour is unchanged and only the (already dominant) compile cost remains.
+const REGEX_MEMO_MAX_PATTERN_LEN: usize = 64 * 1024;
+
+thread_local! {
+    /// Per-thread memo of compiled `=~` patterns, most-recently-inserted last (`rmp` task #878).
+    ///
+    /// `regex_match` used to call [`regex_full_match`] — a full pattern parse plus automaton
+    /// construction — once per **row**, for a pattern that is invariant for the whole statement in
+    /// every realistic query. Measured before this memo: 365.8 ms against 8.0 ms for an equivalent
+    /// `STARTS WITH` over 20 000 rows (45.5x, about 18 µs per row, release profile).
+    ///
+    /// Thread-local for the same reason [`SUBQUERY_PLAN_CACHE`] is: the evaluator is a free function
+    /// with no per-execution handle to hang a cache on, and a [`RefCell`](std::cell::RefCell) keeps it
+    /// sound without locking because each executor thread owns its own. Sharing one across threads
+    /// would put a lock on the hottest path in the evaluator to save a handful of compilations.
+    static REGEX_MEMO: std::cell::RefCell<Vec<(String, std::rc::Rc<regex::Regex>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+
+    /// Count of [`regex_full_match`] calls that actually compiled, for the regression test that pins
+    /// "compiled once per statement, not once per row".
+    ///
+    /// A timing assertion alone could pass for the wrong reason (a fast host, a warm allocator); a
+    /// compilation count cannot. Incrementing a [`Cell`](std::cell::Cell) costs nothing next to the
+    /// automaton construction it counts.
+    static REGEX_COMPILES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Returns the compiled, anchored regex for `pattern`, compiling it at most once per thread per
+/// distinct pattern (`rmp` task #878).
+///
+/// Reached only once both operands are known to be strings, so the error and `NULL` behaviour of
+/// [`regex_match`] is unchanged: a malformed pattern still surfaces as [`EvalError::InvalidRegex`] at
+/// the same point, and a `NULL` or non-string operand still short-circuits *before* any compilation is
+/// attempted. A pattern that fails to compile is **not** memoised — there is nothing to reuse, and the
+/// error aborts the statement anyway.
+fn regex_memoised(pattern: &str) -> Result<std::rc::Rc<regex::Regex>, EvalError> {
+    REGEX_MEMO.with(|memo| {
+        if let Some((_, re)) = memo.borrow().iter().find(|(p, _)| p == pattern) {
+            return Ok(std::rc::Rc::clone(re));
+        }
+        let re = std::rc::Rc::new(regex_full_match(pattern)?);
+        if pattern.len() <= REGEX_MEMO_MAX_PATTERN_LEN {
+            let mut slots = memo.borrow_mut();
+            // Evict the oldest slot rather than clearing the ring: a query alternating between two
+            // patterns must keep both, or it would recompile on every row as if there were no memo.
+            if slots.len() >= REGEX_MEMO_SLOTS {
+                slots.remove(0);
+            }
+            slots.push((pattern.to_owned(), std::rc::Rc::clone(&re)));
+        }
+        Ok(re)
+    })
 }
 
 /// Compiles `pattern` into a [`Regex`](regex::Regex) that matches **only** when the entire haystack
@@ -767,6 +835,8 @@ fn regex_match(subject: &Value, pattern: &Value) -> EvalResult {
 ///
 /// Returns [`EvalError::InvalidRegex`] if the wrapped pattern does not compile.
 fn regex_full_match(pattern: &str) -> Result<regex::Regex, EvalError> {
+    // The single place an automaton is built, so the single place worth counting (`rmp` task #878).
+    REGEX_COMPILES.with(|n| n.set(n.get().wrapping_add(1)));
     // `\A(?:…)\z` ⇒ whole-haystack anchored, precedence-preserving (see the fn docs).
     let anchored = format!(r"\A(?:{pattern})\z");
     regex::Regex::new(&anchored).map_err(|e| EvalError::InvalidRegex {
@@ -5111,6 +5181,187 @@ mod tests {
         let digits = regex_full_match(r"\d+").expect("\\d+ is shared with Java and compiles");
         assert!(digits.is_match("2026"));
         assert!(!digits.is_match("20a6"));
+    }
+
+    // ---- `=~` pattern memoisation (`rmp` task #878) -------------------------------------------
+    //
+    // Every test below asserts on the COMPILATION COUNT, not on elapsed time. A timing assertion can
+    // pass for the wrong reason on a fast host or a warm allocator; a count of automaton builds cannot.
+    // The memo and the counter are both thread-local and each `#[test]` runs on its own thread, so the
+    // tests are isolated from one another by construction.
+
+    /// Automaton builds this thread has performed.
+    fn regex_compiles() -> u64 {
+        REGEX_COMPILES.with(std::cell::Cell::get)
+    }
+
+    /// Patterns currently retained in this thread's memo ring.
+    fn regex_memo_len() -> usize {
+        REGEX_MEMO.with(|m| m.borrow().len())
+    }
+
+    #[test]
+    fn repeated_evaluation_compiles_the_pattern_once_not_once_per_row() {
+        // The defect: `regex_match` called `regex_full_match` — a full parse plus automaton build — on
+        // every row, for a pattern fixed by the query text. Measured before the memo: 365.8 ms against
+        // 8.0 ms for an equivalent `STARTS WITH` over 20 000 rows (45.5x, ~18 µs per row).
+        let before = regex_compiles();
+        for i in 0..500 {
+            // A different SUBJECT each time, the same PATTERN — exactly the per-row shape.
+            let src = format!("'user-{i}-name' =~ 'user-.*-name'");
+            assert_eq!(evaluate(&src), Value::Boolean(true));
+        }
+        let compiled = regex_compiles() - before;
+        assert_eq!(
+            compiled, 1,
+            "the invariant pattern must compile once for 500 evaluations, not {compiled} times"
+        );
+    }
+
+    #[test]
+    fn several_patterns_in_one_statement_all_stay_memoised() {
+        // A ring that cleared itself when full would recompile on every row for a query alternating
+        // between patterns — turning the fix into a no-op for exactly the queries with several `=~`
+        // predicates. Two alternating patterns must cost two compilations in total.
+        let before = regex_compiles();
+        for i in 0..200 {
+            assert_eq!(evaluate(&format!("'a{i}' =~ 'a.*'")), Value::Boolean(true));
+            assert_eq!(evaluate(&format!("'b{i}' =~ 'b.*'")), Value::Boolean(true));
+        }
+        let compiled = regex_compiles() - before;
+        assert_eq!(
+            compiled, 2,
+            "two alternating patterns must compile twice in total, not {compiled} times"
+        );
+    }
+
+    #[test]
+    fn memo_ring_never_grows_past_its_slot_count() {
+        // The memory bound. A cache keyed on attacker-supplied pattern text would retain an unbounded
+        // number of compiled automata (the `regex` crate's default program-size limit is 10 MiB each),
+        // trading a CPU defect for a memory one. Driving far more distinct patterns than there are
+        // slots must leave the ring at its cap.
+        for i in 0..200 {
+            // Each pattern is distinct, so each is a miss.
+            assert_eq!(evaluate(&format!("'x{i}' =~ 'x{i}'")), Value::Boolean(true));
+        }
+        assert_eq!(
+            regex_memo_len(),
+            REGEX_MEMO_SLOTS,
+            "the ring must sit at its cap after 200 distinct patterns"
+        );
+    }
+
+    #[test]
+    fn oversized_pattern_is_not_retained() {
+        // A slot holds the pattern by value, so an enormous pattern would be retained by value. Above
+        // the length limit the pattern still compiles and still matches — it is simply not kept, which
+        // is precisely the pre-task behaviour and therefore cannot regress anything.
+        let long = "a".repeat(REGEX_MEMO_MAX_PATTERN_LEN + 1);
+        let subject = "a".repeat(REGEX_MEMO_MAX_PATTERN_LEN + 1);
+        let before_len = regex_memo_len();
+        let re = regex_memoised(&long).expect("a long literal pattern is still valid");
+        assert!(re.is_match(&subject), "it must still match correctly");
+        assert_eq!(
+            regex_memo_len(),
+            before_len,
+            "an oversized pattern must not occupy a slot"
+        );
+        // And a pattern just inside the limit IS retained, so the boundary is the length and nothing
+        // else — without this the test above would pass even if memoisation were broken outright.
+        let ok = "a".repeat(REGEX_MEMO_MAX_PATTERN_LEN);
+        regex_memoised(&ok).expect("a pattern at the limit compiles");
+        assert_eq!(
+            regex_memo_len(),
+            before_len + 1,
+            "a pattern at the limit must be retained"
+        );
+    }
+
+    #[test]
+    fn invalid_pattern_is_not_memoised_and_still_classifies() {
+        // A failed compile has nothing to reuse, and must not occupy a slot. The error class and its
+        // arrival point are unchanged by the memo: still `InvalidRegex`, still raised from evaluation.
+        let before_len = regex_memo_len();
+        let err = regex_memoised("(").expect_err("an unbalanced group must error");
+        assert!(matches!(err, EvalError::InvalidRegex { .. }));
+        assert_eq!(
+            regex_memo_len(),
+            before_len,
+            "a pattern that failed to compile must not be retained"
+        );
+    }
+
+    #[test]
+    fn null_and_non_string_operands_still_compile_nothing() {
+        // The short-circuit order is load-bearing: `=~` yields NULL for a null or non-string operand
+        // *before* the pattern is looked at, so `null =~ '('` is NULL rather than an error today. The
+        // memo sits behind that check, so no compilation may happen on these paths at all.
+        let before = regex_compiles();
+        assert_eq!(evaluate("null =~ '('"), Value::Null);
+        assert_eq!(evaluate("123 =~ '('"), Value::Null);
+        assert_eq!(evaluate("'abc' =~ null"), Value::Null);
+        assert_eq!(evaluate("'abc' =~ 7"), Value::Null);
+        assert_eq!(
+            regex_compiles(),
+            before,
+            "a null/non-string operand must short-circuit before any compilation"
+        );
+    }
+
+    #[test]
+    fn memoised_pattern_still_matches_exactly_as_the_uncached_one() {
+        // Reuse must not change the answer. The memo returns the SAME automaton the uncached path
+        // built, so anchoring, inline flags and the whole-string rule must all survive a cache hit —
+        // asserted on the second and later evaluations, which are the hits.
+        for _ in 0..3 {
+            assert_eq!(evaluate("'abc' =~ 'a.*'"), Value::Boolean(true));
+            assert_eq!(evaluate("'abc' =~ 'b.*'"), Value::Boolean(false));
+            assert_eq!(evaluate("'ABC' =~ '(?i)abc'"), Value::Boolean(true));
+            assert_eq!(evaluate("'abc' =~ 'a|b'"), Value::Boolean(false));
+        }
+    }
+
+    #[test]
+    fn a_whole_query_over_many_rows_compiles_its_pattern_once() {
+        // End-to-end through the executor, which is where the defect actually lived: the same
+        // statement, one `=~` predicate, many rows.
+        use crate::catalog::IndexCatalog;
+        use crate::physical::plan_physical;
+        use crate::semantics::analyze;
+
+        let mut g = MemGraph::new();
+        for i in 0..2_000 {
+            g.add_node(["P"], [("name", Value::String(format!("user-{i}-name")))]);
+        }
+        let src = "MATCH (n:P) WHERE n.name =~ 'user-1.*' RETURN count(n) AS c";
+        let toks = tokenize(src).expect("lex");
+        let ast = parse_tokens(&toks, src).expect("parse");
+        let validated = analyze(&ast).expect("analyze");
+        let plan = plan_physical(&crate::lower::lower(&validated), &IndexCatalog::empty());
+        let bound = crate::binding::bind_parameters(&plan, &Parameters::new()).expect("bind");
+
+        let before = regex_compiles();
+        let rows = crate::executor::execute(&plan, &bound, &mut g)
+            .expect("open")
+            .collect_all()
+            .expect("run");
+        let compiled = regex_compiles() - before;
+
+        // Non-vacuity: the predicate must actually have matched something, or the count of
+        // compilations would be trivially low because the pattern was never evaluated.
+        let matched = match rows[0].value("c") {
+            Value::Integer(n) => n,
+            other => panic!("expected an integer count, got {other:?}"),
+        };
+        assert!(
+            matched > 0,
+            "the predicate must match some rows, else this proves nothing"
+        );
+        assert_eq!(
+            compiled, 1,
+            "one statement over 2000 rows must compile its pattern once, not {compiled} times"
+        );
     }
 
     #[test]
