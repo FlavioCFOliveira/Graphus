@@ -3804,6 +3804,20 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         ))
     }
 
+    fn rels_from_label_with_type(&self, start_label: &str, rel_type: &str) -> Option<u64> {
+        // Exact `(startLabel, type)` directional counts (`rmp` task #856), or `None` when this
+        // catalogue holds no directional projections at all — see `store_statistics`.
+        crate::store_statistics::rels_from_label_with_type(
+            &self.store.borrow(),
+            start_label,
+            rel_type,
+        )
+    }
+
+    fn rels_with_type_to_label(&self, rel_type: &str, end_label: &str) -> Option<u64> {
+        crate::store_statistics::rels_with_type_to_label(&self.store.borrow(), rel_type, end_label)
+    }
+
     fn estimate_nodes_label_property_eq(
         &self,
         label: &str,

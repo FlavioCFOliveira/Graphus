@@ -364,6 +364,17 @@ struct PendingGcPrune {
     writers: Vec<TxnId>,
 }
 
+/// Both **directional** relationship-count projections of `rmp` task #856:
+/// `(by_start_label_type, by_type_end_label)`, keyed `(startLabelToken, typeToken)` and
+/// `(typeToken, endLabelToken)` respectively.
+///
+/// The return shape of [`RecordStore::recount_directional_rel_counts`], named so the pair reads as one
+/// thing rather than as two anonymous maps whose key orders are easy to transpose.
+pub type DirectionalRelCounts = (
+    std::collections::BTreeMap<(u32, u32), u64>,
+    std::collections::BTreeMap<(u32, u32), u64>,
+);
+
 /// A record store with index-free adjacency, over a buffer pool and the ARIES WAL.
 ///
 /// `RecordStore` is generic over the block device `D` and the WAL log sink `S` so it runs over
@@ -4033,8 +4044,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // bit. Reorder these and an off-thread reader can trust an uncommitted word (a dirty read).
         self.track_label_history(id, txn, old_labels, new_labels, node.mvcc.created_ts);
         self.write_node(id, &node, txn)?;
-        // Adjust the per-label counts by the membership delta of this live node (`rmp` task #79).
-        self.apply_label_count_delta(old_labels, new_labels);
+        // Adjust the per-label counts by the membership delta of this live node (`rmp` task #79), and
+        // re-key the directional relationship counters this node's edges contribute to (`rmp` #856).
+        self.apply_label_count_delta(id, old_labels, new_labels)?;
         Ok(())
     }
 
@@ -4043,7 +4055,7 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// decremented. A bit unchanged in both is left alone. Only inline membership bits (`0..=62`) are
     /// considered; the overflow flag is never a counted label. Call only after a successful node-label
     /// write on a **live** node, so the count tracks exactly the live nodes' contributions.
-    fn apply_label_count_delta(&mut self, old: u64, new: u64) {
+    fn apply_label_count_delta(&mut self, id: u64, old: u64, new: u64) -> Result<()> {
         // `token_ids` cannot error here: both bitmaps come from this build's inline writes (overflow
         // flag clear). The bit arithmetic isolates the changed bits without enumerating unchanged ones.
         let added = new & !old;
@@ -4058,6 +4070,65 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 self.statistics.dec_label(token_id);
             }
         }
+        if added != 0 || removed != 0 {
+            self.apply_directional_label_change(id, added, removed)?;
+        }
+        Ok(())
+    }
+
+    /// Re-keys the **directional** relationship counters (`rmp` task #856) after node `id`'s label set
+    /// gained the bits in `added` and lost those in `removed`.
+    ///
+    /// Both projections are keyed on an endpoint's labels, so changing a node's labels moves the
+    /// contribution of **every relationship incident to that node** from one key to another. There is no
+    /// cheaper formulation: the counters are per `(label, type)` pair, and only a walk of the node's
+    /// incidence chain reveals which types it participates in and on which side.
+    ///
+    /// # Cost
+    ///
+    /// **O(degree of `id`)** — a label change on a supernode walks that supernode's whole chain. This is
+    /// inherent to keeping the counters exact, and Neo4j's counts store pays the same price for the same
+    /// reason. It is charged only when the label set actually changes (an idempotent re-`SET` of a label
+    /// already present has `added == removed == 0` and is skipped by the caller), and the walk is the
+    /// single-pass `incident_rels_typed`, so each chain link is read once.
+    ///
+    /// A **self-loop** satisfies both branches below and is therefore counted on both sides, matching
+    /// how [`apply_directional_rel_counts`](Self::apply_directional_rel_counts) created it.
+    ///
+    /// # Errors
+    /// Propagates a chain-walk failure. A walk that fails leaves the counters partially adjusted, which
+    /// is why the caller performs it *after* the node write has succeeded and why the whole `Statistics`
+    /// is reverted wholesale by `reload_catalog` on rollback.
+    fn apply_directional_label_change(&mut self, id: u64, added: u64, removed: u64) -> Result<()> {
+        let added_ids = labels::token_ids(added)?;
+        let removed_ids = labels::token_ids(removed)?;
+        // Empty `wanted_types` means "every type"; one pass over the chain yields each record.
+        let incident = self.incident_rels_typed(id, &[])?;
+        for (rel_id, rel) in incident {
+            // A tombstoned relationship no longer contributes to any live count — its `delete_rel`
+            // already removed it — so re-keying it would corrupt the balance in both directions.
+            if !Self::is_live_version(rel.mvcc) {
+                debug_assert!(rel_id != 0, "chain yielded a null relationship id");
+                continue;
+            }
+            if rel.start_node == id {
+                for &label in &added_ids {
+                    self.statistics.inc_start_label_type(label, rel.type_id);
+                }
+                for &label in &removed_ids {
+                    self.statistics.dec_start_label_type(label, rel.type_id);
+                }
+            }
+            if rel.end_node == id {
+                for &label in &added_ids {
+                    self.statistics.inc_type_end_label(rel.type_id, label);
+                }
+                for &label in &removed_ids {
+                    self.statistics.dec_type_end_label(rel.type_id, label);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Adds the label with `label_token_id` to node `id` under `txn` (idempotent — a label already
@@ -4082,8 +4153,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // `first_rel` / MVCC word on the same node record (`rmp` #772). `write_node` (whole-record
         // pre-image undo) was the breach.
         self.write_node_labels(id, next, old_labels, txn, node.mvcc.created_ts)?;
-        // Exactly one bit was newly set: increment its per-label count (`rmp` task #79).
-        self.apply_label_count_delta(old_labels, next);
+        // Exactly one bit was newly set: increment its per-label count (`rmp` task #79) and re-key the
+        // directional relationship counters of this node's edges onto the new label (`rmp` #856).
+        self.apply_label_count_delta(id, old_labels, next)?;
         Ok(())
     }
 
@@ -4110,8 +4182,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // `first_rel` / MVCC word on the same node record (`rmp` #772). `write_node` (whole-record
         // pre-image undo) was the breach.
         self.write_node_labels(id, next, old_labels, txn, node.mvcc.created_ts)?;
-        // Exactly one bit was newly cleared: decrement its per-label count (`rmp` task #79).
-        self.apply_label_count_delta(old_labels, next);
+        // Exactly one bit was newly cleared: decrement its per-label count (`rmp` task #79) and re-key
+        // the directional relationship counters of this node's edges off the old label (`rmp` #856).
+        self.apply_label_count_delta(id, old_labels, next)?;
         Ok(())
     }
 
@@ -4217,6 +4290,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             // checkpoint, reverted by `reload_catalog` on rollback.
             self.statistics.inc_rel_type(type_id);
             self.statistics.inc_rel();
+            // Directional projections (`rmp` task #856). A self-loop's one node is both endpoints, so its
+            // label word is passed for both sides — it really does contribute to each map.
+            self.apply_directional_rel_counts(type_id, start_node.labels, start_node.labels, true)?;
             return Ok((id, eid));
         }
 
@@ -4262,7 +4338,55 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // checkpoint, reverted by `reload_catalog` on rollback.
         self.statistics.inc_rel_type(type_id);
         self.statistics.inc_rel();
+        // Directional projections (`rmp` task #856), from the label words of the two endpoint records
+        // this function already read and validated — no extra I/O on the common inline-bitmap path.
+        self.apply_directional_rel_counts(type_id, start_node.labels, end_node.labels, true)?;
         Ok((id, eid))
+    }
+
+    /// Applies one relationship's contribution to the two **directional** count projections of
+    /// `rmp` task #856: `(startLabel, type)` for every label the start node carries, and
+    /// `(type, endLabel)` for every label the end node carries.
+    ///
+    /// `start_labels` / `end_labels` are the endpoints' raw inline label words, which every caller has
+    /// already decoded from the endpoint record it had to read anyway — so the common case costs no
+    /// extra I/O, only a bitmap walk. Pass the SAME word twice for a self-loop: its one node is
+    /// genuinely both the start and the end of that relationship, so it contributes to both maps.
+    ///
+    /// In-memory only, exactly like [`Statistics::inc_rel_type`] and the grand totals: durable at the
+    /// commit checkpoint, and reverted wholesale by `reload_catalog` on rollback. That is what keeps a
+    /// rolled-back transaction from leaving the counters drifted, and it is why this must never be
+    /// called from a path that is not itself covered by that revert.
+    ///
+    /// # Errors
+    /// Propagates [`LabelError::OverflowFlagSet`](crate::labels::LabelError::OverflowFlagSet) if an
+    /// endpoint's label set is in the #39 overflow form this build cannot enumerate. Failing closed is
+    /// deliberate: a label set this build cannot read is one whose counters it cannot keep exact, and an
+    /// inexact counter the planner trusts is worse than a refused write. No node can reach that form in
+    /// this build (`encode_set` rejects a token id at or above the inline limit), so the branch is
+    /// defensive rather than reachable.
+    fn apply_directional_rel_counts(
+        &mut self,
+        type_id: u32,
+        start_labels: u64,
+        end_labels: u64,
+        increment: bool,
+    ) -> Result<()> {
+        for label in crate::labels::token_ids(start_labels)? {
+            if increment {
+                self.statistics.inc_start_label_type(label, type_id);
+            } else {
+                self.statistics.dec_start_label_type(label, type_id);
+            }
+        }
+        for label in crate::labels::token_ids(end_labels)? {
+            if increment {
+                self.statistics.inc_type_end_label(type_id, label);
+            } else {
+                self.statistics.dec_type_end_label(type_id, label);
+            }
+        }
+        Ok(())
     }
 
     /// Points the `prev` pointer of `old_head`'s **head link** at `new_id` and clears its
@@ -4381,6 +4505,20 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // aborted delete does not undercount.
         self.statistics.dec_rel_type(rel.type_id);
         self.statistics.dec_rel();
+        // Directional projections (`rmp` task #856). Unlike the per-type count, whose key is the
+        // relationship's own immutable `type_id`, these are keyed on the ENDPOINTS' labels, which are
+        // not in the relationship record — so the two endpoint records must be read here. The labels
+        // read are the CURRENT ones, which is exactly right: a `SET`/`REMOVE label` in between already
+        // moved this relationship's contribution to the counters it now sits in, so decrementing the
+        // current keys is what balances the books. A self-loop is read once and counted on both sides,
+        // mirroring the create path.
+        let start_labels = self.read_node(rel.start_node)?.labels;
+        let end_labels = if rel.start_node == rel.end_node {
+            start_labels
+        } else {
+            self.read_node(rel.end_node)?.labels
+        };
+        self.apply_directional_rel_counts(rel.type_id, start_labels, end_labels, false)?;
         Ok(())
     }
 
@@ -5533,6 +5671,90 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         (store.alloc.high_water().saturating_sub(1)).saturating_sub(store.free.len() as u64)
     }
 
+    /// Empties both directional relationship-count projections — an **inspection accessor for tests**
+    /// (`rmp` task #856).
+    ///
+    /// It exists to construct the one state the incremental path cannot produce: a catalogue that holds
+    /// relationships but no directional counters, which is what a database predating the projections
+    /// looks like after it loads. The backfill test needs that state to prove convergence, and
+    /// truncating a real catalogue image cannot produce it in a live store.
+    ///
+    /// Not a repair tool: [`backfill_directional_rel_counts`](Self::backfill_directional_rel_counts)
+    /// replaces both maps outright, so nothing needs to clear them first.
+    pub fn clear_directional_rel_counts_for_test(&mut self) {
+        self.statistics.rels_per_start_label_type.clear();
+        self.statistics.rels_per_type_end_label.clear();
+    }
+
+    /// Rebuilds both **directional** relationship-count projections from a full scan of the
+    /// relationship store, replacing whatever they held (`rmp` task #856).
+    ///
+    /// This is the backfill path, needed for two cases the incremental maintenance cannot cover:
+    ///
+    /// * a database whose catalogue **predates** the projections, which decodes them empty (the
+    ///   append-only image rule) and would otherwise never acquire them, since only new writes
+    ///   increment;
+    /// * a repair, if the counters were ever suspected of having drifted.
+    ///
+    /// It reads every allocated relationship slot in `1..high_water` and counts only **live versions**,
+    /// which is exactly the population the incremental path maintains — so the result is the number a
+    /// test can compare the incremental counters against, and equality between the two is the whole
+    /// correctness argument for this task.
+    ///
+    /// # Cost
+    ///
+    /// O(relationship slots) reads plus up to two endpoint reads per relationship. It is an explicit
+    /// operator/maintenance action, never on a query path.
+    ///
+    /// # Errors
+    /// Propagates a read failure. A slot that is not allocated is **skipped**, not an error: the id
+    /// space below the high-water legitimately contains freed slots.
+    pub fn backfill_directional_rel_counts(&mut self) -> Result<()> {
+        let rebuilt = self.recount_directional_rel_counts()?;
+        self.statistics.rels_per_start_label_type = rebuilt.0;
+        self.statistics.rels_per_type_end_label = rebuilt.1;
+        Ok(())
+    }
+
+    /// Counts both directional projections from a full scan **without** installing them
+    /// (`rmp` task #856).
+    ///
+    /// The measurement half of [`backfill_directional_rel_counts`](Self::backfill_directional_rel_counts),
+    /// exposed so a test can assert that the incrementally-maintained counters equal a fresh recount —
+    /// the property that makes "exact" a claim rather than a hope.
+    ///
+    /// # Errors
+    /// Propagates a read failure other than an unallocated slot.
+    pub fn recount_directional_rel_counts(&self) -> Result<DirectionalRelCounts> {
+        let mut by_start = std::collections::BTreeMap::new();
+        let mut by_end = std::collections::BTreeMap::new();
+        let high_water = self.store(StoreKind::Rel).alloc.high_water();
+        // Ids run `1..high_water`; id 0 is the reserved null.
+        for id in 1..high_water {
+            let Ok(rel) = self.read_rel(id) else {
+                // A freed or never-allocated slot below the high-water: not an error, just not a
+                // relationship. Skipping it is what makes the recount equal the live population.
+                continue;
+            };
+            if !Self::is_live_version(rel.mvcc) {
+                continue;
+            }
+            let start_labels = self.read_node(rel.start_node)?.labels;
+            let end_labels = if rel.start_node == rel.end_node {
+                start_labels
+            } else {
+                self.read_node(rel.end_node)?.labels
+            };
+            for label in crate::labels::token_ids(start_labels)? {
+                *by_start.entry((label, rel.type_id)).or_insert(0) += 1;
+            }
+            for label in crate::labels::token_ids(end_labels)? {
+                *by_end.entry((rel.type_id, label)).or_insert(0) += 1;
+            }
+        }
+        Ok((by_start, by_end))
+    }
+
     /// Reads the raw MVCC header of record `id` in `kind`'s store — an inspection accessor exposing
     /// the private `read_mvcc` so the Slice-3a read-view equivalence test (`rmp` #336) can compare the
     /// live store's low-level header read against [`StoreReadView::read_mvcc`]. Behaviour-identical to
@@ -5827,6 +6049,37 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     #[must_use]
     pub fn rel_count_for_type(&self, type_token_id: u32) -> u64 {
         self.statistics.rel_count_for_type(type_token_id)
+    }
+
+    /// The number of currently-live relationships of type `type_token_id` whose **start** node carries
+    /// `label_token_id` (`0` if none) — the `(label, type, *)` directional projection (`rmp` task #856).
+    ///
+    /// Read one pair at a time: summing this over labels overcounts a multi-labelled endpoint, exactly
+    /// as summing [`node_count_for_label`](Self::node_count_for_label) over labels overcounts a
+    /// multi-labelled node.
+    #[must_use]
+    pub fn rel_count_for_start_label_type(&self, label_token_id: u32, type_token_id: u32) -> u64 {
+        self.statistics
+            .rel_count_for_start_label_type(label_token_id, type_token_id)
+    }
+
+    /// The number of currently-live relationships of type `type_token_id` whose **end** node carries
+    /// `label_token_id` (`0` if none) — the `(*, type, label)` directional projection (`rmp` task #856).
+    #[must_use]
+    pub fn rel_count_for_type_end_label(&self, type_token_id: u32, label_token_id: u32) -> u64 {
+        self.statistics
+            .rel_count_for_type_end_label(type_token_id, label_token_id)
+    }
+
+    /// Whether this store's catalogue holds any directional relationship count (`rmp` task #856).
+    ///
+    /// The distinction a bare zero cannot make: "this catalogue predates the projections, or has never
+    /// been backfilled" versus "the graph genuinely has no such relationship". A consumer that reads a
+    /// zero from the former as a real degree would estimate a fan-out of nothing; it must fall back to
+    /// the graph-wide degree instead.
+    #[must_use]
+    pub fn has_directional_rel_counts(&self) -> bool {
+        self.statistics.has_directional_rel_counts()
     }
 
     /// The total number of currently-live nodes, **labelled or not**, from the persisted statistics

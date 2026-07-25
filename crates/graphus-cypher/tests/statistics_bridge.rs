@@ -167,6 +167,78 @@ fn statistics_is_present_and_counts_match_known_distribution() {
     let _ = graph.rollback().expect("read-only rollback");
 }
 
+#[test]
+fn directional_relationship_counts_bridge_from_the_durable_catalogue() {
+    // `rmp` task #856: the two directional projections must reach the estimator through the same seam,
+    // because a single graph-wide degree per type cannot tell a selective anchor from a fan-out one.
+    // Every one of the 9 KNOWS edges in the corpus runs Person -> Person.
+    let store = seed_known_distribution();
+    let graph = RecordStoreGraph::begin(store, TxnId(1000));
+    let stats = graph.statistics().expect("statistics present");
+
+    assert_eq!(
+        stats.rels_from_label_with_type("Person", "KNOWS"),
+        Some(9),
+        "all 9 edges start at a Person"
+    );
+    assert_eq!(
+        stats.rels_with_type_to_label("KNOWS", "Person"),
+        Some(9),
+        "and all 9 end at one"
+    );
+
+    // A label that carries no edge of that type is an EXACT Some(0), not the None "unknown" sentinel —
+    // the catalogue does track these projections, so it can answer definitively.
+    assert_eq!(stats.rels_from_label_with_type("Company", "KNOWS"), Some(0));
+    assert_eq!(stats.rels_with_type_to_label("KNOWS", "Company"), Some(0));
+    // A never-interned label or type likewise: no live relationship can exist for it.
+    assert_eq!(stats.rels_from_label_with_type("Ghost", "KNOWS"), Some(0));
+    assert_eq!(stats.rels_from_label_with_type("Person", "NOPE"), Some(0));
+
+    // The projections are NOT recoverable by summing: this corpus happens to have one start label, so
+    // assert the shape that distinguishes them instead — the directional count is bounded by the
+    // per-type total and both directions are populated.
+    let per_type = stats.relationships_with_type("KNOWS").unwrap();
+    assert_eq!(
+        stats.rels_from_label_with_type("Person", "KNOWS").unwrap(),
+        per_type,
+        "with a single start label the projection coincides with the per-type total"
+    );
+
+    let _ = graph.rollback().expect("read-only rollback");
+}
+
+#[test]
+fn a_catalogue_without_directional_counts_reports_unknown_not_zero() {
+    // The distinction the whole `Option` exists for. A store whose catalogue has no directional
+    // projections — a database predating them, or one never backfilled — must answer `None` so the
+    // consumer falls back to the graph-wide degree. Answering `Some(0)` would tell the planner the
+    // relationship type has a fan-out of nothing, which is worse than admitting ignorance.
+    let store = seed_known_distribution();
+    let graph = RecordStoreGraph::begin(store, TxnId(1000));
+    let stats = graph.statistics().expect("statistics present");
+    assert_eq!(
+        stats.rels_from_label_with_type("Person", "KNOWS"),
+        Some(9),
+        "premise: the counters are populated before we clear them"
+    );
+    let store = graph.rollback().expect("read-only rollback");
+
+    let mut store = store;
+    store.clear_directional_rel_counts_for_test();
+    let graph = RecordStoreGraph::begin(store, TxnId(1001));
+    let stats = graph.statistics().expect("statistics present");
+    assert_eq!(
+        stats.rels_from_label_with_type("Person", "KNOWS"),
+        None,
+        "an un-backfilled catalogue must report unknown"
+    );
+    assert_eq!(stats.rels_with_type_to_label("KNOWS", "Person"), None);
+    // The symmetric counts are untouched, so the fallback the consumer reaches for is still available.
+    assert_eq!(stats.relationships_with_type("KNOWS"), Some(9));
+    let _ = graph.rollback().expect("read-only rollback");
+}
+
 // =================================================================================================
 // 2. ANALYZE recompute + histogram selectivity end-to-end
 // =================================================================================================

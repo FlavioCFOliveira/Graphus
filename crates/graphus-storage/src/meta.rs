@@ -951,6 +951,31 @@ pub struct Statistics {
     /// `rels_per_type[t]` is the number of currently-live relationships whose `RelType`-namespace
     /// token id is `t`. Absent key == count `0`.
     pub rels_per_type: BTreeMap<u32, u64>,
+    /// `rels_per_start_label_type[(l, t)]` is the number of currently-live relationships of `RelType`
+    /// token `t` whose **start** node carries `Label` token `l` (`rmp` task #856). Absent key == `0`.
+    ///
+    /// One of the two **directional** projections the planner needs to tell a selective anchor from a
+    /// fan-out one. [`rels_per_type`](Self#structfield.rels_per_type) alone gives a single graph-wide
+    /// degree per type, which makes both ends of a relationship look identical: measured on the
+    /// evaluation store, `LIKES` estimates a degree of 9.7 from *any* anchor while the true out-degree
+    /// is about 10 from a `USER` and about 333 from an `ARTICLE`.
+    ///
+    /// A start node with `k` labels contributes `1` to each of its `k` entries, exactly as
+    /// [`nodes_per_label`](Self#structfield.nodes_per_label) does — so summing this map over labels
+    /// overcounts a multi-labelled endpoint and is never the way to recover a per-type total. Read one
+    /// `(label, type)` pair at a time, which is the only shape the estimator asks for.
+    ///
+    /// This is the `(label, type, *)` wildcard projection, not the full `(label, type, label)` matrix:
+    /// the matrix is quadratic in the label space for an estimate that needs only the anchor's side.
+    pub rels_per_start_label_type: BTreeMap<(u32, u32), u64>,
+    /// `rels_per_type_end_label[(t, l)]` is the number of currently-live relationships of `RelType`
+    /// token `t` whose **end** node carries `Label` token `l` (`rmp` task #856). Absent key == `0`.
+    ///
+    /// The `(*, type, label)` mirror of
+    /// [`rels_per_start_label_type`](Self#structfield.rels_per_start_label_type); every note there
+    /// applies here with the endpoints exchanged. A **self-loop** contributes to both maps, because its
+    /// one node is genuinely both the start and the end of that relationship.
+    pub rels_per_type_end_label: BTreeMap<(u32, u32), u64>,
     /// Opaque, encoded per-(label-token, property-key-token) value histograms produced by the query
     /// layer (a later sub-task of `rmp` task #81; the planner's `ANALYZE`). Stored **verbatim** —
     /// storage never interprets the bytes (decoding would require a dependency on `graphus-index`,
@@ -1192,11 +1217,13 @@ impl Statistics {
     /// Returns `true` iff the **schema-catalog** half of `self` equals `other`'s — the twelve
     /// `catalog_dirty`-guarded DDL maps (declared node/relationship property, composite, full-text,
     /// text, spatial, vector indexes; their names; constraints; and the opaque property histograms)
-    /// — **ignoring** the four live-record cardinality counters
+    /// — **ignoring** the six live-record cardinality counters
     /// ([`total_nodes`](Self#structfield.total_nodes) /
     /// [`total_relationships`](Self#structfield.total_relationships) /
     /// [`nodes_per_label`](Self#structfield.nodes_per_label) /
-    /// [`rels_per_type`](Self#structfield.rels_per_type)).
+    /// [`rels_per_type`](Self#structfield.rels_per_type) /
+    /// [`rels_per_start_label_type`](Self#structfield.rels_per_start_label_type) /
+    /// [`rels_per_type_end_label`](Self#structfield.rels_per_type_end_label)).
     ///
     /// `rmp` #534: the rollback path uses this to detect whether a **concurrent** open transaction left
     /// a pending catalog DDL change that a wholesale count-revert would otherwise silently drop. It is
@@ -1214,6 +1241,9 @@ impl Statistics {
             total_relationships: _,
             nodes_per_label: _,
             rels_per_type: _,
+            // The directional projections of `rmp` task #856 are counters too, not schema.
+            rels_per_start_label_type: _,
+            rels_per_type_end_label: _,
             // Schema-catalog DDL (the `catalog_dirty`-guarded half): compared.
             node_prop_histograms,
             node_property_indexes,
@@ -1242,7 +1272,7 @@ impl Statistics {
             && *vector_indexes == other.vector_indexes
     }
 
-    /// Moves the **schema-catalog** half of `src` into `self`, leaving `self`'s four live-record
+    /// Moves the **schema-catalog** half of `src` into `self`, leaving `self`'s six live-record
     /// cardinality counters untouched. The twelve fields moved are exactly those compared by
     /// [`schema_eq`](Self::schema_eq) and guarded by the store's `catalog_dirty` flag.
     ///
@@ -1261,6 +1291,9 @@ impl Statistics {
             total_relationships: _,
             nodes_per_label: _,
             rels_per_type: _,
+            // The directional projections of `rmp` task #856 are counters too, not schema.
+            rels_per_start_label_type: _,
+            rels_per_type_end_label: _,
             // Schema-catalog DDL (the `catalog_dirty`-guarded half): moved into `self`.
             node_prop_histograms,
             node_property_indexes,
@@ -1403,9 +1436,90 @@ impl Statistics {
         Self::dec(&mut self.rels_per_type, token_id);
     }
 
+    /// Adds `1` to the directional count for a relationship of type `type_id` whose **start** node
+    /// carries label `label_id` (`rmp` task #856).
+    pub(crate) fn inc_start_label_type(&mut self, label_id: u32, type_id: u32) {
+        *self
+            .rels_per_start_label_type
+            .entry((label_id, type_id))
+            .or_insert(0) += 1;
+    }
+
+    /// Subtracts `1` from that count, removing the entry at `0` (the zero-count invariant, so equality
+    /// against a fresh re-scan holds).
+    ///
+    /// # Panics
+    /// Panics (debug builds) if the count is already `0` or absent (an internal invariant violation).
+    pub(crate) fn dec_start_label_type(&mut self, label_id: u32, type_id: u32) {
+        Self::dec_pair(&mut self.rels_per_start_label_type, (label_id, type_id));
+    }
+
+    /// Adds `1` to the directional count for a relationship of type `type_id` whose **end** node
+    /// carries label `label_id` (`rmp` task #856).
+    pub(crate) fn inc_type_end_label(&mut self, type_id: u32, label_id: u32) {
+        *self
+            .rels_per_type_end_label
+            .entry((type_id, label_id))
+            .or_insert(0) += 1;
+    }
+
+    /// Subtracts `1` from that count, removing the entry at `0`.
+    ///
+    /// # Panics
+    /// Panics (debug builds) if the count is already `0` or absent (an internal invariant violation).
+    pub(crate) fn dec_type_end_label(&mut self, type_id: u32, label_id: u32) {
+        Self::dec_pair(&mut self.rels_per_type_end_label, (type_id, label_id));
+    }
+
+    /// The number of currently-live relationships of type `type_id` whose start node carries
+    /// `label_id` (`0` if none) — the `(label, type, *)` projection (`rmp` task #856).
+    #[must_use]
+    pub fn rel_count_for_start_label_type(&self, label_id: u32, type_id: u32) -> u64 {
+        self.rels_per_start_label_type
+            .get(&(label_id, type_id))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// The number of currently-live relationships of type `type_id` whose end node carries `label_id`
+    /// (`0` if none) — the `(*, type, label)` projection (`rmp` task #856).
+    #[must_use]
+    pub fn rel_count_for_type_end_label(&self, type_id: u32, label_id: u32) -> u64 {
+        self.rels_per_type_end_label
+            .get(&(type_id, label_id))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Whether either directional projection holds any entry (`rmp` task #856).
+    ///
+    /// Distinguishes "this catalogue predates the directional counters, or has never been backfilled"
+    /// from "the graph genuinely has no relationships". The estimator must not read a zero from the
+    /// former as a real degree of zero — it has to fall back to the graph-wide degree — and an absent
+    /// key is indistinguishable from a genuine zero on its own.
+    #[must_use]
+    pub fn has_directional_rel_counts(&self) -> bool {
+        !self.rels_per_start_label_type.is_empty() || !self.rels_per_type_end_label.is_empty()
+    }
+
     /// Shared decrement-with-removal: `count -= 1`, dropping the entry at `0`. In a release build a
     /// missing/zero entry saturates at `0` (never wraps to a huge count) so a logic slip can never
     /// silently corrupt the catalog into an absurd cardinality; in a debug build it is caught.
+    /// [`dec`](Self::dec) for a pair-keyed counter map (`rmp` task #856) — same saturating,
+    /// zero-removing contract, same reason for it.
+    fn dec_pair(map: &mut BTreeMap<(u32, u32), u64>, key: (u32, u32)) {
+        match map.get_mut(&key) {
+            Some(c) if *c > 1 => *c -= 1,
+            Some(_) => {
+                map.remove(&key);
+            }
+            None => debug_assert!(
+                false,
+                "statistics directional count decrement underflow at {key:?}"
+            ),
+        }
+    }
+
     fn dec(map: &mut BTreeMap<u32, u64>, token_id: u32) {
         match map.get_mut(&token_id) {
             Some(c) if *c > 1 => *c -= 1,
@@ -2071,7 +2185,30 @@ impl Statistics {
         // a wholly new block, so every field — including the entity — is stored inline (no base +
         // extension split).
         Self::encode_vector_catalog(&mut out, &self.vector_indexes);
+        // The two directional relationship-count projections (`rmp` task #856), appended LAST by the
+        // same append-only rule, so a pre-#856 image (ending after the vector catalog) decodes both to
+        // empty. They are *counters*, not schema, and so sit apart from the count maps at the head of
+        // the image only because the format is append-only — an image's field order is history, not
+        // meaning.
+        Self::encode_pair_map(&mut out, &self.rels_per_start_label_type);
+        Self::encode_pair_map(&mut out, &self.rels_per_type_end_label);
         out
+    }
+
+    /// Encodes a pair-keyed counter map: a `u32` entry count, then `(u32, u32, u64)` per entry
+    /// (`rmp` task #856). `BTreeMap` iteration is key-ordered, so the image is byte-deterministic for a
+    /// given map — which the checkpoint's page comparison relies on.
+    fn encode_pair_map(out: &mut Vec<u8>, map: &BTreeMap<(u32, u32), u64>) {
+        debug_assert!(
+            map.len() <= u32::MAX as usize,
+            "directional count map too large to frame"
+        );
+        out.extend_from_slice(&(map.len() as u32).to_le_bytes());
+        for (&(a, b), &count) in map {
+            out.extend_from_slice(&a.to_le_bytes());
+            out.extend_from_slice(&b.to_le_bytes());
+            out.extend_from_slice(&count.to_le_bytes());
+        }
     }
 
     fn encode_map(out: &mut Vec<u8>, map: &BTreeMap<u32, u64>) {
@@ -2592,11 +2729,21 @@ impl Statistics {
         // image ends after the relationship composite block, so this block decodes empty via the
         // end-of-input guard.
         let vector_indexes = Self::decode_vector_catalog(bytes, &mut cur)?;
+        // Decode the two trailing directional relationship-count projections (`rmp` task #856), the LAST
+        // blocks. A pre-#856 image ends after the vector catalog, so both decode empty via the
+        // end-of-input guard — the database then simply has no directional input for the estimator, which
+        // falls back to the graph-wide degree until a backfill runs.
+        let rels_per_start_label_type =
+            Self::decode_pair_map(bytes, &mut cur, "rels_per_start_label_type")?;
+        let rels_per_type_end_label =
+            Self::decode_pair_map(bytes, &mut cur, "rels_per_type_end_label")?;
         Ok(Self {
             total_nodes,
             total_relationships,
             nodes_per_label,
             rels_per_type,
+            rels_per_start_label_type,
+            rels_per_type_end_label,
             node_prop_histograms,
             node_property_indexes,
             fulltext_indexes,
@@ -2610,6 +2757,42 @@ impl Statistics {
             text_indexes,
             vector_indexes,
         })
+    }
+
+    /// Decodes a pair-keyed counter map (`rmp` task #856), tolerating a pre-#856 image that simply ends
+    /// where this block would start.
+    ///
+    /// Enforces the same two invariants [`decode_map`](Self::decode_map) does — no stored zero (the
+    /// zero-count invariant that makes equality against a fresh re-scan meaningful) and no repeated key
+    /// — because a violated invariant here would hand the planner a cardinality it must not trust, and a
+    /// corrupt catalogue must be rejected rather than silently believed.
+    fn decode_pair_map(
+        bytes: &[u8],
+        cur: &mut usize,
+        which: &str,
+    ) -> Result<BTreeMap<(u32, u32), u64>> {
+        let mut map = BTreeMap::new();
+        // Backward compatibility (`rmp` task #856): a pre-#856 image ends exactly here.
+        if *cur == bytes.len() {
+            return Ok(map);
+        }
+        let n = read_u32(bytes, cur)? as usize;
+        for _ in 0..n {
+            let a = read_u32(bytes, cur)?;
+            let b = read_u32(bytes, cur)?;
+            let count = read_u64(bytes, cur)?;
+            if count == 0 {
+                return Err(GraphusError::Storage(format!(
+                    "statistics {which} holds a zero count for key ({a}, {b})"
+                )));
+            }
+            if map.insert((a, b), count).is_some() {
+                return Err(GraphusError::Storage(format!(
+                    "statistics {which} repeats key ({a}, {b})"
+                )));
+            }
+        }
+        Ok(map)
     }
 
     fn decode_map(bytes: &[u8], cur: &mut usize, which: &str) -> Result<BTreeMap<u32, u64>> {
@@ -4271,10 +4454,25 @@ mod tests {
             },
         );
         let mut forged = one.encode();
-        // The lone entry trails the image as: … | similarity(1) | m(4) | ef_construction(4) | state(1),
-        // so the similarity byte is `1 + 4 + 4 = 9` bytes before the final `state` byte, i.e. at
-        // `len - 10`. Corrupt it to `2` (a reserved discriminant).
-        let sim_pos = forged.len() - 10;
+        // The lone vector entry ends as: … | similarity(1) | m(4) | ef_construction(4) | state(1), so
+        // the similarity byte sits `1 + 4 + 4 = 9` bytes before the entry's final `state` byte. The
+        // entry is no longer at the very END of the image — `rmp` task #856 appended two directional
+        // count blocks after the vector catalog — so the offset is measured back from where the vector
+        // block ends, not from where the image ends. `trailing` is DERIVED, so appending another block
+        // does not silently move the offset onto the wrong byte.
+        let trailing = {
+            let mut tail = Vec::new();
+            Statistics::encode_pair_map(&mut tail, &BTreeMap::new());
+            Statistics::encode_pair_map(&mut tail, &BTreeMap::new());
+            tail.len()
+        };
+        let sim_pos = forged.len() - trailing - 10;
+        assert_eq!(
+            forged[sim_pos],
+            VectorSimilarity::Cosine as u8,
+            "the derived offset must land on the entry's similarity byte"
+        );
+        // Corrupt it to `2` (a reserved discriminant).
         forged[sim_pos] = 2;
         assert!(Statistics::decode(&forged).is_err());
     }
@@ -4910,14 +5108,38 @@ mod tests {
     /// Builds an image whose preamble (through the empty constraint blocks) is produced by the real
     /// encoder for a `Statistics` declaring the index `target`, with its trailing empty (`0`-count)
     /// name block replaced by `name_block`. Lets the rejection tests hand-craft only the name block.
+    /// Splices `name_block` in as the node-property index-name catalog of an image that declares the
+    /// index `target`, leaving every other block intact.
+    ///
+    /// The position is **derived** by differencing an image that carries a name against one that does
+    /// not: the first byte where they differ is where the name catalog's count begins. It used to be
+    /// found by truncating the last 4 bytes of the image — which stopped pointing at the name catalog
+    /// the moment `rmp` #646 appended blocks after it, and every append since widened the gap. The
+    /// rejection tests below were consequently passing because the decoder choked on a *later* block
+    /// fed the forged bytes, not because it rejected the forged name catalog. Deriving the offset makes
+    /// them test what they claim, and keeps them correct however many blocks are appended in future
+    /// (`rmp` task #856 found this while adding two).
     fn image_with_index_and_name_block(target: (u32, u32), name_block: &[u8]) -> Vec<u8> {
-        let mut s = Statistics::new();
-        s.set_node_property_index(target.0, target.1, IndexState::Online);
-        let mut bytes = s.encode();
-        // The last 4 bytes are the empty (`0`-count) name block the encoder appends; drop them.
-        bytes.truncate(bytes.len() - 4);
-        bytes.extend_from_slice(name_block);
-        bytes
+        let mut without = Statistics::new();
+        without.set_node_property_index(target.0, target.1, IndexState::Online);
+        let mut with = without.clone();
+        with.set_node_property_index_name("probe".to_owned(), target.0, target.1);
+        let plain = without.encode();
+        let named = with.encode();
+        let start = plain
+            .iter()
+            .zip(named.iter())
+            .position(|(a, b)| a != b)
+            .expect("the two images must differ inside the name catalog");
+        assert_eq!(
+            &plain[start..start + 4],
+            &[0, 0, 0, 0],
+            "the derived offset must land on the empty name catalog's u32 count"
+        );
+        let mut out = plain[..start].to_vec();
+        out.extend_from_slice(name_block);
+        out.extend_from_slice(&plain[start + 4..]);
+        out
     }
 
     #[test]

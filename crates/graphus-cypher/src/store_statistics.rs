@@ -53,6 +53,49 @@ pub(crate) fn relationships_with_type<D: BlockDevice, S: LogSink>(
         .map_or(0, |token| store.rel_count_for_type(token))
 }
 
+/// The `(startLabel, type)` directional count, or `None` when this catalogue has no directional
+/// projections at all (`rmp` task #856).
+///
+/// The `None` is load-bearing and is why this cannot simply return `0`: a catalogue that predates the
+/// projections, or that has never been backfilled, holds an empty map, and a consumer reading its zero
+/// as a real count would estimate a fan-out of nothing rather than falling back to the graph-wide
+/// degree. Once the projections hold anything, an absent key is a genuine zero — a never-interned label
+/// or type included, since neither can have a live relationship.
+pub(crate) fn rels_from_label_with_type<D: BlockDevice, S: LogSink>(
+    store: &RecordStore<D, S>,
+    start_label: &str,
+    rel_type: &str,
+) -> Option<u64> {
+    if !store.has_directional_rel_counts() {
+        return None;
+    }
+    let label = store.token_id(Namespace::Label, start_label);
+    let ty = store.token_id(Namespace::RelType, rel_type);
+    match (label, ty) {
+        (Some(l), Some(t)) => Some(store.rel_count_for_start_label_type(l, t)),
+        // A never-interned label or type can have no live relationship: an exact zero, not unknown.
+        _ => Some(0),
+    }
+}
+
+/// The `(type, endLabel)` directional count, or `None` when untracked — the mirror of
+/// [`rels_from_label_with_type`] (`rmp` task #856).
+pub(crate) fn rels_with_type_to_label<D: BlockDevice, S: LogSink>(
+    store: &RecordStore<D, S>,
+    rel_type: &str,
+    end_label: &str,
+) -> Option<u64> {
+    if !store.has_directional_rel_counts() {
+        return None;
+    }
+    let ty = store.token_id(Namespace::RelType, rel_type);
+    let label = store.token_id(Namespace::Label, end_label);
+    match (ty, label) {
+        (Some(t), Some(l)) => Some(store.rel_count_for_type_end_label(t, l)),
+        _ => Some(0),
+    }
+}
+
 /// Decodes the durable histogram stored for `(label, property)` (`rmp` task #81).
 ///
 /// Returns:

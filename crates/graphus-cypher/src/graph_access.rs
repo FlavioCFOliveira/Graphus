@@ -1745,6 +1745,42 @@ impl crate::statistics::Statistics for MemGraph {
         Some(count as u64)
     }
 
+    /// Counted directly, since `MemGraph` knows its full contents (`rmp` task #856).
+    ///
+    /// Always `Some`: unlike a durable catalogue, this seam can never be in the "projections not
+    /// maintained yet" state that makes `None` necessary there — it derives the answer from the live
+    /// data on every call. A relationship whose start node carries several labels is counted once for
+    /// each, matching the durable projection's shape exactly.
+    fn rels_from_label_with_type(&self, start_label: &str, rel_type: &str) -> Option<u64> {
+        let count = self
+            .rels
+            .values()
+            .filter(|r| r.rel_type == rel_type)
+            .filter(|r| {
+                self.nodes
+                    .get(&r.start)
+                    .is_some_and(|n| n.labels.iter().any(|l| l == start_label))
+            })
+            .count();
+        Some(count as u64)
+    }
+
+    /// The `(type, endLabel)` mirror (`rmp` task #856). A self-loop is counted by both, because its one
+    /// node genuinely is both endpoints.
+    fn rels_with_type_to_label(&self, rel_type: &str, end_label: &str) -> Option<u64> {
+        let count = self
+            .rels
+            .values()
+            .filter(|r| r.rel_type == rel_type)
+            .filter(|r| {
+                self.nodes
+                    .get(&r.end)
+                    .is_some_and(|n| n.labels.iter().any(|l| l == end_label))
+            })
+            .count();
+        Some(count as u64)
+    }
+
     fn estimate_nodes_label_property_eq(
         &self,
         label: &str,

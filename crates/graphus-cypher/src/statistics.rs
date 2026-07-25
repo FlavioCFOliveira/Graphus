@@ -94,6 +94,42 @@ pub trait Statistics {
     /// documented estimate) while `Some(0)` is an exact "no such relationship".
     fn relationships_with_type(&self, rel_type: &str) -> Option<u64>;
 
+    /// The number of relationships of type `rel_type` whose **start** node carries `start_label`, or
+    /// `None` if the implementation does not track the directional projections (`rmp` task #856).
+    ///
+    /// The `(label, type, *)` counts store projection. It exists because
+    /// [`relationships_with_type`](Self::relationships_with_type) gives one graph-wide degree per type,
+    /// which makes both ends of a relationship look identical: measured on the evaluation store, `LIKES`
+    /// estimates a degree of 9.7 from *any* anchor while the true out-degree is about 10 from a `USER`
+    /// and about 333 from an `ARTICLE`. With symmetric degrees a cost-based planner cannot tell a
+    /// selective anchor from a fan-out one.
+    ///
+    /// `None` means **unknown** — a store whose catalogue predates the projections, one never
+    /// backfilled, or an implementation that does not keep them; the caller must fall back to the
+    /// graph-wide degree. `Some(0)` is an exact "no such relationship", which is emphatically *not* the
+    /// same thing: reading an unknown as a zero would estimate a fan-out of nothing.
+    ///
+    /// Do **not** recover a per-type total by summing this over labels: a relationship whose start node
+    /// carries several labels contributes to each of their entries, exactly as it does for
+    /// [`nodes_with_label`](Self::nodes_with_label).
+    ///
+    /// The **default** implementation returns `None`, so an implementor that tracks only the symmetric
+    /// counts keeps compiling and transparently exercises the fallback path.
+    fn rels_from_label_with_type(&self, start_label: &str, rel_type: &str) -> Option<u64> {
+        let _ = (start_label, rel_type);
+        None
+    }
+
+    /// The number of relationships of type `rel_type` whose **end** node carries `end_label`, or `None`
+    /// if untracked — the `(*, type, label)` mirror of
+    /// [`rels_from_label_with_type`](Self::rels_from_label_with_type) (`rmp` task #856).
+    ///
+    /// Every note there applies with the endpoints exchanged. A self-loop is counted by both.
+    fn rels_with_type_to_label(&self, rel_type: &str, end_label: &str) -> Option<u64> {
+        let _ = (rel_type, end_label);
+        None
+    }
+
     /// Estimated number of nodes carrying `label` whose `property` **equals** `value` — an **absolute
     /// row count**, not a fraction (see the [module docs](self)).
     ///

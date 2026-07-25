@@ -114,8 +114,8 @@ pub use record::{
     PropRecord, REL_RECORD_SIZE, RelRecord,
 };
 pub use store::{
-    DEFAULT_CHECKPOINT_INTERVAL_BYTES, FreezeFrontierViolation, GcPassReport, META_PAGE,
-    RecordStore, StoreKind,
+    DEFAULT_CHECKPOINT_INTERVAL_BYTES, DirectionalRelCounts, FreezeFrontierViolation, GcPassReport,
+    META_PAGE, RecordStore, StoreKind,
 };
 pub use tokens::{Namespace, TokenSnapshot, TokenStore};
 pub use valenc::{
