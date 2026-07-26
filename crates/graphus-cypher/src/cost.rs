@@ -681,6 +681,17 @@ pub fn estimate_cost(op: &PhysicalOp, stats: Option<&dyn Statistics>) -> CostEst
             CostEstimate::new(rows, cost)
         }
 
+        // A value hash join (`rmp` task #865): linear in both inputs, like the name-keyed hash join, and
+        // costed the same way. Its OUTPUT is estimated as a single-key equi-join, because that is what
+        // it is — one equality between two expressions — regardless of how many columns each side has.
+        PhysicalOp::ValueHashJoin { left, right, .. } => {
+            let l = estimate_cost(left, stats);
+            let r = estimate_cost(right, stats);
+            let rows = hash_join_rows(l.rows, r.rows, 1, stats);
+            let cost = l.cost + r.cost + l.rows * COST_HASH_BUILD + r.rows * COST_HASH_PROBE;
+            CostEstimate::new(rows, cost)
+        }
+
         // A nested-loop join: for each left row, re-evaluate the right branch. Output is the product
         // (cartesian) or the correlated estimate; the cost is the quadratic |left|·|right| pair cost
         // plus inputs — always above the equivalent hash join, which is why an equi-join never lowers
@@ -862,10 +873,10 @@ fn physical_label_for_var(op: &PhysicalOp, variable: &str) -> Option<String> {
         | PhysicalOp::Foreach { input, .. } => physical_label_for_var(input, variable),
 
         // ---- binary operators: either side may bind it ---------------------------------------------
-        PhysicalOp::NestedLoopJoin { left, right } | PhysicalOp::HashJoin { left, right, .. } => {
-            physical_label_for_var(left, variable)
-                .or_else(|| physical_label_for_var(right, variable))
-        }
+        PhysicalOp::NestedLoopJoin { left, right }
+        | PhysicalOp::HashJoin { left, right, .. }
+        | PhysicalOp::ValueHashJoin { left, right, .. } => physical_label_for_var(left, variable)
+            .or_else(|| physical_label_for_var(right, variable)),
 
         // ---- leaves and shapes with no single answer -----------------------------------------------
         _ => None,

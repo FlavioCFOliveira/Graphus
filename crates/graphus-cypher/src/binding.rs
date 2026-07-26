@@ -526,7 +526,9 @@ fn walk_physical(op: &PhysicalOp, record: &mut impl FnMut(&str, ParamType)) {
         }
 
         // ---- joins / branches ---------------------------------------------------------------
-        PhysicalOp::NestedLoopJoin { left, right } | PhysicalOp::HashJoin { left, right, .. } => {
+        PhysicalOp::NestedLoopJoin { left, right }
+        | PhysicalOp::HashJoin { left, right, .. }
+        | PhysicalOp::ValueHashJoin { left, right, .. } => {
             walk_physical(left, record);
             walk_physical(right, record);
         }

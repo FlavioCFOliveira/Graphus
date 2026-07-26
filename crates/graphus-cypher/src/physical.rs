@@ -551,6 +551,7 @@ impl PhysicalOp {
             // Two sub-plans.
             Self::NestedLoopJoin { left, right }
             | Self::HashJoin { left, right, .. }
+            | Self::ValueHashJoin { left, right, .. }
             | Self::Union { left, right, .. } => vec![left, right],
             // FOREACH's per-element update body is a sub-plan, rebuilt per element by the executor.
             Self::Foreach { input, body, .. } => vec![input, body],
@@ -606,6 +607,7 @@ impl PhysicalOp {
             Self::LoadCsv { .. } => "LoadCsv",
             Self::NestedLoopJoin { .. } => "NestedLoopJoin",
             Self::HashJoin { .. } => "HashJoin",
+            Self::ValueHashJoin { .. } => "ValueHashJoin",
             Self::Union { .. } => "Union",
             Self::Optional { .. } => "Optional",
             Self::Create { .. } => "Create",
@@ -1377,6 +1379,30 @@ pub enum PhysicalOp {
         right: Box<PhysicalOp>,
         /// The column names joined on (present on both sides), ascending.
         join_keys: Vec<String>,
+    },
+    /// **Value hash join** (`rmp` task #865): hash the build side on an arbitrary *expression* and
+    /// probe with the other side's expression.
+    ///
+    /// [`HashJoin`](Self::HashJoin) can only join on shared column NAMES, so it expresses a
+    /// node-identity join and nothing else. An equality between two different variables' properties —
+    /// a join on a business key — shares no name, so it fell to a cartesian
+    /// [`NestedLoopJoin`](Self::NestedLoopJoin) with the equality left as a `Filter` above. Measured on
+    /// the evaluation store: `MATCH (u:USER), (a:ARTICLE) WHERE u.city = a.topic RETURN count(*)`
+    /// evaluated 200000 x 2000 = 400M pairs in 188.0s. Neo4j plans a `ValueHashJoin` here, which is
+    /// linear in the two inputs.
+    ///
+    /// Semantics are those of the equality predicate it replaces, which is **not** the grouping
+    /// equivalence the index buckets on: a `null` key matches nothing and `NaN` does not match itself.
+    /// See `value_hash_join_rows`.
+    ValueHashJoin {
+        /// The build (left) relation.
+        left: Box<PhysicalOp>,
+        /// The probe (right) relation.
+        right: Box<PhysicalOp>,
+        /// The key expression evaluated over the build side's rows.
+        left_key: Expr,
+        /// The key expression evaluated over the probe side's rows.
+        right_key: Expr,
     },
     /// Combine two branches, optionally de-duplicating (`UNION` / `UNION ALL`).
     Union {
@@ -3120,6 +3146,7 @@ fn contains_read(op: &PhysicalOp) -> bool {
         | PhysicalOp::Optional { input, .. } => contains_read(input),
         PhysicalOp::NestedLoopJoin { left, right }
         | PhysicalOp::HashJoin { left, right, .. }
+        | PhysicalOp::ValueHashJoin { left, right, .. }
         | PhysicalOp::Union { left, right, .. } => contains_read(left) || contains_read(right),
         PhysicalOp::ProcedureCall { input, .. } => input.as_deref().is_some_and(contains_read),
         PhysicalOp::Argument { .. } | PhysicalOp::Empty => false,
@@ -3154,6 +3181,7 @@ fn contains_write(op: &PhysicalOp) -> bool {
         | PhysicalOp::Optional { input, .. } => contains_write(input),
         PhysicalOp::NestedLoopJoin { left, right }
         | PhysicalOp::HashJoin { left, right, .. }
+        | PhysicalOp::ValueHashJoin { left, right, .. }
         | PhysicalOp::Union { left, right, .. } => contains_write(left) || contains_write(right),
         PhysicalOp::ProcedureCall { input, .. } => input.as_deref().is_some_and(contains_write),
         PhysicalOp::AllNodesScan { .. }
@@ -3219,6 +3247,7 @@ fn contains_procedure_call(op: &PhysicalOp) -> bool {
         // Binary operators: recurse into both branches.
         PhysicalOp::NestedLoopJoin { left, right }
         | PhysicalOp::HashJoin { left, right, .. }
+        | PhysicalOp::ValueHashJoin { left, right, .. }
         | PhysicalOp::Union { left, right, .. } => {
             contains_procedure_call(left) || contains_procedure_call(right)
         }
@@ -3295,6 +3324,7 @@ fn all_procedure_calls_reader_safe(
         // Binary operators: recurse into both branches.
         PhysicalOp::NestedLoopJoin { left, right }
         | PhysicalOp::HashJoin { left, right, .. }
+        | PhysicalOp::ValueHashJoin { left, right, .. }
         | PhysicalOp::Union { left, right, .. } => {
             all_procedure_calls_reader_safe(left, registry)
                 && all_procedure_calls_reader_safe(right, registry)
@@ -3511,6 +3541,15 @@ fn optimize_inner(
     // is anchored there rather than on whichever node happened to be written first. Runs after (C) so
     // the single-hop case keeps its dedicated, narrower pass.
     let op = optimize_chain_anchor(op, catalog, stats);
+
+    // (E) Value hash join (`rmp` task #865): an equality between two branches' VALUES has no shared
+    // column name, so `choose_join` left it a cartesian nested loop with the equality as a filter
+    // above. Costed against that plan and kept when cheaper — which, being linear rather than
+    // quadratic, it essentially always is.
+    let op = match value_hash_join_alternative(&op) {
+        Some(alt) => cheaper(op, alt, stats),
+        None => op,
+    };
 
     // (A) Join reordering: if this node roots a maximal reorderable join region, flatten and re-plan
     // it by DP (small regions) or greedy (large regions). (If it is not such a region root, this is a
@@ -4505,6 +4544,130 @@ fn filter_over_scan_binds(op: &PhysicalOp, variable: &str) -> bool {
     binds_variable_by_scan(input, variable)
 }
 
+// -------------------------------------------------------------------------------------------------
+// Value hash join (`rmp` task #865)
+// -------------------------------------------------------------------------------------------------
+
+/// Turns `Filter(lhs = rhs)` over a **cartesian** nested-loop join into a
+/// [`ValueHashJoin`](PhysicalOp::ValueHashJoin) when each side of the equality reads variables bound by
+/// exactly one branch (`rmp` task #865).
+///
+/// [`choose_join`] derives its keys from shared column NAMES, so it can only ever express a
+/// node-identity join. An equality between two different variables' properties — a join on a business
+/// key — shares no name, so it fell through to a cartesian nested loop with the equality left as a
+/// `Filter` above it. Measured on the evaluation store:
+/// `MATCH (u:USER), (a:ARTICLE) WHERE u.city = a.topic RETURN count(*)` evaluated 200000 x 2000 = 400M
+/// pairs in 188.0s. Neo4j plans a `ValueHashJoin` here, which is linear in the two inputs.
+///
+/// # Preconditions, each load-bearing
+///
+/// * The join is **cartesian** (a `NestedLoopJoin`, i.e. `choose_join` found no shared name). A
+///   correlated apply is never touched: its right branch reads the left row, so no hash join can
+///   express it.
+/// * Neither branch is correlated or write-bearing, checked by the same predicates the join reordering
+///   already uses.
+/// * The conjunct is an equality whose two sides read variables from **different** branches, and each
+///   side reads from **one** branch only. A side reading both cannot be evaluated against a single
+///   branch's row, so it stays a filter.
+///
+/// Residual conjuncts stay in a `Filter` above the join, exactly where they were.
+///
+/// Only the FIRST qualifying conjunct is consumed: a second equality between the same two branches
+/// would need a composite key, which the operator does not model. It remains a residual filter, which
+/// is correct — just not as fast as it could be.
+fn value_hash_join_alternative(op: &PhysicalOp) -> Option<PhysicalOp> {
+    let PhysicalOp::Filter { input, predicate } = op else {
+        return None;
+    };
+    let PhysicalOp::NestedLoopJoin { left, right } = input.as_ref() else {
+        return None;
+    };
+    // A correlated or write-bearing branch is not hash-joinable.
+    if contains_correlated_seek(left) || contains_correlated_seek(right) {
+        return None;
+    }
+    if contains_argument(left) || contains_argument(right) {
+        return None;
+    }
+    if contains_write(left) || contains_write(right) {
+        return None;
+    }
+    let left_cols: BTreeSet<String> = bound_var_names(left).into_iter().collect();
+    let right_cols: BTreeSet<String> = bound_var_names(right).into_iter().collect();
+
+    let conjuncts = split_conjuncts(predicate);
+    let mut chosen: Option<(usize, Expr, Expr)> = None;
+    for (i, c) in conjuncts.iter().enumerate() {
+        let ExprKind::Binary {
+            op: BinaryOp::Eq,
+            lhs,
+            rhs,
+        } = &c.kind
+        else {
+            continue;
+        };
+        // Assign each side to the branch whose variables it reads, declining anything ambiguous.
+        let (Some(l_side), Some(r_side)) = (
+            side_of(lhs, &left_cols, &right_cols),
+            side_of(rhs, &left_cols, &right_cols),
+        ) else {
+            continue;
+        };
+        if l_side == r_side {
+            continue; // both sides read the same branch: an ordinary filter, not a join key
+        }
+        let (lk, rk) = if l_side == Side::Left {
+            ((**lhs).clone(), (**rhs).clone())
+        } else {
+            ((**rhs).clone(), (**lhs).clone())
+        };
+        chosen = Some((i, lk, rk));
+        break;
+    }
+    let (idx, left_key, right_key) = chosen?;
+
+    let join = PhysicalOp::ValueHashJoin {
+        left: left.clone(),
+        right: right.clone(),
+        left_key,
+        right_key,
+    };
+    let residual: Vec<&Expr> = conjuncts
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != idx)
+        .map(|(_, e)| *e)
+        .collect();
+    Some(attach_residual(join, &residual))
+}
+
+/// Which branch an expression's variables come from, or `None` when it reads both, neither, or a name
+/// bound by neither branch.
+///
+/// `None` is the safe answer in every ambiguous case: an expression this cannot place is left in the
+/// filter, where it already worked.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Side {
+    Left,
+    Right,
+}
+
+fn side_of(
+    expr: &Expr,
+    left_cols: &BTreeSet<String>,
+    right_cols: &BTreeSet<String>,
+) -> Option<Side> {
+    let reads_left = left_cols.iter().any(|v| expr_references_var(expr, v));
+    let reads_right = right_cols.iter().any(|v| expr_references_var(expr, v));
+    match (reads_left, reads_right) {
+        (true, false) => Some(Side::Left),
+        (false, true) => Some(Side::Right),
+        // Reads both branches (cannot be evaluated per-branch) or neither (a constant, which makes a
+        // useless join key): decline.
+        _ => None,
+    }
+}
+
 /// If `expr` is exactly `variable:Label` (a single-label `HasLabels` predicate), returns that label.
 /// Multi-label predicates are declined: the reversal re-applies `from`'s label as a single
 /// `HasLabels`, and a multi-label seed has no single catalog `label_property` to anchor on.
@@ -4788,6 +4951,17 @@ fn map_children(op: PhysicalOp, f: &dyn Fn(PhysicalOp) -> PhysicalOp) -> Physica
         PhysicalOp::NestedLoopJoin { left, right } => PhysicalOp::NestedLoopJoin {
             left: go(left),
             right: go(right),
+        },
+        PhysicalOp::ValueHashJoin {
+            left,
+            right,
+            left_key,
+            right_key,
+        } => PhysicalOp::ValueHashJoin {
+            left: go(left),
+            right: go(right),
+            left_key,
+            right_key,
         },
         PhysicalOp::HashJoin {
             left,
@@ -5079,6 +5253,14 @@ fn optimize_join_region(op: PhysicalOp, stats: &dyn Statistics) -> PhysicalOp {
 fn is_reorderable_join(op: &PhysicalOp) -> bool {
     match op {
         PhysicalOp::HashJoin { left, right, .. } => sides_reorderable(left, right),
+        // A `ValueHashJoin` is deliberately NOT reorderable. It carries its own key EXPRESSIONS — the
+        // equality it consumed from the filter above — and the region flattener extracts operands and
+        // re-joins them with `choose_join`, which knows only shared column names. Reordering one would
+        // therefore drop its predicate and turn the join back into a cartesian product: measured as the
+        // openCypher TCK scenarios "Join between node identities" (2 rows expected, 4 produced) and
+        // "Join between node properties of disconnected nodes" (1 expected, 4) while `rmp` task #865
+        // was being written.
+        PhysicalOp::ValueHashJoin { .. } => false,
         PhysicalOp::NestedLoopJoin { left, right } => {
             // A nested-loop join is reorderable only as a *cartesian* product (no shared keys); a
             // correlated apply (the executor feeds the right branch per left row) must never move.
@@ -5168,6 +5350,7 @@ fn contains_correlated_seek(op: &PhysicalOp) -> bool {
         | PhysicalOp::Foreach { input, .. } => contains_correlated_seek(input),
         PhysicalOp::NestedLoopJoin { left, right }
         | PhysicalOp::HashJoin { left, right, .. }
+        | PhysicalOp::ValueHashJoin { left, right, .. }
         | PhysicalOp::Union { left, right, .. } => {
             contains_correlated_seek(left) || contains_correlated_seek(right)
         }
@@ -5227,6 +5410,7 @@ fn contains_argument(op: &PhysicalOp) -> bool {
         | PhysicalOp::Foreach { input, .. } => contains_argument(input),
         PhysicalOp::NestedLoopJoin { left, right }
         | PhysicalOp::HashJoin { left, right, .. }
+        | PhysicalOp::ValueHashJoin { left, right, .. }
         | PhysicalOp::Union { left, right, .. } => {
             contains_argument(left) || contains_argument(right)
         }
@@ -5673,6 +5857,7 @@ fn gather_index_dependencies(op: &PhysicalOp, deps: &mut BTreeSet<IndexId>) {
         }
         PhysicalOp::NestedLoopJoin { left, right }
         | PhysicalOp::HashJoin { left, right, .. }
+        | PhysicalOp::ValueHashJoin { left, right, .. }
         | PhysicalOp::Union { left, right, .. } => {
             gather_index_dependencies(left, deps);
             gather_index_dependencies(right, deps);
@@ -6393,7 +6578,9 @@ fn gather_bound_vars(plan: &PhysicalOp, out: &mut Vec<Var>) {
                 push_unique(out, Var::named(&col.alias));
             }
         }
-        PhysicalOp::NestedLoopJoin { left, right } | PhysicalOp::HashJoin { left, right, .. } => {
+        PhysicalOp::NestedLoopJoin { left, right }
+        | PhysicalOp::HashJoin { left, right, .. }
+        | PhysicalOp::ValueHashJoin { left, right, .. } => {
             gather_bound_vars(left, out);
             gather_bound_vars(right, out);
         }
@@ -6858,6 +7045,21 @@ impl PhysicalOp {
 
             Self::NestedLoopJoin { left, right } => {
                 writeln!(f, "NestedLoopJoin")?;
+                left.fmt_indented(f, depth + 1)?;
+                right.fmt_indented(f, depth + 1)
+            }
+            Self::ValueHashJoin {
+                left,
+                right,
+                left_key,
+                right_key,
+            } => {
+                writeln!(
+                    f,
+                    "ValueHashJoin(on={} = {})",
+                    h::expr(left_key),
+                    h::expr(right_key)
+                )?;
                 left.fmt_indented(f, depth + 1)?;
                 right.fmt_indented(f, depth + 1)
             }

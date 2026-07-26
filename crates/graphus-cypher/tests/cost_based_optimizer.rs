@@ -523,7 +523,11 @@ fn expand_reversal_wall_clock_improvement() {
 fn innermost_join(op: &PhysicalOp) -> Option<&PhysicalOp> {
     fn descend<'a>(op: &'a PhysicalOp, found: &mut Option<&'a PhysicalOp>) {
         match op {
+            // `ValueHashJoin` counts: `rmp` task #865 made an equality between two branches' VALUES a
+            // join operator in its own right, which is exactly the shape this corpus produces
+            // (`a.k = b.k AND b.j = c.j` joins on properties, not on shared node identity).
             PhysicalOp::HashJoin { left, right, .. }
+            | PhysicalOp::ValueHashJoin { left, right, .. }
             | PhysicalOp::NestedLoopJoin { left, right } => {
                 *found = Some(op);
                 // Recurse into both sides; the deepest join wins (left-deep -> the left chain).
@@ -577,12 +581,12 @@ fn join_operand_labels(join: &PhysicalOp) -> Vec<String> {
         }
     }
     match join {
-        PhysicalOp::HashJoin { left, right, .. } | PhysicalOp::NestedLoopJoin { left, right } => {
-            [label_of(left), label_of(right)]
-                .into_iter()
-                .flatten()
-                .collect()
-        }
+        PhysicalOp::HashJoin { left, right, .. }
+        | PhysicalOp::ValueHashJoin { left, right, .. }
+        | PhysicalOp::NestedLoopJoin { left, right } => [label_of(left), label_of(right)]
+            .into_iter()
+            .flatten()
+            .collect(),
         _ => Vec::new(),
     }
 }

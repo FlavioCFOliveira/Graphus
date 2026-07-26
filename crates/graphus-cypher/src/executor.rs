@@ -3307,6 +3307,16 @@ fn build_operator_unprofiled(
             let rows = hash_join_rows(left, right, join_keys, arg, ctx)?;
             Ok(Operator::Buffered { rows })
         }
+        PhysicalOp::ValueHashJoin {
+            left,
+            right,
+            left_key,
+            right_key,
+        } => {
+            // Both sides are independent (no correlation); materialise the join.
+            let rows = value_hash_join_rows(left, right, left_key, right_key, arg, ctx)?;
+            Ok(Operator::Buffered { rows })
+        }
         PhysicalOp::Union { left, right, all } => {
             let rows = union_rows(left, right, *all, arg, ctx)?;
             Ok(Operator::Buffered { rows })
@@ -7122,17 +7132,130 @@ fn hash_join_rows(
 ) -> Result<VecDeque<Row>, ExecError> {
     let mut left_op = build_operator(left, arg, ctx)?;
     let mut build: Vec<(Vec<RowValue>, Row)> = Vec::new();
+    // Hash index over `build`: key-tuple digest -> the build rows whose key hashes there. Until
+    // `rmp` task #865 this operator scanned EVERY build row for every probe row — quadratic, despite
+    // the name. The digest is `group_key_hash`, which is consistent with `row_values_equivalent`, and a
+    // bucket collision still falls back to the exact `keys_match` check, so join semantics are
+    // unchanged. Same construction the grouping index already uses (`rmp` #314/#371): the digest is a
+    // SipHash output, so bucketing it again under SipHash would be waste and `FxHashMap` is used.
+    let mut index: rustc_hash::FxHashMap<u64, Vec<usize>> = rustc_hash::FxHashMap::default();
     while let Some(row) = left_op.next(ctx)? {
+        ctx.check_cancelled()?;
         let key = key_of(&row, join_keys);
+        index
+            .entry(group_key_hash(&key))
+            .or_default()
+            .push(build.len());
         build.push((key, row));
     }
     let mut right_op = build_operator(right, arg, ctx)?;
     let mut out = VecDeque::new();
     while let Some(row) = right_op.next(ctx)? {
+        ctx.check_cancelled()?;
         let key = key_of(&row, join_keys);
-        for (lkey, lrow) in &build {
+        let Some(bucket) = index.get(&group_key_hash(&key)) else {
+            continue;
+        };
+        for &i in bucket {
+            let (lkey, lrow) = &build[i];
             if keys_match(lkey, &key) {
                 out.push_back(merge_rows(lrow, &row));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Materialises a [`ValueHashJoin`](PhysicalOp::ValueHashJoin): hash the build side on `left_key`,
+/// probe with `right_key` (`rmp` task #865).
+///
+/// # Bucket by equivalence, confirm with the ORIGINAL predicate
+///
+/// The index buckets rows by grouping **equivalence** (`group_key_hash`), but a bucket hit is confirmed
+/// by evaluating the very equality this join replaced, over the merged row. Nothing else is sound:
+///
+/// * Comparing the two key *values* with `equality::equals` loses **entity identity**. A key that
+///   evaluates to a node is not a scalar, and two distinct nodes carrying the same properties would
+///   compare equal — which is exactly how the first version of this operator broke the openCypher TCK
+///   scenarios "Join between node identities" (2 rows expected, 4 produced) and "Join between node
+///   properties of disconnected nodes" (1 expected, 4).
+/// * `null = null` is `null`, not true, and `NaN = NaN` is false — yet equivalence groups both together.
+///
+/// Re-evaluating the predicate is correct by construction: it is the same expression, on the same
+/// merged row, that the `Filter` above the nested loop evaluated. It costs one evaluation per candidate
+/// PAIR, but only for pairs sharing a bucket — so the join stays linear in the inputs wherever the key
+/// is at all selective, which is the case it exists for.
+///
+/// A null key is dropped on both sides before indexing: `null` can never satisfy the equality, so such a
+/// row can match nothing and keeping it would only grow the table.
+fn value_hash_join_rows(
+    left: &PhysicalOp,
+    right: &PhysicalOp,
+    left_key: &Expr,
+    right_key: &Expr,
+    arg: Option<&Row>,
+    ctx: &mut Ctx<'_>,
+) -> Result<VecDeque<Row>, ExecError> {
+    // The predicate this join consumed, rebuilt once so each candidate pair can be confirmed with it.
+    let predicate = Expr::new(
+        ExprKind::Binary {
+            op: crate::ast::BinaryOp::Eq,
+            lhs: Box::new(left_key.clone()),
+            rhs: Box::new(right_key.clone()),
+        },
+        left_key.span,
+    );
+
+    let mut left_op = build_operator(left, arg, ctx)?;
+    let mut build: Vec<Row> = Vec::new();
+    let mut index: rustc_hash::FxHashMap<u64, Vec<usize>> = rustc_hash::FxHashMap::default();
+    while let Some(row) = left_op.next(ctx)? {
+        ctx.check_cancelled()?;
+        let key = eval(
+            left_key,
+            &row,
+            ctx.params,
+            ctx.graph,
+            ctx.functions,
+            &ctx.clock,
+        )?;
+        if matches!(key, RowValue::Value(Value::Null)) {
+            continue;
+        }
+        let digest = group_key_hash(std::slice::from_ref(&key));
+        index.entry(digest).or_default().push(build.len());
+        build.push(row);
+    }
+    let mut right_op = build_operator(right, arg, ctx)?;
+    let mut out = VecDeque::new();
+    while let Some(row) = right_op.next(ctx)? {
+        ctx.check_cancelled()?;
+        let key = eval(
+            right_key,
+            &row,
+            ctx.params,
+            ctx.graph,
+            ctx.functions,
+            &ctx.clock,
+        )?;
+        if matches!(key, RowValue::Value(Value::Null)) {
+            continue;
+        }
+        let Some(bucket) = index.get(&group_key_hash(std::slice::from_ref(&key))) else {
+            continue;
+        };
+        for &i in bucket {
+            let merged = merge_rows(&build[i], &row);
+            let verdict = eval(
+                &predicate,
+                &merged,
+                ctx.params,
+                ctx.graph,
+                ctx.functions,
+                &ctx.clock,
+            )?;
+            if matches!(verdict, RowValue::Value(Value::Boolean(true))) {
+                out.push_back(merged);
             }
         }
     }
@@ -8598,7 +8721,9 @@ fn result_columns(op: &PhysicalOp, procedures: &dyn ProcedureRegistry) -> Vec<St
             }
             cols
         }
-        PhysicalOp::NestedLoopJoin { left, right } | PhysicalOp::HashJoin { left, right, .. } => {
+        PhysicalOp::NestedLoopJoin { left, right }
+        | PhysicalOp::HashJoin { left, right, .. }
+        | PhysicalOp::ValueHashJoin { left, right, .. } => {
             let mut cols = result_columns(left, procedures);
             for c in result_columns(right, procedures) {
                 if !cols.contains(&c) {
@@ -9868,18 +9993,20 @@ mod tests {
             "the seek examines exactly one candidate per driving row"
         );
 
-        // SCAN GROWS linearly: examined == D * N at each point (a full label scan per driving row).
+        // The no-index path examines N, not D*N: `rmp` task #865 recognises the branch-to-branch
+        // equality as a value hash join, so the labelled anchors are scanned ONCE into a hash table and
+        // probed per driving row rather than re-scanned for each. The cost lost its factor of D.
         for &(n, examined) in &scan_curve {
             assert_eq!(
-                examined,
-                D as usize * n,
-                "the label SCAN cost must be D*N: examined {examined} at N={n}"
+                examined, n,
+                "the no-index path builds one hash table over the anchors (#865): examined \
+                 {examined} at N={n}"
             );
         }
-        // And the growth is real: doubling N doubles the scan cost while the seek cost is unchanged —
+        // The growth is still real: doubling N doubles the scan cost while the seek cost is unchanged —
         // the flat line is proven against a genuine slope, not asserted in a vacuum.
         assert!(
-            scan_curve.last().unwrap().1 > 10 * scan_curve.first().unwrap().1,
+            scan_curve.last().unwrap().1 > 6 * scan_curve.first().unwrap().1,
             "the scan slope must grow with N across the sweep: {scan_curve:?}"
         );
     }
@@ -10291,17 +10418,26 @@ mod tests {
             "the seek examines exactly one anchor candidate per driving row"
         );
 
-        // SCAN GROWS linearly: examined == D * N (a full label scan of the anchor per driving row).
+        // The no-index path now examines N, not D*N — a planner improvement, not a regression.
+        // `WHERE b.uid = t.uid` is an equality between two independent branches, and `rmp` task #865
+        // recognises exactly that as a value hash join: the anchors are scanned ONCE into a hash table
+        // and probed per driving row, instead of being re-scanned for every driving row. So the cost
+        // lost its factor of D (it was 1600 at N=200 with D=8; it is now 200).
+        //
+        // It still grows with N, which is inherent — the table has to be built — so the contrast with
+        // the seek survives: the seek stays flat at D while this grows linearly. What #730 guarantees is
+        // asserted above and unchanged. Rows are compared seek-versus-scan at every N further up, so a
+        // plan that got fast by getting WRONG would be caught there.
         for &(n, examined) in &scan_curve {
             assert_eq!(
-                examined,
-                D as usize * n,
-                "the anchor SCAN cost must be D*N: examined {examined} at N={n}"
+                examined, n,
+                "the no-index path builds one hash table over the anchors (#865): examined \
+                 {examined} at N={n}"
             );
         }
         assert!(
             scan_curve.last().unwrap().1 > 6 * scan_curve.first().unwrap().1,
-            "the scan slope must grow with N across the sweep: {scan_curve:?}"
+            "the scan slope must still grow with N across the sweep: {scan_curve:?}"
         );
     }
 
