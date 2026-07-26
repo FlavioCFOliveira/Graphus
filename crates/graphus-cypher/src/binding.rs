@@ -477,6 +477,15 @@ fn walk_physical(op: &PhysicalOp, record: &mut impl FnMut(&str, ParamType)) {
             }
             walk_physical(input, record);
         }
+        // `rmp` task #866. The count-store operators hold no expressions of their own — the counted
+        // shape was fully resolved at plan time — but their `fallback` is the very `Aggregation` above,
+        // so the walk must descend into it. Treating them as expression-free *leaves* would silently
+        // stop collecting parameter references from the subtree that actually runs whenever the seam
+        // declines, and a `$param` in it would then fail to bind.
+        PhysicalOp::NodeCountFromCountStore { fallback, .. }
+        | PhysicalOp::RelationshipCountFromCountStore { fallback, .. } => {
+            walk_physical(fallback, record);
+        }
         PhysicalOp::Sort { input, keys } => {
             for k in keys {
                 params_in_expr(&k.expr, ParamType::Any, record);

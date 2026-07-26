@@ -484,6 +484,26 @@ pub(super) fn handle_run<
                 // plan + bound parameters that decide which seeks to run, and only this site has them.
                 // Without it the reader declines every seek and full-scans a planned index.
                 inputs.index_candidates = coordinator.index_candidates_for(txn, &plan, &bound);
+                // `rmp` #866: capture this plan's count-store answers HERE, for the same reason — only
+                // this site has the plan, and only this thread may read the counters or evaluate their
+                // equivalence predicate. The verdict and the values are frozen together, so the reader
+                // reports a number that was provably equal to its own snapshot's count at capture time.
+                // An empty capture (predicate failed, or no count-store operator) declines to the scan.
+                //
+                // Not captured at all for a RESTRICTED principal. The counters are global and
+                // unfiltered, so a denied count must never be answered from them —
+                // `AuthorizedGraph::count_store_nodes` already declines before the memo is ever
+                // consulted (the reader wraps `ReadOnlyGraph` in an `AuthorizedGraph` exactly as the
+                // inline path does), and that decline is the load-bearing control. Skipping the capture
+                // is defence in depth on top of it: the number is then never computed, so it cannot be
+                // disclosed by some future path that reaches the memo without passing the decorator.
+                // It also saves the work, which for a restricted principal could never have been used.
+                if privileges
+                    .as_ref()
+                    .is_none_or(EffectivePrivileges::is_unrestricted)
+                {
+                    inputs.count_store = coordinator.count_store_for(txn, &plan);
+                }
                 // `rmp` #813: mint this auto-commit read's Bolt causal bookmark HERE, on the engine thread,
                 // from the DB's durable-write high-water — the latest already-durable write this read
                 // observes (it is dispatched only from a `RUN`, i.e. after any pending commit batch was

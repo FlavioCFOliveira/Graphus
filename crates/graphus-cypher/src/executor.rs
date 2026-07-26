@@ -2982,6 +2982,47 @@ fn build_operator_unprofiled(
             row: arg.cloned().unwrap_or_else(Row::empty),
         }),
 
+        // ---- count store (`rmp` task #866) -----------------------------------------------------
+        // Ask the seam; on `Some(n)` emit the single row the aggregation would have produced, on
+        // `None` build the fallback subtree and run it verbatim.
+        //
+        // The ask happens HERE, at operator-build time, and not one step earlier. The seam's answer
+        // depends on live transaction state — whether any transaction holds an uncommitted count
+        // delta, whether anything has committed since this statement's snapshot, whether this reader
+        // is Snapshot-isolated — none of which is a property of the plan, and all of which a cached
+        // plan ([`crate::plan_cache`]) would outlive. Deciding at plan time and consuming the verdict
+        // at execution time is a TOCTOU; deciding here is not, because the seam evaluates its
+        // predicate and reads its counter in the same instant, under one borrow, on the thread that
+        // owns the store.
+        //
+        // `count(*)` and `count(v)` both land here and both produce the same number: the recognizer
+        // only admits a bare scan below, and a scan binds a real entity on every row, so there is no
+        // null for `count(v)` to skip. The result is `Value::Integer(i64)` — byte-identical to what
+        // `Accumulator::finish` yields for `AggKind::Count`/`CountStar` — saturating rather than
+        // wrapping on the (unreachable) `u64` overflow, matching the plan-description convention.
+        PhysicalOp::NodeCountFromCountStore {
+            column,
+            label,
+            fallback,
+        } => match ctx
+            .graph
+            .count_store_nodes(label.as_ref().map(|l| l.name.as_str()))
+        {
+            Some(n) => Ok(count_store_row(column, n)),
+            None => build_operator(fallback, arg, ctx),
+        },
+        PhysicalOp::RelationshipCountFromCountStore {
+            column,
+            types,
+            fallback,
+        } => {
+            let names: Vec<String> = types.iter().map(|t| t.name.clone()).collect();
+            match ctx.graph.count_store_rels(&names) {
+                Some(n) => Ok(count_store_row(column, n)),
+                None => build_operator(fallback, arg, ctx),
+            }
+        }
+
         // ---- graph ----------------------------------------------------------------------------
         PhysicalOp::ExpandAll {
             input,
@@ -3523,6 +3564,31 @@ fn build_operator_with_arg(
     ctx: &mut Ctx<'_>,
 ) -> Result<Operator, ExecError> {
     build_operator(op, Some(left_row), ctx)
+}
+
+/// The single row a count-store operator emits (`rmp` task #866): `column` bound to `count`, and
+/// nothing else.
+///
+/// Deliberately built from [`Row::empty`] and **not** from the correlation row, because that is exactly
+/// what the [`Aggregation`](PhysicalOp::Aggregation) it replaces does: `aggregate_rows` starts each
+/// output row empty and sets only the group-key and aggregate aliases, so an ungrouped count yields a
+/// one-column row whether or not it sits under an `Apply`. Carrying the correlation row through here
+/// would add columns the scan path never produces — a bag difference visible the moment the shape
+/// appears inside a `CALL {}` subquery.
+///
+/// The `u64` counter becomes the `i64` [`Value::Integer`] that `Accumulator::finish` produces for
+/// `AggKind::Count` / `AggKind::CountStar`, saturating rather than wrapping (the same convention as
+/// `plan_description::clamp`); a live count above `i64::MAX` is unreachable in any storable graph.
+fn count_store_row(column: &str, count: u64) -> Operator {
+    let mut row = Row::empty();
+    row.set(
+        column.to_owned(),
+        RowValue::Value(Value::Integer(i64::try_from(count).unwrap_or(i64::MAX))),
+    );
+    Operator::SingleRow {
+        emitted: false,
+        row,
+    }
 }
 
 /// Rows for a label scan (each matching node bound to `variable`).
@@ -8779,6 +8845,15 @@ fn result_columns(op: &PhysicalOp, procedures: &dyn ProcedureRegistry) -> Vec<St
             .chain(aggregates)
             .map(|c| c.alias.clone())
             .collect(),
+        // Delegate to the fallback (`rmp` task #866) — it IS the `Aggregation` this replaces, so the
+        // declared columns are identical to the un-rewritten plan's by construction rather than by two
+        // implementations that have to be kept in step. This matters even more than usual here: the
+        // seam may decline and run that very subtree, and the column list is fixed before the statement
+        // executes, so the two paths must declare the same columns whichever one ends up running.
+        PhysicalOp::NodeCountFromCountStore { fallback, .. }
+        | PhysicalOp::RelationshipCountFromCountStore { fallback, .. } => {
+            result_columns(fallback, procedures)
+        }
         PhysicalOp::Filter { input, .. }
         | PhysicalOp::Skip { input, .. }
         | PhysicalOp::Limit { input, .. }

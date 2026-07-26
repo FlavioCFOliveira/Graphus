@@ -175,6 +175,7 @@ pub fn run_read_task<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send +
         buffer,
         fulltext,
         index_candidates,
+        count_store,
     } = inputs;
 
     // Build the off-thread read-only seam over the captured view. It accumulates this reader's SIREAD
@@ -187,8 +188,13 @@ pub fn run_read_task<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send +
     // reader re-checks them through the same lifted body the inline seam uses. An empty capture (any
     // non-indexed read, or a gate refusal) simply declines to the exact scan, as before.
     let mut graph = ReadOnlyGraph::new(view, tokens, snapshot, registry, txn, buffer)
+        // The captured count-store memo (`rmp` #866) lets an off-thread ungrouped `count()` over a bare
+        // label/type scan answer from a counter instead of reading every record. An empty capture — no
+        // count-store operator in the plan, or an equivalence predicate that did not hold on the engine
+        // thread — declines to the `Aggregation`-over-scan subtree, which is the reference path.
         .with_fulltext(fulltext)
-        .with_index_candidates(index_candidates);
+        .with_index_candidates(index_candidates)
+        .with_count_store(count_store);
 
     // RBAC (rmp #93) composes exactly as the inline path: a restricted principal wraps the seam in an
     // `AuthorizedGraph` so reads are filtered uniformly; `None`/admin runs the bare seam (zero cost).

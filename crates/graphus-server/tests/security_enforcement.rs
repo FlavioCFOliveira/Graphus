@@ -22,14 +22,24 @@
 //! unrestricted/admin path here is unchanged, so the TCK ratchet is unaffected.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use graphus_auth::{Action, Authenticator, Privilege};
 use graphus_bolt::server::{encode_client_handshake, encode_request_framed};
 use graphus_bolt::{BoltValue, Dechunker, Frame, Proposal, Request, Response};
 use graphus_core::Value;
+use graphus_core::capability::Clock;
+use graphus_cypher::{MaterializedValue, PrivilegeOracle};
+use graphus_io::MemBlockDevice;
 use graphus_server::config::{
     AdmissionConfig, AuthBootstrap, ServerConfig, TimingConfig, TlsConfig, UserBootstrap,
 };
+use graphus_server::engine::command::{AccessMode, RunSummary};
+use graphus_server::engine::{EffectivePrivileges, LocalEngine};
+use graphus_server::security::SecurityCatalog;
 use graphus_server::{Server, ServerHandle};
+use graphus_sim::SharedClock;
+use graphus_wal::MemLogSink;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
@@ -1265,4 +1275,531 @@ async fn relationship_type_scan_is_rbac_filtered_at_query_time_867() {
 
     bob.goodbye().await;
     server.shutdown().await.expect("clean shutdown");
+}
+
+// ================================================================================================
+// The count store (`rmp` task #866)
+// ================================================================================================
+
+/// Seeds the count-store fixture through `client` (which must be an admin session): 7 `:Person` and 5
+/// `:Secret` nodes, 4 `(:Person)-[:LIKES]->(:Person)` edges and 3 `(:Person)-[:SEES]->(:Secret)` edges.
+///
+/// The numbers are deliberately all different from one another and from every visible subset, so no
+/// assertion below can pass by coincidence: 12 nodes globally against 7 a restricted principal may see,
+/// 7 relationships globally against 0.
+async fn seed_count_store_fixture(client: &mut BoltClient) {
+    client
+        .run_ok(
+            "CREATE (:Person {n: 1}), (:Person {n: 2}), (:Person {n: 3}), (:Person {n: 4}), \
+             (:Person {n: 5}), (:Person {n: 6}), (:Person {n: 7})",
+        )
+        .await;
+    client
+        .run_ok(
+            "CREATE (:Secret {code: 1}), (:Secret {code: 2}), (:Secret {code: 3}), \
+             (:Secret {code: 4}), (:Secret {code: 5})",
+        )
+        .await;
+    client
+        .run_ok(
+            "MATCH (a:Person {n: 1}), (b:Person {n: 2}), (c:Person {n: 3}), (d:Person {n: 4}), \
+             (e:Person {n: 5}) \
+             CREATE (a)-[:LIKES {w: 1}]->(b), (b)-[:LIKES {w: 2}]->(c), (c)-[:LIKES {w: 3}]->(d), \
+             (d)-[:LIKES {w: 4}]->(e)",
+        )
+        .await;
+    client
+        .run_ok(
+            "MATCH (a:Person {n: 1}), (s1:Secret {code: 1}), (s2:Secret {code: 2}), \
+             (s3:Secret {code: 3}) \
+             CREATE (a)-[:SEES]->(s1), (a)-[:SEES]->(s2), (a)-[:SEES]->(s3)",
+        )
+        .await;
+}
+
+/// Runs `query` (an ungrouped `count`) and returns the single integer it produced.
+async fn count_of(client: &mut BoltClient, query: &str) -> i64 {
+    let rows = client.run_ok(query).await;
+    let values = ints(&rows, 0);
+    assert_eq!(
+        values.len(),
+        1,
+        "an ungrouped count returns exactly one row: {query:?}"
+    );
+    values[0]
+}
+
+/// **A count-store answer is RBAC-filtered end to end** (`rmp` task #866).
+///
+/// An ungrouped `count(*)` / `count(v)` over a *bare* label or relationship-type scan no longer has to
+/// enumerate anything: the planner rewrites it into a `NodeCountFromCountStore` /
+/// `RelationshipCountFromCountStore` operator that asks the seam
+/// (`GraphAccess::count_store_nodes` / `count_store_rels`) for the store's maintained live-record
+/// counter, keeping the recognised `Aggregation`-over-scan subtree as its fallback.
+///
+/// **Those counters are global and completely unfiltered by construction** — `statistics()` forwards
+/// them verbatim, by design. Answering a *result row* from one would therefore hand a principal that has
+/// been `DENY TRAVERSE`d a label or a relationship type the exact global count of the very thing it is
+/// denied. That is strictly worse than the `EXPLAIN` estimate of `rmp` #890 (metadata, not the answer)
+/// and is the same defect class as the `rmp` #820 / #822 / #826 authorisation gaps — all of which
+/// shipped behind green CI because enforcement was only ever asserted one layer below the query.
+///
+/// So `AuthorizedGraph` **declines** (`None`) for any principal that is not unrestricted — the blanket
+/// rule `rmp` #867 established for `scan_rels_by_type`, and here the only correct one: a scalar count
+/// carries no rows to gate, so there is nothing left to filter once the number exists. The query then
+/// runs the fallback, which RBAC-composes row by row through the decorator's own `scan_nodes` /
+/// `scan_nodes_by_label` / `expand`.
+///
+/// This is the end-to-end proof at the wire: real `GRANT WRITE ON GRAPH` + real `DENY TRAVERSE`, a real
+/// Bolt session over UDS, real counts. The companion
+/// [`count_store_decline_is_load_bearing_on_the_inline_path_866`] drives the same property through the
+/// **inline** engine path, where the decorator's decline is the *only* control.
+#[tokio::test]
+async fn count_store_is_rbac_filtered_at_query_time_866() {
+    let temp = TempStore::new("countstore-rbac");
+    let server = boot(base_config(&temp)).await;
+    let uds = server.uds_path.clone().expect("UDS enabled");
+
+    // ---- 1) Admin seeds, and the unrestricted principal reads the TRUE global counts. -----------
+    let mut alice = BoltClient::connect(&uds).await;
+    alice.handshake_and_logon("alice", "admin-pw8").await;
+    seed_count_store_fixture(&mut alice).await;
+
+    assert_eq!(
+        count_of(&mut alice, "MATCH (u:Person) RETURN count(u)").await,
+        7,
+        "an unrestricted principal counts every :Person"
+    );
+    assert_eq!(
+        count_of(&mut alice, "MATCH (s:Secret) RETURN count(s)").await,
+        5,
+        "an unrestricted principal counts every :Secret"
+    );
+    assert_eq!(
+        count_of(&mut alice, "MATCH (n) RETURN count(n)").await,
+        12,
+        "an unrestricted principal counts every node"
+    );
+    assert_eq!(
+        count_of(&mut alice, "MATCH ()-[r:LIKES]->() RETURN count(r)").await,
+        4,
+        "an unrestricted principal counts every :LIKES"
+    );
+    assert_eq!(
+        count_of(&mut alice, "MATCH ()-[r:SEES]->() RETURN count(r)").await,
+        3,
+        "an unrestricted principal counts every :SEES"
+    );
+    assert_eq!(
+        count_of(&mut alice, "MATCH ()-[r]->() RETURN count(r)").await,
+        7,
+        "an unrestricted principal counts every relationship"
+    );
+    alice.goodbye().await;
+
+    // ---- 2) bob: a graph-wide WRITE grant with two DENYs carved out of it. ----------------------
+    let mut admin = BoltClient::connect(&uds).await;
+    admin.handshake_and_logon("alice", "admin-pw8").await;
+    admin.run_ok("REVOKE ROLE readwrite FROM bob").await;
+    admin.run_ok("CREATE ROLE counter").await;
+    admin
+        .run_ok("GRANT WRITE ON GRAPH graphus TO counter")
+        .await;
+    admin.run_ok("GRANT ROLE counter TO bob").await;
+    admin
+        .run_ok("DENY TRAVERSE ON LABEL graphus.Secret TO counter")
+        .await;
+    admin
+        .run_ok("DENY TRAVERSE ON RELATIONSHIP graphus.LIKES TO counter")
+        .await;
+    admin.goodbye().await;
+
+    let mut bob = BoltClient::connect(&uds).await;
+    bob.handshake_and_logon("bob", "user2-pw8").await;
+
+    // ---- 3) The denied NODE LABEL: bob gets what he may see (0), never the global 5. ------------
+    assert_eq!(
+        count_of(&mut bob, "MATCH (s:Secret) RETURN count(s)").await,
+        0,
+        "DENY TRAVERSE on :Secret must count 0, NOT the global 5 the counter holds"
+    );
+    assert_eq!(
+        count_of(&mut bob, "MATCH (s:Secret) RETURN count(*)").await,
+        0,
+        "the count(*) spelling of the same shape must agree"
+    );
+    // The enumerating spelling is the reference path (it can never use a counter). It must agree.
+    let secret_rows = bob.run_ok("MATCH (s:Secret) RETURN s.code").await;
+    assert!(
+        secret_rows.is_empty(),
+        "the reference path enumerates no :Secret for bob: {secret_rows:?}"
+    );
+    // ...as must the arithmetic spelling, which the planner never rewrites to the count store.
+    assert_eq!(
+        count_of(&mut bob, "MATCH (s:Secret) RETURN count(s) + 0").await,
+        0,
+        "the count-store shape and the (never-rewritten) arithmetic shape must return the same number"
+    );
+
+    // ---- 4) The denied RELATIONSHIP TYPE: 0, never the global 4. --------------------------------
+    assert_eq!(
+        count_of(&mut bob, "MATCH ()-[r:LIKES]->() RETURN count(r)").await,
+        0,
+        "DENY TRAVERSE on :LIKES must count 0, NOT the global 4 the counter holds"
+    );
+    assert_eq!(
+        count_of(&mut bob, "MATCH ()-[r:LIKES]->() RETURN count(r) + 0").await,
+        0,
+        "the never-rewritten arithmetic spelling must agree"
+    );
+    // :SEES is not itself denied, but every one of its edges ends on a denied :Secret — so the
+    // relationship count must fall to 0 through the *endpoint* rule, not just the type rule.
+    assert_eq!(
+        count_of(&mut bob, "MATCH ()-[r:SEES]->() RETURN count(r)").await,
+        0,
+        "a :SEES edge into a DENY-TRAVERSEd :Secret is not traversable, so it must not be counted"
+    );
+    assert_eq!(
+        count_of(&mut bob, "MATCH ()-[r]->() RETURN count(r)").await,
+        0,
+        "the untyped relationship count must be 0, NOT the global 7"
+    );
+
+    // ---- 5) A permitted count is still EXACT: the blanket decline must not corrupt it. ----------
+    // bob is restricted (so the count store declines for him) but holds Traverse on :Person through
+    // the graph-wide grant. The fallback must therefore produce the true 7 — a decline is a slower
+    // path, never a wrong one.
+    assert_eq!(
+        count_of(&mut bob, "MATCH (u:Person) RETURN count(u)").await,
+        7,
+        "a restricted principal's permitted count must still be exact"
+    );
+    assert_eq!(
+        count_of(&mut bob, "MATCH (u:Person) RETURN count(u) + 0").await,
+        7,
+        "the never-rewritten arithmetic spelling must agree"
+    );
+    let person_rows = bob.run_ok("MATCH (u:Person) RETURN u.n").await;
+    assert_eq!(
+        person_rows.len(),
+        7,
+        "the reference path enumerates all 7 :Person for bob"
+    );
+    // The all-nodes count sees the :Person nodes only — 7, not the global 12.
+    assert_eq!(
+        count_of(&mut bob, "MATCH (n) RETURN count(n)").await,
+        7,
+        "the all-nodes count must exclude the DENY-TRAVERSEd :Secret nodes"
+    );
+
+    // ---- 6) CONTROL: the zeros above are enforcement, not a broken query. -----------------------
+    // Revoking each DENY must make the very same statements report the real numbers on bob's NEXT
+    // statement. Without this control every assertion in step 3/4 could be satisfied by a count that
+    // is simply always zero.
+    let mut admin2 = BoltClient::connect(&uds).await;
+    admin2.handshake_and_logon("alice", "admin-pw8").await;
+    admin2
+        .run_ok("REVOKE DENY TRAVERSE ON LABEL graphus.Secret FROM counter")
+        .await;
+    admin2.goodbye().await;
+
+    assert_eq!(
+        count_of(&mut bob, "MATCH (s:Secret) RETURN count(s)").await,
+        5,
+        "with the label DENY revoked, bob counts all 5 :Secret on his NEXT statement"
+    );
+    assert_eq!(
+        count_of(&mut bob, "MATCH ()-[r:SEES]->() RETURN count(r)").await,
+        3,
+        "and the :SEES edges into them become traversable again"
+    );
+    assert_eq!(
+        count_of(&mut bob, "MATCH (n) RETURN count(n)").await,
+        12,
+        "and the all-nodes count becomes the full 12"
+    );
+    assert_eq!(
+        count_of(&mut bob, "MATCH ()-[r:LIKES]->() RETURN count(r)").await,
+        0,
+        "the :LIKES DENY is still in force — the revoke was scoped to the label"
+    );
+
+    let mut admin3 = BoltClient::connect(&uds).await;
+    admin3.handshake_and_logon("alice", "admin-pw8").await;
+    admin3
+        .run_ok("REVOKE DENY TRAVERSE ON RELATIONSHIP graphus.LIKES FROM counter")
+        .await;
+    admin3.goodbye().await;
+
+    assert_eq!(
+        count_of(&mut bob, "MATCH ()-[r:LIKES]->() RETURN count(r)").await,
+        4,
+        "with the type DENY revoked, bob counts all 4 :LIKES on his NEXT statement"
+    );
+    assert_eq!(
+        count_of(&mut bob, "MATCH ()-[r]->() RETURN count(r)").await,
+        7,
+        "and the untyped relationship count becomes the full 7"
+    );
+
+    bob.goodbye().await;
+    server.shutdown().await.expect("clean shutdown");
+}
+
+// ------------------------------------------------------------------------------------------------
+// The inline (non-reader-pool) engine path — where the decorator's decline is the ONLY control.
+// ------------------------------------------------------------------------------------------------
+
+/// The inline, single-threaded engine driver: production's `ReadDispatch::Inline`.
+type InlineEngine = LocalEngine<MemBlockDevice, MemLogSink>;
+
+/// An in-memory inline engine over a simulated clock (the DST driver, `rmp` #160/#336).
+fn inline_engine() -> InlineEngine {
+    let clock = SharedClock::new(0);
+    LocalEngine::in_memory(Arc::new(clock) as Arc<dyn Clock + Send + Sync>, 256)
+        .expect("build in-memory engine")
+}
+
+/// Runs one auto-commit **write** on the inline engine as the unrestricted internal principal.
+fn inline_write(eng: &mut InlineEngine, stmt: &str) {
+    let ticket = eng
+        .begin_auto_commit(AccessMode::Write)
+        .expect("begin auto-commit write");
+    let mut reply = eng
+        .run(ticket, stmt, vec![], true, None)
+        .unwrap_or_else(|e| panic!("run {stmt:?}: {e:?}"));
+    while reply.rows.next().expect("drain rows").is_some() {}
+}
+
+/// Runs one auto-commit **read** on the inline engine as `privileges`, returning its single count and
+/// the result summary (which carries the `PROFILE` plan when the statement asked for one).
+///
+/// An auto-commit read is the exact shape `rmp` #545 demotes to Snapshot Isolation — the only shape the
+/// count store's equivalence predicate ever admits — so this is the statement kind under test.
+fn inline_count(
+    eng: &mut InlineEngine,
+    stmt: &str,
+    privileges: Option<&EffectivePrivileges>,
+) -> (i64, RunSummary) {
+    let ticket = eng
+        .begin_auto_commit(AccessMode::Read)
+        .expect("begin auto-commit read");
+    let mut reply = eng
+        .run(ticket, stmt, vec![], true, privileges.cloned())
+        .unwrap_or_else(|e| panic!("run {stmt:?}: {e:?}"));
+    let mut counts = Vec::new();
+    while let Some(row) = reply.rows.next().expect("drain rows") {
+        match row.first() {
+            Some(MaterializedValue::Value(Value::Integer(i))) => counts.push(*i),
+            other => panic!("expected an integer count from {stmt:?}, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        counts.len(),
+        1,
+        "an ungrouped count returns exactly one row: {stmt:?}"
+    );
+    // The summary is published before the row sender is dropped, so it is final once `rows` is drained.
+    (counts[0], reply.summary.get())
+}
+
+/// The measured `dbHits` of the plan's count-store operator, or `None` if the plan has no such
+/// operator.
+///
+/// This is the **witness of which access path actually ran** (`rmp` #752's whole purpose): the
+/// `ProfilingGraph` charges exactly **1** `dbHit` to the count-store operator when the seam answered
+/// from the counter, and **0** when it declined — in which case the `Aggregation`-over-scan subtree
+/// underneath does the work and is charged for it. Without this, a test could not tell an enforced
+/// decline apart from a count store that silently never engaged at all.
+fn count_store_db_hits(description: &Value) -> Option<i64> {
+    let Value::Map(entries) = description else {
+        return None;
+    };
+    let field = |key: &str| {
+        entries
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value)
+    };
+    if let Some(Value::String(operator)) = field("operatorType") {
+        if operator == "NodeCountFromCountStore" || operator == "RelationshipCountFromCountStore" {
+            if let Some(Value::Integer(hits)) = field("dbHits") {
+                return Some(*hits);
+            }
+        }
+    }
+    if let Some(Value::List(children)) = field("children") {
+        return children.iter().find_map(count_store_db_hits);
+    }
+    None
+}
+
+/// `PROFILE`s `stmt` on the inline engine as `privileges` and returns `(count, count-store dbHits)`.
+fn profiled_inline_count(
+    eng: &mut InlineEngine,
+    stmt: &str,
+    privileges: Option<&EffectivePrivileges>,
+) -> (i64, i64) {
+    let (count, summary) = inline_count(eng, &format!("PROFILE {stmt}"), privileges);
+    let plan = summary
+        .plan
+        .unwrap_or_else(|| panic!("a PROFILE statement reports a plan: {stmt:?}"));
+    assert!(
+        plan.profiled,
+        "the PROFILE prefix reports measured counters: {stmt:?}"
+    );
+    let hits = count_store_db_hits(&plan.description).unwrap_or_else(|| {
+        panic!("the plan of {stmt:?} must contain a count-store operator: {plan:?}")
+    });
+    (count, hits)
+}
+
+/// A **restricted** principal resolved from a real, live [`SecurityCatalog`]: `carol` holds a
+/// graph-wide `WRITE` grant (which implies Traverse + Read everywhere) carved by an explicit
+/// `DENY TRAVERSE` on the `:Secret` label and on the `:LIKES` relationship type — the same shape the
+/// wire test builds with real DDL.
+fn restricted_counter_privileges() -> EffectivePrivileges {
+    let mut auth = Authenticator::new(JWT_SECRET.as_bytes()).expect("build authenticator");
+    {
+        let catalog = auth.catalog_mut();
+        catalog.create_user("carol").expect("create user");
+        catalog.create_role("counter").expect("create role");
+        catalog
+            .grant_privilege("counter", Privilege::on_graph(Action::Write, "graphus"))
+            .expect("grant write on graph");
+        catalog
+            .deny_privilege(
+                "counter",
+                Privilege::on_label(Action::Traverse, "graphus", "Secret"),
+            )
+            .expect("deny traverse on label");
+        catalog
+            .deny_privilege(
+                "counter",
+                Privilege::on_rel_type(Action::Traverse, "graphus", "LIKES"),
+            )
+            .expect("deny traverse on relationship type");
+        catalog.grant_role("carol", "counter").expect("grant role");
+    }
+    // `from_parts` is the documented no-IO test seam: nothing is loaded or persisted, because nothing
+    // is mutated through the catalog after this point.
+    let security = Arc::new(SecurityCatalog::from_parts(
+        std::env::temp_dir(),
+        "alice".to_owned(),
+        auth,
+    ));
+    let privileges = EffectivePrivileges::resolve(security, Some("carol"), "graphus");
+    assert!(
+        !privileges.is_unrestricted(),
+        "the fixture principal MUST be restricted, or the decline under test never engages"
+    );
+    privileges
+}
+
+/// **The `AuthorizedGraph` count-store decline, proven load-bearing on the inline path** (`rmp` #866).
+///
+/// A booted server dispatches an auto-commit read to the reader pool, where a **second, independent**
+/// control also stops this leak: `engine/exec.rs` does not even capture the count-store memo for a
+/// restricted principal, so the off-thread seam has nothing to answer with. That is defence in depth,
+/// and it means the wire test above cannot, on its own, isolate the decorator's guard.
+///
+/// The **inline** engine path has no memo. It asks `RecordStoreGraph::count_store_nodes` /
+/// `count_store_rels` directly through the decorator, so there the `!oracle.is_unrestricted()` decline
+/// is the *only* thing standing between a `DENY TRAVERSE`d principal and the global counter. That path
+/// is not hypothetical: production takes it whenever the bounded reader queue is full
+/// (`ReadDispatch::try_submit` hands the task back and the statement runs on the engine thread), and
+/// the deterministic DST driver takes it **always** (`ReadDispatch::Inline`). This test drives it
+/// through `LocalEngine` with real [`EffectivePrivileges`].
+///
+/// Each case asserts **both** halves, and it is the pair that makes this evidence about the guard
+/// rather than about arithmetic:
+///
+/// * the **number** — a restricted principal gets what it may see, never the global counter;
+/// * the **path** — `dbHits == 1` on the count-store operator proves the counter really did answer for
+///   the unrestricted principal (so the operator is live, not inert), and `dbHits == 0` proves it was
+///   declined for the restricted one (so the equal-looking permitted count is the fallback's work).
+#[test]
+fn count_store_decline_is_load_bearing_on_the_inline_path_866() {
+    let mut eng = inline_engine();
+
+    // The same fixture the wire test seeds: 7 :Person + 5 :Secret nodes, 4 :LIKES + 3 :SEES edges.
+    inline_write(
+        &mut eng,
+        "CREATE (:Person {n: 1}), (:Person {n: 2}), (:Person {n: 3}), (:Person {n: 4}), \
+         (:Person {n: 5}), (:Person {n: 6}), (:Person {n: 7})",
+    );
+    inline_write(
+        &mut eng,
+        "CREATE (:Secret {code: 1}), (:Secret {code: 2}), (:Secret {code: 3}), \
+         (:Secret {code: 4}), (:Secret {code: 5})",
+    );
+    inline_write(
+        &mut eng,
+        "MATCH (a:Person {n: 1}), (b:Person {n: 2}), (c:Person {n: 3}), (d:Person {n: 4}), \
+         (e:Person {n: 5}) \
+         CREATE (a)-[:LIKES]->(b), (b)-[:LIKES]->(c), (c)-[:LIKES]->(d), (d)-[:LIKES]->(e)",
+    );
+    inline_write(
+        &mut eng,
+        "MATCH (a:Person {n: 1}), (s1:Secret {code: 1}), (s2:Secret {code: 2}), \
+         (s3:Secret {code: 3}) \
+         CREATE (a)-[:SEES]->(s1), (a)-[:SEES]->(s2), (a)-[:SEES]->(s3)",
+    );
+
+    let carol = restricted_counter_privileges();
+
+    // (statement, the true global count, what `carol` may actually see)
+    let cases: [(&str, i64, i64); 6] = [
+        ("MATCH (s:Secret) RETURN count(s) AS c", 5, 0),
+        ("MATCH (u:Person) RETURN count(u) AS c", 7, 7),
+        ("MATCH (n) RETURN count(n) AS c", 12, 7),
+        ("MATCH ()-[r:LIKES]->() RETURN count(r) AS c", 4, 0),
+        ("MATCH ()-[r:SEES]->() RETURN count(r) AS c", 3, 0),
+        ("MATCH ()-[r]->() RETURN count(r) AS c", 7, 0),
+    ];
+
+    // Every case is evaluated and every violation collected, so ONE run enumerates every leaking
+    // shape rather than stopping at the first — the report is then the whole picture, which is what a
+    // guard-removal (non-vacuity) check needs in order to cover both seam methods at once.
+    let mut violations: Vec<String> = Vec::new();
+    for (stmt, global, visible) in cases {
+        // Unrestricted: the counter answers (1 dbHit — a single catalogue read, not a scan) and the
+        // number is the true global one. This is what makes the restricted case below meaningful: the
+        // count store demonstrably DOES serve this statement on this path.
+        let (count, hits) = profiled_inline_count(&mut eng, stmt, None);
+        if count != global {
+            violations.push(format!(
+                "{stmt:?}: unrestricted count = {count}, expected the true global {global}"
+            ));
+        }
+        if hits != 1 {
+            violations.push(format!(
+                "{stmt:?}: the count store did NOT answer for an unrestricted principal \
+                 (dbHits = {hits}, expected 1) — the case proves nothing until it does"
+            ));
+        }
+
+        // Restricted: the decorator declines, so the very same statement runs the
+        // `Aggregation`-over-scan fallback and counts only what `carol` may traverse.
+        let (count, hits) = profiled_inline_count(&mut eng, stmt, Some(&carol));
+        if count != visible {
+            violations.push(format!(
+                "{stmt:?}: RESTRICTED count = {count}, expected the visible {visible} \
+                 (the global counter holds {global}) — a denied count was disclosed"
+            ));
+        }
+        if hits != 0 {
+            violations.push(format!(
+                "{stmt:?}: the count store was NOT declined for a restricted principal \
+                 (dbHits = {hits}, expected 0)"
+            ));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "the count-store access path leaked or mis-counted for {} of {} checks:\n  {}",
+        violations.len(),
+        cases.len() * 4,
+        violations.join("\n  ")
+    );
 }

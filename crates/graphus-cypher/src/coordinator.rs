@@ -1100,6 +1100,12 @@ pub struct ReadTaskInputs<D: BlockDevice, S: LogSink> {
     /// site fills it via [`TxnCoordinator::index_candidates_for`] — a miss simply declines, so an
     /// unfilled capture is always safe.
     pub index_candidates: crate::read_source::IndexCandidateCapture,
+    /// A `Send + Sync` memo of the **count-store answers** this plan will ask for (`rmp` task #866),
+    /// captured on the engine thread together with the verdict that they are equivalent to what this
+    /// reader's snapshot would count. Empty (the default) unless the dispatch site fills it via
+    /// [`TxnCoordinator::count_store_for`] — a miss simply declines to the scan, so an unfilled capture
+    /// is always safe, and it is deliberately left empty whenever the equivalence predicate fails.
+    pub count_store: crate::read_source::CountStoreCapture,
 }
 
 // `rmp` #336 Slice 3b-ii: `ReadTaskInputs` is captured on the engine thread and MOVED into the
@@ -9429,6 +9435,9 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             // caller — the DST harness, the tests — on the pre-#755 behaviour: a miss declines to the
             // exact scan.
             index_candidates: crate::read_source::IndexCandidateCapture::default(),
+            // Left empty here for the same reason as `index_candidates`: only the dispatch site holds
+            // the plan that says which counts are wanted. An unfilled memo declines to the scan.
+            count_store: crate::read_source::CountStoreCapture::default(),
         })
     }
 
@@ -9593,6 +9602,93 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         capture.absorb(index.capture_rel_composite(reader_ts, &rel_composite_requests));
         capture.absorb(index.capture_node_spatial(reader_ts, &spatial_requests));
         capture.absorb(index.capture_rel_spatial(reader_ts, &rel_spatial_requests));
+        capture
+    }
+
+    /// Captures, on the engine thread, the **count-store answers** `plan` will ask for on a reader
+    /// thread (`rmp` task #866) — or an empty capture, which makes every lookup miss and the reader
+    /// fall back to the `Aggregation`-over-scan subtree.
+    ///
+    /// This is the off-thread half of the count-store access path. The inline seam
+    /// ([`RecordStoreGraph::count_store_nodes`](crate::record_graph::RecordStoreGraph)) proves its
+    /// equivalence predicate and reads the counter in one borrow on this same thread; a reader thread
+    /// can do neither — it holds no live store, and the predicate is about *this* thread's current
+    /// state. So the verdict and the values are frozen together here, at dispatch, at an instant at
+    /// which the predicate provably held.
+    ///
+    /// The predicate is the same three conjuncts, for the same reasons, and is documented in full on
+    /// `RecordStoreGraph::count_store_equivalent`:
+    ///
+    /// * **E1** no transaction holds a pending count delta ([`RecordStore::counts_match_committed_image`])
+    ///   — the counters move eagerly at write time, so an in-flight writer's rows are already in them;
+    /// * **E2** nothing has committed since this reader's snapshot (`snapshot_ts() == snapshot.ts`);
+    /// * **E3** the reader is Snapshot-isolated, so its (absent) SIREAD markers are discarded anyway.
+    ///
+    /// E3 is guaranteed at this call site — only a structurally read-only auto-commit statement is
+    /// dispatched off-thread, and it was demoted before dispatch — but it is **checked**, not assumed:
+    /// a future caller that dispatched a Serializable read would otherwise silently narrow its read
+    /// footprint, and this function has no way to know it happened.
+    #[must_use]
+    pub fn count_store_for(
+        &self,
+        txn: TxnId,
+        plan: &crate::physical::PhysicalPlan,
+    ) -> crate::read_source::CountStoreCapture {
+        let mut capture = crate::read_source::CountStoreCapture::default();
+        let (node_requests, rel_requests) = plan.count_store_requests();
+        if node_requests.is_empty() && rel_requests.is_empty() {
+            return capture;
+        }
+        // An unknown transaction cannot have a snapshot to be equivalent to; decline.
+        let Some(active) = self.active.get(&txn) else {
+            return capture;
+        };
+        // E3, keyed on `SsiTracker::is_snapshot` — the SAME predicate the inline seam uses
+        // (`RecordStoreGraph::count_store_equivalent`), and deliberately NOT `isolation.runs_ssi()`.
+        //
+        // The two are not the same set, and the difference is a real hole (`rmp` #866). What makes
+        // answering with zero SIREAD markers sound is that the reader's buffer is DROPPED by
+        // `SsiTracker::merge_read_buffer`, which gates on `snapshot_txns` membership — i.e. on
+        // `is_snapshot`, nothing else. `demote_read_to_snapshot` sets both the per-transaction
+        // isolation and that membership, so for a demoted auto-commit read the two agree; but
+        // `begin(IsolationLevel::Snapshot)` sets only the isolation, and such a reader's markers ARE
+        // merged. Gating on the isolation alone would hand it a count with no markers, dropping an
+        // rw-edge and preventing a Serializable pivot's abort — a transaction SSI would have aborted
+        // would commit instead. No server path reaches it today (`AccessMode::isolation()` returns
+        // `Serializable` unconditionally), but both this method and `begin` are public, so the
+        // predicate must be right by construction rather than by who happens to call it.
+        //
+        // It is also the stronger gate for the case that IS live: a reader-safe procedure read is
+        // dispatched off-thread but deliberately NOT demoted (`rmp` #548), so it keeps full
+        // Serializable SSI. `runs_ssi()` happened to decline it; `is_snapshot()` declines it because it
+        // is genuinely not in `snapshot_txns`, which is the reason that actually matters.
+        if !self.ssi.borrow().is_snapshot(txn) {
+            return capture;
+        }
+        let store = self.store.borrow();
+        if store.snapshot_ts() != active.snapshot.ts || !store.counts_match_committed_image() {
+            return capture;
+        }
+        for label in node_requests {
+            let count = match label.as_deref() {
+                Some(l) => crate::store_statistics::nodes_with_label(&store, l),
+                None => store.total_node_count(),
+            };
+            capture.insert_nodes(label, count);
+        }
+        for types in rel_requests {
+            // Sum over the (already deduplicated) types — a relationship carries exactly one type — and
+            // read the grand total for the "any type" request.
+            let count = if types.is_empty() {
+                store.total_relationship_count()
+            } else {
+                types
+                    .iter()
+                    .map(|t| crate::store_statistics::relationships_with_type(&store, t))
+                    .sum()
+            };
+            capture.insert_rels(types, count);
+        }
         capture
     }
 

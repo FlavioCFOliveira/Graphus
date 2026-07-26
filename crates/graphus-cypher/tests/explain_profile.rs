@@ -584,3 +584,110 @@ fn profile_db_hits_prove_the_index_seek_reads_less_of_the_store() {
         "the index seek must read a fraction of what the scan reads: seek={seek_hits} scan={scan_hits}"
     );
 }
+
+// =================================================================================================
+// Count store (`rmp` task #866) — the plan must never claim a path that did not run
+// =================================================================================================
+
+/// `EXPLAIN` distinguishes the count-store path from the scan, so an operator can see which one the
+/// planner chose. A shape the counters cannot answer — here an `Aggregation` over a `Filter` — must
+/// not carry the operator at all: that decision is plan-time and therefore fully honest.
+#[test]
+fn explain_distinguishes_the_count_store_from_the_scan_866() {
+    let mut g = people(20);
+    let (_, eligible) = run(
+        "EXPLAIN MATCH (p:Person) RETURN count(p) AS c",
+        &IndexCatalog::empty(),
+        &mut g,
+    );
+    let eligible = eligible.expect("EXPLAIN yields a description");
+    assert!(
+        eligible.contains_operator("NodeCountFromCountStore"),
+        "the bare label count must plan the count store: {eligible:?}"
+    );
+
+    let (_, ineligible) = run(
+        "EXPLAIN MATCH (p:Person) WHERE p.name = 'p1' RETURN count(p) AS c",
+        &IndexCatalog::empty(),
+        &mut g,
+    );
+    let ineligible = ineligible.expect("EXPLAIN yields a description");
+    assert!(
+        !ineligible.contains_operator("NodeCountFromCountStore"),
+        "a filtered count is not answerable from a counter and must not claim the fast path: \
+         {ineligible:?}"
+    );
+}
+
+/// The count-store operator keeps the subtree it replaces as its **child**, and says so. `rmp` #755 is
+/// this project's standing example of the opposite failure — a plan that rendered `NodeIndexSeek`
+/// while a full scan ran, with nothing in the output to say so. Here the alternative is printed
+/// directly underneath, and the operator's own `Details` names the condition.
+#[test]
+fn the_count_store_plan_shows_the_fallback_it_would_run_866() {
+    let mut g = people(20);
+    let (_, d) = run(
+        "EXPLAIN MATCH (p:Person) RETURN count(p) AS c",
+        &IndexCatalog::empty(),
+        &mut g,
+    );
+    let d = d.expect("EXPLAIN yields a description");
+    let root = d.root();
+    assert_eq!(root.operator_type, "NodeCountFromCountStore");
+    let details = match root.args.iter().find(|(k, _)| k == "Details") {
+        Some((_, Value::String(s))) => s.clone(),
+        other => panic!("expected a Details string, got {other:?}"),
+    };
+    assert!(
+        details.contains("else child"),
+        "the rendering must state that the child runs when the seam declines: {details}"
+    );
+    // The scan it replaces is visible one level down, not hidden.
+    assert!(
+        d.contains_operator("Aggregation") && d.contains_operator("NodeByLabelScan"),
+        "the fallback subtree must be part of the plan: {d:?}"
+    );
+}
+
+/// `PROFILE` corroborates which path ran. Over `MemGraph` the seam always answers, so the fallback
+/// child must show **zero** rows and zero `dbHits` — it did not run — while the whole statement costs
+/// a single `dbHit` instead of one per record.
+#[test]
+fn profile_db_hits_show_the_count_store_did_not_read_every_record_866() {
+    let mut g = people(200);
+    let (rows, d) = run(
+        "PROFILE MATCH (p:Person) RETURN count(p) AS c",
+        &IndexCatalog::empty(),
+        &mut g,
+    );
+    assert_eq!(rows, 1);
+    let d = d.expect("PROFILE yields a description");
+    let total = total_db_hits(&d);
+    assert!(
+        total <= 2,
+        "a count answered from the counter must not read the 200 records it counted: {total} dbHits"
+    );
+
+    // The fallback child is present in the plan but did no work — that is how a reader tells.
+    let child = &d.root().children[0];
+    assert_eq!(child.operator_type, "Aggregation");
+    assert_eq!(
+        child.rows,
+        Some(0),
+        "the fallback aggregation must report no rows: it did not run"
+    );
+    assert_eq!(child.db_hits, Some(0));
+
+    // Contrast: the same count with a filter takes the scan and pays for every record examined.
+    let mut g = people(200);
+    let (_, scanned) = run(
+        "PROFILE MATCH (p:Person) WHERE p.name <> 'zz' RETURN count(p) AS c",
+        &IndexCatalog::empty(),
+        &mut g,
+    );
+    let scanned = total_db_hits(&scanned.expect("PROFILE yields a description"));
+    assert!(
+        scanned > total,
+        "the scanning path must measurably read more than the count store ({scanned} vs {total})"
+    );
+}

@@ -534,6 +534,39 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         self.inner.scan_rels_by_type(types)
     }
 
+    fn count_store_nodes(&self, label: Option<&str>) -> Option<u64> {
+        // The count store (`rmp` task #866), composed with RBAC by **declining** for any restricted
+        // principal — the same blanket rule as `scan_rels_by_type` above, and here it is not a
+        // conservative choice but the only correct one.
+        //
+        // The counters are global and unfiltered by construction: `statistics()` forwards them verbatim
+        // (see this decorator's own `statistics`, and `rmp` #890 for the fact that `EXPLAIN` already
+        // discloses them as an estimate). Answering a *result row* from them would hand a principal who
+        // has been DENYed a label the exact global count of the very thing it is denied — an
+        // authorization bypass strictly worse than #890, because #890 leaks an estimate in plan
+        // metadata whereas this would leak the answer itself. It is the same defect class as `rmp`
+        // #820/#822/#826.
+        //
+        // Filtering here is not available as an alternative: a scalar count carries no rows to gate,
+        // and there is no per-entity visibility decision left to make once the number exists. Declining
+        // sends the query to the `Aggregation`-over-scan fallback, which RBAC-composes row by row
+        // through this decorator's own `scan_nodes` / `scan_nodes_by_label`, so a restricted principal
+        // gets the count of what it may actually see.
+        if !self.oracle.is_unrestricted() {
+            return None;
+        }
+        self.inner.count_store_nodes(label)
+    }
+
+    fn count_store_rels(&self, types: &[String]) -> Option<u64> {
+        // See `count_store_nodes` above (`rmp` task #866). A principal with `DENY TRAVERSE` on a
+        // relationship type must not be told how many of them exist.
+        if !self.oracle.is_unrestricted() {
+            return None;
+        }
+        self.inner.count_store_rels(types)
+    }
+
     fn node_exists(&self, node: NodeId) -> bool {
         if self.oracle.is_unrestricted() {
             return self.inner.node_exists(node);

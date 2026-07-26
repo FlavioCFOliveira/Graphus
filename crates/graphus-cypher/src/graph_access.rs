@@ -325,6 +325,73 @@ pub trait GraphAccess {
         None
     }
 
+    /// An **optional** count-store answer: how many nodes this statement's snapshot would see from a
+    /// bare label scan (`label = Some`) or a bare all-nodes scan (`label = None`) — `rmp` task #866.
+    ///
+    /// This is the access path behind
+    /// [`NodeCountFromCountStore`](crate::physical::PhysicalOp::NodeCountFromCountStore), which
+    /// replaces an ungrouped `count(*)` / `count(v)` over such a scan. The point is to answer in O(1)
+    /// from a maintained counter instead of reading every node record.
+    ///
+    /// # Contract
+    ///
+    /// [`None`] means "not answerable here"; the caller then runs the scan-and-aggregate subtree,
+    /// which is the reference path. **Declining is always legal and always correct.** Returning a
+    /// wrong number is not: unlike a candidate set from an index seam, a scalar count has *no*
+    /// downstream re-check that could repair it — it becomes the result row verbatim. So an
+    /// implementation must return [`Some`] only when it can prove exactness, and must prefer [`None`]
+    /// whenever it cannot.
+    ///
+    /// Exactness here means **bag-equivalence with the scan it replaces**: the count of entities the
+    /// *reading transaction's own MVCC snapshot* would bind, including that transaction's own
+    /// uncommitted writes and excluding every other transaction's. A counter maintained over the
+    /// committed image is not that number by construction, which is why the store-backed
+    /// implementation guards it (see
+    /// [`RecordStoreGraph`](crate::record_graph::RecordStoreGraph)'s implementation for the three-part
+    /// equivalence predicate it proves before answering).
+    ///
+    /// Its SSI read footprint is **empty**, which is *narrower* than the scan's — the one place this
+    /// seam inverts [`scan_rels_by_type`](Self::scan_rels_by_type)'s superset rule. A narrower
+    /// footprint drops rw-edges and can admit an anomaly SSI would otherwise catch, so an
+    /// implementation may only answer for a reader whose markers are provably discarded anyway (a
+    /// Snapshot-isolated read). This is a **precondition of answering**, not a property of the seam.
+    ///
+    /// # Read faults are not surfaced here
+    ///
+    /// The scan this replaces touches record pages, so an I/O fault or a corrupt page captures an error
+    /// into the statement's channel and fails the statement (the fail-closed-on-read-fault contract of
+    /// `rmp` #733). A counter read touches no page, so that cannot arise: a statement that would
+    /// previously have surfaced store corruption now returns the count and succeeds. This does not
+    /// violate #733's intent — that contract exists to stop a read fault silently yielding a *smaller*
+    /// answer, and the counter yields the true committed cardinality rather than a truncated scan — but
+    /// it is a real change in when corruption becomes visible, and it is deliberate rather than
+    /// overlooked.
+    ///
+    /// The default is `None`, so a backend that keeps no counts — and, deliberately, any decorator
+    /// that cannot reproduce its own filtering over a scalar (see
+    /// [`AuthorizedGraph`](crate::authorized_graph::AuthorizedGraph)) — keeps the reference path.
+    fn count_store_nodes(&self, _label: Option<&str>) -> Option<u64> {
+        None
+    }
+
+    /// An **optional** count-store answer: how many relationships this statement's snapshot would see
+    /// from a bare **directed** relationship scan over `types` (empty = any type) — `rmp` task #866.
+    ///
+    /// The relationship twin of [`count_store_nodes`](Self::count_store_nodes); every note there
+    /// applies. Two extra obligations are specific to relationships:
+    ///
+    /// - **Directed only.** The caller must not ask for an *undirected* pattern. `MATCH ()-[r:T]-()`
+    ///   binds each non-self relationship **twice** (once per orientation) and each self-loop **once**,
+    ///   so the row count is `2 * rels - self_loops` — and the self-loop count is not tracked. A raw
+    ///   per-type counter would answer roughly half. That is the defect `rmp` #867 had just fixed in
+    ///   the executor, and the recognizer declines the shape rather than reintroduce it here.
+    /// - **A type appears once.** `types` is deduplicated by the caller. A relationship carries exactly
+    ///   one type, so the exact answer is the *sum* over distinct types; summing a repeated type
+    ///   (`-[:A|A]->`) would double-count it.
+    fn count_store_rels(&self, _types: &[String]) -> Option<u64> {
+        None
+    }
+
     /// Whether `node` currently exists (is visible).
     fn node_exists(&self, node: NodeId) -> bool;
 
@@ -1289,6 +1356,34 @@ impl GraphAccess for MemGraph {
             .filter(|(_, n)| n.labels.iter().any(|l| l == label))
             .map(|(id, _)| *id)
             .collect()
+    }
+
+    /// Answers the count-store seam (`rmp` task #866) **exactly, by counting the live map**.
+    ///
+    /// There is no counter to be stale against and no MVCC snapshot to disagree with: this backend's
+    /// map *is* the graph, so the count is by construction the number of rows
+    /// [`scan_nodes_by_label`](Self::scan_nodes_by_label) / [`scan_nodes`](Self::scan_nodes) would
+    /// produce. It buys no time here — its value is that the executor's count-store operator is then
+    /// exercised by the whole reference-backend corpus (the TCK runs on `MemGraph`), so the operator's
+    /// bag equivalence, column naming and plan shape are proven against the same expectations the scan
+    /// path is held to, rather than only in bespoke tests.
+    fn count_store_nodes(&self, label: Option<&str>) -> Option<u64> {
+        Some(match label {
+            Some(l) => self.scan_nodes_by_label(l).len() as u64,
+            None => self.nodes.len() as u64,
+        })
+    }
+
+    /// Answers the relationship count-store seam (`rmp` task #866) exactly — see
+    /// [`count_store_nodes`](Self::count_store_nodes). Counts each relationship **once**, which is the
+    /// row count of a *directed* bare scan; the recognizer never asks for the undirected shape.
+    fn count_store_rels(&self, types: &[String]) -> Option<u64> {
+        Some(
+            self.rels
+                .values()
+                .filter(|r| type_matches(&r.rel_type, types))
+                .count() as u64,
+        )
     }
 
     fn expand(&self, node: NodeId, direction: ExpandDirection, types: &[String]) -> Vec<Incident> {

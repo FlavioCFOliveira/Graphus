@@ -310,6 +310,32 @@ impl GraphAccess for ProfilingGraph<'_> {
         r
     }
 
+    fn count_store_nodes(&self, label: Option<&str>) -> Option<u64> {
+        // Forwarded explicitly (`rmp` task #866), for the same reason as `scan_rels_by_type` above: the
+        // trait default is `None`, so an unforwarded method would make every `PROFILE`d count take the
+        // scan fallback that an un-profiled run does not — the plan would then report `dbHits` for a
+        // path that only PROFILE takes, which is precisely the `rmp` #755 defect class.
+        //
+        // One `dbHit` per answer: the count is a single catalogue read, however many entities it
+        // counts. That is the whole point of the operator, and it is what makes `dbHits` the honest
+        // witness of which path ran — a served count charges 1, a decline charges 0 here and the
+        // fallback subtree charges its own scan underneath.
+        let r = self.inner.count_store_nodes(label);
+        if r.is_some() {
+            self.hit1();
+        }
+        r
+    }
+
+    fn count_store_rels(&self, types: &[String]) -> Option<u64> {
+        // See `count_store_nodes` above (`rmp` task #866).
+        let r = self.inner.count_store_rels(types);
+        if r.is_some() {
+            self.hit1();
+        }
+        r
+    }
+
     fn node_exists(&self, node: NodeId) -> bool {
         self.hit1();
         self.inner.node_exists(node)

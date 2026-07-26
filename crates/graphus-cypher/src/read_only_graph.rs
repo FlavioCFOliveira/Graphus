@@ -98,6 +98,15 @@ pub struct ReadOnlyGraph<D: BlockDevice, S: LogSink> {
     /// [`with_index_candidates`](Self::with_index_candidates); an empty capture simply declines, which
     /// is the pre-#755 behaviour (correct, just unaccelerated).
     index_candidates: read_source::IndexCandidateCapture,
+    /// The engine-thread-captured memo of **count-store answers** (`rmp` task #866), letting this
+    /// reader answer an ungrouped `count()` over a bare scan from a counter instead of reading every
+    /// record. Empty (the [`new`](Self::new) default) unless supplied via
+    /// [`with_count_store`](Self::with_count_store); an empty capture simply declines to the
+    /// `Aggregation`-over-scan subtree, which is the reference path.
+    ///
+    /// The memo carries values only — the equivalence predicate that authorised them was proven on the
+    /// engine thread at capture time, because this thread can neither evaluate it nor keep it true.
+    count_store: read_source::CountStoreCapture,
 }
 
 impl<D: BlockDevice, S: LogSink> ReadOnlyGraph<D, S> {
@@ -136,6 +145,7 @@ impl<D: BlockDevice, S: LogSink> ReadOnlyGraph<D, S> {
             error: RefCell::new(None),
             fulltext: read_source::FulltextReadSnapshot::default(),
             index_candidates: read_source::IndexCandidateCapture::default(),
+            count_store: read_source::CountStoreCapture::default(),
         }
     }
 
@@ -155,6 +165,16 @@ impl<D: BlockDevice, S: LogSink> ReadOnlyGraph<D, S> {
     /// empty capture. Consumes and returns `self` for chaining at the dispatch site.
     pub fn with_index_candidates(mut self, candidates: read_source::IndexCandidateCapture) -> Self {
         self.index_candidates = candidates;
+        self
+    }
+
+    /// Attaches the captured count-store answers (`rmp` task #866), enabling this reader to serve
+    /// [`count_store_nodes`](crate::graph_access::GraphAccess::count_store_nodes) /
+    /// [`count_store_rels`](crate::graph_access::GraphAccess::count_store_rels). A builder for the same
+    /// reasons as [`with_index_candidates`](Self::with_index_candidates). Consumes and returns `self`
+    /// for chaining at the dispatch site.
+    pub fn with_count_store(mut self, counts: read_source::CountStoreCapture) -> Self {
+        self.count_store = counts;
         self
     }
 
@@ -288,6 +308,23 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // body implements) — registering the identical `Label`/`AllNodes` + per-candidate SIREAD markers
         // the live index arm registers, so serializability is unchanged.
         read_source::scan_nodes_by_label(&self.source(), &self.ctx(), self, label)
+    }
+
+    fn count_store_nodes(&self, label: Option<&str>) -> Option<u64> {
+        // A pure memo lookup (`rmp` task #866). Everything that makes answering *sound* — the
+        // equivalence predicate, the counter read, the atomicity between them — happened on the engine
+        // thread at dispatch; this thread only reports what was frozen there.
+        //
+        // A MISS declines, and must: returning `Some(0)` for an uncaptured count would report an empty
+        // graph, which is the scalar face of the `rmp` #680/#738 "never `Some(empty)`" rule. The capture
+        // is deliberately empty whenever the predicate failed, so "not equivalent" and "not asked for"
+        // arrive here as the same, safe answer.
+        self.count_store.nodes(label)
+    }
+
+    fn count_store_rels(&self, types: &[String]) -> Option<u64> {
+        // See `count_store_nodes` above (`rmp` task #866).
+        self.count_store.rels(types)
     }
 
     fn scan_filter_eq(&self, label: &str, property: &str, value: &Value) -> ScanFilter {

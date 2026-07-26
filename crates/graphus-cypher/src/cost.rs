@@ -612,6 +612,15 @@ pub fn estimate_cost(op: &PhysicalOp, stats: Option<&dyn Statistics>) -> CostEst
             CostEstimate::new(rows, inner.cost + inner.rows * COST_ROW_PROJECT)
         }
 
+        // One row, one catalogue read, no per-row work (`rmp` task #866). The fallback subtree's cost is
+        // deliberately NOT added: this operator is not a choice the cost model makes — the recognizer
+        // wraps a qualifying shape unconditionally and the seam decides at execution time — so charging
+        // for a subtree that usually does not run would misprice every plan containing one.
+        PhysicalOp::NodeCountFromCountStore { .. }
+        | PhysicalOp::RelationshipCountFromCountStore { .. } => {
+            CostEstimate::new(1.0, COST_SEEK_SETUP)
+        }
+
         // A full sort: rows unchanged, an n·ln(n) comparison cost.
         PhysicalOp::Sort { input, .. } => {
             let inner = estimate_cost(input, stats);
@@ -865,6 +874,10 @@ fn physical_label_for_var(op: &PhysicalOp, variable: &str) -> Option<String> {
         | PhysicalOp::Filter { input, .. }
         | PhysicalOp::Projection { input, .. }
         | PhysicalOp::Aggregation { input, .. }
+        // `rmp` task #866: recurse into the fallback, so a label stated by the scan underneath a
+        // count-store operator is still discoverable.
+        | PhysicalOp::NodeCountFromCountStore { fallback: input, .. }
+        | PhysicalOp::RelationshipCountFromCountStore { fallback: input, .. }
         | PhysicalOp::Sort { input, .. }
         | PhysicalOp::TopN { input, .. }
         | PhysicalOp::Skip { input, .. }

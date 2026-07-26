@@ -265,6 +265,23 @@ impl PhysicalPlan {
         contains_procedure_call(&self.root)
     }
 
+    /// The **count-store requests** this plan would make (`rmp` task #866): the node-count targets
+    /// (`Some(label)` / `None` for the grand total) and the relationship-type lists its
+    /// [`NodeCountFromCountStore`](PhysicalOp::NodeCountFromCountStore) /
+    /// [`RelationshipCountFromCountStore`](PhysicalOp::RelationshipCountFromCountStore) operators carry.
+    ///
+    /// The off-thread dispatch site uses this to build the reader's memo: only the plan knows which
+    /// counts will be asked for, and only the engine thread may read them. Both lists are empty for a
+    /// plan with no count-store operator, so the caller skips the capture entirely — which is also the
+    /// state that makes an unfilled memo safe (every lookup misses and declines to the scan).
+    #[must_use]
+    pub fn count_store_requests(&self) -> (Vec<Option<String>>, Vec<Vec<String>>) {
+        let mut nodes = Vec::new();
+        let mut rels = Vec::new();
+        gather_count_store_requests(&self.root, &mut nodes, &mut rels);
+        (nodes, rels)
+    }
+
     /// Whether **every** procedure this plan invokes is **reader-safe** (`rmp` task #546) — i.e. the
     /// plan calls no procedure at all, or every `CALL` targets a procedure the `registry` classifies
     /// reader-safe ([`ProcedureRegistry::is_reader_safe`](crate::procedure_registry::ProcedureRegistry::is_reader_safe)).
@@ -554,6 +571,14 @@ impl PhysicalOp {
             | Self::Delete { input, .. }
             | Self::Remove { input, .. } => vec![input],
 
+            // The count-store operators' one sub-plan is their `fallback` (`rmp` task #866): the
+            // `Aggregation`-over-scan subtree that runs whenever the seam declines. It is a genuine
+            // child, not a template — the plan description must show it (that is what keeps `EXPLAIN`
+            // honest about the conditional path) and `PROFILE` must be able to attribute its rows and
+            // `dbHits`, which is precisely how a reader tells whether it ran.
+            Self::NodeCountFromCountStore { fallback, .. }
+            | Self::RelationshipCountFromCountStore { fallback, .. } => vec![fallback],
+
             // Two sub-plans.
             Self::NestedLoopJoin { left, right }
             | Self::HashJoin { left, right, .. }
@@ -604,6 +629,8 @@ impl PhysicalOp {
             Self::Filter { .. } => "Filter",
             Self::Projection { .. } => "Projection",
             Self::Aggregation { .. } => "Aggregation",
+            Self::NodeCountFromCountStore { .. } => "NodeCountFromCountStore",
+            Self::RelationshipCountFromCountStore { .. } => "RelationshipCountFromCountStore",
             Self::Sort { .. } => "Sort",
             Self::TopN { .. } => "TopN",
             Self::Skip { .. } => "Skip",
@@ -1309,6 +1336,57 @@ pub enum PhysicalOp {
         /// The aggregate columns.
         aggregates: Vec<ProjectionColumn>,
     },
+    /// **Node count from the count store** — one row carrying an ungrouped `count(*)` / `count(v)`
+    /// over a bare node scan, answered from a maintained counter instead of reading every record
+    /// (`rmp` task #866). Neo4j plans `NodeCountFromCountStore` for exactly this shape.
+    ///
+    /// # Why it carries its own fallback
+    ///
+    /// This operator is **conditional**, and deliberately so. Whether the counter equals what this
+    /// statement's snapshot would count is a fact about the *runtime* state — whether any transaction
+    /// holds an uncommitted count delta, whether anything has committed since the snapshot was taken,
+    /// and whether the reader is Snapshot-isolated (see
+    /// [`count_store_nodes`](crate::graph_access::GraphAccess::count_store_nodes)). None of those is
+    /// knowable when the plan is built, and a plan is cached across executions
+    /// ([`crate::plan_cache`]), so baking a verdict into the plan would be a TOCTOU. The verdict is
+    /// therefore taken at execution time, and [`fallback`](Self::NodeCountFromCountStore::fallback) —
+    /// the original `Aggregation`-over-scan subtree — runs verbatim whenever the seam declines.
+    ///
+    /// Keeping the fallback as a **child** rather than reconstructing it is what makes `EXPLAIN`
+    /// honest. `rmp` #755 is this project's standing example of the opposite: a plan that rendered
+    /// `NodeIndexSeek` while a full scan actually ran, with nothing in the output to say so. Here the
+    /// scan is *in the plan*, one level down, so an operator reading `EXPLAIN` sees both the fast path
+    /// and what replaces it; and under `PROFILE` the child's own `rows` / `dbHits` are non-zero
+    /// exactly when it ran. A shape that can never use the count store never gets this operator at
+    /// all — that decision *is* plan-time (see `rewrite_count_store`).
+    NodeCountFromCountStore {
+        /// The output column name — the alias of the `count(...)` projection column this replaces,
+        /// carried through verbatim so the result bag is byte-identical (`RETURN count(u)` names the
+        /// column `count(u)`; `... AS n` names it `n`).
+        column: String,
+        /// The label the scan was restricted to, or [`None`] for a bare `MATCH (n)` (the grand total).
+        label: Option<Label>,
+        /// The `Aggregation`-over-scan subtree this replaces, run verbatim when the seam declines.
+        fallback: Box<PhysicalOp>,
+    },
+    /// **Relationship count from the count store** — the relationship twin of
+    /// [`NodeCountFromCountStore`](Self::NodeCountFromCountStore) (`rmp` task #866). Neo4j plans
+    /// `RelationshipCountFromCountStore` for this shape.
+    ///
+    /// Only ever built for a **directed** bare scan. An undirected pattern binds each non-self
+    /// relationship twice and each self-loop once, so its row count is not the relationship count and
+    /// the untracked self-loop total makes it unrecoverable from the counters; the recognizer declines
+    /// that shape (`rmp` #867 had just fixed the executor's version of exactly that halving).
+    RelationshipCountFromCountStore {
+        /// The output column name, carried through verbatim — see
+        /// [`NodeCountFromCountStore::column`](Self::NodeCountFromCountStore::column).
+        column: String,
+        /// The relationship-type alternatives, **deduplicated**; empty means "any type". A
+        /// relationship carries exactly one type, so the exact answer is the sum over distinct types.
+        types: Vec<RelType>,
+        /// The `Aggregation`-over-scan subtree this replaces, run verbatim when the seam declines.
+        fallback: Box<PhysicalOp>,
+    },
     /// Sort the input by `keys` (full sort; used when no adjacent `LIMIT` fuses it into a
     /// [`TopN`](Self::TopN)).
     Sort {
@@ -1765,13 +1843,22 @@ pub fn plan_physical_with_stats(
             // cost-based optimiser has settled every access path — so it only elides a Sort when the
             // subtree kept an ordered-capable index access (a cost-reverted scan keeps its Sort).
             let optimized = elide_provided_order_sorts(optimized);
+            // Count-store recognition (`rmp` task #866) runs after every access-path decision has
+            // settled, because it matches on the FINAL leaf: `MATCH (u:USER)` is a `NodeByLabelScan`
+            // or a `TokenLookupScan` depending on the catalogue, and running earlier would see only
+            // one of them. It is not cost-based — it wraps the subtree it recognises and keeps it as
+            // the fallback, so it never removes a cheaper plan.
+            let optimized = rewrite_count_store(optimized);
             let deps = collect_index_dependencies(&optimized);
             (optimized, deps)
         }
         // No stats: the rule-based tree is final (no access-path rewrites), so the elision pass is
         // sound to run directly on it. It preserves index ops (only marks one ordered), so the
         // dependencies gathered during lowering stay correct.
-        None => (elide_provided_order_sorts(rule_based), deps),
+        None => (
+            rewrite_count_store(elide_provided_order_sorts(rule_based)),
+            deps,
+        ),
     };
 
     PhysicalPlan {
@@ -3120,6 +3207,12 @@ fn contains_read(op: &PhysicalOp) -> bool {
         PhysicalOp::Filter { input, .. }
         | PhysicalOp::Projection { input, .. }
         | PhysicalOp::Aggregation { input, .. }
+        // The count-store operators recurse into their `fallback` (`rmp` task #866): it is the
+        // subtree that runs when the seam declines, so every structural question — does this plan
+        // read, write, call a procedure, carry an `Argument`, depend on an index — must be answered
+        // about it, exactly as for any other single-input operator.
+        | PhysicalOp::NodeCountFromCountStore { fallback: input, .. }
+        | PhysicalOp::RelationshipCountFromCountStore { fallback: input, .. }
         | PhysicalOp::Sort { input, .. }
         | PhysicalOp::TopN { input, .. }
         | PhysicalOp::Skip { input, .. }
@@ -3157,6 +3250,12 @@ fn contains_write(op: &PhysicalOp) -> bool {
         PhysicalOp::Filter { input, .. }
         | PhysicalOp::Projection { input, .. }
         | PhysicalOp::Aggregation { input, .. }
+        // The count-store operators recurse into their `fallback` (`rmp` task #866): it is the
+        // subtree that runs when the seam declines, so every structural question — does this plan
+        // read, write, call a procedure, carry an `Argument`, depend on an index — must be answered
+        // about it, exactly as for any other single-input operator.
+        | PhysicalOp::NodeCountFromCountStore { fallback: input, .. }
+        | PhysicalOp::RelationshipCountFromCountStore { fallback: input, .. }
         | PhysicalOp::Sort { input, .. }
         | PhysicalOp::TopN { input, .. }
         | PhysicalOp::Skip { input, .. }
@@ -3213,6 +3312,12 @@ fn contains_procedure_call(op: &PhysicalOp) -> bool {
         PhysicalOp::Filter { input, .. }
         | PhysicalOp::Projection { input, .. }
         | PhysicalOp::Aggregation { input, .. }
+        // The count-store operators recurse into their `fallback` (`rmp` task #866): it is the
+        // subtree that runs when the seam declines, so every structural question — does this plan
+        // read, write, call a procedure, carry an `Argument`, depend on an index — must be answered
+        // about it, exactly as for any other single-input operator.
+        | PhysicalOp::NodeCountFromCountStore { fallback: input, .. }
+        | PhysicalOp::RelationshipCountFromCountStore { fallback: input, .. }
         | PhysicalOp::Sort { input, .. }
         | PhysicalOp::TopN { input, .. }
         | PhysicalOp::Skip { input, .. }
@@ -3289,6 +3394,12 @@ fn all_procedure_calls_reader_safe(
         PhysicalOp::Filter { input, .. }
         | PhysicalOp::Projection { input, .. }
         | PhysicalOp::Aggregation { input, .. }
+        // The count-store operators recurse into their `fallback` (`rmp` task #866): it is the
+        // subtree that runs when the seam declines, so every structural question — does this plan
+        // read, write, call a procedure, carry an `Argument`, depend on an index — must be answered
+        // about it, exactly as for any other single-input operator.
+        | PhysicalOp::NodeCountFromCountStore { fallback: input, .. }
+        | PhysicalOp::RelationshipCountFromCountStore { fallback: input, .. }
         | PhysicalOp::Sort { input, .. }
         | PhysicalOp::TopN { input, .. }
         | PhysicalOp::Skip { input, .. }
@@ -4842,6 +4953,190 @@ fn elide_provided_order_sorts(op: PhysicalOp) -> PhysicalOp {
     elide_sort_over_ordered_index(op)
 }
 
+/// Collects every count-store operator's request from `op` (`rmp` task #866), depth-first.
+///
+/// Walks through [`PhysicalOp::children`] rather than matching each variant, so it needs no
+/// maintenance when an operator is added: a count-store operator can appear anywhere a projection can
+/// (a `UNION` branch, a `CALL {}` subquery), and the walk reaches all of them. It deliberately keeps
+/// recursing *through* a count-store operator into its fallback, because a nested one there would
+/// still be asked.
+fn gather_count_store_requests(
+    op: &PhysicalOp,
+    nodes: &mut Vec<Option<String>>,
+    rels: &mut Vec<Vec<String>>,
+) {
+    match op {
+        PhysicalOp::NodeCountFromCountStore { label, .. } => {
+            nodes.push(label.as_ref().map(|l| l.name.clone()));
+        }
+        PhysicalOp::RelationshipCountFromCountStore { types, .. } => {
+            rels.push(types.iter().map(|t| t.name.clone()).collect());
+        }
+        _ => {}
+    }
+    for child in op.children() {
+        gather_count_store_requests(child, nodes, rels);
+    }
+}
+
+/// What a recognised count-store shape counts.
+enum CountStoreTarget {
+    /// Nodes carrying a label, or — for [`None`] — every node (a bare `MATCH (n)`).
+    Nodes(Option<Label>),
+    /// Relationships of any of these **deduplicated** types; empty means every relationship.
+    Rels(Vec<RelType>),
+}
+
+/// The count-store rewrite (`rmp` task #866): an ungrouped `count(*)` / `count(v)` over a **bare**
+/// node or relationship scan is wrapped in a
+/// [`NodeCountFromCountStore`](PhysicalOp::NodeCountFromCountStore) /
+/// [`RelationshipCountFromCountStore`](PhysicalOp::RelationshipCountFromCountStore) that can answer it
+/// from a maintained counter — keeping the recognised subtree as its fallback.
+///
+/// Runs as the **final** pass, for the reason [`elide_provided_order_sorts`] runs late and one more:
+/// the shape it matches is stated over the *final* leaf, and `MATCH (u:USER)` lowers to a
+/// [`NodeByLabelScan`](PhysicalOp::NodeByLabelScan) or a
+/// [`TokenLookupScan`](PhysicalOp::TokenLookupScan) depending on the catalogue. Matching only one of
+/// them would make the optimisation silently depend on whether a label index happens to exist.
+///
+/// Bag-preserving by construction: it never discards the subtree, so the worst case is that the seam
+/// declines at execution time and the fallback runs — the original plan, verbatim.
+fn rewrite_count_store(op: PhysicalOp) -> PhysicalOp {
+    // Children first, so a qualifying aggregation nested in a `UNION` branch or a `CALL {}` subquery is
+    // recognised in its own right.
+    let op = map_children(op, &rewrite_count_store);
+    let Some((column, target)) = count_store_target(&op) else {
+        return op;
+    };
+    match target {
+        CountStoreTarget::Nodes(label) => PhysicalOp::NodeCountFromCountStore {
+            column,
+            label,
+            fallback: Box::new(op),
+        },
+        CountStoreTarget::Rels(types) => PhysicalOp::RelationshipCountFromCountStore {
+            column,
+            types,
+            fallback: Box::new(op),
+        },
+    }
+}
+
+/// The count-store **precondition gate**: `Some((output column, what to count))` when `op` is a shape a
+/// counter can answer exactly, [`None`] otherwise (`rmp` task #866).
+///
+/// Every precondition below is load-bearing; each is pinned by a decline test.
+///
+/// * **`Aggregation` with no group keys.** With group keys the answer is one row per group, and no
+///   per-group counter exists.
+/// * **Exactly one aggregate.** More than one means more output columns than a single counter read can
+///   fill. (Two `count`s over the same scan would agree, but the general case does not, and the narrow
+///   rule needs no case analysis.)
+/// * **A bare `count`, not `DISTINCT`, not an expression containing one.** `count(DISTINCT v)`
+///   de-duplicates by value and a counter cannot; `count(u) + 1` is an arithmetic expression whose
+///   operand happens to be a count. The function name is matched exactly as
+///   [`Accumulator::new`](crate::executor) matches it (`name.join(".")`, ASCII-case-insensitively), so the
+///   recognizer and the executor can never disagree about what a `count` is.
+/// * **`count(*)` and `count(v)` are interchangeable *here*, and only here.** `count(v)` skips nulls
+///   while `count(*)` does not — they coincide solely because the input is a scan leaf, which binds its
+///   variable to a real entity on every row and therefore never yields a null. That is a property of
+///   the admitted inputs, not of `count`, which is why the gate insists on a bare scan directly below.
+/// * **The counted variable is the scan's own.** `count(v)` over a leaf that does not bind `v` would
+///   be counting something else.
+/// * **The input is a *bare* scan.** Anything between the aggregation and the leaf — a `Filter` (which
+///   `MATCH (u:A:B)`, a `WHERE`, an inline property map and an inline label expression all produce), an
+///   `Optional`, a join, a `Limit` — changes which rows reach the count, and no counter knows about it.
+///   Requiring the leaf to be the aggregation's *direct* child is what makes this exhaustive rather
+///   than a list of things to exclude.
+/// * **Directed relationships only.** An undirected pattern binds each non-self relationship twice and
+///   each self-loop once, so its row count is `2 * rels - self_loops`; the self-loop total is not
+///   tracked, so the answer is not recoverable from the counters. `rmp` #867 had just fixed the
+///   executor's version of exactly this halving — declining is how it stays fixed.
+/// * **Types are deduplicated.** A relationship carries exactly one type, so the exact count is the sum
+///   over *distinct* types; `-[:A|A]->` would otherwise be counted twice.
+/// * **Distinct endpoint variables.** `from.name == to.name` is a self-loop-only pattern
+///   (`MATCH (a)-[r:T]->(a)`), whose row count is the number of self-loops — a quantity the counters do
+///   not track, and emphatically not the per-type total this arm would answer. Today the lowerer never
+///   produces it (a repeated endpoint lowers to `ExpandInto` over a node scan, which is not a bare
+///   scan and declines above), so this conjunct is unreachable. It is here anyway because the gate's
+///   whole claim is to be exhaustive over what the operator *can* be handed rather than a list of the
+///   shapes the lowerer happens to emit: were `AllRelationshipsScan` ever widened to named endpoints,
+///   the silent failure would be a total reported as a self-loop count.
+fn count_store_target(op: &PhysicalOp) -> Option<(String, CountStoreTarget)> {
+    let PhysicalOp::Aggregation {
+        input,
+        group_keys,
+        aggregates,
+    } = op
+    else {
+        return None;
+    };
+    if !group_keys.is_empty() {
+        return None;
+    }
+    let [aggregate] = aggregates.as_slice() else {
+        return None;
+    };
+    let counted = bare_count_variable(&aggregate.expr)?;
+    // A `count(v)` naming a variable the leaf does not bind is not this leaf's count.
+    let binds = |variable: &Var| counted.is_none_or(|v| v == variable.name);
+    let column = aggregate.alias.clone();
+    match input.as_ref() {
+        PhysicalOp::AllNodesScan { variable } if binds(variable) => {
+            Some((column, CountStoreTarget::Nodes(None)))
+        }
+        PhysicalOp::NodeByLabelScan { variable, label }
+        | PhysicalOp::TokenLookupScan {
+            variable, label, ..
+        } if binds(variable) => Some((column, CountStoreTarget::Nodes(Some(label.clone())))),
+        PhysicalOp::AllRelationshipsScan {
+            relationship,
+            from,
+            to,
+            direction,
+            types,
+        } if binds(relationship)
+            && !matches!(direction, crate::ast::RelDirection::Undirected)
+            && from.name != to.name =>
+        {
+            let mut distinct: Vec<RelType> = Vec::with_capacity(types.len());
+            for t in types {
+                if !distinct.iter().any(|d| d.name == t.name) {
+                    distinct.push(t.clone());
+                }
+            }
+            Some((column, CountStoreTarget::Rels(distinct)))
+        }
+        _ => None,
+    }
+}
+
+/// Classifies an aggregate expression as a **bare, non-`DISTINCT` `count`** (`rmp` task #866):
+/// `Some(None)` for `count(*)`, `Some(Some(name))` for `count(name)`, [`None`] for everything else —
+/// including `count(DISTINCT v)`, `count(v.prop)`, and any expression that merely *contains* a count.
+fn bare_count_variable(expr: &Expr) -> Option<Option<&str>> {
+    match &expr.kind {
+        ExprKind::CountStar => Some(None),
+        ExprKind::FunctionCall {
+            name,
+            distinct,
+            args,
+        } => {
+            if *distinct || !name.join(".").eq_ignore_ascii_case("count") {
+                return None;
+            }
+            let [arg] = args.as_slice() else {
+                return None;
+            };
+            match &arg.kind {
+                ExprKind::Variable(v) => Some(Some(v.as_str())),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Rebuilds `op` with `f` applied to each of its immediate child subplans, leaving `op`'s own shape
 /// otherwise untouched. **The single place the plan recursion lists each operator's children** — every
 /// variant appears exactly once, so a new operator variant is a compile error until classified here.
@@ -4997,6 +5292,28 @@ fn map_children(op: PhysicalOp, f: &dyn Fn(PhysicalOp) -> PhysicalOp) -> Physica
             input: go(input),
             group_keys,
             aggregates,
+        },
+        // `rmp` task #866. The count-store operators are rebuilt with their `fallback` mapped, so a
+        // whole-tree pass reaches the scan subtree underneath them. In practice the recognizer runs
+        // last, so nothing rewrites below one of these — but a pass that silently stopped here would
+        // be a trap for the next one added, and `elide_provided_order_sorts` also routes through here.
+        PhysicalOp::NodeCountFromCountStore {
+            column,
+            label,
+            fallback,
+        } => PhysicalOp::NodeCountFromCountStore {
+            column,
+            label,
+            fallback: go(fallback),
+        },
+        PhysicalOp::RelationshipCountFromCountStore {
+            column,
+            types,
+            fallback,
+        } => PhysicalOp::RelationshipCountFromCountStore {
+            column,
+            types,
+            fallback: go(fallback),
         },
         PhysicalOp::Sort { input, keys } => PhysicalOp::Sort {
             input: go(input),
@@ -5428,6 +5745,12 @@ fn contains_correlated_seek(op: &PhysicalOp) -> bool {
         PhysicalOp::Filter { input, .. }
         | PhysicalOp::Projection { input, .. }
         | PhysicalOp::Aggregation { input, .. }
+        // The count-store operators recurse into their `fallback` (`rmp` task #866): it is the
+        // subtree that runs when the seam declines, so every structural question — does this plan
+        // read, write, call a procedure, carry an `Argument`, depend on an index — must be answered
+        // about it, exactly as for any other single-input operator.
+        | PhysicalOp::NodeCountFromCountStore { fallback: input, .. }
+        | PhysicalOp::RelationshipCountFromCountStore { fallback: input, .. }
         | PhysicalOp::Sort { input, .. }
         | PhysicalOp::TopN { input, .. }
         | PhysicalOp::Skip { input, .. }
@@ -5485,6 +5808,12 @@ fn contains_argument(op: &PhysicalOp) -> bool {
         PhysicalOp::Filter { input, .. }
         | PhysicalOp::Projection { input, .. }
         | PhysicalOp::Aggregation { input, .. }
+        // The count-store operators recurse into their `fallback` (`rmp` task #866): it is the
+        // subtree that runs when the seam declines, so every structural question — does this plan
+        // read, write, call a procedure, carry an `Argument`, depend on an index — must be answered
+        // about it, exactly as for any other single-input operator.
+        | PhysicalOp::NodeCountFromCountStore { fallback: input, .. }
+        | PhysicalOp::RelationshipCountFromCountStore { fallback: input, .. }
         | PhysicalOp::Sort { input, .. }
         | PhysicalOp::TopN { input, .. }
         | PhysicalOp::Skip { input, .. }
@@ -5930,6 +6259,12 @@ fn gather_index_dependencies(op: &PhysicalOp, deps: &mut BTreeSet<IndexId>) {
         PhysicalOp::Filter { input, .. }
         | PhysicalOp::Projection { input, .. }
         | PhysicalOp::Aggregation { input, .. }
+        // The count-store operators recurse into their `fallback` (`rmp` task #866): it is the
+        // subtree that runs when the seam declines, so every structural question — does this plan
+        // read, write, call a procedure, carry an `Argument`, depend on an index — must be answered
+        // about it, exactly as for any other single-input operator.
+        | PhysicalOp::NodeCountFromCountStore { fallback: input, .. }
+        | PhysicalOp::RelationshipCountFromCountStore { fallback: input, .. }
         | PhysicalOp::Sort { input, .. }
         | PhysicalOp::TopN { input, .. }
         | PhysicalOp::Skip { input, .. }
@@ -6677,6 +7012,14 @@ fn gather_bound_vars(plan: &PhysicalOp, out: &mut Vec<Var>) {
                 push_unique(out, Var::named(&col.alias));
             }
         }
+        // Delegate to the `fallback` (`rmp` task #866) rather than pushing `column` directly. The
+        // fallback IS the `Aggregation` this replaces, so delegation makes the identifiers the plan
+        // description reports byte-identical to the un-rewritten plan's — by construction, not by two
+        // implementations that must be kept in step.
+        PhysicalOp::NodeCountFromCountStore { fallback, .. }
+        | PhysicalOp::RelationshipCountFromCountStore { fallback, .. } => {
+            gather_bound_vars(fallback, out);
+        }
         PhysicalOp::NestedLoopJoin { left, right }
         | PhysicalOp::HashJoin { left, right, .. }
         | PhysicalOp::ValueHashJoin { left, right, .. } => {
@@ -7094,6 +7437,42 @@ impl PhysicalOp {
                     h::columns(aggregates),
                 )?;
                 input.fmt_indented(f, depth + 1)
+            }
+            // `rmp` task #866. The rendering states the condition explicitly — `else child` — because
+            // this operator, unlike every other access path in the plan, may not be the path that
+            // runs. An operator reading `EXPLAIN` must not have to know that from the source; and the
+            // child it names is printed directly underneath, so the alternative is visible rather
+            // than implied. Under `PROFILE` that child's own `rows` / `dbHits` settle which ran.
+            Self::NodeCountFromCountStore {
+                column,
+                label,
+                fallback,
+            } => {
+                writeln!(
+                    f,
+                    "NodeCountFromCountStore({column} over {}, else child)",
+                    match label {
+                        Some(l) => format!(":{}", l.name),
+                        None => "all nodes".to_owned(),
+                    },
+                )?;
+                fallback.fmt_indented(f, depth + 1)
+            }
+            Self::RelationshipCountFromCountStore {
+                column,
+                types,
+                fallback,
+            } => {
+                writeln!(
+                    f,
+                    "RelationshipCountFromCountStore({column} over {}, else child)",
+                    if types.is_empty() {
+                        "all relationships".to_owned()
+                    } else {
+                        h::types(types)
+                    },
+                )?;
+                fallback.fmt_indented(f, depth + 1)
             }
             Self::Sort { input, keys } => {
                 writeln!(f, "Sort({})", h::sort_keys(keys))?;

@@ -985,6 +985,72 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         }
     }
 
+    /// The **count-store equivalence predicate** (`rmp` task #866): whether the store's durable
+    /// live-record counters equal what *this* statement's snapshot would count by scanning.
+    ///
+    /// The counters are not an MVCC read. They are a single shared tally over the committed image plus
+    /// whatever in-flight transactions have already added to it, with no snapshot and no per-principal
+    /// filtering. Three independent things can therefore make them disagree with a scan, and each needs
+    /// its own conjunct. Answering a `count()` from them without all three is not an optimisation, it is
+    /// a wrong result — so this returns `false` liberally and the caller falls back to the scan, which
+    /// is always correct.
+    ///
+    /// **E1 — no transaction holds a pending count delta** ([`RecordStore::counts_match_committed_image`]).
+    /// The counters move **eagerly, at write time**, not at commit, so an uncommitted foreign writer's
+    /// creates and deletes are *already* in them; reading one then would be a dirty read. That
+    /// foreign-writer dirty read is E1's **live** role, and it is the only one: read-your-own-writes
+    /// also falls out of the arithmetic here (a transaction that has itself written holds a non-empty
+    /// delta, so it declines and scans, and the scan sees its own uncommitted rows) — but that path is
+    /// **unreachable as a control**, because a transaction that has written is never SI-demoted and so
+    /// E3 has already declined it. Do not read E1 as the guard that delivers read-your-own-writes; E3
+    /// is. Stating it the other way round is what once let two "own writes" tests pass with **every**
+    /// conjunct removed, since a lone writer's eager counter coincidentally equals its own view
+    /// (`rmp` #866 audit finding F3 — both tests now run a concurrent foreign writer, so no single
+    /// tally can satisfy them).
+    /// This conjunct also depends on the counters being drift-free, which they are only because
+    /// rollback now withdraws a transaction's own delta from the pre-rollback image instead of
+    /// reverting the shared tally wholesale (the defect this task uncovered).
+    ///
+    /// **E2 — nothing has committed since this snapshot was taken** (`snapshot_ts() == self.snapshot.ts`).
+    /// The committed image the counters describe is the image *now*; the rows this statement may see are
+    /// the image as of `self.snapshot.ts`. A transaction that committed in between is in the counter and
+    /// invisible to the scan. `snapshot_ts()` is the commit-timestamp high-water and every commit
+    /// pre-increments it, so equality is an exact "nothing has committed since". It is *conservative* in
+    /// the safe direction only: a read-only commit also ticks the high-water (`rmp` #529's phantom
+    /// tick), so this occasionally declines a statement that would have been equivalent.
+    ///
+    /// **E3 — this reader is Snapshot-isolated.** A counter read registers **no** SIREAD markers, i.e. a
+    /// strictly *narrower* read footprint than the scan it replaces. For a Serializable transaction that
+    /// would drop rw-edges and could admit an anomaly SSI exists to catch — the one place this seam
+    /// inverts the superset rule that governs every other accelerated path here. It is admissible only
+    /// for a reader whose markers are discarded anyway: an SI-demoted auto-commit read
+    /// (`rmp` #545), whose buffer `SsiTracker::merge_read_buffer` drops unmerged and whose commit skips
+    /// pivot detection. For such a reader, registering nothing is observationally identical to
+    /// registering everything. An explicit `BEGIN … COMMIT` read is Serializable and declines here.
+    ///
+    /// # Why this is not a TOCTOU
+    ///
+    /// All three conjuncts, and the counter read they authorise, run inside the **single `store.borrow()`
+    /// the caller holds**, on the engine thread — the only thread that commits, and one that cannot
+    /// yield in between. There is no instant at which a commit could land after the predicate passed and
+    /// before the number was read. A verdict computed at plan time and consumed at execution time would
+    /// be exactly the hazard this avoids, which is also why the operator asks the seam at build time
+    /// rather than carrying a plan-time flag (plans are cached and outlive their transactions).
+    ///
+    /// The off-thread reader cannot use this at all — it never touches the live store — so it is served
+    /// by a memo captured here, on this thread, at dispatch.
+    fn count_store_equivalent(&self, store: &RecordStore<D, S>) -> bool {
+        // E3 first: it is the cheapest, and the overwhelmingly common decline (every explicit
+        // transaction and every write statement).
+        let snapshot_isolated = self
+            .ssi
+            .as_ref()
+            .is_some_and(|ssi| ssi.borrow().is_snapshot(self.txn));
+        snapshot_isolated
+            && store.snapshot_ts() == self.snapshot.ts
+            && store.counts_match_committed_image()
+    }
+
     /// Removes this statement's accumulated SIREAD-marker buffer for **off-thread delivery** (`rmp` task
     /// #336): the reader hands the owned buffer back to the coordinator, which merges it on the engine
     /// thread (the merge must run where the shared tracker lives). After this the seam's drop merge is a
@@ -4152,6 +4218,37 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             self,
             types,
         )
+    }
+
+    fn count_store_nodes(&self, label: Option<&str>) -> Option<u64> {
+        let store = self.store.borrow();
+        // ONE borrow spanning the predicate and the read — see `count_store_equivalent` for why that
+        // is what makes the answer race-free rather than merely likely-correct.
+        if !self.count_store_equivalent(&store) {
+            return None;
+        }
+        Some(match label {
+            Some(l) => crate::store_statistics::nodes_with_label(&store, l),
+            None => store.total_node_count(),
+        })
+    }
+
+    fn count_store_rels(&self, types: &[String]) -> Option<u64> {
+        let store = self.store.borrow();
+        if !self.count_store_equivalent(&store) {
+            return None;
+        }
+        // A relationship carries exactly one type, so the count over a set of types is the sum over
+        // them; the caller has already deduplicated, so no type is added twice. An empty list is "any
+        // type", which is the grand total rather than an empty sum.
+        Some(if types.is_empty() {
+            store.total_relationship_count()
+        } else {
+            types
+                .iter()
+                .map(|t| crate::store_statistics::relationships_with_type(&store, t))
+                .sum()
+        })
     }
 
     fn node_exists(&self, node: NodeId) -> bool {

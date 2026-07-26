@@ -473,6 +473,76 @@ const _: () = {
     let _ = assert_index_candidate_capture;
 };
 
+/// A `Send + Sync` memo of the **count-store answers** an off-thread reader's plan will ask for
+/// (`rmp` task #866), captured on the engine thread at dispatch by
+/// [`TxnCoordinator::count_store_for`](crate::coordinator::TxnCoordinator::count_store_for).
+///
+/// # Why a memo and not a live read
+///
+/// The reader thread holds no live store — only an owned [`StoreReadView`] and a snapshot — so it
+/// cannot read the durable counters at all, and it could not evaluate their equivalence predicate
+/// even if it could: "no transaction holds a pending count delta" and "nothing has committed since
+/// this snapshot" are facts about the engine thread's *current* state, and by the time a reader ran
+/// them the engine would already have moved on. Capturing the verdict **and** the value together, on
+/// the engine thread, in the same borrow that takes the snapshot, is what makes the answer race-free:
+/// the pair is frozen at an instant at which the predicate provably held.
+///
+/// # Contract
+///
+/// A **miss declines** — the reader falls back to the `Aggregation`-over-scan subtree, which is the
+/// reference path. So an empty capture (the default) is always safe, and the capture is deliberately
+/// left empty whenever the predicate fails, when the plan needs no count, or when a token is unknown.
+/// There is no "captured but wrong" state to guard against: the only way a value enters is with the
+/// predicate already proven.
+#[derive(Debug, Default, Clone)]
+pub struct CountStoreCapture {
+    /// `Some(label)` → nodes carrying it; `None` → the grand total (a bare `MATCH (n)`).
+    nodes: HashMap<Option<String>, u64>,
+    /// The **deduplicated** relationship-type list the operator asked for (empty = any type) → the
+    /// count. Keyed by the list itself, in the operator's own order, because that is what the reader
+    /// re-presents verbatim; a differently-ordered spelling simply misses and declines.
+    rels: HashMap<Vec<String>, u64>,
+}
+
+// `rmp` #866: the capture rides a `ReadTask` to a reader thread, so it must be `Send + Sync` — the same
+// compile-time assertion `IndexCandidateCapture` carries, for the same reason.
+const _: () = {
+    fn assert_send_sync<T: Send + Sync>() {}
+    fn assert_count_store_capture() {
+        assert_send_sync::<CountStoreCapture>();
+    }
+    let _ = assert_count_store_capture;
+};
+
+impl CountStoreCapture {
+    /// Memoises `count` as the answer for a node count over `label` (`None` = every node).
+    pub fn insert_nodes(&mut self, label: Option<String>, count: u64) {
+        self.nodes.insert(label, count);
+    }
+
+    /// Memoises `count` as the answer for a relationship count over `types` (empty = any type).
+    pub fn insert_rels(&mut self, types: Vec<String>, count: u64) {
+        self.rels.insert(types, count);
+    }
+
+    /// The memoised node count, or [`None`] if it was not captured — which the caller MUST turn into a
+    /// declined seam (the scan fallback), never a zero. A `Some(0)` here is a real, captured "no such
+    /// node"; the `None` is "no answer", and conflating them would report an empty graph.
+    #[must_use]
+    pub fn nodes(&self, label: Option<&str>) -> Option<u64> {
+        // `HashMap<Option<String>, _>` cannot be probed with `Option<&str>` through `Borrow`, so the key
+        // is materialised. It happens once per statement, not once per row.
+        self.nodes.get(&label.map(ToOwned::to_owned)).copied()
+    }
+
+    /// The memoised relationship count, or [`None`] if it was not captured — see
+    /// [`nodes`](Self::nodes) for why that is not a zero.
+    #[must_use]
+    pub fn rels(&self, types: &[String]) -> Option<u64> {
+        self.rels.get(types).copied()
+    }
+}
+
 /// The canonical, unambiguous byte key for a `(lower, upper)` range request (`rmp` #768). Each side is
 /// a tag byte — `0` = open, `1` = inclusive, `2` = exclusive — followed, when present, by the
 /// length-prefixed [`encode_single`] of the bound value. Returns `None` when a present bound value is
