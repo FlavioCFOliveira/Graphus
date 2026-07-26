@@ -830,18 +830,91 @@ impl<'t, 's> Parser<'t, 's> {
         let optional = self.eat(&TokenKind::Optional);
         self.expect(&TokenKind::Match, "MATCH")?;
         let pattern = self.parse_pattern()?;
+        let hints = self.parse_planner_hints()?;
         let where_clause = self.parse_optional_where()?;
         let end = where_clause
             .as_ref()
             .map(|e| e.span.end)
+            .or_else(|| hints.last().map(|h| h.span().end))
             .or_else(|| pattern.last().map(|p| p.span.end))
             .unwrap_or(start);
         Ok(MatchClause {
             optional,
             pattern,
+            hints,
             where_clause,
             span: Span::new(start, end),
         })
+    }
+
+    /// Parses zero or more planner hints between a `MATCH` pattern and its `WHERE` (`rmp` task #855).
+    ///
+    /// ```text
+    /// Hint = 'USING', ( 'INDEX', Variable, NodeLabel, '(', PropertyKeyName, ')'
+    ///                 | 'SCAN',  Variable, NodeLabel
+    ///                 | 'JOIN',  'ON', Variable ) ;
+    /// ```
+    ///
+    /// `USING`, `SCAN` and `JOIN` are **contextual**: they lex as identifiers because openCypher does
+    /// not reserve them, and reserving them would break `RETURN a AS join`. They are recognised only
+    /// here. `INDEX` and `ON` are already reserved words, so they arrive as their own tokens.
+    ///
+    /// A bare identifier `using` in this position — impossible in valid Cypher, since a clause cannot
+    /// start with one — is the only thing that could be mistaken for a hint, and it would already have
+    /// been a syntax error.
+    fn parse_planner_hints(&mut self) -> Result<Vec<crate::ast::PlannerHint>, SyntaxError> {
+        use crate::ast::PlannerHint;
+        let mut hints = Vec::new();
+        while self.at_keyword_ident("using") {
+            let start = self.here_span().start;
+            self.pos += 1;
+            if self.eat(&TokenKind::Index) {
+                let variable = self.parse_symbolic_name("a variable after USING INDEX")?;
+                let colon = self.here_span();
+                self.expect(&TokenKind::Colon, "`:` before the hinted label")?;
+                let name_span = self.here_span();
+                let label = Label {
+                    name: self.parse_schema_name("a label name in the index hint")?,
+                    span: Span::new(colon.start, name_span.end),
+                };
+                self.expect(&TokenKind::LParen, "`(` before the hinted property")?;
+                let property = self.parse_schema_name("a property key in the index hint")?;
+                let end = self.here_span().end;
+                self.expect(&TokenKind::RParen, "`)` after the hinted property")?;
+                hints.push(PlannerHint::Index {
+                    variable,
+                    label,
+                    property,
+                    span: Span::new(start, end),
+                });
+            } else if self.eat_keyword_ident("scan") {
+                let variable = self.parse_symbolic_name("a variable after USING SCAN")?;
+                let colon = self.here_span();
+                self.expect(&TokenKind::Colon, "`:` before the hinted label")?;
+                let name_span = self.here_span();
+                let label = Label {
+                    name: self.parse_schema_name("a label name in the scan hint")?,
+                    span: Span::new(colon.start, name_span.end),
+                };
+                let end = label.span.end;
+                hints.push(PlannerHint::Scan {
+                    variable,
+                    label,
+                    span: Span::new(start, end),
+                });
+            } else if self.eat_keyword_ident("join") {
+                self.expect(&TokenKind::On, "ON after USING JOIN")?;
+                let end = self.here_span().end;
+                let variable = self.parse_symbolic_name("a variable after USING JOIN ON")?;
+                hints.push(PlannerHint::Join {
+                    variable,
+                    span: Span::new(start, end),
+                });
+            } else {
+                return Err(self.expected_here("INDEX, SCAN or JOIN after USING"));
+            }
+        }
+        Ok(hints)
     }
 
     /// Parses `Unwind = 'UNWIND', Expression, 'AS', Variable`.
@@ -3383,6 +3456,8 @@ impl<'t, 's> Parser<'t, 's> {
         let leading = Clause::Match(MatchClause {
             optional: false,
             pattern,
+            // A subquery's leading pattern is not written as a `MATCH`, so it carries no hint.
+            hints: Vec::new(),
             where_clause: predicate.map(|b| *b),
             span: Span::new(pattern_start, match_end),
         });

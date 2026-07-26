@@ -161,6 +161,41 @@ impl ValidatedQuery {
         &self.query
     }
 
+    /// Every planner hint written in the query, in clause order (`rmp` task #855).
+    ///
+    /// Hints live on the `MATCH` clauses of the AST, which the logical lowering does not carry into
+    /// [`LogicalOp`](crate::logical::LogicalOp) — they are a directive about *how* to plan, not part of
+    /// what the query means. The compiler therefore reads them from here and hands them to
+    /// [`plan_physical_hinted`](crate::physical::plan_physical_hinted) alongside the logical plan.
+    ///
+    /// Collected across the whole query rather than per-`MATCH`, because a hint names a **variable** and
+    /// the planner resolves it by finding the operator that binds that name. A query whose two `MATCH`
+    /// clauses bind the same name in different scopes could therefore see a hint applied to the first
+    /// site found; that is a documented limit, not an accident, and it cannot mis-plan — an
+    /// unsatisfiable hint is an error and a satisfiable one is bag-preserving either way.
+    #[must_use]
+    pub fn planner_hints(&self) -> Vec<crate::ast::PlannerHint> {
+        fn walk(clauses: &[Clause], out: &mut Vec<crate::ast::PlannerHint>) {
+            for clause in clauses {
+                if let Clause::Match(m) = clause {
+                    out.extend(m.hints.iter().cloned());
+                }
+            }
+        }
+        let mut out = Vec::new();
+        match &self.query.body {
+            crate::ast::QueryBody::Regular { head, unions } => {
+                walk(&head.clauses, &mut out);
+                for part in unions {
+                    walk(&part.query.clauses, &mut out);
+                }
+            }
+            // A standalone `CALL` has no `MATCH`, so no hint can be written on it.
+            crate::ast::QueryBody::StandaloneCall(_) => {}
+        }
+        out
+    }
+
     /// Consumes the wrapper, returning the validated [`Query`] AST.
     pub fn into_query(self) -> Query {
         self.query

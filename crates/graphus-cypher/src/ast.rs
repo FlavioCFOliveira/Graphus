@@ -294,10 +294,76 @@ pub struct MatchClause {
     pub optional: bool,
     /// The comma-separated pattern parts (openCypher `Pattern`).
     pub pattern: Vec<PatternPart>,
+    /// The planner hints written between the pattern and the `WHERE` (`rmp` task #855), in written
+    /// order. Empty for the overwhelming majority of queries, which state none.
+    pub hints: Vec<PlannerHint>,
     /// The optional `WHERE` predicate.
     pub where_clause: Option<Expr>,
-    /// Span from `OPTIONAL`/`MATCH` to the end of the pattern or `WHERE` expression.
+    /// Span from `OPTIONAL`/`MATCH` to the end of the pattern, hints or `WHERE` expression.
     pub span: Span,
+}
+
+/// A planner hint attached to a `MATCH` (`rmp` task #855).
+///
+/// The operator's escape hatch for when the cost estimate is wrong. Graphus chooses its anchor and
+/// access paths by cost (`rmp` tasks #858/#887), and an estimate built on histograms and counters can
+/// still be wrong on a skewed or freshly-loaded store — at which point the operator needs a way to say
+/// what to do rather than wait for statistics to catch up. Neo4j exposes `USING INDEX` / `USING SCAN` /
+/// `USING JOIN`; Memgraph exposes `USING INDEX :Label(prop)`.
+///
+/// The three keywords are **contextual**, recognised only in this position: `USING`, `SCAN` and `JOIN`
+/// are not openCypher reserved words, and reserving them would break their long-standing use as
+/// ordinary identifiers (`RETURN a AS join` is legal). The same treatment the `LOAD CSV` clause words
+/// already get.
+#[derive(Debug, Clone, PartialEq)]
+#[must_use]
+pub enum PlannerHint {
+    /// `USING INDEX v:Label(prop)` — force the index seek on `v`.
+    Index {
+        /// The hinted variable.
+        variable: String,
+        /// The label the index is declared on.
+        label: Label,
+        /// The indexed property key.
+        property: String,
+        /// Span covering the whole hint.
+        span: Span,
+    },
+    /// `USING SCAN v:Label` — force a label scan of `v`, forbidding an index seek on it.
+    Scan {
+        /// The hinted variable.
+        variable: String,
+        /// The label to scan.
+        label: Label,
+        /// Span covering the whole hint.
+        span: Span,
+    },
+    /// `USING JOIN ON v` — force a hash join whose key is `v`.
+    Join {
+        /// The join-key variable.
+        variable: String,
+        /// Span covering the whole hint.
+        span: Span,
+    },
+}
+
+impl PlannerHint {
+    /// The variable the hint names, which every form has.
+    #[must_use]
+    pub fn variable(&self) -> &str {
+        match self {
+            Self::Index { variable, .. }
+            | Self::Scan { variable, .. }
+            | Self::Join { variable, .. } => variable,
+        }
+    }
+
+    /// The hint's span, for error reporting.
+    pub fn span(&self) -> Span {
+        match self {
+            Self::Index { span, .. } | Self::Scan { span, .. } | Self::Join { span, .. } => *span,
+        }
+    }
 }
 
 /// `UNWIND <expr> AS <var>` (openCypher `Unwind`).

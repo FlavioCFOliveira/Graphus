@@ -213,7 +213,8 @@ pub use parser::{
     MAX_EXPR_DEPTH, MAX_QUERY_CLAUSES, SyntaxError, SyntaxErrorKind, parse, parse_tokens,
 };
 pub use physical::{
-    PhysicalOp, PhysicalPlan, QueryType, RangeBound, plan_physical, plan_physical_with_stats,
+    PhysicalOp, PhysicalPlan, QueryType, RangeBound, plan_physical, plan_physical_hinted,
+    plan_physical_with_stats,
 };
 pub use plan_cache::{
     CacheStats, FeatureFlags, NormalizedQuery, PlanCache, PlanCacheKey, SchemaVersion,

@@ -4318,6 +4318,193 @@ fn optimize_chain_anchor(
     best
 }
 
+// -------------------------------------------------------------------------------------------------
+// Planner hints (`rmp` task #855)
+// -------------------------------------------------------------------------------------------------
+
+/// Plans `logical` and then applies the operator's `hints`, overriding the cost-based choice
+/// (`rmp` task #855).
+///
+/// Graphus chooses its anchor and access paths by cost (tasks #858/#887), and an estimate built on
+/// histograms and counters can still be wrong on a skewed or freshly-loaded store. A hint is the escape
+/// hatch for that: the operator states what to do instead of waiting for statistics to catch up. Neo4j
+/// exposes `USING INDEX` / `USING SCAN` / `USING JOIN`; Memgraph exposes `USING INDEX :Label(prop)`.
+///
+/// An **unsatisfiable** hint is an error, following Neo4j: silently ignoring one would leave the
+/// operator believing they had overridden the planner when they had not, which is worse than no hint at
+/// all. That is also why the parser accepts `USING JOIN` but this rejects it — the join-side override is
+/// task #888, and accepting the syntax while doing nothing with it is exactly the failure mode being
+/// avoided.
+///
+/// With no hints this is [`plan_physical_with_stats`] exactly, so every existing caller and the whole
+/// TCK are unaffected.
+///
+/// # Errors
+/// Returns [`GraphusError::Runtime`] when a hint cannot be satisfied: no operator binds the named
+/// variable, the named index is not declared, there is no predicate the index could serve, or the form
+/// is not yet supported.
+pub fn plan_physical_hinted(
+    logical: &LogicalOp,
+    catalog: &IndexCatalog,
+    stats: Option<&dyn Statistics>,
+    hints: &[crate::ast::PlannerHint],
+) -> Result<PhysicalPlan, graphus_core::error::GraphusError> {
+    let mut plan = plan_physical_with_stats(logical, catalog, stats);
+    if hints.is_empty() {
+        return Ok(plan);
+    }
+    for hint in hints {
+        plan.root = apply_hint(
+            std::mem::replace(&mut plan.root, PhysicalOp::Empty),
+            hint,
+            catalog,
+        )?;
+    }
+    plan.index_dependencies = collect_index_dependencies(&plan.root);
+    Ok(plan)
+}
+
+/// Applies one hint to `op`, or reports why it cannot be satisfied.
+fn apply_hint(
+    op: PhysicalOp,
+    hint: &crate::ast::PlannerHint,
+    catalog: &IndexCatalog,
+) -> Result<PhysicalOp, graphus_core::error::GraphusError> {
+    use crate::ast::PlannerHint;
+    let unsatisfiable = |what: &str| {
+        graphus_core::error::GraphusError::Runtime(format!(
+            "planner hint cannot be satisfied: {what}"
+        ))
+    };
+    match hint {
+        PlannerHint::Index {
+            variable,
+            label,
+            property,
+            ..
+        } => {
+            if catalog.label_property(label, property).is_none() {
+                return Err(unsatisfiable(&format!(
+                    "no index on :{}({property}) for USING INDEX {variable}",
+                    label.name
+                )));
+            }
+            let (rewritten, applied) = force_seek(op, variable, catalog);
+            if !applied {
+                return Err(unsatisfiable(&format!(
+                    "USING INDEX {variable}:{}({property}) — no seekable predicate on `{variable}` \
+                     reaches its access path",
+                    label.name
+                )));
+            }
+            Ok(rewritten)
+        }
+        PlannerHint::Scan { variable, .. } => {
+            let (rewritten, applied) = force_scan(op, variable, catalog);
+            if !applied {
+                return Err(unsatisfiable(&format!(
+                    "USING SCAN {variable} — nothing binds `{variable}` through an index seek to revert"
+                )));
+            }
+            Ok(rewritten)
+        }
+        // The parser accepts it so the grammar is one piece; forcing the join build side touches the
+        // join-region optimiser and is task #888. Rejecting is deliberate — see the module note above.
+        PlannerHint::Join { variable, .. } => Err(unsatisfiable(&format!(
+            "USING JOIN ON {variable} is not implemented yet (`rmp` task #888)"
+        ))),
+    }
+}
+
+/// Rewrites the `Filter`-over-scan that binds `variable` into an index seek, reporting whether it found
+/// one to rewrite.
+///
+/// Reuses [`seek_alternative_for_filter`], the very rewrite the cost model would have considered and
+/// possibly rejected — so a hint forces exactly the plan the planner already knew how to build, never a
+/// shape it has not validated. A site that is already a seek on `variable` counts as satisfied.
+fn force_seek(op: PhysicalOp, variable: &str, catalog: &IndexCatalog) -> (PhysicalOp, bool) {
+    if binds_variable_by_seek(&op, variable) {
+        return (op, true);
+    }
+    if filter_over_scan_binds(&op, variable) {
+        if let Some(seek) = seek_alternative_for_filter(&op, catalog) {
+            return (seek, true);
+        }
+    }
+    map_children_reporting(op, &|child| force_seek(child, variable, catalog))
+}
+
+/// Reverts the index seek that binds `variable` to a scan plus filter, reporting whether it found one.
+///
+/// Reuses [`scan_alternative_for_seek`], the exact inverse rewrite, so the forced plan is again one the
+/// planner already builds. A site that is already a scan counts as satisfied.
+fn force_scan(op: PhysicalOp, variable: &str, catalog: &IndexCatalog) -> (PhysicalOp, bool) {
+    if binds_variable_by_scan(&op, variable) {
+        return (op, true);
+    }
+    if binds_variable_by_seek(&op, variable) {
+        if let Some(scan) = scan_alternative_for_seek(&op, catalog) {
+            return (scan, true);
+        }
+    }
+    map_children_reporting(op, &|child| force_scan(child, variable, catalog))
+}
+
+/// [`map_children`] threaded with an "applied anywhere" flag, so a rewrite that fires in one subtree is
+/// reported to the caller.
+fn map_children_reporting(
+    op: PhysicalOp,
+    f: &dyn Fn(PhysicalOp) -> (PhysicalOp, bool),
+) -> (PhysicalOp, bool) {
+    let applied = std::cell::Cell::new(false);
+    let out = map_children(op, &|child| {
+        let (rewritten, hit) = f(child);
+        if hit {
+            applied.set(true);
+        }
+        rewritten
+    });
+    (out, applied.get())
+}
+
+/// Whether `op` is an index seek binding `variable`.
+fn binds_variable_by_seek(op: &PhysicalOp, variable: &str) -> bool {
+    // A residual filter may sit directly over the seek; look through exactly one, mirroring how
+    // `scan_alternative_for_seek` peels it.
+    let inner = match op {
+        PhysicalOp::Filter { input, .. } => input.as_ref(),
+        other => other,
+    };
+    matches!(
+        inner,
+        PhysicalOp::NodeIndexSeek { variable: v, .. }
+            | PhysicalOp::NodeIndexRangeSeek { variable: v, .. }
+            | PhysicalOp::NodeCompositeIndexSeek { variable: v, .. }
+            | PhysicalOp::NodeIndexStartsWithSeek { variable: v, .. }
+            | PhysicalOp::NodeIndexScan { variable: v, .. }
+        if v.name == variable
+    )
+}
+
+/// Whether `op` is a plain label/token scan binding `variable`.
+fn binds_variable_by_scan(op: &PhysicalOp, variable: &str) -> bool {
+    matches!(
+        op,
+        PhysicalOp::NodeByLabelScan { variable: v, .. }
+            | PhysicalOp::TokenLookupScan { variable: v, .. }
+        if v.name == variable
+    )
+}
+
+/// Whether `op` is a `Filter` directly over a scan binding `variable` — the shape
+/// [`seek_alternative_for_filter`] consumes.
+fn filter_over_scan_binds(op: &PhysicalOp, variable: &str) -> bool {
+    let PhysicalOp::Filter { input, .. } = op else {
+        return false;
+    };
+    binds_variable_by_scan(input, variable)
+}
+
 /// If `expr` is exactly `variable:Label` (a single-label `HasLabels` predicate), returns that label.
 /// Multi-label predicates are declined: the reversal re-applies `from`'s label as a single
 /// `HasLabels`, and a multi-label seed has no single catalog `label_property` to anchor on.

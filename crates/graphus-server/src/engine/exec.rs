@@ -20,7 +20,7 @@ use graphus_cypher::{
     AuthorizedGraph, FeatureFlags, GraphAccess, IndexCatalog, Parameters, PhysicalPlan, PlanCache,
     PlanCacheKey, PlanDescription, PrivilegeOracle, ProcedureSignature, ProfileRecorder,
     SchemaVersion, Statistics, TxnCoordinator, analyze_with_extensions, bind_parameters,
-    execute_with_extensions_cancellable, lower, parse_tokens, plan_physical_with_stats, tokenize,
+    execute_with_extensions_cancellable, lower, parse_tokens, plan_physical_hinted, tokenize,
 };
 use graphus_io::BlockDevice;
 use graphus_wal::LogSink;
@@ -796,7 +796,12 @@ fn compile(
     // parse the pipeline already performs is also the one that decides how the statement runs — no second
     // scan of the text, and the plan cache keys the prefixed and unprefixed forms apart naturally (they
     // are different statements).
-    Ok(plan_physical_with_stats(&logical, catalog, stats).with_prefix(ast.prefix()))
+    // Planner hints (`rmp` task #855) are read from the validated AST rather than the logical plan: they
+    // direct HOW to plan, not what the query means, so the lowering does not carry them. An
+    // unsatisfiable hint is an error here, following Neo4j — silently ignoring one would leave the
+    // operator believing they had overridden the planner when they had not.
+    let hints = validated.planner_hints();
+    Ok(plan_physical_hinted(&logical, catalog, stats, &hints)?.with_prefix(ast.prefix()))
 }
 
 /// Builds the result-summary [`QueryPlan`] for a statement that carried an `EXPLAIN` / `PROFILE` prefix
