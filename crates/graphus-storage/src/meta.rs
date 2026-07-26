@@ -1207,6 +1207,50 @@ schema_catalog_table! {
     constraints:               Constraint(String)             => Constraint(ConstraintEntry),
 }
 
+/// A detached copy of the six **live-record cardinality counters** of a [`Statistics`], without its
+/// twelve schema-catalog DDL maps (`rmp` #866).
+///
+/// Produced by [`Statistics::counts_image`] and consumed by [`Statistics::restore_counts`]. It is a
+/// distinct type rather than a `Statistics` so that "restore the counts, keep the schema" cannot be
+/// spelt wrongly, and so the rollback path never pays to clone DDL maps it is not restoring.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CountsImage {
+    pub(crate) total_nodes: u64,
+    pub(crate) total_relationships: u64,
+    pub(crate) nodes_per_label: BTreeMap<u32, u64>,
+    pub(crate) rels_per_type: BTreeMap<u32, u64>,
+    pub(crate) rels_per_start_label_type: BTreeMap<(u32, u32), u64>,
+    pub(crate) rels_per_type_end_label: BTreeMap<(u32, u32), u64>,
+}
+
+/// Names exactly one of [`Statistics`]'s six **live-record cardinality counters** — the counts half
+/// of the catalog, as opposed to the twelve schema-catalog DDL maps a [`SchemaKey`] names.
+///
+/// It is the address a signed count change is applied at
+/// ([`Statistics::apply_count_delta`]) and the key a transaction's pending count delta is
+/// accumulated under (`RecordStore`'s `CountDelta`, `rmp` #866). The two directional variants carry
+/// their pair in the same field order as the map they address, so a reader never has to remember
+/// which way round it is: `StartLabelType(label, type)` for `rels_per_start_label_type`,
+/// `TypeEndLabel(type, label)` for `rels_per_type_end_label` (`rmp` task #856).
+///
+/// `Copy` on purpose: it is passed by value through the whole write path and stored in the delta
+/// maps' keys as its payload, never as the enum, so it never allocates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CountKey {
+    /// [`Statistics::total_nodes`] — the grand-total live-node count (`rmp` task #82).
+    TotalNodes,
+    /// [`Statistics::total_relationships`] — the grand-total live-relationship count (`rmp` task #82).
+    TotalRelationships,
+    /// `nodes_per_label[label_token]` (`rmp` task #79).
+    Label(u32),
+    /// `rels_per_type[type_token]` (`rmp` task #79).
+    RelType(u32),
+    /// `rels_per_start_label_type[(label_token, type_token)]` (`rmp` task #856).
+    StartLabelType(u32, u32),
+    /// `rels_per_type_end_label[(type_token, label_token)]` (`rmp` task #856).
+    TypeEndLabel(u32, u32),
+}
+
 impl Statistics {
     /// An empty statistics catalog (every count `0`).
     #[must_use]
@@ -1322,6 +1366,75 @@ impl Statistics {
         self.vector_indexes = vector_indexes;
     }
 
+    /// Detaches a copy of the **counts** half — the six live-record cardinality counters — leaving
+    /// `self` untouched. The exact counterpart of the schema half's `clone()` + [`adopt_schema_from`]
+    /// (Self::adopt_schema_from), and paired with [`restore_counts`](Self::restore_counts), which
+    /// puts one back.
+    ///
+    /// `rmp` #866: the rollback path captures this **before** `reload_catalog` reverts the whole
+    /// `Statistics` to the durable image, so it can restore the counters a concurrent open transaction
+    /// had already moved (which are in no durable image, since the catalog is only checkpointed at
+    /// commit). It exists instead of a whole-`Statistics` clone because that would also copy the
+    /// twelve schema-catalog DDL maps on **every** rollback, which the `rmp` #534 capture deliberately
+    /// avoids on the common single-writer path. What is copied here is bounded by the number of
+    /// distinct labels and relationship types in the schema, never by the number of records.
+    #[must_use]
+    pub(crate) fn counts_image(&self) -> CountsImage {
+        // Exhaustive destructure so a newly-added `Statistics` field forces a compile decision here
+        // (a COUNTER must join `CountsImage`; a schema-catalog DDL map is bound to `_`), keeping this
+        // in lock-step with `schema_eq` / `adopt_schema_from`, which make the opposite choice.
+        let Self {
+            total_nodes,
+            total_relationships,
+            nodes_per_label,
+            rels_per_type,
+            rels_per_start_label_type,
+            rels_per_type_end_label,
+            // Schema-catalog DDL (the `catalog_dirty`-guarded half): not part of the counts image.
+            node_prop_histograms: _,
+            node_property_indexes: _,
+            fulltext_indexes: _,
+            spatial_indexes: _,
+            constraints: _,
+            node_property_index_names: _,
+            rel_property_indexes: _,
+            rel_property_index_names: _,
+            composite_indexes: _,
+            rel_composite_indexes: _,
+            text_indexes: _,
+            vector_indexes: _,
+        } = self;
+        CountsImage {
+            total_nodes: *total_nodes,
+            total_relationships: *total_relationships,
+            nodes_per_label: nodes_per_label.clone(),
+            rels_per_type: rels_per_type.clone(),
+            rels_per_start_label_type: rels_per_start_label_type.clone(),
+            rels_per_type_end_label: rels_per_type_end_label.clone(),
+        }
+    }
+
+    /// Installs `image` as the counts half, leaving the twelve schema-catalog DDL maps untouched —
+    /// the inverse of [`counts_image`](Self::counts_image) and the counts twin of
+    /// [`adopt_schema_from`](Self::adopt_schema_from). Consumes `image` so the maps are moved, not
+    /// re-cloned.
+    pub(crate) fn restore_counts(&mut self, image: CountsImage) {
+        let CountsImage {
+            total_nodes,
+            total_relationships,
+            nodes_per_label,
+            rels_per_type,
+            rels_per_start_label_type,
+            rels_per_type_end_label,
+        } = image;
+        self.total_nodes = total_nodes;
+        self.total_relationships = total_relationships;
+        self.nodes_per_label = nodes_per_label;
+        self.rels_per_type = rels_per_type;
+        self.rels_per_start_label_type = rels_per_start_label_type;
+        self.rels_per_type_end_label = rels_per_type_end_label;
+    }
+
     /// Reads one schema-catalog entry by [`SchemaKey`], cloned out — [`None`] when the key is absent.
     ///
     /// The single-entry read half of the per-transaction catalog undo (`rmp` #734). Paired with
@@ -1365,110 +1478,106 @@ impl Statistics {
         self.total_relationships
     }
 
-    /// Adds `1` to the grand-total live-node count (`rmp` task #82). Called once per node created,
-    /// labelled or not — distinct from [`inc_label`](Self::inc_label), which a node triggers once per
-    /// label it carries.
-    pub(crate) fn inc_node(&mut self) {
-        self.total_nodes += 1;
-    }
-
-    /// Subtracts `1` from the grand-total live-node count (`rmp` task #82), called once per node
-    /// deleted (at the tombstone-stamping step, not at GC reclaim).
+    /// Applies a **signed** change `delta` to the single live-record counter named by `key` — the one
+    /// and only crate-visible count mutator (`rmp` #866).
     ///
-    /// Saturates at `0` defensively: a logic slip that decremented past zero would otherwise wrap to
-    /// `u64::MAX` and corrupt the catalog into an absurd cardinality the planner would trust. In a
-    /// debug build the slip is caught instead.
-    pub(crate) fn dec_node(&mut self) {
-        Self::dec_total(&mut self.total_nodes, "total_nodes");
-    }
-
-    /// Adds `1` to the grand-total live-relationship count (`rmp` task #82). Called once per
-    /// relationship created (covering both the self-loop and the normal branch of `create_rel`).
-    pub(crate) fn inc_rel(&mut self) {
-        self.total_relationships += 1;
-    }
-
-    /// Subtracts `1` from the grand-total live-relationship count (`rmp` task #82), called once per
-    /// relationship deleted (at the tombstone-stamping step, not at GC reclaim). Saturates at `0`
-    /// defensively for the same reason as [`dec_node`](Self::dec_node).
-    pub(crate) fn dec_rel(&mut self) {
-        Self::dec_total(&mut self.total_relationships, "total_relationships");
-    }
-
-    /// Shared grand-total decrement: `count -= 1`, saturating at `0`. In a release build an
-    /// already-zero count saturates (never wraps to a huge count) so a logic slip can never silently
-    /// corrupt the catalog; in a debug build it is caught (every decrement must match a prior
-    /// increment of a live record).
-    fn dec_total(count: &mut u64, which: &str) {
-        if *count == 0 {
-            debug_assert!(false, "statistics {which} decrement underflow");
+    /// # Why this is the only door
+    ///
+    /// The counters are per-transaction state pretending to be shared state: they move eagerly at
+    /// write time, so at any instant the live value is `committed image + every in-flight
+    /// transaction's delta`. Both the rollback path (withdraw exactly the aborting transaction's own
+    /// delta, `rmp` #866) and the checkpoint path (persist the committed image, so strip every *open*
+    /// transaction's delta) therefore have to *un-apply* a delta, which the ±1 helpers below cannot
+    /// express. Routing every mutation through one signed entry point is also what lets the store
+    /// record the delta at the same instant it applies it: `RecordStore::count_bump` is the sole
+    /// caller, and the ±1 helpers are private, so no write path can move a counter without its
+    /// transaction's delta moving with it. This is the `Statistics` twin of `rmp` #578's
+    /// "every free-list push goes through `RecordStore::free_push`".
+    ///
+    /// A `delta` of `0` is a no-op — in particular it never materialises a zero-valued map entry,
+    /// which would break the zero-count invariant (an absent key and a `0` count must be the same
+    /// thing, so that equality against a fresh re-scan holds).
+    ///
+    /// Saturating in release, asserted in debug: see [`add_total`](Self::add_total) /
+    /// [`add_keyed`](Self::add_keyed).
+    pub(crate) fn apply_count_delta(&mut self, key: CountKey, delta: i64) {
+        if delta == 0 {
             return;
         }
-        *count -= 1;
+        match key {
+            CountKey::TotalNodes => Self::add_total(&mut self.total_nodes, delta, "total_nodes"),
+            CountKey::TotalRelationships => {
+                Self::add_total(&mut self.total_relationships, delta, "total_relationships")
+            }
+            CountKey::Label(token_id) => {
+                Self::add_keyed(&mut self.nodes_per_label, token_id, delta)
+            }
+            CountKey::RelType(token_id) => {
+                Self::add_keyed(&mut self.rels_per_type, token_id, delta)
+            }
+            CountKey::StartLabelType(label_id, type_id) => Self::add_keyed(
+                &mut self.rels_per_start_label_type,
+                (label_id, type_id),
+                delta,
+            ),
+            CountKey::TypeEndLabel(type_id, label_id) => Self::add_keyed(
+                &mut self.rels_per_type_end_label,
+                (type_id, label_id),
+                delta,
+            ),
+        }
     }
 
-    /// Adds `1` to the live-node count for label `token_id`.
-    pub(crate) fn inc_label(&mut self, token_id: u32) {
-        *self.nodes_per_label.entry(token_id).or_insert(0) += 1;
+    /// Shared grand-total signed add. In a release build a decrement below `0` saturates (never wraps
+    /// to a huge count) so a logic slip can never silently corrupt the catalog into an absurd
+    /// cardinality the planner would trust; in a debug build it is caught (every decrement must match
+    /// a prior increment of a live record).
+    fn add_total(count: &mut u64, delta: i64, which: &str) {
+        if delta >= 0 {
+            *count = count.saturating_add(delta.unsigned_abs());
+            return;
+        }
+        let down = delta.unsigned_abs();
+        if down > *count {
+            debug_assert!(
+                false,
+                "statistics {which} decrement underflow ({down} from {count})"
+            );
+            *count = 0;
+            return;
+        }
+        *count -= down;
     }
 
-    /// Subtracts `1` from the live-node count for label `token_id`, removing the entry when it
-    /// reaches `0` so equality against a fresh re-scan holds (the zero-count invariant).
+    /// Shared keyed-counter signed add, for both the token-keyed maps (`rmp` task #79) and the
+    /// pair-keyed directional projections (`rmp` task #856).
     ///
-    /// # Panics
-    /// Panics (debug builds) if the count is already `0` or absent: that is an internal invariant
-    /// violation — every decrement must correspond to a prior increment of a live node's label.
-    pub(crate) fn dec_label(&mut self, token_id: u32) {
-        Self::dec(&mut self.nodes_per_label, token_id);
-    }
-
-    /// Adds `1` to the live-relationship count for relationship-type `token_id`.
-    pub(crate) fn inc_rel_type(&mut self, token_id: u32) {
-        *self.rels_per_type.entry(token_id).or_insert(0) += 1;
-    }
-
-    /// Subtracts `1` from the live-relationship count for relationship-type `token_id`, removing the
-    /// entry when it reaches `0` (the zero-count invariant).
-    ///
-    /// # Panics
-    /// Panics (debug builds) if the count is already `0` or absent (an internal invariant violation).
-    pub(crate) fn dec_rel_type(&mut self, token_id: u32) {
-        Self::dec(&mut self.rels_per_type, token_id);
-    }
-
-    /// Adds `1` to the directional count for a relationship of type `type_id` whose **start** node
-    /// carries label `label_id` (`rmp` task #856).
-    pub(crate) fn inc_start_label_type(&mut self, label_id: u32, type_id: u32) {
-        *self
-            .rels_per_start_label_type
-            .entry((label_id, type_id))
-            .or_insert(0) += 1;
-    }
-
-    /// Subtracts `1` from that count, removing the entry at `0` (the zero-count invariant, so equality
-    /// against a fresh re-scan holds).
-    ///
-    /// # Panics
-    /// Panics (debug builds) if the count is already `0` or absent (an internal invariant violation).
-    pub(crate) fn dec_start_label_type(&mut self, label_id: u32, type_id: u32) {
-        Self::dec_pair(&mut self.rels_per_start_label_type, (label_id, type_id));
-    }
-
-    /// Adds `1` to the directional count for a relationship of type `type_id` whose **end** node
-    /// carries label `label_id` (`rmp` task #856).
-    pub(crate) fn inc_type_end_label(&mut self, type_id: u32, label_id: u32) {
-        *self
-            .rels_per_type_end_label
-            .entry((type_id, label_id))
-            .or_insert(0) += 1;
-    }
-
-    /// Subtracts `1` from that count, removing the entry at `0`.
-    ///
-    /// # Panics
-    /// Panics (debug builds) if the count is already `0` or absent (an internal invariant violation).
-    pub(crate) fn dec_type_end_label(&mut self, type_id: u32, label_id: u32) {
-        Self::dec_pair(&mut self.rels_per_type_end_label, (type_id, label_id));
+    /// Reaching exactly `0` **removes** the entry (the zero-count invariant: an absent key and a `0`
+    /// count must be indistinguishable, so equality against a fresh re-scan holds). A decrement past
+    /// `0` saturates there in release and is caught in debug, for the same reason as
+    /// [`add_total`](Self::add_total). `delta == 0` never reaches here (filtered by
+    /// [`apply_count_delta`](Self::apply_count_delta)), so no zero-valued entry is ever inserted.
+    fn add_keyed<K: Ord + std::fmt::Debug>(map: &mut BTreeMap<K, u64>, key: K, delta: i64) {
+        if delta >= 0 {
+            let slot = map.entry(key).or_insert(0);
+            *slot = slot.saturating_add(delta.unsigned_abs());
+            return;
+        }
+        let down = delta.unsigned_abs();
+        match map.get_mut(&key) {
+            Some(c) if *c > down => *c -= down,
+            Some(c) => {
+                debug_assert!(
+                    *c == down,
+                    "statistics count decrement underflow at {key:?} ({down} from {c})"
+                );
+                map.remove(&key);
+            }
+            None => debug_assert!(
+                false,
+                "statistics count decrement underflow at absent key {key:?}"
+            ),
+        }
     }
 
     /// The number of currently-live relationships of type `type_id` whose start node carries
@@ -1500,39 +1609,6 @@ impl Statistics {
     #[must_use]
     pub fn has_directional_rel_counts(&self) -> bool {
         !self.rels_per_start_label_type.is_empty() || !self.rels_per_type_end_label.is_empty()
-    }
-
-    /// Shared decrement-with-removal: `count -= 1`, dropping the entry at `0`. In a release build a
-    /// missing/zero entry saturates at `0` (never wraps to a huge count) so a logic slip can never
-    /// silently corrupt the catalog into an absurd cardinality; in a debug build it is caught.
-    /// [`dec`](Self::dec) for a pair-keyed counter map (`rmp` task #856) — same saturating,
-    /// zero-removing contract, same reason for it.
-    fn dec_pair(map: &mut BTreeMap<(u32, u32), u64>, key: (u32, u32)) {
-        match map.get_mut(&key) {
-            Some(c) if *c > 1 => *c -= 1,
-            Some(_) => {
-                map.remove(&key);
-            }
-            None => debug_assert!(
-                false,
-                "statistics directional count decrement underflow at {key:?}"
-            ),
-        }
-    }
-
-    fn dec(map: &mut BTreeMap<u32, u64>, token_id: u32) {
-        match map.get_mut(&token_id) {
-            Some(c) if *c > 1 => *c -= 1,
-            Some(_) => {
-                map.remove(&token_id);
-            }
-            None => {
-                debug_assert!(
-                    false,
-                    "statistics decrement underflow for token id {token_id}"
-                );
-            }
-        }
     }
 
     /// Borrows the stored opaque histogram blob for `(label_token, prop_token)`, or [`None`] if no
@@ -3754,6 +3830,45 @@ fn read_u128(b: &[u8], cur: &mut usize) -> Result<u128> {
     ))
 }
 
+/// Unit-test conveniences: the `±1` spellings the write path used to call directly.
+///
+/// They are `#[cfg(test)]` **on purpose**. Since `rmp` #866 the production write path must move a
+/// counter only through `RecordStore::count_bump`, which applies the change *and* records it in the
+/// owning transaction's pending delta; a counter moved by any other route would be un-withdrawable
+/// and would drift the catalog permanently. Keeping these out of the release build makes that a
+/// property of the code rather than of a convention: [`Statistics::apply_count_delta`] is the only
+/// count mutator a non-test caller can reach.
+#[cfg(test)]
+impl Statistics {
+    pub(crate) fn inc_node(&mut self) {
+        self.apply_count_delta(CountKey::TotalNodes, 1);
+    }
+
+    pub(crate) fn dec_node(&mut self) {
+        self.apply_count_delta(CountKey::TotalNodes, -1);
+    }
+
+    pub(crate) fn inc_rel(&mut self) {
+        self.apply_count_delta(CountKey::TotalRelationships, 1);
+    }
+
+    pub(crate) fn inc_label(&mut self, token_id: u32) {
+        self.apply_count_delta(CountKey::Label(token_id), 1);
+    }
+
+    pub(crate) fn dec_label(&mut self, token_id: u32) {
+        self.apply_count_delta(CountKey::Label(token_id), -1);
+    }
+
+    pub(crate) fn inc_rel_type(&mut self, token_id: u32) {
+        self.apply_count_delta(CountKey::RelType(token_id), 1);
+    }
+
+    pub(crate) fn dec_rel_type(&mut self, token_id: u32) {
+        self.apply_count_delta(CountKey::RelType(token_id), -1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4835,11 +4950,18 @@ mod tests {
         // debug build catches the slip via `debug_assert!`, so this is a release-only assertion.
         #[cfg(not(debug_assertions))]
         {
+            // Spelt through `apply_count_delta` rather than the `±1` conveniences above: this pins the
+            // saturation contract of the ONE signed mutator every count change goes through, and it
+            // keeps the conveniences free of a method that only a release build would ever call.
             let mut s = Statistics::new();
-            s.dec_node();
-            s.dec_rel();
+            s.apply_count_delta(CountKey::TotalNodes, -1);
+            s.apply_count_delta(CountKey::TotalRelationships, -1);
             assert_eq!(s.total_nodes(), 0);
             assert_eq!(s.total_relationships(), 0);
+            // A multi-step over-decrement saturates just the same (the `rmp` #866 withdrawal path
+            // applies whole deltas, not repeated `-1`s).
+            s.apply_count_delta(CountKey::TotalNodes, -7);
+            assert_eq!(s.total_nodes(), 0);
         }
     }
 
