@@ -72,9 +72,13 @@
 //! **Covered:** all [`LogicalOp`](crate::logical::LogicalOp) variants are lowered to a physical
 //! form (the relational, graph, write, and procedure operators carry through; the four decisions
 //! above specialise where they apply). Index selection covers single-property **equality** and
-//! **range** node predicates, the **`STARTS WITH` string-prefix** node predicate (a bounded range
-//! seek over `[prefix, successor)`, `rmp` task #658), the **token-lookup** label scan, and
-//! single-property **relationship** predicates routed through the catalog.
+//! **range** node predicates, **multi-value equality** node and relationship predicates — `n.p IN
+//! [a, b, c]` and `n.p = a OR n.p = b`, lowered to a union of per-value index descents
+//! ([`NodeIndexMultiSeek`](PhysicalOp::NodeIndexMultiSeek) /
+//! [`RelIndexMultiSeek`](PhysicalOp::RelIndexMultiSeek), `rmp` task #868) — the **`STARTS WITH`
+//! string-prefix** node predicate (a bounded range seek over `[prefix, successor)`, `rmp` task #658),
+//! the **token-lookup** label scan, and single-property **relationship** predicates routed through the
+//! catalog.
 //!
 //! **Cost-based (task #65, #366), only when statistics are supplied:** selectivity-driven
 //! **access-path choice** (index seek vs label/token scan, [the seek-vs-scan rule](self#cost-based-optimisation)),
@@ -97,10 +101,15 @@
 //! predicate over the scan does drive a real index seek — see
 //! [`RelIndexSeek`](PhysicalOp::RelIndexSeek) and its siblings; (3) **composite multi-key seeks** — only a composite's *leading* key
 //! drives a seek here, matching the catalog's
-//! [`label_property`](crate::catalog::IndexCatalog::label_property) contract; (4) **`IN`-list index
-//! acceleration**, and **`ENDS WITH` / `CONTAINS`** string acceleration (a suffix/substring is not a
-//! contiguous key range — it needs a dedicated text index) — treated as residual filters in v1.
-//! (`STARTS WITH` *is* accelerated, `rmp` task #658; see [`PhysicalOp::NodeIndexStartsWithSeek`].)
+//! [`label_property`](crate::catalog::IndexCatalog::label_property) contract; (4) **`ENDS WITH` /
+//! `CONTAINS`** string acceleration without a text index (a suffix/substring is not a contiguous key
+//! range — it needs a dedicated one) — treated as a residual filter. (`STARTS WITH` *is* accelerated,
+//! `rmp` task #658; see [`PhysicalOp::NodeIndexStartsWithSeek`].) **`IN`-list acceleration is no longer
+//! deferred** — `rmp` task #868 lowers it, and the `OR`-of-equalities spelling, to a multi-value seek;
+//! what remains deferred there is (a) an `IN` whose right side is not a *syntactic* list (`IN $ids`,
+//! `IN keys(m)`), whose length is unknown at plan time so the `k`-seek-setups cost comparison cannot be
+//! made, and (b) a disjunction over **different** properties or mixing an equality with a range, which
+//! is a union of different access paths.
 //!
 //! # Cost-based optimisation
 //!
@@ -533,6 +542,7 @@ impl PhysicalOp {
             | Self::NodeByLabelScan { .. }
             | Self::TokenLookupScan { .. }
             | Self::NodeIndexSeek { .. }
+            | Self::NodeIndexMultiSeek { .. }
             | Self::NodeCompositeIndexSeek { .. }
             | Self::NodeLabelScanEq { .. }
             | Self::NodeIndexRangeSeek { .. }
@@ -542,6 +552,7 @@ impl PhysicalOp {
             | Self::NodeTextIndexSeek { .. }
             | Self::AllRelationshipsScan { .. }
             | Self::RelIndexSeek { .. }
+            | Self::RelIndexMultiSeek { .. }
             | Self::RelIndexRangeSeek { .. }
             | Self::RelCompositeIndexSeek { .. }
             | Self::RelSpatialIndexSeek { .. }
@@ -607,6 +618,7 @@ impl PhysicalOp {
             Self::NodeByLabelScan { .. } => "NodeByLabelScan",
             Self::TokenLookupScan { .. } => "TokenLookupScan",
             Self::NodeIndexSeek { .. } => "NodeIndexSeek",
+            Self::NodeIndexMultiSeek { .. } => "NodeIndexMultiSeek",
             Self::NodeCompositeIndexSeek { .. } => "NodeCompositeIndexSeek",
             Self::NodeLabelScanEq { .. } => "NodeLabelScanEq",
             Self::NodeIndexRangeSeek { .. } => "NodeIndexRangeSeek",
@@ -616,6 +628,7 @@ impl PhysicalOp {
             Self::NodeTextIndexSeek { .. } => "NodeTextIndexSeek",
             Self::AllRelationshipsScan { .. } => "AllRelationshipsScan",
             Self::RelIndexSeek { .. } => "RelIndexSeek",
+            Self::RelIndexMultiSeek { .. } => "RelIndexMultiSeek",
             Self::RelIndexRangeSeek { .. } => "RelIndexRangeSeek",
             Self::RelCompositeIndexSeek { .. } => "RelCompositeIndexSeek",
             Self::RelSpatialIndexSeek { .. } => "RelSpatialIndexSeek",
@@ -819,6 +832,54 @@ pub enum PhysicalOp {
         /// part B); `false` leaves the emission order unspecified (node-id order in practice). Set only
         /// by [`elide_sort_over_ordered_index`].
         ordered: bool,
+        /// The catalog index backing the seek.
+        index: IndexId,
+    },
+    /// **Multi-value index equality seek** (`rmp` task #868): the nodes of `label` whose `property` is
+    /// Cypher-equal to **at least one** of `values` — one index descent per *distinct* value, unioned.
+    /// Serves `WHERE n.p IN [a, b, c]` and the disjunction `WHERE n.p = a OR n.p = b`, which before
+    /// this operator both fell through every index rule to a full label/token scan plus a residual
+    /// filter (the batched-lookup access path of an OLTP application). Neo4j spells the same access
+    /// path `NodeIndexSeek(… WHERE p IN [...])`; Memgraph likewise unions per-value seeks.
+    ///
+    /// # Semantics and why consuming the predicate is legal
+    ///
+    /// `x IN [e₁ … e_k]` is defined by openCypher as the three-valued `OR`-fold of `=` over the
+    /// elements ([`crate::equality::is_in`]), and `x = e₁ OR x = e₂` is that same fold written out. The
+    /// operator therefore emits exactly the rows for which the fold is `TRUE`. It is only ever built
+    /// from a **top-level conjunct of a `Filter`**, where `NULL` and `FALSE` are indistinguishable
+    /// (both drop the row), so replacing the predicate by its positive match set is bag-preserving. A
+    /// three-valued-observable position — under `NOT`, inside a larger `OR`, in a `CASE` or a
+    /// projection — never reaches [`analyze_multi_value_predicate`], which matches only the two
+    /// top-level spellings.
+    ///
+    /// # The whole-or-nothing decline contract (`rmp` #738 / #680)
+    ///
+    /// [`index_seek_eq`](crate::graph_access::GraphAccess::index_seek_eq) answers `None` for *"no
+    /// usable index — take the exact scan"* and `Some(vec![])` for *"the index is registered and
+    /// nothing matches"*. A union of descents must therefore decline **as a whole**: if any one value
+    /// declines, the operator falls back to the exact scan for **every** value. Dropping just the
+    /// declining value from the union would lose the rows it matched. The executor expresses this with
+    /// `?` inside the union loop, so a partial union is not constructible.
+    ///
+    /// # Ordering
+    ///
+    /// Deliberately carries **no `ordered` flag**. `k` independent descents concatenated are not
+    /// globally ordered by `property`, so this operator is excluded from the provided-order `Sort`
+    /// elision of `rmp` #665 — [`mark_ordered_index`] has no arm for it and its catch-all keeps the
+    /// `Sort`. Emission is ascending by node id (the union is sorted and deduplicated), exactly like
+    /// the `ordered: false` [`NodeIndexSeek`](Self::NodeIndexSeek) it generalises.
+    NodeIndexMultiSeek {
+        /// The node variable bound by each row.
+        variable: Var,
+        /// The label the index covers.
+        label: Label,
+        /// The indexed property key.
+        property: String,
+        /// The alternative seek values (unevaluated AST, in source order). Duplicates are permitted
+        /// here and collapsed by the executor under Cypher equality; an **empty** list is legal and
+        /// correctly yields zero rows (`x IN []` is `FALSE` for every `x`, including `null`).
+        values: Vec<Expr>,
         /// The catalog index backing the seek.
         index: IndexId,
     },
@@ -1054,6 +1115,42 @@ pub enum PhysicalOp {
         property: String,
         /// The equality seek value (unevaluated AST; commonly a `$param` after auto-parameterisation).
         value: Expr,
+        /// The arrow direction of the originating pattern (drives endpoint binding + undirected doubling).
+        direction: crate::ast::RelDirection,
+        /// The catalog index backing the seek.
+        index: IndexId,
+    },
+    /// **Multi-value relationship-property index equality seek** (`rmp` task #868): the visible
+    /// relationships of `rel_type` whose current `property` is Cypher-equal to **at least one** of
+    /// `values` — one index descent per *distinct* value, unioned. The relationship analogue of
+    /// [`NodeIndexMultiSeek`](Self::NodeIndexMultiSeek), lowered from the same standalone, single-type,
+    /// fixed-length pattern shape as [`RelIndexSeek`](Self::RelIndexSeek)
+    /// (`MATCH ()-[r:T]-() WHERE r.p IN [a, b]` / `WHERE r.p = a OR r.p = b`), so both endpoints are
+    /// materialised directly from each matched relationship's own record.
+    ///
+    /// Every contract of the node operator carries over verbatim: the predicate is consumed only from a
+    /// **top-level `Filter` conjunct** (where `NULL` and `FALSE` both drop the row, so the positive
+    /// match set is the whole observable content of the predicate); the union **declines as a whole**
+    /// to the typed scan + residual equality if any single value's seek declines (`rmp` #738/#680);
+    /// values are collapsed under Cypher equality before seeking, and the resulting relationship ids
+    /// are sorted and deduplicated. `direction` reproduces the pattern arrow's endpoint binding **and**
+    /// the undirected pattern's two-orientation semantics exactly, so the seek is bag-equivalent to the
+    /// scan path it replaces.
+    RelIndexMultiSeek {
+        /// The relationship variable bound by each row.
+        relationship: Var,
+        /// The source-endpoint node variable (bound per `direction`).
+        from: Var,
+        /// The target-endpoint node variable (bound per `direction`).
+        to: Var,
+        /// The single relationship type the index covers.
+        rel_type: RelType,
+        /// The indexed property key.
+        property: String,
+        /// The alternative seek values (unevaluated AST, in source order). Duplicates are permitted
+        /// here and collapsed by the executor under Cypher equality; an **empty** list is legal and
+        /// correctly yields zero rows.
+        values: Vec<Expr>,
         /// The arrow direction of the originating pattern (drives endpoint binding + undirected doubling).
         direction: crate::ast::RelDirection,
         /// The catalog index backing the seek.
@@ -2472,6 +2569,39 @@ impl Planner<'_> {
             }
         }
 
+        // Multi-value index seek (`rmp` task #868): a `var.prop IN [a, b, c]` conjunct, or a disjunction
+        // `var.prop = a OR var.prop = b`, over an indexed `(label, prop)` becomes ONE
+        // `NodeIndexMultiSeek` — one index descent per distinct value, unioned — instead of the full
+        // label/token scan + residual filter both spellings fell through to before. The seek CONSUMES
+        // the conjunct (it returns exactly the rows the predicate selects; see the operator's soundness
+        // argument), so only the remaining conjuncts re-attach as the residual filter.
+        //
+        // Runs **after** the single-predicate loop above, deliberately: a single equality/range/text/
+        // prefix conjunct is at least as selective as a k-way union, and consuming it first keeps every
+        // plan that already used an index byte-identical to before this task. This pass therefore only
+        // ever fires where the planner previously emitted a scan.
+        for (i, conj) in conjuncts.iter().enumerate() {
+            if let Some(mv) = analyze_multi_value_predicate(conj, &variable.name)
+                && let Some(idx) = self.catalog.label_property(label, &mv.property)
+            {
+                deps.insert(idx.id);
+                let seek = PhysicalOp::NodeIndexMultiSeek {
+                    variable: variable.clone(),
+                    label: label.clone(),
+                    property: mv.property,
+                    values: mv.values,
+                    index: idx.id,
+                };
+                let residual: Vec<&Expr> = conjuncts
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != i)
+                    .map(|(_, e)| *e)
+                    .collect();
+                return attach_residual(seek, &residual);
+            }
+        }
+
         // No index applied. Before falling back to a bare label scan + residual filter, try to fuse a
         // single **equality** conjunct into a precise `NodeLabelScanEq` (`rmp` task #325): it routes
         // through the `scan_filter_eq` seam, which marks only the matching nodes for SSI instead of the
@@ -3011,6 +3141,44 @@ impl Planner<'_> {
                 .collect();
             return Some(attach_residual(seek, &residual));
         }
+
+        // Neither a single equality nor a single range applied: consume the first **multi-value**
+        // conjunct — `r.p IN [a, b]` or `r.p = a OR r.p = b` — into a `RelIndexMultiSeek` (`rmp` task
+        // #868), the relationship analogue of `NodeIndexMultiSeek`. A THIRD, last pass for the same
+        // reason the range pass is second: a single equality (and then a single range) is at least as
+        // selective as a k-way union, and no cost-based rewrite can later flip a relationship seek back
+        // to a scan, so this ordering keeps every pre-#868 relationship plan byte-identical and fires
+        // only where the planner previously emitted a typed scan + filter.
+        //
+        // `analyze_multi_value_predicate` already rejects an alternative that references ANY variable,
+        // which subsumes `seekable_value` here: the executor evaluates the values against the empty row
+        // exactly as `RelIndexSeek` does.
+        for (i, conj) in conjuncts.iter().enumerate() {
+            let Some(mv) = analyze_multi_value_predicate(conj, &relationship.name) else {
+                continue;
+            };
+            let Some(idx) = self.catalog.rel_property(rel_type, &mv.property) else {
+                continue;
+            };
+            deps.insert(idx.id);
+            let seek = PhysicalOp::RelIndexMultiSeek {
+                relationship: relationship.clone(),
+                from: from.clone(),
+                to: to.clone(),
+                rel_type: rel_type.clone(),
+                property: mv.property,
+                values: mv.values,
+                direction,
+                index: idx.id,
+            };
+            let residual: Vec<&Expr> = conjuncts
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, e)| *e)
+                .collect();
+            return Some(attach_residual(seek, &residual));
+        }
         None
     }
 
@@ -3188,6 +3356,7 @@ fn contains_read(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeByLabelScan { .. }
         | PhysicalOp::TokenLookupScan { .. }
         | PhysicalOp::NodeIndexSeek { .. }
+        | PhysicalOp::NodeIndexMultiSeek { .. }
         | PhysicalOp::NodeCompositeIndexSeek { .. }
         | PhysicalOp::NodeLabelScanEq { .. }
         | PhysicalOp::NodeIndexRangeSeek { .. }
@@ -3197,6 +3366,7 @@ fn contains_read(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeTextIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::RelIndexSeek { .. }
+        | PhysicalOp::RelIndexMultiSeek { .. }
         | PhysicalOp::RelIndexRangeSeek { .. }
         | PhysicalOp::RelCompositeIndexSeek { .. }
         | PhysicalOp::RelSpatialIndexSeek { .. }
@@ -3278,6 +3448,7 @@ fn contains_write(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeByLabelScan { .. }
         | PhysicalOp::TokenLookupScan { .. }
         | PhysicalOp::NodeIndexSeek { .. }
+        | PhysicalOp::NodeIndexMultiSeek { .. }
         | PhysicalOp::NodeCompositeIndexSeek { .. }
         | PhysicalOp::NodeLabelScanEq { .. }
         | PhysicalOp::NodeIndexRangeSeek { .. }
@@ -3287,6 +3458,7 @@ fn contains_write(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeTextIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::RelIndexSeek { .. }
+        | PhysicalOp::RelIndexMultiSeek { .. }
         | PhysicalOp::RelIndexRangeSeek { .. }
         | PhysicalOp::RelCompositeIndexSeek { .. }
         | PhysicalOp::RelSpatialIndexSeek { .. }
@@ -3352,6 +3524,7 @@ fn contains_procedure_call(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeByLabelScan { .. }
         | PhysicalOp::TokenLookupScan { .. }
         | PhysicalOp::NodeIndexSeek { .. }
+        | PhysicalOp::NodeIndexMultiSeek { .. }
         | PhysicalOp::NodeCompositeIndexSeek { .. }
         | PhysicalOp::NodeLabelScanEq { .. }
         | PhysicalOp::NodeIndexRangeSeek { .. }
@@ -3361,6 +3534,7 @@ fn contains_procedure_call(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeTextIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::RelIndexSeek { .. }
+        | PhysicalOp::RelIndexMultiSeek { .. }
         | PhysicalOp::RelIndexRangeSeek { .. }
         | PhysicalOp::RelCompositeIndexSeek { .. }
         | PhysicalOp::RelSpatialIndexSeek { .. }
@@ -3436,6 +3610,7 @@ fn all_procedure_calls_reader_safe(
         | PhysicalOp::NodeByLabelScan { .. }
         | PhysicalOp::TokenLookupScan { .. }
         | PhysicalOp::NodeIndexSeek { .. }
+        | PhysicalOp::NodeIndexMultiSeek { .. }
         | PhysicalOp::NodeCompositeIndexSeek { .. }
         | PhysicalOp::NodeLabelScanEq { .. }
         | PhysicalOp::NodeIndexRangeSeek { .. }
@@ -3445,6 +3620,7 @@ fn all_procedure_calls_reader_safe(
         | PhysicalOp::NodeTextIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::RelIndexSeek { .. }
+        | PhysicalOp::RelIndexMultiSeek { .. }
         | PhysicalOp::RelIndexRangeSeek { .. }
         | PhysicalOp::RelCompositeIndexSeek { .. }
         | PhysicalOp::RelSpatialIndexSeek { .. }
@@ -3747,6 +3923,37 @@ fn scan_alternative_for_seek(op: &PhysicalOp, catalog: &IndexCatalog) -> Option<
                 predicate: r,
             },
             None => scan_eq,
+        });
+    }
+
+    // Multi-value seek (`rmp` task #868): reconstruct the consumed `IN` predicate and re-apply it (plus
+    // any residual) as a full `Filter` over the label/token scan. This is the comparison the task's
+    // acceptance criterion names — a `k` large enough that `k` seek setups outweigh one pass over the
+    // label makes the scan cheaper, and `cheaper(..)` keeps it.
+    //
+    // The revert has NO precise `NodeLabelScanEq` analogue (that operator carries a single equality
+    // value, and the seam exposes no multi-value precise scan), so this is a plain scan + `IN` filter —
+    // exactly the plan every `IN`-list produced before this task, i.e. no SSI-footprint regression, only
+    // the pre-existing blanket label-scan footprint the cost model already accepts whenever it reverts a
+    // range seek. **Bag-preserving:** the `Filter` keeps a row iff `n.p IN [...]` is `TRUE`, which is by
+    // definition (`crate::equality::is_in`) the set the union of per-value seeks returns.
+    if let PhysicalOp::NodeIndexMultiSeek {
+        variable,
+        label,
+        property,
+        values,
+        ..
+    } = seek
+    {
+        let consumed = property_in_list_expr(variable, property, values, multi_value_span(values));
+        let full = match residual {
+            Some(r) => and_exprs(consumed, r),
+            None => consumed,
+        };
+        let scan = label_or_token_scan(variable, label, catalog);
+        return Some(PhysicalOp::Filter {
+            input: Box::new(scan),
+            predicate: full,
         });
     }
 
@@ -4129,6 +4336,31 @@ fn seek_alternative_for_filter(op: &PhysicalOp, catalog: &IndexCatalog) -> Optio
                     .collect();
                 return Some(attach_residual(seek, &residual));
             }
+        }
+    }
+    // Multi-value alternative (`rmp` task #868), mirroring `lower_filter`'s ordering: an `IN`-list /
+    // `OR`-of-equalities conjunct on an indexed property becomes a `NodeIndexMultiSeek`, tried only
+    // after every single-property predicate (which is at least as selective). This keeps the two
+    // directions of the access-path rewrite symmetric — `scan_alternative_for_seek` can revert a
+    // multi-seek to this scan, and this can propose it back — with `cheaper(..)` deciding either way.
+    for (i, conj) in conjuncts.iter().enumerate() {
+        if let Some(mv) = analyze_multi_value_predicate(conj, &variable.name)
+            && let Some(idx) = catalog.label_property(label, &mv.property)
+        {
+            let seek = PhysicalOp::NodeIndexMultiSeek {
+                variable: variable.clone(),
+                label: label.clone(),
+                property: mv.property,
+                values: mv.values,
+                index: idx.id,
+            };
+            let residual: Vec<&Expr> = conjuncts
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, e)| *e)
+                .collect();
+            return Some(attach_residual(seek, &residual));
         }
     }
     None
@@ -4729,6 +4961,11 @@ fn binds_variable_by_seek(op: &PhysicalOp, variable: &str) -> bool {
         PhysicalOp::NodeIndexSeek { variable: v, .. }
             | PhysicalOp::NodeIndexRangeSeek { variable: v, .. }
             | PhysicalOp::NodeCompositeIndexSeek { variable: v, .. }
+            // A multi-value seek (`rmp` task #868) IS an index access path, so `USING INDEX v` counts it
+            // as satisfied and — the case that would otherwise regress silently — `USING SCAN v` finds it
+            // and reverts it through `scan_alternative_for_seek`. Omitting it here would leave a
+            // `USING SCAN` hint quietly unhonoured over an `IN`-list.
+            | PhysicalOp::NodeIndexMultiSeek { variable: v, .. }
             | PhysicalOp::NodeIndexStartsWithSeek { variable: v, .. }
             | PhysicalOp::NodeIndexScan { variable: v, .. }
         if v.name == variable
@@ -5150,6 +5387,7 @@ fn map_children(op: PhysicalOp, f: &dyn Fn(PhysicalOp) -> PhysicalOp) -> Physica
         | PhysicalOp::NodeByLabelScan { .. }
         | PhysicalOp::TokenLookupScan { .. }
         | PhysicalOp::NodeIndexSeek { .. }
+        | PhysicalOp::NodeIndexMultiSeek { .. }
         | PhysicalOp::NodeCompositeIndexSeek { .. }
         | PhysicalOp::NodeLabelScanEq { .. }
         | PhysicalOp::NodeIndexRangeSeek { .. }
@@ -5159,6 +5397,7 @@ fn map_children(op: PhysicalOp, f: &dyn Fn(PhysicalOp) -> PhysicalOp) -> Physica
         | PhysicalOp::NodeTextIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::RelIndexSeek { .. }
+        | PhysicalOp::RelIndexMultiSeek { .. }
         | PhysicalOp::RelIndexRangeSeek { .. }
         | PhysicalOp::RelCompositeIndexSeek { .. }
         | PhysicalOp::RelSpatialIndexSeek { .. }
@@ -5714,9 +5953,12 @@ fn contains_correlated_seek(op: &PhysicalOp) -> bool {
         PhysicalOp::NodeIndexSeek { value, .. }
         | PhysicalOp::NodeIndexRangeSeek { value, .. }
         | PhysicalOp::NodeLabelScanEq { value, .. } => expr_contains_variable(value),
-        PhysicalOp::NodeCompositeIndexSeek { values, .. } => {
-            values.iter().any(expr_contains_variable)
-        }
+        // A multi-value seek is never *built* correlated — `analyze_multi_value_predicate` rejects an
+        // alternative that references any variable (`rmp` task #868) — but classify it by the same rule
+        // anyway, so the reorderer's pin stays correct if that precondition is ever relaxed.
+        PhysicalOp::NodeCompositeIndexSeek { values, .. }
+        | PhysicalOp::NodeIndexMultiSeek { values, .. }
+        | PhysicalOp::RelIndexMultiSeek { values, .. } => values.iter().any(expr_contains_variable),
         PhysicalOp::NodeIndexStartsWithSeek { prefix, .. } => expr_contains_variable(prefix),
         _ => false,
     };
@@ -5728,6 +5970,7 @@ fn contains_correlated_seek(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeByLabelScan { .. }
         | PhysicalOp::TokenLookupScan { .. }
         | PhysicalOp::NodeIndexSeek { .. }
+        | PhysicalOp::NodeIndexMultiSeek { .. }
         | PhysicalOp::NodeCompositeIndexSeek { .. }
         | PhysicalOp::NodeLabelScanEq { .. }
         | PhysicalOp::NodeIndexRangeSeek { .. }
@@ -5737,6 +5980,7 @@ fn contains_correlated_seek(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeTextIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::RelIndexSeek { .. }
+        | PhysicalOp::RelIndexMultiSeek { .. }
         | PhysicalOp::RelIndexRangeSeek { .. }
         | PhysicalOp::RelCompositeIndexSeek { .. }
         | PhysicalOp::RelSpatialIndexSeek { .. }
@@ -5792,6 +6036,7 @@ fn contains_argument(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeByLabelScan { .. }
         | PhysicalOp::TokenLookupScan { .. }
         | PhysicalOp::NodeIndexSeek { .. }
+        | PhysicalOp::NodeIndexMultiSeek { .. }
         | PhysicalOp::NodeCompositeIndexSeek { .. }
         | PhysicalOp::NodeLabelScanEq { .. }
         | PhysicalOp::NodeIndexRangeSeek { .. }
@@ -5801,6 +6046,7 @@ fn contains_argument(op: &PhysicalOp) -> bool {
         | PhysicalOp::NodeTextIndexSeek { .. }
         | PhysicalOp::AllRelationshipsScan { .. }
         | PhysicalOp::RelIndexSeek { .. }
+        | PhysicalOp::RelIndexMultiSeek { .. }
         | PhysicalOp::RelIndexRangeSeek { .. }
         | PhysicalOp::RelCompositeIndexSeek { .. }
         | PhysicalOp::RelSpatialIndexSeek { .. }
@@ -6237,6 +6483,7 @@ fn gather_index_dependencies(op: &PhysicalOp, deps: &mut BTreeSet<IndexId>) {
     match op {
         PhysicalOp::TokenLookupScan { index, .. }
         | PhysicalOp::NodeIndexSeek { index, .. }
+        | PhysicalOp::NodeIndexMultiSeek { index, .. }
         | PhysicalOp::NodeCompositeIndexSeek { index, .. }
         | PhysicalOp::NodeIndexRangeSeek { index, .. }
         | PhysicalOp::NodeIndexScan { index, .. }
@@ -6244,6 +6491,7 @@ fn gather_index_dependencies(op: &PhysicalOp, deps: &mut BTreeSet<IndexId>) {
         | PhysicalOp::SpatialIndexSeek { index, .. }
         | PhysicalOp::NodeTextIndexSeek { index, .. }
         | PhysicalOp::RelIndexSeek { index, .. }
+        | PhysicalOp::RelIndexMultiSeek { index, .. }
         | PhysicalOp::RelIndexRangeSeek { index, .. }
         | PhysicalOp::RelCompositeIndexSeek { index, .. }
         | PhysicalOp::RelSpatialIndexSeek { index, .. } => {
@@ -6399,6 +6647,192 @@ fn analyze_is_not_null(expr: &Expr, variable: &str) -> Option<String> {
         return None;
     };
     property_of(operand, variable)
+}
+
+/// A **multi-value equality** predicate on one indexed property (`rmp` task #868): the property, plus
+/// the alternative values it is compared against. Backs
+/// [`NodeIndexMultiSeek`](PhysicalOp::NodeIndexMultiSeek) and
+/// [`RelIndexMultiSeek`](PhysicalOp::RelIndexMultiSeek).
+#[derive(Debug, Clone, PartialEq)]
+struct MultiValuePredicate {
+    /// The property key (`p` in `n.p`).
+    property: String,
+    /// The alternative values, in source order. May contain duplicates (collapsed at run time under
+    /// Cypher equality) and may be **empty** (`IN []`, which matches nothing).
+    values: Vec<Expr>,
+}
+
+/// Analyses a conjunct: does it constrain `variable.<prop>` to a **set** of values, in a form a
+/// multi-value index seek can serve (`rmp` task #868)? Returns the property and the alternatives, or
+/// [`None`].
+///
+/// Two recognised spellings, both of which openCypher defines as the identical three-valued `OR`-fold
+/// of `=` over the alternatives ([`crate::equality::is_in`]):
+///
+/// - **`var.prop IN [e₁, …, e_k]`** — a syntactic list; `k` may be `0`.
+/// - **`var.prop = e₁ OR var.prop = e₂ OR …`** — a disjunction whose **every** branch is an equality
+///   (or a nested `IN` list) on the **same** property of the **same** variable. `OR` is associative, so
+///   the tree is flattened left-to-right and the alternatives concatenate.
+///
+/// # Why this is only legal for a top-level `Filter` conjunct
+///
+/// `IN` and `OR` are **three-valued**: `3 IN [1, null]` is `null`, not `false`, and `n.p = 1 OR n.p =
+/// 2` is `null` when `n.p` is `null`. Lowering the predicate to "the set of rows that positively
+/// match" therefore only preserves meaning where `null` and `false` are indistinguishable — which is
+/// exactly a `WHERE`/`Filter` conjunct (a `Filter` keeps a row iff its predicate is `TRUE`). Under a
+/// `NOT`, nested inside a larger `OR` with a non-matching branch, or in a `CASE`/projection, the
+/// distinction is observable and the rewrite would be wrong. This function is called **only** on the
+/// members of [`split_conjuncts`] — the top-level `AND` conjuncts of a `Filter` predicate — and it
+/// matches neither `Unary { Not }` nor any non-top-level position, so those cases can never reach it.
+///
+/// # Named declines
+///
+/// - **`IN <non-list expression>`** (`IN $ids`, `IN keys(x)`, `IN n.tags`). The alternatives are then
+///   not enumerable at plan time, so `k` is unknown and the cost model cannot weigh `k` seek setups
+///   against the scan (`rmp` #868 costs the operator as exactly that). Stays a residual filter.
+/// - **A value referencing any variable.** Unlike the single-value seek — which supports a *correlated*
+///   key fed per driving row (`rmp` #708) — a multi-value seek is never correlated: it is excluded from
+///   [`contains_correlated_seek`] and so from the reorderer's correlated-seek pin. Requiring every
+///   alternative to be variable-free (not merely free of `variable`) keeps that exclusion sound, and
+///   makes the executor's evaluation against the empty row exactly right.
+/// - **A disjunction over different properties or variables**, or one mixing an equality with a range,
+///   a `STARTS WITH`, an `IS NULL`, … — a union of *different* access paths, out of scope here.
+/// - **A bare `var.prop = v`.** It is accepted as an `OR` *branch* but never as the whole predicate:
+///   the single-value seek is strictly better for it (see the shape gate at the top of the body).
+fn analyze_multi_value_predicate(expr: &Expr, variable: &str) -> Option<MultiValuePredicate> {
+    // Only the two multi-value SPELLINGS are entry points. A bare `var.prop = v` is deliberately not
+    // one, even though the recursion below accepts it as an `OR` *branch*: the single-value
+    // [`PhysicalOp::NodeIndexSeek`] is strictly better for it (it alone can carry the provided-order
+    // `Sort` elision of `rmp` #665 and the correlated per-row key of `rmp` #708), and gating here means
+    // that stays true no matter where this analysis is called from.
+    if !matches!(
+        &expr.kind,
+        ExprKind::Binary {
+            op: BinaryOp::Or,
+            ..
+        } | ExprKind::Predicate {
+            op: PredicateOp::In,
+            ..
+        }
+    ) {
+        return None;
+    }
+    let mut property: Option<String> = None;
+    let mut values: Vec<Expr> = Vec::new();
+    collect_multi_value_alternatives(expr, variable, &mut property, &mut values).ok()?;
+    // Every alternative must be knowable without a row. `expr_contains_variable` is deliberately
+    // stricter than the single-value seek's `expr_references_var(.., variable)`: see the doc above.
+    if values.iter().any(expr_contains_variable) {
+        return None;
+    }
+    Some(MultiValuePredicate {
+        property: property?,
+        values,
+    })
+}
+
+/// The recursive worker behind [`analyze_multi_value_predicate`]: appends `expr`'s alternatives to
+/// `values`, pinning `property` to the single property every branch must agree on. Returns `Err(())`
+/// as soon as a branch is not an equality / `IN` on that one property of `variable`, so a partially
+/// collected alternative list can never escape (the caller discards it).
+fn collect_multi_value_alternatives(
+    expr: &Expr,
+    variable: &str,
+    property: &mut Option<String>,
+    values: &mut Vec<Expr>,
+) -> Result<(), ()> {
+    // `a OR b`: associative, so flatten. Both sides must resolve to the same property.
+    if let ExprKind::Binary {
+        op: BinaryOp::Or,
+        lhs,
+        rhs,
+    } = &expr.kind
+    {
+        collect_multi_value_alternatives(lhs, variable, property, values)?;
+        return collect_multi_value_alternatives(rhs, variable, property, values);
+    }
+
+    // `var.prop IN [ … ]` — the list must be *syntactically* a list so `k` is known at plan time.
+    if let ExprKind::Predicate {
+        op: PredicateOp::In,
+        operand,
+        rhs: Some(list),
+    } = &expr.kind
+        && let Some(prop) = property_of(operand, variable)
+        && let ExprKind::List(items) = &list.kind
+    {
+        pin_property(property, prop)?;
+        values.extend(items.iter().cloned());
+        return Ok(());
+    }
+
+    // `var.prop = value` (either orientation) — one alternative. Reuses the single-property analysis so
+    // the two paths agree on what counts as an index-usable equality.
+    match analyze_property_predicate(expr, variable) {
+        Some(PropertyPredicate {
+            property: prop,
+            kind: PropertyPredicateKind::Equality { value },
+        }) => {
+            pin_property(property, prop)?;
+            values.push(value);
+            Ok(())
+        }
+        _ => Err(()),
+    }
+}
+
+/// Pins the single property a multi-value predicate may name: sets it on first sight, and rejects any
+/// later branch naming a different one (`n.a = 1 OR n.b = 2` is a union of two access paths, not one).
+fn pin_property(slot: &mut Option<String>, property: String) -> Result<(), ()> {
+    match slot {
+        Some(existing) if *existing != property => Err(()),
+        Some(_) => Ok(()),
+        None => {
+            *slot = Some(property);
+            Ok(())
+        }
+    }
+}
+
+/// Builds the `variable.property IN [values]` predicate expression a multi-value seek consumed, so the
+/// cost-based optimiser can reconstruct the equivalent scan + filter realisation (`rmp` task #868).
+///
+/// The reconstruction is always spelled `IN`, even when the seek was lowered from the `OR`-of-equalities
+/// spelling: openCypher defines `IN` as exactly the three-valued `OR`-fold of `=` over the list
+/// ([`crate::equality::is_in`]), so the two are the *same* predicate — and as a residual `Filter` only
+/// the `TRUE` set is observable in any case. Spans come from `variable`'s own span so diagnostics stay
+/// anchored to real source.
+fn property_in_list_expr(
+    variable: &Var,
+    property: &str,
+    values: &[Expr],
+    span: crate::lexer::Span,
+) -> Expr {
+    let var_expr = Expr::new(ExprKind::Variable(variable.name.clone()), span);
+    let prop_expr = Expr::new(
+        ExprKind::Property {
+            base: Box::new(var_expr),
+            key: property.to_owned(),
+        },
+        span,
+    );
+    let list = Expr::new(ExprKind::List(values.to_vec()), span);
+    Expr::new(
+        ExprKind::Predicate {
+            op: PredicateOp::In,
+            operand: Box::new(prop_expr),
+            rhs: Some(Box::new(list)),
+        },
+        span,
+    )
+}
+
+/// The span to anchor a reconstructed multi-value predicate on: the first alternative's span, or a
+/// zero-width span when the list is empty (`IN []` carries no value to point at).
+fn multi_value_span(values: &[Expr]) -> crate::lexer::Span {
+    values
+        .first()
+        .map_or(crate::lexer::Span::new(0, 0), |e| e.span)
 }
 
 /// If `expr` is `variable.<prop> CONTAINS|ENDS WITH|STARTS WITH <needle>` where `<needle>` does **not**
@@ -6617,6 +7051,18 @@ fn build_seek(variable: &Var, label: &Label, pp: &PropertyPredicate, index: Inde
             index,
         },
     }
+}
+
+/// Renders a multi-value seek's alternatives as a comma-separated list, for the `EXPLAIN`/`PROFILE`
+/// plan description of [`NodeIndexMultiSeek`](PhysicalOp::NodeIndexMultiSeek) and
+/// [`RelIndexMultiSeek`](PhysicalOp::RelIndexMultiSeek) (`rmp` task #868). An empty list renders as
+/// nothing between the brackets — `p IN []` — which is exactly how the query was written.
+fn display_expr_list(values: &[Expr]) -> String {
+    values
+        .iter()
+        .map(crate::logical::display_helpers::expr)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The `Display` suffix marking a value-orderable index op as emitting in ascending key order
@@ -6879,6 +7325,7 @@ fn gather_bound_vars(plan: &PhysicalOp, out: &mut Vec<Var>) {
         | PhysicalOp::NodeByLabelScan { variable, .. }
         | PhysicalOp::TokenLookupScan { variable, .. }
         | PhysicalOp::NodeIndexSeek { variable, .. }
+        | PhysicalOp::NodeIndexMultiSeek { variable, .. }
         | PhysicalOp::NodeCompositeIndexSeek { variable, .. }
         | PhysicalOp::NodeLabelScanEq { variable, .. }
         | PhysicalOp::NodeIndexRangeSeek { variable, .. }
@@ -6893,6 +7340,12 @@ fn gather_bound_vars(plan: &PhysicalOp, out: &mut Vec<Var>) {
             ..
         }
         | PhysicalOp::RelIndexSeek {
+            relationship,
+            from,
+            to,
+            ..
+        }
+        | PhysicalOp::RelIndexMultiSeek {
             relationship,
             from,
             to,
@@ -7107,6 +7560,18 @@ impl PhysicalOp {
                 h::expr(value),
                 ordered_suffix(*ordered),
             ),
+            Self::NodeIndexMultiSeek {
+                variable,
+                label,
+                property,
+                values,
+                index,
+            } => writeln!(
+                f,
+                "NodeIndexMultiSeek({variable}:{} {property} IN [{}] via {index})",
+                label.name,
+                display_expr_list(values),
+            ),
             Self::NodeCompositeIndexSeek {
                 variable,
                 label,
@@ -7232,6 +7697,23 @@ impl PhysicalOp {
                 h::arrow_left(*direction),
                 rel_type.name,
                 h::expr(value),
+                h::arrow_right(*direction),
+            ),
+            Self::RelIndexMultiSeek {
+                relationship,
+                from,
+                to,
+                rel_type,
+                property,
+                values,
+                direction,
+                index,
+            } => writeln!(
+                f,
+                "RelIndexMultiSeek({}{relationship}:{} {property} IN [{}]{}{to} from {from} via {index})",
+                h::arrow_left(*direction),
+                rel_type.name,
+                display_expr_list(values),
                 h::arrow_right(*direction),
             ),
             Self::RelIndexRangeSeek {
@@ -7796,6 +8278,25 @@ fn collect_static_rel_eq_seeks(
     {
         out.push((rel_type.name.clone(), property.clone(), seek));
     }
+    // A multi-value relationship seek (`rmp` task #868) needs ONE captured key per alternative, exactly
+    // as its node twin does in `collect_static_node_index_eq_seeks`. Without this the off-thread
+    // reader's memo misses on the first alternative, the whole union declines, and every off-thread
+    // `RelIndexMultiSeek` degrades to the typed scan — the off-thread/inline parity gap `rmp` #768/#769
+    // catalogued for the other seek kinds. A miss is still SAFE (a decline is a decline, never
+    // `Some(vec![])`), just slower.
+    if let PhysicalOp::RelIndexMultiSeek {
+        rel_type,
+        property,
+        values,
+        ..
+    } = op
+    {
+        for value in values {
+            if let Some(seek) = static_seek_value(value, params) {
+                out.push((rel_type.name.clone(), property.clone(), seek));
+            }
+        }
+    }
     for child in op.children() {
         collect_static_rel_eq_seeks(child, params, out);
     }
@@ -7926,6 +8427,24 @@ fn collect_static_node_index_eq_seeks(
         && let Some(seek) = static_seek_value(value, params)
     {
         out.push((label.name.clone(), property.clone(), seek));
+    }
+    // A multi-value seek (`rmp` task #868) needs ONE captured key per alternative, or the off-thread
+    // reader's memo would miss and the reader would decline to a scan — the exact off-thread/inline
+    // parity gap `rmp` #768/#769 catalogued for the other seek kinds. Capturing every alternative keeps
+    // the off-thread predicate exactly as strong as the inline one. A miss on any single alternative is
+    // still safe (the reader declines the whole union and scans), just slower.
+    if let PhysicalOp::NodeIndexMultiSeek {
+        label,
+        property,
+        values,
+        ..
+    } = op
+    {
+        for value in values {
+            if let Some(seek) = static_seek_value(value, params) {
+                out.push((label.name.clone(), property.clone(), seek));
+            }
+        }
     }
     for child in op.children() {
         collect_static_node_index_eq_seeks(child, params, out);

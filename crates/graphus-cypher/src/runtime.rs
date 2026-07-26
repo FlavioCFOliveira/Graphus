@@ -439,12 +439,18 @@ pub fn hash_row_value<H: std::hash::Hasher>(v: &RowValue, state: &mut H) {
         RowValue::Map(entries) => {
             5u8.hash(state);
             entries.len().hash(state);
+            // Wrapping multiply-add, not XOR: commutative (so the hash stays insertion-order
+            // independent, as `row_values_equivalent` requires) but NOT self-cancelling. XOR made every
+            // map of the shape `{k: v, k: v}` hash to the same accumulator whatever `k` and `v` were,
+            // which an attacker can mass-produce for free and drive into one bucket (`rmp` task #868;
+            // the same fix as `equivalence::hash_map_unordered`, where the reasoning is written out).
+            const ENTRY_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
             let mut acc: u64 = 0;
             for (k, val) in entries {
                 let mut h = std::collections::hash_map::DefaultHasher::new();
                 k.hash(&mut h);
                 hash_row_value(val, &mut h);
-                acc ^= h.finish();
+                acc = acc.wrapping_add(h.finish().wrapping_mul(ENTRY_MIX));
             }
             acc.hash(state);
         }

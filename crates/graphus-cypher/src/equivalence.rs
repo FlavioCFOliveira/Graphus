@@ -183,16 +183,31 @@ pub fn hash_value<H: Hasher>(v: &Value, state: &mut H) {
 }
 
 /// Order-independent hash of a map's entries: each `(key, value)` is hashed into an isolated
-/// sub-hash and the per-entry results are XOR-combined (commutative ⇒ insertion-order-independent),
+/// sub-hash and the per-entry results are combined **commutatively** (⇒ insertion-order-independent),
 /// matching [`map_equivalent`].
+///
+/// # Why the combiner is wrapping addition and not XOR (`rmp` task #868)
+///
+/// XOR is self-cancelling: two entries with the same key **and** the same value contribute `h ^ h = 0`,
+/// so *every* map of the shape `{k: v, k: v}` hashed to the identical accumulator regardless of `k` and
+/// `v`. The parser accepts duplicate map keys, so an attacker could put `n` such maps in one
+/// `DISTINCT`, grouping key or `IN` list and drive them all into a single hash bucket with **no**
+/// offline work at all — the equivalence probe inside the bucket then makes the operation quadratic
+/// (CWE-407, hash-collision denial of service; measured at ~4x per doubling of `n`).
+///
+/// Wrapping multiply-then-add is equally commutative (so the order-independence [`map_equivalent`]
+/// requires is preserved) but not self-cancelling: duplicate entries reinforce rather than annihilate.
+/// The odd multiplier keeps the low bits mixed, since `HashMap` buckets on them.
 fn hash_map_unordered<H: Hasher>(entries: &[(String, Value)], state: &mut H) {
+    /// An arbitrary odd 64-bit constant (odd ⇒ invertible modulo 2^64, so no information is lost).
+    const ENTRY_MIX: u64 = 0x9E37_79B9_7F4A_7C15;
     entries.len().hash(state);
     let mut acc: u64 = 0;
     for (k, v) in entries {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         k.hash(&mut h);
         hash_value(v, &mut h);
-        acc ^= h.finish();
+        acc = acc.wrapping_add(h.finish().wrapping_mul(ENTRY_MIX));
     }
     acc.hash(state);
 }
@@ -254,6 +269,51 @@ mod tests {
         let mut s = std::collections::hash_map::DefaultHasher::new();
         hash_value(v, &mut s);
         s.finish()
+    }
+
+    /// **Regression, `rmp` task #868 (CWE-407).** The per-entry combiner in [`hash_map_unordered`] must
+    /// not be self-cancelling.
+    ///
+    /// It used to XOR the per-entry sub-hashes, so any map with a *duplicate entry* contributed
+    /// `h ^ h = 0` — making **every** map of the shape `{k: v, k: v}` hash to the identical value
+    /// whatever `k` and `v` were. The parser accepts duplicate map keys, so an attacker could put `n`
+    /// such maps in one `DISTINCT`, grouping key or `IN` list and drive them all into a single hash
+    /// bucket for free; the equivalence probe inside the bucket then made the operation quadratic
+    /// (measured at ~4x per doubling of `n`). These maps are pairwise NON-equivalent, so nothing
+    /// requires them to collide.
+    #[test]
+    fn duplicate_map_entries_do_not_collapse_the_hash_into_one_bucket() {
+        let dup = |key: &str| {
+            Value::Map(vec![
+                (key.to_owned(), Value::Integer(1)),
+                (key.to_owned(), Value::Integer(1)),
+            ])
+        };
+        let (a, b, c) = (dup("k0"), dup("k1"), dup("k2"));
+        // They are genuinely different values...
+        assert!(!equivalent(&a, &b));
+        assert!(!equivalent(&b, &c));
+        // ...so they must not all share one bucket. (Any *one* pair could collide by chance; all three
+        // colliding is the self-cancellation signature.)
+        assert!(
+            h(&a) != h(&b) || h(&b) != h(&c),
+            "duplicate-entry maps must not all hash to the same bucket"
+        );
+        // The zero accumulator is the specific artefact of the old XOR fold: an empty-ish map and a
+        // duplicate-entry map must not agree either.
+        assert_ne!(h(&a), h(&Value::Map(Vec::new())));
+
+        // The invariant the combiner exists for is preserved: order-independence.
+        let xy = Value::Map(vec![
+            ("x".to_owned(), Value::Integer(1)),
+            ("y".to_owned(), Value::Integer(2)),
+        ]);
+        let yx = Value::Map(vec![
+            ("y".to_owned(), Value::Integer(2)),
+            ("x".to_owned(), Value::Integer(1)),
+        ]);
+        assert!(equivalent(&xy, &yx));
+        assert_eq!(h(&xy), h(&yx), "insertion order must not change the hash");
     }
 
     #[test]

@@ -1029,6 +1029,189 @@ async fn deny_read_property_is_enforced_on_index_seek_and_precise_scan_822() {
     server.shutdown().await.expect("clean shutdown");
 }
 
+/// **A multi-value index seek is RBAC-filtered end to end** (`rmp` task #868).
+///
+/// `WHERE u.uidn IN [1, 2, 3]` and `WHERE u.uidn = 1 OR u.uidn = 2` now plan as a
+/// `NodeIndexMultiSeek` — a UNION of `k` per-value `index_seek_eq` descents. Each descent runs through
+/// the very seam the single-value `NodeIndexSeek` uses, so the `AuthorizedGraph` decorator's
+/// `may_read_node_property` filter (`rmp` #822) applies per descent; and when any value declines, the
+/// whole union falls back to `scan_filter_eq` per value, which the same decorator filters. This test is
+/// the end-to-end proof over the real wire that neither path is a bypass.
+///
+/// Two independent controls are exercised, because a new access path can leak through either:
+///
+/// 1. **`DENY TRAVERSE` on a label** — a node the principal may not see must not surface through the
+///    union, even though its indexed value is one of the alternatives.
+/// 2. **`DENY READ` on the seeked property** — a positive predicate on a denied property must return
+///    NO rows, exactly as the single-value seek does since `rmp` #822 (the seek re-checks the RAW store
+///    value, so without the decorator's filter it would disclose who holds value `v`, CWE-863).
+///
+/// Every assertion is paired with the **scan spelling of the same question**, so the two must agree: a
+/// divergence is precisely the shape of the `rmp` #820 / #822 / #826 gaps, which all shipped behind
+/// green CI because enforcement was only ever asserted one layer below the query.
+#[tokio::test]
+async fn multi_value_index_seek_is_rbac_filtered_at_query_time_868() {
+    let temp = TempStore::new("multiseek-rbac");
+    let server = boot(base_config(&temp)).await;
+    let uds = server.uds_path.clone().expect("UDS enabled");
+
+    // ---- 1) Admin seeds four :USER nodes (one also :Secret) and the RANGE index on uidn. --------
+    let mut alice = BoltClient::connect(&uds).await;
+    alice.handshake_and_logon("alice", "admin-pw8").await;
+    alice.run_ok("CREATE (:USER {uidn: 1, nick: 'a'})").await;
+    alice.run_ok("CREATE (:USER {uidn: 2, nick: 'b'})").await;
+    alice
+        .run_ok("CREATE (:USER:Secret {uidn: 3, nick: 'c'})")
+        .await;
+    alice.run_ok("CREATE (:USER {uidn: 4, nick: 'd'})").await;
+    alice.run_ok("CREATE INDEX FOR (n:USER) ON (n.uidn)").await;
+    // Unrestricted: the accelerated union sees all three alternatives.
+    let admin_in = alice
+        .run_ok("MATCH (u:USER) WHERE u.uidn IN [1, 2, 3] RETURN count(u)")
+        .await;
+    assert_eq!(
+        ints(&admin_in, 0),
+        vec![3],
+        "an unrestricted principal sees every alternative"
+    );
+    alice.goodbye().await;
+
+    // ---- 2) bob: TRAVERSE :USER + READ uidn/nick, with DENY TRAVERSE carved out for :Secret. ----
+    let mut admin = BoltClient::connect(&uds).await;
+    admin.handshake_and_logon("alice", "admin-pw8").await;
+    admin.run_ok("REVOKE ROLE readwrite FROM bob").await;
+    admin.run_ok("CREATE ROLE multiseek").await;
+    admin
+        .run_ok("GRANT TRAVERSE ON LABEL graphus.USER TO multiseek")
+        .await;
+    admin
+        .run_ok("GRANT READ ON PROPERTY graphus.USER.uidn TO multiseek")
+        .await;
+    admin
+        .run_ok("GRANT READ ON PROPERTY graphus.USER.nick TO multiseek")
+        .await;
+    admin
+        .run_ok("DENY TRAVERSE ON LABEL graphus.Secret TO multiseek")
+        .await;
+    admin.run_ok("GRANT ROLE multiseek TO bob").await;
+    admin.goodbye().await;
+
+    let mut bob = BoltClient::connect(&uds).await;
+    bob.handshake_and_logon("bob", "user2-pw8").await;
+
+    // ---- 3) The denied node must not surface through EITHER spelling of the multi-value seek. ---
+    let in_list = bob
+        .run_ok("MATCH (u:USER) WHERE u.uidn IN [1, 2, 3] RETURN count(u)")
+        .await;
+    assert_eq!(
+        ints(&in_list, 0),
+        vec![2],
+        "DENY TRAVERSE on :Secret must remove uidn 3 from the IN-list union"
+    );
+    let or_form = bob
+        .run_ok("MATCH (u:USER) WHERE u.uidn = 1 OR u.uidn = 2 OR u.uidn = 3 RETURN count(u)")
+        .await;
+    assert_eq!(
+        ints(&or_form, 0),
+        ints(&in_list, 0),
+        "the OR spelling must agree with the IN spelling"
+    );
+    // The scan spelling of the same question — the path that was always RBAC-filtered. The union must
+    // not see one row more than it does.
+    let scanned = bob
+        .run_ok("MATCH (u:USER) WHERE u.uidn <> 4 RETURN count(u)")
+        .await;
+    assert_eq!(
+        ints(&scanned, 0),
+        ints(&in_list, 0),
+        "the multi-value seek must agree with the scan+filter answer to the same question"
+    );
+    // And the rows themselves, not merely the count.
+    let nicks = bob
+        .run_ok("MATCH (u:USER) WHERE u.uidn IN [1, 2, 3] RETURN u.nick")
+        .await;
+    let mut ns = opt_strings(&nicks, 0);
+    ns.sort();
+    assert_eq!(
+        ns,
+        vec![Some("a".to_owned()), Some("b".to_owned())],
+        "the denied :Secret node's row must not be enumerated: {ns:?}"
+    );
+    // A single-value alternative naming ONLY the denied node returns nothing at all.
+    let only_denied = bob
+        .run_ok("MATCH (u:USER) WHERE u.uidn IN [3] RETURN u.nick")
+        .await;
+    assert!(
+        only_denied.is_empty(),
+        "an IN list of only denied values must return no rows: {only_denied:?}"
+    );
+    bob.reset().await;
+
+    // ---- 4) Second control: DENY READ on the SEEKED property hides every row. -------------------
+    let mut admin2 = BoltClient::connect(&uds).await;
+    admin2.handshake_and_logon("alice", "admin-pw8").await;
+    admin2
+        .run_ok("DENY READ ON PROPERTY graphus.USER.uidn TO multiseek")
+        .await;
+    admin2.goodbye().await;
+
+    let denied = bob
+        .run_ok("MATCH (u:USER) WHERE u.uidn IN [1, 2, 4] RETURN u.nick")
+        .await;
+    assert!(
+        denied.is_empty(),
+        "a positive predicate on a DENY-READ property must return no rows through the union:          {denied:?}"
+    );
+    let denied_or = bob
+        .run_ok("MATCH (u:USER) WHERE u.uidn = 1 OR u.uidn = 2 RETURN u.nick")
+        .await;
+    assert!(
+        denied_or.is_empty(),
+        "the OR spelling must be equally blind: {denied_or:?}"
+    );
+    // Parity with the single-value seek, which `rmp` #822 already fixed: same answer, same reason.
+    let denied_single = bob
+        .run_ok("MATCH (u:USER) WHERE u.uidn = 1 RETURN u.nick")
+        .await;
+    assert!(
+        denied_single.is_empty(),
+        "control: the single-value seek is blind too: {denied_single:?}"
+    );
+    // `IS NULL` still keeps every node (the denied property reads as null) — the masking parity that
+    // proves the DENY is a *read* mask and the nodes are still traversable.
+    let blind = bob
+        .run_ok("MATCH (u:USER) WHERE u.uidn IS NULL RETURN count(u)")
+        .await;
+    assert_eq!(
+        ints(&blind, 0),
+        vec![3],
+        "IS NULL keeps the three traversable :USER nodes (uidn reads as null)"
+    );
+    bob.reset().await;
+
+    // ---- 5) DROP INDEX: the SAME queries now take the whole-union scan fallback. ----------------
+    let mut admin3 = BoltClient::connect(&uds).await;
+    admin3.handshake_and_logon("alice", "admin-pw8").await;
+    admin3
+        .run_ok("REVOKE DENY READ ON PROPERTY graphus.USER.uidn FROM multiseek")
+        .await;
+    admin3.run_ok("DROP INDEX FOR (n:USER) ON (n.uidn)").await;
+    admin3.goodbye().await;
+
+    let no_index = bob
+        .run_ok("MATCH (u:USER) WHERE u.uidn IN [1, 2, 3] RETURN u.nick")
+        .await;
+    let mut ns2 = opt_strings(&no_index, 0);
+    ns2.sort();
+    assert_eq!(
+        ns2,
+        vec![Some("a".to_owned()), Some("b".to_owned())],
+        "the no-index scan fallback must honour the DENY TRAVERSE identically: {ns2:?}"
+    );
+    bob.goodbye().await;
+    server.shutdown().await.expect("clean shutdown");
+}
+
 /// `rmp` #826 (regression, whole-query end-to-end): the named-index PROCEDURE surface must honour a
 /// `DENY READ` on the property an index covers. A full-text match returns a node BECAUSE a covered TEXT
 /// property matched the search, so a restricted principal denied read on that covered property must NOT

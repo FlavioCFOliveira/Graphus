@@ -420,6 +420,16 @@ fn walk_physical(op: &PhysicalOp, record: &mut impl FnMut(&str, ParamType)) {
                 params_in_expr(value, ParamType::Any, record);
             }
         }
+        PhysicalOp::NodeIndexMultiSeek { values, .. }
+        | PhysicalOp::RelIndexMultiSeek { values, .. } => {
+            // The multi-value seek's alternatives (`rmp` task #868): one per `IN`-list element / `OR`
+            // branch, each treated exactly like a single seek value — no static type expectation,
+            // recorded as Any. They MUST be walked here or a `$param` alternative would never bind.
+            // A leaf — no input to recurse into.
+            for value in values {
+                params_in_expr(value, ParamType::Any, record);
+            }
+        }
         PhysicalOp::NodeLabelScanEq { value, .. } => {
             // The precise equality-scan value (`rmp` task #325): same treatment as a seek value — no
             // static type expectation, recorded as Any. A leaf, so no input to recurse into.

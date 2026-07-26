@@ -30,7 +30,7 @@
 //! same physical tree and the same statistics it returns the same estimate, so the optimiser's
 //! cost-tie-breaking is deterministic.
 
-use crate::ast::{Expr, Label, RelType};
+use crate::ast::{BinaryOp, Expr, ExprKind, Label, PredicateOp, RelType};
 use crate::cardinality::{
     DEFAULT_CSV_RECORDS, DEFAULT_DISTINCT_GROUP_RATIO, DEFAULT_DISTINCT_PROJECTION_RATIO,
     DEFAULT_LABEL_SELECTIVITY, DEFAULT_LIST_LENGTH, DEFAULT_PREDICATE_SELECTIVITY,
@@ -250,6 +250,23 @@ pub fn estimate_cost(op: &PhysicalOp, stats: Option<&dyn Statistics>) -> CostEst
             CostEstimate::new(rows, COST_SEEK_SETUP + rows * COST_SEEK_PER_ROW)
         }
 
+        // A multi-value equality seek (`rmp` task #868): `k` independent index descents, unioned. Costed
+        // exactly as the task specifies — **`k` seek setups plus the summed matched rows**
+        // ([`multi_seek_eq_rows`]) — so `k·COST_SEEK_SETUP` grows linearly in `k` while the scan
+        // alternative's cost is fixed at the label's size, and past the crossover
+        // `optimize_access_path` reverts a large `IN` list to the scan (the `rmp` #868 acceptance
+        // criterion).
+        PhysicalOp::NodeIndexMultiSeek {
+            label,
+            property,
+            values,
+            ..
+        } => {
+            let rows = multi_seek_eq_rows(&label.name, property, values, stats);
+            let setups = values.len() as f64 * COST_SEEK_SETUP;
+            CostEstimate::new(rows, setups + rows * COST_SEEK_PER_ROW)
+        }
+
         // A composite (multi-property) equality seek (`rmp` task #657): the selectivity is the product of
         // the per-key equality selectivities (independence assumption), so a full-key composite seek is
         // highly selective — far cheaper than any single-key seek + residual filters. The estimate is
@@ -375,6 +392,28 @@ pub fn estimate_cost(op: &PhysicalOp, stats: Option<&dyn Statistics>) -> CostEst
                 rows *= 2.0;
             }
             CostEstimate::new(rows, COST_SEEK_SETUP + rows * COST_SEEK_PER_ROW)
+        }
+
+        // A multi-value relationship-property seek (`rmp` task #868): the relationship analogue of
+        // `NodeIndexMultiSeek`, and `k` repetitions of the `RelIndexSeek` arm above. The [`Statistics`]
+        // seam exposes NO per-relationship-property histograms, so — like the relationship equality seek
+        // above, and like the `IN` `Filter` this replaces — the row estimate is the flat
+        // constant-selectivity one, independent of `k`; only the `k` seek setups distinguish the cost.
+        // An undirected pattern surfaces each relationship twice, so the estimate is doubled, matching
+        // the scan-path cardinality this replaces.
+        PhysicalOp::RelIndexMultiSeek {
+            rel_type,
+            values,
+            direction,
+            ..
+        } => {
+            let type_slice = std::slice::from_ref(rel_type);
+            let mut rows = rel_scan_rows(type_slice, stats) * DEFAULT_PREDICATE_SELECTIVITY;
+            if matches!(direction, crate::ast::RelDirection::Undirected) {
+                rows *= 2.0;
+            }
+            let setups = values.len() as f64 * COST_SEEK_SETUP;
+            CostEstimate::new(rows, setups + rows * COST_SEEK_PER_ROW)
         }
 
         // A relationship-property RANGE seek (`rmp` task #680): the relationship analogue of
@@ -581,7 +620,8 @@ pub fn estimate_cost(op: &PhysicalOp, stats: Option<&dyn Statistics>) -> CostEst
             let inner = estimate_cost(input, stats);
             let resolver = |variable: &str| physical_label_for_var(input, variable);
             let rows = inner.rows * predicate_selectivity(predicate, stats, &resolver);
-            CostEstimate::new(rows, inner.cost + inner.rows * COST_ROW_FILTER)
+            let per_row = COST_ROW_FILTER * filter_width(predicate);
+            CostEstimate::new(rows, inner.cost + inner.rows * per_row)
         }
 
         // A projection is one output row per input row (DISTINCT de-duplicates a fraction); a cheap
@@ -918,6 +958,92 @@ fn seek_eq_rows(label: &str, property: &str, value: &Expr, stats: Option<&dyn St
         Some(rows) => rows.clamp(0.0, label_rows),
         None => label_rows * DEFAULT_PREDICATE_SELECTIVITY,
     }
+}
+
+/// How many times more expensive one row of `predicate` is than a plain single-term filter
+/// (`rmp` task #868). Multiplies [`COST_ROW_FILTER`] in the [`PhysicalOp::Filter`] estimate.
+///
+/// # Why this exists
+///
+/// `x IN [e₁ … e_k]` is defined as the `OR`-fold of `=` over the list, so a `Filter` carrying it does
+/// **`k` comparisons per row**, not one — the residual filter of a reverted multi-value seek costs
+/// `O(rows · k)` while the seek it replaced costs `O(k)` descents. Charging every filter a flat
+/// per-row constant made the seek-vs-scan comparison claim the scan was cheaper for a large `IN` list
+/// on a large label, and the plan it chose was **measured at 39.1 s against the seek's 51 ms** on a
+/// 50 000-node label with `k = 20 000` (`rmp` #868). The comparison was not wrong about arithmetic; it
+/// was comparing a term it had priced at zero.
+///
+/// Deliberately narrow: only an `IN` whose right side is a **syntactic list** contributes, and it
+/// contributes its own length. Every other predicate — including a conjunction, a disjunction and an
+/// `IN` over a parameter — yields exactly `1.0`, so every plan the cost model chose before this task is
+/// costed byte-identically and no unrelated plan shape can move.
+fn filter_width(predicate: &Expr) -> f64 {
+    fn extra_terms(e: &Expr) -> usize {
+        match &e.kind {
+            // Conjuncts are evaluated in sequence; sum their widths.
+            ExprKind::Binary {
+                op: BinaryOp::And,
+                lhs,
+                rhs,
+            } => extra_terms(lhs) + extra_terms(rhs),
+            ExprKind::Predicate {
+                op: PredicateOp::In,
+                rhs: Some(list),
+                ..
+            } => match &list.kind {
+                // `k` comparisons instead of one, i.e. `k - 1` extra.
+                ExprKind::List(items) => items.len().saturating_sub(1),
+                _ => 0,
+            },
+            _ => 0,
+        }
+    }
+    1.0 + extra_terms(predicate) as f64
+}
+
+/// Rows a **multi-value** equality seek emits (`rmp` task #868): the union of the per-value match sets.
+///
+/// # Why this is not simply `k ×` the single-value estimate
+///
+/// The row estimate is a property of the **predicate**, not of the access path: the same
+/// `n.p IN [a, b, c]` must estimate the same cardinality whether it is realised as this seek or as the
+/// residual `Filter` over a scan that [`scan_alternative_for_seek`](crate::physical) reverts it to —
+/// otherwise the two realisations would be compared on different row counts and every operator *above*
+/// the access path would be mis-costed depending on which one won. So:
+///
+/// * **With a histogram for every alternative** — sum the per-value equality estimates and clamp to the
+///   label. The alternatives are distinct values of a single property, so their match sets are provably
+///   disjoint and the sum is the union exactly (the clamp only guards against stale statistics).
+/// * **Otherwise** — the flat [`DEFAULT_PREDICATE_SELECTIVITY`], which is precisely what
+///   [`predicate_selectivity`](crate::cardinality) gives the equivalent `IN` `Filter` (an `IN` is not a
+///   recognised property *comparison*, so it takes the documented constant fallback). Multiplying that
+///   constant by `k` instead would claim a 3-element `IN` list matches 90% of the label and would make
+///   every multi-value seek lose to the scan the moment statistics existed but histograms did not.
+///
+/// A single-element list therefore estimates exactly what [`seek_eq_rows`] does, in both branches.
+fn multi_seek_eq_rows(
+    label: &str,
+    property: &str,
+    values: &[Expr],
+    stats: Option<&dyn Statistics>,
+) -> f64 {
+    let label_rows = label_scan_rows(label, stats);
+    let mut sum = 0.0;
+    for value in values {
+        let Some(s) = stats else {
+            return label_rows * DEFAULT_PREDICATE_SELECTIVITY;
+        };
+        let Some(v) = literal_value(value) else {
+            return label_rows * DEFAULT_PREDICATE_SELECTIVITY;
+        };
+        let Some(rows) = s.estimate_nodes_label_property_eq(label, property, &v) else {
+            return label_rows * DEFAULT_PREDICATE_SELECTIVITY;
+        };
+        sum += rows;
+    }
+    // An EMPTY list matches nothing (`x IN []` is FALSE for every `x`), and the loop leaves `sum` at 0 —
+    // the estimate the operator's zero descents genuinely produce.
+    sum.clamp(0.0, label_rows)
 }
 
 /// Rows a range index seek for the concrete `bound`/`value` emits: the histogram's range estimate

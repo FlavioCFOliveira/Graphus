@@ -80,6 +80,70 @@ fn rows(src: &str, g: &mut MemGraph, cat: &IndexCatalog, column: &str) -> Vec<St
 // Grammar compatibility — the hint words are contextual, not reserved
 // =================================================================================================
 
+// =================================================================================================
+// The multi-value seek participates in both hints (`rmp` task #868)
+// =================================================================================================
+
+#[test]
+fn using_scan_reverts_a_multi_value_seek_and_using_index_keeps_it() {
+    // `NodeIndexMultiSeek` is an index access path, so `binds_variable_by_seek` must recognise it — or
+    // `USING SCAN` would find nothing to revert and the operator's override would be silently
+    // unhonoured (a hint that lies is worse than no hint at all, see the module doc).
+    let mut g = corpus();
+    let cat = indexed();
+    let src_plain = "MATCH (u:USER) WHERE u.uidn IN [1, 2, 3] RETURN u.uidn AS x";
+    let plain = compile(src_plain, &g, &cat).expect("plan");
+    assert!(
+        has_op(&plain, "NodeIndexMultiSeek"),
+        "baseline must be a multi-value seek: {plain}"
+    );
+
+    let scanned = compile(
+        "MATCH (u:USER) USING SCAN u:USER WHERE u.uidn IN [1, 2, 3] RETURN u.uidn AS x",
+        &g,
+        &cat,
+    )
+    .expect("USING SCAN must be satisfiable over a multi-value seek");
+    assert!(
+        !has_op(&scanned, "NodeIndexMultiSeek"),
+        "USING SCAN must revert the multi-value seek: {scanned}"
+    );
+
+    let seeked = compile(
+        "MATCH (u:USER) USING INDEX u:USER(uidn) WHERE u.uidn IN [1, 2, 3] RETURN u.uidn AS x",
+        &g,
+        &cat,
+    )
+    .expect("USING INDEX must be satisfiable over a multi-value seek");
+    assert!(
+        has_op(&seeked, "NodeIndexMultiSeek"),
+        "USING INDEX must keep the multi-value seek: {seeked}"
+    );
+
+    // Both forced shapes answer identically to the unhinted one — a hint changes the plan, never the
+    // rows.
+    let want = rows(src_plain, &mut g, &cat, "x");
+    assert_eq!(
+        want,
+        rows(
+            "MATCH (u:USER) USING SCAN u:USER WHERE u.uidn IN [1, 2, 3] RETURN u.uidn AS x",
+            &mut g,
+            &cat,
+            "x"
+        )
+    );
+    assert_eq!(
+        want,
+        rows(
+            "MATCH (u:USER) USING INDEX u:USER(uidn) WHERE u.uidn IN [1, 2, 3] RETURN u.uidn AS x",
+            &mut g,
+            &cat,
+            "x"
+        )
+    );
+    assert_eq!(want.len(), 3, "the three alternatives each match one user");
+}
+
 #[test]
 fn the_hint_words_still_work_as_ordinary_identifiers() {
     // `USING`, `SCAN` and `JOIN` are not openCypher reserved words. Reserving them to parse the hints

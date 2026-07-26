@@ -2543,6 +2543,47 @@ fn build_operator_unprofiled(
                 rows: nodes_to_rows(variable, ids),
             })
         }
+        PhysicalOp::NodeIndexMultiSeek {
+            variable,
+            label,
+            property,
+            values,
+            ..
+        } => {
+            // Multi-value index equality seek (`rmp` task #868): `WHERE n.p IN [a, b, c]` /
+            // `WHERE n.p = a OR n.p = b`. Evaluate the alternatives, collapse the identical ones, then
+            // issue ONE descent per surviving value through the very same `index_seek_eq` seam the
+            // single-value `NodeIndexSeek` above uses — so RBAC filtering (`AuthorizedGraph`), `dbHits`
+            // accounting (`ProfilingGraph`), the off-thread reader's candidate memo (`ReadOnlyGraph`)
+            // and the SSI read footprint all compose exactly as they do for `k` separate single-value
+            // seeks, with no new seam and no new decline path.
+            //
+            // The alternatives are evaluated against the EMPTY row, never the correlation row: the
+            // planner only emits this operator when no alternative references any variable
+            // (`analyze_multi_value_predicate`), so there is nothing a driving row could supply.
+            let seek_values = distinct_seek_values(values, ctx)?;
+            let ids = match multi_index_seek_eq(&label.name, property, &seek_values, ctx)? {
+                Some(ids) => ids,
+                // WHOLE-union decline (`rmp` #738/#680): some value has no usable index, so take the
+                // exact scan for the WHOLE predicate — ONE pass testing membership of the entire value
+                // set, which is exactly the `scan + IN filter` plan this operator replaced. Never `k`
+                // passes: see [`scan_filter_in`].
+                None => scan_filter_in(label, property, &seek_values, ctx),
+            };
+            // Sort + dedup so the operator emits each node exactly once, ascending by id — byte-for-byte
+            // the shape an `ordered: false` `NodeIndexSeek` emits (`index_seek_eq_recheck` sorts and
+            // dedups its own result).
+            //
+            // This is LOAD-BEARING, not defensive. Cypher `=` is **not transitive** across the
+            // `INTEGER`/`FLOAT` boundary: it compares a mixed pair as `f64`, so `9007199254740992` and
+            // `9007199254740993` are unequal to each other while both equal `9007199254740992.0`. A node
+            // holding that float therefore genuinely matches two alternatives that are not the same
+            // value and so were not collapsed by `distinct_seek_values` — and without this dedup its row
+            // would be emitted twice, a bag-cardinality bug the scan path does not have.
+            Ok(Operator::Buffered {
+                rows: nodes_to_rows(variable, sorted_deduped(ids)),
+            })
+        }
         PhysicalOp::NodeCompositeIndexSeek {
             variable,
             label,
@@ -2818,6 +2859,40 @@ fn build_operator_unprofiled(
             };
             Ok(Operator::Buffered {
                 rows: rel_ids_to_rows(relationship, from, to, *direction, ids, ctx)?,
+            })
+        }
+        PhysicalOp::RelIndexMultiSeek {
+            relationship,
+            from,
+            to,
+            rel_type,
+            property,
+            values,
+            direction,
+            ..
+        } => {
+            // Multi-value relationship-property seek (`rmp` task #868) — the relationship analogue of
+            // `NodeIndexMultiSeek`, and `k` repetitions of the `RelIndexSeek` arm above. Same contracts:
+            // identical alternatives collapse first; each surviving value takes one descent through
+            // the existing `index_seek_rel_eq` seam (so the `AuthorizedGraph` decorator's decline for a
+            // restricted principal, and the off-thread reader's decline, both apply unchanged); and the
+            // union declines as a WHOLE to the typed scan + equality re-check when any value's seek
+            // declines. Endpoints are materialised from each matched relationship's own record honouring
+            // the pattern direction, exactly as the single-value seek does.
+            let seek_values = distinct_seek_values(values, ctx)?;
+            let ids = match multi_index_seek_rel_eq(&rel_type.name, property, &seek_values, ctx)? {
+                Some(ids) => ids,
+                None => rel_scan_filter_in_ids(&rel_type.name, property, &seek_values, ctx),
+            };
+            Ok(Operator::Buffered {
+                rows: rel_ids_to_rows(
+                    relationship,
+                    from,
+                    to,
+                    *direction,
+                    sorted_deduped(ids),
+                    ctx,
+                )?,
             })
         }
         PhysicalOp::RelIndexRangeSeek {
@@ -3675,6 +3750,245 @@ fn all_rel_scan(types: &[RelType], ctx: &Ctx<'_>) -> Vec<ScannedRel> {
         }
     }
     out
+}
+
+/// Evaluates a multi-value seek's alternatives and collapses the ones that are the **same Cypher
+/// value**, preserving first-seen order (`rmp` task #868).
+///
+/// # Why the collapse is by value identity and not by Cypher equality
+///
+/// The obvious reading of "deduplicate by Cypher equality" is unsound, and `rmp` #868 measured it.
+/// Cypher `=` compares a mixed `INTEGER`/`FLOAT` pair as `f64` ([`crate::equality`]), so at magnitudes
+/// at or above 2^53 it merges values whose Cypher-equal *classes* differ:
+/// `9007199254740993 = 9007199254740992.0` is `TRUE`, yet the class of the second also contains
+/// `9007199254740992` while the class of the first does not. Collapsing those two alternatives into one
+/// descent loses the rows only the other one reaches. Cypher `=` is not even transitive across that
+/// boundary, which is also why the caller's final sort+dedup is load-bearing rather than defensive: one
+/// node can genuinely match two alternatives that are not equal to each other.
+///
+/// Deduplicating by the *index key* ([`encode_single`](graphus_index::keycodec::encode_single)) is
+/// wrong for the mirror-image reason: that key is **order-preserving**, and ordering is coarser than
+/// equality. It folds an `i64` onto its `f64` magnitude, and it projects a `Duration` through an
+/// approximate `duration_order_nanos` — so `9007199254740992`/`9007199254740993` and
+/// `duration({days: 1})`/`duration({hours: 24})` each share one key while selecting different rows.
+///
+/// So the relation used here is **value identity** ([`seek_value_identity_key`]): two alternatives
+/// collapse only when they are the same value, which makes their descent *and* their per-candidate
+/// re-check identical by construction — no reasoning about equality classes required. Cypher-equal
+/// alternatives that are *not* the same value (`1` and `1.0`, `0.0` and `-0.0`) simply take one descent
+/// each and return the same rows, which the caller's dedup merges — a redundant descent, never a lost
+/// row, and never a narrowed SSI footprint.
+///
+/// The key is hashed, so the loop is O(k) with no adversarial bucket, and an unencodable value —
+/// `Null`, `List`, `Map` — never collapses at all. Not collapsing costs nothing: such a value makes the
+/// seam decline and [`multi_index_seek_eq`] then abandons the union as a whole.
+fn distinct_seek_values(values: &[Expr], ctx: &Ctx<'_>) -> Result<Vec<Value>, ExecError> {
+    use std::collections::HashSet;
+
+    let empty = Row::empty();
+    let mut distinct: Vec<Value> = Vec::with_capacity(values.len());
+    let mut seen: HashSet<Vec<u8>> = HashSet::new();
+    for expr in values {
+        // The alternatives are attacker-controlled in both count and content, and this whole operator
+        // is built before the first `next()` — so poll the statement deadline here, or a long list
+        // would burn CPU with no cancellation safe point (`rmp` #476).
+        ctx.check_cancelled()?;
+        let value = eval_value(
+            expr,
+            &empty,
+            ctx.params,
+            ctx.graph,
+            ctx.functions,
+            &ctx.clock,
+        )?;
+        // A repeated identity key means an earlier alternative already issues this exact descent.
+        if let Some(key) = seek_value_identity_key(&value)
+            && !seen.insert(key)
+        {
+            continue;
+        }
+        distinct.push(value);
+    }
+    Ok(distinct)
+}
+
+/// The value-identity key [`distinct_seek_values`] collapses on, or [`None`] for a value that must
+/// never be collapsed (`rmp` task #868).
+///
+/// Two alternatives may be collapsed **only** when they are the same Cypher value, so the key has to be
+/// *injective*: distinct values must never share one. Three classes need an explicit arm because their
+/// `encode_single` key is deliberately **not** injective — it is an *ordering* key, and ordering is
+/// coarser than equality:
+///
+/// * **`Integer`** — the order key folds an `i64` onto its `f64` magnitude, so `9007199254740992` and
+///   `9007199254740993` share one key while selecting different rows. Keyed on the exact `i64` bits.
+/// * **`Float`** — keyed on the exact bit pattern. `-0.0` and `+0.0` are deliberately **not** merged
+///   even though Cypher `=` calls them equal: they encode to distinct SSI equality markers
+///   ([`crate::read_source`] via `encode_equality_canonical`), so merging them would register one
+///   marker where two are needed and let a concurrent `CREATE {p: -0.0}` escape a reader of `= 0.0`.
+///   Two descents, one extra index probe, no narrowing of the read footprint.
+/// * **`Duration`** — the order key is `duration_order_nanos`, an *approximate* projection
+///   ([`graphus_index::keycodec`] documents that "equality remains strictly component-wise"), so
+///   `duration({days: 1})` and `duration({hours: 24})` share one key and are **not** Cypher-equal.
+///   Collapsing them lost every row the dropped alternative matched — the `rmp` #738 defect class, and
+///   a real one: measured as a multi-seek returning `[1]` where the scan returned `[1, 2]`. Keyed on
+///   the exact `(months, days, seconds, nanos)` tuple.
+///
+/// Every remaining class (`Boolean`, `String`, `Bytes`, `Date`, `LocalTime`, `ZonedTime`,
+/// `LocalDateTime`, `ZonedDateTime`, `Point`) has an exact `encode_single` key and uses it directly.
+/// `Null` / `List` / `Map` fail to encode and return [`None`]: they are never collapsed, which costs
+/// nothing because they make the seam decline anyway.
+fn seek_value_identity_key(value: &Value) -> Option<Vec<u8>> {
+    let mut key = Vec::with_capacity(40);
+    match value {
+        Value::Integer(i) => {
+            key.push(0u8);
+            key.extend_from_slice(&i.to_be_bytes());
+        }
+        Value::Float(f) => {
+            key.push(1u8);
+            key.extend_from_slice(&f.to_bits().to_be_bytes());
+        }
+        Value::Duration(d) => {
+            key.push(3u8);
+            key.extend_from_slice(&d.months.to_be_bytes());
+            key.extend_from_slice(&d.days.to_be_bytes());
+            key.extend_from_slice(&d.seconds.to_be_bytes());
+            key.extend_from_slice(&d.nanos.to_be_bytes());
+        }
+        other => {
+            key.push(2u8);
+            key.extend_from_slice(&graphus_index::keycodec::encode_single(other).ok()?);
+        }
+    }
+    Some(key)
+}
+
+/// The union of one [`index_seek_eq`](crate::graph_access::GraphAccess::index_seek_eq) descent per
+/// value, or [`None`] if **any** single value declines (`rmp` task #868).
+///
+/// # The whole-or-nothing decline contract (`rmp` #738 / #680)
+///
+/// The seam answers `None` for *"no usable index — take the exact scan"* and `Some(vec![])` for *"the
+/// index is registered and nothing matches"*. Silently dropping a declining value from the union would
+/// lose exactly the rows that value matched — a wrong answer, and the defect class `rmp` #738 named. The
+/// `?` below is what makes that unexpressible: on the first decline the partially built `ids` is
+/// **dropped** with the function's stack frame and the caller takes the exact scan for every value. There
+/// is no code path that returns a filtered subset of the requested values.
+///
+/// Note this introduces no new seam and does not touch `index_seek_eq` itself, so every other caller of
+/// it — including [`RecordStoreGraph::unique_conflict`](crate::record_graph), the UNIQUE / NODE KEY
+/// constraint duplicate check, which has its own single-value scan fallback on `None` — is byte-identical
+/// to before this task.
+fn multi_index_seek_eq(
+    label: &str,
+    property: &str,
+    values: &[Value],
+    ctx: &Ctx<'_>,
+) -> Result<Option<Vec<NodeId>>, ExecError> {
+    let mut ids: Vec<NodeId> = Vec::new();
+    for value in values {
+        // `k` is attacker-controlled and this operator is built before the first `next()`, so poll the
+        // statement deadline per descent (`rmp` #476).
+        ctx.check_cancelled()?;
+        let Some(hit) = ctx.graph.index_seek_eq(label, property, value) else {
+            // The WHOLE union is abandoned: the partially built `ids` dies with this `return`.
+            return Ok(None);
+        };
+        ids.extend(hit);
+    }
+    Ok(Some(ids))
+}
+
+/// The relationship analogue of [`multi_index_seek_eq`]: the union of one
+/// [`index_seek_rel_eq`](crate::graph_access::GraphAccess::index_seek_rel_eq) descent per value, or
+/// [`None`] if **any** single value declines (`rmp` task #868). The same `?` makes a partial union
+/// unexpressible.
+fn multi_index_seek_rel_eq(
+    rel_type: &str,
+    property: &str,
+    values: &[Value],
+    ctx: &Ctx<'_>,
+) -> Result<Option<Vec<RelId>>, ExecError> {
+    let mut ids: Vec<RelId> = Vec::new();
+    for value in values {
+        ctx.check_cancelled()?;
+        let Some(hit) = ctx.graph.index_seek_rel_eq(rel_type, property, value) else {
+            return Ok(None);
+        };
+        ids.extend(hit);
+    }
+    Ok(Some(ids))
+}
+
+/// Whether `value` is Cypher-equal to **at least one** of `values` — the positive half of the `IN`
+/// predicate ([`crate::equality::is_in`]'s `TRUE` case), used by the multi-value seeks' whole-union
+/// scan fallback (`rmp` task #868).
+///
+/// A linear scan with short-circuit, exactly the fold `is_in` performs, so the fallback does precisely
+/// the work the pre-#868 `Filter(n.p IN [...])` over a scan did — and no hash structure is built, so
+/// there is no adversarially-collidable bucket on this path.
+fn matches_any_value(value: &Value, values: &[Value]) -> bool {
+    values
+        .iter()
+        .any(|seek| crate::equality::equals(value, seek).is_true())
+}
+
+/// The whole-union scan fallback for a [`NodeIndexMultiSeek`](crate::physical::PhysicalOp::NodeIndexMultiSeek)
+/// (`rmp` task #868): the visible nodes of `label` whose current `property` is Cypher-equal to any of
+/// `values`.
+///
+/// **One** label scan, not one per value. Calling the single-value [`scan_filter_eq`] `k` times would
+/// re-scan the whole label `k` times — a `k`-fold amplification over the `scan + IN filter` plan this
+/// operator replaced, reachable by any client that puts one unencodable element (a `null`, a list) in
+/// the list, and unavoidable for a restricted RBAC principal on the relationship path. This does the
+/// identical work the pre-#868 plan did.
+///
+/// **RBAC** composes exactly as it did before this task: `scan_nodes_by_label` and `node_property` are
+/// both `AuthorizedGraph`-decorated, so a non-traversable node never appears and a `DENY READ` on
+/// `property` masks its value to `null`, which is Cypher-equal to nothing and so drops the row.
+/// **SSI**: a label scan registers the blanket `Label` + every-live-node footprint, a strict superset
+/// of the `k` precise `Equality` markers the served union registers — conservative, never a phantom.
+fn scan_filter_in(label: &Label, property: &str, values: &[Value], ctx: &Ctx<'_>) -> Vec<NodeId> {
+    ctx.graph
+        .scan_nodes_by_label(&label.name)
+        .into_iter()
+        .filter(|&id| {
+            ctx.graph
+                .node_property(id, property)
+                .is_some_and(|v| matches_any_value(&v, values))
+        })
+        .collect()
+}
+
+/// The relationship twin of [`scan_filter_in`] (`rmp` task #868): the visible relationships of
+/// `rel_type` whose current `property` is Cypher-equal to any of `values`, **each id once**.
+///
+/// Shares [`rel_scan_ids_where`] with the single-value [`rel_scan_filter_eq_ids`], so the enumeration
+/// — and therefore the visibility, RBAC and self-loop-deduplication semantics — is identical; only the
+/// `keep` predicate widens from one value to the set. One pass, for the reason given on
+/// [`scan_filter_in`]: this path is taken on **every** relationship multi-seek a restricted principal
+/// issues, since `AuthorizedGraph::index_seek_rel_eq` declines outright for them.
+fn rel_scan_filter_in_ids(
+    rel_type: &str,
+    property: &str,
+    values: &[Value],
+    ctx: &Ctx<'_>,
+) -> Vec<RelId> {
+    rel_scan_ids_where(rel_type, ctx, |rel| {
+        ctx.graph
+            .rel_property(rel, property)
+            .is_some_and(|v| matches_any_value(&v, values))
+    })
+}
+
+/// Sorts `ids` ascending and removes duplicates — the emission shape a multi-value seek shares with the
+/// single-value seek it generalises (`rmp` task #868). Generic over the id type so the node and
+/// relationship operators use one implementation.
+fn sorted_deduped<T: Ord>(mut ids: Vec<T>) -> Vec<T> {
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
 /// Precise equality access (`rmp` task #325): the seam's `scan_filter_eq` reads every node to evaluate
@@ -8967,6 +9281,7 @@ fn result_columns(op: &PhysicalOp, procedures: &dyn ProcedureRegistry) -> Vec<St
         | PhysicalOp::NodeByLabelScan { variable, .. }
         | PhysicalOp::TokenLookupScan { variable, .. }
         | PhysicalOp::NodeIndexSeek { variable, .. }
+        | PhysicalOp::NodeIndexMultiSeek { variable, .. }
         | PhysicalOp::NodeCompositeIndexSeek { variable, .. }
         | PhysicalOp::NodeLabelScanEq { variable, .. }
         | PhysicalOp::NodeIndexRangeSeek { variable, .. }
@@ -8981,6 +9296,12 @@ fn result_columns(op: &PhysicalOp, procedures: &dyn ProcedureRegistry) -> Vec<St
             ..
         }
         | PhysicalOp::RelIndexSeek {
+            relationship,
+            from,
+            to,
+            ..
+        }
+        | PhysicalOp::RelIndexMultiSeek {
             relationship,
             from,
             to,
