@@ -343,9 +343,17 @@ pub fn estimate_cost(op: &PhysicalOp, stats: Option<&dyn Statistics>) -> CostEst
             CostEstimate::new(rows, COST_SEEK_SETUP + rows * COST_SEEK_PER_ROW)
         }
 
-        // A relationship scan: one row per relationship (refined by listed types), a scan-row each.
-        PhysicalOp::AllRelationshipsScan { types, .. } => {
-            let rows = rel_scan_rows(types, stats);
+        // A relationship scan: one row per relationship (refined by listed types), a scan-row each. An
+        // **undirected** pattern binds each non-self relationship in both orientations (`rmp` task #867
+        // — the same two-orientation rule the relationship seeks below apply), so double the row
+        // estimate; the *cost* still tracks the rows the operator emits.
+        PhysicalOp::AllRelationshipsScan {
+            types, direction, ..
+        } => {
+            let mut rows = rel_scan_rows(types, stats);
+            if matches!(direction, crate::ast::RelDirection::Undirected) {
+                rows *= 2.0;
+            }
             CostEstimate::new(rows, rows * COST_ROW_SCAN)
         }
 

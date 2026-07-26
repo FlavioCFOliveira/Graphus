@@ -74,7 +74,7 @@ use graphus_core::error::GraphusError;
 
 use crate::graph_access::{
     DeletedEntity, ExpandDirection, GraphAccess, Incident, NodeId, RelData, RelId, ScanFilter,
-    VectorQueryResult,
+    ScannedRel, VectorQueryResult,
 };
 
 /// The narrow privilege interface the [`AuthorizedGraph`] enforces against, resolved **once per
@@ -514,6 +514,24 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
             .into_iter()
             .filter(|inc| self.rel_visible(inc.rel) && self.node_visible(inc.neighbour))
             .collect()
+    }
+
+    fn scan_rels_by_type(&self, types: &[String]) -> Option<Vec<ScannedRel>> {
+        // The whole-store relationship scan (`rmp` task #867), composed with RBAC exactly as
+        // `columnar_label_property_scan` above: an unrestricted principal gets the inner enumeration
+        // verbatim; a restricted principal is conservatively **declined** (return `None`) so the
+        // executor falls back to the `scan_nodes` + `expand` node-walk, which RBAC-composes through this
+        // decorator's own `scan_nodes` / `expand` and therefore applies the identical traverse gate.
+        //
+        // Declining rather than filtering here is the safe direction: the seam's contract forbids a
+        // superset (this result is materialised into rows directly, with no residual predicate above it), so a
+        // filtering implementation would have to reproduce `expand`'s *anchor* visibility rule as well
+        // as `rel_visible` — and an anchor rule expressed over a set with no anchor is exactly where a
+        // silent authorisation gap would hide. The common (unrestricted) workload keeps the full win.
+        if !self.oracle.is_unrestricted() {
+            return None;
+        }
+        self.inner.scan_rels_by_type(types)
     }
 
     fn node_exists(&self, node: NodeId) -> bool {
@@ -1563,6 +1581,24 @@ mod tests {
         ) -> Option<Vec<NodeId>> {
             Some(self.label_members_with(label, property))
         }
+        /// The whole-store relationship scan (`rmp` task #867). `MemGraph` declines it (the trait
+        /// default), so without this override "forwarded" and "declined" would be indistinguishable and
+        /// the decorator test below would be vacuous. Synthesised from the inner graph the way the real
+        /// seam enumerates: every node's outgoing incidences, raw — no RBAC applied, which is exactly
+        /// why the decorator must gate it.
+        fn scan_rels_by_type(&self, types: &[String]) -> Option<Vec<ScannedRel>> {
+            let mut out = Vec::new();
+            for n in self.0.scan_nodes() {
+                for inc in self.0.expand(n, ExpandDirection::Outgoing, types) {
+                    out.push(ScannedRel {
+                        rel: inc.rel,
+                        start: n,
+                        end: inc.neighbour,
+                    });
+                }
+            }
+            Some(out)
+        }
         fn index_seek_composite_eq(
             &self,
             label: &str,
@@ -1941,6 +1977,44 @@ mod tests {
         // node_properties only returns the readable subset.
         let props = authz.node_properties(ada).expect("visible");
         assert_eq!(props, vec![("name".to_owned(), s("Ada"))]);
+    }
+
+    /// The whole-store relationship scan (`rmp` task #867) is forwarded to an **unrestricted**
+    /// principal and **declined** for a restricted one, so the executor falls back to the
+    /// `scan_nodes` + `expand` node-walk — which composes RBAC through this very decorator.
+    ///
+    /// Declining is load-bearing, not conservatism for its own sake: the seam's contract forbids
+    /// returning a superset (the result is materialised into rows directly, with no residual predicate), so
+    /// a filtering implementation here would have to reproduce `expand`'s **anchor** visibility rule
+    /// over a set that has no anchor. The decline is what keeps a principal denied `WORKS_AT` — or
+    /// denied a *label* one of its endpoints carries — from enumerating the relationship at all.
+    #[test]
+    fn rel_scan_forwards_unrestricted_declines_restricted() {
+        let (g, ada, acme, r) = seed();
+
+        let mut inner_u = SnapshotStub(g.clone());
+        let authz_u = AuthorizedGraph::new(&mut inner_u, StubOracle::unrestricted());
+        assert_eq!(
+            authz_u.scan_rels_by_type(&[]),
+            Some(vec![ScannedRel {
+                rel: r,
+                start: ada,
+                end: acme
+            }]),
+            "an unrestricted principal gets the inner relationship scan"
+        );
+
+        // Restricted — even holding every grant the node-walk would need — is declined.
+        let mut inner_r = SnapshotStub(g);
+        let oracle = StubOracle::default()
+            .traverse_label("Person")
+            .traverse_label("Company")
+            .traverse_rel_type("WORKS_AT");
+        let authz_r = AuthorizedGraph::new(&mut inner_r, oracle);
+        assert!(
+            authz_r.scan_rels_by_type(&[]).is_none(),
+            "a restricted principal must be declined the raw relationship scan (node-walk fallback)"
+        );
     }
 
     #[test]

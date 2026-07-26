@@ -51,6 +51,7 @@ use graphus_wal::LogSink;
 
 use crate::graph_access::{
     DeletedEntity, ExpandDirection, GraphAccess, Incident, NodeId, RelData, RelId, ScanFilter,
+    ScannedRel,
 };
 use crate::read_source::{self, ReadSink, ReadViewSource, VisCtx};
 
@@ -592,6 +593,19 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
 
     fn expand(&self, node: NodeId, direction: ExpandDirection, types: &[String]) -> Vec<Incident> {
         read_source::expand(&self.source(), &self.ctx(), self, node, direction, types)
+    }
+
+    fn scan_rels_by_type(&self, types: &[String]) -> Option<Vec<ScannedRel>> {
+        // Served off-thread from this reader's own MVCC read view (`rmp` task #867), not from any
+        // coordinator-side structure: it is a plain relationship-store scan, so there is nothing to
+        // pre-capture at dispatch and nothing that could go stale. The SAME lifted body the inline seam
+        // runs, so the rows AND the SIREAD markers this reader accumulates are byte-identical to the
+        // INLINE seam's — the off-thread parity `rmp` #768 makes mandatory for every access path.
+        //
+        // (Byte-identical to the inline *scan*, which is a different claim from the scan-vs-node-walk
+        // relation: against the node-walk this access path's footprint is a superset, never a subset —
+        // see `read_source::scan_rels_typed`.)
+        read_source::scan_rels_typed(&self.source(), &self.ctx(), self, types)
     }
 
     fn node_exists(&self, node: NodeId) -> bool {

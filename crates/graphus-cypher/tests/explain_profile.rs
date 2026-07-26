@@ -304,10 +304,12 @@ fn a_relationship_range_seek_is_distinguishable_from_a_relationship_scan() {
         !scan.contains_operator("RelIndexRangeSeek"),
         "with no index the query falls back to a scan — the regression an example must catch"
     );
-    // The scan fallback is the whole `Filter` over `ExpandAll` over `AllNodesScan` subtree the rel seek
-    // replaces (see `PhysicalOp::RelIndexRangeSeek`): visibly different, which is the point.
-    assert!(scan.contains_operator("ExpandAll"));
-    assert!(scan.contains_operator("AllNodesScan"));
+    // The scan fallback is the whole subtree the rel seek replaces (see `PhysicalOp::RelIndexRangeSeek`):
+    // visibly different, which is the point. Since `rmp` task #867 a pattern with two **anonymous**
+    // endpoints lowers that subtree to a single `AllRelationshipsScan` (a relationship-type scan) rather
+    // than `ExpandAll` over `AllNodesScan` — the contrast the assertion is really about is unchanged.
+    assert!(scan.contains_operator("AllRelationshipsScan"));
+    assert!(!scan.contains_operator("AllNodesScan"));
 }
 
 // =================================================================================================

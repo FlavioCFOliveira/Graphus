@@ -72,7 +72,7 @@ use graphus_core::Value;
 use crate::counters::QueryCounters;
 use crate::graph_access::{
     ColumnarScan, DeletedEntity, ExpandDirection, GraphAccess, Incident, NodeId, RelData, RelId,
-    ScanFilter, VectorQueryResult,
+    ScanFilter, ScannedRel, VectorQueryResult,
 };
 use crate::physical::{PhysicalOp, PhysicalPlan, TextSeekOp};
 
@@ -297,6 +297,16 @@ impl GraphAccess for ProfilingGraph<'_> {
     fn expand(&self, node: NodeId, direction: ExpandDirection, types: &[String]) -> Vec<Incident> {
         let r = self.inner.expand(node, direction, types);
         self.hit(r.len());
+        r
+    }
+
+    fn scan_rels_by_type(&self, types: &[String]) -> Option<Vec<ScannedRel>> {
+        // Forwarded explicitly (`rmp` task #867): the trait default is `None`, so an unforwarded method
+        // would silently make every `PROFILE`d relationship scan take the node-walk fallback the real
+        // run does not — a plan whose measured `dbHits` describe a different access path than the one
+        // that ran. `hit_opt` charges nothing for a decline and one per relationship enumerated.
+        let r = self.inner.scan_rels_by_type(types);
+        self.hit_opt(&r);
         r
     }
 

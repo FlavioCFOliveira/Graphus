@@ -86,10 +86,16 @@
 //! wins, enumerating the same directed edge set from the other end (see rule 3 below).
 //!
 //! **Deferred, by name:** (1) **multi-predicate composite-index seeds** beyond a single leading-key
-//! predicate, and general predicate pushdown (`04 §6.6`); (2) **`AllRelationshipsScan` index
-//! routing** — a relationship-type-only scan keeps its logical form (the relationship-property seek
-//! requires a property predicate, lowered when a [`Filter`] supplies one over an expand, which is
-//! itself later territory); (3) **composite multi-key seeks** — only a composite's *leading* key
+//! predicate, and general predicate pushdown (`04 §6.6`); (2) a **relationship-type LOOKUP index** —
+//! [`AllRelationshipsScan`](PhysicalOp::AllRelationshipsScan) *is* emitted (`rmp` task #867, for a
+//! pattern whose two endpoints are anonymous) and *is* served by a real access path, but that path is
+//! the seam's whole-store relationship scan
+//! ([`scan_rels_by_type`](crate::graph_access::GraphAccess::scan_rels_by_type)), **not** a token index:
+//! the engine maintains a token index for node **labels** only, so there is no relationship-type lookup
+//! structure to route to (the `SHOW INDEXES` `rel_type_lookup_index` row is a Neo4j-compatibility
+//! listing whose access path is precisely that typed store scan). A relationship **property**
+//! predicate over the scan does drive a real index seek — see
+//! [`RelIndexSeek`](PhysicalOp::RelIndexSeek) and its siblings; (3) **composite multi-key seeks** — only a composite's *leading* key
 //! drives a seek here, matching the catalog's
 //! [`label_property`](crate::catalog::IndexCatalog::label_property) contract; (4) **`IN`-list index
 //! acceleration**, and **`ENDS WITH` / `CONTAINS`** string acceleration (a suffix/substring is not a
@@ -972,6 +978,14 @@ pub enum PhysicalOp {
     },
     /// Full relationship scan binding the relationship and its endpoints (carried through from the
     /// logical [`AllRelationshipsScan`](crate::logical::LogicalOp::AllRelationshipsScan)).
+    ///
+    /// The access path a pattern with two **anonymous** endpoints (`MATCH ()-[r:T]->()`) lowers to
+    /// (`rmp` task #867) — Neo4j's `DirectedRelationshipTypeScan` / `UndirectedRelationshipTypeScan`.
+    /// The executor serves it from the seam's whole-store relationship scan
+    /// ([`scan_rels_by_type`](crate::graph_access::GraphAccess::scan_rels_by_type)), falling back to the
+    /// `scan_nodes` + `expand` node-walk when the seam declines. An **undirected** pattern binds each
+    /// non-self relationship in both orientations, exactly as the `ExpandAll`-over-`AllNodesScan`
+    /// subtree it replaces did; a self-loop binds one row.
     AllRelationshipsScan {
         /// The relationship variable.
         relationship: Var,
@@ -2695,22 +2709,22 @@ impl Planner<'_> {
     }
 
     /// Attempts to lower a `Filter` carrying an **equality or a range predicate on a relationship
-    /// variable**, sitting over a standalone single-type fixed-length [`Expand`](LogicalOp::Expand) from a
-    /// bare [`AllNodesScan`](LogicalOp::AllNodesScan), into a [`RelIndexSeek`](PhysicalOp::RelIndexSeek)
+    /// variable**, sitting over a standalone single-type fixed-length relationship source — either an
+    /// [`Expand`](LogicalOp::Expand) from a bare [`AllNodesScan`](LogicalOp::AllNodesScan) or an
+    /// [`AllRelationshipsScan`](LogicalOp::AllRelationshipsScan) (`rmp` task #867) — into a
+    /// [`RelIndexSeek`](PhysicalOp::RelIndexSeek)
     /// (`rmp` task #659), a [`RelIndexRangeSeek`](PhysicalOp::RelIndexRangeSeek) (`rmp` task #680), or —
     /// when a **composite** relationship index's full ordered tuple is covered by two or more equality
     /// conjuncts — a single [`RelCompositeIndexSeek`](PhysicalOp::RelCompositeIndexSeek) (`rmp` task
     /// #666). Returns [`None`] (the caller keeps its normal paths) when the shape does not qualify or no
     /// `Online` relationship index covers the `(type, property)` the predicate names.
     ///
-    /// Only the **seek-materialisable** shape qualifies: exactly one relationship type (a single-type
-    /// index), fixed length (`range` is `None`), no earlier pattern relationships to exclude
-    /// (`prior_rels` empty), no per-hop var-length property map, and an anchor that is a **bare**
-    /// [`AllNodesScan`](LogicalOp::AllNodesScan) of the expand's `from` — so both endpoints are
-    /// unconstrained and can be materialised directly from each matched relationship's own record.
-    /// `-[r:T*]-` (var-length), `-[r:T1|T2]-` (no single-type index), a label-constrained anchor (a
-    /// label scan, not an all-nodes scan), and an `OPTIONAL MATCH` (whose anchor is an `Apply`-over-
-    /// `Argument`, never a bare scan) therefore all decline here and stay scans.
+    /// Only the **seek-materialisable** shape qualifies — exactly one relationship type (a single-type
+    /// index) plus everything [`fold_rel_scan_filter_chain`] checks, which is where the shape rules for
+    /// both spellings live. `-[r:T1|T2]-` (no single-type index), `-[r:T*]-` (var-length), a
+    /// label-constrained anchor (a label scan, not an all-nodes scan), an `OPTIONAL MATCH` (whose anchor
+    /// is an `Apply`-over-`Argument`, never a bare scan) and a self-referencing `(a)-[r:T]->(a)`
+    /// therefore all decline here and stay scans.
     ///
     /// The consumption order is **composite-equality → single equality → single range** (each pass
     /// consumes exactly one predicate; every other conjunct — a second range bound, a residual
@@ -2724,38 +2738,24 @@ impl Planner<'_> {
         predicate: &Expr,
         deps: &mut BTreeSet<IndexId>,
     ) -> Option<PhysicalOp> {
-        // Collect every conjunct of the (possibly nested) filter chain down to the bottom `Expand`, so
-        // a multi-key inline map (`{a: …, b: …}`, which lowers to stacked `Filter`s) still exposes the
-        // relationship-equality conjunct.
-        let (expand, conjuncts) = fold_expand_filter_chain(input, predicate)?;
-        let LogicalOp::Expand {
-            input: exp_input,
-            from,
-            relationship,
-            to,
-            direction,
-            types,
-            range,
-            prior_rels,
-            rel_props,
-        } = expand
-        else {
-            return None;
-        };
-        // Seek-materialisable shape only (see the doc): fixed length, standalone, single type, bare
-        // anchor scan.
-        if range.is_some() || !prior_rels.is_empty() || rel_props.is_some() {
-            return None;
-        }
-        let [rel_type] = types.as_slice() else {
+        // Collect every conjunct of the (possibly nested) filter chain down to the bottom relationship
+        // source, so a multi-key inline map (`{a: …, b: …}`, which lowers to stacked `Filter`s) still
+        // exposes the relationship-equality conjunct. `fold_rel_scan_filter_chain` also applies the
+        // seek-materialisable shape checks (see the doc), for the `Expand`-over-`AllNodesScan` and the
+        // `AllRelationshipsScan` (`rmp` #867) spellings alike.
+        let (
+            RelScanSource {
+                relationship,
+                from,
+                to,
+                direction,
+                types,
+            },
+            conjuncts,
+        ) = fold_rel_scan_filter_chain(input, predicate)?;
+        let [rel_type] = types else {
             return None; // zero or multiple types: no single-type rel-property index applies
         };
-        let LogicalOp::AllNodesScan { variable: anchor } = exp_input.as_ref() else {
-            return None; // a constrained anchor (label scan / correlated Apply) is not materialisable
-        };
-        if anchor.name != from.name {
-            return None;
-        }
 
         // A relationship seek binds ALL THREE of `relationship`, `from` and `to` (the endpoints are
         // materialised from each matched relationship's own record), and the executor evaluates its seek
@@ -2824,7 +2824,7 @@ impl Planner<'_> {
                     rel_type: rel_type.clone(),
                     properties: idx.properties.clone(),
                     values,
-                    direction: *direction,
+                    direction,
                     index: idx.id,
                 };
                 let residual: Vec<&Expr> = conjuncts
@@ -2860,7 +2860,7 @@ impl Planner<'_> {
                 rel_type: rel_type.clone(),
                 property: pp.property,
                 value,
-                direction: *direction,
+                direction,
                 index: idx.id,
             };
             let residual: Vec<&Expr> = conjuncts
@@ -2913,7 +2913,7 @@ impl Planner<'_> {
                 property: pp.property,
                 bound,
                 value,
-                direction: *direction,
+                direction,
                 index: idx.id,
             };
             let residual: Vec<&Expr> = conjuncts
@@ -2929,10 +2929,14 @@ impl Planner<'_> {
 
     /// Attempts to lower a `Filter` carrying a **proximity predicate on a relationship variable**
     /// (`distance(r.p, <const>) <op> <const>`) sitting over a standalone single-type fixed-length
-    /// [`Expand`](LogicalOp::Expand) from a bare [`AllNodesScan`](LogicalOp::AllNodesScan), into a
+    /// relationship source (an [`Expand`](LogicalOp::Expand) from a bare
+    /// [`AllNodesScan`](LogicalOp::AllNodesScan), or an
+    /// [`AllRelationshipsScan`](LogicalOp::AllRelationshipsScan)), into a
     /// [`RelSpatialIndexSeek`](PhysicalOp::RelSpatialIndexSeek) (`rmp` task #664) — the relationship
     /// analogue of the node [`SpatialIndexSeek`](PhysicalOp::SpatialIndexSeek) lowering, sharing the
-    /// seek-materialisable shape check with [`try_rel_index_seek`](Self::try_rel_index_seek).
+    /// seek-materialisable shape check ([`fold_rel_scan_filter_chain`]) with
+    /// [`try_rel_index_seek`](Self::try_rel_index_seek), and so recognising the
+    /// [`AllRelationshipsScan`](LogicalOp::AllRelationshipsScan) spelling too (`rmp` task #867).
     ///
     /// Returns [`None`] (the caller keeps its normal paths) when the shape does not qualify, the centre
     /// is **geographic** (a WGS-84 centre measures `distance` in metres while the grid buckets degrees —
@@ -2946,35 +2950,22 @@ impl Planner<'_> {
         predicate: &Expr,
         deps: &mut BTreeSet<IndexId>,
     ) -> Option<PhysicalOp> {
-        let (expand, conjuncts) = fold_expand_filter_chain(input, predicate)?;
-        let LogicalOp::Expand {
-            input: exp_input,
-            from,
-            relationship,
-            to,
-            direction,
-            types,
-            range,
-            prior_rels,
-            rel_props,
-        } = expand
-        else {
-            return None;
-        };
-        // Seek-materialisable shape only (shared with `try_rel_index_seek`): fixed length, standalone,
-        // single type, bare anchor scan.
-        if range.is_some() || !prior_rels.is_empty() || rel_props.is_some() {
-            return None;
-        }
-        let [rel_type] = types.as_slice() else {
+        // Seek-materialisable shape only, recognised once for both spellings (shared with
+        // `try_rel_index_seek`): fixed length, standalone, bare anchor scan — or an
+        // `AllRelationshipsScan` (`rmp` #867), which satisfies all of it structurally.
+        let (
+            RelScanSource {
+                relationship,
+                from,
+                to,
+                direction,
+                types,
+            },
+            conjuncts,
+        ) = fold_rel_scan_filter_chain(input, predicate)?;
+        let [rel_type] = types else {
             return None; // zero or multiple types: no single-type rel spatial index applies
         };
-        let LogicalOp::AllNodesScan { variable: anchor } = exp_input.as_ref() else {
-            return None; // a constrained anchor (label scan / correlated Apply) is not materialisable
-        };
-        if anchor.name != from.name {
-            return None;
-        }
         // Consume the first proximity conjunct on the relationship variable whose `(type, property)` a
         // relationship spatial index covers; re-attach **all** conjuncts (this one included) as a
         // residual filter (the grid is a geometric superset — the filter restores exactness).
@@ -3002,7 +2993,7 @@ impl Planner<'_> {
                 center_x: sp.center_x,
                 center_y: sp.center_y,
                 radius: sp.radius,
-                direction: *direction,
+                direction,
                 index: idx.id,
             };
             return Some(attach_residual(seek, &conjuncts));
@@ -3798,21 +3789,129 @@ fn fold_apply_filter_chain<'a>(
     }
 }
 
-/// If `input` is a (possibly nested) chain of [`Filter`](LogicalOp::Filter)s bottoming out at an
-/// [`Expand`](LogicalOp::Expand), returns that expand plus **every** conjunct in the chain — `top`'s
-/// and each chained filter's, each split on top-level `AND` (outer-to-inner order). This lets
-/// [`Planner::try_rel_index_seek`] pick the relationship-equality conjunct out of a stacked
-/// inline-property / `WHERE` filter (`rmp` task #659). Returns [`None`] when `input` is not such a
-/// chain (the relationship-seek attempt then declines and the normal residual-filter path runs).
-fn fold_expand_filter_chain<'a>(
+/// A **seek-materialisable** relationship source: a standalone, fixed-length, endpoint-unconstrained
+/// enumeration of a pattern's single relationship, from which a relationship index seek can rebuild
+/// every column by reading each matched relationship's own record.
+///
+/// Two logical shapes qualify and are normalised to this one struct
+/// ([`fold_rel_scan_filter_chain`]), so every relationship-seek rule states its conditions once:
+///
+/// * [`Expand`](LogicalOp::Expand) over a **bare** [`AllNodesScan`](LogicalOp::AllNodesScan) of its own
+///   anchor — what `MATCH (a)-[r:T]->(b)` lowers to (`rmp` tasks #659 / #666 / #680 / #664); and
+/// * [`AllRelationshipsScan`](LogicalOp::AllRelationshipsScan) — what `MATCH ()-[r:T]->()` lowers to
+///   since `rmp` task #867.
+///
+/// Recognising the second is **not** an extension of what the seeks accept, it is what keeps them
+/// firing: before #867 the anonymous-endpoint spelling produced the first shape, and had this
+/// recogniser stayed `Expand`-only, `MATCH ()-[r:T {p: 1}]->()` would have silently reverted from a
+/// `RelIndexSeek` to a full type scan + filter.
+struct RelScanSource<'a> {
+    /// The relationship variable the pattern binds.
+    relationship: &'a Var,
+    /// The source-endpoint variable (bound per `direction`).
+    from: &'a Var,
+    /// The target-endpoint variable (bound per `direction`).
+    to: &'a Var,
+    /// The pattern arrow, which decides the endpoint binding and the undirected two-orientation rule.
+    direction: crate::ast::RelDirection,
+    /// The relationship-type alternatives; a seek needs exactly one (checked by each caller).
+    types: &'a [RelType],
+}
+
+/// If `input` is a (possibly nested) chain of [`Filter`](LogicalOp::Filter)s bottoming out at a
+/// **seek-materialisable relationship source**, returns that source plus **every** conjunct in the
+/// chain — `top`'s and each chained filter's, each split on top-level `AND` (outer-to-inner order).
+/// This lets [`Planner::try_rel_index_seek`] pick the relationship-equality conjunct out of a stacked
+/// inline-property / `WHERE` filter (`rmp` task #659). Returns [`None`] when `input` is not such a chain
+/// (the relationship-seek attempt then declines and the normal residual-filter path runs).
+///
+/// The materialisability conditions live here, once, for both shapes (see [`RelScanSource`]):
+/// fixed length (`range` is `None`), standalone (`prior_rels` empty — nothing to exclude for
+/// relationship isomorphism), no per-hop var-length property map, and endpoints reachable from the
+/// relationship record alone (a **bare** all-nodes anchor). `-[r:T*]-`, a label-constrained anchor (a
+/// label scan, not an all-nodes scan) and an `OPTIONAL MATCH` (whose anchor is an `Apply`-over-
+/// `Argument`) therefore all decline and stay scans. An
+/// [`AllRelationshipsScan`](LogicalOp::AllRelationshipsScan) satisfies every one of them structurally:
+/// it carries no range, no `prior_rels` and no anchor at all, and the lowerer only emits it for two
+/// anonymous, unconstrained endpoints (`rmp` task #867).
+///
+/// # The self-referencing pattern is declined (a pre-existing defect, fixed in `rmp` task #867)
+///
+/// `MATCH (a)-[r:T]->(a)` names **one** variable at both ends: it is a connection check, which the
+/// logical planner expresses as an `Expand` whose `from` and `to` are the same variable (lowered to an
+/// `ExpandInto`). A relationship seek binds `from` and `to` as two independent columns from the matched
+/// relationship's own record, so with one shared name the second binding simply **overwrites** the
+/// first — and the `start == end` constraint vanishes. Measured before the fix, on a store with one
+/// self-loop and one ordinary `LIKES`, `MATCH (a)-[r:LIKES]->(a) WHERE r.w = 1` returned **1** row with
+/// no index and **2** with one: declaring an index changed the answer. Declining here restores the
+/// `ExpandInto` + residual filter, which enforces the check. The `AllRelationshipsScan` shape cannot
+/// reach this (the lowerer emits it only for two *anonymous* — hence distinct — endpoints), but the
+/// guard is applied to both spellings so the invariant is stated once and cannot be reintroduced.
+fn fold_rel_scan_filter_chain<'a>(
     input: &'a LogicalOp,
     top: &'a Expr,
-) -> Option<(&'a LogicalOp, Vec<&'a Expr>)> {
+) -> Option<(RelScanSource<'a>, Vec<&'a Expr>)> {
+    /// Builds the source, declining a pattern whose two endpoints are the same variable (see the doc).
+    fn source<'b>(
+        relationship: &'b Var,
+        from: &'b Var,
+        to: &'b Var,
+        direction: crate::ast::RelDirection,
+        types: &'b [RelType],
+    ) -> Option<RelScanSource<'b>> {
+        if from.name == to.name {
+            return None;
+        }
+        Some(RelScanSource {
+            relationship,
+            from,
+            to,
+            direction,
+            types,
+        })
+    }
+
     let mut conjuncts: Vec<&Expr> = split_conjuncts(top);
     let mut cur = input;
     loop {
         match cur {
-            LogicalOp::Expand { .. } => return Some((cur, conjuncts)),
+            LogicalOp::Expand {
+                input: exp_input,
+                from,
+                relationship,
+                to,
+                direction,
+                types,
+                range,
+                prior_rels,
+                rel_props,
+            } => {
+                if range.is_some() || !prior_rels.is_empty() || rel_props.is_some() {
+                    return None;
+                }
+                let LogicalOp::AllNodesScan { variable: anchor } = exp_input.as_ref() else {
+                    return None; // a constrained anchor (label scan / correlated Apply) is not materialisable
+                };
+                if anchor.name != from.name {
+                    return None;
+                }
+                return Some((
+                    source(relationship, from, to, *direction, types)?,
+                    conjuncts,
+                ));
+            }
+            LogicalOp::AllRelationshipsScan {
+                relationship,
+                from,
+                to,
+                direction,
+                types,
+            } => {
+                return Some((
+                    source(relationship, from, to, *direction, types)?,
+                    conjuncts,
+                ));
+            }
             LogicalOp::Filter {
                 input: inner,
                 predicate,
@@ -8457,7 +8556,9 @@ mod tests {
         let rendered = plan.to_string();
         assert!(!rendered.contains("RelCompositeIndexSeek"), "{rendered}");
         assert!(!rendered.contains("RelIndexSeek"), "{rendered}");
-        assert!(rendered.contains("ExpandAll"), "{rendered}");
+        // The declined seek falls back to the scan path, which for two anonymous endpoints is the
+        // relationship-type scan (`rmp` task #867), not an all-nodes scan + expand.
+        assert!(rendered.contains("AllRelationshipsScan"), "{rendered}");
     }
 
     #[test]
@@ -8769,7 +8870,9 @@ mod tests {
             );
             let rendered = plan.to_string();
             assert!(!rendered.contains("RelSpatialIndexSeek"), "{rendered}");
-            assert!(rendered.contains("ExpandAll"), "{rendered}");
+            // The declined seek falls back to the scan path — for two anonymous endpoints, the
+            // relationship-type scan (`rmp` task #867) rather than an all-nodes scan + expand.
+            assert!(rendered.contains("AllRelationshipsScan"), "{rendered}");
             assert!(rendered.contains("Filter"), "{rendered}");
         }
     }
@@ -8792,7 +8895,9 @@ mod tests {
             !geo_s.contains("RelSpatialIndexSeek"),
             "geographic: {geo_s}"
         );
-        assert!(geo_s.contains("ExpandAll"), "{geo_s}");
+        // The declined seek falls back to the scan path — for two anonymous endpoints, the
+        // relationship-type scan (`rmp` task #867) rather than an all-nodes scan + expand.
+        assert!(geo_s.contains("AllRelationshipsScan"), "{geo_s}");
         assert_eq!(geo.index_dependencies().count(), 0);
         let cart = physical(
             "MATCH ()-[r:VISITED]-() WHERE distance(r.at, point({x:0, y:0})) < 5 RETURN r",

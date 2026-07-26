@@ -365,8 +365,16 @@ fn estimate(op: &LogicalOp, stats: Option<&dyn Statistics>) -> f64 {
         // sum the known per-type counts; if a listed type's count is unknown, fall back to the total
         // scaled by the label selectivity for that one type (so a single unknown type does not make
         // the whole estimate collapse to the full total). With no type filter, the full total.
-        LogicalOp::AllRelationshipsScan { types, .. } => {
-            if types.is_empty() {
+        //
+        // An **undirected** pattern (`MATCH ()-[r:T]-()`) binds each non-self relationship in BOTH
+        // orientations — the scan path it replaces surfaces it once from each endpoint's expansion — so
+        // it emits twice the relationship count (`rmp` task #867). Self-loops make this a slight
+        // over-estimate (they bind once), which is the conservative direction and matches how the
+        // relationship index seeks estimate the same pattern.
+        LogicalOp::AllRelationshipsScan {
+            types, direction, ..
+        } => {
+            let rows = if types.is_empty() {
                 total_relationships(stats)
             } else {
                 types
@@ -380,6 +388,11 @@ fn estimate(op: &LogicalOp, stats: Option<&dyn Statistics>) -> f64 {
                             })
                     })
                     .sum()
+            };
+            if matches!(direction, crate::ast::RelDirection::Undirected) {
+                rows * 2.0
+            } else {
+                rows
             }
         }
 

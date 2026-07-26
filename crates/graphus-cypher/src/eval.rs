@@ -3814,6 +3814,13 @@ impl GraphAccess for ReadOnlyGraph<'_> {
     ) -> Vec<crate::graph_access::Incident> {
         self.0.expand(node, direction, types)
     }
+    /// Forwarded explicitly (`rmp` task #867): the trait default is `None`, so leaving it out would make
+    /// a relationship scan **inside** an `EXISTS { … }` subquery take the node-walk fallback while the
+    /// identical pattern outside it takes the store scan — different cost and a different SSI footprint
+    /// for the same pattern.
+    fn scan_rels_by_type(&self, types: &[String]) -> Option<Vec<crate::graph_access::ScannedRel>> {
+        self.0.scan_rels_by_type(types)
+    }
     fn node_exists(&self, node: crate::graph_access::NodeId) -> bool {
         self.0.node_exists(node)
     }

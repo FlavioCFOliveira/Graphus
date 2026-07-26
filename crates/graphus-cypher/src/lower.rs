@@ -519,6 +519,19 @@ impl Planner {
         let anchor_node = part_node_at(element, anchor_idx);
         // The anchor node: scan it unless `current` already binds it, then filter on inline props.
         let anchor_var = self.node_var(anchor_node);
+        // A pattern that constrains only its relationship — `MATCH ()-[r:T]->()` — has no node worth
+        // anchoring on, so scanning one is pure waste: it reads every node record and chases every
+        // incidence chain to produce a set the relationship store already holds
+        // ([`AllRelationshipsScan`](LogicalOp::AllRelationshipsScan), `rmp` task #867). Emit that leaf
+        // instead when the shape provably permits ([`relationship_scan_link`] holds the preconditions).
+        // Minting order is preserved: the anchor variable above, then the relationship, then the far
+        // endpoint — exactly the order the scan + expand path mints them, so no other plan's anonymous
+        // numbering shifts.
+        if anchor_idx == 0
+            && let Some(link) = relationship_scan_link(part, pattern_rels)
+        {
+            return self.lower_relationship_scan(part, link, current, &anchor_var, pattern_rels);
+        }
         // Whether the anchor is **reused** from a prior plan (already bound). A reused anchor is not
         // re-scanned, so its inline labels are *not* applied by `scan_node` and must be enforced by a
         // `HasLabels` filter below (`MATCH (a)-[r]->() WITH a MATCH (a:X)-[r]->()`, TCK `Match3` [25]).
@@ -675,6 +688,74 @@ impl Planner {
                 variable: Var::named(&v.name),
                 start: anchor_var,
                 steps: step_rels,
+            };
+        }
+        plan
+    }
+
+    /// Lowers a pattern part that [`relationship_scan_link`] has cleared into a single
+    /// [`AllRelationshipsScan`](LogicalOp::AllRelationshipsScan) leaf (`rmp` task #867), plus the same
+    /// post-filters the scan + expand lowering would have placed above its `Expand`.
+    ///
+    /// `anchor_var` is the (anonymous) leading node's variable, already minted by the caller so the
+    /// anonymous numbering is unchanged; `link` is the part's single chain link.
+    fn lower_relationship_scan(
+        &mut self,
+        part: &PatternPart,
+        link: &PatternChainLink,
+        current: Option<LogicalOp>,
+        anchor_var: &Var,
+        pattern_rels: &mut Vec<Var>,
+    ) -> LogicalOp {
+        let rel_var = self.rel_var(&link.relationship);
+        let to_var = self.node_var(&link.node);
+        let scan = LogicalOp::AllRelationshipsScan {
+            relationship: rel_var.clone(),
+            from: anchor_var.clone(),
+            to: to_var,
+            direction: link.relationship.direction,
+            types: link.relationship.types.clone(),
+        };
+        // With a prior plan this part is a fresh disconnected component (it shares no variable with it —
+        // both its endpoints are anonymous and its relationship variable is new), so it joins by the same
+        // uncorrelated `Apply` the fresh-scan path uses; the physical planner turns that into a
+        // (cartesian) join exactly as it did for `Apply(prior, AllNodesScan)` + `Expand`.
+        let mut plan = match current {
+            Some(prev) => {
+                let args = collect_bound_vars(&prev);
+                let scan = self.correlate_scan(scan, args);
+                LogicalOp::Apply {
+                    left: Box::new(prev),
+                    right: Box::new(scan),
+                }
+            }
+            None => scan,
+        };
+        // This relationship joins the pattern's uniqueness set for any later part of the same MATCH.
+        pattern_rels.push(rel_var.clone());
+        // A fixed-length hop's inline property map is an ordinary post-`Filter` on the single
+        // relationship binding — identical to the `Expand` path (a var-length hop, whose map must hold
+        // per relationship, is declined by `relationship_scan_link`).
+        plan = self.filter_inline_props(plan, link.relationship.properties.as_ref(), &rel_var);
+        // A general relationship-type expression (`-[r:!A]->`, `-[:A&B]->`) cannot be reduced to the
+        // disjunctive `types` fast path, so the scan enumerates every type and the boolean predicate is
+        // enforced here — again exactly as the `Expand` path does.
+        if let Some(type_expr) = &link.relationship.type_expr {
+            plan = LogicalOp::Filter {
+                input: Box::new(plan),
+                predicate: has_label_expr(&rel_var, type_expr.clone(), link.relationship.span),
+            };
+        }
+        // A named path (`p = ()-[r:T]->()`) binds the path value over this part's traversal variables.
+        // The scan binds `from` to the endpoint the pattern arrow starts at (`start` for `->`/`-`, `end`
+        // for `<-`), which is precisely the start `NamedPath` reconstructs the single hop's orientation
+        // from — the same binding the `Expand` path's anchor scan gave it.
+        if let Some(v) = &part.var {
+            plan = LogicalOp::NamedPath {
+                input: Box::new(plan),
+                variable: Var::named(&v.name),
+                start: anchor_var.clone(),
+                steps: vec![rel_var],
             };
         }
         plan
@@ -2433,6 +2514,78 @@ fn part_node_at(element: &PatternElement, idx: usize) -> &NodePattern {
     } else {
         &element.chain[idx - 1].node
     }
+}
+
+// =================================================================================================
+// Relationship-type scan (`rmp` task #867)
+// =================================================================================================
+
+/// The single chain link of a pattern part that may be lowered to an
+/// [`AllRelationshipsScan`](LogicalOp::AllRelationshipsScan) instead of an anchor scan + an
+/// [`Expand`](LogicalOp::Expand), or [`None`] when any precondition fails (`rmp` task #867).
+///
+/// # Why
+///
+/// `MATCH ()-[r:LIKES]->() RETURN count(r)` constrains no node, yet the written lowering anchors on the
+/// leading node: it scans every node and expands each one's incidences to reach relationships the
+/// relationship store already holds contiguously. Measured on a 200k-node / 2M-`LIKES` store the query
+/// took **1.859 s** that way. Neo4j plans a `DirectedRelationshipTypeScan` here for the same reason.
+///
+/// # Preconditions, each load-bearing
+///
+/// * **No prior relationship in this MATCH** (`pattern_rels` empty).
+///   [`AllRelationshipsScan`](LogicalOp::AllRelationshipsScan) has no `prior_rels` field, so it cannot
+///   exclude a relationship an earlier link of the same pattern already bound — it can only ever be the
+///   pattern's *first* relationship, where Cypher relationship isomorphism forbids nothing yet.
+/// * **Exactly one chain link**, and not a **quantified path pattern** (a QPP's repetition binds group
+///   lists, not one relationship) — a longer chain has to traverse, and traversing needs an anchor.
+/// * **Fixed length** (`range` is `None`): a var-length hop binds `r` to a *list* built by walking, which
+///   no single-relationship enumeration produces.
+/// * **Both endpoints anonymous, unlabelled, with no inline property map and no label expression.**
+///   Anonymity is what makes the rewrite total rather than partial:
+///   - the two endpoints are distinct fresh synthetic variables, so the operator's `from` and `to` can
+///     never be the *same* variable — `MATCH (a)-[r]->(a)` (which the scan path plans as an
+///     `ExpandInto` connection check) would otherwise bind `a` twice and silently drop the
+///     `start == end` constraint;
+///   - nothing downstream can reference an endpoint, and no `USING INDEX` / `USING SCAN` hint can name
+///     one, so removing their access path removes nothing an operator could be relying on;
+///   - a labelled or property-constrained endpoint has a *real* access path (a label scan, possibly an
+///     index seek) that this rewrite would throw away in exchange for a full relationship scan — a
+///     pessimisation, and exactly the trade `rmp` #862 already declines for a constrained anchor.
+///     Those patterns keep the scan + expand lowering, which is the reference path.
+///
+/// `part.kind` needs no check: a shortest-path part returns from [`Planner::lower_pattern_part`] before
+/// this is reached. An **already-bound** anchor needs none either: an anonymous node can never have been
+/// bound by an earlier clause.
+fn relationship_scan_link<'a>(
+    part: &'a PatternPart,
+    pattern_rels: &[Var],
+) -> Option<&'a PatternChainLink> {
+    if !pattern_rels.is_empty() {
+        return None;
+    }
+    let element = &part.element;
+    let [link] = element.chain.as_slice() else {
+        return None;
+    };
+    if link.qpp.is_some() || link.relationship.range.is_some() {
+        return None;
+    }
+    if !is_unconstrained_anonymous_node(&element.start)
+        || !is_unconstrained_anonymous_node(&link.node)
+    {
+        return None;
+    }
+    Some(link)
+}
+
+/// Whether `node` is written as a bare `()` — no variable, no labels, no label expression, no inline
+/// property map (`rmp` task #867). See [`relationship_scan_link`] for why each of the four matters.
+fn is_unconstrained_anonymous_node(node: &NodePattern) -> bool {
+    node.variable.is_none()
+        && node.labels.is_empty()
+        && node.label_expr.is_none()
+        && node.properties.is_none()
 }
 
 /// The direction a chain link is traversed when walked **backwards** — from the node it reaches

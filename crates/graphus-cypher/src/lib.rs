@@ -195,7 +195,9 @@ pub use function_registry::{
 pub use gds_procedures::{
     GdsCatalogHandle, new_catalog as new_gds_catalog, register_gds_procedures,
 };
-pub use graph_access::{ExpandDirection, GraphAccess, Incident, MemGraph, NodeId, RelData, RelId};
+pub use graph_access::{
+    ExpandDirection, GraphAccess, Incident, MemGraph, NodeId, RelData, RelId, ScannedRel,
+};
 /// The full-text [`Analyzer`](graphus_index::fulltext::Analyzer) (`rmp` task #72), re-exported so the
 /// server's index-DDL surface can validate / name analyzers without a direct `graphus-index` dep.
 pub use graphus_index::fulltext::Analyzer;

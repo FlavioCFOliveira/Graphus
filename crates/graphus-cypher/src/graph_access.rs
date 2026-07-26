@@ -94,6 +94,26 @@ pub struct Incident {
     pub neighbour: NodeId,
 }
 
+/// One relationship discovered by [`GraphAccess::scan_rels_by_type`] (`rmp` task #867): the
+/// relationship **and both of its endpoints**, in the record's own `(start, end)` orientation.
+///
+/// The endpoints ride along because the caller needs them for every row and the seam has just decoded
+/// the record that holds them. Returning bare ids instead would force a second
+/// [`rel_data`](GraphAccess::rel_data) read per relationship — a redundant record decode *and* a
+/// relationship-type `String` allocation per row, which measured **slower than the node-walk this
+/// access path exists to beat**. The pattern's arrow is applied by the caller, never here: this is the
+/// stored orientation, not the bound one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[must_use]
+pub struct ScannedRel {
+    /// The relationship.
+    pub rel: RelId,
+    /// The relationship's start node, as stored.
+    pub start: NodeId,
+    /// The relationship's end node, as stored.
+    pub end: NodeId,
+}
+
 /// A node or relationship identity, used to ask the seam whether it was deleted by the current
 /// transaction ([`GraphAccess::entity_deleted_by_txn`]).
 ///
@@ -268,6 +288,42 @@ pub trait GraphAccess {
     /// deduplicates by relationship id where the query asks for distinct incident relationships
     /// (`04 §2.4`).
     fn expand(&self, node: NodeId, direction: ExpandDirection, types: &[String]) -> Vec<Incident>;
+
+    /// An **optional** whole-store relationship scan: every visible relationship whose type is among
+    /// `types` (empty = any type), **each once** with both endpoints, in a deterministic order
+    /// (`rmp` task #867).
+    ///
+    /// This is the access path behind
+    /// [`AllRelationshipsScan`](crate::physical::PhysicalOp::AllRelationshipsScan), the operator a
+    /// pattern with two anonymous endpoints (`MATCH ()-[r:T]->()`) lowers to. Without it the executor
+    /// must synthesise the relationship set from [`scan_nodes`](Self::scan_nodes) +
+    /// [`expand`](Self::expand) — reading every **node** record and chasing every incidence chain to
+    /// enumerate edges it could have read straight out of the relationship store.
+    ///
+    /// # Contract
+    ///
+    /// Returning [`None`] means "no accelerated enumeration here"; the caller then falls back to the
+    /// node-walk, which is the reference path.
+    ///
+    /// An implementation that *can* enumerate MUST return the **exact** visible set — never a subset
+    /// (silent row loss, `rmp` #738) and never a superset (the result is materialised into rows
+    /// directly, with no residual predicate above it to restore exactness).
+    ///
+    /// Its SSI read footprint MUST be a **superset** of what the node-walk would register — the
+    /// `AllNodes` + per-node markers of a full [`scan_nodes`](Self::scan_nodes), and the
+    /// relationship-type predicate + per-matching-edge markers of [`expand`](Self::expand). Containment,
+    /// not equality: a *narrower* footprint drops rw-edges the node-walk created and can admit an
+    /// anomaly SSI used to catch, while a *wider* one only adds rw-edges — at worst a false abort, never
+    /// a missed conflict. The store-backed implementation is genuinely wider: it marks a matching edge
+    /// **both** of whose endpoints are invisible, which the node-walk (reaching edges only through
+    /// visible endpoints) never sees. See `read_source::scan_rels_typed` for the full argument.
+    ///
+    /// The default is `None`, so a seam with no relationship store of its own — and, deliberately, any
+    /// decorator that cannot reproduce its own filtering here (see
+    /// [`AuthorizedGraph`](crate::authorized_graph::AuthorizedGraph)) — keeps the reference path.
+    fn scan_rels_by_type(&self, _types: &[String]) -> Option<Vec<ScannedRel>> {
+        None
+    }
 
     /// Whether `node` currently exists (is visible).
     fn node_exists(&self, node: NodeId) -> bool;

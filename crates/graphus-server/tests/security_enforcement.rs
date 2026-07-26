@@ -1154,3 +1154,115 @@ async fn deny_read_property_is_enforced_on_named_index_procedures_826() {
     bob.goodbye().await;
     server.shutdown().await.expect("clean shutdown");
 }
+
+/// **A relationship-type scan is RBAC-filtered end to end** (`rmp` task #867).
+///
+/// `MATCH ()-[r:LIKES]->()` — a pattern whose two endpoints are anonymous — no longer plans as
+/// `AllNodesScan` + `ExpandAll`; it plans as a relationship-type scan whose access path is a
+/// whole-store relationship enumeration (`GraphAccess::scan_rels_by_type`). That enumeration reads the
+/// relationship store directly and applies **no** privilege filtering, so the `AuthorizedGraph`
+/// decorator declines it for a restricted principal and the query falls back to the node-walk, which
+/// composes RBAC through `scan_nodes` / `expand`.
+///
+/// The decline is asserted at the seam by `graphus-cypher`'s unit tests and at the query level by
+/// `graphus-cypher/tests/relationship_type_scan.rs`. This is the end-to-end proof over the real wire:
+/// real `GRANT WRITE ON GRAPH` + `DENY TRAVERSE ON LABEL`, a real Bolt session, a real count. Were the
+/// decline ever removed, this test would report the raw store count instead of the filtered one — the
+/// exact shape of the `rmp` #820 / #822 / #826 authorisation gaps, which all shipped behind green CI
+/// because enforcement was only ever asserted one layer below the query.
+#[tokio::test]
+async fn relationship_type_scan_is_rbac_filtered_at_query_time_867() {
+    let temp = TempStore::new("relscan-rbac");
+    let server = boot(base_config(&temp)).await;
+    let uds = server.uds_path.clone().expect("UDS enabled");
+
+    // ---- 1) Admin seeds: two LIKES between visible :Person, one LIKES into a :Secret. -----------
+    let mut alice = BoltClient::connect(&uds).await;
+    alice.handshake_and_logon("alice", "admin-pw8").await;
+    alice
+        .run_ok("CREATE (:Person {name: 'Ada'})-[:LIKES {w: 1}]->(:Person {name: 'Bob'})")
+        .await;
+    alice
+        .run_ok("CREATE (:Person {name: 'Cy'})-[:LIKES {w: 2}]->(:Person {name: 'Dee'})")
+        .await;
+    alice
+        .run_ok("CREATE (:Person {name: 'Eve'})-[:LIKES {w: 3}]->(:Secret {code: 42})")
+        .await;
+    // The admin path is unrestricted, so it sees all three through the accelerated scan.
+    let admin_count = alice.run_ok("MATCH ()-[r:LIKES]->() RETURN count(r)").await;
+    assert_eq!(
+        ints(&admin_count, 0),
+        vec![3],
+        "an unrestricted principal sees every LIKES"
+    );
+    alice.goodbye().await;
+
+    // ---- 2) bob: a graph-wide WRITE grant with a DENY carved out of it. -------------------------
+    let mut admin = BoltClient::connect(&uds).await;
+    admin.handshake_and_logon("alice", "admin-pw8").await;
+    admin.run_ok("REVOKE ROLE readwrite FROM bob").await;
+    admin.run_ok("CREATE ROLE relscan").await;
+    admin
+        .run_ok("GRANT WRITE ON GRAPH graphus TO relscan")
+        .await;
+    admin.run_ok("GRANT ROLE relscan TO bob").await;
+    admin
+        .run_ok("DENY TRAVERSE ON LABEL graphus.Secret TO relscan")
+        .await;
+    admin.goodbye().await;
+
+    // ---- 3) bob's relationship-type scan is filtered: the edge into :Secret is gone. ------------
+    let mut bob = BoltClient::connect(&uds).await;
+    bob.handshake_and_logon("bob", "user2-pw8").await;
+
+    let filtered = bob.run_ok("MATCH ()-[r:LIKES]->() RETURN count(r)").await;
+    assert_eq!(
+        ints(&filtered, 0),
+        vec![2],
+        "DENY TRAVERSE on :Secret must remove the LIKES into it — a restricted principal's \
+         relationship-type scan MUST fall back to the RBAC-enforcing node-walk"
+    );
+
+    // The named-endpoint spelling of the same pattern has always been RBAC-filtered (it plans as
+    // AllNodesScan + ExpandAll). The two spellings must agree, or the new access path is a bypass.
+    let named = bob.run_ok("MATCH (a)-[r:LIKES]->(b) RETURN count(r)").await;
+    assert_eq!(
+        ints(&named, 0),
+        ints(&filtered, 0),
+        "the anonymous-endpoint spelling must return the same count as the named-endpoint spelling"
+    );
+
+    // The same holds for the undirected and untyped spellings, which also lower to the scan.
+    let undirected = bob.run_ok("MATCH ()-[r:LIKES]-() RETURN count(r)").await;
+    let undirected_named = bob.run_ok("MATCH (a)-[r:LIKES]-(b) RETURN count(r)").await;
+    assert_eq!(
+        ints(&undirected, 0),
+        ints(&undirected_named, 0),
+        "undirected: the two spellings must agree"
+    );
+    assert_eq!(
+        ints(&undirected, 0),
+        vec![4],
+        "an undirected pattern binds each visible non-self relationship in both orientations"
+    );
+    let untyped = bob.run_ok("MATCH ()-[r]->() RETURN count(r)").await;
+    let untyped_named = bob.run_ok("MATCH (a)-[r]->(b) RETURN count(r)").await;
+    assert_eq!(
+        ints(&untyped, 0),
+        ints(&untyped_named, 0),
+        "untyped: the two spellings must agree"
+    );
+
+    // And the rows themselves, not merely the count: the denied edge's property must be absent.
+    let weights = bob.run_ok("MATCH ()-[r:LIKES]->() RETURN r.w").await;
+    let mut ws = ints(&weights, 0);
+    ws.sort_unstable();
+    assert_eq!(
+        ws,
+        vec![1, 2],
+        "the LIKES into the denied :Secret (w = 3) must not be enumerated"
+    );
+
+    bob.goodbye().await;
+    server.shutdown().await.expect("clean shutdown");
+}

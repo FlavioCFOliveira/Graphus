@@ -244,7 +244,7 @@ fn tuples_match(a: &[Value], b: &[Value]) -> bool {
 use crate::constraint::{ConstraintViolation, ViolationEntity};
 use crate::graph_access::{
     DeletedEntity, ExpandDirection, GraphAccess, Incident, NodeId, RelData, RelId, ScanFilter,
-    VectorQueryResult,
+    ScannedRel, VectorQueryResult,
 };
 use crate::index_set::{ConstraintRule, IndexSet};
 use crate::read_source::{self, LiveSource, ReadSink, VisCtx};
@@ -4137,6 +4137,20 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             direction,
             types,
             csr_candidates,
+        )
+    }
+
+    fn scan_rels_by_type(&self, types: &[String]) -> Option<Vec<ScannedRel>> {
+        // The shared lifted body (`rmp` task #867): enumerate the relationship store directly instead of
+        // decoding every node record and chasing every incidence chain, registering the SIREAD /
+        // predicate markers the `scan_nodes` + `expand` walk it replaces would have registered — see
+        // [`read_source::scan_rels_typed`] for the marker-for-marker argument. Read-only: `LiveSource`
+        // over the live store's `&self` read methods.
+        read_source::scan_rels_typed(
+            &LiveSource(&*self.store.borrow()),
+            &self.vis_ctx(),
+            self,
+            types,
         )
     }
 

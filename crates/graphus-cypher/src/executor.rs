@@ -48,7 +48,7 @@ use crate::ast::{Expr, ExprKind, Label, RelDirection, RelType, SortDirection, Va
 use crate::binding::BoundParameters;
 use crate::eval::{EvalError, eval, eval_value};
 use crate::function_registry::{self, FunctionRegistry};
-use crate::graph_access::{ExpandDirection, GraphAccess, NodeId, RelId};
+use crate::graph_access::{ExpandDirection, GraphAccess, NodeId, RelId, ScannedRel};
 use crate::loadcsv::LoadCsvState;
 use crate::logical::{CreatePart, ProjectionColumn, RemoveOp, SetOp, SortKey, Var, YieldColumn};
 use crate::ordering::cmp_values;
@@ -400,6 +400,30 @@ enum Operator {
         pending: VecDeque<Row>,
     },
 
+    /// `AllRelationshipsScan` (`rmp` task #867): stream the enumerated relationships, binding each to
+    /// the relationship variable plus both endpoints per the pattern arrow.
+    ///
+    /// The enumeration itself is eager (one `Vec<ScannedRel>` — 24 bytes per relationship, produced by a
+    /// single sequential store scan), but the **rows are built lazily**, one relationship at a time.
+    /// Materialising them all up front — the obvious `Operator::Buffered { rows }` — allocates a whole
+    /// `Row` per result row before the first is consumed, and measured **slower than the
+    /// `AllNodesScan` + `ExpandAll` plan it replaces** on a 20k-node / 200k-relationship store
+    /// (151 ms vs 84 ms), because that plan streams: it buffers only the node rows and expands one
+    /// anchor at a time. `pending` holds the at-most-two rows one relationship contributes (an
+    /// undirected pattern binds both orientations).
+    RelScan {
+        /// The enumerated relationships, in seam order.
+        scanned: Vec<ScannedRel>,
+        /// How many of `scanned` have been emitted.
+        cursor: usize,
+        /// The `{from, relationship, to}` row shape, derived once at construction.
+        shape: RelRowTemplate,
+        /// The pattern arrow.
+        direction: RelDirection,
+        /// The rows the current relationship still owes (undirected binds two orientations).
+        pending: VecDeque<Row>,
+    },
+
     /// `ShortestPath`/`allShortestPaths`: for each input row (both endpoints already bound), run a
     /// breadth-first search from `from` to `to` honouring `direction`, `types` and the `range` length
     /// bounds, with node-uniqueness within a path (openCypher `shortestPath` semantics). For
@@ -739,6 +763,23 @@ impl Operator {
                     eval_value(url, &base, ctx.params, ctx.graph, ctx.functions, &ctx.clock)?;
                 let state = LoadCsvState::open(base, &url_value, *field_terminator, *with_headers)?;
                 *current = Some(state);
+            },
+
+            Operator::RelScan {
+                scanned,
+                cursor,
+                shape,
+                direction,
+                pending,
+            } => loop {
+                if let Some(row) = pending.pop_front() {
+                    return Ok(Some(row));
+                }
+                let Some(next) = scanned.get(*cursor) else {
+                    return Ok(None);
+                };
+                *cursor += 1;
+                push_rel_rows(pending, shape, *direction, next.rel, next.start, next.end);
             },
 
             Operator::Expand {
@@ -2776,7 +2817,7 @@ fn build_operator_unprofiled(
                 None => rel_scan_filter_eq_ids(&rel_type.name, property, &seek, ctx),
             };
             Ok(Operator::Buffered {
-                rows: rel_ids_to_rows(relationship, from, to, *direction, ids, ctx),
+                rows: rel_ids_to_rows(relationship, from, to, *direction, ids, ctx)?,
             })
         }
         PhysicalOp::RelIndexRangeSeek {
@@ -2824,7 +2865,7 @@ fn build_operator_unprofiled(
                 }
             };
             Ok(Operator::Buffered {
-                rows: rel_ids_to_rows(relationship, from, to, *direction, ids, ctx),
+                rows: rel_ids_to_rows(relationship, from, to, *direction, ids, ctx)?,
             })
         }
         PhysicalOp::RelCompositeIndexSeek {
@@ -2867,7 +2908,7 @@ fn build_operator_unprofiled(
                 }
             };
             Ok(Operator::Buffered {
-                rows: rel_ids_to_rows(relationship, from, to, *direction, ids, ctx),
+                rows: rel_ids_to_rows(relationship, from, to, *direction, ids, ctx)?,
             })
         }
         PhysicalOp::RelSpatialIndexSeek {
@@ -2903,7 +2944,7 @@ fn build_operator_unprofiled(
                 None => rel_scan_typed_ids(&rel_type.name, ctx),
             };
             Ok(Operator::Buffered {
-                rows: rel_ids_to_rows(relationship, from, to, *direction, ids, ctx),
+                rows: rel_ids_to_rows(relationship, from, to, *direction, ids, ctx)?,
             })
         }
         PhysicalOp::AllRelationshipsScan {
@@ -2912,8 +2953,14 @@ fn build_operator_unprofiled(
             to,
             direction,
             types,
-        } => Ok(Operator::Buffered {
-            rows: all_rels_rows(relationship, from, to, *direction, types, ctx),
+        } => Ok(Operator::RelScan {
+            // The enumeration runs once, here; the rows are built lazily as the operator is pulled
+            // (`rmp` task #867 — see `Operator::RelScan` for why eager row materialisation lost).
+            scanned: all_rel_scan(types, ctx),
+            cursor: 0,
+            shape: RelRowTemplate::require(from, relationship, to)?,
+            direction: *direction,
+            pending: VecDeque::new(),
         }),
         PhysicalOp::Argument { arguments } => {
             // The single correlation row, projected to the declared argument variables.
@@ -3527,41 +3574,38 @@ fn nodes_to_rows(variable: &Var, ids: Vec<NodeId>) -> VecDeque<Row> {
         .collect()
 }
 
-/// All-relationships scan rows: bind relationship + both endpoints, honouring the pattern direction
-/// (an undirected/`<-` pattern still binds `from`/`to` per the AST arrow).
-fn all_rels_rows(
-    relationship: &Var,
-    from: &Var,
-    to: &Var,
-    direction: RelDirection,
-    types: &[RelType],
-    ctx: &Ctx<'_>,
-) -> VecDeque<Row> {
+/// The visible relationships matching `types` (empty = any type), **each once** with both endpoints —
+/// the enumeration [`Operator::RelScan`] streams (`rmp` task #867).
+///
+/// Prefers the seam's whole-store relationship scan
+/// ([`scan_rels_by_type`](crate::graph_access::GraphAccess::scan_rels_by_type)), which reads the
+/// relationship records directly. When the seam declines (`None` — the in-memory reference seam, a
+/// restricted RBAC principal, or a storage fault) it falls back to the **reference** enumeration: every
+/// node's *outgoing* incidences, which visits each relationship exactly once (a relationship has exactly
+/// one start node, and `scan_nodes` yields each node once) and enforces MVCC visibility + RBAC through
+/// the very same seam calls the `AllNodesScan` + `ExpandAll` path used.
+///
+/// Both routes yield the endpoints **without a second record read**: an `Outgoing` expand's anchor *is*
+/// the relationship's start node and its `neighbour` the end, and the store scan reads them out of the
+/// record it already decoded. The two agree on the *set*; the store scan additionally yields it in
+/// ascending physical-id order rather than grouped by start node, which openCypher leaves unconstrained
+/// for a pattern with no `ORDER BY`.
+fn all_rel_scan(types: &[RelType], ctx: &Ctx<'_>) -> Vec<ScannedRel> {
     let type_names: Vec<String> = types.iter().map(|t| t.name.clone()).collect();
-    let mut out = VecDeque::new();
-    // Enumerate every node's outgoing edges once to list all relationships deterministically.
+    if let Some(scanned) = ctx.graph.scan_rels_by_type(&type_names) {
+        return scanned;
+    }
+    let mut out = Vec::new();
     for node in ctx.graph.scan_nodes() {
         for inc in ctx
             .graph
             .expand(node, ExpandDirection::Outgoing, &type_names)
         {
-            let Some(data) = ctx.graph.rel_data(inc.rel) else {
-                continue;
-            };
-            // Bind from/to per the pattern arrow: LeftToRight uses (start, end); RightToLeft swaps;
-            // Undirected keeps (start, end) for the canonical orientation.
-            let (f, t) = match direction {
-                RelDirection::RightToLeft => (data.end, data.start),
-                RelDirection::LeftToRight | RelDirection::Undirected => (data.start, data.end),
-            };
-            let mut row = Row::empty();
-            row.set(from.name.clone(), RowValue::Node(NodeRef { id: f }));
-            row.set(
-                relationship.name.clone(),
-                RowValue::Rel(RelRef { id: inc.rel }),
-            );
-            row.set(to.name.clone(), RowValue::Node(NodeRef { id: t }));
-            out.push_back(row);
+            out.push(ScannedRel {
+                rel: inc.rel,
+                start: node,
+                end: inc.neighbour,
+            });
         }
     }
     out
@@ -3599,38 +3643,149 @@ fn rel_ids_to_rows(
     direction: RelDirection,
     ids: Vec<RelId>,
     ctx: &Ctx<'_>,
-) -> VecDeque<Row> {
+) -> Result<VecDeque<Row>, ExecError> {
+    let shape = RelRowTemplate::require(from, relationship, to)?;
     let mut out = VecDeque::new();
     for rel in ids {
         let Some(data) = ctx.graph.rel_data(rel) else {
             continue; // no longer visible (defensive)
         };
-        match direction {
-            RelDirection::LeftToRight => {
-                out.push_back(rel_row(from, relationship, to, data.start, rel, data.end));
-            }
-            RelDirection::RightToLeft => {
-                out.push_back(rel_row(from, relationship, to, data.end, rel, data.start));
-            }
-            RelDirection::Undirected => {
-                out.push_back(rel_row(from, relationship, to, data.start, rel, data.end));
-                if data.start != data.end {
-                    out.push_back(rel_row(from, relationship, to, data.end, rel, data.start));
-                }
+        push_rel_rows(&mut out, &shape, direction, rel, data.start, data.end);
+    }
+    Ok(out)
+}
+
+/// Appends the row(s) one relationship contributes under the pattern arrow — **the single copy of the
+/// orientation rule** shared by every relationship-producing operator (the index seeks via
+/// [`rel_ids_to_rows`], the relationship-type scan via [`Operator::RelScan`]; `rmp` task #867).
+///
+/// `start`/`end` are the relationship's **stored** endpoints; the arrow decides how they are bound:
+/// `->` binds `(start, end)`, `<-` binds `(end, start)`, and `-` (undirected) binds **both**
+/// orientations — one row each — except for a **self-loop** (`start == end`), which binds a single row.
+/// That is exactly what the `ExpandAll`-over-`AllNodesScan` scan path produces: it surfaces each
+/// non-self relationship once from each endpoint's expansion, and a self-loop once per anchor (deduped
+/// by `Operator::Expand`'s per-anchor `seen_rel` set, and a self-loop has only one anchor).
+///
+/// # Why this rule lives in ONE place (`rmp` task #867)
+///
+/// It used to live in two. While `AllRelationshipsScan` was unreachable from any query, its
+/// materialisation bound only the canonical `(start, end)` orientation for an undirected pattern — one
+/// row per relationship — so `MATCH ()-[r]-() RETURN count(r)` would have silently **halved** the moment
+/// the lowerer started emitting it. The bug was invisible precisely because the operator was dead code
+/// and the (correct) seek copy of the rule was the only one ever exercised.
+fn push_rel_rows(
+    out: &mut VecDeque<Row>,
+    shape: &RelRowTemplate,
+    direction: RelDirection,
+    rel: RelId,
+    start: NodeId,
+    end: NodeId,
+) {
+    match direction {
+        RelDirection::LeftToRight => out.push_back(shape.row(start, rel, end)),
+        RelDirection::RightToLeft => out.push_back(shape.row(end, rel, start)),
+        RelDirection::Undirected => {
+            out.push_back(shape.row(start, rel, end));
+            if start != end {
+                out.push_back(shape.row(end, rel, start));
             }
         }
     }
-    out
 }
 
-/// One relationship row binding `from`/`relationship`/`to` to the given endpoint / relationship /
-/// endpoint ids (`rmp` task #659).
-fn rel_row(from: &Var, relationship: &Var, to: &Var, f: NodeId, rel: RelId, t: NodeId) -> Row {
-    let mut row = Row::empty();
-    row.set(from.name.clone(), RowValue::Node(NodeRef { id: f }));
-    row.set(relationship.name.clone(), RowValue::Rel(RelRef { id: rel }));
-    row.set(to.name.clone(), RowValue::Node(NodeRef { id: t }));
-    row
+/// The pre-built `{from, relationship, to}` row shape every relationship-binding operator emits
+/// (`rmp` task #659; the template technique is `rmp` #364's, lifted here by `rmp` task #867).
+///
+/// Building each row from [`Row::empty`] + three `set`s re-derives the schema per row — three name
+/// clones and an `Arc` schema construction each time. Deriving the shape **once** and then cloning it
+/// (an `Arc` bump) with three `set_at` writes by index is what `Operator::Expand` already does for its
+/// per-edge rows; a whole-store relationship scan emits one row per relationship (two for an undirected
+/// pattern), so it is exactly as hot.
+struct RelRowTemplate {
+    /// The shape, with placeholder values.
+    template: Row,
+    /// Column index of the source endpoint.
+    from_idx: usize,
+    /// Column index of the relationship.
+    rel_idx: usize,
+    /// Column index of the target endpoint.
+    to_idx: usize,
+}
+
+impl RelRowTemplate {
+    /// Derives the shape for the three variables, or [`None`] when they are **not distinct**.
+    ///
+    /// # Why this is fallible rather than asserted
+    ///
+    /// A pattern naming both endpoints the same variable (`MATCH (a)-[r:T]->(a)`) is a *connection
+    /// check*, which no relationship-binding operator can serve: it materialises `from` and `to` as two
+    /// independent columns, so one shared name collapses `from_idx == to_idx` and the second `set_at`
+    /// overwrites the first — the `start == end` constraint silently vanishes and the operator returns
+    /// rows the pattern excludes. That is exactly the pre-existing defect `rmp` task #867 found and fixed
+    /// in the relationship seeks, so it must not be able to come back.
+    ///
+    /// The planner declines the shape upstream twice over — `fold_rel_scan_filter_chain` rejects
+    /// `from.name == to.name` before building any seek, and `relationship_scan_link`'s
+    /// anonymous-endpoint precondition makes it structurally unreachable for the scan — so this returns
+    /// `None` for no query the planner can currently produce. It is nevertheless a **hard, always
+    /// compiled** check rather than a `debug_assert!`: an assertion that vanishes in release turns a
+    /// future planner mistake into a silent wrong answer in production and a green test suite in debug.
+    /// Callers turn `None` into a runtime error, so the failure is loud.
+    fn new(from: &Var, relationship: &Var, to: &Var) -> Option<Self> {
+        if from.name == to.name || from.name == relationship.name || to.name == relationship.name {
+            return None;
+        }
+        let mut template = Row::empty();
+        template.set(from.name.clone(), RowValue::Node(NodeRef { id: NodeId(0) }));
+        template.set(
+            relationship.name.clone(),
+            RowValue::Rel(RelRef { id: RelId(0) }),
+        );
+        template.set(to.name.clone(), RowValue::Node(NodeRef { id: NodeId(0) }));
+        let index = |name: &str| {
+            template
+                .schema()
+                .index_of_pub(name)
+                .expect("INVARIANT: the column was just set on the template")
+        };
+        let (from_idx, rel_idx, to_idx) = (
+            index(&from.name),
+            index(&relationship.name),
+            index(&to.name),
+        );
+        Some(Self {
+            template,
+            from_idx,
+            rel_idx,
+            to_idx,
+        })
+    }
+
+    /// [`new`](Self::new), turning the decline into a loud runtime error naming the invariant.
+    ///
+    /// Every construction site is inside `build_operator_unprofiled`, which already returns
+    /// [`ExecError`] — so failing the statement costs no new plumbing and is strictly better than the
+    /// alternative it replaces (a wrong result bag).
+    fn require(from: &Var, relationship: &Var, to: &Var) -> Result<Self, ExecError> {
+        Self::new(from, relationship, to).ok_or_else(|| {
+            ExecError::Eval(EvalError::TypeError {
+                context: format!(
+                    "a relationship operator must bind three distinct variables, got \
+                     from={}, relationship={}, to={} (`rmp` task #867)",
+                    from.name, relationship.name, to.name
+                ),
+            })
+        })
+    }
+
+    /// One row binding the given endpoint / relationship / endpoint ids.
+    fn row(&self, f: NodeId, rel: RelId, t: NodeId) -> Row {
+        let mut row = self.template.clone();
+        row.set_at(self.from_idx, RowValue::Node(NodeRef { id: f }));
+        row.set_at(self.rel_idx, RowValue::Rel(RelRef { id: rel }));
+        row.set_at(self.to_idx, RowValue::Node(NodeRef { id: t }));
+        row
+    }
 }
 
 /// The scan fallback for a [`RelIndexSeek`](crate::physical::PhysicalOp::RelIndexSeek) when the seam

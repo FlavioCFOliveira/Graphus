@@ -68,13 +68,19 @@ const REL_SSI_KEY_TAG: u64 = 1 << 63;
 
 /// The SSI conflict key for node physical id `id`.
 #[inline]
-fn node_ssi_key(id: u64) -> u64 {
+#[must_use]
+pub fn node_ssi_key(id: u64) -> u64 {
     id
 }
 
 /// The SSI conflict key for relationship physical id `id`.
+///
+/// Public so a test comparing two access paths' SIREAD buffers can name the key of a specific
+/// relationship without re-deriving the tag encoding (`rmp` task #867 — the relationship-scan footprint
+/// containment guard). One definition, no copy to drift.
 #[inline]
-fn rel_ssi_key(id: u64) -> u64 {
+#[must_use]
+pub fn rel_ssi_key(id: u64) -> u64 {
     id | REL_SSI_KEY_TAG
 }
 
@@ -2028,6 +2034,158 @@ pub fn node_labels<S: StoreReadSource, K: ReadSink>(
     // Deterministic, name-sorted order (mirrors `MemGraph`, which keeps labels sorted).
     names.sort();
     Some(names)
+}
+
+/// The body of `RecordStoreGraph::scan_rels_by_type` (`GraphAccess::scan_rels_by_type`, `rmp` task
+/// #867): every **visible** relationship whose type is among `types` (empty = any), each id once, in
+/// ascending physical-id order — read straight out of the relationship store instead of walking every
+/// node's incidence chain.
+///
+/// # Why this exists
+///
+/// `MATCH ()-[r:T]->()` lowers to [`AllRelationshipsScan`](crate::physical::PhysicalOp::AllRelationshipsScan),
+/// whose only enumeration used to be `scan_nodes` + `expand` **per node**: every node record decoded,
+/// every incidence chain chased, to produce a set the relationship store already holds contiguously.
+/// This reads the relationship slots once, sequentially.
+///
+/// # The SSI read footprint is a **superset** of the node-walk's — never a subset
+///
+/// This is the ACID bar the access path has to clear, and it is a *containment*, not an equality.
+/// Deliberately so: a **narrower** footprint would drop rw-edges the previous plan created and could
+/// admit an anomaly SSI used to catch, whereas a **wider** one only ever adds rw-edges — it can cost a
+/// false abort but can never miss a conflict, so serializability is preserved in the safe direction.
+///
+/// What is reproduced exactly:
+///
+/// * [`PredicateRead::AllNodes`] + a SIREAD on **every** slot-occupied node — what
+///   [`scan_nodes`] registers, id for id (that scan marks before its own visibility filter, and so does
+///   this). The node ids are marked without decoding their records (the answer does not depend on any
+///   node's *content*, only on the set the walk would have visited), which is the whole per-node saving.
+/// * the relationship-type predicate marker(s) — what [`expand`] registers via the shared
+///   `note_rel_predicate_read` helper, covering the concurrently-inserted (absent) edge the per-edge
+///   SIREADs cannot.
+/// * a SIREAD on every relationship whose type **matches**, registered *before* the visibility filter —
+///   mirroring [`expand`], which also marks a matching edge before hiding it. A **non-matching** edge is
+///   deliberately *not* marked, again mirroring `expand` (whose storage-side type filter never surfaces
+///   it) and the CSR candidate path, whose soundness rests on the type predicate marker above.
+///
+/// Where the extra markers come from: the node-walk only ever reaches an edge through an endpoint that
+/// is **visible** (`scan_nodes` yields visible nodes, and `expand` marks every matching edge incident to
+/// one). A matching edge **both** of whose endpoints are invisible — an in-flight writer's freshly
+/// created pair, say — is therefore never marked by the walk, while this scan marks it. Neither route
+/// *returns* it (both apply the same visibility filter to the answer), so the divergence is confined to
+/// the conflict graph, in the over-marking direction.
+///
+/// # Errors
+///
+/// A storage fault is captured into `sink` **and** reported as `None`. The `None` is not a "try the
+/// other route and carry on" signal: `capture` has already poisoned the statement's error cell, and
+/// every caller of this seam checks it — `engine::exec` (`exec.rs:663`, `exec.rs:1296`) and
+/// `engine::read_pool` (`read_pool.rs:252`) all fail the statement once `take_error()` is `Some`. So the
+/// caller does compute the node-walk fallback, and those rows are then **discarded** along with the
+/// statement. That is the intended fail-closed-on-read-fault behaviour (`rmp` #733): a read that
+/// faulted must never be answered from a partial set. The `None` exists so that, in the moment before
+/// the error surfaces, nothing downstream can mistake a short list for the truth — declining is always
+/// safe, `Some(short_vec)` never is (`rmp` #738).
+///
+/// # The referential invariant this depends on (`rmp` task #891)
+///
+/// This filters on the **relationship's** MVCC header alone. The node-walk it replaces additionally
+/// required the **start node** to be visible, because [`scan_nodes`] returns visible nodes only. The two
+/// agree because of a storage invariant: *a live relationship's endpoints are live records* — the
+/// referential integrity of relationship endpoints, asserted as rule 3a by the consistency checker
+/// (`graphus-storage/src/check.rs:748`, and again at `877-881` where a dangling endpoint is excluded
+/// from the incidence-count comparison).
+///
+/// That invariant is **not enforced by the write path**:
+/// [`RecordStore::delete_node`](graphus_storage::RecordStore::delete_node) documents that the caller is
+/// expected to have MVCC-deleted the node's relationships first (`DETACH DELETE`) and does not check it.
+/// What masks the gap today is the isolation level, not the storage layer: at `Serializable` — which is
+/// what every production **write** runs at (`demote_read_to_snapshot` applies only to auto-commit
+/// *reads*) — SSI aborts the write-skew that would delete a node while a concurrent transaction attaches
+/// an edge to it. Under an explicit `IsolationLevel::Snapshot` transaction both commit, and the two
+/// spellings of the same pattern then disagree: with a tombstoned start node and a live edge,
+/// `MATCH ()-[r:T]->() RETURN count(r)` is 1 (this scan) while `MATCH (a)-[r:T]->(b) RETURN count(r)` is
+/// 0 (the node-walk). `rmp` task #891 closes it by enforcing the invariant in `delete_node`.
+///
+/// A per-relationship endpoint-visibility check here would restore agreement, and is deliberately **not
+/// done**: it costs a node record read per relationship, which is precisely the cost this access path
+/// exists to remove (`rmp` task #867).
+pub fn scan_rels_typed<S: StoreReadSource, K: ReadSink>(
+    src: &S,
+    ctx: &VisCtx,
+    sink: &K,
+    types: &[String],
+) -> Option<Vec<crate::graph_access::ScannedRel>> {
+    // ---- footprint half 1: what `scan_nodes` would have registered ---------------------------
+    sink.note_predicate_read(PredicateRead::AllNodes);
+    let node_ids = match src.scan_node_ids() {
+        Ok(ids) => ids,
+        Err(e) => {
+            sink.capture(e);
+            return None;
+        }
+    };
+    for id in node_ids {
+        sink.note_read(node_ssi_key(id));
+    }
+
+    // ---- footprint half 2: what `expand` would have registered -------------------------------
+    note_rel_predicate_read(src, sink, types);
+    // Resolve the requested type names to interned ids once, exactly as `expand_with_csr` does, so the
+    // per-edge test is an integer compare. A requested name with no interned token matches no existing
+    // edge; if EVERY requested name is un-interned the answer is empty (the phantom for a concurrent
+    // first-insert of such a type is already covered by the `AnyRel` marker registered above).
+    let wanted_type_ids: Vec<u32> = types
+        .iter()
+        .filter_map(|t| src.token_id(Namespace::RelType, t))
+        .collect();
+    if !types.is_empty() && wanted_type_ids.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let rel_ids = match src.scan_rel_ids() {
+        Ok(ids) => ids,
+        Err(e) => {
+            sink.capture(e);
+            return None;
+        }
+    };
+    let mut out = Vec::new();
+    for id in rel_ids {
+        let rec = match src.rel(id) {
+            Ok(rec) => rec,
+            Err(e) => {
+                sink.capture(e);
+                return None;
+            }
+        };
+        // Re-check slot occupancy on the RE-READ record, exactly as `expand_with_csr` re-checks its CSR
+        // candidates. `scan_rel_ids` reported the slot occupied, but that was a separate read: this makes
+        // the safety **local** instead of derived from three remote invariants. Without it, correctness
+        // would rest on (1) a reclaimed slot decoding with `created_ts == 0`, (2) `VersionStamp::None`
+        // making `creator_visible` false, and (3) the `rmp` #588 held-slots barrier keeping the slot out
+        // of reuse for the duration — all true today, none of them stated here.
+        if !rec.mvcc.in_use() {
+            continue;
+        }
+        // An untyped scan wants every occupied slot, a typed one only the matching type. The type test
+        // precedes the SIREAD so the marked set matches `expand`'s exactly (see the footprint section).
+        if !wanted_type_ids.is_empty() && !wanted_type_ids.contains(&rec.type_id) {
+            continue;
+        }
+        sink.note_read(rel_ssi_key(id));
+        if ctx.visible(rec.mvcc) {
+            // The endpoints come straight out of the record just decoded, so the caller never needs a
+            // second `rel_data` read (which would also allocate the type name it does not want).
+            out.push(crate::graph_access::ScannedRel {
+                rel: RelId(id),
+                start: NodeId(rec.start_node),
+                end: NodeId(rec.end_node),
+            });
+        }
+    }
+    Some(out)
 }
 
 /// The body of `RecordStoreGraph::rel_data` (`GraphAccess::rel_data`): the relationship's structural

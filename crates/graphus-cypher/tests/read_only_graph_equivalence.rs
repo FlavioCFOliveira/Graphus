@@ -36,10 +36,11 @@ use std::rc::Rc;
 use graphus_core::value::temporal::Date;
 use graphus_core::{Crs, Point, TxnId, Value};
 use graphus_cypher::graph_access::{
-    DeletedEntity, ExpandDirection, GraphAccess, NodeId, RelData, RelId,
+    DeletedEntity, ExpandDirection, GraphAccess, NodeId, RelData, RelId, ScannedRel,
 };
 use graphus_cypher::index_set::IndexSet;
 use graphus_cypher::read_only_graph::ReadOnlyGraph;
+use graphus_cypher::read_source::rel_ssi_key;
 use graphus_cypher::record_graph::RecordStoreGraph;
 use graphus_io::MemBlockDevice;
 use graphus_storage::{BLOCK_PAYLOAD, IndexState, Namespace, RecordStore};
@@ -67,6 +68,10 @@ struct Fixture {
     /// An earlier committed snapshot timestamp (sees only transaction 1's commit — so the deletes,
     /// the rolled-back corpse and the later rel are invisible, proving visibility actually filters).
     ts_early: graphus_core::Timestamp,
+    /// The `KNOWS` relationship created by the still-in-flight transaction 4, both of whose endpoints
+    /// are that writer's own uncommitted nodes. Invisible at both snapshots; the relationship-scan SSI
+    /// footprint test uses it to pin *why* the scan's marker set is a proper superset of the walk's.
+    inflight_rel: RelId,
 }
 
 /// Builds the populated fixture directly on the store (the standalone write path commits each
@@ -194,11 +199,31 @@ fn populated() -> Fixture {
     let (_corpse, _) = s.create_rel(txn3, t_knows, n2, n4).unwrap();
     s.rollback(txn3).unwrap();
 
+    // ---- transaction 4: left IN-FLIGHT, so its records are slot-occupied but invisible ----
+    //
+    // A `KNOWS` edge whose BOTH endpoints are this writer's own uncommitted nodes. This is the case that
+    // separates the two relationship enumerations' SSI footprints (`rmp` task #867): the node-walk only
+    // ever reaches an edge through a **visible** endpoint, so it never marks this one, while the
+    // whole-store relationship scan marks every slot-occupied matching edge before filtering. Neither
+    // route RETURNS it (both apply the same visibility filter), so the divergence is confined to the
+    // conflict graph — in the safe, over-marking direction. Without this edge in the fixture, the
+    // superset assertion in `relationship_scan_ssi_footprint_is_a_superset_of_the_node_walk` would be
+    // vacuously an equality and would not describe the real contract.
+    //
+    // Deliberately unlabelled, so the label index (and every label-scan assertion) is untouched.
+    let txn4 = TxnId(4);
+    s.begin(txn4);
+    let (inflight_a, _) = s.create_node(txn4).unwrap();
+    let (inflight_b, _) = s.create_node(txn4).unwrap();
+    let (inflight_rel, _) = s.create_rel(txn4, t_knows, inflight_a, inflight_b).unwrap();
+    // NOT committed and NOT rolled back: the transaction stays open for the lifetime of the fixture.
+
     // Deliberately do NOT run GC: both read routes must face the tombstones, dead versions and corpse.
     Fixture {
         store: s,
         ts_latest,
         ts_early,
+        inflight_rel: RelId(inflight_rel),
     }
 }
 
@@ -287,6 +312,15 @@ impl Coordinated {
     }
 }
 
+/// The relationship-type sets swept by every `scan_rels_by_type` assertion (`rmp` task #867): the
+/// untyped "any type" case, each fixture type alone, both together, and a type no relationship carries.
+const REL_SCAN_TYPE_SETS: [&[&str]; 5] =
+    [&[], &["KNOWS"], &["OWNS"], &["KNOWS", "OWNS"], &["NEVER"]];
+
+fn rel_type_set(types: &&[&str]) -> Vec<String> {
+    types.iter().map(|t| (*t).to_owned()).collect()
+}
+
 /// Asserts two `Option<T: PartialEq>` read results are byte-equal, naming the method+id on failure.
 fn eq_opt<T: PartialEq + std::fmt::Debug>(what: &str, live: Option<T>, ro: Option<T>) {
     assert_eq!(
@@ -318,6 +352,17 @@ fn assert_reads_equal(what_snap: &str, live: &Live, ro: &ReadOnly, node_hi: u64,
             &format!("{what_snap}: scan_nodes_by_label({label})"),
             live.scan_nodes_by_label(label),
             ro.scan_nodes_by_label(label),
+        );
+    }
+    // The whole-store relationship scan (`rmp` task #867) — the access path behind
+    // `AllRelationshipsScan`. Off-thread parity is mandatory for every access path (`rmp` #768), and
+    // this one is served by the reader from its own read view, so it must agree id-for-id AND
+    // marker-for-marker with the inline seam.
+    for types in REL_SCAN_TYPE_SETS.iter().map(rel_type_set) {
+        eq_opt(
+            &format!("{what_snap}: scan_rels_by_type({types:?})"),
+            live.scan_rels_by_type(&types),
+            ro.scan_rels_by_type(&types),
         );
     }
 
@@ -505,6 +550,175 @@ fn read_only_graph_is_byte_identical_to_record_store_graph() {
         !latest.rel_exists(RelId(3)),
         "the OWNS rel must be invisible (tombstoned) at the latest snapshot"
     );
+}
+
+/// The **SSI read footprint** of the whole-store relationship scan **contains** that of the
+/// `scan_nodes` + `expand` node-walk it replaces (`rmp` task #867) — a superset, never a subset.
+///
+/// This is the ACID bar the access path has to clear, and it is a *containment*, not an equality.
+/// A **narrower** footprint would drop rw-edges the node-walk created and could admit an anomaly SSI
+/// used to catch; a **wider** one only adds rw-edges, so at worst it costs a false abort and can never
+/// miss a conflict. Serializability is therefore preserved in the safe direction either way, and the
+/// assertion is directional to match.
+///
+/// The scan is genuinely wider, and the fixture makes it so on purpose: the node-walk reaches an edge
+/// only through a **visible** endpoint, so a matching edge both of whose endpoints are invisible — the
+/// still-in-flight transaction 4's `KNOWS` pair — is marked by the scan and not by the walk. Part (3)
+/// below pins exactly that, so the relaxation from equality to containment is itself non-vacuous.
+/// Neither route *returns* that edge (both apply the same visibility filter), which is why part (1) can
+/// still assert the answers are equal.
+///
+/// Both routes run on their own live seam over the same store at the same snapshot, so the buffers are
+/// directly comparable in canonical sorted+deduped form. The comparison is repeated at two snapshots
+/// (visibility genuinely filters at the later one) and for every relationship-type set, including the
+/// untyped case and a type no relationship carries.
+///
+/// # What still holds it down
+///
+/// Containment is a weaker assertion than equality, so it is paired with the exact-presence checks in
+/// part (2b). Together they kill every way the marking can be under-registered — verified by mutation:
+/// dropping the `AllNodes` predicate, dropping the per-node SIREADs, dropping the relationship-type
+/// predicate, and moving the per-edge SIREAD behind the visibility filter each fail this test.
+#[test]
+fn relationship_scan_ssi_footprint_is_a_superset_of_the_node_walk() {
+    let fx = populated();
+    let coord = Coordinated::new(fx.store);
+    let mut txn_seq = 300;
+
+    for (what_snap, ts) in [("as-of-latest", fx.ts_latest), ("as-of-early", fx.ts_early)] {
+        for types in REL_SCAN_TYPE_SETS.iter().map(rel_type_set) {
+            // Route A: the store scan.
+            txn_seq += 1;
+            let scan_seam = coord.live_at(TxnId(txn_seq), ts);
+            let scanned = scan_seam
+                .scan_rels_by_type(&types)
+                .expect("the live seam serves the relationship scan");
+            assert!(scan_seam.take_error().is_none(), "{what_snap}: {types:?}");
+            let (_, scan_keys, scan_preds) = canonical(
+                scan_seam
+                    .take_read_buffer()
+                    .expect("coordinated seam holds a SIREAD buffer"),
+            );
+
+            // Route B: the node-walk `all_rel_scan` falls back to — every node's OUTGOING incidences,
+            // which visits each relationship exactly once (a relationship has one start node) and yields
+            // its endpoints without a second read (the anchor IS the start, the neighbour the end).
+            txn_seq += 1;
+            let walk_seam = coord.live_at(TxnId(txn_seq), ts);
+            let mut walked: Vec<ScannedRel> = Vec::new();
+            for node in walk_seam.scan_nodes() {
+                for inc in walk_seam.expand(node, ExpandDirection::Outgoing, &types) {
+                    walked.push(ScannedRel {
+                        rel: inc.rel,
+                        start: node,
+                        end: inc.neighbour,
+                    });
+                }
+            }
+            assert!(walk_seam.take_error().is_none(), "{what_snap}: {types:?}");
+            let (_, walk_keys, walk_preds) = canonical(
+                walk_seam
+                    .take_read_buffer()
+                    .expect("coordinated seam holds a SIREAD buffer"),
+            );
+
+            // (1) Same answer — relationship AND both endpoint ids. Sorted, because the two routes
+            // enumerate in different orders (ascending physical id vs grouped by start node), an
+            // ordering openCypher leaves unconstrained.
+            let mut scanned_sorted = scanned.clone();
+            scanned_sorted.sort_unstable();
+            walked.sort_unstable();
+            assert_eq!(
+                scanned_sorted, walked,
+                "{what_snap}: scan_rels_by_type({types:?}) returned a different relationship set than the node-walk"
+            );
+
+            // (2a) CONTAINMENT — the load-bearing assertion. Every marker the node-walk registers must
+            // also be registered by the scan. The converse is deliberately NOT asserted (see the doc):
+            // extra markers only add rw-edges, which can over-abort but never miss a conflict.
+            //
+            // This is what kills an under-registering regression. Dropping the per-node SIREADs, or
+            // moving the per-edge SIREAD behind the visibility filter (so a matching-but-invisible edge
+            // whose endpoint IS visible — the fixture's tombstoned `OWNS` rel at the latest snapshot —
+            // stops being marked), each leave a walk key with no scan counterpart and fail here.
+            let missing_keys: Vec<u64> = walk_keys
+                .iter()
+                .copied()
+                .filter(|k| !scan_keys.contains(k))
+                .collect();
+            assert!(
+                missing_keys.is_empty(),
+                "{what_snap}: the scan MISSED per-record SIREAD markers the node-walk registered for \
+                 {types:?}: {missing_keys:?}\n  scan={scan_keys:?}\n  walk={walk_keys:?}"
+            );
+            // Dropping the `AllNodes` predicate or the relationship-type predicate each fail here.
+            let missing_preds: Vec<&PredicateRead> = walk_preds
+                .iter()
+                .filter(|p| !scan_preds.contains(p))
+                .collect();
+            assert!(
+                missing_preds.is_empty(),
+                "{what_snap}: the scan MISSED predicate SIREAD markers the node-walk registered for \
+                 {types:?}: {missing_preds:?}\n  scan={scan_preds:?}\n  walk={walk_preds:?}"
+            );
+
+            // (2b) EXACT PRESENCE of the markers the contract names, so containment cannot be satisfied
+            // by a scan that simply marks everything and happens to swallow a real regression.
+            assert!(
+                scan_preds.contains(&PredicateRead::AllNodes),
+                "{what_snap}: the scan must register the `AllNodes` predicate for {types:?}: {scan_preds:?}"
+            );
+            let has_rel_predicate = scan_preds
+                .iter()
+                .any(|p| matches!(p, PredicateRead::AnyRel | PredicateRead::RelType(_)));
+            assert!(
+                has_rel_predicate,
+                "{what_snap}: the scan must register a relationship-pattern predicate for {types:?}: \
+                 {scan_preds:?}"
+            );
+
+            // (3) The superset is PROPER, for the documented reason: the still-in-flight transaction's
+            // edge — invisible, and with both endpoints invisible too — is marked by the scan and not by
+            // the walk. Only for the type sets that cover its `KNOWS` type; a set that excludes it must
+            // not mark it either. This is what makes the relaxation from equality to containment
+            // meaningful rather than a quietly weakened assertion.
+            let inflight_key = rel_ssi_key(fx.inflight_rel.0);
+            let covers_knows = types.is_empty() || types.iter().any(|t| t == "KNOWS");
+            if covers_knows {
+                assert!(
+                    scan_keys.contains(&inflight_key),
+                    "{what_snap}: the scan must mark the in-flight (invisible) KNOWS edge for {types:?}"
+                );
+                assert!(
+                    !walk_keys.contains(&inflight_key),
+                    "{what_snap}: the node-walk must NOT reach the in-flight edge (both endpoints \
+                     invisible) for {types:?} — if it does, the fixture no longer exercises the \
+                     superset case this test exists to describe"
+                );
+            } else {
+                assert!(
+                    !scan_keys.contains(&inflight_key),
+                    "{what_snap}: a type set excluding KNOWS must not mark the in-flight edge: {types:?}"
+                );
+            }
+
+            // (4) Non-vacuity: the fixture must have produced real markers for EVERY type set — even
+            // `NEVER`, and even `OWNS` at the latest snapshot (where the fixture's only OWNS rel is
+            // tombstoned): a set that matches nothing still registers the node + relationship-type
+            // markers, and those are exactly what (2) compares. The row-level non-vacuity is pinned on
+            // the untyped sweep, which always matches.
+            assert!(
+                !scan_keys.is_empty() && !scan_preds.is_empty(),
+                "{what_snap}: expected non-empty markers for {types:?} (comparison would be vacuous)"
+            );
+            if types.is_empty() {
+                assert!(
+                    !scanned.is_empty(),
+                    "{what_snap}: the untyped scan must find relationships, else the row comparison is vacuous"
+                );
+            }
+        }
+    }
 }
 
 /// A focused guard for the same-transaction self-`DELETE` path: `entity_deleted_by_txn` and
