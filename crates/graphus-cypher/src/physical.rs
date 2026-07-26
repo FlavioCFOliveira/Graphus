@@ -4120,23 +4120,22 @@ fn recognise_expand_chain(op: &PhysicalOp) -> Option<ExpandChain> {
         _ => return None,
     };
 
-    // Linearity: the chain must start at the anchor and each hop must continue from the previous
-    // hop's target. Anything else is a branch, which belongs to task #887.
-    if hops_rev[0].0.from.name != anchor.name {
-        return None;
-    }
-    for w in hops_rev.windows(2) {
-        if w[1].0.from.name != w[0].0.to.name {
-            return None;
-        }
-    }
-    // No node may repeat: a chain that revisits a node is a cycle, whose re-anchoring would need an
-    // expand-into rather than a plain reversal.
-    let mut seen = BTreeSet::new();
-    seen.insert(anchor.name.clone());
+    // Connectivity and acyclicity (`rmp` task #887 generalised this from a strict chain). The hops must
+    // form a TREE rooted at the anchor: each one expands from a node already bound and introduces
+    // exactly one new node. That covers a straight chain, a star branching from a middle node, and the
+    // connected comma-separated parts the lowering turns into expands off an already-bound node.
+    //
+    // A hop whose BOTH endpoints are already bound closes a cycle. It is a connection check, not a
+    // traversal, and re-anchoring it would require emitting an expand-into rather than a reversal — so
+    // the pattern is declined rather than reordered into something this pass cannot express.
+    let mut bound: BTreeSet<String> = BTreeSet::new();
+    bound.insert(anchor.name.clone());
     for (h, _) in &hops_rev {
-        if !seen.insert(h.to.name.clone()) {
-            return None;
+        if !bound.contains(&h.from.name) {
+            return None; // expands from a node this subtree never bound: not ours to reorder
+        }
+        if !bound.insert(h.to.name.clone()) {
+            return None; // closes a cycle
         }
     }
     // Relationship isomorphism: hop `j` must be constrained against exactly the relationships of the
@@ -4222,10 +4221,29 @@ impl ExpandChain {
             ),
         };
 
-        // Emit the hops, accumulating the isomorphism set in the new order.
+        // Emit the hops in breadth-first order from the new anchor, flipping any whose written
+        // direction points into the already-bound side. Every expand therefore starts from a node the
+        // plan has bound, which keeps the shape a linear spine of operators even when the PATTERN
+        // branches. Breadth-first is chosen because it is deterministic and independent of the written
+        // order — the whole point being to stop the spelling deciding the plan.
         let mut plan = base;
         let mut prior: Vec<Var> = Vec::new();
-        let emit = |plan: PhysicalOp, hop: &ChainHop, flip: bool, prior: &mut Vec<Var>| {
+        let mut bound: BTreeSet<String> = BTreeSet::new();
+        bound.insert(new_anchor.name.clone());
+        let mut remaining: Vec<&ChainHop> = self.hops.iter().collect();
+        while !remaining.is_empty() {
+            // The first hop, in the pattern's own order, with exactly one endpoint already bound.
+            let Some(pos) = remaining
+                .iter()
+                .position(|h| bound.contains(&h.from.name) != bound.contains(&h.to.name))
+            else {
+                // Disconnected from the anchor: this candidate cannot be built. Recognition already
+                // proved the pattern is connected, so this is unreachable for a well-formed tree —
+                // declining rather than asserting keeps a future shape safe.
+                return None;
+            };
+            let hop = remaining.remove(pos);
+            let flip = !bound.contains(&hop.from.name);
             let (from, to, direction) = if flip {
                 (
                     hop.to.clone(),
@@ -4235,7 +4253,8 @@ impl ExpandChain {
             } else {
                 (hop.from.clone(), hop.to.clone(), hop.direction)
             };
-            let out = PhysicalOp::ExpandAll {
+            bound.insert(to.name.clone());
+            plan = PhysicalOp::ExpandAll {
                 input: Box::new(plan),
                 from,
                 relationship: hop.relationship.clone(),
@@ -4247,13 +4266,6 @@ impl ExpandChain {
                 rel_props: None,
             };
             prior.push(hop.relationship.clone());
-            out
-        };
-        for hop in &self.hops[k..] {
-            plan = emit(plan, hop, false, &mut prior);
-        }
-        for hop in self.hops[..k].iter().rev() {
-            plan = emit(plan, hop, true, &mut prior);
         }
 
         // Re-apply every conjunct the new access path did not consume, plus the label of the ORIGINAL
