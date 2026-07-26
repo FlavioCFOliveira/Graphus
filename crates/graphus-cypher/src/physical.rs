@@ -3506,6 +3506,12 @@ fn optimize_inner(
     // rule-based `scan + forward-expand`. Bag-preserving (same directed edge set, same columns).
     let op = optimize_expand_direction(op, catalog, stats);
 
+    // (C2) Cost-based anchor selection over a MULTI-hop chain (`rmp` task #858): the same rewrite
+    // generalised from one hop to N, so a pattern whose selective node sits at the far end of a chain
+    // is anchored there rather than on whichever node happened to be written first. Runs after (C) so
+    // the single-hop case keeps its dedicated, narrower pass.
+    let op = optimize_chain_anchor(op, catalog, stats);
+
     // (A) Join reordering: if this node roots a maximal reorderable join region, flatten and re-plan
     // it by DP (small regions) or greedy (large regions). (If it is not such a region root, this is a
     // no-op returning `op`.)
@@ -4012,6 +4018,292 @@ fn reverse_expand_alternative(op: &PhysicalOp, catalog: &IndexCatalog) -> Option
     }
     let residual_refs: Vec<&Expr> = residual.iter().collect();
     Some(attach_residual(reversed, &residual_refs))
+}
+
+// -------------------------------------------------------------------------------------------------
+// (C2) Cost-based anchor selection over a multi-hop chain (`rmp` task #858)
+// -------------------------------------------------------------------------------------------------
+
+/// One fixed-length hop of a recognised expand chain.
+#[derive(Clone)]
+struct ChainHop {
+    from: Var,
+    relationship: Var,
+    to: Var,
+    direction: crate::ast::RelDirection,
+    types: Vec<RelType>,
+}
+
+/// A linear `Filter*`-over-`ExpandAll…`-over-scan subtree, decomposed so any of its nodes can be made
+/// the anchor (`rmp` task #858).
+struct ExpandChain {
+    /// The variable the bottom scan binds — the rule-based anchor.
+    anchor: Var,
+    /// The label that scan consumed, if it was a label scan rather than an all-nodes scan.
+    anchor_label: Option<Label>,
+    /// The hops in traversal order; `hops[i]` walks from node `i` to node `i + 1`.
+    hops: Vec<ChainHop>,
+    /// Every conjunct peeled from the `Filter` stack above, in plan order.
+    conjuncts: Vec<Expr>,
+}
+
+/// Recognises a re-anchorable expand chain at `op`, or `None`.
+///
+/// The generalisation of [`reverse_expand_alternative`]'s site detection from one hop to N. The same
+/// exclusions apply per hop and for the same reasons — a variable-length range or an inline
+/// relationship-property map changes what "anchor at the other end" means — plus one that only arises
+/// with several hops: each hop's relationship-isomorphism set must be exactly the relationships of the
+/// hops *before* it in this chain. A hop carrying an isomorphism constraint against a relationship from
+/// somewhere else in the `MATCH` is not this chain's to reorder, so the chain is declined rather than
+/// reordered with a constraint it cannot re-derive.
+fn recognise_expand_chain(op: &PhysicalOp) -> Option<ExpandChain> {
+    let mut conjuncts: Vec<Expr> = Vec::new();
+    // Peel filters and expands in whichever order they interleave. They DO interleave: the predicate
+    // pushdown of `rmp` task #857 delivers each conjunct to the deepest point it may reach, so a label
+    // check on a hop's target now sits directly under that hop rather than in one stack at the top.
+    // Collecting the conjuncts as they are met and re-applying them as a single residual is exact,
+    // because every one of them is evaluated on the same rows either way.
+    let mut cursor = op;
+    let mut hops_rev: Vec<(ChainHop, Vec<Var>)> = Vec::new();
+    loop {
+        match cursor {
+            PhysicalOp::Filter { input, predicate } => {
+                for c in split_conjuncts(predicate) {
+                    conjuncts.push(c.clone());
+                }
+                cursor = input.as_ref();
+            }
+            PhysicalOp::ExpandAll {
+                input,
+                from,
+                relationship,
+                to,
+                direction,
+                types,
+                range,
+                prior_rels,
+                rel_props,
+            } => {
+                // A variable-length range or an inline relationship-property map changes what
+                // "anchor at the other end" means, so such a hop is not re-anchorable.
+                if range.is_some() || rel_props.is_some() {
+                    return None;
+                }
+                hops_rev.push((
+                    ChainHop {
+                        from: from.clone(),
+                        relationship: relationship.clone(),
+                        to: to.clone(),
+                        direction: *direction,
+                        types: types.clone(),
+                    },
+                    prior_rels.clone(),
+                ));
+                cursor = input.as_ref();
+            }
+            _ => break,
+        }
+    }
+    if hops_rev.len() < 2 {
+        // A single hop is already handled by the #366 reversal; re-deciding it here would only
+        // duplicate that pass and its cost comparison.
+        return None;
+    }
+    hops_rev.reverse();
+
+    let (anchor, anchor_label) = match cursor {
+        PhysicalOp::NodeByLabelScan { variable, label } => (variable.clone(), Some(label.clone())),
+        PhysicalOp::TokenLookupScan {
+            variable, label, ..
+        } => (variable.clone(), Some(label.clone())),
+        PhysicalOp::AllNodesScan { variable } => (variable.clone(), None),
+        _ => return None,
+    };
+
+    // Linearity: the chain must start at the anchor and each hop must continue from the previous
+    // hop's target. Anything else is a branch, which belongs to task #887.
+    if hops_rev[0].0.from.name != anchor.name {
+        return None;
+    }
+    for w in hops_rev.windows(2) {
+        if w[1].0.from.name != w[0].0.to.name {
+            return None;
+        }
+    }
+    // No node may repeat: a chain that revisits a node is a cycle, whose re-anchoring would need an
+    // expand-into rather than a plain reversal.
+    let mut seen = BTreeSet::new();
+    seen.insert(anchor.name.clone());
+    for (h, _) in &hops_rev {
+        if !seen.insert(h.to.name.clone()) {
+            return None;
+        }
+    }
+    // Relationship isomorphism: hop `j` must be constrained against exactly the relationships of the
+    // hops before it in THIS chain — no more, no fewer. A hop carrying a constraint against a
+    // relationship bound elsewhere in the `MATCH` is not this chain's to reorder, because re-deriving
+    // the set for a new order would silently drop that outside constraint.
+    for (j, (_, prior)) in hops_rev.iter().enumerate() {
+        let expected: BTreeSet<&str> = hops_rev[..j]
+            .iter()
+            .map(|(h, _)| h.relationship.name.as_str())
+            .collect();
+        let actual: BTreeSet<&str> = prior.iter().map(|v| v.name.as_str()).collect();
+        if actual != expected {
+            return None;
+        }
+    }
+
+    Some(ExpandChain {
+        anchor,
+        anchor_label,
+        hops: hops_rev.into_iter().map(|(h, _)| h).collect(),
+        conjuncts,
+    })
+}
+
+impl ExpandChain {
+    /// The chain's nodes in order: the anchor, then each hop's target.
+    fn nodes(&self) -> Vec<Var> {
+        let mut out = vec![self.anchor.clone()];
+        out.extend(self.hops.iter().map(|h| h.to.clone()));
+        out
+    }
+
+    /// The label constrained on `node`, from the peeled conjuncts (or from the anchor scan).
+    fn label_of(&self, node: &Var) -> Option<Label> {
+        if node.name == self.anchor.name {
+            if let Some(l) = &self.anchor_label {
+                return Some(l.clone());
+            }
+        }
+        self.conjuncts
+            .iter()
+            .find_map(|c| has_single_label(c, &node.name))
+    }
+
+    /// Builds the plan anchored at node index `k`, or `None` when that node has no usable access path.
+    ///
+    /// Traversal order from the new anchor: forward along the rest of the chain first, then backward
+    /// towards the original anchor with each of those hops' arrows flipped. Every expand therefore
+    /// starts from a node the plan has already bound, which is what keeps the shape a linear spine
+    /// rather than a branch.
+    ///
+    /// **Soundness.** A directed edge is the same `RelId` whichever endpoint enumerates it — the
+    /// relationship-set equality that already makes the #366 reversal and `ExpandInto` sound — so every
+    /// candidate binds the identical `{from, relationship, to}` columns to the identical entities.
+    /// Relationship isomorphism is re-derived for the new order: each hop carries the relationships of
+    /// every hop emitted before it, which is the same *set* as before, merely accumulated in a
+    /// different sequence.
+    fn candidate_anchored_at(&self, k: usize, catalog: &IndexCatalog) -> Option<PhysicalOp> {
+        let nodes = self.nodes();
+        let new_anchor = &nodes[k];
+        let label = self.label_of(new_anchor)?;
+
+        // Prefer an index seek on the new anchor; fall back to its label scan. A seek consumes its
+        // property conjunct, which must then not be re-applied as a residual.
+        let seek_site = self.conjuncts.iter().position(|c| {
+            analyze_property_predicate(c, &new_anchor.name)
+                .and_then(|pp| catalog.label_property(&label, &pp.property))
+                .is_some()
+        });
+        let (base, consumed) = match seek_site {
+            Some(idx) => {
+                let pp = analyze_property_predicate(&self.conjuncts[idx], &new_anchor.name)?;
+                let index = catalog.label_property(&label, &pp.property)?;
+                (build_seek(new_anchor, &label, &pp, index.id), Some(idx))
+            }
+            None => (
+                PhysicalOp::NodeByLabelScan {
+                    variable: new_anchor.clone(),
+                    label: label.clone(),
+                },
+                None,
+            ),
+        };
+
+        // Emit the hops, accumulating the isomorphism set in the new order.
+        let mut plan = base;
+        let mut prior: Vec<Var> = Vec::new();
+        let emit = |plan: PhysicalOp, hop: &ChainHop, flip: bool, prior: &mut Vec<Var>| {
+            let (from, to, direction) = if flip {
+                (
+                    hop.to.clone(),
+                    hop.from.clone(),
+                    reverse_direction(hop.direction),
+                )
+            } else {
+                (hop.from.clone(), hop.to.clone(), hop.direction)
+            };
+            let out = PhysicalOp::ExpandAll {
+                input: Box::new(plan),
+                from,
+                relationship: hop.relationship.clone(),
+                to,
+                direction,
+                types: hop.types.clone(),
+                range: None,
+                prior_rels: prior.clone(),
+                rel_props: None,
+            };
+            prior.push(hop.relationship.clone());
+            out
+        };
+        for hop in &self.hops[k..] {
+            plan = emit(plan, hop, false, &mut prior);
+        }
+        for hop in self.hops[..k].iter().rev() {
+            plan = emit(plan, hop, true, &mut prior);
+        }
+
+        // Re-apply every conjunct the new access path did not consume, plus the label of the ORIGINAL
+        // anchor when its scan had consumed it — otherwise the candidate would select more rows than
+        // the plan it replaces.
+        let mut residual: Vec<Expr> = self
+            .conjuncts
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| Some(*j) != consumed)
+            .map(|(_, e)| e.clone())
+            .collect();
+        if k != 0 {
+            if let Some(l) = &self.anchor_label {
+                residual.push(has_labels_expr(&self.anchor, l));
+            }
+        }
+        let refs: Vec<&Expr> = residual.iter().collect();
+        Some(attach_residual(plan, &refs))
+    }
+}
+
+/// Re-anchors a multi-hop chain on whichever of its nodes the cost model prefers (`rmp` task #858).
+///
+/// The rule-based anchor is the first-written node, so the same pattern written two ways costs wildly
+/// differently: measured on the evaluation store, one spelling ran in 0.019s and the other in 125.697s
+/// — a 6600x gap decided purely by syntax. This enumerates one candidate per chain node, costs each
+/// against the rule-based plan, and keeps the cheapest.
+///
+/// The enumeration is **linear** in the chain length (one candidate per node), not factorial: the
+/// traversal order within a candidate is fixed (forward then backward). Enumerating alternative orders
+/// for branched and multi-part patterns is task #887.
+///
+/// Only reached when statistics are present, like every other cost-based rewrite here.
+fn optimize_chain_anchor(
+    op: PhysicalOp,
+    catalog: &IndexCatalog,
+    stats: &dyn Statistics,
+) -> PhysicalOp {
+    let Some(chain) = recognise_expand_chain(&op) else {
+        return op;
+    };
+    let mut best = op;
+    // `k = 0` is the rule-based anchor, already represented by `best`.
+    for k in 1..chain.nodes().len() {
+        if let Some(candidate) = chain.candidate_anchored_at(k, catalog) {
+            best = cheaper(best, candidate, stats);
+        }
+    }
+    best
 }
 
 /// If `expr` is exactly `variable:Label` (a single-label `HasLabels` predicate), returns that label.
