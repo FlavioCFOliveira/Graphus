@@ -523,11 +523,44 @@ fn walk_physical(op: &PhysicalOp, record: &mut impl FnMut(&str, ParamType)) {
             walk_physical(input, record);
         }
 
-        // ---- traversals carry expressions only in pattern props (handled via Create/Filter) -
-        PhysicalOp::ExpandAll { input, .. }
-        | PhysicalOp::ExpandInto { input, .. }
-        | PhysicalOp::ShortestPath { input, .. }
-        | PhysicalOp::NamedPath { input, .. } => {
+        // ---- traversals -----------------------------------------------------------------------
+        // A **fixed-length** hop's inline property map is lowered to an ordinary `Filter` over the
+        // relationship binding, so its parameters are collected by the `Filter` arm above. A
+        // **variable-length** hop's is not: the map must hold for *every* relationship of the path, so
+        // the planner keeps it on the operator (`rel_props`) and the expansion applies it per hop. It is
+        // therefore an expression the plan really evaluates and its parameters must be recorded here.
+        //
+        // Not doing so was a silent wrong answer, not merely a missing diagnostic: `BoundParameters`
+        // carries exactly the recorded names, so an unrecorded `$p` was *absent* at evaluation, the
+        // comparison went null, every relationship was rejected, and
+        // `MATCH (a)-[r:T*1..3 {k: $p}]->(b)` returned **zero rows** while the fixed-length spelling of
+        // the same query returned the match. (Literals lifted by
+        // [`normalize_query`](crate::plan_cache::normalize_query) would fall in the same hole; today
+        // that normalisation only builds the cache key, and no plan is compiled from its text.)
+        //
+        // `to_predicate` (`rmp` task #870) is the far-endpoint predicate pushed down out of the
+        // `Filter` that used to sit above the expansion — the very `Filter` whose parameters were
+        // recorded before the pushdown — so it is recorded here for exactly the same reason.
+        PhysicalOp::ExpandAll {
+            input,
+            rel_props,
+            to_predicate,
+            ..
+        } => {
+            for e in rel_props.iter().chain(to_predicate.iter()) {
+                params_in_expr(e, ParamType::Any, record);
+            }
+            walk_physical(input, record);
+        }
+        PhysicalOp::ExpandInto {
+            input, rel_props, ..
+        } => {
+            if let Some(props) = rel_props {
+                params_in_expr(props, ParamType::Any, record);
+            }
+            walk_physical(input, record);
+        }
+        PhysicalOp::ShortestPath { input, .. } | PhysicalOp::NamedPath { input, .. } => {
             walk_physical(input, record);
         }
 

@@ -434,6 +434,8 @@ fn expand_pieces(src: &str) -> ExpandPieces {
         range,
         prior_rels,
         rel_props,
+        to_predicate,
+        pruning,
     } = expand_op
     else {
         panic!("expected an ExpandAll below the post-work, got {expand_op:?}");
@@ -441,6 +443,11 @@ fn expand_pieces(src: &str) -> ExpandPieces {
     assert!(range.is_none(), "expected a fixed-length hop");
     assert!(prior_rels.is_empty(), "expected no prior rels");
     assert!(rel_props.is_none(), "expected no inline rel-prop map");
+    assert!(
+        to_predicate.is_none(),
+        "expected no pushed-down endpoint predicate"
+    );
+    assert!(!pruning, "expected the plain (non-pruning) expansion");
 
     let label = match input.as_ref() {
         PhysicalOp::NodeByLabelScan { label, .. } | PhysicalOp::TokenLookupScan { label, .. } => {

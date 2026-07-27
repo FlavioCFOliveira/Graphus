@@ -1607,6 +1607,8 @@ mod tests {
             range: None,
             prior_rels: Vec::new(),
             rel_props: None,
+            to_predicate: None,
+            pruning: false,
         };
         let expand_rows = estimate_cost(&expand, stats).rows;
         assert!(
@@ -1790,6 +1792,8 @@ mod tests {
                 range,
                 prior_rels: Vec::new(),
                 rel_props: None,
+                to_predicate: None,
+                pruning: false,
             }
         }
     }

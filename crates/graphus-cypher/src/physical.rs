@@ -737,6 +737,11 @@ impl PhysicalOp {
             Self::RelSpatialIndexSeek { .. } => "RelSpatialIndexSeek",
             Self::Argument { .. } => "Argument",
             Self::Empty => "Empty",
+            // `rmp` #870a. Two names for one variant, as for `OptionalExpand` below: which walk ran is
+            // exactly the distinction a client reading the plan needs, because the pruning walk
+            // enumerates distinct END NODES where the plain one enumerates every trail. (Neo4j spells
+            // this `VarLengthExpand(Pruning)`; Graphus reports its own operator names.)
+            Self::ExpandAll { pruning: true, .. } => "VarLengthExpandPruning",
             Self::ExpandAll { .. } => "ExpandAll",
             Self::ExpandInto { .. } => "ExpandInto",
             Self::NamedPath { .. } => "NamedPath",
@@ -868,6 +873,10 @@ impl PhysicalOp {
                 range: None,
                 prior_rels: Vec::new(),
                 rel_props: None,
+                // `rmp` #870 rewrites only variable-length hops, and this reconstruction is a
+                // fixed-length one by construction (`range: None`).
+                to_predicate: None,
+                pruning: false,
             }
         };
         // `predicates` is innermost-first, so re-stacking in order rebuilds the original chain.
@@ -1578,6 +1587,19 @@ pub enum PhysicalOp {
         /// A var-length hop's inline relationship-property map, applied per relationship during
         /// expansion (`None` for a fixed-length hop).
         rel_props: Option<crate::ast::Expr>,
+        /// A predicate on the **far endpoint** `to`, evaluated as each candidate end node is reached
+        /// instead of by a [`Filter`](Self::Filter) above the whole expansion (`rmp` task #870, part
+        /// b). Set only for a variable-length hop, and only for a predicate
+        /// [confined](expr_confined_to) to `to` — see
+        /// [`push_endpoint_predicates_into_var_expands`]. `None` leaves the predicate where the
+        /// planner put it.
+        to_predicate: Option<crate::ast::Expr>,
+        /// `true` for the **pruning** variable-length walk (`rmp` task #870, part a): emit each
+        /// reachable end node **once** instead of one row per trail, for a plan that provably consumes
+        /// only the distinct end node. Set only by [`prune_var_length_expands`], which owns the
+        /// soundness argument; a pruning expansion binds no relationship list (see
+        /// [`gather_bound_vars`]).
+        pruning: bool,
     },
     /// **Expand-into**: both endpoints are already bound; enumerate only the relationships
     /// **between** them (a connection / cycle check, `04 §7.1`).
@@ -2349,7 +2371,7 @@ pub fn plan_physical_with_stats(
     // dependencies are recomputed from the final tree it produces. Either way the provided-order
     // Sort-elision pass (`rmp` #665) runs last on the final tree; it is order-preserving (not
     // cost-based), so it applies on both paths without changing the result multiset.
-    let (mut root, index_dependencies) = match stats {
+    let (root, index_dependencies) = match stats {
         Some(s) => {
             let optimized = optimize(rule_based, catalog, s);
             // Provided-order Sort elision (`rmp` task #665, part B) runs as the FINAL pass, after the
@@ -2373,6 +2395,19 @@ pub fn plan_physical_with_stats(
             deps,
         ),
     };
+
+    // Variable-length expansion rewrites (`rmp` task #870) run on the SETTLED tree, after every
+    // access-path and join decision. Two reasons, and neither is stylistic. They are not cost-based —
+    // each is either legal, and then strictly less work than the plan it replaces, or it does not fire
+    // — so there is nothing for the cost model to choose between and nothing gained by showing them to
+    // it. And running last is what makes them safe: every earlier pass rebuilds `ExpandAll` nodes, and
+    // a rewrite that ran before them could be silently undone by a re-anchored expand chain or a
+    // reverted access path. (Both of those passes decline a variable-length hop today; "declines
+    // today" is not "declines tomorrow".)
+    //
+    // Order between the two matters: the pushdown may remove the `Filter` above an expansion entirely,
+    // which is exactly the shape the pruning recogniser is looking through.
+    let mut root = prune_var_length_expands(push_endpoint_predicates_into_var_expands(root));
 
     // Index-backed property lookup (`rmp` task #879) runs DEAD LAST, on the tree that will actually
     // execute: it reads which properties the finished plan references and which access paths remain,
@@ -2469,6 +2504,11 @@ impl Planner<'_> {
                         range: *range,
                         prior_rels: prior_rels.clone(),
                         rel_props: rel_props.clone(),
+                        // The `rmp` #870 rewrites are later passes over the settled tree, never a
+                        // lowering choice: lowering produces the plain trail expansion, and a rewrite
+                        // that can prove itself legal replaces it.
+                        to_predicate: None,
+                        pruning: false,
                     }
                 }
             }
@@ -4294,6 +4334,11 @@ fn recognize_optional_expand(right: &PhysicalOp) -> Option<FusedOptionalExpand> 
             range: None,
             prior_rels,
             rel_props: None,
+            // `rmp` #870: both are variable-length-only state, so `range: None` already excludes them
+            // — pinned anyway, so that a future lowering which set either on a fixed-length hop
+            // declines here instead of having it silently dropped by the fusion.
+            to_predicate: None,
+            pruning: false,
         } if prior_rels.is_empty() => (
             false,
             input.as_ref(),
@@ -4455,6 +4500,462 @@ fn logical_op_is_correlated(op: &LogicalOp) -> bool {
             logical_op_is_correlated(left) || logical_op_is_correlated(right)
         }
         _ => false,
+    }
+}
+
+// =================================================================================================
+// Variable-length expansion: endpoint-predicate pushdown and distinct-end-node pruning (`rmp` #870)
+// =================================================================================================
+//
+// Two independent rewrites of one operator, run back to back on the settled tree because the second
+// wants the `Filter` the first may remove:
+//
+// * [`push_endpoint_predicates_into_var_expands`] moves a predicate that reads **only the far
+//   endpoint** out of the `Filter` above the expansion and onto the expansion itself, so it is
+//   decided as each candidate end node is reached rather than after the whole frontier has been
+//   materialised into rows.
+// * [`prune_var_length_expands`] replaces the trail enumeration with a walk that emits each reachable
+//   **end node once**, for a plan that provably consumes nothing else.
+//
+// Neither is cost-based: each is either legal (and then strictly less work) or it does not fire.
+
+/// Pushes a far-endpoint predicate out of the `Filter` above a variable-length expansion and into the
+/// expansion itself (`rmp` task #870, part b).
+///
+/// # The gap this closes
+///
+/// `MATCH (u:USER {uidn: 9})-[:FOLLOWS*1..2]->(v:USER) WHERE v.uidn = 100` planned
+/// `Filter((v:USER AND v.uidn = 100))` **above** `ExpandAll`. The expansion therefore built a row per
+/// trail — cloning the driving row and materialising the traversed-relationship list into it — for the
+/// entire two-hop frontier, and the `Filter` then discarded nearly all of them. The predicate reads
+/// nothing but `v`, so it can be decided the moment the walk reaches a candidate end node, before any
+/// row exists.
+///
+/// This does **not** prune the walk, and must not: a node that fails the predicate can still lie on
+/// the path to one that passes, so the traversal is unchanged and only the *emission* is filtered.
+/// The saving is the rows never built, not edges never read.
+///
+/// # Why it preserves the result bag
+///
+/// The whole `Filter` predicate is moved, unchanged, onto the operator directly below it, and is
+/// evaluated on exactly the same candidate `(driving row, end node)` pairs, in the same order, through
+/// the same [`predicate_truth`](crate::executor) the `Filter` uses. Three gates make that equality
+/// hold rather than merely look plausible:
+///
+/// 1. **Confined to `to`.** [`expr_confined_to`] certifies that the conjunct reads no variable other
+///    than the far endpoint — so evaluating it against a row that binds only that endpoint is the same
+///    act as evaluating it against the full row. It also refuses every scope-opening or graph-reading
+///    form (comprehensions, quantifiers, `EXISTS {}` / `COUNT {}` / `COLLECT {}`), whose free-variable
+///    set is not the syntactic one.
+/// 2. **Pure per row.** [`crate::morsel::is_pure_per_row_expr`] certifies the conjunct is
+///    deterministic and cross-row-free. It is the gate that matters once part (a) may collapse
+///    duplicate candidates: `rand()` reads no variable and would pass gate 1, but evaluating it once
+///    per end node instead of once per trail is a different query.
+/// 3. **All conjuncts or none.** A `Filter` is pushed only when **every** conjunct qualifies; a single
+///    one that does not leaves the whole `Filter` alone. A *partial* push is not merely less
+///    profitable, it is unsound, and in both directions. `crate::eval` short-circuits `AND` on `FALSE`
+///    only — deliberately, so a right-hand type error surfaces consistently — so (i) a pushed conjunct
+///    hoisted *over* an unpushed predecessor stops being evaluated on that predecessor's `NULL` rows,
+///    and (ii) an unpushed conjunct demoted *below* a pushed one stops being evaluated on the pushed
+///    one's `NULL` rows. Either way an error the query used to raise disappears. Concretely, for (ii):
+///    `WHERE v.a = 1 AND u.k / v.z > 0` with `v.a` absent and `v.z = 0` raises a division-by-zero
+///    today, and would silently return no rows if `v.a = 1` alone were pushed. Moving the predicate
+///    whole has no such seam. (`rmp` #869 settled the mirror-image point for semi-joins.)
+///
+/// The pushdown is therefore **total**: the `Filter` disappears entirely, and no residual copy is
+/// needed precisely because gates 1-3 prove the two evaluations agree. Where they cannot be proven,
+/// nothing moves.
+///
+/// Declines, each leaving the plan exactly as it was: a fixed-length hop (`range: None` — its
+/// relationship variable binds one relationship and its predicates are already ordinary filters),
+/// an [`ExpandInto`](PhysicalOp::ExpandInto) (`to` is bound by the input, so `crate::physical`'s
+/// existing pushdown already carries the predicate *below* the operator), and an expansion that
+/// already carries a `to_predicate`.
+///
+/// A relationship variable that arrives **already bound** is deliberately *not* a decline here: that
+/// traversal takes a different branch in `crate::executor`, which applies the predicate over the rows
+/// it produced. Same rows, just without the saving.
+fn push_endpoint_predicates_into_var_expands(op: PhysicalOp) -> PhysicalOp {
+    let op = map_children(op, &push_endpoint_predicates_into_var_expands);
+    let PhysicalOp::Filter { input, predicate } = op else {
+        return op;
+    };
+    // Only a variable-length expand-all can host the predicate, and only if it has none already.
+    let hostable = matches!(
+        input.as_ref(),
+        PhysicalOp::ExpandAll {
+            range: Some(_),
+            to_predicate: None,
+            ..
+        }
+    );
+    if !hostable {
+        return PhysicalOp::Filter { input, predicate };
+    }
+    let PhysicalOp::ExpandAll { to, .. } = input.as_ref() else {
+        unreachable!("INVARIANT: `hostable` matched an ExpandAll immediately above")
+    };
+    let visible = [to.name.as_str()];
+    // Gate 3: EVERY conjunct must qualify, or the `Filter` stays exactly where it is. Splitting one
+    // off would reorder it against the others, and `AND` short-circuits on `FALSE` only.
+    let qualifies = split_conjuncts(&predicate)
+        .iter()
+        .all(|c| expr_confined_to(c, &visible) && crate::morsel::is_pure_per_row_expr(c));
+    if !qualifies {
+        return PhysicalOp::Filter { input, predicate };
+    }
+    let PhysicalOp::ExpandAll {
+        input,
+        from,
+        relationship,
+        to,
+        direction,
+        types,
+        range,
+        prior_rels,
+        rel_props,
+        to_predicate: _,
+        pruning,
+    } = *input
+    else {
+        unreachable!("INVARIANT: `hostable` matched an ExpandAll immediately above")
+    };
+    // The predicate moves WHOLE — the same expression, not a re-joined subset — so the operator
+    // evaluates byte-for-byte what the `Filter` evaluated.
+    PhysicalOp::ExpandAll {
+        input,
+        from,
+        relationship,
+        to,
+        direction,
+        types,
+        range,
+        prior_rels,
+        rel_props,
+        to_predicate: Some(predicate),
+        pruning,
+    }
+}
+
+/// Replaces a variable-length trail enumeration with a walk that emits each reachable **end node
+/// once**, when the plan above provably consumes nothing but that node (`rmp` task #870, part a).
+///
+/// # The gap this closes
+///
+/// `MATCH (u:USER {uidn: 9})-[:FOLLOWS*1..3]->(v:USER) RETURN count(DISTINCT v)` enumerated every
+/// *path*, one row each, to answer a question about *nodes*. On a dense graph the path count grows
+/// like the branching factor to the power of the hop bound while the node count is bounded by the
+/// component, so the work the plan did was asymptotically larger than the work the answer needed.
+/// (Neo4j plans `VarLengthExpand(Pruning)` for exactly this shape.)
+///
+/// # What the pruning walk is
+///
+/// The **same** depth-first trail walk (`crate::executor`), with two additions: a per-node memo of the
+/// shallowest depth at which the node has been expanded — a node reached again at that depth or deeper
+/// is not expanded a second time — and an emitted-node set, so each end node produces one row. Trail
+/// (relationship-uniqueness) semantics are kept exactly: the walk still refuses to traverse a
+/// relationship already on the current path. Nothing about which relationships may be traversed
+/// changes; only how often a node's subtree is re-explored.
+///
+/// # Why the emitted node set is unchanged — the isomorphism argument
+///
+/// Write `G` for the graph the walk actually sees: the relationships passing the direction, type and
+/// `rel_props` filters, minus the `prior_rels` the surrounding pattern has already consumed. The plain
+/// walk emits `{ y : some trail from the anchor to y has length in [min, max] }`. Two directions.
+///
+/// **Soundness.** Every row the pruning walk emits is emitted from a real arrival, reached along a
+/// path on which no relationship repeats and whose depth lies in `[min, max]` — i.e. a genuine trail.
+/// So the pruned set is a subset. Pruning can only ever *withhold* work, never invent an end node.
+///
+/// **Completeness** rests on one invariant, proved by induction on the shortest-path distance `k` in
+/// `G`: *if `dist(anchor, y) = k <= max` then the walk reaches `y` at some depth `<= k`, and (for
+/// `k < max`) expands it at some depth `<= k`.* For `k = 0` this is the anchor. For `k >= 1` take `y`'s
+/// predecessor `p` on a shortest path; by induction `p` is expanded at some depth `d <= k-1 < max`, so
+/// its expansion runs. Let `r` be the edge `p—y`. Either `r` is not on the trail that reached `p`, and
+/// the expansion traverses it, reaching `y` at depth `d+1 <= k`; or `r` *is* on that trail, in which
+/// case the trail already passes through `y` and `y` was reached even earlier. Either way `y` is
+/// reached at depth `<= k`. ∎
+///
+/// From the invariant: any `y` with a trail of length `L in [min, max]` has `dist(anchor, y) <= L <= max`
+/// (a trail is a walk, and a walk contains a path no longer than itself), so `y` is reached. For
+/// `y != anchor` every arrival is at depth `>= 1 >= min`, so it is emitted.
+///
+/// **The anchor is the case that decides the `min <= 1` gate**, and it is decided in both directions:
+///
+/// * With `min >= 2` the rewrite is **unsound and is refused**. Concretely: `-[*3..3]->` on
+///   `a->n1->n2->y` where `n2` is also a direct neighbour of `a`. Expanding `n2` at depth 1 reaches `y`
+///   at depth 2, which is below `min` and so emits nothing; the memo then refuses to expand `n2` again
+///   at depth 2, and the depth-3 arrival at `y` that the plain walk emits never happens. The pruning
+///   memo is a statement about *reachability*, and `min >= 2` makes emission depend on the exact depth,
+///   which reachability does not preserve. Hence the gate.
+/// * With `min <= 1` the anchor is handled. `min = 0` emits it at depth 0. For `min = 1` it must be
+///   emitted exactly when a closed trail through it of length in `[1, max]` exists. Take a minimal such
+///   trail (minimal, so it visits the anchor only at its ends) `a -r1- w1 - … - u -rL- a`. If `L = 1`
+///   it is a self-loop and expanding the anchor traverses it. Otherwise `dist(a, u) <= L-1`, so by the
+///   invariant `u` is expanded at some depth `<= L-1 < max`, along a trail `P`.
+///
+///   Here the load-bearing fact is that the anchor is expanded **only at depth 0** — the memo's
+///   smallest possible value, so the prune always fires on any later arrival. The walk therefore never
+///   *continues* from the anchor after position 0, which means **no explored trail has the anchor as an
+///   interior vertex**. (It may perfectly well *end* at the anchor — that is exactly how the anchor
+///   gets emitted, and stating the fact as "no trail contains the anchor except at position 0" would be
+///   false.) Since `P` ends at `u != a`, the anchor appears in `P` only at position 0, so `P` can
+///   contain `rL` only as its *first* edge — i.e. only if `P = a -rL- u`.
+///
+///   When it does not, the expansion of `u` traverses `rL` and the anchor is reached at depth
+///   `<= L <= max`. When it does, the same argument applied to `w1` and `r1` gives the anchor unless
+///   `w1` too was first reached directly, at depth 1 — and those two cannot both hold: depth-first
+///   order explores whichever of `r1`, `rL` the anchor offers first *to exhaustion*, and the trail's
+///   interior is a path between `w1` and `u` avoiding the anchor, so that first subtree reaches the
+///   other endpoint at depth `<= L-1` and expands it there, strictly before the direct depth-1 arrival
+///   it was assumed to have.
+///
+/// The argument was also checked by differential search against a brute-force trail enumerator, over
+/// multigraphs with self-loops and parallel edges, in both traversal directions, across many per-node
+/// incidence orderings and every `max` from 0 to unbounded. The exhaustive six-edge tier alone —
+/// every graph on up to 5 vertices with 6 edges — made **161,068,880 comparisons with zero
+/// disagreements and zero soundness violations for `min <= 1`**, and reported **30,658,122**
+/// disagreements for `min >= 2`. That control is what makes the lower-bound gate a requirement rather
+/// than a precaution; its minimal witness is two parallel self-loops on the anchor with `*2..2`, where
+/// the trail "loop A then loop B" reaches the anchor at depth 2 but the pruning walk, having expanded
+/// the anchor at depth 0, never descends far enough to see it.
+///
+/// # Why the row bag above is unchanged
+///
+/// Pruning changes only the **multiplicity** of each `(driving row, end node)` pair — from "one per
+/// trail" to exactly one — and it removes the relationship-list binding. So the rewrite is legal for a
+/// consumer that is insensitive to both, which is what the gates below establish:
+///
+/// 0. **Nothing above the consumer can observe row order.** Pruning changes the order in which end
+///    nodes are first reached (see below), so it is only legal where that order is not part of the
+///    answer. Two cases qualify, and nothing else: the consumer is the **plan root** — its rows go
+///    straight to the client, and a Cypher result without `ORDER BY` has no defined row order, so the
+///    multiset is the whole contract — or the consumer is a **global aggregation** (no group keys),
+///    which emits exactly one row, and one row has no order to observe. This gate is what stops
+///    `… WITH DISTINCT v RETURN collect(v.id)`, where a `collect` above a `DISTINCT` projection would
+///    put the changed order *inside* a row and change the answer.
+/// 1. **The consumer is a projection boundary.** Only a `DISTINCT` [`Projection`](PhysicalOp::Projection)
+///    or an [`Aggregation`](PhysicalOp::Aggregation) qualifies, and both **reset the visible column set
+///    to their own output** (`04 §7.3`; [`gather_bound_vars`] implements the rule, and
+///    `crate::executor` builds a fresh row from the projected items). That is what makes the gate
+///    *local*: if the relationship variable is neither read by the consumer nor among its output
+///    aliases, then no operator anywhere above it can reach that variable, and no whole-plan scan is
+///    needed to know so.
+/// 2. **Only `Filter`s between consumer and expansion**, none of which reads the relationship variable.
+///    This is what refuses every shape that would consume the trail: a `NamedPath` binding
+///    `MATCH p = …` sits exactly there, and so does the next hop of the same pattern — whose
+///    `prior_rels` carries this hop's relationship variable for isomorphism, and which must therefore
+///    keep seeing the individual trails.
+/// 3. **A `DISTINCT` projection**: no item reads the relationship variable, and no output alias is it.
+///    `DISTINCT` makes the result the *set* of projected tuples; each tuple is a function of the
+///    driving row and the end node; and the *set* of those pairs is exactly what pruning preserves.
+/// 4. **An aggregation whose every aggregate is insensitive to duplicates *and to order***, no group
+///    key or aggregate argument reads the relationship variable, and no output alias is it. Both the
+///    grouping key and each argument are functions of the pair, so duplicate pairs contribute nothing —
+///    but order is the second, sharper requirement, and
+///    [`is_order_and_multiplicity_insensitive_aggregate`] is where the whitelist and the measured
+///    counterexample live.
+/// 5. **`min <= 1`**, per the isomorphism argument above.
+/// 6. **The input does not already bind the relationship variable.** A relationship variable arriving
+///    bound (`MATCH ()-[r*]-() MATCH (a)-[r*]->(b)`) constrains the traversal to that exact list and
+///    takes a different path in `crate::executor` entirely.
+///
+/// # What this rewrite does change: the order of an unordered result
+///
+/// Pruning does **not** preserve the order in which end nodes are first reached. Cutting a subtree can
+/// delay a node's first arrival past another's, so a root `DISTINCT` projection may return the same
+/// rows in a different order ([`is_order_and_multiplicity_insensitive_aggregate`] documents the
+/// concrete five-edge graph that exhibits it). That is the one observable difference, and it is inside
+/// the contract: a Cypher result without `ORDER BY` has no defined row order, and the *multiset* of
+/// rows is preserved exactly.
+///
+/// Gates 0 and 4 are what confine it to that. The moment a row order becomes a **value** — a list built
+/// by `collect`, a float sum accumulated in encounter order — or a **selection** — a `LIMIT` over an
+/// unordered result — the multiset guarantee binds again, and the rewrite declines.
+fn prune_var_length_expands(root: PhysicalOp) -> PhysicalOp {
+    prune_var_length_expands_below(root, true)
+}
+
+/// The recursion behind [`prune_var_length_expands`]; `is_root` is `true` only for the plan's own
+/// root operator (gate 0).
+fn prune_var_length_expands_below(op: PhysicalOp, is_root: bool) -> PhysicalOp {
+    let op = map_children(op, &|child| prune_var_length_expands_below(child, false));
+    // Gates 0, 1, 3 and 4: the consumer, by shape, by what it reads, and by whether anything above it
+    // can observe the order of the rows it emits.
+    let (reads, aliases): (Vec<&Expr>, Vec<&str>) = match &op {
+        PhysicalOp::Projection {
+            items,
+            distinct: true,
+            ..
+        } if is_root => (
+            items.iter().map(|c| &c.expr).collect(),
+            items.iter().map(|c| c.alias.as_str()).collect(),
+        ),
+        PhysicalOp::Aggregation {
+            group_keys,
+            aggregates,
+            ..
+        } if (is_root || group_keys.is_empty())
+            && aggregates
+                .iter()
+                .all(|a| is_order_and_multiplicity_insensitive_aggregate(&a.expr)) =>
+        {
+            (
+                group_keys
+                    .iter()
+                    .chain(aggregates)
+                    .map(|c| &c.expr)
+                    .collect(),
+                group_keys
+                    .iter()
+                    .chain(aggregates)
+                    .map(|c| c.alias.as_str())
+                    .collect(),
+            )
+        }
+        _ => return op,
+    };
+    // Gate 2: only `Filter`s between the consumer and the expansion.
+    let mut cursor = match &op {
+        PhysicalOp::Projection { input, .. } | PhysicalOp::Aggregation { input, .. } => {
+            input.as_ref()
+        }
+        _ => unreachable!("INVARIANT: the match above admitted only these two operators"),
+    };
+    let mut between: Vec<&Expr> = Vec::new();
+    while let PhysicalOp::Filter { input, predicate } = cursor {
+        between.push(predicate);
+        cursor = input.as_ref();
+    }
+    let PhysicalOp::ExpandAll {
+        input,
+        relationship,
+        range: Some(range),
+        pruning: false,
+        ..
+    } = cursor
+    else {
+        return op;
+    };
+    // Gate 5: the lower bound. `VarLengthRange::min` defaults to openCypher's implicit `1`.
+    if range.min.unwrap_or(1) > 1 {
+        return op;
+    }
+    // Gate 6: a relationship variable arriving already bound is a different traversal.
+    let rel = relationship.name.clone();
+    if bound_var_names(input).contains(&rel) {
+        return op;
+    }
+    // Gates 1/3/4, concluded: the trail must be invisible to the consumer, to every `Filter` in
+    // between, and to everything above (which the projection boundary reduces to "not an output
+    // alias").
+    if reads
+        .into_iter()
+        .chain(between)
+        .any(|e| expr_references_var(e, &rel))
+        || aliases.iter().any(|a| *a == rel)
+    {
+        return op;
+    }
+    set_pruning(op, &rel)
+}
+
+/// Whether `expr` is an aggregate whose value is unchanged both by **duplicate** input rows and by the
+/// **order** they arrive in — the only aggregate shape [`prune_var_length_expands`] admits (its gate 4).
+///
+/// Both properties are required, and the second is the one that is easy to get wrong. Pruning collapses
+/// duplicate `(driving row, end node)` pairs, so a multiplicity-sensitive fold is obviously out. It also
+/// changes the *encounter order* of the surviving rows, which is less obvious and was **measured**, not
+/// assumed: on the five-edge graph
+/// `(0)->(5), (5)->(5), (5)->(2), (5)->(4), (2)->(1)` with `-[:E*1..3]->`, the plain walk first reaches
+/// `4` through the self-loop at `5` and reports `[5, 2, 4, 1]`, while the pruning walk declines to
+/// re-expand `5` and reports `[5, 2, 1, 4]`. The two are the same *set* and a different *list*.
+///
+/// So the admitted set is a whitelist of exactly one form:
+///
+/// * `count(DISTINCT e)` — folds a set to its **size**. Neither a duplicate nor an encounter order can
+///   reach an integer count: it names no element, so it cannot name the wrong one.
+///
+/// Everything else declines, and the near misses are worth naming, because most of them look safe.
+///
+/// * `collect(DISTINCT e)` returns a **list**, whose order is part of the row — the counterexample
+///   above.
+/// * `sum(DISTINCT e)` / `avg(DISTINCT e)` fold floats (and a *saturating* integer `sum`), which is
+///   order-dependent at the last bit.
+/// * `min(e)` / `max(e)` look like the archetype of an order-immune fold, and are **not** admitted —
+///   conservatively, not because they are known to be wrong. The accumulator replaces only on a
+///   *strict* comparison, so among values that compare `Equal` the first encountered wins, and a fold
+///   that can name a *representative* is only order-immune if the comparator never calls two
+///   distinguishable values equal. That is a property of `crate::ordering`, not of the fold. Measured
+///   today it holds — `min` over `[1, 1.0]` and over `[1.0, 1]` both return `Integer(1)`, and `max`
+///   both return `Float(1.0)`, so `min`/`max` would in fact be safe right now. The whitelist admits
+///   only `count(DISTINCT …)` anyway, because that one is safe *by the shape of the fold*: it returns a
+///   size, so there is no representative to pick and no comparator change can make it wrong. Widening
+///   the whitelist would move that guarantee from this function into a distant module.
+/// * `count(e)`, `count(*)` and `collect(e)` are multiplicity-sensitive outright.
+/// * A *composite* column such as `size(collect(DISTINCT v)) + 1` is not certified: the outer
+///   expression is not an aggregate fold and this function is not in a position to reason about it.
+fn is_order_and_multiplicity_insensitive_aggregate(expr: &Expr) -> bool {
+    let ExprKind::FunctionCall {
+        name,
+        distinct,
+        args,
+    } = &expr.kind
+    else {
+        // `count(*)` (`ExprKind::CountStar`) has no argument to de-duplicate, and anything that is not
+        // a bare call is not an aggregate fold this function can certify.
+        return false;
+    };
+    *distinct && args.len() == 1 && name.join(".").eq_ignore_ascii_case("count")
+}
+
+/// Sets `pruning` on the unique variable-length [`ExpandAll`](PhysicalOp::ExpandAll) below `op` that
+/// binds `rel`, leaving every other operator untouched.
+///
+/// Split out from [`prune_var_length_expands`] so the recognition can inspect the subtree by reference
+/// — and decline without having disassembled anything — while the rewrite consumes it.
+///
+/// The descent is a full [`map_children`] walk rather than a walk down the `Filter` spine the caller
+/// just validated, so it would in principle visit sibling branches too. It cannot mark the wrong
+/// operator: a relationship variable is bound exactly once in a plan, so at most one expansion carries
+/// this name. (The caller's gate 2 has in any case already established that the spine from the consumer
+/// to the expansion is linear.)
+fn set_pruning(op: PhysicalOp, rel: &str) -> PhysicalOp {
+    let hit = matches!(
+        &op,
+        PhysicalOp::ExpandAll { relationship, range: Some(_), .. } if relationship.name == rel
+    );
+    if !hit {
+        return map_children(op, &|child| set_pruning(child, rel));
+    }
+    let PhysicalOp::ExpandAll {
+        input,
+        from,
+        relationship,
+        to,
+        direction,
+        types,
+        range,
+        prior_rels,
+        rel_props,
+        to_predicate,
+        pruning: _,
+    } = op
+    else {
+        unreachable!("INVARIANT: `hit` matched a variable-length ExpandAll binding `rel`")
+    };
+    PhysicalOp::ExpandAll {
+        input,
+        from,
+        relationship,
+        to,
+        direction,
+        types,
+        range,
+        prior_rels,
+        rel_props,
+        to_predicate,
+        pruning: true,
     }
 }
 
@@ -5155,11 +5656,20 @@ fn reverse_expand_alternative(op: &PhysicalOp, catalog: &IndexCatalog) -> Option
         range,
         prior_rels,
         rel_props,
+        to_predicate,
+        pruning,
     } = cursor
     else {
         return None;
     };
-    if range.is_some() || !prior_rels.is_empty() || rel_props.is_some() {
+    // `rmp` #870's state is variable-length-only, so `range.is_some()` already covers it; naming it
+    // keeps the decline explicit rather than incidental.
+    if range.is_some()
+        || !prior_rels.is_empty()
+        || rel_props.is_some()
+        || to_predicate.is_some()
+        || *pruning
+    {
         return None;
     }
 
@@ -5206,6 +5716,8 @@ fn reverse_expand_alternative(op: &PhysicalOp, catalog: &IndexCatalog) -> Option
         range: None,
         prior_rels: Vec::new(),
         rel_props: None,
+        to_predicate: None,
+        pruning: false,
     };
 
     // Re-apply, as a single residual `Filter` above the reversed expand: every conjunct *except* the
@@ -5287,10 +5799,14 @@ fn recognise_expand_chain(op: &PhysicalOp) -> Option<ExpandChain> {
                 range,
                 prior_rels,
                 rel_props,
+                to_predicate,
+                pruning,
             } => {
                 // A variable-length range or an inline relationship-property map changes what
-                // "anchor at the other end" means, so such a hop is not re-anchorable.
-                if range.is_some() || rel_props.is_some() {
+                // "anchor at the other end" means, so such a hop is not re-anchorable. The `rmp` #870
+                // state rides on a variable-length hop only, so the first test already covers it; it is
+                // named because re-anchoring rebuilds the hop and would otherwise drop it.
+                if range.is_some() || rel_props.is_some() || to_predicate.is_some() || *pruning {
                     return None;
                 }
                 hops_rev.push((
@@ -5468,6 +5984,8 @@ impl ExpandChain {
                 range: None,
                 prior_rels: prior.clone(),
                 rel_props: None,
+                to_predicate: None,
+                pruning: false,
             };
             prior.push(hop.relationship.clone());
         }
@@ -5998,9 +6516,15 @@ fn op_expressions(op: &PhysicalOp) -> Vec<&Expr> {
             right_key,
             ..
         } => vec![left_key, right_key],
-        PhysicalOp::ExpandAll { rel_props, .. } | PhysicalOp::ExpandInto { rel_props, .. } => {
-            rel_props.iter().collect()
-        }
+        // `rmp` #870b: the far-endpoint predicate is evaluated BY the expansion (that is the point of
+        // pushing it down), exactly as a `Filter`'s predicate is by the `Filter` — so it is one of this
+        // operator's own expressions and its property references count here.
+        PhysicalOp::ExpandAll {
+            rel_props,
+            to_predicate,
+            ..
+        } => rel_props.iter().chain(to_predicate.iter()).collect(),
+        PhysicalOp::ExpandInto { rel_props, .. } => rel_props.iter().collect(),
         PhysicalOp::QuantifiedPath {
             interior_predicate, ..
         } => interior_predicate.iter().collect(),
@@ -6426,6 +6950,8 @@ fn map_children(op: PhysicalOp, f: &dyn Fn(PhysicalOp) -> PhysicalOp) -> Physica
             range,
             prior_rels,
             rel_props,
+            to_predicate,
+            pruning,
         } => PhysicalOp::ExpandAll {
             input: go(input),
             from,
@@ -6436,6 +6962,8 @@ fn map_children(op: PhysicalOp, f: &dyn Fn(PhysicalOp) -> PhysicalOp) -> Physica
             range,
             prior_rels,
             rel_props,
+            to_predicate,
+            pruning,
         },
         PhysicalOp::ExpandInto {
             input,
@@ -8701,9 +9229,22 @@ fn gather_bound_vars(plan: &PhysicalOp, out: &mut Vec<Var>) {
             input,
             relationship,
             to,
+            pruning,
             ..
+        } => {
+            gather_bound_vars(input, out);
+            // `rmp` #870a: the pruning walk enumerates distinct END NODES, so it binds no relationship
+            // list at all — and saying so here is not cosmetic. `identifiers()` reports it to the
+            // client, and the planner's own bound-variable analysis (join-key inference,
+            // expand-into detection) must not believe a column exists that no row carries. The rewrite
+            // only fires when nothing above reads that variable, which is what makes omitting it safe;
+            // see `prune_var_length_expands`.
+            if !*pruning {
+                push_unique(out, relationship.clone());
+            }
+            push_unique(out, to.clone());
         }
-        | PhysicalOp::ExpandInto {
+        PhysicalOp::ExpandInto {
             input,
             relationship,
             to,
@@ -9145,15 +9686,34 @@ impl PhysicalOp {
                 types,
                 range,
                 prior_rels: _,
-                rel_props: _,
+                rel_props,
+                to_predicate,
+                pruning,
             } => {
+                // `rmp` #870a: a pruning walk binds no relationship list, so it renders none — the
+                // detail line states what the operator actually produces. `rel_props` and
+                // `to_predicate` are rendered because the expansion really evaluates them: a plan
+                // description that hid them would understate the work and, worse, make an `EXPLAIN`
+                // of two differently-filtered queries look identical.
                 writeln!(
                     f,
-                    "ExpandAll({from}){}{relationship}{}{}{}({to})",
+                    "{}({from}){}{}{}{}{}{}({to}){}",
+                    self.operator_type(),
                     h::arrow_left(*direction),
+                    if *pruning {
+                        String::new()
+                    } else {
+                        relationship.to_string()
+                    },
                     h::types(types),
                     h::range(range),
+                    rel_props
+                        .as_ref()
+                        .map_or_else(String::new, |p| format!(" {}", h::expr(p))),
                     h::arrow_right(*direction),
+                    to_predicate
+                        .as_ref()
+                        .map_or_else(String::new, |p| format!(" WHERE {}", h::expr(p))),
                 )?;
                 input.fmt_indented(f, depth + 1)
             }
@@ -11500,6 +12060,8 @@ mod tests {
                 range: None,
                 prior_rels: Vec::new(),
                 rel_props: None,
+                to_predicate: None,
+                pruning: false,
             }),
             null_variables: vec![Var::named("r"), Var::named("b")],
         }

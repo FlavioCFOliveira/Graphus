@@ -400,6 +400,15 @@ enum Operator {
         /// A var-length hop's inline relationship-property map, applied to **each** relationship of
         /// the path during expansion (`None` for a fixed-length hop).
         rel_props: Option<Expr>,
+        /// A predicate on the far endpoint, decided as each candidate end node is reached rather than
+        /// by a `Filter` above the operator (`rmp` task #870, part b). The planner sets it only for a
+        /// predicate that reads nothing but `to` and is pure per row, so it is evaluated against a
+        /// one-column probe row binding just that endpoint.
+        to_predicate: Option<Expr>,
+        /// `true` for the **pruning** variable-length walk (`rmp` task #870, part a): emit each
+        /// reachable end node once instead of one row per trail. The planner sets it only when the
+        /// plan above provably consumes nothing but the distinct end node.
+        pruning: bool,
         pending: VecDeque<Row>,
     },
 
@@ -856,6 +865,8 @@ impl Operator {
                 range,
                 prior_rels,
                 rel_props,
+                to_predicate,
+                pruning,
                 pending,
             } => loop {
                 if let Some(row) = pending.pop_front() {
@@ -882,6 +893,12 @@ impl Operator {
                         ctx,
                         pending,
                     )?;
+                    // `rmp` #870b: this traversal does not go through the walk that applies the
+                    // far-endpoint predicate, so it is applied here instead. The planner declines to
+                    // set `to_predicate` for a shape that can reach this branch, so this is a belt
+                    // rather than a load-bearing path — but a predicate silently skipped would be a
+                    // wrong answer, and that is not something to leave to a plan-time gate alone.
+                    retain_rows_satisfying(pending, to_predicate.as_ref(), ctx)?;
                 } else if let Some(range) = range {
                     var_expand_into_pending(
                         &base,
@@ -894,6 +911,8 @@ impl Operator {
                         *range,
                         prior_rels,
                         rel_props.as_ref(),
+                        to_predicate.as_ref(),
+                        *pruning && !*into,
                         ctx,
                         pending,
                     )?;
@@ -910,6 +929,9 @@ impl Operator {
                         ctx,
                         pending,
                     )?;
+                    // As above: a fixed-length hop never carries a `to_predicate` today, and if one
+                    // ever arrives here it is honoured rather than dropped.
+                    retain_rows_satisfying(pending, to_predicate.as_ref(), ctx)?;
                 }
             },
 
@@ -1677,6 +1699,32 @@ impl VarExpandFrame {
 /// [`VarExpandFrame`]s, `rmp` #656): a long chain recurses `O(path length)` deep, which overflowed the
 /// finite worker-thread stack and aborted the whole process — the heap stack removes that failure mode
 /// entirely, and a [`PendingBudget`] bounds the trail-path materialisation.
+///
+/// # `to_predicate` — the far-endpoint predicate (`rmp` task #870, part b)
+///
+/// When present, a candidate end node must satisfy it for the trail to be emitted. It is decided
+/// *before* the row is built, against a one-column probe row binding only `to` — which the planner's
+/// confinement gate is what makes equivalent to deciding it on the full row. It never prunes the walk:
+/// a node that fails it can still lie on the path to one that passes, so the traversal is untouched
+/// and only the emission is filtered.
+///
+/// # `pruning` — the distinct-end-node walk (`rmp` task #870, part a)
+///
+/// When `true` the walk emits each reachable end node **once** rather than one row per trail, and
+/// declines to expand a node it has already expanded at the same depth or shallower. Two details are
+/// load-bearing and easy to "simplify" away:
+///
+/// * **Emission is never pruned.** A node whose subtree is skipped is still *reached*, and reaching it
+///   is what emits it. Gating emission on the memo would lose end nodes.
+/// * **Re-expansion on a strictly shallower arrival is required.** The memo is a depth, not a visited
+///   flag: a node first met deep and later met shallow must be expanded again, because the second
+///   arrival carries more remaining budget. A plain visited set breaks completeness at finite `max`.
+///
+/// The emitted **set** is exactly the plain walk's; the **order** is not — cutting a subtree can delay
+/// a node's first arrival past another's. The planner is what keeps that unobservable. No relationship
+/// variable is bound either, because a pruning walk represents no single trail. The soundness argument
+/// — including why the rewrite is refused for `min >= 2` — lives on
+/// `crate::physical::prune_var_length_expands`.
 #[allow(clippy::too_many_arguments)]
 fn var_expand_into_pending(
     base: &Row,
@@ -1689,6 +1737,8 @@ fn var_expand_into_pending(
     range: VarLengthRange,
     prior_rels: &[Var],
     rel_props: Option<&Expr>,
+    to_predicate: Option<&Expr>,
+    pruning: bool,
     ctx: &mut Ctx<'_>,
     pending: &mut VecDeque<Row>,
 ) -> Result<(), ExecError> {
@@ -1719,6 +1769,25 @@ fn var_expand_into_pending(
     let mut budget = PendingBudget::new();
     let mut trail: Vec<RelId> = Vec::new();
     let mut stack: Vec<VarExpandFrame> = vec![VarExpandFrame::enter(0, anchor)];
+    // `rmp` #870a, both empty (and allocation-free) unless the pruning walk is in force. `decided`
+    // records the end nodes whose emission verdict is already settled — emitted, or rejected by
+    // `to_predicate` — so each contributes at most one row and the predicate runs at most once per
+    // node. `expanded_at` records the shallowest depth at which a node's subtree has been explored;
+    // reaching it again no shallower explores nothing new.
+    //
+    // Both grow with the number of *reachable nodes*, which the `PendingBudget` below does not cover
+    // (it bounds materialised rows). That is deliberate and is a strict improvement on what it
+    // replaces: the plain walk holds one row per *trail*, which on the graphs this rewrite targets is
+    // exponentially larger than one `u64` per node.
+    let mut decided: rustc_hash::FxHashSet<NodeId> = rustc_hash::FxHashSet::default();
+    let mut expanded_at: rustc_hash::FxHashMap<NodeId, u64> = rustc_hash::FxHashMap::default();
+    // The far-endpoint predicate's probe row, hoisted out of the walk: its schema is one column and
+    // never changes, so only the value is re-pointed per candidate (`end_node_satisfies`).
+    let mut probe = to_predicate.map(|_| {
+        let mut row = Row::empty();
+        row.set(to.name.clone(), RowValue::Node(NodeRef { id: anchor }));
+        row
+    });
 
     while let Some(mut frame) = stack.pop() {
         ctx.check_cancelled()?;
@@ -1726,30 +1795,70 @@ fn var_expand_into_pending(
         // First visit of this node: emit the trail reaching it (if within `[min, max]` and, for
         // expand-into, ending at the bound target), then resolve its incident relationships.
         if frame.incidents.is_none() {
-            if frame.depth >= min && (!into || Some(frame.current) == target) {
-                let mut row = base.clone();
-                row.set(
-                    relationship.name.clone(),
-                    RowValue::list(
-                        trail
-                            .iter()
-                            .map(|&id| RowValue::Rel(RelRef { id }))
-                            .collect(),
-                    ),
-                );
-                if !into {
-                    row.set(
-                        to.name.clone(),
-                        RowValue::Node(NodeRef { id: frame.current }),
-                    );
+            // A pruning walk decides each end node once; `decided` is empty otherwise, so the plain
+            // walk's condition is unchanged.
+            let fresh = !pruning || !decided.contains(&frame.current);
+            if fresh && frame.depth >= min && (!into || Some(frame.current) == target) {
+                // `rmp` #870b: the far-endpoint predicate, decided BEFORE the row is built — that is
+                // the saving. Confined to `to` by the planner, so a probe row binding only `to` is the
+                // same evaluation as on the full row.
+                let keep = match (to_predicate, probe.as_mut()) {
+                    (Some(pred), Some(probe)) => {
+                        end_node_satisfies(frame.current, pred, probe, ctx)?
+                    }
+                    // `probe` is built exactly when `to_predicate` is `Some`, so the mixed cases
+                    // cannot occur; "no predicate" is the only real alternative.
+                    _ => true,
+                };
+                if pruning {
+                    decided.insert(frame.current);
                 }
-                budget.charge(&row)?;
-                pending.push_back(row);
+                if keep {
+                    let mut row = base.clone();
+                    // A pruning walk represents no single trail, so it binds no relationship list.
+                    // The planner only sets `pruning` when nothing above reads that variable.
+                    if !pruning {
+                        row.set(
+                            relationship.name.clone(),
+                            RowValue::list(
+                                trail
+                                    .iter()
+                                    .map(|&id| RowValue::Rel(RelRef { id }))
+                                    .collect(),
+                            ),
+                        );
+                    }
+                    if !into {
+                        row.set(
+                            to.name.clone(),
+                            RowValue::Node(NodeRef { id: frame.current }),
+                        );
+                    }
+                    budget.charge(&row)?;
+                    pending.push_back(row);
+                }
             }
             if max.is_some_and(|m| frame.depth >= m) {
                 // Maximum length reached: this node is a leaf, no further expansion. Its parent's
                 // trail entry (if any) is undone when the parent frame resurfaces (see `pushed`).
                 continue;
+            }
+            // `rmp` #870a: the pruning memo. Expanding this node again at the same depth or deeper
+            // reaches no node it did not already reach from here with at least as much budget, so the
+            // subtree is skipped. Emission above is deliberately NOT gated on this — a node whose
+            // subtree is pruned is still *reached*, and reaching it is what emits it.
+            if pruning {
+                match expanded_at.entry(frame.current) {
+                    std::collections::hash_map::Entry::Occupied(mut seen) => {
+                        if *seen.get() <= frame.depth {
+                            continue;
+                        }
+                        seen.insert(frame.depth);
+                    }
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(frame.depth);
+                    }
+                }
             }
             // Deduplicate self-loops reported once per side (`04 §2.4`); the trail check enforces
             // relationship uniqueness across the whole walk.
@@ -2337,6 +2446,60 @@ fn bound_rel_expand(
         );
     }
     pending.push_back(row);
+    Ok(())
+}
+
+/// Whether the candidate end node `node` satisfies the far-endpoint predicate pushed into a
+/// variable-length expansion (`rmp` task #870, part b).
+///
+/// `probe` is a **one-column row** binding only `to`, built once per driving row by the walk and
+/// re-pointed at each candidate here — the schema never changes, so this costs no allocation in a
+/// loop whose whole purpose is to avoid building rows.
+///
+/// Evaluating against a row that omits every other column is sound, and is why the planner's
+/// [confinement gate](crate::physical) is load-bearing rather than decorative: it certifies the
+/// predicate reads no variable other than `to`, so the columns this row omits are columns the
+/// predicate cannot ask for. Parameters come from `ctx`, exactly as above the operator.
+///
+/// Verdicts go through [`predicate_truth`], which is the **same** function `Operator::Filter` uses —
+/// deliberately, not incidentally. A hand-rolled `matches!(…, Boolean(true))` would agree with it on
+/// `TRUE`, `FALSE` and `NULL` and silently disagree on the fourth case: `WHERE v.flag` where
+/// `v.flag` is a string is a runtime type error, and mapping it to "row dropped" would make the same
+/// query raise or not depending on whether the predicate was pushed.
+fn end_node_satisfies(
+    node: NodeId,
+    predicate: &Expr,
+    probe: &mut Row,
+    ctx: &mut Ctx<'_>,
+) -> Result<bool, ExecError> {
+    probe.set_at(0, RowValue::Node(NodeRef { id: node }));
+    Ok(predicate_truth(predicate, probe, ctx)?.is_true())
+}
+
+/// Drops from `pending` every row whose far endpoint fails `predicate` (`rmp` task #870, part b), a
+/// no-op when there is no predicate.
+///
+/// The fallback application point for the expansion branches that do not run the trail walk (an
+/// already-bound relationship variable, a fixed-length hop). Those branches build their rows first, so
+/// this cannot save the materialisation the walk's early test does — it exists so that a predicate the
+/// planner attached is *never silently skipped*, whatever branch the operator ends up taking. `to` is
+/// already bound on every row they produce, so the predicate is evaluated against the row itself, and
+/// through the same [`predicate_truth`] a `Filter` would use.
+fn retain_rows_satisfying(
+    pending: &mut VecDeque<Row>,
+    predicate: Option<&Expr>,
+    ctx: &mut Ctx<'_>,
+) -> Result<(), ExecError> {
+    let Some(predicate) = predicate else {
+        return Ok(());
+    };
+    let mut kept = VecDeque::with_capacity(pending.len());
+    for row in std::mem::take(pending) {
+        if predicate_truth(predicate, &row, ctx)?.is_true() {
+            kept.push_back(row);
+        }
+    }
+    *pending = kept;
     Ok(())
 }
 
@@ -3329,6 +3492,8 @@ fn build_operator_unprofiled(
             range,
             prior_rels,
             rel_props,
+            to_predicate,
+            pruning,
         } => Ok(Operator::Expand {
             input: Box::new(build_operator(input, arg, ctx)?),
             from: from.clone(),
@@ -3341,6 +3506,8 @@ fn build_operator_unprofiled(
             range: *range,
             prior_rels: prior_rels.clone(),
             rel_props: rel_props.clone(),
+            to_predicate: to_predicate.clone(),
+            pruning: *pruning,
             pending: VecDeque::new(),
         }),
         PhysicalOp::ExpandInto {
@@ -3365,6 +3532,11 @@ fn build_operator_unprofiled(
             range: *range,
             prior_rels: prior_rels.clone(),
             rel_props: rel_props.clone(),
+            // `rmp` #870 rewrites only expand-ALL: an expand-into's far endpoint is bound by the
+            // input, so a predicate on it is already pushed BELOW the operator by `rmp` #857, and
+            // "distinct end nodes" is not a question the operator answers.
+            to_predicate: None,
+            pruning: false,
             pending: VecDeque::new(),
         }),
         // `rmp` task #882: the fused one-hop `OPTIONAL MATCH`. Everything the traversal needs is
@@ -5728,11 +5900,16 @@ fn try_morsel_frontier_fof_aggregate(
         range,
         prior_rels,
         rel_props,
+        to_predicate,
+        pruning,
     } = cur
     else {
         return Ok(None);
     };
-    if range.is_some() || rel_props.is_some() {
+    // `rmp` #870's two fields ride on a variable-length hop only, which `range.is_some()` already
+    // rejects; naming them keeps this tier's decline explicit, since the morsel path re-implements the
+    // expansion and would otherwise not apply them.
+    if range.is_some() || rel_props.is_some() || to_predicate.is_some() || *pruning {
         return Ok(None);
     }
     // Relationship-isomorphism with prior edges of the SAME `MATCH`: the final hop `r` must differ from
@@ -6629,12 +6806,21 @@ fn recognize_morsel_expand(op: &PhysicalOp) -> Option<MorselExpandShape<'_>> {
         range,
         prior_rels,
         rel_props,
+        to_predicate,
+        pruning,
     } = op
     else {
         return None;
     };
-    // Fixed-length, fresh single hop only (the `expand_into_pending` shape). Anything else → serial.
-    if range.is_some() || !prior_rels.is_empty() || rel_props.is_some() {
+    // Fixed-length, fresh single hop only (the `expand_into_pending` shape). Anything else → serial —
+    // including `rmp` #870's variable-length-only state, named so this tier declines it explicitly
+    // rather than by the accident of the `range` test.
+    if range.is_some()
+        || !prior_rels.is_empty()
+        || rel_props.is_some()
+        || to_predicate.is_some()
+        || *pruning
+    {
         return None;
     }
     // The input must be a bare label scan, and its scanned variable must be this expand's anchor (`from`).
