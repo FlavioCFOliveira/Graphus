@@ -58,7 +58,8 @@ use graphus_txn::{CommitRegistry, PredicateRead, Snapshot, is_visible};
 use graphus_wal::LogSink;
 
 use crate::graph_access::{
-    DeletedEntity, ExpandDirection, Incident, NodeId, RelData, RelId, ScanFilter,
+    CompositeSeekHits, DeletedEntity, ExpandDirection, Incident, IndexSeekHits, KeyValues, NodeId,
+    RelData, RelId, ScanFilter,
 };
 
 /// The conflict key for relationship physical id `id` (tagged into the high half of the SSI key
@@ -1430,6 +1431,15 @@ pub fn scan_filter_eq<S: StoreReadSource, K: ReadSink>(
 /// registers no `Equality` marker, and that is sound with no backstop: `List` declines upstream and takes
 /// the exact scan fallback; `Null`/`Map` are not equality-seekable; and `NaN` equals nothing (not even
 /// itself), so no writer can make a node match — there is no phantom to catch.
+/// # Carrying the re-checked value (`rmp` task #879)
+///
+/// The value-residual below **reads the current visible value from the store** and then throws it
+/// away. Under [`KeyValues::Carry`] it is kept instead and returned parallel to the ids, so a later
+/// `n.property` is served from the row rather than repeating that read. What is carried is precisely
+/// what the store returned through [`node_property`] — the same call, at the same point, under the
+/// same snapshot, having registered the same SIREAD marker — so it is byte-identical to what a
+/// second read would return, for every Cypher type. Nothing is decoded from an index key: the key
+/// codec is not injective (`rmp` #894) and `graphus-index` has no decoder at all.
 #[allow(clippy::too_many_arguments)] // a lifted read body; the source/ctx/sink seams are positional
 pub fn index_seek_eq_recheck<S: StoreReadSource, K: ReadSink>(
     src: &S,
@@ -1440,7 +1450,8 @@ pub fn index_seek_eq_recheck<S: StoreReadSource, K: ReadSink>(
     property: &str,
     seek: &Value,
     candidates: Vec<u64>,
-) -> Vec<NodeId> {
+    carry: KeyValues,
+) -> IndexSeekHits {
     // (2) The precise equality predicate marker. NOTE this is the SSI marker ONLY: the candidate lookup
     // upstream keys off the raw `Value`, so seek/scan *result* semantics are entirely unchanged.
     if let Ok(encoded) = encode_equality_canonical(seek) {
@@ -1456,17 +1467,25 @@ pub fn index_seek_eq_recheck<S: StoreReadSource, K: ReadSink>(
     // then the *current* value equals `seek` by Cypher equality.
     let labelled = filter_label_candidates(src, ctx, sink, label_token, candidates);
 
-    let mut out: Vec<NodeId> = labelled
-        .into_iter()
-        .filter(|id| {
-            node_property(src, ctx, sink, *id, property)
-                .is_some_and(|v| crate::equality::equals(&v, seek).is_true())
-        })
-        .collect();
-    // De-duplicate: a stale + a live index entry can name the same id twice.
-    out.sort_unstable();
-    out.dedup();
-    out
+    let mut out: Vec<(NodeId, Option<Value>)> = Vec::with_capacity(labelled.len());
+    for id in labelled {
+        let Some(value) = node_property(src, ctx, sink, id, property) else {
+            continue;
+        };
+        if crate::equality::equals(&value, seek).is_true() {
+            // `carry.keep` DROPS the value under `Discard`, right here — the discarding path never
+            // holds a second copy of the result set (`rmp` #879).
+            out.push((id, carry.keep(value)));
+        }
+    }
+    // De-duplicate: a stale + a live index entry can name the same id twice. Keyed on the id alone,
+    // so the carried value stays aligned with the id it was read from. The sort stays UNSTABLE, as
+    // before: two entries sharing an id also share their value — both came from `node_property(id,
+    // property)` in this loop, at one snapshot, with nothing writing in between — so which of them
+    // survives the dedup is unobservable.
+    out.sort_unstable_by_key(|(id, _)| *id);
+    out.dedup_by_key(|(id, _)| *id);
+    IndexSeekHits::from_pairs(out)
 }
 
 /// The **re-check half** of an indexed node-property RANGE seek (`rmp` task #768): given a candidate id
@@ -1505,7 +1524,8 @@ pub fn index_seek_range_recheck<S: StoreReadSource, K: ReadSink>(
     lower: Option<(&Value, bool)>,
     upper: Option<(&Value, bool)>,
     candidates: Vec<u64>,
-) -> Vec<NodeId> {
+    carry: KeyValues,
+) -> IndexSeekHits {
     // Preserve the exact `scan_filter_range` read footprint (`scan_nodes_by_label` → `Label` +
     // `mark_all_live_nodes`) so the index path and the scan fallback are indistinguishable to SSI.
     sink.note_predicate_read(PredicateRead::Label(label_token));
@@ -1515,17 +1535,20 @@ pub fn index_seek_range_recheck<S: StoreReadSource, K: ReadSink>(
     // which SIREAD-marks each examined id — subsumed by the blanket above — and fails closed on a read
     // fault), then the *current* value satisfies BOTH bounds under Cypher comparison semantics.
     let labelled = filter_label_candidates(src, ctx, sink, label_token, candidates);
-    let mut out: Vec<NodeId> = labelled
-        .into_iter()
-        .filter(|id| {
-            node_property(src, ctx, sink, *id, property)
-                .is_some_and(|v| crate::eval::satisfies_range(&v, lower, upper))
-        })
-        .collect();
+    let mut out: Vec<(NodeId, Option<Value>)> = Vec::with_capacity(labelled.len());
+    for id in labelled {
+        let Some(value) = node_property(src, ctx, sink, id, property) else {
+            continue;
+        };
+        if crate::eval::satisfies_range(&value, lower, upper) {
+            // The value the range residual just tested — carried under `rmp` #879, dropped otherwise.
+            out.push((id, carry.keep(value)));
+        }
+    }
     // De-duplicate: a stale + a live index entry can name the same id twice.
-    out.sort_unstable();
-    out.dedup();
-    out
+    out.sort_unstable_by_key(|(id, _)| *id);
+    out.dedup_by_key(|(id, _)| *id);
+    IndexSeekHits::from_pairs(out)
 }
 
 /// The **re-check half** of an indexed node COMPOSITE (multi-property) equality seek (`rmp` task #768):
@@ -1559,7 +1582,8 @@ pub fn index_seek_composite_recheck<S: StoreReadSource, K: ReadSink>(
     properties: &[String],
     values: &[Value],
     candidates: Vec<u64>,
-) -> Vec<NodeId> {
+    carry: KeyValues,
+) -> CompositeSeekHits {
     // Preserve the exact `scan_filter_composite_eq` read footprint (the coarse `Label` marker + the
     // blanket `mark_all_live_nodes`) so the index path and the scan fallback are indistinguishable.
     sink.note_predicate_read(PredicateRead::Label(label_token));
@@ -1570,22 +1594,31 @@ pub fn index_seek_composite_recheck<S: StoreReadSource, K: ReadSink>(
     // Cypher equality — the same test `scan_filter_composite_eq` applies, so both paths return the
     // identical set.
     let labelled = filter_label_candidates(src, ctx, sink, label_token, candidates);
-    let mut out: Vec<NodeId> = labelled
-        .into_iter()
-        .filter(|id| {
-            properties
-                .iter()
-                .zip(values.iter())
-                .all(|(property, value)| {
-                    node_property(src, ctx, sink, *id, property)
-                        .is_some_and(|v| crate::equality::equals(&v, value).is_true())
-                })
-        })
-        .collect();
+    let mut out: Vec<(NodeId, Option<Vec<Value>>)> = Vec::with_capacity(labelled.len());
+    for id in labelled {
+        // The element-wise tuple residual, still SHORT-CIRCUITING on the first key that fails: a
+        // candidate rejected on key 1 must not read keys 2..k, or the read footprint would grow.
+        // A candidate that SURVIVES has, by definition, read every key — which is exactly why the
+        // whole tuple is available to carry (`rmp` #879) at no extra cost.
+        let mut tuple: Vec<Value> = Vec::with_capacity(properties.len());
+        let mut all_match = true;
+        for (property, value) in properties.iter().zip(values.iter()) {
+            match node_property(src, ctx, sink, id, property) {
+                Some(v) if crate::equality::equals(&v, value).is_true() => tuple.push(v),
+                _ => {
+                    all_match = false;
+                    break;
+                }
+            }
+        }
+        if all_match {
+            out.push((id, carry.keep(tuple)));
+        }
+    }
     // De-duplicate: a stale + a live index entry can name the same id twice.
-    out.sort_unstable();
-    out.dedup();
-    out
+    out.sort_unstable_by_key(|(id, _)| *id);
+    out.dedup_by_key(|(id, _)| *id);
+    CompositeSeekHits::from_pairs(out)
 }
 
 /// The **re-check half** of an indexed node TEXT (trigram) seek (`rmp` task #768): given a candidate id

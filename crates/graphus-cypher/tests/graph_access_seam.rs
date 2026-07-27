@@ -14,7 +14,8 @@ use graphus_cypher::binding::{Parameters, bind_parameters};
 use graphus_cypher::catalog::IndexCatalog;
 use graphus_cypher::executor::execute;
 use graphus_cypher::graph_access::{
-    ExpandDirection, GraphAccess, Incident, MemGraph, NodeId, RelData, RelId,
+    ExpandDirection, GraphAccess, Incident, IndexSeekHits, KeyValues, MemGraph, NodeId, RelData,
+    RelId,
 };
 use graphus_cypher::lexer::tokenize;
 use graphus_cypher::lower::lower;
@@ -77,16 +78,26 @@ impl GraphAccess for IndexedGraph {
     }
 
     // The point of the test: serve the seek from "the index".
-    fn index_seek_eq(&self, label: &str, property: &str, value: &Value) -> Option<Vec<NodeId>> {
+    fn index_seek_eq(
+        &self,
+        label: &str,
+        property: &str,
+        value: &Value,
+        carry: KeyValues,
+    ) -> Option<IndexSeekHits> {
         self.eq_seek_used.set(true);
-        // A real index would probe a B+-tree; here we just compute the matching ids directly.
-        Some(
+        // A real index would probe a B+-tree; here we just compute the matching ids directly — and,
+        // like the real seam, hand back the value it compared when the caller asks (`rmp` #879).
+        Some(IndexSeekHits::from_pairs(
             self.inner
                 .scan_nodes_by_label(label)
                 .into_iter()
-                .filter(|id| self.inner.node_property(*id, property).as_ref() == Some(value))
+                .filter_map(|id| {
+                    let v = self.inner.node_property(id, property)?;
+                    (&v == value).then(|| (id, carry.keep(v)))
+                })
                 .collect(),
-        )
+        ))
     }
 
     fn index_seek_range(
@@ -95,11 +106,12 @@ impl GraphAccess for IndexedGraph {
         property: &str,
         lower: Option<(&Value, bool)>,
         upper: Option<(&Value, bool)>,
-    ) -> Option<Vec<NodeId>> {
+        _carry: KeyValues,
+    ) -> Option<IndexSeekHits> {
         self.range_seek_used.set(true);
         use graphus_cypher::cmp_values;
         use std::cmp::Ordering;
-        Some(
+        Some(IndexSeekHits::ids(
             self.inner
                 .scan_nodes_by_label(label)
                 .into_iter()
@@ -126,7 +138,7 @@ impl GraphAccess for IndexedGraph {
                     ok_low && ok_high
                 })
                 .collect(),
-        )
+        ))
     }
 
     fn create_node(&mut self, labels: &[String], properties: &[(String, Value)]) -> NodeId {

@@ -73,9 +73,33 @@ use graphus_core::Value;
 use graphus_core::error::GraphusError;
 
 use crate::graph_access::{
-    DeletedEntity, ExpandDirection, GraphAccess, Incident, NodeId, RelData, RelId, ScanFilter,
-    ScannedRel, VectorQueryResult,
+    CompositeSeekHits, DeletedEntity, ExpandDirection, GraphAccess, Incident, IndexSeekHits,
+    KeyValues, NodeId, RelData, RelId, ScanFilter, ScannedRel, SeekHits, VectorQueryResult,
 };
+
+/// Keeps the hits `keep` admits, **carrying each id's key value with it** (`rmp` task #879).
+///
+/// A seek's carried values are positionally parallel to its ids, so filtering the ids alone would
+/// silently re-align every value after the first drop — a value read from one node served as another
+/// node's property. Filtering the pair is the only shape that cannot do that, which is why every RBAC
+/// gate in this file routes through this one helper rather than filtering `matched` in place.
+fn retain_hits<V>(hits: SeekHits<V>, keep: impl Fn(NodeId) -> bool) -> SeekHits<V> {
+    let SeekHits {
+        matched,
+        key_values,
+    } = hits;
+    if key_values.len() == matched.len() {
+        SeekHits::from_pairs(
+            matched
+                .into_iter()
+                .zip(key_values.into_iter().map(Some))
+                .filter(|&(id, _)| keep(id))
+                .collect(),
+        )
+    } else {
+        SeekHits::ids(matched.into_iter().filter(|&id| keep(id)).collect())
+    }
+}
 
 /// The narrow privilege interface the [`AuthorizedGraph`] enforces against, resolved **once per
 /// statement** for one principal + session database (rmp #93).
@@ -681,10 +705,16 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         Some(self.filter_rel_props(&data.rel_type, props))
     }
 
-    fn index_seek_eq(&self, label: &str, property: &str, value: &Value) -> Option<Vec<NodeId>> {
-        let ids = self.inner.index_seek_eq(label, property, value)?;
+    fn index_seek_eq(
+        &self,
+        label: &str,
+        property: &str,
+        value: &Value,
+        carry: KeyValues,
+    ) -> Option<IndexSeekHits> {
+        let hits = self.inner.index_seek_eq(label, property, value, carry)?;
         if self.oracle.is_unrestricted() {
-            return Some(ids);
+            return Some(hits);
         }
         // An index seek is a read path: the result must be filtered exactly like the generic
         // `node_property`-masking `Filter`, so the index-accelerated and scan-fallback paths return the
@@ -692,11 +722,13 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         // property, so a `DENY READ` on `property` drops the candidate exactly as a masked `WHERE n.p =
         // v` would (`rmp` #822) — not merely `node_visible`, which enforced traverse but leaked the
         // denied property's value by inference.
-        Some(
-            ids.into_iter()
-                .filter(|&id| self.may_read_node_property(id, property))
-                .collect(),
-        )
+        // A CARRIED key value (`rmp` #879) travels with its id through this very filter, so it can
+        // only survive when `may_read_node_property` holds — the *same* predicate
+        // [`Self::node_property`] evaluates before it returns the raw value. A denied property
+        // therefore takes its value out of the result with the row, and never reaches a projection.
+        Some(retain_hits(hits, |id| {
+            self.may_read_node_property(id, property)
+        }))
     }
 
     fn scan_filter_eq(&self, label: &str, property: &str, value: &Value) -> ScanFilter {
@@ -732,20 +764,22 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         property: &str,
         lower: Option<(&Value, bool)>,
         upper: Option<(&Value, bool)>,
-    ) -> Option<Vec<NodeId>> {
-        let ids = self.inner.index_seek_range(label, property, lower, upper)?;
+        carry: KeyValues,
+    ) -> Option<IndexSeekHits> {
+        let hits = self
+            .inner
+            .index_seek_range(label, property, lower, upper, carry)?;
         if self.oracle.is_unrestricted() {
-            return Some(ids);
+            return Some(hits);
         }
         // Gate node visibility AND read access to `property`: a `DENY READ` makes `n.p` read as null,
         // so a masked `WHERE n.p > v` (or the `IS NOT NULL` existence scan served by an open range)
         // drops the row — matching the `scan_filter_range` fallback, which already masks via
         // `node_property` (`rmp` #822).
-        Some(
-            ids.into_iter()
-                .filter(|&id| self.may_read_node_property(id, property))
-                .collect(),
-        )
+        // A carried key value (`rmp` #879) is filtered out with its id — see `index_seek_eq` above.
+        Some(retain_hits(hits, |id| {
+            self.may_read_node_property(id, property)
+        }))
     }
 
     fn index_seek_composite_eq(
@@ -753,29 +787,28 @@ impl<O: PrivilegeOracle> GraphAccess for AuthorizedGraph<'_, O> {
         label: &str,
         properties: &[String],
         values: &[Value],
-    ) -> Option<Vec<NodeId>> {
+        carry: KeyValues,
+    ) -> Option<CompositeSeekHits> {
         // A composite index seek is a read path: filter its candidates exactly like a scan / single-key
         // seek, so the index-accelerated and scan-fallback paths return the same visible rows
         // (`rmp` task #657).
-        let ids = self
+        let hits = self
             .inner
-            .index_seek_composite_eq(label, properties, values)?;
+            .index_seek_composite_eq(label, properties, values, carry)?;
         if self.oracle.is_unrestricted() {
-            return Some(ids);
+            return Some(hits);
         }
         // Gate node visibility AND read access to EVERY covered property: a `DENY READ` on ANY key
         // makes that conjunct's `n.p = v` read null, so the whole `AND` is null and the row is dropped
         // — matching the `scan_filter_composite_eq` fallback, which already masks each key via
         // `node_property` (`rmp` #822).
-        Some(
-            ids.into_iter()
-                .filter(|&id| {
-                    properties
-                        .iter()
-                        .all(|property| self.may_read_node_property(id, property))
-                })
-                .collect(),
-        )
+        // The carried TUPLE (`rmp` #879) survives only when EVERY covered property is readable, so no
+        // element of it can outlive the gate that hides it.
+        Some(retain_hits(hits, |id| {
+            properties
+                .iter()
+                .all(|property| self.may_read_node_property(id, property))
+        }))
     }
 
     fn index_seek_rel_eq(
@@ -1592,18 +1625,38 @@ mod tests {
         }
     }
 
+    impl SnapshotStub {
+        /// Pairs each candidate with its raw stored value when the caller asks for it (`rmp` #879).
+        fn carrying(&self, ids: Vec<NodeId>, property: &str, carry: KeyValues) -> IndexSeekHits {
+            IndexSeekHits::from_pairs(
+                ids.into_iter()
+                    .map(|n| {
+                        let v = self.0.node_property(n, property).unwrap_or(Value::Null);
+                        (n, carry.keep(v))
+                    })
+                    .collect(),
+            )
+        }
+    }
+
     impl GraphAccess for SnapshotStub {
         /// Every member of `label` carrying a value for `property` — a raw candidate superset, exactly
         /// what a `RecordGraph` fused seek returns before the RBAC decorator narrows it (`rmp` #822).
         /// The value/predicate match is the seam's own re-check; the decorator test only needs a live
         /// candidate to observe the property-read gate, so these ignore `value`/bounds/geometry/needle.
+        ///
+        /// The candidates are returned **with their key values** whenever the caller asks
+        /// ([`KeyValues::Carry`], `rmp` #879), exactly as the real seam does — so the `rmp` #822
+        /// assertions below observe the decorator on the value-carrying path, not only on the
+        /// ids-only one. A stub that ignored `carry` would make the value-leak assertions vacuous.
         fn index_seek_eq(
             &self,
             label: &str,
             property: &str,
             _value: &Value,
-        ) -> Option<Vec<NodeId>> {
-            Some(self.label_members_with(label, property))
+            carry: KeyValues,
+        ) -> Option<IndexSeekHits> {
+            Some(self.carrying(self.label_members_with(label, property), property, carry))
         }
         fn index_seek_range(
             &self,
@@ -1611,8 +1664,9 @@ mod tests {
             property: &str,
             _lower: Option<(&Value, bool)>,
             _upper: Option<(&Value, bool)>,
-        ) -> Option<Vec<NodeId>> {
-            Some(self.label_members_with(label, property))
+            carry: KeyValues,
+        ) -> Option<IndexSeekHits> {
+            Some(self.carrying(self.label_members_with(label, property), property, carry))
         }
         /// The whole-store relationship scan (`rmp` task #867). `MemGraph` declines it (the trait
         /// default), so without this override "forwarded" and "declined" would be indistinguishable and
@@ -1637,19 +1691,30 @@ mod tests {
             label: &str,
             properties: &[String],
             _values: &[Value],
-        ) -> Option<Vec<NodeId>> {
+            carry: KeyValues,
+        ) -> Option<CompositeSeekHits> {
             // A composite candidate carries every covered property (matching the real seam).
-            Some(
-                self.0
-                    .scan_nodes_by_label(label)
-                    .into_iter()
-                    .filter(|&n| {
-                        properties
-                            .iter()
-                            .all(|p| self.0.node_property(n, p).is_some())
-                    })
-                    .collect(),
-            )
+            let matched: Vec<NodeId> = self
+                .0
+                .scan_nodes_by_label(label)
+                .into_iter()
+                .filter(|&n| {
+                    properties
+                        .iter()
+                        .all(|p| self.0.node_property(n, p).is_some())
+                })
+                .collect();
+            let pairs = matched
+                .into_iter()
+                .map(|n| {
+                    let tuple: Vec<Value> = properties
+                        .iter()
+                        .map(|p| self.0.node_property(n, p).unwrap_or(Value::Null))
+                        .collect();
+                    (n, carry.keep(tuple))
+                })
+                .collect();
+            Some(CompositeSeekHits::from_pairs(pairs))
         }
         fn index_seek_spatial(
             &self,
@@ -2364,19 +2429,33 @@ mod tests {
         // masked `WHERE n.contents <pred>` reads `contents` as null, so the row is dropped. Before the
         // fix each returned `Some(vec![n])` (the raw candidate), leaking the node. `Some(vec![])`
         // (registered-index-but-no-visible-row), not `None`, because the index IS usable.
+        // `rmp` #879: run each seek with `KeyValues::Carry`, so the assertion covers the path that
+        // carries the property VALUE. A leak here would be strictly worse than the `rmp` #822 one —
+        // it hands the denied plaintext to a projection, not merely the node's existence.
         assert_eq!(
-            authz.index_seek_eq("Report", "contents", &s("top-secret")),
-            Some(vec![]),
+            authz.index_seek_eq("Report", "contents", &s("top-secret"), KeyValues::Carry),
+            Some(IndexSeekHits::ids(vec![])),
             "index_seek_eq must not leak a node whose seeked property is DENY READ",
         );
         assert_eq!(
-            authz.index_seek_range("Report", "contents", Some((&s("a"), true)), None),
-            Some(vec![]),
+            authz.index_seek_range(
+                "Report",
+                "contents",
+                Some((&s("a"), true)),
+                None,
+                KeyValues::Carry
+            ),
+            Some(IndexSeekHits::ids(vec![])),
             "index_seek_range must not leak a DENY-READ property",
         );
         assert_eq!(
-            authz.index_seek_composite_eq("Report", &["contents".to_owned()], &[s("top-secret")],),
-            Some(vec![]),
+            authz.index_seek_composite_eq(
+                "Report",
+                &["contents".to_owned()],
+                &[s("top-secret")],
+                KeyValues::Carry,
+            ),
+            Some(CompositeSeekHits::ids(vec![])),
             "composite seek must not leak a DENY-READ property",
         );
         assert_eq!(
@@ -2384,8 +2463,9 @@ mod tests {
                 "Report",
                 &["title".to_owned(), "contents".to_owned()],
                 &[s("Q3"), s("top-secret")],
+                KeyValues::Carry,
             ),
-            Some(vec![]),
+            Some(CompositeSeekHits::ids(vec![])),
             "composite seek drops the node if ANY covered property is DENY READ",
         );
         assert_eq!(
@@ -2416,18 +2496,40 @@ mod tests {
         let mut stub = SnapshotStub(g);
         let authz = AuthorizedGraph::new(&mut stub, deny_contents_oracle());
 
+        // The control keeps the carried value: a READABLE property must still be served from the
+        // index, value and all (`rmp` #879) — otherwise the gate above would be over-broad.
         assert_eq!(
-            authz.index_seek_eq("Report", "title", &s("Q3")),
-            Some(vec![n]),
-            "a readable property still resolves through the accelerated seek",
+            authz.index_seek_eq("Report", "title", &s("Q3"), KeyValues::Carry),
+            Some(IndexSeekHits {
+                matched: vec![n],
+                key_values: vec![s("Q3")],
+            }),
+            "a readable property still resolves through the accelerated seek, with its value",
         );
         assert_eq!(
-            authz.index_seek_range("Report", "title", Some((&s("A"), true)), None),
-            Some(vec![n]),
+            authz.index_seek_range(
+                "Report",
+                "title",
+                Some((&s("A"), true)),
+                None,
+                KeyValues::Carry
+            ),
+            Some(IndexSeekHits {
+                matched: vec![n],
+                key_values: vec![s("Q3")],
+            }),
         );
         assert_eq!(
-            authz.index_seek_composite_eq("Report", &["title".to_owned()], &[s("Q3")]),
-            Some(vec![n]),
+            authz.index_seek_composite_eq(
+                "Report",
+                &["title".to_owned()],
+                &[s("Q3")],
+                KeyValues::Carry,
+            ),
+            Some(CompositeSeekHits {
+                matched: vec![n],
+                key_values: vec![vec![s("Q3")]],
+            }),
         );
         assert_eq!(
             authz.index_seek_spatial("Report", "title", 0.0, 0.0, 1.0),
@@ -2453,9 +2555,12 @@ mod tests {
         let authz = AuthorizedGraph::new(&mut stub, StubOracle::unrestricted());
 
         assert_eq!(
-            authz.index_seek_eq("Report", "contents", &s("top-secret")),
-            Some(vec![n]),
-            "unrestricted principal keeps the accelerated seek over any property",
+            authz.index_seek_eq("Report", "contents", &s("top-secret"), KeyValues::Carry),
+            Some(IndexSeekHits {
+                matched: vec![n],
+                key_values: vec![s("top-secret")],
+            }),
+            "unrestricted principal keeps the accelerated seek — and its carried value — verbatim",
         );
         assert_eq!(
             authz.index_seek_text("Report", "contents", TextSeekOp::Contains, "secret"),

@@ -1377,6 +1377,32 @@ fn is_string_normalized(s: &str, form: NormalForm) -> bool {
 
 /// Evaluates `base.key`: a property access on an entity reference (lazy lookup through the seam) or
 /// a map key access; anything else (incl. null) yields null.
+///
+/// # Index-backed property lookup (`rmp` task #879)
+///
+/// When `base` is a bare variable and the row carries a value an index access path already read for
+/// exactly that `(variable, key)` **on this very node**, that value is returned instead of a second
+/// store read. The three things that makes safe are established elsewhere and are worth naming here,
+/// because this is the one place the shortcut is taken:
+///
+/// 1. **It is the same value.** The carried value came from
+///    [`GraphAccess::node_property`](crate::graph_access::GraphAccess::node_property) — the same call
+///    this function would make, at the same point in the statement, under the same snapshot — so it is
+///    byte-identical for every Cypher type. Nothing is decoded from an index key.
+/// 2. **It is the version this reader sees.** The seek's re-check applies MVCC visibility *before*
+///    reading the value, and RBAC filters the id out entirely when the property is not readable
+///    (`crate::authorized_graph`, `rmp` #822), so an entry can only exist for a row the store read
+///    would have answered identically.
+/// 3. **It cannot go stale.** [`crate::physical::mark_index_backed_properties`] only sets the flag on
+///    a plan that mutates nothing, so no `SET` / `REMOVE` / `DELETE` can run between the seek and this
+///    read; and [`Row::cached_property`] re-checks that the row still binds `base` to the node the
+///    value came from, which covers re-binding, `OPTIONAL MATCH` nulls and in-place overwrites.
+///
+/// The [`entity_deleted_by_txn`](crate::graph_access::GraphAccess::entity_deleted_by_txn) probe is
+/// kept on this path anyway. Under (3) it can never fire — a self-deleted entity is invisible to a
+/// later statement's seek and no `DELETE` can be in *this* statement — but it costs no `dbHit`
+/// (`crate::profile` deliberately does not count it) and it keeps the raising rule of
+/// `clauses/return/Return2.feature` [15] true of this path by construction rather than by argument.
 fn eval_property(
     base: &Expr,
     key: &str,
@@ -1386,6 +1412,19 @@ fn eval_property(
     functions: &dyn FunctionRegistry,
     clock: &StatementClock,
 ) -> EvalResult {
+    if let ExprKind::Variable(name) = &base.kind
+        && let Some(cached) = row.cached_property(name, key)
+    {
+        // `cached_property` already proved the row still binds `name` to the node the value came from.
+        let id = row
+            .get(name)
+            .and_then(RowValue::as_node)
+            .expect("cached_property answers only for a node-bound variable");
+        if graph.entity_deleted_by_txn(DeletedEntity::Node(id)) {
+            return Err(EvalError::DeletedEntityAccess);
+        }
+        return Ok(RowValue::Value(cached.clone()));
+    }
     let base = eval(base, row, params, graph, functions, clock)?;
     property_of(&base, key, graph)
 }
@@ -3853,8 +3892,9 @@ impl GraphAccess for ReadOnlyGraph<'_> {
         label: &str,
         property: &str,
         value: &Value,
-    ) -> Option<Vec<crate::graph_access::NodeId>> {
-        self.0.index_seek_eq(label, property, value)
+        carry: crate::graph_access::KeyValues,
+    ) -> Option<crate::graph_access::IndexSeekHits> {
+        self.0.index_seek_eq(label, property, value, carry)
     }
     fn scan_filter_eq(
         &self,
@@ -3872,8 +3912,10 @@ impl GraphAccess for ReadOnlyGraph<'_> {
         property: &str,
         lower: Option<(&Value, bool)>,
         upper: Option<(&Value, bool)>,
-    ) -> Option<Vec<crate::graph_access::NodeId>> {
-        self.0.index_seek_range(label, property, lower, upper)
+        carry: crate::graph_access::KeyValues,
+    ) -> Option<crate::graph_access::IndexSeekHits> {
+        self.0
+            .index_seek_range(label, property, lower, upper, carry)
     }
     fn index_seek_spatial(
         &self,

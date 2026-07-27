@@ -545,6 +545,49 @@ impl RowSchema {
     }
 }
 
+/// One property value an index access path already read from the store, carried on the row so a
+/// later reference to it is answered without a second store read (`rmp` task #879).
+///
+/// # The three facts an entry pins, and why each is needed
+///
+/// * **`key`** — the `(variable, property)` pair the value answers for. Shared through an [`Arc`]
+///   with every row the access path emitted, so carrying it costs one refcount bump per row rather
+///   than two `String` allocations.
+/// * **`node`** — the node the value was read *from*. The row's binding for `key.0` must still be
+///   this exact node for the entry to apply: that single check is what makes an `OPTIONAL MATCH`
+///   null row, a variable re-bound by a later clause, and a row whose variable was overwritten in
+///   place ([`Row::set_at`]) all fall back to the store instead of answering from a stale entry.
+/// * **`value`** — what [`GraphAccess::node_property`](crate::graph_access::GraphAccess::node_property)
+///   returned, verbatim. Never a value decoded from an index key: the key codec is lossy for
+///   `INTEGER` above 2^53, for `NaN`'s sign and payload, and for `Duration` (`rmp` #894), and
+///   `graphus-index` exposes no decoder at all.
+///
+/// It is held behind an [`Arc`](std::sync::Arc) so that a **fan-out** shares one copy. An expansion
+/// clones the driving row once per produced edge, and a supernode turns one seek row into millions;
+/// with an owned `Value` each of those would carry its own deep copy of (say) a 200-byte string,
+/// which is a memory regression traded for a latency win. The `Arc` makes the memo cost
+/// *O(access-path rows)* rather than *O(result rows)*, at one allocation per access-path row.
+#[derive(Debug, Clone, PartialEq)]
+struct CachedProperty {
+    /// `(variable, property)`, shared across every row of the access path that produced it.
+    key: std::sync::Arc<(String, String)>,
+    /// The node `value` was read from.
+    node: NodeId,
+    /// The store's value for `(node, key.1)` under this statement's snapshot, shared across every
+    /// row a fan-out derives from the row this was attached to.
+    value: std::sync::Arc<Value>,
+}
+
+/// The `(variable, property)` descriptor an index access path allocates **once** and stamps onto
+/// every row it emits (`rmp` task #879). Cloning it is an [`Arc`](std::sync::Arc) refcount bump.
+pub type CachedPropertyKey = std::sync::Arc<(String, String)>;
+
+/// Builds a [`CachedPropertyKey`] for `variable.property`.
+#[must_use]
+pub fn cached_property_key(variable: &str, property: &str) -> CachedPropertyKey {
+    std::sync::Arc::new((variable.to_owned(), property.to_owned()))
+}
+
 /// A single executor result row: a positional tuple of [`RowValue`]s over a **shared** [`RowSchema`]
 /// (`04 §7.4`, `rmp` task #364).
 ///
@@ -559,11 +602,29 @@ impl RowSchema {
 /// `expand`, once per merged row in a join — deep-cloned every column **name** (a heap allocation per
 /// name per row). Carrying the names in an `Arc<RowSchema>` makes a clone a refcount bump: **no
 /// per-row column-name allocation remains**. Only the `values` are cloned, which is unavoidable.
+///
+/// # The cached-property side channel (`rmp` task #879)
+///
+/// `cached` is a **performance shadow of the bindings, never part of them**. It holds property
+/// values an index access path already read from the store while re-checking its candidates, so a
+/// later `n.p` in a projection, a residual predicate or a sort key is answered from the row. It is:
+///
+/// * **invisible to every semantic operation** — it is excluded from [`PartialEq`], from
+///   [`columns`](Self::columns), from [`values`](Self::values) and from the result schema, so
+///   `DISTINCT`, `UNION`, grouping keys and the wire encoders cannot observe it;
+/// * **empty for almost every row** — an empty [`Vec`] neither allocates nor allocates on clone, so
+///   a row produced by a scan, an expand or a projection pays a 24-byte move and nothing else;
+/// * **dropped at every projection boundary** — [`from_schema_values`](Self::from_schema_values)
+///   builds a fresh row, so a `WITH` / `RETURN` re-projection starts with no entries. That is a
+///   correctness convenience, not a requirement: an entry is only ever *used* after its node
+///   identity is re-checked (see [`cached_property`](Self::cached_property)).
 #[derive(Debug, Clone, Default)]
 #[must_use]
 pub struct Row {
     schema: std::sync::Arc<RowSchema>,
     values: Vec<RowValue>,
+    /// Property values an access path already read; see the type docs. **Not** part of row identity.
+    cached: Vec<CachedProperty>,
 }
 
 impl PartialEq for Row {
@@ -571,6 +632,12 @@ impl PartialEq for Row {
     /// exact semantics of the previous derived `PartialEq` over parallel `columns`/`values` vectors.
     /// Schemas are compared structurally (not by `Arc` identity) so independently built rows with the
     /// same shape still compare equal.
+    ///
+    /// The `rmp` #879 cached-property side channel is **deliberately excluded**: it carries no
+    /// binding, only a memo of values the store already returned. Including it would make two rows
+    /// with identical bindings compare unequal because one of them happened to arrive through an
+    /// index — which `DISTINCT`, `UNION` and the parity assertions in the test suite would all read
+    /// as a semantic difference.
     fn eq(&self, other: &Self) -> bool {
         std::sync::Arc::ptr_eq(&self.schema, &other.schema)
             || self.schema.names() == other.schema.names() && self.values == other.values
@@ -612,7 +679,13 @@ impl Row {
             values.len(),
             "from_schema_values: schema arity must match values arity"
         );
-        Self { schema, values }
+        Self {
+            schema,
+            values,
+            // A projection boundary starts a fresh row, so no `rmp` #879 memo is inherited: the
+            // projection's own expressions consumed whatever the input row carried.
+            cached: Vec::new(),
+        }
     }
 
     /// The bound column names, in order.
@@ -727,7 +800,56 @@ impl Row {
         Self {
             schema: std::sync::Arc::clone(schema),
             values,
+            // The fan-out keeps the driving row's `rmp` #879 memo: the driving variable is still bound
+            // to the same node in every produced row, so `MATCH (a:L {p: v})-[r]->(b) RETURN a.p`
+            // answers `a.p` once per produced edge without a store read per edge. An empty memo (the
+            // overwhelmingly common case) clones without allocating.
+            cached: self.cached.clone(),
         }
+    }
+
+    /// Records that an access path read `value` for `node`'s `property`, answering a later
+    /// `variable.property` on this row from memory (`rmp` task #879).
+    ///
+    /// `key` is `(variable, property)`; it is shared across every row of the producing operator.
+    /// The caller MUST pass the value **the graph seam returned** for `(node, property)` in this
+    /// statement — never a value reconstructed from an index key, and never the seek argument (which
+    /// is only Cypher-*equal* to the stored value: `n.p = 1` matches a node storing `1.0`, and a
+    /// projection must return `1.0`).
+    pub fn cache_property(&mut self, key: CachedPropertyKey, node: NodeId, value: Value) {
+        self.cached.push(CachedProperty {
+            key,
+            node,
+            value: std::sync::Arc::new(value),
+        });
+    }
+
+    /// The value an access path already read for `variable.property` on **this** row, if any
+    /// (`rmp` task #879).
+    ///
+    /// Answers `Some` only when the row still binds `variable` to the very [`RowValue::Node`] the
+    /// value was read from. That check is what makes every re-binding shape safe without the caller
+    /// having to enumerate them: an `OPTIONAL MATCH` null row binds `Null`, a `WITH other AS n`
+    /// re-binds a different id, and an in-place [`set_at`](Self::set_at) overwrite changes the id —
+    /// each misses, and the caller reads the store, which is always correct.
+    #[must_use]
+    pub fn cached_property(&self, variable: &str, property: &str) -> Option<&Value> {
+        let entry = self
+            .cached
+            .iter()
+            .find(|c| c.key.0 == variable && c.key.1 == property)?;
+        match self.get(variable) {
+            Some(RowValue::Node(NodeRef { id })) if *id == entry.node => Some(&entry.value),
+            _ => None,
+        }
+        .map(std::sync::Arc::as_ref)
+    }
+
+    /// How many cached property values this row carries (`rmp` task #879) — for tests and
+    /// diagnostics; carries no query semantics.
+    #[must_use]
+    pub fn cached_property_count(&self) -> usize {
+        self.cached.len()
     }
 
     /// The value bound to `name` as a property [`Value`], or `Value::Null` for an absent binding.

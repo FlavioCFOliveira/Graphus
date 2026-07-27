@@ -202,6 +202,7 @@ fn param_equality_seek_cost_beats_label_scan_eq() {
         property: "id".to_owned(),
         value: param_value.clone(),
         ordered: false,
+        cached_property: false,
         index: IndexId(0),
     };
     let scan_eq = PhysicalOp::NodeLabelScanEq {

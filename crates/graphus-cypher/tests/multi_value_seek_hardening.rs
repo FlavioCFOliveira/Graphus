@@ -20,7 +20,8 @@ use graphus_cypher::binding::{Parameters, bind_parameters};
 use graphus_cypher::catalog::IndexCatalog;
 use graphus_cypher::executor::{CancellationToken, ExecError, Executor, execute};
 use graphus_cypher::graph_access::{
-    ExpandDirection, GraphAccess, Incident, MemGraph, NodeId, RelData, RelId, ScanFilter,
+    ExpandDirection, GraphAccess, Incident, IndexSeekHits, KeyValues, MemGraph, NodeId, RelData,
+    RelId, ScanFilter,
 };
 use graphus_cypher::lexer::tokenize;
 use graphus_cypher::lower::lower;
@@ -128,7 +129,13 @@ impl GraphAccess for CountingGraph<'_> {
     /// operator on its **served** path, so `eq_seeks` measures the descents the union issues. The
     /// matches are computed with the same Cypher equality the real seam re-checks with, so the rows are
     /// the correct ones and only the count is under test.
-    fn index_seek_eq(&self, label: &str, property: &str, value: &Value) -> Option<Vec<NodeId>> {
+    fn index_seek_eq(
+        &self,
+        label: &str,
+        property: &str,
+        value: &Value,
+        _carry: KeyValues,
+    ) -> Option<IndexSeekHits> {
         if !self.serve_eq_seeks {
             return None; // inherit the default decline, like `MemGraph` itself
         }
@@ -138,7 +145,7 @@ impl GraphAccess for CountingGraph<'_> {
         {
             token.cancel();
         }
-        Some(
+        Some(IndexSeekHits::ids(
             self.inner
                 .scan_nodes_by_label(label)
                 .into_iter()
@@ -148,7 +155,7 @@ impl GraphAccess for CountingGraph<'_> {
                         .is_some_and(|v| graphus_cypher::equality::equals(&v, value).is_true())
                 })
                 .collect(),
-        )
+        ))
     }
 
     // ---- verbatim forwarding: the rows are the inner graph's rows exactly ---------------------

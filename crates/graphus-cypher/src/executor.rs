@@ -48,15 +48,18 @@ use crate::ast::{Expr, ExprKind, Label, RelDirection, RelType, SortDirection, Va
 use crate::binding::BoundParameters;
 use crate::eval::{EvalError, eval, eval_value};
 use crate::function_registry::{self, FunctionRegistry};
-use crate::graph_access::{ExpandDirection, GraphAccess, NodeId, RelId, ScannedRel};
+use crate::graph_access::{
+    CompositeSeekHits, ExpandDirection, GraphAccess, IndexSeekHits, KeyValues, NodeId, RelId,
+    ScannedRel,
+};
 use crate::loadcsv::LoadCsvState;
 use crate::logical::{CreatePart, ProjectionColumn, RemoveOp, SetOp, SortKey, Var, YieldColumn};
 use crate::ordering::cmp_values;
 use crate::physical::{PhysicalOp, PhysicalPlan, RangeBound, root_is_write};
 use crate::procedure_registry::{self, ProcedureFailure, ProcedureRegistry};
 use crate::runtime::{
-    NodeRef, PathStep, PathValue, RelRef, Row, RowValue, cmp_row_values, hash_row_value,
-    row_values_equivalent,
+    NodeRef, PathStep, PathValue, RelRef, Row, RowValue, cached_property_key, cmp_row_values,
+    hash_row_value, row_values_equivalent,
 };
 use crate::statement_clock::StatementClock;
 use crate::ternary::Ternary;
@@ -2517,6 +2520,7 @@ fn build_operator_unprofiled(
             property,
             value,
             ordered,
+            cached_property,
             ..
         } => {
             // The seek value is normally a literal or `$param`, but a correlated seek (`rmp` task
@@ -2533,14 +2537,19 @@ fn build_operator_unprofiled(
                 ctx.functions,
                 &ctx.clock,
             )?;
-            let ids = match ctx.graph.index_seek_eq(&label.name, property, &seek) {
-                Some(ids) => ids,
-                // No index in the seam: fall back to a label scan + equality residual.
-                None => scan_filter_eq(label, property, &seek, ctx),
+            // `rmp` #879: ask the seam to hand back the value it reads while re-checking each
+            // candidate, but only when the plan actually references it — otherwise a large result set
+            // would retain one `Value` per row for nothing.
+            let carry = carry_for(*cached_property);
+            let hits = match ctx.graph.index_seek_eq(&label.name, property, &seek, carry) {
+                Some(hits) => hits,
+                // No index in the seam: fall back to a label scan + equality residual. That path
+                // carries no value, so a later `n.p` reads the store — always correct, just not free.
+                None => IndexSeekHits::ids(scan_filter_eq(label, property, &seek, ctx)),
             };
-            let ids = order_ids_if_requested(ids, property, *ordered, ctx);
+            let keyed = order_hits_if_requested(hits, property, *ordered, *cached_property, ctx);
             Ok(Operator::Buffered {
-                rows: nodes_to_rows(variable, ids),
+                rows: seek_rows(variable, property, keyed),
             })
         }
         PhysicalOp::NodeIndexMultiSeek {
@@ -2589,6 +2598,7 @@ fn build_operator_unprofiled(
             label,
             properties,
             values,
+            cached_property,
             ..
         } => {
             // Composite (multi-property) equality seek (`rmp` task #657): evaluate each key's seek value
@@ -2617,15 +2627,26 @@ fn build_operator_unprofiled(
                     &ctx.clock,
                 )?);
             }
-            let ids = match ctx
-                .graph
-                .index_seek_composite_eq(&label.name, properties, &seek_values)
-            {
-                Some(ids) => ids,
-                None => scan_filter_composite_eq(label, properties, &seek_values, ctx),
+            let carry = carry_for(*cached_property);
+            let hits = match ctx.graph.index_seek_composite_eq(
+                &label.name,
+                properties,
+                &seek_values,
+                carry,
+            ) {
+                Some(hits) => hits,
+                None => CompositeSeekHits::ids(scan_filter_composite_eq(
+                    label,
+                    properties,
+                    &seek_values,
+                    ctx,
+                )),
             };
+            // `rmp` #879: every covered key's current value is available, so `RETURN n.a, n.b` over a
+            // composite `(a, b)` seek touches the store zero further times — and referencing only a
+            // SUBSET of the keys is served just as well, one entry per key.
             Ok(Operator::Buffered {
-                rows: nodes_to_rows(variable, ids),
+                rows: composite_seek_rows(variable, properties, hits),
             })
         }
         PhysicalOp::NodeLabelScanEq {
@@ -2660,6 +2681,7 @@ fn build_operator_unprofiled(
             bound,
             value,
             ordered,
+            cached_property,
             ..
         } => {
             // As with `NodeIndexSeek`, evaluate the bound against the correlation row so a
@@ -2675,16 +2697,19 @@ fn build_operator_unprofiled(
                 &ctx.clock,
             )?;
             let (lower, upper) = range_bounds(*bound, &bound_val);
-            let ids = match ctx
+            let carry = carry_for(*cached_property);
+            let hits = match ctx
                 .graph
-                .index_seek_range(&label.name, property, lower, upper)
+                .index_seek_range(&label.name, property, lower, upper, carry)
             {
-                Some(ids) => ids,
-                None => scan_filter_range(label, property, *bound, &bound_val, ctx),
+                Some(hits) => hits,
+                None => {
+                    IndexSeekHits::ids(scan_filter_range(label, property, *bound, &bound_val, ctx))
+                }
             };
-            let ids = order_ids_if_requested(ids, property, *ordered, ctx);
+            let keyed = order_hits_if_requested(hits, property, *ordered, *cached_property, ctx);
             Ok(Operator::Buffered {
-                rows: nodes_to_rows(variable, ids),
+                rows: seek_rows(variable, property, keyed),
             })
         }
         PhysicalOp::NodeIndexScan {
@@ -2692,6 +2717,7 @@ fn build_operator_unprofiled(
             label,
             property,
             ordered,
+            cached_property,
             ..
         } => {
             // Existence via a full property-index scan (`rmp` task #665): an unbounded range over the
@@ -2701,16 +2727,17 @@ fn build_operator_unprofiled(
             // this returns `None`; we fall back to a full label scan and rely on the residual
             // `IS NOT NULL` filter the planner attached above to trim the null-valued nodes — both paths
             // yield the identical node set.
-            let ids = match ctx
+            let carry = carry_for(*cached_property);
+            let hits = match ctx
                 .graph
-                .index_seek_range(&label.name, property, None, None)
+                .index_seek_range(&label.name, property, None, None, carry)
             {
-                Some(ids) => ids,
-                None => ctx.graph.scan_nodes_by_label(&label.name),
+                Some(hits) => hits,
+                None => IndexSeekHits::ids(ctx.graph.scan_nodes_by_label(&label.name)),
             };
-            let ids = order_ids_if_requested(ids, property, *ordered, ctx);
+            let keyed = order_hits_if_requested(hits, property, *ordered, *cached_property, ctx);
             Ok(Operator::Buffered {
-                rows: nodes_to_rows(variable, ids),
+                rows: seek_rows(variable, property, keyed),
             })
         }
         PhysicalOp::NodeIndexStartsWithSeek {
@@ -2741,17 +2768,24 @@ fn build_operator_unprofiled(
                     // The exclusive upper is the string successor; `None` (an empty or all-`U+10FFFF`
                     // prefix) leaves the range open above — still a superset (the residual re-checks).
                     let successor = string_prefix_successor(s).map(Value::String);
+                    // `KeyValues::Discard` (`rmp` #879): the prefix seek is out of this task's scope.
                     let seek = match &successor {
                         Some(succ) => ctx.graph.index_seek_range(
                             &label.name,
                             property,
                             lower,
                             Some((succ, false)),
+                            KeyValues::Discard,
                         ),
-                        None => ctx
-                            .graph
-                            .index_seek_range(&label.name, property, lower, None),
-                    };
+                        None => ctx.graph.index_seek_range(
+                            &label.name,
+                            property,
+                            lower,
+                            None,
+                            KeyValues::Discard,
+                        ),
+                    }
+                    .map(|hits| hits.matched);
                     // No usable index at run time (e.g. the off-thread reader declines): fall back to a
                     // label scan — the residual `STARTS WITH` filter then does the exact trimming, and
                     // the SSI read footprint matches the scan path (`scan_nodes_by_label`).
@@ -3684,34 +3718,127 @@ fn label_scan_rows(variable: &Var, label: &Label, ctx: &Ctx<'_>) -> VecDeque<Row
 /// as `null`, which the Cypher order ([`crate::ordering::cmp_values`]) ranks last — matching `ORDER BY`
 /// semantics (these ops never actually emit a null-valued row, since the seam re-check and the residual
 /// filter both drop them, but the fallback is defined regardless).
-fn order_ids_if_requested(
-    ids: Vec<NodeId>,
+fn order_hits_if_requested(
+    hits: IndexSeekHits,
     property: &str,
     ordered: bool,
+    cache: bool,
     ctx: &Ctx<'_>,
-) -> Vec<NodeId> {
+) -> Vec<(NodeId, Option<Value>)> {
+    let IndexSeekHits {
+        matched,
+        key_values,
+    } = hits;
+    // The seam either carried a value for EVERY id or for none (`SeekHits`'s parallel-vector
+    // invariant), so this pairing can never mis-align a value with the wrong node.
+    let carried = key_values.len() == matched.len();
+    let mut keyed: Vec<(NodeId, Option<Value>)> = if carried {
+        matched
+            .into_iter()
+            .zip(key_values.into_iter().map(Some))
+            .collect()
+    } else {
+        matched.into_iter().map(|id| (id, None)).collect()
+    };
     if !ordered {
-        return ids;
+        return keyed;
     }
-    // Decorate-sort-undecorate: fetch each node's current property value exactly once (a comparator
+    // Decorate-sort-undecorate: obtain each node's current property value exactly once (a comparator
     // that re-fetched would be O(n log n) property reads), then sort by (value ASC, node id ASC).
-    let mut keyed: Vec<(Value, NodeId)> = ids
+    //
+    // `rmp` #879: when the seam already carried that value, this is where the FIRST of the two
+    // eliminated reads disappears — the ordering key is the value the seek re-check read, moved (not
+    // cloned, not re-read) into the sort. When it did not (the scan fallback), the historical store
+    // read still happens, and its result is then good enough to cache: it came from the same fully
+    // decorated seam (`ctx.graph`), so it carries the same MVCC visibility, the same RBAC masking and
+    // the same SIREAD marker as any other read of that property.
+    let mut decorated: Vec<(Value, NodeId)> = keyed
         .into_iter()
-        .map(|id| {
-            (
+        .map(|(id, carried_value)| match carried_value {
+            Some(v) => (v, id),
+            None => (
                 ctx.graph.node_property(id, property).unwrap_or(Value::Null),
                 id,
-            )
+            ),
         })
         .collect();
-    keyed.sort_by(|(va, ia), (vb, ib)| crate::ordering::cmp_values(va, vb).then(ia.cmp(ib)));
-    keyed.into_iter().map(|(_, id)| id).collect()
+    decorated.sort_by(|(va, ia), (vb, ib)| crate::ordering::cmp_values(va, vb).then(ia.cmp(ib)));
+    keyed = decorated
+        .into_iter()
+        .map(|(v, id)| (id, cache.then_some(v)))
+        .collect();
+    keyed
+}
+
+/// The seam's carry intent for an operator's plan-time `cached_property` flag (`rmp` task #879).
+fn carry_for(cached_property: bool) -> KeyValues {
+    if cached_property {
+        KeyValues::Carry
+    } else {
+        KeyValues::Discard
+    }
 }
 
 /// Wraps node ids into single-binding rows for `variable`.
 fn nodes_to_rows(variable: &Var, ids: Vec<NodeId>) -> VecDeque<Row> {
     ids.into_iter()
         .map(|id| Row::from_pairs([(variable.name.clone(), RowValue::Node(NodeRef { id }))]))
+        .collect()
+}
+
+/// Wraps a single-key node index access path's hits into single-binding rows, stamping each row with
+/// the key value the seam already read for it (`rmp` task #879).
+///
+/// A row with no carried value is byte-identical to what [`nodes_to_rows`] builds, so an operator that
+/// does not cache is unaffected — and a later `variable.property` on such a row reads the store, which
+/// is the reference behaviour this feature must never diverge from.
+fn seek_rows(variable: &Var, property: &str, keyed: Vec<(NodeId, Option<Value>)>) -> VecDeque<Row> {
+    // One `(variable, property)` allocation for the whole operator; each row bumps its refcount.
+    let key = cached_property_key(&variable.name, property);
+    keyed
+        .into_iter()
+        .map(|(id, value)| {
+            let mut row =
+                Row::from_pairs([(variable.name.clone(), RowValue::Node(NodeRef { id }))]);
+            if let Some(v) = value {
+                row.cache_property(std::sync::Arc::clone(&key), id, v);
+            }
+            row
+        })
+        .collect()
+}
+
+/// The composite twin of [`seek_rows`]: one cache entry **per covered key**, so a later reference to
+/// any subset of the composite key is served from the row (`rmp` task #879).
+fn composite_seek_rows(
+    variable: &Var,
+    properties: &[String],
+    hits: CompositeSeekHits,
+) -> VecDeque<Row> {
+    let CompositeSeekHits {
+        matched,
+        key_values,
+    } = hits;
+    if key_values.len() != matched.len() {
+        return nodes_to_rows(variable, matched); // nothing carried (scan fallback / no cache asked)
+    }
+    let keys: Vec<_> = properties
+        .iter()
+        .map(|p| cached_property_key(&variable.name, p))
+        .collect();
+    matched
+        .into_iter()
+        .zip(key_values)
+        .map(|(id, tuple)| {
+            let mut row =
+                Row::from_pairs([(variable.name.clone(), RowValue::Node(NodeRef { id }))]);
+            // `tuple` is the composite key's values in `properties` order — the seam builds it by
+            // reading them in exactly that order, so `zip` cannot mis-pair a key with a value.
+            for (key, value) in keys.iter().zip(tuple) {
+                row.cache_property(std::sync::Arc::clone(key), id, value);
+            }
+            row
+        })
         .collect()
 }
 
@@ -3891,11 +4018,17 @@ fn multi_index_seek_eq(
         // `k` is attacker-controlled and this operator is built before the first `next()`, so poll the
         // statement deadline per descent (`rmp` #476).
         ctx.check_cancelled()?;
-        let Some(hit) = ctx.graph.index_seek_eq(label, property, value) else {
+        // `KeyValues::Discard` (`rmp` #879): the multi-value union is out of this task's scope — one
+        // id can arrive from two descents, so the operator would have to reconcile two carried values
+        // before it could cache one. Declining to carry is always correct; the union reads the store.
+        let Some(hit) = ctx
+            .graph
+            .index_seek_eq(label, property, value, KeyValues::Discard)
+        else {
             // The WHOLE union is abandoned: the partially built `ids` dies with this `return`.
             return Ok(None);
         };
-        ids.extend(hit);
+        ids.extend(hit.matched);
     }
     Ok(Some(ids))
 }
@@ -10323,15 +10456,18 @@ mod tests {
             _label: &str,
             _properties: &[String],
             values: &[Value],
-        ) -> Option<Vec<NodeId>> {
+            _carry: KeyValues,
+        ) -> Option<CompositeSeekHits> {
             // O(1) hash lookup; charge only the candidates returned (the seek's true storage cost).
+            // Carries nothing (`rmp` #879): this stub measures how many records an access path reads,
+            // and declining to carry keeps that measurement about the access path alone.
             let ids = self
                 .composite
                 .get(&Self::key_of(values))
                 .cloned()
                 .unwrap_or_default();
             self.examined.set(self.examined.get() + ids.len());
-            Some(ids)
+            Some(CompositeSeekHits::ids(ids))
         }
         fn scan_nodes_by_label(&self, label: &str) -> Vec<NodeId> {
             // Charge every node record the scan touches (the label-scan path's true storage cost).
@@ -10756,7 +10892,13 @@ mod tests {
     }
 
     impl GraphAccess for CountingAnchorGraph {
-        fn index_seek_eq(&self, label: &str, property: &str, value: &Value) -> Option<Vec<NodeId>> {
+        fn index_seek_eq(
+            &self,
+            label: &str,
+            property: &str,
+            value: &Value,
+            _carry: KeyValues,
+        ) -> Option<IndexSeekHits> {
             if label != "Person" || property != "uid" {
                 return None;
             }
@@ -10766,7 +10908,7 @@ mod tests {
                 .cloned()
                 .unwrap_or_default();
             self.examined.set(self.examined.get() + ids.len());
-            Some(ids)
+            Some(IndexSeekHits::ids(ids))
         }
         fn scan_nodes_by_label(&self, label: &str) -> Vec<NodeId> {
             let ids = self.inner.scan_nodes_by_label(label);

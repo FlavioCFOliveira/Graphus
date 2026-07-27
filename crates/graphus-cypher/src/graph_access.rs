@@ -226,6 +226,143 @@ pub struct ScanFilter {
     pub examined: usize,
 }
 
+/// Whether an index access path must **carry back** the key value(s) it re-read, so a later
+/// reference to the same property is served from the row instead of a second store read
+/// (`rmp` task #879 — Neo4j's *index-backed property lookup*).
+///
+/// # Why this is a parameter and not always-on
+///
+/// Every node index seek already reads each candidate's current property value to re-check it (a
+/// candidate list is a superset; see [`index_seek_eq`](GraphAccess::index_seek_eq)), and then
+/// **discards** it. Keeping it costs nothing to produce — the `Value` is already owned — but it does
+/// keep it alive until the rows are consumed, and an unbounded access path
+/// ([`NodeIndexScan`](crate::physical::PhysicalOp::NodeIndexScan) over a large label) would then
+/// retain one `Value` per matched node for no reason at all.
+///
+/// So the caller states its intent. The planner sets it from a **static** fact — whether any
+/// expression in the plan reads that property of that variable
+/// (`crate::physical::mark_index_backed_properties`) — so a plan that never touches the property
+/// pays nothing, and a plan that does pays one retained `Value` per row and saves one store read per
+/// reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeyValues {
+    /// Drop each key value as soon as the re-check has used it (the historical behaviour).
+    #[default]
+    Discard,
+    /// Carry each key value back to the caller, parallel to the matched ids.
+    Carry,
+}
+
+impl KeyValues {
+    /// Retains `value` only under [`Carry`](Self::Carry); under [`Discard`](Self::Discard) the value
+    /// is dropped **here**, so the discarding path never holds a second copy of the result set.
+    #[inline]
+    #[must_use]
+    pub fn keep<V>(self, value: V) -> Option<V> {
+        match self {
+            Self::Carry => Some(value),
+            Self::Discard => None,
+        }
+    }
+
+    /// Whether the caller asked for the values.
+    #[inline]
+    #[must_use]
+    pub fn wanted(self) -> bool {
+        matches!(self, Self::Carry)
+    }
+}
+
+/// The result of a node index seek (`rmp` task #879): the matching ids, and — only when the caller
+/// asked for [`KeyValues::Carry`] — the **current, snapshot-visible** value of the seek's key
+/// propert(ies) for each of them.
+///
+/// # The parallel-vector invariant
+///
+/// `key_values` is either **empty** ("not captured — read the store") or **exactly as long as
+/// `matched`**, index for index. It is never partially filled: a partially filled vector would make
+/// `key_values[i]` mean a different node depending on how far the capture got, which is the shape of
+/// a silent wrong answer. [`Self::value_at`] is the only supported way to read it and enforces the
+/// invariant by construction.
+///
+/// # What the carried value is, and is not
+///
+/// It is the value **the store returned**, through the very same `node_property` read the re-check
+/// performs — never a value decoded from an index key. That distinction is load-bearing: the index
+/// key codec is not injective (`graphus_index::keycodec::encode_integer` puts every `i64` on the
+/// `f64` magnitude line, so `Integer(2^54+3)` and `Integer(2^54+5)` share one key; `NaN` payload and
+/// sign are canonicalised; a `Duration` collapses onto one approximate nanosecond total), there is
+/// no decoder in `graphus-index` at all, and `rmp` #894 settled that the difference is *observable*.
+/// Carrying the value is therefore not a preference over decoding the key — it is the only correct
+/// option, for every type.
+#[derive(Debug, Clone, PartialEq, Default)]
+#[must_use]
+pub struct SeekHits<V> {
+    /// The matching node ids, ascending and de-duplicated.
+    pub matched: Vec<NodeId>,
+    /// Parallel to [`matched`](Self::matched), or empty when the values were not captured.
+    pub key_values: Vec<V>,
+}
+
+impl<V> SeekHits<V> {
+    /// A hit list carrying ids only — the shape every caller that does not want values produces.
+    pub fn ids(matched: Vec<NodeId>) -> Self {
+        Self {
+            matched,
+            key_values: Vec::new(),
+        }
+    }
+
+    /// Builds a hit list from `(id, Option<value>)` pairs, keeping the values **only** if every pair
+    /// carries one. A mixed list therefore degrades to ids-only rather than producing a misaligned
+    /// `key_values` — the invariant is enforced here, once, instead of at every call site.
+    pub fn from_pairs(pairs: Vec<(NodeId, Option<V>)>) -> Self {
+        let carried = pairs.iter().all(|(_, v)| v.is_some());
+        let mut matched = Vec::with_capacity(pairs.len());
+        let mut key_values = Vec::with_capacity(if carried { pairs.len() } else { 0 });
+        for (id, value) in pairs {
+            matched.push(id);
+            if let (true, Some(v)) = (carried, value) {
+                key_values.push(v);
+            }
+        }
+        Self {
+            matched,
+            key_values,
+        }
+    }
+
+    /// The captured value for `matched[i]`, or [`None`] when nothing was captured.
+    #[must_use]
+    pub fn value_at(&self, i: usize) -> Option<&V> {
+        if self.key_values.len() == self.matched.len() {
+            self.key_values.get(i)
+        } else {
+            None
+        }
+    }
+
+    /// The number of matching ids.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.matched.len()
+    }
+
+    /// Whether nothing matched. (`Some(hits)` with an empty `matched` still means "the index served
+    /// the seek and nothing matched" — never "no index"; see the `rmp` #680/#738 decline contract.)
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.matched.is_empty()
+    }
+}
+
+/// A single-key node index seek's hits (equality, range, existence scan).
+pub type IndexSeekHits = SeekHits<Value>;
+
+/// A composite (multi-property) node index seek's hits: one value **per covered key**, in the
+/// composite index's declared property order.
+pub type CompositeSeekHits = SeekHits<Vec<Value>>;
+
 /// The result of a [`columnar_label_property_scan`](GraphAccess::columnar_label_property_scan)
 /// (`rmp` tasks #329 / #330): the matched `(node, value)` rows **plus** the total count of visible
 /// nodes carrying the label.
@@ -447,7 +584,17 @@ pub trait GraphAccess {
     ///
     /// Returns `None` when the implementation has no usable index (the executor then falls back to a
     /// label scan + residual filter). The default is `None`.
-    fn index_seek_eq(&self, _label: &str, _property: &str, _value: &Value) -> Option<Vec<NodeId>> {
+    ///
+    /// `carry` (`rmp` task #879) asks the seam to return, alongside each matching id, the **current
+    /// visible value** of `property` it read while re-checking that candidate — the value a later
+    /// `n.property` would otherwise fetch from the store a second time. See [`KeyValues`].
+    fn index_seek_eq(
+        &self,
+        _label: &str,
+        _property: &str,
+        _value: &Value,
+        _carry: KeyValues,
+    ) -> Option<IndexSeekHits> {
         None
     }
 
@@ -491,13 +638,17 @@ pub trait GraphAccess {
 
     /// An **optional** index range seek. `lower`/`upper` are `(value, inclusive)` bounds; either may
     /// be `None` for an open side. Returns `None` when no index is usable (default).
+    ///
+    /// `carry` (`rmp` task #879) asks the seam to return the current visible value of `property` for
+    /// each matching id — the value the range re-check already read. See [`KeyValues`].
     fn index_seek_range(
         &self,
         _label: &str,
         _property: &str,
         _lower: Option<(&Value, bool)>,
         _upper: Option<(&Value, bool)>,
-    ) -> Option<Vec<NodeId>> {
+        _carry: KeyValues,
+    ) -> Option<IndexSeekHits> {
         None
     }
 
@@ -514,12 +665,16 @@ pub trait GraphAccess {
     /// invisible / re-labelled / since-changed node never reaches the result, and RBAC composes for free
     /// through the [`AuthorizedGraph`](crate::authorized_graph::AuthorizedGraph) decorator. The default
     /// returns `None` (no composite index available).
+    ///
+    /// `carry` (`rmp` task #879) asks the seam to return, per matching id, the current visible value
+    /// of **every** covered property, in `properties` order — the tuple the re-check already read.
     fn index_seek_composite_eq(
         &self,
         _label: &str,
         _properties: &[String],
         _values: &[Value],
-    ) -> Option<Vec<NodeId>> {
+        _carry: KeyValues,
+    ) -> Option<CompositeSeekHits> {
         None
     }
 

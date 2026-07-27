@@ -36,7 +36,8 @@ use std::rc::Rc;
 use graphus_core::value::temporal::Date;
 use graphus_core::{Crs, Point, TxnId, Value};
 use graphus_cypher::graph_access::{
-    DeletedEntity, ExpandDirection, GraphAccess, NodeId, RelData, RelId, ScannedRel,
+    DeletedEntity, ExpandDirection, GraphAccess, IndexSeekHits, KeyValues, NodeId, RelData, RelId,
+    ScannedRel,
 };
 use graphus_cypher::index_set::IndexSet;
 use graphus_cypher::read_only_graph::ReadOnlyGraph;
@@ -1272,15 +1273,18 @@ fn off_thread_index_seek_equals_inline_seek_and_scan_across_snapshots() {
             let seek = Value::String(probe.to_owned());
 
             let live = coord.live_at(txn, ts);
+            // `KeyValues::Carry` (`rmp` #879): the comparison covers the ROWS **and** the carried key
+            // values, so the two routes must agree on the value each row's property holds, not just on
+            // which rows survive. `SeekHits`'s `PartialEq` compares both vectors.
             let inline = live
-                .index_seek_eq("Person", "email", &seek)
+                .index_seek_eq("Person", "email", &seek, KeyValues::Carry)
                 .expect("the inline seam has an Online index: it must serve the seek");
 
             let ro = coord
                 .reader_at(txn, ts)
                 .with_index_candidates(capture(ts, probe));
             let off_thread = ro
-                .index_seek_eq("Person", "email", &seek)
+                .index_seek_eq("Person", "email", &seek, KeyValues::Carry)
                 .expect("the reader has a captured memo: it must serve the seek");
 
             // The independent oracle: a full scan, which consults no index at all.
@@ -1293,12 +1297,25 @@ fn off_thread_index_seek_equals_inline_seek_and_scan_across_snapshots() {
 
             assert_eq!(
                 off_thread, inline,
-                "{what}, {probe:?}: the off-thread seek disagrees with the inline seek"
+                "{what}, {probe:?}: the off-thread seek disagrees with the inline seek (rows or carried values)"
             );
             assert_eq!(
-                off_thread, scan_sorted,
+                off_thread.matched, scan_sorted,
                 "{what}, {probe:?}: the off-thread seek disagrees with the exact scan (the oracle)"
             );
+            // Every carried value must be the value the SCAN's own `node_property` read would return —
+            // the reference this feature may never diverge from (`rmp` #879).
+            for (i, id) in off_thread.matched.iter().enumerate() {
+                let from_store = coord
+                    .reader_at(txn, ts)
+                    .node_property(*id, "email")
+                    .expect("a matched node has the property");
+                assert_eq!(
+                    off_thread.value_at(i),
+                    Some(&from_store),
+                    "{what}, {probe:?}: carried value for {id:?} is not the store's value"
+                );
+            }
             assert!(
                 !ro.has_error(),
                 "{what}, {probe:?}: reader captured an error"
@@ -1312,8 +1329,18 @@ fn off_thread_index_seek_equals_inline_seek_and_scan_across_snapshots() {
         .reader_at(TxnId(200), ts_stale)
         .with_index_candidates(capture(ts_stale, "a@x.io"));
     assert_eq!(
-        ro.index_seek_eq("Person", "email", &Value::String("a@x.io".to_owned())),
-        Some(vec![NodeId(ids[0])]),
+        ro.index_seek_eq(
+            "Person",
+            "email",
+            &Value::String("a@x.io".to_owned()),
+            KeyValues::Carry
+        ),
+        Some(IndexSeekHits {
+            matched: vec![NodeId(ids[0])],
+            // The carried value is the version THIS SNAPSHOT sees — `a@x.io`, the value p0 still holds
+            // at `ts_stale`, not the one it was later moved to (`rmp` #879 / TRAP 2).
+            key_values: vec![Value::String("a@x.io".to_owned())],
+        }),
         "the stale reader must see p0 (still `a@x.io` at its snapshot) and NOT the later p_new"
     );
 }
@@ -1405,10 +1432,21 @@ fn off_thread_range_composite_text_seeks_equal_inline_rows_and_ssi_footprint() {
     // A helper: run one seek on the inline seam and on an off-thread reader fed the engine-captured memo,
     // assert the ROWS are equal (and hold `expected`), then assert the canonical SIREAD buffers are
     // byte-identical and non-empty. `run` performs the seek on a `&dyn GraphAccess`-shaped closure.
+    // The closures are normalised to `(ids, carried key values)` so RANGE / COMPOSITE / TEXT share one
+    // comparison: the carried values are part of the parity assertion (`rmp` #879), and TEXT — which
+    // carries nothing — contributes an empty value vector on both sides.
+    type Hits = (Vec<NodeId>, Vec<Vec<Value>>);
+    /// Lifts a single-key hit list into the shared `(ids, per-row value tuple)` shape.
+    fn single_key_hits(h: IndexSeekHits) -> Hits {
+        (
+            h.matched,
+            h.key_values.into_iter().map(|v| vec![v]).collect(),
+        )
+    }
     let compare = |what: &str,
                    capture: graphus_cypher::read_source::IndexCandidateCapture,
-                   inline_seek: &dyn Fn(&Live) -> Option<Vec<NodeId>>,
-                   reader_seek: &dyn Fn(&ReadOnly) -> Option<Vec<NodeId>>,
+                   inline_seek: &dyn Fn(&Live) -> Option<Hits>,
+                   reader_seek: &dyn Fn(&ReadOnly) -> Option<Hits>,
                    expected_subset: &[NodeId]| {
         let live = coord.live_at(TxnId(100), ts);
         let inline = inline_seek(&live).unwrap_or_else(|| {
@@ -1423,17 +1461,19 @@ fn off_thread_range_composite_text_seeks_equal_inline_rows_and_ssi_footprint() {
 
         assert_eq!(
             off_thread, inline,
-            "{what}: the off-thread seek rows disagree with the inline seek"
+            "{what}: the off-thread seek rows or carried key values disagree with the inline seek"
         );
         for id in expected_subset {
             assert!(
-                off_thread.contains(id),
-                "{what}: the seek must contain {id:?} (rows={off_thread:?})"
+                off_thread.0.contains(id),
+                "{what}: the seek must contain {id:?} (rows={:?})",
+                off_thread.0
             );
         }
         assert!(
-            !off_thread.contains(&NodeId(company)),
-            "{what}: the Company node must be excluded by the label re-check (rows={off_thread:?})"
+            !off_thread.0.contains(&NodeId(company)),
+            "{what}: the Company node must be excluded by the label re-check (rows={:?})",
+            off_thread.0
         );
 
         // The load-bearing ACID assertion: byte-identical SIREAD footprint. Take the live buffer BEFORE
@@ -1472,10 +1512,24 @@ fn off_thread_range_composite_text_seeks_equal_inline_rows_and_ssi_footprint() {
         "range age>=4",
         range_cap,
         &|live: &Live| {
-            live.index_seek_range("Person", "age", Some((&Value::Integer(4), true)), None)
+            live.index_seek_range(
+                "Person",
+                "age",
+                Some((&Value::Integer(4), true)),
+                None,
+                KeyValues::Carry,
+            )
+            .map(single_key_hits)
         },
         &|ro: &ReadOnly| {
-            ro.index_seek_range("Person", "age", Some((&Value::Integer(4), true)), None)
+            ro.index_seek_range(
+                "Person",
+                "age",
+                Some((&Value::Integer(4), true)),
+                None,
+                KeyValues::Carry,
+            )
+            .map(single_key_hits)
         },
         &[
             NodeId(ids[4]),
@@ -1498,8 +1552,14 @@ fn off_thread_range_composite_text_seeks_equal_inline_rows_and_ssi_footprint() {
     compare(
         "composite (D3,T3)",
         composite_cap,
-        &|live: &Live| live.index_seek_composite_eq("Person", &comp_props, &comp_vals),
-        &|ro: &ReadOnly| ro.index_seek_composite_eq("Person", &comp_props, &comp_vals),
+        &|live: &Live| {
+            live.index_seek_composite_eq("Person", &comp_props, &comp_vals, KeyValues::Carry)
+                .map(|h| (h.matched, h.key_values))
+        },
+        &|ro: &ReadOnly| {
+            ro.index_seek_composite_eq("Person", &comp_props, &comp_vals, KeyValues::Carry)
+                .map(|h| (h.matched, h.key_values))
+        },
         &[NodeId(ids[3])],
     );
 
@@ -1513,8 +1573,14 @@ fn off_thread_range_composite_text_seeks_equal_inline_rows_and_ssi_footprint() {
     compare(
         "text CONTAINS o3e",
         text_cap,
-        &|live: &Live| live.index_seek_text("Person", "bio", TextSeekOp::Contains, "o3e"),
-        &|ro: &ReadOnly| ro.index_seek_text("Person", "bio", TextSeekOp::Contains, "o3e"),
+        &|live: &Live| {
+            live.index_seek_text("Person", "bio", TextSeekOp::Contains, "o3e")
+                .map(|ids| (ids, Vec::new()))
+        },
+        &|ro: &ReadOnly| {
+            ro.index_seek_text("Person", "bio", TextSeekOp::Contains, "o3e")
+                .map(|ids| (ids, Vec::new()))
+        },
         &[NodeId(ids[3])],
     );
 }

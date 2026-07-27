@@ -520,6 +520,58 @@ all is an error.
 
 ---
 
+## Index-backed property lookup
+
+When an index seek or scan re-checks a candidate, it reads that node's **current** value for the
+indexed property — it has to, because an index entry is only a candidate (it may be stale, invisible
+to your snapshot, or for a node that has since lost the label). Graphus keeps that value on the row,
+so a later reference to the *same property of the same variable* is answered from memory instead of
+going back to the property store. Neo4j calls this **index-backed property lookup**; Graphus renders
+it the same way, as `cache[n.name]` on the access path:
+
+```text
+PROFILE MATCH (n:Person {name: 'p7'}) RETURN n.name AS name
+
+Projection(n.name AS name)                                        rows=1  dbHits=0
+  NodeIndexSeek(n:Person name = 'p7' via idx#1 cache[n.name])     rows=1  dbHits=1
+```
+
+The `dbHits=0` on the projection is the whole point: without this, the same statement cost two store
+accesses instead of one. It applies to every later reference — a projection, a residual predicate, or
+an `ORDER BY` key — and to all three node access paths: the equality seek, the range seek, and the
+composite seek (where **every** covered key is available, so `RETURN n.a, n.b` over a composite
+`(a, b)` index touches the store zero further times).
+
+Measured on the reference host (release build, in-memory store, warm buffer pool — a cold or larger
+store benefits more, because the saved read is a random one):
+
+| Query shape | before | after |
+| ----------- | ------ | ----- |
+| Seek + project the key | 2 dbHits | **1** |
+| Range seek over 5 rows + project the key | 10 dbHits | **5** |
+| Range seek + project + `ORDER BY` the key | 15 dbHits | **5** |
+| `IS NOT NULL` index scan over 20 rows + project the key | 60 dbHits | **20** |
+| Composite seek + project both keys | 3 dbHits | **1** |
+| `IS NOT NULL` scan over 50 000 string-valued rows | 114 ms | **87 ms** (−24%) |
+
+**What is cached, and when it is not.** The value carried is the one the **store returned** for the
+version your transaction can see — never a value reconstructed from the index key, which is a lossy
+projection (two different integers above 2⁵³ share one key). Graphus declines to cache, and reads the
+store as before, whenever it cannot prove the value is still current:
+
+- the statement **writes** anything (`SET` / `REMOVE` / `DELETE` / `MERGE` / `CREATE` / `FOREACH`) or
+  calls a **procedure**, since either can change the value between the seek and the read;
+- the variable is bound to a different node by the time the property is read — a re-binding, or an
+  `OPTIONAL MATCH` row where it is `null`;
+- the index cannot serve the seek at run time (it is `POPULATING`, or was rebuilt after your snapshot
+  was taken), in which case the exact scan runs and the property is read from the store.
+
+Declining is always safe: the store read is the reference behaviour, and the answer is identical
+either way. `PROFILE` is the witness of which path actually ran — an operator that had to read the
+store charges a `dbHit` per row.
+
+---
+
 ## Try it — REST
 
 Log in for a Bearer token, then send the DDL to the auto-commit endpoint (see

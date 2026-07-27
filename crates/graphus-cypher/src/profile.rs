@@ -71,8 +71,9 @@ use graphus_core::Value;
 
 use crate::counters::QueryCounters;
 use crate::graph_access::{
-    ColumnarScan, DeletedEntity, ExpandDirection, GraphAccess, Incident, NodeId, RelData, RelId,
-    ScanFilter, ScannedRel, VectorQueryResult,
+    ColumnarScan, CompositeSeekHits, DeletedEntity, ExpandDirection, GraphAccess, Incident,
+    IndexSeekHits, KeyValues, NodeId, RelData, RelId, ScanFilter, ScannedRel, SeekHits,
+    VectorQueryResult,
 };
 use crate::physical::{PhysicalOp, PhysicalPlan, TextSeekOp};
 
@@ -278,6 +279,16 @@ impl<'g> ProfilingGraph<'g> {
             self.hit(v.len());
         }
     }
+
+    /// The [`SeekHits`] twin of [`hit_opt`](Self::hit_opt) (`rmp` task #879). Charges exactly what the
+    /// id-returning shape charged before the seam started carrying key values — one per matched id,
+    /// never one per carried value — so the *seek's* own `dbHits` are unchanged by the feature and the
+    /// saving shows up where it is real: in the consumer that no longer reads the store.
+    fn hit_hits<V>(&self, r: &Option<SeekHits<V>>) {
+        if let Some(hits) = r {
+            self.hit(hits.len());
+        }
+    }
 }
 
 impl GraphAccess for ProfilingGraph<'_> {
@@ -390,9 +401,15 @@ impl GraphAccess for ProfilingGraph<'_> {
         r
     }
 
-    fn index_seek_eq(&self, label: &str, property: &str, value: &Value) -> Option<Vec<NodeId>> {
-        let r = self.inner.index_seek_eq(label, property, value);
-        self.hit_opt(&r);
+    fn index_seek_eq(
+        &self,
+        label: &str,
+        property: &str,
+        value: &Value,
+        carry: KeyValues,
+    ) -> Option<IndexSeekHits> {
+        let r = self.inner.index_seek_eq(label, property, value, carry);
+        self.hit_hits(&r);
         r
     }
 
@@ -411,9 +428,12 @@ impl GraphAccess for ProfilingGraph<'_> {
         property: &str,
         lower: Option<(&Value, bool)>,
         upper: Option<(&Value, bool)>,
-    ) -> Option<Vec<NodeId>> {
-        let r = self.inner.index_seek_range(label, property, lower, upper);
-        self.hit_opt(&r);
+        carry: KeyValues,
+    ) -> Option<IndexSeekHits> {
+        let r = self
+            .inner
+            .index_seek_range(label, property, lower, upper, carry);
+        self.hit_hits(&r);
         r
     }
 
@@ -422,11 +442,12 @@ impl GraphAccess for ProfilingGraph<'_> {
         label: &str,
         properties: &[String],
         values: &[Value],
-    ) -> Option<Vec<NodeId>> {
+        carry: KeyValues,
+    ) -> Option<CompositeSeekHits> {
         let r = self
             .inner
-            .index_seek_composite_eq(label, properties, values);
-        self.hit_opt(&r);
+            .index_seek_composite_eq(label, properties, values, carry);
+        self.hit_hits(&r);
         r
     }
 

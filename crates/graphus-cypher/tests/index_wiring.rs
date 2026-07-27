@@ -18,7 +18,7 @@ use graphus_cypher::binding::{Parameters, bind_parameters};
 use graphus_cypher::catalog::IndexCatalog;
 use graphus_cypher::coordinator::TxnCoordinator;
 use graphus_cypher::executor::execute;
-use graphus_cypher::graph_access::GraphAccess;
+use graphus_cypher::graph_access::{GraphAccess, KeyValues};
 use graphus_cypher::lexer::tokenize;
 use graphus_cypher::lower::lower;
 use graphus_cypher::parser::parse_tokens;
@@ -313,6 +313,87 @@ fn range_seek_equals_scan_filter_and_uses_node_index_range_seek() {
 // =================================================================================================
 // rmp #665: existence (IS NOT NULL) index scan + ORDER BY served by the index, over the real store
 // =================================================================================================
+
+/// **REGRESSION (`rmp` task #879, found while certifying it).** A property column that holds a value
+/// the index key codec cannot encode — a `List` — makes the derived tree a **strict subset** of the
+/// nodes carrying the property, and the whole-index existence scan then silently loses those rows.
+///
+/// Measured against the code before the fix, on three `:T` nodes with `v` set to `1`, `[1, 2, 3]` and
+/// `'abc'`: `MATCH (n:T) WHERE n.v IS NOT NULL` returned **3** rows through the label scan and **2**
+/// through `NodeIndexScan`. **Declaring an index changed the answer**, and the lost row was committed
+/// data — the `rmp` #680 / #738 / #894 defect class.
+///
+/// The mechanism: `IndexSet::insert_node_property` did `let _ = np.index.insert(...)`, discarding the
+/// `KeyEncodeError::Unindexable` a `List` raises. Skipping a `Null` there is correct (a null property
+/// is *absent* for index purposes); skipping a present value is not. The fix records the refusal and
+/// declines the **unbounded** range seek — and only that one, since a bounded seek can never match a
+/// `List` and so has no row to lose.
+#[test]
+fn a_list_valued_property_does_not_disappear_from_the_existence_scan_879() {
+    let mut coord = fresh_coord();
+    run_write(&mut coord, "CREATE (:T {v: 1})");
+    run_write(&mut coord, "CREATE (:T {v: [1, 2, 3]})");
+    run_write(&mut coord, "CREATE (:T {v: 'abc'})");
+    coord
+        .create_node_property_index("T", "v")
+        .expect("create index");
+
+    let src = "MATCH (n:T) WHERE n.v IS NOT NULL RETURN n.v AS a";
+    let indexed = coord.catalog();
+    // Non-vacuity: the planner really does choose the index access path for this shape, so the run
+    // below exercises the code the bug lived in (the seam declines at RUN time, not at plan time).
+    assert!(
+        has_index_scan(&compile(src, &indexed)),
+        "the index-aware plan must still choose NodeIndexScan for this shape"
+    );
+
+    let via_index = read_rows(&mut coord, &indexed, src);
+    let via_scan = read_rows(&mut coord, &IndexCatalog::empty(), src);
+    assert_eq!(
+        via_index.len(),
+        3,
+        "all three committed rows must survive (was 2 before the fix)"
+    );
+    assert_eq!(
+        sorted_debug(&via_index),
+        sorted_debug(&via_scan),
+        "declaring an index must not change the answer"
+    );
+
+    // The BOUNDED seeks are unaffected and must keep using the index: a `List` matches no cross-type
+    // comparison, so there is no row for them to lose and no reason to give up the access path.
+    for bounded in [
+        "MATCH (n:T) WHERE n.v > 0 RETURN n.v AS a",
+        "MATCH (n:T) WHERE n.v = 1 RETURN n.v AS a",
+    ] {
+        assert_eq!(
+            sorted_debug(&read_rows(&mut coord, &indexed, bounded)),
+            sorted_debug(&read_rows(&mut coord, &IndexCatalog::empty(), bounded)),
+            "{bounded}: the bounded path must still agree with the scan"
+        );
+    }
+}
+
+/// Runs `src` and returns its rows (a small helper for the `rmp` #879 regression above).
+fn read_rows(coord: &mut Coord, catalog: &IndexCatalog, src: &str) -> Vec<Row> {
+    let plan = compile(src, catalog);
+    let bound = bind_parameters(&plan, &Parameters::new()).expect("bind");
+    let txn = coord.begin_serializable();
+    let rows = {
+        let mut graph = coord.statement(txn).expect("statement");
+        let mut cursor = execute(&plan, &bound, &mut graph).expect("open cursor");
+        cursor.collect_all().expect("collect")
+    };
+    coord.commit(txn).expect("read commits");
+    rows
+}
+
+/// A deterministic, order-independent rendering of a row bag for comparison.
+fn sorted_debug(rows: &[Row]) -> Vec<String> {
+    let mut out: Vec<String> = rows.iter().map(|r| format!("{:?}", r.values())).collect();
+    out.sort();
+    out
+}
 
 #[test]
 fn existence_scan_equals_scan_filter_and_uses_node_index_scan() {
@@ -1495,7 +1576,8 @@ fn rebuild_gate_declines_the_capture_for_an_older_snapshot() {
             )
             .with_index_candidates(post);
         assert!(
-            ro.index_seek_eq("Person", "email", &seek).is_none(),
+            ro.index_seek_eq("Person", "email", &seek, KeyValues::Discard)
+                .is_none(),
             "the reader must DECLINE the seek (never Some(vec![])), so the executor scans"
         );
         assert_eq!(

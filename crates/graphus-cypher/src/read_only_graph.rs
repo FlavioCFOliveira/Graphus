@@ -50,8 +50,8 @@ use graphus_txn::{CommitRegistry, PredicateRead, Snapshot, SsiReadBuffer};
 use graphus_wal::LogSink;
 
 use crate::graph_access::{
-    DeletedEntity, ExpandDirection, GraphAccess, Incident, NodeId, RelData, RelId, ScanFilter,
-    ScannedRel,
+    CompositeSeekHits, DeletedEntity, ExpandDirection, GraphAccess, Incident, IndexSeekHits,
+    KeyValues, NodeId, RelData, RelId, ScanFilter, ScannedRel,
 };
 use crate::read_source::{self, ReadSink, ReadViewSource, VisCtx};
 
@@ -335,7 +335,13 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         read_source::scan_filter_eq(&self.source(), &self.ctx(), self, label, property, value)
     }
 
-    fn index_seek_eq(&self, label: &str, property: &str, seek: &Value) -> Option<Vec<NodeId>> {
+    fn index_seek_eq(
+        &self,
+        label: &str,
+        property: &str,
+        seek: &Value,
+        carry: KeyValues,
+    ) -> Option<IndexSeekHits> {
         // `rmp` task #755, Slice S2 — the fix for "the planner picks the index, the plan REPORTS
         // `NodeIndexSeek`, and the runtime reads the whole store". This reader holds no `IndexSet` (its
         // `BTree`s are `&mut self` throughout, so even a `Send + Sync` one would be unusable behind
@@ -366,6 +372,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             property,
             seek,
             candidates.to_vec(),
+            carry,
         ))
     }
 
@@ -375,7 +382,8 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         property: &str,
         lower: Option<(&Value, bool)>,
         upper: Option<(&Value, bool)>,
-    ) -> Option<Vec<NodeId>> {
+        carry: KeyValues,
+    ) -> Option<IndexSeekHits> {
         // `rmp` task #768 — the range twin of `index_seek_eq` above. The reader holds no `IndexSet`, so
         // the range candidates come from the memo the engine thread captured at dispatch, keyed by the
         // same `(lower, upper)` the executor formed. A MISS (not captured, a `List` bound, a gate
@@ -400,6 +408,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             lower,
             upper,
             candidates.to_vec(),
+            carry,
         ))
     }
 
@@ -408,7 +417,8 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         label: &str,
         properties: &[String],
         values: &[Value],
-    ) -> Option<Vec<NodeId>> {
+        carry: KeyValues,
+    ) -> Option<CompositeSeekHits> {
         // `rmp` task #768 — the composite twin. Resolve the label + every property key to a token (a
         // missing token cannot match any composite index, so decline), then consult the memo keyed by
         // the full ordered property-token tuple. A MISS MUST decline to the exact
@@ -433,6 +443,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             properties,
             values,
             candidates.to_vec(),
+            carry,
         ))
     }
 

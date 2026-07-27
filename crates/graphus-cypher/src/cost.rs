@@ -1223,6 +1223,7 @@ mod tests {
             property: "age".to_owned(),
             value: int_expr(42),
             ordered: false,
+            cached_property: false,
             index: IndexId(0),
         }
     }

@@ -605,6 +605,79 @@ impl PhysicalOp {
         }
     }
 
+    /// The mutable twin of [`children`](Self::children) — the same sub-plans, in the same order, for a
+    /// pass that rewrites the tree in place (`rmp` task #879).
+    ///
+    /// Written as a direct mirror of `children` rather than a second traversal so the two cannot
+    /// disagree about what a sub-plan is; the arms are line-for-line the same shape, and a new
+    /// variant is a compile error in both.
+    #[must_use]
+    pub fn children_mut(&mut self) -> Vec<&mut PhysicalOp> {
+        match self {
+            // Leaves: no sub-plan.
+            Self::AllNodesScan { .. }
+            | Self::NodeByLabelScan { .. }
+            | Self::TokenLookupScan { .. }
+            | Self::NodeIndexSeek { .. }
+            | Self::NodeIndexMultiSeek { .. }
+            | Self::NodeCompositeIndexSeek { .. }
+            | Self::NodeLabelScanEq { .. }
+            | Self::NodeIndexRangeSeek { .. }
+            | Self::NodeIndexScan { .. }
+            | Self::NodeIndexStartsWithSeek { .. }
+            | Self::SpatialIndexSeek { .. }
+            | Self::NodeTextIndexSeek { .. }
+            | Self::AllRelationshipsScan { .. }
+            | Self::RelIndexSeek { .. }
+            | Self::RelIndexMultiSeek { .. }
+            | Self::RelIndexRangeSeek { .. }
+            | Self::RelCompositeIndexSeek { .. }
+            | Self::RelSpatialIndexSeek { .. }
+            | Self::Argument { .. }
+            | Self::Empty => Vec::new(),
+
+            // One sub-plan.
+            Self::ExpandAll { input, .. }
+            | Self::ExpandInto { input, .. }
+            | Self::NamedPath { input, .. }
+            | Self::ShortestPath { input, .. }
+            | Self::QuantifiedPath { input, .. }
+            | Self::Filter { input, .. }
+            | Self::Projection { input, .. }
+            | Self::Aggregation { input, .. }
+            | Self::Sort { input, .. }
+            | Self::TopN { input, .. }
+            | Self::Skip { input, .. }
+            | Self::Limit { input, .. }
+            | Self::Eager { input }
+            | Self::Unwind { input, .. }
+            | Self::LoadCsv { input, .. }
+            | Self::Optional { input, .. }
+            | Self::Create { input, .. }
+            | Self::Merge { input, .. }
+            | Self::SetClause { input, .. }
+            | Self::Delete { input, .. }
+            | Self::Remove { input, .. } => vec![input],
+
+            // The count-store operators' one sub-plan is their `fallback` (`rmp` task #866).
+            Self::NodeCountFromCountStore { fallback, .. }
+            | Self::RelationshipCountFromCountStore { fallback, .. } => vec![fallback],
+
+            // Two sub-plans.
+            Self::NestedLoopJoin { left, right }
+            | Self::HashJoin { left, right, .. }
+            | Self::ValueHashJoin { left, right, .. }
+            | Self::Union { left, right, .. } => vec![left, right],
+            // FOREACH's per-element update body is a sub-plan, rebuilt per element by the executor.
+            Self::Foreach { input, body, .. } => vec![input, body],
+
+            // An optional sub-plan (a leading `CALL` has no upstream relation).
+            Self::ProcedureCall { input, .. } => {
+                input.iter_mut().map(std::convert::AsMut::as_mut).collect()
+            }
+        }
+    }
+
     /// The operator's **type name** — the `operatorType` of a plan description (`rmp` #752).
     ///
     /// These are Graphus's own physical-operator names (the ones this crate's planner produces and this
@@ -832,6 +905,22 @@ pub enum PhysicalOp {
         /// part B); `false` leaves the emission order unspecified (node-id order in practice). Set only
         /// by [`elide_sort_over_ordered_index`].
         ordered: bool,
+        /// Make the seek's key property available **from this access path** to every later
+        /// reference on the same variable, instead of reading the store again (`rmp` task #879 —
+        /// Neo4j's *index-backed property lookup*, which renders the same fact as `cache[n.p]`).
+        ///
+        /// The re-check this operator performs already reads each surviving candidate's current
+        /// value; when this is set the executor keeps that value on the row and `crate::eval`
+        /// answers a later `n.p` from it. Set by [`mark_index_backed_properties`] from a purely
+        /// static fact — some expression in the plan reads that property of that variable, and the
+        /// plan mutates nothing — so the decision is safe to cache with the plan.
+        ///
+        /// It is a **plan-time intent**, not a runtime guarantee: if the seam declines at run time
+        /// (a `Populating` index, a rebuild the reader predates) the executor takes the exact scan
+        /// fallback, which carries nothing, and the later reference reads the store. `PROFILE` is
+        /// the runtime witness of which happened — the consuming operator charges a `dbHit` per row
+        /// it had to read.
+        cached_property: bool,
         /// The catalog index backing the seek.
         index: IndexId,
     },
@@ -903,6 +992,22 @@ pub enum PhysicalOp {
         properties: Vec<String>,
         /// The per-key equality seek values (parallel to `properties`; unevaluated AST).
         values: Vec<Expr>,
+        /// Make the seek's key properties — every covered key, in key order available **from this access path** to every later
+        /// reference on the same variable, instead of reading the store again (`rmp` task #879 —
+        /// Neo4j's *index-backed property lookup*, which renders the same fact as `cache[n.p]`).
+        ///
+        /// The re-check this operator performs already reads each surviving candidate's current
+        /// value; when this is set the executor keeps that value on the row and `crate::eval`
+        /// answers a later `n.p` from it. Set by [`mark_index_backed_properties`] from a purely
+        /// static fact — some expression in the plan reads that property of that variable, and the
+        /// plan mutates nothing — so the decision is safe to cache with the plan.
+        ///
+        /// It is a **plan-time intent**, not a runtime guarantee: if the seam declines at run time
+        /// (a `Populating` index, a rebuild the reader predates) the executor takes the exact scan
+        /// fallback, which carries nothing, and the later reference reads the store. `PROFILE` is
+        /// the runtime witness of which happened — the consuming operator charges a `dbHit` per row
+        /// it had to read.
+        cached_property: bool,
         /// The catalog index backing the seek.
         index: IndexId,
     },
@@ -946,6 +1051,22 @@ pub enum PhysicalOp {
         /// part B); `false` leaves the emission order unspecified (node-id order in practice). Set only
         /// by [`elide_sort_over_ordered_index`].
         ordered: bool,
+        /// Make the seek's key property available **from this access path** to every later
+        /// reference on the same variable, instead of reading the store again (`rmp` task #879 —
+        /// Neo4j's *index-backed property lookup*, which renders the same fact as `cache[n.p]`).
+        ///
+        /// The re-check this operator performs already reads each surviving candidate's current
+        /// value; when this is set the executor keeps that value on the row and `crate::eval`
+        /// answers a later `n.p` from it. Set by [`mark_index_backed_properties`] from a purely
+        /// static fact — some expression in the plan reads that property of that variable, and the
+        /// plan mutates nothing — so the decision is safe to cache with the plan.
+        ///
+        /// It is a **plan-time intent**, not a runtime guarantee: if the seam declines at run time
+        /// (a `Populating` index, a rebuild the reader predates) the executor takes the exact scan
+        /// fallback, which carries nothing, and the later reference reads the store. `PROFILE` is
+        /// the runtime witness of which happened — the consuming operator charges a `dbHit` per row
+        /// it had to read.
+        cached_property: bool,
         /// The catalog index backing the seek.
         index: IndexId,
     },
@@ -977,6 +1098,22 @@ pub enum PhysicalOp {
         /// Emit candidates in ascending Cypher `property` order (ties broken by node id) to satisfy a
         /// provided-order `ORDER BY property`; `false` leaves the emission order unspecified.
         ordered: bool,
+        /// Make the seek's key property available **from this access path** to every later
+        /// reference on the same variable, instead of reading the store again (`rmp` task #879 —
+        /// Neo4j's *index-backed property lookup*, which renders the same fact as `cache[n.p]`).
+        ///
+        /// The re-check this operator performs already reads each surviving candidate's current
+        /// value; when this is set the executor keeps that value on the row and `crate::eval`
+        /// answers a later `n.p` from it. Set by [`mark_index_backed_properties`] from a purely
+        /// static fact — some expression in the plan reads that property of that variable, and the
+        /// plan mutates nothing — so the decision is safe to cache with the plan.
+        ///
+        /// It is a **plan-time intent**, not a runtime guarantee: if the seam declines at run time
+        /// (a `Populating` index, a rebuild the reader predates) the executor takes the exact scan
+        /// fallback, which carries nothing, and the later reference reads the store. `PROFILE` is
+        /// the runtime witness of which happened — the consuming operator charges a `dbHit` per row
+        /// it had to read.
+        cached_property: bool,
         /// The catalog index backing the scan.
         index: IndexId,
     },
@@ -1933,7 +2070,7 @@ pub fn plan_physical_with_stats(
     // dependencies are recomputed from the final tree it produces. Either way the provided-order
     // Sort-elision pass (`rmp` #665) runs last on the final tree; it is order-preserving (not
     // cost-based), so it applies on both paths without changing the result multiset.
-    let (root, index_dependencies) = match stats {
+    let (mut root, index_dependencies) = match stats {
         Some(s) => {
             let optimized = optimize(rule_based, catalog, s);
             // Provided-order Sort elision (`rmp` task #665, part B) runs as the FINAL pass, after the
@@ -1957,6 +2094,11 @@ pub fn plan_physical_with_stats(
             deps,
         ),
     };
+
+    // Index-backed property lookup (`rmp` task #879) runs DEAD LAST, on the tree that will actually
+    // execute: it reads which properties the finished plan references and which access paths remain,
+    // so a cost-reverted seek or a count-store rewrite cannot leave a stale `cache[...]` behind.
+    mark_index_backed_properties(&mut root);
 
     PhysicalPlan {
         root,
@@ -2461,6 +2603,9 @@ impl Planner<'_> {
                     label: label.clone(),
                     properties: idx.properties.clone(),
                     values,
+                    // `rmp` #879: the post-pass `mark_index_backed_properties` decides this from the
+                    // finished plan, which does not exist yet here.
+                    cached_property: false,
                     index: idx.id,
                 };
                 let residual: Vec<&Expr> = conjuncts
@@ -2647,6 +2792,7 @@ impl Planner<'_> {
                         label: label.clone(),
                         property,
                         ordered: false,
+                        cached_property: false, // `rmp` #879 post-pass decides
                         index: idx.id,
                     };
                     return attach_residual(scan, &conjuncts);
@@ -2788,6 +2934,9 @@ impl Planner<'_> {
                     label: label.clone(),
                     properties: idx.properties.clone(),
                     values,
+                    // `rmp` #879: the post-pass `mark_index_backed_properties` decides this from the
+                    // finished plan, which does not exist yet here.
+                    cached_property: false,
                     index: idx.id,
                 };
                 return Some(finish(self, seek, &consumed, deps));
@@ -4842,6 +4991,12 @@ pub fn plan_physical_hinted(
         )?;
     }
     plan.index_dependencies = collect_index_dependencies(&plan.root);
+    // A hint can replace an access path outright (`USING SCAN` turns a seek into a scan, `USING INDEX`
+    // the reverse), so re-derive the index-backed property marks over the FINAL tree — the same
+    // "runs dead last" invariant `plan_physical_with_stats` establishes (`rmp` task #879). Without
+    // this a hinted plan could carry a mark that describes an operator the hint removed, which is
+    // exactly the `rmp` #755 class of plan/run divergence.
+    mark_index_backed_properties(&mut plan.root);
     Ok(plan)
 }
 
@@ -5168,6 +5323,277 @@ fn cheaper(a: PhysicalOp, b: PhysicalOp, stats: &dyn Statistics) -> PhysicalOp {
     let cb = estimate_cost(&b, Some(stats)).cost;
     // Strictly-less keeps `a` on a tie: the rule-based shape is the deterministic default.
     if cb < ca { b } else { a }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Index-backed property lookup (`rmp` task #879)
+// -------------------------------------------------------------------------------------------------
+
+/// Marks every node index access path whose key propert(ies) the plan reads again, so the executor
+/// keeps the value the access path already read instead of fetching it a second time (`rmp` task
+/// #879 — Neo4j's *index-backed property lookup*, plan-rendered as `cache[n.p]`).
+///
+/// # Why the flag can be wrong in either direction without being unsafe
+///
+/// This pass decides **nothing semantic**. Setting it where nothing reads the property costs one
+/// retained [`Value`](graphus_core::Value) per row and saves nothing; leaving it clear where something
+/// does costs one store read per reference and saves nothing. Correctness lives entirely at the two
+/// ends: the seam only ever carries the value it read *through the seam* under this snapshot, and
+/// [`Row::cached_property`](crate::runtime::Row::cached_property) refuses to answer unless the row
+/// still binds the variable to the node the value came from. That is what lets this pass be a plain
+/// syntactic scan instead of a dataflow analysis, and why a missed reference is a missed optimisation
+/// rather than a defect.
+///
+/// # The one gate that is load-bearing: the plan must not mutate
+///
+/// A carried value is a snapshot of the store at the moment the access path ran. In a **read-only**
+/// plan nothing can move it: MVCC gives the statement a fixed snapshot and no operator writes. In a
+/// mutating plan it can go stale within a single statement —
+/// `MATCH (n:P {name: 'x'}) SET n.name = 'y' RETURN n.name` must return `'y'`, and a value carried by
+/// the seek says `'x'`. Aliasing makes a narrower rule unreliable (`SET` can reach the same node
+/// through a *different* variable), so the gate is the whole plan: any write operator, and any
+/// `CALL` (a procedure is opaque and may write), and this pass marks nothing at all.
+///
+/// `crate::eval` additionally re-checks node identity per row, which independently covers `OPTIONAL
+/// MATCH` null rows, a variable re-bound by a later clause, and an in-place binding overwrite.
+fn mark_index_backed_properties(root: &mut PhysicalOp) {
+    // The gate: a plan that can mutate the graph, or that calls an opaque procedure, caches nothing.
+    // Both are the crate's EXISTING structural predicates, and both classify every `PhysicalOp`
+    // variant explicitly with no `_` arm, so a new operator cannot slip past this gate unclassified —
+    // it is a compile error in `contains_write` / `contains_procedure_call` first.
+    if contains_write(root) || contains_procedure_call(root) {
+        return;
+    }
+    let mut referenced: BTreeSet<(String, String)> = BTreeSet::new();
+    collect_plan_property_refs(root, &mut referenced);
+    if referenced.is_empty() {
+        return;
+    }
+    set_cached_property_flags(root, &referenced);
+}
+
+/// Collects every `variable.property` the plan reads, over the whole tree.
+///
+/// Recursion uses [`PhysicalOp::children`], the crate's single authoritative sub-plan enumeration, so
+/// a new operator is traversed without this function knowing about it. Only the **expressions** are
+/// enumerated per variant below.
+fn collect_plan_property_refs(op: &PhysicalOp, out: &mut BTreeSet<(String, String)>) {
+    for expr in op_expressions(op) {
+        collect_property_refs(expr, out);
+    }
+    for child in op.children() {
+        collect_plan_property_refs(child, out);
+    }
+}
+
+/// Every [`Expr`] an operator evaluates itself (not counting its sub-plans').
+///
+/// Exhaustive by construction — there is no `_` arm — so a new [`PhysicalOp`] variant is a compile
+/// error here and its author must decide. Both decisions are safe (see
+/// [`mark_index_backed_properties`]); the point of the exhaustive match is that the decision is
+/// *taken*, not defaulted.
+fn op_expressions(op: &PhysicalOp) -> Vec<&Expr> {
+    match op {
+        // --- the expression-bearing read operators ---------------------------------------------
+        PhysicalOp::Filter { predicate, .. } => vec![predicate],
+        PhysicalOp::Projection { items, .. } => items.iter().map(|c| &c.expr).collect(),
+        PhysicalOp::Aggregation {
+            group_keys,
+            aggregates,
+            ..
+        } => group_keys
+            .iter()
+            .chain(aggregates.iter())
+            .map(|c| &c.expr)
+            .collect(),
+        PhysicalOp::Sort { keys, .. } => keys.iter().map(|k| &k.expr).collect(),
+        PhysicalOp::TopN { keys, limit, .. } => keys
+            .iter()
+            .map(|k| &k.expr)
+            .chain(std::iter::once(limit))
+            .collect(),
+        PhysicalOp::Skip { count, .. } | PhysicalOp::Limit { count, .. } => vec![count],
+        PhysicalOp::Unwind { list, .. } => vec![list],
+        PhysicalOp::LoadCsv { url, .. } => vec![url],
+        PhysicalOp::ValueHashJoin {
+            left_key,
+            right_key,
+            ..
+        } => vec![left_key, right_key],
+        PhysicalOp::ExpandAll { rel_props, .. } | PhysicalOp::ExpandInto { rel_props, .. } => {
+            rel_props.iter().collect()
+        }
+        PhysicalOp::QuantifiedPath {
+            interior_predicate, ..
+        } => interior_predicate.iter().collect(),
+        // The access paths' own key expressions. A seek's key can itself read a property (a
+        // correlated seek, `rmp` #708: `MATCH (b:L {p: t.uid})` reads `t.uid`), so they are collected
+        // like any other expression — the reference is to the LEFT branch's variable, never to the
+        // seek's own, so this can never make an access path cache on account of itself.
+        PhysicalOp::NodeIndexSeek { value, .. }
+        | PhysicalOp::NodeLabelScanEq { value, .. }
+        | PhysicalOp::NodeIndexRangeSeek { value, .. }
+        | PhysicalOp::RelIndexSeek { value, .. }
+        | PhysicalOp::RelIndexRangeSeek { value, .. } => vec![value],
+        PhysicalOp::NodeIndexMultiSeek { values, .. }
+        | PhysicalOp::NodeCompositeIndexSeek { values, .. }
+        | PhysicalOp::RelIndexMultiSeek { values, .. }
+        | PhysicalOp::RelCompositeIndexSeek { values, .. } => values.iter().collect(),
+        PhysicalOp::NodeIndexStartsWithSeek { prefix, .. } => vec![prefix],
+        PhysicalOp::NodeTextIndexSeek { needle, .. } => vec![needle],
+        // --- read operators that evaluate no expression of their own ---------------------------
+        PhysicalOp::AllNodesScan { .. }
+        | PhysicalOp::NodeByLabelScan { .. }
+        | PhysicalOp::TokenLookupScan { .. }
+        | PhysicalOp::NodeIndexScan { .. }
+        | PhysicalOp::SpatialIndexSeek { .. }
+        | PhysicalOp::AllRelationshipsScan { .. }
+        | PhysicalOp::RelSpatialIndexSeek { .. }
+        | PhysicalOp::Argument { .. }
+        | PhysicalOp::Empty
+        | PhysicalOp::NamedPath { .. }
+        | PhysicalOp::ShortestPath { .. }
+        | PhysicalOp::NodeCountFromCountStore { .. }
+        | PhysicalOp::RelationshipCountFromCountStore { .. }
+        | PhysicalOp::Eager { .. }
+        | PhysicalOp::NestedLoopJoin { .. }
+        | PhysicalOp::HashJoin { .. }
+        | PhysicalOp::Union { .. }
+        | PhysicalOp::Optional { .. } => Vec::new(),
+        // --- the mutating / opaque operators ----------------------------------------------------
+        // Unreachable: `mark_index_backed_properties` returns before walking a plan that contains any
+        // of these. Enumerated anyway so the match is exhaustive without an `_` arm, and returning
+        // nothing keeps this function total if it is ever reused in another context.
+        PhysicalOp::Create { .. }
+        | PhysicalOp::Merge { .. }
+        | PhysicalOp::SetClause { .. }
+        | PhysicalOp::Delete { .. }
+        | PhysicalOp::Remove { .. }
+        | PhysicalOp::Foreach { .. }
+        | PhysicalOp::ProcedureCall { .. } => Vec::new(),
+    }
+}
+
+/// Collects `variable.property` pairs read by `expr`.
+///
+/// Exhaustive over [`ExprKind`], again with no `_` arm. The nested-query and comprehension forms are
+/// **deliberately not descended**: their bodies carry their own scopes and binders, so a `n.p` inside
+/// one may denote a different `n`. Not descending can only *miss* a reference, which costs an
+/// optimisation and never a row (see [`mark_index_backed_properties`]).
+fn collect_property_refs(expr: &Expr, out: &mut BTreeSet<(String, String)>) {
+    match &expr.kind {
+        ExprKind::Property { base, key } => {
+            if let ExprKind::Variable(name) = &base.kind {
+                out.insert((name.clone(), key.clone()));
+            } else {
+                collect_property_refs(base, out);
+            }
+        }
+        ExprKind::Literal(_)
+        | ExprKind::Parameter(_)
+        | ExprKind::Variable(_)
+        | ExprKind::CountStar => {}
+        ExprKind::Binary { lhs, rhs, .. } => {
+            collect_property_refs(lhs, out);
+            collect_property_refs(rhs, out);
+        }
+        ExprKind::Unary { operand, .. }
+        | ExprKind::HasLabels { operand, .. }
+        | ExprKind::TypePredicate { operand, .. }
+        | ExprKind::NormalizedPredicate { operand, .. } => collect_property_refs(operand, out),
+        ExprKind::Predicate { operand, rhs, .. } => {
+            collect_property_refs(operand, out);
+            if let Some(rhs) = rhs {
+                collect_property_refs(rhs, out);
+            }
+        }
+        ExprKind::Index { base, index } => {
+            collect_property_refs(base, out);
+            collect_property_refs(index, out);
+        }
+        ExprKind::Slice { base, low, high } => {
+            collect_property_refs(base, out);
+            for e in low.iter().chain(high.iter()) {
+                collect_property_refs(e, out);
+            }
+        }
+        ExprKind::FunctionCall { args, .. } | ExprKind::List(args) => {
+            for a in args {
+                collect_property_refs(a, out);
+            }
+        }
+        ExprKind::Map(entries) => {
+            for (_, v) in entries {
+                collect_property_refs(v, out);
+            }
+        }
+        ExprKind::Case(case) => {
+            for e in case
+                .subject
+                .iter()
+                .map(std::convert::AsRef::as_ref)
+                .chain(case.alternatives.iter().flat_map(|a| [&a.when, &a.then]))
+                .chain(case.else_expr.iter().map(std::convert::AsRef::as_ref))
+            {
+                collect_property_refs(e, out);
+            }
+        }
+        // Own scope / own binders — not descended (see the function docs).
+        ExprKind::ListComprehension(_)
+        | ExprKind::PatternComprehension(_)
+        | ExprKind::Quantifier(_)
+        | ExprKind::Reduce(_)
+        | ExprKind::MapProjection(_)
+        | ExprKind::ExistsSubquery(_)
+        | ExprKind::CountSubquery(_)
+        | ExprKind::CollectSubquery(_) => {}
+    }
+}
+
+/// Sets `cached_property` on every node index access path whose `(variable, property)` the plan
+/// reads. Recurses through [`PhysicalOp::children_mut`] so no sub-plan is missed.
+fn set_cached_property_flags(op: &mut PhysicalOp, referenced: &BTreeSet<(String, String)>) {
+    let wants = |variable: &Var, property: &str| {
+        referenced.contains(&(variable.name.clone(), property.to_owned()))
+    };
+    match op {
+        PhysicalOp::NodeIndexSeek {
+            variable,
+            property,
+            cached_property,
+            ..
+        }
+        | PhysicalOp::NodeIndexRangeSeek {
+            variable,
+            property,
+            cached_property,
+            ..
+        }
+        | PhysicalOp::NodeIndexScan {
+            variable,
+            property,
+            cached_property,
+            ..
+        } => *cached_property = wants(variable, property),
+        PhysicalOp::NodeCompositeIndexSeek {
+            variable,
+            properties,
+            cached_property,
+            ..
+        } => {
+            // The seam reads the whole tuple to re-check it, so referencing ANY covered key makes the
+            // whole tuple worth carrying — there is no cheaper "carry only key 2".
+            *cached_property = properties.iter().any(|p| wants(variable, p));
+        }
+        // Every other operator: nothing to mark. A wildcard is safe HERE — unlike in the classifying
+        // predicates above — because not marking is precisely the "do not cache" answer, so an
+        // operator this pass does not know about keeps reading the store, which is the reference
+        // behaviour. An access path that later wants to carry its key adds its own arm.
+        _ => {}
+    }
+    for child in op.children_mut() {
+        set_cached_property_flags(child, referenced);
+    }
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -5771,6 +6197,7 @@ fn mark_ordered_index(op: PhysicalOp, var: &str, prop: &str) -> (PhysicalOp, boo
             label,
             property,
             ordered: _,
+            cached_property,
             index,
         } if variable.name == var && property == prop => (
             PhysicalOp::NodeIndexScan {
@@ -5778,6 +6205,7 @@ fn mark_ordered_index(op: PhysicalOp, var: &str, prop: &str) -> (PhysicalOp, boo
                 label,
                 property,
                 ordered: true,
+                cached_property,
                 index,
             },
             true,
@@ -5789,6 +6217,7 @@ fn mark_ordered_index(op: PhysicalOp, var: &str, prop: &str) -> (PhysicalOp, boo
             bound,
             value,
             ordered: _,
+            cached_property,
             index,
         } if variable.name == var && property == prop => (
             PhysicalOp::NodeIndexRangeSeek {
@@ -5798,6 +6227,7 @@ fn mark_ordered_index(op: PhysicalOp, var: &str, prop: &str) -> (PhysicalOp, boo
                 bound,
                 value,
                 ordered: true,
+                cached_property,
                 index,
             },
             true,
@@ -5808,6 +6238,7 @@ fn mark_ordered_index(op: PhysicalOp, var: &str, prop: &str) -> (PhysicalOp, boo
             property,
             value,
             ordered: _,
+            cached_property,
             index,
         } if variable.name == var && property == prop => (
             PhysicalOp::NodeIndexSeek {
@@ -5816,6 +6247,7 @@ fn mark_ordered_index(op: PhysicalOp, var: &str, prop: &str) -> (PhysicalOp, boo
                 property,
                 value,
                 ordered: true,
+                cached_property,
                 index,
             },
             true,
@@ -7039,6 +7471,9 @@ fn build_seek(variable: &Var, label: &Label, pp: &PropertyPredicate, index: Inde
             property: pp.property.clone(),
             value: value.clone(),
             ordered: false,
+            // `rmp` #879, like `ordered` above: flipped on later by the whole-plan post-pass
+            // `mark_index_backed_properties`, which needs the finished plan to see the references.
+            cached_property: false,
             index,
         },
         PropertyPredicateKind::Range { bound, value } => PhysicalOp::NodeIndexRangeSeek {
@@ -7048,6 +7483,7 @@ fn build_seek(variable: &Var, label: &Label, pp: &PropertyPredicate, index: Inde
             bound: *bound,
             value: value.clone(),
             ordered: false,
+            cached_property: false, // see the equality arm above (`rmp` #879)
             index,
         },
     }
@@ -7070,6 +7506,28 @@ fn display_expr_list(values: &[Expr]) -> String {
 /// byte-identical; ` ordered asc` when the provided-order rewrite has elided a `Sort` onto it.
 fn ordered_suffix(ordered: bool) -> &'static str {
     if ordered { " ordered asc" } else { "" }
+}
+
+/// The `Display` suffix marking an index access path as making its key propert(ies) available to the
+/// operators above it, so a later `n.p` is answered from the row (`rmp` task #879).
+///
+/// Renders Neo4j's spelling — ` cache[n.name]`, or ` cache[n.a, n.b]` for a composite key — and is
+/// **empty** when the plan does not cache, so every existing plan rendering stays byte-identical and
+/// no test that asserts on a plan string had to be touched for a query this does not change.
+///
+/// It states the **planner's** decision. What actually happened at run time is witnessed by `PROFILE`:
+/// an operator that had to read the store charges a `dbHit` per row, and one served from the row
+/// charges none. See [`PhysicalOp::NodeIndexSeek::cached_property`].
+fn cache_suffix(cached: bool, variable: &Var, properties: &[String]) -> String {
+    if !cached {
+        return String::new();
+    }
+    let keys = properties
+        .iter()
+        .map(|p| format!("{variable}.{p}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(" cache[{keys}]")
 }
 
 /// Re-attaches the residual conjuncts (everything not consumed by a seek) as a single
@@ -7552,13 +8010,15 @@ impl PhysicalOp {
                 property,
                 value,
                 ordered,
+                cached_property,
                 index,
             } => writeln!(
                 f,
-                "NodeIndexSeek({variable}:{} {property} = {} via {index}{})",
+                "NodeIndexSeek({variable}:{} {property} = {} via {index}{}{})",
                 label.name,
                 h::expr(value),
                 ordered_suffix(*ordered),
+                cache_suffix(*cached_property, variable, std::slice::from_ref(property)),
             ),
             Self::NodeIndexMultiSeek {
                 variable,
@@ -7577,6 +8037,7 @@ impl PhysicalOp {
                 label,
                 properties,
                 values,
+                cached_property,
                 index,
             } => {
                 let keys = properties
@@ -7587,8 +8048,9 @@ impl PhysicalOp {
                     .join(", ");
                 writeln!(
                     f,
-                    "NodeCompositeIndexSeek({variable}:{} {keys} via {index})",
+                    "NodeCompositeIndexSeek({variable}:{} {keys} via {index}{})",
                     label.name,
+                    cache_suffix(*cached_property, variable, properties),
                 )
             }
             Self::NodeLabelScanEq {
@@ -7609,26 +8071,30 @@ impl PhysicalOp {
                 bound,
                 value,
                 ordered,
+                cached_property,
                 index,
             } => writeln!(
                 f,
-                "NodeIndexRangeSeek({variable}:{} {property} {} {} via {index}{})",
+                "NodeIndexRangeSeek({variable}:{} {property} {} {} via {index}{}{})",
                 label.name,
                 bound.symbol(),
                 h::expr(value),
                 ordered_suffix(*ordered),
+                cache_suffix(*cached_property, variable, std::slice::from_ref(property)),
             ),
             Self::NodeIndexScan {
                 variable,
                 label,
                 property,
                 ordered,
+                cached_property,
                 index,
             } => writeln!(
                 f,
-                "NodeIndexScan({variable}:{} {property} via {index}{})",
+                "NodeIndexScan({variable}:{} {property} via {index}{}{})",
                 label.name,
                 ordered_suffix(*ordered),
+                cache_suffix(*cached_property, variable, std::slice::from_ref(property)),
             ),
             Self::NodeIndexStartsWithSeek {
                 variable,

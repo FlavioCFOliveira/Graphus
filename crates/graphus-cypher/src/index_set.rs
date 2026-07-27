@@ -574,6 +574,27 @@ struct NodePropertyIndex {
     /// The build state, mirrored from the durable catalog. Only an [`IndexState::Online`] index is
     /// surfaced to the planner; a [`IndexState::Populating`] one falls back to a scan + filter.
     state: IndexState,
+    /// Whether a **present, non-null** value was ever refused by the key codec, leaving this tree a
+    /// strict subset of the nodes that carry the property (`rmp` task #879, found while certifying
+    /// it).
+    ///
+    /// [`is_index_encodable`] refuses `{Null, List, Map}`. `Null` is correct to skip — a null
+    /// property is *absent* for every index purpose, exactly as Cypher treats it in equality and
+    /// range predicates. A `List` is not: it is a present value that
+    /// `WHERE n.p IS NOT NULL` must return, and the
+    /// [`NodeIndexScan`](crate::physical::PhysicalOp::NodeIndexScan) access path (`rmp` #665) answers
+    /// that predicate by scanning **the whole index**, on the premise that every non-null value is in
+    /// it. With a `List` in the column the premise fails and the row is silently lost — measured:
+    /// three nodes with `v` set to `1`, `[1,2,3]` and `'abc'` returned **3** rows through the label
+    /// scan and **2** through `NodeIndexScan`. Declaring an index changed the answer, which is the
+    /// defect class `rmp` #680/#738/#894 exist to eliminate.
+    ///
+    /// Only the **unbounded** scan is affected: a bounded seek (`= v`, `> v`, `STARTS WITH …`) never
+    /// matches a `List` anyway (cross-type comparison is `null`, and a `List` bound declines
+    /// upstream), so its absence from the tree costs nothing. So this flag gates exactly that one
+    /// access path, rather than disabling the index (see
+    /// [`node_property_index_is_complete`](IndexSet::node_property_index_is_complete)).
+    unindexable_values: bool,
 }
 
 /// A declared relationship-property index plus its durable build [`IndexState`] (`rmp` task #646) —
@@ -858,6 +879,7 @@ impl IndexSet {
             .or_insert_with(|| NodePropertyIndex {
                 index: PropertyIndex::new(fresh_tree()),
                 state,
+                unindexable_values: false,
             });
     }
 
@@ -1294,6 +1316,10 @@ impl IndexSet {
         self.ft_demoted_blockers.clear();
         for np in self.node_props.values_mut() {
             np.index = PropertyIndex::new(fresh_tree());
+            // The rebuild about to refill this tree re-derives the flag from the store it reads, so a
+            // stale `true` from a value that has since been overwritten would strand the existence
+            // scan on the slow path forever (`rmp` task #879). Mirrors `rebuild_gap` above.
+            np.unindexable_values = false;
         }
         // Relationship-property indexes (`rmp` task #646): recreate each backing tree to drop its
         // entries while keeping the registered `(rel_type_token, prop_key)` set + state, exactly like
@@ -1714,8 +1740,34 @@ impl IndexSet {
             // absent for index purposes, matching Cypher's treatment in equality/range predicates.
             // Maintained regardless of state: keeping a `Populating` index up to date is harmless (it
             // is simply not yet exposed to the planner, see `online_node_properties`).
-            let _ = np.index.insert(EPHEMERAL_TXN, prop_key, value, node_id);
+            //
+            // A **non-null** refusal is different and must be REMEMBERED (`rmp` task #879): the tree
+            // is now a strict subset of the nodes carrying the property, which invalidates the
+            // whole-index existence scan. See [`NodePropertyIndex::unindexable_values`].
+            if np
+                .index
+                .insert(EPHEMERAL_TXN, prop_key, value, node_id)
+                .is_err()
+                && !matches!(value, Value::Null)
+            {
+                np.unindexable_values = true;
+            }
         }
+    }
+
+    /// Whether this node-property index holds an entry for **every** node that carries a non-null
+    /// value for the property — the premise the whole-index existence scan rests on (`rmp` task
+    /// #879).
+    ///
+    /// `false` means at least one present value was refused by the key codec (a `List`), so
+    /// `MATCH (n:L) WHERE n.p IS NOT NULL` must **not** be answered by scanning this tree; the caller
+    /// declines to the exact label scan + residual filter. Returns `true` for an unregistered index —
+    /// the caller has already established registration, and a missing entry declines earlier anyway.
+    #[must_use]
+    pub fn node_property_index_is_complete(&self, label_token: u32, prop_key: u32) -> bool {
+        self.node_props
+            .get(&(label_token, prop_key))
+            .is_none_or(|np| !np.unindexable_values)
     }
 
     /// Candidate node ids carrying `label_token`, ascending. The caller re-checks visibility and
@@ -2310,6 +2362,16 @@ impl IndexSet {
         for (label_token, prop_key, lower, upper) in requests {
             // GATE 2: only an `Online` index may answer.
             if self.node_property_state(*label_token, *prop_key) != Some(IndexState::Online) {
+                continue;
+            }
+            // GATE 4 (`rmp` task #879): an UNBOUNDED range is the whole-index existence scan, which is
+            // only correct over a tree holding every node that carries the property. A `List` in the
+            // column leaves it a strict subset, so capture nothing and let the reader decline to the
+            // exact scan — the same verdict the inline seam reaches in `index_seek_range`.
+            if lower.is_none()
+                && upper.is_none()
+                && !self.node_property_index_is_complete(*label_token, *prop_key)
+            {
                 continue;
             }
             let lo = lower.as_ref().map(|(v, inc)| (v, *inc));

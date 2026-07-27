@@ -243,8 +243,8 @@ fn tuples_match(a: &[Value], b: &[Value]) -> bool {
 
 use crate::constraint::{ConstraintViolation, ViolationEntity};
 use crate::graph_access::{
-    DeletedEntity, ExpandDirection, GraphAccess, Incident, NodeId, RelData, RelId, ScanFilter,
-    ScannedRel, VectorQueryResult,
+    CompositeSeekHits, DeletedEntity, ExpandDirection, GraphAccess, Incident, IndexSeekHits,
+    KeyValues, NodeId, RelData, RelId, ScanFilter, ScannedRel, VectorQueryResult,
 };
 use crate::index_set::{ConstraintRule, IndexSet};
 use crate::read_source::{self, LiveSource, ReadSink, VisCtx};
@@ -3256,17 +3256,19 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // Prefer the index path (`index_seek_eq` returns store-re-checked matching ids); fall back to
         // a full label scan + value re-check when no index is registered. Either way the candidates
         // are exact matches, so the first one that is not `self_node` is a genuine duplicate.
-        let matches: Vec<NodeId> =
-            self.index_seek_eq(label, property, value)
-                .unwrap_or_else(|| {
-                    self.scan_nodes_by_label(label)
-                        .into_iter()
-                        .filter(|id| {
-                            self.node_property(*id, property)
-                                .is_some_and(|v| crate::equality::equals(&v, value).is_true())
-                        })
-                        .collect()
-                });
+        // The write path wants ids only, never the carried values (`rmp` #879): `KeyValues::Discard`.
+        let matches: Vec<NodeId> = self
+            .index_seek_eq(label, property, value, KeyValues::Discard)
+            .map(|hits| hits.matched)
+            .unwrap_or_else(|| {
+                self.scan_nodes_by_label(label)
+                    .into_iter()
+                    .filter(|id| {
+                        self.node_property(*id, property)
+                            .is_some_and(|v| crate::equality::equals(&v, value).is_true())
+                    })
+                    .collect()
+            });
         matches.into_iter().find(|id| *id != self_node).map(|n| n.0)
     }
 
@@ -4425,7 +4427,13 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         )
     }
 
-    fn index_seek_eq(&self, label: &str, property: &str, seek: &Value) -> Option<Vec<NodeId>> {
+    fn index_seek_eq(
+        &self,
+        label: &str,
+        property: &str,
+        seek: &Value,
+        carry: KeyValues,
+    ) -> Option<IndexSeekHits> {
         // Only the coordinated path has a derived index; otherwise the executor falls back to
         // `scan_filter_eq` (`rmp` task #48).
         let index = self.index.as_ref()?;
@@ -4498,6 +4506,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             property,
             seek,
             candidates,
+            carry,
         ))
     }
 
@@ -4524,7 +4533,8 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         property: &str,
         lower: Option<(&Value, bool)>,
         upper: Option<(&Value, bool)>,
-    ) -> Option<Vec<NodeId>> {
+        carry: KeyValues,
+    ) -> Option<IndexSeekHits> {
         let index = self.index.as_ref()?;
         let label_token = self.label_id_existing(label)?;
         let prop_key = self.store.borrow().token_id(Namespace::PropKey, property)?;
@@ -4544,6 +4554,22 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // `scan_filter_range` fallback owns the SSI footprint exactly once. See `rebuilt_trees_serve_reader`.
         if !self.rebuilt_trees_serve_reader(index) {
             return None; // reader predates the rebuild: exact scan fallback (snapshot-correct)
+        }
+        // **AND** an UNBOUNDED range — the whole-index existence scan behind
+        // `MATCH (n:L) WHERE n.p IS NOT NULL` (`rmp` #665) — may only be served by a tree that holds
+        // an entry for every node carrying the property. The key codec refuses a `List`, so a column
+        // containing one leaves the tree a strict SUBSET and the scan silently loses that row:
+        // measured 3 rows via the label scan vs 2 via `NodeIndexScan`, i.e. declaring an index changed
+        // the answer (`rmp` task #879; the `rmp` #680/#738/#894 defect class). A BOUNDED seek is
+        // unaffected — a `List` satisfies no cross-type comparison, so it is not a match to lose — so
+        // only this one shape declines, to the exact `scan_nodes_by_label` + residual `IS NOT NULL`.
+        if lower.is_none()
+            && upper.is_none()
+            && !index
+                .borrow()
+                .node_property_index_is_complete(label_token, prop_key)
+        {
+            return None; // incomplete tree: exact scan fallback
         }
 
         // Candidate ids for the requested range (a superset; see `IndexSet::seek_node_property_range`).
@@ -4576,6 +4602,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             lower,
             upper,
             candidates,
+            carry,
         ))
     }
 
@@ -4584,7 +4611,8 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         label: &str,
         properties: &[String],
         values: &[Value],
-    ) -> Option<Vec<NodeId>> {
+        carry: KeyValues,
+    ) -> Option<CompositeSeekHits> {
         // Only the coordinated path has a derived index; otherwise fall back to a scan + filter
         // (`rmp` task #657).
         let index = self.index.as_ref()?;
@@ -4632,6 +4660,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             properties,
             values,
             candidates,
+            carry,
         ))
     }
 
