@@ -618,6 +618,11 @@ impl PhysicalOp {
             | Self::Union { left, right, .. } => vec![left, right],
             // FOREACH's per-element update body is a sub-plan, rebuilt per element by the executor.
             Self::Foreach { input, body, .. } => vec![input, body],
+            // `rmp` #869: the semi-join's correlated inner branch is a genuine child, not a hidden
+            // template. `EXPLAIN` must show the subquery's access path (that is the whole point of the
+            // operator) and `PROFILE` must attribute its rows and `dbHits`, which is how a reader tells
+            // that the seek inside the subquery really ran.
+            Self::SemiApply { input, inner, .. } => vec![input, inner],
 
             // An optional sub-plan (a leading `CALL` has no upstream relation).
             Self::ProcedureCall { input, .. } => {
@@ -693,6 +698,8 @@ impl PhysicalOp {
             | Self::Union { left, right, .. } => vec![left, right],
             // FOREACH's per-element update body is a sub-plan, rebuilt per element by the executor.
             Self::Foreach { input, body, .. } => vec![input, body],
+            // `rmp` #869: mirrors `children` — the semi-join's inner branch is a real sub-plan.
+            Self::SemiApply { input, inner, .. } => vec![input, inner],
 
             // An optional sub-plan (a leading `CALL` has no upstream relation).
             Self::ProcedureCall { input, .. } => {
@@ -758,6 +765,11 @@ impl PhysicalOp {
             // `OptionalExpand(Into)`; Graphus reports its own operator names.)
             Self::OptionalExpand { into: false, .. } => "OptionalExpandAll",
             Self::OptionalExpand { into: true, .. } => "OptionalExpandInto",
+            // `rmp` #869. Two names for one variant, as above: `SemiApply` and `AntiSemiApply` are
+            // distinct operators to a client reading a plan, and which one ran is exactly the
+            // distinction `EXISTS` vs `NOT EXISTS` makes. (The names are Neo4j's for this shape.)
+            Self::SemiApply { anti: false, .. } => "SemiApply",
+            Self::SemiApply { anti: true, .. } => "AntiSemiApply",
             Self::Create { .. } => "Create",
             Self::Merge { .. } => "Merge",
             Self::SetClause { .. } => "SetClause",
@@ -780,16 +792,38 @@ impl PhysicalOp {
     }
 
     /// For an [`OptionalExpand`](Self::OptionalExpand), the `NestedLoopJoin`/`Optional` plan it
-    /// replaces — its **semantic definition** (`rmp` task #882). `None` for every other operator.
+    /// replaces — its **semantic definition** (`rmp` task #882). Likewise, for a
+    /// [`SemiApply`](Self::SemiApply), the `Filter` over the opaque `EXISTS` predicate it replaced
+    /// (`rmp` task #869). `None` for every other operator.
     ///
-    /// The fusion is only legal because this reconstruction is exact: same driving relation, same
+    /// The rewrite is only legal because this reconstruction is exact: same driving relation, same
     /// [`Argument`](Self::Argument) declaration, same expand, same `Filter` chain in the same order,
     /// same [`Optional`](Self::Optional) null set. Keeping the inverse mechanically derivable (rather
     /// than describing it in a comment) is what lets the equivalence be *tested* — the round trip is
     /// asserted structurally in this module's tests, and the two plans are executed against each other
-    /// row-for-row in `tests/optional_expand.rs`.
+    /// row-for-row in `tests/optional_expand.rs` and `tests/semi_apply.rs`.
     #[must_use]
     pub fn fallback_plan(&self) -> Option<PhysicalOp> {
+        // `rmp` #869: the semi-join un-rewrites to the exact `Filter` it consumed — the driving
+        // relation it was placed over, and the `EXISTS`/`NOT EXISTS` conjunct verbatim. A chain of
+        // semi-joins therefore un-rewrites to a *chain* of one-conjunct `Filter`s rather than the
+        // single `AND`-joined `Filter` the pre-#869 planner emitted. That is deliberate: the chain is
+        // the honest inverse of what the rewrite consumed, and
+        // `the_unrewritten_plan_is_the_pre_869_planner_output` pins the whole-plan text of the
+        // single-conjunct case (the only one this rewrite fires on unaided) against plan text captured
+        // from the pre-change planner, so the reconstruction is checked, not assumed.
+        if let Self::SemiApply {
+            input,
+            anti: _,
+            predicate,
+            ..
+        } = self
+        {
+            return Some(PhysicalOp::Filter {
+                input: input.clone(),
+                predicate: predicate.clone(),
+            });
+        }
         let Self::OptionalExpand {
             input,
             from,
@@ -1911,6 +1945,73 @@ pub enum PhysicalOp {
         arguments: Vec<Var>,
     },
 
+    /// **Semi-join / anti-semi-join** for an existential subquery written as a `WHERE` conjunct
+    /// (`rmp` task #869). Neo4j plans `SemiApply` / `AntiSemiApply` for exactly this shape.
+    ///
+    /// # What it replaces, and why that was bad
+    ///
+    /// `WHERE EXISTS { … }` planned as `Filter(EXISTS{…})` — **one opaque predicate**. The subquery was
+    /// invisible to the planner in two distinct ways:
+    ///
+    /// 1. The *pattern* form (`EXISTS { (u)-[:LIKES]->(:ARTICLE) }`) never reached the planner at all;
+    ///    `eval.rs::eval_exists_subquery` walked it with its own interpreter, once per outer row. That
+    ///    interpreter cannot seek an index — `eval.rs::node_candidates` scans the label and filters —
+    ///    so `EXISTS { (u:USER {uidn: $id}) }` read every `USER` per outer row even with an ONLINE
+    ///    index on `USER.uidn`.
+    /// 2. Neither form could be **costed**, could drive the leaf access-path choice, or could
+    ///    short-circuit: `Filter` asked the predicate for a boolean and the predicate did whatever it
+    ///    liked underneath.
+    ///
+    /// As an operator the inner branch is an ordinary correlated sub-plan rooted at an
+    /// [`Argument`](Self::Argument) leaf, planned by the **same** planner against the **same**
+    /// [`IndexCatalog`] as the outer query — so an indexed inner predicate becomes a real seek, the
+    /// cost model sees the branch, and the executor stops it at the first row.
+    ///
+    /// # Why this is bag-equivalent
+    ///
+    /// [`fallback_plan`](Self::fallback_plan) reconstructs the `Filter` this replaced *exactly* — same
+    /// input, same predicate expression — and that reconstruction is the operator's semantic
+    /// definition. The equivalence then rests on one claim, which [`recognize_semi_applies`] gates and
+    /// `tests/semi_apply.rs` executes both sides of:
+    ///
+    /// > For a driving row `r`, `predicate` evaluates to `TRUE` **iff** the inner branch, seeded with
+    /// > `r`, yields at least one row (negated when [`anti`](Self::SemiApply::anti)).
+    ///
+    /// `EXISTS` is two-valued — never `NULL` — so `Filter`'s "keep iff `TRUE`" and the semi-join's
+    /// "keep iff non-empty" are the same test, with no third case for them to disagree about. The
+    /// inner branch is lowered from the very same AST the predicate held, through
+    /// [`lower_correlated_exists`](crate::lower::lower_correlated_exists), which routes the pattern
+    /// form through the *ordinary* `MATCH` lowering — so the pattern means inside the subquery exactly
+    /// what it means anywhere else.
+    ///
+    /// Only a **leading run** of top-level conjuncts is rewritten, which is what keeps evaluation
+    /// *order* identical too, not merely the result bag; see [`recognize_semi_applies`] for that
+    /// argument and for every declined shape.
+    SemiApply {
+        /// The driving relation.
+        input: Box<PhysicalOp>,
+        /// The correlated inner branch, rooted at an [`Argument`](Self::Argument) leaf. Executed once
+        /// per driving row and **stopped at its first row** — nothing downstream ever sees its
+        /// columns, so what it projects is irrelevant and only its emptiness is observed.
+        inner: Box<PhysicalOp>,
+        /// `true` for `NOT EXISTS { … }` (an *anti*-semi-join: keep the row **iff** `inner` yields
+        /// nothing), `false` for `EXISTS { … }`.
+        ///
+        /// This is not "the negation of the semi-join" in general — it is here, and only here, because
+        /// `EXISTS` is two-valued. A right branch whose verdict could be `NULL` rather than `FALSE`
+        /// would need Neo4j's `SelectOrSemiApply` family instead, which is why
+        /// [`recognize_semi_applies`] declines an `EXISTS` under `OR` / `CASE` rather than negating its
+        /// way there.
+        anti: bool,
+        /// The `EXISTS { … }` / `NOT EXISTS { … }` conjunct this operator replaced, kept **verbatim**.
+        ///
+        /// Never evaluated at execution time — the inner branch is. It is retained because it is what
+        /// makes [`fallback_plan`](Self::fallback_plan) an exact inverse rather than an approximation,
+        /// and because it is the thing the equivalence claim above is *about*: keeping it on the
+        /// operator is what lets a test run the two definitions against each other.
+        predicate: Expr,
+    },
+
     // ---- write --------------------------------------------------------------------------------
     /// Create the `pattern` once per input row (`CREATE`).
     Create {
@@ -2228,9 +2329,20 @@ pub fn plan_physical_with_stats(
     // One-hop `OPTIONAL MATCH` fusion (`rmp` task #882) runs immediately AFTER that pushdown — it
     // must see the settled `Filter` stack, since it absorbs it — and before the cost-based optimiser
     // below, so the model costs the operator that will actually run.
-    let rule_based = fuse_optional_expands(push_filters_through_projections(
-        Planner { catalog }.lower(logical, &mut deps),
-    ));
+    // Semi-join recognition (`rmp` task #869) runs next, for the same two reasons: it also consumes a
+    // settled `Filter` — the pushdown is what leaves an `EXISTS` conjunct alone in one, which is the
+    // shape it can rewrite — and the operator it produces must be visible to the cost model. It plans
+    // each subquery with THIS `catalog`, which is the point: an indexed predicate inside
+    // `EXISTS { … }` becomes a real seek, and any index it depends on is recorded into `deps` so the
+    // no-statistics path (which does not recompute them from the final tree) still invalidates the
+    // cached plan when that index is dropped.
+    let rule_based = recognize_semi_applies(
+        fuse_optional_expands(push_filters_through_projections(
+            Planner { catalog }.lower(logical, &mut deps),
+        )),
+        catalog,
+        &mut deps,
+    );
 
     // With statistics, refine the rule-based tree by the cost model; without, keep its shape (no
     // cost-based rewrites). The optimiser is bag-preserving, so only the shape changes — and the index
@@ -3728,6 +3840,11 @@ fn contains_read(op: &PhysicalOp) -> bool {
         | PhysicalOp::HashJoin { left, right, .. }
         | PhysicalOp::ValueHashJoin { left, right, .. }
         | PhysicalOp::Union { left, right, .. } => contains_read(left) || contains_read(right),
+        // `rmp` #869: BOTH branches, and the inner one is the point. Before this task the subquery's
+        // reads hid inside an opaque `Filter` predicate, where this walk could not see them at all; as
+        // an operator they are visible. Counting them is the truthful answer and also the conservative
+        // one — it can only ever ADD a read-write `Eager` barrier, never remove one.
+        PhysicalOp::SemiApply { input, inner, .. } => contains_read(input) || contains_read(inner),
         PhysicalOp::ProcedureCall { input, .. } => input.as_deref().is_some_and(contains_read),
         PhysicalOp::Argument { .. } | PhysicalOp::Empty => false,
     }
@@ -3771,6 +3888,11 @@ fn contains_write(op: &PhysicalOp) -> bool {
         | PhysicalOp::HashJoin { left, right, .. }
         | PhysicalOp::ValueHashJoin { left, right, .. }
         | PhysicalOp::Union { left, right, .. } => contains_write(left) || contains_write(right),
+        // `rmp` #869: the inner branch is read-only by construction (a writing clause inside an
+        // existential subquery is rejected at compile time — `semantics::reject_writing_clauses`), so
+        // this recursion can only ever return `false` for it. It is written out anyway rather than
+        // asserted, so the structural predicate stays true of the tree it is given.
+        PhysicalOp::SemiApply { input, inner, .. } => contains_write(input) || contains_write(inner),
         PhysicalOp::ProcedureCall { input, .. } => input.as_deref().is_some_and(contains_write),
         PhysicalOp::AllNodesScan { .. }
         | PhysicalOp::NodeByLabelScan { .. }
@@ -3851,6 +3973,12 @@ fn contains_procedure_call(op: &PhysicalOp) -> bool {
         | PhysicalOp::ValueHashJoin { left, right, .. }
         | PhysicalOp::Union { left, right, .. } => {
             contains_procedure_call(left) || contains_procedure_call(right)
+        }
+        // `rmp` #869: an existential subquery may hold a read-only `CALL`, which was invisible to this
+        // walk while it lived inside a `Filter` predicate. Seeing it is what lets the reader-pool and
+        // plan-cache gates that consult this predicate judge the whole statement.
+        PhysicalOp::SemiApply { input, inner, .. } => {
+            contains_procedure_call(input) || contains_procedure_call(inner)
         }
         // Leaves (scans / index seeks / `Argument` / `Empty`) never call a procedure.
         PhysicalOp::AllNodesScan { .. }
@@ -3940,6 +4068,13 @@ fn all_procedure_calls_reader_safe(
         | PhysicalOp::Union { left, right, .. } => {
             all_procedure_calls_reader_safe(left, registry)
                 && all_procedure_calls_reader_safe(right, registry)
+        }
+        // `rmp` #869: same reason as `contains_procedure_call` — and here it is a safety property, not
+        // a diagnostic. A procedure that is NOT reader-safe hiding inside an `EXISTS { CALL … }` used
+        // to be unclassifiable because the subquery was an opaque predicate; now it is judged.
+        PhysicalOp::SemiApply { input, inner, .. } => {
+            all_procedure_calls_reader_safe(input, registry)
+                && all_procedure_calls_reader_safe(inner, registry)
         }
         // Leaves (scans / index seeks / `Argument` / `Empty`) never call a procedure — vacuously safe.
         PhysicalOp::AllNodesScan { .. }
@@ -5902,6 +6037,13 @@ fn op_expressions(op: &PhysicalOp) -> Vec<&Expr> {
         | PhysicalOp::NestedLoopJoin { .. }
         | PhysicalOp::HashJoin { .. }
         | PhysicalOp::Union { .. }
+        // `rmp` #869: a semi-join evaluates NO expression of its own. The `EXISTS` predicate it keeps
+        // is its semantic definition and its un-rewrite target, never something it runs — the inner
+        // branch does the work, and that branch is a real child, so this walk reaches its operators'
+        // expressions through `children()` and reads every property reference from the plan that will
+        // actually execute. Returning the predicate here as well would only re-count the same
+        // references through an expression nobody evaluates.
+        | PhysicalOp::SemiApply { .. }
         | PhysicalOp::Optional { .. } => Vec::new(),
         // --- the mutating / opaque operators ----------------------------------------------------
         // Unreachable: `mark_index_backed_properties` returns before walking a plan that contains any
@@ -6381,6 +6523,20 @@ fn map_children(op: PhysicalOp, f: &dyn Fn(PhysicalOp) -> PhysicalOp) -> Physica
         },
         PhysicalOp::Filter { input, predicate } => PhysicalOp::Filter {
             input: go(input),
+            predicate,
+        },
+        // `rmp` #869: both branches are mapped. The inner branch is a real sub-plan, so a pass that
+        // rewrites the tree (the cost optimiser, the Sort elision, `mark_index_backed_properties`)
+        // reaches inside the subquery exactly as it reaches anywhere else.
+        PhysicalOp::SemiApply {
+            input,
+            inner,
+            anti,
+            predicate,
+        } => PhysicalOp::SemiApply {
+            input: go(input),
+            inner: go(inner),
+            anti,
             predicate,
         },
         PhysicalOp::Projection {
@@ -6922,6 +7078,12 @@ fn contains_correlated_seek(op: &PhysicalOp) -> bool {
         | PhysicalOp::Union { left, right, .. } => {
             contains_correlated_seek(left) || contains_correlated_seek(right)
         }
+        // `rmp` #869: the driving relation only — mirroring `contains_argument` above and for the same
+        // reason. A seek inside the inner branch correlates on the row THIS operator feeds it, which
+        // travels with the operator, so it does not pin the subtree in the reorderer. That is also
+        // exactly what the `Filter` this replaced reported, so no plan the reorderer could build before
+        // this task becomes unavailable, and none that it refused becomes available.
+        PhysicalOp::SemiApply { input, .. } => contains_correlated_seek(input),
         PhysicalOp::ProcedureCall { input, .. } => {
             input.as_deref().is_some_and(contains_correlated_seek)
         }
@@ -6996,6 +7158,12 @@ fn contains_argument(op: &PhysicalOp) -> bool {
         | PhysicalOp::Union { left, right, .. } => {
             contains_argument(left) || contains_argument(right)
         }
+        // `rmp` #869: like FOREACH, and UNLIKE a bare `NestedLoopJoin` — the semi-join RESOLVES its
+        // inner branch's `Argument` itself, so that argument cannot leak out and does not make this
+        // subtree correlated. A semi-join is correlated exactly when its driving relation is, which is
+        // precisely what the `Filter` it replaced reported, so the join reorderer sees the same
+        // eligibility it saw before this task.
+        PhysicalOp::SemiApply { input, .. } => contains_argument(input),
         PhysicalOp::ProcedureCall { input, .. } => input.as_deref().is_some_and(contains_argument),
     }
 }
@@ -7454,6 +7622,12 @@ fn gather_index_dependencies(op: &PhysicalOp, deps: &mut BTreeSet<IndexId>) {
             gather_index_dependencies(left, deps);
             gather_index_dependencies(right, deps);
         }
+        // `rmp` #869: an index seek INSIDE the subquery is a dependency of the statement exactly as one
+        // in the outer plan is — dropping the index must invalidate this cached plan too.
+        PhysicalOp::SemiApply { input, inner, .. } => {
+            gather_index_dependencies(input, deps);
+            gather_index_dependencies(inner, deps);
+        }
         PhysicalOp::ProcedureCall { input, .. } => {
             if let Some(input) = input {
                 gather_index_dependencies(input, deps);
@@ -7817,6 +7991,188 @@ fn property_of(expr: &Expr, variable: &str) -> Option<String> {
         }
     }
     None
+}
+
+// =================================================================================================
+// Semi-join recognition for EXISTS / NOT EXISTS in a WHERE conjunct (`rmp` task #869)
+// =================================================================================================
+
+/// Rewrites a **leading run** of `EXISTS { … }` / `NOT EXISTS { … }` conjuncts of a
+/// [`Filter`](PhysicalOp::Filter) into a chain of
+/// [`SemiApply`](PhysicalOp::SemiApply) / anti-semi-join operators over that filter's input, planning
+/// each subquery as an ordinary correlated branch against the **real** `catalog`.
+///
+/// # What was wrong, and what "leading run" buys
+///
+/// `WHERE EXISTS { … }` was one opaque predicate. The subquery could not be costed, could not drive
+/// the leaf access-path choice, could not short-circuit, and — for the pattern form — never reached
+/// the planner at all (`eval.rs` walked it with a bespoke interpreter that cannot seek an index).
+///
+/// The rewrite splits the filter's top-level conjunction and consumes conjuncts **from the front**,
+/// stopping at the first one that is not an existential subquery. That restriction is not
+/// conservatism for its own sake — it is what makes the rewrite *exactly* equivalent rather than
+/// merely bag-equivalent:
+///
+/// * `Filter` keeps a row iff its predicate is `TRUE`, and Kleene `AND` is `TRUE` only when every
+///   conjunct is. So splitting a conjunction across operators always preserves the **result bag**.
+/// * It does not, in general, preserve which expressions get **evaluated**: this crate's `AND`
+///   short-circuits on `FALSE` only (see `eval::eval_binary`, which deliberately evaluates the
+///   right-hand side when the left is `NULL` "to surface a rhs type error consistently"), whereas a
+///   `Filter` below drops a `NULL` row outright. A conjunct moved *below* a preceding one therefore
+///   stops being evaluated on `NULL` rows, and an error it would have raised is lost.
+/// * A **leading** run has no preceding conjunct, and `EXISTS` is two-valued — it is never `NULL`. So
+///   `E1 AND E2 AND rest` evaluates `E1`; on `FALSE` it skips everything after it; otherwise it
+///   evaluates `E2`; and so on — which is precisely, operator for operator, what the chain
+///   `SemiApply(E1) → SemiApply(E2) → Filter(rest)` does. Nothing is evaluated that was not, nothing
+///   is skipped that was not, and no error moves.
+///
+/// A non-leading `EXISTS` conjunct is therefore **declined** and stays an opaque predicate. In
+/// practice that costs little, because the predicate-pushdown pass (`rmp` #857) runs *before* this one
+/// and routinely moves the other conjuncts down onto the scan they constrain — so
+/// `WHERE u.name = 'x' AND EXISTS { … }` arrives here as a `Filter(EXISTS{…})` over a
+/// `NodeLabelScanEq`/`NodeIndexSeek`, with the `EXISTS` already leading. `tests/semi_apply.rs` pins
+/// both the decline and that interaction.
+///
+/// # Where it runs
+///
+/// After `push_filters_through_projections` (so the `Filter` stack has settled — recognising earlier
+/// would absorb a mid-pipeline snapshot, the premise that fell in `rmp` #882) and before the
+/// cost-based optimiser (so the model costs the operator that will actually run).
+///
+/// # What is declined, and why each one is not merely unimplemented
+///
+/// * An `EXISTS` **not at the top level of the conjunction** — under `OR`, under `CASE`, inside a
+///   function argument, in a projection rather than a `WHERE`. A semi-join answers "keep this row or
+///   not"; it cannot hand a boolean back to a surrounding expression. Neo4j needs a whole further
+///   operator family (`SelectOrSemiApply`, `LetSemiApply`) for those, precisely because they are not
+///   the same rewrite.
+/// * A **non-leading** conjunct, per the argument above.
+/// * `NOT NOT EXISTS { … }` and any deeper negation nest: only a single `NOT` is matched, so the
+///   double negation stays a predicate rather than being folded by this pass.
+/// * A subquery whose lowered branch would **write** — impossible by construction (a writing clause
+///   inside an existential subquery is rejected at compile time) but checked rather than assumed,
+///   because the whole operator is built on the branch being a pure read.
+///
+/// In every declined case the plan is rebuilt **byte-identically** to the pre-#869 planner output, so
+/// the fallback is the code this task did not touch.
+fn recognize_semi_applies(
+    op: PhysicalOp,
+    catalog: &IndexCatalog,
+    deps: &mut BTreeSet<IndexId>,
+) -> PhysicalOp {
+    // `map_children` hands out a `&dyn Fn`, so the dependency set travels in a cell rather than as a
+    // `&mut` capture. It is merged back once, at the end, so callers see one accumulated set.
+    let collected = std::cell::RefCell::new(BTreeSet::new());
+    let out = recognize_semi_applies_in(op, catalog, &collected);
+    deps.extend(collected.into_inner());
+    out
+}
+
+/// The recursive worker of [`recognize_semi_applies`].
+fn recognize_semi_applies_in(
+    op: PhysicalOp,
+    catalog: &IndexCatalog,
+    deps: &std::cell::RefCell<BTreeSet<IndexId>>,
+) -> PhysicalOp {
+    // Children first, so a `Filter` inside a `CALL {}` subquery, a `UNION` branch or a nested
+    // sub-plan is rewritten in its own right.
+    let op = map_children(op, &|child| recognize_semi_applies_in(child, catalog, deps));
+    let PhysicalOp::Filter { input, predicate } = op else {
+        return op;
+    };
+    let conjuncts = split_conjuncts(&predicate);
+    // The leading run of existential conjuncts. `map_while` — not `filter_map` — IS the gate: it
+    // stops at the first conjunct that is not one, so a later `EXISTS` is left where it is.
+    let run: Vec<(bool, &crate::ast::ExistsSubquery)> = conjuncts
+        .iter()
+        .map_while(|c| existential_conjunct(c))
+        .collect();
+    if run.is_empty() {
+        // Nothing to rewrite: rebuild the operator exactly as it was, predicate included.
+        return PhysicalOp::Filter { input, predicate };
+    }
+    // Every semi-join in the chain correlates on the same columns — the ones the filter's input binds
+    // — because a semi-join binds exactly what its own input binds (see `gather_bound_vars`). Cypher
+    // scoping guarantees this set covers every free variable the predicate can name: a `Filter` can
+    // only reference what the plan below it has bound, and this is that plan's own bound-variable
+    // analysis, the same one `identifiers()` reports.
+    let arguments = collect_bound_vars_physical(&input);
+
+    let mut plan = *input;
+    let mut consumed = 0usize;
+    for (anti, ex) in &run {
+        let logical = crate::lower::lower_correlated_exists(ex, &arguments);
+        let mut inner = {
+            let mut local = BTreeSet::new();
+            let built = Planner { catalog }.lower(&logical, &mut local);
+            deps.borrow_mut().extend(local);
+            built
+        };
+        // The subquery's own body may hold a further `WHERE EXISTS { … }`; recognise it too, so
+        // nesting is handled by the same rule rather than stopping one level down.
+        inner = recognize_semi_applies_in(inner, catalog, deps);
+        // Defensive, not decorative: the operator's every soundness argument assumes a pure read.
+        if contains_write(&inner) {
+            break;
+        }
+        plan = PhysicalOp::SemiApply {
+            input: Box::new(plan),
+            inner: Box::new(inner),
+            anti: *anti,
+            predicate: conjuncts[consumed].clone(),
+        };
+        consumed += 1;
+    }
+    if consumed == 0 {
+        // Only reachable through the write guard above; rebuild untouched.
+        return PhysicalOp::Filter {
+            input: Box::new(plan),
+            predicate,
+        };
+    }
+    // Whatever the run did not consume is re-joined in its ORIGINAL left-to-right order, reproducing
+    // exactly the predicate those conjuncts already formed.
+    let residual = conjuncts[consumed..]
+        .iter()
+        .map(|c| (*c).clone())
+        .reduce(and_exprs);
+    match residual {
+        Some(predicate) => PhysicalOp::Filter {
+            input: Box::new(plan),
+            predicate,
+        },
+        None => plan,
+    }
+}
+
+/// Classifies one top-level conjunct as an existential subquery: `Some((anti, subquery))` for
+/// `EXISTS { … }` (`anti = false`) and `NOT EXISTS { … }` (`anti = true`), `None` for anything else.
+///
+/// A single `NOT` is unwrapped and no more. `NOT NOT EXISTS { … }` is left alone deliberately — the
+/// double negation is a predicate-level simplification this pass has no business performing, and
+/// performing it silently would put a rewrite in the plan that no gate here justified.
+fn existential_conjunct(expr: &Expr) -> Option<(bool, &crate::ast::ExistsSubquery)> {
+    match &expr.kind {
+        ExprKind::ExistsSubquery(ex) => Some((false, ex.as_ref())),
+        ExprKind::Unary {
+            op: crate::ast::UnaryOp::Not,
+            operand,
+        } => match &operand.kind {
+            ExprKind::ExistsSubquery(ex) => Some((true, ex.as_ref())),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The variables a physical (sub)plan binds, in introduction order.
+///
+/// A thin named wrapper over [`gather_bound_vars`] so the semi-join's correlation set is derived from
+/// the crate's single bound-variable analysis rather than from a second, divergent one.
+fn collect_bound_vars_physical(plan: &PhysicalOp) -> Vec<Var> {
+    let mut out = Vec::new();
+    gather_bound_vars(plan, &mut out);
+    out
 }
 
 /// Applies the one-hop `OPTIONAL MATCH` fusion at **every** node of `op`, bottom-up
@@ -8397,6 +8753,12 @@ fn gather_bound_vars(plan: &PhysicalOp, out: &mut Vec<Var>) {
         | PhysicalOp::Skip { input, .. }
         | PhysicalOp::Limit { input, .. }
         | PhysicalOp::Eager { input }
+        // `rmp` #869. LOAD-BEARING, not a convenience: a semi-join binds EXACTLY what its driving
+        // relation binds and nothing the inner branch introduced — the inner row is examined for
+        // existence and discarded, never merged. Grouping it with `Filter` is the whole statement of
+        // that semantics, and it is what keeps `identifiers()` and `executor::result_columns` from
+        // leaking a subquery-local variable into the outer scope.
+        | PhysicalOp::SemiApply { input, .. }
         | PhysicalOp::Sort { input, .. } => gather_bound_vars(input, out),
         PhysicalOp::TopN { input, .. } => gather_bound_vars(input, out),
         PhysicalOp::Unwind {
@@ -9040,6 +9402,19 @@ impl PhysicalOp {
                 writeln!(f, "NestedLoopJoin")?;
                 left.fmt_indented(f, depth + 1)?;
                 right.fmt_indented(f, depth + 1)
+            }
+            // `rmp` #869. The operator's own line carries no detail: everything worth reading about the
+            // subquery is the INNER BRANCH printed below it, which is the point of the rewrite — the
+            // access path inside `EXISTS { … }` stops being an opaque `EXISTS{...}` token and becomes
+            // operators a reader can see, cost and profile. Rendering the predicate here as well would
+            // print the subquery twice and, worse, would show the pre-rewrite spelling next to the plan
+            // that actually runs.
+            Self::SemiApply {
+                input, inner, anti, ..
+            } => {
+                writeln!(f, "{}", if *anti { "AntiSemiApply" } else { "SemiApply" })?;
+                input.fmt_indented(f, depth + 1)?;
+                inner.fmt_indented(f, depth + 1)
             }
             Self::ValueHashJoin {
                 left,

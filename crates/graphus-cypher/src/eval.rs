@@ -3755,10 +3755,13 @@ fn eval_pattern_comprehension(
         clock,
         false,
         path_var,
+        // A comprehension has exactly **one** pattern element: no earlier part consumed a
+        // relationship, and no later part has to exclude one (`rmp` #869).
+        &RelScope::standalone(),
     )?;
     let mut out = Vec::new();
     let mut out_bytes: usize = 0;
-    for m in matches {
+    for (m, _consumed) in matches {
         if let Some(pred) = &pc.predicate {
             if !eval_to_ternary(pred, &m, params, graph, functions, clock)?.is_true() {
                 continue;
@@ -3788,12 +3791,18 @@ fn eval_exists_subquery(
         return eval_exists_full_query(inner_query, row, params, graph, functions, clock);
     }
     // Comma-separated parts join through their shared variables: each part's matches seed the next.
-    let mut rows = vec![row.clone()];
-    for part in &ex.pattern {
+    // Relationship isomorphism spans the **whole** pattern of one `MATCH` clause (`04 §2.4`) and
+    // `EXISTS { pattern }` is `EXISTS { MATCH pattern }`, so each candidate carries the
+    // relationships its own partial match already consumed and the next part excludes exactly those
+    // (`rmp` #869) — see [`RelScope`].
+    let mut rows: Vec<PatternMatch> = vec![(row.clone(), Vec::new())];
+    let last_part = ex.pattern.len().saturating_sub(1);
+    for (i, part) in ex.pattern.iter().enumerate() {
         // A named path binds the path variable for the (joint) predicate.
         let path_var = part.var.as_ref().map(|v| v.name.as_str());
+        let record = i < last_part;
         let mut next = Vec::new();
-        for r in &rows {
+        for (r, consumed) in &rows {
             next.extend(pattern_element_rows(
                 &part.element,
                 r,
@@ -3803,6 +3812,10 @@ fn eval_exists_subquery(
                 clock,
                 false,
                 path_var,
+                &RelScope {
+                    prior: consumed,
+                    record,
+                },
             )?);
         }
         if next.is_empty() {
@@ -3813,7 +3826,7 @@ fn eval_exists_subquery(
     match &ex.predicate {
         None => Ok(RowValue::Value(Value::Boolean(true))),
         Some(pred) => {
-            for r in &rows {
+            for (r, _consumed) in &rows {
                 if eval_to_ternary(pred, r, params, graph, functions, clock)?.is_true() {
                     return Ok(RowValue::Value(Value::Boolean(true)));
                 }
@@ -4207,11 +4220,15 @@ fn count_pattern_matches(
     functions: &dyn FunctionRegistry,
     clock: &StatementClock,
 ) -> Result<i64, EvalError> {
-    let mut rows = vec![row.clone()];
-    for part in pattern {
+    // Relationship isomorphism spans the whole pattern, exactly as in [`eval_exists_subquery`]
+    // (`04 §2.4`, `rmp` #869) — see [`RelScope`].
+    let mut rows: Vec<PatternMatch> = vec![(row.clone(), Vec::new())];
+    let last_part = pattern.len().saturating_sub(1);
+    for (i, part) in pattern.iter().enumerate() {
         let path_var = part.var.as_ref().map(|v| v.name.as_str());
+        let record = i < last_part;
         let mut next = Vec::new();
-        for r in &rows {
+        for (r, consumed) in &rows {
             next.extend(pattern_element_rows(
                 &part.element,
                 r,
@@ -4221,6 +4238,10 @@ fn count_pattern_matches(
                 clock,
                 false,
                 path_var,
+                &RelScope {
+                    prior: consumed,
+                    record,
+                },
             )?);
         }
         rows = next;
@@ -4229,7 +4250,7 @@ fn count_pattern_matches(
         None => rows.len(),
         Some(pred) => {
             let mut c = 0usize;
-            for r in &rows {
+            for (r, _consumed) in &rows {
                 if eval_to_ternary(pred, r, params, graph, functions, clock)?.is_true() {
                     c += 1;
                 }
@@ -4283,10 +4304,61 @@ fn exec_error_to_eval(e: crate::executor::ExecError) -> EvalError {
 // Expression-level pattern matching (pattern comprehensions / EXISTS subqueries)
 // =================================================================================================
 
-/// All binding rows produced by matching `element` against the graph, seeded by `row`: variables
-/// already bound in `row` constrain the match (an outer `n` in `[(n)-->(b) | b]` anchors the
-/// start), unbound pattern variables bind into the produced rows. Relationship uniqueness (trail
-/// semantics) holds within the element — one relationship is traversed at most once per match.
+/// One complete match of a pattern element: the bound [`Row`], paired with **every** relationship
+/// that match consumed — those traversed by this element's own hops, on top of those the earlier
+/// comma-separated parts of the same pattern had already consumed (`rmp` #869).
+///
+/// The list cannot be recovered from the `Row`: an anonymous hop (`(a)-[:T]->(b)`) binds no
+/// relationship variable yet still consumes its relationship for isomorphism purposes.
+type PatternMatch = (Row, Vec<crate::graph_access::RelId>);
+
+/// The relationship-isomorphism state threaded across the comma-separated parts of **one**
+/// `EXISTS { … }` / `COUNT { … }` pattern (`rmp` #869).
+///
+/// A single `MATCH` clause binds each relationship at most once across its *whole* pattern
+/// (`04 §2.4`), and `EXISTS { pattern }` is `EXISTS { MATCH pattern }` — so a later part may not
+/// re-use a relationship an earlier part of the *same* candidate match already took. The
+/// accumulator is created fresh per subquery pattern and is **never** seeded from the outer row,
+/// which is what keeps re-use of an **enclosing clause's** relationship variable legal; that mirrors
+/// the fresh `pattern_rels` accumulator `lower::lower_pattern_parts` gives the planner per `MATCH`.
+///
+/// # Why a slice, not a set
+///
+/// The accumulated set is carried as a flat slice and consulted by linear scan
+/// ([`match_chain`]'s `used_rels.contains`), where the executor's variable-length walker uses an
+/// `FxHashSet` for its equivalent `forbidden` set. The asymmetry is deliberate: this list is bounded
+/// by the number of **hops written in the query text** (a pattern of `P` parts with `H` hops each
+/// contributes at most `P * H` entries — single digits for any realistic query), and at that size a
+/// linear scan over `u64`s is cheaper than hashing. It is also push/pop'd as a DFS stack, which a
+/// `Vec` does natively. Should a pathological pattern width ever appear, the fix is to swap the
+/// container here, not to weaken the rule.
+struct RelScope<'a> {
+    /// The relationships the earlier parts of *this* candidate match consumed. Empty for a
+    /// pattern's first part.
+    prior: &'a [crate::graph_access::RelId],
+    /// Whether each produced match must carry its accumulated set forward. Only a part that still
+    /// has a successor needs it, so the last part — and the single-element pattern that every
+    /// comprehension and most subqueries are — records nothing and allocates exactly as it did
+    /// before the threading existed.
+    record: bool,
+}
+
+impl RelScope<'_> {
+    /// The scope of a pattern with exactly **one** element (a pattern comprehension): nothing was
+    /// consumed before it and nothing follows it, so no set is threaded in or out.
+    const fn standalone() -> Self {
+        Self {
+            prior: &[],
+            record: false,
+        }
+    }
+}
+
+/// All matches produced by matching `element` against the graph, seeded by `row`: variables already
+/// bound in `row` constrain the match (an outer `n` in `[(n)-->(b) | b]` anchors the start), unbound
+/// pattern variables bind into the produced rows. Relationship uniqueness (trail semantics) holds
+/// within the element — one relationship is traversed at most once per match — and, through
+/// `rels`, across the comma-separated parts of the enclosing pattern too (`rmp` #869).
 ///
 /// `first_only` stops at the first complete match (the `EXISTS` fast path when no joint
 /// constraints follow).
@@ -4300,7 +4372,8 @@ fn pattern_element_rows(
     clock: &StatementClock,
     first_only: bool,
     path_var: Option<&str>,
-) -> Result<Vec<Row>, EvalError> {
+    rels: &RelScope<'_>,
+) -> Result<Vec<PatternMatch>, EvalError> {
     let mut results = Vec::new();
     for start in node_candidates(&element.start, row, params, graph, functions, clock)? {
         let mut seeded = row.clone();
@@ -4315,13 +4388,18 @@ fn pattern_element_rows(
             first_only,
             path_var,
             start,
+            record_used_rels: rels.record,
         };
+        // Seeded with what the earlier parts of *this* candidate match consumed, and rebuilt per
+        // start candidate — so the exclusion is per match, never shared across the part's
+        // candidates. An empty `prior` allocates nothing.
+        let mut used_rels = rels.prior.to_vec();
         match_chain(
             &element.chain,
             0,
             start,
             seeded,
-            &mut Vec::new(),
+            &mut used_rels,
             &mut Vec::new(),
             &mut results,
             &cctx,
@@ -4334,7 +4412,8 @@ fn pattern_element_rows(
 }
 
 /// The per-element invariants of one [`match_chain`] DFS: the evaluation seams, the `EXISTS`
-/// fast-path flag, and the named-path recording target (`path_var` + the element's start node).
+/// fast-path flag, the named-path recording target (`path_var` + the element's start node), and
+/// whether each completed match must carry its consumed-relationship set out ([`RelScope::record`]).
 struct ChainCtx<'a> {
     params: &'a BoundParameters,
     graph: &'a dyn GraphAccess,
@@ -4343,11 +4422,14 @@ struct ChainCtx<'a> {
     first_only: bool,
     path_var: Option<&'a str>,
     start: crate::graph_access::NodeId,
+    record_used_rels: bool,
 }
 
 /// Depth-first chain matcher: extend the partial match at `chain[idx]` from `current`, pushing
-/// every complete match into `out`. `used_rels` enforces per-match relationship uniqueness (trail
-/// semantics); `steps` records the traversed hops so a named path can be bound on completion.
+/// every complete match into `out`. `used_rels` enforces relationship uniqueness (trail semantics)
+/// across the whole enclosing pattern — it arrives pre-seeded with what earlier comma-separated
+/// parts consumed (`rmp` #869); `steps` records the traversed hops so a named path can be bound on
+/// completion.
 #[allow(clippy::too_many_arguments)] // an internal DFS worker; bundling these adds no clarity
 fn match_chain(
     chain: &[crate::ast::PatternChainLink],
@@ -4356,7 +4438,7 @@ fn match_chain(
     row: Row,
     used_rels: &mut Vec<crate::graph_access::RelId>,
     steps: &mut Vec<PathStep>,
-    out: &mut Vec<Row>,
+    out: &mut Vec<PatternMatch>,
     cctx: &ChainCtx<'_>,
 ) -> Result<(), EvalError> {
     let (params, graph, functions, clock) = (cctx.params, cctx.graph, cctx.functions, cctx.clock);
@@ -4371,7 +4453,14 @@ fn match_chain(
                 }),
             );
         }
-        out.push(row);
+        // Carry the consumed set out only when a later part of the same pattern still has to
+        // exclude it; `Vec::new()` allocates nothing, so the single-part case pays nothing.
+        let consumed = if cctx.record_used_rels {
+            used_rels.clone()
+        } else {
+            Vec::new()
+        };
+        out.push((row, consumed));
         return Ok(());
     };
     if let Some(range) = link.relationship.range {
@@ -4386,7 +4475,15 @@ fn match_chain(
         .map(|t| t.name.clone())
         .collect();
     let direction = crate::graph_access::ExpandDirection::from_pattern(link.relationship.direction);
+    // Deduplicate self-loops reported once per side (`GraphAccess::expand`'s contract, `04 §2.4`):
+    // one hop binds a relationship at most once, so an undirected hop over a self-loop is ONE match,
+    // not two. Mirrors `Operator::Expand`'s per-anchor `seen_rel` set — first occurrence wins
+    // (`rmp` #869).
+    let mut seen_rel = rustc_hash::FxHashSet::default();
     for inc in graph.expand(current, direction, &types) {
+        if !seen_rel.insert(inc.rel) {
+            continue;
+        }
         if used_rels.contains(&inc.rel) {
             continue;
         }
@@ -4479,7 +4576,7 @@ fn match_var_length_link(
     row: Row,
     used_rels: &mut Vec<crate::graph_access::RelId>,
     steps: &mut Vec<PathStep>,
-    out: &mut Vec<Row>,
+    out: &mut Vec<PatternMatch>,
     cctx: &ChainCtx<'_>,
 ) -> Result<(), EvalError> {
     let (params, graph, functions, clock) = (cctx.params, cctx.graph, cctx.functions, cctx.clock);
@@ -4532,7 +4629,16 @@ fn match_var_length_link(
         .map(|t| t.name.clone())
         .collect();
     let direction = crate::graph_access::ExpandDirection::from_pattern(link.relationship.direction);
+    // Deduplicate self-loops reported once per side, exactly as [`match_chain`] does and exactly as
+    // the executor's variable-length walker does with its per-frame `seen_rel` set: this call *is*
+    // one frame of that walk, so the set is local to this depth while `used_rels` carries the trail
+    // (`04 §2.4`, `rmp` #869). Without it a self-loop is re-entered once per reported side, since
+    // the trail entry is popped between the two.
+    let mut seen_rel = rustc_hash::FxHashSet::default();
     for inc in graph.expand(current, direction, &types) {
+        if !seen_rel.insert(inc.rel) {
+            continue;
+        }
         if used_rels.contains(&inc.rel) {
             continue;
         }
@@ -6628,5 +6734,155 @@ mod tests {
             evaluate("point.withinBBox(null, point({x:0,y:0}), point({x:10,y:10}))"),
             Value::Null
         );
+    }
+
+    // =============================================================================================
+    // `pattern_element_rows` seams (`rmp` task #869)
+    //
+    // `first_only` and `RelScope` are internal seams with no reachable spelling from the query
+    // surface (every caller of `pattern_element_rows` passes `first_only = false`, and the
+    // consumed-relationship set is threaded, never spelled). They are pinned here directly so a
+    // future change cannot silently break them; the observable semantics they implement are pinned
+    // end-to-end in `tests/exists_pattern_semantics.rs`.
+    // =============================================================================================
+
+    /// `(a)-[:T]->(b)`, `(a)-[:T]->(b)` (parallel) and `(d)-[:T]->(d)` (self-loop).
+    fn rel_scope_fixture() -> MemGraph {
+        let mut g = MemGraph::new();
+        let a = g.add_node(["P"], [("n", Value::String("a".to_owned()))]);
+        let b = g.add_node(["P"], [("n", Value::String("b".to_owned()))]);
+        let d = g.add_node(["P"], [("n", Value::String("d".to_owned()))]);
+        g.add_rel("T", a, b, [] as [(&str, Value); 0]);
+        g.add_rel("T", a, b, [] as [(&str, Value); 0]);
+        g.add_rel("T", d, d, [] as [(&str, Value); 0]);
+        g
+    }
+
+    /// The single [`crate::ast::PatternElement`] of an `EXISTS { <pattern> }` expression.
+    fn exists_element(src: &str) -> crate::ast::PatternElement {
+        let ExprKind::ExistsSubquery(ex) = parse_expr(src).kind else {
+            panic!("expected an EXISTS subquery");
+        };
+        ex.pattern
+            .first()
+            .expect("the pattern form always has at least one part")
+            .element
+            .clone()
+    }
+
+    /// Matches `element` from every start candidate, returning the produced matches.
+    fn element_rows(
+        graph: &dyn GraphAccess,
+        element: &crate::ast::PatternElement,
+        first_only: bool,
+        rels: &RelScope<'_>,
+    ) -> Vec<PatternMatch> {
+        pattern_element_rows(
+            element,
+            &Row::empty(),
+            &BoundParameters::empty(),
+            graph,
+            no_functions(),
+            &test_clock(),
+            first_only,
+            None,
+            rels,
+        )
+        .expect("the fixture pattern evaluates without error")
+    }
+
+    /// `first_only` must stop at the **first** complete match, and that match must be one the full
+    /// enumeration also produces (a prefix of it, not a different row).
+    #[test]
+    fn first_only_short_circuits_at_the_first_match() {
+        let g = rel_scope_fixture();
+        let element = exists_element("EXISTS { (x)-[r:T]->(y) }");
+
+        let all = element_rows(&g, &element, false, &RelScope::standalone());
+        assert_eq!(all.len(), 3, "three T relationships, each a distinct match");
+
+        let first = element_rows(&g, &element, true, &RelScope::standalone());
+        assert_eq!(first.len(), 1, "`first_only` must stop at one match");
+        assert_eq!(
+            first[0].0.get("r"),
+            all[0].0.get("r"),
+            "`first_only` must yield the first match of the full enumeration"
+        );
+
+        // An unsatisfiable pattern still enumerates to nothing under the fast path.
+        let none = element_rows(
+            &g,
+            &exists_element("EXISTS { (x)-[r:U]->(y) }"),
+            true,
+            &RelScope::standalone(),
+        );
+        assert!(none.is_empty(), "no `U` relationship exists");
+    }
+
+    /// [`RelScope::prior`] excludes exactly the relationships an earlier part consumed, and
+    /// [`RelScope::record`] governs whether the consumed set is carried out.
+    #[test]
+    fn rel_scope_excludes_prior_relationships_and_records_on_demand() {
+        let g = rel_scope_fixture();
+        let element = exists_element("EXISTS { (x)-[r:T]->(y) }");
+
+        // Recording off (the last part / a comprehension): the consumed set is not carried out.
+        let plain = element_rows(&g, &element, false, &RelScope::standalone());
+        assert_eq!(plain.len(), 3);
+        assert!(
+            plain.iter().all(|(_, consumed)| consumed.is_empty()),
+            "nothing is recorded when no later part needs it"
+        );
+
+        // Recording on: each match carries exactly the one relationship its single hop consumed.
+        let recorded = element_rows(
+            &g,
+            &element,
+            false,
+            &RelScope {
+                prior: &[],
+                record: true,
+            },
+        );
+        let consumed: Vec<crate::graph_access::RelId> = recorded
+            .iter()
+            .map(|(_, c)| {
+                assert_eq!(c.len(), 1, "a one-hop element consumes one relationship");
+                c[0]
+            })
+            .collect();
+        assert_eq!(consumed.len(), 3);
+
+        // Seeding `prior` with one of them removes exactly that match — and nothing else.
+        let excluded = element_rows(
+            &g,
+            &element,
+            false,
+            &RelScope {
+                prior: &consumed[..1],
+                record: true,
+            },
+        );
+        assert_eq!(excluded.len(), 2, "the prior relationship is unavailable");
+        assert!(
+            excluded.iter().all(|(_, c)| c.contains(&consumed[0])),
+            "the accumulated set carries the prior relationships forward"
+        );
+        assert!(
+            !excluded.iter().any(|(_, c)| c[c.len() - 1] == consumed[0]),
+            "no match may re-consume the prior relationship"
+        );
+
+        // Excluding every relationship leaves nothing to match.
+        let all_excluded = element_rows(
+            &g,
+            &element,
+            false,
+            &RelScope {
+                prior: &consumed,
+                record: false,
+            },
+        );
+        assert!(all_excluded.is_empty());
     }
 }

@@ -555,6 +555,15 @@ fn walk_physical(op: &PhysicalOp, record: &mut impl FnMut(&str, ParamType)) {
             walk_physical(left, record);
             walk_physical(right, record);
         }
+        // `rmp` #869: the semi-join's `$param` expectations live in its INNER branch, which carries the
+        // subquery's own operators — so walking it is what keeps
+        // `WHERE EXISTS { (u:USER {uidn: $id}) }` declaring `$id`. The `predicate` field is NOT walked:
+        // it is the same subquery in its un-rewritten spelling, so recording it too would double-declare
+        // every parameter, and it is never evaluated.
+        PhysicalOp::SemiApply { input, inner, .. } => {
+            walk_physical(input, record);
+            walk_physical(inner, record);
+        }
         PhysicalOp::Optional { input, .. } | PhysicalOp::Eager { input } => {
             walk_physical(input, record)
         }

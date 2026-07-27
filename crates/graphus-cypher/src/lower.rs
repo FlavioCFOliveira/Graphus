@@ -108,12 +108,12 @@
 use std::collections::BTreeSet;
 
 use crate::ast::{
-    BinaryOp, CallSubqueryClause, Clause, CreateClause, DeleteClause, Expr, ExprKind,
-    ForeachClause, LabelExpr, Literal, LoadCsvClause, MatchClause, MergeAction, MergeClause,
-    NodePattern, PatternChainLink, PatternElement, PatternPart, PatternPartKind, ProjectionBody,
-    ProjectionItem, QppInfo, Query, QueryBody, RelDirection, RelType, RelationshipPattern,
-    RemoveClause, RemoveItem, SetClause, SetItem, SingleQuery, StandaloneCall, StandaloneYield,
-    UnionPart, UnwindClause,
+    BinaryOp, CallSubqueryClause, Clause, CreateClause, DeleteClause, ExistsSubquery, Expr,
+    ExprKind, ForeachClause, LabelExpr, Literal, LoadCsvClause, MatchClause, MergeAction,
+    MergeClause, NodePattern, PatternChainLink, PatternElement, PatternPart, PatternPartKind,
+    ProjectionBody, ProjectionItem, QppInfo, Query, QueryBody, RelDirection, RelType,
+    RelationshipPattern, RemoveClause, RemoveItem, SetClause, SetItem, SingleQuery, StandaloneCall,
+    StandaloneYield, UnionPart, UnwindClause,
 };
 use crate::function_registry;
 use crate::lexer::Span;
@@ -292,6 +292,57 @@ pub fn lower(query: &ValidatedQuery) -> LogicalOp {
 /// validates and plans through the normal pipeline; the only difference is the runtime correlation.
 pub fn lower_correlated(query: &Query, outer_vars: &[Var]) -> LogicalOp {
     Planner::default().lower_correlated_query(query, outer_vars)
+}
+
+/// Lowers the body of an `EXISTS { … }` / `NOT EXISTS { … }` subquery as a **correlated sub-plan**
+/// over `outer_vars` — the right branch of a [`SemiApply`](crate::physical::PhysicalOp::SemiApply)
+/// (`rmp` task #869).
+///
+/// Both spellings the parser produces are handled, and the point of this function is that they are
+/// handled by the *ordinary* lowering:
+///
+/// * the **full-query form** (`EXISTS { MATCH … RETURN … }`) is [`lower_correlated`] verbatim — the
+///   very path the expression evaluator already used;
+/// * the **pattern form** (`EXISTS { (u)-[:LIKES]->(:ARTICLE) WHERE … }`) is lowered exactly as
+///   [`Planner::lower_required_match`] lowers a top-level `MATCH pattern WHERE p`: the same
+///   [`lower_pattern_parts`](Planner::lower_pattern_parts) (so relationship isomorphism threads across
+///   the comma-separated parts, and inline property maps become the same scan-level filters) and the
+///   same [`push_where_onto_scans`] (so an inner `WHERE` reaches the leaf that binds its variable and
+///   can become a seek).
+///
+/// That is the whole equivalence argument for retiring the bespoke interpreter on this path: the
+/// pattern inside a subquery is not lowered by a second implementation with its own idea of what a
+/// pattern means — it is lowered by the one that lowers every other pattern in the language.
+///
+/// # Which outer variables are carried
+///
+/// **Synthetic** variables (the generated names of anonymous pattern elements — `()`, `-[]->`) are
+/// deliberately excluded. Two reasons, and the second is a correctness one:
+///
+/// 1. A subquery cannot reference them; they have no spelling in the source.
+/// 2. The inner body is lowered by a **fresh** [`Planner`], whose synthetic counter restarts at zero.
+///    Its first anonymous element is therefore named `  anon_0` — the same name the outer plan's first
+///    anonymous element already carries. Carrying that name in as an argument would silently
+///    *constrain* the subquery's anonymous element to the outer row's unrelated binding. Excluding
+///    every synthetic name removes the collision entirely, because a user name can never collide with
+///    a generated one (generated names begin with a reserved space).
+pub fn lower_correlated_exists(ex: &ExistsSubquery, outer_vars: &[Var]) -> LogicalOp {
+    let carried: Vec<Var> = outer_vars
+        .iter()
+        .filter(|v| !v.synthetic)
+        .cloned()
+        .collect();
+    if let Some(inner_query) = &ex.full_query {
+        return lower_correlated(inner_query, &carried);
+    }
+    let mut planner = Planner::default();
+    let argument = LogicalOp::Argument { arguments: carried };
+    let predicate = ex.predicate.as_deref();
+    let mut plan = planner.lower_pattern_parts(&ex.pattern, Some(argument), predicate);
+    if let Some(pred) = predicate {
+        plan = push_where_onto_scans(plan, pred);
+    }
+    plan
 }
 
 /// The lowering driver. Carries only the synthetic-variable counter, so anonymous pattern elements

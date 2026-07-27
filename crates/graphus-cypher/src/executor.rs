@@ -544,6 +544,27 @@ enum Operator {
         current_right: Option<Box<Operator>>,
     },
 
+    /// `SemiApply` / `AntiSemiApply` (`rmp` task #869): for each driving row, run the correlated inner
+    /// branch **until its first row** and keep or drop the driving row on that verdict.
+    ///
+    /// Structurally this is [`NestedLoop`](Self::NestedLoop) with two differences, and both are the
+    /// point of the operator: the inner branch is stopped after ONE `next()` instead of being drained,
+    /// and its row is discarded instead of being merged — the driving row passes through unchanged, so
+    /// no subquery-local binding ever reaches the outer scope.
+    SemiApply {
+        input: Box<Operator>,
+        /// The inner branch's plan, rebuilt per driving row seeded with that row (correlation via its
+        /// [`Argument`](PhysicalOp::Argument) leaf), exactly as `NestedLoop` rebuilds its right side.
+        inner_template: Box<PhysicalOp>,
+        /// The plan id of the inner branch's root, for a `PROFILE`d statement (`rmp` #752); `None`
+        /// otherwise. Without this the per-row rebuilds would be unattributable and the subquery's
+        /// `dbHits` would vanish from the report — which would make `EXPLAIN` show an access path whose
+        /// cost `PROFILE` never accounted for (`rmp` #755 is the live precedent for that being a lie).
+        inner_id: Option<crate::profile::OpId>,
+        /// `true` for `AntiSemiApply`: keep the driving row iff the inner branch yields NOTHING.
+        anti: bool,
+    },
+
     /// A write operator (`Create`/`Merge`/`SetClause`/`Delete`/`Remove`), applied once per input row.
     ///
     /// A `MERGE` can emit **more than one** row for a single input row: when its pattern matches
@@ -1117,6 +1138,44 @@ impl Operator {
                 let right_op = build_operator_with_arg(right_template, &left_row, ctx)?;
                 *current_left = Some(left_row);
                 *current_right = Some(Box::new(right_op));
+            },
+
+            // `rmp` task #869 — the semi-join, and the short-circuit that is its reason to exist.
+            //
+            // Per driving row: rebuild the inner branch seeded with that row, ask it for ONE row, drop
+            // the branch. `next()` is called exactly once, so an inner expand stops at its first
+            // neighbour and an inner seek at its first hit — the driving row's verdict is settled and
+            // every further inner row would be work whose answer is already known. That bound is what
+            // a `PROFILE` measures: the inner operator's `dbHits` are bounded by one traversal per
+            // driving row that matches, which is the acceptance criterion this operator is judged on.
+            //
+            // The driving row is MOVED into the result on the keep path — no clone, where the `Filter`
+            // this replaced evaluated a whole correlated sub-plan through the expression evaluator and
+            // the `NestedLoopJoin` shape would have `merge_rows`-cloned every produced row back.
+            Operator::SemiApply {
+                input,
+                inner_template,
+                inner_id,
+                anti,
+            } => loop {
+                let Some(driving) = input.next(ctx)? else {
+                    return Ok(None);
+                };
+                // `PROFILE` (`rmp` #752): re-number the template from the plan id of the branch it was
+                // cloned from, so every per-row rebuild accumulates into the plan's own counters
+                // instead of being unattributable. Identical to the `NestedLoop` arm above — and
+                // load-bearing here, because the inner branch IS what the plan claims to have run.
+                if let (Some(rec), Some(id)) = (ctx.profile.as_ref(), *inner_id) {
+                    rec.rebind_template(inner_template, id);
+                }
+                let mut branch = build_operator_with_arg(inner_template, &driving, ctx)?;
+                // ONE row, then the branch is dropped: the semi-join tests emptiness, nothing more.
+                let matched = branch.next(ctx)?.is_some();
+                if matched != *anti {
+                    return Ok(Some(driving));
+                }
+                // Rejected: take the next driving row. Nothing of the inner branch survives the
+                // iteration, so no subquery-local binding can reach the outer scope.
             },
 
             Operator::Write {
@@ -3651,6 +3710,21 @@ fn build_operator_unprofiled(
             right_id: ctx.profile.as_ref().and_then(|r| r.id_of(right)),
             current_left: None,
             current_right: None,
+        }),
+        // `rmp` task #869: the semi-join. Built exactly like `NestedLoopJoin` above — same per-row
+        // rebuild of a cloned template, same `id_of` capture so a `PROFILE`d run attributes every
+        // rebuild to the one plan operator — because the correlation mechanism IS the same. What
+        // differs is only how the branch is consumed, and that lives in `Operator::next`.
+        PhysicalOp::SemiApply {
+            input,
+            inner,
+            anti,
+            predicate: _,
+        } => Ok(Operator::SemiApply {
+            input: Box::new(build_operator(input, arg, ctx)?),
+            inner_template: inner.clone(),
+            inner_id: ctx.profile.as_ref().and_then(|r| r.id_of(inner)),
+            anti: *anti,
         }),
         PhysicalOp::HashJoin {
             left,
@@ -9581,6 +9655,11 @@ fn result_columns(op: &PhysicalOp, procedures: &dyn ProcedureRegistry) -> Vec<St
             }
             cols
         }
+        // `rmp` #869. A semi-join emits its DRIVING rows unchanged: the inner branch is examined for
+        // emptiness and discarded, so it contributes no column. Grouping it with the joins below —
+        // which union both sides' columns — would leak a subquery-local variable into the outer scope
+        // and change what `RETURN *` returns.
+        PhysicalOp::SemiApply { input, .. } => result_columns(input, procedures),
         PhysicalOp::NestedLoopJoin { left, right }
         | PhysicalOp::HashJoin { left, right, .. }
         | PhysicalOp::ValueHashJoin { left, right, .. } => {

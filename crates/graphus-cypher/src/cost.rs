@@ -624,6 +624,38 @@ pub fn estimate_cost(op: &PhysicalOp, stats: Option<&dyn Statistics>) -> CostEst
             CostEstimate::new(rows, inner.cost + inner.rows * per_row)
         }
 
+        // A semi-join (`rmp` task #869). Before this task the same shape was a `Filter` over an opaque
+        // `EXISTS{…}` predicate, which `predicate_selectivity` could say nothing useful about and whose
+        // per-row work — a whole correlated sub-plan — was modelled as ONE `COST_ROW_FILTER`. Both
+        // numbers are now derived from the branch that actually runs.
+        //
+        // CARDINALITY. `right.rows` is the estimate for **one** driving row (the branch is rooted at an
+        // `Argument`, which the estimator treats as a single row), i.e. the expected number of inner
+        // matches per driving row. Capping it at 1 turns that expectation into the probability of "at
+        // least one", which is what a semi-join tests: an expectation below 1 is a lower bound on that
+        // probability, and above 1 the cap says "near certain". Anti takes the complement, which is
+        // sound for the same reason the operator itself is: `EXISTS` is two-valued, so a driving row is
+        // either kept by the semi-join or by the anti-, never by both and never by neither.
+        //
+        // COST. The executor stops the branch at its FIRST row, so a driving row that matches pays only
+        // its way to that row — `right.cost / right.rows` amortised — while one that does not match
+        // pays the branch out in full. Weighting those two by the same probability is the whole reason
+        // a selective `EXISTS` is now cheap in the model and not merely in the executor.
+        PhysicalOp::SemiApply {
+            input, inner, anti, ..
+        } => {
+            let left = estimate_cost(input, stats);
+            let right = estimate_cost(inner, stats);
+            let matches = right.rows.clamp(0.0, 1.0);
+            let kept = if *anti { 1.0 - matches } else { matches };
+            // `max(1.0)` guards the amortisation against a branch estimated at fewer than one row: the
+            // executor still has to run it to discover the first row (or its absence), so the
+            // short-circuited cost can never be modelled as more than the full branch.
+            let first_row_cost = right.cost / right.rows.max(1.0);
+            let per_driving_row = matches * first_row_cost + (1.0 - matches) * right.cost;
+            CostEstimate::new(left.rows * kept, left.cost + left.rows * per_driving_row)
+        }
+
         // A projection is one output row per input row (DISTINCT de-duplicates a fraction); a cheap
         // per-row tuple build.
         PhysicalOp::Projection {
@@ -967,6 +999,12 @@ fn physical_label_for_var(op: &PhysicalOp, variable: &str) -> Option<String> {
         // explicitly rather than left to the `_ => None` catch-all below, which would blind the cost
         // model to every label stated underneath an `OPTIONAL MATCH`.
         | PhysicalOp::OptionalExpand { input, .. }
+        // `rmp` #869: same reason, and the same trap. A semi-join states no label of its own — the
+        // driving relation does — so it MUST be listed here. Left to the `_ => None` catch-all the cost
+        // model would be blind to every label underneath a `WHERE EXISTS { … }`, which is exactly the
+        // defect #882 found under `OPTIONAL MATCH`: not a wrong answer, a wrong DECISION, and one no
+        // result assertion would ever catch.
+        | PhysicalOp::SemiApply { input, .. }
         | PhysicalOp::NamedPath { input, .. }
         | PhysicalOp::ShortestPath { input, .. }
         | PhysicalOp::QuantifiedPath { input, .. }
