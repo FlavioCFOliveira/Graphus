@@ -32,7 +32,7 @@
 
 use std::collections::HashMap;
 
-use graphus_core::Value;
+use graphus_core::{Value, cmp_int_float};
 
 /// The number of consecutive node ids per zone (BRIN `pages_per_range`). A power of two so the zone
 /// of an id is a shift. 1024 ids/zone keeps the summary ~0.1% of a column while still skipping at a
@@ -273,17 +273,29 @@ impl ZoneMap {
 /// other / mixed class compares `Equal` so the zone is conservatively **kept** (never wrongly
 /// skipped). Integers and floats are compared numerically across the type boundary (Cypher numeric
 /// comparison), matching how an equality/range predicate evaluates.
+///
+/// # Why the cross-type arm calls [`cmp_int_float`] (`rmp` task #894)
+///
+/// A zone map decides which id ranges may be **skipped**, so it is only sound while its notion of
+/// "is this value inside `[min, max]`" is the same one the predicate itself uses. This comparator is
+/// a second, independent implementation of Cypher numeric ordering (it must be: it needs the
+/// conservative `Equal` fallback for mismatched classes, which the real ordering does not have), and
+/// an independent implementation is exactly where the two can drift. Routing the mixed
+/// `INTEGER`/`FLOAT` case through the same exact primitive `crate::ordering` uses removes that
+/// possibility: a zone whose `max` is `Float(2^53.0)` is now correctly recognised as *not*
+/// containing `Integer(2^53+1)`, in the same breath as the predicate says the two are different
+/// numbers.
+///
+/// `NaN` (and any other pair without an order) still falls back to `Equal`, keeping the zone.
 fn cmp_value(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match (a, b) {
         (Value::Integer(x), Value::Integer(y)) => x.cmp(y),
         (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
-        (Value::Integer(x), Value::Float(y)) => {
-            (*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal)
-        }
-        (Value::Float(x), Value::Integer(y)) => {
-            x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal)
-        }
+        (Value::Integer(x), Value::Float(y)) => cmp_int_float(*x, *y).unwrap_or(Ordering::Equal),
+        (Value::Float(x), Value::Integer(y)) => cmp_int_float(*y, *x)
+            .map(Ordering::reverse)
+            .unwrap_or(Ordering::Equal),
         (Value::String(x), Value::String(y)) => x.cmp(y),
         (Value::Boolean(x), Value::Boolean(y)) => x.cmp(y),
         // Mismatched / non-orderable classes: compare Equal so the zone is conservatively kept.

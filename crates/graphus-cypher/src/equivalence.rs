@@ -13,12 +13,16 @@
 //! - **`-0.0 ≡ +0.0` → `true`.** Signed zeros group together (matching `=`, contrasting *ordering*
 //!   where `-0.0 < +0.0`).
 //! - Otherwise it agrees with `=`: `1 ≡ 1.0` → `true`, `1 ≡ 2` → `false`, cross-class → `false`,
-//!   with lists and maps compared element-wise / key-wise under equivalence.
+//!   with lists and maps compared element-wise / key-wise under equivalence. In particular it
+//!   agrees with `=` on *which numbers are the same number*, exactly (the CIP's unlimited-precision
+//!   rule — `9007199254740993 ≢ 9007199254740992.0`, `rmp` task #894), so `DISTINCT` never collapses
+//!   two values a `WHERE` clause reports as different.
 //!
 //! Because it is total and reflexive (every value is equivalent to itself, including `null` and
 //! `NaN`), it is the correct relation for a `HashSet`/group key — see [`equivalent`].
 
-use graphus_core::Value;
+use graphus_core::{Value, cmp_int_float};
+use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 
 /// Returns `true` if `a` and `b` are **equivalent** for `DISTINCT`/grouping (CIP §Equality).
@@ -56,30 +60,39 @@ pub fn equivalent(a: &Value, b: &Value) -> bool {
     }
 }
 
-/// Numeric equivalence: `NaN ≡ NaN` (`true`), `-0.0 ≡ +0.0` (`true`), else numeric `==` across
-/// `INTEGER`/`FLOAT` (`1 ≡ 1.0`).
+/// Numeric equivalence: `NaN ≡ NaN` (`true`), `-0.0 ≡ +0.0` (`true`), else **exact** numeric
+/// sameness across `INTEGER`/`FLOAT` (`1 ≡ 1.0`).
+///
+/// # Why this is not simply `equals(a, b).is_true()` (`rmp` task #894)
+///
+/// Equivalence and equality are *different relations* and must each be right on their own terms:
+/// equivalence is total and two-valued, and it deliberately disagrees with `=` on `NaN`
+/// (`NaN ≡ NaN` is `true`, `NaN = NaN` is `FALSE`). What they must **not** disagree about is which
+/// of two numbers is the same number — otherwise `DISTINCT` would collapse two rows a `WHERE`
+/// clause reports as different. Both therefore route the cross-type case through the single
+/// [`cmp_int_float`], which implements the CIP's unlimited-precision rule (see its docs); only the
+/// `NaN` policy is decided locally, here.
 fn num_equivalent(a: &Value, b: &Value) -> bool {
-    // Two integers compare exactly: the `as f64` round-trip below loses precision above 2^53, so
-    // distinct large `i64`s (e.g. `i64::MAX` and `i64::MAX - 1`) would otherwise be grouped
-    // together, collapsing distinct DISTINCT/grouping keys.
-    if let (Value::Integer(x), Value::Integer(y)) = (a, b) {
-        return x == y;
-    }
-    let (x, y) = (num_f64(a), num_f64(b));
-    if x.is_nan() || y.is_nan() {
-        // Both NaN group together; a NaN and a non-NaN do not.
-        return x.is_nan() && y.is_nan();
-    }
-    // Rust `f64::==` already treats -0.0 == +0.0 as true, which is exactly the equivalence rule.
-    x == y
-}
-
-/// The numeric value of an `INTEGER`/`FLOAT` as `f64`.
-fn num_f64(v: &Value) -> f64 {
-    match v {
-        Value::Integer(i) => *i as f64,
-        Value::Float(f) => *f,
-        _ => unreachable!("num_f64 on a non-number"),
+    match (a, b) {
+        // Two integers compare exactly: an `as f64` round-trip loses precision above 2^53, so
+        // distinct large `i64`s (e.g. `i64::MAX` and `i64::MAX - 1`) would otherwise be grouped
+        // together, collapsing distinct DISTINCT/grouping keys.
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        // Mixed INTEGER/FLOAT: exact (unlimited-precision) sameness. `cmp_int_float` returns `None`
+        // only for a `NaN` float, and an integer is never equivalent to `NaN`, so `None` correctly
+        // falls through to `false`.
+        (Value::Integer(x), Value::Float(y)) => cmp_int_float(*x, *y) == Some(Ordering::Equal),
+        (Value::Float(x), Value::Integer(y)) => cmp_int_float(*y, *x) == Some(Ordering::Equal),
+        (Value::Float(x), Value::Float(y)) => {
+            if x.is_nan() || y.is_nan() {
+                // Both NaN group together; a NaN and a non-NaN do not.
+                x.is_nan() && y.is_nan()
+            } else {
+                // Rust `f64::==` already treats -0.0 == +0.0 as true, exactly the equivalence rule.
+                x == y
+            }
+        }
+        _ => unreachable!("num_equivalent on a non-number pair"),
     }
 }
 
@@ -115,8 +128,12 @@ pub fn hash_value<H: Hasher>(v: &Value, state: &mut H) {
             b.hash(state);
         }
         // INTEGER and FLOAT are one hash class (tag 2) so number-equivalent values collide:
-        // `1 ≡ 1.0`, and `i64::MAX ≡ (i64::MAX as f64)`. Two distinct large integers that round to
-        // the same f64 also share a bucket; `equivalent`'s exact i64 compare separates them.
+        // `1 ≡ 1.0`. The `f64` projection is deliberately **coarser** than [`equivalent`] above
+        // 2^53 — two distinct large integers, and a large integer and the float it rounds to, all
+        // share one bucket — and coarser is exactly what the invariant needs: equivalent values MUST
+        // hash equal, while non-equivalent values merely *may*. `equivalent`'s exact comparison
+        // separates them inside the bucket. Narrowing the equivalence relation (`rmp` task #894)
+        // therefore cannot break this hash; widening it would, so keep the two in step.
         Value::Integer(_) | Value::Float(_) => {
             2u8.hash(state);
             let f = match v {
@@ -365,6 +382,44 @@ mod tests {
         // Equal integers and the integer/float `1 ≡ 1.0` case still hold.
         assert!(equivalent(&i(i64::MAX), &i(i64::MAX)));
         assert!(equivalent(&i(1), &f(1.0)));
+    }
+
+    /// **`rmp` task #894.** Grouping equivalence must agree with `=` about which numbers are the
+    /// same number, or `DISTINCT` collapses two rows a `WHERE` clause calls different. The mixed
+    /// `INTEGER`/`FLOAT` case used to go through `f64`, so `9007199254740993` and
+    /// `9007199254740992.0` landed in one group.
+    #[test]
+    fn mixed_int_float_equivalence_is_exact_above_2_53() {
+        const P53: i64 = 1 << 53;
+        #[allow(clippy::cast_precision_loss)]
+        let p53f = P53 as f64;
+
+        assert!(!equivalent(&i(P53 + 1), &f(p53f)));
+        assert!(!equivalent(&f(p53f), &i(P53 + 1))); // symmetric
+        assert!(equivalent(&i(P53), &f(p53f))); // 2^53 is exactly representable
+        assert!(!equivalent(&i(-(P53 + 1)), &f(-p53f)));
+        assert!(equivalent(&i(-P53), &f(-p53f)));
+        assert!(!equivalent(&i(i64::MAX), &f(9_223_372_036_854_775_808.0)));
+        assert!(equivalent(&i(i64::MIN), &f(-9_223_372_036_854_775_808.0)));
+        // The delicate cases this relation owns are untouched: NaN groups with NaN (unlike `=`),
+        // signed zeros group, and `1 ≡ 1.0` still holds.
+        assert!(equivalent(&nan(), &nan()));
+        assert!(!equivalent(&nan(), &i(P53 + 1)));
+        assert!(!equivalent(&i(P53 + 1), &nan()));
+        assert!(equivalent(&f(-0.0), &f(0.0)));
+        assert!(equivalent(&i(0), &f(-0.0)));
+        assert!(equivalent(&i(1), &f(1.0)));
+
+        // The hash MUST stay consistent: equivalent values hash equal. The `f64` hash projection is
+        // deliberately coarser than the relation, so the newly-separated pair may share a bucket —
+        // that is allowed (the bucket probe decides) and is asserted here so a future "optimisation"
+        // that narrows the hash to match cannot silently break grouping.
+        assert_eq!(
+            h(&i(P53 + 1)),
+            h(&f(p53f)),
+            "a coarser hash bucket is legal and expected; only `equivalent` must be exact"
+        );
+        assert!(!equivalent(&i(P53 + 1), &f(p53f)));
     }
 
     #[test]

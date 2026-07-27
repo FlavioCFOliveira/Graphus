@@ -16,6 +16,7 @@ pub use error::{
 pub use ids::{ElementId, Lsn, PageId, Timestamp, TxnId};
 pub use temporal_calc::{TemporalError, TemporalResult};
 pub use value::Value;
+pub use value::numeric::cmp_int_float;
 pub use value::spatial::{Crs, Point, total_f64};
 pub use value::temporal::{Date, Duration, LocalDateTime, LocalTime, ZonedDateTime, ZonedTime};
 pub use version::{MAX_TIMESTAMP, VersionStamp};
@@ -224,6 +225,10 @@ pub mod value {
     /// ordering. Modelled on [`temporal`] (storage-shaped, fixed-width components); see
     /// `04-technical-design.md` §7.2 and `rmp` task #73.
     pub mod spatial;
+
+    /// The exact comparison between the two Cypher numeric types (`INTEGER` / `FLOAT`), the single
+    /// primitive all three of Cypher's value relations build on (`rmp` task #894).
+    pub mod numeric;
 
     /// Fixed-width temporal component types used by the temporal [`Value`] variants.
     ///

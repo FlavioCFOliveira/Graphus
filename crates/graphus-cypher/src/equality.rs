@@ -13,14 +13,23 @@
 //!   non-`null`, non-`NaN` value compared to `NaN` is likewise unequal.
 //! - **Signed zero is equal.** `-0.0 = +0.0` → `TRUE` (IEEE/openCypher equality; contrast the
 //!   *ordering* rule where `-0.0 < +0.0`, see [`crate::ordering`]).
-//! - **Numbers compare numerically** across `INTEGER`/`FLOAT` (`1 = 1.0` → `TRUE`).
+//! - **Numbers compare numerically** across `INTEGER`/`FLOAT` (`1 = 1.0` → `TRUE`), and they do so
+//!   **exactly**. Quoting the CIP §Numbers, *Comparability and equality*: *"Numbers of different
+//!   types (excluding `NaN` values and the Infinities) are compared to each other and tested for
+//!   equality as if both numbers would have been coerced to unlimited precision big decimals
+//!   (currently outside the Cypher type system) before comparing them with each other numerically in
+//!   their natural order."* So `9007199254740993 = 9007199254740992.0` is **`FALSE`** — the two are
+//!   different numbers, even though the first rounds to the second in `f64`
+//!   ([`graphus_core::cmp_int_float`], `rmp` task #894).
 //! - **Lists and maps compare deeply and three-valuedly.** A definite length / key-set mismatch is
 //!   `FALSE`; otherwise `NULL` from any element comparison propagates, and only an all-`TRUE`
 //!   comparison is `TRUE`.
 //!
 //! `IN` is built on `=` and is likewise three-valued ([`is_in`]).
 
-use graphus_core::Value;
+use std::cmp::Ordering;
+
+use graphus_core::{Value, cmp_int_float};
 
 use crate::ternary::Ternary;
 use crate::value_depth::MAX_VALUE_DEPTH;
@@ -87,11 +96,31 @@ fn deep_equals(a: &Value, b: &Value, depth: usize) -> Ternary {
         // distinct large integers (e.g. 4611686018427387905 vs 4611686018427387900) spuriously
         // equal (TCK `Comparison1 [12]/[13]`).
         (Value::Integer(x), Value::Integer(y)) => Ternary::from_bool(x == y),
-        // Mixed INTEGER/FLOAT (or FLOAT/FLOAT) compare numerically as `f64`; -0.0 == +0.0 (Rust `==`
-        // already does this for f64), and neither is NaN here (filtered in `equals`).
-        (Value::Integer(_) | Value::Float(_), Value::Integer(_) | Value::Float(_)) => {
-            Ternary::from_bool(num_f64(a) == num_f64(b))
+        // Mixed INTEGER/FLOAT compares the two **exactly** (`rmp` task #894). Quoting
+        // CIP2016-06-14 §Numbers, *Comparability and equality*: "Numbers of different types
+        // (excluding NaN values and the Infinities) are compared to each other and tested for
+        // equality **as if both numbers would have been coerced to unlimited precision big
+        // decimals** (currently outside the Cypher type system) before comparing them with each
+        // other numerically in their natural order."
+        //
+        // This arm used to coerce BOTH operands through `f64`, which drops the integer onto the
+        // float's 53-bit significand — the very thing "unlimited precision" forbids. It reported
+        // `9007199254740993 = 9007199254740992.0` as TRUE (Neo4j `NumberValues.numbersEqual` and the
+        // CIP both say FALSE) and, because the *index* key kept the two apart, declaring an index
+        // changed the answer. [`cmp_int_float`] is the exact relation, shared with
+        // [`crate::equivalence`] and [`crate::ordering`] so the three cannot drift apart again.
+        //
+        // `None` (a `NaN` float) is already unreachable — `equals` filtered `NaN` above — and maps
+        // to `FALSE` anyway, which is the CIP's `NaN` rule, so the guard is defence in depth.
+        (Value::Integer(x), Value::Float(y)) => {
+            Ternary::from_bool(cmp_int_float(*x, *y) == Some(Ordering::Equal))
         }
+        (Value::Float(x), Value::Integer(y)) => {
+            Ternary::from_bool(cmp_int_float(*y, *x) == Some(Ordering::Equal))
+        }
+        // FLOAT/FLOAT is plain IEEE equality: `-0.0 == +0.0` (as Cypher requires) and `NaN` was
+        // filtered in `equals`.
+        (Value::Float(x), Value::Float(y)) => Ternary::from_bool(x == y),
         (Value::List(x), Value::List(y)) => list_equals(x, y, depth),
         (Value::Map(x), Value::Map(y)) => map_equals(x, y, depth),
         // Same-class temporals use their structural (component) equality, which is exactly Cypher
@@ -109,15 +138,6 @@ fn deep_equals(a: &Value, b: &Value, depth: usize) -> Ternary {
         (Value::Point(x), Value::Point(y)) => Ternary::from_bool(x.value_eq(y)),
         // Different value classes are never equal (e.g. a string is not a number).
         _ => Ternary::False,
-    }
-}
-
-/// The numeric value of an `INTEGER`/`FLOAT` as `f64`.
-fn num_f64(v: &Value) -> f64 {
-    match v {
-        Value::Integer(i) => *i as f64,
-        Value::Float(f) => *f,
-        _ => unreachable!("num_f64 on a non-number"),
     }
 }
 
@@ -260,6 +280,55 @@ mod tests {
         );
         // A genuine int/float numeric equality still holds across the types.
         assert_eq!(equals(&i(2), &f(2.0)), Ternary::True);
+    }
+
+    /// **`rmp` task #894.** A mixed `INTEGER`/`FLOAT` pair is compared **exactly**, as if both had
+    /// been coerced to unlimited-precision decimals (CIP §Numbers). This arm used to run both
+    /// operands through `f64`, which drops an integer above 2^53 onto the float's 53-bit significand
+    /// and reported `9007199254740993 = 9007199254740992.0` as `TRUE`.
+    #[test]
+    fn mixed_int_float_equality_is_exact_above_2_53() {
+        const P53: i64 = 1 << 53; // 9007199254740992
+        #[allow(clippy::cast_precision_loss)]
+        let p53f = P53 as f64;
+
+        // The reported pair: 2^53+1 rounds to 2^53 in f64 but is a different number.
+        assert_eq!(equals(&i(P53 + 1), &f(p53f)), Ternary::False);
+        assert_eq!(equals(&f(p53f), &i(P53 + 1)), Ternary::False); // symmetric
+        assert_eq!(not_equals(&i(P53 + 1), &f(p53f)), Ternary::True);
+        // 2^53 itself IS exactly representable, so the two spellings are the same number.
+        assert_eq!(equals(&i(P53), &f(p53f)), Ternary::True);
+        assert_eq!(equals(&f(p53f), &i(P53)), Ternary::True);
+        // Negatives mirror.
+        assert_eq!(equals(&i(-(P53 + 1)), &f(-p53f)), Ternary::False);
+        assert_eq!(equals(&i(-P53), &f(-p53f)), Ternary::True);
+        // The i64 extremes against the doubles they round to. `i64::MAX as f64` is 2^63, which is
+        // *larger* than `i64::MAX`; a saturating `as i64` cast back would wrongly say equal.
+        assert_eq!(
+            equals(&i(i64::MAX), &f(9_223_372_036_854_775_808.0)),
+            Ternary::False
+        );
+        // `i64::MIN` is exactly -2^63, so it really does equal that double.
+        assert_eq!(
+            equals(&i(i64::MIN), &f(-9_223_372_036_854_775_808.0)),
+            Ternary::True
+        );
+        // Two integers sharing one double (2^54+3 and 2^54+5 both round to 2^54+4) each compare
+        // correctly against it.
+        let base: i64 = 1 << 54;
+        #[allow(clippy::cast_precision_loss)]
+        let mid = (base + 4) as f64;
+        assert_eq!(equals(&i(base + 3), &f(mid)), Ternary::False);
+        assert_eq!(equals(&i(base + 4), &f(mid)), Ternary::True);
+        assert_eq!(equals(&i(base + 5), &f(mid)), Ternary::False);
+        // TCK `Comparison1 [9]`: the small-magnitude case is untouched.
+        assert_eq!(equals(&i(1), &f(1.0)), Ternary::True);
+        // `IN` is the OR-fold of `=`, so it inherits the exactness.
+        assert_eq!(
+            is_in(&i(P53 + 1), &Value::List(vec![f(p53f)])),
+            Ternary::False
+        );
+        assert_eq!(is_in(&i(P53), &Value::List(vec![f(p53f)])), Ternary::True);
     }
 
     #[test]

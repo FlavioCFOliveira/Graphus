@@ -736,6 +736,54 @@ fn is_index_encodable(v: &Value) -> bool {
     graphus_index::keycodec::encode_single(v).is_ok()
 }
 
+/// The magnitude above which an `i64` is no longer determined by its index key (2^53).
+///
+/// [`keycodec::encode_integer`](graphus_index::keycodec) puts an `INTEGER` on the shared `f64`
+/// magnitude line, which has a 53-bit significand. At `|i| >= 2^53` the projection stops being
+/// injective, and that is exactly where an exclusive upper bound becomes unsafe.
+const LOSSY_INTEGER_KEY_MAGNITUDE: u64 = 1 << 53;
+
+/// Whether using `bound` as the backing seek's **exclusive upper key** would cut away rows the
+/// predicate accepts — in which case the caller must widen to unbounded-above (`rmp` task #894).
+///
+/// # The invariant an exclusive upper bound needs
+///
+/// `PropertyIndex::seek_range` stops at `key(bound)`, so it only returns a superset of
+/// `{ v : v < bound }` while
+///
+/// ```text
+///     v < bound   (Cypher comparison)   ⟹   key(v) < key(bound)   (index byte order)
+/// ```
+///
+/// i.e. while the key order *refines* the comparison order. It normally does: a key is the value's
+/// `f64` magnitude followed by an `INTEGER`-before-`FLOAT` tie-break byte, and a strictly smaller
+/// number never has a strictly larger magnitude.
+///
+/// # Where it fails, and why only for an `INTEGER` bound
+///
+/// The magnitude is **lossy for an `i64` above 2^53**, so several distinct values collapse onto one
+/// key, and then `key(v) < key(bound)` is *false* for a `v` that is genuinely smaller:
+///
+/// * `Integer(18014398509481987)` and `Integer(18014398509481989)` (2^54+3 and 2^54+5) both round to
+///   `18014398509481988.0`, so they share **one** key — yet `2^54+3 < 2^54+5`. This half is
+///   pre-existing: `ordering::compare_values` has always compared two `i64`s exactly.
+/// * `Float(9007199254740992.0)` (2^53) and `Integer(9007199254740993)` (2^53+1) share the same
+///   magnitude, and the `FLOAT` tie-break byte sorts *above* the `INTEGER` one — yet 2^53 is the
+///   smaller number. This half arrived with `rmp` #894, which made that comparison exact.
+///
+/// A **`FLOAT`** bound is safe at every magnitude: an `f64` is its own key magnitude exactly, and any
+/// value below it either has a strictly smaller magnitude or is an `INTEGER` at the same magnitude —
+/// whose tie-break byte sorts *below* the float's. So only `Value::Integer` needs the widening, and
+/// only above 2^53, which no realistic property value reaches; every other bound keeps the tight
+/// range and the performance that goes with it.
+///
+/// Widening to unbounded-above is always sound here because the result is a *candidate* set that the
+/// caller re-checks against `eval::satisfies_range` (the single comparison source of truth). A
+/// superset costs re-check work; a subset is silent row loss.
+fn exclusive_upper_key_is_lossy(bound: &Value) -> bool {
+    matches!(bound, Value::Integer(i) if i.unsigned_abs() >= LOSSY_INTEGER_KEY_MAGNITUDE)
+}
+
 impl IndexSet {
     /// An empty index set: a single label [`TokenIndex`] (always present, auto-maintained) and no
     /// property indexes yet.
@@ -1724,7 +1772,9 @@ impl IndexSet {
     ///   openCypher orderability). To remain a correct **superset**, an unbounded-below request
     ///   therefore returns **all** candidates for the token (the whole index column), which is
     ///   always a superset of any `< upper` request. The caller re-checks the predicate.
-    /// - **Upper** `Some((v, false))` (exclusive) maps exactly to `hi = Some(v)`.
+    /// - **Upper** `Some((v, false))` (exclusive) maps exactly to `hi = Some(v)` — *except* when
+    ///   `v`'s index key does not determine `v` exactly ([`exclusive_upper_key_is_lossy`]), where it
+    ///   widens to `hi = None`. See that function for why.
     /// - **Upper** `Some((v, true))` (inclusive) cannot be expressed (the backing upper is always
     ///   exclusive), so we widen to `hi = None` (unbounded above). This over-includes everything
     ///   `> v`, which the caller's predicate re-check then drops. (A tighter `next-value` upper is
@@ -1758,12 +1808,14 @@ impl IndexSet {
             }
         }
 
-        // Map the upper bound: exclusive maps exactly; inclusive widens to unbounded-above (a
-        // superset); `None` is unbounded-above.
+        // Map the upper bound: exclusive maps exactly (unless its key is lossy — see
+        // `exclusive_upper_key_is_lossy`); inclusive widens to unbounded-above (a superset); `None`
+        // is unbounded-above.
         let hi: Option<&Value> = match upper {
-            Some((v, false)) => Some(v), // exclusive: exact
-            Some((_, true)) => None,     // inclusive: widen to unbounded above (superset)
-            None => None,                // unbounded above
+            Some((v, false)) if !exclusive_upper_key_is_lossy(v) => Some(v), // exclusive: exact
+            Some((_, false)) => None, // exclusive but lossy key: widen (`rmp` #894)
+            Some((_, true)) => None,  // inclusive: widen to unbounded above (superset)
+            None => None,             // unbounded above
         };
 
         let candidates = match lower {
@@ -1980,12 +2032,14 @@ impl IndexSet {
             }
         }
 
-        // Map the upper bound: exclusive maps exactly; inclusive widens to unbounded-above (a
-        // superset); `None` is unbounded-above. Mirrors `seek_node_property_range`.
+        // Map the upper bound: exclusive maps exactly (unless its key is lossy — see
+        // `exclusive_upper_key_is_lossy`); inclusive widens to unbounded-above (a superset); `None`
+        // is unbounded-above. Mirrors `seek_node_property_range`.
         let hi: Option<&Value> = match upper {
-            Some((v, false)) => Some(v), // exclusive: exact
-            Some((_, true)) => None,     // inclusive: widen to unbounded above (superset)
-            None => None,                // unbounded above
+            Some((v, false)) if !exclusive_upper_key_is_lossy(v) => Some(v), // exclusive: exact
+            Some((_, false)) => None, // exclusive but lossy key: widen (`rmp` #894)
+            Some((_, true)) => None,  // inclusive: widen to unbounded above (superset)
+            None => None,             // unbounded above
         };
 
         let candidates = match lower {
@@ -4503,6 +4557,115 @@ mod tests {
         // Unregistered (label_token, prop_key) -> None.
         assert_eq!(set.seek_node_property_eq(1, 3, &Value::Integer(10)), None);
         assert_eq!(set.seek_node_property_eq(9, 2, &Value::Integer(10)), None);
+    }
+
+    /// **`rmp` task #894 — the seam's candidate-SUPERSET contract under a two-sided range.**
+    ///
+    /// [`IndexSet::seek_node_property_range`] documents that its result "always contains every node
+    /// whose current value satisfies the requested bounds". An *exclusive upper bound* is served by
+    /// cutting the backing B+-tree range at `key(bound)`, which only preserves that contract while
+    /// the key order refines the comparison order. It does **not** for a large `INTEGER` bound,
+    /// because [`keycodec::encode_integer`](graphus_index::keycodec) folds an `i64` onto the `f64`
+    /// magnitude line:
+    ///
+    /// * `2^54+3` and `2^54+5` round to the same double, so they share **one** key, yet
+    ///   `2^54+3 < 2^54+5`; and
+    /// * `Float(2^53.0)` shares the magnitude of `Integer(2^53+1)` but carries the *larger*
+    ///   tie-break byte, yet `2^53.0 < 2^53+1` (the exact comparison this task introduced).
+    ///
+    /// Both rows would be cut away — a **subset**, i.e. silent row loss, the `rmp` #680/#738 defect
+    /// class. [`exclusive_upper_key_is_lossy`] makes the seam widen instead.
+    ///
+    /// This is asserted **here, at the seam**, and not end-to-end: the physical planner currently
+    /// emits one bound per `NodeIndexRangeSeek` and pushes the second into a residual `Filter`, so
+    /// no query reaches this shape today. The seam is `pub` and its contract is what future callers
+    /// (and the existing two-bound `NodeIndexStartsWithSeek` caller) rely on, so the contract is
+    /// pinned where it lives.
+    #[test]
+    fn two_sided_range_upper_bound_keeps_the_candidate_superset_above_2_53() {
+        // (a) Two INTEGERs that share one f64 magnitude: 2^54+3 and 2^54+5 both round to 2^54+4.
+        let base: i64 = 1 << 54;
+        let mut set = IndexSet::new();
+        set.register_node_property(1, 2);
+        set.insert_node_property(1, 2, &Value::Integer(base + 3), 100);
+        set.insert_node_property(1, 2, &Value::Integer(base + 5), 101);
+
+        let got = set
+            .seek_node_property_range(
+                1,
+                2,
+                Some((&Value::Integer(0), true)), // inclusive lower
+                Some((&Value::Integer(base + 5), false)), // EXCLUSIVE upper, lossy key
+            )
+            .expect("index is registered");
+        assert!(
+            got.contains(&100),
+            "node 100 (2^54+3) satisfies `< 2^54+5` and MUST be in the candidate superset; got {got:?}"
+        );
+
+        // (b) The mixed pair: Float(2^53.0) is strictly below Integer(2^53+1) but its key sorts above.
+        let p53: i64 = 1 << 53;
+        #[allow(clippy::cast_precision_loss)]
+        let p53f = p53 as f64;
+        let mut set = IndexSet::new();
+        set.register_node_property(1, 2);
+        set.insert_node_property(1, 2, &Value::Float(p53f), 200);
+        set.insert_node_property(1, 2, &Value::Integer(p53), 201);
+        set.insert_node_property(1, 2, &Value::Integer(p53 + 1), 202);
+
+        let got = set
+            .seek_node_property_range(
+                1,
+                2,
+                Some((&Value::Integer(0), true)),
+                Some((&Value::Integer(p53 + 1), false)), // EXCLUSIVE upper, lossy key
+            )
+            .expect("index is registered");
+        assert!(
+            got.contains(&200),
+            "node 200 (FLOAT 2^53.0) satisfies `< 2^53+1` and MUST be in the candidate superset; \
+             got {got:?}"
+        );
+        assert!(
+            got.contains(&201),
+            "node 201 (INTEGER 2^53) satisfies `< 2^53+1` and MUST be in the candidate superset; \
+             got {got:?}"
+        );
+    }
+
+    /// The widening is **scoped**: an ordinary small-magnitude exclusive upper bound keeps the tight
+    /// backing range (values at or above it are not returned at all), and a `FLOAT` bound keeps it at
+    /// every magnitude — an `f64` *is* its own key magnitude, so its key order is exact.
+    #[test]
+    fn exclusive_upper_bound_stays_tight_when_the_key_is_exact() {
+        assert!(!exclusive_upper_key_is_lossy(&Value::Integer(9)));
+        assert!(!exclusive_upper_key_is_lossy(&Value::Integer(-9)));
+        assert!(!exclusive_upper_key_is_lossy(&Value::Integer(
+            (1 << 53) - 1
+        )));
+        assert!(exclusive_upper_key_is_lossy(&Value::Integer(1 << 53)));
+        assert!(exclusive_upper_key_is_lossy(&Value::Integer(-(1 << 53))));
+        assert!(exclusive_upper_key_is_lossy(&Value::Integer(i64::MAX)));
+        // A FLOAT bound is exact at every magnitude, and so is a STRING (the `STARTS WITH` seek's
+        // successor bound, the one two-bound caller that exists today).
+        assert!(!exclusive_upper_key_is_lossy(&Value::Float(1e300)));
+        assert!(!exclusive_upper_key_is_lossy(&Value::Float(9e15)));
+        assert!(!exclusive_upper_key_is_lossy(&s("zzz")));
+
+        // ...and the tight range really is tight: `< 9` excludes 9 itself.
+        let mut set = IndexSet::new();
+        set.register_node_property(1, 2);
+        set.insert_node_property(1, 2, &Value::Integer(8), 300);
+        set.insert_node_property(1, 2, &Value::Integer(9), 301);
+        let got = set
+            .seek_node_property_range(
+                1,
+                2,
+                Some((&Value::Integer(0), true)),
+                Some((&Value::Integer(9), false)),
+            )
+            .expect("index is registered");
+        assert_eq!(got, vec![300], "an exact key keeps the backing range tight");
     }
 
     #[test]

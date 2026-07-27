@@ -376,25 +376,45 @@ fn cypher_equal_alternatives_of_different_types_collapse_without_losing_rows() {
     }
 }
 
-/// A UNIQUE constraint rejects a **cross-type** duplicate at the `i64`/`f64` boundary, through its
-/// index-backed check (`rmp` task #868, scope check).
+/// Runs a write that is expected to be *rejected*, returning the captured error. Rolls the
+/// transaction back either way, so the store is left clean for the next step.
+fn attempt_write(coord: &mut Coord, src: &str) -> Option<graphus_core::error::GraphusError> {
+    let plan = compile_with(src, &IndexCatalog::empty());
+    let txn = coord.begin_serializable();
+    let bound = bind_parameters(&plan, &Parameters::new()).expect("bind");
+    let captured = {
+        let mut graph = coord.statement(txn).expect("statement");
+        let mut cursor = execute(&plan, &bound, &mut graph).expect("open cursor");
+        let _ = cursor.collect_all();
+        graph.take_error()
+    };
+    coord.rollback(txn).expect("the attempt rolls back cleanly");
+    captured
+}
+
+/// A UNIQUE constraint decides a **cross-type** duplicate at the `i64`/`f64` boundary *exactly*,
+/// through its index-backed check (`rmp` task #868, corrected by `rmp` task #894).
 ///
 /// `rmp` #738 names the worst consequence of a narrow index seek: *"a UNIQUE constraint check passing
 /// over rows it never examined"*. Constraint validation is index-accelerated —
-/// `RecordStoreGraph::unique_conflict` asks `index_seek_eq` for the holders of the new value — so #868
-/// had to establish that it still rejects a duplicate the seek could conceivably miss. This pins that
-/// it does.
+/// `RecordStoreGraph::unique_conflict` asks `index_seek_eq` for the holders of the new value, then
+/// re-checks each candidate with `equality::equals` — so both halves have to be right.
 ///
-/// **What this test does NOT prove.** It is deliberately reported as insensitive to the probe-class fix
-/// in `graphus-index::numeric_equal_sibling`: restoring the old narrow probe class by mutation leaves
-/// it passing, because `9007199254740992` and `9007199254740993` happen to share one *order-preserving*
-/// index key (that key folds an `i64` onto its `f64` magnitude), so the candidate reaches the re-check
-/// either way. The probe-class fix is pinned by
-/// [`large_integer_float_alternatives_neither_lose_nor_duplicate_rows`] instead, where the missed value
-/// is a `Float` whose key carries a different numtag. No claim is made here that the constraint was
-/// ever broken — only that it is not broken now.
+/// # Why this test changed with `rmp` #894
+///
+/// It used to assert that inserting `9007199254740992.0` (2^53) collided with a stored
+/// `9007199254740993` (2^53+1), on the stated premise that *"`9007199254740992.0 =
+/// 9007199254740993` is TRUE under Cypher's mixed INTEGER/FLOAT comparison"*. That premise **was the
+/// defect**: the evaluator was coercing the integer through `f64`. openCypher CIP2016-06-14 §Numbers
+/// requires the two to be compared as if coerced to unlimited-precision decimals, under which they
+/// are *different numbers* — so this is **not** a duplicate and admitting it is the correct
+/// behaviour. Neo4j's `NumberValues.numbersEqual` agrees.
+///
+/// The test therefore now pins both directions, which is strictly more than it pinned before:
+/// a cross-type pair that genuinely *is* one number still collides, and one that merely rounds
+/// together does not.
 #[test]
-fn a_unique_constraint_rejects_a_cross_type_duplicate_the_index_used_to_miss() {
+fn a_unique_constraint_decides_a_cross_type_duplicate_exactly() {
     let mut coord = fresh_coord();
     // A UNIQUE constraint registers and populates a backing node-property index, so the duplicate check
     // takes the SEEK path — the one that was narrow.
@@ -404,24 +424,34 @@ fn a_unique_constraint_rejects_a_cross_type_duplicate_the_index_used_to_miss() {
 
     run_write(&mut coord, "CREATE (:USER {id: 1, uidn: 9007199254740993})");
 
-    // `9007199254740992.0 = 9007199254740993` is TRUE under Cypher's mixed INTEGER/FLOAT comparison, so
-    // this is a duplicate and must be rejected.
-    let plan = compile_with(
-        "CREATE (:USER {id: 2, uidn: 9007199254740992.0})",
-        &IndexCatalog::empty(),
+    // NOT a duplicate (`rmp` #894): 2^53+1 and 2^53.0 are different numbers, even though the integer
+    // rounds to the float in `f64` and the two share one order-preserving index key — so the seek DOES
+    // examine the stored row, and the exact re-check correctly lets this write through.
+    assert!(
+        attempt_write(
+            &mut coord,
+            "CREATE (:USER {id: 2, uidn: 9007199254740992.0})"
+        )
+        .is_none(),
+        "2^53+1 and 2^53.0 are different numbers, so this is not a uniqueness violation"
     );
-    let txn = coord.begin_serializable();
-    let bound = bind_parameters(&plan, &Parameters::new()).expect("bind");
-    let captured = {
-        let mut graph = coord.statement(txn).expect("statement");
-        let mut cursor = execute(&plan, &bound, &mut graph).expect("open cursor");
-        let _ = cursor.collect_all();
-        graph.take_error()
-    };
-    coord
-        .rollback(txn)
-        .expect("the rejected write rolls back cleanly");
-    let err = captured.expect("the duplicate must be rejected, not admitted");
+
+    // A REAL cross-type duplicate at the same boundary: 2^53 is exactly representable, so the stored
+    // `INTEGER` and the incoming `FLOAT` are one number and the constraint must reject it. This is the
+    // half the original test meant to cover, on a pair where the premise actually holds.
+    run_write(&mut coord, "CREATE (:USER {id: 4, uidn: 9007199254740992})");
+    let err = attempt_write(
+        &mut coord,
+        "CREATE (:USER {id: 5, uidn: 9007199254740992.0})",
+    )
+    .expect("a genuine cross-type duplicate must be rejected, not admitted");
+    assert!(
+        err.to_string().contains(CONSTRAINT_VIOLATION_PREFIX),
+        "expected a constraint violation, got: {err}"
+    );
+    // ...and symmetrically, a stored FLOAT rejects the equal INTEGER.
+    let err = attempt_write(&mut coord, "CREATE (:USER {id: 6, uidn: 9007199254740993})")
+        .expect("an exact same-type duplicate must be rejected");
     assert!(
         err.to_string().contains(CONSTRAINT_VIOLATION_PREFIX),
         "expected a constraint violation, got: {err}"
@@ -517,12 +547,15 @@ fn order_equal_but_unequal_durations_are_not_collapsed() {
 ///
 /// This test compares the multi-value seek against **`k` separate single-value seeks**, not against the
 /// scan. That is the invariant #868 owns: a union of `k` descents must return exactly what those `k`
-/// descents return. Whether an indexed `=` agrees with a *scanned* `=` at magnitudes at or above 2^53 is
-/// a **separate, open** question — the index's cross-type probe class (`graphus-index`
-/// `numeric_equal_sibling`) follows `encode_equality_canonical`, which keeps a large integer distinct
-/// from its rounded `f64` exactly as Neo4j's `NumberValues.numbersEqual` does, while
-/// `graphus_cypher::equality` compares the pair as `f64`. Reconciling those two is a specification
-/// decision outside this task; see the `rmp` #868 report.
+/// descents return.
+///
+/// Whether an indexed `=` agrees with a *scanned* `=` at magnitudes at or above 2^53 was left open by
+/// #868 and has since been **settled by `rmp` #894**, in the index's favour: the index's cross-type
+/// probe class (`graphus-index` `numeric_equal_sibling`) follows `encode_equality_canonical`, which
+/// keeps a large integer distinct from its rounded `f64` exactly as Neo4j's
+/// `NumberValues.numbersEqual` does, and `graphus_cypher::equality` was corrected to do the same
+/// (openCypher CIP2016-06-14 §Numbers, unlimited precision). The two now agree — pinned end to end by
+/// `tests/int_float_precision.rs`.
 #[test]
 fn large_integer_alternatives_are_not_collapsed_into_one_descent() {
     let mut coord = fresh_coord();

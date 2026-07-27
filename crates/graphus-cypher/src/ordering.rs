@@ -28,17 +28,40 @@
 //! **equivalence** they are equal. This split is the standard openCypher/IEEE behaviour and matches
 //! the index keycodec doc. See [`total_f64`].
 //!
+//! # Numbers are compared exactly, across the two numeric types
+//!
+//! `INTEGER` and `FLOAT` share one class rank and are ordered by their **exact** numeric values, as
+//! if both had been coerced to unlimited-precision decimals (CIP §Numbers; `rmp` task #894). An
+//! `f64` has a 53-bit significand, so an `i64` above 2^53 must not be projected onto it to decide
+//! the comparison: `9007199254740993` rounds to `9007199254740992.0` but is the larger number and
+//! sorts above it. Only when two numbers are genuinely equal does the stable **`INTEGER` before
+//! `FLOAT`** tie-break decide, which is what keeps `1` and `1.0` deterministically ordered.
+//! [`graphus_core::cmp_int_float`] is the shared primitive; `crate::equality` and
+//! `crate::equivalence` use the same one, so `ORDER BY` can never contradict `=` or `DISTINCT`.
+//!
 //! # Cross-check with the index keycodec
 //!
-//! For the index-encodable classes, this ordering is proven byte-for-byte identical to
-//! `graphus_index::keycodec` encoded order by a dev-dependency test
-//! (`tests/ordering_vs_keycodec.rs`): the two implementations are written independently, so the
-//! agreement is a genuine cross-validation that a memcmp B+-tree is Cypher-ordered.
+//! For the index-encodable classes, this ordering agrees with `graphus_index::keycodec` encoded
+//! order, checked by a dev-dependency test (`tests/ordering_vs_keycodec.rs`): the two
+//! implementations are written independently, so the agreement is a genuine cross-validation that a
+//! memcmp B+-tree is Cypher-ordered.
+//!
+//! **The one documented exception** is large integers. The keycodec projects an `i64` onto the `f64`
+//! magnitude line (`keycodec::encode_integer`), which is lossy above 2^53: `Integer(2^54+3)` and
+//! `Integer(2^54+5)` encode to the *same* key, as do `Integer(2^53+1)` and `Float(2^53.0)`, while
+//! this module orders each pair strictly. (The `i64`-vs-`i64` half of that has always been so — the
+//! exact `i64` comparison below predates `rmp` #894 — and `rmp` #894 extended it to the mixed pair.)
+//! Consequently the index tree is a *coarsening* of this order at those magnitudes, never a
+//! contradiction of it, and every index path re-checks its candidates against this module or
+//! `crate::equality`, so no wrong row is ever returned. Two consequences are worth naming:
+//! `index_set`'s range seek widens an exclusive upper bound whose key is lossy (see the note there),
+//! and an `ORDER BY` served directly from index order would be coarse for such data — see the
+//! `rmp` #894 report.
 
 use std::cmp::Ordering;
 
-use graphus_core::Value;
 use graphus_core::value::temporal::NANOS_PER_DAY;
+use graphus_core::{Value, cmp_int_float};
 
 /// The average nanoseconds per month used **only** to order durations (`365.2425 / 12 ≈ 30.436875`
 /// days, expressed in nanoseconds). Cypher durations have no exact length, so the order compares
@@ -93,13 +116,37 @@ pub(crate) fn class_rank(v: &Value) -> u8 {
 /// bodies were identical by construction (a cross-check test guards this).
 pub use graphus_core::total_f64;
 
-/// The numeric value of an `INTEGER`/`FLOAT` as `f64` (the domain Cypher mixes them in for ordering;
-/// `1` and `1.0` compare equal numerically, then a stable type tie-break keeps the order total).
-fn as_f64(v: &Value) -> f64 {
-    match v {
-        Value::Integer(i) => *i as f64,
-        Value::Float(f) => *f,
-        _ => unreachable!("as_f64 on a non-number"),
+/// The **orderability** of an `INTEGER` against a `FLOAT`, with the integer in the `a` position.
+///
+/// Two rules have to hold at once, and they are separated deliberately:
+///
+/// 1. The *ordering-only* rules — `NaN` is the largest number, and `-0.0 < +0.0` — belong to
+///    [`total_f64`] and are byte-identical to what the index key codec encodes. They are evaluated
+///    first, on the shared `f64` magnitude line, and whenever they decide the comparison the answer
+///    is theirs. This is what keeps `cmp_values` agreeing with the keycodec for signed zero and
+///    `NaN`.
+/// 2. Only when the two share one `f64` magnitude does the **exact** comparison
+///    ([`cmp_int_float`], the CIP's unlimited-precision rule — see `rmp` task #894) get to refine
+///    the tie: `Integer(2^53+1)` rounds to the same double as `Float(2^53.0)` but is the greater
+///    number, so it must sort *above* it. Only if the two really are the same number does the
+///    historical stable tie-break apply — **`INTEGER` before `FLOAT`** — which is what keeps the
+///    relation a total order over `1` and `1.0`.
+///
+/// Doing it in this order is what makes the change surgical: the *only* pairs whose order moves are
+/// those where an integer above 2^53 shares a magnitude with a float but is not equal to it.
+fn cmp_int_float_ordering(i: i64, f: f64) -> Ordering {
+    #[allow(clippy::cast_precision_loss)] // the lossy projection is intentional: rule (1) above
+    let by_magnitude = total_f64(i as f64, f);
+    if by_magnitude != Ordering::Equal {
+        return by_magnitude;
+    }
+    match cmp_int_float(i, f) {
+        Some(Ordering::Less) => Ordering::Less,
+        Some(Ordering::Greater) => Ordering::Greater,
+        // Genuinely the same number → the stable type tie-break, `INTEGER` before `FLOAT`.
+        // `None` (a `NaN` float) is unreachable here: `total_f64(_, NaN)` is `Less`, never `Equal`,
+        // so rule (1) already returned. It falls in with the tie-break to keep the match total.
+        Some(Ordering::Equal) | None => Ordering::Less,
     }
 }
 
@@ -205,17 +252,18 @@ fn cmp_values_at(a: &Value, b: &Value, depth: usize) -> Ordering {
         // distinct large `i64`s (e.g. `i64::MAX` and `i64::MAX - 1`) would otherwise collapse to
         // `Equal`, breaking the total order ORDER BY / min / max rely on.
         (Value::Integer(x), Value::Integer(y)) => x.cmp(y),
-        // Otherwise both are numbers (same class rank 14): compare numerically, then INTEGER before
-        // FLOAT on a magnitude tie, so `1` and `1.0` (equal numerically) still order deterministically.
-        _ => {
-            let by_value = total_f64(as_f64(a), as_f64(b));
-            if by_value != Ordering::Equal {
-                by_value
-            } else {
-                let is_float = |v: &Value| matches!(v, Value::Float(_));
-                is_float(a).cmp(&is_float(b))
-            }
-        }
+        // Otherwise both are numbers (same class rank 15). A mixed pair goes through
+        // `cmp_int_float_ordering`, which keeps `NaN`-largest and `-0.0 < +0.0` on the magnitude
+        // line and then refines an exact tie (`rmp` task #894); the FLOAT-first direction is
+        // derived by `reverse()`, so antisymmetry holds *by construction* rather than by review.
+        (Value::Integer(x), Value::Float(y)) => cmp_int_float_ordering(*x, *y),
+        (Value::Float(x), Value::Integer(y)) => cmp_int_float_ordering(*y, *x).reverse(),
+        (Value::Float(x), Value::Float(y)) => total_f64(*x, *y),
+        // Unreachable: `class_rank` already matched, and the arms above exhaust every pair of
+        // same-rank variants. Reporting `Equal` rather than panicking is deliberate — this function
+        // is the comparator handed to `sort_by`, and a panic inside a sort is far worse than a
+        // defined result. Same reasoning as the depth guard above.
+        _ => Ordering::Equal,
     }
 }
 
@@ -234,8 +282,10 @@ fn cmp_values_at(a: &Value, b: &Value, depth: usize) -> Ordering {
 /// - **`null`**: a `null` operand (or a `null` *reached as the deciding element of a list*) is
 ///   incomparable. (Callers must already have handled a *top-level* `null`; this function still
 ///   guards it for nested-list correctness.)
-/// - **Numbers**: `INTEGER` and `FLOAT` compare numerically across the supertype. A `NaN` operand
-///   makes a *number-vs-number* comparison incomparable (`None`); the TCK pins `NaN`-vs-number to a
+/// - **Numbers**: `INTEGER` and `FLOAT` compare numerically across the supertype, and **exactly** —
+///   as if both had been coerced to unlimited-precision decimals (CIP §Numbers; `rmp` task #894), so
+///   `9007199254740993 < 9007199254740992.0` is `false` and `>` is `true`. A `NaN` operand makes a
+///   *number-vs-number* comparison incomparable (`None`); the TCK pins `NaN`-vs-number to a
 ///   `false` inequality, which the operator layer derives from `None` together with the cross-type
 ///   rule below (NaN-vs-string is `null`, NaN-vs-number is `false`).
 /// - **Strings**: lexicographically by Unicode code units.
@@ -271,21 +321,22 @@ pub fn compare_values(a: &Value, b: &Value) -> Option<Ordering> {
             }
         }
         // Numbers compare numerically across INTEGER/FLOAT; a NaN operand is incomparable for a
-        // number-vs-number pair.
+        // number-vs-number pair (each arm below returns `None` for it, which is where that rule
+        // now lives).
         // Two integers compare exactly (an `as f64` round-trip loses precision above 2^53, which
         // would make distinct large `i64`s compare `Equal` and break `<`/`>` ordering).
         (Value::Integer(x), Value::Integer(y)) => Some(x.cmp(y)),
-        (Value::Integer(_) | Value::Float(_), Value::Integer(_) | Value::Float(_)) => {
-            if matches!(a, Value::Float(f) if f.is_nan())
-                || matches!(b, Value::Float(f) if f.is_nan())
-            {
-                return None;
-            }
-            // Reuse the numeric magnitude order; signed zero compares equal here (`-0.0` and `+0.0`
-            // are the same point for comparability/equality, unlike *ordering*).
-            let (xa, xb) = (as_f64(a), as_f64(b));
-            xa.partial_cmp(&xb)
-        }
+        // A mixed pair compares **exactly**, as if both had been coerced to unlimited-precision
+        // decimals (CIP §Numbers; `rmp` task #894) — never through an `f64` cast of the integer,
+        // which would report `9007199254740993 < 9007199254740992.0` and `>` as both false. This is
+        // the same [`cmp_int_float`] `=` and `DISTINCT` use, so `<`/`>`/`<=`/`>=` can never
+        // contradict `=` for a numeric pair. `None` is returned exactly for a `NaN` float, which is
+        // the CIP's incomparability rule for this arm.
+        (Value::Integer(x), Value::Float(y)) => cmp_int_float(*x, *y),
+        (Value::Float(x), Value::Integer(y)) => cmp_int_float(*y, *x).map(Ordering::reverse),
+        // FLOAT/FLOAT: IEEE `partial_cmp` — `None` for `NaN`, and signed zero compares equal here
+        // (`-0.0` and `+0.0` are the same point for comparability/equality, unlike *ordering*).
+        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y),
         // Same-class temporals compare chronologically; mismatched temporal classes fall through to
         // the cross-class `None` arm below.
         (Value::Date(_), Value::Date(_))
@@ -449,6 +500,172 @@ mod tests {
         let d = Value::Integer(i64::MIN + 1);
         assert_eq!(compare_values(&c, &d), Some(Ordering::Less));
         assert_ne!(cmp_values(&c, &d), Ordering::Equal);
+    }
+
+    /// **`rmp` task #894.** Both numeric relations this module owns — the total orderability
+    /// (`cmp_values`, for `ORDER BY` / `min` / `max`) and the partial comparability
+    /// (`compare_values`, for `<` `>` `<=` `>=`) — compare a mixed `INTEGER`/`FLOAT` pair
+    /// **exactly**. They used to project the integer through `f64`, which reported
+    /// `Integer(2^53+1)` and `Float(2^53.0)` as numerically equal and then sorted the integer
+    /// *below* the float on the type tie-break — the opposite of the truth.
+    #[test]
+    fn mixed_int_float_ordering_is_exact_above_2_53() {
+        const P53: i64 = 1 << 53;
+        #[allow(clippy::cast_precision_loss)]
+        let p53f = P53 as f64;
+
+        // Orderability: 2^53+1 sorts strictly ABOVE the float 2^53 (`lt` also checks antisymmetry).
+        lt(Value::Float(p53f), Value::Integer(P53 + 1));
+        // Comparability agrees, and is strict in both directions.
+        assert_eq!(
+            compare_values(&Value::Float(p53f), &Value::Integer(P53 + 1)),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare_values(&Value::Integer(P53 + 1), &Value::Float(p53f)),
+            Some(Ordering::Greater)
+        );
+        // 2^53 itself is exactly representable: numerically equal, so only the stable
+        // INTEGER-before-FLOAT tie-break separates them in the *total* order...
+        lt(Value::Integer(P53), Value::Float(p53f));
+        // ...while comparability reports them equal (no tie-break there).
+        assert_eq!(
+            compare_values(&Value::Integer(P53), &Value::Float(p53f)),
+            Some(Ordering::Equal)
+        );
+        // Negatives mirror.
+        lt(Value::Integer(-(P53 + 1)), Value::Float(-p53f));
+        assert_eq!(
+            compare_values(&Value::Integer(-(P53 + 1)), &Value::Float(-p53f)),
+            Some(Ordering::Less)
+        );
+        // The i64 extremes against the doubles they round to.
+        lt(
+            Value::Integer(i64::MAX),
+            Value::Float(9_223_372_036_854_775_808.0),
+        );
+        assert_eq!(
+            compare_values(
+                &Value::Integer(i64::MIN),
+                &Value::Float(-9_223_372_036_854_775_808.0)
+            ),
+            Some(Ordering::Equal),
+            "i64::MIN IS exactly -2^63"
+        );
+        // Two integers sharing one double are ordered around it in both relations.
+        let base: i64 = 1 << 54;
+        #[allow(clippy::cast_precision_loss)]
+        let mid = (base + 4) as f64;
+        lt(Value::Integer(base + 3), Value::Float(mid));
+        lt(Value::Float(mid), Value::Integer(base + 5));
+        assert_eq!(
+            compare_values(&Value::Integer(base + 3), &Value::Float(mid)),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            compare_values(&Value::Integer(base + 5), &Value::Float(mid)),
+            Some(Ordering::Greater)
+        );
+    }
+
+    /// The two *ordering-only* rules must survive the exactness change untouched, because they are
+    /// what the index key codec encodes: `NaN` is the largest number, and `-0.0 < +0.0` — including
+    /// when the other operand is an `INTEGER`, where the refinement step could have overridden them.
+    #[test]
+    fn ordering_only_rules_survive_the_exact_refinement() {
+        // Signed zero across the type boundary keeps the *ordering* split (`-0.0 < 0 < +0.0` is not
+        // a thing: `Integer(0)` shares `+0.0`'s magnitude and tie-breaks below it).
+        lt(Value::Float(-0.0), Value::Integer(0));
+        lt(Value::Integer(0), Value::Float(0.0));
+        // ...while equality and comparability both call every zero the same point.
+        assert_eq!(
+            compare_values(&Value::Integer(0), &Value::Float(-0.0)),
+            Some(Ordering::Equal)
+        );
+        // NaN outranks every integer, including the extremes, and is incomparable to them.
+        lt(Value::Integer(i64::MAX), Value::Float(f64::NAN));
+        lt(Value::Integer(i64::MIN), Value::Float(f64::NAN));
+        assert_eq!(
+            compare_values(&Value::Integer(i64::MAX), &Value::Float(f64::NAN)),
+            None
+        );
+        assert_eq!(
+            compare_values(&Value::Float(f64::NAN), &Value::Integer(i64::MAX)),
+            None
+        );
+        // The Infinities stay the extremes for a large integer.
+        lt(Value::Integer(i64::MAX), Value::Float(f64::INFINITY));
+        lt(Value::Float(f64::NEG_INFINITY), Value::Integer(i64::MIN));
+    }
+
+    /// Orderability must remain a **total order** over the newly-separated pairs: reflexive,
+    /// antisymmetric and transitive, with `min`/`max`/`ORDER BY` still well defined. The general
+    /// property test below uses a pool that predates `rmp` #894; this one adds the 2^53 straddle.
+    #[test]
+    fn total_order_properties_hold_across_the_2_53_boundary() {
+        const P53: i64 = 1 << 53;
+        let base: i64 = 1 << 54;
+        #[allow(clippy::cast_precision_loss)]
+        let pool: Vec<Value> = vec![
+            Value::Integer(P53 - 1),
+            Value::Float((P53 - 1) as f64),
+            Value::Integer(P53),
+            Value::Float(P53 as f64),
+            Value::Integer(P53 + 1),
+            Value::Integer(P53 + 2),
+            Value::Float((P53 + 2) as f64),
+            Value::Integer(base + 3),
+            Value::Integer(base + 4),
+            Value::Float((base + 4) as f64),
+            Value::Integer(base + 5),
+            Value::Integer(i64::MAX),
+            Value::Float(9_223_372_036_854_775_808.0),
+            Value::Integer(i64::MIN),
+            Value::Float(-9_223_372_036_854_775_808.0),
+            Value::Integer(-(P53 + 1)),
+            Value::Float(-(P53 as f64)),
+            Value::Float(f64::NAN),
+            Value::Float(f64::INFINITY),
+            Value::Float(f64::NEG_INFINITY),
+            Value::Float(-0.0),
+            Value::Float(0.0),
+            Value::Integer(0),
+        ];
+        for a in &pool {
+            assert_eq!(cmp_values(a, a), Ordering::Equal, "reflexivity: {a:?}");
+            for b in &pool {
+                assert_eq!(
+                    cmp_values(a, b),
+                    cmp_values(b, a).reverse(),
+                    "antisymmetry: {a:?} vs {b:?}"
+                );
+                // Comparability must never contradict orderability where it has an opinion, apart
+                // from the two ordering-only rules (signed zero and NaN) that legitimately differ.
+                if let Some(cmp) = compare_values(a, b) {
+                    let is_zero = |v: &Value| {
+                        matches!(v, Value::Integer(0)) || matches!(v, Value::Float(f) if *f == 0.0)
+                    };
+                    if cmp != Ordering::Equal && !(is_zero(a) && is_zero(b)) {
+                        assert_eq!(
+                            cmp_values(a, b),
+                            cmp,
+                            "comparability and orderability disagree on {a:?} vs {b:?}"
+                        );
+                    }
+                }
+                for c in &pool {
+                    if cmp_values(a, b) != Ordering::Greater
+                        && cmp_values(b, c) != Ordering::Greater
+                    {
+                        assert_ne!(
+                            cmp_values(a, c),
+                            Ordering::Greater,
+                            "transitivity: {a:?},{b:?},{c:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

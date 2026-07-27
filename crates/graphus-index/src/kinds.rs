@@ -522,17 +522,21 @@ impl<D: BlockDevice, S: LogSink> RelPropertyIndex<D, S> {
 /// canonical equality encoder ([`keycodec::encode_equality_canonical`], which keeps a large integer
 /// distinct from its rounded `f64`), so no spurious cross-type candidate is produced.
 ///
-/// # Why this is NOT widened to every integer (`rmp` task #868, deliberately not changed)
+/// # Why this is NOT widened to every integer (`rmp` #868, ratified by `rmp` #894)
 ///
-/// [`crate::keycodec::encode_equality_canonical`] and `graphus_cypher::equality` currently disagree
+/// [`crate::keycodec::encode_equality_canonical`] and `graphus_cypher::equality` used to disagree
 /// about a mixed `INTEGER`/`FLOAT` pair at magnitudes at or above 2^53: the encoder keeps
-/// `9007199254740993` distinct from `9007199254740992.0`, while the evaluator compares the pair as
-/// `f64` and calls them equal. Neo4j's `NumberValues.numbersEqual` sides with the **encoder** (it
-/// switches to an exact `long` comparison once `|integer| >= 2^53`), so widening this function to make
-/// the index agree with the evaluator would entrench a divergence from the reference implementation
-/// rather than fix one. Which of the two relations Cypher `=` ratifies is a **specification** decision,
-/// not an index one, and it is left open deliberately — see the `rmp` #868 report. Until it is settled
-/// the seek keeps the encoder's relation, which is what the surrounding test pins.
+/// `9007199254740993` distinct from `9007199254740992.0`, while the evaluator compared the pair as
+/// `f64` and called them equal. `rmp` #868 flagged that as an open **specification** question and left
+/// this function alone; `rmp` #894 settled it in the **encoder's** favour and corrected the evaluator.
+///
+/// openCypher CIP2016-06-14 §Numbers requires the two to be compared "as if both numbers would have
+/// been coerced to unlimited precision big decimals", under which 2^53+1 and 2^53 are different
+/// numbers, and Neo4j's `NumberValues.numbersEqual` implements exactly that (it switches to an exact
+/// `long` comparison once the integer needs more than 53 bits). So this function was already right and
+/// must stay as it is: widening it would re-open the divergence it is documented to avoid, from the
+/// wrong side. The evaluator now shares one exact primitive
+/// (`graphus_core::cmp_int_float`) across equality, equivalence and ordering.
 fn numeric_equal_sibling(value: &Value) -> Option<Value> {
     let sibling = match value {
         #[allow(clippy::cast_precision_loss)]
