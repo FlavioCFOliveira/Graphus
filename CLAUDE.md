@@ -172,6 +172,26 @@ All interactions in the project MUST be based EXCLUSIVELY on the knowledge you a
 
 Use the **Knowledge Graph** (KG) as the primary source of information — both as a means of consultation and as a means of storing the relationships you discover.
 
+When the KG does not hold the answer, the **reference projects** listed in the next section are an authoritative source you MUST exploit.
+
+## Reference projects
+
+For reference and inspiration, you MUST use every open-source project that contains (implements or solves) functionality that is the same as, or similar to, the functionality of the **Graphus** server. Whenever it is necessary, you can and MUST go to the source code of those projects — the ultimate source of truth — in order to evaluate their technical approaches and the impact those approaches have on this project.
+
+The baseline references are:
+
+- **Neo4j** and **Memgraph** — they implement solutions that are identical to Graphus both from an architectural perspective and in the purpose of the project as a graph database (LPG approach).
+- **ClickHouse** and **DuckDB** — references for the **columnar** component.
+- **MariaDB** and **PostgreSQL** — databases that are very well known and widely used by the community.
+
+You can and MUST research and use other reference projects as well, provided that they solve some technical functionality that exists in the Graphus server, and provided that they are open-source projects whose code you can go and consult in order to verify the implementation details empirically.
+
+All of these reference projects MUST provide precious information about the technical and architectural aspects that are used by the open-source community. The insights obtained from them MUST contribute to making the Graphus server an exemplary implementation in terms of **Performance**, **Efficiency**, **Correctness**, and **Security**, and they MUST point the way toward objective and assertive decisions.
+
+Reference projects are consulted for **understanding**, never for copy-and-paste: their code is read in order to learn the approach, the trade-offs, and the measured consequences of a design. The implementation that lands in Graphus MUST be Graphus's own, and the licences of the consulted projects MUST always be respected.
+
+Whatever you learn from a reference project MUST be recorded in the **Knowledge Graph**, so that the insight — and the decision it supports — is preserved and can be consulted again without re-reading external sources.
+
 ## Measure to decide
 
 Whenever it is necessary to evaluate performance, completeness (whether something is complete), or correctness (whether something is right), you MUST ALWAYS gather evidence from the project to determine the needs. You MUST ALWAYS decide empirically.
