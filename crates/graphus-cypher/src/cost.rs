@@ -778,6 +778,60 @@ pub fn estimate_cost(op: &PhysicalOp, stats: Option<&dyn Statistics>) -> CostEst
             )
         }
 
+        // The fused one-hop `OPTIONAL MATCH` (`rmp` task #882) — costed as what it is: an expand,
+        // then the inside-`WHERE` predicates, then the left-outer guarantee. Composing the three
+        // arms above rather than inventing a formula is the point of the operator existing at all:
+        // the `NestedLoopJoin`-over-`Optional` shape it replaces was opaque to the model (a
+        // nested-loop over a sub-plan), so the model could not see that the right side is one hop.
+        //
+        // The guarantee is per DRIVING row, not per plan: an input row whose expansion survives
+        // nothing still emits one row, so the output can never fall below `inner.rows` — which is
+        // also why a selective predicate here does NOT reduce cardinality the way a `Filter` does.
+        PhysicalOp::OptionalExpand {
+            input,
+            from,
+            to,
+            types,
+            direction,
+            into,
+            predicates,
+            ..
+        } => {
+            let inner = estimate_cost(input, stats);
+            let degree = anchored_degree(input, from, types, *direction, stats);
+            let walked = inner.rows * degree;
+            // Expand-into is a selection on the already-bound `to`, expand-all a fan-out — the same
+            // distinction the `ExpandAll` / `ExpandInto` arms above draw, with the same estimator
+            // (`rmp` #863: sharing the fan-out arm over-estimated an expand-into's OUTPUT by the
+            // whole degree factor, and everything costed above it inherited the error).
+            let expanded = if *into {
+                // The expand-into denominator of `rmp` #863/#886: the population `to` could be drawn
+                // from — its label's, when the access path binding it states one; the whole graph
+                // otherwise.
+                let candidates = physical_label_for_var(input, &to.name)
+                    .map(|label| label_scan_rows(&label, stats))
+                    .unwrap_or_else(|| total_nodes(stats));
+                walked / candidates.max(1.0)
+            } else {
+                walked
+            };
+            let resolver = |variable: &str| physical_label_for_var(input, variable);
+            let selectivity: f64 = predicates
+                .iter()
+                .map(|p| predicate_selectivity(p, stats, &resolver))
+                .product();
+            let filter_per_row: f64 = predicates
+                .iter()
+                .map(|p| COST_ROW_FILTER * filter_width(p))
+                .sum();
+            let rows = (expanded * selectivity).max(inner.rows);
+            let cost = inner.cost
+                + walked * COST_EXPAND_EDGE
+                + expanded * filter_per_row
+                + inner.rows * COST_ROW_PROJECT;
+            CostEstimate::new(rows, cost)
+        }
+
         // ---- write --------------------------------------------------------------------------------
 
         // Write clauses run once per input row and emit ~one row each: cardinality passes through, with
@@ -908,6 +962,11 @@ fn physical_label_for_var(op: &PhysicalOp, variable: &str) -> Option<String> {
         // ---- single-input operators: the binding is below ------------------------------------------
         PhysicalOp::ExpandAll { input, .. }
         | PhysicalOp::ExpandInto { input, .. }
+        // `rmp` #882: the fused one-hop `OPTIONAL MATCH` states no label of its own; the anchor's
+        // (and, for an expand-into, the far endpoint's) label scan is in its driving relation. Listed
+        // explicitly rather than left to the `_ => None` catch-all below, which would blind the cost
+        // model to every label stated underneath an `OPTIONAL MATCH`.
+        | PhysicalOp::OptionalExpand { input, .. }
         | PhysicalOp::NamedPath { input, .. }
         | PhysicalOp::ShortestPath { input, .. }
         | PhysicalOp::QuantifiedPath { input, .. }

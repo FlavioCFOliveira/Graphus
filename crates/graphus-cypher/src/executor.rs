@@ -494,6 +494,44 @@ enum Operator {
         exhausted: bool,
     },
 
+    /// `OptionalExpand` (`rmp` task #882): the fused one-hop `OPTIONAL MATCH` — expand from each
+    /// driving row's bound anchor, apply the predicates that sat *inside* the `OPTIONAL MATCH`, and
+    /// emit the driving row once with `null_variables` bound to `NULL` when — and only when — nothing
+    /// survives.
+    ///
+    /// The traversal is [`Expand`](Self::Expand)'s, verbatim: the same two helpers
+    /// (`bound_rel_expand` for a relationship variable that arrives already bound, else
+    /// `expand_into_pending`), on the driving row itself. The driving row is what the replaced
+    /// plan's `Argument` leaf reconstructed and what `merge_rows` folded every produced row back
+    /// into, so the match path is row-for-row identical to it — including column order.
+    ///
+    /// **Streaming, one candidate at a time** — `pending` holds the current driving row's not-yet
+    /// examined candidates and `matched` records whether any of them has already survived. A
+    /// candidate is emitted the instant it passes, exactly as the `Filter` chain it replaces did, so
+    /// a predicate that raises an error raises it on the same candidate at the same point rather than
+    /// after the whole neighbourhood has been evaluated.
+    OptionalExpand {
+        input: Box<Operator>,
+        from: Var,
+        relationship: Var,
+        to: Var,
+        direction: RelDirection,
+        /// The relationship-type names resolved once at construction (`rmp` #371), as for
+        /// [`Expand`](Self::Expand).
+        type_names: Vec<String>,
+        types: Vec<RelType>,
+        into: bool,
+        /// The inside-`OPTIONAL MATCH` predicates, innermost-`Filter` first — evaluated in order, and
+        /// each only on the candidates the earlier ones admitted.
+        predicates: Vec<Expr>,
+        null_variables: Vec<Var>,
+        /// The driving row whose candidates `pending` holds, until its no-match decision is taken.
+        base: Option<Row>,
+        /// Whether any candidate of `base` has already survived (so no null row is owed).
+        matched: bool,
+        pending: VecDeque<Row>,
+    },
+
     /// `NestedLoopJoin`: for each left row, run the right branch with the left bindings available.
     NestedLoop {
         left: Box<Operator>,
@@ -959,6 +997,95 @@ impl Operator {
                     }
                 }
             }
+
+            // `rmp` task #882. Three phases per driving row, in this order: drain its candidates
+            // (emitting the first that survives every predicate), then — only once the last candidate
+            // has been examined — take the no-match decision, then advance.
+            Operator::OptionalExpand {
+                input,
+                from,
+                relationship,
+                to,
+                direction,
+                type_names,
+                types,
+                into,
+                predicates,
+                null_variables,
+                base,
+                matched,
+                pending,
+            } => loop {
+                // Phase 1 — candidates of the current driving row, one at a time. Each predicate is
+                // evaluated only on the candidates the ones before it admitted, and the row is
+                // returned the moment it passes them all: the evaluation order, the cancellation
+                // checks and therefore the point at which an evaluation error surfaces are the
+                // `Filter` chain's, unchanged.
+                while let Some(candidate) = pending.pop_front() {
+                    let mut survives = true;
+                    for predicate in predicates.iter() {
+                        ctx.check_cancelled()?;
+                        if !predicate_truth(predicate, &candidate, ctx)?.is_true() {
+                            survives = false;
+                            break;
+                        }
+                    }
+                    if survives {
+                        *matched = true;
+                        return Ok(Some(candidate));
+                    }
+                }
+                // Phase 2 — the left-outer guarantee. The driving row survives with nulls when, and
+                // only when, nothing above survived. `null_variables` is the lowerer's own set,
+                // carried through the planner untouched, and setting it on the driving row is exactly
+                // what `Optional`'s all-null row folded through `merge_rows` produced — the driving
+                // row's own columns, with these overwritten. The row is MOVED out of `base`, so the
+                // no-match path costs no clone at all (the replaced plan paid one per driving row).
+                if let Some(driving) = base.take() {
+                    if !*matched {
+                        let mut row = driving;
+                        for v in null_variables.iter() {
+                            row.set(v.name.clone(), RowValue::NULL);
+                        }
+                        return Ok(Some(row));
+                    }
+                }
+                // Phase 3 — advance. `pending` and `matched` are reset together with `base`, so a
+                // driving row can never inherit the previous one's verdict.
+                let Some(next_base) = input.next(ctx)? else {
+                    return Ok(None);
+                };
+                *matched = false;
+                if next_base.get(&relationship.name).is_some() {
+                    bound_rel_expand(
+                        &next_base,
+                        from,
+                        relationship,
+                        to,
+                        *direction,
+                        types,
+                        *into,
+                        false,
+                        &[],
+                        ctx,
+                        pending,
+                    )?;
+                } else {
+                    expand_into_pending(
+                        &next_base,
+                        from,
+                        relationship,
+                        to,
+                        *direction,
+                        type_names,
+                        *into,
+                        &[],
+                        ctx,
+                        pending,
+                    )?;
+                }
+                *base = Some(next_base);
+            },
 
             Operator::NestedLoop {
                 left,
@@ -3179,6 +3306,36 @@ fn build_operator_unprofiled(
             range: *range,
             prior_rels: prior_rels.clone(),
             rel_props: rel_props.clone(),
+            pending: VecDeque::new(),
+        }),
+        // `rmp` task #882: the fused one-hop `OPTIONAL MATCH`. Everything the traversal needs is
+        // resolved exactly as for `ExpandAll`/`ExpandInto` above — same `type_names` hoist (`rmp`
+        // #371), same `into` flag — because the operator runs the *same* expansion helpers. What it
+        // adds is the left-outer guarantee and the inside-`WHERE` predicates that decide it.
+        PhysicalOp::OptionalExpand {
+            input,
+            from,
+            relationship,
+            to,
+            direction,
+            types,
+            into,
+            predicates,
+            null_variables,
+            arguments: _,
+        } => Ok(Operator::OptionalExpand {
+            input: Box::new(build_operator(input, arg, ctx)?),
+            from: from.clone(),
+            relationship: relationship.clone(),
+            to: to.clone(),
+            direction: *direction,
+            type_names: types.iter().map(|t| t.name.clone()).collect(),
+            types: types.clone(),
+            into: *into,
+            predicates: predicates.clone(),
+            null_variables: null_variables.clone(),
+            base: None,
+            matched: false,
             pending: VecDeque::new(),
         }),
         PhysicalOp::ShortestPath {
@@ -9346,6 +9503,32 @@ fn result_columns(op: &PhysicalOp, procedures: &dyn ProcedureRegistry) -> Vec<St
         } => {
             let mut cols = result_columns(input, procedures);
             for v in [relationship, to] {
+                if !cols.contains(&v.name) {
+                    cols.push(v.name.clone());
+                }
+            }
+            cols
+        }
+        // `rmp` #882: the fused one-hop `OPTIONAL MATCH` declares exactly the columns the
+        // `NestedLoopJoin(input, Optional(… Expand(Argument) …))` it replaces declared — the driving
+        // relation's, then the `Argument`'s (all already present), then the expand's two, then the
+        // `Optional`'s null set (also already present). Walking the same sequence keeps the declared
+        // column list identical between the fused and the fallback plan, which matters because the
+        // list is fixed before the statement runs and a client sees it either way.
+        PhysicalOp::OptionalExpand {
+            input,
+            relationship,
+            to,
+            null_variables,
+            arguments,
+            ..
+        } => {
+            let mut cols = result_columns(input, procedures);
+            let names = arguments
+                .iter()
+                .chain([relationship, to])
+                .chain(null_variables.iter());
+            for v in names {
                 if !cols.contains(&v.name) {
                     cols.push(v.name.clone());
                 }

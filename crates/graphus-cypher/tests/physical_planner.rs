@@ -494,16 +494,53 @@ fn expand_into_endpoints_are_both_already_bound() {
 
 #[test]
 fn correlated_optional_match_is_nested_loop_join() {
-    // OPTIONAL MATCH lowers to Apply(left, Optional(rhs-over-Argument)) — correlated -> nested loop.
+    // `OPTIONAL MATCH` lowers to `Apply(left, Optional(rhs-over-Argument))`, which is correlated: the
+    // right branch reads the left row through an `Argument`, so a hash join — which has nowhere to
+    // feed the correlation — must never be chosen. That is the invariant here.
+    //
+    // How the correlation is *discharged* changed in `rmp` task #882: a ONE-HOP optional pattern is
+    // now fused into a single `OptionalExpand` that reads the driving row directly, so there is no
+    // join left to pick a strategy for. Anything the fused operator cannot express still needs the
+    // join, and it must still be a nested loop. Both halves are asserted, so neither the fusion nor
+    // the join heuristic can regress unnoticed.
     let catalog = IndexCatalog::empty();
-    let plan = physical("MATCH (a) OPTIONAL MATCH (a)-->(b) RETURN a, b", &catalog);
+
+    // (a) the fused shape: the correlation is resolved inside one operator — and, load-bearing, NOT
+    //     by a hash join.
+    let fused = physical("MATCH (a) OPTIONAL MATCH (a)-->(b) RETURN a, b", &catalog);
     assert!(
-        find(&plan.root, &|op| matches!(
+        find(&fused.root, &|op| matches!(
+            op,
+            PhysicalOp::OptionalExpand { .. }
+        ))
+        .is_some(),
+        "a one-hop OPTIONAL MATCH must fuse (`rmp` #882): {fused}"
+    );
+    assert!(
+        find(&fused.root, &|op| matches!(op, PhysicalOp::HashJoin { .. })).is_none(),
+        "a correlated apply must never become a hash join: {fused}"
+    );
+
+    // (b) a shape the fusion declines (two hops): still a correlated apply, still a nested loop.
+    let unfused = physical(
+        "MATCH (a) OPTIONAL MATCH (a)-->(b)-->(c) RETURN a, c",
+        &catalog,
+    );
+    assert!(
+        find(&unfused.root, &|op| matches!(
             op,
             PhysicalOp::NestedLoopJoin { .. }
         ))
         .is_some(),
-        "correlated apply must be a nested-loop join: {plan}"
+        "correlated apply must be a nested-loop join: {unfused}"
+    );
+    assert!(
+        find(&unfused.root, &|op| matches!(
+            op,
+            PhysicalOp::HashJoin { .. }
+        ))
+        .is_none(),
+        "correlated apply must never become a hash join: {unfused}"
     );
 }
 

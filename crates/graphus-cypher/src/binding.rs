@@ -558,6 +558,18 @@ fn walk_physical(op: &PhysicalOp, record: &mut impl FnMut(&str, ParamType)) {
         PhysicalOp::Optional { input, .. } | PhysicalOp::Eager { input } => {
             walk_physical(input, record)
         }
+        // `rmp` #882: the fused one-hop `OPTIONAL MATCH` carries the predicates that used to be
+        // `Filter` operators of its own, so its parameters must be recorded here or a
+        // `OPTIONAL MATCH (a)-[r]->(b) WHERE b.x = $v` would silently lose the `$v` expectation the
+        // `Filter` arm above used to record.
+        PhysicalOp::OptionalExpand {
+            input, predicates, ..
+        } => {
+            for predicate in predicates {
+                params_in_expr(predicate, ParamType::Any, record);
+            }
+            walk_physical(input, record);
+        }
 
         // ---- write operators carry expressions in their pattern/ops -------------------------
         PhysicalOp::Create { input, pattern } | PhysicalOp::Merge { input, pattern, .. } => {

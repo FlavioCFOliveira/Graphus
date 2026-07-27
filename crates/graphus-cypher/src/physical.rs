@@ -15,7 +15,7 @@
 //! The planner has **two modes**, selected by whether graph [`Statistics`] are supplied:
 //!
 //! * [`plan_physical`] (and [`plan_physical_with_stats`] with `stats = None`) is **rule-based with
-//!   index awareness** (`04 §6.6`): it makes the four obviously-sound strategy choices below and
+//!   index awareness** (`04 §6.6`): it makes the five obviously-sound strategy choices below and
 //!   nothing else. This is the byte-for-byte stable plan the TCK runner and the server execute, and it
 //!   is the deterministic *fallback* the cost-based mode starts from.
 //! * [`plan_physical_with_stats`] with `stats = Some(..)` is **cost-based** (`00-overview` §6, task
@@ -66,6 +66,25 @@
 //!    The pushdown is explicitly **NOT** applied below a `DISTINCT` projection or an
 //!    [`Aggregation`](crate::logical::LogicalOp::Aggregation) — those change the row count, so
 //!    limiting first would change the result (a negative test guards this).
+//! 5. **One-hop `OPTIONAL MATCH` fusion** (`rmp` task #882). An
+//!    [`Apply`](crate::logical::LogicalOp::Apply) whose right branch is
+//!    [`Optional`](crate::logical::LogicalOp::Optional) over a `Filter` chain over a **single
+//!    fixed-length expand rooted at an [`Argument`](crate::logical::LogicalOp::Argument)** becomes one
+//!    [`OptionalExpand`](PhysicalOp::OptionalExpand), instead of a correlated
+//!    [`NestedLoopJoin`](PhysicalOp::NestedLoopJoin) that rebuilds and drives that whole right branch
+//!    once per driving row. Neo4j plans `OptionalExpand(All)` / `OptionalExpand(Into)` here.
+//!    **Soundness:** the operator runs the *same* expansion helpers on the *same* row — the driving
+//!    row is precisely what the `Argument` leaf reconstructed and what `merge_rows` folded each
+//!    produced row back into — so the match path is row-for-row identical, and it emits the
+//!    `Optional`'s own `null_variables` on the driving row when, and only when, nothing survives the
+//!    absorbed predicates. Every shape where that equivalence could fail (a `WHERE` the expand cannot
+//!    decide per candidate, a relationship-isomorphism obligation, a variable-length hop, a null set
+//!    larger than what the expand binds, an anchor the correlation leaf does not declare) is gated
+//!    out by [`recognize_optional_expand`] and keeps the `Apply`/`Optional` plan. Unlike the four
+//!    rules above, this one is applied by a **pass over the lowered tree**
+//!    ([`fuse_optional_expands`]) rather than at the `Apply` itself: the predicate-pushdown pass runs
+//!    in between and merges adjacent `Filter`s, and what this operator absorbs must be the settled
+//!    `Filter` stack, not a mid-pipeline snapshot of it.
 //!
 //! # Covered vs deferred (named)
 //!
@@ -576,6 +595,8 @@ impl PhysicalOp {
             | Self::Unwind { input, .. }
             | Self::LoadCsv { input, .. }
             | Self::Optional { input, .. }
+            // `rmp` #882: the fused one-hop `OPTIONAL MATCH`. Its one child is the driving relation.
+            | Self::OptionalExpand { input, .. }
             | Self::Create { input, .. }
             | Self::Merge { input, .. }
             | Self::SetClause { input, .. }
@@ -653,6 +674,8 @@ impl PhysicalOp {
             | Self::Unwind { input, .. }
             | Self::LoadCsv { input, .. }
             | Self::Optional { input, .. }
+            // `rmp` #882: the fused one-hop `OPTIONAL MATCH`. Its one child is the driving relation.
+            | Self::OptionalExpand { input, .. }
             | Self::Create { input, .. }
             | Self::Merge { input, .. }
             | Self::SetClause { input, .. }
@@ -729,6 +752,12 @@ impl PhysicalOp {
             Self::ValueHashJoin { .. } => "ValueHashJoin",
             Self::Union { .. } => "Union",
             Self::Optional { .. } => "Optional",
+            // `rmp` #882. Two names for one variant, mirroring `ExpandAll`/`ExpandInto`: the
+            // `operatorType` is what a client asserts on, and "which expand strategy ran" is exactly
+            // the distinction it needs to see. (Neo4j spells these `OptionalExpand(All)` /
+            // `OptionalExpand(Into)`; Graphus reports its own operator names.)
+            Self::OptionalExpand { into: false, .. } => "OptionalExpandAll",
+            Self::OptionalExpand { into: true, .. } => "OptionalExpandInto",
             Self::Create { .. } => "Create",
             Self::Merge { .. } => "Merge",
             Self::SetClause { .. } => "SetClause",
@@ -748,6 +777,79 @@ impl PhysicalOp {
     #[must_use]
     pub fn identifiers(&self) -> Vec<String> {
         bound_var_names(self)
+    }
+
+    /// For an [`OptionalExpand`](Self::OptionalExpand), the `NestedLoopJoin`/`Optional` plan it
+    /// replaces — its **semantic definition** (`rmp` task #882). `None` for every other operator.
+    ///
+    /// The fusion is only legal because this reconstruction is exact: same driving relation, same
+    /// [`Argument`](Self::Argument) declaration, same expand, same `Filter` chain in the same order,
+    /// same [`Optional`](Self::Optional) null set. Keeping the inverse mechanically derivable (rather
+    /// than describing it in a comment) is what lets the equivalence be *tested* — the round trip is
+    /// asserted structurally in this module's tests, and the two plans are executed against each other
+    /// row-for-row in `tests/optional_expand.rs`.
+    #[must_use]
+    pub fn fallback_plan(&self) -> Option<PhysicalOp> {
+        let Self::OptionalExpand {
+            input,
+            from,
+            relationship,
+            to,
+            direction,
+            types,
+            into,
+            predicates,
+            null_variables,
+            arguments,
+        } = self
+        else {
+            return None;
+        };
+        let expand_input = Box::new(PhysicalOp::Argument {
+            arguments: arguments.clone(),
+        });
+        // A fused hop is always fixed-length with no prior relationship and no per-hop property map
+        // (the recognizer refuses anything else), so the reconstruction pins those three fields to the
+        // only values that could have been fused.
+        let mut right = if *into {
+            PhysicalOp::ExpandInto {
+                input: expand_input,
+                from: from.clone(),
+                relationship: relationship.clone(),
+                to: to.clone(),
+                direction: *direction,
+                types: types.clone(),
+                range: None,
+                prior_rels: Vec::new(),
+                rel_props: None,
+            }
+        } else {
+            PhysicalOp::ExpandAll {
+                input: expand_input,
+                from: from.clone(),
+                relationship: relationship.clone(),
+                to: to.clone(),
+                direction: *direction,
+                types: types.clone(),
+                range: None,
+                prior_rels: Vec::new(),
+                rel_props: None,
+            }
+        };
+        // `predicates` is innermost-first, so re-stacking in order rebuilds the original chain.
+        for predicate in predicates {
+            right = PhysicalOp::Filter {
+                input: Box::new(right),
+                predicate: predicate.clone(),
+            };
+        }
+        Some(PhysicalOp::NestedLoopJoin {
+            left: input.clone(),
+            right: Box::new(PhysicalOp::Optional {
+                input: Box::new(right),
+                null_variables: null_variables.clone(),
+            }),
+        })
     }
 
     /// The number of operators in this subtree, `self` included (`rmp` #752): the size of the
@@ -1748,6 +1850,67 @@ pub enum PhysicalOp {
         null_variables: Vec<Var>,
     },
 
+    /// **Optional expand** (`rmp` task #882) — a one-hop `OPTIONAL MATCH` as **one** operator instead
+    /// of a correlated [`NestedLoopJoin`](Self::NestedLoopJoin) over a whole sub-plan. Neo4j plans
+    /// `OptionalExpand(All)` / `OptionalExpand(Into)` for exactly this shape.
+    ///
+    /// The plan it replaces is
+    /// `NestedLoopJoin(input, Optional(Filter* (ExpandAll|ExpandInto over Argument)))`: for every
+    /// driving row the executor rebuilt that whole right branch — an [`Argument`](Self::Argument)
+    /// row, an expand operator, one [`Filter`](Self::Filter) per predicate and the
+    /// [`Optional`](Self::Optional) wrapper — merged each produced row back into the driving row, and
+    /// tore it all down again, to discover at most one neighbourhood. This operator expands directly
+    /// from the driving row and emits it once with [`null_variables`](Self::OptionalExpand::null_variables)
+    /// bound to `NULL` when — **and only when** — nothing survives.
+    ///
+    /// [`fallback_plan`](Self::fallback_plan) reconstructs that replaced plan exactly; it is the
+    /// operator's semantic definition, and the round trip is asserted by
+    /// `fusing_an_apply_over_optional_round_trips_to_the_plan_it_replaces`.
+    ///
+    /// # Why this is bag-equivalent
+    ///
+    /// The executor runs the **same** expansion helpers on the **same** row, so the match path is
+    /// row-for-row identical by construction; the gates in [`recognize_optional_expand`] rule out
+    /// every shape where the null path or the predicate evaluation could differ. See that function
+    /// for each precondition and why it is load-bearing.
+    OptionalExpand {
+        /// The driving relation (binds `from`, and `to` as well when `into`).
+        input: Box<PhysicalOp>,
+        /// The bound anchor node to expand from.
+        from: Var,
+        /// The relationship variable bound by the traversal.
+        relationship: Var,
+        /// The far-endpoint variable bound by the traversal.
+        to: Var,
+        /// The traversal direction.
+        direction: crate::ast::RelDirection,
+        /// The relationship-type alternatives; empty means "any type".
+        types: Vec<RelType>,
+        /// `true` when both endpoints are already bound — the fused
+        /// [`ExpandInto`](Self::ExpandInto) (`OptionalExpand(Into)`), else the fused
+        /// [`ExpandAll`](Self::ExpandAll).
+        into: bool,
+        /// The predicates that sat **inside** the `OPTIONAL MATCH`, innermost-`Filter` first.
+        ///
+        /// Kept as a sequence rather than folded into one conjunction so evaluation is
+        /// operator-for-operator identical to the `Filter` chain it replaces: each predicate is
+        /// evaluated only on the candidates the ones below it admitted, so a predicate that raises a
+        /// type error raises it on exactly the same candidate, at exactly the same point.
+        predicates: Vec<Expr>,
+        /// The variables null-filled when nothing survives for a driving row — carried **verbatim**
+        /// from the [`Optional`](Self::Optional) this replaces, never re-derived (`rmp` #882, TRAP 4:
+        /// the lowerer's computation is the definition).
+        null_variables: Vec<Var>,
+        /// The correlation columns the replaced [`Argument`](Self::Argument) leaf declared.
+        ///
+        /// Not read at execution time — the driving row is used directly. It is kept because it is
+        /// the contract the rewrite is gated on (every predicate's free variables must be provided by
+        /// it, or by the expand, or the two plans could evaluate the predicate over different
+        /// columns) and because it is what makes [`fallback_plan`](Self::fallback_plan) an exact
+        /// inverse instead of an approximation.
+        arguments: Vec<Var>,
+    },
+
     // ---- write --------------------------------------------------------------------------------
     /// Create the `pattern` once per input row (`CREATE`).
     Create {
@@ -2062,8 +2225,12 @@ pub fn plan_physical_with_stats(
     // BEFORE the access-path pass below: it delivers a conjunct to the scan that binds the variable it
     // constrains, which is exactly the `Filter`-over-scan shape that pass turns into a seek. It is
     // bag-preserving, so it applies with or without statistics.
-    let rule_based =
-        push_filters_through_projections(Planner { catalog }.lower(logical, &mut deps));
+    // One-hop `OPTIONAL MATCH` fusion (`rmp` task #882) runs immediately AFTER that pushdown — it
+    // must see the settled `Filter` stack, since it absorbs it — and before the cost-based optimiser
+    // below, so the model costs the operator that will actually run.
+    let rule_based = fuse_optional_expands(push_filters_through_projections(
+        Planner { catalog }.lower(logical, &mut deps),
+    ));
 
     // With statistics, refine the rule-based tree by the cost model; without, keep its shape (no
     // cost-based rewrites). The optimiser is bag-preserving, so only the shape changes — and the index
@@ -2339,6 +2506,13 @@ impl Planner<'_> {
                 } else {
                     phys_left
                 };
+                // A one-hop `OPTIONAL MATCH` is fused into a single `OptionalExpand` later, by
+                // [`fuse_optional_expands`] — deliberately not here (`rmp` task #882): the predicate
+                // pushdown pass runs in between and MERGES adjacent `Filter`s, so recognising the
+                // shape here would absorb `Filter(b:Q)` and `Filter(b.x = 1)` separately where the
+                // finished plan has one `Filter(b:Q AND b.x = 1)`. Recognising the settled shape is
+                // what makes [`PhysicalOp::fallback_plan`] reconstruct the plan that would actually
+                // have run, rather than a snapshot of it taken mid-pipeline.
                 choose_join(phys_left, phys_right, right)
             }
             LogicalOp::Optional {
@@ -3521,6 +3695,9 @@ fn contains_read(op: &PhysicalOp) -> bool {
         | PhysicalOp::RelSpatialIndexSeek { .. }
         | PhysicalOp::ExpandAll { .. }
         | PhysicalOp::ExpandInto { .. }
+        // `rmp` #882: the fused one-hop `OPTIONAL MATCH` traverses the store exactly as the
+        // `ExpandAll`/`ExpandInto` it absorbed did.
+        | PhysicalOp::OptionalExpand { .. }
         | PhysicalOp::QuantifiedPath { .. }
         | PhysicalOp::ShortestPath { .. } => true,
         PhysicalOp::Filter { input, .. }
@@ -3584,6 +3761,8 @@ fn contains_write(op: &PhysicalOp) -> bool {
         | PhysicalOp::LoadCsv { input, .. }
         | PhysicalOp::ExpandAll { input, .. }
         | PhysicalOp::ExpandInto { input, .. }
+        // `rmp` #882: one child, the driving relation. The operator itself only reads.
+        | PhysicalOp::OptionalExpand { input, .. }
         | PhysicalOp::ShortestPath { input, .. }
         | PhysicalOp::QuantifiedPath { input, .. }
         | PhysicalOp::NamedPath { input, .. }
@@ -3648,6 +3827,11 @@ fn contains_procedure_call(op: &PhysicalOp) -> bool {
         | PhysicalOp::LoadCsv { input, .. }
         | PhysicalOp::ExpandAll { input, .. }
         | PhysicalOp::ExpandInto { input, .. }
+        // `rmp` #882: one child, the driving relation. The predicates the operator absorbed cannot
+        // hide a call — `recognize_optional_expand` refuses any predicate containing a subquery — and
+        // a `Filter`'s predicate is not inspected here either, so this is the same answer the
+        // `Filter`-over-expand shape gave.
+        | PhysicalOp::OptionalExpand { input, .. }
         | PhysicalOp::ShortestPath { input, .. }
         | PhysicalOp::QuantifiedPath { input, .. }
         | PhysicalOp::NamedPath { input, .. }
@@ -3732,6 +3916,9 @@ fn all_procedure_calls_reader_safe(
         | PhysicalOp::LoadCsv { input, .. }
         | PhysicalOp::ExpandAll { input, .. }
         | PhysicalOp::ExpandInto { input, .. }
+        // `rmp` #882: one child, the driving relation (see [`contains_procedure_call`] for why the
+        // absorbed predicates cannot carry a call).
+        | PhysicalOp::OptionalExpand { input, .. }
         | PhysicalOp::ShortestPath { input, .. }
         | PhysicalOp::QuantifiedPath { input, .. }
         | PhysicalOp::NamedPath { input, .. }
@@ -3843,6 +4030,258 @@ pub fn choose_join(left: PhysicalOp, right: PhysicalOp, logical_right: &LogicalO
             right: Box::new(right),
             join_keys,
         }
+    }
+}
+
+// =================================================================================================
+// OptionalExpand: fusing a one-hop `OPTIONAL MATCH` (`rmp` task #882)
+// =================================================================================================
+
+/// The pieces a recognised one-hop `OPTIONAL MATCH` contributes to an
+/// [`OptionalExpand`](PhysicalOp::OptionalExpand) — everything except the driving relation, which the
+/// caller still owns.
+///
+/// Returned by [`recognize_optional_expand`] so the recognition can inspect the right branch by
+/// reference and decline without the caller having to hand over (and take back) the left branch.
+struct FusedOptionalExpand {
+    from: Var,
+    relationship: Var,
+    to: Var,
+    direction: crate::ast::RelDirection,
+    types: Vec<RelType>,
+    into: bool,
+    predicates: Vec<Expr>,
+    null_variables: Vec<Var>,
+    arguments: Vec<Var>,
+}
+
+impl FusedOptionalExpand {
+    /// Assembles the operator over the driving relation.
+    fn build(self, input: PhysicalOp) -> PhysicalOp {
+        PhysicalOp::OptionalExpand {
+            input: Box::new(input),
+            from: self.from,
+            relationship: self.relationship,
+            to: self.to,
+            direction: self.direction,
+            types: self.types,
+            into: self.into,
+            predicates: self.predicates,
+            null_variables: self.null_variables,
+            arguments: self.arguments,
+        }
+    }
+}
+
+/// Recognises the right branch of an [`Apply`](LogicalOp::Apply) that a single
+/// [`OptionalExpand`](PhysicalOp::OptionalExpand) can express: `Optional` over a `Filter` chain over a
+/// **single fixed-length expand** rooted at an [`Argument`](PhysicalOp::Argument) leaf
+/// (`rmp` task #882). Returns `None` — keeping the `NestedLoopJoin`/`Optional` plan — for anything
+/// else.
+///
+/// # Why each precondition is load-bearing
+///
+/// The fused operator runs the *same* expansion helpers on the *same* row as the plan it replaces, so
+/// the **match** path is row-for-row identical by construction. What the gates protect is everything
+/// else: which rows count as "a match", and which variables the **no-match** row nulls.
+///
+/// 1. **The expand's input is a bare `Argument`.** A one-hop expansion straight off the driving row is
+///    the whole premise: the anchor must come from the driving row, not from a sub-plan the operator
+///    would have to run. Anything richer underneath (a fresh scan for a disconnected comma-component,
+///    a second expand for a two-hop pattern, a `NamedPath`) is a sub-plan and declines. This single
+///    gate also disposes of most of the others below by construction — but they are still checked,
+///    because "cannot happen today" is not "cannot happen".
+/// 2. **`from` is declared by that `Argument`** (and `to` as well when the expand is an
+///    [`ExpandInto`](PhysicalOp::ExpandInto)). The `Argument` leaf projects the driving row down to its
+///    declared columns, so a column it does not declare is *absent* on the right branch. Reading the
+///    anchor from the driving row instead is only the same read if the anchor is one of those columns.
+///    The converse — that the driving row carries nothing the `Argument` omits — holds because the
+///    declaration is `collect_bound_vars` over the whole left plan (`crate::lower`), an **exhaustive**
+///    walk with no wildcard arm. So the two rows carry the same columns, which is what makes "evaluate
+///    the predicate over the driving row" and "evaluate it over the `Argument` row" the same act, and
+///    what makes the already-bound-relationship branch of the expansion take the same fork on both
+///    plans.
+/// 3. **Fixed length, no `prior_rels`, no per-hop `rel_props`.** A variable-length hop enumerates
+///    trails and binds a *list*, which is not the one-hop shape this operator claims to be, and
+///    `rel_props` only ever accompanies one. `prior_rels` is Cypher **relationship isomorphism**: the
+///    relationships earlier links of the *same* pattern already traversed, which this hop must skip
+///    (`rmp` #867 declined its own rewrite for exactly this reason). A one-hop optional pattern is
+///    always the pattern's first relationship, so the list is empty — and if a future lowering ever
+///    makes it non-empty here, this declines rather than silently dropping the isomorphism check.
+///    (Isomorphism never crosses a `MATCH`/`OPTIONAL MATCH` boundary — a relationship variable *bound
+///    by an earlier clause* is a different mechanism: it arrives bound on the driving row and
+///    constrains the traversal to itself, which the shared expansion helper handles identically on
+///    either plan.)
+/// 4. **`null_variables` ⊆ {`relationship`, `to`}.** The lowerer's `null_variables` is *the* definition
+///    of what an unmatched driving row nulls (`crate::lower::Planner::lower_optional_match`), and this
+///    operator can only bind — hence only null — the two variables its expand introduces. A larger set
+///    means the optional part introduced something the expand does not bind (a named path variable, a
+///    second component), so the operator's null row would differ from the plan's. It declines instead
+///    of re-deriving; the set it does carry is copied verbatim, never recomputed.
+/// 5. **Every predicate is confined to {`from`, `relationship`, `to`} and is scope-free.** A `WHERE`
+///    *inside* an `OPTIONAL MATCH` belongs to the optional part: it must be able to null a driving row
+///    out, not remove it, so it has to be evaluated *before* the no-match decision — i.e. inside this
+///    operator. That is only sound for a predicate that is decidable per candidate
+///    relationship/endpoint from the anchor. Confinement to the three pattern variables is the
+///    conservative form of that: it is what the expand itself binds plus the anchor it expands from,
+///    all of which are present and equal on both plans' rows. A predicate over any other driving-row
+///    column, or one that opens a scope or reads the graph (comprehension, quantifier, `reduce`, map
+///    projection, `EXISTS {}` / `COUNT {}` / `COLLECT {}`), keeps the fallback. (A `WHERE` written
+///    *after* the `OPTIONAL MATCH` is a different query and never reaches here — the lowerer puts it
+///    above the `Apply`, where it filters the result and can delete the null row.)
+fn recognize_optional_expand(right: &PhysicalOp) -> Option<FusedOptionalExpand> {
+    let PhysicalOp::Optional {
+        input,
+        null_variables,
+    } = right
+    else {
+        return None;
+    };
+    // Peel the `Filter` stack above the expand, outermost first, then reverse: `predicates` is stored
+    // innermost-first so re-evaluating it in order reproduces the chain's evaluation order exactly.
+    let mut predicates: Vec<Expr> = Vec::new();
+    let mut node = input.as_ref();
+    while let PhysicalOp::Filter { input, predicate } = node {
+        predicates.push(predicate.clone());
+        node = input.as_ref();
+    }
+    predicates.reverse();
+
+    // (3) the hop itself: a single, fixed-length expand with no isomorphism obligation.
+    let (into, expand_input, from, relationship, to, direction, types) = match node {
+        PhysicalOp::ExpandAll {
+            input,
+            from,
+            relationship,
+            to,
+            direction,
+            types,
+            range: None,
+            prior_rels,
+            rel_props: None,
+        } if prior_rels.is_empty() => (
+            false,
+            input.as_ref(),
+            from,
+            relationship,
+            to,
+            *direction,
+            types,
+        ),
+        PhysicalOp::ExpandInto {
+            input,
+            from,
+            relationship,
+            to,
+            direction,
+            types,
+            range: None,
+            prior_rels,
+            rel_props: None,
+        } if prior_rels.is_empty() => (
+            true,
+            input.as_ref(),
+            from,
+            relationship,
+            to,
+            *direction,
+            types,
+        ),
+        _ => return None,
+    };
+
+    // (1) the expand must sit straight on the correlation leaf.
+    let PhysicalOp::Argument { arguments } = expand_input else {
+        return None;
+    };
+    let declared = |v: &Var| arguments.iter().any(|a| a.name == v.name);
+    // (2) the anchor — and the far endpoint of an expand-into — must be columns the leaf declares.
+    if !declared(from) || (into && !declared(to)) {
+        return None;
+    }
+    // (4) the null set must be exactly what this operator can bind.
+    if !null_variables
+        .iter()
+        .all(|v| v.name == relationship.name || v.name == to.name)
+    {
+        return None;
+    }
+    // (5) every predicate must be decidable from the anchor and the candidate hop alone.
+    let visible = [
+        from.name.as_str(),
+        relationship.name.as_str(),
+        to.name.as_str(),
+    ];
+    if !predicates.iter().all(|p| expr_confined_to(p, &visible)) {
+        return None;
+    }
+
+    Some(FusedOptionalExpand {
+        from: from.clone(),
+        relationship: relationship.clone(),
+        to: to.clone(),
+        direction,
+        types: types.clone(),
+        into,
+        predicates,
+        null_variables: null_variables.clone(),
+        arguments: arguments.clone(),
+    })
+}
+
+/// Whether every variable `expr` reads is in `visible`, and `expr` opens no scope of its own
+/// (`rmp` task #882, gate 5 of [`recognize_optional_expand`]).
+///
+/// The mirror of [`expr_references_var`]: that one asks "does this touch *this* variable", this one
+/// asks "does this touch *only* these variables". Kept as a separate walk rather than expressed in
+/// terms of it because the answer for the scope-opening forms is opposite — `expr_references_var`
+/// answers `true` (conservatively assuming a reference), and the conservative answer here is `false`
+/// (do not certify).
+fn expr_confined_to(expr: &Expr, visible: &[&str]) -> bool {
+    let all = |es: &[Expr]| es.iter().all(|e| expr_confined_to(e, visible));
+    let opt = |e: Option<&Expr>| e.is_none_or(|e| expr_confined_to(e, visible));
+    match &expr.kind {
+        ExprKind::Variable(name) => visible.contains(&name.as_str()),
+        ExprKind::Literal(_) | ExprKind::Parameter(_) | ExprKind::CountStar => true,
+        ExprKind::Binary { lhs, rhs, .. } => {
+            expr_confined_to(lhs, visible) && expr_confined_to(rhs, visible)
+        }
+        ExprKind::Unary { operand, .. }
+        | ExprKind::HasLabels { operand, .. }
+        | ExprKind::TypePredicate { operand, .. }
+        | ExprKind::NormalizedPredicate { operand, .. } => expr_confined_to(operand, visible),
+        ExprKind::Predicate { operand, rhs, .. } => {
+            expr_confined_to(operand, visible) && opt(rhs.as_deref())
+        }
+        ExprKind::Property { base, .. } => expr_confined_to(base, visible),
+        ExprKind::Index { base, index } => {
+            expr_confined_to(base, visible) && expr_confined_to(index, visible)
+        }
+        ExprKind::Slice { base, low, high } => {
+            expr_confined_to(base, visible) && opt(low.as_deref()) && opt(high.as_deref())
+        }
+        ExprKind::FunctionCall { args, .. } => all(args),
+        ExprKind::List(items) => all(items),
+        ExprKind::Map(entries) => entries.iter().all(|(_, v)| expr_confined_to(v, visible)),
+        ExprKind::Case(case) => {
+            opt(case.subject.as_deref())
+                && case.alternatives.iter().all(|alt| {
+                    expr_confined_to(&alt.when, visible) && expr_confined_to(&alt.then, visible)
+                })
+                && opt(case.else_expr.as_deref())
+        }
+        // Scope-opening or graph-reading forms: not certified. Their free-variable set is not the
+        // syntactic one (a comprehension binds its own element variable, a subquery its own pattern
+        // variables), and a subquery additionally performs reads of its own — neither is something this
+        // gate is in a position to certify, so the whole `OPTIONAL MATCH` keeps the fallback plan.
+        ExprKind::ListComprehension(_)
+        | ExprKind::PatternComprehension(_)
+        | ExprKind::Quantifier(_)
+        | ExprKind::Reduce(_)
+        | ExprKind::MapProjection(_)
+        | ExprKind::ExistsSubquery(_)
+        | ExprKind::CountSubquery(_)
+        | ExprKind::CollectSubquery(_) => false,
     }
 }
 
@@ -5396,6 +5835,10 @@ fn op_expressions(op: &PhysicalOp) -> Vec<&Expr> {
     match op {
         // --- the expression-bearing read operators ---------------------------------------------
         PhysicalOp::Filter { predicate, .. } => vec![predicate],
+        // `rmp` #882: the fused `OPTIONAL MATCH`'s inside-`WHERE` predicates are evaluated BY this
+        // operator (that is the whole point of absorbing them — they decide the no-match row), so they
+        // are its own expressions, exactly as a `Filter`'s predicate is.
+        PhysicalOp::OptionalExpand { predicates, .. } => predicates.iter().collect(),
         PhysicalOp::Projection { items, .. } => items.iter().map(|c| &c.expr).collect(),
         PhysicalOp::Aggregation {
             group_keys,
@@ -6027,6 +6470,29 @@ fn map_children(op: PhysicalOp, f: &dyn Fn(PhysicalOp) -> PhysicalOp) -> Physica
             input: go(input),
             null_variables,
         },
+        PhysicalOp::OptionalExpand {
+            input,
+            from,
+            relationship,
+            to,
+            direction,
+            types,
+            into,
+            predicates,
+            null_variables,
+            arguments,
+        } => PhysicalOp::OptionalExpand {
+            input: go(input),
+            from,
+            relationship,
+            to,
+            direction,
+            types,
+            into,
+            predicates,
+            null_variables,
+            arguments,
+        },
 
         // Two-input operators.
         PhysicalOp::NestedLoopJoin { left, right } => PhysicalOp::NestedLoopJoin {
@@ -6436,6 +6902,10 @@ fn contains_correlated_seek(op: &PhysicalOp) -> bool {
         | PhysicalOp::LoadCsv { input, .. }
         | PhysicalOp::ExpandAll { input, .. }
         | PhysicalOp::ExpandInto { input, .. }
+        // `rmp` #882: one child, the driving relation. The fused operator's own correlation is
+        // resolved internally — it reads the driving row directly — so a correlated seek can only be
+        // below it.
+        | PhysicalOp::OptionalExpand { input, .. }
         | PhysicalOp::ShortestPath { input, .. }
         | PhysicalOp::QuantifiedPath { input, .. }
         | PhysicalOp::NamedPath { input, .. }
@@ -6501,6 +6971,12 @@ fn contains_argument(op: &PhysicalOp) -> bool {
         | PhysicalOp::LoadCsv { input, .. }
         | PhysicalOp::ExpandAll { input, .. }
         | PhysicalOp::ExpandInto { input, .. }
+        // `rmp` #882: one child, the driving relation. The `Argument` the fusion absorbed was
+        // INTERNAL to the join it replaced — the `Foreach` body rule, inverted: it never fed anything
+        // outside that right branch. So the fused operator is correlated exactly when its input is,
+        // and (unlike the join it replaced) a self-contained one is genuinely movable by the
+        // reorderer, whose soundness argument holds for it as for any other independent operand.
+        | PhysicalOp::OptionalExpand { input, .. }
         | PhysicalOp::ShortestPath { input, .. }
         | PhysicalOp::QuantifiedPath { input, .. }
         | PhysicalOp::NamedPath { input, .. }
@@ -6954,6 +7430,8 @@ fn gather_index_dependencies(op: &PhysicalOp, deps: &mut BTreeSet<IndexId>) {
         | PhysicalOp::LoadCsv { input, .. }
         | PhysicalOp::ExpandAll { input, .. }
         | PhysicalOp::ExpandInto { input, .. }
+        // `rmp` #882: one child, the driving relation. The operator is not an index access path.
+        | PhysicalOp::OptionalExpand { input, .. }
         | PhysicalOp::ShortestPath { input, .. }
         | PhysicalOp::QuantifiedPath { input, .. }
         | PhysicalOp::NamedPath { input, .. }
@@ -7339,6 +7817,32 @@ fn property_of(expr: &Expr, variable: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Applies the one-hop `OPTIONAL MATCH` fusion at **every** node of `op`, bottom-up
+/// (`rmp` task #882, rule 5 of the module docs).
+///
+/// Runs on the rule-based tree **after** [`push_filters_through_projections`], so the `Filter` stack it
+/// absorbs is the one the finished plan would have had (that pass merges adjacent filters), and
+/// **before** the cost-based optimiser, so the model costs what will actually run — the whole point of
+/// the operator existing, since the `NestedLoopJoin`-over-`Optional` shape it replaces is opaque to a
+/// model that cannot see the right side is one expand.
+///
+/// Only a [`NestedLoopJoin`](PhysicalOp::NestedLoopJoin) is considered: [`choose_join`] compiles every
+/// correlated `Apply` — the only source of a [`Optional`](PhysicalOp::Optional) over an
+/// [`Argument`](PhysicalOp::Argument) — to exactly that. Anything else, and anything
+/// [`recognize_optional_expand`] declines, is returned untouched.
+fn fuse_optional_expands(op: PhysicalOp) -> PhysicalOp {
+    // Children first, so a nested `OPTIONAL MATCH` (a second one in the same query, or one inside a
+    // `CALL {}` subquery) is fused in its own right.
+    let op = map_children(op, &fuse_optional_expands);
+    let PhysicalOp::NestedLoopJoin { left, right } = op else {
+        return op;
+    };
+    match recognize_optional_expand(&right) {
+        Some(fused) => fused.build(*left),
+        None => PhysicalOp::NestedLoopJoin { left, right },
+    }
 }
 
 /// Whether `expr` references the variable `variable` anywhere (used to reject a seek value that
@@ -7946,6 +8450,30 @@ fn gather_bound_vars(plan: &PhysicalOp, out: &mut Vec<Var>) {
                 push_unique(out, v.clone());
             }
         }
+        // `rmp` #882: the exact mirror of the plan this replaces —
+        // `NestedLoopJoin(input, Optional(Filter*(Expand(Argument))))` gathers the input's variables,
+        // then the `Argument`'s declared columns (all already present), then the expand's
+        // `relationship` and `to`, then the `Optional`'s null set (also already present). Walking the
+        // same sequence here, rather than a shorter one that "obviously" gives the same answer, keeps
+        // the identifiers a plan description reports identical between the two shapes.
+        PhysicalOp::OptionalExpand {
+            input,
+            relationship,
+            to,
+            null_variables,
+            arguments,
+            ..
+        } => {
+            gather_bound_vars(input, out);
+            for v in arguments {
+                push_unique(out, v.clone());
+            }
+            push_unique(out, relationship.clone());
+            push_unique(out, to.clone());
+            for v in null_variables {
+                push_unique(out, v.clone());
+            }
+        }
         PhysicalOp::Union { left, .. } => gather_bound_vars(left, out),
         PhysicalOp::Create { input, pattern } | PhysicalOp::Merge { input, pattern, .. } => {
             gather_bound_vars(input, out);
@@ -8285,6 +8813,45 @@ impl PhysicalOp {
                     h::types(types),
                     h::range(range),
                     h::arrow_right(*direction),
+                )?;
+                input.fmt_indented(f, depth + 1)
+            }
+            // `rmp` #882. The rendering states the three things that distinguish this operator from a
+            // plain expand and that a reader of `EXPLAIN` cannot otherwise recover: the null set it
+            // fills on the no-match path, and the predicates it absorbed from *inside* the
+            // `OPTIONAL MATCH` (which are no longer visible as `Filter` operators of their own — and
+            // whose position, inside versus above, is precisely what distinguishes
+            // `OPTIONAL MATCH … WHERE p` from `OPTIONAL MATCH … WITH * WHERE p`).
+            Self::OptionalExpand {
+                input,
+                from,
+                relationship,
+                to,
+                direction,
+                types,
+                into,
+                predicates,
+                null_variables,
+                arguments: _,
+            } => {
+                let tag = if *into {
+                    "OptionalExpandInto"
+                } else {
+                    "OptionalExpandAll"
+                };
+                let where_clause = if predicates.is_empty() {
+                    String::new()
+                } else {
+                    let rendered: Vec<String> = predicates.iter().map(h::expr).collect();
+                    format!(" WHERE {}", rendered.join(" AND "))
+                };
+                writeln!(
+                    f,
+                    "{tag}({from}){}{relationship}{}{}({to}){where_clause}, nulls=[{}]",
+                    h::arrow_left(*direction),
+                    h::types(types),
+                    h::arrow_right(*direction),
+                    h::vars(null_variables),
                 )?;
                 input.fmt_indented(f, depth + 1)
             }
@@ -10533,5 +11100,162 @@ mod tests {
             !rendered.contains("ordered asc"),
             "the seek must not be marked ordered for a multi-key order:\n{rendered}"
         );
+    }
+
+    // ---- OptionalExpand: the recognizer's gates (`rmp` task #882) -----------------------------
+
+    /// Builds the shape the recognizer accepts, so a test can perturb exactly one field of it.
+    ///
+    /// `Optional(nulls=[r, b])` over `ExpandAll(a)-[r:T]->(b)` over `Argument(a)` — the plan
+    /// `MATCH (a:P) OPTIONAL MATCH (a)-[r:T]->(b)` produces.
+    fn optional_expand_shape() -> PhysicalOp {
+        PhysicalOp::Optional {
+            input: Box::new(PhysicalOp::ExpandAll {
+                input: Box::new(PhysicalOp::Argument {
+                    arguments: vec![Var::named("a")],
+                }),
+                from: Var::named("a"),
+                relationship: Var::named("r"),
+                to: Var::named("b"),
+                direction: crate::ast::RelDirection::LeftToRight,
+                types: vec![RelType {
+                    name: "T".to_owned(),
+                    span: crate::lexer::Span::new(0, 0),
+                }],
+                range: None,
+                prior_rels: Vec::new(),
+                rel_props: None,
+            }),
+            null_variables: vec![Var::named("r"), Var::named("b")],
+        }
+    }
+
+    /// The baseline: the unperturbed shape IS recognised. Without this, every gate test below could
+    /// pass because the *shape* was wrong rather than because the gate fired.
+    #[test]
+    fn the_reference_optional_expand_shape_is_recognised() {
+        assert!(
+            recognize_optional_expand(&optional_expand_shape()).is_some(),
+            "the baseline shape must fuse, or the gate tests are vacuous"
+        );
+    }
+
+    /// **TRAP 3.** A hop carrying a relationship-isomorphism obligation must decline: the operator
+    /// has no `prior_rels` to enforce, so fusing would silently drop the check.
+    ///
+    /// Exercised on a hand-built operator because no query reaches it — a one-hop optional pattern is
+    /// always its pattern's first relationship, so the lowerer never produces a non-empty
+    /// `prior_rels` under a bare `Argument`. The gate exists for the lowering that might; asserting
+    /// it here is what keeps it from being untested dead code (`tests/optional_expand.rs` records
+    /// why the query-level version is absent).
+    #[test]
+    fn a_prior_relationship_obligation_declines_the_fusion() {
+        let mut shape = optional_expand_shape();
+        let PhysicalOp::Optional { input, .. } = &mut shape else {
+            unreachable!()
+        };
+        let PhysicalOp::ExpandAll { prior_rels, .. } = input.as_mut() else {
+            unreachable!()
+        };
+        *prior_rels = vec![Var::named("r0")];
+        assert!(
+            recognize_optional_expand(&shape).is_none(),
+            "a hop that must skip an earlier relationship cannot fuse"
+        );
+    }
+
+    /// A variable-length hop binds a relationship **list**, not one relationship: not the one-hop
+    /// shape this operator claims to be.
+    #[test]
+    fn a_variable_length_hop_declines_the_fusion() {
+        let mut shape = optional_expand_shape();
+        let PhysicalOp::Optional { input, .. } = &mut shape else {
+            unreachable!()
+        };
+        let PhysicalOp::ExpandAll { range, .. } = input.as_mut() else {
+            unreachable!()
+        };
+        *range = Some(crate::ast::VarLengthRange {
+            min: Some(1),
+            max: Some(2),
+            exact: false,
+        });
+        assert!(recognize_optional_expand(&shape).is_none());
+    }
+
+    /// **TRAP 4.** A null set containing anything the expand does not bind means the optional part
+    /// introduced a variable this operator cannot null — so it declines rather than emitting a
+    /// different no-match row than the lowerer defined.
+    #[test]
+    fn a_null_variable_the_expand_does_not_bind_declines_the_fusion() {
+        let mut shape = optional_expand_shape();
+        let PhysicalOp::Optional { null_variables, .. } = &mut shape else {
+            unreachable!()
+        };
+        null_variables.push(Var::named("p")); // e.g. a named path over the optional pattern
+        assert!(
+            recognize_optional_expand(&shape).is_none(),
+            "the operator must not silently narrow the lowerer's null set"
+        );
+    }
+
+    /// The anchor must be a column the correlation leaf declares: the `Argument` projects the driving
+    /// row down to those columns, so reading the anchor off the driving row instead is only the same
+    /// read when it is one of them.
+    #[test]
+    fn an_anchor_the_argument_does_not_declare_declines_the_fusion() {
+        let mut shape = optional_expand_shape();
+        let PhysicalOp::Optional { input, .. } = &mut shape else {
+            unreachable!()
+        };
+        let PhysicalOp::ExpandAll { input, .. } = input.as_mut() else {
+            unreachable!()
+        };
+        **input = PhysicalOp::Argument {
+            arguments: vec![Var::named("z")],
+        };
+        assert!(recognize_optional_expand(&shape).is_none());
+    }
+
+    /// The fusion is exactly invertible: `fallback_plan` reconstructs the `NestedLoopJoin` /
+    /// `Optional` / `Filter*` / expand / `Argument` tree it was built from, field for field.
+    ///
+    /// This is the property the whole rewrite rests on — the operator is defined as "that plan, run
+    /// in one pass" — so it is asserted rather than described. `tests/optional_expand.rs` then
+    /// executes both halves of the round trip against each other over a real graph.
+    #[test]
+    fn fusing_an_apply_over_optional_round_trips_to_the_plan_it_replaces() {
+        for src in [
+            "MATCH (a:P) OPTIONAL MATCH (a)-[r:T]->(b) RETURN a, r, b",
+            "MATCH (a:P) OPTIONAL MATCH (a)-[r]-(b) RETURN a, r, b",
+            "MATCH (a:P) OPTIONAL MATCH (a)-[r:T]->(b:Q) WHERE b.x = 1 RETURN a, r, b",
+            "MATCH (a:P), (b:Q) OPTIONAL MATCH (a)-[r:T]->(b) RETURN a, b, r",
+        ] {
+            let plan = physical(src, &IndexCatalog::empty());
+            let fused = find_op(&plan.root, |op| {
+                matches!(op, PhysicalOp::OptionalExpand { .. })
+            })
+            .unwrap_or_else(|| panic!("`{src}` did not fuse:\n{}", plan.root));
+            let PhysicalOp::NestedLoopJoin { left, right } = fused
+                .fallback_plan()
+                .expect("an OptionalExpand has a fallback")
+            else {
+                panic!("the fallback must be the correlated join it replaced");
+            };
+            // Re-running the recognizer on the reconstructed right branch must produce the very same
+            // operator: recognition and reconstruction are inverses, not merely similar.
+            let refused = recognize_optional_expand(&right)
+                .expect("the reconstructed branch must be recognisable again")
+                .build(*left);
+            assert_eq!(&refused, fused, "the round trip is not exact for `{src}`");
+        }
+    }
+
+    /// Depth-first search for the first operator satisfying `pred`.
+    fn find_op(op: &PhysicalOp, pred: impl Fn(&PhysicalOp) -> bool + Copy) -> Option<&PhysicalOp> {
+        if pred(op) {
+            return Some(op);
+        }
+        op.children().into_iter().find_map(|c| find_op(c, pred))
     }
 }
