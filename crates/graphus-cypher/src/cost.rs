@@ -765,7 +765,13 @@ pub fn estimate_cost(op: &PhysicalOp, stats: Option<&dyn Statistics>) -> CostEst
         } => {
             let l = estimate_cost(left, stats);
             let r = estimate_cost(right, stats);
-            let rows = hash_join_rows(l.rows, r.rows, join_keys.len(), stats);
+            let rows = hash_join_rows(
+                l.rows,
+                r.rows,
+                join_keys.len(),
+                single_key_domain(left, right, join_keys, stats),
+                stats,
+            );
             let cost = l.cost + r.cost + l.rows * COST_HASH_BUILD + r.rows * COST_HASH_PROBE;
             CostEstimate::new(rows, cost)
         }
@@ -776,7 +782,9 @@ pub fn estimate_cost(op: &PhysicalOp, stats: Option<&dyn Statistics>) -> CostEst
         PhysicalOp::ValueHashJoin { left, right, .. } => {
             let l = estimate_cost(left, stats);
             let r = estimate_cost(right, stats);
-            let rows = hash_join_rows(l.rows, r.rows, 1, stats);
+            // Its key is an arbitrary *expression*, not a bound node variable, so there is no label
+            // whose population bounds the distinct-key count: the key-preserving heuristic stands.
+            let rows = hash_join_rows(l.rows, r.rows, 1, None, stats);
             let cost = l.cost + r.cost + l.rows * COST_HASH_BUILD + r.rows * COST_HASH_PROBE;
             CostEstimate::new(rows, cost)
         }
@@ -1234,20 +1242,139 @@ fn typed_degree(types: &[RelType], stats: Option<&dyn Statistics>) -> f64 {
 /// independence assumption.
 ///
 /// With `key_count == 0` the join is a cartesian product: `|left| · |right|`. With shared keys, the
-/// classic equi-join estimate is `|left| · |right| / max(distinct keys)`; lacking per-key distinct
-/// statistics here we approximate the join-key domain by the larger side's cardinality (the standard
-/// "the larger relation bounds the distinct join-key values" heuristic), giving
-/// `|left|·|right| / max(|left|,|right|)  =  min(|left|, |right|)`. That is the well-known result that
-/// a key-preserving equi-join of two relations produces about `min` rows — independent of which side
-/// builds, so the **output** is build-side-invariant (only the *cost* differs), preserving the result
-/// bag.
-fn hash_join_rows(left: f64, right: f64, key_count: usize, stats: Option<&dyn Statistics>) -> f64 {
+/// classic equi-join estimate is `|left| · |right| / max(D_left, D_right)`, where `D_side` is the
+/// number of **distinct** join-key values on that side.
+///
+/// # Why the distinct-key domain needs `key_domain`
+///
+/// Approximating `max(D_left, D_right)` by `max(|left|, |right|)` — the standard "the larger relation
+/// bounds the distinct join-key values" heuristic — reduces the formula to `min(|left|, |right|)`, and
+/// that is right only when the key is (nearly) **unique** on the larger side. A graph pattern joined on
+/// a shared node is the opposite case: both sides are relationship enumerations, so the same node
+/// recurs on each of them and `D` is bounded by the node **population**, not by the row count.
+///
+/// Measured (`rmp` task #880, on the uniform 100-node digraph of `tests/expand_into_selectivity.rs`):
+/// the join under `MATCH (a:Person)-[r1:KNOWS]->(b:Person)-[r2:KNOWS]->(c:Person)` really emits
+/// **39 472** rows, and each side estimates 1 980 — so `min(|left|, |right|)` predicted 1 980, a
+/// **20x** under-estimate. It propagated into every operator above: the `ExpandInto` on top of it
+/// estimated 117.6 rows against 7 741 measured, **65x** out, which is what
+/// `uniform_random_graph_estimate_is_within_an_order_of_magnitude` now forbids.
+///
+/// `key_domain` supplies the missing bound — the population of the join key's label — so the estimate
+/// becomes `max( min(|left|,|right|), |left|·|right| / domain )`, which predicts 39 204 against the
+/// 39 472 actually emitted (0.7% low). It can only **raise** the estimate, and it collapses to the
+/// previous expression exactly when the domain is at least as large as the bigger side (a key that
+/// really is unique there), so a join whose key was already being estimated as key-preserving is
+/// costed byte-identically.
+///
+/// # Build-side invariance, and its one precondition
+///
+/// `min`, `left * right` and `left * right / domain` are all symmetric in the two sides, so swapping
+/// build and probe cannot change the output estimate — **provided `key_domain` is itself symmetric**.
+/// It is: [`single_key_domain`] resolves the key's label from the left side and falls back to the
+/// right, and a variable is bound once per plan, so at most one side can state a label for it and the
+/// answer does not depend on which side is asked first. Were that ever to change — two sides
+/// disagreeing about the key's label — the estimate would become orientation-dependent while the
+/// result bag stayed invariant, which is a defect worth naming here rather than discovering later.
+fn hash_join_rows(
+    left: f64,
+    right: f64,
+    key_count: usize,
+    key_domain: Option<f64>,
+    stats: Option<&dyn Statistics>,
+) -> f64 {
     let _ = stats;
     if key_count == 0 {
-        left * right
-    } else {
-        left.min(right)
+        return left * right;
     }
+    let key_preserving = left.min(right);
+    match key_domain {
+        // A domain below 1 would divide the product upward without bound; a domain that big means the
+        // join key is not repeated at all, which is the key-preserving case already covered.
+        Some(domain) if domain >= 1.0 => key_preserving.max(left * right / domain),
+        _ => key_preserving,
+    }
+}
+
+/// How many distinct values a **single**-column join key can take, when that column is a node variable
+/// whose label some access path on either side states (`rmp` task #880).
+///
+/// The bound is the label's population: a join key bound to a `:Person` node cannot take more than
+/// `|Person|` distinct values, however many rows carry it. With no label stated the honest bound is the
+/// whole node population, which is still a bound — it is only useless when the sides are smaller than
+/// the graph, in which case [`hash_join_rows`] falls back to the key-preserving estimate anyway.
+///
+/// Deliberately restricted to a single key. A composite key's domain is the product of its columns'
+/// domains, which no statistic here measures, and using one column's domain for a two-column key would
+/// *over*-estimate — the one direction that must not be guessed. A multi-column join therefore keeps
+/// the key-preserving estimate it has always had.
+fn single_key_domain(
+    left: &PhysicalOp,
+    right: &PhysicalOp,
+    join_keys: &[String],
+    stats: Option<&dyn Statistics>,
+) -> Option<f64> {
+    let [key] = join_keys else {
+        return None;
+    };
+    if let Some(label) =
+        physical_label_for_var(left, key).or_else(|| physical_label_for_var(right, key))
+    {
+        // A label was stated by an access path, which also proves the key is a node column.
+        return Some(label_scan_rows(&label, stats));
+    }
+    // No label stated. The node population is still a bound — but only if the key really is a node.
+    // `choose_join` derives its keys from shared column NAMES, and a column can hold a relationship
+    // (two `MATCH` clauses may share a relationship variable), for which `total_nodes` is simply the
+    // wrong population. Positively identify the key as node-bound before using it; anything not
+    // recognised keeps the key-preserving estimate, which is what this function returned before the
+    // bound existed.
+    if binds_var_as_node(left, key) || binds_var_as_node(right, key) {
+        return Some(total_nodes(stats));
+    }
+    None
+}
+
+/// Whether any operator in `op` binds `variable` to a **node**.
+///
+/// Deliberately positive-only: an operator this does not recognise answers `false`, so the caller
+/// falls back to an estimate that needs no domain at all. The alternative polarity — assuming node
+/// unless proven otherwise — would silently apply a node population to a relationship column the day a
+/// new binding operator was added.
+fn binds_var_as_node(op: &PhysicalOp, variable: &str) -> bool {
+    let bound_here = match op {
+        // Node access paths bind their `variable` as a node.
+        PhysicalOp::AllNodesScan { variable: v }
+        | PhysicalOp::NodeByLabelScan { variable: v, .. }
+        | PhysicalOp::TokenLookupScan { variable: v, .. }
+        | PhysicalOp::NodeIndexSeek { variable: v, .. }
+        | PhysicalOp::NodeIndexMultiSeek { variable: v, .. }
+        | PhysicalOp::NodeCompositeIndexSeek { variable: v, .. }
+        | PhysicalOp::NodeLabelScanEq { variable: v, .. }
+        | PhysicalOp::NodeIndexRangeSeek { variable: v, .. }
+        | PhysicalOp::NodeIndexScan { variable: v, .. }
+        | PhysicalOp::NodeIndexStartsWithSeek { variable: v, .. }
+        | PhysicalOp::SpatialIndexSeek { variable: v, .. }
+        | PhysicalOp::NodeTextIndexSeek { variable: v, .. } => v.name == variable,
+        // An expansion binds both endpoints as nodes (its `relationship` is deliberately not matched).
+        PhysicalOp::ExpandAll { from, to, .. }
+        | PhysicalOp::ExpandInto { from, to, .. }
+        | PhysicalOp::OptionalExpand { from, to, .. }
+        | PhysicalOp::AllRelationshipsScan { from, to, .. }
+        | PhysicalOp::RelIndexSeek { from, to, .. }
+        | PhysicalOp::RelIndexMultiSeek { from, to, .. }
+        | PhysicalOp::RelIndexRangeSeek { from, to, .. }
+        | PhysicalOp::RelCompositeIndexSeek { from, to, .. }
+        | PhysicalOp::RelSpatialIndexSeek { from, to, .. } => {
+            from.name == variable || to.name == variable
+        }
+        _ => false,
+    };
+    bound_here
+        || op
+            .children()
+            .into_iter()
+            .any(|child| binds_var_as_node(child, variable))
 }
 
 /// `n · ln(max(n, 2))` scaled by [`COST_SORT_PER_ROW_LOG`] — a comparison sort's work over `n` rows.
@@ -1683,6 +1810,110 @@ mod tests {
         assert!(
             (small.rows - large.rows).abs() < 1e-9,
             "join output is symmetric"
+        );
+    }
+
+    /// 100 `:Hub` nodes, each with ten outgoing `LINKS` — an average degree of ten, so a relationship
+    /// enumeration out of the label emits ten times the node population and the join key really does
+    /// repeat. (`skewed_graph` has no edges at all, and `connected_graph`'s degree is below one, so
+    /// neither can distinguish the two join estimates.)
+    fn dense_graph() -> MemGraph {
+        /// A typed empty property list, so the property generic infers at the empty case.
+        const NO_PROPS_COST: [(&str, Value); 0] = [];
+        let mut g = MemGraph::new();
+        let ids: Vec<_> = (0..100)
+            .map(|i| g.add_node(["Hub"], [("k", Value::Integer(i))]))
+            .collect();
+        for (i, &from) in ids.iter().enumerate() {
+            for step in 1..=10 {
+                g.add_rel("LINKS", from, ids[(i + step) % ids.len()], NO_PROPS_COST);
+            }
+        }
+        g
+    }
+
+    /// A relationship enumeration out of every `:Hub`, binding `from` and `to`. Two of these joined on
+    /// `to` is the shape a pattern cut produces, and the shape whose output the key-preserving heuristic
+    /// alone got wrong (`rmp` task #880).
+    fn expand_binding(from: &str, to: &str, rel: &str) -> PhysicalOp {
+        PhysicalOp::ExpandAll {
+            input: Box::new(PhysicalOp::NodeByLabelScan {
+                variable: Var::named(from),
+                label: label("Hub"),
+            }),
+            from: Var::named(from),
+            relationship: Var::named(rel),
+            to: Var::named(to),
+            direction: crate::ast::RelDirection::LeftToRight,
+            types: Vec::new(),
+            range: None,
+            prior_rels: Vec::new(),
+            rel_props: None,
+            to_predicate: None,
+            pruning: false,
+        }
+    }
+
+    #[test]
+    fn a_join_key_repeated_on_both_sides_is_not_estimated_key_preserving() {
+        // `rmp` task #880. `min(|left|, |right|)` is the equi-join estimate only when the key is nearly
+        // UNIQUE on the larger side. Two relationship enumerations meeting on a shared node are the
+        // opposite: the same node recurs on each side, so the distinct-key count is bounded by the node
+        // population and the join really emits `|left|.|right|/population` rows.
+        let g = dense_graph();
+        let stats = g.statistics();
+        let left = expand_binding("p", "t", "r1");
+        let right = expand_binding("q", "t", "r2");
+        let join = PhysicalOp::HashJoin {
+            left: Box::new(left.clone()),
+            right: Box::new(right.clone()),
+            join_keys: vec!["t".to_owned()],
+        };
+        let l = estimate_cost(&left, stats).rows;
+        let r = estimate_cost(&right, stats).rows;
+        let joined = estimate_cost(&join, stats).rows;
+        assert!(
+            joined >= l.min(r),
+            "the domain bound may only RAISE the estimate: {joined} against min {}",
+            l.min(r)
+        );
+        assert!(
+            joined > l.min(r) * 1.001,
+            "a key repeated on both sides must estimate above the key-preserving figure: {joined} \
+             against min {}",
+            l.min(r)
+        );
+        // And the output is still independent of which side builds.
+        let swapped = PhysicalOp::HashJoin {
+            left: Box::new(right),
+            right: Box::new(left),
+            join_keys: vec!["t".to_owned()],
+        };
+        assert!(
+            (joined - estimate_cost(&swapped, stats).rows).abs() < 1e-9,
+            "join output must stay build-side invariant"
+        );
+    }
+
+    #[test]
+    fn a_multi_column_join_keeps_the_key_preserving_estimate() {
+        // The domain of a composite key is the product of its columns' domains, which no statistic here
+        // measures — so using one column's domain would OVER-estimate. Such a join is left exactly as it
+        // was costed before `rmp` task #880.
+        let g = dense_graph();
+        let stats = g.statistics();
+        let left = expand_binding("p", "t", "r1");
+        let right = expand_binding("q", "t", "r2");
+        let l = estimate_cost(&left, stats).rows;
+        let r = estimate_cost(&right, stats).rows;
+        let join = PhysicalOp::HashJoin {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_keys: vec!["t".to_owned(), "r1".to_owned()],
+        };
+        assert!(
+            (estimate_cost(&join, stats).rows - l.min(r)).abs() < 1e-9,
+            "a composite key must keep the key-preserving estimate"
         );
     }
 

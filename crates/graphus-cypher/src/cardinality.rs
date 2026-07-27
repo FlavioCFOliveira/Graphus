@@ -643,7 +643,9 @@ fn estimate_filter(input: &LogicalOp, predicate: &Expr, stats: Option<&dyn Stati
 /// 2. **A label predicate** (`v:Label`) — `1.0` when the input already binds `v` through that very
 ///    label (the filter is redundant and keeps everything), otherwise the label's share of all nodes.
 ///    A negated, disjunctive or otherwise compound label expression is not modelled and falls through.
-/// 3. **Anything else** — the documented [`DEFAULT_PREDICATE_SELECTIVITY`] fallback.
+/// 3. **A distinctness test between two bound variables** (`x <> y`) — see
+///    [`distinctness_selectivity`].
+/// 4. **Anything else** — the documented [`DEFAULT_PREDICATE_SELECTIVITY`] fallback.
 ///
 /// The result is clamped to `[0, 1]`, so a filter can never be estimated to add rows however stale the
 /// statistics are.
@@ -671,7 +673,86 @@ pub(crate) fn predicate_selectivity(
     if let Some(s) = label_predicate_selectivity(predicate, stats, label_of) {
         return s.clamp(0.0, 1.0);
     }
+    if let Some(s) = distinctness_selectivity(predicate, stats, label_of) {
+        return s.clamp(0.0, 1.0);
+    }
     DEFAULT_PREDICATE_SELECTIVITY
+}
+
+/// Selectivity of `x <> y` between two **distinct bare variables** — `1 - 1/D`, where `D` bounds how
+/// many distinct values the two columns range over (`rmp` task #880).
+///
+/// # Why this is modelled and `x = y` is not
+///
+/// A distinctness test removes only the rows on which the two columns coincide, which under
+/// independence is `1/D` of them. That makes the true selectivity **close to 1** for any `D` above a
+/// handful, whereas the flat [`DEFAULT_PREDICATE_SELECTIVITY`] claims it throws away 70% of the input.
+///
+/// The relationship-isomorphism guard a pattern cut re-imposes across its join is exactly such a test,
+/// one per cross pair, so the flat constant made a cut shrink its own row estimate for predicates that
+/// in reality remove almost nothing. Measured on the uniform corpus of
+/// `tests/expand_into_selectivity.rs`, where the cut carries a single guard: the operator above it
+/// estimated **2 328.72** rows against **7 741** measured — the guard alone accounting for the factor
+/// of 0.30 — and with this model it estimates **7 758.47**. The un-cut spelling of the same pattern
+/// estimates **7 762.39**; the remaining difference is `1 - 1/1980`, the one guard being modelled
+/// honestly rather than ignored, and
+/// `label_predicates_that_remove_nothing_no_longer_shrink_the_estimate` asserts that identity exactly.
+///
+/// `D` is the label's population when `label_of` states one for either side, and otherwise the larger
+/// of the node and relationship populations. Over-stating `D` is the safe direction *for this operator
+/// and only for it*: the selectivity is capped at 1 and the true value is `1 - 1/D_true`, so for two
+/// **entity** columns the error is at most `1/D_true` — a fraction of a row on any real graph. The
+/// mirror-image `x = y` is deliberately left to the fallback: there the same domain question resolves
+/// the other way, and an over-stated `D` would claim a selectivity of `1/D` that the statistics do not
+/// support.
+///
+/// # Known limitation: the match is syntactic, so value columns get an entity-sized domain
+///
+/// The pattern matched is "two distinct bare variables", which a **value** column satisfies just as a
+/// node or relationship column does. `UNWIND [1, 2] AS x UNWIND [1, 2] AS y … WHERE x <> y` has a true
+/// selectivity of 0.5, and this answers `1 - 1/D` with `D` sized from the graph — so ~1.0. The error is
+/// an over-estimate of the surviving rows, the same direction as the flat constant's error was an
+/// under-estimate, and it is bounded by 1.
+///
+/// Narrowing the match would need the predicate model to know whether a column holds an entity, which
+/// neither caller can currently answer: the seam it is given is `label_of`, and a relationship column
+/// has no label — the very case the isomorphism guard occupies. Adding an entity resolver to a seam
+/// shared by the logical and physical estimators is a larger change than this bound warrants, so the
+/// limitation is recorded here rather than papered over.
+///
+/// Requires statistics: without them there is no population to divide by, and the plan must stay
+/// byte-identical to the rule-based one.
+fn distinctness_selectivity(
+    predicate: &Expr,
+    stats: Option<&dyn Statistics>,
+    label_of: &dyn Fn(&str) -> Option<String>,
+) -> Option<f64> {
+    let stats = stats?;
+    let ExprKind::Binary {
+        op: BinaryOp::Neq,
+        lhs,
+        rhs,
+    } = &predicate.kind
+    else {
+        return None;
+    };
+    let (ExprKind::Variable(x), ExprKind::Variable(y)) = (&lhs.kind, &rhs.kind) else {
+        return None;
+    };
+    if x == y {
+        // `v <> v` is `FALSE` for any non-null `v`; it is not a distinctness test between two columns
+        // and the arithmetic below would answer `1 - 1/D` for something that keeps nothing.
+        return None;
+    }
+    let stats = Some(stats);
+    let domain = match label_of(x).or_else(|| label_of(y)) {
+        Some(label) => label_rows(&label, stats),
+        None => total_nodes(stats).max(total_relationships(stats)),
+    };
+    if domain < 1.0 {
+        return None;
+    }
+    Some(1.0 - 1.0 / domain)
 }
 
 /// Attempts a histogram-backed selectivity for a property comparison, returning `None` to request the
@@ -1709,6 +1790,117 @@ mod tests {
         assert!(
             (0.5..=2.0).contains(&est),
             "label resolved through Sort; histogram estimate {est} ~ 1"
+        );
+    }
+
+    // =============================================================================================
+    // Distinctness between two bound variables (`rmp` task #880)
+    // =============================================================================================
+
+    /// A bare `variable` expression.
+    fn var_expr(name: &str) -> Expr {
+        Expr::new(ExprKind::Variable(name.to_owned()), span())
+    }
+
+    #[test]
+    fn distinctness_between_two_variables_barely_filters() {
+        // `x <> y` removes only the rows where the two columns coincide — `1/D` of them. The flat
+        // fallback claimed it removed 70%, which is what made a pattern cut's relationship-isomorphism
+        // guard shrink its own row estimate by `0.09` for two predicates that in reality remove
+        // nothing.
+        let g = age_graph();
+        let stats = g.statistics();
+        let input_rows = estimate_rows(&person_scan(), stats);
+        let filter = LogicalOp::Filter {
+            input: Box::new(person_scan()),
+            predicate: binary(crate::ast::BinaryOp::Neq, var_expr("r1"), var_expr("r2")),
+        };
+        let est = estimate_rows(&filter, stats);
+        assert!(
+            est > input_rows * 0.9,
+            "a distinctness test must keep nearly everything: {est} of {input_rows}"
+        );
+        assert!(
+            est < input_rows,
+            "but it must still remove the coinciding share: {est} of {input_rows}"
+        );
+        assert!(
+            (est - input_rows * DEFAULT_PREDICATE_SELECTIVITY).abs() > 1.0,
+            "non-vacuity: the estimate must not be the flat fallback it replaces ({est})"
+        );
+    }
+
+    #[test]
+    fn a_variable_compared_with_itself_is_not_a_distinctness_test() {
+        // `v <> v` is `FALSE` for any non-null `v`, so it keeps nothing — the opposite of the model
+        // above. It must fall through rather than be answered `1 - 1/D`.
+        let g = age_graph();
+        let stats = g.statistics();
+        let input_rows = estimate_rows(&person_scan(), stats);
+        let filter = LogicalOp::Filter {
+            input: Box::new(person_scan()),
+            predicate: binary(crate::ast::BinaryOp::Neq, var_expr("p"), var_expr("p")),
+        };
+        let est = estimate_rows(&filter, stats);
+        assert!(
+            (est - input_rows * DEFAULT_PREDICATE_SELECTIVITY).abs() < 1e-9,
+            "a self-comparison must keep the documented fallback, got {est}"
+        );
+    }
+
+    #[test]
+    fn an_equality_between_two_variables_keeps_the_fallback() {
+        // The mirror image is deliberately NOT modelled: an over-stated domain would claim a `1/D`
+        // selectivity the statistics do not support. Pinned so the asymmetry is a decision, not a gap.
+        let g = age_graph();
+        let stats = g.statistics();
+        let input_rows = estimate_rows(&person_scan(), stats);
+        let filter = LogicalOp::Filter {
+            input: Box::new(person_scan()),
+            predicate: binary(crate::ast::BinaryOp::Eq, var_expr("r1"), var_expr("r2")),
+        };
+        let est = estimate_rows(&filter, stats);
+        assert!(
+            (est - input_rows * DEFAULT_PREDICATE_SELECTIVITY).abs() < 1e-9,
+            "an identity equality must keep the documented fallback, got {est}"
+        );
+    }
+
+    #[test]
+    fn a_value_column_gets_an_entity_sized_domain_and_that_is_a_known_limit() {
+        // The documented limitation, pinned so it is a recorded fact rather than a claim in prose. The
+        // match is syntactic — "two distinct bare variables" — so a column holding integers is treated
+        // exactly like one holding relationships, and `D` comes from the graph's populations. The
+        // direction of the error is what matters: it OVER-estimates the surviving rows (selectivity
+        // near 1), never under-estimates them, and it is bounded by 1.
+        let g = age_graph();
+        let stats = g.statistics();
+        let input_rows = estimate_rows(&person_scan(), stats);
+        let filter = LogicalOp::Filter {
+            input: Box::new(person_scan()),
+            predicate: binary(crate::ast::BinaryOp::Neq, var_expr("x"), var_expr("y")),
+        };
+        let est = estimate_rows(&filter, stats);
+        assert!(
+            est > input_rows * 0.9 && est <= input_rows,
+            "the model answers ~1 for any two bare variables, entity-valued or not: {est} of \
+             {input_rows}"
+        );
+    }
+
+    #[test]
+    fn distinctness_without_statistics_keeps_the_fallback() {
+        // No statistics means no population to divide by; the plan must stay byte-identical to the
+        // rule-based one.
+        let filter = LogicalOp::Filter {
+            input: Box::new(person_scan()),
+            predicate: binary(crate::ast::BinaryOp::Neq, var_expr("r1"), var_expr("r2")),
+        };
+        let input_rows = estimate_rows(&person_scan(), None);
+        let est = estimate_rows(&filter, None);
+        assert!(
+            (est - input_rows * DEFAULT_PREDICATE_SELECTIVITY).abs() < 1e-9,
+            "without statistics the fallback must stand, got {est}"
         );
     }
 }

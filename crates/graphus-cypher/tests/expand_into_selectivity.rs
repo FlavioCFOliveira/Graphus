@@ -247,6 +247,21 @@ fn label_predicates_that_remove_nothing_no_longer_shrink_the_estimate() {
     // a corpus where every node is a `Person`, so they match the same rows — and now that a label
     // predicate is estimated from the label's actual population rather than a flat constant, they must
     // also be *estimated* the same. Before #864 the labelled spelling estimated 0.09 of the other.
+    //
+    // The comparison is no longer term-for-term identical, and the reason is measured rather than
+    // assumed (`rmp` task #880). The labelled spelling states a label on `b` and `c`, which is what
+    // lets the pattern be cut at `b` into two hash-joined halves; the unlabelled one has no label to
+    // anchor a half on and keeps its pipeline. The cut re-imposes relationship isomorphism across the
+    // join, and each guard really does remove `1/|R|` of the rows.
+    //
+    // So the residue is not slack to be absorbed by a tolerance band — it is a quantity this test can
+    // predict exactly. `r3` closes the triangle and lowers to an `ExpandInto`, which breaks the chain
+    // recogniser's peel, so the recognised chain is TWO hops and only `b` has degree two: ONE cut, ONE
+    // cross pair, ONE guard. The guard count is read from the plan rather than hard-coded, and the
+    // identity `est_labelled = est_plain . (1 - 1/|R|)^k` is asserted to 1e-9 — strictly stronger than
+    // the exact equality this replaced, because it also pins the guard model. (An earlier revision of
+    // this comment claimed two guards and `(1 - 1/1980)^2`; that contradicted the magnitude actually
+    // observed, and measuring settled it at one.)
     let mut g = uniform_digraph(100, 1, 5);
     let labelled_rows = measured_rows(TRIANGLE, &mut g) as f64;
     let plain_rows = measured_rows(TRIANGLE_UNLABELLED, &mut g) as f64;
@@ -265,10 +280,35 @@ fn label_predicates_that_remove_nothing_no_longer_shrink_the_estimate() {
         stats,
     )
     .rows;
+    // Premise: the labelled spelling really is cut. If it ever stops being cut there is no guard, the
+    // prediction below degenerates to plain equality, and this test would silently stop covering the
+    // guard model — so the premise is asserted, not assumed.
+    let labelled_plan = plan(TRIANGLE, &g);
+    let labelled_text = format!("{labelled_plan}");
     assert!(
-        (est_labelled - est_plain).abs() < 1e-9,
-        "a label predicate that removes nothing must not change the estimate: \
-         labelled={est_labelled} plain={est_plain} (both measured {plain_rows})"
+        labelled_text.contains("HashJoin"),
+        "premise: the labelled spelling must be cut, else this test no longer pins the guard model:\n\
+         {labelled_text}"
+    );
+    let guards = format!("{}", find(&labelled_plan, true).expect("into"))
+        .matches(" <> ")
+        .count();
+    assert_eq!(
+        guards, 1,
+        "premise: `r3` lowers to an `ExpandInto`, so the recognised chain is two hops with a single \
+         degree-two node — one cut, one cross pair, one guard:\n{labelled_text}"
+    );
+    let relationships = stats
+        .expect("the corpus supplies statistics")
+        .total_relationships() as f64;
+    // Each guard keeps `1 - 1/|R|` of its input, and they compose independently.
+    let predicted = 1.0 - (1.0 - 1.0 / relationships).powi(i32::try_from(guards).expect("small"));
+    let relative = (est_plain - est_labelled) / est_plain;
+    assert!(
+        (relative - predicted).abs() < 1e-9,
+        "the only difference between the two estimates must be the {guards} isomorphism guard(s) the \
+         cut adds: labelled={est_labelled} plain={est_plain} relative={relative} \
+         predicted={predicted} |R|={relationships} (both measured {plain_rows})"
     );
 }
 

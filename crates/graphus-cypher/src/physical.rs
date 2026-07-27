@@ -169,6 +169,105 @@
 //! The optimiser recurses into every operand and child, so all three rewrites apply throughout the
 //! tree.
 //! Cost ties break on a stable structural key, so plan choice is deterministic for fixed statistics.
+//!
+//! # Splitting a pattern into two hash-joined halves (`rmp` task #880)
+//!
+//! The join-region reordering of rule 2 above reorders *relational* join regions, so a linear `MATCH`
+//! pattern is always one left-to-right pipeline from a single anchor. When such a pattern is selective
+//! at BOTH ends and unselective in the middle, that pipeline has to materialise the whole middle: it
+//! walks out from one anchor through the wide part and only discovers the other end at the far side.
+//! [`ExpandChain::cut_candidate`] plans the alternative — cut the pattern at one node, plan each half
+//! independently from its own anchor, and meet them in a [`HashJoin`](PhysicalOp::HashJoin) on the
+//! shared node — and it is adopted only when strictly cheaper than **every** single-pipeline
+//! candidate, under the same [`cheaper`] tie-break as the rest of the optimiser.
+//!
+//! ## Why the row bag is unchanged
+//!
+//! Write `P` for the recognised pattern, `m` for the cut node, and `A`, `B` for the two halves: `A` and
+//! `B` partition `P`'s hops, and `A ∪ {m}` and `B ∪ {m}` are each connected subtrees whose node sets
+//! meet exactly in `m` (`GATE 1`, re-checked against the built plans by `GATE 2`).
+//!
+//! 1. **The join computes the pattern's node/relationship bindings.** Each half, planned on its own, is
+//!    an ordinary chain candidate, so by task #858's argument it binds exactly its own hops'
+//!    `{from, relationship, to}` columns to exactly the entities the pattern admits — with one
+//!    exception, isomorphism, taken up in (3). The halves share exactly the column `m`, so the natural
+//!    join on `m` — which is what a `HashJoin` with `join_keys = [m]` computes — is precisely the set of
+//!    pairs of half-matches that agree on the shared node, i.e. the matches of `P` modulo (3). Nothing
+//!    is duplicated: for two distinct matches of `P` to merge into one joined row, they would have to
+//!    agree on every column of both halves, which makes them the same match.
+//! 2. **Predicates are applied exactly once, on rows where their variables are bound.** A conjunct is
+//!    given to a half only when it reads that half's variables and no other half's; anything reading
+//!    both, reading neither, or containing a scope-establishing form (a comprehension, a quantifier, an
+//!    `EXISTS`/`COUNT` subquery — for which `expr_references_var` conservatively answers "reads
+//!    everything") is applied above the join instead. A predicate over one half's columns is
+//!    independent of the other half's, so selecting on it before the join yields exactly the joined
+//!    rows selecting on it after would have — the standard selection-pushdown-through-join identity.
+//!    Each conjunct goes to exactly one place, so none is evaluated twice for one output row.
+//!
+//!    That is a statement about *output* rows, and it is deliberately not the stronger one. A conjunct
+//!    handed to a half is evaluated on every row **that half** produces, including the ones that find
+//!    no partner across the join and never become output rows at all — so a predicate that can raise
+//!    (a type error on a value the other half would have excluded) can newly raise, and a
+//!    non-deterministic one is drawn more often. This is the same property the predicate pushdown of
+//!    task #857 already has, and it is a pre-existing class rather than something a cut introduces; it
+//!    is named here because the paragraph above would otherwise read as ruling it out.
+//! 3. **Relationship isomorphism spans the whole `MATCH`, and the join must restore it.** This is the
+//!    one property a cut genuinely breaks and the reason it cannot be waved through. Inside one
+//!    pipeline, hop `j` carries `prior_rels` — every relationship bound before it — and
+//!    `used_relationships` refuses an edge already in that set. Two independently planned halves have
+//!    no such link, so a relationship of `A` and one of `B` may denote the same edge. It is reachable,
+//!    not theoretical: in `MATCH (x)-[r1]->(m)<-[r2]-(y)` cut at `m`, any single edge `e = x→m` gives
+//!    the half-matches `r1 = e` and (with `y` bound to `x`) `r2 = e`, which join on `m` into a row the
+//!    single pipeline rejects.
+//!
+//!    Two repairs were available: **carry the traversed relationship set across the join and filter on
+//!    disjointness**, or **cut only where no relationship can be shared**. The second was rejected on
+//!    the evidence: the only workable static proof of "cannot be shared" is disjoint relationship
+//!    types, and the patterns this task exists for — a long chain of one type, selective at both ends —
+//!    are exactly the ones it would decline. The first is taken.
+//!
+//!    It is exact because the set is already in the row. Every hop of a recognised chain is
+//!    fixed-length and single (`recognise_expand_chain` declines a `range`), so each relationship
+//!    variable binds one relationship, and a half's traversed set is literally its relationship
+//!    columns. The guard is therefore one `a <> b` per cross pair, which
+//!    [`distinct_relationships_expr`] documents as total: `<>` on two relationships is `RelId`
+//!    inequality — the very comparison `used_relationships` performs — and both operands are bound by
+//!    an `ExpandAll` on their own side, so the predicate is `TRUE` or `FALSE` and never `NULL`. A pair
+//!    whose declared types are non-empty and disjoint is skipped, because a relationship carries
+//!    exactly one type and so cannot satisfy both hops; skipping is an optimisation, and emitting the
+//!    guard anyway would be equally correct. Within a half, isomorphism is unchanged — the half is a
+//!    chain candidate and re-derives its own `prior_rels`.
+//!
+//!    **The variable-length case does not arise, and is not assumed away.**
+//!    [`recognise_expand_chain`] rejects any hop with a `range`, so no relationship variable in a cut
+//!    pattern binds a *list*, and the list-vs-list and list-vs-scalar disjointness cases the guard
+//!    cannot express are unreachable rather than unhandled. A `MATCH` containing a var-length hop is
+//!    not cut at all; it keeps its pipeline.
+//!
+//! ## The guard cannot be separated from the join it guards
+//!
+//! A `HashJoin` is a **reorderable** operand of rule 2 above, so a later join-region reorder could in
+//! principle move the two halves apart and join each with something else — leaving a guard that no
+//! longer sits over the pair it constrains. It cannot happen, and not by luck:
+//!
+//! * When any cross pair needs a guard, the cut's root is a `Filter` — `attach_residual` builds one
+//!   whenever it is given a non-empty predicate list, and the guards are the first thing put in it. A
+//!   `Filter` is not a reorderable join, so [`flatten_join_region`] stops there and the whole
+//!   `Filter`-over-`HashJoin` is one opaque operand: guard and join travel together.
+//! * When **no** cross pair needs one (every pair proven type-disjoint), the root is a `Filter` over
+//!   the join if any conjunct was placed above it, and a **bare** `HashJoin` only when that list is
+//!   empty too. The bare case is the one a region may re-plan, and there is nothing to lose: the reason
+//!   no guard was emitted is that no relationship of one half can be a relationship of the other,
+//!   whatever order the region joins them in.
+//!
+//! ## What is declined
+//!
+//! A cut is refused — leaving the pipeline exactly as it was, never a partial answer — when the halves
+//! share anything but the cut node, when the cut node's name is also a relationship variable, when a
+//! half is not a single-rooted subtree, when either half has no usable access path, or when a built
+//! half binds a different variable set from the one the conjunct assignment assumed. The `to_predicate`
+//! / `pruning` state of task #870 and the isomorphism-from-outside case are already declined one level
+//! up, by [`recognise_expand_chain`].
 
 use crate::ast::{
     BinaryOp, Expr, ExprKind, Label, LabelExpr, PredicateOp, QueryPrefix, RelType, SortDirection,
@@ -5024,7 +5123,36 @@ fn optimize_inner(
         return optimize_children(op, catalog, stats);
     }
 
-    // First, optimise all children (bottom-up): the cost of a parent depends on its inputs' shapes.
+    // (C2/C3) Chain re-shaping gets FIRST REFUSAL, before the children are optimised — because it is
+    // the only pass whose input is a whole subtree rather than one node, and the bottom-up recursion
+    // destroys that subtree before it is ever seen.
+    //
+    // `recognise_expand_chain` requires a plain scan at the bottom of the chain. Optimising children
+    // first replaces that scan with an index seek the moment any inner rewrite re-anchors a two-hop
+    // prefix — so the maximal chain was NEVER recognised, and the "one candidate per chain node"
+    // enumeration of task #858 in practice searched a two-hop prefix and stopped. Measured on the
+    // four-hop comma pattern of `tests/pattern_cut.rs` (`BOTH_ENDS`), counting every successful
+    // recognition: running only below, `recognise_expand_chain` succeeded TWICE and both times over a
+    // TWO-hop chain, so the outer two hops were never re-anchored at all. Running here it succeeds
+    // ONCE, over all four hops — which is the pattern the cut is looking for.
+    //
+    // # What this position does and does not guarantee
+    //
+    // It costs one extra `recognise_expand_chain` per node. A top-down attempt that declines returns
+    // `op` byte-identical, so the bottom-up attempt below behaves exactly as it did before; one that
+    // succeeds has been costed against the very tree it replaces by [`cheaper`], so the *bag* is
+    // preserved either way.
+    //
+    // It is **not** true that running here cannot pick a worse plan than running only below, and the
+    // reason is worth stating because it is what [`optimize_chain_shape`]'s `k = 0` candidate exists to
+    // repair. Below, `op`'s children have already been through `optimize_access_path`, so the incoming
+    // baseline already carries whatever seek the written anchor deserves. Here it does not: the
+    // baseline is the raw subtree, bottoming out in a scan. The candidate enumeration therefore has to
+    // offer the written anchor's own seek explicitly — which it does, at `k = 0` — or the baseline
+    // competes one access path short. See the comment on that loop.
+    let op = optimize_chain_shape(op, catalog, stats);
+
+    // Then optimise all children (bottom-up): the cost of a parent depends on its inputs' shapes.
     let op = optimize_children(op, catalog, stats);
 
     // (B) Access-path selection: a seek the rule-based planner chose may lose to a scan when the
@@ -5038,11 +5166,13 @@ fn optimize_inner(
     // rule-based `scan + forward-expand`. Bag-preserving (same directed edge set, same columns).
     let op = optimize_expand_direction(op, catalog, stats);
 
-    // (C2) Cost-based anchor selection over a MULTI-hop chain (`rmp` task #858): the same rewrite
+    // (C2) Cost-based anchor selection over a MULTI-hop chain (`rmp` task #858), plus (C3) splitting
+    // that chain at a shared node into two hash-joined halves (`rmp` task #880): the same rewrite
     // generalised from one hop to N, so a pattern whose selective node sits at the far end of a chain
-    // is anchored there rather than on whichever node happened to be written first. Runs after (C) so
-    // the single-hop case keeps its dedicated, narrower pass.
-    let op = optimize_chain_anchor(op, catalog, stats);
+    // is anchored there rather than on whichever node happened to be written first — and a pattern
+    // selective at BOTH ends is planned from both of them at once. Runs after (C) so the single-hop
+    // case keeps its dedicated, narrower pass.
+    let op = optimize_chain_shape(op, catalog, stats);
 
     // (E) Value hash join (`rmp` task #865): an equality between two branches' VALUES has no shared
     // column name, so `choose_join` left it a cartesian nested loop with the equality as a filter
@@ -5695,10 +5825,26 @@ fn reverse_expand_alternative(op: &PhysicalOp, catalog: &IndexCatalog) -> Option
         .find_map(|c| has_single_label(c, &to.name))?;
 
     // Find a conjunct on `to` that an index can serve, and reconstruct the seek over `to`.
+    //
+    // The seek becomes the reversed plan's BOTTOM, and `from` / `relationship` are bound by the expand
+    // placed above it — so a key expression reading either of them reads a column that does not exist
+    // yet, and the seek probes on `null`. `analyze_property_predicate` only proves the key does not
+    // reference `to` itself, which is why this check is separate.
+    //
+    // Measured before this gate existed:
+    // `MATCH (p:PERSON)-[:LIVES_IN]->(c:CITY) WHERE c.cname = p.pid` planned
+    // `NodeIndexSeek(c:CITY cname = p.pid)` beneath the expand that binds `p`, and returned **0 rows
+    // where the rule-based plan returned 50**. Declining leaves the conjunct an ordinary residual
+    // filter, which is always correct — only not accelerated. (`rmp` task #880 found this in #366 and
+    // in the #858 chain generalisation of it; see `ExpandChain::candidate_anchored_at`.)
+    let evaluable_before_the_expand = |c: &Expr| {
+        !expr_references_var(c, &from.name) && !expr_references_var(c, &relationship.name)
+    };
     let idx = conjuncts.iter().position(|c| {
-        analyze_property_predicate(c, &to.name)
-            .and_then(|pp| catalog.label_property(&to_label, &pp.property))
-            .is_some()
+        evaluable_before_the_expand(c)
+            && analyze_property_predicate(c, &to.name)
+                .and_then(|pp| catalog.label_property(&to_label, &pp.property))
+                .is_some()
     })?;
     let pp = analyze_property_predicate(&conjuncts[idx], &to.name)?;
     let index = catalog.label_property(&to_label, &pp.property)?;
@@ -5921,10 +6067,33 @@ impl ExpandChain {
 
         // Prefer an index seek on the new anchor; fall back to its label scan. A seek consumes its
         // property conjunct, which must then not be re-applied as a residual.
+        //
+        // The seek is placed at the BOTTOM of the candidate, before a single hop has run, so its key
+        // expression must be evaluable there. `analyze_property_predicate` only proves the key does not
+        // reference the anchor itself; a key reading ANOTHER node of this chain reads a column the
+        // candidate binds *above* the seek, and the seek then probes on `null` and silently returns
+        // nothing.
+        //
+        // Measured before this gate existed:
+        // `MATCH (t:TOPIC)<-[:FOLLOWS]-(p:PERSON)-[:LIVES_IN]->(c:CITY) WHERE p.pid = c.cname` planned
+        // `NodeIndexSeek(c:CITY cname = p.pid)` under the expand that binds `p`, and returned **0 rows
+        // where the rule-based plan returned 50**. Such a conjunct stays an ordinary residual filter,
+        // which is always correct — only not accelerated.
+        let chain_vars: BTreeSet<&str> = nodes
+            .iter()
+            .map(|n| n.name.as_str())
+            .chain(self.hops.iter().map(|h| h.relationship.name.as_str()))
+            .collect();
+        let evaluable_before_any_hop = |c: &Expr| {
+            !chain_vars
+                .iter()
+                .any(|v| *v != new_anchor.name.as_str() && expr_references_var(c, v))
+        };
         let seek_site = self.conjuncts.iter().position(|c| {
-            analyze_property_predicate(c, &new_anchor.name)
-                .and_then(|pp| catalog.label_property(&label, &pp.property))
-                .is_some()
+            evaluable_before_any_hop(c)
+                && analyze_property_predicate(c, &new_anchor.name)
+                    .and_then(|pp| catalog.label_property(&label, &pp.property))
+                    .is_some()
         });
         let (base, consumed) = match seek_site {
             Some(idx) => {
@@ -6010,19 +6179,26 @@ impl ExpandChain {
     }
 }
 
-/// Re-anchors a multi-hop chain on whichever of its nodes the cost model prefers (`rmp` task #858).
+/// Re-shapes a multi-hop chain: re-anchoring it on whichever of its nodes the cost model prefers
+/// (`rmp` task #858), and splitting it at a shared node into two hash-joined halves (`rmp` task #880).
 ///
 /// The rule-based anchor is the first-written node, so the same pattern written two ways costs wildly
 /// differently: measured on the evaluation store, one spelling ran in 0.019s and the other in 125.697s
 /// — a 6600x gap decided purely by syntax. This enumerates one candidate per chain node, costs each
 /// against the rule-based plan, and keeps the cheapest.
 ///
-/// The enumeration is **linear** in the chain length (one candidate per node), not factorial: the
-/// traversal order within a candidate is fixed (forward then backward). Enumerating alternative orders
-/// for branched and multi-part patterns is task #887.
+/// The anchor enumeration is **linear** in the chain length (one candidate per node), not factorial:
+/// the traversal order within a candidate is fixed (forward then backward). Enumerating alternative
+/// orders for branched and multi-part patterns is task #887.
+///
+/// The cut enumeration on top of it is bounded twice — by pattern size ([`MAX_CUT_PATTERN_HOPS`]) and,
+/// within that, by cut count ([`MAX_PATTERN_CUTS`]). See [`ExpandChain::enumerate_cuts`] for why a cut
+/// exists at all and
+/// [the module note](self#splitting-a-pattern-into-two-hash-joined-halves-rmp-task-880) for why it is
+/// sound.
 ///
 /// Only reached when statistics are present, like every other cost-based rewrite here.
-fn optimize_chain_anchor(
+fn optimize_chain_shape(
     op: PhysicalOp,
     catalog: &IndexCatalog,
     stats: &dyn Statistics,
@@ -6031,13 +6207,471 @@ fn optimize_chain_anchor(
         return op;
     };
     let mut best = op;
-    // `k = 0` is the rule-based anchor, already represented by `best`.
-    for k in 1..chain.nodes().len() {
+    // (C2) One single-pipeline candidate per chain node — **including `k = 0`**, the written anchor.
+    //
+    // `k = 0` is not redundant with `best`, and assuming it was is a plan-quality bug. `best` is the
+    // subtree as recognised, whose bottom is by construction a plain *scan* (that is what
+    // `recognise_expand_chain` requires); `candidate_anchored_at` builds an index **seek** whenever the
+    // conjuncts offer one. Omitting `k = 0` therefore compared "written anchor, scanned" against "every
+    // other anchor, seeked" — a comparison the written anchor can lose on the strength of the seek it
+    // was never offered. It matters most when the winner is a cut: a `Filter`-over-`HashJoin` is not a
+    // recognisable chain, so unlike a re-anchoring it never gets a second pass to recover the seek.
+    //
+    // Enumerating it costs one extra candidate and cannot perturb an existing choice: `cheaper` keeps
+    // its first argument on a tie, and `best` starts as the incoming tree, so an equal-cost `k = 0`
+    // candidate loses to the shape already there.
+    for k in 0..chain.nodes().len() {
         if let Some(candidate) = chain.candidate_anchored_at(k, catalog) {
             best = cheaper(best, candidate, stats);
         }
     }
+    // (C3) One two-pipelines-plus-join candidate per cut. Costed against the winner above, so a cut is
+    // adopted only when it beats EVERY single pipeline — never merely the rule-based one.
+    for cut in chain.enumerate_cuts().iter().take(MAX_PATTERN_CUTS) {
+        #[cfg(test)]
+        cut_search_probe::record();
+        if let Some(candidate) = chain.cut_candidate(cut, catalog, stats) {
+            best = cheaper(best, candidate, stats);
+        }
+    }
     best
+}
+
+/// Test-only instrumentation for the cut search's bounds (`rmp` task #880).
+///
+/// The property [`MAX_CUT_PATTERN_HOPS`] exists to enforce — "the search stops growing past a fixed
+/// pattern size" — is about **work done**, so the test that pins it counts work rather than timing it.
+/// A wall-clock assertion in a debug build measures the machine at least as much as the code, and a
+/// loaded CI host would make it flap.
+///
+/// The counter is a `thread_local`, not a global: the test harness runs tests in parallel on separate
+/// threads, and planning happens entirely on the calling thread, so a thread-local is both race-free
+/// and exact without any locking.
+#[cfg(test)]
+mod cut_search_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Cut candidates costed on this thread since the last [`reset`].
+        static COSTED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(super) fn record() {
+        COSTED.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Zeroes the counter and returns what it held, so a caller can measure one planning run.
+    pub(super) fn take() -> usize {
+        COSTED.with(|c| c.replace(0))
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// (C3) Splitting a pattern at a shared node into two hash-joined halves (`rmp` task #880)
+// -------------------------------------------------------------------------------------------------
+
+/// The largest pattern, in hops, [`optimize_chain_shape`] will search for a cut at all.
+///
+/// A cut is not free: it plans BOTH halves from scratch, and each half enumerates one anchoring per
+/// node and costs it. That makes one cut `O(n^2)` work and the whole cut pass `O(n^3)` at a node with
+/// `n` hops beneath it — attempted at every node of a recursion that is itself `O(n)` deep, so `O(n^4)`
+/// over a pattern. This bound is the load-bearing defence against a **plan-time CPU DoS** from a very
+/// long written pattern, exactly as [`MAX_JOIN_REGION_OPERANDS`] is for a very wide one.
+///
+/// Because the bound is on the pattern *size*, the search stops growing past it: the sites with more
+/// than `MAX_CUT_PATTERN_HOPS` hops beneath them contribute nothing, so the cut's cost becomes a
+/// constant instead of a quartic.
+///
+/// # Measured
+///
+/// The primary figure is the **number of cut candidates costed** while planning one `MATCH` of `n`
+/// `FOLLOWS` hops. It is a deterministic property of the planner — not of the machine — and
+/// `physical::tests::the_cut_search_stops_growing_past_the_pattern_size_bound` re-derives it, so it
+/// cannot drift unnoticed. Wall-clock is given alongside for scale only (release build, in-memory
+/// statistics, single shot).
+///
+/// | hops | candidates, unbounded | candidates, this bound | time, unbounded | time, this bound |
+/// |------|-----------------------|------------------------|-----------------|------------------|
+/// | 4    | 18                    | 18                     | 4.7 ms          | 4.7 ms           |
+/// | 8    | 70                    | 70                     | 19.1 ms         | 19.2 ms          |
+/// | 12   | 154                   | 154                    | 51.4 ms         | 51.5 ms          |
+/// | 16   | 270                   | 132                    | 104.6 ms        | 16.7 ms          |
+/// | 24   | 528                   | 132                    | 222.5 ms        | 29.7 ms          |
+/// | 32   | 784                   | 132                    | 400.8 ms        | 47.7 ms          |
+///
+/// The two columns are identical up to the bound, which is the point: no pattern a person would write
+/// loses a candidate. Past it the bounded column is flat at 132 while the unbounded one keeps climbing
+/// — 784 against 132 at 32 hops, a **5.9x** reduction in candidates.
+///
+/// Two honest caveats about the shape of that table. The bounded *time* still grows (16.7 ms to
+/// 47.7 ms) because the **anchor** search of task #858 is not bounded by this constant: it is linear in
+/// the pattern and runs at every site. And the bounded candidate count *falls* from 154 at the bound to
+/// 132 past it rather than holding at 154 — past the bound the outermost sites stop cutting, and the
+/// anchor search they still run re-shapes the subtree the inner sites then recognise. Neither affects
+/// what the constant is for; both are stated because a table that looked cleaner than the measurement
+/// would be the wrong kind of documentation.
+///
+/// `12` sits far above any realistic pattern — a query has to write twelve hops in one `MATCH` before a
+/// single cut is skipped.
+///
+/// Past the bound the pattern is simply not cut: the plan falls back to the best single pipeline, which
+/// is always a complete, correct plan.
+const MAX_CUT_PATTERN_HOPS: usize = 12;
+
+/// The maximum number of cuts costed for one pattern, within [`MAX_CUT_PATTERN_HOPS`].
+///
+/// The hop bound does not by itself bound the cut count: a tree on `n` hops has `sum(deg(v)) = 2n`
+/// (cut node, component) pairs, and the unordered-partition dedup in
+/// [`ExpandChain::enumerate_cuts`] only collapses the degree-2 ones — a node of degree `d >= 3` still
+/// contributes one cut per branch. This states the per-site budget directly, so the two bounds are
+/// independent and neither has to be re-derived from the other.
+///
+/// # It does not truncate at today's hop bound, and that is deliberate
+///
+/// Worked out rather than assumed. A tree with `n = MAX_CUT_PATTERN_HOPS = 12` hops has 13 nodes and
+/// total degree 24. Writing `f(1) = 0`, `f(2) = 1`, `f(d) = d` for the cuts a node of each degree
+/// contributes, the count is maximised by spending as much degree as possible on nodes of degree `>= 3`
+/// (one cut per unit of degree, against half a cut per unit at degree 2). With `m` such nodes and
+/// `13 - m` leaves, `D + (13 - m) = 24` and `D >= 3m`, giving `m <= 5` and `D <= 16`. So **16 is exactly
+/// the tight maximum** — reachable, never exceeded, and `.take(16)` therefore discards nothing today.
+///
+/// It is kept because it is the bound that stays true if [`MAX_CUT_PATTERN_HOPS`] is ever raised: at 13
+/// hops the same arithmetic allows 17. A budget that has to be recomputed whenever a different constant
+/// moves is a bound in name only.
+///
+/// Cuts are taken in [`enumerate_cuts`](ExpandChain::enumerate_cuts)' deterministic order, so *which*
+/// cuts survive is stable for a fixed pattern.
+const MAX_PATTERN_CUTS: usize = 16;
+
+/// One way of cutting a recognised pattern in two at a shared node.
+///
+/// The two halves are disjoint, non-empty sets of hop indices into [`ExpandChain::hops`]; together
+/// with `join_node` — the only node they share — each is a connected subtree of the pattern.
+struct PatternCut {
+    /// The node both halves bind: the hash join's single join key.
+    join_node: Var,
+    /// The hops of one half.
+    a: Vec<usize>,
+    /// The hops of the other half.
+    b: Vec<usize>,
+}
+
+impl ExpandChain {
+    /// The cheapest single-pipeline realisation of this (sub-)chain, or `None` when no node of it has
+    /// a usable access path.
+    ///
+    /// Ties break toward the lowest node index, because [`cheaper`] keeps its first argument on a tie
+    /// and the enumeration is ascending — so the choice is deterministic for fixed statistics.
+    fn best_anchoring(&self, catalog: &IndexCatalog, stats: &dyn Statistics) -> Option<PhysicalOp> {
+        let mut best: Option<PhysicalOp> = None;
+        for k in 0..self.nodes().len() {
+            if let Some(candidate) = self.candidate_anchored_at(k, catalog) {
+                best = Some(match best {
+                    Some(current) => cheaper(current, candidate, stats),
+                    None => candidate,
+                });
+            }
+        }
+        best
+    }
+
+    /// The hop indices of each connected component the pattern falls into once `cut` is removed,
+    /// each ascending, ordered by the lowest hop index it contains.
+    ///
+    /// [`recognise_expand_chain`] has already proved the hops form a **tree** rooted at the anchor
+    /// (every hop expands from a bound node and introduces exactly one new one, and a hop closing a
+    /// cycle is declined), so removing one node leaves exactly `deg(cut)` components and every hop
+    /// belongs to exactly one of them: the component of whichever endpoint is not `cut`.
+    fn components_without(&self, cut: &str) -> Vec<Vec<usize>> {
+        // Undirected incidence: node name -> [(hop index, the hop's other endpoint)].
+        let mut adjacent: BTreeMap<&str, Vec<(usize, &str)>> = BTreeMap::new();
+        for (i, hop) in self.hops.iter().enumerate() {
+            adjacent
+                .entry(hop.from.name.as_str())
+                .or_default()
+                .push((i, hop.to.name.as_str()));
+            adjacent
+                .entry(hop.to.name.as_str())
+                .or_default()
+                .push((i, hop.from.name.as_str()));
+        }
+        let incident: Vec<(usize, &str)> = adjacent.get(cut).cloned().unwrap_or_default();
+        let mut component_of: Vec<Option<usize>> = vec![None; self.hops.len()];
+        let mut components: Vec<Vec<usize>> = Vec::new();
+        for (seed_hop, seed_node) in incident {
+            if component_of[seed_hop].is_some() {
+                continue;
+            }
+            let id = components.len();
+            components.push(vec![seed_hop]);
+            component_of[seed_hop] = Some(id);
+            // Flood the nodes reachable from the far side of the seed hop, never crossing `cut`, and
+            // claim every hop met on the way.
+            let mut visited: BTreeSet<&str> = BTreeSet::new();
+            visited.insert(cut);
+            let mut frontier = vec![seed_node];
+            while let Some(node) = frontier.pop() {
+                if !visited.insert(node) {
+                    continue;
+                }
+                for &(hop, other) in adjacent.get(node).into_iter().flatten() {
+                    if component_of[hop].is_none() {
+                        component_of[hop] = Some(id);
+                        components[id].push(hop);
+                    }
+                    frontier.push(other);
+                }
+            }
+            components[id].sort_unstable();
+        }
+        components
+    }
+
+    /// Every distinct way of cutting this pattern at one of its nodes into two connected halves.
+    ///
+    /// # Why a cut exists
+    ///
+    /// A single pipeline walks the pattern left-to-right from one anchor, so a pattern that is
+    /// selective at BOTH ends and unselective in the middle must materialise the whole middle: it
+    /// walks out from one anchor through the wide part and only discovers the other end at the far
+    /// side. Cutting the pattern at a middle node lets each end pay only its own fan-out, with a hash
+    /// join meeting them on the shared node — the shape Neo4j's IDP solver plans as two `Expand`
+    /// pipelines under a `NodeHashJoin`.
+    ///
+    /// # Enumeration and determinism
+    ///
+    /// One cut per (cut node, component) pair, deduplicated to the unordered partition it induces —
+    /// so a degree-2 node yields exactly one cut, and a degree-`d` node yields `d`. The order is fixed
+    /// by [`nodes`](Self::nodes) (anchor first, then each hop's target in pattern order) and, within a
+    /// node, by [`components_without`]'s hop ordering, so the prefix the
+    /// [count cap](MAX_PATTERN_CUTS) keeps is stable for a fixed pattern.
+    ///
+    /// A pattern longer than [`MAX_CUT_PATTERN_HOPS`] yields **no** cuts at all — the bound that keeps
+    /// the search's contribution constant rather than quartic. Returning none is a decline, and the
+    /// caller keeps the best single pipeline, which is always a complete plan.
+    fn enumerate_cuts(&self) -> Vec<PatternCut> {
+        let mut out: Vec<PatternCut> = Vec::new();
+        if self.hops.len() > MAX_CUT_PATTERN_HOPS {
+            return out;
+        }
+        let mut seen: BTreeSet<(String, Vec<usize>)> = BTreeSet::new();
+        for node in self.nodes() {
+            let components = self.components_without(&node.name);
+            if components.len() < 2 {
+                continue; // a leaf or a degenerate node: nothing to cut
+            }
+            for component in &components {
+                let complement: Vec<usize> = (0..self.hops.len())
+                    .filter(|i| !component.contains(i))
+                    .collect();
+                // `component` and `complement` partition a non-empty hop set, so exactly one of them
+                // holds hop 0. Keying on the other one makes the pair canonical, which is what turns
+                // the two mirror-image cuts of a degree-2 node into one.
+                let key = if component.contains(&0) {
+                    complement.clone()
+                } else {
+                    component.clone()
+                };
+                if !seen.insert((node.name.clone(), key)) {
+                    continue;
+                }
+                out.push(PatternCut {
+                    join_node: node.clone(),
+                    a: component.clone(),
+                    b: complement,
+                });
+            }
+        }
+        out
+    }
+
+    /// The root of a half — the one node it binds that no hop of the half expands *into* — together
+    /// with every variable name the half binds.
+    ///
+    /// `recognise_expand_chain` orients every hop away from the pattern's anchor, and a half is a
+    /// connected subtree, so exactly one of its nodes has no incoming hop within the half. That node
+    /// is where the half must be rooted for [`candidate_anchored_at`](Self::candidate_anchored_at) to
+    /// find every hop's `from` already bound. Anything else — no root, or two — is not a subtree this
+    /// pass can express, and is declined rather than planned on an assumption.
+    fn half_root_and_vars(&self, hops: &[usize]) -> Option<(Var, BTreeSet<String>)> {
+        let mut nodes: Vec<&Var> = Vec::new();
+        let mut targets: BTreeSet<&str> = BTreeSet::new();
+        let mut vars: BTreeSet<String> = BTreeSet::new();
+        for &i in hops {
+            let hop = self.hops.get(i)?;
+            for node in [&hop.from, &hop.to] {
+                if !nodes.iter().any(|n| n.name == node.name) {
+                    nodes.push(node);
+                }
+                vars.insert(node.name.clone());
+            }
+            vars.insert(hop.relationship.name.clone());
+            targets.insert(hop.to.name.as_str());
+        }
+        let mut roots = nodes
+            .into_iter()
+            .filter(|n| !targets.contains(n.name.as_str()));
+        let root = roots.next()?;
+        if roots.next().is_some() {
+            return None;
+        }
+        Some((root.clone(), vars))
+    }
+
+    /// Builds the two-pipelines-plus-[`HashJoin`](PhysicalOp::HashJoin) realisation of `cut`, or
+    /// `None` when any of its gates does not hold.
+    ///
+    /// Every gate below is load-bearing; see the module section
+    /// [Splitting a pattern into two hash-joined halves](self#splitting-a-pattern-into-two-hash-joined-halves-rmp-task-880)
+    /// for the bag-equality argument they add up to.
+    fn cut_candidate(
+        &self,
+        cut: &PatternCut,
+        catalog: &IndexCatalog,
+        stats: &dyn Statistics,
+    ) -> Option<PhysicalOp> {
+        let (root_a, vars_a) = self.half_root_and_vars(&cut.a)?;
+        let (root_b, vars_b) = self.half_root_and_vars(&cut.b)?;
+
+        // GATE 1 — the halves meet in exactly the cut node, and it is a NODE on both sides. Anything
+        // else shared would silently become a second join key (or, for a relationship variable, join
+        // two columns this pass never reasoned about), so it is declined.
+        let shared: Vec<String> = vars_a.intersection(&vars_b).cloned().collect();
+        if shared.as_slice() != std::slice::from_ref(&cut.join_node.name) {
+            return None;
+        }
+        if self
+            .hops
+            .iter()
+            .any(|h| h.relationship.name == cut.join_node.name)
+        {
+            return None;
+        }
+
+        // Each conjunct goes to the half whose variables it reads, or above the join when it reads
+        // both, neither, or anything scope-establishing. A conjunct assigned to a half is a function of
+        // that half's columns alone, so applying it before the join selects exactly the joined rows
+        // applying it after would have.
+        //
+        // POLARITY, and it is load-bearing: this needs the [`expr_references_var`] **of this module**,
+        // which answers `true` for a comprehension, quantifier or subquery — treating it as reading
+        // EVERY variable, so such a conjunct reads "both halves" and lands above the join, the safe
+        // side. `crate::executor` has a same-named function with the OPPOSITE convention (it answers
+        // `false` for those forms). Resolving to that one would push a subquery-bearing conjunct into a
+        // single half and silently change the answer, so the two must not be confused.
+        let mut conjuncts_a: Vec<Expr> = Vec::new();
+        let mut conjuncts_b: Vec<Expr> = Vec::new();
+        let mut above: Vec<Expr> = Vec::new();
+        for conjunct in &self.conjuncts {
+            let reads_a = vars_a.iter().any(|v| expr_references_var(conjunct, v));
+            let reads_b = vars_b.iter().any(|v| expr_references_var(conjunct, v));
+            match (reads_a, reads_b) {
+                (true, false) => conjuncts_a.push(conjunct.clone()),
+                (false, true) => conjuncts_b.push(conjunct.clone()),
+                _ => above.push(conjunct.clone()),
+            }
+        }
+
+        // A half inherits the anchor's scan-consumed label only when it is rooted AT the anchor —
+        // that is the one place `candidate_anchored_at` may re-derive it. When the cut node IS the
+        // anchor both halves are rooted there and both inherit it; re-applying a label predicate on
+        // the same node twice is idempotent, so the bag is unchanged.
+        let half = |root: &Var, hops: &[usize], conjuncts: Vec<Expr>| ExpandChain {
+            anchor: root.clone(),
+            anchor_label: if root.name == self.anchor.name {
+                self.anchor_label.clone()
+            } else {
+                None
+            },
+            hops: hops.iter().map(|&i| self.hops[i].clone()).collect(),
+            conjuncts,
+        };
+        let chain_a = half(&root_a, &cut.a, conjuncts_a);
+        let chain_b = half(&root_b, &cut.b, conjuncts_b);
+        let plan_a = chain_a.best_anchoring(catalog, stats)?;
+        let plan_b = chain_b.best_anchoring(catalog, stats)?;
+
+        // GATE 2 — the built plans bind exactly the variables the conjunct assignment above assumed.
+        // Without this, a half that bound less than expected would evaluate a conjunct against an
+        // unbound column (null, so the row is dropped) and the cut would silently lose rows.
+        let cols_a: BTreeSet<String> = bound_var_names(&plan_a).into_iter().collect();
+        let cols_b: BTreeSet<String> = bound_var_names(&plan_b).into_iter().collect();
+        if cols_a != vars_a || cols_b != vars_b {
+            return None;
+        }
+
+        // GATE 3 — relationship isomorphism across the cut. Inside one pipeline it is enforced by each
+        // hop's `prior_rels`; two independently planned halves have no such link, so it is restored
+        // here as an explicit inequality per cross pair. See the module section for why this is exact
+        // and total.
+        let mut predicates: Vec<Expr> = Vec::new();
+        for &i in &cut.a {
+            for &j in &cut.b {
+                let (left, right) = (&self.hops[i], &self.hops[j]);
+                if hop_types_provably_disjoint(&left.types, &right.types) {
+                    continue;
+                }
+                predicates.push(distinct_relationships_expr(
+                    &left.relationship,
+                    &right.relationship,
+                ));
+            }
+        }
+        predicates.extend(above);
+        let refs: Vec<&Expr> = predicates.iter().collect();
+
+        // Build side: the cost model builds the LEFT input, so both orientations are offered and the
+        // cheaper kept. `cheaper` keeps its first argument on a tie, so the choice is deterministic.
+        let join = |left: PhysicalOp, right: PhysicalOp| {
+            attach_residual(
+                PhysicalOp::HashJoin {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    join_keys: shared.clone(),
+                },
+                &refs,
+            )
+        };
+        Some(cheaper(
+            join(plan_a.clone(), plan_b.clone()),
+            join(plan_b, plan_a),
+            stats,
+        ))
+    }
+}
+
+/// Whether two hops can be proven, from their declared types alone, never to bind the same
+/// relationship — in which case the cut needs no isomorphism guard between them.
+///
+/// A relationship carries **exactly one** type (`GraphAccess::expand` matches a single `rel_type`
+/// against the requested list), so a relationship whose type is in `a` cannot also be in a disjoint
+/// `b`. An **empty** list means "any type" and proves nothing, which is why both must be non-empty.
+///
+/// Skipping a provably-unnecessary guard is an optimisation, never a soundness step: emitting the
+/// guard anyway would be equally correct, just a predicate that can never be false.
+fn hop_types_provably_disjoint(a: &[RelType], b: &[RelType]) -> bool {
+    !a.is_empty() && !b.is_empty() && !a.iter().any(|x| b.iter().any(|y| y.name == x.name))
+}
+
+/// Builds `left <> right` over two relationship variables — the relationship-isomorphism guard a cut
+/// re-imposes across its join (`rmp` task #880).
+///
+/// `<>` on two relationships is `RelId` inequality (`row_values_equal`'s `Rel`/`Rel` arm), which is
+/// exactly the test `used_relationships` performs inside a pipeline. Both operands are bound by an
+/// `ExpandAll` on their own side of the join, so neither can be null and the predicate is **total**:
+/// it is `TRUE` or `FALSE`, never `NULL`, and the `Filter` therefore drops precisely the rows that
+/// re-traverse an edge.
+fn distinct_relationships_expr(left: &Var, right: &Var) -> Expr {
+    let span = crate::lexer::Span::new(0, 0);
+    let variable = |v: &Var| Expr::new(ExprKind::Variable(v.name.clone()), span);
+    Expr::new(
+        ExprKind::Binary {
+            op: BinaryOp::Neq,
+            lhs: Box::new(variable(left)),
+            rhs: Box::new(variable(right)),
+        },
+        span,
+    )
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -10458,6 +11092,143 @@ mod tests {
         let ast = parse_tokens(&toks, src).expect("parse");
         let validated = analyze(&ast).expect("analyze");
         lower(&validated)
+    }
+
+    // ---- Cut-search bounds (`rmp` task #880) --------------------------------------------------
+
+    /// A store with a real relationship population, so the cost model has something to work with while
+    /// the cut search runs over patterns of increasing length.
+    fn cut_probe_graph() -> crate::graph_access::MemGraph {
+        use crate::graph_access::MemGraph;
+        const NO_PROPS: [(&str, Value); 0] = [];
+        let mut g = MemGraph::new();
+        let topics: Vec<_> = (0..4)
+            .map(|i| g.add_node(["TOPIC"], [("tid", Value::Integer(i))]))
+            .collect();
+        for i in 0..400i64 {
+            let p = g.add_node(["PERSON"], [("pid", Value::Integer(i))]);
+            g.add_rel("FOLLOWS", p, topics[(i % 4) as usize], NO_PROPS);
+            g.add_rel("FOLLOWS", p, topics[((i + 1) % 4) as usize], NO_PROPS);
+        }
+        g
+    }
+
+    /// A single `MATCH` of `hops` `FOLLOWS` links whose only selective predicate sits on the LAST node.
+    ///
+    /// The placement is load-bearing: on `n0` the predicate becomes an index seek at lowering,
+    /// `recognise_expand_chain` refuses a seek-anchored chain, and the search under test would never
+    /// run at all.
+    fn cut_probe_pattern(hops: usize) -> String {
+        let mut src = String::from("MATCH (n0:PERSON)");
+        for i in 1..=hops {
+            let label = if i % 2 == 1 { "TOPIC" } else { "PERSON" };
+            src.push_str(&format!("<-[:FOLLOWS]-(n{i}:{label})"));
+        }
+        let property = if hops % 2 == 0 { "pid" } else { "tid" };
+        src.push_str(&format!(
+            " WHERE n{hops}.{property} = 1 RETURN count(*) AS c"
+        ));
+        src
+    }
+
+    /// Cut candidates costed while planning a `hops`-long pattern.
+    fn cut_candidates_costed(hops: usize, graph: &crate::graph_access::MemGraph) -> usize {
+        use crate::graph_access::GraphAccess;
+        let catalog = IndexCatalog::builder()
+            .with_label_property("PERSON", "pid")
+            .build();
+        let _ = cut_search_probe::take(); // discard anything an earlier step on this thread recorded
+        let _ = plan_physical_with_stats(
+            &logical_of(&cut_probe_pattern(hops)),
+            &catalog,
+            graph.statistics(),
+        );
+        cut_search_probe::take()
+    }
+
+    #[test]
+    fn the_cut_search_really_runs_on_a_long_pattern() {
+        // Non-vacuity for the bound below. If the recogniser declined these patterns the counter would
+        // read zero at every size and the plateau would be trivially satisfied.
+        let g = cut_probe_graph();
+        assert!(
+            cut_candidates_costed(4, &g) > 0,
+            "the probe pattern must actually reach the cut search"
+        );
+    }
+
+    /// Runs `body` on a thread with a large stack.
+    ///
+    /// The planner, the cost model and the plan `Display` are all recursive over the operator tree, so
+    /// a pattern of several dozen hops overflows a debug build's default 2 MiB test stack long before
+    /// it reaches anything this test is about. The project already isolates its deep-tree tests this
+    /// way (the TCK runner and the deep-AST DoS tests both do).
+    fn on_a_deep_stack<T: Send + 'static>(body: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(body)
+            .expect("spawn a deep-stack thread")
+            .join()
+            .expect("the probe must not panic")
+    }
+
+    #[test]
+    fn the_cut_search_stops_growing_past_the_pattern_size_bound() {
+        // `MAX_CUT_PATTERN_HOPS` is the defence against a plan-time CPU blow-up: the cut search is
+        // `O(n^3)` at a node with `n` hops beneath it, attempted at every node of an `O(n)`-deep
+        // recursion. Bounding the PATTERN SIZE (rather than only the cut count) makes the contribution
+        // of longer patterns a constant instead of a quartic, because only the innermost
+        // `MAX_CUT_PATTERN_HOPS` sites still search.
+        //
+        // Counted, not timed, so the assertion pins the code rather than the machine.
+        on_a_deep_stack(|| {
+            let g = cut_probe_graph();
+            let at_bound = cut_candidates_costed(MAX_CUT_PATTERN_HOPS, &g);
+            assert!(at_bound > 0, "the search must run at the bound");
+            for hops in [
+                MAX_CUT_PATTERN_HOPS * 2,
+                MAX_CUT_PATTERN_HOPS * 3,
+                MAX_CUT_PATTERN_HOPS * 4,
+            ] {
+                let beyond = cut_candidates_costed(hops, &g);
+                assert!(
+                    beyond <= at_bound,
+                    "a {hops}-hop pattern costed {beyond} cut candidates against {at_bound} at the \
+                     {MAX_CUT_PATTERN_HOPS}-hop bound: the search is still growing"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn no_planning_site_costs_more_cuts_than_the_count_cap() {
+        // The per-site budget. At today's `MAX_CUT_PATTERN_HOPS` the count cap is exactly the tight
+        // maximum a twelve-hop tree can reach (see its documentation), so this does not assert that the
+        // cap TRUNCATES — it asserts the invariant the cap states: no single planning site ever costs
+        // more than `MAX_PATTERN_CUTS` candidates. A star is the shape that comes closest to the bound,
+        // because its centre contributes one cut per branch.
+        let g = cut_probe_graph();
+        let catalog = IndexCatalog::builder()
+            .with_label_property("PERSON", "pid")
+            .build();
+        use crate::graph_access::GraphAccess;
+        let mut src = String::from("MATCH (hub:TOPIC)");
+        for i in 0..10 {
+            src.push_str(&format!("<-[:FOLLOWS]-(n{i}:PERSON), (hub)"));
+        }
+        src.push_str("<-[:FOLLOWS]-(z:PERSON) WHERE z.pid = 1 RETURN count(*) AS c");
+        let sites = src.matches("<-[").count();
+        let _ = cut_search_probe::take();
+        let _ = plan_physical_with_stats(&logical_of(&src), &catalog, g.statistics());
+        let costed = cut_search_probe::take();
+        assert!(
+            costed > 0,
+            "non-vacuity: the star pattern must reach the search"
+        );
+        assert!(
+            costed <= MAX_PATTERN_CUTS * sites,
+            "every site must respect the per-site budget: {costed} candidates over {sites} sites"
+        );
     }
 
     // ---- QueryType classification (`rmp` task #511) -------------------------------------------
