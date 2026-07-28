@@ -625,8 +625,9 @@ pub fn node_has_label<D: BlockDevice, S: LogSink, P: StorePages>(
     labels::has_label(node.labels, label_token_id).map_err(GraphusError::from)
 }
 
-/// Collects every live property `(physical_id, record)` in `node_id`'s chain, head to tail (the body
-/// of `RecordStore::node_properties`). The cycle guard uses the `Prop` high-water from `pages`.
+/// Collects every **slot-occupied** (`in_use`) property `(physical_id, record)` in `node_id`'s chain,
+/// head to tail (the body of `RecordStore::node_properties`) — MVCC tombstones included, see that
+/// method's doc. The cycle guard uses the `Prop` high-water from `pages`.
 ///
 /// # Errors
 /// Returns a storage error if a chain page is missing or the chain does not terminate.
@@ -639,8 +640,8 @@ pub fn node_properties<D: BlockDevice, S: LogSink, P: StorePages>(
     collect_prop_chain(pool, pages, node.first_prop, "node", node_id)
 }
 
-/// Collects every live property `(physical_id, record)` in `rel_id`'s chain, head to tail (the body
-/// of `RecordStore::rel_properties`).
+/// Collects every **slot-occupied** (`in_use`) property `(physical_id, record)` in `rel_id`'s chain,
+/// head to tail (the body of `RecordStore::rel_properties`) — MVCC tombstones included.
 ///
 /// # Errors
 /// Returns a storage error if a chain page is missing or the chain does not terminate.

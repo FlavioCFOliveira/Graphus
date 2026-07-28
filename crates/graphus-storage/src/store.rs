@@ -1783,6 +1783,42 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.active.contains_key(&txn)
     }
 
+    /// The lowest-numbered **open transaction that has already written data**, or [`None`] when every
+    /// open transaction is read-only (`rmp` task #902).
+    ///
+    /// "Has written data" means its mutations are already **physically present** in the store — a
+    /// record it created or tombstoned, or a label bitmap it changed — and would therefore be observed
+    /// by any caller that reads the store raw instead of through a [`Snapshot`](graphus_txn::Snapshot).
+    /// The three lists this reads are exactly the ones the commit/rollback paths consume to settle or
+    /// undo those mutations, so a transaction with all three empty has changed nothing a raw scan can
+    /// see, and its future writes are subject to whatever the caller declares in the meantime.
+    ///
+    /// This is the store's answer to "is the committed image decidable right now?", used by the
+    /// constraint DDL to refuse rather than judge existing data it cannot resolve
+    /// (`TxnCoordinator::create_constraint_general`). It deliberately reports the **lowest** such id
+    /// rather than an arbitrary one: `active` is a `HashMap`, so returning "any" would make the error
+    /// message — and any test over it — non-deterministic, which DST forbids.
+    ///
+    /// Read-only transactions are excluded on purpose. They hold no uncommitted state, so they cannot
+    /// make the committed image ambiguous, and refusing a schema change merely because a session has
+    /// an open read would be disproportionate on a server whose mandate is extreme concurrency.
+    ///
+    /// That is a statement about *this* predicate only, and not a claim that an open reader is harmless
+    /// to a constraint. An open transaction whose **snapshot** predates a row committed before the
+    /// constraint was declared can still write a duplicate it cannot itself see; nothing here detects
+    /// that, because there is nothing uncommitted to detect. Closing it needs the DDL to carry an SSI
+    /// predicate marker (`rmp` task #903) — see the caller for the full scenario.
+    #[must_use]
+    pub fn uncommitted_data_writer(&self) -> Option<TxnId> {
+        self.active
+            .iter()
+            .filter(|(_, a)| {
+                !a.created.is_empty() || !a.expired.is_empty() || !a.labelled_nodes.is_empty()
+            })
+            .map(|(txn, _)| *txn)
+            .min()
+    }
+
     /// Opens transaction `txn`'s MVCC version-stamp bookkeeping. The WAL `BEGIN` is **lazy** (`rmp`
     /// #529): it is *not* emitted here — the WAL Active-Transaction-Table entry is created on demand by
     /// the first data record ([`WalManager::log_update`]'s `or_insert`). A read-only transaction
@@ -5399,7 +5435,19 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.read_prop(id)
     }
 
-    /// Collects every live property `(physical_id, record)` in `node_id`'s chain, head to tail.
+    /// Collects every **slot-occupied** (`in_use`) property `(physical_id, record)` in `node_id`'s
+    /// chain, head to tail — which is prepend order, so the FIRST occurrence of a key is its NEWEST
+    /// version and the caller applies newest-wins per key.
+    ///
+    /// # This includes MVCC tombstones
+    ///
+    /// A removed or overwritten version keeps its slot (and its place in the chain) until [`gc`](Self::gc)
+    /// reclaims it, so a record here may carry a non-zero `expired_ts`. Deciding whether a version is
+    /// part of the caller's graph is the caller's job — read `mvcc.expired_ts` (and, where the answer
+    /// must be snapshot-correct rather than merely committed, resolve it through
+    /// [`graphus_txn::is_visible`]). This doc comment used to say "every **live** property", which is
+    /// what the code does NOT do; a caller that believed it counted a committed `REMOVE n.p` as a
+    /// present value (`rmp` task #902).
     ///
     /// # Errors
     /// Returns a storage error if a chain page is missing.
@@ -5804,9 +5852,10 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Ok(pid)
     }
 
-    /// Collects every live property `(physical_id, record)` in relationship `rel_id`'s chain, head to
-    /// tail (`rmp` task #44). The relationship analogue of
-    /// [`node_properties`](Self::node_properties).
+    /// Collects every **slot-occupied** (`in_use`) property `(physical_id, record)` in relationship
+    /// `rel_id`'s chain, head to tail (`rmp` task #44). The relationship analogue of
+    /// [`node_properties`](Self::node_properties), including its treatment of MVCC tombstones — read
+    /// that doc before judging a version.
     ///
     /// # Errors
     /// Returns a storage error if a chain page is missing or the chain is malformed (cycle-guarded).

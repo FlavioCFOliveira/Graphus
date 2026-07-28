@@ -26,7 +26,6 @@
 //! disappear) is pinned too: retaining entries must not resurrect a label that is really gone.
 
 use graphus_core::Value;
-use graphus_cypher::ConstraintKind;
 use graphus_cypher::binding::{Parameters, bind_parameters};
 use graphus_cypher::catalog::IndexCatalog;
 use graphus_cypher::coordinator::TxnCoordinator;
@@ -109,34 +108,34 @@ fn labelled_vs_truth(coord: &Coord, txn: graphus_core::TxnId) -> (usize, usize) 
     (routed, truth)
 }
 
-/// An UNRELATED `CREATE CONSTRAINT` on the PRODUCTION route, while a writer holds an uncommitted
+/// An UNRELATED index DDL on the PRODUCTION route, while a writer holds an uncommitted
 /// `REMOVE n:Person`.
 ///
-/// THE PRODUCTION ROUTE (`rmp` #771 acceptance criterion 1). A server `CREATE CONSTRAINT` runs
-/// `handle_constraint_ddl` (graphus-server/src/engine/mod.rs:3100) → `create_constraint_ddl` →
-/// `create_constraint_general` → `rebuild_index` → `IndexSet::clear`. It is the synchronous full
-/// rebuild, NOT the incremental build, that destroys the tree — the task expected the incremental
-/// `advance_index_builds` to be the carrier, and it is not (it never calls `clear`; see
-/// `the_incremental_build_is_additive_and_cannot_lose_the_label`). The constraint is on an unrelated
-/// label: nothing about `:Person` is being declared, and the writer is still open.
+/// THE PRODUCTION ROUTE (`rmp` #771 acceptance criterion 1). A server
+/// `CREATE POINT INDEX FOR ()-[r:WIDGET]-() ON (r.at)` runs `handle_index_ddl`
+/// (graphus-server/src/engine/mod.rs) → `create_point_rel_index` → `rebuild_index` →
+/// `IndexSet::clear`. It is the synchronous full rebuild, NOT the incremental build, that destroys
+/// the tree — the task expected the incremental `advance_index_builds` to be the carrier, and it is
+/// not (it never calls `clear`; see `the_incremental_build_is_additive_and_cannot_lose_the_label`).
+/// The index is on an unrelated relationship type: nothing about `:Person` is being declared, and the
+/// writer is still open.
+///
+/// The vehicle used to be `CREATE CONSTRAINT`, which reaches the same `rebuild_index`. It no longer
+/// can: since `rmp` task #902 a constraint DDL is fail-closed while any transaction holds uncommitted
+/// writes, because a constraint *decides* on the data it reads and must never decide on a value that
+/// may be rolled back. An index DDL is the right vehicle anyway — index **population** is precisely
+/// the path that is allowed to read raw physical state, since the seek re-checks every candidate.
+/// That opposite polarity is the whole subject of this file.
 #[test]
-fn an_unrelated_constraint_ddl_does_not_lose_a_label_a_rolled_back_writer_removed() {
+fn an_unrelated_index_ddl_does_not_lose_a_label_a_rolled_back_writer_removed() {
     let mut coord = fresh_coord();
     run_write(&mut coord, "CREATE (:Person {email: 'a@x.io'})");
 
     let writer = open_writer_removing_label(&mut coord);
 
     coord
-        .create_constraint_ddl(
-            "widget_sku",
-            "Widget",
-            &["sku"],
-            ConstraintKind::Unique,
-            None,
-            false,
-            false,
-        )
-        .expect("unrelated constraint DDL");
+        .create_point_rel_index("widget_at", "WIDGET", "at", false)
+        .expect("unrelated index DDL");
 
     // WAL undo restores the record's label bit: the node carries `:Person` again, as the ground truth
     // below independently confirms.
@@ -164,23 +163,15 @@ fn an_unrelated_constraint_ddl_does_not_lose_a_label_a_rolled_back_writer_remove
 /// produce WRONG ANSWERS rather than harmless candidates (the trap that nearly shipped in `rmp` #766,
 /// where the full-text consumer re-checks no term).
 #[test]
-fn an_unrelated_constraint_ddl_does_not_resurrect_a_label_a_committed_writer_removed() {
+fn an_unrelated_index_ddl_does_not_resurrect_a_label_a_committed_writer_removed() {
     let mut coord = fresh_coord();
     run_write(&mut coord, "CREATE (:Person {email: 'a@x.io'})");
 
     let writer = open_writer_removing_label(&mut coord);
 
     coord
-        .create_constraint_ddl(
-            "widget_sku",
-            "Widget",
-            &["sku"],
-            ConstraintKind::Unique,
-            None,
-            false,
-            false,
-        )
-        .expect("unrelated constraint DDL");
+        .create_point_rel_index("widget_at", "WIDGET", "at", false)
+        .expect("unrelated index DDL");
 
     coord.commit(writer).expect("the REMOVE commits");
 
@@ -222,16 +213,8 @@ fn a_rolled_back_create_is_not_resurrected_by_a_retained_label_entry() {
     );
 
     coord
-        .create_constraint_ddl(
-            "widget_sku",
-            "Widget",
-            &["sku"],
-            ConstraintKind::Unique,
-            None,
-            false,
-            false,
-        )
-        .expect("unrelated constraint DDL");
+        .create_point_rel_index("widget_at", "WIDGET", "at", false)
+        .expect("unrelated index DDL");
 
     coord.rollback(writer).expect("rollback");
 
