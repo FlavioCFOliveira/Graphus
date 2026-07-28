@@ -4613,6 +4613,44 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         read_view::node_labels(&self.pool, &self.stores, id)
     }
 
+    /// The `Label`-namespace token ids node `id` carries under **any** snapshot, ascending — the
+    /// candidate-membership superset an index refill must gate on (`rmp` task #904).
+    ///
+    /// This is [`node_labels`](Self::node_labels) widened by every bitmap
+    /// [`LabelHistory`](crate::label_history::LabelHistory) still retains for the node
+    /// ([`candidate_superset`](crate::label_history::LabelHistory::candidate_superset)), so it holds
+    /// the union of the live word and every committed, in-flight and not-yet-pruned version.
+    ///
+    /// # Why a refill must use this and never the raw live word
+    ///
+    /// Labels are mutated **in place**, so the live word carries an uncommitted writer's changes. A
+    /// refill that reads it decides membership from a bitmap that may be neither the committed set nor
+    /// the one any reader will end up seeing:
+    ///
+    /// * a refill run while a writer holds an uncommitted `REMOVE n:L` writes a **subset** — the node
+    ///   is excluded from every `(L, *)` index, the writer then rolls back, the record carries `:L`
+    ///   again, and nothing re-inserts the entry. A seek's re-check can REMOVE a candidate but never
+    ///   RESURRECT one, so that committed row is invisible to every future seek for the life of the
+    ///   process — and, because the uniqueness / node-key duplicate checks read those same trees as an
+    ///   exact candidate source, a live `IS UNIQUE` constraint then ADMITS a duplicate;
+    /// * a refill that read the newest *committed* bitmap instead would merely move the victim, losing
+    ///   an uncommitted writer's ADDED label, which `commit` never re-inserts (index entries are made
+    ///   eagerly at write time).
+    ///
+    /// The union is the only image that serves both. Its extra entries are false positives that every
+    /// consumer of these trees drops: each re-checks label membership against the reader's own snapshot
+    /// via [`label_bitmap_at`](Self::label_bitmap_at) (`graphus_cypher::read_source`'s
+    /// `filter_label_candidates` / `filter_any_label_candidates`, and the vector procedure's
+    /// `node_labels`).
+    ///
+    /// # Errors
+    /// As [`node_labels`](Self::node_labels).
+    pub fn node_label_superset(&self, id: u64) -> Result<Vec<u32>> {
+        let live = self.read_node(id)?.labels;
+        labels::token_ids(self.label_history.candidate_superset(id, live))
+            .map_err(GraphusError::from)
+    }
+
     /// Whether node `id` carries the label with `label_token_id`.
     ///
     /// # Errors
@@ -4630,9 +4668,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// record because every caller on the hot path has just decoded it for the MVCC visibility check.
     ///
     /// [`node_labels`](Self::node_labels) / [`node_has_label`](Self::node_has_label) deliberately do
-    /// NOT apply this: the index-build and constraint-enforcement paths want the CURRENT word (they
-    /// build a candidate superset that a snapshot-correct re-check then narrows — see
-    /// `graphus_cypher::read_source::filter_label_candidates`).
+    /// NOT apply this: they report the CURRENT word, for the write-path enforcement that acts on it.
+    ///
+    /// An index build must use neither. It has no snapshot to resolve against, and the current word is
+    /// **not** the candidate superset this doc once claimed it was — it is a subset whenever an
+    /// uncommitted writer has removed a label (`rmp` task #904). The build's gate is
+    /// [`node_label_superset`](Self::node_label_superset); the snapshot-correct narrowing then happens
+    /// at seek time in `graphus_cypher::read_source::filter_label_candidates`, which routes back
+    /// through this method.
     #[must_use]
     pub fn label_bitmap_at(
         &self,

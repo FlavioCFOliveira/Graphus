@@ -44,6 +44,7 @@ pub mod fault;
 pub mod faults;
 pub mod freelist_reuse;
 pub mod harness;
+pub mod index_refill_label_gate;
 pub mod isolation;
 pub mod label_rollback_clobber;
 pub mod label_snapshot_visibility;
@@ -86,6 +87,13 @@ pub use freelist_reuse::{
     run_freelist_reuse_after_rollback, run_freelist_reuse_crash,
 };
 pub use harness::{ScenarioReport, run_crash_scenario, run_scenario, run_with_fault};
+// The `rmp` #904 scenarios: an index refill must gate node membership on the live-OR-retained label
+// superset, so a rebuild run while a writer holds an uncommitted `REMOVE n:L` neither loses the
+// committed row nor lets a live `IS UNIQUE` constraint admit a duplicate.
+pub use index_refill_label_gate::{
+    SeekReport, UniqueReport, run_seek_across_a_committed_relabel,
+    run_seek_across_a_rolled_back_relabel, run_unique_across_a_rolled_back_relabel,
+};
 pub use model::{AckLedger, Model};
 pub use rng::DetRng;
 // The `rmp` #955 half-undone-transaction scenarios: a rollback or commit that fails part-way must

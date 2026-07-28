@@ -366,6 +366,50 @@ impl LabelHistory {
         hist.base
     }
 
+    /// The union of every label bitmap node `id` can present to **any** snapshot: the `live` word, the
+    /// retained [`base`](NodeLabelHistory::base), and every retained version (`rmp` task #904).
+    ///
+    /// # Why an index refill needs this and not [`resolve`](Self::resolve)
+    ///
+    /// A refill has no reader and therefore no snapshot — it populates a **candidate** structure that
+    /// every consumer re-checks against its own snapshot. The only image it may hold is a SUPERSET,
+    /// because the asymmetry the whole index layer rests on is that a re-check can REMOVE a candidate
+    /// but never RESURRECT one. Picking any single bitmap is therefore wrong in one direction or the
+    /// other:
+    ///
+    /// * the **live word** loses a COMMITTED label an uncommitted writer has removed — the write is
+    ///   in place, so the committed set exists nowhere the refill can read it, and after that writer
+    ///   rolls back the record carries the label again while the index entry is gone for good;
+    /// * the newest **committed** bitmap loses an uncommitted writer's ADDED label, which `commit`
+    ///   would never re-insert (index entries are made eagerly at write time), so that row stays lost
+    ///   once the writer commits.
+    ///
+    /// The union is a superset in both directions and costs the same single [`any`](Self::any) load on
+    /// the overwhelmingly common untracked path. The extra bits it can carry are bounded by the tracked
+    /// churn set, which GC [`prune`](Self::prune) keeps tiny.
+    ///
+    /// Aborted versions may still be retained here (a rollback's [`forget`](Self::forget) is a memory
+    /// bound, not a correctness requirement); their bits are additional false positives, which is
+    /// exactly what the re-check exists to drop.
+    #[must_use]
+    pub fn candidate_superset(&self, id: u64, live: u64) -> u64 {
+        // Hot path, and the same two gates `resolve` documents: no node anywhere has a tracked change,
+        // then a lock-free membership miss, which is authoritative.
+        if !self.any() {
+            return live;
+        }
+        if !self.filter.maybe_contains(id) {
+            return live;
+        }
+        let map = self.map.read().unwrap_or_else(|e| e.into_inner());
+        let Some(hist) = map.get(&id) else {
+            return live;
+        };
+        hist.versions
+            .iter()
+            .fold(live | hist.base, |acc, v| acc | v.bitmap)
+    }
+
     /// **Settles** every version stamped by `txn` to `Committed(commit_ts)`, for use when `txn`
     /// COMMITS.
     ///
@@ -578,6 +622,72 @@ mod tests {
         h.record(1, TxnId(7), 0b1, 0b1);
         assert!(!h.any());
         assert_eq!(h.tracked_nodes(), 0);
+    }
+
+    // --------------------------- `candidate_superset` (`rmp` task #904) ---------------------------
+
+    #[test]
+    fn an_untracked_node_supersets_to_its_live_word() {
+        let h = LabelHistory::new();
+        assert_eq!(h.candidate_superset(1, 0b101), 0b101, "unarmed");
+        // Armed by a DIFFERENT node: the filter miss must still return the live word untouched.
+        h.record(2, TxnId(7), 0b1, 0b11);
+        assert!(h.any());
+        assert_eq!(h.candidate_superset(1, 0b101), 0b101, "armed, not tracked");
+    }
+
+    /// THE `rmp` #904 DEFECT, at its source. An uncommitted `REMOVE` clears the bit in the live word;
+    /// the superset must still carry it, because the committed set is what a rollback restores.
+    #[test]
+    fn an_uncommitted_removal_keeps_the_committed_bit_in_the_superset() {
+        let h = LabelHistory::new();
+        h.record(1, TxnId(7), 0b11, 0b01);
+        assert_eq!(
+            h.candidate_superset(1, 0b01),
+            0b11,
+            "the committed bit an uncommitted writer removed must survive in the superset",
+        );
+    }
+
+    /// The other direction, which a "newest committed bitmap" gate would have lost: an uncommitted
+    /// writer's ADDED label. `commit` never re-inserts index entries, so losing it here loses the row
+    /// for good once that writer commits.
+    #[test]
+    fn an_uncommitted_addition_is_also_in_the_superset() {
+        let h = LabelHistory::new();
+        h.record(1, TxnId(7), 0b01, 0b11);
+        assert_eq!(h.candidate_superset(1, 0b11), 0b11);
+        // And it holds even if the live word were somehow read before the in-place write landed.
+        assert_eq!(h.candidate_superset(1, 0b01), 0b11);
+    }
+
+    /// Every retained version contributes, not just the newest and not just the base — a stack of
+    /// writers must not let a middle version's bit escape the union.
+    #[test]
+    fn every_retained_version_contributes_to_the_superset() {
+        let h = LabelHistory::new();
+        h.record(1, TxnId(1), 0b0001, 0b0011);
+        h.record(1, TxnId(2), 0b0011, 0b0101);
+        h.record(1, TxnId(3), 0b0101, 0b1001);
+        assert_eq!(h.candidate_superset(1, 0b1001), 0b1111);
+    }
+
+    /// After a `prune` collapses everything into `base` and drops the node, the live word is
+    /// authoritative again — and the superset says exactly that, with no stale bit left over.
+    #[test]
+    fn a_pruned_node_supersets_to_its_live_word_again() {
+        let h = LabelHistory::new();
+        let mut reg = CommitRegistry::default();
+        h.record(1, TxnId(7), 0b11, 0b01);
+        reg.record_commit(TxnId(7), Timestamp(50));
+        assert_eq!(h.candidate_superset(1, 0b01), 0b11, "before the prune");
+        h.prune(Timestamp(50), &reg);
+        assert!(!h.tracks_node(1), "the prune drops a fully-collapsed node");
+        assert_eq!(
+            h.candidate_superset(1, 0b01),
+            0b01,
+            "once no version is retained the live word is the whole answer",
+        );
     }
 
     /// `rmp` #767, Finding 3 (adversarial audit): WHY `RecordStore::rollback` must call `forget`

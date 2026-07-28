@@ -495,21 +495,33 @@ pub struct IndexSet {
     ///   gated only by `IndexState::Online` (`rmp` #733), NOT by the #467 marker — do not assume it is.
     /// * **`labels`** — stale-RETAINING, and `clear` does **not** empty it at all (`rmp` task #771), so
     ///   there is nothing for a watermark to gate: the refill only ever ADDS. It needs that exemption
-    ///   rather than a watermark because labels are mutated IN PLACE, so the refill's only source is
-    ///   the CURRENT bitmap and it cannot reproduce a committed label an uncommitted writer has
-    ///   removed — see [`clear`](Self::clear) for the full argument. Since `rmp` #767 that retention
-    ///   is also the ONLY defence left: the per-candidate re-check is now snapshot-isolated, so it no
-    ///   longer independently rejects a stale entry an older reader may genuinely need.
+    ///   rather than a watermark because labels are mutated IN PLACE, so the refill cannot reconstruct
+    ///   a committed label an uncommitted writer removed from the record alone — see
+    ///   [`clear`](Self::clear) for the full argument. Since `rmp` #767 that retention is also the ONLY
+    ///   defence left: the per-candidate re-check is now snapshot-isolated, so it no longer
+    ///   independently rejects a stale entry an older reader may genuinely need.
+    ///
+    ///   Since `rmp` #904 the refill no longer reads the current bitmap at all, here or anywhere: it
+    ///   gates on `RecordStore::node_label_superset`, the union of the live word with every bitmap
+    ///   `LabelHistory` retains. That is what makes the refill of the trees `clear` DOES empty a
+    ///   superset too, and it is why this bullet's argument no longer has to carry them. The exemption
+    ///   still stays, because retention is free and the superset reaches only as far back as the
+    ///   retained history: a version the GC prune collapsed is one no live reader can still need, but a
+    ///   surviving entry must not be destroyed on that basis.
     ///
     ///   This entry used to claim the opposite — that emptying `labels` was safe because "any entry the
     ///   refill drops is one the re-check would have rejected anyway", so "the rebuild changes no
     ///   answer". That was FALSE, and it was the #771 defect: it holds only at the refill INSTANT, and
     ///   the record's bitmap changes BACK when the writer rolls back, at which point the re-check would
     ///   have accepted the entry the refill had already destroyed.
-    /// * **`bitmap`** — membership-EXACT (maintained by remove-then-reinsert, `rmp` #453), so the refill
-    ///   reproduces exactly what the live bitmap already held. It also has no *planner* consumer (only
-    ///   `TxnCoordinator::bitmap_seek_eq` / `bitmap_conjunction`, a documented test/diagnostic surface),
-    ///   so no query path reaches it.
+    /// * **`bitmap`** — destructive per entry on the WRITE path (remove-then-reinsert, `rmp` #453,
+    ///   with the abort re-derive restoring exact membership after a rollback), so the live bitmap holds
+    ///   only current state and there is nothing a rebuild can destroy that a reader was owed. The
+    ///   REFILL is deliberately wider than that — every property version (`rmp` #766) and the
+    ///   live-OR-retained label superset (`rmp` #904) — because a refill has no snapshot to be exact
+    ///   against; the extra memberships are false positives, and a *hole* is what could never be
+    ///   repaired. It also has no *planner* consumer (only `TxnCoordinator::bitmap_seek_eq` /
+    ///   `bitmap_conjunction`, a documented test/diagnostic surface), so no query path reaches it.
     ///
     /// `0` (the default) means "never rebuilt": the trees are then purely append-only and every reader
     /// may be served.
@@ -1386,9 +1398,16 @@ impl IndexSet {
         for bm in self.bitmap.values_mut() {
             *bm = BitmapIndex::new();
         }
-        // A full rebuild re-derives every bitmap from the committed store, so any pending per-txn
-        // abort-repair tracking (`rmp` #453) is moot — drop it so a stale txn id can never leak.
-        self.dirty_bitmap_nodes.clear();
+        // The per-txn bitmap abort-repair tracking (`rmp` #453) is deliberately NOT dropped here
+        // (`rmp` task #904). This used to read "a full rebuild re-derives every bitmap from the
+        // committed store, so any pending tracking is moot" — and that justification was false in
+        // precisely the way `rmp` #771's was: the refill re-derives from the LIVE store, not the
+        // committed one, and an open writer's rollback changes that live state BACK afterwards. Dropping
+        // the tracking therefore stranded every node an in-flight writer had bitmap-dirtied, so nothing
+        // re-derived them and the bitmap kept the rolled-back membership until the next unrelated
+        // rebuild. Retaining costs one `BTreeSet` per open writer and cannot leak a stale txn id: every
+        // transaction's entry is removed by its own `commit` (`forget_dirty_bitmap_nodes`) or `abort`
+        // (`take_dirty_bitmap_nodes`), neither of which this touches.
     }
 
     /// **Fail-closed**: makes every derived index unusable for reads after a rebuild could not be

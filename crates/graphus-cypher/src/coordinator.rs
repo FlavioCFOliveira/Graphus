@@ -2638,12 +2638,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         registered: &[(u32, Vec<u32>)],
     ) {
         // The node's label tokens + EVERY version of its properties (with MVCC stamps), read in one
-        // store-borrow scope. Read-only: `node_labels` / `node_properties` are `&self` (`rmp` #337
-        // Slice 2). `node_properties` is used rather than `node_property_values` because the latter
-        // strips the stamps, and the per-view tuple construction below needs them (`rmp` task #766).
+        // store-borrow scope. Read-only: `node_label_superset` / `node_properties` are `&self`
+        // (`rmp` #337 Slice 2). `node_properties` is used rather than `node_property_values` because
+        // the latter strips the stamps, and the per-view tuple construction below needs them
+        // (`rmp` task #766). The membership gate is the LIVE-OR-RETAINED label superset, never the raw
+        // live word (`rmp` task #904) — see `RecordStore::node_label_superset`.
         let (label_tokens, props, registry): (Vec<u32>, Vec<(u32, PropVersion)>, CommitRegistry) = {
             let store = store.borrow();
-            let labels = match store.node_labels(id) {
+            let labels = match store.node_label_superset(id) {
                 Ok(l) => l,
                 Err(_) => {
                     // `rmp` task #733: record the gap instead of hiding it — an entity missing from
@@ -2736,8 +2738,22 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         id: u64,
         registered: &[(u32, u32)],
     ) {
-        // Read this node's current label tokens (store borrow, released before the index borrow).
-        let label_tokens = match store.borrow_mut().node_labels(id) {
+        // Read this node's label-membership SUPERSET — the live word unioned with every bitmap
+        // `LabelHistory` still retains for it (`rmp` task #904) — in a store borrow released before the
+        // index borrow.
+        //
+        // # Why the superset and not the live word (`rmp` task #904)
+        //
+        // The live word is mutated IN PLACE, so it carries an uncommitted writer's changes and is
+        // neither the committed set nor the one a future reader will see. Gating on it made this refill
+        // a SUBSET in exactly the way the version loop below is written to avoid: a refill run while a
+        // writer held an uncommitted `REMOVE n:L` skipped the node for every `(L, *)` index, the entry
+        // `clear` had just wiped was never re-inserted, and the writer's rollback restored the record's
+        // label bit but nothing restored the entry — the same asymmetry, one level up. The victim was a
+        // committed row lost to every seek for the life of the process, and — because `unique_conflict`
+        // reads this tree as an EXACT candidate source and treats `Some([])` as "no duplicate" — a live
+        // `IS UNIQUE` constraint that then admitted a duplicate. See `RecordStore::node_label_superset`.
+        let label_tokens = match store.borrow_mut().node_label_superset(id) {
             Ok(tokens) => tokens,
             Err(_) => {
                 // overflow-form bitmap or read fault: skip this node's entries.
@@ -3003,13 +3019,21 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         index: &Rc<RefCell<IndexSet>>,
         id: u64,
     ) {
-        // Read the node's labels, the covered full-text keys, its STAMPED property chain (newest-first)
-        // and the commit registry in one shared borrow scope (`node_labels` / `node_properties` are
-        // `&self`, `rmp` #337 Slice 2). The chain carries MVCC stamps (`node_properties`, not
-        // `node_property_values`) because the #778 gate below must resolve the newest version's writer.
+        // Read the node's label-membership SUPERSET (`rmp` task #904 — the live word unioned with every
+        // bitmap `LabelHistory` retains, never the raw live word; see
+        // `RecordStore::node_label_superset`), the covered full-text keys, its STAMPED property chain
+        // (newest-first) and the commit registry in one shared borrow scope (`node_label_superset` /
+        // `node_properties` are `&self`, `rmp` #337 Slice 2). The chain carries MVCC stamps
+        // (`node_properties`, not `node_property_values`) because the #778 gate below must resolve the
+        // newest version's writer.
+        //
+        // Widening only the LABEL component is sound here even though this consumer re-checks no term:
+        // `RecordStoreGraph::fulltext_query` re-checks a hit's visibility and current label
+        // (`filter_any_label_candidates`), so a document indexed under a label the node does not carry
+        // at the reader's snapshot is dropped whole.
         let (label_tokens, covered, chain) = {
             let store = store.borrow();
-            let label_tokens = match store.node_labels(id) {
+            let label_tokens = match store.node_label_superset(id) {
                 Ok(tokens) => tokens,
                 Err(_) => {
                     // `rmp` task #733: record the gap instead of hiding it — an entity missing from
@@ -3285,7 +3309,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         id: u64,
         registered: &[(u32, u32)],
     ) {
-        let label_tokens = match store.borrow_mut().node_labels(id) {
+        // `rmp` task #904: the membership gate is the LIVE-OR-RETAINED label superset, never the raw
+        // live word — see `RecordStore::node_label_superset` for why a refill must not read the word an
+        // uncommitted `REMOVE n:L` is sitting on.
+        let label_tokens = match store.borrow_mut().node_label_superset(id) {
             Ok(tokens) => tokens,
             Err(_) => {
                 // `rmp` task #733: record the gap instead of hiding it — an entity missing from
@@ -3363,7 +3390,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         id: u64,
         registered: &[(u32, u32)],
     ) {
-        let label_tokens = match store.borrow_mut().node_labels(id) {
+        // `rmp` task #904: the membership gate is the LIVE-OR-RETAINED label superset, never the raw
+        // live word — see `RecordStore::node_label_superset` for why a refill must not read the word an
+        // uncommitted `REMOVE n:L` is sitting on.
+        let label_tokens = match store.borrow_mut().node_label_superset(id) {
             Ok(tokens) => tokens,
             Err(_) => {
                 // `rmp` task #733: record the gap instead of hiding it — an entity missing from
@@ -3423,7 +3453,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         id: u64,
         registered: &[(u32, u32)],
     ) {
-        let label_tokens = match store.borrow_mut().node_labels(id) {
+        // `rmp` task #904: the membership gate is the LIVE-OR-RETAINED label superset, never the raw
+        // live word — see `RecordStore::node_label_superset` for why a refill must not read the word an
+        // uncommitted `REMOVE n:L` is sitting on.
+        let label_tokens = match store.borrow_mut().node_label_superset(id) {
             Ok(tokens) => tokens,
             Err(_) => {
                 // `rmp` task #733: record the gap instead of hiding it — an entity missing from
@@ -3626,10 +3659,21 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// (Re)captures node `id`'s current value into each `registered` `(label_token, prop_key)` bitmap
     /// index it matches (`rmp` task #328). The bitmap analogue of [`index_one_node`](Self::index_one_node):
     /// the same single per-node path the full rebuild drives, so a recovered store rebuilds the
-    /// low-cardinality bitmaps store-consistently. Membership is exact (the bitmap is a candidate
-    /// SOURCE): each registered column the node carries gets the node's bit set under its current
-    /// value; a node missing the label / property contributes nothing. Store and index are borrowed in
-    /// **separate, non-overlapping** scopes (the borrow discipline of this file).
+    /// low-cardinality bitmaps store-consistently. Each registered column the node carries gets the
+    /// node's bit set under its value; a node carrying neither the label nor the property contributes
+    /// nothing. Store and index are borrowed in **separate, non-overlapping** scopes (the borrow
+    /// discipline of this file).
+    ///
+    /// # This refill produces a candidate SUPERSET, not exact membership
+    ///
+    /// The write path maintains a bitmap membership-EXACT (remove-then-reinsert, `rmp` #453) and the
+    /// abort re-derive ([`rederive_node_bitmap`](Self::rederive_node_bitmap)) restores that exactness
+    /// after a rollback. A *refill* cannot, and must not try: it has no reader and therefore no
+    /// snapshot, so it indexes every property version rather than collapsing newest-wins (`rmp` #766)
+    /// and gates membership on the live-OR-retained label superset rather than the raw live word
+    /// (`rmp` #904). Both widenings exist for the same reason — a bitmap is a candidate SOURCE, so an
+    /// extra membership is a false positive its consumer's re-check drops, while a node it wrongly
+    /// OMITS is a committed row no re-check can ever resurrect.
     fn index_one_node_bitmap(
         store: &Rc<RefCell<RecordStore<D, S>>>,
         index: &Rc<RefCell<IndexSet>>,
@@ -3647,7 +3691,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             Ok(node) if node.mvcc.in_use() => {}
             _ => return, // not in use, or a read fault: contribute nothing (the bitmap stays cleared).
         }
-        let label_tokens = match store.borrow_mut().node_labels(id) {
+        // `rmp` task #904: the membership gate is the LIVE-OR-RETAINED label superset, never the raw
+        // live word — see `RecordStore::node_label_superset` for why a refill must not read the word an
+        // uncommitted `REMOVE n:L` is sitting on.
+        let label_tokens = match store.borrow_mut().node_label_superset(id) {
             Ok(tokens) => tokens,
             Err(_) => {
                 // `rmp` task #733: record the gap instead of hiding it — an entity missing from
@@ -4543,10 +4590,23 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         Ok(())
     }
 
-    /// Rebuilds one declared zone-map column exactly from the current store: scans the in-use nodes
-    /// that carry the label and captures `(id, value)` for the property, then installs the exact
-    /// per-zone summary. Reads committed state without a snapshot (like the index rebuild); the scan's
-    /// per-row re-check makes any later staleness harmless.
+    /// Rebuilds one declared zone-map column from the current store: scans the in-use nodes that carry
+    /// the label and captures `(id, value)` for the property, then installs the per-zone summary.
+    /// Reads without a snapshot, like the index rebuild.
+    ///
+    /// # A zone map PRUNES, so an omitted node is a lost row (`rmp` task #904)
+    ///
+    /// This used to claim that "the scan's per-row re-check makes any later staleness harmless". That
+    /// is true of a *widened* zone and false of a *narrowed* one: `zone_scan_eq`'s re-check only ever
+    /// runs on the ids `candidate_ranges_eq` did not prune, so a node this rebuild leaves out of its
+    /// zone's `[min, max]` — when it was that zone's only carrier of the value — makes the whole id
+    /// range disappear before any re-check happens. The membership gate is therefore the live-OR-
+    /// retained label superset, exactly as the index refills use
+    /// ([`RecordStore::node_label_superset`](graphus_storage::RecordStore::node_label_superset)): a
+    /// rebuild run while a writer holds an uncommitted `REMOVE n:L` must not narrow a zone on the
+    /// strength of a change that writer may roll back. Nothing repairs a zone map afterwards — there is
+    /// no rebuild on open and no rollback hook, only a later write to the same node — so the loss would
+    /// be permanent.
     fn rebuild_zone_column(&self, label_token: u32, prop_key: u32) {
         // Read-only store access (`rmp` #337 Slice 2): the rebuild scan only reads.
         let node_ids = match self.store.borrow().scan_node_ids() {
@@ -4557,7 +4617,9 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         for id in node_ids {
             let (labels, chain) = {
                 let store = self.store.borrow();
-                let labels = match store.node_labels(id) {
+                // `rmp` task #904: the live-OR-retained superset, never the raw live word — see this
+                // method's doc for why a narrowed zone is unrecoverable.
+                let labels = match store.node_label_superset(id) {
                     Ok(l) => l,
                     Err(_) => continue,
                 };
@@ -4581,10 +4643,29 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
 
     /// Candidate-and-confirmed node ids for `label` whose `property` **equals** `value`, driven by the
     /// zone-map data-skipping sidecar (`rmp` #331): only the id zones the summary cannot exclude are
-    /// examined, and each examined node is authoritatively re-checked (in-use, current label, current
-    /// value) — so the result is **exactly** the committed matching set regardless of zone staleness.
-    /// `None` if no zone map is declared for the column (the caller scans normally). After the call,
+    /// examined, and each examined node is re-checked (in-use, label, value). `None` if no zone map is
+    /// declared for the column (the caller scans normally). After the call,
     /// [`zone_map_zones_skipped`](Self::zone_map_zones_skipped) reports how many zones were pruned.
+    ///
+    /// # This reads CURRENT state, not a snapshot — it is not a transactional read path
+    ///
+    /// This doc used to promise "**exactly** the committed matching set regardless of zone staleness".
+    /// It delivers neither half (`rmp` task #904):
+    ///
+    /// * the re-check reads the **raw live** label word and `mvcc.in_use()`, not
+    ///   [`RecordStore::label_bitmap_at`](graphus_storage::RecordStore::label_bitmap_at) and
+    ///   `is_visible`, so a concurrent uncommitted `REMOVE n:L` hides a matching node and a concurrent
+    ///   uncommitted `SET n:L` yields a phantom — dirty reads in both directions;
+    /// * "regardless of zone staleness" holds only for a zone that is too WIDE. A zone the rebuild
+    ///   narrowed is pruned by `candidate_ranges_eq` before any re-check runs (see
+    ///   [`rebuild_zone_column`](Self::rebuild_zone_column), whose membership gate is widened for
+    ///   exactly this reason).
+    ///
+    /// [`TxnCoordinator`] holds no statement snapshot, so this cannot be made snapshot-isolated where
+    /// it stands: `label_bitmap_at` needs a `(Snapshot, CommitRegistry)` pair that only a statement seam
+    /// has. It is a **current-state** diagnostic surface, and the only callers today are
+    /// `tests/zone_map_skipping.rs`; no planner or executor path reaches it. Wiring it into a query
+    /// path requires moving it to a seam that carries a snapshot first.
     #[must_use]
     pub fn zone_scan_eq(&self, label: &str, property: &str, value: &Value) -> Option<Vec<u64>> {
         let (label_token, prop_key) = {
