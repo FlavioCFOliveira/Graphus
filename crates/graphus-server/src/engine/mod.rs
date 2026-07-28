@@ -819,6 +819,12 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // sized with `engine_queue_capacity` (≥ `max_concurrent_queries` in any sane config), so this cap is
     // a never-reached defense-in-depth ceiling against an admission bypass — not a routine limit.
     max_parked_inline: usize,
+    // The server-wide live-transaction registry (`rmp` #637/#903), shared with both connectivity seams.
+    // The engine registers its **own** validating `CREATE CONSTRAINT` transactions here so they appear
+    // in `SHOW TRANSACTIONS` while they run and can be stopped by `TERMINATE TRANSACTIONS`. It is
+    // deliberately NOT an `Option`: an engine without a registry would silently lose that visibility,
+    // which is precisely the failure mode this wiring exists to remove, so the type system requires one.
+    transactions: Arc<crate::txn_registry::TransactionRegistry>,
 ) {
     // This engine's contribution to the server-wide open-transaction gauge (`rmp` #418): published
     // additively so the gauge sums across every database engine. Also folds the same delta into THIS
@@ -1015,6 +1021,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                 pending_cmd: &mut pending_cmd,
                 wal_sync: &wal_sync,
                 retire_rx: &retire_rx,
+                transactions: &transactions,
             }) {
                 break 'engine;
             }
@@ -1158,6 +1165,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             pending_cmd: &mut pending_cmd,
             wal_sync: &wal_sync,
             retire_rx: &retire_rx,
+            transactions: &transactions,
         }) {
             break 'engine; // Shutdown handled (drained + hardened) inside the dispatch.
         }
@@ -2189,6 +2197,10 @@ struct ProcessCtx<'a, D: BlockDevice + Send + Sync + 'static, S: LogSink + Send 
     /// can release readers' GC-watermark pins BETWEEN hardened batches under a sustained write storm,
     /// instead of leaving them pinned until the engine loop's next top-of-tick sweep (`rmp` #583, F1b).
     retire_rx: &'a std::sync::mpsc::Receiver<read_pool::ReadRetirement>,
+    /// The server-wide live-transaction registry (`rmp` #637/#903): where a validating
+    /// `CREATE CONSTRAINT` registers itself, so it is visible to `SHOW TRANSACTIONS` and stoppable by
+    /// `TERMINATE TRANSACTIONS` for as long as its validation walk runs.
+    transactions: &'a Arc<crate::txn_registry::TransactionRegistry>,
 }
 
 /// Processes one received [`EngineCommand`] end-to-end (`rmp` #528): dispatches it, coalesces a
@@ -2234,6 +2246,7 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         pending_cmd,
         wal_sync,
         retire_rx,
+        transactions,
     } = ctx;
 
     // Whether a Mode A bulk-import loading session is active **before** this command is dispatched, so
@@ -2265,6 +2278,7 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         statement_timeout,
         loading_session,
         &mut commit_batch,
+        transactions,
     ) {
         return false; // Shutdown handled (drained + hardened) inside the dispatch.
     }
@@ -2300,6 +2314,7 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             statement_timeout,
             loading_session,
             retire_rx,
+            transactions,
         );
         // The redo-bounding checkpoint, once, AFTER every batch is acked (the commits are all durable).
         checkpoint_after_batch(coordinator);
@@ -2375,6 +2390,9 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
     // ONE `harden_wal` for all of them (see `flush_commit_batch`). Read-only and SSI-aborted commits are
     // still answered immediately and never join the batch.
     commit_batch: &mut Vec<PendingCommit>,
+    // The server-wide live-transaction registry (`rmp` #637/#903), for the one command that registers a
+    // transaction of the engine's own: the validating `CREATE CONSTRAINT`.
+    transactions: &Arc<crate::txn_registry::TransactionRegistry>,
 ) -> bool {
     // `rmp` #409 / #414: once a statement-recovery double-panic has flagged **this** engine degraded,
     // the coordinator's in-memory state can no longer be trusted (a deep storage/MVCC invariant broke).
@@ -2487,9 +2505,20 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             }
             let _ = reply.send(out);
         }
-        Cmd::ConstraintDdl { command, reply } => {
+        Cmd::ConstraintDdl {
+            command,
+            principal,
+            reply,
+        } => {
             let mutating = !matches!(command, ConstraintCommand::Show { .. });
-            let mut out = handle_constraint_ddl(coord, &command);
+            let mut out = handle_constraint_ddl(
+                coord,
+                &command,
+                transactions,
+                db,
+                principal.as_deref(),
+                active_txns,
+            );
             // A successful mutating constraint DDL changes the schema (a new/dropped unique/existence/
             // node-key/property-type rule) — invalidate so no plan compiled under the old schema is
             // reused (`rmp` task #322).
@@ -3293,15 +3322,41 @@ fn constraint_storage_kind(
 fn handle_constraint_ddl<D: BlockDevice, S: LogSink>(
     coordinator: &mut TxnCoordinator<D, S>,
     command: &ConstraintCommand,
+    transactions: &Arc<crate::txn_registry::TransactionRegistry>,
+    db: &str,
+    principal: Option<&str>,
+    active_txns: &mut ActiveTxnGauge,
 ) -> Result<IndexDdlReply> {
     match command {
         ConstraintCommand::Create(create) => {
             let (kind, descriptor) = constraint_storage_kind(create);
             let props: Vec<&str> = create.properties.iter().map(String::as_str).collect();
+            // Register this DDL as a first-class live transaction (`rmp` task #903) for the whole of
+            // its validate-and-declare run. Two operator-facing properties come from it:
+            //
+            // * `SHOW TRANSACTIONS` lists it while it runs, so schema work that reads user property
+            //   values is no longer the one class of database activity an administrator cannot see;
+            // * `TERMINATE TRANSACTIONS` can stop it, which matters because the validation walk is
+            //   O(entities carrying the covered token) — a `CREATE CONSTRAINT` on a large label is a
+            //   realistic runaway.
+            //
+            // Only `CREATE` is registered. `DROP` is a single catalogue write with no walk, and `SHOW`
+            // is a read of the catalogue: neither can run long, and neither reads user data, so an entry
+            // for them would be noise in an operator's listing rather than information.
+            let guard = transactions.register_internal(
+                db,
+                principal,
+                AccessMode::Write,
+                graphus_cypher::CancellationToken::new(),
+            );
+            // The rendered statement, as the `currentQuery` column. Reuses the audit trail's own
+            // renderer so an operator reads the same text in `SHOW TRANSACTIONS` and in the audit log,
+            // with the same redaction applied.
+            guard.set_current_query(&crate::audit::redact_constraint_detail(command));
             // The idempotent entry point (`rmp` #638) handles `IF NOT EXISTS` (equivalent existing →
             // no-op, `mutated == false`) and `OR REPLACE` (drop same-named then create) around the
             // synchronous validate-and-declare path.
-            let mutated = coordinator.create_constraint_ddl(
+            let outcome = coordinator.create_constraint_ddl_cancellable(
                 &create.name,
                 create.entity.covering_name(),
                 &props,
@@ -3309,8 +3364,29 @@ fn handle_constraint_ddl<D: BlockDevice, S: LogSink>(
                 descriptor,
                 create.if_not_exists,
                 create.or_replace,
-            )?;
-            Ok(IndexDdlReply::mutation(mutated))
+                guard.cancellation(),
+            );
+            // A terminated DDL reports the registry's own wording, so an operator sees the same message
+            // whichever kind of transaction they stopped. Only an ERROR is re-labelled: a DDL that had
+            // already reached its uninterruptible tail committed, and reporting that as "terminated"
+            // would tell the operator the opposite of what happened. The coordinator guarantees the
+            // error case left no trace — no catalogue entry, no in-memory rule, no index rebuild, and no
+            // entry in its active set or SSI tracker — so a terminated DDL and a refused one are
+            // indistinguishable in their after-effects.
+            let outcome = if outcome.is_err() && guard.is_terminated() {
+                Err(crate::txn_registry::terminated_error())
+            } else {
+                outcome
+            };
+            // Deregisters the entry (RAII). Runs on every path out of this arm, including the error one.
+            drop(guard);
+            // Republish the true open-transaction / SSI-tracked counts. The DDL's own transaction is
+            // registered in both while it runs (`rmp` task #903), and a successful one leaves a
+            // committed entry in the SSI tracker until GC prunes it, so the gauges move here. The
+            // counts are read AFTER the DDL, never anticipated: a DDL refused before it opened a
+            // transaction must not be reported as having held one.
+            active_txns.publish(coordinator.active_count(), coordinator.ssi_tracked_len());
+            Ok(IndexDdlReply::mutation(outcome?))
         }
         ConstraintCommand::Drop { name, if_exists } => {
             // `mutated == false` is a no-op drop of a missing constraint → 0 removed. With `IF EXISTS`
@@ -3522,6 +3598,7 @@ fn pipelined_group_commit<
     statement_timeout: Option<std::time::Duration>,
     loading_session: &mut Option<bulk_load::LoadingSession>,
     retire_rx: &std::sync::mpsc::Receiver<read_pool::ReadRetirement>,
+    transactions: &Arc<crate::txn_registry::TransactionRegistry>,
 ) {
     // The current PREPAREd batch (batch K). First coalesce further queued commits into it, exactly as
     // the inline path did before hardening — so a burst that is all already-queued still forms ONE
@@ -3550,6 +3627,7 @@ fn pipelined_group_commit<
             clock,
             statement_timeout,
             loading_session,
+            transactions,
         );
     }
 
@@ -3590,6 +3668,7 @@ fn pipelined_group_commit<
                 clock,
                 statement_timeout,
                 loading_session,
+                transactions,
             );
         }
 
@@ -3744,6 +3823,7 @@ fn drain_commit_batch<
     clock: &Arc<dyn graphus_core::capability::Clock + Send + Sync>,
     statement_timeout: Option<std::time::Duration>,
     loading_session: &mut Option<bulk_load::LoadingSession>,
+    transactions: &Arc<crate::txn_registry::TransactionRegistry>,
 ) {
     // `rmp` #583 (F1): bound the drain by TOTAL commands processed as well as by batch size — reads and
     // transaction-opens are processed here without growing `commit_batch`, so `MAX_COMMIT_BATCH` alone
@@ -3784,6 +3864,7 @@ fn drain_commit_batch<
                     statement_timeout,
                     loading_session,
                     commit_batch,
+                    transactions,
                 );
                 // Park a suspended auto-commit `Run` (slow consumer, `rmp` #372/#485) so the loop resumes
                 // it — it has NOT committed (mid-stream), so it never joined the batch; its later resume
@@ -3840,6 +3921,7 @@ fn drain_commit_batch<
                     statement_timeout,
                     loading_session,
                     commit_batch,
+                    transactions,
                 );
                 debug_assert!(
                     ignored.is_none(),
@@ -3981,6 +4063,7 @@ pub struct Engine {
 /// # Errors
 /// Returns the spawn error if the OS thread cannot be created, or the `build` error (e.g. an
 /// integrity-check failure) if the store cannot be opened/verified.
+#[allow(clippy::too_many_arguments)] // Mirrors `spawn_engine_with_timeout`'s parameter list.
 pub fn spawn_engine<D, S, B>(
     db_name: Arc<str>,
     build: B,
@@ -3989,6 +4072,7 @@ pub fn spawn_engine<D, S, B>(
     reader_threads: usize,
     metrics: Arc<Metrics>,
     clock: Arc<dyn graphus_core::capability::Clock + Send + Sync>,
+    transactions: Arc<crate::txn_registry::TransactionRegistry>,
 ) -> Result<Engine>
 where
     D: BlockDevice + Send + Sync + 'static,
@@ -4006,6 +4090,7 @@ where
         None,
         None,
         None,
+        transactions,
     )
 }
 
@@ -4037,6 +4122,7 @@ pub fn spawn_engine_with_timeout<D, S, B>(
     statement_timeout: Option<std::time::Duration>,
     max_transaction_age: Option<std::time::Duration>,
     egress_stall_timeout: Option<std::time::Duration>,
+    transactions: Arc<crate::txn_registry::TransactionRegistry>,
 ) -> Result<Engine>
 where
     D: BlockDevice + Send + Sync + 'static,
@@ -4097,6 +4183,7 @@ where
                     // `max_concurrent_queries` (the admission limit that actually bounds how many
                     // statements can be parked at once), so this is a generous never-reached ceiling.
                     engine_queue_capacity,
+                    transactions,
                 );
             }
             Err(e) => {

@@ -271,6 +271,21 @@ impl Server {
         let audit =
             AuditLog::open(&config.audit, &config.store_path).map_err(ServerError::Audit)?;
 
+        // 1c) The server-wide live-transaction registry (`rmp` #637/#903), backing `SHOW TRANSACTIONS`
+        //     and `TERMINATE TRANSACTIONS`. Constructed HERE — before the catalog and therefore before
+        //     any engine thread exists — because it is now shared three ways: both connectivity seams
+        //     register their managed transactions in it, and every engine registers its own validating
+        //     `CREATE CONSTRAINT` transactions. It used to be built inside `listeners::start_all`, which
+        //     runs after the engines are already serving, so an engine could never have reached it.
+        //
+        //     Ordering it before `DatabaseCatalog::load` is what makes the single shared instance reach
+        //     *every* engine — including the ones `CREATE DATABASE` / `START DATABASE` spawn later at
+        //     runtime, which take it from the catalog's captured `EngineParams`. Construction is
+        //     infallible and depends on nothing, so moving it earlier cannot introduce a startup
+        //     failure; and because `EngineParams::transactions` is not an `Option`, an engine that never
+        //     received one does not compile rather than silently serving with no transaction visibility.
+        let transactions = Arc::new(crate::txn_registry::TransactionRegistry::new());
+
         // 2) The database catalog + engines (`crate::dbcatalog`, decision `D-multi-db`): load the
         //    durable catalog (malformed ⇒ fail startup closed), start the default database (its
         //    failure fails startup — unchanged single-db behaviour; the `!Send` coordinator is
@@ -278,7 +293,8 @@ impl Server {
         //    §4.6`/§4.8), then start every additional database marked online (failures logged,
         //    never fatal). The returned handle already carries the admission limit (`04 §9.3`).
         let catalog = Arc::new(
-            DatabaseCatalog::load(&config, Arc::clone(&metrics)).map_err(ServerError::Catalog)?,
+            DatabaseCatalog::load(&config, Arc::clone(&metrics), Arc::clone(&transactions))
+                .map_err(ServerError::Catalog)?,
         );
         let handle = catalog
             .start_default()
@@ -315,6 +331,7 @@ impl Server {
             Arc::clone(&metrics),
             shutdown.clone(),
             readiness.clone(),
+            Arc::clone(&transactions),
         )
         .await
         {

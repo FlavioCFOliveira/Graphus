@@ -452,7 +452,7 @@ impl BoltExecutor for BoltEngineExecutor {
                 // `reply.mutated`); only the success path reaches the stream (a failure returns via
                 // `outcome?`).
                 let summary_cmd = cmd.clone();
-                let outcome = handle.constraint_ddl_blocking(cmd);
+                let outcome = handle.constraint_ddl_blocking(cmd, self.principal.clone());
                 if mutating {
                     self.context.audit().record(
                         AuditEvent::new(

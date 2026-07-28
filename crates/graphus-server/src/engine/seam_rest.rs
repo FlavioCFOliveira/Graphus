@@ -315,7 +315,7 @@ impl RestEngineAdapter {
                 // Keep the command shape for the post-outcome summary (counters depend on
                 // `reply.mutated`) and to detect the `SHOW CONSTRAINTS` tail.
                 let summary_cmd = cmd.clone();
-                let outcome = handle.constraint_ddl_blocking(cmd);
+                let outcome = handle.constraint_ddl_blocking(cmd, Some(principal.to_owned()));
                 if mutating {
                     self.context.audit().record(
                         AuditEvent::new(

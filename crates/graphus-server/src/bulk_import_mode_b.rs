@@ -743,6 +743,7 @@ mod tests {
             0,
             metrics,
             clock,
+            Arc::new(crate::txn_registry::TransactionRegistry::new()),
         )
         .expect("spawn test engine")
     }

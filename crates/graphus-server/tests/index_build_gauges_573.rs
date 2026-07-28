@@ -51,6 +51,7 @@ fn threaded_engine(metrics: Arc<Metrics>) -> Engine {
         2,
         metrics,
         clock,
+        std::sync::Arc::new(graphus_server::txn_registry::TransactionRegistry::new()),
     )
     .expect("spawn threaded engine")
 }

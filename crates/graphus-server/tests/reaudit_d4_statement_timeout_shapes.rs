@@ -70,6 +70,7 @@ fn engine_with_timeout(timeout: Option<Duration>) -> Engine {
         None,
         // No egress-stall ceiling here (rmp #591): this gate exercises per-statement-timeout shapes.
         None,
+        std::sync::Arc::new(graphus_server::txn_registry::TransactionRegistry::new()),
     )
     .expect("spawn threaded engine")
 }

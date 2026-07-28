@@ -305,10 +305,15 @@ impl EngineHandle {
     pub async fn constraint_ddl(
         &self,
         command: ConstraintCommand,
+        principal: Option<String>,
     ) -> Result<IndexDdlReply, GraphusError> {
         let (reply, rx) = reply_channel();
-        self.submit(EngineCommand::ConstraintDdl { command, reply })
-            .await?;
+        self.submit(EngineCommand::ConstraintDdl {
+            command,
+            principal,
+            reply,
+        })
+        .await?;
         recv_async(rx).await?
     }
 
@@ -505,9 +510,14 @@ impl EngineHandle {
     pub fn constraint_ddl_blocking(
         &self,
         command: ConstraintCommand,
+        principal: Option<String>,
     ) -> Result<IndexDdlReply, GraphusError> {
         let (reply, rx) = reply_channel();
-        self.submit_blocking(EngineCommand::ConstraintDdl { command, reply })?;
+        self.submit_blocking(EngineCommand::ConstraintDdl {
+            command,
+            principal,
+            reply,
+        })?;
         recv_blocking(rx)?
     }
 

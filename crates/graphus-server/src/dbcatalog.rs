@@ -518,6 +518,19 @@ pub struct EngineParams {
     /// deterministic [`crate::engine::LocalEngine`] uses an unbounded egress and never dispatches
     /// off-thread, so this has no effect there (DST stays wall-clock-free and deterministic).
     pub egress_stall_timeout: Option<std::time::Duration>,
+    /// The server-wide live-transaction registry (`rmp` #637/#903), shared by both connectivity seams
+    /// and now by every engine thread. The engine registers its own validating `CREATE CONSTRAINT`
+    /// transactions in it, so schema work that reads user data is visible to `SHOW TRANSACTIONS` while
+    /// it runs and can be stopped with `TERMINATE TRANSACTIONS`.
+    ///
+    /// It rides on [`EngineParams`] rather than on the boot path alone because engines are also created
+    /// at **runtime** — `CREATE DATABASE` and `START DATABASE` both spawn one — and every such engine
+    /// must join the same server-wide view. A per-engine registry would make `SHOW TRANSACTIONS` report
+    /// a different set depending on which database an operator happened to be connected to.
+    ///
+    /// Not an [`Option`]: an engine without a registry would silently lose that visibility, which is
+    /// exactly the failure this field exists to prevent, so the type system requires one.
+    pub transactions: std::sync::Arc<crate::txn_registry::TransactionRegistry>,
 }
 
 impl std::fmt::Debug for EngineParams {
@@ -538,6 +551,7 @@ impl std::fmt::Debug for EngineParams {
             .field("statement_timeout", &self.statement_timeout)
             .field("max_transaction_age", &self.max_transaction_age)
             .field("egress_stall_timeout", &self.egress_stall_timeout)
+            .field("live_transactions", &self.transactions.len())
             .finish()
     }
 }
@@ -549,7 +563,10 @@ impl EngineParams {
     /// # Errors
     /// [`GraphusError`] (mapped to [`CatalogError::Engine`] by the caller) if encryption is enabled
     /// but the key file cannot be read or contains invalid key material.
-    pub fn from_config(config: &ServerConfig) -> Result<Self, GraphusError> {
+    pub fn from_config(
+        config: &ServerConfig,
+        transactions: std::sync::Arc<crate::txn_registry::TransactionRegistry>,
+    ) -> Result<Self, GraphusError> {
         let master_key = match &config.encryption.key_path {
             Some(path) => Some(MasterKey::load_from_file(path)?),
             None => None,
@@ -595,6 +612,7 @@ impl EngineParams {
             statement_timeout: config.timing.statement_timeout(),
             max_transaction_age: config.timing.max_transaction_age(),
             egress_stall_timeout: config.timing.egress_stall_timeout(),
+            transactions,
         })
     }
 }
@@ -973,6 +991,7 @@ fn spawn_db_engine(
         params.statement_timeout,
         params.max_transaction_age,
         params.egress_stall_timeout,
+        std::sync::Arc::clone(&params.transactions),
     )
 }
 
@@ -1232,8 +1251,13 @@ impl DatabaseCatalog {
     /// # Errors
     /// [`CatalogError`] if the default name is invalid or the durable catalog cannot be loaded
     /// (a malformed file fails closed — module docs).
-    pub fn load(config: &ServerConfig, metrics: Arc<Metrics>) -> Result<Self, CatalogError> {
-        let params = EngineParams::from_config(config).map_err(CatalogError::Engine)?;
+    pub fn load(
+        config: &ServerConfig,
+        metrics: Arc<Metrics>,
+        transactions: std::sync::Arc<crate::txn_registry::TransactionRegistry>,
+    ) -> Result<Self, CatalogError> {
+        let params =
+            EngineParams::from_config(config, transactions).map_err(CatalogError::Engine)?;
         Self::open(
             config.store_path.clone(),
             &config.default_database,
@@ -2871,6 +2895,7 @@ mod tests {
             statement_timeout: None,
             max_transaction_age: None,
             egress_stall_timeout: None,
+            transactions: std::sync::Arc::new(crate::txn_registry::TransactionRegistry::new()),
         }
     }
 

@@ -65,6 +65,7 @@ fn engine_with_timeout(statement_timeout: Option<Duration>) -> Engine {
         // bound on a stalled reader; the egress-stall ceiling has its own dedicated gate
         // (`egress_stall_timeout.rs`), driving the `statement_timeout = None` case this file does not.
         None,
+        std::sync::Arc::new(graphus_server::txn_registry::TransactionRegistry::new()),
     )
     .expect("spawn threaded engine")
 }

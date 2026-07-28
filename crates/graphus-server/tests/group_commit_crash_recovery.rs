@@ -310,6 +310,7 @@ fn spawn_shared_engine(sink: SharedGatedSink, device: SharedDevice) -> Engine {
         2,
         metrics,
         clock,
+        std::sync::Arc::new(graphus_server::txn_registry::TransactionRegistry::new()),
     )
     .expect("spawn shared-store engine")
 }
