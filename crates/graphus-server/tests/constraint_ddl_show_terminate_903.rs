@@ -8,9 +8,11 @@
 //! * **Audit.** The validation walk reads every entity carrying the covered token, including the
 //!   property values it compares. Schema work that reads user data was the one class of database
 //!   activity an administrator could not observe while it happened.
-//! * **Availability.** The walk is O(entities carrying the token) — and, for a uniqueness constraint,
-//!   quadratic in the number of covered values — so a `CREATE CONSTRAINT` on a large label is a
-//!   realistic runaway an operator needs to be able to kill.
+//! * **Availability.** The walk is O(entities carrying the token) — one store read and one property
+//!   resolution each — so a `CREATE CONSTRAINT` on a large label is a realistic runaway an operator
+//!   needs to be able to kill. (It was additionally *quadratic* in the covered values until `rmp` task
+//!   #956 replaced the duplicate search's linear scan with a hash-bucketed set; killability is what
+//!   makes the linear walk tolerable, and it is what made the quadratic one survivable.)
 //!
 //! These gates drive the **real threaded engine** with a shared
 //! [`TransactionRegistry`](graphus_server::txn_registry::TransactionRegistry) — the same instance a
@@ -61,9 +63,16 @@ use graphus_wal::{MemLogSink, WalManager};
 /// slower still.
 const APPEAR_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Nodes seeded under the covered label. Sized so the uniqueness walk — which compares every value
-/// against every value already seen — runs long enough that a concurrent operator reliably observes
-/// it, while keeping the whole gate well inside a normal test budget.
+/// Nodes seeded under the covered label. Sized so the uniqueness walk — one store read plus one
+/// property resolution per node, and one cancellation poll — runs long enough that a concurrent
+/// operator polling every millisecond reliably observes it, while keeping the whole gate well inside a
+/// normal test budget.
+///
+/// The margin used to come for free from the walk being quadratic; since `rmp` task #956 it comes from
+/// the per-node work alone, which is why the count stays generous rather than tracking the (now much
+/// shorter) wall time. Only the *termination* gate below admits either side of its race; the listing
+/// gate must genuinely observe the DDL in flight, so this count is what buys it a window many
+/// thousands of poll intervals wide.
 const SEEDED_NODES: usize = 20_000;
 
 /// Spawns a threaded engine sharing `transactions`, exactly as the server does.

@@ -846,6 +846,129 @@ fn tuples_equal(a: &[Value], b: &[Value]) -> bool {
             .all(|(x, y)| crate::equality::equals(x, y).is_true())
 }
 
+/// The covered value tuples a uniqueness walk has already inspected, indexed so that deciding whether
+/// the next entity duplicates one of them costs **O(1) expected** instead of O(entities) (`rmp` task
+/// #956).
+///
+/// Both constraint walks used to keep the inspected values in a plain `Vec` and search it with
+/// [`tuples_equal`] per entity, which made `CREATE CONSTRAINT … IS UNIQUE` quadratic in the number of
+/// entities carrying the covered token: measured over distinct string values, 42.94 s for 100 000
+/// nodes against 0.381 s for 10 000 — a fitted exponent of 2.05 — where this set makes the same walk
+/// 1.159 s and 0.110 s, an exponent of 1.02
+/// (`graphus-cypher`'s `tests/constraint_validation_scaling_956.rs`). Since `rmp` task #903 the walk is
+/// a registered transaction holding a snapshot, so its duration is exactly the window in which it pins
+/// the GC watermark: a quadratic walk blocks reclamation on a live database for a quadratic time, which
+/// turns a latency defect into an availability one.
+///
+/// The construction is the one already used for this exact shape by `aggregate_rows` (`rmp` #314) and
+/// `hash_join_rows` (`rmp` #865): bucket by a digest, then resolve *inside* the bucket with the
+/// authoritative relation.
+///
+/// # The hash buckets; only [`tuples_equal`] decides
+///
+/// Cypher value equality is not Rust's `Eq`, so a `HashSet<Value>` would be a different — wrong —
+/// relation. `1 = 1.0` is `TRUE` across `INTEGER`/`FLOAT`, and above 2^53 the comparison is *exact*,
+/// so `9007199254740993 = 9007199254740992.0` is `FALSE` even though the first rounds to the second in
+/// `f64` (`rmp` task #894). The digest therefore only ever chooses a bucket; the accept/refuse decision
+/// stays with [`tuples_equal`], i.e. with [`crate::equality::equals`], exactly as before this task.
+///
+/// # Why equal values are guaranteed to share a bucket
+///
+/// The soundness obligation is one-directional and total: whenever `equals(a, b)` is `TRUE`, `a` and
+/// `b` **must** hash alike, or the walk could file a duplicate in a bucket where the probe never looks
+/// and accept a constraint the data violates. A collision in the other direction costs nothing — two
+/// unequal values sharing a bucket are separated by [`tuples_equal`].
+///
+/// [`crate::equivalence::hash_value`] discharges that obligation. It is documented consistent with
+/// [`crate::equivalence::equivalent`] (equivalent values hash alike), and definite equality is a
+/// *subset* of equivalence: the two relations differ only on `null` (`null ≡ null` but `null = null`
+/// is `NULL`) and on `NaN` (`NaN ≡ NaN` but `NaN = NaN` is `FALSE`) — neither of which is ever
+/// `Ternary::True`, so no pair `equals` calls equal escapes equivalence. Case by case that means
+/// `INTEGER` and `FLOAT` share one hash class (`1` and `1.0` collide, as they must), signed zeros are
+/// normalised, temporals hash through their derived `Hash` (consistent with the derived `PartialEq`
+/// their equality uses), points hash CRS-then-coordinates like [`graphus_core::Point::value_eq`]
+/// compares them, and lists/maps recurse — maps order-independently, matching a map equality that
+/// ignores key order. The `rmp` #894 pair lands in the *safe* direction: `hash_value` projects an
+/// integer through `f64` and is therefore deliberately **coarser** than equality above 2^53, so
+/// `9007199254740993` and `9007199254740992.0` share a bucket and are then correctly told apart by
+/// [`tuples_equal`]. Coarser is always sound here; only a *finer* hash could split an equal pair, which
+/// is why the digest must not be narrowed as the equality relation is refined.
+///
+/// # Hash-flooding resistance
+///
+/// The digest is `std`'s `DefaultHasher` — SipHash-1-3 with a per-process random seed — because the
+/// values being bucketed are client-derived property values (SEC-210 / CWE-407); a fixed-seed hasher
+/// over them would let an attacker seed a label whose values all collide and restore the quadratic
+/// walk on demand. The outer map is an [`rustc_hash::FxHashMap`] because its key is that digest, which
+/// is already a SipHash output — re-hashing it under SipHash would be pure waste. This is the same
+/// split `group_key_hash` makes, and for the same reason. The tuple length is mixed in first, so a
+/// 1-tuple and a 2-tuple cannot collide trivially.
+///
+/// # The one residual, and why it is bounded
+///
+/// The numeric coarsening above is the single input shape that can still stack a bucket, since a
+/// bucket is searched linearly: distinct `INTEGER`s that round to one double share a key, and no
+/// random seed separates them (they must share a key, or `1 = 1.0` would break). It is **bounded**
+/// rather than open-ended. A double in `[2^e, 2^(e+1))` has spacing `2^(e-52)`, and an `i64` reaches
+/// only `e ≤ 62`, so at most `2^10` = 1024 distinct integers can ever collapse onto one double. The
+/// worst case is therefore O(entities × 1024) comparisons — still linear in the corpus, with a
+/// constant an attacker cannot raise — and it is reachable only by values deliberately packed above
+/// 2^53. Every other value class goes through the seeded SipHash, where buckets cannot be stacked at
+/// all.
+struct SeenTuples {
+    /// Every recorded tuple, in first-seen order.
+    tuples: Vec<Vec<Value>>,
+    /// Digest → the ordinals in `tuples` whose tuple hashes there. Normally singleton.
+    index: rustc_hash::FxHashMap<u64, Vec<usize>>,
+}
+
+impl SeenTuples {
+    /// An empty set.
+    fn new() -> Self {
+        Self {
+            tuples: Vec::new(),
+            index: rustc_hash::FxHashMap::default(),
+        }
+    }
+
+    /// The bucketing digest of `tuple` (see the type docs for the invariant it must satisfy).
+    ///
+    /// Deliberately *not* required to agree with any other digest in the codebase — it is a private
+    /// bucketing device of this set, so it can hash [`Value`]s directly instead of wrapping each in a
+    /// `RowValue` the way `group_key_hash` must.
+    fn digest(tuple: &[Value]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        tuple.len().hash(&mut h);
+        for v in tuple {
+            crate::equivalence::hash_value(v, &mut h);
+        }
+        h.finish()
+    }
+
+    /// Whether a tuple **Cypher-equal** to `tuple` has already been recorded.
+    ///
+    /// Probes one bucket and confirms every candidate in it with [`tuples_equal`], so the answer is
+    /// identical to the linear scan this replaced — only the number of comparisons differs.
+    fn contains_equal(&self, tuple: &[Value]) -> bool {
+        self.index
+            .get(&Self::digest(tuple))
+            .is_some_and(|bucket| bucket.iter().any(|&i| tuples_equal(&self.tuples[i], tuple)))
+    }
+
+    /// Records `tuple` as seen. Call only after [`contains_equal`](Self::contains_equal) reported
+    /// `false`; recording a duplicate would not corrupt the set, but the walk refuses the constraint
+    /// before it can happen.
+    fn record(&mut self, tuple: Vec<Value>) {
+        let digest = Self::digest(&tuple);
+        self.index
+            .entry(digest)
+            .or_default()
+            .push(self.tuples.len());
+        self.tuples.push(tuple);
+    }
+}
+
 /// A declared constraint resolved to human-readable names, for the `SHOW CONSTRAINTS` surface
 /// (`rmp` tasks #99, #100). Carries the covered label, the **whole** covered property tuple (one for a
 /// non-composite kind, several for a node key), the [`ConstraintKind`] and (for a property-type
@@ -7630,9 +7753,9 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// # Cost
     ///
     /// One marker per inspected value, so O(entities carrying the token) markers held until the DDL is
-    /// pruned from the tracker. That is the same order as the walk's own pre-existing `seen` /
-    /// `seen_tuples` vectors, which already retain every value for the duplicate search, so it does not
-    /// change the memory profile of a `CREATE CONSTRAINT`.
+    /// pruned from the tracker. That is the same order as the walk's own [`SeenTuples`] set, which
+    /// already retains every value for the duplicate search, so it does not change the memory profile
+    /// of a `CREATE CONSTRAINT`.
     ///
     /// # Encoding
     ///
@@ -7732,6 +7855,15 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// itself see the row that makes its write a duplicate — closes an rw-edge into the DDL and is
     /// aborted by the pivot rule instead of committing a violation.
     ///
+    /// # Cost, and why it is an availability property (`rmp` task #956)
+    ///
+    /// One store read and one property-chain resolution per node carrying the label, plus — for the
+    /// uniqueness kinds — an O(1) expected duplicate probe against [`SeenTuples`]. The probe used to be
+    /// a linear scan of every value already inspected, making the walk quadratic in the covered
+    /// entities. Because the walk holds this transaction's snapshot from `begin` to `commit`
+    /// (`rmp` task #903), its duration *is* the window in which it pins the GC watermark, so a
+    /// quadratic walk suspended reclamation on a live database for a quadratic time.
+    ///
     /// # Errors
     /// Returns a [`ConstraintViolation`]-wrapped runtime error naming the first offending node /
     /// duplicate value (uniqueness) or the first node missing the property (existence). A store-read
@@ -7750,10 +7882,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ) -> Result<()> {
         self.note_constraint_token_read(ctx);
         let node_ids = self.store.borrow_mut().scan_node_ids()?;
-        // For single-property uniqueness: remember the values seen to detect a duplicate.
-        let mut seen: Vec<(Value, u64)> = Vec::new();
-        // For composite node-key uniqueness: remember the full tuples seen.
-        let mut seen_tuples: Vec<Vec<Value>> = Vec::new();
+        // The covered values seen so far, for the uniqueness kinds. One indexed set serves the
+        // single-property and the composite kinds alike — a single-property value is simply a 1-tuple —
+        // so the two can no longer drift apart, and neither is quadratic (`rmp` task #956).
+        let mut seen = SeenTuples::new();
         for id in node_ids {
             // Cancellation is checked FIRST, before this node's record read (`rmp` task #903): the
             // check is one atomic load, the work it guards is a store read plus a property-chain walk,
@@ -7825,10 +7957,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     else {
                         continue;
                     };
-                    if seen
-                        .iter()
-                        .any(|(v, _)| crate::equality::equals(v, &value).is_true())
-                    {
+                    if seen.contains_equal(std::slice::from_ref(&value)) {
                         return Err(ConstraintViolation::Uniqueness {
                             name: name.to_owned(),
                             entity: ViolationEntity::Node,
@@ -7838,7 +7967,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                         }
                         .into_error());
                     }
-                    seen.push((value, id));
+                    seen.record(vec![value]);
                 }
                 ConstraintKind::Unique => {
                     // Composite uniqueness (`rmp` #651): no existence requirement — a null in any
@@ -7861,7 +7990,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     if !complete {
                         continue;
                     }
-                    if seen_tuples.iter().any(|seen| tuples_equal(seen, &tuple)) {
+                    if seen.contains_equal(&tuple) {
                         return Err(ConstraintViolation::UniquenessComposite {
                             name: name.to_owned(),
                             entity: ViolationEntity::Node,
@@ -7871,7 +8000,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                         }
                         .into_error());
                     }
-                    seen_tuples.push(tuple);
+                    seen.record(tuple);
                 }
                 ConstraintKind::NodeKey => {
                     // Existence half: every covered property must be present and non-null.
@@ -7899,7 +8028,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                         .into_error());
                     }
                     // Uniqueness half: the complete tuple must not have been seen before.
-                    if seen_tuples.iter().any(|seen| tuples_equal(seen, &tuple)) {
+                    if seen.contains_equal(&tuple) {
                         return Err(ConstraintViolation::NodeKeyDuplicate {
                             name: name.to_owned(),
                             entity: ViolationEntity::Node,
@@ -7909,7 +8038,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                         }
                         .into_error());
                     }
-                    seen_tuples.push(tuple);
+                    seen.record(tuple);
                 }
                 ConstraintKind::PropertyType => {
                     // Only a present, non-null value is type-checked (a missing/null value is allowed —
@@ -8055,6 +8184,9 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// [`note_constraint_value_read`](Self::note_constraint_value_read) for why `RelType(T)` alone
     /// cannot pair with a concurrent `SET r.p = v`.
     ///
+    /// Its duplicate probe is the same O(1)-expected [`SeenTuples`] set the node walk uses, for the
+    /// reasons given there (`rmp` task #956).
+    ///
     /// # Errors
     /// Returns a [`ConstraintViolation`]-wrapped runtime error (with `entity: Relationship`) naming the
     /// first offending relationship / duplicate value.
@@ -8072,10 +8204,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ) -> Result<()> {
         self.note_constraint_token_read(ctx);
         let rel_ids = self.store.borrow().scan_rel_ids()?;
-        // Single-property uniqueness: values seen so far, to detect a duplicate.
-        let mut seen: Vec<(Value, u64)> = Vec::new();
-        // Composite key uniqueness: full tuples seen so far.
-        let mut seen_tuples: Vec<Vec<Value>> = Vec::new();
+        // The covered values seen so far, for the uniqueness kinds — the relationship twin of the node
+        // walk's set, and the same one indexed structure for the single-property and composite kinds
+        // alike (`rmp` task #956).
+        let mut seen = SeenTuples::new();
         for id in rel_ids {
             // Polled per relationship, for the reason given on the node walk (`rmp` task #903).
             Self::check_constraint_ddl_cancelled(name, ctx.cancel)?;
@@ -8113,10 +8245,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     else {
                         continue;
                     };
-                    if seen
-                        .iter()
-                        .any(|(v, _)| crate::equality::equals(v, &value).is_true())
-                    {
+                    if seen.contains_equal(std::slice::from_ref(&value)) {
                         return Err(ConstraintViolation::Uniqueness {
                             name: name.to_owned(),
                             entity: ViolationEntity::Relationship,
@@ -8126,7 +8255,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                         }
                         .into_error());
                     }
-                    seen.push((value, id));
+                    seen.record(vec![value]);
                 }
                 ConstraintKind::RelUnique => {
                     // Composite relationship uniqueness (`rmp` #651): no existence requirement — a null
@@ -8149,7 +8278,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     if !complete {
                         continue;
                     }
-                    if seen_tuples.iter().any(|seen| tuples_equal(seen, &tuple)) {
+                    if seen.contains_equal(&tuple) {
                         return Err(ConstraintViolation::UniquenessComposite {
                             name: name.to_owned(),
                             entity: ViolationEntity::Relationship,
@@ -8159,7 +8288,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                         }
                         .into_error());
                     }
-                    seen_tuples.push(tuple);
+                    seen.record(tuple);
                 }
                 ConstraintKind::RelKey => {
                     // Existence half: every covered property must be present and non-null.
@@ -8187,7 +8316,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                         .into_error());
                     }
                     // Uniqueness half: the complete tuple must not have been seen before.
-                    if seen_tuples.iter().any(|seen| tuples_equal(seen, &tuple)) {
+                    if seen.contains_equal(&tuple) {
                         return Err(ConstraintViolation::NodeKeyDuplicate {
                             name: name.to_owned(),
                             entity: ViolationEntity::Relationship,
@@ -8197,7 +8326,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                         }
                         .into_error());
                     }
-                    seen_tuples.push(tuple);
+                    seen.record(tuple);
                 }
                 ConstraintKind::RelPropertyType => {
                     let Some(value) = self
