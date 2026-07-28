@@ -181,6 +181,7 @@ fn spawn_dwb_engine(
         2,
         metrics,
         clock,
+        std::sync::Arc::new(graphus_server::txn_registry::TransactionRegistry::new()),
     )
     .expect("spawn DWB-protected engine")
 }

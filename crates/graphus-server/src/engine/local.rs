@@ -117,6 +117,13 @@ pub struct LocalEngine<D: BlockDevice, S: LogSink> {
     /// This inline engine's own reclamation-degraded flag (`rmp` #394/#435), mirroring the threaded
     /// engine. Single-engine inline driver, so it gates only itself; present for determinism parity.
     maintenance_degraded: super::MaintenanceDegraded,
+    /// This inline engine's **own** live-transaction registry (`rmp` #637/#903), mirroring the
+    /// server-wide one the threaded engine is handed. The deterministic driver has no listeners and no
+    /// seams, so nothing else would ever construct one — yet the engine registers its validating
+    /// `CREATE CONSTRAINT` transactions in it, and a scenario needs somewhere to observe and terminate
+    /// them. Private per driver, so two `LocalEngine`s never see each other's transactions and a
+    /// scenario's ids are a pure function of what that scenario did.
+    transactions: Arc<crate::txn_registry::TransactionRegistry>,
     /// This inline engine's contribution to the (private) server-wide open-transaction gauge
     /// (`rmp` #418): published additively, exactly as the threaded loop does.
     active_txns: super::ActiveTxnGauge,
@@ -150,6 +157,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             plan_cache: super::exec::EnginePlanCache::new(),
             degraded: super::EngineDegraded::new(),
             maintenance_degraded: super::MaintenanceDegraded::new(),
+            transactions: Arc::new(crate::txn_registry::TransactionRegistry::new()),
             active_txns: super::ActiveTxnGauge::new(Arc::clone(&metrics), Arc::clone(&db_name)),
             db_name,
             metrics,
@@ -202,6 +210,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             None,
             &mut self.loading_session,
             &mut commit_batch,
+            &self.transactions,
         );
         // Harden + ack the (at most one) PREPAREd commit immediately: one command in, one durable commit
         // out, exactly as before group commit (`rmp` #528). A no-op when the command was not a durable
@@ -339,6 +348,16 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     ///
     /// # Errors
     /// [`GraphusError`] if the engine has been shut down.
+    /// Whether this inline engine has been flagged **degraded** (`rmp` #409/#414/#955): a
+    /// statement-recovery double-panic, or a rollback whose durable undo failed with the transaction
+    /// left open, has broken a deep in-memory invariant, so the engine refuses further work pending a
+    /// controlled restart. The inline mirror of the threaded engine's `/health/ready` signal, and the
+    /// witness a deterministic scenario asserts on.
+    #[must_use]
+    pub fn is_degraded(&self) -> bool {
+        self.degraded.is_degraded()
+    }
+
     pub fn status_open_txns(&mut self) -> Result<usize> {
         let (reply, rx) = reply_channel();
         self.dispatch(EngineCommand::Status { reply });
@@ -356,13 +375,29 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         rx.recv().map_err(|_| gone())?
     }
 
+    /// This driver's live-transaction registry (`rmp` #637/#903) — the same one the engine registers
+    /// its validating `CREATE CONSTRAINT` transactions in.
+    ///
+    /// Exposed so a deterministic scenario can do what an operator does: list the live transactions
+    /// (`SHOW TRANSACTIONS`) and stop one (`TERMINATE TRANSACTIONS`). It is per-driver, so the ids a
+    /// scenario observes depend only on what that scenario did.
+    #[must_use]
+    pub fn transactions(&self) -> &Arc<crate::txn_registry::TransactionRegistry> {
+        &self.transactions
+    }
+
     /// Executes a constraint-DDL statement (`CREATE/DROP CONSTRAINT`, `SHOW CONSTRAINTS`).
     ///
     /// # Errors
     /// [`GraphusError`] if existing data violates a `CREATE`, or a storage fault.
     pub fn constraint_ddl(&mut self, command: ConstraintCommand) -> Result<IndexDdlReply> {
         let (reply, rx) = reply_channel();
-        self.dispatch(EngineCommand::ConstraintDdl { command, reply });
+        self.dispatch(EngineCommand::ConstraintDdl {
+            command,
+            // The deterministic driver has no authenticated session behind it.
+            principal: None,
+            reply,
+        });
         rx.recv().map_err(|_| gone())?
     }
 

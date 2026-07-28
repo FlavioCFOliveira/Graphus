@@ -137,6 +137,14 @@ it (another principal targeting the same id gets a `404`).
 An idle open transaction is swept after a timeout, and the number a single principal may
 hold open is bounded (excess `begin`s get a retriable `429`).
 
+A transaction an administrator has stopped with `TERMINATE TRANSACTIONS` is refused at **every**
+one of these endpoints — the next run, the keep-alive (`POST /db/{db}/tx/{id}` with an empty
+`statements` list), and the commit — with a `400` problem+json whose `code` is
+`Neo.ClientError.Statement.ArgumentError` and whose `detail` reads *"the transaction has been
+terminated by an administrator (TERMINATE TRANSACTIONS)"*. It is **not** retriable. `DELETE` still
+succeeds, because rolling the transaction back is what the termination asked for. Bolt answers with
+the identical code and message; see [transactions.md](transactions.md).
+
 ---
 
 ## 4. Request and response shapes

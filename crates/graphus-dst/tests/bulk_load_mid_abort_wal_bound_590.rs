@@ -291,8 +291,9 @@ fn mid_abort_reopen_recovers_every_committed_batch() {
         .expect("nodes prop key recovered");
     let mut sentinel_nodes: Option<i64> = None;
     for (_pid, prop) in recovered
-        .node_properties(sentinel_id)
+        .superset_scan_node_properties(sentinel_id)
         .expect("walk sentinel property chain")
+        .into_every_version()
     {
         if prop.key == s_nodes && prop.mvcc.in_use() && prop.mvcc.expired_ts == 0 {
             let v = recovered

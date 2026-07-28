@@ -132,6 +132,7 @@ pub async fn start_all(
     metrics: Arc<Metrics>,
     shutdown: ShutdownCoordinator,
     readiness: crate::observability::Readiness,
+    transactions: Arc<crate::txn_registry::TransactionRegistry>,
 ) -> Result<Listeners, String> {
     let tls_acceptor = tls.map(TlsAcceptor::from);
 
@@ -192,10 +193,12 @@ pub async fn start_all(
     // The shared database-targeting + admin-statement context (rmp #84/#92). One per server: both
     // Bolt loops clone it per connection, the REST adapter holds one. It carries the live
     // `SecurityCatalog` (admin authorization + security-command execution + persistence).
-    // The server-wide live explicit-transaction registry (rmp #637), shared by both connectivity
-    // seams: each registers its managed (BEGIN…COMMIT) transactions here so `SHOW TRANSACTIONS` /
-    // `TERMINATE TRANSACTIONS` see one cross-seam view.
-    let transactions = Arc::new(crate::txn_registry::TransactionRegistry::new());
+    //
+    // The live-transaction registry (rmp #637/#903) is passed IN rather than built here: it is shared
+    // by both connectivity seams AND by every engine thread, and the engines are constructed before
+    // this function is called, so it must already exist by the time we get here. `Server::start` owns
+    // its construction (see the `1c)` step there) and hands the same `Arc` to the catalog and to us —
+    // one server-wide view, whichever seam or database an operator is connected to.
     let context = AdminContext::new(
         Arc::clone(&catalog),
         Arc::clone(&security),

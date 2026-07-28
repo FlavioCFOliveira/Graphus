@@ -276,7 +276,8 @@ fn properties_chain_head_to_tail() {
     let p2 = s.add_node_property(txn, a, age, 2, 42).unwrap();
     s.commit(txn).unwrap();
 
-    let props = s.node_properties(a).unwrap();
+    let props = s.superset_scan_node_properties(a).unwrap();
+    let props = props.every_version();
     // Prepend order: p2 (age) then p1 (name).
     assert_eq!(props.len(), 2);
     assert_eq!(props[0].0, p2);

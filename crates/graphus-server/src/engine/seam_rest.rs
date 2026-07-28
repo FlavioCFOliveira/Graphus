@@ -59,6 +59,7 @@ use super::command::{AccessMode, constraint_ddl_summary, index_ddl_summary};
 use super::constraint_show;
 use super::handle::AdmissionPermit;
 use super::index_show;
+use super::managed::ManagedTx;
 use super::privileges::EffectivePrivileges;
 use super::stream::{RowReceiver, SummarySink};
 use super::{EngineHandle, RunSummary, TxTicket};
@@ -136,6 +137,31 @@ impl RestEngineAdapter {
         self.txns().get(&tx.0).cloned().ok_or_else(|| {
             GraphusError::Transaction(format!("unknown transaction handle {}", tx.0))
         })
+    }
+
+    /// Drops the table entry for `tx` — the seam-side bookkeeping a transaction the engine has already
+    /// finished must not outlive (`rmp` task #957).
+    ///
+    /// Removing the entry is what eventually releases the admission permit and deregisters the
+    /// live-registry entry: both are held behind an `Arc` shared with any in-flight `run` clone, so
+    /// they are freed when the **last** clone drops, not necessarily here. The public handle is spent
+    /// either way — a later `run`/`commit` against it reports the unknown-handle error.
+    fn discard(&self, tx: TxHandle) {
+        self.txns().remove(&tx.0);
+    }
+
+    /// The shared resumption guard (`rmp` task #957) plus this seam's own cleanup: if `open` has been
+    /// terminated by `TERMINATE TRANSACTIONS` (rmp #637), the engine transaction is rolled back, the
+    /// table entry is dropped, and the non-retryable terminated error is returned.
+    ///
+    /// The rule itself lives in [`ManagedTx`], shared verbatim with the Bolt seam — this wrapper only
+    /// adds the table bookkeeping the Bolt seam does not have.
+    fn resume(&self, tx: TxHandle, open: &OpenTx) -> Result<(), GraphusError> {
+        if let Err(e) = ManagedTx::new(&open.handle, open.ticket, &open.txn).resume() {
+            self.discard(tx);
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Emits a config-gated `data_change` audit event (rmp #70) for a **write** statement on REST.
@@ -315,7 +341,7 @@ impl RestEngineAdapter {
                 // Keep the command shape for the post-outcome summary (counters depend on
                 // `reply.mutated`) and to detect the `SHOW CONSTRAINTS` tail.
                 let summary_cmd = cmd.clone();
-                let outcome = handle.constraint_ddl_blocking(cmd);
+                let outcome = handle.constraint_ddl_blocking(cmd, Some(principal.to_owned()));
                 if mutating {
                     self.context.audit().record(
                         AuditEvent::new(
@@ -593,15 +619,10 @@ impl RestEngine for RestEngineAdapter {
     ) -> Result<Self::Stream, GraphusError> {
         let open = self.lookup(tx)?;
 
-        // If this transaction was terminated by `TERMINATE TRANSACTIONS` (rmp #637), fail fast:
-        // remove it from the table (releasing its permit + GC pin as the entry drops), roll it back,
-        // and return the non-retryable terminated error.
-        if open.txn.is_terminated() {
-            if let Some(removed) = self.txns().remove(&tx.0) {
-                let _ = removed.handle.rollback_blocking(removed.ticket);
-            }
-            return Err(crate::txn_registry::terminated_error());
-        }
+        // The resumption guard (`rmp` task #957): a transaction terminated by `TERMINATE TRANSACTIONS`
+        // (rmp #637) is rolled back here, its table entry dropped, and the statement fails with the
+        // non-retryable terminated error — the same rule, from the same code, as the Bolt seam.
+        self.resume(tx, &open)?;
         // Record the statement as this transaction's current query for `SHOW TRANSACTIONS`.
         open.txn.set_current_query(query);
 
@@ -751,12 +772,27 @@ impl RestEngine for RestEngineAdapter {
         })
     }
 
+    fn ensure_live(&self, tx: TxHandle) -> Result<(), GraphusError> {
+        // An unknown handle is not this guard's concern: `run`/`commit` already report it, and the
+        // caller (the keep-alive) has just resolved the id through its own registry. Reporting only
+        // termination here keeps the guard's meaning exact.
+        let Ok(open) = self.lookup(tx) else {
+            return Ok(());
+        };
+        self.resume(tx, &open)
+    }
+
     fn commit(&self, tx: TxHandle) -> Result<RestRunSummary, GraphusError> {
         // Remove first: whatever the engine answers, the public handle is spent.
         let open = self.txns().remove(&tx.0).ok_or_else(|| {
             GraphusError::Transaction(format!("unknown transaction handle {}", tx.0))
         })?;
-        let summary = open.handle.commit_blocking(open.ticket)?;
+        // Through the shared guard (`rmp` task #957): a transaction terminated by
+        // `TERMINATE TRANSACTIONS` (rmp #637) is rolled back and fails with the non-retryable
+        // terminated error instead of committing. This is the check the REST commit path was missing
+        // while the Bolt one had it — an operator was told the transaction had been stopped and it
+        // committed anyway. The rule now comes from the same code on both interfaces.
+        let summary = ManagedTx::new(&open.handle, open.ticket, &open.txn).commit()?;
         Ok(to_rest_summary(summary))
     }
 
@@ -766,6 +802,8 @@ impl RestEngine for RestEngineAdapter {
         let Some(open) = self.txns().remove(&tx.0) else {
             return Ok(());
         };
-        open.handle.rollback_blocking(open.ticket)
+        // Unconditional, terminated or not — rolling a terminated transaction back is exactly what the
+        // operator asked for (see [`super::managed`]).
+        ManagedTx::new(&open.handle, open.ticket, &open.txn).rollback()
     }
 }

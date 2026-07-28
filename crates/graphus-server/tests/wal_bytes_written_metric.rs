@@ -159,6 +159,7 @@ fn spawn(dir: &Path, metrics: Arc<Metrics>) -> Engine {
         1,
         metrics,
         clock,
+        std::sync::Arc::new(graphus_server::txn_registry::TransactionRegistry::new()),
     )
     .expect("spawn file-backed engine")
 }
@@ -185,6 +186,7 @@ fn reopen(dir: &Path, metrics: Arc<Metrics>) -> Engine {
         1,
         metrics,
         clock,
+        std::sync::Arc::new(graphus_server::txn_registry::TransactionRegistry::new()),
     )
     .expect("reopen file-backed engine")
 }

@@ -32,7 +32,11 @@ fn fresh() -> Store {
 /// read path does: walk the chain, keep the first record of `key` that `is_visible` to `reader`.
 fn visible_value(store: &Store, node: u64, key: u32, reader: Snapshot) -> Option<i64> {
     let registry: CommitRegistry = store.commit_registry().clone();
-    for (_pid, prop) in store.node_properties(node).expect("walk property chain") {
+    for (_pid, prop) in store
+        .superset_scan_node_properties(node)
+        .expect("walk property chain")
+        .every_version()
+    {
         if prop.key != key {
             continue;
         }

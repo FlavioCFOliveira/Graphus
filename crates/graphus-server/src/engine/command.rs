@@ -721,6 +721,11 @@ pub enum EngineCommand {
     ConstraintDdl {
         /// The constraint-DDL statement to execute.
         command: ConstraintCommand,
+        /// The authenticated principal the seam authorised this DDL for, or [`None`] on the
+        /// unauthenticated / deterministic paths (`rmp` task #903). Carried so the engine's
+        /// `SHOW TRANSACTIONS` entry for a validating `CREATE CONSTRAINT` names the user who asked for
+        /// the schema change, even though the transaction itself belongs to the server.
+        principal: Option<String>,
         /// Reply channel: the buffered fields + rows (reusing [`IndexDdlReply`]), or an engine error.
         reply: Reply<Result<IndexDdlReply, GraphusError>>,
     },

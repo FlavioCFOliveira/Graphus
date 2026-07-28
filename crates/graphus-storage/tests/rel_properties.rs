@@ -44,7 +44,7 @@ fn rel_between(s: &mut Store, txn: TxnId) -> u64 {
 
 /// The value bound to `key` in `rel`'s live property set, or `None`.
 fn rel_val(s: &mut Store, rel: u64, key: u32) -> Option<Value> {
-    s.rel_property_values(rel)
+    s.superset_scan_rel_property_values(rel)
         .unwrap()
         .into_iter()
         .find(|(_, k, _)| *k == key)
@@ -193,7 +193,7 @@ fn removing_an_overflow_rel_value_frees_its_chain() {
         0,
         "removal frees the chain at GC"
     );
-    assert!(s.rel_property_values(r).unwrap().is_empty());
+    assert!(s.superset_scan_rel_property_values(r).unwrap().is_empty());
 }
 
 // =================================================================================================
@@ -225,9 +225,10 @@ fn rel_properties_are_independent_across_relationships() {
         Some(Value::String("hello".to_owned()))
     );
 
-    // Removing r1's property tombstones it (per-value MVCC, `rmp` task #50); it stays in-use (and so
-    // is still returned by `rel_property_values`, which the reader layer would filter by visibility)
-    // until GC. Commit + GC reclaims it, after which r1 has no value and r2 is untouched.
+    // Removing r1's property tombstones it (per-value MVCC, `rmp` task #50); it stays in-use (and
+    // so is still returned by `superset_scan_rel_property_values`, which the reader layer would
+    // filter by visibility) until GC. Commit + GC reclaims it, after which r1 has no value and r2
+    // is untouched.
     assert!(s.remove_rel_property_value(txn, r1, k).unwrap());
     s.commit(txn).unwrap();
     gc_pass(&mut s, TxnId(2));
@@ -266,7 +267,7 @@ fn overwriting_an_overflow_rel_value_is_newest_wins_and_frees_old_chain() {
     );
 
     // The read returns the new value, and only one property record for the key remains (no shadow).
-    let vals = s.rel_property_values(r).unwrap();
+    let vals = s.superset_scan_rel_property_values(r).unwrap();
     let for_key: Vec<_> = vals.iter().filter(|(_, key, _)| *key == k).collect();
     assert_eq!(
         for_key.len(),
@@ -378,7 +379,7 @@ fn clear_rel_properties_frees_every_overflow_chain() {
         0,
         "every overflow chain is freed at GC"
     );
-    assert!(s.rel_property_values(r).unwrap().is_empty());
+    assert!(s.superset_scan_rel_property_values(r).unwrap().is_empty());
     // The relationship itself survives a property clear + GC (only its property chain is reclaimed).
     assert!(s.rel(r).unwrap().mvcc.in_use());
 }
@@ -522,6 +523,6 @@ fn non_persistable_rel_value_errors_before_any_mutation() {
         0,
         "no orphan blocks on a failed encode"
     );
-    assert!(s.rel_property_values(r).unwrap().is_empty());
+    assert!(s.superset_scan_rel_property_values(r).unwrap().is_empty());
     s.commit(txn).unwrap();
 }

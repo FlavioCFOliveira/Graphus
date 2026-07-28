@@ -22,6 +22,7 @@ how CI should schedule it.
 | 7 | Criterion micro-benchmark suites | `graphus-bench/benches/*`, `graphus-io/benches/loopback` | manual / perf job | minutes |
 | 8 | LDBC-SNB macro harness | `graphus-bench` (`bin/ldbc_snb`, `src/ldbc/`) | nightly / perf job | seconds (tiny) |
 | 9 | Examples suite — E2E, both modes | `examples/run-all.sh` via `scripts/examples-gate.sh` | every push | ~2–4 min |
+| 10 | Read-polarity census (superset / decision / conservative) | `graphus-cypher/tests/read_polarity_census.rs`, `graphus-storage/tests/scan_polarity_barrier.rs` | every push | < 1 s |
 
 ---
 
@@ -348,10 +349,61 @@ finding, not a test artefact, and no per-example verdict can see it.
 
 ---
 
+## 10. Read-polarity census — the rule for any new constraint or validation path (`rmp` #905)
+
+**What it is.** Every read of the record store returns raw physical state. Which *answer* the caller
+owes back is one of three (`04-technical-design.md` §5.3, and `graphus_storage::scan_polarity`):
+
+- **superset** — index population. The consumer re-checks each candidate against its own snapshot, and
+  a re-check can remove a candidate but never resurrect one, so a hole is unrecoverable.
+- **decision** — constraint validation. The verdict is written into the catalogue and nothing
+  re-checks it, so it must be exactly what the deciding snapshot sees.
+- **conservative** — a pruning structure (the zone map). It excludes an id range *before* any re-check
+  runs and nothing repairs it, so it may never narrow on unproven state.
+
+Reading raw is **correct** for the first and **wrong** for the second. That single confusion produced
+three CRITICAL defects (`rmp` #771, #902, #904), and in each of them a docstring asserted the wrong
+polarity and was believed.
+
+**Invocation:**
+
+```sh
+cargo test -p graphus-cypher --test read_polarity_census
+cargo test -p graphus-storage --test scan_polarity_barrier
+```
+
+**Expected:** green. Both files run in well under a second and read source text, so they cost nothing
+to keep on every push.
+
+**The checklist, for a reviewer or an author adding a constraint, a validation path, an index refill
+or any data-skipping structure:**
+
+1. **Name the polarity before writing the read.** Which of the three does this code owe? If the
+   answer is "it does not matter", the code is a decision path and the answer is *decision*.
+2. **A decision path takes a `Snapshot`.** Resolve values through `RecordStore::decision_scan_*`.
+   Handing it a raw chain does not compile — `DecidedProperties` has no other constructor — and
+   walking a raw chain inline is caught by gate 10.
+3. **A population or pruning path gates labels on `RecordStore::node_label_superset`,** never on
+   `node_labels`. The live word is a *subset* while an uncommitted `REMOVE n:L` is open.
+4. **If you must read raw somewhere new, classify it in the census** — in
+   `read_polarity_census.rs`'s module docs — **with the reason it is correct there.** An entry with
+   no justification is not an entry. The census also records the two shapes that sit outside the
+   three: the write path (which reads the image it has just written) and a memoization with a total
+   fallback (where a hole costs a decode, not a row).
+5. **Do not trust a docstring about polarity that you have not checked against the code.** That is
+   not a figure of speech: it is what happened three times.
+
+**When gate 10 fails**, the new code is not necessarily wrong. It means a polarity-sensitive read
+appeared or moved and nobody classified it. Classify it, then either fix the read or extend the
+census table with its justification.
+
+---
+
 ## Quick start
 
 ```sh
-# Fast gates only (build/clippy/fmt, anomaly, proptest, regression gate, LDBC, examples) — every push:
+# Fast gates only (build/clippy/fmt, anomaly, read-polarity census, proptest, regression gate,
+# LDBC, examples) — every push:
 scripts/verify.sh
 
 # Add the slow gates as needed:

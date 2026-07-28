@@ -132,6 +132,7 @@ fn create_engine(dir: &Path, hardens: Arc<AtomicU64>) -> Engine {
         2,
         metrics,
         clock,
+        std::sync::Arc::new(graphus_server::txn_registry::TransactionRegistry::new()),
     )
     .expect("spawn fresh file engine")
 }
@@ -158,6 +159,7 @@ fn reopen_engine(dir: &Path) -> Engine {
         2,
         metrics,
         clock,
+        std::sync::Arc::new(graphus_server::txn_registry::TransactionRegistry::new()),
     )
     .expect("reopen file engine")
 }

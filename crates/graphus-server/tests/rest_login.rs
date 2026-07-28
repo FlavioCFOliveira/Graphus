@@ -141,8 +141,14 @@ async fn boot(temp: &TempStore) -> Router {
     let auth: Arc<dyn AuthProvider> = Arc::new(LiveAuth::new(Arc::clone(&security)));
     let audit = AuditLog::open(&cfg.audit, &cfg.store_path).expect("open audit log");
 
-    let catalog =
-        Arc::new(DatabaseCatalog::load(&cfg, Arc::clone(&metrics)).expect("load db catalog"));
+    let catalog = Arc::new(
+        DatabaseCatalog::load(
+            &cfg,
+            Arc::clone(&metrics),
+            std::sync::Arc::new(graphus_server::txn_registry::TransactionRegistry::new()),
+        )
+        .expect("load db catalog"),
+    );
     let handle = catalog.start_default().await.expect("start default db");
 
     let context = AdminContext::new(

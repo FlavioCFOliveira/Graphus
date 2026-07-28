@@ -470,7 +470,9 @@ fn deferred_fsync_overlap_dropped_tail_is_a_genuine_oracle() {
             "correct recovery (tail dropped) must match the committed-or-nothing model"
         );
         // n0 has NO property — the un-synced batch was lost whole.
-        let props = recovered.node_properties(n0).expect("node_properties");
+        let props = recovered
+            .superset_scan_node_properties(n0)
+            .expect("superset_scan_node_properties");
         assert!(
             props.is_empty(),
             "the written-but-un-synced property must NOT survive a power-loss crash"

@@ -18,6 +18,22 @@
 //! - [`graphus_wal::WalManager`] — the ARIES log; mutations append redo/undo intra-page patches
 //!   and recovery replays them ([`recovery::recover_device`]).
 //!
+//! ## Read polarity (`rmp` task #905)
+//!
+//! Every read in this crate returns **raw physical state**: the slot's current contents, MVCC
+//! tombstones the GC has not reclaimed included, versions whose writer has not committed included,
+//! and — for labels, which are mutated in place — a word a rollback will change back. That is not a
+//! defect, it is the layer's contract; deciding what a version means belongs above it.
+//!
+//! What the caller owes back is one of **three** different answers, and using the wrong one is the
+//! single mistake behind `rmp` tasks #771, #902 and #904. [`scan_polarity`] states the three
+//! obligations, and separates the first two in the type system: a decision-grade read takes the
+//! deciding [`Snapshot`](graphus_txn::Snapshot) and returns a
+//! [`DecidedProperties`](scan_polarity::DecidedProperties) that has no other constructor, while the
+//! raw [`SupersetProperties`](scan_polarity::SupersetProperties) cannot be walked without naming
+//! the polarity out loud. Read that module before adding a read, and before *changing* one: the
+//! docstrings it replaced asserted the wrong polarity and were believed.
+//!
 //! ## Frozen layouts
 //!
 //! The 25-byte MVCC record header (`05 §7`) and the type-specific record tails (`04 §2.3`) are
@@ -68,6 +84,7 @@ pub mod propenc;
 pub mod read_view;
 pub mod record;
 pub mod recovery;
+pub mod scan_polarity;
 pub mod store;
 pub mod tokens;
 pub mod valenc;
@@ -113,6 +130,9 @@ pub use record::{
     ChainSide, MVCC_HEADER_SIZE, MvccHeader, NODE_RECORD_SIZE, NodeRecord, PROP_RECORD_SIZE,
     PropRecord, REL_RECORD_SIZE, RelRecord,
 };
+/// The read-polarity taxonomy (`rmp` task #905): which of superset / decision / conservative a
+/// storage read is required to answer, and the two types that keep the first two apart.
+pub use scan_polarity::{DecidedProperties, SupersetProperties};
 pub use store::{
     DEFAULT_CHECKPOINT_INTERVAL_BYTES, DirectionalRelCounts, FreezeFrontierViolation, GcPassReport,
     META_PAGE, RecordStore, StoreKind,

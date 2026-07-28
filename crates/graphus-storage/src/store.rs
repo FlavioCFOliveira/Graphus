@@ -55,6 +55,7 @@ use crate::record::{
     NODE_RECORD_SIZE, NodeRecord, PROP_RECORD_SIZE, PropRecord, REL_OFF_CHAIN_FLAGS,
     REL_OFF_END_PREV, REL_OFF_FIRST_PROP, REL_OFF_START_PREV, REL_RECORD_SIZE, RelRecord,
 };
+use crate::scan_polarity::{DecidedProperties, SupersetProperties};
 use crate::tokens::{Namespace, TokenSnapshot, TokenStore};
 use crate::valenc;
 use crate::wal_rule::SharedWal;
@@ -1783,6 +1784,42 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.active.contains_key(&txn)
     }
 
+    /// The lowest-numbered **open transaction that has already written data**, or [`None`] when every
+    /// open transaction is read-only (`rmp` task #902).
+    ///
+    /// "Has written data" means its mutations are already **physically present** in the store — a
+    /// record it created or tombstoned, or a label bitmap it changed — and would therefore be observed
+    /// by any caller that reads the store raw instead of through a [`Snapshot`](graphus_txn::Snapshot).
+    /// The three lists this reads are exactly the ones the commit/rollback paths consume to settle or
+    /// undo those mutations, so a transaction with all three empty has changed nothing a raw scan can
+    /// see, and its future writes are subject to whatever the caller declares in the meantime.
+    ///
+    /// This is the store's answer to "is the committed image decidable right now?", used by the
+    /// constraint DDL to refuse rather than judge existing data it cannot resolve
+    /// (`TxnCoordinator::create_constraint_general`). It deliberately reports the **lowest** such id
+    /// rather than an arbitrary one: `active` is a `HashMap`, so returning "any" would make the error
+    /// message — and any test over it — non-deterministic, which DST forbids.
+    ///
+    /// Read-only transactions are excluded on purpose. They hold no uncommitted state, so they cannot
+    /// make the committed image ambiguous, and refusing a schema change merely because a session has
+    /// an open read would be disproportionate on a server whose mandate is extreme concurrency.
+    ///
+    /// That is a statement about *this* predicate only, and not a claim that an open reader is harmless
+    /// to a constraint. An open transaction whose **snapshot** predates a row committed before the
+    /// constraint was declared can still write a duplicate it cannot itself see; nothing here detects
+    /// that, because there is nothing uncommitted to detect. Closing it needs the DDL to carry an SSI
+    /// predicate marker (`rmp` task #903) — see the caller for the full scenario.
+    #[must_use]
+    pub fn uncommitted_data_writer(&self) -> Option<TxnId> {
+        self.active
+            .iter()
+            .filter(|(_, a)| {
+                !a.created.is_empty() || !a.expired.is_empty() || !a.labelled_nodes.is_empty()
+            })
+            .map(|(txn, _)| *txn)
+            .min()
+    }
+
     /// Opens transaction `txn`'s MVCC version-stamp bookkeeping. The WAL `BEGIN` is **lazy** (`rmp`
     /// #529): it is *not* emitted here — the WAL Active-Transaction-Table entry is created on demand by
     /// the first data record ([`WalManager::log_update`]'s `or_insert`). A read-only transaction
@@ -2000,44 +2037,36 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // registry maps the unknown id to `Aborted`, so the version would read as never-committed and
         // every reader would fall back to the PRE-CHANGE bitmap — a committed label change silently
         // reverting in memory, healed only by a restart.
-        // Take the label ids out of the per-txn bookkeeping — but leave the ACTIVE-SET ENTRY in place
-        // (`rmp` #866). It is dropped only once every fallible step below has succeeded, at
-        // `commit_settled` (and in the `rmp` #529 read-only early return, which is infallible from
-        // here). Holding it across `checkpoint_meta`/`commit_at_no_sync` is what makes a failure there
-        // recoverable: the transaction's count delta and schema undo log survive, so a subsequent
-        // `rollback` withdraws exactly its own effect. Removing it first — as this did until #866 —
-        // left a failed commit's counts folded into the shared tally with nothing left to withdraw
-        // them, drifting the catalog permanently while `counts_match_committed_image` still read
-        // `true`. `committed_statistics(txn)` now excludes the committing transaction BY NAME rather
-        // than by it having already been removed, so the checkpoint below still persists its counts and
-        // DDL. The rest of the per-txn created/expired bookkeeping fed the old eager settle loop and is
-        // dead once the commit-registry entry exists; it is dropped with the entry.
-        let labelled_nodes = self
-            .active
-            .get_mut(&txn)
-            .map(|a| std::mem::take(&mut a.labelled_nodes))
-            .unwrap_or_default();
-        // Settle BEFORE the `rmp` #529 read-only fast path returns, not after. A label writer always
-        // logs a WAL data record, so it never takes that path — but placing the settle after the check
-        // would make correctness depend on that invariant holding forever, and a stranded in-flight
-        // stamp is precisely the silent, restart-healed defect this settle exists to prevent. Running
-        // it first is unconditionally correct and costs nothing when the list is empty. The invariant
-        // is asserted rather than assumed.
+        // The settle itself is DEFERRED to [`settle_committed_txn`](Self::settle_committed_txn), which
+        // runs at each of this method's two exits — and at neither of them before every fallible step
+        // has succeeded (`rmp` #955). Until then NOTHING of this transaction's bookkeeping is released:
+        // not the active-set entry (`rmp` #866), not the `labelled_nodes` list, not the freeze-frontier
+        // savepoint. That is what keeps a FAILED commit recoverable: the transaction is still, in every
+        // respect the store can be asked about, an open writer holding uncommitted state, so
+        // [`uncommitted_data_writer`](Self::uncommitted_data_writer) keeps naming it (the `rmp` #902
+        // constraint-DDL guard stays fail-CLOSED) and a subsequent [`rollback`](Self::rollback)
+        // withdraws exactly its own effect.
+        //
+        // Taking `labelled_nodes` here — as this did until #955 — broke both halves. A transaction whose
+        // ONLY uncommitted mutation is a label change (`MATCH (n) SET n:L`, which writes the label word
+        // in place and creates no record) vanished from `uncommitted_data_writer` the instant its commit
+        // was attempted, so a `CREATE CONSTRAINT` racing a failed commit was ADMITTED over uncommitted
+        // data; and the settle that followed re-stamped those versions `Committed(commit_ts)`, which the
+        // rollback's `LabelHistory::forget` — keyed on the in-flight stamp — then could not find, leaving
+        // a rolled-back label change permanently visible as committed.
+        //
+        // `committed_statistics(txn)` excludes the committing transaction BY NAME rather than by it
+        // having already been removed, so the checkpoint below still persists its counts and DDL. The
+        // rest of the per-txn created/expired bookkeeping fed the old eager settle loop and is dead once
+        // the commit-registry entry exists; it is dropped with the entry.
         debug_assert!(
-            labelled_nodes.is_empty() || self.wal.with(|w| w.is_active(txn)),
-            "a label writer must have logged a WAL record; if it can take the read-only fast path, \
-             the settle below must move with it"
+            self.active
+                .get(&txn)
+                .is_none_or(|a| a.labelled_nodes.is_empty())
+                || self.wal.with(|w| w.is_active(txn)),
+            "a label writer must have logged a WAL record; the `rmp` #529 read-only fast path settles \
+             the label history too, but this asserts the two can never disagree"
         );
-        self.label_history.settle(txn, commit_ts, &labelled_nodes);
-        // `rmp` #522: this GC pass is committing — its freeze frontier advance is now permanent, so the
-        // rollback savepoint is no longer needed (a GC pass never takes the read-only fast path below,
-        // since it schedules a prune, so clearing it here always runs for a committing GC pass).
-        if self
-            .gc_freeze_low_savepoint
-            .is_some_and(|(sp_txn, _)| sp_txn == txn)
-        {
-            self.gc_freeze_low_savepoint = None;
-        }
 
         // Read-only fast path (`rmp` #529): a transaction that changed nothing durable — and is not a
         // GC pass with a scheduled Active/Recent-Transaction-Table prune to apply — has nothing to
@@ -2048,8 +2077,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // reissued, which is harmless precisely because the transaction produced no versions (nothing on
         // disk references it). ALL in-memory bookkeeping the coordinator relies on is preserved: the
         // commit-ts oracle advanced above (so [`snapshot_ts`](Self::snapshot_ts) returns this
-        // transaction's timestamp for the coordinator's `ssi.record_commit`), the active-set entry was
-        // removed above, and the GC watermark (`oldest_active_snapshot`) is a coordinator-level concern.
+        // transaction's timestamp for the coordinator's `ssi.record_commit`), and the GC watermark
+        // (`oldest_active_snapshot`) is a coordinator-level concern.
         // `commit_ts_hw` monotonicity across a later rollback's `reload_catalog` is preserved by that
         // method taking `max` (a read-only bump is not durable, so the persisted catalog lags it).
         let is_gc_prune = self
@@ -2057,27 +2086,43 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             .as_ref()
             .is_some_and(|p| p.gc_txn == txn);
         if !wrote_durable && !self.catalog_dirty && !is_gc_prune {
-            // Nothing fallible remains, so the active-set entry can go (`rmp` #866). A transaction on
+            // Nothing fallible remains, so the bookkeeping can go (`rmp` #866 / #955). A transaction on
             // this path wrote no record, so its count delta is empty and there is nothing to withdraw.
             debug_assert!(
                 self.active.get(&txn).is_none_or(|a| a.counts.is_empty()),
                 "the `rmp` #529 read-only fast path must never hold a count delta: a counter mutation \
                  implies a record write, which implies WAL activity"
             );
-            self.active.remove(&txn);
+            self.settle_committed_txn(txn, commit_ts);
             return Ok(None);
         }
 
-        self.commit_registry.record_commit(txn, commit_ts);
         self.checkpoint_meta(txn, false)?;
         // PREPARE: append the `COMMIT` record with NO `fdatasync` (the group-commit deferral, `rmp`
         // #528). The caller hardens the whole batch with a single `harden_wal`.
         let commit_lsn = self.wal.with(|w| w.commit_at_no_sync(txn, commit_ts))?;
-        // COMMIT SETTLED. Every fallible step has succeeded, so the active-set entry — and with it this
-        // transaction's count delta and schema undo log — is now safe to drop (`rmp` #866). This must
-        // happen before `open_txn_holds_pending_ddl()` below, which asks whether any *other* open
-        // transaction still holds unpersisted DDL and would otherwise count this one's.
-        self.active.remove(&txn);
+        // COMMIT SETTLED. Every fallible step has succeeded, so — and not one line earlier — this
+        // transaction becomes committed-visible and its bookkeeping is released.
+        //
+        // The registry entry is PUBLISHED here rather than before `checkpoint_meta` (`rmp` #955). It is
+        // what resolves an in-flight `xmin`/`xmax` stamp, and every record this transaction wrote still
+        // carries one, so writing it earlier meant that a `checkpoint_meta` failure left the whole
+        // uncommitted write set resolving as `Committed(commit_ts)` — a dirty read of data the caller
+        // is about to roll back, and a permanent one if that rollback also fails. Publishing it after
+        // the last fallible step makes the absence of an entry (which
+        // [`CommitRegistry::outcome`](graphus_txn::CommitRegistry::outcome) reads as `Aborted`) the
+        // fail-safe answer for exactly the window where the outcome is not yet decided.
+        //
+        // It is published BEFORE the label settle below, not after: between the two, a concurrent
+        // reader resolves an `InFlight(txn)` label version through the registry and gets
+        // `Committed(commit_ts)` — the same answer the settle then writes down. The reverse order would
+        // open a window in which a settled label version read as committed while the record headers of
+        // the same transaction still read as aborted.
+        self.commit_registry.record_commit(txn, commit_ts);
+        // Releases the active-set entry — and with it this transaction's count delta and schema undo log
+        // (`rmp` #866). This must happen before `open_txn_holds_pending_ddl()` below, which asks whether
+        // any *other* open transaction still holds unpersisted DDL and would otherwise count this one's.
+        self.settle_committed_txn(txn, commit_ts);
         // `rmp` #813: record this durable write's `(commit_lsn, commit_ts)` so a read transaction's causal
         // bookmark can advance to it — but ONLY once the deferred harden makes `commit_lsn` durable. The
         // pair is drained into `durable_write_commit_ts_hw` at the next harden (or lazily on a read of the
@@ -2120,6 +2165,46 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             }
         }
         Ok(Some(commit_lsn))
+    }
+
+    /// Releases `txn`'s per-transaction bookkeeping now that its commit is **settled** (`rmp` #955).
+    ///
+    /// Every step here is infallible, and that is the point: [`commit_prepare`](Self::commit_prepare)
+    /// calls it at each of its two exits and at neither of them before the last fallible step has
+    /// succeeded. While a commit is still in doubt the transaction must stay, in every respect the
+    /// store can be asked about, an open writer holding uncommitted state — otherwise a failed commit
+    /// leaves mutations that are physically present but attributable to nobody.
+    ///
+    /// It does three things, in this order:
+    ///
+    /// 1. **Settles the retained label versions** from the in-flight stamp to `Committed(commit_ts)`
+    ///    (`rmp` #767). Unlike the record headers — settled lazily at GC time because doing it eagerly
+    ///    was `O(records)` WAL-logged page writes — this history is small and purely in-memory, so
+    ///    settling now is free and logs nothing. It is REQUIRED, not an optimisation: a raw in-flight
+    ///    stamp is only resolvable while the [`CommitRegistry`] still holds `txn`, and a GC pass
+    ///    FORGETS committed writers from that registry once their headers are frozen. After that the
+    ///    registry maps the unknown id to `Aborted`, so the version would read as never-committed and
+    ///    every reader would fall back to the PRE-CHANGE bitmap — a committed label change silently
+    ///    reverting in memory, healed only by a restart.
+    /// 2. **Clears the GC freeze-frontier savepoint** (`rmp` #522). This GC pass is committing, so its
+    ///    freeze-frontier advance is permanent and the rollback savepoint is no longer needed. A no-op
+    ///    for any transaction that is not the in-progress GC pass.
+    /// 3. **Removes the active-set entry**, and with it the count delta (`rmp` #866) and the schema
+    ///    undo log (`rmp` #734) a rollback would otherwise have withdrawn.
+    fn settle_committed_txn(&mut self, txn: TxnId, commit_ts: Timestamp) {
+        let labelled_nodes = self
+            .active
+            .get_mut(&txn)
+            .map(|a| std::mem::take(&mut a.labelled_nodes))
+            .unwrap_or_default();
+        self.label_history.settle(txn, commit_ts, &labelled_nodes);
+        if self
+            .gc_freeze_low_savepoint
+            .is_some_and(|(sp_txn, _)| sp_txn == txn)
+        {
+            self.gc_freeze_low_savepoint = None;
+        }
+        self.active.remove(&txn);
     }
 
     /// Group-commit **HARDEN** (phase 2, `04 §4.2` / `rmp` #528): `fdatasync`s the WAL, making every
@@ -3535,30 +3620,36 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// reload. The page growth itself is not reverted (a grown device page is harmless: it holds no
     /// live records and will be reused), matching the "physical ids may be reused" model (`04 §2.7`).
     ///
+    /// # Failure leaves the transaction OPEN (`rmp` #955)
+    ///
+    /// The active-set entry is released only once **every** fallible step below has succeeded. A
+    /// rollback that fails — or that unwinds on the WAL `fdatasync` panic — therefore leaves `txn`
+    /// in the active set, where [`is_txn_active`](Self::is_txn_active) and
+    /// [`uncommitted_data_writer`](Self::uncommitted_data_writer) keep reporting it as a live writer
+    /// holding uncommitted state. That is the truth: its effects were not undone, so every gate that
+    /// asks "may I decide the committed image right now?" must keep answering *no*.
+    ///
+    /// The store cannot repair itself from here — the undo is not restartable from an arbitrary
+    /// mid-point — so the caller MUST treat an `Err` (or a caught unwind) as a hard failure of this
+    /// database and stop serving over the suspect in-memory state; on the server that is the
+    /// per-engine degraded flag (`rmp` #409/#414), which is per-database and never fleet-wide. What
+    /// the caller must NOT do is drop the entry to "tidy up": that flips the `rmp` #902 constraint-DDL
+    /// guard from fail-safe to fail-open at exactly the moment it matters most.
+    ///
     /// # Errors
     /// Returns a storage error if undo apply fails or the catalog cannot be reloaded.
     ///
     /// # Panics
     /// Panics if the WAL `fdatasync` fails (`04 §4.9`).
     pub fn rollback(&mut self, txn: TxnId) -> Result<()> {
-        // Drop the version-stamp bookkeeping: every stamp this txn wrote (in-flight `xmin`/`xmax`)
-        // is reverted by the WAL undo below, and the commit timestamp was never issued (only
-        // `commit` advances it), so nothing of this txn remains visible or durable. Take the removed
-        // entry so we can withdraw this transaction's OWN free-list pushes below (`rmp` #578): only a
-        // GC pass populates `freed_ids`; a normal write transaction's is empty. Also take its `rmp`
-        // #581 pop bookkeeping (`popped_ids` / `popped_prop_owners`) so a normal write transaction's
-        // own reused-id pops can be RECLAIMED to the free list after the restore below.
-        // Also take its `rmp` #866 pending COUNT delta, withdrawn from the pre-rollback counter image
-        // below.
-        let ActiveTxn {
-            created: aborted_created,
-            freed_ids: aborted_freed_ids,
-            popped_ids: aborted_popped_ids,
-            popped_prop_owners: aborted_prop_owners,
-            schema_undo: aborted_schema_undo,
-            counts: aborted_counts,
-            ..
-        } = self.active.remove(&txn).unwrap_or_default();
+        // PEEK at this transaction's pending catalog DDL — do NOT take the entry (`rmp` #955). The
+        // entry stays in `active` across every fallible step below and is removed only once they have
+        // all succeeded; see the method docs. The `pre_statistics` guard further down is the one thing
+        // that needs to know, before the undo runs, whether this transaction holds DDL of its own.
+        let holds_schema_undo = self
+            .active
+            .get(&txn)
+            .is_some_and(|a| !a.schema_undo.is_empty());
         // Snapshot the in-memory free lists BEFORE the catalog reload (`rmp` #578). The free list has
         // the SAME monotonicity hazard as the high-water / token / device-page state restored below,
         // but — unlike them — is NOT monotonic (ids are popped as well as pushed), so it cannot use a
@@ -3586,37 +3677,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // bounded by the number of distinct labels/relationship types in the schema, not by the number
         // of records the transaction touched.
         let pre_counts = self.statistics.counts_image();
-        // Any catalog-only change this txn made is discarded by the `reload_catalog` below (`rmp`
-        // #529): clear the dirty flag so the NEXT transaction's read-only fast path is not forced onto
-        // the durable path by this aborted transaction's un-persisted mutation. (A token this txn
-        // interned is kept in memory by the superset restore below, but as an unused id it needs no
-        // durability — it rides the next durable commit's checkpoint if a later write actually uses it.)
-        // A CONCURRENT open transaction's still-pending catalog DDL, by contrast, IS restored below and
-        // must stay flagged: the `rmp` #534 superset-preserve block re-sets this flag when it keeps one.
-        self.catalog_dirty = false;
-        // If `txn` was a GC pass, discard its scheduled registry prune (`rmp` task #59): the WAL
-        // undo below restores the in-flight header stamps the freeze had rewritten, and those
-        // stamps still need their Active/Recent Transaction Table entries to resolve. A rolled-back
-        // GC pass must therefore prune NOTHING — otherwise a restored in-flight stamp would be
-        // stranded as unresolvable (it would wrongly read as aborted).
-        if self
-            .pending_gc_prune
-            .as_ref()
-            .is_some_and(|p| p.gc_txn == txn)
-        {
-            self.pending_gc_prune = None;
-        }
-        // `rmp` #522: if `txn` is the in-progress GC pass, restore the freeze frontier its freeze sweep
-        // advanced. The WAL undo below un-freezes the stamps this pass had frozen (restoring them to
-        // their in-flight form); without restoring the frontier those records would sit below it and the
-        // next freeze sweep would skip them, stranding a committed writer's stamp unfrozen forever. Taken
-        // (not just read) so a normal write transaction — whose savepoint this never is — leaves it be.
-        if let Some((sp_txn, saved)) = self.gc_freeze_low_savepoint
-            && sp_txn == txn
-        {
-            self.freeze_low = saved;
-            self.gc_freeze_low_savepoint = None;
-        }
         // Capture the in-memory physical-id high-water marks BEFORE the catalog reload (`rmp` #220 /
         // #172). `reload_catalog` restores the allocators from the last COMMITTED metadata — but under
         // STATEMENT-granularity interleaving a CONCURRENT, still-open transaction may have advanced a
@@ -3652,11 +3712,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // SILENTLY DROP its committed DDL.
         //
         // Snapshot the in-memory schema now so it can be superset-preserved after the reload — but ONLY
-        // when a concurrent transaction is still open to OWN a pending DDL change (`self.active` already
-        // excludes `txn`, removed at the top of this method). With no concurrent transaction the reload
-        // is the whole story (a lone transaction's own DDL is correctly discarded), so the common
-        // single-writer path clones NOTHING and is byte-identical to the pre-#534 behaviour. The counts
-        // this also clones are discarded — `adopt_schema_from` moves only the schema half.
+        // when a concurrent transaction is still open to OWN a pending DDL change. `txn`'s own entry is
+        // still in `active` (it is released only after the fallible steps, `rmp` #955), so it is
+        // excluded BY NAME here rather than by having already been removed. With no concurrent
+        // transaction the reload is the whole story (a lone transaction's own DDL is correctly
+        // discarded), so the common single-writer path clones NOTHING and is byte-identical to the
+        // pre-#534 behaviour. The counts this also clones are discarded — `adopt_schema_from` moves only
+        // the schema half.
         // Also snapshot when THIS transaction holds catalog DDL of its own, even with no concurrent
         // transaction open (`rmp` #734). The tempting shortcut — "alone ⇒ the reload discards exactly
         // my DDL" — is FALSE: a concurrent transaction that committed and has since resolved may have
@@ -3665,8 +3727,18 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // is the only thing that removes it. (`committed_statistics` stops new checkpoints from
         // capturing pending DDL; this keeps the rollback correct regardless.) A transaction with no
         // catalog DDL and no concurrent transaction still clones nothing — the common path is unchanged.
-        let pre_statistics = (!self.active.is_empty() || !aborted_schema_undo.is_empty())
+        let pre_statistics = (self.active.keys().any(|t| *t != txn) || holds_schema_undo)
             .then(|| self.statistics.clone());
+        // ------------------------------------------------------------------------------------------
+        // FALLIBLE SECTION (`rmp` #955). Everything from here to `reload_catalog` can fail — with an
+        // `Err` from the pool/catalog, or by unwinding out of the WAL `fdatasync` panic. NOTHING in it
+        // may release or mutate this transaction's bookkeeping: its active-set entry, its count delta,
+        // its schema undo log, the scheduled GC prune and the freeze-frontier savepoint all stay
+        // exactly as they were, so a failure leaves `txn` a fully-formed open writer rather than a
+        // half-dismantled one. That is why the entry is removed BELOW this section and not above it,
+        // and why the removal needs no unwind guard: an entry that is never taken cannot be dropped on
+        // the way out.
+        // ------------------------------------------------------------------------------------------
         // `rmp` #337, Slice 1: drive the WAL rollback with a *recording* target that captures the
         // compensating page images WITHOUT touching the pool while the WAL lock is held, then replay
         // them into the pool AFTER the lock is released. This breaks the eviction-during-rollback
@@ -3707,6 +3779,59 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // which a reader can observe anything but the true, monotone map. Exception safety is likewise
         // structural: a failing `reload_catalog` cannot strand a map it never moved.
         self.reload_catalog()?;
+        // ------------------------------------------------------------------------------------------
+        // UNDO SETTLED (`rmp` #955). Every fallible step has succeeded and nothing below can fail, so
+        // the transaction's bookkeeping is released here — and only here.
+        // ------------------------------------------------------------------------------------------
+        // Drop the version-stamp bookkeeping: every stamp this txn wrote (in-flight `xmin`/`xmax`) has
+        // just been reverted by the WAL undo above, and the commit timestamp was never issued (only
+        // `commit` advances it), so nothing of this txn remains visible or durable. Take the removed
+        // entry so we can withdraw this transaction's OWN free-list pushes below (`rmp` #578): only a
+        // GC pass populates `freed_ids`; a normal write transaction's is empty. Also take its `rmp`
+        // #581 pop bookkeeping (`popped_ids` / `popped_prop_owners`) so a normal write transaction's
+        // own reused-id pops can be RECLAIMED to the free list after the restore below.
+        // Also take its `rmp` #866 pending COUNT delta, withdrawn from the pre-rollback counter image
+        // below.
+        let ActiveTxn {
+            created: aborted_created,
+            freed_ids: aborted_freed_ids,
+            popped_ids: aborted_popped_ids,
+            popped_prop_owners: aborted_prop_owners,
+            schema_undo: aborted_schema_undo,
+            counts: aborted_counts,
+            ..
+        } = self.active.remove(&txn).unwrap_or_default();
+        // Any catalog-only change this txn made has been discarded by the `reload_catalog` above (`rmp`
+        // #529): clear the dirty flag so the NEXT transaction's read-only fast path is not forced onto
+        // the durable path by this aborted transaction's un-persisted mutation. (A token this txn
+        // interned is kept in memory by the superset restore below, but as an unused id it needs no
+        // durability — it rides the next durable commit's checkpoint if a later write actually uses it.)
+        // A CONCURRENT open transaction's still-pending catalog DDL, by contrast, IS restored below and
+        // must stay flagged: the `rmp` #534 superset-preserve block re-sets this flag when it keeps one.
+        self.catalog_dirty = false;
+        // If `txn` was a GC pass, discard its scheduled registry prune (`rmp` task #59): the WAL
+        // undo above restored the in-flight header stamps the freeze had rewritten, and those
+        // stamps still need their Active/Recent Transaction Table entries to resolve. A rolled-back
+        // GC pass must therefore prune NOTHING — otherwise a restored in-flight stamp would be
+        // stranded as unresolvable (it would wrongly read as aborted).
+        if self
+            .pending_gc_prune
+            .as_ref()
+            .is_some_and(|p| p.gc_txn == txn)
+        {
+            self.pending_gc_prune = None;
+        }
+        // `rmp` #522: if `txn` is the in-progress GC pass, restore the freeze frontier its freeze sweep
+        // advanced. The WAL undo above un-froze the stamps this pass had frozen (restoring them to
+        // their in-flight form); without restoring the frontier those records would sit below it and the
+        // next freeze sweep would skip them, stranding a committed writer's stamp unfrozen forever. Taken
+        // (not just read) so a normal write transaction — whose savepoint this never is — leaves it be.
+        if let Some((sp_txn, saved)) = self.gc_freeze_low_savepoint
+            && sp_txn == txn
+        {
+            self.freeze_low = saved;
+            self.gc_freeze_low_savepoint = None;
+        }
         self.tokens = pre_tokens;
         // Restore the live-record COUNTERS to their pre-rollback in-memory image, then withdraw
         // exactly this transaction's own delta (`rmp` #866) — the counts twin of the `pre_free` minus
@@ -4489,6 +4614,44 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         read_view::node_labels(&self.pool, &self.stores, id)
     }
 
+    /// The `Label`-namespace token ids node `id` carries under **any** snapshot, ascending — the
+    /// candidate-membership superset an index refill must gate on (`rmp` task #904).
+    ///
+    /// This is [`node_labels`](Self::node_labels) widened by every bitmap
+    /// [`LabelHistory`](crate::label_history::LabelHistory) still retains for the node
+    /// ([`candidate_superset`](crate::label_history::LabelHistory::candidate_superset)), so it holds
+    /// the union of the live word and every committed, in-flight and not-yet-pruned version.
+    ///
+    /// # Why a refill must use this and never the raw live word
+    ///
+    /// Labels are mutated **in place**, so the live word carries an uncommitted writer's changes. A
+    /// refill that reads it decides membership from a bitmap that may be neither the committed set nor
+    /// the one any reader will end up seeing:
+    ///
+    /// * a refill run while a writer holds an uncommitted `REMOVE n:L` writes a **subset** — the node
+    ///   is excluded from every `(L, *)` index, the writer then rolls back, the record carries `:L`
+    ///   again, and nothing re-inserts the entry. A seek's re-check can REMOVE a candidate but never
+    ///   RESURRECT one, so that committed row is invisible to every future seek for the life of the
+    ///   process — and, because the uniqueness / node-key duplicate checks read those same trees as an
+    ///   exact candidate source, a live `IS UNIQUE` constraint then ADMITS a duplicate;
+    /// * a refill that read the newest *committed* bitmap instead would merely move the victim, losing
+    ///   an uncommitted writer's ADDED label, which `commit` never re-inserts (index entries are made
+    ///   eagerly at write time).
+    ///
+    /// The union is the only image that serves both. Its extra entries are false positives that every
+    /// consumer of these trees drops: each re-checks label membership against the reader's own snapshot
+    /// via [`label_bitmap_at`](Self::label_bitmap_at) (`graphus_cypher::read_source`'s
+    /// `filter_label_candidates` / `filter_any_label_candidates`, and the vector procedure's
+    /// `node_labels`).
+    ///
+    /// # Errors
+    /// As [`node_labels`](Self::node_labels).
+    pub fn node_label_superset(&self, id: u64) -> Result<Vec<u32>> {
+        let live = self.read_node(id)?.labels;
+        labels::token_ids(self.label_history.candidate_superset(id, live))
+            .map_err(GraphusError::from)
+    }
+
     /// Whether node `id` carries the label with `label_token_id`.
     ///
     /// # Errors
@@ -4506,9 +4669,14 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// record because every caller on the hot path has just decoded it for the MVCC visibility check.
     ///
     /// [`node_labels`](Self::node_labels) / [`node_has_label`](Self::node_has_label) deliberately do
-    /// NOT apply this: the index-build and constraint-enforcement paths want the CURRENT word (they
-    /// build a candidate superset that a snapshot-correct re-check then narrows — see
-    /// `graphus_cypher::read_source::filter_label_candidates`).
+    /// NOT apply this: they report the CURRENT word, for the write-path enforcement that acts on it.
+    ///
+    /// An index build must use neither. It has no snapshot to resolve against, and the current word is
+    /// **not** the candidate superset this doc once claimed it was — it is a subset whenever an
+    /// uncommitted writer has removed a label (`rmp` task #904). The build's gate is
+    /// [`node_label_superset`](Self::node_label_superset); the snapshot-correct narrowing then happens
+    /// at seek time in `graphus_cypher::read_source::filter_label_candidates`, which routes back
+    /// through this method.
     #[must_use]
     pub fn label_bitmap_at(
         &self,
@@ -5202,8 +5370,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 dead.mvcc = MvccHeader::default(); // clears in_use (no-op for a corpse, already clear)
                 // `rmp` #821/#811: PRESERVE `dead.next_prop` (do NOT zero it). This tombstone/corpse sits
                 // on a **live** owner's chain, so an off-thread reader (`read_view::collect_prop_chain`,
-                // behind `node_properties`/`rel_properties`) that captured a pointer to `cur` — from the
-                // owner's `first_prop` or a predecessor's `next_prop` — BEFORE the bridge below still
+                // behind `superset_scan_node_properties`/`superset_scan_rel_properties`) that
+                // captured a pointer to `cur` — from the owner's `first_prop` or a predecessor's
+                // `next_prop` — BEFORE the bridge below still
                 // reads this record and must thread through its `next_prop` to the live successor it
                 // points at. The reader correctly SKIPS this record (its `!in_use` bit hides the
                 // tombstone), but it walks the chain LIVE and non-atomically: zeroing `next_prop` made
@@ -5399,12 +5568,57 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.read_prop(id)
     }
 
-    /// Collects every live property `(physical_id, record)` in `node_id`'s chain, head to tail.
+    /// The **superset**-polarity read of node `node_id`'s property chain: every **slot-occupied**
+    /// (`in_use`) `(physical_id, record)`, head to tail — which is prepend order, so the FIRST
+    /// occurrence of a key is its NEWEST version (`rmp` task #905 named the polarity; see
+    /// [`scan_polarity`](crate::scan_polarity) for the taxonomy).
+    ///
+    /// # This includes MVCC tombstones
+    ///
+    /// A removed or overwritten version keeps its slot (and its place in the chain) until [`gc`](Self::gc)
+    /// reclaims it, so a record here may carry a non-zero `expired_ts`; a version written by a
+    /// transaction that has not committed is here too. That is the point: an index refill has no
+    /// snapshot and must populate a **superset** its consumers re-check (`rmp` task #766).
+    ///
+    /// # It is the wrong read for a decision
+    ///
+    /// A caller whose answer is final and is never re-checked — a constraint verdict, above all — must
+    /// call [`decision_scan_node_properties`](Self::decision_scan_node_properties), or narrow this
+    /// chain itself with [`SupersetProperties::decide`], which requires the deciding
+    /// [`Snapshot`]. This doc comment used to say "every **live** property", which is what the code
+    /// does NOT do; a caller that believed it counted a committed `REMOVE n.p` as a present value
+    /// (`rmp` task #902).
     ///
     /// # Errors
     /// Returns a storage error if a chain page is missing.
-    pub fn node_properties(&self, node_id: u64) -> Result<Vec<(u64, PropRecord)>> {
-        read_view::node_properties(&self.pool, &self.stores, node_id)
+    pub fn superset_scan_node_properties(&self, node_id: u64) -> Result<SupersetProperties> {
+        read_view::superset_scan_node_properties(&self.pool, &self.stores, node_id)
+    }
+
+    /// The **decision**-polarity read of node `node_id`'s properties: the newest version of each key
+    /// that `snapshot` can see, and nothing else (`rmp` task #905).
+    ///
+    /// This is [`superset_scan_node_properties`](Self::superset_scan_node_properties) narrowed by
+    /// [`SupersetProperties::decide`] against this store's [`CommitRegistry`] — that is, by the same
+    /// [`graphus_txn::is_visible`] predicate the query read path applies, so the caller decides over
+    /// exactly the graph a `MATCH` in the same transaction would return.
+    ///
+    /// Use it wherever the answer is **final**: nothing downstream re-checks a constraint verdict, so
+    /// reading the superset there counted a committed `REMOVE n.p` as a present value and both refused
+    /// valid constraints and admitted invalid ones (`rmp` task #902).
+    ///
+    /// # Errors
+    /// As [`superset_scan_node_properties`](Self::superset_scan_node_properties). Values are not
+    /// decoded here, so an unreadable overflow chain belonging to an uninvolved property does not fail
+    /// the caller (`rmp` task #733).
+    pub fn decision_scan_node_properties(
+        &self,
+        node_id: u64,
+        snapshot: Snapshot,
+    ) -> Result<DecidedProperties> {
+        Ok(self
+            .superset_scan_node_properties(node_id)?
+            .decide(snapshot, self.commit_registry()))
     }
 
     /// MVCC-tombstones the **live** property records in the chain rooted at `owner_first_prop`
@@ -5699,19 +5913,30 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         read_view::decode_property_value(&self.pool, &self.stores, type_tag, value_inline)
     }
 
-    /// Collects node `node_id`'s live properties as `(physical_id, key_token, Value)`, decoding both
-    /// inline scalars and overflow `String`/`List`/temporal values (`rmp` task #43). The chain is
-    /// walked head-to-tail; the caller applies newest-wins per key (the chain is prepend-ordered).
+    /// The **superset**-polarity read of node `node_id`'s properties, **decoded**: every
+    /// slot-occupied `(physical_id, key_token, Value)` in the chain, decoding both inline scalars and
+    /// overflow `String`/`List`/temporal values (`rmp` task #43).
+    ///
+    /// The decoded twin of
+    /// [`superset_scan_node_properties`](Self::superset_scan_node_properties), and it carries
+    /// exactly the same polarity: the chain is walked head-to-tail (prepend order, so newest first
+    /// per key) and **every** version is returned — MVCC tombstones and uncommitted versions
+    /// included. This doc comment used to say "live properties", the same false claim `rmp` task
+    /// #902 had to correct on the undecoded twin.
+    ///
+    /// Values are decoded eagerly, so it cannot be the read a decision path uses: pick a version
+    /// first, through [`decision_scan_node_properties`](Self::decision_scan_node_properties), and
+    /// decode only that one (`rmp` tasks #733, #905).
     ///
     /// # Errors
     /// Returns a storage error if the property chain or an overflow chain is unreadable/corrupt.
-    pub fn node_property_values(
+    pub fn superset_scan_node_property_values(
         &self,
         node_id: u64,
     ) -> Result<Vec<(u64, u32, graphus_core::Value)>> {
-        let chain = self.node_properties(node_id)?;
+        let chain = self.superset_scan_node_properties(node_id)?;
         let mut out = Vec::with_capacity(chain.len());
-        for (pid, prop) in chain {
+        for (pid, prop) in chain.into_every_version() {
             let value = self.decode_property_value(prop.type_tag, prop.value_inline)?;
             out.push((pid, prop.key, value));
         }
@@ -5804,14 +6029,32 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Ok(pid)
     }
 
-    /// Collects every live property `(physical_id, record)` in relationship `rel_id`'s chain, head to
-    /// tail (`rmp` task #44). The relationship analogue of
-    /// [`node_properties`](Self::node_properties).
+    /// The **superset**-polarity read of relationship `rel_id`'s property chain (`rmp` task #44): every
+    /// **slot-occupied** (`in_use`) `(physical_id, record)`, head to tail. The relationship analogue of
+    /// [`superset_scan_node_properties`](Self::superset_scan_node_properties), including its
+    /// treatment of MVCC tombstones and its polarity — read that doc before judging a version.
     ///
     /// # Errors
     /// Returns a storage error if a chain page is missing or the chain is malformed (cycle-guarded).
-    pub fn rel_properties(&self, rel_id: u64) -> Result<Vec<(u64, PropRecord)>> {
-        read_view::rel_properties(&self.pool, &self.stores, rel_id)
+    pub fn superset_scan_rel_properties(&self, rel_id: u64) -> Result<SupersetProperties> {
+        read_view::superset_scan_rel_properties(&self.pool, &self.stores, rel_id)
+    }
+
+    /// The **decision**-polarity read of relationship `rel_id`'s properties (`rmp` task #905): the
+    /// relationship analogue of
+    /// [`decision_scan_node_properties`](Self::decision_scan_node_properties), with the same
+    /// obligation — use it wherever the answer is final and nothing re-checks it.
+    ///
+    /// # Errors
+    /// As [`superset_scan_rel_properties`](Self::superset_scan_rel_properties).
+    pub fn decision_scan_rel_properties(
+        &self,
+        rel_id: u64,
+        snapshot: Snapshot,
+    ) -> Result<DecidedProperties> {
+        Ok(self
+            .superset_scan_rel_properties(rel_id)?
+            .decide(snapshot, self.commit_registry()))
     }
 
     /// Sets relationship `rel_id`'s property `key` to `value` under `txn`, **replacing** any current
@@ -5865,16 +6108,20 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Ok(tombstoned > 0)
     }
 
-    /// Collects relationship `rel_id`'s live properties as `(physical_id, key_token, Value)`, decoding
-    /// both inline scalars and overflow `String`/`List`/temporal values (`rmp` task #44). The
-    /// chain is walked head-to-tail; the caller applies newest-wins per key (the chain is
-    /// prepend-ordered). The relationship analogue of
-    /// [`node_property_values`](Self::node_property_values).
+    /// The **superset**-polarity read of relationship `rel_id`'s properties, **decoded** (`rmp` task
+    /// #44): the relationship analogue of
+    /// [`superset_scan_node_property_values`](Self::superset_scan_node_property_values), with the
+    /// same polarity and the same caveat — every slot-occupied version is returned, tombstones
+    /// included, and a decision path must narrow through
+    /// [`decision_scan_rel_properties`](Self::decision_scan_rel_properties) instead.
     ///
     /// # Errors
     /// Returns a storage error if the property chain or an overflow chain is unreadable/corrupt.
-    pub fn rel_property_values(&self, rel_id: u64) -> Result<Vec<(u64, u32, graphus_core::Value)>> {
-        read_view::rel_property_values(&self.pool, &self.stores, rel_id)
+    pub fn superset_scan_rel_property_values(
+        &self,
+        rel_id: u64,
+    ) -> Result<Vec<(u64, u32, graphus_core::Value)>> {
+        read_view::superset_scan_rel_property_values(&self.pool, &self.stores, rel_id)
     }
 
     /// Clears **all** of relationship `rel_id`'s properties under `txn` via per-value MVCC (`rmp`
@@ -8243,11 +8490,12 @@ mod tests {
         s.commit(t2).unwrap();
 
         // The chain now holds BOTH in-use records: the new live one (xmax == 0) and the old
-        // tombstoned one (xmax committed). `node_properties` returns every in-use record (the reader
-        // layer filters by visibility), so we see exactly two.
-        let chain = s.node_properties(n).unwrap();
+        // tombstoned one (xmax committed). `superset_scan_node_properties` returns every in-use
+        // record (the reader layer filters by visibility), so we see exactly two.
+        let chain = s.superset_scan_node_properties(n).unwrap();
         assert_eq!(chain.len(), 2, "old version tombstoned, not freed");
         let live: Vec<_> = chain
+            .every_version()
             .iter()
             .filter(|(_, p)| Store::is_live_version(p.mvcc))
             .collect();
@@ -8258,6 +8506,7 @@ mod tests {
             Value::Integer(2)
         );
         let tomb: Vec<_> = chain
+            .every_version()
             .iter()
             .filter(|(_, p)| p.mvcc.in_use() && p.mvcc.expired_ts != 0)
             .collect();
@@ -8277,7 +8526,7 @@ mod tests {
             "GC must not reclaim a version an older snapshot can still see"
         );
         assert_eq!(
-            s.node_properties(n).unwrap().len(),
+            s.superset_scan_node_properties(n).unwrap().len(),
             2,
             "old version still present after a too-early GC"
         );
@@ -8286,11 +8535,11 @@ mod tests {
         // tombstoned old version and splices it out, leaving exactly the live one.
         let latest = s.snapshot_ts();
         gc_at(&mut s, TxnId(4), latest);
-        let chain = s.node_properties(n).unwrap();
+        let chain = s.superset_scan_node_properties(n).unwrap();
         assert_eq!(chain.len(), 1, "tombstoned old version reclaimed at GC");
         assert_eq!(
-            s.node_property_values(n).unwrap(),
-            vec![(chain[0].0, key, Value::Integer(2))]
+            s.superset_scan_node_property_values(n).unwrap(),
+            vec![(chain.every_version()[0].0, key, Value::Integer(2))]
         );
     }
 
@@ -8452,7 +8701,7 @@ mod tests {
             "a LIFO single-txn abort restores V0 to live (CAS undo reverts its own stamp)"
         );
         assert_eq!(
-            s.node_property_values(h).unwrap(),
+            s.superset_scan_node_property_values(h).unwrap(),
             vec![(v0, key, Value::Integer(1))],
             "the property is readable again after the abort"
         );
@@ -9221,12 +9470,12 @@ mod tests {
             "an in-flight tombstone is not reclaimable"
         );
         s.commit(t2).unwrap();
-        assert_eq!(s.node_properties(n).unwrap().len(), 2);
+        assert_eq!(s.superset_scan_node_properties(n).unwrap().len(), 2);
 
         // After commit, a GC at the latest watermark reclaims it.
         let latest = s.snapshot_ts();
         gc_at(&mut s, TxnId(3), latest);
-        assert_eq!(s.node_properties(n).unwrap().len(), 1);
+        assert_eq!(s.superset_scan_node_properties(n).unwrap().len(), 1);
     }
 
     #[test]
@@ -9563,8 +9812,9 @@ mod tests {
             report.violations
         );
         assert_eq!(
-            s.node_properties(node)
+            s.superset_scan_node_properties(node)
                 .unwrap()
+                .into_every_version()
                 .into_iter()
                 .map(|(pid, _)| pid)
                 .collect::<Vec<_>>(),
@@ -9574,8 +9824,9 @@ mod tests {
     }
 
     /// `rmp` #821 (threaded stress — also closes the GAP-A concurrency-coverage gap of the v0.0.9
-    /// storage re-audit): an off-thread reader hammering `node_properties` on a **live** owner whose
-    /// chain is `B(tombstone) -> A(live)` must NEVER lose the live property A while the engine
+    /// storage re-audit): an off-thread reader hammering `superset_scan_node_properties` on a
+    /// **live** owner whose chain is `B(tombstone) -> A(live)` must NEVER lose the live property A
+    /// while the engine
     /// repeatedly runs a GC pass that reclaims the tombstone B above it. Pre-fix the GC zeroed B's
     /// `next_prop`, and a reader that read the owner's (not-yet-bridged) head B and then read B after
     /// the zero terminated its walk and dropped A. This drives REAL threads over the shared
@@ -9611,11 +9862,11 @@ mod tests {
             let reads = Arc::clone(&reads);
             std::thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
-                    match view.node_properties(node) {
+                    match view.superset_scan_node_properties(node) {
                         // The live property A (pid `a`) is NEVER deleted, so it must be present on every
                         // read: only a severed walk can drop it.
                         Ok(props) => {
-                            if !props.iter().any(|(pid, _)| *pid == a) {
+                            if !props.every_version().iter().any(|(pid, _)| *pid == a) {
                                 losses.fetch_add(1, Ordering::Relaxed);
                             }
                         }

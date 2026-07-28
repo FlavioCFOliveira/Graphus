@@ -46,7 +46,6 @@
 //! COMMITTED label removal, across a full rebuild. It fails the moment the tree stops being additive.
 
 use graphus_core::{TxnId, Value};
-use graphus_cypher::ConstraintKind;
 use graphus_cypher::binding::{Parameters, bind_parameters};
 use graphus_cypher::catalog::IndexCatalog;
 use graphus_cypher::coordinator::TxnCoordinator;
@@ -111,22 +110,19 @@ fn routed_vs_truth(coord: &Coord, txn: TxnId) -> (usize, usize) {
     (routed, truth)
 }
 
-/// Runs an UNRELATED `CREATE CONSTRAINT`, the production route to a full `IndexSet::clear` +
-/// `rebuild_index` (`rmp` #771): `handle_constraint_ddl` -> `create_constraint_ddl` ->
-/// `create_constraint_general` -> `rebuild_index` -> `IndexSet::clear`. Nothing about `:Person` is
-/// being declared.
+/// Runs an UNRELATED index DDL, the production route to a full `IndexSet::clear` + `rebuild_index`
+/// (`rmp` #771): `handle_index_ddl` -> `create_point_rel_index` -> `rebuild_index` ->
+/// `IndexSet::clear`. Nothing about `:Person` is being declared.
+///
+/// The vehicle was `CREATE CONSTRAINT` until `rmp` task #902 made a constraint DDL fail-closed while
+/// any transaction holds uncommitted writes — which is the state the trap below deliberately sets up.
+/// An index DDL is the right vehicle in any case: index **population** is exactly the path that may
+/// read raw physical state, because every candidate is re-checked at seek time, which is the property
+/// this file audits.
 fn unrelated_rebuild(coord: &mut Coord) {
     coord
-        .create_constraint_ddl(
-            "widget_sku",
-            "Widget",
-            &["sku"],
-            ConstraintKind::Unique,
-            None,
-            false,
-            false,
-        )
-        .expect("unrelated constraint DDL succeeds");
+        .create_point_rel_index("widget_at", "WIDGET", "at", false)
+        .expect("unrelated index DDL succeeds");
 }
 
 /// **THE #765 RE-AUDIT TRAP for the `labels` tree (`rmp` #767 AC 4).**

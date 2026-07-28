@@ -119,7 +119,9 @@ fn reader_view_follows_prop_chain_onto_a_page_allocated_after_its_snapshot() {
 
     // (1) The reader captures its view: the Prop store has exactly one device page.
     let view = s.read_view();
-    let before = view.node_properties(node).expect("baseline chain");
+    let before = view
+        .superset_scan_node_properties(node)
+        .expect("baseline chain");
     assert_eq!(before.len(), 1, "one live property to start with");
 
     // (2) The writer churns the property. Per-value MVCC makes every `SET` a tombstone + a fresh
@@ -134,7 +136,7 @@ fn reader_view_follows_prop_chain_onto_a_page_allocated_after_its_snapshot() {
 
     // (3) The pre-growth reader walks the property chain. It must not fail.
     let walked = view
-        .node_properties(node)
+        .superset_scan_node_properties(node)
         .expect("a concurrent writer growing the prop store must never fail a reader's chain walk");
     assert!(
         !walked.is_empty(),
@@ -163,8 +165,8 @@ fn reader_view_follows_overflow_chain_onto_a_page_allocated_after_its_snapshot()
     s.commit(txn).unwrap();
 
     let view = s.read_view();
-    let before = view.node_properties(node).unwrap();
-    let (_, p0) = before[0];
+    let before = view.superset_scan_node_properties(node).unwrap();
+    let (_, p0) = before.every_version()[0];
     view.decode_property_value(p0.type_tag, p0.value_inline)
         .expect("baseline overflow decode");
 
@@ -179,8 +181,10 @@ fn reader_view_follows_overflow_chain_onto_a_page_allocated_after_its_snapshot()
     // The pre-growth reader re-reads the property chain and decodes every value it finds. Every
     // record it can REACH it must be able to READ — including the newest versions, which it will then
     // filter by visibility above this layer.
-    let walked = view.node_properties(node).expect("prop chain walk");
-    for (pid, prop) in walked {
+    let walked = view
+        .superset_scan_node_properties(node)
+        .expect("prop chain walk");
+    for (pid, prop) in walked.every_version() {
         view.decode_property_value(prop.type_tag, prop.value_inline)
             .unwrap_or_else(|e| panic!("overflow decode of prop {pid} failed: {e}"));
     }

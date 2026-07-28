@@ -131,7 +131,9 @@ fn sec194_neutralisation_round_trips_logical_value() {
     // The single re-imported node carries name == the original payload (no leading `'`).
     let ids = store2.scan_node_ids().expect("scan");
     assert_eq!(ids.len(), 1, "exactly one node round-trips");
-    let props = store2.node_property_values(ids[0]).expect("props");
+    let props = store2
+        .superset_scan_node_property_values(ids[0])
+        .expect("props");
     let name = props
         .iter()
         .find_map(|(_, _tok, v)| match v {

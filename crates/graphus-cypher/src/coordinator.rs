@@ -36,6 +36,30 @@
 //! statement's duration, never for the whole transaction), then [`commit`](TxnCoordinator::commit)
 //! or [`rollback`](TxnCoordinator::rollback). Markers and locks accumulate across statements in the
 //! coordinator's shared trackers.
+//!
+//! ## Read polarity: this file holds two opposite ones (`rmp` task #905)
+//!
+//! The index refills (`index_one_node*`, `index_one_rel*`) and the constraint-validation walks
+//! (`validate_existing_*_against_constraint`) sit a few thousand lines apart in this file and make
+//! **opposite** demands of the same store reads. They are not variations on a theme; they discharge
+//! different obligations, and the whole of `rmp` tasks #902 and #904 was one being written with the
+//! other's read:
+//!
+//! * a **refill** has no snapshot. It populates a candidate structure that every consumer re-checks,
+//!   and a re-check can remove a candidate but never resurrect one, so the tree must be a
+//!   **superset** — every property version (`rmp` #766), and the live-OR-retained label union
+//!   ([`RecordStore::node_label_superset`], `rmp` #904), never the live word;
+//! * a **constraint verdict** is written into the catalogue and nothing re-checks it, so it must be
+//!   a **decision** — exactly what the DDL transaction's snapshot sees, resolved through
+//!   [`RecordStore::decision_scan_node_properties`] / `decision_scan_rel_properties`, which cannot
+//!   be called without that snapshot;
+//! * `rebuild_zone_column` is a third thing again: a zone map **prunes** an id range before any
+//!   re-check runs and nothing repairs one, so it must be **conservative** and takes the refill's
+//!   superset gate.
+//!
+//! [`graphus_storage::scan_polarity`] states the rule in full. The census that keeps this file
+//! honest — including every raw read here that is deliberately correct, and why — is
+//! `tests/read_polarity_census.rs`.
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -46,8 +70,9 @@ use graphus_core::error::{GraphusError, Result};
 use graphus_core::{Lsn, Timestamp, TxnId, VersionStamp};
 
 /// One version of one property, as the index build sees it: the MVCC stamps plus the decoded value
-/// (`rmp` task #766). `RecordStore::node_property_values` / `rel_property_values` discard the stamps,
-/// so the composite builds read `node_properties` / `rel_properties` and keep them.
+/// (`rmp` task #766). `RecordStore::superset_scan_node_property_values` /
+/// `superset_scan_rel_property_values` discard the stamps, so the composite builds read
+/// `superset_scan_node_properties` / `superset_scan_rel_properties` and keep them.
 struct PropVersion {
     /// The creating transaction's stamp (`MvccHeader::created_ts`), raw.
     xmin: u64,
@@ -718,19 +743,24 @@ mod composite_sweep_equivalence {
 }
 use graphus_index::fulltext::Analyzer;
 use graphus_index::histogram::PropertyHistogram;
+use graphus_index::keycodec::encode_equality_canonical;
 use graphus_index::{Similarity, VectorIndexError};
 use graphus_io::BlockDevice;
 use graphus_storage::{
-    CompositeIndexEntry, ConstraintEntry, ConstraintKind, ConstraintTypeDescriptor, FulltextEntity,
-    FulltextIndexEntry, GcPassReport, IndexState, Namespace, PropRecord, RecordStore,
-    RelCompositeIndexEntry, SpatialEntity, SpatialIndexEntry, StoreReadView, TextIndexEntry,
-    TokenSnapshot, VectorEntity, VectorIndexEntry, VectorSimilarity,
+    CompositeIndexEntry, ConstraintEntry, ConstraintKind, ConstraintTypeDescriptor,
+    DecidedProperties, FulltextEntity, FulltextIndexEntry, GcPassReport, IndexState, Namespace,
+    PropRecord, RecordStore, RelCompositeIndexEntry, SpatialEntity, SpatialIndexEntry,
+    StoreReadView, TextIndexEntry, TokenSnapshot, VectorEntity, VectorIndexEntry, VectorSimilarity,
 };
-use graphus_txn::{CommitRegistry, IsolationLevel, LockTable, Snapshot, SsiReadBuffer, SsiTracker};
+use graphus_txn::{
+    CommitRegistry, IsolationLevel, LockTable, PredicateRead, Snapshot, SsiReadBuffer, SsiTracker,
+    is_visible,
+};
 use graphus_wal::LogSink;
 
 use crate::catalog::IndexCatalog;
 use crate::constraint::{ConstraintViolation, ViolationEntity};
+use crate::executor::CancellationToken;
 use crate::index_set::IndexSet;
 use crate::record_graph::RecordStoreGraph;
 use crate::schema_error::{
@@ -816,6 +846,129 @@ fn tuples_equal(a: &[Value], b: &[Value]) -> bool {
             .all(|(x, y)| crate::equality::equals(x, y).is_true())
 }
 
+/// The covered value tuples a uniqueness walk has already inspected, indexed so that deciding whether
+/// the next entity duplicates one of them costs **O(1) expected** instead of O(entities) (`rmp` task
+/// #956).
+///
+/// Both constraint walks used to keep the inspected values in a plain `Vec` and search it with
+/// [`tuples_equal`] per entity, which made `CREATE CONSTRAINT … IS UNIQUE` quadratic in the number of
+/// entities carrying the covered token: measured over distinct string values, 42.94 s for 100 000
+/// nodes against 0.381 s for 10 000 — a fitted exponent of 2.05 — where this set makes the same walk
+/// 1.159 s and 0.110 s, an exponent of 1.02
+/// (`graphus-cypher`'s `tests/constraint_validation_scaling_956.rs`). Since `rmp` task #903 the walk is
+/// a registered transaction holding a snapshot, so its duration is exactly the window in which it pins
+/// the GC watermark: a quadratic walk blocks reclamation on a live database for a quadratic time, which
+/// turns a latency defect into an availability one.
+///
+/// The construction is the one already used for this exact shape by `aggregate_rows` (`rmp` #314) and
+/// `hash_join_rows` (`rmp` #865): bucket by a digest, then resolve *inside* the bucket with the
+/// authoritative relation.
+///
+/// # The hash buckets; only [`tuples_equal`] decides
+///
+/// Cypher value equality is not Rust's `Eq`, so a `HashSet<Value>` would be a different — wrong —
+/// relation. `1 = 1.0` is `TRUE` across `INTEGER`/`FLOAT`, and above 2^53 the comparison is *exact*,
+/// so `9007199254740993 = 9007199254740992.0` is `FALSE` even though the first rounds to the second in
+/// `f64` (`rmp` task #894). The digest therefore only ever chooses a bucket; the accept/refuse decision
+/// stays with [`tuples_equal`], i.e. with [`crate::equality::equals`], exactly as before this task.
+///
+/// # Why equal values are guaranteed to share a bucket
+///
+/// The soundness obligation is one-directional and total: whenever `equals(a, b)` is `TRUE`, `a` and
+/// `b` **must** hash alike, or the walk could file a duplicate in a bucket where the probe never looks
+/// and accept a constraint the data violates. A collision in the other direction costs nothing — two
+/// unequal values sharing a bucket are separated by [`tuples_equal`].
+///
+/// [`crate::equivalence::hash_value`] discharges that obligation. It is documented consistent with
+/// [`crate::equivalence::equivalent`] (equivalent values hash alike), and definite equality is a
+/// *subset* of equivalence: the two relations differ only on `null` (`null ≡ null` but `null = null`
+/// is `NULL`) and on `NaN` (`NaN ≡ NaN` but `NaN = NaN` is `FALSE`) — neither of which is ever
+/// `Ternary::True`, so no pair `equals` calls equal escapes equivalence. Case by case that means
+/// `INTEGER` and `FLOAT` share one hash class (`1` and `1.0` collide, as they must), signed zeros are
+/// normalised, temporals hash through their derived `Hash` (consistent with the derived `PartialEq`
+/// their equality uses), points hash CRS-then-coordinates like [`graphus_core::Point::value_eq`]
+/// compares them, and lists/maps recurse — maps order-independently, matching a map equality that
+/// ignores key order. The `rmp` #894 pair lands in the *safe* direction: `hash_value` projects an
+/// integer through `f64` and is therefore deliberately **coarser** than equality above 2^53, so
+/// `9007199254740993` and `9007199254740992.0` share a bucket and are then correctly told apart by
+/// [`tuples_equal`]. Coarser is always sound here; only a *finer* hash could split an equal pair, which
+/// is why the digest must not be narrowed as the equality relation is refined.
+///
+/// # Hash-flooding resistance
+///
+/// The digest is `std`'s `DefaultHasher` — SipHash-1-3 with a per-process random seed — because the
+/// values being bucketed are client-derived property values (SEC-210 / CWE-407); a fixed-seed hasher
+/// over them would let an attacker seed a label whose values all collide and restore the quadratic
+/// walk on demand. The outer map is an [`rustc_hash::FxHashMap`] because its key is that digest, which
+/// is already a SipHash output — re-hashing it under SipHash would be pure waste. This is the same
+/// split `group_key_hash` makes, and for the same reason. The tuple length is mixed in first, so a
+/// 1-tuple and a 2-tuple cannot collide trivially.
+///
+/// # The one residual, and why it is bounded
+///
+/// The numeric coarsening above is the single input shape that can still stack a bucket, since a
+/// bucket is searched linearly: distinct `INTEGER`s that round to one double share a key, and no
+/// random seed separates them (they must share a key, or `1 = 1.0` would break). It is **bounded**
+/// rather than open-ended. A double in `[2^e, 2^(e+1))` has spacing `2^(e-52)`, and an `i64` reaches
+/// only `e ≤ 62`, so at most `2^10` = 1024 distinct integers can ever collapse onto one double. The
+/// worst case is therefore O(entities × 1024) comparisons — still linear in the corpus, with a
+/// constant an attacker cannot raise — and it is reachable only by values deliberately packed above
+/// 2^53. Every other value class goes through the seeded SipHash, where buckets cannot be stacked at
+/// all.
+struct SeenTuples {
+    /// Every recorded tuple, in first-seen order.
+    tuples: Vec<Vec<Value>>,
+    /// Digest → the ordinals in `tuples` whose tuple hashes there. Normally singleton.
+    index: rustc_hash::FxHashMap<u64, Vec<usize>>,
+}
+
+impl SeenTuples {
+    /// An empty set.
+    fn new() -> Self {
+        Self {
+            tuples: Vec::new(),
+            index: rustc_hash::FxHashMap::default(),
+        }
+    }
+
+    /// The bucketing digest of `tuple` (see the type docs for the invariant it must satisfy).
+    ///
+    /// Deliberately *not* required to agree with any other digest in the codebase — it is a private
+    /// bucketing device of this set, so it can hash [`Value`]s directly instead of wrapping each in a
+    /// `RowValue` the way `group_key_hash` must.
+    fn digest(tuple: &[Value]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        tuple.len().hash(&mut h);
+        for v in tuple {
+            crate::equivalence::hash_value(v, &mut h);
+        }
+        h.finish()
+    }
+
+    /// Whether a tuple **Cypher-equal** to `tuple` has already been recorded.
+    ///
+    /// Probes one bucket and confirms every candidate in it with [`tuples_equal`], so the answer is
+    /// identical to the linear scan this replaced — only the number of comparisons differs.
+    fn contains_equal(&self, tuple: &[Value]) -> bool {
+        self.index
+            .get(&Self::digest(tuple))
+            .is_some_and(|bucket| bucket.iter().any(|&i| tuples_equal(&self.tuples[i], tuple)))
+    }
+
+    /// Records `tuple` as seen. Call only after [`contains_equal`](Self::contains_equal) reported
+    /// `false`; recording a duplicate would not corrupt the set, but the walk refuses the constraint
+    /// before it can happen.
+    fn record(&mut self, tuple: Vec<Value>) {
+        let digest = Self::digest(&tuple);
+        self.index
+            .entry(digest)
+            .or_default()
+            .push(self.tuples.len());
+        self.tuples.push(tuple);
+    }
+}
+
 /// A declared constraint resolved to human-readable names, for the `SHOW CONSTRAINTS` surface
 /// (`rmp` tasks #99, #100). Carries the covered label, the **whole** covered property tuple (one for a
 /// non-composite kind, several for a node key), the [`ConstraintKind`] and (for a property-type
@@ -847,6 +1000,29 @@ struct ActiveTxn {
     /// reap a transaction whose lifetime exceeds the configured cap — freeing the GC watermark
     /// ([`TxnCoordinator::oldest_active_snapshot`]) it would otherwise pin indefinitely.
     begin_nanos: Option<u64>,
+}
+
+/// Everything one constraint-validation walk needs to decide *what it sees* and *what it announces*
+/// (`rmp` task #903) — bundled so the two already-long validator signatures do not grow two more
+/// positional parameters.
+///
+/// The walk runs inside the constraint DDL's own first-class transaction, so it carries that
+/// transaction's [`Snapshot`] (whose `owner` is the DDL transaction id, which is also the SIREAD
+/// marker's subject) together with the covered token and constraint kind that decide the marker shape
+/// (node `Label`/`Equality` versus relationship `RelType`/`RelEquality`).
+#[derive(Debug, Clone, Copy)]
+struct ConstraintWalkCtx<'a> {
+    /// The DDL transaction's snapshot: what the walk may see, and whose id the markers are recorded
+    /// under (`snapshot.owner`).
+    snapshot: Snapshot,
+    /// The constraint kind, which selects the node or the relationship marker family.
+    kind: ConstraintKind,
+    /// The covered token — a node-label token for the node kinds, a relationship-type token for the
+    /// `Rel*` kinds.
+    token: u32,
+    /// The cancellation token an operator's `TERMINATE TRANSACTIONS` trips (`rmp` task #903). Polled
+    /// once per entity, which is the only granularity that can interrupt an O(store) walk.
+    cancel: &'a CancellationToken,
 }
 
 /// One in-progress **non-blocking** node-property index build (`rmp` task #91).
@@ -1543,8 +1719,9 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// # Why this is a second pass, not a fold into the build scan
     ///
     /// The index build's scan ([`index_one_node`](Self::index_one_node)) reads through
-    /// `RecordStore::node_labels` / `node_property_values` — **raw** store reads with no MVCC
-    /// visibility filtering. That is sound for the *tree*, which is a **candidate** source: a seek
+    /// `RecordStore::node_labels` / `superset_scan_node_property_values` — **raw** store reads with
+    /// no MVCC visibility filtering. That is sound for the *tree*, which is a **candidate** source:
+    /// a seek
     /// re-checks every candidate against the reader's snapshot, so an extra invisible version costs a
     /// rejected candidate, never a wrong answer. A histogram has no such re-check — it is consumed
     /// **directly** as an estimate — so folding it into that scan would describe a graph that never
@@ -2610,12 +2787,15 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         registered: &[(u32, Vec<u32>)],
     ) {
         // The node's label tokens + EVERY version of its properties (with MVCC stamps), read in one
-        // store-borrow scope. Read-only: `node_labels` / `node_properties` are `&self` (`rmp` #337
-        // Slice 2). `node_properties` is used rather than `node_property_values` because the latter
-        // strips the stamps, and the per-view tuple construction below needs them (`rmp` task #766).
+        // store-borrow scope. Read-only: `node_label_superset` / `node_properties` are `&self`
+        // (`rmp` #337 Slice 2). `superset_scan_node_properties` is used rather than
+        // `superset_scan_node_property_values` because the latter strips the stamps, and the
+        // per-view tuple construction below needs them (`rmp` task #766). The membership gate is
+        // the LIVE-OR-RETAINED label superset, never the raw live word (`rmp` task #904) — see
+        // `RecordStore::node_label_superset`.
         let (label_tokens, props, registry): (Vec<u32>, Vec<(u32, PropVersion)>, CommitRegistry) = {
             let store = store.borrow();
-            let labels = match store.node_labels(id) {
+            let labels = match store.node_label_superset(id) {
                 Ok(l) => l,
                 Err(_) => {
                     // `rmp` task #733: record the gap instead of hiding it — an entity missing from
@@ -2625,8 +2805,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     return;
                 }
             };
-            let chain = match store.node_properties(id) {
-                Ok(chain) => chain,
+            let chain = match store.superset_scan_node_properties(id) {
+                Ok(chain) => chain.into_every_version(),
                 Err(_) => {
                     // `rmp` task #733: record the gap instead of hiding it — an entity missing from
                     // the index is a candidate a seek can never resurrect, so the build that drove
@@ -2708,8 +2888,22 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         id: u64,
         registered: &[(u32, u32)],
     ) {
-        // Read this node's current label tokens (store borrow, released before the index borrow).
-        let label_tokens = match store.borrow_mut().node_labels(id) {
+        // Read this node's label-membership SUPERSET — the live word unioned with every bitmap
+        // `LabelHistory` still retains for it (`rmp` task #904) — in a store borrow released before the
+        // index borrow.
+        //
+        // # Why the superset and not the live word (`rmp` task #904)
+        //
+        // The live word is mutated IN PLACE, so it carries an uncommitted writer's changes and is
+        // neither the committed set nor the one a future reader will see. Gating on it made this refill
+        // a SUBSET in exactly the way the version loop below is written to avoid: a refill run while a
+        // writer held an uncommitted `REMOVE n:L` skipped the node for every `(L, *)` index, the entry
+        // `clear` had just wiped was never re-inserted, and the writer's rollback restored the record's
+        // label bit but nothing restored the entry — the same asymmetry, one level up. The victim was a
+        // committed row lost to every seek for the life of the process, and — because `unique_conflict`
+        // reads this tree as an EXACT candidate source and treats `Some([])` as "no duplicate" — a live
+        // `IS UNIQUE` constraint that then admitted a duplicate. See `RecordStore::node_label_superset`.
+        let label_tokens = match store.borrow_mut().node_label_superset(id) {
             Ok(tokens) => tokens,
             Err(_) => {
                 // overflow-form bitmap or read fault: skip this node's entries.
@@ -2722,9 +2916,9 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         };
 
         // Resolve the node's property values, keyed by prop-key, so the index borrow below never
-        // overlaps a store borrow. `node_property_values` decodes the whole chain newest-first
-        // (`rmp` task #50): it holds EVERY not-yet-GC'd version of every key — the live one, the
-        // versions an older snapshot still reads, and any still-uncommitted write.
+        // overlaps a store borrow. `superset_scan_node_property_values` decodes the whole chain
+        // newest-first (`rmp` task #50): it holds EVERY not-yet-GC'd version of every key — the
+        // live one, the versions an older snapshot still reads, and any still-uncommitted write.
         //
         // # Index EVERY version, never just the newest (`rmp` task #766)
         //
@@ -2746,7 +2940,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // is the only image that serves both readers.
         let mut values: Vec<(u32, graphus_core::Value)> = Vec::new();
         {
-            let chain = match store.borrow_mut().node_property_values(id) {
+            let chain = match store.borrow_mut().superset_scan_node_property_values(id) {
                 Ok(chain) => chain,
                 Err(_) => {
                     // a non-storable / read fault: skip this node's properties.
@@ -2823,7 +3017,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // lost row but an ADMITTED COMMITTED DUPLICATE (the `rmp` #683 / #765 failure mode).
         let mut values: Vec<(u32, graphus_core::Value)> = Vec::new();
         {
-            let chain = match store.borrow().rel_property_values(id) {
+            let chain = match store.borrow().superset_scan_rel_property_values(id) {
                 Ok(chain) => chain,
                 Err(_) => {
                     // a non-storable / read fault: skip this relationship's properties.
@@ -2888,12 +3082,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             return;
         }
         // EVERY version of the relationship's properties, with MVCC stamps (`rmp` task #766):
-        // `rel_properties` rather than `rel_property_values`, which strips the stamps the per-view
-        // tuple construction needs.
+        // `rel_properties` rather than `superset_scan_rel_property_values`, which strips the stamps
+        // the per-view tuple construction needs.
         let (props, registry): (Vec<(u32, PropVersion)>, CommitRegistry) = {
             let store = store.borrow();
-            let chain = match store.rel_properties(id) {
-                Ok(chain) => chain,
+            let chain = match store.superset_scan_rel_properties(id) {
+                Ok(chain) => chain.into_every_version(),
                 Err(_) => {
                     // a non-storable / read fault: skip this relationship's properties.
                     // `rmp` task #733: record the gap instead of hiding it — an entity missing from
@@ -2975,13 +3169,21 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         index: &Rc<RefCell<IndexSet>>,
         id: u64,
     ) {
-        // Read the node's labels, the covered full-text keys, its STAMPED property chain (newest-first)
-        // and the commit registry in one shared borrow scope (`node_labels` / `node_properties` are
-        // `&self`, `rmp` #337 Slice 2). The chain carries MVCC stamps (`node_properties`, not
-        // `node_property_values`) because the #778 gate below must resolve the newest version's writer.
+        // Read the node's label-membership SUPERSET (`rmp` task #904 — the live word unioned with every
+        // bitmap `LabelHistory` retains, never the raw live word; see
+        // `RecordStore::node_label_superset`), the covered full-text keys, its STAMPED property chain
+        // (newest-first) and the commit registry in one shared borrow scope (`node_label_superset` /
+        // `node_properties` are `&self`, `rmp` #337 Slice 2). The chain carries MVCC stamps
+        // (`node_properties`, not `superset_scan_node_property_values`) because the #778 gate below
+        // must resolve the newest version's writer.
+        //
+        // Widening only the LABEL component is sound here even though this consumer re-checks no term:
+        // `RecordStoreGraph::fulltext_query` re-checks a hit's visibility and current label
+        // (`filter_any_label_candidates`), so a document indexed under a label the node does not carry
+        // at the reader's snapshot is dropped whole.
         let (label_tokens, covered, chain) = {
             let store = store.borrow();
-            let label_tokens = match store.node_labels(id) {
+            let label_tokens = match store.node_label_superset(id) {
                 Ok(tokens) => tokens,
                 Err(_) => {
                     // `rmp` task #733: record the gap instead of hiding it — an entity missing from
@@ -2994,8 +3196,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             let covered = index
                 .borrow()
                 .fulltext_covered_keys_for_labels(&label_tokens);
-            let chain = match store.node_properties(id) {
-                Ok(chain) => chain,
+            let chain = match store.superset_scan_node_properties(id) {
+                Ok(chain) => chain.into_every_version(),
                 Err(_) => {
                     Self::note_rebuild_gap(index);
                     return;
@@ -3074,8 +3276,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ) {
         // The relationship's type, covered full-text keys, STAMPED property chain and the commit
         // registry in one shared borrow scope — the relationship twin of `index_one_node_fulltext`
-        // (`rmp` task #778). `rel_properties` (not `rel_property_values`) so the #778 gate can resolve
-        // the newest version's writer.
+        // (`rmp` task #778). `rel_properties` (not `superset_scan_rel_property_values`) so the #778
+        // gate can resolve the newest version's writer.
         let (type_token, covered, chain) = {
             let store = store.borrow();
             let type_token = match store.rel(id) {
@@ -3091,8 +3293,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             let covered = index
                 .borrow()
                 .fulltext_rel_covered_keys_for_type(type_token);
-            let chain = match store.rel_properties(id) {
-                Ok(chain) => chain,
+            let chain = match store.superset_scan_rel_properties(id) {
+                Ok(chain) => chain.into_every_version(),
                 Err(_) => {
                     Self::note_rebuild_gap(index);
                     return;
@@ -3191,7 +3393,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // type, in chain order (newest first) — NOT collapsed newest-wins (`rmp` task #779).
         let mut values: Vec<(u32, Value)> = Vec::new();
         {
-            let chain = match store.borrow().rel_property_values(id) {
+            let chain = match store.borrow().superset_scan_rel_property_values(id) {
                 Ok(chain) => chain,
                 Err(_) => {
                     // `rmp` task #733: record the gap instead of hiding it — an entity missing from
@@ -3257,7 +3459,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         id: u64,
         registered: &[(u32, u32)],
     ) {
-        let label_tokens = match store.borrow_mut().node_labels(id) {
+        // `rmp` task #904: the membership gate is the LIVE-OR-RETAINED label superset, never the raw
+        // live word — see `RecordStore::node_label_superset` for why a refill must not read the word an
+        // uncommitted `REMOVE n:L` is sitting on.
+        let label_tokens = match store.borrow_mut().node_label_superset(id) {
             Ok(tokens) => tokens,
             Err(_) => {
                 // `rmp` task #733: record the gap instead of hiding it — an entity missing from
@@ -3271,7 +3476,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // chain order (newest first) — NOT collapsed newest-wins (`rmp` task #779).
         let mut values: Vec<(u32, Value)> = Vec::new();
         {
-            let chain = match store.borrow_mut().node_property_values(id) {
+            let chain = match store.borrow_mut().superset_scan_node_property_values(id) {
                 Ok(chain) => chain,
                 Err(_) => {
                     // `rmp` task #733: record the gap instead of hiding it — an entity missing from
@@ -3335,7 +3540,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         id: u64,
         registered: &[(u32, u32)],
     ) {
-        let label_tokens = match store.borrow_mut().node_labels(id) {
+        // `rmp` task #904: the membership gate is the LIVE-OR-RETAINED label superset, never the raw
+        // live word — see `RecordStore::node_label_superset` for why a refill must not read the word an
+        // uncommitted `REMOVE n:L` is sitting on.
+        let label_tokens = match store.borrow_mut().node_label_superset(id) {
             Ok(tokens) => tokens,
             Err(_) => {
                 // `rmp` task #733: record the gap instead of hiding it — an entity missing from
@@ -3349,7 +3557,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // (`rmp` task #773), keeping only string values (a text index covers strings only).
         let mut values: Vec<(u32, Value)> = Vec::new();
         {
-            let chain = match store.borrow_mut().node_property_values(id) {
+            let chain = match store.borrow_mut().superset_scan_node_property_values(id) {
                 Ok(chain) => chain,
                 Err(_) => {
                     // `rmp` task #733: record the gap instead of hiding it — an entity missing from
@@ -3395,7 +3603,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         id: u64,
         registered: &[(u32, u32)],
     ) {
-        let label_tokens = match store.borrow_mut().node_labels(id) {
+        // `rmp` task #904: the membership gate is the LIVE-OR-RETAINED label superset, never the raw
+        // live word — see `RecordStore::node_label_superset` for why a refill must not read the word an
+        // uncommitted `REMOVE n:L` is sitting on.
+        let label_tokens = match store.borrow_mut().node_label_superset(id) {
             Ok(tokens) => tokens,
             Err(_) => {
                 // `rmp` task #733: record the gap instead of hiding it — an entity missing from
@@ -3427,8 +3638,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // when a transaction *resolves*. That exact confusion is `rmp` #522 and it silently no-opped the
         // pre-#778 full-text gate; re-making it here would no-op this one.
         let conflicted_keys: Vec<u32> = {
-            let chain = match store.borrow().node_properties(id) {
-                Ok(chain) => chain,
+            let chain = match store.borrow().superset_scan_node_properties(id) {
+                Ok(chain) => chain.into_every_version(),
                 Err(_) => {
                     Self::note_rebuild_gap(index);
                     return;
@@ -3460,7 +3671,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // pre-filtered here (unlike text/spatial): `insert_vector_value` validates the embedding shape.
         let mut values: Vec<(u32, Value)> = Vec::new();
         {
-            let chain = match store.borrow_mut().node_property_values(id) {
+            let chain = match store.borrow_mut().superset_scan_node_property_values(id) {
                 Ok(chain) => chain,
                 Err(_) => {
                     // `rmp` task #733: record the gap instead of hiding it — an entity missing from
@@ -3532,8 +3743,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // `rmp` task #780 — the relationship twin of the node gate in
         // [`index_one_node_vector`](Self::index_one_node_vector); see there for the full rationale.
         let conflicted_keys: Vec<u32> = {
-            let chain = match store.borrow().rel_properties(id) {
-                Ok(chain) => chain,
+            let chain = match store.borrow().superset_scan_rel_properties(id) {
+                Ok(chain) => chain.into_every_version(),
                 Err(_) => {
                     Self::note_rebuild_gap(index);
                     return;
@@ -3560,7 +3771,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
 
         let mut values: Vec<(u32, Value)> = Vec::new();
         {
-            let chain = match store.borrow().rel_property_values(id) {
+            let chain = match store.borrow().superset_scan_rel_property_values(id) {
                 Ok(chain) => chain,
                 Err(_) => {
                     // `rmp` task #733: record the gap instead of hiding it — an entity missing from
@@ -3598,10 +3809,21 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// (Re)captures node `id`'s current value into each `registered` `(label_token, prop_key)` bitmap
     /// index it matches (`rmp` task #328). The bitmap analogue of [`index_one_node`](Self::index_one_node):
     /// the same single per-node path the full rebuild drives, so a recovered store rebuilds the
-    /// low-cardinality bitmaps store-consistently. Membership is exact (the bitmap is a candidate
-    /// SOURCE): each registered column the node carries gets the node's bit set under its current
-    /// value; a node missing the label / property contributes nothing. Store and index are borrowed in
-    /// **separate, non-overlapping** scopes (the borrow discipline of this file).
+    /// low-cardinality bitmaps store-consistently. Each registered column the node carries gets the
+    /// node's bit set under its value; a node carrying neither the label nor the property contributes
+    /// nothing. Store and index are borrowed in **separate, non-overlapping** scopes (the borrow
+    /// discipline of this file).
+    ///
+    /// # This refill produces a candidate SUPERSET, not exact membership
+    ///
+    /// The write path maintains a bitmap membership-EXACT (remove-then-reinsert, `rmp` #453) and the
+    /// abort re-derive ([`rederive_node_bitmap`](Self::rederive_node_bitmap)) restores that exactness
+    /// after a rollback. A *refill* cannot, and must not try: it has no reader and therefore no
+    /// snapshot, so it indexes every property version rather than collapsing newest-wins (`rmp` #766)
+    /// and gates membership on the live-OR-retained label superset rather than the raw live word
+    /// (`rmp` #904). Both widenings exist for the same reason — a bitmap is a candidate SOURCE, so an
+    /// extra membership is a false positive its consumer's re-check drops, while a node it wrongly
+    /// OMITS is a committed row no re-check can ever resurrect.
     fn index_one_node_bitmap(
         store: &Rc<RefCell<RecordStore<D, S>>>,
         index: &Rc<RefCell<IndexSet>>,
@@ -3611,15 +3833,19 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // Skip a slot that is not in use (`rmp` #453, F-IDX-3): the rebuild/declare callers only pass
         // ids from the in-use scan, but the abort re-derive (`rederive_node_bitmap`) may pass a node
         // whose CREATE was just rolled back — a header-only create-undo (#220) clears the slot's in-use
-        // bit but PRESERVES its body, so `node_labels`/`node_property_values` below would still decode
-        // residual labels/values and wrongly RE-INSERT a phantom. Guarding on `in_use` keeps a
-        // reverted-create node out of every bitmap (correct: it no longer exists), and is a defensive
+        // bit but PRESERVES its body, so `node_labels`/`superset_scan_node_property_values` below
+        // would still decode residual labels/values and wrongly RE-INSERT a phantom. Guarding on
+        // `in_use` keeps a reverted-create node out of every bitmap (correct: it no longer exists),
+        // and is a defensive
         // no-op for the rebuild/declare callers (their nodes are always in use).
         match store.borrow().node(id) {
             Ok(node) if node.mvcc.in_use() => {}
             _ => return, // not in use, or a read fault: contribute nothing (the bitmap stays cleared).
         }
-        let label_tokens = match store.borrow_mut().node_labels(id) {
+        // `rmp` task #904: the membership gate is the LIVE-OR-RETAINED label superset, never the raw
+        // live word — see `RecordStore::node_label_superset` for why a refill must not read the word an
+        // uncommitted `REMOVE n:L` is sitting on.
+        let label_tokens = match store.borrow_mut().node_label_superset(id) {
             Ok(tokens) => tokens,
             Err(_) => {
                 // `rmp` task #733: record the gap instead of hiding it — an entity missing from
@@ -3637,7 +3863,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // more than one of its versions is live.
         let mut values: Vec<(u32, Value)> = Vec::new();
         {
-            let chain = match store.borrow_mut().node_property_values(id) {
+            let chain = match store.borrow_mut().superset_scan_node_property_values(id) {
                 Ok(chain) => chain,
                 Err(_) => {
                     // `rmp` task #733: record the gap instead of hiding it — an entity missing from
@@ -4515,10 +4741,23 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         Ok(())
     }
 
-    /// Rebuilds one declared zone-map column exactly from the current store: scans the in-use nodes
-    /// that carry the label and captures `(id, value)` for the property, then installs the exact
-    /// per-zone summary. Reads committed state without a snapshot (like the index rebuild); the scan's
-    /// per-row re-check makes any later staleness harmless.
+    /// Rebuilds one declared zone-map column from the current store: scans the in-use nodes that carry
+    /// the label and captures `(id, value)` for the property, then installs the per-zone summary.
+    /// Reads without a snapshot, like the index rebuild.
+    ///
+    /// # A zone map PRUNES, so an omitted node is a lost row (`rmp` task #904)
+    ///
+    /// This used to claim that "the scan's per-row re-check makes any later staleness harmless". That
+    /// is true of a *widened* zone and false of a *narrowed* one: `zone_scan_eq`'s re-check only ever
+    /// runs on the ids `candidate_ranges_eq` did not prune, so a node this rebuild leaves out of its
+    /// zone's `[min, max]` — when it was that zone's only carrier of the value — makes the whole id
+    /// range disappear before any re-check happens. The membership gate is therefore the live-OR-
+    /// retained label superset, exactly as the index refills use
+    /// ([`RecordStore::node_label_superset`](graphus_storage::RecordStore::node_label_superset)): a
+    /// rebuild run while a writer holds an uncommitted `REMOVE n:L` must not narrow a zone on the
+    /// strength of a change that writer may roll back. Nothing repairs a zone map afterwards — there is
+    /// no rebuild on open and no rollback hook, only a later write to the same node — so the loss would
+    /// be permanent.
     fn rebuild_zone_column(&self, label_token: u32, prop_key: u32) {
         // Read-only store access (`rmp` #337 Slice 2): the rebuild scan only reads.
         let node_ids = match self.store.borrow().scan_node_ids() {
@@ -4529,11 +4768,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         for id in node_ids {
             let (labels, chain) = {
                 let store = self.store.borrow();
-                let labels = match store.node_labels(id) {
+                // `rmp` task #904: the live-OR-retained superset, never the raw live word — see this
+                // method's doc for why a narrowed zone is unrecoverable.
+                let labels = match store.node_label_superset(id) {
                     Ok(l) => l,
                     Err(_) => continue,
                 };
-                let chain = match store.node_property_values(id) {
+                let chain = match store.superset_scan_node_property_values(id) {
                     Ok(c) => c,
                     Err(_) => continue,
                 };
@@ -4553,10 +4794,29 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
 
     /// Candidate-and-confirmed node ids for `label` whose `property` **equals** `value`, driven by the
     /// zone-map data-skipping sidecar (`rmp` #331): only the id zones the summary cannot exclude are
-    /// examined, and each examined node is authoritatively re-checked (in-use, current label, current
-    /// value) — so the result is **exactly** the committed matching set regardless of zone staleness.
-    /// `None` if no zone map is declared for the column (the caller scans normally). After the call,
+    /// examined, and each examined node is re-checked (in-use, label, value). `None` if no zone map is
+    /// declared for the column (the caller scans normally). After the call,
     /// [`zone_map_zones_skipped`](Self::zone_map_zones_skipped) reports how many zones were pruned.
+    ///
+    /// # This reads CURRENT state, not a snapshot — it is not a transactional read path
+    ///
+    /// This doc used to promise "**exactly** the committed matching set regardless of zone staleness".
+    /// It delivers neither half (`rmp` task #904):
+    ///
+    /// * the re-check reads the **raw live** label word and `mvcc.in_use()`, not
+    ///   [`RecordStore::label_bitmap_at`](graphus_storage::RecordStore::label_bitmap_at) and
+    ///   `is_visible`, so a concurrent uncommitted `REMOVE n:L` hides a matching node and a concurrent
+    ///   uncommitted `SET n:L` yields a phantom — dirty reads in both directions;
+    /// * "regardless of zone staleness" holds only for a zone that is too WIDE. A zone the rebuild
+    ///   narrowed is pruned by `candidate_ranges_eq` before any re-check runs (see
+    ///   [`rebuild_zone_column`](Self::rebuild_zone_column), whose membership gate is widened for
+    ///   exactly this reason).
+    ///
+    /// [`TxnCoordinator`] holds no statement snapshot, so this cannot be made snapshot-isolated where
+    /// it stands: `label_bitmap_at` needs a `(Snapshot, CommitRegistry)` pair that only a statement seam
+    /// has. It is a **current-state** diagnostic surface, and the only callers today are
+    /// `tests/zone_map_skipping.rs`; no planner or executor path reaches it. Wiring it into a query
+    /// path requires moving it to a seam that carries a snapshot first.
     #[must_use]
     pub fn zone_scan_eq(&self, label: &str, property: &str, value: &Value) -> Option<Vec<u64>> {
         let (label_token, prop_key) = {
@@ -4588,7 +4848,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                         Ok(l) => l,
                         Err(_) => continue,
                     };
-                    let chain = match store.node_property_values(id) {
+                    let chain = match store.superset_scan_node_property_values(id) {
                         Ok(c) => c,
                         Err(_) => continue,
                     };
@@ -4674,7 +4934,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     Ok(l) => l,
                     Err(_) => continue,
                 };
-                let chain = match store.node_property_values(id) {
+                let chain = match store.superset_scan_node_property_values(id) {
                     Ok(chain) => chain,
                     Err(_) => continue,
                 };
@@ -4686,8 +4946,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 if !label_tokens.contains(&label_token) {
                     continue;
                 }
-                // `node_property_values` decodes the chain newest-first, so the FIRST occurrence of the
-                // key is the newest in-use version — its pid is the staleness witness.
+                // `superset_scan_node_property_values` decodes the chain newest-first, so the FIRST
+                // occurrence of the key is the newest in-use version — its pid is the staleness witness.
                 if let Some((pid, _key, value)) = props.iter().find(|(_, key, _)| *key == prop_key)
                 {
                     // A null value is never stored as a property (Cypher), so any present record holds a
@@ -6821,13 +7081,87 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         if_not_exists: bool,
         or_replace: bool,
     ) -> Result<bool> {
+        self.create_constraint_ddl_cancellable(
+            name,
+            covering,
+            properties,
+            kind,
+            type_descriptor,
+            if_not_exists,
+            or_replace,
+            &CancellationToken::new(),
+        )
+    }
+
+    /// [`create_constraint_ddl`](Self::create_constraint_ddl) with a **cancellation token** the
+    /// validation walk polls, so an operator can abort a long-running `CREATE CONSTRAINT` with
+    /// `TERMINATE TRANSACTIONS` (`rmp` task #903).
+    ///
+    /// The naming mirrors the executor's own
+    /// [`execute_with_extensions_cancellable`](crate::executor::execute_with_extensions_cancellable):
+    /// the plain entry point is the same call with a token that is never cancelled, so no existing
+    /// caller changes behaviour.
+    ///
+    /// # Why a parameter and not a field on the coordinator
+    ///
+    /// A token stored on `self` and cleared after the call is a latch, and a latch that survives one
+    /// early return poisons every later DDL in the process — the exact shape of the `rmp` #467/#803
+    /// full-text marker defect. Passing it explicitly makes its lifetime the call's lifetime.
+    ///
+    /// # Errors
+    /// As [`create_constraint_ddl`](Self::create_constraint_ddl), plus a
+    /// [`GraphusError::Transaction`] when the token is cancelled during validation. A cancelled DDL
+    /// has **zero** side effects — see
+    /// [`create_constraint_general_cancellable`](Self::create_constraint_general_cancellable).
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_constraint_ddl_cancellable(
+        &mut self,
+        name: &str,
+        covering: &str,
+        properties: &[&str],
+        kind: ConstraintKind,
+        type_descriptor: Option<ConstraintTypeDescriptor>,
+        if_not_exists: bool,
+        or_replace: bool,
+        cancel: &CancellationToken,
+    ) -> Result<bool> {
         if or_replace {
+            // The `rmp` #902 concurrency guard is applied HERE, before the drop, and not once at the
+            // top of this function: an `OR REPLACE` drops before it creates, so refusing only inside
+            // the create would leave the operator with the old constraint dropped and the new one not
+            // declared — for a condition a retry would have cleared. Every other arm reaches the same
+            // guard inside `create_constraint_general`, *after* the resolutions below.
+            self.refuse_constraint_ddl_while_writers_open(name)?;
+            // The cancellation pre-flight runs HERE, before the drop, for exactly the reason the #902
+            // guard above does (`rmp` task #903). An `OR REPLACE` drops before it creates, so a
+            // cancellation observed only inside the create would leave the operator with the old
+            // constraint gone and the new one not declared — the one half-applied state this command
+            // must never produce. Checked once here; the create below re-checks per entity, and
+            // cancelling *it* leaves precisely the state a failed re-create already leaves.
+            Self::check_constraint_ddl_cancelled(name, cancel)?;
             // Drop any existing constraint of this name, then (re)create. A replace always mutates.
             let _ = self.drop_constraint(name)?;
-            self.create_constraint_general(name, covering, properties, kind, type_descriptor)?;
+            self.create_constraint_general_cancellable(
+                name,
+                covering,
+                properties,
+                kind,
+                type_descriptor,
+                cancel,
+            )?;
             return Ok(true);
         }
         // Detect any conflict once (read-only): a same-name constraint, or an equivalent-schema one.
+        // Resolved BEFORE the `rmp` #902 concurrency guard (which `create_constraint_general` applies),
+        // so that neither of the two answers below is displaced by it:
+        //
+        // * an `IF NOT EXISTS` that resolves to an existing equivalent constraint validates nothing and
+        //   decides nothing, so there is no stale data to be misled by and no reason to refuse it. This
+        //   is the canonical application-startup idiom — refusing it on a busy server would make every
+        //   boot load-dependent for a call that changes nothing.
+        // * a name/schema conflict is a PERMANENT error. Reporting it as the retryable transaction error
+        //   would make drivers retry (`Neo.TransientError` is retryable by contract) a call that cannot
+        //   ever succeed, and then surface a different error once the writer happened to close.
         let name_taken = self.store.borrow().constraint(name).is_some();
         let schema_taken =
             self.constraint_schema_exists(covering, properties, kind, type_descriptor.as_ref());
@@ -6847,7 +7181,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 return Err(equivalent_constraint_exists(covering, properties));
             }
         }
-        self.create_constraint_general(name, covering, properties, kind, type_descriptor)?;
+        self.create_constraint_general_cancellable(
+            name,
+            covering,
+            properties,
+            kind,
+            type_descriptor,
+            cancel,
+        )?;
         Ok(true)
     }
 
@@ -6882,6 +7223,125 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         })
     }
 
+    /// Refuses a `CREATE CONSTRAINT` while any other transaction holds **uncommitted writes**
+    /// (`rmp` task #902) — the fail-closed answer to "a write I cannot see could falsify the
+    /// assertion I am about to publish".
+    ///
+    /// # What `rmp` task #903 replaced, and what this still covers
+    ///
+    /// Task #903 made the DDL a first-class SSI transaction: it reads through its own [`Snapshot`] and
+    /// announces a predicate footprint — the coarse token marker
+    /// ([`note_constraint_token_read`](Self::note_constraint_token_read)) together with one precise
+    /// per-value marker ([`note_constraint_value_read`](Self::note_constraint_value_read)) for every
+    /// value it inspects — so a transaction that writes
+    /// inside that footprint closes an rw-edge into the DDL and is aborted by the pivot rule. That
+    /// closes the window this guard never could — the *declare-while-open* window, where nothing is
+    /// uncommitted when the DDL runs but an already-open transaction later writes a duplicate its own
+    /// snapshot hides from it (guarded by the DST scenario
+    /// `graphus_dst::isolation` `constraint_declared_while_an_older_reader_is_open_903`).
+    ///
+    /// It does **not** subsume this guard, and the reason is a property of predicates rather than an
+    /// omission. An rw-edge needs *both* endpoints to have announced something that matches. A
+    /// transaction holding an uncommitted write that would falsify the constraint may have announced
+    /// **nothing the DDL can pair with**, in three verified ways:
+    ///
+    /// 1. **A blind write announces no read.** `CREATE (:P {email: 'a'})` in a transaction opened
+    ///    *before* the constraint existed performs no duplicate check — there was no constraint to
+    ///    enforce — so it registers no SIREAD marker at all. The DDL's own marker gives `DDL --rw--> W`,
+    ///    but a single rw-edge is not a dangerous structure and nothing aborts. Closing it would need
+    ///    the *writer* to have read something the DDL wrote, i.e. every write to announce a predicate
+    ///    read over the schema of the labels/properties it touches. That is a new
+    ///    [`PredicateRead`] variant on the hot write path and a change to the whole engine's abort
+    ///    profile — an architecture decision, deliberately not taken here.
+    /// 2. **A relationship property write is gated on the schema already existing.**
+    ///    `RecordStoreGraph::note_rel_property_predicate_write` (the `SET r.p = v` form) announces its
+    ///    `RelEquality` marker only when `IndexSet::rel_equality_marker_possible` holds for
+    ///    `(type, property)` — which, for the very constraint being declared, it does not yet. So an
+    ///    in-flight `SET r.p = v` announces no marker the DDL's walk can pair with, whichever marker the
+    ///    DDL holds.
+    /// 3. **Not every store writer is SSI-tracked.** [`TxnCoordinator::raw_txn`](Self::raw_txn) — the
+    ///    bulk-ingestion escape hatch — opens a transaction on the store alone, with no tracker entry
+    ///    and no footprint. [`RecordStore::uncommitted_data_writer`] sees it; the tracker cannot.
+    ///
+    /// The guard is therefore kept **whole** rather than narrowed. Narrowing it to "refuse only when the
+    /// DDL has an rw-edge to an uncommitted transaction" would look precise and would be wrong on all
+    /// three counts above; narrowing it by guessing which entities an open writer might still touch is
+    /// the unsound approximation the predicate footprint exists to remove. What did change is that it is
+    /// no longer the *only* mechanism, and no longer the one the correctness of
+    /// [`decided_value_for_key`](Self::decided_value_for_key) rests on.
+    ///
+    /// # Why a guard is required by the visibility discipline, not merely nice to have
+    ///
+    /// The walk judges the graph its snapshot sees (`rmp` tasks #902, #903). That is right, and on its
+    /// own it is *strictly worse* than the raw read it replaced in one scenario: two committed nodes
+    /// hold `'a'` and `'b'`, and a concurrent transaction `W` holds an uncommitted `SET b.email = 'a'`.
+    /// Reading raw, the DDL saw `W`'s dirty `'a'` and refused — conservative, but safe. Reading through
+    /// a snapshot, it sees no duplicate and ACCEPTS; `W` then commits two `'a'`s under a live
+    /// `IS UNIQUE`, with no dangerous structure to abort anything (case 1 above) and no re-check
+    /// anywhere to catch it. A constraint that is already false when it is published is unrepairable:
+    /// the write path only ever checks *new* writes.
+    ///
+    /// # Why refuse rather than wait
+    ///
+    /// Every reference implementation excludes concurrent writers around this decision instead of
+    /// guessing: PostgreSQL's non-concurrent build takes a `ShareLock` on the table and, if it still
+    /// meets a tuple written by an unresolved transaction during a **unique** build, blocks on that
+    /// transaction's XID and re-classifies it (`heapam_handler.c`,
+    /// `XactLockTableWait` + `goto recheck`); Memgraph requires READ_ONLY/UNIQUE storage access, which
+    /// waits until no writer is open; Neo4j re-acquires the exclusive LABEL lock before validating,
+    /// which every property/label writer holds shared for its whole transaction
+    /// (`ConstraintIndexCreator.java`). Graphus cannot *block*: the writer engine is single-threaded per
+    /// database, so waiting for the open writer on the engine thread would deadlock — the writer needs
+    /// that same thread to commit. Refusing with a **retryable** error is the same decision made
+    /// non-blocking: the client retries, which is a client-side `XactLockTableWait`.
+    ///
+    /// # Scope
+    ///
+    /// It is bounded in one direction only: a transaction that has written **nothing** cannot make the
+    /// data ambiguous, so open *readers* never refuse a DDL
+    /// ([`RecordStore::uncommitted_data_writer`](graphus_storage::RecordStore::uncommitted_data_writer)).
+    /// A transaction holding only pending **catalog** DDL is likewise out of scope, deliberately: it has
+    /// mutated no node, relationship or property record, so the data this walk reads is unaffected by
+    /// whether it commits.
+    ///
+    /// It runs **before** [`begin_schema_txn`](Self::begin_schema_txn), so the DDL's own transaction —
+    /// which does become an uncommitted writer the moment it interns a token — is never its own blocker.
+    /// Keeping that order is load-bearing; moving the call below the `begin` makes every
+    /// `CREATE CONSTRAINT` refuse itself.
+    ///
+    /// This is sound only because no *new* write can appear while the DDL runs: the engine is
+    /// single-threaded per database, so the whole validate-persist-register sequence is atomic with
+    /// respect to every other writer, and off-thread reader-pool transactions never write.
+    ///
+    /// `DROP CONSTRAINT` is deliberately NOT guarded: dropping decides nothing about existing data, so
+    /// no reading of it can be stale.
+    ///
+    /// # Availability
+    ///
+    /// A refusal is retryable but not queued — unlike PostgreSQL's `XactLockTableWait`, which gets in
+    /// line, this fails fast and needs an instant with no open writer. Two things bound that: the DDL
+    /// is one command on a single-threaded engine (so "no open writer" is a real, frequent state rather
+    /// than a race to win), and a forgotten open transaction cannot block it forever, because the
+    /// server reaps transactions past the configured maximum age
+    /// ([`aged_transactions`](Self::aged_transactions), `rmp` #477). A sustained write stream can still
+    /// starve a schema change: a principal with only `Write` privilege can, without holding any schema
+    /// privilege, delay one with `Schema`. Removing that residual availability cost means removing the
+    /// guard, which means adopting one of the two designs case 1 above rules out of this task's scope.
+    ///
+    /// # Errors
+    /// Returns a retryable [`GraphusError::Transaction`] naming the constraint and the blocking
+    /// transaction. The caller has made no change at this point, so a refusal has zero side effects.
+    fn refuse_constraint_ddl_while_writers_open(&self, name: &str) -> Result<()> {
+        match self.store.borrow().uncommitted_data_writer() {
+            None => Ok(()),
+            Some(writer) => Err(GraphusError::Transaction(format!(
+                "constraint `{name}` cannot be validated while transaction {} holds uncommitted \
+                 writes; retry once it commits or rolls back",
+                writer.0
+            ))),
+        }
+    }
+
     /// Declares a **constraint** named `name` over `(label, property)` of `kind`, **validating it
     /// against existing data first** and only then **durably recording it** (`rmp` task #99) — the
     /// constraint analogue of [`create_point_index`](Self::create_point_index), but synchronous and
@@ -6889,12 +7349,20 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ///
     /// Order of operations (so a rejected creation has **zero** side effects):
     ///
-    /// 1. **Intern** the label + property-key tokens (in a dedicated transaction).
-    /// 2. **Validate** every currently-live node carrying the label against the rule
-    ///    ([`validate_existing_against_constraint`](Self::validate_existing_against_constraint)):
+    /// 0. **Refuse** outright if any other transaction holds uncommitted writes (`rmp` task #902) —
+    ///    a write the walk cannot see could falsify the assertion it is about to publish, and not every
+    ///    such write is expressible as a predicate
+    ///    ([`refuse_constraint_ddl_while_writers_open`](Self::refuse_constraint_ddl_while_writers_open)).
+    /// 1. **Open** a first-class serializable transaction
+    ///    ([`begin_schema_txn`](Self::begin_schema_txn), `rmp` task #903) and **intern** the label +
+    ///    property-key tokens in it.
+    /// 2. **Validate** every node carrying the label that this transaction's snapshot sees, against the
+    ///    rule ([`validate_existing_against_constraint`](Self::validate_existing_against_constraint)):
     ///    a uniqueness constraint rejects if two nodes share a value; an existence constraint rejects
-    ///    if a node lacks the property. On any violation the transaction is **rolled back** (no token,
-    ///    no catalog entry, no registration) and a [`ConstraintViolation`] runtime error is returned.
+    ///    if a node lacks the property. The walk announces the transaction's SSI predicate footprint as
+    ///    it goes, so a concurrent transaction that later writes inside it aborts on the dangerous
+    ///    structure. On any violation the transaction is **rolled back** (no token, no catalog entry,
+    ///    no registration) and a [`ConstraintViolation`] runtime error is returned.
     /// 3. **Persist** the catalog entry, **register** the in-memory rule, and — for a uniqueness
     ///    constraint — **register + populate** the backing node-property index, all in the committed
     ///    transaction. After commit the durable catalog and the in-memory set agree, and the write
@@ -6904,8 +7372,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ///
     /// # Errors
     /// Returns a [`ConstraintViolation`]-wrapped [`GraphusError::Runtime`] if existing data violates
-    /// the constraint, or a storage error if interning a token, recording the catalog entry, or the
-    /// committing transaction fails. On any error the constraint is left undeclared.
+    /// the constraint, a retryable [`GraphusError::Transaction`] if another transaction holds
+    /// uncommitted writes (or, in principle, if the DDL's own transaction loses an SSI validation), or
+    /// a storage error if interning a token, recording the catalog entry, or the committing transaction
+    /// fails. On any error the constraint is left undeclared.
     pub fn create_constraint(
         &mut self,
         name: &str,
@@ -6946,18 +7416,70 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         kind: ConstraintKind,
         type_descriptor: Option<ConstraintTypeDescriptor>,
     ) -> Result<()> {
+        self.create_constraint_general_cancellable(
+            name,
+            label,
+            properties,
+            kind,
+            type_descriptor,
+            &CancellationToken::new(),
+        )
+    }
+
+    /// [`create_constraint_general`](Self::create_constraint_general) with a **cancellation token**
+    /// the validation walk polls once per entity, so an operator can abort a long-running
+    /// `CREATE CONSTRAINT` with `TERMINATE TRANSACTIONS` (`rmp` task #903).
+    ///
+    /// # The cancellation window ends at the point of no return
+    ///
+    /// The token is polled during token interning and the validation walk, and **not** afterwards. The
+    /// remainder — persist the catalogue entry, commit, register the in-memory rule, rebuild the
+    /// backing index — is the atomic tail that publishes the constraint, and it is deliberately
+    /// uninterruptible: aborting inside it is what would produce a half-applied constraint (a durable
+    /// catalogue entry with no in-memory rule, or a rule with no backing index). Everything before it
+    /// is undone by one `rollback`, so a cancelled DDL is byte-for-byte the state a **refused** one
+    /// leaves: no token committed, no catalogue entry, no in-memory registration, no index rebuild, and
+    /// no leaked entry in the active set or the SSI tracker.
+    ///
+    /// This is why the walk — not the caller — owns the poll. The DDL is one synchronous command on a
+    /// single-threaded engine, so there is no other moment at which anything could observe the request
+    /// and stop it: without a poll inside the loop, a `TERMINATE TRANSACTIONS` against a
+    /// `CREATE CONSTRAINT` over a large label could only ever be noticed after the walk had already
+    /// finished, which is precisely when it no longer matters.
+    ///
+    /// # Errors
+    /// As [`create_constraint_general`](Self::create_constraint_general), plus a
+    /// [`GraphusError::Transaction`] naming the constraint when the token is cancelled.
+    pub fn create_constraint_general_cancellable(
+        &mut self,
+        name: &str,
+        label: &str,
+        properties: &[&str],
+        kind: ConstraintKind,
+        type_descriptor: Option<ConstraintTypeDescriptor>,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
         debug_assert!(
             !properties.is_empty(),
             "a constraint covers at least one property"
         );
         // Names are globally unique across every schema catalog (`rmp` task #624): reject a name already
         // used by a *different* catalog (a re-declare within the constraint catalog keeps its semantics).
+        // Checked BEFORE the concurrency guard below so a permanent error is reported as one, rather
+        // than as a condition a retry could clear.
         if Self::name_used_by_other_catalog(&self.store.borrow(), name, NameCatalog::Constraint) {
             return Err(index_name_in_use(name));
         }
-        self.next_txn_id += 1;
-        let txn = TxnId(self.next_txn_id);
-        self.store.borrow_mut().begin(txn);
+        // Never decide a constraint on data that is not yet decided (`rmp` task #902). Re-checked here
+        // and not only in `create_constraint_ddl`, because this is a public entry point in its own right.
+        // Runs BEFORE the `begin` below, so the DDL's own transaction is not its own blocker.
+        self.refuse_constraint_ddl_while_writers_open(name)?;
+        // Pre-flight cancellation check (`rmp` task #903): a DDL terminated while it was still queued
+        // behind another command on the engine's channel must not open a transaction at all. The walk
+        // polls again per entity; this one keeps the "already cancelled" case free of any side effect
+        // whatsoever, not merely of a rolled-back one.
+        Self::check_constraint_ddl_cancelled(name, cancel)?;
+        let (txn, snapshot) = self.begin_schema_txn();
 
         // Intern the covering token — a node **label** for the node kinds, a relationship **type** for
         // the `Rel*` kinds (`rmp` #638) — plus every property-key token (rolled back with the
@@ -6979,15 +7501,23 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         let (label_token, prop_keys) = match intern {
             Ok(v) => v,
             Err(e) => {
-                let _ = self.store.borrow_mut().rollback(txn);
+                let _ = self.rollback(txn);
                 return Err(e);
             }
+        };
+        // The covering token is only known after interning, so the walk context is built here.
+        let ctx = ConstraintWalkCtx {
+            snapshot,
+            kind,
+            token: label_token,
+            cancel,
         };
 
         // Validate existing data BEFORE recording anything. A violation rolls back the whole
         // transaction (so the interned tokens never become durable for a rejected create) and reports
         // the offending entity precisely. Relationship constraints scan relationships of the type; node
-        // constraints scan nodes carrying the label.
+        // constraints scan nodes carrying the label. Both walks read through `ctx.snapshot` and announce
+        // this transaction's SSI predicate footprint (`rmp` task #903).
         let validation = if kind.is_relationship() {
             self.validate_existing_rels_against_constraint(
                 name,
@@ -6997,6 +7527,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 &prop_keys,
                 kind,
                 type_descriptor.as_ref(),
+                ctx,
             )
         } else {
             self.validate_existing_against_constraint(
@@ -7007,10 +7538,11 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 &prop_keys,
                 kind,
                 type_descriptor.as_ref(),
+                ctx,
             )
         };
         if let Err(e) = validation {
-            let _ = self.store.borrow_mut().rollback(txn);
+            let _ = self.rollback(txn);
             return Err(e);
         }
 
@@ -7025,7 +7557,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 type_descriptor: type_descriptor.clone(),
             },
         );
-        self.store.borrow_mut().commit(txn)?;
+        // Committed through the coordinator (`rmp` task #903), not `store.commit`: this runs the SSI
+        // pivot check, records the commit timestamp in the tracker — which is what keeps the walk's
+        // predicate markers live for later concurrent writers to conflict with — releases the lock
+        // table, and retires the active-set entry. On an SSI abort the transaction is already rolled
+        // back by `commit` itself, so the constraint is simply not declared.
+        self.commit(txn)?;
 
         // Register the rule in the in-memory set so the write path enforces it from now on. A uniqueness
         // constraint registers + populates a backing node-property index; a node-key constraint
@@ -7099,15 +7636,238 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         Ok(())
     }
 
-    /// Scans every currently-live node carrying `label_token` and rejects if any violates the
-    /// constraint of `kind` on `prop_key` (`rmp` task #99). Used by
+    /// Opens the **first-class** transaction a validating schema DDL runs in (`rmp` task #903),
+    /// returning it together with its [`Snapshot`].
+    ///
+    /// # Why the constraint DDL stopped opening a bare transaction
+    ///
+    /// Every other schema DDL opens its transaction straight on the store — `next_txn_id += 1` then
+    /// [`RecordStore::begin`] — which is adequate for a command that *decides nothing about data*: an
+    /// index declaration, a drop, a build-chunk promotion. `CREATE CONSTRAINT` is the one schema command
+    /// that reads the whole graph and publishes a durable assertion about it, and a bare transaction is
+    /// registered in **neither** [`SsiTracker`] **nor** the active set, so it formed no rw-edge with
+    /// anything and pinned no watermark. That is what let a transaction whose snapshot predates the
+    /// constraint write a duplicate the constraint forbids, and commit it: nothing connected the two.
+    ///
+    /// Going through [`begin_serializable`](Self::begin_serializable) gives the DDL the three properties
+    /// it was missing:
+    ///
+    /// 1. an [`SsiTracker`] registration, without which `record_predicate_read` leaves an entry no
+    ///    `forget` can ever clean and `are_concurrent` returns `false` for it — so every marker it
+    ///    announced would be silently inert;
+    /// 2. an active-set entry, hence a real [`Snapshot`] to read through and a contribution to
+    ///    [`oldest_active_snapshot`](Self::oldest_active_snapshot), so GC cannot reclaim a version the
+    ///    walk is still reading;
+    /// 3. commit / rollback through [`commit`](Self::commit) and [`rollback`](Self::rollback), which
+    ///    run SSI validation and release the SSI entry, the lock table and the active-set slot under a
+    ///    drop guard (`rmp` #415) instead of leaking them.
+    ///
+    /// The DDL cannot be *spuriously* aborted by (3): it announces no predicate write and takes no
+    /// physical write marker, so [`SsiTracker::detect_pivot_abort`]'s read-only exemption
+    /// (`writes.is_empty() && !out_conflict`) applies unless a concurrent writer wrote inside its
+    /// footprint — and while it validates there is none, because
+    /// [`refuse_constraint_ddl_while_writers_open`](Self::refuse_constraint_ddl_while_writers_open) ran
+    /// first and no writer can start mid-DDL on a single-threaded engine.
+    fn begin_schema_txn(&mut self) -> (TxnId, Snapshot) {
+        let txn = self.begin_serializable();
+        // `begin_serializable` has just inserted the entry; the fallback reconstructs the identical
+        // snapshot `begin_inner` builds rather than panicking on an invariant this method owns.
+        let snapshot = self.active.get(&txn).map_or_else(
+            || Snapshot {
+                owner: txn,
+                ts: self.store.borrow().snapshot_ts(),
+            },
+            |a| a.snapshot,
+        );
+        (txn, snapshot)
+    }
+
+    /// The error a cancelled constraint-DDL walk aborts with (`rmp` task #903), or [`Ok`] while the
+    /// token is clear.
+    ///
+    /// Classified as a [`GraphusError::Transaction`] rather than a runtime error because that is what
+    /// it is: the transaction was ended by an operator, the schema is unchanged, and re-issuing the
+    /// statement is the correct client response. The server seam replaces the message with the
+    /// registry's own `TERMINATE TRANSACTIONS` wording once it has confirmed the cancellation came from
+    /// there rather than from a statement deadline.
+    ///
+    /// # Errors
+    /// Returns the abort error when `cancel` is cancelled — either explicitly flagged, or past the
+    /// deadline the token carries.
+    fn check_constraint_ddl_cancelled(name: &str, cancel: &CancellationToken) -> Result<()> {
+        if cancel.is_cancelled() {
+            return Err(GraphusError::Transaction(format!(
+                "constraint `{name}` was cancelled while it validated existing data; nothing was \
+                 changed"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Announces the constraint-DDL transaction's **coarse** predicate SIREAD marker (`rmp` task #903):
+    /// [`PredicateRead::Label`] for a node constraint, [`PredicateRead::RelType`] for a relationship
+    /// one. Registered once, before the walk, because the walk's question is universally quantified
+    /// over the token ("no node carrying `L` violates this rule"), so *any* concurrent write that makes
+    /// an entity carry the token is a phantom for it.
+    ///
+    /// This is the marker that pairs with the write footprint every node create/update/delete announces
+    /// (`RecordStoreGraph::note_predicate_write` pushes `Label(l)` for each of the node's labels) and
+    /// with the `[AnyRel, RelType]` pair `create_rel` / `delete_rel` announce. It is deliberately coarse
+    /// for the same reason the composite seek's marker is (`record_graph.rs`,
+    /// `composite_seek_eq`): a coarse `Label` only adds an rw-edge between the DDL and concurrent
+    /// same-token writers, which is exactly the population the DDL's decision depends on.
+    fn note_constraint_token_read(&self, ctx: ConstraintWalkCtx<'_>) {
+        let marker = if ctx.kind.is_relationship() {
+            PredicateRead::RelType(ctx.token)
+        } else {
+            PredicateRead::Label(ctx.token)
+        };
+        self.ssi
+            .borrow_mut()
+            .record_predicate_read(ctx.snapshot.owner, marker);
+    }
+
+    /// Announces the **precise** per-value predicate SIREAD marker for one value the walk inspected
+    /// (`rmp` task #903): [`PredicateRead::Equality`] for a node constraint,
+    /// [`PredicateRead::RelEquality`] for a relationship one.
+    ///
+    /// # Why this is not redundant with the coarse marker
+    ///
+    /// For **nodes** it is, as far as edge formation goes: `RecordStoreGraph::note_predicate_write` is
+    /// the single announcement point for every node create/update/delete, and it pushes `Label(l)`
+    /// alongside its `Equality{l, p, v}` markers, so the coarse marker already forms every edge this
+    /// one would. It is registered anyway, for symmetry with the relationship path and because it is
+    /// the marker a *future* narrowing of the coarse footprint would keep.
+    ///
+    /// For **relationships** it is load-bearing and the coarse marker is not enough:
+    /// `RecordStoreGraph::note_rel_property_predicate_write` — the `SET r.p = v` form — announces
+    /// **only** the `RelEquality{T, p, v}` marker for the key it changed, never the `[AnyRel, RelType]`
+    /// pair that `create_rel` announces. A relationship uniqueness/key constraint whose DDL held only
+    /// `RelType(T)` therefore forms no edge at all with a concurrent `SET` on an existing relationship
+    /// of that type — precisely the write that can duplicate a covered value. Measured, by disabling
+    /// this method and re-running the DST scenario
+    /// `graphus_dst::isolation` `relationship_constraint_vs_a_concurrent_property_update_903`: with the
+    /// value markers the concurrent writer is aborted and one live `'a'` remains; with only the coarse
+    /// marker it commits, leaving two committed `'a'`s under a live relationship `IS UNIQUE`.
+    ///
+    /// # Cost
+    ///
+    /// One marker per inspected value, so O(entities carrying the token) markers held until the DDL is
+    /// pruned from the tracker. That is the same order as the walk's own [`SeenTuples`] set, which
+    /// already retains every value for the duplicate search, so it does not change the memory profile
+    /// of a `CREATE CONSTRAINT`.
+    ///
+    /// # Encoding
+    ///
+    /// [`encode_equality_canonical`], never `encode_single`: the order-preserving index key tags
+    /// `Integer(1)` and `Float(1.0)` apart, so a writer of `1.0` and a DDL that read `1` would register
+    /// different markers and the rw-edge would silently never close (`rmp` #171 blocker C1). A value
+    /// that does not encode canonically (`Null` / `List` / `Map` / `NaN`) contributes no marker, which
+    /// is sound: no writer can announce one for it either, and the coarse token marker still covers
+    /// every node write and every relationship create/delete.
+    fn note_constraint_value_read(&self, ctx: ConstraintWalkCtx<'_>, prop_key: u32, value: &Value) {
+        let Ok(encoded) = encode_equality_canonical(value) else {
+            return; // not canonically encodable: no writer can hold a matching marker either
+        };
+        let marker = if ctx.kind.is_relationship() {
+            PredicateRead::RelEquality {
+                rel_type: ctx.token,
+                property: prop_key,
+                value: encoded,
+            }
+        } else {
+            PredicateRead::Equality {
+                label: ctx.token,
+                property: prop_key,
+                value: encoded,
+            }
+        };
+        self.ssi
+            .borrow_mut()
+            .record_predicate_read(ctx.snapshot.owner, marker);
+    }
+
+    /// The value node `id` holds for `prop_key` as of the walk's snapshot, **announcing** the precise
+    /// predicate SIREAD marker for it (`rmp` task #903) — the marker-registering wrapper the constraint
+    /// walk uses in place of the bare [`node_value_for_key`](Self::node_value_for_key), so that every
+    /// value the decision rests on leaves a footprint.
+    ///
+    /// # Errors
+    /// Propagates a store read fault, exactly as [`node_value_for_key`](Self::node_value_for_key) does.
+    fn constraint_node_value(
+        &self,
+        id: u64,
+        prop_key: u32,
+        ctx: ConstraintWalkCtx<'_>,
+    ) -> Result<Option<Value>> {
+        let value = self.node_value_for_key(id, prop_key, ctx.snapshot)?;
+        if let Some(v) = &value {
+            self.note_constraint_value_read(ctx, prop_key, v);
+        }
+        Ok(value)
+    }
+
+    /// The relationship analogue of [`constraint_node_value`](Self::constraint_node_value)
+    /// (`rmp` task #903).
+    ///
+    /// # Errors
+    /// Propagates a store read fault, exactly as [`rel_value_for_key`](Self::rel_value_for_key) does.
+    fn constraint_rel_value(
+        &self,
+        id: u64,
+        prop_key: u32,
+        ctx: ConstraintWalkCtx<'_>,
+    ) -> Result<Option<Value>> {
+        let value = self.rel_value_for_key(id, prop_key, ctx.snapshot)?;
+        if let Some(v) = &value {
+            self.note_constraint_value_read(ctx, prop_key, v);
+        }
+        Ok(value)
+    }
+
+    /// Scans every node visible to `ctx`'s snapshot carrying `label_token` and rejects if any violates
+    /// the constraint of `kind` on `prop_key` (`rmp` task #99). Used by
     /// [`create_constraint`](Self::create_constraint) to refuse a constraint that existing data does
     /// not satisfy. No-op success when no node carries the label.
+    ///
+    /// # The scan is physical; the decision must not be
+    ///
+    /// [`scan_node_ids`](graphus_storage::RecordStore::scan_node_ids) enumerates every **slot-occupied**
+    /// node, which includes MVCC tombstones the GC has not reclaimed — and GC has no automatic trigger
+    /// (`rmp` #305), so "not yet" can mean "never". A node the DDL's snapshot cannot see is therefore
+    /// filtered out here ([`visible_to`](Self::visible_to)), and each surviving node's property values
+    /// are resolved through the same snapshot by
+    /// [`node_value_for_key`](Self::node_value_for_key). Before `rmp` task #902 neither filter existed,
+    /// so a constraint the live data satisfies was refused over data no query can reach; `rmp` task #903
+    /// then replaced the raw stamp tests with the production [`is_visible`] predicate.
+    ///
+    /// This is the exact opposite polarity to an index *population*, which may legitimately read raw
+    /// (`rmp` #765/#766/#771): a candidate index is a superset whose seek re-checks visibility, whereas
+    /// a constraint decision is final and is never re-checked. The same reading is right there and
+    /// wrong here.
+    ///
+    /// # The walk leaves an SSI footprint (`rmp` task #903)
+    ///
+    /// It announces the coarse token marker once ([`note_constraint_token_read`](Self::note_constraint_token_read))
+    /// and one precise equality marker per value it inspects
+    /// ([`note_constraint_value_read`](Self::note_constraint_value_read)), so a transaction that later
+    /// writes inside the footprint — including one whose snapshot predates the constraint and so cannot
+    /// itself see the row that makes its write a duplicate — closes an rw-edge into the DDL and is
+    /// aborted by the pivot rule instead of committing a violation.
+    ///
+    /// # Cost, and why it is an availability property (`rmp` task #956)
+    ///
+    /// One store read and one property-chain resolution per node carrying the label, plus — for the
+    /// uniqueness kinds — an O(1) expected duplicate probe against [`SeenTuples`]. The probe used to be
+    /// a linear scan of every value already inspected, making the walk quadratic in the covered
+    /// entities. Because the walk holds this transaction's snapshot from `begin` to `commit`
+    /// (`rmp` task #903), its duration *is* the window in which it pins the GC watermark, so a
+    /// quadratic walk suspended reclamation on a live database for a quadratic time.
     ///
     /// # Errors
     /// Returns a [`ConstraintViolation`]-wrapped runtime error naming the first offending node /
     /// duplicate value (uniqueness) or the first node missing the property (existence). A store-read
-    /// fault on a node is treated as "skip that node" (best-effort), consistent with the rebuild path.
+    /// fault on a node **fails the DDL** (`rmp` task #733) — see the guard on the label read below.
     #[allow(clippy::too_many_arguments)]
     fn validate_existing_against_constraint(
         &self,
@@ -7118,13 +7878,34 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         prop_keys: &[u32],
         kind: ConstraintKind,
         type_descriptor: Option<&ConstraintTypeDescriptor>,
+        ctx: ConstraintWalkCtx<'_>,
     ) -> Result<()> {
+        self.note_constraint_token_read(ctx);
         let node_ids = self.store.borrow_mut().scan_node_ids()?;
-        // For single-property uniqueness: remember the values seen to detect a duplicate.
-        let mut seen: Vec<(Value, u64)> = Vec::new();
-        // For composite node-key uniqueness: remember the full tuples seen.
-        let mut seen_tuples: Vec<Vec<Value>> = Vec::new();
+        // The covered values seen so far, for the uniqueness kinds. One indexed set serves the
+        // single-property and the composite kinds alike — a single-property value is simply a 1-tuple —
+        // so the two can no longer drift apart, and neither is quadratic (`rmp` task #956).
+        let mut seen = SeenTuples::new();
         for id in node_ids {
+            // Cancellation is checked FIRST, before this node's record read (`rmp` task #903): the
+            // check is one atomic load, the work it guards is a store read plus a property-chain walk,
+            // and the walk is O(store) — so the poll must be inside the loop or an operator's
+            // `TERMINATE TRANSACTIONS` can only ever be observed after the walk has finished.
+            Self::check_constraint_ddl_cancelled(name, ctx.cancel)?;
+            // A node the DDL's snapshot cannot see is not part of the graph the constraint governs
+            // (`rmp` tasks #902, #903). The scan returns it because the record keeps its slot until GC
+            // reclaims it, and GC has no automatic trigger (`rmp` #305), so judging it anyway refused a
+            // valid constraint indefinitely. `rmp` task #902 filtered on a raw `expired_ts != 0`, sound
+            // only under the "no writer is open" precondition; the walk now runs inside a real
+            // transaction, so the filter is the production [`is_visible`] predicate and the decision is
+            // made over exactly the node set a `MATCH` in this transaction would return. PostgreSQL
+            // draws the same line in its index build: dead and recently-dead tuples may still be
+            // *indexed* for older snapshots, but are always "excluded from unique-checking"
+            // (`heapam_handler.c`, `HEAPTUPLE_RECENTLY_DEAD`).
+            let rec = self.store.borrow().node(id)?;
+            if !self.visible_to(ctx.snapshot, rec.mvcc.created_ts, rec.mvcc.expired_ts) {
+                continue;
+            }
             // A node whose labels cannot be read **fails the DDL** (`rmp` task #733). This used to
             // `continue`, i.e. validate the constraint against the nodes it happened to be able to read
             // — so a `CREATE CONSTRAINT … IS UNIQUE` could be ACCEPTED over data that violates it, with
@@ -7134,14 +7915,29 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             // retries once the store is readable — and it is the only answer that cannot corrupt the
             // schema's meaning. (This is the same class of defect `rmp` #733 exists to eliminate: never
             // publish a schema object you could not fully verify.)
-            let label_tokens = self.store.borrow_mut().node_labels(id)?;
+            //
+            // Decoded off the record just read, which is what `RecordStore::node_labels` does (it is a
+            // one-line delegation to the same `labels::token_ids`, erroring identically on an
+            // overflow-form bitmap) — so the whole per-node decision costs ONE record read rather than
+            // two, on a walk that is already O(store).
+            //
+            // The label word is read IN PLACE, not resolved through the snapshot: labels are stored as
+            // a bitmap on the record and are not versioned per snapshot (`rmp` #767), so unlike the
+            // property chain there is no older version to fall back to. Reading the current word is
+            // therefore correct here for the same reason it is correct for the DDL to run at all — the
+            // `rmp` #902 guard means no other transaction holds an uncommitted label change while the
+            // walk runs, and none can start mid-DDL on a single-threaded engine. If that guard is ever
+            // lifted, this read needs `RecordStore::label_bitmap_at` (the `rmp` #767 as-of-snapshot
+            // resolver the read path uses), not just the visibility filter above.
+            let label_tokens =
+                graphus_storage::labels::token_ids(rec.labels).map_err(GraphusError::from)?;
             if !label_tokens.contains(&label_token) {
                 continue; // node does not carry the covered label
             }
             match kind {
                 ConstraintKind::Existence => {
                     // A missing or null value violates the existence (NOT NULL) constraint.
-                    let value = self.node_value_for_key(id, prop_keys[0])?;
+                    let value = self.constraint_node_value(id, prop_keys[0], ctx)?;
                     if value.as_ref().is_none_or(graphus_core::Value::is_null) {
                         return Err(ConstraintViolation::Existence {
                             name: name.to_owned(),
@@ -7156,15 +7952,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     // A null/absent value never participates in uniqueness (Cypher equality treats
                     // null as never-equal), matching the index's treatment.
                     let Some(value) = self
-                        .node_value_for_key(id, prop_keys[0])?
+                        .constraint_node_value(id, prop_keys[0], ctx)?
                         .filter(|v| !v.is_null())
                     else {
                         continue;
                     };
-                    if seen
-                        .iter()
-                        .any(|(v, _)| crate::equality::equals(v, &value).is_true())
-                    {
+                    if seen.contains_equal(std::slice::from_ref(&value)) {
                         return Err(ConstraintViolation::Uniqueness {
                             name: name.to_owned(),
                             entity: ViolationEntity::Node,
@@ -7174,7 +7967,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                         }
                         .into_error());
                     }
-                    seen.push((value, id));
+                    seen.record(vec![value]);
                 }
                 ConstraintKind::Unique => {
                     // Composite uniqueness (`rmp` #651): no existence requirement — a null in any
@@ -7184,7 +7977,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     let mut complete = true;
                     for &prop_key in prop_keys {
                         match self
-                            .node_value_for_key(id, prop_key)?
+                            .constraint_node_value(id, prop_key, ctx)?
                             .filter(|v| !v.is_null())
                         {
                             Some(v) => tuple.push(v),
@@ -7197,7 +7990,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     if !complete {
                         continue;
                     }
-                    if seen_tuples.iter().any(|seen| tuples_equal(seen, &tuple)) {
+                    if seen.contains_equal(&tuple) {
                         return Err(ConstraintViolation::UniquenessComposite {
                             name: name.to_owned(),
                             entity: ViolationEntity::Node,
@@ -7207,7 +8000,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                         }
                         .into_error());
                     }
-                    seen_tuples.push(tuple);
+                    seen.record(tuple);
                 }
                 ConstraintKind::NodeKey => {
                     // Existence half: every covered property must be present and non-null.
@@ -7215,7 +8008,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     let mut complete = true;
                     for &prop_key in prop_keys {
                         match self
-                            .node_value_for_key(id, prop_key)?
+                            .constraint_node_value(id, prop_key, ctx)?
                             .filter(|v| !v.is_null())
                         {
                             Some(v) => tuple.push(v),
@@ -7235,7 +8028,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                         .into_error());
                     }
                     // Uniqueness half: the complete tuple must not have been seen before.
-                    if seen_tuples.iter().any(|seen| tuples_equal(seen, &tuple)) {
+                    if seen.contains_equal(&tuple) {
                         return Err(ConstraintViolation::NodeKeyDuplicate {
                             name: name.to_owned(),
                             entity: ViolationEntity::Node,
@@ -7245,13 +8038,13 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                         }
                         .into_error());
                     }
-                    seen_tuples.push(tuple);
+                    seen.record(tuple);
                 }
                 ConstraintKind::PropertyType => {
                     // Only a present, non-null value is type-checked (a missing/null value is allowed —
                     // property-type does not imply existence).
                     let Some(value) = self
-                        .node_value_for_key(id, prop_keys[0])?
+                        .constraint_node_value(id, prop_keys[0], ctx)?
                         .filter(|v| !v.is_null())
                     else {
                         continue;
@@ -7281,45 +8074,118 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         Ok(())
     }
 
-    /// The newest value node `id` holds for property-key token `prop_key`, or [`None`] if the node has
-    /// no such property. Reads the property chain newest-first and keeps the first occurrence — the same
-    /// newest-wins discipline the index rebuild uses (`rmp` task #99).
+    /// The value node `id` holds for property-key token `prop_key` **as of `snapshot`**, or [`None`]
+    /// if the node does not hold that property in that snapshot (`rmp` task #99). The value a
+    /// constraint decision is made on, so it must be the value a `MATCH` in the same transaction would
+    /// return — see [`decided_value_for_key`](Self::decided_value_for_key) for the resolution rule.
+    ///
+    /// The read is [`RecordStore::decision_scan_node_properties`], the **decision**-polarity member
+    /// of the pair (`rmp` task #905): it cannot be called without the snapshot, and the
+    /// [`DecidedProperties`] it returns cannot be built any other way. Reaching for the
+    /// superset-polarity twin here is what `rmp` task #902 was.
     ///
     /// # Errors
     /// Propagates a store read fault. It is deliberately **fallible** (`rmp` task #733): it used to fold
     /// a read fault into `None`, indistinguishable from "the node has no such property" — which let the
     /// constraint-validation walk that calls it treat an unreadable node as *not* violating, and so
     /// accept a `IS UNIQUE` constraint whose duplicate was hiding in that node.
-    fn node_value_for_key(&self, id: u64, prop_key: u32) -> Result<Option<Value>> {
-        let chain = self.store.borrow_mut().node_property_values(id)?;
-        Ok(chain
-            .into_iter()
-            .find(|(_pid, key, _value)| *key == prop_key)
-            .map(|(_pid, _key, value)| value))
+    fn node_value_for_key(
+        &self,
+        id: u64,
+        prop_key: u32,
+        snapshot: Snapshot,
+    ) -> Result<Option<Value>> {
+        let store = self.store.borrow();
+        let decided = store.decision_scan_node_properties(id, snapshot)?;
+        Self::decided_value_for_key(&store, &decided, prop_key)
     }
 
-    /// The newest value relationship `id` holds for property-key token `prop_key` (`rmp` #638), or
-    /// [`None`] if the relationship has no such property — the relationship analogue of
-    /// [`node_value_for_key`](Self::node_value_for_key).
+    /// The value relationship `id` holds for property-key token `prop_key` as of `snapshot`
+    /// (`rmp` #638), or [`None`] if it does not hold that property in that snapshot — the relationship
+    /// analogue of [`node_value_for_key`](Self::node_value_for_key), reading through the same
+    /// decision-polarity surface.
     ///
     /// # Errors
     /// Propagates a store read fault, for the reason documented on
     /// [`node_value_for_key`](Self::node_value_for_key) (`rmp` task #733).
-    fn rel_value_for_key(&self, id: u64, prop_key: u32) -> Result<Option<Value>> {
-        let chain = self.store.borrow().rel_property_values(id)?;
-        Ok(chain
-            .into_iter()
-            .find(|(_pid, key, _value)| *key == prop_key)
-            .map(|(_pid, _key, value)| value))
+    fn rel_value_for_key(
+        &self,
+        id: u64,
+        prop_key: u32,
+        snapshot: Snapshot,
+    ) -> Result<Option<Value>> {
+        let store = self.store.borrow();
+        let decided = store.decision_scan_rel_properties(id, snapshot)?;
+        Self::decided_value_for_key(&store, &decided, prop_key)
     }
 
-    /// Scans every currently-slot-occupied relationship of the type token `type_token` and rejects if
-    /// any violates the relationship constraint of `kind` on `prop_keys` (`rmp` #638) — the
+    /// Decodes the version of `prop_key` an already-narrowed [`DecidedProperties`] holds, or [`None`]
+    /// when the entity does not hold that key in the snapshot it was narrowed against (`rmp` tasks
+    /// #902, #903, #905).
+    ///
+    /// # Why the parameter is `DecidedProperties` and not a chain
+    ///
+    /// This helper used to take the entity's **raw** chain and resolve the key itself. The raw chain
+    /// returns every `in_use` record, and a removed version keeps its slot until GC reclaims it — which
+    /// has no automatic trigger (`rmp` #305) — so a caller who did not apply the visibility filter read
+    /// a committed `REMOVE n.email` as a present value, and `CREATE CONSTRAINT … IS UNIQUE` was refused
+    /// over a duplicate no `MATCH` can find. That was `rmp` task #902; `rmp` task #903 replaced its raw
+    /// `expired_ts != 0` patch with the production [`is_visible`] predicate, and `rmp` task #905 moved
+    /// the narrowing itself into [`SupersetProperties::decide`] so that **the resolution can no longer
+    /// be skipped**: the only value of this parameter type is one a [`Snapshot`] produced.
+    ///
+    /// Exactly one version of a key is visible to a given snapshot (a `SET` stamps the new version's
+    /// `xmin` and the old version's `xmax` with the same transaction), so the narrowing resolves a
+    /// single value rather than choosing among several.
+    ///
+    /// # Errors
+    /// Propagates a store read fault raised while decoding the value (an unreadable overflow chain).
+    ///
+    /// This decodes **only the covered key**, where the caller used to decode the entity's whole
+    /// property chain. That deliberately narrows the `rmp` #733 fail-closed surface: an unreadable
+    /// overflow chain belonging to an *unrelated* property no longer fails the DDL. Sound, because the
+    /// constraint decision depends on no other property — and the fail-closed guarantee that matters is
+    /// intact, since the chain walk itself still errors on a missing page or a malformed chain, and any
+    /// fault on the covered value still propagates.
+    fn decided_value_for_key(
+        store: &RecordStore<D, S>,
+        decided: &DecidedProperties,
+        prop_key: u32,
+    ) -> Result<Option<Value>> {
+        let Some(prop) = decided.visible_version(prop_key) else {
+            return Ok(None); // no version of this key is visible: the entity does not hold it
+        };
+        store
+            .decode_property_value(prop.type_tag, prop.value_inline)
+            .map(Some)
+    }
+
+    /// Whether the entity version carrying the MVCC stamps `created_ts` / `expired_ts` is visible to
+    /// `snapshot` (`rmp` task #903) — the constraint walk's node/relationship filter, delegating to the
+    /// one production visibility predicate [`is_visible`] so the walk judges exactly the graph a
+    /// `MATCH` in the same transaction would.
+    fn visible_to(&self, snapshot: Snapshot, created_ts: u64, expired_ts: u64) -> bool {
+        let store = self.store.borrow();
+        is_visible(snapshot, created_ts, expired_ts, store.commit_registry())
+    }
+
+    /// Scans every relationship visible to `ctx`'s snapshot carrying the type token `type_token` and
+    /// rejects if any violates the relationship constraint of `kind` on `prop_keys` (`rmp` #638) — the
     /// relationship analogue of
-    /// [`validate_existing_against_constraint`](Self::validate_existing_against_constraint). Used by
+    /// [`validate_existing_against_constraint`](Self::validate_existing_against_constraint), including
+    /// its snapshot discipline (`rmp` tasks #902/#903: invisible relationships are filtered out, values
+    /// resolve newest-visible-wins) and its SSI footprint. Used by
     /// [`create_constraint_general`](Self::create_constraint_general) to refuse a relationship
     /// constraint that existing data does not satisfy. No-op success when no relationship carries the
-    /// type. A relationship whose record cannot be read is skipped best-effort (matching the node path).
+    /// type. A relationship whose record cannot be read **fails the DDL** (`rmp` task #733).
+    ///
+    /// The per-value [`PredicateRead::RelEquality`] markers this walk announces are the load-bearing
+    /// half of its footprint, not a refinement of the coarse one — see
+    /// [`note_constraint_value_read`](Self::note_constraint_value_read) for why `RelType(T)` alone
+    /// cannot pair with a concurrent `SET r.p = v`.
+    ///
+    /// Its duplicate probe is the same O(1)-expected [`SeenTuples`] set the node walk uses, for the
+    /// reasons given there (`rmp` task #956).
     ///
     /// # Errors
     /// Returns a [`ConstraintViolation`]-wrapped runtime error (with `entity: Relationship`) naming the
@@ -7334,24 +8200,34 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         prop_keys: &[u32],
         kind: ConstraintKind,
         type_descriptor: Option<&ConstraintTypeDescriptor>,
+        ctx: ConstraintWalkCtx<'_>,
     ) -> Result<()> {
+        self.note_constraint_token_read(ctx);
         let rel_ids = self.store.borrow().scan_rel_ids()?;
-        // Single-property uniqueness: values seen so far, to detect a duplicate.
-        let mut seen: Vec<(Value, u64)> = Vec::new();
-        // Composite key uniqueness: full tuples seen so far.
-        let mut seen_tuples: Vec<Vec<Value>> = Vec::new();
+        // The covered values seen so far, for the uniqueness kinds — the relationship twin of the node
+        // walk's set, and the same one indexed structure for the single-property and composite kinds
+        // alike (`rmp` task #956).
+        let mut seen = SeenTuples::new();
         for id in rel_ids {
+            // Polled per relationship, for the reason given on the node walk (`rmp` task #903).
+            Self::check_constraint_ddl_cancelled(name, ctx.cancel)?;
             // A relationship whose record cannot be read **fails the DDL** (`rmp` task #733) — the
             // relationship twin of the node guard above. Skipping it would let a `CREATE CONSTRAINT …
             // IS UNIQUE` be accepted over data that violates it, with the duplicate hiding in the
             // unreadable slot.
-            let this_type = self.store.borrow().rel(id)?.type_id;
-            if this_type != type_token {
+            let rec = self.store.borrow().rel(id)?;
+            // A relationship the DDL's snapshot cannot see is not part of the graph the constraint
+            // governs (`rmp` tasks #902, #903) — the relationship twin of the node visibility filter,
+            // for the same reason and with the same soundness argument.
+            if !self.visible_to(ctx.snapshot, rec.mvcc.created_ts, rec.mvcc.expired_ts) {
+                continue;
+            }
+            if rec.type_id != type_token {
                 continue; // relationship does not carry the covered type
             }
             match kind {
                 ConstraintKind::RelExistence => {
-                    let value = self.rel_value_for_key(id, prop_keys[0])?;
+                    let value = self.constraint_rel_value(id, prop_keys[0], ctx)?;
                     if value.as_ref().is_none_or(graphus_core::Value::is_null) {
                         return Err(ConstraintViolation::Existence {
                             name: name.to_owned(),
@@ -7364,15 +8240,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 }
                 ConstraintKind::RelUnique if prop_keys.len() == 1 => {
                     let Some(value) = self
-                        .rel_value_for_key(id, prop_keys[0])?
+                        .constraint_rel_value(id, prop_keys[0], ctx)?
                         .filter(|v| !v.is_null())
                     else {
                         continue;
                     };
-                    if seen
-                        .iter()
-                        .any(|(v, _)| crate::equality::equals(v, &value).is_true())
-                    {
+                    if seen.contains_equal(std::slice::from_ref(&value)) {
                         return Err(ConstraintViolation::Uniqueness {
                             name: name.to_owned(),
                             entity: ViolationEntity::Relationship,
@@ -7382,7 +8255,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                         }
                         .into_error());
                     }
-                    seen.push((value, id));
+                    seen.record(vec![value]);
                 }
                 ConstraintKind::RelUnique => {
                     // Composite relationship uniqueness (`rmp` #651): no existence requirement — a null
@@ -7392,7 +8265,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     let mut complete = true;
                     for &prop_key in prop_keys {
                         match self
-                            .rel_value_for_key(id, prop_key)?
+                            .constraint_rel_value(id, prop_key, ctx)?
                             .filter(|v| !v.is_null())
                         {
                             Some(v) => tuple.push(v),
@@ -7405,7 +8278,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     if !complete {
                         continue;
                     }
-                    if seen_tuples.iter().any(|seen| tuples_equal(seen, &tuple)) {
+                    if seen.contains_equal(&tuple) {
                         return Err(ConstraintViolation::UniquenessComposite {
                             name: name.to_owned(),
                             entity: ViolationEntity::Relationship,
@@ -7415,7 +8288,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                         }
                         .into_error());
                     }
-                    seen_tuples.push(tuple);
+                    seen.record(tuple);
                 }
                 ConstraintKind::RelKey => {
                     // Existence half: every covered property must be present and non-null.
@@ -7423,7 +8296,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     let mut complete = true;
                     for &prop_key in prop_keys {
                         match self
-                            .rel_value_for_key(id, prop_key)?
+                            .constraint_rel_value(id, prop_key, ctx)?
                             .filter(|v| !v.is_null())
                         {
                             Some(v) => tuple.push(v),
@@ -7443,7 +8316,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                         .into_error());
                     }
                     // Uniqueness half: the complete tuple must not have been seen before.
-                    if seen_tuples.iter().any(|seen| tuples_equal(seen, &tuple)) {
+                    if seen.contains_equal(&tuple) {
                         return Err(ConstraintViolation::NodeKeyDuplicate {
                             name: name.to_owned(),
                             entity: ViolationEntity::Relationship,
@@ -7453,11 +8326,11 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                         }
                         .into_error());
                     }
-                    seen_tuples.push(tuple);
+                    seen.record(tuple);
                 }
                 ConstraintKind::RelPropertyType => {
                     let Some(value) = self
-                        .rel_value_for_key(id, prop_keys[0])?
+                        .constraint_rel_value(id, prop_keys[0], ctx)?
                         .filter(|v| !v.is_null())
                     else {
                         continue;
@@ -10224,6 +11097,32 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     #[must_use]
     pub fn active_count(&self) -> usize {
         self.active.len()
+    }
+
+    /// Whether the **store** still holds `txn` as an open, unresolved writer (`rmp` #955) — i.e. its
+    /// mutations are still physically present and attributable to a transaction that has neither
+    /// committed nor been undone.
+    ///
+    /// This is deliberately the *store's* answer, not this coordinator's. [`abort`](Self::abort) frees
+    /// the coordinator-level footprint (SSI markers, locks, the `active` entry) in a drop guard that
+    /// fires even when the durable undo fails or panics (`rmp` #415), because a dangling rw-edge would
+    /// false-abort innocent successors. The store's active-set entry is the opposite obligation: it
+    /// survives a failed undo precisely so that
+    /// [`uncommitted_data_writer`](RecordStore::uncommitted_data_writer) keeps the `rmp` #902
+    /// constraint-DDL guard fail-CLOSED over data nothing has undone. The two are not redundant, and
+    /// only this one distinguishes "the rollback did not happen" from "there was nothing to roll back".
+    ///
+    /// That distinction is what the engine needs: a [`rollback`](Self::rollback) of an already-resolved
+    /// or unknown transaction returns `Err` too, and it is entirely benign (the idempotent
+    /// double-rollback). Degrading an engine on *that* would take a healthy database out of service on
+    /// a routine race.
+    ///
+    /// Use this, never `commit_registry().outcome(txn) == TxnOutcome::InFlight` — that arm is dead
+    /// (always `false`), and mistaking it for this question has already caused two silent-data-loss
+    /// defects (`rmp` #522, `rmp` #778). See [`RecordStore::is_txn_active`].
+    #[must_use]
+    pub fn store_txn_unresolved(&self, txn: TxnId) -> bool {
+        self.store.borrow().is_txn_active(txn)
     }
 
     /// Test-only witness that the SSI engine still tracks `txn` (a live conflict record / dangling

@@ -44,6 +44,7 @@ pub mod fault;
 pub mod faults;
 pub mod freelist_reuse;
 pub mod harness;
+pub mod index_refill_label_gate;
 pub mod isolation;
 pub mod label_rollback_clobber;
 pub mod label_snapshot_visibility;
@@ -53,6 +54,7 @@ pub mod mode_b_batch_size_measurement;
 pub mod model;
 pub mod reader_store_growth;
 pub mod rng;
+pub mod rollback_undo_fault;
 pub mod scenarios;
 pub mod selfloop_churn;
 pub mod spatial_build_uncommitted;
@@ -85,8 +87,24 @@ pub use freelist_reuse::{
     run_freelist_reuse_after_rollback, run_freelist_reuse_crash,
 };
 pub use harness::{ScenarioReport, run_crash_scenario, run_scenario, run_with_fault};
+// The `rmp` #904 scenarios: an index refill must gate node membership on the live-OR-retained label
+// superset, so a rebuild run while a writer holds an uncommitted `REMOVE n:L` neither loses the
+// committed row nor lets a live `IS UNIQUE` constraint admit a duplicate.
+pub use index_refill_label_gate::{
+    SeekReport, UniqueReport, run_seek_across_a_committed_relabel,
+    run_seek_across_a_rolled_back_relabel, run_unique_across_a_rolled_back_relabel,
+};
 pub use model::{AckLedger, Model};
 pub use rng::DetRng;
+// The `rmp` #955 half-undone-transaction scenarios: a rollback or commit that fails part-way must
+// leave a fully-formed OPEN writer, never a transaction that has vanished from the active set with
+// its effects still on the page.
+pub use rollback_undo_fault::{
+    CommitFaultReport, GuardReport, RollbackFaultReport, WriterVisibility,
+    run_bystander_survives_failed_rollback, run_failed_commit_publishes_no_registry_entry,
+    run_guard_across_failed_commit, run_guard_across_failed_rollback,
+    run_io_error_at_commit_of_a_label_writer, run_wal_sync_failure_during_rollback,
+};
 pub use selfloop_churn::{SelfLoopChurnReport, run_selfloop_churn_crash};
 pub use spatial_build_uncommitted::{
     SpatialBuildReport, WriterEnding, run_spatial_build_uncommitted,

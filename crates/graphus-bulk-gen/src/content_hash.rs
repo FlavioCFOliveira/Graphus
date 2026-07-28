@@ -90,7 +90,7 @@ fn node_shape_bytes<D: BlockDevice, S: LogSink>(store: &mut RecordStore<D, S>, i
     // Newest-wins per key (the property chain is prepend-ordered), then sorted by key.
     let mut by_key: BTreeMap<String, String> = BTreeMap::new();
     let mut seen: HashSet<u32> = HashSet::new();
-    for (_pid, key_token, value) in store.node_property_values(id).expect("props") {
+    for (_pid, key_token, value) in store.superset_scan_node_property_values(id).expect("props") {
         if seen.insert(key_token) && !is_empty_value(&value) {
             let key = store
                 .token_name(Namespace::PropKey, key_token)
@@ -168,7 +168,10 @@ pub fn content_hash<D: BlockDevice, S: LogSink>(store: &mut RecordStore<D, S>) -
 
         let mut by_key: BTreeMap<String, String> = BTreeMap::new();
         let mut seen: HashSet<u32> = HashSet::new();
-        for (_pid, key_token, value) in store.rel_property_values(*id).expect("rel props") {
+        for (_pid, key_token, value) in store
+            .superset_scan_rel_property_values(*id)
+            .expect("rel props")
+        {
             if seen.insert(key_token) && !is_empty_value(&value) {
                 let key = store
                     .token_name(Namespace::PropKey, key_token)

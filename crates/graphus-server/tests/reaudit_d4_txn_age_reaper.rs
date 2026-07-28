@@ -70,6 +70,7 @@ fn engine_with_age_cap(clock: &SharedClock, max_age: Option<Duration>) -> (Engin
         max_age,
         // No egress-stall ceiling here (rmp #591): this gate exercises the transaction-age reaper.
         None,
+        std::sync::Arc::new(graphus_server::txn_registry::TransactionRegistry::new()),
     )
     .expect("spawn threaded engine");
     (eng, metrics)

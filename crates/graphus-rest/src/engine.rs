@@ -258,11 +258,36 @@ pub trait RestEngine {
         parameters: Vec<(String, Value)>,
     ) -> Result<Self::Stream, GraphusError>;
 
+    /// Fails when the transaction identified by `tx` has been **terminated by an administrator**
+    /// (`TERMINATE TRANSACTIONS`), after rolling it back — the resumption guard a lifecycle endpoint
+    /// applies before it treats `tx` as usable (`rmp` task #957).
+    ///
+    /// [`run`](RestEngine::run) and [`commit`](RestEngine::commit) apply the same rule themselves, so a
+    /// handler that reaches either is already covered. This method exists for the one resumption point
+    /// that reaches **neither**: the **keep-alive** `POST /db/{db}/tx/{id}` carrying an empty statement
+    /// batch, which refreshes the transaction's inactivity lease without running anything. Without this
+    /// guard a terminated transaction could be kept alive indefinitely — still pinning its MVCC
+    /// snapshot — by a client that keeps sending keep-alives, while the operator who terminated it was
+    /// told it had been stopped.
+    ///
+    /// An **unknown** handle is `Ok(())`, not an error: reporting an unknown transaction belongs to the
+    /// caller's own registry (and to `run`/`commit`), so this answers only the termination question.
+    ///
+    /// # Errors
+    /// The engine's terminated error — a non-retryable [`GraphusError::Runtime`] — when `tx` has been
+    /// terminated. An engine with no transaction registry behind it (a simulator, a test double) has
+    /// nothing to report and returns `Ok(())`.
+    fn ensure_live(&self, tx: TxHandle) -> Result<(), GraphusError>;
+
     /// Commits the transaction identified by `tx`.
+    ///
+    /// A transaction that has been **terminated by an administrator** (`TERMINATE TRANSACTIONS`) must
+    /// **not** commit: the implementation rolls it back and fails with the terminated error instead
+    /// (`rmp` task #957), the same rule the Bolt seam applies to its `COMMIT`.
     ///
     /// # Errors
     /// [`GraphusError::Transaction`] if `tx` is unknown, or on a serialization failure (retriable;
-    /// `04 §5.4`).
+    /// `04 §5.4`); the engine's terminated error if `tx` has been terminated.
     fn commit(&self, tx: TxHandle) -> Result<RunSummary, GraphusError>;
 
     /// Rolls back the transaction identified by `tx`.
@@ -270,6 +295,11 @@ pub trait RestEngine {
     /// Rolling back an unknown handle is **not** an error: rollback is idempotent so the registry's
     /// inactivity sweep (`04 §8.2`) and an explicit `DELETE` can both target the same handle without
     /// racing into a spurious failure.
+    ///
+    /// A **terminated** transaction rolls back normally rather than failing (`rmp` task #957): the
+    /// rollback is precisely what the terminating operator asked for, and refusing it would leave the
+    /// client no way to discard a transaction it has just been told is dead. Bolt's `ROLLBACK` behaves
+    /// identically.
     ///
     /// # Errors
     /// [`GraphusError::Transaction`] only for a genuine engine fault while rolling back.
@@ -284,8 +314,12 @@ pub(crate) mod mock {
     //! assert the router drove the seam correctly (e.g. that `DELETE` rolled back, that the
     //! auto-commit shortcut both ran and committed), and it enforces the `READ`-rejects-write rule so
     //! the access-mode test exercises real seam behaviour rather than a router-only check.
+    //!
+    //! It also models **administrative termination** (`rmp` task #957): [`MockEngine::terminate`] marks
+    //! a handle, after which `run` / `ensure_live` / `commit` refuse it and only `rollback` still
+    //! succeeds — the engine-side contract every REST lifecycle endpoint is gated against.
 
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Mutex;
 
     use graphus_core::{GraphusError, Value};
@@ -339,6 +373,12 @@ pub(crate) mod mock {
         /// commit-time serialization conflict so the buffered auto-commit path can be proven to return
         /// a clean `409` instead of dropping the response mid-stream.
         commit_error: Option<GraphusError>,
+        /// When set, every transaction is marked terminated the instant `begin` registers it (`rmp`
+        /// task #957) — the operator who kills a transaction in the window between an endpoint opening
+        /// it and finalising it. It is what lets a test reach the endpoints that manage their own
+        /// transaction internally (`…/tx/commit`, `…/graph`, `…/query/columnar`), where there is no
+        /// client-visible id to terminate.
+        terminate_on_begin: bool,
         inner: Mutex<Inner>,
     }
 
@@ -348,12 +388,53 @@ pub(crate) mod mock {
         txns: HashMap<u64, TxState>,
         /// The ordered log of lifecycle calls, for test assertions.
         log: Vec<String>,
+        /// Handles marked by [`MockEngine::terminate`] — the mock's stand-in for a `TERMINATE
+        /// TRANSACTIONS` flag in the server's live-transaction registry (`rmp` task #957).
+        terminated: HashSet<u64>,
     }
+
+    /// The message the mock's terminated error carries. It stands in for the server's
+    /// `txn_registry::terminated_error()`, which `graphus-rest` cannot reach (and deliberately does not
+    /// depend on): what the router contract fixes is the error **shape** — a non-retryable
+    /// [`GraphusError::Runtime`], which the problem mapper renders as a `400`/`runtime` — and that is
+    /// what the router tests assert. The exact wording is the server's, and is asserted there, on both
+    /// interfaces at once.
+    pub const TERMINATED: &str =
+        "the transaction has been terminated by an administrator (TERMINATE TRANSACTIONS)";
 
     impl MockEngine {
         #[must_use]
         pub fn new() -> Self {
             Self::default()
+        }
+
+        /// Marks every transaction terminated as soon as `begin` opens it (`rmp` task #957) — see the
+        /// field docs for why the endpoints that own their transaction internally need this.
+        #[must_use]
+        pub fn terminate_on_begin(mut self) -> Self {
+            self.terminate_on_begin = true;
+            self
+        }
+
+        /// Marks `tx` as terminated by an administrator (`rmp` task #957). Afterwards `run`,
+        /// `ensure_live` and `commit` refuse it with [`TERMINATED`]; only `rollback` still succeeds,
+        /// because rolling a terminated transaction back is what termination asks for.
+        pub fn terminate(&self, tx: TxHandle) {
+            self.inner
+                .lock()
+                .expect("INVARIANT: mutex un-poisoned")
+                .terminated
+                .insert(tx.0);
+        }
+
+        /// The terminated error, or `None` when `tx` is live.
+        fn terminated_error(&self, tx: TxHandle) -> Option<GraphusError> {
+            self.inner
+                .lock()
+                .expect("INVARIANT: mutex un-poisoned")
+                .terminated
+                .contains(&tx.0)
+                .then(|| GraphusError::Runtime(TERMINATED.to_owned()))
         }
 
         /// Canned rows for an exact query string.
@@ -444,6 +525,9 @@ pub(crate) mod mock {
                     committed: false,
                 },
             );
+            if self.terminate_on_begin {
+                inner.terminated.insert(h);
+            }
             Ok(TxHandle(h))
         }
 
@@ -453,6 +537,16 @@ pub(crate) mod mock {
             query: &str,
             _parameters: Vec<(String, Value)>,
         ) -> Result<Self::Stream, GraphusError> {
+            // A terminated transaction refuses every statement (`rmp` task #957), before any
+            // scripted result is consulted — exactly as the real seam's resumption guard does.
+            if let Some(err) = self.terminated_error(tx) {
+                self.inner
+                    .lock()
+                    .expect("INVARIANT: mutex un-poisoned")
+                    .log
+                    .push(format!("run(tx={}, q={query}) -> terminated", tx.0));
+                return Err(err);
+            }
             {
                 let mut inner = self.inner.lock().expect("INVARIANT: mutex un-poisoned");
                 inner.log.push(format!("run(tx={}, q={query})", tx.0));
@@ -521,7 +615,27 @@ pub(crate) mod mock {
             })
         }
 
+        fn ensure_live(&self, tx: TxHandle) -> Result<(), GraphusError> {
+            self.inner
+                .lock()
+                .expect("INVARIANT: mutex un-poisoned")
+                .log
+                .push(format!("ensure_live(tx={})", tx.0));
+            match self.terminated_error(tx) {
+                Some(err) => Err(err),
+                None => Ok(()),
+            }
+        }
+
         fn commit(&self, tx: TxHandle) -> Result<RunSummary, GraphusError> {
+            // A terminated transaction must NOT commit (`rmp` task #957): it rolls back and reports the
+            // termination, exactly as the real seam does.
+            if let Some(err) = self.terminated_error(tx) {
+                let mut inner = self.inner.lock().expect("INVARIANT: mutex un-poisoned");
+                inner.log.push(format!("commit(tx={}) -> terminated", tx.0));
+                inner.txns.remove(&tx.0);
+                return Err(err);
+            }
             let mut inner = self.inner.lock().expect("INVARIANT: mutex un-poisoned");
             inner.log.push(format!("commit(tx={})", tx.0));
             // rmp #530: a scripted commit-time serialization conflict — `run` already succeeded and

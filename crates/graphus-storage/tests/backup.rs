@@ -138,8 +138,9 @@ fn snapshot<D: graphus_io::BlockDevice>(store: &mut RecordStore<D, MemLogSink>) 
         adjacency.insert(neid, inc);
 
         let mut props: Vec<PropView> = store
-            .node_properties(nphys)
+            .superset_scan_node_properties(nphys)
             .expect("node properties")
+            .into_every_version()
             .into_iter()
             .map(|(_, p)| PropView {
                 key: p.key,

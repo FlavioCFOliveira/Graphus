@@ -56,6 +56,7 @@ fn threaded_engine(reader_threads: usize) -> Engine {
         reader_threads,
         metrics,
         clock,
+        std::sync::Arc::new(graphus_server::txn_registry::TransactionRegistry::new()),
     )
     .expect("spawn threaded engine")
 }

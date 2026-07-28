@@ -32,6 +32,7 @@ mod exec;
 mod handle;
 pub(crate) mod index_show;
 mod local;
+mod managed;
 pub mod privileges;
 mod read_pool;
 pub mod rest_values;
@@ -819,6 +820,12 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
     // sized with `engine_queue_capacity` (≥ `max_concurrent_queries` in any sane config), so this cap is
     // a never-reached defense-in-depth ceiling against an admission bypass — not a routine limit.
     max_parked_inline: usize,
+    // The server-wide live-transaction registry (`rmp` #637/#903), shared with both connectivity seams.
+    // The engine registers its **own** validating `CREATE CONSTRAINT` transactions here so they appear
+    // in `SHOW TRANSACTIONS` while they run and can be stopped by `TERMINATE TRANSACTIONS`. It is
+    // deliberately NOT an `Option`: an engine without a registry would silently lose that visibility,
+    // which is precisely the failure mode this wiring exists to remove, so the type system requires one.
+    transactions: Arc<crate::txn_registry::TransactionRegistry>,
 ) {
     // This engine's contribution to the server-wide open-transaction gauge (`rmp` #418): published
     // additively so the gauge sums across every database engine. Also folds the same delta into THIS
@@ -1015,6 +1022,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
                 pending_cmd: &mut pending_cmd,
                 wal_sync: &wal_sync,
                 retire_rx: &retire_rx,
+                transactions: &transactions,
             }) {
                 break 'engine;
             }
@@ -1158,6 +1166,7 @@ fn run_engine_loop<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             pending_cmd: &mut pending_cmd,
             wal_sync: &wal_sync,
             retire_rx: &retire_rx,
+            transactions: &transactions,
         }) {
             break 'engine; // Shutdown handled (drained + hardened) inside the dispatch.
         }
@@ -1270,7 +1279,10 @@ fn finish_reader<D: BlockDevice, S: LogSink>(
         }) {
             Some(Ok(_)) => metrics.record_commit_for(db),
             Some(Err(e)) => {
-                // The COMMIT failed (e.g. an SSI serialization abort): the transaction is rolled back.
+                // The COMMIT failed. An SSI abort is already rolled back; a store-level failure is not
+                // (`rmp` #955), and this reader's ticket is already gone from `open`.
+                resolve_failed_commit(coordinator, txn, degraded, "failed-reader-commit rollback");
+                // The transaction is rolled back either way.
                 // Deliver the failure to the consumer as a terminal stream item BEFORE closing the
                 // egress channel — a rolled-back auto-commit must be reported as failed/retriable, never
                 // a silent success over undone work (`04 §1.3` step 6; the rmp #238 atomicity divergence).
@@ -1294,7 +1306,14 @@ fn finish_reader<D: BlockDevice, S: LogSink>(
             match catch_recovery(metrics, degraded, "reader rollback", || {
                 coordinator.rollback(txn)
             }) {
-                Some(_) => metrics.record_abort_for(db),
+                Some(Ok(())) => metrics.record_abort_for(db),
+                Some(Err(e)) => {
+                    // `rmp` #955: an `Err` here is usually the benign idempotent rollback (which the
+                    // pre-#955 code accounted as an abort — kept, so the metric is unchanged for it).
+                    // A rollback that left the transaction OPEN in the store is not benign.
+                    degrade_on_incomplete_undo(coordinator, txn, degraded, "reader rollback", &e);
+                    metrics.record_abort_for(db);
+                }
                 None => {
                     let _ = row_tx.send(Err(GraphusError::Runtime(
                         "internal error: engine degraded (rollback recovery panicked)".to_owned(),
@@ -1610,7 +1629,9 @@ fn resume_parked_statements<
         };
         let txn = stmt.txn();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            exec::resume_inflight(&mut stmt, coord, open, extensions, metrics, db, clock)
+            exec::resume_inflight(
+                &mut stmt, coord, open, extensions, metrics, db, degraded, clock,
+            )
         }));
         match outcome {
             // Re-suspended: round-robin to the back of the queue for the next tick.
@@ -1692,11 +1713,14 @@ fn recover_panicked_resume<D: BlockDevice, S: LogSink>(
     if let Some(ticket) = open.iter().find(|(_, t)| t.txn == txn).map(|(k, _)| *k) {
         open.remove(&ticket);
     }
-    if let Some(Ok(())) = catch_recovery(metrics, degraded, "resumed statement rollback", || {
-        coord.rollback(txn)
-    }) {
-        metrics.record_abort_for(db);
-    }
+    recovery_rollback(
+        coord,
+        txn,
+        metrics,
+        degraded,
+        db,
+        "resumed statement rollback",
+    );
     metrics.record_statement_panic();
 }
 
@@ -1733,13 +1757,14 @@ fn enqueue_suspended<D: BlockDevice, S: LogSink>(
         if let Some(ticket) = open.iter().find(|(_, t)| t.txn == txn).map(|(k, _)| *k) {
             open.remove(&ticket);
         }
-        if let Some(Ok(())) =
-            catch_recovery(metrics, degraded, "overflow statement rollback", || {
-                coord.rollback(txn)
-            })
-        {
-            metrics.record_abort_for(db);
-        }
+        recovery_rollback(
+            coord,
+            txn,
+            metrics,
+            degraded,
+            db,
+            "overflow statement rollback",
+        );
     }
     stmt.deliver_terminal_error(GraphusError::Runtime(
         "server busy: in-flight statement capacity reached, retry".to_owned(),
@@ -2189,6 +2214,10 @@ struct ProcessCtx<'a, D: BlockDevice + Send + Sync + 'static, S: LogSink + Send 
     /// can release readers' GC-watermark pins BETWEEN hardened batches under a sustained write storm,
     /// instead of leaving them pinned until the engine loop's next top-of-tick sweep (`rmp` #583, F1b).
     retire_rx: &'a std::sync::mpsc::Receiver<read_pool::ReadRetirement>,
+    /// The server-wide live-transaction registry (`rmp` #637/#903): where a validating
+    /// `CREATE CONSTRAINT` registers itself, so it is visible to `SHOW TRANSACTIONS` and stoppable by
+    /// `TERMINATE TRANSACTIONS` for as long as its validation walk runs.
+    transactions: &'a Arc<crate::txn_registry::TransactionRegistry>,
 }
 
 /// Processes one received [`EngineCommand`] end-to-end (`rmp` #528): dispatches it, coalesces a
@@ -2234,6 +2263,7 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         pending_cmd,
         wal_sync,
         retire_rx,
+        transactions,
     } = ctx;
 
     // Whether a Mode A bulk-import loading session is active **before** this command is dispatched, so
@@ -2265,6 +2295,7 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
         statement_timeout,
         loading_session,
         &mut commit_batch,
+        transactions,
     ) {
         return false; // Shutdown handled (drained + hardened) inside the dispatch.
     }
@@ -2300,6 +2331,7 @@ fn process_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + S
             statement_timeout,
             loading_session,
             retire_rx,
+            transactions,
         );
         // The redo-bounding checkpoint, once, AFTER every batch is acked (the commits are all durable).
         checkpoint_after_batch(coordinator);
@@ -2375,6 +2407,9 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
     // ONE `harden_wal` for all of them (see `flush_commit_batch`). Read-only and SSI-aborted commits are
     // still answered immediately and never join the batch.
     commit_batch: &mut Vec<PendingCommit>,
+    // The server-wide live-transaction registry (`rmp` #637/#903), for the one command that registers a
+    // transaction of the engine's own: the validating `CREATE CONSTRAINT`.
+    transactions: &Arc<crate::txn_registry::TransactionRegistry>,
 ) -> bool {
     // `rmp` #409 / #414: once a statement-recovery double-panic has flagged **this** engine degraded,
     // the coordinator's in-memory state can no longer be trusted (a deep storage/MVCC invariant broke).
@@ -2454,11 +2489,20 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             // Group commit (`rmp` #528): PREPARE the commit (SSI + append `COMMIT`, no `fdatasync`) and
             // DEFER the ack into `commit_batch`; the caller hardens the whole batch with one sync and
             // then replies. A read-only or SSI-aborted commit is answered here and never batched.
-            commit_prepare_tx(coord, open, ticket, reply, commit_batch, metrics, db);
+            commit_prepare_tx(
+                coord,
+                open,
+                ticket,
+                reply,
+                commit_batch,
+                metrics,
+                db,
+                degraded,
+            );
             active_txns.publish(coord.active_count(), coord.ssi_tracked_len());
         }
         Cmd::Rollback { ticket, reply } => {
-            let out = rollback_tx(coord, open, ticket, metrics, db);
+            let out = rollback_tx(coord, open, ticket, metrics, db, degraded);
             active_txns.publish(coord.active_count(), coord.ssi_tracked_len());
             let _ = reply.send(out);
         }
@@ -2487,9 +2531,20 @@ fn dispatch_command<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + 
             }
             let _ = reply.send(out);
         }
-        Cmd::ConstraintDdl { command, reply } => {
+        Cmd::ConstraintDdl {
+            command,
+            principal,
+            reply,
+        } => {
             let mutating = !matches!(command, ConstraintCommand::Show { .. });
-            let mut out = handle_constraint_ddl(coord, &command);
+            let mut out = handle_constraint_ddl(
+                coord,
+                &command,
+                transactions,
+                db,
+                principal.as_deref(),
+                active_txns,
+            );
             // A successful mutating constraint DDL changes the schema (a new/dropped unique/existence/
             // node-key/property-type rule) — invalidate so no plan compiled under the old schema is
             // reused (`rmp` task #322).
@@ -2717,6 +2772,7 @@ fn run_statement_isolated<
             result_buffer_capacity,
             metrics,
             db,
+            degraded,
             clock,
             statement_timeout,
             commit_batch,
@@ -2808,14 +2864,14 @@ fn run_mode_b_chunk_isolated<
                  engine alive (rmp #386/#520)",
             );
             if let Some(tx) = open.remove(&ticket.0) {
-                let txn = tx.txn;
-                if let Some(Ok(())) =
-                    catch_recovery(metrics, degraded, "mode-b chunk rollback", || {
-                        coord.rollback(txn)
-                    })
-                {
-                    metrics.record_abort_for(db);
-                }
+                recovery_rollback(
+                    coord,
+                    tx.txn,
+                    metrics,
+                    degraded,
+                    db,
+                    "mode-b chunk rollback",
+                );
             }
             metrics.record_statement_panic();
             let _ = fallback.try_send_fallback(Err(GraphusError::Runtime(format!(
@@ -2863,15 +2919,11 @@ fn rollback_panicked_statement<D: BlockDevice, S: LogSink>(
         // it would unwind the single engine thread — the exact `engine_gone`-forever failure #386 set
         // out to prevent, one panic deeper. Wrap it so a double-panic flags the engine degraded and
         // keeps the loop alive instead of killing the thread.
-        let txn = tx.txn;
-        // `Some(Ok(()))` = rollback ran and succeeded → account the abort. `Some(Err(_))` (a benign
-        // rollback failure on a torn-down txn) and `None` (a caught recovery double-panic, which already
-        // flagged the engine degraded inside `catch_recovery`) both need no extra action here.
-        if let Some(Ok(())) = catch_recovery(metrics, degraded, "statement rollback", || {
-            coord.rollback(txn)
-        }) {
-            metrics.record_abort_for(db);
-        }
+        // `Some(Ok(()))` = rollback ran and succeeded → account the abort. `Some(Err(_))` is benign
+        // ONLY when the transaction is already resolved; one that left it open in the store flags the
+        // engine degraded (`rmp` #955). `None` (a caught recovery double-panic) already flagged it
+        // inside `catch_recovery`.
+        recovery_rollback(coord, tx.txn, metrics, degraded, db, "statement rollback");
     }
     metrics.record_statement_panic();
     // Best-effort terminal error to the consumer (no-op if the executor already replied / consumer
@@ -2936,6 +2988,106 @@ fn catch_recovery<R>(
             degraded.set();
             None
         }
+    }
+}
+
+/// Flags **this database's** engine degraded when a rollback returned an error and left the
+/// transaction still OPEN in the store (`rmp` #955).
+///
+/// A rollback that fails part-way is not a tidy no-op: the WAL undo, the compensation replay and the
+/// catalog reload are one indivisible repair, and the store cannot restart it from an arbitrary
+/// mid-point. So [`RecordStore::rollback`](graphus_storage::RecordStore::rollback) keeps the
+/// transaction in its active set, where every "is a writer holding uncommitted state?" gate — the
+/// `rmp` #902 constraint-DDL guard above all — keeps answering *yes*. That is the honest answer, and
+/// it is fail-safe, but it is also permanent: nothing will ever resolve that transaction. Continuing
+/// to serve statements over such a store would be serving over data the engine has admitted it cannot
+/// account for, so the database is taken out of rotation for a controlled restart, exactly as a
+/// recovery double-panic does (`rmp` #409).
+///
+/// The flag is **per-engine** and never fleet-wide (`rmp` #414): one database's unfinishable undo must
+/// not refuse work on its healthy neighbours.
+///
+/// The guard is [`TxnCoordinator::store_txn_unresolved`] and not "the rollback returned `Err`",
+/// because the overwhelmingly common `Err` is the benign idempotent one — a rollback of a transaction
+/// that was already committed, already rolled back, or never known — which leaves nothing unresolved
+/// and must never degrade anything.
+fn degrade_on_incomplete_undo<D: BlockDevice, S: LogSink>(
+    coord: &TxnCoordinator<D, S>,
+    txn: TxnId,
+    degraded: &EngineDegraded,
+    label: &'static str,
+    error: &GraphusError,
+) {
+    if !coord.store_txn_unresolved(txn) {
+        return; // Benign: an idempotent rollback of an already-resolved transaction.
+    }
+    tracing::error!(
+        target: "graphus::engine",
+        recovery = label,
+        txn = txn.0,
+        error = %error,
+        "ROLLBACK LEFT A TRANSACTION HALF-UNDONE: the durable undo failed with the transaction still \
+         open in the store, so its uncommitted writes are physically present and nothing will undo \
+         them — flagging THIS database's engine DEGRADED (readiness now reports not-ready for this \
+         database); the engine stays alive but will serve an engine-degraded error until a controlled \
+         restart (rmp #955, mirroring rmp #409/#414)",
+    );
+    degraded.set();
+}
+
+/// Resolves a transaction whose **COMMIT failed** (`rmp` #955).
+///
+/// Every commit call site removes the transaction's ticket from `open` *before* asking the coordinator
+/// to commit, and each of them documents its error arm as "an SSI serialization abort (or an inactive
+/// txn): the coordinator already rolled it back". That is true of the SSI arm and only of the SSI arm.
+/// `TxnCoordinator::commit_prepare` propagates a **storage** failure from
+/// `RecordStore::commit_prepare` — a failed catalog checkpoint, a failed `COMMIT` append — with the
+/// transaction deliberately left OPEN, because `rmp` #866 needs its count delta and schema undo log to
+/// survive for the rollback that must follow. With the ticket already gone, no client `ROLLBACK` and no
+/// inactivity sweep could ever reach it: the transaction stayed open forever, its rows physically
+/// present, holding the `rmp` #902 constraint-DDL guard closed and the GC watermark pinned for the life
+/// of the process. This is that rollback.
+///
+/// Guarded by [`TxnCoordinator::store_txn_unresolved`] so the SSI arm — which really has already rolled
+/// back — is not rolled back twice, and so a transaction that was never active is left alone.
+fn resolve_failed_commit<D: BlockDevice, S: LogSink>(
+    coord: &mut TxnCoordinator<D, S>,
+    txn: TxnId,
+    degraded: &EngineDegraded,
+    label: &'static str,
+) {
+    if !coord.store_txn_unresolved(txn) {
+        return;
+    }
+    if let Err(e) = coord.rollback(txn) {
+        degrade_on_incomplete_undo(coord, txn, degraded, label, &e);
+    }
+}
+
+/// Runs a statement-recovery rollback behind [`catch_recovery`], accounts the abort on success, and
+/// degrades the engine when the undo was left incomplete (`rmp` #955).
+///
+/// The three outcomes, and why each is handled as it is:
+///
+/// * `Some(Ok(()))` — the undo completed; account the abort.
+/// * `Some(Err(e))` — the undo returned an error. Benign if the transaction was already resolved;
+///   otherwise the store is left half-undone, so [`degrade_on_incomplete_undo`] takes this database
+///   out of rotation.
+/// * `None` — the undo **panicked**. [`catch_recovery`] has already flagged the engine degraded, and
+///   the store has kept the transaction open across the unwind (the active-set entry is released only
+///   after the last fallible step, so there is no half-released entry to repair).
+fn recovery_rollback<D: BlockDevice, S: LogSink>(
+    coord: &mut TxnCoordinator<D, S>,
+    txn: TxnId,
+    metrics: &Metrics,
+    degraded: &EngineDegraded,
+    db: &str,
+    label: &'static str,
+) {
+    match catch_recovery(metrics, degraded, label, || coord.rollback(txn)) {
+        Some(Ok(())) => metrics.record_abort_for(db),
+        Some(Err(e)) => degrade_on_incomplete_undo(coord, txn, degraded, label, &e),
+        None => {}
     }
 }
 
@@ -3293,15 +3445,41 @@ fn constraint_storage_kind(
 fn handle_constraint_ddl<D: BlockDevice, S: LogSink>(
     coordinator: &mut TxnCoordinator<D, S>,
     command: &ConstraintCommand,
+    transactions: &Arc<crate::txn_registry::TransactionRegistry>,
+    db: &str,
+    principal: Option<&str>,
+    active_txns: &mut ActiveTxnGauge,
 ) -> Result<IndexDdlReply> {
     match command {
         ConstraintCommand::Create(create) => {
             let (kind, descriptor) = constraint_storage_kind(create);
             let props: Vec<&str> = create.properties.iter().map(String::as_str).collect();
+            // Register this DDL as a first-class live transaction (`rmp` task #903) for the whole of
+            // its validate-and-declare run. Two operator-facing properties come from it:
+            //
+            // * `SHOW TRANSACTIONS` lists it while it runs, so schema work that reads user property
+            //   values is no longer the one class of database activity an administrator cannot see;
+            // * `TERMINATE TRANSACTIONS` can stop it, which matters because the validation walk is
+            //   O(entities carrying the covered token) — a `CREATE CONSTRAINT` on a large label is a
+            //   realistic runaway.
+            //
+            // Only `CREATE` is registered. `DROP` is a single catalogue write with no walk, and `SHOW`
+            // is a read of the catalogue: neither can run long, and neither reads user data, so an entry
+            // for them would be noise in an operator's listing rather than information.
+            let guard = transactions.register_internal(
+                db,
+                principal,
+                AccessMode::Write,
+                graphus_cypher::CancellationToken::new(),
+            );
+            // The rendered statement, as the `currentQuery` column. Reuses the audit trail's own
+            // renderer so an operator reads the same text in `SHOW TRANSACTIONS` and in the audit log,
+            // with the same redaction applied.
+            guard.set_current_query(&crate::audit::redact_constraint_detail(command));
             // The idempotent entry point (`rmp` #638) handles `IF NOT EXISTS` (equivalent existing →
             // no-op, `mutated == false`) and `OR REPLACE` (drop same-named then create) around the
             // synchronous validate-and-declare path.
-            let mutated = coordinator.create_constraint_ddl(
+            let outcome = coordinator.create_constraint_ddl_cancellable(
                 &create.name,
                 create.entity.covering_name(),
                 &props,
@@ -3309,8 +3487,29 @@ fn handle_constraint_ddl<D: BlockDevice, S: LogSink>(
                 descriptor,
                 create.if_not_exists,
                 create.or_replace,
-            )?;
-            Ok(IndexDdlReply::mutation(mutated))
+                guard.cancellation(),
+            );
+            // A terminated DDL reports the registry's own wording, so an operator sees the same message
+            // whichever kind of transaction they stopped. Only an ERROR is re-labelled: a DDL that had
+            // already reached its uninterruptible tail committed, and reporting that as "terminated"
+            // would tell the operator the opposite of what happened. The coordinator guarantees the
+            // error case left no trace — no catalogue entry, no in-memory rule, no index rebuild, and no
+            // entry in its active set or SSI tracker — so a terminated DDL and a refused one are
+            // indistinguishable in their after-effects.
+            let outcome = if outcome.is_err() && guard.is_terminated() {
+                Err(crate::txn_registry::terminated_error())
+            } else {
+                outcome
+            };
+            // Deregisters the entry (RAII). Runs on every path out of this arm, including the error one.
+            drop(guard);
+            // Republish the true open-transaction / SSI-tracked counts. The DDL's own transaction is
+            // registered in both while it runs (`rmp` task #903), and a successful one leaves a
+            // committed entry in the SSI tracker until GC prunes it, so the gauges move here. The
+            // counts are read AFTER the DDL, never anticipated: a DDL refused before it opened a
+            // transaction must not be reported as having held one.
+            active_txns.publish(coordinator.active_count(), coordinator.ssi_tracked_len());
+            Ok(IndexDdlReply::mutation(outcome?))
         }
         ConstraintCommand::Drop { name, if_exists } => {
             // `mutated == false` is a no-op drop of a missing constraint → 0 removed. With `IF EXISTS`
@@ -3380,6 +3579,7 @@ fn open_tx<D: BlockDevice, S: LogSink>(
 ///   needed, so no reason to make the client wait for the batch).
 /// * **durable write commit** → `(reply, commit_lsn)` is pushed onto `commit_batch`; the reply is held
 ///   until [`flush_commit_batch`] has hardened a covering `fdatasync` (ack-after-fsync).
+#[allow(clippy::too_many_arguments)] // the commit path threads its execution context here
 fn commit_prepare_tx<D: BlockDevice, S: LogSink>(
     coordinator: &mut TxnCoordinator<D, S>,
     open: &mut HashMap<u64, OpenTx>,
@@ -3388,6 +3588,7 @@ fn commit_prepare_tx<D: BlockDevice, S: LogSink>(
     commit_batch: &mut Vec<PendingCommit>,
     metrics: &Metrics,
     db: &str,
+    degraded: &EngineDegraded,
 ) {
     let Some(tx) = open.remove(&ticket.0) else {
         let _ = reply.send(Err(GraphusError::Transaction(format!(
@@ -3422,8 +3623,11 @@ fn commit_prepare_tx<D: BlockDevice, S: LogSink>(
                 ..RunSummary::default()
             }));
         }
-        // An SSI serialization abort (or an inactive txn): the coordinator already rolled it back.
+        // An SSI serialization abort (or an inactive txn) has already been rolled back by the
+        // coordinator; a STORE-level prepare failure has NOT, and this ticket is already out of `open`,
+        // so nothing else ever would (`rmp` #955).
         Err(e) => {
+            resolve_failed_commit(coordinator, tx.txn, degraded, "failed-commit rollback");
             metrics.record_abort_for(db);
             let _ = reply.send(Err(e));
         }
@@ -3522,6 +3726,7 @@ fn pipelined_group_commit<
     statement_timeout: Option<std::time::Duration>,
     loading_session: &mut Option<bulk_load::LoadingSession>,
     retire_rx: &std::sync::mpsc::Receiver<read_pool::ReadRetirement>,
+    transactions: &Arc<crate::txn_registry::TransactionRegistry>,
 ) {
     // The current PREPAREd batch (batch K). First coalesce further queued commits into it, exactly as
     // the inline path did before hardening — so a burst that is all already-queued still forms ONE
@@ -3550,6 +3755,7 @@ fn pipelined_group_commit<
             clock,
             statement_timeout,
             loading_session,
+            transactions,
         );
     }
 
@@ -3590,6 +3796,7 @@ fn pipelined_group_commit<
                 clock,
                 statement_timeout,
                 loading_session,
+                transactions,
             );
         }
 
@@ -3744,6 +3951,7 @@ fn drain_commit_batch<
     clock: &Arc<dyn graphus_core::capability::Clock + Send + Sync>,
     statement_timeout: Option<std::time::Duration>,
     loading_session: &mut Option<bulk_load::LoadingSession>,
+    transactions: &Arc<crate::txn_registry::TransactionRegistry>,
 ) {
     // `rmp` #583 (F1): bound the drain by TOTAL commands processed as well as by batch size — reads and
     // transaction-opens are processed here without growing `commit_batch`, so `MAX_COMMIT_BATCH` alone
@@ -3784,6 +3992,7 @@ fn drain_commit_batch<
                     statement_timeout,
                     loading_session,
                     commit_batch,
+                    transactions,
                 );
                 // Park a suspended auto-commit `Run` (slow consumer, `rmp` #372/#485) so the loop resumes
                 // it — it has NOT committed (mid-stream), so it never joined the batch; its later resume
@@ -3840,6 +4049,7 @@ fn drain_commit_batch<
                     statement_timeout,
                     loading_session,
                     commit_batch,
+                    transactions,
                 );
                 debug_assert!(
                     ignored.is_none(),
@@ -3881,22 +4091,42 @@ fn checkpoint_after_batch<D: BlockDevice, S: LogSink>(
 
 /// Rolls back `ticket`. Idempotent: an unknown ticket is `Ok(())` (mirrors the REST seam contract),
 /// so the inactivity sweep and an explicit rollback cannot race into a spurious failure.
+///
+/// A client-driven rollback whose durable undo fails leaves the transaction open in the store with
+/// its writes physically present, exactly as a recovery-path one does — so it degrades this database's
+/// engine on the same terms (`rmp` #955). The error is still returned to the client: it is a real
+/// failure of the statement, not only of the engine.
 fn rollback_tx<D: BlockDevice, S: LogSink>(
     coordinator: &mut TxnCoordinator<D, S>,
     open: &mut HashMap<u64, OpenTx>,
     ticket: TxTicket,
     metrics: &Metrics,
     db: &str,
+    degraded: &EngineDegraded,
 ) -> Result<()> {
     let Some(tx) = open.remove(&ticket.0) else {
         // Idempotent no-op.
         return Ok(());
     };
-    let out = coordinator.rollback(tx.txn);
-    if out.is_ok() {
-        metrics.record_abort_for(db);
+    // The undo is a fallible WAL + buffer-pool path that PANICS on an `fdatasync` failure (`04 §4.9`).
+    // Unguarded, that panic unwinds the single engine thread — `engine_gone` forever, the exact `rmp`
+    // #386 failure the statement path is already protected from, reached through a client `ROLLBACK`
+    // instead of through a statement. `catch_recovery` gives it the same boundary: the engine is
+    // flagged degraded and the loop stays alive (`rmp` #955).
+    match catch_recovery(metrics, degraded, "client rollback", || {
+        coordinator.rollback(tx.txn)
+    }) {
+        Some(Ok(())) => {
+            metrics.record_abort_for(db);
+            Ok(())
+        }
+        Some(Err(e)) => {
+            degrade_on_incomplete_undo(coordinator, tx.txn, degraded, "client rollback", &e);
+            Err(e)
+        }
+        // The undo double-panicked; `catch_recovery` has already flagged the engine degraded.
+        None => Err(engine_degraded_error()),
     }
-    out
 }
 
 /// Graceful-shutdown drain (`04 §9.4`), part 1: roll back every still-open transaction. Uncommitted
@@ -3981,6 +4211,7 @@ pub struct Engine {
 /// # Errors
 /// Returns the spawn error if the OS thread cannot be created, or the `build` error (e.g. an
 /// integrity-check failure) if the store cannot be opened/verified.
+#[allow(clippy::too_many_arguments)] // Mirrors `spawn_engine_with_timeout`'s parameter list.
 pub fn spawn_engine<D, S, B>(
     db_name: Arc<str>,
     build: B,
@@ -3989,6 +4220,7 @@ pub fn spawn_engine<D, S, B>(
     reader_threads: usize,
     metrics: Arc<Metrics>,
     clock: Arc<dyn graphus_core::capability::Clock + Send + Sync>,
+    transactions: Arc<crate::txn_registry::TransactionRegistry>,
 ) -> Result<Engine>
 where
     D: BlockDevice + Send + Sync + 'static,
@@ -4006,6 +4238,7 @@ where
         None,
         None,
         None,
+        transactions,
     )
 }
 
@@ -4037,6 +4270,7 @@ pub fn spawn_engine_with_timeout<D, S, B>(
     statement_timeout: Option<std::time::Duration>,
     max_transaction_age: Option<std::time::Duration>,
     egress_stall_timeout: Option<std::time::Duration>,
+    transactions: Arc<crate::txn_registry::TransactionRegistry>,
 ) -> Result<Engine>
 where
     D: BlockDevice + Send + Sync + 'static,
@@ -4097,6 +4331,7 @@ where
                     // `max_concurrent_queries` (the admission limit that actually bounds how many
                     // statements can be parked at once), so this is a generous never-reached ceiling.
                     engine_queue_capacity,
+                    transactions,
                 );
             }
             Err(e) => {

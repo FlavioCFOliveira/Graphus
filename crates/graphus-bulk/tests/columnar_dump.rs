@@ -68,7 +68,7 @@ fn node_shape(store: &mut Store, id: u64) -> NodeShape {
 
     let mut by_key: BTreeMap<String, String> = BTreeMap::new();
     let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    for (_pid, key_token, value) in store.node_property_values(id).expect("props") {
+    for (_pid, key_token, value) in store.superset_scan_node_property_values(id).expect("props") {
         if seen.insert(key_token) {
             let key = store
                 .token_name(Namespace::PropKey, key_token)
@@ -96,7 +96,10 @@ fn rel_shapes(store: &mut Store) -> Vec<RelShape> {
         let end = node_shape(store, rec.end_node);
         let mut by_key: BTreeMap<String, String> = BTreeMap::new();
         let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        for (_pid, key_token, value) in store.rel_property_values(id).expect("rel props") {
+        for (_pid, key_token, value) in store
+            .superset_scan_rel_property_values(id)
+            .expect("rel props")
+        {
             if seen.insert(key_token) {
                 let key = store
                     .token_name(Namespace::PropKey, key_token)

@@ -80,6 +80,7 @@ fn engine_with(
         // isolation, on the auto-commit-read path the age reaper explicitly excludes.
         None,
         egress_stall_timeout,
+        std::sync::Arc::new(graphus_server::txn_registry::TransactionRegistry::new()),
     )
     .expect("spawn threaded engine");
     (engine, metrics)

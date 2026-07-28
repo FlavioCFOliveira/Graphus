@@ -576,14 +576,14 @@ struct Scan {
     /// Live property ids -> their record.
     live_props: BTreeMap<u64, PropRecord>,
     /// **Dead-link corpse** property ids -> their record (`rmp` #172, the property twin of
-    /// [`corpse_rels`](Scan::corpse_rels)): slots that are `!in_use` and NOT on the free list, left by
-    /// an aborted/crashed property creation whose header-only creation undo cleared the in-use bit
-    /// while PRESERVING the `next_prop` body. When a concurrently-committed writer had prepended on
-    /// top, such a corpse remains threaded in a live owner's chain until GC's
+    /// [`corpse_rels`](Scan::corpse_rels)): slots that are `!in_use` and NOT on the free list, left
+    /// by an aborted/crashed property creation whose header-only creation undo cleared the in-use
+    /// bit while PRESERVING the `next_prop` body. When a concurrently-committed writer had
+    /// prepended on top, such a corpse remains threaded in a live owner's chain until GC's
     /// [`gc_property_chain`](RecordStore::gc_property_chain) splices it out. The runtime read path
-    /// ([`read_view::node_properties`](crate::read_view)) threads transparently THROUGH it, so the
-    /// property-chain check must do the same rather than flag [`PropertyFault::DeadProp`] on a valid
-    /// transient state (`rmp` #581 surfaced this asymmetry).
+    /// ([`read_view::superset_scan_node_properties`](crate::read_view)) threads transparently
+    /// THROUGH it, so the property-chain check must do the same rather than flag
+    /// [`PropertyFault::DeadProp`] on a valid transient state (`rmp` #581 surfaced this asymmetry).
     corpse_props: BTreeMap<u64, PropRecord>,
     /// Live `strings.store` overflow-heap block ids -> their block (`rmp` task #43).
     live_blocks: BTreeMap<u64, HeapBlock>,

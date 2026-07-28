@@ -70,6 +70,7 @@ fn engine(reader_threads: usize, pool_pages: usize, queue_cap: usize) -> Engine 
         reader_threads,
         metrics,
         clock,
+        std::sync::Arc::new(graphus_server::txn_registry::TransactionRegistry::new()),
     )
     .expect("spawn threaded engine")
 }

@@ -236,10 +236,13 @@ fn create_property_type(
 /// `db_admin_surface.rs`.
 async fn show_constraints(handle: &EngineHandle) -> IndexDdlReply {
     handle
-        .constraint_ddl(ConstraintCommand::Show {
-            filter: ConstraintTypeFilter::All,
-            tail: None,
-        })
+        .constraint_ddl(
+            ConstraintCommand::Show {
+                filter: ConstraintTypeFilter::All,
+                tail: None,
+            },
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("show constraints")
 }
@@ -250,7 +253,10 @@ async fn show_constraints_filtered(
     filter: ConstraintTypeFilter,
 ) -> IndexDdlReply {
     handle
-        .constraint_ddl(ConstraintCommand::Show { filter, tail: None })
+        .constraint_ddl(
+            ConstraintCommand::Show { filter, tail: None },
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("show constraints (filtered)")
 }
@@ -263,7 +269,10 @@ async fn uniqueness_enforced_on_create_set_and_merge() {
 
     run(&engine, "CREATE (:Person {email: 'a@x.com', name: 'A'})").await;
     engine
-        .constraint_ddl(create_unique("uniq_email", "Person", "email"))
+        .constraint_ddl(
+            create_unique("uniq_email", "Person", "email"),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("create uniqueness constraint over conforming data");
 
@@ -314,7 +323,10 @@ async fn existence_enforced_on_create_and_set() {
 
     run(&engine, "CREATE (:Person {name: 'A'})").await;
     engine
-        .constraint_ddl(create_existence("name_exists", "Person", "name"))
+        .constraint_ddl(
+            create_existence("name_exists", "Person", "name"),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("create existence constraint over conforming data");
 
@@ -353,7 +365,10 @@ async fn creation_time_validation_rejects_nonconforming_data() {
     run(&engine, "CREATE (:Person {email: 'dup@x.com'})").await;
     run(&engine, "CREATE (:Person {email: 'dup@x.com'})").await;
     let err = engine
-        .constraint_ddl(create_unique("uniq_email", "Person", "email"))
+        .constraint_ddl(
+            create_unique("uniq_email", "Person", "email"),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect_err("uniqueness over duplicate data must be rejected");
     assert_constraint_violation(&err);
@@ -363,7 +378,10 @@ async fn creation_time_validation_rejects_nonconforming_data() {
     // A Person without `name`: an existence constraint cannot be created.
     run(&engine, "CREATE (:Person {email: 'noname@x.com'})").await;
     let err = engine
-        .constraint_ddl(create_existence("name_exists", "Person", "name"))
+        .constraint_ddl(
+            create_existence("name_exists", "Person", "name"),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect_err("existence over data missing the property must be rejected");
     assert_constraint_violation(&err);
@@ -379,11 +397,17 @@ async fn show_constraints_lists_declared_constraints() {
     let engine = handle.engine.clone();
 
     engine
-        .constraint_ddl(create_unique("uniq_email", "Person", "email"))
+        .constraint_ddl(
+            create_unique("uniq_email", "Person", "email"),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("create unique");
     engine
-        .constraint_ddl(create_existence("name_exists", "Person", "name"))
+        .constraint_ddl(
+            create_existence("name_exists", "Person", "name"),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("create existence");
 
@@ -448,7 +472,10 @@ async fn drop_constraint_removes_enforcement() {
 
     run(&engine, "CREATE (:Person {email: 'a@x.com'})").await;
     engine
-        .constraint_ddl(create_unique("uniq_email", "Person", "email"))
+        .constraint_ddl(
+            create_unique("uniq_email", "Person", "email"),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("create constraint");
     try_run(&engine, "CREATE (:Person {email: 'a@x.com'})")
@@ -456,10 +483,13 @@ async fn drop_constraint_removes_enforcement() {
         .expect_err("enforced before drop");
 
     engine
-        .constraint_ddl(ConstraintCommand::Drop {
-            name: "uniq_email".to_owned(),
-            if_exists: false,
-        })
+        .constraint_ddl(
+            ConstraintCommand::Drop {
+                name: "uniq_email".to_owned(),
+                if_exists: false,
+            },
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("drop constraint");
     assert_eq!(show_constraints(&engine).await.rows.len(), 0);
@@ -482,11 +512,17 @@ async fn constraints_survive_a_full_server_restart() {
         let engine = handle.engine.clone();
         run(&engine, "CREATE (:Person {email: 'a@x.com', name: 'A'})").await;
         engine
-            .constraint_ddl(create_unique("uniq_email", "Person", "email"))
+            .constraint_ddl(
+                create_unique("uniq_email", "Person", "email"),
+                None, /* principal: the test drives the engine directly */
+            )
             .await
             .expect("create unique");
         engine
-            .constraint_ddl(create_existence("name_exists", "Person", "name"))
+            .constraint_ddl(
+                create_existence("name_exists", "Person", "name"),
+                None, /* principal: the test drives the engine directly */
+            )
             .await
             .expect("create existence");
         // Enforced before restart.
@@ -538,7 +574,10 @@ async fn node_key_enforced_on_create_set_and_merge() {
 
     run(&engine, "CREATE (:Person {first: 'Ada', last: 'Lovelace'})").await;
     engine
-        .constraint_ddl(create_node_key("person_key", "Person", &["first", "last"]))
+        .constraint_ddl(
+            create_node_key("person_key", "Person", &["first", "last"]),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("create node key over conforming data");
 
@@ -581,7 +620,10 @@ async fn node_key_creation_time_validation() {
     run(&engine, "CREATE (:Person {first: 'Ada', last: 'Lovelace'})").await;
     run(&engine, "CREATE (:Person {first: 'Ada', last: 'Lovelace'})").await;
     let err = engine
-        .constraint_ddl(create_node_key("person_key", "Person", &["first", "last"]))
+        .constraint_ddl(
+            create_node_key("person_key", "Person", &["first", "last"]),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect_err("node key over duplicate tuples must be rejected");
     assert_constraint_violation(&err);
@@ -590,7 +632,10 @@ async fn node_key_creation_time_validation() {
     // A node missing a component: the node key cannot be created.
     run(&engine, "CREATE (:Person {first: 'Solo'})").await;
     let err = engine
-        .constraint_ddl(create_node_key("person_key2", "Person", &["first", "last"]))
+        .constraint_ddl(
+            create_node_key("person_key2", "Person", &["first", "last"]),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect_err("node key over data missing a component must be rejected");
     assert_constraint_violation(&err);
@@ -609,7 +654,10 @@ async fn node_key_survives_a_full_server_restart() {
         let engine = handle.engine.clone();
         run(&engine, "CREATE (:Person {first: 'Ada', last: 'Lovelace'})").await;
         engine
-            .constraint_ddl(create_node_key("person_key", "Person", &["first", "last"]))
+            .constraint_ddl(
+                create_node_key("person_key", "Person", &["first", "last"]),
+                None, /* principal: the test drives the engine directly */
+            )
             .await
             .expect("create node key");
         try_run(&engine, "CREATE (:Person {first: 'Ada', last: 'Lovelace'})")
@@ -658,7 +706,10 @@ async fn property_type_enforced_on_create_and_set() {
 
     run(&engine, "CREATE (:Person {age: 30})").await;
     engine
-        .constraint_ddl(create_property_type("age_int", "Person", "age", T::Integer))
+        .constraint_ddl(
+            create_property_type("age_int", "Person", "age", T::Integer),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("create property-type constraint over conforming data");
 
@@ -695,12 +746,10 @@ async fn property_type_creation_time_validation_and_restart() {
         // Existing wrong-typed data: the constraint cannot be created.
         run(&engine, "CREATE (:Person {score: 'high'})").await;
         let err = engine
-            .constraint_ddl(create_property_type(
-                "score_int",
-                "Person",
-                "score",
-                T::Integer,
-            ))
+            .constraint_ddl(
+                create_property_type("score_int", "Person", "score", T::Integer),
+                None, /* principal: the test drives the engine directly */
+            )
             .await
             .expect_err("property-type over wrong-typed data must be rejected");
         assert_constraint_violation(&err);
@@ -709,12 +758,10 @@ async fn property_type_creation_time_validation_and_restart() {
         // Overwrite with a conforming value, then declare the constraint.
         run(&engine, "MATCH (p:Person {score: 'high'}) SET p.score = 99").await;
         engine
-            .constraint_ddl(create_property_type(
-                "score_int",
-                "Person",
-                "score",
-                T::Integer,
-            ))
+            .constraint_ddl(
+                create_property_type("score_int", "Person", "score", T::Integer),
+                None, /* principal: the test drives the engine directly */
+            )
             .await
             .expect("create over conforming data");
         handle.shutdown().await.expect("shutdown");
@@ -742,19 +789,31 @@ async fn show_constraints_lists_all_four_kinds() {
     let engine = handle.engine.clone();
 
     engine
-        .constraint_ddl(create_unique("u", "Person", "email"))
+        .constraint_ddl(
+            create_unique("u", "Person", "email"),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("unique");
     engine
-        .constraint_ddl(create_existence("e", "Person", "name"))
+        .constraint_ddl(
+            create_existence("e", "Person", "name"),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("existence");
     engine
-        .constraint_ddl(create_node_key("k", "Person", &["first", "last"]))
+        .constraint_ddl(
+            create_node_key("k", "Person", &["first", "last"]),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("node key");
     engine
-        .constraint_ddl(create_property_type("t", "Person", "age", T::Integer))
+        .constraint_ddl(
+            create_property_type("t", "Person", "age", T::Integer),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("property type");
 
@@ -813,24 +872,31 @@ async fn show_constraints_type_filter_selects_matching_kinds() {
     let engine = handle.engine.clone();
 
     engine
-        .constraint_ddl(create_unique("u", "Person", "email"))
+        .constraint_ddl(
+            create_unique("u", "Person", "email"),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("unique");
     engine
-        .constraint_ddl(create_node_key("k", "Person", &["first", "last"]))
+        .constraint_ddl(
+            create_node_key("k", "Person", &["first", "last"]),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("node key");
     engine
-        .constraint_ddl(create_property_type("t", "Person", "age", T::Integer))
+        .constraint_ddl(
+            create_property_type("t", "Person", "age", T::Integer),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("property type");
     engine
-        .constraint_ddl(rel_create(
-            "rk",
-            "RATED",
-            &["a", "b"],
-            ConstraintCreateKind::Key,
-        ))
+        .constraint_ddl(
+            rel_create("rk", "RATED", &["a", "b"], ConstraintCreateKind::Key),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("rel key");
 
@@ -878,39 +944,48 @@ async fn create_constraint_if_not_exists_is_idempotent() {
 
     // First create: mutates.
     let first = engine
-        .constraint_ddl(create_unique("uniq_email", "Person", "email"))
+        .constraint_ddl(
+            create_unique("uniq_email", "Person", "email"),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("first create");
     assert!(first.mutated, "the first create mutates the schema");
 
     // Same-name IF NOT EXISTS: no-op.
     let same_name = engine
-        .constraint_ddl(ConstraintCommand::Create(CreateConstraint {
-            name: "uniq_email".to_owned(),
-            entity: ConstraintEntity::Node {
-                label: "Person".to_owned(),
-            },
-            properties: vec!["email".to_owned()],
-            kind: ConstraintCreateKind::Unique,
-            if_not_exists: true,
-            or_replace: false,
-        }))
+        .constraint_ddl(
+            ConstraintCommand::Create(CreateConstraint {
+                name: "uniq_email".to_owned(),
+                entity: ConstraintEntity::Node {
+                    label: "Person".to_owned(),
+                },
+                properties: vec!["email".to_owned()],
+                kind: ConstraintCreateKind::Unique,
+                if_not_exists: true,
+                or_replace: false,
+            }),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("if-not-exists same name");
     assert!(!same_name.mutated, "an existing name is a no-op");
 
     // Equivalent schema under a DIFFERENT name, with IF NOT EXISTS: still a no-op.
     let same_schema = engine
-        .constraint_ddl(ConstraintCommand::Create(CreateConstraint {
-            name: "another_name".to_owned(),
-            entity: ConstraintEntity::Node {
-                label: "Person".to_owned(),
-            },
-            properties: vec!["email".to_owned()],
-            kind: ConstraintCreateKind::Unique,
-            if_not_exists: true,
-            or_replace: false,
-        }))
+        .constraint_ddl(
+            ConstraintCommand::Create(CreateConstraint {
+                name: "another_name".to_owned(),
+                entity: ConstraintEntity::Node {
+                    label: "Person".to_owned(),
+                },
+                properties: vec!["email".to_owned()],
+                kind: ConstraintCreateKind::Unique,
+                if_not_exists: true,
+                or_replace: false,
+            }),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("if-not-exists same schema");
     assert!(!same_schema.mutated, "an equivalent schema is a no-op");
@@ -920,7 +995,10 @@ async fn create_constraint_if_not_exists_is_idempotent() {
 
     // A duplicate name WITHOUT IF NOT EXISTS is an error.
     engine
-        .constraint_ddl(create_unique("uniq_email", "Person", "email"))
+        .constraint_ddl(
+            create_unique("uniq_email", "Person", "email"),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect_err("duplicate name without IF NOT EXISTS is rejected");
 
@@ -937,7 +1015,10 @@ async fn create_or_replace_constraint_drops_and_recreates() {
 
     // Start with an existence constraint named `c`.
     engine
-        .constraint_ddl(create_existence("c", "Person", "email"))
+        .constraint_ddl(
+            create_existence("c", "Person", "email"),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("create existence");
     // A node missing `email` is now rejected.
@@ -947,16 +1028,19 @@ async fn create_or_replace_constraint_drops_and_recreates() {
 
     // OR REPLACE the same name with a uniqueness rule.
     let replaced = engine
-        .constraint_ddl(ConstraintCommand::Create(CreateConstraint {
-            name: "c".to_owned(),
-            entity: ConstraintEntity::Node {
-                label: "Person".to_owned(),
-            },
-            properties: vec!["email".to_owned()],
-            kind: ConstraintCreateKind::Unique,
-            if_not_exists: false,
-            or_replace: true,
-        }))
+        .constraint_ddl(
+            ConstraintCommand::Create(CreateConstraint {
+                name: "c".to_owned(),
+                entity: ConstraintEntity::Node {
+                    label: "Person".to_owned(),
+                },
+                properties: vec!["email".to_owned()],
+                kind: ConstraintCreateKind::Unique,
+                if_not_exists: false,
+                or_replace: true,
+            }),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("or replace");
     assert!(replaced.mutated, "OR REPLACE mutates");
@@ -990,12 +1074,15 @@ async fn relationship_existence_enforced_on_create_and_set() {
 
     run(&engine, "CREATE (:Person {id: 1}), (:Person {id: 2})").await;
     engine
-        .constraint_ddl(rel_create(
-            "knows_since",
-            "KNOWS",
-            &["since"],
-            ConstraintCreateKind::Existence,
-        ))
+        .constraint_ddl(
+            rel_create(
+                "knows_since",
+                "KNOWS",
+                &["since"],
+                ConstraintCreateKind::Existence,
+            ),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("create rel existence");
 
@@ -1034,12 +1121,15 @@ async fn relationship_key_enforced_and_creation_validation() {
 
     run(&engine, "CREATE (:U {id: 1}), (:M {id: 10})").await;
     engine
-        .constraint_ddl(rel_create(
-            "rated_key",
-            "RATED",
-            &["user", "movie"],
-            ConstraintCreateKind::Key,
-        ))
+        .constraint_ddl(
+            rel_create(
+                "rated_key",
+                "RATED",
+                &["user", "movie"],
+                ConstraintCreateKind::Key,
+            ),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("create rel key");
 
@@ -1072,12 +1162,10 @@ async fn relationship_key_enforced_and_creation_validation() {
     )
     .await;
     engine
-        .constraint_ddl(rel_create(
-            "link_unique",
-            "LINK",
-            &["a"],
-            ConstraintCreateKind::Unique,
-        ))
+        .constraint_ddl(
+            rel_create("link_unique", "LINK", &["a"], ConstraintCreateKind::Unique),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect_err("creation-time validation rejects duplicate rel values");
 
@@ -1097,12 +1185,10 @@ async fn relationship_constraints_survive_restart_and_show_entity_type() {
         let engine = handle.engine.clone();
         run(&engine, "CREATE (:A {id: 1}), (:B {id: 2})").await;
         engine
-            .constraint_ddl(rel_create(
-                "paid_ref",
-                "PAID",
-                &["ref"],
-                ConstraintCreateKind::Unique,
-            ))
+            .constraint_ddl(
+                rel_create("paid_ref", "PAID", &["ref"], ConstraintCreateKind::Unique),
+                None, /* principal: the test drives the engine directly */
+            )
             .await
             .expect("create rel unique");
         // A SHOW reports the relationship entityType and the 5.x rel-uniqueness type string.
@@ -1173,7 +1259,10 @@ async fn remove_property_is_rejected_by_node_existence_constraint() {
 
     run(&engine, "CREATE (:Person {id: 1, name: 'A'})").await;
     engine
-        .constraint_ddl(create_existence("name_exists", "Person", "name"))
+        .constraint_ddl(
+            create_existence("name_exists", "Person", "name"),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("create existence constraint");
 
@@ -1200,7 +1289,10 @@ async fn remove_property_is_rejected_by_node_key_constraint() {
     )
     .await;
     engine
-        .constraint_ddl(create_node_key("person_key", "Person", &["first", "last"]))
+        .constraint_ddl(
+            create_node_key("person_key", "Person", &["first", "last"]),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("create node-key constraint");
 
@@ -1227,12 +1319,15 @@ async fn remove_property_is_rejected_by_relationship_existence_constraint() {
 
     run(&engine, "CREATE (:A {id: 1}), (:B {id: 2})").await;
     engine
-        .constraint_ddl(rel_create(
-            "since_exists",
-            "KNOWS",
-            &["since"],
-            ConstraintCreateKind::Existence,
-        ))
+        .constraint_ddl(
+            rel_create(
+                "since_exists",
+                "KNOWS",
+                &["since"],
+                ConstraintCreateKind::Existence,
+            ),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("create rel existence constraint");
     run(
@@ -1261,12 +1356,10 @@ async fn remove_property_is_rejected_by_relationship_key_constraint() {
 
     run(&engine, "CREATE (:A {id: 1}), (:B {id: 2})").await;
     engine
-        .constraint_ddl(rel_create(
-            "rated_key",
-            "RATED",
-            &["u", "m"],
-            ConstraintCreateKind::Key,
-        ))
+        .constraint_ddl(
+            rel_create("rated_key", "RATED", &["u", "m"], ConstraintCreateKind::Key),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("create rel-key constraint");
     run(
@@ -1301,7 +1394,10 @@ async fn property_type_constraint_temporal_point_union_and_list_enforced() {
     // --- DATE ---
     run(&engine, "CREATE (:D {id: 1, d: date('2020-01-01')})").await;
     engine
-        .constraint_ddl(create_property_type("d_is_date", "D", "d", T::Date))
+        .constraint_ddl(
+            create_property_type("d_is_date", "D", "d", T::Date),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("DATE property-type constraint over conforming data");
     run(&engine, "CREATE (:D {id: 2, d: date('2021-06-01')})").await; // conforming
@@ -1313,7 +1409,10 @@ async fn property_type_constraint_temporal_point_union_and_list_enforced() {
 
     // --- POINT ---
     engine
-        .constraint_ddl(create_property_type("loc_is_point", "Loc", "p", T::Point))
+        .constraint_ddl(
+            create_property_type("loc_is_point", "Loc", "p", T::Point),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("POINT property-type constraint");
     run(&engine, "CREATE (:Loc {id: 1, p: point({x: 1.0, y: 2.0})})").await;
@@ -1324,12 +1423,15 @@ async fn property_type_constraint_temporal_point_union_and_list_enforced() {
 
     // --- Closed union INTEGER | STRING ---
     engine
-        .constraint_ddl(create_property_type(
-            "code_union",
-            "Code",
-            "c",
-            T::Union(vec![T::Integer, T::String]),
-        ))
+        .constraint_ddl(
+            create_property_type(
+                "code_union",
+                "Code",
+                "c",
+                T::Union(vec![T::Integer, T::String]),
+            ),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("union property-type constraint");
     run(&engine, "CREATE (:Code {id: 1, c: 42})").await;
@@ -1341,12 +1443,10 @@ async fn property_type_constraint_temporal_point_union_and_list_enforced() {
 
     // --- LIST<INTEGER NOT NULL> ---
     engine
-        .constraint_ddl(create_property_type(
-            "tags_list",
-            "Tags",
-            "t",
-            T::List(Box::new(T::Integer)),
-        ))
+        .constraint_ddl(
+            create_property_type("tags_list", "Tags", "t", T::List(Box::new(T::Integer))),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("list property-type constraint");
     run(&engine, "CREATE (:Tags {id: 1, t: [1, 2, 3]})").await;
@@ -1382,11 +1482,10 @@ async fn composite_node_uniqueness_enforced_with_null_relaxation() {
     )
     .await;
     engine
-        .constraint_ddl(create_composite_unique(
-            "uq_name",
-            "Person",
-            &["first", "last"],
-        ))
+        .constraint_ddl(
+            create_composite_unique("uq_name", "Person", &["first", "last"]),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect("composite uniqueness over conforming data");
 
@@ -1420,7 +1519,10 @@ async fn composite_node_uniqueness_enforced_with_null_relaxation() {
     run(&engine, "CREATE (:Dup {a: 1, b: 2})").await;
     run(&engine, "CREATE (:Dup {a: 1, b: 2})").await;
     let err = engine
-        .constraint_ddl(create_composite_unique("dk", "Dup", &["a", "b"]))
+        .constraint_ddl(
+            create_composite_unique("dk", "Dup", &["a", "b"]),
+            None, /* principal: the test drives the engine directly */
+        )
         .await
         .expect_err("composite uniqueness over duplicate data must be rejected");
     assert_constraint_violation(&err);
@@ -1438,12 +1540,10 @@ async fn composite_relationship_uniqueness_enforced_and_durable() {
         let engine = handle.engine.clone();
         run(&engine, "CREATE (:A {id: 1}), (:B {id: 2})").await;
         engine
-            .constraint_ddl(rel_create(
-                "rq_pair",
-                "PAID",
-                &["x", "y"],
-                ConstraintCreateKind::Unique,
-            ))
+            .constraint_ddl(
+                rel_create("rq_pair", "PAID", &["x", "y"], ConstraintCreateKind::Unique),
+                None, /* principal: the test drives the engine directly */
+            )
             .await
             .expect("composite rel uniqueness");
         run(

@@ -62,11 +62,12 @@ fn observe(store: &Store, node: u64) -> Result<Observed, CheckFailure> {
         })?;
     incident.sort_unstable();
     let mut props: Vec<(u32, u8, u64)> = store
-        .node_properties(node)
+        .superset_scan_node_properties(node)
         .map_err(|e| CheckFailure::StoreError {
-            context: "node_properties".into(),
+            context: "superset_scan_node_properties".into(),
             message: e.to_string(),
         })?
+        .into_every_version()
         .into_iter()
         .map(|(_, p)| (p.key, p.type_tag, p.value_inline))
         .collect();

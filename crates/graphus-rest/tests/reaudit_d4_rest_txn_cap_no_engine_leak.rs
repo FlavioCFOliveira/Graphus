@@ -121,6 +121,11 @@ impl RestEngine for LeakTrackingEngine {
         })
     }
 
+    /// This double models no live-transaction registry, so nothing here is ever terminable.
+    fn ensure_live(&self, _tx: TxHandle) -> Result<(), GraphusError> {
+        Ok(())
+    }
+
     fn commit(&self, _tx: TxHandle) -> Result<RunSummary, GraphusError> {
         self.live.fetch_sub(1, Ordering::Relaxed);
         Ok(RunSummary::default())

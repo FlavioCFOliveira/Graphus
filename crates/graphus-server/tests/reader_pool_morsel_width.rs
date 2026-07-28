@@ -154,6 +154,7 @@ fn engine_seeded(reader_threads: usize, pool: usize, cfg: SeedCfg) -> Engine {
         reader_threads,
         metrics,
         clock,
+        std::sync::Arc::new(graphus_server::txn_registry::TransactionRegistry::new()),
     )
     .expect("spawn threaded engine")
 }
@@ -557,6 +558,7 @@ fn engine_seeded_pooled(
         reader_threads,
         metrics,
         clock,
+        std::sync::Arc::new(graphus_server::txn_registry::TransactionRegistry::new()),
     )
     .expect("spawn threaded engine (explicit pool)")
 }

@@ -122,6 +122,7 @@ fn create_engine(dir: &Path, real_fsyncs: Arc<AtomicU64>) -> Engine {
         4,
         metrics,
         clock,
+        std::sync::Arc::new(graphus_server::txn_registry::TransactionRegistry::new()),
     )
     .expect("spawn fresh file engine")
 }

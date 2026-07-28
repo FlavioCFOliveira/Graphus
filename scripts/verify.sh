@@ -4,10 +4,11 @@
 # This runs the gates that finish in seconds-to-minutes and belong on every push:
 #   1. workspace build + clippy + fmt check
 #   2. anomaly checker (Elle/DSG serializability)
-#   3. proptest invariants (codec round-trips + order-preserving key codec)
-#   4. the criterion regression gate (vs the committed baseline)
-#   5. the LDBC-SNB macro harness (tiny scale)
-#   6. the examples suite, in BOTH modes (self-boot + attached to a running instance)
+#   3. the read-polarity census (superset / decision / conservative storage reads)
+#   4. proptest invariants (codec round-trips + order-preserving key codec)
+#   5. the criterion regression gate (vs the committed baseline)
+#   6. the LDBC-SNB macro harness (tiny scale)
+#   7. the examples suite, in BOTH modes (self-boot + attached to a running instance)
 #
 # The SLOW gates are deliberately NOT run here (they are documented in VERIFICATION.md and run on a
 # nightly/manual job): the loom model-check, the miri UB gate, the full Criterion suites, and any
@@ -36,22 +37,31 @@ done
 
 step() { printf '\n\033[1;34m==> %s\033[0m\n' "$1"; }
 
-step "1/5  build + clippy + fmt (workspace)"
+step "1/7  build + clippy + fmt (workspace)"
 cargo build --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 
-step "2/5  anomaly gate — Elle/DSG serializability checker"
+step "2/7  anomaly gate — Elle/DSG serializability checker"
 cargo test -p graphus-cypher --test elle
 
-step "3/5  proptest invariants — codec round-trips + order-preserving key codec"
+# A read of the record store returns raw physical state; which answer the caller owes back is one of
+# three (superset / decision / conservative, `04 §5.3`). Confusing them produced three CRITICAL
+# defects, each of them behind a docstring that asserted the wrong polarity and was believed. This
+# gate reads source text, costs milliseconds, and fails when a polarity-sensitive read appears or
+# moves without being classified (`rmp` #905; VERIFICATION.md gate 10).
+step "3/7  read-polarity census — superset / decision / conservative storage reads"
+cargo test -p graphus-cypher --test read_polarity_census
+cargo test -p graphus-storage --test scan_polarity_barrier
+
+step "4/7  proptest invariants — codec round-trips + order-preserving key codec"
 cargo test -p graphus-storage --test proptest_codecs
 cargo test -p graphus-cypher --test proptest_keycodec
 
-step "4/5  criterion regression gate — vs committed baseline (release)"
+step "5/7  criterion regression gate — vs committed baseline (release)"
 cargo run -q -p graphus-bench --release --bin bench_gate
 
-step "5/6  LDBC-SNB macro harness — tiny scale (release)"
+step "6/7  LDBC-SNB macro harness — tiny scale (release)"
 cargo run -q -p graphus-bench --release --bin ldbc_snb
 
 # The examples are the project's instrument for exposing regressions and resource inefficiencies in a
@@ -59,7 +69,7 @@ cargo run -q -p graphus-bench --release --bin ldbc_snb
 # evidence defects this gate now guards against (a failing example sitting unnoticed on `main`, reports
 # publishing fabricated zeros, a baseline gate comparing 0.0 to 0.0) survived precisely because nothing
 # executed the suite. It runs BOTH modes: self-boot, and attached to an already-running instance.
-step "6/6  examples suite — E2E, both modes (self-boot + attach to a running instance)"
+step "7/7  examples suite — E2E, both modes (self-boot + attach to a running instance)"
 scripts/examples-gate.sh
 
 if [ "$WITH_LOOM" = "1" ]; then

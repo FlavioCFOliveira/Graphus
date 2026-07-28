@@ -254,6 +254,7 @@ impl LoadingSession {
                     Ok(())
                 }
                 Err(e) => {
+                    roll_back_failed_commit(store, txn);
                     self.stats = stats_before;
                     Err(e)
                 }
@@ -325,6 +326,7 @@ impl LoadingSession {
                     Ok(())
                 }
                 Err(e) => {
+                    roll_back_failed_commit(store, txn);
                     self.stats = stats_before;
                     Err(e)
                 }
@@ -349,10 +351,39 @@ impl LoadingSession {
                     let _ = store.rollback(txn);
                     return Err(e);
                 }
-                store.commit(txn)
+                store.commit(txn).inspect_err(|_| {
+                    roll_back_failed_commit(store, txn);
+                })
             })?;
         }
         Ok(self.stats)
+    }
+}
+
+/// Rolls `txn` back after its [`RecordStore::commit`] returned an error (`rmp` #955).
+///
+/// A failed commit used to be returned to the caller untouched, which left the transaction neither
+/// committed nor rolled back: its rows stayed physically present in the store, its count delta stayed
+/// folded into the shared tally, and — since the active-set entry survives a failed commit by design
+/// (`rmp` #866) — it stayed an open writer forever, permanently refusing every subsequent
+/// `CREATE CONSTRAINT` through the `rmp` #902 guard. The session is torn down on this path anyway, so
+/// there is no later `ROLLBACK` to do it instead.
+///
+/// The rollback is conditional on [`RecordStore::is_txn_active`] because [`RecordStore::commit`] has
+/// two failure shapes and only one of them leaves anything to undo. A failure in `commit_prepare`
+/// (the catalog checkpoint, the `COMMIT` record) leaves the transaction OPEN and its writes
+/// un-undone — that is the case this exists for. A failure in the post-commit tail (the redo-bounding
+/// auto-checkpoint) happens *after* the commit record is hardened: the transaction is committed and
+/// already gone from the active set, and rolling it back would run `reload_catalog` over a durably
+/// committed transaction. `is_txn_active` distinguishes the two exactly — and it, not
+/// `commit_registry().outcome(txn) == InFlight`, is the live-writer predicate (that arm is dead: the
+/// registry records an outcome only when a transaction resolves).
+///
+/// Best-effort: the commit error is the primary failure being reported, and a rollback that fails on
+/// top of it has already left the store in a state only a controlled restart can resolve.
+fn roll_back_failed_commit<D: BlockDevice, S: LogSink>(store: &mut RecordStore<D, S>, txn: TxnId) {
+    if store.is_txn_active(txn) {
+        let _ = store.rollback(txn);
     }
 }
 
@@ -642,14 +673,15 @@ fn recover_and_delete_orphaned_sentinel<D: BlockDevice, S: LogSink>(
             }
             // Read AFTER the (successful) delete: `delete_node` tombstones only the node's own MVCC
             // header, never its property chain, so the chain remains fully readable within this same
-            // transaction. `node_property_values` returns the WHOLE chain, prepend-ordered (newest
-            // first) — every `checkpoint_sentinel` call on a prior batch appended a fresh version of
-            // each of these three keys rather than overwriting in place (MVCC), so older, stale values
-            // are still walked here until GC reclaims them. Only the FIRST (newest) occurrence of each
-            // key must win; a naive last-write-in-iteration-order assignment would end up keeping the
-            // OLDEST recorded value instead.
+            // transaction. `superset_scan_node_property_values` returns the WHOLE chain,
+            // prepend-ordered (newest first) — every `checkpoint_sentinel` call on a prior batch
+            // appended a fresh version of each of these three keys rather than overwriting in
+            // place (MVCC), so older, stale values are still walked here until GC reclaims them.
+            // Only the FIRST (newest) occurrence of each key must win; a naive
+            // last-write-in-iteration-order assignment would end up keeping the OLDEST recorded
+            // value instead.
             let (mut have_nodes, mut have_rels, mut have_props) = (false, false, false);
-            for (_pid, key, value) in store.node_property_values(id)? {
+            for (_pid, key, value) in store.superset_scan_node_property_values(id)? {
                 let Value::Integer(n) = value else { continue };
                 let n = u64::try_from(n).unwrap_or(0);
                 if key == nodes_key && !have_nodes {

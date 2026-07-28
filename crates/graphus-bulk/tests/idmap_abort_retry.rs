@@ -37,7 +37,9 @@ fn fresh_store() -> Store {
 fn node_names(store: &mut Store) -> HashMap<u64, String> {
     let mut out = HashMap::new();
     for id in store.scan_node_ids().expect("scan nodes") {
-        let props = store.node_property_values(id).expect("node props");
+        let props = store
+            .superset_scan_node_property_values(id)
+            .expect("node props");
         if let Some(name) = props.iter().find_map(|(_, _tok, v)| match v {
             Value::String(s) => Some(s.clone()),
             _ => None,
@@ -54,7 +56,9 @@ fn node_names(store: &mut Store) -> HashMap<u64, String> {
 fn node_name_age_set(store: &mut Store) -> BTreeSet<(String, i64)> {
     let mut out = BTreeSet::new();
     for id in store.scan_node_ids().expect("scan nodes") {
-        let props = store.node_property_values(id).expect("node props");
+        let props = store
+            .superset_scan_node_property_values(id)
+            .expect("node props");
         let name = props.iter().find_map(|(_, _tok, v)| match v {
             Value::String(s) => Some(s.clone()),
             _ => None,

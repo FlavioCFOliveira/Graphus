@@ -39,6 +39,29 @@ you then run belongs to that transaction until you `COMMIT` (durably applies all
 Use an explicit transaction when you need several statements to succeed or fail together, or to
 read-modify-write under the strongest isolation (see below).
 
+### Administrative termination
+
+An administrator can stop an open transaction with `TERMINATE TRANSACTIONS '<id>'` (the id comes
+from `SHOW TRANSACTIONS` — see [cypher.md](cypher.md)). A terminated transaction **cannot commit on
+any interface**: the next thing the client does with it — run a statement, refresh it, or commit —
+rolls it back and fails with
+
+```
+the transaction has been terminated by an administrator (TERMINATE TRANSACTIONS)
+```
+
+as a **non-retryable** client error (Bolt `Neo.ClientError.Statement.ArgumentError`; REST `400`
+problem+json carrying the same code and the same message). A driver must not auto-retry it: the
+transaction was deliberately killed, not aborted by a serialization conflict.
+
+Rolling a terminated transaction back (`ROLLBACK` on Bolt, `DELETE /db/{db}/tx/{id}` on REST)
+**succeeds**: it is exactly what the termination asked for, so a client is never denied the ability
+to discard a transaction it has been told is dead.
+
+Termination reaches a **client** transaction at its next interaction, not mid-statement: a statement
+that is already executing runs to completion, and the transaction is stopped immediately afterwards.
+Server-internal schema work (a validating `CREATE CONSTRAINT`) *is* interrupted while it runs.
+
 ## Reads never lock
 
 A read-only query **takes no locks** and **never blocks a writer** (and no writer blocks a

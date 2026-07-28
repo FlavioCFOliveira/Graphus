@@ -170,6 +170,11 @@ impl RestEngine for MockEngine {
         })
     }
 
+    /// This double models no live-transaction registry, so nothing here is ever terminable.
+    fn ensure_live(&self, _tx: TxHandle) -> Result<(), GraphusError> {
+        Ok(())
+    }
+
     fn commit(&self, tx: TxHandle) -> Result<RunSummary, GraphusError> {
         self.inner
             .lock()
@@ -685,6 +690,10 @@ async fn sec5_storage_error_detail_is_redacted_from_client() {
             Err(GraphusError::Storage(
                 "page fault at /var/lib/graphus/data/store.0001 offset 0xDEADBEEF".to_owned(),
             ))
+        }
+        /// This double models no live-transaction registry, so nothing here is ever terminable.
+        fn ensure_live(&self, _tx: TxHandle) -> Result<(), GraphusError> {
+            Ok(())
         }
         fn commit(&self, _tx: TxHandle) -> Result<RunSummary, GraphusError> {
             Ok(RunSummary::default())

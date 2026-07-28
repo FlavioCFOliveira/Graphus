@@ -97,6 +97,7 @@ fn engine() -> Engine {
         2,               // reader threads (irrelevant: explicit reads always run inline)
         metrics,
         clock,
+        std::sync::Arc::new(graphus_server::txn_registry::TransactionRegistry::new()),
     )
     .expect("spawn threaded engine")
 }

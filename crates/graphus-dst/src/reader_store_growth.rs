@@ -273,12 +273,12 @@ pub fn run_reader_vs_store_growth(seed: u64) -> ReaderGrowthReport {
     }
 
     // -- the property chain + the overflow heap (the `Prop`/`Strings` faces) ----------------------
-    match view.node_properties(hub) {
-        Err(e) => read_failures.push(format!("node_properties(hub): {e}")),
+    match view.superset_scan_node_properties(hub) {
+        Err(e) => read_failures.push(format!("superset_scan_node_properties(hub): {e}")),
         Ok(props) => {
             let mut visible_hot: Option<Value> = None;
             let mut visible_tag = 0u32;
-            for (pid, prop) in &props {
+            for (pid, prop) in props.every_version() {
                 // ORACLE 1 (location): every located property must decode — including its overflow
                 // chain, which walks the `strings` store's page map.
                 let value = match view.decode_property_value(prop.type_tag, prop.value_inline) {

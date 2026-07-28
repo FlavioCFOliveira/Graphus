@@ -20,6 +20,28 @@
 //! | `POST /db/{db}/query/columnar` | `query_columnar` | run a read query, return an **analytical columnar** result body (rmp #334) |
 //! | `GET /openapi.json` | `openapi_doc` | the static OpenAPI 3.1 document |
 //!
+//! # Administrative termination (`rmp` task #957)
+//!
+//! A transaction an operator has killed with `TERMINATE TRANSACTIONS` must not be resumable on **any**
+//! interface, and REST must answer exactly as Bolt does. Every endpoint that can touch an already-open
+//! transaction is therefore gated; the guard lives in the engine seam (one implementation shared with
+//! the Bolt seam), and this table records where each endpoint meets it:
+//!
+//! | Endpoint | Resumption point(s) | Guarded by |
+//! | --- | --- | --- |
+//! | `POST /db/{db}/tx` | none — the transaction does not exist yet, so nothing can have terminated it | n/a |
+//! | `POST /db/{db}/tx/{id}` | each statement; the **empty-batch keep-alive** | [`RestEngine::run`]; [`RestEngine::ensure_live`] |
+//! | `POST /db/{db}/tx/{id}/commit` | each statement; the **commit** | [`RestEngine::run`]; [`RestEngine::commit`] |
+//! | `POST /db/{db}/tx/commit` | each statement; the commit (the batch / single-write path opens a registered transaction) | [`RestEngine::run`]; [`RestEngine::commit`] |
+//! | `POST /db/{db}/graph` | each statement; the commit | [`RestEngine::run`]; [`RestEngine::commit`] |
+//! | `POST /db/{db}/query/columnar` | each statement; the commit | [`RestEngine::run`]; [`RestEngine::commit`] |
+//! | `DELETE /db/{db}/tx/{id}` | rollback | **exempt on purpose** — see below |
+//!
+//! `DELETE` (and the registry's inactivity reaper, and every error path that rolls back) is exempt
+//! because rolling a terminated transaction back is precisely what the terminating operator asked for.
+//! Refusing it would leave a client no way to discard a transaction it has just been told is dead, and
+//! would diverge from Bolt's `ROLLBACK`, which has always succeeded. Both interfaces report success.
+//!
 //! # No sockets here
 //!
 //! Per the hard rule, this module builds a `Router` and drives it; binding a listener and
@@ -671,6 +693,11 @@ async fn begin<E: RestEngine + 'static>(
 
 /// `POST /db/{db}/tx/{id}` → run statements in the open transaction (resets the timeout)
 /// (`04 §8.2`).
+///
+/// An **empty** statement batch is the documented keep-alive: it refreshes the inactivity lease and
+/// runs nothing. Because it reaches neither [`RestEngine::run`] nor [`RestEngine::commit`], it is the
+/// one resumption point whose termination guard has to be applied by the handler itself — see
+/// [`RestEngine::ensure_live`] (`rmp` task #957).
 async fn run_in_tx<E: RestEngine + Send + Sync + 'static>(
     State(state): State<AppState<E>>,
     Path((db, id)): Path<(String, String)>,
@@ -695,6 +722,16 @@ where
         else {
             return Err(Problem::unknown_transaction(&id));
         };
+        // Termination guard (`rmp` task #957): a transaction an administrator has terminated must not
+        // be resumable — and a keep-alive (an empty statement batch) IS a resumption, since the touch
+        // above has just extended the lease of a transaction that is supposed to be dead. The engine
+        // rolls it back and reports the termination; drop the router-side entry too, so the id is gone
+        // rather than lingering until its (just-refreshed) deadline. A batch WITH statements is caught
+        // by the identical guard inside `RestEngine::run`, so both forms of this request are covered.
+        if let Err(e) = state.engine.ensure_live(info.handle) {
+            let _ = state.registry.take(&id, &identity);
+            return Err(Problem::from_graphus_error(&e));
+        }
         authorize_mode(&state, &identity, &db, info.mode)?;
         Ok((req, info))
     })();

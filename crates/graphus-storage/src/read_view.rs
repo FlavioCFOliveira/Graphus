@@ -75,6 +75,7 @@ use crate::record::{
     MVCC_HEADER_SIZE, MvccHeader, NODE_RECORD_SIZE, NodeRecord, PROP_RECORD_SIZE, PropRecord,
     REL_RECORD_SIZE, RelRecord,
 };
+use crate::scan_polarity::SupersetProperties;
 use crate::store::{STORE_COUNT, StoreKind};
 use crate::wal_rule::SharedWal;
 use crate::{labels, valenc};
@@ -625,38 +626,53 @@ pub fn node_has_label<D: BlockDevice, S: LogSink, P: StorePages>(
     labels::has_label(node.labels, label_token_id).map_err(GraphusError::from)
 }
 
-/// Collects every live property `(physical_id, record)` in `node_id`'s chain, head to tail (the body
-/// of `RecordStore::node_properties`). The cycle guard uses the `Prop` high-water from `pages`.
+/// Collects every **slot-occupied** (`in_use`) property `(physical_id, record)` in `node_id`'s chain,
+/// head to tail (the body of `RecordStore::superset_scan_node_properties`) — MVCC tombstones
+/// included, see that method's doc. The cycle guard uses the `Prop` high-water from `pages`.
 ///
 /// # Errors
 /// Returns a storage error if a chain page is missing or the chain does not terminate.
-pub fn node_properties<D: BlockDevice, S: LogSink, P: StorePages>(
+pub fn superset_scan_node_properties<D: BlockDevice, S: LogSink, P: StorePages>(
     pool: &Pool<D, S>,
     pages: &P,
     node_id: u64,
-) -> Result<Vec<(u64, PropRecord)>> {
+) -> Result<SupersetProperties> {
     let node = read_node(pool, pages, node_id)?;
-    collect_prop_chain(pool, pages, node.first_prop, "node", node_id)
+    Ok(SupersetProperties::from_chain(collect_prop_chain(
+        pool,
+        pages,
+        node.first_prop,
+        "node",
+        node_id,
+    )?))
 }
 
-/// Collects every live property `(physical_id, record)` in `rel_id`'s chain, head to tail (the body
-/// of `RecordStore::rel_properties`).
+/// Collects every **slot-occupied** (`in_use`) property `(physical_id, record)` in `rel_id`'s chain,
+/// head to tail (the body of `RecordStore::superset_scan_rel_properties`) — MVCC tombstones
+/// included.
 ///
 /// # Errors
 /// Returns a storage error if a chain page is missing or the chain does not terminate.
-pub fn rel_properties<D: BlockDevice, S: LogSink, P: StorePages>(
+pub fn superset_scan_rel_properties<D: BlockDevice, S: LogSink, P: StorePages>(
     pool: &Pool<D, S>,
     pages: &P,
     rel_id: u64,
-) -> Result<Vec<(u64, PropRecord)>> {
+) -> Result<SupersetProperties> {
     let rel = read_rel(pool, pages, rel_id)?;
-    collect_prop_chain(pool, pages, rel.first_prop, "rel", rel_id)
+    Ok(SupersetProperties::from_chain(collect_prop_chain(
+        pool,
+        pages,
+        rel.first_prop,
+        "rel",
+        rel_id,
+    )?))
 }
 
-/// The shared property-chain walk behind [`node_properties`] / [`rel_properties`] (`rmp` #326's
-/// newest-wins is applied by the caller above this layer; here we collect every `in_use` record head
-/// to tail). `owner_kind` / `owner_id` are only used in the cycle-guard diagnostic, matching the
-/// exact messages `RecordStore::{node,rel}_properties` produce.
+/// The shared property-chain walk behind [`superset_scan_node_properties`] /
+/// [`superset_scan_rel_properties`] (`rmp` #326's newest-wins is applied by the caller above this
+/// layer; here we collect every `in_use` record head to tail). `owner_kind` / `owner_id` are only used
+/// in the cycle-guard diagnostic, matching the exact messages
+/// `RecordStore::superset_scan_{node,rel}_properties` produce.
 fn collect_prop_chain<D: BlockDevice, S: LogSink, P: StorePages>(
     pool: &Pool<D, S>,
     pages: &P,
@@ -686,19 +702,21 @@ fn collect_prop_chain<D: BlockDevice, S: LogSink, P: StorePages>(
     Ok(out)
 }
 
-/// Collects relationship `rel_id`'s live properties as `(physical_id, key_token, Value)`, decoding
-/// inline scalars and overflow values (the body of `RecordStore::rel_property_values`).
+/// The **superset**-polarity decoded read of relationship `rel_id`'s properties as
+/// `(physical_id, key_token, Value)`, decoding inline scalars and overflow values (the body of
+/// `RecordStore::superset_scan_rel_property_values`) — every slot-occupied version, tombstones
+/// included.
 ///
 /// # Errors
 /// Returns a storage error if the property chain or an overflow chain is unreadable/corrupt.
-pub fn rel_property_values<D: BlockDevice, S: LogSink, P: StorePages>(
+pub fn superset_scan_rel_property_values<D: BlockDevice, S: LogSink, P: StorePages>(
     pool: &Pool<D, S>,
     pages: &P,
     rel_id: u64,
 ) -> Result<Vec<(u64, u32, Value)>> {
-    let chain = rel_properties(pool, pages, rel_id)?;
+    let chain = superset_scan_rel_properties(pool, pages, rel_id)?;
     let mut out = Vec::with_capacity(chain.len());
-    for (pid, prop) in chain {
+    for (pid, prop) in chain.into_every_version() {
         let value = decode_property_value(pool, pages, prop.type_tag, prop.value_inline)?;
         out.push((pid, prop.key, value));
     }
@@ -832,11 +850,11 @@ pub fn incident_rels_typed<D: BlockDevice, S: LogSink, P: StorePages>(
 /// state (`rmp` task #336, Slice 3a): an [`Arc`]-shared page cache plus a [`MetaSnapshot`] captured on
 /// the engine thread. It exposes exactly the read surface the Cypher `GraphAccess` layer
 /// (`graphus-cypher`) drives (the analogues of `node` / `rel` /
-/// `scan_*` / `node_labels` / `node_has_label` / `node_properties` / `rel_properties` /
-/// `rel_property_values` / `incident_rels` and the low-level `read_*`), computed **purely** from
-/// `(pool, meta)` — it never touches the store's mutable fields (`tokens` / `statistics` /
-/// `element_ids` / free lists), so the writer keeps exclusive `&mut RecordStore` and the
-/// write/commit/GC/alloc path is untouched.
+/// `scan_*` / `node_labels` / `node_has_label` / `superset_scan_node_properties` /
+/// `superset_scan_rel_properties` / `superset_scan_rel_property_values` / `incident_rels` and the
+/// low-level `read_*`), computed **purely** from `(pool, meta)` — it never touches the store's
+/// mutable fields (`tokens` / `statistics` / `element_ids` / free lists), so the writer keeps
+/// exclusive `&mut RecordStore` and the write/commit/GC/alloc path is untouched.
 ///
 /// It carries **no** snapshot/visibility logic of its own: a returned record's `xmin`/`xmax` is
 /// filtered by `graphus_txn::is_visible` against the caller's own cloned `CommitRegistry` and
@@ -1004,31 +1022,31 @@ impl<D: BlockDevice, S: LogSink> StoreReadView<D, S> {
         node_has_label(&self.pool, &self.meta, id, label_token_id)
     }
 
-    /// Collects every live property `(physical_id, record)` in `node_id`'s chain. See
-    /// [`node_properties`].
+    /// The **superset**-polarity read of `node_id`'s property chain. See
+    /// [`superset_scan_node_properties`].
     ///
     /// # Errors
     /// Returns a storage error if a chain page is missing or the chain does not terminate.
-    pub fn node_properties(&self, node_id: u64) -> Result<Vec<(u64, PropRecord)>> {
-        node_properties(&self.pool, &self.meta, node_id)
+    pub fn superset_scan_node_properties(&self, node_id: u64) -> Result<SupersetProperties> {
+        superset_scan_node_properties(&self.pool, &self.meta, node_id)
     }
 
-    /// Collects every live property `(physical_id, record)` in `rel_id`'s chain. See
-    /// [`rel_properties`].
+    /// The **superset**-polarity read of `rel_id`'s property chain. See
+    /// [`superset_scan_rel_properties`].
     ///
     /// # Errors
     /// Returns a storage error if a chain page is missing or the chain does not terminate.
-    pub fn rel_properties(&self, rel_id: u64) -> Result<Vec<(u64, PropRecord)>> {
-        rel_properties(&self.pool, &self.meta, rel_id)
+    pub fn superset_scan_rel_properties(&self, rel_id: u64) -> Result<SupersetProperties> {
+        superset_scan_rel_properties(&self.pool, &self.meta, rel_id)
     }
 
-    /// Collects relationship `rel_id`'s live properties as `(physical_id, key_token, Value)`. See
-    /// [`rel_property_values`].
+    /// The **superset**-polarity decoded read of relationship `rel_id`'s properties as
+    /// `(physical_id, key_token, Value)`. See [`superset_scan_rel_property_values`].
     ///
     /// # Errors
     /// Returns a storage error if the property chain or an overflow chain is unreadable/corrupt.
-    pub fn rel_property_values(&self, rel_id: u64) -> Result<Vec<(u64, u32, Value)>> {
-        rel_property_values(&self.pool, &self.meta, rel_id)
+    pub fn superset_scan_rel_property_values(&self, rel_id: u64) -> Result<Vec<(u64, u32, Value)>> {
+        superset_scan_rel_property_values(&self.pool, &self.meta, rel_id)
     }
 
     /// Decodes a property value from its `(type_tag, value_inline)` pair. See
