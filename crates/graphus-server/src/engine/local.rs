@@ -375,10 +375,6 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         rx.recv().map_err(|_| gone())?
     }
 
-    /// Executes a constraint-DDL statement (`CREATE/DROP CONSTRAINT`, `SHOW CONSTRAINTS`).
-    ///
-    /// # Errors
-    /// [`GraphusError`] if existing data violates a `CREATE`, or a storage fault.
     /// This driver's live-transaction registry (`rmp` #637/#903) — the same one the engine registers
     /// its validating `CREATE CONSTRAINT` transactions in.
     ///
@@ -390,6 +386,10 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         &self.transactions
     }
 
+    /// Executes a constraint-DDL statement (`CREATE/DROP CONSTRAINT`, `SHOW CONSTRAINTS`).
+    ///
+    /// # Errors
+    /// [`GraphusError`] if existing data violates a `CREATE`, or a storage fault.
     pub fn constraint_ddl(&mut self, command: ConstraintCommand) -> Result<IndexDdlReply> {
         let (reply, rx) = reply_channel();
         self.dispatch(EngineCommand::ConstraintDdl {

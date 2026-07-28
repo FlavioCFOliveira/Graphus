@@ -467,6 +467,12 @@ id).
 TERMINATE TRANSACTIONS 'graphus-transaction-42'
 ```
 
+A terminated transaction **cannot commit on any interface** — Bolt, Bolt-over-UDS, or REST. Its
+client is refused at the next thing it does with the transaction (a statement, a keep-alive, or the
+commit) with the non-retryable error *"the transaction has been terminated by an administrator
+(TERMINATE TRANSACTIONS)"*, and the transaction is rolled back; a rollback still succeeds. See
+[transactions.md](transactions.md#administrative-termination).
+
 > **Note.** `SHOW …` statements do **not** accept a trailing `YIELD` / `WHERE` / `RETURN` clause;
 > run the bare statement and post-process the rows. `CALL <procedure>() YIELD …` **is** supported
 > (see below).

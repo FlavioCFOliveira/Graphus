@@ -856,6 +856,277 @@ async fn auto_commit_single_write_buffered_returns_200_with_summary() {
     );
 }
 
+// =============================== administrative termination (rmp #957) ==========================
+//
+// A transaction an operator killed with `TERMINATE TRANSACTIONS` must not be resumable on ANY
+// endpoint. The enforcement lives in the engine seam (shared with Bolt — see `graphus-server`'s
+// `engine::managed`), so what these tests gate is the ROUTER half of the contract: that every
+// endpoint which can touch an already-open transaction actually reaches the guard, and that the
+// engine's refusal is surfaced as a clean problem+json rather than swallowed.
+//
+// The enumeration is the route table in the module docs. One test per row:
+//
+//   POST   /db/{db}/tx              — nothing to terminate yet (no test: the transaction does not exist)
+//   POST   /db/{db}/tx/{id}         — with statements  → `terminated_transaction_refuses_run_in_tx`
+//   POST   /db/{db}/tx/{id}         — keep-alive       → `terminated_transaction_refuses_the_keep_alive`
+//   POST   /db/{db}/tx/{id}/commit  — no statements    → `terminated_transaction_refuses_commit_tx` (THE defect)
+//   POST   /db/{db}/tx/{id}/commit  — with statements  → `terminated_transaction_refuses_commit_tx_with_statements`
+//   POST   /db/{db}/tx/commit       — auto-commit      → `terminated_transaction_refuses_auto_commit`
+//   POST   /db/{db}/graph           — projection       → `terminated_transaction_refuses_graph_projection`
+//   POST   /db/{db}/query/columnar  — columnar         → `terminated_transaction_refuses_columnar_query`
+//   DELETE /db/{db}/tx/{id}         — rollback         → `terminated_transaction_still_rolls_back_on_delete` (exempt)
+
+/// The engine handle the mock minted for the LAST `begin` it logged (`begin(…) -> <h>`), so a test can
+/// terminate exactly the transaction the router just opened.
+fn last_begun_handle(engine: &MockEngine) -> crate::engine::TxHandle {
+    let line = engine
+        .log()
+        .into_iter()
+        .rfind(|l| l.starts_with("begin("))
+        .expect("the router opened a transaction");
+    let raw = line
+        .rsplit_once("-> ")
+        .expect("the mock's begin log records the minted handle")
+        .1
+        .to_owned();
+    crate::engine::TxHandle(raw.parse().expect("the handle is a u64"))
+}
+
+/// Asserts that `resp` is the terminated-transaction refusal: a `400` problem+json whose detail names
+/// the administrative termination. `400`/`Neo.ClientError.Statement.ArgumentError` is what a
+/// non-retryable `GraphusError::Runtime` maps to — the REST rendering of the same error shape Bolt
+/// returns as a `FAILURE`, so a driver on either interface classifies it identically (client fault,
+/// never auto-retried).
+async fn assert_terminated(resp: Response<Body>) {
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a terminated transaction is a non-retryable client fault"
+    );
+    let body = body_json(resp).await;
+    assert_eq!(body["code"], "Neo.ClientError.Statement.ArgumentError");
+    let detail = body["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("terminated"),
+        "the client must be told the transaction was terminated, got {body}"
+    );
+}
+
+/// A statement in a terminated transaction is refused, and the transaction is gone.
+#[tokio::test]
+async fn terminated_transaction_refuses_run_in_tx() {
+    let h = Harness::new();
+    let token = h.token("alice");
+
+    let begin = body_json(h.send(post_json("/db/neo4j/tx", &token, json!({}))).await).await;
+    let id = begin["id"].as_str().unwrap().to_owned();
+    h.engine.terminate(last_begun_handle(&h.engine));
+
+    let resp = h
+        .send(post_json(
+            &format!("/db/neo4j/tx/{id}"),
+            &token,
+            json!({ "statements": [{ "statement": "RETURN 1" }] }),
+        ))
+        .await;
+    assert_terminated(resp).await;
+}
+
+/// The **keep-alive** — `POST …/tx/{id}` with an empty statement batch — must not refresh a terminated
+/// transaction's inactivity lease and report success. It reaches neither `run` nor `commit`, so it is
+/// the one resumption point the handler has to guard itself (`RestEngine::ensure_live`); without that
+/// guard a client could keep a transaction the operator killed alive for ever.
+#[tokio::test]
+async fn terminated_transaction_refuses_the_keep_alive() {
+    let h = Harness::new();
+    let token = h.token("alice");
+
+    let begin = body_json(h.send(post_json("/db/neo4j/tx", &token, json!({}))).await).await;
+    let id = begin["id"].as_str().unwrap().to_owned();
+
+    // Non-vacuity: the keep-alive succeeds and keeps the transaction open while it is LIVE.
+    let resp = h
+        .send(post_json(
+            &format!("/db/neo4j/tx/{id}"),
+            &token,
+            json!({ "statements": [] }),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(h.registry.open_count(), 1);
+
+    h.engine.terminate(last_begun_handle(&h.engine));
+
+    let resp = h
+        .send(post_json(
+            &format!("/db/neo4j/tx/{id}"),
+            &token,
+            json!({ "statements": [] }),
+        ))
+        .await;
+    assert_terminated(resp).await;
+    assert_eq!(
+        h.registry.open_count(),
+        0,
+        "a terminated transaction must not survive the keep-alive that discovered it"
+    );
+    assert!(
+        h.engine.log().iter().any(|l| l.starts_with("ensure_live")),
+        "the keep-alive must consult the termination guard: {:?}",
+        h.engine.log()
+    );
+}
+
+/// **The `rmp` #957 reproduction.** Open a transaction, run one statement, terminate it, then POST the
+/// commit with no further statements: the commit path used to reach the engine with no termination
+/// check at all and the transaction committed. It must be refused.
+#[tokio::test]
+async fn terminated_transaction_refuses_commit_tx() {
+    let h = Harness::new();
+    let token = h.token("alice");
+
+    // (1) Open and run one statement.
+    let begin = body_json(h.send(post_json("/db/neo4j/tx", &token, json!({}))).await).await;
+    let id = begin["id"].as_str().unwrap().to_owned();
+    let resp = h
+        .send(post_json(
+            &format!("/db/neo4j/tx/{id}"),
+            &token,
+            json!({ "statements": [{ "statement": "CREATE (:T)" }] }),
+        ))
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK, "the statement runs normally");
+
+    // (2) An administrator terminates it. (3) The client commits without running anything further —
+    // so the commit is the FIRST guarded call the request makes.
+    h.engine.terminate(last_begun_handle(&h.engine));
+    let resp = h
+        .send(post_json(
+            &format!("/db/neo4j/tx/{id}/commit"),
+            &token,
+            json!({}),
+        ))
+        .await;
+    assert_terminated(resp).await;
+
+    let log = h.engine.log();
+    assert!(
+        log.iter().any(|l| l == "commit(tx=1) -> terminated"),
+        "the commit must reach the engine and be REFUSED there: {log:?}"
+    );
+    assert!(
+        !log.iter().any(|l| l == "commit(tx=1)"),
+        "the transaction must NOT have committed: {log:?}"
+    );
+    assert_eq!(h.registry.open_count(), 0);
+}
+
+/// The same commit endpoint carrying final statements: the statement is refused first, and the
+/// transaction still does not commit.
+#[tokio::test]
+async fn terminated_transaction_refuses_commit_tx_with_statements() {
+    let h = Harness::new();
+    let token = h.token("alice");
+
+    let begin = body_json(h.send(post_json("/db/neo4j/tx", &token, json!({}))).await).await;
+    let id = begin["id"].as_str().unwrap().to_owned();
+    h.engine.terminate(last_begun_handle(&h.engine));
+
+    let resp = h
+        .send(post_json(
+            &format!("/db/neo4j/tx/{id}/commit"),
+            &token,
+            json!({ "statements": [{ "statement": "CREATE (:T)" }] }),
+        ))
+        .await;
+    assert_terminated(resp).await;
+    assert!(
+        !h.engine.log().iter().any(|l| l == "commit(tx=1)"),
+        "no commit may follow a refused statement: {:?}",
+        h.engine.log()
+    );
+}
+
+/// `POST …/tx/commit` (the auto-commit shortcut) opens a transaction the client never names, so the
+/// operator's window is between that open and the finalising commit. The mock models exactly that
+/// (`terminate_on_begin`), and an empty batch makes the COMMIT the first guarded call.
+#[tokio::test]
+async fn terminated_transaction_refuses_auto_commit() {
+    let h = Harness::with_engine(MockEngine::new().terminate_on_begin());
+    let token = h.token("alice");
+
+    let resp = h
+        .send(post_json("/db/neo4j/tx/commit", &token, json!({})))
+        .await;
+    assert_terminated(resp).await;
+    assert!(
+        !h.engine.log().iter().any(|l| l == "commit(tx=1)"),
+        "the auto-commit batch must not commit once terminated: {:?}",
+        h.engine.log()
+    );
+}
+
+/// The graph-projection endpoint manages its own read transaction; its commit is guarded too.
+#[tokio::test]
+async fn terminated_transaction_refuses_graph_projection() {
+    let h = Harness::with_engine(MockEngine::new().terminate_on_begin());
+    let token = h.token("alice");
+
+    let resp = h
+        .send(post_json("/db/neo4j/graph", &token, json!({})))
+        .await;
+    assert_terminated(resp).await;
+    assert!(
+        !h.engine.log().iter().any(|l| l == "commit(tx=1)"),
+        "the projection must not commit once terminated: {:?}",
+        h.engine.log()
+    );
+}
+
+/// The analytical columnar endpoint manages its own read transaction; its commit is guarded too.
+#[tokio::test]
+async fn terminated_transaction_refuses_columnar_query() {
+    let h = Harness::with_engine(MockEngine::new().terminate_on_begin());
+    let token = h.token("alice");
+
+    let resp = h
+        .send(post_json("/db/neo4j/query/columnar", &token, json!({})))
+        .await;
+    assert_terminated(resp).await;
+    assert!(
+        !h.engine.log().iter().any(|l| l == "commit(tx=1)"),
+        "the columnar query must not commit once terminated: {:?}",
+        h.engine.log()
+    );
+}
+
+/// `DELETE` is the deliberate exemption: rolling a terminated transaction back is exactly what the
+/// operator asked for, so it succeeds — matching Bolt's `ROLLBACK`, which has always succeeded.
+#[tokio::test]
+async fn terminated_transaction_still_rolls_back_on_delete() {
+    let h = Harness::new();
+    let token = h.token("alice");
+
+    let begin = body_json(h.send(post_json("/db/neo4j/tx", &token, json!({}))).await).await;
+    let id = begin["id"].as_str().unwrap().to_owned();
+    h.engine.terminate(last_begun_handle(&h.engine));
+
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/db/neo4j/tx/{id}"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.send(req).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a client must always be able to discard a transaction it has been told is dead"
+    );
+    assert_eq!(h.registry.open_count(), 0);
+    assert!(h.engine.log().iter().any(|l| l.starts_with("rollback")));
+}
+
 // =============================== inactivity auto-rollback =======================================
 
 #[tokio::test]

@@ -137,6 +137,10 @@ impl RestEngine for GenEngine {
         })
     }
 
+    /// This double models no live-transaction registry, so nothing here is ever terminable.
+    fn ensure_live(&self, _tx: TxHandle) -> Result<(), GraphusError> {
+        Ok(())
+    }
     fn commit(&self, _tx: TxHandle) -> Result<RunSummary, GraphusError> {
         Ok(RunSummary::default())
     }

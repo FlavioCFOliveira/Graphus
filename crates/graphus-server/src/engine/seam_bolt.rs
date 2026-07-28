@@ -49,6 +49,7 @@ use super::command::{AccessMode, constraint_ddl_summary, index_ddl_summary};
 use super::constraint_show;
 use super::handle::AdmissionPermit;
 use super::index_show;
+use super::managed::ManagedTx;
 use super::privileges::EffectivePrivileges;
 use super::stream::{RowReceiver, SummarySink};
 use super::{EngineHandle, RunSummary, TxTicket};
@@ -535,17 +536,20 @@ impl BoltExecutor for BoltEngineExecutor {
                 stream
             }
             TxControl::InExplicit { db } => {
-                // If this transaction was terminated by `TERMINATE TRANSACTIONS` (rmp #637), fail
-                // fast: roll it back (releasing its GC pin) and return a non-retryable terminated
-                // error. Checked at the statement boundary — the idle-in-transaction case an
-                // operator kills — before any work is done.
-                if self
-                    .current_tx
-                    .as_ref()
-                    .is_some_and(|o| o.txn.is_terminated())
-                {
-                    self.rollback_open_tx();
-                    return Err(crate::txn_registry::terminated_error());
+                // The shared resumption guard (`rmp` task #957, in [`super::managed`]): if this
+                // transaction was terminated by `TERMINATE TRANSACTIONS` (rmp #637), it is rolled back
+                // (releasing its GC pin) and the non-retryable terminated error is returned. Applied at
+                // the statement boundary — the idle-in-transaction case an operator kills — before any
+                // work is done. The REST seam applies the same guard at its own statement boundary.
+                if let Some(open) = self.current_tx.as_ref() {
+                    let terminated = ManagedTx::new(&open.handle, open.ticket, &open.txn).resume();
+                    if let Err(e) = terminated {
+                        // The engine transaction is already rolled back; drop this connection's
+                        // handle on it so the registry entry deregisters and a later COMMIT/ROLLBACK
+                        // reports "no open transaction" rather than resurrecting it.
+                        self.current_tx = None;
+                        return Err(e);
+                    }
                 }
                 let open = self.current_tx.as_ref().ok_or_else(|| {
                     GraphusError::Transaction(
@@ -622,13 +626,10 @@ impl BoltExecutor for BoltEngineExecutor {
         let open = self.current_tx.take().ok_or_else(|| {
             GraphusError::Transaction("COMMIT with no open transaction".to_owned())
         })?;
-        // A terminated transaction (rmp #637) must not commit: roll it back and fail with the
-        // non-retryable terminated error. `open` drops here, deregistering it from the registry.
-        if open.txn.is_terminated() {
-            let _ = open.handle.rollback_blocking(open.ticket);
-            return Err(crate::txn_registry::terminated_error());
-        }
-        let summary = open.handle.commit_blocking(open.ticket)?;
+        // Through the shared guard (`rmp` task #957): a terminated transaction (rmp #637) is rolled
+        // back and fails with the non-retryable terminated error instead of committing. `open` drops
+        // here either way, deregistering it from the registry.
+        let summary = ManagedTx::new(&open.handle, open.ticket, &open.txn).commit()?;
         Ok(to_bolt_summary(summary))
     }
 
@@ -636,7 +637,9 @@ impl BoltExecutor for BoltEngineExecutor {
         let open = self.current_tx.take().ok_or_else(|| {
             GraphusError::Transaction("ROLLBACK with no open transaction".to_owned())
         })?;
-        open.handle.rollback_blocking(open.ticket)
+        // Unconditional, terminated or not — rolling a terminated transaction back is exactly what the
+        // operator asked for (see [`super::managed`]).
+        ManagedTx::new(&open.handle, open.ticket, &open.txn).rollback()
     }
 
     fn set_principal(&mut self, principal: Option<&str>) {
@@ -648,7 +651,7 @@ impl BoltExecutor for BoltEngineExecutor {
         // `current_tx.take()` means a prior explicit ROLLBACK/RESET (which already cleared it) makes
         // this a no-op, so the session's EOF arm and `Drop` cannot double-roll-back.
         if let Some(open) = self.current_tx.take() {
-            let _ = open.handle.rollback_blocking(open.ticket);
+            let _ = ManagedTx::new(&open.handle, open.ticket, &open.txn).rollback();
         }
     }
 

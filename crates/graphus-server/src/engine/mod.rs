@@ -32,6 +32,7 @@ mod exec;
 mod handle;
 pub(crate) mod index_show;
 mod local;
+mod managed;
 pub mod privileges;
 mod read_pool;
 pub mod rest_values;

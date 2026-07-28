@@ -672,6 +672,15 @@ impl RestEngine for SimRestEngine {
         Ok(SimRestStream { reply })
     }
 
+    fn ensure_live(&self, _tx: TxHandle) -> Result<(), GraphusError> {
+        // The deterministic simulator drives a bare [`LocalEngine`] with no live-transaction registry
+        // behind it, so no transaction here can be terminated by an operator (`rmp` task #957): there
+        // is no `SHOW TRANSACTIONS` / `TERMINATE TRANSACTIONS` surface in the simulated server. The
+        // guard therefore has nothing to report — and `Ok(())` keeps the simulated REST core
+        // byte-identical to the production one for every scenario the simulator can express.
+        Ok(())
+    }
+
     fn commit(&self, tx: TxHandle) -> Result<RestRunSummary, GraphusError> {
         self.engine.borrow_mut().commit(TxTicket(tx.0))?;
         Ok(RestRunSummary::default())

@@ -106,8 +106,11 @@ pub fn document() -> Json {
                     "tags": ["transaction"],
                     "summary": "Run statements in an open transaction.",
                     "description": "Runs the request's statements in the open transaction, resetting \
-                        its inactivity timeout. Results stream as NDJSON when the client accepts \
-                        `application/x-ndjson`.",
+                        its inactivity timeout. An empty `statements` list is the keep-alive: it \
+                        resets the timeout and runs nothing. Results stream as NDJSON when the \
+                        client accepts `application/x-ndjson`. A transaction an administrator has \
+                        stopped with TERMINATE TRANSACTIONS is rolled back and refused with a 400 \
+                        instead — including on the keep-alive.",
                     "operationId": "runInTransaction",
                     "parameters": [
                         { "$ref": "#/components/parameters/Db" },
@@ -139,6 +142,9 @@ pub fn document() -> Json {
                 "post": {
                     "tags": ["transaction"],
                     "summary": "Run final statements and commit.",
+                    "description": "Runs any final statements and commits the transaction. A \
+                        transaction an administrator has stopped with TERMINATE TRANSACTIONS does \
+                        not commit: it is rolled back and the request is refused with a 400.",
                     "operationId": "commitTransaction",
                     "parameters": [
                         { "$ref": "#/components/parameters/Db" },
