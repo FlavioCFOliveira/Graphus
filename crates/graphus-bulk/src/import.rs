@@ -199,6 +199,14 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
         &self.store
     }
 
+    /// Mutable twin of [`store_ref_for_test`](Self::store_ref_for_test), so a Deterministic
+    /// Simulation Test can arm a device fault on the LIVE store between two batches (`rmp` #955) —
+    /// the importer owns the store outright, so there is no other way to reach the seam mid-import.
+    #[doc(hidden)]
+    pub fn store_mut_for_test(&mut self) -> &mut RecordStore<D, S> {
+        &mut self.store
+    }
+
     /// A CSV reader builder configured with this importer's delimiter, treating the first record as a
     /// header (we read it explicitly to decode the schema).
     fn reader_builder(&self) -> csv::ReaderBuilder {
@@ -459,6 +467,14 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
     /// If the commit itself fails, the batch's writes never became durable, so its staged id-map
     /// bindings and stats deltas are discarded exactly as an explicit [`Self::rollback`] would — the
     /// importer's visible state always matches "this batch either fully happened or never happened".
+    /// The store-side undo is discarded with them (`rmp` #955): a failure inside `commit_prepare`
+    /// leaves the transaction OPEN with its rows physically present, so without the rollback below the
+    /// batch would be neither committed nor undone — and, because the active-set entry survives a
+    /// failed commit by design (`rmp` #866), the store would keep reporting a live uncommitted writer
+    /// forever, holding the `rmp` #902 constraint-DDL guard closed on a transaction nobody will ever
+    /// finish. [`Self::rollback`] is conditioned on [`RecordStore::is_txn_active`] because the other
+    /// failure shape — the post-commit auto-checkpoint — leaves a genuinely COMMITTED transaction that
+    /// must not be undone.
     ///
     /// # Errors
     ///
@@ -470,8 +486,12 @@ impl<D: BlockDevice, S: LogSink> BulkImporter<D, S> {
                 Ok(())
             }
             Err(e) => {
-                self.pending_id_map.clear();
-                self.stats = self.batch_start_stats;
+                if self.store.is_txn_active(txn) {
+                    self.rollback(txn);
+                } else {
+                    self.pending_id_map.clear();
+                    self.stats = self.batch_start_stats;
+                }
                 Err(e)
             }
         }

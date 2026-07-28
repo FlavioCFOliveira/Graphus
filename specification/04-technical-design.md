@@ -431,6 +431,19 @@ change and an `undo_next_lsn` pointer to the next record still to be undone. CLR
 they make undo itself idempotent and crash-safe (a crash mid-rollback resumes from the last CLR
 rather than re-undoing). This is the standard ARIES guarantee against repeated undo.
 
+**A live rollback that fails leaves its transaction OPEN.** That ARIES guarantee is about *crash*
+recovery, which restarts the undo from the durable log. A *live* rollback has no such restart point:
+its WAL undo, its compensation replay into the buffer pool and its catalog reload are one indivisible
+repair, and once the WAL manager has consumed the transaction's active-transaction entry a second
+call finds no undo chain and would report success over pages it never repaired. So a live rollback
+releases the transaction's active-set entry only after every fallible step has succeeded. A failure —
+or an unwind out of the `fdatasync` panic of §4.9 — therefore leaves the transaction visibly **active**
+and holding uncommitted state, which is the truth: its writes are still on the page. Every gate that
+asks "is a writer holding uncommitted state?" (notably the constraint-DDL guard) keeps answering
+*yes*, so it fails closed rather than open. The engine then takes that database — and only that
+database — to the same safe stopped state §4.6 mandates for an unrepairable corruption event, pending
+a controlled restart; the transaction is never quietly discarded to make the state look tidy.
+
 ### 4.5 Torn-write protection — recommendation: **doublewrite buffer**
 
 A logical page (8 KiB) spans multiple device sectors; a power loss mid-write can leave a **torn

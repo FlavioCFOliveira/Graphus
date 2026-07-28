@@ -34,9 +34,11 @@
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use graphus_core::Value;
     use graphus_cypher::MaterializedValue;
+    use graphus_cypher::TxnCoordinator;
     use graphus_elle::{Op, Transaction, check};
     use graphus_io::MemBlockDevice;
     use graphus_server::engine::command::AccessMode;
@@ -45,7 +47,8 @@ mod tests {
         CreateConstraint, LocalEngine, TxTicket,
     };
     use graphus_sim::SharedClock;
-    use graphus_wal::MemLogSink;
+    use graphus_storage::RecordStore;
+    use graphus_wal::{MemLogSink, WalManager};
 
     type Eng = LocalEngine<MemBlockDevice, MemLogSink>;
 
@@ -538,6 +541,16 @@ mod tests {
         }
     }
 
+    /// A `CREATE` carrying enough distinct property keys to push the token dictionary — and with it
+    /// the encoded catalog — past a single metadata page. Built programmatically because the exact
+    /// count is a property of the page size, not of the scenario.
+    fn wide_property_create() -> String {
+        let props: Vec<String> = (0..512)
+            .map(|i| format!("chain_growth_property_key_number_{i:08}: {i}"))
+            .collect();
+        format!("CREATE (:Filler {{{}}})", props.join(", "))
+    }
+
     /// Counts the `(:P {email})` nodes visible to a fresh auto-committed read — the post-state oracle
     /// for "did a duplicate survive under a live `IS UNIQUE`?".
     fn count_persons(eng: &mut Eng, email: &str) -> i64 {
@@ -984,5 +997,213 @@ mod tests {
             "a live relationship IS UNIQUE must not admit a second committed 'a' through a concurrent \
              SET (rmp #903); R committed = {committed}, found {live}"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // A transaction must never be left NEITHER committed NOR rolled back (rmp #955)
+    // ---------------------------------------------------------------------------------------------
+    //
+    // The store-level windows of this defect are pinned deterministically in
+    // `crate::rollback_undo_fault`, which drives a bare `RecordStore` so a fault can be placed between
+    // two exactly-known steps. What only the engine can show is the CONSEQUENCE of a failure that
+    // reaches a real command dispatch: every commit call site surrenders the transaction's ticket
+    // BEFORE it commits, so a commit that fails at the store level (rather than as an SSI abort) used
+    // to leave a transaction no client `ROLLBACK`, no inactivity sweep and no shutdown drain could
+    // ever reach — permanently holding the rmp #902 constraint-DDL guard closed and permanently
+    // pinning the GC watermark.
+
+    /// A durable auto-commit write whose commit fails at the STORE level must be rolled back by the
+    /// engine, not orphaned.
+    ///
+    /// The one-shot device I/O error is armed immediately before the commit, and the transaction has
+    /// interned enough property keys that its catalog no longer fits one metadata page — so the
+    /// commit's `checkpoint_meta` must grow the metadata chain, which is the first home write it
+    /// performs and therefore where the fault lands. What is asserted is the state the engine is left
+    /// in: no open transaction, the rmp #902 guard re-opened (a `CREATE CONSTRAINT` is accepted), and
+    /// the failed write absent.
+    ///
+    /// Fails against the pre-#955 code: the transaction stayed open forever and the DDL was refused
+    /// for the rest of the process's life, naming a transaction that no longer had a ticket.
+    #[test]
+    fn a_store_level_commit_failure_orphans_no_transaction_955() {
+        let mut eng = engine();
+
+        let seed = eng.begin(AccessMode::Write).expect("begin seed");
+        create_person(&mut eng, seed, "a");
+        eng.commit(seed).expect("seed commits");
+
+        // Precondition: with nothing open the DDL is accepted, so a refusal later is attributable.
+        // Over a DIFFERENT property, so this probe does not itself become the equivalent-schema
+        // conflict that would mask the guard's answer later.
+        eng.constraint_ddl(create_unique("u_probe", "P", "name"))
+            .expect("the DDL must be accepted over a quiet, committed graph");
+
+        let w = eng.begin(AccessMode::Write).expect("begin w");
+        create_person(&mut eng, w, "b");
+        // Intern enough distinct property keys that the catalog no longer fits one metadata page, so
+        // the commit's `checkpoint_meta` must GROW the metadata chain — a fresh page allocation and a
+        // home write. That is what puts a guaranteed *device write* inside `commit_prepare`, where the
+        // armed one-shot I/O error can land; without it the whole commit stays in the buffer pool and
+        // the fault never fires (which the `fault_surfaced` assertion below is what detects).
+        write(&mut eng, w, &wide_property_create(), vec![]);
+        assert!(
+            eng.constraint_ddl(create_unique("u_email", "P", "email"))
+                .is_err(),
+            "precondition (rmp #902): an OPEN writer refuses the DDL — without this the assertion \
+             after the fault would prove nothing"
+        );
+
+        eng.with_device_mut(MemBlockDevice::arm_io_error)
+            .expect("the engine is live, so the device seam must be reachable");
+        let commit = eng.commit(w);
+        let fault_surfaced = commit
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.to_string().contains("injected I/O error"));
+        assert!(
+            fault_surfaced,
+            "non-vacuity: the armed I/O error must actually fail the commit; got {commit:?}"
+        );
+
+        assert_eq!(
+            eng.status_open_txns().expect("status"),
+            0,
+            "a commit that failed at the store level must leave NO open transaction: its ticket is \
+             already gone, so nothing else would ever roll it back (rmp #955)"
+        );
+        eng.constraint_ddl(create_unique("u_email", "P", "email"))
+            .expect(
+                "the rmp #902 guard must re-open once the failed commit's transaction is rolled \
+                 back — before rmp #955 it stayed shut for the life of the process",
+            );
+        assert_eq!(
+            count_persons(&mut eng, "b"),
+            0,
+            "the failed commit's row must be gone: the transaction was rolled back, not left \
+             half-applied"
+        );
+        assert_eq!(
+            count_persons(&mut eng, "a"),
+            1,
+            "the previously committed row must be untouched — the rollback undid the failed \
+             transaction and nothing else"
+        );
+        assert!(
+            !eng.is_degraded(),
+            "a commit failure whose rollback SUCCEEDED is an ordinary aborted transaction: the \
+             database must stay in service, or every transient I/O error would take it down"
+        );
+    }
+
+    /// An explicit `ROLLBACK` whose durable undo panics must flag the engine degraded and keep the
+    /// engine alive — never unwind the engine thread, and never quietly carry on over a store whose
+    /// undo did not complete.
+    ///
+    /// Fails against the pre-#955 code twice over: the panic escaped `rollback_tx` (which had no
+    /// recovery boundary at all, so the engine thread died — the `engine_gone` failure rmp #386
+    /// closed for statements but not for this command), and the store had already dropped the
+    /// transaction's active-set entry before the WAL undo it panicked in.
+    #[test]
+    fn a_rollback_whose_undo_panics_degrades_the_engine_955() {
+        let fail_sync = Arc::new(AtomicBool::new(false));
+        let device = MemBlockDevice::new(0);
+        let sink = RollbackFaultSink {
+            inner: MemLogSink::new(),
+            fail_sync: Arc::clone(&fail_sync),
+        };
+        let wal = WalManager::create(sink).expect("create wal");
+        let store = RecordStore::create(device, wal, 64, 1).expect("create store");
+        let mut eng: LocalEngine<MemBlockDevice, RollbackFaultSink> =
+            LocalEngine::new(TxnCoordinator::new(store), Arc::new(SharedClock::new(0)));
+
+        let seed = eng.begin(AccessMode::Write).expect("begin seed");
+        let mut reply = eng
+            .run(seed, "CREATE (:P {email: 'a'})", vec![], false, None)
+            .expect("seed write runs");
+        while let Ok(Some(_)) = reply.rows.next() {}
+        eng.commit(seed).expect("seed commits");
+        assert!(
+            !eng.is_degraded(),
+            "precondition: a healthy engine, so the degradation below is caused by the fault"
+        );
+
+        let w = eng.begin(AccessMode::Write).expect("begin w");
+        let mut reply = eng
+            .run(w, "CREATE (:P {email: 'b'})", vec![], false, None)
+            .expect("write runs");
+        while let Ok(Some(_)) = reply.rows.next() {}
+
+        fail_sync.store(true, Ordering::SeqCst);
+        let rolled_back = eng.rollback(w);
+        fail_sync.store(false, Ordering::SeqCst);
+
+        assert!(
+            rolled_back.is_err(),
+            "a rollback whose WAL fdatasync failed must report failure, not success"
+        );
+        assert!(
+            eng.is_degraded(),
+            "the engine must be flagged DEGRADED: the undo did not complete, so the transaction's \
+             writes are still on the page with nothing left to remove them (rmp #955). Reaching this \
+             assertion at all is the other half of the fix — before it, the fsyncgate panic unwound \
+             the engine thread instead of being caught"
+        );
+        assert!(
+            eng.begin(AccessMode::Write).is_err(),
+            "a degraded engine must refuse further work pending a controlled restart (rmp #409/#414)"
+        );
+    }
+
+    /// The WAL sink used by [`a_rollback_whose_undo_panics_degrades_the_engine_955`]: its `fdatasync`
+    /// can be armed to fail, which `WalManager::harden` turns into the controlled fsyncgate panic.
+    /// Structurally identical to `crate::rollback_undo_fault`'s, and deliberately declared again here
+    /// rather than shared: that module's is private to it, and a fault sink is the one thing a fault
+    /// scenario should be able to read in full without following a re-export.
+    struct RollbackFaultSink {
+        inner: MemLogSink,
+        fail_sync: Arc<AtomicBool>,
+    }
+
+    impl graphus_wal::LogSink for RollbackFaultSink {
+        fn append(&mut self, bytes: &[u8]) {
+            self.inner.append(bytes);
+        }
+        fn sync(&mut self) -> graphus_core::error::Result<()> {
+            if self.fail_sync.load(Ordering::SeqCst) {
+                return Err(graphus_core::error::GraphusError::Storage(
+                    "injected WAL fdatasync failure during undo (rmp #955)".to_owned(),
+                ));
+            }
+            self.inner.sync()
+        }
+        fn begin_harden(&mut self) -> graphus_core::error::Result<graphus_wal::FsyncJob> {
+            self.inner.begin_harden()
+        }
+        fn complete_harden(&mut self, target_len: u64) {
+            self.inner.complete_harden(target_len);
+        }
+        fn durable_len(&self) -> u64 {
+            self.inner.durable_len()
+        }
+        fn buffered_len(&self) -> u64 {
+            self.inner.buffered_len()
+        }
+        fn read_durable(&self, from: u64, into: &mut Vec<u8>) -> graphus_core::error::Result<()> {
+            self.inner.read_durable(from, into)
+        }
+        fn read_bounded(
+            &self,
+            from: u64,
+            to: u64,
+            into: &mut Vec<u8>,
+        ) -> graphus_core::error::Result<()> {
+            self.inner.read_bounded(from, to, into)
+        }
+        fn reclaim(&mut self, from: u64, up_to: u64) -> graphus_core::error::Result<()> {
+            self.inner.reclaim(from, up_to)
+        }
+        fn reclaimed_floor(&self) -> u64 {
+            self.inner.reclaimed_floor()
+        }
     }
 }

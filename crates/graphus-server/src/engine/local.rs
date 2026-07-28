@@ -348,6 +348,16 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     ///
     /// # Errors
     /// [`GraphusError`] if the engine has been shut down.
+    /// Whether this inline engine has been flagged **degraded** (`rmp` #409/#414/#955): a
+    /// statement-recovery double-panic, or a rollback whose durable undo failed with the transaction
+    /// left open, has broken a deep in-memory invariant, so the engine refuses further work pending a
+    /// controlled restart. The inline mirror of the threaded engine's `/health/ready` signal, and the
+    /// witness a deterministic scenario asserts on.
+    #[must_use]
+    pub fn is_degraded(&self) -> bool {
+        self.degraded.is_degraded()
+    }
+
     pub fn status_open_txns(&mut self) -> Result<usize> {
         let (reply, rx) = reply_channel();
         self.dispatch(EngineCommand::Status { reply });

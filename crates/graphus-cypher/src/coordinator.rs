@@ -10871,6 +10871,32 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         self.active.len()
     }
 
+    /// Whether the **store** still holds `txn` as an open, unresolved writer (`rmp` #955) — i.e. its
+    /// mutations are still physically present and attributable to a transaction that has neither
+    /// committed nor been undone.
+    ///
+    /// This is deliberately the *store's* answer, not this coordinator's. [`abort`](Self::abort) frees
+    /// the coordinator-level footprint (SSI markers, locks, the `active` entry) in a drop guard that
+    /// fires even when the durable undo fails or panics (`rmp` #415), because a dangling rw-edge would
+    /// false-abort innocent successors. The store's active-set entry is the opposite obligation: it
+    /// survives a failed undo precisely so that
+    /// [`uncommitted_data_writer`](RecordStore::uncommitted_data_writer) keeps the `rmp` #902
+    /// constraint-DDL guard fail-CLOSED over data nothing has undone. The two are not redundant, and
+    /// only this one distinguishes "the rollback did not happen" from "there was nothing to roll back".
+    ///
+    /// That distinction is what the engine needs: a [`rollback`](Self::rollback) of an already-resolved
+    /// or unknown transaction returns `Err` too, and it is entirely benign (the idempotent
+    /// double-rollback). Degrading an engine on *that* would take a healthy database out of service on
+    /// a routine race.
+    ///
+    /// Use this, never `commit_registry().outcome(txn) == TxnOutcome::InFlight` — that arm is dead
+    /// (always `false`), and mistaking it for this question has already caused two silent-data-loss
+    /// defects (`rmp` #522, `rmp` #778). See [`RecordStore::is_txn_active`].
+    #[must_use]
+    pub fn store_txn_unresolved(&self, txn: TxnId) -> bool {
+        self.store.borrow().is_txn_active(txn)
+    }
+
     /// Test-only witness that the SSI engine still tracks `txn` (a live conflict record / dangling
     /// rw-edge). Used by the `rmp` #415 regression to assert that an abort whose durable store undo
     /// failed/panicked nonetheless freed the transaction's SSI footprint.

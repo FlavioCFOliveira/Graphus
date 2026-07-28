@@ -254,6 +254,7 @@ impl LoadingSession {
                     Ok(())
                 }
                 Err(e) => {
+                    roll_back_failed_commit(store, txn);
                     self.stats = stats_before;
                     Err(e)
                 }
@@ -325,6 +326,7 @@ impl LoadingSession {
                     Ok(())
                 }
                 Err(e) => {
+                    roll_back_failed_commit(store, txn);
                     self.stats = stats_before;
                     Err(e)
                 }
@@ -349,10 +351,39 @@ impl LoadingSession {
                     let _ = store.rollback(txn);
                     return Err(e);
                 }
-                store.commit(txn)
+                store.commit(txn).inspect_err(|_| {
+                    roll_back_failed_commit(store, txn);
+                })
             })?;
         }
         Ok(self.stats)
+    }
+}
+
+/// Rolls `txn` back after its [`RecordStore::commit`] returned an error (`rmp` #955).
+///
+/// A failed commit used to be returned to the caller untouched, which left the transaction neither
+/// committed nor rolled back: its rows stayed physically present in the store, its count delta stayed
+/// folded into the shared tally, and — since the active-set entry survives a failed commit by design
+/// (`rmp` #866) — it stayed an open writer forever, permanently refusing every subsequent
+/// `CREATE CONSTRAINT` through the `rmp` #902 guard. The session is torn down on this path anyway, so
+/// there is no later `ROLLBACK` to do it instead.
+///
+/// The rollback is conditional on [`RecordStore::is_txn_active`] because [`RecordStore::commit`] has
+/// two failure shapes and only one of them leaves anything to undo. A failure in `commit_prepare`
+/// (the catalog checkpoint, the `COMMIT` record) leaves the transaction OPEN and its writes
+/// un-undone — that is the case this exists for. A failure in the post-commit tail (the redo-bounding
+/// auto-checkpoint) happens *after* the commit record is hardened: the transaction is committed and
+/// already gone from the active set, and rolling it back would run `reload_catalog` over a durably
+/// committed transaction. `is_txn_active` distinguishes the two exactly — and it, not
+/// `commit_registry().outcome(txn) == InFlight`, is the live-writer predicate (that arm is dead: the
+/// registry records an outcome only when a transaction resolves).
+///
+/// Best-effort: the commit error is the primary failure being reported, and a rollback that fails on
+/// top of it has already left the store in a state only a controlled restart can resolve.
+fn roll_back_failed_commit<D: BlockDevice, S: LogSink>(store: &mut RecordStore<D, S>, txn: TxnId) {
+    if store.is_txn_active(txn) {
+        let _ = store.rollback(txn);
     }
 }
 

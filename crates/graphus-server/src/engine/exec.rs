@@ -315,6 +315,10 @@ pub(super) fn handle_run<
     result_buffer_capacity: usize,
     metrics: &Arc<Metrics>,
     db: &str,
+    // `rmp` #955: a commit that fails at the STORE level leaves its transaction open, and this path has
+    // already surrendered the ticket — so the auto-commit finaliser rolls it back, and flags the engine
+    // degraded if that rollback is itself left incomplete.
+    degraded: &super::EngineDegraded,
     clock: &Arc<dyn Clock + Send + Sync>,
     statement_timeout: Option<Duration>,
     // Group commit (`rmp` #566): when this statement finishes within its visit as a durable auto-commit
@@ -623,6 +627,7 @@ pub(super) fn handle_run<
                 produced_ok,
                 metrics,
                 db,
+                degraded,
                 clock,
                 // Defer a durable auto-commit WRITE's ack into the group-commit batch (`rmp` #566): a
                 // clone of `row_tx` is held open in the batch until the batch harden makes it durable.
@@ -1215,6 +1220,7 @@ enum BatchStep {
 /// returns; on re-suspension it stores the cursor state back into `inflight`.
 ///
 /// Returns `true` while the statement is still in flight (stay subscribed), `false` once finalised.
+#[allow(clippy::too_many_arguments)] // the resume path threads its execution context here
 pub(super) fn resume_inflight<
     D: BlockDevice + Send + Sync + 'static,
     S: LogSink + Send + Sync + 'static,
@@ -1225,6 +1231,7 @@ pub(super) fn resume_inflight<
     extensions: &ExtensionRegistry,
     metrics: &Metrics,
     db: &str,
+    degraded: &super::EngineDegraded,
     clock: &Arc<dyn Clock + Send + Sync>,
 ) -> bool {
     let step = run_batch(inflight, coordinator, extensions);
@@ -1242,6 +1249,7 @@ pub(super) fn resume_inflight<
                 produced_ok,
                 metrics,
                 db,
+                degraded,
                 clock,
                 None,
             );
@@ -1409,6 +1417,7 @@ fn finalize_inflight<D: BlockDevice, S: LogSink>(
     produced_ok: bool,
     metrics: &Metrics,
     db: &str,
+    degraded: &super::EngineDegraded,
     clock: &Arc<dyn Clock + Send + Sync>,
     // Group commit (`rmp` #566): `Some(batch)` (the single-visit / `dispatch_command` path) DEFERS a
     // durable auto-commit WRITE's ack into `batch` — coalescing its `fdatasync` with the rest of the
@@ -1445,6 +1454,7 @@ fn finalize_inflight<D: BlockDevice, S: LogSink>(
             &inflight.row_tx,
             metrics,
             db,
+            degraded,
             commit_batch,
         )
     } else {
@@ -1566,6 +1576,7 @@ fn finish_autocommit<D: BlockDevice, S: LogSink>(
     row_tx: &RowSender,
     metrics: &Metrics,
     db: &str,
+    degraded: &super::EngineDegraded,
     commit_batch: Option<&mut Vec<super::PendingCommit>>,
 ) -> Option<String> {
     let tx = open.remove(&ticket.0)?;
@@ -1602,11 +1613,19 @@ fn finish_autocommit<D: BlockDevice, S: LogSink>(
                 metrics.record_commit_for(db);
                 Some(bookmark_token(db, coordinator.durable_write_commit_ts()))
             }
-            // SSI serialization abort (or inactive txn): already rolled back — surface the retriable
-            // failure as a terminal stream error, never a silent success over rolled-back writes
-            // (`04 §1.3` step 6; the rmp #238 seed-4 atomicity divergence). A rolled-back txn mints no
-            // bookmark, and the consumer sees the terminal error and never reads the summary anyway.
+            // An SSI serialization abort (or an inactive txn) has already been rolled back; a STORE-level
+            // prepare failure has NOT, and this ticket is already out of `open`, so `resolve_failed_commit`
+            // is the only thing that ever will (`rmp` #955). Either way the retriable failure is surfaced
+            // as a terminal stream error, never a silent success over rolled-back writes (`04 §1.3` step 6;
+            // the rmp #238 seed-4 atomicity divergence). A rolled-back txn mints no bookmark, and the
+            // consumer sees the terminal error and never reads the summary anyway.
             Err(e) => {
+                super::resolve_failed_commit(
+                    coordinator,
+                    tx.txn,
+                    degraded,
+                    "failed-autocommit rollback",
+                );
                 let _ = row_tx.send(Err(e));
                 metrics.record_abort_for(db);
                 None
@@ -1622,6 +1641,12 @@ fn finish_autocommit<D: BlockDevice, S: LogSink>(
                 Some(bookmark_token(db, commit_ts))
             }
             Err(e) => {
+                super::resolve_failed_commit(
+                    coordinator,
+                    tx.txn,
+                    degraded,
+                    "failed-autocommit rollback",
+                );
                 let _ = row_tx.send(Err(e));
                 metrics.record_abort_for(db);
                 None

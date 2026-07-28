@@ -2036,44 +2036,36 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // registry maps the unknown id to `Aborted`, so the version would read as never-committed and
         // every reader would fall back to the PRE-CHANGE bitmap — a committed label change silently
         // reverting in memory, healed only by a restart.
-        // Take the label ids out of the per-txn bookkeeping — but leave the ACTIVE-SET ENTRY in place
-        // (`rmp` #866). It is dropped only once every fallible step below has succeeded, at
-        // `commit_settled` (and in the `rmp` #529 read-only early return, which is infallible from
-        // here). Holding it across `checkpoint_meta`/`commit_at_no_sync` is what makes a failure there
-        // recoverable: the transaction's count delta and schema undo log survive, so a subsequent
-        // `rollback` withdraws exactly its own effect. Removing it first — as this did until #866 —
-        // left a failed commit's counts folded into the shared tally with nothing left to withdraw
-        // them, drifting the catalog permanently while `counts_match_committed_image` still read
-        // `true`. `committed_statistics(txn)` now excludes the committing transaction BY NAME rather
-        // than by it having already been removed, so the checkpoint below still persists its counts and
-        // DDL. The rest of the per-txn created/expired bookkeeping fed the old eager settle loop and is
-        // dead once the commit-registry entry exists; it is dropped with the entry.
-        let labelled_nodes = self
-            .active
-            .get_mut(&txn)
-            .map(|a| std::mem::take(&mut a.labelled_nodes))
-            .unwrap_or_default();
-        // Settle BEFORE the `rmp` #529 read-only fast path returns, not after. A label writer always
-        // logs a WAL data record, so it never takes that path — but placing the settle after the check
-        // would make correctness depend on that invariant holding forever, and a stranded in-flight
-        // stamp is precisely the silent, restart-healed defect this settle exists to prevent. Running
-        // it first is unconditionally correct and costs nothing when the list is empty. The invariant
-        // is asserted rather than assumed.
+        // The settle itself is DEFERRED to [`settle_committed_txn`](Self::settle_committed_txn), which
+        // runs at each of this method's two exits — and at neither of them before every fallible step
+        // has succeeded (`rmp` #955). Until then NOTHING of this transaction's bookkeeping is released:
+        // not the active-set entry (`rmp` #866), not the `labelled_nodes` list, not the freeze-frontier
+        // savepoint. That is what keeps a FAILED commit recoverable: the transaction is still, in every
+        // respect the store can be asked about, an open writer holding uncommitted state, so
+        // [`uncommitted_data_writer`](Self::uncommitted_data_writer) keeps naming it (the `rmp` #902
+        // constraint-DDL guard stays fail-CLOSED) and a subsequent [`rollback`](Self::rollback)
+        // withdraws exactly its own effect.
+        //
+        // Taking `labelled_nodes` here — as this did until #955 — broke both halves. A transaction whose
+        // ONLY uncommitted mutation is a label change (`MATCH (n) SET n:L`, which writes the label word
+        // in place and creates no record) vanished from `uncommitted_data_writer` the instant its commit
+        // was attempted, so a `CREATE CONSTRAINT` racing a failed commit was ADMITTED over uncommitted
+        // data; and the settle that followed re-stamped those versions `Committed(commit_ts)`, which the
+        // rollback's `LabelHistory::forget` — keyed on the in-flight stamp — then could not find, leaving
+        // a rolled-back label change permanently visible as committed.
+        //
+        // `committed_statistics(txn)` excludes the committing transaction BY NAME rather than by it
+        // having already been removed, so the checkpoint below still persists its counts and DDL. The
+        // rest of the per-txn created/expired bookkeeping fed the old eager settle loop and is dead once
+        // the commit-registry entry exists; it is dropped with the entry.
         debug_assert!(
-            labelled_nodes.is_empty() || self.wal.with(|w| w.is_active(txn)),
-            "a label writer must have logged a WAL record; if it can take the read-only fast path, \
-             the settle below must move with it"
+            self.active
+                .get(&txn)
+                .is_none_or(|a| a.labelled_nodes.is_empty())
+                || self.wal.with(|w| w.is_active(txn)),
+            "a label writer must have logged a WAL record; the `rmp` #529 read-only fast path settles \
+             the label history too, but this asserts the two can never disagree"
         );
-        self.label_history.settle(txn, commit_ts, &labelled_nodes);
-        // `rmp` #522: this GC pass is committing — its freeze frontier advance is now permanent, so the
-        // rollback savepoint is no longer needed (a GC pass never takes the read-only fast path below,
-        // since it schedules a prune, so clearing it here always runs for a committing GC pass).
-        if self
-            .gc_freeze_low_savepoint
-            .is_some_and(|(sp_txn, _)| sp_txn == txn)
-        {
-            self.gc_freeze_low_savepoint = None;
-        }
 
         // Read-only fast path (`rmp` #529): a transaction that changed nothing durable — and is not a
         // GC pass with a scheduled Active/Recent-Transaction-Table prune to apply — has nothing to
@@ -2084,8 +2076,8 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // reissued, which is harmless precisely because the transaction produced no versions (nothing on
         // disk references it). ALL in-memory bookkeeping the coordinator relies on is preserved: the
         // commit-ts oracle advanced above (so [`snapshot_ts`](Self::snapshot_ts) returns this
-        // transaction's timestamp for the coordinator's `ssi.record_commit`), the active-set entry was
-        // removed above, and the GC watermark (`oldest_active_snapshot`) is a coordinator-level concern.
+        // transaction's timestamp for the coordinator's `ssi.record_commit`), and the GC watermark
+        // (`oldest_active_snapshot`) is a coordinator-level concern.
         // `commit_ts_hw` monotonicity across a later rollback's `reload_catalog` is preserved by that
         // method taking `max` (a read-only bump is not durable, so the persisted catalog lags it).
         let is_gc_prune = self
@@ -2093,27 +2085,43 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             .as_ref()
             .is_some_and(|p| p.gc_txn == txn);
         if !wrote_durable && !self.catalog_dirty && !is_gc_prune {
-            // Nothing fallible remains, so the active-set entry can go (`rmp` #866). A transaction on
+            // Nothing fallible remains, so the bookkeeping can go (`rmp` #866 / #955). A transaction on
             // this path wrote no record, so its count delta is empty and there is nothing to withdraw.
             debug_assert!(
                 self.active.get(&txn).is_none_or(|a| a.counts.is_empty()),
                 "the `rmp` #529 read-only fast path must never hold a count delta: a counter mutation \
                  implies a record write, which implies WAL activity"
             );
-            self.active.remove(&txn);
+            self.settle_committed_txn(txn, commit_ts);
             return Ok(None);
         }
 
-        self.commit_registry.record_commit(txn, commit_ts);
         self.checkpoint_meta(txn, false)?;
         // PREPARE: append the `COMMIT` record with NO `fdatasync` (the group-commit deferral, `rmp`
         // #528). The caller hardens the whole batch with a single `harden_wal`.
         let commit_lsn = self.wal.with(|w| w.commit_at_no_sync(txn, commit_ts))?;
-        // COMMIT SETTLED. Every fallible step has succeeded, so the active-set entry — and with it this
-        // transaction's count delta and schema undo log — is now safe to drop (`rmp` #866). This must
-        // happen before `open_txn_holds_pending_ddl()` below, which asks whether any *other* open
-        // transaction still holds unpersisted DDL and would otherwise count this one's.
-        self.active.remove(&txn);
+        // COMMIT SETTLED. Every fallible step has succeeded, so — and not one line earlier — this
+        // transaction becomes committed-visible and its bookkeeping is released.
+        //
+        // The registry entry is PUBLISHED here rather than before `checkpoint_meta` (`rmp` #955). It is
+        // what resolves an in-flight `xmin`/`xmax` stamp, and every record this transaction wrote still
+        // carries one, so writing it earlier meant that a `checkpoint_meta` failure left the whole
+        // uncommitted write set resolving as `Committed(commit_ts)` — a dirty read of data the caller
+        // is about to roll back, and a permanent one if that rollback also fails. Publishing it after
+        // the last fallible step makes the absence of an entry (which
+        // [`CommitRegistry::outcome`](graphus_txn::CommitRegistry::outcome) reads as `Aborted`) the
+        // fail-safe answer for exactly the window where the outcome is not yet decided.
+        //
+        // It is published BEFORE the label settle below, not after: between the two, a concurrent
+        // reader resolves an `InFlight(txn)` label version through the registry and gets
+        // `Committed(commit_ts)` — the same answer the settle then writes down. The reverse order would
+        // open a window in which a settled label version read as committed while the record headers of
+        // the same transaction still read as aborted.
+        self.commit_registry.record_commit(txn, commit_ts);
+        // Releases the active-set entry — and with it this transaction's count delta and schema undo log
+        // (`rmp` #866). This must happen before `open_txn_holds_pending_ddl()` below, which asks whether
+        // any *other* open transaction still holds unpersisted DDL and would otherwise count this one's.
+        self.settle_committed_txn(txn, commit_ts);
         // `rmp` #813: record this durable write's `(commit_lsn, commit_ts)` so a read transaction's causal
         // bookmark can advance to it — but ONLY once the deferred harden makes `commit_lsn` durable. The
         // pair is drained into `durable_write_commit_ts_hw` at the next harden (or lazily on a read of the
@@ -2156,6 +2164,46 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
             }
         }
         Ok(Some(commit_lsn))
+    }
+
+    /// Releases `txn`'s per-transaction bookkeeping now that its commit is **settled** (`rmp` #955).
+    ///
+    /// Every step here is infallible, and that is the point: [`commit_prepare`](Self::commit_prepare)
+    /// calls it at each of its two exits and at neither of them before the last fallible step has
+    /// succeeded. While a commit is still in doubt the transaction must stay, in every respect the
+    /// store can be asked about, an open writer holding uncommitted state — otherwise a failed commit
+    /// leaves mutations that are physically present but attributable to nobody.
+    ///
+    /// It does three things, in this order:
+    ///
+    /// 1. **Settles the retained label versions** from the in-flight stamp to `Committed(commit_ts)`
+    ///    (`rmp` #767). Unlike the record headers — settled lazily at GC time because doing it eagerly
+    ///    was `O(records)` WAL-logged page writes — this history is small and purely in-memory, so
+    ///    settling now is free and logs nothing. It is REQUIRED, not an optimisation: a raw in-flight
+    ///    stamp is only resolvable while the [`CommitRegistry`] still holds `txn`, and a GC pass
+    ///    FORGETS committed writers from that registry once their headers are frozen. After that the
+    ///    registry maps the unknown id to `Aborted`, so the version would read as never-committed and
+    ///    every reader would fall back to the PRE-CHANGE bitmap — a committed label change silently
+    ///    reverting in memory, healed only by a restart.
+    /// 2. **Clears the GC freeze-frontier savepoint** (`rmp` #522). This GC pass is committing, so its
+    ///    freeze-frontier advance is permanent and the rollback savepoint is no longer needed. A no-op
+    ///    for any transaction that is not the in-progress GC pass.
+    /// 3. **Removes the active-set entry**, and with it the count delta (`rmp` #866) and the schema
+    ///    undo log (`rmp` #734) a rollback would otherwise have withdrawn.
+    fn settle_committed_txn(&mut self, txn: TxnId, commit_ts: Timestamp) {
+        let labelled_nodes = self
+            .active
+            .get_mut(&txn)
+            .map(|a| std::mem::take(&mut a.labelled_nodes))
+            .unwrap_or_default();
+        self.label_history.settle(txn, commit_ts, &labelled_nodes);
+        if self
+            .gc_freeze_low_savepoint
+            .is_some_and(|(sp_txn, _)| sp_txn == txn)
+        {
+            self.gc_freeze_low_savepoint = None;
+        }
+        self.active.remove(&txn);
     }
 
     /// Group-commit **HARDEN** (phase 2, `04 §4.2` / `rmp` #528): `fdatasync`s the WAL, making every
@@ -3571,30 +3619,36 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
     /// reload. The page growth itself is not reverted (a grown device page is harmless: it holds no
     /// live records and will be reused), matching the "physical ids may be reused" model (`04 §2.7`).
     ///
+    /// # Failure leaves the transaction OPEN (`rmp` #955)
+    ///
+    /// The active-set entry is released only once **every** fallible step below has succeeded. A
+    /// rollback that fails — or that unwinds on the WAL `fdatasync` panic — therefore leaves `txn`
+    /// in the active set, where [`is_txn_active`](Self::is_txn_active) and
+    /// [`uncommitted_data_writer`](Self::uncommitted_data_writer) keep reporting it as a live writer
+    /// holding uncommitted state. That is the truth: its effects were not undone, so every gate that
+    /// asks "may I decide the committed image right now?" must keep answering *no*.
+    ///
+    /// The store cannot repair itself from here — the undo is not restartable from an arbitrary
+    /// mid-point — so the caller MUST treat an `Err` (or a caught unwind) as a hard failure of this
+    /// database and stop serving over the suspect in-memory state; on the server that is the
+    /// per-engine degraded flag (`rmp` #409/#414), which is per-database and never fleet-wide. What
+    /// the caller must NOT do is drop the entry to "tidy up": that flips the `rmp` #902 constraint-DDL
+    /// guard from fail-safe to fail-open at exactly the moment it matters most.
+    ///
     /// # Errors
     /// Returns a storage error if undo apply fails or the catalog cannot be reloaded.
     ///
     /// # Panics
     /// Panics if the WAL `fdatasync` fails (`04 §4.9`).
     pub fn rollback(&mut self, txn: TxnId) -> Result<()> {
-        // Drop the version-stamp bookkeeping: every stamp this txn wrote (in-flight `xmin`/`xmax`)
-        // is reverted by the WAL undo below, and the commit timestamp was never issued (only
-        // `commit` advances it), so nothing of this txn remains visible or durable. Take the removed
-        // entry so we can withdraw this transaction's OWN free-list pushes below (`rmp` #578): only a
-        // GC pass populates `freed_ids`; a normal write transaction's is empty. Also take its `rmp`
-        // #581 pop bookkeeping (`popped_ids` / `popped_prop_owners`) so a normal write transaction's
-        // own reused-id pops can be RECLAIMED to the free list after the restore below.
-        // Also take its `rmp` #866 pending COUNT delta, withdrawn from the pre-rollback counter image
-        // below.
-        let ActiveTxn {
-            created: aborted_created,
-            freed_ids: aborted_freed_ids,
-            popped_ids: aborted_popped_ids,
-            popped_prop_owners: aborted_prop_owners,
-            schema_undo: aborted_schema_undo,
-            counts: aborted_counts,
-            ..
-        } = self.active.remove(&txn).unwrap_or_default();
+        // PEEK at this transaction's pending catalog DDL — do NOT take the entry (`rmp` #955). The
+        // entry stays in `active` across every fallible step below and is removed only once they have
+        // all succeeded; see the method docs. The `pre_statistics` guard further down is the one thing
+        // that needs to know, before the undo runs, whether this transaction holds DDL of its own.
+        let holds_schema_undo = self
+            .active
+            .get(&txn)
+            .is_some_and(|a| !a.schema_undo.is_empty());
         // Snapshot the in-memory free lists BEFORE the catalog reload (`rmp` #578). The free list has
         // the SAME monotonicity hazard as the high-water / token / device-page state restored below,
         // but — unlike them — is NOT monotonic (ids are popped as well as pushed), so it cannot use a
@@ -3622,37 +3676,6 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // bounded by the number of distinct labels/relationship types in the schema, not by the number
         // of records the transaction touched.
         let pre_counts = self.statistics.counts_image();
-        // Any catalog-only change this txn made is discarded by the `reload_catalog` below (`rmp`
-        // #529): clear the dirty flag so the NEXT transaction's read-only fast path is not forced onto
-        // the durable path by this aborted transaction's un-persisted mutation. (A token this txn
-        // interned is kept in memory by the superset restore below, but as an unused id it needs no
-        // durability — it rides the next durable commit's checkpoint if a later write actually uses it.)
-        // A CONCURRENT open transaction's still-pending catalog DDL, by contrast, IS restored below and
-        // must stay flagged: the `rmp` #534 superset-preserve block re-sets this flag when it keeps one.
-        self.catalog_dirty = false;
-        // If `txn` was a GC pass, discard its scheduled registry prune (`rmp` task #59): the WAL
-        // undo below restores the in-flight header stamps the freeze had rewritten, and those
-        // stamps still need their Active/Recent Transaction Table entries to resolve. A rolled-back
-        // GC pass must therefore prune NOTHING — otherwise a restored in-flight stamp would be
-        // stranded as unresolvable (it would wrongly read as aborted).
-        if self
-            .pending_gc_prune
-            .as_ref()
-            .is_some_and(|p| p.gc_txn == txn)
-        {
-            self.pending_gc_prune = None;
-        }
-        // `rmp` #522: if `txn` is the in-progress GC pass, restore the freeze frontier its freeze sweep
-        // advanced. The WAL undo below un-freezes the stamps this pass had frozen (restoring them to
-        // their in-flight form); without restoring the frontier those records would sit below it and the
-        // next freeze sweep would skip them, stranding a committed writer's stamp unfrozen forever. Taken
-        // (not just read) so a normal write transaction — whose savepoint this never is — leaves it be.
-        if let Some((sp_txn, saved)) = self.gc_freeze_low_savepoint
-            && sp_txn == txn
-        {
-            self.freeze_low = saved;
-            self.gc_freeze_low_savepoint = None;
-        }
         // Capture the in-memory physical-id high-water marks BEFORE the catalog reload (`rmp` #220 /
         // #172). `reload_catalog` restores the allocators from the last COMMITTED metadata — but under
         // STATEMENT-granularity interleaving a CONCURRENT, still-open transaction may have advanced a
@@ -3688,11 +3711,13 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // SILENTLY DROP its committed DDL.
         //
         // Snapshot the in-memory schema now so it can be superset-preserved after the reload — but ONLY
-        // when a concurrent transaction is still open to OWN a pending DDL change (`self.active` already
-        // excludes `txn`, removed at the top of this method). With no concurrent transaction the reload
-        // is the whole story (a lone transaction's own DDL is correctly discarded), so the common
-        // single-writer path clones NOTHING and is byte-identical to the pre-#534 behaviour. The counts
-        // this also clones are discarded — `adopt_schema_from` moves only the schema half.
+        // when a concurrent transaction is still open to OWN a pending DDL change. `txn`'s own entry is
+        // still in `active` (it is released only after the fallible steps, `rmp` #955), so it is
+        // excluded BY NAME here rather than by having already been removed. With no concurrent
+        // transaction the reload is the whole story (a lone transaction's own DDL is correctly
+        // discarded), so the common single-writer path clones NOTHING and is byte-identical to the
+        // pre-#534 behaviour. The counts this also clones are discarded — `adopt_schema_from` moves only
+        // the schema half.
         // Also snapshot when THIS transaction holds catalog DDL of its own, even with no concurrent
         // transaction open (`rmp` #734). The tempting shortcut — "alone ⇒ the reload discards exactly
         // my DDL" — is FALSE: a concurrent transaction that committed and has since resolved may have
@@ -3701,8 +3726,18 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // is the only thing that removes it. (`committed_statistics` stops new checkpoints from
         // capturing pending DDL; this keeps the rollback correct regardless.) A transaction with no
         // catalog DDL and no concurrent transaction still clones nothing — the common path is unchanged.
-        let pre_statistics = (!self.active.is_empty() || !aborted_schema_undo.is_empty())
+        let pre_statistics = (self.active.keys().any(|t| *t != txn) || holds_schema_undo)
             .then(|| self.statistics.clone());
+        // ------------------------------------------------------------------------------------------
+        // FALLIBLE SECTION (`rmp` #955). Everything from here to `reload_catalog` can fail — with an
+        // `Err` from the pool/catalog, or by unwinding out of the WAL `fdatasync` panic. NOTHING in it
+        // may release or mutate this transaction's bookkeeping: its active-set entry, its count delta,
+        // its schema undo log, the scheduled GC prune and the freeze-frontier savepoint all stay
+        // exactly as they were, so a failure leaves `txn` a fully-formed open writer rather than a
+        // half-dismantled one. That is why the entry is removed BELOW this section and not above it,
+        // and why the removal needs no unwind guard: an entry that is never taken cannot be dropped on
+        // the way out.
+        // ------------------------------------------------------------------------------------------
         // `rmp` #337, Slice 1: drive the WAL rollback with a *recording* target that captures the
         // compensating page images WITHOUT touching the pool while the WAL lock is held, then replay
         // them into the pool AFTER the lock is released. This breaks the eviction-during-rollback
@@ -3743,6 +3778,59 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         // which a reader can observe anything but the true, monotone map. Exception safety is likewise
         // structural: a failing `reload_catalog` cannot strand a map it never moved.
         self.reload_catalog()?;
+        // ------------------------------------------------------------------------------------------
+        // UNDO SETTLED (`rmp` #955). Every fallible step has succeeded and nothing below can fail, so
+        // the transaction's bookkeeping is released here — and only here.
+        // ------------------------------------------------------------------------------------------
+        // Drop the version-stamp bookkeeping: every stamp this txn wrote (in-flight `xmin`/`xmax`) has
+        // just been reverted by the WAL undo above, and the commit timestamp was never issued (only
+        // `commit` advances it), so nothing of this txn remains visible or durable. Take the removed
+        // entry so we can withdraw this transaction's OWN free-list pushes below (`rmp` #578): only a
+        // GC pass populates `freed_ids`; a normal write transaction's is empty. Also take its `rmp`
+        // #581 pop bookkeeping (`popped_ids` / `popped_prop_owners`) so a normal write transaction's
+        // own reused-id pops can be RECLAIMED to the free list after the restore below.
+        // Also take its `rmp` #866 pending COUNT delta, withdrawn from the pre-rollback counter image
+        // below.
+        let ActiveTxn {
+            created: aborted_created,
+            freed_ids: aborted_freed_ids,
+            popped_ids: aborted_popped_ids,
+            popped_prop_owners: aborted_prop_owners,
+            schema_undo: aborted_schema_undo,
+            counts: aborted_counts,
+            ..
+        } = self.active.remove(&txn).unwrap_or_default();
+        // Any catalog-only change this txn made has been discarded by the `reload_catalog` above (`rmp`
+        // #529): clear the dirty flag so the NEXT transaction's read-only fast path is not forced onto
+        // the durable path by this aborted transaction's un-persisted mutation. (A token this txn
+        // interned is kept in memory by the superset restore below, but as an unused id it needs no
+        // durability — it rides the next durable commit's checkpoint if a later write actually uses it.)
+        // A CONCURRENT open transaction's still-pending catalog DDL, by contrast, IS restored below and
+        // must stay flagged: the `rmp` #534 superset-preserve block re-sets this flag when it keeps one.
+        self.catalog_dirty = false;
+        // If `txn` was a GC pass, discard its scheduled registry prune (`rmp` task #59): the WAL
+        // undo above restored the in-flight header stamps the freeze had rewritten, and those
+        // stamps still need their Active/Recent Transaction Table entries to resolve. A rolled-back
+        // GC pass must therefore prune NOTHING — otherwise a restored in-flight stamp would be
+        // stranded as unresolvable (it would wrongly read as aborted).
+        if self
+            .pending_gc_prune
+            .as_ref()
+            .is_some_and(|p| p.gc_txn == txn)
+        {
+            self.pending_gc_prune = None;
+        }
+        // `rmp` #522: if `txn` is the in-progress GC pass, restore the freeze frontier its freeze sweep
+        // advanced. The WAL undo above un-froze the stamps this pass had frozen (restoring them to
+        // their in-flight form); without restoring the frontier those records would sit below it and the
+        // next freeze sweep would skip them, stranding a committed writer's stamp unfrozen forever. Taken
+        // (not just read) so a normal write transaction — whose savepoint this never is — leaves it be.
+        if let Some((sp_txn, saved)) = self.gc_freeze_low_savepoint
+            && sp_txn == txn
+        {
+            self.freeze_low = saved;
+            self.gc_freeze_low_savepoint = None;
+        }
         self.tokens = pre_tokens;
         // Restore the live-record COUNTERS to their pre-rollback in-memory image, then withdraw
         // exactly this transaction's own delta (`rmp` #866) — the counts twin of the `pre_free` minus
