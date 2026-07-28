@@ -264,7 +264,8 @@ fn csr_eliminates_nonmatching_chain_reads() {
     use std::cell::Cell;
 
     use graphus_cypher::StoreReadSource;
-    use graphus_storage::record::{NodeRecord, PropRecord, RelRecord};
+    use graphus_storage::SupersetProperties;
+    use graphus_storage::record::{NodeRecord, RelRecord};
 
     /// A source that counts every `rel()` decode and every `incident_rels_typed` chain walk.
     struct Counting<'a> {
@@ -305,17 +306,17 @@ fn csr_eliminates_nonmatching_chain_reads() {
         ) -> u64 {
             self.inner.label_bitmap_at(id, live, snapshot, registry)
         }
-        fn node_properties(
+        fn superset_scan_node_properties(
             &self,
             id: u64,
-        ) -> Result<Vec<(u64, PropRecord)>, graphus_core::error::GraphusError> {
-            self.inner.node_properties(id)
+        ) -> Result<SupersetProperties, graphus_core::error::GraphusError> {
+            self.inner.superset_scan_node_properties(id)
         }
-        fn rel_properties(
+        fn superset_scan_rel_properties(
             &self,
             id: u64,
-        ) -> Result<Vec<(u64, PropRecord)>, graphus_core::error::GraphusError> {
-            self.inner.rel_properties(id)
+        ) -> Result<SupersetProperties, graphus_core::error::GraphusError> {
+            self.inner.superset_scan_rel_properties(id)
         }
         fn incident_rels(&self, id: u64) -> Result<Vec<u64>, graphus_core::error::GraphusError> {
             self.inner.incident_rels(id)

@@ -55,6 +55,7 @@ use crate::record::{
     NODE_RECORD_SIZE, NodeRecord, PROP_RECORD_SIZE, PropRecord, REL_OFF_CHAIN_FLAGS,
     REL_OFF_END_PREV, REL_OFF_FIRST_PROP, REL_OFF_START_PREV, REL_RECORD_SIZE, RelRecord,
 };
+use crate::scan_polarity::{DecidedProperties, SupersetProperties};
 use crate::tokens::{Namespace, TokenSnapshot, TokenStore};
 use crate::valenc;
 use crate::wal_rule::SharedWal;
@@ -5369,8 +5370,9 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
                 dead.mvcc = MvccHeader::default(); // clears in_use (no-op for a corpse, already clear)
                 // `rmp` #821/#811: PRESERVE `dead.next_prop` (do NOT zero it). This tombstone/corpse sits
                 // on a **live** owner's chain, so an off-thread reader (`read_view::collect_prop_chain`,
-                // behind `node_properties`/`rel_properties`) that captured a pointer to `cur` — from the
-                // owner's `first_prop` or a predecessor's `next_prop` — BEFORE the bridge below still
+                // behind `superset_scan_node_properties`/`superset_scan_rel_properties`) that
+                // captured a pointer to `cur` — from the owner's `first_prop` or a predecessor's
+                // `next_prop` — BEFORE the bridge below still
                 // reads this record and must thread through its `next_prop` to the live successor it
                 // points at. The reader correctly SKIPS this record (its `!in_use` bit hides the
                 // tombstone), but it walks the chain LIVE and non-atomically: zeroing `next_prop` made
@@ -5566,24 +5568,57 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         self.read_prop(id)
     }
 
-    /// Collects every **slot-occupied** (`in_use`) property `(physical_id, record)` in `node_id`'s
-    /// chain, head to tail — which is prepend order, so the FIRST occurrence of a key is its NEWEST
-    /// version and the caller applies newest-wins per key.
+    /// The **superset**-polarity read of node `node_id`'s property chain: every **slot-occupied**
+    /// (`in_use`) `(physical_id, record)`, head to tail — which is prepend order, so the FIRST
+    /// occurrence of a key is its NEWEST version (`rmp` task #905 named the polarity; see
+    /// [`scan_polarity`](crate::scan_polarity) for the taxonomy).
     ///
     /// # This includes MVCC tombstones
     ///
     /// A removed or overwritten version keeps its slot (and its place in the chain) until [`gc`](Self::gc)
-    /// reclaims it, so a record here may carry a non-zero `expired_ts`. Deciding whether a version is
-    /// part of the caller's graph is the caller's job — read `mvcc.expired_ts` (and, where the answer
-    /// must be snapshot-correct rather than merely committed, resolve it through
-    /// [`graphus_txn::is_visible`]). This doc comment used to say "every **live** property", which is
-    /// what the code does NOT do; a caller that believed it counted a committed `REMOVE n.p` as a
-    /// present value (`rmp` task #902).
+    /// reclaims it, so a record here may carry a non-zero `expired_ts`; a version written by a
+    /// transaction that has not committed is here too. That is the point: an index refill has no
+    /// snapshot and must populate a **superset** its consumers re-check (`rmp` task #766).
+    ///
+    /// # It is the wrong read for a decision
+    ///
+    /// A caller whose answer is final and is never re-checked — a constraint verdict, above all — must
+    /// call [`decision_scan_node_properties`](Self::decision_scan_node_properties), or narrow this
+    /// chain itself with [`SupersetProperties::decide`], which requires the deciding
+    /// [`Snapshot`]. This doc comment used to say "every **live** property", which is what the code
+    /// does NOT do; a caller that believed it counted a committed `REMOVE n.p` as a present value
+    /// (`rmp` task #902).
     ///
     /// # Errors
     /// Returns a storage error if a chain page is missing.
-    pub fn node_properties(&self, node_id: u64) -> Result<Vec<(u64, PropRecord)>> {
-        read_view::node_properties(&self.pool, &self.stores, node_id)
+    pub fn superset_scan_node_properties(&self, node_id: u64) -> Result<SupersetProperties> {
+        read_view::superset_scan_node_properties(&self.pool, &self.stores, node_id)
+    }
+
+    /// The **decision**-polarity read of node `node_id`'s properties: the newest version of each key
+    /// that `snapshot` can see, and nothing else (`rmp` task #905).
+    ///
+    /// This is [`superset_scan_node_properties`](Self::superset_scan_node_properties) narrowed by
+    /// [`SupersetProperties::decide`] against this store's [`CommitRegistry`] — that is, by the same
+    /// [`graphus_txn::is_visible`] predicate the query read path applies, so the caller decides over
+    /// exactly the graph a `MATCH` in the same transaction would return.
+    ///
+    /// Use it wherever the answer is **final**: nothing downstream re-checks a constraint verdict, so
+    /// reading the superset there counted a committed `REMOVE n.p` as a present value and both refused
+    /// valid constraints and admitted invalid ones (`rmp` task #902).
+    ///
+    /// # Errors
+    /// As [`superset_scan_node_properties`](Self::superset_scan_node_properties). Values are not
+    /// decoded here, so an unreadable overflow chain belonging to an uninvolved property does not fail
+    /// the caller (`rmp` task #733).
+    pub fn decision_scan_node_properties(
+        &self,
+        node_id: u64,
+        snapshot: Snapshot,
+    ) -> Result<DecidedProperties> {
+        Ok(self
+            .superset_scan_node_properties(node_id)?
+            .decide(snapshot, self.commit_registry()))
     }
 
     /// MVCC-tombstones the **live** property records in the chain rooted at `owner_first_prop`
@@ -5878,19 +5913,30 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         read_view::decode_property_value(&self.pool, &self.stores, type_tag, value_inline)
     }
 
-    /// Collects node `node_id`'s live properties as `(physical_id, key_token, Value)`, decoding both
-    /// inline scalars and overflow `String`/`List`/temporal values (`rmp` task #43). The chain is
-    /// walked head-to-tail; the caller applies newest-wins per key (the chain is prepend-ordered).
+    /// The **superset**-polarity read of node `node_id`'s properties, **decoded**: every
+    /// slot-occupied `(physical_id, key_token, Value)` in the chain, decoding both inline scalars and
+    /// overflow `String`/`List`/temporal values (`rmp` task #43).
+    ///
+    /// The decoded twin of
+    /// [`superset_scan_node_properties`](Self::superset_scan_node_properties), and it carries
+    /// exactly the same polarity: the chain is walked head-to-tail (prepend order, so newest first
+    /// per key) and **every** version is returned — MVCC tombstones and uncommitted versions
+    /// included. This doc comment used to say "live properties", the same false claim `rmp` task
+    /// #902 had to correct on the undecoded twin.
+    ///
+    /// Values are decoded eagerly, so it cannot be the read a decision path uses: pick a version
+    /// first, through [`decision_scan_node_properties`](Self::decision_scan_node_properties), and
+    /// decode only that one (`rmp` tasks #733, #905).
     ///
     /// # Errors
     /// Returns a storage error if the property chain or an overflow chain is unreadable/corrupt.
-    pub fn node_property_values(
+    pub fn superset_scan_node_property_values(
         &self,
         node_id: u64,
     ) -> Result<Vec<(u64, u32, graphus_core::Value)>> {
-        let chain = self.node_properties(node_id)?;
+        let chain = self.superset_scan_node_properties(node_id)?;
         let mut out = Vec::with_capacity(chain.len());
-        for (pid, prop) in chain {
+        for (pid, prop) in chain.into_every_version() {
             let value = self.decode_property_value(prop.type_tag, prop.value_inline)?;
             out.push((pid, prop.key, value));
         }
@@ -5983,15 +6029,32 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Ok(pid)
     }
 
-    /// Collects every **slot-occupied** (`in_use`) property `(physical_id, record)` in relationship
-    /// `rel_id`'s chain, head to tail (`rmp` task #44). The relationship analogue of
-    /// [`node_properties`](Self::node_properties), including its treatment of MVCC tombstones — read
-    /// that doc before judging a version.
+    /// The **superset**-polarity read of relationship `rel_id`'s property chain (`rmp` task #44): every
+    /// **slot-occupied** (`in_use`) `(physical_id, record)`, head to tail. The relationship analogue of
+    /// [`superset_scan_node_properties`](Self::superset_scan_node_properties), including its
+    /// treatment of MVCC tombstones and its polarity — read that doc before judging a version.
     ///
     /// # Errors
     /// Returns a storage error if a chain page is missing or the chain is malformed (cycle-guarded).
-    pub fn rel_properties(&self, rel_id: u64) -> Result<Vec<(u64, PropRecord)>> {
-        read_view::rel_properties(&self.pool, &self.stores, rel_id)
+    pub fn superset_scan_rel_properties(&self, rel_id: u64) -> Result<SupersetProperties> {
+        read_view::superset_scan_rel_properties(&self.pool, &self.stores, rel_id)
+    }
+
+    /// The **decision**-polarity read of relationship `rel_id`'s properties (`rmp` task #905): the
+    /// relationship analogue of
+    /// [`decision_scan_node_properties`](Self::decision_scan_node_properties), with the same
+    /// obligation — use it wherever the answer is final and nothing re-checks it.
+    ///
+    /// # Errors
+    /// As [`superset_scan_rel_properties`](Self::superset_scan_rel_properties).
+    pub fn decision_scan_rel_properties(
+        &self,
+        rel_id: u64,
+        snapshot: Snapshot,
+    ) -> Result<DecidedProperties> {
+        Ok(self
+            .superset_scan_rel_properties(rel_id)?
+            .decide(snapshot, self.commit_registry()))
     }
 
     /// Sets relationship `rel_id`'s property `key` to `value` under `txn`, **replacing** any current
@@ -6045,16 +6108,20 @@ impl<D: BlockDevice, S: LogSink> RecordStore<D, S> {
         Ok(tombstoned > 0)
     }
 
-    /// Collects relationship `rel_id`'s live properties as `(physical_id, key_token, Value)`, decoding
-    /// both inline scalars and overflow `String`/`List`/temporal values (`rmp` task #44). The
-    /// chain is walked head-to-tail; the caller applies newest-wins per key (the chain is
-    /// prepend-ordered). The relationship analogue of
-    /// [`node_property_values`](Self::node_property_values).
+    /// The **superset**-polarity read of relationship `rel_id`'s properties, **decoded** (`rmp` task
+    /// #44): the relationship analogue of
+    /// [`superset_scan_node_property_values`](Self::superset_scan_node_property_values), with the
+    /// same polarity and the same caveat — every slot-occupied version is returned, tombstones
+    /// included, and a decision path must narrow through
+    /// [`decision_scan_rel_properties`](Self::decision_scan_rel_properties) instead.
     ///
     /// # Errors
     /// Returns a storage error if the property chain or an overflow chain is unreadable/corrupt.
-    pub fn rel_property_values(&self, rel_id: u64) -> Result<Vec<(u64, u32, graphus_core::Value)>> {
-        read_view::rel_property_values(&self.pool, &self.stores, rel_id)
+    pub fn superset_scan_rel_property_values(
+        &self,
+        rel_id: u64,
+    ) -> Result<Vec<(u64, u32, graphus_core::Value)>> {
+        read_view::superset_scan_rel_property_values(&self.pool, &self.stores, rel_id)
     }
 
     /// Clears **all** of relationship `rel_id`'s properties under `txn` via per-value MVCC (`rmp`
@@ -8423,11 +8490,12 @@ mod tests {
         s.commit(t2).unwrap();
 
         // The chain now holds BOTH in-use records: the new live one (xmax == 0) and the old
-        // tombstoned one (xmax committed). `node_properties` returns every in-use record (the reader
-        // layer filters by visibility), so we see exactly two.
-        let chain = s.node_properties(n).unwrap();
+        // tombstoned one (xmax committed). `superset_scan_node_properties` returns every in-use
+        // record (the reader layer filters by visibility), so we see exactly two.
+        let chain = s.superset_scan_node_properties(n).unwrap();
         assert_eq!(chain.len(), 2, "old version tombstoned, not freed");
         let live: Vec<_> = chain
+            .every_version()
             .iter()
             .filter(|(_, p)| Store::is_live_version(p.mvcc))
             .collect();
@@ -8438,6 +8506,7 @@ mod tests {
             Value::Integer(2)
         );
         let tomb: Vec<_> = chain
+            .every_version()
             .iter()
             .filter(|(_, p)| p.mvcc.in_use() && p.mvcc.expired_ts != 0)
             .collect();
@@ -8457,7 +8526,7 @@ mod tests {
             "GC must not reclaim a version an older snapshot can still see"
         );
         assert_eq!(
-            s.node_properties(n).unwrap().len(),
+            s.superset_scan_node_properties(n).unwrap().len(),
             2,
             "old version still present after a too-early GC"
         );
@@ -8466,11 +8535,11 @@ mod tests {
         // tombstoned old version and splices it out, leaving exactly the live one.
         let latest = s.snapshot_ts();
         gc_at(&mut s, TxnId(4), latest);
-        let chain = s.node_properties(n).unwrap();
+        let chain = s.superset_scan_node_properties(n).unwrap();
         assert_eq!(chain.len(), 1, "tombstoned old version reclaimed at GC");
         assert_eq!(
-            s.node_property_values(n).unwrap(),
-            vec![(chain[0].0, key, Value::Integer(2))]
+            s.superset_scan_node_property_values(n).unwrap(),
+            vec![(chain.every_version()[0].0, key, Value::Integer(2))]
         );
     }
 
@@ -8632,7 +8701,7 @@ mod tests {
             "a LIFO single-txn abort restores V0 to live (CAS undo reverts its own stamp)"
         );
         assert_eq!(
-            s.node_property_values(h).unwrap(),
+            s.superset_scan_node_property_values(h).unwrap(),
             vec![(v0, key, Value::Integer(1))],
             "the property is readable again after the abort"
         );
@@ -9401,12 +9470,12 @@ mod tests {
             "an in-flight tombstone is not reclaimable"
         );
         s.commit(t2).unwrap();
-        assert_eq!(s.node_properties(n).unwrap().len(), 2);
+        assert_eq!(s.superset_scan_node_properties(n).unwrap().len(), 2);
 
         // After commit, a GC at the latest watermark reclaims it.
         let latest = s.snapshot_ts();
         gc_at(&mut s, TxnId(3), latest);
-        assert_eq!(s.node_properties(n).unwrap().len(), 1);
+        assert_eq!(s.superset_scan_node_properties(n).unwrap().len(), 1);
     }
 
     #[test]
@@ -9743,8 +9812,9 @@ mod tests {
             report.violations
         );
         assert_eq!(
-            s.node_properties(node)
+            s.superset_scan_node_properties(node)
                 .unwrap()
+                .into_every_version()
                 .into_iter()
                 .map(|(pid, _)| pid)
                 .collect::<Vec<_>>(),
@@ -9754,8 +9824,9 @@ mod tests {
     }
 
     /// `rmp` #821 (threaded stress — also closes the GAP-A concurrency-coverage gap of the v0.0.9
-    /// storage re-audit): an off-thread reader hammering `node_properties` on a **live** owner whose
-    /// chain is `B(tombstone) -> A(live)` must NEVER lose the live property A while the engine
+    /// storage re-audit): an off-thread reader hammering `superset_scan_node_properties` on a
+    /// **live** owner whose chain is `B(tombstone) -> A(live)` must NEVER lose the live property A
+    /// while the engine
     /// repeatedly runs a GC pass that reclaims the tombstone B above it. Pre-fix the GC zeroed B's
     /// `next_prop`, and a reader that read the owner's (not-yet-bridged) head B and then read B after
     /// the zero terminated its walk and dropped A. This drives REAL threads over the shared
@@ -9791,11 +9862,11 @@ mod tests {
             let reads = Arc::clone(&reads);
             std::thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
-                    match view.node_properties(node) {
+                    match view.superset_scan_node_properties(node) {
                         // The live property A (pid `a`) is NEVER deleted, so it must be present on every
                         // read: only a severed walk can drop it.
                         Ok(props) => {
-                            if !props.iter().any(|(pid, _)| *pid == a) {
+                            if !props.every_version().iter().any(|(pid, _)| *pid == a) {
                                 losses.fetch_add(1, Ordering::Relaxed);
                             }
                         }

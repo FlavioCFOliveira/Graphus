@@ -802,7 +802,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             store.rel(rel.0).ok()?.type_id
         };
         let store = self.store.borrow();
-        let chain = store.rel_property_values(rel.0).ok()?;
+        let chain = store.superset_scan_rel_property_values(rel.0).ok()?;
         let mut resolved: Vec<(u32, Value)> = Vec::new();
         for (_pid, key, value) in chain {
             if resolved.iter().any(|(k, _)| *k == key) {
@@ -1242,7 +1242,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // `node_properties`, `decode_property_value`) take `&self`, so a shared borrow suffices.
         let store = self.store.borrow();
         let key_id = store.token_id(Namespace::PropKey, key)?;
-        let chain = match store.node_properties(node.0) {
+        let chain = match store.superset_scan_node_properties(node.0) {
             Ok(chain) => chain,
             Err(e) => {
                 drop(store);
@@ -1250,7 +1250,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
                 return None;
             }
         };
-        for (_pid, prop) in chain {
+        for (_pid, prop) in chain.every_version() {
             if prop.key != key_id || !self.visible(prop.mvcc) {
                 continue;
             }
@@ -1270,7 +1270,8 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     /// #50), decoding both inline scalars (#38) and `String`/`List` overflow values (`rmp` task #43).
     ///
     /// A property overwrite is an MVCC operation now (`rmp` task #50): the old `PropRecord` is
-    /// tombstoned and the new one prepended, so the chain (from [`RecordStore::node_properties`])
+    /// tombstoned and the new one prepended, so the chain (from
+    /// [`RecordStore::superset_scan_node_properties`])
     /// holds **multiple versions per key**, live and not-yet-GC'd tombstones. Each is filtered through
     /// [`is_visible`] on its `xmin`/`xmax`, so this query sees exactly the version committed at or
     /// before its snapshot (or its own write) — never a concurrent transaction's uncommitted value.
@@ -1278,7 +1279,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
     fn read_node_props(&self, node: NodeId) -> Vec<(String, Value)> {
         // Read-only store access (`rmp` #337 Slice 2): `&self` read methods, shared borrow.
         let store = self.store.borrow();
-        let chain = match store.node_properties(node.0) {
+        let chain = match store.superset_scan_node_properties(node.0) {
             Ok(chain) => chain,
             Err(e) => {
                 drop(store);
@@ -1287,7 +1288,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
             }
         };
         let mut out: Vec<(u32, Value)> = Vec::new();
-        for (_pid, prop) in chain {
+        for (_pid, prop) in chain.into_every_version() {
             // MVCC visibility filter + newest-visible-wins: skip versions invisible to this snapshot,
             // and a key id already resolved to a newer visible version.
             if !self.visible(prop.mvcc) || out.iter().any(|(k, _)| *k == prop.key) {
@@ -2025,7 +2026,7 @@ impl<D: BlockDevice + Send + Sync + 'static, S: LogSink + Send + Sync + 'static>
         // below never overlaps a store borrow.
         let resolved: Vec<(u32, Value)> = {
             let store = self.store.borrow();
-            let chain = match store.rel_property_values(rel.0) {
+            let chain = match store.superset_scan_rel_property_values(rel.0) {
                 Ok(chain) => chain,
                 Err(_) => return, // a non-storable / read fault: skip this relationship's properties.
             };

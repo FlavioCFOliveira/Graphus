@@ -723,8 +723,9 @@ fn multi_field_record_write_recovers_and_aborts_byte_identically() {
 
     let before: Vec<(u32, u64)> = {
         let mut v: Vec<(u32, u64)> = s
-            .node_properties(node)
+            .superset_scan_node_properties(node)
             .unwrap()
+            .every_version()
             .iter()
             .map(|(_, p)| (p.key, p.value_inline))
             .collect();
@@ -743,8 +744,9 @@ fn multi_field_record_write_recovers_and_aborts_byte_identically() {
 
     let rec = recover_no_force(&s);
     let mut after: Vec<(u32, u64)> = rec
-        .node_properties(node)
+        .superset_scan_node_properties(node)
         .unwrap()
+        .every_version()
         .iter()
         .map(|(_, p)| (p.key, p.value_inline))
         .collect();
@@ -773,8 +775,9 @@ fn multi_field_record_write_recovers_and_aborts_byte_identically() {
     let rec2 = recover_steal(&mut s2);
     // The committed node keeps exactly its one property; the loser node was never made live.
     let kept_props: Vec<(u32, u64)> = rec2
-        .node_properties(kept)
+        .superset_scan_node_properties(kept)
         .unwrap()
+        .every_version()
         .iter()
         .map(|(_, p)| (p.key, p.value_inline))
         .collect();
@@ -788,7 +791,9 @@ fn multi_field_record_write_recovers_and_aborts_byte_identically() {
         "the uncommitted multi-field node create is rolled back to not-in-use (header-only undo)"
     );
     assert!(
-        rec2.node_properties(loser).unwrap().is_empty(),
+        rec2.superset_scan_node_properties(loser)
+            .unwrap()
+            .is_empty(),
         "the uncommitted property chain is undone (chain-head CAS undo unlinked every prop)"
     );
 }

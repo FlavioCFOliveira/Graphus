@@ -550,8 +550,8 @@ fn recovered_contains_sentinel(
     sentinel: i64,
 ) -> bool {
     for node in store.scan_node_ids().unwrap_or_default() {
-        if let Ok(props) = store.node_properties(node) {
-            for (_pid, pr) in props {
+        if let Ok(props) = store.superset_scan_node_properties(node) {
+            for (_pid, pr) in props.every_version() {
                 if let Ok(Value::Integer(v)) =
                     graphus_storage::propenc::decode_inline(pr.type_tag, pr.value_inline)
                     && v == sentinel

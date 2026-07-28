@@ -71,7 +71,7 @@ fn node_shape(store: &mut Store, id: u64) -> NodeShape {
     // Newest-wins per key (the chain is prepend-ordered), then sorted by key for a stable shape.
     let mut by_key: BTreeMap<String, ValueKey> = BTreeMap::new();
     let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    for (_pid, key_token, value) in store.node_property_values(id).expect("props") {
+    for (_pid, key_token, value) in store.superset_scan_node_property_values(id).expect("props") {
         if seen.insert(key_token) {
             let key = store
                 .token_name(Namespace::PropKey, key_token)
@@ -101,7 +101,10 @@ fn rel_shapes(store: &mut Store) -> Vec<RelShape> {
         let end = node_shape(store, rec.end_node);
         let mut by_key: BTreeMap<String, ValueKey> = BTreeMap::new();
         let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        for (_pid, key_token, value) in store.rel_property_values(id).expect("rel props") {
+        for (_pid, key_token, value) in store
+            .superset_scan_rel_property_values(id)
+            .expect("rel props")
+        {
             if seen.insert(key_token) {
                 let key = store
                     .token_name(Namespace::PropKey, key_token)
@@ -392,7 +395,7 @@ fn dump_import_round_trips_to_an_identical_graph() {
 /// Returns a node's string property `key`, if present, resolving tokens and taking the newest value.
 fn node_string_prop(store: &mut Store, id: u64, key: &str) -> Option<String> {
     let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    for (_pid, key_token, value) in store.node_property_values(id).expect("props") {
+    for (_pid, key_token, value) in store.superset_scan_node_property_values(id).expect("props") {
         if seen.insert(key_token) {
             let name = store
                 .token_name(Namespace::PropKey, key_token)

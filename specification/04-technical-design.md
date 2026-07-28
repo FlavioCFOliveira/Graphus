@@ -563,6 +563,51 @@ A transaction always sees its **own** uncommitted writes (its `TxnId` matches). 
 Snapshot Isolation reads; SSI (below) upgrades correctness to Serializable without adding read
 locks.
 
+**Read polarity: which reads owe this predicate, and which owe something else.** Every read of the
+record store returns raw physical state — the slot's current contents, including MVCC tombstones the
+GC has not reclaimed, versions whose writer has not committed, and (for labels, which are mutated in
+place) a word a rollback will change back. Nothing about that is wrong; what is wrong is using one
+polarity's read where another polarity's answer was owed, and that single mistake produced three
+CRITICAL defects. A read therefore has to state which of **three** obligations it is discharging:
+
+| Polarity | Obligation | Who re-checks | Cost of a wrong answer |
+|---|---|---|---|
+| **Superset** | must CONTAIN every row any snapshot could need | the consumer, against its own snapshot | a missing row is unrecoverable; an extra row is dropped by the re-check |
+| **Decision** | must be EXACTLY what the deciding snapshot sees | nobody | a wrong row is written into the schema, or into a uniqueness verdict |
+| **Conservative** | must never EXCLUDE on unproven state | nobody, for the excluded range | an excluded range disappears before any re-check runs |
+
+*Superset* is index population. A refill has no reader and therefore no snapshot; it populates a
+candidate structure that every consumer re-checks, and the asymmetry that makes that safe runs one
+way only — **a re-check can remove a candidate, but it can never resurrect one**. So a refill indexes
+every property version with no visibility filter, and gates label membership on the union of the live
+word with every retained bitmap, because the live word is a *subset* while an uncommitted
+`REMOVE n:L` is open.
+
+*Decision* is constraint validation. A `CREATE CONSTRAINT` walk produces a verdict that is written
+durably into the catalogue and is never re-checked, so it must see exactly the graph a `MATCH` in the
+same transaction would see. Reading the superset there counted a committed `REMOVE n.p` as a present
+value: `IS UNIQUE` was refused over a duplicate no query could find, and `IS NOT NULL` was accepted
+over a property that was gone.
+
+*Conservative* is a data-skipping structure. A zone map **prunes**: the per-row re-check only ever
+runs on the ids the summary did not exclude, so a narrowed zone removes a whole id range before any
+re-check can see it, and nothing rebuilds a zone map afterwards. A pruning structure may therefore
+only narrow on state it can prove, which in practice means it takes the same superset gate a refill
+takes.
+
+Two shapes sit outside the three and must not be mistaken for them. The **write path** reads the
+entity's current image, because the state it is announcing or indexing is the state it has just
+written — there is no snapshot to resolve against. And a **memoization with a total fallback** (the
+columnar accelerator) may read the current image because a row it omits falls through to the
+authoritative property read, so a hole costs a decode rather than a row.
+
+The first two polarities are separated in the type system: the decision-grade store read takes the
+snapshot as a parameter and returns a view that has no other constructor, so a validation helper
+cannot be handed a raw chain, and the raw view cannot be walked without naming the polarity out loud.
+The label axis cannot be separated the same way — all three label reads deal in the same bitmap — so
+it is held by an enforced census that also records every raw read the engine performs on purpose,
+with its justification.
+
 ### 5.4 SSI: dangerous-structure detection and abort
 
 Pure SI permits **write-skew** and other serialization anomalies. SSI adds detection of the
@@ -688,6 +733,11 @@ come back consistent with the base store because they share one log and one reco
   time) is what makes uniqueness serializable rather than merely snapshot-correct.
 - Constraint violations surface as the appropriate **Cypher error** (TCK-conformant error class,
   §7.3), not as a panic.
+- **Validating a constraint against existing data is a `decision`-polarity read (§5.3).** The walk
+  runs inside the DDL's own serializable transaction and judges exactly the entities and values that
+  transaction's snapshot sees. It must never reach for the reads an index refill uses: those are
+  deliberately supersets, and the constraint verdict is the one answer in the engine that nothing
+  downstream re-checks.
 
 ### 6.6 Planner use of indexes
 

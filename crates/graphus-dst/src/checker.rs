@@ -202,8 +202,9 @@ pub fn verify<D: BlockDevice, S: LogSink>(
 
         // Properties: compare as sorted multisets (the chain order is an implementation detail).
         let mut store_props: Vec<PropTriple> = store
-            .node_properties(node)
-            .map_err(|e| store_err("node_properties()", node, &e))?
+            .superset_scan_node_properties(node)
+            .map_err(|e| store_err("superset_scan_node_properties()", node, &e))?
+            .into_every_version()
             .into_iter()
             .map(|(_, p)| PropTriple {
                 key: p.key,

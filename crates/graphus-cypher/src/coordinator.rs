@@ -36,6 +36,30 @@
 //! statement's duration, never for the whole transaction), then [`commit`](TxnCoordinator::commit)
 //! or [`rollback`](TxnCoordinator::rollback). Markers and locks accumulate across statements in the
 //! coordinator's shared trackers.
+//!
+//! ## Read polarity: this file holds two opposite ones (`rmp` task #905)
+//!
+//! The index refills (`index_one_node*`, `index_one_rel*`) and the constraint-validation walks
+//! (`validate_existing_*_against_constraint`) sit a few thousand lines apart in this file and make
+//! **opposite** demands of the same store reads. They are not variations on a theme; they discharge
+//! different obligations, and the whole of `rmp` tasks #902 and #904 was one being written with the
+//! other's read:
+//!
+//! * a **refill** has no snapshot. It populates a candidate structure that every consumer re-checks,
+//!   and a re-check can remove a candidate but never resurrect one, so the tree must be a
+//!   **superset** — every property version (`rmp` #766), and the live-OR-retained label union
+//!   ([`RecordStore::node_label_superset`], `rmp` #904), never the live word;
+//! * a **constraint verdict** is written into the catalogue and nothing re-checks it, so it must be
+//!   a **decision** — exactly what the DDL transaction's snapshot sees, resolved through
+//!   [`RecordStore::decision_scan_node_properties`] / `decision_scan_rel_properties`, which cannot
+//!   be called without that snapshot;
+//! * `rebuild_zone_column` is a third thing again: a zone map **prunes** an id range before any
+//!   re-check runs and nothing repairs one, so it must be **conservative** and takes the refill's
+//!   superset gate.
+//!
+//! [`graphus_storage::scan_polarity`] states the rule in full. The census that keeps this file
+//! honest — including every raw read here that is deliberately correct, and why — is
+//! `tests/read_polarity_census.rs`.
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -46,8 +70,9 @@ use graphus_core::error::{GraphusError, Result};
 use graphus_core::{Lsn, Timestamp, TxnId, VersionStamp};
 
 /// One version of one property, as the index build sees it: the MVCC stamps plus the decoded value
-/// (`rmp` task #766). `RecordStore::node_property_values` / `rel_property_values` discard the stamps,
-/// so the composite builds read `node_properties` / `rel_properties` and keep them.
+/// (`rmp` task #766). `RecordStore::superset_scan_node_property_values` /
+/// `superset_scan_rel_property_values` discard the stamps, so the composite builds read
+/// `superset_scan_node_properties` / `superset_scan_rel_properties` and keep them.
 struct PropVersion {
     /// The creating transaction's stamp (`MvccHeader::created_ts`), raw.
     xmin: u64,
@@ -722,10 +747,10 @@ use graphus_index::keycodec::encode_equality_canonical;
 use graphus_index::{Similarity, VectorIndexError};
 use graphus_io::BlockDevice;
 use graphus_storage::{
-    CompositeIndexEntry, ConstraintEntry, ConstraintKind, ConstraintTypeDescriptor, FulltextEntity,
-    FulltextIndexEntry, GcPassReport, IndexState, Namespace, PropRecord, RecordStore,
-    RelCompositeIndexEntry, SpatialEntity, SpatialIndexEntry, StoreReadView, TextIndexEntry,
-    TokenSnapshot, VectorEntity, VectorIndexEntry, VectorSimilarity,
+    CompositeIndexEntry, ConstraintEntry, ConstraintKind, ConstraintTypeDescriptor,
+    DecidedProperties, FulltextEntity, FulltextIndexEntry, GcPassReport, IndexState, Namespace,
+    PropRecord, RecordStore, RelCompositeIndexEntry, SpatialEntity, SpatialIndexEntry,
+    StoreReadView, TextIndexEntry, TokenSnapshot, VectorEntity, VectorIndexEntry, VectorSimilarity,
 };
 use graphus_txn::{
     CommitRegistry, IsolationLevel, LockTable, PredicateRead, Snapshot, SsiReadBuffer, SsiTracker,
@@ -1571,8 +1596,9 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// # Why this is a second pass, not a fold into the build scan
     ///
     /// The index build's scan ([`index_one_node`](Self::index_one_node)) reads through
-    /// `RecordStore::node_labels` / `node_property_values` — **raw** store reads with no MVCC
-    /// visibility filtering. That is sound for the *tree*, which is a **candidate** source: a seek
+    /// `RecordStore::node_labels` / `superset_scan_node_property_values` — **raw** store reads with
+    /// no MVCC visibility filtering. That is sound for the *tree*, which is a **candidate** source:
+    /// a seek
     /// re-checks every candidate against the reader's snapshot, so an extra invisible version costs a
     /// rejected candidate, never a wrong answer. A histogram has no such re-check — it is consumed
     /// **directly** as an estimate — so folding it into that scan would describe a graph that never
@@ -2639,10 +2665,11 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ) {
         // The node's label tokens + EVERY version of its properties (with MVCC stamps), read in one
         // store-borrow scope. Read-only: `node_label_superset` / `node_properties` are `&self`
-        // (`rmp` #337 Slice 2). `node_properties` is used rather than `node_property_values` because
-        // the latter strips the stamps, and the per-view tuple construction below needs them
-        // (`rmp` task #766). The membership gate is the LIVE-OR-RETAINED label superset, never the raw
-        // live word (`rmp` task #904) — see `RecordStore::node_label_superset`.
+        // (`rmp` #337 Slice 2). `superset_scan_node_properties` is used rather than
+        // `superset_scan_node_property_values` because the latter strips the stamps, and the
+        // per-view tuple construction below needs them (`rmp` task #766). The membership gate is
+        // the LIVE-OR-RETAINED label superset, never the raw live word (`rmp` task #904) — see
+        // `RecordStore::node_label_superset`.
         let (label_tokens, props, registry): (Vec<u32>, Vec<(u32, PropVersion)>, CommitRegistry) = {
             let store = store.borrow();
             let labels = match store.node_label_superset(id) {
@@ -2655,8 +2682,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     return;
                 }
             };
-            let chain = match store.node_properties(id) {
-                Ok(chain) => chain,
+            let chain = match store.superset_scan_node_properties(id) {
+                Ok(chain) => chain.into_every_version(),
                 Err(_) => {
                     // `rmp` task #733: record the gap instead of hiding it — an entity missing from
                     // the index is a candidate a seek can never resurrect, so the build that drove
@@ -2766,9 +2793,9 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         };
 
         // Resolve the node's property values, keyed by prop-key, so the index borrow below never
-        // overlaps a store borrow. `node_property_values` decodes the whole chain newest-first
-        // (`rmp` task #50): it holds EVERY not-yet-GC'd version of every key — the live one, the
-        // versions an older snapshot still reads, and any still-uncommitted write.
+        // overlaps a store borrow. `superset_scan_node_property_values` decodes the whole chain
+        // newest-first (`rmp` task #50): it holds EVERY not-yet-GC'd version of every key — the
+        // live one, the versions an older snapshot still reads, and any still-uncommitted write.
         //
         // # Index EVERY version, never just the newest (`rmp` task #766)
         //
@@ -2790,7 +2817,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // is the only image that serves both readers.
         let mut values: Vec<(u32, graphus_core::Value)> = Vec::new();
         {
-            let chain = match store.borrow_mut().node_property_values(id) {
+            let chain = match store.borrow_mut().superset_scan_node_property_values(id) {
                 Ok(chain) => chain,
                 Err(_) => {
                     // a non-storable / read fault: skip this node's properties.
@@ -2867,7 +2894,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // lost row but an ADMITTED COMMITTED DUPLICATE (the `rmp` #683 / #765 failure mode).
         let mut values: Vec<(u32, graphus_core::Value)> = Vec::new();
         {
-            let chain = match store.borrow().rel_property_values(id) {
+            let chain = match store.borrow().superset_scan_rel_property_values(id) {
                 Ok(chain) => chain,
                 Err(_) => {
                     // a non-storable / read fault: skip this relationship's properties.
@@ -2932,12 +2959,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             return;
         }
         // EVERY version of the relationship's properties, with MVCC stamps (`rmp` task #766):
-        // `rel_properties` rather than `rel_property_values`, which strips the stamps the per-view
-        // tuple construction needs.
+        // `rel_properties` rather than `superset_scan_rel_property_values`, which strips the stamps
+        // the per-view tuple construction needs.
         let (props, registry): (Vec<(u32, PropVersion)>, CommitRegistry) = {
             let store = store.borrow();
-            let chain = match store.rel_properties(id) {
-                Ok(chain) => chain,
+            let chain = match store.superset_scan_rel_properties(id) {
+                Ok(chain) => chain.into_every_version(),
                 Err(_) => {
                     // a non-storable / read fault: skip this relationship's properties.
                     // `rmp` task #733: record the gap instead of hiding it — an entity missing from
@@ -3024,8 +3051,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // `RecordStore::node_label_superset`), the covered full-text keys, its STAMPED property chain
         // (newest-first) and the commit registry in one shared borrow scope (`node_label_superset` /
         // `node_properties` are `&self`, `rmp` #337 Slice 2). The chain carries MVCC stamps
-        // (`node_properties`, not `node_property_values`) because the #778 gate below must resolve the
-        // newest version's writer.
+        // (`node_properties`, not `superset_scan_node_property_values`) because the #778 gate below
+        // must resolve the newest version's writer.
         //
         // Widening only the LABEL component is sound here even though this consumer re-checks no term:
         // `RecordStoreGraph::fulltext_query` re-checks a hit's visibility and current label
@@ -3046,8 +3073,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             let covered = index
                 .borrow()
                 .fulltext_covered_keys_for_labels(&label_tokens);
-            let chain = match store.node_properties(id) {
-                Ok(chain) => chain,
+            let chain = match store.superset_scan_node_properties(id) {
+                Ok(chain) => chain.into_every_version(),
                 Err(_) => {
                     Self::note_rebuild_gap(index);
                     return;
@@ -3126,8 +3153,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     ) {
         // The relationship's type, covered full-text keys, STAMPED property chain and the commit
         // registry in one shared borrow scope — the relationship twin of `index_one_node_fulltext`
-        // (`rmp` task #778). `rel_properties` (not `rel_property_values`) so the #778 gate can resolve
-        // the newest version's writer.
+        // (`rmp` task #778). `rel_properties` (not `superset_scan_rel_property_values`) so the #778
+        // gate can resolve the newest version's writer.
         let (type_token, covered, chain) = {
             let store = store.borrow();
             let type_token = match store.rel(id) {
@@ -3143,8 +3170,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
             let covered = index
                 .borrow()
                 .fulltext_rel_covered_keys_for_type(type_token);
-            let chain = match store.rel_properties(id) {
-                Ok(chain) => chain,
+            let chain = match store.superset_scan_rel_properties(id) {
+                Ok(chain) => chain.into_every_version(),
                 Err(_) => {
                     Self::note_rebuild_gap(index);
                     return;
@@ -3243,7 +3270,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // type, in chain order (newest first) — NOT collapsed newest-wins (`rmp` task #779).
         let mut values: Vec<(u32, Value)> = Vec::new();
         {
-            let chain = match store.borrow().rel_property_values(id) {
+            let chain = match store.borrow().superset_scan_rel_property_values(id) {
                 Ok(chain) => chain,
                 Err(_) => {
                     // `rmp` task #733: record the gap instead of hiding it — an entity missing from
@@ -3326,7 +3353,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // chain order (newest first) — NOT collapsed newest-wins (`rmp` task #779).
         let mut values: Vec<(u32, Value)> = Vec::new();
         {
-            let chain = match store.borrow_mut().node_property_values(id) {
+            let chain = match store.borrow_mut().superset_scan_node_property_values(id) {
                 Ok(chain) => chain,
                 Err(_) => {
                     // `rmp` task #733: record the gap instead of hiding it — an entity missing from
@@ -3407,7 +3434,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // (`rmp` task #773), keeping only string values (a text index covers strings only).
         let mut values: Vec<(u32, Value)> = Vec::new();
         {
-            let chain = match store.borrow_mut().node_property_values(id) {
+            let chain = match store.borrow_mut().superset_scan_node_property_values(id) {
                 Ok(chain) => chain,
                 Err(_) => {
                     // `rmp` task #733: record the gap instead of hiding it — an entity missing from
@@ -3488,8 +3515,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // when a transaction *resolves*. That exact confusion is `rmp` #522 and it silently no-opped the
         // pre-#778 full-text gate; re-making it here would no-op this one.
         let conflicted_keys: Vec<u32> = {
-            let chain = match store.borrow().node_properties(id) {
-                Ok(chain) => chain,
+            let chain = match store.borrow().superset_scan_node_properties(id) {
+                Ok(chain) => chain.into_every_version(),
                 Err(_) => {
                     Self::note_rebuild_gap(index);
                     return;
@@ -3521,7 +3548,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // pre-filtered here (unlike text/spatial): `insert_vector_value` validates the embedding shape.
         let mut values: Vec<(u32, Value)> = Vec::new();
         {
-            let chain = match store.borrow_mut().node_property_values(id) {
+            let chain = match store.borrow_mut().superset_scan_node_property_values(id) {
                 Ok(chain) => chain,
                 Err(_) => {
                     // `rmp` task #733: record the gap instead of hiding it — an entity missing from
@@ -3593,8 +3620,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // `rmp` task #780 — the relationship twin of the node gate in
         // [`index_one_node_vector`](Self::index_one_node_vector); see there for the full rationale.
         let conflicted_keys: Vec<u32> = {
-            let chain = match store.borrow().rel_properties(id) {
-                Ok(chain) => chain,
+            let chain = match store.borrow().superset_scan_rel_properties(id) {
+                Ok(chain) => chain.into_every_version(),
                 Err(_) => {
                     Self::note_rebuild_gap(index);
                     return;
@@ -3621,7 +3648,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
 
         let mut values: Vec<(u32, Value)> = Vec::new();
         {
-            let chain = match store.borrow().rel_property_values(id) {
+            let chain = match store.borrow().superset_scan_rel_property_values(id) {
                 Ok(chain) => chain,
                 Err(_) => {
                     // `rmp` task #733: record the gap instead of hiding it — an entity missing from
@@ -3683,9 +3710,10 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // Skip a slot that is not in use (`rmp` #453, F-IDX-3): the rebuild/declare callers only pass
         // ids from the in-use scan, but the abort re-derive (`rederive_node_bitmap`) may pass a node
         // whose CREATE was just rolled back — a header-only create-undo (#220) clears the slot's in-use
-        // bit but PRESERVES its body, so `node_labels`/`node_property_values` below would still decode
-        // residual labels/values and wrongly RE-INSERT a phantom. Guarding on `in_use` keeps a
-        // reverted-create node out of every bitmap (correct: it no longer exists), and is a defensive
+        // bit but PRESERVES its body, so `node_labels`/`superset_scan_node_property_values` below
+        // would still decode residual labels/values and wrongly RE-INSERT a phantom. Guarding on
+        // `in_use` keeps a reverted-create node out of every bitmap (correct: it no longer exists),
+        // and is a defensive
         // no-op for the rebuild/declare callers (their nodes are always in use).
         match store.borrow().node(id) {
             Ok(node) if node.mvcc.in_use() => {}
@@ -3712,7 +3740,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         // more than one of its versions is live.
         let mut values: Vec<(u32, Value)> = Vec::new();
         {
-            let chain = match store.borrow_mut().node_property_values(id) {
+            let chain = match store.borrow_mut().superset_scan_node_property_values(id) {
                 Ok(chain) => chain,
                 Err(_) => {
                     // `rmp` task #733: record the gap instead of hiding it — an entity missing from
@@ -4623,7 +4651,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     Ok(l) => l,
                     Err(_) => continue,
                 };
-                let chain = match store.node_property_values(id) {
+                let chain = match store.superset_scan_node_property_values(id) {
                     Ok(c) => c,
                     Err(_) => continue,
                 };
@@ -4697,7 +4725,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                         Ok(l) => l,
                         Err(_) => continue,
                     };
-                    let chain = match store.node_property_values(id) {
+                    let chain = match store.superset_scan_node_property_values(id) {
                         Ok(c) => c,
                         Err(_) => continue,
                     };
@@ -4783,7 +4811,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                     Ok(l) => l,
                     Err(_) => continue,
                 };
-                let chain = match store.node_property_values(id) {
+                let chain = match store.superset_scan_node_property_values(id) {
                     Ok(chain) => chain,
                     Err(_) => continue,
                 };
@@ -4795,8 +4823,8 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
                 if !label_tokens.contains(&label_token) {
                     continue;
                 }
-                // `node_property_values` decodes the chain newest-first, so the FIRST occurrence of the
-                // key is the newest in-use version — its pid is the staleness witness.
+                // `superset_scan_node_property_values` decodes the chain newest-first, so the FIRST
+                // occurrence of the key is the newest in-use version — its pid is the staleness witness.
                 if let Some((pid, _key, value)) = props.iter().find(|(_, key, _)| *key == prop_key)
                 {
                     // A null value is never stored as a property (Cypher), so any present record holds a
@@ -7117,7 +7145,7 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// three counts above; narrowing it by guessing which entities an open writer might still touch is
     /// the unsound approximation the predicate footprint exists to remove. What did change is that it is
     /// no longer the *only* mechanism, and no longer the one the correctness of
-    /// [`visible_value_for_key`](Self::visible_value_for_key) rests on.
+    /// [`decided_value_for_key`](Self::decided_value_for_key) rests on.
     ///
     /// # Why a guard is required by the visibility discipline, not merely nice to have
     ///
@@ -7920,7 +7948,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// The value node `id` holds for property-key token `prop_key` **as of `snapshot`**, or [`None`]
     /// if the node does not hold that property in that snapshot (`rmp` task #99). The value a
     /// constraint decision is made on, so it must be the value a `MATCH` in the same transaction would
-    /// return — see [`visible_value_for_key`](Self::visible_value_for_key) for the resolution rule.
+    /// return — see [`decided_value_for_key`](Self::decided_value_for_key) for the resolution rule.
+    ///
+    /// The read is [`RecordStore::decision_scan_node_properties`], the **decision**-polarity member
+    /// of the pair (`rmp` task #905): it cannot be called without the snapshot, and the
+    /// [`DecidedProperties`] it returns cannot be built any other way. Reaching for the
+    /// superset-polarity twin here is what `rmp` task #902 was.
     ///
     /// # Errors
     /// Propagates a store read fault. It is deliberately **fallible** (`rmp` task #733): it used to fold
@@ -7934,13 +7967,14 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         snapshot: Snapshot,
     ) -> Result<Option<Value>> {
         let store = self.store.borrow();
-        let chain = store.node_properties(id)?;
-        Self::visible_value_for_key(&store, &chain, prop_key, snapshot)
+        let decided = store.decision_scan_node_properties(id, snapshot)?;
+        Self::decided_value_for_key(&store, &decided, prop_key)
     }
 
     /// The value relationship `id` holds for property-key token `prop_key` as of `snapshot`
     /// (`rmp` #638), or [`None`] if it does not hold that property in that snapshot — the relationship
-    /// analogue of [`node_value_for_key`](Self::node_value_for_key).
+    /// analogue of [`node_value_for_key`](Self::node_value_for_key), reading through the same
+    /// decision-polarity surface.
     ///
     /// # Errors
     /// Propagates a store read fault, for the reason documented on
@@ -7952,34 +7986,28 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
         snapshot: Snapshot,
     ) -> Result<Option<Value>> {
         let store = self.store.borrow();
-        let chain = store.rel_properties(id)?;
-        Self::visible_value_for_key(&store, &chain, prop_key, snapshot)
+        let decided = store.decision_scan_rel_properties(id, snapshot)?;
+        Self::decided_value_for_key(&store, &decided, prop_key)
     }
 
-    /// Resolves `prop_key` against an entity's raw property chain, **newest-visible-wins** (`rmp` tasks
-    /// #902, #903): the chain is prepend-ordered, so the first version of the key that `snapshot` can
-    /// see is the one that decides. A version the snapshot cannot see — an uncommitted or aborted
-    /// creator, a committed removal at or below the snapshot, a creator that committed *after* the
-    /// snapshot — is skipped, exactly as [`is_visible`] decides it for `MATCH`.
+    /// Decodes the version of `prop_key` an already-narrowed [`DecidedProperties`] holds, or [`None`]
+    /// when the entity does not hold that key in the snapshot it was narrowed against (`rmp` tasks
+    /// #902, #903, #905).
     ///
-    /// # Why visibility, and not a raw `expired_ts` test
+    /// # Why the parameter is `DecidedProperties` and not a chain
     ///
-    /// `node_properties` / `rel_properties` return every `in_use` record, and a removed version keeps
-    /// its slot until GC reclaims it — which has no automatic trigger (`rmp` #305). `rmp` task #902 fixed
-    /// the resulting defect (a committed `REMOVE n.email` stayed indefinitely readable here, so
-    /// `CREATE CONSTRAINT … IS UNIQUE` was refused over a duplicate no `MATCH` can find) with a raw
-    /// `expired_ts != 0` test, sound only because the DDL refused to run while any writer was open.
-    /// That is a *precondition on the caller* encoded in a value resolver, and `rmp` task #903 removes
-    /// the need for it: the walk now runs inside a real transaction with a real [`Snapshot`], so the
-    /// decision is made by the same predicate the read path uses. The two agree on every state the #902
-    /// precondition allowed — a live version is visible, a committed removal is not — and this one is
-    /// additionally right for the states it did not: an aborted write is invisible instead of being
-    /// read as present, and an in-flight write by another transaction is invisible instead of being
-    /// mistaken for a committed one.
+    /// This helper used to take the entity's **raw** chain and resolve the key itself. The raw chain
+    /// returns every `in_use` record, and a removed version keeps its slot until GC reclaims it — which
+    /// has no automatic trigger (`rmp` #305) — so a caller who did not apply the visibility filter read
+    /// a committed `REMOVE n.email` as a present value, and `CREATE CONSTRAINT … IS UNIQUE` was refused
+    /// over a duplicate no `MATCH` can find. That was `rmp` task #902; `rmp` task #903 replaced its raw
+    /// `expired_ts != 0` patch with the production [`is_visible`] predicate, and `rmp` task #905 moved
+    /// the narrowing itself into [`SupersetProperties::decide`] so that **the resolution can no longer
+    /// be skipped**: the only value of this parameter type is one a [`Snapshot`] produced.
     ///
     /// Exactly one version of a key is visible to a given snapshot (a `SET` stamps the new version's
-    /// `xmin` and the old version's `xmax` with the same transaction), so "first visible wins" resolves
-    /// a single value rather than picking among several.
+    /// `xmin` and the old version's `xmax` with the same transaction), so the narrowing resolves a
+    /// single value rather than choosing among several.
     ///
     /// # Errors
     /// Propagates a store read fault raised while decoding the value (an unreadable overflow chain).
@@ -7990,22 +8018,12 @@ impl<D: BlockDevice, S: LogSink> TxnCoordinator<D, S> {
     /// constraint decision depends on no other property — and the fail-closed guarantee that matters is
     /// intact, since the chain walk itself still errors on a missing page or a malformed chain, and any
     /// fault on the covered value still propagates.
-    fn visible_value_for_key(
+    fn decided_value_for_key(
         store: &RecordStore<D, S>,
-        chain: &[(u64, PropRecord)],
+        decided: &DecidedProperties,
         prop_key: u32,
-        snapshot: Snapshot,
     ) -> Result<Option<Value>> {
-        let registry = store.commit_registry();
-        let Some((_pid, prop)) = chain.iter().find(|(_pid, prop)| {
-            prop.key == prop_key
-                && is_visible(
-                    snapshot,
-                    prop.mvcc.created_ts,
-                    prop.mvcc.expired_ts,
-                    registry,
-                )
-        }) else {
+        let Some(prop) = decided.visible_version(prop_key) else {
             return Ok(None); // no version of this key is visible: the entity does not hold it
         };
         store

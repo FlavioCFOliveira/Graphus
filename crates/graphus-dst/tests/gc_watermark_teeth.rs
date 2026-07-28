@@ -82,9 +82,9 @@ fn build() -> Fixture {
 fn reader_resolves(store: &Store, node_a: u64, key: u32, reader_snapshot: Snapshot) -> Option<i64> {
     let registry: CommitRegistry = store.commit_registry().clone();
     let chain = store
-        .node_properties(node_a)
+        .superset_scan_node_properties(node_a)
         .expect("walk a's property chain");
-    for (_pid, prop) in chain {
+    for (_pid, prop) in chain.every_version() {
         if prop.key != key {
             continue;
         }

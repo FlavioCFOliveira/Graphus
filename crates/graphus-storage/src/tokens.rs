@@ -211,11 +211,11 @@ impl TokenStore {
 /// The off-thread read view ([`StoreReadView`](crate::read_view::StoreReadView), Slice 3a) exposes the
 /// **decode** surface computed purely from `(Arc<pool>, MetaSnapshot)`, but it cannot resolve token
 /// `id ↔ name` (that lives in the store's `tokens` field, which the writer keeps exclusively). A
-/// name-returning read (`node_labels → Vec<String>`, `node_properties → Vec<(String, Value)>`, the
-/// relationship type) therefore needs the full reverse `id → name` dictionary for whatever tokens the
-/// surfaced records carry, which cannot be pre-resolved without knowing the result rows in advance.
-/// `TokenSnapshot` carries the whole dictionary, frozen at capture, so the reader resolves any token
-/// it meets exactly as the live store would.
+/// name-returning read at the Cypher seam (`node_labels → Vec<String>`, `node_properties →
+/// Vec<(String, Value)>`, the relationship type) therefore needs the full reverse `id → name`
+/// dictionary for whatever tokens the surfaced records carry, which cannot be pre-resolved without
+/// knowing the result rows in advance. `TokenSnapshot` carries the whole dictionary, frozen at
+/// capture, so the reader resolves any token it meets exactly as the live store would.
 ///
 /// # MVCC-superset-safe
 ///

@@ -26,6 +26,15 @@
 //! **superset** of the truly-matching ids is always correct; returning a subset never is. The range
 //! seek deliberately exploits this when a bound cannot be expressed exactly against the backing
 //! index (see [`IndexSet::seek_node_property_range`]).
+//!
+//! That asymmetry is the **superset** polarity of [`graphus_storage::scan_polarity`], and it runs
+//! one way only: a re-check can REMOVE a candidate, but it can never RESURRECT one. Everything that
+//! fills these trees is bound by it — every property version is indexed with no visibility filter
+//! (`rmp` #766) and label membership is gated on the live-OR-retained union, never the live word
+//! (`rmp` #904) — and everything that *empties* them is bound by it too, which is what
+//! [`IndexSet::clear`] and the `rmp` #765 rebuild watermark below are about. The opposite polarity
+//! — a read whose answer is final and is never re-checked, such as a constraint verdict — must
+//! never be served from here; see that module for the full rule.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 

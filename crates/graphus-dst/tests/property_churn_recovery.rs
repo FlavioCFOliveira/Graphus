@@ -9,11 +9,12 @@
 //! mechanism the incidence chain uses for relationships: a header-only creation undo for the prop
 //! record plus a compare-and-set logical undo for the owner's `first_prop` head (`store.rs`
 //! `write_chain_head`, `rmp` #172). When two sessions interleave property creations on the same
-//! committed node, one is rolled back **live**, and the other is left **in flight** at a crash, ARIES
-//! recovery can legitimately leave the node's `first_prop` pointing at a `!in_use` **dead-link
-//! corpse** whose `next_prop` body still threads down to the committed properties below it. The hot
-//! read path [`RecordStore::node_properties`] (→ `read_view::collect_prop_chain`) must thread through
-//! that corpse run, bounded by the cycle guard `Prop.high_water + 1`.
+//! committed node, one is rolled back **live**, and the other is left **in flight** at a crash,
+//! ARIES recovery can legitimately leave the node's `first_prop` pointing at a `!in_use`
+//! **dead-link corpse** whose `next_prop` body still threads down to the committed properties below
+//! it. The hot read path [`RecordStore::superset_scan_node_properties`] (→
+//! `read_view::collect_prop_chain`) must thread through that corpse run, bounded by the cycle guard
+//! `Prop.high_water + 1`.
 //!
 //! That is structurally the SAME bug `rmp` #468 fixed for the rel chain: if ARIES redo materialises a
 //! loser's prop record on an already-mapped (committed-catalog) densely-packed Prop page *above* the

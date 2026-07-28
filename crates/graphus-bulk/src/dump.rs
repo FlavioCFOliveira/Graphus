@@ -157,7 +157,7 @@ pub fn dump_nodes<D: BlockDevice, S: LogSink, W: Write>(
         for t in label_tokens {
             labels.push(key_name(store, Namespace::Label, t)?);
         }
-        let by_name = newest_by_name(store, store.node_property_values(id)?)?;
+        let by_name = newest_by_name(store, store.superset_scan_node_property_values(id)?)?;
         for (key, value) in &by_name {
             key_types
                 .entry(key.clone())
@@ -212,7 +212,7 @@ pub fn dump_relationships<D: BlockDevice, S: LogSink, W: Write>(
     for &id in &rel_ids {
         let rec = store.rel(id)?;
         let type_name = key_name(store, Namespace::RelType, rec.type_id)?;
-        let by_name = newest_by_name(store, store.rel_property_values(id)?)?;
+        let by_name = newest_by_name(store, store.superset_scan_rel_property_values(id)?)?;
         for (key, value) in &by_name {
             key_types
                 .entry(key.clone())

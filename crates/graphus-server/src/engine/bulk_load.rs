@@ -673,14 +673,15 @@ fn recover_and_delete_orphaned_sentinel<D: BlockDevice, S: LogSink>(
             }
             // Read AFTER the (successful) delete: `delete_node` tombstones only the node's own MVCC
             // header, never its property chain, so the chain remains fully readable within this same
-            // transaction. `node_property_values` returns the WHOLE chain, prepend-ordered (newest
-            // first) — every `checkpoint_sentinel` call on a prior batch appended a fresh version of
-            // each of these three keys rather than overwriting in place (MVCC), so older, stale values
-            // are still walked here until GC reclaims them. Only the FIRST (newest) occurrence of each
-            // key must win; a naive last-write-in-iteration-order assignment would end up keeping the
-            // OLDEST recorded value instead.
+            // transaction. `superset_scan_node_property_values` returns the WHOLE chain,
+            // prepend-ordered (newest first) — every `checkpoint_sentinel` call on a prior batch
+            // appended a fresh version of each of these three keys rather than overwriting in
+            // place (MVCC), so older, stale values are still walked here until GC reclaims them.
+            // Only the FIRST (newest) occurrence of each key must win; a naive
+            // last-write-in-iteration-order assignment would end up keeping the OLDEST recorded
+            // value instead.
             let (mut have_nodes, mut have_rels, mut have_props) = (false, false, false);
-            for (_pid, key, value) in store.node_property_values(id)? {
+            for (_pid, key, value) in store.superset_scan_node_property_values(id)? {
                 let Value::Integer(n) = value else { continue };
                 let n = u64::try_from(n).unwrap_or(0);
                 if key == nodes_key && !have_nodes {

@@ -283,7 +283,7 @@ fn store_read_view_is_byte_identical_to_record_store() {
     let strings_hw = view.meta().store(StoreKind::Strings).high_water;
 
     // Sweep the node store: node, node_labels, node_has_label (for several token ids incl. an
-    // unlikely one), node_properties, incident_rels, and the low-level read_mvcc.
+    // unlikely one), superset_scan_node_properties, incident_rels, and the low-level read_mvcc.
     for id in 1..node_hw {
         assert_results_eq(&format!("node({id})"), s.node(id), view.node(id));
         assert_results_eq(
@@ -299,9 +299,11 @@ fn store_read_view_is_byte_identical_to_record_store() {
             );
         }
         assert_results_eq(
-            &format!("node_properties({id})"),
-            s.node_properties(id),
-            view.node_properties(id),
+            &format!("superset_scan_node_properties({id})"),
+            s.superset_scan_node_properties(id)
+                .map(|c| c.into_every_version()),
+            view.superset_scan_node_properties(id)
+                .map(|c| c.into_every_version()),
         );
         assert_results_eq(
             &format!("incident_rels({id})"),
@@ -315,18 +317,21 @@ fn store_read_view_is_byte_identical_to_record_store() {
         );
     }
 
-    // Sweep the rel store: rel, rel_properties, rel_property_values, read_mvcc.
+    // Sweep the rel store: rel, superset_scan_rel_properties, superset_scan_rel_property_values,
+    // read_mvcc.
     for id in 1..rel_hw {
         assert_results_eq(&format!("rel({id})"), s.rel(id), view.rel(id));
         assert_results_eq(
-            &format!("rel_properties({id})"),
-            s.rel_properties(id),
-            view.rel_properties(id),
+            &format!("superset_scan_rel_properties({id})"),
+            s.superset_scan_rel_properties(id)
+                .map(|c| c.into_every_version()),
+            view.superset_scan_rel_properties(id)
+                .map(|c| c.into_every_version()),
         );
         assert_results_eq(
-            &format!("rel_property_values({id})"),
-            s.rel_property_values(id),
-            view.rel_property_values(id),
+            &format!("superset_scan_rel_property_values({id})"),
+            s.superset_scan_rel_property_values(id),
+            view.superset_scan_rel_property_values(id),
         );
         assert_results_eq(
             &format!("read_mvcc(Rel, {id})"),
@@ -391,26 +396,28 @@ fn store_read_view_is_byte_identical_to_record_store() {
         );
     }
 
-    // A multi-block read_chain on a real overflow head (exercise the chain reassembly explicitly via
-    // the live store and confirm the view's decode_property_value of an overflow prop equals it).
-    // (read_chain is private; node_property_values already round-trips it above through both routes.)
+    // A multi-block read_chain on a real overflow head (exercise the chain reassembly explicitly
+    // via the live store and confirm the view's decode_property_value of an overflow prop equals
+    // it). (read_chain is private; superset_scan_node_property_values already round-trips it above
+    // through both routes.)
     assert_results_eq(
-        "node_property_values(1)",
-        s.node_property_values(1),
+        "superset_scan_node_property_values(1)",
+        s.superset_scan_node_property_values(1),
         view_node_property_values(&view, 1),
     );
 }
 
-/// Reconstructs `node_property_values` over a [`StoreReadView`] from its public surface
-/// (`node_properties` + `decode_property_value`), mirroring `RecordStore::node_property_values`, so the
-/// overflow-walk path is compared end-to-end. Returns the same `(pid, key, Value)` triples.
+/// Reconstructs `superset_scan_node_property_values` over a [`StoreReadView`] from its public
+/// surface (`superset_scan_node_properties` + `decode_property_value`), mirroring
+/// `RecordStore::superset_scan_node_property_values`, so the overflow-walk path is compared
+/// end-to-end. Returns the same `(pid, key, Value)` triples.
 fn view_node_property_values(
     view: &View,
     node_id: u64,
 ) -> Result<Vec<(u64, u32, Value)>, GraphusError> {
-    let chain = view.node_properties(node_id)?;
+    let chain = view.superset_scan_node_properties(node_id)?;
     let mut out = Vec::with_capacity(chain.len());
-    for (pid, prop) in chain {
+    for (pid, prop) in chain.into_every_version() {
         let value = view.decode_property_value(prop.type_tag, prop.value_inline)?;
         out.push((pid, prop.key, value));
     }

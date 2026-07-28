@@ -7,13 +7,13 @@
 //!   alloc→read round-trips for payloads spanning 1, 2 and many blocks; empty and large payloads;
 //!   and free→realloc reuse of freed block ids (no leak);
 //! * the **value-level property codec** ([`RecordStore::set_node_property_value`] /
-//!   [`node_property_values`]): `String`, `List` and temporal values round-trip through the heap,
-//!   inline scalars stay inline, and an overwrite/removal frees the old chain (asserted via
-//!   [`RecordStore::heap_block_usage`]).
+//!   [`superset_scan_node_property_values`]): `String`, `List` and temporal values round-trip
+//!   through the heap, inline scalars stay inline, and an overwrite/removal frees the old chain
+//!   (asserted via [`RecordStore::heap_block_usage`]).
 //!
 //! [`read_chain`]: graphus_storage::RecordStore::read_chain
 //! [`free_chain`]: graphus_storage::RecordStore::free_chain
-//! [`node_property_values`]: graphus_storage::RecordStore::node_property_values
+//! [`superset_scan_node_property_values`]: graphus_storage::RecordStore::superset_scan_node_property_values
 
 use graphus_core::{TxnId, Value};
 use graphus_io::MemBlockDevice;
@@ -256,7 +256,7 @@ fn inline_scalars_stay_inline_and_use_no_heap_blocks() {
 
     // No heap blocks were allocated for inline scalars.
     assert_eq!(s.heap_block_usage().unwrap(), 0);
-    let vals = s.node_property_values(n).unwrap();
+    let vals = s.superset_scan_node_property_values(n).unwrap();
     let by_key = |key: u32| {
         vals.iter()
             .find(|(_, k, _)| *k == key)
@@ -287,7 +287,7 @@ fn string_and_list_values_round_trip_through_the_property_api() {
         .unwrap();
     s.set_node_property_value(txn, n, k_l, &list).unwrap();
 
-    let vals = s.node_property_values(n).unwrap();
+    let vals = s.superset_scan_node_property_values(n).unwrap();
     let by_key = |key: u32| {
         vals.iter()
             .find(|(_, k, _)| *k == key)
@@ -390,7 +390,7 @@ fn temporal_values_round_trip_through_the_property_api() {
     // Every temporal value goes through the overflow heap (none fits the 64-bit inline payload).
     assert!(s.heap_block_usage().unwrap() >= values.len() as u64);
 
-    let vals = s.node_property_values(n).unwrap();
+    let vals = s.superset_scan_node_property_values(n).unwrap();
     for (k, (name, value)) in keys.iter().zip(&values) {
         let got = vals
             .iter()
@@ -422,7 +422,7 @@ fn committed_temporal_property_survives_a_crash_and_recovers() {
     s.commit(txn).unwrap();
 
     let rec = recover_no_force(&s);
-    let vals = rec.node_property_values(n).unwrap();
+    let vals = rec.superset_scan_node_property_values(n).unwrap();
     let v = vals
         .iter()
         .find(|(_, key, _)| *key == k)
@@ -472,7 +472,7 @@ fn spatial_point_values_round_trip_through_the_property_api() {
     // A point does not fit the 64-bit inline payload, so each goes through the overflow heap.
     assert!(s.heap_block_usage().unwrap() >= values.len() as u64);
 
-    let vals = s.node_property_values(n).unwrap();
+    let vals = s.superset_scan_node_property_values(n).unwrap();
     for (k, (name, value)) in keys.iter().zip(&values) {
         let got = vals
             .iter()
@@ -501,7 +501,7 @@ fn committed_point_property_survives_a_crash_and_recovers() {
     s.commit(txn).unwrap();
 
     let rec = recover_no_force(&s);
-    let vals = rec.node_property_values(n).unwrap();
+    let vals = rec.superset_scan_node_property_values(n).unwrap();
     let v = vals
         .iter()
         .find(|(_, key, _)| *key == k)
@@ -542,7 +542,7 @@ fn overwriting_an_overflow_value_frees_the_old_chain() {
     );
 
     // The read returns the new value, and only one property record for the key remains.
-    let vals = s.node_property_values(n).unwrap();
+    let vals = s.superset_scan_node_property_values(n).unwrap();
     let for_key: Vec<_> = vals.iter().filter(|(_, key, _)| *key == k).collect();
     assert_eq!(
         for_key.len(),
@@ -577,7 +577,7 @@ fn removing_an_overflow_value_frees_its_chain() {
         0,
         "removal frees the chain at GC"
     );
-    assert!(s.node_property_values(n).unwrap().is_empty());
+    assert!(s.superset_scan_node_property_values(n).unwrap().is_empty());
 }
 
 #[test]
@@ -615,7 +615,7 @@ fn clearing_all_properties_frees_every_overflow_chain() {
         0,
         "every overflow chain is freed at GC"
     );
-    assert!(s.node_property_values(n).unwrap().is_empty());
+    assert!(s.superset_scan_node_property_values(n).unwrap().is_empty());
 }
 
 #[test]
@@ -634,7 +634,7 @@ fn committed_overflow_property_survives_a_crash_and_recovers() {
     s.commit(txn).unwrap();
 
     let rec = recover_no_force(&s);
-    let vals = rec.node_property_values(n).unwrap();
+    let vals = rec.superset_scan_node_property_values(n).unwrap();
     let v = vals
         .iter()
         .find(|(_, key, _)| *key == k)

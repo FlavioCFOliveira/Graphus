@@ -18,9 +18,9 @@
 //! A grep of every store call on `RecordStoreGraph`'s read path resolves into exactly two categories:
 //!
 //! 1. the **decode** surface (`node` / `rel` / `scan_node_ids` / `scan_rel_ids` / `node_labels` /
-//!    `node_has_label` / `node_properties` / `rel_properties` / `incident_rels` /
-//!    `decode_property_value` / `read_prop`), which [`StoreReadView`]
-//!    already implements method-for-method; and
+//!    `node_has_label` / `superset_scan_node_properties` / `superset_scan_rel_properties` /
+//!    `incident_rels` / `decode_property_value` / `read_prop`), which [`StoreReadView`] already
+//!    implements method-for-method; and
 //! 2. **token** resolution (`token_id` / `token_name`), which the view lacks (it is satisfied by a
 //!    [`TokenSnapshot`]).
 //!
@@ -52,8 +52,10 @@ use graphus_core::{TxnId, Value, VersionStamp};
 use graphus_index::fulltext::Analyzer;
 use graphus_index::keycodec::{encode_equality_canonical, encode_single};
 use graphus_io::BlockDevice;
-use graphus_storage::record::{NodeRecord, PropRecord, RelRecord};
-use graphus_storage::{MvccHeader, Namespace, RecordStore, StoreReadView, TokenSnapshot, labels};
+use graphus_storage::record::{NodeRecord, RelRecord};
+use graphus_storage::{
+    MvccHeader, Namespace, RecordStore, StoreReadView, SupersetProperties, TokenSnapshot, labels,
+};
 use graphus_txn::{CommitRegistry, PredicateRead, Snapshot, is_visible};
 use graphus_wal::LogSink;
 
@@ -122,12 +124,11 @@ pub fn csr_adjacency_enabled() -> bool {
 // StoreReadSource — the shared read surface
 // =================================================================================================
 
-/// The store-side read surface the lifted read body
-/// ([`scan_nodes`] … [`rel_properties`]) drives (`rmp` task #336, Slice
-/// 3b-i). It is exactly the decode surface
-/// [`RecordStoreGraph`](crate::record_graph::RecordStoreGraph)'s read path calls on the store, **plus**
-/// the one capability the off-thread [`StoreReadView`] lacks — token
-/// `id ↔ name` resolution.
+/// The store-side read surface the lifted read body ([`scan_nodes`] …
+/// [`StoreReadSource::superset_scan_rel_properties`]) drives (`rmp` task #336, Slice 3b-i). It is
+/// exactly the decode surface [`RecordStoreGraph`](crate::record_graph::RecordStoreGraph)'s read
+/// path calls on the store, **plus** the one capability the off-thread [`StoreReadView`] lacks —
+/// token `id ↔ name` resolution.
 ///
 /// Implemented by [`LiveSource`] (over `&RecordStore`, on the engine thread) and [`ReadViewSource`]
 /// (over a [`StoreReadView`] + [`TokenSnapshot`], on a reader thread). Both return identical values for
@@ -183,11 +184,24 @@ pub trait StoreReadSource {
         registry: &CommitRegistry,
     ) -> u64;
 
-    /// Every live `(physical_id, record)` in `node_id`'s property chain, head to tail (newest first).
-    fn node_properties(&self, node_id: u64) -> Result<Vec<(u64, PropRecord)>, GraphusError>;
+    /// The **superset**-polarity read of `node_id`'s property chain, head to tail (newest first).
+    ///
+    /// This doc used to promise every *live* record. It does not: it returns every
+    /// **slot-occupied** record, MVCC tombstones and uncommitted versions included, which is the
+    /// same false claim `rmp` task #902 had to correct on
+    /// `RecordStore::superset_scan_node_properties` itself. The visibility fold is applied ABOVE
+    /// this surface — see [`graphus_storage::scan_polarity`] for which reads owe which answer.
+    fn superset_scan_node_properties(
+        &self,
+        node_id: u64,
+    ) -> Result<SupersetProperties, GraphusError>;
 
-    /// Every live `(physical_id, record)` in `rel_id`'s property chain, head to tail (newest first).
-    fn rel_properties(&self, rel_id: u64) -> Result<Vec<(u64, PropRecord)>, GraphusError>;
+    /// The **superset**-polarity read of `rel_id`'s property chain, head to tail (newest first) —
+    /// the relationship twin of
+    /// [`superset_scan_node_properties`](Self::superset_scan_node_properties), with the same
+    /// polarity.
+    fn superset_scan_rel_properties(&self, rel_id: u64)
+    -> Result<SupersetProperties, GraphusError>;
 
     /// The physical ids of the relationships incident to `node_id` (self-loops deduped, dead-link
     /// corpses threaded through transparently).
@@ -252,11 +266,17 @@ impl<D: BlockDevice, S: LogSink> StoreReadSource for LiveSource<'_, D, S> {
     ) -> u64 {
         self.0.label_bitmap_at(id, live, snapshot, registry)
     }
-    fn node_properties(&self, node_id: u64) -> Result<Vec<(u64, PropRecord)>, GraphusError> {
-        self.0.node_properties(node_id)
+    fn superset_scan_node_properties(
+        &self,
+        node_id: u64,
+    ) -> Result<SupersetProperties, GraphusError> {
+        self.0.superset_scan_node_properties(node_id)
     }
-    fn rel_properties(&self, rel_id: u64) -> Result<Vec<(u64, PropRecord)>, GraphusError> {
-        self.0.rel_properties(rel_id)
+    fn superset_scan_rel_properties(
+        &self,
+        rel_id: u64,
+    ) -> Result<SupersetProperties, GraphusError> {
+        self.0.superset_scan_rel_properties(rel_id)
     }
     fn incident_rels(&self, node_id: u64) -> Result<Vec<u64>, GraphusError> {
         self.0.incident_rels(node_id)
@@ -321,11 +341,17 @@ impl<D: BlockDevice, S: LogSink> StoreReadSource for ReadViewSource<'_, D, S> {
     ) -> u64 {
         self.view.label_bitmap_at(id, live, snapshot, registry)
     }
-    fn node_properties(&self, node_id: u64) -> Result<Vec<(u64, PropRecord)>, GraphusError> {
-        self.view.node_properties(node_id)
+    fn superset_scan_node_properties(
+        &self,
+        node_id: u64,
+    ) -> Result<SupersetProperties, GraphusError> {
+        self.view.superset_scan_node_properties(node_id)
     }
-    fn rel_properties(&self, rel_id: u64) -> Result<Vec<(u64, PropRecord)>, GraphusError> {
-        self.view.rel_properties(rel_id)
+    fn superset_scan_rel_properties(
+        &self,
+        rel_id: u64,
+    ) -> Result<SupersetProperties, GraphusError> {
+        self.view.superset_scan_rel_properties(rel_id)
     }
     fn incident_rels(&self, node_id: u64) -> Result<Vec<u64>, GraphusError> {
         self.view.incident_rels(node_id)
@@ -2859,14 +2885,14 @@ fn read_node_prop_one<S: StoreReadSource, K: ReadSink>(
     key: &str,
 ) -> Option<Value> {
     let key_id = src.token_id(Namespace::PropKey, key)?;
-    let chain = match src.node_properties(node.0) {
+    let chain = match src.superset_scan_node_properties(node.0) {
         Ok(chain) => chain,
         Err(e) => {
             sink.capture(e);
             return None;
         }
     };
-    for (_pid, prop) in chain {
+    for (_pid, prop) in chain.every_version() {
         if prop.key != key_id || !ctx.visible(prop.mvcc) {
             continue;
         }
@@ -2891,14 +2917,14 @@ fn read_rel_prop_one<S: StoreReadSource, K: ReadSink>(
     key: &str,
 ) -> Option<Value> {
     let key_id = src.token_id(Namespace::PropKey, key)?;
-    let chain = match src.rel_properties(rel.0) {
+    let chain = match src.superset_scan_rel_properties(rel.0) {
         Ok(chain) => chain,
         Err(e) => {
             sink.capture(e);
             return None;
         }
     };
-    for (_pid, prop) in chain {
+    for (_pid, prop) in chain.every_version() {
         if prop.key != key_id || !ctx.visible(prop.mvcc) {
             continue;
         }
@@ -2922,7 +2948,7 @@ fn read_node_props<S: StoreReadSource, K: ReadSink>(
     sink: &K,
     node: NodeId,
 ) -> Vec<(String, Value)> {
-    let chain = match src.node_properties(node.0) {
+    let chain = match src.superset_scan_node_properties(node.0) {
         Ok(chain) => chain,
         Err(e) => {
             sink.capture(e);
@@ -2943,7 +2969,7 @@ fn read_rel_props<S: StoreReadSource, K: ReadSink>(
     sink: &K,
     rel: RelId,
 ) -> Vec<(String, Value)> {
-    let chain = match src.rel_properties(rel.0) {
+    let chain = match src.superset_scan_rel_properties(rel.0) {
         Ok(chain) => chain,
         Err(e) => {
             sink.capture(e);
@@ -2966,10 +2992,10 @@ fn collect_visible_props<S: StoreReadSource, K: ReadSink>(
     src: &S,
     ctx: &VisCtx,
     sink: &K,
-    chain: Vec<(u64, PropRecord)>,
+    chain: SupersetProperties,
 ) -> Option<Vec<(u32, Value)>> {
     let mut out: Vec<(u32, Value)> = Vec::new();
-    for (_pid, prop) in chain {
+    for (_pid, prop) in chain.into_every_version() {
         if !ctx.visible(prop.mvcc) || out.iter().any(|(k, _)| *k == prop.key) {
             continue;
         }
